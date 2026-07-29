@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as resolver from "./ExecutableResolver.js";
 import { expandOpenCodeShim, OpenCodeBackend } from "./OpenCodeBackend.js";
 import { LocalAgentSetupError } from "./Types.js";
 
@@ -94,5 +95,19 @@ describe("OpenCodeBackend.buildInvocation with launcher args", () => {
 			{ prompt: "hi", model: "", systemPrompt: "" },
 		);
 		expect(inv.args).toEqual(["cli.js", "run", "hi"]);
+	});
+});
+
+describe("OpenCodeBackend.isPresent", () => {
+	it("is false for an override path that does not exist", () => {
+		expect(new OpenCodeBackend().isPresent("/nonexistent/path/to/opencode")).toBe(false);
+	});
+
+	it("delegates to the OPENCODE_SPEC discovery, not another tool's", () => {
+		const spy = vi.spyOn(resolver, "isPresent").mockReturnValue(true);
+		expect(new OpenCodeBackend().isPresent()).toBe(true);
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ binName: "opencode" }), {
+			overridePath: undefined,
+		});
 	});
 });

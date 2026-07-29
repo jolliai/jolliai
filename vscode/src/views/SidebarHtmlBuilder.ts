@@ -13,6 +13,17 @@
  *     key). In that mode the tab bar and tab content are hidden; the onboarding
  *     panel takes the entire viewport. The Anthropic API key path is positioned
  *     as the recommended primary option above the secondary Sign in to Jolli card.
+ *   - A local-agent card sibling (`#onboarding-localagent-block`), hidden by
+ *     default and rendered above the Anthropic API key card. `init` carries
+ *     `state.localAgents` (Task 7); when non-empty, SidebarScriptBuilder shows
+ *     this card, moves the RECOMMENDED badge onto it, populates the
+ *     `<select>` with the detected tools (first entry pre-selected), and
+ *     drops `ob-card--recommended` / the badge from the API-key card
+ *     (`#onboarding-apikey-card`) below. When `localAgents` is empty or
+ *     absent, the block stays hidden and the badge / recommended styling
+ *     move back onto the API-key card, so exactly one card is ever marked
+ *     recommended. (The "Configure API Key" button itself is `--secondary`
+ *     in both cases — it now matches "Sign In / Sign Up".)
  *   - An API key entry panel sibling, hidden by default. Shown when the user
  *     clicks "Configure API Key" from the onboarding panel — replaces the
  *     onboarding cards with a focused input + Save/Back so users can save the
@@ -95,8 +106,25 @@ export function buildSidebarHtml(
         <p class="ob-subtitle">Jolli Memory automatically captures your work context and surfaces relevant memories as you code. Choose how you'd like to set it up.</p>
       </header>
       <hr class="ob-divider" />
-      <section class="ob-card ob-card--recommended">
-        <span class="ob-badge">RECOMMENDED</span>
+      <div class="ob-localagent hidden" id="onboarding-localagent-block">
+        <section class="ob-card ob-card--recommended">
+          <span class="ob-badge">RECOMMENDED</span>
+          <div class="ob-card-row">
+            <i class="codicon codicon-terminal ob-card-icon" aria-hidden="true"></i>
+            <div class="ob-card-text">
+              <h3 class="ob-card-title">Use your local agent tool</h3>
+              <p class="ob-card-desc">Use your local agent tool for AI summarization. Memories are stored locally only.</p>
+            </div>
+          </div>
+          <p class="ob-hint">Make sure you're signed in to the tool.</p>
+          <label class="ob-select-label" for="onboarding-localagent-select">Agent tool</label>
+          <select class="ob-select" id="onboarding-localagent-select"></select>
+        </section>
+        <p class="ob-error hidden" id="onboarding-localagent-error" role="alert"></p>
+        <button type="button" id="onboarding-localagent-btn" class="ob-btn ob-btn--primary">Use Local Agent Tool</button>
+        <div class="ob-or"><span>OR</span></div>
+      </div>
+      <section class="ob-card" id="onboarding-apikey-card">
         <div class="ob-card-row">
           <i class="codicon codicon-key ob-card-icon" aria-hidden="true"></i>
           <div class="ob-card-text">
@@ -105,7 +133,7 @@ export function buildSidebarHtml(
           </div>
         </div>
       </section>
-      <button type="button" id="onboarding-apikey-btn" class="ob-btn ob-btn--primary">Configure API Key</button>
+      <button type="button" id="onboarding-apikey-btn" class="ob-btn ob-btn--secondary">Configure API Key</button>
       <div class="ob-or"><span>OR</span></div>
       <section class="ob-card">
         <div class="ob-card-row">

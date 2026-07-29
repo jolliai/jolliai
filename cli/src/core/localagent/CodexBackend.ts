@@ -1,6 +1,6 @@
 import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { createLocalAgentCwd, LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
-import { resolveExecutable } from "./ExecutableResolver.js";
+import { isPresent, resolveExecutable } from "./ExecutableResolver.js";
 import {
 	type Invocation,
 	LocalAgentAuthError,
@@ -44,6 +44,10 @@ export class CodexBackend implements LocalAgentBackend {
 
 	discoverExecutable(overridePath?: string): Promise<ResolvedExecutable> {
 		return Promise.resolve(resolveExecutable(CODEX_SPEC, { overridePath }));
+	}
+
+	isPresent(overridePath?: string): boolean {
+		return isPresent(CODEX_SPEC, { overridePath });
 	}
 
 	buildInvocation(exe: ResolvedExecutable, req: LocalAgentRequest): Invocation {

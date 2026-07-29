@@ -1,12 +1,29 @@
 /**
  * EnableCommand tests — focused on the local-agent tool-selection prompt in
- * `promptSetup` (`handleLocalAgent`).
+ * `promptSetup` (`handleLocalAgent`), and on the generalized presence-based
+ * auto-select / picker branches that front it.
  *
  * Covers:
  *   - picking the local-agent option then a non-default tool (Codex) persists
  *     { aiProvider: "local-agent", localAgentTool: "codex" }
- *   - an out-of-range / blank answer falls back to the first listed tool
+ *   - the tool sub-menu has NO default: a blank answer is re-asked exactly like
+ *     an out-of-range / unparseable one, and holding Enter skips without writing
+ *   - a tool that fails its probe is dropped from the menu, so the loop can
+ *     never re-probe a known-broken tool
  *   - the flow is self-sufficient: no Anthropic-key prompt runs afterward
+ *   - zero present tools falls through to the provider menu unchanged
+ *   - exactly one present + usable tool auto-selects silently, no prompt
+ *   - exactly one present but unusable tool falls through to the menu
+ *   - the local-agent route is gated on "no usable credential", NOT on an unset
+ *     aiProvider: a keyless leftover provider must not close it, while a real
+ *     Anthropic key must
+ *   - two or more present tools prompt among them, probing before saving
+ *   - a failed probe on the chosen tool retries rather than looping forever
+ *   - menu choice 3 lists only present tools, or all four with a note when
+ *     none are present
+ *   - exhausting the AUTO-ROUTED picker (every detected tool broken) hands the
+ *     user back the provider menu instead of dead-ending, while an explicit
+ *     "Skip for now" still ends the flow
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -18,7 +35,6 @@ const h = vi.hoisted(() => ({
 	getJolliUrl: vi.fn(),
 	browserLogin: vi.fn(),
 	isLocalAgentChild: vi.fn(),
-	isClaudeCodeUsable: vi.fn(),
 	validateJolliApiKey: vi.fn(),
 	readManualDisableFlag: vi.fn(),
 	writeManualDisableFlag: vi.fn(),
@@ -38,7 +54,6 @@ const h = vi.hoisted(() => ({
 vi.mock("../auth/AuthConfig.js", () => ({ getJolliUrl: h.getJolliUrl }));
 vi.mock("../auth/Login.js", () => ({ browserLogin: h.browserLogin }));
 vi.mock("../core/AgentReentry.js", () => ({ isLocalAgentChild: h.isLocalAgentChild }));
-vi.mock("../core/localagent/ClaudeExecutableResolver.js", () => ({ isClaudeCodeUsable: h.isClaudeCodeUsable }));
 vi.mock("../core/JolliApiUtils.js", () => ({ validateJolliApiKey: h.validateJolliApiKey }));
 vi.mock("../core/RepoProfile.js", () => ({
 	readManualDisableFlag: h.readManualDisableFlag,
@@ -64,38 +79,56 @@ vi.mock("./CliUtils.js", async (importOriginal) => {
 	};
 });
 
+import * as detect from "../core/localagent/DetectAgents.js";
 import { promptSetup } from "./EnableCommand.js";
 
 const GLOBAL_CONFIG_DIR = "/global/config";
+const promptText = h.promptText;
+
+let logs: string[];
+let output: string;
+let savedConfig: Partial<JolliMemoryConfig> | undefined;
+
+beforeEach(() => {
+	// resetAllMocks (not clearAllMocks): also drains any queued
+	// `.mockResolvedValueOnce(...)` values a prior test left unconsumed on the
+	// shared `h.promptText` mock — clearAllMocks only clears call history, so a
+	// leftover queued answer would silently leak into the next test's prompts.
+	vi.resetAllMocks();
+	logs = [];
+	output = "";
+	savedConfig = undefined;
+	vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+		logs.push(a.map(String).join(" "));
+		output = logs.join("\n");
+	});
+	h.getGlobalConfigDir.mockReturnValue(GLOBAL_CONFIG_DIR);
+	// No tools present by default, so promptSetup falls through to the provider
+	// menu rather than the zero-friction auto-select-and-return branch. (Left
+	// unmocked, the real detector would depend on whatever local agent CLIs are
+	// installed on the machine running the test.) Individual tests override via
+	// vi.spyOn(detect, ...) when they need presence.
+	vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([]);
+	vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(true);
+	// No jolliApiKey configured, so promptSetup shows the top-level menu
+	// instead of taking the early-return "already configured" branch.
+	h.loadConfigFromDir.mockResolvedValue({} as Partial<JolliMemoryConfig>);
+	h.saveConfigScoped.mockImplementation((partial: Partial<JolliMemoryConfig>) => {
+		savedConfig = partial;
+		return Promise.resolve(undefined);
+	});
+});
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 describe("EnableCommand — promptSetup local-agent tool selection", () => {
-	let logs: string[];
-
-	beforeEach(() => {
-		vi.clearAllMocks();
-		logs = [];
-		vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
-			logs.push(a.map(String).join(" "));
-		});
-		h.getGlobalConfigDir.mockReturnValue(GLOBAL_CONFIG_DIR);
-		// No auto-detected Claude Code, so promptSetup falls through to the provider
-		// menu rather than the zero-friction auto-select-and-return branch. (Left
-		// unmocked, the real probe spawns `claude` and its result would depend on
-		// whatever is installed on the test machine.)
-		h.isClaudeCodeUsable.mockReturnValue(false);
-		// No jolliApiKey configured, so promptSetup shows the top-level menu
-		// instead of taking the early-return "already configured" branch.
-		h.loadConfigFromDir.mockResolvedValue({} as Partial<JolliMemoryConfig>);
-		h.saveConfigScoped.mockResolvedValue(undefined);
-	});
-
-	afterEach(() => {
-		vi.restoreAllMocks();
-	});
-
 	it("persists the chosen local-agent tool (Codex, the 2nd listed tool)", async () => {
 		// Top-level menu choice "3" = local agent; second-level menu choice "2" =
 		// Codex, per LOCAL_AGENT_TOOLS insertion order (claude-code, codex, ...).
+		// No tools present (beforeEach default), so the picker falls back to all
+		// four with a note.
 		h.promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("2");
 
 		await promptSetup();
@@ -111,26 +144,66 @@ describe("EnableCommand — promptSetup local-agent tool selection", () => {
 		expect(h.promptText).toHaveBeenCalledTimes(2);
 	});
 
-	it("persists claude-code when the tool sub-menu answer is blank (defaults to choice 1)", async () => {
-		h.promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("");
+	it("re-asks (never pins the first tool) when the tool sub-menu answer is blank", async () => {
+		// The sub-menu has NO default. A bare Enter used to be coerced to "1" and
+		// silently wrote { aiProvider: "local-agent", localAgentTool: "claude-code" }
+		// to the global config — the whole product's first prompt, decided by a
+		// stray newline (one queued in the TTY buffer during startup is enough).
+		// Blank now takes the same re-ask path an out-of-range answer takes.
+		h.promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("").mockResolvedValueOnce("2");
 
 		await promptSetup();
 
 		expect(h.saveConfigScoped).toHaveBeenCalledWith(
-			expect.objectContaining({ aiProvider: "local-agent", localAgentTool: "claude-code" }),
+			expect.objectContaining({ aiProvider: "local-agent", localAgentTool: "codex" }),
+			GLOBAL_CONFIG_DIR,
+		);
+		// Never probed claude-code on the way through — the blank consumed no candidate.
+		expect(logs.join("\n")).toContain("Enter a number between 1 and 5");
+	});
+
+	it("gives up and skips (writing nothing) when the sub-menu answer stays blank", async () => {
+		// Holding Enter is the exact input that used to auto-select Claude Code.
+		// It must now exhaust MAX_INVALID_CHOICES and leave the config untouched.
+		h.promptText.mockResolvedValueOnce("3").mockResolvedValue("");
+
+		await promptSetup();
+
+		expect(h.saveConfigScoped).not.toHaveBeenCalled();
+		expect(logs.join("\n")).toContain("Couldn't read a choice");
+	});
+
+	it("advertises no default in the sub-menu prompt", async () => {
+		// The `[1]` hint is what made a bare Enter look like a legitimate answer.
+		h.promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("2");
+
+		await promptSetup();
+
+		const subMenuPrompt = h.promptText.mock.calls[1][0] as string;
+		expect(subMenuPrompt).toContain("Choice (1-5)");
+		expect(subMenuPrompt).not.toContain("[1]");
+	});
+
+	it("re-prompts (never silently pins the first tool) on an out-of-range sub-menu answer", async () => {
+		// `99` used to index past the list and fall back to list[0], pinning a tool
+		// the user never named. It must now be rejected and re-asked instead.
+		h.promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("99").mockResolvedValueOnce("3");
+
+		await promptSetup();
+
+		expect(h.saveConfigScoped).toHaveBeenCalledWith(
+			expect.objectContaining({ aiProvider: "local-agent", localAgentTool: "cursor-agent" }),
 			GLOBAL_CONFIG_DIR,
 		);
 	});
 
-	it("persists claude-code when the tool sub-menu answer is out of range", async () => {
-		h.promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("99");
+	it("gives up and skips after repeated unreadable sub-menu answers, writing nothing", async () => {
+		// The one loop branch that consumes no candidate needs its own bound.
+		h.promptText.mockResolvedValueOnce("3").mockResolvedValue("nonsense");
 
 		await promptSetup();
 
-		expect(h.saveConfigScoped).toHaveBeenCalledWith(
-			expect.objectContaining({ aiProvider: "local-agent", localAgentTool: "claude-code" }),
-			GLOBAL_CONFIG_DIR,
-		);
+		expect(h.saveConfigScoped).not.toHaveBeenCalled();
 	});
 
 	it("persists cursor-agent (the 3rd listed tool)", async () => {
@@ -142,5 +215,260 @@ describe("EnableCommand — promptSetup local-agent tool selection", () => {
 			expect.objectContaining({ aiProvider: "local-agent", localAgentTool: "cursor-agent" }),
 			GLOBAL_CONFIG_DIR,
 		);
+	});
+});
+
+describe("promptSetup — local agent auto-select", () => {
+	it("auto-selects silently when exactly one tool is present and usable", async () => {
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([{ id: "codex", label: "Codex" }]);
+		vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(true);
+		await promptSetup();
+		expect(savedConfig).toMatchObject({ aiProvider: "local-agent", localAgentTool: "codex" });
+		expect(promptText).not.toHaveBeenCalled();
+	});
+
+	it("falls through to the provider menu when the single present tool fails its probe", async () => {
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([{ id: "codex", label: "Codex" }]);
+		vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(false);
+		promptText.mockResolvedValue("4"); // Skip
+		await promptSetup();
+		expect(savedConfig).toBeUndefined();
+		expect(output).toContain("How would you like to generate summaries?");
+	});
+
+	it("prompts when two or more tools are present", async () => {
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([
+			{ id: "claude-code", label: "Claude Code" },
+			{ id: "opencode", label: "OpenCode" },
+		]);
+		vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(true);
+		promptText.mockResolvedValue("2");
+		await promptSetup();
+		expect(savedConfig).toMatchObject({ aiProvider: "local-agent", localAgentTool: "opencode" });
+	});
+
+	it("still routes to local agents when a KEYLESS aiProvider is left over on disk", async () => {
+		// The route used to be gated on `aiProvider === undefined`, i.e. "the field
+		// was never written" as a proxy for "the user never chose". VS Code's
+		// Settings panel breaks that proxy: it DERIVES a provider for display when
+		// the field is unset (not signed in → "anthropic") and persists it on the
+		// next Apply — even an Apply that only touched an unrelated field. That one
+		// stray write permanently closed the local-agent route on a machine with
+		// agents installed, sending the user to the top-level provider menu forever.
+		// A provider with no key behind it is a stale preference, not a decision.
+		h.loadConfigFromDir.mockResolvedValue({ aiProvider: "anthropic" } as Partial<JolliMemoryConfig>);
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([{ id: "codex", label: "Codex" }]);
+		vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(true);
+
+		await promptSetup();
+
+		expect(savedConfig).toMatchObject({ aiProvider: "local-agent", localAgentTool: "codex" });
+		expect(output).not.toContain("How would you like to generate summaries?");
+	});
+
+	it("does NOT route to local agents when a REAL Anthropic key backs the provider", async () => {
+		// The other half of the same contract: an actual credential is a decision to
+		// honour, so detection must not second-guess it even with tools installed.
+		h.loadConfigFromDir.mockResolvedValue({
+			aiProvider: "anthropic",
+			apiKey: "sk-ant-real",
+		} as Partial<JolliMemoryConfig>);
+		const present = vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([{ id: "codex", label: "Codex" }]);
+		promptText.mockResolvedValue("4"); // Skip at the provider menu.
+
+		await promptSetup();
+
+		expect(present).not.toHaveBeenCalled();
+		expect(output).toContain("How would you like to generate summaries?");
+		expect(savedConfig).toBeUndefined();
+	});
+
+	it("re-prompts when the chosen tool fails its probe, writing nothing", async () => {
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([
+			{ id: "claude-code", label: "Claude Code" },
+			{ id: "opencode", label: "OpenCode" },
+		]);
+		vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+		// A failed tool is REMOVED from the menu, so the second round renumbers:
+		// OpenCode becomes choice 1. Both answers are "1" against the freshly
+		// printed list — which is also what stops a held-Enter run from
+		// re-probing the same broken tool.
+		promptText.mockResolvedValueOnce("1").mockResolvedValueOnce("1");
+		await promptSetup();
+		expect(output).toContain("OpenCode");
+		expect(savedConfig).toMatchObject({ localAgentTool: "opencode" });
+	});
+
+	it("shows the provider menu unchanged when no tool is present", async () => {
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([]);
+		promptText.mockResolvedValue("4");
+		await promptSetup();
+		expect(output).toContain("How would you like to generate summaries?");
+	});
+});
+
+describe("menu choice 3 — explicit local agent", () => {
+	it("lists only present tools", async () => {
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([
+			{ id: "codex", label: "Codex" },
+			{ id: "opencode", label: "OpenCode" },
+		]);
+		vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(true);
+		promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("1");
+		await promptSetup();
+		expect(output).toContain("1. Codex");
+		expect(output).toContain("2. OpenCode");
+		expect(output).not.toContain("Cursor");
+	});
+
+	it("falls back to all four with a note when none are present", async () => {
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([]);
+		vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(true);
+		promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("1");
+		await promptSetup();
+		expect(output).toContain("None detected");
+		expect(output).toContain("Cursor");
+	});
+
+	it("terminates with install guidance, writing nothing, when the only listed tool fails its probe", async () => {
+		// Exactly one tool present: promptSetup's own fresh-config check probes
+		// it, the probe fails, and it falls through to the top-level menu (per
+		// the "1 present but unusable → menu" row). Choosing menu option "3"
+		// re-detects the same single tool and re-probes it inside
+		// handleLocalAgent's loop, which must empty the candidate list and return
+		// rather than looping forever waiting for a second promptText answer that
+		// never comes.
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([{ id: "codex", label: "Codex" }]);
+		vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(false);
+		promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("1");
+		await promptSetup();
+		expect(output).toContain("Codex isn't usable on this machine — nothing was saved.");
+		// Detected-but-broken: "install one" would be a wrong diagnosis for a user
+		// who already has it on disk (that wording is reserved for the blind list).
+		expect(output).toContain("Every detected tool failed to run");
+		expect(savedConfig).toBeUndefined();
+		// Exactly the top-menu choice + the one submenu answer — proves the loop
+		// returned instead of prompting again.
+		expect(h.promptText).toHaveBeenCalledTimes(2);
+	});
+
+	it("terminates (rather than reprompting forever) when 2+ candidates all keep failing their probe", async () => {
+		// Regression for the deterministic hang: with 2+ candidates that never
+		// pass their probe, the old `for(;;)` loop only ever returned on
+		// `list.length === 1`, so it reprompted forever. A fresh config with
+		// 2+ present tools drives straight into handleLocalAgent's submenu
+		// (see "prompts when two or more tools are present" above), and
+		// promptText here always answers "1" (never "Skip"), so the ONLY thing
+		// that can stop this test from hanging until the test-runner's timeout
+		// is the loop shrinking its own candidate list. The low `it()` timeout
+		// below means a reintroduced unbounded loop fails fast via timeout
+		// instead of hanging the whole suite.
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([
+			{ id: "claude-code", label: "Claude Code" },
+			{ id: "opencode", label: "OpenCode" },
+		]);
+		const usable = vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(false);
+		promptText.mockResolvedValue("1");
+
+		await promptSetup();
+
+		expect(output).toContain("Every detected tool failed to run");
+		// Each failed tool is removed, so the loop runs exactly once per
+		// candidate — never re-probing a tool already known to be broken.
+		expect(usable).toHaveBeenCalledTimes(2);
+		// Exhausting the auto-routed picker hands the user back the provider menu
+		// (see the dedicated test below), where the always-"1" answer takes
+		// browser sign-in — hence the third prompt.
+		expect(h.promptText.mock.calls.length).toBe(3);
+		expect(h.browserLogin).toHaveBeenCalledTimes(1);
+	}, 2000);
+
+	it("falls through to the provider menu when every auto-routed candidate fails its probe", async () => {
+		// The user never ASKED for a local agent here — detection routed them into
+		// the picker. Dead-ending there ("install one, then run jolli enable
+		// again") stranded a multi-tool machine with no way to reach browser
+		// sign-in or an Anthropic key in the same run.
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([
+			{ id: "claude-code", label: "Claude Code" },
+			{ id: "opencode", label: "OpenCode" },
+		]);
+		vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(false);
+		// Two failing picks, then the provider menu's "2" (Anthropic key), then the
+		// key itself.
+		promptText
+			.mockResolvedValueOnce("1")
+			.mockResolvedValueOnce("1")
+			.mockResolvedValueOnce("2")
+			.mockResolvedValueOnce("sk-ant-test");
+
+		await promptSetup();
+
+		expect(output).toContain("How would you like to generate summaries?");
+		expect(savedConfig).toEqual({ apiKey: "sk-ant-test", aiProvider: "anthropic" });
+	}, 2000);
+
+	it("does NOT re-offer the provider menu when the user skips the auto-routed picker", async () => {
+		// Skip is the user's own decision and already names where to configure
+		// later — re-asking would read as the command ignoring the answer.
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([
+			{ id: "claude-code", label: "Claude Code" },
+			{ id: "opencode", label: "OpenCode" },
+		]);
+		vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(true);
+		promptText.mockResolvedValueOnce("3");
+
+		await promptSetup();
+
+		expect(output).not.toContain("How would you like to generate summaries?");
+		expect(savedConfig).toBeUndefined();
+		expect(h.promptText).toHaveBeenCalledTimes(1);
+	});
+
+	it("offers an explicit Skip choice in the local-agent submenu and honors it without probing", async () => {
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([
+			{ id: "claude-code", label: "Claude Code" },
+			{ id: "opencode", label: "OpenCode" },
+		]);
+		const usable = vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(true);
+		// Fresh config + 2 present tools enters the submenu directly (no
+		// top-level menu). Submenu lists 2 tools, so "Skip for now" is choice 3.
+		promptText.mockResolvedValue("3");
+
+		await promptSetup();
+
+		expect(output).toContain("3. Skip for now (configure later)");
+		expect(savedConfig).toBeUndefined();
+		expect(usable).not.toHaveBeenCalled();
+	});
+
+	it("threads config.localAgentPath into the probe for the two-or-more-present picker", async () => {
+		h.loadConfigFromDir.mockResolvedValue({ localAgentPath: "/custom/bin/tool" } as Partial<JolliMemoryConfig>);
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([
+			{ id: "claude-code", label: "Claude Code" },
+			{ id: "opencode", label: "OpenCode" },
+		]);
+		const usable = vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(true);
+		promptText.mockResolvedValue("1");
+
+		await promptSetup();
+
+		// Tool-SCOPED: the config names no localAgentTool, so the override binds to
+		// the "claude-code" default and reaches the probe only for that tool.
+		expect(usable).toHaveBeenCalledWith("claude-code", {
+			override: { tool: "claude-code", path: "/custom/bin/tool" },
+		});
+	});
+
+	it("threads config.localAgentPath into the probe for the explicit menu-choice-3 submenu", async () => {
+		h.loadConfigFromDir.mockResolvedValue({ localAgentPath: "/custom/bin/codex" } as Partial<JolliMemoryConfig>);
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([]);
+		const usable = vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(true);
+		promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("1");
+
+		await promptSetup();
+
+		expect(usable).toHaveBeenCalledWith("claude-code", {
+			override: { tool: "claude-code", path: "/custom/bin/codex" },
+		});
 	});
 });

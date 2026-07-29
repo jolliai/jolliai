@@ -80,6 +80,7 @@ export interface StatusSnapshot extends Snapshot<StatusChangeReason> {
 const INITIAL_DERIVED: StatusDerived = {
 	hasApiKey: false,
 	signedIn: false,
+	usesLocalAgent: false,
 	allHooksInstalled: false,
 	hooksDescription: "none installed",
 };

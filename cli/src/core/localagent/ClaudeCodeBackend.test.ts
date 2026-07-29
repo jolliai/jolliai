@@ -1,7 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ClaudeCodeBackend } from "./ClaudeCodeBackend.js";
+import * as resolver from "./ExecutableResolver.js";
 import { LocalAgentAuthError, LocalAgentSetupError, LocalAgentTransientError } from "./Types.js";
 
 const successFixture = readFileSync(
@@ -205,5 +206,17 @@ describe("ClaudeCodeBackend.buildInvocation with launcher args", () => {
 			{ prompt: "p", model: "m", systemPrompt: "s" },
 		);
 		expect(inv.args.slice(0, 2)).toEqual(["cli.js", "-p"]);
+	});
+});
+
+describe("ClaudeCodeBackend.isPresent", () => {
+	it("is false for an override path that does not exist", () => {
+		expect(new ClaudeCodeBackend().isPresent("/nonexistent/path/to/claude")).toBe(false);
+	});
+
+	it("delegates to the CLAUDE_SPEC discovery, not another tool's", () => {
+		const spy = vi.spyOn(resolver, "isPresent").mockReturnValue(true);
+		expect(new ClaudeCodeBackend().isPresent()).toBe(true);
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ binName: "claude" }), { overridePath: undefined });
 	});
 });

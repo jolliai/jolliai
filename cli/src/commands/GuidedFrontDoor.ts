@@ -3,8 +3,8 @@
  *
  * It reads two orthogonal capabilities and guides the next step:
  *   - can generate — is there a usable engine (`canGenerateNow`)? For the local
- *     agent this actually probes that `claude` is runnable, so a broken CLI is
- *     caught here rather than silently at commit time.
+ *     agent this actually probes that the CONFIGURED tool is runnable, so a
+ *     broken CLI is caught here rather than silently at commit time.
  *   - can sync     — is there any Jolli credential (OAuth token or jolliApiKey)
  *                    to push memories to a Space?
  *
@@ -22,6 +22,7 @@
 import { basename } from "node:path";
 import { loadAuthToken } from "../auth/AuthConfig.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
+import { localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getSummaryCount, setActiveStorage } from "../core/SummaryStore.js";
@@ -131,12 +132,12 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	}
 
 	// ── Two orthogonal capabilities, recomputed after each interactive step. ──
-	let canGenerate = canGenerateNow(config);
+	let canGenerate = await canGenerateNow(config);
 	let canSync = Boolean(token || config.jolliApiKey);
 
 	// ── Rung 1 (blocking): a credential exists but the chosen provider can't use
 	// it → repair the provider mismatch. Covers R1/R2 (anthropic/jolli) and R3 (a
-	// configured local agent whose `claude` isn't runnable). `hasCredential()`
+	// configured local agent whose tool isn't runnable). `hasCredential()`
 	// excludes the fresh user who just skipped setup (nothing to repair). ──
 	if (!canGenerate && hasCredential()) {
 		await promptGenerationFix(config);
@@ -145,7 +146,7 @@ export async function runGuidedFrontDoor(): Promise<void> {
 		// Recompute from the freshly-saved config, not the fix's optimistic return:
 		// a switch to Jolli only actually restores generation if a jolliApiKey now
 		// exists, so trust canGenerateNow.
-		canGenerate = canGenerateNow(config);
+		canGenerate = await canGenerateNow(config);
 		canSync = Boolean(token || config.jolliApiKey);
 	}
 
@@ -158,7 +159,7 @@ export async function runGuidedFrontDoor(): Promise<void> {
 		// Signing in can flip an unset provider to "jolli"; if no jolliApiKey was
 		// minted, generation is no longer possible — recompute so the closing
 		// "listening" promise stays honest.
-		canGenerate = canGenerateNow(config);
+		canGenerate = await canGenerateNow(config);
 		canSync = Boolean(token || config.jolliApiKey);
 	}
 
@@ -194,7 +195,10 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	// ── Status line (AFTER enable, so `✓ enabled` is always truthful). ──
 	if (token) {
 		const site = siteHost(config.jolliUrl);
-		const engine = canGenerate && config.aiProvider === "local-agent" ? " · summaries via Claude Code" : "";
+		const engine =
+			canGenerate && config.aiProvider === "local-agent"
+				? ` · summaries via ${localAgentToolLabel(config.localAgentTool ?? "claude-code")}`
+				: "";
 		console.log(site ? `\n  ✓ signed in · ${site}${engine}` : `\n  ✓ signed in${engine}`);
 	} else if (canGenerate && config.aiProvider === "local-agent") {
 		console.log("\n  ✓ local agent set (not signed in to Jolli)");

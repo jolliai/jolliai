@@ -3,11 +3,8 @@ import { homedir } from "node:os";
 import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSyncHidden } from "../../util/Subprocess.js";
-import {
-	__resetResolverCacheForTest,
-	isClaudeCodeUsable,
-	resolveClaudeExecutable,
-} from "./ClaudeExecutableResolver.js";
+import { __resetResolverCacheForTest, resolveClaudeExecutable } from "./ClaudeExecutableResolver.js";
+import { isLocalAgentUsable } from "./DetectAgents.js";
 import { LocalAgentSetupError } from "./Types.js";
 
 vi.mock("../../util/Subprocess.js", () => ({ execFileSyncHidden: vi.fn() }));
@@ -322,20 +319,44 @@ describe("resolveClaudeExecutable", () => {
 	});
 });
 
-describe("isClaudeCodeUsable", () => {
-	it("true when a candidate resolves", () => {
+// Migrated from the former `isClaudeCodeUsable` (deleted alongside the
+// Claude-only fast path in EnableCommand.ts): same two behaviors, now exercised
+// through the registry-backed `isLocalAgentUsable("claude-code", …)` seam.
+// `isLocalAgentUsable` has no candidates/probe/now injection points of its own
+// — it goes through the real `discover()` + default probe — so these mock
+// `execFileSyncHidden` / `existsSync` (both already module-mocked above) the
+// same way the "default candidates/probe" suite does, rather than injecting
+// fakes directly.
+describe("isLocalAgentUsable (claude-code)", () => {
+	const mockedExecFileSync = vi.mocked(execFileSyncHidden);
+	const mockedExistsSync = vi.mocked(existsSync);
+
+	beforeEach(() => {
 		__resetResolverCacheForTest();
-		expect(
-			isClaudeCodeUsable({
-				candidates: () => [{ file: "/a/claude" }],
-				probe: () => ({ ok: true, version: "1.0.0" }),
-				now: () => 1000,
-			}),
-		).toBe(true);
+		mockedExecFileSync.mockReset();
+		mockedExistsSync.mockReset();
+		mockedExistsSync.mockReturnValue(false);
 	});
 
-	it("false when nothing resolves (resolveClaudeExecutable throws)", () => {
-		__resetResolverCacheForTest();
-		expect(isClaudeCodeUsable({ candidates: () => [], probe: () => ({ ok: false }), now: () => 1000 })).toBe(false);
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("true when a candidate resolves", async () => {
+		mockedExecFileSync.mockImplementation((file: unknown) => {
+			if (file === "which" || file === "where") return "/usr/local/bin/claude\n";
+			return "1.0.0\n";
+		});
+
+		await expect(isLocalAgentUsable("claude-code")).resolves.toBe(true);
+	});
+
+	it("false when nothing resolves (resolveClaudeExecutable throws)", async () => {
+		mockedExecFileSync.mockImplementation((file: unknown) => {
+			if (file === "which" || file === "where") throw new Error("not found");
+			return "1.0.0\n";
+		});
+
+		await expect(isLocalAgentUsable("claude-code")).resolves.toBe(false);
 	});
 });

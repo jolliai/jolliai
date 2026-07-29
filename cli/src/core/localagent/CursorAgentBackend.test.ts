@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CursorAgentBackend, cursorKnownPaths, expandCursorShim } from "./CursorAgentBackend.js";
+import * as resolver from "./ExecutableResolver.js";
 import { LocalAgentAuthError, LocalAgentSetupError } from "./Types.js";
 
 const fixture = readFileSync(join(__dirname, "__fixtures__/cursor-agent/success.json"), "utf8");
@@ -148,5 +149,19 @@ describe("CursorAgentBackend.buildInvocation with a resolved Windows launcher", 
 		);
 		expect(inv.file).toBe(node);
 		expect(inv.args).toEqual(["--use-system-ca", entry, "-p", "--output-format", "json", "--trust", "hi"]);
+	});
+});
+
+describe("CursorAgentBackend.isPresent", () => {
+	it("is false for an override path that does not exist", () => {
+		expect(new CursorAgentBackend().isPresent("/nonexistent/path/to/cursor-agent")).toBe(false);
+	});
+
+	it("delegates to the CURSOR_SPEC discovery, not another tool's", () => {
+		const spy = vi.spyOn(resolver, "isPresent").mockReturnValue(true);
+		expect(new CursorAgentBackend().isPresent()).toBe(true);
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ binName: "cursor-agent" }), {
+			overridePath: undefined,
+		});
 	});
 });

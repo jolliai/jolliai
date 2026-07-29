@@ -8,6 +8,11 @@ const { getWorkspaceRoot, resolveCLIPath } = vi.hoisted(() => ({
 	resolveCLIPath: vi.fn(),
 }));
 
+const { listPresentLocalAgents, isLocalAgentUsable } = vi.hoisted(() => ({
+	listPresentLocalAgents: vi.fn(() => [] as Array<{ id: string; label: string }>),
+	isLocalAgentUsable: vi.fn(async () => true),
+}));
+
 const {
 	info,
 	warn,
@@ -38,8 +43,9 @@ const { manuallyDisabledState, setManuallyDisabledMock, isManuallyDisabledMock }
 	};
 });
 
-const { mockNotifyApiKeySaveError } = vi.hoisted(() => ({
+const { mockNotifyApiKeySaveError, mockNotifyLocalAgentSelectError } = vi.hoisted(() => ({
 	mockNotifyApiKeySaveError: vi.fn(),
+	mockNotifyLocalAgentSelectError: vi.fn(),
 }));
 
 const { triggerPendingPushRetry } = vi.hoisted(() => ({
@@ -55,13 +61,21 @@ const { mockRefreshKnowledgeBaseFolders, mockClearKnowledgeBaseFolderDivergence 
 	mockClearKnowledgeBaseFolderDivergence: vi.fn(),
 }));
 
-const { mockNotifyEnabledChanged, mockNotifyAuthChanged, mockToggleStatus, mockNotifyColdStart } =
-	vi.hoisted(() => ({
-		mockNotifyEnabledChanged: vi.fn(),
-		mockNotifyAuthChanged: vi.fn(),
-		mockToggleStatus: vi.fn(),
-		mockNotifyColdStart: vi.fn(),
-	}));
+const {
+	mockNotifyEnabledChanged,
+	mockNotifyAuthChanged,
+	mockToggleStatus,
+	mockNotifyColdStart,
+	mockNotifyConfiguredChanged,
+	mockNotifyLocalAgentsChanged,
+} = vi.hoisted(() => ({
+	mockNotifyEnabledChanged: vi.fn(),
+	mockNotifyAuthChanged: vi.fn(),
+	mockToggleStatus: vi.fn(),
+	mockNotifyColdStart: vi.fn(),
+	mockNotifyConfiguredChanged: vi.fn(),
+	mockNotifyLocalAgentsChanged: vi.fn(),
+}));
 
 const { isWorkerBusy, readIngestPhase } = vi.hoisted(() => ({
 	isWorkerBusy: vi.fn(),
@@ -669,6 +683,15 @@ vi.mock("../../cli/src/core/DiscoveryCatchUp.js", () => ({
 	catchUpTranscriptDiscovery,
 }));
 
+// Partial mock: the detection/probe seams are stubbed, but `localAgentOverrideFrom`
+// (a pure config→override mapper) stays real so the tool-scoping rule is exercised
+// rather than re-implemented here.
+vi.mock("../../cli/src/core/localagent/DetectAgents.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../cli/src/core/localagent/DetectAgents.js")>()),
+	listPresentLocalAgents,
+	isLocalAgentUsable,
+}));
+
 // Mock the KB folder-mode dependencies so the auto-migration path in `activate`
 // and the rebuildKnowledgeBase command run with predictable, side-effect-free
 // stand-ins. Each test that exercises those paths overrides the relevant helper
@@ -979,12 +1002,17 @@ vi.mock("./views/SidebarWebviewProvider.js", () => ({
 		notifyColdStart = mockNotifyColdStart;
 		toggleStatus = mockToggleStatus;
 		notifyAuthChanged = mockNotifyAuthChanged;
-		notifyConfiguredChanged() {}
+		notifyConfiguredChanged = mockNotifyConfiguredChanged;
+		notifyLocalAgentsChanged = mockNotifyLocalAgentsChanged;
 		setBadge() {}
 		// Tracked via a shared vi.fn so saveAnthropicApiKey-error tests can
 		// assert the failure-path message routing without needing access to
 		// the constructed instance.
 		notifyApiKeySaveError = mockNotifyApiKeySaveError;
+		// Tracked via a shared vi.fn so selectLocalAgentTool-error tests can
+		// assert the failure-path message routing without needing access to
+		// the constructed instance.
+		notifyLocalAgentSelectError = mockNotifyLocalAgentSelectError;
 	},
 }));
 
@@ -1229,6 +1257,8 @@ describe("Extension", () => {
 		isWorkerBusy.mockResolvedValue(false);
 		readIngestPhase.mockResolvedValue({ busy: false, phase: null });
 		loadConfig.mockResolvedValue({});
+		listPresentLocalAgents.mockReturnValue([]);
+		isLocalAgentUsable.mockResolvedValue(true);
 
 		// Reset provider mocks to defaults
 		for (const p of [
@@ -2429,6 +2459,44 @@ describe("Extension", () => {
 					"refreshStatus failed: status fetch failed",
 					expect.any(Error),
 				);
+			});
+		});
+
+		// The onboarding-vs-main-UI gate registered via `statusStore.onChange`
+		// (Extension.ts ~1483): `nextConfigured = signedIn || hasApiKey ||
+		// usesLocalAgent`. `usesLocalAgent` widens the gate on config INTENT
+		// alone — losing the agent binary later must not flip this back to
+		// false, so there's no "binary present" input for this callback to
+		// observe in the first place.
+		describe("statusStore configured gate", () => {
+			// `ctx`/`activate(ctx)` already ran in the enclosing "command
+			// handlers" beforeEach, which registered the callback we're after.
+			function invokeStatusChange(derived: Record<string, boolean>) {
+				const onChangeCallback = mockStatusStore.onChange.mock.calls[0]?.[0] as (snap: {
+					derived: Record<string, boolean>;
+					status: { enabled: boolean } | null;
+				}) => void;
+				onChangeCallback({ derived, status: null });
+			}
+
+			it("is configured when usesLocalAgent is true even with no key and no sign-in", () => {
+				invokeStatusChange({
+					signedIn: false,
+					hasApiKey: false,
+					usesLocalAgent: true,
+				});
+
+				expect(mockNotifyConfiguredChanged).toHaveBeenCalledWith(true);
+			});
+
+			it("is not configured when signedIn, hasApiKey, and usesLocalAgent are all false", () => {
+				invokeStatusChange({
+					signedIn: false,
+					hasApiKey: false,
+					usesLocalAgent: false,
+				});
+
+				expect(mockNotifyConfiguredChanged).not.toHaveBeenCalled();
 			});
 		});
 
@@ -7349,6 +7417,163 @@ describe("Extension", () => {
 		});
 	});
 
+	describe("selectLocalAgentTool command", () => {
+		// Onboarding local-agent-card "Use Local Agent Tool" button path. The
+		// capability probe (isLocalAgentUsable) runs here, once, for the tool the
+		// user picked — the onboarding sweep (listPresentLocalAgents) stays
+		// presence-only. Success is implicit: saveConfigScoped + statusStore.refresh
+		// flip `configured`, which rides the existing configured:changed channel —
+		// only failures post localAgent:selectError.
+
+		it("registers the selectLocalAgentTool command", () => {
+			activate(makeContext());
+			const handler = getRegisteredCommand("jollimemory.selectLocalAgentTool");
+			expect(handler).toBeDefined();
+		});
+
+		it("saves aiProvider:'local-agent' + the chosen tool and refreshes statusStore when the probe passes", async () => {
+			activate(makeContext());
+			isLocalAgentUsable.mockResolvedValueOnce(true);
+			saveConfigScoped.mockResolvedValueOnce(undefined);
+			mockStatusStore.refresh.mockClear();
+
+			const handler = getRegisteredCommand("jollimemory.selectLocalAgentTool");
+			await handler("codex");
+
+			expect(isLocalAgentUsable).toHaveBeenCalledWith("codex", { overridePath: undefined });
+			expect(saveConfigScoped).toHaveBeenCalledWith(
+				{ aiProvider: "local-agent", localAgentTool: "codex" },
+				"/home/user/.jolli/jollimemory",
+			);
+			expect(mockStatusStore.refresh).toHaveBeenCalled();
+			expect(mockNotifyLocalAgentSelectError).not.toHaveBeenCalled();
+		});
+
+		it("forwards a configured localAgentPath override to the probe when it names the chosen tool", async () => {
+			activate(makeContext());
+			loadConfig.mockResolvedValueOnce({
+				localAgentTool: "codex",
+				localAgentPath: "/opt/homebrew/bin/codex",
+			});
+			isLocalAgentUsable.mockResolvedValueOnce(true);
+			saveConfigScoped.mockResolvedValueOnce(undefined);
+
+			const handler = getRegisteredCommand("jollimemory.selectLocalAgentTool");
+			await handler("codex");
+
+			expect(isLocalAgentUsable).toHaveBeenCalledWith("codex", {
+				override: { tool: "codex", path: "/opt/homebrew/bin/codex" },
+			});
+		});
+
+		it("does not lend one tool's configured path to a different tool's probe", async () => {
+			// The override is tool-scoped: picking OpenCode while `localAgentPath`
+			// points at Codex's binary must auto-discover OpenCode, not probe
+			// Codex's file and call the answer OpenCode's.
+			activate(makeContext());
+			loadConfig.mockResolvedValueOnce({
+				localAgentTool: "codex",
+				localAgentPath: "/opt/homebrew/bin/codex",
+			});
+			isLocalAgentUsable.mockResolvedValueOnce(true);
+			saveConfigScoped.mockResolvedValueOnce(undefined);
+
+			const handler = getRegisteredCommand("jollimemory.selectLocalAgentTool");
+			await handler("opencode");
+
+			expect(isLocalAgentUsable).toHaveBeenCalledWith("opencode", {
+				override: { tool: "codex", path: "/opt/homebrew/bin/codex" },
+			});
+			// isLocalAgentUsable itself drops the mismatched override — asserted
+			// directly in DetectAgents.test.ts.
+		});
+
+		it("writes nothing and reports an error naming the tool when the probe fails", async () => {
+			activate(makeContext());
+			isLocalAgentUsable.mockResolvedValueOnce(false);
+
+			const handler = getRegisteredCommand("jollimemory.selectLocalAgentTool");
+			await handler("codex");
+
+			expect(saveConfigScoped).not.toHaveBeenCalled();
+			expect(mockNotifyLocalAgentSelectError).toHaveBeenCalledWith(
+				"Found Codex, but it didn't respond as expected. Try another tool.",
+			);
+		});
+
+		it("rejects an unrecognized tool id without probing or writing", async () => {
+			activate(makeContext());
+
+			const handler = getRegisteredCommand("jollimemory.selectLocalAgentTool");
+			await handler("evil-tool");
+
+			expect(isLocalAgentUsable).not.toHaveBeenCalled();
+			expect(saveConfigScoped).not.toHaveBeenCalled();
+			expect(mockNotifyLocalAgentSelectError).toHaveBeenCalledWith(
+				"Unknown local agent tool.",
+			);
+		});
+
+		it("rejects non-string input (defensive against malformed webview message) without probing or saving", async () => {
+			activate(makeContext());
+
+			const handler = getRegisteredCommand("jollimemory.selectLocalAgentTool");
+			await handler(42 as unknown);
+
+			expect(isLocalAgentUsable).not.toHaveBeenCalled();
+			expect(saveConfigScoped).not.toHaveBeenCalled();
+			expect(mockNotifyLocalAgentSelectError).toHaveBeenCalledWith(
+				"Unknown local agent tool.",
+			);
+		});
+
+		// Regression: the allow-list used to read as `rawTool in LOCAL_AGENT_TOOLS`,
+		// which walks the prototype chain — `"toString"` / `"constructor"` pass
+		// that check even though they are never own keys of LOCAL_AGENT_TOOLS.
+		// Object.hasOwn closes that gap.
+		it("rejects a prototype-chain key ('toString') without probing or saving", async () => {
+			activate(makeContext());
+
+			const handler = getRegisteredCommand("jollimemory.selectLocalAgentTool");
+			await handler("toString");
+
+			expect(isLocalAgentUsable).not.toHaveBeenCalled();
+			expect(saveConfigScoped).not.toHaveBeenCalled();
+			expect(mockNotifyLocalAgentSelectError).toHaveBeenCalledWith(
+				"Unknown local agent tool.",
+			);
+		});
+
+		it("posts localAgent:selectError with the error message when saveConfigScoped throws", async () => {
+			activate(makeContext());
+			isLocalAgentUsable.mockResolvedValueOnce(true);
+			saveConfigScoped.mockRejectedValueOnce(new Error("EROFS: read-only fs"));
+
+			const handler = getRegisteredCommand("jollimemory.selectLocalAgentTool");
+			await handler("codex");
+
+			expect(mockNotifyLocalAgentSelectError).toHaveBeenCalledWith(
+				"EROFS: read-only fs",
+			);
+		});
+
+		// Defensive fallback: a non-Error rejection (a plain string from a
+		// misbehaving lower layer) must still surface a user-readable message
+		// via notifyLocalAgentSelectError rather than blowing up the selection flow.
+		it("falls back to a generic message naming the tool when saveConfigScoped rejects with a non-Error", async () => {
+			activate(makeContext());
+			isLocalAgentUsable.mockResolvedValueOnce(true);
+			saveConfigScoped.mockRejectedValueOnce("plain-string-failure");
+
+			const handler = getRegisteredCommand("jollimemory.selectLocalAgentTool");
+			await handler("codex");
+
+			expect(mockNotifyLocalAgentSelectError).toHaveBeenCalledWith(
+				"Failed to select Codex.",
+			);
+		});
+	});
+
 	describe("URI handler", () => {
 		it("registers a URI handler on activation", () => {
 			const ctx = makeContext();
@@ -8046,6 +8271,125 @@ describe("Extension", () => {
 			mockNotifyColdStart.mockClear();
 			await runEnable();
 			expect(mockNotifyColdStart).toHaveBeenCalledWith(expect.objectContaining({ coldStartVariant: null }));
+		});
+	});
+
+	// ── Local agent detection under the initialStateReady barrier ──────────
+	// detectLocalAgents() runs inside initialLoad's `.finally`, right beside
+	// computeColdStartSignals and before resolveInitialStateReady, so the
+	// first `init` message already carries the answer (no reshuffle).
+	describe("local agent detection (onboarding card)", () => {
+		function localAgentsState(): { localAgents?: Array<{ id: string; label: string }> } {
+			return (
+				sidebarDepsCaptured as {
+					getInitialState: () => { localAgents?: Array<{ id: string; label: string }> };
+				}
+			).getInitialState();
+		}
+
+		it("carries detected local agents on the first init message", async () => {
+			listPresentLocalAgents.mockReturnValue([{ id: "codex", label: "Codex" }]);
+			activate(makeContext());
+			// Poll until initialLoad's .finally(async …) has run detectLocalAgents,
+			// rather than guessing a tick count — matches the file's established
+			// vi.waitFor convention for async-settling assertions.
+			await vi.waitFor(() => {
+				expect(localAgentsState().localAgents).toEqual([{ id: "codex", label: "Codex" }]);
+			});
+		});
+
+		it("skips detection entirely when already configured", async () => {
+			activate(makeContext());
+			// Flip currentConfigured to true via the same statusStore.onChange
+			// callback the "statusStore configured gate" tests use, BEFORE letting
+			// initialLoad's .finally settle, so detectLocalAgents observes
+			// currentConfigured === true and short-circuits.
+			const onChangeCallback = mockStatusStore.onChange.mock.calls[0]?.[0] as (snap: {
+				derived: Record<string, boolean>;
+				status: { enabled: boolean } | null;
+			}) => void;
+			onChangeCallback({
+				derived: { signedIn: true, hasApiKey: false, usesLocalAgent: false },
+				status: null,
+			});
+			// "never called" can't itself be expressed as a positive vi.waitFor
+			// condition — it's equally true before AND after the barrier settles,
+			// so polling it would pass instantly without proving the barrier ever
+			// ran. Instead, await the exact barrier promise the SidebarWebviewProvider
+			// dep receives (`initialStateReady` — the same promise `detectLocalAgents`
+			// and `resolveInitialStateReady` are sequenced under in Extension.ts's
+			// `.finally`), then assert the negative. This is deterministic — no
+			// fixed tick count, no polling interval — because it's the real
+			// settlement signal, not a proxy for it.
+			await (sidebarDepsCaptured as { initialStateReady: Promise<void> }).initialStateReady;
+			expect(listPresentLocalAgents).not.toHaveBeenCalled();
+			expect(localAgentsState().localAgents).toEqual([]);
+		});
+
+		// Onboarding is not a one-shot: `configured` can flip back to false
+		// mid-window (sign-out, cleared key) and re-raise the panel. Detection is
+		// skipped for configured users, so without a re-run + push the reappearing
+		// panel silently omits the local-agent card until the window is reloaded.
+		describe("configured flips back to false mid-window", () => {
+			function flipConfigured(configured: boolean): void {
+				const onChangeCallback = mockStatusStore.onChange.mock.calls[0]?.[0] as (snap: {
+					derived: Record<string, boolean>;
+					status: { enabled: boolean } | null;
+				}) => void;
+				onChangeCallback({
+					derived: { signedIn: configured, hasApiKey: false, usesLocalAgent: false },
+					status: null,
+				});
+			}
+
+			it("re-detects and pushes the refreshed list before the panel is shown", async () => {
+				activate(makeContext());
+				// Start configured, so the activation-path sweep short-circuits and the
+				// host's list is empty — the exact state that used to strand the card.
+				flipConfigured(true);
+				await (sidebarDepsCaptured as { initialStateReady: Promise<void> }).initialStateReady;
+				expect(listPresentLocalAgents).not.toHaveBeenCalled();
+
+				listPresentLocalAgents.mockReturnValue([{ id: "codex", label: "Codex" }]);
+				mockNotifyConfiguredChanged.mockClear();
+				flipConfigured(false);
+
+				expect(listPresentLocalAgents).toHaveBeenCalledTimes(1);
+				expect(mockNotifyLocalAgentsChanged).toHaveBeenCalledWith([{ id: "codex", label: "Codex" }]);
+				expect(localAgentsState().localAgents).toEqual([{ id: "codex", label: "Codex" }]);
+				// Ordering matters: the list must land BEFORE the panel is un-hidden,
+				// or the card renders one message late.
+				expect(mockNotifyLocalAgentsChanged.mock.invocationCallOrder[0]).toBeLessThan(
+					mockNotifyConfiguredChanged.mock.invocationCallOrder[0],
+				);
+			});
+
+			it("does not re-detect when configured flips to true", async () => {
+				activate(makeContext());
+				await (sidebarDepsCaptured as { initialStateReady: Promise<void> }).initialStateReady;
+				listPresentLocalAgents.mockClear();
+
+				flipConfigured(true);
+
+				expect(listPresentLocalAgents).not.toHaveBeenCalled();
+				expect(mockNotifyLocalAgentsChanged).not.toHaveBeenCalled();
+			});
+		});
+
+		it("degrades to an empty list when detection throws", async () => {
+			listPresentLocalAgents.mockImplementation(() => {
+				throw new Error("boom");
+			});
+			activate(makeContext());
+			// Poll for the sweep having actually run (and thrown) rather than a
+			// fixed tick count — [] alone can't distinguish "ran and degraded" from
+			// "never ran", so wait on the call + warn evidence together with the
+			// resulting state.
+			await vi.waitFor(() => {
+				expect(listPresentLocalAgents).toHaveBeenCalled();
+				expect(warn).toHaveBeenCalledWith("detectLocalAgents", "Detection failed", { error: "boom" });
+				expect(localAgentsState().localAgents).toEqual([]);
+			});
 		});
 	});
 

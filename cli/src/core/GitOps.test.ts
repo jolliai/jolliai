@@ -196,6 +196,34 @@ describe("GitOps", () => {
 			);
 		});
 
+		/**
+		 * git is gettext-localized: with translations installed and a non-English
+		 * LANG, its stderr comes back translated, which would silently defeat every
+		 * text-based classification we do on it (see GIT_ABSENT_STDERR_FRAGMENTS).
+		 * LC_ALL outranks LANG and LC_MESSAGES, so pinning it alone is sufficient.
+		 */
+		it("pins git's message locale so stderr stays parseable", async () => {
+			mockSuccess("main\n");
+			await execGit(["branch"]);
+			expect(mockExecFileAsync).toHaveBeenCalledWith(
+				"git",
+				["branch"],
+				expect.objectContaining({ env: expect.objectContaining({ LC_ALL: "C" }) }),
+			);
+		});
+
+		it("keeps the ambient environment while pinning the locale", async () => {
+			process.env.JOLLI_LOCALE_PIN_PROBE = "kept";
+			try {
+				mockSuccess("main\n");
+				await execGit(["branch"]);
+				const env = mockExecFileAsync.mock.calls.at(-1)?.[2]?.env as Record<string, string>;
+				expect(env.JOLLI_LOCALE_PIN_PROBE).toBe("kept");
+			} finally {
+				delete process.env.JOLLI_LOCALE_PIN_PROBE;
+			}
+		});
+
 		it("should handle command failure", async () => {
 			mockFailure(128, "fatal: not a git repository");
 			const result = await execGit(["status"]);
@@ -669,9 +697,67 @@ describe("GitOps", () => {
 		});
 
 		it("should return null when file does not exist", async () => {
-			mockFailure(128, "fatal: Path does not exist");
+			mockFailure(128, "fatal: path 'nonexistent.json' does not exist in 'branch'");
 			const content = await readFileFromBranch("branch", "nonexistent.json");
 			expect(content).toBeNull();
+		});
+
+		/**
+		 * Absence vs. failure classification (JOLLI-2066). Both exit 128, so only
+		 * stderr can tell them apart, and the caller sees an identical `null` —
+		 * making the log level the sole observable difference. Every `stderr`
+		 * string below is verbatim real `git show` output.
+		 */
+		describe("absence vs. read failure (JOLLI-2066)", () => {
+			const warnSpy = vi.mocked(console.warn);
+
+			beforeEach(() => {
+				warnSpy.mockClear();
+			});
+
+			it.each([
+				["path missing from an existing tree", "fatal: path 'x.json' does not exist in 'branch'"],
+				[
+					"path missing from disk and index",
+					"fatal: path 'x.json' does not exist (neither on disk nor in the index)",
+				],
+				["branch/ref absent (fresh repo)", "fatal: invalid object name 'branch'."],
+				[
+					"path present on disk but not on the branch",
+					"fatal: path 'x.json' exists on disk, but not in 'branch'",
+				],
+				[
+					"bare unknown revision",
+					"fatal: ambiguous argument 'x': unknown revision or path not in the working tree.",
+				],
+			])("stays quiet for absence: %s", async (_label, stderr) => {
+				mockFailure(128, stderr);
+
+				expect(await readFileFromBranch("branch", "x.json")).toBeNull();
+				expect(warnSpy).not.toHaveBeenCalled();
+			});
+
+			it.each([
+				["broken repo", 128, "fatal: not a git repository (or any of the parent directories): .git"],
+				["dubious ownership", 128, "fatal: detected dubious ownership in repository at '/repo'"],
+				["corrupt object database", 128, "fatal: object file .git/objects/ab/cdef does not exist"],
+				["git missing from PATH", 127, "spawn git ENOENT"],
+			])("warns for a real failure: %s", async (_label, code, stderr) => {
+				mockFailure(code, stderr);
+
+				expect(await readFileFromBranch("branch", "index.json")).toBeNull();
+				expect(warnSpy).toHaveBeenCalledTimes(1);
+				const logged = String(warnSpy.mock.calls[0]?.[0]);
+				expect(logged).toContain("Read failed for branch:index.json");
+				expect(logged).toContain(stderr);
+			});
+
+			it("labels an empty stderr rather than logging a blank reason", async () => {
+				mockFailure(1, "");
+
+				expect(await readFileFromBranch("branch", "index.json")).toBeNull();
+				expect(String(warnSpy.mock.calls[0]?.[0])).toContain("(no stderr)");
+			});
 		});
 	});
 

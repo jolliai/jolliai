@@ -171,6 +171,36 @@ describe("DoctorCommand — local-agent tool diagnostic", () => {
 		expect(joined).toContain("Run `claude` once and sign in");
 	});
 
+	it("names localAgentPath as the likely cause when the probe fails with one configured", async () => {
+		// An override short-circuits discovery, so a stale path IS the failure —
+		// including a path orphaned by an older version that didn't clear it on a
+		// tool switch. Nothing else tells the user discovery never ran.
+		h.loadConfig.mockResolvedValue({
+			localAgentTool: "cursor-agent",
+			localAgentPath: "/opt/codex",
+		} as Partial<JolliMemoryConfig>);
+		h.getBackend.mockReturnValue({
+			discoverExecutable: vi
+				.fn()
+				.mockRejectedValue(
+					new Error('Configured local agent path "/opt/codex" is not a working cursor-agent CLI.'),
+				),
+		});
+
+		const joined = (await runDoctor()).join("\n");
+
+		expect(joined).toContain("Discovery was skipped because localAgentPath is set");
+		expect(joined).toContain("jolli configure --remove localAgentPath");
+	});
+
+	it("omits the localAgentPath hint when the probe fails without one", async () => {
+		h.getBackend.mockReturnValue({
+			discoverExecutable: vi.fn().mockRejectedValue(new Error("claude not found")),
+		});
+
+		expect((await runDoctor()).join("\n")).not.toContain("localAgentPath");
+	});
+
 	it("skips the local-agent probe entirely when the credential source isn't local-agent", async () => {
 		h.resolveLlmCredentialSource.mockReturnValue("anthropic-config");
 

@@ -51,6 +51,13 @@ export interface LocalAgentBackend {
 	discoverExecutable(overridePath?: string): Promise<ResolvedExecutable>;
 	buildInvocation(exe: ResolvedExecutable, req: LocalAgentRequest): Invocation;
 	parseResult(stdout: string): LocalAgentOutcome;
+	/**
+	 * Cheap presence check — is this tool on disk? No capability probe, no
+	 * subprocess. Used by onboarding surfaces that must decide what to OFFER
+	 * before the user has committed to a tool; anything that must know the tool
+	 * actually RUNS calls `discoverExecutable` instead.
+	 */
+	isPresent(overridePath?: string): boolean;
 }
 
 /* v8 ignore start */

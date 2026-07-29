@@ -1,5 +1,5 @@
 import { createLocalAgentCwd, LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
-import { resolveClaudeExecutable } from "./ClaudeExecutableResolver.js";
+import { isClaudeCodePresent, resolveClaudeExecutable } from "./ClaudeExecutableResolver.js";
 import {
 	type Invocation,
 	LocalAgentAuthError,
@@ -48,6 +48,10 @@ export class ClaudeCodeBackend implements LocalAgentBackend {
 
 	discoverExecutable(overridePath?: string): Promise<ResolvedExecutable> {
 		return Promise.resolve(resolveClaudeExecutable({ overridePath }));
+	}
+
+	isPresent(overridePath?: string): boolean {
+		return isClaudeCodePresent({ overridePath });
 	}
 
 	buildInvocation(exe: ResolvedExecutable, req: LocalAgentRequest): Invocation {

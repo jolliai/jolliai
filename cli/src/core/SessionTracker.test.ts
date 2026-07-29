@@ -1461,6 +1461,105 @@ describe("SessionTracker", () => {
 			expect(() => JSON.parse(content)).not.toThrow();
 			expect(content).toContain("\t");
 		});
+
+		// The localAgentPath ownership invariant. `localAgentPath` names ONE tool's
+		// binary but is persisted without its owner, and an override
+		// short-circuits discovery — so a path left behind by a previous tool
+		// becomes the new tool's only launch candidate. Readers can't tell the
+		// difference; this write path is where the orphan is removed.
+		describe("localAgentPath ownership", () => {
+			const readSaved = async (dir: string): Promise<{ localAgentTool?: string; localAgentPath?: string }> =>
+				JSON.parse(await readFile(join(dir, "config.json"), "utf-8"));
+
+			it("clears an orphaned localAgentPath when the tool changes", async () => {
+				const targetDir = join(tempDir, "orphan-cleared");
+				await saveConfigScoped({ localAgentTool: "codex", localAgentPath: "/opt/codex" }, targetDir);
+
+				await saveConfigScoped({ aiProvider: "local-agent", localAgentTool: "cursor-agent" }, targetDir);
+
+				const config = await readSaved(targetDir);
+				expect(config.localAgentTool).toBe("cursor-agent");
+				expect(config.localAgentPath).toBeUndefined();
+			});
+
+			it("treats a path with no recorded tool as claude-code's", async () => {
+				// Pre-`localAgentTool` configs: localAgentOverrideFrom attributes a
+				// bare path to claude-code, so switching AWAY from claude-code must
+				// clear it, and re-saving claude-code must not.
+				const targetDir = join(tempDir, "orphan-legacy");
+				await saveConfigScoped({ localAgentPath: "/opt/claude" }, targetDir);
+
+				await saveConfigScoped({ localAgentTool: "claude-code" }, targetDir);
+				expect((await readSaved(targetDir)).localAgentPath).toBe("/opt/claude");
+
+				await saveConfigScoped({ localAgentTool: "opencode" }, targetDir);
+				expect((await readSaved(targetDir)).localAgentPath).toBeUndefined();
+			});
+
+			it("keeps the path when the tool is re-saved unchanged", async () => {
+				// The VS Code Settings panel writes localAgentTool on EVERY Apply, so
+				// a same-tool write must never discard the user's override.
+				const targetDir = join(tempDir, "orphan-unchanged");
+				await saveConfigScoped({ localAgentTool: "cursor-agent", localAgentPath: "/opt/cursor" }, targetDir);
+
+				await saveConfigScoped({ localAgentTool: "cursor-agent", model: "claude-sonnet" }, targetDir);
+
+				expect((await readSaved(targetDir)).localAgentPath).toBe("/opt/cursor");
+			});
+
+			it("keeps a path supplied in the same update as the new tool", async () => {
+				// Configuring a tool AND its binary in one write: the incoming path
+				// belongs to the incoming tool, so it is not an orphan.
+				const targetDir = join(tempDir, "orphan-paired");
+				await saveConfigScoped({ localAgentTool: "codex", localAgentPath: "/opt/codex" }, targetDir);
+
+				await saveConfigScoped({ localAgentTool: "cursor-agent", localAgentPath: "/opt/cursor" }, targetDir);
+
+				const config = await readSaved(targetDir);
+				expect(config.localAgentTool).toBe("cursor-agent");
+				expect(config.localAgentPath).toBe("/opt/cursor");
+			});
+
+			it("clears the path when the tool is explicitly cleared back to the default", async () => {
+				// `{localAgentTool: undefined}` is a WRITE ("reset to the default"),
+				// not an absent field: JSON.stringify drops the key, so the persisted
+				// config has a path and no tool, and localAgentOverrideFrom then reads
+				// it as claude-code's — Codex's binary handed to Claude Code. Presence
+				// must therefore be tested with `in`, exactly as it is for the path.
+				const targetDir = join(tempDir, "orphan-cleared-tool");
+				await saveConfigScoped({ localAgentTool: "codex", localAgentPath: "/opt/codex" }, targetDir);
+
+				await saveConfigScoped({ localAgentTool: undefined }, targetDir);
+
+				const config = await readSaved(targetDir);
+				expect(config.localAgentTool).toBeUndefined();
+				expect(config.localAgentPath).toBeUndefined();
+			});
+
+			it("keeps the path when clearing a tool that was already the default", async () => {
+				// The mirror case, and why `in` alone isn't the whole fix: both sides of
+				// the comparison normalize through `?? "claude-code"`, so clearing an
+				// already-defaulted tool is NOT a tool change and must not drop the
+				// override the user set for claude-code.
+				const targetDir = join(tempDir, "orphan-cleared-default");
+				await saveConfigScoped({ localAgentPath: "/opt/claude" }, targetDir);
+
+				await saveConfigScoped({ localAgentTool: undefined }, targetDir);
+
+				expect((await readSaved(targetDir)).localAgentPath).toBe("/opt/claude");
+			});
+
+			it("leaves unrelated updates alone when no path is configured", async () => {
+				const targetDir = join(tempDir, "orphan-none");
+				await saveConfigScoped({ localAgentTool: "codex" }, targetDir);
+
+				await saveConfigScoped({ localAgentTool: "cursor-agent" }, targetDir);
+
+				const config = await readSaved(targetDir);
+				expect(config.localAgentTool).toBe("cursor-agent");
+				expect(config.localAgentPath).toBeUndefined();
+			});
+		});
 	});
 
 	describe("filterSessionsByEnabledIntegrations", () => {

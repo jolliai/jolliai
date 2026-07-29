@@ -68,6 +68,16 @@ describe("DualWriteStorage", () => {
 		rmrf(tempDir);
 	});
 
+	// Minification-safe backend identity — `constructor.name` is mangled in both
+	// shipping bundles, so diagnostics read this instead (JOLLI-2066). Reports
+	// "dual-write" rather than delegating to the primary's kind: a read served by
+	// the primary is still a dual-write installation, and that is what a log line
+	// naming the backend needs to say.
+	it("reports a stable kind that does not depend on the class name", () => {
+		const dual = new DualWriteStorage(new InMemoryStorage(), new InMemoryStorage());
+		expect(dual.kind).toBe("dual-write");
+	});
+
 	it("exposes the shadow's kbRoot via the kbRoot getter", () => {
 		const primary = new InMemoryStorage();
 		const shadow = {

@@ -10,8 +10,14 @@ import { type Command, Option } from "commander";
 import { getJolliUrl, loadAuthToken } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
-import { isClaudeCodeUsable } from "../core/localagent/ClaudeExecutableResolver.js";
-import { LOCAL_AGENT_TOOLS, localAgentToolLabel } from "../core/localagent/ToolMeta.js";
+import {
+	type DetectedAgent,
+	isLocalAgentUsable,
+	type LocalAgentOverride,
+	listPresentLocalAgents,
+	localAgentOverrideFrom,
+} from "../core/localagent/DetectAgents.js";
+import { LOCAL_AGENT_TOOLS, localAgentToolLabel, localAgentToolLoginHint } from "../core/localagent/ToolMeta.js";
 import { getGlobalConfigDir, loadConfig, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
 import { markSkipExitFlush } from "../core/TelemetryCommandHook.js";
@@ -27,11 +33,30 @@ import { offerOptionalJolliLogin } from "./OptionalLogin.js";
 const log = createLogger("EnableCommand");
 
 /**
- * Interactive provider-setup flow after hooks are installed. When a fresh config
- * meets a working local Claude Code CLI it auto-selects the local agent and
- * returns; otherwise it offers browser sign-in (recommended), an Anthropic key,
- * or skip. Always uses the global config directory. Shared by `jolli enable` and
- * the bare-`jolli` guided front door.
+ * How many unreadable answers the local-agent picker tolerates before it gives
+ * up and skips. Bounds the one loop branch that consumes no candidate — see
+ * {@link handleLocalAgent}. Three so a genuine typo costs nothing, while a
+ * prompt stuck returning garbage (or a user holding Enter, since that menu has no
+ * default) cannot spin.
+ */
+const MAX_INVALID_CHOICES = 3;
+
+/**
+ * What a run of {@link handleLocalAgent} settled on. `"exhausted"` is the one
+ * outcome the caller must react to: every offered tool failed its capability
+ * probe, so the local-agent route is closed on this machine and a caller that
+ * ENTERED that route automatically (the multi-tool fast path) has to hand the
+ * user back the full provider menu rather than dead-end them.
+ */
+type LocalAgentPickOutcome = "saved" | "skipped" | "exhausted";
+
+/**
+ * Interactive provider-setup flow after hooks are installed. When there is no
+ * usable credential and exactly one present, working local agent tool, it
+ * auto-selects that tool and returns; when two or more are present it prompts
+ * among them; otherwise it offers browser sign-in (recommended), an Anthropic
+ * key, a local-agent picker, or skip. Always uses the global config directory.
+ * Shared by `jolli enable` and the bare-`jolli` guided front door.
  */
 export async function promptSetup(): Promise<void> {
 	const configDir = getGlobalConfigDir();
@@ -44,17 +69,49 @@ export async function promptSetup(): Promise<void> {
 		return;
 	}
 
-	// Zero-friction default: when nothing is configured yet AND a working local
-	// Claude Code CLI is present, generate summaries through the user's own
-	// subscription (no API key, no sign-in) and skip the menu entirely. Probe
-	// ONLY on a truly fresh config so an existing Anthropic key or a deliberate
-	// provider choice is never second-guessed (and so an already-configured
-	// re-run never pays for the subprocess probe). Detection already picked the
-	// tool, so this bypasses the interactive local-agent picker below.
-	const fresh = !config.apiKey && !process.env.ANTHROPIC_API_KEY && config.aiProvider === undefined;
-	if (fresh && isClaudeCodeUsable({ overridePath: config.localAgentPath })) {
-		await autoSelectClaudeCode(configDir);
-		return;
+	// Zero-friction default: when there is no usable credential AND local agent
+	// tools are installed, generate summaries through the user's own subscription
+	// (no API key, no sign-in).
+	//
+	// The gate is "no credential that could generate", NOT "aiProvider was never
+	// written". A bare `aiProvider` with no key behind it is a STALE preference,
+	// not a decision to honour — and it is routinely written by accident: VS Code's
+	// Settings panel derives a provider for display when the field is unset
+	// (`SettingsWebviewPanel.resolveProvider` → "anthropic" when not signed in) and
+	// persists it on the next Apply, even one that only touched an unrelated field.
+	// Gating on `=== undefined` let that one stray write permanently close the
+	// local-agent route on a machine with four agents installed. A REAL Anthropic
+	// credential still suppresses the route — that is what the two checks below do.
+	// A jolliApiKey never reaches here (early return above).
+	//
+	// Presence detection is filesystem-only (~4 ms for all four tools); the
+	// expensive capability probe (161-1772 ms each) runs for at most ONE tool,
+	// never as a sweep.
+	//
+	// Exactly one present → auto-select it silently, as this command has always
+	// done for Claude Code. Two or more → there is a real choice to make, so ask.
+	const noCredential = !config.apiKey && !process.env.ANTHROPIC_API_KEY;
+	const override = localAgentOverrideFrom(config);
+	if (noCredential) {
+		const present = listPresentLocalAgents(override);
+		if (present.length === 1) {
+			const only = present[0];
+			if (await isLocalAgentUsable(only.id, { override })) {
+				await autoSelectLocalAgent(configDir, only.id);
+				return;
+			}
+			// Present but not runnable — fall through to the menu rather than
+			// pinning a provider that cannot generate.
+		} else if (present.length > 1) {
+			// The user did not ASK for a local agent here — detection routed them
+			// into the picker. So when every detected tool turns out to be unusable,
+			// the route we chose for them is closed and the menu below (sign-in /
+			// Anthropic key / skip) is still owed to them. Only "exhausted" falls
+			// through: an explicit "Skip for now" is the user's own decision and has
+			// already printed where to configure later.
+			if ((await handleLocalAgent(configDir, present, override)) !== "exhausted") return;
+			console.log("\n  No usable local agent CLI — here are the other ways to generate summaries.");
+		}
 	}
 
 	// Otherwise present the provider menu. A local agent CLI is always offered —
@@ -76,7 +133,10 @@ export async function promptSetup(): Promise<void> {
 	if (choice === "2") {
 		await handleAnthropicKey(configDir);
 	} else if (choice === "3") {
-		await handleLocalAgent(configDir);
+		// Outcome deliberately ignored: the user picked the local-agent route from
+		// this very menu, so "exhausted" has nowhere better to fall through to —
+		// re-offering the menu here would loop.
+		await handleLocalAgent(configDir, undefined, override);
 	} else if (choice === "4") {
 		console.log("\n  Skipped. Configure later with 'jolli auth login' or 'jolli configure'.");
 		console.log(`    ${join(configDir, "config.json")}\n`);
@@ -112,54 +172,162 @@ async function handleAnthropicKey(configDir: string): Promise<void> {
 }
 
 /**
- * Auto-selects the Local Agent provider after a working Claude Code CLI is
- * detected: summaries are generated by driving the local `claude` through the
- * user's own subscription, so no jollimemory-held API key is stored. Reached
- * only when {@link isClaudeCodeUsable} already returned true on a fresh config,
- * so it skips the interactive tool picker and states the detection plainly,
- * pointing at how to change it.
+ * Auto-selects the Local Agent provider after exactly one working tool was
+ * detected: summaries are generated by driving that tool through the user's own
+ * subscription, so no jollimemory-held API key is stored. Reached only when the
+ * tool already passed its capability probe, so it skips the picker and states
+ * the detection plainly, pointing at how to change it.
  */
-async function autoSelectClaudeCode(configDir: string): Promise<void> {
+async function autoSelectLocalAgent(configDir: string, tool: LocalAgentToolId): Promise<void> {
+	const label = localAgentToolLabel(tool);
 	await saveConfigScoped(
-		{ aiProvider: "local-agent", localAgentTool: "claude-code" } as Partial<JolliMemoryConfig>,
+		{ aiProvider: "local-agent", localAgentTool: tool } as Partial<JolliMemoryConfig>,
 		configDir,
 	);
-	console.log("\n  ✓ Detected Claude Code — using your subscription to generate summaries (claude -p), no API key.");
-	console.log("  Summaries run through your local `claude` login.");
+	console.log(`\n  ✓ Detected ${label} — using your subscription to generate summaries, no API key.`);
+	console.log(`  Summaries run through your local ${label} login.`);
 	console.log("  Change this anytime: 'jolli auth login', or 'jolli configure --set aiProvider=jolli'.");
 	console.log(`\n  Configuration saved to ${join(configDir, "config.json")}\n`);
 }
 
 /**
- * Selects the Local Agent provider from an interactive tool picker: summaries
- * are generated by driving a locally-installed agent CLI (Claude Code, Codex,
- * Cursor, or OpenCode) through its own subscription/account login, so no
- * jollimemory-held API key is stored. Self-sufficient — the caller does not
- * fall through to the Anthropic-key prompt. Binary liveness is verified by
- * `jolli doctor`, which probes that the chosen tool is installed and accepts the
- * flags we pass.
+ * Picks a local agent from a list and pins it as the provider. Summaries are
+ * generated by driving the chosen CLI through its own subscription login, so no
+ * jollimemory-held API key is stored.
+ *
+ * `candidates` is the detected list when any tool is present. When nothing is
+ * detected we still offer all four with a note, because reaching here means the
+ * user asked for a local agent explicitly and the command must not dead-end.
+ * `override` is the config's tool-scoped explicit path (see
+ * {@link localAgentOverrideFrom}); it reaches the probe only for the tool it
+ * actually names, so choosing a *different* tool is auto-discovered rather than
+ * probed at someone else's binary.
+ *
+ * The choice is capability-probed BEFORE it is written: this used to save any of
+ * the four unprobed and defer verification to `jolli doctor`, which let a
+ * known-broken configuration land in config.json.
+ *
+ * The prompt deliberately has NO default. This is an N-way choice the user did
+ * not necessarily ask to be in (the multi-tool fast path routes them here), and
+ * its outcome is a global-config write pinning a provider — so a bare Enter must
+ * not decide it. It used to be coerced to `1`, which meant a single stray newline
+ * (one queued in the TTY buffer while startup did its git + storage work is
+ * enough) silently pinned Claude Code. Blank now takes the same rejection path as
+ * `99`, bounded by {@link MAX_INVALID_CHOICES}, so the worst case is "nothing was
+ * saved" rather than "a provider the user never named".
+ *
+ * Termination has two independent guarantees, because the loop can turn over for
+ * two different reasons:
+ *
+ * - A tool that FAILS its probe is REMOVED from the menu, so a probing round
+ *   either writes a config, returns, or strictly shrinks a finite list. Leaving
+ *   the failed entry in place would offer a tool already known to be broken, and
+ *   re-picking it costs another 161-1772 ms probe to learn nothing new.
+ * - A BLANK / UNPARSEABLE / out-of-range answer consumes no candidate, so it is
+ *   capped separately by {@link MAX_INVALID_CHOICES}; without that cap a prompt
+ *   wired to keep returning garbage would spin forever.
+ *
+ * "Skip for now" stays available at every step. No exit path writes.
+ *
+ * Returns which of the three exits was taken (see {@link LocalAgentPickOutcome}),
+ * because "every tool failed" is not the same answer as "the user declined" and
+ * the auto-routed caller must be able to tell them apart.
  */
-async function handleLocalAgent(configDir: string): Promise<void> {
-	const toolIds = Object.keys(LOCAL_AGENT_TOOLS) as LocalAgentToolId[];
+async function handleLocalAgent(
+	configDir: string,
+	candidates?: DetectedAgent[],
+	override?: LocalAgentOverride,
+): Promise<LocalAgentPickOutcome> {
+	const detected = candidates ?? listPresentLocalAgents(override);
+	const none = detected.length === 0;
+	// Mutable: failed probes are spliced out (see the docstring). Copied so a
+	// caller's array is never mutated under it.
+	const list: DetectedAgent[] = none
+		? (Object.keys(LOCAL_AGENT_TOOLS) as LocalAgentToolId[]).map((id) => ({
+				id,
+				label: localAgentToolLabel(id),
+			}))
+		: [...detected];
 
-	console.log("\n  Which local agent CLI would you like to use?\n");
-	toolIds.forEach((id, i) => {
-		console.log(`    ${i + 1}. ${localAgentToolLabel(id)}`);
-	});
+	const skip = (): void => {
+		console.log("\n  Skipped. Configure later with 'jolli auth login' or 'jolli configure'.");
+		console.log(`    ${join(configDir, "config.json")}\n`);
+	};
 
-	const answer = await promptText(`\n  Choice [1]: `);
-	const index = Number.parseInt(answer.trim() || "1", 10) - 1;
-	const tool = toolIds[index] ?? toolIds[0];
-	const label = localAgentToolLabel(tool);
+	let invalid = 0;
+	// `for(;;)`, not `while (list.length > 0)`: `list` is non-empty on entry in
+	// both branches above, and the only way it empties is the splice below —
+	// which returns "exhausted" on the spot. A length condition here would
+	// therefore be a loop exit that cannot be taken, forcing an unreachable tail
+	// after the loop that no test can cover (see the 97% cli/src floor in
+	// AGENTS.md). Every exit is an explicit return inside the body; termination
+	// is guaranteed by the two bounds described in the docstring.
+	for (;;) {
+		// Recomputed each round: the skip entry always sits directly below the
+		// remaining tools, so its number moves down as failed tools are removed.
+		const skipChoice = list.length + 1;
+		console.log("\n  Which local agent CLI would you like to use?\n");
+		if (none) console.log("    (None detected on this machine — pick one to configure anyway.)\n");
+		list.forEach((a, i) => {
+			console.log(`    ${i + 1}. ${a.label}`);
+		});
+		console.log(`    ${skipChoice}. Skip for now (configure later)`);
 
-	await saveConfigScoped(
-		{ aiProvider: "local-agent", localAgentTool: tool } as Partial<JolliMemoryConfig>,
-		configDir,
-	);
-	console.log(`\n  AI provider:       Local Agent (${label}) ✓`);
-	console.log(`  No API key needed — summaries run through your local ${label} login.`);
-	console.log("  Run 'jolli doctor' to verify the tool is installed and signed in.");
-	console.log(`\n  Configuration saved to ${join(configDir, "config.json")}\n`);
+		// No default — see the docstring. `parseInt("")` is NaN, so a bare Enter
+		// falls into the same rejection branch as any other unreadable answer.
+		const answer = await promptText(`\n  Choice (1-${skipChoice}): `);
+		const index = Number.parseInt(answer.trim(), 10) - 1;
+
+		if (index === skipChoice - 1) {
+			skip();
+			return "skipped";
+		}
+
+		// Blank, out-of-range and non-numeric input are all REJECTED, never coerced
+		// to the first entry: typing `9` — or pressing Enter — used to probe (and
+		// could pin) a tool the user never named. Consumes no candidate, so it needs
+		// its own bound.
+		if (!Number.isInteger(index) || index < 0 || index >= list.length) {
+			invalid++;
+			if (invalid >= MAX_INVALID_CHOICES) {
+				console.log(`\n  Couldn't read a choice after ${MAX_INVALID_CHOICES} tries.`);
+				skip();
+				return "skipped";
+			}
+			console.log(`\n  Enter a number between 1 and ${skipChoice}.`);
+			continue;
+		}
+
+		const chosen = list[index];
+
+		if (await isLocalAgentUsable(chosen.id, { override })) {
+			await saveConfigScoped(
+				{ aiProvider: "local-agent", localAgentTool: chosen.id } as Partial<JolliMemoryConfig>,
+				configDir,
+			);
+			console.log(`\n  AI provider:       Local Agent (${chosen.label}) ✓`);
+			console.log(`  No API key needed — summaries run through your local ${chosen.label} login.`);
+			console.log(`  ${localAgentToolLoginHint(chosen.id)}`);
+			console.log(`\n  Configuration saved to ${join(configDir, "config.json")}\n`);
+			return "saved";
+		}
+
+		console.log(`\n  ${chosen.label} isn't usable on this machine — nothing was saved.`);
+		list.splice(index, 1);
+		if (list.length === 0) {
+			// Wording splits on WHY the list is empty. `none` means we offered all four
+			// blind, so "install one" is the right advice. Otherwise the tools were
+			// detected on disk and merely failed to run — telling that user to install
+			// something they already have reads as a broken diagnosis, and the real
+			// fixes are an upgrade or a different provider.
+			console.log(
+				none
+					? "  Install one, then run 'jolli enable' again.\n"
+					: "  Every detected tool failed to run — upgrade one, or pick another provider.\n",
+			);
+			return "exhausted";
+		}
+	}
 }
 
 /**
@@ -320,7 +488,7 @@ async function reportEnableResult(
 						process.env.ANTHROPIC_API_KEY ||
 						cfg.aiProvider === "local-agent",
 				);
-			let canGenerate = canGenerateNow(cfg);
+			let canGenerate = await canGenerateNow(cfg);
 			// Onboarding menu — EXCEPT when a provider is already configured but simply
 			// broken (has a credential yet can't generate). That case skips straight to
 			// the repair ladder below, so the user sees ONE menu (the fix), not two: the
@@ -331,18 +499,18 @@ async function reportEnableResult(
 				await promptSetup();
 				cfg = await loadConfig();
 				token = await loadAuthToken();
-				canGenerate = canGenerateNow(cfg);
+				canGenerate = await canGenerateNow(cfg);
 			}
 			// Repair ladder (parity with the guided front door's Rung 1): a provider
-			// that is configured but can't actually generate — a broken local `claude`,
-			// or an anthropic/jolli key mismatch — gets a one-step fix BEFORE the sync
-			// nudge, so `jolli enable` can't finish with generation silently broken.
+			// that is configured but can't actually generate — a broken local agent
+			// tool, or an anthropic/jolli key mismatch — gets a one-step fix BEFORE the
+			// sync nudge, so `jolli enable` can't finish with generation silently broken.
 			// Skipped for the fresh user who just chose "Skip" (no credential to repair).
 			if (!canGenerate && hasCredential()) {
 				await promptGenerationFix(cfg);
 				cfg = await loadConfig();
 				token = await loadAuthToken();
-				canGenerate = canGenerateNow(cfg);
+				canGenerate = await canGenerateNow(cfg);
 			}
 			// Sign-in nudge (parity with the guided front door's Rung 2): a user
 			// who just configured local-agent / Anthropic generation but isn't
@@ -358,7 +526,7 @@ async function reportEnableResult(
 			console.log("\n  Configure a provider to enable summarization:");
 			console.log(`    Edit: ${join(configDir, "config.json")}`);
 			console.log('    - Set "apiKey" (Anthropic) and/or "jolliApiKey" (Jolli Space), or');
-			console.log('    - Set "aiProvider": "local-agent" to drive a local Claude Code CLI (no key)\n');
+			console.log('    - Set "aiProvider": "local-agent" to drive a local agent CLI (no key)\n');
 		}
 
 		// Pre-push sync catch-up (JOLLI-1900): retry any commits left in

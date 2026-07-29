@@ -9,6 +9,7 @@
  */
 
 import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
+import type { DetectedAgent } from "../../../cli/src/core/localagent/DetectAgents.js";
 import type { PinEntry, PinKind } from "../../../cli/src/core/PinStore.js";
 import type { ReferenceField, SourceId, TranscriptSource } from "../../../cli/src/Types.js";
 import type { IngestPhase } from "../stores/StatusStore.js";
@@ -82,6 +83,18 @@ export interface SidebarState {
 	 * `configured: true` once `currentConfigured` is hydrated.
 	 */
 	readonly configured?: boolean;
+	/**
+	 * Local agent CLIs detected on this machine, in display order. Drives the
+	 * onboarding panel's local-agent card: empty (or absent) means no card and a
+	 * panel identical to the pre-feature one.
+	 *
+	 * Sent on `init` and refreshed through `localAgents:changed` when the
+	 * onboarding panel reappears mid-window (sign-out / cleared key), since the
+	 * host deliberately skips detection while the user is configured. A user who
+	 * INSTALLS an agent while the panel is already up still needs a reload —
+	 * that would require watching the filesystem, which the card doesn't warrant.
+	 */
+	readonly localAgents?: DetectedAgent[];
 	readonly activeTab: SidebarTab;
 	readonly kbMode: KbMode;
 	readonly branchName: string;
@@ -955,6 +968,14 @@ export type SidebarInboundMsg =
 	| { readonly type: "enabled:changed"; readonly enabled: boolean }
 	| { readonly type: "auth:changed"; readonly authenticated: boolean }
 	| { readonly type: "configured:changed"; readonly configured: boolean }
+	/**
+	 * Refreshed local-agent list for the onboarding card. Pushed just before
+	 * `configured:changed` flips the panel back on, because the host skips
+	 * detection while the user is configured and the `init` list would be stale
+	 * (empty) for anyone who signs out mid-window. See `SidebarState.localAgents`.
+	 */
+	| { readonly type: "localAgents:changed"; readonly localAgents: DetectedAgent[] }
+	| { readonly type: "localAgent:selectError"; readonly message: string }
 	| {
 			readonly type: "worker:busy";
 			readonly busy: boolean;

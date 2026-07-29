@@ -171,7 +171,7 @@ describe("SidebarHtmlBuilder", () => {
 			expect(html).toContain('id="onboarding-apikey-btn"');
 		});
 
-		it("renders Anthropic API key as the recommended option above Sign in to Jolli", () => {
+		it("renders Anthropic API key above Sign in to Jolli, with the RECOMMENDED badge preceding both", () => {
 			const html = buildSidebarHtml(
 				"test-nonce",
 				"vscode-resource:",
@@ -183,14 +183,22 @@ describe("SidebarHtmlBuilder", () => {
 			expect(apikeyIdx).toBeGreaterThan(-1);
 			expect(signinIdx).toBeGreaterThan(-1);
 			expect(apikeyIdx).toBeLessThan(signinIdx);
-			// The RECOMMENDED badge must live in the same DOM region as the
-			// Anthropic card — i.e. between the panel header and the Sign in card.
+			// In the static skeleton the RECOMMENDED badge lives inside the
+			// (hidden-by-default) local-agent card, which sits above the API-key
+			// card — SidebarScriptBuilder moves it back onto the API-key card at
+			// runtime only when state.localAgents is empty. Either way it must
+			// precede the Sign in to Jolli card.
 			const badgeIdx = html.indexOf("RECOMMENDED");
 			expect(badgeIdx).toBeGreaterThan(-1);
 			expect(badgeIdx).toBeLessThan(signinIdx);
+			// The API-key card itself no longer carries the recommended styling
+			// statically — that is applied dynamically only in the no-agents case.
+			const apikeyCardTag = html.match(/<section[^>]*id="onboarding-apikey-card"[^>]*>/)?.[0] ?? "";
+			expect(apikeyCardTag).not.toBe("");
+			expect(apikeyCardTag).not.toContain("ob-card--recommended");
 		});
 
-		it("uses primary button class on Configure API Key and secondary on Sign In", () => {
+		it("uses secondary button class on both Configure API Key and Sign In", () => {
 			const html = buildSidebarHtml(
 				"test-nonce",
 				"vscode-resource:",
@@ -198,11 +206,107 @@ describe("SidebarHtmlBuilder", () => {
 				SIDEBAR_EMPTY_STRINGS,
 			);
 			expect(html).toMatch(
-				/id="onboarding-apikey-btn"[^>]*class="ob-btn ob-btn--primary"/,
+				/id="onboarding-apikey-btn"[^>]*class="ob-btn ob-btn--secondary"/,
 			);
 			expect(html).toMatch(
 				/id="onboarding-signin-btn"[^>]*class="ob-btn ob-btn--secondary"/,
 			);
+		});
+	});
+
+	describe("onboarding local-agent card", () => {
+		it("renders the block hidden by default", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			expect(html).toContain('id="onboarding-localagent-block"');
+			expect(html).toMatch(/<div class="ob-localagent hidden" id="onboarding-localagent-block">/);
+		});
+
+		it("uses the exact approved copy", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			expect(html).toContain("Use your local agent tool");
+			expect(html).toContain(
+				"Use your local agent tool for AI summarization. Memories are stored locally only.",
+			);
+			expect(html).toContain("Use Local Agent Tool");
+			expect(html).toContain("Make sure you're signed in to the tool.");
+		});
+
+		it("carries no inline style or inline handler (CSP)", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			expect(html).not.toMatch(/<[^>]*\sstyle="/);
+			expect(html).not.toMatch(/\son(click|change)=/);
+		});
+
+		it("produces the DOM ids and CSS classes the script builder consumes", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			expect(html).toContain('id="onboarding-localagent-select"');
+			expect(html).toContain('id="onboarding-localagent-btn"');
+			expect(html).toContain('id="onboarding-localagent-error"');
+			expect(html).toContain('class="ob-select"');
+			expect(html).toContain('class="ob-hint"');
+			// The error paragraph starts hidden — Task 9 owns showing it.
+			expect(html).toMatch(/class="ob-error hidden" id="onboarding-localagent-error"/);
+			// The <option> list is NOT interpolated into the HTML string — the
+			// skeleton's own docstring states it carries no user-supplied data.
+			// SidebarScriptBuilder populates it via the DOM API on init.
+			const selectTag = html.match(/<select[^>]*id="onboarding-localagent-select"[^>]*>[\s\S]*?<\/select>/)?.[0] ?? "";
+			expect(selectTag).not.toBe("");
+			expect(selectTag).not.toContain("<option");
+		});
+
+		it("positions the block immediately after the onboarding divider, above the API-key card", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			const dividerIdx = html.indexOf('<hr class="ob-divider" />');
+			const blockIdx = html.indexOf('id="onboarding-localagent-block"');
+			const apikeyCardIdx = html.indexOf('id="onboarding-apikey-card"');
+			expect(dividerIdx).toBeGreaterThan(-1);
+			expect(blockIdx).toBeGreaterThan(dividerIdx);
+			expect(apikeyCardIdx).toBeGreaterThan(blockIdx);
+		});
+
+		it("nests the hint, label and dropdown inside the recommended card", () => {
+			const html = buildSidebarHtml(
+				"test-nonce",
+				"vscode-resource:",
+				"https://example/codicon.css",
+				SIDEBAR_EMPTY_STRINGS,
+			);
+			// The card is the only .ob-card--recommended section and holds no
+			// nested <section>, so a non-greedy match is its full inner HTML.
+			const card =
+				html.match(/<section class="ob-card ob-card--recommended">[\s\S]*?<\/section>/)?.[0] ?? "";
+			expect(card).not.toBe("");
+			expect(card).toContain("Make sure you're signed in to the tool.");
+			expect(card).toContain('for="onboarding-localagent-select"');
+			expect(card).toContain('id="onboarding-localagent-select"');
+			// The action button and error line stay outside the card.
+			expect(card).not.toContain('id="onboarding-localagent-btn"');
+			expect(card).not.toContain('id="onboarding-localagent-error"');
 		});
 	});
 

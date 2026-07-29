@@ -2275,6 +2275,23 @@ describe("SummaryStore", () => {
 			expect(map.size).toBe(0);
 		});
 
+		/**
+		 * An absent index is routine — a fresh repo before its first summary, or a
+		 * cross-repo scan over a sibling Memory Bank that has none. It used to warn,
+		 * which put a WARN in front of first-run users mid-setup and produced
+		 * hundreds of lines per VS Code sidebar refresh. Real read failures are
+		 * warned by the backend instead, where the cause is known (JOLLI-2066).
+		 */
+		it("does not warn when the index is merely absent", async () => {
+			const warnSpy = vi.mocked(console.warn);
+			warnSpy.mockClear();
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+
+			await getIndexEntryMap();
+
+			expect(warnSpy).not.toHaveBeenCalled();
+		});
+
 		it("should preserve topicCount and diffStats on entries", async () => {
 			const entry: SummaryIndexEntry = {
 				...rootEntry("hash1", "A"),

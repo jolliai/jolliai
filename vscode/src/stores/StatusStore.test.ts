@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { StatusInfo } from "../../../cli/src/Types.js";
+import type { JolliMemoryConfig, StatusInfo } from "../../../cli/src/Types.js";
 
 const { loadConfigFromDir, getGlobalConfigDir } = vi.hoisted(() => ({
 	loadConfigFromDir: vi.fn(),
@@ -231,6 +231,39 @@ describe("StatusStore", () => {
 			expect(store.getSnapshot().workerBusy).toBe(false);
 			expect(store.getSnapshot().ingestBusy).toBe(true);
 			expect(store.getSnapshot().ingestPhase).toBe("wiki");
+		});
+	});
+
+	// ── configured gate — usesLocalAgent must widen it without live detection ──
+	describe("configured gate", () => {
+		async function buildSnapshot(configOverrides: Partial<JolliMemoryConfig> = {}) {
+			const bridge = { getStatus: vi.fn(async () => makeStatus()) };
+			loadConfigFromDir.mockResolvedValue(configOverrides);
+			const store = new StatusStore(bridge as never);
+			await store.refresh();
+			return store.getSnapshot();
+		}
+
+		it("is configured when the provider is local-agent with no key and no sign-in", async () => {
+			const snap = await buildSnapshot({ aiProvider: "local-agent" });
+			expect(snap.derived.usesLocalAgent).toBe(true);
+			expect(snap.derived.signedIn || snap.derived.hasApiKey || snap.derived.usesLocalAgent).toBe(true);
+		});
+
+		it("is not configured for anthropic with no key", async () => {
+			const snap = await buildSnapshot({ aiProvider: "anthropic" });
+			expect(snap.derived.usesLocalAgent).toBe(false);
+			expect(snap.derived.signedIn || snap.derived.hasApiKey || snap.derived.usesLocalAgent).toBe(false);
+		});
+
+		it("stays configured after the agent binary disappears", async () => {
+			// usesLocalAgent is keyed on config INTENT, not live presence: losing
+			// the binary must not silently discard the user's provider choice and
+			// dump them back into onboarding. There is no "binary present" input
+			// to this derivation at all — re-deriving from the same config
+			// (simulating a reload with the agent gone) must still be true.
+			const snap = await buildSnapshot({ aiProvider: "local-agent" });
+			expect(snap.derived.usesLocalAgent).toBe(true);
 		});
 	});
 });

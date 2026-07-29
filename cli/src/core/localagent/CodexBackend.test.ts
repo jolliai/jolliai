@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CodexBackend } from "./CodexBackend.js";
+import * as resolver from "./ExecutableResolver.js";
 import { LocalAgentAuthError, LocalAgentSetupError } from "./Types.js";
 
 const fixture = readFileSync(join(__dirname, "__fixtures__/codex/success.json"), "utf8");
@@ -94,5 +95,17 @@ describe("CodexBackend.buildInvocation with launcher args", () => {
 			{ prompt: "hi", model: "", systemPrompt: "" },
 		);
 		expect(inv.args.slice(0, 2)).toEqual(["cli.js", "exec"]);
+	});
+});
+
+describe("CodexBackend.isPresent", () => {
+	it("is false for an override path that does not exist", () => {
+		expect(new CodexBackend().isPresent("/nonexistent/path/to/codex")).toBe(false);
+	});
+
+	it("delegates to the CODEX_SPEC discovery, not another tool's", () => {
+		const spy = vi.spyOn(resolver, "isPresent").mockReturnValue(true);
+		expect(new CodexBackend().isPresent()).toBe(true);
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ binName: "codex" }), { overridePath: undefined });
 	});
 });

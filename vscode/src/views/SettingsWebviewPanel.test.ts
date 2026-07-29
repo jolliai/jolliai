@@ -96,6 +96,18 @@ vi.mock("../../../cli/src/core/GitOps.js", () => ({
 	listWorktrees: mockListWorktrees,
 }));
 
+const { mockIsLocalAgentUsable } = vi.hoisted(() => ({
+	mockIsLocalAgentUsable: vi.fn().mockResolvedValue(true),
+}));
+
+// Partial mock: only the expensive capability probe is stubbed. The rest —
+// notably `localAgentOverrideFrom`, a pure config→override mapper — stays real,
+// so these tests exercise the actual tool-scoping rule rather than a copy of it.
+vi.mock("../../../cli/src/core/localagent/DetectAgents.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../../cli/src/core/localagent/DetectAgents.js")>()),
+	isLocalAgentUsable: mockIsLocalAgentUsable,
+}));
+
 const {
 	mockInstallClaudeHook,
 	mockRemoveClaudeHook,
@@ -237,6 +249,7 @@ describe("SettingsWebviewPanel", () => {
 		mockGetProjectRootDir.mockResolvedValue("/workspace");
 		mockSaveConfigScoped.mockResolvedValue(undefined);
 		mockListWorktrees.mockResolvedValue(["/workspace"]);
+		mockIsLocalAgentUsable.mockResolvedValue(true);
 	});
 
 	// ── show() ───────────────────────────────────────────────────────────────
@@ -2819,6 +2832,156 @@ describe("SettingsWebviewPanel", () => {
 
 			expect(postMessage).not.toHaveBeenCalledWith(
 				expect.objectContaining({ command: "rebuildKnowledgeBaseDone" }),
+			);
+		});
+	});
+
+	describe("probeLocalAgent message", () => {
+		it("probes the allow-listed tool with the configured localAgentPath override and posts the result back", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				apiKey: "",
+				model: "sonnet",
+				maxTokens: null,
+				localAgentTool: "cursor-agent",
+				localAgentPath: "/custom/path/to/cursor-agent",
+				claudeEnabled: true,
+			});
+			mockIsLocalAgentUsable.mockResolvedValue(true);
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "probeLocalAgent", tool: "cursor-agent" });
+			await flushPromises();
+
+			// Tool-scoped: the path is paired with the tool it belongs to, so a
+			// dropdown pick of a DIFFERENT tool auto-discovers instead of borrowing
+			// this path (isLocalAgentUsable drops the mismatch — see
+			// DetectAgents.test.ts).
+			expect(mockIsLocalAgentUsable).toHaveBeenCalledWith("cursor-agent", {
+				override: { tool: "cursor-agent", path: "/custom/path/to/cursor-agent" },
+			});
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "localAgentProbeResult",
+				tool: "cursor-agent",
+				available: true,
+			});
+		});
+
+		it("posts available: false when the backend reports the tool unusable", async () => {
+			mockIsLocalAgentUsable.mockResolvedValue(false);
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "probeLocalAgent", tool: "codex" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "localAgentProbeResult",
+				tool: "codex",
+				available: false,
+			});
+		});
+
+		it("still answers available: false when reading the config throws", async () => {
+			// The webview holds an Apply click that lands mid-probe until the reply
+			// decides it, so a swallowed reply strands a save. A failure to even
+			// establish usability must therefore answer, and answer `false` —
+			// matching isLocalAgentUsable's own error semantics rather than
+			// optimistically reporting a tool nobody could verify.
+			mockLoadConfigFromDir.mockRejectedValue(new Error("EACCES: config.json"));
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "probeLocalAgent", tool: "codex" });
+			await flushPromises();
+
+			expect(mockIsLocalAgentUsable).not.toHaveBeenCalled();
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "localAgentProbeResult",
+				tool: "codex",
+				available: false,
+			});
+		});
+
+		it("drops an unrecognized tool id instead of trusting untrusted webview input", async () => {
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "probeLocalAgent", tool: "not-a-real-tool" });
+			await flushPromises();
+
+			expect(mockIsLocalAgentUsable).not.toHaveBeenCalled();
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ command: "localAgentProbeResult" }),
+			);
+		});
+
+		it("drops a non-string tool value instead of trusting untrusted webview input", async () => {
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "probeLocalAgent", tool: 12345 });
+			await flushPromises();
+
+			expect(mockIsLocalAgentUsable).not.toHaveBeenCalled();
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ command: "localAgentProbeResult" }),
+			);
+		});
+
+		it("logs a rejection from isLocalAgentUsable and still answers available: false", async () => {
+			// isLocalAgentUsable swallows its own errors in production, so this only
+			// fires if that contract changes. Either way the probe must not go
+			// unanswered: a reply is what releases an Apply click held mid-probe.
+			mockIsLocalAgentUsable.mockRejectedValue(new Error("probe boom"));
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "probeLocalAgent", tool: "opencode" });
+			await flushPromises();
+
+			expect(logError).toHaveBeenCalledWith(
+				"SettingsPanel",
+				expect.stringContaining("probe boom"),
+			);
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "localAgentProbeResult",
+				tool: "opencode",
+				available: false,
+			});
+		});
+
+		it("bails out of posting when the panel was disposed before the probe resolved", async () => {
+			let resolveProbe: (available: boolean) => void = () => {};
+			mockIsLocalAgentUsable.mockImplementation(
+				() => new Promise((res) => { resolveProbe = res; }),
+			);
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "probeLocalAgent", tool: "claude-code" });
+			// Let the pending loadConfigFromDir microtask resolve and
+			// isLocalAgentUsable actually get invoked (capturing resolveProbe)
+			// before disposing the panel and resolving the probe.
+			await flushPromises();
+			(SettingsWebviewPanel as unknown as { currentPanel: undefined }).currentPanel = undefined;
+			resolveProbe(true);
+			await flushPromises();
+
+			expect(postMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ command: "localAgentProbeResult" }),
 			);
 		});
 	});

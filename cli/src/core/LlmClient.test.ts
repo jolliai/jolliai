@@ -1517,6 +1517,7 @@ describe("callLlm — local-agent", () => {
 				costUsd: 0.01,
 				stopReason: "end_turn",
 			}),
+			isPresent: () => true,
 		};
 		registerBackend(stub); // replaces the real claude-code backend for this test
 
@@ -1565,6 +1566,7 @@ describe("callLlm — local-agent", () => {
 				costUsd: 0,
 				stopReason: "end_turn",
 			}),
+			isPresent: () => true,
 		};
 		registerBackend(stub);
 
@@ -1589,6 +1591,7 @@ describe("callLlm — local-agent", () => {
 			parseResult: () => {
 				throw boom;
 			},
+			isPresent: () => true,
 		};
 		registerBackend(stub);
 
@@ -1619,6 +1622,7 @@ describe("callLlm — local-agent", () => {
 				costUsd: 0,
 				stopReason: null,
 			}),
+			isPresent: () => true,
 		};
 		registerBackend(stub);
 
@@ -1653,6 +1657,7 @@ describe("callLlm — local-agent", () => {
 					costUsd: 0,
 					stopReason: "end_turn",
 				}),
+				isPresent: () => true,
 			};
 			registerBackend(stub);
 
@@ -1683,6 +1688,7 @@ describe("callLlm — local-agent", () => {
 					costUsd: 0,
 					stopReason: "end_turn",
 				}),
+				isPresent: () => true,
 			};
 			registerBackend(stub);
 
@@ -1708,6 +1714,7 @@ describe("callLlm — local-agent", () => {
 				parseResult: () => {
 					throw new Error("should not be reached");
 				},
+				isPresent: () => true,
 			};
 			registerBackend(stub);
 
@@ -1744,6 +1751,7 @@ describe("callLlm — local-agent", () => {
 					costUsd: 0,
 					stopReason: "end_turn",
 				}),
+				isPresent: () => true,
 			};
 			registerBackend(stub);
 

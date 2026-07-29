@@ -164,6 +164,17 @@ export function buildSettingsCss(): string {
     min-height: 14px;
   }
 
+  /* ── Local agent tool availability status (Settings > AI Summary) ── */
+  .local-agent-status {
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground);
+    margin: 4px 0 0;
+    min-height: 16px;
+  }
+  .local-agent-status.error {
+    color: var(--vscode-errorForeground);
+  }
+
   select {
     cursor: pointer;
     appearance: auto;

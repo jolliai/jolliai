@@ -1,6 +1,8 @@
 import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 import {
 	type Candidate,
+	isPresent,
+	type PresenceOpts,
 	type ProbeFn,
 	__resetResolverCacheForTest as reset,
 	resolveExecutable,
@@ -37,23 +39,10 @@ export function resolveClaudeExecutable(opts: ResolveOpts = {}): ResolvedExecuta
 }
 
 /**
- * Non-throwing liveness check for the local Claude Code CLI: true when a
- * compatible `claude` is resolvable (present on PATH / known locations AND it
- * accepts the flags we pass), false otherwise. Thin wrapper over
- * {@link resolveClaudeExecutable} so interactive callers (the guided front door,
- * `promptSetup`) can branch on availability without a try/catch.
- *
- * Exported as its own function on purpose: it is the seam tests mock so they
- * never shell out to a real `claude`. Cost is one `resolveClaudeExecutable`
- * call — a successful resolution is cached for {@link RESOLUTION_CACHE_TTL_MS},
- * but a failure is never cached, so a just-installed / just-fixed binary is
- * picked up on the next call.
+ * Presence-only counterpart of {@link resolveClaudeExecutable}: true when a
+ * `claude` binary is discoverable, WITHOUT probing that it runs. Kept beside the
+ * resolver so the Claude spec stays in one file.
  */
-export function isClaudeCodeUsable(opts: ResolveOpts = {}): boolean {
-	try {
-		resolveClaudeExecutable(opts);
-		return true;
-	} catch {
-		return false;
-	}
+export function isClaudeCodePresent(opts: PresenceOpts = {}): boolean {
+	return isPresent(CLAUDE_SPEC, opts);
 }

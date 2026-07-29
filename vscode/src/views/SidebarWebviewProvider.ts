@@ -9,6 +9,7 @@
 
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
+import type { DetectedAgent } from "../../../cli/src/core/localagent/DetectAgents.js";
 import type { PinEntry, PinKind } from "../../../cli/src/core/PinStore.js";
 import { resolveSessionTitle } from "../../../cli/src/core/SessionTitleResolver.js";
 import { getTranscriptIds } from "../../../cli/src/core/SummaryTree.js";
@@ -1912,11 +1913,22 @@ export class SidebarWebviewProvider
 
 	/**
 	 * Pushed whenever the user's `configured` state changes — i.e. whenever
-	 * either of the two underlying signals (`signedIn`, `hasApiKey`) flips.
-	 * Drives the onboarding-panel vs main-UI split in the webview.
+	 * any of the underlying signals (`signedIn`, `hasApiKey`, `usesLocalAgent`)
+	 * flips. Drives the onboarding-panel vs main-UI split in the webview.
 	 */
 	notifyConfiguredChanged(configured: boolean): void {
 		this.postMessage({ type: "configured:changed", configured });
+	}
+
+	/**
+	 * Pushed when the onboarding panel is about to reappear mid-window, so its
+	 * local-agent card reflects a fresh detection sweep instead of the `init`
+	 * snapshot (which is deliberately empty for users who started out
+	 * configured). Sent before `configured:changed` so the card is correct on the
+	 * panel's first paint.
+	 */
+	notifyLocalAgentsChanged(localAgents: DetectedAgent[]): void {
+		this.postMessage({ type: "localAgents:changed", localAgents });
 	}
 
 	/**
@@ -1928,6 +1940,11 @@ export class SidebarWebviewProvider
 	 */
 	notifyApiKeySaveError(message: string): void {
 		this.postMessage({ type: "apikey:saveError", message });
+	}
+
+	/** Pushed only on the failure path of the onboarding local-agent selection. */
+	notifyLocalAgentSelectError(message: string): void {
+		this.postMessage({ type: "localAgent:selectError", message });
 	}
 
 	private pushStatus(): void {

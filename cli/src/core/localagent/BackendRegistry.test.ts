@@ -7,6 +7,7 @@ const fake: LocalAgentBackend = {
 	discoverExecutable: async () => ({ file: "/x/claude", version: "9.9.9" }),
 	buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "", env: {}, cwd: "/tmp" }),
 	parseResult: () => ({ text: "", inputTokens: 0, outputTokens: 0, cachedTokens: 0, costUsd: 0, stopReason: null }),
+	isPresent: () => true,
 };
 
 describe("BackendRegistry", () => {

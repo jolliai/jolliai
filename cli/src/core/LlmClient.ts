@@ -16,23 +16,13 @@ import type { LlmCredentialSource, LocalAgentToolId } from "../Types.js";
 import { LOCAL_AGENT_TMP_PREFIX } from "./AgentReentry.js";
 import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
 import { parseBaseUrl, parseJolliApiKey } from "./JolliApiUtils.js";
-import { getBackend, registerBackend } from "./localagent/BackendRegistry.js";
-import { ClaudeCodeBackend } from "./localagent/ClaudeCodeBackend.js";
-import { CodexBackend } from "./localagent/CodexBackend.js";
-import { CursorAgentBackend } from "./localagent/CursorAgentBackend.js";
+import { getBackend } from "./localagent/BackendRegistry.js";
+import "./localagent/BuiltinBackends.js";
 import { describeCandidate } from "./localagent/ExecutableResolver.js";
 import { runInvocation as defaultRunInvocation } from "./localagent/LocalAgentRunner.js";
-import { OpenCodeBackend } from "./localagent/OpenCodeBackend.js";
 import { fillTemplate, findUnfilledPlaceholders, TEMPLATES } from "./PromptTemplates.js";
 import { resolveModelId } from "./Summarizer.js";
 import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "./TraceContext.js";
-
-// Register the v1 backend once at module load. The registry is the extension
-// point for future tools (Codex, Cursor) — add a `registerBackend(...)` here.
-registerBackend(new ClaudeCodeBackend());
-registerBackend(new CursorAgentBackend());
-registerBackend(new CodexBackend());
-registerBackend(new OpenCodeBackend());
 
 // Re-export so existing imports of LlmCredentialSource from this module keep
 // working — the source-of-truth definition lives in Types.ts because

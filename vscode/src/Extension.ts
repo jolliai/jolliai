@@ -18,6 +18,13 @@ import { discoverCodexConversations } from "../../cli/src/core/CodexDiscovery.js
 import { catchUpTranscriptDiscovery } from "../../cli/src/core/DiscoveryCatchUp.js";
 import type { FolderStorage, ForceRegenerateResult } from "../../cli/src/core/FolderStorage.js";
 import { getDefaultBranch } from "../../cli/src/core/GitOps.js";
+import type { DetectedAgent } from "../../cli/src/core/localagent/DetectAgents.js";
+import {
+	isLocalAgentUsable,
+	listPresentLocalAgents,
+	localAgentOverrideFrom,
+} from "../../cli/src/core/localagent/DetectAgents.js";
+import { LOCAL_AGENT_TOOLS, localAgentToolLabel } from "../../cli/src/core/localagent/ToolMeta.js";
 import {
 	extractRepoName,
 	getRemoteUrl,
@@ -58,7 +65,7 @@ import {
 } from "../../cli/src/core/SummaryTree.js";
 import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
 import { isManuallyDisabled, ORPHAN_BRANCH, setManuallyDisabled } from "../../cli/src/Logger.js";
-import type { SourceId, StatusInfo } from "../../cli/src/Types.js";
+import type { LocalAgentToolId, SourceId, StatusInfo } from "../../cli/src/Types.js";
 import { execFileSyncHidden } from "../../cli/src/util/Subprocess.js";
 import { runCopyBranchRecallPrompt, runRecallInClaudeCode } from "./commands/BranchRecallCommands.js";
 import { CommitCommand } from "./commands/CommitCommand.js";
@@ -894,6 +901,12 @@ export function activate(context: vscode.ExtensionContext): void {
 	// from statusStore.onChange so sign-in / sign-out / settings save / config
 	// reload all converge on a single source of truth.
 	let currentConfigured = false;
+	// Local agent tools present on this machine, for the onboarding card. Empty
+	// until resolved under the initialStateReady barrier, and left empty for
+	// already-configured users (who never see the card) — those users get a
+	// detection sweep only if `configured` later flips back to false, which is
+	// where the onboarding panel can reappear mid-window. See detectLocalAgents.
+	let currentLocalAgents: DetectedAgent[] = [];
 	// Per-repo cold-start signals for the back-fill card. Optimistic defaults
 	// (has memories / no variant / not dismissed) so the card never flashes
 	// before initialLoad resolves the real values under the barrier.
@@ -1060,6 +1073,38 @@ export function activate(context: vscode.ExtensionContext): void {
 		}
 	}
 
+	/**
+	 * Presence-only sweep of the local agent CLIs, for the onboarding card.
+	 *
+	 * Filesystem work only — `existsSync` across the discovery dirs, no `which`
+	 * and no subprocess of any kind (see `discoverPresence`) — measured at ~4 ms
+	 * for all four tools, which is what lets it sit on the activation path at all:
+	 * this runs synchronously on the extension host's single thread, where a
+	 * blocked event loop stalls every extension, not just this one. The expensive
+	 * capability probe (161-1772 ms per tool; 3384 ms to sweep all four) is
+	 * deliberately NOT run here; it happens once, for the one tool the user picks.
+	 *
+	 * Skipped when already configured: those users never see the card. That is a
+	 * cost optimization, NOT a one-shot — `configured` can flip back to false
+	 * mid-window (sign-out, cleared API key) and bring the onboarding panel with
+	 * it, so the statusStore subscription calls this again on that transition
+	 * (after `currentConfigured` has been updated, or the guard would swallow it).
+	 * Without that second call the reappearing panel would silently omit the
+	 * local-agent card, because the host's list was never populated.
+	 *
+	 * Best-effort — any failure leaves the list empty, which renders today's
+	 * onboarding panel unchanged.
+	 */
+	const detectLocalAgents = (): void => {
+		if (currentConfigured) return;
+		try {
+			currentLocalAgents = listPresentLocalAgents();
+		} catch (err) {
+			log.warn("detectLocalAgents", "Detection failed", { error: (err as Error).message });
+			currentLocalAgents = [];
+		}
+	};
+
 	let sidebarProvider: SidebarWebviewProvider;
 	sidebarProvider = new SidebarWebviewProvider({
 		executeCommand: (cmd, ...args) =>
@@ -1073,6 +1118,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			enabled: currentEnabled && !isManuallyDisabled(),
 			authenticated: currentAuthenticated,
 			configured: currentConfigured,
+			localAgents: currentLocalAgents,
 			activeTab: "branch",
 			kbMode: "folders",
 			branchName: currentBranchName,
@@ -1486,9 +1532,26 @@ export function activate(context: vscode.ExtensionContext): void {
 	// webview round-trips minimal.
 	context.subscriptions.push({
 		dispose: statusStore.onChange((snap) => {
-			const nextConfigured = snap.derived.signedIn || snap.derived.hasApiKey;
+			// A local-agent provider is self-sufficient — it drives the tool's own
+			// login and holds no jollimemory credential — so it counts as
+			// configured. Keyed on config intent, NOT live detection: if the user
+			// later uninstalls the agent we must not silently drop them back into
+			// onboarding and discard the choice. That failure belongs to
+			// `jolli doctor` and the generation error path.
+			const nextConfigured =
+				snap.derived.signedIn || snap.derived.hasApiKey || snap.derived.usesLocalAgent;
 			if (nextConfigured !== currentConfigured) {
 				currentConfigured = nextConfigured;
+				// Onboarding can come BACK mid-window: signing out or clearing the API
+				// key flips `configured` to false and re-raises the panel. Refresh the
+				// local-agent list and push it BEFORE the panel is shown, so the card is
+				// already correct on the first paint rather than one message late. The
+				// assignment above must come first — detectLocalAgents self-guards on
+				// `currentConfigured`.
+				if (!nextConfigured) {
+					detectLocalAgents();
+					sidebarProvider.notifyLocalAgentsChanged(currentLocalAgents);
+				}
 				sidebarProvider.notifyConfiguredChanged(nextConfigured);
 			}
 			if (snap.status && snap.status.enabled !== currentEnabled) {
@@ -3812,6 +3875,54 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 		),
 
+		// Onboarding local-agent selection — wired from the sidebar card's
+		// "Use Local Agent Tool" button. Mirrors saveAnthropicApiKey: touches only
+		// the provider fields, and a successful save flips configured=true via
+		// statusStore.refresh, which retires the panel through the existing
+		// configured:changed plumbing — no success ack needed.
+		//
+		// The capability probe runs HERE rather than during detection: the
+		// onboarding sweep is presence-only (~4 ms) precisely so that the
+		// expensive probe (161-1772 ms) is paid once, for the one tool the user
+		// actually chose.
+		vscode.commands.registerCommand(
+			"jollimemory.selectLocalAgentTool",
+			async (rawTool: unknown) => {
+				log.info("cmd", "selectLocalAgentTool invoked");
+				// Webview input is untrusted — allow-list against the tool registry.
+				const tool =
+					typeof rawTool === "string" && Object.hasOwn(LOCAL_AGENT_TOOLS, rawTool)
+						? (rawTool as LocalAgentToolId)
+						: null;
+				if (!tool) {
+					sidebarProvider.notifyLocalAgentSelectError("Unknown local agent tool.");
+					return;
+				}
+				const label = localAgentToolLabel(tool);
+				try {
+					const cfg = await loadConfig();
+					// Tool-scoped override: `localAgentPath` names ONE tool's binary, so
+					// it reaches the probe only when it names the tool being selected.
+					const override = cfg ? localAgentOverrideFrom(cfg) : undefined;
+					if (!(await isLocalAgentUsable(tool, { override }))) {
+						sidebarProvider.notifyLocalAgentSelectError(
+							`Found ${label}, but it didn't respond as expected. Try another tool.`,
+						);
+						return;
+					}
+					await saveConfigScoped(
+						{ aiProvider: "local-agent", localAgentTool: tool },
+						getGlobalConfigDir(),
+					);
+					await statusStore.refresh();
+				} catch (err) {
+					const message = err instanceof Error ? err.message : `Failed to select ${label}.`;
+					log.error("cmd", `selectLocalAgentTool failed: ${message}`);
+					sidebarProvider.notifyLocalAgentSelectError(message);
+				}
+			},
+		),
+
 		// Auth — sign in / sign out via browser-based OAuth flow.
 		vscode.commands.registerCommand("jollimemory.signIn", async () => {
 			log.info("cmd", "signIn invoked");
@@ -4077,6 +4188,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		// (no flash). Best-effort inside the helper: any failure leaves the
 		// optimistic defaults (no variant → no card).
 		await computeColdStartSignals();
+		detectLocalAgents();
 		resolveInitialStateReady();
 	});
 

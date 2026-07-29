@@ -1,8 +1,36 @@
 import type { FileWrite, SummaryIndexEntry } from "../Types.js";
 import type { TopicPage } from "./TopicKBTypes.js";
 
+/**
+ * Stable, minification-safe identity of a storage backend.
+ *
+ * Exists because `constructor.name` is NOT usable for this: both shipping
+ * bundles minify without `keepNames`, so the class name reaches production as
+ * a mangled identifier that also differs per bundle (`Xe` from the CLI, `t`
+ * from the VS Code extension). Any diagnostic that needs to name the backend
+ * must read {@link StorageProvider.kind} instead.
+ */
+export type StorageKind = "orphan-branch" | "folder" | "dual-write";
+
 export interface StorageProvider {
-	/** Read a file's content. Returns null if not found. */
+	/**
+	 * Stable backend identity for diagnostics. See {@link StorageKind} for why
+	 * this exists rather than reading `constructor.name`.
+	 *
+	 * Optional so the many `as unknown as StorageProvider` test doubles keep
+	 * type-checking; consumers must therefore tolerate `undefined` (log it as
+	 * "unknown" rather than assuming a backend).
+	 */
+	readonly kind?: StorageKind;
+
+	/**
+	 * Read a file's content. Returns null if not found.
+	 *
+	 * A `null` return means **absent**, not "failed". Implementations that can
+	 * fail while the file is present (fs errno, git plumbing) MUST log the
+	 * failure themselves, at the point where the cause is still in hand —
+	 * callers receive an indistinguishable `null` and cannot report it.
+	 */
 	readFile(path: string): Promise<string | null>;
 
 	/**

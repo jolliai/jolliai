@@ -8,12 +8,14 @@
 
 import { createLogger, errMsg, isManuallyDisabled } from "../Logger.js";
 import type { FileWrite, SummaryIndexEntry } from "../Types.js";
-import type { HealOptions, HealResult, StorageProvider } from "./StorageProvider.js";
+import type { HealOptions, HealResult, StorageKind, StorageProvider } from "./StorageProvider.js";
 import type { TopicPage } from "./TopicKBTypes.js";
 
 const log = createLogger("DualWriteStorage");
 
 export class DualWriteStorage implements StorageProvider {
+	readonly kind: StorageKind = "dual-write";
+
 	constructor(
 		private readonly primary: StorageProvider,
 		private readonly shadow: StorageProvider,

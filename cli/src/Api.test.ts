@@ -142,11 +142,16 @@ vi.mock("open", () => ({
 vi.mock("./auth/Login.js", () => ({
 	browserLogin: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("./core/localagent/ClaudeExecutableResolver.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("./core/localagent/ClaudeExecutableResolver.js")>();
-	// Default: no local agent detected, so `promptSetup` shows the provider menu
-	// deterministically (never shells out to a real `claude` during tests).
-	return { ...actual, isClaudeCodeUsable: vi.fn(() => false) };
+vi.mock("./core/localagent/DetectAgents.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./core/localagent/DetectAgents.js")>();
+	// Default: nothing is present and no configured local-agent tool is usable,
+	// so `promptSetup` shows the provider menu and `canGenerateNow` deterministically
+	// reports "can't generate" without shelling out to a real CLI during tests.
+	return {
+		...actual,
+		listPresentLocalAgents: vi.fn().mockReturnValue([]),
+		isLocalAgentUsable: vi.fn().mockResolvedValue(false),
+	};
 });
 vi.mock("./commands/OptionalLogin.js", () => ({
 	offerOptionalJolliLogin: vi.fn().mockResolvedValue(undefined),
@@ -3641,8 +3646,9 @@ describe("CLI", () => {
 
 		it("should auto-select Local Agent when a working claude is detected (no menu)", async () => {
 			const { saveConfigScoped } = await import("./core/SessionTracker.js");
-			const { isClaudeCodeUsable } = await import("./core/localagent/ClaudeExecutableResolver.js");
-			vi.mocked(isClaudeCodeUsable).mockReturnValue(true);
+			const { listPresentLocalAgents, isLocalAgentUsable } = await import("./core/localagent/DetectAgents.js");
+			vi.mocked(listPresentLocalAgents).mockReturnValue([{ id: "claude-code", label: "Claude Code" }]);
+			vi.mocked(isLocalAgentUsable).mockResolvedValue(true);
 			// No menu input — detection auto-selects local agent and returns.
 			mockUserInput();
 			mockExistsSync.mockReturnValue(false);
@@ -3661,18 +3667,24 @@ describe("CLI", () => {
 				expect(calls.some((s) => s.includes("How would you like to generate summaries"))).toBe(false);
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
-				vi.mocked(isClaudeCodeUsable).mockReturnValue(false);
+				vi.mocked(listPresentLocalAgents).mockReturnValue([]);
+				vi.mocked(isLocalAgentUsable).mockResolvedValue(false);
 			}
 		});
 
 		it("should select a Local Agent tool via the picker on menu choice 3 (no key, no Anthropic prompt)", async () => {
 			const { saveConfigScoped } = await import("./core/SessionTracker.js");
+			const { isLocalAgentUsable } = await import("./core/localagent/DetectAgents.js");
+			// Chosen tool must pass its probe before anything is saved (module default
+			// is false, which would retry forever against a 4-option fallback list).
+			vi.mocked(isLocalAgentUsable).mockResolvedValue(true);
 			// Claude not auto-detected → the provider menu appears. Choose "3" (local
-			// agent CLI). The follow-up tool sub-menu gets no explicit answer, so it
-			// defaults to the first tool (claude-code). A fallthrough to the Anthropic
-			// prompt would hang on a missing answer, so reaching the end proves the
-			// self-sufficient early return.
-			mockUserInput("3");
+			// agent CLI), then "1" (Claude Code) in the tool sub-menu. That sub-menu
+			// answer must be explicit: it has no default, so the exhausted-answers ""
+			// this helper falls back to would be rejected and skip without writing. A
+			// fallthrough to the Anthropic prompt would consume that "" instead, so
+			// reaching the end proves the self-sufficient early return.
+			mockUserInput("3", "1");
 			mockExistsSync.mockReturnValue(false);
 			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
 
@@ -3689,6 +3701,7 @@ describe("CLI", () => {
 				expect(calls.some((s) => s.includes("Anthropic API Key"))).toBe(false);
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+				vi.mocked(isLocalAgentUsable).mockResolvedValue(false);
 			}
 		});
 
@@ -3827,9 +3840,9 @@ describe("CLI", () => {
 		it("enable nudge: local-agent generation, not signed in → offers sign-in", async () => {
 			const { offerOptionalJolliLogin } = await import("./commands/OptionalLogin.js");
 			const { loadConfig } = await import("./core/SessionTracker.js");
-			const { isClaudeCodeUsable } = await import("./core/localagent/ClaudeExecutableResolver.js");
+			const { isLocalAgentUsable } = await import("./core/localagent/DetectAgents.js");
 			vi.mocked(offerOptionalJolliLogin).mockClear();
-			vi.mocked(isClaudeCodeUsable).mockReturnValue(true);
+			vi.mocked(isLocalAgentUsable).mockResolvedValue(true);
 			vi.mocked(loadConfig).mockResolvedValue({ aiProvider: "local-agent" });
 			mockUserInput();
 			mockExistsSync.mockReturnValue(false);
@@ -3840,7 +3853,7 @@ describe("CLI", () => {
 				expect(offerOptionalJolliLogin).toHaveBeenCalled();
 			} finally {
 				Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
-				vi.mocked(isClaudeCodeUsable).mockReturnValue(false);
+				vi.mocked(isLocalAgentUsable).mockResolvedValue(false);
 				vi.mocked(loadConfig).mockResolvedValue({});
 			}
 		});
@@ -3850,7 +3863,7 @@ describe("CLI", () => {
 			const { loadConfig } = await import("./core/SessionTracker.js");
 			vi.mocked(promptGenerationFix).mockClear();
 			vi.mocked(console.log).mockClear();
-			// isClaudeCodeUsable stays false (module default) → local-agent can't generate,
+			// isLocalAgentUsable stays false (module default) → local-agent can't generate,
 			// so this configured-but-broken state must go STRAIGHT to the repair ladder.
 			vi.mocked(loadConfig).mockResolvedValue({ aiProvider: "local-agent" });
 			mockUserInput();
@@ -4596,6 +4609,7 @@ describe("CLI", () => {
 				discoverExecutable: vi.fn().mockResolvedValue({ file: "/usr/local/bin/claude", version: "2.1.210" }),
 				buildInvocation: vi.fn(),
 				parseResult: vi.fn(),
+				isPresent: vi.fn(),
 			});
 			const output = (await runDoctor(["doctor"], { config: { aiProvider: "local-agent" } })).join("\n");
 			expect(output).toContain("✓ Config");
@@ -4611,6 +4625,7 @@ describe("CLI", () => {
 				discoverExecutable: vi.fn().mockRejectedValue(new Error("No compatible Claude Code CLI found.")),
 				buildInvocation: vi.fn(),
 				parseResult: vi.fn(),
+				isPresent: vi.fn(),
 			});
 			const output = (await runDoctor(["doctor"], { config: { aiProvider: "local-agent" } })).join("\n");
 			// Config is still "selected" (green), but the liveness probe fails loudly.

@@ -28,6 +28,7 @@ describe("StatusDataService.derive", () => {
 		expect(derived).toEqual({
 			hasApiKey: false,
 			signedIn: false,
+			usesLocalAgent: false,
 			allHooksInstalled: false,
 			hooksDescription: "none installed",
 		});
@@ -73,5 +74,19 @@ describe("StatusDataService.derive", () => {
 		const derived = StatusDataService.derive(null, config);
 		expect(derived.hasApiKey).toBe(false);
 		expect(derived.signedIn).toBe(false);
+	});
+
+	it("reports usesLocalAgent when aiProvider is local-agent, with no key and no sign-in", () => {
+		const config = { aiProvider: "local-agent" } as JolliMemoryConfig;
+		const derived = StatusDataService.derive(null, config);
+		expect(derived.usesLocalAgent).toBe(true);
+		expect(derived.hasApiKey).toBe(false);
+		expect(derived.signedIn).toBe(false);
+	});
+
+	it("does not report usesLocalAgent for other providers", () => {
+		const config = { aiProvider: "anthropic" } as JolliMemoryConfig;
+		const derived = StatusDataService.derive(null, config);
+		expect(derived.usesLocalAgent).toBe(false);
 	});
 });

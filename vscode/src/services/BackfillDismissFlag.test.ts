@@ -9,7 +9,15 @@ import { readBackfillDismissFlag, writeBackfillDismissFlag } from "./BackfillDis
 // exhaustive path-resolution / migration / worktree-sharing coverage lives in
 // cli/src/core/RepoProfile.test.ts; here we only assert the boolean forwarding
 // and the new storage location.
-describe("BackfillDismissFlag", () => {
+//
+// Direct sibling of ManualDisableFlag.test.ts: both wrap the same RepoProfile
+// helpers and spawn a real `git init` in beforeEach plus real git reads/writes
+// via `git rev-parse --git-common-dir`. Under v8 coverage instrumentation plus
+// a large parallel suite, that subprocess can occasionally take longer than
+// Vitest's 5s default, which is a load signal, not a correctness one. Give the
+// whole suite a generous timeout so it stays robust under load without hiding
+// an actual hang (45s is far beyond any real subprocess latency).
+describe("BackfillDismissFlag", { timeout: 45_000 }, () => {
 	let cwd: string;
 
 	beforeEach(() => {

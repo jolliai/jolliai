@@ -23,7 +23,7 @@ const h = vi.hoisted(() => ({
 	loadUserProfile: vi.fn(),
 	saveUserProfile: vi.fn(),
 	isInsideGitWorkTree: vi.fn(),
-	isClaudeCodeUsable: vi.fn(),
+	isLocalAgentUsable: vi.fn(),
 }));
 
 vi.mock("../auth/AuthConfig.js", () => ({ loadAuthToken: h.loadAuthToken, getJolliUrl: h.getJolliUrl }));
@@ -59,9 +59,9 @@ vi.mock("./CliUtils.js", async (importOriginal) => {
 		isInsideGitWorkTree: h.isInsideGitWorkTree,
 	};
 });
-vi.mock("../core/localagent/ClaudeExecutableResolver.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../core/localagent/ClaudeExecutableResolver.js")>();
-	return { ...actual, isClaudeCodeUsable: h.isClaudeCodeUsable };
+vi.mock("../core/localagent/DetectAgents.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/localagent/DetectAgents.js")>();
+	return { ...actual, isLocalAgentUsable: h.isLocalAgentUsable };
 });
 
 import { getGuidedFrontDoorStatus, runGuidedFrontDoor } from "./GuidedFrontDoor.js";
@@ -114,7 +114,7 @@ describe("GuidedFrontDoor", () => {
 		h.loadUserProfile.mockResolvedValue({});
 		h.saveUserProfile.mockResolvedValue(undefined);
 		h.isInsideGitWorkTree.mockReturnValue(true);
-		h.isClaudeCodeUsable.mockReturnValue(true);
+		h.isLocalAgentUsable.mockResolvedValue(true);
 	});
 
 	afterEach(() => {
@@ -629,25 +629,37 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).toContain("Jolli is listening");
 	});
 
-	// ── R3: local-agent configured but `claude` not usable ──
+	it("names the configured local agent in the status line", async () => {
+		h.loadAuthToken.mockResolvedValue("oauth-token");
+		h.loadConfig.mockResolvedValue({
+			jolliUrl: "https://acme.jolli.ai",
+			aiProvider: "local-agent",
+			localAgentTool: "codex",
+		});
+		await runGuidedFrontDoor();
+		expect(out()).toContain("summaries via Codex");
+		expect(out()).not.toContain("summaries via Claude Code");
+	});
+
+	// ── R3: local-agent configured but the tool's binary isn't usable ──
 
 	it("R3: local agent broken + skip → repair menu, no false listening", async () => {
 		h.loadAuthToken.mockResolvedValue(undefined);
 		h.loadConfig.mockResolvedValue({ aiProvider: "local-agent" });
-		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.isLocalAgentUsable.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("4"); // skip
 		await runGuidedFrontDoor();
-		expect(out()).toContain("no usable `claude` was found");
+		expect(out()).toContain("no usable binary was found");
 		expect(out()).toContain("Skipped");
 		expect(out()).not.toContain("Jolli is listening");
 		expect(h.runBackfillFrontDoorStep).not.toHaveBeenCalled();
 	});
 
-	it("R3: retry succeeds (claude now usable) → generation restored, listening", async () => {
+	it("R3: retry succeeds (tool now usable) → generation restored, listening", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
 		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai", aiProvider: "local-agent" });
 		h.getSummaryCount.mockResolvedValue(1);
-		h.isClaudeCodeUsable.mockReturnValueOnce(false).mockReturnValue(true);
+		h.isLocalAgentUsable.mockResolvedValueOnce(false).mockResolvedValue(true);
 		h.promptText.mockResolvedValue("1"); // retry
 		await runGuidedFrontDoor();
 		expect(out()).toContain("Claude Code is working now");
@@ -657,10 +669,10 @@ describe("GuidedFrontDoor", () => {
 	it("R3: retry still broken → stops, no listening", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
 		h.loadConfig.mockResolvedValue({ aiProvider: "local-agent" });
-		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.isLocalAgentUsable.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("1"); // retry, still broken
 		await runGuidedFrontDoor();
-		expect(out()).toContain("Still no usable `claude`");
+		expect(out()).toContain("Still no usable Claude Code");
 		expect(out()).not.toContain("Jolli is listening");
 	});
 
@@ -669,7 +681,7 @@ describe("GuidedFrontDoor", () => {
 		h.loadConfig
 			.mockResolvedValueOnce({ aiProvider: "local-agent" })
 			.mockResolvedValue({ aiProvider: "jolli", jolliApiKey: "sk-jol-new", jolliUrl: "https://acme.jolli.ai" });
-		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.isLocalAgentUsable.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("2"); // switch to Jolli
 		await runGuidedFrontDoor();
 		expect(h.browserLogin).toHaveBeenCalledWith("https://acme.jolli.ai");
@@ -680,7 +692,7 @@ describe("GuidedFrontDoor", () => {
 	it("R3: switch to Jolli but login fails → no provider change, no listening", async () => {
 		h.loadAuthToken.mockResolvedValue(undefined);
 		h.loadConfig.mockResolvedValue({ aiProvider: "local-agent" });
-		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.isLocalAgentUsable.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("2");
 		h.browserLogin.mockRejectedValue(new Error("network down"));
 		await runGuidedFrontDoor();
@@ -692,7 +704,7 @@ describe("GuidedFrontDoor", () => {
 	it("R3: enter an Anthropic key → saved with provider anthropic", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
 		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai", aiProvider: "local-agent" });
-		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.isLocalAgentUsable.mockResolvedValue(false);
 		h.promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("sk-ant-new");
 		await runGuidedFrontDoor();
 		expect(h.saveConfigScoped).toHaveBeenCalledWith(
@@ -705,17 +717,17 @@ describe("GuidedFrontDoor", () => {
 	it("R3: Enter at the repair menu defaults to Retry", async () => {
 		h.loadAuthToken.mockResolvedValue("oauth-token");
 		h.loadConfig.mockResolvedValue({ aiProvider: "local-agent" });
-		h.isClaudeCodeUsable.mockReturnValue(false); // broken; retry re-probes, still broken
+		h.isLocalAgentUsable.mockResolvedValue(false); // broken; retry re-probes, still broken
 		h.promptText.mockResolvedValue(""); // Enter → default [1] = Retry
 		await runGuidedFrontDoor();
-		expect(out()).toContain("Still no usable `claude`");
+		expect(out()).toContain("Still no usable Claude Code");
 		expect(out()).not.toContain("Jolli is listening");
 	});
 
 	it("R3: switch to Jolli, login rejects with a non-Error value → still reported", async () => {
 		h.loadAuthToken.mockResolvedValue(undefined);
 		h.loadConfig.mockResolvedValue({ aiProvider: "local-agent" });
-		h.isClaudeCodeUsable.mockReturnValue(false);
+		h.isLocalAgentUsable.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("2"); // switch to Jolli
 		h.browserLogin.mockRejectedValue("odd failure"); // non-Error rejection
 		await runGuidedFrontDoor();

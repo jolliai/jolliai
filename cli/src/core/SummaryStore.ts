@@ -2082,20 +2082,21 @@ async function loadIndex(cwd?: string, storage?: StorageProvider): Promise<Summa
 	const store = resolveStorage(storage, cwd);
 	const content = await store.readFile(INDEX_FILE);
 	if (!content) {
-		// Surface as warn: in a healthy installation the index always exists
-		// once any summary has been generated. A null read here means either
-		// (a) fresh repo / no summaries yet, or (b) the backend's read failed
-		// (git plumbing for OrphanBranchStorage; fs/EACCES for FolderStorage)
-		// — `store.readFile` swallows the underlying error and returns null,
-		// so production needs the warn to notice (b). Callers (`getSummary`,
-		// `listSummaries`, …) treat this as "nothing to return" rather than
-		// throwing, so the warn is the only signal. Tagging the storage class
-		// keeps cross-repo foreign reads (FolderStorage on a sibling Memory
-		// Bank) from being misread as workspace orphan-branch failures.
-		log.warn(
-			"loadIndex: index.json unreadable from %s (fresh repo or backend read failed)",
-			store.constructor.name,
-		);
+		// DEBUG, not WARN. A null here now carries exactly one meaning — the
+		// index is absent — and absence is routine: a fresh repo before its
+		// first summary, or a cross-repo scan touching a sibling Memory Bank
+		// that has none. Warning on it produced hundreds of lines per sidebar
+		// refresh and greeted first-run users with a WARN mid-setup, while the
+		// failure it was meant to catch stayed invisible inside the noise.
+		//
+		// Genuine read failures are warned by the backend itself, where the
+		// errno / git stderr is still available to name the cause
+		// (`FolderStorage.readFile`, `readFileFromBranch`) — see JOLLI-2066.
+		//
+		// `store.kind`, never `store.constructor.name`: both shipping bundles
+		// minify without `keepNames`, so the class name reaches production
+		// mangled and bundle-specific (`Xe` / `t`).
+		log.debug("loadIndex: no index.json in %s storage", store.kind ?? "unknown");
 		return null;
 	}
 

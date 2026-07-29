@@ -10,7 +10,15 @@ import { readManualDisableFlag, readManualDisableFlagSync, writeManualDisableFla
 // is a thin re-export. `git init` makes each temp dir a real repo so we exercise
 // RepoProfile's git-common-dir anchoring (the actual VS Code path) and don't
 // accidentally resolve to an enclosing repo if TMPDIR happens to sit inside one.
-describe("ManualDisableFlag (repo-wide, profile.json backed)", () => {
+//
+// Every test in this suite (directly or via beforeEach's `git init`) spawns a
+// real `git` subprocess — read/write both resolve the repo root via
+// `git rev-parse --git-common-dir`. Under v8 coverage instrumentation plus a
+// large parallel suite, that subprocess can occasionally take longer than
+// Vitest's 5s default, which is a load signal, not a correctness one. Give the
+// whole suite a generous timeout so it stays robust under load without hiding
+// an actual hang (45s is far beyond any real subprocess latency).
+describe("ManualDisableFlag (repo-wide, profile.json backed)", { timeout: 45_000 }, () => {
 	let cwd: string;
 
 	beforeEach(async () => {

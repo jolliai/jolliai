@@ -17,21 +17,33 @@ import { getJolliUrl } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
-import { isClaudeCodeUsable } from "../core/localagent/ClaudeExecutableResolver.js";
+import {
+	isLocalAgentUsable,
+	type LocalAgentOverride,
+	localAgentOverrideFrom,
+} from "../core/localagent/DetectAgents.js";
+import { localAgentToolLabel, localAgentToolLoginHint } from "../core/localagent/ToolMeta.js";
 import { getGlobalConfigDir, saveConfigScoped } from "../core/SessionTracker.js";
-import type { JolliMemoryConfig } from "../Types.js";
+import type { JolliMemoryConfig, LocalAgentToolId } from "../Types.js";
 import { promptText } from "./CliUtils.js";
 
 /**
  * True when the current config can actually generate summaries right now. For
- * the local agent this PROBES the same `claude` binary the commit-time runtime
- * would use (honoring an explicit `localAgentPath`) so it never disagrees with
- * what actually generates; for every other provider it defers to
- * {@link resolveLlmCredentialSource}. Shared verbatim by both the guided front
- * door and `jolli enable` so the two paths agree on "can generate?".
+ * the local agent this PROBES the CONFIGURED tool's binary — the same one the
+ * commit-time runtime resolves via getBackend(localAgentTool) — so it never
+ * disagrees with what actually generates. It used to probe `claude`
+ * unconditionally, which told Codex/Cursor/OpenCode users their generation was
+ * broken and sent them to repair a tool they never selected.
+ *
+ * The `?? "claude-code"` default matches StatusTreeProvider and SummaryUtils,
+ * and covers configs written before `localAgentTool` existed.
  */
-export function canGenerateNow(config: JolliMemoryConfig): boolean {
-	if (config.aiProvider === "local-agent") return isClaudeCodeUsable({ overridePath: config.localAgentPath });
+export async function canGenerateNow(config: JolliMemoryConfig): Promise<boolean> {
+	if (config.aiProvider === "local-agent") {
+		return isLocalAgentUsable(config.localAgentTool ?? "claude-code", {
+			override: localAgentOverrideFrom(config),
+		});
+	}
 	return resolveLlmCredentialSource(config) !== null;
 }
 
@@ -44,9 +56,9 @@ export function canGenerateNow(config: JolliMemoryConfig): boolean {
 export async function promptGenerationFix(config: JolliMemoryConfig): Promise<boolean> {
 	const configDir = getGlobalConfigDir();
 
-	// R3: the local agent is configured but `claude` isn't runnable.
+	// R3: the configured local agent tool isn't runnable.
 	if (config.aiProvider === "local-agent") {
-		return promptLocalAgentFix(configDir, config.localAgentPath);
+		return promptLocalAgentFix(configDir, config.localAgentTool ?? "claude-code", localAgentOverrideFrom(config));
 	}
 
 	const provider = config.aiProvider === "jolli" ? "jolli" : "anthropic";
@@ -95,23 +107,28 @@ export async function promptGenerationFix(config: JolliMemoryConfig): Promise<bo
 }
 
 /**
- * R3 repair: the provider is Local Agent but no usable `claude` was found.
- * Offers a retry (re-probe once), or a switch to Jolli / Anthropic, or skip.
- * Every branch terminates — no infinite retry loop. Returns whether generation
- * can now proceed.
+ * R3 repair: the provider is Local Agent but no usable binary was found for the
+ * CONFIGURED tool. Offers a retry (re-probe once), or a switch to Jolli /
+ * Anthropic, or skip. Every branch terminates — no infinite retry loop.
+ * Returns whether generation can now proceed.
  */
-async function promptLocalAgentFix(configDir: string, localAgentPath: string | undefined): Promise<boolean> {
+async function promptLocalAgentFix(
+	configDir: string,
+	tool: LocalAgentToolId,
+	override: LocalAgentOverride | undefined,
+): Promise<boolean> {
+	const label = localAgentToolLabel(tool);
 	console.log(
-		"\n  AI provider is set to Local Agent but no usable `claude` was found — memories won't be generated.\n",
+		`\n  AI provider is set to Local Agent (${label}) but no usable binary was found — memories won't be generated.\n`,
 	);
-	console.log("    1. Retry (after install / upgrade, or `claude login`)");
+	console.log("    1. Retry (after install / upgrade, or signing in)");
 	console.log("    2. Switch to Jolli (sign in)");
 	console.log("    3. Enter an Anthropic key");
 	console.log("    4. Skip for now");
 	const choice = (await promptText("\n  Choice [1]: ")) || "1";
 
 	if (choice === "4") {
-		console.log("\n  Skipped. Fix Claude Code or run `jolli configure` later.\n");
+		console.log(`\n  Skipped. Fix ${label} or run \`jolli configure\` later.\n`);
 		return false;
 	}
 	if (choice === "2") {
@@ -131,11 +148,12 @@ async function promptLocalAgentFix(configDir: string, localAgentPath: string | u
 		return promptAndSaveAnthropicKey(configDir);
 	}
 	// choice 1 — retry the probe exactly once, then stop.
-	if (isClaudeCodeUsable({ overridePath: localAgentPath })) {
-		console.log("\n  ✓ Claude Code is working now.");
+	if (await isLocalAgentUsable(tool, { override })) {
+		console.log(`\n  ✓ ${label} is working now.`);
 		return true;
 	}
-	console.log("\n  Still no usable `claude`. Fix it and run `jolli` again, or `jolli configure`.\n");
+	console.log(`\n  Still no usable ${label}. ${localAgentToolLoginHint(tool)}`);
+	console.log("  Fix it and run `jolli` again, or `jolli configure`.\n");
 	return false;
 }
 

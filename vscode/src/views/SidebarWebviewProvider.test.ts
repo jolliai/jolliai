@@ -2209,6 +2209,36 @@ describe("SidebarWebviewProvider", () => {
 		).toBe(true);
 	});
 
+	it("notifyLocalAgentSelectError posts localAgent:selectError with the supplied message", () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: false,
+				activeTab: "status",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		provider.notifyLocalAgentSelectError("agent not found");
+		const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+		expect(
+			sent.some(
+				(m) =>
+					typeof m === "object" &&
+					m !== null &&
+					(m as { type?: unknown }).type === "localAgent:selectError" &&
+					(m as { message?: unknown }).message === "agent not found",
+			),
+		).toBe(true);
+	});
+
 	it("notifyConfiguredChanged posts configured:changed with the new configured flag", () => {
 		const view = makeMockView();
 		const provider = new SidebarWebviewProvider({
@@ -2235,6 +2265,37 @@ describe("SidebarWebviewProvider", () => {
 					m !== null &&
 					(m as { type?: unknown }).type === "configured:changed" &&
 					(m as { configured?: unknown }).configured === true,
+			),
+		).toBe(true);
+	});
+
+	it("notifyLocalAgentsChanged posts localAgents:changed with the refreshed list", () => {
+		const view = makeMockView();
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn(),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				configured: false,
+				activeTab: "status",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		provider.notifyLocalAgentsChanged([{ id: "codex", label: "Codex" }]);
+		const sent = view.webview.postMessage.mock.calls.map((c) => c[0]);
+		expect(
+			sent.some(
+				(m) =>
+					typeof m === "object" &&
+					m !== null &&
+					(m as { type?: unknown }).type === "localAgents:changed" &&
+					JSON.stringify((m as { localAgents?: unknown }).localAgents) ===
+						JSON.stringify([{ id: "codex", label: "Codex" }]),
 			),
 		).toBe(true);
 	});

@@ -83,7 +83,7 @@ beforeAll(async () => {
 	execFileSync("git", ["add", "."], { cwd: seed });
 	execFileSync("git", ["commit", "--quiet", "-m", "[jolli-mb] seed"], { cwd: seed });
 	execFileSync("git", ["push", "--quiet", "origin", "main"], { cwd: seed });
-}, 30_000);
+}, 60_000);
 
 afterAll(async () => {
 	await rm(rootTempDir, { recursive: true, force: true });

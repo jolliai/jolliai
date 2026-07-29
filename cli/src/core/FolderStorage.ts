@@ -21,7 +21,7 @@ import type { CommitSummary, FileWrite, SummaryIndex, SummaryIndexEntry } from "
 import type { ManifestEntry } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
 import { toForwardSlash } from "./PathUtils.js";
-import type { HealOptions, HealResult, StorageProvider } from "./StorageProvider.js";
+import type { HealOptions, HealResult, StorageKind, StorageProvider } from "./StorageProvider.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
 import type { TopicPage } from "./TopicKBTypes.js";
 import {
@@ -42,6 +42,8 @@ const log = createLogger("FolderStorage");
 export type ForceRegenerateResult = { ok: true } | { ok: false; reason: "missing" | "malformed" | "unlinkFailed" };
 
 export class FolderStorage implements StorageProvider {
+	readonly kind: StorageKind = "folder";
+
 	constructor(
 		private readonly rootPath: string,
 		private readonly metadataManager: MetadataManager,
@@ -70,10 +72,27 @@ export class FolderStorage implements StorageProvider {
 
 	async readFile(path: string): Promise<string | null> {
 		const file = join(this.rootPath, ".jolli", path);
-		if (!existsSync(file)) return null;
+		// Read first and classify the errno, rather than gating on existsSync:
+		// existsSync returns false for a file it merely cannot STAT, so an EACCES
+		// on a parent directory used to be indistinguishable from absence and fell
+		// straight through to a silent `null` — the exact failure class the (now
+		// DEBUG) loadIndex warning used to be the last line of defence for. It also
+		// halves the syscalls on the index-heavy sweep path this change is about.
 		try {
 			return readFileSync(file, "utf-8");
-		} catch {
+		} catch (error: unknown) {
+			const code = (error as NodeJS.ErrnoException).code;
+			// The routine "nothing here" outcomes: the file is missing, or a path
+			// segment above it is missing / not a directory. Absence is expected on
+			// a fresh repo and on a cross-repo scan, so it stays quiet.
+			if (code === "ENOENT" || code === "ENOTDIR") return null;
+			// Anything else — EACCES, EIO, EBUSY, EISDIR, a concurrent truncation —
+			// is a genuine failure that the `null` return hides. Callers cannot
+			// recover the distinction: to them it is identical to "absent". So the
+			// warning belongs here, where the errno is still in hand, rather than at
+			// a caller reduced to guessing ("fresh repo or backend read failed").
+			// See JOLLI-2066.
+			log.warn("readFile failed for %s: %s", file, errMsg(error));
 			return null;
 		}
 	}

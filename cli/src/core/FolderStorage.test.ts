@@ -111,6 +111,66 @@ describe("FolderStorage", () => {
 			expect(existsSync(join(rootPath, ".jolli", "index.json"))).toBe(true);
 			expect(existsSync(join(rootPath, "index.json"))).toBe(false);
 		});
+
+		/**
+		 * A `null` from readFile means "absent" — but the same `null` used to be
+		 * returned for a file that IS present and failed to read, with the errno
+		 * discarded. Callers cannot recover that distinction, so the warning has
+		 * to happen here (JOLLI-2066).
+		 *
+		 * The failure is provoked with a directory standing where a file is
+		 * expected, so `readFileSync` throws EISDIR — a code that is neither
+		 * ENOENT nor ENOTDIR and therefore must be reported. That beats chmod,
+		 * which is a no-op for root and unreliable on Windows.
+		 */
+		it("warns (and still returns null) when an existing path cannot be read", async () => {
+			const warnSpy = vi.mocked(console.warn);
+			warnSpy.mockClear();
+			mkdirSync(join(rootPath, ".jolli", "trap.txt"));
+
+			expect(await storage.readFile("trap.txt")).toBeNull();
+
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+			const logged = String(warnSpy.mock.calls[0]?.[0]);
+			expect(logged).toContain("readFile failed for");
+			expect(logged).toContain("trap.txt");
+		});
+
+		it("stays quiet when the file is simply absent", async () => {
+			const warnSpy = vi.mocked(console.warn);
+			warnSpy.mockClear();
+
+			expect(await storage.readFile("never-written.txt")).toBeNull();
+
+			expect(warnSpy).not.toHaveBeenCalled();
+		});
+
+		it("stays quiet when a parent path segment is a FILE, not a directory", async () => {
+			// ENOTDIR: `<root>/.jolli/wall/inner.json` where `wall` is a regular
+			// file. Structurally "nothing here", same as ENOENT — so it must not
+			// warn, or a cross-repo sweep over a malformed sibling folder would
+			// warn on every read.
+			const warnSpy = vi.mocked(console.warn);
+			warnSpy.mockClear();
+			writeFileSync(join(rootPath, ".jolli", "wall"), "not a dir");
+
+			expect(await storage.readFile("wall/inner.json")).toBeNull();
+
+			expect(warnSpy).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("kind", () => {
+		/**
+		 * Guards the minification trap this field exists to close: both shipping
+		 * bundles minify without `keepNames`, so `constructor.name` reaches
+		 * production mangled (`Xe` from the CLI, `t` from the extension) and is
+		 * useless for diagnostics. Asserting the literal keeps any rename of the
+		 * class from silently changing what logs report.
+		 */
+		it("reports a stable identity that does not depend on the class name", () => {
+			expect(storage.kind).toBe("folder");
+		});
 	});
 
 	describe("listFiles", () => {

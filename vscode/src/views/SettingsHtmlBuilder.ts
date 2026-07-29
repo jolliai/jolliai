@@ -166,6 +166,7 @@ export function buildSettingsHtml(nonce: string): string {
         <select id="localAgentTool">
           ${LOCAL_AGENT_TOOL_OPTIONS}
         </select>
+        <p class="local-agent-status" id="localAgentStatus"></p>
         <p class="section-hint">Uses your local agent's own login (subscription/BYOK). Sign in with that tool's CLI if prompted.</p>
       </div>
     </section>

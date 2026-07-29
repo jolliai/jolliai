@@ -32,6 +32,18 @@ const log = createLogger("GitOps");
  * argv array, sidestepping CodeQL's `js/shell-command-constructed-from-input`
  * static-analysis alert (`spawn` with an args array never invokes a shell,
  * but CodeQL tracks taint conservatively).
+ *
+ * `LC_ALL=C` pins git's messages to English. git is gettext-localized, so on a
+ * host with translations installed (`git-l10n` on most Linux distros; Apple git
+ * ships none, which is why this is invisible on macOS) a non-English `LANG`
+ * makes git emit translated stderr. Every consumer that classifies git output by
+ * text — {@link GIT_ABSENT_STDERR_FRAGMENTS} most sharply, since a missed match
+ * there turns a routine absence into a logged failure — would then silently
+ * misread it for exactly the users least able to report why. `LC_ALL` (rather
+ * than `LANG`/`LC_MESSAGES`) because it outranks both, so one variable is
+ * enough. Set here, at the single choke point for our message-parsing git
+ * calls; the `spawnHidden` paths below parse plumbing protocol output
+ * (`cat-file --batch` headers, fast-import), which git does not translate.
  */
 export async function execGit(args: ReadonlyArray<string>, cwd?: string): Promise<GitCommandResult> {
 	log.debug("git %s%s", cwd ? `[cwd=${cwd}] ` : "", args.join(" "));
@@ -39,6 +51,7 @@ export async function execGit(args: ReadonlyArray<string>, cwd?: string): Promis
 	try {
 		const { stdout, stderr } = await execFileAsyncHidden("git", args, {
 			maxBuffer: MAX_GIT_BUFFER_BYTES,
+			env: { ...process.env, LC_ALL: "C" },
 			...(cwd !== undefined && { cwd }),
 		});
 		const result: GitCommandResult = {
@@ -483,14 +496,72 @@ export async function ensureOrphanBranch(branch: string, cwd?: string): Promise<
 }
 
 /**
+ * stderr fragments git emits when the requested object is simply not there —
+ * a normal, expected outcome (fresh repo with no orphan branch yet, a path that
+ * predates a summary, a cross-repo probe).
+ *
+ * Matching is on stderr text rather than exit code because git returns **128**
+ * for both absence and genuine breakage alike (measured: missing path, missing
+ * ref, and "not a git repository" all exit 128). Each entry below is verbatim
+ * from real `git show` output:
+ *
+ *     fatal: path 'x.json' does not exist in '<branch>'
+ *     fatal: path 'x.json' does not exist (neither on disk nor in the index)
+ *     fatal: invalid object name '<branch>'.
+ *     fatal: path 'AGENTS.md' exists on disk, but not in '<branch>'
+ *     fatal: ambiguous argument 'x': unknown revision or path not in the working tree.
+ *
+ * The polarity is deliberate: this is an allowlist of *absence*, so anything
+ * unrecognized — a corrupt object database, `detected dubious ownership`,
+ * `not a git repository`, EACCES on `.git`, git missing from PATH — falls
+ * through to the failure branch and is reported. A denylist of failures would
+ * silently swallow every error phrasing we failed to anticipate.
+ *
+ * Note the fragments stay specific rather than collapsing to a bare
+ * "does not exist": a corrupt object database reports `object file … does not
+ * exist`, which is a real failure that the loose form would swallow.
+ */
+const GIT_ABSENT_STDERR_FRAGMENTS = [
+	"does not exist in",
+	"does not exist (neither on disk nor in the index)",
+	"invalid object name",
+	"exists on disk, but not in",
+	"unknown revision or path not in the working tree",
+] as const;
+
+/** True when git's stderr says the object is absent, as opposed to unreadable. */
+function isAbsentFromBranch(stderr: string): boolean {
+	const lower = stderr.toLowerCase();
+	return GIT_ABSENT_STDERR_FRAGMENTS.some((fragment) => lower.includes(fragment));
+}
+
+/**
  * Reads a file from a branch without checking it out.
- * Returns null if the file doesn't exist.
+ *
+ * Returns null when the file doesn't exist. A null is ALSO returned when the
+ * read fails outright, because callers have no third state to receive — but that
+ * case is logged as a warning here rather than passed up silently, since this is
+ * the last point where git's stderr is available to name the cause. Callers must
+ * therefore treat null as "nothing to read", not "nothing went wrong".
  */
 export async function readFileFromBranch(branch: string, filePath: string, cwd?: string): Promise<string | null> {
 	log.debug("Reading file from branch: %s:%s", branch, filePath);
 	const result = await execGit(["show", `${branch}:${filePath}`], cwd);
 	if (result.exitCode !== 0) {
-		log.debug("File not found: %s:%s", branch, filePath);
+		if (isAbsentFromBranch(result.stderr)) {
+			log.debug("File not found: %s:%s", branch, filePath);
+		} else {
+			// Not an absence — the read itself broke. Callers only ever see the
+			// `null` below and cannot tell the two apart, so this is the only
+			// place the cause can be named. See JOLLI-2066.
+			log.warn(
+				"Read failed for %s:%s (git exit %d): %s",
+				branch,
+				filePath,
+				result.exitCode,
+				result.stderr || "(no stderr)",
+			);
+		}
 		return null;
 	}
 	return result.stdout;

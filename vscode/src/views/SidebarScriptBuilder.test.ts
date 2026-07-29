@@ -1972,6 +1972,134 @@ describe("SidebarScriptBuilder", () => {
 			const end = js.indexOf("function ", start + 1);
 			expect(js.slice(start, end)).toMatch(/applyEnabled\(state\.enabled\)/);
 		});
+
+		describe("onboarding local-agent card", () => {
+			// NOTE: like the rest of this file, these are assertions on the
+			// GENERATED SCRIPT STRING (no jsdom execution — see the file-level
+			// convention note elsewhere in this suite), sliced to the relevant
+			// function/case body so a regression in structure or ordering fails
+			// loudly even without a live DOM.
+			it("declares element refs for every local-agent DOM id the HTML produces", () => {
+				const js = buildSidebarScript();
+				expect(js).toContain("getElementById('onboarding-localagent-block')");
+				expect(js).toContain("getElementById('onboarding-localagent-select')");
+				expect(js).toContain("getElementById('onboarding-localagent-btn')");
+				expect(js).toContain("getElementById('onboarding-localagent-error')");
+				expect(js).toContain("getElementById('onboarding-apikey-card')");
+			});
+
+			it("init handler forwards state.localAgents to applyLocalAgents", () => {
+				const js = buildSidebarScript();
+				const start = js.indexOf("case 'init'");
+				const end = js.indexOf("case '", start + 1);
+				expect(start).toBeGreaterThan(-1);
+				const body = js.slice(start, end);
+				expect(body).toContain("applyLocalAgents(msg.state.localAgents)");
+			});
+
+			it("handles localAgents:changed by re-applying the refreshed list", () => {
+				// The onboarding panel can come back mid-window (sign-out / cleared
+				// key) with a host-side list that was never populated. Without this
+				// case the panel re-renders from the stale init snapshot and silently
+				// drops the local-agent card.
+				const js = buildSidebarScript();
+				const start = js.indexOf("case 'localAgents:changed'");
+				expect(start).toBeGreaterThan(-1);
+				const body = js.slice(start, js.indexOf("case '", start + 1));
+				expect(body).toContain("applyLocalAgents(msg.localAgents)");
+				// Ordering guarantee mirrored on the host: the list case is handled
+				// before the panel-visibility case in the same switch.
+				expect(start).toBeLessThan(js.indexOf("case 'configured:changed'"));
+			});
+
+			it("applyLocalAgents: empty list hides the block and restores ob-card--recommended onto the API-key card", () => {
+				const js = buildSidebarScript();
+				expect(js).toContain("function applyLocalAgents");
+				const start = js.indexOf("function applyLocalAgents");
+				const end = js.indexOf("\n  function ", start + 1);
+				const body = js.slice(start, end);
+				const listIsEmptyIdx = body.search(/if\s*\(\s*list\.length === 0\s*\)/);
+				expect(listIsEmptyIdx).toBeGreaterThan(-1);
+				const emptyBranch = body.slice(listIsEmptyIdx, body.indexOf("return;", listIsEmptyIdx));
+				expect(emptyBranch).toContain("onboardingLocalAgentBlock.classList.add('hidden')");
+				expect(emptyBranch).toContain("onboardingApikeyCard.classList.add('ob-card--recommended')");
+				// The badge is moved (not merely un-hidden) onto the API-key card —
+				// a real DOM reparent so querySelector('.ob-badge') on the
+				// local-agent card returns null once it has moved.
+				expect(emptyBranch).toMatch(
+					/onboardingApikeyCard\.insertBefore\(onboardingLocalAgentBadge,\s*onboardingApikeyCard\.firstChild\)/,
+				);
+			});
+
+			it("applyLocalAgents: non-empty list populates <option>s in order, pre-selects the first, and shows the block", () => {
+				const js = buildSidebarScript();
+				const start = js.indexOf("function applyLocalAgents");
+				const end = js.indexOf("\n  function ", start + 1);
+				const body = js.slice(start, end);
+				// Cleared before repopulating so a second init (or a stale list)
+				// never leaves duplicate <option>s behind.
+				expect(body).toContain("onboardingLocalAgentSelect.replaceChildren()");
+				expect(body).toMatch(
+					/for\s*\(\s*const a of list\s*\)[\s\S]*?opt\.value = a\.id;[\s\S]*?opt\.textContent = a\.label;[\s\S]*?onboardingLocalAgentSelect\.appendChild\(opt\)/,
+				);
+				expect(body).toContain("onboardingLocalAgentSelect.value = list[0].id");
+				expect(body).toContain("onboardingLocalAgentBlock.classList.remove('hidden')");
+				expect(body).toContain("onboardingApikeyCard.classList.remove('ob-card--recommended')");
+				// Idempotent badge placement: if a previous no-agents init already
+				// moved it onto the API-key card, this call moves it back.
+				expect(body).toMatch(
+					/localAgentCard\.insertBefore\(onboardingLocalAgentBadge,\s*localAgentCard\.firstChild\)/,
+				);
+			});
+
+			it("wires the button click to dispatch jollimemory.selectLocalAgentTool with the selected tool and shows Checking…", () => {
+				const js = buildSidebarScript();
+				expect(js).toContain("onboardingLocalAgentBtn.addEventListener('click'");
+				const start = js.indexOf("onboardingLocalAgentBtn.addEventListener('click'");
+				const end = js.indexOf("});", start);
+				const body = js.slice(start, end);
+				// Both controls are disabled while the (possibly slow) capability
+				// probe is in flight, and any stale error from a prior attempt is
+				// cleared before dispatching.
+				expect(body).toContain("onboardingLocalAgentBtn.disabled = true");
+				expect(body).toContain("onboardingLocalAgentSelect.disabled = true");
+				expect(body).toMatch(/onboardingLocalAgentBtn\.textContent\s*=\s*['"]Checking/);
+				expect(body).toContain("onboardingLocalAgentError.classList.add('hidden')");
+				expect(body).toContain("onboardingLocalAgentError.textContent = ''");
+				expect(body).toContain("'jollimemory.selectLocalAgentTool'");
+				// The selected <option>'s value (a LOCAL_AGENT_TOOLS id) is forwarded
+				// as args:[tool] — SidebarWebviewProvider.handleOutbound spreads it
+				// into the registered handler's first positional parameter.
+				expect(body).toMatch(/args:\s*\[\s*tool\s*\]/);
+			});
+
+			it("guards the click handler on a non-empty select value", () => {
+				const js = buildSidebarScript();
+				const start = js.indexOf("onboardingLocalAgentBtn.addEventListener('click'");
+				const end = js.indexOf("});", start);
+				const body = js.slice(start, end);
+				expect(body).toMatch(/if\s*\(\s*!tool\s*\)\s*return;/);
+			});
+
+			it("localAgent:selectError restores the button and select and surfaces the message inline (only when onboarding is still active)", () => {
+				const js = buildSidebarScript();
+				expect(js).toContain("case 'localAgent:selectError'");
+				const start = js.indexOf("case 'localAgent:selectError'");
+				const end = js.indexOf("break", start);
+				const body = js.slice(start, end);
+				// Guard: if the onboarding panel was already retired (success raced
+				// past us), don't re-show the controls.
+				expect(body).toContain("onboardingPanel.classList.contains('hidden')");
+				expect(body).toContain("onboardingLocalAgentBtn.disabled = false");
+				expect(body).toContain("onboardingLocalAgentSelect.disabled = false");
+				expect(body).toMatch(
+					/onboardingLocalAgentBtn\.textContent\s*=\s*['"]Use Local Agent Tool['"]/,
+				);
+				expect(body).toContain("onboardingLocalAgentError.classList.remove('hidden')");
+				// Fall-back string when the host posts an empty/non-string message.
+				expect(body).toContain("Could not use that tool.");
+			});
+		});
 	});
 
 	describe("Current Branch command bar footer", () => {

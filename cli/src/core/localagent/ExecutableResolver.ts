@@ -1,6 +1,6 @@
-import { existsSync, readdirSync } from "node:fs";
+import { accessSync, existsSync, constants as fsConstants, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { posix as pathPosix } from "node:path";
+import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { createLogger } from "../../Logger.js";
 import { execFileSyncHidden } from "../../util/Subprocess.js";
 import { LocalAgentSetupError, type ResolvedExecutable } from "./Types.js";
@@ -230,6 +230,141 @@ export function discover(spec: ExecutableSpec, platform: NodeJS.Platform, deps: 
 	const candidates = dedupe([...unique.filter(isExe).map((file) => ({ file })), ...expanded]);
 	logDiscovery(spec, candidates.length, candidates.map(describeCandidate), shims, known, searchPath, ";");
 	return candidates;
+}
+
+/**
+ * win32 filename extensions a presence scan accepts. Deliberately WIDER than
+ * what {@link discover} treats as spawnable: a `.cmd` / `.ps1` / extensionless
+ * shim cannot be launched directly (see {@link discover}'s header), but it IS
+ * proof of an install, and presence answers "is this tool on disk?", not "can we
+ * spawn it?". Resolving a shim to a native target stays {@link resolveExecutable}'s
+ * job. `""` last so a real image sorts ahead of a shim in the returned list.
+ */
+const WIN32_PRESENCE_EXTS = [".exe", ".cmd", ".bat", ".ps1", ""] as const;
+
+/**
+ * Default file test for the PRESENCE half only. Deliberately stricter than
+ * `existsSync`, which answers true for a DIRECTORY and ignores the execute bit:
+ * a directory named `codex` somewhere on PATH, or an `opencode` that has been
+ * `chmod -x`'d, would otherwise both be reported as an installed tool.
+ *
+ * That matters because presence and usability must not disagree in the
+ * optimistic direction. {@link discover} cannot produce this false positive —
+ * `which -a` / `where` only ever name executables — so a presence-only "yes"
+ * becomes an onboarding option the user can click and then cannot use. The CLI
+ * menu absorbs it (a failed probe splices the entry out), but the VS Code
+ * onboarding card has no such fallback.
+ *
+ * NOT wired into {@link discover}'s `exists` seam, which is also handed to
+ * `expandShim` — that one legitimately tests a plain `index.js`, which carries
+ * no execute bit.
+ *
+ * `X_OK` is POSIX-only: Windows has no execute bit (Node treats `X_OK` as
+ * `F_OK` there) and a win32 presence hit is allowed to be a `.cmd` / `.ps1`
+ * shim, so win32 stops at "is a regular file". `statSync` follows symlinks,
+ * matching `existsSync` — a symlink to a real binary is a good install, and a
+ * broken one is absent under either predicate.
+ */
+function isPresentFile(file: string, platform: NodeJS.Platform): boolean {
+	try {
+		if (!statSync(file).isFile()) return false;
+		if (platform === "win32") return true;
+		accessSync(file, fsConstants.X_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Test seams and platform override for {@link isPresent} / {@link discoverPresence}. */
+export interface PresenceOpts {
+	readonly overridePath?: string;
+	/** Pre-baked enumeration result; bypasses {@link discoverPresence} entirely. */
+	readonly candidates?: () => readonly Candidate[];
+	readonly platform?: NodeJS.Platform;
+	readonly exists?: (path: string) => boolean;
+	/** Home directory; defaults to `os.homedir()`. */
+	readonly home?: string;
+	/** Base PATH scanned before common-dir augmentation; defaults to `process.env.PATH`. */
+	readonly basePath?: string;
+}
+
+/**
+ * Spawn-free presence enumeration: the files named `<binName>` (plus the win32
+ * extensions) that exist across {@link discoveryPath}, followed by the spec's
+ * known install locations.
+ *
+ * Deliberately does NOT shell out to `which` / `where` the way {@link discover}
+ * does. Those are synchronous subprocesses (`execFileSyncHidden`), and the whole
+ * point of the presence half is that a four-tool sweep can sit on the VS Code
+ * activation path — where the extension host is single-threaded and a blocked
+ * event loop stalls *every* extension, not just this one. Four `which` spawns
+ * are cheap on macOS and distinctly not cheap on Windows, where `where` runs
+ * tens of milliseconds apiece. Reading the same directories with `existsSync`
+ * answers the same question with no process at all.
+ *
+ * The trade-off versus `which`: PATHEXT subtleties and shell aliases are not
+ * modelled. That is acceptable precisely because presence is allowed to be
+ * approximate — {@link resolveExecutable} still runs the real enumeration and
+ * capability probe before anything is launched.
+ *
+ * Approximate is allowed to mean "misses an install"; it is NOT allowed to mean
+ * "invents one", since a presence-only yes is what paints a clickable onboarding
+ * option. Hence {@link isPresentFile} rather than a bare `existsSync` — see its
+ * header for the directory / non-executable false positives that closes.
+ */
+export function discoverPresence(spec: ExecutableSpec, platform: NodeJS.Platform, opts: PresenceOpts = {}): string[] {
+	const home = opts.home ?? homedir();
+	const basePath = opts.basePath ?? process.env.PATH ?? "";
+	const exists = opts.exists ?? ((f: string) => isPresentFile(f, platform));
+	// Join with the TARGET platform's rules, not the host's, so a `"darwin"`-
+	// pinned test on a Windows box still builds POSIX paths (same reason
+	// commonBinDirs uses path.posix).
+	const joinFor = platform === "win32" ? pathWin32.join : pathPosix.join;
+	const dirs = discoveryPath(basePath, home, platform).split(platform === "win32" ? ";" : ":");
+	const exts = platform === "win32" ? WIN32_PRESENCE_EXTS : [""];
+	const hits: string[] = [];
+	for (const dir of dirs) {
+		if (!dir) continue;
+		for (const ext of exts) {
+			const file = joinFor(dir, spec.binName + ext);
+			if (exists(file)) hits.push(file);
+		}
+	}
+	hits.push(...spec.knownPaths(home, platform).filter(exists));
+	return [...new Set(hits)];
+}
+
+/**
+ * Cheap "is this tool on disk?" check — filesystem enumeration only, with NO
+ * capability probe and NO subprocess.
+ *
+ * This is the presence half of the presence/usability split. {@link resolveExecutable}
+ * spawns `<bin> --version` per candidate to pick the newest and prove the tool
+ * accepts our flags; that costs a measured 161-1772 ms per tool and 3384 ms to
+ * sweep all four. Presence is pure filesystem work — see {@link discoverPresence}
+ * for why it avoids `which`/`where` too — which is what makes a four-tool sweep
+ * affordable on the VS Code activation path.
+ *
+ * Deliberately does NOT touch the module-level resolution cache: a presence
+ * answer must never be mistaken for, or displace, a real resolution.
+ *
+ * A `true` result means "found something that looks installed". It does not mean
+ * the binary runs, is a compatible version, or that the user is signed in.
+ * Callers that need those guarantees must still call {@link resolveExecutable}.
+ */
+export function isPresent(spec: ExecutableSpec, opts: PresenceOpts = {}): boolean {
+	const platform = opts.platform ?? process.platform;
+	const exists = opts.exists ?? ((f: string) => isPresentFile(f, platform));
+	if (opts.overridePath) {
+		// An override names one specific file. overrideCandidates always returns
+		// at least the verbatim path (so the probe can produce a useful error),
+		// which would make presence trivially true — so check the filesystem here
+		// instead of trusting the list's length.
+		return overrideCandidates(spec, opts.overridePath, platform).list.some((c) => exists(c.file));
+	}
+	if (opts.candidates) return opts.candidates().length > 0;
+	return discoverPresence(spec, platform, opts).length > 0;
 }
 
 /**

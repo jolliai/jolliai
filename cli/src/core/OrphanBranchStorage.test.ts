@@ -33,6 +33,12 @@ describe("OrphanBranchStorage", () => {
 		vi.clearAllMocks();
 	});
 
+	// Minification-safe backend identity — `constructor.name` is mangled in both
+	// shipping bundles, so diagnostics read this instead (JOLLI-2066).
+	it("reports a stable kind that does not depend on the class name", () => {
+		expect(new OrphanBranchStorage("/tmp/repo").kind).toBe("orphan-branch");
+	});
+
 	it("readFile forwards ORPHAN_BRANCH, path and cwd to readFileFromBranch", async () => {
 		mockedReadFile.mockResolvedValueOnce("hello");
 		const storage = new OrphanBranchStorage("/tmp/repo");

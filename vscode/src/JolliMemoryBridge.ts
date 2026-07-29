@@ -886,6 +886,7 @@ export class JolliMemoryBridge {
 			diffLength: stagedDiff.length,
 			branch,
 			hasApiKey: !!config.apiKey,
+			usesLocalAgent: config.aiProvider === "local-agent",
 			model: config.model,
 		});
 

@@ -325,8 +325,67 @@ function coalesceLegacyKeys(raw: JolliMemoryConfig): JolliMemoryConfig {
 }
 
 /**
+ * Drops a `localAgentPath` that the incoming `localAgentTool` would orphan.
+ *
+ * `localAgentPath` names ONE tool's binary (see `LocalAgentOverride` in
+ * `core/localagent/DetectAgents.ts`), but the persisted config records only the
+ * path — never its owner. So a path left behind by a previous tool is
+ * INDISTINGUISHABLE at read time from a path deliberately set for the current
+ * one: `{tool: "cursor", path: "…/codex"}` and `{tool: "cursor",
+ * path: "…/my-cursor"}` are the same two fields. That is why the ownership rule
+ * cannot be enforced by the readers (`callLocalAgent`, `jolli doctor`,
+ * `BackfillEngine`) — an override short-circuits discovery entirely
+ * (`resolveExecutable`), so a stale path becomes the ONLY candidate and the new
+ * tool is probed at the old tool's binary.
+ *
+ * It is enforced here instead, at the single write chokepoint every surface
+ * funnels through — CLI commands, the VS Code extension (which bundles this
+ * module), and the IntelliJ plugin (via `ide-bridge config-save`) — so no writer
+ * can forget it and no new writer has to remember.
+ *
+ * Two deliberate exemptions:
+ *   - The tool is UNCHANGED — re-saving the same tool must not discard the user's
+ *     override. The VS Code Settings panel writes `localAgentTool` on every Apply.
+ *     BOTH sides of that comparison go through `?? "claude-code"`, mirroring the
+ *     ownership fallback in `localAgentOverrideFrom`: an update that clears the
+ *     field is asking for the default, so clearing it on a config that was
+ *     already defaulted is not a tool change and must not drop the override.
+ *   - The update supplies `localAgentPath` ITSELF — setting both together is how
+ *     a tool + its explicit binary are configured in one write, so the incoming
+ *     path is the new owner's and stays.
+ *
+ * Both fields are tested for presence with `in`, never `=== undefined`. An
+ * explicit `undefined` IS a write — "clear this back to the default" — and
+ * `JSON.stringify` duly drops the key. Treating it as absent would let
+ * `{localAgentTool: undefined}` sail past this guard on a config holding
+ * `{tool: "codex", path: "…/codex"}`, persisting the path with no tool: read
+ * back, `localAgentOverrideFrom` reports `{tool: "claude-code", path: "…/codex"}`
+ * and Claude Code gets probed at Codex's binary — the exact orphan state this
+ * function exists to make unrepresentable. No writer does that today; the point
+ * of enforcing it here is that no future one has to know.
+ */
+function dropOrphanedLocalAgentPath(
+	existing: JolliMemoryConfig,
+	update: Partial<JolliMemoryConfig>,
+): Partial<JolliMemoryConfig> {
+	if (!("localAgentTool" in update) || "localAgentPath" in update) return update;
+	if ((existing.localAgentTool ?? "claude-code") === (update.localAgentTool ?? "claude-code")) return update;
+	if (existing.localAgentPath === undefined) return update;
+	log.info(
+		"Clearing localAgentPath (was set for %s, switching to %s)",
+		existing.localAgentTool ?? "claude-code",
+		update.localAgentTool,
+	);
+	return { ...update, localAgentPath: undefined };
+}
+
+/**
  * Saves a partial config update to a specific directory.
  * Creates the directory if needed, merges with existing config, writes atomically.
+ *
+ * Switching `localAgentTool` also clears a now-orphaned `localAgentPath` — see
+ * {@link dropOrphanedLocalAgentPath} for why that invariant lives here and not
+ * in the code that reads those two fields.
  *
  * @param update - Partial config fields to save
  * @param targetDir - Directory to write config.json into
@@ -336,7 +395,7 @@ export async function saveConfigScoped(update: Partial<JolliMemoryConfig>, targe
 	const existing = await loadConfigFromDir(targetDir);
 	// Fields set to undefined are omitted by JSON.stringify, effectively
 	// removing them from the persisted config file.
-	const merged = { ...existing, ...update };
+	const merged = { ...existing, ...dropOrphanedLocalAgentPath(existing, update) };
 	await atomicWrite(join(targetDir, CONFIG_FILE), JSON.stringify(merged, null, "\t"));
 	log.info("Config saved to %s", targetDir);
 }

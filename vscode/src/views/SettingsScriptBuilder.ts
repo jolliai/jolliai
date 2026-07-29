@@ -28,6 +28,7 @@ export function buildSettingsScript(): string {
   const maxTokensInput = document.getElementById('maxTokens');
   const aiProviderSelect = document.getElementById('aiProvider');
   const localAgentToolSelect = document.getElementById('localAgentTool');
+  const localAgentStatus = document.getElementById('localAgentStatus');
   // Two Jolli API key inputs (jolli-ok and jolli-nokey cards) — kept in sync.
   const jolliApiKeyInput = document.getElementById('jolliApiKey');
   const jolliApiKeyNoKeyInput = document.getElementById('jolliApiKeyNoKey');
@@ -73,6 +74,22 @@ export function buildSettingsScript(): string {
   let initialState = {};
   let isDirty = false;
   let hasErrors = false;
+  // Availability of the currently-selected agent tool. null = unknown / probe
+  // in flight. Only a confirmed false blocks Apply (via localAgentBlocks(),
+  // read from updateApplyBtn), so a slow probe never flickers Apply to
+  // disabled.
+  let localAgentAvailable = null;
+  // Which tool the in-flight probe was dispatched for. A reply is applied
+  // only when it still matches the current dropdown value, so switching tools
+  // before a slow reply lands can't apply a stale result to the new selection.
+  let localAgentProbeTool = null;
+  // Set when an Apply click landed while a probe was still in flight. The save
+  // is HELD (not rejected, not sent) until the reply decides it — see
+  // submitApplySettings. Cleared by probeLocalAgent(), so any form edit that
+  // dispatches a new probe drops the held save rather than applying a click the
+  // user made against a form state that no longer exists.
+  let pendingApply = false;
+  let pendingApplyTimer = null;
   // Auth state pushed by the extension host (settingsLoaded + authStateChanged).
   let signedIn = false;
   let hasJolliKey = false;
@@ -405,17 +422,73 @@ export function buildSettingsScript(): string {
     updateApplyBtn();
   }
 
+  // Only meaningful when the provider actually reads localAgentTool ("Ignored
+  // unless aiProvider === 'local-agent'" — cli/src/Types.ts). Apply is a
+  // single global button saving every tab, so an unusable agent tool must not
+  // block an unrelated Memory Bank edit. A pending probe (localAgentAvailable
+  // === null) never blocks — only a confirmed-unavailable result does.
+  function localAgentBlocks() {
+    return aiProviderSelect.value === 'local-agent' && localAgentAvailable === false;
+  }
+
+  // Looks up a tool's display label by <option value>, never by selectedIndex:
+  // selectedIndex is -1 when nothing is selected, and indexing options[-1]
+  // throws. Falls back to the raw id so a lookup miss degrades to readable
+  // text instead of "undefined".
+  function localAgentToolOptionLabel(toolId) {
+    for (var i = 0; i < localAgentToolSelect.options.length; i++) {
+      if (localAgentToolSelect.options[i].value === toolId) {
+        return localAgentToolSelect.options[i].textContent;
+      }
+    }
+    return toolId;
+  }
+
+  // Verifies the currently-selected agent tool actually runs on this machine.
+  // Dispatched on tool-select change, on switching the provider to
+  // local-agent, and once on panel open (settingsLoaded) so an already-
+  // unavailable configured tool surfaces immediately.
+  function probeLocalAgent() {
+    var tool = localAgentToolSelect.value;
+    // A new probe means the form moved (tool switched, provider switched, or a
+    // fresh load). Whatever Apply click is being held was made against the old
+    // state, so drop it instead of silently re-targeting it at the new value.
+    // The change handlers call clearSaveFeedback() just before this, so the
+    // 'Checking…' line the held save wrote is already gone.
+    cancelPendingApply();
+    localAgentProbeTool = tool;
+    localAgentAvailable = null;
+    if (localAgentStatus) {
+      localAgentStatus.textContent = 'Checking…';
+      localAgentStatus.classList.remove('error');
+    }
+    updateApplyBtn();
+    vscode.postMessage({ command: 'probeLocalAgent', tool: tool });
+  }
+
   function updateApplyBtn() {
-    // Gate on both "nothing to save" and "has client-side errors". The click
-    // handler also re-runs validateAll() and surfaces a saveFeedback message
-    // if a validation error slips through (e.g. programmatic value change),
-    // so the user gets explicit feedback rather than a swallowed click.
-    applyBtn.disabled = !isDirty || hasErrors;
+    // Gate on "nothing to save", "has client-side errors", and an unusable
+    // local-agent tool selection (localAgentBlocks — only live while the
+    // provider is local-agent). The click handler also re-runs validateAll()
+    // and surfaces a saveFeedback message if a validation error slips through
+    // (e.g. programmatic value change), so the user gets explicit feedback
+    // rather than a swallowed click.
+    applyBtn.disabled = !isDirty || hasErrors || localAgentBlocks();
   }
 
   function clearSaveFeedback() {
     saveFeedback.classList.remove('visible');
     saveFeedback.classList.remove('error');
+  }
+
+  // Drops a held Apply and disarms its watchdog. Idempotent — safe to call when
+  // nothing is held, which is the common case.
+  function cancelPendingApply() {
+    pendingApply = false;
+    if (pendingApplyTimer) {
+      clearTimeout(pendingApplyTimer);
+      pendingApplyTimer = null;
+    }
   }
 
   // ── Event listeners ──
@@ -453,28 +526,102 @@ export function buildSettingsScript(): string {
     rebuildKbStatus.textContent = '';
   });
   modelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
-  localAgentToolSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
+  localAgentToolSelect.addEventListener('change', function() {
+    checkDirty(); clearSaveFeedback(); probeLocalAgent();
+  });
   aiProviderSelect.addEventListener('change', function() {
     checkDirty(); clearSaveFeedback(); syncProviderCard();
+    // Re-verify when switching TO local-agent (a stale/never-probed result
+    // must not silently pass); switching away is handled by checkDirty()'s
+    // updateApplyBtn() call above, since localAgentBlocks() reads the live
+    // provider value and clears on its own.
+    if (aiProviderSelect.value === 'local-agent') probeLocalAgent();
   });
   [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput, copilotEnabledInput, clineEnabledInput, devinEnabledInput, antigravityEnabledInput, globalInstructionsInput].forEach(function(input) {
     input.addEventListener('change', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
   });
   dcoSignoffInput.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
 
+  // Aborts a queued Migrate-after-Apply / SyncNow-after-Apply chain. Called
+  // wherever the save those chains are waiting on will definitively not land:
+  // the host rejected it (settingsError), a resumed held save hit a validation
+  // error, or the probe watchdog gave up. Without a single place doing this, a
+  // flag armed by the Sync now / Migrate button can outlive its save and fire
+  // against some LATER, unrelated one.
+  function abortApplyChains() {
+    if (pendingMigrateAfterApply) {
+      // Don't migrate against state that was never persisted.
+      pendingMigrateAfterApply = false;
+      rebuildKbStatus.textContent = '';
+    }
+    // Same reason: no sync round against config the host never wrote.
+    pendingSyncAfterApply = false;
+  }
+
   // ── Apply Changes ──
-  // Returns true if the apply message was posted, false if a validation error
-  // blocked the post. The Migrate-after-Apply chain uses the return value to
-  // decide whether to clear pendingMigrateAfterApply on the spot.
+  // Returns true if the save is under way — either posted now, or HELD behind an
+  // in-flight local-agent probe that will re-enter this function. Returns false
+  // only when the save definitively will not happen (a validation error, or a
+  // confirmed-unavailable agent tool).
+  //
+  // The Migrate-after-Apply / SyncNow-after-Apply chains read this to decide
+  // whether to disarm on the spot, so "held" must be truthy: those chains have
+  // to stay armed across the hold and fire on the resumed save's settingsSaved.
+  // The resume site is what disarms them if the held save is then rejected.
   function submitApplySettings() {
     // Final client-side pass so inline errors stay in sync even if a field was
     // changed programmatically or before any input event had a chance to fire.
     validateAll();
-    if (hasErrors) {
-      saveFeedback.textContent = 'Please fix the highlighted fields before saving';
+    // Mirror updateApplyBtn()'s gate here too: the Apply button being disabled
+    // only stops a direct click. Migrate-after-Apply and SyncNow-after-Apply
+    // call submitApplySettings() directly, bypassing the button entirely, so a
+    // confirmed-unavailable local-agent tool must be re-checked at the actual
+    // save chokepoint or it can still be persisted through those chains.
+    if (hasErrors || localAgentBlocks()) {
+      saveFeedback.textContent = hasErrors
+        ? 'Please fix the highlighted fields before saving'
+        : localAgentToolOptionLabel(localAgentToolSelect.value) +
+          " isn't available on this machine. Install it, or pick another tool before saving.";
       saveFeedback.classList.add('error');
       saveFeedback.classList.add('visible');
       return false;
+    }
+    // An in-flight probe means "unknown", not "usable". localAgentBlocks() above
+    // only fires on a CONFIRMED false, by design: Apply is one global button and
+    // must not gray out mid-probe for an unrelated tab's edit (rule 2). That
+    // leaves a 161-1772 ms window (single-tool probe cost, DetectAgents.ts) in
+    // which a click would persist aiProvider: 'local-agent' against a tool
+    // nobody has verified — so the race is closed HERE instead, by HOLDING the
+    // save until the reply arrives. The localAgentProbeResult handler then
+    // re-enters this function, which either posts or reports the tool as
+    // unavailable through the branch above.
+    if (aiProviderSelect.value === 'local-agent' && localAgentAvailable === null) {
+      pendingApply = true;
+      saveFeedback.textContent =
+        'Checking ' + localAgentToolOptionLabel(localAgentToolSelect.value) + '…';
+      saveFeedback.classList.remove('error');
+      saveFeedback.classList.add('visible');
+      // Watchdog. handleProbeLocalAgent replies on every path a dropdown pick can
+      // take, but a held save must not depend on that promise: one lost reply
+      // would swallow the click with no save and no error, and the user has no
+      // way to tell that from a slow probe. Armed only when a save is actually
+      // held (never on an ordinary probe), and set well past the 1772 ms
+      // worst-case so a slow-but-live probe still wins.
+      if (pendingApplyTimer) clearTimeout(pendingApplyTimer);
+      pendingApplyTimer = setTimeout(function() {
+        pendingApplyTimer = null;
+        if (!pendingApply) return;
+        pendingApply = false;
+        saveFeedback.textContent =
+          "Couldn't verify " + localAgentToolOptionLabel(localAgentToolSelect.value) +
+          ' — nothing was saved. Click Apply to try again.';
+        saveFeedback.classList.add('error');
+        saveFeedback.classList.add('visible');
+        abortApplyChains();
+      }, 8000);
+      // Truthy: the save is queued, not refused. See the docstring — the
+      // Migrate/Sync chains must stay armed across the hold.
+      return true;
     }
     var maxVal = maxTokensInput.value.trim();
     vscode.postMessage({
@@ -644,6 +791,13 @@ export function buildSettingsScript(): string {
         // clicked on an unknown count.
         if (missingSummariesCount) missingSummariesCount.textContent = 'Checking…';
         if (generateSummariesBtn) generateSummariesBtn.disabled = true;
+        // Probe on open (not just on dropdown change) so a panel opened with
+        // an already-unavailable tool configured shows the problem immediately.
+        // Gated on the provider: the local-agent card is hidden for every other
+        // provider, so an unconditional probe would spend a 161-1772 ms
+        // subprocess producing a status line nobody can see. Switching TO
+        // local-agent later re-probes via the aiProvider change handler.
+        if (aiProviderSelect.value === 'local-agent') probeLocalAgent();
         captureInitialState();
         break;
       case 'missingSummaryCountLoaded': {
@@ -663,6 +817,36 @@ export function buildSettingsScript(): string {
         // Pushed after sign-in / sign-out so the cards re-render without
         // requiring a full settings reload. Mirror IntelliJ's auth listener.
         applyAuthState(msg);
+        break;
+      case 'localAgentProbeResult':
+        // Ignore a stale reply for a tool the user has already moved off —
+        // e.g. switched from Cursor to Codex before Cursor's probe returned.
+        if (msg.tool !== localAgentProbeTool) break;
+        localAgentAvailable = !!msg.available;
+        if (localAgentStatus) {
+          // Derive the label from localAgentProbeTool (the id the reply is
+          // for), not localAgentToolSelect.selectedIndex — selectedIndex is
+          // -1 when nothing is selected, and indexing options[-1] throws.
+          localAgentStatus.textContent = msg.available
+            ? ''
+            : localAgentToolOptionLabel(localAgentProbeTool) +
+              ' not found on this machine. Install it, or pick another tool.';
+          localAgentStatus.classList.toggle('error', !msg.available);
+        }
+        updateApplyBtn();
+        // Resume a save the probe was holding. Reached only past the stale-reply
+        // guard above, so the verdict being acted on is the one for the tool
+        // currently selected. Re-entering submitApplySettings() (rather than
+        // posting from here) keeps ONE save chokepoint: availability is now a
+        // definite true/false, so it either posts or takes the
+        // localAgentBlocks() error branch with its existing wording.
+        if (pendingApply) {
+          cancelPendingApply();
+          // Disarm the Migrate/Sync chains here if the verdict turned the held
+          // save into a rejection — they were deliberately left armed across the
+          // hold, so this is the only place that can still catch them.
+          if (!submitApplySettings()) abortApplyChains();
+        }
         break;
       case 'setLocalFolder':
         localFolderInput.value = msg.path || '';
@@ -719,17 +903,12 @@ export function buildSettingsScript(): string {
         saveFeedback.textContent = msg.message;
         saveFeedback.classList.add('error');
         saveFeedback.classList.add('visible');
-        if (pendingMigrateAfterApply) {
-          // Host rejected the save (e.g. server-side jolli key validation).
-          // Abort the chain so we don't migrate against unsaved state.
-          pendingMigrateAfterApply = false;
-          rebuildKbStatus.textContent = '';
-        }
-        if (pendingSyncAfterApply) {
-          // Same reason: don't run a sync round against config the host just
-          // refused to persist.
-          pendingSyncAfterApply = false;
-        }
+        // Host rejected the save (e.g. server-side jolli key validation).
+        abortApplyChains();
+        // Deliberately does NOT touch pendingApply. This message is about a save
+        // that was POSTED; a held save has posted nothing, so an error arriving
+        // mid-hold belongs to an earlier submission. Cancelling here would drop
+        // the newer held save silently — let it resume and be judged on its own.
         break;
     }
   });

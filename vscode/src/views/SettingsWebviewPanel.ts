@@ -24,16 +24,18 @@ import {
 	validateJolliApiKey,
 } from "../../../cli/src/core/JolliApiUtils.js";
 import { resolveMemoryBankState } from "../../../cli/src/core/KBPathResolver.js";
+import { isLocalAgentUsable, localAgentOverrideFrom } from "../../../cli/src/core/localagent/DetectAgents.js";
+import { LOCAL_AGENT_TOOLS } from "../../../cli/src/core/localagent/ToolMeta.js";
 import {
 	describeMemoryBank,
 	type MemoryBankDisplay,
 } from "../../../cli/src/core/MemoryBankStatusText.js";
-import { track } from "../../../cli/src/core/Telemetry.js";
 import {
 	getGlobalConfigDir,
 	loadConfigFromDir,
 	saveConfigScoped,
 } from "../../../cli/src/core/SessionTracker.js";
+import { track } from "../../../cli/src/core/Telemetry.js";
 import {
 	installClaudeHook,
 	installGeminiHook,
@@ -100,6 +102,7 @@ type SettingsMessage =
 	| { command: "signIn" }
 	| { command: "signOut" }
 	| { command: "syncNow" }
+	| { command: "probeLocalAgent"; tool?: unknown }
 	| {
 			command: "applySettings";
 			settings: SettingsPayload;
@@ -328,7 +331,57 @@ export class SettingsWebviewPanel {
 						);
 					});
 				break;
+			case "probeLocalAgent":
+				this.handleProbeLocalAgent(message.tool).catch((err: unknown) => {
+					log.error("SettingsPanel", `probeLocalAgent failed: ${err}`);
+				});
+				break;
 		}
+	}
+
+	/**
+	 * Verifies whether the tool the webview's Agent tool dropdown currently
+	 * holds is actually usable on this machine, and posts the result back.
+	 *
+	 * The webview is untrusted input, so `tool` is allow-listed against
+	 * `LOCAL_AGENT_TOOLS` before it's ever passed to `isLocalAgentUsable` —
+	 * mirrors the same guard in `jollimemory.selectLocalAgentTool`
+	 * (Extension.ts). An id that fails the guard is silently dropped: there is
+	 * no tool selected for the script to be blocked on, so no reply is needed.
+	 *
+	 * Every OTHER path must answer. The webview holds an Apply click that lands
+	 * while a probe is in flight until the reply decides it (see
+	 * `submitApplySettings` in SettingsScriptBuilder), so a swallowed reply would
+	 * strand a save. A failure to even read the config answers `false`, matching
+	 * `isLocalAgentUsable`'s own error semantics — "couldn't establish that this
+	 * runs" is reported as not usable, never optimistically as usable.
+	 */
+	private async handleProbeLocalAgent(rawTool: unknown): Promise<void> {
+		const tool =
+			typeof rawTool === "string" && Object.hasOwn(LOCAL_AGENT_TOOLS, rawTool)
+				? (rawTool as LocalAgentToolId)
+				: null;
+		if (!tool) return;
+		let available = false;
+		try {
+			const configDir = this.resolveConfigDir();
+			const config = await loadConfigFromDir(configDir);
+			// Tool-scoped: `localAgentPath` belongs to the CONFIGURED tool, so probing
+			// the dropdown's current pick must not borrow it. `localAgentOverrideFrom`
+			// pairs the path with its owner and `isLocalAgentUsable` drops it on a
+			// mismatch, so switching the dropdown auto-discovers instead.
+			available = await isLocalAgentUsable(tool, {
+				override: localAgentOverrideFrom(config),
+			});
+		} catch (err) {
+			log.error("SettingsPanel", `probeLocalAgent(${tool}) failed: ${err}`);
+		}
+		if (SettingsWebviewPanel.currentPanel !== this) return;
+		this.panel.webview.postMessage({
+			command: "localAgentProbeResult",
+			tool,
+			available,
+		});
 	}
 
 	/**

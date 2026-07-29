@@ -183,10 +183,19 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 			// Append the tool-specific login hint so a not-signed-in user gets
 			// actionable guidance instead of just the raw discovery error.
 			const loginHint = localAgentToolLoginHint(localAgentTool);
+			// An explicit `localAgentPath` short-circuits discovery, so when the probe
+			// fails WITH one set, the path itself is the likeliest cause — including
+			// the case it was set for a different tool before `saveConfigScoped`
+			// started clearing orphans (configs that drifted under an older version
+			// heal on the next tool switch, never on their own). Name the escape
+			// hatch, because nothing else tells the user discovery was skipped.
+			const overrideHint = config.localAgentPath
+				? " Discovery was skipped because localAgentPath is set — clear it with `jolli configure --remove localAgentPath` to auto-discover instead."
+				: "";
 			checks.push({
 				name: "Local agent CLI",
 				status: "fail",
-				message: `${(err as Error).message} — ${loginHint}`,
+				message: `${(err as Error).message} — ${loginHint}${overrideHint}`,
 			});
 		}
 	}

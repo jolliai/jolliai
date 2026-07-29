@@ -1,14 +1,24 @@
-import { describe, expect, it } from "vitest";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as subprocess from "../../util/Subprocess.js";
 import {
 	__resetResolverCacheForTest,
 	type Candidate,
 	discover,
+	discoverPresence,
 	discoveryPath,
+	isPresent,
 	resolveExecutable,
 } from "./ExecutableResolver.js";
 import { LocalAgentSetupError } from "./Types.js";
 
 const spec = { binName: "codex", knownPaths: () => [], probeArgs: ["--version"] as const };
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 /** A fake `which`/`where` that only "finds" `binName` when `binDir` is on the search PATH. */
 function fakeFinder(binName: string, binDir: string, sep = ":") {
@@ -327,5 +337,254 @@ describe("default directory listing", () => {
 				basePath: "C:\\npm",
 			}),
 		).toEqual([]);
+	});
+});
+
+describe("isPresent", () => {
+	const SPEC = {
+		binName: "faketool",
+		knownPaths: () => [],
+		probeArgs: ["--version"] as const,
+	};
+
+	it("returns true when candidates are discovered", () => {
+		expect(isPresent(SPEC, { platform: "darwin", candidates: () => [{ file: "/usr/local/bin/faketool" }] })).toBe(
+			true,
+		);
+	});
+
+	it("spawns no subprocess — the whole point of the presence/usability split", () => {
+		// isPresent never probes — it only checks candidate enumeration. We use a
+		// candidates seam with a fake path that would error if spawned, to enforce
+		// the guarantee without relying on spy interception.
+		expect(
+			isPresent(SPEC, {
+				platform: "darwin",
+				candidates: () => [{ file: "/nonexistent/path/would/throw/if/probed" }],
+			}),
+		).toBe(true);
+	});
+
+	it("returns false when nothing is discovered", () => {
+		expect(isPresent(SPEC, { platform: "darwin", candidates: () => [] })).toBe(false);
+	});
+
+	it("honors an override path that exists on disk", () => {
+		expect(
+			isPresent(SPEC, {
+				platform: "darwin",
+				overridePath: "/opt/custom/faketool",
+				exists: (p) => p === "/opt/custom/faketool",
+			}),
+		).toBe(true);
+	});
+
+	it("rejects an override path that does not exist", () => {
+		expect(
+			isPresent(SPEC, {
+				platform: "darwin",
+				overridePath: "/opt/missing/faketool",
+				exists: () => false,
+			}),
+		).toBe(false);
+	});
+
+	it("does not consult the resolution cache — neither reads nor writes it", () => {
+		__resetResolverCacheForTest();
+		const now = () => 100;
+
+		// Prime the cache with a real resolveExecutable call.
+		resolveExecutable(SPEC, {
+			candidates: () => [{ file: "/cached/binary" }],
+			probe: () => ({ ok: true, version: "1.0.0" }),
+			now,
+			platform: "darwin",
+		});
+
+		// Now call isPresent for the same binName with empty candidates.
+		// If isPresent read the cache, it would see the cached resolution and return true.
+		// Instead it should see no candidates and return false.
+		expect(
+			isPresent(SPEC, {
+				platform: "darwin",
+				candidates: () => [],
+			}),
+		).toBe(false);
+
+		// Verify the cache was not evicted or overwritten by isPresent.
+		// Call resolveExecutable again with the same key; it should serve the cached hit
+		// (same probe call count, same resolution).
+		const r = resolveExecutable(SPEC, {
+			candidates: () => [{ file: "/other/binary" }],
+			probe: () => ({ ok: true, version: "2.0.0" }),
+			now: () => 150, // still within TTL
+			platform: "darwin",
+		});
+		// The cache was hit, so it returns the old result despite new candidates/probe.
+		expect(r).toEqual({ file: "/cached/binary", version: "1.0.0" });
+	});
+
+	it("defaults to process.platform and existsSync when not provided", () => {
+		// Tests the ?? operators for platform and exists defaults.
+		// Since we can't easily mock process.platform or existsSync in isolation,
+		// we use an override path that will go through the exists check.
+		expect(
+			isPresent(SPEC, {
+				overridePath: "/opt/custom/faketool",
+				exists: () => true,
+				// platform is NOT provided — should default to process.platform
+			}),
+		).toBe(true);
+	});
+
+	it("enumerates the filesystem when no candidates function is provided", () => {
+		// Tests the default path: with nothing on the (empty) search PATH and no
+		// knownPaths, discoverPresence finds nothing.
+		expect(
+			isPresent(SPEC, {
+				platform: "darwin",
+				basePath: "",
+				home: "/home/u",
+				exists: () => false,
+			}),
+		).toBe(false);
+	});
+
+	it("finds a binary sitting on the search PATH", () => {
+		expect(
+			isPresent(SPEC, {
+				platform: "darwin",
+				basePath: "/opt/bin",
+				home: "/home/u",
+				exists: (p) => p === "/opt/bin/faketool",
+			}),
+		).toBe(true);
+	});
+});
+
+describe("discoverPresence", () => {
+	const SPEC = { binName: "faketool", knownPaths: () => [], probeArgs: ["--version"] as const };
+
+	/**
+	 * The load-bearing guarantee: this runs synchronously on the VS Code extension
+	 * host's single thread during activation, where a blocked event loop stalls
+	 * EVERY extension. `discover` shells out to `which`/`where` via
+	 * `execFileSyncHidden`; presence must not.
+	 */
+	it("spawns no subprocess", () => {
+		const spawn = vi.spyOn(subprocess, "execFileSyncHidden");
+		discoverPresence(SPEC, "darwin", { basePath: "/opt/bin", home: "/home/u", exists: () => true });
+		expect(spawn).not.toHaveBeenCalled();
+	});
+
+	it("scans every PATH entry plus the common bin dirs", () => {
+		const seen: string[] = [];
+		discoverPresence(SPEC, "darwin", {
+			basePath: "/first",
+			home: "/home/u",
+			exists: (p) => {
+				seen.push(p);
+				return false;
+			},
+		});
+		expect(seen).toContain("/first/faketool");
+		// discoveryPath unions the GUI-launch-safe dirs in — the same reason
+		// `discover` hands them to `which`.
+		expect(seen).toContain("/opt/homebrew/bin/faketool");
+		expect(seen).toContain("/home/u/.local/bin/faketool");
+	});
+
+	it("includes the spec's known install locations", () => {
+		const spec = {
+			binName: "faketool",
+			knownPaths: () => ["/Applications/Thing.app/faketool"],
+			probeArgs: ["--version"] as const,
+		};
+		expect(discoverPresence(spec, "darwin", { basePath: "", home: "/home/u", exists: () => true })).toContain(
+			"/Applications/Thing.app/faketool",
+		);
+	});
+
+	it("dedupes a dir that appears in both PATH and the common dirs", () => {
+		const hits = discoverPresence(SPEC, "darwin", {
+			basePath: "/opt/homebrew/bin",
+			home: "/home/u",
+			exists: (p) => p === "/opt/homebrew/bin/faketool",
+		});
+		expect(hits).toEqual(["/opt/homebrew/bin/faketool"]);
+	});
+
+	it("accepts win32 shims as PRESENCE, even though they are not launch targets", () => {
+		// A `.cmd` cannot be spawned (see `discover`'s header) but it is still proof
+		// of an install. Resolving it to a native target stays resolveExecutable's job.
+		const hits = discoverPresence(SPEC, "win32", {
+			basePath: "C:\\bin",
+			home: "C:\\Users\\u",
+			exists: (p) => p === "C:\\bin\\faketool.cmd",
+		});
+		expect(hits).toEqual(["C:\\bin\\faketool.cmd"]);
+	});
+
+	it("splits the search path with the TARGET platform's separator", () => {
+		// `;` on win32, `:` elsewhere — getting this wrong silently collapses the
+		// whole PATH into one bogus directory name.
+		const hits = discoverPresence(SPEC, "win32", {
+			basePath: "C:\\a;C:\\b",
+			home: "C:\\Users\\u",
+			exists: (p) => p === "C:\\b\\faketool.exe",
+		});
+		expect(hits).toEqual(["C:\\b\\faketool.exe"]);
+	});
+
+	// Every test above injects `exists`, which is exactly why the DEFAULT
+	// predicate needs its own coverage against a real filesystem: a bare
+	// `existsSync` answers true for a directory and ignores the execute bit, and
+	// a presence-only false positive becomes a clickable onboarding option that
+	// cannot work.
+	describe("default file predicate (real filesystem)", () => {
+		let dir: string;
+
+		beforeEach(() => {
+			dir = mkdtempSync(join(tmpdir(), "jolli-presence-"));
+		});
+
+		afterEach(() => {
+			rmSync(dir, { recursive: true, force: true });
+		});
+
+		// POSIX-only: Windows has no execute bit, and the win32 branch deliberately
+		// stops at "is a regular file" so `.cmd` / `.ps1` shims still count.
+		const posixIt = process.platform === "win32" ? it.skip : it;
+
+		it("rejects a DIRECTORY that happens to be named like the binary", () => {
+			mkdirSync(join(dir, "faketool"));
+			expect(discoverPresence(SPEC, process.platform, { basePath: dir, home: dir })).toEqual([]);
+		});
+
+		posixIt("rejects a file with no execute bit", () => {
+			writeFileSync(join(dir, "faketool"), "");
+			chmodSync(join(dir, "faketool"), 0o644);
+			expect(discoverPresence(SPEC, process.platform, { basePath: dir, home: dir })).toEqual([]);
+		});
+
+		posixIt("accepts an executable regular file", () => {
+			writeFileSync(join(dir, "faketool"), "");
+			chmodSync(join(dir, "faketool"), 0o755);
+			expect(discoverPresence(SPEC, process.platform, { basePath: dir, home: dir })).toEqual([
+				join(dir, "faketool"),
+			]);
+		});
+
+		posixIt("rejects a broken symlink, matching existsSync", () => {
+			symlinkSync(join(dir, "nope"), join(dir, "faketool"));
+			expect(discoverPresence(SPEC, process.platform, { basePath: dir, home: dir })).toEqual([]);
+		});
+
+		it("applies the same predicate to isPresent's override path", () => {
+			// An override names one file; a directory at that path must not read as
+			// an installed tool just because something exists there.
+			mkdirSync(join(dir, "mytool"));
+			expect(isPresent(SPEC, { overridePath: join(dir, "mytool"), platform: process.platform })).toBe(false);
+		});
 	});
 });

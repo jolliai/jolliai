@@ -8,9 +8,11 @@ import {
 	readFileFromBranch,
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
-import type { StorageProvider } from "./StorageProvider.js";
+import type { StorageKind, StorageProvider } from "./StorageProvider.js";
 
 export class OrphanBranchStorage implements StorageProvider {
+	readonly kind: StorageKind = "orphan-branch";
+
 	constructor(private readonly cwd?: string) {}
 
 	async readFile(path: string): Promise<string | null> {

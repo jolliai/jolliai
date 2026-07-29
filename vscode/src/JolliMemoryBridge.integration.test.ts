@@ -27,6 +27,17 @@ vi.mock("./util/Logger.js", () => ({
 
 import { JolliMemoryBridge } from "./JolliMemoryBridge.js";
 
+// The shared `beforeEach` below spawns real `git` subprocesses (init, config,
+// commit) and is file-scoped, so it applies across every `describe` block in
+// this file — a describe-level `{ timeout }` option would only cover the one
+// describe it wraps, not this hook. Under v8 coverage instrumentation plus a
+// large parallel suite, that subprocess chain can occasionally take longer
+// than Vitest's 5s/10s defaults, which is a load signal, not a correctness
+// one. Bump both timeouts file-wide so the suite stays robust under load
+// without hiding an actual hang (45s is far beyond any real subprocess
+// latency).
+vi.setConfig({ testTimeout: 45_000, hookTimeout: 45_000 });
+
 let repoDir: string;
 
 beforeEach(() => {

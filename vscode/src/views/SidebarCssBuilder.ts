@@ -1944,6 +1944,48 @@ export function buildSidebarCss(): string {
     flex: 1;
     border-top: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
   }
+  /* ── Local-agent onboarding card ──────────────────────────────────────
+     Block above the Anthropic API key card, shown only when
+     state.localAgents (Task 7) is non-empty. The hint + label + dropdown
+     live INSIDE the recommended .ob-card (below .ob-card-row); only the
+     error line and the action button are siblings of the card. Sizing
+     mirrors the .apikey-label / .apikey-input / .apikey-error rules above
+     so both panels read the same. */
+  .ob-select-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    margin: 12px 0 6px 0;
+    color: var(--vscode-foreground);
+  }
+  .ob-select {
+    display: block;
+    width: 100%;
+    padding: 6px 8px;
+    box-sizing: border-box;
+    background: var(--vscode-dropdown-background);
+    color: var(--vscode-dropdown-foreground);
+    border: 1px solid var(--vscode-dropdown-border, var(--vscode-widget-border, transparent));
+    border-radius: 4px;
+    font-size: 12px;
+    font-family: var(--vscode-font-family);
+  }
+  .ob-select:focus {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+  }
+  .ob-hint {
+    margin: 8px 0 0 0;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--vscode-descriptionForeground);
+  }
+  .ob-error {
+    margin: 8px 0 0 0;
+    font-size: 12px;
+    color: var(--vscode-errorForeground);
+    line-height: 1.4;
+  }
 
   /* Pinned to the bottom of the sidebar (the .sidebar-root box is the
      positioning context — see its position:relative). absolute (not sticky)

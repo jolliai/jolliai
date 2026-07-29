@@ -1,6 +1,6 @@
 import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { createLocalAgentCwd, LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
-import { type Candidate, resolveExecutable, type ShimDeps } from "./ExecutableResolver.js";
+import { type Candidate, isPresent, resolveExecutable, type ShimDeps } from "./ExecutableResolver.js";
 import {
 	type Invocation,
 	type LocalAgentBackend,
@@ -45,6 +45,10 @@ export class OpenCodeBackend implements LocalAgentBackend {
 
 	discoverExecutable(overridePath?: string): Promise<ResolvedExecutable> {
 		return Promise.resolve(resolveExecutable(OPENCODE_SPEC, { overridePath }));
+	}
+
+	isPresent(overridePath?: string): boolean {
+		return isPresent(OPENCODE_SPEC, { overridePath });
 	}
 
 	buildInvocation(exe: ResolvedExecutable, req: LocalAgentRequest): Invocation {

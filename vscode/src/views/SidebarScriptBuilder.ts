@@ -267,6 +267,20 @@ export function buildSidebarScript(): string {
   const onboardingPanel = document.getElementById('onboarding-panel');
   const onboardingSigninBtn = document.getElementById('onboarding-signin-btn');
   const onboardingApikeyBtn = document.getElementById('onboarding-apikey-btn');
+  // Local-agent onboarding card — sibling of the Anthropic API-key card,
+  // shown only when the host reports a non-empty local-agent list (on init, or
+  // via 'localAgents:changed'). See applyLocalAgents below.
+  const onboardingLocalAgentBlock = document.getElementById('onboarding-localagent-block');
+  const onboardingLocalAgentSelect = document.getElementById('onboarding-localagent-select');
+  const onboardingLocalAgentBtn = document.getElementById('onboarding-localagent-btn');
+  const onboardingLocalAgentError = document.getElementById('onboarding-localagent-error');
+  const onboardingApikeyCard = document.getElementById('onboarding-apikey-card');
+  // The single RECOMMENDED badge node lives in the local-agent card's markup
+  // by default (SidebarHtmlBuilder) and is physically moved onto the API-key
+  // card when there are no local agents to offer -- never duplicated, never
+  // just hidden, so querySelector('.ob-badge') reflects which card is
+  // actually recommended.
+  const onboardingLocalAgentBadge = onboardingLocalAgentBlock.querySelector('.ob-badge');
   // Disabled panel — full-viewport "Enable" CTA shown when the user is
   // configured but has explicitly disabled the extension. Sibling of the
   // onboarding panel; mutually exclusive with it.
@@ -708,6 +722,27 @@ export function buildSidebarScript(): string {
     });
   }
 
+  // Onboarding local-agent card -- "Use Local Agent Tool" button. The host
+  // command runs the (expensive) capability probe for the chosen tool only,
+  // then writes aiProvider/localAgentTool on success. Success flips
+  // configured via statusStore.refresh -> configured:changed retires the
+  // onboarding panel, same hand-off as submitApikey above. Failure comes
+  // back as 'localAgent:selectError', handled below.
+  onboardingLocalAgentBtn.addEventListener('click', function() {
+    const tool = onboardingLocalAgentSelect.value;
+    if (!tool) return;
+    onboardingLocalAgentBtn.disabled = true;
+    onboardingLocalAgentSelect.disabled = true;
+    onboardingLocalAgentBtn.textContent = 'Checking…';
+    onboardingLocalAgentError.classList.add('hidden');
+    onboardingLocalAgentError.textContent = '';
+    vscode.postMessage({
+      type: 'command',
+      command: 'jollimemory.selectLocalAgentTool',
+      args: [tool],
+    });
+  });
+
   // Disabled-panel Enable button — same command as the legacy in-Status
   // disabled-banner Enable button (jollimemory.enableJolliMemory). Wired
   // separately because the two buttons live in disjoint DOM regions and
@@ -762,6 +797,9 @@ export function buildSidebarScript(): string {
         // true on undefined (e.g. older host code, transient init message)
         // so the regular UI keeps working without a strict-host upgrade.
         applyConfigured(msg.state.configured !== false);
+        // Initial list; refreshed later via 'localAgents:changed' when the
+        // onboarding panel reappears mid-window (see SidebarMessages.ts).
+        applyLocalAgents(msg.state.localAgents);
         // Guard against a stale persisted tab that no longer exists (e.g. the
         // removed 'knowledge' view): fall back to the default 'branch' rather
         // than switching to a tab with no panel/toolbar. Only honored on the
@@ -807,6 +845,12 @@ export function buildSidebarScript(): string {
         // toolbar; re-render so the swap takes effect immediately.
         if (state.activeTab === 'status') renderToolbar();
         break;
+      case 'localAgents:changed':
+        // Host re-ran detection because the onboarding panel is about to
+        // reappear (sign-out / cleared key). Arrives BEFORE configured:changed,
+        // so the card is already right when applyConfigured un-hides the panel.
+        applyLocalAgents(msg.localAgents);
+        break;
       case 'configured:changed': {
         // Capture the prior value BEFORE applyConfigured mutates state.configured —
         // we use the false→true edge to detect "user just finished onboarding"
@@ -840,6 +884,20 @@ export function buildSidebarScript(): string {
             ? msg.message
             : 'Failed to save the API key.';
           apikeyError.classList.remove('hidden');
+        }
+        break;
+      case 'localAgent:selectError':
+        // Only restore the controls if the onboarding panel is still up; a
+        // success path that raced past us has already hidden it (see the
+        // apikey:saveError guard above for the same pattern).
+        if (!onboardingPanel.classList.contains('hidden')) {
+          onboardingLocalAgentBtn.disabled = false;
+          onboardingLocalAgentSelect.disabled = false;
+          onboardingLocalAgentBtn.textContent = 'Use Local Agent Tool';
+          onboardingLocalAgentError.textContent = typeof msg.message === 'string' && msg.message.length > 0
+            ? msg.message
+            : 'Could not use that tool.';
+          onboardingLocalAgentError.classList.remove('hidden');
         }
         break;
       case 'worker:busy': {
@@ -1299,6 +1357,40 @@ export function buildSidebarScript(): string {
     // the bar in disabled mode because disabled-panel owns the viewport),
     // so just delegate — no manual tabBar.classList.remove('hidden') needed.
     applyEnabled(state.enabled);
+  }
+
+  // Local-agent onboarding card -- shown when the host detects a local agent
+  // CLI (state.localAgents on init, refreshed by 'localAgents:changed' when the
+  // panel comes back mid-window). Renders
+  // the select options in display order with the first entry pre-selected,
+  // and moves the single RECOMMENDED badge node onto whichever card is
+  // actually recommended: the local-agent card when agents are present, back
+  // onto the API-key card when the list is empty -- so exactly one card in
+  // the panel is ever marked recommended.
+  function applyLocalAgents(agents) {
+    const list = Array.isArray(agents) ? agents : [];
+    onboardingLocalAgentSelect.replaceChildren();
+    if (list.length === 0) {
+      onboardingLocalAgentBlock.classList.add('hidden');
+      onboardingApikeyCard.classList.add('ob-card--recommended');
+      if (onboardingLocalAgentBadge.parentElement !== onboardingApikeyCard) {
+        onboardingApikeyCard.insertBefore(onboardingLocalAgentBadge, onboardingApikeyCard.firstChild);
+      }
+      return;
+    }
+    for (const a of list) {
+      const opt = document.createElement('option');
+      opt.value = a.id;
+      opt.textContent = a.label;
+      onboardingLocalAgentSelect.appendChild(opt);
+    }
+    onboardingLocalAgentSelect.value = list[0].id;
+    onboardingLocalAgentBlock.classList.remove('hidden');
+    onboardingApikeyCard.classList.remove('ob-card--recommended');
+    const localAgentCard = onboardingLocalAgentBlock.querySelector('.ob-card');
+    if (localAgentCard && onboardingLocalAgentBadge.parentElement !== localAgentCard) {
+      localAgentCard.insertBefore(onboardingLocalAgentBadge, localAgentCard.firstChild);
+    }
   }
 
   // Degraded mode (no workspace / no git) keeps the legacy disabled-banner

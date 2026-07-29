@@ -15,6 +15,14 @@ import type {
 export interface StatusDerived {
 	readonly hasApiKey: boolean;
 	readonly signedIn: boolean;
+	/**
+	 * True when `config.aiProvider === "local-agent"`. Keyed on config INTENT,
+	 * NOT on whether the agent binary is currently present or runnable — if
+	 * the user later uninstalls the agent we must not silently drop them back
+	 * into onboarding and discard their provider choice. That failure belongs
+	 * to `jolli doctor` and the generation error path, not this gate.
+	 */
+	readonly usesLocalAgent: boolean;
 	readonly allHooksInstalled: boolean;
 	readonly hooksDescription: string;
 }
@@ -38,6 +46,7 @@ export class StatusDataService {
 		return {
 			hasApiKey: !!config?.apiKey,
 			signedIn: !!config?.authToken,
+			usesLocalAgent: config?.aiProvider === "local-agent",
 			allHooksInstalled: !!status?.gitHookInstalled,
 			hooksDescription: parts.length > 0 ? parts.join(" + ") : "none installed",
 		};
