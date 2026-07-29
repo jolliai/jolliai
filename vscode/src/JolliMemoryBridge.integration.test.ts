@@ -33,11 +33,13 @@ beforeEach(() => {
 	repoDir = mkdtempSync(join(tmpdir(), "proj-1326-"));
 	execSync("git init -q", { cwd: repoDir });
 	// Deterministic identity so commits succeed even in sandboxed env.
-	execSync('git -c commit.gpgsign=false config user.email "test@example.com"', {
-		cwd: repoDir,
-	});
+	execSync('git config user.email "test@example.com"', { cwd: repoDir });
 	execSync('git config user.name "Test"', { cwd: repoDir });
-	execSync('git commit --allow-empty -qm "init"', { cwd: repoDir });
+	// `-c commit.gpgsign=false` belongs on the *commit*, not on the `git config`
+	// calls above where it does nothing. The host's global config is already
+	// neutralized by `test/gitEnv.ts` (see `vitest.config.ts` setupFiles); this
+	// stays as a local belt-and-braces for the one command that would block.
+	execSync('git -c commit.gpgsign=false commit --allow-empty -qm "init"', { cwd: repoDir });
 });
 
 afterEach(() => {

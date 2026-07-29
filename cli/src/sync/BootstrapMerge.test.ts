@@ -21,26 +21,15 @@ import type { GitCredentials } from "./SyncTypes.js";
 // symlink-collection case on a non-elevated account where symlink() throws EPERM.
 const itIfSymlinks = symlinksSupported ? it : it.skip;
 
-// Same global-config isolation rationale as GitClient.test.ts: a developer
-// `commit.gpgsign=true` or husky hook would hang every commit here.
-process.env.GIT_CONFIG_GLOBAL = "/dev/null";
-process.env.GIT_CONFIG_SYSTEM = "/dev/null";
-process.env.GIT_TERMINAL_PROMPT = "0";
-// `GIT_CONFIG_GLOBAL=/dev/null` neutralizes ~/.gitconfig but NOT the XDG default
-// excludes file (~/.config/git/ignore) — its path is a git built-in, not read
-// from config. A developer entry there (e.g. `.jolli/`, which `jolli impact
-// init` adds) would make `git add .` silently skip every seeded `.jolli/...`
-// fixture, so origin never receives them and the bootstrap conflict cases
-// resolve local-wins instead of remote-wins. Force core.excludesFile empty for
-// every git invocation this suite spawns.
-process.env.GIT_CONFIG_COUNT = "1";
-process.env.GIT_CONFIG_KEY_0 = "core.excludesFile";
-process.env.GIT_CONFIG_VALUE_0 = "/dev/null";
-
-// Every test spawns several real `git` subprocesses; under parallel suite load
-// + `--coverage` the global 15s testTimeout / 10s hookTimeout flake. 30s gives
-// this real-git suite headroom without loosening the global pure-unit budget.
-vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
+// Git isolation for this suite lives in `test/gitEnv.ts` (global `setupFiles`).
+// The XDG-excludes neutralization there is load-bearing for THIS file in
+// particular: a developer `.jolli/` line in ~/.config/git/ignore makes `git add
+// .` silently skip every seeded `.jolli/...` fixture, so origin never receives
+// them and the conflict cases below resolve local-wins instead of remote-wins.
+//
+// The timeout budget is global too (vite.config.ts). This file used to clamp
+// itself to 30s via `vi.setConfig`, which replaces the global instead of
+// widening it — don't reintroduce it.
 
 const NOOP_ASKPASS = async (): Promise<{
 	scriptPath: string;

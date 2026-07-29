@@ -11,11 +11,11 @@ npm install
 # Build (vite lib mode, multi-entry)
 npm run build
 
-# Run tests
+# Run tests — always with coverage and the 97%+ thresholds; this IS the gate
 npm run test
 
-# Run tests with coverage (97%+ threshold)
-npm run test:coverage
+# Inner loop: the 324 light files, coverage still enforced (see next section)
+npm run test:fast
 
 # Lint (biome)
 npm run lint
@@ -23,6 +23,96 @@ npm run lint
 # All checks (lint + build + test with coverage)
 npm run all
 ```
+
+### Two tiers: inner loop vs gate
+
+`npm run test` is the **gate**: all 336 unit files (~8.9k tests) with `--coverage` and the 97% thresholds, 3.5 min on a quiet box and 9+ min when the machine is busy (measured 213 s and 552 s on the same commit). It is meant to run once before a commit, not once per edit. The 5 acceptance files are a separate runner (`npm run test:acceptance`, 9 tests, ~47 s) — the *root* `npm run test` chains both plus the vscode suite.
+
+**The cost is not spread evenly.** Profiling the full suite (`--reporter=json`, per-file wall time) shows **12 files account for 96.4% of the runtime** while the median file takes **14 ms**:
+
+| s | file | | s | file |
+|--:|---|---|--:|---|
+| 167 | `sync/GitClient` | | 55 | `install/GitExclude` |
+| 160 | `install/Installer` | | 53 | `core/SpaceBindingCache` |
+| 153 | `sync/BootstrapMerge` | | 47 | `core/KBPathResolver` |
+| 111 | `core/BranchCommitLister` | | 41 | `install/DispatchScripts` |
+| 101 | `core/RepoProfile` | | 30 | `core/Locks` |
+| 57 | `backfill/CommitTargetIndex` | | 30 | `sync/SyncBootstrap` |
+
+Every one of them drives real `git` subprocesses or real filesystem/lock work. The other 324 files sum to well under a minute. So the tiers split along that line:
+
+```bash
+# 324 light files WITH coverage — 8.3k tests in ~25-45s (load-dependent).
+# The default inner loop.
+npm run test:fast
+
+# The 12 heavy files above — 651 tests, ~4 min, no coverage.
+# Run when you touch sync/, install/, or git plumbing.
+npm run test:slow
+
+# Only tests whose import graph reaches your changes
+npm run test:changed                     # vs origin/main
+npm run test:changed -- --changed HEAD    # uncommitted only
+
+# Tests covering a specific source file / one case
+npx vitest related --run src/core/FolderStorage.ts
+npx vitest run src/core/SummaryStore.test.ts -t "merges children"
+```
+
+`test:fast` + `test:slow` partition the suite exactly (324 + 12 = 336), and they cannot drift apart: both tiers read the **same** `SLOW_TEST_FILES` list in [`vite.config.ts`](vite.config.ts) — `--mode fast` uses it as `exclude`, `--mode slow` uses it as `include`. Adding a 13th slow file is one edit. (It used to be two: the same 12 paths were also spelled out in the `test:slow` npm script, where updating one copy and not the other left a file running in both tiers or neither, silently.) Entries are exact repo-relative paths, not `{A,B}.test.ts` brace globs, so a future same-named file elsewhere in the tree can't be captured by accident. Re-derive the list from a fresh `--reporter=json` run rather than guessing which files got slow.
+
+Three traps in the fast tier:
+
+- **`--changed` forces `passWithNoTests`.** Vitest sets it automatically, so a run that matches nothing exits **0**. "Green" from `test:changed` can mean "nothing ran" — check the file count.
+- **`--changed` fans out to everything when you touch a shared file.** Editing `vite.config.ts`, `../test/gitEnv.ts`, or a widely-imported module makes every test related — measured at all 336 files. Correct behavior, but it means `--changed` is only fast for localized changes.
+- **Skipping coverage is a minor lever.** Full suite: 308s with coverage vs 270s without (`tests` CPU 1919s → 1538s). Instrumentation is ~13%; the win comes from running *fewer files*, not from dropping `--coverage`.
+
+**How `test:fast` keeps coverage meaningful.** Skipping test files without also narrowing the coverage denominator produces a *failing* run out of a passing suite: measured (at the time, 319 files) all green but `92.44/90.43/92.25/92.53` and `EXIT=1`, because `sync/GitClient.ts`, `install/Installer.ts` and friends are still counted while nothing exercises them. A permanently-red inner loop trains you to stop reading its exit code, so `test:fast` runs as `vitest --mode fast` and [`vite.config.ts`](vite.config.ts) drops both halves together — the 12 test files (`SLOW_TEST_FILES`) and the 16 source files they are responsible for (`SLOW_ONLY_SOURCES`). Result: `98.84/96.74/98.73/99.11` in ~25-45s, thresholds enforced.
+
+Three things about that pair:
+
+- **Maintain them together, and re-derive from measurement.** The mapping is not one-to-one — `Installer.test.ts` is the only meaningful cover for four separate hook-installer modules, so the source list is 16 entries against 12 test files. The config header documents the two commands that regenerate each list.
+- **The coverage exclusion must stay inside the `fast` branch.** Applied to the gate it would silently stop the floor from protecting `sync/` and `install/` at all — the one thing the floor exists for, and a violation of the "don't regress CLI coverage" rule in [`AGENTS.md`](../AGENTS.md).
+- **Headroom is thin on purpose:** 96.74% branches against a 96% threshold. If `test:fast` fails on coverage alone, the list needs re-deriving; do not lower the threshold.
+
+For "is the code I just wrote covered", scoping *both* sides to one module is sharper and needs no lists:
+
+```bash
+# 100% (10/10) in 152ms — thresholds meaningful because the scope matches
+npx vitest run --coverage --coverage.include="src/core/PathUtils.ts" src/core/PathUtils.test.ts
+```
+
+The per-file table renders empty under a narrow `--coverage.include`; read the `Coverage summary` block below it.
+
+### Real-`git` tests: isolation and load
+
+About a dozen test files under `src/` spawn real `git` subprocesses instead of mocking them — `sync/GitClient`, `sync/BootstrapMerge`, `install/GitExclude`, `core/BranchCommitLister`, `core/KBPathResolver`, `core/RepoProfile`, `core/Locks` and friends. That is deliberate: they exist to catch what mocks would hide (refspec semantics, git's refusal behavior, `ls-files` output parsing, "untracked working tree files would be overwritten by checkout"). Two consequences follow, and both have burned debugging time.
+
+**1. Isolation is global, not per-file — and monorepo-wide, not CLI-only.** [`../test/gitEnv.ts`](../test/gitEnv.ts) runs as a `setupFiles` entry for every test module and neutralizes `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM`, `GIT_TERMINAL_PROMPT`, and `core.excludesFile`. It sits at the **repo root** because all three vitest configs wire it in: this suite ([`vite.config.ts`](vite.config.ts)), the acceptance suite ([`vitest.acceptance.config.ts`](vitest.acceptance.config.ts)), and the vscode suite (`vscode/vitest.config.ts`, whose `JolliMemoryBridge.integration.test.ts` runs a real `git commit`). Don't re-add an isolation prologue to an individual test file — the per-file copies had already drifted apart before this was centralized. Read that file's header before adding a git-related env var; in particular it explains why an author identity is deliberately **not** injected (`GIT_CONFIG_COUNT` outranks repo-local config, so it would override what a test set on purpose).
+
+Env vars, not `git -c` flags, are what make this work: the acceptance fixtures also harden every git command *they* issue (`SAFE_GIT_OPTS` in `test/sync-acceptance/_helpers.ts`), but a `-c` flag only covers the command line you assemble yourself. The git subprocesses spawned by the **production code under test** — `GitClient.commit()` passes an identity and no `commit.gpgsign=false` — inherit the developer's config regardless. Environment variables reach those children; that is the gap `gitEnv.ts` closes.
+
+The `core.excludesFile` neutralization is the non-obvious one: the XDG excludes path (`~/.config/git/ignore`) is a git built-in, so the two `GIT_CONFIG_*` variables do not cover it. A developer `.jolli/` line there — `jolli impact init` adds one — makes `git add .` silently skip seeded `.jolli/…` fixtures, and conflict tests then resolve local-wins instead of remote-wins.
+
+**2. Timeouts are a load signal, not a regression signal.** Triage a failure by its *shape* before investigating:
+
+| Failure shape | Read it as |
+|---|---|
+| `Test timed out in NNNNms` in `sync/*`, `install/*`, `core/{Locks,KBPathResolver,BranchCommitLister}` | Almost always CPU contention starving a real `git` subprocess. Confirm by running the file alone (`npx vitest run src/sync/GitClient.test.ts`) with the **stock** timeout — green in isolation is the proof. |
+
+**A raised ceiling is not a fix for that first row — read it as a symptom instead.** Worked example, same commit, two gate runs: `GitClient > isRebaseInProgress > returns true while a rebase is paused on conflicts` blew the **60 s** budget in a run whose wall clock was 552 s, then the whole 336-file gate re-ran green in 213 s. Alone, that case takes **7.1 s**. So the 8.6× stretch came from load, and the same case has now failed under three successive ceilings (30 s → 45 s → 60 s) — a `git rebase` starved of CPU degrades linearly, and no ceiling outruns that. The levers that would actually change the outcome are trade-offs, not fixes, so they are deliberately not taken here: lower `maxWorkers` for the gate (buys determinism with wall clock), lift the heaviest `GitClient` cases out of the shared fan-out, or accept occasional local red and require green only on CI. Don't reach for a 90 s ceiling as if it were the next step.
+| `Unhandled Rejection … ENOENT … coverage/.tmp/coverage-N.json` | Infrastructure, not a test result — a coverage worker wrote its temp file after the directory was cleaned. Seen once after a previous run was killed mid-flight (orphaned worker is the leading suspect, unproven). Zero `FAIL` lines and no threshold errors accompany it. Re-run before investigating; don't kill a coverage run and immediately start another. |
+| An assertion or thrown error | Worth investigating as a real regression. |
+
+Rules that follow from this, each learned the hard way:
+
+- **Tune timeouts in the vitest config only** — [`vite.config.ts`](vite.config.ts) for the unit tiers, [`vitest.acceptance.config.ts`](vitest.acceptance.config.ts) for acceptance, `vscode/vitest.config.ts` for the extension (all three sit at 60 s). A per-file `vi.setConfig({ testTimeout })` *replaces* the global rather than widening it, so it can silently shrink the budget for the files that need it most — and a `vitest --testTimeout=…` flag cannot override such a file-local clamp.
+- **Concurrency is `maxWorkers`, not `poolOptions`.** Vitest 4 removed `poolOptions`; a config still using `poolOptions.forks.maxForks` runs at **full fan-out** and only prints a one-line `DEPRECATED` notice, which is easy to miss when you grep a long log for `FAIL`. If you tune concurrency, confirm it took effect rather than assuming — an ignored knob makes every measurement after it meaningless. Note `maxWorkers: "75%"` applies to `--mode fast` too, even though the 12 files that motivated the cap don't run there; whether lifting it for `fast` is a win is unmeasured.
+- **`fileParallelism: false` is not immunity from load.** The acceptance suite runs its files serially and still blew a 30 s budget when it started while the slow tier's forks were winding down (the same file passes in 11.8 s alone). Git-subprocess-bound work absorbs pressure from anything on the box, not just from sibling vitest workers.
+- **Don't credit a flag for a green run.** If a serial or low-concurrency round passes, the reduced load did it.
+- **A flaky round is a wasted round.** Vitest emits no coverage report at all when any test fails — not even a `coverage/` directory — so you cannot mine coverage numbers from a failed run. `maxWorkers` is capped below the default fan-out for exactly this reason.
+- **Don't run `./gradlew` (the IntelliJ build) concurrently.** It reliably doubles the timeout count and can starve otherwise-solid files.
+- **Don't pipe the gate.** `npm run all | tail -60` reports `tail`'s exit code, which is always 0. Use `npm run all > log 2>&1; echo $?`.
 
 ## Local CLI Testing
 

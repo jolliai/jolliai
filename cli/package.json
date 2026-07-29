@@ -38,6 +38,9 @@
 		"cli:build": "npm run build && node dist/Cli.js",
 		"gen:telemetry-doc": "tsx scripts/gen-telemetry-doc.mjs",
 		"test": "vitest run --coverage",
+		"test:fast": "vitest run --mode fast --coverage --reporter=dot",
+		"test:slow": "vitest run --mode slow --reporter=dot",
+		"test:changed": "vitest run --changed origin/main --reporter=dot",
 		"test:watch": "vitest",
 		"test:acceptance": "vitest run --config vitest.acceptance.config.ts",
 		"postinstall": "node -e \"require('fs').existsSync('dist/PostInstall.js') && require('child_process').spawnSync(process.execPath,['dist/PostInstall.js'],{stdio:'inherit'})\""

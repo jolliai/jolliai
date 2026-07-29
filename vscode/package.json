@@ -320,6 +320,7 @@
 		"lint": "npx biome check --error-on-warnings src/",
 		"lint:fix": "npx biome check --write src/",
 		"test": "node ./scripts/run-vitest.mjs --coverage",
+		"test:changed": "node ./scripts/run-vitest.mjs --changed origin/main --reporter=dot",
 		"build": "npm run clean && node ./scripts/copy-codicons.mjs && node esbuild.config.mjs && node ./scripts/copy-graph-assets.mjs",
 		"build:watch": "node esbuild.config.mjs --watch",
 		"package": "npm run build && npx @vscode/vsce package --no-dependencies --allow-missing-repository",

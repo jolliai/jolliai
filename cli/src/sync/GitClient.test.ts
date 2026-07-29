@@ -12,7 +12,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
 	GitClient,
 	injectGithubAppUsername,
@@ -22,19 +22,15 @@ import {
 } from "./GitClient.js";
 import type { GitCredentials } from "./SyncTypes.js";
 
-// Isolate every `git` subprocess in this file from the developer's ~/.gitconfig
-// and /etc/gitconfig. Without this, a global `commit.gpgsign=true`, gitsign
-// signer, or `core.hooksPath` pointing at husky/lefthook will hang `git commit`
-// in beforeAll — surfaces as a vitest hookTimeout, not a real failure.
-process.env.GIT_CONFIG_GLOBAL = "/dev/null";
-process.env.GIT_CONFIG_SYSTEM = "/dev/null";
-process.env.GIT_TERMINAL_PROMPT = "0";
-
-// Every test here spawns several real `git` subprocesses (clone/commit/push/
-// pullRebase). Under parallel suite load + `--coverage` instrumentation the
-// global 15s testTimeout / 10s hookTimeout flake; 30s gives this real-git
-// suite headroom without loosening the global budget for pure-unit tests.
-vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
+// Every `git` subprocess in this file is isolated from the developer's
+// ~/.gitconfig, /etc/gitconfig and XDG excludes file by `test/gitEnv.ts`
+// (wired in as a global `setupFiles` — see that file for the rationale).
+//
+// The timeout budget is likewise global: `testTimeout` / `hookTimeout` in
+// vite.config.ts. This file used to pin itself to 30s via `vi.setConfig`, which
+// REPLACES the global rather than widening it — after the global rose to 45s
+// that clamp left this suite with less headroom than a pure-unit file, in the
+// heaviest real-git suite in the repo. Don't reintroduce it.
 
 const NOOP_ASKPASS = async (): Promise<{
 	scriptPath: string;
