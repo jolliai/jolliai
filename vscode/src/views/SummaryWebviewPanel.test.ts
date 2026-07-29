@@ -496,6 +496,7 @@ const {
 	mockRenderE2eScenario,
 	mockBuildPlansAndNotesSection,
 	mockBuildJolliRow,
+	mockBuildTokenMeter,
 } = vi.hoisted(() => ({
 	mockBuildHtml: vi.fn().mockReturnValue("<html>mock</html>"),
 	mockBuildE2eTestSection: vi.fn().mockReturnValue("<div>e2e</div>"),
@@ -507,6 +508,7 @@ const {
 		.fn()
 		.mockReturnValue("<div>plansAndNotes</div>"),
 	mockBuildJolliRow: vi.fn().mockReturnValue("<div>jolliRow</div>"),
+	mockBuildTokenMeter: vi.fn().mockReturnValue('<div class="tmeter">meter</div>'),
 }));
 
 vi.mock("./SummaryHtmlBuilder.js", async (importActual) => {
@@ -524,6 +526,11 @@ vi.mock("./SummaryHtmlBuilder.js", async (importActual) => {
 		buildPlansAndNotesSection: mockBuildPlansAndNotesSection,
 		buildJolliRow: mockBuildJolliRow,
 		contextChipCount: actual.contextChipCount,
+		// Stubbed rather than real: the real one reaches into SummaryUtils (fully
+		// mocked here), and the markup itself is covered by SummaryHtmlBuilder's own
+		// tests. What matters at this layer is WHICH summary the panel rebuilds the
+		// meter from, which the stub captures.
+		buildTokenMeter: mockBuildTokenMeter,
 	};
 });
 
@@ -4509,6 +4516,74 @@ describe("SummaryWebviewPanel", () => {
 		// ── loadTranscriptStats ──────────────────────────────────────────────
 
 		describe("loadTranscriptStats", () => {
+			it("excludes a usage-only carrier from sessionCounts but still counts a split conversation", async () => {
+				// The count must agree with the Conversations list, which hides carriers —
+				// "1 conversation" against an empty list reads as a bug. Skipping a carrier
+				// slice must NOT consume the key though: the same conversation's real turns
+				// may live in another transcript, and that one counts.
+				// Hashes must intersect the summary's own transcript ids (v3 ⇒ its commit
+				// hash), or loadTranscriptStats early-returns without posting at all.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123", "def456"]));
+				const transcriptMap = new Map([
+					[
+						"abc123",
+						{
+							sessions: [
+								{
+									sessionId: "carrier-only",
+									source: "claude" as const,
+									entries: [],
+									usage: { input: 600, output: 300, cached: 0 },
+								},
+								// Carrier slice of a conversation that is real elsewhere.
+								{
+									sessionId: "split",
+									source: "codex" as const,
+									entries: [],
+									usage: { input: 1, output: 1, cached: 0 },
+								},
+							],
+						},
+					],
+					[
+						"def456",
+						{
+							sessions: [
+								{
+									sessionId: "split",
+									source: "codex" as const,
+									entries: [{ role: "human" as const, content: "hi" }],
+								},
+							],
+						},
+					],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap as never);
+
+				await SummaryWebviewPanel.show(
+					makeSummary(),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadTranscriptStats" });
+				await flushPromises();
+
+				const call = postMessage.mock.calls.find(
+					(c) => (c[0] as { command?: string })?.command === "transcriptStatsLoaded",
+				);
+				const msg = call?.[0] as {
+					totalEntries: number;
+					sessionCounts: Record<string, number>;
+				};
+				// `carrier-only` contributes to neither count; `split` counts once, via c2.
+				expect(msg.sessionCounts).toEqual({ codex: 1 });
+				expect(msg.totalEntries).toBe(1);
+			});
+
 			it("deduplicates sessions and counts codex sessions separately", async () => {
 				mockGetTranscriptHashes.mockResolvedValue(
 					new Set(["abc123", "def456"]),
@@ -5454,6 +5529,289 @@ describe("SummaryWebviewPanel", () => {
 				});
 			});
 
+			it("subtracts the detached session's tokens from the summary and refreshes the meter in place", async () => {
+				// The reported bug: detaching a conversation rewrote the transcript files but
+				// left `conversationTokens` / breakdown / cost at their pre-detach values, so
+				// the memory kept reporting usage from a conversation no longer attached.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+										usage: { input: 40, output: 50, cached: 200 },
+										usageByModel: [
+											{
+												model: "claude-opus-5",
+												provider: "anthropic" as const,
+												input: 40,
+												output: 50,
+												cached: 200,
+											},
+										],
+									},
+									{
+										sessionId: "keep",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "K" }],
+										usage: { input: 60, output: 150, cached: 500 },
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 1000,
+					conversationTokenBreakdown: { input: 100, output: 200, cached: 700 },
+					conversationModels: [
+						{ model: "claude-opus-5", provider: "anthropic" as const, input: 100, output: 200, cached: 700 },
+					],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				// No transcript became empty, so `persistTranscriptIdRemoval` does not run and
+				// the corrected totals need their own write.
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(written.conversationTokens).toBe(710);
+				expect(written.conversationTokenBreakdown).toEqual({ input: 60, output: 150, cached: 500 });
+
+				// In-place meter swap rather than a full panel rebuild, which would collapse
+				// scroll position and expanded sections for a single-row change.
+				const ack = postMessage.mock.calls
+					.map((c) => c[0])
+					.find((m: { command?: string }) => m?.command === "conversationDetached");
+				expect(ack.tokenMeterHtml).toBe('<div class="tmeter">meter</div>');
+				// Rebuilt from the CORRECTED summary — rebuilding from the pre-detach one
+				// would swap in a meter showing the very total the fix removes.
+				const meterArg = mockBuildTokenMeter.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(meterArg.conversationTokens).toBe(710);
+			});
+
+			it("warns the user when a lost summary write leaves the token figures permanently stale", async () => {
+				// Files first, summary second — so a summary-write failure leaves the sessions
+				// gone from disk while the memory still counts their tokens. That is not
+				// recoverable: a retry finds nothing to remove (plain ack), the subtrahend was
+				// only readable while the sessions were still in the files, and Regenerate
+				// carries `conversationTokens` over verbatim. Logging it and posting a clean ack
+				// reported the operation as fully successful; the user must be told.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+										usage: { input: 40, output: 50, cached: 200 },
+									},
+									{
+										sessionId: "keep",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "K" }],
+										usage: { input: 60, output: 150, cached: 500 },
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 1000,
+					conversationTokenBreakdown: { input: 100, output: 200, cached: 700 },
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				// Nothing is emptied, so the correction takes the rescue `storeSummary` path.
+				mockStoreSummary.mockRejectedValueOnce(new Error("orphan-write lock timeout"));
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				expect(showWarningMessage).toHaveBeenCalledWith(
+					expect.stringContaining("token and cost figures could not be updated"),
+				);
+				// The files really did change, so the row is still acked — but with no meter,
+				// since the figures on disk are the old ones.
+				const ack = postMessage.mock.calls
+					.map((c) => c[0])
+					.find((m: { command?: string }) => m?.command === "conversationDetached");
+				expect(ack).toBeDefined();
+				expect(ack).not.toHaveProperty("tokenMeterHtml");
+			});
+
+			it("leaves token totals untouched when the detached session has no recorded usage", async () => {
+				// Forward-only: memories written before per-session usage was persisted have
+				// no subtrahend, so the honest behaviour is to leave the figure alone and post
+				// no meter update rather than invent a remainder.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{ sessionId: "s1", source: "claude" as const, entries: [{ role: "human" as const, content: "A" }] },
+									{ sessionId: "keep", source: "claude" as const, entries: [{ role: "human" as const, content: "K" }] },
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 1000,
+					conversationTokenBreakdown: { input: 100, output: 200, cached: 700 },
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				const ack = postMessage.mock.calls
+					.map((c) => c[0])
+					.find((m: { command?: string }) => m?.command === "conversationDetached");
+				expect(ack).not.toHaveProperty("tokenMeterHtml");
+			});
+
+			it("does not subtract twice when a retry follows a failed transcript write", async () => {
+				// The corrected totals are persisted only AFTER the files are durably
+				// rewritten, and `currentSummary` is not reassigned before that write lands.
+				// Otherwise the failed attempt would leave the panel holding an
+				// already-subtracted summary, the row would still be there (no ack is posted
+				// on the error path), and the user's retry would subtract a second time —
+				// flooring the meter to "not reported" via Math.max(0, …).
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+										usage: { input: 40, output: 50, cached: 200 },
+									},
+									{
+										sessionId: "keep",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "K" }],
+										usage: { input: 60, output: 150, cached: 500 },
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 1000,
+					conversationTokenBreakdown: { input: 100, output: 200, cached: 700 },
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				// Attempt 1: the file batch fails, so nothing about the totals is persisted.
+				mockSaveTranscriptsBatch.mockRejectedValueOnce(new Error("disk full"));
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+
+				// Attempt 2: the batch succeeds. The subtraction must run against the
+				// ORIGINAL 1000, landing on 710 — not 420 (a second 290 taken off 710).
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(written.conversationTokens).toBe(710);
+				expect(written.conversationTokenBreakdown).toEqual({ input: 60, output: 150, cached: 500 });
+			});
+
+			it("still corrects the totals on retry when the failed attempt emptied the whole transcript", async () => {
+				// The `deletes.length > 0` sibling of the retry case above, and the reason the
+				// transcript-id removal moved AFTER the file batch. Stripping the id first is a
+				// durable write: when the batch then fails, the sessions are still in the files
+				// but no node claims their transcript id any more, so the retry's
+				// `subtractDetachedUsage` finds nothing to attribute the removed usage to (its
+				// `claimed` check) and gives up — the detach "succeeds" the second time with
+				// conversationTokens/cost permanently stale.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+										usage: { input: 40, output: 50, cached: 200 },
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 1000,
+					conversationTokenBreakdown: { input: 100, output: 200, cached: 700 },
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				// Attempt 1: the batch fails, so neither the id list nor the totals are written.
+				mockSaveTranscriptsBatch.mockRejectedValueOnce(new Error("disk full"));
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+
+				// Attempt 2: the summary still claims "abc123", so the removed usage is
+				// attributable and the correction lands — 1000 − 290 = 710 — in the SAME write
+				// that drops the emptied transcript's id.
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(written.conversationTokens).toBe(710);
+				expect(written.conversationTokenBreakdown).toEqual({ input: 60, output: 150, cached: 500 });
+				expect(written.transcripts).toEqual([]);
+				expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			});
+
 			it("openConversation opens the archived transcript in a read-only ConversationDetailsPanel", async () => {
 				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
 				mockReadTranscriptsForCommits.mockResolvedValue(
@@ -5740,7 +6098,14 @@ describe("SummaryWebviewPanel", () => {
 				);
 			});
 
-			it("reports an error and leaves the summary untouched when persisting the transcript-ID removal fails", async () => {
+			it("completes the detach when persisting the transcript-ID removal fails — the dangling id self-heals", async () => {
+				// The files are rewritten FIRST, so a summary-write failure lands on the
+				// tolerated side: `summary.transcripts` still lists an id whose file is gone,
+				// which `refreshTranscriptHashes` heals by intersecting tree ids with the files
+				// on disk. The detach itself succeeded, so it must not report a failure or
+				// leave the row stuck — the opposite ordering would abort with the sessions
+				// still in the files but their id already stripped, which is unrecoverable
+				// (see the retry test below).
 				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
 				mockReadTranscriptsForCommits.mockResolvedValue(
 					new Map([
@@ -5774,16 +6139,18 @@ describe("SummaryWebviewPanel", () => {
 				mockSaveTranscriptsBatch.mockClear();
 				const dispatch = captureMessageHandler();
 
-				// The only session in the only transcript → kept.length === 0 →
-				// deletes.length > 0 → persistTranscriptIdRemoval runs (and fails)
-				// before the (never-reached) file batch write.
+				// The only session in the only transcript → kept.length === 0 → the transcript
+				// is deleted and `persistTranscriptIdRemoval` runs (and fails) afterwards.
 				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
 				await flushPromises();
 
-				expect(showErrorMessage).toHaveBeenCalledWith(
+				expect(mockSaveTranscriptsBatch).toHaveBeenCalledWith([], ["abc123"], workspaceRoot);
+				expect(showErrorMessage).not.toHaveBeenCalledWith(
 					expect.stringContaining("Detach conversation failed"),
 				);
-				expect(mockSaveTranscriptsBatch).not.toHaveBeenCalled();
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "conversationDetached" }),
+				);
 			});
 
 			it("is denied on a foreign-repo panel", async () => {
@@ -11907,6 +12274,82 @@ describe("SummaryWebviewPanel", () => {
 				});
 			});
 
+			it("hides a usage-only carrier but keeps a real conversation that shares the transcript", async () => {
+				// The queue worker persists a zero-entry session carrying `usage` when a
+				// conversation spent tokens without producing a readable turn — it exists
+				// only so `detach` has a subtrahend. Listing it would render an empty
+				// conversation row, so the reader drops it. The sibling with real turns,
+				// and an entries-less LEGACY session (no `usage`), both still list.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["c1"]));
+				const map = new Map<
+					string,
+					{
+						sessions: Array<{
+							sessionId: string;
+							source?: string;
+							entries?: unknown[];
+							usage?: { input: number; output: number; cached: number };
+						}>;
+					}
+				>([
+					[
+						"c1",
+						{
+							sessions: [
+								{ sessionId: "real", entries: [{ role: "human", content: "hi" }] },
+								{ sessionId: "carrier", entries: [], usage: { input: 600, output: 300, cached: 0 } },
+								// Legacy/malformed: omits `entries`, carries no `usage` → NOT a
+								// carrier, still listed with a turn count of 0.
+								{ sessionId: "legacy" },
+							],
+						},
+					],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(map as never);
+				const dispatch = await openPanel();
+
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				const call = postMessage.mock.calls.find(
+					(c) => (c[0] as { command?: string })?.command === "conversationsData",
+				);
+				const items = call?.[0].items as Array<{ sessionId: string; messageCount: number }>;
+				expect(items.map((i) => i.sessionId)).toEqual(["real", "legacy"]);
+			});
+
+			it("keeps a conversation whose carrier slice is joined by real turns in another transcript", async () => {
+				// Merged-view semantics: the same conversation can be a carrier in one
+				// commit's transcript and carry real turns in another. Filtering per slice
+				// would hide a conversation the user can actually read.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["c1", "c2"]));
+				const map = new Map<
+					string,
+					{
+						sessions: Array<{
+							sessionId: string;
+							entries?: unknown[];
+							usage?: { input: number; output: number; cached: number };
+						}>;
+					}
+				>([
+					["c1", { sessions: [{ sessionId: "split", entries: [], usage: { input: 1, output: 1, cached: 0 } }] }],
+					["c2", { sessions: [{ sessionId: "split", entries: [{ role: "human", content: "hi" }] }] }],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(map as never);
+				const dispatch = await openPanel();
+
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				const call = postMessage.mock.calls.find(
+					(c) => (c[0] as { command?: string })?.command === "conversationsData",
+				);
+				const items = call?.[0].items as Array<{ sessionId: string; messageCount: number }>;
+				expect(items).toHaveLength(1);
+				expect(items[0]).toMatchObject({ sessionId: "split", messageCount: 1 });
+			});
+
 			it("logs a warning when the transcript read rejects (Error and non-Error)", async () => {
 				const dispatch = await openPanel();
 				warn.mockClear();
@@ -12141,7 +12584,7 @@ describe("SummaryWebviewPanel", () => {
 				expect(result).toBe(summary);
 			});
 
-			it("reports an error when persisting the transcript-ID removal rejects with a non-Error", async () => {
+			it("tolerates a non-Error rejection when persisting the transcript-ID removal", async () => {
 				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
 				mockReadTranscriptsForCommits.mockResolvedValue(
 					new Map([
@@ -12182,8 +12625,14 @@ describe("SummaryWebviewPanel", () => {
 				});
 				await flushPromises();
 
-				expect(showErrorMessage).toHaveBeenCalledWith(
+				// Covers the `String(err)` side of the post-write catch's log formatting. The
+				// files are already rewritten at that point, so the failure is logged and the
+				// detach still completes rather than reporting a failure it didn't have.
+				expect(showErrorMessage).not.toHaveBeenCalledWith(
 					expect.stringContaining("Detach conversation failed"),
+				);
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ command: "conversationDetached" }),
 				);
 			});
 

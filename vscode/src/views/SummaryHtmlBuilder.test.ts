@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const {
 	aggregateConversationTokenBreakdown,
 	aggregateConversationTokens,
+	aggregateEstimatedCost,
 	aggregateStats,
 	aggregateTurns,
 	formatDurationLabel,
@@ -15,6 +16,7 @@ const {
 	interface TokNode {
 		conversationTokens?: number;
 		conversationTokenBreakdown?: { input: number; output: number; cached: number };
+		estimatedCostUsd?: number;
 		children?: ReadonlyArray<TokNode>;
 	}
 	// Mirror the real SummaryTree aggregators: the token meter now sums the whole
@@ -32,9 +34,14 @@ const {
 			{ input: raw?.input ?? 0, output: raw?.output ?? 0, cached: raw?.cached ?? 0 },
 		);
 	};
+	// Same recursion for the stored per-model cost: a consolidated memory carries
+	// it on the folded children, so the meter must sum the tree to prefer it.
+	const sumCost = (node: TokNode): number =>
+		(node.children ?? []).reduce((a, c) => a + sumCost(c), node.estimatedCostUsd ?? 0);
 	return {
 		aggregateConversationTokens: vi.fn(sumTokens),
 		aggregateConversationTokenBreakdown: vi.fn(sumBreakdown),
+		aggregateEstimatedCost: vi.fn(sumCost),
 		aggregateStats: vi.fn(() => ({
 			insertions: 10,
 			deletions: 5,
@@ -137,6 +144,7 @@ const {
 vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
 	aggregateConversationTokenBreakdown,
 	aggregateConversationTokens,
+	aggregateEstimatedCost,
 	aggregateStats,
 	aggregateTurns,
 	formatDurationLabel,
@@ -1841,6 +1849,122 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).not.toContain("seg-cache");
 			expect(html).not.toContain("tmeter-legend");
 			expect(html).not.toContain("tmeter na");
+		});
+
+		it("prefers the stored per-model cost over the flat Sonnet estimate", () => {
+			// This surface used to price every memory at Sonnet rates unconditionally
+			// while the sidebar preferred the stored per-model figure, so the same memory
+			// showed two different dollar amounts — and Opus work was understated here.
+			const html = buildTokenMeter(
+				makeSummary({
+					conversationTokens: 1_000_000,
+					conversationTokenBreakdown: { input: 200_000, output: 300_000, cached: 500_000 },
+					estimatedCostUsd: 42.5,
+				}),
+			);
+			expect(html).toContain("≈$42.50");
+			// Sonnet-rate arithmetic on the same breakdown would land near $6.47.
+			expect(html).not.toContain("≈$6.4");
+			expect(html).toContain("priced per model at list rates");
+		});
+
+		it("falls back to the Sonnet estimate, and says so, when no stored cost exists", () => {
+			const html = buildTokenMeter(
+				makeSummary({
+					conversationTokens: 1_000_000,
+					conversationTokenBreakdown: { input: 200_000, output: 300_000, cached: 500_000 },
+					estimatedCostUsd: undefined,
+				}),
+			);
+			// 200k·$3 + 300k·$15 + 500k·$3.75 per MTok = $6.975, which toFixed(2) renders
+			// as 6.97 (6.975 has no exact binary form and lands just below the midpoint).
+			expect(html).toContain("≈$6.97");
+			expect(html).toContain("assumes Sonnet pricing");
+		});
+
+		it("aggregates the stored cost across the consolidation tree, not just the root", () => {
+			const html = buildTokenMeter(
+				makeSummary({
+					conversationTokens: undefined,
+					estimatedCostUsd: undefined,
+					children: [
+						makeSummary({ conversationTokens: 500_000, estimatedCostUsd: 10 }),
+						makeSummary({ conversationTokens: 500_000, estimatedCostUsd: 5.25 }),
+					],
+				}),
+			);
+			expect(html).toContain("≈$15.25");
+		});
+
+		it("fills in the Sonnet fallback per node when only part of the tree has a stored cost", () => {
+			// The token headline aggregates EVERY node, so an all-or-nothing "any stored
+			// cost wins" test priced only the root of a mixed consolidation and showed that
+			// figure next to the whole tree's tokens — a dollar amount covering half the
+			// tokens beside it, and lower than the flat estimate it replaced.
+			const html = buildTokenMeter(
+				makeSummary({
+					conversationTokens: 500_000,
+					conversationTokenBreakdown: { input: 500_000, output: 0, cached: 0 },
+					estimatedCostUsd: 10,
+					children: [
+						makeSummary({
+							conversationTokens: 500_000,
+							conversationTokenBreakdown: { input: 200_000, output: 300_000, cached: 0 },
+							estimatedCostUsd: undefined,
+						}),
+					],
+				}),
+			);
+			// $10 stored for the root + Sonnet rates for the child (200k·$3 + 300k·$15
+			// per MTok = $5.10) = $15.10. The old behaviour showed the root's $10 alone.
+			expect(html).toContain("≈$15.10");
+			expect(html).not.toContain("≈$10.00");
+			// And the tooltip must not claim everything was priced per model.
+			expect(html).toContain("where that model has a known price");
+			expect(html).not.toContain("assumes Sonnet pricing");
+		});
+
+		it("tops up the stored cost with the flat rate for a node's unpriced models", () => {
+			// A stored `estimatedCostUsd` is a LOWER bound, not full coverage: write time
+			// prices only the models in the host table and excludes the rest. Gemini is the
+			// live example — a supported transcript source with no rows in Pricing.ts, so
+			// its buckets arrive `provider: "unknown"` and unpriced. Reading
+			// `estimatedCostUsd > 0` as "fully priced" charged $0 for those tokens while
+			// still counting them in the headline beside the figure.
+			const html = buildTokenMeter(
+				makeSummary({
+					conversationTokens: 1_000_000,
+					conversationTokenBreakdown: { input: 700_000, output: 300_000, cached: 0 },
+					conversationModels: [
+						{ model: "claude-opus-5", provider: "anthropic", input: 200_000, output: 300_000, cached: 0 },
+						{ model: "gemini-3-flash", provider: "unknown", input: 500_000, output: 0, cached: 0 },
+					],
+					// Opus alone: 200k·$5 + 300k·$25 per MTok = $8.50.
+					estimatedCostUsd: 8.5,
+				}),
+			);
+			// $8.50 stored + the unpriced gemini-3-flash bucket at Sonnet input rates
+			// (500k·$3 per MTok = $1.50) = $10.00.
+			expect(html).toContain("≈$10.00");
+			expect(html).not.toContain("≈$8.50");
+			// Mixed, not "stored": the tooltip must stop claiming a fully model-priced figure.
+			expect(html).toContain("where that model has a known price");
+		});
+
+		it("keeps the stored cost as-is when every recorded model is priced", () => {
+			const html = buildTokenMeter(
+				makeSummary({
+					conversationTokens: 500_000,
+					conversationTokenBreakdown: { input: 200_000, output: 300_000, cached: 0 },
+					conversationModels: [
+						{ model: "claude-opus-5", provider: "anthropic", input: 200_000, output: 300_000, cached: 0 },
+					],
+					estimatedCostUsd: 8.5,
+				}),
+			);
+			expect(html).toContain("≈$8.50");
+			expect(html).toContain("priced per model at list rates");
+			expect(html).not.toContain("where that model has a known price");
 		});
 
 		it("token meter treats conversationTokens of 0 as unreported", () => {

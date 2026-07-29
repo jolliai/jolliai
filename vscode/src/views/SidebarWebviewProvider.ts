@@ -1477,20 +1477,32 @@ export class SidebarWebviewProvider
 		// by their first known timestamp reconstructs the true conversation order.
 		// The sort is stable, so slices with no parseable timestamp (legacy data)
 		// keep their first-seen order rather than jumping to the front.
-		return order.map((key) => {
-			// Non-null: every key in `order` was set in `grouped` above.
-			const { base, parts } = grouped.get(key) as {
-				base: StoredSession;
-				parts: ReadonlyArray<TranscriptEntry>[];
-			};
-			const sorted = [...parts].sort((a, b) => {
-				const ta = sliceStartTime(a);
-				const tb = sliceStartTime(b);
-				if (ta === undefined || tb === undefined) return 0;
-				return ta - tb;
-			});
-			return { ...base, entries: sorted.flat() };
-		});
+		return (
+			order
+				.map((key) => {
+					// Non-null: every key in `order` was set in `grouped` above.
+					const { base, parts } = grouped.get(key) as {
+						base: StoredSession;
+						parts: ReadonlyArray<TranscriptEntry>[];
+					};
+					const sorted = [...parts].sort((a, b) => {
+						const ta = sliceStartTime(a);
+						const tb = sliceStartTime(b);
+						if (ta === undefined || tb === undefined) return 0;
+						return ta - tb;
+					});
+					return { ...base, entries: sorted.flat() };
+				})
+				// Drop usage-only carriers: stored so `detach` has a per-session
+				// subtrahend, but with no readable turn to show — an evidence/branch row
+				// for one would render as an empty conversation. Applied to the MERGED
+				// entries so a conversation that is a carrier in one transcript and real in
+				// another still surfaces. A session that merely OMITS `entries` (legacy /
+				// malformed stored data) is not a carrier and is deliberately kept: those
+				// are real conversations, rendered with a turn count of 0 — hence the
+				// `usage` half of the predicate.
+				.filter((session) => session.entries.length > 0 || session.usage === undefined)
+		);
 	}
 
 	/**

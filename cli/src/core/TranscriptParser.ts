@@ -11,7 +11,7 @@
  */
 
 import { createLogger } from "../Logger.js";
-import type { ConversationTokenBreakdown, ModelTokenUsage, TranscriptEntry } from "../Types.js";
+import type { ModelTokenUsage, ParsedTurnUsage, TranscriptEntry } from "../Types.js";
 import { parseTranscriptLine } from "./TranscriptReader.js";
 
 const log = createLogger("TranscriptParser");
@@ -23,9 +23,11 @@ const log = createLogger("TranscriptParser");
 export interface TranscriptParser {
 	parseLine(line: string, lineNum: number): TranscriptEntry | null;
 	/** Per-turn token usage split into input / output / cached segments. The
-	 *  reader sums these into the scalar `usageTokens` total. Absent method =
-	 *  source exposes no usage (all downstream sums default to 0). */
-	parseUsageTokens?(line: string, lineNum: number): ConversationTokenBreakdown;
+	 *  reader sums these into the scalar `usageTokens` total, skipping any line
+	 *  whose `dedupKey` it has already counted — see {@link ParsedTurnUsage} for
+	 *  why one response can arrive on several lines. Absent method = source
+	 *  exposes no usage (all downstream sums default to 0). */
+	parseUsageTokens?(line: string, lineNum: number): ParsedTurnUsage;
 	/** Per-model token usage over a whole consumed slice, one bucket per model
 	 *  the transcript attributed tokens to. Whole-slice (not per-line) because a
 	 *  source may record the model on a *different* line than the usage (e.g.
@@ -51,10 +53,19 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 		return parseTranscriptLine(line, lineNum);
 	}
 
-	parseUsageTokens(line: string, _lineNum?: number): ConversationTokenBreakdown {
+	parseUsageTokens(line: string, _lineNum?: number): ParsedTurnUsage {
 		const usage = extractClaudeUsage(line);
 		if (!usage) return { input: 0, output: 0, cached: 0 };
-		return { input: usage.input, output: usage.output, cached: usage.cached };
+		return {
+			input: usage.input,
+			output: usage.output,
+			cached: usage.cached,
+			// `message.id` identifies the API response, not the line. Several lines
+			// (one per content block) repeat the same id and the same usage object;
+			// the reader counts only the first. Omitted when the id is absent so the
+			// line still counts rather than being silently dropped.
+			...(usage.id && { dedupKey: usage.id }),
+		};
 	}
 
 	/**
@@ -63,12 +74,22 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 	 * drift from {@link parseUsageTokens}. Lines with usage but no model string
 	 * are bucketed under an empty model id (provider "anthropic") — they still
 	 * count toward tokens; pricing will treat an unknown id as unpriced.
+	 *
+	 * De-duplicates by `message.id` for the same reason the reader does (see
+	 * {@link ParsedTurnUsage}) — and it must dedupe on the SAME identity, or the
+	 * per-model buckets would drift from the breakdown and the cost estimate
+	 * would be priced off a larger token count than the bar displays.
 	 */
 	parseUsageByModel(lines: ReadonlyArray<string>): ModelTokenUsage[] {
 		const byModel = new Map<string, ModelTokenUsage>();
+		const seen = new Set<string>();
 		for (const line of lines) {
 			const usage = extractClaudeUsage(line);
 			if (!usage) continue;
+			if (usage.id) {
+				if (seen.has(usage.id)) continue;
+				seen.add(usage.id);
+			}
 			const existing = byModel.get(usage.model);
 			if (existing) {
 				byModel.set(usage.model, {
@@ -197,11 +218,17 @@ function parseCodexAgentMessage(
  * `model` is `message.model` (falling back to a top-level `model`), or an empty
  * string when absent; the turn still counts toward tokens and pricing treats an
  * empty/unknown id as unpriced.
+ *
+ * `id` is `message.id` — the API response's identity, used to collapse the
+ * several lines one response is written across (see `ParsedTurnUsage`). Empty
+ * when absent, which makes the caller count the line unconditionally.
  */
-function extractClaudeUsage(line: string): { model: string; input: number; output: number; cached: number } | null {
+function extractClaudeUsage(
+	line: string,
+): { id: string; model: string; input: number; output: number; cached: number } | null {
 	try {
 		const o = JSON.parse(line) as {
-			message?: { usage?: Record<string, unknown>; model?: unknown };
+			message?: { usage?: Record<string, unknown>; model?: unknown; id?: unknown };
 			usage?: Record<string, unknown>;
 			model?: unknown;
 		};
@@ -210,7 +237,9 @@ function extractClaudeUsage(line: string): { model: string; input: number; outpu
 		const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
 		const rawModel = o.message?.model ?? o.model;
 		const model = typeof rawModel === "string" ? rawModel : "";
+		const rawId = o.message?.id;
 		return {
+			id: typeof rawId === "string" ? rawId : "",
 			model,
 			input: n("input_tokens"),
 			output: n("output_tokens"),

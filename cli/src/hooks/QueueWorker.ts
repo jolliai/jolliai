@@ -3551,9 +3551,11 @@ async function loadSessionTranscripts(
 	};
 	const conversationModels: ModelTokenUsage[] = [...modelMerge.values()];
 
+	const withUsage = attachPerSessionUsage(sessionTranscripts, raw.perSessionTokens, preBySession, postBySession);
+
 	return {
 		allSessions,
-		sessionTranscripts,
+		sessionTranscripts: withUsage,
 		totalEntries,
 		humanEntries,
 		conversationTokens,
@@ -3567,10 +3569,62 @@ async function loadSessionTranscripts(
  * the scalar total, the 3-segment breakdown, and the per-model split (keyed by
  * model id) used to estimate cost. `byModel` segments sum to `breakdown`.
  */
-interface SessionTokenBucket {
+/**
+ * Exported only so `attachPerSessionUsage`'s signature is nameable: `__test__` is
+ * re-exported through `PostCommitHook._testHelpers`, and TS4023 rejects a public
+ * declaration whose parameter type is module-private.
+ */
+export interface SessionTokenBucket {
 	tokens: number;
 	breakdown: { input: number; output: number; cached: number };
 	byModel: Map<string, ModelTokenUsage>;
+}
+
+/**
+ * Attaches each surviving conversation's own token attribution to its
+ * `SessionTranscript` so `buildStoredTranscript` can persist it alongside the
+ * entries. Without this the per-session split dies with the local
+ * `perSessionTokens` map and only the merged total reaches disk — which is exactly
+ * what leaves a later detach with no subtrahend to correct the token bar (see
+ * `StoredSession.usage`).
+ *
+ * Exactly ONE carrier per conversation key. A single run can produce several
+ * `SessionTranscript` objects for the same key: `readAllTranscripts` merges
+ * repeated slices into ONE bucket but pushes one object per slice, and nothing
+ * upstream de-duplicates `allSessions` (the hook-tracked registry is keyed by
+ * sessionId, but each hookless discoverer concatenates several scan roots). Copying
+ * the bucket onto every object would persist the same usage N times, and detach —
+ * which sums ALL stored sessions matching the key — would subtract N× what the
+ * summary ever counted, flooring the meter to "not reported". First in traversal
+ * order wins: the bucket is already the whole conversation's merged total, so which
+ * slice carries it is arbitrary, and splitting it per slice would mean inventing a
+ * share no usage line supports.
+ *
+ * @param preBySession - entry counts BEFORE conversation-edit overlays were applied
+ * @param postBySession - entry counts AFTER; a lower count means the overlay pruned
+ *   entries, so that session's tokens were excluded from the summary totals and its
+ *   raw pre-overlay usage must NOT be persisted (it would over-subtract on detach).
+ */
+function attachPerSessionUsage(
+	sessionTranscripts: ReadonlyArray<SessionTranscript>,
+	perSessionTokens: ReadonlyMap<string, SessionTokenBucket>,
+	preBySession: ReadonlyMap<string, number>,
+	postBySession: ReadonlyMap<string, number>,
+): SessionTranscript[] {
+	const attached = new Set<string>();
+	return sessionTranscripts.map((st) => {
+		const key = conversationKey(st.source ?? "claude", st.sessionId);
+		if ((postBySession.get(key) ?? 0) < (preBySession.get(key) ?? 0)) return st;
+		if (attached.has(key)) return st;
+		const bucket = perSessionTokens.get(key);
+		if (!bucket) return st;
+		attached.add(key);
+		return {
+			...st,
+			usage: { ...bucket.breakdown },
+			...(bucket.byModel.size > 0 && { usageByModel: [...bucket.byModel.values()] }),
+		};
+	});
 }
 
 /**
@@ -3611,6 +3665,13 @@ async function readAllTranscripts(
 	// populated even when a slice yields zero merged entries (a usage-only slice),
 	// so the subtraction stays exact.
 	const perSessionTokens = new Map<string, SessionTokenBucket>();
+	// Session identity per conversationKey, so a conversation that produced tokens
+	// but no merged entries can still be given a persistence carrier after the loop
+	// (see the usage-only reconciliation below). `perSessionTokens` is keyed by
+	// conversationKey alone and carries no `transcriptPath`/`source`, which a
+	// `SessionTranscript` needs. First slice wins: these three fields are identical
+	// across a conversation's slices.
+	const sessionIdentity = new Map<string, { sessionId: string; transcriptPath: string; source: TranscriptSource }>();
 
 	for (const session of sessions) {
 		const cursor = await loadCursorForTranscript(session.transcriptPath, cwd);
@@ -3738,6 +3799,13 @@ async function readAllTranscripts(
 		// (source, sessionId) identity used everywhere else; a repeated session merges
 		// into its bucket rather than overwriting.
 		const convKey = conversationKey(source, session.sessionId);
+		if (!sessionIdentity.has(convKey)) {
+			sessionIdentity.set(convKey, {
+				sessionId: session.sessionId,
+				transcriptPath: session.transcriptPath,
+				source,
+			});
+		}
 		const bucket = perSessionTokens.get(convKey) ?? {
 			tokens: 0,
 			breakdown: { input: 0, output: 0, cached: 0 },
@@ -3790,7 +3858,69 @@ async function readAllTranscripts(
 		await saveCursor(result.newCursor, cwd);
 	}
 
+	// Give every conversation that spent tokens a persistence carrier, including the
+	// ones the entries gate above skipped. Runs AFTER the loop because slice order is
+	// arbitrary: whether a conversation has any entry-bearing slice is only knowable
+	// once every slice has been read.
+	appendUsageOnlyCarriers(sessionTranscripts, perSessionTokens, sessionIdentity);
+
 	return { sessionTranscripts, totalEntries, humanEntries, conversationTokens, perSessionTokens };
+}
+
+/**
+ * Appends a zero-entry `SessionTranscript` for each conversation that accumulated
+ * tokens but never produced a merged entry, so its `perSessionTokens` bucket has
+ * something to ride to disk on.
+ *
+ * Why this exists: token accounting is deliberately decoupled from the
+ * `entries.length > 0` gate in {@link readAllTranscripts} (a tool-only or
+ * noise-filtered slice still spent real tokens, so its usage belongs in
+ * `conversationTokens`). But the ONLY carrier a per-session split has to reach
+ * disk is a `SessionTranscript`: `attachPerSessionUsage` maps over that array, and
+ * `buildStoredTranscript` serializes it. A conversation absent from the array had
+ * its bucket die in memory — the summary kept the tokens while the stored
+ * transcript kept no record of who spent them, which left `detach` with no
+ * subtrahend (`StoredSession.usage`) and, when the conversation was the commit's
+ * only one, meant no transcript id was ever allocated for it at all.
+ *
+ * Mutates `sessionTranscripts` in place (append-only) — the caller's array is
+ * already the loop's accumulator.
+ *
+ * @param sessionIdentity - conversationKey → the session's identity fields, needed
+ *   because `perSessionTokens` is keyed by conversationKey alone.
+ */
+function appendUsageOnlyCarriers(
+	sessionTranscripts: SessionTranscript[],
+	perSessionTokens: ReadonlyMap<string, SessionTokenBucket>,
+	sessionIdentity: ReadonlyMap<string, { sessionId: string; transcriptPath: string; source: TranscriptSource }>,
+): void {
+	// Keys already represented by a real slice. Derived with the SAME expression
+	// attachPerSessionUsage uses to look buckets up, so "already carried" here means
+	// exactly "that pass will find this slice" — a divergent key would append a
+	// duplicate carrier that then never receives its usage.
+	const carried = new Set(sessionTranscripts.map((st) => conversationKey(st.source ?? "claude", st.sessionId)));
+
+	for (const [key, bucket] of perSessionTokens) {
+		if (carried.has(key)) continue;
+		// Gate on the breakdown, not `bucket.tokens`: the breakdown sum is the exact
+		// predicate buildStoredTranscript uses to decide whether `usage` reaches disk.
+		// A source that reports usageTokens but no usageBreakdown would otherwise get a
+		// carrier whose usage is stripped on serialize, leaving an entry-less AND
+		// usage-less session — the noise this function exists to avoid.
+		if (bucket.breakdown.input + bucket.breakdown.output + bucket.breakdown.cached <= 0) continue;
+		const identity = sessionIdentity.get(key);
+		// Unreachable by construction (both maps are populated from the same slice, in
+		// the same iteration), but a carrier without identity fields is unserializable.
+		/* v8 ignore start */
+		if (!identity) continue;
+		/* v8 ignore stop */
+		sessionTranscripts.push({
+			sessionId: identity.sessionId,
+			transcriptPath: identity.transcriptPath,
+			source: identity.source,
+			entries: [],
+		});
+	}
 }
 
 /**
@@ -3810,6 +3940,12 @@ function buildStoredTranscript(sessionTranscripts: ReadonlyArray<SessionTranscri
 			source: st.source,
 			transcriptPath: st.transcriptPath,
 			entries: [...st.entries],
+			// Per-session usage is persisted only when non-zero: a stored `usage` of
+			// all zeros is indistinguishable from "this source reports no usage", and
+			// detach treats a present-but-zero record as a legitimate no-op subtraction
+			// while an absent one means "cannot attribute" (see StoredSession.usage).
+			...(st.usage && st.usage.input + st.usage.output + st.usage.cached > 0 && { usage: st.usage }),
+			...(st.usageByModel && st.usageByModel.length > 0 && { usageByModel: st.usageByModel }),
 		})),
 	};
 }
@@ -3829,6 +3965,8 @@ export const __test__ = {
 	handleAmendPipeline,
 	handleSquashFromQueue,
 	loadSessionTranscripts,
+	attachPerSessionUsage,
+	appendUsageOnlyCarriers,
 	buildStoredTranscript,
 	processQueueEntry,
 	runIngestEntry,

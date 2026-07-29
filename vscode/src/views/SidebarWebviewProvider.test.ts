@@ -4081,6 +4081,68 @@ describe("SidebarWebviewProvider", () => {
 	});
 
 	describe("kb:expandMemory → kb:memoryEvidence", () => {
+		it("omits a usage-only carrier from the conversations evidence, keeps entries-less legacy sessions", async () => {
+			// A carrier (empty `entries` + a recorded `usage`) is stored only so `detach`
+			// has a token subtrahend; an evidence row for it would read as an empty
+			// conversation. A session that merely OMITS `entries` is legacy data, not a
+			// carrier, and must still surface with a turn count of 0 — hence the `usage`
+			// half of the predicate.
+			const view = makeMockView();
+			const fakeSummary = {
+				version: 5,
+				commitHash: "abc1234",
+				commitMessage: "feat: add widget",
+				commitAuthor: "Dev",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: ["tid-1"],
+			};
+			const fakeTranscript = {
+				sessions: [
+					{
+						sessionId: "sess-real",
+						source: "claude" as const,
+						transcriptPath: "/tmp/claude.jsonl",
+						entries: [{ role: "human" as const, content: "hi" }],
+					},
+					{
+						sessionId: "sess-carrier",
+						source: "claude" as const,
+						transcriptPath: "/tmp/carrier.jsonl",
+						entries: [],
+						usage: { input: 600, output: 300, cached: 0 },
+					},
+					{ sessionId: "sess-legacy", source: "claude" as const, transcriptPath: "/tmp/legacy.jsonl" },
+				],
+			};
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+					currentRepoName: "myrepo",
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash: vi.fn().mockResolvedValue(fakeSummary),
+				readTranscriptById: vi.fn().mockResolvedValue(fakeTranscript),
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "abc1234" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+
+			expect(evidenceMsg.evidence.conversations.map((c: { id: string }) => c.id)).toEqual([
+				"sess-real",
+				"sess-legacy",
+			]);
+		});
+
 		it("posts kb:memoryEvidence with projected conversations/context/files from the summary", async () => {
 			const view = makeMockView();
 			const fakeSummary = {

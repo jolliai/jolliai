@@ -103,6 +103,26 @@ describe("loadRegenerateContext", () => {
 		expect(ctx.sources).toEqual(["Claude"]);
 	});
 
+	it("excludes a usage-only carrier from sessionCount but keeps an entries-less legacy session", async () => {
+		// A carrier is a zero-entry session that carries `usage` — stored only so a
+		// later detach has a token subtrahend, and hidden from every Conversations
+		// surface. Counting it would make the confirm dialog promise a conversation the
+		// user cannot see, and it contributes nothing to the regenerate prompt anyway.
+		// A session that merely omits/empties `entries` WITHOUT `usage` is legacy data
+		// and must keep counting.
+		vi.mocked(SummaryStore.readTranscriptsForCommits).mockResolvedValue(
+			singleHashMap(baseSummary.commitHash, {
+				sessions: [
+					{ sessionId: "carrier", source: "claude", entries: [], usage: { input: 6, output: 3, cached: 0 } },
+					{ sessionId: "legacy", source: "claude", entries: [] },
+				],
+			}),
+		);
+
+		const ctx = await loadRegenerateContext(baseSummary, "/repo");
+		expect(ctx.sessionCount).toBe(1);
+	});
+
 	it("defaults missing session.source to 'claude' for sessionId dedup keys", async () => {
 		// Legacy / partial stored sessions may not carry .source. The
 		// dedup key uses `session.source ?? "claude"` so two sessions

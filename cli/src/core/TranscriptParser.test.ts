@@ -208,6 +208,34 @@ describe("ClaudeTranscriptParser", () => {
 	});
 
 	describe("parseUsageTokens", () => {
+		it("emits message.id as the dedupKey so repeated block lines collapse to one response", () => {
+			const line = JSON.stringify({
+				type: "assistant",
+				message: {
+					id: "msg_01EWeKJMpUeBRTNGECP3PiaQ",
+					role: "assistant",
+					content: [{ type: "thinking", thinking: "…" }],
+					usage: { input_tokens: 15654, cache_creation_input_tokens: 23100, output_tokens: 1402 },
+				},
+			});
+			expect(parser.parseUsageTokens(line, 1)).toEqual({
+				input: 15654,
+				output: 1402,
+				cached: 23100,
+				dedupKey: "msg_01EWeKJMpUeBRTNGECP3PiaQ",
+			});
+		});
+
+		it("omits dedupKey when the line carries no message.id, so the line still counts", () => {
+			const line = JSON.stringify({
+				type: "assistant",
+				message: { role: "assistant", content: [], usage: { input_tokens: 7, output_tokens: 1 } },
+			});
+			const parsed = parser.parseUsageTokens(line, 1);
+			expect(parsed).toEqual({ input: 7, output: 1, cached: 0 });
+			expect(parsed.dedupKey).toBeUndefined();
+		});
+
 		it("sums input + cache_creation + output, EXCLUDING the cumulative cache_read prefix", () => {
 			const line = JSON.stringify({
 				type: "assistant",
@@ -322,6 +350,62 @@ describe("ClaudeTranscriptParser", () => {
 				type: "assistant",
 				message: { role: "assistant", content: [{ type: "text", text: "x" }], model, usage },
 			});
+
+		// Real-shape regression: Claude Code writes one line per content block of a
+		// single assistant response and repeats that response's whole `usage` object
+		// verbatim on each. The `message.id` + usage values below are copied from a
+		// real transcript (~/.claude/projects/-Users-flyer-jolli-code-jollimemory/
+		// 9cc7113b-….jsonl, captured 2026-07-29) where msg_01EWeKJMpUeBRTNGECP3PiaQ
+		// spans 5 lines: thinking, text, and three parallel tool_use blocks — all
+		// carrying in=15654 out=1402 cc=23100. Summing per line bills that one API
+		// call 5×. Across that file, 186 of 262 responses repeat this way, inflating
+		// the total 2.54×; the worst measured file inflated 10.13×.
+		it("counts one response once even when its blocks span five lines (real transcript shape)", () => {
+			const usage = {
+				input_tokens: 15654,
+				cache_creation_input_tokens: 23100,
+				cache_read_input_tokens: 18831,
+				output_tokens: 1402,
+			};
+			const blockLine = (content: unknown): string =>
+				JSON.stringify({
+					type: "assistant",
+					message: {
+						id: "msg_01EWeKJMpUeBRTNGECP3PiaQ",
+						role: "assistant",
+						model: "claude-opus-5",
+						stop_reason: "tool_use",
+						content: [content],
+						usage,
+					},
+				});
+			const lines = [
+				blockLine({ type: "thinking", thinking: "…" }),
+				blockLine({ type: "text", text: "Let me check three files." }),
+				blockLine({ type: "tool_use", id: "toolu_1", name: "Read", input: {} }),
+				blockLine({ type: "tool_use", id: "toolu_2", name: "Read", input: {} }),
+				blockLine({ type: "tool_use", id: "toolu_3", name: "Read", input: {} }),
+			];
+			expect(parser.parseUsageByModel(lines)).toEqual([
+				{ model: "claude-opus-5", provider: "anthropic", input: 15654, output: 1402, cached: 23100 },
+			]);
+		});
+
+		it("still sums distinct responses that share a model", () => {
+			const withId = (id: string, usage: Record<string, number>): string =>
+				JSON.stringify({
+					type: "assistant",
+					message: { id, role: "assistant", model: "claude-opus-5", content: [], usage },
+				});
+			const lines = [
+				withId("msg_a", { input_tokens: 10, output_tokens: 1, cache_creation_input_tokens: 2 }),
+				withId("msg_a", { input_tokens: 10, output_tokens: 1, cache_creation_input_tokens: 2 }), // repeat block
+				withId("msg_b", { input_tokens: 30, output_tokens: 3, cache_creation_input_tokens: 4 }),
+			];
+			expect(parser.parseUsageByModel(lines)).toEqual([
+				{ model: "claude-opus-5", provider: "anthropic", input: 40, output: 4, cached: 6 },
+			]);
+		});
 
 		it("buckets by model with the same segment semantics as parseUsageTokens", () => {
 			const line = turn("claude-opus-4-8", {

@@ -68,6 +68,14 @@ export async function loadRegenerateContext(
 			for (const entry of session.entries) {
 				if (entry.role === "human") humanTurns++;
 			}
+			// Skip a usage-only carrier: the queue worker stores a zero-entry session
+			// carrying `usage` purely so `detach` has a token subtrahend, and the
+			// Conversations surfaces hide it. Counting it here would make the confirm
+			// dialog promise a conversation the user cannot see (and which contributes
+			// nothing to the regenerate prompt — buildMultiSessionContext emits no block
+			// for an entry-less session). A session that merely omits `entries` is legacy
+			// data, not a carrier, and still counts — hence the `usage` half.
+			if (session.entries.length === 0 && session.usage !== undefined) continue;
 			const sourceKey = session.source ?? "claude";
 			seenSessions.add(`${sourceKey}:${session.sessionId}`);
 			sourceSet.add(transcriptSourceLabel(session.source));

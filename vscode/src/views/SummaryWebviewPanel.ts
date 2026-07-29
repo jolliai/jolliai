@@ -21,6 +21,10 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { execFileSyncHidden } from "../../../cli/src/util/Subprocess.js";
+import {
+	type DetachedSessionUsage,
+	subtractDetachedUsage,
+} from "../../../cli/src/core/DetachedUsageSubtraction.js";
 import { isAncestor } from "../../../cli/src/core/GitOps.js";
 import { withPlansLock } from "../../../cli/src/core/Locks.js";
 import { toForwardSlash } from "../../../cli/src/core/PathUtils.js";
@@ -112,6 +116,7 @@ import {
 	buildJolliRow,
 	buildPlansAndNotesSection,
 	buildRecapSection,
+	buildTokenMeter,
 	buildTopicsSection,
 	contextChipCount,
 	type FileRow,
@@ -3823,6 +3828,17 @@ export class SummaryWebviewPanel {
 				if (seen.has(key)) {
 					continue;
 				}
+				// Skip a usage-only carrier slice WITHOUT marking the key seen: such a
+				// conversation must not be counted (its row is hidden, so a count of 1
+				// against an empty list reads as a bug), but a conversation whose slice in
+				// THIS transcript happens to be a carrier still gets counted when a later
+				// transcript carries its real turns. Same merged-view semantics as
+				// readGroupedArchivedSessions, reached without a second grouping pass, and
+				// the same narrow predicate — a session that merely omits `entries` is
+				// legacy data, not a carrier, and still counts.
+				if ((session.entries ?? []).length === 0 && session.usage !== undefined) {
+					continue;
+				}
 				seen.add(key);
 				sessionCounts[source] = (sessionCounts[source] ?? 0) + 1;
 			}
@@ -3907,9 +3923,29 @@ export class SummaryWebviewPanel {
 				if (ta === undefined || tb === undefined) return 0;
 				return ta - tb;
 			});
-			grouped.set(key, { session: g.session, hash: g.hash, entries: sorted.flat() });
+			const entries = sorted.flat();
+			// Hide a usage-only conversation: it exists on disk only so `detach` has a
+			// per-session subtrahend (the queue worker persists a zero-entry carrier for
+			// a conversation that spent tokens without producing a readable turn), so a
+			// row for it would render as an empty conversation.
+			//
+			// The `usage` half of the predicate is load-bearing. "No entries at all" is a
+			// DIFFERENT case: a legacy/malformed stored session can omit `entries`
+			// entirely, and those are real conversations this panel deliberately still
+			// lists (turn count 0). Only a carrier is identifiable by empty-entries AND a
+			// recorded `usage`.
+			//
+			// Filtered on the MERGED entries, not per slice: a conversation split across
+			// commits can legitimately be entry-less in one transcript and real in
+			// another, and that one must still show. Detach reads `transcript.sessions`
+			// directly and is deliberately NOT filtered — the record stays subtractable.
+			if (entries.length === 0 && g.session.usage !== undefined) continue;
+			grouped.set(key, { session: g.session, hash: g.hash, entries });
 		}
-		return { order, grouped };
+		// Keep `order` in sync with `grouped` so callers can zip the two without
+		// hitting a key that was just filtered out (handleLoadConversations maps over
+		// `order` and non-null-asserts the lookup).
+		return { order: order.filter((key) => grouped.has(key)), grouped };
 	}
 
 	private async handleLoadConversations(): Promise<void> {
@@ -4146,6 +4182,11 @@ export class SummaryWebviewPanel {
 
 		const writes: Array<{ hash: string; data: StoredTranscript }> = [];
 		const deletes: Array<string> = [];
+		// The detached sessions' own token attribution, keyed by the transcript id
+		// they came out of, so the summary's token/cost figures can be corrected by
+		// the same amount the files lost. Collected here (before the files are
+		// rewritten) because that is the last point the removed sessions are readable.
+		const removedUsage = new Map<string, Array<DetachedSessionUsage>>();
 		let removedAny = false;
 
 		for (const [commitHash, transcript] of transcriptMap) {
@@ -4157,6 +4198,13 @@ export class SummaryWebviewPanel {
 				continue;
 			}
 			removedAny = true;
+			const dropped = transcript.sessions.filter(
+				(s) => s.sessionId === sessionId && (s.source ?? "claude") === source,
+			);
+			removedUsage.set(
+				commitHash,
+				dropped.map((s) => ({ usage: s.usage, usageByModel: s.usageByModel })),
+			);
 			if (kept.length === 0) {
 				deletes.push(commitHash);
 			} else {
@@ -4176,39 +4224,124 @@ export class SummaryWebviewPanel {
 			return;
 		}
 
-		// Summary-first ordering (same rationale as persistTranscriptIdRemoval's
-		// other callers): if any transcript files become empty, drop their IDs from
-		// `summary.transcripts` BEFORE touching files, so a file-batch failure
-		// leaves at worst "no files touched yet" rather than a dangling reference.
-		// Both steps re-throw on failure (rather than swallowing the error) so
-		// the dispatcher's `catchAndShow` wrapper surfaces a visible error toast
-		// instead of leaving `summary.transcripts` and the on-disk transcript
-		// files silently inconsistent with each other. Unlike the old modal's
-		// Save/Delete buttons, this row has no "in progress" UI state to unstick,
-		// so there's no need for a dedicated webview-side failure message.
-		if (deletes.length > 0 && this.currentSummary) {
-			try {
-				this.currentSummary = await this.persistTranscriptIdRemoval(
-					this.currentSummary,
-					new Set(deletes),
+		// Compute the memory's corrected conversation token/cost figures — the detached
+		// session's own recorded share subtracted — but hold the result in a LOCAL and
+		// publish nothing yet.
+		//
+		// `this.currentSummary` must NOT be reassigned here. Every write below can
+		// throw, and an already-subtracted in-memory summary would survive the failure:
+		// the row stays in the webview (no `conversationDetached` is posted on the error
+		// path), so the user retries, the sessions are still in the transcript files, and
+		// the subtraction runs a SECOND time against a figure that already had it
+		// applied. `Math.max(0, …)` then floors the meter to nothing, which renders
+		// exactly like a legacy memory that never reported usage. Publish only what is
+		// durable.
+		let correctedSummary: CommitSummary | undefined;
+		if (this.currentSummary) {
+			const subtraction = subtractDetachedUsage(this.currentSummary, removedUsage);
+			if (subtraction.unattributed.length > 0) {
+				// Forward-only by design: memories written before per-session usage was
+				// persisted have nothing to subtract, so their totals stay as-is. A
+				// partially-attributable transcript lands here too (some removed sessions
+				// carried `usage`, some did not) — the total is corrected by what could be
+				// accounted for and the shortfall is reported. Logged rather than silently
+				// skipped: a stale or short bar with no trace reads as a bug.
+				log.info(
+					"Detach: token totals incomplete — no recorded per-session usage for transcript(s): %s",
+					subtraction.unattributed.join(", "),
 				);
-			} catch (err) {
-				log.warn(
-					"Detach aborted — could not persist summary.transcripts: %s",
-					err instanceof Error ? err.message : String(err),
-				);
-				throw new Error("Could not update summary. Transcript files were NOT modified.");
 			}
+			if (subtraction.changed) correctedSummary = subtraction.summary;
 		}
 
+		// FILES FIRST, then ONE summary write carrying both the transcript-id removal
+		// and the token correction.
+		//
+		// The reverse (ids first, as persistTranscriptIdRemoval's other callers do) is
+		// unrecoverable here, because the id strip is a DURABLE write
+		// (`storeSummary(force=true)`) while the batch below may still fail. The
+		// sessions then remain in the files, but neither the summary on disk nor
+		// `this.currentSummary` claims those ids any more — so the user's retry recomputes
+		// `subtractDetachedUsage` against a summary in which no node claims the detached
+		// id, which that module reports as unattributable and refuses to guess at (see its
+		// `claimed` check). The detach then "succeeds" on the second attempt with
+		// conversationTokens/cost permanently stale, and the orphaned files are no longer
+		// referenced by anything.
+		//
+		// Writing files first turns both failure modes into tolerated ones:
+		//   - batch fails         → nothing has been written at all, so a retry is a clean
+		//                           redo: the sessions are still readable and the summary
+		//                           still claims their ids.
+		//   - summary write fails → a dangling `summary.transcripts` id (file gone, id
+		//                           still listed) plus a stale meter. The id self-heals —
+		//                           `refreshTranscriptHashes` intersects tree ids with the
+		//                           files that actually exist on disk — and a stale meter is
+		//                           the already-logged "could not attribute" outcome, not a
+		//                           corrupted figure.
+		// The batch re-throws so the dispatcher's `catchAndShow` wrapper surfaces a visible
+		// error toast rather than leaving the files and `summary.transcripts` silently
+		// inconsistent. Unlike the old modal's Save/Delete buttons, this row has no "in
+		// progress" UI state to unstick, so there's no need for a dedicated webview-side
+		// failure message.
 		try {
 			await this.bridge.saveTranscriptsBatch(writes, deletes);
 		} catch (err) {
 			log.warn(
-				"Summary updated but transcript file batch failed during detach: %s",
+				"Detach aborted — transcript file batch failed, summary left untouched: %s",
 				err instanceof Error ? err.message : String(err),
 			);
 			throw new Error("Some transcript files failed to write. See logs.");
+		}
+
+		// The files have lost the sessions, so the corrected totals are now the truth —
+		// persist them together with the id removal. `correctedSummary` was derived from
+		// the PRE-removal summary (subtraction needs the nodes to still claim the detached
+		// transcript ids), so it carries the unfiltered id list; routing it back through
+		// `persistTranscriptIdRemoval` re-applies the same filter and writes in one step.
+		// When nothing was attributable there is no correction to fold in, but any emptied
+		// transcript's id must still be dropped — hence the `this.currentSummary` fallback.
+		let usageChanged = false;
+		const summaryToPersist = correctedSummary ?? this.currentSummary;
+		if (summaryToPersist && (correctedSummary || deletes.length > 0)) {
+			try {
+				const persisted =
+					deletes.length > 0
+						? await this.persistTranscriptIdRemoval(summaryToPersist, new Set(deletes))
+						: summaryToPersist;
+				// A same-reference return means the id filter was a no-op and
+				// `persistTranscriptIdRemoval` wrote NOTHING — which happens when the root's
+				// `transcripts` list is empty because a CHILD node claims the detached id (the
+				// helper only inspects the root). The correction then still owes its own write;
+				// without this the panel would publish a correction that never reached disk.
+				// Only the correction needs that rescue write: a no-op id filter with no
+				// correction to carry has nothing to persist.
+				if (correctedSummary && persisted === correctedSummary) {
+					await this.bridge.storeSummary(correctedSummary, true);
+				}
+				this.currentSummary = persisted;
+				usageChanged = correctedSummary !== undefined;
+			} catch (err) {
+				log.warn(
+					"Detach succeeded but the summary could not be updated — transcript ids may dangle and the meter stays stale: %s",
+					err instanceof Error ? err.message : String(err),
+				);
+				// Surface it. The write is not retried and the outcome is NOT recoverable:
+				// the sessions are already gone from the transcript files, so a second attempt
+				// finds nothing to remove (`removedAny` false → plain ack) and the subtrahend
+				// this run held in memory is unrecoverable — `subtractDetachedUsage` is fed
+				// from the removed sessions' own stored `usage`, which is only readable while
+				// they are still in the files. Regenerate does not help either: it carries
+				// `conversationTokens` over verbatim (see Regenerator) rather than recomputing
+				// from transcripts. So the figures stay permanently high by the detached
+				// conversation's share, and a log line the user never opens is not an honest
+				// way to report that. The row is still acked below — the files really did
+				// change, and leaving the row on screen would only invite that no-op retry.
+				if (correctedSummary) {
+					vscode.window.showWarningMessage(
+						"Conversation detached, but this memory's token and cost figures could not be updated — they still include the detached conversation. See the Jolli Memory log for details.",
+					);
+				}
+			}
 		}
 
 		if (this.currentSummary) {
@@ -4220,6 +4353,11 @@ export class SummaryWebviewPanel {
 			hash,
 			sessionId,
 			source,
+			// Rebuilt only when the totals actually changed, so the webview swaps the
+			// meter in place instead of rebuilding the whole panel (which would collapse
+			// scroll position and expanded sections for a single-row change). Omitted
+			// when nothing was attributable — the meter then keeps its current value.
+			...(usageChanged && this.currentSummary && { tokenMeterHtml: buildTokenMeter(this.currentSummary) }),
 		});
 	}
 

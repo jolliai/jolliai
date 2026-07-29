@@ -563,6 +563,19 @@ describe("SummaryScriptBuilder", () => {
 			expect(script).toContain(".row[data-session=");
 		});
 
+		it("swaps the token meter in place on the ack instead of rebuilding the panel", () => {
+			// The detached conversation's tokens no longer belong to this memory, so the
+			// meter must not keep showing the pre-detach total until the panel reopens.
+			expect(script).toContain("msg.tokenMeterHtml");
+			expect(script).toContain("document.querySelector('.tmeter')");
+			// Widths and the '?' listener are bound per element, so the replaced node
+			// needs re-initialisation or it renders as an empty bar with a dead button.
+			// Scoped to the new meter, NOT document-wide: a second pass over the whole
+			// page would bind a duplicate click listener to every other pinnable popover,
+			// and two listeners toggle the pin twice per click (net no-op).
+			expect(script).toContain("initTokenMeter(document.querySelector('.tmeter'))");
+		});
+
 		it("matches the acked row by the source:sessionId composite key, not sessionId alone", () => {
 			expect(script).toContain("function conversationRowSelector(sessionId, source)");
 			expect(script).toContain('[data-source="');

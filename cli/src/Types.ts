@@ -95,6 +95,28 @@ export interface ConversationTokenBreakdown {
 	readonly cached: number;
 }
 
+/**
+ * One transcript line's usage, plus an optional identity for de-duplicating the
+ * SAME model response reported on more than one line.
+ *
+ * Claude Code writes one JSONL line per content block of an assistant response
+ * (a `thinking` block, a `text` block, and one line per parallel `tool_use`),
+ * and EVERY one of those lines carries a verbatim copy of that response's single
+ * `message.usage` object — not a per-block share of it. Summing per line
+ * therefore counts one API call's tokens once per block: measured against real
+ * transcripts the inflation runs 2.2×–10×, the high end being agentic turns that
+ * fire six or seven tool calls from one response.
+ *
+ * `dedupKey` is that response's identity (`message.id` for Claude). The reader
+ * keeps a per-read set of keys it has already counted and skips repeats, so a
+ * response contributes exactly once no matter how many lines carry it. Omitted
+ * when a source cannot identify the response, in which case every line counts
+ * (the pre-existing behaviour, correct for sources that report usage once).
+ */
+export interface ParsedTurnUsage extends ConversationTokenBreakdown {
+	readonly dedupKey?: string;
+}
+
 /** Billing provider for a conversation model — selects the pricing formula. */
 export type TokenProvider = "anthropic" | "openai" | "unknown";
 
@@ -143,6 +165,23 @@ export interface StoredSession {
 	/** Original JSONL file path, preserved for re-summarize (future) */
 	readonly transcriptPath?: string;
 	readonly entries: ReadonlyArray<TranscriptEntry>;
+	/**
+	 * This session's own share of the commit's conversation tokens — the
+	 * per-session attribution the queue worker already computes in memory while
+	 * reading slices, now persisted so it survives the write.
+	 *
+	 * Without it, detaching one conversation from a committed memory cannot
+	 * update that memory's token total: the summary stores only the post-merge
+	 * aggregate, so there is no way to know how much of it belonged to the
+	 * session being removed. Forward-only — absent on memories written before
+	 * this field existed, and on sources whose transcript carries no usage; a
+	 * detach that finds no `usage` leaves the token total untouched rather than
+	 * guessing at a subtrahend.
+	 */
+	readonly usage?: ConversationTokenBreakdown;
+	/** Per-model split of {@link usage}, so a detach can also correct the cost
+	 *  estimate (which is priced per model, not from the aggregate). */
+	readonly usageByModel?: ReadonlyArray<ModelTokenUsage>;
 }
 
 /** Structured transcript data for a commit, stored as `transcripts/{commitHash}.json` in the orphan branch */

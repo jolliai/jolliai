@@ -76,24 +76,33 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
   // unsafe-inline for styles. buildTokenMeter emits each segment with a
   // data-pct attribute instead; a JS property write (el.style.width) is
   // allowed even though an inline style attribute is not, so we set it here.
-  document.querySelectorAll('.tmeter-bar [data-pct]').forEach(function(el) {
-    el.style.width = el.dataset.pct + '%';
-  });
-  // The '?' help button toggles a pinned popover (click-to-pin rather than
-  // hover-only, so it stays reachable on touch/keyboard). Clicking elsewhere
-  // on the page closes any open popover.
-  document.querySelectorAll('.tok-help').forEach(function(btn) {
-    btn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      var wrap = btn.closest('.tok-help-wrap');
-      if (!wrap) { return; }
-      var wasPinned = wrap.classList.contains('pinned');
-      document.querySelectorAll('.tok-help-wrap.pinned').forEach(function(w) {
-        w.classList.remove('pinned');
-      });
-      if (!wasPinned) { wrap.classList.add('pinned'); }
+  // Wrapped in a function (rather than run once inline) because the meter is
+  // replaced in place when a conversation is detached — the 'conversationDetached'
+  // handler re-runs this against the new node. Both the widths and the '?'
+  // listener are bound per element, so a replaced meter renders as an empty bar
+  // with a dead help button unless this re-runs.
+  function initTokenMeter(root) {
+    var scope = root || document;
+    scope.querySelectorAll('.tmeter-bar [data-pct]').forEach(function(el) {
+      el.style.width = el.dataset.pct + '%';
     });
-  });
+    // The '?' help button toggles a pinned popover (click-to-pin rather than
+    // hover-only, so it stays reachable on touch/keyboard). Clicking elsewhere
+    // on the page closes any open popover.
+    scope.querySelectorAll('.tok-help').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        var wrap = btn.closest('.tok-help-wrap');
+        if (!wrap) { return; }
+        var wasPinned = wrap.classList.contains('pinned');
+        document.querySelectorAll('.tok-help-wrap.pinned').forEach(function(w) {
+          w.classList.remove('pinned');
+        });
+        if (!wasPinned) { wrap.classList.add('pinned'); }
+      });
+    });
+  }
+  initTokenMeter(document);
   document.addEventListener('click', function() {
     document.querySelectorAll('.tok-help-wrap.pinned').forEach(function(w) {
       w.classList.remove('pinned');
@@ -2412,6 +2421,29 @@ ${buildSourceLabelScript()}
         if (cntEl) cntEl.textContent = String(remaining);
         if (remaining === 0) {
           conversationsBody.innerHTML = '<p class="conv-empty">No conversations linked to this memory.</p>';
+        }
+      }
+      // The detached conversation's tokens no longer belong to this memory, so
+      // the meter is rebuilt host-side and swapped in with the row removal
+      // rather than left showing the pre-detach total until the panel reopens.
+      // Absent when the host could not attribute the removed usage (memories
+      // written before per-session usage was recorded) — the meter then stays
+      // as-is, which is the honest reading of "we don't know".
+      if (typeof msg.tokenMeterHtml === 'string' && msg.tokenMeterHtml !== '') {
+        var meterEl = document.querySelector('.tmeter');
+        if (meterEl) {
+          // outerHTML is safe here specifically: tokenMeterHtml is composed
+          // host-side by buildTokenMeter from numeric aggregates and literal
+          // strings only — no summary text, path, or other repo content reaches
+          // it. Do not extend this to markup carrying commit/user strings.
+          meterEl.outerHTML = msg.tokenMeterHtml;
+          // Re-init scoped to the REPLACED meter, not the whole document: the help
+          // button gets its click listener bound per element, so re-scanning
+          // document-wide would hand a second listener to every other pinnable
+          // popover on the page and each click would toggle it twice (net no-op).
+          // Only .tmeter carries .tok-help today, but the scope keeps that from
+          // becoming a trap the next time one is added elsewhere.
+          initTokenMeter(document.querySelector('.tmeter'));
         }
       }
     }

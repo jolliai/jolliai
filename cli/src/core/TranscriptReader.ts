@@ -21,7 +21,14 @@
 
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../Logger.js";
-import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult, TranscriptSource } from "../Types.js";
+import type {
+	ConversationTokenBreakdown,
+	ModelTokenUsage,
+	TranscriptCursor,
+	TranscriptEntry,
+	TranscriptReadResult,
+	TranscriptSource,
+} from "../Types.js";
 import type { TranscriptParser } from "./TranscriptParser.js";
 import { ClaudeTranscriptParser } from "./TranscriptParser.js";
 
@@ -109,6 +116,18 @@ export async function readTranscript(
 	let usageInput = 0;
 	let usageOutput = 0;
 	let usageCached = 0;
+	// Response ids already counted in this read. One API response is written
+	// across several lines (one per content block) and every line repeats that
+	// response's whole `usage` object, so counting per line multiplied real usage
+	// by the block count — 2.2×–10× on measured transcripts. See ParsedTurnUsage.
+	//
+	// Scoped to this read, which closes the inflation within a slice but not the
+	// rarer cross-slice case: if `beforeTimestamp` cuts between two blocks of one
+	// response, this commit counts it and the next commit counts it again (each
+	// read starts with an empty set). Bounded to one duplicated response per
+	// commit boundary — closing it fully means persisting the last counted id in
+	// the cursor, which is not worth the schema change at that magnitude.
+	const countedUsageKeys = new Set<string>();
 
 	for (let i = 0; i < newLines.length; i++) {
 		const lineNum = startLine + i;
@@ -130,9 +149,12 @@ export async function readTranscript(
 		if (entry) {
 			rawEntries.push(entry);
 		}
-		// Accumulate per-line token usage (per segment) from the parser
+		// Accumulate per-response token usage (per segment) from the parser. A line
+		// whose response was already counted contributes nothing; a line with no
+		// `dedupKey` always counts (sources that report usage once per line).
 		const usage = activeParser.parseUsageTokens?.(newLines[i], lineNum);
-		if (usage) {
+		if (usage && !(usage.dedupKey && countedUsageKeys.has(usage.dedupKey))) {
+			if (usage.dedupKey) countedUsageKeys.add(usage.dedupKey);
 			usageInput += usage.input;
 			usageOutput += usage.output;
 			usageCached += usage.cached;
@@ -328,6 +350,13 @@ export interface SessionTranscript {
 	 */
 	readonly source?: TranscriptSource;
 	readonly entries: ReadonlyArray<TranscriptEntry>;
+	/** This session's own share of the commit's conversation tokens, attached by
+	 *  the queue worker after overlay reconciliation so `buildStoredTranscript`
+	 *  can persist it (see {@link StoredSession.usage} for why it must survive
+	 *  the write). Absent for sources whose transcript carries no usage. */
+	readonly usage?: ConversationTokenBreakdown;
+	/** Per-model split of {@link usage}. */
+	readonly usageByModel?: ReadonlyArray<ModelTokenUsage>;
 }
 
 /**

@@ -2407,6 +2407,257 @@ describe("QueueWorker", () => {
 			expect(stored.sessions[0].source).toBeUndefined();
 			expect(stored.sessions[0].transcriptPath).toBe("/claude/legacy.jsonl");
 		});
+
+		it("persists each session's own token attribution so a later detach can subtract it", async () => {
+			// The worker computes this split in memory while reading slices; before it was
+			// persisted, only the merged total reached disk and detaching one conversation
+			// from a committed memory had no subtrahend to correct the token bar with.
+			const stored = __test__.buildStoredTranscript([
+				{
+					sessionId: "s1",
+					transcriptPath: "/claude/s1.jsonl",
+					source: "claude",
+					entries: [],
+					usage: { input: 100, output: 200, cached: 700 },
+					usageByModel: [
+						{ model: "claude-opus-5", provider: "anthropic", input: 100, output: 200, cached: 700 },
+					],
+				},
+			]);
+
+			expect(stored.sessions[0].usage).toEqual({ input: 100, output: 200, cached: 700 });
+			expect(stored.sessions[0].usageByModel).toEqual([
+				{ model: "claude-opus-5", provider: "anthropic", input: 100, output: 200, cached: 700 },
+			]);
+		});
+
+		it("omits an all-zero usage record so absent stays distinguishable from zero", async () => {
+			// A stored zero would read as "this session used nothing", which detach would
+			// treat as a valid no-op subtraction; absent means "cannot attribute" and
+			// leaves the memory's totals alone. Sources with no usage must land on absent.
+			const stored = __test__.buildStoredTranscript([
+				{
+					sessionId: "s1",
+					transcriptPath: "/gemini/s1.json",
+					source: "gemini",
+					entries: [],
+					usage: { input: 0, output: 0, cached: 0 },
+					usageByModel: [],
+				},
+			]);
+
+			expect(stored.sessions[0]).not.toHaveProperty("usage");
+			expect(stored.sessions[0]).not.toHaveProperty("usageByModel");
+		});
+	});
+
+	describe("attachPerSessionUsage", () => {
+		const bucket = (input: number, output: number, cached: number) => ({
+			tokens: input + output + cached,
+			breakdown: { input, output, cached },
+			byModel: new Map([
+				["claude-opus-5", { model: "claude-opus-5", provider: "anthropic" as const, input, output, cached }],
+			]),
+		});
+
+		it("attaches the bucket to exactly one slice when a conversation yields several", () => {
+			// readAllTranscripts merges repeated slices of one conversation into a SINGLE
+			// bucket but pushes one SessionTranscript per slice. Copying the bucket onto
+			// every slice would persist the usage twice, and detach sums ALL stored
+			// sessions matching the key — so it would subtract 2x what the summary counted
+			// and Math.max(0, …) would floor the meter to "not reported".
+			const slices = [
+				{ sessionId: "s1", transcriptPath: "/a/s1.jsonl", source: "cline" as const, entries: [] },
+				{ sessionId: "s1", transcriptPath: "/b/s1.jsonl", source: "cline" as const, entries: [] },
+			];
+			const out = __test__.attachPerSessionUsage(
+				slices,
+				new Map([["cline:s1", bucket(100, 200, 700)]]),
+				new Map(),
+				new Map(),
+			);
+
+			const carriers = out.filter((s) => s.usage !== undefined);
+			expect(carriers).toHaveLength(1);
+			expect(carriers[0].usage).toEqual({ input: 100, output: 200, cached: 700 });
+			// The sum across all persisted slices must equal the bucket exactly once —
+			// this is the number detach subtracts.
+			const persistedTotal = out.reduce(
+				(acc, s) => acc + (s.usage ? s.usage.input + s.usage.output + s.usage.cached : 0),
+				0,
+			);
+			expect(persistedTotal).toBe(1000);
+		});
+
+		it("keeps distinct conversations independent", () => {
+			const out = __test__.attachPerSessionUsage(
+				[
+					{ sessionId: "s1", transcriptPath: "/a.jsonl", source: "claude" as const, entries: [] },
+					{ sessionId: "s2", transcriptPath: "/b.jsonl", source: "claude" as const, entries: [] },
+				],
+				new Map([
+					["claude:s1", bucket(1, 2, 3)],
+					["claude:s2", bucket(10, 20, 30)],
+				]),
+				new Map(),
+				new Map(),
+			);
+
+			expect(out[0].usage).toEqual({ input: 1, output: 2, cached: 3 });
+			expect(out[1].usage).toEqual({ input: 10, output: 20, cached: 30 });
+		});
+
+		it("attaches nothing for a session an overlay pruned", () => {
+			// Pruned sessions are excluded from the summary totals, so persisting their
+			// raw pre-overlay usage would over-subtract on a later detach.
+			const out = __test__.attachPerSessionUsage(
+				[{ sessionId: "s1", transcriptPath: "/a.jsonl", source: "claude" as const, entries: [] }],
+				new Map([["claude:s1", bucket(100, 200, 700)]]),
+				new Map([["claude:s1", 5]]),
+				new Map([["claude:s1", 2]]),
+			);
+
+			expect(out[0]).not.toHaveProperty("usage");
+		});
+
+		it("leaves a slice untouched when no bucket recorded its conversation", () => {
+			const out = __test__.attachPerSessionUsage(
+				[{ sessionId: "s1", transcriptPath: "/a.jsonl", source: "claude" as const, entries: [] }],
+				new Map(),
+				new Map(),
+				new Map(),
+			);
+
+			expect(out[0]).not.toHaveProperty("usage");
+			expect(out[0]).not.toHaveProperty("usageByModel");
+		});
+
+		it("omits usageByModel when the bucket recorded no model", () => {
+			const out = __test__.attachPerSessionUsage(
+				[{ sessionId: "s1", transcriptPath: "/a.jsonl", source: "claude" as const, entries: [] }],
+				new Map([
+					["claude:s1", { tokens: 3, breakdown: { input: 1, output: 2, cached: 0 }, byModel: new Map() }],
+				]),
+				new Map(),
+				new Map(),
+			);
+
+			expect(out[0].usage).toEqual({ input: 1, output: 2, cached: 0 });
+			expect(out[0]).not.toHaveProperty("usageByModel");
+		});
+	});
+
+	// ─── usage-only carrier: the persistence path for tokens with no entries ─────
+	// `attachPerSessionUsage` can only attach a bucket to a SessionTranscript that
+	// EXISTS. A conversation whose every slice yielded zero merged entries never got
+	// one, so its tokens reached the summary while no `StoredSession.usage` reached
+	// disk — leaving detach with nothing to subtract. These pin the carrier policy.
+	describe("appendUsageOnlyCarriers", () => {
+		const bucket = (input: number, output: number, cached: number) => ({
+			tokens: input + output + cached,
+			breakdown: { input, output, cached },
+			byModel: new Map<string, never>(),
+		});
+		const identity = (sessionId: string, source: "claude" | "cline" = "claude") => ({
+			sessionId,
+			transcriptPath: `/tmp/${sessionId}.jsonl`,
+			source,
+		});
+
+		it("appends one zero-entry carrier for a conversation with tokens but no entries", () => {
+			const sessionTranscripts: Parameters<typeof __test__.appendUsageOnlyCarriers>[0] = [];
+
+			__test__.appendUsageOnlyCarriers(
+				sessionTranscripts,
+				new Map([["claude:s1", bucket(600, 300, 0)]]),
+				new Map([["claude:s1", identity("s1")]]),
+			);
+
+			expect(sessionTranscripts).toHaveLength(1);
+			expect(sessionTranscripts[0].sessionId).toBe("s1");
+			expect(sessionTranscripts[0].source).toBe("claude");
+			expect(sessionTranscripts[0].transcriptPath).toBe("/tmp/s1.jsonl");
+			expect(sessionTranscripts[0].entries).toHaveLength(0);
+			// The carrier is bare — attachPerSessionUsage (which runs later, in
+			// loadSessionTranscripts) is the single place that stamps `usage`.
+			expect(sessionTranscripts[0]).not.toHaveProperty("usage");
+		});
+
+		it("appends nothing when the conversation already has an entry-bearing slice", () => {
+			// Its bucket rides that real slice; a second, entry-less object for the same
+			// key would be persisted entry-less AND usage-less (attachPerSessionUsage is
+			// first-wins per key) — pure noise in the stored transcript.
+			const sessionTranscripts = [
+				{
+					sessionId: "s1",
+					transcriptPath: "/tmp/s1.jsonl",
+					source: "claude" as const,
+					entries: [{ role: "human" as const, content: "hi" }],
+				},
+			];
+
+			__test__.appendUsageOnlyCarriers(
+				sessionTranscripts,
+				new Map([["claude:s1", bucket(600, 300, 0)]]),
+				new Map([["claude:s1", identity("s1")]]),
+			);
+
+			expect(sessionTranscripts).toHaveLength(1);
+			expect(sessionTranscripts[0].entries).toHaveLength(1);
+		});
+
+		it("appends nothing for a conversation that recorded zero tokens", () => {
+			// No entries AND no tokens: buildStoredTranscript would emit a session with
+			// neither content nor a `usage` record, which detach reads as "cannot
+			// attribute" anyway. Persisting it only invents an empty conversation.
+			const sessionTranscripts: Parameters<typeof __test__.appendUsageOnlyCarriers>[0] = [];
+
+			__test__.appendUsageOnlyCarriers(
+				sessionTranscripts,
+				new Map([["claude:s1", bucket(0, 0, 0)]]),
+				new Map([["claude:s1", identity("s1")]]),
+			);
+
+			expect(sessionTranscripts).toHaveLength(0);
+		});
+
+		it("appends exactly ONE carrier when a conversation had several usage-only slices", () => {
+			// readAllTranscripts merges repeated slices into a SINGLE bucket, so N
+			// carriers would mean N-1 entry-less, usage-less sessions on disk.
+			const sessionTranscripts: Parameters<typeof __test__.appendUsageOnlyCarriers>[0] = [];
+
+			__test__.appendUsageOnlyCarriers(
+				sessionTranscripts,
+				new Map([["claude:s1", bucket(600, 300, 0)]]),
+				// One identity per conversationKey by construction (first slice wins), so
+				// the merged bucket can only ever produce one carrier.
+				new Map([["claude:s1", identity("s1")]]),
+			);
+
+			expect(sessionTranscripts.filter((s) => s.sessionId === "s1")).toHaveLength(1);
+		});
+
+		it("carries independent conversations separately", () => {
+			const sessionTranscripts: Parameters<typeof __test__.appendUsageOnlyCarriers>[0] = [];
+
+			__test__.appendUsageOnlyCarriers(
+				sessionTranscripts,
+				new Map([
+					["claude:s1", bucket(10, 5, 0)],
+					["cline:s2", bucket(20, 5, 0)],
+				]),
+				new Map([
+					["claude:s1", identity("s1")],
+					["cline:s2", identity("s2", "cline")],
+				]),
+			);
+
+			expect(sessionTranscripts).toHaveLength(2);
+			expect(sessionTranscripts.map((s) => `${s.source}:${s.sessionId}`).sort()).toEqual([
+				"claude:s1",
+				"cline:s2",
+			]);
+		});
 	});
 
 	describe("OpenCode integration — empty sessions", () => {
@@ -3998,13 +4249,90 @@ describe("QueueWorker", () => {
 					},
 					totalLinesRead: 3,
 					usageTokens: 777,
+					// Mirrors readTranscript's single return shape, where usageTokens IS
+					// input+output+cached and usageBreakdown is always present
+					// (TranscriptReader.ts). Omitting it here would encode a state the
+					// reader cannot produce, and appendUsageOnlyCarriers gates the carrier
+					// on the breakdown sum — the same predicate buildStoredTranscript uses
+					// to decide whether `usage` reaches disk.
+					usageBreakdown: { input: 500, output: 277, cached: 0 },
 				});
 
 				const result = await __test__.loadSessionTranscripts(cwd, {});
 
 				expect(result.totalEntries).toBe(0);
-				expect(result.sessionTranscripts).toHaveLength(0);
 				expect(result.conversationTokens).toBe(777);
+				// A usage-only conversation now gets a zero-entry CARRIER so its bucket
+				// can reach disk (previously this asserted length 0 — the tokens were
+				// counted but nothing persisted them; see the "usage-only carrier"
+				// tests). Still zero *entries*, so totalEntries stays 0.
+				expect(result.sessionTranscripts).toHaveLength(1);
+				expect(result.sessionTranscripts[0].entries).toHaveLength(0);
+			} finally {
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+
+		// End-to-end contract for the fix: token accumulation is deliberately
+		// decoupled from the `entries.length > 0` gate, but the only carrier a
+		// per-session split has to reach disk is a SessionTranscript — and that object
+		// used to be pushed ONLY inside the same gate. A usage-only conversation
+		// therefore landed in `conversationTokens` (persisted on the summary) while
+		// `buildStoredTranscript` had nothing to serialize: no StoredSession, no
+		// `usage` record, and no transcript id allocated by the leaf/amend writers.
+		// Consequences, both reachable:
+		//   1. the memory reported nonzero tokens/cost with an EMPTY Conversations list;
+		//   2. detach could never subtract those tokens (no `StoredSession.usage` to
+		//      sum), so detaching every *visible* conversation left a residue the token
+		//      bar kept showing with zero conversations to explain it.
+		it("persists a usage-only conversation's per-session record so detach has a subtrahend", async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "jolli-c5b-"));
+			try {
+				vi.mocked(loadAllSessions).mockResolvedValue([
+					{
+						sessionId: "claude-usage-only",
+						transcriptPath: "/tmp/claude-usage-only.jsonl",
+						updatedAt: "2026-04-01T12:00:00.000Z",
+						source: "claude" as const,
+					},
+				]);
+				vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+				vi.mocked(saveCursor).mockResolvedValue(undefined);
+				vi.mocked(readTranscript).mockResolvedValue({
+					entries: [],
+					newCursor: {
+						transcriptPath: "/tmp/claude-usage-only.jsonl",
+						lineNumber: 4,
+						updatedAt: "2026-04-01T12:00:00.000Z",
+					},
+					totalLinesRead: 4,
+					usageTokens: 900,
+					usageBreakdown: { input: 600, output: 300, cached: 0 },
+					usageByModel: [
+						{ model: "claude-opus-5", provider: "anthropic" as const, input: 600, output: 300, cached: 0 },
+					],
+				});
+
+				const result = await __test__.loadSessionTranscripts(cwd, {});
+
+				// The summary carries these tokens…
+				expect(result.conversationTokens).toBe(900);
+				expect(result.conversationTokenBreakdown).toEqual({ input: 600, output: 300, cached: 0 });
+				expect(result.conversationModels).toHaveLength(1);
+
+				// …and the stored transcript now carries the matching per-session record,
+				// so `subtractDetachedUsage` has an exact subtrahend and the leaf/amend
+				// writers allocate a transcript id for it.
+				const stored = __test__.buildStoredTranscript(result.sessionTranscripts);
+				expect(stored.sessions).toHaveLength(1);
+				expect(stored.sessions[0].sessionId).toBe("claude-usage-only");
+				expect(stored.sessions[0].entries).toHaveLength(0);
+				expect(stored.sessions[0].usage).toEqual({ input: 600, output: 300, cached: 0 });
+				expect(stored.sessions[0].usageByModel).toHaveLength(1);
+				// The persisted record sums to exactly what the summary counted — an
+				// over- or under-sized subtrahend would floor or strand the token bar.
+				const persisted = stored.sessions[0].usage as { input: number; output: number; cached: number };
+				expect(persisted.input + persisted.output + persisted.cached).toBe(result.conversationTokens);
 			} finally {
 				rmSync(cwd, { recursive: true, force: true });
 			}

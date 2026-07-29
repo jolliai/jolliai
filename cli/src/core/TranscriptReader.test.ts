@@ -973,6 +973,82 @@ describe("TranscriptReader", () => {
 			expect(result.usageBreakdown).toEqual({ input: 100, output: 5, cached: 20 });
 		});
 
+		// The bug this pins: the token bar read 13M for one commit whose real usage was
+		// ~5M. Claude Code writes one JSONL line per content block of an assistant
+		// response — thinking, text, and one per parallel tool_use — and every line
+		// repeats that response's whole `usage` object verbatim, so accumulating per
+		// line billed one API call once per block. Measured inflation across six real
+		// transcripts: 2.17×–10.13×, the high end being turns that fire six or seven
+		// tool calls from a single response. Shape and values below are copied from a
+		// real transcript (9cc7113b-….jsonl, captured 2026-07-29).
+		it("counts a multi-block response once, not once per block line", async () => {
+			const filePath = join(tempDir, "claude-usage-multiblock.jsonl");
+			const usage = {
+				input_tokens: 15654,
+				cache_creation_input_tokens: 23100,
+				cache_read_input_tokens: 18831,
+				output_tokens: 1402,
+			};
+			const block = (content: unknown): string =>
+				JSON.stringify({
+					type: "assistant",
+					message: {
+						id: "msg_01EWeKJMpUeBRTNGECP3PiaQ",
+						role: "assistant",
+						model: "claude-opus-5",
+						stop_reason: "tool_use",
+						content: [content],
+						usage,
+					},
+					timestamp: "2026-07-29T02:11:00Z",
+				});
+			await writeFile(
+				filePath,
+				[
+					block({ type: "thinking", thinking: "…" }),
+					block({ type: "text", text: "Checking three files." }),
+					block({ type: "tool_use", id: "toolu_1", name: "Read", input: {} }),
+					block({ type: "tool_use", id: "toolu_2", name: "Read", input: {} }),
+					block({ type: "tool_use", id: "toolu_3", name: "Read", input: {} }),
+				].join("\n"),
+				"utf-8",
+			);
+
+			const result = await readTranscript(filePath);
+			// One response → counted once: 15654 + 1402 + 23100 = 40156.
+			// Pre-fix this returned 5 × 40156 = 200780.
+			expect(result.usageTokens).toBe(40156);
+			expect(result.usageBreakdown).toEqual({ input: 15654, output: 1402, cached: 23100 });
+			// The per-model split must dedupe on the SAME identity, or the cost estimate
+			// would be priced off more tokens than the bar displays.
+			expect(result.usageByModel).toEqual([
+				{ model: "claude-opus-5", provider: "anthropic", input: 15654, output: 1402, cached: 23100 },
+			]);
+		});
+
+		it("keeps counting separate responses that repeat identical usage values", async () => {
+			const filePath = join(tempDir, "claude-usage-distinct-ids.jsonl");
+			// Two genuinely distinct API calls that happen to report the same numbers —
+			// deduping on the values rather than on message.id would wrongly drop one.
+			const turn = (id: string): string =>
+				JSON.stringify({
+					type: "assistant",
+					message: {
+						id,
+						role: "assistant",
+						model: "claude-opus-5",
+						content: [{ type: "text", text: "x" }],
+						usage: { input_tokens: 10, cache_creation_input_tokens: 2, output_tokens: 1 },
+					},
+					timestamp: "2026-07-29T02:11:00Z",
+				});
+			await writeFile(filePath, [turn("msg_a"), turn("msg_b")].join("\n"), "utf-8");
+
+			const result = await readTranscript(filePath);
+			expect(result.usageTokens).toBe(26);
+			expect(result.usageBreakdown).toEqual({ input: 20, output: 2, cached: 4 });
+		});
+
 		it("produces per-model usage buckets from the consumed slice", async () => {
 			const filePath = join(tempDir, "claude-usage-by-model.jsonl");
 			const lines = [
