@@ -16,22 +16,27 @@ A multi-line report written to stdout. Lines are aligned with two-space leading 
 
 1. A header line with the product name and CLI version (e.g. `Jolli Memory Status (v1.2.3)`).
 2. A horizontal-rule separator.
-3. **Hooks** — the installed hook families joined with ` + `, e.g. `5 Git + 2 Claude + 1 Gemini CLI`, or `none installed` when no family is present. The Git count reads `5` when the pre-push section is installed and `4` when it is not — but whether the Git family is reported as installed at all is decided by a check over only four of the five sections (see "The Git family's count and its health check disagree" below).
+3. **Hooks** — the installed hook families joined with ` + `, e.g. `5 Git + 2 Claude + 1 Gemini`, or `none installed` when no family is present. The Git count reads `5` when the pre-push section is installed and `4` when it is not — but whether the Git family is reported as installed at all is decided by a check over only four of the five sections (see "The Git family's count and its health check disagree" below).
 4. **Hook runtime** — the source and version that wrote the active hooks (e.g. `cli@1.2.3`), printed only if a hook source has been recorded.
-5. **Jolli Account** — `Signed in` or `Not signed in`.
-6. **Jolli API Key** — `Configured` or `Not configured`.
-7. **Jolli Space** — the repo's Space-binding state, printed unconditionally (even "not connected" / "unknown"). See "The Jolli Space: row" below.
-8. **Anthropic Key** — `Configured` or `Not configured` (the env variable counts).
-9. **Sessions** — total active session count across all AI agents.
-10. **Per-agent breakdown** — one row per AI agent that was *detected* on this machine (see state model below). Undetected agents are omitted entirely to keep the output terse. The list is, in order: Claude, Codex, Gemini, OpenCode, Cursor, Devin, Copilot, Cline, Antigravity. Undetected agents are omitted.
-11. **Merged-row sub-lines** — three rows are each a merged dual-variant row that, when detected, renders an additional indented sub-line beneath itself showing whether its two variants are each present (`✓`/`✗`): Cursor (`↳ IDE: …, CLI: …`), Copilot (`↳ CLI: …, Chat: …`), and Cline (`↳ CLI: …, VS Code: …`). If a variant's scan failed, a further indented line reports that variant's failure kind and message without masking the other variant's working count.
-12. **Stored memories** — count of summaries on the orphan branch.
-13. **Jolli Site** — the host portion of the Jolli tenant URL parsed out of the stored Jolli API key (with `http://` / `https://` scheme stripped). Printed only when a Jolli API key is configured.
-14. **Orphan branch** — the orphan-branch name used for summary storage.
+5. **Data migration** — a one-line descriptor of the schema-migration state, printed unconditionally. It is deliberately binary: `Up to date (v5)` when the migration has completed, and `Not migrated — run jolli migrate` for **every** other state (in progress, failed, never started). Finer sub-states are not surfaced, because nothing short of "completed" is actionable in a different way. The same wording is used by the desktop editor's hooks tooltip.
+6. **Jolli Account** — `Signed in` or `Not signed in`.
+7. **Jolli API Key** — `Configured` or `Not configured`.
+8. **Jolli Space** — the repo's Space-binding state, printed unconditionally (even "not connected" / "unknown"). See "The Jolli Space: row" below.
+9. **AI Provider** — the provider the *next* commit would actually generate with, printed unconditionally. See "The AI Provider: row" below.
+10. **Anthropic Key** — `Configured` or `Not configured` (the env variable counts). Printed **only** when the configured provider is explicitly the Anthropic one; omitted for every other provider and when no provider is set. See "The AI Provider: row" below for why the two rows are coupled.
+11. **Sessions** — total active session count across all AI agents.
+12. **Per-agent breakdown** — one row per AI agent that was *detected* on this machine (see state model below). Undetected agents are omitted entirely to keep the output terse. The list is, in order: Claude, Codex, Gemini, OpenCode, Cursor, Devin, Copilot, Cline, Antigravity. Undetected agents are omitted.
+13. **Merged-row sub-lines** — three rows are each a merged dual-variant row that, when detected, renders an additional indented sub-line beneath itself showing whether its two variants are each present (`✓`/`✗`): Cursor (`↳ IDE: …, CLI: …`), Copilot (`↳ CLI: …, Chat: …`), and Cline (`↳ CLI: …, VS Code: …`). If a variant's scan failed, a further indented line reports that variant's failure kind and message without masking the other variant's working count.
+14. **Stored memories** — count of summaries on the orphan branch.
+15. **Memory Bank** — where folder-layer memory writes will actually land, or the blocker stopping them, printed unconditionally. The row prints only the *text* of the shared Memory-Bank display record; the record's severity is discarded here, so this row carries no icon and no colour. The state model, the three arms, and every string verbatim are owned by spec 300 — this spec adds only the row's position and unconditionality.
+16. **Jolli Site** / **Last signed-in site** — the host portion of the **persisted Jolli site URL** (with `http://` / `https://` scheme stripped), printed only when that URL is stored at all. The label is switched by whether an on-disk credential (an on-disk OAuth token or a Jolli API key) backs it: `Jolli Site:` when one does, `Last signed-in site:` when none does. The URL is **not** derived from the stored Jolli API key.
+17. **Orphan branch** — the orphan-branch name used for summary storage.
 
 ### Machine-readable format (`--json`)
 
 A single JSON object on one line followed by a newline. The object is the status snapshot exactly as produced by the installer, with no additional formatting or transformation. This format is consumed by the VS Code extension.
+
+The snapshot carries the effective **Memory Bank state** as a **required**, structured field — the same record the human-readable `Memory Bank:` row renders to text. Consumers read the discriminated record (its arm tag plus the arm's own fields), never the rendered string. It is deliberately mandatory rather than optional, unlike the neighbouring migration-state field whose absence means "pending": "absent" must not be readable as one of the Memory-Bank states. The arms and their fields are owned by spec 300.
 
 When `--json` is supplied, **only** the JSON line is printed; none of the human-readable lines are emitted.
 
@@ -116,6 +121,24 @@ Rendered values:
 
 `<fix>` is `run jolli to rebind` when the server attached a non-empty bindable pool, else `ask for access`. `canPush: null` renders as healthy.
 
+### The AI Provider: row
+
+An unconditional row, printed immediately after the Space-binding row. Its value is resolved by the **same credential-precedence resolution the LLM dispatcher itself uses** to pick a provider for a call, so the row can never name a provider the next commit would not actually use.
+
+Exactly five values are possible:
+
+| Rendered value | Condition |
+| --- | --- |
+| `Anthropic` | The Anthropic key stored in the config is what would be used. |
+| `Anthropic (env)` | No stored Anthropic key, but the `ANTHROPIC_API_KEY` environment variable is set and is what would be used. |
+| `Jolli` | The stored Jolli API key routed through the Jolli proxy is what would be used. |
+| `Local agent - <tool>` | The provider is explicitly the local-agent one. `<tool>` is the display name of the configured agent tool, defaulting to Claude Code's display name when the tool setting is absent, and degrading to a generic label for a tool identifier this build does not recognize. |
+| `Not configured` | The resolution yielded nothing. |
+
+`Not configured` covers **two** distinct states, deliberately collapsed into one string: nothing is configured at all, **and** a provider is explicitly pinned but its required credential is absent (the Anthropic provider with neither a stored key nor the environment variable; the Jolli provider with no Jolli API key). The local-agent provider can never render `Not configured` — it is selected on the strength of the provider setting alone, with no credential and no executable probe at this surface.
+
+**The `Anthropic Key:` row is coupled to this one.** It prints only when the provider is explicitly the Anthropic one — the sole provider that consumes an Anthropic key. Before that gate existed the row printed unconditionally, so a healthy Jolli-proxy or local-agent user saw `Anthropic Key: Not configured` in an otherwise clean report and read their install as broken.
+
 ### `--cwd` resolution
 
 The project directory is auto-resolved to the enclosing git repository root when `--cwd` is omitted. The Jolli config and session counts are loaded from the *global* config directory regardless of `--cwd` — `--cwd` only scopes the per-project state (hooks, queue, orphan branch).
@@ -136,8 +159,10 @@ The project directory is auto-resolved to the enclosing git repository root when
 - **A single broken channel never masks its healthy sibling — now true for all three merged rows.** Until recently only Cursor behaved this way. Copilot reported the entire row as `unavailable` whenever its CLI store failed, hiding a perfectly healthy Chat channel and its session count; Cline was worse still — either channel's failure both masked the sibling *and* silently discarded the other channel's failure, so the Cline row printed no failure sub-line at all. Both now follow the Cursor rule, and Cline gained its two per-channel failure sub-lines. (Surprising; intentional.)
 - **A both-channels-failed row reports only one kind.** The main row shows a single failure kind (Cursor's IDE, Copilot's CLI, Cline's VS Code channel); the other channel's kind is visible only on its own sub-line. (Notable.)
 - **Auth-token check honors the env variable**: the "Signed in" vs "Not signed in" line uses the same token-loading path as `jolli auth status`, so setting `JOLLI_AUTH_TOKEN` makes the user appear signed in.
-- **Anthropic key check honors the env variable**: `ANTHROPIC_API_KEY` set in the environment counts the same as a key written to the config file.
-- **Jolli Site row is conditional**: it is omitted when no Jolli API key is configured, since there is no tenant URL to print.
+- **Anthropic key check honors the env variable — in the one case where the row prints at all**: when the provider is explicitly Anthropic, `ANTHROPIC_API_KEY` set in the environment counts the same as a key written to the config file. Under any other provider the row is absent, so the environment variable has no visible effect on this report even when it is set.
+- **The provider row and the vendor-key row are deliberately coupled.** `AI Provider:` is unconditional and `Anthropic Key:` is gated on it, so the report never asserts a credential state for a key the active provider would not consult. The consequence to know: a user who has an Anthropic key stored but has pinned the Jolli or local-agent provider sees no Anthropic row at all — the report describes what *will be used*, not everything that is stored. (Notable; intentional.)
+- **Jolli Site row is conditional**: it is omitted when no site URL has been persisted, since there is nothing to print. When it does print, its label distinguishes a live tenant from a merely remembered one — an environment-injected auth token carries no tenant of its own, so pairing it with a stale stored site URL would otherwise render "Signed in" beside an unrelated tenant.
+- **The Memory Bank row is read-only by construction.** Its active arm resolves the per-repository folder through a peek path rather than the claiming path, so *asking where the Memory Bank is* can never be what brings that folder into existence. Running `jolli status` in a directory that has never had a folder claimed leaves the disk untouched. (Notable; the full rationale and the wording table are spec 300's.)
 - **The `--json` payload is unfiltered**: it includes fields that the human-readable view never shows (e.g. the per-source session breakdown raw counts, scan-error objects). The VS Code extension reads it directly and renders its own panel.
 - **The Space-binding cache is shared with the guided front door**: a binding confirmed via bare `jolli` or a push renders `status`'s row with no network call, and vice versa; only a degraded state is never cached.
 - **`--json` mode makes no Space-binding call at all** — the JSON payload has no Space-binding field, so there is nothing to resolve or cache in that mode.
@@ -147,4 +172,6 @@ The project directory is auto-resolved to the enclosing git repository root when
 - The `--cwd <dir>` flag is shared with most other `jolli` sub-commands. When omitted, the project directory is auto-resolved to the enclosing git repository root.
 - The version string in the header is the same `VERSION` constant used by `jolli --version`.
 - The per-agent state strings here intentionally match the labels used by the VS Code extension's sidebar STATUS tree (295) so users see the same wording in both surfaces. The merged-row masking rule is likewise identical across the three surfaces that render it: this command, that tree, and the MCP `status` tool (148).
+- The `Memory Bank:` row's state model, its three arms, the shared wording table with every string verbatim, its three severity levels (of which this surface uses none), and the identical required field in the `--json` snapshot are all owned by spec 300. This spec owns only the row's position in the report and the fact that it is unconditional. The same table also drives the desktop editor's Memory Bank settings line, which is why the two surfaces cannot disagree about whether folder writes are landing.
+- The credential-precedence resolution behind the `AI Provider:` row is the same resolution the LLM dispatcher applies per call (spec 10), and the same one the doctor's Config probe reports (spec 59) — the three surfaces share it so none of them can name a provider the others would not.
 - The MCP `status` tool reports the same per-agent rows in structured form. Because its flat per-integration descriptor carries the merged reading, a single-channel failure — which this command shows as a sub-line — travels there in a separate per-channel scan-error list; see 148.

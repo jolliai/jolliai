@@ -12,7 +12,9 @@ Generate a structured summary of a single commit by combining the captured conve
 - The single-shot retry triggered when the response fails a format-compliance check.
 - The post-parse filter that drops topics whose decisions field is empty or a placeholder.
 - The default model selection, alias-to-full-id resolution, and the maximum-output-tokens budget.
-- The product-ticket extraction pattern and its canonical-uppercase normalization.
+- The whole-string whitelist every ticket identifier must satisfy before it is written, and the canonical-uppercase normalization it applies.
+- The separate substring extraction pattern used as a display-time fallback and as the squash pipeline's outer-ticket hint, and how it differs from the whitelist.
+- The two read-time surfaces that re-apply the whitelist to already-stored values, and the fact that they suppress rather than repair.
 - The topic-count guidance embedded in the prompt and the absence of any caller-side bucketing.
 - Validation and normalization of optional per-topic fields (todo, files-affected, category, importance).
 
@@ -44,7 +46,7 @@ An object spread onto the persisted summary, containing:
 - `llm`: a metadata block with the model identifier actually used, input/output token counts, total API latency in milliseconds, and a stop-reason string (or null). When the format-retry branch fires, the input/output token counts and the latency are summed across both calls; the model identifier and stop-reason are taken from the retry call.
 - `stats`: copied from input `diffStats`.
 - `topics`: an ordered list of topic objects (possibly empty).
-- `ticketId`: optional canonical-uppercase product-ticket string.
+- `ticketId`: optional canonical-uppercase product-ticket string. Present only when the model emitted a value that satisfies the whitelist below; a non-conforming value is dropped, so absence does not distinguish "the model omitted the field" from "the model emitted something that was discarded".
 - `recap`: optional recap paragraph(s).
 
 ### Soft-excluded context field on the stored summary
@@ -106,8 +108,47 @@ The known top-level markers form a closed set: the opening sentinel, the topic d
 ### Format compliance
 The first non-blank line of the LLM's output must start with the opening sentinel or be exactly one of the other top-level marker lines. An empty trimmed response is also compliant (it represents a deliberate "trivial commit, nothing substantive to record" outcome). Any other first-line content is non-compliant and triggers the strict retry.
 
-### Ticket-extraction pattern
-A regex matching the form `<2+ uppercase-or-alphanumeric chars starting with a letter>-<digits>` (e.g. PROJ-123, FEAT-45, JOLLI-7890). The first match in the searched text is normalized to uppercase. This is used as a fallback ticket source by callers and as the same regex is applied to the squash commit message in the squash pipeline.
+### Ticket-identifier whitelist
+
+Every ticket identifier written into a summary must satisfy a single whole-string whitelist. The candidate is trimmed first; an empty or whitespace-only candidate counts as absent. Exactly two forms are accepted, and the accepted form must cover the **entire** candidate:
+
+- **Project-key form** — a leading alphabetic character, then one or more further characters each of which may be alphabetic or a digit (so the part before the hyphen is at least two characters long and may itself contain digits), then a hyphen, then one or more digits. Letters may be supplied in any case; the accepted value is canonicalized by upper-casing the whole string (`proj-123` → `PROJ-123`).
+- **Bare issue-number form** — a `#` followed by one or more digits. Accepted verbatim, with no case folding (it has no letters).
+
+The digit run is otherwise unconstrained: a single `0` qualifies, a zero-padded run (`007`) qualifies, and there is no upper length bound.
+
+Anything else is rejected outright and the identifier is treated as absent. Rejected shapes include: a 40-character commit hash; a date-led plan slug (`2026-07-02-memory-detail-panel`); a bare date (`2026-07-02`); a file path; a parenthesized placeholder such as `(none referenced)`; a key with an empty digit run (`PROJ-`); a key whose digit run carries a trailing letter (`PROJ-12a`); a single-character prefix (`A-1`); a digit-led prefix (`1234-56`); a bare `#`; and any candidate that merely *contains* a ticket somewhere inside a longer string (`fix PROJ-123 now`).
+
+**The whitelist is anchored on purpose.** It never mines a ticket-shaped fragment out of a longer blob — the whole candidate either is a ticket or is not one. The failure mode it defends against is the model dropping an entire non-ticket string into the ticket slot; a fragment-extracting rule would happily recover a plausible-looking key from such a blob and persist it.
+
+**The whitelist is shape-based, not existence-based.** Nothing verifies that the identifier names a real issue in any tracker, so any string of the accepted shape passes — including strings that are not tickets at all (`UTF-8`, `ISO-8601`, `COVID-19`).
+
+**The prompt states the same contract to the model.** The per-commit ticket rule names the required shape (`ABC-123`, or the `#789` form), and explicitly rules out a plan slug (with the date-led example spelled out), a file path, a commit hash, and a bare date; it also forbids emitting a placeholder such as a parenthesized "none referenced" in place of omitting the field. The squash-consolidation prompt carries the same required shape and the same forbidden list (see "Squash Consolidation Summary" and the prompt-template library).
+
+**Where the whitelist runs — two boundaries, and only two.**
+
+1. **Ingest**, in this generator's top-level field parse (below), so no non-conforming value is written going forward.
+2. **Read/display**, at exactly two surfaces: the panel-title builder, and the shared per-commit hit projection that the recall context payload is built from (and that the retained local search-provider extension point also uses). Each re-applies the whitelist to the *stored* value and treats a failure as absent, so a pre-existing non-conforming identifier is suppressed there.
+
+(The squash/amend consolidation's source-selection scan also runs candidate source values through the whitelist so a non-conforming one is skipped rather than chosen — but that is a selection filter on a write path, not a third read guard. See "Squash Consolidation Summary".)
+
+Neither read surface repairs storage — a non-conforming value already on disk stays on disk, verbatim, and is merely hidden at those two surfaces. Every other consumer of the stored field is unguarded and still sees the raw value: the per-commit catalog entry rewritten on every summary write (see "Summary Catalog File"), the consolidation paths that copy the field onto a new root, the squash/amend outer-ticket hint, and the stored-ticket input to squash-message generation.
+
+### Ticket-extraction pattern (a substring scan — **not** the whitelist)
+A separate regex matching `<a leading uppercase letter, then one or more uppercase letters or digits>-<digits>`, applied as an **unanchored substring search** over free text. The first match found is upper-cased and returned. Its single live caller is the squash pipeline, which scans the squash commit message with it to derive the outer-ticket hint.
+
+A second, closely-related scan lives at the display boundary as the panel title's fallback when no usable stored identifier exists. It is **not** the same rule object — it is a separate pair of patterns of the same shape: first an uppercase-only scan of the commit message (match returned as found), then, only if that misses, a case-insensitive scan of the branch name whose match is upper-cased. So a lower-case key is discoverable from a branch name but not from a commit message. This fallback value is not itself put through the whitelist (values of this shape would pass anyway).
+
+The two rules are deliberately different and must not be confused:
+
+| | Whitelist | Extraction pattern |
+| --- | --- | --- |
+| Match span | The whole candidate, anchored | Any substring of the searched text |
+| Case | Accepts any case; upper-cases the result | Only matches an **uppercase** run, so a lower-case `proj-123` in the text is not found |
+| `#123` form | Accepted | Not recognized at all |
+| On a longer token | Rejects the whole candidate | Extracts the leading ticket-shaped fragment (`PROJ-123X` yields `PROJ-123`) |
+
+One direction does hold: because a matched substring, taken on its own, satisfies the anchored project-key form, anything the extraction pattern yields would also pass the whitelist. The converse does not — a lower-case key and the `#123` form pass the whitelist but are invisible to the scan.
 
 ## Behavior
 
@@ -161,8 +202,10 @@ The retry is single-shot. There is no further retry on the strict call's output.
 
 #### Top-level field extraction
 1. Scan the entire response for top-level marker lines using a single combined regex that matches either the topic delimiter or one of the top-level field markers (ticket-id, recap), each on its own line.
-2. For each top-level field marker found OUTSIDE topic blocks, capture content from end-of-marker to the next marker or end-of-text. First occurrence wins; later occurrences of the same field are ignored.
-3. Build a sanitized response text in which the field-marker line and its captured content have been excised. The topic delimiters themselves are preserved in the sanitized text.
+2. For each top-level field marker found OUTSIDE topic blocks, capture content from end-of-marker to the next marker or end-of-text and trim it. Empty content is ignored.
+3. For the recap field, keep the captured content as-is. For the ticket-id field, put the captured content through the whitelist: keep the canonicalized value when it passes; **discard it silently** when it does not, leaving the field absent from the parse result. A discarded value produces one debug-level log line carrying the first 80 characters of the rejected content and nothing else — no error, no retry, no signal to the caller.
+4. Occurrence rule: for the recap field, the first occurrence wins and later ones are ignored. For the ticket-id field the slot is claimed only by a value that **passes** the whitelist — a rejected first occurrence leaves the slot empty, so a later ticket-id marker carrying a conforming value is still accepted.
+5. Build a sanitized response text in which each field-marker line and its captured content have been excised — including a rejected ticket-id value, so a discarded value never leaks into the topic parser. The topic delimiters themselves are preserved in the sanitized text.
 
 This whole-text scan is required (not preamble-only) because the strict-retry path can place the recap AFTER the last topic block, and a preamble-only parser would otherwise drop it and let the trailing marker pollute the last topic's final field.
 
@@ -208,15 +251,17 @@ None. This generator is a pure request/response: caller passes inputs in, genera
 - **Topic delimiter must be on its own line.** The split regex is line-anchored. Backtick-fenced or in-prose mentions of the literal delimiter do not split topics. (Surprising.)
 - **Unknown per-topic field markers are appended to the previous field's content.** Rather than ignoring an unrecognized field marker, the parser treats it as text inside the last-known field. This protects against prose that mentions a marker-like string. The behaviour is asymmetric to top-level fields, which use a closed-set scan. (Notable.)
 - **Top-level fields are scanned across the whole response.** The parser does not assume the recap appears in the preamble; it scans the whole response and excises matches from the text passed to the topic parser. This was added after observing the strict-retry path place the recap after the last topic, which previously caused the recap to be dropped and the last topic's final field to absorb the trailing marker. (Surprising; bug-fix history.)
-- **First-occurrence wins for top-level fields.** Duplicated ticket-id or recap markers are ignored after the first; the prompt expects the preamble copy to be canonical when present. (Notable.)
+- **First-occurrence wins for the recap; first-VALID-occurrence wins for the ticket id.** A duplicated recap marker is ignored after the first. The ticket-id slot, by contrast, is claimed only by a value that passes the whitelist, so a rejected first ticket-id marker does not consume the slot and a later marker carrying a conforming value can still fill it. The prompt expects the preamble copy to be canonical when present. (Notable.)
+- **A non-ticket in the ticket slot is dropped silently, and the response still counts as compliant.** Format compliance is judged on the response's first line, before parsing; a rejected ticket value therefore triggers no retry, raises no error, and produces only a debug log line truncated to the first 80 characters of the offending content. The consequence is that the result contract cannot distinguish "the model omitted the ticket field" from "the model emitted a non-ticket that was discarded" — both surface as an absent identifier. (Surprising; intentional.)
 - **Empty-decisions filter is post-parse.** Topics returned to the caller never include decisions fields that are empty or placeholder strings; the prompt forbids the model from emitting them, but the filter exists as defense in depth. (Notable.)
 - **Output-token budget set to the strictest tier's ceiling.** The maximum-output-tokens cap is set to the smallest model tier's maximum so that switching to a smaller tier does not silently truncate. (Notable.)
 - **Default alias resolved at call time.** Config stores short aliases (e.g. "sonnet"); the resolver maps them to vendor ids on each call. Adding a new model version requires only updating the alias map. (Notable.)
 - **Forward compatibility on unknown model strings.** A model string that is neither a known alias nor an empty value is passed through as-is to the LLM client. (Notable.)
 - **Files-affected cap is silent.** When the model returns more than five entries, the surplus is discarded with no warning to the caller. (Surprising.)
-- **The ticket-extraction regex is shared.** The same regex feeds the post-call ticket fallback for callers that build a panel title from a legacy summary, and the squash pipeline's outer-ticket-id hint extracted from the squash commit message. (Notable.)
+- **The substring extraction scan is not the whitelist, and there are two copies of it.** The exported scan has exactly one live caller — the squash pipeline's outer-ticket hint, taken from the squash commit message. The panel title's legacy fallback does its own equivalent scan (commit message uppercase-only, then branch name case-insensitively) rather than calling that one. All of these are unanchored and mostly uppercase-only, where the whitelist is anchored and case-insensitive: they answer different questions ("is a ticket mentioned somewhere in this text" vs. "is this whole string a ticket"). (Notable.)
+- **Read-time whitelisting suppresses, it never repairs.** Exactly two read surfaces re-validate a stored identifier and treat a failure as absent — the panel-title builder (which then falls back to the substring scan over the commit message and branch) and the per-commit hit projection behind the recall payload. Neither rewrites the summary, so a legacy non-conforming identifier persists on disk indefinitely and remains visible to every unguarded consumer, most notably the per-commit catalog entry that is rewritten on every summary write. There is no migration. (Surprising; intentional.)
 - **A track-only reference is archived and displayed but is invisible to both LLM stages.** It is skipped by the prompt-block builder and withheld from the relevance ranker's input, then spliced back into the kept set unconditionally. So a commit can carry kept references in its stored summary while the references block the model saw was empty, and those references carry no relevance tier or reason at all. (Surprising; intentional.)
-- **Two language ports exist.** A canonical port and a JVM-based port. The JVM port lacks the strict-format retry, lacks the recap top-level field, and uses a different "no topics" sentinel scheme (a literal `===NO_TOPICS===` line on its own line) instead of accepting an empty trimmed response as compliant. The JVM port also still derives a small/medium/large prompt-action suffix from total changed lines, which the canonical port has removed. (Notable parity gap.)
+- **There is one implementation of this generator.** The former JVM-language port of it was deleted outright. Nothing invoked its summary-generation entry point before the deletion — neither that surface's own code nor its tests, which exercised only its parsing helpers — so removing it changed no behavior. A build-time gate on that surface now fails the build if production code there reaches the vendor LLM endpoint directly, so the parity gaps that port carried cannot return. (Notable.)
 
 ## Shared Behavior
 - The CONTEXT blocks (plans / notes / references) fed to this generator are relevance-ranked and filtered upstream; the soft-excluded items are recorded on the stored summary's excluded-context list and the kept items' tier+reason on its kept-item relevance list, rather than dropped; see [258 — AI Context-Relevance Filtering] for the ranker and the two projections, and [188 — Commit Exclusion Selection Store] for the persisted full per-item ranking the fingerprint-reuse path reads. Soft-excluded plans/notes are removed from archival without being discarded — identical to a user hard-exclude, which is now also skip-only; see [42 — Plan Archival on Commit] and [43 — Note Archival on Commit].

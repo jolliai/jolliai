@@ -32,6 +32,8 @@ This spec defines how Cline VS Code extension sessions are detected, discovered 
 
 The Cline VS Code extension is considered installed when, for at least one supported VS Code-family flavor, `<globalStorage>/saoudrizwan.claude-dev/state/taskHistory.json` exists and is readable. Flavors are checked in a fixed order and detection short-circuits on the first hit. ENOENT (or any other access failure) on a given flavor's file simply advances to the next flavor; if every flavor misses, the extension is reported not installed. There is no gate on any embedded-database runtime module — this source never touches SQLite.
 
+MCP registration does **not** use this predicate. It asks a different question about Cline — whether the extension's MCP settings file is accessible — and asks it of **every** supported flavor without short-circuiting, because each flavor has its own independent MCP settings file. The two predicates can disagree in both directions, so "detected" here says nothing about whether Cline was registered as an MCP host; see spec 149.
+
 ### User-data directory (per flavor)
 
 Identical to the VS Code-family layout used elsewhere in this product:

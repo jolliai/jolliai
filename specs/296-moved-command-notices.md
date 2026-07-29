@@ -22,6 +22,7 @@ Three top-level command names that the workflow-run surface used to occupy befor
 - The stand-in command the host registers for the `workflow` name when that plugin is absent — owned by the plugin-loader and plugin-API-contract specs. That stand-in is a different mechanism with a different failure signal; the two are only compared here.
 - The startup recipe self-heal that rewrites stale on-disk recipes to the new command names — owned by the skill-installation spec. This spec depends only on the fact that the self-heal runs earlier in the same invocation.
 - The help formatter and its section grouping — these commands are hidden and therefore appear in no section.
+- **The flat Space command names retired in the same namespace overhaul.** The Space stand-in's family was narrowed from seven top-level names to the single `space` command, retiring `init`, `source`, `impact`, `sync`, `docs`, and `agent`. **None of those six was given a notice here.** The retired-name map below still contains exactly the three flat workflow-run names and nothing else, and no host built-in or other stand-in claims the six. The consequence is that invoking any of them now produces the command parser's bare unknown-command error — precisely the failure this whole mechanism exists to replace for the workflow names. Whether that asymmetry is deliberate is **not** recorded anywhere in the code: the mechanism's own rationale speaks only about the workflow-run migration and says nothing about the Space retirement, so this spec records the gap as observed rather than as intended. See the plugin-loader spec for the Space stand-in's new shape and the local-workflow-run spec for a recipe that consumes one of the six retired names.
 
 ## Data Contracts
 
@@ -34,6 +35,8 @@ A fixed, in-source list of three pairs, each mapping one retired flat command na
 | `local-run-workflows` | `workflow local-run` |
 | `workflow-run-status` | `workflow run-status` |
 | `workflow-runs` | `workflow runs` |
+
+The map is **exactly** these three. It has not grown to cover the six flat Space names retired by the same namespace overhaul (`init`, `source`, `impact`, `sync`, `docs`, `agent`) — see the boundary note in Scope.
 
 ### Notice message (exact)
 
@@ -100,6 +103,7 @@ There is no persisted state and nothing to clean up between invocations.
 - **Hidden from help.** Discovery of the new surface is the replacement command's job; advertising the retired names would work against the migration. (Notable.)
 - **The message's "your skills were refreshed" claim depends on invocation ordering, not on the notice.** The notice does no refreshing itself. Its truthfulness is inherited from the earlier startup self-heal step in the same invocation. (Notable; a cross-surface dependency worth recording because reordering the startup sequence would make the message a lie.)
 - **A bounded migration aid.** The map is a fixed three entries covering exactly the names retired in one migration. It is safe to remove once recipe revisions predating the migration are out of circulation; nothing else depends on these names existing. (Notable.)
+- **The coverage is workflow-only, and the code gives no reason why.** A second, same-vintage retirement — the six flat Space names collapsed into a single `space` stand-in — got no notices, so those names fail with the parser's bare unknown-command error: the exact outcome this mechanism was built to replace. That gap is asymmetric with the treatment the three workflow names received, and nothing in the code states a rationale for the difference. Recorded as observed, not as intended. (Notable; an unexplained coverage gap.)
 
 ## Shared Behavior
 

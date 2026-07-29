@@ -50,7 +50,7 @@ Each probe produces exactly one line, with three exceptions: the dist-paths prob
    - `ok` "installed" if present.
    - `warn` "not installed (optional)" otherwise. Treated as a warning because Claude Code is not required for Jolli Memory to function.
 
-3. **Gemini hook** — same shape as Claude hook, for Gemini CLI.
+3. **Gemini hook** — same shape as Claude hook, for Gemini.
    - `ok` "installed" or `warn` "not installed (optional)".
 
 4. **Orphan branch** — checks whether the summary-storage orphan branch exists in the project's git repository.
@@ -70,12 +70,21 @@ Each probe produces exactly one line, with three exceptions: the dist-paths prob
    - `warn` "<n> entries (high — Worker may be stuck)" when greater than 10. (Stale entries older than 7 days are *not* counted here — they are handled by `jolli clean`.)
 
 8. **Config** — checks LLM credential availability using the same precedence rules the runtime uses to dispatch LLM calls, so the doctor never disagrees with what the live system would accept.
-   - `ok` "credentials found — Anthropic API key (config)" / "Anthropic API key (ANTHROPIC_API_KEY env)" / "Jolli proxy key", whichever applies.
+   - `ok` "credentials found — <label>", where `<label>` is one of four: `Anthropic API key (config)`, `Anthropic API key (ANTHROPIC_API_KEY env)`, `Jolli proxy key`, or `local agent (<tool display name>)`.
    - `warn` "no credentials — summaries will not be generated" otherwise.
 
+   The local-agent label **names the configured tool** rather than a fixed string: it reads `local agent (Claude Code)`, `local agent (Codex)`, `local agent (Cursor)`, or `local agent (OpenCode)`, defaulting to the default tool's name when the tool setting is absent and degrading to a generic label for a tool identifier this build does not recognize. It previously always claimed the default tool's subscription, which was wrong for the three tools that are now selectable.
+
 9. **Local agent CLI** — a **conditional** probe: it is emitted only when the Config probe above resolved the local-agent source. It exists because for that provider the "credential" is an executable rather than a stored key, so a green Config line only means the provider is *selected*. This probe therefore runs the same executable resolver the runtime would use (honouring the configured agent tool and any explicitly configured executable path — mechanics owned by spec 280) so the doctor can never report healthy while every commit silently fails to find the binary.
-   - `ok` with the resolved executable path and version.
-   - `fail` with the resolver's own error message if no usable executable was found.
+   - `ok` with the **full launch command** and the resolved version — `<launch command> (v<version>)`. The launch command is the interpreter plus the script when the tool resolves through a launcher shim, not the bare interpreter path. Reporting the bare path was actively misleading: for a shim-resolved tool it named a generic interpreter, reading as though the doctor had picked the wrong program entirely.
+   - `fail` with the resolver's own error message **followed by a tool-specific sign-in instruction**, in the form `<resolver error message> — <hint>`. The five hints are:
+     - Claude Code → ``Run `claude` once and sign in to your subscription.``
+     - Codex → ``Run `codex login` to sign in with your ChatGPT plan.``
+     - Cursor → ``Run `cursor-agent login` to sign in to Cursor.``
+     - OpenCode → ``Run `opencode auth login` to connect a provider.``
+     - a tool identifier this build does not recognize → `Sign in to your local agent CLI.`
+
+   **The probe checks discovery and capability only — it never probes login state.** It resolves candidates, runs a capability probe, and reports the newest capable one; nothing asks the tool whether it is authenticated. An installed-but-signed-out agent CLI therefore reports `ok` here and fails at commit time instead. The sign-in hint is attached to the *failure* message unconditionally, so it is offered for a purely-missing binary as readily as for an auth problem — it is guidance, not a diagnosis.
 
    This probe has **no fixer** (spec 60). Installing, upgrading, or signing in to the agent CLI is user action; the interactive repair ladder (spec 291) is the surface that offers it, and it is never reached from `doctor`.
 
@@ -112,6 +121,8 @@ Exit code `0` therefore means "Jolli Memory is functional", but does not promise
 - **Optional-hook warnings do not affect exit code.** Missing Claude or Gemini hooks emit `warn`, which is treated the same as `ok` for exit-code purposes.
 - **Empty dist-paths registry is `fail`, not `warn`.** Without it the runtime cannot locate the bundle, so this is a hard failure. Stale individual registry entries are `warn` because the other entries may still cover the active install.
 - **The Config probe alone is not sufficient for the local-agent provider.** Because that provider is selected unconditionally with no presence check (spec 10), Config reports `ok` for a machine with no agent CLI at all. The dedicated Local-agent-CLI probe is what makes that state visible, and it is the only probe here that actually spawns a subprocess.
+- **A green Local-agent-CLI line does not mean "signed in".** The probe verifies that an executable exists and answers a capability probe; it never asks the tool about its authentication state. An installed but logged-out agent CLI passes this probe and fails at the next commit — which is also why the *failure* message carries a sign-in hint even when the actual fault was a missing binary. (Surprising.)
+- **The Config probe's local-agent label names the configured tool.** With four selectable tools, a fixed label would misattribute generation to the default one; the label follows the setting and degrades to a generic string for an identifier this build does not know (which is reachable, because the setting is shared across surfaces and versions). (Notable.)
 - **A plugin line's `ok` verdict says "compatible", not "working".** Version compatibility is all this probe checks; load failures surface separately at load time, so a green plugin line does not promise the plugin's commands will run.
 
 ## Shared Behavior

@@ -1,6 +1,6 @@
 # Spec corpus index
 
-299 behavioral specifications reverse-engineered from this repository's actual code, grouped below by
+305 behavioral specifications reverse-engineered from this repository's actual code, grouped below by
 theme and ordered by number within each group.
 
 **These specs document reality, not intent.** Every statement in them was derived from — and is meant
@@ -87,6 +87,7 @@ gate a change.
 - [277 — Devin CLI Session and Main-Chain Transcript Reading](277-devin-cli-session-and-transcript-reading.md) — reconstruct the canonical linear conversation from a message forest in one machine-global embedded store.
 - [278 — Antigravity Conversation Discovery and Transcript Reading](278-antigravity-session-and-transcript-reading.md) — recover the workspace path from a per-conversation encrypted database, then read the plaintext transcript beside it.
 - [279 — Cursor CLI (cursor-agent) Session and Transcript Reading](279-cursor-cli-session-and-transcript-reading.md) — read the terminal `cursor-agent` product's own plain JSON/JSONL layout, unrelated to the Cursor IDE source.
+- [305 — Re-Enable Transcript Discovery Catch-Up](305-re-enable-transcript-discovery-catch-up.md) — re-scan recorded sessions from their frozen watermark when a repository is re-enabled, recovering the window during which discovery was suspended; editor-only, uncapped, and paid inside the enable gesture.
 
 ## Working-memory state: overlays, selection, pins
 
@@ -227,6 +228,7 @@ gate a change.
 - [170 — Sync Backend Client](170-sync-backend-client.md) — tenant-scoped requests against the personal-space sync endpoints, mapped into typed successes or a fixed typed-error taxonomy.
 - [171 — Vault Write Lock](171-vault-write-lock.md) — serialize writers against one shared working tree by keying a host file lock to the canonicalized vault root path.
 - [172 — Global Sync Lock](172-global-sync-lock.md) — the machine-global mutex serializing reconciliation rounds across every checkout, window, and CLI invocation for one OS user.
+- [300 — Memory Bank Write Boundary and Effective-State Reporting](300-memory-bank-write-boundary-and-state-reporting.md) — refuse to claim a folder from a working directory that is not a real project, degrade silently to ref-only storage, and report the resulting effective state through one shared wording table.
 
 ## Jolli Space, sharing and push
 
@@ -237,6 +239,7 @@ gate a change.
 - [268 — Git Pre-Push Hook and Detached Sync Worker](268-git-pre-push-hook-and-worker.md) — queue the pushed commits, optimistically publish the budget-eligible ones inline, and never block or fail the push.
 - [269 — Push-Pending Queue and Claim-Based Drain Engine](269-push-pending-queue-and-drain-engine.md) — two entry points over one drain core that atomically claims each commit, uploads with bounded concurrency, and tracks a retry budget.
 - [270 — Push-Pending Compensation Retry](270-push-pending-compensation-retry.md) — a fire-and-forget catch-up on activation or sign-in that retries every queued commit with no hash filter.
+- [301 — Memory Reference Identifier and Copy Chip](301-memory-reference-id-chip.md) — a memory's human-facing identifier, minted only once the backend has one, and the click-to-copy chip that surfaces it — always on detail panels, synced-only in lists, so a chip in a list is itself the "already pushed" signal.
 
 ## PR authoring
 
@@ -272,6 +275,7 @@ gate a change.
 - [288 — IntelliJ CLI Daemon Connection](288-intellij-cli-daemon-connection.md) — serve every bridge call from a lazily spawned per-project connection, falling back to a one-shot spawn — except on two failures that must never retry.
 - [289 — IDE-Bridge Refresh Notification Channel](289-ide-bridge-refresh-notification-channel.md) — push coarse queue and orphan-ref change notices to the IDE host, multiplexed onto the response stream and distinguished by having no correlation id.
 - [290 — Claude Plugin Session Bootstrap](290-claude-plugin-session-bootstrap-hook.md) — the plugin's single manifest action: a per-session reconciler that restores canonical installation under short-budget locks and never overrides a deliberate disable.
+- [303 — Claude Plugin Front-Door Menu Content](303-claude-plugin-front-door-menu-content.md) — the body of the plugin companion's action menu: its revision-ordering invariant over the standalone menu, the status fields it reads, and its provider-aware "can generate memories" derivation.
 
 ## Workflows
 
@@ -344,6 +348,7 @@ gate a change.
 - [238 — Create-PR Diff Preview](238-vscode-create-pr-diff-preview.md) — a read-only side-by-side of base vs HEAD served as virtual documents, guarded against workspace escape and rename-aware.
 - [247 — Working-Memory Review Panel](247-vscode-next-memory-review-panel.md) — a singleton editor webview mirroring the sidebar's next-commit draft through the same host handler, so the two can never drift.
 - [295 — Sidebar Status Tree](295-vscode-status-tree-panel.md) — the STATUS tab's three degenerate render states plus the enabled row set, where each dual-variant integration shows its merged row and an additional standalone warn row.
+- [304 — Zero-Write Contract for a Manually-Disabled Repository](304-manually-disabled-zero-write-contract.md) — the in-process suppression flag seeded before the first log line, the full inventory of writes it stops, and the carve-outs that still reach disk.
 
 ## The IntelliJ surface
 
@@ -367,8 +372,8 @@ gate a change.
 - [192 — Active Conversations Panel](192-intellij-active-conversations-panel.md) — one row per active conversation across all producers, refreshed on a timer, with pin, terminal-resume, and next-commit selection actions.
 - [193 — KB Explorer Panel](193-intellij-kb-explorer-panel.md) — the Memory Bank parent folder as a two-level tree: discovered repos at top, each repo's visible content interleaved with user folders below.
 - [212 — Claude/Codex Session Resume via Terminal](212-intellij-claude-session-resume-via-terminal.md) — open a project-rooted terminal tab running the source-appropriate resume command, gated by one shared predicate at three call sites.
-- [216 — Knowledge-Wiki Build Trigger](216-intellij-knowledge-wiki-build-trigger.md) — a manual all-repos sweep plus an automatic single-repo drain-tail run, with concurrency governed solely by a per-vault lock and no debounce.
-- [217 — Native LLM Seam (Wiki-Ingest Framing Retired)](217-intellij-wiki-ingest-anthropic-mode.md) — the surviving in-process LLM seam: three-source credential selection, a fail-loud direct-mode guard, and a streaming/non-streaming client.
+- [216 — Knowledge-Wiki Build Trigger](216-intellij-knowledge-wiki-build-trigger.md) — exactly one build: a manual all-repos sweep behind a credential-gated toolbar button. This surface performs no ingest of its own, runs no automatic post-commit build, and holds no build lock.
+- ~~[217 — Native LLM Seam](217-intellij-wiki-ingest-anthropic-mode.md)~~ **(REMOVED)** — the in-process LLM seam, its credential selector, its direct-vendor client and its alias resolver are all deleted; every model-backed action on this surface now spawns the CLI's generation bridge, and a build gate prevents reintroduction.
 - [219 — CLI-Delegated Sync Orchestration and UI](219-intellij-vault-sync-ui.md) — a poll timer and a manual entry point turn each round into one bridge call, mapping the result into a status-bar badge and toolbar label with auto-clearing finished states.
 - [220 — PINNED Panel](220-intellij-pinned-panel.md) — a newest-first list of pinned items mirroring each source row's badge and title, with open / resume / unpin hover actions and an empty placeholder.
 - [221 — WORKING MEMORY Section Container](221-intellij-working-memory-section-container.md) — a vertical stack of consequence message, AI-summary status, and three input sub-sections above Commit and Review, reporting its natural height.
@@ -389,3 +394,4 @@ gate a change.
 - [284 — Node.js Runtime Detection and Hard Gate](284-intellij-nodejs-runtime-detection.md) — two-phase detection (gather candidates, then prove each by execution) with a version floor, persisted winner, retry, and a blocking panel on failure.
 - [298 — IntelliJ AI Commit Action](298-intellij-ai-commit-action.md) — stage the checked files, obtain a message from the command-line surface, offer a three-way review, then restore prior staging and force the IDE to re-read git state.
 - [299 — IntelliJ Squash Action](299-intellij-squash-action.md) — consolidate a selected commit range with a generated message, warning before rewriting pushed history and writing the squash-pending marker before the reset.
+- [302 — IntelliJ Embedded-Browser Pool](302-intellij-jcef-browser-pool.md) — a project-scoped pool of reusable embedded-browser instances behind a checkout/hand-back discipline, prewarmed at project open so opening a memory tab no longer constructs one, with a trim-on-hand-back population bound that is not admission control.

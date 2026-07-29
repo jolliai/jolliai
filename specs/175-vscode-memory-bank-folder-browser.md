@@ -11,7 +11,7 @@ Surface the Memory Bank parent folder as a lazily-expanded tree that interleaves
 - The flat root listing that interleaves managed-repository entries with arbitrary user-created top-level sibling directories and files.
 - The lazy-expansion contract: a request for a relative path returns one folder node populated with its immediate children, with each child directory's own children left unloaded.
 - The disambiguation rule between the repository namespace and the user-entry namespace when resolving the first segment.
-- The per-listing reconcile + heal pre-pass that runs before any listing inside a discovered repository and the per-instance "clean repository" memoisation that suppresses it once a clean pass has been observed.
+- The per-listing reconcile + heal pre-pass that runs before any listing inside a discovered repository, the per-instance "clean repository" memoisation that suppresses it once a clean pass has been observed, and the manual-disable condition that suppresses it without memoising.
 - Manifest-driven enrichment of every tracked Markdown file with a classification kind, a stable identifier, a human-readable title, a source branch, and a "user-edited on disk" divergence flag.
 - Title derivation for Markdown files outside the manifest, falling back through frontmatter title, first H1, then nothing.
 - Sort order: directories first then files, alphabetical within each group; at the root, discovered repositories first then user-created entries within the same dirs-then-files ordering.
@@ -149,6 +149,8 @@ A consequence at every level except the root user-entry list: symbolic links who
 
 Each instance of the listing service maintains a set of absolute repository-root paths that were observed to be in sync between manifest and on-disk content. A repository is added to the set after a listing inside it observes a heal pass that healed zero files and failed zero files. Membership in the set suppresses reconcile + heal on subsequent listings inside that repository.
 
+The insertion happens *inside* the gated pre-pass block, so a session in which the pre-pass never runs — notably a manually disabled workspace — never adds to the set at all.
+
 The set is keyed by absolute repository-root path, not by basename, so that a configuration change that re-points the Memory Bank parent folder to a different location cannot leak a memoised "clean" status onto a same-named repository under the new parent.
 
 The memo has two interfaces for invalidation:
@@ -181,7 +183,7 @@ For any inner sub-path, the outer name is left as the on-disk basename produced 
 3. Otherwise split the normalised path on the forward-slash separator. The first segment is the namespace key.
 4. Invoke the repository-discovery surface (passing the current-workspace identity and the configured Memory Bank parent folder, every call, so settings changes take effect on the next listing without recreating the service) and look for a discovered repository whose on-disk basename equals the first segment.
 5. If a discovered repository matches:
-   - If the repository's absolute root is **not** in the per-instance clean-repository memo, run the reconcile + heal pre-pass for this repository. See "Reconcile + heal pre-pass" below.
+   - If the repository's absolute root is **not** in the per-instance clean-repository memo **and** the workspace is not manually disabled, run the reconcile + heal pre-pass for this repository. See "Reconcile + heal pre-pass" below. When either condition suppresses it, the listing continues unchanged.
    - Compute the inner relative path: the remaining segments joined by forward slashes (the empty string when the first segment is the entire path).
    - Call the inner listing on the repository's on-disk root with the inner relative path. See "Inner listing of a directory" or "Inner listing of a file" below.
    - Prefix every relative path in the returned node and its descendants with the first segment, joined by a forward slash.
@@ -210,7 +212,15 @@ If the directory-read of the Memory Bank parent folder fails for any reason (mos
 
 ### Reconcile + heal pre-pass
 
-Triggered before any listing inside a discovered repository whose absolute root is not in the clean-repository memo:
+Triggered before any listing inside a discovered repository whose absolute root is not in the clean-repository memo **and** whose workspace has not been manually disabled by the user. Both conditions gate the same block; the disabled case is a plain skip with no logging and no error.
+
+The skip is scoped tightly: reconcile rewrites the manifest and heal regenerates visible files, so both must not run for a repository the user has turned off — but **the listing itself still proceeds in full**. Every folder node, classification, title, branch and divergence flag is computed exactly as usual. A disabled project's Memory Bank browser is therefore fully readable; only the self-healing is paused. (Rationale: the browser is one of the surfaces a user reaches *while* the product is off, so making it degrade would be the wrong trade.)
+
+Because the clean-repository memo is recorded **inside** the skipped block, a disabled session never memoises anything. That is the elegant part of the placement: the memo is the only thing that would make the skip sticky, so once the repository is re-enabled the pre-pass re-arms automatically on the next listing, with no invalidation call and no bookkeeping. Had the memo been recorded outside the block, a single listing during a disabled window would have permanently convinced the service the repository was clean.
+
+Cross-reference: spec 145 for the manual-disable state, `specs/304-manually-disabled-zero-write-contract.md` for the wider contract.
+
+When the pre-pass does run:
 
 1. Invoke the repository's metadata-reconcile entry point (which rewrites the manifest in place when a file recorded under one path is now located under another, based on fingerprint match — boundary).
 2. Invoke the repository's heal pass with an explicit flag instructing it **not** to drop orphaned manifest entries when their hidden source is missing. The dual-write storage mode could otherwise produce false positives at this call site, since this surface cannot inspect the active storage-mode configuration to determine whether folder-only mode is in effect. The explicit pass-through is the deliberate "preserve under uncertainty" policy. (As a consequence, the dropped-ids field of the healed-callback invocation is always empty when populated by this pre-pass.)
@@ -303,6 +313,7 @@ PRESENT ──(external refresh trigger calls the single-repo clear with this ro
 ABSENT ──(listing inside the repository observes a heal pass that healed at least one file)──> ABSENT (pass through; memo not added)
 ABSENT ──(listing inside the repository observes a heal pass that failed at least one file)──> ABSENT (pass through; memo not added)
 ABSENT ──(reconcile or heal throws)──> ABSENT (memo not added; warning logged; listing continues)
+ABSENT ──(listing inside the repository while the workspace is manually disabled)──> ABSENT (pre-pass skipped entirely; memo not added; listing proceeds in full; the pre-pass re-arms by itself once re-enabled)
 ```
 
 The folder-node payload returned from any single listing has no state of its own; every listing is computed from disk and the manifest at the moment of the call. Consumer-side caching of expanded subtrees is the consumer's concern; the service simply returns one folder node per call.
@@ -313,6 +324,9 @@ The folder-node payload returned from any single listing has no state of its own
 - **Repository-discovery is re-invoked on every listing.** The service stores no repository list; every listing fetches the latest snapshot from the boundary discovery surface using the latest-supplied workspace identity and Memory Bank parent folder. A repository created or removed since the previous listing is reflected immediately on the next call. (Notable.)
 - **Reconcile + heal is awaited inline, not fire-and-forget.** The regenerated visible files must be on disk by the time the inner listing enumerates the folder; a fire-and-forget heal would return a tree omitting the recovered files and require the consumer to refresh again. (Notable.)
 - **The pre-pass passes "do not drop orphaned manifest entries" explicitly.** This surface cannot inspect the active storage-mode configuration to determine whether dropping is safe, so it always preserves. The explicit pass-through makes the contract visible at the call site and survives future signature changes. As a consequence, the dropped-ids field of the healed-callback is always an empty array when populated by this pre-pass. (Notable; intentional defensive default.)
+- **A manually disabled workspace skips the pre-pass but keeps a fully readable browser.** Reconcile and heal both write, so both are suppressed; every listing, classification, title, branch and divergence flag is still computed. Read access is deliberately not a casualty of turning the product off. (Notable.)
+- **The disabled skip is self-cancelling, because the clean memo lives inside the skipped block.** A disabled session never memoises, so the pre-pass re-arms automatically on the first listing after re-enable — no invalidation call, no marker, no bookkeeping. Had the memo been recorded outside the gate, one listing during a disabled window would have permanently marked the repository clean and silently disabled self-healing forever after. (Surprising; the placement is the whole mechanism.)
+- **This call site is the sole suppression point for the pre-pass.** Neither the reconcile operation nor the heal-and-regenerate operations carry a manual-disable gate of their own — only the underlying bulk-write entry point does, and heal does not go through it. So moving, duplicating, or bypassing this one check would let a disabled repository be written to. (Surprising; a real refactoring hazard. Cross-reference: spec 145 and `specs/304-manually-disabled-zero-write-contract.md`.)
 - **The clean-repository memo is keyed by absolute root path, not basename.** A configuration change that re-points the Memory Bank parent folder to a different location cannot leak a "clean" status onto a same-named repository under the new parent. (Notable; intentional regression-closer.)
 - **The clean-repository memo can short-circuit recovery of externally deleted files.** Once a repository is marked clean, external actors that delete a tracked visible file (manual deletion, file-system eviction, cloud-sync conflict) will not see the file regenerated on the next listing — the memo skips heal. The external-refresh-clear interface exists precisely to re-arm the pre-pass. Consumers that wrap external file-system events into a refresh trigger must invoke the clear before the listing. (Notable; surprising at first sight; intentional.)
 - **Inner stat throws propagate; root readdir throws are swallowed.** A listing inside a discovered repository for a stale sub-path will throw (the consumer's webview catches and converts into an empty-tree fallback so the loading state ends). A root listing whose parent folder does not exist returns an empty children list. The asymmetry is intentional: a missing root is the normal "fresh install / reconfigured to a path not yet created" state, while a missing inner path is a stale-cache signal. (Notable.)

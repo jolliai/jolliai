@@ -14,7 +14,7 @@ The IDE plugin exposes exactly one knowledge-wiki build: a manual all-repos swee
 **Out of scope (boundaries):**
 - Everything the build actually does — Memory Bank repo discovery, per-repo storage construction, the ingest pipeline (batching, route/reconcile model calls, per-topic failure isolation, the high-water mark, processed-source marking, outcome codes), the orphan-page purge, the visible-wiki render, per-repo failure isolation, and whatever locking it uses — is owned by the command-line surface (specs 152, 156, 158, 160 and the vault-write-lock spec). The IDE observes only the aggregate it returns.
 - The credential resolution chain and its precedence — spec 10. This spec treats credential presence as a single boolean precondition.
-- The in-process LLM seam that survives on this surface for three summary-viewer actions — spec 217. It is **not** used by the wiki build.
+- The generation bridge the surface's model-backed actions spawn — spec 292 (and spec 217 for the record of the in-process seam it replaced). Neither is involved in the wiki build, which delegates through its own build call.
 - The Memory Bank browser panel that hosts the button (tree building, reset-migration action, refresh behavior) — spec 193.
 
 ## Data Contracts
@@ -40,7 +40,7 @@ Each defaults to zero (an empty repo list) when absent. Per-repo names, per-repo
 
 ### Credential precondition
 
-A single boolean, true when any one of three is present: a configured direct provider (Anthropic) API key, a configured platform (jolli) API key, or the provider-API-key environment variable. False only when all three are absent. It is the same predicate the rest of the IDE uses to decide whether summary generation is possible, so this button and the cold-start / backfill surfaces agree.
+A single boolean, true when any one of three is present: a configured direct provider (Anthropic) API key, a configured platform (jolli) API key, or the provider-API-key environment variable. False only when all three are absent. It has the same shape as the predicates the surface's onboarding, auto-install, and status paths apply, so this button agrees with them; the settings dialog's own equivalent gate has since diverged (see Notable Behavior).
 
 Note that the predicate does **not** recognize a local-agent subscription: a user configured for a local agent and holding no keys is told to configure a key even though the command-line surface could drive the build.
 
@@ -89,7 +89,7 @@ click
 - **A partially failed build still reports success.** The toast is an information notification whenever the call returns, even when every repo failed — the failed count appears only as a parenthetical. Only a thrown call produces an error notification.
 - **The virtual-file refresh is mandatory and IDE-specific.** The wiki files are written by another process through plain filesystem APIs the IDE does not observe, so the panel forces a recursive refresh of the Memory Bank root. Skipping it would leave the tree showing stale or missing wiki files until an unrelated refresh happened. Note the refresh runs only on the success path — a failed build leaves the tree unrefreshed even if the build wrote some repos before failing.
 - **The "already running — skipped" outcome is gone.** The IDE used to show "Another knowledge wiki build is already running for this Memory Bank folder — skipped." on a fail-fast lock collision. The aggregate no longer carries a skip flag and the branch has been removed, so that notification can never fire.
-- **The credential gate is narrower than the build's actual capability.** The precondition recognizes only the two configured keys and the environment key. A local-agent subscription — which the settings dialog offers and the delegated build can use — is not recognized, so such a user is blocked at the button with a "needs an API key" message.
+- **The credential gate is narrower than the build's actual capability.** The precondition recognizes only the two configured keys and the environment key. A local-agent subscription — which the settings dialog offers and the delegated build can use — is not recognized, so such a user is blocked at the button with a "needs an API key" message. This gate is now out of step with the settings dialog's own equivalent gate, which **was** widened: selecting the local-agent provider there now counts as having a credential, so merely saving settings no longer silently disables the whole surface for a keyless local-agent user. The button's predicate was not widened with it. It is not the last such gate on this surface either: the same key-only shape still decides whether hooks are auto-installed at project open, whether the tool window shows onboarding or the main view (and whether a sign-out silently uninstalls), and whether the status surface warns about a missing key — each owned by its own topic. This button is simply the one place where the mismatch produces an outright refusal with a "needs an API key" message.
 - **The button is always enabled.** There is no disabled state for a missing credential, a paused project, or an unresolved Memory Bank folder; each is discovered only after the click.
 - **The Memory Bank folder root is the last locally-computed path in this flow.** The default-parent fallback is resolved in-process; every path derived from it is resolved on the command-line side.
 
@@ -98,4 +98,4 @@ click
 - Everything the build does — repo discovery, the ingest pipeline, the orphan-page purge, the visible-wiki render, per-repo failure isolation, and locking — is owned by the command-line surface (specs 152, 156, 158, 160 and the vault-write-lock spec).
 - The credential resolution chain and provider precedence are owned by spec 10; this spec treats credential presence as one boolean.
 - The Memory Bank browser panel that hosts the button, and its own delegated round-trips, are owned by spec 193.
-- The in-process LLM seam that survives on this surface (spec 217) is not involved in the wiki build; it serves three summary-viewer actions only.
+- The generation bridge every model-backed action on this surface now spawns is owned by spec 292 (spec 217 records the in-process seam it replaced). It is not involved in the wiki build, which reaches the command-line surface through its own delegated build call.

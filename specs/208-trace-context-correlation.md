@@ -12,9 +12,9 @@ A Jolli-private correlation identifier that ties every log line and outbound HTT
 - The all-zero sentinel that the backend rejects and this layer never emits.
 - The in-process ambient scope mechanism and its scoping / nesting rules, in both the async (TypeScript) and synchronous-threaded (Kotlin) implementations.
 - The escape hatch that strips an ambient id from a deliberately unrelated child scope.
-- The three cross-process propagation paths: environment variable on worker spawn, persisted queue entry field, and freshly minted standalone value for code outside any scope.
-- Every entry point that opens a trace scope: CLI main, all git hooks (post-commit, post-rewrite, post-merge), the queue worker main, sync-engine rounds, and all UI-layer action dispatchers (VS Code webview handlers, IntelliJ push and binding dialogs).
-- Every outbound call site that attaches the header: LLM proxy, backend sync, auth exchange, and all IntelliJ Jolli API calls.
+- The cross-process propagation paths: environment variable on worker spawn, persisted queue entry field, the IDE-to-runtime channels (a request-line field on the long-lived connection, an environment variable on the one-shot spawn), and the freshly minted standalone value for code outside any scope.
+- Every entry point that opens a trace scope: CLI main, all git hooks (post-commit, post-rewrite, post-merge), the queue worker main, sync-engine rounds, every request served on the long-lived IDE connection, and all UI-layer action dispatchers (VS Code webview handlers, IntelliJ push / share / create-PR / binding dialog actions).
+- Every outbound call site that attaches the header: LLM proxy, backend sync, auth exchange, the VS Code push service, and the runtime-issued calls made on the IntelliJ plugin's behalf.
 - The log-line stamping rule: one `[trace=<id>]` tag per line whenever an ambient scope is active.
 
 **Out of scope:**
@@ -121,9 +121,11 @@ Every process entry point opens a trace scope as its outermost action:
 | Sync engine round | Mints a fresh id with no env-var adoption. Sync rounds are not tied to a git operation, so each round is an independent trace. |
 | VS Code webview dispatch | Mints a fresh id for each incoming webview message dispatch. Push, regenerate, edit-topic, and related actions each run inside their own scope. |
 | VS Code binding chooser | Mints a fresh id for the binding-creation action. |
-| IntelliJ LLM call | Mints a fresh id wrapping the LLM invocation. Every LLM call is a self-contained trace. |
-| IntelliJ push action | Mints a fresh id on the pooled worker thread, covering all `pushToJolli`/`listSpaces` calls and their logs. The `withTrace` must be set on the actual worker thread because a `ThreadLocal` is thread-bound. |
-| IntelliJ binding dialog confirm | Mints a fresh id on the pooled worker thread for the `createBinding` call. |
+| IntelliJ push action | Mints a fresh id on the pooled worker thread, covering the push, the list-spaces call in the binding-required path, and their logs. The scope must be opened on the actual worker thread because the ambient mechanism there is thread-bound. |
+| IntelliJ binding dialog confirm | Mints a fresh id on the pooled worker thread for the binding-creation call. |
+| IntelliJ branch/summary share action | Mints a fresh id on the pooled worker thread for the share command and its follow-ups. |
+| IntelliJ create-PR action | Mints a fresh id on the pooled worker thread covering the branch push, PR lookup, and PR create/update. |
+| Long-lived IDE connection — per served request | Opens a scope for **every** request it serves, unconditionally: it adopts the requester-supplied identifier when one is present and well-formed, and mints a fresh one otherwise. So a served request is never untraced. |
 
 ### Cross-process trace propagation
 
@@ -136,6 +138,15 @@ If no ambient trace is active at spawn time, `JOLLI_TRACE_ID` is not set, and th
 **Hook → worker (via persisted queue entry):**
 
 For each queue entry the hook processes (post-commit, post-rewrite, post-merge), the ambient trace id is written into the entry's `traceId` field before the entry is persisted to disk. When the queue worker drains the entry, it opens a new inner trace scope using `op.traceId`, if present, falling back to the worker's own ambient id if the field is absent (compatibility with entries written before this feature was added). This inner scope covers the LLM call, the summary write, and all backend pushes for that specific commit — so a single commit's work is identified by the trace id that was active when the commit hook ran.
+
+**IDE → runtime (two channels, same adoption rule):**
+
+The IntelliJ plugin no longer terminates a trace by making its own outbound HTTP calls — it *forwards* the trace to the runtime that makes them. Both channels read the plugin's ambient id and pass it only when one is active:
+
+- **Long-lived connection:** the id travels as an optional `traceId` field inside the request line's parameter object, included only when non-blank. The serving side opens a scope with it around the whole action, so the runtime's log lines and its outbound requests carry the IDE's id.
+- **One-shot spawn (no connection bound, or the connection call failed over):** the id travels as `JOLLI_TRACE_ID` in the child process's environment, which the runtime's entry point adopts exactly as any other process does.
+
+Validation is split by failure kind on the connection channel: a `traceId` of the **wrong JSON type** is a malformed request and is rejected as a protocol error, while a **string that is not a well-formed identifier** is silently ignored and a fresh id is minted in its place. Nothing about a bad value can leave a served request untraced.
 
 **Worker → sibling-repo worker (trace isolation):**
 
@@ -150,11 +161,7 @@ Every outbound HTTP / HTTPS call site applies the `currentTraceHeader() ?? newTr
 | LLM proxy call (CLI) | Header added alongside auth, client-version, and tenant headers. |
 | Backend sync / Memory Bank sync call (CLI) | Header added per request inside the sync round's trace scope. |
 | CLI auth exchange | Header added to the single-request OAuth token exchange. |
-| IntelliJ Jolli API — push article | Header added per request. |
-| IntelliJ Jolli API — delete article | Header added per request. |
-| IntelliJ Jolli API — list spaces | Header added per request. |
-| IntelliJ Jolli API — create binding | Header added per request. |
-| IntelliJ Jolli API — additional endpoints | Same pattern; all request builders in the Jolli API client apply the header. |
+| Jolli API calls made on the IntelliJ plugin's behalf | The plugin attaches **no** header itself — it issues no HTTP for these calls. The runtime applies the header on the request it makes, using the identifier the plugin forwarded over either channel, or a freshly minted one when the plugin supplied none. The plugin's own header-building helper still exists but has no production caller. |
 | VS Code push service | Header added to the `fetch` call for article push. |
 
 No outbound call site omits the header. Any new call site that does not apply this pattern breaks the correlation guarantee.
@@ -200,6 +207,14 @@ No outbound call site omits the header. Any new call site that does not apply th
   ambient trace = fresh id for this action
   scope closes when dispatch completes
 
+[IDE action calls the runtime]
+  reads ambient trace id
+  long-lived connection → sends it as a request-line field when non-blank
+  one-shot spawn        → sets JOLLI_TRACE_ID in the child env when non-blank
+  runtime opens a scope for the request: adopt if well-formed, else mint fresh
+  runtime's log lines + outbound header carry that id
+  (the generation spawn sets nothing — see Notable Behavior)
+
 [outbound HTTP call]
   currentTraceHeader() read → if ambient active: traceId + fresh spanId
   if no ambient: newTraceHeader() → fresh traceId + fresh spanId
@@ -223,6 +238,10 @@ No outbound call site omits the header. Any new call site that does not apply th
 - **The IntelliJ `withTrace` must be called on the worker thread, not the EDT.** Because the Kotlin ambient mechanism is a `ThreadLocal`, code that opens a scope on the Event Dispatch Thread and then dispatches work to a pooled thread will not propagate the id. The IntelliJ push and binding operations call `withTrace` inside the `executeOnPooledThread` lambda, not before it.
 
 - **The IntelliJ Kotlin implementation does not support `runWithoutTrace`.** The sibling-repo trace isolation pattern (clearing the ambient before an unrelated launch) is not present in the Kotlin surface because the IntelliJ plugin does not launch cross-repo workers.
+
+- **The IDE forwards a trace instead of terminating one.** Since the plugin's Jolli API calls became runtime-issued, the plugin's role changed from "attach the header" to "hand the identifier across the process boundary". The correlation guarantee is unchanged, but *where* the header is stamped moved, and the plugin's own header helper is now unreachable from production code.
+
+- **Real gap: the generation spawn forwards no identifier.** The bridged one-shot spawn is the **only** child-process launch from the IDE that sets `JOLLI_TRACE_ID`. The spawn used for model-backed work (generation) does not, even when an ambient id is active in the IDE — and neither do the plugin's other one-shot launches (enable, disable, memory-bank migration, the queue worker). A generation child therefore mints a fresh, runtime-only identifier, so the model call's logs and its outbound requests cannot be joined to the IDE-side logs of the action that triggered them. The omission is inconsistent with the bridged path rather than principled: the plugin's own model client was removed in favour of that spawn, so a model-backed IDE action lost the correlation it used to have.
 
 - **Adopting the all-zero sentinel is an explicit error case.** The validity check rejects it so that accidental propagation of a zeroed-out buffer (a common memory-init pattern) does not cause the backend to log a traceable-looking but invalid and non-unique id. The backend independently rejects it; the client mirrors that rejection at adoption time.
 

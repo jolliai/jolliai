@@ -37,6 +37,8 @@ GitHub Copilot CLI is considered installed when:
 
 Either condition failing reports Copilot CLI as not installed. ENOENT is silent; other failures of `stat` are warned. A non-supporting runtime emits an informational log line that explains why Copilot CLI is reported absent.
 
+This predicate governs discovery, the status tree, and this spec's "not installed" reporting only. MCP registration asks a **distinct, presence-only** question about Copilot CLI — the same session-store-file check without the runtime gate — so Copilot CLI can be reported "not installed" here in the same run in which it is registered as an MCP host. See spec 149.
+
 ### Storage location
 
 The session-store lives under the user's home in a Copilot-specific directory: `<home>/.copilot/session-store.db`. The store uses write-ahead-logging mode; the runtime-built-in embedded-database module reads it correctly because it is statically linked against the same SQLite version that produced the store.

@@ -19,7 +19,7 @@ The first-time provider setup wizard *is* owned here, and the guided front door 
 
 The command writes a free-form, multi-line, human-readable report to stdout. It is not designed to be machine-parsed; the `--json` flag belongs to `jolli status`, not `jolli enable`. Errors **and warnings** are written to stderr, on both the success and the failure branch.
 
-The credential setup section, when run interactively, **may** present a numbered menu of three choices and read a single line from stdin — but on a fresh configuration where a usable local agent CLI is detected the provider is auto-selected and no menu is printed at all (see the sequence below). Menus, headers, and confirmations are written to stdout; the prompt lines themselves are written to **stderr**.
+The credential setup section, when run interactively, **may** present a numbered menu of four choices and read a single line from stdin — and one of those choices leads to a second numbered menu (the local-agent tool picker). On a fresh configuration where a usable local agent CLI is detected the provider is auto-selected and no menu is printed at all (see the sequence below). Menus, headers, and confirmations are written to stdout; the prompt lines themselves are written to **stderr**.
 
 ## Behavior
 
@@ -48,7 +48,7 @@ If the command detects it is running inside a Jolli-spawned local-agent child pr
    - the git post-merge hook path,
    - the git pre-push hook path,
    - the Claude Code hook settings path,
-   - the Gemini CLI hook settings path (only printed if Gemini was detected and a hook was written).
+   - the Gemini hook settings path, printed as `- Gemini hook (<path>)` (only printed if Gemini was detected and a hook was written).
 
    Any warnings produced during installation are printed afterward, each on its own line, prefixed with `Warning:`, and written to **stderr** rather than stdout. This warnings block prints on the success branch in **both** modes — after the hook list (or after the single integrations line) and before the closing report below.
 
@@ -80,13 +80,13 @@ If the command detects it is running inside a Jolli-spawned local-agent child pr
 
 3. **Interactive credential phase** runs only if stdin is a TTY and `--yes` was not passed. It has three ordered parts — the setup wizard, the generation repair ladder, and the sign-in nudge — and the first two are mutually exclusive by design.
 
-   **3a. Wizard-suppression gate.** Before any prompt is shown, the command reads the global config and auth token and evaluates two facts: whether *any* credential exists (an OAuth token, a Jolli API key, an Anthropic config key, the `ANTHROPIC_API_KEY` environment variable, or an explicit local-agent provider choice), and whether generation can actually run right now (the shared predicate of spec 291, which for the local-agent provider **probes** the agent CLI rather than trusting the provider setting). The setup wizard is **skipped exactly when a credential exists but generation is broken** — that state goes straight to the repair ladder, so the user sees **one** menu (the fix), not two. Every other state runs the wizard, including an already-working configuration (which is how a user adds a second key).
+   **3a. Wizard-suppression gate.** Before any prompt is shown, the command reads the global config and auth token and evaluates two facts: whether *any* credential exists (an OAuth token, a Jolli API key, an Anthropic config key, the `ANTHROPIC_API_KEY` environment variable, or an explicit local-agent provider choice), and whether generation can actually run right now (the shared predicate of spec 291, which for the local-agent provider **probes** an agent CLI rather than trusting the provider setting — specifically the *default* tool's, whichever tool is configured). The setup wizard is **skipped exactly when a credential exists but generation is broken** — that state goes straight to the repair ladder, so the user sees **one** menu (the fix), not two. Every other state runs the wizard, including an already-working configuration (which is how a user adds a second key).
 
    **3b. Setup wizard.** If a Jolli API key is already stored in the global config, the wizard prints `Jolli API Key:     configured ✓` and skips directly to the Anthropic-key step (step 4) — this is the wizard's **only** path to that step.
 
    Otherwise, the wizard first checks whether the configuration is **fresh**: no stored Anthropic key, no `ANTHROPIC_API_KEY` in the environment, and no provider setting at all. (An OAuth token does **not** disqualify a configuration from being fresh.)
 
-   - **Fresh-configuration local-agent probe.** Only on a fresh configuration, the wizard probes whether a usable local agent CLI is present. If it is, the provider is auto-selected — the local-agent provider and its agent-tool identity are persisted — and the wizard **prints no menu and returns**, having printed:
+   - **Fresh-configuration local-agent probe.** Only on a fresh configuration, the wizard probes for **one specific** agent tool — the default one, Claude Code — and no other. It is not a "which agent CLI is installed?" sweep: a machine with Codex, Cursor, or OpenCode installed but no Claude Code fails this probe and falls through to the menu. If the probe succeeds, the provider is auto-selected — the local-agent provider is persisted, **pinned to that one tool** — the interactive tool picker is bypassed entirely, and the wizard **prints no menu and returns**, having printed:
 
      ```
      ✓ Detected Claude Code — using your subscription to generate summaries (claude -p), no API key.
@@ -96,26 +96,58 @@ If the command detects it is running inside a Jolli-spawned local-agent child pr
 
      followed by `Configuration saved to <absolute config path>`. This is the zero-friction default: no key, no sign-in, no question asked. The probe is deliberately restricted to a fresh configuration so an existing key or a deliberate provider choice is never second-guessed and an already-configured re-run never pays for the subprocess probe.
 
-   - **Provider menu.** Otherwise the wizard prints a three-option numbered menu under one of **two headers**, chosen by whether the fresh-configuration probe just ran and failed:
+   - **Provider menu.** Otherwise the wizard prints a **four**-option numbered menu under a **single, unconditional** header:
 
-     - probe ran and found nothing → `No local agent CLI found. How would you like to generate summaries?`
-     - configuration was not fresh, so no probe ran → `How would you like to generate summaries?`
+     ```
+     How would you like to generate summaries?
+     ```
 
      ```
      1. Sign up / Sign in to Jolli (browser login)   [recommended]
      2. Enter Anthropic API key (sk-ant-...)
-     3. Skip for now (configure later)
+     3. Use a local agent CLI — no API key needed
+     4. Skip for now (configure later)
      ```
+
+     **There is no longer a second header.** The alternate header that used to print when the fresh-configuration probe ran and came back empty is gone: a failed probe no longer means "no local agent is available", because the menu now offers a local agent CLI unconditionally and its picker lists all four tools — so a "no local agent CLI found" claim would be actively wrong for a user who has one of the other three.
 
      The prompt is `Choice [1]:` and the default (empty input) is `1`.
 
-     **Every choice is terminal — there is no fall-through to a further prompt**, and unrecognized input is **not** treated as skip:
+     **Every choice is terminal — there is no fall-through to a further prompt** (option `3` leads to its own sub-menu and still returns from there), and unrecognized input is **not** treated as skip:
 
      - `2` — prompts for an Anthropic API key. A supplied key is saved without validation, the provider is pinned to Anthropic, and `Anthropic API Key: saved ✓` plus the config path are printed. Empty input prints **nothing at all** — no "skipped" line.
-     - `3` — prints `Skipped. Configure later with 'jolli auth login' or 'jolli configure'.` and the absolute config path.
+     - `3` — runs the local-agent tool picker below.
+     - `4` — prints `Skipped. Configure later with 'jolli auth login' or 'jolli configure'.` and the absolute config path. Skipping now requires typing exactly `4`.
      - **Anything else, including `1`, an empty line, and any typo** — opens the browser-based OAuth flow against the configured Jolli site. On success it prints `Authenticated successfully ✓` and, if the callback also saved a Jolli API key, `Jolli API Key:     saved ✓`. On failure it prints `Login failed: <message>` to stderr plus a retry hint pointing at `jolli auth login`, and the phase continues (a failed login is not fatal).
 
      **Manual entry of a Jolli API key is no longer offered by this command.** A user who holds one sets it with `jolli configure`.
+
+   - **Local-agent tool picker (option `3`).** A second numbered menu under its own header:
+
+     ```
+     Which local agent CLI would you like to use?
+     ```
+
+     The options are the four supported agent tools' display names, numbered from `1`, in a fixed order — drawn from the same source that supplies the accepted values of the agent-tool configuration key (spec 62), so the offered list and the settable values cannot drift:
+
+     ```
+     1. Claude Code
+     2. Codex
+     3. Cursor
+     4. OpenCode
+     ```
+
+     The prompt is `Choice [1]:` and the default (empty input) is `1` — the first tool. Input is read as a **number** (leniently: a leading numeric prefix is accepted and the rest ignored) and **clamped to the first entry**: an out-of-range number (`0`, `5` and above, a negative) and any input with no leading number at all all select the first tool. There is no "invalid choice" message and no re-prompt.
+
+     The chosen tool is persisted together with the local-agent provider, and the wizard prints three lines followed by the configuration path:
+
+     ```
+     AI provider:       Local Agent (<tool display name>) ✓
+     No API key needed — summaries run through your local <tool display name> login.
+     Run 'jolli doctor' to verify the tool is installed and signed in.
+     ```
+
+     followed by `Configuration saved to <absolute config path>`. This choice is **terminal**: the picker does not fall through to the Anthropic-key step, and no probe of the chosen tool's executable happens here — verification is deferred to `jolli doctor` (spec 59).
 
    **3c. Generation repair ladder.** After the wizard (or in place of it, per the suppression gate), the config and token are re-read and the predicate re-evaluated. If generation still cannot run **and** some credential exists, the shared repair ladder of **spec 291** runs — one prompt round-trip offering a provider crossover, a key entry, or a retry of the local agent probe, depending on which mismatch applies. The ladder's own return value is discarded; this command re-reads the config and re-derives the answer afterward. A fresh user who just chose "Skip for now" has no credential and is deliberately not offered the ladder.
 
@@ -158,13 +190,15 @@ Exit code `0` is therefore returned even when the user finishes with no provider
 
 ## Notable Behavior
 
-- **Idempotent for hooks, but not silent for credentials**: re-running `jolli enable` on an already-enabled project re-installs the same hooks (the installer treats existing hooks as upgrades, not errors) and re-prints the full success report. Re-running on a project that already has a Jolli API key short-circuits the provider menu and only re-checks the Anthropic key. But re-running on **any other already-configured project — including a perfectly working local-agent or Anthropic-key user — shows the provider menu again**, because the fresh-configuration probe only runs on a truly fresh config: such a user is not fresh, so no probe runs, the generic header prints, and the default answer is browser login. The menu is not suppressed by "already configured"; it is suppressed only by a stored Jolli key, or by the ladder-eligibility gate when generation is broken.
-- **A fresh configuration with a working local agent CLI is configured without asking anything.** The zero-friction default selects the local-agent provider on the strength of a real probe and prints a confirmation instead of a question. This is the only path where `jolli enable` changes the provider without a user choice, and it is confined to a truly fresh configuration.
+- **Idempotent for hooks, but not silent for credentials**: re-running `jolli enable` on an already-enabled project re-installs the same hooks (the installer treats existing hooks as upgrades, not errors) and re-prints the full success report. Re-running on a project that already has a Jolli API key short-circuits the provider menu and only re-checks the Anthropic key. But re-running on **any other already-configured project — including a perfectly working local-agent or Anthropic-key user — shows the provider menu again**, because the fresh-configuration probe only runs on a truly fresh config: such a user is not fresh, so no probe runs, the menu prints, and the default answer is browser login. The menu is not suppressed by "already configured"; it is suppressed only by a stored Jolli key, or by the ladder-eligibility gate when generation is broken.
+- **A fresh configuration with a working default agent CLI is configured without asking anything.** The zero-friction default selects the local-agent provider on the strength of a real probe of **one** tool (Claude Code) and prints a confirmation instead of a question. This is the only path where `jolli enable` changes the provider without a user choice, and it is confined to a truly fresh configuration. A fresh machine that has one of the other three agent tools but not Claude Code gets the menu, not the auto-select.
 - **The setup wizard and the repair ladder are mutually exclusive, by design.** A user who has a credential but broken generation is shown exactly one menu — the repair (spec 291) — never the provider menu followed by the repair menu.
 - **Credentials are stored globally, not per-project.** The interactive phase always reads from and writes to the global configuration directory regardless of the `--cwd` value.
 - **Browser-login failure is non-fatal.** A failed OAuth attempt does not abort the phase and does not change the exit code.
-- **The default answer to the provider menu is `1`, and every unrecognized answer is also treated as `1`.** Pressing Enter, or typing anything the menu does not list, launches the browser login flow. Skipping requires typing exactly `3`; entering an Anthropic key requires typing exactly `2`. There is no "invalid choice" message.
-- **The "no local agent CLI found" header is not a general "no local agent" signal.** It prints only when the fresh-configuration probe actually ran and came back empty. A user who already has a provider set and a broken agent CLI gets the *generic* header — their broken agent is handled by the repair ladder (spec 291), not by this menu.
+- **The default answer to the provider menu is `1`, and every unrecognized answer is also treated as `1`.** Pressing Enter, or typing anything the menu does not list, launches the browser login flow. Skipping requires typing exactly `4`; the local-agent picker requires exactly `3`; entering an Anthropic key requires exactly `2`. There is no "invalid choice" message.
+- **The provider menu has exactly one header now.** The old alternate header (`No local agent CLI found. …`) no longer exists in any state, because the menu itself offers a local agent CLI unconditionally — the fresh-configuration probe's outcome changes nothing about what is printed, only whether the menu is reached at all.
+- **Picking a non-default agent tool is immediately followed by a repair prompt naming the default one.** The picker persists the chosen tool without probing it, and the interactive phase then re-evaluates the "can generate right now" predicate — which, for the local-agent provider, probes **only the default tool's executable** regardless of which tool was just pinned (spec 291). Because an explicit local-agent provider choice satisfies "a credential exists", the ladder is eligible, so a user who picks Codex, Cursor, or OpenCode on a machine without Claude Code installed is told, seconds later, that no usable default agent was found — naming a tool they deliberately did not choose. The remedies the ladder then offers (retry the probe, switch provider, enter a key) do not include "use the tool I picked". (Surprising; a real mismatch, not a wording problem.)
+- **`jolli enable` clears the durable opt-out but performs no discovery catch-up.** A successful full enable wipes the repo-wide manual-disable marker, but nothing re-reads the transcript backlog that accumulated while the repository was opted out. A repository re-enabled from the command line therefore keeps its frozen-window backlog: still-active sessions recover on their next turn, while quiet sessions lose whatever was authored during the window once they age out of the session registry. This is an asymmetry with the desktop editor's enable, which does run the catch-up drain — see spec 305, which owns both the drain and this omission.
 - **Prompts go to stderr, menus to stdout.** Every prompt line the interactive phase reads is written to standard error while the menus, headers, and confirmations go to standard output — so redirecting stdout still shows the questions.
 - **Interactivity is decided on stdin alone.** This command consults only whether standard input is a TTY; a piped or redirected stdout does not suppress the interactive phase.
 - **`--integrations-only` skips all git and agent hooks** and runs only the integration steps (MCP registration, skill files, dispatch scripts / dist-paths, and the machine-global skill-preference sync). It prints the single integrations line instead of the hook-path list and omits the restart reminder — but **not** the rest of the closing report: the warnings block, the `jolli doctor` hint, and the telemetry disclosure all still print. The restart reminder is the *only* piece of output this mode suppresses. The global-instructions apply-step still runs in this mode (it is an integration, not a hook).
@@ -183,6 +217,7 @@ Exit code `0` is therefore returned even when the user finishes with no provider
 
 - The `--cwd <dir>` flag is shared with most other `jolli` sub-commands. When omitted, the project directory is auto-resolved to the enclosing git repository root.
 - All Jolli sub-commands set up the per-project log directory under `<cwd>/.jolli/jollimemory/` before doing any work; messages logged by `enable` land there in addition to whatever is printed to the terminal.
-- The provider setup wizard specified here is the same implementation the guided front door runs as its onboarding step (spec 265), so the auto-detect copy and the three-option menu are identical on both surfaces.
+- The provider setup wizard specified here is the same implementation the guided front door runs as its onboarding step (spec 265), so the auto-detect copy, the four-option provider menu, and the local-agent tool picker are identical on both surfaces.
+- The four selectable agent tools, their display names, and the executable discovery / capability probe that decides whether one is usable are owned by spec 280. The picker reads the same tool registry that `jolli configure --set localAgentTool=…` validates against (spec 62), so the offered list and the accepted values cannot diverge.
 - The "can generate right now" predicate that gates the wizard-suppression rule, the repair ladder, and the sign-in nudge is the shared predicate defined in spec 291 — including its deliberate divergence from dispatch-time credential selection (spec 10) for the local-agent provider.
 - The repair ladder and the sign-in nudge run in the same relative order here as in the guided front door (repair, then nudge), so a user meeting either surface sees the same sequence.

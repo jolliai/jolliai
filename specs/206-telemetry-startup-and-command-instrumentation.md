@@ -97,7 +97,7 @@ Every event ships only bucketed or boolean properties:
 | `settings_opened` | `tab` (e.g. `general`). |
 | `memory_bank_migrated` | `repos` (count), `outcome` (`completed`/`partial`), `entries_bucket` (bucketed migrated count). |
 | `ingest_completed` | `outcome` (terminal code), `duration_ms`, `batches`, `ingested`, `touched_slugs`, `route_calls`, `reconcile_calls`, `topic_failures` (count). |
-| `error_occurred` | `code` (the structured error/outcome code), `where` (the subsystem, e.g. `ingest`). |
+| `error_occurred` | `code` (the structured error/outcome code), `where` (the subsystem — `ingest`, `push`, or `signin`). |
 | `queue_drained` | `ops` (count of processed ops), `duration_ms`. |
 | `sync_completed` | `outcome` (the new state, or `failed`), `duration_ms`. |
 
@@ -133,6 +133,7 @@ The plugin bootstrap mints-or-reads the install identifier (firing the install e
 
 - The sign-in initiation emits `signin_started` with the originating surface as `trigger`.
 - A completed sign-in emits `signin_completed` with `api_key_minted` reflecting whether a key was returned — the conversion event. The JVM IDE refreshes the environment immediately before this so the event carries the right tenant environment.
+- **A failed sign-in on the JVM IDE surface emits `error_occurred` with `where: signin`.** The `code` preserves the callback's own classified failure code (`invalid_callback`, `failed_to_get_token`, `access_denied`, a server-supplied code, …) so the sign-in funnel keeps the specific reason instead of collapsing every rejected callback into one opaque bucket; it falls back to `server_error` only when no classification was available (the shared runtime was unreachable, timed out, or answered unreadably). A reported success whose payload carried **no token** is a distinct failure mode and gets its own code, `no_token`, rather than reusing the generic bucket. The error event is emitted **before** the UI failure callback, so it is buffered even if the caller tears the sign-in listener down synchronously. The conversion event is deliberately *not* emitted by the shared runtime for this surface — doing it in both places would double-count.
 - Logging out emits `signed_out`.
 
 ### AI-source-detected deduplication
@@ -142,6 +143,7 @@ When a transcript-processing pass encounters a session source, it fires `ai_sour
 ### Pipeline-health instrumentation
 
 - Each ingest drain run flows through one choke point that emits `ingest_completed` with the run's health metrics, and — only when the terminal outcome is a genuine failure (not the normal "ok" or "nothing pending" states) — additionally emits `error_occurred { code, where: ingest }`.
+- `error_occurred` has **three** emitters today, not one: the ingest choke point above (`where: ingest`); the JVM IDE push path, on an **unclassified** push failure only (`where: push, code: push_failed`) — the classified push outcomes (binding-required, plugin-outdated, key-rejected) are handled by their own flows and do not raise it; and the JVM IDE sign-in path (`where: signin`, see below).
 - The post-commit worker emits `queue_drained` with the processed-op count and duration when a drain finishes.
 - A sync round emits `sync_completed` with the resulting state and duration on the success path, and emits it again with `outcome: failed` on the failure path so the sync-health view sees failures, not only successes.
 

@@ -15,9 +15,12 @@ Select one of three storage configurations — version-controlled-ref-only, fold
 - Initialization of both backends in the composite and what happens when the secondary's initialization fails.
 - The dirty-flag protocol used to mark the shadow as out-of-sync after a failed shadow write, and to clear it on success.
 - The read-side fallback chain in the dual-write configuration: probes for the folder shadow's readiness and its dirty flag before serving reads from it.
+- The position of the Memory Bank write-boundary precondition in both construction paths, and the degradation it produces — but not the boundary's own conditions.
 - Delegation of optional storage-provider methods that only the folder backend implements (visible-markdown delete / regenerate, plan-and-note visible delete, branch-mapping prune, heal-missing-visible-markdown, topic-wiki render, wiki-presence probe) to the shadow when in the composite configuration.
 
 **Out of scope (boundaries):**
+- The write-boundary decision itself — the conditions under which a working directory may not claim a per-repository folder, its vocabulary of refusal reasons, and the separately-reported effective Memory Bank state derived from the same predicate (covered by "Memory Bank Write Boundary and Effective-State Reporting"). This spec states only where the precondition sits in each construction path and what each path returns on a refusal.
+- The durable repo-wide manual-disable opt-out — how it is set, cleared, and stored, and the full inventory of writes it suppresses (covered by "Manually-Disabled Zero-Write Contract"). This spec states only that the composite's batch write carries the gate and where.
 - The internal mechanics of either backend (covered by "Orphan Branch Summary Storage" and "Folder-Based Summary Storage").
 - The schema or interpretation of summary content (covered by "Summary Tree Structure").
 - The schema of canonical topic pages and the topic-wiki rebuild input (covered by "Topic Index and Page Storage" and "Wiki Markdown Rendering").
@@ -72,7 +75,10 @@ Each method is invoked using optional-call semantics: if the shadow does not imp
 1. Load the project-scoped configuration document. If loading throws, log a warning with the error message and continue with an empty configuration object.
 2. Read `storageMode` from the configuration; if absent, default to `"dual-write"`.
 3. Read `localFolder` from the configuration; if absent, leave undefined.
-4. Switch on the mode:
+4. **Consult the Memory Bank write boundary** for every mode that can reach the folder layer — that is, for every mode value other than the explicit `"orphan"`. On a refusal: log a warning naming the project path and the mode that was skipped, and return the version-controlled-ref backend **regardless of the selected mode**. The predicate, its refusal reasons, and the evaluation order are defined by "Memory Bank Write Boundary and Effective-State Reporting"; this step defines only its position (after the configuration read, before the mode switch) and its consequence.
+
+   The boundary is **skipped** for `"orphan"` because nothing in that configuration touches the folder layer, so the boundary's version-control interrogation would be pure overhead. It is **not** skipped for an unrecognised value: such a value still pays for an evaluation even though step 5 reaches the version-controlled-ref backend either way, so the only observable difference is which log line is written.
+5. Switch on the mode:
    - `"dual-write"`: construct a version-controlled-ref backend over the working directory, construct a folder-mirror backend rooted at the resolved KB path for the project (using `localFolder` as the custom parent if present), and return the composite with the version-controlled-ref backend as `primary` and the folder-mirror backend as `shadow`.
    - `"folder"`: construct and return the folder-mirror backend directly (no composite).
    - default (`"orphan"` **and any unrecognised value**): construct and return the version-controlled-ref backend directly. A typo in the configuration value silently produces the orphan-only configuration on the write side.
@@ -85,7 +91,11 @@ The folder-backend construction sub-step (used by both `"folder"` and `"dual-wri
 5. Return a folder-backend bound to the KB root and metadata manager.
 
 ### Read-side storage resolution
-A separate read-side entry point exists (used by code paths that need a read-only view of the same storage the user sees in the UI — notably the CLI's recall and compile commands and the host extension's read-side surface). It re-reads the same configuration document on every call and dispatches as follows:
+A separate read-side entry point exists (used by code paths that need a read-only view of the same storage the user sees in the UI — notably the CLI's recall and compile commands and the host extension's read-side surface). It re-reads the same configuration document on every call.
+
+Before any dispatch it applies the **identical write-boundary step** described above, in the same position and with the same guard (every mode other than the explicit `"orphan"`), logging a warning naming the working directory and the mode and returning the version-controlled-ref backend on a refusal. The read side is gated for a reason specific to it: the folder-mirror backend it would construct is rooted through the **claiming** path resolver, so an ungated *read* created the very per-repository folder it was only trying to read. Degrading costs nothing at this seam in the dual-write configuration — a folder that had only just come into existence would have failed the summary-index probe below and fallen back to the version-controlled-ref backend anyway, just after leaving the folder behind.
+
+Having passed the boundary, it dispatches as follows:
 - `"orphan"`: return a fresh version-controlled-ref backend over the working directory.
 - `"folder"`: return a fresh folder-mirror backend with `localFolder` as custom parent if present.
 - `"dual-write"`: construct the folder-mirror backend with `localFolder` as custom parent if present, then probe its readiness:
@@ -113,6 +123,7 @@ Forward unchanged to `primary.exists()`. The shadow's existence is **never** che
 2. Then await `shadow.ensure()`. If it throws, log a warning with the error message and **swallow** the error. The composite reports success regardless.
 
 ### `writeFiles(files, message)` (composite only)
+0. If the project is **manually disabled**, return immediately — before either backend is invoked (and therefore before either backend's own initialization step), and before the dirty-flag tail in step 2. Both underlying backends carry the same gate on their own batch writes, so the writes themselves would already have been no-ops; the composite needs its own gate because the tail would otherwise clear the shadow's dirty marker and record a never-performed shadow write as clean. The opt-out itself is defined by "Manually-Disabled Zero-Write Contract".
 1. Await `primary.writeFiles(files, message)`. If it throws, the error propagates to the caller and the shadow is **not** written.
 2. Then enter a try/catch around `shadow.writeFiles(files, message)`:
    - On success: optionally call `shadow.clearDirty()` (no-op if not implemented).
@@ -160,6 +171,7 @@ Triggers:
 
 - **Three modes, one configuration value.** The same `storageMode` value selects between an orphan-only configuration, a folder-only configuration, and the dual-write composite. The mode is read once per storage-create call; an in-process storage instance does not observe a mid-life mode change. Host extensions that surface the setting in their UI must reconstruct their storage instance after a settings save. (Notable.)
 - **Default mode is dual-write.** A missing or unparseable configuration document still produces the composite. The user must explicitly opt out by setting `storageMode` to `"orphan"` or `"folder"`. (Surprising.)
+- **A refused write boundary silently degrades both sides to the orphan-only configuration.** Both construction paths return the version-controlled-ref backend on a refusal, and the refusal is a **warning log, not an error** — nothing throws and no caller fails. The resulting API surface is therefore indistinguishable from a user who deliberately configured `"orphan"`, which is exactly why the effective Memory Bank state is reported separately rather than being inferable from this layer. See "Memory Bank Write Boundary and Effective-State Reporting". (Surprising; intentional, and the reason the state has its own report.)
 - **Unknown-value handling differs between write and read sides.** On the write side, any unrecognised `storageMode` value silently falls back to the orphan-only configuration (so a typo cannot half-construct the composite). On the read side, any unrecognised value falls back to the orphan-only configuration **with a warning**. In both cases a config typo splits no state — both sides reach the same backend. (Notable; intentional safety-first asymmetry.)
 - **Read-side picks the folder shadow when it's ready.** In the dual-write configuration, the read-side resolution returns the folder backend rather than the version-controlled-ref backend whenever the folder layer has been initialised (its summary-index document is present) AND is not dirty. This is so any read-side surface (recall, compile, host extension's tree view) sees the exact bytes the user can see in their KB folder. Two documented fallbacks to the version-controlled-ref backend exist: (1) fresh install with the migration not yet run; (2) folder shadow is dirty after a suppressed shadow-write failure. (Notable.)
 - **Reads always go to the primary inside the composite.** The composite's own `readFile` / `listFiles` / `exists` paths consult only the primary. The read-side resolution above picks the folder backend directly (bypassing the composite) when the conditions hold; the composite itself never serves a read from its shadow. (Notable; intentional.)
@@ -178,6 +190,8 @@ Triggers:
 - **Wiki layer lives on the shadow.** The composite's topic-wiki render entry point and wiki-presence probe both delegate to the shadow; the version-controlled-ref backend has no visible-wiki layer. (Notable.)
 
 ## Shared Behavior
+- The write-boundary predicate both construction paths consult, its refusal reasons, its evaluation order, and the effective-state record and wording derived from it are defined by **Memory Bank Write Boundary and Effective-State Reporting**.
+- The durable repo-wide manual-disable opt-out that suppresses the composite's batch write, and the full inventory of writes it suppresses, are defined by **Manually-Disabled Zero-Write Contract**.
 - The atomicity, plumbing, and ref-update semantics of the primary backend are defined by **Orphan Branch Summary Storage**.
 - The three-layer file layout (hidden machine-readable, visible per-branch, generated topic-wiki), manifest, branch-mapping registry, atomic-write semantics, dirty-flag persistence, and the topic-wiki rebuild contract of the shadow backend are defined by **Folder-Based Summary Storage**.
 - The schema of the content carried by both backends is defined by **Summary Tree Structure**.

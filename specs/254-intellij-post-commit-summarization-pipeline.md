@@ -41,6 +41,8 @@ The following behaviors this topic used to describe are **no longer present** on
 - Native plan / note / reference archival, the lightweight plan-progress model call, the store-then-finalize ordering, and the updated-at / already-committed re-upsert guards.
 - The native discard pass and its per-kind backing-file treatment (external plan file untouched, snippet file deleted, reference markdown deleted).
 
+The source behind those behaviors outlived the behaviors themselves for a while — the pipeline had no live entry point, but its parts were still compiled on this surface. That gap is now closed: the multi-topic summary generator, the context-relevance ranker, the plan and note prompt-block formatters, the direct model-vendor client, and the credential-source selector that dispatched between the direct and proxy legs have all been **deleted outright**, along with the commit-message, squash-message and squash-consolidation generators that shared them. A build gate now scans this surface's production sources for a direct model-vendor endpoint (and for the runtime's built-in HTTP transport that stack was built on) and fails the build outside a short allowlist of the remaining non-model network traffic, so the pipeline's model call cannot be reintroduced here. The surface has gone from "no live pipeline" to "no pipeline source".
+
 ## State Transitions
 
 None. This topic has no live surface. The conversation and working-item lifecycles it used to describe are now the command-line pipeline's.
@@ -55,5 +57,6 @@ None. This topic has no live surface. The conversation and working-item lifecycl
 
 - **IntelliJ Git-Operation Queue (248, retired)** — the queue that used to dispatch this pipeline; also removed.
 - **The surviving per-commit pipeline** — session discovery, transcript attribution by cutoff, structured-summary generation, plan and note archival on commit, and conversation token attribution are owned by their CLI-side specs; the IDE surface now consumes their output only.
+- **IntelliJ Native LLM Seam (217, retired)** — the in-process model seam this pipeline's generator called, deleted in the same sweep; it owns the record of the deleted seam, the generators, and the build gate.
 - **IntelliJ Delegated Hook Installation (128)** — owns the install step whose delegated hooks route IDE commits into the surviving pipeline.
 - **Downstream consumers.** The commits panel (123), the embedded summary viewer's token/cost banner (120), and the branch-level Create-PR banner (251) read and tree-aggregate the conversation-usage fields written by the **command-line** per-commit pipeline; none of them recompute usage themselves.

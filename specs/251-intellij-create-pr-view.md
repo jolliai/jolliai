@@ -13,6 +13,8 @@ A dedicated, branch-level "Create PR" editor tab in the JVM IDE that aggregates 
 - The branch token/cost banner rendered under the heading.
 - The editor-tab plumbing: a virtual file whose identity is the branch name, so re-triggering on the same branch reuses the open tab instead of stacking; a hide-default-editor policy; a read-only virtual file.
 - The embedded webview and its base64 message tunnel (both directions), inbound and outbound message vocabularies.
+- The theming inputs and their disagreement: the pre-load shell colour taken from the IDE's live editor background, the light/dark palette taken from the widget theme's brightness flag, and the page's own hard-coded per-theme background.
+- The fact that this view constructs and destroys its own embedded-browser instance rather than borrowing a pooled one.
 - The submit flow: push the branch, then find-or-create-or-update the PR, then share the included memories (when signed in), then rebuild and re-render so the view flips into update mode.
 - The binding-required resolution handled inline via the binding-chooser dialog, resolved at most once per submit even across multiple shared memories.
 - Cross-panel synchronization via a memory-state publish/subscribe channel so the commits list, any open memory summary, and this view converge on one source of truth after any of them creates a PR or shares a memory.
@@ -116,6 +118,12 @@ External `http`/`https` link clicks inside the page are intercepted at the host 
 ### Editor-tab identity
 
 The view is hosted by a virtual file whose equality and hash are **the branch name alone**. Re-triggering "Create PR" on the same branch therefore reopens the same tab rather than stacking a new one; a different branch opens a distinct tab. The tab is read-only, titled for the branch, and uses a hide-default-editor policy so no fallback text editor competes with it.
+
+### Theming and the first load
+
+**Before the first content load**, the IDE's live editor background colour is read and applied to both the hosting component and the embedded browser's initial blank page. The browser keeps the blank page painted until the real page commits its first frame, so this is what stops the initial blank-to-content navigation from flashing white. It applies to the *first* load only; a re-render replaces content with content, where the previous page stays painted and there is no blank page to cover.
+
+**Theming divergence worth recording.** The pre-load colour above comes from the **editor colour scheme**, while the light/dark palette baked into the page comes from the **widget theme's brightness flag** — two independent settings that can disagree. The memory-summary view (spec 120) derives both from one colour precisely so they cannot; this view was given the pre-load background treatment without that second half. This view's page background is also not the editor colour at all: its stylesheet is declared independently of the memory-summary view's and carries a hard-coded background per theme, so the pre-load shell colour and the page's own background differ whenever the editor scheme's background is not that hard-coded value.
 
 ### Rendering
 
@@ -241,6 +249,9 @@ If the embedded webview cannot be instantiated in this environment, the view deg
 - **open-diff opens a file, not a diff.** The inbound message is named for a diff but the handler opens the working-tree file in the editor. The path is validated to be repo-relative (no leading separator, no parent-traversal segment) before opening. (Naming quirk; reality is a file open.)
 - **The dirty-edit guard trades staleness for safety.** A cross-panel refresh that arrives while the user is typing is dropped rather than reloading and losing the edits; the view re-syncs on the next reload. Losing in-progress typing is treated as the worse failure. (Surprising; intentional.)
 - **The VS Code branch-classification blocking rules are not consumed here.** That surface can block PR creation on branch classification; this view has no such guard and always builds from the branch's committed-memory set. (Divergence; intentional.)
+- **The pre-content blank page is theme-coloured, which is what removes the white flash on open.** The embedded browser keeps the previous document painted until the new one commits a frame, so colouring the blank page (and the hosting component) covers the whole parse-and-first-paint window of the first load. A re-render is content-to-content and needs no such cover. (Notable.)
+- **Three theming inputs, only two of which agree by construction.** The pre-load shell colour is the live editor background; the light/dark palette is the widget theme's brightness flag; the page's own background is a hard-coded per-theme value in this view's independently-declared stylesheet. So the shell and the page can be different shades, and the palette can be chosen for the opposite brightness from the shell. The memory-summary view (spec 120) collapses all three onto one colour; this view does not. (Divergence; not yet closed here.)
+- **This view is not pooled.** It constructs its own embedded browser instance and destroys it on disposal, unlike the memory-summary tab which borrows one from the project-scoped pool and hands it back. It is consequently not counted against that pool's capacity (spec 302). (Notable.)
 - **Update preserves user text outside the markers.** An update merges the freshly built body only into the marker region, so hand-authored prose the user added outside the markers survives; a create wraps the whole body in fresh markers. (Notable.)
 
 ## Shared Behavior

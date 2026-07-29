@@ -11,7 +11,7 @@ The watcher-driven gate that decides whether a newly-appearing plan markdown fil
 - The attribution check: search the current workspace's recent agent transcripts for the plan path, in the JSON-escaped form Claude Code records under `"file_path"` in tool-use entries.
 - The two-way outcome: register-into-this-workspace or silently ignore (sibling-window's plan).
 - Why it matters: the plans directory is global across all editor windows; without the check, every plan would appear in every workspace.
-- Edit-count tracking: once a plan is registered, subsequent change events on the same file refresh the per-workspace registry view; the registration step is a no-op for already-registered plans (preserving any user-set "ignore" flag).
+- Post-registration change tracking: once a plan is registered, subsequent change events on the same file only refresh the per-workspace registry view; the registration step is a no-op for already-registered plans.
 - Serialization: file-create bursts must not interleave registry reads/writes, so the registration calls are queued behind one another per editor window.
 - The auxiliary path: a plan can also be registered from outside the watcher (e.g. by the agent's stop-hook scanning transcripts at turn end) — the watcher path is only one of two routes and must agree with that path's attribution semantics.
 
@@ -19,7 +19,7 @@ The watcher-driven gate that decides whether a newly-appearing plan markdown fil
 - The plan markdown's own format / content. This spec is purely about which workspace claims a plan, not what is inside it.
 - The agent stop-hook's incremental transcript scan that writes the registry from the CLI side. This spec only covers the watcher-driven registration that runs in the editor.
 - Archive guards (the snapshot-on-commit hash that hides committed plans whose source file is unchanged). Covered in the plan-and-note archive guards spec.
-- The sidebar's render rules that decide which registered plans actually display (branch filtering, ignored entries, missing source files). Covered in the plan-and-note archive guards spec.
+- The sidebar's render rules that decide which registered plans actually display (archive guards, missing source files). Covered in the plan-and-note archive guards spec.
 - Note attribution. Notes are not discovered from the global plans directory.
 - The note editor flow that creates new note files inside the workspace.
 
@@ -69,15 +69,13 @@ The registration step writes a registry entry keyed by the plan's slug (its file
 | sourcePath | absolute path to the plan file in the global plans directory |
 | addedAt | now (ISO 8601), or preserved from any previous entry |
 | updatedAt | now |
-| branch | current git branch of the workspace |
 | commitHash | null (uncommitted) |
-| editCount | preserved from any previous entry, else 0 |
 
 If the slug is already in the workspace's registry, registration is a strict no-op — even if the previous entry was marked ignored. This preserves the user's explicit "I don't want to see this plan" state across re-creates of the same filename.
 
-### Edit-count tracking after registration
+### Change tracking after registration
 
-The watcher also subscribes to file-change events for `*.md` in the global plans directory. Change and delete events trigger a debounced refresh of the panel from the registry; they do not register-or-attribute. Edit counts are maintained by the agent stop-hook (which has access to per-turn transcripts) — the watcher is purely a "did the registry need re-read" trigger for the panel.
+The watcher also subscribes to file-change and file-delete events for `*.md` in the global plans directory. Those events trigger a debounced refresh of the panel from the registry; they do not register-or-attribute. Neither this path nor any other writer on this surface keeps a per-plan edit tally — the watcher is purely a "did the registry need re-read" trigger for the panel, and any edit-count value found on a row is purged when the registry is read.
 
 ## Behavior
 
@@ -107,7 +105,7 @@ The watcher also subscribes to file-change events for `*.md` in the global plans
 
 | Registry state for slug | Trigger | New state |
 | --- | --- | --- |
-| Not present | Create event + matched transcript | Fresh uncommitted entry (commitHash=null, editCount=0) |
+| Not present | Create event + matched transcript | Fresh uncommitted entry (commitHash=null) |
 | Not present | Create event + no transcript match | Not present (no-op) |
 | Present (any state, including ignored) | Create event + matched transcript | Unchanged — registration is a strict no-op |
 | Present (any state) | Create event + no transcript match | Unchanged — no-op |

@@ -36,7 +36,7 @@ One record per root commit summary. Fields:
 
 - **commit hash** (required, string): the commit hash this entry describes. Joins to the corresponding index entry. Globally unique within the catalog.
 - **recap** (optional, string): a one-paragraph narrative summarizing the commit. Omitted when absent.
-- **ticket identifier** (optional, string): a ticket or issue reference sourced from the summary payload. The catalog is the authoritative holder of this field; the index does not carry it. Omitted when absent.
+- **ticket identifier** (optional, string): a ticket or issue reference sourced from the summary payload. The catalog is the authoritative holder of this field; the index does not carry it. Omitted when absent. **Copied verbatim, with no validation:** the projection takes whatever the payload holds, so a legacy identifier that does not conform to the whitelisted ticket shape (a plan slug, a commit hash, a placeholder phrase) is carried into the catalog unchanged and re-carried on every subsequent write-along — even though the two read surfaces that do re-validate suppress that same value.
 - **topics** (optional, list): zero or more topic records derived via the display-topic collector. Omitted when absent.
 
 ### Topic record
@@ -130,6 +130,10 @@ Topic decisions text is persisted without truncation. Applying a token budget or
 ### Ticket identifier is catalog-authoritative
 
 The ticket identifier field is present only in catalog entries, not in index entries. Surfaces that need ticket identifiers for root commits must read the catalog; copying the field into the index would require a coordinated schema migration across all three implementations of the index consumer.
+
+### The authoritative holder of the ticket identifier is not a validated one
+
+An asymmetry worth stating plainly: the catalog is where the ticket identifier lives for root commits, yet the catalog projection applies **no** shape validation to it, while the whitelist that guards that field at read time is applied at two entirely different surfaces (a panel title, and the per-commit hit projection behind the recall payload). Consequently a non-conforming legacy identifier is invisible at those two guarded surfaces yet permanently present — and re-persisted on every write-along — in the very file that is treated as authoritative for the field. Neither guarded surface writes back, so nothing ever repairs the catalog copy. The whitelist itself is owned by **Multi-Topic Commit Summary Generation**.
 
 ### Stale-coherent degradation under lock contention
 

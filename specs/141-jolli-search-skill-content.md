@@ -14,17 +14,18 @@ The instruction document of the search skill describes a single-phase invocation
 
 ### Skill name
 
-`jolli-search`. This value is used as the skill directory name and appears in the frontmatter `name` field. The same byte-identical document is written into both a Claude-Code-specific skills directory and a cross-platform agent-skills directory (see spec 48).
+`jolli-search`. This value is used as the skill directory name and appears in the frontmatter `name` field. The document is written into the single cross-platform agent-skills directory (see spec 48); the Claude-Code slot is the Claude Code plugin's territory and receives no unnamespaced copy.
 
 ### Frontmatter values
 
-The frontmatter is spec-compliant only — `name`, `description`, and a nested `metadata` block (version string and vendor string). It carries no Claude-private fields.
+The frontmatter is spec-compliant only — `name`, `description`, and a nested `metadata` block (version string, content-revision integer, and vendor string). It carries no Claude-private fields.
 
 | Field | Value |
 |---|---|
 | `name` | `jolli-search` |
 | `description` | `Search structured commit memories across all branches — decisions, topics, files. Use when the user wants to find prior decisions, related commits, or how a topic was handled before.` |
 | `metadata.version` | set to the bundled version at write time (spec 48) |
+| `metadata.revision` | `2` |
 | `metadata.vendor` | `jolli.ai` |
 
 ### Body structure
@@ -38,7 +39,7 @@ The body immediately follows the frontmatter closing delimiter and contains:
 5. **Step 2: Get hits** — a preferred in-process-tool invocation and a shell here-doc fallback, plus failure handling.
 6. **Step 3: Render** — inline hit-field documentation followed by the seven universal rendering principles and empty-result handling.
 
-The body's exact wording (including the inline field descriptions) is part of the on-disk contract. Editing body text without bumping the package version will not trigger a rewrite of already-installed documents.
+The body's exact wording (including the inline field descriptions) is part of the on-disk contract. The **sole** rewrite trigger is the `metadata.revision` integer, not the bundled release version: editing the body without raising that integer ships nothing to any existing install, and the repository guards against that omission at build time (spec 48).
 
 ### Query parsing (Step 1)
 
@@ -46,11 +47,20 @@ The host LLM extracts a natural-language query (any human language) and an optio
 
 ### Preferred in-process-tool path (Step 2)
 
-When an in-process search tool is available, the skill instructs the host LLM to call it with a query and an optional limit, receiving a `{ hits }` object whose entries are relevance-ranked. The skill notes the ranking is relevance-based (BM25).
+When the in-process search tool from the memory server is available, the skill instructs the host LLM to call it with a query and an optional limit, receiving a `{ hits }` object whose entries are relevance-ranked. The skill notes the ranking is relevance-based (BM25).
+
+The document is explicit that the tool must be matched **by what it does, not by one host's spelling of its name**, and it names both forms it expects to encounter:
+
+- On Claude Code the tool is surfaced under a **prefixed** name, `mcp__jollimemory__search`.
+- On Codex the same tool is surfaced as a **bare** `search` **inside** the `mcp__jollimemory` namespace, and that host loads MCP tools **lazily** — so an empty first look is explicitly **not** proof the tool is absent.
 
 ### Shell here-doc fallback path (Step 2)
 
-When no in-process tool is available, the skill instructs the host LLM to invoke the dispatch entry point through a POSIX bash here-doc with **standard-input argument passing**, not argv interpolation:
+The fallback gate is deliberately strict: it is **not** "no such tool is available", but **only** when the memory server is not registered at all — *not* merely because one spelling of the tool name is missing from the visible tool list.
+
+The document additionally gives a **performance** reason to prefer the tool path: in a sandboxed agent the shell path cannot write its search-index cache, so it rebuilds the whole index on **every** call.
+
+When the stricter fallback condition does hold, the skill instructs the host LLM to invoke the dispatch entry point through a POSIX bash here-doc with **standard-input argument passing**, not argv interpolation:
 
 - The search subcommand is invoked with a standard-input flag and a structured-output flag.
 - The query is fed on standard input between a here-doc delimiter whose token the LLM **generates freshly per invocation** as a random 16-character hex string; the single-quoted delimiter form suppresses every shell metacharacter, and the per-invocation high-entropy delimiter defeats pre-computed prompt-injection payloads. The LLM is told to regenerate the delimiter if the query contains the closing line.
@@ -90,7 +100,7 @@ Extract the natural-language query and the optional limit. Do not attempt to pas
 
 ### Step 2: Get hits
 
-Prefer the in-process search tool when available, calling it with the query and optional limit. Otherwise run the shell here-doc fallback. Handle the missing-entry-point and stale-CLI conditions as described above. Both paths yield the same `{ hits }` shape; proceed to Step 3 regardless of which path was used.
+Prefer the in-process search tool, matching it by capability across both host spellings and searching the available tools before concluding it is absent. Drop to the shell here-doc fallback only when the memory server is not registered at all. Handle the missing-entry-point and stale-CLI conditions as described above. Both paths yield the same `{ hits }` shape; proceed to Step 3 regardless of which path was used.
 
 ### Step 3: Render
 
@@ -110,15 +120,17 @@ Output shape is the LLM's call — prose, compact list, timeline, per-theme sect
 
 - **Single-phase, no catalog and no hash round-trip.** The current document has no Phase 1 / Phase 2 split, no `--hashes` flag, no semantic-pick step over a catalog, and no truncation-retry-with-bigger-budget loop. It is one query in, one ranked hit list out. (Notable; a prior two-phase design has been retired.)
 - **The skill prefers an in-process tool and falls back to a shell here-doc.** Both paths return the same `{ hits }` envelope. The shell fallback uses standard-input argument passing through a single-quoted, freshly-randomized here-doc delimiter — not argv interpolation — as the shell-injection defense. (Notable; load-bearing.)
+- **Tool discovery is capability-based and host-aware; the fallback gate is server-level, not name-level.** The document names two spellings of the same tool (prefixed on Claude Code, bare inside the namespace on Codex) and warns that one host loads MCP tools lazily, so a first look that finds nothing is not evidence of absence. The fallback is therefore gated on "the memory server is not registered at all" rather than "this name is not in my tool list". (Notable; load-bearing.)
+- **Preferring the tool path is a performance rule here, not only an ergonomic one.** The document states outright that in a sandboxed agent the shell path cannot write its search-index cache and so rebuilds the entire index on every call — which makes a name-level fallback gate actively expensive, not merely redundant. (Notable; this reason is stated in the search recipe and not in the recall recipe.)
 - **Hits are lightweight by design.** Each hit carries only a title, snippet, identity fields, and an internal score — no full decisions or recap. The skill repeatedly redirects depth-seeking users to `jolli-recall`. (Notable.)
 - **The score is internal and must not be surfaced.** The skill explicitly forbids exposing the relevance score or any other machinery to the user. (Notable.)
 - **Free-form rendering with seven guardrails is intentional.** The search use case varies widely by user intent; the guardrails are the minimal set that prevents known bad outputs. (Notable.)
 - **Stale-CLI detection has no retry.** Detecting an out-of-date CLI ends the run with a guidance message rather than attempting a fallback. (Notable.)
-- **Inline field documentation is on-disk contract.** The field descriptions in Step 3 are written once at install time and reach installed documents only on a version bump. (Notable.)
+- **Inline field documentation is on-disk contract.** The field descriptions in Step 3 are written once at install time and reach an already-installed document only when the document's `metadata.revision` integer is raised — a release-version bump alone reaches nothing (spec 48). (Notable.)
 
 ## Shared Behavior
 
-- Spec 48 owns the file path(s), the frontmatter schema, the version-guard, the bundled-version sentinel, the dual write into the Claude-Code and cross-platform skills directories, and the legacy-directory cleanup. This spec owns only the content written inside that file.
+- Spec 48 owns the file path(s), the frontmatter schema, the revision-guard (including the build-time fingerprint that fails a body edit made without a revision bump), the bundled-version interpolation, the single cross-platform write target, and the legacy-directory cleanup. This spec owns only the content written inside that file.
 - The dispatch entry-point pattern is described in spec 48's Shared Behavior section and is common to all skill invocations.
 - Specs 137 and 138 own the command and pipeline behavior the skill's invocations exercise — the single-phase dispatch, the required-query guard, and the `{ hits }` shape.
 - Spec 148 owns the in-process search tool that the preferred Step-2 path calls.

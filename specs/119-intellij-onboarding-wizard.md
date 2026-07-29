@@ -10,7 +10,7 @@ A single-screen card that takes over the JolliMemory tool window whenever the us
 - The trigger condition that decides whether the onboarding card or the main accordion is visible.
 - The card's two-option layout and the textual contract of each option's title and description.
 - The two interactive paths: inline API-key entry with format validation, and an external sign-in flow.
-- The button states across each path (idle, in-flight, error) and the textual labels at each state.
+- The button states across each path and the textual labels at each state.
 - The persistence consequence of each successful path: which configuration field is written, and how the parent surface flips back to the main view.
 - The error surfacing for the sign-in path (an IDE notification banner) versus the API-key path (an inline red message under the field).
 - The fact that the card has no per-step "Next/Back" sequence — both options are visible simultaneously.
@@ -80,15 +80,13 @@ Both warnings render in red beneath the field. The keystroke field never validat
 
 ### Sign-in button states
 
-The sign-in button has three textual states:
+The sign-in button has exactly one textual state:
 
 | State        | Label                | Enabled |
 | ------------ | -------------------- | ------- |
 | Idle         | "Sign In / Sign Up"  | yes     |
-| In-flight    | "Signing in..."      | no      |
-| (After auth) | "Sign In / Sign Up"  | yes     |
 
-The state transition from in-flight back to idle is driven by the auth service's listener, not by the click handler — this is what allows the card to recover even if the sign-in flow ends in another window.
+The click handler does not disable the button and does not relabel it, so there is **no in-flight state**: the button reads "Sign In / Sign Up" and stays clickable for the whole duration of the external flow. The card still subscribes to the auth service's listener and that listener still assigns the idle label and enabled state, but since the button never leaves idle, the assignment is a no-op restatement rather than a recovery.
 
 ## Behavior
 
@@ -107,16 +105,17 @@ The inline form remains visible until the parent surface flips the view away —
 
 ### Sign-in path
 
-1. The user clicks "Sign In / Sign Up". The button becomes "Signing in..." and is disabled.
+1. The user clicks "Sign In / Sign Up". The click is fire-and-forget — the button is not disabled and not relabelled.
 2. The auth service's external sign-in flow begins. The card itself does not hold any UI for that flow — it is handed off to the auth service.
-3. On success, the auth service's listener fires. The card writes a follow-up config update:
+3. On success, the card writes a follow-up config update:
    - If `aiProvider` is currently empty or `anthropic`, it is set to `jolli`.
    - The existing `apiKey` (if any) is left untouched.
 4. The project status is asked to refresh.
-5. The auth listener also resets the button to its idle state ("Sign In / Sign Up", enabled) — this is what recovers the card if the user closes the auth window.
-6. The parent surface's own auth listener flips the view from onboarding to the main accordion.
+5. The parent surface's own auth listener flips the view from onboarding to the main accordion.
 
-If the sign-in fails, the card's onError callback is invoked. The button is reset to its idle state and an IDE-level notification banner is raised with the failure message. The card itself does not show an inline error for the sign-in path — only for the API-key path.
+If the sign-in fails, the card's onError callback is invoked and an IDE-level notification banner is raised with the failure message. Nothing about the button changes — there is no state to restore. The card itself does not show an inline error for the sign-in path — only for the API-key path.
+
+A user who closes the browser window mid-flow therefore needs no recovery: the button was never taken away from them, so they can simply click it again.
 
 ### Mid-flow exit
 
@@ -153,18 +152,15 @@ The flip from onboarding card → main accordion is owned by the parent surface,
   → parent flips view → main accordion
 
 [user clicks "Sign In / Sign Up"]
-  button → "Signing in...", disabled
-  hand off to auth service
+  hand off to auth service (button untouched — stays idle and clickable)
   → state: signing in
 
 [signing in: auth service success]
   if aiProvider is blank or "anthropic": aiProvider ← "jolli"
   refresh project status
-  button → idle (via auth listener)
   → parent flips view → main accordion
 
 [signing in: auth service error]
-  button → idle
   raise IDE notification with error message
   stay on onboarding (signed-in path)
 
@@ -180,7 +176,7 @@ The flip from onboarding card → main accordion is owned by the parent surface,
 - **The view flip is owned by the parent.** The card itself only writes config and fires a callback; whether that flips the visible card is decided by the parent re-running `isConfigured`.
 - **Either credential path is sufficient.** The user does not have to do both. After completing one, the other option's card simply disappears with the rest of the onboarding view.
 - **The sign-in path errors via IDE notification, not inline.** The API-key path errors inline in red beneath the field. This split is intentional: the API-key path's failures are about format and only meaningful inline; the sign-in path's failures often reference an external browser flow and are surfaced as a higher-level alert.
-- **The button state recovery is listener-driven.** A click handler that disables the button does not also re-enable it; that responsibility belongs to the auth-service listener so the button recovers even when the user finishes the flow in another window.
+- **The sign-in button has no in-flight state, so there is nothing to recover.** The click handler neither disables nor relabels it; the external flow runs with the button sitting enabled and reading "Sign In / Sign Up". The card's auth-service listener still assigns those exact values, but the button never left them — a closed browser window strands nothing, and a repeat click is the whole recovery path. (Surprising; intentional.)
 - **Anthropic prefix is the only client-side check on the key.** The key is not test-pinged against the LLM provider before saving — saving fails only on prefix mismatch or empty input. Wrong-but-prefixed keys are accepted here and surface as a runtime failure later, on the first LLM call.
 - **Sign-in does not overwrite an existing Anthropic API key.** If the user already has an `apiKey` saved and then signs in to the cloud, only `aiProvider` is updated. The Anthropic key remains in place.
 - **Anthropic-key save sets `aiProvider` to `anthropic`.** Even if the previous value was `jolli`, the API-key path forces the provider field to `anthropic` because the user just deliberately chose this path.

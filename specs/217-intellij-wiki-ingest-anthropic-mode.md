@@ -1,137 +1,72 @@
-# 217. IntelliJ Native LLM Seam (Wiki-Ingest Framing Retired)
+# 217. IntelliJ Native LLM Seam (Retired)
 
 ## Topic Statement
 
-This topic previously described the IDE plugin driving the knowledge-wiki ingest with only a direct provider (Anthropic) API key — rendering the route and reconcile prompts locally, calling the provider's HTTP API itself, supplying both a proxy action+params and a locally-rendered prompt from one caller, and resolving plan/note source identifiers out of the folder layer. **Every one of those claims is gone.** The IDE runs no ingest: there is no ingest pipeline, no local route/reconcile templates, no dual-supply caller, and no plan/note source reader on this surface. Wiki ingest is owned entirely by the command-line surface (spec 152), triggered from the IDE only as a delegated build (spec 216).
+This topic previously described an **in-process model seam** owned by the IDE plugin: a three-source credential selector (a configured direct-vendor key, the same key from the environment, or the product's platform key) with a provider-preference override and a fixed fallback order; a fail-loud guard when direct mode was selected without a pre-built prompt; a direct-to-vendor HTTP call with a streaming / non-streaming split, per-mode request timeouts, and two stream-rejection conditions; a model alias-to-id resolver; and a platform-proxy leg. It was reachable from exactly three read-path actions on the summary viewer, alongside several generators that already had no caller.
 
-What survives is a narrower, still-live thing: an **in-process LLM seam** — a three-source credential selector with a provider-preference override, a fail-loud direct-mode guard, and a direct-provider HTTP client with a streaming/non-streaming split — reachable from exactly **three** read-path actions on the summary viewer page.
+**None of that survives on this surface.** The whole in-process model stack was deleted: the seam, the direct-vendor client, the credential selector, the alias resolver, the proxy leg, and the already-unreachable generators (multi-topic summary, commit message, squash message, squash consolidation) together with the recap / end-to-end-test / translate prompt builders and response parsers. The three summary-viewer actions that were the seam's only live callers now spawn the command-line surface's generation subcommand instead. The plugin performs no model call of its own.
+
+An earlier framing of this same topic — the IDE driving the knowledge-wiki ingest with a direct-vendor key, rendering route and reconcile prompts locally, and resolving plan/note source identifiers — had already stopped being live behavior before this. Its **source** outlived the behavior, and is now gone too: the local route and reconcile prompt templates, the route-plan response parser, the compiled-topic-page parser, and the reconciled-page assembler were all deleted in the same sweep. Each was already unreachable — nothing outside that cluster called any of them — so removing them changed source, not behavior. The IDE runs no ingest; wiki ingest is owned by the command-line surface and triggered from the IDE only as a delegated build.
 
 ## Scope
 
 **In scope:**
-- The credential-source selection that picks between direct-provider mode and platform-proxy mode for each in-process call, including the provider-preference override and the fixed fallback order.
-- The fail-loud guard when direct mode is selected but no prompt was supplied.
-- The direct-provider HTTP call: request shape, the streaming-vs-non-streaming decision threshold, the per-mode request timeouts, and the event-stream accumulation with its two rejection conditions.
-- The model-alias resolution applied before each call.
-- The exact reachability of all of the above: three summary-viewer actions and nothing else.
+- Recording that the in-process model seam and everything it comprised — credential-source selection with its preference override and fallback order, the direct-mode prompt guard, the direct-vendor HTTP call with its streaming threshold and per-mode timeouts, streamed-event accumulation with its mid-stream-error and missing-terminal-event rejections, the model alias resolver, and the platform-proxy leg — has been removed from the plugin.
+- Recording that the generators that shared that seam (multi-topic summary, commit message, squash message, squash consolidation) and the recap / end-to-end-test / translate prompt builders and parsers were removed with it, and that all four generators were already unreachable when they were removed.
+- Recording that the ingest-era leftovers this topic's earliest framing described — the local route and reconcile prompt templates, the route-plan parser, the compiled-topic-page parser, and the reconciled-page assembler — were deleted in the same sweep, and were also already unreachable.
+- The supersession relationship: the three summary-viewer actions that used this seam — generate an end-to-end test guide, regenerate the quick recap, and translate a document to English — now spawn the command-line surface's generation subcommand and use its three corresponding actions.
+- Recording that a build gate now scans production sources on this surface and fails the build if a direct model-vendor call is reintroduced.
 
 **Out of scope (boundaries):**
-- The wiki ingest itself — batching, route-then-reconcile orchestration, per-topic concurrency, the high-water mark, processed-source marking, and the outcome codes — is the cross-surface topic-ingest-pipeline (spec 152). The IDE does not run it.
-- The IDE's wiki-build trigger, which is now a delegated call to the command-line surface — spec 216.
-- The platform-proxy request/response protocol (endpoint, auth header, origin allowlist, response envelope) — spec 9.
-- Credential precedence as a product concept — spec 10. This spec documents only this seam's concrete branch order and its narrowed reach.
-- Commit-message and squash-message generation on this surface, which no longer use this seam at all: they are delegated to the command-line surface, which resolves credentials by its own rules (including a local-agent source this seam has no concept of).
+- The generation subcommand the three actions now spawn — its invocation form, per-action request and response shapes, error envelope, and exit-code contract — spec 292.
+- Credential resolution and provider precedence as a product concept, now resolved entirely on the command-line side — spec 10.
+- The wiki ingest itself (batching, route-then-reconcile orchestration, per-topic concurrency, the high-water mark, processed-source marking, outcome codes) — spec 152. The IDE does not run it.
+- The IDE's wiki-build trigger, a delegated call to the command-line surface — spec 216.
+- The platform-proxy request/response protocol — spec 9.
 - The visible-wiki renderer — spec 158.
+- The summary viewer page that hosts the three actions — spec 120.
 
 ## Data Contracts
 
-### Credential source (selector output)
-
-One of three enumerated values, each with a stable wire string used in trace tagging:
-- **Direct provider, configured key** — the configuration's provider API key.
-- **Direct provider, environment key** — the provider-API-key environment variable.
-- **Platform proxy** — the configuration's platform API key.
-
-The selector returns null when none of the three is present; the caller turns that into a thrown error ("No LLM credentials available. Sign in to Jolli or configure an Anthropic API key.").
-
-### Provider-preference input
-
-An optional string from configuration. Three recognized states drive the order:
-- `"jolli"` — prefer proxy, then the configured direct key, then the environment direct key.
-- `"anthropic"` — prefer the configured direct key, then the environment direct key, then proxy.
-- any other value or unset — same order as `"anthropic"` (the historical "direct wins" default).
-
-In every order the first credential actually present wins; an absent preferred credential falls through to the next. This seam recognizes **no** local-agent source — a user configured for a local agent subscription and holding no keys gets the no-credentials error from these three actions.
-
-### Call inputs and result
-
-A call carries an action key, a params map (used only in proxy mode), a model alias-or-id, a max-output-tokens ceiling, and a pre-built prompt (used only in direct mode).
-
-The result carries the generated text (nullable), the resolved model id (nullable in proxy mode), input- and output-token counts, an API-latency measurement, a stop-reason string (nullable; always null in proxy mode), and the wire string of the credential source that produced it.
+There is no live data contract for this topic. The plugin defines no credential-source enumeration, no provider-preference input, no model-call input record, and no model-call result record. The credential sources, the provider preference, the model identifier, the output-token ceiling, and the resolved-model / token-count / latency / stop-reason result fields are all resolved and produced on the command-line side now, against its own contracts.
 
 ## Behavior
 
-### Selecting the credential source
+### Current reality
 
-For each call the selector computes which of the three sources are available and picks the first available in the order dictated by the provider preference. If none is available it throws.
+Each of the three summary-viewer actions serializes the inputs it holds — the stored memory's topic list, its commit message, the commit's own change, or the document text — and spawns the command-line surface's generation subcommand with the matching action name. The subcommand loads the shared configuration itself, resolves credentials and the provider by its own rules, builds the prompt, makes the call, and returns one result line. The plugin reads that line, persists the derived text onto the stored memory, and re-renders. It holds no credential ordering rule, no prompt, and no transport of its own.
 
-### Direct-mode prompt guard
+The same subcommand is what the plugin's commit-message and squash-message actions already used, so all five of the product's generation flows now run in one place.
 
-If the selected source is either direct-provider variant and the supplied prompt is null, the call throws an explicit error naming the action ("Direct-mode LLM call for action '<action>' requires a prompt, but none was supplied (no local template for this action — use proxy mode / Jolli sign-in)"). This converts what would be a null dereference into a clear failure. It exists because the retired ingest caller could route a template-only action here; all three surviving callers always build a prompt, so the guard is now a pure safety net.
+### Retired behaviors
 
-### Direct-provider HTTP call
+The following behaviors this topic used to describe are **no longer present** on this surface:
 
-1. Resolve the model alias to a concrete model id (alias map, else pass through; default alias when unset).
-2. Resolve the max-output-tokens ceiling (a default applies when unset).
-3. Decide transport: **stream** when the resolved ceiling exceeds a fixed threshold; otherwise a single non-streaming request.
-4. Issue a single POST to the provider messages endpoint with the API-key header, the API-version header, a JSON content type, and a body carrying the model, the max-tokens, a zero temperature, one user message holding the prompt, and the stream flag.
-5. **Request timeout** is mode-dependent: a generous multi-minute ceiling for streaming, a shorter fixed ceiling for non-streaming.
-6. **Non-streaming:** a non-success HTTP status is logged and thrown with the status and a truncated error body; otherwise the JSON response is parsed into the message shape.
-7. **Streaming:** a non-success status drains and joins the body lines, logs, and throws with the status and a truncated body; otherwise the event stream is accumulated (below).
-8. Compute elapsed latency, extract the first text content block (trimmed), and return the result with token counts and stop reason.
-
-### Accumulating the streamed event stream
-
-Reading the line-oriented event stream, for each line beginning with the data prefix and carrying a non-empty JSON payload (non-data lines, empty payloads, and unparseable payloads are skipped):
-
-- **error event** — extract the error type and message (defaulting when absent) and **throw** ("Anthropic stream error (<type>): <message>"). A success HTTP status only means the stream opened; the API can still emit an error mid-flight.
-- **message-stop event** — mark the terminal-stop flag seen.
-- **message-start event** — capture the message id, the model id, and the input-token count.
-- **content-block-delta event** — when the delta is a text delta, append its text.
-- **message-delta event** — capture the stop reason and the output-token count.
-
-After the stream ends: if the terminal-stop flag was never seen, log the accumulated length and **throw** ("Anthropic stream ended prematurely (no message_stop)"). Otherwise return the reconstructed message — captured id, captured model (or the request's model as fallback), the accumulated text as one text block, the captured token counts, and the captured stop reason.
-
-### Reachability
-
-This seam is reached from exactly three actions, all on the summary viewer page and all read-path (they read a stored memory and produce derived text for it):
-
-1. **Generate E2E test guide.**
-2. **Regenerate the quick recap.**
-3. **Translate a document to English.**
-
-Nothing else in the IDE calls it. The multi-topic summary generator and the commit-message generator still exist in the source tree on this surface but have **no caller** — they are unreachable.
+- Selecting a credential source in-process from three candidates, in an order dictated by a configured provider preference, and throwing a no-credentials error when none was present.
+- The fail-loud direct-mode guard that converted a missing prompt into an explicit, action-named failure instead of a null dereference.
+- The direct-to-vendor HTTP call: its request shape, its fixed zero temperature, its streaming-vs-non-streaming threshold on the output-token ceiling, and its two different request timeouts.
+- Accumulating a line-oriented event stream, and its two rejection conditions — a mid-stream error event, and a stream that ended without its terminal stop event.
+- Resolving a model alias to a concrete vendor model id before each call.
+- The platform-proxy leg of the seam, including its always-null stop reason.
+- The four generators that shared the seam (multi-topic summary, commit message, squash message, squash consolidation) and the prompt builders and response parsers behind the three viewer actions.
 
 ## State Transitions
 
-### Per call — mode resolution
-
-```
-inputs (config key?, env key?, platform key?, preference)
-   │
-   ├── none present                               → throw "No LLM credentials available"
-   ├── preference=jolli, platform present         → PROXY
-   ├── preference=anthropic/unset, config present → DIRECT(config)
-   ├── (fall-through) config present              → DIRECT(config)
-   ├── (fall-through) env present                 → DIRECT(env)
-   └── (fall-through) platform present            → PROXY
-DIRECT(*) with null prompt                        → throw "requires a prompt"
-```
-
-### Per direct streamed call — stream terminal state
-
-```
-stream opens (HTTP 200)
-   │
-   ├── error event seen         → throw "stream error (<type>)"
-   ├── message_stop seen, EOF   → return accumulated response
-   └── EOF without message_stop → throw "ended prematurely (no message_stop)"
-```
+None. This topic has no live surface. Both diagrams it used to carry — the per-call credential-mode resolution, and the streamed-call terminal state — describe code that no longer exists.
 
 ## Notable Behavior
 
-- **The wiki-ingest framing is entirely retired.** No IDE code renders route or reconcile prompts, supplies both a proxy action and a local prompt from one caller, resolves plan/note source identifiers, or drives an ingest. The local template library, the dual-supply caller, and the plan/note identifier contract this topic used to specify no longer exist on this surface.
-- **The streaming transport is code-present but not reached by any live action.** All three surviving callers request the same moderate token ceiling, which sits **below** the streaming threshold — so every live in-process call on this surface is non-streaming. The streaming client, its multi-minute timeout, and both stream-rejection conditions describe real code with no live entry point.
-- **The recap action ignores the configured provider preference.** Two of the three callers pass the preference through; the recap caller does not, so a recap regeneration always uses the default "direct wins" order even when the user has selected the platform provider. A user with both a direct key and a platform key gets proxy routing for the E2E guide and the translation, and direct routing for the recap.
-- **This seam has no local-agent branch.** The IDE's settings dialog offers a local-agent subscription provider, and the delegated commit-message and squash paths honor it. These three in-process actions do not: with only a local agent configured they fail with the no-credentials error.
-- **A success HTTP status is not a successful call.** The stream parser treats an opened stream as provisional — a mid-stream error event throws, and a stream ending without the terminal stop event throws. Partial text is never returned as success.
-- **Proxy mode returns a null stop reason**, so any max-tokens truncation guard is inert on that branch.
-- **Temperature is fixed at zero** for every direct call from this seam.
+- **The two divergences this topic recorded are resolved, not relocated.** It used to record that the recap action ignored the configured provider preference (two of the three callers forwarded it, the recap caller did not), and that the seam recognized no local-agent provider at all, so a user holding only a local-agent subscription got a no-credentials error from all three actions. Both are gone: each of the three actions now spawns the subcommand with no provider argument, the subcommand loads the shared configuration itself, and the local-agent provider is one of the sources it resolves. All three actions now behave identically with respect to the configured provider, and a local-agent user can drive all three.
+- **A build gate prevents reintroduction.** The build scans this surface's production sources for a direct model-vendor endpoint, and for the runtime's built-in HTTP transport the deleted stack was built on, and fails when a match appears outside a short allowlist of the remaining non-model network traffic. The gate is two-sided: an allowlist entry that no longer matches also fails, so the list cannot bloat past what is genuinely in use. Unlike the surface's other source gate it carries no ratcheting baseline — a hit is a defect to fix, not something to record — and it runs as part of the normal test invocation rather than as a separate pipeline step, so a second model stack cannot reappear here unnoticed.
+- **Most of what was deleted was already dead, so most of this change is source-only.** The four generators and every ingest-era leftover had no caller on this surface before removal; deleting them changed no behavior. Only the seam itself and the three viewer actions' prompt builders and parsers were live, and those were replaced in the same change rather than dropped. Read the deletion list as "the source finally caught up with the behavior", not "a capability was lost".
+- **The streaming client this topic documented never ran.** All three live callers requested the same moderate output-token ceiling, which sat below the streaming threshold, so every in-process call this surface ever made on the live path was non-streaming. The streaming transport, its longer timeout, and both stream-rejection conditions were code with no live entry point at the time they were deleted.
+- **No correlation scope survives around a model call.** The seam opened a correlation scope for each call so every log line of one model operation shared an identifier. That scope lived in the deleted code and was not re-established around the subcommand spawn — see spec 292 for the consequence on the calling side.
 
 ## Shared Behavior
 
-- The wiki ingest (batching, route/reconcile orchestration, processed-source high-water mark, outcome codes) is owned by spec 152 and runs only on the command-line surface. The IDE's trigger for it is spec 216.
-- The platform-proxy request protocol is owned by spec 9; this spec covers only the branch that selects proxy mode and what it sends.
-- The credential-priority concept and provider precedence are owned by spec 10. That spec's "JVM-surface" statements are grounded **only** through this seam and only for the three actions above; commit-message and squash-message generation on this surface resolve credentials on the command-line side instead.
-- The model-alias map and the alias-to-id resolver are shared with the (now unreachable) in-process summarizer entry points.
-- The summary viewer page that hosts the three live actions is owned by the IntelliJ summary-viewer spec (120).
+- **`jolli generate` — the generation bridge (292)** — the subcommand the three summary-viewer actions now spawn, and the owner of the request/response and error contracts they depend on. It also owns the caller-side reachability record for all five actions.
+- **Credential priority (10)** — the credential sources and their precedence, now resolved wholly on the command-line side. This spec no longer grounds any "JVM-surface" statement in that spec; the surface holds no credential ordering rule of its own.
+- **The platform-proxy request protocol (9)** — the proxy leg this seam used to hold is gone; the proxy is now reached only from the command-line side.
+- **Wiki ingest (152) and its IDE trigger (216)** — the ingest the earliest framing of this topic described. It runs only on the command-line surface, and the IDE's only involvement is the delegated build trigger.
+- **The summary viewer (120)** — the page that hosts the three actions and renders their results.
+- **IntelliJ Post-Commit Summarization Pipeline (254, retired)** — the sibling retirement; the deleted multi-topic generator was that pipeline's model call.

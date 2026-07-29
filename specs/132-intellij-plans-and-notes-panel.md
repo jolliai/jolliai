@@ -18,7 +18,7 @@ The PLANS & NOTES section of the JolliMemory tool window — a single newest-fir
 - The Delete and Backspace key bindings on the focused list, both routed to the same remove flow.
 - The remove-confirmation dialog (`Remove plan "X"?` / `Remove note "X"?`).
 - The remove semantics that differ between plans (soft delete via `ignored = true`) and notes (full registry removal plus optional source-file deletion for uncommitted snippet notes).
-- The visibility filter that hides plans/notes whose source file no longer exists, whose commit is on a different branch, whose archive guard says the file is unchanged from its committed snapshot, or whose entry is the committed-snapshot copy that exists only for storage.
+- The visibility filter that hides plans/notes whose source file no longer exists, whose archive guard says the file is unchanged from its committed snapshot, or whose entry is the committed-snapshot copy that exists only for storage.
 - The empty / disabled / initializing placeholder states.
 - The post-action refresh that runs on the project's status listener so the panel re-renders whenever a hook fires or a commit is made.
 
@@ -27,7 +27,7 @@ The PLANS & NOTES section of the JolliMemory tool window — a single newest-fir
 - The note-creation form / editor — separate spec.
 - The summary viewer that opens for a row's commit hash — this panel does not open it; only the file itself opens.
 - The plan-archival logic that promotes a live plan into a committed snapshot — separate spec.
-- The cross-branch hashing / archive-guard logic that the visibility filter consults — owned by core; this panel only calls the filter.
+- The content-hashing / archive-guard logic that the visibility filter consults — owned by core; this panel only calls the filter.
 - The actual on-disk format of plan or note files.
 
 ## Data Contracts
@@ -53,7 +53,9 @@ Each item is wrapped into a unified row carrying its title and a `lastModified` 
 | Format / count | Edit count from the plan registry (e.g. `3 edits`, `1 edit`).   | Format word: `markdown` or `snippet`.                        |
 | Icon           | "lock" when committed; otherwise "file-text" (plan icon).       | "lock" when committed; "comment" for snippet; "note" otherwise. |
 | Source path    | Plan's source path (used for open-on-double-click).             | Note's source path (used for open-on-double-click).          |
-| Branch         | Plan's branch (used in tooltip).                                | Note's branch (used in tooltip).                             |
+| Branch         | Plan's branch, when the row carries one (used in tooltip).       | Note's branch, when the row carries one (used in tooltip).    |
+
+This surface is the only one that still declares a branch on a working-area plan or note row, and the only one whose detail view has a branch line. See "Parity gap: a branch is still written here, and can never be read back" under Notable Behavior — the value never reaches the rendered row.
 
 ### Title rendering
 
@@ -70,8 +72,10 @@ Per-row HTML / multi-line tooltip:
 
 | Row type | Tooltip lines |
 | -------- | ------------- |
-| Plan     | `<slug>.md` / `Branch: <branch>` / `Updated: <updatedAt>` |
-| Note     | `<id>` / `Format: <markdown\|snippet>` / `Branch: <branch>` / `Updated: <updatedAt>` |
+| Plan     | `<slug>.md` / `Branch: <branch>` (only when the row carries a branch) / `Updated: <updatedAt>` |
+| Note     | `<id>` / `Format: <markdown\|snippet>` / `Branch: <branch>` (only when the row carries a branch) / `Updated: <updatedAt>` |
+
+Both branch lines are conditional on the row actually carrying a branch, and no row handed to this panel does — see "Parity gap: a branch is still written here, and can never be read back" under Notable Behavior.
 
 ### Trash icon zone
 
@@ -96,10 +100,11 @@ A row is included only when **all** of the following are true:
 1. `ignored` is not `true`.
 2. The entry is not a "committed-snapshot copy" of an already-committed item (committed-snapshot copies are filtered out — they exist only for storage and are not surfaced in the panel).
 3. If the entry has an "archive guard" hash recording the file's contents at commit time, the source file still differs from that recorded hash (otherwise the file is "unchanged from committed snapshot" and is hidden).
-4. If the entry is committed, its commit is reachable from `HEAD` on the current branch.
-5. If the entry is uncommitted, the source file still exists on disk.
+4. If the entry is uncommitted, the source file still exists on disk.
 
-The same five rules apply to plans and notes (each with its own source-path field and its own archive-guard mechanism).
+The same four rules apply to plans and notes (each with its own source-path field and its own archive-guard mechanism).
+
+None of the four is branch-sensitive. The filter performs no branch comparison and no commit-reachability test: a working-area plan or note is worktree-scoped and stays listed regardless of which branch is checked out, and a committed row is hidden or shown purely by its archive guard. The panel does read the current branch before filtering, but nothing in the filter consumes it.
 
 ## Behavior
 
@@ -236,7 +241,8 @@ The panel registers a status listener at construction. Every time the project st
 - **Markdown note source files are never deleted on remove.** Even when hard-deleting the registry entry — markdown notes can be user-authored documents whose loss would be data loss.
 - **Committed entries hide automatically when their file equals the archived snapshot.** The archive-guard hash is what prevents a committed plan or note from re-appearing in the panel after its content is committed; the moment the user edits it again, the hash diverges and it reappears.
 - **The committed-snapshot copies are deliberately invisible.** They exist in the registry only because storage needs them. Surfacing them would show a duplicate row for every committed plan.
-- **Cross-branch commits are filtered.** A plan or note committed on branch `feature-A` is hidden when the user is on branch `feature-B` — the entry survives in the registry, but the panel doesn't list it.
+- **Nothing here is filtered by branch.** There is no branch comparison and no commit-reachability test in the visibility filter. A plan or note committed on one branch is hidden or shown by its archive guard alone, identically on every branch; a still-pending plan or note is worktree-scoped and survives branch switches, exactly like uncommitted code. The refresh does read the current branch before filtering, but no rule consumes it.
+- **Parity gap: a branch is still written here, and can never be read back.** This is the only plugin that still declares a branch on a working-area plan or note record, the only one whose detail view has a branch line, and the only one where anything still stamps a branch onto a row — the section toolbar's add-plan and add-note actions do (those actions are out of scope here; only the field they write is relevant). The other two surfaces removed the field from their record contracts and stamp nothing. But the shared registry loader — the very loader that serves this panel its rows — **strips** any branch value it finds on read and marks the registry as changed, so the next write-back from any surface persists the cleaned shape. The net effect: a branch written here reaches disk, is discarded on the very next read, and never reaches the row the panel renders. The declaration and the render code survive; the branch line is dead for every record. (Surprising; a leftover.)
 - **No plan ever enters the registry from this surface.** Plan discovery is not performed here at all: rows appear only because another surface's transcript discovery wrote them. This panel reads, filters, renders, soft-deletes and hard-deletes; it never registers a plan. (The retired IDE-side plan discovery is recorded in its own spec.)
 - **The registry read is a cross-process round-trip, but the archived bodies are not.** Enumeration goes through the shared registry loader while the archived plan/note text is read directly off the memory ref in process. So which rows exist and what a row's committed body says come from two different mechanisms and can, in principle, disagree.
 - **Registry writes serialize against other surfaces' writers, best-effort.** This panel's soft-delete and hard-delete take the registry's cross-process lock through the bridge before their load-modify-save. A failed acquire does not abort the write — it proceeds unlocked — so a delete racing a concurrent discovery write can lose one side's change.
@@ -250,7 +256,7 @@ The panel registers a status listener at construction. Every time the project st
 - **Notes registry** — the source of note rows; written by the note creation/edit flow and the note-archival flow. Reached over a bridge round-trip; the notes directory path is resolved the same way.
 - **Archived plan and note bodies** — read natively in process off the memory ref (a direct show-at-revision), not through the shared storage layer. Reference markdown is likewise read natively.
 - **Project status listener** — drives every refresh; flips between `enabled` placeholders and the actual list.
-- **Visibility filter** — shared with the VS Code Plans/Notes provider; this panel re-implements the same five rules so both surfaces show identical sets.
+- **Visibility filter** — shared with the VS Code Plans/Notes provider; this panel re-implements the same four rules so both surfaces show identical sets. Neither surface filters by branch.
 - **IDE editor** — the destination for double-click opens; the panel uses the standard "open file" entry point.
 - **Section toolbar** — owns the `+` action that opens the note-creation form (separate spec).
 - **Plan-archival flow** — the writer of the archive-guard hash that hides unchanged committed plans.

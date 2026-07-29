@@ -13,7 +13,8 @@ A long-lived per-workspace driver schedules background sync rounds on a slow int
 - The polling interval: default, clamp floor, clamp ceiling, value source, and the rebuild path that picks up an interval change without reloading the host process.
 - The conditional eager-tick decision at start, the persistence-backed freshness threshold that drives it, and the per-workspace-folder key used for that persistence.
 - The manual entry point, the in-flight coalescing rule, and the followup latch that ensures a manual click during an in-flight round still results in real work after that round settles.
-- Round execution order: a workspace readiness gate, a generation-mismatch check, a per-round read of the "include transcripts" preference, the boundary call into the sync engine, the post-round side effects, and the catch-all that turns an unexpected throw into a terminal-error outcome.
+- Round execution order: a workspace readiness gate, a generation-mismatch check, a manual-disable refusal, a capped await on the per-round initialization barrier followed by a re-check of both of those cancellations, a per-round read of the "include transcripts" preference, the boundary call into the sync engine, the post-round side effects, and the catch-all that turns an unexpected throw into a terminal-error outcome.
+- The distinction between the one-shot readiness promise and the per-round initialization barrier, and why the former cannot substitute for the latter.
 - The phase-label pipeline: a neutral round-start label, per-phase conversational labels, and the final-state transitions for success, conflicts, transient transport failure, terminal failure, and a round that could not enter because of the global single-flight lock.
 - The locked-wait spinner: how engine wait events drive a once-per-second countdown, how the label distinguishes "this device's previous round" from "another device", how a fresh wait event reseats the countdown, and how the countdown stops itself at zero.
 - The terminal-failure notification surface: when it fires, what title copy it uses, what message body it uses, what suppression rules apply, and which surface it uses (a separate dismissable notification rather than the in-flight indicator).
@@ -37,6 +38,8 @@ A long-lived per-workspace driver schedules background sync rounds on a slow int
 - The persistent failure notification surface (separate spec). The driver hands the host a (title, message) pair.
 - The IDE host command-registration boundary. This driver exposes a single command id; the command surface that registers it is itself a thin pass-through.
 - The pre-round workspace initialization promise. The driver awaits it once per round, swallows its rejection, and continues.
+- What the workspace-initialization work actually does, why it is skipped entirely on a manually-disabled startup, and why the enable path re-runs it (spec 100 step 11, spec 215). The driver only awaits the barrier and re-checks its cancellations afterwards.
+- The manually-disabled state itself — its durable storage, the process-local gate the refusal reads, and the full inventory of writes it suppresses (spec 145, `specs/304-manually-disabled-zero-write-contract.md`). The driver only reads a boolean, per round.
 
 ## Data Contracts
 
@@ -47,7 +50,10 @@ A long-lived per-workspace driver schedules background sync rounds on a slow int
 - An optional activity-registry handle (`setSyncPhase(payload | null)`). Omission disables the in-flight phase indicator without otherwise changing behavior.
 - A workspace identity object exposing an absolute filesystem path for the workspace root.
 - An optional polling interval in seconds.
-- An optional readiness promise that the round body awaits before invoking the engine; defaults to an already-resolved promise.
+- An optional readiness promise that the round body awaits before invoking the engine; defaults to an already-resolved promise. One-shot: once it settles it is settled for the host's lifetime.
+- An optional **per-round initialization barrier**, supplied as a thunk the round body calls to obtain the currently-outstanding workspace-initialization work. Unlike the readiness promise, it is re-consulted at the start of *every* round.
+
+  The one-shot readiness promise cannot do this job. On a startup where the repository was manually disabled, the workspace-initialization body is skipped outright and the promise resolves immediately (see spec 100 step 11) — so by the time the user re-enables, the promise is long since settled and offers no protection at all. The re-enable path then starts a catch-up initialization run that can migrate for minutes, while sync is already unblocked. Without the per-round barrier a round would overlap that run and operate on its half-written output.
 - An optional outer round-finished listener.
 - An optional persistent-failure notifier `(title, message) => void`.
 - An optional timer seam exposing `setInterval(handler, ms) → handle` and `clearInterval(handle)`.
@@ -208,20 +214,22 @@ A single round, regardless of trigger, follows this order:
 
 1. **Disposed guard.** If the driver is disposed, return immediately.
 2. **Coalesce against in-flight.** If a round promise is already recorded, await it and return without invoking the engine. Concurrent callers therefore all resolve at the same instant as the in-flight round but observe no extra engine work.
-3. **Capture pre-tick state.** Record the most-recently-reported `lastState` so it can be restored if the round bails at the generation check.
+3. **Capture pre-tick state.** Record the most-recently-reported `lastState` so it can be restored if the round bails at the generation check, at the manual-disable refusal, or at either of their post-barrier re-checks.
 4. **Seed the status visuals.** Set `lastState` to `"syncing"` and push that on the status-visual boundary with no detail. Reset the local "most-recent phase" tracker to absent. Push `{ label: "Syncing memory bank…", severity: "info" }` onto the activity registry if wired.
 5. **Begin the round promise.** Store its handle so concurrent callers can coalesce.
 6. **Await readiness.** Await the readiness promise; any rejection is caught and discarded.
 7. **Generation check.** If the queued-at-generation is defined and does not equal the current generation counter, restore the captured pre-tick state on the status-visual boundary, push `null` to the activity registry, and end the round body. Manual rounds pass an undefined queued-at-generation and skip this check.
-8. **Read transcripts preference.** Re-read disk-backed config; the round options' `transcripts` boolean is `cliConfig.syncTranscripts === true` (strict — any non-true value is `false`).
-9. **Invoke the engine round.** Pass `{ cwd, reason, transcripts }`. Await the result envelope.
-10. **Apply outcome to status visuals.** Push the result's `newState` plus a derived detail (see "Detail derivation") on the status-visual boundary.
-11. **Apply outcome to phase indicator.** Push a derived activity-registry payload (see "Phase indicator final state" below).
-12. **Broadcast round finish.** Invoke the round-finished listener with `(newState, result)`. A throwing listener is caught and the throw is dropped at debug log level.
-13. **Persist last success.** If `newState === "synced"` and the persistence seam is wired, write `now()` to it; a thrown setter is caught and logged at debug.
-14. **Catch-all.** Any throw during the body is caught: log the message and stack, synthesize a fallback result `{ fetched: false, pulled: false, pushed: false, conflicts: [], newState: "offline", lastError: { code: "sync_failed_after_retries", message: <caught error message> } }`, apply that as if the engine had returned it (status visuals + phase indicator + round-finished broadcast).
-15. **Finally.** Clear the in-flight round promise.
-16. **Followup latch.** After the round body settles, if the manual-followup latch is set and the driver is not disposed, clear the latch and recursively invoke a manual round.
+8. **Manual-disable refusal.** If the workspace's repository has been manually disabled, refuse the round: restore the captured pre-tick state on the status-visual boundary, push `null` to the activity registry, and end the round body. The three actions are the same three the generation check performs, so a refused round settles back into exactly the end state a tick that never happened would have left — no "syncing" residue on the status visual, no stale in-flight label in the sidebar. (The transient seeded "syncing" label of steps 4–5 is still momentarily visible, exactly as on the generation-mismatch path.) The refusal exists because a round writes: it stages, commits and pushes inside the Memory Bank vault and spawns a background worker afterwards. It is evaluated **per round** rather than once at start, so a disable mid-session silences the very next tick and a later re-enable resumes rounds without rebuilding the driver.
+9. **Await the per-round initialization barrier**, if one was supplied, under a **60-second cap** (matching the host's own initialization watchdog) so a hung initialization run degrades to the pre-barrier behavior instead of blocking sync forever. The await re-opens both of the cancellation windows the readiness await opens, so **both** the generation check and the manual-disable refusal are re-evaluated immediately afterwards, with identical handling: a stop that landed while parked here must still cancel a queued poll tick, and a disable clicked while parked here must still silence this round.
+10. **Read transcripts preference.** Re-read disk-backed config; the round options' `transcripts` boolean is `cliConfig.syncTranscripts === true` (strict — any non-true value is `false`).
+11. **Invoke the engine round.** Pass `{ cwd, reason, transcripts }`. Await the result envelope.
+12. **Apply outcome to status visuals.** Push the result's `newState` plus a derived detail (see "Detail derivation") on the status-visual boundary.
+13. **Apply outcome to phase indicator.** Push a derived activity-registry payload (see "Phase indicator final state" below).
+14. **Broadcast round finish.** Invoke the round-finished listener with `(newState, result)`. A throwing listener is caught and the throw is dropped at debug log level.
+15. **Persist last success.** If `newState === "synced"` and the persistence seam is wired, write `now()` to it; a thrown setter is caught and logged at debug.
+16. **Catch-all.** Any throw during the body is caught: log the message and stack, synthesize a fallback result `{ fetched: false, pulled: false, pushed: false, conflicts: [], newState: "offline", lastError: { code: "sync_failed_after_retries", message: <caught error message> } }`, apply that as if the engine had returned it (status visuals + phase indicator + round-finished broadcast).
+17. **Finally.** Clear the in-flight round promise.
+18. **Followup latch.** After the round body settles, if the manual-followup latch is set and the driver is not disposed, clear the latch and recursively invoke a manual round.
 
 ### Manual entry point
 
@@ -335,6 +343,10 @@ The dedupe set is per-runtime-instance (workspace lifetime). Reloading the host 
     │
     │  if gen ≠ current && gen defined →
     │      restore lastState = S₀; indicator = null; finish
+    │  if manually disabled (no manual exemption) →
+    │      restore lastState = S₀; indicator = null; finish
+    │
+    │ await init barrier (60s cap), then RE-CHECK both of the above
     │
     │ read transcripts; call engine.runRound
     │
@@ -402,9 +414,15 @@ The eager-on-start path reports reason `"poll"` to the engine. This is deliberat
 
 The driver has exactly two trigger sources: scheduled poll and explicit manual call. There is no integration with filesystem watch events on the vault directory, and there is no automatic sync attempt on local commits to the source repo. (Either would risk surprising the user or self-triggering on the driver's own writes.)
 
-### Manual round is exempt from the generation-mismatch bail
+### Manual round is exempt from the generation-mismatch bail — but NOT from the manual-disable refusal
 
 Manual rounds pass an undefined queued-at-generation through, so even if the user toggled automatic polling off after the manual click but before the round body started its engine call, the manual round still proceeds. Generation checks are a self-cancellation mechanism for polling, not a global cancel.
+
+The manual-disable refusal is the counterexample that bounds that framing: it carries no manual exemption at all. A user who clicks "sync now" on a repository they have turned off gets a round that restores the pre-tick visual and ends, exactly as a cancelled poll tick would. So the driver has one genuinely global cancel and one that is polling-scoped, and they are checked back to back. The reason for the asymmetry is what each protects: the generation counter protects a *preference* the user can change freely, while the manual disable is a zero-write guarantee about the repository, and a round writes into the vault. See spec 145 and `specs/304-manually-disabled-zero-write-contract.md`.
+
+### The refusal and the cancellation are deliberately indistinguishable from outside
+
+Both the generation-mismatch bail and the manual-disable refusal perform the identical three actions — restore the captured pre-tick state, clear the activity-registry indicator, end the round body — and the barrier's post-await re-checks repeat both with the same handling. The end state after a refused round is therefore the end state of a tick that never happened: no lingering "syncing" state, no stale in-flight label, and no round-finished broadcast, so downstream consumers do not invalidate caches for work that was never done. The only observable difference is the transient seeded label and a log line.
 
 ### Followup latch coalescing
 
@@ -476,3 +494,5 @@ The reconciliation entry point re-reads both flags from disk-backed config on ev
 - **The persistent-failure notification surface** is owned by the host notification spec. This driver hands a (title, message) tuple.
 - **Disk-backed config** (the source of truth for `jolliApiKey`, `autoSyncEnabled`, `syncPollIntervalSec`, `syncTranscripts`) is owned by the config-store spec.
 - **Persistence of the last-successful-round timestamp** is owned by the IDE host's global state spec; this driver consumes thin get/set seams.
+- **The workspace-initialization step** the per-round barrier fronts — including its serialization across the activation run and the enable path's catch-up run, and the fact that its one-shot completion promise resolves even on the skipped disabled path — is owned by spec 100 (step 11) and spec 215.
+- **The manual-disable state** the per-round refusal reads is owned by spec 145; the write-suppression contract it belongs to by `specs/304-manually-disabled-zero-write-contract.md`.

@@ -104,11 +104,7 @@ Pure function: the same ordered list of subjects always produces the same string
 - **The first subject's prefix wins.** Both prefix-stripping strategies keep the first subject's wording and discard the rest, on the rule that the earliest commit's stated intent is the squash's intent. (Notable.)
 - **The output can be arbitrarily long.** Merging many subjects produces one long line; nothing here bounds it. The review UI the surfaces show before committing is the only safeguard. (Notable.)
 - **One implementation, three surfaces, two transports.** The editor extension calls it in-process; the CLI's squash-message generation command calls it in-process; the JVM plugin's squash action reaches that same command out-of-process. There is no port and no re-implementation, so the three surfaces cannot drift — their squash fallback is identical by construction. (Notable.)
-- **This unified implementation eliminated a real divergence.** Before it, the JVM plugin ran its own LLM squash-message call gated on a narrower credential (a direct vendor API key only — no product-proxy and no local-agent support) and had **no mechanical fallback at all**: an LLM failure surfaced an error dialog instead of a merged message. Both gaps closed when the JVM action started invoking the shared command. (Surprising; intentional.)
-
-## Unreachable / Not-live
-
-- The JVM plugin still contains its pre-refactor commit-message and squash-message generation paths that called the vendor API directly with a configured key. Nothing invokes them any more — every JVM entry point goes through the shared command — so they are stale, unreachable source. (Unreachable.)
+- **This unified implementation eliminated a real divergence.** Before it, the JVM plugin ran its own LLM squash-message call gated on a narrower credential (a direct vendor API key only — no product-proxy and no local-agent support) and had **no mechanical fallback at all**: an LLM failure surfaced an error dialog instead of a merged message. Both gaps closed when the JVM action started invoking the shared command. That superseded path has since been deleted outright rather than left as unreachable source, and a build-time gate on that surface fails the build if production code there reaches the vendor endpoint directly, so the divergence cannot reappear. (Surprising; intentional.)
 
 ## Shared Behavior
 

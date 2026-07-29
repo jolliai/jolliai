@@ -38,7 +38,7 @@ Repairs are attempted in the same order the probes ran. A probe contributes to t
 |-------|---------------|--------|
 | Git hooks | `ok` "manually disabled" (repo-wide opt-out set, spec 145) | No fixer. `--fix` never reinstalls hooks while the opt-out holds — the user must run `jolli enable` explicitly. |
 | Git hooks | `fail` "not installed" | Re-runs the same install action that `jolli enable` would, but asks it to **honour** the repo-wide manual-disable opt-out (spec 145) rather than override it. The fixer reports `reinstalled` on success, or throws the installer's error message on failure. |
-| Local agent CLI | `fail` (resolver could not find a usable agent CLI) | No fixer. Installing, upgrading, or signing in to a local agent CLI requires user action; the interactive repair ladder (spec 291) is the surface that offers it. |
+| Local agent CLI | `fail` (resolver could not find a usable agent CLI) | No fixer. Installing, upgrading, or signing in to a local agent CLI requires user action; the interactive repair ladder (spec 291) is the surface that offers it. The diagnostic line itself now carries a tool-specific sign-in instruction (spec 59) — which is precisely the user action this table records as unfixable, so the message tells the user what `--fix` deliberately will not do for them. No fixer is attached on the strength of that hint. |
 | Claude hook | `warn` "not installed (optional)" | No fixer. Missing optional hooks are not auto-installed. |
 | Gemini hook | `warn` "not installed (optional)" | No fixer. |
 | Orphan branch | `warn` "not yet created" | No fixer. The orphan branch is created lazily on the first commit; nothing to do. |

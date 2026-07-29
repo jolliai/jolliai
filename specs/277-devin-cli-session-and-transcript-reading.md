@@ -106,6 +106,8 @@ Devin is considered installed only when both:
 1. The runtime supports the embedded-database module, and
 2. The session database file exists at the resolved path and is a regular file (a directory at that path does not count).
 
+This predicate governs discovery, the status tree, and this spec's "not present" reporting only. MCP registration asks a **distinct, presence-only** question about Devin — it drops the runtime gate and additionally accepts the bare CLI data directory, without a session database — so Devin can be reported "not present" here in the same run in which it is registered as an MCP host. See spec 149.
+
 ### Discovery flow
 
 1. Resolve the database path per the per-OS rule above.

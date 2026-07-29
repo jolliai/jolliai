@@ -17,6 +17,7 @@ A disposable on-disk inverted index over the project's stored memory is built la
 - The exact-enum branch-filter semantics and why a tokenized text filter is not used for that field.
 - The optional record-kind filter and the optional result-count clamp applied at query time.
 - The atomic-write ordering used to persist the pair and what happens when the pair is torn.
+- The required-versus-best-effort classification of the persist step: which entry points treat a failed persist as fatal, which one swallows a narrow class of permission failures and serves the query from memory, and exactly which error codes qualify.
 - The in-process memoization layer used by the long-lived agent server and the cheap staleness check it consults on every reuse.
 - The "force rebuild and exit" entry point that performs an immediate rebuild and reports the document count.
 - The "warm the index" hook the compile sweep runs after ingest, including its non-fatal containment.
@@ -168,9 +169,25 @@ The build procedure constructs the in-memory index from authoritative sources an
 1. Collect every document — a topic record per topic in the topic index, and a commit record per catalog entry that has a matching commit-index head. A catalog entry without a matching index head is silently dropped (not browsable through the agent surface and therefore not indexable).
 2. Create an empty index using the declared schema, with the augmented tokenizer attached as a component.
 3. Bulk-insert all documents.
-4. Persist the pair (see Persist), passing the signature that was supplied to build.
+4. Persist the pair (see Persist), passing the signature that was supplied to build, under the caching mode the caller selected — **required** or **best-effort** (see "Persistence is required or best-effort"). The build's default is required; only the two read-triggered entry points pass best-effort.
 5. Log an informational line reporting the built document count.
 6. Return a wrapper holding the in-memory index plus the document count.
+
+At step 4 the in-memory index is already complete and queryable; persisting it is a cache-population step, which is what makes the best-effort classification safe for a read.
+
+### Persistence is required or best-effort
+
+The persist step is classified by **who asked for the build**, not by what went wrong:
+
+- **Required** — an explicit force-rebuild. Both callers of that entry point are in this class: the reindex command-mode entry point, and the compile-sweep warm-up. Landing the files *is* the point of that call: they are what lets a later long-lived server process skip the rebuild. A persist failure of any shape — permission-class included — propagates out of the build rather than being absorbed, so the build never reports a warm-up that warmed nothing. What the caller then does with it differs by caller: the reindex entry point surfaces it, while the compile-sweep warm-up catches it in its own non-fatal containment and logs a warning (described later in this spec).
+- **Best-effort** — a rebuild that happened **behind a read** (either read entry point: the plain open and the memoized open, on a stale or missing cache). The caller wants results; the on-disk copy is only an optimization for next time.
+
+Under best-effort, and only under best-effort, a persist failure whose error carries one of exactly three permission-class codes — `EPERM`, `EACCES`, `EROFS` — is swallowed. The handling is:
+
+1. Log a warning naming the target directory and the failure's message, stating that the index was built but not cached and that the next search will rebuild it.
+2. Serve the query from the fully-built in-memory index, exactly as if the persist had succeeded.
+
+Every other failure shape still propagates out of the read path unchanged — a full disk, a target directory that vanished because the memory-bank folder moved, a corrupt directory, a serialization error. Those are real misconfigurations, and swallowing them would convert every subsequent search into a silent full rebuild whose only trace is a log line.
 
 #### Topic record construction
 
@@ -278,9 +295,11 @@ The index has three observable states for a given resolved directory:
 2. **Fresh** — index file present, manifest present, manifest's schema version matches the current constant, and manifest's source signature matches the freshly-computed signature. An open restores and returns. The state remains Fresh.
 3. **Stale** — index file present, manifest present, but the manifest fails one of the restore guards (schema version mismatch, signature mismatch). An open's restore returns "not restored" and the build runs, atomically persisting a new pair and transitioning the directory back to Fresh.
 
+4. **Stale → Stale** — the Stale case above, except the rebuild's cache write is denied with one of the three permission-class codes. The build succeeds in memory and the query is answered from it, but no matching pair lands: depending on where in the persist sequence the denial hit, the directory is left either untouched or torn (the index payload replaced with no matching manifest). Both read as Stale, so the directory stays Stale and the *next* read repeats the whole sequence. This is the only outcome in which a completed build does not leave the directory Fresh. A non-permission persist failure does not reach this state — it propagates, leaving the directory Stale and the caller with an error instead of hits.
+
 A torn pair (index present, manifest absent, or manifest present without index, or manifest present with mismatched JSON) collapses into Stale from the open's point of view — the restore guard fails and the build runs.
 
-The force-rebuild entry point unconditionally transitions the directory to Fresh, regardless of its prior state.
+The force-rebuild entry point unconditionally transitions the directory to Fresh, regardless of its prior state — unless its (required) persist fails, in which case the failure propagates and the directory keeps whatever state it had.
 
 The in-process memo has two states per directory: Empty (no entry) and Populated (entry with a signature and a wrapper). On every memoized call, a Populated entry transitions to Empty (and is then refilled) iff its stored signature does not equal the freshly-computed one; otherwise it stays Populated.
 
@@ -302,6 +321,9 @@ The in-process memo has two states per directory: Empty (no entry) and Populated
 - **The "compute once on a cold open" rule.** The non-memoized open computes the signature exactly once and threads it through whichever of restore or build runs. The build path explicitly accepts a signature parameter rather than recomputing — each recompute re-reads three files. (Notable.)
 - **A restore failure of any shape demotes to a rebuild.** The restore's catch is broad: missing manifest, missing index, JSON parse failure, signature mismatch, schema-version mismatch, or any other exception. The result is the same — the build runs and produces a fresh pair. There is no diagnostic distinction between "corrupt" and "stale". (Notable.)
 - **The manifest is the "index is ready" marker.** It is written **after** the index payload. A crash mid-pair leaves the index without a manifest; the next open rebuilds. The torn pair never serves results. (Notable; load-bearing.)
+- **A read-triggered rebuild survives an unwritable index directory — and only that.** A query whose cache is stale rebuilds in memory and then tries to cache; if the cache write fails with one of exactly three permission-class codes (`EPERM`, `EACCES`, `EROFS`) the failure is logged as a warning naming the directory and the message, and the query is answered from the fully-built in-memory index. The condition this exists for is a sandboxed agent: for folder-backed storage the index directory resolves under the memory-bank root, which sits outside the workspace such a sandbox makes writable, so persisting is denied there while everything else about the request is fine. Any other failure shape still propagates out of the read. (Surprising; load-bearing.)
+- **The unwritable-cache condition presents as INTERMITTENT.** The swallow only sits on the rebuild path, and a rebuild only happens when the cache is stale — a fresh cache never reaches it. So the same sandboxed search alternates between silent success (cache still fresh) and a warning plus an uncached rebuild (any commit changed the source signature). Nothing about the sandbox changed between the two; only the cache's freshness did. (Surprising.)
+- **The classification is by caller intent, not by error shape.** The identical permission failure is fatal on an explicit reindex and survivable behind a read. This is deliberate: the reindex exists to leave a file on disk, while the read exists to return hits. (Notable.)
 - **The result snippet is a fixed 280-character prefix of the content body.** It is not a query-aware excerpt, not an ellipsized window around a matched term, and not configurable. (Notable.)
 - **The branch field returned in a hit is a single string formed by joining the branch list with spaces.** A topic with multiple related branches is rendered as a single space-separated string in the hit envelope. This is a display-side projection: the underlying record still holds a set. (Notable.)
 - **The result-limit clamp covers both denial-of-service-sized values and non-numeric input.** The clamp must coerce the value first (because string-typed input can reach the surface despite the protocol's outer envelope validation), fall back to the default on non-finite values (because `Math.trunc` on NaN is NaN, which poisons the clamp), integer-truncate, and bound to \[1, 100\] (because the engine preallocates an array of the requested size, which range-errors past `2^32-1`). (Surprising; defensive.)

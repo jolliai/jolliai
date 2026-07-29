@@ -7,7 +7,7 @@ The Commit Selected action that snapshots the current git index, stages exactly 
 ## Scope
 
 **In scope:**
-- The pre-flight guards (worker-busy lock, at least one checked file).
+- The pre-flight guards (manual-disable refusal, worker-busy lock, at least one checked file).
 - The index snapshot taken before any staging change so cancel / error / failure paths can restore the working tree exactly.
 - The staging diff between "selected by checkbox" and "currently in the index", including how deletions, sparse-excluded files, and untracked entries are handled.
 - The LLM input set (staged diff only — no transcripts, no narrative, no prior summaries) and what the user sees while it runs.
@@ -115,6 +115,7 @@ The "own commits" base — the point from which the branch's work is counted —
 
 ### When the user invokes Commit Selected
 
+0. **Refuse outright when the repository is manually disabled**, with the informational message "Jolli Memory is disabled for this project — enable it first." and no further work. This guard sits **ahead of everything else** — ahead of the worker-busy lock probe and ahead of the engagement-telemetry gathering — so a refused invocation records no "memory committed" event and takes no lock reading.
 1. Run the worker-busy guard. If busy, show the warning toast and return.
 2. Read the selected file list. If empty, show "No files are selected. Please check at least one file before committing." and return.
 3. Snapshot the index tree. On failure: if conflict markers were detected, surface that specific error; otherwise surface a generic "Could not read the current git index. Commit aborted to avoid data loss." Either way, return without staging anything.
@@ -146,6 +147,7 @@ Every error and cancel path restores the index by writing the captured tree back
 | From | Trigger | To |
 | --- | --- | --- |
 | Idle | User clicks Commit Selected | Guarded |
+| Guarded | Repository manually disabled | Idle (informational toast; nothing probed, nothing recorded) |
 | Guarded | Worker busy | Idle (warning toast) |
 | Guarded | Nothing checked | Idle (warning toast) |
 | Guarded | At least one checked, no worker | Snapshotted |
@@ -169,6 +171,7 @@ The index has exactly two persistent states from the user's perspective: "the st
 
 ## Notable Behavior
 
+- **The manual-disable guard exists for the command-palette route, not the button.** The sidebar collapses to its disabled panel in a manually-disabled repository, so the Commit Selected button is not on screen at all — but the command stays registered and reachable from the palette. The guard is what stops that route from writing into a repository the user has opted out of. It is deliberately the *first* thing the invocation does, so the engagement telemetry that the normal path gathers off the click path is not recorded for a refused attempt either. (Notable; see 304.)
 - **Checkboxes are UI-only; the action is the staging.** The Changes panel does not stage on click — staging happens entirely inside this flow at step 5. Anything the user did in another tool (terminal `git add`, source-control panel) before running the action is picked up via the "currently-staged paths" snapshot and restored after the commit, but the checkbox set is the authoritative input to the commit itself. (Surprising; intentional — mirrors GitHub Desktop, not the built-in source-control panel.)
 - **Deletions including ignored-and-deleted are stage-able.** Allowing the stage list to contain missing paths means that a file the user removed from the working tree (whether or not it was tracked at action time) can be the subject of a commit. Without this, deleting a file would require an extra workaround to land. (Notable.)
 - **Sparse-excluded and untracked-but-not-checked files are intentionally not unstaged.** A path that the index has never seen would error on un-stage. Filtering them out keeps the unstage step from spuriously failing on repositories using sparse-checkout, partial clones, or just unrelated untracked files. (Notable.)
@@ -188,6 +191,7 @@ The index has exactly two persistent states from the user's perspective: "the st
 
 ## Shared Behavior
 
+- **Manual-disable opt-out** — the durable repo-wide opt-out this action's first guard reads, and the zero-write contract it belongs to, are owned by **Zero-Write Contract for a Manually-Disabled Repository** (304); the sidebar's disabled panel that hides this action's button is owned by the onboarding-panel topic.
 - **Worker-busy lock guard** — the same warning toast and probe used by Push and Squash blocks this action when a summary is being generated. This action also re-checks the guard after the quick-pick is shown (step 9), not only at action invocation time.
 - **LLM commit-message generation** — the prompt, the model alias, the credential resolution, and the single-line output contract are owned by the AI commit-message generation topic. There is a **single** generation implementation: this action calls it in-process, and the JVM-based plugin surface reaches the same implementation out-of-process, so the two surfaces cannot drift. The failure classification this action's toast rule keys on is produced by that shared implementation, and the JVM surface maps it to the same guidance sentence.
 - **Index snapshot tooling** — the tree-write / tree-read mechanic is shared with Squash, which also restores by snapshot on error.

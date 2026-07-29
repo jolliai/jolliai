@@ -14,6 +14,7 @@ The IDE plugin's "AI Commit" action: a re-entrancy-guarded background flow that 
 - The absence of any in-plugin credential pre-check, and where credential gating happens instead.
 - File selection: the Changes panel's checked set, its fallback, and the derivation of the unselected-tracked set.
 - The index snapshot and the two restore paths (cancel, failure).
+- The flush of unsaved editor buffers immediately before staging, and why it sits there rather than at flow entry.
 - The empty-stage abort and its dialog.
 - The delegated message generation: what is sent, what comes back, cancellation, timeout, and error classification.
 - The review dialog's three actions and its message-blank rules.
@@ -101,7 +102,7 @@ Enablement is computed on a **background** thread, not the UI thread, because it
 5. **Collect the selection** and derive the unselected-tracked set. Empty selection ⇒ warn and return.
 6. Everything below runs in a **cancellable background task** titled "Jolli Memory: Generating commit message...".
 7. **Snapshot the index** (tree object + already-staged paths). Failure ⇒ abort with the data-loss dialog.
-8. **Stage the selected paths; unstage the unselected tracked paths.**
+8. **Flush unsaved editor buffers to disk, then stage the selected paths and unstage the unselected tracked paths.** The flush is required because the two halves disagree about what "changed" means: the file-selection surface reads the IDE's in-memory change tracker, which sees unsaved buffer edits, while staging shells out to a process that only ever sees the filesystem. Its placement is deliberate — it happens *at* the staging step, not at flow entry, so a flow that aborts earlier (a busy worker, an empty selection, a failed index snapshot) never writes unrelated open buffers to disk as a side effect.
 9. **Empty-stage abort.** Re-read the staged set. If it is empty, restore the index from the snapshot, refresh the IDE's git view, and show "No changes to commit — the selected files have no modifications." This is the common case where the IDE's change cache is stale right after an external commit: continuing would call the model on an empty diff and end in a confusing git error.
 10. **Generate the message** (delegated, as above).
 11. **Show the review dialog on the UI thread.** A throw from the dialog itself is caught in its own handler that restores the index, releases the guard, and shows "AI commit dialog failed: …". Without that bracket, a dialog throw would escape both the background task's handler and the commit block's release, leaking the guard permanently and silently disabling the action for the rest of the session.
@@ -135,9 +136,12 @@ This is required because the commit runs in an **external** git process the IDE 
 [trigger] ──guard acquired──────────────────► [staging]
 
 [staging] ──index snapshot failed───────────► abort (data-loss dialog), guard released
+          ──unsaved editor buffers flushed to disk (only once staging is actually reached)──
 [staging] ──staged set empty────────────────► index restored, IDE refreshed,
                                               "No changes to commit — the selected files
                                                have no modifications.", guard released
+                                              (now reachable only when the files genuinely
+                                               have no modifications on disk)
 [staging] ──staged──────────────────────────► [generating]
 
 [generating] ──error envelope / no message──► "Failed: …", index untouched, guard released
@@ -166,6 +170,8 @@ This is required because the commit runs in an **external** git process the IDE 
 - **The guard is per project because a process-wide one was a fleet-wide outage.** A throw on the dialog thread leaked the flag; with a single static flag that disabled AI Commit in every open window until the IDE restarted.
 - **The dialog step has its own exception bracket.** Because showing the dialog is scheduled rather than called inline, a throw there is outside both the background task's handler and the commit block's release. The bracket exists solely to guarantee the guard is released and the index restored on that path.
 - **Two separate "nothing to commit" outcomes exist, at different points, with different copy.** The pre-generation one ("the selected files have no modifications") catches a stale change cache before spending a model call. The post-dialog one ("the working tree is clean") catches an external process cleaning the tree while the dialog was open. Both restore the index and refresh the IDE; neither is presented as an error.
+
+  The pre-generation one used to fire for a second, wrong reason: **an unsaved edit appeared in the selection surface yet staged nothing**, because the surface reads the in-memory change tracker while staging reads the filesystem, so the flow aborted with "the selected files have no modifications" over a file the user could plainly see was modified. Flushing unsaved buffers immediately before staging removed that case, and the abort is now reachable only when the files genuinely have no modifications on disk.
 - **The clean-tree downgrade applies only to the plain commit path.** An amend that fails for the same reason is surfaced as an error, because an amend of a clean tree is not a benign race.
 - **Whether the head was pushed is checked before the amend, not after.** Checked afterwards it would always read as unpushed, and the force-push warning would never appear.
 - **Files are staged twice.** Once before generation (so the model sees the right diff) and again after the dialog closes (so edits made while the dialog was open are included). The second staging can therefore change what is committed relative to what the message describes.

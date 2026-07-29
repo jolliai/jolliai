@@ -105,6 +105,8 @@ Optional fields are present only when the server returned a non-empty string for
 1. Run the origin-allowlist check against the supplied Jolli URL. A mismatch throws synchronously and the request is never issued. (A long-lived process could otherwise hold a stale, off-allowlist value.)
 2. Parse the URL into origin and optional tenant slug.
 
+Additionally, on the JVM IDE surface the *caller* runs its own allowlist check before this routine is entered: it composes and validates the hosted completion-page URL for the same tenant origin up front, because that value goes straight into an HTTP `Location` header. The practical effect on this endpoint is ordering — an off-allowlist tenant fails **before** the exchange is issued, so the single-use code is never spent on a request that was going to be refused anyway. (See **OAuth Browser Login Flow**.)
+
 ### URL and headers
 
 3. Build the target URL by joining the parsed origin with `/api/auth/cli-exchange`. The tenant path prefix (if any) is *not* repeated in the URL — the route is mounted at the origin.
@@ -162,7 +164,7 @@ There is no idle / pending / resolved client state — the function either retur
 - **Empty strings on optional fields are treated as absent.** A response of `{ token: "tok", jolliApiKey: "" }` returns `{ token: "tok" }` with no `jolliApiKey` set. Callers therefore cannot distinguish "server returned empty" from "server omitted the field" — and no caller has reason to. (Notable.)
 - **Every failure surfaces a failure with a user-facing message.** No status codes, no surfaced HTTP failures, no opaque error codes. Callers (the loopback callback handler and the deep-link URI handler) propagate the message into the rendered error page or surfaced UI dialog without further mapping. (Notable.)
 - **Error messages do not echo server output.** Status-mapped messages and the missing-token message are fixed strings; only the malformed-JSON message and the network-error message embed the underlying `<message>`. This bounds the surface for an attacker-controlled origin to inject text into the user's UI. (Notable, defensive.)
-- **One implementation exists.** The exchange routine is the implementation shared by the CLI loopback callback and the editor-extension deep-link URI handler. There is no JVM port — the JVM IDE plugin uses the legacy token-in-URL callback shape and therefore never reaches this endpoint. (Notable parity fact.)
+- **One implementation exists, and all three surfaces reach it.** The exchange routine is a single implementation. The CLI loopback callback and the editor-extension deep-link URI handler call it directly; the JVM IDE plugin reaches the *same* routine indirectly, because it delegates its whole callback handling to the shared command-line runtime. There is no JVM port of the exchange, and the JVM surface is **not** confined to the legacy token-in-URL shape — a `?code=` callback there is redeemed here like anywhere else. (Notable parity fact.)
 
 ## Shared Behavior
 

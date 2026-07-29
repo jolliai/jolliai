@@ -17,6 +17,7 @@ Persist summary files on a long-lived parallel git ref using only object-databas
 - The folder-mirror copy of the same files (covered by "Folder-Based Summary Storage").
 - The conditional combination of this storage with other backends (covered by "Dual-Write Summary Storage").
 - Locking and concurrency at higher levels (queues, hooks). This storage performs no in-process or filesystem locking of its own; it relies entirely on the atomicity of a single ref-update at the underlying VCS layer.
+- The durable repo-wide manual-disable opt-out — how it is set, cleared, and stored, and the full inventory of writes it suppresses (covered by "Manually-Disabled Zero-Write Contract"). Only its position inside this storage's write batch is stated here.
 
 ## Data Contracts
 
@@ -67,6 +68,7 @@ A new commit on the ref whose tree reflects the cumulative effect of all entries
 3. Otherwise return the captured stdout as the file content.
 
 ### Write batch (`writeFiles(files, message)`)
+0. If the project is **manually disabled**, return immediately. The refusal sits **before** the initialization routine in step 1, so a disabled project never has the ref created for it: on a repository whose ref does not yet exist, a batch write leaves the repository with no parallel ref at all rather than an empty initialized one. This is the only entry point on this storage that carries the gate — read, list, existence, and the standalone initialization routine are unaffected. The opt-out itself is defined by **Manually-Disabled Zero-Write Contract**.
 1. Call the initialization routine first; this is a no-op if the ref already exists.
 2. Resolve the current commit at the ref's tip; if resolution fails, throw with the underlying stderr.
 3. Resolve the tree object at that commit; if resolution fails, throw.
@@ -130,6 +132,7 @@ There is no Present → Absent transition implemented by this storage.
 - **There is one implementation of this storage.** The former JVM-based port is gone. The JVM-hosted surface still **reads** the orphan branch natively — it lists and shows branch files with its own direct VCS invocations, bypassing the storage abstraction entirely — but it performs **no writes**: every write on that surface goes through this implementation over a bridge action. So the write protocol described above has exactly one implementation, while the read path has two (this one, and the JVM surface's native display-time reads). (Notable.)
 
 ## Shared Behavior
+- The durable repo-wide manual-disable opt-out that suppresses this storage's write batch is defined by **Manually-Disabled Zero-Write Contract**.
 - The schema and interpretation of stored summary documents are defined by **Summary Tree Structure**.
 - A folder-on-disk mirror of the same files, layered on top of this storage, is defined by **Folder-Based Summary Storage**.
 - Conditional dual-write semantics that combine this storage with the folder mirror are defined by **Dual-Write Summary Storage**.

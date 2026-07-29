@@ -31,6 +31,8 @@ This spec defines how Cline CLI (the standalone `cline` terminal tool) sessions 
 
 The Cline CLI is considered installed when `<home>/.cline/data/sessions` exists and is accessible. There is no gate on any embedded-database runtime module — detection is a plain directory-existence check, and the discoverer never reads the CLI's WAL-mode session database.
 
+This predicate governs session discovery only. MCP registration asks a separate, narrower question that this source can never satisfy (see Notable Behavior below, and spec 149).
+
 ### Directory layout
 
 - Data root: `<home>/.cline/data`
@@ -135,6 +137,7 @@ Detection, discovery, and reading are all read-only with respect to Cline CLI's 
 
 ## Notable Behavior
 
+- **This source is deliberately not an MCP host.** The standalone terminal tool ships no MCP config file, so MCP registration accepts only the Cline editor extension — its Cline predicate is narrower than this spec's, the one case across all hosts where the MCP gate is stricter rather than looser (spec 149). Consequence: a CLI-only Cline user has their sessions discovered and summarized but never gets a Cline MCP registration, and detecting the CLI here must never be read as implying one.
 - **The CLI maintains a WAL-mode `sessions.db` that this source never reads.** Detection and discovery are both built entirely on plain JSON sidecar + messages files; this is a deliberate design choice to avoid any embedded-database runtime dependency for this source, in contrast to Cursor/OpenCode/Copilot CLI which do read an embedded SQLite store and are consequently gated by runtime SQLite support.
 - **Per-session sidecar corruption is invisible at the discovery-error level.** A malformed or unreadable `<id>.json` is logged at debug level and the session is simply skipped — it never becomes a `"parse"`-kind (or any) discovery error, unlike the VS Code extension source where a malformed *flavor-wide* `taskHistory.json` does surface as a scan error. The granularity differs because this source's per-session sidecars are independent files, while the extension's history is one shared file per flavor.
 - **Freshness comes from the messages file's mtime, not from any timestamp field inside either JSON document.** Neither the sidecar nor the messages file is required to carry (or is ever read for) an explicit "last updated" field.

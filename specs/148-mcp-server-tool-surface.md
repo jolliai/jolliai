@@ -74,9 +74,9 @@ The `status` tool's result is a curated health report — the structured mirror 
 |---|---|
 | Version | The product version string. |
 | Enabled flag | True when the git hook is installed. |
-| Hooks | A block with: a `summary` string (e.g. `5 Git + 2 Claude + 1 Gemini CLI`, or `none installed`); booleans for the git family, the pre-push hook, the Claude agent hooks, and the Gemini agent hook; and a `runtime` string naming the source and version that wrote the active hooks (e.g. `cli@1.0.0`), or null when no source is registered. |
+| Hooks | A block with: a `summary` string (e.g. `5 Git + 2 Claude + 1 Gemini`, or `none installed`); booleans for the git family, the pre-push hook, the Claude agent hooks, and the Gemini agent hook; and a `runtime` string naming the source and version that wrote the active hooks (e.g. `cli@1.0.0`), or null when no source is registered. |
 | Data migration | A one-line descriptor of the schema-migration state — the same wording the CLI report prints. |
-| Account | A block with three presence booleans (signed in, product API key configured, vendor API key configured); the explicit AI-provider choice (`anthropic`, `jolli`, `local-agent`, or null when unset); the public site host with its scheme stripped (or null); and a site label that reads `Jolli Site` when an on-disk credential backs the URL and `Last signed-in site` otherwise (null when there is no site). |
+| Account | A **provider-contextual** block — see "The account block is provider-contextual" below. Always present: a signed-in boolean, the explicit AI-provider choice (`anthropic`, `jolli`, `local-agent`, or null when unset), the public site host with its scheme stripped (or null), and a site label that reads `Jolli Site` when an on-disk credential backs the URL and `Last signed-in site` otherwise (null when there is no site). Conditionally present: a product-API-key-present boolean, a vendor-API-key-present boolean, and a human-readable local-agent tool label. |
 | Sessions | The total active session count across all integrations. |
 | Integrations | The per-integration list (below). |
 | Stored memories | The count of recorded summaries. |
@@ -92,7 +92,23 @@ Each **integration entry** carries:
 
 The list exists because a merged integration's flat descriptor stays healthy when only **one** of its two channels fails (so the surviving channel's session count is not masked — see 58), which would otherwise make a single-channel failure completely invisible to an MCP caller. It is the structured counterpart of the CLI report's `↳ … scan failed` sub-lines and the VS Code status tree's per-channel warning rows (295).
 
+#### The account block is provider-contextual
+
+Three of the account fields are surfaced **only** in the state where they are meaningful, and omission is by **field absence** — the field is not present in the object at all, rather than present with a `false` or empty value:
+
+| Field | Present when | Absent when |
+|---|---|---|
+| Product-API-key-present boolean | The caller is signed **out**. | Signed in — a sign-in already implies a product generation credential, so the key's presence is redundant. |
+| Vendor-API-key-present boolean | The AI-provider choice is exactly the vendor-direct one. | Every other provider (product-proxy, local-agent, unset), where a vendor key is moot. |
+| Local-agent tool label | The AI-provider choice is exactly the local-agent one. It is the tool's human-readable display name (e.g. the display name of Claude Code or of Codex), defaulting to the default tool's name when the tool setting is absent and degrading to a generic label for a tool identifier this build does not recognize. | Every other provider. |
+
+The always-present provider enum is what a caller branches on to know which of the conditional fields to expect.
+
+The motivation is a real misreport: while both credential booleans were unconditionally present, an AI host reading a healthy local-agent user's report saw two `false` credential booleans and concluded that memory generation was disabled — for a configuration that needs no stored credential at all. Absence is unambiguous where `false` was not.
+
 The report never decodes the API key: the site is read from the persisted site URL, and credential presence is exposed as booleans only, so no secret material can reach the result.
+
+The curated result deliberately carries **no Memory Bank / folder-layer state field**, even though the underlying installation snapshot it is built from does. An AI host asking for installation health therefore cannot see a degraded folder layer; the gap is recorded as observable in spec 300.
 
 ### Tool-result envelope
 
@@ -156,15 +172,30 @@ The entry-point command exposes two mutually exclusive modes. Without a flag, it
 ### Startup sequence (long-lived mode)
 
 0. **Local-agent child guard (runs first, before storage init).** If the process
-   is marked as a descendant of a product-spawned local agent (an inherited
-   environment marker — see the local-agent CLI provider backend spec), the
-   entire server startup is a **no-op**: it logs and returns immediately, before
-   storage is bound or any transport is opened. This prevents a nested agent CLI
-   (which the product spawned to generate a summary) from recursively launching a
-   full MCP server rooted at the agent's throwaway temporary working directory
-   (which would otherwise claim a spurious Memory Bank "repo" named after that
-   temp dir on every summary call). The child runs with all tools denied, so it
-   never invokes an MCP tool; skipping the whole server is safe.
+   is marked as a descendant of a product-spawned local agent, the entire server
+   startup is a **no-op**: it logs and returns immediately. Reentry is detected
+   through **either** of two independent channels — an inherited environment
+   marker, **or** a marker file inside the bound working directory. The
+   working-directory channel exists because this process is spawned by the *host*
+   rather than by the product's own child, and a host's environment allowlist can
+   strip the marker, whereas the working directory is the one thing every host
+   preserves. Both markers and the reason for the split are owned by the
+   local-agent CLI provider backend spec (280).
+
+   This prevents a nested agent CLI (which the product spawned to generate a
+   summary) from recursively launching a full MCP server rooted at the agent's
+   throwaway temporary working directory — which would otherwise claim a spurious
+   Memory Bank "repo" named after that temp dir on every summary call.
+
+   What the host observes: the return happens **before storage is bound, before
+   any request handler is registered, and before the transport is opened**, so the
+   process exits immediately with no protocol negotiation and no advertised tools
+   at all. There is no degraded or empty-tool-list server — there is no server.
+
+   **The index-rebuild mode does not consult this guard.** It is reached through
+   the same entry-point command, but the guard lives in the long-lived server's
+   startup path only, so a reindex invoked from inside a product-spawned agent
+   still binds storage and rebuilds.
 1. Storage-backend initialization runs first. The configured backend is constructed for the bound working directory (used both as the project root and the kb-root) and is installed as the process-wide active storage. This must happen before any tool handler runs; otherwise reads through the store would silently fall back to the default backend (the orphan-branch fallback), producing wrong results for folder-mode or dual-write configurations and emitting a warning on every read in this otherwise long-lived process.
 2. A server instance is created with the advertised name "jollimemory" and the host package version. It declares the tools capability always, and the prompts capability only when the curated `/jolli` menu is non-empty; it declares no other capability.
 3. A list-tools handler is registered that, on request, returns the fixed tool-registry array verbatim.
@@ -297,11 +328,22 @@ The server has three observable lifecycle states:
 - **The server name is the literal string "jollimemory"** (the product name, not the npm package scope or the GitHub org name). The version is sourced from the host package's version constant — not a hardcoded literal.
 - **The `search` tool's description advertises a default limit of 20**, but the actual default is whatever the underlying search engine treats as unset (the surface forwards the limit unchanged, including `undefined`). The "20" in the description is documentation of the engine's default, not a value injected at the tool surface.
 - **Platform tools are on by default and fail safe.** With the activation gate closed (an explicit opt-out) the server is built-in-only and never contacts the backend. With it open, a disabled/older/unreachable backend yields an empty manifest and the server still advertises exactly the built-in tools — the manifest fetch never throws. The static built-in registry is never mutated; platform tools are appended to a locally-built list. A manifest tool that collides with a built-in name is dropped so the built-in always wins, and a manifest tool whose name duplicates an earlier platform tool is dropped so the advertised list and the dispatch map agree (first entry per name wins). Manifest entries are validated/normalized to the MCP tool-input-schema contract: `type` must be `"object"`; `properties` is optional and defaulted to `{}` (a valid zero-arg tool is kept, not dropped); `required`, when present, must be an array of strings; other schema keywords are preserved. An entry with a malformed *advertised-schema* field is dropped individually so one bad tool neither poisons the advertised `tools/list` nor removes a valid neighbor. The internal `binding` and `menu` metadata are the exception — because they are never advertised, a malformed one degrades at field granularity (bad `binding` ⇒ discarded, the call falls back to the conventional endpoint; bad `menu` ⇒ no menu item) rather than dropping the tool. Each surviving platform tool is advertised as only its public schema; `binding`/`menu` are projected off the advertised entry and retained only for dispatch/menu-building.
-- **The server is inert inside a product-spawned local agent.** It shares its
-  re-entrancy guard (the inherited local-agent child marker) with the
-  session-start hook, the stop hook, and the enable command — all four detect the
-  same marker and no-op, so a nested agent CLI spawned to generate a summary never
-  recursively launches a full MCP server rooted at its throwaway temp directory.
+- **The server is inert inside a product-spawned local agent, and it is the only
+  entry point that consults the working-directory channel.** It shares the
+  re-entrancy predicate with the session-start hook, the stop hook, the
+  agent-plugin bootstrap, and the enable command, but those are spawned by the
+  product's own child and therefore rely on the inherited environment marker
+  alone. This server additionally consults the marker file in the bound working
+  directory, because it is spawned by the *host* and the host's environment policy
+  can strip the marker. So a host that sanitizes the environment still gets an
+  inert server here, while the other entry points would not be protected in that
+  same situation. (Notable; the channel rationale is spec 280's.)
+- **The guard is not justified by tool denial.** The nested agent is denied all
+  tools only under one of the four local-agent backends; the others run with a
+  read-only sandbox or with no tool restriction expressed at all. The guard's
+  actual justification is the spurious per-call Memory Bank folder, not an
+  assumption that the child could never call a tool. (Notable; a narrower earlier
+  justification was wrong for three of the four backends.)
 - **The `/jolli` menu prompt is presence-gated by the menu, not just the flag.** The prompts capability and the single `jolli` prompt exist only when the curated menu is non-empty (at least one menu-flagged platform tool or one resolvable local-list tool); an empty menu — the default, and the outcome for a CLI running against a backend that does not yet emit `menu` metadata — leaves the server byte-identical to a tools-only server. A malformed `menu` block never drops its tool: it is discarded at field granularity (no `label` ⇒ no menu item; bad `description`/`order` ⇒ only that field dropped). The prompt only steers the agent to an already-advertised tool; it introduces no new tool, name, or execution path.
 
 ## Shared Behavior
@@ -315,4 +357,5 @@ The server has three observable lifecycle states:
 - The `queue_status` tool's verdict computation and its bounded-wait semantics (the status fields, the "drained" rule, the wiki/graph ingest exclusion, the poll/timeout/non-overshoot loop and its input hardening) are owned by the **queue-status computation** spec (218). This tool only crosses the accepted-argument and status-plus-waited response shapes.
 - The `list_spaces`, `bind_space`, and `push_memory` tools' backend calls (listing spaces, registering a binding, pushing branch summaries, and the binding-required outcome) are owned by the **CLI space-push** specs (230/231); the underlying push mechanism and binding-required flow are further owned by specs 94 and 95. This spec only crosses the accepted-argument and result-union shapes at the tool boundary, including that `bind_space`'s already-bound and `push_memory`'s binding-required results are non-error outcomes.
 - The `status` tool's report mirrors the **CLI status command** spec (58): the hook summary, the data-migration descriptor, the per-integration state strings, and the merged dual-variant masking rule are built by shared helpers, so 58 is the authority on their wording and on the aggregation truth table. The VS Code sidebar status tree (295) renders the same row set with the same rule.
+- The two re-entrancy markers the startup guard keys off — the inherited environment marker and the marker file planted in the agent's throwaway working directory — together with the reason two independent channels are needed and the full list of entry points that detect them, are owned by the local-agent CLI provider backend spec (280). This server is one consumer of that contract, and the only one that opts into the working-directory channel.
 - The per-client configuration files that point a client at this server (so the client knows to spawn the entry-point command) are owned by the MCP-client-registration spec.

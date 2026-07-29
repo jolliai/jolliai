@@ -11,7 +11,7 @@ Refuse to save any Jolli URL whose host is not on a fixed allowlist of approved 
 - The fixed list of allowlisted host suffixes.
 - The HTTPS-only requirement and how it composes with the host check.
 - The suffix-boundary host check that prevents `<allowed>.<attacker>` style bypasses.
-- The set of save-time call sites that gate persistence on this check.
+- The set of call sites that gate a trust boundary on this check: persistence, environment-variable resolution, and composition of a URL that is handed to a browser.
 - The save-time-only doctrine: where this check runs and where it deliberately does not.
 - The failure mode (refuse to save, surface a fixed user-facing error) and what it preserves about the trusted state.
 - Two implementations (canonical port and JVM IDE port) and their parity gap.
@@ -75,15 +75,17 @@ A throw at a save site refuses the save: nothing is persisted, the in-memory pen
 
 ## Behavior
 
-### Save-time call sites
+### Call sites
 
 The check is invoked at every place where a Jolli URL is about to enter a trusted boundary:
 
-1. **OAuth callback save.** The browser-login flow validates the configured Jolli URL before composing the outbound login page URL and again before issuing the code-exchange POST. (See **OAuth Browser Login Flow** and **CLI Authorization Code Exchange**.)
+1. **OAuth sign-in.** The browser-login flow has the resolved Jolli URL screened before the browser is opened, and screened again before the code-exchange request is issued. On the canonical port and the editor extension the first screening happens inside the origin resolver (login-URL composition is then plain concatenation and re-checks nothing); on the JVM IDE surface the resolver does not check, so the first screening is the login-URL composition itself. (See **OAuth Browser Login Flow** and **CLI Authorization Code Exchange**.)
 2. **`configure --set jolliUrl`.** Before persisting a user-supplied URL via the CLI configuration command. The same command path also runs the API-key validation when `--set jolliApiKey` is used, which itself includes this check on the embedded `u`.
 3. **Settings UI save.** Before persisting a URL the user typed into the editor extension's settings panel.
 4. **`JOLLI_URL` env var at read time.** When the resolver reads `JOLLI_URL` (or falls back to the default Jolli URL) during a process startup, it runs the check on the resolved value. A long-lived process that started without `JOLLI_URL` set, then had it injected by an attacker into the environment, would still go through the resolver on subsequent reads and fail-closed before any request is built.
 5. **API-key save (indirect).** The save-time validator for the product API key decodes the key, then runs this check on the decoded `u`. So pasting an off-allowlist API key is also refused at save.
+6. **Composition of a URL for a page on the product's site.** Building the login-page URL and the hosted sign-in-completion-page URL runs the check on the tenant base. This is not decorative: the composed value is handed to a browser — the completion URL is written directly into an HTTP `Location` response header on the loopback callback — and the tenant URL can originate from an environment variable that no other layer validates. The check runs on the **base** origin *before* the page path and query parameters are appended; the resulting full URL is **not** re-checked.
+7. **Credential persistence boundary.** The combined credential save re-runs the check on the Jolli URL it is about to persist, so no caller can persist an off-allowlist origin for downstream readers to trust. (See **Auth Credential Storage**.)
 
 ### Algorithm
 
@@ -100,7 +102,7 @@ Given an input string:
 
 ### Save-time-only doctrine
 
-This check is invoked only at save time and at env-var read time. Request paths (push, LLM proxy, code exchange) trust the saved value and do not re-run the allowlist on every outbound request.
+This check is invoked at save time, at env-var read time, and when composing a product-site URL that will be handed to a browser. Request paths trust the saved value and do not re-run the allowlist on every outbound request. Concretely: neither the memory-push client nor the share client re-checks the allowlist before issuing a request — each only *parses* its resolved base URL into `(origin, tenantSlug)`. A product API key whose embedded tenant is off the allowlist is therefore used as-is by those clients; the barrier is that such a key should never have been persisted in the first place.
 
 The exception is the code-exchange entry point, which re-runs the check on its `jolliUrl` argument. This is documented as defense against a long-lived process that holds a stale, off-allowlist value in memory — not because a fresh save could ever produce one.
 
@@ -135,7 +137,13 @@ There is no Trusted → Tainted transition. The allowlist throw runs *before* th
 - **A failed save does not taint the trusted state.** The throw runs before any persistence call, so the in-memory pending state can be cleared by the caller (the browser-login flow does exactly this) and the on-disk trusted value is unaffected. (Notable.)
 - **`configure --set jolliApiKey` runs the API-key validator, which calls this check on the decoded `u`.** A key whose payload claims an off-allowlist URL is refused with this layer's message, even though the user only supplied the key. (Notable.)
 - **`JOLLI_URL` resolver fail-closes.** The resolver lowercases nothing; it strips trailing slashes, then calls this check. A blank or unset env var falls through to the default URL (which is on the allowlist). A non-blank value pointing off-allowlist throws and the calling command surfaces the error to the user without persisting anything. (Notable.)
-- **Two implementations exist with a parity gap.** The canonical port enforces the full predicate (HTTPS, non-empty host, suffix-boundary host check) at every save site listed above. The JVM IDE port currently does *not* run this allowlist check on its `JOLLI_URL` resolver, on its login-URL composition, or on its API-key save path — it accepts whatever the user supplies as long as the URL is parseable. The JVM IDE port also does not have a `configure --set jolliUrl` equivalent. This is a known parity gap, not an intentional difference. (Surprising; documented.)
+- **No carriage-return / line-feed rejection exists — and none is needed as a separate rule.** Nothing in this layer (or in the URL-composition callers) inspects an input for header-splitting characters. What actually blocks such an input is URL normalization mangling the host into something this predicate then refuses. State the mechanism as "the origin allowlist rejects it", never as "CR/LF is detected and refused" — a reader who assumes a dedicated CR/LF filter exists will look for a guard that is not there. (Surprising; document the real mechanism.)
+- **Two implementations exist, and the parity gap has narrowed but not closed.** The canonical port enforces the full predicate (HTTPS, non-empty host, suffix-boundary host check) at every save site listed above. For the JVM IDE surface:
+  - **Login-URL composition IS checked now.** That composition happens in the shared command-line runtime on the plugin's behalf, so the canonical predicate runs on the tenant base before the browser is opened. The plugin's callback handling is likewise gated: the completion-page URL is composed (and therefore checked) at the top of callback handling, before the shape of the callback is even examined — so **both** the code-exchange shape and the legacy token shape are covered.
+  - **Its own tenant-URL resolver still performs no check of its own.** It reads an environment variable, then a system property, then falls back to a default, and returns whatever it finds as long as it is non-blank — it does not parse or validate. The value is only screened later, downstream, at login-URL composition and at callback handling. So an off-allowlist value flows freely inside the plugin until it reaches one of those two boundaries, where it fails closed.
+  - **Its own key validator is now unreachable from production code.** The JVM port still carries a decode-then-check-origin validator for product API keys, but no production call site invokes it (only tests do). Its settings surface persists a pasted key with no allowlist screening at all, so an off-allowlist key entered there is not refused at save on that surface.
+  - The JVM IDE port also does not have a `configure --set jolliUrl` equivalent.
+  Its origin-check helper *is* used in production for two other purposes (screening a share URL, and screening the telemetry reporting origin). (Surprising; partially documented gap.)
 
 ## Shared Behavior
 

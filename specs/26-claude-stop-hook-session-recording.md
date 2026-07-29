@@ -12,6 +12,7 @@ Record one entry into the local session registry every time the Claude Code agen
 - The shape of the payload received over standard input.
 - The fields written into the session registry record.
 - The ordering and decision points before, during, and after the registry write.
+- The local-agent-child gate evaluated before anything else, which detection channel it consults, and why that is the right channel here.
 - The repo-wide manual-disable gate read before the configuration load, and what returning on it rules out.
 - The fire-and-forget execution contract that lets the agent return control immediately.
 - The set of conditions that cause the handler to do nothing (early-exit and skip cases).
@@ -75,6 +76,12 @@ The handler does not read the transcript file at this stage; it only stores the 
 
 ### Execution order
 
+**Evaluated first, ahead of the numbered sequence below — the local-agent-child gate.** Before reading standard input, before configuring the diagnostic log directory, and before any other work, the handler checks whether this process descends from a generation invocation the product itself made against a locally-installed agent CLI. If it does, it logs an informational line and returns, doing nothing at all — no registry write, no discovery pass, no cursor write, no telemetry flush, and standard input is never even read. Recording a session for the throwaway temporary working directory such an invocation runs in is pure self-recursion noise.
+
+This site consults the **inherited-environment channel only**; it passes no working directory and therefore never consults the working-directory marker. That is the correct channel here because this handler is a direct descendant of the product's own child: the product sets the marker on the agent CLI it spawns, and the hooks that CLI in turn spawns inherit the environment reliably. The marker-file channel exists for the one entry point that is launched by a *host* rather than by the product's own child, where the environment can be sanitized away. Both channels, and the reason the marker-file probe is opt-in per call site rather than always on, are owned by spec 280.
+
+Then, in order:
+
 1. If the project-directory environment variable is set, configure the diagnostic log directory under that path before any other work.
 2. Read all bytes from standard input as text. If the read fails, log the failure and return without writing anything.
 3. If the resulting string is empty (after trimming whitespace), log a warning and return.
@@ -116,6 +123,7 @@ The gate is fail-safe in one direction only. Running when it could have deferred
 ### Branches
 
 - **All inputs valid** → record is upserted into the session registry, then the discovery pass runs (plan first, references second), then the merged cursor is advanced, then the telemetry buffer is flushed.
+- **Running inside a product-spawned local agent** → nothing at all happens; standard input is never read, so no payload check, no manual-disable read, no configuration load, no registry write, no discovery pass, no cursor write, and no telemetry flush; logged informational message.
 - **Standard input read fails** → no registry write, no discovery pass, no error propagation; only a logged error.
 - **Empty standard input** → no registry write, no discovery pass; logged warning.
 - **Malformed JSON on standard input** → no registry write, no discovery pass; logged error.
@@ -155,6 +163,7 @@ This is the property that makes it acceptable to run the handler on every single
 
 | Class                       | Trigger                                           | Outcome                                                            |
 | --------------------------- | ------------------------------------------------- | ------------------------------------------------------------------ |
+| Running inside a product-spawned local agent | The inherited environment marks this process a descendant of a product-made agent-CLI generation invocation. | Logged info; handler returns before reading standard input — nothing is read and nothing is written. Not an error condition. |
 | Input I/O failure           | Standard input cannot be read.                    | Logged; handler returns without writing.                           |
 | Empty input                 | Standard input is whitespace-only.                | Logged warning; handler returns.                                   |
 | Malformed JSON              | Standard input is not valid JSON.                 | Logged; handler returns.                                           |
@@ -193,6 +202,7 @@ This handler never deletes a session record itself. It can only insert or refres
 - **No transcript read for the session-recording write itself.** The recording step only stores the transcript-file path; it never reads the file. The plan-discovery and reference-extraction scans that run afterwards do read the transcript suffix beyond the merged cursor, but each scan reads only the new lines (the incremental cursor keeps the per-stop cost flat regardless of total transcript length). Reading the transcript for the purpose of model input (summary generation) is still deferred to a downstream consumer (the source-control commit pipeline).
 - **No model call at this stage.** The handler never contacts any language-model provider. The plan-discovery and reference-extraction scans are pure local processing — file reads, set operations, registry mutations. All model interactions for this product happen in the source-control commit pipeline, not in agent hooks.
 - **One implementation.** This handler is the single implementation of the stop-hook contract for every surface, including the agent-plugin surface, which invokes this same handler rather than carrying its own port. An earlier JVM-based port — which omitted the discovery pass entirely and treated the payload's working directory as required — no longer exists.
+- **The local-agent-child gate outranks even the manual-disable gate, and is environment-only.** It is the very first thing the handler evaluates — ahead of the log-directory setup, the payload read, and the manual-disable read — so a nested generation session produces exactly one log line and no disk effect of any kind. It deliberately consults only the inherited environment and not the working-directory marker, for two reasons that hold specifically here: this handler is spawned by the product's own child and so inherits the environment reliably, and keeping the marker-file probe opt-in per call site means this gate cannot be flipped by unrelated stubbing of filesystem checks. (Notable; channel rationale owned by spec 280.)
 - **The manual-disable gate outranks the per-integration opt-out, and masks it.** The repo-wide flag is read before the configuration is loaded, so on a disabled repository the per-integration Claude flag is never consulted at all. It also masks the required-field check: a disabled repository never warns about a malformed payload. (Surprising; intentional — the repo-wide opt-out is the highest-priority signal and must not be reachable-around.)
 - **Discovery has exactly one owner, decided per invocation by three independent conditions.** The gate is deliberately narrow: it needs a plugin-process marker, the shared launcher actually present on disk, *and* both canonical agent hooks registered in the repository-**local** settings file with an exact command and asynchronous-execution match. A legacy-form command that merely contains a recognized product marker, a repository using the older shared settings file, or a healthy stop hook alongside a missing session-start hook all fail the gate — and failing it means this invocation runs discovery itself. Erring toward running is the safe direction; erring toward deferring could leave nobody running it. (Surprising; intentional.)
 - **The cursor's forward-only nature is what makes the single-owner gate necessary.** Two runners of different vintages sharing one merged cursor means the older one can advance it past transcript lines it cannot interpret, and those lines are then never re-read. Serializing which runner owns the pass is cheaper and more robust than making the cursor reversible. (Notable; the design rationale.)
@@ -205,6 +215,7 @@ This handler never deletes a session record itself. It can only insert or refres
 ## Shared Behavior
 
 - The session registry's storage layout, atomic-write semantics, and stale-entry pruning rules are defined by the **session-tracking** spec.
+- The local-agent-child gate evaluated ahead of everything else — the backend that sets the markers, the two detection channels, which entry points opt into the working-directory channel and which stay environment-only, and the write-boundary backstop behind both — is owned by spec 280. This spec records only that this handler carries the gate and that it is one of the environment-only sites.
 - The repo-wide manual-disable flag read before the configuration load — its storage, repo-wide anchoring, priority, migration, and the fact that eight other hook and worker entry points carry the same gate — is owned by the manual-disable spec.
 - The registration of the two canonical agent hooks whose exact shape the single-owner gate tests, and the per-hook health contract it consumes, are owned by the agent-hook installation spec. The shared machine-global launcher whose presence the gate probes is owned by the dispatch-script spec.
 - The telemetry buffer, its consent gate, and its flush semantics are owned by the telemetry specs; this handler is only one of the occasions that triggers a flush.

@@ -41,7 +41,7 @@ Exactly one JSON line:
 { "type": "migrate-memory-bank", "status": "…", "totalEntries": <n>, "migratedEntries": <n> }
 ```
 
-`status`, `totalEntries`, and `migratedEntries` are the subset of the engine's migration state that an out-of-process caller needs for a status line. The `status` vocabulary is the engine's (`in_progress` / `completed` / `partial` / `failed`) and is owned by the migration-engine spec.
+`status`, `totalEntries`, and `migratedEntries` are the subset of the engine's migration state that an out-of-process caller needs for a status line. The `status` vocabulary is the engine's (`pending` / `in_progress` / `completed` / `partial` / `failed` / `skipped`) and is owned by the migration-engine spec, including which of those values the engine actually emits and which are never persisted.
 
 ### Error envelope (standard output)
 

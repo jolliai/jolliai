@@ -1,10 +1,10 @@
 {
   "branches": {
     "main": {
-      "revision": "b09ac5189533e2497621a5c3dd7690df10fe9c1f",
-      "subject": "fix(claude-plugin): drop JOLLI_DIST_PREFER_SOURCE so cli wins same-version ties",
-      "reviewedAt": "2026-07-25T17:34:32Z",
-      "actor": "douglas.schroeder",
+      "revision": "18e8c624493ae9f1f18ea84a58ae9183cb5deb93",
+      "subject": "Set up jteam plugin configuration",
+      "reviewedAt": "2026-07-29T22:37:36Z",
+      "actor": "doug.schroeder",
       "skill": "specs-update"
     }
   }

@@ -15,10 +15,12 @@ A trio of IDE editor wrappers that expose a stored commit memory as if it were a
 - Tab title format and the always-clean (never dirty) state.
 - Tab reuse: clicking the same memory twice surfaces the existing tab instead of opening a duplicate.
 - Lifecycle: ephemeral (no persistence across IDE restart), disposed when the tab is closed.
+- The tab's borrow-and-return relationship with the embedded-browser pool: taking a lease when the body is constructed, what a refused lease degrades to, and exactly what the tab must detach before handing the lease back.
 - Boundary with the embedded HTML summary view (the editor's body delegates to it).
 
 **Out of scope:**
 - The contents of the embedded HTML summary view — owned by its own spec.
+- The embedded-browser pool's own rules — capacity, standby target, eviction, prewarm, and disposal — owned by spec 302. This spec covers only the lease this tab holds.
 - The mechanism by which the memory is read from storage — owned by the storage spec.
 - The action toolbar that the editor exposes — currently none beyond the IDE-standard tab actions.
 - Persistence of an open memory tab across IDE restarts — explicitly not supported.
@@ -77,7 +79,7 @@ The editor's component is the embedded HTML summary view (its own spec). The edi
 | property-change listeners | accepted but never fired                     |
 | `getFile()`         | the wrapping virtual file                          |
 
-When the tab is closed, the editor's `dispose()` calls through to dispose the embedded HTML summary view (which releases the embedded browser process, the message-bridge query handler, and any in-flight LLM/HTTP calls bound to it).
+When the tab is closed, the editor's `dispose()` calls through to dispose the embedded HTML summary view. That teardown does **not** destroy the embedded browser — it **returns** it to the project-scoped browser pool for the next memory tab to reuse (spec 302). What it does release is everything the tab attached to that shared instance: the message-bridge query channel, the navigation-interception and load-completion observers (all three through the lease), and the tab's own size and visibility observers (which the lease does not track and the tab must therefore detach itself). All of it must come off precisely because the shared instance **outlives the tab** — a missed detachment accumulates one stale observer set per open/close cycle instead of being collected with the tab.
 
 ## Behavior
 
@@ -89,7 +91,9 @@ When the tab is closed, the editor's `dispose()` calls through to dispose the em
 4. The IDE's editor manager looks up an existing tab with an equal virtual file:
    - If found, the existing tab is brought to front.
    - If not, the registered provider is consulted; it accepts the file; the IDE constructs a new editor; the editor's body is the embedded HTML summary view bound to the memory.
-5. The tab title is the virtual-file's `name`. The tab is marked read-only (no dirty dot).
+5. Constructing that body **takes out a lease on an embedded browser from the project-scoped pool** (spec 302) rather than building one of its own: immediate when an idle instance is on standby, otherwise a synchronous construction on the UI thread. The lease is also the only sanctioned attachment point for the tab's message bridge and its navigation/load observers.
+   - If the pool **refuses** the checkout — it has been disposed, or the call is off the UI thread, or construction genuinely fails — the refusal is caught along with any other construction failure and the editor's body becomes the pre-existing read-only plain-text rendering of the memory instead (spec 120). No lease is retained, so the tab's later teardown hands nothing back.
+6. The tab title is the virtual-file's `name`. The tab is marked read-only (no dirty dot).
 
 ### Tab reuse
 
@@ -109,7 +113,8 @@ No tab is opened in either case.
 When the tab is closed:
 
 - The editor's `dispose()` is called.
-- That disposes the embedded HTML view, which in turn disposes the embedded browser, the bridge, and any pending background work.
+- That disposes the embedded HTML view, which detaches the tab's own size and visibility observers from the shared browser's component **first** (so no next tenant can attach in between), then hands the lease back — which detaches the bridge channel and the navigation/load observers and **returns the browser to the pool**. The browser itself is not destroyed.
+- Because the pool's hand-back requires the UI thread while the IDE's disposer can tear an editor down from any thread during project close, the teardown hops to the UI thread when it is not already there. Handing back off the UI thread is the sharp edge the hop avoids: the lease's own cleanup runs and marks itself spent *before* the pool's thread assertion fires, which strands that instance in the checked-out set — stripped of handlers, never re-offered, one slot of the pool's ceiling lost for the rest of the session (spec 302).
 - The virtual file is released; the IDE's editor manager forgets it.
 
 ### Persistence
@@ -134,13 +139,22 @@ The write itself is a **cross-process round-trip** to the shared store-a-summary
       [tab with same H already exists]
         bring to front
       [no such tab]
-        provider claims; build embedded HTML view bound to M; new tab opens
+        provider claims; build embedded HTML view bound to M
+          take a browser lease from the project pool
+            [idle instance available] → immediate
+            [none available]          → synchronous construction on the UI thread
+            [refused / construction failed] → plain-text fallback body; no lease held
+        new tab opens
 
   [M not found]
     show warning dialog; no tab opens
 
 [user closes the tab]
-  editor.dispose() → embedded HTML view disposed → bridge / browser released
+  editor.dispose() → embedded HTML view disposed
+    detach the tab's own size / visibility observers from the shared component
+    hop to the UI thread if the disposer raced us elsewhere
+    hand the lease back → bridge channel + navigation/load observers detached
+                        → browser returned to the pool (not destroyed)
 
 [IDE restarts]
   no memory tab is restored
@@ -157,12 +171,14 @@ The write itself is a **cross-process round-trip** to the shared store-a-summary
 - **No persistence across IDE restart.** The lack of a backing path makes the IDE's standard "reopen last editor" mechanism a no-op for memory tabs. Closing and re-opening the IDE leaves the editor area empty of memories.
 - **The display name `"Commit Memory"` is internal.** It surfaces in accessibility / breadcrumb roles, not in the tab title; the tab title is the virtual-file's `name`.
 - **The provider is dumb-aware.** Memory tabs can be opened during project indexing; the editor does not depend on indexes.
-- **Disposing the tab disposes downstream resources.** The chain runs: tab close → editor dispose → embedded HTML view dispose → bridge query handler released → embedded browser process released. This is what makes opening and closing many memory tabs in a row safe.
+- **Opening and closing many memory tabs in a row is safe because of lease-and-return discipline, not per-tab teardown.** The embedded browser is *not* destroyed on tab close — it goes back to a project-scoped pool whose bounded capacity is what stops the population from growing without limit (spec 302). What tab close guarantees is that nothing the tab attached survives on the shared instance: the bridge channel and the navigation/load observers come off through the lease, and the tab's own size and visibility observers — which the lease does not track — come off by the tab itself, before the hand-back. A missed detachment here does not leak with the tab; it accumulates on an instance the *next* tab will receive.
+- **Teardown may be raced onto a non-UI thread, so it hops before handing the lease back.** Tab close normally runs on the UI thread, but the IDE's disposer can tear editors down from any thread while a project is closing. The pool's hand-back asserts the UI thread, and failing that assertion is worse than it sounds: the lease has already cleaned up and marked itself spent by then, so the instance is stranded in the checked-out set and one slot of the pool's ceiling is lost for the session. The hop is what makes project close harmless. (Notable; see spec 302.)
 - **Three host paths converge on the same virtual file.** The MEMORIES single-click, the COMMITS eye-icon click, and the COMMITS double-click all build the same kind of virtual file via the same constructor. They differ only in their no-summary fallback dialog text.
 
 ## Shared Behavior
 
-- **Embedded HTML summary view** — the editor's body; this topic is the IDE wrapper around it.
+- **Embedded HTML summary view** (spec 120) — the editor's body; this topic is the IDE wrapper around it, including the plain-text fallback body a refused browser checkout lands in.
+- **Embedded-browser pool** (spec 302) — supplies the browser this editor's body borrows for the life of the tab, defines the lease that is the only sanctioned attachment point for the bridge and the navigation/load observers, and owns the capacity, eviction, and disposal rules that make return-instead-of-destroy safe.
 - **Storage** — the source of the memory the virtual file wraps.
 - **MEMORIES panel and COMMITS panel** — the two surfaces that build virtual files and call the IDE's open-file mechanism.
 - **IDE editor manager** — the dispatch layer that looks up provider claims, performs equality-based tab reuse, and routes lifecycle calls.

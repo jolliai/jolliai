@@ -18,7 +18,8 @@ A read-only embedded-browser editor tab that renders "the full memory the next c
 - The JS↔host bridge: the page calls a single host function with a JSON command; the host recognizes the `commitMemory` command and runs the AI commit on the UI thread.
 - The reload-on-status-change behavior: the page is rebuilt off the UI thread and reloaded whenever project status changes.
 - External-link handling: http/https navigations open in the system browser instead of inside the panel.
-- The light/dark theming sourced from the IDE's current theme.
+- The theming inputs and their disagreement: the pre-load shell colour taken from the IDE's live editor background, the light/dark palette taken from the widget theme's brightness flag, and the page's own background left at the borrowed stylesheet's dark default.
+- The fact that this view constructs and destroys its own embedded-browser instance rather than borrowing a pooled one.
 
 **Out of scope (boundaries):**
 
@@ -113,8 +114,13 @@ In order:
 ### Opening / building
 
 1. The tab is created with the embedded-browser body.
-2. The body builds the HTML from the gathered view and the current light/dark theme and loads it.
-3. A status listener is registered so the page reloads on every status change.
+2. **Before the first content load**, the IDE's live editor background colour is read and applied to both the hosting component and the embedded browser's initial blank page. The browser keeps the blank page painted until the real page commits its first frame, so this is what stops the blank-to-content navigation from flashing white.
+3. The body builds the HTML from the gathered view and the current light/dark theme and loads it.
+4. A status listener is registered so the page reloads on every status change.
+
+**Theming divergence worth recording.** The pre-load background in step 2 comes from the **editor colour scheme**, while the light/dark palette baked into the page in step 3 comes from the **widget theme's brightness flag** — two independent settings that can disagree. The memory-summary view (spec 120) derives both from one colour precisely so they cannot; this view was given the pre-load background treatment without that second half.
+
+The page's own background is a third, separate input, and it is currently wrong in the light case. This page borrows the memory-summary view's stylesheet, whose background variable is a parameter with a **dark default**; this view passes only the light/dark flag and never supplies a colour. So the page always paints a near-black background: correct-looking under a dark widget theme, and under a **light** widget theme a near-black page rendered with the light palette's near-black text — the page's own content is effectively unreadable. The pre-load shell colour also stops matching the page's background whenever the editor scheme's background is not that same near-black. See Notable Behavior.
 
 If the embedded browser cannot be created, the body falls back to a read-only monospace text area reading that the preview requires the embedded browser; no further data gathering or bridge is set up.
 
@@ -185,6 +191,10 @@ Remove the status listener, dispose the bridge query handler, and dispose the em
 - **External links escape the panel.** http/https navigation opens in the system browser; the embedded page never navigates away.
 - **The Commit Memory bridge supplies an explicit project context.** Invoking the action from the embedded panel's own component context could resolve a null project; the host therefore builds the event with the project data context directly.
 - **The page reuses the shared summary theme tokens** and layers working-memory-specific rules on top, so it visually matches the memory-summary and PR web views.
+- **The pre-content blank page is theme-coloured, which is what removes the white flash on open.** The embedded browser keeps the previous document painted until the new one commits a frame, so colouring the blank page (and the hosting component) covers the whole parse-and-first-paint window. (Notable.)
+- **This view's pre-load shell colour and its palette come from two settings that can disagree.** The shell colour is the live editor background; the light/dark palette is the widget theme's brightness flag. The memory-summary view (spec 120) derives both from one colour to make that impossible — this view does not. (Divergence; not yet closed here.)
+- **Under a light widget theme this page is currently unreadable.** It borrows the memory-summary stylesheet, whose page-background variable is a parameter with a dark default, and passes only the light/dark flag — never a colour. The light palette therefore renders near-black text on a near-black page. The dark case looks right by coincidence of that default, and even there the page's background stops matching the pre-load shell colour whenever the editor scheme's background is not that same near-black. (Bug-shaped; the rendered reality is what is recorded here.)
+- **This view is not pooled.** It constructs its own embedded browser instance and destroys it on disposal, unlike the memory-summary tab which borrows one from the project-scoped pool and hands it back. It is consequently not counted against that pool's capacity (spec 302). (Notable.)
 - **The embedded-browser-unavailable fallback is inert.** When the browser cannot be created, only a static message is shown; no view is gathered, no bridge exists, and the Commit Memory path is unreachable from that tab.
 - **The tab is always clean.** It never shows a dirty dot, never prompts on close, and is not restored across IDE restarts (no backing path).
 

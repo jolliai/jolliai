@@ -76,7 +76,7 @@ Step elements that are missing any of `id`, `description`, or `status` are silen
 A record carrying:
 - `summary` — verbatim from the LLM response.
 - `steps` — the validated/normalized step array.
-- `llm` — call metadata (resolved model id, input token count, output token count, end-to-end API latency in milliseconds, stop reason, defaulting to null when the SDK omits it).
+- `llm` — call metadata (resolved model id, input token count, output token count, end-to-end API latency in milliseconds, stop reason defaulting to null when the SDK omits it, the credential source the call resolved to, and — only when that source is the local-agent one — which local agent tool produced it). The last two are copied straight off the call result; the tool identifier is absent for every non-local-agent source. Both field shapes are owned by the summary-tree spec's call-metadata record.
 
 The evaluator does NOT add commit metadata; the caller is responsible for wrapping the result.
 
@@ -114,7 +114,7 @@ For each plan in the association list:
 8. Attempt to parse the (possibly fence-stripped) text as JSON. On parse failure, log a warning containing a truncated snippet of the raw text and yield null.
 9. Validate that `summary` is a non-empty string AND `steps` is an array. If either check fails, log a warning and yield null.
 10. Walk each step in the array. Skip elements missing `id`, `description`, or `status`. Coerce a status value outside the valid enumeration to `not_started`. Coerce a missing or null note to null. Append surviving elements to the validated step array.
-11. Capture call metadata into a structured record (model id, input/output tokens, latency, stop reason).
+11. Capture call metadata into a structured record (model id, input/output tokens, latency, stop reason, credential source, and the local-agent tool identifier when the call ran through a local agent).
 12. Return the evaluator result `{ summary, steps, llm }`.
 
 ### Caller wrapping and persistence

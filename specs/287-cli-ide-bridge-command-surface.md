@@ -9,7 +9,8 @@ A hidden command surface lets a non-TypeScript IDE host invoke any command-line-
 **In scope:**
 - Registration of the three commands that make up this surface, their hidden-ness, their default working directory, and the fact that none can appear in a help section.
 - The protocol identifier and the handshake notification the long-lived form emits before any read.
-- The request envelope, its validation rules, and the field that is accepted but never validated.
+- The request envelope, its validation rules, the field that is accepted but never validated, and the optional correlation identifier.
+- The per-request surface-identity override on the platform-API action, and the drift warning that fires when a network-reaching operation arrives without it.
 - The response envelope shapes, the two error codes, and the differences between the one-shot and long-lived envelopes.
 - The complete action catalogue: every action, its operations, its required fields, and the exact error text a missing or wrong field produces.
 - Credential redaction on error payloads: the two barriers, their asymmetry, what is copied at all, and what that means for an ordinary error.
@@ -54,12 +55,15 @@ The long-lived request/response form speaks `jolli-ide-bridge-jsonrpc-v1`. Befor
 ### Request envelope (long-lived form)
 
 ```
-{"jsonrpc"?: any, "id": number | string | null, "method": <action name>, "params"?: {"cwd"?: string, "request"?: object}}
+{"jsonrpc"?: any, "id": number | string | null, "method": <action name>,
+ "params"?: {"cwd"?: string, "request"?: object, "traceId"?: string}}
 ```
 
 - **`jsonrpc` is accepted but never validated and never required.** A line with no `jsonrpc`, or with a wrong value, is processed normally. The protocol-version field is decoration on this wire.
 - `method` must be a non-empty string; it is the action name.
 - `params`, `params.cwd`, and `params.request` must be a JSON object / object / string of the right type when present; each is optional.
+- `params.traceId` is an optional **correlation identifier**. It is validated only as a string (`Request field "params.traceId" must be a string.`); the value's own shape is not checked here. When it is a well-formed correlation identifier the action runs inside a scope carrying it, so every outbound platform request the action makes carries the caller's identifier instead of a freshly minted one — which is what keeps the IDE's logs, this surface's logs, and the platform's logs correlatable for one logical operation. A malformed value is **silently replaced by a fresh identifier**; it is never an error.
+- **Every request that reaches dispatch opens a correlation scope, supplied or not.** Opening the scope is unconditional — a request with no `traceId` gets a fresh identifier rather than no scope, so outbound requests are always correlatable. (A line that fails parsing or validation never reaches dispatch and so opens no scope.)
 - Unknown extra fields at any level are ignored.
 
 ### Request (one-shot form)
@@ -81,7 +85,7 @@ Two deliberate asymmetries in the one-shot form:
 - **The success envelope carries no correlation id, because the process *is* the correlation.** One spawn answers one request; there is nothing to correlate against.
 - **The error envelope is written to standard output, not standard error**, and is accompanied by a non-zero exit code. A caller that reads only standard error sees nothing on failure.
 
-`-32000` is the code for every action-level failure in both forms. `-32603` is used in exactly one place: the fallback taken when serialising a response throws (a circular structure, a bigint), emitted by the same single writer that frames every other line.
+`-32000` is the code for every action-level failure in both forms. `-32603` is used in exactly one place: the fallback taken when serialising a response throws (a circular structure, a bigint), emitted by the same single writer that frames every other line. Because the one-shot form now writes through that same writer, the fallback covers it too — a one-shot result that will not serialise produces the `-32603` envelope with a null id, and because the writer swallows the serialisation failure rather than rethrowing it, the process still exits zero.
 
 ### Error-payload redaction (identical in both forms)
 
@@ -124,11 +128,11 @@ Twenty-six actions. Actions whose work is a family of named operations take the 
 | `conversation-overlay` | `hide` / `view` / `merge-save` — all require `source` and `sessionId` |
 | `session-state` | `global-config-dir`, `notes-dir`, `config-load` (`dir?`), `config-save` (`config`, `dir?`), `plans-load`, `plans-save` (`registry`), `worker-busy`, `acquire-lock` (`timeoutMs?` = 5000, `pollMs?` = 25), `release-lock`, `save-plugin-source`, `save-squash-pending` (`sourceHashes`, `expectedParentHash`) |
 | `auth` | `site-url`, `is-signed-in`, `parse-api-key`, `validate-api-key`, `assert-origin`, `should-request-fresh`, `build-login-url` (`jolliUrl`, `callbackUrl`, `clientVersion`; optional `state`, `generateApiKey`, `installId`. `generateApiKey` also appends a locally-resolved `device_name`, so a second machine's sign-in mints its own key row), `exchange-and-save`, `handle-auth-callback` (`jolliUrl`, `queryString`, `expectedState`; optional `retryHint` for the `user_denied` sentence → `{ success, redirectUrl, token?, space?, jolliApiKey?, errorCode?, errorMessage? }`; whole-callback handler for IDE surfaces — accepts the `?code=` shape (with CSRF check) and the legacy `?token=` shape (without CSRF check, mirroring main CLI / VS Code)), `sign-out` |
-| `jolli-api` | `serialize-summary` (no key needed) and `llm-proxy` (`apiKey`, `action`, `params` — a string→string map; returns `{ text, inputTokens, outputTokens }`; takes no `baseUrl`) both return before the push client is built; `push`, `delete`, `list-spaces`, `create-binding`, `create-share`, `update-share`, `revoke-share`, `invite-share`, `list-org-members` — each requires `apiKey`, with an optional `baseUrl` |
+| `jolli-api` | `serialize-summary` (no key needed) returns before the platform client is built; `push`, `delete`, `list-spaces`, `create-binding`, `create-share`, `update-share`, `revoke-share`, `invite-share`, `list-org-members` — each requires `apiKey`, with an optional `baseUrl`. An optional `clientHeader` surface-identity override (below) is read and string-validated for **every** operation, but only affects the network-reaching ones |
 | `pricing` | `sonnet-cost`, `provider`, `model-cost`, `total-cost` |
 | `shared-store` | `pins-read` / `-add` / `-remove`; `selection-read` / `-key` / `-set` / `-set-all`; `branch-share-put` / `-remove` / `-get`; `push-pending-hashes`; `repo-profile-read`; `repo-profile-set-backfill-dismissed`; `summary-markdown`; `summary-pr-markdown`; `pr-wrap-markdown`; `pr-replace-markdown`; `reference-push-presentation` |
 | `summary-store` | `index`, `get`, `list` (`count?` = 10), `count`, `find-root`, `filter-hashes`, `scan-aliases`, `resolve-alias`, `store-summary`, `read-plan-progress`, `store-files`, `read-plan`, `write-plan`, `read-reference`, `write-reference`, `transcript-hashes`, `read-transcript`, `write-transcript-batch` |
-| `summary-tree` | `analyze`, `update-topic`, `delete-topic` — all require a `summary` object |
+| `summary-tree` | `analyze`, `update-topic`, `delete-topic` — all require a `summary` object. `analyze` additionally returns the summary's **resolved transcript identifiers**, so the version-tolerant resolution rule (an authoritative identifier list when the summary carries one, otherwise the legacy tree walk) lives here once instead of being re-ported per IDE surface |
 | `plan-grouping` | `base-key`, `base-keys`, `latest` |
 | `reference-store` | `read` (`sourcePath`), `parse` (`content`) |
 | `kb` | `resolve`, `initialize`, `find-repo-folders`, `find-fresh`, `archive`, `extract-repo-name`, `get-remote-url`, `discover`; plus `metadata-ensure`, `-read-manifest`, `-read-index`, `-read-config`, `-find-by-path`, `-update-path`, `-rename-branch-folder`, `-remove-branch-folder`, `-remove-manifest`, `-reconcile`, `-save-migration` — **every** metadata operation requires `jolliDir` |
@@ -143,10 +147,18 @@ Twenty-six actions. Actions whose work is a family of named operations take the 
 
 The set of accepted transcript sources for the two transcript actions is the surface's own canonical source list, not an inlined copy, and the twelve names match the IDE host's own enumeration exactly, so a round trip by name works.
 
+### Surface-identity override on the platform-API action
+
+Every `jolli-api` operation reads an optional `clientHeader` and rejects a non-string value with the ordinary string-field message. When present it **replaces** the client-identity header the bundled build would otherwise send — that default names the bundled build, not the surface that initiated the call, and the platform's per-surface minimum-version gate and its call attribution both key off the header. So an IDE surface stamps its own `<kind>/<version>` identity on every request.
+
+When a **network-reaching** operation arrives without it, the surface falls back to the bundled identity and logs a **non-fatal warning** naming the operation. The purely local operation (`serialize-summary`) is **exempt** from that warning — it builds no platform client and reaches no network. The warning is deliberately non-fatal because the product's own commands legitimately omit the field; it exists so a future IDE caller that forgets to stamp its identity is caught in the log rather than silently misidentifying itself.
+
 ### One-shot-only limits
 
-- **A hard request ceiling of 64 KiB** on piped input. Larger input is rejected. The long-lived form has no equivalent per-request ceiling.
-- **An outright refusal when standard input is a terminal**, reported as `"--arg-stdin requires piped stdin; it cannot be used interactively…"` — a message naming a flag that has nothing to do with this command. Consequence: typing the one-shot form at a terminal *always* produces that error envelope rather than running the action.
+- **A hard request ceiling of 16 MiB** on piped input, rejected as `"ide-bridge request payload exceeds 16777216 bytes"`. The long-lived form has no equivalent per-request ceiling. This ceiling is specific to this command: the separate argument-from-piped-input flow used by the installed skill templates keeps its own, much tighter **64 KiB** ceiling, and the two are deliberately independent — only this one was raised. The reason is that a request here is a JSON document synthesised in-process by an IDE plugin (a push body carries a whole commit summary plus its enriched sidecar), never text a human typed at a shell, so the memory-exhaustion concern that shapes the tight ceiling does not apply; the bound is kept only so a pathological caller fails fast rather than after minutes of streaming.
+- **An outright refusal when standard input is a terminal**, reported as `"ide-bridge request requires piped stdin; it cannot be used interactively. Pipe the argument via a here-doc or echo."` Consequence: typing the one-shot form at a terminal *always* produces that error envelope rather than running the action.
+
+Both messages are built from the same template as the argument-from-input flow's, with a per-caller label substituted — which is why they now name this command rather than that flow's flag.
 
 ## Behavior
 
@@ -190,7 +202,7 @@ Logging, however, was bound **once**, at startup, to the startup directory. So *
 
 ### Why standard output stays clean
 
-Console output is silenced process-wide at startup, and the two informational notices that would otherwise print (the telemetry disclosure and the version-mismatch notice) go to standard error. The only writers to standard output on these paths are the one-shot envelopes and the single framing writer.
+Console output is silenced process-wide at startup, and the two informational notices that would otherwise print (the telemetry disclosure and the version-mismatch notice) go to standard error. **Every** standard-output write on these paths — including the one-shot form's success and failure envelopes — funnels through the **single framing writer**. There is no second writer: the one-shot form and the long-lived loop share one choke point, so both emit exactly one well-formed JSON envelope per line and both inherit the same serialisation fallback.
 
 One pre-flight does run on **every** invocation, including both long-lived forms: a staleness refresh of the installed skill files, before argument parsing. Only the enable / disable / uninstall commands skip it. It is silent, so it cannot corrupt the wire — but it is a synchronous step paid on every spawn, including every one-shot bridge call.
 
@@ -221,8 +233,9 @@ spawn → bind log → read stdin
 
 - **A one-shot failure is reported on standard output, not standard error.** Combined with the non-zero exit, a caller that treats standard output as "only valid results" and standard error as "problems" sees the failure in the wrong stream.
 - **A one-shot success envelope has no correlation id** because the process is the correlation. Anything reading both forms with one parser must tolerate a missing id on success.
-- **Typing the one-shot form at a terminal always fails, citing an unrelated flag.** This makes the surface effectively un-explorable by hand.
-- **The 64 KiB request ceiling applies to the one-shot form only.** The same request that succeeds over a long-lived connection can be rejected outright when the connection is unavailable and the call falls back to a spawn.
+- **Typing the one-shot form at a terminal always fails.** The refusal now names this command, so the message is at least self-explanatory — but the surface remains effectively un-explorable by hand.
+- **The 16 MiB request ceiling applies to the one-shot form only.** The same request that succeeds over a long-lived connection can still be rejected outright when the connection is unavailable and the call falls back to a spawn — just at a far higher threshold than the tight ceiling the skill-template argument-from-input flow keeps. Raising one did not raise the other.
+- **The correlation identifier is the one inbound field whose *value* shape is tolerated rather than enforced.** It must be a string or the request is rejected, but a string that is not a well-formed identifier is quietly swapped for a fresh one — so a caller that stamps a malformed identifier loses cross-log correlation with no error and no warning anywhere.
 - **The protocol-version field on inbound requests is never checked.** Version negotiation on this wire exists only in the outbound handshake; inbound, any value (or none) is accepted.
 - **There is no `type` field anywhere on this wire.** Requests are `method` plus `params`; responses are `result` or `error` with `code` / `message` / `data`.
 - **Concurrency is unbounded.** No cap, no queue, no cancellation — a host is responsible for its own pacing, and a host that is not paced can drive an arbitrary number of simultaneous model calls, git invocations, and file writes.
@@ -232,7 +245,7 @@ spawn → bind log → read stdin
 - **An ordinary error contributes nothing to `data`.** Only explicitly attached fields are copied, so the common case is an error payload with just a name.
 - **`errorName` can be overwritten by the very copy pass that is supposed to enrich around it.**
 - **The raw git action accepts arbitrary argument vectors with no allowlist.** Any caller with access to this surface has full git command access against any directory it names.
-- **Much of the catalogue has no shipped consumer.** Authentication, platform-API, pricing, plan-grouping, reference-store, PR-description, raw git, git-remote, main-worktree-root, and all four telemetry actions — plus most of the shared-store operations — are live code paths with no IDE caller today. They are surface, not observed behavior.
+- **Part of the catalogue still has no shipped consumer, but authentication and the platform API are no longer in that set.** Three authentication operations (`sign-out`, `build-login-url`, `handle-auth-callback`) and nine platform-API operations (`push`, `delete`, `list-spaces`, `create-binding`, and all five live-share / org-member operations) now have a shipped IDE caller. What genuinely remains consumer-less: the **pricing**, **plan-grouping**, **reference-store**, **PR-description**, **raw git**, **git-remote** and **main-worktree-root** actions, and all four **telemetry** actions; the platform API's one purely local operation (`serialize-summary`); the seven unused authentication operations (`site-url`, `is-signed-in`, `parse-api-key`, `validate-api-key`, `assert-origin`, `should-request-fresh`, `exchange-and-save`); and all of the shared-store operations except the three pin operations. Those are surface, not observed behavior.
 
 ## Shared Behavior
 

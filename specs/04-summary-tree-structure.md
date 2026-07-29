@@ -13,6 +13,7 @@ Define the in-memory hierarchical commit-summary tree, its per-node fields, the 
 - The version-based discriminator that selects between the legacy regime (referred to as v3) and the unified-hoist regime (referred to as v4 onward).
 - Pure traversal helpers: collecting all topics in chronological order, aggregating diff statistics, summing conversation turns, summing conversation tokens (scalar and per-segment breakdown), merging per-model conversation usage across the tree, summing estimated cost across the tree, counting topics, collecting leaf-descendant source nodes, collecting transcript hashes, computing duration spans, collecting display-topics under each regime, collecting and deduplicating plans, updating one topic at a global tree-index, deleting one topic at a global tree-index.
 - The leaf-vs-container rule used by the canonical diff-stats helper.
+- The read-time provider-attribution string derived by walking the tree's call-metadata records (what it returns; where the resulting string is rendered is a presentation concern owned elsewhere).
 - The lightweight summary-index entry shape and the parent-pointer convention.
 
 **Out of scope (boundaries):**
@@ -36,7 +37,7 @@ Required fields:
 - `generatedAt`: ISO-8601 wall-clock timestamp at the moment the summary was (re)generated. Updated on every summary-generating event (commit, amend, squash, rebase).
 
 Optional classification fields:
-- `ticketId`: a ticket/issue identifier extracted from text (e.g. `PROJ-123`, `#789`).
+- `ticketId`: a ticket/issue identifier in one of exactly two whitelisted whole-string shapes: an alphabetic-led prefix of at least two characters (further characters may be alphabetic or digits), a hyphen, then one or more digits — stored upper-cased (e.g. `PROJ-123`) — or a `#` followed by one or more digits (e.g. `#789`), stored verbatim. Going forward the field is written **only** through that whitelist, so no other shape can enter. Values already persisted before the whitelist existed may not conform (a plan slug, a commit hash, a placeholder phrase); they are **not** migrated, and instead the two read surfaces that re-validate treat a non-conforming stored value as absent while every other consumer still sees it raw. The whitelist, its rejected shapes, and the exact set of guarded surfaces are owned by "Multi-Topic Commit Summary Generation".
 - `commitType`: enumeration `commit` | `amend` | `squash` | `rebase` | `cherry-pick` | `revert`. Indicates how this commit came to exist.
 - `commitSource`: enumeration `cli` | `plugin`. Indicates which user surface initiated the operation.
 
@@ -130,6 +131,8 @@ still read.
 - `cachedTokens`: optional integer — prompt-cache tokens on **the product's own summarization call** (cache-read + cache-creation, summed). Distinct from the node's `conversationTokenBreakdown.cached`, which measures the developer's conversation and excludes cache-read. Optional because summaries written before the field existed lack it (readers default to `0`). Defined by "Anthropic Message API Call".
 - `apiLatencyMs`: integer wall-clock milliseconds.
 - `stopReason`: nullable string. The literal value `max_tokens` indicates the response may have been truncated.
+- `source`: optional enumeration naming the **credential source** that produced this node, from a closed set of four: `anthropic-config` (a directly-configured vendor key), `anthropic-env` (a vendor key taken from the environment), `jolli-proxy` (the product's own proxy), `local-agent` (a locally-installed agent tool driven as the provider). Optional because summaries written before the field existed lack it; a reader must then omit provider attribution entirely rather than guessing. Populated for every new call.
+- `localAgentTool`: optional enumeration naming **which** local agent tool produced this node, from a closed set of four: `claude-code`, `codex`, `cursor-agent`, `opencode`. Present only when `source` is `local-agent`; absent on every other source and on summaries written before the field existed. When the local-agent path runs with no tool explicitly selected it records its default tool, so a new local-agent node always carries a value.
 
 ### PlanReference record
 - `slug`: string. After archival it takes the form `<originalSlug>-<commitHash8or-more>`.
@@ -254,6 +257,20 @@ helpers deliberately answer different questions ("what models were used" vs.
 written before the field existed also contribute 0, the tree-level total is
 always a lower bound, exactly as the per-node field is.
 
+### Derive provider attribution across the tree
+
+A read-time helper produces the one-line provider attribution that summary footers show. It walks the node and every descendant, and for each node that carries an `llm.source` it computes that node's **rendered label**, collecting the distinct labels in first-seen order:
+
+- For every source other than the local-agent one, the label is the fixed display string for that source.
+- For the local-agent source, the label is the generic local-agent string plus the specific tool's display name when `localAgentTool` is present, and the bare generic string when it is absent.
+
+Then:
+- No node in the tree carried a `source` → no attribution at all (callers omit the provider segment of the footer rather than printing an "unknown" placeholder).
+- Exactly one distinct label → that label.
+- Two or more distinct labels → a "mixed" form listing them, comma-separated, in first-seen order.
+
+De-duplication is by **rendered label**, not by the underlying `source` value. Two nodes attributed to the same source *and* the same tool collapse to one entry; two nodes attributed to the same source but different tools do not.
+
 ### Count topics (`countTopics`)
 Sum of `topics.length` across the node and all descendants (using 0 where absent).
 
@@ -343,6 +360,7 @@ There is no in-tree transition between regimes; each persisted summary fixes its
 - **Parent-pointer is tri-state.** A summary-index entry's `parentCommitHash` may be `null` (root), a string (child), or `undefined` (legacy v1 entry, treated as root for backward compatibility). Consumers must distinguish all three. (Notable.)
 - **Tree-hash alias is one-shot.** Once written into the index's `commitAliases` map, an alias is never invalidated, even if the underlying commits change. (Surprising; intentional.)
 - **Container nodes have no `llm` field** because no API call was made to produce the container; the LLM data lives on the leaves whose summaries the container wraps. (Notable.)
+- **Provider attribution de-duplicates rendered labels, not credential-source values.** Two consequences follow, both real. First, a consolidated tree whose children were produced by two *different* local agent tools now renders a mixed attribution naming both, where the earlier source-value de-duplication collapsed them into a single generic local-agent entry. Second, a `localAgentTool` value this build does not recognize — written by a newer build, or hand-edited — does not throw: the tool-name lookup falls back to the generic local-agent string, which in the local-agent label form yields the generic string in **both** positions (the generic prefix and the unresolved tool name), so the footer degrades to a doubled generic label rather than failing. Previously-stored summaries read unchanged: a local-agent node with no `localAgentTool` still renders the bare generic label, and every non-local-agent source renders exactly the label it always did. (Surprising; intentional.)
 - **Token-breakdown aggregation falls back per field, not per object.** A present-but-partial breakdown must contribute its present segments; a per-object fallback would let a missing field become NaN and, because `NaN > 0` is false, silently hide the whole aggregate figure. (Surprising; intentional.)
 - **`conversationTokens` and `conversationTokenBreakdown` are co-written and never zero.** Going forward both are present or both absent; a literal zero total is never stored, so absence means "no usage-bearing conversation", not "zero". Older data may carry the scalar total alone. (Notable.)
 - **`conversationModels` can be present without `estimatedCostUsd`.** Unlike the scalar/breakdown pair, per-model usage and cost are NOT strictly co-written: a commit whose usage is entirely on unpriced models keeps `conversationModels` (for future re-pricing) but omits `estimatedCostUsd` and `pricesAsOf` entirely. Absence of the cost field therefore means "no priced usage", not "zero cost" and not "no usage at all" — three distinct states collapse into two possible field combinations, which display code must not conflate. (Surprising; intentional. See "Multi-Provider Pricing and Cost Estimation".)

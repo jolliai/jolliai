@@ -36,8 +36,8 @@ Exactly the following keys are accepted by `--set` / `--remove` / `--list-keys`.
 | `maxTokens` | number | Token budget for LLM calls. Must be a positive integer. |
 | `jolliApiKey` | string (sensitive) | Jolli Space API key (`sk-jol-…`). |
 | `authToken` | string (sensitive) | OAuth token from browser login. |
-| `codexEnabled` | boolean | Enable Codex CLI session discovery. |
-| `geminiEnabled` | boolean | Enable Gemini CLI session tracking. |
+| `codexEnabled` | boolean | Enable Codex session discovery. |
+| `geminiEnabled` | boolean | Enable Gemini session tracking. |
 | `claudeEnabled` | boolean | Enable Claude Code session tracking. |
 | `openCodeEnabled` | boolean | Enable OpenCode session discovery. |
 | `cursorEnabled` | boolean | Enable Cursor session discovery — Composer IDE and cursor-agent CLI (one shared toggle). |
@@ -50,7 +50,9 @@ Exactly the following keys are accepted by `--set` / `--remove` / `--list-keys`.
 | `logLevel` | enum | One of `debug`, `info`, `warn`, `error`. |
 | `excludePatterns` | string array | Glob patterns, comma-separated on input. |
 | `localFolder` | string | Absolute path to the Memory Bank folder (per-machine). |
-| `aiProvider` | enum | AI summary provider. One of `anthropic`, `jolli`. |
+| `aiProvider` | enum | AI summary provider. One of `anthropic`, `jolli`, `local-agent`. |
+| `localAgentTool` | enum | Which local agent CLI to drive when `aiProvider=local-agent`. One of `claude-code`, `codex`, `cursor-agent`, `opencode`. |
+| `localAgentPath` | string | Explicit path to the local agent binary, overriding search-path discovery. |
 | `syncTranscripts` | boolean | Include raw AI conversation transcripts in cloud sync. |
 | `syncPollIntervalSec` | number | Sync poll interval in seconds. Must be a positive integer clamped to the range `5400`–`86400` (90 min floor, 24h ceiling). |
 | `syncOnPush` | boolean | Auto-sync pushed commits' memory to Jolli Space on every git push. |
@@ -74,10 +76,11 @@ The `value` portion of `--set key=value` is a single string from the command lin
 - **`syncPollIntervalSec`** — parsed as a finite integer greater than zero, then clamped to the range `5400`–`86400`. A value below `5400` fails with `syncPollIntervalSec must be at least 5400 (90 min) to avoid excessive sync push frequency (got: <raw>)`; a value above `86400` fails with `syncPollIntervalSec must be at most 86400 (24h) (got: <raw>)`; a non-integer fails with `syncPollIntervalSec must be a positive integer (got: <raw>)`.
 - **Boolean keys** (`codexEnabled`, `geminiEnabled`, `claudeEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `clineEnabled`, `devinEnabled`, `antigravityEnabled`, `mcpPlatformToolsEnabled`, `syncTranscripts`, `syncOnPush`) — case-insensitive. `true`, `1`, `yes` → `true`; `false`, `0`, `no` → `false`. Anything else is rejected: `<key> must be true/false (got: <raw>)`.
 - **`logLevel`** — must be exactly one of `debug`, `info`, `warn`, `error`. Failure: `logLevel must be one of: debug, info, warn, error (got: <raw>)`.
-- **`aiProvider`** — must be exactly one of `anthropic`, `jolli`. Failure: `aiProvider must be one of: anthropic, jolli (got: <raw>)`.
+- **`aiProvider`** — must be exactly one of `anthropic`, `jolli`, `local-agent`. Failure: `aiProvider must be one of: anthropic, jolli, local-agent (got: <raw>)`.
+- **`localAgentTool`** — must be exactly one of `claude-code`, `codex`, `cursor-agent`, `opencode`. Failure: `localAgentTool must be one of: claude-code, codex, cursor-agent, opencode (got: <raw>)`. The accepted set and the order it is listed in are **derived from the single agent-tool registry** that also supplies each tool's display name and sign-in hint, so this key's accepted values cannot drift from the tools the setup picker offers (spec 57) or the ones the runtime can actually drive (spec 280). Adding a tool to that registry widens this key with no edit here.
 - **`globalInstructions`** — must be exactly one of `enabled`, `disabled`. Failure: `globalInstructions must be one of: enabled, disabled (got: <raw>)`.
 - **`excludePatterns`** — split on `,`, each part trimmed, empty parts dropped. Stored as a string array.
-- **String keys** (`apiKey`, `model`, `jolliApiKey`, `authToken`, `localFolder`) — stored as-is. The `=` sign that delimits key and value is matched on the **first** occurrence, so values containing `=` (e.g. base64-padded tokens) are preserved verbatim.
+- **String keys** (`apiKey`, `model`, `jolliApiKey`, `authToken`, `localFolder`, `localAgentPath`) — stored as-is. The `=` sign that delimits key and value is matched on the **first** occurrence, so values containing `=` (e.g. base64-padded tokens) are preserved verbatim.
 - **`slack.workspaceUrl`** — parsed as a URL; see "Per-key validation" below, since for this key validation and coercion are the same step (the value that comes out of a successful parse is not the raw input but a normalized form).
 
 ### Per-key validation
@@ -149,6 +152,7 @@ The configuration is global to the user, not per-project. There is no `--cwd` fl
 
 - The Jolli-API-key validation rule (origin allowlist + recognized shape + HTTPS-only with suffix-boundary host check) is the same rule used everywhere a Jolli API key can be stored in the CLI, the VS Code extension, and the IntelliJ plugin.
 - The `slack.workspaceUrl` validation rule (HTTPS-only + suffix-boundary host check) mirrors the shape of the Jolli-API-key validation rule above, applied to the `slack.com` host family instead of the Jolli origin allowlist.
+- The `localAgentTool` accepted set is the single agent-tool registry shared with the interactive provider setup picker (spec 57), the diagnostic command's credential label and sign-in hints (spec 59), and the runtime backend that actually drives the chosen tool (spec 280).
 - The set of valid keys is kept in lockstep with the configuration type used internally; adding a new field there requires adding it to this command's whitelist before users can set it.
 - The path printed by `Config updated:` and `Location:` is the same global path printed by `jolli enable`'s skip-and-configure-later guidance.
 - The persisted `slack.workspaceUrl` value is read back and used, as one of two link-resolution fallbacks, by the Slack thread-reference capture pipeline (spec 256), which reconstructs a thread's shareable link from this base address when no permalink was pasted into the conversation.

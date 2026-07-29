@@ -15,6 +15,7 @@ Decide whether anonymous usage telemetry may be collected at all, using an opt-o
 - The one-time first-run disclosure: when it is shown, where it is shown, and how it is recorded as shown.
 - The flush-time re-gate that drops already-buffered events when the user has since opted out.
 - The interactions between turning telemetry off and the event already in flight for the "off" action itself.
+- How turning the *product* off for a repository interacts with consent: which single automatic event that suppresses, which explicit-gesture events it does not, and what the resulting undrained buffer means.
 
 **Out of scope (boundaries):**
 
@@ -104,6 +105,7 @@ The command-line enable flow additionally prints a plain-language telemetry-is-o
 
 On editor activation, after bootstrapping telemetry with the host-platform signal:
 
+0. Record the once-per-activation client event — **unless** the workspace's repository has been manually disabled by the user, in which case this one event is skipped. It is an automatic write into the repository's own local buffer, so the zero-write contract for a disabled repository applies to it; the user-gesture events below and elsewhere are deliberately exempt. The disclosure block that follows runs either way, so a disabled repository is still told what would be collected.
 1. Load config.
 2. If the first-run-disclosure decision (using the host signal) says show:
    - Persist `telemetryNoticeShown = true` first.
@@ -161,6 +163,8 @@ A change to the environment-variable channel or the host-platform channel flips 
 - **The JVM-IDE host consent fails open.** If the IDE consent API is absent, renamed, or unavailable (headless worker, no running application), the IDE channel reports "not declined", leaving the product off-switch and the environment variable in charge — the plugin never suppresses everything just because it could not read the IDE setting. (Surprising; intentional.)
 - **The off-switch and notice marker are machine-global and cross-surface.** All three surfaces read and write the same fields in the same shared config file, so opting out in one surface opts out in all of them. (Notable.)
 - **Re-enabling sets the notice-shown marker too.** Turning telemetry on suppresses the first-run banner forever after, on the assumption that a user who re-enables has already seen the disclosure. (Notable.)
+- **A manually disabled repository is not a fourth opt-out channel — it is a per-call-site suppression, and it is consent-relevant.** Turning the product off for a repository does not resolve consent to disabled, and it does not touch any of the three channels above. The recording primitive itself carries no such check. What happens instead is that *individual call sites* decline to record: the automatic per-activation event is suppressed, and every flush trigger on the editor surface is suppressed. Explicit user-gesture events at other call sites — including the funnel events for the enable and disable gestures themselves, opening settings, signing in or out, and changing the model provider — are **still recorded into the repository's local buffer**. (Surprising; the asymmetry is deliberate but it means "I turned Jolli off for this repo" is not the same promise as "I turned telemetry off".)
+- **Because flushes are suppressed too, a disabled repository accumulates an undeliverable buffer.** Those still-recorded gesture events pile up locally with nothing draining them, bounded only by the buffer's own caps, until the repository is re-enabled — at which point the ordinary flush triggers resume and send whatever survived the caps. Consent is still re-gated at that flush, so a user who opted out of telemetry in the interim never has them uploaded. (Surprising; follows from suppressing recording and sending independently. Cross-reference: spec 204, spec 145, and `specs/304-manually-disabled-zero-write-contract.md`.)
 
 ## Shared Behavior
 

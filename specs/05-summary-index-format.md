@@ -119,6 +119,7 @@ This biases matches toward container roots over buried descendants and toward re
 
 Given a list of candidate commit hashes (typically those that didn't match directly):
 
+0. **Refuse outright when this process sees the manually-disabled suppression flag**, before the index is loaded and — crucially — before the shared cross-process lock is acquired. Acquiring that lock is itself a disk write, and the alias write it guards would be dropped by the storage gate anyway, so taking it would create a lock file for a write that can never land. The refusal reports **"no new aliases written"** — the same answer as "nothing to alias" — which is what stops the caller from re-detecting the same candidates and re-creating the lock file on every refresh. (The suppression flag — what it is, and which processes ever set it — and the broader no-write promise are owned by **Zero-Write Contract for a Manually-Disabled Repository** (304); only this scan's own refusal and its return value are specified here.)
 1. Load the index. If absent, or its format version isn't current, do nothing.
 2. For each candidate not already an entry and not already an alias key:
    1. Compute its tree hash. If unavailable, skip.
@@ -194,6 +195,10 @@ On parse failure of the index payload, readers log the failure and treat the ind
 ### Locking for alias-only writes
 
 Pure alias scans (no payload changes) acquire the same shared cross-process lock that the summary-write pipelines use. If the lock cannot be acquired, the alias write is silently dropped — a future invocation retries. This is acceptable because aliases are a cache and never load-bearing for correctness, only for performance.
+
+### A disabled project's alias scan refuses before the lock, and says so
+
+The manually-disabled refusal is placed ahead of the lock acquisition rather than relying on the storage layer to swallow the write, because the lock file is itself a write. Equally load-bearing is the *answer* it returns. Callers treat "new aliases written" as "your view is out of date, refresh" — and a refresh recomputes the same unmatched-candidate set and re-enters the scan. Reporting "no new aliases written" therefore terminates the cycle; claiming success while writing nothing would spin refresh → rescan → lock-file write on every tick, which is precisely the loop the gate exists to prevent. (Surprising; load-bearing.)
 
 ### Counting and listing exclude descendants
 

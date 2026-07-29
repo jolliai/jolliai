@@ -33,8 +33,9 @@ repository plus the contracts those artifacts consume:
 - The **`workflow` stand-in** the host registers when the workflow plugin is
   absent, including the machine-readable needs-input envelope its `local-run`
   branch emits.
-- The **sibling Space stand-ins** the recipe depends on when `@jolli.ai/space-cli`
-  is absent.
+- The **sibling Space stand-in** the recipe depends on when `@jolli.ai/space-cli`
+  is absent — now a single `space` command, which no longer covers the recipe's
+  `docs` calls.
 - The **spawn-target convention** the recipe encodes for every command-line call.
 - The **consumed contracts**: the offer JSON the recipe parses, the four run-tool
   shapes, the `docs pull` / `docs publish` command shapes, and the branch-integrity
@@ -52,9 +53,11 @@ repository plus the contracts those artifacts consume:
   variadic argument, and its two deliberately **asymmetric** absent-plugin
   branches (a machine-readable needs-input object for `local-run`; a prose
   install hint for everything else).
-- The **sibling Space stand-in requirement**: `docs pull` / `docs publish` (and
-  the `space` command the branch cross-check rides on) must produce a clean,
-  actionable install prompt when the space-cli plugin is absent.
+- The **sibling Space stand-in requirement** the recipe body still assumes —
+  that `docs pull` / `docs publish` and the `space` command the branch cross-check
+  rides on all produce a clean, actionable install prompt when the space-cli
+  plugin is absent — and the fact that the host now satisfies that requirement
+  for `space` **only**.
 - The **spawn-target convention** every command-line call in the recipe encodes.
 - The **consumed offer contract**: the JSON shapes the recipe parses from
   `workflow local-run`, and the eligibility rule the offer must satisfy
@@ -176,7 +179,8 @@ list is the absent workflow source, not space-cli).
 
 When the `@jolli.ai/workflow-cli` plugin is absent, the host registers a
 stand-in in the real command's place. Its shape is deliberately not the
-"one top-level command per subcommand" shape the other plugin stand-ins use:
+"one top-level command per subcommand" shape the site stand-in uses (the Space
+stand-in has since collapsed to a single forwarding command too — spec 146):
 
 - **Exactly one** top-level `workflow` command, whose subcommand and flags arrive
   as a **forwarded variadic argument**. Unknown options are tolerated, so a user
@@ -314,7 +318,7 @@ own thin helper commands. The shape the recipe consumes:
   landed right. An empty `expected` branch is likewise a non-match.
 
 Because the cross-check rides the `space` command, its absent-plugin path is the
-host's flat `space` stand-in: a single-package prose install hint on stderr with
+host's single `space` stand-in: a single-package prose install hint on stderr with
 a non-zero exit.
 
 ### Missing plugin install prompts (frozen)
@@ -325,12 +329,47 @@ actionable install prompt rather than a crash or a silent no-op.
 - The **combined** install string surfaced by the offer path and the recipe is,
   per plugin: `npm i -g @jolli.ai/cli @jolli.ai/space-cli` and
   `npm i -g @jolli.ai/cli @jolli.ai/workflow-cli`.
-- The generic per-command **stand-in** (the `docs` / `space` / `sync` / … fallback,
-  spec 146) keeps its existing single-package hint
-  (`npm install -g @jolli.ai/space-cli`) for consistency with the other Space
-  stand-ins. **This split is intentional** and must not be "fixed" later as a
-  false inconsistency: the offer/recipe messaging is where the user is told they
-  need both packages; the individual stand-in is a per-command fallback.
+- The generic per-command **stand-in** (spec 146) keeps its single-package hint
+  (`npm install -g @jolli.ai/space-cli`). **This split is intentional** and must
+  not be "fixed" later as a false inconsistency: the offer/recipe messaging is
+  where the user is told they need both packages; the stand-in is a per-command
+  fallback.
+- **That stand-in now covers only one of the names this recipe shells.** The Space
+  stand-in was narrowed to the single top-level `space` command; the six former
+  flat names (including `docs`) are unregistered when the plugin is absent. So of
+  the recipe's three space-cli calls, only `space verify-publish-branch` reaches a
+  stand-in — `docs pull` and `docs publish` hit the command parser's bare
+  unknown-command error instead. This is recorded below as a live inconsistency
+  between the (unchanged) recipe body and the (changed) stand-in surface.
+
+### Live inconsistency: the recipe's `docs` install-hint branch is unreachable
+
+The recipe body was **not** revised when the Space stand-in collapsed, so the two
+no longer agree. This is recorded as an observed inconsistency, **not** as design.
+
+- The recipe's closing section instructs the agent that "any `docs` command that
+  prints an install hint … means the space-cli plugin is not installed", then to
+  tell the user to install `npm i -g @jolli.ai/cli @jolli.ai/space-cli` and stop.
+- With the plugin absent, no `docs` command prints an install hint any more —
+  `docs pull --branch …` (Step 3) and `docs publish --json` (Step 5) both die on
+  the parser's bare unknown-command error, before any action runs.
+- The `docs`-based half of that branch is therefore **unreachable through the
+  `docs` calls**. An agent that follows the recipe literally hits an opaque parser
+  error at Step 3 with no install guidance in front of it.
+
+Two absent-plugin signals do remain reliable, and both are what the recipe
+actually degrades through today:
+
+1. **The eligibility path.** The offer read (`workflow local-run`) emits
+   `{ type: "space_cli_required", message, install }` on stdout with exit 0 when
+   the real workflow plugin is installed but space-cli is not. The recipe already
+   handles this shape explicitly, and it fires **before** Step 3 — so a run that
+   starts from the offer normally never reaches the `docs` calls at all.
+2. **The branch cross-check.** `space verify-publish-branch` still rides the
+   surviving `space` stand-in and still yields the single-package prose hint on
+   stderr with a non-zero exit. It is now the **only** direct space-cli invocation
+   in the recipe with a clean absent-plugin surface — and it sits *after* the
+   `docs` calls, so it can only report the problem the recipe already failed on.
 
 ## Behavior
 
@@ -409,8 +448,10 @@ destination, and never presents a `runnable:false` workflow.
 - **space-cli / clones unavailable** → the offer surfaces the combined-install
   needs-input result (`npm i -g @jolli.ai/cli @jolli.ai/space-cli`), modeled on
   the `binding_required` non-error idiom (specs 148 / 230) — never a crash. A
-  direct `docs` / `space` invocation with the plugin absent hits the flat Space
-  stand-in's single-package prose hint and non-zero exit instead.
+  direct `space` invocation with the plugin absent hits the Space stand-in's
+  single-package prose hint and non-zero exit instead. A direct `docs` invocation
+  no longer has a stand-in behind it and hits the command parser's bare
+  unknown-command error — see the live-inconsistency note above.
 - **Non-git-backed or non-cloned workflow** → never appears in the offer, so the
   backend's `start_local_run` refusal is never reached through this path.
 - **Publish landed on the wrong branch** → the cross-check reports `match:false`
@@ -461,8 +502,9 @@ agent, not by the stateless MCP server.
   different ways, so "making them consistent" would break one of them.
   (Load-bearing; the most easily-broken invariant in this feature.)
 - **The workflow stand-in is one command with a forwarded variadic argument,
-  not a family of subcommands.** It deviates from the other plugin stand-ins
-  because the real surface is one top-level command with subcommands. Unknown
+  not a family of subcommands.** It deviates from the site stand-in's flat family
+  because the real surface is one top-level command with subcommands; the Space
+  stand-in has since adopted the same single-command shape (spec 146). Unknown
   options are tolerated so the full real invocation reaches the action, and the
   registration declines rather than throwing when the name (or an alias) is
   already taken. (Notable.)
@@ -487,7 +529,8 @@ agent, not by the stateless MCP server.
   dropped or substituted branch is exactly the kind of failure an LLM comparison
   would miss, so the recipe shells a command and reads a boolean verdict. That
   command now lives in space-cli, so the check depends on a *second* plugin being
-  installed — its absence surfaces as the flat `space` stand-in's install hint.
+  installed — its absence surfaces as the `space` stand-in's install hint. That stand-in
+  is now the only space-cli name in this recipe with a clean absent-plugin surface.
   (Notable; a real cross-plugin dependency.)
 - **The heartbeat brackets the approval prompt; it does not run during it.** A
   blocking human prompt suspends the agent turn, so the realistic model is
@@ -497,11 +540,19 @@ agent, not by the stateless MCP server.
 - **Two install strings coexist by design.** The offer/recipe path surfaces the
   combined `npm i -g @jolli.ai/cli @jolli.ai/<plugin>`; the generic per-command
   stand-in keeps its single-package hint. This is deliberate, not drift.
-- **The host stands in for `init` / `space` / `source` / `impact` / `sync` /
-  `docs` / `agent`.** The `docs` stand-in makes `jolli docs pull` /
-  `jolli docs publish` emit the single-package install prompt (not a parser
-  error) when the space-cli plugin is absent, exactly like the other Space
-  stand-ins.
+- **The host now stands in for `space` alone, and the recipe body was not updated
+  to match.** The Space stand-in used to cover a seven-name flat family
+  (`init` / `space` / `source` / `impact` / `sync` / `docs` / `agent`), which is
+  what made `jolli docs pull` / `jolli docs publish` emit a single-package install
+  prompt instead of a parser error. It is now the single top-level `space` command,
+  so `docs` is unregistered when the plugin is absent and those two calls produce
+  the command parser's bare unknown-command error. The recipe's "any `docs` command
+  that prints an install hint" branch is consequently unreachable through them.
+  **This is a live inconsistency between the unchanged recipe body and the changed
+  stand-in surface — not intended design.** The surviving reliable signals are the
+  offer's `space_cli_required` shape (which normally fires first and stops the run)
+  and the `space verify-publish-branch` stand-in (which sits after the failure).
+  (Notable; a real defect worth recording.)
 - **The deliverable here is a recipe, not a monolithic CLI command.** A single
   CLI command has no agent to write the workflow's files; what this repository
   ships is the recipe body, the stand-in surfaces it degrades through, and the

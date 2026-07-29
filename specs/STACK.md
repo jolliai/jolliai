@@ -2,7 +2,7 @@
 
 Operational reference for an agent about to change this repo: what the deliverables are, how to
 iterate on each, and the exact gate a change must pass. Every value here was read out of a manifest
-in this tree — not inferred. Recorded at `b09ac518`.
+in this tree — not inferred. Recorded at `18e8c624`.
 
 This is **not** a behavioral spec. Command names, file paths, and version numbers are the point.
 
@@ -12,7 +12,7 @@ This is **not** a behavioral spec. Command names, file paths, and version number
 
 Three deliverables, one product model, one shared on-disk state.
 
-| Deliverable | Directory | Build system | Coordinated by root? | Version at `b09ac518` |
+| Deliverable | Directory | Build system | Coordinated by root? | Version at `18e8c624` |
 |---|---|---|---|---|
 | `@jolli.ai/cli` | `cli/` | Vite multi-entry lib build + `tsc` declarations | **Yes** — npm workspace | `0.99.9` |
 | `jollimemory-vscode` | `vscode/` | esbuild → CJS bundles | **Yes** — npm workspace | `0.99.9` |
@@ -145,7 +145,7 @@ npm install -g .
 plain `npm run build` (in `cli/`) is enough — the global `jolli` picks it up immediately with no
 re-install. `postbuild` chmods `dist/Cli.js` to `0o755`.
 
-`cli` build = `vite build && tsc --project tsconfig.build.json` — the Vite step emits 14 ES entries
+`cli` build = `vite build && tsc --project tsconfig.build.json` — the Vite step emits 13 ES entries
 (`Cli`, `Api`, `PostInstall`, and the hook/worker entries `StopHook`, `PostCommitHook`,
 `PostRewriteHook`, `PrepareMsgHook`, `GeminiAfterAgentHook`, `SessionStartHook`, `PostMergeHook`,
 `PrePushHook`, `PrePushWorker`, `QueueWorker`) plus `dist/graph-assets/` (the knowledge-graph viz
@@ -186,6 +186,21 @@ If you changed `cli/src/**` and want the plugin to pick it up, run the root `npm
 `build-intellij.yaml` does exactly that ("Build bundled CLI (vscode/dist/*.js)") before invoking
 Gradle, because the plugin extracts hook scripts from the bundled CLI output.
 
+### 4.6 Regenerating the local-agent fixtures (manual, not part of any gate)
+
+`scripts/probe-local-agents.mjs` captures **real** headless output from each local-agent CLI into
+`cli/src/core/localagent/__fixtures__/<tool>/` (`help.txt`, `meta.json`, `success.json`). It is wired
+into **no** npm script, no Gradle task, and no workflow — run it by hand:
+
+```bash
+node scripts/probe-local-agents.mjs
+```
+
+It requires each tool installed **and logged in** on this machine; a missing or logged-out tool
+records that status in its `meta.json` and is skipped rather than failing the run. The fixtures are
+therefore recorded observations, not hand-written expectations — regenerate them rather than editing
+them by hand. They are excluded from Biome's scope (§6.1).
+
 ---
 
 ## 5. The verify gate
@@ -213,6 +228,15 @@ Each stage fans out across the two npm workspaces:
 | `test` | `npm run test -w @jolli.ai/cli && npm run test:acceptance -w @jolli.ai/cli && npm run test -w vscode` |
 
 `build:claude-plugin` = `node claude-plugin/plugins/jolli/scripts/build.mjs`.
+
+This gate is also declared **machine-readably**, in the tree's one committed piece of `.jolli/`:
+`.jolli/agents.json` sets `verify.gate: ["npm run all"]`, `verify.scope: "repo-root"`,
+`verify.coveragePolicy: "never-lower"`, and
+`verify.configFilesOffLimits: ["cli/vite.config.ts", "vscode/vite.config.ts"]`. That file is the
+authority for any tool that must *branch* on the gate; this document is the prose around it. Note the
+off-limits list is **narrower** than §6.7's rule, which also covers `vscode/vitest.config.ts` and both
+`biome.json` files — the prose is the broader constraint. `.gitignore` excludes `.jolli/` entry by
+entry precisely so this one file can be committed while the per-developer state beside it is not.
 
 CI runs the identical command: `.github/workflows/build-vscode.yaml` ("CI - CLI + VS Code") does
 `npm ci` then `npm run all`, then asserts the IntelliJ bundling contract on `vscode/dist/Cli.js`.
@@ -289,9 +313,11 @@ cd intellij
 ./gradlew buildPlugin test verifyPlugin -x buildSearchableOptions
 ```
 
-`test` `dependsOn` a `checkGlobalState` `Exec` task (`bash scripts/check-global-state.sh`), so the
-global-state ratchet runs on every local `./gradlew test` too — no separate pipeline step. The task
-is `onlyIf { !os.name.contains("win") }` (the gate is bash; CI is Linux).
+`test` `dependsOn` **two** `Exec` tasks — `checkGlobalState` (`bash scripts/check-global-state.sh`,
+§6.4) and `checkNoDirectLlmHttp` (`bash scripts/check-no-direct-llm-http.sh`, §6.5) — so both gates
+run on every local `./gradlew test` too, with no separate pipeline step. Both are
+`onlyIf { !os.name.contains("win") }` (the gates are bash; CI is Linux) and both sit in Gradle's
+`verification` group.
 
 ### 5.5 Coverage floors and exclusions — quoted
 
@@ -378,8 +404,10 @@ the IntelliJ plugin in `build.gradle.kts`.
 ```
 
 Tabs, 4-wide, 120 columns, double quotes, always semicolons. `files.includes` is
-`["src/**", "!src/graph/assets"]` — the vendored graph viz assets are out of scope. Import
-organization runs as an assist: `assist.actions.source.organizeImports: "on"`.
+`["src/**", "!src/graph/assets", "!src/core/localagent/__fixtures__"]` — both the vendored graph viz
+assets and the recorded local-agent CLI fixtures (§4.6) are out of scope; the fixtures are captured
+third-party output, so formatting them would corrupt the observation. Import organization runs as an
+assist: `assist.actions.source.organizeImports: "on"`.
 
 `vscode/biome.json` is deliberately narrower: **`formatter.enabled: false`** and
 **`assist.enabled: false`** — only the linter runs there, over `files.includes: ["src/**"]`.
@@ -473,7 +501,41 @@ holds is `autodetection.exclude=com.intellij.*`, applied at extension-registrati
 also set as system properties in `build.gradle.kts` (which take precedence over the properties file)
 and asserted by `JUnitConfigurationGateTest`.
 
-### 6.5 Commit and PR hygiene
+### 6.5 The no-direct-LLM-HTTP gate (IntelliJ)
+
+`intellij/scripts/check-no-direct-llm-http.sh`, wired into `test` alongside the global-state ratchet
+(§5.4). It greps `src/main/**/*.kt` for the single alternation
+`api\.anthropic\.com|java\.net\.http` and compares the hit set against an inline `ALLOWLIST`.
+
+**It has no baseline, deliberately** — unlike §6.4's two ratchets. The Kotlin LLM stack was deleted
+outright, so provider routing now lives in exactly one place (`cli/src/core/LlmClient.ts`) and the
+plugin reaches it through the bundled CLI. A hit means fix the code, not baseline it.
+
+The gate is **bidirectional**, and the second half is the easy one to miss:
+
+| Half | Fails when | Required fix |
+|---|---|---|
+| new offender | a production Kotlin file matches the pattern and is **not** on the allowlist | route the call through the CLI bridge, or extend `ALLOWLIST` with review |
+| stale allowlist | an allowlist entry **no longer** matches the pattern | delete the entry, in the same PR that removed the last legitimate use |
+
+`ALLOWLIST` currently holds exactly **one** file:
+`src/main/kotlin/ai/jolli/jollimemory/core/telemetry/TelemetryFlusher.kt`. Like §6.4's script it
+`export LC_ALL=C`s, because `comm(1)` needs both inputs sorted under identical collation.
+
+> **⚠ Stale prose inside the gate itself.** The script's header comment says production Kotlin must
+> not import `java.net.http` "outside the three known Jolli Space / auth / telemetry HTTP consumers,"
+> and line 35 repeats "the small set." The allowlist is **one** entry, and one entry is all the tree
+> needs — the Jolli Space and auth clients were rewritten onto the CLI bridge in the same migration,
+> which is exactly what the stale-allowlist half of the gate would have caught had they not been
+> removed from the list. Trust the `ALLOWLIST` array, not the comment above it.
+
+**What the gate does not catch.** The pattern is two literals, so it is a tripwire, not a proof. A new
+Kotlin caller passes it by using the older `java.net.URL` / `URLConnection` API, by bundling a
+third-party HTTP library, or by talking to a different vendor's host. It also says nothing about
+*inbound* HTTP — the plugin's loopback sign-in listener is untouched by it. Read a green gate as
+"nobody reintroduced the obvious thing", and review new network code on its merits.
+
+### 6.6 Commit and PR hygiene
 
 - `git commit -s` on every commit. `.github/workflows/verify-dco.yaml` rejects PRs without
   `Signed-off-by:`.
@@ -482,8 +544,13 @@ and asserted by `JUnitConfigurationGateTest`.
 - Release tags are sigstore-signed (`gitsign`) and verified against an OIDC identity allowlist by the
   publish workflows. Independent of, and additional to, the DCO requirement.
 
-### 6.6 Cross-cutting invariants that break silently
+### 6.7 Cross-cutting invariants that break silently
 
+- **All LLM traffic routes through the CLI** — `cli/src/core/LlmClient.ts` is the single provider-routing
+  implementation, and the CLI, VS Code, and IntelliJ are behavior-identical by construction because
+  the other two reach it rather than reimplementing it. On the IntelliJ side this is machine-enforced
+  (§6.5); on the VS Code side it follows from the bundle. Do not add a second LLM stack in any
+  language.
 - **Three implementations of the API key parser stay in lockstep** —
   `cli/src/core/JolliApiUtils.ts` (canonical), the VS Code bundle (imports the canonical file
   verbatim across the package boundary), and the Kotlin port in `intellij/`.

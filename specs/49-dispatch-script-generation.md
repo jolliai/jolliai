@@ -9,6 +9,7 @@ The product writes three small executable shell scripts under the per-user state
 **In scope:**
 - The three scripts (`resolve-dist-path`, `run-hook`, `run-cli`) that are written into the per-user state directory.
 - What each script does and the contract it implements toward its callers.
+- The two-tier Node-runtime resolution both dispatchers perform, and the asymmetric failure policy when both tiers come up empty.
 - Where version-selection logic lives (only in `resolve-dist-path`); the other two delegate to it.
 - Why this indirection exists (so an upgrade or rewrite of any installed product version updates only the per-user dist-path registry; the git hook scripts already installed in user repositories continue to call the same three scripts and never need to be rewritten).
 - Executable-permission requirement on each of the three files.
@@ -17,6 +18,7 @@ The product writes three small executable shell scripts under the per-user state
 
 **Out of scope:**
 - The per-source dist-path registry that `resolve-dist-path` reads, and the semantics of the version-comparison rule and preference order used to pick a winning entry (covered by the per-source dist-path version-selection topic). This topic covers the shell realization of that selection — its stage order, its eligibility gate, and the fact that its behavior is not identical to the in-process implementation of the same rule.
+- **Producing** the recorded-runtime record the dispatchers read as their second tier — its writer, the lockstep guarantee that keeps it consistent with the structured detection record, and the path rewriting it applies are owned by the IDE runtime-detection topic (284). This topic covers only the dispatchers' consumption of it.
 - The npm postinstall hook that triggers a refresh of these scripts after an upgrade (covered by its own topic).
 - The git hook scripts in user repositories that invoke `run-hook` (covered by the hook-install topic).
 - The agent-side hook scripts that invoke `run-hook` (covered by their own topics).
@@ -32,6 +34,14 @@ All three are written as executable POSIX shell scripts under `~/.jolli/jollimem
 - `~/.jolli/jollimemory/run-cli`
 
 All three are written with executable permission for the owning user.
+
+### The recorded-runtime record the two dispatchers read
+
+Beside the structured runtime-detection record in the same per-user state directory sits a **plain-text, single-line** record holding one absolute path: the runtime an IDE surface detected and proved. The two dispatcher scripts **read** it; none of the three scripts ever writes it. Its writer, its lockstep guarantee with the structured record, and the path rewriting it applies are owned by the IDE runtime-detection topic (284).
+
+The dispatchers consume it as follows: take the first line, delete any carriage returns from it (a record that round-tripped through a cross-platform file sync or a Windows editor arrives with a trailing one, and without the strip the executable test would fail against a path that is otherwise perfectly good — a silent no-op with no user-visible error), and accept the result only when it is non-empty **and** carries the executable bit. A missing or unreadable record is indistinguishable from an empty one and simply yields nothing.
+
+Plain text rather than the structured record because a POSIX shell has no robust way to parse the structured form — on Windows the path arrives escaped inside it, and the naive line-oriented extraction a shell can manage mangles it.
 
 ### `resolve-dist-path` — output contract
 
@@ -52,11 +62,24 @@ A dispatcher that takes a hook-type token as its first positional argument and f
 - `session-start`
 - `gemini-after-agent`
 
-For each recognized token the script invokes the corresponding hook entry from the chosen distribution directory under a fixed file-name convention (a token-derived basename ending in `.js`, executed with the system Node runtime). The token is mapped to that basename **before** resolution, and the basename is then handed to the resolver as its required-entry-file argument — so a distribution that would otherwise win selection but is missing this particular hook entry is bypassed in favour of one that has it, rather than being resolved and then failing on a nonexistent file. For unrecognized tokens it prints a diagnostic to standard error. On absence of a Node runtime it prints a diagnostic to standard error. On failure to resolve a distribution directory it exits silently. The exit status of the script is always zero — it must not block the caller (git, the agent, etc.) under any condition.
+For each recognized token the script invokes the corresponding hook entry from the chosen distribution directory under a fixed file-name convention (a token-derived basename ending in `.js`, executed with the Node runtime chosen by the two-tier resolution below). The token is mapped to that basename **before** resolution, and the basename is then handed to the resolver as its required-entry-file argument — so a distribution that would otherwise win selection but is missing this particular hook entry is bypassed in favour of one that has it, rather than being resolved and then failing on a nonexistent file. For unrecognized tokens it prints a diagnostic to standard error. On absence of **both** runtime tiers it prints a diagnostic to standard error. On failure to resolve a distribution directory it exits silently. The exit status of the script is always zero — it must not block the caller (git, the agent, etc.) under any condition.
 
 ### `run-cli` — input and output contract
 
-A dispatcher that forwards all arguments unchanged to the CLI entry inside the chosen distribution directory, executed with the system Node runtime. It passes the CLI entry's own basename to the resolver as the required-entry-file argument, so a distribution without a CLI entry is never selected here. On absence of a Node runtime it prints a diagnostic to standard error and exits with status one. On failure to resolve a distribution directory it exits with status one. Otherwise it inherits the exit status of the CLI process.
+A dispatcher that forwards all arguments unchanged to the CLI entry inside the chosen distribution directory, executed with the Node runtime chosen by the two-tier resolution below. It passes the CLI entry's own basename to the resolver as the required-entry-file argument, so a distribution without a CLI entry is never selected here. On absence of **both** runtime tiers it prints a diagnostic to standard error and exits with status one. On failure to resolve a distribution directory it exits with status one. Otherwise it inherits the exit status of the CLI process.
+
+### Two-tier Node-runtime resolution (identical in both dispatchers)
+
+Neither dispatcher assumes a runtime is on the caller's search path. Each resolves one in two tiers, in order:
+
+1. **A runtime found on the caller's own search path.** This is preferred so an interactive shell keeps whatever version-manager choice that shell already made.
+2. **Only when the first tier yields nothing** — the absolute path in the plain-text recorded-runtime record described above, accepted only if present and executable.
+
+The recorded path is deliberately **never spawned to ask its version**. One of the dispatched hook types (`prepare-commit-msg`) sits on the blocking commit path, so the dispatchers must not pay an extra process start; the record's writer already proved the binary runs and meets the minimum version before recording it (284), so the executable-bit check is the whole verification here.
+
+The motivating case is a graphical version-control client: it launches with a minimal search path that lacks the version-manager and package-manager locations where a runtime normally lives, so before the second tier existed the dispatched hook printed a diagnostic and did nothing on a machine that plainly had a runtime installed.
+
+The failure policy when **both** tiers come up empty is unchanged and **asymmetric**: the hook dispatcher prints a diagnostic to standard error and still exits **zero**, because a hook must never block the version-control operation; the CLI dispatcher prints a diagnostic to standard error and exits **one**.
 
 ## Behavior
 
@@ -87,11 +110,11 @@ A rollback to an older product version is also safe under this model: the older 
 
 ### `run-hook` exit-status policy
 
-Hooks must never block their callers. `run-hook` therefore exits with status zero in every failure mode that does not reach a successful exec into a hook entry: missing distribution directory, missing Node runtime, unrecognized hook-type token. Diagnostics are written to standard error (visible if the caller logs hook output) but the exit status never propagates failure up to git or the agent.
+Hooks must never block their callers. `run-hook` therefore exits with status zero in every failure mode that does not reach a successful exec into a hook entry: missing distribution directory, no runtime from **either** tier, unrecognized hook-type token. Diagnostics are written to standard error (visible if the caller logs hook output) but the exit status never propagates failure up to git or the agent.
 
 ### `run-cli` exit-status policy
 
-CLI invocations are user-facing and must report real exit codes. `run-cli` exits with status one on missing distribution directory or missing Node runtime, and inherits the exit status of the underlying CLI process otherwise.
+CLI invocations are user-facing and must report real exit codes. `run-cli` exits with status one on missing distribution directory or when neither runtime tier yields a usable runtime, and inherits the exit status of the underlying CLI process otherwise.
 
 ### Writer idempotency
 
@@ -116,7 +139,7 @@ The set of hook-type tokens accepted by `run-hook` is closed and built into the 
 
 ## State Transitions
 
-The three scripts have no state of their own. Their inputs are the per-source dist-path registry (read by `resolve-dist-path`) and the arguments forwarded to them by their callers. Their outputs are determined entirely by the registry contents at the moment of invocation.
+The three scripts have no state of their own. Their inputs are the per-source dist-path registry (read by `resolve-dist-path`), the recorded-runtime record (read by the two dispatchers as their second runtime tier), the caller's own search path, and the arguments forwarded to them by their callers. Their outputs are determined entirely by those inputs at the moment of invocation.
 
 Across successive product installs or upgrades the scripts move through these transitions:
 
@@ -146,7 +169,15 @@ By contrast, `run-cli` exits with status one on resolution failure because it is
 
 ### The Node-runtime probe is at dispatch time, not write time
 
-Both dispatcher scripts probe for the system Node runtime each time they are invoked, not at the time the writer produces them. A user who installs the dispatch scripts and only later installs Node will find the scripts work the next time they invoke a hook or CLI command without any rewrite step. The probe is a single command lookup in the script's standard environment.
+Both dispatcher scripts resolve a Node runtime each time they are invoked, not at the time the writer produces them. A user who installs the dispatch scripts and only later installs Node will find the scripts work the next time they invoke a hook or CLI command without any rewrite step. The resolution is the two-tier sequence above — a search-path lookup, then a read of the recorded-runtime record — and neither tier is decided at write time.
+
+### The recorded-runtime tier is second, not first
+
+The search-path lookup is deliberately tried first. An interactive shell has already made a version-manager choice, and that choice must win over whatever runtime an IDE happened to detect and record — the recorded path exists only to rescue callers whose environment has no runtime on its search path at all. So the record can never override a working search-path runtime, and a user who switches runtime versions in their shell does not need the record refreshed for the dispatchers to follow along.
+
+### The dispatchers read the recorded-runtime record but never write it
+
+Both dispatchers treat the plain-text record as read-only input. Nothing in the dispatch-script writer creates, refreshes, or removes it. That means the second tier is only available on a machine where an IDE surface has run detection at least once (284); on a machine where only the standalone CLI was ever installed, the second tier is permanently empty and the dispatchers behave exactly as they did before it existed.
 
 ### The three scripts may be present without a populated registry
 
@@ -156,6 +187,7 @@ If only the writer has run but no source has yet written a per-source dist-path 
 
 - **Per-user state directory at `~/.jolli/jollimemory/`** — the location where all three scripts live, alongside the per-source dist-path registry they read.
 - **Per-source dist-path registry** — read by `resolve-dist-path` to enumerate candidates and pick a winner; covered by its own topic.
+- **The recorded-runtime record (`node-path`)** — the plain-text single-line file the two dispatchers read as their second runtime tier. Produced exclusively by the IDE runtime-detection topic (284), which owns its write/delete lockstep with the structured detection record and the shell-executable path rewriting it applies; this topic owns only the consumption side.
 - **Hook installation in user repositories** — the consumer that places hook scripts which invoke `~/.jolli/jollimemory/run-hook`; covered by the hook-install topic.
 - **Agent-side hook installation** — the consumer that places agent-configuration hooks which invoke `~/.jolli/jollimemory/run-hook`; covered by its own topics.
 - **Skill files for the agent** — consumers that invoke `~/.jolli/jollimemory/run-cli` to run product subcommands.

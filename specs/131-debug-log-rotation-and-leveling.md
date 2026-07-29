@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-A persistent debug log under the per-user state directory that every Jolli Memory process writes to in shared sequential order, with size-based archive rotation that preserves history across a bounded number of timestamped archive files, an `info`/`debug`/`warn`/`error` level model whose threshold is configurable per process and per module, a hard skip when running under a known test environment variable, a level-conditional mirror to the standard error stream, and silent failure on any permission or filesystem error.
+A persistent debug log under the per-user state directory that every Jolli Memory process writes to in shared sequential order, with size-based archive rotation that preserves history across a bounded number of timestamped archive files, an `info`/`debug`/`warn`/`error` level model whose threshold is configurable per process and per module, a three-signal hard skip of the file write (two environment switches plus the process's manual-disable gate), a level-conditional mirror to the standard error stream, and silent failure on any permission or filesystem error.
 
 ## Scope
 
@@ -14,7 +14,7 @@ A persistent debug log under the per-user state directory that every Jolli Memor
 - The 2 MB rotation rule and the archive-and-restart behavior that renames the live file to a timestamped archive and starts a fresh `debug.log`.
 - The archive naming scheme (`debug_<UTC-timestamp>.log`), same-second collision handling, and the maximum-10-archives pruning rule.
 - The serialization that guarantees every record appended by the same process lands in the file in submission order.
-- The test-mode skip: when running under a recognised test runner's environment variable, no file write happens at all.
+- The three-signal file-write short-circuit (a recognised test-runner variable, an explicit suppression variable, and the process's in-memory manual-disable gate), its fixed check order, and everything it therefore also skips (size check, rotation, pruning).
 - The `console.error` / `console.warn` mirror behavior that depends on the level and the silent-console flag.
 - The fail-silent guarantee: missing directory, permission errors, disk-full, etc. never throw and never crash the calling process.
 - The "do not auto-create the state directory" rule: log writes are skipped when the state directory is absent.
@@ -85,11 +85,21 @@ A record is written to the file only when its level's priority is greater than o
 
 Default global level is `info`. Default per-module overrides is the empty map.
 
-### Test-mode skip
+### File-write short-circuit (three signals)
 
-When either the environment variable `VITEST` or `JOLLI_DISABLE_LOG_FILE` is set (truthy) in the calling process, `debug.log` writes are skipped entirely. This applies to the file write only — the level filter and the standard-error mirror still run.
+Three independent signals suppress the `debug.log` write entirely, checked in this fixed order at the point where a record would be handed to the write queue:
 
-`VITEST` covers test runs driven by the test runner. `JOLLI_DISABLE_LOG_FILE` is for non-test-runner contexts (for example, a subprocess that imports the built bundle as a probe) where the caller still needs to suppress file output. Either variable alone is sufficient; both are checked.
+| Order | Signal | Kind | Purpose |
+| --- | --- | --- | --- |
+| 1 | The test-runner environment variable | Process environment | Test runs driven by the test runner produce no log artifact. |
+| 2 | An explicit suppression environment variable | Process environment | Non-test-runner contexts that still need file output suppressed — for example a subprocess that imports the built bundle purely as a probe. |
+| 3 | The process's in-memory manual-disable gate | In-process boolean | A repository whose owner has explicitly turned the product off must leave nothing on disk, the log included. |
+
+Any one of the three alone is sufficient. The two environment signals are checked first because they are constants for the process's lifetime; the third can flip mid-process (a disable gesture sets it, an enable gesture releases it), so a session can start writing, stop, and start again.
+
+All three suppress **the enqueue itself**, not just the append. Because the size check, the archive rename, and the archive pruning all live *inside* the queued work, none of them run either: a suppressed record produces no stat, no rotation, and no prune. The level filter and the standard-error mirror sit **earlier** in the per-record flow and are unaffected by all three.
+
+The in-memory gate is process-local and is set only by the editor host; it is inert in command-line invocations, hook scripts and background workers, which is why those processes still write their own log lines. Its lifecycle, and the durable on-disk opt-out it mirrors, are owned by spec 145; the write suppression it drives across other subsystems by `specs/304-manually-disabled-zero-write-contract.md`.
 
 ### Silent-console flag
 
@@ -164,9 +174,9 @@ Inside the queued write:
 
 After rotation the live `debug.log` begins fresh with the triggering record as its first line; the full prior content is in the archive.
 
-### Test-mode short-circuit
+### File-write short-circuit
 
-When either `VITEST` or `JOLLI_DISABLE_LOG_FILE` is truthy in the process environment, the file enqueue is bypassed entirely — the queue chain is not extended, no stat runs, and no append runs. Standard-error mirroring still runs because it sits earlier in the per-record flow.
+When any of the three signals above holds, the file enqueue is bypassed entirely — the queue chain is not extended, no stat runs, no rotation or prune runs, and no append runs. Standard-error mirroring still runs because it sits earlier in the per-record flow, and so does the level filter.
 
 ### Fail-silent guarantee
 
@@ -216,7 +226,9 @@ A fourth setter sets the global working directory the log file path resolves aga
   format record
   if level allows mirror → write to console.error / console.warn
   if level passes filter for module:
-    if VITEST or JOLLI_DISABLE_LOG_FILE → skip file write
+    if test-runner var, or explicit suppression var, or the
+       in-memory manual-disable gate → skip file write entirely
+       (no enqueue, so no stat / rotation / prune either)
     else → append to write queue chain
 
 [write queue runs an entry]
@@ -239,6 +251,8 @@ A fourth setter sets the global working directory the log file path resolves aga
 - **The IntelliJ surface uses a daemon thread instead of a promise chain.** The contract is identical (sequential ordering, fail-silent, 2 MB archive rotation, no directory auto-create, ISO timestamp, padded level tag, module brackets, printf placeholders) — the implementation difference is invisible to consumers of the log file.
 - **The format-string placeholders are intentionally limited to three.** `%s`, `%d`, `%j` cover stringification, numeric coercion, and JSON serialization. There is no `%o`, no width specifier, no precision specifier. An unsubstituted placeholder is left as-is.
 - **Calling a logger method on a freshly imported module is safe.** Defaults (`info`, no overrides, silent console, fallback cwd) make every method usable before any setter has been called.
+- **A manually disabled repository produces no log growth and no rotation — but the editor session stays fully diagnosable.** The gate suppresses the enqueue, so the live file never grows, never reaches the size ceiling, and never spawns an archive or a prune. Meanwhile the editor surface writes every line to its own output panel *before* handing it to the file logger, so the user (and support) can still read the complete session log in the editor — just not on disk. Diagnosability moves, it does not disappear. (Surprising; intentional.)
+- **The in-memory gate can flip mid-process; the two environment signals cannot.** A session can begin writing, be silenced by a disable gesture, and resume on a later enable, all without restarting. This is why the gate is checked on every record rather than sampled once. (Notable.)
 
 ## Shared Behavior
 
@@ -247,3 +261,5 @@ A fourth setter sets the global working directory the log file path resolves aga
 - **Saved config (level + overrides)** — read by entry points at startup; logging only applies the values they pass in.
 - **Standard-error stream** — the destination for every mirror, level-conditional via silent-console.
 - **Test runner detection** — owned by the test-runner's own environment variable (`VITEST`) and the explicit suppression flag (`JOLLI_DISABLE_LOG_FILE`); logging checks both.
+- **The in-memory manual-disable gate** — its durable on-disk source, its lifecycle, and which process sets it are owned by spec 145; the wider set of writes it suppresses by `specs/304-manually-disabled-zero-write-contract.md`. Logging only reads the boolean.
+- **The editor output panel** that mirrors every line regardless of the gate is owned by the editor surface's own logging spec; this spec owns only the file destination.

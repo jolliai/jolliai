@@ -77,7 +77,7 @@ Both surfaces that call this pipeline construct the configured storage backend f
 ### Failure modes
 
 - An empty / whitespace-only query raises the required-query error described above, before any I/O.
-- Any error raised while opening the index or matching the query propagates unchanged; this pipeline has no in-pipeline catch. The two calling surfaces each wrap propagated errors into their own error envelope.
+- Any error raised while opening the index or matching the query propagates unchanged; this pipeline has no in-pipeline catch. The two calling surfaces each wrap propagated errors into their own error envelope. One qualification: the pipeline's lack of a catch is unchanged, but the index open no longer *raises* for one narrow class — when a rebuild happens behind the open and its cache write is denied with a permission-class error, the index open absorbs that failure below this boundary, logs a warning, and returns a fully-built in-memory index, so the pipeline sees a normal success and serves hits. Nothing else about the open is absorbed; every other failure shape still reaches this boundary and propagates. See the **local search index** spec for the exact error codes and the intent-based classification behind them.
 - An index that exists but matches nothing is **not** a failure: the pipeline returns `{ hits: [] }`.
 
 ## Notable Behavior

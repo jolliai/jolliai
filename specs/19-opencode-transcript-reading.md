@@ -94,6 +94,8 @@ The actual embedded-database module is imported the first time a connection is o
 
 Either condition failing returns false. The intent is to avoid showing OpenCode as "detected but yields zero sessions" on hosts where any scan would fail.
 
+This check governs discovery, the status tree, and this spec's "not installed" reporting only. MCP registration asks a **distinct, presence-only** question about OpenCode — the same database-file check without the runtime gate — so OpenCode can be reported "not installed" here in the same run in which it is registered as an MCP host. See spec 149.
+
 ### Discovery flow
 
 1. Resolve the database path. Pre-flight `stat` it. If the file is missing (ENOENT), return an empty result with no error. If `stat` fails for another reason (permission, I/O), classify and return as a discovery error.

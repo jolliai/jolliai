@@ -188,7 +188,37 @@ Each stub-registration callback (defined per known plugin in the registry):
   - When invoked, writes a multi-line install-hint message to the standard error stream — naming the command, the missing plugin's package, the install command, and a "re-run" reminder — and exits with a non-zero status code so calling scripts fail loudly.
 - Tags every successfully-attached stub command with the help group the registry entry declares.
 
-One shipping stub deviates from the "list of name+description pairs, each its own top-level command" shape: the "workflow"-plugin stub registers a **single** top-level command whose subcommands (`local-run` / `runs` / `run-status`) are forwarded as a variadic argument (with arbitrary unknown options allowed) rather than declared as separate stub-command specifications. Its action branches on the forwarded subcommand: the `local-run` branch writes a machine-readable `{ type: "workflow_cli_required", installHint }` JSON object to the standard **output** stream and exits **zero** (a "needs input" state the local-run recipe parses, not an error), while every other subcommand — or none — follows the standard multi-line stderr install-hint plus non-zero exit.
+**Two** of the three shipping stand-ins deviate from the "list of name+description pairs, each its own top-level command" shape. Both now register exactly **one** top-level command whose subcommands and flags arrive as a forwarded variadic argument with arbitrary unknown options allowed, so every subcommand/flag combination reaches the action instead of a parse error. Only the "site" plugin's stand-in still declares a multi-name family.
+
+- The **"space"** plugin's stand-in registers the single command `space`, described as `Manage Jolli spaces, synchronization, sources, impact analysis, and agents` (plus the shared `(requires @jolli.ai/space-cli)` suffix). Its action is **uniform**: *every* forwarded subcommand — and the no-subcommand case — takes the standard multi-line install hint on the standard **error** stream followed by an immediate non-zero process exit, and the hint always names the bare top-level command rather than the subcommand the user typed. Its exact output is quoted below.
+- The **"workflow"** plugin's stand-in registers the single command `workflow`, and it is the **only** stand-in with an *asymmetric* action. Its action branches on the forwarded subcommand: the `local-run` branch writes a machine-readable `{ type: "workflow_cli_required", installHint }` JSON object to the standard **output** stream and exits **zero** (a "needs input" state the local-run recipe parses, not an error), while every other subcommand — or none — follows the standard multi-line stderr install-hint plus non-zero exit.
+
+The "space" stand-in's exact standard-error output, for any invocation:
+
+```
+
+  Space command `space` requires the @jolli.ai/space-cli plugin.
+
+  Install it with:
+      npm install -g @jolli.ai/space-cli
+
+  Then re-run: jolli space ...
+
+```
+
+Both the leading and trailing blank lines are emitted, the prose lines are indented two spaces, and the install command is indented six. The process then exits with status **1** immediately (it does not merely set an exit-code property, which is how the retired-name notices signal failure instead).
+
+The **"space"** stand-in's one-command shape is a recent narrowing. It previously declared a **seven**-name flat family (`init`, `space`, `source`, `impact`, `sync`, `docs`, `agent`). Six of those names — everything but `space` — are now **unregistered** entirely when the plugin is absent, so invoking one of them yields the command parser's bare **unknown-command** error rather than any install hint. Nothing else in the host claims those six names.
+
+### Collision on a single-member help group removes the whole section
+
+The per-name collision skip described above is unchanged, but its *consequence* changed when a stand-in's family shrank to one member. With a multi-name family, a collision on one name degraded to "one stand-in missing, the rest of the family still renders under its heading". With a single-name family there is no rest: a collision on that one name means the callback attaches **nothing**, so **no** command carries that plugin's help-group tag, and the help formatter — which emits each product heading only when at least one command carries its tag — **omits the entire section**, heading and section description included.
+
+Three properties of that degraded state are worth pinning down:
+
+- **Help rendering does not throw.** The collision is detected from the pre-registration occupied-name snapshot, so the duplicate-name error is never raised, and the formatter's per-section emission is conditional on a non-empty member list rather than assuming one exists.
+- **The occupying command keeps its own provenance.** The stand-in never reaches the tagging step for a skipped name, so the command that won the name is not retroactively tagged into the plugin's section. An untagged occupant (and no host built-in claims `space` today) therefore renders under the formatter's generic "Other commands:" section instead.
+- **An alias counts as a collision.** The occupied-name snapshot covers every existing command's primary name *and* every alias, so an existing command merely *aliased* to the stand-in's name suppresses it just as a same-named command does.
 
 ### Diagnostic snapshot
 
@@ -263,6 +293,12 @@ The global install-root cache file transitions: when a stat shows a modification
 - **The opt-out switch is consulted as part of the shared discovery routine.** It applies symmetrically to the load path and the diagnostic path; a defensive cleanup of the environment variable is performed in the loader's tests because a leaked value would otherwise pass every "skipped because of opt-out" assertion without actually exercising the loader. (Notable; the production caller does not unset it.)
 
 - **Stub commands forward arbitrary arguments and unknown options to their action.** A user typing `<missing-command> arg --some-flag` sees the install hint instead of an "unrecognized option" parser error. The variadic positional and the unknown-option permission together cover both shapes. The stub's action exits with a non-zero status so scripts that depended on the real command fail loudly rather than silently no-op. (Notable.)
+
+- **Two of the three stand-ins are now a single forwarding command, and only one of those two is asymmetric.** Both the "space" and the "workflow" stand-in register exactly one top-level command and forward every subcommand and flag to a single action. The "space" one is uniform — every forwarded subcommand, including none, prints the multi-line install hint on standard error and exits non-zero immediately. Only the "workflow" one branches, carving out a machine-readable object on standard **output** with exit **zero** for one specific subcommand because a recipe parses that stream as JSON. Collapsing the two into "one shape" would break that recipe. (Notable; the distinction is easy to lose.)
+
+- **A collision on a single-member stand-in erases its entire help section, not just one entry.** When the stand-in's family was many names, a taken name cost one entry and the section still rendered. Now that two families are one name each, a taken name means nothing carries the group tag and the product heading is not emitted at all — while the command that won the name renders under its own provenance (the generic section, for an untagged occupant). Rendering still does not throw, because the collision is caught from the pre-registration name snapshot rather than from the parser's duplicate-name error. (Notable; a behavior change that followed from a shape change, not from a rendering change.)
+
+- **Retiring a stand-in name produces no moved-command notice.** The six flat names dropped from the "space" stand-in in the same overhaul were not given hidden "this command moved" shims; the retired-name map that mechanism reads still lists only the three flat workflow-run names. So those six now surface the command parser's bare unknown-command error — exactly the failure the moved-command mechanism exists to replace for the workflow names. Nothing in the code states a rationale for treating the two retirements differently. (Notable; an asymmetry between two same-vintage retirements. See the moved-command-notices spec.)
 
 - **One specific embedding explicitly opts out rather than relying on emergent absence.** Every other product embedding that bundles this loader's code simply never finds a candidate package alongside it; this one runs on a general-purpose installing machine where the same optional extensions could plausibly be present, so it carries an explicit build-identity check forcing the same outcome as full opt-out. (Notable.)
 

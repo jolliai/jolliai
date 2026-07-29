@@ -9,7 +9,7 @@ The single action the embedded assistant plugin's manifest registers is a per-se
 **In scope:**
 
 - The trigger and the input the host supplies.
-- The bail conditions that produce no output at all.
+- The bail conditions that produce no output at all, including which detection channel the nested-generation guard consults.
 - The two pre-mutation snapshots taken before anything is written, and what each is later used to decide.
 - The first lock-guarded phase (front-door skill, legacy-skill sweep, exclude entry, disable check, first-session metadata) and its behaviour when the project is disabled.
 - The un-locked reconciliation step between the two phases, and why it is outside both.
@@ -64,7 +64,9 @@ When neither applies, nothing is written to standard output. The process's exit 
 
 ### Entry and bail conditions
 
-1. If the bootstrap detects it is running as a child of a local-agent generation invocation — that is, the product itself invoked the assistant to generate a memory, and that nested session is now firing its own session-start event — it logs and returns with **no output**. Without this guard, memory generation would recursively bootstrap.
+1. If the bootstrap detects it is running as a child of a local-agent generation invocation — that is, the product itself invoked the assistant to generate a memory, and that nested session is now firing its own session-start event — it logs and returns with **no output**. Without this guard, memory generation would recursively bootstrap. The check runs before the input payload is read, so nothing is parsed and no working-tree root is resolved on this path.
+
+   This site consults the **inherited-environment channel only**; it passes no working directory and therefore never consults the working-directory marker. The environment is the reliable channel here because the bootstrap is launched by the assistant CLI the product itself spawned — the product's own direct child, carrying the environment the product set — so the marker is always inherited. The marker-file channel exists for the one entry point launched by a *host* rather than by the product's own child, where the host's environment policy can strip the marker. Both channels, and why the marker-file probe is opt-in per call site rather than always on, are owned by the local-agent provider-backend topic.
 2. The input payload is read and parsed; anything unusable becomes an empty payload.
 3. The project directory must be inside a git repository, and the repository's working-tree root must be resolvable. If either check fails, the bootstrap returns with **no output** and writes nothing. The resolved working-tree root — not the directory the host reported — is the target for everything that follows, and is also where diagnostics are logged.
 
@@ -151,6 +153,7 @@ Per project, across successive session starts:
 - **Short lock budgets are a deferral mechanism.** The bootstrap runs on the user's critical path at session start, so it asks for a fraction of the normal wait budget and accepts losing. Because the lock is strict, losing means doing nothing rather than doing something unlocked.
 - **Automatic mode means "respect the user's opt-out".** The bootstrap is the caller of the narrowed install mode that asks for the durable disable preference to be honoured and never cleared. The explicitly user-run setup command asks for the opposite. The mode itself is neutral; the choice belongs to the caller, and the two callers choose oppositely on purpose.
 - **The first-session metadata write is deliberately minimal.** It records that a session exists and where its transcript is, and nothing else. Doing the product's session-stop work here would duplicate it from the second session onward and would put transcript reading on the session-start critical path.
+- **The nested-generation guard is environment-only, and is evaluated before anything is read.** It is the very first check, ahead of the payload read and the repository resolution, so a nested generation session costs one log line and nothing else. It deliberately consults only the inherited environment and not the working-directory marker, for two reasons that hold specifically here: the bootstrap is launched by the assistant CLI the product itself spawned, so the environment always carries the marker, and keeping the marker-file probe opt-in per call site means the guard cannot be flipped by unrelated stubbing of filesystem checks.
 - **Fail-open, including on a fatal.** The exit status is success unconditionally. This is the strongest instance of the product's general rule that hooks must never degrade the tool they are embedded in.
 
 ## Shared Behavior
@@ -163,3 +166,4 @@ Per project, across successive session starts:
 - **The lock primitive registry** owns the repository hook-lifecycle lock this bootstrap takes twice, its strict discipline, its shared-across-worktrees location, and the non-re-entrancy rule that forces the release between the two phases.
 - **The bare unnamespaced menu skill topic** owns the file whose canonicality this bootstrap compares and whose installation triggers the reload request.
 - **The durable manual-disable topic** owns the preference this bootstrap reads three times per session (once per phase plus the installer's own read).
+- **The local-agent provider-backend topic** (spec 280) owns the re-entrancy guard this bootstrap evaluates first: the backend that marks its nested invocations, the two detection channels, which entry points opt into the working-directory channel and which stay environment-only, and the write-boundary backstop behind both. This topic records only that the bootstrap carries the guard and is one of the environment-only sites.

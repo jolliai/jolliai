@@ -78,8 +78,8 @@ The order below is fixed and identical across states — a given run only shows 
 
 If "has some credential" is false, the flow runs the first-time provider setup wizard (spec 57), reusing that command's implementation so the wording cannot drift. Two outcomes matter here:
 
-- on a **fresh** configuration where a usable local agent CLI is detected, the wizard auto-selects the local-agent provider and prints a confirmation — **no menu is shown at all**;
-- otherwise it prints the three-option provider menu (browser sign-in `[recommended]` / Anthropic key / skip). Every choice is terminal, and any unrecognized answer — including an empty line — takes the browser-sign-in branch. Manual entry of a Jolli API key is not offered by this wizard.
+- on a **fresh** configuration where the **default** agent CLI is detected as usable, the wizard auto-selects the local-agent provider pinned to that one tool and prints a confirmation — **no menu is shown at all**;
+- otherwise it prints the four-option provider menu (browser sign-in `[recommended]` / Anthropic key / use a local agent CLI / skip). Every choice is terminal, and any unrecognized answer — including an empty line — takes the browser-sign-in branch. The local-agent choice leads to a second menu that picks one of the four supported agent tools. Manual entry of a Jolli API key is not offered by this wizard.
 
 Afterward the flow re-reads the token and config so the rest of the flow sees whatever the wizard established. When any credential already exists, this step is skipped entirely.
 
@@ -135,7 +135,7 @@ When the repository is already enabled, this step is skipped.
 
 Two lines are printed. The first is chosen by the sign-in state, then by generation capability:
 
-- **signed in** → `✓ signed in · <host>` when a host parses from the saved Jolli site URL, else `✓ signed in`. Either form gains the suffix ` · summaries via Claude Code` when generation is possible **and** the provider is the local agent.
+- **signed in** → `✓ signed in · <host>` when a host parses from the saved Jolli site URL, else `✓ signed in`. Either form gains the suffix ` · summaries via Claude Code` when generation is possible **and** the provider is the local agent. The suffix is a fixed string: it names one specific agent tool and is not derived from which of the four selectable tools is configured (see Notable Behavior).
 - not signed in, generation possible, provider is the local agent → `✓ local agent set (not signed in to Jolli)`
 - not signed in, generation possible otherwise → `✓ <Jolli API key|Anthropic API key> set (not signed in to Jolli)`. The label names the key that would **actually** be used, derived from dispatch-time credential resolution rather than from whichever key happens to be present — a Jolli key sitting alongside an Anthropic provider pin still generates via Anthropic.
 - neither → `✗ not signed in — run \`jolli auth login\` to start generating memories`
@@ -202,6 +202,7 @@ There are exactly **three** dead ends that never reach this block, all of them e
 - **A non-work-tree directory is a hard dead end, and it is the very first thing checked.** The gate runs before storage is initialized so a non-repository never resolves a bogus Memory Bank path off the working directory, and it deliberately offers no "initialize a repository for you" path. Because it reads git's printed answer rather than its exit status, a bare repository and a repository's own metadata directory are both correctly rejected.
 - **The full status command is deliberately avoided.** The opening read is only hook-installed + memory count; it never probes AI hosts or worktrees, keeping bare `jolli` fast.
 - **The status line is printed after the enable step, not before it.** That ordering is what makes `✓ enabled` unconditionally truthful.
+- **The signed-in status line's engine suffix names one specific agent tool for every local-agent user.** The suffix ` · summaries via Claude Code` is a fixed string appended whenever generation is possible and the provider is the local agent — it does not consult which of the four agent tools is actually pinned. A user who pinned Codex, Cursor, or OpenCode is told their summaries come via Claude Code. This was vacuously correct while only one tool was selectable and is now reachable from the setup picker (spec 57); the line is behavior-of-record, unchanged. (Surprising; observable mismatch.)
 - **"Can generate" is not just credential resolution.** For the local-agent provider it probes the agent CLI, so this flow catches a broken local agent that dispatch-time resolution would have accepted (spec 291, spec 10).
 - **Being signed in never controls flow.** It selects which branch of the status line is taken; sync capability is what gates the sign-in offer, and generation capability is what gates the repair step, the back-fill offer, and the listening line.
 - **The provider is only ever changed by an explicit choice** — the repair ladder's switch option, a key entry that pins its own provider, the post-sign-in write in the ladder's local-agent rung, or the setup wizard's fresh-configuration auto-detect. The flow itself never silently reassigns the provider.

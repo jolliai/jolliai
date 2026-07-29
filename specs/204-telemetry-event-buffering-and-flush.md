@@ -134,7 +134,7 @@ The JVM-IDE flush operates on the **raw stored JSON lines** rather than re-seria
 | Command-line (process exit) | A flush after every command's exit, with a short ~2-second timeout; skipped for the telemetry command group and for explicit latency-critical opt-outs. On the failure path, the failed-command event is recorded before the flush. |
 | AI-agent turn-end hooks | The Claude Stop hook and the Gemini after-agent hook each flush at turn end, awaited, with a short ~2-second timeout. |
 | Post-commit queue worker | The long-lived post-commit worker bootstraps telemetry, drains its work, then flushes once on completion — the natural send point for events that short-lived hook invocations only buffered. |
-| Editor | A flush on activation and on a 60-second extension-level interval regardless of panel visibility, plus the pre-existing visibility-gated sidebar-tick flush, threading the live host opt-out signal each time. |
+| Editor | A flush on activation and on a 60-second extension-level interval regardless of panel visibility, plus the pre-existing visibility-gated sidebar-tick flush, threading the live host opt-out signal each time. **All three are suppressed while the workspace's repository is manually disabled** — they share one entry point, and it declines before resolving anything. |
 | JVM IDE | A flush once on project open and a 60-second background schedule off the UI thread tied to the project lifecycle, plus the pre-existing visibility-gated panel-tick flush, re-reading the IDE data-sharing decision at flush time. |
 
 ### Never-throw guarantee
@@ -148,6 +148,8 @@ The queue file moves through:
 
 - **Absent.** No file. A first append creates the directory and the file.
 - **Accumulating.** Appended lines pile up. Each append checks the byte cap; an overflow compacts in place to the newest 500.
+
+  This state can now be **entered and never left** until an external gesture intervenes: while the workspace's repository is manually disabled, every editor flush trigger is suppressed while explicit user-gesture events are still appended, so the buffer grows with nothing draining it. The two caps are the only bound — the oldest events are evicted rather than sent. Re-enabling the repository restores the ordinary triggers, and the next one drains whatever survived (subject to the flush-time consent re-gate). See spec 203 for which events are still recorded and why.
 - **Partially drained.** A flush acknowledged some events; the replace rewrites the buffer to the un-acknowledged remainder (plus anything appended during the flush). The file may be removed if the remainder is empty.
 - **Fully drained.** All events acknowledged → the buffer is replaced with an empty list, which removes the file.
 - **Discarded.** The consent re-gate (off path) or an explicit clear removes the file without sending.
@@ -170,7 +172,8 @@ The queue file moves through:
 
 ## Shared Behavior
 
-- Whether an event reaches the buffer at all, and whether a flush is allowed to send (the flush-time consent re-gate that drops the buffer when opted out), are defined by **Telemetry Consent and Opt-Out**.
+- Whether an event reaches the buffer at all, and whether a flush is allowed to send (the flush-time consent re-gate that drops the buffer when opted out), are defined by **Telemetry Consent and Opt-Out** — which also owns the separate, per-call-site suppression that a manually disabled repository imposes on the editor's flush triggers.
+- The manually-disabled repository state that suppresses those triggers is owned by spec 145, and the wider write-suppression contract it belongs to by `specs/304-manually-disabled-zero-write-contract.md`.
 - The envelope serialized into each line, and what is and is not inside it, are defined by **Telemetry Event Catalog**.
 - The resolution of the flush target/credential from config, and the lifecycle points that call flush, are defined by **Telemetry Startup and Command Instrumentation**.
 - The product-origin allowlist the flush re-asserts, and the API-key parsing it uses to find the tenant origin, are owned by the auth/origin specs and only referenced here as boundaries.

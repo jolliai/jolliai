@@ -12,11 +12,12 @@ Every external-reference source (Linear, Jira, GitHub, Notion, Slack, and any fu
 - The pipe evaluation model: how a value is threaded op-to-op, and the "first op reads the root payload, later ops read the threaded value" rule.
 - The field-spec model: a pipe plus an optional match-constraint (`require`) with optional flags, plus an `optional` flag; and the reference-level `guard` field that reuses the same field-spec mechanism as a pre-extraction gate.
 - Reference extraction from one payload object: guard evaluation, the required/optional core fields, the opaque display-field bag, and the assembled record shape (including its registry map key).
+- The fact that the destination-link field-spec is itself **optional at the definition level** (a definition may declare none at all), and the three distinct link outcomes that follow from that.
 - Prompt-block rendering: per-record XML emission, attribute-vs-text escaping, the per-reference body truncation cue, and the block-level budget selection algorithm.
 - The closed transform registry as a security boundary, including the own-key membership check that rejects prototype-chain names.
 - The compiled-pattern cache used by the regex op and the `require` constraint.
 - Structural validation of a candidate definition: required keys, the display-field key charset, the per-pipe op-count cap, and the coalesce/template nesting-depth cap.
-- The two optional top-level consumer flags a definition may declare (track-only; arguments-derived) — their declared meaning, the fact that the engine never acts on either, and the fact that the validator checks neither.
+- The three optional top-level consumer flags a definition may declare (track-only; arguments-derived; accumulate-body) — their declared meaning, the fact that the engine never acts on any of them, and the fact that the validator checks none of them.
 - The process-wide registry singleton built once from the built-in definitions, and its fail-fast behavior on an invalid built-in.
 - The documented (but not-yet-implemented) seam for loading user-authored definitions from durable state.
 
@@ -84,18 +85,21 @@ An entry contributes to the record only when its pipe yields a non-empty value.
 
 ### Source definition (aggregate)
 
-A source definition bundles: a string **id**, a **label**, an **icon**, a **match** block (spec 153), an ordered **wrapperKeys** list (spec 153's payload walk), a **reference** block (the core field-specs: nativeId, title, url, optional description, optional guard), the **display-field** list, a **storage** spec, a **render** spec, and two optional top-level consumer flags (below). It contains no functions; the only reference to code is a transform name inside a `transform` op, resolved against the closed registry.
+A source definition bundles: a string **id**, a **label**, an **icon**, a **match** block (spec 153), an ordered **wrapperKeys** list (spec 153's payload walk), a **reference** block (the core field-specs: nativeId, title, an **optional** destination-link spec, optional description, optional guard), the **display-field** list, a **storage** spec, a **render** spec, and three optional top-level consumer flags (below). It contains no functions; the only reference to code is a transform name inside a `transform` op, resolved against the closed registry.
+
+Only the nativeId and title field-specs are structurally mandatory. The destination-link spec is **absent** for a source whose referenced system has no external destination at all; that is deliberately a different state from a declared spec that fails to produce a value, and the two are not collapsed (see "Reference extraction from one payload object").
 
 ### Consumer flags (engine-inert)
 
-Two optional top-level booleans sit alongside the blocks above. Neither is read by the engine; each exists purely to be read by a specific downstream consumer:
+Three optional top-level booleans sit alongside the blocks above. None is read by the engine; each exists purely to be read by a specific downstream consumer:
 
 - **trackOnly** (optional boolean) — declares that references from this source are kept as background context only. Read by the two prompt-block builders (the commit-summarization block assembly of spec 12 and its regeneration counterpart), which skip a track-only definition entirely, and by the AI-relevance stage (spec 258), which removes track-only references from the ranker's input and splices them back unconditionally. Read nowhere else: it does not gate extraction, persistence, archival, display, or any user-facing exclusion control.
 - **argumentsDerived** (optional boolean) — declares that this source's reference is built from the tool call's *arguments* rather than from the tool's returned payload. Read only by the per-producer envelope parsers (spec 153), which — on a failure to parse the result payload as JSON — supply an empty payload object to the source's normalizer instead of warning and dropping the call.
+- **accumulateBody** (optional boolean) — declares that this source's identity is an **act** rather than an entity, so several extracted records sharing one map key must have their descriptions **merged** rather than the newest overwriting the rest. The default (newest-overwrites) is right for an entity — two fetches of the same ticket describe one ticket, and the later read wins — and wrong for an act, where two different recorded acts are two different facts. Read by three consumers, none of them the engine: the extraction pipeline's cross-record collapse (spec 153), which merges instead of discarding and additionally lifts each body into a timestamped entry line; the persistence layer's write (spec 179), which folds the body already on disk into the incoming record; and the newest-entry read-back helper the display surfaces call (specs 179, 187), which returns nothing at all for a non-accumulating source.
 
-Both flags are also read by the persistence layer's note-emission decision (spec 179), which appends an explanatory note to a reference's on-disk markdown when its registered definition declares either flag.
+The track-only and arguments-derived flags are also read by the persistence layer's note-emission decision (spec 179), which appends an explanatory note to a reference's on-disk markdown when its registered definition declares either one. The accumulate-body flag does not participate in that decision.
 
-Every consumer tests for an exact `true`. Any other value — including a truthy non-boolean — behaves exactly as if the flag were absent.
+Every consumer tests for an exact `true` — including all three of the accumulate-body consumers, which either compare to `true` or take their non-accumulating branch on anything that is not exactly `true`. Any other value — including a truthy non-boolean — behaves exactly as if the flag were absent.
 
 ### Transform registry
 
@@ -137,7 +141,14 @@ Given a definition and one already-parsed payload object:
 
 1. If the payload is not a plain object, produce no reference.
 2. If the definition declares a `guard`, evaluate it; if it voids or produces nothing, produce no reference.
-3. Evaluate the `nativeId`, `title`, and `url` field-specs. If any voids, produce no reference. If `nativeId` or `title` produced nothing, produce no reference. `url` may be legitimately absent only when the definition marked it `optional`; a required-but-missing url would already have voided at step-3 evaluation.
+3. Evaluate the `nativeId` and `title` field-specs, and the destination-link field-spec **only when the definition declares one**. If any evaluated spec voids, produce no reference. If `nativeId` or `title` produced nothing, produce no reference.
+
+   There are exactly **three** link outcomes, and they are deliberately distinct:
+   - **No link spec declared** — nothing is evaluated, no link is attached to the record, and no void is possible. The source has no external destination, so there is no link to fail at.
+   - **A declared spec that voids** (required-but-missing, or produced a value failing its `require`) — no reference at all. The link was supposed to exist and could not be established, and a record whose destination cannot be reached is judged worth nothing.
+   - **A declared `optional` spec that yields nothing** — a reference *is* produced, carrying no link.
+
+   The pair that must not be collapsed is the first and the second: one produces a record and the other produces none, and only the definition says which case a source is in. The first and third are, by contrast, indistinguishable from the produced record alone — both simply leave its link absent — and that is harmless, because the one consumer decision that depends on a link (whether to offer an open-in-browser affordance) keys on the record's link being present rather than on why it is not (spec 187).
 4. Evaluate the optional `description` field-spec if present; a void there produces no reference.
 5. Evaluate each display-field entry's pipe; include only those yielding a non-empty value, preserving definition order; carry each entry's key, label, value, and optional icon.
 6. Assemble the record: map key `<id>:<nativeId>`, the source id, native id, title, and the tool name + referenced-at echoed through verbatim. Include url, description, and the display-field list only when non-absent / non-empty.
@@ -173,13 +184,14 @@ Every pattern used by a `regex` op or a `require` constraint is compiled once an
 A validator gates any candidate definition (built-in today; user-authored in the future seam):
 
 - The candidate must be a plain object with a non-empty string id, non-empty label, non-empty icon, an object `match`, an array `wrapperKeys`, an object `reference`, an array display-field list, an object `storage`, and an object `render`.
-- The `reference` block must carry object field-specs for nativeId, title, and url; each such pipe is validated. An optional description and optional guard, if present, must be object field-specs and their pipes validated.
+- The `reference` block must carry object field-specs for **nativeId and title only**; each such pipe is validated. The destination-link spec, the description spec, and the guard spec are each validated **only when present** — each must then be an object field-spec whose pipe validates, exactly like any other pipe. An **absent** link spec is accepted without comment; the validator makes no attempt to decide whether a source ought to have one.
+- A declared-but-unsatisfiable link spec is **not** a validation concern. Whether a pipe can actually produce a value depends on the payload, so voiding on it is the extraction step's job, not the validator's.
 - Each display-field entry must be an object whose key matches `[\w-]+`, whose label is a non-empty string, and whose pipe validates.
 - **Pipe validation** walks every op: each op must be an object naming one of the seven kinds; kind-specific required members must be present and correctly typed; a `transform` op's name must be an own key of the transform registry; `coalesce`/`template` sub-pipes recurse.
 - **Op-count cap:** each top-level pipe field gets a fresh budget; the total op count (including all nested sub-pipe ops) may not exceed 64.
 - **Nesting-depth cap:** each `coalesce`/`template` step adds one depth level; depth may not exceed 8. The two caps are tracked separately so a wide-but-shallow pipe and a narrow-but-deep pipe each fail for the right reason.
 - The validator does not (yet) deep-check `match`/`storage`/`render` beyond presence; those are internal wiring for built-ins today.
-- The validator does **not** check the two optional consumer flags at all — neither their presence nor their type. A definition carrying a non-boolean value under either name passes validation unnoticed. This is tolerable only because every consumer tests for an exact `true`, so a non-`true` value is inert; it is not a type guarantee.
+- The validator does **not** check the three optional consumer flags at all — neither their presence nor their type. A definition carrying a non-boolean value under any of those names passes validation unnoticed. This is tolerable only because every consumer tests for an exact `true`, so a non-`true` value is inert; it is not a type guarantee.
 
 ### Registry construction (fail-fast for built-ins)
 
@@ -208,14 +220,15 @@ The engine is otherwise pure: extraction and rendering are functions of (definit
 - **Resource caps make a definition's evaluation cost bounded.** The op-count and nesting-depth caps bound the work any single pipe can require, which matters once untrusted definitions are admitted.
 - **A cached, globally-flagged pattern's scan position is reset before each `require` test.** Without this, a reused compiled pattern with the global flag would carry match state across references and intermittently fail.
 - **Empty selection yields an empty string, not an empty wrapper.** A block whose every candidate is over budget (or whose input is empty) contributes nothing, so a caller can skip writing an empty wrapper.
-- **Three declared members are engine-inert.** The engine records `storage.nativeIdPathSafe`, `trackOnly`, and `argumentsDerived` and never acts on any of them: extraction, pipe evaluation, and render all behave identically whether they are set or absent. Each is read by exactly one class of downstream consumer — the path-safety flag by the persistence layer (spec 179), the track-only flag by the prompt-block builders (spec 12) and the relevance ranker (spec 258), the arguments-derived flag by the envelope parsers (spec 153) — plus the persistence layer's note-emission decision, which reads both new flags (spec 179).
-- **The validator ignores the two consumer flags entirely.** Unlike every block it does check, neither flag is validated for presence or type. Safety comes only from every consumer requiring an exact `true`, which makes any other value inert rather than misinterpreted.
+- **Four declared members are engine-inert.** The engine records `storage.nativeIdPathSafe`, `trackOnly`, `argumentsDerived`, and `accumulateBody` and never acts on any of them: extraction, pipe evaluation, and render all behave identically whether they are set or absent. Each is read by a specific class of downstream consumer — the path-safety flag by the persistence layer (spec 179), the track-only flag by the prompt-block builders (spec 12) and the relevance ranker (spec 258), the arguments-derived flag by the envelope parsers (spec 153), the accumulate-body flag by the extraction pipeline's record collapse (spec 153), the persistence layer's write and its newest-entry read-back helper (spec 179), and the display surfaces that call that helper (spec 187) — plus the persistence layer's note-emission decision, which reads the track-only and arguments-derived flags (spec 179).
+- **The validator ignores all three consumer flags entirely.** Unlike every block it does check, no flag is validated for presence or type. Safety comes only from every consumer requiring an exact `true`, which makes any other value inert rather than misinterpreted.
+- **An absent destination-link spec and an unsatisfied one are different outcomes, and only the definition distinguishes them.** Both leave the produced record without a link, but the first produces a record and the second produces nothing. Structural validation accepts the absence silently, so nothing warns a definition author who forgot a link spec they meant to declare — such a source simply extracts records with no link.
 - **A track-only source's render spec is declared but unreachable.** Because both prompt-block builders skip a track-only definition before any rendering happens, such a definition's render tags, field-attribute toggle, and both character budgets are never exercised by any reachable code path. The engine will still render them if handed the definition directly, but nothing in the product does.
 
 ## Shared Behavior
 
 - **The catalog of concrete source definitions** — each source's pipes, field sets, match rules, wrapper keys, render tags, budgets, and the two transforms — is spec 154.
-- **Identity resolution** (which definition owns a given tool call, via prefix/suffix/namespace/invocation-tool matching held in the `match` block) is spec 153. The registry singleton built here is the object that answers those lookups.
+- **Identity resolution** (which definition owns a given tool call, via prefix/suffix/namespace/invocation-tool matching held in the `match` block) is spec 153. The registry singleton built here is the object that answers those lookups. Two further per-definition match gates now live in that contract and are documented there, not here: an **exact tool-name allow-list** narrowing a prefix match to a closed set, and a **server pin** scoping the no-namespace lookup to the server the producer's event reported. Like every other part of the `match` block, both are opaque to the engine and unchecked by the validator.
 - **Transcript reading, tool-call/result pairing, and the wrapper-key payload walk** that feeds the engine one payload object at a time are spec 153.
 - **On-disk persistence, native-id path-safety (driven by `storage.nativeIdPathSafe`), and the strict-vs-lenient source-id checks** are spec 179.
 - **The produced reference record shape** and its downstream registry/commit-snapshot lifecycle are specs 153 and the summary-storage specs (01–06).

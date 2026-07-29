@@ -201,6 +201,12 @@ Two of the four knowledge-graph templates carry instructions that pair with a sp
 - **`graph-edges` is scoped to a single category.** Its intro, its units-block heading, and an explicit closing instruction all state that every unit in the block belongs to **one** category, and that relationships to units in *other* categories are computed separately and are **not** the model's job for this call. This matches a caller that issues one edge call per category rather than one call over the whole graph.
 - **`graph-units` asks for load-bearing units only, not a fixed count.** The earlier instruction requested a flat range of units per topic. It now instructs the model to extract only load-bearing units — most topics yield a small handful, with a hard upper bound of eight — and explicitly forbids padding to reach a count. The hard cap remains; the floor is gone.
 
+### Ticket-identifier rule (shared wording, two templates)
+
+Both `summarize` and `squash-consolidate` carry a ticket-id rule that names the required shape rather than only asking for "the ticket": the value must be a real ticket key of the `ABC-123` form (or the `#789` form), and the rule explicitly rules out a plan slug, a file path, a commit hash, and a bare date. `summarize` spells the plan-slug case out with a date-led example. Both rules also forbid emitting a placeholder in place of omitting the field — `summarize` names the parenthesized "none referenced" shape specifically. Both still ask for the canonical uppercase form.
+
+These are two separate rule bodies (this is *not* one of the extracted shared fragments above), so the wording must be tightened in both to stay aligned. The tightening was made **without** bumping either template's `version`, so the pinned revisions are unchanged. On the proxy path the client's body is never sent, so what the model actually sees for a given `(action, version)` pair is whatever body the backend holds for that pair; only the direct path is governed by the wording described here.
+
 ### Encoding constraint
 
 Template bodies are pure ASCII to avoid encoding issues on Windows consoles. Non-ASCII characters are not introduced into prompts.

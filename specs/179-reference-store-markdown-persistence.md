@@ -23,7 +23,8 @@ Persist each extracted external reference as a single per-reference markdown fil
   - dropping individual field-list items that are non-JSON, that have the wrong object shape, that carry an unsafe key character set, or whose icon attribute is the wrong type, while still returning the rest of the reference;
   - ignoring frontmatter lines that are neither key-value nor list-item lines.
 - A markdown-body normalization rule, shared between render and parse, that strips leading and trailing blank lines on the body so render-then-parse on the same reference yields a byte-equal canonical form.
-- A conditional, auto-generated explanatory note appended after the body for any reference whose source declares either of the two consumer flags (track-only; arguments-derived), its exact user-visible text, the machine-readable sentinel that opens it, and the parse-time truncation that cuts it back off.
+- A conditional, auto-generated explanatory note appended after the body for any reference whose source declares either of the track-only / arguments-derived consumer flags, its exact user-visible text (including the two wordings its first paragraph takes depending on whether the source declares a destination link at all), the machine-readable sentinel that opens it, and the parse-time truncation that cuts it back off.
+- The accumulating-body variant a source may opt into: the entry-line format, the merge rule for two bodies of one key, the entry cap and its announced drop, the verbatim preservation of non-entry lines, and the read-back helper that returns the newest entry.
 - A pure-string variant of the parser for callers that already hold the markdown text in memory (no filesystem read).
 
 **Boundaries:**
@@ -80,7 +81,7 @@ The on-disk file is a single text file with this structure, in order, with each 
    - `source` → JSON-encoded string with the source-id value.
    - `nativeId` → JSON-encoded string with the source-canonical identifier.
    - `title` → JSON-encoded string.
-   - `url` → JSON-encoded string. **Emitted only when the reference carries a non-empty url.** When the source's url is absent (a source whose url field-spec is optional and whose payload carried none — e.g. a chat thread with no resolvable permalink), the `url:` line is omitted entirely rather than written as `url: ""` or `url: null`, so that the parser's missing-key path round-trips it back to an absent url.
+   - `url` → JSON-encoded string. **Emitted only when the reference carries a non-empty url.** When the url is absent the `url:` line is omitted entirely rather than written as `url: ""` or `url: null`, so that the parser's missing-key path round-trips it back to an absent url. Absence now has **two distinct upstream causes**, and this layer treats them identically: a source whose url field-spec is declared-and-optional and whose payload carried none (e.g. a chat thread with no resolvable permalink), or a source that declares **no url field-spec at all** because it has no external destination to link to (spec 255). Nothing on disk records which case applied — only the source definition distinguishes them.
 3. An optional fields list block. It appears only when the reference carries at least one displayable field. When present, it consists of:
    - A line containing exactly `fields:`.
    - One line per field of the form `  - <json>` (two leading spaces, a hyphen, a space, then the JSON encoding of the field object). Field-object shape is `{key, label, value, icon?}` — see "Field-list item shape" below.
@@ -107,11 +108,21 @@ The sentinel is exactly:
 <!-- jolli:auto-note -->
 ```
 
-Paragraph one is emitted if and only if the definition declares **arguments-derived**. Its text interpolates the source's display label **twice**:
+Paragraph one is emitted if and only if the definition declares **arguments-derived**, and it has **two wordings**, chosen by whether the definition declares a destination-link field-spec at all (spec 255).
+
+When a link spec **is** declared, the text interpolates the source's display label **twice**:
 
 ```
 > ℹ️ **This is a bookmark, not a full copy.** Only the query and the <LABEL> link are recorded here — <LABEL>'s full response is intentionally not saved. This is expected behaviour, not a bug.
 ```
+
+When **no** link spec is declared, the sentence promises only the query, and the label is interpolated **once**:
+
+```
+> ℹ️ **This is a bookmark, not a full copy.** Only the query is recorded here — <LABEL>'s full response is intentionally not saved. This is expected behaviour, not a bug.
+```
+
+The second wording exists because a source with no external destination has no link the reader could follow, so promising one would simply be false. The branch is keyed on the **definition** — does it declare a link spec — not on the reference instance's own url, which is what preserves the byte-identical-across-renders property below: every reference from a given source takes the same branch, so the note is still a pure function of the definition.
 
 Paragraph two is emitted if and only if the definition declares **track-only**. Its text is fixed, with no interpolation:
 
@@ -157,7 +168,7 @@ Two properties of the cut are load-bearing:
 
 ### Accumulating bodies
 
-A source definition may declare an **accumulate-body** flag (spec 154; one built-in declares it today). Its identity is an act rather than an entity, so successive writes of the same key must *collect* rather than overwrite.
+A source definition may declare an **accumulate-body** flag (spec 255 owns the flag's contract; spec 154 records the one built-in that declares it today). Its identity is an act rather than an entity, so successive writes of the same key must *collect* rather than overwrite.
 
 The body of such a source is a list of **entry lines**, one per recorded act, each carrying the act's text and the timestamp it was recorded at, with the text delimited so a text containing the delimiter character still round-trips (the split is taken at the last delimiter occurrence in the line). Entries are emitted newest-first, ordered by timestamp with the text as tie-breaker so the rendered bytes — and therefore the content hash — do not depend on scan order. The same entry text seen twice collapses onto the later timestamp.
 
@@ -166,7 +177,7 @@ Two further properties:
 - **The list is capped.** Beyond a fixed maximum the oldest entries are dropped, and the drop is *announced* in the body by a notice line rather than happening silently. The notice is re-derived on every render and is sticky: a body that has ever overflowed keeps its notice even if a later merge would not itself overflow. The cap is chosen for the readability of the human-browsable markdown, not measured against a workload.
 - **Non-entry lines are preserved verbatim.** These files are the user-browsable layer, so any hand-edited line from either side of a merge is kept and hoisted above the entry list rather than discarded by the next machine write. The auto-note block is not one of these: it is cut before the merge ever sees it (see "Parse-time note truncation"), so it can never be folded into an accumulated body.
 
-Reading the newest entry back out of a body is done through the **same entry format the writer emits**, exposed as a helper alongside a source-gated variant that returns nothing for a non-accumulating source. Display surfaces (specs 187, 255) call those helpers; none of them re-derives the entry format locally, which is what keeps the surfaces from drifting apart from the writer or from each other.
+Reading the newest entry back out of a body is done through the **same entry format the writer emits**, exposed as a helper alongside a source-gated variant that returns nothing for a non-accumulating source. Two callers use them: the display surface that renders an uncommitted reference row (spec 187), and the commit-archive step that freezes the newest entry onto the per-commit value snapshot (the summary-storage specs, 01–06) because that snapshot does not carry the body. Neither re-derives the entry format locally, which is what keeps them from drifting apart from the writer or from each other — the two surfaces previously disagreed, and re-deriving the rule per surface is how they drifted.
 
 ### Canonical content hash
 
@@ -189,7 +200,7 @@ A persisted file is accepted as a valid reference if and only if all of the foll
 - A scalar named `referencedAt` is present, JSON-decoded to a string (the empty string is allowed).
 - A scalar named `sourceToolName` is present, JSON-decoded to a non-empty string.
 
-`url` is **not** a required scalar. A missing `url:` key parses as an absent url (not an empty string) and does not fail the reference; when present it is JSON-decoded to a string. A source whose url field-spec is optional may legitimately lack one.
+`url` is **not** a required scalar. A missing `url:` key parses as an absent url (not an empty string) and does not fail the reference; when present it is JSON-decoded to a string. Two kinds of source legitimately lack one: a source whose url field-spec is declared-and-optional, and a source that declares no url field-spec at all (spec 255).
 
 Any missing required scalar (other than url), any JSON-decode failure on a required scalar, a `source` value failing the charset check, or a missing closing fence causes the parse to return a null reference. The file is not deleted or modified by a failing parse.
 
@@ -362,7 +373,8 @@ The directory `<jollimemory-dir>/references/<source>/` is created on the first t
 ## Shared Behavior
 
 - The source-id model is open (spec 255): a source id is a plain string, twelve built-ins ship today, and the definition registry — not a closed union — decides registered-vs-unregistered. This layer's read path uses only the lenient charset check; the strict registry-membership check lives at the path sinks. Adding a source requires registering a new definition upstream and is out of this layer's scope.
-- The two consumer flags that gate the auto-note block (track-only; arguments-derived) are declared on the source definition and contractually owned by spec 255; which built-in declares them is spec 154. This layer reads them only to decide whether to emit the note, and never changes any other aspect of its output because of them.
+- The two consumer flags that gate the auto-note block (track-only; arguments-derived) are declared on the source definition and contractually owned by spec 255; which built-in declares them is spec 154. This layer reads them only to decide whether to emit the note, and never changes any other aspect of its output because of them. It reads one further flag — accumulate-body, also owned by spec 255 — which does change its output, by turning the write into the read-modify-write merge described above.
+- Whether a source declares a destination-link field-spec at all is likewise a source-definition fact owned by spec 255. This layer reads it for exactly one decision (which wording the note's first paragraph takes) and is otherwise indifferent: an absent url is written, parsed, and hashed identically whichever upstream cause produced it.
 - The in-memory reference shape (the input to the writer and the output of the reader) is produced by the source-definition engine (spec 255), whose built-in catalog is spec 154, and the transcript extraction pipeline (spec 153). This layer treats the field-list bag as opaque and does not interpret any individual `key`.
 - The canonical content hash produced here is consumed downstream as the "content hash at archive time" guard on the commit-summary side, which decides whether a previously-archived reference's on-disk file is still in sync with what was committed. That consumer is out of scope here.
 - The on-disk markdown is also written to the orphan branch by a separate module that can parse the same bytes back via the in-memory-string parser variant; the orphan-branch storage layout is out of scope here.

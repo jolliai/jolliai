@@ -40,7 +40,7 @@ After a successful login, the command prints:
   Jolli API Key:     saved ✓     (only when the OAuth callback issued an API key)
 ```
 
-On failure (browser flow aborted, callback timed out, exchange code rejected, etc.), the command prints to stderr:
+On failure (browser flow aborted, the callback arrived with neither a code nor a token, the nonce did not match, the code exchange timed out — it is bounded at 20 seconds — or the exchange was rejected, etc.), the command prints to stderr:
 
 ```
   Login failed: <error message>
@@ -112,6 +112,7 @@ The command takes no flags.
 - **The product API key is never displayed.** `status` reports only its presence as a boolean. There is no flag to print or unmask the key — to inspect it, the user reads the config file directly.
 - **`logout` is idempotent.** Running it on a system that has no credentials produces the same output as running it after `login`. This makes scripted teardown safe.
 - **`login` failures do not corrupt existing credentials.** If a user re-runs `login` after a successful prior login and the new attempt fails, the previously saved token and key remain valid.
+- **There is no login-window timeout on this surface.** The local callback listener has no expiry timer: if the user never completes the browser flow, `jolli auth login` simply keeps waiting and the user aborts the command themselves. The only timeout in the flow is the 20-second bound on the code-exchange request, which surfaces as a timed-out sign-in message. (Notable; a common wrong assumption.)
 
 ## Shared Behavior
 

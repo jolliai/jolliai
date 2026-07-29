@@ -34,6 +34,8 @@ This spec defines how Cursor IDE sessions are detected, discovered for the curre
 
 Cursor is considered installed when the runtime supports the embedded-database module and Cursor's global state file exists and is a regular file. Either condition failing reports Cursor as not installed.
 
+This predicate governs discovery, the status tree, and this spec's "not installed" reporting only. MCP registration asks a **distinct, presence-only** question about Cursor — the same global-state-file check without the runtime gate — so Cursor can be reported "not installed" here in the same run in which it is registered as an MCP host. See spec 149.
+
 ### User-data directory
 
 The Cursor user-data root is platform-specific, identical in shape to a VS Code-family install:

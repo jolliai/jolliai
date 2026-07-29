@@ -35,7 +35,6 @@ A single record in the local note registry, with these fields relevant to archiv
   - **snippet**: the note's textual content was originally entered inline; it is stored as a file under the per-repository state directory and the source path points at that file. On archival, the local file is removed because the canonical copy has moved to the orphan branch.
   - **markdown**: the note references a separate markdown file at an arbitrary path the user supplied; the source path points at that file. On archival, the file is left intact because the user owns its location.
 - **source path** (required when present, string): the absolute path on disk to the file backing the note.
-- **branch** (optional, string): the branch the note was added on. Optional — a record legitimately carries no branch when the current-branch query failed at registration time (the field is omitted rather than stored as a literal `unknown`), and legacy records predating branch-stamping also lack it.
 - **commit hash** (required, nullable string): null while the note is uncommitted; set to a commit hash once associated.
 - **content hash at commit** (optional, hex string): the SHA-256 of the source content at the moment of archival; presence of this field marks the entry as a guard.
 - **added at**, **updated at** (required, ISO timestamps).
@@ -66,7 +65,7 @@ The archived note content is stored on the orphan branch at a conventional path 
 1. Load the registry; access the notes map (which may be absent in legacy registries — treat as empty).
 2. Collect every entry whose commit-hash field is null and whose content-hash-at-commit field is absent.
 
-These two conditions express "this entry is genuinely uncommitted and not yet archived". There is no per-row hidden flag consulted here: user hard-exclude is handled entirely by the separate commit-exclusion store (see [188]), and any row the registry reader finds carrying a legacy `ignored === true` marker is deleted outright on read rather than kept as a hidden variant. The selection rule does not filter by branch. The branch-aware visibility logic that hides notes from other branches is applied later by the panel display layer, not at archival time.
+These two conditions express "this entry is genuinely uncommitted and not yet archived". There is no per-row hidden flag consulted here: user hard-exclude is handled entirely by the separate commit-exclusion store (see [188]), and any row the registry reader finds carrying a legacy `ignored === true` marker is deleted outright on read rather than kept as a hidden variant. Selection is branch-independent, because a registry entry carries no branch to select on. Every genuinely-uncommitted entry in the worktree's registry is eligible for the commit being processed, whichever branch that commit is on. The commit's own branch is the only branch attribution an archived note ever acquires.
 
 ### Per-entry archival
 
@@ -121,9 +120,9 @@ Snippet-format and markdown-format entries archive identically with one exceptio
 
 If the original identifier were deleted on archival, the system would lose its only handle for detecting subsequent edits to the source. The guard entry is the mechanism by which "this note was archived under exactly this content; if the source changes, surface it again" is enforced.
 
-### Branch-aware filtering happens at display time, not archival time
+### Branch attribution begins at archival
 
-The archival path does not filter by branch. The registry entry retains its branch field unchanged through the guard rewrite. The display layer reads the branch field at panel-query time and hides entries whose branch does not match the current branch. Notes registered on branches other than the current one are therefore never archived against a commit on the current branch via the panel-driven selection — but the archival path itself is permissive: any uncommitted note in the registry is eligible at this stage.
+Neither archival nor the panel filters by branch, because a registry entry carries no branch. A pending note is worktree-scoped: it stays visible regardless of which branch is checked out, exactly like uncommitted code. Archival is where a branch first enters the picture, and it is the **commit's** branch — the one recorded on that commit's stored summary — not anything the registry ever held. Any branch value found on a row is purged when the registry is read, and the purge marks the registry as changed so the next write-back persists the cleaned shape; because this path reads through that same normalization, the guard rewrite has no branch to preserve.
 
 ### Idempotency rests on the guard
 

@@ -32,7 +32,6 @@ A single record in the local plan registry, with these fields relevant to archiv
 - **slug** (required, string): a deterministic identifier of the plan, derived from the file's location at registration time.
 - **title** (required, string): the first heading text from the markdown file at registration time.
 - **source path** (required, string): the absolute path to the plan's markdown file on disk.
-- **branch** (optional, string): the branch the plan was added on. Optional — a record legitimately carries no branch when the current-branch query failed at registration time (the field is omitted rather than stored as a literal `unknown`), and legacy records predating branch-stamping also lack it.
 - **commit hash** (required, nullable string): null while the plan is uncommitted; set to a commit hash once associated.
 - **content hash at commit** (optional, hex string): the SHA-256 of the file content at the moment of archival; presence of this field marks the entry as a guard.
 - **added at**, **updated at** (required, ISO timestamps).
@@ -59,7 +58,7 @@ The archived plan content is stored on the orphan branch at a conventional path 
 
 These two conditions express "this entry is genuinely uncommitted and not yet archived". Entries that already carry a content hash are guard records from a prior archival; entries with a non-null commit hash are either committed snapshots or stale records superseded elsewhere. There is no per-row hidden flag consulted here: user hard-exclude is handled entirely by the separate commit-exclusion store (see [188]), and any row the registry reader finds carrying a legacy `ignored === true` marker is deleted outright on read rather than kept as a hidden variant.
 
-The selection rule does not filter by branch. The branch-aware visibility logic that hides plans from other branches is applied later by the panel display layer, not at archival time. As a result, the archival path will associate a plan with the current commit even when the plan's recorded branch differs from the commit's branch, on the principle that the registry's branch field reflects the user's intent at registration.
+Selection is branch-independent, because a registry entry carries no branch to select on. Every genuinely-uncommitted entry in the worktree's registry is eligible for the commit being processed, whichever branch that commit is on. The commit's own branch is the only branch attribution an archived plan ever acquires.
 
 ### Per-entry archival
 
@@ -132,9 +131,9 @@ There is **no discard pass** for plans. An earlier design permanently deleted a 
 
 **Contrast with conversations (the discard exception):** excluded *conversations* are the one item kind that is still a one-time discard — an excluded conversation is read only to advance its cursor to the commit boundary and is then dropped from the summary, so it never reappears. That discard is owned by the transcript-loading path, not this one; plans (like notes and references) are the sticky, skip-only kind.
 
-### Branch handling is permissive at archival, strict at display
+### Branch attribution begins at archival
 
-The archival path does not filter by branch. The registry entry retains its branch field unchanged through the guard rewrite. The display layer reads the branch field at panel-query time and hides entries whose branch does not match the current branch. As a result, an archived plan's registry trail is consistent across branch switches while the panel remains uncluttered.
+Neither archival nor the panel filters by branch, because a registry entry carries no branch. A pending plan is worktree-scoped: it stays visible regardless of which branch is checked out, exactly like uncommitted code. Archival is where a branch first enters the picture, and it is the **commit's** branch — the one recorded on that commit's stored summary — not anything the registry ever held. Any branch value found on a row is purged when the registry is read, and the purge marks the registry as changed so the next write-back persists the cleaned shape; because this path reads through that same normalization, the guard rewrite has no branch to preserve.
 
 ### Discovery is upstream
 

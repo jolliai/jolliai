@@ -12,8 +12,9 @@ A per-project service initializes the Jolli Memory bridge on project open, liste
 - The status-listener API used by all panels in the side tool window.
 - Detecting that `.git` has been removed (or has reappeared) since initialization, and signalling panels to switch their UI accordingly.
 - Resetting the initialization flag so a re-opened repository can re-run initialization without restarting the IDE.
+- The two fire-and-forget warm-ups dispatched near the end of initialization (a read-path warm-up and a browser-pool prewarm), and what a failure of either costs.
 
-Out of scope: hook installation itself, summary reading, ref watching (covered by spec 125), the pending-push drain's own mechanics (covered by spec 271; this service only dispatches it), and any individual panel's UI.
+Out of scope: hook installation itself, summary reading, ref watching (covered by spec 125), the pending-push drain's own mechanics (covered by spec 271; this service only dispatches it), the embedded-browser pool's own capacity/eviction/disposal rules (covered by spec 302; this service only asks it to prewarm), and any individual panel's UI.
 
 ## Data Contracts
 
@@ -47,9 +48,13 @@ Initialization is single-shot and gated by `isInitialized`. It performs the foll
 7. Initializes the Memory Bank folder with the repo's identity (repo name and remote URL), then auto-migrates: if the orphan branch has data and migration has not been completed, runs the migration engine synchronously. Both the folder initialization and the migration run on the calling thread; failures are caught and recorded in the initialization log without aborting initialization.
 8. Auto-installs hooks if credentials are present and the service is not paused and hooks are not yet enabled (eliminates a separate manual "Enable" step). If auto-install runs, a second status refresh follows it to pick up the newly installed state.
 9. **Dispatches a fire-and-forget pending-push drain off the EDT** — retries any commits left in the pending-push queue by a push in a prior session (an offline push, or a push that raced ahead of summary generation). This is dispatched before the service is marked initialized (and before the git-change subscription and watchers below); it never blocks initialization, no-ops when nothing is pending, and is otherwise fully guarded (no Node, non-git dir, signed-out → silent no-op). Owned by spec 271; mirrors the VS Code extension's activation-time retry.
-10. Subscribes to the IDE's git repository change events so working-tree changes fire a status refresh.
-11. Starts the file watcher over the orphan-branch ref and the per-project Jolli state directory (covered by spec 125).
-12. Writes the accumulated initialization log to a per-user diagnostics file for support purposes.
+10. **Dispatches a fire-and-forget read-path warm-up off the EDT.** It performs the same three read operations that opening a memory tab performs — read the memory index, read the set of stored transcript identifiers, and read one memory body (the last only when the index has at least one entry). The point is that a memory tab open puts exactly those reads on the UI thread, and the first few reads after the read path comes up are an order of magnitude slower than warm ones. Failures are swallowed and logged as non-fatal; the only cost of a failure is that the first user action warms the path itself, which is the pre-existing behaviour.
+11. **Requests a prewarm from the embedded-browser pool**, so the first memory tab does not pay the browser-construction cost the pool exists to hide. Also wrapped in a catch that logs a non-fatal warning; a failure costs exactly one thing — the first memory tab pays that construction itself. Owned by spec 302; this service only issues the request.
+12. Subscribes to the IDE's git repository change events so working-tree changes fire a status refresh.
+13. Starts the file watcher over the orphan-branch ref and the per-project Jolli state directory (covered by spec 125).
+14. Writes the accumulated initialization log to a per-user diagnostics file for support purposes.
+
+Steps 9–11 all run before the service is marked initialized, and none of them is waited on.
 
 Initialization completes before returning, and the service is marked initialized regardless of whether the first status check succeeded.
 
@@ -57,7 +62,9 @@ Initialization completes before returning, and the service is marked initialized
 
 The startup activity then, in order and each inside a catch that logs and swallows: **starts the refresh-notification client**, and activates sync (spec 219).
 
-Starting the refresh-notification client **spawns no process and starts no channel**. Its body only records that it was started; the call has no other observable effect. The refresh channel that actually reaches this service is owned by the long-lived bridge connection (spec 288) and comes up lazily on the **first** bridge call whose working directory matches an open project — nothing in the startup path brings it forward. See spec 289 for that channel and for the degenerate client registry this call belongs to.
+Starting the refresh-notification client **spawns no process and starts no channel**. Its body only records that it was started; the call has no other observable effect. The refresh channel that actually reaches this service is owned by the long-lived bridge connection (spec 288) and comes up lazily on the **first** bridge call whose working directory matches an open project. See spec 289 for that channel and for the degenerate client registry this call belongs to.
+
+That first matching bridge call now happens **during initialization itself**, not on the user's first action: the initial status refresh (step 5) and the read-path warm-up (step 10) are both bridge calls against this project's own working directory, so the long-lived connection and its server process come up while initialization is still running. A reader should not expect the connection to be idle until a panel or a command asks for something.
 
 ### Status refresh and `.git` removal detection
 
@@ -106,13 +113,17 @@ The service moves through three observable states for the duration of a project 
 - The full initialization log is persisted to a per-user diagnostics file on every initialization, regardless of success, so support can reproduce the path-resolution decisions the service made.
 - Auto-hook-install at initialization is gated on three conditions all being true: at least one credential (direct API key, environment-variable key, or Jolli API key) is present, the service config is not paused, and the status check found hooks not yet enabled. The auto-install does not run when any condition is false, so a deliberate pause or a clean state is respected.
 - **A status refresh now costs a round-trip, not a local computation.** Status is produced by the command-line surface and read back over the bridge, so every refresh is either one round-trip on the long-lived connection (spec 288) or one cold process start when that connection is unavailable. Because refreshes are driven by two independent debounced watchers (specs 125 and 289) plus the IDE's own repository-change events, an ordinary commit can cost several such round-trips.
-- **Starting the refresh-notification client is a no-op at present.** The startup activity's call to it flips a flag and nothing more; a reader expecting a channel to exist after initialization will not find one. The channel arrives only with the first bridge call (specs 288, 289).
+- **Starting the refresh-notification client is a no-op at present.** The startup activity's call to it flips a flag and nothing more. The channel arrives with the first bridge call (specs 288, 289) — which initialization itself makes, twice (the initial status refresh and the read-path warm-up), so by the time initialization returns the connection is up. What is *not* true is that starting the client is what brought it up.
+- **Two fire-and-forget warm-ups sit at the end of initialization, and both degrade to nothing.** The read-path warm-up and the browser-pool prewarm are dispatched, not awaited, and each swallows its own failure. The only consequence of either failing is that the first user action pays the cost it was meant to hide — exactly the behaviour that existed before they were added. Neither can fail initialization.
+- **The read-path warm-up is a real round-trip, not a local cache touch.** It performs the same three reads a memory tab open performs, which is why it also has the side effect of bringing the long-lived bridge connection and its server process up during initialization.
 - Disposing the service does not clear the cached status; readers who hold a stale reference after disposal still see the last-known status, but no new refreshes will occur.
 - The panel registry is set externally by the tool window factory after panels are constructed; the service does not depend on the registry being populated for its own behavior, only contextual actions do.
 
 ## Shared Behavior
 
 - The fire-and-forget pending-push drain dispatched during initialization (step 9) is owned by **IntelliJ Pre-Push Sync Catch-Up** (271); this service only dispatches it off the EDT and never waits on it.
+- The prewarm requested during initialization (step 11) is owned by the **IntelliJ Embedded-Browser Pool** (302), which decides what a prewarm actually builds, how many instances it keeps, and what a failure costs; this service only issues the request and swallows its failure.
+- The three read operations the warm-up performs (step 10) belong to the memory-read path shared with the memory tab; this service only calls them once, early, for their cache-warming side effect.
 - Worktree resolution is handled by the git wrapper and the hook installer (covered by their own specs); this service only stores the resolved root for downstream readers.
 - The file watcher over the orphan-branch ref and the per-project Jolli state directory, and its debounced refresh, are described in spec 125; this service owns the watcher's lifecycle (start during `initialize`, stop the debounce timer during `dispose`) but not its mechanism.
 - The second, command-line-side path into the same status refresh — refresh notifications pushed over the bridge and debounced again on the client — is owned by spec 289; the connection that carries them is spec 288.

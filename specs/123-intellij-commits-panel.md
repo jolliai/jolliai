@@ -7,8 +7,8 @@ The COMMITS section of the JolliMemory tool window — a row-per-commit list tha
 ## Scope
 
 **In scope:**
-- The commit range the panel walks: from the branch's own-commits base (the merge-base of `HEAD` and the project's main branch, then narrowed to the branch creation point) forward to `HEAD` (this is the unmerged-history, own-commits-only view).
-- Per-row anatomy of the collapsed state: arrow, optional checkbox, title line (message + pushed badge + type badge), sub-line (relative date · short hash · token spend), chips row (PR chip, SYNCED/LOCAL chip, optional E2E chip), and "Show memory details" link.
+- The commit range the panel walks: from the branch's own-commits base (the merge-base of `HEAD` and the project's main branch, then narrowed to the branch creation point) forward to `HEAD` (this is the unmerged-history, own-commits-only view) — and the single alternate range used when the branch tip is already fully contained in the mainline.
+- Per-row anatomy of the collapsed state: arrow, optional checkbox, title line (optional memory reference chip + message + pushed badge + type badge), sub-line (relative date · short hash · token spend), chips row (PR chip, SYNCED/LOCAL chip, optional E2E chip), and "Show memory details" link.
 - The expand-to-show-groups behavior: arrow flips, body expands, detail loads on first expand; the SHIPPED / CONVERSATIONS / CONTEXT / FILES four-group structure always renders with headers and empty-state rows.
 - The lazy-load deduplication rule: concurrent expands of the same commit share a single in-flight bundle.
 - The merged-mode behavior: when the branch's tip is reachable from `main`, the panel becomes a read-only history view (no checkboxes).
@@ -36,6 +36,7 @@ The COMMITS section of the JolliMemory tool window — a row-per-commit list tha
 **Out of scope:**
 - The ai-commit flow that consumes the selection (squash-multiple-commits) — separate spec.
 - The contents of the embedded HTML summary view that opens when a row is clicked — separate spec.
+- The memory reference identifier's format, its "only when pushed" presence rule on a list row, its hover hint, its clipboard payload, its confirmation balloon, and its exclusion from the row's open-on-click behaviour — owned by spec 301. Only the chip's slot in this row's geometry is in scope here.
 - The Memories panel's flat memory list (this panel groups by commit; the Memories panel is a flat global view).
 - The git plumbing that determines "is this branch fully merged into main" — abstracted as a project-service call.
 - The cloud push that flips the sync state — owned by the cloud-API spec.
@@ -46,27 +47,22 @@ The COMMITS section of the JolliMemory tool window — a row-per-commit list tha
 
 ### Commit range
 
-The panel renders the commits that the branch has on top of `main` — that is, walking back from `HEAD` to the branch's own-commits base. The main-branch ref is resolved in priority order: `origin/main`, `upstream/main`, `main`. The range is inclusive of the branch tip, exclusive of the base. A branch that has not diverged from `main` (zero commits ahead) renders the empty-state message.
+The panel renders the commits that the branch has on top of `main` — that is, walking back from `HEAD` to the branch's own-commits base. The main-branch ref is resolved in priority order: `origin/main`, `upstream/main`, `main`. The range is inclusive of the branch tip, exclusive of the base. A branch that has not diverged from `main` (zero commits ahead) does **not** simply render the empty-state message — it falls into the merged-mode history view described below, and only clears when that mode's own requirements are unmet.
 
 The base is **not** the plain merge-base with main: after computing the merge-base, the panel narrows it to the branch's own-commits base via the shared own-commits-base / branch-creation-point resolver (see below). This means a branch cut from a feature or release branch — including a brand-new branch that still shares its parent's tip — lists only its **own** commits, not the parent branch's shared history. When the narrowed base equals `HEAD` the branch has no own commits yet and the panel clears. This is what fixes committed memories from carrying over or clearing incorrectly on a freshly cut branch.
 
-When on `main` itself and an `origin/main` ref exists, the range is `origin/main..HEAD` so locally committed but not yet pushed commits are visible.
-
-When the merge-base equals `HEAD` (the branch tip is fully contained in the mainline), the panel takes one of two paths depending on whether the resolved mainline ref is an origin ref — this replaces an earlier, simpler description ("when the merge-base equals `HEAD` and no remote exists, the panel shows empty") that no longer matches the code:
-
-- **Mainline ref is an origin ref** (e.g. `origin/main`): unchanged — the range is `<origin-ref>..HEAD` as above.
-- **Mainline ref is not an origin ref** (it resolved to an upstream ref or the local `main`, i.e. no remote is configured): the panel enters a **merged-mode history view** instead of clearing. It resolves the branch's own creation point from the reflog and lists `<creation-point>..HEAD`, filtered to commits authored by the current git user. This is what lets a no-remote repo keep showing committed memories on `main` (or on a branch that has been fully merged) rather than an empty panel.
+When the merge-base equals `HEAD` (the branch tip is fully contained in the mainline — the user is on `main` itself, or on a branch that has been fully merged), there is exactly **one** path, regardless of whether the resolved mainline ref is a remote-tracking ref: the panel enters a **merged-mode history view** instead of clearing. It resolves the branch's own creation point from the reflog and lists `<creation-point>..HEAD`, filtered to commits authored by the current git user. This is what lets `main` (or a fully-merged branch) keep showing committed memories rather than an empty panel — whether or not a remote is configured, and whether or not the local tip is already pushed.
 
 Merged mode requires two additional signals, both derived from the branch's reflog:
 
 - **An "own-commit" signal**: at least one reflog entry must record an actual commit operation (as opposed to a branch-creation, checkout, rebase, reset, or pull entry). A branch/`main` whose reflog shows only creation/rebase/reset activity — never a commit of its own — has authored nothing, so the panel returns the empty state rather than crediting it with the mainline's history.
 - **An author filter**: the current git user's configured name. If it is unset, the panel returns empty rather than showing an unfiltered (unscoped) history, because merged mode is author-scoped by design.
 
+The author filter is applied as a **literal substring** match, not as a pattern match, so a configured name containing pattern metacharacters (`J. Doe (Acme)`) matches the intended commits instead of erroring or matching the wrong ones. The switch into literal matching is **global to that one listing invocation** — it retunes every pattern-taking operand in the same call, not just the author one. Today the author filter is the only such operand, so the switch is safe; adding a second pattern-taking operand (a message filter, a committer filter) alongside it would silently make that one literal too.
+
 The reflog-derived creation point used as the range base: scan the reflog oldest→newest for an explicit "branch created from X" entry; if none is found, fall back to the oldest surviving reflog entry. Returns nothing (aborting merged mode entirely) for a detached HEAD or an empty/unavailable reflog.
 
 Note this merged-mode base resolution is deliberately more permissive than the own-commits-base resolver below: it always falls back to the oldest surviving reflog entry when no explicit creation marker is found, whereas the own-commits-base resolver requires the explicit marker and refuses to guess. This is intentional, not an inconsistency — the fork-point narrowing below must never guess (a wrong guess would silently drop the branch's own first commit from the non-merged listing), while merged mode already gates on the own-commit signal and an author filter, so a slightly-approximate base is an acceptable trade there.
-
-**Notable divergence from the VS Code sidebar (pre-existing, not introduced here):** VS Code's equivalent enters its merged-mode view whenever merge-base equals HEAD, with **no** origin carve-out — it applies the author filter even when a live origin remote exists. This panel's origin carve-out (an unfiltered range when an origin ref is present) is a partial port of that behavior — a genuine platform difference between the two tools, not a regression in this change.
 
 ### Own-commits-base resolver
 
@@ -106,6 +102,8 @@ Each row's input fields:
 | `conversationTurns`| Count of human turns across contributing conversations, from the stored summary.                   |
 | `contextCount`    | Count of linked context items (plans + notes + references).                                          |
 
+The per-commit change statistics (`filesChanged` / `insertions` / `deletions`) come from the **same single listing invocation** that produces the metadata, rather than one additional child process per listed commit. A commit for which the listing emits no statistics line at all — a commit whose diff is empty — keeps zeros for all three. One incidental consequence: a repository's very first commit now reports its real statistics, where the previous per-commit comparison against a non-existent parent always failed and left zeros.
+
 ### Token usage data
 
 The row's usage was previously read as a single legacy scalar token-usage object off the stored memory's root summary; that no longer matches the code. The row's usage is now the memory's canonical conversation-token breakdown (input / output / cached segments) plus an estimated cost, both **tree-aggregated** across the memory's whole consolidation tree rather than read off the root node alone. This fixes a real display bug: a squash/amend/rebase memory carries its tokens on the folded child nodes, not the root, so a shallow root-only read previously showed "N/A" on the list for exactly the memories whose detail view (which already aggregated the tree) showed real numbers.
@@ -135,11 +133,13 @@ Code-only commits (no memory) are ignored by the aggregation. A memory-bearing c
 
 A commit row is a vertical stack:
 
-1. **Top line** (`BorderLayout`): WEST = arrow + optional checkbox; CENTER = title + sub-line stacked vertically; EAST = hover action icons (initially hidden).
+1. **Top line** (`BorderLayout`): WEST = arrow + optional checkbox; CENTER = title (optionally prefixed by the memory reference chip) + sub-line stacked vertically; EAST = hover action icons (initially hidden).
 2. **Chips row** (right-aligned flow): optional PR chip, SYNCED or LOCAL chip, optional E2E chip.
 3. **"Show memory details" link** (right-aligned, hidden while expanded).
 
 The title label shows `<message>[<pushed-badge>][<type-badge>]` where the pushed badge is a space + cloud emoji and the type badge is ` [<type>]`. The sub-line shows `<relative-age> · <shortHash> · <N tokens>` (or `N/A tokens` when no breakdown is recorded), followed by `· <≈$cost>` when the row carries an estimated cost.
+
+A memory row that has been pushed to a Space additionally carries a clickable **memory reference chip** ahead of the title. The identifier's format, the strict "only when pushed" rule that governs whether the chip appears at all, its hover hint, its clipboard payload, its confirmation balloon, and its exclusion from the row's open-on-click behaviour are all owned by spec 301 and are not restated here. What this panel owns is the chip's place in the row's geometry: the chip occupies a **leading slot pinned to the top** of the title area, with the wrapping title beside it, so a commit message that wraps onto further lines hang-indents under the first character of its own first line rather than running back underneath the chip. The row's height computation subtracts the chip's width from the width it hands the wrapping title; without that subtraction the title's last line clips.
 
 ### Chips
 
@@ -218,7 +218,7 @@ Cleared automatically whenever the commit sequence changes (different hashes tha
 | ---------------------------------------- | -------------------------------------------------------------------------- |
 | Status not yet loaded                    | "Initializing Jolli Memory..."                                             |
 | Status loaded but the repository is not enabled | "Jolli Memory is not enabled for this repository." then, on a second line, "Open the Status panel to install hooks and enable it." |
-| Branch has no commits ahead of main      | "Start coding — your commit memories will appear here. Every commit on this branch will be automatically summarized." |
+| The listing returned no commits (no own commits and no usable merged-mode history) | "Start coding — your commit memories will appear here. Every commit on this branch will be automatically summarized." |
 
 The not-yet-loaded and not-enabled cases are now **two distinct states**, where they previously shared the initializing message. The split is deliberate: showing "Initializing…" for a repository that will never initialize because nothing is installed misled users into waiting for a background task that was not running. The disabled copy instead names the situation and points at the Status panel, where hooks can be installed.
 
@@ -228,10 +228,11 @@ The not-yet-loaded and not-enabled cases are now **two distinct states**, where 
 
 On panel construction:
 
-1. The panel registers a project-status listener.
-2. It subscribes to the project-level git-repository-change channel with a 500 ms debounced refresh handler.
-3. It subscribes to the VCS configuration change channel with the same 500 ms debounced handler (catches terminal branch operations).
-4. It schedules a background "list branch commits" query and renders the initializing placeholder until the result arrives.
+1. The initializing placeholder is painted **synchronously**, on the UI thread, as part of construction — so the panel's very first frame is never blank while a background listing runs.
+2. The panel registers a project-status listener.
+3. It subscribes to the project-level git-repository-change channel with a 500 ms debounced refresh handler.
+4. It subscribes to the VCS configuration change channel with the same 500 ms debounced handler (catches terminal branch operations).
+5. It launches an initial background "list branch commits" query **only when no status snapshot exists yet**. Registering the status listener already fires an immediate callback whenever a snapshot is cached (see the project-service spec), and that callback schedules a refresh of its own — so launching one unconditionally meant two refreshes racing, with one full listing round-trip computed and then discarded.
 
 ### Row creation rules
 
@@ -323,7 +324,9 @@ The section's "toggle select all" toolbar action:
 
 ### PR lookup
 
-After fetching the branch commits, the panel performs one `gh pr list --state all --head <branch>` call (off-EDT) to resolve the branch-level PR. The result is stored as `prLookup` and shared by all row renders for that refresh cycle.
+The panel performs one `gh pr list --state all --head <branch>` call (off-EDT) per refresh to resolve the branch-level PR. The result is stored as `prLookup` and shared by all row renders.
+
+**The lookup does not gate the first paint.** After the commit listing returns, the panel renders the list immediately using the **previous** refresh's PR value — which is nothing at all on the first refresh, so the first paint of a fresh panel carries no PR chip and no PR entry in the SHIPPED group. The lookup then runs in the background (it is a network round-trip, typically seconds) and the list is re-painted with the result when it lands. A result whose refresh generation has already been superseded by a newer refresh is discarded rather than applied, so a slow lookup cannot flip the PR chip back to a stale value.
 
 The call is skipped when:
 - The branch is not published (no `@{upstream}` and no `refs/remotes/origin/<branch>`).
@@ -343,11 +346,13 @@ Three refresh sources, all running through the same `refresh()` entry point:
 | Project-level git-repo change   | A commit landed, branch was switched, index was updated, rebase, amend.  | 500 ms   |
 | VCS configuration change        | Catches branch operations performed in a terminal outside the IDE.       | 500 ms   |
 
-The panel uses a monotonic version counter to discard stale background results: if a newer refresh started before the old one's query returned, the old result is dropped.
+The panel uses a monotonic version counter to discard stale background results: if a newer refresh started before the old one's query returned, the old result is dropped. A failure of the listing on this versioned path is recorded in the log rather than silently swallowed; the panel still falls back to an empty list. (The bypass-version force path below still swallows its failures.)
 
 A second `forceRefresh()` entry point exists that bypasses the version-discard mechanism; it is used by the action bar when it needs a guaranteed update.
 
-When the new commit list differs from the previous one (any change in the hash sequence), the selection set and the detail cache are cleared, and the visible page (below) resets to the base page size. The expand/collapse states are reset because the row list is rebuilt from scratch.
+When the new commit list differs from the previous one (any change in the hash sequence), the selection set and the detail cache are cleared, and the visible page (below) resets to the base page size.
+
+**Expand/collapse state survives a rebuild.** Every rebuild of the row list first snapshots which commits were expanded and re-applies that state to the freshly built rows. This matters because a rebuild is no longer only a user-visible content change: the asynchronous PR-lookup re-paint arrives seconds after the first paint, and without the snapshot it would silently collapse rows the user had opened in the meantime. A restored row renders straight from its already-resolved detail bundle when one is cached, so no `"Loading..."` placeholder flashes; when the bundle is not cached (or a previous load failed), the row falls back to the normal asynchronous load and does briefly show the placeholder. Rows whose commit is no longer listed are simply dropped.
 
 ### Pagination
 
@@ -366,6 +371,15 @@ Clicking the row body (when `hasSummary` is true):
    - If found, wrap in the summary virtual-file class and open it via the IDE's editor manager (reuses an existing tab when one is open for the same hash).
    - If not found, show an informational dialog: `"No summary found for <short-hash>"`.
 
+### Row hover treatment
+
+Entering a row tints it and reveals its hover action icons; leaving it clears both. Two invariants govern this:
+
+- **At most one row is tinted at any time.** The panel tracks which row currently carries the tint, and the *first* thing a new row's hover-enter does is clear the previously tracked row. A lost exit event on the previous row — which really happens: an action icon that has just been hidden can still dispatch its own exit, and asking that hidden component where it is on screen fails — therefore cannot leave two rows tinted at once. An exit event whose source is no longer on screen clears the tint unconditionally instead of trying to test whether the cursor is still inside the row. Rebuilding the row list also drops the tracked row, so a subsequent hover cannot try to clear a row belonging to a discarded render.
+- **The row paints its own tint, after its ancestor has drawn, and is not marked opaque.** The tint is translucent. Letting the row's own background fill do the work meant the fill happened without the ancestor being redrawn first, so every region *not* covered by a child widget — the chips row's right padding, the "Show memory details" gutter, the row's own vertical padding — accumulated the previous frame plus the tint. The visible symptom was a row that appeared tinted on one side and flat on the other.
+
+The memory reference chip participates in the row's hover treatment like any other child, so hovering it tints the row and reveals the row's hover actions exactly as hovering the title does.
+
 ### Hover popup
 
 After the cursor has been inside a row for 1 s, a native popup window appears below the row. The popup has a 200 ms grace period on exit: moving from the row to the popup does not dismiss it. Moving fully outside both regions starts the grace timer.
@@ -380,17 +394,21 @@ When another panel (e.g. Memory Bank explorer) calls `setForeignMode(repo, branc
 
 ```
 [panel construction]
+  paint "Initializing Jolli Memory..." synchronously (first frame is never blank)
   subscribe to status listener
+    [status snapshot already cached] → listener fires immediately → schedules refresh
   subscribe to git-repo change channel (debounced 500 ms)
   subscribe to VCS config change channel (debounced 500 ms)
-  spawn initial background refresh
+  [no status snapshot yet] → spawn initial background refresh
+  [snapshot exists]        → no extra refresh (the listener's already covers it)
 
 [refresh]
   if foreignMode → re-filter KB cache, re-render foreign list
   version++
-  background: list branch commits, check is-merged, lookup branch PR
+  background: list branch commits, check is-merged
   on response:
     if version mismatch → discard
+    if listing threw → log the failure; fall back to an empty list
     if status == null → "Initializing Jolli Memory..."
     else if !status.enabled → "not enabled for this repository" placeholder
     else if commits.empty → empty-branch placeholder
@@ -400,9 +418,14 @@ When another panel (e.g. Memory Bank explorer) calls `setForeignMode(repo, branc
         clear detail cache
         reset visible page to base page size
       isMerged ← projectService.isBranchMerged()
-      prLookup ← lookupBranchPr() [skipped if branch unpublished or gh unavailable]
       render token meter (always, above list)
-      rebuild commit rows; reset row states (collapsed, details-not-loaded)
+      snapshot expanded hashes; rebuild commit rows using the PREVIOUS prLookup
+      restore expanded rows (from cached detail bundle if present, else async load)
+
+  then, in the background (does not gate the paint above):
+    prLookup ← lookupBranchPr() [skipped if branch unpublished or gh unavailable]
+      if version mismatch → discard the result
+      else → store it and re-paint the list (expanded rows restored again)
 
 [user clicks arrow or "Show/Hide memory details"]
   toggle expand/collapse
@@ -449,6 +472,17 @@ When another panel (e.g. Memory Bank explorer) calls `setForeignMode(repo, branc
 
 [hash sequence changes (rebase, amend, branch switch, new commit)]
   clear selection; clear detail cache; reset visible page to base page size; rebuild rows
+  (expanded rows that still exist in the new list stay expanded; their detail reloads)
+
+[cursor enters a row]
+  clear the previously tinted row's tint (even if its own exit was lost)
+  tint this row; reveal its hover action icons; record it as the tinted row
+  start the 1 s hover-popup timer
+
+[cursor exits a row]
+  [source or row no longer on screen] → clear tint unconditionally
+  [otherwise] → clear tint only when the cursor is outside the row's bounds
+  start the 200 ms hover-popup dismiss grace
 
 [setForeignMode(repo, branch)]
   switch to read-only KB view
@@ -462,16 +496,20 @@ When another panel (e.g. Memory Bank explorer) calls `setForeignMode(repo, branc
 
 ## Notable Behavior
 
-- **The range is `merge-base ↔ HEAD`, not "all branch commits".** Commits reachable from `main` are not shown; the panel is the unmerged-history view.
+- **The range is `merge-base ↔ HEAD` while the branch has own commits, and something else entirely once it does not.** On a diverged branch the panel is the unmerged-history view and commits reachable from `main` are not shown. The moment the branch tip is fully contained in the mainline — on `main` itself, or after the branch is merged — that framing stops applying: the panel switches to the author-scoped merged-mode view and deliberately *does* show commits reachable from the mainline.
 - **Token meter is always shown when there are commits.** Even when every commit has no recorded breakdown, the meter renders `"N/A tokens"` without a bar, so the panel's structure is consistent. The meter is absent only when the list is empty (placeholder replaces the content area).
 - **Per-commit token spend and cost appear on the sub-line of every row.** Neither is gated on `hasSummary`; a code-only commit's sub-line still shows `"N/A tokens"` so the layout is uniform. Cost is never shown for a row/branch with no priced estimate — the UI omits it rather than showing a misleading `"≈$0.00"`.
 - **Cost is decided once, then only summed.** The "prefer stored per-model estimate, else a rough estimate at fixed list rates" decision happens once per commit at the point row data is assembled. The per-row sub-line and the branch-total aggregator downstream never re-derive that decision — the branch total is a pure sum of each contributing commit's already-decided figure.
 - **Token-bar segment colors are fixed and consistent with the embedded summary viewer:** input = green, output = grey, cache = blue, in both this meter and the per-commit detail view's own token/cost banner (embedded-HTML-viewer spec).
 - **The `partial` flag is a lower-bound signal, not an error.** It is set when a source (e.g. Cursor) does not report usage, or when old memories predate usage capture. The "· partial" label and the info popover communicate this explicitly.
-- **No-remote merged mode is a genuine alternate path, not an empty fallback.** When the resolved mainline ref is not an origin ref and the merge-base equals HEAD, the panel resolves the branch's own reflog creation point and lists the current user's own commits from there — rather than clearing — so a no-remote repo (or `main` itself) still shows committed memories. It requires both a reflog "own-commit" signal and a resolvable git user name; missing either clears the panel rather than over-listing. (Notable; fixes a previously-empty no-remote case.)
-- **The IntelliJ origin carve-out is a pre-existing, partial divergence from VS Code, not a new one.** VS Code's equivalent merged-mode view applies its author filter unconditionally (no origin carve-out); this panel skips merged mode (and the author filter) whenever the mainline ref is a live origin ref. This is a genuine platform difference that predates this pass — record it as notable, not as a regression.
+- **Merged mode is the only path when the branch tip is fully contained in the mainline, and that closed a whole-panel blindness.** The panel previously short-circuited that case to "the commits not yet on the remote" whenever the resolved mainline ref was remote-tracking. That range is empty by definition on a fully-synced mainline or release branch, so on `main` — or on any branch already pushed in full — the panel **hid every already-pushed memory** and looked as if nothing had ever been summarized. There is now no carve-out: the panel always resolves the branch's own reflog creation point and lists the current user's own commits from there. It still requires both a reflog "own-commit" signal and a resolvable git user name; missing either clears the panel rather than over-listing. (Notable; fixes a panel that was empty for the most common branch.)
+- **The author scoping is a literal substring match, and the switch that makes it literal is global to the invocation.** A configured user name containing pattern metacharacters resolves correctly instead of erroring or matching the wrong commits. The cost is that the same switch retunes every pattern-taking operand in that one listing call; the author filter happens to be the only one today, so a future message- or committer-filter added beside it would silently become literal too. (Notable; latent footgun.)
+- **Per-commit change statistics ride along with the listing.** Files/insertions/deletions come from the same single invocation that produces each row's metadata, instead of one extra child process per listed commit — so a long branch no longer pays a process fork per row. A commit with an empty diff, for which no statistics line is emitted, keeps zeros; a repository's first commit, which the old per-commit comparison could never stat, now reports real numbers. (Notable.)
 - **Commit-list pagination is render-time only and independent of the git-log query.** The underlying commit-range query always resolves and returns the full listed range; only the number of rows the panel *renders* is paged, starting at a fixed page size and growing by that same increment on each "Show N more" click. The page size resets to the base page size only when the ordered commit-hash sequence differs from the previous refresh — a content-identical background refresh (e.g., a summary landing on an already-listed commit, or a periodic status tick) leaves the user's current page untouched so the list doesn't visually snap shut mid-read.
 - **Branch PR lookup runs once per refresh.** A single `gh` call resolves the open PR and the closed-PR history strip for the branch; the result is reused by all row chips and the SHIPPED group. This avoids one `gh` spawn per memory row.
+- **The PR lookup no longer gates the first paint, so the PR chip arrives late.** The list is painted with the previous refresh's PR value and re-painted when the network lookup returns. On the very first refresh of a fresh panel that previous value is nothing, so the PR chip and the SHIPPED group's PR entry are genuinely absent for the first second or two and then appear — the trade made to stop a seconds-long network call from holding the whole list back. A superseded lookup result is thrown away rather than applied, so the chip never flickers back to a stale value. (Surprising; intentional.)
+- **A rebuild preserves expansion, and the async PR re-paint is why it has to.** Expanded rows are snapshotted and re-applied on every rebuild; a restored row renders from its cached detail bundle with no loading flash when one exists, and falls back to the asynchronous load (with the placeholder) when it does not. Without this, the PR re-paint arriving seconds after the first paint would collapse whatever the user had just opened. (Notable.)
+- **Exactly one row can be tinted, enforced on enter rather than on exit.** Clearing the previously tinted row is the first thing a hover-enter does, because exit events are genuinely lossy here — a just-hidden action icon can dispatch an exit that cannot be located on screen. The row also paints its own translucent tint after its ancestor has drawn instead of relying on an opaque background fill, which is what fixed a row appearing tinted on one side and flat on the other. (Notable; both are bug fixes.)
 - **PR lookup is gated on branch being published, not on commits being pushed.** A branch that was pushed then locally amended retains its PR chip because the PR lives on the remote; gating on pushed commits would wrongly hide the chip after a squash.
 - **The `PrLookup` result is a sealed type.** `Found` / `NoPr` / `LookupError` replace the previous single nullable PR result; `NoPr` and `Found` both carry a `history` list of closed/merged PRs for the branch.
 - **Merged mode is read-only.** When the branch has been fully merged into main, checkboxes vanish. Expand, click-to-open-summary, and hover popup still work.
@@ -517,3 +555,4 @@ When another panel (e.g. Memory Bank explorer) calls `setForeignMode(repo, branc
 - **Own-commits-base / branch-creation-point resolver** — used to narrow the listed commit range to the branch's own commits; the same resolver aligns the Create-PR view's diff stats (Create-PR-view spec).
 - **Branch-level Create-PR view** — the destination of the action bar's Create-PR button, opened via this panel's open-Create-PR-view action (Create-PR-view spec).
 - **Post-commit summarization pipeline** — the write-time source of the token breakdown, per-model usage, and estimated cost every row and the branch meter here read and tree-aggregate (post-commit-pipeline spec).
+- **Memory reference identifier and copy chip** (spec 301) — owns the identifier's format, the strict presence rule that decides whether a row shows a chip at all, and everything the chip does when clicked. This panel owns only where the chip sits in the row and how the wrapping title measures around it.

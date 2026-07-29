@@ -13,7 +13,8 @@ A hidden command that exposes five one-shot generation flows — commit message,
 - Request validation: the empty-body allowance, the object-shape requirement, per-field type requirements, and the hex-only restriction on the squash action's hash list.
 - The squash action's two distinct non-LLM fallbacks: the short-circuit when no credential source resolves, and the same fallback again when a generation call fails.
 - The error envelope, the stream it is written to, and the exit-code contract.
-- Which actions have a live caller and which are reachable only by direct invocation.
+- Which host actions spawn which of the five actions.
+- The caller half of the transport contract: how the single response line is located in the child's captured output, the wall-clock budget, cancellation, the handling of the captured-output file, and the one classified error the caller rewrites.
 
 **Out of scope (boundaries):**
 
@@ -21,7 +22,7 @@ A hidden command that exposes five one-shot generation flows — commit message,
 - Credential resolution and provider routing (hosted provider, product proxy, local agent). The command only asks "does any credential source resolve?" for one fallback decision; the routing itself is owned by the credential-priority and provider-selection specs.
 - The mechanical string merge used as the squash fallback — a pure text transform owned by its own topic; this spec states only when it is used.
 - The stored-summary read the squash action performs to gather per-commit topics — owned by the summary-storage and read-resolution specs.
-- The IDE-side wiring on the calling host (which of its actions spawn this command, how it renders the result) — owned by the IDE-plugin specs.
+- How the calling host renders, persists, or re-displays a result, and the user-visible surfaces its actions live on — owned by the IDE-plugin specs. Only the transport contract on the caller's side is recorded here, because it is what makes this command's single-line-response design work.
 - The sibling hidden bridge that runs the Memory Bank migration. It shares this command's response and error envelope shapes but is a separate topic.
 
 ## Data Contracts
@@ -116,7 +117,15 @@ Each parses its request object, validates the required fields (see above), runs 
 
 ### Caller reachability
 
-Only **two** of the five actions have a live caller: the JVM IDE plugin spawns this command for `squash-message` and for `commit-message`. The `e2e-test`, `recap`, and `translate` actions are fully implemented and reachable by direct invocation, but no shipped surface spawns them — the JVM host still performs those three generations in-process through its own port of the generation code. Documentation that describes this bridge as covering all five flows overstates what is actually wired.
+**All five** actions have a live caller, and they all have the same one: the JVM IDE plugin spawns every one of them.
+
+- `commit-message` — its AI-commit action.
+- `squash-message` — its squash action.
+- `e2e-test`, `recap`, `translate` — three actions on its memory viewer: generate an end-to-end test guide, regenerate the quick recap, and translate a document to English.
+
+`e2e-test` has a **second** entry point on the same host: the memory viewer's create-pull-request-with-a-test-guide flow runs the identical generation, persists the result, and then opens the PR form — so one action name serves two user-visible flows.
+
+That host performs no generation in-process. The three viewer actions used to; the in-process code they called was deleted and they now spawn this command, which is what closed the gap between "five actions implemented" and "five actions wired".
 
 ## State Transitions
 
@@ -136,7 +145,12 @@ The command holds no state and performs no writes. Per invocation:
 - **Commit hashes are validated as hex before use.** Anything else is refused at the request boundary because the values flow into repository command arguments. (Safety.)
 - **A non-object request body fails loudly instead of defaulting to an empty object.** A silent `{}` would surface a caller's serialization bug as a confusing missing-field error much later in the flow. (Notable; intentional.)
 - **`topics` rows are trusted element-wise but validated container-wise.** The caller is the product's own plugin, so per-element structural validation would be duplicated work; a non-array `topics` field is still a loud failure. (Notable; a deliberate asymmetry.)
-- **Three of the five actions have no live caller.** They are part of the command's contract and behave as specified, but the only shipped consumer wires `commit-message` and `squash-message`. (Notable; grounded, and contradicts the calling host's own description of the bridge.)
+- **The caller reads the LAST NON-BLANK line, not the first line and not the whole stream.** The success and error envelopes are each one line, but the child's output stream is not guaranteed to be the *only* thing on that stream — a runtime warning (an experimental-feature notice, for instance) can precede the envelope. Taking the last non-blank line makes such noise harmless. An output with no non-blank line at all, and an output whose last non-blank line does not parse as JSON, each surface as a distinct caller-side failure carrying the child's exit code (the unparseable case truncates the offending text). A non-zero exit with no error envelope is reported as a generic failure — the envelope is preferred over the exit code whenever both are present. (Notable; this is what makes the single-line contract robust in practice.)
+- **The caller's wall-clock budget is five minutes, and it is sized for the local-agent provider.** A hosted-provider or proxy call finishes far sooner and never approaches it; a local-agent call drives a full agent turn and can legitimately take minutes. On expiry the child is force-killed and a timeout failure is raised. (Notable; the budget belongs to the caller, not to this command — the command imposes none of its own.)
+- **Cancellation is polled, not signalled, and it force-kills the child.** While waiting, the caller checks its progress indicator roughly twice a second and destroys the child forcibly the moment the user cancels, surfacing the platform's standard cancellation signal rather than an error. Without this, a cancelled local-agent invocation would keep running behind a dismissed progress bar, burning CPU and provider budget on a result nobody will read. Only the two call sites that run under a progress indicator — the commit-message and squash-message actions — are cancellable this way; the three memory-viewer actions pass no indicator and therefore run to completion or to the timeout. (Notable; a real asymmetry between the five callers.)
+- **The response is captured to a file, not read from a pipe, and the file is owner-only.** A large response — a translated document, a full test guide — could fill an output pipe and deadlock the caller against its own wait, so the child's output stream is redirected to a temporary file instead. That file can hold private memory or transcript content, so it is created readable and writable by its owner alone on POSIX systems (falling back to the platform default where per-file permissions are unsupported, because the temporary directory is already per-user there) and is deleted as soon as the response has been read, on both the success and the failure path. (Safety; the pipe-deadlock avoidance is the reason the file exists at all, the permission mode is why it is safe.)
+- **One classified error is rewritten into guidance, at a single point.** The caller keys off the envelope's `errorName` and turns the expired-local-agent-sign-in classification into actionable prose — sign in to the agent tool from a terminal, or switch the provider in settings — because the raw message from that failure does not tell a user what to do. Every other error name passes its message through verbatim. The rewrite happens at the one place the response is parsed, so all five actions inherit it identically; this is the concrete payoff of `errorName` being a machine-readable class name rather than prose to pattern-match. (Notable.)
+- **The spawn forwards no correlation identifier — a real gap.** The calling host's general-purpose bridge spawn hands its ambient correlation id to the child through the child's environment, precisely so both sides' logs of one operation share an id. The generation spawn does not set it, and this command adopts an id from that channel or mints a fresh one — so every model-backed action from that host gets a fresh, runtime-only id, and nothing links the host's log lines to the child's. It is worse than a missing hand-off: the host no longer opens a correlation scope around a model-backed action at all, because that scope lived in the in-process model code that was deleted — so at the moment of the spawn there is no id to forward even if the spawn were changed. Diagnosing a failed generation therefore means correlating by wall-clock time across two processes' logs. (Notable; grounded gap, not a design choice.)
 - **The command is read-only.** It never writes stored memories, never touches the repository's working tree, and never creates a commit. (Notable; the bridge is generation only.)
 - **Hidden from help by design.** It is IDE plumbing, not a workflow a user is expected to discover or drive by hand. (Notable.)
 
@@ -149,3 +163,4 @@ The command holds no state and performs no writes. Per invocation:
 - The **`--cwd` option and the per-project log directory setup** are shared with the other project-scoped commands.
 - The **response and error envelope shapes** are shared with the sibling hidden Memory Bank migration bridge, deliberately, so the out-of-process caller can reuse one JSON-response parser across both.
 - The **out-of-process bridge pattern** — a hidden command whose only consumer is a JVM host that cannot import the in-process code — is the same pattern the back-fill command's machine-readable modes follow.
+- The **JVM host's deleted in-process model stack** — the seam, credential selector, vendor client and generators the three memory-viewer actions used before they were pointed at this command, and the build gate that now keeps them from returning — is recorded by the IDE-plugin native-model-seam spec (217, retired). The commit-message and squash-message actions never used it.

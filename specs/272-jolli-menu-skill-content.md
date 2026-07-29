@@ -18,14 +18,17 @@ The instruction document of the umbrella menu skill describes a single front doo
 
 ### Frontmatter values
 
-The frontmatter is spec-compliant only — `name`, `description`, and a nested `metadata` block (version string and vendor string). It carries no host-private fields.
+The frontmatter is spec-compliant only — `name`, `description`, and a nested `metadata` block (version string, content-revision integer, and vendor string). It carries no host-private fields.
 
 | Field | Value |
 |---|---|
 | `name` | `jolli` |
 | `description` | `The Jolli action menu — a single front door that lists the Jolli skills (recall, search, run a workflow local or remote, workflow history) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.` |
 | `metadata.version` | set to the bundled version at write time (spec 48) |
+| `metadata.revision` | `6` |
 | `metadata.vendor` | `jolli.ai` |
+
+This document's revision is the lower half of a build-asserted ordering invariant: the plugin-bootstrap companion menu (spec 303) claims the same skill name and the same vendor marker, so arbitration between the two is purely by revision, and the companion's revision must stay **strictly greater** than this one's. See spec 48.
 
 ### Body structure
 
@@ -35,7 +38,7 @@ The body immediately follows the frontmatter closing delimiter and contains:
 2. **Step 1: build the unified menu** — assemble one combined list of actions from the two sources below.
 3. **Step 2: route the request** — the request/no-request routing contract.
 
-The body's exact wording is part of the on-disk contract. Editing body text without bumping the package version will not trigger a rewrite of already-installed documents (see spec 48).
+The body's exact wording is part of the on-disk contract. The **sole** rewrite trigger is the `metadata.revision` integer, not the bundled release version: editing the body without raising that integer ships nothing to any existing install, and the repository guards against that omission at build time (see spec 48).
 
 ### Menu source 1 — local Jolli skills and the run-a-workflow action (always present)
 
@@ -52,9 +55,15 @@ The following actions are always listed, each with a one-line description and an
 
 ### Menu source 2 — Jolli MCP tools (whatever is registered this session)
 
-The skill instructs the host LLM to surface every tool whose name begins with `mcp__jollimemory__` that is available in the current session — for example the read tools, the PR-description and queue-status tools, and any manifest-driven platform tools (space, article, and the like) — and to route such a choice by calling the matching `mcp__jollimemory__*` tool.
+The skill instructs the host LLM to surface **every registered memory-server tool** available in the current session — for example the read tools, the PR-description and queue-status tools, and any manifest-driven platform tools (space, article, and the like) — and to route such a choice by calling the matching tool.
 
-Three constraints are stated explicitly:
+**How to find them is explicitly host-dependent**, and the document says so rather than assuming one spelling:
+
+- On Claude Code the tools carry a **prefix**, so matching names that start with `mcp__jollimemory__` is correct there.
+- On Codex the same tools are **bare names inside** the `mcp__jollimemory` namespace, so a prefix match finds **nothing** — the instruction is to look for the *namespace* instead.
+- That host also loads MCP tools **lazily**, so the document tells the LLM to search its available tools before concluding that none are registered.
+
+Three further constraints are stated explicitly:
 
 - **Do not assume a fixed list.** The LLM must enumerate the Jolli MCP tools that are actually registered right now, not a hard-coded set.
 - **Do not fetch or re-derive any backend "menu" curation.** A static skill document cannot read the manifest, so the LLM simply surfaces the Jolli MCP tools present in the session. If no Jolli MCP tools are registered, it presents just the local skills.
@@ -75,15 +84,16 @@ The following describes what the skill instructs the host LLM to do at runtime, 
 
 ### Step 1: Build the unified menu
 
-Assemble one combined list of actions from the two sources. The local skills (jolli-recall, jolli-search), the run-a-workflow action, and the workflow-history action are always included. Then enumerate the currently-registered `mcp__jollimemory__*` tools and add each as a menu action, **excluding** `list_workflow_definitions` (plumbing) and the `run_remote_workflow` / `cancel_remote_workflow` tools (already covered by the run-a-workflow action, whose remote path routes through the `jolli-remote-run` recipe that drives `run_remote_workflow`); if none survive, the menu is just the local actions. Do not hard-code the MCP tool list and do not attempt to fetch backend curation.
+Assemble one combined list of actions from the two sources. The local skills (jolli-recall, jolli-search), the run-a-workflow action, and the workflow-history action are always included. Then enumerate the currently-registered memory-server tools — by prefix on a prefixing host, by namespace on a host that exposes them bare, and only after actually searching the available tools, since one host loads them lazily — and add each as a menu action, **excluding** `list_workflow_definitions` (plumbing) and the `run_remote_workflow` / `cancel_remote_workflow` tools (already covered by the run-a-workflow action, whose remote path routes through the `jolli-remote-run` recipe that drives `run_remote_workflow`); if none survive, the menu is just the local actions. Do not hard-code the MCP tool list and do not attempt to fetch backend curation.
 
 ### Step 2: Route the request
 
-If a request argument was supplied, match it to a single menu action and invoke that action directly — invoking a local skill through the host's skill mechanism, or calling the `mcp__jollimemory__*` tool — asking the user only when the intent is ambiguous or unmatched. If no request was supplied, present the menu (single-select tool if the host has one, else a plain-text list), capture the user's choice, and invoke the corresponding action.
+If a request argument was supplied, match it to a single menu action and invoke that action directly — invoking a local skill through the host's skill mechanism, or calling the matching memory-server tool — asking the user only when the intent is ambiguous or unmatched. If no request was supplied, present the menu (single-select tool if the host has one, else a plain-text list), capture the user's choice, and invoke the corresponding action.
 
 ## Notable Behavior
 
-- **The menu is assembled live from two sources, not a static list.** The local skills are fixed, but the MCP-tool half is whatever `mcp__jollimemory__*` tools happen to be registered in the session — so the menu grows or shrinks with the host's registered tools and with any manifest-driven platform tools. (Notable.)
+- **The menu is assembled live from two sources, not a static list.** The local skills are fixed, but the MCP-tool half is whatever memory-server tools happen to be registered in the session — so the menu grows or shrinks with the host's registered tools and with any manifest-driven platform tools. (Notable.)
+- **Tool discovery is host-aware, not a single prefix match.** The document no longer states one rule ("names beginning with the prefix"); it states that the prefix match is correct only on a prefixing host, that another host exposes the same tools as bare names *inside* the namespace where a prefix match finds nothing, and that the LLM must search its available tools before concluding none are registered because that host loads them lazily. The document says outright that a prefix match "finds nothing" on that host — which under the old single-rule wording would have left the MCP half of the menu empty. (Notable; load-bearing.)
 - **It is a front door, never a second execution path.** The skill only steers to an already-existing skill or MCP tool; it re-implements no action. The standalone skill commands and the MCP-server `jolli` prompt keep working unchanged. (Notable; load-bearing.)
 - **It does not re-derive the backend's curated menu.** A static skill document cannot fetch the tool manifest, so curation of which platform tools belong in the backend menu stays authoritative in the server-side MCP `jolli` prompt (spec 148); this skill just surfaces the Jolli MCP tools present in the session. (Notable.)
 - **The skill applies its own hardcoded exclusions because it cannot read curation.** Since the skill cannot consult the backend `menu` metadata, it names the excluded tools explicitly: `list_workflow_definitions` is never surfaced (plumbing), and `run_remote_workflow` / `cancel_remote_workflow` are folded into the single run-a-workflow action rather than listed as raw tools. (Notable; load-bearing — keeps the menu from double-listing the remote-run tools.)
@@ -91,11 +101,12 @@ If a request argument was supplied, match it to a single menu action and invoke 
 - **Workflow history is a routed action, not a re-implementation.** The menu's "Workflow history" entry shells the `jolli workflow runs <workflowId>` helper and offers to open any listed URL via `jolli open-url`; it renders the helper's JSON projection but computes nothing itself, and an empty history is a normal outcome. Because `workflow runs` is a `@jolli.ai/workflow-cli` plugin subcommand, a missing plugin makes the host stub print an install hint and exit non-zero, and the recipe surfaces that hint (`npm i -g @jolli.ai/cli @jolli.ai/workflow-cli`) and stops. The behavior of those helpers is owned by spec 274. (Notable.)
 - **Request-supplied invocations skip the menu.** A non-empty argument is matched to one action and invoked directly, asking only on ambiguity or no match — the menu is presented only when the user gives no request. (Notable.)
 - **Presentation is host-agnostic.** The interactive-single-select tool is an example only; the plain-text-list fallback keeps the skill usable on any host that loads skills. (Notable.)
-- **Plugin-bootstrap companion menu.** This standalone document is written by a full `jolli enable` into the cross-platform agent-skills directory. Separately, the Claude Code plugin's reduced repo-hooks-only bootstrap (spec 57) writes a bare `/jolli` menu into the Claude-Code skills slot — necessary because a plugin skill can only ever be invoked as `/jolli:<name>`, so the ecosystem's mandatory bare `/jolli` entry point has to come from a non-plugin project skill written outside the plugin's own bundle. That companion is a **distinct, state-aware variant** (it inspects how Jolli is set up in the repo and guides first-time setup rather than listing the fixed action set this spec documents), not a byte-identical copy of this document. On success the bootstrap also signals a same-session skill reload so the freshly written bare `/jolli` is invocable in the very session that wrote it, rather than only the next one. This spec documents the standalone menu's content; the plugin companion's body is a separate front door. (Notable.)
+- **Plugin-bootstrap companion menu.** This standalone document is written by a full `jolli enable` into the cross-platform agent-skills directory. Separately, the Claude Code plugin's reduced repo-hooks-only bootstrap (spec 57) writes a bare `/jolli` menu into the Claude-Code skills slot — necessary because a plugin skill can only ever be invoked as `/jolli:<name>`, so the ecosystem's mandatory bare `/jolli` entry point has to come from a non-plugin project skill written outside the plugin's own bundle. That companion is a **distinct, state-aware variant** (it inspects how Jolli is set up in the repo and guides first-time setup rather than listing the fixed action set this spec documents), not a byte-identical copy of this document. On success the bootstrap also signals a same-session skill reload so the freshly written bare `/jolli` is invocable in the very session that wrote it, rather than only the next one. This spec documents the standalone menu's content; the plugin companion's body is a separate front door, owned by **spec 303** — which also records the other half of the revision-ordering invariant noted under Data Contracts. (Notable.)
 
 ## Shared Behavior
 
 - Spec 48 owns the file path(s), the frontmatter schema, the revision-guard, the bundled-version and revision sentinels, the single-target write (the cross-platform agent-skills directory), the plugin-driven Claude-Code-slot operations (the companion bare-umbrella write, the legacy-copy cleanup, and the uninstall removal), and the legacy-directory cleanup — and installs this skill while explicitly disclaiming ownership of its body. This spec owns only the content written inside that file.
 - Specs 140 and 141 own the content of the `jolli-recall` and `jolli-search` skills that this menu routes to; the menu carries **no** pull-request action — the PR skill it used to list was retired (spec 211), and PR authoring is reached through the PR-description tool or command-line surface rather than through this menu; spec 273 owns the `jolli-local-run` recipe skill; spec 274 owns the `jolli-remote-run` recipe skill and the `workflow runs` / `open-url` helpers the workflow-history action shells.
 - Spec 148 owns the MCP tool surface the routed choices exercise and the server-side `jolli` **prompt** (the manifest-`menu`-metadata-curated counterpart to this skill), including its identical request/no-request steering contract.
+- Spec 303 owns the plugin-bootstrap companion bare-`jolli` menu's body — the state-aware variant written into the Claude-Code slot, and the upper half of the revision-ordering invariant this document's revision participates in.
 - Worktree-awareness is inherited from spec 48: each worktree has its own copy of this skill document.

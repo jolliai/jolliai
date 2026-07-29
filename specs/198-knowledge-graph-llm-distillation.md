@@ -43,8 +43,8 @@ An optional callback taking a one-line human-readable message. Throttle-free, tr
 - The categorize and delta calls use a large output cap (16,384 tokens) and force streaming.
 - Each per-topic unit call uses a small cap (4,096 tokens) and does not force streaming.
 - Each per-category edge call uses a large cap (32,000 tokens) and forces streaming.
-- Unit calls fan out at a fixed concurrency (4).
-- Edge calls fan out at a fixed concurrency (4).
+- Unit calls fan out at a fixed concurrency (4) — but that constant is the **hosted-provider** limit. It is passed through the shared provider-aware fan-out limit, which forces it to **one** whenever the active provider is the local-agent one (spec 280 owns why: each call spawns a whole agent CLI process).
+- Edge calls fan out at a fixed concurrency (4), passed through the same provider-aware limit and likewise forced to **one** under the local-agent provider.
 - A per-topic unit call gets at most three attempts.
 
 ### Distilled graph (output)

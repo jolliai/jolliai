@@ -10,7 +10,8 @@ Surface user-authored Markdown files in a per-repository memory mirror by enumer
 
 - The set of entry points exposed for "scan with a known branch" and "scan every branch present on disk", and their cwd-resolving siblings.
 - Resolution of the memory-mirror root from the caller's bound working directory: when present, the configured user-pickable parent folder; the host repository's name; the host repository's remote-origin URL.
-- Handling of an absent or unresolvable memory-mirror root.
+- The write-boundary consultation that precedes root resolution, its unconditional application, and what the scanner returns when it refuses — but not the predicate itself.
+- Handling of a refused, absent, or unresolvable memory-mirror root.
 - The three scoped directories searched, in the order they are searched, and the depth limit applied to each (top-level entries only — no recursion).
 - The exclusion rules used to drop system-generated entries: a registry-driven exclusion, a hash-suffix-named-file exclusion, and a prefix-named-file exclusion.
 - The degraded-mode behavior used when the per-repository file registry cannot be read or parsed.
@@ -29,6 +30,7 @@ Surface user-authored Markdown files in a per-repository memory mirror by enumer
 - The shape and mutation semantics of the per-repository file registry, the per-repository branch-mapping registry, and the per-repository configuration document (defined by the folder-based summary storage spec and the memory-bank folder layout spec).
 - The naming rules for the system-generated visible files this scanner excludes — specifically the `-<8-hex>.md` suffix shape and the `plan--` / `note--` / `topic--` prefix shape (defined by the folder-based summary storage spec); this scanner only describes the recognition patterns it applies.
 - The validation and selection of the user-pickable parent folder itself (defined by the memory-bank folder layout spec).
+- The write boundary this scanner consults before resolving its root: the conditions under which a working directory is refused, the vocabulary of refusal reasons, their evaluation order, and the separately-reported effective Memory Bank state derived from the same predicate (defined by the memory-bank write-boundary and effective-state-reporting spec). This spec states only where the consultation sits, that it is unconditional, and what the scanner returns on a refusal.
 - The three-layer fallback used to compute the host repository's basename (defined by the memory-bank folder layout spec).
 - The deterministic transcoding rule applied to a branch name when no registry mapping exists, and the reverse folder-to-branch lookup (defined by the folder-based summary storage spec); this scanner consumes both as primitives.
 - The downstream ingestion pipeline that consumes the scanner's output, including how user files are merged into the topic-page timeline, how their fingerprint is used for cache invalidation, and how their modification timestamp is folded into the source-of-truth ordering (defined by the topic ingest pipeline and source timeline specs).
@@ -52,14 +54,22 @@ A pair of explicit-root sibling entry points accept the absolute memory-mirror r
 
 ### Memory-mirror root resolution
 
-Given a bound working-directory path, the scanner resolves a per-repository memory-mirror root by combining three inputs (see Boundaries above for who owns each input's derivation):
+Given a bound working-directory path, the scanner resolves a per-repository memory-mirror root in two stages.
+
+**Stage 1 — the write boundary.** Having read the configured parent folder, the scanner consults the Memory Bank write boundary for the bound working directory *before* deriving anything else. On a refusal it yields **"no root"**: it emits a single debug-level log line naming the working directory, emits **no warning**, and creates nothing on disk. The predicate and its refusal reasons are defined by the memory-bank write-boundary spec (see Boundaries).
+
+This stage exists because stage 2 does not merely *look up* the root — it **claims** it, creating the directory and writing the repository's identity. Ungated, a scan started from a working directory that is not a real project therefore *created* the root it then found empty, and reported "no user knowledge" about a mirror it had just brought into existence. The gate makes the scan's read-only intent true in fact.
+
+The boundary is consulted **unconditionally**: the scanner never reads the storage-mode configuration, so the gate applies identically whether or not the user has a folder layer configured at all.
+
+**Stage 2 — resolution.** The scanner combines three inputs (see Boundaries above for who owns each input's derivation):
 - A configured user-pickable parent folder, if any (else a fallback determined by the parent-folder layout spec).
 - The host repository's name.
 - The host repository's remote-origin URL, if any.
 
-The result is an absolute path naming a single per-repository subdirectory beneath the parent folder. When any input resolution throws, the scanner returns an empty result without warning (treated as "no memory mirror configured here").
+The result is an absolute path naming a single per-repository subdirectory beneath the parent folder, ordinarily claimed on return. When any input resolution throws, the scanner returns an empty result without warning (treated as "no memory mirror configured here").
 
-When the resolved root does not exist on disk, the scanner returns an empty result with a debug-level log entry. (This is the normal "fresh install" / "reconfigured root not yet created" path.)
+When the root does not exist on disk, the scanner returns an empty result with a debug-level log entry. (This is the normal "fresh install" / "reconfigured root not yet created" path for the explicit-root entry points, which accept a root nobody has claimed.)
 
 ### Per-repository file registry
 
@@ -114,7 +124,7 @@ The modification timestamp's role is to serve as the chronological ordering key 
 
 ### Entry point: scan with a known branch (cwd-resolving)
 
-1. Attempt memory-mirror root resolution from the bound working directory. If resolution throws or yields a path that does not exist on disk, return an empty result.
+1. Attempt memory-mirror root resolution from the bound working directory. If the write boundary refuses that directory, if resolution throws, or if resolution yields a path that does not exist on disk, return an empty result.
 2. Delegate to the explicit-root sibling (below) with the resolved root and the optional branch name.
 
 ### Entry point: scan with a known branch (explicit root)
@@ -148,7 +158,7 @@ The modification timestamp's role is to serve as the chronological ordering key 
 
 ### Entry point: scan every branch present on disk (cwd-resolving)
 
-1. Attempt memory-mirror root resolution from the bound working directory. If resolution throws or yields a path that does not exist on disk, return an empty result.
+1. Attempt memory-mirror root resolution from the bound working directory. If the write boundary refuses that directory, if resolution throws, or if resolution yields a path that does not exist on disk, return an empty result.
 2. Delegate to the explicit-root sibling (above) with the resolved root.
 
 ### Per-directory collector
@@ -210,6 +220,7 @@ The scanner does **not** apply the vault-aware symlink-refusal protection used b
 
 | Failure mode | Behavior |
 | --- | --- |
+| Memory-mirror root refused by the write boundary | Empty result; debug log; no warning; **nothing created on disk**. Reached before any repository-name or remote-URL derivation. |
 | Memory-mirror root resolution throws | Empty result; debug log; no warning. |
 | Memory-mirror root does not exist on disk | Empty result; debug log; no warning. |
 | Per-repository file registry missing | Degraded mode (empty path-set); warning emitted. |
@@ -249,6 +260,8 @@ Two invocations interleaved with a system-driven write or an ingest can produce 
 - **Per-directory enumeration failure during the multi-branch sweep returns partial results.** When the root subdirectory listing fails partway through, the scanner returns the accumulated global-scope and repository-scope contributions; it does not throw, does not retry, and does not include any branch-scope contributions. The same primitive (per-directory enumeration) used inside the per-directory collector silently skips on failure. The asymmetric treatment is deliberate: a failure to list the root is qualitatively different from a failure to list one branch folder. (Notable.)
 - **Symlink handling is platform-default.** The scanner uses stat (not lstat), so symlinks to regular files are followed transparently for content read and fingerprinting. Symlink-refusal protection applies only to system-driven writes elsewhere in the system; the scanner does not duplicate it for reads. (Notable.)
 - **Stat-fails-on-vanished-file is silent.** A file that disappears between directory enumeration and the stat call is silently skipped with no warning — by contrast, a file that exists at stat time but fails to read **does** emit a warning. The asymmetry encodes the assumption that vanishing-between-enumeration-and-stat is a benign race, while read-after-stat-failure is a permission or filesystem problem worth surfacing. (Notable.)
+- **Scanning never creates the mirror it scans.** The write boundary is consulted before the root is resolved, precisely because resolving it *claims* it. A scan from a working directory the boundary refuses therefore reports "no user knowledge" without having produced a per-repository subdirectory to be empty about — where previously it produced one on every scan. This makes the scanner read-only in fact and not merely in intent, and it is the reason the boundary sits ahead of resolution rather than around it. (Notable; intentional regression-closer.)
+- **The gate is unconditional, and the claim behind it is not.** The scanner never consults the storage-mode configuration, so the boundary is evaluated on every scan regardless of whether a folder layer is configured — and when the boundary *allows*, resolution still claims the root. A user whose configuration selects the version-controlled-ref layer only, and who therefore expects no per-repository subdirectory to exist at all, can still have one claimed by a knowledge scan. (Surprising.)
 - **Configuration-failure path returns empty without warning.** When the bound-working-directory-based resolution of the memory-mirror root throws (e.g. configuration unloadable, repository basename unresolvable), the scanner emits a debug-level log and returns empty. This deliberately keeps the scanner non-fatal for hosts where memory-mirror configuration is not present. (Notable.)
 - **Empty branch directory triggers no warning.** A branch name that resolves to a folder that does not exist on disk is treated as "no user content for this branch yet" and silently skipped in the known-branch variant. The same scenario in the multi-branch sweep cannot arise (the sweep enumerates folders that exist on disk by definition). (Notable.)
 - **Modification timestamp serves as a downstream ordering key.** Beyond identifying a file, the modification timestamp is promoted by downstream consumers to the chronological position of the file in the source-of-truth timeline that ingest reads. This means a user editing a file shifts its position in the timeline; this is intentional. The fingerprint, not the timestamp, drives cache invalidation. (Notable.)
@@ -260,6 +273,7 @@ Two invocations interleaved with a system-driven write or an ingest can produce 
 ## Shared Behavior
 
 - The full layout and reserved-name semantics of the per-repository memory mirror, including how the global / repository / branch scopes correspond to fixed directory depths and how the system-reserved subdirectory names are chosen, are defined by the memory-bank folder layout spec.
+- The write-boundary predicate this scanner's root resolution consults, its refusal reasons, the other two consumers that consult it, and the effective-state report that makes a refusal visible to the user are defined by the memory-bank write-boundary and effective-state-reporting spec. The claiming behavior of the root resolution the boundary guards is defined by the memory-bank folder layout spec.
 - The shape and mutation semantics of the per-repository file registry, the per-repository branch-mapping registry, and the fingerprint algorithm used to populate the registry's fingerprint column are defined by the folder-based summary storage spec.
 - The naming conventions for system-emitted visible files (the hash-suffix shape and the `plan--` / `note--` / `topic--` prefixes) are defined by the folder-based summary storage spec; this scanner consumes the patterns as exclusion rules.
 - The deterministic transcoding rule used as the branch-name → folder-name fallback, and the reverse folder-name → branch-name lookup, are defined by the folder-based summary storage spec.

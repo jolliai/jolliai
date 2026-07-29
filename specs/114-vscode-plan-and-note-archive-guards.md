@@ -7,12 +7,11 @@ The content-hash guard the plans-and-notes registry uses to hide a plan or note 
 ## Scope
 
 **In scope:**
-- The shape of a registry entry, including the fields that drive guard behavior: `slug` / `id`, `sourcePath`, `branch`, `commitHash`, `editCount`, `addedAt`, `updatedAt`, `contentHashAtCommit`, `ignored`, plus the `format` discriminant for notes (snippet vs markdown).
+- The shape of a registry entry, including the fields that drive guard behavior: `slug` / `id`, `sourcePath`, `commitHash`, `editCount`, `addedAt`, `updatedAt`, `contentHashAtCommit`, `ignored`, plus the `format` discriminant for notes (snippet vs markdown).
 - What "archive" does to the entry: writes `commitHash`, writes `contentHashAtCommit` (SHA-256 of current source content), clears `ignored`, and creates a sibling `<slug>-<shortHash>` snapshot entry the orphan branch / Summary WebView consume.
 - The sidebar visibility rule: an entry whose `contentHashAtCommit` is set is hidden when the live source content still hashes to the guard value, and shown again when it differs.
 - The user-hide rule (`ignored = true`): hides from the sidebar regardless of any other field.
 - The interaction between the two: an explicit user-hide trumps content-hash logic; clearing `ignored` (via the panel's "Add" / Associate flow) restores the content-hash decision.
-- The branch filter: entries from other branches are also hidden, independent of the archive guard.
 - The "snapshot copy" rule: entries with `commitHash` set AND no `contentHashAtCommit` are hidden from the sidebar (they exist for orphan-branch storage / Summary WebView only).
 - The orphan-source-file rule: an uncommitted entry whose source file no longer exists is hidden; for plans only, the next sidebar load also evicts that entry from the registry as a one-shot cleanup.
 
@@ -34,7 +33,6 @@ The content-hash guard the plans-and-notes registry uses to hide a plan or note 
 | `sourcePath` | absolute path | Where the plan markdown lives on disk (under the global plans directory for fresh entries; archive snapshots reference the same path). |
 | `addedAt` | ISO 8601 | First time the plan was registered. |
 | `updatedAt` | ISO 8601 | Last registry mutation. |
-| `branch` | string | Git branch the entry belongs to. |
 | `commitHash` | string \| null | Null while uncommitted; the commit's full hash once associated. |
 | `editCount` | number | Times the source file has been edited (maintained by the agent stop-hook, not the guard logic). |
 | `contentHashAtCommit` | string \| undefined | SHA-256 of the source content captured at archive time. Presence of this field flips the entry into "archive guard" mode. |
@@ -49,7 +47,6 @@ The content-hash guard the plans-and-notes registry uses to hide a plan or note 
 | `format` | `"snippet"` \| `"markdown"` | Snippet notes are stored as a file inside the per-repo notes directory; markdown notes reference an arbitrary user file. |
 | `sourcePath` | absolute path \| undefined | The file on disk that holds the content. |
 | `addedAt` / `updatedAt` | ISO 8601 | Same as plans. |
-| `branch` | string | Git branch the entry belongs to. |
 | `commitHash` | string \| null | Same role as plans. |
 | `contentHashAtCommit` | string \| undefined | Same role as plans — SHA-256 of the current content captured at archive time. |
 | `ignored` | boolean \| undefined | Same force-hide semantics. |
@@ -79,7 +76,6 @@ The sidebar (PLANS panel for plans; the merged Plans-and-Notes view) renders onl
 | Gate | Pass condition |
 | --- | --- |
 | Ignored guard | `ignored !== true`. |
-| Branch guard | `branch === currentBranch` (entries with no branch are accepted). |
 | Archive guard | If `contentHashAtCommit` is set: source file must exist AND its current SHA-256 must differ from `contentHashAtCommit`. If `contentHashAtCommit` is unset: pass. |
 | Snapshot-copy guard | If `commitHash !== null` AND `contentHashAtCommit` is unset: hide (it's a snapshot copy intended for orphan-branch / Summary WebView). |
 | Source-file-deleted guard | If `commitHash === null` AND source file does not exist: hide (uncommitted artifact whose file the user removed). |
@@ -145,7 +141,7 @@ For a plan/note registry entry, the visibility-relevant transitions are:
 | Ignored | User clicks "Add" / "Associate" | Fresh uncommitted (visible) |
 | Snapshot-copy (`commitHash` set, no `contentHashAtCommit`) | Anything | Hidden (snapshot-copy guard) |
 
-The `branch !== currentBranch` filter cross-cuts every state — switching branches hides every entry whose `branch` does not match the new branch, restoring them when you switch back.
+No transition is branch-sensitive. The entry shape has no branch field, the loader that feeds the sidebar strips any branch value it finds on a row, and none of the gates compares one — a pending plan or note belongs to the worktree, so switching branches neither hides nor reveals anything. A branch is attached to the artifact only once a commit archives it, and it is that commit's branch, recorded on the commit's stored summary.
 
 ## Notable Behavior
 
@@ -153,7 +149,7 @@ The `branch !== currentBranch` filter cross-cuts every state — switching branc
 - **Editing an archived plan reincarnates it in the sidebar.** The archive guard does not require the user to do anything explicit to "un-archive" — touching the source file is sufficient. This is intentional: it means iterating on a plan after the first commit is frictionless. (Surprising; intentional.)
 - **The user-hide flag wins against all other rules.** A user who clicks "Remove" gets their wish even if the source content later changes back; only an explicit "Add" / "Associate" can reverse it. The system never decides on its own that an ignored entry should reappear. (Notable.)
 - **"Remove" on a note has different physical effects depending on format.** For snippet notes, removing also deletes the local snippet file (the orphan branch holds the archive copy if any). For markdown notes referencing a user file, removing only erases the registry entry — the user's file is untouched. The plan equivalent ("Remove from list") merely sets `ignored`; the plan markdown file is never deleted. (Surprising; intentional.)
-- **Branch filtering is independent of archive guards.** An entry can be archive-hidden and branch-mismatched at the same time; the sidebar only needs one gate to fail. Switching branches re-evaluates everything from scratch — so an entry that was hidden by the archive guard on branch A can re-appear on branch B if its `branch` matches and its archive guard happens to be passing there. In practice the archive snapshot was taken on a specific branch, so this rarely occurs, but the rules are independent. (Notable.)
+- **There is no branch gate.** The sidebar never compares a branch. A pending plan or note is worktree-scoped and stays listed across branch switches, exactly like uncommitted code; the artifact acquires a branch only when a commit archives it, and it is the commit's branch, not anything the registry held. (Notable.)
 - **Plan source files live outside the workspace.** Plans live under a per-user global directory (the agent's plans directory). When the source file is deleted, the orphan-cleanup pass evicts the registry entry; this is the only place in the visibility logic that mutates the registry as a side-effect of rendering. (Notable.)
 - **Note source files live in two different places.** Snippet notes are written by the panel itself into a per-repo notes directory; markdown notes can reference any path the user picks. The visibility rule treats both uniformly — it just hashes whatever bytes the `sourcePath` points to. (Notable.)
 - **The snapshot-copy guard is an opaque rule, not a UI flag.** The reason `<slug>-<shortHash8>` entries don't show up is that they have `commitHash` set without `contentHashAtCommit` — which the visibility rule reads as "this is the orphan-branch shadow, not a sidebar artifact". A future field added to mark these explicitly would not change behavior. (Notable.)
@@ -165,5 +161,4 @@ The `branch !== currentBranch` filter cross-cuts every state — switching branc
 - **One registry file holds plans and notes.** A single `plans.json` per repo with sibling `plans` and `notes` maps; readers and writers (sidebar, post-commit hook, Summary WebView) all consume the same file with atomic writes.
 - **SHA-256 over UTF-8 source bytes.** The same hashing primitive is used everywhere a content guard is evaluated — both at archive-time and at sidebar-render time — so guard checks always agree across surfaces.
 - **First-`#`-heading title extraction.** The same rule that drives plan attribution (cross-project guard) and the panel's display titles is used here for both plans and notes.
-- **Branch comparison via the same git command.** The "current branch" is the value of `git rev-parse --abbrev-ref HEAD` for the workspace; the same value the rest of the product uses to scope per-branch artifacts.
 - **Atomic write via tmpfile + rename.** All registry writes use the shared tmpfile-then-rename primitive used by every per-repo state file (`sessions.json`, `cursors.json`, `plans.json`, …), with the same Windows EPERM fallback.

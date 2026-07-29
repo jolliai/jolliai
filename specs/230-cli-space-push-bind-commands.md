@@ -22,6 +22,7 @@ Expose the push-to-Jolli-Space engine through three command-line commands — pu
 - How a branch's commit summaries become deduplicated summary/plan/note articles inside the push loop (covered by **Jolli Space Push Article Assembly**).
 - The interactive editor chooser that resolves a binding-required outcome in the GUI surface (covered by **Binding Required Flow**).
 - How a workspace's git remote is normalized into the canonical repo URL and derived repo name (covered by **Canonical Repo URL and Name Derivation**).
+- **The plugin-provided `space` command surface.** Despite the shared "Space" wording, the three commands here (`push`, `spaces`, `bind`) are host built-ins grouped under the product's Memory section, and they are unaffected by the Space plugin's presence. The separate top-level `space` command — and every subcommand under it — belongs to the `@jolli.ai/space-cli` plugin; when that plugin is absent the host registers a single forwarding stand-in for the `space` name that prints an install hint and exits non-zero. Neither the plugin nor its stand-in participates in the push/list-spaces/bind flows described here, and the narrowing of that stand-in from a seven-name flat family to the single `space` command touched none of these three commands. See the plugin-loader spec.
 
 ## Data Contracts
 

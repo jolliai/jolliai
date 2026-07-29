@@ -14,17 +14,18 @@ The instruction document of the recall skill describes a one-step context load t
 
 ### Skill name
 
-`jolli-recall`. This value is used as the skill directory name and appears in the frontmatter `name` field. The same byte-identical document is written into both a Claude-Code-specific skills directory and a cross-platform agent-skills directory (see spec 48). The name is fixed; changing it must be treated as a breaking change with an accompanying legacy-cleanup entry in spec 48.
+`jolli-recall`. This value is used as the skill directory name and appears in the frontmatter `name` field. The document is written into the single cross-platform agent-skills directory (see spec 48); the Claude-Code slot is the Claude Code plugin's territory and receives no unnamespaced copy. The name is fixed; changing it must be treated as a breaking change with an accompanying legacy-cleanup entry in spec 48.
 
 ### Frontmatter values
 
-The frontmatter is spec-compliant only — it carries `name`, `description`, and a nested `metadata` block (a version string and a vendor string). It carries **no** Claude-private fields (no `argument-hint`, no `user-invocable`), so the same file validates and runs on every host.
+The frontmatter is spec-compliant only — it carries `name`, `description`, and a nested `metadata` block (a version string, a content-revision integer, and a vendor string). It carries **no** Claude-private fields (no `argument-hint`, no `user-invocable`), so the same file validates and runs on every host.
 
 | Field | Value |
 |---|---|
 | `name` | `jolli-recall` |
 | `description` | `Recall prior development context from Jolli for the current branch. Use when the user wants to recall, remember, or resume prior work on a branch.` |
 | `metadata.version` | set to the bundled version at write time (spec 48) |
+| `metadata.revision` | `2` |
 | `metadata.vendor` | `jolli.ai` |
 
 ### Body structure
@@ -37,15 +38,20 @@ The body immediately follows the frontmatter closing delimiter and contains:
 4. **"Step 1: Load the recall result" section** — a preferred in-process-tool path and a shell here-doc fallback path, plus the fallback message when the dispatch entry point is missing.
 5. **"Step 2: Handle the result by `type`" section** — how to dispatch on the result's `type` field, then detailed rendering / matching / error instructions for each value.
 
-The body's exact wording is part of the on-disk contract and must be preserved across releases except for the bundled-version field value. Editing the body text without bumping the package version will not trigger a rewrite of already-installed documents; the version sentinel is the sole rewrite trigger.
+The body's exact wording is part of the on-disk contract and must be preserved across releases except for the bundled-version field value. The **sole** rewrite trigger is the `metadata.revision` integer, not the bundled release version: editing the body without raising that integer ships nothing to any existing install, and the repository guards against that omission at build time (spec 48).
 
 ### Preferred in-process-tool path (Step 1)
 
-The skill instructs the host LLM to prefer an in-process recall tool when one is available, calling it with a branch argument object (and omitting the branch when the user supplied no argument, which targets the current branch). The tool returns the same `type`-tagged object the shell fallback returns, so Step 2 handles both identically.
+The skill instructs the host LLM to prefer the in-process recall tool from the memory server when one is available, calling it with a branch argument object (and omitting the branch when the user supplied no argument, which targets the current branch). The tool returns the same `type`-tagged object the shell fallback returns, so Step 2 handles both identically.
+
+The document is explicit that the tool must be matched **by what it does, not by one host's spelling of its name**, and it names both forms it expects to encounter:
+
+- On Claude Code the tool is surfaced under a **prefixed** name, `mcp__jollimemory__recall`.
+- On Codex the same tool is surfaced as a **bare** `recall` **inside** the `mcp__jollimemory` namespace, and that host loads MCP tools **lazily** — so an empty first look is explicitly **not** proof the tool is absent.
 
 ### Shell here-doc fallback path (Step 1)
 
-When no in-process tool is available, the skill instructs the host LLM to invoke the dispatch entry point through a POSIX bash here-doc with **standard-input argument passing**, not argv interpolation:
+The fallback gate is deliberately strict: it is **not** "no such tool is available", but **only** when the memory server is not registered at all — *not* merely because one spelling of the tool name is missing from the visible tool list. When that stricter condition holds, the skill instructs the host LLM to invoke the dispatch entry point through a POSIX bash here-doc with **standard-input argument passing**, not argv interpolation:
 
 - The recall subcommand is invoked with a standard-input flag and a structured-output flag.
 - The user's argument is fed on standard input between a here-doc delimiter whose token the LLM **generates freshly per invocation** as a random 16-character hex string. The single-quoted here-doc delimiter form suppresses every shell metacharacter; the per-invocation high-entropy delimiter defeats prompt-injection payloads that try to pre-compute the delimiter. The LLM is told to scan the argument and regenerate the delimiter if the argument happens to contain the closing line.
@@ -100,16 +106,17 @@ When the result type is `error`, the LLM surfaces the error's message string ver
 ## Notable Behavior
 
 - **The skill prefers an in-process tool and falls back to a shell here-doc.** Both paths return the same `type`-tagged object, so Step 2 dispatches identically regardless of which path produced the result. The shell fallback uses standard-input argument passing through a single-quoted, freshly-randomized here-doc delimiter — not argv interpolation — as the shell-injection defense. (Notable; load-bearing.)
+- **Tool discovery is capability-based and host-aware; the fallback gate is server-level, not name-level.** The document names two spellings of the same tool (prefixed on Claude Code, bare inside the namespace on Codex) and warns that one host loads MCP tools lazily, so a first look that finds nothing is not evidence of absence. Correspondingly the shell fallback is gated on "the memory server is not registered at all" rather than "this name is not in my tool list" — a name-level gate would drive a fully-equipped Codex session down the shell path unnecessarily. (Notable; load-bearing.)
 - **Three result types, not two.** The current document handles `recall`, `catalog`, **and** `error`; the error branch surfaces the message verbatim rather than fabricating a result. (Notable.)
 - **The render is two parts (forced facts, then free-form synthesis), not a fixed three-part report.** Part A is a mandated heading-plus-bullet fact block with interpretation explicitly deferred to Part B; Part B is free-form under universal principles. (Notable.)
-- **The fallback message is part of the on-disk contract.** Changing its text without a version bump will not update already-installed documents. (Notable.)
+- **The fallback message is part of the on-disk contract.** Changing its text without raising the document's `metadata.revision` integer updates no already-installed document at all — the release version is not the trigger (spec 48). (Notable.)
 - **The semantic-matching instructions in the catalog branch are instructions to the host LLM, not to the underlying flow.** The catalog is returned without pre-filtering; the LLM performs the semantic selection. (Notable.)
 - **Step 1 and Step 2 are the literal heading names used in the document.** They are load-bearing structural anchors. (Notable.)
 - **Bold means "verbatim from stored data."** The skill forbids using bold for general emphasis, so the user can trust that any bold span is a quote. (Notable.)
 
 ## Shared Behavior
 
-- Spec 48 owns the file path(s), the frontmatter schema, the version-guard, the bundled-version sentinel, the dual write into the Claude-Code and cross-platform skills directories, and the legacy-directory cleanup. This spec owns only the content written inside that file.
+- Spec 48 owns the file path(s), the frontmatter schema, the revision-guard (including the build-time fingerprint that fails a body edit made without a revision bump), the bundled-version interpolation, the single cross-platform write target, and the legacy-directory cleanup. This spec owns only the content written inside that file.
 - The dispatch entry-point pattern is described in spec 48's Shared Behavior section and is common to all skill invocations.
 - Spec 7 covers the recall flow at runtime — what actually happens when the skill's invocation executes.
 - Spec 148 owns the in-process recall tool that the preferred Step-1 path calls.

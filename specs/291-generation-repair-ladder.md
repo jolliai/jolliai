@@ -8,9 +8,9 @@ When a credential or a provider is already configured but memory generation cann
 
 **In scope**
 
-- The shared "can generate right now" predicate both entry points branch on, and its deliberate divergence from dispatch-time credential selection.
+- The shared "can generate right now" predicate both entry points branch on, its deliberate divergence from dispatch-time credential selection, and the fact that it probes only **one** of the four selectable agent tools.
 - The eligibility gate that decides whether the ladder runs at all.
-- The three rungs: the key/provider crossover rung, the no-crossover rung, and the local-agent rung — with their exact headlines, menu text, default answers, and the rule for unmatched input.
+- The three rungs: the key/provider crossover rung, the no-crossover rung, and the local-agent rung — with their exact headlines, menu text, default answers, and the rule for unmatched input, including that the local-agent rung's headline and re-probe both target one specific agent tool rather than the configured one.
 - The single one-shot re-probe offered by the local-agent rung, and why it can succeed.
 - The two key-entry branches and their asymmetric validation.
 - Where every persisted change lands.
@@ -41,7 +41,7 @@ The two repair surfaces are complements, not overlapping implementations, and th
 
 A single boolean over the loaded machine-global configuration, shared verbatim by both entry points so they can never disagree about whether generation works:
 
-- When the configured provider is the local-agent value: the answer is whether the locally-installed agent CLI is **actually usable right now** — a real discovery-and-capability probe honouring an explicitly configured executable path (mechanics owned by spec 280).
+- When the configured provider is the local-agent value: the answer is whether the locally-installed agent CLI is **actually usable right now** — a real discovery-and-capability probe honouring an explicitly configured executable path (mechanics owned by spec 280). The probe targets **one specific tool — the default one (Claude Code) — regardless of which of the four selectable agent tools is actually pinned.** The configured tool setting is not read here at all.
 - For every other provider (including unset): the answer is whether dispatch-time credential resolution yields any source at all.
 
 **This deliberately diverges from dispatch-time selection, for exactly one provider.** Dispatch-time resolution selects the local-agent source *unconditionally*, with no presence check, the moment the provider is pinned to it (spec 10) — so the runtime would happily choose it and only fail at commit time. The interactive predicate additionally probes the binary, so a broken, missing, or too-old agent CLI is caught here, in front of the user, rather than silently on their next commit. For all other providers the two agree exactly.
@@ -115,6 +115,8 @@ Opens with:
 AI provider is set to Local Agent but no usable `claude` was found — memories won't be generated.
 ```
 
+**This headline names one specific agent tool for every local-agent user**, because both the eligibility predicate and this rung's own re-probe target only the default tool's executable — never the tool the user pinned. A user who selected Codex, Cursor, or OpenCode and does not have Claude Code installed reaches this rung and is told that `claude` is missing. The mismatch was vacuously correct while only one tool was selectable; it became reachable once the setup picker started offering all four (spec 57), and is reached most directly straight after that pick. No wording in this ladder changed — the menu text, the defaults, and the unmatched-input rule below are exactly as they were.
+
 Then a four-choice menu, same prompt and default:
 
 ```
@@ -185,6 +187,7 @@ The two callers differ only in how the ladder interacts with first-time setup (e
 - **The reported verdict is advisory and is discarded by both callers.** The local-agent sign-in branch in particular reports success without confirming a Jolli API key exists, so "the ladder returned success" is not the same as "generation works".
 - **The provider is only ever changed by an explicit choice.** The three ways it can change are the crossover switch, a key entry (which pins its own provider), and the post-sign-in write in the local-agent rung. The ladder never silently reassigns the provider, and a skipped or failed branch leaves it exactly as it was.
 - **A Jolli key is validated before it is saved; an Anthropic key is not.** A rejected Jolli key is never written to disk and the provider is not touched; any supplied Anthropic key is written as-is.
+- **The whole local-agent path is single-tool, in a four-tool product.** The eligibility predicate, this rung's headline, its retry option, and both of its retry outcome lines all reference the default agent tool only; the configured tool identity is never read. So a user who pins another tool is judged unable to generate whenever Claude Code is absent — even if the tool they chose is installed and working — and the ladder's remedies (retry, switch provider, enter a key) contain no way to say "use the tool I picked". Selecting the tool is `jolli configure --set localAgentTool=…` or the setup picker (specs 62, 57); nothing in this ladder consults it. (Surprising; a real mismatch reachable from the setup menu, not a wording problem.)
 - **The one re-probe can genuinely succeed**, because probe failures are never cached while successes are. This is what makes "fix it in another terminal, then press Enter" a real workflow rather than a placebo.
 - **Every write is machine-global**, so a repair performed while sitting in one repository fixes generation for every repository on the machine.
 - **A browser-login-only user is told about a provider they never chose.** A user holding a sign-in token but no Jolli API key, no Anthropic key, and no provider setting satisfies "has some credential" yet fails the predicate — so the ladder runs. Because an unset provider is read as Anthropic, it announces `AI provider is set to Anthropic but no Anthropic key is available`, for a provider that was never set, and (since there is no Jolli key either) offers only the no-crossover menu: enter an Anthropic key, or skip. The wording is inaccurate about how the state arose but the offered remedy is correct.

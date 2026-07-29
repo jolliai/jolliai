@@ -16,6 +16,7 @@ Copy all summaries, transcripts, plans, notes, and plan-progress from the versio
 - The two-phase visible-layer reconciliation that runs after every copy — and on every activation even when no copy is needed.
 - The archive directory: its location, naming convention, and why it is hidden from sync and IDE explorers.
 - Migration outcome codes, success and failure cases, and their telemetry.
+- The four manual-disable gates (entry to the copy, entry to the reconciliation, the mid-run re-checks, and the progress writer's own refusal) and why a persisted outcome would be worse than no outcome.
 
 **Out of scope:**
 - The orphan-branch write path (covered by the orphan-branch summary storage spec).
@@ -32,7 +33,9 @@ Copy all summaries, transcripts, plans, notes, and plan-progress from the versio
 
 Stored inside the per-repository hidden layer at `migration.json`. The document carries:
 
-- `status`: one of `in_progress`, `completed`, `partial`, `failed`.
+- `status`: one of `pending`, `in_progress`, `completed`, `partial`, `failed`, `skipped`.
+  - `pending` is part of the vocabulary but is never written by the engine; a document carrying it is treated exactly like an absent one by the "is migration complete?" check (anything other than `completed` runs the full copy).
+  - `skipped` is a **transient return value only**, meaning "not attempted because the project is manually disabled". It is **never persisted to disk** — the writer that would persist it refuses on the same condition that produces it (see "Manual-disable gates" below).
 - `totalEntries`: total count of root entries (entries with no parent commit hash) found in the orphan-branch index.
 - `migratedEntries`: count of root entries successfully written by this run.
 - `failedHashes` (optional): array of commit hashes that raised an error during the per-root copy pass.
@@ -59,6 +62,17 @@ Located at `<parent>/.jolli/archive/<name>-<timestamp>/`, where `<parent>` is th
 The archive directory stays inside the Memory Bank parent so it travels with the user's `localFolder` configuration. The orphan branch remains the system of record for recovery.
 
 ## Behavior
+
+### Manual-disable gates
+
+A project whose owner has explicitly turned the product off must have nothing written into it. Because the engine's destination writes are individually suppressed at the storage layer when that is the case, an ungated engine would run to completion against a stream of silent no-ops and then record its own success — the single worst outcome, since a persisted `completed` permanently prevents the copy from being re-attempted. The engine therefore carries four gates on the same condition:
+
+1. **Entry to the full migration.** Returns immediately with the `skipped` status and zero total and migrated counts, before reading the source index. Nothing is written, including the progress document.
+2. **Entry to the visible-layer reconciliation.** Returns the same `skipped` status and zero counts, plus a zero changed-file count, before reading the progress document. Neither phase runs.
+3. **Mid-run re-checks.** The condition is re-read between every entry of the per-root pass, and again before the bulk passes begin. This exists because the disable gesture can land while a first-install copy is still in flight, minutes into the run: the destination writes issued after that moment are silently dropped, so continuing would count silently-dropped writes as migrated entries. The run instead aborts and returns `skipped` with the entries migrated *before* the gesture — an honest partial count, and one that is not persisted.
+4. **The progress writer itself.** Every write of the progress document goes through one internal writer that refuses outright on the same condition. This is the backstop that makes gate 3 safe: without it, an abort would still be racing whatever progress write was already queued, and a false `completed` landing on disk would permanently block re-migration. The reconciliation's final merged stamp was re-routed through this same gated writer for exactly that reason — it must not record a phase-1 completion stamp for regeneration work whose writes were dropped.
+
+All four gates read the same process-local in-memory manual-disable gate. That gate is set only by the editor host, so it is inert in any separate process that spawns the engine, and the engine consults the durable on-disk opt-out nowhere. Consequently the out-of-process command-line bridge carries **no** manual-disable protection of its own — whether an opted-out project is protected on that path is entirely up to whatever spawns the bridge. Cross-reference: spec 145 for the gate's lifecycle and scope limit, and `specs/304-manually-disabled-zero-write-contract.md` for the destination-write suppression that makes these gates necessary.
 
 ### Auto-migration (on activation)
 
@@ -170,6 +184,8 @@ The reconciliation returns the total count of visible Markdown files actually ch
 | `completed` | Copy finished with no per-root failures. |
 | `partial` | Copy finished but one or more root entries failed. |
 | `failed` | `index.json` could not be parsed. |
+| `skipped` | **Never written.** Returned by the entry gate, by a mid-run abort, and by the reconciliation's entry gate when the project is manually disabled. The writer that would persist it refuses on the same condition, so this status exists only in the value handed back to the caller and never appears in the document on disk. |
+| `pending` | **Never written by the engine.** Part of the vocabulary only; a document carrying it is treated as not-yet-complete, exactly like an absent document. |
 
 The document is absent before the first run and after the folder is wiped. A wiped folder resets the gate check to "never run", so the auto-migration runs the full copy again on the next activation.
 
@@ -194,6 +210,9 @@ The document is absent before the first run and after the folder is wiped. A wip
 - **Phase 2 of the reconciliation runs on every activation regardless of the gate.** The "delete stale child Markdown" sweep is an ongoing invariant enforcement, not a one-shot fix. Children hoisted on dormant branches are never swept by the per-commit queue worker, so this is the only path that guarantees they are eventually removed. (Notable; intentional.)
 - **A partial copy does not block activation on the next startup.** If `status` is `partial`, the auto-migration condition (`status !== "completed"`) triggers a re-run. The per-root pass skips already-migrated entries via the manifest check, so only the failed hashes need to be retried. (Notable; same mechanism as full resumability.)
 - **The `swept` count drives the sidebar-refresh decision, not a boolean "did anything run."** A no-op reconcile (steady state) reports `swept = 0` and the sidebar is not refreshed. Only actual file mutations (deletions or regenerations) cause a refresh, which prevents the user's expanded folder tree from collapsing on every activation. (Notable; intentional.)
+- **A disable asserted mid-migration abandons the run without recording any progress.** The per-entry and pre-bulk re-checks stop the copy at the next boundary and report the entries migrated before the gesture, but the progress writer refuses that report, so nothing lands on disk. The next activation after a re-enable therefore sees the state it saw before — absent, or the prior status — and re-runs the full copy, which the manifest-based idempotency check makes cheap for entries that did survive. The alternative (persisting the abort) would have recorded silently-dropped writes as completed work and permanently blocked the re-copy. (Surprising; the ordering of the abort and the write-refusal is what makes it safe.)
+- **The four manual-disable gates protect only the in-process invocation paths.** They all read a process-local in-memory signal that the editor host sets; the engine never reads the durable on-disk opt-out. So a spawned out-of-process invocation of the engine is entirely ungated at this layer. Whether that matters depends on the spawning host applying its own check — nothing in the engine enforces it. (Surprising; a real gap in the layering, documented as-is.)
+- **`skipped` is the one status that is a return value and not a state.** Every other status is both. A caller that renders "status: skipped" is reading something no invocation will ever find in the progress document, including its own next invocation. (Notable; a real source of confusion when reading a status line.)
 - **The legacy `leafCleanup.completedAt` field is preserved but never consulted.** Installs that ran the 0.99.2 inverted-pass version wrote this field. Current code carries it through all progress-document round-trips so the JSON does not lose fields, but the field has no effect on phase 1 gating — those installs must still run phase 1 to recover from the inverted deletion. (Notable; preserving the field is for round-trip fidelity only.)
 
 ## Shared Behavior
@@ -205,3 +224,4 @@ The document is absent before the first run and after the folder is wiped. A wip
 - **Host activation sequence** — invokes auto-migration as a fire-and-forget step. Defined by spec 100.
 - **Command-line migration bridge** — the hidden out-of-process entry point that spawns this engine for a host which cannot import it, with its own JSON output and exit-code contract and its explicit no-sign-in rule. Defined by the Memory Bank migration bridge spec.
 - **Telemetry** — the engine emits one event at the end of each copy run. The event schema is defined in the telemetry event catalog.
+- **The manual-disable state** the four gates read, and the destination-write suppression that makes them necessary, are owned by spec 145 and `specs/304-manually-disabled-zero-write-contract.md`. This spec owns only the gates' placement and their effect on the outcome vocabulary.

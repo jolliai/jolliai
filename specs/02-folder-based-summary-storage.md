@@ -23,6 +23,8 @@ Store summaries as plain files inside a user-chosen knowledge-base folder, mirro
 - UI surfaces that badge hand-edited visible or wiki files (covered by "VS Code Memory-File Divergence Decoration" and host-specific equivalents).
 - The version-controlled-ref backend that this storage can mirror (covered by "Orphan Branch Summary Storage").
 - Combination semantics with the version-controlled-ref backend (covered by "Dual-Write Summary Storage").
+- The Memory Bank write boundary that callers must clear before invoking the claiming resolution path — its conditions, refusal reasons, and the effective-state report derived from it (covered by "Memory Bank Write Boundary and Effective-State Reporting").
+- The durable repo-wide manual-disable opt-out — how it is set, cleared, and stored, and the full inventory of writes it suppresses (covered by "Manually-Disabled Zero-Write Contract"). Only its position inside this storage's batch write, and which of this storage's other paths lack it, are stated here.
 - Push-to-cloud or sync to remote services.
 - The schema of the summary-index document, plan files, or note files; this storage stores them verbatim and parses only enough to derive routing and titles.
 
@@ -155,6 +157,11 @@ The per-topic Markdown page and the wiki index page. The body composition of eac
 - A separate `findFreshKBPath` skips the reuse step.
 - `initializeKBFolder` creates the hidden subdirectory, ensures default sidecar files exist, then writes/updates the KB-level config to record the resolved `remoteUrl` and `repoName`.
 
+The standard resolution entry point is **not** a pure read despite its name: it **claims** the root it returns — creating the directory, seeding the default sidecars, and writing the repository identity — so that the returned path is already fully claimed on return and no caller needs a follow-up initialize step (the atomicity contract, defined by **Memory Bank Folder Layout**). Two consequences:
+
+- **It carries a caller-side write-boundary precondition.** Any caller whose repository name is derived from an ambient working directory must first clear the Memory Bank write boundary, because resolving from a directory that is not a real project permanently materializes a folder named after that directory. The predicate and its refusal reasons are defined by **Memory Bank Write Boundary and Effective-State Reporting**; this spec states only that the precondition exists and is the caller's to satisfy.
+- **A read-only peek sibling exists for callers that must not claim.** It computes the same answer as the standard entry point — same reuse, adoption, and suffix-ladder selection — while omitting every filesystem mutation: no directory creation, no identity write. It is what lets a caller distinguish "this repository has no folder yet" from "this repository's folder exists and would be reused" without creating one, and it is the path the effective-Memory-Bank-state report resolves through, so *displaying* where memories will land cannot be what brings the folder into existence.
+
 ### `ensure()`
 1. Recursively create the KB root directory.
 2. Initialize the hidden subdirectory: create it if missing; write a default `manifest.json` (`{version: 1, files: []}`), default `branches.json` (`{version: 1, mappings: []}`), and default `config.json` (`{version: 1, sortOrder: "date"}`) only if they do not exist.
@@ -166,6 +173,7 @@ Returns whether the KB root directory exists on disk.
 Returns the textual content of `<root>/.<product-namespace>/<path>`, or null if absent or unreadable.
 
 ### `writeFiles(files, message)`
+0. If the project is **manually disabled**, return immediately. The refusal sits **before** the `ensure()` in step 1, so a disabled project never has its folder tree created: neither the KB root, nor the hidden subdirectory, nor any default sidecar comes into existence as a side effect of a batch write.
 1. Run `ensure()`.
 2. Initialize counters (written, deleted).
 3. For each entry in batch order:
@@ -280,6 +288,7 @@ The topic-wiki layer (`<root>/_wiki/`) has no explicit state transitions tracked
 
 ## Notable Behavior
 
+- **The manual-disable gate sits on the batch write only.** Of this storage's mutating entry points, only the batch write refuses while the project is manually disabled. The initialization routine, the visible-markdown delete and regenerate paths, the plan-and-note visible deletes, the branch-mapping prune, the heal-missing-visible-markdown pass, the topic-wiki rebuild, the manifest reconciliation, and the dirty-marker write and clear all run normally. A disabled project therefore accumulates no new content through the batch write, but a repair, cleanup, or rebuild call that reaches this storage directly still touches disk. Whether such a call can be reached at all while disabled is decided by its own callers upstream, not here. (Surprising; the gate is per-entry-point, not per-storage-instance.)
 - **Two layers, one storage-provider surface.** Read/list operations apply only to the hidden layer; writes to the hidden layer additionally derive visible markdown for three known prefixes (`summaries/`, `plans/`, `notes/`). The hidden layer is the source of truth for `readFile` and `listFiles`. (Notable.)
 - **Per-file atomicity, not batch atomicity.** Each entry in a `writeFiles` batch is atomic on its own (rename-from-temp), but a partial batch can leave the KB in a half-applied state. (Surprising; documented in the storage-provider contract.)
 - **Visible markdown invisibly updates the manifest.** Each visible-file write recomputes a content fingerprint and overwrites the manifest entry for that `fileId`. There is no separate "register file" step. (Notable.)
@@ -311,3 +320,5 @@ The topic-wiki layer (`<root>/_wiki/`) has no explicit state transitions tracked
 - The UI surfaces that badge hand-edited visible or wiki files (using the same fingerprint comparison this storage records) are defined by **VS Code Memory-File Divergence Decoration** and host-specific equivalents.
 - The version-controlled-ref backend that this folder mirrors when paired in dual-write mode is defined by **Orphan Branch Summary Storage**.
 - The conditional combination of this folder mirror with that backend is defined by **Dual-Write Summary Storage**.
+- The write-boundary predicate that callers of the claiming resolution path must clear first, and the effective-state report that resolves through the peek path, are defined by **Memory Bank Write Boundary and Effective-State Reporting**.
+- The durable repo-wide manual-disable opt-out that suppresses this storage's batch write is defined by **Manually-Disabled Zero-Write Contract**.

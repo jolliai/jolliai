@@ -26,7 +26,7 @@ Produce a single summary for a new commit that resulted from squashing N source 
 
 ### Inputs
 - `squashCommitMessage`: the new commit's message string.
-- `ticketId` (optional): an outer ticket-id hint already extracted from the squash commit message; when absent the consolidation extracts it itself using the shared product-ticket regex.
+- `ticketId` (optional): an outer ticket-id hint supplied by the caller. It is **not** run through the ticket whitelist and it short-circuits the whole resolution chain below, so whatever the caller passes is what gets persisted (see Notable Behavior).
 - `sources`: an unordered list of per-source-commit consolidation inputs.
 - `config`: LLM credentials and model selection.
 
@@ -65,7 +65,7 @@ When null is returned, the pipeline calling layer falls back to the mechanical c
 When the LLM cannot produce a result, the mechanical fallback produces:
 - `topics`: source topics concatenated in oldest-first order (no merging, no de-duplication, no renumbering — what comes in goes out preserving multiplicity).
 - `recap`: the joined sequence of source recaps separated by blank lines; absent if no source had one.
-- `ticketId`: the outer hint when present; otherwise the first ticket id found while scanning sources oldest-first; otherwise absent.
+- `ticketId`: the outer hint when present, unvalidated; otherwise the first source ticket id found while scanning sources oldest-first **that passes the ticket whitelist**, in its canonicalized form — a legacy non-conforming source value is skipped rather than winning by position; otherwise absent.
 
 The mechanical fallback is "complete but unconsolidated": duplicates and superseded items remain; no source content is dropped.
 
@@ -115,7 +115,7 @@ Apply the shared product-ticket regex to the squash commit message; the first ma
 
 ### Step 4 — Render the prompt and call the LLM
 1. Render an oldest-first source-commits block. Each source produces a numbered block (`Commit i of N`) with the short hash, the date prefix, the message, the optional source ticket, the optional recap, and one sub-block per topic listing title, trigger, response, decisions, optional todo, optional category, optional importance, and optional files list. Missing fields drop entire lines (no placeholder strings — the prompt explicitly forbids "None" / "N/A" output).
-2. Compute a ticket line: outer hint > earliest source's ticket id > a literal "No ticket associated" string.
+2. Compute the ticket line shown to the model: outer hint (unvalidated) > the earliest source ticket id that passes the ticket whitelist, canonicalized > a literal "No ticket associated" string.
 3. Issue the call with action "squash-consolidate", maximum-output-tokens budget identical to the per-commit generator, the resolved model, and any direct or proxy credentials.
 4. On a failure, retry the same call once. If the retry also fails, return null (caller will mechanical-fallback).
 
@@ -130,11 +130,13 @@ The response is parsed using the same delimited-plain-text parser as the per-com
 
 ### Step 6 — Resolve the final ticket id
 Priority chain (first non-empty wins):
-1. The outer hint passed into the pipeline (from the squash commit message).
-2. The earliest source's ticket id (oldest-first scan).
-3. The ticket id parsed out of the LLM response (top-level field).
+1. The outer hint passed into the pipeline. Taken as-is: it is **not** whitelist-checked, and its presence short-circuits both steps below.
+2. The earliest source ticket id, scanning oldest-first, **that passes the ticket whitelist** — returned canonicalized (upper-cased project-key form). A source whose stored value does not conform is skipped, so the scan can reach a later, conforming source; if no source conforms the chain falls through to step 3.
+3. The ticket id parsed out of the LLM response (top-level field) — itself already whitelist-validated at parse time, so it can only be a conforming value or absent.
 
 Otherwise, the result has no ticket id.
+
+The same guarded scan is used in all three places that need a ticket: the prompt's ticket line, this post-call resolution, and the mechanical no-model fallback. The three cannot disagree about which source wins.
 
 ### Step 7 — Build the consolidated payload
 - On LLM success: take the LLM's parsed topics, parsed recap, the resolved ticket id, and the LLM-call metadata.
@@ -155,17 +157,13 @@ Either way the payload has the same shape; the only difference is whether `llm` 
 For every plan slug recorded on any source's plans field, update the plans registry to point that slug at the new commit hash. For every note id recorded on any source's notes field, update the notes registry to point that note at the new commit hash.
 
 ### LLM-call decision summary
-On the CLI/VS Code surface, the LLM is called in both the squash and squash-rebase paths whenever there is at least one source with non-empty topics or a non-empty recap. On the JVM (IntelliJ) surface, the LLM is called only when credentials are available and the path is the plugin-driven squash path; the rebase-squash path always falls back mechanically (credentials are not passed by the post-rewrite hook — see Notable Behavior). There is no scenario on the CLI/VS Code surface in which the squash path skips the LLM unconditionally — the README phrasing "the worker skips LLM for squash" is out of date relative to current behavior.
-
-On the JVM surface, the LLM is additionally skipped (mechanical fallback always runs) when no credentials are configured, regardless of path.
+The LLM is called in both the squash and squash-rebase paths whenever there is at least one source with non-empty topics or a non-empty recap, on every surface — all of them run this one pipeline. There is no scenario in which the squash path skips the LLM unconditionally — the README phrasing "the worker skips LLM for squash" is out of date relative to current behavior.
 
 The mechanical fallback is reached on:
 - Both LLM calls failing.
 - The LLM producing a format-compliant but empty response.
 - The strict retry also failing format checks or also producing nothing usable.
 - The strict retry call itself failing.
-- (JVM only) No credentials available.
-- (JVM only) Path is the rebase-squash path (credentials not forwarded by the post-rewrite hook).
 
 In every case the writer ends up with a non-null consolidated payload (either LLM-derived or mechanical), so the root is never written without a topics array.
 
@@ -197,7 +195,8 @@ The new index entry tree replaces the existing entries: each previously-root sou
 - **No locking inside the consolidation primitive.** Concurrent writers race at the ref-update layer; one wins and the other's commit becomes unreachable. The queue worker serializes externally. (Notable.)
 - **Format-compliance retry uses the same shared header as the per-commit retry.** The strict-retry template is the per-commit/squash-consolidate template prepended with a single shared correction header that embeds the truncated previous response. (Notable.)
 - **Compliant-but-empty LLM response does NOT trigger a strict retry.** The LLM had its chance and produced nothing usable; retrying with the same input is unlikely to help. The mechanical fallback runs instead. (Surprising.)
-- **Ticket-id priority chain reuses the earliest-source value, not the first-encountered.** The fallback scans sources oldest-first to ensure a deterministic outcome regardless of caller order. (Notable.)
+- **Ticket-id priority chain reuses the earliest CONFORMING source value, not the first-encountered.** The fallback scans sources oldest-first for determinism regardless of caller order, and skips any source whose stored identifier fails the ticket whitelist — so a legacy bad value cannot win merely by being oldest, and a good value on a later source is reachable. (Notable.)
+- **The outer ticket hint is the one remaining way a non-conforming identifier is written.** The hint is never whitelist-checked and short-circuits the entire guarded chain. On the squash path this is harmless: the hint is derived by scanning the squash commit message with the substring pattern, and anything that pattern yields would satisfy the whitelist anyway. The **amend** path is the ingress — it supplies the previous summary's *stored* ticket id as the outer hint, so if that stored value is a legacy non-conforming string (a plan slug, a hash, a placeholder), it wins the chain unexamined and is re-persisted verbatim onto the new amend root, once per amend, indefinitely. (Amend's short-circuit writers, which skip consolidation entirely, copy the stored identifier straight across for the same net effect.) The read-time guards then hide it at the two surfaces that re-validate, which is why the value survives without ever being seen. (Surprising; real behavior.)
 - **All paths share one pipeline, on every surface.** A host-driven squash, a "merge --squash" via the standard squash-message file, and a `rebase --interactive` squash/fixup all converge on the same consolidation primitive; the user-visible result is identical no matter which host initiated it. The former JVM-based consolidation arm — and the whole set of parity gaps it carried (a flat source expansion, no outer-ticket-id hint, no note re-association, no strict retry, no orphaned-doc-id accumulation, and an LLM-less rebase-squash path) — is gone. There is nothing left to diverge. (Notable.)
 - **A host Squash button is a producer, not an implementation.** The JVM-hosted Squash action still resets and re-commits in process, and it still writes the squash-pending marker and the host-source marker before doing so — but it writes both **through the shared session-state layer**, so the marker files have one writer. The commit-message-preparation hook and the queue worker then recognize the squash and run the pipeline above. (Notable.)
 

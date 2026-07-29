@@ -9,11 +9,12 @@ Every command-line bridge call the IntelliJ plugin makes is served, when possibl
 **In scope:**
 - The single call entry point and its prefer-connection-then-fall-back decision, including the two exception classes that are rethrown rather than retried.
 - Project matching for a requested working directory, and the arbitrary-project fallback used by calls that have no project of their own.
-- The spawn shape, its environment marker, and the two hard failures that prevent it.
+- The spawn shape, the environment variables set on spawned children, the permissions of the one-shot capture file, and the two hard failures that prevent a spawn.
 - The handshake gate, its budget, and the exact protocol-string check.
 - Version-drift-triggered respawn and the atomicity it depends on.
 - Per-connection in-flight scoping, correlation-id allocation, and what happens when a connection's process dies.
-- The per-call budget.
+- The per-call budget, and the two timing diagnostics tied to it.
+- The optional correlation identifier carried on the request line, and its one-shot counterpart on the child environment.
 - The reader thread's routing rules, and the two grounded dead-letter cases.
 - The shutdown sequence and its stated platform rationale.
 
@@ -31,14 +32,19 @@ Every command-line bridge call the IntelliJ plugin makes is served, when possibl
 One line per call, newline-terminated:
 
 ```
-{"jsonrpc":"2.0","id":<positive integer>,"method":<action>,"params":{"cwd":<directory>,"request":<body>}}
+{"jsonrpc":"2.0","id":<positive integer>,"method":<action>,
+ "params":{"cwd":<directory>,"request":<body>,"traceId"?:<correlation identifier>}}
 ```
 
 Correlation ids come from a per-connection counter that starts at 1 and increments per call. A null or blank request body becomes `{}`. A request body that is valid JSON but **not** an object — an array, a string, a number — is rejected **client-side**, before anything is written, so it never reaches the server.
 
+`traceId` carries the host's ambient cross-log correlation identifier for the operation the call belongs to, and is **included only when it is non-null and non-blank** — a call made outside any such operation omits the field entirely rather than sending an empty one. The server adopts it for that action's duration so its own outbound platform requests are correlatable with the host's logs (spec 287).
+
 ### Per-call budget
 
 300 seconds by default, applied to both transports; callers may pass a shorter value. Nothing in the plugin marshals these calls off the UI thread on their behalf, so **a bridge call made on the UI thread can block for up to five minutes.**
+
+Two diagnostics exist precisely because of that: a round trip over the connection that exceeds **300 milliseconds** is logged at warning, naming the action, the elapsed time, and the **calling thread** (so a UI-thread caller is identifiable from the log alone); and the lazy spawn logs, at info, how long it blocked the caller that triggered it — a normal-path event, kept off the warning channel so it does not crowd out genuine failures.
 
 ### Failure mapping
 
@@ -52,9 +58,14 @@ Correlation ids come from a per-connection counter that starts at 1 and incremen
 
 The error-envelope mapping is identical for both transports, so a caller cannot tell from the exception which transport served it.
 
-### Environment marker
+### Environment variables on spawned children
 
-`JOLLI_IDE_BRIDGE_SERVE=1` is set on the spawned server process purely so it is identifiable in a process listing. Nothing reads it — it is a diagnostic marker, not a behavioral switch.
+Two, on different paths, and only one of them is inert:
+
+- **`JOLLI_IDE_BRIDGE_SERVE=1`, on the long-lived server spawn only.** Set purely so the process is identifiable in a process listing. **Nothing reads it** — *this one* is a diagnostic marker, not a behavioral switch.
+- **A correlation identifier, on the one-shot spawn only** (and only when the host is inside an operation scope, so the value is non-blank). Unlike the marker, **this one is read by the child**: the command-line entry point adopts it at startup, which is how a one-shot call gets the same cross-log correlation the long-lived path gets from the request line's `traceId` field. The long-lived server spawn does not receive it — it could not usefully, since one server serves many operations and the identifier is per call.
+
+The other two one-shot spawns this component makes (AI generation and Memory Bank migration) receive neither.
 
 ### Version stamp dependency
 
@@ -75,6 +86,8 @@ For every bridge call, in order:
 ### One-shot fallback
 
 Spawn the command-line entry in its one-shot bridge form with the action name and the working directory, redirecting output to a temporary file and discarding the error stream. Write the request body to the child's input and close it. Wait for the budget, force-terminating on expiry. Parse the **last non-blank line** of the captured output; map an `error` object to the business-error exception; treat a non-zero exit with no error envelope as a generic failure; otherwise return the result (or a JSON null when the response carried none).
+
+**The capture file is created owner-read/write-only on POSIX hosts**, not with the platform default. It has to be: a whole-callback authentication response travels through this file and carries a bearer token and a platform key, and the default creation path leaves the file world-readable for the life of the call on hosts with a shared temporary directory. On a non-POSIX filesystem, where the permission request is unsupported, it falls back to the default creation path — the per-user temporary directory there already restricts access at the access-control-list layer. The same helper is used for the AI-generation and Memory Bank migration capture files, which carry no credentials but can carry private summary and transcript content.
 
 ### Project matching
 

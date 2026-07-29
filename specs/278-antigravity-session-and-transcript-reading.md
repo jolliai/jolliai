@@ -54,6 +54,8 @@ Antigravity is considered installed only when both:
 
 On a runtime that lacks the embedded-database module, an informational log records the runtime's version and the reported node-version requirement, and installation is reported false without touching the filesystem for `.db` files.
 
+This predicate governs discovery, the status tree, and this spec's "not installed" reporting only. MCP registration asks a **distinct, presence-only** question about Antigravity — it drops the runtime gate and also accepts a bare variant root with no `conversations/` directory at all — so Antigravity can be reported "not installed" here in the same run in which it is registered as an MCP host. See spec 149; that looser variant rule belongs to it, not to this spec.
+
 ### Workspace-path recovery (`trajectory_metadata_blob`)
 
 The per-conversation database is queried for a single row: the `data` column of the `trajectory_metadata_blob` row whose id is the main record. The row's `data` is a protobuf-shaped binary blob. Rather than decode the full protobuf schema, the workspace path is recovered by a targeted byte scan:
