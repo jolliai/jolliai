@@ -360,5 +360,26 @@ export function buildSettingsCss(): string {
     color: var(--vscode-errorForeground);
     font-weight: 600;
   }
+  .push-control-list { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+  .push-control-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    /* No margin here: the list is a flex column with its own gap, so a per-row
+       margin would double the spacing between rows. */
+    padding: 6px 8px;
+    border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.35));
+    border-radius: 4px;
+  }
+  .push-control-row .pc-meta { display: flex; flex-direction: column; min-width: 0; }
+  .push-control-row .pc-name { font-weight: 600; }
+  .push-control-row .pc-path {
+    font-size: 0.85em;
+    color: var(--vscode-descriptionForeground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .push-control-row .pc-toggle { margin-left: auto; display: flex; align-items: center; gap: 6px; }
   `;
 }

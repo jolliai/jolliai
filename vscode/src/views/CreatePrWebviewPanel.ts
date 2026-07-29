@@ -26,7 +26,7 @@ import { track } from "../../../cli/src/core/Telemetry.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import { pushBranchMemoriesToSpace } from "../services/LiveShareController.js";
 import { ShareBindingError } from "../services/JolliPushOrchestrator.js";
-import { parseJolliApiKey, PluginOutdatedError } from "../services/JolliPushService.js";
+import { parseJolliApiKey, PluginOutdatedError, PushDisabledError } from "../services/JolliPushService.js";
 import {
 	findOpenPrForBranch,
 	findPrWithHistoryForBranch,
@@ -487,6 +487,15 @@ export class CreatePrWebviewPanel {
 				} else {
 					vscode.window.showErrorMessage("Sharing failed — could not bind a Memory space for this repo.");
 				}
+				return;
+			}
+			if (err instanceof PushDisabledError) {
+				// A deliberate per-repo opt-out (spec 306), NOT a failure — the PR is
+				// created and the memories stay recorded locally. Surface it as
+				// information, mirroring SummaryWebviewPanel's push button and
+				// IntelliJ's info dialog; a "sharing failed" warning would
+				// misrepresent the user's own choice as an error.
+				vscode.window.showInformationMessage(err.message);
 				return;
 			}
 			if (err instanceof PluginOutdatedError) {

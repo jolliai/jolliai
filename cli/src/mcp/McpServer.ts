@@ -76,7 +76,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	{
 		name: "push_memory",
 		description:
-			'Push this branch\'s JolliMemory commit summaries to the bound Jolli Space as articles. If the repo isn\'t bound yet, returns {"type":"binding_required"} with the available spaces — call again with `space` set (or use `bind_space` first) to bind and push.',
+			'Push this branch\'s JolliMemory commit summaries to the bound Jolli Space as articles. If the repo isn\'t bound yet, returns {"type":"binding_required"} with the available spaces — call again with `space` set (or use `bind_space` first) to bind and push. If the user has turned outbound push off for this repo, returns {"type":"push_disabled"} — memory is still recorded locally; this is a deliberate setting, so do not retry, and tell the user to re-enable it instead.',
 		inputSchema: {
 			type: "object",
 			properties: {

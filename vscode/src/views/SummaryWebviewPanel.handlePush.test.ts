@@ -276,6 +276,7 @@ const {
 	mockDeleteFromJolli,
 	MockPluginOutdatedError,
 	MockBindingRequiredError,
+	MockPushDisabledError,
 	mockParseJolliApiKey,
 } = vi.hoisted(() => {
 	class MockPluginOutdatedError extends Error {
@@ -292,11 +293,18 @@ const {
 			this.repoUrl = repoUrl;
 		}
 	}
+	class MockPushDisabledError extends Error {
+		constructor(msg = "Outbound push is disabled for this repo.") {
+			super(msg);
+			this.name = "PushDisabledError";
+		}
+	}
 	return {
 		mockPushToJolli: vi.fn().mockResolvedValue({ docId: 42 }),
 		mockDeleteFromJolli: vi.fn().mockResolvedValue(undefined),
 		MockPluginOutdatedError,
 		MockBindingRequiredError,
+		MockPushDisabledError,
 		mockParseJolliApiKey: vi
 			.fn()
 			.mockReturnValue({ u: "https://example.jolli.app" }),
@@ -308,7 +316,19 @@ vi.mock("../services/JolliPushService.js", () => ({
 	deleteFromJolli: mockDeleteFromJolli,
 	PluginOutdatedError: MockPluginOutdatedError,
 	BindingRequiredError: MockBindingRequiredError,
+	PushDisabledError: MockPushDisabledError,
 	parseJolliApiKey: mockParseJolliApiKey,
+}));
+
+// spec 306: the real orchestrator (spied above) now gates on the outbound-push
+// opt-out up front. Stub it allowed by default so these push tests don't hit
+// real git / the machine-global store; the gate's own logic is covered in
+// PushControl.test. A hoisted handle lets one test force the disabled path.
+const { mockIsOutboundPushAllowed } = vi.hoisted(() => ({
+	mockIsOutboundPushAllowed: vi.fn(async () => true),
+}));
+vi.mock("../../../cli/src/core/PushControl.js", () => ({
+	isOutboundPushAllowed: mockIsOutboundPushAllowed,
 }));
 
 const { mockGetCanonicalRepoUrl, mockDeriveRepoNameFromUrl } = vi.hoisted(
@@ -752,6 +772,29 @@ describe("SummaryWebviewPanel handlePush", () => {
 					error: "string rejection reason",
 				}),
 			);
+		});
+	});
+
+	// ── Test 8b: per-repo outbound push opt-out (spec 306) ────────────────────
+
+	describe("push-disabled repo (spec 306)", () => {
+		it("surfaces the opt-out as information, not a Push-failed error", async () => {
+			mockLoadConfig.mockResolvedValue({ apiKey: "test", jolliApiKey: "jk_valid" });
+			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+			// Force the gate closed for this push only.
+			mockIsOutboundPushAllowed.mockResolvedValueOnce(false);
+			const dispatch = await setupPanel();
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			// Shown as information (deliberate choice), never as a red "Push failed" error.
+			expect(showInformationMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Outbound push is disabled"),
+			);
+			expect(showErrorMessage).not.toHaveBeenCalled();
+			// Nothing left the machine.
+			expect(mockPushToJolli).not.toHaveBeenCalled();
 		});
 	});
 

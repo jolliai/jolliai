@@ -322,6 +322,23 @@ describe("runSpaceSyncStep", () => {
 		expect(logSpy).toHaveBeenCalledWith("  No Jolli Spaces available to you — create one in the Jolli web app");
 	});
 
+	it("guides the user to an administrator when no_spaces is restricted (repo allowlisted on none)", async () => {
+		// Spaces exist but every one repo-allowlists and this repo is on none —
+		// same admin-action-required condition as the push path's 412
+		// repo_not_allowlisted, so "create a Space" would be wrong guidance.
+		const { client } = makeClient({
+			frontDoor: vi.fn().mockResolvedValue({ status: "no_spaces", restricted: true }),
+		});
+
+		await runSpaceSyncStep("/repo", { client });
+
+		expect(logSpy).toHaveBeenCalledWith(
+			"  This repo isn't registered in any Jolli Space — ask an administrator to add it in the Space's settings",
+		);
+		expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("create one"));
+		expect(h.clearCache).toHaveBeenCalled();
+	});
+
 	it("falls back to a generic no-Spaces hint when the api key site URL is unparseable", async () => {
 		h.parseJolliApiKey.mockReturnValue({ u: "not a url" });
 		const { client } = makeClient({ frontDoor: vi.fn().mockResolvedValue({ status: "no_spaces" }) });

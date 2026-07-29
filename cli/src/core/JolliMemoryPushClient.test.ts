@@ -300,9 +300,13 @@ describe("frontDoor", () => {
 		const c = client(async () => jsonResponse(200, { status: "unbound" }));
 		await expect(c.frontDoor(args)).resolves.toEqual({ status: "unbound", spaces: [], defaultSpaceId: null });
 	});
-	it("returns no_spaces", async () => {
+	it("returns no_spaces (restricted defaults to false when the server omits it)", async () => {
 		const c = client(async () => jsonResponse(200, { status: "no_spaces" }));
-		await expect(c.frontDoor(args)).resolves.toEqual({ status: "no_spaces" });
+		await expect(c.frontDoor(args)).resolves.toEqual({ status: "no_spaces", restricted: false });
+	});
+	it("carries restricted: true on no_spaces (Spaces exist but this repo is allowlisted on none)", async () => {
+		const c = client(async () => jsonResponse(200, { status: "no_spaces", restricted: true }));
+		await expect(c.frontDoor(args)).resolves.toEqual({ status: "no_spaces", restricted: true });
 	});
 	it("maps 426 to ClientOutdatedError", async () => {
 		const c = client(async () => jsonResponse(426, { error: "client_outdated" }));
@@ -519,6 +523,20 @@ describe("push", () => {
 		await expect(
 			c.push({ title: "t", content: "c", commitHash: "abc1234", docType: "summary" }),
 		).rejects.toMatchObject({ repoUrl: "" });
+	});
+	it("maps 412 repo_not_allowlisted to PermissionDeniedError (the allowlist refusal, NOT 403)", async () => {
+		const c = client(async () =>
+			jsonResponse(412, {
+				error: "repo_not_allowlisted",
+				message: "Ask an administrator to add this repo to the Space.",
+			}),
+		);
+		await expect(
+			c.push({ title: "t", content: "c", commitHash: "abc1234", docType: "summary" }),
+		).rejects.toMatchObject({
+			name: "PermissionDeniedError",
+			message: "Ask an administrator to add this repo to the Space.",
+		});
 	});
 	it("maps 426 to ClientOutdatedError", async () => {
 		const c = client(async () => jsonResponse(426, { error: "client_outdated" }));
@@ -1230,6 +1248,11 @@ describe("pushBatch", () => {
 			jsonResponse(412, { error: "binding_required", repoUrl: "https://github.com/acme/repo" }),
 		);
 		await expect(c.pushBatch(payload)).rejects.toBeInstanceOf(BindingRequiredError);
+	});
+
+	it("maps 412 repo_not_allowlisted to PermissionDeniedError (the allowlist refusal, NOT 403)", async () => {
+		const c = client(async () => jsonResponse(412, { error: "repo_not_allowlisted" }));
+		await expect(c.pushBatch(payload)).rejects.toBeInstanceOf(PermissionDeniedError);
 	});
 
 	it("maps 401 to NotAuthenticatedError", async () => {

@@ -21,6 +21,7 @@ import {
 	pushSummary,
 } from "./JolliMemoryPushOrchestrator.js";
 import { loadBranchSummaries } from "./PrDescription.js";
+import { isOutboundPushAllowed } from "./PushControl.js";
 import { classifyError, processPrePushInline, processPushPending, triggerPushForNewSummaries } from "./PushExecutor.js";
 import { claimForPush, loadPushPending, type PushPendingEntry, updateBatch } from "./PushPendingStore.js";
 import { loadConfig } from "./SessionTracker.js";
@@ -38,6 +39,15 @@ vi.mock("./SummaryStore.js", () => ({
 vi.mock("./StorageFactory.js", () => ({ createStorage: vi.fn() }));
 vi.mock("./GitOps.js", () => ({ execGit: vi.fn(), getCurrentBranch: vi.fn(), getDefaultBranch: vi.fn() }));
 vi.mock("./GitRemoteUtils.js", () => ({ getCanonicalRepoUrl: vi.fn() }));
+// Spreads the real module on purpose: `classifyError` and the per-commit catch
+// construct/branch on the REAL `PushDisabledError`. A bare factory omitting it
+// makes the binding `undefined`, so `instanceof` throws a TypeError that the
+// surrounding catch swallows — a missing mock entry becoming silently wrong
+// control flow rather than a visible failure.
+vi.mock("./PushControl.js", async (orig) => ({
+	...(await orig<typeof import("./PushControl.js")>()),
+	isOutboundPushAllowed: vi.fn(),
+}));
 vi.mock("./PrDescription.js", () => ({ loadBranchSummaries: vi.fn() }));
 vi.mock("./PushPendingStore.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./PushPendingStore.js")>();
@@ -150,6 +160,7 @@ beforeEach(() => {
 	vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
 	vi.mocked(execGit).mockResolvedValue({ stdout: "", stderr: "", exitCode: 1 });
 	vi.mocked(getCanonicalRepoUrl).mockResolvedValue("https://github.com/acme/repo");
+	vi.mocked(isOutboundPushAllowed).mockResolvedValue(true);
 	vi.mocked(getSummary).mockImplementation(async (hash: string) => summary(hash));
 	vi.mocked(loadBranchSummaries).mockResolvedValue({
 		summaries: [summary(HASH_A), summary(HASH_B)],
@@ -219,6 +230,102 @@ describe("processPushPending", () => {
 		const r = await processPushPending(CWD, { source: "activation", client: fakeClient() });
 		expect(r.note).toBe("not signed in");
 		expect(updateBatch).not.toHaveBeenCalled();
+	});
+
+	it("keeps entries and no-ops when push is disabled for the repo (Story 2)", async () => {
+		vi.mocked(isOutboundPushAllowed).mockResolvedValue(false);
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const r = await processPushPending(CWD, { source: "activation", client: fakeClient() });
+		expect(r.note).toBe("push disabled for this repo");
+		expect(pushSummary).not.toHaveBeenCalled();
+		expect(updateBatch).not.toHaveBeenCalled();
+	});
+
+	// The entry gate runs once, before the loop. A toggle DURING the drain must stop
+	// the remaining sends too — VS Code re-checks inside its HTTP client and IntelliJ
+	// inside the bridge, and this is the native CLI's equivalent. Critically the held
+	// entry must stay pending with no attempt recorded: marking it failed (or burning a
+	// retry) would punish the user for their own setting and could exhaust the budget.
+	it("holds the remaining entries — no failure, no retry burn — when disabled mid-drain (Story 2)", async () => {
+		vi.mocked(loadPushPending).mockResolvedValue({
+			version: 1,
+			entries: { [HASH_A]: entry(), [HASH_B]: entry() },
+		});
+		// Allowed at the drain's entry gate, revoked before any per-commit send.
+		vi.mocked(isOutboundPushAllowed).mockResolvedValueOnce(true).mockResolvedValue(false);
+
+		const r = await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		expect(pushSummary).not.toHaveBeenCalled();
+		expect(r.failed).toBe(0);
+		// Every patch written is claim-release-ONLY (`patch: {}`). An empty patch is
+		// what distinguishes "held" from "failed": `updateBatch` clears `claimedAt` and
+		// touches nothing else, so no `lastError` is recorded and no retry is burned.
+		const patches = vi
+			.mocked(updateBatch)
+			.mock.calls.flatMap(([, updates]) => [...updates.values()])
+			.filter((u) => u.kind === "patch");
+		expect(patches).toEqual([
+			{ kind: "patch", patch: {} },
+			{ kind: "patch", patch: {} },
+		]);
+	});
+
+	// Regression: the claim release above is not cosmetic. `applyPushDisabled` fires the
+	// re-enable drain the moment the user toggles push back on, and that drain is ONE
+	// detached pass with no retry of its own — so a claim this run left behind makes
+	// `claimForPush` skip the entry (claims are honoured for CLAIM_STALE_MS = 5 min) and
+	// the backlog sits until some unrelated later trigger. The mirror site in
+	// `processPrePushInline` already released; this one silently did not.
+	it("releases the claim on every held entry so the re-enable drain can re-claim immediately", async () => {
+		vi.mocked(loadPushPending).mockResolvedValue({
+			version: 1,
+			entries: { [HASH_A]: entry(), [HASH_B]: entry() },
+		});
+		vi.mocked(isOutboundPushAllowed).mockResolvedValueOnce(true).mockResolvedValue(false);
+
+		await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		const flushed = vi.mocked(updateBatch).mock.calls.at(-1)?.[1];
+		expect(flushed?.get(HASH_A)).toEqual({ kind: "patch", patch: {} });
+		expect(flushed?.get(HASH_B)).toEqual({ kind: "patch", patch: {} });
+	});
+
+	it("releases the claim when the per-commit gate holds an individual-fallback push", async () => {
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		// Batch-ineligible → the legacy per-commit fallback, whose own gate is the one
+		// under test here (the batch loop never runs: there are no eligible groups).
+		vi.mocked(buildBatchItems).mockImplementation(async (summaries) =>
+			summaries.map((s) => ({ ...builtItem(s.commitHash), batchIneligibleReason: "attachment too large" })),
+		);
+		vi.mocked(isOutboundPushAllowed).mockResolvedValueOnce(true).mockResolvedValue(false);
+
+		const r = await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		expect(pushSummary).not.toHaveBeenCalled();
+		expect(r.pushed).toBe(0);
+		expect(r.failed).toBe(0);
+		const flushed = vi.mocked(updateBatch).mock.calls.at(-1)?.[1];
+		expect(flushed?.get(HASH_A)).toEqual({ kind: "patch", patch: {} });
+	});
+
+	it("releases the claim when the orchestrator's own live re-check rejects a fallback push", async () => {
+		const { PushDisabledError } = await import("./PushControl.js");
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		vi.mocked(buildBatchItems).mockImplementation(async (summaries) =>
+			summaries.map((s) => ({ ...builtItem(s.commitHash), batchIneligibleReason: "attachment too large" })),
+		);
+		// Both gates pass; the toggle lands between the attachment sends, so the refusal
+		// arrives as the orchestrator's typed error instead.
+		vi.mocked(pushSummary).mockRejectedValue(new PushDisabledError());
+
+		const r = await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		// Held, not failed — and no retry burned, which is what the empty patch proves.
+		expect(r.pushed).toBe(0);
+		expect(r.failed).toBe(0);
+		const flushed = vi.mocked(updateBatch).mock.calls.at(-1)?.[1];
+		expect(flushed?.get(HASH_A)).toEqual({ kind: "patch", patch: {} });
 	});
 
 	it("skips entries that exhausted the retry budget", async () => {
@@ -814,6 +921,18 @@ describe("processPrePushInline", () => {
 			client: fakeBatchClient(vi.fn()),
 		});
 		expect(r.note).toBe("not signed in");
+		expect(updateBatch).not.toHaveBeenCalled();
+	});
+
+	it("keeps entries untouched when push is disabled for the repo (Story 2)", async () => {
+		vi.mocked(isOutboundPushAllowed).mockResolvedValue(false);
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const r = await processPrePushInline(CWD, {
+			priorityHashes: [HASH_A],
+			deadlineAt: farDeadline(),
+			client: fakeBatchClient(vi.fn()),
+		});
+		expect(r.note).toBe("push disabled for this repo");
 		expect(updateBatch).not.toHaveBeenCalled();
 	});
 

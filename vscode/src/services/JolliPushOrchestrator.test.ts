@@ -10,6 +10,13 @@ const { mockReadPlan, mockReadNote, mockReadReference } = vi.hoisted(() => ({
 	mockReadNote: vi.fn(),
 	mockReadReference: vi.fn(),
 }));
+// spec 306: the outbound-push gate. Default allowed; the fail-fast test flips it.
+const { mockIsOutboundPushAllowed } = vi.hoisted(() => ({
+	mockIsOutboundPushAllowed: vi.fn(async () => true),
+}));
+vi.mock("../../../cli/src/core/PushControl.js", () => ({
+	isOutboundPushAllowed: mockIsOutboundPushAllowed,
+}));
 
 // Stub only the network functions; keep BindingRequiredError / PluginOutdatedError real (instanceof).
 vi.mock("./JolliPushService.js", async (importActual) => {
@@ -27,7 +34,12 @@ vi.mock("../util/Logger.js", () => ({
 	log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { BindingRequiredError, PluginOutdatedError } from "./JolliPushService.js";
+import {
+	BindingRequiredError,
+	PermissionDeniedError,
+	PluginOutdatedError,
+	PushDisabledError,
+} from "./JolliPushService.js";
 import {
 	type BindingOutcome,
 	type PushContext,
@@ -65,6 +77,7 @@ beforeEach(() => {
 	mockReadPlan.mockResolvedValue("plan body");
 	mockReadNote.mockResolvedValue("note body");
 	mockReadReference.mockResolvedValue(null);
+	mockIsOutboundPushAllowed.mockResolvedValue(true);
 });
 
 describe("pushSummaryWithAttachments", () => {
@@ -78,6 +91,15 @@ describe("pushSummaryWithAttachments", () => {
 		expect(result.isUpdate).toBe(false);
 		expect(result.attachmentCount).toBe(0);
 		expect(ctx.storeSummary).toHaveBeenCalledWith(expect.objectContaining({ jolliDocId: 100 }), true);
+	});
+
+	it("fails fast with PushDisabledError and uploads nothing when the repo opted out (spec 306)", async () => {
+		mockIsOutboundPushAllowed.mockResolvedValue(false);
+		const ctx = makeContext();
+		await expect(pushSummaryWithAttachments(makeSummary(), ctx)).rejects.toBeInstanceOf(PushDisabledError);
+		// No attachment or summary push was attempted, and nothing was persisted.
+		expect(mockPushToJolli).not.toHaveBeenCalled();
+		expect(ctx.storeSummary).not.toHaveBeenCalled();
 	});
 
 	it("writes back a doc URL whose origin keys to the current push env", async () => {
@@ -99,6 +121,7 @@ describe("pushSummaryWithAttachments", () => {
 			expect.anything(),
 			expect.anything(),
 			expect.objectContaining({ docType: "summary", docId: 7 }),
+			expect.anything(),
 		);
 	});
 
@@ -118,7 +141,7 @@ describe("pushSummaryWithAttachments", () => {
 		await pushSummaryWithAttachments(summary, makeContext(), { plans: [], notes: [] });
 		// Only the summary doc is pushed — the summary's own plan is NOT, because the selection was empty.
 		expect(mockPushToJolli).toHaveBeenCalledTimes(1);
-		expect(mockPushToJolli).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ docType: "summary" }));
+		expect(mockPushToJolli).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ docType: "summary" }), expect.anything());
 	});
 
 	it("pushes a chosen plan with its resolved docId and returns it keyed by slug", async () => {
@@ -132,7 +155,7 @@ describe("pushSummaryWithAttachments", () => {
 		expect(result.pushedDoc.plans).toEqual([{ slug: "p-abc12345", title: "Plan", docId: 200, url: "https://acme.jolli.ai/articles?doc=200" }]);
 		expect(result.attachmentCount).toBe(1);
 		// The plan push reused the known docId so the Space doc updates in place.
-		expect(mockPushToJolli).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ docType: "plan", docId: 200 }));
+		expect(mockPushToJolli).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ docType: "plan", docId: 200 }), expect.anything());
 	});
 
 	it("collects a per-attachment failure without aborting the summary push", async () => {
@@ -180,6 +203,7 @@ describe("pushSummaryWithAttachments", () => {
 			expect.anything(),
 			expect.anything(),
 			expect.objectContaining({ docType: "reference", title: "Linear · ENG-1 — Fix bug" }),
+			expect.anything(),
 		);
 		expect(result.pushedDoc.references).toEqual([
 			{ archivedKey: "linear:ENG-1-a1b2c3d4", baseKey: "linear:ENG-1", title: "Linear · ENG-1 — Fix bug", docId: 400, url: "https://acme.jolli.ai/articles?doc=400" },
@@ -299,6 +323,40 @@ describe("pushSummaryWithAttachments", () => {
 		).rejects.toBeInstanceOf(PluginOutdatedError);
 		// Not a binding problem — the chooser must not open.
 		expect(ctx.resolveBinding).not.toHaveBeenCalled();
+	});
+
+	it("propagates a permission refusal from a plan push instead of collecting it", async () => {
+		// `repo_not_allowlisted` / ownership mismatch is a REPO-WIDE verdict: the
+		// summary and every remaining attachment would be refused identically.
+		// Collecting it would label a repo-wide condition as 'plan "Plan" failed'
+		// and then fire the doomed summary request anyway.
+		mockPushToJolli.mockImplementation((_b, _k, p: { docType: string }) => {
+			if (p.docType === "plan") return Promise.reject(new PermissionDeniedError("repo not allowlisted"));
+			return Promise.resolve({ docId: 100 });
+		});
+		const plan = { slug: "p-abc12345", title: "Plan", addedAt: "t", updatedAt: "t" };
+		const ctx = makeContext();
+		await expect(
+			pushSummaryWithAttachments(makeSummary({ plans: [plan] }), ctx, { plans: [plan], notes: [] }),
+		).rejects.toBeInstanceOf(PermissionDeniedError);
+		// Only the doomed plan was attempted — no summary push followed it.
+		expect(mockPushToJolli).toHaveBeenCalledOnce();
+		expect(ctx.resolveBinding).not.toHaveBeenCalled();
+	});
+
+	it("propagates a mid-push opt-out from a note push instead of collecting it", async () => {
+		// The HTTP client re-reads the flag per call so a mid-push opt-out takes
+		// effect immediately (spec 306). That makes PushDisabledError reachable in
+		// the attachment loop even though pushSummaryWithAttachments fails fast on
+		// entry — and when it fires it must abort, not become a note failure.
+		mockPushToJolli.mockImplementation((_b, _k, p: { docType: string }) => {
+			if (p.docType === "note") return Promise.reject(new PushDisabledError());
+			return Promise.resolve({ docId: 100 });
+		});
+		const note = { id: "n1", title: "Note", format: "markdown" as const, addedAt: "t", updatedAt: "t" };
+		await expect(
+			pushSummaryWithAttachments(makeSummary(), makeContext(), { plans: [], notes: [note] }),
+		).rejects.toBeInstanceOf(PushDisabledError);
 	});
 
 	it("stringifies a non-Error plan failure into the collected message", async () => {

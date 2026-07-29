@@ -16,7 +16,15 @@ interface MockClientRequest {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/** Creates a mock IncomingMessage that emits data chunks then 'end'. */
+/**
+ * Creates a mock IncomingMessage that emits data chunks then 'end'.
+ *
+ * Emission is scheduled when the consumer registers its `end` listener (rather
+ * than eagerly at creation): by then pushToJolli has attached both `data` and
+ * `end` handlers. This is robust against the outbound-push gate's extra `await`,
+ * which reorders microtasks — a creation-time pre-scheduled emit would fire
+ * before the listeners attach and hang the test.
+ */
 function createMockResponse(
 	statusCode: number,
 	body: string,
@@ -32,23 +40,22 @@ function createMockResponse(
 				listeners[event] = [];
 			}
 			listeners[event].push(cb);
+			if (event === "end") {
+				queueMicrotask(() => {
+					if (body && listeners.data) {
+						for (const dataCb of listeners.data) {
+							dataCb(Buffer.from(body));
+						}
+					}
+					for (const endCb of listeners.end ?? []) {
+						endCb();
+					}
+				});
+			}
 			return res;
 		}),
 		resume: vi.fn(),
 	};
-	// Schedule data + end emission after the callback registers listeners
-	queueMicrotask(() => {
-		if (body && listeners.data) {
-			for (const cb of listeners.data) {
-				cb(Buffer.from(body));
-			}
-		}
-		if (listeners.end) {
-			for (const cb of listeners.end) {
-				cb();
-			}
-		}
-	});
 	return res;
 }
 
@@ -95,6 +102,14 @@ vi.mock("node:https", () => ({
 	request: mockHttpsRequest,
 }));
 
+// spec 306: the outbound-push gate. Default allowed; individual gate tests flip it.
+const { mockIsOutboundPushAllowed } = vi.hoisted(() => ({
+	mockIsOutboundPushAllowed: vi.fn(async () => true),
+}));
+vi.mock("../../../cli/src/core/PushControl.js", () => ({
+	isOutboundPushAllowed: mockIsOutboundPushAllowed,
+}));
+
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
 import { VSCODE_CLIENT_INFO } from "./ClientInfo.js";
@@ -103,9 +118,11 @@ import {
 	BindingAlreadyExistsError,
 	BindingRequiredError,
 	deleteFromJolli,
+	PermissionDeniedError,
 	PluginOutdatedError,
 	parseJolliApiKey,
 	pushToJolli,
+	PushDisabledError,
 } from "./JolliPushService.js";
 
 // ─── Helpers for API keys ───────────────────────────────────────────────────
@@ -132,6 +149,14 @@ const DEFAULT_PAYLOAD: JolliPushPayload = {
 	docType: "summary",
 	branch: "main",
 };
+
+/**
+ * A sentinel workspace path for the now-required `cwd` gate argument. These
+ * request/response-shape tests don't care about the opt-out, so the mocked
+ * `isOutboundPushAllowed` (below) resolves true by default; the two dedicated
+ * gate tests flip it to false.
+ */
+const WS = "/ws";
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -208,6 +233,9 @@ describe("parseJolliApiKey", () => {
 describe("pushToJolli", () => {
 	beforeEach(() => {
 		vi.resetAllMocks();
+		// resetAllMocks clears the hoisted implementation, so restore the default
+		// "push allowed" here; the gate tests override it per-case.
+		mockIsOutboundPushAllowed.mockResolvedValue(true);
 	});
 
 	it("succeeds with HTTPS and 2xx response", async () => {
@@ -235,6 +263,7 @@ describe("pushToJolli", () => {
 			"https://acme.jolli.ai",
 			OLD_KEY,
 			DEFAULT_PAYLOAD,
+			WS,
 		);
 		expect(result).toEqual({
 			url: "https://acme.jolli.ai/doc/1",
@@ -281,10 +310,15 @@ describe("pushToJolli", () => {
 		);
 
 		for (const docType of ["summary", "plan", "note"] as const) {
-			await pushToJolli("https://acme.jolli.ai", OLD_KEY, {
-				...DEFAULT_PAYLOAD,
-				docType,
-			});
+			await pushToJolli(
+				"https://acme.jolli.ai",
+				OLD_KEY,
+				{
+					...DEFAULT_PAYLOAD,
+					docType,
+				},
+				WS,
+			);
 		}
 
 		expect(writtenBodies).toHaveLength(3);
@@ -319,15 +353,25 @@ describe("pushToJolli", () => {
 		);
 
 		const summaryJson = JSON.stringify({ version: 4, commitHash: "abc123" });
-		await pushToJolli("https://acme.jolli.ai", OLD_KEY, {
-			...DEFAULT_PAYLOAD,
-			docType: "summary",
-			summaryJson,
-		});
-		await pushToJolli("https://acme.jolli.ai", OLD_KEY, {
-			...DEFAULT_PAYLOAD,
-			docType: "summary",
-		});
+		await pushToJolli(
+			"https://acme.jolli.ai",
+			OLD_KEY,
+			{
+				...DEFAULT_PAYLOAD,
+				docType: "summary",
+				summaryJson,
+			},
+			WS,
+		);
+		await pushToJolli(
+			"https://acme.jolli.ai",
+			OLD_KEY,
+			{
+				...DEFAULT_PAYLOAD,
+				docType: "summary",
+			},
+			WS,
+		);
 
 		expect(writtenBodies).toHaveLength(2);
 		const withField = JSON.parse(writtenBodies[0]) as Record<string, unknown>;
@@ -356,6 +400,7 @@ describe("pushToJolli", () => {
 			"https://acme.jolli.ai",
 			OLD_KEY,
 			DEFAULT_PAYLOAD,
+			WS,
 		).catch((e: unknown) => e);
 		expect(err).toBeInstanceOf(PluginOutdatedError);
 		expect((err as Error).message).toBe("Please update your plugin.");
@@ -378,7 +423,7 @@ describe("pushToJolli", () => {
 		);
 
 		await expect(
-			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD),
+			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS),
 		).rejects.toThrow(
 			"Plugin version is outdated. Please update to the latest version.",
 		);
@@ -401,7 +446,7 @@ describe("pushToJolli", () => {
 		);
 
 		await expect(
-			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD),
+			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS),
 		).rejects.toThrow("Forbidden");
 	});
 
@@ -422,7 +467,7 @@ describe("pushToJolli", () => {
 		);
 
 		await expect(
-			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD),
+			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS),
 		).rejects.toThrow("HTTP 500");
 	});
 
@@ -442,7 +487,7 @@ describe("pushToJolli", () => {
 		);
 
 		await expect(
-			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD),
+			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS),
 		).rejects.toThrow(/Invalid JSON response \(HTTP 200\): not json at all/);
 	});
 
@@ -462,7 +507,7 @@ describe("pushToJolli", () => {
 		);
 
 		await expect(
-			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD),
+			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS),
 		).rejects.toThrow("Network error: ECONNREFUSED");
 	});
 
@@ -487,7 +532,7 @@ describe("pushToJolli", () => {
 			},
 		);
 
-		await pushToJolli("https://jolli.ai/test1/", OLD_KEY, DEFAULT_PAYLOAD);
+		await pushToJolli("https://jolli.ai/test1/", OLD_KEY, DEFAULT_PAYLOAD, WS);
 
 		const callArgs = mockHttpsRequest.mock.calls[0] as [
 			unknown,
@@ -517,7 +562,7 @@ describe("pushToJolli", () => {
 			},
 		);
 
-		await pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD);
+		await pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS);
 
 		const callArgs = mockHttpsRequest.mock.calls[0] as [
 			unknown,
@@ -552,7 +597,7 @@ describe("pushToJolli", () => {
 			},
 		);
 
-		await pushToJolli("https://acme.jolli.ai", keyWithOrg, DEFAULT_PAYLOAD);
+		await pushToJolli("https://acme.jolli.ai", keyWithOrg, DEFAULT_PAYLOAD, WS);
 
 		const callArgs = mockHttpsRequest.mock.calls[0] as [
 			unknown,
@@ -583,7 +628,7 @@ describe("pushToJolli", () => {
 			},
 		);
 
-		await pushToJolli("https://acme.jolli.ai", keyNoOrg, DEFAULT_PAYLOAD);
+		await pushToJolli("https://acme.jolli.ai", keyNoOrg, DEFAULT_PAYLOAD, WS);
 
 		const callArgs = mockHttpsRequest.mock.calls[0] as [
 			unknown,
@@ -614,14 +659,14 @@ describe("pushToJolli", () => {
 			},
 		);
 
-		const result = await pushToJolli(undefined, keyWithUrl, DEFAULT_PAYLOAD);
+		const result = await pushToJolli(undefined, keyWithUrl, DEFAULT_PAYLOAD, WS);
 		expect(result.docId).toBe(1);
 		expect(mockHttpsRequest).toHaveBeenCalledOnce();
 	});
 
 	it("rejects with clear error when no baseUrl and old key", async () => {
 		await expect(
-			pushToJolli(undefined, OLD_KEY, DEFAULT_PAYLOAD),
+			pushToJolli(undefined, OLD_KEY, DEFAULT_PAYLOAD, WS),
 		).rejects.toThrow(/Jolli site URL could not be determined/);
 	});
 
@@ -646,7 +691,7 @@ describe("pushToJolli", () => {
 			},
 		);
 
-		await pushToJolli("http://localhost:7034", OLD_KEY, DEFAULT_PAYLOAD);
+		await pushToJolli("http://localhost:7034", OLD_KEY, DEFAULT_PAYLOAD, WS);
 		expect(mockHttpRequest).toHaveBeenCalledOnce();
 		expect(mockHttpsRequest).not.toHaveBeenCalled();
 	});
@@ -674,6 +719,7 @@ describe("pushToJolli", () => {
 			"https://acme.jolli.ai",
 			OLD_KEY,
 			DEFAULT_PAYLOAD,
+			WS,
 		).catch((e: unknown) => e);
 		expect(err).toBeInstanceOf(BindingRequiredError);
 		expect((err as BindingRequiredError).repoUrl).toBe(
@@ -705,6 +751,7 @@ describe("pushToJolli", () => {
 			"https://acme.jolli.ai",
 			OLD_KEY,
 			payload,
+			WS,
 		).catch((e: unknown) => e);
 		expect(err).toBeInstanceOf(BindingRequiredError);
 		expect((err as BindingRequiredError).repoUrl).toBe(
@@ -733,6 +780,7 @@ describe("pushToJolli", () => {
 			"https://acme.jolli.ai",
 			OLD_KEY,
 			DEFAULT_PAYLOAD,
+			WS,
 		).catch((e: unknown) => e);
 		expect(err).toBeInstanceOf(BindingRequiredError);
 		expect((err as BindingRequiredError).repoUrl).toBe("");
@@ -758,6 +806,7 @@ describe("pushToJolli", () => {
 			"https://acme.jolli.ai",
 			OLD_KEY,
 			DEFAULT_PAYLOAD,
+			WS,
 		).catch((e: unknown) => e);
 		expect(err).not.toBeInstanceOf(BindingRequiredError);
 		expect((err as Error).message).toBe("precondition_failed (HTTP 412)");
@@ -789,6 +838,7 @@ describe("pushToJolli", () => {
 			"https://acme.jolli.ai",
 			OLD_KEY,
 			DEFAULT_PAYLOAD,
+			WS,
 		).catch((e: unknown) => e);
 		expect(err).toBeInstanceOf(BindingAlreadyExistsError);
 		expect((err as BindingAlreadyExistsError).winner.jmSpaceId).toBe(42);
@@ -817,9 +867,154 @@ describe("pushToJolli", () => {
 			"https://acme.jolli.ai",
 			OLD_KEY,
 			DEFAULT_PAYLOAD,
+			WS,
 		).catch((e: unknown) => e);
 		expect(err).not.toBeInstanceOf(BindingAlreadyExistsError);
 		expect((err as Error).message).toBe("conflict (HTTP 409)");
+	});
+
+	it("throws PermissionDeniedError on 412 repo_not_allowlisted with the server's message (cross-client parity)", async () => {
+		// The allowlist refusal is a 412 (NOT 403 — that status is the bind path's
+		// space_restricted). It must map to PermissionDeniedError, not the generic
+		// "(HTTP 412)" branch, so callers stop retrying.
+		const responseBody = JSON.stringify({
+			error: "repo_not_allowlisted",
+			message: "Ask an administrator to add this repo to the Space.",
+		});
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(412, responseBody);
+		mockHttpsRequest.mockImplementation((_u: unknown, _o: unknown, cb: (r: MockIncomingMessage) => void) => {
+			cb(mockRes);
+			return mockReq;
+		});
+
+		const err = await pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(PermissionDeniedError);
+		// The full sentence, not the bare slug.
+		expect((err as Error).message).toBe("Ask an administrator to add this repo to the Space.");
+	});
+
+	it("falls back to the error slug on 412 repo_not_allowlisted when no message is present", async () => {
+		const responseBody = JSON.stringify({ error: "repo_not_allowlisted" });
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(412, responseBody);
+		mockHttpsRequest.mockImplementation((_u: unknown, _o: unknown, cb: (r: MockIncomingMessage) => void) => {
+			cb(mockRes);
+			return mockReq;
+		});
+
+		const err = await pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(PermissionDeniedError);
+		expect((err as Error).message).toBe("repo_not_allowlisted");
+	});
+
+	it("throws PermissionDeniedError on a push-path 403 (ownership mismatch), cross-client parity", async () => {
+		// On the push path a 403 is an ownership mismatch (doc belongs to another
+		// user). The server's sentence is surfaced; a proxy/gateway 403 with a
+		// non-JSON body still maps to PermissionDeniedError with the default
+		// sentence, not a generic "Invalid JSON response" — the branch decides on
+		// status alone (matching the CLI).
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(403, "Forbidden");
+		mockHttpsRequest.mockImplementation((_u: unknown, _o: unknown, cb: (r: MockIncomingMessage) => void) => {
+			cb(mockRes);
+			return mockReq;
+		});
+
+		const err = await pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(PermissionDeniedError);
+		expect((err as Error).message).toBe("You don't have permission to push to this Space.");
+	});
+
+	it("prefers message over the error slug in the generic branch (cross-client parity)", async () => {
+		const responseBody = JSON.stringify({ error: "some_slug", message: "A human sentence." });
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(400, responseBody);
+		mockHttpsRequest.mockImplementation((_u: unknown, _o: unknown, cb: (r: MockIncomingMessage) => void) => {
+			cb(mockRes);
+			return mockReq;
+		});
+
+		const err = await pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS).catch((e: unknown) => e);
+		expect((err as Error).message).toBe("A human sentence. (HTTP 400)");
+	});
+
+	it("keeps a snippet of an UNPARSEABLE non-2xx body, collapsed to one line", async () => {
+		// Branching on status before parsing (so a proxy 403 maps correctly) makes
+		// non-JSON bodies reachable in the generic branch too. Those bodies are the
+		// CDN / WAF / gateway case, and the HTML is the only thing naming which
+		// intermediary refused — a bare "request failed (HTTP 502)" is undebuggable.
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(502, "<html>\n  <title>502 Bad Gateway</title>\n</html>");
+		mockHttpsRequest.mockImplementation((_u: unknown, _o: unknown, cb: (r: MockIncomingMessage) => void) => {
+			cb(mockRes);
+			return mockReq;
+		});
+
+		const err = await pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS).catch((e: unknown) => e);
+		expect((err as Error).message).toBe("<html> <title>502 Bad Gateway</title> </html> (HTTP 502)");
+	});
+
+	it("truncates a very long unparseable body instead of dumping the page", async () => {
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(500, "x".repeat(5000));
+		mockHttpsRequest.mockImplementation((_u: unknown, _o: unknown, cb: (r: MockIncomingMessage) => void) => {
+			cb(mockRes);
+			return mockReq;
+		});
+
+		const err = await pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS).catch((e: unknown) => e);
+		expect((err as Error).message).toBe(`${"x".repeat(200)}… (HTTP 500)`);
+	});
+
+	it("falls back to 'request failed' when a non-2xx body is empty", async () => {
+		// Nothing to quote — the static fallback is correct here, and this is the
+		// case the snippet fallback must NOT turn into an empty-string message.
+		const mockReq = createMockRequest();
+		const mockRes = createMockResponse(503, "");
+		mockHttpsRequest.mockImplementation((_u: unknown, _o: unknown, cb: (r: MockIncomingMessage) => void) => {
+			cb(mockRes);
+			return mockReq;
+		});
+
+		const err = await pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS).catch((e: unknown) => e);
+		expect((err as Error).message).toBe("request failed (HTTP 503)");
+	});
+
+	it("throws PushDisabledError before any request when the repo opted out (spec 306)", async () => {
+		mockIsOutboundPushAllowed.mockResolvedValue(false);
+		const err = await pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, "/ws").catch(
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(PushDisabledError);
+		expect(mockHttpsRequest).not.toHaveBeenCalled();
+	});
+
+	it("still pushes when the repo is push-allowed and a cwd is given", async () => {
+		mockIsOutboundPushAllowed.mockResolvedValue(true);
+		const mockReq = createMockRequest();
+		// Emit synchronously AFTER pushToJolli registers its listeners. The gate's
+		// extra `await` reorders microtasks, so a pre-scheduled emit (the shared
+		// createMockResponse helper) would fire before listeners attach and hang.
+		mockHttpsRequest.mockImplementation((_u: unknown, _o: unknown, cb: (r: unknown) => void) => {
+			const listeners: Record<string, Array<(...a: Array<unknown>) => void>> = {};
+			const res = {
+				statusCode: 200,
+				on: (event: string, fn: (...a: Array<unknown>) => void) => {
+					if (!listeners[event]) listeners[event] = [];
+					listeners[event].push(fn);
+					return res;
+				},
+				resume: vi.fn(),
+			};
+			cb(res);
+			for (const fn of listeners.data ?? []) fn(Buffer.from(JSON.stringify({ url: "u", docId: 1, jrn: "j", created: true })));
+			for (const fn of listeners.end ?? []) fn();
+			return mockReq;
+		});
+		const result = await pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, "/ws");
+		expect(result.docId).toBe(1);
+		expect(mockHttpsRequest).toHaveBeenCalledOnce();
 	});
 
 	it("handles statusCode being undefined (defaults to 0)", async () => {
@@ -858,7 +1053,7 @@ describe("pushToJolli", () => {
 		);
 
 		await expect(
-			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD),
+			pushToJolli("https://acme.jolli.ai", OLD_KEY, DEFAULT_PAYLOAD, WS),
 		).rejects.toThrow("HTTP 0");
 	});
 });
@@ -866,6 +1061,14 @@ describe("pushToJolli", () => {
 describe("deleteFromJolli", () => {
 	beforeEach(() => {
 		vi.resetAllMocks();
+		mockIsOutboundPushAllowed.mockResolvedValue(true);
+	});
+
+	it("throws PushDisabledError before any request when the repo opted out (spec 306)", async () => {
+		mockIsOutboundPushAllowed.mockResolvedValue(false);
+		const err = await deleteFromJolli("https://acme.jolli.ai", OLD_KEY, 42, "/ws").catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(PushDisabledError);
+		expect(mockHttpsRequest).not.toHaveBeenCalled();
 	});
 
 	it("resolves on 204 status", async () => {
@@ -884,7 +1087,7 @@ describe("deleteFromJolli", () => {
 		);
 
 		await expect(
-			deleteFromJolli("https://acme.jolli.ai", OLD_KEY, 42),
+			deleteFromJolli("https://acme.jolli.ai", OLD_KEY, 42, WS),
 		).resolves.toBeUndefined();
 	});
 
@@ -904,7 +1107,7 @@ describe("deleteFromJolli", () => {
 		);
 
 		await expect(
-			deleteFromJolli("https://acme.jolli.ai", OLD_KEY, 42),
+			deleteFromJolli("https://acme.jolli.ai", OLD_KEY, 42, WS),
 		).resolves.toBeUndefined();
 	});
 
@@ -924,7 +1127,7 @@ describe("deleteFromJolli", () => {
 		);
 
 		await expect(
-			deleteFromJolli("https://acme.jolli.ai", OLD_KEY, 42),
+			deleteFromJolli("https://acme.jolli.ai", OLD_KEY, 42, WS),
 		).rejects.toThrow("Delete failed with status 500");
 	});
 
@@ -941,7 +1144,7 @@ describe("deleteFromJolli", () => {
 		});
 
 		await expect(
-			deleteFromJolli("https://acme.jolli.ai", OLD_KEY, 42),
+			deleteFromJolli("https://acme.jolli.ai", OLD_KEY, 42, WS),
 		).rejects.toThrow("Network error: ECONNRESET");
 	});
 
@@ -962,13 +1165,13 @@ describe("deleteFromJolli", () => {
 		);
 
 		await expect(
-			deleteFromJolli(undefined, keyWithUrl, 42),
+			deleteFromJolli(undefined, keyWithUrl, 42, WS),
 		).resolves.toBeUndefined();
 		expect(mockHttpsRequest).toHaveBeenCalledOnce();
 	});
 
 	it("rejects when no baseUrl and old key", async () => {
-		await expect(deleteFromJolli(undefined, OLD_KEY, 42)).rejects.toThrow(
+		await expect(deleteFromJolli(undefined, OLD_KEY, 42, WS)).rejects.toThrow(
 			"Jolli site URL could not be determined.",
 		);
 	});
@@ -988,7 +1191,7 @@ describe("deleteFromJolli", () => {
 			},
 		);
 
-		await deleteFromJolli("https://jolli.ai/test1/", OLD_KEY, 42);
+		await deleteFromJolli("https://jolli.ai/test1/", OLD_KEY, 42, WS);
 
 		const callArgs = mockHttpsRequest.mock.calls[0] as [
 			{ headers: Record<string, string> },
@@ -1016,7 +1219,7 @@ describe("deleteFromJolli", () => {
 			},
 		);
 
-		await deleteFromJolli("https://acme.jolli.ai", keyWithOrg, 42);
+		await deleteFromJolli("https://acme.jolli.ai", keyWithOrg, 42, WS);
 
 		const callArgs = mockHttpsRequest.mock.calls[0] as [
 			{ headers: Record<string, string> },
@@ -1039,7 +1242,7 @@ describe("deleteFromJolli", () => {
 			},
 		);
 
-		await deleteFromJolli("https://acme.jolli.ai", OLD_KEY, 99);
+		await deleteFromJolli("https://acme.jolli.ai", OLD_KEY, 99, WS);
 
 		const callArgs = mockHttpsRequest.mock.calls[0] as [
 			{ path: string; method: string },
@@ -1069,7 +1272,7 @@ describe("deleteFromJolli", () => {
 			},
 		);
 
-		await deleteFromJolli("http://localhost:7034", OLD_KEY, 42);
+		await deleteFromJolli("http://localhost:7034", OLD_KEY, 42, WS);
 
 		expect(mockHttpRequest).toHaveBeenCalledOnce();
 		expect(mockHttpsRequest).not.toHaveBeenCalled();
@@ -1090,7 +1293,7 @@ describe("deleteFromJolli", () => {
 			},
 		);
 
-		await deleteFromJolli("http://localhost", OLD_KEY, 42);
+		await deleteFromJolli("http://localhost", OLD_KEY, 42, WS);
 
 		expect(mockHttpRequest).toHaveBeenCalledOnce();
 		const callArgs = mockHttpRequest.mock.calls[0] as [

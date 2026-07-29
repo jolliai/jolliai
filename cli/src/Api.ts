@@ -31,6 +31,7 @@ import { registerMigrateMemoryBankCommand } from "./commands/MigrateMemoryBankCo
 import { registerMovedCommandNotices } from "./commands/MovedCommandNotices.js";
 import { registerOpenUrlCommand } from "./commands/OpenUrlCommand.js";
 import { registerPrDescriptionCommand } from "./commands/PrDescriptionCommand.js";
+import { registerPushControlCommand } from "./commands/PushControlCommand.js";
 import { registerQueueStatusCommand } from "./commands/QueueStatusCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
 import { registerSearchCommand } from "./commands/SearchCommand.js";
@@ -193,6 +194,7 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"push",
 	"spaces",
 	"bind",
+	"push-control",
 ]);
 
 const MEMORY_DESCRIPTION = `Auto-documents your AI-assisted development. Lightweight git and AI-agent
@@ -383,6 +385,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerPushCommand(program);
 	registerSpacesCommand(program);
 	registerBindCommand(program);
+	registerPushControlCommand(program);
 	registerQueueStatusCommand(program);
 	registerOpenUrlCommand(program);
 	registerCompileCommand(program);

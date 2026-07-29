@@ -1635,6 +1635,33 @@ class SummaryPanel(
                         )
                         if (choice == Messages.YES) reauthenticateAndRetry()
                     }
+                } catch (e: JolliApiClient.PermissionDeniedError) {
+                    // Credential is fine but the server refused the push (e.g. the
+                    // repo isn't allowlisted for the Space). Show the server's
+                    // actionable sentence — do NOT offer re-auth (that would send the
+                    // user to re-login instead of to an admin) and do NOT open the
+                    // binding chooser (that path is only for BindingRequiredError).
+                    ApplicationManager.getApplication().invokeLater {
+                        postToWebview("pushFailed")
+                        Messages.showErrorDialog(project, "Push failed: ${e.message}", "Push Not Allowed")
+                    }
+                } catch (e: JolliShareService.PushDisabledError) {
+                    // The user opted this repo out of outbound push (spec 306). Not a
+                    // failure — memory is still recorded locally; tell them how to re-enable.
+                    ApplicationManager.getApplication().invokeLater {
+                        postToWebview("pushFailed")
+                        Messages.showInfoMessage(project, e.message, "Outbound Push Disabled")
+                    }
+                } catch (e: JolliShareService.PushGateUnavailableError) {
+                    // The gate could not be EVALUATED, so nothing was sent (fail-closed).
+                    // Kept out of the generic arm on purpose: that arm reports
+                    // `trackError("push", "push_failed")`, and a gate we couldn't read is
+                    // not a push failure — counting it would pollute the error metric with
+                    // a condition the user can simply retry. Mirrors CreatePrPanel.
+                    ApplicationManager.getApplication().invokeLater {
+                        postToWebview("pushFailed")
+                        Messages.showWarningDialog(project, e.message, "Couldn't Verify Push Setting")
+                    }
                 } catch (e: Exception) {
                     ai.jolli.jollimemory.core.telemetry.Telemetry.trackError("push", "push_failed")
                     ApplicationManager.getApplication().invokeLater {

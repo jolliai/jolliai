@@ -22,6 +22,8 @@ object TelemetryEvents {
                 "First-seen (install_id, surface_version) ≈ new + upgrade installs that launched.",
             "surface_enabled" to "A surface was enabled in a repo. Props: trigger.",
             "surface_disabled" to "A surface was disabled / opted out. Props: trigger, reason.",
+            "push_enabled" to "Outbound push re-enabled for a repo (spec 306, per-repo push control). Props: trigger.",
+            "push_disabled" to "Outbound push disabled for a repo (spec 306, per-repo push control). Props: trigger.",
             "signin_started" to "User initiated OAuth sign-in. Props: trigger.",
             "signin_completed" to "jolliApiKey minted — the conversion event. Props: api_key_minted.",
             "signed_out" to "User logged out. Props: none.",

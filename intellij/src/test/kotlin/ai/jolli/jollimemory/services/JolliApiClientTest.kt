@@ -105,13 +105,28 @@ class JolliApiClientTest {
         }
 
         @Test
-        fun `PermissionDeniedError also maps to UnauthorizedError`() {
-            // 401 and 403 both surfaced as UnauthorizedError before the migration —
-            // preserve that by folding both CLI error names into the same Kotlin type.
+        fun `PermissionDeniedError maps to the distinct PermissionDeniedError (cross-client parity)`() {
+            // A credential-OK refusal (repo not allowlisted / ownership mismatch)
+            // must stay distinct from NotAuthenticatedError so the panels can
+            // surface the admin-oriented text instead of a re-login prompt.
             val e = CliIntegrations.CliBridgeException("PermissionDeniedError", "forbidden")
             val mapped = JolliApiClient.remapBridgeException(e, null)
-            mapped.shouldBeInstanceOf<JolliApiClient.UnauthorizedError>()
+            mapped.shouldBeInstanceOf<JolliApiClient.PermissionDeniedError>()
             mapped.message shouldBe "forbidden"
+        }
+
+        @Test
+        fun `PushDisabledError maps to the share service's opt-out type, not a generic error`() {
+            // The CLI's own gate can refuse mid-call when the opt-out flips after a push
+            // site's pre-check. Without this mapping it fell through to the plain
+            // RuntimeException, so the panels' quiet "re-enable to push" info path was
+            // skipped and a user opt-out surfaced as a push failure.
+            val e = CliIntegrations.CliBridgeException("PushDisabledError", "disabled; use jolli push-control --enable")
+            val mapped = JolliApiClient.remapBridgeException(e, null)
+            mapped.shouldBeInstanceOf<JolliShareService.PushDisabledError>()
+            // The bridge message is DROPPED on purpose: it names a CLI command, so IDE
+            // users get the IDE-worded default — identical to the pre-call gate's text.
+            mapped.message shouldBe JolliShareService.PushDisabledError().message
         }
 
         @Test

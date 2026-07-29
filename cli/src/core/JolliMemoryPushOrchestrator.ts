@@ -23,13 +23,14 @@ import {
 	type BatchPushItem,
 	BindingAlreadyExistsError,
 	BindingRequiredError,
-	ClientOutdatedError,
 	JolliMemoryPushClient,
 	type JolliMemorySpace,
 	NotAuthenticatedError,
 } from "./JolliMemoryPushClient.js";
 import { loadBranchSummaries } from "./PrDescription.js";
+import { isOutboundPushAllowed, PushDisabledError } from "./PushControl.js";
 import { loadPushPending } from "./PushPendingStore.js";
+import { isRepoWideRefusal } from "./PushRefusal.js";
 import { readReferenceMarkdownFromString } from "./references/ReferenceStore.js";
 import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import type { StorageProvider } from "./StorageProvider.js";
@@ -883,6 +884,37 @@ export interface PushSummaryResult {
  * rather than retrying inline (unlike the VS Code version, which resolves the
  * binding case via an injected chooser).
  */
+/**
+ * Errors that must ABORT an attachment loop instead of being collected per item:
+ * every {@link isRepoWideRefusal} (see `PushRefusal.ts` — the shared, three-surface
+ * source of truth for that membership), plus `BindingRequiredError`, which is
+ * fatal *here* because these loops cannot run the binding chooser themselves and
+ * so must propagate to the caller that can. Shared by all three loops so the set
+ * cannot drift between them.
+ */
+function isFatalAttachmentError(err: unknown): boolean {
+	return isRepoWideRefusal(err) || (err instanceof Error && err.name === "BindingRequiredError");
+}
+
+/**
+ * Re-reads the per-repo opt-out immediately before an outbound send.
+ *
+ * The entry gates (`pushBranchToJolli`, the two drains) check once, up front —
+ * that is what makes a disabled repo cheap to refuse. But a branch push is a
+ * LOOP of network calls that can run for many seconds, and spec 306 requires the
+ * flag be read LIVE: a user who disables push mid-run must stop the REMAINING
+ * sends, not merely the next run. The VS Code client re-checks inside
+ * `pushToJolli` / `deleteFromJolli` and IntelliJ re-checks inside the `jolli-api`
+ * bridge, so without this the native CLI would be the one surface that keeps
+ * leaking after the toggle.
+ *
+ * Cheap by construction: the repo identity is memoized per-cwd (see
+ * `PushControl`), so the extra reads are a file read each, not a git spawn.
+ */
+export async function assertOutboundStillAllowed(cwd: string): Promise<void> {
+	if (!(await isOutboundPushAllowed(cwd))) throw new PushDisabledError();
+}
+
 export async function pushSummary(
 	summary: CommitSummary,
 	ctx: PushContext,
@@ -926,6 +958,9 @@ export async function pushSummary(
 	// the share page renders it directly instead of regex-parsing the markdown.
 	const summaryJson = serializeSummaryJson(summaryForMarkdown);
 
+	// Live re-read of the opt-out before the summary send too: the attachment loops
+	// above may have taken seconds, and this is the last outbound call of the group.
+	await assertOutboundStillAllowed(ctx.cwd);
 	const result = await ctx.client.push({
 		title: buildPushTitle(summary),
 		content: markdown,
@@ -1002,8 +1037,9 @@ export async function pushSummary(
 /**
  * Uploads the given plans, returning their published URLs. A single plan's
  * unreadable content or transient push failure is logged and skipped;
- * `BindingRequiredError` and `ClientOutdatedError` are fatal and propagate so
- * the caller can surface the binding / upgrade flow.
+ * {@link isFatalAttachmentError} ones propagate so the caller can surface the
+ * binding / upgrade flow or the repo-wide refusal. Re-reads the outbound opt-out
+ * before each send, so a mid-run disable stops the remaining uploads.
  */
 async function pushPlanList(
 	plans: ReadonlyArray<PlanReference>,
@@ -1021,6 +1057,8 @@ async function pushPlanList(
 		}
 		let planResult: Awaited<ReturnType<JolliMemoryPushClient["push"]>>;
 		try {
+			// Live re-read of the opt-out before EVERY send — see assertOutboundStillAllowed.
+			await assertOutboundStillAllowed(ctx.cwd);
 			planResult = await ctx.client.push({
 				title: buildPlanPushTitle(summary, plan.title),
 				content: planContent,
@@ -1033,7 +1071,7 @@ async function pushPlanList(
 				relativePath: buildBranchRelativePath(summary.branch),
 			});
 		} catch (err) {
-			if (err instanceof BindingRequiredError || err instanceof ClientOutdatedError) throw err;
+			if (isFatalAttachmentError(err)) throw err;
 			log.error("Plan %s push FAILED: %s", plan.slug, err instanceof Error ? err.message : String(err));
 			continue;
 		}
@@ -1046,7 +1084,7 @@ async function pushPlanList(
 	return results;
 }
 
-/** Uploads the given notes; like {@link pushPlanList}, transient single-note failures are logged and skipped while `BindingRequiredError` / `ClientOutdatedError` propagate. */
+/** Uploads the given notes; like {@link pushPlanList}, transient single-note failures are logged and skipped while {@link isFatalAttachmentError} ones propagate. */
 async function pushNoteList(
 	notes: ReadonlyArray<NoteReference>,
 	summary: CommitSummary,
@@ -1063,6 +1101,8 @@ async function pushNoteList(
 		}
 		let noteResult: Awaited<ReturnType<JolliMemoryPushClient["push"]>>;
 		try {
+			// Live re-read of the opt-out before EVERY send — see assertOutboundStillAllowed.
+			await assertOutboundStillAllowed(ctx.cwd);
 			noteResult = await ctx.client.push({
 				title: buildNotePushTitle(summary, note.title),
 				content: noteContent,
@@ -1075,7 +1115,7 @@ async function pushNoteList(
 				relativePath: buildBranchRelativePath(summary.branch),
 			});
 		} catch (err) {
-			if (err instanceof BindingRequiredError || err instanceof ClientOutdatedError) throw err;
+			if (isFatalAttachmentError(err)) throw err;
 			log.error("Note %s push FAILED: %s", note.id, err instanceof Error ? err.message : String(err));
 			continue;
 		}
@@ -1093,7 +1133,7 @@ async function pushNoteList(
  * returning their published URLs keyed by `archivedKey`. The body is synthesized
  * from the value snapshot ({@link buildReferencePushMarkdown}) since a reference
  * has no on-disk file. Like {@link pushPlanList}, a single transient failure is
- * logged and skipped while `BindingRequiredError` / `ClientOutdatedError` propagate.
+ * logged and skipped while {@link isFatalAttachmentError} ones propagate.
  */
 async function pushReferenceList(
 	references: ReadonlyArray<ReferenceCommitRef>,
@@ -1114,6 +1154,8 @@ async function pushReferenceList(
 			: undefined;
 		let refResult: Awaited<ReturnType<JolliMemoryPushClient["push"]>>;
 		try {
+			// Live re-read of the opt-out before EVERY send — see assertOutboundStillAllowed.
+			await assertOutboundStillAllowed(ctx.cwd);
 			refResult = await ctx.client.push({
 				title: buildReferencePushTitle(ref),
 				content: buildReferencePushMarkdown(ref, description),
@@ -1126,7 +1168,7 @@ async function pushReferenceList(
 				relativePath: buildBranchRelativePath(summary.branch),
 			});
 		} catch (err) {
-			if (err instanceof BindingRequiredError || err instanceof ClientOutdatedError) throw err;
+			if (isFatalAttachmentError(err)) throw err;
 			log.error(
 				"Reference %s push FAILED: %s",
 				ref.archivedKey,
@@ -1257,6 +1299,7 @@ export type PushBranchResult =
 			readonly spaces: ReadonlyArray<JolliMemorySpace>;
 			readonly defaultSpaceId: number | null;
 	  }
+	| { readonly type: "push_disabled"; readonly message: string }
 	| { readonly type: "error"; readonly message: string };
 
 /**
@@ -1279,6 +1322,15 @@ export async function pushBranchToJolli(opts: PushBranchOpts): Promise<PushBranc
 	const client = opts.client ?? new JolliMemoryPushClient();
 	const cwd = opts.cwd;
 	try {
+		// Per-repo outbound-push opt-out (Story 2). Fail closed before any network
+		// call so a manual `jolli push` / MCP `push_memory` can never leak from a
+		// repo the user push-disabled. Memory stays recorded locally.
+		if (!(await isOutboundPushAllowed(cwd))) {
+			// Same wording as the thrown form — taken FROM it rather than re-typed, so
+			// the CLI's two refusal shapes (a tagged result here, an error on the bridge)
+			// can never drift into two different sentences for one condition.
+			return { type: "push_disabled", message: new PushDisabledError().message };
+		}
 		const repoUrl = await getCanonicalRepoUrl(cwd);
 		if (opts.space) {
 			const jmSpaceId = await resolveSpaceId(client, opts.space);
@@ -1373,6 +1425,14 @@ export async function pushBranchToJolli(opts: PushBranchOpts): Promise<PushBranc
 				);
 			}
 			return { type: "binding_required", repoUrl: err.repoUrl, spaces, defaultSpaceId };
+		}
+		if (err instanceof PushDisabledError) {
+			// The opt-out was flipped mid-run (the entry gate above passed). Report the
+			// SAME tagged result the entry gate returns rather than `type:"error"` —
+			// `jolli push` prints it and exits 0, and MCP `push_memory` must not mark a
+			// deliberate user setting as a failure. Summaries already pushed in this run
+			// stay pushed; the rest simply were not sent.
+			return { type: "push_disabled", message: err.message };
 		}
 		if (err instanceof NotAuthenticatedError) return { type: "error", message: err.message };
 		return { type: "error", message: err instanceof Error ? err.message : String(err) };

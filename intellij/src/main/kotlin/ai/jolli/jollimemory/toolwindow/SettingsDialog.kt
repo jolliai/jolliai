@@ -8,8 +8,11 @@ import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.bridge.GitOps
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
+import com.google.gson.JsonObject
 import com.intellij.ide.BrowserUtil
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
@@ -80,9 +83,20 @@ class SettingsDialog(
     private val syncCardLayout = CardLayout()
     private val syncCardPanel = JPanel(syncCardLayout)
     private lateinit var signInForSyncButton: JButton
-    private val autoSyncCheckbox = JBCheckBox("Auto-sync to Personal Space", true)
     private val syncTranscriptsCheckbox = JBCheckBox("Sync transcripts", false)
-    private val pollIntervalField = JBTextField()
+    // Personal Space AUTO-sync (`autoSyncEnabled`) and its paired poll interval are
+    // deliberately NOT surfaced yet (not actionable). They are held as plain VALUES
+    // rather than as unparented JBCheckBox/JBTextField instances: a widget that is
+    // never added to a container still looks live to every reader of this class, so
+    // it silently rots (a re-label, a listener, a validation rule — all no-ops that
+    // nobody notices). These two fields make the "round-trip only, no UI" contract
+    // explicit; populateFields loads them and doOKAction writes them back unchanged.
+    private var savedAutoSyncEnabled: Boolean? = null
+    private var savedSyncPollIntervalSec: Int? = null
+    // Per-repo outbound-push control (spec 306): checked = push this repo to its
+    // Jolli Space; unchecked = keep memory local only. Read/written via the CLI
+    // bridge (the single source of truth), disabled until the async read lands.
+    private val pushEnabledCheckbox = JBCheckBox("Push this repository's memories to Jolli").apply { isEnabled = false }
 
     // ── Tab 3: Memory Bank ─────────────────────────────────────────────────
     private val kbPathField = TextFieldWithBrowseButton().apply {
@@ -127,6 +141,11 @@ class SettingsDialog(
     private var anthropicWarningRef: JBLabel? = null
     private var syncApiKeyFieldRef: JBTextField? = null
     private var syncAdvancedPanelRef: JPanel? = null
+    // Per-repo push-control state (spec 306). `pushControlLoaded` gates the
+    // doOKAction write until the async bridge read has landed, so merely opening
+    // Settings never flips the flag (and never re-triggers the toggle-on drain).
+    private var savedPushDisabled: Boolean = false
+    private var pushControlLoaded: Boolean = false
     private val authListenerDisposable: Disposable
 
     init {
@@ -135,6 +154,7 @@ class SettingsDialog(
         ai.jolli.jollimemory.core.telemetry.Telemetry.track("settings_opened", mapOf("tab" to "general"))
         init()
         loadSettings()
+        loadPushControlAsync()
 
         authListenerDisposable = JolliAuthService.addAuthListener {
             SwingUtilities.invokeLater {
@@ -452,26 +472,29 @@ class SettingsDialog(
         syncCardPanel.alignmentX = JComponent.LEFT_ALIGNMENT
         panel.add(syncCardPanel)
 
+        // Per-repo outbound-push control (spec 306): whether THIS repository's
+        // memories are pushed to its bound Jolli Space (auto AND manual). The
+        // Personal Space cloud-sync lives on the Memory Bank tab — keeping the two
+        // different channels apart avoids the confusion of mixing them here.
         panel.add(Box.createVerticalStrut(12))
-        panel.add(javax.swing.JSeparator().apply { alignmentX = JComponent.LEFT_ALIGNMENT; maximumSize = Dimension(Int.MAX_VALUE, 1) })
-        panel.add(Box.createVerticalStrut(8))
-
-        autoSyncCheckbox.alignmentX = JComponent.LEFT_ALIGNMENT
-        panel.add(autoSyncCheckbox)
-        panel.add(Box.createVerticalStrut(4))
-
-        syncTranscriptsCheckbox.alignmentX = JComponent.LEFT_ALIGNMENT
-        panel.add(syncTranscriptsCheckbox)
-        panel.add(Box.createVerticalStrut(8))
-
-        pollIntervalField.apply {
+        panel.add(javax.swing.JSeparator().apply {
             alignmentX = JComponent.LEFT_ALIGNMENT
-            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
-        }
-        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
-            .addLabeledComponent(JBLabel("Poll interval (seconds):"), pollIntervalField, 1, false)
-            .addTooltip("How often to sync automatically. Leave blank for the default (90 minutes); shorter values are raised to the 90-minute minimum.")
-            .panel))
+            maximumSize = Dimension(Int.MAX_VALUE, 1)
+        })
+        panel.add(Box.createVerticalStrut(8))
+        panel.add(JBLabel("<html><b>Push to Jolli Space (this repository)</b></html>").apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.emptyBottom(4)
+        })
+        pushEnabledCheckbox.alignmentX = JComponent.LEFT_ALIGNMENT
+        panel.add(pushEnabledCheckbox)
+        panel.add(JBLabel(
+            "<html><span style='color:gray'>Off = keep recording this repository's memory locally but never push it to its " +
+                "Jolli Space (auto or manual). Re-enabling syncs the backlog.</span></html>",
+        ).apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.emptyTop(2)
+        })
 
         return wrapTabContent(panel)
     }
@@ -489,6 +512,22 @@ class SettingsDialog(
             .addTooltip("How files are sorted in the Memory Bank explorer")
             .addComponent(createMigrateButton(), 12)
             .panel))
+
+        // Personal Space AUTO-sync — the "Auto-sync to Personal Space" toggle and its
+        // paired "Poll interval" — is intentionally NOT surfaced for now (not yet
+        // actionable). Both fields + the startSync wiring remain, so populateFields/
+        // doOKAction still round-trip the saved values (an invisible control never
+        // changes them) and behavior is unchanged. Only "Sync transcripts" — the
+        // content preference, independent of the auto-poll — is shown.
+        panel.add(Box.createVerticalStrut(16))
+        syncTranscriptsCheckbox.alignmentX = JComponent.LEFT_ALIGNMENT
+        panel.add(syncTranscriptsCheckbox)
+        panel.add(JBLabel(
+            "<html><span style='color:gray'>Include AI session transcripts (not just summaries) when memory syncs to Jolli.</span></html>",
+        ).apply {
+            alignmentX = JComponent.LEFT_ALIGNMENT
+            border = JBUI.Borders.emptyTop(2)
+        })
 
         // Historical memory — the re-entry point for the cold-start "build memory" flow.
         // Runs a full-scope back-fill regardless of whether the tool-window card was
@@ -797,9 +836,10 @@ class SettingsDialog(
             knowledgeBasePath = kbPath,
             knowledgeBaseSort = kbSort,
             paused = if (pauseCheckbox.isSelected) true else null,
-            autoSyncEnabled = if (autoSyncCheckbox.isSelected) null else false,
+            // Round-tripped, not edited — see savedAutoSyncEnabled's declaration.
+            autoSyncEnabled = savedAutoSyncEnabled,
             syncTranscripts = if (syncTranscriptsCheckbox.isSelected) true else null,
-            syncPollIntervalSec = pollIntervalField.text.trim().toIntOrNull(),
+            syncPollIntervalSec = savedSyncPollIntervalSec,
         )
         SessionTracker.saveConfigToDir(config, configDir)
         // Provider routing lives ONLY in the shared config.json (cross-surface, one copy) so the
@@ -874,6 +914,10 @@ class SettingsDialog(
         val nowPaused = pauseCheckbox.isSelected
         val projectPath = service.mainRepoRoot ?: project.basePath
         val kbCustomPath = config.knowledgeBasePath
+        // Per-repo outbound-push toggle (spec 306) — snapshot for the off-EDT write below.
+        val pushControlWasLoaded = pushControlLoaded
+        val pushDisabledNow = !pushEnabledCheckbox.isSelected
+        val pushDisabledWas = savedPushDisabled
 
         // Resolve the tri-state global-instructions consent. Checked → "enabled". Unchecked
         // is an explicit opt-out ("disabled") ONLY when it was previously enabled; otherwise
@@ -946,6 +990,68 @@ class SettingsDialog(
                         }
                     }
 
+                    // 2c. Persist the per-repo outbound-push toggle (spec 306) via the CLI
+                    // bridge — the single source of truth. Only when it actually changed, so
+                    // merely re-saving Settings never re-triggers the toggle-on drain.
+                    if (pushControlWasLoaded && pushDisabledNow != pushDisabledWas && projectPath != null) {
+                        indicator.text = "Updating outbound push setting…"
+                        try {
+                            val body = JsonObject()
+                                .apply { addProperty("disabled", pushDisabledNow) }
+                                .toString()
+                            val res = CliIntegrations.runIdeBridge(projectPath, "push-control-set", body)
+                            // The ENABLE path may have rebuilt an unreadable push-control
+                            // store from empty, which drops EVERY other repo's opt-out. The
+                            // store contract requires callers to surface that — reporting a
+                            // bare success would hide a machine-wide settings reset behind
+                            // one checkbox. Parity with the CLI's note and VS Code's status.
+                            val obj = res.takeIf { it.isJsonObject }?.asJsonObject
+                            val recovered = obj?.get("recoveredFromCorrupt")
+                                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }
+                                ?.asBoolean == true
+                            if (recovered) {
+                                val preservedAt = obj?.get("preservedAt")
+                                    ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+                                    ?.asString
+                                LOG.warn(
+                                    "push-control-set rebuilt an unreadable store from empty; " +
+                                        "other repos' opt-outs were reset" +
+                                        (preservedAt?.let { " (previous file kept at $it)" } ?: ""),
+                                )
+                                SwingUtilities.invokeLater {
+                                    com.intellij.notification.Notifications.Bus.notify(
+                                        com.intellij.notification.Notification(
+                                            "JolliMemory",
+                                            "Outbound push setting file was rebuilt",
+                                            "The setting file was unreadable and has been rebuilt from scratch, so every " +
+                                                "other repository's outbound-push opt-out was reset to ON. Re-apply the " +
+                                                "ones you want off." +
+                                                (preservedAt?.let { " The unreadable file was kept at $it." } ?: ""),
+                                            com.intellij.notification.NotificationType.WARNING,
+                                        )
+                                    )
+                                }
+                            }
+                        } catch (e: Exception) {
+                            // Unlike the old silent swallow, surface the failure: the
+                            // dialog has already closed, so the user would otherwise
+                            // believe the toggle saved. Log it and warn (parity with VS
+                            // Code's "Couldn't update…"); the real state is re-read on the
+                            // next Settings open.
+                            LOG.warn("push-control-set failed; outbound-push setting was NOT saved", e)
+                            SwingUtilities.invokeLater {
+                                com.intellij.notification.Notifications.Bus.notify(
+                                    com.intellij.notification.Notification(
+                                        "JolliMemory",
+                                        "Couldn't update outbound push",
+                                        "The setting wasn't saved (${e.message}). It will be re-read next time you open Settings.",
+                                        com.intellij.notification.NotificationType.WARNING,
+                                    )
+                                )
+                            }
+                        }
+                    }
+
                     // 3. Refresh status once, after everything settled.
                     service.refreshStatus()
                 }
@@ -962,6 +1068,95 @@ class SettingsDialog(
         val configDir = SessionTracker.getGlobalConfigDir()
         val config = SessionTracker.loadConfigFromDir(configDir)
         populateFields(config)
+    }
+
+    /**
+     * Reads THIS repo's push-disabled flag via the `push-control-get` bridge OFF
+     * the EDT (spec 306), then sets the checkbox on the EDT.
+     *
+     * On a bridge error we must NOT assert a state: the previous code defaulted to
+     * "push enabled" (checked) AND marked the row loaded, which (a) mis-reported an
+     * actually push-disabled repo as syncing, and (b) made the toggle un-writable —
+     * doOKAction only writes when `pushDisabledNow != savedPushDisabled`, and a
+     * checked box against `savedPushDisabled=false` never differs. Instead leave the
+     * checkbox DISABLED and `pushControlLoaded=false` (so doOKAction skips the write)
+     * and explain via a tooltip; the state is re-read next time Settings opens.
+     *
+     * A MALFORMED reply (non-object body, or `pushDisabled` missing / not a boolean)
+     * is treated as the same "unknown" as an exception — same orientation as
+     * [JolliShareService.defaultOutboundPushAllowed]'s fail-closed. Defaulting it to
+     * `false` would assert "push is on" for a repo that may be opted out.
+     *
+     * A reply carrying `pushDisabledError` is the THIRD state and also lands in
+     * "unknown", even though `pushDisabled` parses fine (it is `true`): the bridge
+     * could not read the machine-global push-control store and failed closed, so that
+     * `true` is not this repo's recorded choice. Rendering it as an unchecked box would
+     * claim the user turned THIS repo off when the condition is machine-wide and the
+     * user chose nothing. Leaving the toggle unwritable matters twice over here —
+     * enabling is the one direction that rebuilds an unreadable store from empty and
+     * drops every other repo's opt-out, so that recovery must stay behind
+     * `jolli push-control`, which explains what it destroys. The tooltip therefore
+     * names the store's path and points at that command, never at `--enable`.
+     */
+    private fun loadPushControlAsync() {
+        val cwd = service.mainRepoRoot ?: project.basePath
+        if (cwd == null) {
+            // No repo root at all (a project with no content root). Explain the
+            // permanently-disabled checkbox rather than leaving it inert and unlabelled —
+            // the two failure branches below both set a tooltip, so this one must too.
+            pushEnabledCheckbox.toolTipText = "This project has no repository, so there is nothing to push."
+            return
+        }
+        ApplicationManager.getApplication().executeOnPooledThread {
+            // Set when the reply says the store itself is unreadable — checked BEFORE
+            // the flag, because the flag it accompanies is a fail-closed `true` rather
+            // than this repo's recorded choice.
+            var storeError: String? = null
+            val disabled: Boolean? = try {
+                val res = CliIntegrations.runIdeBridge(cwd, "push-control-get")
+                val body = res.takeIf { it.isJsonObject }?.asJsonObject
+                storeError = body?.get("pushDisabledError")
+                    ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+                    ?.asString
+                val flag = body?.get("pushDisabled")
+                if (flag != null && flag.isJsonPrimitive && flag.asJsonPrimitive.isBoolean) {
+                    flag.asBoolean
+                } else {
+                    LOG.warn("push-control-get returned a malformed reply ($res); leaving the toggle disabled")
+                    null
+                }
+            } catch (e: Exception) {
+                LOG.warn("push-control-get failed; leaving the toggle disabled (state unknown)", e)
+                null
+            }
+            SwingUtilities.invokeLater {
+                if (storeError != null) {
+                    // Store unreadable: fail-closed for every repo on this machine, so
+                    // this repo's own state is UNKNOWN. Same unwritable treatment as a
+                    // failed read, plus the store's path and the non-destructive repair
+                    // route (deliberately not `--enable`, which rebuilds the store from
+                    // empty and drops every repo's opt-out).
+                    pushControlLoaded = false
+                    pushEnabledCheckbox.isEnabled = false
+                    pushEnabledCheckbox.toolTipText =
+                        "Couldn't read this machine's outbound-push setting ($storeError), " +
+                        "so this repository's state is unknown. Run `jolli push-control` to repair it."
+                } else if (disabled == null) {
+                    // Read failed — keep the checkbox unloaded + disabled so we never
+                    // claim a state we don't have, and so doOKAction won't write.
+                    pushControlLoaded = false
+                    pushEnabledCheckbox.isEnabled = false
+                    pushEnabledCheckbox.toolTipText =
+                        "Couldn't read this repository's push setting — reopen Settings to retry."
+                } else {
+                    savedPushDisabled = disabled
+                    pushControlLoaded = true
+                    pushEnabledCheckbox.isSelected = !disabled
+                    pushEnabledCheckbox.isEnabled = true
+                    pushEnabledCheckbox.toolTipText = null
+                }
+            }
+        }
     }
 
     private fun populateFields(config: JolliMemoryConfig) {
@@ -1025,10 +1220,11 @@ class SettingsDialog(
         kbPathField.text = config.knowledgeBasePath ?: KBPathResolver.KB_PARENT.toString()
         kbSortCombo.selectedItem = config.knowledgeBaseSort ?: "date"
 
-        // Sync settings
-        autoSyncCheckbox.isSelected = config.autoSyncEnabled != false
+        // Sync settings. autoSyncEnabled / syncPollIntervalSec have no control on any
+        // tab; snapshot them verbatim so doOKAction writes back exactly what was read.
+        savedAutoSyncEnabled = config.autoSyncEnabled
+        savedSyncPollIntervalSec = config.syncPollIntervalSec
         syncTranscriptsCheckbox.isSelected = config.syncTranscripts == true
-        pollIntervalField.text = config.syncPollIntervalSec?.toString() ?: ""
 
         // Sync card states after all fields are populated
         syncProviderCard()
@@ -1142,6 +1338,8 @@ class SettingsDialog(
     }
 
     companion object {
+        private val LOG = Logger.getInstance(SettingsDialog::class.java)
+
         /** Remembers last selected tab across dialog open/close within the same IDE session. */
         private var lastSelectedTab = 0
 

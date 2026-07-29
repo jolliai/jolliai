@@ -1,5 +1,6 @@
 package ai.jolli.jollimemory.services
 
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.bridge.GitRemoteUtils
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.JmLogger
@@ -27,6 +28,28 @@ object JolliShareService {
 
     private val log = JmLogger.create("JolliShareService")
 
+    /**
+     * Thrown when the repo has opted out of OUTBOUND push (spec 306 per-repo push
+     * control). Memory stays recorded locally; the caller surfaces a
+     * "re-enable to push" message rather than treating it as a failure.
+     */
+    class PushDisabledError(
+        message: String =
+            "Outbound push is disabled for this repo. Re-enable it in Settings → Sync to Jolli to push.",
+    ) : RuntimeException(message)
+
+    /**
+     * Thrown when the per-repo push gate could not be *evaluated* — the CLI bridge
+     * answered, but not with a definitive `{ allowed: boolean }`. Push is blocked
+     * (fail-closed, see [defaultOutboundPushAllowed]) but this is deliberately NOT
+     * a [PushDisabledError]: the user made no opt-out, so telling them to "re-enable
+     * it in Settings" would send them to a checkbox that is already on.
+     */
+    class PushGateUnavailableError(
+        message: String =
+            "Couldn't verify this repo's push setting, so nothing was sent. Try again; see the log for detail.",
+    ) : RuntimeException(message)
+
     /** Outcome of a successful [shareSummary] call. */
     data class ShareResult(
         val updatedSummary: CommitSummary,
@@ -41,6 +64,10 @@ object JolliShareService {
      * summary, and cleans up orphaned docs. Returns the stored summary.
      *
      * @param resolvedBaseUrl the Jolli site base URL already resolved from the API key.
+     * @param isOutboundPushAllowed the per-repo outbound-push gate (spec 306).
+     *   Defaults to the CLI bridge (`outbound-push-allowed`, the single source of
+     *   truth). Injected so unit tests stay hermetic — no bridge subprocess spawn.
+     * @throws PushDisabledError when the repo has opted out of outbound push.
      * @throws JolliApiClient.BindingRequiredError when the repo has no space binding yet.
      * @throws JolliApiClient.PluginOutdatedError / UnauthorizedError on server rejection.
      */
@@ -50,7 +77,14 @@ object JolliShareService {
         cwd: String,
         apiKey: String,
         resolvedBaseUrl: String,
+        isOutboundPushAllowed: (String) -> Boolean = ::defaultOutboundPushAllowed,
     ): ShareResult {
+        // spec 306: honor the per-repo outbound-push opt-out before ANY
+        // network call, so a repo push-disabled from the CLI or VS Code cannot be
+        // pushed from IntelliJ's Share / Create-PR flows. This is the single
+        // chokepoint both panels drive, so the gate lives here rather than at each
+        // call site (which is exactly how the gate was missed before).
+        if (!isOutboundPushAllowed(cwd)) throw PushDisabledError()
         val baseUrl = resolvedBaseUrl.trimEnd('/')
         val repoUrl = GitRemoteUtils.getCanonicalRepoUrl(cwd)
         val relativePath = GitRemoteUtils.sanitizeBranchSlug(summary.branch)
@@ -60,7 +94,7 @@ object JolliShareService {
             val planContent = store.readPlanFromBranch(plan.slug) ?: continue
             if (planContent.isBlank()) continue
             val planResult = JolliApiClient.pushToJolli(
-                resolvedBaseUrl, apiKey,
+                cwd, resolvedBaseUrl, apiKey,
                 JolliApiClient.JolliPushPayload(
                     title = SummaryUtils.buildPlanPushTitle(summary, plan.title),
                     content = planContent,
@@ -90,7 +124,7 @@ object JolliShareService {
         val markdown = SummaryMarkdownBuilder.buildMarkdown(summaryForMarkdown)
 
         val result = JolliApiClient.pushToJolli(
-            resolvedBaseUrl, apiKey,
+            cwd, resolvedBaseUrl, apiKey,
             JolliApiClient.JolliPushPayload(
                 title = SummaryUtils.buildPushTitle(summary),
                 content = markdown,
@@ -109,7 +143,8 @@ object JolliShareService {
         store.storeSummary(updatedSummary, force = true)
 
         val resolvedSummary = resolveUnresolvedOrphans(store, updatedSummary, cwd)
-        val cleanedSummary = cleanupOrphanedDocs(store, resolvedSummary, resolvedSummary, baseUrl, apiKey) ?: resolvedSummary
+        val cleanedSummary =
+            cleanupOrphanedDocs(store, resolvedSummary, resolvedSummary, cwd, baseUrl, apiKey) ?: resolvedSummary
 
         Telemetry.track(
             "memory_pushed",
@@ -121,6 +156,65 @@ object JolliShareService {
         )
 
         return ShareResult(cleanedSummary, result.created, planUrls.size)
+    }
+
+    /**
+     * Default outbound-push gate: asks the CLI bridge whether this repo may push
+     * (spec 306's `isOutboundPushAllowed`, composing `manuallyDisabled` with the
+     * push-control store — the SAME predicate the CLI drains and VS Code use).
+     *
+     * Three failure modes, resolved by whether the bridge ANSWERED:
+     *   - **Ran, answered `{ allowed: boolean }`** — trust it, including a
+     *     definitive `allowed:false` (block).
+     *   - **Ran, answered something else** (non-object body, missing/non-boolean
+     *     `allowed`, or a JSON-RPC `error` — an unknown action, a throwing handler):
+     *     the bridge reached us and could not confirm the repo may push, so we fail
+     *     **CLOSED**. It cannot be version skew: [CliIntegrations.resolveCliJs]
+     *     always runs the CLI bundled in THIS plugin, so plugin and bridge are in
+     *     lockstep and an unknown action is a protocol bug, not an old global CLI.
+     *     A silent fail-open here would let IntelliJ's manual Share / Create-PR
+     *     push from a repo the user opted out of. Signalled as
+     *     [PushGateUnavailableError], NOT [PushDisabledError] — the user did not
+     *     opt out, so "re-enable it in Settings" would be a lie.
+     *   - **Could not run at all** (Node missing, spawn failure, timeout): infra,
+     *     not an answer, so we fail **OPEN** — a push that historically worked
+     *     without Node must not be newly broken. The CLI drains still gate every
+     *     AUTOMATIC path here, so this concession only widens manual pushes.
+     *
+     * @throws PushGateUnavailableError when the bridge answered but not definitively.
+     */
+    internal fun defaultOutboundPushAllowed(cwd: String): Boolean {
+        val res = try {
+            CliIntegrations.runIdeBridge(cwd, "outbound-push-allowed")
+        } catch (e: CliIntegrations.CliBridgeException) {
+            // The bridge RAN and returned an error envelope — an answer, not an outage.
+            log.warn(
+                "outbound-push-allowed bridge check failed — blocking push (fail-closed, bridge answered): %s",
+                e.message ?: e.toString(),
+            )
+            throw PushGateUnavailableError()
+        } catch (e: Exception) {
+            log.warn(
+                "outbound-push-allowed bridge check could not run — allowing push (fail-open on infra error): %s",
+                e.message ?: e.toString(),
+            )
+            return true
+        }
+        return parseOutboundPushAllowed(res)
+    }
+
+    /**
+     * Pure parse half of [defaultOutboundPushAllowed] — split out so the
+     * fail-closed decision is unit-testable without spawning a bridge.
+     * Only a real boolean `allowed` is definitive; anything else blocks.
+     */
+    internal fun parseOutboundPushAllowed(res: com.google.gson.JsonElement): Boolean {
+        val allowed = res.takeIf { it.isJsonObject }?.asJsonObject?.get("allowed")
+        if (allowed == null || !allowed.isJsonPrimitive || !allowed.asJsonPrimitive.isBoolean) {
+            log.warn("outbound-push-allowed returned a malformed reply — blocking push (fail-closed): %s", res)
+            throw PushGateUnavailableError()
+        }
+        return allowed.asBoolean
     }
 
     /**
@@ -176,6 +270,7 @@ object JolliShareService {
         store: SummaryStore,
         originalSummary: CommitSummary,
         updatedSummary: CommitSummary,
+        cwd: String,
         baseUrl: String,
         apiKey: String,
     ): CommitSummary? {
@@ -184,7 +279,7 @@ object JolliShareService {
         val deleted = mutableSetOf<Int>()
         for (id in orphanedIds) {
             try {
-                JolliApiClient.deleteFromJolli(baseUrl, apiKey, id)
+                JolliApiClient.deleteFromJolli(cwd, baseUrl, apiKey, id)
                 deleted.add(id)
             } catch (e: Exception) {
                 log.warn("Failed to delete orphaned doc %d: %s", id, e.message ?: e.toString())

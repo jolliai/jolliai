@@ -193,6 +193,80 @@ export function buildSettingsScript(): string {
     });
   });
 
+  // ── Per-repo outbound push control (spec 306) ──
+  function renderPushControl(repos, unreadable) {
+    var list = document.getElementById('pushControlList');
+    if (!list) return;
+    list.innerHTML = '';
+    // The setting file could not be read. The outbound gate fails CLOSED on the
+    // same file, so every push is being blocked right now — say that before any
+    // row, because the rows below are last-known values and each checkbox would
+    // otherwise read as "Push ✓" while nothing can actually push.
+    if (unreadable) {
+      var bad = document.createElement('div');
+      bad.className = 'error-message visible';
+      bad.textContent =
+        "Can't read the outbound-push setting, so pushing is blocked for every repository until it's fixed. "
+        + 'The states below are the last known ones and may be wrong. Detail: ' + unreadable;
+      list.appendChild(bad);
+    }
+    if (!repos || repos.length === 0) {
+      if (!unreadable) {
+        var empty = document.createElement('div');
+        empty.className = 'hint';
+        empty.textContent = 'No tracked repositories yet. Open a repo or generate a memory and it will appear here.';
+        list.appendChild(empty);
+      }
+      return;
+    }
+    repos.forEach(function(repo) {
+      var rowEl = document.createElement('div');
+      rowEl.className = 'push-control-row';
+      var meta = document.createElement('div');
+      meta.className = 'pc-meta';
+      var name = document.createElement('span');
+      name.className = 'pc-name';
+      name.textContent = repo.repoName + (repo.isCurrentRepo ? ' (this repo)' : '');
+      var path = document.createElement('span');
+      path.className = 'pc-path';
+      path.textContent = repo.repoIdentity;
+      meta.appendChild(name);
+      meta.appendChild(path);
+      var toggleWrap = document.createElement('label');
+      toggleWrap.className = 'pc-toggle';
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !repo.pushDisabled;
+      // The visible label is just "Push", which is identical on every row — name
+      // the repo for screen readers so the control is distinguishable.
+      cb.setAttribute('aria-label', 'Push memories for ' + repo.repoName + ' to its Jolli Space');
+      var cbText = document.createElement('span');
+      cbText.textContent = 'Push';
+      cb.addEventListener('change', function() {
+        var disabled = !cb.checked;
+        vscode.postMessage({
+          command: 'setPushDisabled',
+          repoIdentity: repo.repoIdentity,
+          disabled: disabled,
+          isCurrent: !!repo.isCurrentRepo,
+        });
+        // Show a PENDING message only — the backend confirms (or reverts) by
+        // re-posting the persisted list with a settled status, so we never
+        // claim success before the store write actually lands.
+        var status = document.getElementById('pushControlStatus');
+        if (status) {
+          status.textContent = (disabled ? 'Disabling' : 'Enabling') + ' outbound push for ' + repo.repoName + '…';
+          status.classList.add('visible');
+        }
+      });
+      toggleWrap.appendChild(cb);
+      toggleWrap.appendChild(cbText);
+      rowEl.appendChild(meta);
+      rowEl.appendChild(toggleWrap);
+      list.appendChild(rowEl);
+    });
+  }
+
   // ── Sign-in / Sign-out buttons ──
   function postSignIn() { vscode.postMessage({ command: 'signIn' }); }
   function postSignOut() { vscode.postMessage({ command: 'signOut' }); }
@@ -846,6 +920,23 @@ export function buildSettingsScript(): string {
           // save into a rejection — they were deliberately left armed across the
           // hold, so this is the only place that can still catch them.
           if (!submitApplySettings()) abortApplyChains();
+        }
+        break;
+      case 'pushControlLoaded':
+        // The machine-wide repo list — pushed after settingsLoaded and again
+        // after each toggle so each row reflects the PERSISTED flag (this also
+        // reverts an optimistic checkbox when a toggle failed).
+        renderPushControl(msg.repos, msg.unreadable);
+        if (msg.status) {
+          var pcStatus = document.getElementById('pushControlStatus');
+          if (pcStatus) {
+            pcStatus.textContent = msg.status;
+            pcStatus.classList.add('visible');
+            // Auto-hide the settled status so it doesn't hang around forever
+            // (mirrors saveFeedback). A newer toggle overwrites+re-arms it.
+            if (window.__pcStatusTimer) clearTimeout(window.__pcStatusTimer);
+            window.__pcStatusTimer = setTimeout(function() { pcStatus.classList.remove('visible'); }, 4000);
+          }
         }
         break;
       case 'setLocalFolder':

@@ -1421,6 +1421,22 @@ export interface StatusInfo {
 	readonly mostRecentSession: SessionInfo | null;
 	readonly summaryCount: number;
 	readonly orphanBranch: string;
+	/**
+	 * Whether OUTBOUND push to a Jolli Space is disabled for this repo (spec 306,
+	 * per-repo push control). Memory is still captured locally; only sync is off.
+	 */
+	readonly pushDisabled?: boolean;
+	/**
+	 * Why {@link pushDisabled} is true, when it is NOT the user's recorded choice —
+	 * i.e. the push-control store could not be read and the gate failed closed.
+	 * Carries the store's absolute path.
+	 *
+	 * Present so a status surface can tell the two apart: without it, one corrupt
+	 * file makes every repo on the machine report "you turned this off", which is
+	 * wrong twice over (the user chose nothing, and it isn't per-repo) and points
+	 * away from the single file that needs fixing.
+	 */
+	readonly pushDisabledError?: string;
 	/** Whether Claude Code directory (~/.claude/) was detected */
 	readonly claudeDetected?: boolean;
 	/** Whether Codex directory (~/.codex/) was detected */

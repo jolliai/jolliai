@@ -49,6 +49,7 @@ import {
 	type OpenCodeScanError,
 	scanOpenCodeSessions,
 } from "../core/OpenCodeSessionDiscoverer.js";
+import { readPushDisabledState } from "../core/PushControl.js";
 import { readManualDisableFlag, writeManualDisableFlag } from "../core/RepoProfile.js";
 import { readSchemaV5State } from "../core/SchemaV5Migration.js";
 import {
@@ -1203,6 +1204,11 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	// the Rebuild/Migrate flow peeks instead of resolving.
 	const memoryBank = resolveMemoryBankState(projectDir, config);
 
+	// Per-repo outbound-push opt-out (spec 306). Read the STATE form, not the
+	// boolean: both halves go into StatusInfo so a surface can tell the user's
+	// recorded choice apart from a fail-closed read of an unreadable store.
+	const pushState = await readPushDisabledState(projectDir);
+
 	const status: StatusInfo = {
 		// The extension is "enabled" when the git hook is installed.
 		// Individual integration hooks (Claude, Codex, Gemini) have their own
@@ -1218,6 +1224,13 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		mostRecentSession: filteredMostRecent,
 		summaryCount,
 		orphanBranch: ORPHAN_BRANCH,
+		// readPushDisabledState is already fail-safe (catches internally, reports
+		// disabled on a bad store) and never rejects — a `.catch(() => false)` was dead
+		// code, and would have wrongly reported "enabled" for an unreadable store,
+		// contradicting fail-closed. The `error` half rides along so a status surface can
+		// distinguish the user's opt-out from a fail-closed read (see StatusInfo).
+		pushDisabled: pushState.disabled,
+		...(pushState.error ? { pushDisabledError: pushState.error } : {}),
 		claudeDetected,
 		codexDetected,
 		codexEnabled: config.codexEnabled,

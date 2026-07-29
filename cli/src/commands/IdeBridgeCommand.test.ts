@@ -225,6 +225,19 @@ vi.mock("../core/RepoProfile.js", () => ({
 	updateRepoProfile: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Spreads the real module on purpose: the jolli-api push/delete gate constructs
+// the REAL `PushDisabledError`, whose `name` is the ide-bridge wire contract the
+// IntelliJ side dispatches on. A bare factory omitting it makes the destructured
+// binding `undefined`, so the gate dies with "not a constructor" instead of
+// refusing the push — and a class re-declared here would make the name assertions
+// below vacuous. The three functions are still fully stubbed.
+vi.mock("../core/PushControl.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/PushControl.js")>()),
+	applyPushDisabled: vi.fn().mockResolvedValue(true),
+	isOutboundPushAllowed: vi.fn().mockResolvedValue(true),
+	readPushDisabledState: vi.fn().mockResolvedValue({ disabled: false }),
+}));
+
 vi.mock("../core/SummaryMarkdownBuilder.js", () => ({
 	buildMarkdown: vi.fn().mockReturnValue("# md"),
 	buildReferencePushMarkdown: vi.fn().mockReturnValue("# ref"),
@@ -432,9 +445,14 @@ function captureConsole(): { stdout: string[]; stderr: string[]; consoleLog: str
 	return { stdout, stderr, consoleLog };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
 	daemonWatcherInstances.length = 0;
 	process.exitCode = undefined;
+	// afterEach's restoreAllMocks strips the factory default, and the jolli-api
+	// push/delete gate (spec 306) now reads this predicate — reset it to allowed so
+	// each test starts from a known state; the gate tests override it explicitly.
+	const { isOutboundPushAllowed } = await import("../core/PushControl.js");
+	vi.mocked(isOutboundPushAllowed).mockResolvedValue(true);
 });
 
 afterEach(() => {
@@ -752,6 +770,50 @@ describe("runIdeBridgeAction — active-conversations", () => {
 		const { listActiveConversationsWithDiagnostics } = await import("../core/ActiveSessionAggregator.js");
 		await runIdeBridgeAction("active-conversations", "/repo", { windowMs: 1234 });
 		expect(listActiveConversationsWithDiagnostics).toHaveBeenCalledWith({ cwd: "/repo", windowMs: 1234 });
+	});
+});
+
+describe("runIdeBridgeAction — per-repo push control (spec 306)", () => {
+	it("outbound-push-allowed returns the predicate for the cwd", async () => {
+		const { isOutboundPushAllowed } = await import("../core/PushControl.js");
+		vi.mocked(isOutboundPushAllowed).mockResolvedValue(false);
+		const result = await runIdeBridgeAction("outbound-push-allowed", "/repo", {});
+		expect(isOutboundPushAllowed).toHaveBeenCalledWith("/repo");
+		expect(result).toEqual({ allowed: false });
+	});
+
+	it("push-control-set toggles the current repo (cwd) and echoes the flag", async () => {
+		const { applyPushDisabled } = await import("../core/PushControl.js");
+		const result = await runIdeBridgeAction("push-control-set", "/repo", { disabled: true });
+		expect(applyPushDisabled).toHaveBeenCalledWith("/repo", true, "intellij");
+		expect(result).toEqual({ pushDisabled: true });
+	});
+
+	it("push-control-get returns the pure push-disabled flag for the cwd", async () => {
+		const { readPushDisabledState } = await import("../core/PushControl.js");
+		vi.mocked(readPushDisabledState).mockResolvedValue({ disabled: true });
+		const result = await runIdeBridgeAction("push-control-get", "/repo", {});
+		expect(readPushDisabledState).toHaveBeenCalledWith("/repo");
+		// No `pushDisabledError` key at all when the store read succeeded — its mere
+		// presence is what tells the host "this is not the user's choice".
+		expect(result).toEqual({ pushDisabled: true });
+	});
+
+	// The reporting-surface half of spec 306: an unreadable store fails closed to
+	// `disabled: true` for EVERY repo on the machine, so the boolean alone would have
+	// the IntelliJ Settings checkbox claim the user turned THIS repo off. The error
+	// (carrying the store's path) must reach the host so it can render "unknown".
+	it("push-control-get carries the fail-closed reason when the store is unreadable", async () => {
+		const { readPushDisabledState } = await import("../core/PushControl.js");
+		vi.mocked(readPushDisabledState).mockResolvedValue({
+			disabled: true,
+			error: "unreadable: /home/u/.jolli/jollimemory/push-control.json",
+		});
+		const result = await runIdeBridgeAction("push-control-get", "/repo", {});
+		expect(result).toEqual({
+			pushDisabled: true,
+			pushDisabledError: "unreadable: /home/u/.jolli/jollimemory/push-control.json",
+		});
 	});
 });
 
@@ -1611,6 +1673,47 @@ describe("runIdeBridgeAction — jolli-api", () => {
 	it("deletes a doc via JolliMemoryPushClient", async () => {
 		expect(await runIdeBridgeAction("jolli-api", "/r", { operation: "delete", apiKey: "sk", docId: 7 })).toEqual({
 			ok: true,
+		});
+	});
+
+	it("blocks push and delete when outbound push is disabled for the repo (spec 306)", async () => {
+		const { isOutboundPushAllowed } = await import("../core/PushControl.js");
+		vi.mocked(isOutboundPushAllowed).mockResolvedValue(false);
+		await expect(
+			runIdeBridgeAction("jolli-api", "/repo", { operation: "push", apiKey: "sk", payload: { a: 1 } }),
+		).rejects.toThrow(/Outbound push is disabled/);
+		await expect(
+			runIdeBridgeAction("jolli-api", "/repo", { operation: "delete", apiKey: "sk", docId: 7 }),
+		).rejects.toThrow(/Outbound push is disabled/);
+		expect(isOutboundPushAllowed).toHaveBeenCalledWith("/repo");
+	});
+
+	// The refusal crosses the bridge as `data.errorName` (see
+	// `copyPrimitiveErrorFields`), and IntelliJ's `remapBridgeException` keys off
+	// that exact string to reach its quiet "re-enable to push" handling. A bare
+	// `Error` here (name "Error") falls through to the host's generic
+	// RuntimeException, mislabelling a user opt-out as a push failure.
+	it.each(["push", "delete"] as const)(
+		"names the %s refusal PushDisabledError so IDE hosts can map it",
+		async (operation) => {
+			const { isOutboundPushAllowed } = await import("../core/PushControl.js");
+			vi.mocked(isOutboundPushAllowed).mockResolvedValue(false);
+			const request = operation === "push" ? { payload: { a: 1 } } : { docId: 7 };
+			const error = await runIdeBridgeAction("jolli-api", "/repo", {
+				operation,
+				apiKey: "sk",
+				...request,
+			}).catch((e: unknown) => e);
+			expect((error as Error).name).toBe("PushDisabledError");
+		},
+	);
+
+	it("still allows non-push reads (list-spaces) when push is disabled", async () => {
+		const { isOutboundPushAllowed } = await import("../core/PushControl.js");
+		vi.mocked(isOutboundPushAllowed).mockResolvedValue(false);
+		expect(await runIdeBridgeAction("jolli-api", "/repo", { operation: "list-spaces", apiKey: "sk" })).toEqual({
+			spaces: [],
+			defaultSpaceId: null,
 		});
 	});
 

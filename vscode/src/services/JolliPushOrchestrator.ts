@@ -23,6 +23,7 @@
 
 import type { CommitSummary, NoteReference, PlanReference, ReferenceCommitRef } from "../../../cli/src/Types.js";
 import { deriveJolliEnvKey, resolveArticleUrl } from "../../../cli/src/core/JolliApiUtils.js";
+import { isOutboundPushAllowed } from "../../../cli/src/core/PushControl.js";
 import { buildReferencePushMarkdown } from "../../../cli/src/core/SummaryMarkdownBuilder.js";
 import { readReferenceMarkdownFromString } from "../../../cli/src/core/references/ReferenceStore.js";
 import { readNoteFromBranch, readPlanFromBranch, readReferenceFromBranch } from "../../../cli/src/core/SummaryStore.js";
@@ -37,7 +38,20 @@ import {
 	buildReferencePushTitle,
 } from "../views/SummaryUtils.js";
 import { buildMarkdown } from "../views/SummaryMarkdownBuilder.js";
-import { BindingRequiredError, deleteFromJolli, PluginOutdatedError, pushToJolli } from "./JolliPushService.js";
+import { BindingRequiredError, deleteFromJolli, PushDisabledError, pushToJolli } from "./JolliPushService.js";
+import { isRepoWideRefusal } from "../../../cli/src/core/PushRefusal.js";
+
+/**
+ * Errors that must ABORT this summary's push instead of being collected as a
+ * per-attachment failure: every {@link isRepoWideRefusal} (see `cli/src/core/PushRefusal.ts`
+ * for why that lives in its own module), plus `BindingRequiredError` — fatal
+ * *here* because the orchestrator cannot run the chooser itself, so it propagates
+ * to the caller that can. Shared by all three attachment loops so the set cannot
+ * drift between them.
+ */
+function isFatalPushError(err: unknown): boolean {
+	return isRepoWideRefusal(err) || (err instanceof Error && err.name === "BindingRequiredError");
+}
 
 /** Outcome of the injected binding-chooser callback. */
 export type BindingOutcome = { status: "bound" | "anotherOpen" | "cancelled" | "failed" };
@@ -178,6 +192,17 @@ export async function pushSummaryWithAttachments(
 	options: PushSummaryOptions = {},
 	retried = false,
 ): Promise<PushSummaryResult> {
+	// Story 2: fail fast for a push-disabled repo before uploading anything.
+	// Checking here (not only inside each HTTP call) avoids issuing a doomed
+	// per-attachment push that would be mislabeled as an attachment failure. The
+	// HTTP client still re-checks per call — both as defense-in-depth for any
+	// non-orchestrator caller and because spec 306 requires the flag be read LIVE
+	// (no cached decision), so a mid-push opt-out takes effect immediately. That
+	// makes the gate 1 + N reads for N attachments, each resolving the repo
+	// identity again; deliberate — correctness over saving a few `git config` spawns.
+	if (!(await isOutboundPushAllowed(ctx.workspaceRoot))) {
+		throw new PushDisabledError();
+	}
 	const displayBase = ctx.baseUrl.replace(/\/+$/, "");
 	// Env key of the tenant this push targets — every docId minted below is tagged
 	// with it, and an existing docId is reused as an update target only when its
@@ -189,8 +214,9 @@ export async function pushSummaryWithAttachments(
 
 	try {
 		// Step 1: upload plans + notes. Per-attachment failures are collected, not
-		// thrown, so one bad plan/note doesn't abort the summary push. Fatal
-		// binding/plugin errors still propagate to drive the chooser below.
+		// thrown, so one bad plan/note doesn't abort the summary push. The
+		// `isFatalPushError` set still propagates — to drive the chooser below, or
+		// (opt-out / permission) because every remaining doc would be refused too.
 		const { results: planUrls, failures: planFailures } = await pushPlanList(
 			plansToPush,
 			summary,
@@ -250,17 +276,22 @@ export async function pushSummaryWithAttachments(
 		// the share page renders it directly instead of regex-parsing the markdown.
 		const summaryJson = serializeSummaryJson(summaryForMarkdown);
 
-		const result = await pushToJolli(ctx.baseUrl, ctx.apiKey, {
-			title: buildPushTitle(summary),
-			content: markdown,
-			commitHash: summary.commitHash,
-			docType: "summary",
-			branch: summary.branch,
-			...(summary.jolliDocId && canReuseDocId(summary.jolliDocUrl, envKey) && { docId: summary.jolliDocId }),
-			repoUrl: ctx.repoUrl,
-			relativePath: buildBranchRelativePath(summary.branch),
-			...(summaryJson && { summaryJson }),
-		});
+		const result = await pushToJolli(
+			ctx.baseUrl,
+			ctx.apiKey,
+			{
+				title: buildPushTitle(summary),
+				content: markdown,
+				commitHash: summary.commitHash,
+				docType: "summary",
+				branch: summary.branch,
+				...(summary.jolliDocId && canReuseDocId(summary.jolliDocUrl, envKey) && { docId: summary.jolliDocId }),
+				repoUrl: ctx.repoUrl,
+				relativePath: buildBranchRelativePath(summary.branch),
+				...(summaryJson && { summaryJson }),
+			},
+			ctx.workspaceRoot,
+		);
 
 		track("memory_pushed", { kind: "summary" });
 
@@ -320,8 +351,8 @@ export async function pushSummaryWithAttachments(
 
 /**
  * Uploads the given plans, returning their published URLs + per-plan failures.
- * A single plan failure is collected (not thrown); fatal binding/plugin errors
- * propagate so the caller can drive the chooser.
+ * A single plan failure is collected (not thrown); {@link isFatalPushError} ones
+ * propagate so the caller can drive the chooser / surface the repo-wide refusal.
  */
 async function pushPlanList(
 	plans: ReadonlyArray<PlanReference>,
@@ -347,18 +378,24 @@ async function pushPlanList(
 		}
 		let planResult: Awaited<ReturnType<typeof pushToJolli>>;
 		try {
-			planResult = await pushToJolli(ctx.baseUrl, ctx.apiKey, {
-				title: buildPlanPushTitle(summary, plan.title),
-				content: planContent,
-				commitHash: summary.commitHash,
-				docType: "plan",
-				branch: summary.branch,
-				...(plan.jolliPlanDocId && canReuseDocId(plan.jolliPlanDocUrl, envKey) && { docId: plan.jolliPlanDocId }),
-				repoUrl: ctx.repoUrl,
-				relativePath: buildBranchRelativePath(summary.branch),
-			});
+			planResult = await pushToJolli(
+				ctx.baseUrl,
+				ctx.apiKey,
+				{
+					title: buildPlanPushTitle(summary, plan.title),
+					content: planContent,
+					commitHash: summary.commitHash,
+					docType: "plan",
+					branch: summary.branch,
+					...(plan.jolliPlanDocId &&
+						canReuseDocId(plan.jolliPlanDocUrl, envKey) && { docId: plan.jolliPlanDocId }),
+					repoUrl: ctx.repoUrl,
+					relativePath: buildBranchRelativePath(summary.branch),
+				},
+				ctx.workspaceRoot,
+			);
 		} catch (err) {
-			if (err instanceof BindingRequiredError || err instanceof PluginOutdatedError) throw err;
+			if (isFatalPushError(err)) throw err;
 			const msg = err instanceof Error ? err.message : String(err);
 			log.error("PushOrchestrator", `Plan ${plan.slug} push FAILED: ${msg}`);
 			failures.push({ label: `plan "${plan.title}"`, message: msg });
@@ -414,18 +451,24 @@ async function pushNoteList(
 		}
 		let noteResult: Awaited<ReturnType<typeof pushToJolli>>;
 		try {
-			noteResult = await pushToJolli(ctx.baseUrl, ctx.apiKey, {
-				title: buildNotePushTitle(summary, note.title),
-				content: noteContent,
-				commitHash: summary.commitHash,
-				docType: "note",
-				branch: summary.branch,
-				...(note.jolliNoteDocId && canReuseDocId(note.jolliNoteDocUrl, envKey) && { docId: note.jolliNoteDocId }),
-				repoUrl: ctx.repoUrl,
-				relativePath: buildBranchRelativePath(summary.branch),
-			});
+			noteResult = await pushToJolli(
+				ctx.baseUrl,
+				ctx.apiKey,
+				{
+					title: buildNotePushTitle(summary, note.title),
+					content: noteContent,
+					commitHash: summary.commitHash,
+					docType: "note",
+					branch: summary.branch,
+					...(note.jolliNoteDocId &&
+						canReuseDocId(note.jolliNoteDocUrl, envKey) && { docId: note.jolliNoteDocId }),
+					repoUrl: ctx.repoUrl,
+					relativePath: buildBranchRelativePath(summary.branch),
+				},
+				ctx.workspaceRoot,
+			);
 		} catch (err) {
-			if (err instanceof BindingRequiredError || err instanceof PluginOutdatedError) throw err;
+			if (isFatalPushError(err)) throw err;
 			const msg = err instanceof Error ? err.message : String(err);
 			log.error("PushOrchestrator", `Note ${note.id} push FAILED: ${msg}`);
 			failures.push({ label: `note "${note.title}"`, message: msg });
@@ -445,7 +488,7 @@ async function pushNoteList(
  * Uploads the given archived references as standalone `reference` articles. The
  * body is synthesized from the value snapshot ({@link buildReferencePushMarkdown})
  * since a reference has no on-disk file. Like {@link pushPlanList}, a single
- * transient failure is collected; fatal binding/plugin errors propagate.
+ * transient failure is collected; {@link isFatalPushError} ones propagate.
  */
 async function pushReferenceList(
 	references: ReadonlyArray<ReferenceCommitRef>,
@@ -465,19 +508,24 @@ async function pushReferenceList(
 		const description = storedMd ? (readReferenceMarkdownFromString(storedMd)?.description ?? undefined) : undefined;
 		let refResult: Awaited<ReturnType<typeof pushToJolli>>;
 		try {
-			refResult = await pushToJolli(ctx.baseUrl, ctx.apiKey, {
-				title,
-				content: buildReferencePushMarkdown(ref, description),
-				commitHash: summary.commitHash,
-				docType: "reference",
-				branch: summary.branch,
-				...(ref.jolliReferenceDocId &&
-					canReuseDocId(ref.jolliReferenceDocUrl, envKey) && { docId: ref.jolliReferenceDocId }),
-				repoUrl: ctx.repoUrl,
-				relativePath: buildBranchRelativePath(summary.branch),
-			});
+			refResult = await pushToJolli(
+				ctx.baseUrl,
+				ctx.apiKey,
+				{
+					title,
+					content: buildReferencePushMarkdown(ref, description),
+					commitHash: summary.commitHash,
+					docType: "reference",
+					branch: summary.branch,
+					...(ref.jolliReferenceDocId &&
+						canReuseDocId(ref.jolliReferenceDocUrl, envKey) && { docId: ref.jolliReferenceDocId }),
+					repoUrl: ctx.repoUrl,
+					relativePath: buildBranchRelativePath(summary.branch),
+				},
+				ctx.workspaceRoot,
+			);
 		} catch (err) {
-			if (err instanceof BindingRequiredError || err instanceof PluginOutdatedError) throw err;
+			if (isFatalPushError(err)) throw err;
 			const msg = err instanceof Error ? err.message : String(err);
 			log.error("PushOrchestrator", `Reference ${ref.archivedKey} push FAILED: ${msg}`);
 			failures.push({ label: `reference "${title}"`, message: msg });
@@ -570,7 +618,7 @@ async function cleanupOrphanedDocs(
 	if (orphanedIds.length === 0) return null;
 
 	const results = await Promise.allSettled(
-		orphanedIds.map((id) => deleteFromJolli(displayBase, ctx.apiKey, id).then(() => id)),
+		orphanedIds.map((id) => deleteFromJolli(displayBase, ctx.apiKey, id, ctx.workspaceRoot).then(() => id)),
 	);
 	const deleted = new Set<number>();
 	for (const r of results) {

@@ -460,6 +460,37 @@ class CreatePrPanel(
      * the calling pooled thread; best-effort per memory. Resolves a binding-required
      * (412) once via the chooser dialog, then continues.
      */
+    /**
+     * Maps a share failure to a whole-loop stop reason, or null when it is a
+     * per-memory failure worth counting and moving past.
+     *
+     * Every included memory belongs to the SAME repo, so a sign-in / permission /
+     * opt-out / gate verdict applies to all of them: continuing would fire N doomed
+     * requests and report one repo-wide condition as N per-memory failures.
+     *
+     * This is a FUNCTION, not a chain of `catch` arms, because the share loop has two
+     * failure sites — the first attempt and the post-binding retry — and each new
+     * repo-wide error type would otherwise have to be added to both. It only ever
+     * got added to one, which is exactly how a repo-wide refusal from the retry ended
+     * up counted as a single per-memory failure. Add new repo-wide types HERE.
+     *
+     * `BindingRequiredError` is deliberately absent: it is recoverable (the chooser
+     * runs, then the memory is retried), so it is handled by its own arm rather than
+     * being classified as a stop.
+     */
+    private fun repoWideStopReason(e: Throwable): String? = when (e) {
+        is JolliApiClient.UnauthorizedError -> "sign-in rejected"
+        // Credential is valid but the server refused the push (e.g. the repo isn't
+        // allowlisted for the Space) — an admin problem, not a sign-in one.
+        is JolliApiClient.PermissionDeniedError -> "not allowed — ask an administrator"
+        is JolliApiClient.PluginOutdatedError -> "plugin outdated"
+        // The user opted this repo out of outbound push (spec 306) — not a failure.
+        is JolliShareService.PushDisabledError -> "outbound push disabled"
+        // The gate could not be evaluated (spec 306 fail-closed): nothing was sent.
+        is JolliShareService.PushGateUnavailableError -> "couldn't verify the push setting"
+        else -> null
+    }
+
     private fun shareIncludedMemoriesIfSignedIn(): String {
         val config = SessionTracker.loadConfig(cwd)
         val apiKey = config.jolliApiKey?.takeIf { it.isNotBlank() } ?: return ""
@@ -484,23 +515,30 @@ class CreatePrPanel(
                     break@loop
                 }
                 bindingResolved = true
-                // Retry this memory now that the repo is bound.
+                // Retry this memory now that the repo is bound. The retry is a SECOND
+                // failure site, so it must classify through the same helper: catching
+                // bare Exception here is what let a repo-wide refusal raised by the
+                // retry be counted as one per-memory failure and keep the loop running.
                 try {
                     JolliShareService.shareSummary(store, summary, cwd, apiKey, resolvedBaseUrl)
                     shared++
                 } catch (e2: Exception) {
+                    val reason = repoWideStopReason(e2)
+                    if (reason != null) {
+                        LOG.warn("Share stopped after binding retry — $reason: ${e2.message}")
+                        stopReason = reason
+                        break@loop
+                    }
                     LOG.warn("Share retry failed for ${summary.commitHash.take(8)}: ${e2.message}")
                     failed++
                 }
-            } catch (e: JolliApiClient.UnauthorizedError) {
-                LOG.warn("Share stopped — key rejected: ${e.message}")
-                stopReason = "sign-in rejected"
-                break@loop
-            } catch (e: JolliApiClient.PluginOutdatedError) {
-                LOG.warn("Share stopped — plugin outdated: ${e.message}")
-                stopReason = "plugin outdated"
-                break@loop
             } catch (e: Exception) {
+                val reason = repoWideStopReason(e)
+                if (reason != null) {
+                    LOG.warn("Share stopped — $reason: ${e.message}")
+                    stopReason = reason
+                    break@loop
+                }
                 LOG.warn("Share failed for ${summary.commitHash.take(8)}: ${e.message}")
                 failed++
             }

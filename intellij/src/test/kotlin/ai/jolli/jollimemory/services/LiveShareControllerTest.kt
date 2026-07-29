@@ -38,7 +38,10 @@ class LiveShareControllerTest {
         commitDate = "t", branch = branch, generatedAt = "t",
     )
 
-    private fun deps(summaries: List<CommitSummary>) = LiveShareController.Deps(
+    private fun deps(
+        summaries: List<CommitSummary>,
+        outboundPushAllowed: (String) -> Boolean = { true },
+    ) = LiveShareController.Deps(
         workspaceRoot = root,
         apiKey = apiKey,
         loadBranchSummaries = { summaries },
@@ -46,6 +49,9 @@ class LiveShareControllerTest {
         readPlanFromBranch = { null },
         readNoteBody = { null },
         resolveBinding = { JolliPushOrchestrator.BindingOutcome.CANCELLED },
+        // Hermetic: default allowed so tests never hit the real CLI bridge; the
+        // opt-out test flips it to false.
+        outboundPushAllowed = outboundPushAllowed,
     )
 
     @BeforeEach
@@ -83,6 +89,23 @@ class LiveShareControllerTest {
 
     @AfterEach
     fun tearDown() = unmockkAll()
+
+    @Test
+    fun `generate aborts with PushDisabledError and uploads nothing when the repo opted out of push (spec 306)`() {
+        val ex = shouldThrow<JolliShareService.PushDisabledError> {
+            LiveShareController.generateLiveShare(
+                LiveShareController.GenerateParams(
+                    deps = deps(listOf(summary("aaaa1111"), summary("bbbb2222")), outboundPushAllowed = { false }),
+                    branch = branch,
+                    visibility = "public",
+                ),
+            )
+        }
+        ex.shouldNotBeNull()
+        // The gate is BEFORE any upload — no Space docs and no live share were created.
+        verify(exactly = 0) { JolliPushOrchestrator.pushSummaryWithAttachments(any(), any(), any(), any(), any()) }
+        verify(exactly = 0) { JolliApiClient.createLiveShare(any(), any(), any()) }
+    }
 
     @Test
     fun `generate branch share builds a branchCollection ref covering every commit`() {

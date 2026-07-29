@@ -778,6 +778,16 @@ describe("StatusCommand — Jolli Space row", () => {
 		expect(out).toContain("Jolli Space:      Not bound — no Spaces available to you");
 	});
 
+	it("renders the admin-action hint when no_spaces is restricted (repo allowlisted on none)", async () => {
+		// Spaces exist but this repo isn't allowlisted on any — same condition the
+		// push path reports as 412 repo_not_allowlisted, so point at an admin.
+		mockFrontDoor.mockResolvedValue({ status: "no_spaces", restricted: true });
+		const out = await renderStatus(baseStatus);
+		expect(out).toContain(
+			"Jolli Space:      Not bound — this repo isn't registered in any Space (ask an administrator to add it)",
+		);
+	});
+
 	it("renders not-connected without any HTTP call when no jolliApiKey is configured", async () => {
 		mockLoadConfigFromDir.mockResolvedValue({});
 		const out = await renderStatus(baseStatus);
@@ -921,5 +931,46 @@ describe("StatusCommand — Jolli Space row", () => {
 		expect(out).toContain('Jolli Space:      Bound to Space "Acme Core"');
 		expect(mockLoadCache).not.toHaveBeenCalled();
 		expect(mockSaveCache).not.toHaveBeenCalled();
+	});
+});
+
+describe("StatusCommand — Outbound push row (spec 306)", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockLoadConfigFromDir.mockResolvedValue({});
+		mockLoadAuthToken.mockResolvedValue(null);
+		mockFrontDoor.mockResolvedValue({ status: "no_spaces" });
+		mockTenantOrigin.mockReturnValue(null);
+		mockLoadCache.mockResolvedValue(null);
+	});
+
+	afterEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it("omits the row entirely when outbound push is on", async () => {
+		// The row exists to make a SILENT non-syncing repo visible; printing it in the
+		// healthy case would just add noise to every status call.
+		const out = await renderStatus(baseStatus);
+		expect(out).not.toContain("Outbound push:");
+	});
+
+	it("attributes a genuine opt-out to this repo", async () => {
+		const out = await renderStatus({ ...baseStatus, pushDisabled: true });
+		expect(out).toContain("Outbound push:    Disabled for this repo (memory recorded locally)");
+	});
+
+	it("reports an unreadable store as blocked, naming the file — never as the user's choice", async () => {
+		// The gate fails CLOSED, so one corrupt file makes EVERY repo read disabled.
+		// Saying "Disabled for this repo" there is wrong twice (the user chose nothing,
+		// and it isn't per-repo) and hides the single file that needs repairing.
+		const out = await renderStatus({
+			...baseStatus,
+			pushDisabled: true,
+			pushDisabledError: "Push-control store at /g/push-control.json is corrupt",
+		});
+		expect(out).toContain("Outbound push:    Blocked — setting unreadable");
+		expect(out).toContain("/g/push-control.json");
+		expect(out).not.toContain("Disabled for this repo");
 	});
 });

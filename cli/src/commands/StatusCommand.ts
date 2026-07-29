@@ -125,7 +125,8 @@ export type SpaceBindingStatus =
 			readonly canRebind: boolean;
 	  }
 	| { readonly kind: "unbound"; readonly spaceCount: number }
-	| { readonly kind: "no_spaces" }
+	/** `restricted` true: Spaces exist but this repo isn't allowlisted on any (admin-action-required); false: genuinely none available. */
+	| { readonly kind: "no_spaces"; readonly restricted: boolean }
 	| { readonly kind: "no_key" }
 	| { readonly kind: "auth_rejected" }
 	| { readonly kind: "outdated" }
@@ -187,7 +188,9 @@ async function fetchSpaceBindingStatus(
 		if (result.status === "unbound" && result.spaces.length > 0) {
 			return { kind: "unbound", spaceCount: result.spaces.length };
 		}
-		return { kind: "no_spaces" };
+		// `restricted` only exists on the real `no_spaces` variant; a folded-in
+		// empty `unbound` (contract drift) is never allowlist-restricted.
+		return { kind: "no_spaces", restricted: result.status === "no_spaces" ? result.restricted : false };
 	} catch (error) {
 		if (error instanceof ClientOutdatedError) {
 			return { kind: "outdated" };
@@ -231,6 +234,13 @@ export function describeSpaceBinding(state: SpaceBindingStatus): string {
 		case "unbound":
 			return `Not bound — ${state.spaceCount} Space${state.spaceCount === 1 ? "" : "s"} available (run jolli to bind)`;
 		case "no_spaces":
+			// `restricted`: Spaces exist but this repo isn't allowlisted on any —
+			// same admin-action-required condition the push path reports as 412
+			// `repo_not_allowlisted`, so point at an administrator (mirrors the
+			// front door's SpaceSyncStep hint), not at "create a Space".
+			if (state.restricted) {
+				return "Not bound — this repo isn't registered in any Space (ask an administrator to add it)";
+			}
 			// Caller-relative on the server: also the answer when Spaces exist
 			// but none are visible/bindable to this key — don't claim "the
 			// tenant has none".
@@ -535,6 +545,18 @@ export function registerStatusCommand(program: Command): void {
 			console.log(`  Jolli Account:    ${authToken ? "Signed in" : "Not signed in"}`);
 			console.log(`  Jolli API Key:    ${config?.jolliApiKey ? "Configured" : "Not configured"}`);
 			console.log(`  Jolli Space:      ${describeSpaceBinding(spaceBinding)}`);
+			// Only surface the row when push is off — a silent non-syncing repo is
+			// exactly what spec 306 must make visible. Two different reasons, two
+			// different sentences: attributing a fail-closed read of a corrupt store to
+			// the user ("Disabled for this repo") is wrong twice over — they chose
+			// nothing, and it isn't per-repo — and it hides the one file to fix.
+			if (status.pushDisabled) {
+				console.log(
+					status.pushDisabledError
+						? `  Outbound push:    Blocked — setting unreadable (${status.pushDisabledError})`
+						: "  Outbound push:    Disabled for this repo (memory recorded locally)",
+				);
+			}
 			console.log(`  AI Provider:      ${describeAiProvider(config)}`);
 			// Anthropic Key row only when the user picked Anthropic — mirrors the
 			// VS Code Status panel, where the key warning shows solely for the

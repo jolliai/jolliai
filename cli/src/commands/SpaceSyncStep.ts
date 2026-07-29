@@ -125,6 +125,17 @@ export async function runSpaceSyncStep(cwd: string, opts: SpaceSyncStepOpts = {}
 		// access to every one of them.
 		if (result.status === "no_spaces" || result.spaces.length === 0) {
 			await clearSpaceBindingCache(cwd);
+			// `restricted` lives only on the `no_spaces` variant, so narrow first.
+			// Spaces exist but every one repo-allowlists and this repo is on none —
+			// the same admin-action-required condition the push path surfaces as a
+			// 412 `repo_not_allowlisted`, so the guidance must match (point at an
+			// administrator, not "create a Space").
+			if (result.status === "no_spaces" && result.restricted) {
+				console.log(
+					"  This repo isn't registered in any Jolli Space — ask an administrator to add it in the Space's settings",
+				);
+				return;
+			}
 			const site = siteFromApiKey(config.jolliApiKey);
 			console.log(
 				`  No Jolli Spaces available to you — create one${site ? ` at ${site}` : " in the Jolli web app"}`,

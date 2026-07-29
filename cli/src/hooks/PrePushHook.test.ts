@@ -8,9 +8,15 @@ import { execFileAsyncHidden } from "../util/Subprocess.js";
 import { PRE_PUSH_SYNC_BUDGET_MS, parsePushRefs, prePushEntry } from "./PrePushHook.js";
 
 const mockReadManualDisableFlag = vi.hoisted(() => vi.fn().mockResolvedValue(false));
+const mockReadPushDisabledState = vi.hoisted(() => vi.fn().mockResolvedValue({ disabled: false }));
 
 vi.mock("../core/SessionTracker.js", () => ({ loadConfig: vi.fn() }));
-vi.mock("../core/RepoProfile.js", () => ({ readManualDisableFlag: mockReadManualDisableFlag }));
+vi.mock("../core/RepoProfile.js", () => ({
+	readManualDisableFlag: mockReadManualDisableFlag,
+}));
+vi.mock("../core/PushControl.js", () => ({
+	readPushDisabledState: mockReadPushDisabledState,
+}));
 vi.mock("../core/PushPendingStore.js", () => ({ mergeEntries: vi.fn() }));
 vi.mock("../core/PushExecutor.js", () => ({ processPrePushInline: vi.fn() }));
 vi.mock("../core/StorageFactory.js", () => ({ createStorage: vi.fn() }));
@@ -44,6 +50,7 @@ beforeEach(() => {
 	vi.mocked(getSummary).mockResolvedValue(null);
 	vi.mocked(execFileAsyncHidden).mockResolvedValue({ stdout: "c1\nc2\n", stderr: "" });
 	mockReadManualDisableFlag.mockResolvedValue(false);
+	mockReadPushDisabledState.mockResolvedValue({ disabled: false });
 });
 
 afterEach(() => {
@@ -72,6 +79,36 @@ describe("prePushEntry", () => {
 		await prePushEntry(CWD, `refs/heads/x ${LOCAL} refs/heads/x ${REMOTE}\n`, REMOTE_NAME);
 		expect(mergeEntries).not.toHaveBeenCalled();
 		expect(processPrePushInline).not.toHaveBeenCalled();
+	});
+
+	it("records commits but skips inline sync when outbound push is disabled for the repo (spec 306)", async () => {
+		mockReadPushDisabledState.mockResolvedValue({ disabled: true });
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		await prePushEntry(CWD, `refs/heads/x ${LOCAL} refs/heads/x ${REMOTE}\n`, REMOTE_NAME);
+		// Entries are still recorded (a later re-enable catches up) but no sync runs.
+		expect(mergeEntries).toHaveBeenCalled();
+		expect(processPrePushInline).not.toHaveBeenCalled();
+		// A genuine opt-out is the ONE case that may point at --enable.
+		expect(stderr.mock.calls.flat().join("")).toContain("jolli push-control --enable");
+	});
+
+	it("does NOT offer --enable when the OFF came from an unreadable store (spec 306)", async () => {
+		// --enable rebuilds a corrupt store from empty and drops EVERY repo's
+		// opt-out. This notice prints on every `git push`, so recommending it here
+		// would be the most-seen path to silent data loss in the feature. Point at
+		// `jolli push-control`, which explains the trade-off, and name the file.
+		mockReadPushDisabledState.mockResolvedValue({
+			disabled: true,
+			error: "Push-control store at /g/push-control.json is corrupt",
+		});
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		await prePushEntry(CWD, `refs/heads/x ${LOCAL} refs/heads/x ${REMOTE}\n`, REMOTE_NAME);
+		expect(mergeEntries).toHaveBeenCalled();
+		expect(processPrePushInline).not.toHaveBeenCalled();
+		const written = stderr.mock.calls.flat().join("");
+		expect(written).toContain("can't read your outbound-push setting");
+		expect(written).toContain("/g/push-control.json");
+		expect(written).not.toContain("--enable");
 	});
 
 	it("records commits but does NOT sync inline when not signed in", async () => {

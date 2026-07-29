@@ -83,8 +83,10 @@ export class BatchUnsupportedError extends Error {
 }
 
 /**
- * Server returned 403 — the API key is valid but lacks permission to write
- * (no `articles.edit` on the bound Space, or a key scope restriction).
+ * The API key is valid but the server refused the push. Two server shapes map
+ * here: a 412 `repo_not_allowlisted` (the repo is not registered in a Space that
+ * restricts memory repos — an admin must add it) and a push-path 403 (an
+ * ownership mismatch, or a missing `articles.edit`/key-scope restriction).
  * Distinct from {@link NotAuthenticatedError} so user-facing surfaces (the
  * pre-push result list) don't mislabel a permission problem as "not signed
  * in". Config-class: retrying without a permission change cannot succeed.
@@ -120,6 +122,15 @@ export interface JolliMemorySpace {
  * read call; both stay `[]`/null on healthy bindings and older servers.
  * `unbound` means several Spaces are bindable and the caller should prompt,
  * then bind via {@link JolliMemoryPushClient.createBinding}.
+ *
+ * `no_spaces` means nothing is bindable. Its `restricted` flag distinguishes the
+ * two reasons the caller must act on differently: `false` — the caller genuinely
+ * has no Space to bind to (create one), the historical meaning; `true` — Spaces
+ * exist but every one repo-allowlists its memory repos and THIS repo is on none
+ * of those allowlists. That second case is the same admin-action-required
+ * condition the push path surfaces as a 412 `repo_not_allowlisted`, so guidance
+ * must point at an administrator, not at "create a Space". Older servers omit the
+ * field → `restricted: false`, i.e. today's "no Spaces available" behavior.
  */
 export type FrontDoorResult =
 	| {
@@ -137,7 +148,7 @@ export type FrontDoorResult =
 			readonly spaces: ReadonlyArray<JolliMemorySpace>;
 			readonly defaultSpaceId: number | null;
 	  }
-	| { readonly status: "no_spaces" };
+	| { readonly status: "no_spaces"; readonly restricted: boolean };
 
 /** How to reach a platform tool's backend endpoint, as advertised by the manifest. */
 export interface PlatformToolBinding {
@@ -251,6 +262,8 @@ interface FrontDoorResponseBody {
 	};
 	readonly spaces?: ReadonlyArray<{ readonly id: number; readonly name: string; readonly slug: string }>;
 	readonly defaultSpaceId?: number | null;
+	/** On `no_spaces`: Spaces exist but all repo-allowlist and this repo is on none. Absent on older servers → false. */
+	readonly restricted?: boolean;
 }
 
 /** Generic error-shaped JSON body: `{ error?: string; message?: string }`. */
@@ -524,7 +537,10 @@ export class JolliMemoryPushClient {
 			return { status: "unbound", spaces, defaultSpaceId: json.defaultSpaceId ?? null };
 		}
 		if (json.status === "no_spaces") {
-			return { status: "no_spaces" };
+			// Older servers omit `restricted` → false, preserving today's
+			// "no Spaces available" guidance. `true` = Spaces exist but this repo
+			// isn't allowlisted on any of them (admin-action-required).
+			return { status: "no_spaces", restricted: json.restricted === true };
 		}
 		// A 2xx whose body carries no recognizable status (field renamed, contract
 		// drift) — fail loudly rather than have the caller misread the repo state.
@@ -572,6 +588,13 @@ export class JolliMemoryPushClient {
 		}
 		if (status === 412 && json.error === "binding_required") {
 			throw new BindingRequiredError(json.repoUrl ?? payload.repoUrl ?? "", json.message);
+		}
+		// The allowlist refusal: the server emits `repo_not_allowlisted` as 412 (NOT
+		// 403 — that status is the bind path's `space_restricted`). Treat it like the
+		// other admin-action-required rejections so `classifyError` holds the retry
+		// budget instead of hammering the server with doomed pushes.
+		if (status === 412 && json.error === "repo_not_allowlisted") {
+			throw new PermissionDeniedError(errorMessage(json));
 		}
 		if (status === 409 && json.error === "binding_already_exists") {
 			throw new BindingAlreadyExistsError(json.message ?? "binding_already_exists");
@@ -625,6 +648,13 @@ export class JolliMemoryPushClient {
 		}
 		if (status === 412 && json.error === "binding_required") {
 			throw new BindingRequiredError(json.repoUrl ?? payload.repoUrl ?? "", json.message);
+		}
+		// The allowlist refusal: the server emits `repo_not_allowlisted` as 412 (NOT
+		// 403 — that status is the bind path's `space_restricted`). Treat it like the
+		// other admin-action-required rejections so `classifyError` holds the retry
+		// budget instead of hammering the server with doomed pushes.
+		if (status === 412 && json.error === "repo_not_allowlisted") {
+			throw new PermissionDeniedError(errorMessage(json));
 		}
 		if (status === 401) {
 			throw new NotAuthenticatedError();

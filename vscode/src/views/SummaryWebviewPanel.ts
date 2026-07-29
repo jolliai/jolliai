@@ -69,7 +69,7 @@ import {
 	removePlan,
 } from "../core/PlanService.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
-import { PluginOutdatedError, parseJolliApiKey } from "../services/JolliPushService.js";
+import { PluginOutdatedError, parseJolliApiKey, PushDisabledError } from "../services/JolliPushService.js";
 import {
 	type PushContext,
 	pushSummaryWithAttachments,
@@ -2208,6 +2208,15 @@ export class SummaryWebviewPanel {
 						"Push failed — could not bind a Memory space for this repo.",
 					);
 				}
+				throw err;
+			}
+			if (err instanceof PushDisabledError) {
+				// A deliberate per-repo opt-out (spec 306), NOT a failure — memory is
+				// still recorded locally. Surface it as information (mirrors IntelliJ's
+				// info dialog and the CLI's exit-0), then rethrow so the push button
+				// resets. Showing a red "Push failed" toast would misrepresent the
+				// user's own choice as an error.
+				vscode.window.showInformationMessage(err.message);
 				throw err;
 			}
 			if (err instanceof PluginOutdatedError) {

@@ -64,6 +64,7 @@ import {
 	pushSummary,
 } from "./JolliMemoryPushOrchestrator.js";
 import { loadBranchSummaries } from "./PrDescription.js";
+import { isOutboundPushAllowed, PushDisabledError } from "./PushControl.js";
 import {
 	type BatchUpdate,
 	claimForPush,
@@ -127,6 +128,11 @@ export interface ProcessPushPendingResult {
 export function classifyError(err: unknown): { readonly increment: boolean; readonly message: string } {
 	if (err instanceof NotAuthenticatedError) return { increment: false, message: "not-authenticated" };
 	if (err instanceof PermissionDeniedError) return { increment: false, message: "permission-denied" };
+	// The repo's own outbound opt-out (spec 306), tripped mid-drain by the live
+	// re-check inside the orchestrator. Never burn a retry on it: retrying cannot
+	// succeed until the user changes the setting, and the entry must survive intact
+	// so the re-enable drain picks it up.
+	if (err instanceof PushDisabledError) return { increment: false, message: "push-disabled" };
 	if (err instanceof BindingRequiredError) return { increment: false, message: "binding-required" };
 	if (err instanceof ClientOutdatedError) return { increment: false, message: "client-outdated" };
 	return { increment: true, message: errMsg(err) };
@@ -399,6 +405,18 @@ export async function processPushPending(
 		return { ...empty, note: "syncOnPush disabled" };
 	}
 
+	// Per-repo opt-out gate (Story 2): the user disabled OUTBOUND push for this
+	// repo. Keep the entries (re-enabling drains them) but upload nothing. Applies
+	// to every caller (activation, post-queue, pre-push) exactly like syncOnPush.
+	if (!(await isOutboundPushAllowed(cwd))) {
+		log.info(
+			"processPushPending(%s): push disabled for this repo — skipping %d entries",
+			options.source,
+			allHashes.length,
+		);
+		return { ...empty, note: "push disabled for this repo" };
+	}
+
 	// Auth gate: without a jolliApiKey there is nothing to push to. Keep the
 	// entries (the user may sign in later) and return without marking failures.
 	if (!config.jolliApiKey) {
@@ -573,9 +591,43 @@ export async function processPushPending(
 		}
 		const batchGroups = partitionBatchItems(built.filter((item) => item.batchIneligibleReason === undefined));
 
+		/**
+		 * Every claimed candidate this drain has not attempted yet, counted from
+		 * `fromGroupIndex`: that group onwards, this chunk's individual-fallback items
+		 * (they run only after the group loop finishes), and the chunks never reached.
+		 * Disjoint from the hashes already in `updates`, which belong to groups the
+		 * loop has passed.
+		 */
+		const unattemptedFrom = (fromGroupIndex: number): string[] => [
+			...batchGroups.slice(fromGroupIndex).flatMap((group) => group.map((item) => item.item.commitHash)),
+			...individualFallbackHashes,
+			...withMemory.slice(index),
+		];
+
 		for (let groupIndex = 0; groupIndex < batchGroups.length; groupIndex++) {
 			const batchBuilt = batchGroups[groupIndex];
 			const batchHashes = batchBuilt.map((item) => item.item.commitHash);
+			// Story 2 / spec 306: re-read the opt-out before EVERY batch so a user who
+			// disables push mid-drain stops the remaining sends. Nothing is marked failed
+			// and no retry is burned — but every unattempted entry must also have its
+			// CLAIM released, or the re-enable drain (which runs immediately on toggle-on)
+			// finds them still claimed by this run and skips them: `claimForPush` honours
+			// a claim for CLAIM_STALE_MS (5 min), and the drain is a single detached pass
+			// with no retry of its own, so the backlog would sit until some unrelated
+			// trigger. Same fix as the mirror site in `processPrePushInline`, folded into
+			// the run's existing single `updateBatch` write instead of a second one.
+			if (!(await isOutboundPushAllowed(cwd))) {
+				const held = unattemptedFrom(groupIndex);
+				releaseClaimsInto(updates, held);
+				log.info(
+					"processPushPending(%s): push disabled mid-drain — stopping before batch %d of %d, releasing %d claim(s)",
+					options.source,
+					groupIndex + 1,
+					batchGroups.length,
+					held.length,
+				);
+				break batchLoop;
+			}
 			let batchResult: BatchPushResult;
 			try {
 				batchResult = await client.pushBatch({ repoUrl, items: batchBuilt.map((item) => item.item) });
@@ -616,16 +668,7 @@ export async function processPushPending(
 				const failedAtIso = new Date().toISOString();
 				// Config failures affect every unsent item identically, so release all
 				// remaining claims without wasting more network requests.
-				const affected = increment
-					? batchHashes
-					: [
-							...batchHashes,
-							...batchGroups
-								.slice(groupIndex + 1)
-								.flatMap((group) => group.map((item) => item.item.commitHash)),
-							...individualFallbackHashes,
-							...withMemory.slice(index),
-						];
+				const affected = increment ? batchHashes : [...batchHashes, ...unattemptedFrom(groupIndex + 1)];
 				for (const hash of affected) {
 					updates.set(hash, {
 						kind: "patch",
@@ -723,6 +766,28 @@ export async function processPushPending(
 }
 
 /**
+ * Per-commit outcome of the fallback loop. `held` means the push was skipped by
+ * the per-repo outbound opt-out (spec 306) — no attempt is recorded, so it is
+ * deliberately counted as neither a success nor a failure; only the claim is
+ * released (see {@link releaseClaimsInto}).
+ */
+type PushOutcome = "pushed" | "failed" | "held";
+
+/**
+ * Stages a claim-release-only update for `hashes`: an empty patch clears
+ * `claimedAt` and touches nothing else (see `updateBatch`), so the entry becomes
+ * indistinguishable from one this drain never reached — no `lastError`, no retry
+ * burned — while any later drain can re-claim it immediately instead of waiting
+ * out the 5-minute claim TTL.
+ *
+ * The in-place variant of {@link releaseClaims}, for callers that already have an
+ * `updates` map being flushed in one `updateBatch` write.
+ */
+function releaseClaimsInto(updates: Map<string, BatchUpdate>, hashes: Iterable<string>): void {
+	for (const hash of hashes) updates.set(hash, { kind: "patch", patch: {} });
+}
+
+/**
  * Legacy per-commit push loop — retained as the fallback for servers that
  * predate the batch endpoint. Identical semantics to the pre-batch drain:
  * re-reads each summary right before the network call (stale-summary race
@@ -750,7 +815,20 @@ async function pushCandidatesIndividually(args: {
 	// The server's Space echo from any successful push this run (concurrent
 	// writers all observe the same binding, so last-write-wins is fine).
 	let confirmedSpace: { readonly id: number; readonly name: string } | undefined;
-	const results = await mapWithConcurrency(hashes, PUSH_CONCURRENCY, async (hash): Promise<"pushed" | "failed"> => {
+	const results = await mapWithConcurrency(hashes, PUSH_CONCURRENCY, async (hash): Promise<PushOutcome> => {
+		// Story 2 / spec 306: the drain's entry gate ran once, before this loop.
+		// Re-read the opt-out per commit so a user who disables push mid-drain stops
+		// the REMAINING sends — the VS Code client and the IntelliJ bridge both
+		// re-check per outbound call, and this is where the native CLI matches them.
+		// "held" is deliberately neither pushed nor failed: no attempt is recorded and
+		// no retry is burned. The claim IS released, because the re-enable drain runs
+		// immediately on toggle-on and `claimForPush` would otherwise skip a claim this
+		// young for CLAIM_STALE_MS (5 min) — leaving the backlog for an unrelated later
+		// trigger, the opposite of the catch-up this branch exists to enable.
+		if (!(await isOutboundPushAllowed(cwd))) {
+			releaseClaimsInto(updates, [hash]);
+			return "held";
+		}
 		// Re-read immediately before the network call so a concurrent rewrite or
 		// cleanup cannot make us publish a stale summary captured earlier.
 		const freshSummary = await getSummary(hash, cwd, storage);
@@ -774,6 +852,15 @@ async function pushCandidatesIndividually(args: {
 			updates.set(hash, { kind: "delete" });
 			return "pushed";
 		} catch (err) {
+			// The orchestrator's live re-check tripped between attachments (the
+			// per-commit check above passed). Record no attempt — no lastError, no retry —
+			// so the entry is indistinguishable from one this drain never reached, and
+			// report it as held rather than failed. Releasing the claim is what makes that
+			// true for the re-enable drain as well; see the per-commit gate above.
+			if (err instanceof PushDisabledError) {
+				releaseClaimsInto(updates, [hash]);
+				return "held";
+			}
 			const { increment, message } = classifyError(err);
 			if (
 				err instanceof BindingRequiredError ||
@@ -805,7 +892,9 @@ async function pushCandidatesIndividually(args: {
 	});
 	for (const result of results) {
 		if (result === "pushed") counters.pushed++;
-		else counters.failed++;
+		else if (result === "failed") counters.failed++;
+		// "held" (opt-out) is counted as neither: nothing was sent and nothing failed,
+		// and the entry stays pending for the re-enable drain.
 	}
 	await persistConfirmedSpace(ctx, confirmedSpace);
 }
@@ -943,6 +1032,14 @@ export async function processPrePushInline(
 	if (config.syncOnPush === false) {
 		log.info("processPrePushInline: syncOnPush disabled — skipping %d entries", allHashes.length);
 		return { ...EMPTY_INLINE_RESULT, note: "syncOnPush disabled" };
+	}
+	// Per-repo opt-out gate (Story 2). Entries are recorded write-first by the
+	// hook before this call, so returning here keeps them pending (a later
+	// re-enable drains them) while uploading nothing — the "record locally, skip
+	// outbound" behavior. The hook surfaces the note.
+	if (!(await isOutboundPushAllowed(cwd))) {
+		log.info("processPrePushInline: push disabled for this repo — skipping %d entries", allHashes.length);
+		return { ...EMPTY_INLINE_RESULT, note: "push disabled for this repo" };
 	}
 	if (!config.jolliApiKey) {
 		log.info("processPrePushInline: not signed in — keeping %d entries for later", allHashes.length);
@@ -1186,6 +1283,22 @@ export async function processPrePushInline(
 	// Capture the latest remaining budget immediately before the network call.
 	const requestClient = options.client ?? new JolliMemoryPushClient({ timeoutMs: remainingMs() });
 	const requestCtx: PushContext = { ...preparationCtx, client: requestClient };
+	// Story 2 / spec 306: re-read the opt-out immediately before the send. The entry
+	// gate ran at the top of this function, but preparation (summary reads, batch
+	// building) sits in between — a toggle in that window must stop this batch.
+	// Mirrors the BatchUnsupportedError path: release the claims and defer, so the
+	// hook-recorded entries stay pending for the re-enable drain with no retry burned.
+	if (!(await isOutboundPushAllowed(cwd))) {
+		log.info("processPrePushInline: push disabled mid-run — holding %d commit(s)", batchHashes.length);
+		await releaseClaims(cwd, batchHashes);
+		deferAll(batchHashes, "outbound push disabled for this repo");
+		return {
+			...baseResult,
+			notAttempted: deferredByBatchLimit.length + batchHashes.length,
+			commits: commitsInPushOrder(options.priorityHashes, outcomes),
+			note: "push disabled for this repo",
+		};
+	}
 	log.info("processPrePushInline: pushing %d commit(s) in one batch request", batchBuilt.length);
 	let batchResult: BatchPushResult;
 	try {

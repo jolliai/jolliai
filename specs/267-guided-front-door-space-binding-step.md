@@ -53,7 +53,7 @@ The response is validated field-by-field into exactly one of three outcomes:
 | ----------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `bound`     | `status: "bound"`, `binding: { jmSpaceId, spaceName, canPush }`, and — only on a **degraded** bound response — `spaces` / `defaultSpaceId` | The repo already has a binding **or** the server auto-bound it (see below). `jmSpaceId` and `spaceName` are each **`null` when the caller lacks view permission** on the bound Space — the server withholds the Space identity but still reports bound-ness. `canPush` mirrors the server's push-right check: `false` means the next push will be rejected; `null` means an older server that doesn't report it (unknown, not broken). |
 | `unbound`   | `status: "unbound"`, `spaces: [{ id, name, slug }]`, `defaultSpaceId: number \| null` | Several Spaces are bindable; the caller must pick one and bind it. `defaultSpaceId` is the tenant's configured default when set, otherwise `null`.                  |
-| `no_spaces` | `status: "no_spaces"`                                                            | The tenant has no Space this repo can be bound to.                                                                                                                 |
+| `no_spaces` | `status: "no_spaces"`, `restricted: boolean`                                    | Nothing is bindable. `restricted: false` — the caller has no Space to bind to at all (create one). `restricted: true` — Spaces exist but every one repo-allowlists its memory repos and this repo is on none of those allowlists; the same admin-action-required condition the push path reports as `412 repo_not_allowlisted`. Older servers omit the field → normalized to `false`. |
 
 **Server-side auto-bind.** The server binds the repo itself when **exactly one** Space is bindable, and reports that as `bound`. Consequently the client only ever needs a follow-up binding call after an `unbound` outcome (several Spaces → the user picked one). A correct server therefore never returns `unbound` with a single-Space list, nor `unbound` with an empty list — the client tolerates both as contract drift (see Behavior).
 
@@ -73,7 +73,7 @@ The response is dispatched by status code first, then by body shape:
 | `2xx` whose body is **not JSON** (proxy/gateway HTML or plain text) | **Fail loudly** with a "malformed (non-JSON) response" error — never read as empty state.  |
 | `2xx` JSON with `status: "bound"` and a well-formed `binding` | `bound` outcome.                                                                            |
 | `2xx` JSON with `status: "unbound"`               | `unbound` outcome.                                                                          |
-| `2xx` JSON with `status: "no_spaces"`             | `no_spaces` outcome.                                                                        |
+| `2xx` JSON with `status: "no_spaces"`             | `no_spaces` outcome; `restricted` is read as a boolean (`true` only when the body says so, else `false`). |
 | `2xx` JSON with an **unrecognized / missing** `status` (or a `bound` status with a malformed `binding`) | **Fail loudly** with an "unexpected response shape" error — the caller must not misread the repo state. |
 
 An empty but valid JSON body (`{}`) is *not* a parse failure; it has no recognized `status`, so it lands in the fail-loud "unexpected shape" arm. The distinction matters: a non-JSON `2xx` from an intermediary must never be silently read as "no Spaces" and mask an outage. All of these errors are then absorbed by the step's best-effort posture (below) — the point of failing loud at the client boundary is to keep a malformed body from being mistaken for a *legitimate* empty/unknown state, not to abort the front door.
@@ -99,7 +99,7 @@ An empty but valid JSON body (`{}`) is *not* a parse failure; it has no recogniz
 
 When the server attached a non-empty bindable pool to a degraded response, drop the `(ask for access)` hint (the rebind prompt supplies the way out instead) and run the interactive rebind offer (below) immediately after. Done.
 
-**`no_spaces`, or `unbound` with an empty Space list** — clear the local binding cache first, then print `  No Jolli Spaces available to you — create one at <host>`, where `<host>` is the host of the site URL embedded in the API key; if that host can't be determined, print `… create one in the Jolli web app` instead. Done. (An empty `unbound` list is contract drift — a correct server answers `no_spaces` when nothing is bindable — so it is folded into the same hint rather than prompting with zero choices.)
+**`no_spaces`, or `unbound` with an empty Space list** — clear the local binding cache first, then print a hint. If the outcome is `no_spaces` with `restricted: true`, the hint is instead `  This repo isn't registered in any Jolli Space — ask an administrator to add it in the Space's settings` — Spaces exist but this repo is allowlisted on none, the same admin-action-required condition the push path reports as `412 repo_not_allowlisted`, so "create a Space" would be the wrong guidance. Otherwise (genuinely no Spaces, or a folded-in empty `unbound`) print `  No Jolli Spaces available to you — create one at <host>`, where `<host>` is the host of the site URL embedded in the API key; if that host can't be determined, print `… create one in the Jolli web app` instead. Done. (`restricted` lives only on the `no_spaces` variant, so the empty-`unbound` contract-drift case — a correct server answers `no_spaces` when nothing is bindable — never takes the administrator branch; it is folded into the plain create-one hint rather than prompting with zero choices.)
 
 **`unbound` with one or more Spaces** — pick a Space, then bind:
 
@@ -153,7 +153,7 @@ Terminal outcomes of a single run:
 
 - **Silent no-op** — no `jolliApiKey` configured, or any swallowed error.
 - **Confirmed** — `  ✓ syncing · Space "<name>"` printed (from a healthy `bound`, from a fresh bind, from a confirmed-match race, or from a successful rebind).
-- **Hint** — `  No Jolli Spaces available to you …` printed (from `no_spaces` or an empty `unbound`).
+- **Hint** — `  No Jolli Spaces available to you …` printed (from a non-restricted `no_spaces` or an empty `unbound`), or `  This repo isn't registered in any Jolli Space — ask an administrator …` printed (from a `no_spaces` with `restricted: true`).
 - **Degraded warning** — `  ⚠ bound · no access to the Space …` or `  ⚠ bound · Space "<name>" — read-only access …` printed (from a degraded `bound`), optionally followed by the interactive rebind offer.
 - **Race warning** — `  ⚠ this repo is already bound to a different Jolli Space …` printed (from an unconfirmable already-exists race), or `  ⚠ rebind failed — re-run jolli to retry` (from an unconfirmable rebind race).
 

@@ -115,9 +115,14 @@ vi.mock("../services/JolliPushOrchestrator.js", () => ({
 		}
 	},
 }));
+// Every error class the panel branches on must be present: the panel does
+// `err instanceof X`, so a missing export is not a silently-unmatched branch but
+// a TypeError ("Right-hand side of 'instanceof' is not callable") that hijacks
+// the catch it was meant to classify.
 vi.mock("../services/JolliPushService.js", () => ({
 	parseJolliApiKey: mocks.parseJolliApiKey,
 	PluginOutdatedError: class PluginOutdatedError extends Error {},
+	PushDisabledError: class PushDisabledError extends Error {},
 }));
 vi.mock("../util/WorkspaceUtils.js", () => ({ loadGlobalConfig: mocks.loadGlobalConfig }));
 vi.mock("../util/GitRemoteUtils.js", () => ({

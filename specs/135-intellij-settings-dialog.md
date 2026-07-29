@@ -11,7 +11,8 @@ Two surfaces that together let an IntelliJ user edit their Jolli Memory configur
 - The modal dialog opened from the tool window gear icon: its title `Jolli Memory Settings`, its OK button text `Apply Changes`, its fixed preferred size, its last-selected-tab memory, and its five tabs — **AI Agents**, **AI Summary**, **Sync to Jolli**, **Memory Bank**, **Others** — and everything each tab edits.
 - The Memory Bank tab's **Historical memory** entry point ("Generate Missing Summaries"): what it runs, how it relates to the tool-window cold-start card's dismiss marker, and how it differs from the tab's separate "Migrate to Memory Bank" action.
 - The AI Summary tab's provider-dependent card switching (Anthropic / Jolli-signed-in / Jolli-signed-in-no-key / Jolli-signed-out) and its "Advanced" disclosure for the Jolli API key field.
-- The Sync tab's own provider-independent card switching (signed-out / signed-in-no-key / signed-in) and its auto-sync / transcript / poll-interval fields.
+- The Sync tab's own provider-independent card switching (signed-out / signed-in-no-key / signed-in) and its per-repo outbound-push toggle.
+- The `Sync transcripts` checkbox on the Memory Bank tab, and the two config fields (`autoSyncEnabled`, `syncPollIntervalSec`) that are **round-tripped without any control** on any tab.
 - The shared save target: a single global config directory; both surfaces read from and write to the same file.
 - The validation rules surfaced via the dialog's continuous validation (provider-specific requirements; max-tokens must be a positive integer when set; at least one of the six platform checkboxes must stay enabled).
 - The apply-vs-OK semantics: the IDE-native page exposes Apply (no dialog dismissal) plus OK (apply + close); the gear-icon dialog only has OK (relabeled `Apply Changes`) and Cancel, and defers its heaviest work (hook install/uninstall, Memory Bank init + migration, and re-pointing the session's memory-mirror read source) to a background task that runs **after** the dialog has already closed.
@@ -88,8 +89,8 @@ The dialog's center panel is a tabbed pane. Selecting a tab is remembered (a pro
 | - | ---------------- | ------------------------------------------------------------------------------------------------------------------ |
 | 1 | **AI Agents**     | A gray explainer line, then six enable/disable checkboxes (see Platform checkboxes below), all default checked.  |
 | 2 | **AI Summary**    | A `Provider:` dropdown (`Anthropic` / `Jolli`) driving a four-card panel (see AI Summary provider cards below), plus a collapsible "Advanced" Jolli-API-key field below the card. |
-| 3 | **Sync to Jolli** | A three-card sign-in panel (see Sync tab cards below), a separator, then `Auto-sync to Personal Space` (default on), `Sync transcripts` (default off), and a poll-interval field. |
-| 4 | **Memory Bank**   | A folder-path picker, a sort-order dropdown, a `Migrate to Memory Bank` button, and (below a spacer) the **Historical memory** section: a heading, an explainer, and a `Generate Missing Summaries` button. |
+| 3 | **Sync to Jolli** | A three-card sign-in panel (see Sync tab cards below), a separator, then the **Push to Jolli Space (this repository)** section: a bold heading, the `Push this repository's memories to Jolli` checkbox, and a gray explainer. |
+| 4 | **Memory Bank**   | A folder-path picker, a sort-order dropdown, a `Migrate to Memory Bank` button, then `Sync transcripts` (default off) with a gray explainer, and (below a spacer) the **Historical memory** section: a heading, an explainer, and a `Generate Missing Summaries` button. |
 | 5 | **Others**        | An `Exclude Patterns` heading + comma-separated globs field, a `Pause Jolli Memory` checkbox, and a `Privacy` heading with a telemetry opt-in checkbox and a hyperlink to telemetry details. |
 
 ### Platform checkboxes (AI Agents tab)
@@ -135,7 +136,11 @@ A separate three-card panel, independent of the AI Summary tab's provider select
 | Signed in, no key | Signed in but no Jolli API key saved | A warning line, a `Sign Out & Re-login` button, and its own `Advanced` toggle revealing its own Jolli-API-key field. |
 | Signed in, has key | Signed in and a Jolli API key exists | A green-check "ready to push memories" line and a `Sign Out` button. |
 
-Below the card: `Auto-sync to Personal Space` (checked by default), `Sync transcripts` (unchecked by default), and a `Poll interval (seconds):` field (tooltip: blank defaults to 90 minutes; shorter values are raised to the 90-minute floor).
+Below the card, after a separator, the **Push to Jolli Space (this repository)** section: a bold heading, a `Push this repository's memories to Jolli` checkbox, and a gray explainer ("Off = keep recording this repository's memory locally but never push it to its Jolli Space (auto or manual). Re-enabling syncs the backlog."). This is the IntelliJ face of the per-repo outbound-push control (spec 306) — it is **not** a config-file field: it is read via the `push-control-get` IDE bridge and written via `push-control-set`, against the machine-global push-control store.
+
+The checkbox starts **disabled** and is enabled only once the async read lands, so the dialog never asserts a state it does not have. A read that fails — or answers with a malformed reply — leaves it disabled with an explanatory tooltip and leaves the row marked *not loaded*, which suppresses the write in `doOKAction` entirely; the state is re-read next time Settings opens. The write fires only when the value actually changed, so re-saving Settings never re-triggers the re-enable drain, and a failed write raises a warning notification rather than being swallowed (the dialog has already closed by then).
+
+`Auto-sync to Personal Space` and its paired `Poll interval (seconds):` field are **no longer surfaced** on any tab (not yet actionable); `Sync transcripts` moved to the **Memory Bank** tab, next to the other content-scope controls. See the field map below for how the two unsurfaced values are preserved.
 
 ### Memory Bank tab: folder controls
 
@@ -177,9 +182,10 @@ Below the folder controls, a **Historical memory** section with a `Generate Miss
 | Memory Bank folder path                  | `knowledgeBasePath` (defaults to the standard Memory Bank parent directory when left blank).           |
 | Memory Bank sort order                   | `knowledgeBaseSort` (`date` or `name`).                                                                |
 | Pause                                    | `paused` (true, or null when unchecked — not `false`).                                                |
-| Auto-sync                                | `autoSyncEnabled` (null when checked — the "on" default — or `false` when unchecked).                 |
-| Sync transcripts                         | `syncTranscripts` (true, or null when unchecked).                                                      |
-| Poll interval                            | `syncPollIntervalSec` (parsed integer, or null when blank).                                            |
+| *(no control)*                           | `autoSyncEnabled` — **round-tripped verbatim**: `populateFields` snapshots the loaded value and `doOKAction` writes exactly that back. |
+| Sync transcripts *(Memory Bank tab)*     | `syncTranscripts` (true, or null when unchecked).                                                      |
+| *(no control)*                           | `syncPollIntervalSec` — **round-tripped verbatim**, same as `autoSyncEnabled`.                          |
+| Push this repository's memories to Jolli | **Not a config field.** Read/written through the `push-control-get` / `push-control-set` IDE bridge against the machine-global push-control store (spec 306); written only when changed, and only once the async read has landed. |
 | Telemetry opt-in/out                     | Written to the shared telemetry flag immediately (not through the config load-merge-save cycle), and applied live to the running telemetry context in the same click — not deferred to IDE restart. |
 
 The IDE-native page edits only `apiKey`, `model`, and `jolliApiKey` — it does not touch provider, max-tokens, excluded patterns, platform toggles, Memory Bank fields, pause, or sync fields; those exist only in the gear-icon dialog.
@@ -252,7 +258,7 @@ Clicking the OK button (`Apply Changes`):
 1. Resolves the provider (`"anthropic"` / `"local-agent"` / `"jolli"`), the effective Anthropic key, parsed max-tokens, and the split/trimmed excluded-patterns list.
 2. Resolves the Jolli API key per the precedence in Field persistence semantics above, and records whether that resolution *clears* a previously-existing key. **No sign-out is dispatched at this point.**
 3. Resolves the Memory Bank folder path (falling back to the standard default when blank) and sort order.
-4. Builds the merged config from all of the above plus the six platform booleans, pause, auto-sync, sync-transcripts, and poll-interval — **and, when the key was cleared, a nulled session token in the same record** — and saves it.
+4. Builds the merged config from all of the above plus the six platform booleans, pause, sync-transcripts, and the two round-tripped values (`autoSyncEnabled`, `syncPollIntervalSec`, written back exactly as they were loaded — no control edits them) — **and, when the key was cleared, a nulled session token in the same record** — and saves it.
 5. Applies the telemetry opt-in/out choice immediately to the live telemetry context (not deferred to restart) and records a provider-selection event.
 6. **Only now**, after every interface-thread write has landed, fires the asynchronous sign-out if the key was cleared.
 7. Computes the auto-disable decision (see below).
@@ -262,6 +268,7 @@ Clicking the OK button (`Apply Changes`):
    - If a project path is available: initializes the Memory Bank folder for the resolved path and then migrates into it **unconditionally** — this flow performs no existence probe of its own. Whether there is anything to migrate is decided inside the one-shot migration command (which no-ops when there is no orphan-branch data and runs its idempotent reconcile once migration has already completed), so this branch has no "nothing to migrate" outcome to report. (The existence probe, and the message dialog that goes with it, belong to the Memory Bank tab's Migrate button instead.)
    - **Then, in the same branch and immediately after that migration, asks the JolliMemory service to re-point its direct memory-mirror read source at the newly configured folder and storage mode.** This step is what makes the two Memory Bank settings this dialog owns — the folder path, and (via the storage mode) whether a mirror is read at all — actually take effect in the running session. Without it, both changes appear to apply and do not: the service's initialization is single-shot, so the read source stays attached to the folder resolved at project open, and every memory, plan, and note read keeps coming from that previous folder (or keeps coming from the mirror after the mode stopped writing one) for the rest of the session. The re-attach itself is fail-soft — a failure leaves the previous attachment in place — and resolving to *no* read source is a normal outcome that simply sends reads back to the orphan branch. Owned by specs 124 (the hook) and 307 (the read source).
    - Synchronizes the global agent instructions, by running the command-line surface's integrations-only enable rather than an in-process installer.
+   - Persists the per-repo outbound-push toggle through the `push-control-set` bridge — **only** when the async read had landed *and* the value actually changed, so merely re-saving Settings never re-triggers the re-enable drain. A failure here surfaces as a warning notification (the dialog is already closed, so silence would leave the user believing it saved).
    - Refreshes status once, after all of the above has settled.
 
 Cancel discards all edits with no I/O; it does not undo a `Migrate to Memory Bank` or `Generate Missing Summaries` run already triggered earlier in the same dialog session, since those are independent immediate actions.

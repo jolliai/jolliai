@@ -98,6 +98,9 @@ export function registerPushCommand(program: Command): void {
 					lines.push("  Re-run with --space <id|slug> to bind and push.");
 					lines.push("");
 					console.log(lines.join("\n"));
+				} else if (result.type === "push_disabled") {
+					// A deliberate opt-out, not a failure — inform and exit clean.
+					console.log(`\n  ${result.message}\n`);
 				} else {
 					emitError(result.message, options.format);
 				}

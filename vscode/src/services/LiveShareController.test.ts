@@ -54,7 +54,7 @@ import {
 	subjectFingerprint,
 } from "./LiveShareController.js";
 import { ShareBindingError } from "./JolliPushOrchestrator.js";
-import { PluginOutdatedError } from "./JolliPushService.js";
+import { PermissionDeniedError, PluginOutdatedError, PushDisabledError } from "./JolliPushService.js";
 
 // Maps a commit hash to a deterministic summary docId for assertions.
 const SUMMARY_DOC = { A: 1001, B: 1002, C: 1003 } as const;
@@ -647,6 +647,45 @@ describe("reconcileLiveShare", () => {
 		expect(stored.shareUrl).toBe("https://acme.jolli.ai/b/x"); // cached fallback
 	});
 
+	it("skips quietly (no PATCH, no throw) when the repo opted out of outbound push (spec 306)", async () => {
+		// The share modal reconciles on every open, so letting the opt-out escape
+		// would show the user's own setting as the modal's "Couldn't refresh the
+		// shared content" error. Leave the cached record untouched instead —
+		// matches IntelliJ's reconcile branch.
+		mockGetShare.mockResolvedValue({
+			shareId: "7",
+			shareUrl: "https://acme.jolli.ai/b/x",
+			visibility: "public",
+			ref: { kind: "branchCollection", relativePath: "feature/x", covered: [] },
+			expiresAt: "2026-09-01T00:00:00.000Z",
+			decisionCount: 1,
+		});
+		mockLoad.mockResolvedValue({ summaries: [summary("A")], missingCount: 0 });
+		mockPush.mockRejectedValue(new PushDisabledError());
+
+		await expect(reconcileLiveShare(deps(), "feature/x")).resolves.toBeUndefined();
+		expect(mockUpdate).not.toHaveBeenCalled();
+		expect(mockPutShare).not.toHaveBeenCalled();
+	});
+
+	it("still propagates a non-opt-out push failure from reconcile", async () => {
+		// The quiet skip is scoped to PushDisabledError — a real failure must keep
+		// reaching the modal's error surface.
+		mockGetShare.mockResolvedValue({
+			shareId: "7",
+			shareUrl: "https://acme.jolli.ai/b/x",
+			visibility: "public",
+			ref: { kind: "branchCollection", relativePath: "feature/x", covered: [] },
+			expiresAt: "2026-09-01T00:00:00.000Z",
+			decisionCount: 1,
+		});
+		mockLoad.mockResolvedValue({ summaries: [summary("A")], missingCount: 0 });
+		mockPush.mockRejectedValue(new PermissionDeniedError("repo not allowlisted"));
+
+		await expect(reconcileLiveShare(deps(), "feature/x")).rejects.toBeInstanceOf(PermissionDeniedError);
+		expect(mockUpdate).not.toHaveBeenCalled();
+	});
+
 	it("preserves the cached shareUrl/expiry/recipients when the ref-only PATCH omits them", async () => {
 		mockGetShare.mockResolvedValue({
 			shareId: "7",
@@ -790,6 +829,28 @@ describe("pushBranchMemoriesToSpace", () => {
 		mockPush.mockRejectedValueOnce(new PluginOutdatedError("outdated"));
 
 		await expect(pushBranchMemoriesToSpace(deps(), "feature/x")).rejects.toBeInstanceOf(PluginOutdatedError);
+		expect(mockPush).toHaveBeenCalledTimes(1);
+	});
+
+	it("propagates a PushDisabledError instead of collecting it once per summary (spec 306)", async () => {
+		// The opt-out is repo-wide: every remaining summary would be refused too.
+		// Collecting it would turn the user's own setting into "Shared 0 memories,
+		// but 3 failed" and re-read the gate for each remaining commit.
+		mockLoad.mockResolvedValue({ summaries: [summary("A"), summary("B"), summary("C")] });
+		mockPush.mockRejectedValue(new PushDisabledError());
+
+		await expect(pushBranchMemoriesToSpace(deps(), "feature/x")).rejects.toBeInstanceOf(PushDisabledError);
+		expect(mockPush).toHaveBeenCalledTimes(1);
+	});
+
+	it("propagates a PermissionDeniedError instead of firing a doomed request per summary", async () => {
+		// `repo_not_allowlisted` / ownership mismatch is equally repo-wide, but it
+		// comes from the server — so collecting it costs one refused HTTP request
+		// per remaining commit on top of the misleading report.
+		mockLoad.mockResolvedValue({ summaries: [summary("A"), summary("B"), summary("C")] });
+		mockPush.mockRejectedValue(new PermissionDeniedError("repo not allowlisted"));
+
+		await expect(pushBranchMemoriesToSpace(deps(), "feature/x")).rejects.toBeInstanceOf(PermissionDeniedError);
 		expect(mockPush).toHaveBeenCalledTimes(1);
 	});
 });

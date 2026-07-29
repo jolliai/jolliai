@@ -181,6 +181,19 @@ export function buildSettingsHtml(nonce: string): string {
         <div class="status-ok"><span class="status-icon">✓</span> Signed in — ready to push memories</div>
         <button type="button" class="browse-btn" id="syncSignOutBtn">Sign Out</button>
       </div>
+
+      <!-- ── Per-repo outbound push control (spec 306) ─────────────────────── -->
+      <hr class="settings-divider" />
+      <div class="settings-row column">
+        <label class="settings-label">
+          Outbound push per repo
+          <span class="hint">Every repository on this machine that Jolli tracks. Turning one <strong>off</strong> keeps capturing its memory locally but blocks all outbound sync (auto and manual). New repos are allowed by default. <strong>Each toggle applies immediately</strong> — no “Apply Changes” needed. Re-enabling a repo syncs its retained backlog on that repo’s next activity (right away for the repo you’re currently in). (Local-only repos with no git remote are managed from within the repo instead.)</span>
+        </label>
+        <div id="pushControlList" class="push-control-list">
+          <div class="hint" id="pushControlEmpty">Loading…</div>
+        </div>
+        <div id="pushControlStatus" class="save-feedback" role="status"></div>
+      </div>
     </section>
 
     <!-- ── Tab 4: Memory Bank ── -->

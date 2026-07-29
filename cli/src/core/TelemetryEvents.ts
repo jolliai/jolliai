@@ -31,6 +31,8 @@ export const TELEMETRY_EVENTS = {
 		"A GUI surface activated (VS Code activate / IntelliJ project open), carrying `surface_version`. First-seen (install_id, surface_version) ≈ new + upgrade installs that launched. GUI-only — CLI new/upgrade is read from any event's surface_version.",
 	surface_enabled: "A surface was enabled in a repo. Props: trigger.",
 	surface_disabled: "A surface was disabled / opted out. Props: trigger, reason.",
+	push_enabled: "Outbound push re-enabled for a repo (spec 306, per-repo push control). Props: trigger.",
+	push_disabled: "Outbound push disabled for a repo (spec 306, per-repo push control). Props: trigger.",
 	signin_started: "User initiated OAuth sign-in. Props: trigger.",
 	signin_completed: "jolliApiKey minted — the conversion event. Props: api_key_minted.",
 	signed_out: "User logged out. Props: none.",

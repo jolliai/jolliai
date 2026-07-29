@@ -41,7 +41,8 @@ import { loadBranchSummaries } from "../views/BranchSummaryLoader.js";
 import { buildBranchRelativePath } from "../views/SummaryUtils.js";
 import type { BindingOutcome, PushAttachmentFailure, PushContext } from "./JolliPushOrchestrator.js";
 import { pushSummaryWithAttachments, ShareBindingError } from "./JolliPushOrchestrator.js";
-import { PluginOutdatedError } from "./JolliPushService.js";
+import { PushDisabledError } from "./JolliPushService.js";
+import { isRepoWideRefusal } from "../../../cli/src/core/PushRefusal.js";
 import { createLiveShare, type LiveShareResult, updateLiveShare } from "./JolliShareService.js";
 
 /** Raised when the share subject has no generated summaries to push. */
@@ -541,7 +542,21 @@ export function reconcileLiveShare(deps: LiveShareDeps, branch: string): Promise
 		const baseUrl = resolveBaseUrl(deps.apiKey);
 		const repoUrl = await getCanonicalRepoUrl(deps.workspaceRoot);
 		const ctx = buildPushContext(deps, baseUrl, repoUrl);
-		const ref = await pushSubjectAndBuildRef(subjectSummaries, "branch", branch, ctx);
+		// Reconcile is a best-effort background pass (the share modal opens it on every
+		// view), so a push-disabled repo just means "nothing to sync outbound" — skip
+		// quietly and leave the cached record intact. Letting it escape would surface
+		// the user's own opt-out as the modal's red "Couldn't refresh the shared
+		// content" toast. Mirrors IntelliJ's LiveShareController reconcile branch.
+		let ref: LiveRef;
+		try {
+			ref = await pushSubjectAndBuildRef(subjectSummaries, "branch", branch, ctx);
+		} catch (err) {
+			if (err instanceof PushDisabledError) {
+				log.info("LiveShare", `reconcile: outbound push disabled for this repo; skipping re-push of ${branch}`);
+				return;
+			}
+			throw err;
+		}
 
 		// Recap edits move `contentHash` (see subjectFingerprint), so the blurb refreshes
 		// on the same reconcile that republishes the content.
@@ -577,8 +592,9 @@ export interface PushBranchMemoriesResult {
 	/**
 	 * Summaries whose own article push failed with a non-fatal error (transient
 	 * network / HTTP 5xx). Collected instead of aborting the batch so an early
-	 * success is not lost when a later summary fails — fatal binding/plugin
-	 * errors still propagate and abort. `pushedCount` counts only successes.
+	 * success is not lost when a later summary fails. Repo-wide conditions —
+	 * binding, outdated plugin, push opt-out, permission refusal — never land
+	 * here; they propagate and abort. `pushedCount` counts only successes.
 	 */
 	readonly summaryFailures: ReadonlyArray<PushAttachmentFailure>;
 }
@@ -589,8 +605,9 @@ export interface PushBranchMemoriesResult {
  * {@link generateLiveShare}. Best-effort on attachments (non-strict): a single
  * unreadable plan/note is collected into `attachmentFailures`, not thrown. Fatal
  * binding / plugin errors propagate (BindingRequiredError → ShareBindingError via
- * the injected `resolveBinding`). Throws {@link NothingToShareError} when the
- * branch has no summaries.
+ * the injected `resolveBinding`), as do the repo-wide refusals
+ * {@link PushDisabledError} and {@link PermissionDeniedError}. Throws
+ * {@link NothingToShareError} when the branch has no summaries.
  */
 export function pushBranchMemoriesToSpace(deps: LiveShareDeps, branch: string): Promise<PushBranchMemoriesResult> {
 	return withSubjectLock(deps.workspaceRoot, branch, async () => {
@@ -622,9 +639,21 @@ export function pushBranchMemoriesToSpace(deps: LiveShareDeps, branch: string): 
 				attachmentCount += result.attachmentCount;
 				attachmentFailures.push(...result.attachmentFailures);
 			} catch (err) {
-				// Fatal for the whole batch — a missing Space binding or an outdated
-				// plugin will fail every remaining summary too, so stop here.
-				if (err instanceof ShareBindingError || err instanceof PluginOutdatedError) throw err;
+				// Fatal for the whole batch: every summary here belongs to the SAME repo,
+				// so a repo-wide refusal (outdated plugin, this repo's push opt-out,
+				// the server's allowlist/ownership verdict) fails all of them —
+				// collecting them would report one condition as "Shared 0 memories, but
+				// N failed" AND keep firing doomed requests for every remaining commit.
+				// `ShareBindingError` is added on top: the chooser already ran and did
+				// not produce a binding, so retrying the rest is equally pointless.
+				//
+				// Membership comes from `cli/src/core/PushRefusal.ts` rather than a local `instanceof`
+				// chain, so a new repo-wide type is added once and every classifier picks
+				// it up — and it is imported from a module no test stubs, so a partial
+				// mock can't turn the predicate into `undefined`.
+				if (isRepoWideRefusal(err) || err instanceof ShareBindingError) {
+					throw err;
+				}
 				// Transient (network / HTTP 5xx): record and keep going so earlier
 				// successes are not discarded by a later failure.
 				summaryFailures.push({

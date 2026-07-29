@@ -23,6 +23,17 @@ vi.mock("./SpaceBindingCache.js", () => ({
 	clearSpaceBindingCache: vi.fn(),
 	saveSpaceBindingCache: vi.fn(),
 }));
+// Story 2 gate. cwd is a fake path (no git), so the real predicate would throw
+// on the mocked GitOps; stub it (default allowed) — its own logic is covered by
+// RepoProfile.test.ts.
+// Spread the REAL module and override only the gate. An enumerating factory would
+// silently drop every other export — and the module under test also uses
+// `PushDisabledError`, so an omission surfaces as `new undefined()` (a TypeError
+// swallowed by the caller's catch) rather than as a missing-mock error.
+vi.mock("./PushControl.js", async (orig) => ({
+	...(await orig<typeof import("./PushControl.js")>()),
+	isOutboundPushAllowed: vi.fn(),
+}));
 
 import { getDefaultBranch } from "./GitOps.js";
 import { buildBranchRelativePath, getCanonicalRepoUrl } from "./GitRemoteUtils.js";
@@ -56,6 +67,7 @@ import {
 	serializeSummaryJson,
 } from "./JolliMemoryPushOrchestrator.js";
 import { loadBranchSummaries } from "./PrDescription.js";
+import { isOutboundPushAllowed } from "./PushControl.js";
 import { loadPushPending } from "./PushPendingStore.js";
 import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import { buildPushTitle } from "./SummaryFormat.js";
@@ -68,6 +80,16 @@ import {
 	readReferenceFromBranch,
 	storeSummary,
 } from "./SummaryStore.js";
+
+// The outbound gate is consulted before EVERY send (see
+// `assertOutboundStillAllowed`), not just at the entry points, so every push test
+// in this file now reaches it. Default it to ALLOWED here rather than in the mock
+// factory: vitest's `clearMocks` clears calls but NOT implementations, so a
+// `mockResolvedValue(false)` set inside one test would otherwise leak into every
+// test that runs after it. Tests that need a disabled repo override this locally.
+beforeEach(() => {
+	vi.mocked(isOutboundPushAllowed).mockResolvedValue(true);
+});
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -958,6 +980,33 @@ describe("pushSummary", () => {
 		expect(pushed.plans?.[0].jolliPlanDocUrl).toBe(`${BASE}/articles?doc=99`);
 	});
 
+	// Repo-wide refusals must ABORT the attachment loop, not be collected per item:
+	// the verdict applies to every doc in the repo, so continuing fires N doomed
+	// requests and logs N misleading `Plan X push FAILED` lines for one cause.
+	// Membership lives in `PushRefusal.ts` — the one source of truth for all three
+	// surfaces — so this pins the CLI half of that contract.
+	it.each([
+		["PermissionDeniedError", "repo not allowlisted"],
+		["PushDisabledError", "outbound push disabled"],
+	])("aborts the attachment loop on a repo-wide %s instead of collecting it", async (name, message) => {
+		const err = new Error(message);
+		err.name = name;
+		const client = fakeClient({
+			push: async (payload) => {
+				if (payload.docType === "plan") throw err;
+				return fakePushResult({ docId: 42 });
+			},
+		});
+		vi.mocked(readPlanFromBranch).mockResolvedValue("# Plan content");
+		const plans = [plan({ slug: "p1" }), plan({ slug: "p2" })];
+		const summary = leaf({ plans });
+
+		await expect(pushSummary(summary, baseCtx(client), { plans, notes: [] })).rejects.toThrow(message);
+		// Stopped at the FIRST plan — the second plan and the summary itself were
+		// never attempted.
+		expect(client.push).toHaveBeenCalledTimes(1);
+	});
+
 	it("includes docId in the plan payload when the plan already carries jolliPlanDocId", async () => {
 		const client = fakeClient();
 		vi.mocked(readPlanFromBranch).mockResolvedValue("# Plan content");
@@ -1365,6 +1414,40 @@ describe("pushBranchToJolli", () => {
 		vi.mocked(loadBranchSummaries).mockReset();
 		vi.mocked(saveSpaceBindingCache).mockReset().mockResolvedValue(undefined);
 		vi.mocked(clearSpaceBindingCache).mockReset().mockResolvedValue(undefined);
+		vi.mocked(isOutboundPushAllowed).mockReset().mockResolvedValue(true);
+	});
+
+	it("returns push_disabled without any network call when the repo opted out (Story 2)", async () => {
+		vi.mocked(isOutboundPushAllowed).mockResolvedValue(false);
+		const client = fakeClient();
+		const result = await pushBranchToJolli({ cwd: "/repo", client });
+		expect(result.type).toBe("push_disabled");
+		expect(loadBranchSummaries).not.toHaveBeenCalled();
+	});
+
+	// The entry gate alone is not enough: a branch push is a LOOP of network calls
+	// that can run for many seconds, and spec 306 requires the flag be read LIVE.
+	// VS Code re-checks inside its HTTP client and IntelliJ inside the bridge, so
+	// without a per-send re-check the native CLI would keep leaking after a toggle.
+	it("stops mid-run when the repo is disabled between summaries, reporting push_disabled (not error)", async () => {
+		const client = fakeClient();
+		vi.mocked(loadBranchSummaries).mockResolvedValue({
+			summaries: [leaf({ commitHash: "aaa1111" }), leaf({ commitHash: "bbb2222" })],
+			missingCount: 0,
+		});
+		// Allowed for the entry gate and the first summary's send, then revoked.
+		vi.mocked(isOutboundPushAllowed)
+			.mockResolvedValueOnce(true)
+			.mockResolvedValueOnce(true)
+			.mockResolvedValue(false);
+
+		const result = await pushBranchToJolli({ cwd: "/repo", client });
+
+		// Reported as the opt-out, NOT as `type:"error"` — `jolli push` exits 0 and
+		// MCP `push_memory` must not mark a deliberate user setting as a failure.
+		expect(result.type).toBe("push_disabled");
+		// The second summary was never sent.
+		expect(client.push).toHaveBeenCalledTimes(1);
 	});
 
 	it("persists the binding cache when a pushed summary echoes the bound Space", async () => {

@@ -1,6 +1,6 @@
 # Spec corpus index
 
-309 behavioral specifications reverse-engineered from this repository's actual code, grouped below by
+310 behavioral specifications reverse-engineered from this repository's actual code, grouped below by
 theme and ordered by number within each group.
 
 **These specs document reality, not intent.** Every statement in them was derived from — and is meant
@@ -242,6 +242,7 @@ gate a change.
 - [269 — Push-Pending Queue and Claim-Based Drain Engine](269-push-pending-queue-and-drain-engine.md) — two entry points over one drain core that atomically claims each commit, uploads with bounded concurrency, and tracks a retry budget.
 - [270 — Push-Pending Compensation Retry](270-push-pending-compensation-retry.md) — a fire-and-forget catch-up on activation or sign-in that retries every queued commit with no hash filter.
 - [301 — Memory Reference Identifier and Copy Chip](301-memory-reference-id-chip.md) — a memory's human-facing identifier, minted only once the backend has one, and the click-to-copy chip that surfaces it — always on detail panels, synced-only in lists, so a chip in a list is itself the "already pushed" signal.
+- [310 — Per-Repo Outbound-Push Control](310-per-repo-outbound-push-control.md) — a machine-global, identity-keyed `pushDisabled` store and one `isOutboundPushAllowed` predicate gating every CLI/VS Code/IntelliJ push path, plus a current-repo toggle on each surface.
 
 ## PR authoring
 

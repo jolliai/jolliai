@@ -317,6 +317,7 @@ const {
 	mockDeleteFromJolli,
 	MockPluginOutdatedError,
 	MockBindingRequiredError,
+	MockPushDisabledError,
 	mockParseJolliApiKey,
 } = vi.hoisted(() => {
 	class MockPluginOutdatedError extends Error {
@@ -333,11 +334,18 @@ const {
 			this.repoUrl = repoUrl;
 		}
 	}
+	class MockPushDisabledError extends Error {
+		constructor(msg = "Outbound push is disabled for this repo.") {
+			super(msg);
+			this.name = "PushDisabledError";
+		}
+	}
 	return {
 		mockPushToJolli: vi.fn().mockResolvedValue({ docId: 42 }),
 		mockDeleteFromJolli: vi.fn().mockResolvedValue(undefined),
 		MockPluginOutdatedError,
 		MockBindingRequiredError,
+		MockPushDisabledError,
 		mockParseJolliApiKey: vi
 			.fn()
 			.mockReturnValue({ u: "https://example.jolli.app" }),
@@ -349,7 +357,15 @@ vi.mock("../services/JolliPushService.js", () => ({
 	deleteFromJolli: mockDeleteFromJolli,
 	PluginOutdatedError: MockPluginOutdatedError,
 	BindingRequiredError: MockBindingRequiredError,
+	PushDisabledError: MockPushDisabledError,
 	parseJolliApiKey: mockParseJolliApiKey,
+}));
+
+// spec 306: the orchestrator now gates on the outbound-push opt-out up front.
+// Stub it allowed so these push tests don't hit real git / the machine-global
+// store; the gate's own logic is covered in PushControl.test.
+vi.mock("../../../cli/src/core/PushControl.js", () => ({
+	isOutboundPushAllowed: vi.fn(async () => true),
 }));
 
 const { mockGetCanonicalRepoUrl, mockDeriveRepoNameFromUrl } = vi.hoisted(
@@ -2225,11 +2241,13 @@ describe("SummaryWebviewPanel", () => {
 					"https://my.jolli.app",
 					"jk_valid",
 					10,
+					workspaceRoot,
 				);
 				expect(mockDeleteFromJolli).toHaveBeenCalledWith(
 					"https://my.jolli.app",
 					"jk_valid",
 					20,
+					workspaceRoot,
 				);
 				// storeSummary called twice: once for the push, once for orphan cleanup
 				expect(mockStoreSummary).toHaveBeenCalledTimes(2);
@@ -6955,6 +6973,7 @@ describe("SummaryWebviewPanel", () => {
 					"https://my.jolli.app",
 					"jk_valid",
 					expect.objectContaining({ docId: 77, relativePath: "main" }),
+					workspaceRoot,
 				);
 			});
 		});
@@ -6978,6 +6997,7 @@ describe("SummaryWebviewPanel", () => {
 					"https://my.jolli.app",
 					"jk_valid",
 					expect.objectContaining({ docId: 42 }),
+					workspaceRoot,
 				);
 			});
 		});

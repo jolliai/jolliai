@@ -153,8 +153,18 @@ object JolliApiClient {
     /** Thrown when the server rejects the request due to outdated plugin version (HTTP 426). */
     class PluginOutdatedError(message: String) : RuntimeException(message)
 
-    /** Thrown when the server rejects the API key (HTTP 401/403) — invalid/disabled/wrong org. */
+    /** Thrown when the server rejects the API key (HTTP 401) — invalid/disabled/wrong org. */
     class UnauthorizedError(message: String) : RuntimeException(message)
+
+    /**
+     * The server accepted the credential but refused the push. Two server shapes
+     * map here: a 412 `repo_not_allowlisted` (the repo is not registered in a
+     * restricted Space — an admin must add it) and a push-path 403 (an ownership
+     * mismatch). Distinct from [UnauthorizedError]: the user should contact an
+     * admin, not re-login. Mirrors the CLI / VS Code `PermissionDeniedError` so
+     * all three clients surface the same actionable text (cross-client parity).
+     */
+    class PermissionDeniedError(message: String) : RuntimeException(message)
 
     /** Thrown when the server returns 412 because the repo has no space binding yet. */
     class BindingRequiredError(
@@ -206,11 +216,17 @@ object JolliApiClient {
     /**
      * Pushes a commit summary to a Jolli Space via the CLI ide-bridge.
      *
+     * @param cwd the working tree of the repo being pushed FROM. Required (not
+     *   defaulted) because the CLI side evaluates the per-repo outbound-push
+     *   opt-out against it — a default would silently re-introduce the
+     *   wrong-project gate described on `callJolliApi`. Callers already hold it:
+     *   `PushContext.workspaceRoot` / the panel's project `cwd`.
      * @param baseUrl Jolli site base URL override. When null the CLI derives it from the API key metadata.
      * @param apiKey Jolli API key (sk-jol-...)
      * @param payload Summary content to push
      */
     fun pushToJolli(
+        cwd: String,
         baseUrl: String?,
         apiKey: String,
         payload: JolliPushPayload,
@@ -221,7 +237,7 @@ object JolliApiClient {
             if (baseUrl != null) addProperty("baseUrl", baseUrl)
             add("payload", pushPayloadJson(payload))
         }
-        val response = callJolliApi(request, payload.repoUrl)
+        val response = callJolliApi(request, payload.repoUrl, cwd)
         val obj = response.asJsonObjectOrNull()
             ?: throw RuntimeException("push endpoint returned a non-object response")
         return parsePushResponse(obj)
@@ -264,15 +280,20 @@ object JolliApiClient {
         created = obj.boolOrFalse("created"),
     )
 
-    /** Deletes an orphaned JolliMemory article from the server. */
-    fun deleteFromJolli(baseUrl: String?, apiKey: String, docId: Int) {
+    /**
+     * Deletes an orphaned JolliMemory article from the server.
+     *
+     * @param cwd the working tree of the repo the article belongs to — required
+     *   for the same reason as [pushToJolli]'s: `delete` is per-repo gated.
+     */
+    fun deleteFromJolli(cwd: String, baseUrl: String?, apiKey: String, docId: Int) {
         val request = JsonObject().apply {
             addProperty("operation", "delete")
             addProperty("apiKey", apiKey)
             if (baseUrl != null) addProperty("baseUrl", baseUrl)
             addProperty("docId", docId)
         }
-        callJolliApi(request)
+        callJolliApi(request, cwd = cwd)
     }
 
     /**
@@ -648,14 +669,25 @@ object JolliApiClient {
      * `BindingRequiredError` without a `repoUrl` field in the CLI-side error
      * detail can still fall back to the payload's own repo URL.
      *
+     * [cwd] names the repo the request acts ON, and is REQUIRED for any operation
+     * the CLI side gates per-repo — today `push` and `delete`, which consult
+     * `isOutboundPushAllowed(cwd)` (spec 306). Only operations whose answer does
+     * not depend on which project serves them (`list-spaces`, `create-binding`,
+     * the `*-share` calls — reads, binding metadata, or the separate live-share
+     * channel) may leave it null and fall back to [CliIntegrations.resolveDefaultCwd],
+     * whose contract is exactly that: "any open project answers identically".
+     * Passing that default for a gated op would evaluate the opt-out against the
+     * FIRST open project's repo, so in a multi-project IDE project B's push could
+     * be blocked by project A's setting.
+     *
      * Stamps `clientHeader` on every request so the CLI-side `x-jolli-client`
      * identifies the plugin (`intellij-plugin/<plugin-version>`) rather than
      * the bundled CLI build. See [intellijClientHeader].
      */
-    private fun callJolliApi(request: JsonObject, payloadRepoUrl: String? = null): JsonElement {
+    private fun callJolliApi(request: JsonObject, payloadRepoUrl: String? = null, cwd: String? = null): JsonElement {
         request.addProperty("clientHeader", intellijClientHeader)
         return try {
-            CliIntegrations.runIdeBridge(CliIntegrations.resolveDefaultCwd(), "jolli-api", gson.toJson(request))
+            CliIntegrations.runIdeBridge(cwd ?: CliIntegrations.resolveDefaultCwd(), "jolli-api", gson.toJson(request))
         } catch (e: CliIntegrations.CliBridgeException) {
             throw remapBridgeException(e, payloadRepoUrl)
         }
@@ -664,14 +696,29 @@ object JolliApiClient {
     /**
      * Maps the CLI's structured error envelope (see IdeBridgeCommand.ts's
      * `copyPrimitiveErrorFields`) to the Kotlin exception the UI still branches
-     * on. Kotlin previously threw `UnauthorizedError` for both 401 and 403; both
-     * `NotAuthenticatedError` and `PermissionDeniedError` on the CLI side map to
-     * that same exception to preserve the pre-existing behavior.
+     * on. `NotAuthenticatedError` is a bad/expired credential (re-login) and maps
+     * to [UnauthorizedError]; `PermissionDeniedError` is a credential-OK refusal
+     * (repo not allowlisted / ownership mismatch — contact an admin) and maps to
+     * the distinct [PermissionDeniedError] so the panels can surface the
+     * admin-oriented text. Mirrors the CLI / VS Code split (cross-client parity).
      */
     internal fun remapBridgeException(e: CliIntegrations.CliBridgeException, payloadRepoUrl: String?): RuntimeException {
         return when (e.errorName) {
             "ClientOutdatedError" -> PluginOutdatedError(e.message ?: "Plugin outdated")
-            "NotAuthenticatedError", "PermissionDeniedError" -> UnauthorizedError(e.message ?: "Not authenticated")
+            "NotAuthenticatedError" -> UnauthorizedError(e.message ?: "Not authenticated")
+            "PermissionDeniedError" -> PermissionDeniedError(e.message ?: "You don't have permission to push to this Space.")
+            // The per-repo outbound-push opt-out (spec 306), refused by the CLI's own
+            // gate mid-call. Push sites gate before calling, but that check and the
+            // CLI's straddle a round trip: a flag flipped in between (or by another
+            // surface) arrives here, and without this branch it degraded to the plain
+            // RuntimeException below — surfacing a user opt-out as a push failure and
+            // skipping the quiet "re-enable to push" handling the panels already have.
+            //
+            // Deliberately DROPS the bridge message: the CLI's wording names a CLI
+            // command (`jolli push-control --enable`), so the IDE-worded default is
+            // used instead, keeping this path's text identical to the pre-call gate's
+            // (JolliShareService.shareSummary / LiveShareController).
+            "PushDisabledError" -> JolliShareService.PushDisabledError()
             "BindingRequiredError" -> {
                 val repoUrl = e.details.get("repoUrl")
                     ?.takeIf { it.isJsonPrimitive }?.asString

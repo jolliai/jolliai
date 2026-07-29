@@ -417,7 +417,7 @@ async function runAuthAction(request: JsonObject): Promise<unknown> {
 // local helpers (serialize-summary) or don't hit the jolli-api HTTP path.
 const JOLLI_API_LOCAL_OPERATIONS = new Set(["serialize-summary"]);
 
-async function runJolliApiAction(_cwd: string, request: JsonObject): Promise<unknown> {
+async function runJolliApiAction(cwd: string, request: JsonObject): Promise<unknown> {
 	const operation = stringField(request, "operation");
 	// The `x-jolli-client` header the bundled CLI would otherwise send
 	// identifies the CLI build (`cli/<cli-version>`), not the plugin that
@@ -438,6 +438,25 @@ async function runJolliApiAction(_cwd: string, request: JsonObject): Promise<unk
 	if (operation === "serialize-summary") {
 		const { serializeSummaryJson } = await import("../core/JolliMemoryPushOrchestrator.js");
 		return { json: serializeSummaryJson(request.summary as Parameters<typeof serializeSummaryJson>[0]) ?? null };
+	}
+	// spec 306: the memory-mutating operations must consult the per-repo
+	// outbound-push opt-out — the SAME gate the CLI drains, the manual/MCP push, and
+	// the VS Code HTTP client use — so a host driving this bridge cannot push/delete
+	// from a repo the user push-disabled. `list-spaces`/`create-binding` are reads or
+	// binding metadata (not memory content); `*-share` is the separate live-share
+	// channel, out of this flag's scope.
+	//
+	// Thrown as the NAMED `PushDisabledError` so the error envelope carries
+	// `errorName: "PushDisabledError"` and an IDE host can map it back to its own
+	// push-disabled type (quiet "re-enable to push" info, not a failure dialog).
+	// Hosts gate before calling too, but that check and this one straddle a
+	// network round trip — a flag flipped in between lands here, and with a bare
+	// `Error` the host could only report it as a generic push failure.
+	if (operation === "push" || operation === "delete") {
+		const { isOutboundPushAllowed, PushDisabledError } = await import("../core/PushControl.js");
+		if (!(await isOutboundPushAllowed(cwd))) {
+			throw new PushDisabledError();
+		}
 	}
 	const apiKey = stringField(request, "apiKey");
 	const baseUrl = optionalString(request, "baseUrl");
@@ -1029,6 +1048,52 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 				baseBranch: optionalString(request, "baseBranch"),
 				includeMarkers: request.includeMarkers !== false,
 			});
+		}
+		case "outbound-push-allowed": {
+			// spec 306 gate. IntelliJ push sites call this before pushing so the
+			// per-repo opt-out is enforced from the one source of truth (the
+			// machine-global push-control store, keyed by canonical repo identity).
+			const { isOutboundPushAllowed } = await import("../core/PushControl.js");
+			return { allowed: await isOutboundPushAllowed(cwd) };
+		}
+		case "push-control-get": {
+			// Reads the PURE per-repo push-disabled flag for the current project's
+			// repo (NOT the composed `outbound-push-allowed`, which also folds in
+			// `manuallyDisabled`). Drives the IntelliJ Settings toggle's initial
+			// state so unchecking it maps 1:1 to clearing this flag.
+			//
+			// The STATE form, not the boolean shorthand: this is a *reporting* surface,
+			// and `isPushDisabled` drops the reason. An unreadable store fails closed to
+			// `true` for EVERY repo on the machine, so the boolean alone would make the
+			// Settings checkbox claim "you turned this repo off" — a state the user never
+			// chose, machine-wide rather than per-repo, and with no hint of the one file
+			// that needs fixing. `pushDisabledError` rides along (carrying the store's
+			// absolute path) so the host can render "unknown" instead, exactly like
+			// `getStatus` / `jolli push-control` show.
+			const { readPushDisabledState } = await import("../core/PushControl.js");
+			const state = await readPushDisabledState(cwd);
+			return { pushDisabled: state.disabled, ...(state.error ? { pushDisabledError: state.error } : {}) };
+		}
+		case "push-control-set": {
+			// Toggle outbound push for the current project's repo (spec 306). The
+			// flag is per-repo, so the bridge acts on `cwd` — the project the IDE
+			// opened it for. Re-enabling drains retained memory via the shared core.
+			const { applyPushDisabled } = await import("../core/PushControl.js");
+			// Validate rather than coerce. `request.disabled === true` would make a
+			// missing or mistyped field silently mean ENABLE — and enabling is the one
+			// direction that rebuilds an unreadable store from empty, dropping every
+			// other repo's opt-out. A malformed request must never take that path.
+			if (typeof request.disabled !== "boolean") {
+				throw new Error('Request field "disabled" must be a boolean.');
+			}
+			const disabled = request.disabled;
+			const { recoveredFromCorrupt, preservedAt } = await applyPushDisabled(cwd, disabled, "intellij");
+			return {
+				pushDisabled: disabled,
+				...(recoveredFromCorrupt
+					? { recoveredFromCorrupt: true, ...(preservedAt ? { preservedAt } : {}) }
+					: {}),
+			};
 		}
 		case "status": {
 			const { createStorage } = await import("../core/StorageFactory.js");

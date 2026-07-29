@@ -124,6 +124,7 @@ export const PUSH_PENDING_LOCK_FILE = "push-pending.lock";
 export const PROFILE_LOCK_FILE = "profile.lock";
 export const REPO_HOOKS_LOCK_FILE = "repo-hooks.lock";
 export const RUNTIME_REGISTRY_LOCK_FILE = "runtime-registry.lock";
+export const PUSH_CONTROL_LOCK_FILE = "push-control.lock";
 
 /** Default wait budget for `acquireOrphanWriteLock` (background callers). */
 export const DEFAULT_ORPHAN_WRITE_TIMEOUT_MS = 1000;
@@ -161,6 +162,7 @@ export const DEFAULT_PROFILE_LOCK_TIMEOUT_MS = 5000;
 export const DEFAULT_PROFILE_LOCK_POLL_MS = 25;
 export const DEFAULT_REPO_HOOKS_LOCK_TIMEOUT_MS = 5000;
 export const DEFAULT_RUNTIME_REGISTRY_LOCK_TIMEOUT_MS = 5000;
+export const DEFAULT_PUSH_CONTROL_LOCK_TIMEOUT_MS = 5000;
 
 /** Optional knobs for `acquireOrphanWriteLock`. */
 export interface OrphanWriteLockOpts {
@@ -636,5 +638,29 @@ export async function withRuntimeRegistryLock<T>(
 		return { acquired: true, value: await fn() };
 	} finally {
 		await releaseIfOwned(lockPath, RUNTIME_REGISTRY_LOCK_FILE);
+	}
+}
+
+/**
+ * Serialises writes to the machine-global push-control store (`push-control.json`)
+ * so a CLI toggle and a VS Code toggle of different repos can't lose-update each
+ * other. Machine-global, like {@link withRuntimeRegistryLock}, but a distinct
+ * file so the two never contend.
+ */
+export async function withPushControlLock<T>(
+	fn: () => Promise<T>,
+	opts: RuntimeRegistryLockOpts = {},
+): Promise<StrictLockResult<T>> {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_PUSH_CONTROL_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_PROFILE_LOCK_POLL_MS;
+	const dir = opts.globalDir ?? join(homedir(), ".jolli", "jollimemory");
+	await mkdir(dir, { recursive: true });
+	const lockPath = join(dir, PUSH_CONTROL_LOCK_FILE);
+	const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+	if (!acquired) return { acquired: false };
+	try {
+		return { acquired: true, value: await fn() };
+	} finally {
+		await releaseIfOwned(lockPath, PUSH_CONTROL_LOCK_FILE);
 	}
 }

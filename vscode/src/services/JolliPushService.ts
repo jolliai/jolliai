@@ -35,6 +35,7 @@ import {
 	parseBaseUrl,
 	parseJolliApiKey,
 } from "../../../cli/src/core/JolliApiUtils.js";
+import { isOutboundPushAllowed } from "../../../cli/src/core/PushControl.js";
 import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "../../../cli/src/core/TraceContext.js";
 import { type ClientInfo, VSCODE_CLIENT_INFO } from "./ClientInfo.js";
 
@@ -73,6 +74,35 @@ export class BindingAlreadyExistsError extends Error {
 		super(message ?? "binding_already_exists");
 		this.name = "BindingAlreadyExistsError";
 		this.winner = body;
+	}
+}
+
+/**
+ * The server accepted the credential but refused the push. Two server shapes map
+ * here: a 412 `repo_not_allowlisted` (the repo is not registered in a restricted
+ * Space — an admin must add it) and a push-path 403 (an ownership mismatch).
+ * Distinct from an auth failure (401): the user should contact an admin, not
+ * re-login. Mirrors the CLI's `PermissionDeniedError` so all three clients
+ * surface the same actionable text.
+ */
+export class PermissionDeniedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "PermissionDeniedError";
+	}
+}
+
+/**
+ * Thrown before any network call when the repo has opted out of outbound push
+ * (spec 306, per-repo push control). The opt-out lives in the machine-global,
+ * identity-keyed push-control store (NOT `profile.json`); see spec 306. Memory
+ * stays recorded locally; the call site should surface a "re-enable to push"
+ * message rather than treating it as a failure.
+ */
+export class PushDisabledError extends Error {
+	constructor(message = "Outbound push is disabled for this repo. Re-enable it in Settings → Sync to Jolli to push.") {
+		super(message);
+		this.name = "PushDisabledError";
 	}
 }
 
@@ -173,19 +203,53 @@ export function buildJolliApiHeaders(params: {
 }
 
 /**
+ * A short, single-line excerpt of a response body, for error messages whose body
+ * could not be parsed as JSON. Returns null when there is nothing to show, so
+ * callers can `??` their way to a static fallback.
+ *
+ * Collapses whitespace because the bodies this exists for — CDN / WAF / gateway
+ * refusals — are multi-line HTML, and a raw paste turns a one-line error into a
+ * screenful. Capped at 200 chars: enough to identify the intermediary (`<title>`,
+ * a Cloudflare ray id) without dumping a page into a toast or a log line.
+ */
+function rawSnippet(raw: string): string | null {
+	const collapsed = raw.replace(/\s+/g, " ").trim();
+	if (collapsed.length === 0) return null;
+	return collapsed.length > 200 ? `${collapsed.slice(0, 200)}…` : collapsed;
+}
+
+/**
  * Pushes a commit summary to a Jolli Space via the push API.
  *
  * @param baseUrl - Jolli site base URL. If undefined, falls back to the URL embedded in the API key.
  * @param apiKey - Jolli API key (sk-jol-...)
  * @param payload - Summary content to push
+ * @param cwd - A path inside the repo, used to enforce the per-repo outbound-push
+ *   opt-out (spec 306). This function is the choke for every VS Code push of
+ *   MEMORY CONTENT, so the gate lives here — not just at the orchestrator — to
+ *   close the "separate HTTP implementation" gap. **Required**: a new caller that
+ *   forgot to thread a workspace through would otherwise silently bypass the gate
+ *   with no compile-time signal, defeating the whole point of this choke.
+ *
+ *   Not the extension's only outbound HTTP path, though: `JolliShareService.ts`
+ *   issues its own `node:http`/`node:https` requests for `createLiveShare` /
+ *   `updateLiveShare`. Those are deliberately ungated — they carry share
+ *   metadata (visibility, recipients, a `ref` pointing at already-pushed Space
+ *   docs), not memory content, and every path that reaches them runs a gated
+ *   push first. If you add a send there that carries memory content, gate it.
  * @returns Push result with article URL and metadata
- * @throws Error if the push fails (network error, non-2xx response, or missing base URL)
+ * @throws PushDisabledError when the repo opted out; Error otherwise (network,
+ *   non-2xx, or missing base URL)
  */
-export function pushToJolli(
+export async function pushToJolli(
 	baseUrl: string | undefined,
 	apiKey: string,
 	payload: JolliPushPayload,
+	cwd: string,
 ): Promise<JolliPushResult> {
+	if (!(await isOutboundPushAllowed(cwd))) {
+		throw new PushDisabledError();
+	}
 	const keyMeta = parseJolliApiKey(apiKey);
 	const resolvedBaseUrl = baseUrl ?? keyMeta?.u;
 	if (!resolvedBaseUrl) {
@@ -221,47 +285,70 @@ export function pushToJolli(
 				res.on("data", (chunk: Buffer) => chunks.push(chunk));
 				res.on("end", () => {
 					const raw = Buffer.concat(chunks).toString("utf-8");
+					const status = res.statusCode ?? 0;
+					// Parse tolerantly: error statuses are decided on the status code
+					// alone, so a proxy/gateway 403 (or any non-2xx) with an empty or
+					// non-JSON body still maps to the right error rather than a generic
+					// "Invalid JSON" one. Only the 2xx success path requires valid JSON.
+					// Mirrors the CLI's `call()` + `push()`.
+					let parsed: (JolliPushResult & ErrorBody) | null = null;
 					try {
-						const json = JSON.parse(raw) as JolliPushResult & ErrorBody;
-						const status = res.statusCode ?? 0;
-						if (status >= 200 && status < 300) {
-							resolve(json);
-						} else if (status === 426) {
-							reject(
-								new PluginOutdatedError(
-									json.message ??
-										"Plugin version is outdated. Please update to the latest version.",
-								),
-							);
-						} else if (status === 412 && json.error === "binding_required") {
-							reject(
-								new BindingRequiredError(
-									json.repoUrl ?? payload.repoUrl ?? "",
-									json.message,
-								),
-							);
-						} else if (
-							status === 409 &&
-							json.error === "binding_already_exists"
-						) {
-							reject(
-								new BindingAlreadyExistsError(
-									json as unknown as BindingExistsBody,
-									json.message,
-								),
-							);
-						} else {
-							const detail = [json.error, json.message]
-								.filter(Boolean)
-								.join(" — ");
-							reject(new Error(`${detail || "request failed"} (HTTP ${status})`));
-						}
+						parsed = JSON.parse(raw) as JolliPushResult & ErrorBody;
 					} catch {
+						parsed = null;
+					}
+					const body = parsed ?? ({} as JolliPushResult & ErrorBody);
+
+					if (status === 426) {
 						reject(
-							new Error(
-								`Invalid JSON response (HTTP ${res.statusCode}): ${raw.slice(0, 200)}`,
+							new PluginOutdatedError(
+								body.message ?? "Plugin version is outdated. Please update to the latest version.",
 							),
 						);
+					} else if (status === 412 && body.error === "binding_required") {
+						reject(new BindingRequiredError(body.repoUrl ?? payload.repoUrl ?? "", body.message));
+					} else if (status === 412 && body.error === "repo_not_allowlisted") {
+						// The allowlist refusal — the server emits it as 412 (NOT 403;
+						// that status is the bind path's `space_restricted`). Map it to
+						// PermissionDeniedError so callers stop retrying and surface the
+						// admin-action sentence, not a generic "(HTTP 412)".
+						reject(
+							new PermissionDeniedError(
+								body.message ?? body.error ?? "You don't have permission to push to this Space.",
+							),
+						);
+					} else if (status === 409 && body.error === "binding_already_exists") {
+						reject(new BindingAlreadyExistsError(body as unknown as BindingExistsBody, body.message));
+					} else if (status === 403) {
+						// Credential OK but the push was refused — on the push path a 403
+						// is an ownership mismatch (the target doc belongs to another user
+						// / was not created by JolliMemory). Surface the server's sentence,
+						// not an auth message, matching the CLI's
+						// PermissionDeniedError).
+						reject(
+							new PermissionDeniedError(
+								body.message ?? body.error ?? "You don't have permission to push to this Space.",
+							),
+						);
+					} else if (status < 200 || status >= 300) {
+						// Prefer the human `message`, then the `error` slug, so a slug
+						// like `repo_not_allowlisted` never surfaces alone when the
+						// server also sent a sentence.
+						//
+						// When NOTHING parsed, fall back to a truncated snippet of the raw
+						// body rather than a bare "request failed": an unparseable non-2xx
+						// is the CDN / WAF / reverse-proxy case, and that HTML is the only
+						// thing identifying which intermediary refused the request. Deciding
+						// the branch on status alone (above) is what makes such a body
+						// reachable here at all, so dropping it would trade one blind spot
+						// for another.
+						const detail = body.message ?? body.error ?? rawSnippet(raw) ?? "request failed";
+						reject(new Error(`${detail} (HTTP ${status})`));
+					} else if (parsed === null) {
+						// 2xx but the body isn't parseable — there is no result to return.
+						reject(new Error(`Invalid JSON response (HTTP ${status}): ${rawSnippet(raw) ?? ""}`));
+					} else {
+						resolve(parsed);
 					}
 				});
 			},
@@ -279,12 +366,20 @@ export function pushToJolli(
 /**
  * Deletes an orphaned JolliMemory article from the server.
  * Used to clean up articles from squashed/rebased commits.
+ *
+ * @param cwd - A path inside the repo; deletes are outbound too, so a
+ *   push-disabled repo (spec 306) must not emit them either. **Required** for the
+ *   same reason as {@link pushToJolli}: the gate must not be silently bypassable.
  */
-export function deleteFromJolli(
+export async function deleteFromJolli(
 	baseUrl: string | undefined,
 	apiKey: string,
 	docId: number,
+	cwd: string,
 ): Promise<void> {
+	if (!(await isOutboundPushAllowed(cwd))) {
+		throw new PushDisabledError();
+	}
 	const keyMeta = parseJolliApiKey(apiKey);
 	const resolvedBaseUrl = baseUrl ?? keyMeta?.u;
 	if (!resolvedBaseUrl) {

@@ -60,10 +60,10 @@ class JolliShareServiceTest {
 
     @Test
     fun `pushes the summary and writes the jolli doc url back`() {
-        every { JolliApiClient.pushToJolli(any(), any(), any()) } returns
+        every { JolliApiClient.pushToJolli(any(), any(), any(), any()) } returns
             JolliApiClient.JolliPushResult(url = "ignored", docId = 99, jrn = "jrn:1", created = true)
 
-        val res = JolliShareService.shareSummary(store, summary(), "/repo", apiKey, baseUrl)
+        val res = JolliShareService.shareSummary(store, summary(), "/repo", apiKey, baseUrl) { true }
 
         res.created shouldBe true
         res.planCount shouldBe 0
@@ -75,21 +75,21 @@ class JolliShareServiceTest {
 
     @Test
     fun `deletes orphaned docs and clears them from the stored summary`() {
-        every { JolliApiClient.pushToJolli(any(), any(), any()) } returns
+        every { JolliApiClient.pushToJolli(any(), any(), any(), any()) } returns
             JolliApiClient.JolliPushResult(url = "ignored", docId = 5, jrn = "jrn:2", created = false)
-        every { JolliApiClient.deleteFromJolli(any(), any(), any()) } returns Unit
+        every { JolliApiClient.deleteFromJolli(any(), any(), any(), any()) } returns Unit
 
-        val res = JolliShareService.shareSummary(store, summary(orphaned = listOf(7)), "/repo", apiKey, baseUrl)
+        val res = JolliShareService.shareSummary(store, summary(orphaned = listOf(7)), "/repo", apiKey, baseUrl) { true }
 
-        verify { JolliApiClient.deleteFromJolli(baseUrl, apiKey, 7) }
+        verify { JolliApiClient.deleteFromJolli("/repo", baseUrl, apiKey, 7) }
         res.updatedSummary.orphanedDocIds shouldBe null
     }
 
     @Test
     fun `resolves delayed child doc ids before orphan cleanup`() {
-        every { JolliApiClient.pushToJolli(any(), any(), any()) } returns
+        every { JolliApiClient.pushToJolli(any(), any(), any(), any()) } returns
             JolliApiClient.JolliPushResult(url = "ignored", docId = 5, jrn = "jrn:2", created = false)
-        every { JolliApiClient.deleteFromJolli(any(), any(), any()) } returns Unit
+        every { JolliApiClient.deleteFromJolli(any(), any(), any(), any()) } returns Unit
         every { store.getSummary("childHash") } returns summary().copy(commitHash = "childHash", jolliDocId = 77)
         every { PushPendingReader.loadHashes("/repo") } returns setOf("stillPending")
 
@@ -99,19 +99,19 @@ class JolliShareServiceTest {
             "/repo",
             apiKey,
             baseUrl,
-        )
+        ) { true }
 
-        verify { JolliApiClient.deleteFromJolli(baseUrl, apiKey, 77) }
+        verify { JolliApiClient.deleteFromJolli("/repo", baseUrl, apiKey, 77) }
         res.updatedSummary.unresolvedOrphanHashes shouldBe listOf("stillPending")
     }
 
     @Test
     fun `propagates a binding-required error to the caller`() {
-        every { JolliApiClient.pushToJolli(any(), any(), any()) } throws
+        every { JolliApiClient.pushToJolli(any(), any(), any(), any()) } throws
             JolliApiClient.BindingRequiredError(repoUrl = "https://github.com/o/r")
 
         val threw = try {
-            JolliShareService.shareSummary(store, summary(), "/repo", apiKey, baseUrl)
+            JolliShareService.shareSummary(store, summary(), "/repo", apiKey, baseUrl) { true }
             false
         } catch (_: JolliApiClient.BindingRequiredError) {
             true
@@ -120,12 +120,83 @@ class JolliShareServiceTest {
     }
 
     @Test
+    fun `aborts without any push when outbound push is disabled for the repo (spec 306)`() {
+        val threw = try {
+            JolliShareService.shareSummary(store, summary(), "/repo", apiKey, baseUrl) { false }
+            false
+        } catch (_: JolliShareService.PushDisabledError) {
+            true
+        }
+        threw shouldBe true
+        // The gate is BEFORE any network call — nothing was pushed or stored.
+        verify(exactly = 0) { JolliApiClient.pushToJolli(any(), any(), any(), any()) }
+        verify(exactly = 0) { store.storeSummary(any(), any()) }
+    }
+
+    @Test
+    fun `parseOutboundPushAllowed trusts a definitive boolean answer (spec 306)`() {
+        JolliShareService.parseOutboundPushAllowed(
+            com.google.gson.JsonParser.parseString("""{"allowed":true}"""),
+        ) shouldBe true
+        JolliShareService.parseOutboundPushAllowed(
+            com.google.gson.JsonParser.parseString("""{"allowed":false}"""),
+        ) shouldBe false
+    }
+
+    @Test
+    fun `parseOutboundPushAllowed fails CLOSED on any non-definitive reply (spec 306)`() {
+        // A bridge that ANSWERED but not with `{allowed: boolean}` must block, not
+        // wave the push through — and must say "couldn't verify", not "you opted out".
+        for (body in listOf("""{}""", """{"allowed":"yes"}""", """{"allowed":null}""", """[]""", """"str"""")) {
+            val threw = try {
+                JolliShareService.parseOutboundPushAllowed(com.google.gson.JsonParser.parseString(body))
+                false
+            } catch (_: JolliShareService.PushGateUnavailableError) {
+                true
+            }
+            threw shouldBe true
+        }
+    }
+
+    @Test
+    fun `threads the pushing repo's cwd into every gated bridge call (spec 306)`() {
+        // The CLI side gates `push`/`delete` on isOutboundPushAllowed(cwd). If the
+        // cwd is not threaded from the panel, JolliApiClient falls back to
+        // resolveDefaultCwd() — the FIRST open project — so in a multi-project IDE
+        // this repo's push would be judged by another repo's opt-out. Pin the cwd
+        // on both operations so that regression cannot come back silently.
+        val pushCwd = slot<String>()
+        val deleteCwd = slot<String>()
+        every { JolliApiClient.pushToJolli(capture(pushCwd), any(), any(), any()) } returns
+            JolliApiClient.JolliPushResult(url = "ignored", docId = 5, jrn = "jrn", created = true)
+        every { JolliApiClient.deleteFromJolli(capture(deleteCwd), any(), any(), any()) } returns Unit
+        every { store.readPlanFromBranch(any()) } returns "plan body"
+
+        JolliShareService.shareSummary(
+            store,
+            summary(orphaned = listOf(7)).copy(
+                plans = listOf(
+                    ai.jolli.jollimemory.core.PlanReference(
+                        slug = "p1", title = "Plan 1", editCount = 1, addedAt = "t", updatedAt = "t",
+                    ),
+                ),
+            ),
+            "/repo-b",
+            apiKey,
+            baseUrl,
+        ) { true }
+
+        pushCwd.captured shouldBe "/repo-b"
+        deleteCwd.captured shouldBe "/repo-b"
+    }
+
+    @Test
     fun `sends the summary docType payload for a summary push`() {
         val payloadSlot = slot<JolliApiClient.JolliPushPayload>()
-        every { JolliApiClient.pushToJolli(any(), any(), capture(payloadSlot)) } returns
+        every { JolliApiClient.pushToJolli(any(), any(), any(), capture(payloadSlot)) } returns
             JolliApiClient.JolliPushResult(url = "ignored", docId = 1, jrn = "jrn", created = true)
 
-        JolliShareService.shareSummary(store, summary(), "/repo", apiKey, baseUrl)
+        JolliShareService.shareSummary(store, summary(), "/repo", apiKey, baseUrl) { true }
 
         payloadSlot.captured.docType shouldBe "summary"
         payloadSlot.captured.commitHash shouldBe "abc12345"

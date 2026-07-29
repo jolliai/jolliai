@@ -31,6 +31,12 @@ import {
 	type MemoryBankDisplay,
 } from "../../../cli/src/core/MemoryBankStatusText.js";
 import {
+	listPushControlRepos,
+	type PushControlRepo,
+	setRepoPushDisabledByIdentity,
+	triggerReenableDrain,
+} from "../../../cli/src/core/PushControl.js";
+import {
 	getGlobalConfigDir,
 	loadConfigFromDir,
 	saveConfigScoped,
@@ -108,7 +114,8 @@ type SettingsMessage =
 			settings: SettingsPayload;
 			maskedApiKey: string;
 			maskedJolliApiKey: string;
-	  };
+	  }
+	| { command: "setPushDisabled"; repoIdentity: string; disabled: boolean; isCurrent: boolean };
 
 /**
  * Masks an API key for display.
@@ -162,6 +169,8 @@ export class SettingsWebviewPanel {
 	/** Full (unmasked) API keys from the last config load — used to detect unchanged masked values. */
 	private fullApiKey = "";
 	private fullJolliApiKey = "";
+	/** Last successfully-listed push-control rows, re-posted if a later refresh fails so a transient error doesn't blank the list. */
+	private lastPushControlRepos: PushControlRepo[] = [];
 
 	private constructor(
 		extensionUri: vscode.Uri,
@@ -261,6 +270,11 @@ export class SettingsWebviewPanel {
 					log.error("SettingsPanel", `Save failed: ${err}`);
 					this.postError("Failed to save settings");
 				});
+				break;
+			case "setPushDisabled":
+				// handleSetPushDisabled owns its errors (it re-posts the persisted list
+				// so an optimistic toggle reverts), so it never rejects here.
+				void this.handleSetPushDisabled(message.repoIdentity, message.disabled, message.isCurrent);
 				break;
 			case "syncNow":
 				// Delegates to the orchestrator if one is wired; otherwise the
@@ -473,6 +487,111 @@ export class SettingsWebviewPanel {
 		}
 	}
 
+	/**
+	 * Builds the machine-wide push-control repo list (every repo the Memory Bank
+	 * knows about, plus the current workspace repo) and pushes it to the webview
+	 * (spec 306). Each row carries its live push-disabled state and an
+	 * `isCurrentRepo` flag; `currentCwd` is the repo the Settings panel was opened
+	 * in.
+	 *
+	 * On failure it keeps the last-known rows AND posts `unreadable` so the webview
+	 * can say the checkboxes are not to be trusted. That combination is the point:
+	 * the list is built from the machine-global store, and the outbound gate fails
+	 * CLOSED on the same unreadable store — so silently rendering stale rows would
+	 * show every repo as "Push ✓" while every push is in fact being blocked, i.e.
+	 * the exact opposite of the truth. The CLI already carries this reason
+	 * (`readPushDisabledState.error`); the webview must not be the one surface that
+	 * hides it.
+	 */
+	private async refreshPushControl(status?: string): Promise<void> {
+		// The Memory Bank root only decides which OTHER repos get enumerated, so read
+		// it separately and degrade to "none" when it fails: folding this into the try
+		// below would report a global-config read error as an unreadable push-control
+		// store — a machine-wide "pushing is blocked" alarm for a condition that
+		// blocks nothing. The current repo's row is unaffected either way.
+		let localFolder: string | undefined;
+		try {
+			localFolder = (await loadConfigFromDir(getGlobalConfigDir())).localFolder;
+		} catch (err) {
+			log.warn("SettingsPanel", `Push-control list: global config unreadable, listing current repo only: ${err}`);
+		}
+		try {
+			const repos = await listPushControlRepos({
+				localFolder,
+				currentCwd: this.workspaceRoot || undefined,
+			});
+			if (SettingsWebviewPanel.currentPanel !== this) return; // panel closed meanwhile
+			this.lastPushControlRepos = repos;
+			this.panel.webview.postMessage({ command: "pushControlLoaded", repos, status });
+		} catch (err) {
+			// `listPushControlRepos` enumerates defensively — KBRepoDiscoverer swallows
+			// its own IO errors and the current-repo identity read is guarded — so the
+			// only thing that reaches here is an unreadable push-control store, the very
+			// file the outbound gate fails CLOSED on. That is what makes the webview's
+			// "pushing is blocked for every repository" wording accurate rather than
+			// alarmist; keep this catch that narrow.
+			log.warn("SettingsPanel", `Push-control list failed: ${err}`);
+			if (SettingsWebviewPanel.currentPanel !== this) return;
+			this.panel.webview.postMessage({
+				command: "pushControlLoaded",
+				repos: this.lastPushControlRepos,
+				status,
+				unreadable: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	/**
+	 * Toggles one listed repo's outbound-push flag, then re-pushes the refreshed
+	 * list.
+	 *
+	 * EVERY row — including the current repo — is written by identity via
+	 * `setRepoPushDisabledByIdentity`, i.e. by the key the user actually clicked.
+	 * `isCurrent` decides only whether the re-enable drain can run (that needs a
+	 * working tree); it deliberately does NOT also re-derive the target through
+	 * `applyPushDisabled(workspaceRoot)`, which would give "which repo did they
+	 * mean" two sources of truth that disagree once the workspace's remote changes
+	 * after the list was rendered. Non-current repos drain on their own repo's next
+	 * activation / push instead.
+	 *
+	 * On failure it re-pushes the PERSISTED list (which snaps the optimistic
+	 * checkbox back to reality) with an error status, so the webview can never be
+	 * left asserting a toggle succeeded when the store was never written.
+	 */
+	private async handleSetPushDisabled(repoIdentity: string, disabled: boolean, isCurrent: boolean): Promise<void> {
+		try {
+			// Always write BY IDENTITY — the row's own key, which is what the user
+			// clicked. `isCurrent` only decides whether the re-enable drain can run
+			// (that needs a working tree); it must not also re-derive the target, or
+			// "which repo did they mean" would have two sources of truth that can
+			// disagree if the workspace's remote changed since the list was rendered.
+			const { recoveredFromCorrupt, preservedAt } = await setRepoPushDisabledByIdentity(
+				repoIdentity,
+				disabled,
+				"vscode",
+			);
+			const drainable = isCurrent && this.workspaceRoot.length > 0;
+			if (!disabled && drainable) triggerReenableDrain(this.workspaceRoot);
+			let status = disabled
+				? "Disabled — this repo's memory stays local ✓"
+				: drainable
+					? "Enabled — syncing retained memory now ✓"
+					: "Enabled ✓ — backlog will sync on this repo's next activity";
+			if (recoveredFromCorrupt) {
+				// The write rebuilt an unreadable store from empty, so every OTHER repo's
+				// opt-out was just reset to ON. Reporting a bare "Enabled ✓" over that
+				// would hide a machine-wide settings reset behind one checkbox click.
+				status = `Enabled ✓ — but the setting file was unreadable and was rebuilt, so every other repository's opt-out was reset to ON.${
+					preservedAt ? ` The unreadable file was kept at ${preservedAt}.` : ""
+				}`;
+			}
+			await this.refreshPushControl(status);
+		} catch (err) {
+			log.error("SettingsPanel", `setPushDisabled failed: ${err}`);
+			await this.refreshPushControl("Couldn't update outbound push — see logs. No change was made.");
+		}
+	}
+
 	/** Opens a folder picker and posts the selected path back to the webview. */
 	private async handleBrowseLocalFolder(): Promise<void> {
 		const picked = await vscode.window.showOpenDialog({
@@ -574,6 +693,10 @@ export class SettingsWebviewPanel {
 		// critical path and push a separate update when ready (the count span
 		// shows "Checking…" until then).
 		void this.refreshMissingSummaryCount();
+
+		// Per-repo push-control list — computed off the critical path and pushed
+		// as its own message (mirrors the missing-summary-count pattern).
+		void this.refreshPushControl();
 
 		if (this.fullJolliApiKey.length > 0) {
 			try {

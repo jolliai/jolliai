@@ -31,6 +31,48 @@ object JolliPushOrchestrator {
 
     private val log = JmLogger.create("PushOrchestrator")
 
+    /**
+     * Errors that must ABORT the whole push instead of being collected as a
+     * per-attachment failure.
+     *
+     * [JolliApiClient.BindingRequiredError] / [JolliApiClient.PluginOutdatedError]
+     * drive the caller's binding chooser and update prompt.
+     * [JolliApiClient.PermissionDeniedError] and [JolliShareService.PushDisabledError]
+     * are **repo-wide refusals**: the server's allowlist/ownership verdict and the
+     * per-repo outbound-push opt-out (spec 306) apply to every doc in this repo, so
+     * the summary and every remaining attachment would be refused identically.
+     * Collecting them would mislabel a repo-wide condition as `plan "X" failed`,
+     * fire N doomed requests on the way, and rob the panels of the admin-oriented
+     * ("contact an admin") / quiet ("re-enable to push") handling they have for
+     * exactly these two.
+     *
+     * Mirrors vscode's `FATAL_PUSH_ERROR_NAMES`; shared by BOTH attachment loops so
+     * the fatal set cannot drift between them.
+     *
+     * Membership must stay in step with `CreatePrPanel.repoWideStopReason`, the other
+     * place this project decides "repo-wide or per-item". The two differ in exactly
+     * one entry, on purpose: `BindingRequiredError` is FATAL here (the orchestrator
+     * cannot run a chooser) but RECOVERABLE there (the panel resolves the binding and
+     * retries). Every other repo-wide type belongs in both — a type added to only one
+     * is the bug shape that let a repo-wide refusal be counted as a single per-item
+     * failure. When adding one, update both.
+     *
+     * `internal` so the set is unit-testable: both loops reach it only through a
+     * static [JolliApiClient.pushToJolli] call, which cannot be faked without the
+     * mockk object-stubbing that `scripts/check-global-state.sh` bans in new tests.
+     */
+    internal fun isFatalPushError(e: Throwable): Boolean =
+        e is JolliApiClient.BindingRequiredError ||
+            e is JolliApiClient.PluginOutdatedError ||
+            e is JolliApiClient.PermissionDeniedError ||
+            e is JolliShareService.PushDisabledError ||
+            // Not reachable from inside the attachment loops today (the gate that raises
+            // it runs at the entry points), but it is unambiguously repo-wide: if the
+            // opt-out could not be evaluated for this repo, it cannot be evaluated for
+            // the next attachment either. Listed so a future gate call inside a loop
+            // cannot silently degrade to a per-attachment failure.
+            e is JolliShareService.PushGateUnavailableError
+
     /** Outcome of the injected binding-chooser callback. */
     enum class BindingOutcome { BOUND, ANOTHER_OPEN, CANCELLED, FAILED }
 
@@ -118,7 +160,7 @@ object JolliPushOrchestrator {
             val markdown = SummaryMarkdownBuilder.buildMarkdown(summaryForMarkdown)
 
             val result = JolliApiClient.pushToJolli(
-                ctx.baseUrl, ctx.apiKey,
+                ctx.workspaceRoot, ctx.baseUrl, ctx.apiKey,
                 JolliApiClient.JolliPushPayload(
                     title = SummaryUtils.buildPushTitle(summary),
                     content = markdown,
@@ -235,7 +277,7 @@ object JolliPushOrchestrator {
             }
             val planResult = try {
                 JolliApiClient.pushToJolli(
-                    ctx.baseUrl, ctx.apiKey,
+                    ctx.workspaceRoot, ctx.baseUrl, ctx.apiKey,
                     JolliApiClient.JolliPushPayload(
                         title = SummaryUtils.buildPlanPushTitle(summary, plan.title),
                         content = planContent,
@@ -247,11 +289,8 @@ object JolliPushOrchestrator {
                         relativePath = SummaryUtils.buildBranchRelativePath(summary.branch),
                     ),
                 )
-            } catch (e: JolliApiClient.BindingRequiredError) {
-                throw e
-            } catch (e: JolliApiClient.PluginOutdatedError) {
-                throw e
             } catch (e: Exception) {
+                if (isFatalPushError(e)) throw e
                 val msg = e.message ?: e.toString()
                 log.error("Plan ${plan.slug} push FAILED: $msg")
                 failures.add(PushAttachmentFailure("plan \"${plan.title}\"", msg))
@@ -295,7 +334,7 @@ object JolliPushOrchestrator {
             }
             val noteResult = try {
                 JolliApiClient.pushToJolli(
-                    ctx.baseUrl, ctx.apiKey,
+                    ctx.workspaceRoot, ctx.baseUrl, ctx.apiKey,
                     JolliApiClient.JolliPushPayload(
                         title = SummaryUtils.buildNotePushTitle(summary, note.title),
                         content = noteContent,
@@ -307,11 +346,8 @@ object JolliPushOrchestrator {
                         relativePath = SummaryUtils.buildBranchRelativePath(summary.branch),
                     ),
                 )
-            } catch (e: JolliApiClient.BindingRequiredError) {
-                throw e
-            } catch (e: JolliApiClient.PluginOutdatedError) {
-                throw e
             } catch (e: Exception) {
+                if (isFatalPushError(e)) throw e
                 val msg = e.message ?: e.toString()
                 log.error("Note ${note.id} push FAILED: $msg")
                 failures.add(PushAttachmentFailure("note \"${note.title}\"", msg))
@@ -357,7 +393,7 @@ object JolliPushOrchestrator {
         val deleted = HashSet<Int>()
         for (id in orphanedIds) {
             try {
-                JolliApiClient.deleteFromJolli(displayBase, ctx.apiKey, id)
+                JolliApiClient.deleteFromJolli(ctx.workspaceRoot, displayBase, ctx.apiKey, id)
                 deleted.add(id)
             } catch (e: Exception) {
                 log.warn("Failed to delete orphaned doc $id: ${e.message}")

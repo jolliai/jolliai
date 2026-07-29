@@ -27,6 +27,7 @@
 
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readPushDisabledState } from "../core/PushControl.js";
 import {
 	type InlineCommitStatus,
 	type ProcessPrePushInlineResult,
@@ -294,6 +295,33 @@ export async function prePushEntry(cwd: string, stdin: string, remote?: string, 
 		return;
 	}
 	log.info("pre-push: recorded %d commit(s) across %d pushed ref(s)", total, refs.length);
+
+	// Per-repo outbound-push opt-out (spec 306). Entries are already recorded
+	// above, so a later re-enable catches up; skip the sync and tell the user why
+	// rather than leaving them in silence (processPrePushInline would also gate,
+	// but its empty result prints nothing).
+	//
+	// Read the STATE, not the boolean: the gate fails CLOSED, so an unreadable
+	// store reports "disabled" for every repo on the machine. Pointing that user at
+	// `--enable` would be actively harmful — on a corrupt store that command rebuilds
+	// from empty and drops EVERY repo's opt-out — so the two cases get different
+	// advice. This is the one push-disabled notice a user cannot miss (it prints on
+	// every `git push`), which is exactly why it must not be the one that misleads.
+	const pushState = await readPushDisabledState(cwd);
+	if (pushState.disabled) {
+		if (pushState.error) {
+			log.warn("Recorded %d commit(s) — push-control state unreadable: %s", total, pushState.error);
+			process.stderr.write(
+				`jollimemory: can't read your outbound-push setting, so nothing was sent — recorded locally. Run \`jolli push-control\` for detail (${pushState.error}).\n`,
+			);
+			return;
+		}
+		log.info("Recorded %d commit(s) — outbound push is disabled for this repo", total);
+		process.stderr.write(
+			"jollimemory: outbound push disabled for this repo — recorded locally; re-enable it with `jolli push-control --enable`.\n",
+		);
+		return;
+	}
 
 	if (skipSync) {
 		log.info("Recorded %d commit(s) for later sync — not signed in to Jolli", total);

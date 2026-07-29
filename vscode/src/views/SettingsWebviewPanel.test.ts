@@ -195,6 +195,19 @@ vi.mock("../../../cli/src/core/KBPathResolver.js", async (importOriginal) => ({
 	extractRepoName: mockExtractRepoName,
 }));
 
+// spec 306: per-repo outbound-push control. Stub the shared engine so the panel's
+// toggle handler is deterministic (no real git / machine-global store).
+const { mockSetRepoPushDisabledByIdentity, mockListPushControlRepos, mockTriggerReenableDrain } = vi.hoisted(() => ({
+	mockSetRepoPushDisabledByIdentity: vi.fn().mockResolvedValue({ disabled: true, recoveredFromCorrupt: false }),
+	mockListPushControlRepos: vi.fn().mockResolvedValue([]),
+	mockTriggerReenableDrain: vi.fn(),
+}));
+vi.mock("../../../cli/src/core/PushControl.js", () => ({
+	setRepoPushDisabledByIdentity: mockSetRepoPushDisabledByIdentity,
+	listPushControlRepos: mockListPushControlRepos,
+	triggerReenableDrain: mockTriggerReenableDrain,
+}));
+
 // ── Import under test ────────────────────────────────────────────────────────
 
 import { setManuallyDisabled } from "../../../cli/src/Logger.js";
@@ -3553,6 +3566,110 @@ describe("SettingsWebviewPanel", () => {
 					message: "Invalid Jolli API Key",
 				}),
 			);
+		});
+	});
+
+	describe("per-repo outbound push control (spec 306)", () => {
+		// `mockResolvedValue` sets an implementation, which the suite-wide
+		// `clearAllMocks` does not undo — restore the default per test so these cases
+		// stay order-independent.
+		beforeEach(() => {
+			mockSetRepoPushDisabledByIdentity.mockReset().mockResolvedValue({
+				disabled: true,
+				recoveredFromCorrupt: false,
+			});
+			mockTriggerReenableDrain.mockReset();
+		});
+
+		it("toggles the current repo and re-posts the persisted list with a success status", async () => {
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "setPushDisabled", repoIdentity: "id", disabled: true, isCurrent: true });
+			await flushPromises();
+
+			// Written BY IDENTITY even for the current repo — the row's key is what the
+			// user clicked, so the target is never re-derived from workspaceRoot.
+			expect(mockSetRepoPushDisabledByIdentity).toHaveBeenCalledWith("id", true, "vscode");
+			// Disabling never drains (only re-enabling has a backlog to flush).
+			expect(mockTriggerReenableDrain).not.toHaveBeenCalled();
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ command: "pushControlLoaded", status: expect.stringContaining("✓") }),
+			);
+		});
+
+		it("drains the backlog when RE-ENABLING the current repo, but not a foreign one", async () => {
+			mockSetRepoPushDisabledByIdentity.mockResolvedValue({ disabled: false, recoveredFromCorrupt: false });
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "setPushDisabled", repoIdentity: "id", disabled: false, isCurrent: true });
+			await flushPromises();
+			// The drain needs a working tree, so it keys off the workspace — not the identity.
+			expect(mockTriggerReenableDrain).toHaveBeenCalledWith(workspaceRoot);
+
+			mockTriggerReenableDrain.mockClear();
+			dispatch({ command: "setPushDisabled", repoIdentity: "other", disabled: false, isCurrent: false });
+			await flushPromises();
+			// A foreign repo has no working tree here; it drains on its own next activity.
+			expect(mockTriggerReenableDrain).not.toHaveBeenCalled();
+		});
+
+		it("says so when enabling had to rebuild an unreadable store (never a bare success)", async () => {
+			// The rebuild resets EVERY other repo's opt-out, so a plain "Enabled ✓"
+			// would hide a machine-wide settings reset behind one checkbox click.
+			mockSetRepoPushDisabledByIdentity.mockResolvedValue({
+				disabled: false,
+				recoveredFromCorrupt: true,
+				preservedAt: "/g/push-control.json.corrupt-1",
+			});
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "setPushDisabled", repoIdentity: "id", disabled: false, isCurrent: true });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "pushControlLoaded",
+					status: expect.stringContaining("every other repository's opt-out was reset"),
+				}),
+			);
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ status: expect.stringContaining("/g/push-control.json.corrupt-1") }),
+			);
+		});
+
+		it("re-posts the persisted list with an error status when the write fails (no silent success)", async () => {
+			mockSetRepoPushDisabledByIdentity.mockRejectedValueOnce(new Error("boom"));
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "setPushDisabled", repoIdentity: "id", disabled: true, isCurrent: true });
+			await flushPromises();
+
+			// The failure must surface as a status the webview can show, and the row
+			// re-renders from the persisted list (reverting the optimistic checkbox).
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "pushControlLoaded",
+					status: expect.stringContaining("Couldn't update"),
+				}),
+			);
+		});
+
+		it("toggles a non-current listed repo by identity", async () => {
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "setPushDisabled", repoIdentity: "https://github.com/acme/other", disabled: false, isCurrent: false });
+			await flushPromises();
+
+			expect(mockSetRepoPushDisabledByIdentity).toHaveBeenCalledWith("https://github.com/acme/other", false, "vscode");
 		});
 	});
 });

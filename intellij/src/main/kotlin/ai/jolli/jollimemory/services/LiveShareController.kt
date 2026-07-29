@@ -56,6 +56,13 @@ object LiveShareController {
         val readNoteBody: (String) -> String?,
         val readSummary: (String) -> CommitSummary? = { null },
         val resolveBinding: (String) -> JolliPushOrchestrator.BindingOutcome,
+        /**
+         * Per-repo outbound-push gate (spec 306). Defaults to the shared CLI-bridge
+         * check so live share honors the SAME opt-out as the CLI drains / VS Code /
+         * the "Share in Jolli" path — otherwise a push-disabled repo could still leak
+         * Space docs via branch/commit live share. Injected so tests stay hermetic.
+         */
+        val outboundPushAllowed: (String) -> Boolean = JolliShareService::defaultOutboundPushAllowed,
     )
 
     data class GenerateParams(
@@ -106,7 +113,12 @@ object LiveShareController {
         kind: String,
         branch: String,
         ctx: PushContext,
+        outboundPushAllowed: (String) -> Boolean,
     ): BranchShareStore.LiveRef {
+        // spec 306: honor the per-repo outbound-push opt-out BEFORE uploading
+        // any Space doc. This is the single funnel both live-share entry points go
+        // through, so a push-disabled repo can't leak via branch/commit live share.
+        if (!outboundPushAllowed(ctx.workspaceRoot)) throw JolliShareService.PushDisabledError()
         val planWinners = LinkedHashMap<String, Winner<PlanReference>>()
         val noteWinners = LinkedHashMap<String, Winner<NoteReference>>()
         for (summary in subjectSummaries) {
@@ -244,7 +256,7 @@ object LiveShareController {
             if (subjectSummaries.isEmpty()) throw NothingToShareError(params.branch)
 
             val ctx = buildPushContext(deps, baseUrl, repoUrl)
-            val ref = pushSubjectAndBuildRef(subjectSummaries, kind, params.branch, ctx)
+            val ref = pushSubjectAndBuildRef(subjectSummaries, kind, params.branch, ctx, deps.outboundPushAllowed)
 
             val decisions = decisionCount(subjectSummaries)
             val headCommitHash = subjectSummaries.last().commitHash
@@ -315,7 +327,14 @@ object LiveShareController {
             val baseUrl = resolveBaseUrl(deps.apiKey)
             val repoUrl = GitRemoteUtils.getCanonicalRepoUrl(deps.workspaceRoot)
             val ctx = buildPushContext(deps, baseUrl, repoUrl)
-            val ref = pushSubjectAndBuildRef(subjectSummaries, "branch", branch, ctx)
+            // Reconcile is a best-effort background pass — a push-disabled repo just
+            // means "nothing to sync outbound", so skip quietly instead of surfacing an error.
+            val ref = try {
+                pushSubjectAndBuildRef(subjectSummaries, "branch", branch, ctx, deps.outboundPushAllowed)
+            } catch (_: JolliShareService.PushDisabledError) {
+                log.info("reconcile: outbound push disabled for this repo; skipping re-push")
+                return@withSubjectLock
+            }
             val result = JolliApiClient.updateLiveShare(
                 baseUrl, deps.apiKey, existing.shareId,
                 JolliApiClient.LiveSharePatch(ref = ref),
