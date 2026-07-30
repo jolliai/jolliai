@@ -57,9 +57,62 @@ class CreatePrHtmlBuilderTest {
         html shouldContain """data-hash="aaaaaaaa1111""""
         html shouldContain """data-path="src/App.kt""""
         html shouldContain """gs gs-M"""
-        // body markdown carried for client-side rendering (not raw <pre>)
+        // Body is rendered server-side into #prBody (matching VS Code) — `##` is
+        // consumed by renderPrBodyMarkdown into an <h3> instead of appearing as raw
+        // text. The raw markdown still shows up escaped inside the edit textarea.
         html shouldContain """id="prBody""""
-        html shouldContain "## Summary"
+        html shouldContain """<h3 class="md-heading">Summary</h3>"""
+        html shouldContain """<textarea id="prBodyInput" class="pr-textarea hidden""""
+    }
+
+    @Test
+    fun `renders Topics folding tags natively so details fold works (regression)`() {
+        // The PR body for a real branch includes wrapInGithubDetails output —
+        // `<details>`, `<summary><strong>…</strong></summary>`, `<br>`,
+        // `<blockquote>` — and each of those structural tags must pass through as
+        // real HTML, not be escaped into literal `&lt;details&gt;` text (which is
+        // what the old client-side `esc(raw)` render did — Topics displayed as
+        // raw tag text instead of folding).
+        val body = """
+            ## Topics (1)
+
+            <details>
+            <summary><strong>01 · Skeleton loading state could permanently lock Create PR panel</strong></summary>
+            <br>
+            <blockquote>
+
+            **⚡ Why This Change**
+
+            Users saw the button stuck disabled.
+
+            </blockquote>
+            </details>
+        """.trimIndent()
+        val v = vm().copy(bodyMarkdown = body)
+        val html = CreatePrHtmlBuilder.buildHtml(v, isDark = true, bridgeScript = "")
+        // Structural tags pass through verbatim inside the body panel — before this
+        // fix, `esc(raw)` in the JS renderer double-escaped everything and only the
+        // textarea's `&lt;details&gt;` form reached the document. Now the display
+        // div itself must emit the real tags. Extract the display region and assert
+        // on that, so the raw markdown legitimately escaped inside `#prBodyInput`
+        // can't accidentally satisfy the pass-through assertion. The display's
+        // outer `</div>` is hard to locate by substring (it emits many inner
+        // `</div>`s for `.md-line` / `.md-blank`); the sibling textarea start tag
+        // is a stable end marker.
+        val displayStart = html.indexOf("""<div class="md-body" id="prBody">""")
+        val displayEnd = html.indexOf("<textarea id=\"prBodyInput\"", displayStart)
+        val display = html.substring(displayStart, displayEnd)
+        display shouldContain "<details>"
+        display shouldContain "<summary><strong>01 · Skeleton loading state could permanently lock Create PR panel</strong></summary>"
+        display shouldContain "<br>"
+        display shouldContain "<blockquote>"
+        display shouldContain "</blockquote>"
+        display shouldContain "</details>"
+        // Regression sentinel — the escaped forms must NOT appear in the display.
+        display shouldNotContain "&lt;details&gt;"
+        display shouldNotContain "&lt;summary&gt;"
+        // Heading is rendered into an <h3> (## → level 3 per the +1 offset).
+        display shouldContain """<h3 class="md-heading">Topics (1)</h3>"""
     }
 
     @Test
@@ -164,5 +217,92 @@ class CreatePrHtmlBuilderTest {
         val html = CreatePrHtmlBuilder.buildHtml(vm(branchTokenTotals = totals), true, "")
         html shouldContain "cost N/A"
         html shouldNotContain "not reported"
+    }
+
+    // ─── Skeleton mode ─────────────────────────────────────────────────────
+    // The fast first paint served by CreatePrData.buildSkeleton. Renders shimmer
+    // placeholders in the sections that need heavy data (memories, files, body)
+    // and disables the submit button so a click during the ~1-3s hydrate window
+    // can't create a PR with an empty body. CommitsPanel.openCreatePrView calls
+    // panel.hydrate(fullVm) once build() returns, which loadHTMLs the non-skeleton
+    // version in place — no separate JS "hydrate" message needed.
+
+    @Test
+    fun `skeleton mode renders shimmer placeholders and disables submit`() {
+        val skeleton = vm().copy(
+            memoryCount = 3,
+            filesChanged = 5,
+            memories = emptyList(),
+            files = emptyList(),
+            bodyMarkdown = "",
+            e2eScenarios = emptyList(),
+            existingPr = null,
+            skeleton = true,
+        )
+        val html = CreatePrHtmlBuilder.buildHtml(skeleton, isDark = true, bridgeScript = "")
+
+        // Header still shows the create verb since existingPr is null while loading.
+        html shouldContain "Create Pull Request"
+        // Submit is labelled Loading… and disabled so a click can't submit an empty body.
+        html shouldContain ">Loading…</button>"
+        html shouldContain """data-uptodate="false" disabled"""
+        // Skeleton rows appear in both list panels; the count is bounded by
+        // memoryCount / filesChanged so height doesn't jump on hydrate. Match
+        // the actual HTML class attribute, not the CSS selector — the emitted
+        // stylesheet also mentions "skeleton-row" / "skeleton-bar" verbatim.
+        html shouldContain """class="row skeleton-row""""
+        html shouldContain """class="skeleton-bar""""
+        // No real data-* row attributes since summaries + files haven't loaded.
+        html shouldNotContain "data-hash="
+        html shouldNotContain "data-path="
+    }
+
+    @Test
+    fun `non-skeleton mode does not render shimmer placeholders`() {
+        val html = CreatePrHtmlBuilder.buildHtml(vm(), isDark = true, bridgeScript = "")
+        // Same class-attribute check as above — CSS selectors always mention these.
+        html shouldNotContain """class="row skeleton-row""""
+        html shouldNotContain """class="skeleton-bar""""
+        html shouldNotContain ">Loading…</button>"
+    }
+
+    @Test
+    fun `skeleton mode disables Edit and Copy body so dirty-flag cannot latch on empty inputs`() {
+        // Regression guard for the webviewDirty latch: an Edit click during
+        // the ~1-3 s hydrate window unhid the empty title/body inputs, the
+        // first keystroke fired editState=true, and CreatePrPanel.hydrate()
+        // then bailed on the still-in-flight hydrate — leaving the tab stuck
+        // on skeleton content until the user submitted or closed it.
+        val skeleton = vm().copy(skeleton = true, existingPr = null, memories = emptyList(), files = emptyList(), bodyMarkdown = "")
+        val html = CreatePrHtmlBuilder.buildHtml(skeleton, isDark = true, bridgeScript = "")
+        html shouldContain """id="cmdEdit" disabled>Edit</button>"""
+        html shouldContain """id="cmdCopyBody" disabled>Copy body</button>"""
+    }
+
+    @Test
+    fun `non-skeleton mode leaves Edit and Copy body enabled`() {
+        val html = CreatePrHtmlBuilder.buildHtml(vm(), isDark = true, bridgeScript = "")
+        html shouldContain """id="cmdEdit">Edit</button>"""
+        html shouldContain """id="cmdCopyBody">Copy body</button>"""
+    }
+
+    @Test
+    fun `skeleton with a hydrate error re-enables Edit and Copy body along with the primary`() {
+        // Mirrors the primary-button policy: hasLoadError means "no hydrate is coming"
+        // so the panel must be fully interactive with the partial fields it filled
+        // from the skeleton, not stuck in Loading… state.
+        val skeleton = vm().copy(
+            skeleton = true,
+            existingPr = null,
+            memories = emptyList(),
+            files = emptyList(),
+            bodyMarkdown = "",
+            loadError = "gh timed out",
+        )
+        val html = CreatePrHtmlBuilder.buildHtml(skeleton, isDark = true, bridgeScript = "")
+        html shouldNotContain """id="cmdEdit" disabled"""
+        html shouldNotContain """id="cmdCopyBody" disabled"""
+        html shouldContain """id="cmdEdit">Edit</button>"""
+        html shouldContain """id="cmdCopyBody">Copy body</button>"""
     }
 }

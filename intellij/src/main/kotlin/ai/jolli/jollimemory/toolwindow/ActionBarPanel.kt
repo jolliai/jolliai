@@ -188,10 +188,8 @@ class ActionBarPanel(
 					return@invokeLater
 				}
 				ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_shared")
-				val vFile = SummaryVirtualFile(newest)
-				val editors = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
-					.openFile(vFile, true)
-				editors.filterIsInstance<SummaryFileEditor>().firstOrNull()?.requestOpenShare(branchShare = true)
+				MemoryTabOpener.openOrReuse(project, newest)
+				MemoryTabOpener.findExistingEditor(project)?.requestOpenShare(branchShare = true)
 			}
 		}
 	}

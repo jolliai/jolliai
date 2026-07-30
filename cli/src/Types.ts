@@ -1212,11 +1212,11 @@ export interface JolliMemoryConfig {
 	 * missing or stale. Pure URL — no secret material. Trailing slash stripped
 	 * on write to match `getJolliUrl`.
 	 *
-	 * Surface-local: written only by the CLI / VS Code login paths and read
-	 * only by consumers running in the CLI process. IntelliJ keeps its own
-	 * auth state in `config-intellij.json` and is intentionally not covered
-	 * here — if a closed-source IntelliJ consumer ever needs the same
-	 * fallback, mirror this persistence in the Kotlin auth flow.
+	 * Written by every login path (CLI, VS Code, and IntelliJ via the CLI's
+	 * `handle-auth-callback` ide-bridge action). Consumed only by CLI-process
+	 * code today — the Kotlin `JolliMemoryConfig` data class deliberately omits
+	 * this field, since the IntelliJ side resolves its origin via JolliUrlConfig.
+	 * Add it to the Kotlin type if IntelliJ ever needs the same fallback.
 	 */
 	readonly jolliUrl?: string;
 	/**

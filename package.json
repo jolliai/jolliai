@@ -29,7 +29,8 @@
 		"clean": "npm run clean -w @jolli.ai/cli && npm run clean -w vscode",
 		"all": "npm run clean && npm run build && npm run typecheck && npm run lint && npm run test",
 		"cli": "npm run cli -w @jolli.ai/cli",
-		"cli:build": "npm run cli:build -w @jolli.ai/cli"
+		"cli:build": "npm run cli:build -w @jolli.ai/cli",
+		"intellij:sandbox": "node intellij/scripts/run-sandbox.mjs"
 	},
 	"keywords": ["ai", "documentation", "git-hooks", "claude-code", "codex", "gemini", "commit-summary", "dev-memory"],
 	"author": "Jolli",

@@ -7,6 +7,7 @@ import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliMemoryService
 import ai.jolli.jollimemory.services.PrService
+import ai.jolli.jollimemory.services.PrStatusCache
 import ai.jolli.jollimemory.toolwindow.BranchTokenTotals
 import ai.jolli.jollimemory.toolwindow.CommitMemoryFormat
 import com.intellij.openapi.project.Project
@@ -68,6 +69,23 @@ object CreatePrData {
          * branch-level counterpart of the per-memory meter in the detail webview.
          */
         val branchTokenTotals: BranchTokenTotals? = null,
+        /**
+         * True when this vm is the "skeleton" — only cheap fields (branch, count,
+         * shortstat totals, title) are populated; [memories]/[files]/[bodyMarkdown]/
+         * [e2eScenarios]/[existingPr] are placeholders that will be hydrated by a
+         * follow-up `postToWebview("hydrate", ...)` message. The webview should
+         * render skeleton loaders in those sections when this is true.
+         */
+        val skeleton: Boolean = false,
+        /**
+         * Non-null when the full [build] failed after the skeleton was placed on
+         * screen. The webview renders a banner with this message, drops the
+         * skeleton loaders (so the panel doesn't look "still loading"), and
+         * relabels the primary button so it isn't stuck in "Loading…" state.
+         * The user can retry by re-clicking Create PR from the sidebar — which
+         * re-runs the pipeline top-to-bottom.
+         */
+        val loadError: String? = null,
     )
 
     /**
@@ -96,9 +114,20 @@ object CreatePrData {
         val base = resolveDeltaBase(git, branch, mainBranch)
         val (stats, files) = computeStats(git, base)
 
-        val existingPr = when (val lookup = PrService.findPrForBranch(cwd, branch)) {
-            is PrService.PrLookup.Found -> ExistingPr(lookup.pr.number, lookup.pr.url)
-            else -> null
+        // Route through the project-scoped TTL cache instead of the raw
+        // PrService.findPrForBranch. The 60s cache is populated by CommitsPanel
+        // on sidebar refresh, so by the time the user clicks Create PR the
+        // cache is almost always warm — turning a 1-3s `gh pr list` into a
+        // microsecond map lookup. Cold path degrades to the same cost as the
+        // old direct call. Gh-availability + auth are checked first, both
+        // cached at 5-min TTL; false → skip the network attempt cleanly.
+        val existingPr = run {
+            val prCache = PrStatusCache.getInstance(project)
+            if (!prCache.isGhAvailable(cwd) || !prCache.isGhAuthenticated(cwd)) null
+            else when (val lookup = prCache.getLookup(cwd, branch)) {
+                is PrService.PrLookup.Found -> ExistingPr(lookup.pr.number, lookup.pr.url)
+                else -> null
+            }
         }
         val signedIn = !SessionTracker.loadConfig(cwd).jolliApiKey.isNullOrBlank()
         // Something to push = HEAD isn't on the remote yet (unpushed commits, or a
@@ -107,6 +136,86 @@ object CreatePrData {
         val hasUnpushedChanges = !git.isHeadPushed()
 
         return assemble(branch, mainBranch, summaries, stats, files, existingPr, signedIn, hasUnpushedChanges, tokenTotals)
+    }
+
+    /**
+     * Fast lightweight vm for the FIRST paint — pool line runs this instead of
+     * [build] so the Create PR tab appears in <100 ms. Skips:
+     *   - N × service.getSummary(...)  (heavy StorageProvider reads)
+     *   - PrStatusCache.getLookup (cold: a `gh pr list` network round-trip)
+     *   - git diff --numstat / --name-status (kept but shrunk to a single
+     *     --shortstat call that returns only aggregate numbers)
+     * The webview renders skeleton loaders where `memories/files/bodyMarkdown/
+     * e2eScenarios/existingPr` used to be, then a follow-up
+     * `postToWebview("hydrate", ...)` swaps in the real data returned by [build].
+     * Returns null when the branch has no committed memory (same contract as
+     * [build] so the caller uses one "commit first" hint path).
+     */
+    fun buildSkeleton(project: Project, mainBranch: String = "main"): ViewModel? {
+        val service = project.getService(JolliMemoryService::class.java) ?: return null
+        val cwd = service.mainRepoRoot ?: project.basePath ?: return null
+        val git = service.getGitOps() ?: return null
+
+        val briefs = service.getBranchCommits()
+        val briefsWithSummary = briefs.filter { it.hasSummary }
+        if (briefsWithSummary.isEmpty()) return null
+
+        val branch = git.getCurrentBranch()?.trim().orEmpty()
+        val base = resolveDeltaBase(git, branch, mainBranch)
+        val shortstat = shortstatTotals(git, base)
+
+        val anchorBrief = briefsWithSummary.first() // newest-first, matches build()
+        val tokenTotals = CommitMemoryFormat.aggregateTokens(briefs)
+
+        // signedIn: derived from local config, no network — keep it in the skeleton
+        // so the "sign in to also share" strip renders correctly on first paint.
+        val signedIn = !SessionTracker.loadConfig(cwd).jolliApiKey.isNullOrBlank()
+
+        return ViewModel(
+            branch = branch,
+            mainBranch = mainBranch,
+            memoryCount = briefsWithSummary.size,
+            insertions = shortstat.insertions,
+            deletions = shortstat.deletions,
+            filesChanged = shortstat.filesChanged,
+            title = firstLine(anchorBrief.message),
+            bodyMarkdown = "",
+            memories = emptyList(),
+            files = emptyList(),
+            e2eScenarios = emptyList(),
+            existingPr = null,
+            signedIn = signedIn,
+            includedSummaries = emptyList(),
+            hasUnpushedChanges = true, // optimistic; hydrate corrects it
+            branchTokenTotals = tokenTotals,
+            skeleton = true,
+        )
+    }
+
+    /**
+     * Aggregate `git diff --shortstat` numbers used by [buildSkeleton]. Named
+     * fields (rather than `Triple<Int, Int, Int>`) so a caller can't quietly
+     * swap two positional Ints — an easy failure mode when three same-typed
+     * counters live in a tuple.
+     */
+    private data class Shortstat(val insertions: Int, val deletions: Int, val filesChanged: Int) {
+        companion object { val EMPTY = Shortstat(0, 0, 0) }
+    }
+
+    /**
+     * Fast counterpart to [computeStats]: a single `git diff --shortstat` call
+     * that returns only aggregate insertions / deletions / files, avoiding the
+     * per-file --name-status parse. Used by [buildSkeleton] where we want
+     * numbers for the header but not the full file list (which is hydrated).
+     * Format: "N files changed, M insertions(+), K deletions(-)".
+     */
+    private fun shortstatTotals(git: GitOps, base: String?): Shortstat {
+        if (base == null) return Shortstat.EMPTY
+        val out = git.exec("diff", "--shortstat", base, "HEAD") ?: return Shortstat.EMPTY
+        val files = Regex("(\\d+) files? changed").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val ins = Regex("(\\d+) insertions?").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val del = Regex("(\\d+) deletions?").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        return Shortstat(insertions = ins, deletions = del, filesChanged = files)
     }
 
     /** Aggregate insertions/deletions/filesChanged. */

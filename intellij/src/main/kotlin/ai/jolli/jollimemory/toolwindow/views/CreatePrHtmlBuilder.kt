@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.toolwindow.views
 import ai.jolli.jollimemory.core.E2eTestScenario
 import ai.jolli.jollimemory.toolwindow.BranchTokenTotals
 import ai.jolli.jollimemory.toolwindow.CommitMemoryFormat
+import ai.jolli.jollimemory.toolwindow.views.CreatePrBodyMarkdown.renderPrBodyMarkdown
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.escAttr
 
 /**
@@ -11,24 +12,63 @@ import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.escAttr
  *
  * Reuses the existing JCEF document skeleton (inline `<style>` + bridge `<script>`
  * + behaviour `<script>`, no CSP nonce) from [SummaryHtmlBuilder]. Data comes from
- * [CreatePrData.ViewModel]; the PR body is rendered as markdown client-side by
- * [CreatePrScriptBuilder].
+ * [CreatePrData.ViewModel]; the PR body is rendered server-side by
+ * [CreatePrBodyMarkdown.renderPrBodyMarkdown] — matching the VS Code pane — so
+ * whole-line structural tags (`<details>`/`<summary>`/`<blockquote>`/`<br>`)
+ * emitted by [SummaryPrMarkdownBuilder.wrapInGithubDetails] pass through and
+ * fold natively instead of showing as escaped text.
  */
 object CreatePrHtmlBuilder {
 
     fun buildHtml(vm: CreatePrData.ViewModel, isDark: Boolean, bridgeScript: String): String {
         val isUpdate = vm.existingPr != null
         val heading = if (isUpdate) "Update Pull Request" else "Create Pull Request"
-        val primaryLabel = if (isUpdate) "Update PR" else "Create PR"
+        // Skeleton state disables the primary until hydrate lands. When hydrate
+        // failed [loadError] gets set — treat that like "no longer loading":
+        // the button re-enables so the user isn't staring at a disabled
+        // "Loading…" forever, and the label reads normally so a retry can be
+        // initiated by re-clicking Create PR from the sidebar. The error strip
+        // rendered below explains why the memory/file lists are empty.
+        val hasLoadError = vm.loadError != null
+        val primaryLabel = when {
+            vm.skeleton && !hasLoadError -> "Loading…"
+            isUpdate -> "Update PR"
+            else -> "Create PR"
+        }
         // "Up to date" here means only "no new commits to push". The PR body is drafted
         // from memory content (summary / E2E / plans), which is editable without a new
         // git commit — and can even change from another panel — so an Update is ALWAYS a
         // valid action. We therefore never disable the button; we only surface an
         // informational hint about the git-push state.
         val upToDate = isUpdate && !vm.hasUnpushedChanges
-        val primaryDisabled = ""
+        val primaryDisabled = if (vm.skeleton && !hasLoadError) " disabled" else ""
+        // Also disable Edit + Copy body while the vm is skeleton (no
+        // memories/body loaded yet). Otherwise a click on Edit during the
+        // 1-3 s hydrate window unhides the empty title/body inputs — the
+        // first keystroke there fires editState=true, and [CreatePrPanel]'s
+        // webviewDirty guard then makes the still-in-flight hydrate() bail.
+        // The panel latches on the skeleton until the user submits or
+        // closes the tab (memories/files stay shimmer, existingPr appears
+        // as null so the button label lies about Update-vs-Create, and
+        // cross-panel memory-state events are silently dropped for the
+        // lifetime of the tab).
+        //
+        // hasLoadError re-enables both so the failure banner state is
+        // interactive: nothing worth hydrating is coming, and the user
+        // should be able to eyeball / copy whatever partial fields we
+        // filled from the skeleton before retrying via the sidebar.
+        val secondaryDisabled = if (vm.skeleton && !hasLoadError) " disabled" else ""
         val upToDateHint = if (upToDate) {
             """<span class="up-to-date">No new commits to push — Update still refreshes the PR body from the latest memory</span>"""
+        } else {
+            ""
+        }
+        val loadErrorBanner = if (hasLoadError) {
+            """<div class="pr-load-error" role="alert">""" +
+                """<b>Couldn't finish loading this PR view.</b> """ +
+                escAttr(vm.loadError.orEmpty()) +
+                """ Re-click Create PR to retry.""" +
+                """</div>"""
         } else {
             ""
         }
@@ -44,6 +84,7 @@ object CreatePrHtmlBuilder {
 <body>
 <div class="pane" id="pane-pr">
   <h1>$heading</h1>
+  $loadErrorBanner
   ${buildTokenBanner(vm.branchTokenTotals)}
   ${buildMetaStrip(vm)}
   ${buildShipSub(vm)}
@@ -54,7 +95,7 @@ object CreatePrHtmlBuilder {
   </div>
   <div class="panel">
     <div class="panel-header"><span class="panel-title">Body — drafted from this branch&#39;s memories</span></div>
-    <div class="md-mock" id="prBody" data-body="${escAttr(vm.bodyMarkdown)}"></div>
+    <div class="md-body" id="prBody">${buildBodyHtml(vm)}</div>
     <textarea id="prBodyInput" class="pr-textarea hidden" rows="12">${escAttr(vm.bodyMarkdown)}</textarea>
   </div>
   <div class="panel">
@@ -74,8 +115,8 @@ object CreatePrHtmlBuilder {
   </div>
   <div class="actions">
     <button class="btn" id="cmdCreatePr" data-uptodate="$upToDate"$primaryDisabled>$primaryLabel</button>
-    <button class="btn secondary" id="cmdEdit">Edit</button>
-    <button class="btn secondary" id="cmdCopyBody">Copy body</button>
+    <button class="btn secondary" id="cmdEdit"$secondaryDisabled>Edit</button>
+    <button class="btn secondary" id="cmdCopyBody"$secondaryDisabled>Copy body</button>
     $upToDateHint
   </div>
   <p class="ship-sub" id="prStatusText"></p>
@@ -172,8 +213,24 @@ object CreatePrHtmlBuilder {
         }
     }
 
-    private fun buildMemoryRows(vm: CreatePrData.ViewModel): String =
-        vm.memories.joinToString("") { m ->
+    private fun buildMemoryRows(vm: CreatePrData.ViewModel): String {
+        // Skeleton mode: memoryCount was set from the brief list, but the per-row
+        // titles + jolliDocUrl come from full summaries (not loaded yet). Render
+        // that many placeholder rows so the panel's height doesn't jump on hydrate.
+        // Suppress the shimmer when loadError is set — the row list will never
+        // arrive, and animated placeholders would read as "still loading".
+        if (vm.skeleton && vm.loadError == null) {
+            val rows = vm.memoryCount.coerceAtLeast(1).coerceAtMost(8)
+            return (1..rows).joinToString("") {
+                """<div class="row skeleton-row">""" +
+                    """<span class="mem-ico">▤</span>""" +
+                    """<div class="r-main">""" +
+                    """<div class="r-title skeleton-bar" style="width:60%">&nbsp;</div>""" +
+                    """<div class="r-sub"><span class="skeleton-bar" style="width:30%">&nbsp;</span></div>""" +
+                    """</div></div>"""
+            }
+        }
+        return vm.memories.joinToString("") { m ->
             val sharedSuffix = if (m.jolliDocUrl != null) """ · <span style="opacity:0.7">shared</span>""" else ""
             """<div class="row" data-hash="${escAttr(m.hash)}">""" +
                 """<span class="mem-ico">▤</span>""" +
@@ -182,9 +239,24 @@ object CreatePrHtmlBuilder {
                 """<div class="r-sub"><span class="meta-hash">${escAttr(m.hash.take(8))}</span>$sharedSuffix</div>""" +
                 """</div></div>"""
         }
+    }
 
-    private fun buildFileRows(vm: CreatePrData.ViewModel): String =
-        vm.files.joinToString("") { f ->
+    private fun buildFileRows(vm: CreatePrData.ViewModel): String {
+        // Skeleton mode: filesChanged came from shortstat, but the per-file
+        // path + status came from --name-status (not run yet). Same
+        // placeholder-count trick as buildMemoryRows — also suppressed when
+        // loadError is set so the shimmer isn't lying about progress.
+        if (vm.skeleton && vm.loadError == null) {
+            val rows = vm.filesChanged.coerceAtLeast(1).coerceAtMost(8)
+            return (1..rows).joinToString("") {
+                """<div class="row skeleton-row">""" +
+                    """<div class="r-main">""" +
+                    """<div class="r-title skeleton-bar" style="width:45%">&nbsp;</div>""" +
+                    """<div class="r-sub"><span class="skeleton-bar" style="width:65%">&nbsp;</span></div>""" +
+                    """</div></div>"""
+            }
+        }
+        return vm.files.joinToString("") { f ->
             val fname = f.path.substringAfterLast('/')
             """<div class="row" data-path="${escAttr(f.path)}">""" +
                 """<div class="r-main">""" +
@@ -194,6 +266,24 @@ object CreatePrHtmlBuilder {
                 """<span class="gs gs-${escAttr(f.status)}">${escAttr(f.status)}</span>""" +
                 """</div>"""
         }
+    }
+
+    /**
+     * Renders the body panel content: shimmer bars during skeleton mode (so the
+     * panel has visible height and reads as "loading"), otherwise the PR body
+     * markdown rendered to HTML server-side by [renderPrBodyMarkdown]. Matches
+     * VS Code's CreatePrHtmlBuilder — the body HTML is baked in at build time,
+     * not read from a `data-body` attribute and re-parsed in JS.
+     */
+    private fun buildBodyHtml(vm: CreatePrData.ViewModel): String {
+        if (vm.skeleton && vm.loadError == null) {
+            return """<div class="skeleton-bar" style="width:80%; height:1em; margin:6px 0">&nbsp;</div>""" +
+                """<div class="skeleton-bar" style="width:95%; height:1em; margin:6px 0">&nbsp;</div>""" +
+                """<div class="skeleton-bar" style="width:65%; height:1em; margin:6px 0">&nbsp;</div>""" +
+                """<div class="skeleton-bar" style="width:88%; height:1em; margin:6px 0">&nbsp;</div>"""
+        }
+        return renderPrBodyMarkdown(vm.bodyMarkdown)
+    }
 
     private fun buildE2ePanel(scenarios: List<E2eTestScenario>): String {
         if (scenarios.isEmpty()) return ""

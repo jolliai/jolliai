@@ -10,6 +10,19 @@
  * 2. Parses CommitSummary and generates markdown with YAML frontmatter
  * 3. Writes markdown to {branch}/{slug}-{hash8}.md (visible)
  * 4. Updates manifest to track the AI-generated file
+ *
+ * ── LOCKSTEP NOTE ────────────────────────────────────────────────────────
+ * IntelliJ has an independent READ path for this folder at
+ *   intellij/src/main/kotlin/ai/jolli/jollimemory/bridge/FolderStorageReader.kt
+ * that reads the JSON layer directly (bypasses the ide-bridge daemon for
+ * latency). The Kotlin reader consumes ONLY `.jolli/summaries/<hash>.json`,
+ * `.jolli/plans/<slug>.md`, `.jolli/notes/<id>.md`, and the `.jolli/shadow-
+ * status.json` dirty marker — any change to those file paths, folder names,
+ * or the JSON schemas MUST be mirrored in that Kotlin reader in the same PR.
+ * `.jolli/index.json` is CLI-only (no read path in IntelliJ today) so its
+ * schema can evolve independently; if a future Kotlin read path starts
+ * consuming it, add it to the list here AND to AGENTS.md "Critical rules".
+ * Writes stay CLI-only for all layers.
  */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";

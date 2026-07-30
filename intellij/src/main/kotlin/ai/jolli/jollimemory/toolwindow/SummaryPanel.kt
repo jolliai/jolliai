@@ -67,13 +67,34 @@ import java.awt.BorderLayout
 class SummaryPanel(
     private val project: Project,
     summary: CommitSummary,
-    private val readOnly: Boolean = false,
+    initialReadOnly: Boolean = false,
 ) : JPanel(BorderLayout()) {
+
+    // readOnly used to be a val — now a var so [setSummary] can flip it when the
+    // same tab is reused to view a different commit (e.g. own → foreign). Writes
+    // and reads both happen on the EDT (setSummary is EDT-only; doRefreshNow
+    // snapshots the field on the EDT before handing it to a pool thread), so
+    // @Volatile is defensive only — it costs nothing and documents that the
+    // field mutates after construction.
+    @Volatile
+    private var readOnly: Boolean = initialReadOnly
 
     @Volatile
     var currentSummary: CommitSummary = summary
         private set
 
+    // Fires after Chromium's compositor produces its first frame (double rAF).
+    // The message is picked up in dispatchWebviewMessage → scheduleSwingSizeShake,
+    // which forces AppKit to reconcile the child NSView's frame — without this,
+    // the tab's top can stay blank until an external resize/drag wakes AppKit.
+    private val firstFrameTriggerJs = """
+        (function(){
+          if (!window.jmSend) return;
+          requestAnimationFrame(function(){
+            requestAnimationFrame(function(){ window.jmSend({command: 'firstFramePainted'}); });
+          });
+        })();
+    """.trimIndent()
 
     // Every field cleared in dispose() is @Volatile so an EDT reader (refreshHtml,
     // triggerNativeRepaint, postToWebview) sees the cleared value promptly when
@@ -119,10 +140,48 @@ class SummaryPanel(
     // later resize happens to sweep them.
     @Volatile
     private var postFireResizeListenerRef: java.awt.event.ComponentAdapter? = null
+    // Companion to postFireResizeListener that handles SHOWING_CHANGED events —
+    // installed by the 0×0-timeout branch of loadFallbackTimer so a tab that first
+    // becomes visible without changing size (background tab already had bounds set)
+    // still gets a wasResized() nudge to Chromium. Detached in dispose alongside
+    // the resize listener.
+    @Volatile
+    private var postFireHierarchyListenerRef: java.awt.event.HierarchyListener? = null
     @Volatile
     private var preFireComponentListenerRef: java.awt.event.ComponentAdapter? = null
     @Volatile
     private var preFireHierarchyListenerRef: java.awt.event.HierarchyListener? = null
+
+    // One-shot latch guarding the post-fire paint-recovery path (see the
+    // postFireResizeListener comment). When the initial loadHTML was forced at
+    // 0×0/hidden, Chromium's onLoadEnd sometimes never fires — pageLoaded
+    // stays false, refreshPending piled up by every setSummary since is never
+    // drained, and the tab ends up permanently blank. The first post-fire
+    // event that observes a valid surface flips this latch and calls
+    // doRefreshNow() directly, rebuilding html from currentSummary and
+    // loading it onto the now-real surface. AtomicBoolean so a burst of
+    // resize/hierarchy events fires the recovery exactly once.
+    private val postFirePaintRecovery = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // Set to true right after the 1500ms fallback Timer fires the initial
+    // loadHTML. Distinguishes "we haven't tried yet" (fast path pending) from
+    // "we've tried but Chromium hasn't reported success" (pageLoaded still
+    // false after fire). Read by setSummary's fast path so a re-click of the
+    // SAME memory forces a re-render when the initial render never landed.
+    @Volatile
+    private var initialLoadFired = false
+
+    // Visibility poll started by the 1500ms Timer when it fires with
+    // isShowing=false. SHOWING_CHANGED is not reliable in every IntelliJ
+    // editor-group state (an editor group that just lost its last tab, or a
+    // background split, can leave the newly-added tab with isShowing=false
+    // and never emit the transition-to-true event when the user brings it
+    // into view). The poll checks component.isShowing every 500ms and, once
+    // it sees the tab actually mounted-and-visible with a real size, drives
+    // wasResized + doRefreshNow — the same paint-recovery path the SHOWING_
+    // CHANGED listener would have taken.
+    @Volatile
+    private var visibilityPollTimer: javax.swing.Timer? = null
 
     // Snapshot of the pooled browser component the listeners above were attached
     // to. Held separately from `browser` because we still need it AFTER the
@@ -158,8 +217,12 @@ class SummaryPanel(
 
     private val gson = Gson()
     private val store: SummaryStore
-    private val transcriptHashSet = mutableSetOf<String>()
-    private val planTranslateSet = mutableSetOf<String>()
+    // Concurrent-safe: mutated from multiple pool threads (loadDeferredSets scan,
+    // handleSaveAllTranscripts, handleDeleteAllTranscripts, handleTranslatePlan)
+    // as well as the EDT clear() in setSummary. A plain LinkedHashSet would
+    // ConcurrentModificationException under rapid memory-tab switches.
+    private val transcriptHashSet = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val planTranslateSet = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val cwd: String
     private val service = project.getService(JolliMemoryService::class.java)
     // Refresh when a PR is created/updated or a memory is shared elsewhere (the Create PR
@@ -189,6 +252,11 @@ class SummaryPanel(
         val git = gitOps ?: GitOps(cwd)
         store = SummaryStore(cwd, git, StorageFactory.create(git, cwd))
         add(createContent(), BorderLayout.CENTER)
+        // Only editable panels care about memory-state events; read-only /
+        // foreign-mode tabs would waste a pooled `getSummary` + full HTML
+        // refresh on every event. [setSummary] re-runs this decision when it
+        // flips [readOnly] on the fly (Flavor A tab reuse own → foreign or
+        // foreign → own).
         if (!readOnly) service?.addMemoryStateListener(memoryStateListener)
         loadDeferredSets()
     }
@@ -214,11 +282,19 @@ class SummaryPanel(
      * as [refreshPending].
      */
     private fun loadDeferredSets() {
+        // Snapshot the current identity so a rapid setSummary→setSummary sequence
+        // doesn't let this scan's transcript / plan-translate results land on
+        // the newer memory's DOM. Refresh helpers below also honour the gen so
+        // stale mutations don't overwrite the incoming memory's fresh clear().
+        val myGen = summaryGeneration
         ApplicationManager.getApplication().executeOnPooledThread {
-            refreshTranscriptHashes()
-            refreshPlanTranslateSet()
+            if (myGen != summaryGeneration) return@executeOnPooledThread
+            refreshTranscriptHashes(myGen)
+            if (myGen != summaryGeneration) return@executeOnPooledThread
+            refreshPlanTranslateSet(myGen)
             ApplicationManager.getApplication().invokeLater {
                 if (disposed) return@invokeLater
+                if (myGen != summaryGeneration) return@invokeLater
                 if (transcriptHashSet.isEmpty() && planTranslateSet.isEmpty()) return@invokeLater
                 // Arm the pending flag even when the webview is currently dirty.
                 // [maybeSendDeferredHydrate] holds it back while dirty and
@@ -274,11 +350,40 @@ class SummaryPanel(
     @Volatile
     private var webviewDirty = false
 
+    // Monotonic counter that lets a pool-thread `buildHtml` cheaply detect it
+    // was superseded by a newer refresh before its result reaches the EDT.
+    // Written on the EDT (in `doRefreshNow` entry), snapshotted on the pool
+    // thread, read on the EDT again after loadHTML. All accesses are EDT-only
+    // today, so the ++ is trivially atomic; @Volatile is defensive against a
+    // future off-EDT reader (mirrors CreatePrPanel.renderGeneration's shape
+    // and documents that this field is designed for cross-thread visibility).
+    @Volatile
+    private var renderGeneration: Long = 0
+
+    // Bumps every time [setSummary] installs a different memory into this reused
+    // tab. Async callbacks launched from that setSummary — handleCheckPrStatus,
+    // loadDeferredSets, refreshTranscript/PlanTranslate helpers — snapshot the
+    // value at dispatch and short-circuit on invokeLater if the user has since
+    // switched to another memory. Without this, memory A's cold gh lookup or
+    // transcript scan can land on memory B's DOM (postToWebview "prStatus"
+    // payload for A's branch → wrong PR badge on B; A's transcript chips mis-
+    // attributed to B). The prStatus:"ready" payload doesn't carry a branch
+    // field, so the JS side can't filter after the fact.
+    @Volatile
+    private var summaryGeneration: Long = 0
+
     private fun onMemoryStateChanged() {
         // Never clobber unsaved edits — the PR/share badges will re-sync on the next
         // reload (after the user saves). Dropping in-progress edits is the worse failure.
         if (webviewDirty) return
+        // The pool fetch below runs ~100-200 ms of git plumbing. If the user
+        // switches this reused tab to a different memory in that window (setSummary
+        // bumps summaryGeneration), the invokeLater write `currentSummary = fresh`
+        // would overwrite the incoming memory's identity with the outgoing memory's
+        // fetched summary. Guard the whole chain on the snapshotted gen.
+        val myGen = summaryGeneration
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             val fresh = try {
                 service?.getSummary(currentSummary.commitHash)
             } catch (_: Exception) {
@@ -286,6 +391,7 @@ class SummaryPanel(
             }
             ApplicationManager.getApplication().invokeLater {
                 if (webviewDirty) return@invokeLater
+                if (myGen != summaryGeneration) return@invokeLater
                 if (fresh != null) currentSummary = fresh
                 refreshHtml()
                 handleCheckPrStatus()
@@ -404,6 +510,10 @@ class SummaryPanel(
                         ApplicationManager.getApplication().invokeLater {
                             if (!disposed) triggerNativeRepaint()
                         }
+                        // Post the firstFramePainted ping after Chromium's compositor
+                        // produces its first frame — routed to scheduleSwingSizeShake
+                        // to force AppKit to reconcile the child NSView's frame.
+                        browser?.executeJavaScript(firstFrameTriggerJs, browser.url ?: "", 0)
                     }
                 }
             })
@@ -414,9 +524,14 @@ class SummaryPanel(
             val pageBg = editorBackground()
             // isDark from the page bg's luma (not JBColor.isBright()) so the text-colour
             // vars always match --bg; the LaF and the editor colour scheme are independent.
-            val isDark = pageBg.isDarkByLuma()
             val pageBgHex = pageBg.toCssHex()
-            val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript, readOnly, pageBgHex)
+            // NOTE: no more synchronous `SummaryHtmlBuilder.buildHtml(...)` here —
+            // that call is 100–400 KB of Kotlin string concatenation and freezes the
+            // EDT for 100–300 ms on every new memory tab. Both fire paths below
+            // now go through `doRefreshNow()`, which snapshots panel state on the
+            // EDT and does the actual build off-EDT on a pool thread, then hops
+            // back to loadHTML. `renderGeneration` inside `doRefreshNow` supersedes
+            // any concurrent refreshes so we never load a stale intermediate.
             // Theme-coloured background BEFORE loadHTML: the Swing component background and
             // the page-level background must both be set before the first load so the native
             // Chromium view never shows its default white.
@@ -477,7 +592,11 @@ class SummaryPanel(
                 if (b.component.width <= 0 || b.component.height <= 0) return@Runnable
                 if (!firedInit.compareAndSet(false, true)) return@Runnable
                 if (disposed) return@Runnable
-                b.loadHTML(html)
+                initialLoadFired = true
+                // buildHtml runs on a pool thread inside doRefreshNow. The
+                // sync b.loadHTML call this used to do (100-300ms EDT freeze
+                // for the 100-400KB summary HTML) is gone.
+                doRefreshNow()
             }
             // Post-fire size watcher: once the initial loadHTML has gone through,
             // any later size change on the component is pushed down to CEF via
@@ -485,6 +604,19 @@ class SummaryPanel(
             // fired at 0×0 by the Timer fallback below — as soon as IntelliJ
             // mounts the tab and the layout kicks in, Chromium learns its true
             // viewport and repaints. Without this the tab stays permanently blank.
+            //
+            // Paint-recovery safety net: when the initial loadHTML was forced
+            // onto a 0×0/hidden surface, Chromium sometimes never fires
+            // onLoadEnd. pageLoaded stays false, every setSummary since has
+            // piled `refreshPending = true` (which the missing onLoadEnd would
+            // have drained), and the tab is stuck with no rendered DOM. The
+            // first post-fire event that observes a valid surface fires
+            // doRefreshNow() through the postFirePaintRecovery latch, which
+            // rebuilds html from currentSummary (so we render the *latest*
+            // summary the user clicked, not the stale one captured at
+            // createContent) and loadHTMLs onto the now-real surface. The
+            // eventual onLoadEnd from this second load flips pageLoaded=true
+            // and puts the panel back on the happy path.
             val postFireResizeListener = object : java.awt.event.ComponentAdapter() {
                 override fun componentResized(e: java.awt.event.ComponentEvent) {
                     if (disposed) { b.component.removeComponentListener(this); return }
@@ -495,9 +627,36 @@ class SummaryPanel(
                     try {
                         b.cefBrowser?.wasResized(w, h)
                     } catch (_: Throwable) { /* best-effort */ }
+                    if (!pageLoaded && postFirePaintRecovery.compareAndSet(false, true)) {
+                        jmLog.warn("post-fire paint recovery: pageLoaded=false at first valid resize, forcing doRefreshNow for hash=%s", currentSummary.commitHash.take(8))
+                        doRefreshNow()
+                    }
                 }
             }
             postFireResizeListenerRef = postFireResizeListener
+            // Sibling listener for the "SHOWING_CHANGED without a matching resize"
+            // case: an IntelliJ tab that had bounds set while hidden can flip to
+            // visible without firing componentResized, so postFireResizeListener
+            // above wouldn't catch it. Same wasResized(w,h) push, keyed on the
+            // SHOWING event. Chromium ignores a wasResized to the current size,
+            // so this is safe to fire even when postFireResizeListener also fires.
+            val postFireHierarchyListener = java.awt.event.HierarchyListener { e ->
+                if ((e.changeFlags and java.awt.event.HierarchyEvent.SHOWING_CHANGED.toLong()) == 0L) return@HierarchyListener
+                if (disposed) { b.component.removeHierarchyListener(postFireHierarchyListenerRef ?: return@HierarchyListener); return@HierarchyListener }
+                if (!firedInit.get()) return@HierarchyListener
+                if (!b.component.isShowing) return@HierarchyListener
+                val w = b.component.width
+                val h = b.component.height
+                if (w <= 0 || h <= 0) return@HierarchyListener
+                try {
+                    b.cefBrowser?.wasResized(w, h)
+                } catch (_: Throwable) { /* best-effort */ }
+                if (!pageLoaded && postFirePaintRecovery.compareAndSet(false, true)) {
+                    jmLog.warn("post-fire paint recovery: pageLoaded=false at first valid SHOWING_CHANGED, forcing doRefreshNow for hash=%s", currentSummary.commitHash.take(8))
+                    doRefreshNow()
+                }
+            }
+            postFireHierarchyListenerRef = postFireHierarchyListener
             // Componentlistener: re-check on every resize; keep listening until we actually
             // fire, then hand the seat over to postFireResizeListener.
             val componentListener = object : java.awt.event.ComponentAdapter() {
@@ -550,15 +709,21 @@ class SummaryPanel(
                 b.component.addComponentListener(postFireResizeListener)
             }
             // Last-resort timeout: if 1500 ms goes by without either componentResized
-            // or SHOWING_CHANGED, we're on a background tab that IntelliJ hasn't
-            // mounted yet. DO NOT fire loadHTML into a 0×0 canvas — that produces a
-            // permanently blank tab because Chromium doesn't automatically re-render
-            // when the surface size later goes non-zero. Instead:
-            //   • If the component now has real bounds, fire cleanly.
-            //   • If it's still 0×0, log a warning, install the post-fire listener
-            //     directly (so a later mount pushes wasResized(w,h) down to CEF), and
-            //     leave `firedInit` false — the first real componentResized will then
-            //     go through the normal fireIfReady path.
+            // or SHOWING_CHANGED, IntelliJ hasn't fully mounted the tab yet. Previously
+            // we refused to loadHTML while 0×0 and hoped a later mount event would run
+            // fireIfReady — but for the FIRST tab of a fresh IDE session on macOS,
+            // those events sometimes never arrive (or arrive minutes later when the
+            // user finally clicks the tab), leaving the tab permanently blank.
+            //
+            // We now ALWAYS fire loadHTML at the deadline. Two cases:
+            //   • w>0 && h>0: Chromium renders to the real canvas immediately — the
+            //     "background tab already sized" path.
+            //   • 0×0: Chromium renders to a 0×0 surface (invisibly) → [postFireResizeListener]
+            //     catches the eventual componentResized and calls wasResized(w,h), which
+            //     tells CEF the surface changed size and triggers a repaint. As a safety
+            //     net for the "SHOWING_CHANGED fires without a matching componentResized"
+            //     path, [postFireHierarchyListener] does the same on hierarchy events.
+            //     Both are installed BEFORE the loadHTML so no resize event can be lost.
             loadFallbackTimer = javax.swing.Timer(1500) {
                 if (disposed) {
                     b.component.removeComponentListener(componentListener)
@@ -569,22 +734,43 @@ class SummaryPanel(
                 val w = b.component.width
                 val h = b.component.height
                 val showing = b.component.isShowing
+                if (!firedInit.compareAndSet(false, true)) return@Timer
                 if (w > 0 && h > 0) {
-                    if (firedInit.compareAndSet(false, true)) {
-                        jmLog.warn(
-                            "loadHTML forcing fire after 1500ms (component=%dx%d, showing=%s)",
-                            w, h, showing,
-                        )
-                        b.loadHTML(html)
-                        b.component.removeComponentListener(componentListener)
-                        b.component.removeHierarchyListener(hierarchyListener)
-                        b.component.addComponentListener(postFireResizeListener)
-                    }
-                } else {
                     jmLog.warn(
-                        "loadHTML timeout after 1500ms but component still 0×0 (showing=%s) — keeping listeners so a later mount fires cleanly",
+                        "loadHTML forcing fire after 1500ms (component=%dx%d, showing=%s)",
+                        w, h, showing,
+                    )
+                } else {
+                    // Fire anyway. The pre-fire listeners get retired because they'd
+                    // race with postFireResizeListener now that firedInit is true; the
+                    // post-fire ones take over full responsibility for pushing size
+                    // changes down to CEF.
+                    jmLog.warn(
+                        "loadHTML forcing fire at 1500ms deadline despite 0×0 (showing=%s) — postFireResizeListener will drive wasResized on the eventual mount",
                         showing,
                     )
+                }
+                b.component.removeComponentListener(componentListener)
+                b.component.removeHierarchyListener(hierarchyListener)
+                b.component.addComponentListener(postFireResizeListener)
+                b.component.addHierarchyListener(postFireHierarchyListener)
+                initialLoadFired = true
+                // doRefreshNow snapshots the CURRENT panel state on the EDT
+                // and builds HTML on a pool thread — no more EDT freeze from
+                // a sync SummaryHtmlBuilder.buildHtml(...) here, and if
+                // setSummary swapped currentSummary between createContent and
+                // this Timer tick, doRefreshNow naturally picks up the latest.
+                doRefreshNow()
+                // If we fired to a surface that isn't showing yet, start a
+                // visibility poll — SHOWING_CHANGED events aren't reliable when
+                // the editor group was empty (last tab just closed) or the tab
+                // opened into a background split, so postFireHierarchyListener
+                // may never observe the transition. The poll drives the paint
+                // recovery once isShowing actually flips, up to a 30s ceiling
+                // after which we give up (nothing more we can do — the tab is
+                // probably permanently hidden by user layout choices).
+                if (!showing || w <= 0 || h <= 0) {
+                    startVisibilityPoll()
                 }
             }.apply { isRepeats = false; start() }
             b.component
@@ -608,8 +794,10 @@ class SummaryPanel(
         // fully alive or fully torn down — never a half-null intermediate state.
         val leaseSnapshot: PooledBrowserLease?
         val timerSnapshot: javax.swing.Timer?
+        val visibilityPollSnapshot: javax.swing.Timer?
         val browserComponentSnapshot: java.awt.Component?
         val postFireSnapshot: java.awt.event.ComponentAdapter?
+        val postFireHierarchySnapshot: java.awt.event.HierarchyListener?
         val preFireCompSnapshot: java.awt.event.ComponentAdapter?
         val preFireHierarchySnapshot: java.awt.event.HierarchyListener?
         synchronized(disposeLock) {
@@ -617,16 +805,20 @@ class SummaryPanel(
             disposed = true
             leaseSnapshot = lease
             timerSnapshot = loadFallbackTimer
+            visibilityPollSnapshot = visibilityPollTimer
             browserComponentSnapshot = browserComponentRef
             postFireSnapshot = postFireResizeListenerRef
+            postFireHierarchySnapshot = postFireHierarchyListenerRef
             preFireCompSnapshot = preFireComponentListenerRef
             preFireHierarchySnapshot = preFireHierarchyListenerRef
             lease = null
             loadFallbackTimer = null
+            visibilityPollTimer = null
             jsQuery = null
             browser = null
             browserComponentRef = null
             postFireResizeListenerRef = null
+            postFireHierarchyListenerRef = null
             preFireComponentListenerRef = null
             preFireHierarchyListenerRef = null
         }
@@ -634,6 +826,9 @@ class SummaryPanel(
         // Stop the fallback loadHTML Timer explicitly. isRepeats=false only guarantees
         // it fires at most once — the closure still pins this panel until then.
         timerSnapshot?.stop()
+        // Same reason for the visibility poll: it's a repeating Timer, so its
+        // closure keeps this panel and the pooled browser reachable until stop().
+        visibilityPollSnapshot?.stop()
         // Detach the Swing/AWT listeners we attached to the pooled browser's component.
         // PooledBrowserLease.release() only unhooks JCEF-layer stuff (JS queries, load /
         // request handlers); the ComponentListener / HierarchyListener sit on the shared
@@ -645,6 +840,7 @@ class SummaryPanel(
         if (comp != null) {
             val detach = Runnable {
                 try { postFireSnapshot?.let { comp.removeComponentListener(it) } } catch (_: Throwable) { /* best-effort */ }
+                try { postFireHierarchySnapshot?.let { comp.removeHierarchyListener(it) } } catch (_: Throwable) { /* best-effort */ }
                 try { preFireCompSnapshot?.let { comp.removeComponentListener(it) } } catch (_: Throwable) { /* best-effort */ }
                 try { preFireHierarchySnapshot?.let { comp.removeHierarchyListener(it) } } catch (_: Throwable) { /* best-effort */ }
             }
@@ -756,27 +952,207 @@ class SummaryPanel(
         // A full reload replaces the DOM, so clear the unsaved-edits flag: future
         // memory-state events may refresh again.
         webviewDirty = false
+        // Whatever queued this reload (a direct refreshHtml, an onLoadEnd
+        // drain, the visibility-poll rescue) is now being served — clear
+        // refreshPending so a later onLoadEnd doesn't fire ANOTHER redundant
+        // doRefreshNow on top of the one about to complete.
+        refreshPending = false
+
+        // ── Snapshot every input on the EDT ────────────────────────────────
+        // buildHtml is pure w.r.t. its arguments, so we can freeze them once
+        // and hand them to a pool thread. The two mutable sets get copied
+        // (`.toSet()`) since production code can still mutate them on the EDT
+        // between here and the pool-side read.
+        val summarySnapshot = currentSummary
+        val transcriptSnapshot = transcriptHashSet.toSet()
+        val planTranslateSnapshot = planTranslateSet.toSet()
+        val bridgeScriptSnapshot = bridgeScript
+        val readOnlySnapshot = readOnly
         val pageBg = editorBackground()
         val isDark = pageBg.isDarkByLuma()
         val pageBgHex = pageBg.toCssHex()
-        val html = SummaryHtmlBuilder.buildHtml(currentSummary, isDark, transcriptHashSet, planTranslateSet, bridgeScript, readOnly, pageBgHex)
-        browser?.loadHTML(html)
+        val myGen = ++renderGeneration
+
+        // ── Build the HTML off the EDT, only bounce back to load it ────────
+        // buildHtml is 100–400 KB of string concatenation (topics, timeline,
+        // e2e, attachments, footer …). Doing that on the EDT freezes the
+        // whole UI for 100–300 ms. CSS/JS are cached (see SummaryCssBuilder /
+        // SummaryScriptBuilder Stage-1.2 changes), so the pool-side work is
+        // dominated by summary-specific rendering.
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val html = try {
+                SummaryHtmlBuilder.buildHtml(
+                    summarySnapshot,
+                    isDark,
+                    transcriptSnapshot,
+                    planTranslateSnapshot,
+                    bridgeScriptSnapshot,
+                    readOnlySnapshot,
+                    pageBgHex,
+                )
+            } catch (e: Exception) {
+                jmLog.warn("doRefreshNow: buildHtml failed: %s", e.message ?: e.toString())
+                return@executeOnPooledThread
+            }
+            javax.swing.SwingUtilities.invokeLater {
+                if (disposed) return@invokeLater
+                // A newer refresh was scheduled while we were building. Drop
+                // ours — the newer one either already ran or is about to.
+                if (myGen != renderGeneration) return@invokeLater
+                // Chromium is about to swap the DOM. Any pending post-load hook
+                // (openShare, deferred hydrate) must wait for the NEW page's
+                // onLoadEnd before firing — otherwise executeJavaScript targets
+                // the outgoing DOM. Concretely: setSummary → refreshHtml lands
+                // here while pageLoaded is still true from the prior page, and
+                // a same-tick openShare would see pageLoaded && fire shareOpen()
+                // against a DOM that loadHTML replaces microseconds later.
+                // Reset here (not in refreshHtml) so a request queued behind
+                // the "not loaded yet" branch of refreshHtml still sees false
+                // after we take over the browser.
+                pageLoaded = false
+                browser?.loadHTML(html)
+            }
+        }
     }
 
     /**
-     * Nudge the underlying JCEF native surface into a full repaint after the first
-     * loadHTML — see the `onLoadEnd` handler for background. Three signals sent in
-     * escalating strength; every one of them is cheap and independently safe:
-     *   1. `CefBrowser.wasResized()` — the same "your viewport may have changed"
-     *      notification a real drag-resize would send. This is what usually forces
-     *      Chromium to reconcile its rendered bitmap with the NSView's visible rect
-     *      on macOS.
-     *   2. `component.revalidate()` — kicks the Swing layout manager so the wrapper
-     *      component's bounds are re-published to any child observers.
-     *   3. `component.repaint()` — asks AWT/Swing to redraw the wrapper; lightweight
-     *      for a heavyweight peer but doesn't hurt.
-     * Guarded by a try/catch because the browser can be torn down while our
-     * invokeLater is queued (project close, tab dispose).
+     * Swap this panel's summary in place — the tab-reuse path from
+     * [MemoryTabOpener]. Preserves the JCEF browser (and its attached native
+     * peer), so the macOS "NSView first-attach half-renders" trauma is NOT
+     * re-triggered — only Chromium's DOM changes.
+     *
+     * Must be called on the EDT.
+     */
+    fun setSummary(newSummary: CommitSummary, newReadOnly: Boolean) {
+        if (disposed) return
+        // ── FAST PATH ─────────────────────────────────────────────────────
+        // Same content → the tab is already showing exactly what the user
+        // wants. Rebuilding + reloading the 100–400 KB HTML through JCEF
+        // (300–800 ms on macOS) accomplishes nothing here. This is the
+        // IntelliJ analogue of VS Code's `existing.panel.reveal()` short-
+        // circuit — CommitSummary is a `data class`, so `==` is a structural
+        // deep-equals across every field (topics, plans, refs, e2e). Any real
+        // change flows through the slow path below.
+        //
+        // Exception: the initial loadHTML has already fired (initialLoadFired)
+        // but Chromium's onLoadEnd never came through (pageLoaded still false).
+        // The tab is showing blank and the user is re-clicking the same memory
+        // to unstick it — normally that's a no-op, but here we force a fresh
+        // doRefreshNow so the user's click actually accomplishes something.
+        if (newSummary == currentSummary && newReadOnly == readOnly) {
+            if (initialLoadFired && !pageLoaded) {
+                jmLog.warn("setSummary same-hash rescue: initialLoadFired=true but pageLoaded=false, forcing doRefreshNow for hash=%s", currentSummary.commitHash.take(8))
+                doRefreshNow()
+            }
+            return
+        }
+        // Bump identity gen BEFORE we start mutating memory-specific state.
+        // Every async task that touches memory-scoped state — loadDeferredSets,
+        // handleCheckPrStatus, all the handle* topic/plan/reference/e2e/recap
+        // edit paths, onMemoryStateChanged, handlePushToJolli, syncPlanTitle,
+        // generateAndStoreE2eTest — snapshots summaryGeneration at dispatch and
+        // bails on mismatch. Any outstanding callback from the OUTGOING memory
+        // now sees the wrong gen and no-ops rather than overwriting the incoming
+        // memory's currentSummary or landing PR / transcript chips on its DOM.
+        ++summaryGeneration
+        // Sets are memory-specific — clear before re-hydrating so we don't leak
+        // the previous memory's transcript / plan-translate UI into the new page.
+        transcriptHashSet.clear()
+        planTranslateSet.clear()
+        currentSummary = newSummary
+        // If the read-only mode flipped, re-run the memory-state listener
+        // decision (registered only when editable) so a read-only tab reused
+        // for an editable memory picks up events, and vice versa.
+        if (newReadOnly != readOnly) {
+            if (newReadOnly) service?.removeMemoryStateListener(memoryStateListener)
+            else service?.addMemoryStateListener(memoryStateListener)
+        }
+        readOnly = newReadOnly
+        // loadHTML replaces the DOM in the SAME browser instance. NSView doesn't
+        // detach/re-attach — that's the whole point of Flavor A.
+        refreshHtml()
+        // Mark the page as no-longer-loaded SYNCHRONOUSLY on the EDT so any code
+        // that lands in the same tick (ActionBarPanel's [requestOpenShare] right
+        // after [MemoryTabOpener.openOrReuse], or [loadDeferredSets]' invokeLater
+        // continuation calling [maybeSendDeferredHydrate]) sees `pageLoaded=false`
+        // and parks its intent in [pendingShareOpen] / [deferredHydratePending]
+        // instead of executing JS against the OUTGOING DOM (which loadHTML is about
+        // to replace microseconds later). The parked intent is drained by the new
+        // page's [onLoadEnd]. Without this, the branch-share overlay silently no-
+        // ops on tab reuse and the transcript / plan-translate chips fail to
+        // hydrate. Must come AFTER refreshHtml() — refreshHtml short-circuits when
+        // pageLoaded is already false and would otherwise park the whole render.
+        pageLoaded = false
+        // Same-reason clear for pending-share intent left over from the OUTGOING
+        // memory: e.g. user requested share on A while A was still loading, then
+        // switched to B via a non-share entry point (CommitsPanel / MemoriesPanel).
+        // Without this, B's onLoadEnd drains the pending flags and fires a share
+        // overlay on B the user never asked for. [shareBranchMode] is the same
+        // "outgoing memory's modal state" leaking into follow-up copy/access/
+        // invite commands on B if the JS bridge sends one before a fresh
+        // 'shareBranch' message updates the flag.
+        pendingShareOpen = false
+        pendingShareBranch = false
+        shareBranchMode = false
+        // Re-run the deferred-set scan for the new memory (transcripts on branch,
+        // plan translate targets). Same code path init uses.
+        loadDeferredSets()
+        // Refresh the PR badge for the new memory's branch.
+        handleCheckPrStatus()
+    }
+
+    /**
+     * Workaround for the macOS "NSView first-attach half-renders" issue: the
+     * JCEF peer sometimes doesn't fill the tab until an external resize hits
+     * AppKit. Detaching the JCEF component from the panel and re-adding on the
+     * next EDT tick sends `[NSView removeFromSuperview]` + `[NSView addSubview:]`
+     * to AppKit, forcing it to reconcile the child view's frame against the
+     * parent's coordinate system. Softer signals (CEF-only wasResized,
+     * setBounds tweaks) were tried and did not wake AppKit. Cost: one-tick
+     * flash as the component briefly detaches (~16 ms).
+     */
+    private fun scheduleSwingSizeShake() {
+        val doShake = Runnable {
+            javax.swing.Timer(100) { evt ->
+                (evt.source as javax.swing.Timer).stop()
+                if (disposed) return@Timer
+                val b = browser ?: return@Timer
+                val c = b.component
+                val panel = this@SummaryPanel
+                if (c.parent !== panel) return@Timer
+                try {
+                    panel.remove(c)
+                    panel.revalidate()
+                    javax.swing.SwingUtilities.invokeLater {
+                        if (disposed) return@invokeLater
+                        val b2 = browser ?: return@invokeLater
+                        val c2 = b2.component
+                        try {
+                            panel.add(c2, java.awt.BorderLayout.CENTER)
+                            panel.revalidate()
+                            panel.repaint()
+                            b2.cefBrowser?.wasResized(c2.width, c2.height)
+                        } catch (e: Throwable) {
+                            jmLog.warn("shakeReAttach re-add failed: %s", e.message ?: "")
+                        }
+                    }
+                } catch (e: Throwable) {
+                    jmLog.warn("shakeReAttach detach failed: %s", e.message ?: "")
+                }
+            }.apply { isRepeats = false; start() }
+        }
+        if (ApplicationManager.getApplication().isDispatchThread) {
+            doShake.run()
+        } else {
+            ApplicationManager.getApplication().invokeLater(doShake)
+        }
+    }
+
+    /**
+     * Fires CEF's `wasResized` after the first init loadHTML — the same signal
+     * a real drag-resize would send. Chromium then reconciles its rendered
+     * bitmap with the NSView's visible rect on macOS. `revalidate`/`repaint`
+     * follow as a belt-and-braces Swing-side kick.
      */
     private fun triggerNativeRepaint() {
         val b = browser ?: return
@@ -785,8 +1161,6 @@ class SummaryPanel(
         val h = c.height
         if (w <= 0 || h <= 0) return
         try {
-            // CefBrowser.wasResized(width, height): same signal a drag-resize sends,
-            // forcing Chromium to reconcile its bitmap with the NSView's visible rect.
             b.cefBrowser?.wasResized(w, h)
         } catch (e: Throwable) {
             jmLog.warn("triggerNativeRepaint: wasResized failed: %s", e.message ?: "")
@@ -799,7 +1173,75 @@ class SummaryPanel(
         }
     }
 
-    private fun refreshTranscriptHashes() {
+    /**
+     * Started by the 1500ms fallback Timer when it fires while the component is
+     * not showing (or is 0×0). Polls `isShowing` + component bounds every 500ms
+     * for up to 30s. As soon as both are valid, it drives the same paint-
+     * recovery path the SHOWING_CHANGED listener would have — `wasResized(w,h)`
+     * to inform CEF of the surface size, plus a forced `doRefreshNow()` to
+     * re-fire loadHTML on the now-real surface (Chromium's initial fire to a
+     * hidden/0×0 surface can silently drop onLoadEnd, leaving `pageLoaded=false`
+     * and every subsequent `setSummary` piling up into a permanent
+     * `refreshPending` latch that nothing drains).
+     *
+     * Guarded by [postFirePaintRecovery] so it can't double-fire alongside the
+     * SHOWING_CHANGED listener; the 30s ceiling stops the timer even if the tab
+     * is permanently hidden by user layout choices.
+     */
+    private fun startVisibilityPoll() {
+        if (visibilityPollTimer != null) return
+        val started = System.currentTimeMillis()
+        val timer = javax.swing.Timer(500) { evt ->
+            val self = evt.source as javax.swing.Timer
+            if (disposed) { self.stop(); visibilityPollTimer = null; return@Timer }
+            // If SHOWING_CHANGED / componentResized already drove the recovery,
+            // stop polling — the paint has been kicked, there's nothing left to do.
+            if (postFirePaintRecovery.get()) { self.stop(); visibilityPollTimer = null; return@Timer }
+            if (System.currentTimeMillis() - started > 30_000) {
+                jmLog.warn("visibilityPoll: giving up after 30s (isShowing=%s, w=%d, h=%d, pageLoaded=%s)",
+                    browser?.component?.isShowing ?: false,
+                    browser?.component?.width ?: 0,
+                    browser?.component?.height ?: 0,
+                    pageLoaded)
+                self.stop(); visibilityPollTimer = null
+                return@Timer
+            }
+            val b = browser ?: run { self.stop(); visibilityPollTimer = null; return@Timer }
+            val c = b.component
+            if (!c.isShowing) return@Timer
+            val w = c.width
+            val h = c.height
+            if (w <= 0 || h <= 0) return@Timer
+            // Fire once: same-shape recovery as postFireHierarchyListener.
+            if (!postFirePaintRecovery.compareAndSet(false, true)) {
+                self.stop(); visibilityPollTimer = null; return@Timer
+            }
+            self.stop()
+            visibilityPollTimer = null
+            try { b.cefBrowser?.wasResized(w, h) } catch (_: Throwable) { /* best-effort */ }
+            jmLog.warn(
+                "visibilityPoll paint recovery: isShowing=true at %dms after Timer fire, forcing doRefreshNow for hash=%s",
+                System.currentTimeMillis() - started,
+                currentSummary.commitHash.take(8),
+            )
+            doRefreshNow()
+        }
+        timer.isRepeats = true
+        visibilityPollTimer = timer
+        timer.start()
+    }
+
+    /**
+     * Refreshes [transcriptHashSet] from the orphan branch. When called from
+     * [loadDeferredSets] the caller passes its snapshotted [guardedGen]; every
+     * mutation checks against the current [summaryGeneration] and bails when a
+     * newer [setSummary] has fired, so the outgoing memory's transcripts can't
+     * overwrite the incoming memory's freshly-cleared set. Save/delete callers
+     * pass null (no guard) — they operate on the same memory the user is
+     * actively editing, so there is no identity race.
+     */
+    private fun refreshTranscriptHashes(guardedGen: Long? = null) {
+        if (guardedGen != null && guardedGen != summaryGeneration) return
         transcriptHashSet.clear()
         try {
             // CLI-owned getTranscriptIds: v5 `summary.transcripts` UUIDs (with a
@@ -807,6 +1249,7 @@ class SummaryPanel(
             // actually on the orphan branch — mirroring the VS Code panel.
             val allIds = SummaryTree.getTranscriptIds(currentSummary)
             val onBranch = store.getTranscriptHashes()
+            if (guardedGen != null && guardedGen != summaryGeneration) return
             transcriptHashSet.addAll(allIds.toSet().intersect(onBranch))
             LOG.info("refreshTranscriptHashes: tree=${allIds.size}, onBranch=${onBranch.size}, matched=${transcriptHashSet.size}")
         } catch (e: Exception) {
@@ -814,21 +1257,83 @@ class SummaryPanel(
         }
     }
 
-    private fun refreshPlanTranslateSet() {
+    /**
+     * Refreshes [planTranslateSet] via a bounded fan-out of ide-bridge plan-body
+     * reads. [guardedGen] mirrors [refreshTranscriptHashes] — when non-null, every
+     * mutation checks the current [summaryGeneration] so a stale scan can't leak
+     * the outgoing memory's plans onto the incoming memory's set.
+     */
+    private fun refreshPlanTranslateSet(guardedGen: Long? = null) {
+        if (guardedGen != null && guardedGen != summaryGeneration) return
         planTranslateSet.clear()
-        // PERF: each readPlanFromBranch below is one ide-bridge call — the per-plan loop makes
-        // this O(plans) calls, which is why it runs via loadDeferredSets() off the EDT.
+        // Each readPlanFromBranch is one ide-bridge call (5-20 ms hot, 500+ ms
+        // cold). Fanning out the body reads across a bounded pool turns the
+        // wall-clock from O(plans × RTT) into O(RTT × ceil(plans/8)) — a plan-
+        // heavy memory used to spend most of its "opening…" time here.
         val cjkPattern = Regex("[\\u4E00-\\u9FFF\\u3400-\\u4DBF\\uF900-\\uFAFF]")
         val plans = SummaryUtils.collectAllPlans(currentSummary)
+        if (plans.isEmpty()) return
+
+        // Fast pre-filter: any plan whose title already contains CJK never
+        // needs a body read to be added to the translate set.
+        val quickHits = mutableListOf<String>()
+        val bodyLookups = mutableListOf<ai.jolli.jollimemory.core.PlanReference>()
         for (plan in plans) {
-            if (cjkPattern.containsMatchIn(plan.title)) {
-                planTranslateSet.add(plan.slug)
-                continue
-            }
+            if (cjkPattern.containsMatchIn(plan.title)) quickHits.add(plan.slug)
+            else bodyLookups.add(plan)
+        }
+        if (guardedGen != null && guardedGen != summaryGeneration) return
+        planTranslateSet.addAll(quickHits)
+
+        if (bodyLookups.isEmpty()) return
+
+        // Fan out each ide-bridge readPlanFromBranch onto IntelliJ's shared
+        // pooled-thread executor. Previously this method built a throwaway
+        // `Executors.newFixedThreadPool(8)` per invocation — 1 thread-pool
+        // create + shutdown per panel init AND per setSummary, which the
+        // reuse path can hit several times per second when the user clicks
+        // through the memory list. Application's pooled thread reuses long-
+        // lived workers and is the same executor CLI-integration helpers
+        // already use, so we're not competing for a distinct resource here.
+        //
+        // Concurrency bound: the IDE pool is shared with unrelated background
+        // work (git status ticks, VFS refreshes, other tool windows). A memory
+        // that references 50+ plans would submit 50 blocking ide-bridge calls
+        // at once and starve those consumers.
+        //
+        // The gate is acquired on the CALLER thread (already a pool worker
+        // — [loadDeferredSets] submitted us) before we submit each sub-task.
+        // Only PLAN_READ_CONCURRENCY sub-tasks ever occupy pool threads at
+        // once. Doing gate.acquire() inside the sub-task instead — the shape
+        // this code used to have — parked the other N-8 tasks ON pool threads
+        // waiting for permits, which is the pool-starvation regression the
+        // comment above warns against. Individual futures still carry a 30 s
+        // ceiling so a stuck ide-bridge request can't wedge this method.
+        // tryAcquire (not acquire) so a stuck ide-bridge call holding a permit
+        // for the full 30 s future-timeout can't block THIS caller thread for
+        // 30 s × ⌈N/8⌉ — on timeout we skip the remaining plans rather than
+        // queueing up behind a wedged permit.
+        val gate = java.util.concurrent.Semaphore(PLAN_READ_CONCURRENCY)
+        val futures = mutableListOf<java.util.concurrent.Future<String?>>()
+        for (plan in bodyLookups) {
+            if (!gate.tryAcquire(30, java.util.concurrent.TimeUnit.SECONDS)) break
+            futures.add(ApplicationManager.getApplication().executeOnPooledThread<String?> {
+                try {
+                    val content = store.readPlanFromBranch(plan.slug) ?: return@executeOnPooledThread null
+                    if (cjkPattern.containsMatchIn(content)) plan.slug else null
+                } catch (_: Exception) {
+                    null
+                } finally {
+                    gate.release()
+                }
+            })
+        }
+        for (f in futures) {
             try {
-                val content = store.readPlanFromBranch(plan.slug) ?: continue
-                if (cjkPattern.containsMatchIn(content)) planTranslateSet.add(plan.slug)
-            } catch (_: Exception) { /* skip */ }
+                val slug = f.get(30, java.util.concurrent.TimeUnit.SECONDS)
+                if (guardedGen != null && guardedGen != summaryGeneration) return
+                if (slug != null) planTranslateSet.add(slug)
+            } catch (_: Exception) { /* individual read failure — skip */ }
         }
     }
 
@@ -859,6 +1364,9 @@ class SummaryPanel(
                         "memory_ref_id_copied",
                         mapOf("surface_area" to "detail"),
                     )
+                // Chromium's compositor produced its first frame — trigger the
+                // AWT-level NSView shake so AppKit reconciles the visible rect.
+                "firstFramePainted" -> scheduleSwingSizeShake()
                 "copyMarkdown" -> handleCopyMarkdown()
                 "downloadMarkdown" -> handleDownloadMarkdown()
                 "pushToJolli" -> handlePushToJolli()
@@ -1048,6 +1556,10 @@ class SummaryPanel(
         ai.jolli.jollimemory.toolwindow.views.ShareWebview.stateToMap(state)
     private fun handlePushToJolli(retried: Boolean = false) {
         val summary = currentSummary
+        // Push is a multi-second network chain; capture the identity so a mid-push
+        // memory switch can't overwrite the incoming memory's currentSummary with
+        // the outgoing one's updatedSummary.
+        val myGen = summaryGeneration
         val config = SessionTracker.loadConfig(cwd)
         if (config.jolliApiKey.isNullOrBlank()) {
             ApplicationManager.getApplication().invokeLater {
@@ -1069,6 +1581,7 @@ class SummaryPanel(
         postToWebview("pushStarted")
 
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             // One trace per push operation (on this pooled thread) so the push
             // logs, the binding-required retry, and every pushToJolli/listSpaces
             // call share one id; ThreadLocal must be set on the worker thread.
@@ -1078,9 +1591,11 @@ class SummaryPanel(
                     // reuse the exact same logic; the binding/re-auth/UI handling below
                     // stays panel-side.
                     val res = JolliShareService.shareSummary(store, summary, cwd, config.jolliApiKey!!, resolvedBaseUrl)
+                    if (myGen != summaryGeneration) return@withTrace
                     currentSummary = res.updatedSummary
 
                     ApplicationManager.getApplication().invokeLater {
+                        if (myGen != summaryGeneration) return@invokeLater
                         refreshHtml()
                         val verb = if (summary.jolliDocUrl != null) "Updated" else "Pushed"
                         val planMsg = if (res.planCount > 0) " (with ${res.planCount} plan${if (res.planCount > 1) "s" else ""})" else ""
@@ -1217,6 +1732,7 @@ class SummaryPanel(
             filesAffected = updatesJson.getAsJsonArray("filesAffected")?.map { it.asString },
         )
 
+        val myGen = summaryGeneration
         val result = SummaryTree.updateTopicInTree(currentSummary, topicIndex, updates)
         if (result == null) {
             postToWebview("topicUpdateError", mapOf("message" to "Memory index $topicIndex is out of range"))
@@ -1224,7 +1740,15 @@ class SummaryPanel(
         }
 
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             store.storeSummary(result.result, force = true)
+            // Drop the service-wide summary LRU so a subsequent cross-surface
+            // reopen (CommitsPanel/MemoriesPanel/PinnedPanel/ActionBarPanel/
+            // ViewSummaryAction/CreatePrData.build) reads the fresh topic
+            // list instead of the pre-edit snapshot. Local panel state stays
+            // via the patch ack below — this only unpoisons the service cache.
+            service?.invalidateSummaryCache()
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             currentSummary = result.result
 
             val (allTopics) = SummaryUtils.collectSortedTopics(result.result)
@@ -1233,6 +1757,7 @@ class SummaryPanel(
             val html = if (topic != null) SummaryHtmlBuilder.renderTopic(topic, displayIndex) else ""
 
             ApplicationManager.getApplication().invokeLater {
+                if (myGen != summaryGeneration) return@invokeLater
                 postToWebview("topicUpdated", mapOf("topicIndex" to topicIndex, "html" to html))
             }
         }
@@ -1244,17 +1769,27 @@ class SummaryPanel(
             val choice = Messages.showYesNoDialog(project, detail, "Delete Memory?", "Delete", "Cancel", Messages.getWarningIcon())
             if (choice != Messages.YES) return@invokeLater
 
+            // Snapshot gen inside the confirm-continuation so a memory switch that
+            // happens BEFORE the user hits Delete bumps the gen appropriately.
+            val myGen = summaryGeneration
             ApplicationManager.getApplication().executeOnPooledThread {
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 val result = SummaryTree.deleteTopicInTree(currentSummary, topicIndex)
                 if (result == null) {
                     ApplicationManager.getApplication().invokeLater {
+                        if (myGen != summaryGeneration) return@invokeLater
                         postToWebview("topicDeleteError", mapOf("message" to "Memory index $topicIndex is out of range"))
                     }
                     return@executeOnPooledThread
                 }
                 store.storeSummary(result.result, force = true)
+                // See handleUpdateTopic: unpoison the service LRU so
+                // reopens elsewhere reflect the deletion.
+                service?.invalidateSummaryCache()
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 currentSummary = result.result
                 ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
                     refreshHtml()
                     postToWebview("topicDeleted", mapOf("topicIndex" to topicIndex))
                 }
@@ -1264,13 +1799,20 @@ class SummaryPanel(
 
     private fun handleGenerateE2eTest() {
         postToWebview("e2eTestGenerating")
+        val myGen = summaryGeneration
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             try {
-                generateAndStoreE2eTest()
+                generateAndStoreE2eTest(myGen)
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 val html = SummaryHtmlBuilder.buildE2eTestSection(currentSummary)
-                ApplicationManager.getApplication().invokeLater { postToWebview("e2eTestUpdated", mapOf("html" to html)) }
+                ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
+                    postToWebview("e2eTestUpdated", mapOf("html" to html))
+                }
             } catch (e: Exception) {
                 ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
                     postToWebview("e2eTestError", mapOf("message" to (e.message ?: "Generation failed")))
                     Messages.showErrorDialog(project, "E2E test generation failed: ${e.message}", "Error")
                 }
@@ -1287,7 +1829,15 @@ class SummaryPanel(
      * provider routing, prompt assembly, and HTTP live in the CLI — the plugin
      * only serializes the topic list, commit message, and diff.
      */
-    private fun generateAndStoreE2eTest(): List<E2eTestScenario> {
+    /**
+     * Runs `jolli generate e2e-test` and persists the result. Callers on a pool
+     * thread pass their captured [guardedGen] so the `currentSummary` write at
+     * the end doesn't clobber a memory the user has since switched to (see the
+     * comment on [summaryGeneration]). A null [guardedGen] disables the guard
+     * for callers that don't need identity protection (there are none today —
+     * every caller runs off setSummary-reachable dispatches).
+     */
+    private fun generateAndStoreE2eTest(guardedGen: Long? = null): List<E2eTestScenario> {
         val summary = currentSummary
         val (topics) = SummaryUtils.collectSortedTopics(summary)
         val diff = getDiffForCommit(summary.commitHash)
@@ -1306,7 +1856,17 @@ class SummaryPanel(
 
         val updatedSummary = summary.copy(e2eTestGuide = scenarios)
         store.storeSummary(updatedSummary, force = true)
-        currentSummary = updatedSummary
+        // Both callers (handleGenerateE2eTest, handleCreatePrWithE2e) rely on
+        // the service LRU being fresh for downstream reads — Create PR builds
+        // its E2E section from service.getSummary. Invalidate here rather
+        // than in each caller so any future caller inherits the guarantee.
+        service?.invalidateSummaryCache()
+        // The write to currentSummary is the point of no return — every guarded
+        // caller must skip it on gen mismatch. The store.storeSummary above is
+        // idempotent so an over-write from a stale gen isn't destructive.
+        if (guardedGen == null || guardedGen == summaryGeneration) {
+            currentSummary = updatedSummary
+        }
         return scenarios
     }
 
@@ -1348,13 +1908,20 @@ class SummaryPanel(
     }
 
     private fun handleEditE2eTest(scenariosJson: JsonArray) {
+        val myGen = summaryGeneration
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             val scenarios = parseE2eScenariosFromJson(scenariosJson)
             val updatedSummary = currentSummary.copy(e2eTestGuide = scenarios)
             store.storeSummary(updatedSummary, force = true)
+            service?.invalidateSummaryCache()
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             currentSummary = updatedSummary
             val html = SummaryHtmlBuilder.buildE2eTestSection(updatedSummary)
-            ApplicationManager.getApplication().invokeLater { postToWebview("e2eTestUpdated", mapOf("html" to html)) }
+            ApplicationManager.getApplication().invokeLater {
+                if (myGen != summaryGeneration) return@invokeLater
+                postToWebview("e2eTestUpdated", mapOf("html" to html))
+            }
         }
     }
 
@@ -1362,19 +1929,29 @@ class SummaryPanel(
         ApplicationManager.getApplication().invokeLater {
             val choice = Messages.showYesNoDialog(project, "This will remove all test scenarios. This cannot be undone.", "Delete E2E Test Guide?", "Delete", "Cancel", Messages.getWarningIcon())
             if (choice != Messages.YES) return@invokeLater
+            val myGen = summaryGeneration
             ApplicationManager.getApplication().executeOnPooledThread {
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 val updatedSummary = currentSummary.copy(e2eTestGuide = null)
                 store.storeSummary(updatedSummary, force = true)
+                service?.invalidateSummaryCache()
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 currentSummary = updatedSummary
                 val html = SummaryHtmlBuilder.buildE2eTestSection(updatedSummary)
-                ApplicationManager.getApplication().invokeLater { postToWebview("e2eTestUpdated", mapOf("html" to html)) }
+                ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
+                    postToWebview("e2eTestUpdated", mapOf("html" to html))
+                }
             }
         }
     }
 
     private fun handleGenerateRecap() {
         postToWebview("recapGenerating")
+        // LLM call — the widest identity-race window in the file (seconds).
+        val myGen = summaryGeneration
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             try {
                 val summary = currentSummary
                 val (topics) = SummaryUtils.collectSortedTopics(summary)
@@ -1389,6 +1966,7 @@ class SummaryPanel(
                 val trimmed = recap.trim()
                 if (trimmed.isEmpty()) {
                     ApplicationManager.getApplication().invokeLater {
+                        if (myGen != summaryGeneration) return@invokeLater
                         postToWebview("recapUpdateError")
                         Messages.showInfoMessage(project, "No major topics in this commit, so there's nothing to recap.", "Recap")
                     }
@@ -1397,11 +1975,17 @@ class SummaryPanel(
 
                 val updatedSummary = summary.copy(recap = trimmed)
                 store.storeSummary(updatedSummary, force = true)
+                service?.invalidateSummaryCache()
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 currentSummary = updatedSummary
                 val html = SummaryHtmlBuilder.buildRecapSection(updatedSummary)
-                ApplicationManager.getApplication().invokeLater { postToWebview("recapUpdated", mapOf("html" to html)) }
+                ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
+                    postToWebview("recapUpdated", mapOf("html" to html))
+                }
             } catch (e: Exception) {
                 ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
                     postToWebview("recapUpdateError", mapOf("message" to (e.message ?: "Generation failed")))
                     Messages.showErrorDialog(project, "Recap generation failed: ${e.message}", "Error")
                 }
@@ -1410,15 +1994,23 @@ class SummaryPanel(
     }
 
     private fun handleEditRecap(recap: String) {
+        val myGen = summaryGeneration
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             try {
                 val updatedSummary = currentSummary.copy(recap = recap.ifEmpty { null })
                 store.storeSummary(updatedSummary, force = true)
+                service?.invalidateSummaryCache()
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 currentSummary = updatedSummary
                 val html = SummaryHtmlBuilder.buildRecapSection(updatedSummary)
-                ApplicationManager.getApplication().invokeLater { postToWebview("recapUpdated", mapOf("html" to html)) }
+                ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
+                    postToWebview("recapUpdated", mapOf("html" to html))
+                }
             } catch (e: Exception) {
                 ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
                     postToWebview("recapUpdateError", mapOf("message" to (e.message ?: "Save failed")))
                     Messages.showErrorDialog(project, "Recap save failed: ${e.message}", "Error")
                 }
@@ -1437,10 +2029,17 @@ class SummaryPanel(
     }
 
     private fun handleSavePlan(slug: String, content: String) {
+        val myGen = summaryGeneration
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             store.writePlanToBranch(slug, content, "Edit plan $slug")
-            syncPlanTitle(slug, content)
-            ApplicationManager.getApplication().invokeLater { postToWebview("planSaved", mapOf("slug" to slug)) }
+            // syncPlanTitle writes currentSummary too — thread the gen through so it
+            // no-ops when the user has switched memories.
+            syncPlanTitle(slug, content, myGen)
+            ApplicationManager.getApplication().invokeLater {
+                if (myGen != summaryGeneration) return@invokeLater
+                postToWebview("planSaved", mapOf("slug" to slug))
+            }
         }
     }
 
@@ -1448,13 +2047,20 @@ class SummaryPanel(
         ApplicationManager.getApplication().invokeLater {
             val choice = Messages.showYesNoDialog(project, "The plan will no longer be associated with this commit.", "Remove plan \"$title\"?", "Remove", "Cancel", Messages.getWarningIcon())
             if (choice != Messages.YES) return@invokeLater
+            val myGen = summaryGeneration
             ApplicationManager.getApplication().executeOnPooledThread {
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 val updatedPlans = (currentSummary.plans ?: emptyList()).filter { it.slug != slug }
                 val updatedSummary = currentSummary.copy(plans = updatedPlans.takeIf { it.isNotEmpty() })
                 store.storeSummary(updatedSummary, force = true)
+                service?.invalidateSummaryCache()
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 currentSummary = updatedSummary
                 PlanService.unassociatePlanFromCommit(slug, cwd)
-                ApplicationManager.getApplication().invokeLater { refreshHtml() }
+                ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
+                    refreshHtml()
+                }
             }
         }
     }
@@ -1535,45 +2141,64 @@ class SummaryPanel(
             val displayName = if (nativeId.isNotBlank()) "$nativeId — $title" else title
             val choice = Messages.showYesNoDialog(project, "The reference will no longer be associated with this commit.", "Remove reference \"$displayName\"?", "Remove", "Cancel", Messages.getWarningIcon())
             if (choice != Messages.YES) return@invokeLater
+            val myGen = summaryGeneration
             ApplicationManager.getApplication().executeOnPooledThread {
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 val updatedRefs = (currentSummary.references ?: emptyList()).filter { it.archivedKey != archivedKey }
                 val updatedSummary = currentSummary.copy(references = updatedRefs.takeIf { it.isNotEmpty() })
                 store.storeSummary(updatedSummary, force = true)
+                service?.invalidateSummaryCache()
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 currentSummary = updatedSummary
-                ApplicationManager.getApplication().invokeLater { refreshHtml() }
+                ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
+                    refreshHtml()
+                }
             }
         }
     }
 
     private fun handleTranslatePlan(slug: String) {
+        val myGen = summaryGeneration
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             try {
                 val content = store.readPlanFromBranch(slug)
                 if (content == null) {
                     ApplicationManager.getApplication().invokeLater {
+                        if (myGen != summaryGeneration) return@invokeLater
                         postToWebview("planTranslateError", mapOf("slug" to slug, "message" to "Plan not found"))
                     }
                     return@executeOnPooledThread
                 }
                 val cjkPattern = Regex("[\\u4E00-\\u9FFF\\u3400-\\u4DBF\\uF900-\\uFAFF]")
                 if (!cjkPattern.containsMatchIn(content) && !(currentSummary.plans?.find { it.slug == slug }?.let { cjkPattern.containsMatchIn(it.title) } ?: false)) {
-                    ApplicationManager.getApplication().invokeLater { Messages.showInfoMessage(project, "Plan is already in English.", "Translation") }
+                    ApplicationManager.getApplication().invokeLater {
+                        if (myGen != summaryGeneration) return@invokeLater
+                        Messages.showInfoMessage(project, "Plan is already in English.", "Translation")
+                    }
                     return@executeOnPooledThread
                 }
-                ApplicationManager.getApplication().invokeLater { postToWebview("planTranslating", mapOf("slug" to slug)) }
+                ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
+                    postToWebview("planTranslating", mapOf("slug" to slug))
+                }
                 val request = Gson().toJson(mapOf("content" to content))
                 val response = CliIntegrations.generate(cwd, "translate", request)
                 val translated = response.get("text")?.asString
                     ?: throw RuntimeException("Empty response from the CLI")
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 store.writePlanToBranch(slug, translated, "Translate plan $slug to English")
-                syncPlanTitle(slug, translated)
+                syncPlanTitle(slug, translated, myGen)
                 planTranslateSet.remove(slug)
                 ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
                     refreshHtml()
                     postToWebview("planTranslated", mapOf("slug" to slug))
                 }
             } catch (e: Exception) {
                 ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
                     postToWebview("planTranslateError", mapOf("slug" to slug, "message" to (e.message ?: "Unknown error")))
                     Messages.showErrorDialog(project, "Translation failed: ${e.message}", "Translation Error")
                 }
@@ -1598,18 +2223,30 @@ class SummaryPanel(
                     val index = items.indexOf(selectedItem)
                     if (index < 0) return@setItemChosenCallback
                     val selected = available[index]
+                    // Snapshot AFTER the user picks — the popup itself may sit open
+                    // long enough for the identity to shift, and the write must
+                    // reflect the memory the picker was launched from (captured
+                    // in `summary` above).
+                    val myGen = summaryGeneration
                     ApplicationManager.getApplication().executeOnPooledThread {
+                        if (myGen != summaryGeneration) return@executeOnPooledThread
                         val planRef = PlanService.archivePlanForCommit(selected.slug, summary.commitHash, store, cwd)
                         if (planRef == null) {
                             ApplicationManager.getApplication().invokeLater {
+                                if (myGen != summaryGeneration) return@invokeLater
                                 Messages.showErrorDialog(project, "Failed to associate plan \"${selected.slug}\".", "Association Failed")
                             }
                             return@executeOnPooledThread
                         }
                         val updatedSummary = summary.copy(plans = (summary.plans ?: emptyList()) + planRef)
                         store.storeSummary(updatedSummary, force = true)
+                        service?.invalidateSummaryCache()
+                        if (myGen != summaryGeneration) return@executeOnPooledThread
                         currentSummary = updatedSummary
-                        ApplicationManager.getApplication().invokeLater { refreshHtml() }
+                        ApplicationManager.getApplication().invokeLater {
+                            if (myGen != summaryGeneration) return@invokeLater
+                            refreshHtml()
+                        }
                     }
                 }
                 .createPopup()
@@ -1618,42 +2255,63 @@ class SummaryPanel(
     }
 
     private fun handleCheckPrStatus() {
+        // Snapshot the memory identity for the whole gh chain. A cold `gh pr
+        // list` takes 1-3 s; if the user clicks a different memory in that
+        // window (tab-reuse setSummary), a naïve postToWebview("prStatus",
+        // {status:"ready", pr:{...}}) would land on the new memory's DOM. The
+        // "ready" payload doesn't include the branch, so the webview cannot
+        // filter after the fact — guard here or the wrong PR badge sticks.
+        val myGen = summaryGeneration
         val targetBranch = currentSummary.branch
         jmLog.info("handleCheckPrStatus: start (cwd='%s', branch='%s')", cwd, targetBranch)
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                val ghAvailable = PrService.isGhAvailable(cwd)
+                if (myGen != summaryGeneration) return@executeOnPooledThread
+                // All three underlying gh calls are TTL-cached on the project
+                // service so opening or switching memory tabs on the same
+                // branch does not re-fork gh. See PrStatusCache for TTLs.
+                val prCache = ai.jolli.jollimemory.services.PrStatusCache.getInstance(project)
+
+                val ghAvailable = prCache.isGhAvailable(cwd)
                 jmLog.info("handleCheckPrStatus: isGhAvailable=%s", ghAvailable)
                 if (!ghAvailable) {
                     jmLog.warn("handleCheckPrStatus: status=unavailable (gh --version failed — not installed or not on resolved PATH)")
                     ApplicationManager.getApplication().invokeLater {
+                        if (myGen != summaryGeneration) return@invokeLater
                         postToWebview("prStatus", mapOf("status" to "unavailable"))
                     }
                     return@executeOnPooledThread
                 }
-                val ghAuth = PrService.isGhAuthenticated(cwd)
+                val ghAuth = prCache.isGhAuthenticated(cwd)
                 jmLog.info("handleCheckPrStatus: isGhAuthenticated=%s", ghAuth)
                 if (!ghAuth) {
                     jmLog.warn("handleCheckPrStatus: status=unavailable (gh auth status failed — not logged in)")
                     ApplicationManager.getApplication().invokeLater {
+                        if (myGen != summaryGeneration) return@invokeLater
                         postToWebview("prStatus", mapOf("status" to "unavailable"))
                     }
                     return@executeOnPooledThread
                 }
 
-                val lookup = PrService.findPrForBranch(cwd, targetBranch)
+                // getLookup returns null only when the underlying PrService call
+                // threw; a real cache miss is transparently repopulated inside
+                // getLookup, so the label here reflects the actual failure mode.
+                val lookup = prCache.getLookup(cwd, targetBranch)
+                    ?: PrService.PrLookup.LookupError("gh lookup failed")
                 jmLog.info("handleCheckPrStatus: lookup=%s", lookup::class.simpleName)
 
                 when (lookup) {
                     is PrService.PrLookup.LookupError -> {
                         jmLog.warn("handleCheckPrStatus: status=unavailable (lookupError: %s)", lookup.reason)
                         ApplicationManager.getApplication().invokeLater {
+                            if (myGen != summaryGeneration) return@invokeLater
                             postToWebview("prStatus", mapOf("status" to "unavailable", "reason" to lookup.reason))
                         }
                     }
                     is PrService.PrLookup.NoPr -> {
                         jmLog.info("handleCheckPrStatus: status=noPr (branch='%s', history=%d)", targetBranch, lookup.history.size)
                         ApplicationManager.getApplication().invokeLater {
+                            if (myGen != summaryGeneration) return@invokeLater
                             postToWebview("prStatus", mapOf(
                                 "status" to "noPr",
                                 "branch" to targetBranch,
@@ -1664,6 +2322,7 @@ class SummaryPanel(
                     is PrService.PrLookup.Found -> {
                         jmLog.info("handleCheckPrStatus: status=ready (pr #%d, history=%d)", lookup.pr.number, lookup.history.size)
                         ApplicationManager.getApplication().invokeLater {
+                            if (myGen != summaryGeneration) return@invokeLater
                             postToWebview("prStatus", mapOf(
                                 "status" to "ready",
                                 "pr" to mapOf("number" to lookup.pr.number, "url" to lookup.pr.url, "title" to lookup.pr.title),
@@ -1676,6 +2335,7 @@ class SummaryPanel(
                 jmLog.error("handleCheckPrStatus: status=unavailable (exception: %s)", e.message ?: e.toString())
                 LOG.warn("Check PR status failed: ${e.message}")
                 ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
                     postToWebview("prStatus", mapOf("status" to "unavailable"))
                 }
             }
@@ -1690,19 +2350,24 @@ class SummaryPanel(
     private fun handleCreatePrWithE2e() {
         jmLog.info("handleCreatePrWithE2e: starting E2E generation")
         postToWebview("prGeneratingE2e")
+        val myGen = summaryGeneration
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (myGen != summaryGeneration) return@executeOnPooledThread
             try {
                 jmLog.info("handleCreatePrWithE2e: generateAndStoreE2eTest() start")
-                val scenarios = generateAndStoreE2eTest()
+                val scenarios = generateAndStoreE2eTest(myGen)
                 jmLog.info("handleCreatePrWithE2e: generateAndStoreE2eTest() done — %d scenario(s)", scenarios.size)
+                if (myGen != summaryGeneration) return@executeOnPooledThread
                 val e2eHtml = SummaryHtmlBuilder.buildE2eTestSection(currentSummary)
                 ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
                     postToWebview("e2eTestUpdated", mapOf("html" to e2eHtml))
                     showCreatePrForm()
                 }
             } catch (e: Exception) {
                 jmLog.error("handleCreatePrWithE2e: E2E generation failed: %s", e.message ?: e.toString())
                 ApplicationManager.getApplication().invokeLater {
+                    if (myGen != summaryGeneration) return@invokeLater
                     postToWebview("e2eTestError", mapOf("message" to (e.message ?: "Generation failed")))
                     Messages.showErrorDialog(project, "E2E test generation failed: ${e.message}", "Error")
                     handleCheckPrStatus()
@@ -1782,6 +2447,16 @@ class SummaryPanel(
                 }
                 ApplicationManager.getApplication().invokeLater {
                     postToWebview("prCreated", mapOf("url" to prUrl))
+                    // Drop the 60s TTL cache entry for this branch BEFORE
+                    // handleCheckPrStatus reads it — a `NoPr` cached moments
+                    // ago (when the tab opened) would otherwise be served
+                    // back and the badge would show "no PR" for up to 60s
+                    // even though we just created one. See PrStatusCache
+                    // header ("invalidateBranch should be called after any
+                    // surface creates or updates a PR").
+                    ai.jolli.jollimemory.services.PrStatusCache
+                        .getInstance(project)
+                        .invalidateBranch(cwd, currentSummary.branch)
                     handleCheckPrStatus()
                     // A PR now exists for the branch — sync the Create PR view + Commits list.
                     service?.notifyMemoryStateChanged()
@@ -1828,6 +2503,13 @@ class SummaryPanel(
                 PrService.updatePr(pr.number, title, body, cwd)
                 ApplicationManager.getApplication().invokeLater {
                     postToWebview("prUpdated", mapOf("url" to pr.url))
+                    // Same reasoning as handleCreatePr: the branch may have a
+                    // 60s-cached lookup from when the tab opened; drop it so
+                    // handleCheckPrStatus reflects the just-updated PR title
+                    // instead of the pre-update snapshot.
+                    ai.jolli.jollimemory.services.PrStatusCache
+                        .getInstance(project)
+                        .invalidateBranch(cwd, currentSummary.branch)
                     handleCheckPrStatus()
                     service?.notifyMemoryStateChanged()
                 }
@@ -1970,14 +2652,28 @@ class SummaryPanel(
 
     // ── Internal helpers ────────────────────────────────────────────────────
 
-    private fun syncPlanTitle(slug: String, content: String) {
+    /**
+     * Re-derives the plan's title from its H1 and mirrors it into [currentSummary]
+     * + the on-disk plans registry. Called from pool contexts (handleSavePlan,
+     * handleTranslatePlan) — the [guardedGen] param mirrors the pattern used by
+     * [refreshTranscriptHashes] and short-circuits the currentSummary write when
+     * the user has switched memories. The store.storeSummary write above the
+     * currentSummary assignment is idempotent, so writing to the (now-outgoing)
+     * hash's summary on disk is fine — only the in-memory identity is protected.
+     */
+    private fun syncPlanTitle(slug: String, content: String, guardedGen: Long? = null) {
         val titleMatch = Regex("^#\\s+(.+)", RegexOption.MULTILINE).find(content)
         val newTitle = titleMatch?.groupValues?.get(1)?.trim() ?: return
         val plans = currentSummary.plans ?: return
         val updatedPlans = plans.map { p -> if (p.slug == slug) p.copy(title = newTitle) else p }
         val updatedSummary = currentSummary.copy(plans = updatedPlans)
         store.storeSummary(updatedSummary, force = true)
-        currentSummary = updatedSummary
+        // Both callers (handleSavePlan, handleTranslatePlan) rely on the
+        // service LRU being fresh for cross-surface reads of the plan title.
+        service?.invalidateSummaryCache()
+        if (guardedGen == null || guardedGen == summaryGeneration) {
+            currentSummary = updatedSummary
+        }
         val registry = SessionTracker.loadPlansRegistry(cwd)
         val entry = registry.plans[slug]
         if (entry != null) {
@@ -2006,5 +2702,13 @@ class SummaryPanel(
 
         /** Writes to <projectDir>/.jolli/jollimemory/debug.log (same sink as PrService). */
         private val jmLog = ai.jolli.jollimemory.core.JmLogger.create("SummaryPanel")
+
+        /**
+         * Cap on concurrent ide-bridge readPlanFromBranch calls fanned out from
+         * [refreshPlanTranslateSet]. Matches the previous fixed-thread-pool sizing
+         * so a plan-heavy memory doesn't monopolize IntelliJ's shared pooled-thread
+         * executor and starve git status / VFS refresh work.
+         */
+        private const val PLAN_READ_CONCURRENCY = 8
     }
 }

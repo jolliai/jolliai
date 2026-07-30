@@ -15,6 +15,15 @@ class CreatePrFileEditor(
 
     private val panel = CreatePrPanel(project, file.vm)
 
+    /**
+     * Hydrates the skeleton vm (used at first paint by
+     * [ai.jolli.jollimemory.toolwindow.CommitsPanel.openCreatePrView]) with the
+     * full vm loaded asynchronously. Called on the EDT.
+     */
+    fun hydrate(fullVm: ai.jolli.jollimemory.toolwindow.views.CreatePrData.ViewModel) {
+        panel.hydrate(fullVm)
+    }
+
     override fun getComponent(): JComponent = panel
     override fun getPreferredFocusedComponent(): JComponent = panel
     override fun getName(): String = "Create PR"

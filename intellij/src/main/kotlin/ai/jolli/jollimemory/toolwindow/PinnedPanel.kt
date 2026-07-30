@@ -317,7 +317,7 @@ class PinnedPanel(
 			SwingUtilities.invokeLater {
 				if (summary != null) {
 					// Full memory UI (Create PR etc.), same as the Committed Memories view.
-					FileEditorManager.getInstance(project).openFile(SummaryVirtualFile(summary), true)
+					MemoryTabOpener.openOrReuse(project, summary)
 				}
 			}
 		}

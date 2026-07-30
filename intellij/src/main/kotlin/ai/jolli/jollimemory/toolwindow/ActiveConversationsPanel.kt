@@ -108,7 +108,19 @@ class ActiveConversationsPanel(
 	// ── Data loading ────────────────────────────────────────────────────
 
 	private fun loadData() {
-		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		// `sessions.json`, `commit-selection.json`, `pins.json` and the CLI's
+		// `active-conversations` bridge action are all WORKTREE-LOCAL — read from
+		// `<cwd>/.jolli/jollimemory/`. Claude's Stop hook writes each session under
+		// the worktree it ran in, so a linked worktree's conversations only ever
+		// live in *its own* `.jolli/jollimemory/sessions.json`, not the main
+		// worktree's. Prefer `project.basePath` (the current worktree, matching
+		// VS Code's `workspaceFolders[0].uri.fsPath`) — passing `mainRepoRoot`
+		// makes the CLI read the main worktree's stale sessions and drop every
+		// one that's outside the 48h window, showing an empty list. The CLI
+		// itself calls `git rev-parse --git-common-dir` when it needs the
+		// shared root (repo profile, orphan-branch locks), so nothing here
+		// needs to pre-resolve it.
+		val cwd = project.basePath ?: service.mainRepoRoot ?: return
 		// A bridge / transport failure means we don't know which sources are OK,
 		// so mark ALL of them as failed. Without this, an empty `failedSources`
 		// hides the warning banner and the user sees a "no active conversations"
@@ -164,7 +176,7 @@ class ActiveConversationsPanel(
 	// ── Row actions ─────────────────────────────────────────────────────
 
 	private fun onRowClicked(item: ActiveConversationItem) {
-		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		val cwd = project.basePath ?: service.mainRepoRoot ?: return
 		val vf = ConversationVirtualFile(item, cwd)
 		val editors = FileEditorManager.getInstance(project).openFile(vf, true)
 		// Wire the save callback so the list refreshes after edits
@@ -177,12 +189,12 @@ class ActiveConversationsPanel(
 
 	private fun onResume(item: ActiveConversationItem) {
 		if (!TerminalUtils.canResumeSource(item.source.name)) return
-		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		val cwd = project.basePath ?: service.mainRepoRoot ?: return
 		TerminalUtils.resumeSession(project, item.source.name, item.sessionId, cwd, item.title)
 	}
 
 	private fun onSelectionChanged(item: ActiveConversationItem, selected: Boolean) {
-		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		val cwd = project.basePath ?: service.mainRepoRoot ?: return
 		val key = CommitSelectionStore.conversationKey(item.source, item.sessionId)
 		ApplicationManager.getApplication().executeOnPooledThread {
 			CommitSelectionStore.setExcluded(cwd, "conversations", key, !selected)
@@ -192,7 +204,7 @@ class ActiveConversationsPanel(
 
 	fun toggleSelectAll() {
 		val anyUnchecked = conversations.any { !it.isSelected }
-		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		val cwd = project.basePath ?: service.mainRepoRoot ?: return
 		val keys = conversations.map { CommitSelectionStore.conversationKey(it.source, it.sessionId) }
 		ApplicationManager.getApplication().executeOnPooledThread {
 			CommitSelectionStore.setAllExcluded(cwd, "conversations", keys, !anyUnchecked)
@@ -202,7 +214,7 @@ class ActiveConversationsPanel(
 	}
 
 	private fun onPin(item: ActiveConversationItem) {
-		val cwd = service.mainRepoRoot ?: project.basePath ?: return
+		val cwd = project.basePath ?: service.mainRepoRoot ?: return
 		val key = CommitSelectionStore.conversationKey(item.source, item.sessionId)
 		val title = item.title.ifBlank { "${item.source.name} conversation" }
 		// Pinning a conversation mirrors PlansPanel/CommitsPanel pins (memory_pinned);

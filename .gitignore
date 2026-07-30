@@ -68,6 +68,8 @@ Thumbs.db
 # Claude MCP server config — written per-worktree with an absolute local path
 # (jolli install → registerMcpInClaude), so it must never be committed.
 .mcp.json
+# Per-developer Claude/agent hooks overrides (references $HOME paths).
+settings.local.json
 .DS_Store
 .idea/
 *.iml

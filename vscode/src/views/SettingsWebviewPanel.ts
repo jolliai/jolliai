@@ -131,8 +131,8 @@ function maskApiKey(key: string | undefined): string {
 /**
  * Builds the human-friendly site label shown on the AI Summary > Jolli card.
  * Mirrors the Kotlin port in `intellij/.../SettingsDialog.kt::refreshJolliFields`
- * (the IntelliJ side persists no `jolliUrl` of its own — config-intellij.json
- * has no such field — so the Kotlin port can ignore the fallback argument).
+ * (the Kotlin `JolliMemoryConfig` data class omits `jolliUrl`, so the port
+ * can ignore the fallback argument).
  *
  * Falls back to `jolliUrl` when `jolliApiKey` is absent OR present but
  * undecodable. This matches `cli/src/commands/StatusCommand.ts` so the

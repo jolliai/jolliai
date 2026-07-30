@@ -16,8 +16,17 @@
 package ai.jolli.jollimemory.toolwindow.views
 
 object SummaryScriptBuilder {
+    // The script is a static template with no runtime inputs — allocate it once
+    // and reuse forever. Rebuilding the ~1870-line string on every summary
+    // render was pure garbage for the GC and (before the buildHtml move to a
+    // pool thread) also blocked the EDT for 5-15 ms per re-render. See the
+    // "Stage 1.2" optimization in the IntelliJ perf plan.
+    private val cachedScript: String by lazy { buildScriptInternal() }
+
     /** Returns the JavaScript for interactive behaviors in the JCEF webview. */
-    fun buildScript(): String {
+    fun buildScript(): String = cachedScript
+
+    private fun buildScriptInternal(): String {
         return """
   // ── Bridge: post messages to IntelliJ via JCEF query handler ──
   // Named jmSend (not postMessage) to avoid conflict with the built-in

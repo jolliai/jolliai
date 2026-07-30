@@ -77,6 +77,24 @@ ${if (isDark) darkVars() else lightVars()}
   /* ── Rows (memories + files) ── */
   .row { display: flex; align-items: center; gap: 10px; padding: 7px 4px; border-radius: 6px; cursor: pointer; }
   .row:hover { background: var(--surface-hover); }
+  /* Skeleton loaders shown between skeleton-vm open and full-vm hydrate.
+     `skeleton-row` disables hover/pointer; `skeleton-bar` is a shimmer using
+     the current --surface-hover token so it blends in every theme. */
+  .skeleton-row { cursor: default; pointer-events: none; }
+  .skeleton-row:hover { background: transparent; }
+  .skeleton-bar {
+    display: inline-block; border-radius: 4px;
+    background: linear-gradient(90deg, var(--surface-hover) 0%, var(--panel-bg) 50%, var(--surface-hover) 100%);
+    background-size: 200% 100%;
+    animation: jm-shimmer 1.2s linear infinite;
+    color: transparent;
+    min-height: 0.9em;
+  }
+  @keyframes jm-shimmer {
+    0%   { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+  button[disabled] { opacity: 0.55; cursor: not-allowed; }
   .mem-ico { font-size: 1em; opacity: 0.5; flex-shrink: 0; }
   .r-main { flex: 1; min-width: 0; }
   .r-title { font-size: 0.9em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -93,20 +111,50 @@ ${if (isDark) darkVars() else lightVars()}
   .gs-C, .fname-C { color: var(--gs-deleted); }
 
   /* ── Rendered markdown body ── */
+  /* .md-body — server-rendered PR body (matches VS Code's md-body). Handles
+     the folded-topic layout (`<details>`/`<summary>`/`<blockquote>`) that
+     wrapInGithubDetails emits into the markdown. */
+  .md-body { font-size: 0.9em; line-height: 1.6; color: var(--text-primary); word-break: break-word; }
+  .md-body .md-heading {
+    font-size: 0.82em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--text-secondary); margin: 14px 0 6px;
+  }
+  .md-body .md-heading:first-child { margin-top: 0; }
+  .md-body .md-line { margin: 2px 0; }
+  .md-body .md-blank { height: 8px; }
+  .md-body .md-list { margin: 4px 0 8px 20px; }
+  .md-body .md-list li { margin: 2px 0; }
+  .md-body strong { font-weight: 650; }
+  .md-body .md-link { color: var(--link-fg); }
+  .md-body .md-hr { border: none; border-top: 1px solid var(--border-light); margin: 14px 0; }
+  .md-body .md-inline-code, .md-body code {
+    font-family: $MONO_FONT_FAMILY; font-size: 0.9em;
+    background: var(--code-block-bg); padding: 1px 5px; border-radius: 4px;
+  }
+  .md-body .md-code-block {
+    background: var(--code-block-bg); border-radius: 6px; padding: 10px 12px;
+    overflow-x: auto; margin: 8px 0; font-size: 0.9em; line-height: 1.5;
+  }
+  .md-body .md-code-block code { background: none; padding: 0; }
+  .md-body blockquote, .md-body .md-quote {
+    border-left: 2px solid var(--border-light); margin: 8px 0;
+    padding: 2px 0 2px 12px; color: var(--text-secondary);
+  }
+  .md-body details { margin: 6px 0; }
+  .md-body summary { cursor: pointer; padding: 3px 0; }
+  .md-body summary:hover { color: var(--text-primary); }
+
+  /* .md-mock — E2E test guide rendered from raw HTML (`<p>/<ol>/<li>`), so no
+     .md-heading/.md-list classes appear inside it. Separate stylesheet from
+     .md-body which does emit those classes. */
   .md-mock { line-height: 1.65; font-size: 0.93em; }
-  .md-mock .md-heading { font-weight: 700; margin: 10px 0 4px; }
-  .md-mock h2.md-heading { font-size: 1.05em; } .md-mock h3.md-heading { font-size: 1em; }
-  .md-mock .md-list { margin: 4px 0 8px 20px; } .md-mock .md-list li { margin: 2px 0; }
-  .md-mock .md-blank { height: 6px; }
+  .md-mock p { margin: 6px 0; }
+  .md-mock ol { margin: 4px 0 8px 20px; }
+  .md-mock li { margin: 2px 0; }
   .md-mock .md-inline-code, .md-mock code {
     background: var(--code-block-bg); padding: 1px 5px; border-radius: 4px;
     font-family: $MONO_FONT_FAMILY; font-size: 0.9em;
   }
-  .md-mock .md-code-block {
-    background: var(--code-block-bg); padding: 10px 12px; border-radius: 6px;
-    overflow-x: auto; margin: 6px 0; font-family: $MONO_FONT_FAMILY; font-size: 0.85em;
-  }
-  .md-mock .md-link { color: var(--link-fg); }
 
   /* ── Actions ── */
   .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
@@ -121,6 +169,15 @@ ${if (isDark) darkVars() else lightVars()}
   .btn.secondary:hover { background: var(--btn-secondary-hover-bg); color: var(--text-primary); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
   .up-to-date { align-self: center; font-size: 0.8em; color: var(--text-tertiary); }
+  /* Error strip shown when the async CreatePrData.build() call failed after
+     the skeleton was placed. Sits under the heading so the user notices it
+     immediately, styled as a warning without shouting. */
+  .pr-load-error {
+    margin: 4px 0 12px 0; padding: 10px 12px; border-radius: 6px;
+    background: rgba(217, 132, 54, 0.12); border: 1px solid rgba(217, 132, 54, 0.45);
+    color: var(--text-primary); font-size: 0.85em; line-height: 1.5;
+  }
+  .pr-load-error b { color: var(--text-primary); margin-right: 4px; }
 
   /* ── Inline editors (revealed by Edit, replace the read-only display in place) ── */
   .pr-input, .pr-textarea {

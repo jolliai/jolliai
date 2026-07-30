@@ -14,10 +14,10 @@ import java.util.UUID
  * TelemetrySharedConfig — reads/writes the telemetry identity + opt-out flag in
  * the **shared** `~/.jolli/jollimemory/config.json` (JOLLI-1785 Phase 3).
  *
- * Deliberately NOT `config-intellij.json`: `installId` and the `telemetry` flag
- * are machine-global so there is one anonymous identity and one opt-out switch
- * per machine across CLI / VS Code / IntelliJ (the `surface` field distinguishes
- * clients). Because the CLI co-owns this file, we mutate it as a Gson
+ * `installId` and the `telemetry` flag are machine-global so there is one
+ * anonymous identity and one opt-out switch per machine across CLI / VS Code /
+ * IntelliJ (the `surface` field distinguishes clients). Because the CLI
+ * co-owns this file, we mutate it as a Gson
  * `JsonObject` tree — preserving every other field's exact JSON (a parse→Map
  * round-trip would widen the CLI's integer fields to doubles).
  *

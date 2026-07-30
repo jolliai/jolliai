@@ -4,10 +4,13 @@ package ai.jolli.jollimemory.toolwindow.views
  * CreatePrScriptBuilder — inline JS for the Create PR JCEF webview.
  *
  * Mirrors [SummaryScriptBuilder]'s bridge (`jmSend` → `window.__jbQuery`, and an
- * inbound `jollimemory` CustomEvent from the Kotlin `postToWebview`). Renders the
- * PR body markdown client-side via a ported `renderMarkdown`, and wires the
- * create/edit/copy actions plus memory/file row clicks. No CSP nonce is needed —
- * the IntelliJ JCEF webview does not enforce a CSP (unlike VS Code).
+ * inbound `jollimemory` CustomEvent from the Kotlin `postToWebview`). The PR body
+ * is rendered server-side by [CreatePrBodyMarkdown.renderPrBodyMarkdown] and baked
+ * into the initial HTML — matching the VS Code pane. This script no longer parses
+ * markdown itself; when the user clicks Done after editing, it sends the raw body
+ * back to Kotlin (`renderBody`) and swaps in the returned HTML (`bodyRendered`) so
+ * there is exactly one renderer implementation to keep aligned with GitHub's.
+ * No CSP nonce is needed — the IntelliJ JCEF webview does not enforce a CSP.
  */
 object CreatePrScriptBuilder {
 
@@ -22,67 +25,6 @@ object CreatePrScriptBuilder {
     }
   }
 
-  function esc(s) {
-    return (s == null ? '' : String(s))
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-  }
-
-  /** Inline markdown: code, bold, italic, links. Uses function replacers to keep it robust. */
-  function applyInline(text) {
-    text = text.replace(/`([^`]+)`/g, function(m, g) { return '<code class="md-inline-code">' + g + '</code>'; });
-    text = text.replace(/\*\*(.+?)\*\*/g, function(m, g) { return '<strong>' + g + '</strong>'; });
-    text = text.replace(/__(.+?)__/g, function(m, g) { return '<strong>' + g + '</strong>'; });
-    text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, function(m, label, url) {
-      return '<a href="' + url + '" class="md-link">' + label + '</a>';
-    });
-    return text;
-  }
-
-  /** Minimal block-level markdown → HTML (headings, lists, code fences, paragraphs). */
-  function renderMarkdown(raw) {
-    if (!raw) return '';
-    var text = esc(raw);
-    text = text.replace(/```[a-zA-Z]*\n([\s\S]*?)```/g, function(m, code) {
-      return '<pre class="md-code-block"><code>' + code.replace(/\n$/, '') + '</code></pre>';
-    });
-    var lines = text.split('\n');
-    var out = [];
-    var inList = false;
-    for (var i = 0; i < lines.length; i++) {
-      var line = lines[i];
-      if (line.indexOf('<pre class="md-code-block">') !== -1) {
-        if (inList) { out.push('</ul>'); inList = false; }
-        var block = line;
-        while (block.indexOf('</pre>') === -1 && i + 1 < lines.length) { i++; block += '\n' + lines[i]; }
-        out.push(block);
-        continue;
-      }
-      var headerMatch = line.match(/^(#{1,4})\s+(.+)${'$'}/);
-      if (headerMatch) {
-        if (inList) { out.push('</ul>'); inList = false; }
-        var level = headerMatch[1].length + 1;
-        out.push('<h' + level + ' class="md-heading">' + applyInline(headerMatch[2]) + '</h' + level + '>');
-        continue;
-      }
-      var listMatch = line.match(/^[\-\*]\s+(.+)${'$'}/);
-      if (listMatch) {
-        if (!inList) { out.push('<ul class="md-list">'); inList = true; }
-        out.push('<li>' + applyInline(listMatch[1]) + '</li>');
-        continue;
-      }
-      if (inList) { out.push('</ul>'); inList = false; }
-      if (line.trim() === '') { out.push('<div class="md-blank"></div>'); continue; }
-      out.push('<div>' + applyInline(line) + '</div>');
-    }
-    if (inList) out.push('</ul>');
-    return out.join('');
-  }
-
-  (function () {
-    var bodyEl = document.getElementById('prBody');
-    if (bodyEl) { bodyEl.innerHTML = renderMarkdown(bodyEl.getAttribute('data-body') || ''); }
-  })();
-
   var inFlight = false;
   function setInFlight(on) { inFlight = on; var b = document.getElementById('cmdCreatePr'); if (b) b.disabled = on; }
   function setStatus(t) { var s = document.getElementById('prStatusText'); if (s) s.textContent = t || ''; }
@@ -91,7 +33,9 @@ object CreatePrScriptBuilder {
   function show(id, visible) { var el = document.getElementById(id); if (el) el.classList.toggle('hidden', !visible); }
 
   // Edit toggles the Title/Body panels between their read-only display and inline
-  // editors (no separate form). Toggling back re-renders the display from the edits.
+  // editors (no separate form). Toggling back re-renders the display via a
+  // round-trip to Kotlin's renderPrBodyMarkdown so the client and initial paint
+  // never disagree about how the same markdown looks.
   var editing = false;
   function setEditing(on) {
     editing = on;
@@ -105,8 +49,11 @@ object CreatePrScriptBuilder {
     if (!on) {
       var t = document.getElementById('prTitleInput'), d = document.getElementById('prTitleDisplay');
       if (t && d) d.textContent = t.value;
-      var b = document.getElementById('prBodyInput'), body = document.getElementById('prBody');
-      if (b && body) body.innerHTML = renderMarkdown(b.value);
+      var b = document.getElementById('prBodyInput');
+      // Send the edited body to Kotlin; the `bodyRendered` handler below swaps
+      // the rendered HTML into #prBody. Textarea input value is preserved so
+      // clicking Edit again resumes the same edit session.
+      if (b) jmSend({ command: 'renderBody', body: b.value });
     }
   }
 
@@ -164,6 +111,14 @@ object CreatePrScriptBuilder {
       case 'prCreated': setInFlight(false); setStatus(msg.text || ''); break;
       case 'prCreateError': setInFlight(false); setStatus(msg.text || ''); break;
       case 'bodyCopied': showToast(msg.text || 'Copied PR body to clipboard'); break;
+      case 'bodyRendered': {
+        // Kotlin's renderPrBodyMarkdown response after a Done click. Replace the
+        // display in place — no other panels re-render so any current scroll
+        // position on the page is preserved.
+        var bodyEl = document.getElementById('prBody');
+        if (bodyEl) bodyEl.innerHTML = msg.html || '';
+        break;
+      }
     }
   });
 """

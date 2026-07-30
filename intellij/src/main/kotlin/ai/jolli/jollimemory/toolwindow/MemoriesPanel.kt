@@ -350,8 +350,7 @@ class MemoriesPanel(
             val summary = service.getSummary(entry.commitHash)
             SwingUtilities.invokeLater {
                 if (summary != null) {
-                    val vFile = SummaryVirtualFile(summary)
-                    FileEditorManager.getInstance(project).openFile(vFile, true)
+                    MemoryTabOpener.openOrReuse(project, summary)
                 } else {
                     JOptionPane.showMessageDialog(
                         this, "No summary found for ${entry.commitHash.take(8)}",

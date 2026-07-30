@@ -773,9 +773,9 @@ class SettingsDialog(
         // when appropriate. Those are safe to run last.
         val existing = SessionTracker.loadConfigFromDir(configDir)
         val config = existing.copy(
-            // apiKey / aiProvider / localAgentTool / localAgentPath live ONLY in the shared
-            // config.json (one copy) — force-null here so they never leak into config-intellij.json;
-            // the real save happens via saveSharedProviderConfig below.
+            // apiKey / aiProvider / localAgentTool / localAgentPath are written separately via
+            // saveSharedProviderConfig below. Force-null here so this data-class overwrite
+            // doesn't clobber the value that call will restore.
             apiKey = null,
             authToken = if (jolliKeyCleared) null else existing.authToken,
             jolliApiKey = if (jolliKeyCleared) null else jolliApiKeyText.ifBlank { null },
@@ -791,9 +791,8 @@ class SettingsDialog(
             aiProvider = null,
             localAgentTool = null,
             localAgentPath = null,
-            // dcoSignoff is NOT written to config-intellij.json — it lives in the shared
-            // config.json (cross-surface). Force-null here so a stale overlay value never
-            // leaks into the per-IDE file; the real save happens via saveDcoSignoff below.
+            // dcoSignoff is written separately via saveDcoSignoff below. Force-null here
+            // so this data-class overwrite doesn't clobber the value that call will restore.
             dcoSignoff = null,
             knowledgeBasePath = kbPath,
             knowledgeBaseSort = kbSort,
@@ -813,9 +812,9 @@ class SettingsDialog(
             apiKey = resolvedApiKey.ifBlank { null },
             localAgentTool = "claude-code",
         )
-        // DCO sign-off lives in the shared config.json (cross-surface with CLI / VS Code),
-        // so it is persisted via a JSON-level partial update instead of the
-        // config-intellij.json data-class overwrite above.
+        // DCO sign-off is persisted via a JSON-level partial update rather than the
+        // data-class overwrite above, so a value the CLI or VS Code just wrote to the
+        // same config.json isn't clobbered by our stale in-memory copy.
         SessionTracker.saveDcoSignoff(dcoSignoffCheckbox.isSelected)
         // Telemetry opt-out lives in the shared config.json (machine-global, cross-surface).
         // Apply the choice to the LIVE Telemetry context too, so it takes effect this session
@@ -919,6 +918,14 @@ class SettingsDialog(
                         // the idempotent reconcile once migration has completed.
                         indicator.text = "Migrating memories to Memory Bank…"
                         CliIntegrations.migrateMemoryBank(projectPath)
+
+                        // Re-point the SummaryReader's folder attachment at the new
+                        // kbRoot / storageMode. Without this, changing the Memory Bank
+                        // path (or toggling storageMode to "orphan") in Settings keeps
+                        // reads served from the previous folder for the rest of the
+                        // session — [JolliMemoryService.initialize] is gated by
+                        // `isInitialized`, so it will not re-run.
+                        service.refreshFolderReader()
                     }
 
                     // 2b. Apply the global-instructions consent: persist a fresh decision to

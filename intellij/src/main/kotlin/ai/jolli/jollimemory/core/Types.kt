@@ -487,7 +487,7 @@ data class SummaryIndex(
     val commitAliases: Map<String, String>? = null,
 )
 
-/** Configuration stored in .jolli/jollimemory/config-intellij.json */
+/** Configuration stored in ~/.jolli/jollimemory/config.json (shared across CLI / VS Code / IntelliJ). */
 data class JolliMemoryConfig(
     val apiKey: String? = null,
     val model: String? = null,

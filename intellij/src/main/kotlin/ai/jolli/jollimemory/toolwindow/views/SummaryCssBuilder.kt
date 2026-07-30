@@ -21,8 +21,29 @@ object SummaryCssBuilder {
     private const val MONO_FONT_FAMILY =
         "'JetBrains Mono', Menlo, Consolas, 'Courier New', monospace"
 
+    // Theme-keyed cache. The CSS only depends on (isDark, pageBgHex), and in
+    // practice only 2-4 unique combos are ever seen per IDE session (light /
+    // dark × editor background variants). Caching the ~1780-line string avoids
+    // reallocating and rebuilding it on every summary render — this used to be
+    // roughly half of the EDT time in doRefreshNow.
+    private data class CssKey(val isDark: Boolean, val pageBgHex: String)
+
+    private val cssCache = java.util.concurrent.ConcurrentHashMap<CssKey, String>()
+
     /** Returns the complete CSS stylesheet for the summary webview. */
     fun buildCss(isDark: Boolean, pageBgHex: String = "#1e1e1e"): String {
+        // Belt-and-suspenders: bound the cache in case a caller feeds arbitrary
+        // hex values. In normal operation cssCache.size stays ≤ 4, so this
+        // check-then-clear is racy-by-design — two concurrent threads could
+        // both see size > 32 and both call clear(), which is fine (worst case:
+        // a redundant clear followed by re-populating on the next getOrPut).
+        // No atomic replacement needed for a 4-entry cache; if the real
+        // cardinality ever grows we'd swap this for a bounded LinkedHashMap.
+        if (cssCache.size > 32) cssCache.clear()
+        return cssCache.getOrPut(CssKey(isDark, pageBgHex)) { buildCssInternal(isDark, pageBgHex) }
+    }
+
+    private fun buildCssInternal(isDark: Boolean, pageBgHex: String): String {
         val rootVars = buildRootVars(isDark, pageBgHex)
         return """
   /* ── Theme variables ── */

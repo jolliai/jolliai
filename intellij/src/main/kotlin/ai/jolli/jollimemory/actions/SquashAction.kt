@@ -62,6 +62,49 @@ class SquashAction : AnAction() {
         // Get selected commits from CommitsPanel if available, otherwise use all branch commits
         val commitsPanel = service.panelRegistry?.commitsPanel
         if (commitsPanel?.isForeignMode == true) return
+
+        // Two-step invocation matches the design's squash mode:
+        //   1st click (no active mode) → enter squash mode so the user can
+        //     see checkboxes appear and pick 2+ memories to consolidate.
+        //   2nd click (in mode, 2+ selected) → run the actual AI squash flow
+        //     below with those exact selections.
+        //
+        // The "in mode with 0/1 selected" case MUST no-op instead of falling
+        // through to service.getBranchCommits(): once squash mode is entered
+        // (which clears the selection), a bare second click on the section-
+        // header Squash button would otherwise rewrite the WHOLE branch's
+        // history and consolidate every memory — surprising, and irreversible.
+        // Unpushed branches don't even see the force-push warning.
+        //
+        // The gate reads the panel's already-loaded commit count instead of
+        // re-forking git — service.getBranchCommits() is 3× rev-parse +
+        // merge-base + reflog + git log + a per-commit orphan-branch summary
+        // read (~100-500 ms cold), and every first-click "just enter squash
+        // mode" invocation would pay that price on the EDT.
+        //
+        // Cold-start fallback: CommitsPanel.commits is populated asynchronously
+        // by [CommitsPanel.refreshFromGit] and is empty in the ~50-200 ms
+        // between tool-window open and the pool call finishing. A `commitCount()
+        // == 0` in that window would skip the two-step guard and fall straight
+        // through to the whole-branch service.getBranchCommits() path below —
+        // silently squashing without the "enter mode → click again" protection.
+        // When the panel hasn't loaded yet, pay the git-plumbing cost once.
+        val branchCommitsCount = commitsPanel?.commitCount()?.takeIf { it > 0 }
+            ?: service.getBranchCommits().size
+        if (commitsPanel != null && branchCommitsCount >= 2) {
+            val selectedCount = commitsPanel.getSelectedCommits().size
+            if (!commitsPanel.isInSquashMode()) {
+                commitsPanel.enterSquashMode()
+                return
+            }
+            if (selectedCount < 2) {
+                // In squash mode but nothing (or 1) checked — quietly no-op.
+                // The squash bar's own count label already tells the user to
+                // "Select 2+ memories to squash", so no dialog is needed here.
+                return
+            }
+        }
+
         val selectedCommits = commitsPanel?.getSelectedCommits()?.takeIf { it.isNotEmpty() }
         val commits = selectedCommits ?: service.getBranchCommits()
         if (commits.size < 2) {
@@ -221,6 +264,12 @@ class SquashAction : AnAction() {
                                         Messages.showWarningDialog(project,
                                             "Squash succeeded but push failed. You can push manually.",
                                             "Jolli Memory")
+                                        // The git commit already went through; from the panel's
+                                        // point of view the squash is done. Exit squash mode so
+                                        // the checkboxes disappear and a follow-up header click
+                                        // isn't one confirmation away from re-triggering the
+                                        // "in-mode with 0 selected" path.
+                                        commitsPanel?.exitSquashMode()
                                         service.refreshStatus()
                                     }
                                     return@executeOnPooledThread
@@ -233,6 +282,10 @@ class SquashAction : AnAction() {
                                 Messages.showInfoMessage(project,
                                     "${commits.size} commits $actionLabel. Post-commit hook is merging summaries in the background.",
                                     "Jolli Memory")
+                                // Leave selection mode now that the operation finished —
+                                // stays symmetric with the Cancel button and prevents
+                                // stale checkboxes from feeding the next action.
+                                commitsPanel?.exitSquashMode()
                                 service.refreshStatus()
                             }
                         }
@@ -256,7 +309,12 @@ class SquashAction : AnAction() {
         val cwd = e.project?.basePath
         val workerBusy = cwd != null && SessionTracker.isWorkerBusy(cwd)
         val isForeign = service?.panelRegistry?.commitsPanel?.isForeignMode == true
-        e.presentation.isEnabled = status != null && status.enabled && !workerBusy && !isForeign
+        // enterSquashMode() early-returns on isMerged, and the fall-through
+        // path also needs 2+ commits; without this gate a merged-branch click
+        // would silently no-op (enter-mode returns, then we exit before the
+        // service.getBranchCommits() call), giving the user no feedback.
+        val isMerged = service?.panelRegistry?.commitsPanel?.branchIsMerged == true
+        e.presentation.isEnabled = status != null && status.enabled && !workerBusy && !isForeign && !isMerged
     }
 }
 

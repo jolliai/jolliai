@@ -902,7 +902,7 @@ class KBExplorerPanel(
                 if (summary != null) {
                     val isForeign = data.entryKbRoot != null && data.entryKbRoot != kbRoot
                     SwingUtilities.invokeLater {
-                        FileEditorManager.getInstance(project).openFile(SummaryVirtualFile(summary, readOnly = isForeign), true)
+                        MemoryTabOpener.openOrReuse(project, summary, readOnly = isForeign)
                     }
                 } else {
                     SwingUtilities.invokeLater { openFile(data.path) }

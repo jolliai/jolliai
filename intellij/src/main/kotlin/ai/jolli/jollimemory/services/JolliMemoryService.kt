@@ -55,6 +55,12 @@ class JolliMemoryService(private val project: Project) : Disposable {
     private val log = Logger.getInstance(JolliMemoryService::class.java)
     private var git: GitOps? = null
     private var installer: HookInstaller? = null
+    // Written once by initialize() on a pool thread; read from EDT (SummaryPanel
+    // hovers), other pool threads (refreshFolderReader, hook status refresh) and
+    // Task.Backgroundable actions. Executor happens-before covers the common case,
+    // but the @Volatile matches the convention used for cachedStatus/workerBusy/
+    // installProtectionUntil below and documents cross-thread intent.
+    @Volatile
     private var reader: SummaryReader? = null
     @Volatile
     private var cachedStatus: StatusInfo? = null
@@ -70,7 +76,15 @@ class JolliMemoryService(private val project: Project) : Disposable {
      *  Set after install() to prevent GIT_REPO_CHANGE from flapping the status. */
     @Volatile
     private var installProtectionUntil: Long = 0L
-    /** The resolved main repo root (handles worktrees). */
+    /**
+     * The resolved main repo root (handles worktrees). Written on the initialize
+     * pool thread; read from many surfaces (EDT + pool) including
+     * [refreshFolderReader], hook-driven callers, and `getStatus` consumers. Kept
+     * @Volatile so late readers see the assignment without relying on executor
+     * happens-before, and to match the convention on the other cross-thread fields
+     * in this class.
+     */
+    @Volatile
     var mainRepoRoot: String? = null
         private set
     var lastError: String? = null
@@ -150,7 +164,49 @@ class JolliMemoryService(private val project: Project) : Disposable {
     private val memoryStateListeners = CopyOnWriteArrayList<() -> Unit>()
     fun addMemoryStateListener(listener: () -> Unit) { memoryStateListeners.add(listener) }
     fun removeMemoryStateListener(listener: () -> Unit) { memoryStateListeners.remove(listener) }
-    fun notifyMemoryStateChanged() { memoryStateListeners.forEach { it() } }
+    fun notifyMemoryStateChanged() {
+        // Any surface that changed a committed memory (topic edit, e2e regen,
+        // squash, PR creation, branch backfill, orphan-branch update from
+        // outside) fires this. Wipe the summary cache — the shape of "which
+        // hashes are affected" is not always knowable from the call site, and
+        // over-invalidation is cheap (next read repopulates lazily).
+        invalidateSummaryCache()
+        memoryStateListeners.forEach { it() }
+    }
+
+    /**
+     * Wipes the [getSummary] LRU without firing memory-state listeners.
+     * Use this from in-panel edit handlers (topic / e2e / recap / plan /
+     * reference edits in [ai.jolli.jollimemory.toolwindow.SummaryPanel]) so
+     * a subsequent cross-surface reopen — via CommitsPanel, MemoriesPanel,
+     * PinnedPanel, ActionBarPanel, ViewSummaryAction, [CreatePrData.build] —
+     * reads the just-persisted content instead of the pre-edit snapshot.
+     *
+     * Not routed through [notifyMemoryStateChanged] because those panels
+     * already update themselves locally (patch acks + refreshHtml) — a
+     * full listener refresh would clobber their patch with a redundant
+     * full reload and flash the tab. Alias-aware by construction (clear
+     * removes both the raw and root-hash entries in one shot; a targeted
+     * per-hash remove would leave the alias sibling stale).
+     */
+    fun invalidateSummaryCache() {
+        summaryCache.clear()
+    }
+
+    // ── Summary in-memory LRU ────────────────────────────────────────────
+    // Reads on the orphan branch cost a `git show` fork (100-200 ms cold);
+    // this cache eliminates repeated forks for the same hash across the
+    // three read paths (commits-list hover-expand, viewSummary tab open,
+    // memory-state refresh). Aligns with the effect VS Code gets for free
+    // via FolderStorage.readFileSync + OS page cache; Stage 3.1 adds the
+    // Kotlin folder reader for even tighter parity.
+    private val summaryCache: MutableMap<String, CommitSummary> =
+        java.util.Collections.synchronizedMap(
+            object : LinkedHashMap<String, CommitSummary>(128, 0.75f, /*accessOrder=*/true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CommitSummary>) =
+                    size > 128
+            }
+        )
 
     // ── Back-fill cold-start signals ─────────────────────────────────────
     // Mirrors the VS Code extension's `computeColdStartSignals()` /
@@ -283,6 +339,37 @@ class JolliMemoryService(private val project: Project) : Disposable {
         isInitialized = false
     }
 
+    /**
+     * Re-attach the folder reader against the CURRENT `config.knowledgeBasePath`
+     * + `config.storageMode`. Call after Settings persists a change to either —
+     * without this, the reader keeps pointing at the previous Memory Bank
+     * directory (so summaries/plans/notes are read from a stale folder) or keeps
+     * serving folder JSON after storageMode flips to "orphan". Passing null is a
+     * valid outcome (folder isn't populated, or storageMode="orphan") — the
+     * SummaryReader falls back to orphan-branch reads for the rest of the session.
+     *
+     * THREADING: does file I/O (SessionTracker.loadConfig, KBPathResolver.resolve,
+     * FolderStorageReader.forRoot → File.isDirectory). Must NOT be called on the
+     * EDT. Current callers: SettingsDialog's Task.Backgroundable, initialize() on
+     * a pool thread.
+     */
+    fun refreshFolderReader() {
+        val root = mainRepoRoot ?: project.basePath ?: return
+        val r = reader ?: return
+        try {
+            val repoName = KBPathResolver.extractRepoName(root)
+            val remoteUrl = KBPathResolver.getRemoteUrl(root)
+            val config = SessionTracker.loadConfig()
+            val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
+            val folderReader = ai.jolli.jollimemory.bridge.FolderStorageReader.forRoot(kbRoot.toString(), config.storageMode)
+            r.attachFolder(folderReader)
+        } catch (e: Exception) {
+            // Best effort — a failed re-attach just leaves the previous reader in
+            // place, and read paths still fall back to the orphan branch.
+            log.warn("refreshFolderReader failed: ${e.message}")
+        }
+    }
+
     fun initialize() {
         if (isInitialized) return
         val sb = StringBuilder()
@@ -372,6 +459,27 @@ class JolliMemoryService(private val project: Project) : Disposable {
             // matching the VS Code activate path. The Kotlin MigrationEngine is gone.
             val migration = CliIntegrations.migrateMemoryBank(resolvedRoot)
             sb.appendLine("Auto-migration: ${migration.status} (${migration.migratedEntries}/${migration.totalEntries})")
+
+            // Attach a direct filesystem reader for the hidden `.jolli/` layer
+            // so summary / plan / note reads bypass ide-bridge + `git show`.
+            // Null-safe: reader stays null when the folder isn't populated
+            // yet, everything falls back to the orphan-branch path unchanged.
+            //
+            // MUST run AFTER migrateMemoryBank: on a fresh install the folder
+            // exists but its .jolli/summaries/ is empty until migration copies
+            // the orphan-branch data across. Attaching before migration would
+            // make [FolderStorageReader.forRoot] return null (isReady() gates
+            // on the summaries dir existing), and the reader would stay null
+            // for the whole session — the reads that most benefit from the
+            // page-cache-fast path would keep forking `git show`.
+            //
+            // storageMode gate: if the repo is on `storageMode = "orphan"`
+            // (writes only to the orphan branch), the folder may still exist
+            // from a prior dual-write session but would serve stale JSON on
+            // amend/squash. forRoot returns null for that mode.
+            val folderReader = ai.jolli.jollimemory.bridge.FolderStorageReader.forRoot(kbRoot.toString(), config.storageMode)
+            reader?.attachFolder(folderReader)
+            sb.appendLine("Folder reader: ${if (folderReader != null) "attached" else "unavailable"}")
         } catch (e: Exception) {
             sb.appendLine("KB folder init/migration failed: ${e.message}")
         }
@@ -828,18 +936,32 @@ class JolliMemoryService(private val project: Project) : Disposable {
     }
 
     fun getSummary(commitHash: String): CommitSummary? {
+        // Cache hit → skip the git-show fork (and, later, the folder read).
+        // The cache is wiped whenever a memory-state event fires
+        // ([notifyMemoryStateChanged]) or an in-panel edit calls
+        // [invalidateSummaryCache], so any real change repopulates lazily.
+        summaryCache[commitHash]?.let { return it }
+
         // Try direct lookup first, then resolve through tree-hash aliases
         val direct = reader?.getSummary(commitHash)
-        if (direct != null) return direct
+        if (direct != null) {
+            summaryCache[commitHash] = direct
+            return direct
+        }
 
         val g = git ?: return null
         val projectPath = mainRepoRoot ?: ""
-            val store = ai.jolli.jollimemory.core.SummaryStore(projectPath, g, StorageFactory.create(g, projectPath))
+        val store = ai.jolli.jollimemory.core.SummaryStore(projectPath, g, StorageFactory.create(g, projectPath))
         val resolvedHash = store.resolveAlias(commitHash)
         if (resolvedHash != commitHash) {
             // Find the root summary for the alias target
             val rootHash = store.findRootHash(resolvedHash) ?: resolvedHash
-            return reader?.getSummary(rootHash)
+            val fresh = reader?.getSummary(rootHash) ?: return null
+            // Cache under BOTH keys so future lookups by either the alias or
+            // the root hit — the alias→root resolution is stable per branch.
+            summaryCache[commitHash] = fresh
+            summaryCache[rootHash] = fresh
+            return fresh
         }
         return null
     }

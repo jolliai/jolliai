@@ -20,10 +20,30 @@ import com.google.gson.JsonParser
  * reads (listSummaries / getSummary) go through `git` (GitOps), which resolves
  * the shared common-dir automatically, so they aren't affected by this choice.
  */
-class SummaryReader(private val worktreeDir: String, private val git: GitOps) {
+class SummaryReader(
+    private val worktreeDir: String,
+    private val git: GitOps,
+    /**
+     * Optional local Memory Bank reader. When present AND ready, every
+     * summary/plan/note read tries the folder first (page-cache-fast) and
+     * only falls back to the orphan branch (`git show`, 100-200 ms cold fork)
+     * on a miss. When null, behaviour is unchanged: everything goes through
+     * git plumbing.
+     *
+     * See [FolderStorageReader] for the lockstep contract with the CLI's
+     * `FolderStorage.ts`. Attached via [attachFolder] once the KB folder
+     * path is known (which itself costs an ide-bridge round-trip), so init
+     * can create the reader before that resolve completes.
+     */
+    @Volatile private var folder: FolderStorageReader? = null,
+) {
 
     private val log = JmLogger.create("SummaryReader")
     private val gson = Gson()
+
+    /** Attach or detach the folder reader after construction. Safe to call
+     *  from any thread; reads see the new value on the next lookup. */
+    fun attachFolder(reader: FolderStorageReader?) { folder = reader }
 
     /** Read the full installation and data status. */
     fun getStatus(@Suppress("UNUSED_PARAMETER") installer: HookInstaller): StatusInfo {
@@ -55,6 +75,9 @@ class SummaryReader(private val worktreeDir: String, private val git: GitOps) {
 
     /** Get full summary object for a commit. */
     fun getSummary(commitHash: String): CommitSummary? {
+        // Folder-first: on 0.99.0+ (dual-write default) this hits the OS page
+        // cache in microseconds and avoids a `git show` fork entirely.
+        folder?.getSummary(commitHash)?.let { return it }
         val path = "summaries/$commitHash.json"
         val json = git.readBranchFile(ORPHAN_BRANCH, path) ?: return null
         return try {
@@ -67,14 +90,17 @@ class SummaryReader(private val worktreeDir: String, private val git: GitOps) {
 
     /** Get raw JSON for a commit summary. */
     fun getSummaryJson(commitHash: String): String? {
+        folder?.getSummaryJson(commitHash)?.let { return it }
         return git.readBranchFile(ORPHAN_BRANCH, "summaries/$commitHash.json")
     }
 
     /** Reads an archived plan body (`plans/<slug>.md`) from the orphan branch. */
-    fun readPlanBody(slug: String): String? = git.readBranchFile(ORPHAN_BRANCH, "plans/$slug.md")
+    fun readPlanBody(slug: String): String? =
+        folder?.readPlanBody(slug) ?: git.readBranchFile(ORPHAN_BRANCH, "plans/$slug.md")
 
     /** Reads an archived markdown-note body (`notes/<id>.md`) from the orphan branch. */
-    fun readNoteBody(id: String): String? = git.readBranchFile(ORPHAN_BRANCH, "notes/$id.md")
+    fun readNoteBody(id: String): String? =
+        folder?.readNoteBody(id) ?: git.readBranchFile(ORPHAN_BRANCH, "notes/$id.md")
 
     /**
      * Reads the committed AI conversations for a commit. Looks up the

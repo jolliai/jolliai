@@ -41,8 +41,7 @@ export async function saveAuthToken(token: string): Promise<void> {
  * `jolliUrl` is required: every successful login knows the origin it signed
  * into, and persisting it lets space-cli recover the tenant when
  * `jolliApiKey` is missing or stale. Trailing slash is stripped so the
- * persisted value matches `getJolliUrl`. CLI / VS Code only — IntelliJ
- * writes its own auth state to `config-intellij.json`.
+ * persisted value matches `getJolliUrl`.
  *
  * Also writes `aiProvider: "jolli"` because clicking "Sign in to Jolli" is the
  * user's explicit declaration of intent to use Jolli for AI summaries — UNLESS
