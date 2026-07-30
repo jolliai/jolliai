@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import type { ActiveConversationItem } from "../../../cli/src/core/ActiveSessionAggregator.js";
 import { sumConversationTokens } from "../../../cli/src/core/ConversationTokenTotals.js";
-import { assessContextRelevance, computeChangeFingerprint } from "../../../cli/src/core/ContextRelevance.js";
+import { assessContextRelevance, capDiffForRelevance, computeChangeFingerprint } from "../../../cli/src/core/ContextRelevance.js";
 import { type AiRelevanceEntry, readExclusions, writeAiSelection } from "../../../cli/src/core/CommitSelectionStore.js";
 import { getWorkingTreeDiffStats } from "../../../cli/src/core/GitOps.js";
 import {
@@ -18,6 +18,9 @@ import type { SerializedTreeItem } from "./SidebarMessages.js";
 interface Bridge {
 	generateCommitMessageForFiles(relativePaths: ReadonlyArray<string>): Promise<string>;
 	getCurrentBranch(): Promise<string>;
+	/** Working-tree diff (staged + unstaged + untracked) for the selected paths —
+	 *  fed to the relevance ranker so the panel's cached decision is diff-informed. */
+	diffForSelection(relativePaths: ReadonlyArray<string>): Promise<string>;
 }
 
 interface SidebarBroadcastHost {
@@ -431,7 +434,10 @@ export class NextMemoryPreviewPanel {
 				notes: notes.filter((n) => !exclusions.notes.has(n.id)),
 				references: refs.filter((e) => !exclusions.references.has(`${e.source}:${e.nativeId}`)),
 			};
-			const changeSignal = { commitMessage: "", changedFiles, symbols: [] };
+			// The fingerprint is keyed only on changedFiles (see computeChangeFingerprint),
+			// so the diff is left empty here — it is fetched below, only on a cache MISS,
+			// and folded into the signal passed to the ranker.
+			const changeSignal = { commitMessage: "", changedFiles, symbols: [], diff: "" };
 			const fingerprint = computeChangeFingerprint(changeSignal);
 			// Cache key = file fingerprint + candidate item set. Reopening the panel or
 			// switching editor tabs re-invokes this; when both are unchanged, reuse the
@@ -459,10 +465,22 @@ export class NextMemoryPreviewPanel {
 			// A newer refresh started while we read the registry — let it own the
 			// ranking; don't fire a redundant LLM call or post a stale overlay.
 			if (isStale()) return;
+			// Fetch the working-tree diff ONLY now (cache missed), so cache hits above
+			// never pay for it. Best-effort: a diff failure just yields a diff-less
+			// signal (the ranker still has files + symbols). Re-check staleness after
+			// this extra async hop before firing the LLM call.
+			let diffForRanker = "";
+			try {
+				diffForRanker = capDiffForRelevance(await bridge.diffForSelection(changedFiles));
+			} catch {
+				// diff is best-effort; fall through with an empty diff.
+			}
+			if (isStale()) return;
 			void webview.postMessage({ type: "context:analyzing", analyzing: true });
-			const decision = await assessContextRelevance(raw, changeSignal, config);
-			// Superseded during the (up-to-45s) LLM call → discard, so this stale file
-			// set's ranking can't clobber the newer result's cache/overlay/fingerprint.
+			const decision = await assessContextRelevance(raw, { ...changeSignal, diff: diffForRanker }, config);
+			// Superseded during the (multi-second, provider-dependent) LLM call → discard,
+			// so this stale file set's ranking can't clobber the newer result's
+			// cache/overlay/fingerprint.
 			if (isStale()) return;
 			// Persist EVERY item's full verdict (tier + reason + the AI's exclude
 			// decision) as ONE list: the post-commit worker's fingerprint-reuse path

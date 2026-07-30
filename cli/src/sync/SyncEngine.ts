@@ -714,7 +714,7 @@ export class SyncEngine {
 		// Refresh `vault-write.lock`'s mtime while `fn` runs. The lock can be
 		// held across `ConflictResolver.resolveAll`, which may invoke N Tier 2
 		// AI merges (~30 s each) and/or open-ended Tier 3 user prompts. If the
-		// total exceeds `LOCK_TIMEOUT_MS` (5 min), a peer `acquireWithPoll`
+		// total exceeds `LOCK_HEARTBEAT_TIMEOUT_MS` (5 min), a peer `acquireWithPoll`
 		// would mtime-reclaim the lock and a concurrent QueueWorker write could
 		// land in the paused-rebase window — exactly the R9 race this lock was
 		// added to close. The 60 s interval matches the `sync.lock` refresher

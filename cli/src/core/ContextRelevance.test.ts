@@ -16,13 +16,18 @@ import {
 	buildChangeSignal,
 	buildDecisionFromAiRelevance,
 	buildItemsBlock,
+	type ChangeSignal,
 	type ContextItem,
+	capDiffForRelevance,
 	computeChangeFingerprint,
 	extractCandidateRepr,
 	extractSymbols,
 	keptContextRelevanceRefs,
 	parseRankContextResponse,
+	RELEVANCE_DIFF_BUDGET,
 	rankContextRelevance,
+	rankTimeoutForProvider,
+	sortByChangeAffinity,
 	stripFrontmatter,
 } from "./ContextRelevance.js";
 import { execGit, getDiffContent } from "./GitOps.js";
@@ -138,13 +143,30 @@ describe("buildItemsBlock", () => {
 
 describe("buildChangeBlock", () => {
 	it("renders message, files, and symbols", () => {
-		const block = buildChangeBlock({ commitMessage: "Fix X", changedFiles: ["a/b.ts"], symbols: ["doThing"] });
+		const block = buildChangeBlock({
+			commitMessage: "Fix X",
+			changedFiles: ["a/b.ts"],
+			symbols: ["doThing"],
+			diff: "",
+		});
 		expect(block).toContain("Commit message: Fix X");
 		expect(block).toContain("a/b.ts");
 		expect(block).toContain("doThing");
 	});
 	it("handles empty message/files/symbols", () => {
-		expect(buildChangeBlock({ commitMessage: "", changedFiles: [], symbols: [] })).toBe("Commit message: (none)");
+		expect(buildChangeBlock({ commitMessage: "", changedFiles: [], symbols: [], diff: "" })).toBe(
+			"Commit message: (none)",
+		);
+	});
+	it("renders the diff body when present", () => {
+		const block = buildChangeBlock({
+			commitMessage: "m",
+			changedFiles: [],
+			symbols: [],
+			diff: "+const answer = 42;",
+		});
+		expect(block).toContain("Diff (may be truncated):");
+		expect(block).toContain("+const answer = 42;");
 	});
 });
 
@@ -190,7 +212,7 @@ describe("parseRankContextResponse", () => {
 describe("rankContextRelevance", () => {
 	it("returns [] for no items", async () => {
 		expect(
-			await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, [], { config }),
+			await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [], diff: "" }, [], { config }),
 		).toEqual([]);
 	});
 
@@ -210,7 +232,7 @@ describe("rankContextRelevance", () => {
 			),
 		);
 		const items = [item("plan", "p1", "Low", "aa"), item("note", "n1", "High", "bb")];
-		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [], diff: "" }, items, {
 			config,
 		});
 		expect(res[0]).toMatchObject({ id: "n1", rank: 1, tier: "high", relevant: true });
@@ -220,7 +242,7 @@ describe("rankContextRelevance", () => {
 	it("conservatively keeps items the LLM omitted", async () => {
 		mockCallLlm.mockResolvedValue(llmText(["===ITEM===", "index: 1", "tier: high", "reason: x"].join("\n")));
 		const items = [item("plan", "p1", "Has", "aa"), item("note", "n1", "Omitted", "bb")];
-		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [], diff: "" }, items, {
 			config,
 		});
 		const omitted = res.find((r) => r.id === "n1");
@@ -231,7 +253,7 @@ describe("rankContextRelevance", () => {
 	it("fails open (keeps all) when the LLM call throws", async () => {
 		mockCallLlm.mockRejectedValue(new Error("boom"));
 		const items = [item("plan", "p1", "A", "aa"), item("note", "n1", "B", "bb")];
-		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [], diff: "" }, items, {
 			config,
 		});
 		expect(res).toHaveLength(2);
@@ -242,18 +264,65 @@ describe("rankContextRelevance", () => {
 		expect(res.map((r) => r.id)).toEqual(["p1", "n1"]);
 	});
 
-	it("skips the LLM entirely under local-agent (keeps all, no spawn)", async () => {
-		mockCallLlm.mockRejectedValue(new Error("should not be called"));
+	it("ranks under local-agent too, using the longer local-agent wall-clock", async () => {
+		mockCallLlm.mockResolvedValue(llmText(["===ITEM===", "index: 1", "tier: low", "reason: unrelated"].join("\n")));
 		const localAgentConfig = { aiProvider: "local-agent" } as LlmConfig;
 		const items = [item("plan", "p1", "A", "aa"), item("note", "n1", "B", "bb")];
-		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [], diff: "" }, items, {
 			config: localAgentConfig,
 		});
-		// A cold multi-minute CLI agent can't finish inside RANK_TIMEOUT_MS; skip
-		// straight to the conservative keep-all without cold-spawning `claude`.
-		expect(mockCallLlm).not.toHaveBeenCalled();
-		expect(res).toHaveLength(2);
-		expect(res.every((r) => r.relevant && r.tier === "mid" && !r.autoExclude)).toBe(true);
+		// local-agent is no longer short-circuited — it ranks like every provider,
+		// only with a longer wall-clock (rankTimeoutForProvider) to absorb the
+		// cold-spawn without SIGKILLing a call that would have succeeded.
+		expect(mockCallLlm).toHaveBeenCalledTimes(1);
+		expect(mockCallLlm.mock.calls[0][0].timeoutMs).toBe(180_000);
+		// The verdict is honored (item 1 low → excluded), not a blanket keep-all.
+		expect(res.find((r) => r.id === "p1")?.autoExclude).toBe(true);
+	});
+
+	it("uses the 120s API wall-clock for anthropic/jolli providers", async () => {
+		mockCallLlm.mockResolvedValue(llmText(["===ITEM===", "index: 1", "tier: high", "reason: r"].join("\n")));
+		const items = [item("plan", "p1", "A", "aa")];
+		await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [], diff: "" }, items, {
+			config: { aiProvider: "anthropic" } as LlmConfig,
+		});
+		expect(mockCallLlm.mock.calls[0][0].timeoutMs).toBe(120_000);
+	});
+
+	it("passes the change diff into the LLM prompt (end-to-end integration)", async () => {
+		mockCallLlm.mockResolvedValue(llmText(["===ITEM===", "index: 1", "tier: high", "reason: r"].join("\n")));
+		await rankContextRelevance(
+			{ commitMessage: "m", changedFiles: [], symbols: [], diff: "+const sentinel = 42;" },
+			[item("plan", "p1", "A", "aa")],
+			{ config },
+		);
+		// The diff must actually reach callLlm's prompt, not just be renderable in isolation.
+		expect(mockCallLlm.mock.calls[0][0].params.changeSignal).toContain("+const sentinel = 42;");
+		// And the raised output budget is wired through.
+		expect(mockCallLlm.mock.calls[0][0].maxTokens).toBe(8192);
+	});
+
+	it("judges the low-affinity item and keeps the dropped high-affinity item as mid (ascending + merge-back)", async () => {
+		// Ascending sort sends the LOW-affinity (likely-unrelated) item to the LLM so it
+		// can be excluded; the HIGH-affinity item overflows totalBudget:1 and is dropped →
+		// kept "mid". The dropped item is at original index 0, so a buggy `?? i+1` fallback
+		// would graft the judged item's block-index-1 verdict onto it — this guards both the
+		// ascending direction AND the affinity-reorder merge-back fix.
+		mockCallLlm.mockResolvedValue(llmText(["===ITEM===", "index: 1", "tier: low", "reason: unrelated"].join("\n")));
+		const items = [
+			item("plan", "highAff", "Auth service", "touches AuthService in cli/src/core"), // original index 0
+			item("plan", "lowAff", "Marketing", "nothing to do with the change"), // original index 1
+		];
+		const res = await rankContextRelevance(
+			{ commitMessage: "m", changedFiles: ["cli/src/core/AuthService.ts"], symbols: ["AuthService"], diff: "" },
+			items,
+			{ config, totalBudget: 1 },
+		);
+		// The low-affinity item was SENT to the LLM → judged low → excluded.
+		expect(res.find((r) => r.id === "lowAff")?.autoExclude).toBe(true);
+		// The high-affinity item overflowed → dropped → kept "mid", NOT grafted the low verdict.
+		expect(res.find((r) => r.id === "highAff")?.tier).toBe("mid");
+		expect(res.find((r) => r.id === "highAff")?.autoExclude).toBe(false);
 	});
 });
 
@@ -265,6 +334,8 @@ describe("buildChangeSignal", () => {
 		expect(sig.changedFiles).toEqual(["cli/src/a.ts", "cli/src/b.ts"]);
 		expect(sig.symbols).toContain("newFn");
 		expect(sig.commitMessage).toBe("Fix a");
+		// The diff body is now retained (not just mined for symbols then discarded).
+		expect(sig.diff).toContain("newFn");
 	});
 	it("leaves fields empty when git fails", async () => {
 		mockExecGit.mockResolvedValue({ stdout: "", stderr: "bad", exitCode: 1 });
@@ -272,6 +343,89 @@ describe("buildChangeSignal", () => {
 		const sig = await buildChangeSignal("m", "a", "b", "/repo");
 		expect(sig.changedFiles).toEqual([]);
 		expect(sig.symbols).toEqual([]);
+		expect(sig.diff).toBe("");
+	});
+	it("caps an oversized diff to the relevance budget with a truncation marker", async () => {
+		mockExecGit.mockResolvedValue({ stdout: "cli/src/a.ts", stderr: "", exitCode: 0 });
+		mockGetDiff.mockResolvedValue("+".repeat(RELEVANCE_DIFF_BUDGET + 5_000));
+		const sig = await buildChangeSignal("m", "a", "b", "/repo");
+		expect(sig.diff.length).toBeLessThan(RELEVANCE_DIFF_BUDGET + 200);
+		expect(sig.diff).toContain("diff truncated");
+	});
+});
+
+describe("capDiffForRelevance", () => {
+	it("returns a small diff unchanged", () => {
+		expect(capDiffForRelevance("small diff")).toBe("small diff");
+	});
+	it("truncates to the head + a marker when over budget", () => {
+		const out = capDiffForRelevance("x".repeat(RELEVANCE_DIFF_BUDGET + 100));
+		expect(out.startsWith("x".repeat(RELEVANCE_DIFF_BUDGET))).toBe(true);
+		expect(out).toContain("diff truncated");
+	});
+});
+
+describe("rankTimeoutForProvider", () => {
+	it("uses 180s for local-agent and 120s otherwise", () => {
+		expect(rankTimeoutForProvider("local-agent")).toBe(180_000);
+		expect(rankTimeoutForProvider("anthropic")).toBe(120_000);
+		expect(rankTimeoutForProvider("jolli")).toBe(120_000);
+		expect(rankTimeoutForProvider(undefined)).toBe(120_000);
+	});
+});
+
+describe("sortByChangeAffinity", () => {
+	const change = (files: string[], symbols: string[] = []): ChangeSignal => ({
+		commitMessage: "",
+		changedFiles: files,
+		symbols,
+		diff: "",
+	});
+	it("orders least-affinity (likely-unrelated) FIRST so the budget judges the excludable ones", () => {
+		// Ascending: the low-affinity item survives the budget and gets judged (can be
+		// excluded); the high-affinity item is the drop-on-overflow tail (kept unranked,
+		// which is correct — it is the likely-relevant set).
+		const items = [
+			item("plan", "unrelated", "Marketing plan", "nothing to do with the change"),
+			item("plan", "related", "Auth refactor", "touches AuthService in cli/src/core"),
+		];
+		const sorted = sortByChangeAffinity(items, change(["cli/src/core/AuthService.ts"], ["AuthService"]));
+		expect(sorted.map((s) => s.id)).toEqual(["unrelated", "related"]);
+	});
+	it("is stable (keeps original order) when nothing matches", () => {
+		const items = [item("plan", "a", "A", "x"), item("plan", "b", "B", "y")];
+		const sorted = sortByChangeAffinity(items, change(["zzz/nope.ts"]));
+		expect(sorted.map((s) => s.id)).toEqual(["a", "b"]);
+	});
+	it("returns a copy without mutating the input", () => {
+		const items = [item("plan", "a", "A", "x")];
+		const sorted = sortByChangeAffinity(items, change([]));
+		expect(sorted).not.toBe(items);
+		expect(sorted.map((s) => s.id)).toEqual(["a"]);
+	});
+	it("short-circuits a single-item list even when the change has needles", () => {
+		const items = [item("plan", "a", "A", "x")];
+		const sorted = sortByChangeAffinity(items, change(["cli/src/core/Thing.ts"], ["Thing"]));
+		expect(sorted.map((s) => s.id)).toEqual(["a"]);
+		expect(sorted).not.toBe(items);
+	});
+	it("uses the basename (not generic dir segments) as the needle", () => {
+		// If dir segments were needles, "dirs" (mentions core/src) would outscore "file"
+		// and sort last. With only the basename "Makefile" as a needle, "file" scores 1
+		// and "dirs" scores 0 → ascending puts "dirs" first. Also covers the `dot > 0`
+		// false branch (Makefile has no extension → no without-ext needle).
+		const items = [
+			item("plan", "dirs", "X", "all about core and src layout"),
+			item("plan", "file", "Y", "edits the Makefile"),
+		];
+		const sorted = sortByChangeAffinity(items, change(["core/src/Makefile"]));
+		expect(sorted.map((s) => s.id)).toEqual(["dirs", "file"]);
+	});
+	it("adds the basename without extension but drops a <3-char stem", () => {
+		// "src/ab.ts": basename "ab.ts" is a needle; its stem "ab" is <3 chars → dropped.
+		const items = [item("plan", "stem", "F", "mentions ab"), item("plan", "full", "G", "mentions ab.ts")];
+		const sorted = sortByChangeAffinity(items, change(["src/ab.ts"]));
+		expect(sorted.map((s) => s.id)).toEqual(["stem", "full"]);
 	});
 });
 
@@ -300,7 +454,7 @@ describe("review-fix regressions", () => {
 			item("note", "n1", "B", "y"),
 			item("reference", "linear:R", "C", "z"),
 		];
-		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [], diff: "" }, items, {
 			config,
 		});
 		// Ordered by tier (high → mid → low), not input order.
@@ -339,7 +493,7 @@ describe("review-fix regressions", () => {
 			item("note", "n1", "B", "y"),
 			item("reference", "linear:R", "C", "z"),
 		];
-		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [] }, items, {
+		const res = await rankContextRelevance({ commitMessage: "m", changedFiles: [], symbols: [], diff: "" }, items, {
 			config,
 		});
 		expect(res.map((r) => r.tier)).toEqual(["low", "low", "low"]);
@@ -405,7 +559,7 @@ describe("assessContextRelevance", () => {
 		mockCallLlm.mockResolvedValue(rankTwo());
 		const decision = await assessContextRelevance(
 			twoPlans(),
-			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] },
+			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [], diff: "" },
 			config,
 		);
 		expect(decision.plans.map((p) => p.slug)).toEqual(["p1"]);
@@ -419,7 +573,7 @@ describe("assessContextRelevance", () => {
 		mockCallLlm.mockResolvedValue(llmText(["===ITEM===", "index: 1", "tier: high", "reason: x"].join("\n")));
 		const decision = await assessContextRelevance(
 			{ plans: [planEntry("p1", "P1")], notes: [], references: [] },
-			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] },
+			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [], diff: "" },
 			config,
 		);
 		expect(decision.plans).toHaveLength(1);
@@ -428,7 +582,7 @@ describe("assessContextRelevance", () => {
 	it("returns raw entries and empty results when there are no items", async () => {
 		const decision = await assessContextRelevance(
 			{ plans: [], notes: [], references: [] },
-			{ commitMessage: "m", changedFiles: [], symbols: [] },
+			{ commitMessage: "m", changedFiles: [], symbols: [], diff: "" },
 			config,
 		);
 		expect(decision.results).toEqual([]);
@@ -462,7 +616,7 @@ describe("assessContextRelevance", () => {
 		const ref = { source: "linear", nativeId: "X-1", title: "Ref", sourcePath: "/x/r.md" } as never;
 		const decision = await assessContextRelevance(
 			{ plans: [], notes: [note], references: [ref] },
-			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] },
+			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [], diff: "" },
 			config,
 		);
 		expect(decision.notes).toEqual([note]);
@@ -483,7 +637,7 @@ describe("assessContextRelevance", () => {
 		} as never;
 		const decision = await assessContextRelevance(
 			{ plans: [planEntry("p1", "P1")], notes: [note], references: [] },
-			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] },
+			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [], diff: "" },
 			config,
 		);
 		expect(decision.notes).toEqual([]);
@@ -497,7 +651,7 @@ describe("assessContextRelevance", () => {
 		const ref = { source: "linear", nativeId: "X-1", title: "Ref", sourcePath: "/x/r.md" } as never;
 		const decision = await assessContextRelevance(
 			{ plans: [planEntry("p1", "P1")], notes: [], references: [ref] },
-			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] },
+			{ commitMessage: "m", changedFiles: ["a.ts"], symbols: [], diff: "" },
 			config,
 		);
 		expect(decision.references).toEqual([]);
@@ -510,19 +664,19 @@ describe("assessContextRelevance", () => {
 
 describe("computeChangeFingerprint", () => {
 	it("is stable regardless of changed-file order", () => {
-		expect(computeChangeFingerprint({ commitMessage: "m", changedFiles: ["a.ts", "b.ts"], symbols: [] })).toBe(
-			computeChangeFingerprint({ commitMessage: "m", changedFiles: ["b.ts", "a.ts"], symbols: [] }),
-		);
+		expect(
+			computeChangeFingerprint({ commitMessage: "m", changedFiles: ["a.ts", "b.ts"], symbols: [], diff: "" }),
+		).toBe(computeChangeFingerprint({ commitMessage: "m", changedFiles: ["b.ts", "a.ts"], symbols: [], diff: "" }));
 	});
 	it("ignores the commit message (panel has none pre-commit) and keys only on files", () => {
 		// Same files, different message → same fingerprint (so panel↔worker match).
-		expect(computeChangeFingerprint({ commitMessage: "m1", changedFiles: ["a.ts"], symbols: [] })).toBe(
-			computeChangeFingerprint({ commitMessage: "m2", changedFiles: ["a.ts"], symbols: [] }),
+		expect(computeChangeFingerprint({ commitMessage: "m1", changedFiles: ["a.ts"], symbols: [], diff: "" })).toBe(
+			computeChangeFingerprint({ commitMessage: "m2", changedFiles: ["a.ts"], symbols: [], diff: "" }),
 		);
 		// Different files → different fingerprint.
-		expect(computeChangeFingerprint({ commitMessage: "m", changedFiles: ["a.ts"], symbols: [] })).not.toBe(
-			computeChangeFingerprint({ commitMessage: "m", changedFiles: ["b.ts"], symbols: [] }),
-		);
+		expect(
+			computeChangeFingerprint({ commitMessage: "m", changedFiles: ["a.ts"], symbols: [], diff: "" }),
+		).not.toBe(computeChangeFingerprint({ commitMessage: "m", changedFiles: ["b.ts"], symbols: [], diff: "" }));
 	});
 });
 

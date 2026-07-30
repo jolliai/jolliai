@@ -20,6 +20,8 @@
 
 import { type Command, Option } from "commander";
 import { buildPrDescription } from "../core/PrDescription.js";
+import { createStorage } from "../core/StorageFactory.js";
+import { setActiveStorage } from "../core/SummaryStore.js";
 import { setLogDir } from "../Logger.js";
 import { readStdin, resolveProjectDir, SAFE_ARGUMENT_PATTERN } from "./CliUtils.js";
 
@@ -77,6 +79,15 @@ export function registerPrDescriptionCommand(program: Command): void {
 			try {
 				const projectDir = options.cwd;
 				setLogDir(projectDir);
+				// Establish the configured storage backend before any read — same as
+				// the MCP `get_pr_description` tool (McpServer.startMcpServer) and the
+				// recall/search commands. buildPrDescription → loadBranchSummaries reads
+				// through getSummary without threading `storage`, so without this it
+				// falls through resolveStorage to the orphan branch and logs the
+				// "resolveStorage fallback to OrphanBranchStorage" WARN. Reads still
+				// resolve from the orphan branch, but folder-mode users otherwise see
+				// the spurious warning on every CLI pr-description run.
+				setActiveStorage(await createStorage(projectDir, projectDir));
 
 				// --arg-stdin and --base name the same value via two channels; mixing
 				// them would silently favor one and undermine the here-doc contract

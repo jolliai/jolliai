@@ -775,7 +775,7 @@ describe("SyncEngine.runRound — onRoundComplete (P2 #1 chain-spawn hook)", () 
 describe("SyncEngine.runRound — vault-write.lock refresh during long pullRebase", () => {
 	it("refreshes `vault-write.lock` mtime while `withPullLock` holds it across a long resolver", async () => {
 		// Regression guard: a Tier-2-heavy or Tier-3-prompt conflict round
-		// can exceed `LOCK_TIMEOUT_MS` (5 min). Without an in-flight refresh
+		// can exceed `LOCK_HEARTBEAT_TIMEOUT_MS` (5 min). Without an in-flight refresh
 		// the lock's mtime falls behind and a peer `acquireWithPoll` would
 		// reclaim it — reopening R9. The refresher inside `withPullLock`
 		// must drive `lock.refresh()` on the configured interval so the

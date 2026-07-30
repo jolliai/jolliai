@@ -24,13 +24,13 @@ import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
- * Lock timeout matches `LOCK_TIMEOUT_MS` in cli/src/core/Locks.ts (5 minutes).
+ * Lock timeout matches `LOCK_HEARTBEAT_TIMEOUT_MS` in cli/src/core/Locks.ts (5 minutes).
  * Doubles as the freshness window for the cosmetic `ingest-phase` file: the
  * worker heartbeats both `ingest.lock` and the `ingest-phase` file every 60 s
  * (WORKER_LOCK_REFRESH_INTERVAL_MS in QueueWorker), so the same 5× margin
  * applies to all three files.
  */
-const LOCK_TIMEOUT_MS = 5 * 60 * 1000;
+const LOCK_HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
 
 function jolliMemoryFile(cwd: string, name: string): string {
 	return join(cwd, ".jolli", "jollimemory", name);
@@ -39,7 +39,7 @@ function jolliMemoryFile(cwd: string, name: string): string {
 async function isFileFresh(path: string): Promise<boolean> {
 	try {
 		const st = await stat(path);
-		return Date.now() - st.mtimeMs < LOCK_TIMEOUT_MS;
+		return Date.now() - st.mtimeMs < LOCK_HEARTBEAT_TIMEOUT_MS;
 	} catch {
 		return false;
 	}

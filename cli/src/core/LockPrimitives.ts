@@ -7,7 +7,7 @@
  *
  *   - PID written into the file as ASCII
  *   - mtime is the freshness signal
- *   - locks older than `LOCK_TIMEOUT_MS` are reclaimable by the next acquirer
+ *   - locks older than `LOCK_HEARTBEAT_TIMEOUT_MS` are reclaimable by the next acquirer
  *   - releases are PID-checked to prevent the stale-reclaim race where
  *     process A's finally block deletes process B's freshly-acquired lock
  *
@@ -29,14 +29,24 @@ import { createLogger } from "../Logger.js";
 const log = createLogger("LockPrimitives");
 
 /**
- * Stale-reclaim threshold for all jollimemory file locks.
+ * Heartbeat-lapse threshold for all jollimemory file locks: a lock whose mtime
+ * (its heartbeat) has not been bumped within this window is treated as owned by a
+ * dead process and is reclaimable by the next acquirer.
+ *
+ * This is NOT a cap on how long a lock may be held. A live holder bumps its mtime
+ * on an independent timer (the worker: every 60 s, via a setInterval that fires
+ * during the awaited LLM call), so a legitimately long operation — a multi-minute
+ * summary or relevance turn — keeps the lock indefinitely without ever tripping
+ * this threshold. It fires only on an actual death (crash, kill, machine sleep),
+ * where recovery latency is bounded by this value. Hence the name: it is a
+ * heartbeat timeout, not a lock-duration timeout.
  *
  * Invariant: must be greater than 2 × the longest heartbeat interval of any
  * caller. Today the worker bumps mtime every 60 s while running, so 5 min
  * leaves ample margin for a missed GC tick or slow scheduler. Sync rounds
  * are shorter (no LLM by default), but follow the same convention.
  */
-export const LOCK_TIMEOUT_MS = 5 * 60 * 1000;
+export const LOCK_HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** Optional knobs for `acquireWithPoll`. */
 export interface PollOpts {
@@ -87,7 +97,7 @@ export function isPidAlive(pidStr: string): boolean {
  * filesystem error blocked us.
  *
  * Stale locks are removed automatically — "stale" means either:
- *   1. `mtime` older than `LOCK_TIMEOUT_MS` (heartbeat lapsed → process
+ *   1. `mtime` older than `LOCK_HEARTBEAT_TIMEOUT_MS` (heartbeat lapsed → process
  *      probably hung), OR
  *   2. the written PID is no longer alive (`isPidAlive` returns false →
  *      owner crashed without running the release path; mtime check would
@@ -103,7 +113,7 @@ export async function tryAcquireOnce(lockPath: string): Promise<boolean> {
 		const age = Date.now() - lockStat.mtimeMs;
 		const ownerPid = await readLockOwnerPid(lockPath);
 		const ownerDead = ownerPid !== null && !isPidAlive(ownerPid);
-		if (!ownerDead && age < LOCK_TIMEOUT_MS) {
+		if (!ownerDead && age < LOCK_HEARTBEAT_TIMEOUT_MS) {
 			return false;
 		}
 		if (ownerDead) {
@@ -212,14 +222,14 @@ export async function refreshLockMtime(lockPath: string): Promise<void> {
 }
 
 /**
- * Returns true when `lockPath` exists and is younger than `LOCK_TIMEOUT_MS`.
+ * Returns true when `lockPath` exists and is younger than `LOCK_HEARTBEAT_TIMEOUT_MS`.
  * Used by callers that need to detect "is anyone currently running?" without
  * trying to acquire.
  */
 export async function isLockHeld(lockPath: string): Promise<boolean> {
 	try {
 		const lockStat = await stat(lockPath);
-		return Date.now() - lockStat.mtimeMs < LOCK_TIMEOUT_MS;
+		return Date.now() - lockStat.mtimeMs < LOCK_HEARTBEAT_TIMEOUT_MS;
 		/* v8 ignore next 3 -- ENOENT: lock doesn't exist, return false */
 	} catch {
 		return false;
@@ -227,14 +237,14 @@ export async function isLockHeld(lockPath: string): Promise<boolean> {
 }
 
 /**
- * Returns true when `lockPath` exists but is older than `LOCK_TIMEOUT_MS` —
+ * Returns true when `lockPath` exists but is older than `LOCK_HEARTBEAT_TIMEOUT_MS` —
  * a crashed holder left it behind and the next acquirer will reclaim it. Used
  * by `doctor` and similar diagnostics, not the acquire path.
  */
 export async function isLockStale(lockPath: string): Promise<boolean> {
 	try {
 		const lockStat = await stat(lockPath);
-		return Date.now() - lockStat.mtimeMs >= LOCK_TIMEOUT_MS;
+		return Date.now() - lockStat.mtimeMs >= LOCK_HEARTBEAT_TIMEOUT_MS;
 		/* v8 ignore next 3 -- ENOENT: lock doesn't exist, return false */
 	} catch {
 		return false;

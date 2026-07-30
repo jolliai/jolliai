@@ -48,10 +48,30 @@ const log = createLogger("ContextRelevance");
  *  prompts rather than overflow. */
 export const CHARS_PER_TOKEN = 3;
 
-/** Total character budget for the rendered <context-items> block. ~40K tokens
- *  at CHARS_PER_TOKEN. Items beyond the budget (after skeletonization) are
- *  dropped from the tail of the initial order and logged. */
-export const TOTAL_ITEMS_CHAR_BUDGET = 120_000;
+/** Total character budget for the rendered <context-items> block. ~53K tokens
+ *  at CHARS_PER_TOKEN. Items beyond the budget (after skeletonization) are dropped
+ *  from the tail and logged — and a dropped item is conservatively KEPT unranked
+ *  (see rankContextRelevance), so an overflow leaves items unjudged. Candidates are
+ *  pre-sorted by change-affinity ASCENDING before the budget is applied (see
+ *  sortByChangeAffinity), so the dropped tail is the HIGH-affinity (likely-relevant,
+ *  kept-anyway) set and the budget is spent judging the low-affinity candidates that
+ *  might warrant exclusion.
+ *
+ *  Note: for the arg-based local-agent backends (codex / cursor-agent / opencode)
+ *  the whole prompt is passed as a single argv string, which on Linux is capped at
+ *  ~128 KiB (MAX_ARG_STRLEN); items (up to this budget) + diff can exceed that and
+ *  the spawn fails with E2BIG → caught → keepAll (a safe fallback, identical to the
+ *  pre-ranking local-agent behavior). The robust fix (feed the prompt via stdin like
+ *  ClaudeCodeBackend, or a local-agent-specific smaller budget) is deferred. */
+export const TOTAL_ITEMS_CHAR_BUDGET = 160_000;
+
+/** Character budget for the diff body embedded in the <change> block. The diff
+ *  is the strongest relevance signal ("what did this change actually do"), but it
+ *  competes with TOTAL_ITEMS_CHAR_BUDGET for the model window and the wall-clock
+ *  budget, so it is capped to the head of the diff. Sized between the commit-
+ *  message diff budget (12K) and the summary's own diff cap (150K): enough to
+ *  characterize the change without dominating the prompt. */
+export const RELEVANCE_DIFF_BUDGET = 20_000;
 
 /** A reference whose (frontmatter-stripped) body is at/under this is sent
  *  whole; aligned with the summarize-stage per-reference cap so we never send
@@ -64,12 +84,33 @@ export const PLANNOTE_WHOLE_CHAR_CAP = 6_000;
 /** Hard cap on a single item's skeleton (~1.5K tokens). */
 export const SKELETON_CHAR_CAP = 4_500;
 
-/** Short per-call wall-clock so a wedged ranking call fails open fast without
- *  holding the post-commit queue lock. */
-export const RANK_TIMEOUT_MS = 45_000;
+/** Per-call wall-clock for API providers (anthropic / jolli). Bounds how long a
+ *  ranking call can hold the post-commit queue lock before it fails open. Raised
+ *  from the original 45s because the <change> block now carries a diff body
+ *  (bigger input → longer), and the ranker runs in the detached post-commit
+ *  worker (git has already returned), so it can afford the same order of budget
+ *  as the summary call that follows it. Still well under the worker-lock heartbeat
+ *  window (see LOCK_HEARTBEAT_TIMEOUT_MS), and the summary call's own cap. */
+export const RANK_TIMEOUT_MS = 120_000;
 
-/** Max output tokens for the ranking call — one short block per item. */
-const RANK_MAX_TOKENS = 4_096;
+/** Per-call wall-clock for the local-agent provider. A local CLI agent cold-spawns
+ *  a real `claude`/`codex` process, so a ranking (small prompt, single turn) is
+ *  expected to be tens of seconds — this ceiling only exists to absorb cold-spawn
+ *  variance without SIGKILLing a call that is about to succeed. It does NOT imply
+ *  ranking is minutes-long (that is the summary worst case). The worker heartbeats
+ *  the lock every 60s regardless, so a longer run never trips the stale-reclaim. */
+export const RANK_TIMEOUT_LOCAL_AGENT_MS = 180_000;
+
+/** Resolves the ranking wall-clock for the active provider. */
+export function rankTimeoutForProvider(aiProvider: LlmConfig["aiProvider"]): number {
+	return aiProvider === "local-agent" ? RANK_TIMEOUT_LOCAL_AGENT_MS : RANK_TIMEOUT_MS;
+}
+
+/** Max output tokens for the ranking call — one short block per item. Raised to
+ *  keep the response from truncating when many items are ranked in one call: a
+ *  truncated tail is omitted from the parse and then conservatively KEPT (mid),
+ *  which is the same silent-leak failure mode as an items-budget overflow. */
+const RANK_MAX_TOKENS = 8_192;
 
 // -- Types --------------------------------------------------------------------
 
@@ -91,6 +132,10 @@ export interface ChangeSignal {
 	readonly commitMessage: string;
 	readonly changedFiles: readonly string[];
 	readonly symbols: readonly string[];
+	/** Head of the change's diff (capped to RELEVANCE_DIFF_BUDGET). The strongest
+	 *  relevance signal — what the change actually did — beyond file names and
+	 *  declared symbols. May be empty when the diff is unavailable. */
+	readonly diff: string;
 }
 
 export type RelevanceTier = "high" | "mid" | "low";
@@ -243,6 +288,68 @@ export function extractCandidateRepr(item: ContextItem): string {
 
 // -- Prompt assembly ----------------------------------------------------------
 
+/** How many chars of an item's body to scan when scoring change-affinity. Bounds
+ *  the sort's cost for large items; the head of a doc carries its topic. */
+const AFFINITY_SCAN_CAP = 8_000;
+
+/** Lowercased, deduped tokens that characterize the change: each changed file's
+ *  basename (with and without extension) plus declared symbols. Intermediate path
+ *  directories are DELIBERATELY excluded — in a monorepo, generic segments like
+ *  `cli` / `src` / `core` / `hooks` match almost any document and would dominate
+ *  the affinity score with noise (affinityScore is substring-based). Tokens shorter
+ *  than 3 chars are dropped (too generic to signal). */
+function changeNeedles(change: ChangeSignal): string[] {
+	const out = new Set<string>();
+	const add = (raw: string): void => {
+		const t = raw.trim().toLowerCase();
+		if (t.length >= 3) out.add(t);
+	};
+	for (const file of change.changedFiles) {
+		const segments = file.split("/").filter((s) => s.length > 0);
+		const base = segments[segments.length - 1];
+		if (base) {
+			add(base); // basename with extension
+			const dot = base.lastIndexOf(".");
+			if (dot > 0) add(base.slice(0, dot)); // basename without extension
+		}
+	}
+	for (const sym of change.symbols) add(sym);
+	return [...out];
+}
+
+/** Count of distinct change-needles that appear in an item's (title + bounded
+ *  body) text. Cheap, deterministic, best-effort — never throws. */
+function affinityScore(item: ContextItem, needles: readonly string[]): number {
+	const hay = `${item.title}\n${item.content.slice(0, AFFINITY_SCAN_CAP)}`.toLowerCase();
+	let score = 0;
+	for (const n of needles) if (hay.includes(n)) score += 1;
+	return score;
+}
+
+/**
+ * Orders candidates by change-affinity ASCENDING (least-affinity first) before the
+ * items-budget is applied. This is deliberately the *opposite* of "most important
+ * first", because the ranker is fail-open-KEEP: a candidate dropped by the budget
+ * is conservatively KEPT unranked, so ONLY the candidates that actually reach the
+ * LLM can be excluded. The scarce prompt budget must therefore be spent on the
+ * candidates most likely to warrant exclusion — the LOW-affinity ones (little
+ * overlap with the change ⇒ likely unrelated). High-affinity candidates that
+ * overflow the budget are dropped and kept unranked, which is correct: they are the
+ * likely-relevant set and would have been kept anyway (the only cost is losing their
+ * displayed tier/reason). Sorting the other way would drop the likely-unrelated tail
+ * and keep it unjudged — the exact silent leak this filter exists to prevent.
+ *
+ * Stable: ties keep original order (so no signal ⇒ order unchanged); returns a copy
+ * (never mutates the input).
+ */
+export function sortByChangeAffinity(items: readonly ContextItem[], change: ChangeSignal): ContextItem[] {
+	const needles = changeNeedles(change);
+	if (needles.length === 0 || items.length < 2) return [...items];
+	const scored = items.map((item, i) => ({ item, i, score: affinityScore(item, needles) }));
+	scored.sort((a, b) => a.score - b.score || a.i - b.i);
+	return scored.map((s) => s.item);
+}
+
 /** Renders the <context-items> block and the index→id map. Enforces a total
  *  char budget by dropping items from the tail of the initial order (logged),
  *  so an oversized candidate set never overflows the prompt. */
@@ -278,6 +385,15 @@ export function buildItemsBlock(
 }
 
 /** Renders the <change> block from a ChangeSignal. */
+/** Caps a raw diff to the head of RELEVANCE_DIFF_BUDGET chars (+ a truncation
+ *  marker). Shared by `buildChangeSignal` (post-commit worker) and the pre-commit
+ *  preview panel so both feed the ranker an identically-shaped diff signal. */
+export function capDiffForRelevance(diff: string): string {
+	return diff.length > RELEVANCE_DIFF_BUDGET
+		? `${diff.slice(0, RELEVANCE_DIFF_BUDGET)}\n--- diff truncated (${diff.length} chars total) ---`
+		: diff;
+}
+
 export function buildChangeBlock(change: ChangeSignal): string {
 	const lines: string[] = [`Commit message: ${change.commitMessage || "(none)"}`];
 	if (change.changedFiles.length > 0) {
@@ -285,6 +401,9 @@ export function buildChangeBlock(change: ChangeSignal): string {
 	}
 	if (change.symbols.length > 0) {
 		lines.push(`Key symbols: ${change.symbols.join(", ")}`);
+	}
+	if (change.diff.length > 0) {
+		lines.push(`Diff (may be truncated):\n${change.diff}`);
 	}
 	return lines.join("\n");
 }
@@ -397,25 +516,26 @@ export async function rankContextRelevance(
 ): Promise<ContextRelevanceResult[]> {
 	if (items.length === 0) return [];
 
-	// The ranker is a latency-sensitive, fail-open optimization: its short
-	// RANK_TIMEOUT_MS exists so a wedged call never holds the post-commit queue
-	// lock. A local CLI agent runs a full multi-minute agentic turn, so under the
-	// local-agent provider this call could never finish inside that budget — it
-	// would cold-spawn `claude` only to be SIGKILLed on every commit. Skip
-	// straight to the conservative keep-all result (identical to the fail-open
-	// branch below) without spawning anything.
-	if (opts.config.aiProvider === "local-agent") {
-		log.info("Skipping context-relevance ranking under local-agent provider — keeping all items");
-		return keepAll(items);
-	}
-
+	// Relevance ranking runs for EVERY provider. It is the engine behind the
+	// pre-commit preview panel and the summary's excluded set, so it must not be
+	// provider-gated (a local-agent user opens the same panel and needs the same
+	// filtering). The RANK_TIMEOUT_MS ceiling exists so a wedged call cannot pin
+	// the post-commit queue lock indefinitely; the local-agent ceiling is longer
+	// (rankTimeoutForProvider) to absorb its cold-spawn without SIGKILLing a call
+	// that is about to succeed. On any failure this falls open to keepAll below.
 	try {
-		const { block, indexToId } = buildItemsBlock(items, opts.totalBudget ?? TOTAL_ITEMS_CHAR_BUDGET);
+		// Pre-sort by change-affinity ASCENDING so a budget/token overflow drops the
+		// HIGH-affinity (likely-relevant, kept-anyway) tail and spends the budget
+		// judging the low-affinity candidates that might warrant exclusion. Dropped
+		// items are conservatively kept unranked (fail-open), so only judged ones can
+		// be excluded — see sortByChangeAffinity for why this direction is correct.
+		const ordered = sortByChangeAffinity(items, change);
+		const { block, indexToId } = buildItemsBlock(ordered, opts.totalBudget ?? TOTAL_ITEMS_CHAR_BUDGET);
 		const llmResult = await callLlm({
 			action: "rank-context",
 			params: { changeSignal: buildChangeBlock(change), items: block },
 			maxTokens: RANK_MAX_TOKENS,
-			timeoutMs: opts.timeoutMs ?? RANK_TIMEOUT_MS,
+			timeoutMs: opts.timeoutMs ?? rankTimeoutForProvider(opts.config.aiProvider),
 			model: resolveModelId(opts.config.model),
 			...llmCredentials(opts.config),
 		});
@@ -426,12 +546,18 @@ export async function rankContextRelevance(
 		const byIndex = new Map<number, ParsedItem>();
 		for (const p of parsed) byIndex.set(p.index, p);
 
-		const merged = items.map((item, i) => {
-			// index in the block is 1-based and matches insertion order up to any
-			// dropped tail; find this item's block index via indexToId.
-			const blockIndex = findIndexForId(indexToId, item.id) ?? i + 1;
-			const p = byIndex.get(blockIndex);
-			// Omitted item → conservative "mid" keep (never a false high, never excluded).
+		const merged = items.map((item) => {
+			// Look up this item's verdict by its block index. Candidates are affinity-
+			// sorted before buildItemsBlock, so block order != original order, and a
+			// budget overflow drops the block's TAIL. An item absent from indexToId was
+			// therefore DROPPED — it must be conservatively kept as "mid". Never fall
+			// back to a guessed block index from the original position: after the
+			// reorder that would graft a DIFFERENT item's verdict onto the dropped one,
+			// silently excluding context the model never judged.
+			const blockIndex = findIndexForId(indexToId, item.id);
+			const p = blockIndex !== undefined ? byIndex.get(blockIndex) : undefined;
+			// Dropped or LLM-omitted item → conservative "mid" keep (never a false
+			// high, never excluded).
 			const tier = p?.tier ?? "mid";
 			const reason = p?.reason ?? "";
 			return { item, tier, reason };
@@ -514,20 +640,41 @@ export async function buildChangeSignal(
 			.filter((l) => l.length > 0);
 	}
 	let symbols: readonly string[] = [];
+	let diff = "";
 	try {
-		const diff = await getDiffContent(fromRef, toRef, cwd, 60_000);
-		symbols = extractSymbols(diff);
+		// One diff read serves both signals: the full (capped) body feeds symbol
+		// extraction, and its head (RELEVANCE_DIFF_BUDGET) becomes the change's diff
+		// signal. Previously the body was extracted-from then discarded.
+		const fullDiff = await getDiffContent(fromRef, toRef, cwd, 60_000);
+		symbols = extractSymbols(fullDiff);
+		diff = capDiffForRelevance(fullDiff);
 	} catch {
-		// symbols are best-effort; leave empty on failure
+		// diff + symbols are best-effort; leave empty on failure
 	}
-	return { commitMessage, changedFiles, symbols };
+	return { commitMessage, changedFiles, symbols, diff };
 }
 
 /** Fingerprint of a change for panel↔worker reuse coordination. Keyed ONLY on the
  *  sorted changed-file set — deliberately NOT the commit message — so the pre-commit
  *  panel (which has no message yet) and the post-commit worker (which does) produce
  *  the SAME fingerprint for the same file set, letting the worker reuse the panel's
- *  ranking instead of re-running the LLM. Order-independent (sorted). */
+ *  ranking instead of re-running the LLM. Order-independent (sorted).
+ *
+ *  ACCEPTED LIMITATION (diff deliberately NOT in the key — rare, left unhandled):
+ *  the ranker now also consumes the change diff, but this fingerprint stays
+ *  file-set-only. So a stale-diff reuse is possible: the panel ranks file set F with
+ *  working-tree diff D1, then the user edits the SAME files (F unchanged) to add
+ *  content on a new topic and commits diff D2 WITHOUT the panel re-ranking, so the
+ *  worker reuses the D1-based decision against the D2 commit. The trigger is narrow —
+ *  it needs the interactive preview panel open, a prior rank, an in-place edit that
+ *  keeps the file set identical but changes the topic, and a commit before any
+ *  re-rank. It cannot happen on the CLI/MCP `pr-description`/`push` path (no panel →
+ *  the worker always ranks fresh against the real commit diff). We deliberately do NOT
+ *  handle it: folding the diff into the key would defeat reuse across the board,
+ *  because the panel diff (`git diff HEAD`) and the worker diff
+ *  (`git diff <commit>~1..<commit>`) are not guaranteed byte-identical for the same
+ *  content, so the keys would perpetually miss and every commit would pay a redundant
+ *  re-rank — too high a price for so rare a case. */
 export function computeChangeFingerprint(change: ChangeSignal): string {
 	const h = createHash("sha1");
 	h.update([...change.changedFiles].sort().join("\n"));

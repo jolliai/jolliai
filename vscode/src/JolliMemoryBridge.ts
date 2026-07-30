@@ -943,8 +943,13 @@ export class JolliMemoryBridge {
 	 * them, so the title preview must see their content. `git ls-files --others`
 	 * finds the untracked subset of the selection; each is diffed against
 	 * `/dev/null`. Entirely read-only — the index is never touched.
+	 *
+	 * Public because the Next Memory preview panel also feeds this working-tree
+	 * diff into the context-relevance ranker (the strongest relevance signal), so
+	 * the panel's cached ranking — which the post-commit worker reuses on a
+	 * fingerprint hit — is judged against the same diff the worker would use.
 	 */
-	private async diffForSelection(paths: Array<string>): Promise<string> {
+	async diffForSelection(paths: ReadonlyArray<string>): Promise<string> {
 		const [tracked, untrackedRaw] = await Promise.all([
 			tryExecGit(["-c", "core.quotepath=false", "diff", "HEAD", "--", ...paths], this.cwd),
 			tryExecGit(["-c", "core.quotepath=false", "ls-files", "--others", "--exclude-standard", "--", ...paths], this.cwd),

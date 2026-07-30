@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { LOCK_TIMEOUT_MS } from "../core/LockPrimitives.js";
+import { LOCK_HEARTBEAT_TIMEOUT_MS } from "../core/LockPrimitives.js";
 import { consumePendingWorkers, recordPendingWorker } from "./PendingWorkers.js";
 import { getVaultWriteLockPath } from "./VaultLockPath.js";
 import { acquireVaultWriteLock, isVaultWriteLockHeld, withVaultWriteLock } from "./VaultWriteLock.js";
@@ -289,12 +289,12 @@ describe("acquireVaultWriteLock", () => {
 			}
 		});
 
-		it("LOCK_TIMEOUT_MS (5 min) is what the mtime-refresh story assumes", () => {
+		it("LOCK_HEARTBEAT_TIMEOUT_MS (5 min) is what the mtime-refresh story assumes", () => {
 			// Not a behavioural test — just pins the constant so a future
 			// refactor of LockPrimitives that changes the threshold doesn't
 			// silently invalidate the refresh-interval choice in SyncEngine
 			// and QueueWorker (both bump every ~60s).
-			expect(LOCK_TIMEOUT_MS).toBe(5 * 60 * 1000);
+			expect(LOCK_HEARTBEAT_TIMEOUT_MS).toBe(5 * 60 * 1000);
 		});
 	});
 });

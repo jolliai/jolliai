@@ -100,7 +100,7 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 		message: branchExists ? "exists" : "not yet created (will be created on first commit)",
 	});
 
-	// 3. Worker lock (stuck = exists AND older than LOCK_TIMEOUT_MS; a normal worker
+	// 3. Worker lock (stuck = exists AND older than LOCK_HEARTBEAT_TIMEOUT_MS; a normal worker
 	// refreshes mtime every minute, so any age > 5 min implies a crashed worker).
 	// `orphan-write.lock` is held only for milliseconds and is not surfaced here —
 	// if a stale orphan-write lock ever appears, doctor's `--fix` would release it

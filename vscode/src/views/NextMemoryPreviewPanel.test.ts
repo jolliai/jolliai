@@ -41,6 +41,10 @@ const { assessMock, detectPlansMock, writeAiMock } = vi.hoisted(() => ({
 vi.mock("../../../cli/src/core/ContextRelevance.js", () => ({
 	assessContextRelevance: assessMock,
 	computeChangeFingerprint: () => "fp",
+	// Identity so a folded diff passes through unchanged in tests. Without this the
+	// panel's `import { capDiffForRelevance }` resolves to undefined and the whole
+	// diff-fold block silently runs in its catch (vacuous test).
+	capDiffForRelevance: (d: string) => d,
 }));
 vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadConfig: vi.fn().mockResolvedValue({}),
@@ -77,6 +81,9 @@ function makeBridge(overrides: Record<string, unknown> = {}) {
 	return {
 		generateCommitMessageForFiles: vi.fn().mockResolvedValue("feat: example"),
 		getCurrentBranch: vi.fn().mockResolvedValue("feature/demo"),
+		// Working-tree diff fed to the relevance ranker. Empty by default (so existing
+		// tests are unaffected); the diff-fold test overrides it with real content.
+		diffForSelection: vi.fn().mockResolvedValue(""),
 		...overrides,
 	};
 }
@@ -463,6 +470,26 @@ describe("NextMemoryPreviewPanel — context relevance overlay", () => {
 		expect(sidebar.pushContextRelevanceToSidebar).toHaveBeenCalledWith([
 			expect.objectContaining({ id: "p1", autoExclude: true }),
 		]);
+	});
+
+	it("folds the working-tree diff into the ranker signal on a cache miss", async () => {
+		postMessage.mockClear();
+		assessMock.mockClear(); // this suite has no per-test mock reset — clear so calls[0] is ours
+		detectPlansMock.mockResolvedValue([{ slug: "diffFoldPlan", title: "P" }]);
+		assessMock.mockResolvedValue({ plans: [], notes: [], references: [], excludedContext: [], results: [] });
+		const bridge = makeBridge({ diffForSelection: vi.fn().mockResolvedValue("+const sentinel = 1;") });
+		const sidebar = makeSidebarProvider({
+			getFilesSnapshot: vi.fn().mockReturnValue([{ id: "f1", description: "src/a.ts", isSelected: true }]),
+		});
+		await openAndReady(bridge, sidebar);
+		// Wait on the specific call we're testing (not the shared assessMock, which can
+		// be stale from a prior test).
+		await vi.waitFor(() => expect(bridge.diffForSelection).toHaveBeenCalled());
+		// The working-tree diff was fetched for exactly the selected paths...
+		expect(bridge.diffForSelection).toHaveBeenCalledWith(["src/a.ts"]);
+		// ...and folded into the changeSignal (2nd arg) handed to the ranker — without
+		// this the whole diff-informed ranking is dead in the panel path.
+		expect(assessMock.mock.calls[0][1]).toMatchObject({ diff: "+const sentinel = 1;" });
 	});
 
 	it("does not persist fabricated empty-reason verdicts (fail-open keepAll)", async () => {

@@ -162,7 +162,7 @@ export type VaultWriteLockMode = "fail-fast" | { readonly wait: number };
  * Returns a handle with `release()` / `refresh()` methods on success, or
  * `null` on miss (fail-fast) / timeout (wait-mode). The handle MUST be
  * released on every exit path — caller's `try/finally` is the load-bearing
- * cleanup hook. Failure to release leaks the lock for up to `LOCK_TIMEOUT_MS`
+ * cleanup hook. Failure to release leaks the lock for up to `LOCK_HEARTBEAT_TIMEOUT_MS`
  * (5 min) before the next acquirer reclaims it.
  *
  * The handle interface mirrors a Disposable / Resource pattern so callers
@@ -288,7 +288,7 @@ export async function withVaultWriteLock<T>(
 
 /**
  * Returns true when `vault-write.lock` exists and is younger than
- * `LOCK_TIMEOUT_MS`. Diagnostic-only — callers that want to act on the
+ * `LOCK_HEARTBEAT_TIMEOUT_MS`. Diagnostic-only — callers that want to act on the
  * outcome should `acquireVaultWriteLock` instead, since this read is
  * inherently racy (lock can be released between the check and any
  * follow-up action).

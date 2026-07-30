@@ -194,7 +194,7 @@ const RETRY_DELAY_MS = 2000;
 
 /**
  * How often to bump the worker.lock's mtime while the worker is running.
- * Comfortably below `LOCK_TIMEOUT_MS` (5 min) so even a missed tick keeps
+ * Comfortably below `LOCK_HEARTBEAT_TIMEOUT_MS` (5 min) so even a missed tick keeps
  * the lock alive against the stale-lock reclaimer.
  */
 const WORKER_LOCK_REFRESH_INTERVAL_MS = 60_000;
@@ -462,7 +462,7 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 
 	// Periodically bump vault-write.lock's mtime so a long-running LLM call
 	// (rare, but possible when an upstream is slow) cannot be reaped by the
-	// stale-lock reclaimer at LOCK_TIMEOUT_MS. Same refresh cadence as
+	// stale-lock reclaimer at LOCK_HEARTBEAT_TIMEOUT_MS. Same refresh cadence as
 	// worker.lock's timer further below.
 	/* v8 ignore start -- setInterval's lambda only fires on a real timer tick; unit tests finish in milliseconds and never observe the callback. */
 	const vaultRefreshTimer = setInterval(() => {

@@ -33,7 +33,7 @@
  * compare its PID against `process.pid` before removing. Without the check, a
  * stale-reclaim race could let process A delete process B's freshly-acquired
  * lock and re-open the concurrent-write window:
- *   1. A holds lock, lock becomes stale (≥ `LOCK_TIMEOUT_MS`)
+ *   1. A holds lock, lock becomes stale (≥ `LOCK_HEARTBEAT_TIMEOUT_MS`)
  *   2. B's `tryAcquireOnce` removes A's lock and writes its own PID
  *   3. A's finally block runs `releaseLock` — without the PID check, A would rm B's lock
  *   4. C now sees no lock and acquires concurrently with B → corrupt writes
@@ -51,7 +51,7 @@
  * boundary tick inside a 60 s refresh cycle — vanishingly unlikely.
  *
  * **Why PID, not a UUID token.** PID-reuse collision inside one lock lifetime
- * would require: OS restart within `LOCK_TIMEOUT_MS` AND the lock file
+ * would require: OS restart within `LOCK_HEARTBEAT_TIMEOUT_MS` AND the lock file
  * surviving the restart AND the new PID matching the dead holder's exact
  * value AND that recycled-PID process happening to acquire the same lock. We
  * accept this as an intentional simplification — a token file would close it
@@ -67,7 +67,7 @@ import * as Subprocess from "../util/Subprocess.js";
 import {
 	acquireWithPoll,
 	isLockStale,
-	LOCK_TIMEOUT_MS,
+	LOCK_HEARTBEAT_TIMEOUT_MS,
 	refreshLockMtime,
 	releaseIfOwned,
 	tryAcquireOnce,
@@ -75,7 +75,7 @@ import {
 
 // Re-export so existing callers (Locks.test.ts, QueueWorker.ts, etc.) that
 // imported it from this module keep compiling.
-export { LOCK_TIMEOUT_MS };
+export { LOCK_HEARTBEAT_TIMEOUT_MS };
 
 const log = createLogger("Locks");
 
@@ -97,7 +97,7 @@ export const WORKER_LOCK_FILE = "worker.lock";
  * generation: summary drain keeps `worker.lock`, ingest runs concurrently
  * under `ingest.lock`. Lives next to `worker.lock` at
  * `<cwd>/.jolli/jollimemory/ingest.lock`. Heartbeated the same way (an ingest
- * can outlast `LOCK_TIMEOUT_MS`, so its mtime must be bumped to avoid a
+ * can outlast `LOCK_HEARTBEAT_TIMEOUT_MS`, so its mtime must be bumped to avoid a
  * stale-reclaim by the next worker).
  */
 export const INGEST_LOCK_FILE = "ingest.lock";
@@ -269,7 +269,7 @@ export async function releaseWorkerLock(cwd?: string): Promise<void> {
 }
 
 /**
- * Returns true when `worker.lock` exists and is younger than `LOCK_TIMEOUT_MS`.
+ * Returns true when `worker.lock` exists and is younger than `LOCK_HEARTBEAT_TIMEOUT_MS`.
  * Used by PostRewriteHook and PostCommitHook to decide whether a worker is
  * already running. The check intentionally ignores `orphan-write.lock` so a
  * brief background writer (scanTreeHashAliases, getCatalogWithLazyBuild) does
@@ -280,14 +280,14 @@ export async function isWorkerLockHeld(cwd?: string): Promise<boolean> {
 	const lockPath = join(dir, WORKER_LOCK_FILE);
 	try {
 		const lockStat = await stat(lockPath);
-		return Date.now() - lockStat.mtimeMs < LOCK_TIMEOUT_MS;
+		return Date.now() - lockStat.mtimeMs < LOCK_HEARTBEAT_TIMEOUT_MS;
 	} catch {
 		return false;
 	}
 }
 
 /**
- * Returns true when `worker.lock` exists but is older than `LOCK_TIMEOUT_MS`.
+ * Returns true when `worker.lock` exists but is older than `LOCK_HEARTBEAT_TIMEOUT_MS`.
  * Used by `doctor` to detect a crashed worker that left its lock behind.
  */
 export async function isWorkerLockStale(cwd?: string): Promise<boolean> {
@@ -310,7 +310,7 @@ export async function getWorkerBusyState(cwd?: string): Promise<{ held: boolean;
 
 /**
  * Bumps the mtime on `worker.lock` so a long-running worker (e.g. an LLM call
- * that exceeds `LOCK_TIMEOUT_MS`) cannot be stolen by the stale-lock reclaimer.
+ * that exceeds `LOCK_HEARTBEAT_TIMEOUT_MS`) cannot be stolen by the stale-lock reclaimer.
  * The worker calls this on a periodic timer for the duration of its run.
  *
  * Skips the bump when the lock is owned by a different PID — refreshing

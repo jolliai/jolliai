@@ -35,7 +35,7 @@ import {
 	INGEST_LOCK_FILE,
 	isWorkerLockHeld,
 	isWorkerLockStale,
-	LOCK_TIMEOUT_MS,
+	LOCK_HEARTBEAT_TIMEOUT_MS,
 	ORPHAN_WRITE_LOCK_FILE,
 	PLANS_LOCK_FILE,
 	PROFILE_LOCK_FILE,
@@ -144,9 +144,9 @@ describe("Locks", () => {
 			await releaseWorkerLock(tempDir);
 		});
 
-		it("reclaims a stale lock (older than LOCK_TIMEOUT_MS) and acquires", async () => {
+		it("reclaims a stale lock (older than LOCK_HEARTBEAT_TIMEOUT_MS) and acquires", async () => {
 			expect(await acquireWorkerLock(tempDir)).toBe(true);
-			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
+			const past = new Date(Date.now() - LOCK_HEARTBEAT_TIMEOUT_MS - 60_000);
 			await utimes(workerLockPath(tempDir), past, past);
 			expect(await acquireWorkerLock(tempDir)).toBe(true);
 			await releaseWorkerLock(tempDir);
@@ -156,7 +156,7 @@ describe("Locks", () => {
 			// Simulate a crashed-without-release: write a PID that definitely
 			// doesn't exist (huge number, virtually never reused) without
 			// advancing mtime. Previously the next acquirer had to wait the
-			// full LOCK_TIMEOUT_MS; with the PID liveness check it reclaims
+			// full LOCK_HEARTBEAT_TIMEOUT_MS; with the PID liveness check it reclaims
 			// immediately.
 			const fsPromises = await import("node:fs/promises");
 			await fsPromises.writeFile(workerLockPath(tempDir), "9999999", "utf-8");
@@ -226,9 +226,9 @@ describe("Locks", () => {
 			await releaseWorkerLock(tempDir);
 		});
 
-		it("isWorkerLockStale returns true when lock is older than LOCK_TIMEOUT_MS", async () => {
+		it("isWorkerLockStale returns true when lock is older than LOCK_HEARTBEAT_TIMEOUT_MS", async () => {
 			await acquireWorkerLock(tempDir);
-			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
+			const past = new Date(Date.now() - LOCK_HEARTBEAT_TIMEOUT_MS - 60_000);
 			await utimes(workerLockPath(tempDir), past, past);
 			expect(await isWorkerLockStale(tempDir)).toBe(true);
 			await releaseWorkerLock(tempDir);
@@ -238,7 +238,7 @@ describe("Locks", () => {
 	describe("refreshWorkerLockMtime", () => {
 		it("bumps the lock's mtime so a long-lived worker is not reaped", async () => {
 			await acquireWorkerLock(tempDir);
-			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
+			const past = new Date(Date.now() - LOCK_HEARTBEAT_TIMEOUT_MS - 60_000);
 			await utimes(workerLockPath(tempDir), past, past);
 			expect(await isWorkerLockStale(tempDir)).toBe(true);
 
@@ -263,7 +263,7 @@ describe("Locks", () => {
 			const fsPromises = await import("node:fs/promises");
 			await fsPromises.mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
 			await writeFile(lockPath, "999999", "utf-8");
-			const backdated = new Date(Date.now() - 2 * LOCK_TIMEOUT_MS);
+			const backdated = new Date(Date.now() - 2 * LOCK_HEARTBEAT_TIMEOUT_MS);
 			await utimes(lockPath, backdated, backdated);
 
 			await refreshWorkerLockMtime(tempDir);
@@ -326,7 +326,7 @@ describe("Locks", () => {
 
 		it("reclaims a stale orphan-write lock", async () => {
 			expect(await acquireOrphanWriteLock(tempDir)).toBe(true);
-			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
+			const past = new Date(Date.now() - LOCK_HEARTBEAT_TIMEOUT_MS - 60_000);
 			await utimes(orphanWriteLockPath(tempDir), past, past);
 			expect(await acquireOrphanWriteLock(tempDir, { timeoutMs: 100 })).toBe(true);
 			await releaseOrphanWriteLock(tempDir);
@@ -366,7 +366,7 @@ describe("Locks", () => {
 			await fsPromises.mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
 			const stalePath = workerLockPath(tempDir);
 			await writeFile(stalePath, "12345", "utf-8");
-			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
+			const past = new Date(Date.now() - LOCK_HEARTBEAT_TIMEOUT_MS - 60_000);
 			await utimes(stalePath, past, past);
 
 			expect(await acquireOrphanWriteLock(tempDir)).toBe(true);
@@ -379,7 +379,7 @@ describe("Locks", () => {
 	//
 	// Stale-reclaim race the PID check guards against:
 	//   1. Process A acquires lock (mtime t0)
-	//   2. A blocks long enough that age ≥ LOCK_TIMEOUT_MS
+	//   2. A blocks long enough that age ≥ LOCK_HEARTBEAT_TIMEOUT_MS
 	//   3. Process B's tryAcquireOnce removes A's lock and writes its own PID
 	//   4. A wakes up and runs its `finally { releaseLock }` block
 	//   5. Without the PID check: A would `rm` B's lock → C arrives → no lock
@@ -808,7 +808,7 @@ describe("Locks", () => {
 			const dir = await jmDir(tempDir);
 			const lockPath = join(dir, "worker.lock");
 			await writeFile(lockPath, String(process.pid));
-			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
+			const past = new Date(Date.now() - LOCK_HEARTBEAT_TIMEOUT_MS - 60_000);
 			await utimes(lockPath, past, past);
 			expect(await getWorkerBusyState(tempDir)).toEqual({ held: false, blocking: false });
 		});
@@ -842,7 +842,7 @@ describe("Locks", () => {
 			const lockPath = ingestLockPath(tempDir);
 			await mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
 			await writeFile(lockPath, "999999");
-			const past = new Date(Date.now() - LOCK_TIMEOUT_MS - 60_000);
+			const past = new Date(Date.now() - LOCK_HEARTBEAT_TIMEOUT_MS - 60_000);
 			await utimes(lockPath, past, past);
 			expect(await acquireIngestLock(tempDir)).toBe(true);
 			expect((await readFile(lockPath, "utf-8")).trim()).toBe(String(process.pid));
@@ -868,7 +868,7 @@ describe("Locks", () => {
 			await utimes(lockPath, past, past);
 			await refreshIngestLockMtime(tempDir);
 			const fresh = await stat(lockPath);
-			expect(Date.now() - fresh.mtimeMs).toBeLessThan(LOCK_TIMEOUT_MS);
+			expect(Date.now() - fresh.mtimeMs).toBeLessThan(LOCK_HEARTBEAT_TIMEOUT_MS);
 		});
 	});
 });

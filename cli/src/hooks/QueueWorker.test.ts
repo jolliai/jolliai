@@ -78,7 +78,12 @@ vi.mock("../core/ContextRelevance.js", async (importOriginal) => {
 		// throws, the relevance try-block skips assessContextRelevance entirely. Stub it
 		// so assess actually runs. computeChangeFingerprint / buildDecisionFromAiExcluded
 		// keep their real implementations.
-		buildChangeSignal: vi.fn(async () => ({ commitMessage: "", changedFiles: ["src/file.ts"], symbols: [] })),
+		buildChangeSignal: vi.fn(async () => ({
+			commitMessage: "",
+			changedFiles: ["src/file.ts"],
+			symbols: [],
+			diff: "",
+		})),
 		assessContextRelevance: vi.fn(async (raw: Parameters<typeof actual.assessContextRelevance>[0]) => ({
 			plans: raw.plans,
 			notes: raw.notes,
@@ -3527,7 +3532,7 @@ describe("QueueWorker", () => {
 				.mockResolvedValueOnce([])
 				.mockResolvedValueOnce([]);
 			setupPipelineMocks();
-			const signal = { commitMessage: "", changedFiles: ["src/file.ts"], symbols: [] as string[] };
+			const signal = { commitMessage: "", changedFiles: ["src/file.ts"], symbols: [] as string[], diff: "" };
 			vi.mocked(buildChangeSignal).mockResolvedValueOnce(signal);
 			// Persisted fingerprint matches this change → executePipeline takes the
 			// buildDecisionFromAiExcluded reuse arm and skips assessContextRelevance.
@@ -4872,7 +4877,7 @@ describe("QueueWorker", () => {
 				.mockResolvedValueOnce([])
 				.mockResolvedValueOnce([]);
 			setupPipelineMocks();
-			const signal = { commitMessage: "", changedFiles: ["src/file.ts"], symbols: [] as string[] };
+			const signal = { commitMessage: "", changedFiles: ["src/file.ts"], symbols: [] as string[], diff: "" };
 			vi.mocked(buildChangeSignal).mockResolvedValueOnce(signal);
 			// Matching fingerprint → the reuse arm runs (no LLM). This suite's
 			// default mocks detect no plans/notes/refs, so the meaningful assertion
@@ -4912,7 +4917,7 @@ describe("QueueWorker", () => {
 					commitHash: null,
 				} as never,
 			]);
-			const signal = { commitMessage: "", changedFiles: ["src/file.ts"], symbols: [] as string[] };
+			const signal = { commitMessage: "", changedFiles: ["src/file.ts"], symbols: [] as string[], diff: "" };
 			vi.mocked(buildChangeSignal).mockResolvedValueOnce(signal);
 			vi.mocked(readAiSelection).mockResolvedValueOnce({
 				aiRelevance: [

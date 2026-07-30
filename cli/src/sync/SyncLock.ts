@@ -96,7 +96,7 @@ export async function refreshSyncLockMtime(): Promise<void> {
 }
 
 /**
- * Returns true when `sync.lock` exists and is younger than `LOCK_TIMEOUT_MS`.
+ * Returns true when `sync.lock` exists and is younger than `LOCK_HEARTBEAT_TIMEOUT_MS`.
  * Used by the VS Code status orchestrator to detect "another round is in
  * flight" without trying to acquire (avoids creating contention for a quick
  * status probe).

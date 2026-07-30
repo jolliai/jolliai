@@ -229,7 +229,7 @@ describe("SyncLock", () => {
 			const lockPath = getSyncLockPath();
 			await mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
 			await writeFile(lockPath, String(process.pid));
-			// Backdate beyond LOCK_TIMEOUT_MS (5 min). Use 6 min to be safe.
+			// Backdate beyond LOCK_HEARTBEAT_TIMEOUT_MS (5 min). Use 6 min to be safe.
 			const sixMinAgo = new Date(Date.now() - 6 * 60 * 1000);
 			await utimes(lockPath, sixMinAgo, sixMinAgo);
 
