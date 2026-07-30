@@ -2,6 +2,8 @@ package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.KBPathResolver
+import ai.jolli.jollimemory.core.LocalAgentTools
+import ai.jolli.jollimemory.core.LocalAgentToolOption
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.StorageFactory
 import ai.jolli.jollimemory.bridge.CliIntegrations
@@ -62,10 +64,25 @@ class SettingsDialog(
         maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
     }
     private val anthropicKeyField = JBPasswordField()
-    /** Agent tool picker for the Local Agent provider — v1 supports only Claude Code (parity with VS Code). */
-    private val localAgentToolCombo = ComboBox(DefaultComboBoxModel(arrayOf("Claude Code"))).apply {
+    /**
+     * Agent tool picker for the Local Agent provider. Populated at load time from
+     * the CLI-owned `LOCAL_AGENT_TOOLS` map over `jolli ide-bridge local-agent-tools`
+     * (see [LocalAgentTools.load]) so every backend the CLI supports —
+     * claude-code / codex / cursor-agent / opencode today — appears here without
+     * a Kotlin port to keep in lockstep. Initial model holds the fallback entry
+     * only; the async fetch replaces it on the EDT once the tool list arrives.
+     */
+    private val localAgentToolCombo = ComboBox(DefaultComboBoxModel(arrayOf(LocalAgentTools.FALLBACK.label))).apply {
         maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
     }
+
+    /**
+     * Current tool list backing [localAgentToolCombo]. The combo model itself
+     * stores labels (for display); this array preserves the parallel `id`
+     * values so save-time can persist the CLI-side identifier (e.g. `codex`),
+     * not the human label (`Codex`).
+     */
+    private var localAgentTools: List<LocalAgentToolOption> = listOf(LocalAgentTools.FALLBACK)
     private val modelCombo = ComboBox(DefaultComboBoxModel(arrayOf(
         "haiku — fastest, cheapest",
         "sonnet — balanced (default)",
@@ -155,6 +172,7 @@ class SettingsDialog(
         init()
         loadSettings()
         loadPushControlAsync()
+        refreshLocalAgentToolCombo()
 
         authListenerDisposable = JolliAuthService.addAuthListener {
             SwingUtilities.invokeLater {
@@ -351,7 +369,9 @@ class SettingsDialog(
             override fun changedUpdate(e: javax.swing.event.DocumentEvent) = update()
         })
 
-        // Local Agent card: agent-tool picker (v1: Claude Code only). Uses the tool's own
+        // Local Agent card: agent-tool picker (contents fetched from the CLI-side
+        // LOCAL_AGENT_TOOLS map via `refreshLocalAgentToolCombo`, so new backends
+        // added to that map appear here automatically). Uses the tool's own
         // subscription sign-in, so no API key is collected here — mirrors the VS Code card.
         val localAgentContent = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -359,7 +379,7 @@ class SettingsDialog(
             add(Box.createVerticalStrut(8))
             add(createStretchedFormPanel(FormBuilder.createFormBuilder()
                 .addLabeledComponent(JBLabel("Agent tool:"), localAgentToolCombo, 1, false)
-                .addTooltip("Uses your local Claude Code login (subscription). Sign in with the claude CLI if prompted.")
+                .addTooltip("Uses your local agent's own login (subscription). Sign in with the corresponding CLI if prompted.")
                 .panel))
         }
 
@@ -833,7 +853,16 @@ class SettingsDialog(
             // dcoSignoff is written separately via saveDcoSignoff below. Force-null here
             // so this data-class overwrite doesn't clobber the value that call will restore.
             dcoSignoff = null,
-            knowledgeBasePath = kbPath,
+            // Memory Bank folder writes go to `localFolder` — the canonical
+            // cross-surface key shared with CLI + VS Code. IntelliJ used to
+            // write a separate `knowledgeBasePath` key here, which drifted from
+            // `localFolder` and made the two IDE surfaces read different folders
+            // for the same repo. The DTO field now carries
+            // `@SerializedName(alternate = ["knowledgeBasePath"])` so a legacy
+            // config that only has the old key is transparently picked up on
+            // read; serialization always writes `localFolder`, so the legacy key
+            // self-heals on the next save.
+            localFolder = kbPath.ifBlank { null },
             knowledgeBaseSort = kbSort,
             paused = if (pauseCheckbox.isSelected) true else null,
             // Round-tripped, not edited — see savedAutoSyncEnabled's declaration.
@@ -845,12 +874,17 @@ class SettingsDialog(
         // Provider routing lives ONLY in the shared config.json (cross-surface, one copy) so the
         // CLI's summary QueueWorker honors the choice made here. The Anthropic key is still
         // preserved across provider switches, but now stored shared so the CLI can read it too.
-        // localAgentTool is always "claude-code" (the only supported tool) and localAgentPath is
-        // never touched — both mirror how the VS Code settings panel persists this group.
+        // localAgentTool is the CLI-side id (e.g. `codex`, not the human label `Codex`); map the
+        // combo selection back through `localAgentTools` — falling back to the fallback id when
+        // no row matches (async fetch never landed, or user chose a stale option). localAgentPath
+        // is never touched — both mirror how the VS Code settings panel persists this group.
+        val selectedLabel = localAgentToolCombo.selectedItem as? String
+        val selectedToolId = localAgentTools.firstOrNull { it.label == selectedLabel }?.id
+            ?: LocalAgentTools.FALLBACK.id
         SessionTracker.saveSharedProviderConfig(
             aiProvider = provider,
             apiKey = resolvedApiKey.ifBlank { null },
-            localAgentTool = "claude-code",
+            localAgentTool = selectedToolId,
         )
         // DCO sign-off is persisted via a JSON-level partial update rather than the
         // data-class overwrite above, so a value the CLI or VS Code just wrote to the
@@ -913,7 +947,7 @@ class SettingsDialog(
         val wasPaused = existing.paused == true
         val nowPaused = pauseCheckbox.isSelected
         val projectPath = service.mainRepoRoot ?: project.basePath
-        val kbCustomPath = config.knowledgeBasePath
+        val kbCustomPath = config.localFolder
         // Per-repo outbound-push toggle (spec 306) — snapshot for the off-EDT write below.
         val pushControlWasLoaded = pushControlLoaded
         val pushDisabledNow = !pushEnabledCheckbox.isSelected
@@ -1159,6 +1193,30 @@ class SettingsDialog(
         }
     }
 
+    /**
+     * Fetches the CLI's `LOCAL_AGENT_TOOLS` map over `jolli ide-bridge` on a
+     * pooled thread, then re-populates [localAgentToolCombo] on the EDT with
+     * the returned entries. Off-EDT because the daemon fast path is ~5-20 ms
+     * but the one-shot spawn fallback (unbound daemon) can hit 500 ms-2 s — the
+     * dialog is already visible at this point and IntelliJ's slow-EDT floor is
+     * 300 ms, so we must not block. On any failure the fallback singleton the
+     * combo was initialised with stays in place.
+     */
+    private fun refreshLocalAgentToolCombo() {
+        val projectDir = service.mainRepoRoot ?: project.basePath ?: return
+        val currentId = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir()).localAgentTool
+            ?: LocalAgentTools.FALLBACK.id
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val tools = LocalAgentTools.load(projectDir)
+            ApplicationManager.getApplication().invokeLater {
+                localAgentTools = tools
+                localAgentToolCombo.model = DefaultComboBoxModel(tools.map { it.label }.toTypedArray())
+                val selectIdx = tools.indexOfFirst { it.id == currentId }.takeIf { it >= 0 } ?: 0
+                localAgentToolCombo.selectedIndex = selectIdx
+            }
+        }
+    }
+
     private fun populateFields(config: JolliMemoryConfig) {
         // AI Summary
         savedAnthropicKey = config.apiKey ?: ""
@@ -1217,7 +1275,7 @@ class SettingsDialog(
             val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
             defaultKBPath = KBPathResolver.resolve(repoName, remoteUrl).toString()
         }
-        kbPathField.text = config.knowledgeBasePath ?: KBPathResolver.KB_PARENT.toString()
+        kbPathField.text = config.localFolder ?: KBPathResolver.KB_PARENT.toString()
         kbSortCombo.selectedItem = config.knowledgeBaseSort ?: "date"
 
         // Sync settings. autoSyncEnabled / syncPollIntervalSec have no control on any
@@ -1288,16 +1346,16 @@ class SettingsDialog(
                                 // archiveKBFolder MOVES each folder into the hidden .jolli/archive/
                                 // (not an in-place identity rewrite, which left them visible and
                                 // still git-tracked). Mirrors the VS Code rebuildKnowledgeBase flow.
-                                val staleFolders = KBPathResolver.findRepoFolders(repoName, remoteUrl, config.knowledgeBasePath)
+                                val staleFolders = KBPathResolver.findRepoFolders(repoName, remoteUrl, config.localFolder)
                                 for (stale in staleFolders) {
                                     indicator.text = "Archiving $stale…"
-                                    KBPathResolver.archiveKBFolder(stale, config.knowledgeBasePath)
+                                    KBPathResolver.archiveKBFolder(stale, config.localFolder)
                                 }
 
                                 // With the pile archived, the base slot is free; resolve to it
                                 // (falling back to a fresh -N only if some folder survived archiving).
                                 indicator.text = "Initializing Memory Bank…"
-                                val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
+                                val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.localFolder)
                                 KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
 
                                 // Run the migration through the bundled CLI. The CLI resolves the

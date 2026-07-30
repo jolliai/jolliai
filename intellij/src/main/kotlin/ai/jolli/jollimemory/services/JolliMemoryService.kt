@@ -340,7 +340,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
     }
 
     /**
-     * Re-attach the folder reader against the CURRENT `config.knowledgeBasePath`
+     * Re-attach the folder reader against the CURRENT `config.localFolder`
      * + `config.storageMode`. Call after Settings persists a change to either —
      * without this, the reader keeps pointing at the previous Memory Bank
      * directory (so summaries/plans/notes are read from a stale folder) or keeps
@@ -360,7 +360,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
             val repoName = KBPathResolver.extractRepoName(root)
             val remoteUrl = KBPathResolver.getRemoteUrl(root)
             val config = SessionTracker.loadConfig()
-            val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
+            val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.localFolder)
             val folderReader = ai.jolli.jollimemory.bridge.FolderStorageReader.forRoot(kbRoot.toString(), config.storageMode)
             r.attachFolder(folderReader)
         } catch (e: Exception) {
@@ -406,7 +406,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
         }
 
         val gitOps = GitOps(basePath)
-        val resolvedRoot = gitOps.resolveMainWorktreeRoot() ?: basePath
+        val resolvedRoot = gitOps.resolveWorktreeRoot() ?: basePath
         mainRepoRoot = resolvedRoot
         JmLogger.setLogDir(resolvedRoot)
         sb.appendLine("resolvedRoot=$resolvedRoot")
@@ -448,7 +448,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
             val repoName = KBPathResolver.extractRepoName(resolvedRoot)
             val remoteUrl = KBPathResolver.getRemoteUrl(resolvedRoot)
             val config = SessionTracker.loadConfig()
-            val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
+            val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.localFolder)
             KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
             sb.appendLine("KB folder initialized: $kbRoot")
 
@@ -973,6 +973,15 @@ class JolliMemoryService(private val project: Project) : Disposable {
 
     /** Archived markdown-note body (`notes/<id>.md`) from committed-memory storage, or null. */
     fun readArchivedNote(id: String): String? = reader?.readNoteBody(id)
+
+    /**
+     * Archived reference body (`references/<source>/<sanitized-bareKey>.md`) from
+     * committed-memory storage, or null. Used by CommittedMemories to open a
+     * reference (e.g. a jollimemory recall) whose upstream `url` is absent —
+     * without this the row would fall back to re-opening the whole commit summary.
+     */
+    fun readArchivedReference(source: ai.jolli.jollimemory.core.references.SourceId, archivedKey: String): String? =
+        reader?.readReferenceBody(source, archivedKey)
 
     /** Stored committed conversation (by session) rendered as read-only markdown, or null. */
     fun readCommittedConversationMarkdown(commitHash: String, sessionId: String): String? =

@@ -2,6 +2,8 @@ package ai.jolli.jollimemory.bridge
 
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.JmLogger
+import ai.jolli.jollimemory.core.references.SourceId
+import ai.jolli.jollimemory.core.references.SourceIds
 import com.google.gson.Gson
 import java.io.File
 
@@ -23,6 +25,10 @@ import java.io.File
  * schema-touching change to FolderStorage.ts must edit this file in the
  * same PR. See the header comment on `cli/src/core/FolderStorage.ts`.
  *
+ * Paths consumed: `.jolli/summaries/<hash>.json`, `.jolli/plans/<slug>.md`,
+ * `.jolli/notes/<id>.md`, `.jolli/references/<source>/<sanitized-bareKey>.md`,
+ * `.jolli/shadow-status.json`.
+ *
  * ── SCOPE ────────────────────────────────────────────────────────────────
  * READ ONLY. Never writes anywhere on disk — dual-write consistency is
  * the CLI's job, and reintroducing a Kotlin writer would fork the schema
@@ -36,6 +42,7 @@ class FolderStorageReader private constructor(private val kbRoot: File) {
     private val summariesDir = File(kbRoot, ".jolli/summaries")
     private val plansDir = File(kbRoot, ".jolli/plans")
     private val notesDir = File(kbRoot, ".jolli/notes")
+    private val referencesDir = File(kbRoot, ".jolli/references")
     private val shadowStatusFile = File(kbRoot, ".jolli/shadow-status.json")
 
     /** True if the hidden `.jolli/summaries` directory exists (dual-write
@@ -121,6 +128,40 @@ class FolderStorageReader private constructor(private val kbRoot: File) {
         if (isDirty()) return null
         val file = File(notesDir, "$id.md")
         if (!file.isSafelyWithin(notesDir) || !file.isFile) return null
+        return try { file.readText(Charsets.UTF_8) } catch (_: Exception) { null }
+    }
+
+    /**
+     * Reads an archived reference body from
+     * `.jolli/references/<source>/<pathKey>.md` — the layout
+     * `SummaryStore.orphanPathFor` writes for reference archival.
+     *
+     * `pathKey` is the CLI-side `sanitizeNativeIdForPath` applied to the
+     * bare archivedKey; for GitHub / Context7 (declared `nativeIdPathSafe:
+     * false`) that folds `/` and `#` in the native id to `-` and appends an
+     * 8-hex sha256 suffix. Without this the reader used to interpolate the
+     * raw bareKey — which for GitHub contains `/` — and read
+     * `github/owner/repo#…md` (nested subdirectory, wrong stem), returning
+     * null for every GitHub / Context7 reference.
+     *
+     * `bareKey` is `archivedKey` with the leading `<source>:` stripped
+     * ("jollimemory:recall-abc12345" → "recall-abc12345"); callers hold the
+     * archivedKey directly and pass it through unchanged.
+     */
+    fun readReferenceBody(source: SourceId, archivedKey: String): String? {
+        if (isDirty()) return null
+        val wire = SourceIds.wireName(source)
+        val bareKey = SourceIds.stripPrefix(wire, archivedKey)
+        val stem = SourceIds.pathKey(source, bareKey)
+        val sourceDir = File(referencesDir, wire)
+        val file = File(sourceDir, "$stem.md")
+        // Two containment checks: the source subfolder must sit under references/,
+        // and the file must sit under that subfolder. Rejects both `../..` in
+        // sanitized keys and a hostile source name reaching disk. The pathKey
+        // sanitize already strips `/`, so this is defense-in-depth against
+        // future refactors that might route unsanitized data past this point.
+        if (!sourceDir.isSafelyWithin(referencesDir)) return null
+        if (!file.isSafelyWithin(sourceDir) || !file.isFile) return null
         return try { file.readText(Charsets.UTF_8) } catch (_: Exception) { null }
     }
 

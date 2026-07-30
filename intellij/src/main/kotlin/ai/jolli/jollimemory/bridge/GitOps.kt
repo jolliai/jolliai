@@ -428,19 +428,26 @@ class GitOps(private val projectDir: String) {
         return if (isAncestor(mergeBaseMain, creationPoint)) creationPoint else mergeBaseMain
     }
 
-    /** Resolve the main worktree root (handles worktrees). */
-    fun resolveMainWorktreeRoot(): String? {
-        val gitFile = File(projectDir, ".git")
-        if (gitFile.isFile) {
-            // Worktree: .git is a file with "gitdir: /path/to/main/.git/worktrees/<name>"
-            try {
-                val gitdirLine = gitFile.readText().trim()
-                if (gitdirLine.startsWith("gitdir:")) {
-                    val gitdirPath = gitdirLine.removePrefix("gitdir:").trim()
-                    return File(gitdirPath).parentFile?.parentFile?.parentFile?.absolutePath
-                }
-            } catch (_: Exception) { }
-        }
-        return projectDir
-    }
+    /**
+     * Returns the CURRENT worktree root (handles worktrees).
+     *
+     * Historically named `resolveMainWorktreeRoot` and walked up to the main
+     * worktree, but that was wrong: `.jolli/jollimemory/` (plans.json,
+     * sessions.json, notes/, references/, git-op-queue/, briefing-cache.json,
+     * space-binding.json, cursors.json, debug.log) is **per-worktree**, not
+     * repo-wide (AGENTS.md "Critical rules"). The old walk-up caused every
+     * secondary-worktree session to write into its OWN worktree while IntelliJ
+     * read from the main worktree, silently hiding those entries in CONTEXT /
+     * WORKING MEMORY. VSCode never had this bug — it uses
+     * `workspaceFolders[0].uri.fsPath` directly.
+     *
+     * The one file that IS repo-wide, `profile.json`, is resolved to the main
+     * worktree by `RepoProfile.ts` INSIDE the CLI, so callers here don’t need
+     * to know about it.
+     *
+     * The `JolliMemoryService.mainRepoRoot` field that stores this value is a
+     * legacy misnomer (it holds the CURRENT worktree root, not the main one);
+     * renaming that field is a separate 50-site cleanup.
+     */
+    fun resolveWorktreeRoot(): String? = projectDir
 }

@@ -526,6 +526,13 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                     commitsPanel.clearForeignMode()
                 }
             },
+            // Memory Bank view: scope the KBExplorer tree to the picked repo.
+            // Null = the user picked "All repos" (broaden back out). This runs
+            // in parallel with onSelectionChanged; the two callbacks own
+            // independent slices of the UI (foreign-mode routing vs tree filter).
+            onRepoFilterChanged = { repoName ->
+                kbPanel.setRepoFilter(repoName)
+            },
         )
 
         // View switch (Current Branch / Memory Bank / Knowledge) above the breadcrumb.

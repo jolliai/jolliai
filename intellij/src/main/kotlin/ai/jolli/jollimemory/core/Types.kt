@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.core
 
 import ai.jolli.jollimemory.core.references.ReferenceCommitRef
 import ai.jolli.jollimemory.core.references.ReferenceEntry
+import com.google.gson.annotations.SerializedName
 
 /**
  * JolliMemory Type Definitions — Kotlin port of Types.ts
@@ -520,7 +521,6 @@ data class JolliMemoryConfig(
     val telemetry: String? = null,
     val logLevel: String? = null,
     val logLevelOverrides: Map<String, String>? = null,
-    val knowledgeBasePath: String? = null,
     val knowledgeBaseSort: String? = null,  // "date" | "name"
     val storageMode: String? = null,        // "orphan" | "dual-write" | "folder"
     /** When true, hooks are uninstalled and the plugin is paused without losing config. */
@@ -531,7 +531,25 @@ data class JolliMemoryConfig(
     val syncPollIntervalSec: Int? = null,
     /** Whether to sync transcripts to the vault. */
     val syncTranscripts: Boolean? = null,
-    /** Custom local folder path for the memory bank root. */
+    /**
+     * Custom local folder path for the memory bank root.
+     *
+     * The [SerializedName] alternate ["knowledgeBasePath"] is a read-side migration shim:
+     * IntelliJ \< 1.1 persisted the user's custom Memory Bank path under that legacy key,
+     * which the CLI and VS Code never read (they use "localFolder"). Users who only had
+     * "knowledgeBasePath" get their setting back on first load, and serialization always
+     * writes "localFolder", so the legacy key self-heals on next save.
+     *
+     * Gson resolves the alternate by walking the JSON top-to-bottom and assigning the
+     * field on EVERY matching key it encounters — primary and alternate compete on file
+     * order, NOT on "primary wins". This is safe for the intended migration path
+     * (files with only the legacy key), but for a file that somehow carries both keys
+     * whichever appears LATER in the JSON overwrites the earlier one. See
+     * [ai.jolli.jollimemory.core.TypesTest.LocalFolderMigration] for the locked-down
+     * behavior and the risk case (legacy key followed by `"localFolder": null` silently
+     * drops the user's setting).
+     */
+    @SerializedName(value = "localFolder", alternate = ["knowledgeBasePath"])
     val localFolder: String? = null,
     /** Folder names (or `*`-glob patterns) under the Memory Bank root to skip when building the wiki. */
     val compileExcludeFolders: List<String>? = null,

@@ -45,15 +45,61 @@ import javax.swing.SwingUtilities
 class BreadcrumbHeaderPanel(
 	private val service: JolliMemoryService,
 	private val onSelectionChanged: (repo: String?, branch: String?, isForeign: Boolean) -> Unit,
+	/**
+	 * Fires whenever the "Showing: <repo>" picker selection changes in
+	 * REPO_FILTER mode. Argument is the picked repo name, or `null` when the
+	 * user picks the synthetic "All repos" entry. Independent of
+	 * [onSelectionChanged] because "All repos" is not a real repo — it can't
+	 * be routed through the branch / foreign-mode logic that callback owns.
+	 * KBExplorerPanel consumes this to scope its tree/timeline render.
+	 */
+	private val onRepoFilterChanged: (repoName: String?) -> Unit = {},
 ) : JPanel(BorderLayout()) {
 
 	enum class Mode { BRANCH, REPO_FILTER }
+
+	companion object {
+		/** Synthetic entry prepended to the repo picker in REPO_FILTER mode.
+		 *  Selecting it broadens the KBExplorer tree back to every discovered
+		 *  repo. VS Code uses the same literal in its sidebar dropdown so the
+		 *  two IDE surfaces read identically. Localization: currently intentionally
+		 *  English-only across CLI/VS Code/IntelliJ — keep in lockstep. */
+		const val ALL_REPOS_LABEL = "All repos"
+
+		/**
+		 * Restore-selection rule when [setMode] repopulates the repo picker.
+		 * Preserve [previous] ONLY if it's a member of [newItems]; otherwise
+		 * fall back to the first non-[ALL_REPOS_LABEL] entry (the workspace
+		 * repo — present in both modes' lists).
+		 *
+		 * Written this way because the unrestrained restore used to leak
+		 * `ALL_REPOS_LABEL` from the Memory Bank picker into the Branch view's
+		 * item list, where that label is not present. `onBranchSelected` would
+		 * then hand `"All repos"` downstream as a repo name, blowing up KB
+		 * lookups with no matching repo AND losing the workspace `(current)`
+		 * bold in the popup renderer (index-0 check misfires).
+		 *
+		 * Exposed for unit tests — the Swing surface is otherwise heavy to
+		 * instantiate in isolation.
+		 */
+		internal fun resolveRestoredRepoSelection(previous: String?, newItems: List<String>): String? {
+			if (previous != null && previous in newItems) return previous
+			return newItems.firstOrNull { it != ALL_REPOS_LABEL }
+		}
+	}
 
 	private val showingLabel = JBLabel("Showing:")
 	private val slashLabel = JBLabel("/")
 
 	private val repoPicker = CrumbPicker(
-		isWorkspaceItem = { _, index -> index == 0 && repos.any { it.isCurrentRepo } },
+		// In REPO_FILTER mode the picker prepends "All repos" at index 0, so the
+		// current-repo entry is now at index 1 (VS Code parity — that's where
+		// the sidebar puts "<repo> (current)" too). In BRANCH mode there's no
+		// "All repos" prefix, so index 0 stays the workspace entry.
+		isWorkspaceItem = { _, index ->
+			val allReposIdx = if (mode == Mode.REPO_FILTER) 1 else 0
+			index == allReposIdx && repos.any { it.isCurrentRepo }
+		},
 		onPick = { onRepoSelected() },
 	)
 	private val branchPicker = CrumbPicker(
@@ -102,8 +148,37 @@ class BreadcrumbHeaderPanel(
 		slashLabel.isVisible = branchVisible
 		branchPicker.isVisible = branchVisible
 		showingLabel.isVisible = !branchVisible
+		// The picker's item list depends on mode ("All repos" is prepended only
+		// in REPO_FILTER). Repopulate without a full refresh() so we don't lose
+		// the current selection or refire a git branch enumeration.
+		val previousSelection = repoPicker.selected
+		val newItems = itemsForCurrentMode()
+		repoPicker.setItems(newItems)
+		val restored = resolveRestoredRepoSelection(previousSelection, newItems)
+		repoPicker.setSelectedSilently(restored)
+		// Newly entering REPO_FILTER (Memory Bank / Knowledge views): broadcast
+		// the current selection so the KBExplorer tree scopes to it — otherwise
+		// the tree stays "All repos" until the user pokes the picker.
+		// Guard on repos.isNotEmpty(): setMode can be called during panel
+		// construction before the first refresh() populates repos — firing
+		// onRepoFilterChanged at that point triggers a tree rebuild against
+		// an empty cachedRepos (harmless but wasteful flash of "No memories").
+		if (newMode == Mode.REPO_FILTER && restored != null && restored != ALL_REPOS_LABEL && repos.isNotEmpty()) {
+			onRepoFilterChanged(restored)
+		}
 		revalidate()
 		repaint()
+	}
+
+	/**
+	 * Items the repo picker should show for the current [mode]. In REPO_FILTER
+	 * mode a synthetic "All repos" entry is prepended at index 0 so the user
+	 * can broaden the Memory Bank / Knowledge view back out; in BRANCH mode the
+	 * view is scoped to one repo/branch by design so the prefix is omitted.
+	 */
+	private fun itemsForCurrentMode(): List<String> {
+		val repoNames = repos.map { it.repoName }
+		return if (mode == Mode.REPO_FILTER) listOf(ALL_REPOS_LABEL) + repoNames else repoNames
 	}
 
 	/** Populate pickers. Call from a background thread after KB data is loaded. */
@@ -117,25 +192,49 @@ class BreadcrumbHeaderPanel(
 		val discoveredRepos = KBRepoDiscoverer.discover(
 			currentRepoName = currentRepoName,
 			currentRemoteUrl = currentRemoteUrl,
-			customParent = config.knowledgeBasePath,
+			customParent = config.localFolder,
 		)
 		repos = discoveredRepos
 
 		val repoNames = discoveredRepos.map { it.repoName }
 
 		SwingUtilities.invokeLater {
-			repoPicker.setItems(repoNames)
-			// Current repo is first.
+			repoPicker.setItems(itemsForCurrentMode())
+			// Default selection is the current repo (bolded "(current)" entry)
+			// so the initial Memory Bank / Current Branch view is scoped like
+			// VS Code's sidebar. Users pick "All repos" to broaden — never the
+			// implicit default, because an unfiltered tree on 10+ repos is a
+			// wall of text on cold start.
 			repoPicker.setSelectedSilently(repoNames.firstOrNull())
+			// Broadcast the initial filter so KBExplorer scopes its tree at
+			// startup — setSelectedSilently deliberately skips onPick, and the
+			// first user click would otherwise flip the tree from "all" to
+			// "current repo" for no visible reason.
+			if (mode == Mode.REPO_FILTER) onRepoFilterChanged(repoPicker.selected)
 			refreshBranches()
 		}
 	}
 
 	private fun onRepoSelected() {
+		val selected = repoPicker.selected
+		// In REPO_FILTER mode the picker may return the synthetic "All repos"
+		// entry; fire onRepoFilterChanged with null and stop before the branch
+		// refresh — there is no repo to look up branches for, and the existing
+		// onSelectionChanged path expects a concrete repo name. In BRANCH mode
+		// "All repos" is never in the item list, so this branch is a no-op there.
+		if (selected == ALL_REPOS_LABEL) {
+			ai.jolli.jollimemory.core.telemetry.Telemetry.track("repo_switched", mapOf("is_foreign" to false, "all_repos" to true))
+			onRepoFilterChanged(null)
+			return
+		}
 		// User picked a repo in the breadcrumb (setSelectedSilently doesn't fire onPick,
 		// so this is genuinely user-driven). is_foreign = not the workspace's own repo.
-		val isForeign = repos.find { it.repoName == repoPicker.selected }?.isCurrentRepo != true
+		val isForeign = repos.find { it.repoName == selected }?.isCurrentRepo != true
 		ai.jolli.jollimemory.core.telemetry.Telemetry.track("repo_switched", mapOf("is_foreign" to isForeign))
+		// In REPO_FILTER mode the tree also needs to know which specific repo to
+		// scope to; fire before refreshBranches so KBExplorer starts rebuilding
+		// its filtered view in parallel with the branch lookup.
+		if (mode == Mode.REPO_FILTER) onRepoFilterChanged(selected)
 		refreshBranches()
 	}
 
@@ -248,9 +347,14 @@ class BreadcrumbHeaderPanel(
 
 		private fun showPopup() {
 			if (items.isEmpty()) return
+			// The renderer needs to know the currently-selected value so it can
+			// draw a checkmark next to that row (VS Code parity). Passing it via
+			// a getter — not a snapshot at popup-open time — is defensive: the
+			// popup could outlive one paint pass, though in practice the
+			// selection can't change until the callback fires.
 			JBPopupFactory.getInstance()
 				.createPopupChooserBuilder(items)
-				.setRenderer(WorkspaceAwareCellRenderer(isWorkspaceItem))
+				.setRenderer(WorkspaceAwareCellRenderer(isWorkspaceItem) { selected })
 				.setItemChosenCallback { chosen ->
 					setSelectedSilently(chosen)
 					onPick(chosen)
@@ -261,12 +365,20 @@ class BreadcrumbHeaderPanel(
 	}
 
 	/**
-	 * Cell renderer that bolds the workspace item, appends a muted "(current)"
-	 * suffix, and draws a 1px separator below it — matching VS Code's breadcrumb
-	 * dropdown styling.
+	 * Cell renderer that:
+	 *   - bolds the workspace repo and appends a muted "(current)" suffix,
+	 *   - draws a 1px separator below the workspace row so the "All repos"
+	 *     header + workspace pair reads as a group above the alphabetical tail,
+	 *   - stamps a ✓ prefix on whichever row is currently selected in the
+	 *     picker (VS Code parity — its Memory Bank dropdown checkmarks the
+	 *     active repo).
+	 *
+	 * `getSelected` is a getter (not a snapshot) so the renderer stays correct
+	 * across repaints — see [CrumbPicker.showPopup] for the wiring rationale.
 	 */
 	private inner class WorkspaceAwareCellRenderer(
 		private val isWorkspaceItem: (String, Int) -> Boolean,
+		private val getSelected: () -> String?,
 	) : DefaultListCellRenderer() {
 		override fun getListCellRendererComponent(
 			list: JList<*>, value: Any?, index: Int, isSelected: Boolean, cellHasFocus: Boolean,
@@ -274,20 +386,24 @@ class BreadcrumbHeaderPanel(
 			val label = super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus) as JLabel
 			val strValue = value as? String ?: return label
 			val isWorkspace = isWorkspaceItem(strValue, index)
+			val isPicked = strValue == getSelected()
+			// Fixed-width check gutter so the picked row lines up with the rest,
+			// otherwise the label shifts left/right depending on which row is picked.
+			val checkPrefix = if (isPicked) "✓ " else "  "
 
 			if (isWorkspace) {
-				label.text = "<html><b>$strValue</b> <span style='color:gray'>(current)</span></html>"
+				label.text = "<html>$checkPrefix<b>$strValue</b> <span style='color:gray'>(current)</span></html>"
 				// Separator line below the workspace item.
 				if (index >= 0) {
 					label.border = BorderFactory.createCompoundBorder(
 						BorderFactory.createMatteBorder(0, 0, 1, 0, com.intellij.ui.JBColor.border()),
-						JBUI.Borders.empty(1, 2),
+						JBUI.Borders.empty(3, 12, 3, 12),
 					)
 				}
 			} else {
-				label.text = strValue
+				label.text = "$checkPrefix$strValue"
 				if (index >= 0) {
-					label.border = JBUI.Borders.empty(1, 2)
+					label.border = JBUI.Borders.empty(3, 12, 3, 12)
 				}
 			}
 			return label

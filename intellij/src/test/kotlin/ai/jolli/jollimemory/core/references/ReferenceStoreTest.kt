@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.core.references
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldMatch
 import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.string.shouldStartWith
 import org.junit.jupiter.api.Nested
@@ -73,6 +74,25 @@ class ReferenceStoreTest {
 			assertThrows<IllegalArgumentException> {
 				ReferenceStore.sanitizeNativeIdForPath(SourceId.notion, "abc\\def")
 			}
+		}
+
+		@Test
+		fun `context7 id gets sanitized like github`() {
+			// Context7 is `nativeIdPathSafe: false` in the CLI — `/org/project` must
+			// go through the same sanitize + sha8 tail as github. This test locks
+			// down that parity: an earlier version of this helper hardcoded
+			// `source == github`, which would have hit the identity branch here
+			// and thrown on the path-traversal guard for the legitimate leading `/`.
+			val result = ReferenceStore.sanitizeNativeIdForPath(SourceId.context7, "/org/project")
+			result.contains("/") shouldBe false
+			result shouldMatch Regex("^.+-[0-9a-f]{8}$")
+		}
+
+		@Test
+		fun `context7 different ids produce different output`() {
+			val a = ReferenceStore.sanitizeNativeIdForPath(SourceId.context7, "/org/proj-a")
+			val b = ReferenceStore.sanitizeNativeIdForPath(SourceId.context7, "/org/proj-b")
+			a shouldNotBe b
 		}
 	}
 

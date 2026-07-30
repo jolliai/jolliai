@@ -1,7 +1,9 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.core.CommitSummary
+import ai.jolli.jollimemory.core.FolderHealer
 import ai.jolli.jollimemory.core.KBDataCache
+import ai.jolli.jollimemory.core.KBFolderReader
 import ai.jolli.jollimemory.core.KBPathResolver
 import ai.jolli.jollimemory.core.KBRepoDiscoverer
 import ai.jolli.jollimemory.core.MetadataManager
@@ -115,6 +117,50 @@ class KBExplorerPanel(
     private var cachedRepos: List<KBRepoDiscoverer.DiscoveredRepo> = emptyList()
     private var searchQuery: String = ""
 
+    /**
+     * Repo filter driven by [BreadcrumbHeaderPanel]'s "Showing: <repo>" picker.
+     *
+     *   null                    — "All repos": render every discovered KB repo
+     *   `<repoName>` (non-null) — scope the tree to that one repo
+     *
+     * Never persisted — resets to "current repo" every time the panel loads,
+     * matching VS Code's sidebar which also starts scoped to the workspace
+     * repo and requires an explicit dropdown pick to broaden. Set from
+     * [JolliMemoryToolWindowFactory]'s onSelectionChanged callback whenever
+     * the user picks a row in the header dropdown.
+     */
+    @Volatile
+    private var repoFilter: String? = null
+
+    /**
+     * Repos whose last heal pass returned nothing-to-heal (VS Code parity via
+     * `KbFoldersService.cleanRepos`). A repo enters the set only after
+     * [FolderHealer.healVisibleMarkdown] reports `healed=0, failed=0, error=null`;
+     * subsequent tree rebuilds skip heal until the entry is invalidated. Cleared
+     * whole-hog on any KB change signal — the VFS listener when a
+     * create/delete/move lands under the Memory Bank parent, and after
+     * migration reset. Note [reloadCache] itself does NOT clear this set;
+     * callers that need to re-arm heal do the clear explicitly before
+     * calling `refresh()`. Path-keyed by the absolute `kbRoot` — a repo can
+     * move (Migrate creates `<repo>-2/`) so a stale kbRoot never keeps a
+     * fresh folder out of the heal path.
+     */
+    private val cleanRepos: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    /**
+     * Per-repo timestamp (epoch millis) of the last FAILED heal attempt.
+     * A failed heal (bridge down, CLI error) is not retried for
+     * [HEAL_ERROR_COOLDOWN_MS] so a dead daemon doesn't cause N bridge
+     * timeouts per tree rebuild × N repos. Clean passes use [cleanRepos]
+     * instead (no cooldown needed — they're free). Cleared alongside
+     * [cleanRepos] at the same call sites (VFS listener + migration reset);
+     * [reloadCache] does not clear this set on its own.
+     */
+    private val healErrorAt: java.util.concurrent.ConcurrentHashMap<String, Long> = java.util.concurrent.ConcurrentHashMap()
+
+    /** Don't retry a failed heal for 30 s — avoids N × bridge-timeout per rebuild when the daemon is down. */
+    private val HEAL_ERROR_COOLDOWN_MS = 30_000L
+
     private val statusListener: () -> Unit
     private val syncStateListener: (SyncState, SyncStatusDetail?) -> Unit
     private val busConnection: MessageBusConnection
@@ -148,8 +194,25 @@ class KBExplorerPanel(
         val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 2, 0)).apply {
             border = JBUI.Borders.empty(2)
         }
-        val btnTree = JToggleButton("Tree").apply { toolTipText = "Tree view"; putClientProperty("JButton.buttonType", "segmented"); putClientProperty("JButton.segmentPosition", "first") }
-        val btnTimeline = JToggleButton("Timeline").apply { toolTipText = "Timeline view"; putClientProperty("JButton.buttonType", "segmented"); putClientProperty("JButton.segmentPosition", "last") }
+        // Icon-only Tree / Timeline toggles, per the mock at
+        // jolli-design/extension/intellij-interactive.html:2521 which uses the
+        // VS Code codicons `type-hierarchy` and `milestone` for the same
+        // segmented control. IntelliJ's AllIcons equivalents are
+        // `Nodes.ObjectTypeAttribute` (a hierarchy glyph) and `Vcs.History`
+        // (a clock — reads as "timeline"). Text labels drop out because the
+        // right-side toolbar competes for width with the sync widget + build
+        // wiki button; two glyphs stay legible where two "Tree" / "Timeline"
+        // labels start eliding on narrow tool windows.
+        val btnTree = JToggleButton(AllIcons.Actions.ShowAsTree).apply {
+            toolTipText = "Tree view"
+            putClientProperty("JButton.buttonType", "segmented")
+            putClientProperty("JButton.segmentPosition", "first")
+        }
+        val btnTimeline = JToggleButton(AllIcons.Vcs.History).apply {
+            toolTipText = "Timeline view"
+            putClientProperty("JButton.buttonType", "segmented")
+            putClientProperty("JButton.segmentPosition", "last")
+        }
         val viewButtons = listOf(btnTree, btnTimeline)
         // Search field — only visible in Timeline view
         val searchField = com.intellij.ui.SearchTextField(false).apply {
@@ -260,6 +323,13 @@ class KBExplorerPanel(
                         (e.path ?: "").startsWith(parentStr)
                 }
                 if (hasRelevantChange) {
+                    // A create / delete / move under the Memory Bank parent is
+                    // exactly the signal that some repo's visible `.md` layer may
+                    // have drifted from its manifest — re-arm the heal check on
+                    // the next tree build. Matches VS Code's `notifyDirty()` which
+                    // fires on the same class of events.
+                    cleanRepos.clear()
+                    healErrorAt.clear()
                     ApplicationManager.getApplication().executeOnPooledThread { refresh() }
                 }
             }
@@ -306,7 +376,7 @@ class KBExplorerPanel(
         val projectPath = service.mainRepoRoot ?: project.basePath
         val currentRepoName = projectPath?.let { KBPathResolver.extractRepoName(it) }
         val currentRemoteUrl = projectPath?.let { KBPathResolver.getRemoteUrl(it) }
-        cachedRepos = KBRepoDiscoverer.discover(currentRepoName, currentRemoteUrl, config.knowledgeBasePath)
+        cachedRepos = KBRepoDiscoverer.discover(currentRepoName, currentRemoteUrl, config.localFolder)
         KBDataCache.reload(cachedRepos)
     }
 
@@ -317,13 +387,34 @@ class KBExplorerPanel(
         }
     }
 
+    /**
+     * Public entry point for the [BreadcrumbHeaderPanel] repo picker. Passing
+     * null broadens to "All repos"; a non-null [repoName] scopes the tree /
+     * timeline to that one repo. Rebuilds the current view synchronously on the
+     * calling thread (callers already run on a pool thread — the header wires
+     * this from `SwingUtilities.invokeLater`, but the rebuild itself does
+     * blocking IO so must NOT be on the EDT).
+     */
+    fun setRepoFilter(repoName: String?) {
+        if (repoFilter == repoName) return
+        repoFilter = repoName
+        ApplicationManager.getApplication().executeOnPooledThread { rebuildCurrentView() }
+    }
+
+    /** Applies [repoFilter] to the cached repo list — the single source of
+     *  truth for which repos build*() iterates. */
+    private fun filteredRepos(): List<KBRepoDiscoverer.DiscoveredRepo> {
+        val filter = repoFilter ?: return cachedRepos
+        return cachedRepos.filter { it.repoName == filter }
+    }
+
     private fun resolveKBRoot() {
         val projectPath = service.mainRepoRoot ?: project.basePath
             ?: throw IllegalStateException("No project path")
         val config = SessionTracker.loadConfig()
         val repoName = KBPathResolver.extractRepoName(projectPath)
         val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
-        val resolved = KBPathResolver.resolve(repoName, remoteUrl, config.knowledgeBasePath)
+        val resolved = KBPathResolver.resolve(repoName, remoteUrl, config.localFolder)
         KBPathResolver.initializeKBFolder(resolved, repoName, remoteUrl)
         kbRoot = resolved
         metadataManager = MetadataManager(resolved.resolve(".jolli"))
@@ -337,7 +428,9 @@ class KBExplorerPanel(
     // ── Tree building ──────────────────────────────────────────────────────
 
     private fun buildTree() {
-        val repos = cachedRepos
+        // Header repo picker's "Showing: <repo>" scopes the tree. Null filter
+        // = "All repos" and iterates the full discovered list; VS Code parity.
+        val repos = filteredRepos()
         if (repos.isEmpty()) {
             showMessageIn(treePanel, "No memories yet — commit with an AI coding tool to get started")
             return
@@ -346,13 +439,51 @@ class KBExplorerPanel(
         val rootNode = DefaultMutableTreeNode("KB")
 
         for (repo in repos) {
-            val repoMM = MetadataManager(repo.kbRoot.resolve(".jolli"))
             val badgeMap = mutableMapOf<String, String>()
             val titleMap = mutableMapOf<String, String>()
             val branchMap = mutableMapOf<String, String>()
 
-            // Build set of paths to hide (child entries after squash/consolidation)
-            val index = repoMM.readIndex()
+            // Heal missing visible Markdown BEFORE reading the manifest — mirrors
+            // VS Code's KbFoldersService, which runs `healMissingVisibleMarkdown`
+            // in the same spot. Without heal, a manifest entry whose `.md` was
+            // deleted (by the user, or a stray editor) silently disappears from
+            // the tree because the branch-directory walk below won't find the
+            // file. Heal regenerates the `.md` from `.jolli/summaries/<hash>.json`
+            // so the walk picks it up again.
+            //
+            // Guarded by [cleanRepos]: once a repo returns a clean pass (no writes
+            // performed) it is cached until the next reloadCache clears it. That
+            // keeps steady-state renders bridge-free — heal only fires when
+            // there's actually something to heal (fresh install, user deletion,
+            // manifest add without a matching visible file). Failures are logged
+            // and swallowed — the tree still renders, just without the recovery.
+            val repoKey = repo.kbRoot.toString()
+            if (repoKey !in cleanRepos) {
+                // Skip repos whose last heal FAILED within the cooldown window —
+                // a dead daemon would otherwise cause N bridge timeouts per rebuild.
+                val lastErr = healErrorAt[repoKey]
+                if (lastErr != null && System.currentTimeMillis() - lastErr < HEAL_ERROR_COOLDOWN_MS) {
+                    // still in cooldown — skip
+                } else {
+                    val healResult = FolderHealer.healVisibleMarkdown(repo.kbRoot)
+                    if (healResult.error != null) {
+                        LOG.warn("healMissingVisibleMarkdown for $repoKey: ${healResult.error}")
+                        healErrorAt[repoKey] = System.currentTimeMillis()
+                    } else {
+                        healErrorAt.remove(repoKey)
+                        if (healResult.isClean()) {
+                            cleanRepos.add(repoKey)
+                        }
+                    }
+                }
+            }
+
+            // Manifest + index are read natively (Files.readString + Gson) — same
+            // bypass VS Code's KbFoldersService.buildManifestLookup uses to keep
+            // the tree render off the ide-bridge hot path. Writes still go through
+            // MetadataManager (dual-write consistency + atomicWrite ownership stays
+            // with the CLI). See [KBFolderReader] for the lockstep contract.
+            val index = KBFolderReader.readIndex(repo.kbRoot)
             val childHashes = index?.entries
                 ?.filter { it.parentCommitHash != null }
                 ?.map { it.commitHash }
@@ -360,7 +491,7 @@ class KBExplorerPanel(
                 ?: emptySet()
             val hiddenPaths = mutableSetOf<String>()
 
-            repoMM.readManifest().files.forEach { entry ->
+            KBFolderReader.readManifest(repo.kbRoot).files.forEach { entry ->
                 badgeMap[entry.path] = when (entry.type) {
                     "commit" -> "C"; "plan" -> "P"; "note" -> "N"; else -> ""
                 }
@@ -957,6 +1088,10 @@ class KBExplorerPanel(
             val result = CliIntegrations.migrateMemoryBank(projectPath)
 
             LOG.info("Reset migration: ${result.status} (${result.migratedEntries}/${result.totalEntries})")
+            // Re-migration writes fresh JSON/Markdown to the folder; force a heal
+            // pass on the next tree build so any regenerated `.md` gaps get filled.
+            cleanRepos.clear()
+            healErrorAt.clear()
             refresh()
         } catch (e: Exception) {
             LOG.warn("Reset migration failed", e)
@@ -1021,7 +1156,7 @@ class KBExplorerPanel(
             )
             return
         }
-        val parent = config.knowledgeBasePath?.let { Path.of(it) } ?: KBPathResolver.KB_PARENT
+        val parent = config.localFolder?.let { Path.of(it) } ?: KBPathResolver.KB_PARENT
 
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Jolli Memory: Building knowledge wiki…", false) {
             override fun run(indicator: ProgressIndicator) {
@@ -1144,9 +1279,15 @@ class KBExplorerPanel(
             return
         }
 
+        // Same repo scope as the Tree view — a null filter iterates every repo
+        // (KBDataCache.byTimeline() is already multi-repo), otherwise keep only
+        // rows whose repo matches. Search text stacks on top of the scope.
+        val repoFilterCapture = repoFilter
         val rootNode = DefaultMutableTreeNode("Timeline")
         for ((dateLabel, entries) in groups) {
-            val filtered = entries.filter { matchesSearch(it.repo, it.branch, it.title, it.path) }
+            val filtered = entries
+                .filter { repoFilterCapture == null || it.repo == repoFilterCapture }
+                .filter { matchesSearch(it.repo, it.branch, it.title, it.path) }
             if (filtered.isEmpty()) continue
             val dateNode = DefaultMutableTreeNode(dateLabel)
             for (entry in filtered) {
@@ -1256,17 +1397,23 @@ class KBExplorerPanel(
                 val attrs = if (data.isCurrentRepo) SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES
                     else SimpleTextAttributes.REGULAR_ATTRIBUTES
                 append(data.name, attrs)
+                // Match VS Code's Memory Bank tree: the workspace repo carries a
+                // muted "(current)" suffix so it reads as "this project's Memory
+                // Bank" against sibling repos (agi, course, etc.) when the user
+                // has "All repos" selected.
+                if (data.isCurrentRepo) {
+                    append(" (current)", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                }
             } else if (data.isDirectory) {
                 icon = AllIcons.Nodes.Folder
                 append(data.name)
             } else {
+                // No trailing C/P/N badge — VS Code's sidebar shows only the
+                // Markdown file icon + title. The badge was a legacy IntelliJ-only
+                // affordance that added chrome without adding information (the
+                // leading file icon already discriminates .md content).
                 icon = FileTypeManager.getInstance().getFileTypeByFileName(data.name).icon
                 append(data.displayName ?: data.name)
-                when (data.badge) {
-                    "C" -> append("  C", SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, Color(0x9C, 0x27, 0xB0)))
-                    "P" -> append("  P", SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, Color(0x21, 0x96, 0xF3)))
-                    "N" -> append("  N", SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, Color(0x4C, 0xAF, 0x50)))
-                }
             }
         }
     }

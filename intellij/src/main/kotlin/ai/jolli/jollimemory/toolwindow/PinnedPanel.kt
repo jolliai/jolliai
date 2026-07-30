@@ -114,6 +114,9 @@ class PinnedPanel(
 			isEditable = false
 			isFocusable = false
 			isOpaque = false
+			// Non-null transparent bg so Swing does not paint the default opaque
+			// ancestor colour through this component; setRowHovered(false) nulls it.
+			background = Color(0, 0, 0, 0)
 			lineWrap = true
 			wrapStyleWord = true
 			border = JBUI.Borders.empty()
@@ -189,6 +192,20 @@ class PinnedPanel(
 				val contentH = maxOf(title.preferredSize.height, west.preferredSize.height, JBUI.scale(16))
 				return Dimension(base.width, contentH + ins.top + ins.bottom)
 			}
+
+			// Translucent hover tint: keep isOpaque=false so RepaintManager paints the
+			// ancestor first, then overlay the tint on top (same pattern as CommitsPanel).
+			override fun paintComponent(g: Graphics) {
+				super.paintComponent(g)
+				val bg = background ?: return
+				val g2 = g.create() as Graphics2D
+				try {
+					g2.color = bg
+					g2.fillRect(0, 0, width, height)
+				} finally {
+					g2.dispose()
+				}
+			}
 		}.apply {
 			border = JBUI.Borders.empty(2, 4)
 			alignmentX = Component.LEFT_ALIGNMENT
@@ -206,10 +223,13 @@ class PinnedPanel(
 		})
 
 		// Hover: reveal the action icons and paint a subtle highlight bar across the
-		// row (mirrors the Active Conversations rows). The row is transparent until
-		// hovered, then opaque with a translucent overlay.
+		// row (mirrors the Active Conversations rows). The row stays non-opaque;
+		// the translucent tint is painted in paintComponent so RepaintManager
+		// always repaints the ancestor first (no stale-pixel artefacts).
+		var rowHovered = false
 		fun setRowHovered(hovered: Boolean) {
-			row.isOpaque = hovered
+			if (rowHovered == hovered) return
+			rowHovered = hovered
 			row.background = if (hovered) RowStyle.HOVER_BG else null
 			actions.forEach { it.isVisible = hovered }
 			row.repaint()

@@ -1042,6 +1042,43 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 			const { compileAllRepos } = await import("../core/MultiRepoCompile.js");
 			return compileAllRepos(localFolder, config);
 		}
+		case "local-agent-tools": {
+			// The `LOCAL_AGENT_TOOLS` map in cli/src/core/localagent/ToolMeta.ts is
+			// the single source of truth for the four supported local-agent CLIs
+			// (claude-code / codex / cursor-agent / opencode). VS Code renders its
+			// Agent-tool <select> from the same map at bundle time; the IntelliJ
+			// SettingsDialog pulls this action instead so a new backend added to
+			// the map appears in the IntelliJ picker automatically, with no Kotlin
+			// port and no lockstep rule to maintain.
+			const { LOCAL_AGENT_TOOLS } = await import("../core/localagent/ToolMeta.js");
+			return {
+				tools: Object.entries(LOCAL_AGENT_TOOLS).map(([id, meta]) => ({
+					id,
+					label: meta.label,
+					loginHint: meta.loginHint,
+				})),
+			};
+		}
+		case "folder-heal-visible-markdown": {
+			// Regenerates missing `<branch>/<slug>.md` files from their canonical
+			// `.jolli/summaries/<hash>.json` counterpart, matching VS Code's
+			// KbFoldersService which fires the same heal on every tree listing.
+			// The kbRoot argument scopes the pass to one Memory Bank repo — the
+			// IntelliJ sidebar calls this once per discovered repo before
+			// rendering. `dropOrphanedManifestEntries` defaults to false because
+			// the ide-bridge can't tell whether the caller is on folder-only
+			// storage (where the manifest is the last record and dropping it is
+			// data loss); the explicit `jolli heal-folder` CLI reads
+			// `storageMode` and is the only place opt-in dropping happens.
+			const kbRoot = stringField(request, "kbRoot");
+			const dropOrphans = request.dropOrphanedManifestEntries === true;
+			const { join } = await import("node:path");
+			const { MetadataManager } = await import("../core/MetadataManager.js");
+			const { FolderStorage } = await import("../core/FolderStorage.js");
+			const mm = new MetadataManager(join(kbRoot, ".jolli"));
+			const storage = new FolderStorage(kbRoot, mm);
+			return await storage.healMissingVisibleMarkdown({ dropOrphanedManifestEntries: dropOrphans });
+		}
 		case "pr-description": {
 			const { buildPrDescription } = await import("../core/PrDescription.js");
 			return buildPrDescription(cwd, {

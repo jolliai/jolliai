@@ -26,12 +26,12 @@ object KBDataCache {
     fun reload(repos: List<KBRepoDiscoverer.DiscoveredRepo>) {
         val entries = mutableListOf<KBEntry>()
         for (repo in repos) {
-            val mm = MetadataManager(repo.kbRoot.resolve(".jolli"))
-            val manifest = mm.readManifest()
-
-            // Read index.json to identify child entries (parentCommitHash != null)
-            // that should be hidden after squash/consolidation, matching VS Code behavior.
-            val index = mm.readIndex()
+            // Manifest + index reads are native (Files.readString + Gson) — same
+            // bypass VS Code's KbFoldersService.buildManifestLookup uses to keep
+            // the sidebar off the ide-bridge hot path. See [KBFolderReader] for
+            // the lockstep contract with the CLI schemas.
+            val manifest = KBFolderReader.readManifest(repo.kbRoot)
+            val index = KBFolderReader.readIndex(repo.kbRoot)
             val childHashes = index?.entries
                 ?.filter { it.parentCommitHash != null }
                 ?.map { it.commitHash }

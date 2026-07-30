@@ -8,6 +8,7 @@ import ai.jolli.jollimemory.core.StoredSession
 import ai.jolli.jollimemory.core.ConversationUsage
 import ai.jolli.jollimemory.core.TranscriptMessageCounter
 import ai.jolli.jollimemory.core.TranscriptSource
+import ai.jolli.jollimemory.core.references.SourceDisplay
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliMemoryService
 import ai.jolli.jollimemory.toolwindow.views.ThemeUtils
@@ -369,13 +370,7 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         return out
     }
 
-    private fun referenceTag(source: SourceId): String = when (source) {
-        SourceId.linear -> "L"
-        SourceId.jira -> "J"
-        SourceId.github -> "GH"
-        SourceId.notion -> "No"
-        SourceId.slack -> "S"
-    }
+    private fun referenceTag(source: SourceId?): String = SourceDisplay.of(source).tag
 
     fun dispose() {
         service?.removeStatusListener(statusListener)

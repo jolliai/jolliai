@@ -16,9 +16,11 @@
  *   intellij/src/main/kotlin/ai/jolli/jollimemory/bridge/FolderStorageReader.kt
  * that reads the JSON layer directly (bypasses the ide-bridge daemon for
  * latency). The Kotlin reader consumes ONLY `.jolli/summaries/<hash>.json`,
- * `.jolli/plans/<slug>.md`, `.jolli/notes/<id>.md`, and the `.jolli/shadow-
- * status.json` dirty marker — any change to those file paths, folder names,
- * or the JSON schemas MUST be mirrored in that Kotlin reader in the same PR.
+ * `.jolli/plans/<slug>.md`, `.jolli/notes/<id>.md`,
+ * `.jolli/references/<source>/<sanitized-bareKey>.md`, and the
+ * `.jolli/shadow-status.json` dirty marker — any change to those file
+ * paths, folder names, or the JSON schemas MUST be mirrored in that
+ * Kotlin reader in the same PR.
  * `.jolli/index.json` is CLI-only (no read path in IntelliJ today) so its
  * schema can evolve independently; if a future Kotlin read path starts
  * consuming it, add it to the list here AND to AGENTS.md "Critical rules".

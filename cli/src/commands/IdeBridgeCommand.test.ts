@@ -342,6 +342,14 @@ vi.mock("../core/MetadataManager.js", () => {
 	return { MetadataManager };
 });
 
+vi.mock("../core/FolderStorage.js", () => {
+	const healMissingVisibleMarkdown = vi.fn().mockResolvedValue({ healed: 0, skipped: 0, failed: 0 });
+	const FolderStorage = vi.fn().mockImplementation(function FolderStorageMock() {
+		return { healMissingVisibleMarkdown };
+	});
+	return { FolderStorage };
+});
+
 vi.mock("../core/ActiveSessionAggregator.js", () => ({
 	listActiveConversationsWithDiagnostics: vi.fn().mockResolvedValue({ conversations: [], diagnostics: {} }),
 }));
@@ -874,6 +882,53 @@ describe("runIdeBridgeAction — compile", () => {
 
 	it("rejects when there is no folder configured anywhere", async () => {
 		await expect(runIdeBridgeAction("compile", "/r", { config: {} })).rejects.toThrow(/No Memory Bank folder/);
+	});
+});
+
+describe("runIdeBridgeAction — folder-heal-visible-markdown", () => {
+	it("delegates to FolderStorage.healMissingVisibleMarkdown with dropOrphans default false", async () => {
+		const { FolderStorage } = await import("../core/FolderStorage.js");
+		const { MetadataManager } = await import("../core/MetadataManager.js");
+		const result = await runIdeBridgeAction("folder-heal-visible-markdown", "/r", { kbRoot: "/bank/repo" });
+		expect(MetadataManager).toHaveBeenCalledWith("/bank/repo/.jolli");
+		expect(FolderStorage).toHaveBeenCalled();
+		const instance = vi.mocked(FolderStorage).mock.results[0]?.value as {
+			healMissingVisibleMarkdown: ReturnType<typeof vi.fn>;
+		};
+		expect(instance.healMissingVisibleMarkdown).toHaveBeenCalledWith({ dropOrphanedManifestEntries: false });
+		expect(result).toEqual({ healed: 0, skipped: 0, failed: 0 });
+	});
+
+	it("forwards dropOrphanedManifestEntries when explicitly true", async () => {
+		const { FolderStorage } = await import("../core/FolderStorage.js");
+		vi.mocked(FolderStorage).mockClear();
+		await runIdeBridgeAction("folder-heal-visible-markdown", "/r", {
+			kbRoot: "/bank/repo",
+			dropOrphanedManifestEntries: true,
+		});
+		const instance = vi.mocked(FolderStorage).mock.results[0]?.value as {
+			healMissingVisibleMarkdown: ReturnType<typeof vi.fn>;
+		};
+		expect(instance.healMissingVisibleMarkdown).toHaveBeenCalledWith({ dropOrphanedManifestEntries: true });
+	});
+
+	it("rejects when kbRoot is missing", async () => {
+		await expect(runIdeBridgeAction("folder-heal-visible-markdown", "/r", {})).rejects.toThrow(/"kbRoot"/);
+	});
+});
+
+describe("runIdeBridgeAction — local-agent-tools", () => {
+	it("returns every entry of LOCAL_AGENT_TOOLS with id/label/loginHint", async () => {
+		const { LOCAL_AGENT_TOOLS } = await import("../core/localagent/ToolMeta.js");
+		const result = (await runIdeBridgeAction("local-agent-tools", "/r", {})) as {
+			tools: Array<{ id: string; label: string; loginHint: string }>;
+		};
+		const expected = Object.entries(LOCAL_AGENT_TOOLS).map(([id, meta]) => ({
+			id,
+			label: meta.label,
+			loginHint: meta.loginHint,
+		}));
+		expect(result.tools).toEqual(expected);
 	});
 });
 

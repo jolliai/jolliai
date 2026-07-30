@@ -3,6 +3,8 @@ package ai.jolli.jollimemory.bridge
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.StatusInfo
+import ai.jolli.jollimemory.core.references.SourceId
+import ai.jolli.jollimemory.core.references.SourceIds
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 
@@ -101,6 +103,36 @@ class SummaryReader(
     /** Reads an archived markdown-note body (`notes/<id>.md`) from the orphan branch. */
     fun readNoteBody(id: String): String? =
         folder?.readNoteBody(id) ?: git.readBranchFile(ORPHAN_BRANCH, "notes/$id.md")
+
+    /**
+     * Reads an archived reference body from
+     * `references/<source>/<pathKey>.md` — the layout the CLI's
+     * `SummaryStore.storeReferences` writes on commit. Tries the folder mirror
+     * first for latency (mirrors [readPlanBody]/[readNoteBody]), then falls
+     * back to the orphan branch. Returns null when the archived md is absent.
+     *
+     * `pathKey` is the CLI-side `sanitizeNativeIdForPath` applied to the bare
+     * archivedKey. For GitHub / Context7 (`nativeIdPathSafe: false`) that
+     * folds `/` and `#` to `-` and appends an 8-hex sha256 suffix. The raw
+     * bareKey for those two sources legitimately contains `/`
+     * (`owner/repo#42-abc12345`, `/org/project`), so the prior "reject
+     * anything with `/`" guard vetoed every legitimate GitHub / Context7
+     * archivedKey — the sanitize call now IS the guard, and we defend on the
+     * sanitized stem instead.
+     */
+    fun readReferenceBody(source: SourceId, archivedKey: String): String? {
+        folder?.readReferenceBody(source, archivedKey)?.let { return it }
+        val wire = SourceIds.wireName(source)
+        val bareKey = SourceIds.stripPrefix(wire, archivedKey)
+        val stem = SourceIds.pathKey(source, bareKey)
+        // Defense-in-depth on the FINAL file stem: pathKey sanitize strips
+        // `/` and `\\` for unsafe sources and identity is only used for
+        // sources whose native ids cannot contain those bytes, so this branch
+        // is unreachable on well-formed data. Kept for tampered / older-format
+        // data that predates the sanitize contract.
+        if (".." in stem || "/" in stem || "\\" in stem) return null
+        return git.readBranchFile(ORPHAN_BRANCH, "references/$wire/$stem.md")
+    }
 
     /**
      * Reads the committed AI conversations for a commit. Looks up the

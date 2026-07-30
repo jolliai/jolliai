@@ -1513,10 +1513,42 @@ class CommitsPanel(
             })
         }
         summary?.references?.forEach { ref ->
+            // Gson leaves `source` as null when the CLI writes a source this Kotlin
+            // enum doesn't have yet (SourceId is closed here, `SourceId = string`
+            // in the CLI). Skip such rows rather than crash `referenceTag` —
+            // once the enum is extended these will start rendering again.
+            @Suppress("SENSELESS_COMPARISON") val src = ref.source ?: return@forEach
             val url = ref.url?.ifBlank { null }
-            contextRows.add(contextRow(referenceTag(ref.source), ref.title, isLink = url != null) {
+            // Only Linear/Jira/GitHub lead with the nativeId; jollimemory and other
+            // sources show just the title. Same rule as PlansPanel and VSCode's
+            // `referenceDisplayTitle`.
+            val label = ai.jolli.jollimemory.core.references.SourceDisplay.displayTitle(
+                src, ref.nativeId, ref.title,
+            )
+            // Rows with an upstream url open the browser (Linear / Jira / GitHub /
+            // …). Rows without one (jollimemory recall, and any track-only source)
+            // open the archived reference markdown — mirrors VSCode's
+            // `previewReference` webview action so the click reveals what the
+            // tool was asked, not the whole commit summary.
+            // Filled coloured badge (source brand hue) so the reference letter
+            // reads as the same visual chip VSCode paints via
+            // `.kb-tag t-ref src-<source>` — plans/notes keep the outlined dim chip
+            // by omitting tagColor.
+            val brand = ai.jolli.jollimemory.core.references.SourceDisplay.of(src)
+            contextRows.add(contextRow(brand.tag, label, isLink = true, tagColor = brand.color) {
                 trackItemOpened("reference")
-                if (url != null) BrowserUtil.browse(url) else if (commit.hasSummary) viewSummary(commit.hash)
+                if (url != null) {
+                    BrowserUtil.browse(url)
+                } else {
+                    // Source view — YAML frontmatter and HTML comments carry the
+                    // reference's metadata (source, nativeId, referencedAt,
+                    // sourceToolName, jolli:auto-note); preview would hide both.
+                    // Matches VSCode's `handlePreviewReference` which opens an
+                    // untitled markdown doc, not a rendered preview.
+                    openArchivedMarkdownSource(commit, label) {
+                        service.readArchivedReference(src, ref.archivedKey)
+                    }
+                }
             })
         }
         val contextCount = contextRows.size
@@ -1859,9 +1891,25 @@ class CommitsPanel(
      * A CONTEXT row: a small kind tag (P / N / L / GH …) + wrapping title. Clicking runs
      * [onClick] (open the plan/note body or the reference link). [isLink] styles the
      * title as a link.
+     *
+     * When [tagColor] is non-null the tag renders as a **filled coloured pill**
+     * with a white letter (matches VSCode's `.kb-tag t-ref src-<source>` styling
+     * — brand hues from [ai.jolli.jollimemory.core.references.SourceDisplay]).
+     * When null it falls back to the original outlined dim chip used for
+     * plan / note rows.
      */
-    private fun contextRow(tag: String, title: String, isLink: Boolean, onClick: () -> Unit): JComponent {
-        val tagLabel = chip(tag, CHIP_DIM_COLOR)
+    private fun contextRow(
+        tag: String,
+        title: String,
+        isLink: Boolean,
+        tagColor: Color? = null,
+        onClick: () -> Unit,
+    ): JComponent {
+        val tagLabel: JComponent = if (tagColor != null) {
+            TagLabel().apply { setBadge(tag, tagColor) }
+        } else {
+            chip(tag, CHIP_DIM_COLOR)
+        }
         val titleArea = wrappingTitleArea(title).apply {
             if (isLink) foreground = JBUI.CurrentTheme.Link.Foreground.ENABLED
         }
@@ -1885,6 +1933,19 @@ class CommitsPanel(
     }
 
     /**
+     * Opens markdown [content] read-only in a **source-view** editor — matches
+     * VSCode's `openTextDocument({content, language: "markdown"})` behaviour.
+     * Used for archived reference bodies where the YAML frontmatter and HTML
+     * comments carry information users expect to see (source id, tool name,
+     * referencedAt); preview mode would hide both.
+     */
+    private fun openMarkdownSource(content: String, name: String) {
+        val safeName = if (name.endsWith(".md")) name else "$name.md"
+        val vf = com.intellij.testFramework.LightVirtualFile(safeName, content).apply { isWritable = false }
+        MarkdownPreview.openSource(project, vf)
+    }
+
+    /**
      * Reads an archived plan/note body from committed-memory storage (off the EDT) and
      * opens it read-only; falls back to the commit memory if the body isn't found.
      */
@@ -1901,6 +1962,24 @@ class CommitsPanel(
         }
     }
 
+    /**
+     * Same as [openArchivedMarkdown] but opens the body in source view. Used for
+     * archived reference bodies — mirrors VSCode's `handlePreviewReference` which
+     * calls `openTextDocument({content, language: "markdown"})` for the same case.
+     */
+    private fun openArchivedMarkdownSource(commit: CommitSummaryBrief, title: String, read: () -> String?) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val body = read()
+            SwingUtilities.invokeLater {
+                if (body != null) {
+                    openMarkdownSource(body, title)
+                } else if (commit.hasSummary) {
+                    viewSummary(commit.hash)
+                }
+            }
+        }
+    }
+
     /** A plain indented detail row (fallbacks / placeholders). */
     private fun plainDetailRow(text: String): JComponent = JLabel(text).apply {
         foreground = UIManager.getColor("Component.infoForeground") ?: Color.GRAY
@@ -1908,14 +1987,14 @@ class CommitsPanel(
         alignmentX = Component.LEFT_ALIGNMENT
     }
 
-    /** Single-letter context tag for an external reference source. */
-    private fun referenceTag(source: ai.jolli.jollimemory.core.references.SourceId): String = when (source) {
-        ai.jolli.jollimemory.core.references.SourceId.linear -> "L"
-        ai.jolli.jollimemory.core.references.SourceId.jira -> "J"
-        ai.jolli.jollimemory.core.references.SourceId.github -> "GH"
-        ai.jolli.jollimemory.core.references.SourceId.notion -> "No"
-        ai.jolli.jollimemory.core.references.SourceId.slack -> "S"
-    }
+    /**
+     * Short letter tag for an external reference source. Sourced from the shared
+     * [ai.jolli.jollimemory.core.references.SourceDisplay] table so this file and
+     * PlansPanel/PinnedPanel show the same badge; unknown sources render as the
+     * neutral "R" placeholder instead of crashing the CONTEXT group.
+     */
+    private fun referenceTag(source: ai.jolli.jollimemory.core.references.SourceId?): String =
+        ai.jolli.jollimemory.core.references.SourceDisplay.of(source).tag
 
     /**
      * Creates a file row (indented under its commit):

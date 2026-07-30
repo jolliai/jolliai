@@ -3,15 +3,19 @@
  *
  * Pipeline (each step logged with an `[intellij:sandbox]` prefix):
  *   1. Ensure npm deps — checks `node_modules/` at repo root; runs `npm install` only if missing
- *   2. Clean sandbox cache — OPT-IN via `--clean`: removes `config/`, `system/`, `log/`
- *      under `intellij/build/idea-sandbox/<ide>/`. Off by default because deleting `config/`
- *      throws away the sandbox IDE's settings and installed plugins on every launch, which
- *      slows the workflow rather than speeding it up.
- *   3. Build + sync hooks — OPT-IN via `--sync-hooks`: `npm run build`, then copy
- *      `vscode/dist/*.js` (except Extension.js) to `~/.jolli/jollimemory/dist-intellij/`
- *      for local hook execution. Off by default because this writes to a machine-global
- *      path shared with the developer's other repos.
- *   4. Launch — `./gradlew runIde` (or `gradlew.bat runIde` on Windows)
+ *   2. Build — always runs `npm run build`. Gradle's `prepareSandbox` copies
+ *      `vscode/dist/*.js` into the sandbox plugin's `cli-dist/`, so any change to
+ *      `cli/src/**` or `vscode/src/**` must land in `vscode/dist/Cli.js` before launch
+ *      or the sandbox runs stale code. Incremental esbuild/vite is fast (~2 s), so we
+ *      just always rebuild rather than staleness-detect.
+ *   3. Clean sandbox cache — always removes `config/`, `system/`, `log/` under
+ *      `intellij/build/idea-sandbox/<ide>/` so every launch starts from a fresh sandbox
+ *      IDE. Note this discards manually-installed plugins in the sandbox, keybindings,
+ *      window layout, and the project index — first-launch indexing runs each time.
+ *   4. Sync hooks — OPT-IN via `--sync-hooks`: copy `vscode/dist/*.js` (except Extension.js)
+ *      to `~/.jolli/jollimemory/dist-intellij/` for local hook execution. Off by default
+ *      because this writes to a machine-global path shared with the developer's other repos.
+ *   5. Launch — `./gradlew runIde` (or `gradlew.bat runIde` on Windows)
  *
  * Gradle dependency downloads (IntelliJ Platform SDK, Kotlin, etc.) are cached by Gradle
  * itself under `~/.gradle/caches/` — first `runIde` downloads, subsequent runs are instant.
@@ -35,18 +39,16 @@ if (args.has("--help") || args.has("-h")) {
 	console.log(`
 Usage: node intellij/scripts/run-sandbox.mjs [flags]
 
-  --clean         Remove config/, system/, log/ from the sandbox IDE before
-                  launching. Discards sandbox settings and installed plugins.
-  --sync-hooks    Run \`npm run build\` and copy hook scripts into
+  --sync-hooks    After building, also copy hook scripts into
                   ~/.jolli/jollimemory/dist-intellij/ (machine-global path).
   --help, -h      Show this message.
 
-With no flags, only the npm install check and \`gradlew runIde\` run — the
-sandbox reuses whatever it had from the previous launch.
+The script always runs \`npm install\` (if node_modules/ is missing), then
+\`npm run build\`, wipes the sandbox IDE's config/system/log so every launch
+starts fresh, then \`gradlew runIde\`.
 `);
 	process.exit(0);
 }
-const shouldClean = args.has("--clean");
 const shouldSyncHooks = args.has("--sync-hooks");
 
 function log(msg) {
@@ -78,6 +80,15 @@ async function ensureNpmInstalled() {
 	await runCommand("npm", ["install"]);
 }
 
+async function runBuild() {
+	log("Running `npm run build` (CLI + Claude plugin + VSCode extension) …");
+	await runCommand("npm", ["run", "build"]);
+	const cliJs = join(repoRoot, "vscode", "dist", "Cli.js");
+	if (!existsSync(cliJs)) {
+		throw new Error(`vscode/dist/Cli.js missing after \`npm run build\` — build output looks incomplete.`);
+	}
+}
+
 function cleanSandboxCache() {
 	const sandboxRoot = join(repoRoot, "intellij", "build", "idea-sandbox");
 	if (!existsSync(sandboxRoot)) {
@@ -99,15 +110,9 @@ function cleanSandboxCache() {
 	log(`Cleared ${removed} sandbox cache director${removed === 1 ? "y" : "ies"}.`);
 }
 
-async function buildAndSyncHooks() {
-	log("Running `npm run build` (CLI + Claude plugin + VSCode extension) …");
-	await runCommand("npm", ["run", "build"]);
-
+function syncHooks() {
 	const source = join(repoRoot, "vscode", "dist");
 	const dest = join(homedir(), ".jolli", "jollimemory", "dist-intellij");
-	if (!existsSync(source)) {
-		throw new Error(`vscode/dist not found at ${source} — build must have failed.`);
-	}
 	mkdirSync(dest, { recursive: true });
 
 	let copied = 0;
@@ -130,15 +135,12 @@ async function runGradleSandbox() {
 
 try {
 	await ensureNpmInstalled();
-	if (shouldClean) {
-		cleanSandboxCache();
-	} else {
-		log("Skipping sandbox cache clean (pass --clean to discard config/system/log).");
-	}
+	await runBuild();
+	cleanSandboxCache();
 	if (shouldSyncHooks) {
-		await buildAndSyncHooks();
+		syncHooks();
 	} else {
-		log("Skipping hook sync (pass --sync-hooks to rebuild and copy into ~/.jolli/jollimemory/dist-intellij).");
+		log("Skipping hook sync (pass --sync-hooks to copy hooks into ~/.jolli/jollimemory/dist-intellij).");
 	}
 	await runGradleSandbox();
 } catch (err) {

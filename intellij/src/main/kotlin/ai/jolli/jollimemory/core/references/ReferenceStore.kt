@@ -7,11 +7,20 @@ import java.security.MessageDigest
 /**
  * ReferenceStore — Kotlin port of ReferenceStore.ts
  *
- * Per-reference markdown I/O: write, read, parse, hash, delete.
- * Each reference is stored at `<jolliMemoryDir>/references/<source>/<key>.md`.
+ * Per-reference markdown I/O. Each reference is stored at
+ * `<jolliMemoryDir>/references/<source>/<key>.md`. Frontmatter format:
+ * YAML-style with JSON-encoded values. The `fields:` list holds one JSON
+ * object per item. The body after `---` is the description.
  *
- * Frontmatter format: YAML-style with JSON-encoded values. The `fields:` list
- * holds one JSON object per item. The body after `---` is the description.
+ * ── LIVE PRODUCTION SURFACE ──────────────────────────────────────────────
+ * Only [readReferenceMarkdown] is called from `main/` today
+ * ([ai.jolli.jollimemory.toolwindow.PlansPanel.buildReferencePopupContent]).
+ * The write / render / delete / sanitize functions here are exercised by
+ * `ReferenceStoreTest` only — the production write path moved to the CLI
+ * (`SummaryStore.storeReferences`, `cli/src/core/references/ReferenceStore.ts`).
+ * They are kept in-tree so the Kotlin format stays byte-for-byte aligned with
+ * the CLI writer; any Kotlin caller that starts writing again picks up the
+ * exact same layout the CLI already produces.
  */
 object ReferenceStore {
 
@@ -20,7 +29,7 @@ object ReferenceStore {
 	/** Absolute directory `<jolliMemoryDir>/references/<source>`. */
 	fun referenceDir(cwd: String, source: SourceId): String {
 		val dir = JmLogger.getJolliMemoryDir(cwd)
-		return "$dir/references/${source.name}"
+		return "$dir/references/${SourceIds.wireName(source)}"
 	}
 
 	/** Absolute path to the per-reference markdown file. */
@@ -28,22 +37,33 @@ object ReferenceStore {
 		"${referenceDir(cwd, source)}/$key.md"
 
 	/**
-	 * Returns the safe file stem for a given source's nativeId.
+	 * Returns the safe file stem for a given source's nativeId — delegates to
+	 * the canonical [SourceIds.pathKey] so any callers here and the bridge-side
+	 * readers ([ai.jolli.jollimemory.bridge.FolderStorageReader],
+	 * [ai.jolli.jollimemory.bridge.SummaryReader]) cannot drift.
 	 *
-	 * Linear / Jira / Notion: identity (filesystem-safe).
-	 * GitHub: `<owner>/<repo>#<n>` → replace unsafe chars + sha256 suffix.
+	 * Kept alongside [writeReferenceMarkdown] / [renderMarkdown] as test-only
+	 * infrastructure — the production write path lives in the CLI's
+	 * `SummaryStore.storeReferences` (see AGENTS.md's "FolderStorage
+	 * hidden-layer schema stays in lockstep" note); the read path here that IS
+	 * production-live is [readReferenceMarkdown]. This function's behavior
+	 * still has to match the CLI writer byte-for-byte, which is why it stays.
+	 *
+	 * Before delegating, keeps the strict path-traversal guard for
+	 * `nativeIdPathSafe: true` sources (linear / jira / notion / …) — the
+	 * shared helper falls through to identity for those, but a Linear id
+	 * carrying `..` would still point at data any hypothetical writer must
+	 * refuse (locked down by [ReferenceStoreTest]). The unsafe sources
+	 * (github / context7) always go through the sanitize+sha8 branch, where
+	 * `/` and `#` are folded and no traversal can survive.
 	 */
 	fun sanitizeNativeIdForPath(source: SourceId, nativeId: String): String {
-		if (source == SourceId.github) {
-			val safe = nativeId.replace(Regex("[^\\w.-]"), "-")
-			val suffix = sha256(nativeId).substring(0, 8)
-			return "$safe-$suffix"
+		if (!SourceIds.isPathUnsafe(source)) {
+			if (".." in nativeId || Regex("[/\\\\]").containsMatchIn(nativeId)) {
+				throw IllegalArgumentException("Refusing unsafe ${source.name} nativeId for path: \"$nativeId\"")
+			}
 		}
-		// linear / jira / notion: identity, with path-traversal guard.
-		if (".." in nativeId || Regex("[/\\\\]").containsMatchIn(nativeId)) {
-			throw IllegalArgumentException("Refusing unsafe ${source.name} nativeId for path: \"$nativeId\"")
-		}
-		return nativeId
+		return SourceIds.pathKey(source, nativeId)
 	}
 
 	data class WriteResult(val sourcePath: String, val contentHash: String)
@@ -105,7 +125,10 @@ object ReferenceStore {
 
 	internal fun renderMarkdown(ref: Reference): String {
 		val lines = mutableListOf("---")
-		lines.add("source: ${jsonString(ref.source.name)}")
+		// Use the wire name (with hyphen for zoom_doc/zoom_meeting) so the file
+		// this writer emits parses cleanly through both the Kotlin parseMarkdown
+		// above and the TS ReferenceStore.parseMarkdown that VSCode reads.
+		lines.add("source: ${jsonString(SourceIds.wireName(ref.source))}")
 		lines.add("nativeId: ${jsonString(ref.nativeId)}")
 		lines.add("title: ${jsonString(ref.title)}")
 		// url is optional (Slack can be linkless): omit the line entirely when absent
@@ -178,7 +201,10 @@ object ReferenceStore {
 		}
 
 		val sourceStr = readString("source") ?: return null
-		val source = try { SourceId.valueOf(sourceStr) } catch (_: Exception) { return null }
+		// Lenient: accepts hyphenated ids like `zoom-doc` and returns null for
+		// sources this enum hasn't caught up with yet. The caller (Reference
+		// popup preview) handles the null-source path via SourceDisplay.unknown().
+		val source = SourceIds.parse(sourceStr) ?: return null
 		val nativeId = readString("nativeId") ?: return null
 		val title = readString("title") ?: return null
 		// url is optional (Slack can be linkless) — a missing url does not void the reference.
@@ -187,7 +213,7 @@ object ReferenceStore {
 		val sourceToolName = readString("sourceToolName") ?: return null
 
 		return Reference(
-			mapKey = "${source.name}:$nativeId",
+			mapKey = "${SourceIds.wireName(source)}:$nativeId",
 			source = source,
 			nativeId = nativeId,
 			title = title,

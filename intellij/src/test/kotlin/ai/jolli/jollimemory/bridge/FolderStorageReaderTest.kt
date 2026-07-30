@@ -1,5 +1,7 @@
 package ai.jolli.jollimemory.bridge
 
+import ai.jolli.jollimemory.core.references.SourceId
+import ai.jolli.jollimemory.core.references.SourceIds
 import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
@@ -131,6 +133,73 @@ class FolderStorageReaderTest {
 
         reader.getSummary(hash).shouldBeNull()
         reader.getSummary(hash2).shouldBeNull()
+    }
+
+    @Test
+    fun `readReferenceBody reads path-safe sources at the identity stem`() {
+        // Sources declared `nativeIdPathSafe: true` in the CLI (linear here).
+        // The archive stem IS the bareKey, so the reader must interpolate directly.
+        writeFile(".jolli/summaries/dummy.json", "{}")
+        writeFile(".jolli/references/linear/PROJ-42-abc12345.md", "linear body")
+        val reader = FolderStorageReader.forRoot(tmp.toFile().absolutePath).shouldNotBeNull()
+
+        reader.readReferenceBody(SourceId.linear, "linear:PROJ-42-abc12345") shouldBe "linear body"
+        reader.readReferenceBody(SourceId.linear, "linear:missing").shouldBeNull()
+    }
+
+    @Test
+    fun `readReferenceBody sanitizes GitHub bareKey and reads at the sanitized stem`() {
+        // GitHub archivedKey is `github:<owner>/<repo>#<n>-<shortHash>`. The CLI's
+        // orphanPathFor folds `/` and `#` to `-` and appends an 8-hex sha256 tail
+        // over the RAW bareKey; the reader MUST do the same or it will point at
+        // `references/github/owner/repo#n-…md` (nested subdirectory, wrong stem).
+        // Regression guard for the bug fixed alongside this test.
+        writeFile(".jolli/summaries/dummy.json", "{}")
+        val archivedKey = "github:owner/repo#42-abc12345"
+        val bareKey = "owner/repo#42-abc12345"
+        val stem = SourceIds.pathKey(SourceId.github, bareKey)
+        // Sanity: the stem must not contain path separators anymore.
+        (stem.contains("/") || stem.contains("#")) shouldBe false
+        writeFile(".jolli/references/github/$stem.md", "github body")
+        val reader = FolderStorageReader.forRoot(tmp.toFile().absolutePath).shouldNotBeNull()
+
+        reader.readReferenceBody(SourceId.github, archivedKey) shouldBe "github body"
+
+        // A file at the raw (un-sanitized) path is NOT what the CLI writes and
+        // must NOT be read either — the previous reader accidentally accepted it
+        // for path-safe sources but never for GitHub (the `/` would nest a
+        // subdirectory). Explicit assertion so a future refactor doesn't
+        // regress this.
+        reader.readReferenceBody(SourceId.github, "github:different/repo#42-abc12345").shouldBeNull()
+    }
+
+    @Test
+    fun `readReferenceBody sanitizes Context7 bareKey and reads at the sanitized stem`() {
+        // Context7 nativeIds are shaped `/org/project` (optionally `/org/project/version`),
+        // so the bareKey legitimately starts with `/` — the same sanitize rule as GitHub
+        // (`nativeIdPathSafe: false`) applies here. Missing this in the reader made
+        // every Context7 reference unreadable.
+        writeFile(".jolli/summaries/dummy.json", "{}")
+        val archivedKey = "context7:/org/project-abc12345"
+        val bareKey = "/org/project-abc12345"
+        val stem = SourceIds.pathKey(SourceId.context7, bareKey)
+        stem.contains("/") shouldBe false
+        writeFile(".jolli/references/context7/$stem.md", "context7 body")
+        val reader = FolderStorageReader.forRoot(tmp.toFile().absolutePath).shouldNotBeNull()
+
+        reader.readReferenceBody(SourceId.context7, archivedKey) shouldBe "context7 body"
+    }
+
+    @Test
+    fun `readReferenceBody short-circuits when the folder is dirty`() {
+        // Same dirty-marker gate as the other read methods — a shadow-write
+        // failure must not serve stale reference bodies.
+        writeFile(".jolli/summaries/dummy.json", "{}")
+        writeFile(".jolli/references/linear/PROJ-1-abc12345.md", "body")
+        writeFile(".jolli/shadow-status.json", """{"dirty":true,"lastFailedAt":"2026-01-01T00:00:00Z"}""")
+        val reader = FolderStorageReader.forRoot(tmp.toFile().absolutePath).shouldNotBeNull()
+
+        reader.readReferenceBody(SourceId.linear, "linear:PROJ-1-abc12345").shouldBeNull()
     }
 
     @Test

@@ -22,4 +22,21 @@ object MarkdownPreview {
 			}
 		}
 	}
+
+	/**
+	 * Opens a (markdown) file in **source-view** mode — the raw text of the file
+	 * as VSCode's `vscode.workspace.openTextDocument({ content, language:
+	 * "markdown" })` does. Used for archived reference bodies so the YAML
+	 * frontmatter (`source`, `nativeId`, `title`, `referencedAt`, `sourceToolName`)
+	 * and any HTML comments stay visible — preview mode hides both, and users
+	 * comparing IntelliJ to VSCode see very different content otherwise.
+	 */
+	fun openSource(project: Project, vf: VirtualFile) {
+		val editors = FileEditorManager.getInstance(project).openFile(vf, true)
+		for (editor in editors) {
+			if (editor is TextEditorWithPreview) {
+				editor.setLayout(TextEditorWithPreview.Layout.SHOW_EDITOR)
+			}
+		}
+	}
 }

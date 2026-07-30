@@ -44,6 +44,9 @@ class ConversationRowComponent(
 		isEditable = false
 		isFocusable = false
 		isOpaque = false
+		// Non-null transparent bg so Swing does not paint the default opaque
+		// ancestor colour through this component; setHovered(false) nulls it.
+		background = Color(0, 0, 0, 0)
 		lineWrap = true
 		wrapStyleWord = true
 		margin = JBUI.insets(0)
@@ -106,20 +109,38 @@ class ConversationRowComponent(
 	}
 
 	/** Swaps the right side between the message count and the hover actions. */
+	private var rowHovered = false
 	private fun setHovered(hovered: Boolean) {
+		if (rowHovered == hovered) return
+		rowHovered = hovered
 		background = if (hovered) RowStyle.HOVER_BG else null
 		countLabel.isVisible = !hovered
 		pinLabel.isVisible = hovered
 		eyeLabel.isVisible = hovered
 		resumeLabel.isVisible = hovered && canResume
 		toggleLabel.isVisible = hovered
+		repaint()
+	}
+
+	// Translucent hover tint: keep isOpaque=false so RepaintManager paints the
+	// ancestor first, then overlay the tint on top (same pattern as CommitsPanel).
+	override fun paintComponent(g: Graphics) {
+		super.paintComponent(g)
+		val bg = background ?: return
+		val g2 = g.create() as Graphics2D
+		try {
+			g2.color = bg
+			g2.fillRect(0, 0, width, height)
+		} finally {
+			g2.dispose()
+		}
 	}
 
 	init {
 		// Match PINNED's row insets (empty(2,4)); the rowsPanel adds the other 4px of
 		// side padding so the edge gaps line up across all sections.
 		border = JBUI.Borders.empty(2, 4)
-		isOpaque = true
+		isOpaque = false
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
 
 		// Left side: source badge / logo (no more checkbox), vertically centered.

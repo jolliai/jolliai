@@ -1,6 +1,10 @@
 package ai.jolli.jollimemory.core
 
+import com.google.gson.GsonBuilder
+import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 
@@ -129,6 +133,113 @@ class TypesTest {
             updates.title shouldBe "New Title"
             updates.trigger shouldBe null
             updates.response shouldBe null
+        }
+    }
+
+    /**
+     * Locks down the `knowledgeBasePath` → `localFolder` schema migration in
+     * [JolliMemoryConfig]. The field carries
+     * `@SerializedName(value = "localFolder", alternate = ["knowledgeBasePath"])`
+     * so old configs written by pre-1.1 IntelliJ (`knowledgeBasePath` only) still
+     * load, while every new save writes the canonical `localFolder` key.
+     *
+     * IMPORTANT: Gson resolves the alternate by ASSIGNING each matching key it
+     * encounters as it walks the JSON, so on a config that carries BOTH keys
+     * whichever appears LATER in the JSON stream wins — the primary and the
+     * alternate compete on file order, not on "primary wins". A pre-1.1
+     * config with only `knowledgeBasePath` still migrates cleanly (the tests
+     * below prove it); the risk lives entirely in configs that were written
+     * with both keys by some intermediate/broken code path. If that becomes a
+     * real user-reported failure mode, either normalize the JSON before
+     * parsing or drop the alternate and do an explicit on-load fixup.
+     *
+     * Uses the same `serializeNulls()` builder [SessionTracker] uses so the
+     * observed behavior matches production.
+     */
+    @Nested
+    inner class LocalFolderMigration {
+        // Matches SessionTracker.gson (serializeNulls() flips the roundtrip
+        // semantics for the null-primary edge case).
+        private val gson = GsonBuilder().serializeNulls().create()
+
+        @Test
+        fun `legacy-only knowledgeBasePath deserializes into localFolder`() {
+            val json = """{ "knowledgeBasePath": "/legacy/path" }"""
+            val cfg = gson.fromJson(json, JolliMemoryConfig::class.java)
+            cfg.localFolder shouldBe "/legacy/path"
+        }
+
+        @Test
+        fun `new-only localFolder deserializes normally`() {
+            val json = """{ "localFolder": "/new/path" }"""
+            val cfg = gson.fromJson(json, JolliMemoryConfig::class.java)
+            cfg.localFolder shouldBe "/new/path"
+        }
+
+        @Test
+        fun `absent-both stays null`() {
+            val cfg = gson.fromJson("{}", JolliMemoryConfig::class.java)
+            cfg.localFolder.shouldBeNull()
+        }
+
+        @Test
+        fun `both keys present — later key in JSON order wins`() {
+            // Documents Gson's actual alternate rule: as the parser walks the
+            // JSON top-to-bottom, EVERY matching key (primary or alternate)
+            // assigns the field, so the LATER occurrence overwrites the
+            // earlier one. This is NOT "primary wins"; there is no priority
+            // between value and alternate at all.
+            //
+            // Practical impact: a hand-edited or intermediate-build config
+            // whose keys landed in an unexpected order can flip which value
+            // the plugin loads. The intended migration path (files with only
+            // the legacy key) is unaffected — see the `legacy-only …` test.
+            gson.fromJson(
+                """{ "localFolder": "/new", "knowledgeBasePath": "/legacy" }""",
+                JolliMemoryConfig::class.java,
+            ).localFolder shouldBe "/legacy"
+
+            gson.fromJson(
+                """{ "knowledgeBasePath": "/legacy", "localFolder": "/new" }""",
+                JolliMemoryConfig::class.java,
+            ).localFolder shouldBe "/new"
+        }
+
+        @Test
+        fun `null primary followed by legacy key — legacy value is picked up`() {
+            // Same rule as above applied to the "primary null" edge case:
+            // because the legacy key sits AFTER `"localFolder": null` in the
+            // JSON, it overwrites the null and the user's setting survives.
+            // This test exists so a future regression that reintroduces
+            // "primary-wins" (silently dropping the user's setting) fails
+            // loudly. If the file order flips (legacy first, then primary
+            // null), the reverse holds — a real risk case documented by the
+            // next test.
+            val json = """{ "localFolder": null, "knowledgeBasePath": "/legacy" }"""
+            val cfg = gson.fromJson(json, JolliMemoryConfig::class.java)
+            cfg.localFolder shouldBe "/legacy"
+        }
+
+        @Test
+        fun `legacy key followed by null primary — legacy value IS silently dropped`() {
+            // REGRESSION-GUARD RISK CASE. With the legacy key parsed first
+            // and `localFolder: null` following it, the null wins and the
+            // user's setting is silently dropped. This can only happen if
+            // some code path writes both keys with the primary explicitly
+            // null — no current write path in `main/` does this, but a
+            // partial-merge helper (SessionTracker.saveSharedProviderConfig
+            // et al.) or a hand edit can produce it.
+            val json = """{ "knowledgeBasePath": "/legacy", "localFolder": null }"""
+            val cfg = gson.fromJson(json, JolliMemoryConfig::class.java)
+            cfg.localFolder.shouldBeNull()
+        }
+
+        @Test
+        fun `serialization always writes localFolder — legacy key self-heals`() {
+            val cfg = JolliMemoryConfig(localFolder = "/anywhere")
+            val out = gson.toJson(cfg)
+            out shouldContain "\"localFolder\":\"/anywhere\""
+            out shouldNotContain "knowledgeBasePath"
         }
     }
 }

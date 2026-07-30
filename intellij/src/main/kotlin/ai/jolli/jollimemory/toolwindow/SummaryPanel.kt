@@ -2109,7 +2109,6 @@ class SummaryPanel(
                 return@executeOnPooledThread
             }
             ApplicationManager.getApplication().invokeLater {
-                val displayTitle = "$nativeId — $title"
                 val tmpFile = java.io.File.createTempFile("jm-ref-", ".md")
                 tmpFile.writeText(content)
                 tmpFile.deleteOnExit()
@@ -2165,7 +2164,13 @@ class SummaryPanel(
 
     private fun handleRemoveReference(archivedKey: String, source: String, nativeId: String, title: String) {
         ApplicationManager.getApplication().invokeLater {
-            val displayName = if (nativeId.isNotBlank()) "$nativeId — $title" else title
+            // Confirm-dialog label matches the sidebar row (VSCode's
+            // `referenceDisplayTitle`): Linear/Jira/GitHub prepend the nativeId,
+            // everyone else shows just the title.
+            val sourceId = ai.jolli.jollimemory.core.references.SourceIds.parse(source)
+            val displayName = ai.jolli.jollimemory.core.references.SourceDisplay.displayTitle(
+                sourceId, nativeId, title,
+            )
             val choice = Messages.showYesNoDialog(project, "The reference will no longer be associated with this commit.", "Remove reference \"$displayName\"?", "Remove", "Cancel", Messages.getWarningIcon())
             if (choice != Messages.YES) return@invokeLater
             val myGen = summaryGeneration
