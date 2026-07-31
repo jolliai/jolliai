@@ -8,6 +8,7 @@
 
 import type { CommitSummary, E2eTestScenario, ReferenceCommitRef, SourceId } from "../Types.js";
 import { escMdLinkText, escMdStrikeText, escMdUrl } from "./MarkdownEscape.js";
+import { REF_HASH_SUFFIX } from "./RefMerge.js";
 import { referenceDisplayTitle } from "./references/ReferenceDisplay.js";
 import { getRegistry } from "./references/SourceDefinitionRegistry.js";
 import { buildSkillsSummaryLabel } from "./SkillsAggregateMarkdown.js";
@@ -154,19 +155,17 @@ export function referencesBySourceOrder(
 	return out;
 }
 
-/** Archive suffix on committed plan slugs / note ids (`slug-<hash8>`). Relevance
- *  keys are working-area identities (pre-archive), so lookups try the exact key
- *  first and then this stripped form. Mirrors QueueWorker's REF_HASH_SUFFIX. */
-const ARCHIVE_HASH_SUFFIX = /-[0-9a-f]{8}$/;
-
 /** Relevance lookup for one archived ref: exact key first (covers unarchived or
- *  naturally-hex-ending working keys), then the archive-suffix-stripped base. */
+ *  naturally-hex-ending working keys), then the archive-suffix-stripped base.
+ *  `REF_HASH_SUFFIX` (from RefMerge) is the archive suffix on committed plan slugs
+ *  / note ids (`slug-<hash8>`); relevance keys are working-area identities, i.e.
+ *  pre-archive, which is why the stripped form has to be tried at all. */
 function lookupRelevance(
 	map: ReadonlyMap<string, { tier: "high" | "mid" | "low"; reason: string }>,
 	kind: "plan" | "note" | "reference",
 	key: string,
 ): { tier: "high" | "mid" | "low"; reason: string } | undefined {
-	return map.get(`${kind}:${key}`) ?? map.get(`${kind}:${key.replace(ARCHIVE_HASH_SUFFIX, "")}`);
+	return map.get(`${kind}:${key}`) ?? map.get(`${kind}:${key.replace(REF_HASH_SUFFIX, "")}`);
 }
 
 const TIER_LABEL = { high: "High", mid: "Med", low: "Low" } as const;

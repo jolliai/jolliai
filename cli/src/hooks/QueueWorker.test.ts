@@ -3062,7 +3062,13 @@ describe("QueueWorker", () => {
 				firstUsedAt: "2026-04-01T09:00:00.000Z",
 				lastUsedAt: "2026-04-01T09:30:00.000Z",
 			};
-			vi.mocked(associateSkillsWithCommit).mockResolvedValue({
+			// `…Once`, not `mockResolvedValue`: this path calls associateSkillsWithCommit
+			// TWICE (here, then again inside consumeWorkspaceContext), and the real second
+			// call finds nothing — uncommittedDelta returns undefined once the first call
+			// has advanced `archivedTotals` to the row's total. The beforeEach default
+			// ({ refs: [], filesToStore: [] }) models that. A blanket mockResolvedValue
+			// would instead hand the SAME delta back twice, which is the race below.
+			vi.mocked(associateSkillsWithCommit).mockResolvedValueOnce({
 				refs: [skillRef],
 				filesToStore: [{ path: "skills/claude/superpowers-brainstorming-newhash1.md", content: "# x" }],
 			});
@@ -3081,9 +3087,70 @@ describe("QueueWorker", () => {
 				"feature/test",
 				new Set(),
 			);
-			expect(storeSkills).toHaveBeenCalled();
-			// And handed to mergeManyToOne so the root it writes carries them.
-			expect(vi.mocked(mergeManyToOne).mock.calls[0]?.[6]).toEqual([skillRef]);
+			// Exactly once: the no-op second association must not emit a second batch of
+			// orphan-branch bytes. Loosening this to toHaveBeenCalled() is what let the
+			// double archival below go unnoticed.
+			expect(storeSkills).toHaveBeenCalledTimes(1);
+			// And handed to mergeManyToOne so the root it writes carries them. Asserted by
+			// NAME, not argument position — the optional tail is one options object.
+			expect(vi.mocked(mergeManyToOne).mock.calls[0]?.[3]?.extraSkills).toEqual([skillRef]);
+		});
+
+		it("carries a skill archived by the SECOND association too (no stranded orphan bytes)", async () => {
+			// The race the merged `extraSkills` exists for. consumeWorkspaceContext archives
+			// skills as well, so this path calls associateSkillsWithCommit twice, and a skill
+			// entered for the FIRST time between the two calls (the Stop hook writes
+			// plans.json asynchronously) yields a real delta on the second one. Being a
+			// different skill, it gets its own archivedKey and its own orphan-branch path —
+			// so dropping its ref, as this call site used to, left those bytes with no
+			// summary pointer AND the row guarded, i.e. never re-archived. Permanent.
+			//
+			// Note the same-skill case is NOT this bug: both calls share the commit hash, so
+			// archivedKey and the orphan path are identical, the second write overwrites the
+			// first and the existing ref still points at it. mergeSkillRefs deliberately
+			// dedupes such a repeat rather than summing it (see its header — a squash tree
+			// meets each hoisted ref twice), so that window costs an undercount, not bytes.
+			const { associateSkillsWithCommit } = await import("../core/skills/SkillArchive.js");
+			const { getSummary, mergeManyToOne, storeSkills } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 5,
+				commitHash: "oldhash",
+				commitMessage: "Old",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Old topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			const base = {
+				source: "claude" as const,
+				entryPaths: ["tool" as const],
+				invocationCount: 1,
+				firstUsedAt: "2026-04-01T09:00:00.000Z",
+				lastUsedAt: "2026-04-01T09:30:00.000Z",
+			};
+			vi.mocked(associateSkillsWithCommit)
+				.mockResolvedValueOnce({
+					refs: [{ ...base, archivedKey: "claude:brainstorming-newhash2", skill: "brainstorming" }],
+					filesToStore: [{ path: "skills/claude/brainstorming-newhash2.md", content: "# a" }],
+				})
+				// Landed during the window — a skill the first call could not have seen.
+				.mockResolvedValueOnce({
+					refs: [{ ...base, archivedKey: "claude:writing-plans-newhash2", skill: "writing-plans" }],
+					filesToStore: [{ path: "skills/claude/writing-plans-newhash2.md", content: "# b" }],
+				});
+			setupPipelineMocks("newhash2");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "newhash2", sourceHashes: ["oldhash"] }),
+				"/test/cwd",
+			);
+
+			// Both associations wrote their own bytes to the orphan branch…
+			expect(storeSkills).toHaveBeenCalledTimes(2);
+			// …and the summary points at both, so neither file is stranded.
+			const extraSkills = vi.mocked(mergeManyToOne).mock.calls[0]?.[3]?.extraSkills;
+			expect(extraSkills?.map((s) => s.skill)).toEqual(["brainstorming", "writing-plans"]);
 		});
 
 		it("passes user skill exclusions INTO the squash association, not as a post-filter", async () => {
@@ -3185,18 +3252,19 @@ describe("QueueWorker", () => {
 				"/test/cwd",
 			);
 
-			// runSquashPipeline calls mergeManyToOne with a 5th `consolidated`
-			// argument (LLM result or mechanicalConsolidate fallback).
+			// runSquashPipeline passes `options.consolidated` (LLM result or
+			// mechanicalConsolidate fallback) plus the refs it just consumed.
 			expect(mergeManyToOne).toHaveBeenCalledWith(
 				expect.any(Array),
 				expect.objectContaining({ hash: "newhash123" }),
 				"/test/cwd",
-				expect.objectContaining({ commitSource: "cli", commitType: "squash" }),
-				expect.objectContaining({ topics: expect.any(Array) }),
-				// 6th `storage` is left undefined; 7th carries the skill refs archived for
-				// THIS squash (see runSquashPipeline).
-				undefined,
-				expect.any(Array),
+				expect.objectContaining({
+					metadata: expect.objectContaining({ commitSource: "cli", commitType: "squash" }),
+					consolidated: expect.objectContaining({ topics: expect.any(Array) }),
+					extraRefs: expect.objectContaining({ plans: expect.any(Array) }),
+					// Skill refs archived for THIS squash (see runSquashPipeline).
+					extraSkills: expect.any(Array),
+				}),
 			);
 		});
 
@@ -3222,7 +3290,7 @@ describe("QueueWorker", () => {
 			);
 
 			expect(mergeManyToOne).toHaveBeenCalledTimes(1);
-			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][4];
+			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][3]?.consolidated;
 			expect(consolidatedArg?.summaryError).toBe("llm-failed");
 			expect((consolidatedArg?.topics ?? []).length).toBeGreaterThan(0); // mechanical preserved content
 		});
@@ -3249,7 +3317,7 @@ describe("QueueWorker", () => {
 			);
 
 			expect(mergeManyToOne).toHaveBeenCalledTimes(1);
-			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][4];
+			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][3]?.consolidated;
 			expect(consolidatedArg?.summaryError).toBeUndefined();
 		});
 
@@ -3297,7 +3365,7 @@ describe("QueueWorker", () => {
 			);
 
 			expect(mergeManyToOne).toHaveBeenCalledTimes(1);
-			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][4];
+			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][3]?.consolidated;
 			expect(consolidatedArg?.summaryError).toBe("llm-failed");
 		});
 
@@ -3340,7 +3408,7 @@ describe("QueueWorker", () => {
 			);
 
 			expect(mergeManyToOne).toHaveBeenCalledTimes(1);
-			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][4];
+			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][3]?.consolidated;
 			expect(consolidatedArg?.summaryError).toBeUndefined();
 		});
 
@@ -3370,8 +3438,331 @@ describe("QueueWorker", () => {
 			);
 
 			expect(mergeManyToOne).toHaveBeenCalledTimes(1);
-			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][4];
+			const consolidatedArg = vi.mocked(mergeManyToOne).mock.calls[0][3]?.consolidated;
 			expect(consolidatedArg?.summaryError).toBe("llm-failed");
+		});
+
+		// ── Working-area Context consumption on the squash paths ────────────
+		// runSquashPipeline used to call only reassociateMetadata (migrate the
+		// OLD summaries' refs onto the new hash) and never consumeWorkspaceContext
+		// (archive the refs the user activated for THIS commit). A reference
+		// captured during the session that ended in a squash was therefore left
+		// active on the panel with no pointer from the squash memory.
+		it("squash archives an active reference onto the squash commit", async () => {
+			const { getSummary, mergeManyToOne, storeReferences } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 5,
+				commitHash: "sqsrc1",
+				commitMessage: "Src",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Src topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			setupPipelineMocks("sqref123def45678");
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{ mapKey: "linear:PROJ-9", source: "linear", sourcePath: "/ref.md" },
+			]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				references: {
+					"linear:PROJ-9": {
+						source: "linear",
+						nativeId: "PROJ-9",
+						title: "Proj nine",
+						url: "https://linear.app/x/PROJ-9",
+						sourcePath: "/ref.md",
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				},
+			});
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockResolvedValue({
+				mapKey: "linear:PROJ-9",
+				source: "linear",
+				nativeId: "PROJ-9",
+				title: "Proj nine",
+				url: "https://linear.app/x/PROJ-9",
+				toolName: "mcp__linear__get_issue",
+				referencedAt: "2026-05-14T06:06:01.123Z",
+			});
+			const { readFile } = await import("node:fs/promises");
+			(readFile as unknown as { mockResolvedValue: (v: string) => void }).mockResolvedValue("ref content");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sqref123def45678", sourceHashes: ["sqsrc1"] }),
+				"/test/cwd",
+			);
+
+			// Orphan-branch snapshot written for the squash hash…
+			expect(storeReferences).toHaveBeenCalledTimes(1);
+			// …and the new ref is handed to mergeManyToOne so the merged root points at it.
+			const extraRefs = vi.mocked(mergeManyToOne).mock.calls[0][3]?.extraRefs;
+			expect(extraRefs?.references?.map((r) => r.archivedKey)).toEqual(["linear:PROJ-9-sqref123"]);
+		});
+
+		it("squash archives an active plan onto the squash commit", async () => {
+			const { getSummary, mergeManyToOne, storePlans } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 5,
+				commitHash: "sqsrc2",
+				commitMessage: "Src",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Src topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			setupPipelineMocks("sqplan12def34567");
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {
+					"my-plan": {
+						slug: "my-plan",
+						title: "My plan",
+						sourcePath: "/x/my-plan.md",
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						commitHash: null,
+					},
+				},
+			} as Awaited<ReturnType<typeof loadPlansRegistry>>);
+			vi.mocked(existsSync).mockReturnValue(true);
+			vi.mocked(readFileSync).mockReturnValue("# My plan");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sqplan12def34567", sourceHashes: ["sqsrc2"] }),
+				"/test/cwd",
+			);
+
+			expect(storePlans).toHaveBeenCalledTimes(1);
+			const extraRefs = vi.mocked(mergeManyToOne).mock.calls[0][3]?.extraRefs;
+			expect(extraRefs?.plans?.map((p) => p.slug)).toEqual(["my-plan-sqplan12"]);
+		});
+
+		it("squash archives an active note onto the squash commit", async () => {
+			// The third artifact type consumeWorkspaceContext returns. Covered
+			// explicitly because plans/notes/references each have their own detect →
+			// associate → store triplet, so a plan passing proves nothing about notes.
+			const { getSummary, mergeManyToOne, storeNotes } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 5,
+				commitHash: "sqsrc4",
+				commitMessage: "Src",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Src topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			setupPipelineMocks("sqnote12def34567");
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				notes: {
+					"my-note": {
+						id: "my-note",
+						title: "My note",
+						format: "markdown" as const,
+						sourcePath: "/x/my-note.md",
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						commitHash: null,
+					},
+				},
+			} as Awaited<ReturnType<typeof loadPlansRegistry>>);
+			vi.mocked(existsSync).mockReturnValue(true);
+			vi.mocked(readFileSync).mockReturnValue("# My note");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sqnote12def34567", sourceHashes: ["sqsrc4"] }),
+				"/test/cwd",
+			);
+
+			expect(storeNotes).toHaveBeenCalledTimes(1);
+			const extraRefs = vi.mocked(mergeManyToOne).mock.calls[0][3]?.extraRefs;
+			expect(extraRefs?.notes?.map((n) => n.id)).toEqual(["my-note-sqnote12"]);
+		});
+
+		it("falls back to the source summaries' branch when the live read fails", async () => {
+			// The queue entry carries no branch (both enqueue hooks omit the field when
+			// their own read failed) and the live read throws. Archival must NOT be
+			// skipped: skill archival on this path takes its branch from the source
+			// summaries and would proceed regardless, so bailing here produced a squash
+			// that recorded skills but not plans/notes/references. The source summaries'
+			// branch is already in hand and cannot throw, so it backstops the live read.
+			const { getSummary, storeReferences } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 5,
+				commitHash: "sqsrc5",
+				commitMessage: "Src",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/from-summary",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Src topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			setupPipelineMocks("sqnobr12def34567");
+			// makeCommitOp carries no `branch`, so the pipeline falls through to the
+			// live read — which fails here.
+			vi.mocked(getCurrentBranch).mockRejectedValue(new Error("fatal: not a git repository"));
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{ mapKey: "linear:PROJ-7", source: "linear", sourcePath: "/ref.md" },
+			]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				references: {
+					"linear:PROJ-7": {
+						source: "linear",
+						nativeId: "PROJ-7",
+						title: "Proj seven",
+						url: "https://linear.app/x/PROJ-7",
+						sourcePath: "/ref.md",
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				},
+			});
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockResolvedValue({
+				mapKey: "linear:PROJ-7",
+				source: "linear",
+				nativeId: "PROJ-7",
+				title: "Proj seven",
+				url: "https://linear.app/x/PROJ-7",
+				toolName: "mcp__linear__get_issue",
+				referencedAt: "2026-05-14T06:06:01.123Z",
+			});
+			const { readFile } = await import("node:fs/promises");
+			(readFile as unknown as { mockResolvedValue: (v: string) => void }).mockResolvedValue("ref content");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sqnobr12def34567", sourceHashes: ["sqsrc5"] }),
+				"/test/cwd",
+			);
+
+			// Archival happened, filed under the fallback branch rather than skipped.
+			expect(detectUncommittedReferenceIds).toHaveBeenCalledWith("/test/cwd", "feature/from-summary");
+			expect(storeReferences).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(storeReferences).mock.calls[0][3]).toBe("feature/from-summary");
+		});
+
+		it("prefers the enqueue-time branch hint over a live read", async () => {
+			// The worker drains asynchronously, so HEAD may have moved since the commit.
+			// `op.branch` is the branch as of enqueue and must win outright — a live read
+			// on this path is not merely redundant, it can file the archive under whatever
+			// branch a sibling worktree or a later checkout left at HEAD.
+			const { getSummary } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 5,
+				commitHash: "sqsrc6",
+				commitMessage: "Src",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/stale-summary-branch",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Src topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			setupPipelineMocks("sqhint12def34567");
+			vi.mocked(getCurrentBranch).mockClear();
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({
+					commitHash: "sqhint12def34567",
+					sourceHashes: ["sqsrc6"],
+					branch: "feature/hinted",
+				}),
+				"/test/cwd",
+			);
+
+			expect(detectUncommittedReferenceIds).toHaveBeenCalledWith("/test/cwd", "feature/hinted");
+			// Not consulted at all — the hint short-circuits it.
+			expect(getCurrentBranch).not.toHaveBeenCalled();
+		});
+
+		it("squash invalidates the panel's cached AI ranking", async () => {
+			// A squash always moves HEAD, so the stored change fingerprint is stale —
+			// a later commit must not reuse its exclude decisions. Mirrors the amend
+			// paths, which clear up front for the same reason.
+			const { getSummary } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 5,
+				commitHash: "sqsrc3",
+				commitMessage: "Src",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Src topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			setupPipelineMocks("sqclear1def23456");
+			vi.mocked(clearAiSelection).mockClear();
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "sqclear1def23456", sourceHashes: ["sqsrc3"] }),
+				"/test/cwd",
+			);
+
+			expect(clearAiSelection).toHaveBeenCalledWith("/test/cwd");
+		});
+
+		it("rebase-squash also archives an active reference (same pipeline)", async () => {
+			const { getSummary, storeReferences } = await import("../core/SummaryStore.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 5,
+				commitHash: "rbsrc1",
+				commitMessage: "Src",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Src topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			setupPipelineMocks("rbsq1234def56789");
+			vi.mocked(detectUncommittedReferenceIds).mockResolvedValue([
+				{ mapKey: "linear:PROJ-8", source: "linear", sourcePath: "/ref.md" },
+			]);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				references: {
+					"linear:PROJ-8": {
+						source: "linear",
+						nativeId: "PROJ-8",
+						title: "Proj eight",
+						url: "https://linear.app/x/PROJ-8",
+						sourcePath: "/ref.md",
+						addedAt: "2026-04-01T00:00:00Z",
+						updatedAt: "2026-04-01T00:00:00Z",
+						sourceToolName: "mcp__linear__get_issue",
+					},
+				},
+			});
+			const { readReferenceMarkdown } = await import("../core/references/ReferenceStore.js");
+			vi.mocked(readReferenceMarkdown).mockResolvedValue({
+				mapKey: "linear:PROJ-8",
+				source: "linear",
+				nativeId: "PROJ-8",
+				title: "Proj eight",
+				url: "https://linear.app/x/PROJ-8",
+				toolName: "mcp__linear__get_issue",
+				referencedAt: "2026-05-14T06:06:01.123Z",
+			});
+			const { readFile } = await import("node:fs/promises");
+			(readFile as unknown as { mockResolvedValue: (v: string) => void }).mockResolvedValue("ref content");
+
+			await __test__.handleRebaseSquashFromQueue(
+				makeCommitOp({ type: "rebase-squash", commitHash: "rbsq1234def56789", sourceHashes: ["rbsrc1"] }),
+				"/test/cwd",
+			);
+
+			expect(storeReferences).toHaveBeenCalledTimes(1);
 		});
 	});
 
@@ -4662,33 +5053,9 @@ describe("QueueWorker", () => {
 
 	// ─── amend Context consumption: new-wins ref union, audit filter, plan soft-exclude, fresh-leaf refs ───
 	describe("amend workspace-Context consumption", () => {
-		const bySlug = (r: { slug: string }) => r.slug;
-
-		describe("mergeRefsNewWins", () => {
-			it("returns [] for empty / undefined inputs", () => {
-				expect(__test__.mergeRefsNewWins(undefined, undefined, bySlug)).toEqual([]);
-				expect(__test__.mergeRefsNewWins([], [], bySlug)).toEqual([]);
-			});
-
-			it("keeps old refs when there are no new refs", () => {
-				const old = [{ slug: "a" }, { slug: "b" }];
-				expect(__test__.mergeRefsNewWins(old, undefined, bySlug)).toEqual(old);
-			});
-
-			it("unions non-colliding new refs after the old ones", () => {
-				const merged = __test__.mergeRefsNewWins([{ slug: "a" }], [{ slug: "b" }], bySlug);
-				expect(merged.map(bySlug)).toEqual(["a", "b"]);
-			});
-
-			it("new ref wins on base-key collision (drops the stale old snapshot)", () => {
-				const merged = __test__.mergeRefsNewWins(
-					[{ slug: "a", tag: "old" }],
-					[{ slug: "a", tag: "new" }],
-					bySlug,
-				);
-				expect(merged).toEqual([{ slug: "a", tag: "new" }]);
-			});
-		});
+		// mergeRefsNewWins itself now lives in core/RefMerge (both hoisted roots need
+		// it — amend and squash, with different dedupe keys); its unit tests, and the
+		// coverage of which key family each path must use, live in RefMerge.test.ts.
 
 		describe("buildHoistedAmendRoot ref merge + audit", () => {
 			const newInfo: CommitInfo = {

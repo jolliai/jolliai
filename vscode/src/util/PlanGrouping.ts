@@ -11,6 +11,7 @@
  * push-to-Jolli path (latestPlanPerName) so the two never drift.
  */
 
+import { REF_HASH_SUFFIX } from "../../../cli/src/core/RefMerge.js";
 import type { PlanReference } from "../../../cli/src/Types.js";
 
 /** A plan plus its standing among its same-named siblings. */
@@ -26,9 +27,13 @@ export interface AnnotatedPlan {
  * Strips a trailing archived commit-hash suffix (`-<8 hex>`) to get the base
  * name. Committed snapshots (`refactor-auth-a1b2c3d4`) and an uncommitted base
  * (`refactor-auth`) collapse to the same key.
+ *
+ * Shares `REF_HASH_SUFFIX` with cli's `baseKeyOf.plan` / `planBaseKey` rather than
+ * re-spelling the pattern: this is the same base key the amend hoist dedupes by, and
+ * a drift would have the panel group snapshots the summary kept apart.
  */
 export function planBaseKey(slug: string): string {
-	return slug.replace(/-[0-9a-f]{8}$/, "");
+	return slug.replace(REF_HASH_SUFFIX, "");
 }
 
 /**

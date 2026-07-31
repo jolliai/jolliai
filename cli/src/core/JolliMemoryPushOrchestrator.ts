@@ -31,6 +31,7 @@ import { loadBranchSummaries } from "./PrDescription.js";
 import { isOutboundPushAllowed, PushDisabledError } from "./PushControl.js";
 import { loadPushPending } from "./PushPendingStore.js";
 import { isRepoWideRefusal } from "./PushRefusal.js";
+import { REF_HASH_SUFFIX } from "./RefMerge.js";
 import { readReferenceMarkdownFromString } from "./references/ReferenceStore.js";
 import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import type { StorageProvider } from "./StorageProvider.js";
@@ -169,9 +170,13 @@ export function applyReferenceUrls(
  * Strips a trailing archived commit-hash suffix (`-<8 hex>`) to get the base
  * name. Committed snapshots (`refactor-auth-a1b2c3d4`) and an uncommitted base
  * (`refactor-auth`) collapse to the same key.
+ *
+ * Shares `REF_HASH_SUFFIX` with RefMerge's `baseKeyOf.plan` rather than re-spelling
+ * the pattern: this is the same base key the amend hoist dedupes by, and a drift
+ * between the two would have the push path group snapshots the summary kept apart.
  */
 export function planBaseKey(slug: string): string {
-	return slug.replace(/-[0-9a-f]{8}$/, "");
+	return slug.replace(REF_HASH_SUFFIX, "");
 }
 
 /**

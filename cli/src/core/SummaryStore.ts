@@ -43,6 +43,7 @@ import { CURRENT_SCHEMA_VERSION } from "../Types.js";
 import { getDiffStats, getTreeHash } from "./GitOps.js";
 import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
+import { mergeRefsNewWins, snapshotKeyOf } from "./RefMerge.js";
 import { isRegisteredSourceId, sanitizeNativeIdForPath } from "./references/ReferenceStore.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import type { SquashConsolidationSource } from "./Summarizer.js";
@@ -664,6 +665,17 @@ export function collectChildSkills(nodes: ReadonlyArray<CommitSummary>): Readonl
 	return mergeSkillRefs(all);
 }
 
+/**
+ * Working-area Context refs a caller just associated with the new commit, to be
+ * merged into a hoisted root alongside the refs inherited from its children.
+ * Mirrors the `newRefs` parameter of `buildHoistedAmendRoot`.
+ */
+export interface NewlyAssociatedRefs {
+	readonly plans?: ReadonlyArray<PlanReference>;
+	readonly notes?: ReadonlyArray<NoteReference>;
+	readonly references?: ReadonlyArray<ReferenceCommitRef>;
+}
+
 /** Returns a deep copy of the summary tree with Jolli metadata stripped from all nodes. */
 function stripJolliMetadata(node: CommitSummary): CommitSummary {
 	const { jolliDocId: _d, jolliDocUrl: _u, orphanedDocIds: _o, unresolvedOrphanHashes: _h, ...rest } = node;
@@ -1063,23 +1075,38 @@ export interface ConsolidatedTopics {
  * E2E test guides, plans, notes, jolliDoc metadata are still hoisted from
  * children via the existing collect* helpers; that part of the contract is
  * unchanged. The new piece is topics/recap going in via `consolidated`.
+ *
+ * `options.extraRefs` are the plans/notes/references the CALLER just associated
+ * with the squash commit itself (via consumeWorkspaceContext) — refs that exist
+ * in no child, so the collect* helpers cannot see them. They are unioned over
+ * the hoisted set by SNAPSHOT key (`snapshotKeyOf`), not base key: see RefMerge's
+ * header for why squash and amend need different keys here.
+ *
+ * The optional tail is one object rather than four positional parameters so a
+ * caller that wants only the last one doesn't have to pass `undefined`
+ * placeholders (and so adding a fifth doesn't shift anyone's argument list).
  */
-export async function mergeManyToOne(
-	oldSummaries: ReadonlyArray<CommitSummary>,
-	newCommitInfo: CommitInfo,
-	cwd?: string,
-	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
-	consolidated?: ConsolidatedTopics,
-	storage?: StorageProvider,
+export interface MergeManyToOneOptions {
+	readonly metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource };
+	readonly consolidated?: ConsolidatedTopics;
+	readonly storage?: StorageProvider;
+	readonly extraRefs?: NewlyAssociatedRefs;
 	/**
 	 * Skill refs archived for THIS squash, on top of whatever the children carry.
 	 * A squash lands new work, so uncommitted skill rows belong on the root exactly
 	 * as they would on a plain commit; the children's own refs cannot supply them.
 	 */
-	extraSkills?: ReadonlyArray<SkillCommitRef>,
+	readonly extraSkills?: ReadonlyArray<SkillCommitRef>;
+}
+
+export async function mergeManyToOne(
+	oldSummaries: ReadonlyArray<CommitSummary>,
+	newCommitInfo: CommitInfo,
+	cwd?: string,
+	options?: MergeManyToOneOptions,
 ): Promise<{ orphanedDocIds: number[] }> {
 	return withRequiredOrphanWriteLock(cwd, "mergeManyToOne", () =>
-		mergeManyToOneLocked(oldSummaries, newCommitInfo, cwd, metadata, consolidated, storage, extraSkills),
+		mergeManyToOneLocked(oldSummaries, newCommitInfo, cwd, options),
 	);
 }
 
@@ -1087,11 +1114,9 @@ async function mergeManyToOneLocked(
 	oldSummaries: ReadonlyArray<CommitSummary>,
 	newCommitInfo: CommitInfo,
 	cwd?: string,
-	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
-	consolidated?: ConsolidatedTopics,
-	storage?: StorageProvider,
-	extraSkills?: ReadonlyArray<SkillCommitRef>,
+	options?: MergeManyToOneOptions,
 ): Promise<{ orphanedDocIds: number[] }> {
+	const { metadata, consolidated, storage, extraRefs, extraSkills } = options ?? {};
 	log.info("Merging %d summaries into %s", oldSummaries.length, newCommitInfo.hash.substring(0, 8));
 
 	// Sort children by activity date descending (newest first) via getDisplayDate.
@@ -1107,12 +1132,22 @@ async function mergeManyToOneLocked(
 	// - orphanedDocIds: accumulated memory article IDs pending cleanup on next push
 	// - topics/recap: from `consolidated` (LLM or mechanical); see ConsolidatedTopics.
 	const hoistedE2e = collectChildE2eScenarios(children);
-	const hoistedPlans = collectChildPlans(children);
-	const hoistedNotes = collectChildNotes(children);
-	const hoistedReferences = collectChildReferences(children);
+	// Children's refs ∪ the refs this squash just associated. Without the union
+	// the newly archived orphan-branch snapshots would have no pointer from any
+	// summary. Keyed by SNAPSHOT key (hash stamp included) — the amend paths' base
+	// keys would collapse two children that archived the same logical item at
+	// different commits and strand one of their orphan-branch files. See RefMerge.
+	const hoistedPlans = mergeRefsNewWins(collectChildPlans(children), extraRefs?.plans, snapshotKeyOf.plan);
+	const hoistedNotes = mergeRefsNewWins(collectChildNotes(children), extraRefs?.notes, snapshotKeyOf.note);
+	const hoistedReferences = mergeRefsNewWins(
+		collectChildReferences(children),
+		extraRefs?.references,
+		snapshotKeyOf.reference,
+	);
 	// Newly-archived rows (squash lands new work) merge with the children's own refs
 	// through the same fold, so a skill entered both before and during the squash is
-	// one row carrying the sum.
+	// one row carrying the sum. Skills need no snapshot-key union: mergeSkillRefs
+	// ACCUMULATES per skill instead of deduping, so nothing can be stranded.
 	const hoistedSkills = mergeSkillRefs([...collectChildSkills(children), ...(extraSkills ?? [])]);
 	const jolliMeta = collectChildJolliMeta(children);
 	const inheritedOrphanIds = children.flatMap((c) => c.orphanedDocIds ?? []);

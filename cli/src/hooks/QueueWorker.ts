@@ -31,7 +31,13 @@ import { isClineInstalled } from "../core/ClineDetector.js";
 import { discoverClineSessions } from "../core/ClineSessionDiscoverer.js";
 import { readClineTranscript } from "../core/ClineTranscriptReader.js";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
-import { clearAiSelection, conversationKey, readAiSelection, readExclusions } from "../core/CommitSelectionStore.js";
+import {
+	type CommitExclusions,
+	clearAiSelection,
+	conversationKey,
+	readAiSelection,
+	readExclusions,
+} from "../core/CommitSelectionStore.js";
 import {
 	assessContextRelevance,
 	buildChangeSignal,
@@ -74,6 +80,7 @@ import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
 import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
 import { estimateCostUsd, PRICES_AS_OF } from "../core/Pricing.js";
 import { triggerPushForNewSummaries } from "../core/PushExecutor.js";
+import { baseKeyOf, mergeRefsNewWins } from "../core/RefMerge.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import {
 	accumulatedQueryOf,
@@ -131,6 +138,7 @@ import {
 } from "../core/SummaryStore.js";
 import { resolveTranscriptIdsFiltered } from "../core/SummaryTree.js";
 import { associateSkillsWithCommit } from "../core/skills/SkillArchive.js";
+import { mergeSkillRefs } from "../core/skills/SkillDelta.js";
 import { getTelemetryContext, track } from "../core/Telemetry.js";
 import { bootstrapTelemetry, flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { getCurrentTraceId, runWithTrace, TRACE_ID_ENV, traceIdFromEnv } from "../core/TraceContext.js";
@@ -1655,7 +1663,7 @@ async function consumeWorkspaceContext(args: {
 		readonly skills?: ReadonlySet<string>;
 	};
 	readonly excludedContext: ReadonlyArray<ExcludedContextItem>;
-	readonly archiveLabel?: "commit" | "amend";
+	readonly archiveLabel?: "commit" | "amend" | "squash";
 }): Promise<ConsumedWorkspaceContext> {
 	const { cwd, branch, commitHash, exclusions, excludedContext, archiveLabel = "commit" } = args;
 
@@ -2199,6 +2207,60 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 }
 
 /**
+ * Resolves the branch and consumes the working-area Context for a squash commit.
+ *
+ * Branch resolution cannot fail the caller, by construction — three sources, the
+ * last of which performs no I/O:
+ *   1. `branchHint`, captured at enqueue time. Preferred because the worker drains
+ *      asynchronously and HEAD may have moved since the commit.
+ *   2. A live read. Reachable by design: both enqueue hooks deliberately tolerate
+ *      their own branch read failing and omit the field, and pre-0.99.x queue
+ *      entries predate it entirely.
+ *   3. `fallbackBranch` — the source summaries' own branch. Already in hand and
+ *      cannot throw, so a failed live read costs nothing.
+ *
+ * Step 3 exists because skipping archival on a failed live read produced a partial
+ * memory rather than a smaller one: skill archival on this path resolves its branch
+ * from the same source summaries and would have proceeded anyway, so the squash
+ * would record skills but not plans/notes/references. `fallbackBranch` may be stale
+ * relative to HEAD (that is exactly why it is last), but a stale branch label costs
+ * at most a mis-filed archive, where skipping cost the pointer altogether.
+ *
+ * `exclusions` is passed in rather than read here so this path reads the panel's
+ * selection exactly once — a second read straddles an orphan write and can disagree
+ * with the set the caller's own skill archival already honoured.
+ */
+async function consumeSquashContext(args: {
+	readonly cwd: string;
+	readonly branchHint: string | undefined;
+	readonly fallbackBranch: string;
+	readonly commitHash: string;
+	readonly exclusions: CommitExclusions;
+}): Promise<ConsumedWorkspaceContext> {
+	const { cwd, branchHint, fallbackBranch, commitHash, exclusions } = args;
+	let branch = branchHint;
+	if (!branch) {
+		try {
+			branch = await getCurrentBranch(cwd);
+		} catch (err) {
+			log.warn(
+				"Squash: live branch read failed (%s) — falling back to the source summaries' branch",
+				errMsg(err),
+			);
+			branch = fallbackBranch;
+		}
+	}
+	return consumeWorkspaceContext({
+		cwd,
+		branch,
+		commitHash,
+		exclusions,
+		excludedContext: [],
+		archiveLabel: "squash",
+	});
+}
+
+/**
  * Shared squash consolidation pipeline. Used by BOTH:
  *   - handleSquashFromQueue (op.type = "squash"): VSCode plugin Squash button
  *     (writes squash-pending.json + git reset --soft + git commit), or `git
@@ -2227,7 +2289,15 @@ async function runSquashPipeline(
 	commitInfo: CommitInfo,
 	cwd: string,
 	metadata: { readonly commitType: CommitType; readonly commitSource: CommitSource },
+	branchHint: string | undefined,
 ): Promise<number> {
+	// Invalidate the panel's cached AI ranking up front, for the same reason the
+	// amend paths do: a squash always moves HEAD, so the stored change fingerprint
+	// is stale and a LATER commit must not reuse its exclude decisions. Clearing
+	// before the LLM window keeps a concurrent panel re-rank from being clobbered.
+	// Best-effort — a clear failure must never break consolidation.
+	await clearAiSelection(cwd).catch((err) => log.warn("clearAiSelection failed: %s", (err as Error).message));
+
 	// Expand each source via expandSourcesForConsolidation: preserves per-commit
 	// grouping for nested squash roots (so the LLM can apply rule 4 evidence).
 	const sources: ReadonlyArray<SquashConsolidationSource> = oldSummaries.flatMap(expandSourcesForConsolidation);
@@ -2311,9 +2381,6 @@ async function runSquashPipeline(
 	);
 	/* v8 ignore stop */
 
-	// mergeManyToOne writes the v4 root with these consolidated topics + recap +
-	// stripped children. Hoist invariant always completes (consolidated is never
-	// undefined here, even on LLM failure thanks to mechanicalConsolidate).
 	// A squash lands new work, so uncommitted skill rows belong on the squash commit
 	// exactly as they would on a plain commit. Done BEFORE mergeManyToOne so the refs
 	// can be hoisted onto the root it writes — there is no second write to patch them
@@ -2324,6 +2391,14 @@ async function runSquashPipeline(
 	// MUST go into the association rather than filter its result: it guards the row
 	// and emits orphan-branch bytes, so a post-filter would leave an excluded skill
 	// archived on the branch while merely hiding it from the summary.
+	//
+	// Ordered BEFORE consumeSquashContext, not after: storeSkills is another orphan
+	// write that can throw, and everything between the consume and the summary write
+	// is a window where a throw strands a snapshot with no pointer (see below). Skills
+	// carry no such window — their registry rows are only migrated, never torn down.
+	// One read of the panel selection for the whole path — shared with
+	// consumeSquashContext below. Two reads would straddle the storeSkills orphan
+	// write and could disagree, leaving the two halves honouring different sets.
 	const branch = oldSummaries[0].branch;
 	const squashExclusions = await readExclusions(cwd);
 	const { refs: newSkillRefs, filesToStore: newSkillFiles } = await associateSkillsWithCommit(
@@ -2341,9 +2416,71 @@ async function runSquashPipeline(
 		);
 	}
 
-	await mergeManyToOne(oldSummaries, commitInfo, cwd, metadata, consolidated, undefined, newSkillRefs);
+	// Consume the working-area Context for the squash commit itself. Squash used to
+	// run only reassociateMetadata, which MIGRATES the sources' already-archived
+	// refs — it can never archive a plan/note/reference the user activated during
+	// the session that ended in this squash. Those stayed on the panel with the
+	// squash memory holding no pointer to them.
+	//
+	// Placed HERE, immediately before mergeManyToOne, rather than at the top of the
+	// pipeline: consumeWorkspaceContext is write-ahead (it commits the orphan-branch
+	// snapshot, THEN tears down the local registry rows), so every await between it
+	// and the summary write is a window where a throw — an orphan write-lock timeout
+	// is the realistic one — strands a snapshot with no pointer and no panel row.
+	// Consuming after the consolidation LLM keeps that window at one call, matching
+	// the amend full path (which also consumes only once its LLM has returned).
+	//
+	// `excludedContext: []`: squash runs no relevance LLM (it consolidates existing
+	// topic structures rather than re-deriving from diff + transcript), so there is
+	// no AI soft-exclude set — the user's panel selection is associated in full,
+	// minus their hard excludes. Same argument as applyAmendShortCircuit.
+	const consumed = await consumeSquashContext({
+		cwd,
+		branchHint,
+		fallbackBranch: branch,
+		commitHash: commitInfo.hash,
+		exclusions: squashExclusions,
+	});
 
-	// Re-associate plans, notes and skill guards with the new squash commit hash.
+	// mergeManyToOne writes the v4 root with these consolidated topics + recap +
+	// stripped children. Hoist invariant always completes (consolidated is never
+	// undefined here, even on LLM failure thanks to mechanicalConsolidate). The
+	// just-consumed refs ride along as `extraRefs` so the merged root points at
+	// the orphan-branch snapshots consumeWorkspaceContext just wrote; the skill refs
+	// ride along as `extraSkills` for the same reason.
+	//
+	// `newSkillRefs` ∪ `consumed.skillRefs`: consumeWorkspaceContext archives skills
+	// too, so this path calls associateSkillsWithCommit twice. The second call is
+	// normally a no-op — uncommittedDelta returns undefined once the first call has
+	// advanced `archivedTotals` to the row's total — but "normally" is not "always":
+	// a skill entered for the first time between the two calls (the Stop hook writes
+	// plans.json asynchronously) yields a real delta on the second one. Being a
+	// different skill it gets its own archivedKey and its own orphan-branch path, so
+	// dropping its ref here stranded those bytes with no summary pointer AND left the
+	// row guarded, i.e. unable to ever re-archive — the exact permanent, silent
+	// stranding this consumption exists to prevent.
+	//
+	// A repeat of the SAME skill is not that bug and needs no handling: both calls
+	// share the commit hash, so archivedKey and the orphan path are identical, the
+	// second write overwrites the first and the first call's ref still points at it.
+	// mergeSkillRefs dedupes such a repeat rather than summing it — deliberately, see
+	// its header — so that window costs an undercount of the in-window increment, not
+	// bytes on the branch.
+	await mergeManyToOne(oldSummaries, commitInfo, cwd, {
+		metadata,
+		consolidated,
+		extraSkills: mergeSkillRefs([...newSkillRefs, ...consumed.skillRefs]),
+		extraRefs: {
+			plans: consumed.planAssociation.refs,
+			notes: consumed.noteRefs,
+			references: consumed.referenceRefs,
+		},
+	});
+
+	// Re-associate plans, notes and skill guards with the new squash commit hash. Runs
+	// AFTER the associations above so a revived guard's commitHash has already moved to
+	// the new hash — reassociate's old-short-hash guard is then a no-op for it, avoiding
+	// a double migration (same ordering rationale as applyAmendShortCircuit).
 	await reassociateMetadata(oldSummaries, commitInfo.hash, cwd);
 
 	// Consolidated topic count for the caller's `stored` progress event — mirrors
@@ -2410,10 +2547,16 @@ async function handleSquashFromQueue(op: CommitGitOperation, cwd: string): Promi
 
 	const commitInfo = await getCommitInfo(op.commitHash, cwd);
 	/* v8 ignore start -- commitSource is always set by the enqueue path; fallback is defensive */
-	const topics = await runSquashPipeline(oldSummaries, commitInfo, cwd, {
-		commitType: "squash",
-		commitSource: op.commitSource ?? "cli",
-	});
+	const topics = await runSquashPipeline(
+		oldSummaries,
+		commitInfo,
+		cwd,
+		{
+			commitType: "squash",
+			commitSource: op.commitSource ?? "cli",
+		},
+		op.branch,
+	);
 	/* v8 ignore stop */
 	emitCaptureProgress(cwd, op.commitHash, "stored", { data: { topics } });
 }
@@ -2479,10 +2622,16 @@ async function handleRebaseSquashFromQueue(op: CommitGitOperation, cwd: string):
 	}
 
 	const newCommitInfo = await getCommitInfo(op.commitHash, cwd);
-	const topics = await runSquashPipeline(oldSummaries, newCommitInfo, cwd, {
-		commitType: "squash",
-		commitSource: (op.commitSource ?? "cli") as CommitSource,
-	});
+	const topics = await runSquashPipeline(
+		oldSummaries,
+		newCommitInfo,
+		cwd,
+		{
+			commitType: "squash",
+			commitSource: (op.commitSource ?? "cli") as CommitSource,
+		},
+		op.branch,
+	);
 	emitCaptureProgress(cwd, op.commitHash, "stored", { data: { topics } });
 }
 
@@ -2583,30 +2732,6 @@ function conversationUsageFields(
 	};
 }
 
-/** Trailing `-<8 hex>` short-hash suffix that association appends to plan slugs / note ids. */
-const REF_HASH_SUFFIX = /-[0-9a-f]{8}$/;
-
-/**
- * Unions old (hoisted) refs with newly-associated refs, deduped by BASE key,
- * with **new refs winning** on collision. Base key strips the per-commit
- * `-<shortHash>` suffix (plans/notes) or uses `<source>:<nativeId>` (references),
- * so a revived guard that re-archives `foo-<oldHash>` as `foo-<newHash>` lists
- * once — as the NEW ref. New-wins is a data-integrity requirement: the new ref
- * is the one whose markdown was just written to the orphan branch, so dropping
- * it in favour of the old ref would leave an orphan-branch file with no summary
- * pointer (the exact bug this consumption fix exists to prevent).
- */
-function mergeRefsNewWins<T>(
-	oldRefs: ReadonlyArray<T> | undefined,
-	newRefs: ReadonlyArray<T> | undefined,
-	baseKey: (ref: T) => string,
-): T[] {
-	const byKey = new Map<string, T>();
-	for (const ref of oldRefs ?? []) byKey.set(baseKey(ref), ref);
-	for (const ref of newRefs ?? []) byKey.set(baseKey(ref), ref);
-	return [...byKey.values()];
-}
-
 /**
  * Builds the v4 amend root with all 8 Hoist fields populated and the old
  * summary attached as a stripped child. Used by all three amend paths
@@ -2621,8 +2746,8 @@ function mergeRefsNewWins<T>(
  *
  * `newRefs` are the plans/notes/references this amend just associated (via
  * consumeWorkspaceContext). They are merged into the hoisted old refs with
- * NEW winning per base key (see mergeRefsNewWins) — without this, the newly
- * archived orphan-branch snapshots would have no pointer in the summary root.
+ * NEW winning per base key (`baseKeyOf`) — without this, the newly archived
+ * orphan-branch snapshots would have no pointer in the summary root.
  * `excludedContext` is the AI soft-exclude audit, written only on the paths
  * that generate a new summary (full path / fresh leaf), mirroring the normal
  * commit pipeline; the short-circuit paths pass `[]`.
@@ -2656,24 +2781,21 @@ function buildHoistedAmendRoot(
 	excludedContext?: ReadonlyArray<ExcludedContextItem>,
 	contextRelevance?: ReadonlyArray<ContextRelevanceRef>,
 ): CommitSummary {
-	// Old (hoisted) refs ∪ new refs, deduped by base key with new winning.
+	// Old (hoisted) refs ∪ new refs, deduped by BASE key with new winning — sound
+	// here because an amend root has exactly one old summary (see RefMerge). The
+	// squash path deliberately keys the same union differently.
 	const hoistedMeta = hoistMetadataFromOldSummary(oldSummary);
-	const mergedPlans = mergeRefsNewWins(hoistedMeta.plans, newRefs?.plans, (p) => p.slug.replace(REF_HASH_SUFFIX, ""));
-	const mergedNotes = mergeRefsNewWins(hoistedMeta.notes, newRefs?.notes, (n) => n.id.replace(REF_HASH_SUFFIX, ""));
-	const mergedReferences = mergeRefsNewWins(
-		hoistedMeta.references,
-		newRefs?.references,
-		(r) => `${r.source}:${r.nativeId}`,
-	);
-	// Skills merge on the registry mapKey `<source>:<skill>` verbatim — NOT via
-	// REF_HASH_SUFFIX like plans and notes above. Those two carry the archive short
-	// hash inside the identifier they are keyed on (`<slug>-<hash8>`), so it has to be
-	// stripped to recover a base key; a skill ref keeps its hash in `archivedKey` and
-	// leaves `skill` as the raw id, so there is nothing to strip. Stripping anyway
-	// silently truncated any id that happens to end in 8 hex characters, folding two
-	// distinct skills into one row here while `attachedBaseKeys.skill` below and
-	// `mergeSkillRefs` both kept them apart — three derivations of one key that have
-	// to agree.
+	const mergedPlans = mergeRefsNewWins(hoistedMeta.plans, newRefs?.plans, baseKeyOf.plan);
+	const mergedNotes = mergeRefsNewWins(hoistedMeta.notes, newRefs?.notes, baseKeyOf.note);
+	const mergedReferences = mergeRefsNewWins(hoistedMeta.references, newRefs?.references, baseKeyOf.reference);
+	// Skills merge on the registry mapKey `<source>:<skill>` verbatim, so they get no
+	// `baseKeyOf` entry — there is no hash stamp to strip. Plans and notes carry the
+	// archive short hash inside the identifier they are keyed on (`<slug>-<hash8>`),
+	// which is what `baseKeyOf.plan` / `.note` strip; a skill ref keeps its hash in
+	// `archivedKey` and leaves `skill` as the raw id. Stripping anyway silently
+	// truncated any id that happens to end in 8 hex characters, folding two distinct
+	// skills into one row here while `attachedBaseKeys.skill` below and `mergeSkillRefs`
+	// both kept them apart — three derivations of one key that have to agree.
 	const mergedSkills = mergeRefsNewWins(hoistedMeta.skills, newRefs?.skills, (s) => `${s.source}:${s.skill}`);
 	// Drop from the AI-exclude audit any item that is nonetheless ATTACHED to this
 	// summary via a hoisted (inherited) ref — otherwise the same item would appear
@@ -2683,9 +2805,9 @@ function buildHoistedAmendRoot(
 	// old snapshot is still hoisted. plans/notes skip committed guards upstream
 	// (detectActive*ForBranch), but we filter all three kinds for symmetry.
 	const attachedBaseKeys: Record<ExcludedContextItem["kind"], ReadonlySet<string>> = {
-		plan: new Set(mergedPlans.map((p) => p.slug.replace(REF_HASH_SUFFIX, ""))),
-		note: new Set(mergedNotes.map((n) => n.id.replace(REF_HASH_SUFFIX, ""))),
-		reference: new Set(mergedReferences.map((r) => `${r.source}:${r.nativeId}`)),
+		plan: new Set(mergedPlans.map((p) => baseKeyOf.plan(p))),
+		note: new Set(mergedNotes.map((n) => baseKeyOf.note(n))),
+		reference: new Set(mergedReferences.map((r) => baseKeyOf.reference(r))),
 		skill: new Set(mergedSkills.map((s) => `${s.source}:${s.skill}`)),
 	};
 	const auditedExclusions = (excludedContext ?? []).filter((e) => !attachedBaseKeys[e.kind].has(e.key));
@@ -4063,7 +4185,6 @@ export const __test__ = {
 	detectPlanSlugsFromRegistry,
 	detectUncommittedNoteIds,
 	hoistMetadataFromOldSummary,
-	mergeRefsNewWins,
 	buildHoistedAmendRoot,
 	consumeWorkspaceContext,
 	associatePlansWithCommit,
@@ -4072,6 +4193,7 @@ export const __test__ = {
 	executePipeline,
 	handleAmendPipeline,
 	handleSquashFromQueue,
+	handleRebaseSquashFromQueue,
 	loadSessionTranscripts,
 	attachPerSessionUsage,
 	appendUsageOnlyCarriers,

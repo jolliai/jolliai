@@ -1414,13 +1414,13 @@ describe("queue-driven Worker", () => {
 				]),
 				expect.objectContaining({ hash: "newHash" }),
 				"/test/project",
-				expect.objectContaining({ commitType: "squash" }),
-				// runSquashPipeline passes a 5th `consolidated` arg to mergeManyToOne.
-				expect.objectContaining({ topics: expect.any(Array) }),
-				// 6th `storage` is left undefined; 7th carries the skill refs archived for
-				// THIS squash (see runSquashPipeline).
-				undefined,
-				expect.any(Array),
+				expect.objectContaining({
+					metadata: expect.objectContaining({ commitType: "squash" }),
+					consolidated: expect.objectContaining({ topics: expect.any(Array) }),
+					extraRefs: expect.objectContaining({ plans: expect.any(Array) }),
+					// Skill refs archived for THIS squash (see runSquashPipeline).
+					extraSkills: expect.any(Array),
+				}),
 			);
 			expect(generateSummary).not.toHaveBeenCalled();
 		});
@@ -1450,8 +1450,8 @@ describe("queue-driven Worker", () => {
 
 			await runWorker("/test/project");
 
-			// Should merge with only the 2 available summaries; the 5th arg is the
-			// consolidated topics/recap built by runSquashPipeline.
+			// Should merge with only the 2 available summaries; `options.consolidated`
+			// is the topics/recap built by runSquashPipeline.
 			expect(mergeManyToOne).toHaveBeenCalledWith(
 				expect.arrayContaining([
 					expect.objectContaining({ commitHash: "hash1" }),
@@ -1459,12 +1459,12 @@ describe("queue-driven Worker", () => {
 				]),
 				expect.objectContaining({ hash: "newHash" }),
 				"/test/project",
-				expect.anything(),
-				expect.objectContaining({ topics: expect.any(Array) }),
-				// 6th `storage` is left undefined; 7th carries the skill refs archived for
-				// THIS squash (see runSquashPipeline).
-				undefined,
-				expect.any(Array),
+				expect.objectContaining({
+					consolidated: expect.objectContaining({ topics: expect.any(Array) }),
+					extraRefs: expect.objectContaining({ plans: expect.any(Array) }),
+					// Skill refs archived for THIS squash (see runSquashPipeline).
+					extraSkills: expect.any(Array),
+				}),
 			);
 			// Verify exactly 2 summaries were passed (not 3)
 			const summariesArg = vi.mocked(mergeManyToOne).mock.calls[0][0];
@@ -2329,7 +2329,7 @@ describe("queue-driven Worker", () => {
 
 			await runWorker("/test/project");
 
-			// Should merge available summaries (2 of 3); 5th arg is consolidated topics/recap.
+			// Should merge available summaries (2 of 3); options.consolidated carries topics/recap.
 			expect(mergeManyToOne).toHaveBeenCalledWith(
 				expect.arrayContaining([
 					expect.objectContaining({ commitHash: "hash1" }),
@@ -2337,12 +2337,12 @@ describe("queue-driven Worker", () => {
 				]),
 				expect.anything(),
 				"/test/project",
-				expect.anything(),
-				expect.objectContaining({ topics: expect.any(Array) }),
-				// 6th `storage` is left undefined; 7th carries the skill refs archived for
-				// THIS squash (see runSquashPipeline).
-				undefined,
-				expect.any(Array),
+				expect.objectContaining({
+					consolidated: expect.objectContaining({ topics: expect.any(Array) }),
+					extraRefs: expect.objectContaining({ plans: expect.any(Array) }),
+					// Skill refs archived for THIS squash (see runSquashPipeline).
+					extraSkills: expect.any(Array),
+				}),
 			);
 		});
 	});

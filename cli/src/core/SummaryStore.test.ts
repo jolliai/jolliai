@@ -36,6 +36,7 @@ import type {
 	CommitSummary,
 	FileWrite,
 	PlanProgressArtifact,
+	ReferenceCommitRef,
 	SourceId,
 	SummaryIndex,
 	SummaryIndexEntry,
@@ -1402,11 +1403,12 @@ describe("SummaryStore", () => {
 				[createMockSummary("old1"), createMockSummary("old2")],
 				createMockCommitInfo("newhash"),
 				undefined,
-				undefined,
 				{
-					topics: [{ title: "Consolidated topic", trigger: "t", response: "r", decisions: "d" }],
-					recap: "Consolidated paragraph.",
-					ticketId: "PROJ-1",
+					consolidated: {
+						topics: [{ title: "Consolidated topic", trigger: "t", response: "r", decisions: "d" }],
+						recap: "Consolidated paragraph.",
+						ticketId: "PROJ-1",
+					},
 				},
 			);
 
@@ -1649,6 +1651,49 @@ describe("SummaryStore", () => {
 			]);
 		});
 
+		it("keeps every child's snapshot of the same reference alongside the squash's own", async () => {
+			// Regression pin. The hoisted union used to be keyed by BASE key
+			// (`source:nativeId`), so a branch where the same ticket was consulted on
+			// two commits kept only the child visited last: the other child's
+			// orphan-branch file survived the squash with no summary pointing at it —
+			// the exact stranding that consuming Context on this path exists to prevent.
+			// `snapshotKeyOf` keys by archivedKey, i.e. one pointer per archived file.
+			const ref = (hash: string): ReferenceCommitRef => ({
+				source: "linear",
+				nativeId: "PROJ-9",
+				archivedKey: `linear:PROJ-9-${hash}`,
+				title: "Proj nine",
+				url: "https://linear.app/x/PROJ-9",
+				referencedAt: "2026-02-18T00:00:00Z",
+				sourceToolName: "mcp__linear__get_issue",
+			});
+			const old1: CommitSummary = {
+				...createMockSummary("old1", "Old 1"),
+				commitDate: "2026-02-20T00:00:00Z",
+				references: [ref("aaaaaaaa")],
+			};
+			const old2: CommitSummary = {
+				...createMockSummary("old2", "Old 2"),
+				commitDate: "2026-02-19T00:00:00Z",
+				references: [ref("bbbbbbbb")],
+			};
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
+
+			// `cccccccc` stands in for the ref runSquashPipeline just archived for the
+			// squash commit itself — same ticket, third snapshot.
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), undefined, {
+				extraRefs: { references: [ref("cccccccc")] },
+			});
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.references?.map((r) => r.archivedKey)).toEqual([
+				"linear:PROJ-9-aaaaaaaa",
+				"linear:PROJ-9-bbbbbbbb",
+				"linear:PROJ-9-cccccccc",
+			]);
+		});
+
 		it("should hoist merge metadata and e2e guides onto the new container summary", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
@@ -1668,7 +1713,7 @@ describe("SummaryStore", () => {
 				],
 				createMockCommitInfo("newhash"),
 				undefined,
-				{ commitType: "squash", commitSource: "plugin" },
+				{ metadata: { commitType: "squash", commitSource: "plugin" } },
 			);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -2139,10 +2184,11 @@ describe("SummaryStore", () => {
 				[createMockSummary("old1"), createMockSummary("old2")],
 				createMockCommitInfo(newHash),
 				undefined,
-				undefined,
 				{
-					topics: [{ title: "Merged", trigger: "t", response: "r", decisions: "d" }],
-					summaryError: "llm-failed",
+					consolidated: {
+						topics: [{ title: "Merged", trigger: "t", response: "r", decisions: "d" }],
+						summaryError: "llm-failed",
+					},
 				},
 			);
 
@@ -2156,8 +2202,8 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 			const newHash = "newhash0000000000000098";
 
-			await mergeManyToOne([createMockSummary("old1")], createMockCommitInfo(newHash), undefined, undefined, {
-				topics: [{ title: "Merged", trigger: "t", response: "r", decisions: "d" }],
+			await mergeManyToOne([createMockSummary("old1")], createMockCommitInfo(newHash), undefined, {
+				consolidated: { topics: [{ title: "Merged", trigger: "t", response: "r", decisions: "d" }] },
 			});
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;

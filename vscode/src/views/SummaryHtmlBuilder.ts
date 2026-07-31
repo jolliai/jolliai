@@ -12,6 +12,7 @@
 import { labelLeadsWithNativeId, referenceDisplayTitle } from "../../../cli/src/core/references/ReferenceDisplay.js";
 import { getRegistry } from "../../../cli/src/core/references/SourceDefinitionRegistry.js";
 import { estimateModelCostUsd } from "../../../cli/src/core/Pricing.js";
+import { REF_HASH_SUFFIX } from "../../../cli/src/core/RefMerge.js";
 import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
 import {
 	aggregateConversationTokenBreakdown,
@@ -864,11 +865,6 @@ export interface ContextRelevanceDisplay {
 	readonly excluded?: ReadonlyArray<ExcludedContextItem>;
 }
 
-/** Archive suffix on committed plan slugs / note ids (`slug-<hash8>`). Relevance
- *  keys are working-area identities (pre-archive), so lookups try the exact key
- *  first, then this stripped form. Mirrors QueueWorker's REF_HASH_SUFFIX. */
-const ARCHIVE_HASH_SUFFIX = /-[0-9a-f]{8}$/;
-
 const TIER_LABEL = { high: "High", mid: "Med", low: "Low" } as const;
 const TIER_TIP = {
 	high: "High relevance to this change",
@@ -882,12 +878,17 @@ function buildRelevanceLookup(refs: ReadonlyArray<ContextRelevanceRef> | undefin
 	return map;
 }
 
+/** Relevance lookup for one archived ref: exact key first (covers unarchived or
+ *  naturally-hex-ending working keys), then the archive-suffix-stripped base.
+ *  `REF_HASH_SUFFIX` (from cli's RefMerge) is the archive suffix on committed plan
+ *  slugs / note ids (`slug-<hash8>`); relevance keys are working-area identities,
+ *  i.e. pre-archive, which is why the stripped form has to be tried at all. */
 function lookupRelevance(
 	map: ReadonlyMap<string, ContextRelevanceRef>,
 	kind: "plan" | "note" | "reference",
 	key: string,
 ): ContextRelevanceRef | undefined {
-	return map.get(`${kind}:${key}`) ?? map.get(`${kind}:${key.replace(ARCHIVE_HASH_SUFFIX, "")}`);
+	return map.get(`${kind}:${key}`) ?? map.get(`${kind}:${key.replace(REF_HASH_SUFFIX, "")}`);
 }
 
 /** Second meta line under a kept row's title: tier chip + the AI's one-line
