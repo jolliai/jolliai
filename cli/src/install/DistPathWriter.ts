@@ -14,7 +14,6 @@ import { fileURLToPath } from "node:url";
 import { atomicWriteFile } from "../core/AtomicWrite.js";
 import { createLogger } from "../Logger.js";
 import { isValidSourceTag } from "./DistSourceTag.js";
-import { compareSemver } from "./SemverCompare.js";
 
 const log = createLogger("DistPathWriter");
 
@@ -39,13 +38,14 @@ const log = createLogger("DistPathWriter");
  * the bundled core's version (see Globals.d.ts).
  *
  * The read-modify-write below (read existing entry → keep-or-overwrite by
- * version → atomic write) is deliberately NOT internally locked: every caller
- * runs it under the machine-global `withRuntimeRegistryLock` (see
+ * completeness → atomic write) is deliberately NOT internally locked: every
+ * caller runs it under the machine-global `withRuntimeRegistryLock` (see
  * `Installer.reconcileRuntime` and `PostInstall`), which serializes concurrent
  * writers to `dist-paths/<sourceTag>` across processes and surfaces. A future
- * caller MUST hold that lock too, or it reintroduces a version-compare race.
+ * caller MUST hold that lock too, or it reintroduces a read-modify-write race.
  * The write itself is atomic (temp + rename), so the file is never left torn
- * even if that invariant is ever violated — only the version pick could race.
+ * even if that invariant is ever violated — only the keep/overwrite decision
+ * could race.
  *
  * @param sourceTag - Source identifier ("cli", "vscode", "cursor", ...).
  *   Becomes the filename inside `dist-paths/`.
@@ -88,14 +88,30 @@ export async function installDistPath(
 		if (existing) {
 			const [existingVersion, existingDir] = existing.split("\n");
 			const existingComplete = Boolean(existingVersion && existingDir && isCompleteRuntimeDist(existingDir));
-			// Keep the existing entry when it is complete AND the candidate is either
-			// not strictly newer (monotonic same-source update) or itself incomplete.
+			// Keep the existing entry ONLY when it is complete and the candidate is not.
 			// An incomplete dist can't serve `run-hook`, so it must never replace a
 			// working one — not even at a higher version. Otherwise a corrupt/partial
 			// build would brick a single-source install: the only registered dist would
-			// resolve to no runnable hook. Mirror of the existing-incomplete case below.
-			if (existingComplete && (compareSemver(existingVersion, ver) >= 0 || !isCompleteRuntimeDist(currentDir))) {
-				log.info("Kept dist-paths/%s at complete version=%s (candidate=%s)", sourceTag, existingVersion, ver);
+			// resolve to no runnable hook.
+			//
+			// This gate deliberately does NOT compare versions. It used to also keep the
+			// existing entry on `compareSemver(existingVersion, ver) >= 0`, which reads as
+			// "monotonic same-source update" but is wrong for a registry keyed by source
+			// tag ALONE, never by path: two builds of the SAME version compete for one
+			// slot, and the incumbent won forever. A same-version rebuild in another
+			// worktree — or a global reinstall at a new path — then kept dispatching to
+			// the old dist while the write reported success, with only a debug-log line
+			// to show for it. Re-registering the same path is already a no-op via the
+			// `existing !== next` check below, so the version arm could only ever freeze
+			// a stale path. Don't re-add it: reaching this function at all means an
+			// install or enable ran, which is an explicit claim on the slot.
+			if (existingComplete && !isCompleteRuntimeDist(currentDir)) {
+				log.info(
+					"Kept complete dist-paths/%s (version=%s) — candidate dist is incomplete: %s",
+					sourceTag,
+					existingVersion,
+					currentDir,
+				);
 				return true;
 			}
 		}

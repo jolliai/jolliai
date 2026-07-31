@@ -93,9 +93,9 @@ When no skip condition fires and the registry lock is held, the postinstall exec
 
 2. **Run the one-time legacy migration.** If a legacy single-file `~/.jolli/jollimemory/dist-path` exists, migrate it into the per-source layout under the appropriate target tag (per the migration rules covered by the per-source dist-path version-selection topic) and delete the legacy file. If no legacy file exists, this step is a no-op. Without this step an `npm update` would leave the legacy file as a dead artifact, since the new dispatch scripts no longer read it.
 
-3. **Offer the standalone-CLI's per-source entry.** Present `~/.jolli/jollimemory/dist-paths/cli` with the new version and the new distribution directory. The fixed source tag for the standalone CLI is `cli`. The write is **not** an unconditional overwrite: the registry's keep-existing gate decides. If the currently recorded `cli` distribution still holds the complete runtime entry set **and** its recorded version is greater than or equal to the newly installed package's, the recorded entry is left pointing at the **old** distribution and the postinstall still reports success. Identical content is likewise never rewritten.
+3. **Offer the standalone-CLI's per-source entry.** Present `~/.jolli/jollimemory/dist-paths/cli` with the new version and the new distribution directory. The fixed source tag for the standalone CLI is `cli`. The write is **not** an unconditional overwrite: the registry's keep-existing gate decides. The gate turns on completeness alone — it compares no versions — so the newly installed distribution is recorded unless it is *itself* missing one or more of the ten runtime entries while the currently recorded one is complete. In that one case the recorded entry is left pointing at the **old** distribution and the postinstall still reports success. Identical content is likewise never rewritten.
 
-   Two consequences follow directly. A **same-version reinstall to a different global path** does not move the `cli` entry — the old path stays recorded as long as it is still complete on disk. And a **downgrade** (installing an older package over a newer one) does not move the entry either, so dispatch keeps resolving to the newer distribution until that distribution is removed from disk or its entry is pruned.
+   Two consequences follow directly. A **same-version reinstall to a different global path** does move the `cli` entry, so a rebuilt distribution takes effect without a version bump. And a **downgrade** (installing an older package over a newer one) moves the entry too, so dispatch resolves to the older distribution afterwards — the version recorded for a source describes what that source shipped, and does not defend its slot.
 
 ### Failure mode
 
@@ -118,8 +118,9 @@ The single-source-of-truth principle is preserved by relying on the dispatch scr
 For the standalone-CLI's per-source registry entry, the postinstall drives this transition:
 
 - **Absent** (user has previously enabled but no `cli` entry exists, e.g. they originally enabled via an IDE extension only and have just installed the standalone CLI globally for the first time) → **Present, version V1, distribution D1** (after a successful refresh).
-- **Present, version V0, distribution D0** → **Present, version V1, distribution D1** (after a global upgrade, where V1 is newer than V0 — or where D0 is no longer a complete distribution on disk).
-- **Present, version V0, distribution D0** → **unchanged** (the keep gate declined: D0 still holds the complete runtime entry set and V0 is greater than or equal to the newly installed version). This covers a same-version reinstall at a new global path and any downgrade.
+- **Present, version V0, distribution D0** → **Present, version V1, distribution D1** (after any global reinstall whose distribution is complete — an upgrade, a downgrade, or a same-version rebuild at a new path).
+- **Present, version V0, distribution D0** → **unchanged** (the keep gate declined: D0 still holds the complete runtime entry set and the newly installed distribution does not — a partial or interrupted package install).
+- **Present, version V0, distribution D0** → **unchanged, no write performed** (the newly installed distribution is byte-identical to what is already recorded — the ordinary `npm install` re-run at the same path).
 - **Present, version V0, distribution D0** → **Absent** (npm uninstall removes the package; the postinstall has no role here).
 
 For the dispatch scripts under `~/.jolli/jollimemory/`, the postinstall drives:
@@ -145,9 +146,11 @@ A `npm install --save-dev @jolli.ai/cli` inside a user's project produces a work
 
 If the postinstall fails (permissions, full disk, race), the user's `npm install` succeeds and the package binary is functional. The user can re-trigger the refresh at any time by running the enable command, which performs the same writes plus additional first-time-setup work. There is no error message at install time pointing at the recovery action; it is documented but not surfaced.
 
-### A refresh does not guarantee the entry moves
+### A refresh moves the entry unless the new distribution is unusable
 
-The postinstall's job is to *offer* the newly installed distribution, not to force it. When the recorded `cli` distribution is still complete on disk and at least as new, the registry keeps it and the postinstall reports success. This is what makes reinstalling the same version at a new global path a no-op for dispatch, and it is why "I reinstalled and it still runs the old copy" is expected behavior rather than a fault: the old copy is still complete, still recorded, and still at least as new. Removing the old distribution directory (or letting the next install/enable sweep prune it) is what releases the slot.
+The postinstall *offers* the newly installed distribution rather than forcing it, but the only thing that can decline the offer is the new distribution being incomplete while the recorded one is not. A complete distribution always claims the slot: reinstalling the same version at a different global path moves the entry, and so does a downgrade.
+
+The gate deliberately does not defend the slot by version. Doing so made "I reinstalled and it still runs the old copy" the expected outcome of a same-version reinstall — the registry is keyed by source tag alone, so two distributions of one version compete for one entry and the incumbent won every time, silently, while the postinstall reported success. A version comparison is the right rule for deciding which *source* services a dispatch, and the wrong rule for deciding which distribution a source records for itself.
 
 ### Dispatch scripts are rewritten before the per-source entry
 

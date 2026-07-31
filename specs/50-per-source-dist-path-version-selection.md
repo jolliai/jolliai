@@ -14,7 +14,7 @@ The per-user state directory at `~/.jolli/jollimemory/` keeps a small registry o
 - The fact that there are **two** independent selection implementations — the shell dispatch resolver that decides what actually executes, and an in-process selector used for reporting and for one host-configuration writer — and the four ways they diverge.
 - The optional required-entry-file argument that gates candidate eligibility in the dispatch resolver.
 - The soft source-preference environment override the dispatch resolver consults ahead of the fixed preference order.
-- The write-time "keep the existing entry" gate, its ten-file completeness definition, and its consequences for re-registration and downgrades.
+- The write-time "keep the existing entry" gate, its ten-file completeness definition, and the fact that it turns on completeness alone — never on a version comparison.
 - The machine-global lock every registry writer is required to hold.
 - The missing-distribution filter: entries whose recorded directory no longer exists are skipped at selection time, and are additionally pruned (deleted from the registry) by any source's install/enable run.
 - The legacy single-file format at `~/.jolli/jollimemory/dist-path` and the one-time migration that converts it to the per-source layout, including the source-tag recovery rule when the legacy file does not name a recognizable source.
@@ -185,7 +185,7 @@ A source registering itself does **not** unconditionally overwrite its own entry
 2. The candidate content is assembled: the caller's version (defaulting to the placeholder `dev` when the build carries no version) on the first line, the caller's distribution directory on the second.
 3. If no entry exists for that source tag yet, the candidate is written.
 4. Otherwise the existing entry is read and classified as **complete** or not. An entry is complete when it has both lines *and* its recorded directory holds the full runtime entry set (see below).
-5. **Keep gate.** If the existing entry is complete AND (its recorded version is greater than or equal to the candidate's, OR the candidate's own directory is *not* complete), the existing entry is left untouched and the write reports success.
+5. **Keep gate.** If the existing entry is complete AND the candidate's own directory is *not* complete, the existing entry is left untouched and the write reports success. Completeness is the gate's only input: the two recorded versions are never compared, so a candidate that is itself complete always wins the slot regardless of whether it is newer, older, or identical in version.
 6. Otherwise the candidate is written — but only if its content actually differs from what is already there. Identical content produces no write at all.
 
 A filesystem failure at the write step is a warning and a failure return, not a thrown error.
@@ -194,9 +194,10 @@ A filesystem failure at the write step is a warning and a failure return, not a 
 
 **Consequences of the keep gate:**
 
-- A **same-version re-registration pointing at a different directory is silently ignored** while the recorded directory is still complete, because equal versions satisfy the "greater than or equal" arm. A surface that moved its distribution but did not change its core version therefore does not move its own registry entry, and a caller that re-runs install to "refresh the path" observes no change.
-- A **downgrade is never recorded** for a source whose recorded distribution is still complete.
-- An **incomplete candidate can never displace a complete existing entry**, even at a strictly higher version. A half-built or partially-extracted distribution cannot take over the slot.
+- A **same-version re-registration pointing at a different directory moves the entry.** The registry is keyed by source tag alone and never by directory, so every build of one source competes for a single slot; re-registering is treated as an explicit claim on it. This is what makes a rebuild at a new path — a second checkout of the same version, or a global reinstall to a different location — take effect without a version bump.
+- A **downgrade is recorded** whenever the incoming distribution is complete. Deliberately installing an older build is an intentional act, and the registry does not second-guess it.
+- An **incomplete candidate can never displace a complete existing entry**, even at a strictly higher version. A half-built or partially-extracted distribution cannot take over the slot. This is the gate's entire purpose.
+- Because the gate ignores versions, an entry's recorded version is **descriptive, not a claim to the slot**. It still decides cross-source selection at dispatch time; it has no bearing on which distribution a source records for itself.
 - Because a same-content write is skipped entirely, a repeated install is not merely idempotent in outcome — it performs no filesystem write at all.
 
 ### The machine-global registry lock
@@ -218,7 +219,7 @@ The first time a current product version runs an install or refresh (including t
 3. Determine the per-source target tag:
    - If the legacy tag is `cli`, the target tag is `cli`.
    - Otherwise (notably for the legacy tag `vscode-extension`), re-derive the tag from the recorded distribution directory using the same source-tag derivation rules. If that derivation lands on the hash-fallback branch (no recognizable IDE marker, no extractable IDE name) the target tag is forced to `vscode`, since the legacy `vscode-extension` tag overwhelmingly originated from VS Code installations.
-4. Write the migrated entry to `~/.jolli/jollimemory/dist-paths/<target-tag>` in the new two-line format. This write goes through the same keep-existing gate as any other write, so a migration whose recovered version does not beat an already-recorded complete entry for that tag leaves the recorded entry alone.
+4. Write the migrated entry to `~/.jolli/jollimemory/dist-paths/<target-tag>` in the new two-line format. This write goes through the same keep-existing gate as any other write, so a migration whose recovered directory is not complete leaves an already-recorded complete entry for that tag alone.
 5. Delete the legacy file, swallowing any failure.
 
 The migration is idempotent: if it is run again after the legacy file is gone, it is a no-op. If a future rollback to a pre-registry product version reinstalls, that version's installer will recreate the legacy file and overwrite the dispatch scripts back to their old form, so the legacy format re-emerges naturally without the current product needing to retain dual-read code.
@@ -243,8 +244,8 @@ The lifecycle of a single registry entry under `~/.jolli/jollimemory/dist-paths/
 - **Absent** → **Present, available** (a source's installer or refresh wrote the entry; the recorded distribution directory exists on disk).
 - **Present, available** → **Present, missing** (the distribution directory was deleted without the entry being deleted; the entry is now a stale slot the resolver skips at selection time).
 - **Present, missing** → **Present, available** (the distribution directory reappeared before any install/enable sweep removed the entry, e.g. because the same source reinstalled the same version).
-- **Present, available** → **Present, available, different version** (an upgrade rewrote the entry). A *downgrade* only rewrites the entry when the recorded distribution is no longer complete; otherwise the keep gate leaves the higher version in place.
-- **Present, available, stale path** → **unchanged** (the same source re-registered at the same version from a different distribution directory while the recorded directory was still complete; the keep gate declines the write and the entry keeps pointing at the old directory).
+- **Present, available** → **Present, available, different version** (an upgrade rewrote the entry — or a *downgrade* did, since the gate compares no versions; either way the incoming distribution only has to be complete).
+- **Present, available, stale path** → **Present, available, new path** (the same source re-registered from a different distribution directory; the entry moves even when the recorded version is unchanged and the old directory is still complete).
 - **Present, available** → **unchanged** (a candidate at a strictly higher version was offered, but its distribution directory is missing one or more of the ten runtime entries, so it cannot displace the complete recorded entry).
 - **Present, missing** → **Absent** (any source's install/enable run prunes the entry because its recorded directory no longer exists on disk — this is a normal flow that auto-deletes missing entries; the pruning source writes its own live entry first, so it never prunes itself).
 - **Present** → **Absent** (the registry was wiped, or the user manually deleted the file). An **available** entry (directory present) is never auto-deleted; only missing entries are pruned.

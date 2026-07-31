@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -48,17 +48,32 @@ describe("installDistPath — source-tag write-boundary guard", () => {
 		expect(await installDistPath("-x", "/some/dist", "1.0.0")).toBe(false);
 	});
 
-	it("never downgrades or churns an existing complete source entry", async () => {
+	it("moves the entry to a different complete dist at the same version", async () => {
+		const globalDir = await mkdtemp(join(tmpdir(), "jolli-global-"));
+		cleanup.push(globalDir);
+		const first = await completeDist("first");
+		const second = await completeDist("second");
+
+		expect(await installDistPath("claude-plugin", first, "2.0.0", globalDir)).toBe(true);
+		// The registry is keyed by source tag ALONE, so two builds of one version share a
+		// single slot. Re-registering is an explicit claim on it and the entry must move;
+		// keeping the incumbent left a same-version rebuild at a new path dispatching to
+		// the old dist forever.
+		expect(await installDistPath("claude-plugin", second, "2.0.0", globalDir)).toBe(true);
+		expect(await readFile(join(globalDir, "dist-paths", "claude-plugin"), "utf-8")).toBe(`2.0.0\n${second}`);
+	});
+
+	it("records a downgrade between two complete dists", async () => {
 		const globalDir = await mkdtemp(join(tmpdir(), "jolli-global-"));
 		cleanup.push(globalDir);
 		const newer = await completeDist("newer");
 		const older = await completeDist("older");
 
 		expect(await installDistPath("claude-plugin", newer, "2.0.0", globalDir)).toBe(true);
+		// Installing an older build is a deliberate act; the gate no longer second-guesses
+		// it as long as the incoming dist is complete.
 		expect(await installDistPath("claude-plugin", older, "1.0.0", globalDir)).toBe(true);
-		expect(await installDistPath("claude-plugin", older, "2.0.0", globalDir)).toBe(true);
-
-		expect(await readFile(join(globalDir, "dist-paths", "claude-plugin"), "utf-8")).toBe(`2.0.0\n${newer}`);
+		expect(await readFile(join(globalDir, "dist-paths", "claude-plugin"), "utf-8")).toBe(`1.0.0\n${older}`);
 	});
 
 	it("upgrades a complete entry to a complete higher version", async () => {
@@ -68,10 +83,24 @@ describe("installDistPath — source-tag write-boundary guard", () => {
 		const newer = await completeDist("newer");
 
 		expect(await installDistPath("claude-plugin", older, "1.0.0", globalDir)).toBe(true);
-		// A complete, strictly-newer candidate legitimately replaces a complete entry —
-		// the monotonic guard must not freeze real upgrades.
 		expect(await installDistPath("claude-plugin", newer, "2.0.0", globalDir)).toBe(true);
 		expect(await readFile(join(globalDir, "dist-paths", "claude-plugin"), "utf-8")).toBe(`2.0.0\n${newer}`);
+	});
+
+	it("performs no write at all when the entry already matches", async () => {
+		const globalDir = await mkdtemp(join(tmpdir(), "jolli-global-"));
+		cleanup.push(globalDir);
+		const dist = await completeDist("same");
+		const entry = join(globalDir, "dist-paths", "claude-plugin");
+
+		expect(await installDistPath("claude-plugin", dist, "2.0.0", globalDir)).toBe(true);
+		// Backdating beats comparing two timestamps taken microseconds apart: a rewrite
+		// restores a current mtime, so the assertion holds at any clock resolution.
+		const backdated = new Date(1_000_000_000_000);
+		await utimes(entry, backdated, backdated);
+
+		expect(await installDistPath("claude-plugin", dist, "2.0.0", globalDir)).toBe(true);
+		expect((await stat(entry)).mtimeMs).toBe(backdated.getTime());
 	});
 
 	it("replaces an incomplete existing entry even when its recorded version is newer", async () => {
