@@ -19,6 +19,7 @@ import {
 	getGlobalConfigDir,
 	loadConfigFromDir,
 } from "../../../cli/src/core/SessionTracker.js";
+import { maybeEmitOnboardingProgress } from "../../../cli/src/core/OnboardingFunnel.js";
 import type { JolliMemoryConfig, StatusInfo } from "../../../cli/src/Types.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import type { AuthService } from "../services/AuthService.js";
@@ -131,6 +132,10 @@ export class StatusStore extends BaseStore<StatusChangeReason, StatusSnapshot> {
 		this.status = await this.bridge.getStatus();
 		this.config = await loadConfigFromDir(getGlobalConfigDir());
 		this.authService?.refreshContextKey(this.config);
+		// Onboarding-funnel snapshot from the status + config just computed here,
+		// so no extra git/`getStatus()` cost. Deduped per repo, so it only emits on
+		// real state changes; fully guarded and a no-op until telemetry is active.
+		void maybeEmitOnboardingProgress({ cwd: this.bridge.cwd, config: this.config, status: this.status });
 		this.rebuildSnapshot("refresh");
 	}
 
