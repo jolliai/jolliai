@@ -440,7 +440,7 @@ describe("CreatePrWebviewPanel", () => {
 		// Error) to cover the String(e) branch of the diff's rejection handler.
 		(bridge as { getBranchDiffBase: ReturnType<typeof vi.fn> }).getBranchDiffBase.mockResolvedValueOnce("basehash");
 		(vscode.commands.executeCommand as ReturnType<typeof vi.fn>).mockRejectedValueOnce("diff perm denied");
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openDiff", path: "missing/file.ts" });
 		for (let i = 0; i < 10; i++) await Promise.resolve();
 		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
@@ -456,7 +456,7 @@ describe("CreatePrWebviewPanel", () => {
 		// e.message branch of the fallback's rejection handler.
 		(bridge as { getBranchDiffBase: ReturnType<typeof vi.fn> }).getBranchDiffBase.mockResolvedValueOnce(undefined);
 		(vscode.commands.executeCommand as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("open failed"));
-		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
 		created[0].onMsg({ command: "openDiff", path: "another/file.ts" });
 		for (let i = 0; i < 10; i++) await Promise.resolve();
 		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(

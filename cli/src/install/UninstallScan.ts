@@ -23,7 +23,7 @@
 
 import { lstat, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir, platform as osPlatform } from "node:os";
-import { basename, dirname, join, sep } from "node:path";
+import { basename, dirname, join, posix as pathPosix, win32 as pathWin32, sep } from "node:path";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import { createLogger, getJolliMemoryDir } from "../Logger.js";
 import { execFileAsyncHidden } from "../util/Subprocess.js";
@@ -198,13 +198,20 @@ export async function pruneVscodeExtensionManifest(extensionDir: string): Promis
 
 /** Per-platform config root for a JetBrains-platform vendor (`JetBrains`, `Google`). */
 export function getVendorConfigRoot(vendor: string, home: string, platform: NodeJS.Platform): string {
+	// Build the path with the flavor matching the TARGET platform, not the host,
+	// so a `platform`-pinned unit test yields the same string on any OS. This is
+	// the convention written down in `ExecutableSpec.knownPaths`' docstring
+	// (core/localagent/ExecutableResolver.ts:34-39) and applied verbatim by
+	// `discoverPresence` (same file) — this `joinFor` line mirrors the one there.
+	// In production `platform === osPlatform()`, so this is a no-op.
+	const joinFor = platform === "win32" ? pathWin32.join : pathPosix.join;
 	switch (platform) {
 		case "darwin":
-			return join(home, "Library", "Application Support", vendor);
+			return joinFor(home, "Library", "Application Support", vendor);
 		case "win32":
-			return join(process.env.APPDATA ?? join(home, "AppData", "Roaming"), vendor);
+			return joinFor(process.env.APPDATA ?? joinFor(home, "AppData", "Roaming"), vendor);
 		default:
-			return join(home, ".local", "share", vendor);
+			return joinFor(home, ".local", "share", vendor);
 	}
 }
 

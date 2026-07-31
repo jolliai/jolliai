@@ -343,8 +343,12 @@ describe("isLocalAgentUsable (claude-code)", () => {
 	});
 
 	it("true when a candidate resolves", async () => {
+		// `isLocalAgentUsable` runs the real host `discover()`, which uses `where`
+		// on win32 and then keeps only `.exe` candidates. Return a path whose
+		// flavor matches the host so discovery accepts it on Windows too.
+		const resolved = process.platform === "win32" ? "C:\\tools\\claude.exe\n" : "/usr/local/bin/claude\n";
 		mockedExecFileSync.mockImplementation((file: unknown) => {
-			if (file === "which" || file === "where") return "/usr/local/bin/claude\n";
+			if (file === "which" || file === "where") return resolved;
 			return "1.0.0\n";
 		});
 

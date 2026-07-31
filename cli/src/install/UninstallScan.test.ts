@@ -12,6 +12,15 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { symlinksSupported } from "../testUtils/symlinkSupport.js";
+
+// The bin-shim fixture is a DANGLING symlink on purpose (its target Cli.js is
+// never created): dangling is the one state where scanCliGlobal's deliberate
+// `lstat` (UninstallScan.ts) diverges from `stat`, so it guards that choice
+// against a future `lstat`→`stat` regression. A regular file would satisfy
+// both and lose the guard, so we keep the symlink and skip where symlink
+// creation is forbidden (a plain Windows account without Developer Mode).
+const itIfSymlinks = symlinksSupported ? it : it.skip;
 
 // ─── Hoisted mocks ────────────────────────────────────────────────────────────
 
@@ -292,10 +301,13 @@ describe("staticNpmGlobalRoots", () => {
 // ─── scanCliGlobal ────────────────────────────────────────────────────────────
 
 describe("scanCliGlobal", () => {
-	it("finds the package dir and the POSIX bin shim, de-duplicating roots", async () => {
+	itIfSymlinks("finds the package dir and the POSIX bin shim, de-duplicating roots", async () => {
 		const root = join(tempDir, "lib", "node_modules");
 		mkdirSync(join(root, "@jolli.ai", "cli"), { recursive: true });
 		mkdirSync(join(tempDir, "bin"), { recursive: true });
+		// Dangling on purpose — target Cli.js is never created. scanCliGlobal
+		// `lstat`s the shim, so it still detects it; a `stat` would miss it. This
+		// is the regression guard for that deliberate lstat choice.
 		symlinkSync(join(root, "@jolli.ai", "cli", "dist", "Cli.js"), join(tempDir, "bin", "jolli"));
 
 		// Pass the same root twice to exercise de-duplication.

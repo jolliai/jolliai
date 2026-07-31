@@ -61,16 +61,22 @@ describe("installPrePushHook / removePrePushHook", () => {
 		expect(occurrences).toBe(1);
 	});
 
-	it("repairs an otherwise canonical hook whose executable bit was removed", async () => {
-		await installPrePushHook(cwd);
-		await chmod(hookPath(), 0o644);
-		expect(await isHookSectionInstalled(cwd, "pre-push", PRE_PUSH_MARKER_START)).toBe(false);
+	// POSIX-only: Windows has no executable bit and `isHookSectionInstalled`
+	// treats marker presence as the install signal there (see its win32 branch),
+	// so the "exec bit removed ⇒ not installed" premise cannot hold on win32.
+	it.skipIf(process.platform === "win32")(
+		"repairs an otherwise canonical hook whose executable bit was removed",
+		async () => {
+			await installPrePushHook(cwd);
+			await chmod(hookPath(), 0o644);
+			expect(await isHookSectionInstalled(cwd, "pre-push", PRE_PUSH_MARKER_START)).toBe(false);
 
-		await installPrePushHook(cwd);
+			await installPrePushHook(cwd);
 
-		expect((await stat(hookPath())).mode & 0o111).not.toBe(0);
-		expect(await isHookSectionInstalled(cwd, "pre-push", PRE_PUSH_MARKER_START)).toBe(true);
-	});
+			expect((await stat(hookPath())).mode & 0o111).not.toBe(0);
+			expect(await isHookSectionInstalled(cwd, "pre-push", PRE_PUSH_MARKER_START)).toBe(true);
+		},
+	);
 
 	it("appends to an existing pre-push hook without clobbering it", async () => {
 		await mkdir(join(cwd, ".git", "hooks"), { recursive: true });

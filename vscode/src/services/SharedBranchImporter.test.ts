@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../util/Logger.js", () => ({
@@ -252,7 +253,7 @@ describe("importSharedBranchForDisplay", () => {
 			const res = await run(makeExport());
 			expect(res?.ingestedLocally).toBe(false);
 			expect(bridge.storeSummary).not.toHaveBeenCalled();
-			expect(FolderStorageMock).toHaveBeenCalledWith("/gs/shared-imports/acme-widgets", expect.anything());
+			expect(FolderStorageMock).toHaveBeenCalledWith(join("/gs", "shared-imports", "acme-widgets"), expect.anything());
 		});
 
 		it("rejects a current repo that is a different repo entirely → sandbox", async () => {
@@ -454,7 +455,7 @@ describe("importSharedBranchForDisplay", () => {
 			expect(res?.ingestedLocally).toBe(false);
 			expect(res?.head.commitHash).toBe("h1");
 			expect(bridge.storeSummary).not.toHaveBeenCalled();
-			expect(FolderStorageMock).toHaveBeenCalledWith("/gs/shared-imports/acme-widgets", expect.anything());
+			expect(FolderStorageMock).toHaveBeenCalledWith(join("/gs", "shared-imports", "acme-widgets"), expect.anything());
 		});
 
 		it("persists each commit's raw summary JSON so the sandbox is a self-contained copy", async () => {
@@ -501,17 +502,17 @@ describe("importSharedBranchForDisplay", () => {
 
 		it("slugs an all-punctuation repo name to 'repo' for the import dir", async () => {
 			await run(makeExport({ repoName: "///" }));
-			expect(FolderStorageMock).toHaveBeenCalledWith("/gs/shared-imports/repo", expect.anything());
+			expect(FolderStorageMock).toHaveBeenCalledWith(join("/gs", "shared-imports", "repo"), expect.anything());
 		});
 
 		it("neutralizes a '.'/'..' repo name so the import dir can't escape shared-imports/", async () => {
 			// A crafted repoName of "." or ".." would otherwise survive as a path segment and
 			// join() would resolve OUT of the per-repo sandbox (".." → the parent dir).
 			await run(makeExport({ repoName: ".." }));
-			expect(FolderStorageMock).toHaveBeenCalledWith("/gs/shared-imports/repo", expect.anything());
+			expect(FolderStorageMock).toHaveBeenCalledWith(join("/gs", "shared-imports", "repo"), expect.anything());
 			FolderStorageMock.mockClear();
 			await run(makeExport({ repoName: "." }));
-			expect(FolderStorageMock).toHaveBeenCalledWith("/gs/shared-imports/repo", expect.anything());
+			expect(FolderStorageMock).toHaveBeenCalledWith(join("/gs", "shared-imports", "repo"), expect.anything());
 		});
 	});
 

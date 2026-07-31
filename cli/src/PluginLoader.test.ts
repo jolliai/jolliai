@@ -1583,7 +1583,7 @@ describe("loadPlugins", () => {
 		expect(program.commands.find((c) => c.name() === "plugin-own-prop")).toBeDefined();
 	});
 
-	it("logs symlink forensics only when the link resolves outside the walked roots", async () => {
+	itIfSymlinks("logs symlink forensics only when the link resolves outside the walked roots", async () => {
 		// L655 false branch: a symlink whose realpath stays inside a walked root is
 		// the benign workspace case — no out-of-roots breadcrumb is emitted. The
 		// existing symlink test covers the outside-roots (true) branch.

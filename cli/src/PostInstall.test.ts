@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.stubGlobal("__PKG_VERSION__", "1.0.0");
@@ -52,7 +53,7 @@ describe("PostInstall", () => {
 		await runPostInstall();
 		expect(mockInstallResolveScripts).toHaveBeenCalledTimes(1);
 		expect(mockWithRuntimeRegistryLock).toHaveBeenCalledWith(expect.any(Function), {
-			globalDir: expect.stringContaining(".jolli/jollimemory"),
+			globalDir: expect.stringContaining(join(".jolli", "jollimemory")),
 		});
 		expect(mockInstallDistPath).toHaveBeenCalledTimes(1);
 		expect(mockInstallDistPath).toHaveBeenCalledWith("cli", expect.any(String));

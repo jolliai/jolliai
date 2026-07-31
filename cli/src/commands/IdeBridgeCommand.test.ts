@@ -12,6 +12,7 @@
  *      startRefreshWatchers retry loop reached through it.
  */
 
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -890,7 +891,7 @@ describe("runIdeBridgeAction — folder-heal-visible-markdown", () => {
 		const { FolderStorage } = await import("../core/FolderStorage.js");
 		const { MetadataManager } = await import("../core/MetadataManager.js");
 		const result = await runIdeBridgeAction("folder-heal-visible-markdown", "/r", { kbRoot: "/bank/repo" });
-		expect(MetadataManager).toHaveBeenCalledWith("/bank/repo/.jolli");
+		expect(MetadataManager).toHaveBeenCalledWith(join("/bank/repo", ".jolli"));
 		expect(FolderStorage).toHaveBeenCalled();
 		const instance = vi.mocked(FolderStorage).mock.results[0]?.value as {
 			healMissingVisibleMarkdown: ReturnType<typeof vi.fn>;
@@ -1129,7 +1130,7 @@ describe("runIdeBridgeAction — session-state", () => {
 
 	it("builds a notes-dir under the jolli memory dir", async () => {
 		const result = await runIdeBridgeAction("session-state", "/r", { operation: "notes-dir" });
-		expect(result).toEqual({ path: "/r/.jolli/jollimemory/notes" });
+		expect(result).toEqual({ path: join("/r", ".jolli", "jollimemory", "notes") });
 	});
 
 	it("loads config from a specific dir when dir is provided", async () => {
@@ -1222,7 +1223,7 @@ describe("runIdeBridgeAction — session-state", () => {
 		// The daemon must acquire against the per-worktree plans.lock path — a
 		// wrong path (e.g. hitting the shared orphan-write dir) would silently
 		// bypass every other plans.json writer.
-		expect(vi.mocked(acquireWithPoll)).toHaveBeenCalledWith("/r/.jolli/jollimemory/plans.lock", {
+		expect(vi.mocked(acquireWithPoll)).toHaveBeenCalledWith(join("/r", ".jolli", "jollimemory", "plans.lock"), {
 			timeoutMs: 5000,
 			pollMs: 25,
 		});
@@ -1245,7 +1246,7 @@ describe("runIdeBridgeAction — session-state", () => {
 			timeoutMs: 200,
 			pollMs: 10,
 		});
-		expect(vi.mocked(acquireWithPoll)).toHaveBeenLastCalledWith("/r/.jolli/jollimemory/plans.lock", {
+		expect(vi.mocked(acquireWithPoll)).toHaveBeenLastCalledWith(join("/r", ".jolli", "jollimemory", "plans.lock"), {
 			timeoutMs: 200,
 			pollMs: 10,
 		});
@@ -1258,7 +1259,10 @@ describe("runIdeBridgeAction — session-state", () => {
 		const { releaseIfOwned } = await import("../core/LockPrimitives.js");
 		const result = await runIdeBridgeAction("session-state", "/r", { operation: "release-lock" });
 		expect(result).toEqual({ ok: true });
-		expect(vi.mocked(releaseIfOwned)).toHaveBeenCalledWith("/r/.jolli/jollimemory/plans.lock", "plans.lock");
+		expect(vi.mocked(releaseIfOwned)).toHaveBeenCalledWith(
+			join("/r", ".jolli", "jollimemory", "plans.lock"),
+			"plans.lock",
+		);
 	});
 });
 

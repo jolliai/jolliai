@@ -3403,29 +3403,39 @@ describe("Installer", () => {
 	});
 
 	describe("reconcileClaudeAgentHooks — atomic write survives a read-only settings file", () => {
-		it("enable still succeeds when .claude/settings.local.json is read-only (atomic tmp+rename)", async () => {
-			// install() writes the canonical Claude hooks via reconcileClaudeAgentHooks,
-			// which uses atomicWriteFile (temp file + rename). rename replaces the target
-			// based on the PARENT DIRECTORY's permissions, not the target file's — so a
-			// read-only settings FILE does not block the rewrite. This guards that
-			// resilience (a plain writeFile to the same path would EACCES). It does NOT
-			// exercise a "writeFile catch" — reconcileClaudeAgentHooks has none on its
-			// write path; the resilience comes from the atomic rename.
-			await install(tempDir);
-			const settingsPath = join(tempDir, ".claude", "settings.local.json");
-			// Drop SessionStart so the reconcile has a real change to write, then lock the file.
-			const settings = JSON.parse(await readFile(settingsPath, "utf-8"));
-			delete settings.hooks.SessionStart;
-			await writeFile(settingsPath, JSON.stringify(settings), "utf-8");
-			await chmod(settingsPath, 0o444);
+		// POSIX-only: this exercises the fact that rename replaces a target based on
+		// the PARENT DIR's permissions, so a read-only target FILE doesn't block the
+		// rewrite. On Windows this can't hold: rename over a read-only file fails with
+		// EPERM, and although atomicWriteFile (core/AtomicWrite.ts) catches EPERM/EACCES
+		// from rename and retries with a plain writeFile, that fallback ALSO fails against
+		// a read-only target — so the win32 path has no way through, which is a different
+		// filesystem contract, not what this resilience guard is about.
+		it.skipIf(process.platform === "win32")(
+			"enable still succeeds when .claude/settings.local.json is read-only (atomic tmp+rename)",
+			async () => {
+				// install() writes the canonical Claude hooks via reconcileClaudeAgentHooks,
+				// which uses atomicWriteFile (temp file + rename). rename replaces the target
+				// based on the PARENT DIRECTORY's permissions, not the target file's — so a
+				// read-only settings FILE does not block the rewrite. This guards that
+				// resilience (a plain writeFile to the same path would EACCES). It does NOT
+				// exercise a "writeFile catch" — reconcileClaudeAgentHooks has none on its
+				// write path; the resilience comes from the atomic rename.
+				await install(tempDir);
+				const settingsPath = join(tempDir, ".claude", "settings.local.json");
+				// Drop SessionStart so the reconcile has a real change to write, then lock the file.
+				const settings = JSON.parse(await readFile(settingsPath, "utf-8"));
+				delete settings.hooks.SessionStart;
+				await writeFile(settingsPath, JSON.stringify(settings), "utf-8");
+				await chmod(settingsPath, 0o444);
 
-			try {
-				const result = await install(tempDir);
-				expect(result.success).toBe(true);
-			} finally {
-				await chmod(settingsPath, 0o755);
-			}
-		});
+				try {
+					const result = await install(tempDir);
+					expect(result.success).toBe(true);
+				} finally {
+					await chmod(settingsPath, 0o755);
+				}
+			},
+		);
 	});
 
 	describe("manual-disable persistence is fail-safe (behavioral)", () => {
