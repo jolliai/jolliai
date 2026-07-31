@@ -1,10 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.99.10
+
+### New Features
+
+- **More references on your memories** — Slack threads mentioned in **Codex** conversations (previously Claude-only) and **context7** library-documentation lookups now appear alongside Linear, Jira, GitHub, Notion, Slack, Zoom, Confluence, Asana, and monday.com.
+- **Clickable Jolli Memory IDs** — the commits list and memory detail panels now show a `JM-…` reference chip on each memory title; click it, or focus and press Enter/Space, to copy the id.
+- **Per-repository push control** — a new **Push this repository's memories to Jolli** toggle in Settings decides whether this repository's memories may be pushed to your Jolli Space, so a shared machine can't push a personal repo by accident. The choice is shared with the CLI and VS Code.
+- **Repository-wide Disable** — turning Jolli off now persists at the repository level (across every worktree) and outlives IDE restarts; a disabled repository writes no data to your project until you re-enable it.
+- **Sessions in project subdirectories** — AI sessions started in a nested subdirectory are now attributed to the enclosing repo instead of being missed.
 
 ### Changes
 
 - **The `/jolli-pr` skill has been removed** — only `jolli-recall` and `jolli-search` are installed now. Generating a PR description from a branch's memories is still available through the `get_pr_description` MCP tool and the `jolli pr-description` command; upgrading removes any previously-installed `jolli-pr` skill file automatically.
+
+### Fixes & Improvements
+
+- **GUI git clients now trigger memories reliably** — commits made from SourceTree or IntelliJ's own commit UI no longer silently skip memory generation on machines whose GUI git launches with a minimal `PATH`.
+- **Commit AI stages the right changes** — the "Generate memory & commit" flow now flushes unsaved editor buffers before staging, so an unsaved edit shown in the Changes panel is no longer left out of the commit with a spurious "No changes to commit".
+- **Branch commits list is complete again** — a fully-synced main branch, or a user name containing regex metacharacters, no longer hides already-pushed memories from the commits list.
+- **Sidebar and Commit AI respect Disable** — a manually disabled repository no longer refreshes background data or offers the AI-commit action.
+- **Accurate token stats and cost estimates** — per-conversation token counts and USD estimates are correct in more edge cases (mixed models, squash trees, and the ranking pipeline).
+- **Cleaner anonymous telemetry** — usage events are more reliably deduplicated and batched, and benign no-op ingests are no longer counted as errors.
+
+### Performance
+
+- **Faster panel refreshes** — memory summary, Create PR, and Working Memory panels open onto the correct editor background on first paint (no more 1–2 s white flash) and share a warm browser pool, so subsequent opens render immediately.
+- **No slow first click** — memory data is preloaded in the background at IDE start, so the first click on a memory renders instantly instead of pausing while cold data loads.
 
 ## 0.99.8
 
