@@ -32,7 +32,7 @@ When the IDE activates a git workspace where the project's git hooks are not yet
 
 The three preconditions themselves are unchanged by the zero-write contract. What changed is what happens **before** them: the hook-path staleness check that precondition 1 sits inside is no longer even invoked when the session's in-process write gate is set (a "no mismatch" answer is synthesized in its place). The staleness step's downstream chain — and therefore this substep — still runs; the durable read in precondition 3 is what actually stops auto-enable. So a disabled repository reaches this substep and is turned away by precondition 3, not by an earlier short-circuit. Cross-reference: spec 100 step 16, spec 145, and `specs/304-manually-disabled-zero-write-contract.md`.
 
-Signed-in state and Anthropic API key configuration are **not** preconditions. Auto-enable installs the git hooks regardless of whether the user is configured. The unconfigured user sees the onboarding panel in parallel; the hooks are installed silently so that a later sign-in or key entry becomes the only remaining step.
+None of the three arms of the configured boolean is a precondition: not the cloud session, not the vendor API key, and not the recorded local-agent provider. Auto-enable installs the git hooks regardless of whether the user is configured. The unconfigured user sees the onboarding panel in parallel; the hooks are installed silently so that supplying a credential — signing in, entering a key, or adopting a local agent tool — becomes the only remaining step.
 
 ### State updated on success
 
@@ -88,7 +88,7 @@ There is no first-run flag. On every activation the staleness step runs and the 
 
 ## Notable Behavior
 
-- **The previous explicit-Enable-first-activation requirement is retired.** The new contract is that a project is implicitly enabled on first activation unless the user has explicitly opted out, even before the user signs in or supplies an API key.
+- **The previous explicit-Enable-first-activation requirement is retired.** The new contract is that a project is implicitly enabled on first activation unless the user has explicitly opted out, even before the user has supplied any summarization credential at all.
 - **Failures are silent because the user has not asked for anything.** A noisy failure on first activation would be jarring for a user who has not yet interacted with the product. The explicit Enable command from the sidebar disabled panel remains available if the user wants diagnostics.
 - **Auto-enable is not independently gated on "not in a degraded branch."** The staleness step itself only runs on the full branch, so by the time auto-enable is reached the degraded-branch check has already been satisfied. There is no redundant guard here.
 - **The hook installer is responsible for its own per-step logging.** Auto-enable does not re-log installer progress lines; it only logs at warning level when the top-level call returns an error.
@@ -102,5 +102,5 @@ There is no first-run flag. On every activation the staleness step runs and the 
 - **Activation lifecycle (spec 100)** owns the staleness step and the surrounding full-branch sequence. Auto-enable is a substep of step 16 in that sequence.
 - **Bridge-level enable path** is shared with the explicit Enable command. Both surfaces converge on the same install mechanics; changes to enable mechanics are automatically inherited by auto-enable.
 - **Repo-wide manual-disable flag (spec 145)** owns the flag's storage location, write/clear ordering, error-handling, and legacy-marker migration. This spec only consumes a boolean read.
-- **Onboarding panel (spec 142)** is independent. Auto-enable can complete while the user is still unconfigured, in which case the onboarding panel remains visible alongside a now-enabled hook installation.
+- **Onboarding panel (spec 142)** is independent. Auto-enable can complete while the user is still unconfigured, in which case the onboarding panel remains visible alongside a now-enabled hook installation. Spec 142 also owns the three-armed configured derivation this spec deliberately does not consult, and the local-agent tool sweep that runs in the same activation but in an earlier step.
 - **Hook installation orchestration (spec 44)** owns the per-step mechanics invoked by the bridge-level enable path.

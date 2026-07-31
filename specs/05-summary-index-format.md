@@ -190,7 +190,19 @@ When the tree hash for a node cannot be computed (e.g. the source object is no l
 
 ### Recovery from corrupt index
 
-On parse failure of the index payload, readers log the failure and treat the index as absent. Writers that subsequently produce an upsert will rebuild a fresh index from the operation's own subtree only — older entries not represented in the operation are lost from the index but their underlying payload files remain. There is no automatic full-index rebuild; recovery is opportunistic and incremental. When the index file is read but parses as a null payload (the absent-or-empty case), the read path now logs a warning at production-visible level distinguishing "fresh repository" from "underlying source store read failure" — older code returned silently.
+On parse failure of the index payload, readers log the failure and treat the index as absent. Writers that subsequently produce an upsert will rebuild a fresh index from the operation's own subtree only — older entries not represented in the operation are lost from the index but their underlying payload files remain. There is no automatic full-index rebuild; recovery is opportunistic and incremental.
+
+### The nothing-here signal on index load is a debug line, not a warning
+
+When the index load comes back empty — the document is missing, or present but holds no bytes; the read path cannot tell those apart — it records a **debug**-level line naming the storage backend it asked (rendering an unnamed backend as `unknown`, since the identity is optional on the storage contract) and returns "no index".
+
+It was briefly a production-visible warning, on the reasoning that an empty result could equally mean "the backend's read failed" and nothing else would surface that. Three findings reversed it:
+
+1. **A genuine read failure is no longer what this result means.** Each storage backend reports its own read failures at the point where the cause is still available, so by the time the read path sees an empty result the breakage has already been named elsewhere. The result is not, however, a single-meaning signal: the test is a plain emptiness test on the loaded document, and both backends hand back an empty document for a file that exists but holds no bytes. Absence and a present-but-empty (zero-byte or truncated-to-nothing) index are therefore indistinguishable here, and both are reported as absence at the quiet level.
+2. **Absence is routine.** A fresh repository has no index until its first summary is stored, and a cross-repository sweep legitimately touches sibling repositories that have none.
+3. **The warning drowned out what it was meant to catch.** At warning level it produced many lines per interface refresh, and it greeted first-run users with a warning in the middle of setup — while the failure it existed to surface stayed invisible inside that noise.
+
+The line also names the backend by the contract's declared identity value rather than by the instance's runtime type, because the shipped bundles are minified: a runtime type name reaches production as a mangled token, and a different one per bundle.
 
 ### Locking for alias-only writes
 
@@ -206,7 +218,7 @@ Both the root count and the recent-roots listing filter to parent-null entries. 
 
 ## Shared Behavior
 
-- **Storage backend** — atomic multi-file writes, payload paths, and locking primitives.
+- **Storage backend** — atomic multi-file writes, payload paths, and locking primitives; also the read contract this format's load path depends on (an empty read means absent, each backend reports its own failures) and the optional backend-identity value the debug line above names.
 - **Summary tree format** — the payload structure that the index flattens into entries; in particular, what counts as a root vs descendant, and what topic count and diff stats mean inside a node.
 - **Schema migration** — the transition from the legacy index format to the current one, including version markers and entry shape changes.
 - **Pipeline operations** — when and why upserts happen (commit, amend, squash, rebase pick, manual overwrite).

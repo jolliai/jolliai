@@ -19,7 +19,7 @@ The first-time provider setup wizard *is* owned here, and the guided front door 
 
 The command writes a free-form, multi-line, human-readable report to stdout. It is not designed to be machine-parsed; the `--json` flag belongs to `jolli status`, not `jolli enable`. Errors **and warnings** are written to stderr, on both the success and the failure branch.
 
-The credential setup section, when run interactively, **may** present a numbered menu of four choices and read a single line from stdin — and one of those choices leads to a second numbered menu (the local-agent tool picker). On a fresh configuration where a usable local agent CLI is detected the provider is auto-selected and no menu is printed at all (see the sequence below). Menus, headers, and confirmations are written to stdout; the prompt lines themselves are written to **stderr**.
+The credential setup section, when run interactively, **may** present a numbered menu of four choices and read a single line from stdin. A second numbered menu — the local-agent tool picker — can be reached two ways: from that menu's local-agent choice, or *before* it, when detection found two or more agent tools installed. The picker may prompt several times in one run (a rejected answer and a failed tool both re-prompt). When exactly one agent tool is installed and it works, the provider is auto-selected and no menu is printed at all (see the sequence below). Menus, headers, and confirmations are written to stdout; the prompt lines themselves are written to **stderr**.
 
 ## Behavior
 
@@ -80,23 +80,37 @@ If the command detects it is running inside a Jolli-spawned local-agent child pr
 
 3. **Interactive credential phase** runs only if stdin is a TTY and `--yes` was not passed. It has three ordered parts — the setup wizard, the generation repair ladder, and the sign-in nudge — and the first two are mutually exclusive by design.
 
-   **3a. Wizard-suppression gate.** Before any prompt is shown, the command reads the global config and auth token and evaluates two facts: whether *any* credential exists (an OAuth token, a Jolli API key, an Anthropic config key, the `ANTHROPIC_API_KEY` environment variable, or an explicit local-agent provider choice), and whether generation can actually run right now (the shared predicate of spec 291, which for the local-agent provider **probes** an agent CLI rather than trusting the provider setting — specifically the *default* tool's, whichever tool is configured). The setup wizard is **skipped exactly when a credential exists but generation is broken** — that state goes straight to the repair ladder, so the user sees **one** menu (the fix), not two. Every other state runs the wizard, including an already-working configuration (which is how a user adds a second key).
+   **3a. Wizard-suppression gate.** Before any prompt is shown, the command reads the global config and auth token and evaluates two facts: whether *any* credential exists (an OAuth token, a Jolli API key, an Anthropic config key, the `ANTHROPIC_API_KEY` environment variable, or an explicit local-agent provider choice), and whether generation can actually run right now (the shared predicate of spec 291, which for the local-agent provider **probes** the *configured* agent tool rather than trusting the provider setting). The setup wizard is **skipped exactly when a credential exists but generation is broken** — that state goes straight to the repair ladder, so the user sees **one** menu (the fix), not two. Every other state runs the wizard, including an already-working configuration (which is how a user adds a second key).
 
    **3b. Setup wizard.** If a Jolli API key is already stored in the global config, the wizard prints `Jolli API Key:     configured ✓` and skips directly to the Anthropic-key step (step 4) — this is the wizard's **only** path to that step.
 
-   Otherwise, the wizard first checks whether the configuration is **fresh**: no stored Anthropic key, no `ANTHROPIC_API_KEY` in the environment, and no provider setting at all. (An OAuth token does **not** disqualify a configuration from being fresh.)
+   Otherwise the wizard evaluates a single gate: **is no Anthropic credential available?** — that is, no stored Anthropic key *and* no `ANTHROPIC_API_KEY` in the environment. (A stored Jolli key never reaches this point; an OAuth token does not affect the gate.)
 
-   - **Fresh-configuration local-agent probe.** Only on a fresh configuration, the wizard probes for **one specific** agent tool — the default one, Claude Code — and no other. It is not a "which agent CLI is installed?" sweep: a machine with Codex, Cursor, or OpenCode installed but no Claude Code fails this probe and falls through to the menu. If the probe succeeds, the provider is auto-selected — the local-agent provider is persisted, **pinned to that one tool** — the interactive tool picker is bypassed entirely, and the wizard **prints no menu and returns**, having printed:
+   The gate is about **credentials, not about whether a provider was ever recorded.** A bare provider setting with no key behind it is a stale preference, not a decision to honour, and does not suppress the auto-detect route. This matters because the field is written by accident: the desktop editor's settings panel derives a provider for display when the field is unset and persists that derived value on the next Apply, even an Apply that only touched an unrelated field — so requiring "no provider recorded" let one stray write permanently close the local-agent route on a machine with four agent tools installed. A **real** Anthropic credential still suppresses it.
 
-     ```
-     ✓ Detected Claude Code — using your subscription to generate summaries (claude -p), no API key.
-     Summaries run through your local `claude` login.
-     Change this anytime: 'jolli auth login', or 'jolli configure --set aiProvider=jolli'.
-     ```
+   - **Auto-detect route** — runs only when the gate holds. The wizard performs the cheap multi-tool **presence sweep** (spec 280): filesystem only, no subprocess, all four tools, milliseconds. It never performs a four-tool *capability* sweep — the expensive probe is paid for at most one tool per round. Three outcomes:
 
-     followed by `Configuration saved to <absolute config path>`. This is the zero-friction default: no key, no sign-in, no question asked. The probe is deliberately restricted to a fresh configuration so an existing key or a deliberate provider choice is never second-guessed and an already-configured re-run never pays for the subprocess probe.
+     - **Exactly one tool present** — that tool is capability-probed.
+       - **Usable** → the local-agent provider is persisted **pinned to that tool**, the picker is bypassed entirely, and the wizard **prints no menu and returns**, having printed:
 
-   - **Provider menu.** Otherwise the wizard prints a **four**-option numbered menu under a **single, unconditional** header:
+         ```
+         ✓ Detected <tool display name> — using your subscription to generate summaries, no API key.
+         Summaries run through your local <tool display name> login.
+         Change this anytime: 'jolli auth login', or 'jolli configure --set aiProvider=jolli'.
+         ```
+
+         followed by `Configuration saved to <absolute config path>`. This is the zero-friction default: no key, no sign-in, no question asked, and it is the only path where this command changes the provider without a user choice.
+       - **Not usable** → the wizard falls through to the provider menu **having printed nothing at all** about the tool it found and rejected. The user sees the general four-option menu with no indication that detection ran, what it found, or why that finding was discarded. (Observable gap; see Notable Behavior.)
+
+     - **Two or more tools present** — the **tool picker runs first**, ahead of the provider menu, listing **only the detected tools**. Detection routed the user here; they did not ask for it. If the picker saves a tool, or the user chooses its skip entry, the wizard returns without ever printing the provider menu. Only when **every** detected tool fails its capability probe does the wizard fall through — printing exactly one line first, so the change of subject is explained:
+
+       ```
+       No usable local agent CLI — here are the other ways to generate summaries.
+       ```
+
+     - **No tool present** — straight to the provider menu, with nothing printed.
+
+   - **Provider menu.** Reached whenever the auto-detect route did not return. The wizard prints a **four**-option numbered menu under a **single, unconditional** header:
 
      ```
      How would you like to generate summaries?
@@ -109,7 +123,7 @@ If the command detects it is running inside a Jolli-spawned local-agent child pr
      4. Skip for now (configure later)
      ```
 
-     **There is no longer a second header.** The alternate header that used to print when the fresh-configuration probe ran and came back empty is gone: a failed probe no longer means "no local agent is available", because the menu now offers a local agent CLI unconditionally and its picker lists all four tools — so a "no local agent CLI found" claim would be actively wrong for a user who has one of the other three.
+     **The header itself is unconditional and there is no alternate form of it.** The only variation is a single explanatory line printed *above* it in exactly one case — when the auto-detect route ran the picker and every detected tool failed (see 3b). No state prints a "no local agent CLI found" header: the menu offers a local agent CLI unconditionally, so such a claim would be wrong for anyone holding one of the other three tools.
 
      The prompt is `Choice [1]:` and the default (empty input) is `1`.
 
@@ -122,32 +136,65 @@ If the command detects it is running inside a Jolli-spawned local-agent child pr
 
      **Manual entry of a Jolli API key is no longer offered by this command.** A user who holds one sets it with `jolli configure`.
 
-   - **Local-agent tool picker (option `3`).** A second numbered menu under its own header:
+   - **Local-agent tool picker.** Reached **two** ways: automatically, when the sweep found two or more tools (above), or explicitly, by choosing `3` on the provider menu. What is offered differs:
+
+     - **From the auto-detect route** — exactly the tools the sweep found.
+     - **From menu option `3`** — the sweep is re-run and whatever it finds is the list. If it finds **nothing**, all four tools are offered instead, with an extra explanatory line, because a user who explicitly asked for a local agent must not be dead-ended. So option `3` on a machine where one tool is detected offers only that one tool; all four appear only when none were detected.
+
+     The menu prints under its own header, plus the blind-offer note when and only when nothing was detected:
 
      ```
      Which local agent CLI would you like to use?
+     (None detected on this machine — pick one to configure anyway.)
      ```
 
-     The options are the four supported agent tools' display names, numbered from `1`, in a fixed order — drawn from the same source that supplies the accepted values of the agent-tool configuration key (spec 62), so the offered list and the settable values cannot drift:
+     Then the remaining tools, numbered from `1` in the registry's fixed order — the same source that supplies the accepted values of the agent-tool configuration key (spec 62), so the offered list and the settable values cannot drift — followed by a skip entry:
 
      ```
      1. Claude Code
      2. Codex
      3. Cursor
      4. OpenCode
+     5. Skip for now (configure later)
      ```
 
-     The prompt is `Choice [1]:` and the default (empty input) is `1` — the first tool. Input is read as a **number** (leniently: a leading numeric prefix is accepted and the rest ignored) and **clamped to the first entry**: an out-of-range number (`0`, `5` and above, a negative) and any input with no leading number at all all select the first tool. There is no "invalid choice" message and no re-prompt.
+     The skip entry's number is always **one past the last tool** and is **recomputed every round**, so it moves down as tools are removed from the menu.
 
-     The chosen tool is persisted together with the local-agent provider, and the wizard prints three lines followed by the configuration path:
+     The prompt is `Choice (1-<skip number>): ` and **advertises no default — none is applied**. This is an N-way choice the user may not have asked to be in (the auto-detect route puts them there) whose outcome is a global-config write pinning a provider, so a bare Enter must not decide it:
+
+     - **The skip number** — prints `Skipped. Configure later with 'jolli auth login' or 'jolli configure'.` and the absolute config path. Nothing is written.
+     - **A number naming a listed tool** — that tool is **capability-probed before anything is written** (spec 280).
+       - *Usable* → the local-agent provider and the chosen tool are persisted, and the wizard prints three lines followed by the configuration path:
+
+         ```
+         AI provider:       Local Agent (<tool display name>) ✓
+         No API key needed — summaries run through your local <tool display name> login.
+         <that tool's sign-in instruction>
+         ```
+
+         followed by `Configuration saved to <absolute config path>`. The third line is the tool's own sign-in instruction from the shared registry — the same five strings the diagnostic command attaches to its failure line (spec 59) — not a pointer at `jolli doctor`.
+       - *Not usable* → prints `<tool display name> isn't usable on this machine — nothing was saved.`, **removes that tool from the menu**, and re-prompts. A tool that failed is never offered again in that run: re-offering a known-broken tool would cost another probe to learn nothing.
+     - **Blank, non-numeric, or out-of-range** — all three are **rejected, never coerced to the first entry**. The picker prints `Enter a number between 1 and <skip number>.` and re-prompts. Because these answers consume no tool, they carry their own bound: after **3 unreadable answers cumulatively** (not consecutively) in one run, the picker prints `Couldn't read a choice after 3 tries.`, then the skip lines, and returns **having written nothing**.
+
+     **When the list empties** because every offered tool failed its probe, the closing advice splits on how the list was built — telling someone to install a tool they demonstrably already have would read as a broken diagnosis:
 
      ```
-     AI provider:       Local Agent (<tool display name>) ✓
-     No API key needed — summaries run through your local <tool display name> login.
-     Run 'jolli doctor' to verify the tool is installed and signed in.
+     Install one, then run 'jolli enable' again.
      ```
 
-     followed by `Configuration saved to <absolute config path>`. This choice is **terminal**: the picker does not fall through to the Anthropic-key step, and no probe of the chosen tool's executable happens here — verification is deferred to `jolli doctor` (spec 59).
+     when the four were offered blind, versus
+
+     ```
+     Every detected tool failed to run — upgrade one, or pick another provider.
+     ```
+
+     when the tools were detected on disk and merely failed to run.
+
+     Termination is guaranteed by two independent bounds: a probing round either writes and returns, or strictly shrinks a finite list; an unreadable answer is capped at three. **No exit path from the picker writes anything except the successful pick.**
+
+     The picker distinguishes three outcomes internally — saved, the user skipped, and every tool exhausted — and only the auto-detect caller reacts to the difference (it falls back to the provider menu on "exhausted" only). Reached from menu option `3`, the outcome is **discarded**: "exhausted" there has nowhere better to fall through to, since re-offering the same menu would loop.
+
+     This choice is **terminal** with respect to the wizard: the picker never falls through to the Anthropic-key step.
 
    **3c. Generation repair ladder.** After the wizard (or in place of it, per the suppression gate), the config and token are re-read and the predicate re-evaluated. If generation still cannot run **and** some credential exists, the shared repair ladder of **spec 291** runs — one prompt round-trip offering a provider crossover, a key entry, or a retry of the local agent probe, depending on which mismatch applies. The ladder's own return value is discarded; this command re-reads the config and re-derives the answer afterward. A fresh user who just chose "Skip for now" has no credential and is deliberately not offered the ladder.
 
@@ -190,14 +237,21 @@ Exit code `0` is therefore returned even when the user finishes with no provider
 
 ## Notable Behavior
 
-- **Idempotent for hooks, but not silent for credentials**: re-running `jolli enable` on an already-enabled project re-installs the same hooks (the installer treats existing hooks as upgrades, not errors) and re-prints the full success report. Re-running on a project that already has a Jolli API key short-circuits the provider menu and only re-checks the Anthropic key. But re-running on **any other already-configured project — including a perfectly working local-agent or Anthropic-key user — shows the provider menu again**, because the fresh-configuration probe only runs on a truly fresh config: such a user is not fresh, so no probe runs, the menu prints, and the default answer is browser login. The menu is not suppressed by "already configured"; it is suppressed only by a stored Jolli key, or by the ladder-eligibility gate when generation is broken.
-- **A fresh configuration with a working default agent CLI is configured without asking anything.** The zero-friction default selects the local-agent provider on the strength of a real probe of **one** tool (Claude Code) and prints a confirmation instead of a question. This is the only path where `jolli enable` changes the provider without a user choice, and it is confined to a truly fresh configuration. A fresh machine that has one of the other three agent tools but not Claude Code gets the menu, not the auto-select.
+- **Idempotent for hooks, but not silent for credentials**: re-running `jolli enable` on an already-enabled project re-installs the same hooks (the installer treats existing hooks as upgrades, not errors) and re-prints the full success report. Re-running on a project that already has a Jolli API key short-circuits everything below and only re-checks the Anthropic key. Re-running with a stored Anthropic key (or the environment variable) skips the auto-detect route and shows the provider menu. The menu is not suppressed by "already configured"; it is suppressed only by a stored Jolli key, by the ladder-eligibility gate when generation is broken, or by the auto-detect route returning.
+- **The auto-detect route can silently re-pin a *different* tool than the one already configured.** It consults presence and the probe, never the stored tool setting: so a user who deliberately pinned one tool, on a machine where only a *different* tool is installed and working, has their selection overwritten without a prompt — and the confirmation printed reads as a fresh detection rather than a change. (Surprising; the same write also drops an explicit executable path recorded for the outgoing tool, per spec 308.)
+- **A working local-agent user who re-runs the command is asked to re-pick their tool.** Because the auto-detect gate is "no Anthropic credential available" and nothing about it consults whether the local-agent provider is already configured and working, such a user re-enters detection on every re-run: with **two or more** agent tools installed they are shown the tool picker again and must answer it (or skip); with exactly one installed and working, the same tool is silently re-selected and the auto-detect confirmation re-printed. That is a behaviour change from the earlier gate, which treated any recorded provider as a decision to leave alone. (Surprising; the trade for not letting a stray provider write close the route.)
+- **A single detected-but-broken tool falls through to the provider menu silently.** When exactly one tool is present and its capability probe fails, nothing is printed to say so — no "found X but it doesn't run" line, no hint. The user sees the ordinary four-option provider menu and has no way to tell that detection ran at all. This is the one detection outcome with no user-visible explanation; the two-or-more branch prints a line and the picker's own failures print per-tool messages. (Surprising; observable gap.)
+- **A tool that just failed its probe is re-offered if the user loops back around.** An exhausted auto-detect picker falls through to the provider menu, which still offers `3` (use a local agent CLI), which re-runs detection and re-probes the very tools that just failed — paying for each probe again. Nothing carries the failures across that boundary: the splice-out list is per picker run, and the underlying resolution never caches a failure (spec 280). The two runs' remedy wording can also differ, since the second run rebuilds its list from a fresh sweep.
+- **One tool present and working configures the machine without asking anything.** The zero-friction default pins the local-agent provider on the strength of a real capability probe of that one tool and prints a confirmation instead of a question. It is the only path where `jolli enable` changes the provider without a user choice. Two or more tools is treated as a genuine choice and always asks.
+- **The tool picker probes before it writes.** A pick that fails its capability probe is never persisted, and the failed tool is removed from the menu rather than re-offered. This is what stops a known-broken configuration from landing in the global config and only being discovered later by `jolli doctor` (spec 59).
+- **The tool picker has no default, and that is deliberate.** Blank input is rejected exactly like `99` — it does not select the first tool. A stray newline (one queued in the terminal's buffer while startup does its git and storage work is enough) can therefore no longer pin a provider the user never named; the worst case is that nothing is saved. Unreadable answers are capped at three cumulative tries, after which the picker skips without writing.
+- **The provider menu still has a default, and it is still `1`.** The no-default rule applies to the tool picker only: the four-option provider menu keeps `Choice [1]:` and still treats an empty line and any unrecognized answer as browser login. The two menus in the same flow therefore behave differently on a bare Enter — one launches a login, the other rejects the input.
 - **The setup wizard and the repair ladder are mutually exclusive, by design.** A user who has a credential but broken generation is shown exactly one menu — the repair (spec 291) — never the provider menu followed by the repair menu.
 - **Credentials are stored globally, not per-project.** The interactive phase always reads from and writes to the global configuration directory regardless of the `--cwd` value.
 - **Browser-login failure is non-fatal.** A failed OAuth attempt does not abort the phase and does not change the exit code.
-- **The default answer to the provider menu is `1`, and every unrecognized answer is also treated as `1`.** Pressing Enter, or typing anything the menu does not list, launches the browser login flow. Skipping requires typing exactly `4`; the local-agent picker requires exactly `3`; entering an Anthropic key requires exactly `2`. There is no "invalid choice" message.
-- **The provider menu has exactly one header now.** The old alternate header (`No local agent CLI found. …`) no longer exists in any state, because the menu itself offers a local agent CLI unconditionally — the fresh-configuration probe's outcome changes nothing about what is printed, only whether the menu is reached at all.
-- **Picking a non-default agent tool is immediately followed by a repair prompt naming the default one.** The picker persists the chosen tool without probing it, and the interactive phase then re-evaluates the "can generate right now" predicate — which, for the local-agent provider, probes **only the default tool's executable** regardless of which tool was just pinned (spec 291). Because an explicit local-agent provider choice satisfies "a credential exists", the ladder is eligible, so a user who picks Codex, Cursor, or OpenCode on a machine without Claude Code installed is told, seconds later, that no usable default agent was found — naming a tool they deliberately did not choose. The remedies the ladder then offers (retry the probe, switch provider, enter a key) do not include "use the tool I picked". (Surprising; a real mismatch, not a wording problem.)
+- **The default answer to the provider menu is `1`, and every unrecognized answer is also treated as `1`.** Pressing Enter, or typing anything the menu does not list, launches the browser login flow. Skipping requires typing exactly `4`; the local-agent picker requires exactly `3`; entering an Anthropic key requires exactly `2`. There is no "invalid choice" message on this menu.
+- **The provider menu has exactly one header.** The old alternate header (`No local agent CLI found. …`) no longer exists in any state, because the menu itself offers a local agent CLI unconditionally. The only extra output above it is the one-line hand-off printed when the auto-detect picker exhausted every detected tool.
+- **A successful pick is no longer immediately contradicted by the repair prompt.** The picker probes the tool it saves, and the repair ladder's predicate probes the *configured* tool (spec 291), so a user who picks Codex, Cursor, or OpenCode is not told seconds later that some other tool is missing. The ladder can still fire right after a pick — if the tool broke between the probe and the re-check, or if the picker was skipped leaving an older broken configuration in place — but when it does, it names the tool the user actually chose.
 - **`jolli enable` clears the durable opt-out but performs no discovery catch-up.** A successful full enable wipes the repo-wide manual-disable marker, but nothing re-reads the transcript backlog that accumulated while the repository was opted out. A repository re-enabled from the command line therefore keeps its frozen-window backlog: still-active sessions recover on their next turn, while quiet sessions lose whatever was authored during the window once they age out of the session registry. This is an asymmetry with the desktop editor's enable, which does run the catch-up drain — see spec 305, which owns both the drain and this omission.
 - **Prompts go to stderr, menus to stdout.** Every prompt line the interactive phase reads is written to standard error while the menus, headers, and confirmations go to standard output — so redirecting stdout still shows the questions.
 - **Interactivity is decided on stdin alone.** This command consults only whether standard input is a TTY; a piped or redirected stdout does not suppress the interactive phase.
@@ -218,6 +272,7 @@ Exit code `0` is therefore returned even when the user finishes with no provider
 - The `--cwd <dir>` flag is shared with most other `jolli` sub-commands. When omitted, the project directory is auto-resolved to the enclosing git repository root.
 - All Jolli sub-commands set up the per-project log directory under `<cwd>/.jolli/jollimemory/` before doing any work; messages logged by `enable` land there in addition to whatever is printed to the terminal.
 - The provider setup wizard specified here is the same implementation the guided front door runs as its onboarding step (spec 265), so the auto-detect copy, the four-option provider menu, and the local-agent tool picker are identical on both surfaces.
-- The four selectable agent tools, their display names, and the executable discovery / capability probe that decides whether one is usable are owned by spec 280. The picker reads the same tool registry that `jolli configure --set localAgentTool=…` validates against (spec 62), so the offered list and the accepted values cannot diverge.
+- The four selectable agent tools, their display names, their sign-in instructions, the cheap presence sweep that decides what to offer, and the per-tool capability probe that decides whether a pick is usable are all owned by spec 280 — including the reachable "present but not resolvable" state on one platform that makes the picker's splice-out behavior necessary rather than defensive. The picker reads the same tool registry that `jolli configure --set localAgentTool=…` validates against (spec 62), so the offered list and the accepted values cannot diverge, and the same registry supplies the diagnostic command's labels and hints (spec 59).
+- The wizard's writes go through the shared configuration write path, so pinning a tool here also clears an explicit executable path recorded for a *different* tool (spec 308). Neither the picker nor the auto-detect route ever writes an explicit path itself.
 - The "can generate right now" predicate that gates the wizard-suppression rule, the repair ladder, and the sign-in nudge is the shared predicate defined in spec 291 — including its deliberate divergence from dispatch-time credential selection (spec 10) for the local-agent provider.
 - The repair ladder and the sign-in nudge run in the same relative order here as in the guided front door (repair, then nudge), so a user meeting either surface sees the same sequence.

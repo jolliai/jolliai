@@ -27,7 +27,7 @@ The PINNED section of the tool window — a single newest-first list of items th
 - The pin store's on-disk format, versioning, group-key construction, atomic-write, defensive read coercion, and de-dup-on-re-pin rules — owned by the pin store spec (246). This panel only reads the list and calls add/remove through the bridge.
 - The act of *creating* a pin — performed by the source panels (the conversations sub-panel pins a conversation, the context sub-panel pins a plan/note/reference, the committed-memories panel pins a memory). This panel never writes a new pin; it only reads, opens, and removes.
 - The conversation transcript editor tab opened for a conversation pin — its own spec; this panel only constructs the conversation virtual file and hands it to the IDE open-file mechanism.
-- The summary/memory editor tab opened for a memory pin — its own spec; this panel only looks up the memory and constructs its virtual file.
+- The summary/memory editor tab opened for a memory pin — its own spec; this panel only looks up the memory and hands it to the shared single-memory-tab opener. That opener's one-tab-per-project rule and its in-place content swap belong to that spec too.
 - The rendered-markdown preview opened for plan/note/reference pins — owned by the markdown-preview utility; this panel only resolves the source path and calls it.
 - The terminal-resume utility — its own spec; this panel only supplies the session id, working directory, and tab title.
 - The active-session aggregator used to re-resolve a conversation pin to a live conversation item — its own spec.
@@ -140,7 +140,7 @@ Resolve the working directory; if null, do nothing. Then by kind:
 | plans | Look up the plan in the plans registry by key, resolve its source path, and open it as rendered markdown. |
 | notes | Look up the note in the notes map by key, resolve its source path, open as rendered markdown. |
 | references | Look up the reference in the references map by key, resolve its source path, open as rendered markdown. |
-| memories | On a background thread, fetch the memory by commit hash; if found, open its memory virtual file as an editor tab on the UI thread (the full memory UI, identical to the committed-memories view). |
+| memories | On a background thread, fetch the memory by commit hash; if found, hand it on the UI thread to the **shared single-memory-tab opener** (the full memory UI, identical to the committed-memories view). That opener allows at most one memory tab per project, so if one is already open it swaps that tab's content to this memory and re-activates it rather than opening a second tab — **whatever memory the tab was showing is replaced**. This panel never constructs the memory's virtual file itself. |
 
 For plan/note/reference, a null or blank source path is a no-op; the path is resolved to a virtual file and, if that resolution fails, nothing opens.
 
@@ -211,6 +211,7 @@ The panel holds no timers or external listeners and releases nothing special on 
 - **The session id for resume is parsed from the composite key.** It is the substring after the first `:`; a malformed key with no `:` or an empty session id makes resume a no-op.
 - **Plan/note/reference pins open as rendered markdown, not raw text** — consistent with the design intent that these are human-readable documents.
 - **Memory pins open the full memory editor**, the same surface as the committed-memories list (with its own actions such as Create PR), not a read-only snippet.
+- **Opening a memory pin replaces whatever memory was already showing.** Memory opening goes through the shared single-memory-tab opener, which allows at most one memory tab per project. Clicking through several memory pins in a row therefore reuses one tab rather than accumulating tabs, and there is no way to keep two pinned memories open side by side. (Notable; the list's "several pinned memories" framing does not suggest it.)
 - **The panel fits to content and owns no scroll bar.** It participates in the section's single shared scroll bar; every render revalidates the whole panel so the section re-measures.
 - **The lead is logo-first for conversation pins only.** Context-kind pins always render a colored letter pill, never a logo.
 - **The empty-state render path does not fire the count callback.** The count callback is fired from the data render path (which reports `0` for an empty list); the standalone empty-state render used at construction simply shows the label.
@@ -221,7 +222,7 @@ The panel holds no timers or external listeners and releases nothing special on 
 - **Active-session aggregator** — re-resolves a conversation pin's key to a live conversation item at open time.
 - **Plans/notes/references registry** — resolves a context pin's source path by key.
 - **Conversation transcript editor tab / conversation virtual file** — the surface a conversation pin opens; this panel only constructs the virtual file.
-- **Memory editor tab / memory virtual file** — the surface a memory pin opens; this panel only looks up the memory and constructs the virtual file.
+- **Memory editor tab / memory virtual file** — the surface a memory pin opens; this panel only looks up the memory and hands it to the shared single-memory-tab opener, which decides between swapping the one existing memory tab and opening a new one.
 - **Markdown preview utility** — renders plan/note/reference markdown.
 - **Terminal-resume utility** — resumes a Claude session; this panel only supplies session metadata.
 - **Tool-window section frame** — owns the PINNED header, count suffix, collapse, gear-menu visibility, and the shared scroll bar.

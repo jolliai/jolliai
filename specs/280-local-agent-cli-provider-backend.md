@@ -9,8 +9,9 @@ This spec defines a third LLM execution backend, selected when the configured pr
 **In scope**
 
 - Backend selection at dispatch time (the local-agent provider value) and the two auxiliary config fields that parameterize it (which tool to drive; an optional explicit executable path).
-- A pluggable backend registry keyed by tool id, with four backends registered at module load and an extension point for future tools.
+- A pluggable backend registry keyed by tool id, populated by one dedicated registration module imported for its side effect, with four backends registered and an extension point for future tools.
 - Discovering and capability-verifying each tool's executable through one shared, per-tool-parameterized procedure: candidate enumeration, the search-path augmentation, the capability probe, launcher-shim resolution, newest-capable selection, per-tool result caching, and the discovery diagnostics.
+- The parallel **spawn-free presence enumeration** ("is this tool on disk?"), the multi-tool sweep built on it, and the three deliberate asymmetries between presence and resolution.
 - Per-tool display-name and sign-in-guidance metadata, and its degradation on an unrecognized tool identifier.
 - Building the child-process invocation: the shared parts (headless single-shot operation, tool denial where expressible, the isolated temporary working directory, the re-entrancy markers) and the per-tool differences (prompt delivery channel, system-prompt handling, tool-specific flags, environment posture).
 - Running the child: the argument sanitization and working-directory environment pinning applied at the single spawn boundary, standard-output capture, standard-error tail retention, the wall-clock timeout with graceful-then-forceful termination, and the exit-code interpretation rules.
@@ -19,7 +20,7 @@ This spec defines a third LLM execution backend, selected when the configured pr
 - Fan-out serialization under this provider.
 - Mapping an auth failure into a distinct summary-error marker; the no-fallback guarantee.
 - The two re-entrancy markers the backend plants, and the set of entry points that detect them and no-op.
-- A health probe of the executable exposed by the diagnostic command, and the non-throwing liveness predicate that the interactive setup and repair surfaces consume.
+- A health probe of the executable exposed by the diagnostic command, and the non-throwing **per-tool** usability predicate that the interactive setup, repair, and editor onboarding surfaces consume.
 
 **Boundaries**
 
@@ -30,6 +31,7 @@ This spec defines a third LLM execution backend, selected when the configured pr
 - How a summary-generation failure marker is subsequently acted upon (retry policy, placeholder writes, the "regenerate" affordance) is owned by the queue-worker / summary-error specs; this spec only defines which marker a failure produces.
 - The MCP server's own no-op-in-child behavior is described in the MCP tool-surface spec; this spec owns the marker contract it keys off.
 - The storage-layer write boundary that independently refuses to claim a non-project directory is owned by spec 300; this spec only records that it is a backstop to the re-entrancy guard.
+- The write-time invariant that keeps the persisted explicit path from outliving the tool it was chosen for is owned by spec 308. This spec consumes the *result* of that invariant (a path may be attributed to the configured tool) and defines how a mismatched path is dropped at the detection surfaces.
 
 ## Data Contracts
 
@@ -39,6 +41,8 @@ The backend is reached only when the resolved credential source is the local-age
 
 - **Which tool to drive** — an enumerated identifier with exactly four accepted values: `"claude-code"`, `"codex"`, `"cursor-agent"`, and `"opencode"`. When the field is absent the default is `"claude-code"`. An unrecognized value is rejected at config-set time with a message listing the valid values, which are themselves derived from the per-tool metadata table so the two cannot drift.
 - **An optional explicit executable path** — overrides automatic discovery. When set, no discovered candidate is considered.
+
+The persisted path records **no owning tool**. The detection surfaces therefore do not pass it around as a bare string: they carry it **paired with the one tool it describes**, re-derived by attributing the stored path to the currently-configured tool (defaulting to the default tool when that setting is absent). Any predicate handed such a pair applies it **only** when it names the tool being asked about, and otherwise falls back to auto-discovery. This makes one specific mistake unrepresentable: because an override short-circuits enumeration to that single file, a bare path handed to a multi-tool sweep would report every tool as installed at one file and then probe each of them with another tool's binary. What makes the attribution *true* rather than merely conventional is a write-time invariant enforced elsewhere (spec 308); no reader can detect the drift on its own.
 
 Both fields are threaded through the credential-field extraction helper alongside the provider choice, so a call site that copies credentials cannot silently drop them.
 
@@ -81,7 +85,11 @@ Presence of either means "this process descends from a jollimemory-spawned local
 
 ### Backend registry
 
-Backends are registered under a string tool id in a process-wide registry; all four are registered at module load. Looking up an unknown id raises a setup error naming the available ids. The registry is the extension point for future tools; the user-facing tool lists are derived from the per-tool metadata table instead.
+Backends are registered under a string tool id in a process-wide registry. Looking up an unknown id raises a setup error naming the ids currently registered — and the error is worded to cover the empty case, because until registration has happened the registry legitimately holds nothing.
+
+**Registration is the side effect of importing one dedicated module, and that is a correctness property, not a packaging detail.** The registry starts empty; a consumer that reaches it without that module anywhere in its import graph finds it empty and gets an "unknown tool" setup error for a tool that ships with the product. Consolidating registration into a single module whose only job is to perform it means the two entry points that reach the registry — the LLM dispatch path and the detection surfaces — each declare that dependency explicitly, rather than a populated registry being an invisible consequence of importing an unrelated module.
+
+Registration order is irrelevant: the registry keys by id, and the ordering authority for every user-facing list is the per-tool metadata table, whose order differs from the registration order.
 
 ### Executable resolution
 
@@ -110,6 +118,27 @@ A configured explicit path replaces enumeration entirely. On the non-POSIX platf
 ### Resolution cache
 
 A successful resolution is cached with a time-to-live in a **single most-recent slot**, keyed by the tool's binary name *and* the override path (empty for default discovery). Including the tool in the key is what stops one tool's binary from being served for another; because there is only one slot, alternating between two tools simply misses the cache and re-probes each time. Failures are never cached, so a fresh install or upgrade is picked up on the next call.
+
+### Presence detection — the spawn-free half
+
+Two different questions are asked about a tool, answered by two different mechanisms that are separated **deliberately by cost**:
+
+- **"Is it on disk?"** — pure filesystem work: no capability probe and no subprocess of any kind, milliseconds for all four tools together. Cheap enough for a caller that must decide what to *offer* before the user has committed to anything, including one that runs on a single-threaded editor's startup path.
+- **"Does it actually run?"** — the resolution procedure above, which spawns one probe per candidate and costs hundreds of milliseconds to roughly two seconds for a **single** tool. A four-tool sweep with it costs several seconds, which is why nothing ever performs one.
+
+Presence enumerates the same directories the discovery step would search — the augmented search path, then the tool's well-known install locations — and tests each candidate filename directly. It deliberately does **not** run the platform's path-lookup utility, because that utility is a synchronous subprocess. The trade-off is accepted **asymmetrically**: presence is allowed to *miss* an install (shell aliases and the platform's executable-extension resolution rules are not modelled), but it must never *invent* one, because a presence-only "yes" is what paints a clickable option the user can then fail to use.
+
+Three asymmetries with the resolution half are deliberate:
+
+1. **On POSIX presence is stricter than resolution.** A candidate counts only if it is a **regular file with the execute bit set** — stricter than the plain existence test that resolution applies to the tool's well-known install locations, and it closes two false positives that test accepts: a *directory* carrying the tool's name somewhere on the search path, and a real binary whose execute permission has been removed. Symbolic links are followed, so a link to a working binary is a good install and a broken link is absent under either test. (The stricter test is confined to the presence half; the plain existence test remains what the shim-resolution rules use, since those legitimately point at a script that carries no execute bit.)
+2. **On the shim-restricted platform presence is looser than resolution.** It accepts a native executable image, a batch launcher, the script launcher, or an extensionless stub as proof of an install (native images listed first) — where resolution will spawn only a native image and otherwise depends on the tool's shim-resolution rule. For the **two tools that carry no such rule**, this produces a reachable **present-but-not-resolvable** state: the tool is reported installed, and then fails. An interactive picker absorbs that by removing the failed entry (spec 57); a surface that paints presence without probing does not.
+3. **The search-path augmentation applies on POSIX only**, on both halves alike — so on the other platform presence sees the bare inherited path, exactly as resolution does.
+
+Presence **never reads or writes the resolution cache**: a presence answer must not be mistaken for, or displace, a real resolution. A `true` result means only "something that looks installed was found" — it promises nothing about version, flag compatibility, or login state, and a caller that needs those must still resolve.
+
+**With an explicit path configured**, presence tests the filesystem directly rather than trusting the length of the candidate list: the override always yields at least the verbatim path (so the probe can produce an error naming what the user configured), which would otherwise make presence unconditionally true for a file that does not exist.
+
+**The multi-tool sweep** walks all four tools in the per-tool metadata table's order — the ordering authority for every user-facing list, *not* the registry's registration order, which differs — and returns each present tool's identifier together with its display label. It **never throws**: a failure while checking one tool is reported as that tool being absent, because a detection failure must degrade to "offer fewer options", never to a broken setup surface. An empty result is an ordinary outcome, not an error. The tool-scoped explicit path is applied to its own tool and to no other.
 
 ### Discovery diagnostics
 
@@ -243,18 +272,26 @@ The guard is independent of whether the temporary directory happens to be a git 
 
 ### Diagnostic probe
 
-The diagnostic ("doctor") command, when the active provider is local-agent, does not stop at "provider selected": because the "credential" here is an executable rather than a stored key, it labels the provider with the configured tool's display name and additionally runs the executable resolution for that tool (cheap, and it verifies the flags are accepted). On success it reports the launch command **rendered with its launcher arguments** — a bare target path would read as the wrong binary having been picked for a shim-resolved tool — plus the version. On failure it reports a failing check carrying the resolution error *and* that tool's sign-in hint, so it never reports healthy while every commit silently fails with a setup error (spec 59). This is the only surface that consumes the per-tool sign-in hints.
+The diagnostic ("doctor") command, when the active provider is local-agent, does not stop at "provider selected": because the "credential" here is an executable rather than a stored key, it labels the provider with the configured tool's display name and additionally runs the executable resolution for that tool (cheap, and it verifies the flags are accepted). On success it reports the launch command **rendered with its launcher arguments** — a bare target path would read as the wrong binary having been picked for a shim-resolved tool — plus the version. On failure it reports a failing check carrying the resolution error *and* that tool's sign-in hint, so it never reports healthy while every commit silently fails with a setup error (spec 59). It is one of three surfaces that consume the per-tool sign-in hints — the others are the interactive repair ladder's still-failing line (spec 291) and the setup picker's successful-pick confirmation (spec 57).
 
-### Liveness predicate for interactive callers
+Unlike the detection predicates, this surface hands the configured path to the configured tool's resolver **as a bare value**, without re-deriving the tool it was recorded for — the same shape the dispatch path uses, and correct for the same reason (the tool being resolved *is* the configured tool). It is also the surface whose failure message names the path as the likely cause, precisely because a configuration that drifted before the write-time invariant existed cannot be detected here (specs 59, 308).
 
-The executable resolution is additionally exposed as a **non-throwing boolean liveness predicate**: "is a usable agent CLI present right now?", taking the same optional explicit-path override. It is a plain success/failure wrapper — it performs the identical candidate enumeration and capability probe, and simply reports `false` instead of raising the setup error.
+### Usability predicate for interactive callers
 
-**It is hard-wired to Claude Code's discovery and probe rules and does not consult the configured tool identifier.** So for a user who selected any of the other three tools, the predicate answers a question about a CLI the run will not drive: it can report "cannot generate" while the configured tool works, and "can generate" while the configured tool is absent. Only the diagnostic command probes the tool that will actually run.
+The executable resolution is additionally exposed as a **non-throwing, per-tool boolean**: "does *this named tool* resolve to a runnable binary that accepts the flags we pass, right now?" It takes the tool identifier to test plus the tool-scoped explicit path, and is a plain success/failure wrapper — it performs the identical candidate enumeration and capability probe and simply reports `false` instead of raising the setup error. **Every** failure is absorbed, including a tool identifier this build does not recognize (which resolves to no backend and would otherwise raise a setup error).
 
-Two interactive surfaces consume it, and both would otherwise have to catch an error to ask a yes/no question:
+**It probes the tool it is asked about, and the explicit path reaches that probe only when the path names the same tool.** Both halves matter: because an override short-circuits enumeration to that one file, handing one tool's configured path to a different tool's probe would answer a question nobody asked, and answer it wrongly in both directions.
 
-- the fresh-configuration auto-detect in the first-time provider setup wizard (spec 57), which selects the local-agent provider without asking when the answer is yes — and which is the one place where the Claude-only wiring is exactly right, since that auto-detect is specifically choosing Claude Code;
-- the shared "can generate right now" predicate (spec 291), which is why that predicate deliberately diverges from dispatch-time provider selection (spec 10) for this provider only.
+It still says nothing about **login state**. There is no uniform authentication probe across the four tools, so an installed, capability-passing, signed-out CLI reports usable here and fails at generation time — which is exactly what the per-tool sign-in hints exist for.
+
+Four kinds of caller consume it, and every one of them would otherwise have to catch an error to ask a yes/no question:
+
+- the setup wizard's **auto-detect**, which pins the local-agent provider without asking when exactly one tool is present and this predicate says it works (spec 57);
+- the setup wizard's **tool picker**, which probes the user's pick **before** writing it, so a known-broken configuration cannot land in the config (spec 57);
+- the shared **"can generate right now"** predicate and the repair ladder's single one-shot re-probe (spec 291), which is why that predicate deliberately diverges from dispatch-time provider selection (spec 10) for this provider only;
+- the desktop editor's tool-selection and settings surfaces (their own specs), which likewise probe the tool being selected before saving it.
+
+The **presence** sweep described above is the deliberately cheaper companion: it is what those surfaces use to decide what to *offer*, and this predicate is what they use once the user has committed to one tool.
 
 **The caching asymmetry is operative here, not incidental.** Because a resolution is cached only *after* it succeeds, a **success** is served from the time-bounded most-recent slot while a **failure is never cached at all**. That is precisely what makes the repair ladder's single one-shot re-probe meaningful: a user who installs, upgrades, or signs in to the agent CLI in another terminal and then answers "retry" gets a genuinely fresh answer rather than a replayed failure. Conversely, a user whose agent CLI *stops* working within the cache window can still be told it is usable.
 
@@ -283,13 +320,20 @@ The backend is stateless per call except for the module-level executable-resolut
 - **The re-entrancy guard has two channels because one is not enough.** The environment marker is inherited transitively but is stripped by a host that spawns MCP servers under a fixed environment allowlist; the working-directory marker file survives that hop.
 - **A leaked working directory is permanent.** The marker file is only ever removed by deleting the whole directory in the call's cleanup step, and no sweep exists — a hard kill leaks one directory per interrupted call, forever. A directory with the reserved prefix but no marker is not treated as re-entrant.
 - **The search path's contents are never logged, only its entry count**, because the value inventories the machine and users paste diagnostics into bug reports.
-- **Unknown tool identifiers degrade rather than crash** in the display-name and sign-in-hint lookups, because the identifier arrives from a machine-global config shared across surfaces *and versions* and from persisted metadata, so a newer build's value read by an older build is reachable.
-- **The liveness predicate ignores the configured tool.** It always probes Claude Code, so for the other three tools it can disagree in both directions with what a real run would do; only the diagnostic command probes the tool that will actually run.
+- **Unknown tool identifiers degrade rather than crash** in the display-name and sign-in-hint lookups, because the identifier arrives from a machine-global config shared across surfaces *and versions* and from persisted metadata, so a newer build's value read by an older build is reachable. The usability predicate absorbs such an identifier too, reporting "not usable" rather than raising.
+- **"Installed" and "runnable" are two separate predicates with two different costs**, and no caller may substitute one for the other. The cheap one stats files (milliseconds for all four tools); the expensive one spawns a probe per candidate (hundreds of milliseconds to ~2 s for **one** tool). Nothing sweeps all four with the expensive one.
+- **Presence and resolution disagree in three specific ways, each on purpose.** On POSIX presence is *stricter* (regular file plus execute bit, which resolution does not require of a well-known install location). On the shim-restricted platform presence is *looser* (launchers and extensionless stubs count as installed but are never spawned). And the search-path augmentation is POSIX-only on both halves.
+- **A reachable "present but not resolvable" state exists**, on the shim-restricted platform, for the two tools that carry no shim-resolution rule: presence accepts their launcher, resolution refuses to spawn it and has nothing to map it to. An interactive picker survives this by removing the failed entry; a surface that paints presence without probing offers something the user cannot use.
+- **The presence sweep never throws and never touches the resolution cache.** One tool's failure is reported as that tool being absent, an empty result is ordinary, and no presence answer can be mistaken for or displace a real resolution.
+- **The user-facing tool order is the metadata table's, not the registry's**, and the two differ. Anything that enumerates tools for a person reads the table.
+- **An empty backend registry is a reachable error state, so registration lives in one dedicated module.** The registry is populated only as the side effect of importing that module; a consumer that reaches the registry without it in its import graph gets an "unknown tool" setup error for a tool that ships with the product.
+- **The usability predicate probes the configured tool.** It takes the tool as an argument and applies an explicit path only when the path names that same tool, so it no longer answers a question about a CLI the run would not drive.
 
 ## Shared Behavior
 
 - Which provider (this backend vs. the direct hosted API vs. the proxy) is selected, and the credential-source priority, are owned by the LLM-credential-priority spec (10).
-- The interactive surfaces that consume the liveness predicate are owned elsewhere: the first-time provider setup wizard and its fresh-configuration auto-detect by spec 57, and the shared can-generate predicate plus the repair ladder's one-shot re-probe by spec 291.
+- The interactive surfaces that consume the presence sweep and the usability predicate are owned elsewhere: the first-time provider setup wizard — its auto-detect, its tool picker, and the splice-out-on-failure behavior — by spec 57; the shared can-generate predicate plus the repair ladder's one-shot re-probe by spec 291; the desktop editor's onboarding card (which paints the presence sweep's result) and its settings-panel tool probe by their own specs.
+- The write-time invariant that stops a persisted explicit path from being attributed to a tool it was not chosen for is owned by spec 308; the read-side attribution and the tool-scoped pairing described here are its counterpart. The configuration keys themselves are owned by spec 62.
 - The prompt template library and the model-id resolution are shared with the direct backend.
 - The summary-error marker's downstream handling (retry policy, placeholder writes, regenerate affordance) is owned by the queue-worker / summary-error specs. The remediation copy shown for an auth marker is owned by spec 286 — including the fact that it is authored for one tool only.
 - The MCP server's own no-op-in-child behavior is described in the MCP tool-surface spec; the markers it keys off are defined here.

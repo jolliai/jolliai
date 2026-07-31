@@ -83,6 +83,24 @@ Attribution] and [16 — Claude Code Transcript Reading]). The review-panel mete
 and a commit's stored figure are therefore expected to differ and are not the
 same number.
 
+### A second, independent reason the two figures differ
+
+The reader counts a model response once per **read**, and the already-counted set
+is discarded when the read ends (see [243 — Token Usage Extraction and Cost
+Estimation] and [16 — Claude Code Transcript Reading]). Because this computation
+reads a whole conversation in **one** read, every response in it is counted
+exactly once. The commit pipeline reads the same conversation in one slice per
+commit, so any response whose records straddle a commit boundary is counted by
+both slices.
+
+The two figures therefore diverge for two unrelated reasons at once — the window
+(whole conversation vs. one commit's slice) and the de-duplication scope (one read
+vs. one read per commit). Neither is a defect, and a stored figure being *larger*
+than the arithmetic of the panel's numbers suggests is an expected outcome, not
+evidence of a miscount. A stored figure written before per-response
+de-duplication existed is inflated for a third reason, which nothing here or in
+the pipeline retroactively corrects.
+
 ### Exclusion is the caller's job
 
 This computation has no exclusion logic. It sums exactly the conversations it is
@@ -102,6 +120,12 @@ files but mutates nothing, advances no cursor, and persists nothing.
 - **Full re-read, no cursor.** The panel figure is a whole-conversation total,
   not a since-last-commit delta, so it deliberately differs from the commit
   pipeline's stored figure. (Surprising; intentional.)
+- **One read means one de-duplication scope, which is a second reason the panel
+  and a stored figure disagree.** Reading the whole conversation in a single read
+  counts every model response exactly once; the pipeline's per-commit slices each
+  start with an empty already-counted set, so a response straddling a commit
+  boundary lands in two commits' totals. (Surprising; intentional. See [243 —
+  Token Usage Extraction and Cost Estimation].)
 - **Reporting count vs total count.** `totalCount` counts every supplied entry;
   `reportingCount` counts only entries that read as strictly-positive Claude
   usage. A selection of non-Claude or empty conversations yields a positive

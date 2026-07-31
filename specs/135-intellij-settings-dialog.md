@@ -14,7 +14,7 @@ Two surfaces that together let an IntelliJ user edit their Jolli Memory configur
 - The Sync tab's own provider-independent card switching (signed-out / signed-in-no-key / signed-in) and its auto-sync / transcript / poll-interval fields.
 - The shared save target: a single global config directory; both surfaces read from and write to the same file.
 - The validation rules surfaced via the dialog's continuous validation (provider-specific requirements; max-tokens must be a positive integer when set; at least one of the six platform checkboxes must stay enabled).
-- The apply-vs-OK semantics: the IDE-native page exposes Apply (no dialog dismissal) plus OK (apply + close); the gear-icon dialog only has OK (relabeled `Apply Changes`) and Cancel, and defers its heaviest work (hook install/uninstall, Memory Bank init + migration) to a background task that runs **after** the dialog has already closed.
+- The apply-vs-OK semantics: the IDE-native page exposes Apply (no dialog dismissal) plus OK (apply + close); the gear-icon dialog only has OK (relabeled `Apply Changes`) and Cancel, and defers its heaviest work (hook install/uninstall, Memory Bank init + migration, and re-pointing the session's memory-mirror read source) to a background task that runs **after** the dialog has already closed.
 - The privacy notice on the IDE-native page (an HTML label with a link to the privacy policy, marked copyable).
 
 **Out of scope:**
@@ -143,6 +143,8 @@ A folder-path field (with a browse button scoped to folder selection), a sort-or
 
 The button **runs on a background task with progress text**, not on the UI thread — it is still immediate (not deferred to the dialog's background apply task) and still independent of OK/Cancel, but it no longer blocks the IDE for the duration of the migration. Success or failure is reported via a message dialog when it finishes.
 
+This flow — and **only** this flow — probes first: before archiving anything it asks whether storage already exists for this repo (through the shared storage-backend selection for the configured storage mode, rather than by asking the orphan-branch backend specifically), and on "no storage" it reports "nothing to migrate" in a message dialog and stops without archiving, resolving, or invoking the migration command. The dialog's deferred apply has no such probe.
+
 ### Memory Bank tab: Historical memory
 
 Below the folder controls, a **Historical memory** section with a `Generate Missing Summaries` button. This is a **re-entry point into the same shared back-fill runner** used by the tool window's cold-start card (spec 260): clicking it runs a **full-scope** back-fill (every own commit lacking a summary — an empty hash selection, which the underlying CLI bridge treats as "all") regardless of whether the cold-start card has been dismissed for this repo. The button disables itself for the duration of the run and re-enables on completion. It does not live inside the dialog's Apply/OK flow — it fires its background task immediately on click, independent of whether the dialog is later confirmed or cancelled.
@@ -257,7 +259,8 @@ Clicking the OK button (`Apply Changes`):
 8. Closes the dialog **immediately** — the remaining work runs in a background task, not before dismissal, so the IDE is never blocked on it:
    - If credentials are now absent, or the user just checked Pause: uninstalls hooks.
    - Else if the user just unchecked Pause (was paused, now isn't): initializes the service if needed and installs hooks.
-   - If a project path is available: initializes the Memory Bank folder for the resolved path, and — if storage already exists for this repo (probed through the shared storage factory for the configured storage mode, rather than by asking the orphan-branch backend specifically) — migrates its entries into the folder.
+   - If a project path is available: initializes the Memory Bank folder for the resolved path and then migrates into it **unconditionally** — this flow performs no existence probe of its own. Whether there is anything to migrate is decided inside the one-shot migration command (which no-ops when there is no orphan-branch data and runs its idempotent reconcile once migration has already completed), so this branch has no "nothing to migrate" outcome to report. (The existence probe, and the message dialog that goes with it, belong to the Memory Bank tab's Migrate button instead.)
+   - **Then, in the same branch and immediately after that migration, asks the JolliMemory service to re-point its direct memory-mirror read source at the newly configured folder and storage mode.** This step is what makes the two Memory Bank settings this dialog owns — the folder path, and (via the storage mode) whether a mirror is read at all — actually take effect in the running session. Without it, both changes appear to apply and do not: the service's initialization is single-shot, so the read source stays attached to the folder resolved at project open, and every memory, plan, and note read keeps coming from that previous folder (or keeps coming from the mirror after the mode stopped writing one) for the rest of the session. The re-attach itself is fail-soft — a failure leaves the previous attachment in place — and resolving to *no* read source is a normal outcome that simply sends reads back to the orphan branch. Owned by specs 124 (the hook) and 307 (the read source).
    - Synchronizes the global agent instructions, by running the command-line surface's integrations-only enable rather than an in-process installer.
    - Refreshes status once, after all of the above has settled.
 
@@ -337,6 +340,7 @@ The IDE-native page **does** own a live authentication-listener subscription: it
   re-sync AI Summary card; re-sync Sync tab card
 
 [user clicks Migrate to Memory Bank]
+  probe whether storage exists for this repo → if not: "nothing to migrate" dialog, stop
   archive existing repo folders → resolve/init the (now-free) canonical folder
   run migration from the orphan branch → success/failure message dialog
   (independent of OK/Cancel)
@@ -358,7 +362,9 @@ The IDE-native page **does** own a live authentication-listener subscription: it
   close dialog
   → background task (non-cancellable):
       enable/disable hooks per credential + pause-transition state
-      init Memory Bank folder; migrate from orphan branch if present
+      init Memory Bank folder; migrate unconditionally (no probe — the migration
+        command itself decides whether there is anything to do)
+      re-point the session's memory-mirror read source at the new folder + mode
       refresh status
 
 [user clicks Cancel]
@@ -375,6 +381,7 @@ The IDE-native page **does** own a live authentication-listener subscription: it
 - **The IDE-native page does not edit provider, max-tokens, excluded patterns, platform toggles, Memory Bank fields, pause, or sync fields.** Those exist only in the gear-icon dialog. The IDE-native page is the slim surface (Anthropic key, model, Jolli API key) anchored at the standard IDE settings location.
 - **The gear-icon dialog builds its own sign-in and provider-selection UI inline, on each of two tabs, rather than reusing a single shared component.** A reusable sign-in-banner component and a reusable provider-picker component both exist elsewhere in the plugin's source, but neither is instantiated by the dialog (or by anything else in the live UI) — the dialog's AI Summary and Sync tabs each implement their own bespoke card-switching instead. (Notable / partially dead code — see Unreachable below.)
 - **Migrate to Memory Bank no longer blocks the UI thread.** It runs on a background task with progress text and delegates the migration itself to the command-line surface's one-shot migration command. It is still immediate and still not undone by Cancel; what changed is that the IDE stays responsive while it runs.
+- **This dialog's save is the only in-session trigger that re-points where memories are read from.** After the deferred background apply runs the migration, it re-points the session's direct memory-mirror read source at the newly configured folder and storage mode. That step is load-bearing rather than tidy-up: the service's initialization is single-shot, so without it a changed Memory Bank path or a storage mode switched to ref-only would appear to take effect while reads carried on being served from the previously attached folder for the rest of the session. A storage-mode or folder change made from the command line or the desktop editor instead is *not* observed by this IDE until the next project open. (Notable; specs 124, 307.)
 - **The dialog closes before its heaviest work runs.** Applying settings snapshots everything it needs off the UI thread, dismisses the dialog immediately, and only then runs hook install/uninstall and Memory Bank init/migration in one ordered background task — so the IDE is never blocked, and the enable/disable step is guaranteed to run before the migration step within that task.
 - **The Jolli API key's save value depends on dialog interaction, not just field contents.** If the user never opens either tab's Advanced disclosure, the field's displayed (pre-populated) value is ignored entirely and the existing saved key is kept — only opening the disclosure marks that tab's field as authoritative for save purposes.
 - **Generate Missing Summaries ignores the cold-start dismiss marker on the way in and does NOT clear it on the way out.** It always runs full scope regardless of whether the tool-window card was dismissed for this repo — but a successful run, even one that generates many summaries, leaves the dismiss marker in place. There is now **no** path that clears a dismissed cold-start card: once dismissed, it stays dismissed for the life of the marker (spec 260). (Corrected: the shared runner used to clear the marker on a successful run; it no longer does.)
@@ -407,6 +414,7 @@ The IDE-native page **does** own a live authentication-listener subscription: it
 
 - **Global config directory** — the canonical save target for both surfaces, shared with the command-line surface and the VS Code extension; load-merge-save preserves untouched fields. The file identity, the delegated load/save, and the four-write Apply sequence are owned by the configuration-file spec (129).
 - **One-shot migration command** — what the Memory Bank tab's Migrate button actually invokes; this surface only launches it on a background task and reports its outcome.
+- **Memory-mirror read source** — the read source the background apply re-points after migrating. Its attach hook and threading contract are owned by **IntelliJ Project Service Lifecycle** (124); its read shapes, eligibility rules, and decline conditions by **IntelliJ Direct Memory-Mirror Read Path** (307). This surface only calls the hook, at one point in one ordered task.
 - **Auth service** — the OAuth flow's entry point and the source of sign-in state. Every sign-in affordance across both surfaces subscribes to its listener or calls it directly.
 - **Pending-push drain** — the off-EDT pending-push retry the IDE-native page fires on successful sign-in is owned by **IntelliJ Pre-Push Sync Catch-Up** (271); this surface only dispatches it and never waits on it.
 - **OAuth flow** — runs the browser launch, callback server, and token exchange (separate spec); writes the Jolli API key into the global config.

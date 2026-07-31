@@ -84,6 +84,16 @@ Each probe produces exactly one line, with three exceptions: the dist-paths prob
      - OpenCode → ``Run `opencode auth login` to connect a provider.``
      - a tool identifier this build does not recognize → `Sign in to your local agent CLI.`
 
+   - **The `fail` message gains one further clause, and only when an explicit executable path is configured**, appended after the sign-in hint:
+
+     ```
+     Discovery was skipped because localAgentPath is set — clear it with `jolli configure --remove localAgentPath` to auto-discover instead.
+     ```
+
+     It is present only in that case, and the remedy it names is real: the explicit-path key is a settable/removable configuration key, and removing it restores automatic discovery (spec 62). The clause exists because an explicit path **short-circuits enumeration entirely** (spec 280) — so when the probe fails with one set, that path is the single likeliest cause, and nothing else in the report tells the user that discovery never ran. The `ok` line carries no such clause.
+
+     The clause is worded around a specific drift this probe cannot detect. It hands the stored path to the configured tool's resolver **as a bare value, without checking which tool the path was recorded for** — the persisted configuration records no owner for it. A path left behind by a previous tool is therefore indistinguishable here from one deliberately chosen for the current tool, and the probe dutifully resolves the current tool at the old tool's binary. A write-time invariant now prevents that state from being created (spec 308), but a configuration that drifted before it existed only heals on the next tool switch, never on its own — hence a message that names the escape hatch rather than a diagnosis.
+
    **The probe checks discovery and capability only — it never probes login state.** It resolves candidates, runs a capability probe, and reports the newest capable one; nothing asks the tool whether it is authenticated. An installed-but-signed-out agent CLI therefore reports `ok` here and fails at commit time instead. The sign-in hint is attached to the *failure* message unconditionally, so it is offered for a purely-missing binary as readily as for an auth problem — it is guidance, not a diagnosis.
 
    This probe has **no fixer** (spec 60). Installing, upgrading, or signing in to the agent CLI is user action; the interactive repair ladder (spec 291) is the surface that offers it, and it is never reached from `doctor`.
@@ -123,6 +133,7 @@ Exit code `0` therefore means "Jolli Memory is functional", but does not promise
 - **The Config probe alone is not sufficient for the local-agent provider.** Because that provider is selected unconditionally with no presence check (spec 10), Config reports `ok` for a machine with no agent CLI at all. The dedicated Local-agent-CLI probe is what makes that state visible, and it is the only probe here that actually spawns a subprocess.
 - **A green Local-agent-CLI line does not mean "signed in".** The probe verifies that an executable exists and answers a capability probe; it never asks the tool about its authentication state. An installed but logged-out agent CLI passes this probe and fails at the next commit — which is also why the *failure* message carries a sign-in hint even when the actual fault was a missing binary. (Surprising.)
 - **The Config probe's local-agent label names the configured tool.** With four selectable tools, a fixed label would misattribute generation to the default one; the label follows the setting and degrades to a generic string for an identifier this build does not know (which is reachable, because the setting is shared across surfaces and versions). (Notable.)
+- **An explicitly configured executable path changes the failure message but not the verdict.** The extra clause naming that key and how to remove it is appended only when the path is set, and only to the `fail` line. The probe still reports `fail`, still has no fixer, and still cannot tell whether the path was recorded for the tool it is now being applied to. (Surprising: the most actionable remedy this probe ever prints is "delete the setting you added".)
 - **A plugin line's `ok` verdict says "compatible", not "working".** Version compatibility is all this probe checks; load failures surface separately at load time, so a green plugin line does not promise the plugin's commands will run.
 
 ## Shared Behavior
@@ -130,4 +141,5 @@ Exit code `0` therefore means "Jolli Memory is functional", but does not promise
 - The `--cwd <dir>` flag is shared with most other `jolli` sub-commands. When omitted, the project directory is auto-resolved to the enclosing git repository root.
 - The credential-precedence order used by the Config probe is the same one used by every other place in the CLI that decides which LLM endpoint to call.
 - The dist-paths registry probed here is the same one written by `jolli enable`'s installer.
-- The executable resolution behind the Local-agent-CLI probe (candidate enumeration, capability probe, newest-capable selection, success-only caching) is owned by spec 280. The interactive counterpart that *repairs* an unusable agent CLI or a provider/key mismatch is spec 291; `doctor` only reports these faults and never prompts.
+- The executable resolution behind the Local-agent-CLI probe (candidate enumeration, capability probe, newest-capable selection, success-only caching, and the short-circuit an explicit path performs) is owned by spec 280. The interactive counterpart that *repairs* an unusable agent CLI or a provider/key mismatch is spec 291; `doctor` only reports these faults and never prompts. The five sign-in instructions are the same strings that ladder renders and that the setup picker prints on a successful pick (specs 291, 57).
+- The configuration keys this probe reads and the one its failure message tells the user to remove are owned by spec 62; the write-time rule that keeps the explicit path from outliving its tool is spec 308.

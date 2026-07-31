@@ -2,8 +2,9 @@
 
 ## Topic Statement
 
-Extract a per-turn input / output / cached token breakdown from a Claude Code
-transcript and estimate a dollar cost from it at a single hardcoded Sonnet-class
+Extract a per-response input / output / cached token breakdown from a Claude Code
+transcript — de-duplicating the several records one model response is written
+across — and estimate a dollar cost from it at a single hardcoded Sonnet-class
 rate, plus the family of formatters that render token counts and costs on the
 pushed-memory article and the token-usage meters. This spec now describes one
 specific estimator among two that coexist in the product — see the Out-of-Scope
@@ -11,40 +12,58 @@ note on [257 — Multi-Provider Pricing and Cost Estimation] for the other.
 
 **Product-wide scope correction:** every claim below about "no per-model
 table" and "the model is never consulted for pricing" is still exactly true of
-*this* estimator (the Sonnet-only one) and of the surfaces that call it — the
-per-commit token meter, the pushed-memory article's "Task usage" line, and the
-PR-body markdown. It is **no longer true product-wide**: a second, model-aware
-pricing path now exists and is the primary source for the VS Code sidebar's
-branch-level token bar (see [257]). Read every "no per-model table" statement
-in this spec as scoped to the Sonnet-only estimator, not as a product-wide
-guarantee.
+*this* estimator (the Sonnet-only one), but the set of surfaces *wholly* served by
+it is now the article "Task usage" line — rendered on **three** surfaces, from
+three separate copies of the same block: the shared core's article builder (which
+feeds the pushed memory), the editor extension's own article builder (clipboard and
+local-folder export), and the JVM/IDE surface's article builder. The PR-body
+markdown renders no token or cost figure at all. Every token meter in the product —
+the editor extension's branch-level bar and per-memory detail meter, and the
+JVM/IDE surface's detail meter and memories-list figure — now **prefers** a
+model-aware, write-time cost and falls back to Sonnet-rate constants only for what
+that figure does not cover (see [257 — Multi-Provider Pricing and Cost
+Estimation]). Read every "no per-model table" statement in this spec as scoped to
+the Sonnet-only estimator itself, not as a product-wide guarantee, and not as a
+claim about the meters.
+
+**And one of those three articles does not share this spec's code.** The two
+in-process builders reach the same estimator and the same formatters, so their
+figures cannot drift; the JVM/IDE builder prices its line with an independent
+re-implementation of the flat-rate estimator and its own re-implemented formatters.
+So the constants below are a single source of truth for the surfaces that *call*
+them, not for the product — see "Not a single source of truth off-process" under
+Shared Behavior.
 
 ## Scope
 
 **In scope**
 
-- The per-turn token-usage breakdown shape (input, output, cached) extracted from a raw transcript line.
+- The per-response token-usage breakdown shape (input, output, cached) extracted from a raw transcript line.
 - The rule that the "cached" segment carries cache-creation tokens only, and why the cache-read counter is deliberately excluded.
+- The per-response de-duplication rule: one model response is written across several records that each repeat the whole usage object, so a response is counted exactly once per read; the optional response-identity key that drives it, and the first-seen-wins and no-identity-always-counts consequences.
+- The scope of the already-counted set (one read, never persisted) and the bounded cross-read double-count it accepts.
 - The gating of usage accumulation by the line-level time cutoff, independent of whether a line produced a displayable conversation turn.
 - The Claude-only nature of real token usage: no other producer's transcript carries a usage figure anywhere in the product.
 - The single hardcoded per-token pricing table (Sonnet-class) and the deliberate absence of any per-model lookup or unknown-model fallback **in this estimator**.
 - The cost-estimation function: segment-priced when a breakdown is available, floored to the input rate when it is not.
 - The compact and exact token formatters and the compact and exact cost formatters, including their rounding boundaries.
 - The pushed-memory-article "Task usage" line: tree-aggregated total + cost, the omit-when-zero rule, the optional per-segment split, and the NaN-avoidance in the aggregation.
-- The fact that the sidebar's client-side cost fallback (used only when the branch's write-time, model-aware cost is absent or zero) reads these same Sonnet-rate constants directly — the one place the model-aware surface still touches this spec's numbers.
+- The fact that every token meter reaches for these same Sonnet rates as a *fallback* only: the branch bar's client-side estimate when the branch's write-time, model-aware cost is absent or zero, the editor extension's per-memory detail meter's per-node / per-model-bucket remainder, and the JVM/IDE meters' tree-wide all-or-nothing fallback (see [257 — Multi-Provider Pricing and Cost Estimation] for the preference rules; this spec owns only the constants and the formula they feed).
+- The two structural caveats on that fallback: the branch bar can suppress its cost figure entirely rather than falling back, and the JVM/IDE surface reaches a re-implementation of these constants rather than these constants.
 
 **Out of scope (boundaries)**
 
 - **The model-aware, per-model-table pricing path** — a second, independent cost estimator that prices a commit's actual conversation model(s) at their own rates, feeds the VS Code sidebar's branch token bar as its primary source, and is stamped on the commit summary at write time (see [257 — Multi-Provider Pricing and Cost Estimation]). This spec's estimator and that one are not the same code and must not be conflated.
 - Summing real usage across a caller-supplied set of transcripts for the live review-panel meter (see [244 — Conversation Token Totals for the Review Panel]).
 - Attributing and storing per-conversation usage during commit-summary generation, including exclusion and overlay-delete zeroing (see [245 — Commit-Pipeline Conversation Token Attribution]).
+- Correcting an already-written memory's figures when a conversation is detached from it (see [306 — Conversation Detach Usage Correction]).
 - The tree-aggregation helpers themselves and the token fields on the summary record (see [04 — Summary Tree Structure]).
 - How a Claude transcript is read, cleaned, cursored, and time-cut (see [16 — Claude Code Transcript Reading]).
 - The product's own summarization LLM-call cache accounting, which is a different figure (see [08 — Anthropic Message API Call]).
 
 ## Data Contracts
 
-### Per-turn token breakdown
+### Per-response token breakdown
 
 A record of three non-negative integers:
 
@@ -56,6 +75,12 @@ The scalar total of a breakdown is `input + output + cached`. This is the same
 scalar historically stored as a single "conversation tokens" number, so a
 breakdown and its scalar total are always mutually consistent.
 
+A breakdown produced from one transcript record additionally carries an
+**optional de-duplication key** — the identity of the model response the record
+belongs to. It is present only when the record names that response; a breakdown
+with no key is unconditionally counted by the consumer (see "Per-response
+de-duplication"). The key is never stored anywhere and never leaves the read.
+
 ### Source usage counters (external Claude transcript format)
 
 Each Claude transcript line may carry a usage object whose counters this layer
@@ -65,6 +90,16 @@ maps as follows:
 - output count → `output`.
 - cache-creation count → `cached`.
 - **cache-read count → deliberately dropped (never mapped, never summed).**
+
+Alongside the counters, the record's message envelope may carry the identifying
+string of the API response the counters describe. That string becomes the
+de-duplication key. Two placement rules matter and are load-bearing:
+
+- The usage object itself is read from the message envelope, falling back to a
+  top-level usage object on the record when the envelope carries none.
+- The response identity is read from the message envelope **only** — there is no
+  top-level fallback. A record whose usage came from the top-level fallback
+  location therefore has no identity and is always counted.
 
 ### Pricing table (the data contract; exact constants are load-bearing)
 
@@ -92,18 +127,59 @@ Cost Estimation] — but nothing in this estimator reads it.)
 
 For each raw transcript line, the usage object (if any) is parsed and its
 counters mapped to the breakdown as described in the source-counter contract. A
-line that fails to parse, or that has no usage object, yields a zeroed breakdown
-(`{input: 0, output: 0, cached: 0}`) rather than an error.
+line that fails to parse, or that has no usage object, yields a breakdown whose
+three segments are all zero and which carries **no** de-duplication key, rather
+than an error.
 
-Usage is accumulated **per raw line**, not per displayable turn. A line that
+Usage is extracted **per raw line**, not per displayable turn. A line that
 carries a real usage object but produces no conversation turn (for example an
 assistant turn whose only content was a tool call, so it has no display text)
 still contributes its tokens. Accumulation is gated only by the read's
 line-level time cutoff (see [16 — Claude Code Transcript Reading]): a line past
 the cutoff halts the read and contributes nothing; every line at or before the
-cutoff contributes its usage, turn-bearing or not. The running per-segment sums
-over the consumed slice become that read's breakdown, and their scalar sum
+cutoff is offered for accumulation, turn-bearing or not. The running per-segment
+sums over the consumed slice become that read's breakdown, and their scalar sum
 becomes that read's total.
+
+### Per-response de-duplication (load-bearing reality — document verbatim)
+
+The producer writes **one record per content block** of a single model response —
+one for a reasoning block, one for a text block, and one per parallel tool call —
+and every one of those records repeats that response's **whole** usage object
+verbatim, not a per-block share of it. Accumulating per record therefore billed
+one API call once per block; measured against real transcripts the inflation runs
+roughly 2×–10×, the high end being agentic turns that fire six or seven tool calls
+out of one response.
+
+The consumer therefore keeps a set of response identities it has already counted:
+
+- A record whose breakdown carries a de-duplication key already in the set
+  contributes **nothing** — no segment, no scalar.
+- A record whose key is new is counted in full and its key is added to the set.
+- A record with **no** key is always counted (the pre-existing behavior, correct
+  for a producer that reports usage once per line).
+
+Two consequences follow directly from that shape and are real:
+
+- **First-seen wins, unconditionally.** The first record bearing a given identity
+  fixes what the whole response contributes. If that first record's counters are
+  missing or non-numeric they map to zero, the identity is still registered, and
+  every later record of the same response — including ones carrying real
+  figures — is skipped. The response scores zero.
+- **The set lives for exactly one read and is never persisted.** Nothing in the
+  resumption bookmark records a response identity (see [24 — Transcript Cursor
+  Resumption]). So when a read's time cutoff falls between two records of one
+  response, that response is counted by the read that owns the earlier records
+  *and again* by the read that picks up the rest. The over-count is bounded at
+  one response per read boundary, which is accepted rather than closed: closing
+  it would mean persisting the last-counted identity in the bookmark, and that
+  schema change is not worth the magnitude.
+
+The per-model split (see [257 — Multi-Provider Pricing and Cost Estimation]) is
+computed over the same consumed slice and de-duplicates on the **same** identity.
+That is deliberate: were the two to dedupe differently, the per-model buckets
+would drift from the segment breakdown and the cost would be priced off a larger
+token count than the meter displays.
 
 ### The cache-read exclusion (load-bearing reality — document verbatim)
 
@@ -142,6 +218,16 @@ are present, because output is priced five times higher than input but the floor
 prices everything at the input rate. This is accepted: the product never
 fabricates a segment split it does not have.
 
+**The branch-level token bar does not reach the no-breakdown path at all.** It
+consumes these same per-token rates but applies them inline to the three segments
+only, never to the scalar total, so it has no input-rate floor. Two consequences
+follow: a branch whose memories carry only a scalar total has nothing the bar can
+price, and rather than showing a contradictory $0 beside a real token total the bar
+**suppresses the cost figure entirely** whenever no memory on the branch reported a
+per-segment breakdown. So "falls back to this estimator" is true of the bar only
+when segment data exists somewhere on the branch; otherwise there is no fallback,
+there is no figure. (The preference rules themselves are [257]'s.)
+
 Every produced cost is documented as a **ballpark estimate, not a billing-accurate
 figure** — actual cost varies by the true model and by cache-read savings that
 this estimate does not represent.
@@ -172,12 +258,15 @@ this estimate does not represent.
   precise computed figure (precision here is about not rounding the number away,
   not about billing accuracy).
 
-### Pushed-article "Task usage" line
+### Article "Task usage" line
 
 On the pushed-memory / clipboard / folder-export article, a "Task usage"
 property line is rendered from the whole consolidation tree (a squash or amend
 memory carries its tokens on its folded children, so the figure is the
-tree-aggregated total, not the root's own):
+tree-aggregated total, not the root's own). The steps below are implemented
+**three times over** — once per article builder (shared core, editor extension,
+JVM/IDE surface) — rather than once in a shared helper, so the sequence is a
+duplicated contract rather than a single code path:
 
 1. Compute the tree-aggregated scalar total. If it is not greater than zero,
    omit the line entirely (there is no "not reported" state in the article's
@@ -210,21 +299,44 @@ zero-fallback keeps a partial breakdown contributing its present segments.
   order of magnitude. (Surprising; intentional. Bug-as-feature: the "cached"
   figure is cache-creation only by design.)
 - **The model is never consulted for pricing, within this estimator.** Every
-  transcript passing through this path is priced at the one hardcoded
+  breakdown passing through this path is priced at the one hardcoded
   Sonnet-class table regardless of the model that produced it; there is no
   per-model table and no unknown-model fallback here. The resulting cost is
-  explicitly a ballpark. This is still true of the per-commit meter, the
-  pushed-article line, and the PR-body markdown — but it is no longer true of
-  the whole product: the VS Code sidebar's branch token bar now prefers a
-  model-aware, per-model-priced figure computed at write time, falling back to
-  this spec's Sonnet-rate constants only when that figure is absent or zero
-  (see [257 — Multi-Provider Pricing and Cost Estimation]). (Bug-as-feature,
-  now scoped rather than product-wide.)
+  explicitly a ballpark. This remains true of every article's "Task usage" line,
+  which consults nothing else — but it is **not** true of any token meter any more:
+  all four prefer a model-aware, per-model-priced figure computed at write time and
+  reach for a flat rate only for the remainder that figure does not cover (see
+  [257 — Multi-Provider Pricing and Cost Estimation]). (Bug-as-feature, now scoped
+  to the article line rather than product-wide.)
+- **"Single source of truth" holds within one process, not across the product.** The
+  JVM/IDE surface re-implements this estimator and these formatters rather than
+  calling them, so its article line and its meters' fallback figures can drift from
+  every other surface's after a rate or rounding change here. Nothing in this
+  estimator's code flags that pairing — unlike the model-aware price table, whose
+  duplication is documented as a lockstep contract. (Surprising; the drift risk is
+  real and unguarded.)
+- **One response, several records, one whole usage object on each.** Summing per
+  record multiplied real usage by the response's content-block count (measured
+  2×–10×). De-duplicating on the response identity is what makes the figure
+  mean what it says. (Surprising; the inflation shipped before it was fixed.)
+- **First-seen wins even when the first record is the useless one.** A first
+  record with missing or non-numeric counters registers the identity at zero and
+  suppresses every later record of the same response, scoring the whole response
+  zero. (Surprising; intentional — no re-scoring pass exists.)
+- **A record with no response identity always counts.** Absence of an identity is
+  treated as "this producer reports usage once", not as "unknown, skip" — so a
+  usage object found only at the record's top level (where no identity is ever
+  read) is never de-duplicated. (Notable.)
+- **The already-counted set is per read, so a response straddling a read boundary
+  is counted twice.** Bounded at one response per boundary and knowingly
+  accepted, because closing it would require the resumption bookmark to carry a
+  response identity. (Surprising; intentional.)
 - **The no-breakdown cost is a deliberate underestimate** when output is
   present, because the floor prices everything at the input rate. (Intentional.)
-- **Usage accumulates per raw line, not per turn.** A tool-only assistant turn
-  contributes tokens even though it produces no displayable conversation turn.
-  (Notable.)
+- **Usage is extracted per raw line, not per turn — but counted per response.** A
+  tool-only assistant turn contributes tokens even though it produces no
+  displayable conversation turn; several such records belonging to one response
+  contribute once between them. (Notable.)
 - **The 999,500 compact boundary** is chosen so rounding never emits `1000k`.
   (Notable.)
 - **Exact cost never renders all-zeros for a real amount**: a positive value too
@@ -237,16 +349,24 @@ zero-fallback keeps a partial breakdown contributing its present segments.
 
 ## Shared Behavior
 
-- The pricing constants and the formatters are the single source of truth shared
-  by the article builders and the token meters, so those surfaces can never
-  disagree on the same underlying counts. This is now also true of the sidebar's
-  client-side cost fallback: it imports these same Sonnet-rate constants
-  directly rather than duplicating them, so its fallback figure never drifts
-  from this spec's numbers even though it is otherwise a [257]-driven surface.
-- The per-turn breakdown shape is the same shape summed by the review-panel
-  meter (see [244 — Conversation Token Totals for the Review Panel]) and
-  attributed per conversation during commit-summary generation (see
-  [245 — Commit-Pipeline Conversation Token Attribution]).
+- **Not a single source of truth off-process.** The pricing constants and the
+  formatters *are* shared by every in-process consumer — the two in-process article
+  builders and the editor extension's two meters all call them directly rather than
+  duplicating them, including on the meters' fallback paths, so none of those
+  surfaces can disagree on the same underlying counts even though the meters are
+  otherwise [257]-driven. The JVM/IDE surface is outside that guarantee: it
+  re-implements the estimator and the formatters in its own language for its article
+  line and both its meters, so a change to the numbers or the rounding here silently
+  leaves that surface behind until it is ported too.
+- The per-response breakdown shape is the same shape summed by the review-panel
+  meter (see [244 — Conversation Token Totals for the Review Panel]), attributed
+  per conversation during commit-summary generation (see
+  [245 — Commit-Pipeline Conversation Token Attribution]), and persisted per
+  conversation so a later detach can subtract it (see [306 — Conversation Detach
+  Usage Correction]).
+- The de-duplication described here happens inside a single transcript read, so
+  its scope, and the bookmark that cannot carry it across reads, belong to
+  [16 — Claude Code Transcript Reading] and [24 — Transcript Cursor Resumption].
 - The token fields persisted on a summary and the tree-aggregation helpers are
   defined in [04 — Summary Tree Structure].
 - The model-aware pricing path that now coexists with this estimator is defined

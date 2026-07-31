@@ -1,9 +1,9 @@
 {
   "branches": {
     "main": {
-      "revision": "18e8c624493ae9f1f18ea84a58ae9183cb5deb93",
-      "subject": "Set up jteam plugin configuration",
-      "reviewedAt": "2026-07-29T22:37:36Z",
+      "revision": "64f8bc6b8530f81b242acbf1e788622b1820cee0",
+      "subject": "Add IntelliJ FolderStorageReader for direct JSON reads",
+      "reviewedAt": "2026-07-31T01:04:12Z",
       "actor": "doug.schroeder",
       "skill": "specs-update"
     }

@@ -76,7 +76,7 @@ When the range yields **zero** commits with recorded memory, the engine throws a
 1. Enumerate the commit hashes in the range `base..currentHead`. (The enumeration is newest-first; see boundary note — base resolution and merged-branch fallbacks belong to the enumerator.)
 2. If the range is empty, treat it as zero summaries and zero missing.
 3. Reverse the hashes to **chronological** order (oldest first).
-4. Load the recorded memory for every hash concurrently, tolerating per-commit failures: settle all loads, and for each one —
+4. Load the recorded memory for every hash concurrently, tolerating per-commit failures. The loads resolve their store from the **process-wide active storage backend** rather than from an argument threaded in by the caller, so every surface that drives this engine must bind that backend before invoking it (an unbound process falls back to a default backend and warns per read). Settle all loads, and for each one —
    - if it resolved to a memory, append it to the summaries list (preserving chronological order);
    - if it failed **or** resolved to nothing, increment the missing count.
 5. Return the chronological summaries list and the missing count.

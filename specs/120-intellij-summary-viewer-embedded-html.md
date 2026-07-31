@@ -19,8 +19,12 @@ A self-contained interactive HTML view that renders a single commit memory (or a
 - The read-only save-as-markdown-file export command.
 - The end-to-end test guide section's three modes: not-yet-generated, generating, populated.
 - The light/dark theming contract: both the page background and the light/dark palette are derived from one sample of the IDE's live editor background colour and baked into the rendered page, and that colour is applied to the host surface and the pre-content blank page before the first content load.
-- When the page's content is first loaded — the readiness conditions the load waits for, the last-resort timeout, and the one-shot repaint nudge afterwards.
-- Deferred hydration: which data sets are gathered after the page opens and applied by message rather than by a second load.
+- Where the page's HTML is assembled: inputs snapshotted on the interface thread, the document built on a background thread, and the load issued back on the interface thread under a supersession guard.
+- When the page's content is first loaded — the readiness conditions the load waits for, the last-resort timeout that now always fires, the three armed recovery paths behind it, and the one-shot repaint nudge afterwards.
+- The first-painted-frame round trip: the host asking the page to report once the display engine has painted, and the brief detach-and-re-attach of the view in its tab that report triggers.
+- The in-place memory swap: what changes when the single memory tab is handed a different memory, and the identity guard that keeps the outgoing memory's asynchronous results off the incoming memory's page.
+- Deferred hydration: which data sets are gathered after the page opens and applied by message rather than by a second load, and how the translatable-plan scan is performed.
+- Cache invalidation on persisted edits, so other surfaces reopening the memory see the edit.
 - In-document hover hints, because the embedded browser surfaces no native tooltips.
 - The fallback rendering path when the embedded HTML view cannot be created in this environment.
 
@@ -30,7 +34,8 @@ A self-contained interactive HTML view that renders a single commit memory (or a
 - The pull-request creation network call — owned by the PR service spec.
 - The generation call that produces an end-to-end test guide, a recap, or a plan translated to English — this host cannot run generation in process and delegates each one over the one-shot generation bridge (spec 292), which owns the request/response contract, provider routing, and prompt assembly.
 - The memory reference identifier's format and the copy chip's own behaviour (clipboard payload, confirmation banner, keyboard activation, accessible name, read-only-mode exemption) — owned by spec 301.
-- The IDE-level virtual-file wrapper that lets this view open as an editor tab — owned by the virtual-file spec.
+- The IDE-level virtual-file wrapper that lets this view open as an editor tab, and the one-tab-per-project rule that makes a memory swap the normal case rather than a new tab — owned by spec 121. This spec owns only what the swap does *inside* the page.
+- The pull-request status cache that answers this page's PR-state question — its TTLs, its coalescing, and its invalidation API — owned by spec 309. This spec owns only the staleness the page can show as a result.
 - The git-status discovery that lists changed files for the host — owned by the changes-panel spec.
 
 ## Data Contracts
@@ -88,13 +93,15 @@ A new section, rendered between the header and the ship bar, showing the AI codi
 
 | State | Condition | Rendering |
 | ----- | --------- | --------- |
-| Breakdown | A per-segment token breakdown is available | The bold token total, an estimated-cost figure, a three-segment colored bar (input / output / cached — green / grey / blue respectively), and a legend labeling each segment's value. |
+| Breakdown | A per-segment token breakdown is available | The bold token total, an estimated-cost figure, a three-segment colored bar (input / output / cached — **green / grey / blue** respectively), and a legend labeling each segment's value. |
 | Tokens-only | A nonzero token total exists but no per-segment breakdown | The bold token total and cost figure, with a single full-width bar segment and no legend. |
 | Zero | No usage at all was recorded | The literal text "Task usage not reported" (no bar, no cost). |
 
 Cost follows the same rule used elsewhere: prefer the memory's stored per-model cost estimate (tree-aggregated, a pure sum); when absent, fall back to a rough estimate priced at fixed list rates from the aggregated breakdown. When the resulting figure is still zero, the banner shows the literal text "cost N/A" rather than a dollar amount. An info affordance next to the total explains the figure is a lower bound (unreporting sources and pre-capture memories are excluded).
 
-This banner and the branch-level Create-PR view's own token/cost banner (spec 251) follow the same coloring and cost-fallback convention, though each is rendered independently rather than through a shared component.
+This banner and the branch-level Create-PR view's own token/cost banner (spec 251) still agree on both the segment colouring (green input, grey output, blue cached) and the cost-fallback convention — prefer the stored per-model estimate, fall back to a fixed-rate estimate, and print the literal "cost N/A" when the result is still zero. Each is rendered independently rather than through a shared component, so the agreement is by convention only.
+
+**A third surface no longer agrees.** The branch commit list draws the same three-segment meter, and its second and third segments now carry the **opposite** pair: output is blue and cached is grey, the reverse of this page. The two used to match. This is a live inconsistency, not a deliberate distinction: a user reading a memory's banner and then the branch meter above the commit list sees the same three quantities coloured two different ways, with no signal that the legends mean different things. Nothing in either surface reads the other's assignment, so neither is authoritative. (Defect.)
 
 ### Inbound commands (page → host)
 
@@ -102,6 +109,7 @@ Sent as JSON, base64-encoded, over a single host-bridge channel:
 
 | Command                | Payload                                                          | Purpose                                      |
 | ---------------------- | ---------------------------------------------------------------- | -------------------------------------------- |
+| `firstFramePainted`    | (none)                                                           | **Not user-initiated.** Reports that the display engine has committed the page's first frame. Sent once per content load, by page script the host injects after load completion, on the second animation frame. The host responds by briefly detaching and re-attaching the view in its tab — see *First painted frame* below. |
 | `copyMarkdown`         | (none)                                                           | Build a markdown rendering of the memory and place on the system clipboard. |
 | `downloadMarkdown`     | (none)                                                           | Build the same markdown rendering and write it to a user-chosen path via a native save dialog. A read-only export — not gated behind the write-command permission check the mutating commands below share, so it works even on a stale or foreign (read-only) memory. |
 | `pushToJolli`          | (none)                                                           | Push (or update) the memory and its plans to the cloud. |
@@ -167,6 +175,20 @@ The page's send helper encodes its outbound message as UTF-8 bytes, then to a bi
 
 Page-to-host sends are **best-effort**: an encoding or channel failure inside the send helper is swallowed rather than thrown back into the handler that called it. Previously a send that failed took the surrounding interaction handler down with it, so one unencodable payload could abort the rest of a click's work.
 
+### How the document is assembled (off the interface thread)
+
+**The page's HTML is no longer built on the interface thread.** Every render — the first one and every later one — follows the same three steps:
+
+1. On the interface thread, snapshot every input the build needs: the memory, the two deferred sets (copied, not shared), the bridge script, the read-only flag, and the theme colour. The build is a pure function of those inputs.
+2. Build the document on a background thread. It is a few hundred kilobytes of string assembly.
+3. Hop back to the interface thread, and only then issue the load.
+
+Step 3 is guarded by a monotonic render counter: a build that finds a newer render has been requested since it started is **dropped**, and the newer one's own load is what the user sees. A build that throws is logged and dropped, leaving the page on its previous document.
+
+What this bought: the fraction-of-a-second interface freeze that used to accompany every memory open and every full refresh is gone. What it costs: the first painted frame now arrives one thread hand-off later than the moment the render was requested, and a render is no longer complete by the time the requesting call returns. Nothing about the page's appearance changed.
+
+The stylesheet and the interactive script are both memoized (the stylesheet keyed by theme, the script built once), so the background work is dominated by memory-specific rendering. Neither memoization has any observable effect on the page.
+
 ### First content load
 
 The page's content is not loaded as soon as the view is constructed. The constructor's caller only attaches the view to its parent *after* construction returns, and the IDE then takes several further turns to mount the editor into the tab hierarchy — so loading immediately meant the embedded browser began painting against a zero-sized surface, and the visible symptom was content scrunched into the top-left corner of an otherwise blank tab, slowly catching up over a second or two.
@@ -177,13 +199,48 @@ The load therefore waits until the hosting surface is **both attached to a shown
 2. A shown-state-change notification on the hosting surface. This is the one a *reused* surface hits — a surface handed back at the same size never reports a size change at all.
 3. An immediate check at construction time, for the fast path where a reused surface arrives already sized and already shown.
 
-A last-resort timer fires **1500 ms** later. It is deliberately not a "load anyway" fallback: if real bounds have arrived by then it loads cleanly, and if the surface is *still* zero-sized it **does not load** — it logs a warning and installs a post-load size watcher instead, leaving the readiness path armed so the first genuine size change loads normally. Loading into a zero-sized surface is worse than waiting, because the browser does not re-render on its own when the surface later becomes non-zero, which would strand the tab permanently blank.
+A last-resort timer fires **1500 ms** later, and it **now always renders — even at zero size**. This reverses the earlier policy. That policy was to refuse the load without real bounds and stay armed for the first genuine size change, on the reasoning that a browser painting into a zero-sized surface does not re-render on its own when the surface later grows. The reason it changed: on the first memory tab of a fresh session, the readiness signals sometimes never arrived at all — or arrived minutes later, when the user finally clicked the tab — leaving the tab blank indefinitely with nothing the user could do. A blank-until-recovered tab turned out to be strictly better than a blank-forever one.
+
+Three recovery paths therefore cover that forced load. The two that wait on an *event* are armed **before** the load is issued, and they have to be: an observer that does not exist yet cannot see an edge that fires while the render is going out.
+
+1. A real size change on the hosting surface.
+2. A shown-state change on the hosting surface (the case where a surface that already had bounds while hidden becomes visible without ever reporting a size change).
+
+The third is armed **after** the load instead, and that placement is harmless:
+
+3. A repeating visibility poll, started only when the timer fired against a hidden or zero-sized surface, that checks roughly every **500 ms** and **gives up after about 30 s**. A poll re-reads the surface's *current* state on every tick rather than waiting for a transition, so unlike the two observers it cannot miss anything that happened before it began — its ordering relative to the load carries no risk.
+
+Any one of them suffices, and only the first to observe a genuinely mounted, non-zero-sized, visible surface takes effect — a shared one-shot latch makes the other two no-ops. Each one pushes the true viewport size down to the browser and then forces a fresh render of the current memory, so the recovered page shows whatever memory the user most recently clicked rather than the one captured when the tab was built. The give-up point is reached when the tab is still hidden after 30 s, which in practice means the user's own layout keeps it hidden — there is nothing further to recover, and the poll stops rather than spinning for the session.
 
 Once the first load has gone through, a size watcher stays installed and forwards every later size change down to the embedded browser, so a background tab that is mounted long after construction, or a tool window the user resizes, still learns its true viewport.
 
 A **full re-render that is requested before the first load has completed is latched rather than issued**, and fired once on load-completion. Issuing it immediately meant a second navigation arriving while the browser was still parsing the first page: the first load was aborted and restarted, and the user saw the tab flash through blank → partial → blank → rendered.
 
 Immediately after the first load completes, the host fires a **one-shot viewport-changed notification** — the same signal a real resize sends — plus a layout revalidate and repaint. This exists because a freshly built embedded browser does not reliably fill its whole component area on its first paint: the native view's visible rect can lag the real component size, leaving the top strip of the tab showing the wrapper's background until some later layout event forces a repaint. The earlier workaround for this was to perform a **second full content load** once the deferred data arrived, which did force the repaint but cost a visible 300–400 ms flash. The notification replaces that load; the flash is gone.
+
+### First painted frame, and the detach / re-attach nudge
+
+The viewport notification above is not always enough. So after a content load completes, the host **injects a small script asking the page to report back once the display engine has actually committed a frame** (it waits two animation frames, then sends `firstFramePainted`). On receiving that report the host, after a short delay, **detaches the embedded view from its tab container and re-attaches it on the next turn**, then re-publishes the size.
+
+That detach/re-attach is the only signal found to reliably make the embedded view's frame agree with its container on macOS — softer nudges (a viewport notification alone, bounds tweaks) did not. Without it, the top of the tab can stay blank until something external, like the user dragging a window edge, wakes the platform. The cost is a roughly one-frame flash as the view momentarily leaves the layout.
+
+The round trip is armed only when the load that completed was a *not-yet-loaded* transition. That matters because **an in-place memory swap resets the loaded flag** (see below): the swap's own load-completion is therefore also a not-yet-loaded transition, so the nudge — and its one-frame flash — happens on **every memory swap, not only on first open**.
+
+### Swapping the memory in place
+
+Because there is at most one memory tab (spec 121), the normal way a different memory reaches this page is an in-place swap rather than a new tab. On a swap the host, on the interface thread:
+
+- bumps a **memory-identity generation** counter (below);
+- clears the two deferred sets, so the outgoing memory's transcript and translate affordances cannot leak into the incoming page;
+- installs the new memory and, if it changed, the new read-only flag — subscribing to or unsubscribing from memory-change notifications to match;
+- requests a full re-render, which replaces the document in the same browser instance (no native re-attach);
+- marks the page as not-loaded **synchronously**, so anything landing in the same turn — a share-overlay request from the action bar, or a deferred-hydration continuation — parks its intent instead of running script against the document that is about to be replaced. The parked intent is drained by the new page's load completion;
+- clears any pending share-overlay intent and share-modal state left over from the outgoing memory, so a share the user requested on the previous memory does not pop open on the next one;
+- restarts the deferred-set scan and re-asks for the pull-request state, both for the new memory.
+
+**The identity guard.** Roughly twenty memory-scoped asynchronous paths now snapshot that generation counter when they are dispatched and **no-op on mismatch** — the deferred-set scan and both of its halves, the pull-request status lookup, the push-to-cloud chain, topic edit and delete, test-guide generate / edit / delete, recap generate / edit, plan save / remove / translate / associate, the plan-title sync, reference removal, and the memory-state-changed refresh. Without it, single-tab reuse would have introduced a whole class of wrong-attribution errors: the outgoing memory's cold pull-request lookup (seconds) landing its badge on the incoming page, its transcript or translatable-plan chips appearing on the wrong memory, or its just-persisted edit overwriting the incoming memory's in-memory identity. The pull-request "ready" payload does not carry a branch, so the page itself cannot filter it after the fact — the guard has to be host-side.
+
+The guard protects the *in-memory* identity and the *messages sent to the page*. Persisted writes are deliberately not rolled back: they were writes against the memory the user was actually editing, and re-writing the same content is harmless.
 
 ### Deferred hydration
 
@@ -197,6 +254,24 @@ Two parking rules govern when a hydration is actually delivered:
 
 - **Arriving mid-load:** if the page's first load has not completed yet, the hydration is parked and drained on load-completion, on the same transition that drains a parked refresh.
 - **Arriving while the user has unsaved edits:** the hydration is held, not dropped. The page reports its unsaved-edit state to the host, and while that flag is set the hydration waits; it is drained on the next persisted-save acknowledgement, so a user who started typing before the background scan returned still gets the transcript and translate controls revealed as soon as their next save lands.
+- **A scan that returns after the user switched memories is discarded** by the identity guard rather than applied to the incoming memory's page.
+
+**How the translatable-plan set is gathered.** Each plan's body is a separate cross-process read, so the scan does two things to cut latency without changing its result:
+
+- A plan whose **title** already qualifies for translation is added without reading its body at all.
+- The remaining bodies are read **several at a time** (bounded to eight in flight), rather than one after another, with a per-read time limit; a read that fails or times out is skipped, and the whole fan-out abandons the remaining plans rather than queueing behind a wedged read.
+
+The resulting set is identical to the one a strictly sequential scan produced. Only the wall-clock time changed — a memory referencing many plans used to spend most of its "opening" delay here.
+
+### Persisted edits and the host's shared memory cache
+
+The host keeps a shared in-memory cache of memories that every surface reads through. **Every edit this page persists now invalidates that cache** as part of the same operation: topic edit and delete, test-guide generate / edit / delete, recap generate and edit, plan removal, plan association, and the plan-title re-derivation that follows a plan save or translation. The cloud push reaches the same outcome through the memory-state notification it fires, which wipes the cache before notifying listeners.
+
+Before this, an edit made here was correct on disk and correct in this page — but any other surface that reopened the same memory (the commits list, the Memory Bank explorer, the PINNED list, the action bar, the "view newest memory" action, the branch-level pull-request draft) served the **pre-edit snapshot** from the cache. Editing a topic and then reopening the memory from the commits list showed the old text.
+
+The invalidation is deliberately *not* routed through the memory-state notification: that would make every listening panel reload itself, clobbering this page's own in-place patch with a redundant full render and flashing the tab. It only clears the cache.
+
+Transcript writes are the one persistence path that does not invalidate, because they do not rewrite the memory document.
 
 ### In-document hover hints
 
@@ -235,7 +310,7 @@ After save or translate, the host rewrites the plan's title from the markdown's 
 
 ### Pull-request flow
 
-The PR section starts in a "Checking PR status..." state. The page sends `checkPrStatus` on mount; the host replies with one of:
+The PR section starts in a "Checking PR status..." state. The page sends `checkPrStatus` on mount (and the host re-asks on its behalf after a memory swap); the host replies with one of:
 
 | Status            | Page renders                                                                              |
 | ----------------- | ----------------------------------------------------------------------------------------- |
@@ -243,6 +318,12 @@ The PR section starts in a "Checking PR status..." state. The page sends `checkP
 | `unavailable`     | Informational message: gh is missing or unauthenticated.                                  |
 | `noPr`            | "Create PR" button; clicking opens the embedded form.                                     |
 | `ready`           | The PR's link, title, and an "Edit PR" button.                                            |
+
+**The state the page is told is cached, not freshly measured.** All three questions behind that reply — is the pull-request tool present, is it signed in, and does this branch have a pull request — are answered from a shared time-limited cache (spec 309), so opening a memory or swapping to another memory on the same branch does not re-run them. The branch answer expires on a short window; the tool-presence and sign-in answers on a much longer one. Consequences the user can see:
+
+- This page's own create and update flows **clear the branch's cached answer before re-asking**, so a pull request the user just created or edited here is reflected immediately.
+- A pull request **merged, closed, or opened elsewhere** — on the forge, in a terminal, by a teammate — is not noticed until the branch answer expires. Until then the card can claim "no PR" for a branch that has one, or show a stale title.
+- Signing in to the pull-request tool, or installing it, is likewise not noticed until the longer window expires.
 
 The embedded form has Title and Body fields and Cancel / Submit buttons. On Submit, the page sends `createPr` (no-PR state) or `updatePr` (ready state).
 
@@ -295,18 +376,52 @@ If the embedded HTML view cannot be instantiated, the host falls back to a read-
   Read the live editor background colour once
     → theme the host surface, the pre-content blank page, and the page's --bg
     → pick the light/dark palette from that colour's luminance
-  Build the page HTML (both transcript variants emitted; every plan's translate control emitted, hidden)
   Hold the content load until the host surface is attached-and-shown AND non-zero-sized
-    [size change | shown change | already ready at construction] → load (first wins)
-    [1500 ms elapsed, bounds now real]  → load, logged as a forced fire
-    [1500 ms elapsed, still zero-sized] → DO NOT load; warn; arm the size watcher
+    [size change | shown change | already ready at construction] → render (first wins)
+    [1500 ms elapsed, bounds now real]  → render, logged as a forced fire
+    [1500 ms elapsed, still hidden or zero-sized]
+        → arm the two event-driven recovery paths FIRST (real size change |
+          shown-state change), then render ANYWAY (policy reversed), then start
+          the 500 ms visibility poll (30 s ceiling) — late is fine for a poll
+          first one to see a mounted, visible, non-zero surface wins:
+             push the true viewport size, then force a fresh render of the CURRENT memory
+          [30 s with the tab still hidden] → give up, stop polling
   Start gathering the transcript set and the plan-translate set on a background thread
+    (title-qualifying plans need no body read; remaining bodies read ≤8 at a time)
+
+[any render requested]
+  Snapshot inputs on the interface thread (memory, both sets copied, bridge script,
+                                          read-only flag, theme colour); bump render counter
+  Build the document on a background thread
+    (both transcript variants emitted; every plan's translate control emitted, hidden)
+  Hop back to the interface thread
+    [a newer render was requested meanwhile] → DROP this one
+    [build threw]                            → log and drop; previous document stays
+    [otherwise] → mark not-loaded, then load
 
 [page load completes]
   Drain a parked refresh, if any
   Drain a parked deferred hydration, if any
+  Drain a parked share-overlay request, if any
   Fire the one-shot viewport-changed notification + revalidate/repaint
+  [this was a not-yet-loaded → loaded transition]
+    Ask the page to report its first painted frame
   Install/keep the size watcher that forwards later size changes to the browser
+
+[page reports firstFramePainted]  (not user-initiated)
+  After a short delay: detach the view from its tab container, re-attach next turn,
+                       re-publish the size  → ~1-frame flash
+
+[the single memory tab is handed a different memory]
+  Bump the memory-identity generation (every outstanding memory-scoped async no-ops)
+  Clear both deferred sets
+  Install the new memory; if the read-only flag changed, subscribe/unsubscribe
+  Request a full re-render (same browser instance, no native re-attach)
+  Mark not-loaded synchronously → same-turn share/hydrate intents park instead of firing
+  Clear leftover share-overlay and share-modal state from the outgoing memory
+  Restart the deferred-set scan; re-ask for the PR state
+  (on the new page's load completion the firstFramePainted round trip runs again,
+   so the ~1-frame flash recurs on every swap)
 
 [page loaded with summary S]
   Render structure (Conversations zone, Header [reference chip + title], Token/cost banner,
@@ -314,6 +429,7 @@ If the embedded HTML view cannot be instantiated, the host falls back to a read-
   Send checkPrStatus
 
 [background gather returns]
+  [memory switched since dispatch] → discard (identity guard)
   [both sets empty]        → send nothing
   [page not loaded yet]    → park; drain on load-completion
   [unsaved edits pending]  → hold; drain on the next persisted-save acknowledgement
@@ -367,8 +483,16 @@ If the embedded HTML view cannot be instantiated, the host falls back to a read-
 - **Palette and background come from the same colour, on purpose.** The light/dark palette is chosen from the perceived luminance of the live editor background rather than from the widget theme's brightness flag. The two settings are independent, and the old pairing produced a dark page rendered with the light palette — unreadable text — for anyone running a light widget theme with a dark editor scheme. (Notable; fixes a real unreadable state.)
 - **The pre-content blank page is theme-coloured, and that is what removes the white flash.** The embedded browser keeps the old document painted until the new one commits a frame, so theming the *blank* page (and the host surface, and the page's root element) is what covers the whole parse-and-first-paint window. Theming only the finished page would leave the default white visible for exactly as long as the page takes to render. (Notable.)
 - **Floating elements deliberately do not use the page's surface tokens.** Those are a few percent alpha, which reads correctly on a known background and fails over arbitrary scrolled content. Floating elements use opaque theme-matched tokens instead, and hover hints use their own opaque bubble token set — deliberately inverted on a light page — rather than a surface at all. Two absolutely-positioned timeline decorations were moved onto opaque equivalents for the same reason. (Notable.)
-- **The content load waits for real bounds, and the timeout deliberately refuses to load without them.** Loading into a zero-sized surface produced a permanently blank tab, because the browser does not re-render on its own when the surface later becomes non-zero. So the last-resort timer loads only if bounds have arrived; otherwise it warns, installs the size watcher, and leaves the readiness path armed. The failure mode this replaced was content scrunched into the top-left corner of an otherwise blank tab. (Surprising; intentional.)
+- **The document is built off the interface thread, and a superseded build is thrown away.** Every render snapshots its inputs, assembles a few hundred kilobytes of document on a background thread, and hops back only to issue the load — dropping itself if a newer render has been requested in the meantime. This removed a fraction-of-a-second interface freeze on every memory open and every full refresh. The trade is that the first paint arrives one thread hand-off later, and a render is not complete when the call requesting it returns. (Notable.)
+- **The last-resort timer now always renders, even at zero size — the earlier policy was reversed.** It used to refuse to load without real bounds, on the (correct) reasoning that a browser painting into a zero-sized surface will not re-render itself when the surface later grows. The reason it changed: on the first memory tab of a fresh session the readiness signals sometimes never arrived, leaving the tab blank indefinitely. So it renders anyway and arms three recovery paths — a real size change, a shown-state change, and a ~500 ms visibility poll that gives up after ~30 s — any one of which suffices, with a shared one-shot latch making the other two no-ops. The two event-driven ones are armed *before* the render goes out, because an observer that does not exist yet cannot see an edge fired in the meantime; the poll is started *after* it, which is safe for a different reason — a poll re-reads the current state on every tick instead of waiting for a transition, so nothing can be missed by starting it late. The give-up point is a tab the user's own layout keeps hidden. A blank-until-recovered tab replaced a blank-forever one. (Surprising; intentional; reverses a documented earlier decision.)
+- **A recovery render rebuilds from the memory the user most recently clicked**, not the one captured when the tab was built — so a tab that sat blank while the user clicked through several memories recovers onto the right one.
 - **A viewport-changed notification replaced a second full page load.** The first paint of a freshly built embedded browser does not reliably fill the component, and the old fix was to load the whole page again once the deferred data arrived — which worked, at the cost of a visible 300–400 ms flash. The notification (plus a layout revalidate/repaint) achieves the same repaint with no navigation and no flash. (Notable; the flash is gone, which is why the page now ships both hidden variants instead.)
+- **The viewport notification alone was not enough, so the view is detached and re-attached once per load.** After a load completes the host asks the page to report its first *painted* frame, and on that report briefly removes the embedded view from its tab container and puts it back. That is the only signal that reliably reconciles the embedded view's frame with its container on macOS; without it the top of the tab can stay blank until an external window resize wakes the platform. It costs about a one-frame flash. (Notable; a page-initiated inbound message that the user never triggers.)
+- **That flash happens on every memory swap, not only on first open.** The round trip is armed on a not-yet-loaded → loaded transition, and a memory swap deliberately resets the loaded flag — so the swap's own load completion arms it again. Clicking through five memories in the single reused tab therefore produces five brief flashes. (Surprising; a direct consequence of the single-tab reuse.)
+- **About twenty asynchronous paths carry a memory-identity generation and no-op on mismatch.** Single-tab reuse would otherwise have introduced a whole class of wrong-attribution errors: memory A's cold pull-request lookup landing its badge on memory B's page, A's transcript or translatable-plan chips appearing under B, or A's just-persisted edit overwriting B's in-memory identity. The pull-request "ready" payload carries no branch, so the page cannot filter it after the fact — the guard has to be host-side. Persisted writes are deliberately *not* guarded: they were writes against the memory the user was actually editing. (Notable; the cost of admission for one shared tab.)
+- **Every persisted edit invalidates the host's shared memory cache.** Reopening the memory from any other surface therefore shows the edit instead of a pre-edit snapshot — the failure this fixed was editing a topic here and then seeing the old text after reopening from the commits list. The invalidation deliberately does not fire the memory-state notification, which would make every listening panel reload and clobber this page's own in-place patch. Transcript writes are the exception, since they do not rewrite the memory document. (Notable.)
+- **The pull-request state shown here is cached and can lag reality.** A pull request merged, closed, or created outside the IDE is not reflected until the branch answer's short window expires; installing or signing in to the pull-request tool is not reflected until a much longer window expires. This page's own create/update flows clear the branch entry first, so its *own* actions always show immediately. (Notable; the cache's TTLs, coalescing and invalidation are owned by spec 309.)
+- **The translatable-plan scan reads bodies several at a time and skips the read when the title already qualifies.** The resulting set is identical to the old strictly-sequential scan's; only the latency changed, which used to dominate the opening delay for a plan-heavy memory. (Notable; no behavioral difference.)
 - **The page always opens claiming zero transcripts and no translatable plans.** Both sets are gathered after the page opens, so the first frame of every tab shows the conversations zero-state and no translate controls, and they appear a moment later. That is the price of getting two I/O-shaped reads off the UI thread on every tab open. (Surprising; intentional.)
 - **A hydration that arrives while the user is typing is held, not dropped.** It waits for the next persisted-save acknowledgement and is delivered then, so the controls still appear rather than being lost until the next full render. (Notable.)
 - **Hover hints are drawn in the document because the embedded browser has no native tooltips**, and the first hover of an element *moves* its native hint into a private attribute. The consequence is an invariant: page code must never read the native hint attribute at runtime, because after the first hover it no longer exists. A live native hint always wins over the cached copy, which is what keeps hints rewritten at runtime from being pinned to their first-hover text. (Notable; a latent trap for future page code.)
@@ -396,7 +520,8 @@ If the embedded HTML view cannot be instantiated, the host falls back to a read-
 - **Force-push gate** — the divergence check and confirmation dialog invoked by the Create-PR failure path when a push is rejected as non-fast-forward; its own mechanics (safety inspection, gate outcomes, the actual force-push) are owned by that spec (264), not documented here.
 - **Plan service** — owns the available-plans chooser and the associate / unassociate flows.
 - **One-shot generation bridge (spec 292)** — the seam `generateE2eTest`, the recap generation, and `translatePlan` are delegated over, because this host cannot run generation in process. It owns the request/response contract, provider routing, and prompt assembly; this view only serializes the inputs and renders the result.
-- **Virtual-file editor wrapper** — the surface that this view becomes the body of (spec 121). It is also the party that borrows the embedded browser this page is loaded into and hands it back on tab close.
+- **Virtual-file editor wrapper** — the surface that this view becomes the body of (spec 121). It is also the party that borrows the embedded browser this page is loaded into and hands it back on tab close, and the owner of the one-tab-per-project rule that makes the in-place memory swap this page implements the normal path for viewing a second memory.
+- **Pull-request status cache (spec 309)** — answers the tool-presence, sign-in, and branch-lookup questions behind `checkPrStatus`, and is what this page's create/update flows invalidate for the current branch before re-asking. Its TTLs and coalescing are owned there; this page owns only the staleness the user can observe.
 - **Embedded-browser pool (spec 302)** — supplies the reused embedded-browser instance this page loads into, and defines the lease through which the message bridge and the navigation/load observers must be attached. A refused lease is one of the ways the plain-text fallback below is reached.
 - **Memory reference identifier and copy chip (spec 301)** — owns the identifier the header chip renders (here the always-present variant, so a never-pushed memory still shows a reference), and everything the chip does when activated. This page owns only its position in the title.
 - **System clipboard / external browser** — destinations for `copyMarkdown`, `downloadMarkdown`, and external link clicks.

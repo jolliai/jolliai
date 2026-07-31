@@ -17,14 +17,14 @@ A singleton editor-area webview that lets the user review — and edit — exact
 - Independent settling of the sections so one section's failure never blocks the others.
 - The token meter's exact-percentage three-segment bar and its "not reported" degradation.
 - The two distinct per-row affordances: a reversible exclude toggle (posts the same selection messages the sidebar posts) and a separate destructive remove/discard affordance.
-- The AI context-relevance overlay: the pre-commit ranking against the selected-file change set, its persistence (the full per-item verdict list + change fingerprint) for post-commit reuse, the per-row tier chips / "Excluded" badge / ✨ reason line / rank-sorted ordering / "Analyzing…" placeholder, the Include/dismiss affordance (a `dismissed` flag, not a deletion), the mirroring of the same overlay to the sidebar on every outcome, the memoization and monotonic-generation guard against stale overwrites, the empty-file-set short-circuit, and the fail-open contract.
+- The AI context-relevance overlay: the pre-commit ranking against the selected-file change set (including the working-tree diff of exactly those files, fetched only on a memoization miss), its persistence (the full per-item verdict list + change fingerprint) for post-commit reuse, the per-row tier chips / "Excluded" badge / ✨ reason line / rank-sorted ordering / "Analyzing…" placeholder, the Include/dismiss affordance (a `dismissed` flag, not a deletion), the mirroring of the same overlay to the sidebar on every outcome, the memoization and monotonic-generation guard against stale overwrites, the empty-file-set short-circuit, and the fail-open contract.
 - The footer commit affordance and its enablement rule.
 
 **Out of scope (boundaries — referenced, not duplicated):**
 
 - The relevance-ranking algorithm, its LLM call, the change-fingerprint derivation, and its fail-open contract — invoked here, owned by [258 — AI Context-Relevance Filtering].
 - Persistence of the full AI relevance verdict list + change fingerprint, the cross-process file lock all writes serialize under, and the dismiss/clear operations — owned by [188 — Commit Exclusion Selection Store]. This panel writes through those APIs.
-- The LLM commit-title generation algorithm and the working-tree diffstat computation — invoked here, owned elsewhere.
+- The LLM commit-title generation algorithm, the working-tree diffstat computation, and the shared working-tree-diff-for-a-selection read (the same read the title generator uses, which also renders included untracked files as whole-file additions) — all invoked here, owned elsewhere.
 - The selection stores this panel writes through: the commit-exclusion store for conversation/plan/note/reference/file inclusion (spec 188) and the files selection store.
 - The token breakdown extraction (per-turn input / output / cache-creation) and cost model (spec 243).
 - Transcript-cutoff attribution, which the exclusion pass feeds (spec 36).
@@ -43,7 +43,7 @@ The preview has five independently-derived sections:
 | `diffstat` | Working-tree diff statistics over the *selected* files.                             |
 | `tokens`   | Aggregated token usage over the *selected* conversations.                           |
 | `ticket`   | An issue key detected from the *selected* context (reference) rows.                 |
-| `context`  | The AI context-relevance overlay: per-item tier + reason + soft-exclude, ranked against the *selected* files' change set. |
+| `context`  | The AI context-relevance overlay: per-item tier + reason + soft-exclude, ranked against the *selected* files' change set — their paths plus (on a cache miss) their working-tree diff. |
 
 "Selected" throughout means the item is currently *included* in the next memory — i.e. not excluded in the selection stores.
 
@@ -140,6 +140,15 @@ The panel decorates each context (plan / note / reference) row with an AI releva
 
 **Ranking and persistence.** When the selected-file set changes (and on full refresh), the panel builds a change signal from the currently-*included* files (repo-relative paths, no commit message) and asks the relevance ranker to score every user-kept context item (see [258]). This is the authoritative-style path: it reads full registry content (like the post-commit worker) and **persists the FULL per-item verdict list** — every ranked item, kept *and* excluded — plus a file-based change fingerprint to the exclusion store (spec 188). Each persisted entry carries: the item's kind, its key, its relevance tier (`high` / `mid` / `low`), the one-line reason, and the AI's **original exclude decision** (written once by the ranking, never rewritten). The single full list is what lets the post-commit worker's fingerprint-reuse path rebuild **both** the effective exclude set **and** the kept items' tier + reason (recorded on the summary's context-relevance field) without re-running the LLM. Because the fingerprint is keyed on the file set only, the worker reuses this exact ranking verbatim when its fingerprint matches — one ranking, panel result == final. Nevertheless the **pre-commit rank is non-authoritative**: the post-commit worker always recomputes on a fingerprint miss, and its recompute is the authoritative result; the worker also **clears this AI layer** after consuming it.
 
+**The change signal carries a diff, fetched only on a cache miss.** The signal handed to the ranker also includes the **working-tree diff of exactly the included files** — their staged *and* unstaged changes, plus any included **untracked** file rendered as a whole-file addition — capped by the ranker's own diff budget ([258]). Two properties are load-bearing:
+
+- The diff is read **only after the memoization check misses**, so a cache hit costs no repository read at all. (The cache key is computed before the diff exists, which is possible precisely because the fingerprint ignores the diff.)
+- The read is **best-effort and swallowed**: a failure leaves the diff empty and ranking proceeds on paths and symbols alone, rather than aborting the overlay.
+
+Because the diff read is an extra asynchronous hop between the cache check and the model call, the panel re-checks its staleness generation immediately after it — an additional guard alongside the existing checks after the registry read, after the ranking call, and after the persist — so a superseded refresh neither fires the call nor posts an overlay.
+
+The panel's change **fingerprint stays keyed on the file set only**: carrying a diff cannot move the cache key or the persisted fingerprint, which is what keeps the post-commit worker's reuse path matching. The cost of that choice — a ranking reused against a different committed diff over an identical file set — is owned by [258].
+
 The persisted list is filtered to entries that have a **non-empty reason OR are auto-excluded** — a fresh ranking's excluded (tier `low`) items must persist their exclusion even when the model gave no reason, or the reuse path would silently keep an item the fresh path drops. Entries with an empty reason that are *not* excluded are the fail-open keep-all placeholders (tier `mid`, reason `""`); they are dropped so the reuse path never stamps a fabricated tier onto the artifact.
 
 **Cross-process serialization.** All writes to the exclusion file — the panel's persist, the user dismiss, and the worker's post-consume clear — serialize under a dedicated **cross-process file lock** (spec 188). This is new: the worker previously only *read* this file and never wrote it. The lock exists precisely because the pre-commit panel and the post-commit worker are separate processes that both mutate the AI layer, and a lost update would either strand a stale ranking or drop the user's dismiss.
@@ -193,8 +202,10 @@ The footer's commit control dispatches the same commit command the sidebar's com
 [timer fires] ─────► drain pending set ─► recompute those sections concurrently ─► push each
 
 [file toggle] ─────► (in the debounced refresh) rank context vs. selected files
-                     ─► claim a generation ─► cache hit? replay overlay
-                                            ─► miss? "Analyzing…" ─► rank ─► if still latest:
+                     ─► claim a generation ─► cache hit? replay overlay (no diff read)
+                                            ─► miss? read working-tree diff of the selected files
+                                                     (best-effort) ─► re-check generation
+                                                     ─► "Analyzing…" ─► rank ─► if still latest:
                                                  persist full verdict list + fingerprint, cache, post overlay
                                                  (to panel + sidebar), under the cross-process lock
 [Include on excluded row] ─► optimistic un-exclude in panel ─► host sets the entry's `dismissed` flag
@@ -221,6 +232,8 @@ The footer's commit control dispatches the same commit command the sidebar's com
 - **The overlay is mirrored to the sidebar on every outcome.** The panel is not the only surface: empty file set, cache hit, success, and failure each mirror the same overlay to the sidebar's Working Memory Context rows (via a direct sidebar push, not the broadcast fan-out), so a strikethrough shown in one surface shows in both.
 - **Persistence writes the full ranking, not just exclusions.** The panel persists every ranked item's tier + reason + exclude decision as one list (filtered to real verdicts), which is what lets the worker rebuild both the kept-item relevance and the effective exclude set on a fingerprint match — one LLM call, reused verbatim. All writes (panel persist, dismiss, worker clear) serialize under a cross-process file lock.
 - **The disposal cleanup must not read the live webview accessor.** It uses the webview captured at open time; re-reading the accessor (which throws once disposed, and disposal fires exactly then) would abort cleanup before the singleton pointer is cleared, stranding a dead panel as the singleton.
+- **The diff is a cache-miss-only cost.** The panel reads the selected files' working-tree diff (staged, unstaged, and untracked) only after the memoization check misses, so reopening the panel or switching tabs replays the previous overlay without touching the repository. A diff read that fails is swallowed and the ranking proceeds on paths alone.
+- **Carrying a diff cannot move the cache key.** The fingerprint the panel computes and persists remains file-set-only, deliberately: that is what lets the post-commit worker recognize and reuse this ranking. The diff is folded into the signal *after* the key is computed.
 - **The generation guard makes ranking order-of-start authoritative.** A slow earlier ranking that finishes after a newer one cannot clobber the newer overlay/cache/persisted fingerprint — only the latest generation may write.
 
 ## Shared Behavior

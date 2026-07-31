@@ -8,6 +8,7 @@ This topic previously described a standalone MEMORIES section of the IntelliJ si
 
 **In scope:**
 - Recording that the standalone all-branches MEMORIES panel — and its distinctive behaviors (flat all-branch list, modal search dialog driving an external filter, "Load More" page-size pagination against a `MAX_SEARCH_ENTRIES` ceiling, recall-prompt-to-clipboard with a confirmation popup, the initializing / disabled / empty tri-state) — has been removed from the live tool window.
+- Recording that the dead class continues to receive changes made for the live surfaces, and that none of them are reachable.
 - The supersession relationship: the live memory list is the COMMITTED MEMORIES section, scoped to the current branch (or a foreign branch in read-only mode), not a flat all-branches list.
 
 **Out of scope:**
@@ -17,7 +18,7 @@ This topic previously described a standalone MEMORIES section of the IntelliJ si
 
 ## Data Contracts
 
-There is no live data contract for this topic. The class that implemented the old panel still exists in the source tree but is unreferenced — it is not constructed by the tool-window factory, not held in the panel registry, and has no action group in the plugin manifest. The `listMemoryEntries(count, filter?)` service method it consumed still exists but has no live caller from the UI.
+There is no live data contract for this topic. The class that implemented the old panel still exists in the source tree but is unreferenced — it is not constructed by the tool-window factory, not held in the panel registry, and has no action group in the plugin manifest. Nothing outside the class names it except two comments in other files. The `listMemoryEntries(count, filter?)` service method it consumed still exists but has no live caller from the UI.
 
 ## Behavior
 
@@ -50,7 +51,7 @@ None. This topic has no live UI surface.
 
 - **The standalone MEMORIES panel was superseded, not merely renamed.** The live COMMITTED MEMORIES section is branch-scoped (current branch, or a foreign branch read-only), whereas the retired panel was a flat list across every branch.
 - **The implementing class is dead code.** It is present in the source tree but has no construction site, no registry entry, and no manifest action group; its search / pagination / recall-copy logic is unreachable from the running product.
-- **The dead class is still being maintained.** It picked up the same "not enabled for this repository" placeholder the live panels gained, which means edits aimed at the live surfaces are being applied here too. Nothing renders it, so those edits have no user-visible effect — but they are a signal that the class has not been recognized as dead by everyone touching it.
+- **The dead class is still being maintained.** It picked up the same "not enabled for this repository" placeholder the live panels gained, which means edits aimed at the live surfaces are being applied here too. It has since also been **rewired onto the shared single-memory-tab opener** alongside every live memory-opening surface — its row-open path no longer builds a memory virtual file of its own and instead hands the memory to the opener that enforces one memory tab per project. That refactor was applied uniformly, dead code included. Nothing renders it, so neither edit has any user-visible effect, and its open path **still can never run** — but they are a signal that the class has not been recognized as dead by everyone touching it. (Unreachable.)
 
 ## Shared Behavior
 

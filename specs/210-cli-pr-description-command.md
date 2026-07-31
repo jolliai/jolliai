@@ -84,12 +84,13 @@ In JSON mode the error envelope is the type-tagged `{ type: "error", message }` 
 ## Behavior (execution order)
 
 1. Resolve the project directory option (defaulting to the git repo root) and point logging at it.
-2. **Exclusivity guard:** if both the stdin toggle and the base-branch flag were supplied, emit the exclusivity error in the active mode, set exit code 1, and return.
-3. **Resolve the base value:** if the stdin toggle is set, read piped stdin and use a non-empty read as the base (empty read ⇒ unset); otherwise use the base-branch flag value.
-4. **Validate:** if a base value was resolved and it contains a disallowed character, emit the invalid-characters error in the active mode, set exit code 1, and return.
-5. **Call the engine** (spec 209) with the project directory, the resolved base (or unset), and the include-markers boolean forwarded from the no-markers toggle.
-6. **Format success:** in JSON mode, print the serialized result object; in human mode, print the short summary block.
-7. **Catch failures:** any thrown error (including the engine's no-summaries error and any stdin-read error such as a non-piped/TTY stdin or an over-cap payload) is converted to its message, emitted as the error envelope in the active mode, and the exit code is set to 1.
+2. **Establish the configured storage backend as the process-wide active backend**, constructing it for the resolved project directory. This happens **before** the exclusivity guard and before the character validation — i.e. before any argument is judged — because the generation engine (spec 209) resolves its memory store from a process-wide handle rather than from a threaded argument, so without this step every run fell through to the default backend and emitted a warning per commit read. The same binding is performed by the sibling programmatic surface and by the recall/search commands.
+3. **Exclusivity guard:** if both the stdin toggle and the base-branch flag were supplied, emit the exclusivity error in the active mode, set exit code 1, and return.
+4. **Resolve the base value:** if the stdin toggle is set, read piped stdin and use a non-empty read as the base (empty read ⇒ unset); otherwise use the base-branch flag value.
+5. **Validate:** if a base value was resolved and it contains a disallowed character, emit the invalid-characters error in the active mode, set exit code 1, and return.
+6. **Call the engine** (spec 209) with the project directory, the resolved base (or unset), and the include-markers boolean forwarded from the no-markers toggle.
+7. **Format success:** in JSON mode, print the serialized result object; in human mode, print the short summary block.
+8. **Catch failures:** any thrown error (including the engine's no-summaries error and any stdin-read error such as a non-piped/TTY stdin or an over-cap payload) is converted to its message, emitted as the error envelope in the active mode, and the exit code is set to 1.
 
 ## State Transitions
 
@@ -105,10 +106,12 @@ The command is single-shot and stateless across runs; there are no persisted tra
 - **Every failure sets a non-zero exit code in both output modes** so pipelines and CI detect it regardless of the requested format. (Notable.)
 - **An empty stdin read is treated as "no base supplied," not as an empty branch name** — the engine then default-resolves the base. (Notable.)
 - **Only `json` is an accepted format value**; any other value is rejected by the argument parser before the action runs. (Notable.)
+- **Storage is bound before the arguments are judged, so a rejected invocation has still read configuration and constructed a backend.** The binding sits ahead of both guards on purpose (the engine reads through a process-wide handle, so binding it late would be binding it after the first read). The observable consequence is that a run which dies on the exclusivity or character check has nevertheless loaded configuration and built the storage backend before printing its error. (Notable.)
+- **Under the default configuration this is a warning/consistency fix, not a change of which store is read.** The default (dual-write) backend and the orphan-only backend both resolve *reads* from the orphan branch, exactly as the previous unbound fallback did — what the binding removes is a per-read warning and the divergence from the sibling surfaces. Only a folder-only configuration actually changes which layer the command reads from. (Notable.)
 
 ## Shared Behavior
 
-- The title + body computation, the result object's full field set, the marker-wrapping semantics, and the no-summaries error message are owned by **PR Description Generation** (spec 209).
+- The title + body computation, the result object's full field set, the marker-wrapping semantics, and the no-summaries error message are owned by **PR Description Generation** (spec 209) — including the fact that the engine resolves its memory store from the process-wide active backend, which is why this command binds one first.
 - The retired PR skill that used to call this command as a fallback (and the `error:` / stale-command detection it keyed on) is recorded in **jolli-pr Skill Content (Retired)** (spec 211); no installed skill drives this command today.
 - Creating or editing the actual GitHub PR with this command's output is owned by **PR Creation and Update via gh** (spec 99).
 - The shared stdin-reading channel (byte cap, TTY rejection, trailing-newline trimming), the safe-argument character pattern, and the project-directory resolution default are shared command-line utilities consumed here.

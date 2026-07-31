@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-The settings webview that edits the per-user configuration — Anthropic API key, model alias, max-output tokens, Jolli API key, nine independent agent-integration toggles, AI-summary provider selection (including the local-agent provider and its agent-tool choice), Memory Bank local folder, Memory Bank cloud-sync controls, DCO sign-off, and exclude-pattern globs — and persists them to a single per-user config file with no per-workspace overrides, validating the Jolli API key against an HTTPS-only host allowlist before any disk write. The Memory Bank tab additionally carries a read-only line reporting whether folder-layer writes are actually landing and where.
+The settings webview that edits the per-user configuration — Anthropic API key, model alias, max-output tokens, Jolli API key, nine independent agent-integration toggles, AI-summary provider selection (including the local-agent provider and its agent-tool choice), Memory Bank local folder, Memory Bank cloud-sync controls, DCO sign-off, and exclude-pattern globs — and persists them to a single per-user config file with no per-workspace overrides, validating the Jolli API key against an HTTPS-only host allowlist before any disk write. The Memory Bank tab additionally carries a read-only line reporting whether folder-layer writes are actually landing and where; the AI Summary tab carries a read-only line reporting whether the selected agent tool actually runs on this machine, which is the one form state that can block saving on every tab at once.
 
 ## Scope
 
@@ -14,7 +14,10 @@ The settings webview that edits the per-user configuration — Anthropic API key
 - The Jolli-API-key origin allowlist that runs on every keystroke and again on save.
 - The "at least one integration must be enabled" rule.
 - The integration-toggle side effect: enabling or disabling the Claude or Gemini toggle installs or removes the corresponding hook across every worktree of the repository. The other agent toggles (Codex, OpenCode, Cursor, Devin, Copilot, Cline, Antigravity) gate discovery-only integrations and have no per-worktree hook to install.
-- The AI Summary provider selection (Anthropic direct, Jolli proxy, or local agent) and the conditional cards rendered for each: an Anthropic card with key / model / max-tokens; a Jolli card with three sub-states (signed-in-with-key, signed-in-but-key-missing, signed-out) and a sign-in button that hands off to the shared auth service; a local-agent card with an agent-tool dropdown and no credential field.
+- The AI Summary provider selection (Anthropic direct, Jolli proxy, or local agent) and the conditional cards rendered for each: an Anthropic card with key / model / max-tokens; a Jolli card with three sub-states (signed-in-with-key, signed-in-but-key-missing, signed-out) and a sign-in button that hands off to the shared auth service; a local-agent card with an agent-tool dropdown, an availability status line, and no credential field.
+- The agent-tool availability check: exactly when it is dispatched, the line it drives and that line's renderings, the stale-reply rule, and why it is deliberately not part of loading the panel.
+- The third arm of the Apply gate — a *confirmed*-unavailable local-agent selection — its re-application at the save chokepoint, and its blast radius across every tab.
+- Held saves: an Apply clicked while an availability check is in flight, its watchdog, what drops it, and how it interacts with the migrate-after-save and sync-after-save chains.
 - The Memory Bank tab's read-only effective-state line: its position, its ships-collapsed rule, the hidden-on-missing-payload rule, and its plain-text rendering.
 - The Memory Bank sync controls: a "Sync to Personal Space Now" button that triggers an on-demand sync round, an "Auto-sync to Personal Space" toggle, a poll-interval input clamped at the lower bound (lower values clamp up to the floor; values above the upper bound clamp down), an "Include transcripts" toggle (off by default; warns the user that transcripts may include sensitive content), and a warning banner reminding the user that the local-folder must not be shared with iCloud / Dropbox / Syncthing because manual sync still writes there even when auto-sync is off (cross-ref spec 174 for the sync engine).
 - The local-folder browse button, the "Migrate to Memory Bank" button, the compile-exclude-folders input, and their per-action feedback strings.
@@ -53,6 +56,7 @@ The settings webview that edits the per-user configuration — Anthropic API key
 | AI Summary | Sign In to Jolli | Button. | Jolli card, signed-out sub-state only. Hands off to the shared auth service; OAuth completion returns the Jolli API key, which then persists through the normal save path. |
 | AI Summary | Jolli API Key | Plain text input (under an "Advanced" disclosure). | Jolli card, signed-in sub-states. Masked on display; validated for shape and origin both inline and at save. |
 | AI Summary | Agent tool | Dropdown, one option per supported local-agent tool. | Local-agent card only. The options are **generated from the tool registry**, not hand-written, so a newly-supported tool appears with no edit to this form. **No credential of any kind is collected on this card** — the tool's own login is the credential. |
+| AI Summary | Agent tool availability | Read-only single line of text. | Local-agent card only; directly beneath the Agent tool dropdown and above the card's hint. Blank, neutral "checking", or an error-coloured "not found" message. See "Agent-tool availability line" below. |
 | Sync to Jolli | Sign In / Sign Out to Jolli | Button. | Two sub-cards (signed-in vs. signed-out) based on the current sign-in state. |
 | Memory Bank | Folder Path | Read-only text + Browse button. | Folder picker on Browse; selected path written back via a webview message. |
 | Memory Bank | Memory Bank effective state | Read-only single line (icon + text). | Directly beneath the Folder Path row. Populated from the host's verdict, never derived in the webview. See "Memory Bank state line" below. |
@@ -68,13 +72,40 @@ The settings webview that edits the per-user configuration — Anthropic API key
 
 ### Local-agent card
 
-Rendered instead of the Anthropic / Jolli cards when the provider dropdown is on the local-agent option. It holds one control and one hint, and nothing else: a label reading `Agent tool`, its dropdown, and the hint line
+Rendered instead of the Anthropic / Jolli cards when the provider dropdown is on the local-agent option. It holds one control, one read-only status line, and one hint, and nothing else: a label reading `Agent tool`, its dropdown, the availability line described below, and the hint line
 
 > `Uses your local agent's own login (subscription/BYOK). Sign in with that tool's CLI if prompted.`
 
 **Each option's visible label is distinct from the identifier persisted for it.** The dropdown's options are built by walking the tool registry, taking each entry's identifier as the option value and its display label as the option text. These routinely differ: the option a user reads as **`Cursor`** persists the identifier **`cursor-agent`**. Nothing in this form ever shows an identifier, and nothing downstream renders one — the same registry maps the stored identifier back to the label wherever the active tool is displayed.
 
-Because the card collects no credential, selecting this provider is the one choice that cannot fail this form's validation for a missing key: neither the Anthropic key-prefix rule nor the Jolli origin rule applies to it.
+Because the card collects no credential, selecting this provider is the one choice that cannot fail this form's validation for a missing key: neither the Anthropic key-prefix rule nor the Jolli origin rule applies to it. What it *can* fail is the availability check below, which is not a validation rule on any field but still gates Apply.
+
+### Agent-tool availability line
+
+A single read-only line under the Agent tool dropdown. Two of its four situations render identically — a blank line means both "nothing checked" and "checked, fine":
+
+| Situation | Rendering |
+| --- | --- |
+| Nothing has been checked yet | Blank (no text, no colour). This is also the state after switching the provider away from the local agent, since the whole card is hidden. |
+| A check is in flight | Neutral, description-coloured `Checking…`. |
+| The check succeeded | Blank again — a runnable tool is reported by saying nothing. |
+| The check failed | Error-coloured: `<Tool label> not found on this machine. Install it, or pick another tool.` The label is the tool's display label from the registry, resolved for the tool the reply is *for*. |
+
+**It reports only whether the tool runs.** It says nothing about whether the user is signed in to that tool — there is no uniform way to ask — so a tool that reports available can still fail at summarization time for want of a login. That is what the card's own hint line exists to pre-empt.
+
+The check is dispatched in exactly three situations:
+
+1. The Agent tool dropdown changes.
+2. The provider dropdown changes **to** the local-agent option. (Switching *away* needs no dispatch: the gate reads the live provider value and stops applying on its own.)
+3. Once when the panel finishes loading — **only if** the local-agent provider is already the configured one. Never otherwise, because the card is hidden for every other provider and the check costs a subprocess launch: an unconditional check would spend it producing a line nobody can see.
+
+**A reply for a tool the user has since moved off is discarded.** Each dispatch records which tool it asked about, and a reply whose tool no longer matches the dropdown's current value is dropped, so a slow answer for one tool can never be attributed to — or displayed against — a different current selection.
+
+Host-side outcomes of the check:
+
+- An identifier the supported-tool registry does not know is **dropped with no reply at all**, and it is safe precisely because such an identifier cannot be a real dropdown selection, so nothing in the form can be waiting on it. There is one further silent return, on a different axis: a reply is discarded when the panel that asked is no longer the live one, having been disposed or replaced while the check was in flight — equally safe, because the form holding any pending save went with it. **Every other path answers**, including the failure paths, since a held save may be blocked on the reply.
+- Being unable even to read the configuration answers **"not available"** rather than optimistically available: "couldn't establish that this runs" is never reported as runnable.
+- An explicitly configured executable path is honoured **only when it belongs to the tool being checked**. The recorded path names one tool's binary; probing a different tool with it would answer a question nobody asked, and answer it wrongly in both directions. Switching the dropdown therefore falls back to ordinary discovery for the newly-picked tool.
 
 ### Memory Bank state line
 
@@ -117,7 +148,13 @@ Any deviation rejects with the inline error: `Origin <u> is not on the Jolli all
 
 ### Apply Changes button
 
-Disabled unless the form is dirty AND has no inline errors. A click runs a final inline validation pass (catches programmatic mutations that bypassed input events) and, if anything is wrong, shows a persistent red feedback string ("Please fix the highlighted fields before saving") at the action bar without sending the message. A clean click sends an `applySettings` message with the field values plus the masked sentinel pair so the host can resolve "the user did not change this key" to the existing value on file.
+Disabled unless **all three** hold: the form is dirty, it has no inline errors, and it is not blocked by a *confirmed*-unavailable local-agent selection. A click runs a final inline validation pass (catches programmatic mutations that bypassed input events) and, if anything is wrong, shows a persistent red feedback string at the action bar without sending the message: "Please fix the highlighted fields before saving" for a validation error, or `<Tool label> isn't available on this machine. Install it, or pick another tool before saving.` for the unavailable tool. A clean click sends an `applySettings` message with the field values plus the masked sentinel pair so the host can resolve "the user did not change this key" to the existing value on file.
+
+**The third arm fires only on a confirmed negative.** A check still in flight is "unknown", not "unavailable", and never disables Apply — Apply is one button for the whole panel and must not gray out mid-check because of an edit on an unrelated tab. The arm also only applies while the provider dropdown is actually on the local-agent option; switching away clears it with no new check.
+
+**Consequence, stated plainly: because Apply is a single button for the whole panel, a confirmed-unavailable agent tool blocks saving edits on every tab — including tabs that have nothing to do with summarization.** A user whose selected agent tool is missing cannot save an exclude-pattern change, a DCO toggle, or a Memory Bank folder change until they install that tool or pick another one.
+
+**The rule is re-applied at the save chokepoint, not just on the button.** The Migrate-after-save and Sync-after-save chains issue a save directly, bypassing the button entirely, so the same gate is re-evaluated where the save is actually issued — otherwise those chains could still persist a local-agent provider whose tool nobody verified.
 
 ### Outbound webview messages
 
@@ -131,6 +168,8 @@ Disabled unless the form is dirty AND has no inline errors. A click runs a final
 | `signIn` | Webview → host | Starts the OAuth sign-in flow via the shared auth service. The card re-renders to the signed-in sub-state on success; the Jolli API key is auto-filled. |
 | `signOut` | Webview → host | Clears the persisted Jolli credentials. The card re-renders to the signed-out sub-state. |
 | `syncNow` | Webview → host | Triggers an on-demand sync round via the sync engine (cross-ref spec 174). The host owns the in-flight guard; the button stays clickable but a second invocation while one is mid-round is dropped. |
+| `probeLocalAgent` | Webview → host | Asks whether the tool currently held by the Agent tool dropdown actually runs on this machine. Carries the tool identifier, which the host allow-lists against the supported-tool registry before use. Host responds with `localAgentProbeResult` on every path except an identifier the registry does not know, which is dropped silently. |
+| `localAgentProbeResult` | Host → webview | Carries the tool identifier the answer is for plus an availability boolean. Drives the availability line, re-evaluates the Apply gate, and resumes a held save. Discarded by the webview when the identifier no longer matches the dropdown's current value. |
 | `settingsLoaded` | Host → webview | Initial population. Also carries the Memory Bank effective-state verdict (severity + text) computed by the host from the configuration it just loaded plus the workspace root. |
 | `setLocalFolder` | Host → webview | Picker result. |
 | `rebuildKnowledgeBaseDone` | Host → webview | Carries `success` and `message`. |
@@ -165,6 +204,7 @@ After Jolli-API-key validation passes, the host enumerates every worktree of the
 3. Compute the masked forms.
 4. Send `settingsLoaded` with the masked keys, the model alias (defaulting to "sonnet"), the max-tokens value (or null), the nine integration toggle states (defaults true), the agent-tool identifier (defaulting to the registry's default tool), the local-folder path (or empty), the Memory Bank effective-state verdict, and the comma-joined exclude patterns. The verdict is derived through the read-only peek path, so merely opening this panel cannot materialize the folder it reports on.
 5. If the cached full Jolli key is non-empty, run validation. On failure, send `settingsError` with `<message> (the key currently on disk is invalid — paste a new one and click Apply)`. This surfaces invalid-but-saved keys at open time so the user does not learn about the problem only when trying to save.
+6. On receipt, if — and only if — the loaded provider is the local-agent one, the webview dispatches one agent-tool availability check, so a panel opened against an already-missing tool reports it immediately instead of at the first Apply. This happens before the initial field state is captured, so it never marks the form dirty.
 
 ### Save (`applySettings`)
 
@@ -195,8 +235,23 @@ After Jolli-API-key validation passes, the host enumerates every worktree of the
 
 1. After a fresh load, the webview captures the initial state of every field.
 2. Every input or change event re-evaluates dirty (any field differs from its initial state) and re-runs inline validation.
-3. The Apply Changes button is enabled only when both dirty is true AND no inline error is present.
+3. The Apply Changes button is enabled only when dirty is true AND no inline error is present AND no confirmed-unavailable local-agent selection is blocking.
 4. After a successful save, the initial state is recaptured (so the form starts clean from the new values).
+
+### Held saves
+
+An Apply clicked while an agent-tool availability check is still in flight is **held, not refused**. The window is real — a single check can take on the order of a second or two — and the third Apply arm deliberately does not fire on an in-flight check, so without the hold a click in that window would persist a local-agent provider whose tool nobody had verified.
+
+1. The action bar shows the neutral message `Checking <Tool label>…`. Nothing is sent to the host.
+2. An eight-second watchdog is armed — only when a save is actually held, never on an ordinary check. Eight seconds is deliberately well past the worst observed single-tool check, so a slow-but-live check still wins the race.
+3. When the answer arrives, the held save re-enters the ordinary save path with a now-definite verdict, so it either issues normally or takes the confirmed-unavailable rejection with its existing wording. There is only ever one place a save is issued from.
+4. **Any edit that starts a new check drops the held save** — a tool switch, a switch to the local-agent provider, or a fresh panel load. The click was made against a form state that no longer exists, so silently re-targeting it at the new values would be wrong.
+5. **If the watchdog fires first**, the hold is abandoned with the error-coloured message `Couldn't verify <Tool label> — nothing was saved. Click Apply to try again.`, and the migrate-after-save / sync-after-save chains are disarmed. The watchdog exists because a lost reply would otherwise swallow the click with no save and no error, which the user cannot tell apart from a slow check.
+
+Interaction with the two follow-on chains:
+
+- Migrate-after-save and Sync-after-save treat a *held* save as under way and stay armed across the hold. They fire on the resumed save's success acknowledgement, and are disarmed at the resume point if the verdict turned the held save into a rejection.
+- **A host save-failure message does not cancel a hold.** That message describes a save that was actually issued; a held save has issued nothing, so an error arriving mid-hold belongs to an earlier submission. Cancelling on it would silently drop the newer held save. It does still disarm the two follow-on chains.
 
 ### Save feedback
 
@@ -214,6 +269,13 @@ After Jolli-API-key validation passes, the host enumerates every worktree of the
 | Validating | Form is clean (all fields match initial state) | Clean |
 | Validating | Form has errors | Dirty-with-errors |
 | Dirty | User clicks Apply Changes | Saving |
+| Dirty | User clicks Apply Changes while an agent-tool check is in flight | Save-held (neutral "Checking `<tool>`…" shown; nothing sent) |
+| Dirty | Agent-tool check confirms unavailable | Dirty-blocked (Apply disabled; the availability line carries the reason) |
+| Dirty-blocked | User picks another tool, or switches provider away from local-agent | Dirty (Apply re-enabled once a check clears or the arm stops applying) |
+| Save-held | Check answers available | Saving |
+| Save-held | Check answers unavailable | Dirty-blocked (red feedback; follow-on chains disarmed) |
+| Save-held | Any edit that starts a new check | Dirty (held save dropped) |
+| Save-held | Watchdog expires | Dirty (red "couldn't verify — nothing was saved"; follow-on chains disarmed) |
 | Dirty-with-errors | User clicks Apply Changes | Dirty-with-errors (red feedback shown) |
 | Saving | `settingsSaved` from host | Clean (initial state recaptured; green feedback shown briefly) |
 | Saving | `settingsError` from host | Dirty (red banner shown) |
@@ -235,6 +297,14 @@ The browse and migrate buttons run in parallel with the dirty-tracking machine; 
 - **The Memory Bank verdict is sent twice per panel session, and the second time is the point.** It rides `settingsLoaded` on open, and it rides the save acknowledgement as well — because changing the configured folder can flip the write boundary in **either** direction (pointing it inside the working tree starts refusing; pointing it back out resumes), and the save acknowledgement is the only host-to-webview message a save produces. Without the second send, the line would keep asserting the pre-save verdict until the panel was closed and reopened. (Notable.)
 - **The agent-tool dropdown is generated, so this form does not know the tool list.** Its options are derived from the tool registry rather than written out here, which is also why the visible label and the persisted identifier can diverge (`Cursor` → `cursor-agent`) without this form having to translate between them. A newly-supported tool appears in the dropdown with no edit to this form and no new option text to agree on. (Notable.)
 - **Choosing the local-agent provider saves with no credential at all.** That card collects nothing, so neither the Anthropic prefix rule nor the Jolli origin rule can reject it — the credential is the agent tool's own login, established outside this product. (Notable.)
+- **The agent-tool availability check is deliberately not part of loading the panel.** It costs a subprocess launch per tool asked about, and the card it reports on is hidden for every provider but one, so an unconditional check on open would spend that cost producing a line nobody can see. It runs on open only when the local-agent provider is already configured; otherwise it waits until the user actually selects that provider or changes the tool. (Surprising; intentional cost decision.)
+- **The availability line answers "does it run", never "am I signed in".** There is no uniform way to ask an agent tool about its login state, so a tool the line reports as fine can still fail at summarization time for want of a login. The card's hint line is the only warning about that. (Surprising; reality.)
+- **A confirmed-unavailable agent tool blocks Apply for the whole panel, not just the AI Summary tab.** Apply is one button for every tab, so an exclude-pattern edit, a DCO toggle, or a Memory Bank folder change cannot be saved while the selected agent tool is missing. Narrowing the block to its own tab would require per-tab saves, which this panel does not have. (Surprising; consequence of the single-button design.)
+- **A check in flight never blocks Apply, and that is what makes held saves necessary.** Graying Apply out mid-check would make the button flicker for reasons unrelated to what the user is editing, so "unknown" is treated as passable at the button — and the resulting window is closed at the save chokepoint by holding the click until the answer lands rather than by refusing it. (Notable.)
+- **The Apply gate is enforced twice, and the second enforcement is the load-bearing one.** The button's disabled state only stops a direct click; Migrate-after-save and Sync-after-save issue saves without touching the button. Re-checking at the point the save is actually issued is what stops those chains from persisting an unverified local-agent selection. (Notable.)
+- **A host save-failure does not cancel a held save, on purpose.** That message can only describe a save that was already issued, so treating it as an answer to a hold would silently discard the newer, still-pending click. The hold is left to be judged by its own check. (Surprising; intentional.)
+- **The availability check answers everything except an unrecognized identifier and a reply nobody is left to receive.** Every other outcome — including an unreadable configuration, which answers "not available" rather than optimistically available — sends a reply, because a held save may be waiting on one and a swallowed reply would strand it until the watchdog fires. An unknown identifier cannot be a real dropdown selection, so nothing can be waiting on it. (Notable.)
+- **An explicitly configured executable path is scoped to one tool.** It reaches the check only when it names the tool being checked; switching the dropdown falls back to ordinary discovery rather than borrowing the other tool's path, which would answer wrongly in both directions. (Notable.)
 - **Applying settings while the repository is manually disabled writes the configuration but touches no hooks.** The hook-sync step returns before enumerating worktrees, in both directions. So the toggle states persist and take effect the moment the repository is re-enabled, and in the meantime the on-disk hook state deliberately disagrees with the toggle state — the opposite of the invariant the hook sync normally maintains. (Surprising; intentional. See 304.)
 - **Default elision is intentional.** Saving "sonnet" as the model alias writes `undefined` to the field, not the literal string. The motivation is so a future change to the default propagates automatically to anyone who never picked an explicit value. The same applies to empty max-tokens, empty local folder, and an empty exclude list. (Notable.)
 - **Migrate button is disabled while running.** The webview disables the button immediately on click, sets a "Rebuilding…" status, and only re-enables it when the host responds. The host's migrate action can take noticeable time on large repos; multiple in-flight migrations would corrupt the orphan-branch indirection. (Notable.)
@@ -253,5 +323,7 @@ The browse and migrate buttons run in parallel with the dirty-tracking machine; 
 - **Memory Bank sync engine** — the Sync Now button, the auto-sync toggle, the poll-interval input, and the include-transcripts toggle are the user-facing controls for the sync engine; the engine itself, the round lifecycle, the conflict / offline / failed states, and the personal-space lock semantics are owned by spec 174.
 - **Shared auth service** — sign-in / sign-out / `authStateChanged` are owned by the auth service shared with the sidebar onboarding panel; this webview is one of two surfaces the service drives.
 - **Memory Bank effective state (spec 300)** — owns the write-boundary decision, the three-armed state, the severity vocabulary, the shared wording table, and the read-only peek guarantee. This form renders that verdict and adds no wording of its own.
-- **Local-agent tool registry** — the single source for each supported tool's identifier and display label, shared with the status surfaces that name the active tool; this form only projects it into a dropdown.
+- **Local-agent tool registry** — the single source for each supported tool's identifier and display label, shared with the status surfaces that name the active tool; this form only projects it into a dropdown and uses it to allow-list the identifier the availability check is asked about.
+- **Local Agent CLI Provider Backend (spec 280)** — owns the "does this agent tool actually run" predicate this form's availability line reports, including how each tool's executable is discovered, what the capability probe accepts, and how an explicit executable path is bound to its owning tool. This form adds only when the check is dispatched, how its answer is displayed, and what it gates.
+- **Onboarding panel (spec 142)** — the other surface that offers the local-agent provider and tool choice. It runs the same runnability check, but only for the one tool the user selects, and reports failure inline on its own card rather than through this line.
 - **Manual-disable opt-out (spec 304)** — owns the durable opt-out and the inventory of writes suppressed while it is set, including this form's hook-sync skip and the carve-out that leaves the machine-global configuration and instruction writes running.

@@ -127,6 +127,17 @@ Setting or removing `globalInstructions` is the one config key whose update has 
 
 This is the CLI-side opt-in surface for the block, mirroring the VS Code Settings toggle. The block is written only because the user explicitly set this key here — it is never written by a bare `jolli enable`, which only *applies* an already-persisted decision. The block content, target files, and host gating are spec 241; the tri-state switch semantics are spec 242.
 
+### Coupling between `localAgentTool` and `localAgentPath`
+
+These two keys are not independent at save time, and this command is one of several writers subject to the rule rather than its owner (spec 308 owns it). The shared write path applies one invariant on every configuration write, whoever performs it:
+
+- An update that **changes the effective value of `localAgentTool`** and does **not** itself supply `localAgentPath` also **clears** any stored `localAgentPath`, because that path names one specific tool's binary and records no owner.
+- Supplying **both keys in the same update** keeps the incoming path — that is how a tool and its explicit binary are configured together. On this command, that means `--set localAgentTool=… --set localAgentPath=…` in one invocation (the flags are repeatable and merged into a single atomic update) preserves the path, whereas setting the tool alone discards it.
+- Re-writing the **same** tool value never discards a path, so an idempotent write is safe.
+- Key **presence** is what counts, not whether a value is defined. `--remove localAgentTool` is therefore a *change* to the tool key (back to the default) and will clear a stored path if the previous tool was not already the default; `--remove localAgentPath` on its own touches nothing else.
+
+The practical consequence for this command: after `--set localAgentTool=…` alone, a subsequent `jolli configure` display will show no `localAgentPath`, even though the user never removed it.
+
 ### Configuration scope
 
 The configuration is global to the user, not per-project. There is no `--cwd` flag on `configure`. The path printed by `Config updated:` and `Location:` is the global config file inside the user's home Jolli directory.
@@ -147,12 +158,14 @@ The configuration is global to the user, not per-project. There is no `--cwd` fl
 - **The default boolean for *Enabled keys is "enabled".** A key that is absent from the config is treated as `true` by the rest of the system; setting it to `false` is the only way to opt out of an integration.
 - **Display masking is recognizability-preserving.** The first 6 and last 4 characters are kept so a user can confirm at a glance which key is stored without exposing the full secret in screenshots or logs.
 - **`globalInstructions` is the only key with a filesystem side effect.** Every other key only mutates `config.json`; setting `globalInstructions` also writes to or removes from the AI hosts' global instruction files as part of the same command, synchronously, before the success line prints.
+- **Setting `localAgentTool` alone silently clears `localAgentPath`.** It is the one key whose update can remove a *different* key's value, and the removal is not reported in this command's one-line success output. Batching both keys in the same invocation is the way to keep the path — see the coupling section. This command is also the only surface that can *set* an explicit path at all; every other writer of the tool key either omits the path or clears it.
 
 ## Shared Behavior
 
 - The Jolli-API-key validation rule (origin allowlist + recognized shape + HTTPS-only with suffix-boundary host check) is the same rule used everywhere a Jolli API key can be stored in the CLI, the VS Code extension, and the IntelliJ plugin.
 - The `slack.workspaceUrl` validation rule (HTTPS-only + suffix-boundary host check) mirrors the shape of the Jolli-API-key validation rule above, applied to the `slack.com` host family instead of the Jolli origin allowlist.
 - The `localAgentTool` accepted set is the single agent-tool registry shared with the interactive provider setup picker (spec 57), the diagnostic command's credential label and sign-in hints (spec 59), and the runtime backend that actually drives the chosen tool (spec 280).
+- The tool/path clearing invariant applied to this command's writes is owned by spec 308, which also lists the other writers subject to it; how a stored path is attributed to a tool at read time is spec 280. The diagnostic command's failure message names `--remove localAgentPath` as its remedy (spec 59).
 - The set of valid keys is kept in lockstep with the configuration type used internally; adding a new field there requires adding it to this command's whitelist before users can set it.
 - The path printed by `Config updated:` and `Location:` is the same global path printed by `jolli enable`'s skip-and-configure-later guidance.
 - The persisted `slack.workspaceUrl` value is read back and used, as one of two link-resolution fallbacks, by the Slack thread-reference capture pipeline (spec 256), which reconstructs a thread's shareable link from this base address when no permalink was pasted into the conversation.

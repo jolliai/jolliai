@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-The Commit Memory side panel that opens beside the editor and renders one summary at a time — properties header, quick recap, plans and notes, e2e test guide, source commits (when the summary was assembled from a tree of children), topic cards (collapsible), and a footer — and offers in-panel actions to edit topics, copy or download the markdown, push to Jolli Cloud and (optionally) a local folder, and create or update a pull request whose body aggregates every reachable branch summary into one document.
+The Commit Memory side panel that opens beside the editor and renders one summary at a time — properties header, task-usage meter, quick recap, plans and notes, e2e test guide, source commits (when the summary was assembled from a tree of children), topic cards (collapsible), and a footer — and offers in-panel actions to edit topics, detach a single conversation from the memory, copy or download the markdown, push to Jolli Cloud and (optionally) a local folder, and create or update a pull request whose body aggregates every reachable branch summary into one document.
 
 ## Scope
 
@@ -11,8 +11,11 @@ The Commit Memory side panel that opens beside the editor and renders one summar
 - The opening behavior in each slot — single-instance for memory, one-tab-per-commit for commits — and what happens when the user clicks the same item twice.
 - The view column the panel opens in and the panel title, "Commit Memory".
 - Light/dark theme adaptation tied to the editor's CSS variables.
-- The static section layout: optional top-of-page error banner, all-conversations section, properties header, quick recap, pull-request panel, plans & notes, e2e test guide, source commits, topics list, footer.
+- The static section layout: optional top-of-page error banner, all-conversations section, properties header, task-usage meter, quick recap, pull-request panel, plans & notes, e2e test guide, source commits, topics list, footer.
+- The task-usage (token) meter: its three render states, the tree-wide aggregation it reads, its bar-width denominator, and its help tooltip.
 - The inbound message types the panel accepts from the webview, what each one mutates on the persisted summary, and which messages produce a partial in-place rewrite vs. a full re-render.
+- The per-conversation detach action offered on each conversations row, its acknowledgement, and the in-place meter swap that rides on it.
+- Which stored conversation records the conversations list and the per-source count chips deliberately hide.
 - The collapsible behavior on topic cards and the "expand / collapse all" toggle.
 - The AI context-relevance display layer inside the Context panel: a tier chip (High / Med / Low) + one-line reason under each *kept* plan / note / reference row (sourced from the summary's `contextRelevance` record), and each *soft-excluded* item rendered as an inline dimmed, struck-through row with an "Excluded" chip, an optional reason, and a single delete affordance (sourced from the summary's `excludedContext` record). Fail-open (empty-reason) verdicts render no chip/reason.
 - The `removeExcludedContext` action: dropping one soft-excluded entry from *this commit's* `excludedContext` and re-persisting, without touching the working plan/note/reference registry, behind the same stale-commit + confirm-modal guards as remove-plan / remove-note.
@@ -33,6 +36,8 @@ The Commit Memory side panel that opens beside the editor and renders one summar
 - The PR comment-marker contract that wraps body text — owned by the PR comment topic.
 - The binding chooser webview that opens when Jolli Cloud reports `412 binding_required` — that is a separate webview with its own topic.
 - The lock-file probe semantics — owned by the lock-file guard topic.
+- The token/cost arithmetic behind the meter: segment semantics, the flat-rate estimator and its formatters (spec 243), the per-model price table and the per-node / per-bucket preference rules and tooltip wordings (spec 257), and the tree-aggregation helpers (spec 04).
+- What a detach does to the persisted figures — ownership resolution, subtraction, cost re-derivation, write ordering, and the permanent-failure outcome and its notification gate (spec 306). This spec owns only the row's UI contract.
 - The settings webview, note editor webview, and any other webview surface.
 
 ## Data Contracts
@@ -62,14 +67,22 @@ The two slot lifetimes are independent — opening a panel in one slot never dis
 1. **Summary-error banner** (only when the persisted summary carries the LLM-failure marker; suppressed for healthy summaries). One row with a warning icon, a short status sentence ("Summary generation failed during the last attempt. …"), and — in normal mode only — a Regenerate button. In read-only modes the call-to-action text is shortened and the button is omitted, so the banner still tells the user the summary is degraded but does not promise an action they cannot take.
 2. **All conversations** (only when transcripts exist for any commit in the tree).
 3. **Header / properties** — its first element is the memory's **reference chip**, prefixing the commit message on the same line. This surface uses the always-present variant, so the chip is there for every memory: the backend-minted identifier once the memory has been pushed to a Space, and the commit-hash fallback form until then. The chip's format, rendered text, accessible name, hover hint, keyboard activation, clipboard payload, and confirmation are owned by **Memory Reference Identifier and Copy Chip** (301). After it: commit message, commit hash, branch, author, date, duration, files changed and ±lines, optional turn count, optional Jolli Memory article URL plus published plan / note URLs, and the push button whose label is "Share in Jolli" or "Update on Jolli" depending on whether a Jolli article URL is stored on the summary.
-4. **Horizontal separator.**
-5. **Quick recap** (only when the summary has a recap; placeholder with a Generate button when not).
-6. **Pull-request panel** — Create / Update / Check status buttons, dynamically populated.
-7. **Context** — plans, notes, and references, in one panel with a header count chip and an "add" affordance. Rendered unconditionally: the panel and its header always appear, even when the summary has zero plans, notes, and references, in which case the body shows an empty state instead of the section being omitted. Kept rows are ordered plans → notes → references; reference rows within that block are ordered by the built-in source registry (see "Reference ordering"). Each kept row carries a second meta line — an AI relevance tier chip + one-line reason — when the summary records a verdict for it. AI soft-excluded items render *after* the kept rows as inline dimmed, struck-through "Excluded" rows (see "AI context-relevance display"), replacing the earlier collapsed "AI excluded N" disclosure.
-8. **E2E test guide** (only when the summary has one).
-9. **Source commits** (only when the summary aggregates more than one source — i.e. it is a squash or branch-aggregate).
-10. **Topics** — every topic in the tree, sorted, each in its own collapsible card. Header shows `<emoji> Topic / Topics <count>` and an "Expand All / Collapse All" button.
-11. **Footer.**
+4. **Task-usage meter** — sits between the header's title line and its property rows. Three states, and no other:
+   - **Segmented**: the tree carries per-segment data → a compact total, a compact cost figure, a three-part bar (input / output / cached) and a legend naming each segment's count.
+   - **Total-only degrade**: the tree carries a positive total but no segment data anywhere → the same head line with a single full-width bar. A split is never fabricated.
+   - **Empty**: the tree's aggregated total is not positive → a "task usage not reported" line with **no bar and no dollar figure at all**, plus a help tooltip saying there is nothing to total. The absence is stated, never priced at zero.
+
+   Both the total and the cost are aggregated over the **whole consolidation tree**, not the root's own values: a squash / amend / rebase memory carries its tokens on its folded children, so reading only the root would show "not reported" for a memory the sidebar reports a large figure for. The bar's segment widths are denominated by the **breakdown's own** sum rather than the headline total — the headline can legitimately exceed it when some folded conversations report only a scalar count — and the last segment absorbs the rounding remainder so the widths always sum to a full bar. The head line carries a help affordance whose tooltip explains that cache reads are excluded because they double-count, plus one of three cost caveats naming which sources fed the figure (owned by spec 257).
+
+   Segment widths travel as data attributes and are applied by the client script rather than as inline styles, because the panel's content policy admits no inline styles.
+5. **Horizontal separator.**
+6. **Quick recap** (only when the summary has a recap; placeholder with a Generate button when not).
+7. **Pull-request panel** — Create / Update / Check status buttons, dynamically populated.
+8. **Context** — plans, notes, and references, in one panel with a header count chip and an "add" affordance. Rendered unconditionally: the panel and its header always appear, even when the summary has zero plans, notes, and references, in which case the body shows an empty state instead of the section being omitted. Kept rows are ordered plans → notes → references; reference rows within that block are ordered by the built-in source registry (see "Reference ordering"). Each kept row carries a second meta line — an AI relevance tier chip + one-line reason — when the summary records a verdict for it. AI soft-excluded items render *after* the kept rows as inline dimmed, struck-through "Excluded" rows (see "AI context-relevance display"), replacing the earlier collapsed "AI excluded N" disclosure.
+9. **E2E test guide** (only when the summary has one).
+10. **Source commits** (only when the summary aggregates more than one source — i.e. it is a squash or branch-aggregate).
+11. **Topics** — every topic in the tree, sorted, each in its own collapsible card. Header shows `<emoji> Topic / Topics <count>` and an "Expand All / Collapse All" button.
+12. **Footer.**
 
 ### Topic flattening
 
@@ -89,6 +102,42 @@ The Context panel decorates its rows from two per-commit records on the summary 
 ### Reference ordering
 
 Reference rows are ordered by the **built-in source registry**, which doubles as the render allowlist: the panel iterates the registry in its canonical order (linear → jira → github → notion → slack → zoom-meeting → zoom-doc → asana → …) and emits each source's references in that order, preserving within-source order. A reference whose `source` is **not** a registered built-in — e.g. a crafted value from a tampered orphan branch or a shared Memory Bank — is dropped and never rendered into the webview DOM. This replaced an earlier hand-maintained five-source allowlist (linear / jira / github / notion only), which silently dropped every other registered source; deriving the order from the registry means a newly-registered source appears with no further edit while keeping the drop-unknown-sources security property.
+
+### Conversations list membership
+
+The conversations rows and the per-source count chips are both built from the
+stored conversation records of every commit in the tree, collapsed to one row per
+producer-and-id pair (a conversation split across several commits has its turns
+merged, and the row keeps the first-seen owning commit). Two membership rules
+matter:
+
+- **A turn-less usage carrier is hidden.** The commit pipeline persists a
+  record with no turns for a conversation that spent tokens without producing a
+  readable turn, purely so a later detach has a subtrahend (see spec 245). Such a
+  record would otherwise render as an empty conversation row, so it is filtered out
+  of the list and never increments a count chip.
+- **The predicate is narrow, and that narrowness is load-bearing.** A record is
+  treated as a carrier only when it has **no turns AND records a usage share**. A
+  record with no turns and **no** share is older or malformed data — a real
+  conversation — and is deliberately still listed, with a turn count of zero.
+- **"Records a usage share" means specifically the per-segment breakdown**, not a
+  share of any kind. The write side gates the breakdown and the per-model split
+  independently (see spec 245), so a record can carry the per-model split alone —
+  and this filter would not recognise such a record as a carrier. No reachable write
+  path produces that shape *together with* zero turns today, since a turn-less
+  carrier is minted only for a conversation whose segments sum above zero, so the
+  mismatch is latent rather than live; it is the same missing cross-check that costs
+  a detach its subtrahend.
+
+Two further details follow from the merged view:
+
+- The filter is applied to the **merged** turns, not per record: a conversation
+  that is turn-less in one commit's records and real in another must still appear.
+  For the count chips, which avoid a second grouping pass, this means a
+  carrier-shaped record does not mark its conversation as seen, so a later record
+  carrying the real turns still counts it.
+- The detach action reads the stored records **directly and unfiltered**, so a
+  hidden carrier record remains subtractable.
 
 ### Inbound webview messages
 
@@ -111,6 +160,8 @@ The webview posts these messages to the extension host. Each lists the persisten
 | `addMarkdownNote`, `saveSnippet`, `loadNoteContent`, `saveNote`, `previewNote`, `removeNote`, `translateNote` | Persisted note content / association / title; `removeNote` requires a confirmation modal and marks the note as ignored. | Various `noteContentLoaded`, `noteSaved`, `noteTranslating`, `noteTranslated`, `snippetSaved` messages. |
 | `removeExcludedContext` (`{ kind, key, title }`) | Drops the matching entry from *this commit's* `excludedContext` and re-persists the summary; the working plan/note/reference registry is **untouched**. Behind the same stale-commit guard + confirmation modal as `removePlan` / `removeNote`. A key already absent (stale DOM) is a silent no-op — no modal, no write. | Partial in-place Context refresh. |
 | `loadTranscriptStats`, `loadAllTranscripts`, `saveAllTranscripts`, `deleteAllTranscripts` | None / persisted transcript map updates. | Stats summary, full transcript dump, save / delete confirmations. |
+| `loadConversations`, `openConversation` | **None** — both are reads. The first fills the conversations rows (titles resolved through the same helper the sidebar uses, so the two surfaces show identical labels); the second opens one row's archived turns in a separate read-only panel. | Conversations data for the rows; a new read-only panel. Both are permitted in foreign-readonly mode. |
+| per-conversation detach request (identifies the memory plus the conversation's **producer-and-id pair**) | Removes that one conversation (matched on the pair, not the bare id) from every stored conversation record of this memory's tree — rewriting records that still hold conversations, deleting those left empty — then performs **one** summary write carrying both the transcript-id removal and the corrected token/cost figures (spec 306 owns that correction). Behind the stale-commit guard, and excluded from both the foreign-readonly and the regenerate-in-flight allow-lists, since it writes storage. | A detach acknowledgement naming the row, carrying a rebuilt token-meter fragment **only when the figures actually changed**. A no-match (already detached / stale row) still acknowledges so the row is cleared rather than left stuck. A failed record write surfaces an error toast and no acknowledgement. A failed summary write always acknowledges the row, but only *warns* the user when the figures had actually been corrected — when nothing was attributable, the write that carried only the id removal fails silently, with a log line and no notification. |
 | `checkPrStatus`, `prepareCreatePr`, `createPr`, `prepareUpdatePr`, `updatePr` | Pull-request side-effects on the forge. | Per-step messages back: status, title and body for the form, success or error after submission. |
 
 ### Push behavior
@@ -174,6 +225,7 @@ Every inbound message routes through a single dispatcher that catches rejections
 | Per-scenario E2E delete | Whole E2E section replaced (indices shift after removal). |
 | Topic delete | Full re-render (topic indices and counts change). |
 | Plan / note / reference add, remove, save, translate, or `removeExcludedContext` | Partial in-place refresh, not a full re-render: the Context section (plans, notes, references, kept-row relevance chips, and inline soft-excluded rows) is rebuilt and swapped in place — this is also how a translation is reflected, since the translate-needed state feeds the same rebuild — paired with a row-update of the properties-header's published-link list. The refresh message also carries the recomputed Context count so the out-of-section count chip stays in sync (see Context chip count above). |
+| Conversation detach | **Two surgical in-place edits, no full re-render.** The acknowledged row is removed by matching the producer-and-id pair (a bare-id match could remove the wrong row, since two producers can mint the same raw id), the conversations count chip is decremented to the surviving row count, and an empty list is replaced by an empty-state line. When the acknowledgement carries a rebuilt meter fragment, the existing meter element is replaced by it and the meter's help affordance is re-initialised **scoped to the replaced element only** — re-scanning the whole page would bind a second listener to every other pinnable popover, making each click toggle twice. When no fragment is carried (nothing was attributable), the meter is left showing its current value. A full re-render is deliberately avoided so a single-row change does not collapse scroll position and expanded sections. |
 | Push success | Full re-render so PR section picks up the published Jolli URL and plan/note URLs. |
 
 ### Push orchestration
@@ -223,6 +275,13 @@ The push lifecycle has its own micro-state: idle → pushing (re-entrancy flag s
 - **Re-entrancy guard on Push.** A second click while the first push is in flight is silently dropped. The guard clears in a `finally` so it always lifts even on failure. (Notable.)
 - **Plan push deduplicates same-named snapshots.** After a squash, the same logical plan appears once per source commit — same title, different slug (the slug embeds the commit hash). Before uploading, the plan list is collapsed to one entry per base name (the latest snapshot, by last-updated timestamp). If an older snapshot was previously pushed and carries a server-assigned id, the latest snapshot inherits that id so the push updates the existing document rather than creating a duplicate that the server would reject. (Notable; dedup applies to both the upload set and the pushed article's Context link list — the local summary still stores all snapshots.)
 - **Per-attachment plan and note failures are collected, not thrown.** Each plan and note upload is independently wrapped so a single failure (e.g. a server error on one plan) does not abort the remaining uploads or the summary push. Failures are gathered and surfaced as a modal warning after the push completes — not a transient toast, because the panel re-renders to "Synced" and a toast would disappear before the user sees it. Only fatal errors (`binding_required`, plugin-outdated) still propagate and abort the whole push. (Notable.)
+- **The task-usage meter aggregates the whole tree, and its bar is denominated by the breakdown rather than the headline.** Reading the root's own values alone would show "not reported" for any consolidated memory (its tokens live on the folded children), and dividing the bar's widths by the headline total would under-fill the bar whenever some folded conversation reported only a scalar count. Two different denominators for two different questions. (Surprising; intentional.)
+- **The meter's empty state shows no dollar figure at all.** A memory with no reported usage says so in words rather than displaying a priced zero, which would read as a measurement. (Notable.)
+- **A detach is a surgical DOM edit, not a re-render — and the meter is only swapped when the figures really changed.** Omitting the swap is the honest rendering of "the removed conversation's share could not be attributed", so the meter keeps its previous value rather than being replaced by a guess. (Notable; the correction itself is spec 306.)
+- **Row identity for the detach is the producer-and-id pair, on both sides.** The host matches stored records that way and the webview removes the row that way; a bare-id match could detach or remove the wrong conversation, because two producers can mint the same raw conversation id. (Notable.)
+- **A detach that matches nothing still acknowledges the row.** An already-detached or stale row would otherwise stay on screen forever inviting a retry that can never succeed. (Notable.)
+- **A detach whose summary write fails is reported to the user only when a correction was lost with it.** When the removed conversation's share was attributable, the conversation really is gone from the stored records while the memory's figures still include it, permanently — and the panel shows a warning rather than leaving a silently-wrong number behind a log line. When nothing was attributable, the failing write carried only the transcript-id removal, and the user is shown nothing at all: a log line is the whole report, and the memory keeps a dangling id plus figures that stay wrong. (Surprising; the silent branch is a reporting gap, not a designed exemption. The permanence is explained in spec 306.)
+- **Turn-less usage carrier records are hidden from the conversations list and the count chips, but stay subtractable.** A record with no turns *and* a recorded per-segment usage share exists only so a detach has a subtrahend; a record with no turns and no such share is real (older) data and is still listed with a turn count of zero. The narrow predicate is what keeps legacy conversations visible — and it keys on the per-segment share alone, so a record carrying only a per-model split would slip through it (latent today, since nothing mints that shape turn-less). (Surprising; intentional. See spec 245.)
 - **Transcript history is not filtered by per-source enable flags.** Both the lightweight stats load and the full Manage-modal transcript load include every session archived at commit time, regardless of whether the session's source (e.g. Cursor, Codex) is currently enabled in settings. The enable flags govern future capture only; filtering already-archived history by them under-counted sessions in the stats display and — paired with Save All — caused sessions from disabled sources to be silently deleted on save. (Notable.)
 - **Translation removes its trigger immediately.** Once a plan or note is translated, the panel removes it from the translate-button-needed set so the button doesn't flash back on the next render — even before the cache refresh has run. (Notable.)
 - **Worker-busy interaction on PR actions re-runs the status check.** The user clicked a button that flipped to "Loading…"; if the action is rejected by the lock guard, the panel re-fires `checkPrStatus` so the button rebuilds itself in its true pre-click state instead of staying stuck on "Loading…". (Notable.)
@@ -253,4 +312,6 @@ The push lifecycle has its own micro-state: idle → pushing (re-entrancy flag s
 - **Push to Jolli Cloud** — the publish pipeline that the "Share in Jolli" / "Update on Jolli" button drives; persisting the returned article URL on the summary is what flips the button's label on the next re-render. See spec 94.
 - **Conversation overlay store** — the per-session sidecar of user-authored edits and deletions that the conversations modal reads and writes; the modal is the UI surface, the overlay store is the data layer. See spec 183.
 - **Memory reference identifier and copy chip** — the chip that prefixes this panel's title, its two format variants, its activation and clipboard contract, its confirmation, and its telemetry are owned by spec 301. This spec owns only the chip's position in the header and the copy notification's exemption from the two message-level gates.
+- **Task-usage meter arithmetic** — the token segments and their formatters come from spec 243, the per-model price table and the per-node / per-bucket cost preference (and the three tooltip wordings) from spec 257, and the tree-aggregation helpers the meter walks from spec 04. This spec owns only the meter's placement, its three render states, and its in-place replacement on a detach.
+- **Conversation detach correction** — subtracting a detached conversation's persisted share from the owning node, re-deriving the cost, the records-before-summary write ordering, and the permanent-failure outcome are owned by spec 306; the share it consumes is written by spec 245. This spec owns the row's action, its acknowledgement, and the DOM edit.
 - **Summary-error marker** — the persistent flag on the summary that the error banner uses to decide whether to render itself; the marker is written by the post-commit / amend / squash pipeline whenever the LLM call fails and the resulting summary is empty-topics or mechanically assembled.

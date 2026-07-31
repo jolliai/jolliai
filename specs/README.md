@@ -1,6 +1,6 @@
 # Spec corpus index
 
-305 behavioral specifications reverse-engineered from this repository's actual code, grouped below by
+309 behavioral specifications reverse-engineered from this repository's actual code, grouped below by
 theme and ordered by number within each group.
 
 **These specs document reality, not intent.** Every statement in them was derived from — and is meant
@@ -53,11 +53,13 @@ gate a change.
 - [14 — AI Commit Message Generation](14-ai-commit-message-generation.md) — generate a 50–72 character imperative subject from the staged diff alone, presented for editing before any commit happens.
 - [15 — Recap Paragraph Generation](15-recap-paragraph-generation.md) — the short narrative produced at initial generation, regenerated at squash time, and available as a standalone on-demand call.
 - [25 — Plan Progress Evaluation](25-plan-progress-evaluation.md) — classify every plan step as completed / in-progress / not-started against the commit, persisting the result as a sidecar.
-- [243 — Token Usage Extraction and Cost Estimation](243-token-usage-extraction-and-cost-estimation.md) — the Sonnet-rate per-turn token/cost estimator and the formatters that render counts and costs.
+- [243 — Token Usage Extraction and Cost Estimation](243-token-usage-extraction-and-cost-estimation.md) — the flat-rate token/cost estimator, its formatters, and the per-model-response de-duplication that stops one billed call being counted once per content block.
 - [244 — Conversation Token Totals for the Review Panel](244-conversation-token-totals-for-review-panel.md) — sum real per-conversation token usage across a caller-supplied transcript set, tolerating per-file read failures.
 - [245 — Commit-Pipeline Conversation Token Attribution](245-commit-pipeline-conversation-token-attribution.md) — drop excluded conversations and overlay-deleted turns from the stored token total while still advancing every cursor.
 - [257 — Multi-Provider Pricing and Cost Estimation](257-multi-provider-pricing-and-cost-estimation.md) — the hand-maintained per-model USD price table keyed by transcript model id, plus the uniform cost formula.
-- [258 — AI Context-Relevance Filtering](258-ai-context-relevance-filtering.md) — one batch LLM call tiers and soft-excludes low-relevance context items, failing open so any error keeps everything.
+- [258 — AI Context-Relevance Filtering](258-ai-context-relevance-filtering.md) — one batch LLM call, now issued for every provider, tiers and soft-excludes low-relevance context items; a least-affinity-first pre-ordering decides who the prompt budget is spent on, and any error keeps everything.
+- [306 — Conversation Detach Usage Correction](306-conversation-detach-usage-correction.md) — correcting a committed memory's recorded token and cost figures when one conversation is detached: per-node ownership of the persisted share, the unattributable cases it refuses to guess at, and cost re-derived rather than scaled.
+- [308 — Local-Agent Tool / Explicit-Path Ownership Invariant](308-local-agent-tool-path-ownership.md) — the persisted agent-binary path records no owning tool, so one write-time rule clears it whenever the tool changes; its exemptions, its writers, and the read-side attribution it underwrites.
 - [280 — Local Agent CLI Provider Backend](280-local-agent-cli-provider-backend.md) — a third execution backend that drives a locally-installed agent CLI headlessly, authenticated by its own subscription login.
 - [286 — Local-Agent Login-Expiry Remediation Guidance](286-local-agent-login-expiry-remediation.md) — persist an auth-expired placeholder summary and surface one shared remediation message inline and at next session start.
 - [291 — Generation Repair Ladder](291-generation-repair-ladder.md) — the shared interactive ladder that diagnoses which of three provider/credential mismatches applies and offers the smallest fix in one prompt.
@@ -320,8 +322,8 @@ gate a change.
 - [106 — AI Commit From Checkbox Selection](106-vscode-ai-commit-from-checkbox-selection.md) — snapshot the index, stage exactly the checked files, generate a message, gate the Amend options, and roll back on cancel or error.
 - [107 — Push Command With force-with-lease](107-vscode-push-command-with-force-with-lease.md) — detect when a force-push is genuinely required and only proceed after a modal naming the at-risk commit, always with a remote-ref lease.
 - [108 — Squash Multi-Commit Flow](108-vscode-squash-multi-commit-flow.md) — require two or more commits, warn on already-pushed ones, generate a message with mechanical fallback, and write the pre-squash hand-off file.
-- [109 — Summary Webview Panel](109-vscode-summary-webview-panel.md) — the Commit Memory side panel rendering one summary with in-panel edit, copy, download, push, and create-or-update-PR actions.
-- [110 — Settings Webview](110-vscode-settings-webview.md) — edit the per-user config with no workspace overrides, validating the Jolli API key against the HTTPS host allowlist before any disk write.
+- [109 — Summary Webview Panel](109-vscode-summary-webview-panel.md) — the Commit Memory side panel rendering one summary with in-panel edit, copy, download, push, create-or-update-PR, a per-memory usage meter, and per-conversation detach.
+- [110 — Settings Webview](110-vscode-settings-webview.md) — edit the per-user config with no workspace overrides, validating the Jolli API key against the HTTPS host allowlist before any disk write, and gating Apply on a live agent-tool availability check that can hold a save mid-probe.
 - [111 — Note Editor Webview](111-vscode-note-editor-webview.md) — two note kinds: inline text snippets authored in a webview, and markdown-file notes linked via picker without copying.
 - [112 — Lock File Block During Commit / Squash / Create PR](112-vscode-lock-file-block-during-commit.md) — abort those three actions while the summary-drain lock is live; Push is deliberately ungated and ingest never trips the guard.
 - [113 — Cross-Project Plan Attribution](113-vscode-cross-project-plan-attribution.md) — register a new global plan file only if its absolute path appears JSON-escaped in one of this workspace's recent transcripts.
@@ -330,7 +332,7 @@ gate a change.
 - [116 — Status Bar Items](116-vscode-status-bar-items.md) — one fixed-priority left-side entry showing enabled state, layering a four-state Memory Bank sync visual once the sync engine takes ownership.
 - [117 — Binding Chooser Webview](117-vscode-binding-chooser-webview.md) — a per-repo singleton that lets the user pick a space when a push is rejected unbound, then closes so the push retries automatically.
 - [134 — JolliMemory Bridge Data Abstraction](134-vscode-jollimemory-bridge-data-abstraction.md) — one per-workspace object funneling every git, storage, and install operation so no command spawns git or imports a backend itself.
-- [142 — Onboarding Panel](142-vscode-onboarding-panel.md) — a full-viewport panel replacing the tabs when unconfigured, offering the local-key path above sign-in, with disabled and loading siblings.
+- [142 — Onboarding Panel](142-vscode-onboarding-panel.md) — a full-viewport panel replacing the tabs when unconfigured, offering up to three paths (a detected local agent tool first, then the local key, then sign-in) with exactly one card ever badged.
 - [143 — Anthropic API Key Panel](143-vscode-anthropic-api-key-panel.md) — a sidebar sub-view capturing an Anthropic key during onboarding for the machine-global config.
 - [144 — Auto-Enable on Activation](144-vscode-auto-enable-on-activation.md) — auto-install hooks on activating a git workspace via the same path the explicit Enable uses, suppressed only by the repo-wide manual-disable flag.
 - [145 — Repo-Wide Manual Disable Flag](145-vscode-manual-disable-flag.md) — one canonical boolean in a repo-wide profile file that every hook and worker checks in its own hot path, shared across worktrees and surfaces.
@@ -355,9 +357,9 @@ gate a change.
 - [118 — Tool Window Layout](118-intellij-tool-window-accordion.md) — a three-segment view switch over three collapsible sections sharing one scroll bar, with status, no-git, and onboarding takeovers.
 - [119 — First-Run Onboarding Card](119-intellij-onboarding-wizard.md) — a single card offering the Anthropic-key path beside sign-in, flipping back to the accordion the instant either yields a credential.
 - [120 — Embedded HTML Summary View](120-intellij-summary-viewer-embedded-html.md) — a self-contained interactive page for one memory, bridging to the host over a base64-tunneled message channel.
-- [121 — Summary Virtual-File Editor](121-intellij-summary-virtual-file-editor.md) — a virtual file, a class-scoped editor provider, and a read-only editor so a memory row opens through the IDE's standard file path.
+- [121 — Summary Virtual-File Editor](121-intellij-summary-virtual-file-editor.md) — one memory tab per project: every open site routes through a shared path that swaps the open tab's content in place rather than stacking a second tab, so two memories can no longer be viewed side by side.
 - [122 — Changes Panel](122-intellij-changes-panel.md) — rows from a NUL-separated rename-aware `git status` with checkbox, status badge, muted parent dir, hover discard, and click-to-diff.
-- [123 — Commits Panel](123-intellij-commits-panel.md) — one card per commit from HEAD back to the merge-base, expanding into four groups, above a branch token meter, with range-based selection.
+- [123 — Commits Panel](123-intellij-commits-panel.md) — one card per commit from HEAD back to the merge-base, expanding into four groups, above a branch token meter; checkboxes exist only inside an opt-in squash-selection mode, and the status chips hide behind an overflow chip.
 - [124 — Project Service Lifecycle](124-intellij-project-service-lifecycle.md) — initialize the bridge on project open, watch for `.git` disappearing or returning, and notify panels over one subscription bus.
 - [125 — Orphan-Branch Ref Monitoring](125-intellij-orphan-branch-ref-monitoring.md) — watch the orphan ref and worker lock through the platform watcher, debouncing bursts before telling panels to reload.
 - [126 — Native Git CLI Wrapper](126-intellij-native-git-cli-wrapper.md) — invoke the system `git` with the user's interactive-shell PATH, a Windows PATH addition, a 15s default timeout, and threaded stdout reads.
@@ -382,7 +384,9 @@ gate a change.
 - ~~[248 — Git-Operation Queue](248-intellij-gitops-queue.md)~~ **(REMOVED)** — the IDE-native queue and its own hook are gone; every git event is captured and drained by the CLI surface's queue.
 - [249 — MCP & Skills Integration](249-intellij-mcp-and-skills-integration.md) — extract the bundled CLI to a machine-global directory and shell out to its integrations-only enable; there is no native MCP registry writer.
 - ~~[250 — Transcript Plan Discovery](250-intellij-transcript-plan-discovery.md)~~ **(REMOVED)** — the IDE-side scanner and its hook are gone; plans enter the registry only through the CLI's discovery, and this surface only reads.
-- [251 — Create-PR View](251-intellij-create-pr-view.md) — a branch-level tab aggregating every committed memory on the branch into one draft and sharing them in the same submit action.
+- [251 — Create-PR View](251-intellij-create-pr-view.md) — a branch-level tab aggregating every committed memory on the branch into one draft and sharing them in the same submit action, opened in two stages so a cheap draft paints before the expensive one replaces it.
+- [307 — Direct Memory-Mirror Read Path](307-intellij-direct-memory-mirror-read.md) — a second, filesystem-direct read source for four single-item memory shapes, attached after migration and gated per read on the out-of-sync marker, whose degradations are invisible and can be outlived by the cache in front of it.
+- [309 — PR-Status Cache](309-intellij-pr-status-cache.md) — a project-scoped in-memory cache over the three forge probes, with two freshness windows, join-one-in-flight-probe deduplication, and a retention policy that keeps a genuine negative but discards a failed answer.
 - [252 — Share-to-Jolli Core](252-intellij-share-to-jolli.md) — the UI-free core sharing one memory and its plans, persisting returned ids, and cleaning up orphans behind both share entry points.
 - ~~[254 — Post-Commit Summarization Pipeline](254-intellij-post-commit-summarization-pipeline.md)~~ **(REMOVED)** — the IDE-native per-commit summarization pipeline no longer exists on this surface; summarization is owned entirely by the CLI queue worker.
 - [260 — Cold-start Back-fill Card](260-intellij-cold-start-backfill-card.md) — the Swing analog of the VS Code card: same signals, same dismiss marker, same copy, driven through an out-of-process CLI bridge.
@@ -393,5 +397,5 @@ gate a change.
 - [271 — Pre-Push Sync Catch-Up](271-intellij-pre-push-sync-catch-up.md) — install the one hook that shells to the Node dispatcher, read the pending queue non-gatingly, and best-effort trigger a drain at a few lifecycle moments.
 - [284 — Node.js Runtime Detection and Hard Gate](284-intellij-nodejs-runtime-detection.md) — two-phase detection (gather candidates, then prove each by execution) with a version floor, persisted winner, retry, and a blocking panel on failure.
 - [298 — IntelliJ AI Commit Action](298-intellij-ai-commit-action.md) — stage the checked files, obtain a message from the command-line surface, offer a three-way review, then restore prior staging and force the IDE to re-read git state.
-- [299 — IntelliJ Squash Action](299-intellij-squash-action.md) — consolidate a selected commit range with a generated message, warning before rewriting pushed history and writing the squash-pending marker before the reset.
-- [302 — IntelliJ Embedded-Browser Pool](302-intellij-jcef-browser-pool.md) — a project-scoped pool of reusable embedded-browser instances behind a checkout/hand-back discipline, prewarmed at project open so opening a memory tab no longer constructs one, with a trim-on-hand-back population bound that is not admission control.
+- [299 — IntelliJ Squash Action](299-intellij-squash-action.md) — consolidate a selected commit range with a generated message behind a two-step gesture, warning before rewriting pushed history and writing the squash-pending marker before the reset.
+- [302 — IntelliJ Embedded-Browser Pool](302-intellij-jcef-browser-pool.md) — a project-scoped pool of reusable embedded-browser instances behind a checkout/hand-back discipline, prewarmed at project open, now shared by the memory tab and the branch-level PR draft, with a trim-on-hand-back population bound that is not admission control.

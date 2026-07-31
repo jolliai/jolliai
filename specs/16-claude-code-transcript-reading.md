@@ -15,6 +15,7 @@ This spec defines how a Claude Code session transcript is read from local newlin
 - The rule that consecutive same-role records (streaming chunks of one response) are coalesced into a single normalized entry.
 - The cursor structure used for incremental resumption.
 - The optional time-cutoff filter that lets a queue-driven caller attribute records to a specific commit boundary.
+- The token-usage figures the read returns alongside the entries, and the fact that a model response spread over several records is counted once per read.
 - The character-budgeted context-string assembly used to feed an LLM, including a default per-call budget.
 - Behavior on partial / blank / unparseable lines.
 
@@ -66,7 +67,7 @@ A null/absent cursor means "read from the beginning."
 
 ### Read result
 
-A read returns the list of normalized entries produced by this call, the new cursor, and a count of how many lines were actually consumed during this call.
+A read returns the list of normalized entries produced by this call, the new cursor, a count of how many lines were actually consumed during this call, and the token figures for the consumed slice: a scalar total and its three-segment breakdown — **always present**, and both zero for a producer whose records carry no usage counters — plus an optional per-model split, omitted entirely when the producer exposes no per-model capture or when the split would be empty. The segment semantics, the counter mapping, and the cost pricing are owned by **Token Usage Extraction and Cost Estimation**; what belongs here is that the figures are a property of *this read's consumed slice*, not of the file.
 
 ## Behavior
 
@@ -111,12 +112,34 @@ When the caller provides an instant cutoff:
 - Lines without a timestamp are conservatively treated as belonging to the current window (they are written before the next timestamped line, so they are included).
 - The cursor is advanced only to the last consumed line, leaving the deferred lines for the next call.
 
-### Context-string assembly (50KB rule)
+### Usage accumulation within one read
+
+Usage is read from raw lines, not from produced entries, and it is accumulated
+over exactly the lines the read consumed (so the time cutoff bounds it the same
+way it bounds the cursor). Two rules are specific to the read:
+
+- **A response is counted once per read.** The producer writes one record per
+  content block of a single model response and repeats that response's whole
+  usage object on each, so the read keeps a set of response identities it has
+  already counted and skips repeats. A record that carries no identity always
+  counts. The rule, its measured inflation, and the first-seen-wins consequence
+  are owned by **Token Usage Extraction and Cost Estimation**.
+- **That set is local to one read.** It is created empty at the start of every
+  read and discarded at the end; nothing about it is written to the cursor. So a
+  response whose records straddle the time cutoff is counted by this read and
+  again by the next one. The over-count is bounded at one response per cutoff
+  boundary and is accepted.
+
+The per-model split (when the producer supports one) is computed over the same
+consumed lines and de-duplicates on the same identities, so it can never
+disagree with the segment breakdown about what was counted.
+
+### Context-string assembly (character-budget rule)
 
 When the read result is rendered into a single LLM-facing string:
 
 - Each entry is formatted with a role prefix `[Human]: ` or `[Assistant]: ` followed by its content.
-- Entries are walked from newest to oldest, appended (in original order) until the accumulated character count plus separators would exceed the configured budget. The budget defaults to 50000 characters.
+- Entries are walked from newest to oldest, appended (in original order) until the accumulated character count plus separators would exceed the configured budget. The budget defaults to 150000 characters.
 - The selected entries are joined by blank lines.
 - The result is "the most-recent entries that fit," preserving original ordering.
 
@@ -140,7 +163,9 @@ The reader is stateless beyond the input cursor: each call takes a transcript pa
 - **IDE-injected tags are stripped before noise-prefix filtering**, so a user message that begins with an IDE opened-file tag and is otherwise system-generated still ends up dropped.
 - **Coalescing happens after line-level filtering**, so dropped streaming chunks do not "split" what was logically one assistant turn.
 - **Same-role coalescing keeps the earliest timestamp** of the run, not the latest, so the merged turn aligns with when the model started speaking.
-- **The 50KB budget is per-call default and applied after read**: the read itself does not truncate; truncation belongs to the context-assembly step.
+- **The character budget is a per-call default applied after read**: the read itself does not truncate; truncation belongs to the context-assembly step.
+- **Usage is counted per model response, not per record.** One response is written across several records that each repeat its whole usage object; the read counts the first and skips the rest. (Surprising; see **Token Usage Extraction and Cost Estimation** for why summing per record inflated totals several-fold.)
+- **The de-duplication set does not survive the read.** A response whose records fall on both sides of the time cutoff is counted by both reads. Bounded and accepted, because the cursor stores no response identity (see **Transcript Cursor Resumption**). (Surprising; intentional.)
 - **The cursor field is named `lineNumber`** but its semantics are "lines already consumed," so it equals the count, not the last-index.
 - **Same-role coalescing is idempotent**: applying it twice produces the same output.
 
@@ -151,3 +176,4 @@ The reader is stateless beyond the input cursor: each call takes a transcript pa
 - **Lossy normalization**: only `text`-bearing user and assistant turns survive; everything else is discarded.
 - **Canonical entry shape** (`{ role: "human"|"assistant", content, timestamp? }`) is the same shape produced by every other transcript-source reader in this product, so downstream consumers do not branch on source.
 - **Cursor-keyed resumption** by `(transcriptPath, lineNumber)` is the same shape used by every other transcript-source reader in this product.
+- **The token figures a read returns** are defined and priced by **Token Usage Extraction and Cost Estimation**, attributed per conversation by **Commit-Pipeline Conversation Token Attribution**, and summed cursorlessly for the review panel's live meter by **Conversation Token Totals for the Review Panel**. This spec owns only the fact that they describe the consumed slice and are de-duplicated within a single read.

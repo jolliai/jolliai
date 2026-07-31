@@ -30,7 +30,7 @@ A tool-window section that lists the currently-active AI coding conversations fr
 - The accordion section that hosts this panel (its header, collapse state, resize bar, gear-menu visibility toggle, action group anchor) is owned by the tool-window accordion spec. The parent section also owns the single scroll bar shared by this panel and sibling panels.
 - The shape and meaning of the result envelope's `items` and `failedSources` fields are owned by the aggregator spec; this panel only renders them.
 - The action-system registration of the "refresh" action is part of the tool-window action surface; this panel only exposes a public refresh method.
-- The project's "main repo root" resolution and the project's status-listener channel are owned by the project-service spec; this panel only subscribes.
+- The project's shared-repository-root resolution and the project's status-listener channel are owned by the project-service spec; this panel only subscribes (and uses that root only as the fallback working directory).
 - The terminal integration used to resume Claude or Codex sessions (including the shared eligibility predicate, the two command forms, and the per-source default tab title) is owned by the terminal utilities module (see spec 212); this panel only calls it with the session identifier and source.
 - The pinned-panel data store is owned by the pinned panel; this panel only calls the pin entry point.
 - The commit-selection store (which records which conversations are excluded from the next commit memory) is owned by its own spec; this panel only reads and writes the per-conversation exclusion flag.
@@ -42,7 +42,7 @@ A tool-window section that lists the currently-active AI coding conversations fr
 | Field | Provider | Meaning |
 | --- | --- | --- |
 | project handle | host | The IDE-level handle for the current project; used to obtain the file-editor manager and the project base path fallback. |
-| status-aware project service | host | Exposes (a) a registration channel for status-change listeners with the contract "the listener fires once immediately if status is already available, then on every subsequent change", (b) the resolved main repo root (or `null` until resolution), and (c) the project base path fallback for the rare case where the main repo root has not been resolved yet. |
+| status-aware project service | host | Exposes (a) a registration channel for status-change listeners with the contract "the listener fires once immediately if status is already available, then on every subsequent change" and (b) the resolved shared-repository root (or `null` until resolution), which is the **fallback** for the working directory when the project's own checkout path is unavailable. |
 | result envelope from the aggregator | delegated aggregator round-trip | A list of conversation items plus a list of failed-producer names. |
 
 ### The aggregator call
@@ -143,7 +143,7 @@ When the panel is constructed:
 
 A load cycle, executed on a background thread:
 
-1. Resolve the project's working directory: prefer the service's main repo root; fall back to the project's base path. If both are null, abort the load silently (no error, no UI mutation).
+1. Resolve the project's working directory: prefer the project's own checkout path; fall back to the service's resolved shared-repository root. If both are null, abort the load silently (no error, no UI mutation).
 2. Issue the delegated aggregator round-trip with the resolved working directory and the 48-hour window.
 3. If that call throws, catch the exception and substitute an envelope with **no items and every producer marked failed** (`items = []`, `failedSources = <every member of the producer enumeration>`). The exception itself is still swallowed — no error toast, no modal — but the substituted envelope is diagnostic: the warning banner shows, and because the item list is empty the empty-state label shows too. This **matches** the consumer wrapper's contract on the VS Code side; the previous IntelliJ-only behavior of substituting an all-empty envelope (which made a crashed aggregator indistinguishable from "no active conversations") is gone.
 4. Marshal back to the UI thread to apply the envelope.
@@ -194,7 +194,7 @@ Each hover-action icon label has its own click mouse-adapter that consumes the e
 
 When the user clicks anywhere on the row except one of the four hover-action icons:
 
-1. Resolve the working directory the same way the data load does (main repo root, then project base path). If both are null, do nothing.
+1. Resolve the working directory the same way the data load does (the project's own checkout path, then the shared-repository root). If both are null, do nothing.
 2. Construct a virtual file carrying the row's item plus the working directory.
 3. Hand the virtual file to the IDE's file-editor manager's open-file call with focus.
 4. The open call returns one or more file editors. Iterate them; for any editor of the conversation-editor type, install a save-side callback that re-invokes the panel's refresh method.
@@ -274,7 +274,7 @@ The panel does not need to explicitly tear down its child components — the IDE
 
 [load cycle scheduled]
   on background thread:
-    cwd ← service.mainRepoRoot ?? project.basePath
+    cwd ← project.checkoutPath ?? service.sharedRepoRoot
     if cwd == null → return (no UI mutation)
     envelope ← delegated aggregator round-trip (cwd, window = 48h)
                 catch (any) → envelope = { items: [], failedSources: EVERY producer }
@@ -301,7 +301,7 @@ The panel does not need to explicitly tear down its child components — the IDE
   schedule load cycle
 
 [row clicked]
-  cwd ← service.mainRepoRoot ?? project.basePath
+  cwd ← project.checkoutPath ?? service.sharedRepoRoot
   if cwd == null → no-op
   vf ← new ConversationVirtualFile(item, cwd)
   editors ← fileEditorManager.openFile(vf, focus=true)
@@ -311,7 +311,7 @@ The panel does not need to explicitly tear down its child components — the IDE
 
 [pin icon clicked]
   consume click (prevents row-click)
-  cwd ← service.mainRepoRoot ?? project.basePath
+  cwd ← project.checkoutPath ?? service.sharedRepoRoot
   if cwd == null → no-op
   on background thread:
     PinStore.pin(cwd, "conversations", rowKey, title, producer)
@@ -320,7 +320,7 @@ The panel does not need to explicitly tear down its child components — the IDE
 [resume icon clicked]
   consume click (prevents row-click)
   if !canResumeSource(item.source) → no-op   // passes only claude, codex
-  cwd ← service.mainRepoRoot ?? project.basePath
+  cwd ← project.checkoutPath ?? service.sharedRepoRoot
   TerminalUtils.resumeSession(project, item.source, sessionId, cwd, tabTitle)
 
 [selection toggle clicked]
@@ -332,7 +332,7 @@ The panel does not need to explicitly tear down its child components — the IDE
 
 [select-all / deselect-all invoked]
   intent ← if any item has isSelected=false then "select all" else "deselect all"
-  cwd ← service.mainRepoRoot ?? project.basePath
+  cwd ← project.checkoutPath ?? service.sharedRepoRoot
   keys ← all composite row keys
   on background thread:
     CommitSelectionStore.setAllExcluded(cwd, "conversations", keys, !intent=="select all")
@@ -364,6 +364,7 @@ The panel does not need to explicitly tear down its child components — the IDE
 
 ## Notable Behavior
 
+- **The working directory now prefers the current checkout, and that inversion is a fix for an empty panel in a linked checkout.** All six places the panel needs a working directory — the aggregator call, the row-click open, the resume call, the per-row selection write, the select-all/deselect-all batch write, and the pin write — resolve the project's own checkout path first and fall back to the shared repository root only when that is unavailable; when neither resolves, the operation aborts silently. The order used to be the other way round. Every input this panel depends on is written **per checkout**: the recorded sessions the aggregator reads, the per-item include/exclude choices, and the pinned set all live under the checkout the producing agent actually ran in. Preferring the shared root therefore made a linked checkout read the *main* checkout's records, find nothing inside the recency window, and render "No active conversations" even while a conversation was live in that very checkout. Nothing here needs to pre-resolve the shared root: the surface being called resolves it itself for the things that genuinely are repository-wide. (Notable; fixes an empty panel in a multi-checkout setup.)
 - **The 60-second poll only fires when the panel is on screen.** The timer keeps ticking regardless of visibility; each tick checks `isShowing` and skips silently when collapsed in the accordion, minimized in the tool window, or hidden behind another tab. This avoids both an unbounded backlog of refreshes when the panel re-appears and the cost of polling work the user cannot see.
 - **The 60-second timer tick also flushes buffered telemetry.** The flush is a best-effort call that swallows all errors and is a no-op when the buffer is empty. It is piggybacked on the poll tick rather than having its own timer, so there is no separate scheduling concern.
 - **The status listener is invoked once immediately on registration if status is already cached.** Late-attached panels do not have to wait for the next status change to receive the current value. The contract is owned by the project service; this panel's reliance on it is what makes the panel's first paint match the service's current state without an explicit kickoff call.

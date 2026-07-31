@@ -18,7 +18,8 @@ Mirror the canonical memory store onto a user-pickable on-disk parent folder tha
 - The validation policy applied to a user-configured parent path.
 - The collision-handling and adoption policy when a repository's intended subdirectory name is already in use.
 - The caller-side write-boundary precondition on the claiming resolution mode: which callers carry it, which are exempt, and why it cannot be enforced inside the resolver — but not the predicate itself.
-- The semantics of the per-device "shadow dirty" marker at the per-repository layer.
+- The semantics of the per-device "shadow dirty" marker at the per-repository layer, including its second role as a read switch.
+- Which names in the hidden layer are read by a second, independent reader in another language, and therefore which of them cannot change without a coordinated multi-language change.
 - Which subdirectories of a repository's hidden layer are treated as system reserved (never scanned as user content).
 - Hand-edit detection: how the visible and wiki layers protect user-modified files from being overwritten or cleaned up.
 
@@ -27,6 +28,7 @@ Mirror the canonical memory store onto a user-pickable on-disk parent folder tha
 - The write-path orchestration of the parallel ref backend with the per-repository folder mirror (covered by the dual-write summary storage spec).
 - The per-file atomic-write mechanics, manifest mutations, branch-mapping registry mutations, and superseded-descendant cleanup of the per-repository folder mirror (covered by the folder-based summary storage spec).
 - The schema of summary, plan, note, transcript, catalog, or topic-page documents (covered by their respective schema specs).
+- The internals of the second, direct reader of the hidden layer (covered by the direct hidden-layer reader spec, 307); only the subset of this layout it consumes is defined here.
 - The sync engine that uploads the parent folder to a remote service and merges peer writes (covered by the sync engine spec).
 - The bootstrap process that downloads a remote vault into a fresh parent folder (covered by the sync engine spec).
 - The classifier that decides which paths are eligible for sync staging (covered by the sync engine spec).
@@ -107,7 +109,7 @@ Under each per-repository subdirectory, a dot-prefixed subdirectory holds machin
 - `migration.json` — progress state of any one-shot data migration the system runs on activation.
 - `index.json` — projection of the per-repository summary index (heads and hoisted children, by branch and parent-pointer); written as a copy of the orphan-branch source of truth.
 - `catalog.json` — cold-path enrichment data joined with the summary index by some surfaces (search, ticket-id projection); may be absent on legacy installs or installs written by surfaces that do not maintain it.
-- `shadow-status.json` — **per-device** dirty marker. Present only when the most recent shadow-write into this repository's hidden layer failed and was suppressed; absent otherwise. Carries `dirty: true`, an ISO-8601 timestamp, and the message of the failing batch. This document is **not** synced across devices — it represents recovery state local to one device's mirror operations.
+- `shadow-status.json` — **per-device** dirty marker. Present only when the most recent shadow-write into this repository's hidden layer failed and was suppressed; absent otherwise. Carries `dirty: true`, an ISO-8601 timestamp, and the message of the failing batch. This document is **not** synced across devices — it represents recovery state local to one device's mirror operations. **No consumer parses its body**: every reader tests only whether the file exists, which makes it a per-device *read* switch as well as a recovery record (see "Two readers of the hidden layer" below) and means it must stay an existence-signalling file of its own rather than becoming a field inside one of the aggregate documents above.
 
 **Content directories** (one file per artifact, written verbatim from the source of truth):
 - `summaries/<commitHash>.json` — one per top-level summary.
@@ -117,6 +119,10 @@ Under each per-repository subdirectory, a dot-prefixed subdirectory holds machin
 - `plan-progress/<slug>.json` — one per plan-progress artifact.
 - `topics/<stableSlug>.json` — one canonical topic-page document plus a sibling `topics/index.json` projecting the topic set.
 - Any other relative path written via the storage-provider surface lands as-is inside the hidden layer.
+
+**Two readers of the hidden layer.** The layout above is written by exactly one writer, but read by two independent implementations in two languages. Alongside the writer's own read path, one host reads the hidden layer directly off disk to avoid its normal per-read process hop. That second reader consumes a fixed **four-name subset**: the per-commit summary documents, the plan bodies, the note bodies, and the per-device dirty marker. It never writes, and it fails soft — any read or parse failure yields nothing and the caller falls back to the version-controlled ref that this folder mirrors.
+
+The **hidden layer's copy of the summary index is explicitly not consumed by it** (that host has no hash-discovery path over the folder — every folder read it performs is for a commit hash it already learned from version control). This distinction is what determines which names in this layout can change unilaterally: the four consumed names, the directory names containing them, the dirty marker's presence-only semantics, and the document schemas of anything the second reader parses require a coordinated change in both languages, whereas the hidden index's schema may evolve on the writer's side alone for as long as nothing reads it there. The second reader's own internals — its readiness probe, its mode gate, its path-containment guard — are defined by the direct hidden-layer reader spec (307).
 
 **Quarantine directories** (engine-managed, never synced, never scanned as user content):
 - `quarantine-summaries/<basename>` — destination for files placed into `summaries/` whose basename does not match the canonical content-addressed naming.
@@ -200,7 +206,7 @@ A per-device state file directly under the parent folder, used by the sync engin
 
    **Exempt callers** are the flows a user invokes deliberately against a project they already have open, where the resolution is the point of the command rather than an incidental side effect: the sync round's mirror initialization and the one-shot back-fill migration into the parent folder. The exemption is about the *invocation* being deliberate, not about the inputs being different — both still derive the repository name from a working directory exactly as the gated callers do. (The desktop editor's folder re-target flow is exempt for a different reason: it never reaches this mode at all, resolving through the peek mode and then claiming the chosen path explicitly.)
 
-   The exempt set is wider than that list in practice: the desktop editor's activation-time mirror initialization, and the resolution adapter the JetBrains host reaches, both call the claiming mode with no boundary consultation. So a refused placement is closed only on the three gated seams, not on every surface. (See the boundary spec for the cross-host asymmetry.)
+   The exempt set is wider than that list in practice: the desktop editor's activation-time mirror initialization, and the resolution adapter the JetBrains host reaches, both call the claiming mode with no boundary consultation. That adapter now also backs a purely-*read* capability — the direct hidden-layer read path, which must resolve the subdirectory in order to read it and does so through the claiming mode at host activation and again on every settings save. So a refused placement is closed only on the three gated seams, not on every surface, and attaching a read path is one of the surfaces that can create a subdirectory the boundary would have refused. (See the boundary spec for the cross-host asymmetry.)
 1. Compute the parent folder by applying the validation policy to the configured value.
 2. Compute the repository basename via the three-layer fallback.
 3. Compute the candidate path `<parent>/<basename>`.
@@ -247,7 +253,7 @@ On first creation of a per-repository subdirectory's hidden layer:
 
 ### Enumerating repositories (UI / sidebar)
 1. Resolve the parent folder via the validation policy.
-2. List direct children. ENOENT on the parent is silently treated as an empty list.
+2. List direct children. A "no such entry" outcome on the parent is silently treated as an empty list.
 3. For each child directory whose per-repository configuration document is readable, project a discovered-repository row with:
    - the recorded repository name (or directory basename when absent) as the display name.
    - the directory basename recorded separately.
@@ -292,7 +298,7 @@ Force-regenerate paths (used by explicit "discard my edits" user actions) valida
 ### Per-device shadow-dirty marker
 - The marker file `<repo>/<dot-namespace>/shadow-status.json` is written, atomically, after a shadow-side write failure has been suppressed by the dual-write orchestrator.
 - It is deleted after a subsequent successful shadow-side write.
-- A presence check `exists?` is the only consumer-visible read; downstream code uses it to decide whether to surface a "your mirror is behind" UI indicator.
+- A presence check `exists?` is the only consumer-visible read. Its body is never parsed by anything. Downstream code uses the presence check for two distinct purposes: to decide whether to surface a "your mirror is behind" UI indicator, and — in the second, direct reader of the hidden layer — to gate every individual read, so that a repository whose mirror is known to be behind is served from the version-controlled ref instead. The marker is therefore a per-device read switch as much as a recovery record.
 - The marker is per-device (it represents local recovery state) and is intentionally excluded from sync.
 
 ### Topic-wiki regeneration
@@ -350,6 +356,8 @@ The visible and wiki layers have no explicit state; their presence is a function
 - **`_wiki/` is always regenerable, never source-of-truth.** A crash mid-wiki-render can leave `_wiki/` empty. This is documented as a recoverable state — the next ingest re-renders from the canonical topic pages in the hidden layer. The presence of `_wiki/_index.md` is the cheap "wiki layer exists" probe. (Notable.)
 - **Wiki manifest unregister happens before disk wipe.** The order is intentional: even if the disk wipe fails partway, surviving `_wiki/*.md` files become orphan user-content (recoverable) rather than ghost generated entries (incoherent). (Notable; intentional ordering.)
 - **`shadow-status.json` is per-device and never synced.** This marker represents local recovery state from a suppressed shadow-write failure. It is excluded from sync because peers' mirror state is independent. The marker's name is duplicated in three places (hidden-layer reserved name, sync classifier rejection list, bootstrap untrack list) so that one of the three catching it is sufficient. (Notable; intentional defense-in-depth duplication.)
+- **The dirty marker's contract is its existence, in both languages.** No consumer parses the document; the presence of the file is the whole signal, and the second, direct reader of the hidden layer gates every read on it. Folding the marker into one of the aggregate documents as a field would therefore break a read path in another language, not just a UI badge. (Notable; the file's existence *is* the API.)
+- **The hidden layer has two readers and one writer, and only part of it is a two-language contract.** A second host reads the per-commit summary documents, plan bodies, note bodies, and dirty marker straight off disk; writes remain single-sourced. The hidden index copy is deliberately outside that read subset, so its schema — unlike the four consumed names — can change without a coordinated multi-language change. If a future read path in that host starts consuming the index, it joins the coordinated set. (Notable; the lockstep obligation is scoped to the names actually consumed, not to the whole layer.)
 - **Hand-edit detection is conservative.** Every system-driven write to the visible or wiki layer checks the on-disk fingerprint against the manifest fingerprint and refuses to overwrite when they differ. A missing baseline (legacy row) is also treated as "do not touch". A read error while computing the on-disk fingerprint is treated as "assume edited". The net effect: the user cannot lose their visible-file edits by virtue of a system write — but the visible file may diverge indefinitely from the system view. UI surfaces are expected to expose a divergence badge. (Notable; intentional.)
 - **Force-regenerate validates the source before unlinking.** The path that exists to explicitly discard a user's hand-edits validates the hidden-layer source content first, then unlinks the visible copy, then re-emits. The validation-before-unlink ordering exists because the visible file is the user's only copy of their edits — destroying it before knowing the hidden source can produce a replacement would turn the safety command into a data-loss path. (Notable; intentional.)
 - **Plan/note slug-based branch fallback.** When a plan or note write does not specify a branch, the writer attempts to recover the branch from a hash suffix embedded in the slug (looking it up in the manifest and then in the hidden index); if recovery fails, the visible copy lands in the literal folder `_shared`. (Surprising.)
@@ -366,7 +374,8 @@ The visible and wiki layers have no explicit state; their presence is a function
 ## Shared Behavior
 
 - The canonical, version-controlled-ref source of truth that this folder mirrors, including ref naming, write-batch semantics, and plumbing primitives, is defined by the orphan-branch summary storage spec.
-- The atomic-write mechanics, per-file write contract, manifest mutation semantics, branch-mapping registry mutation semantics, superseded-descendant cleanup, manifest reconciliation, and the per-file shape of the visible layer are defined by the folder-based summary storage spec.
+- The atomic-write mechanics, per-file write contract, manifest mutation semantics, branch-mapping registry mutation semantics, superseded-descendant cleanup, manifest reconciliation, the per-file shape of the visible layer, and the read semantics of the hidden layer (absence versus an unreadable entry, and which failures are reported) are defined by the folder-based summary storage spec.
+- The second, direct reader of the hidden layer — the four-name read subset it consumes, its fail-soft behavior, its readiness and mode gates, and its path-containment guard — is defined by the direct hidden-layer reader spec (307). This spec defines only which names in the layout that reader makes into a two-language contract.
 - The orchestration of the version-controlled-ref backend with the per-repository folder mirror (which gets the primary read role, when each is written, and how dirty-flag state is set or cleared) is defined by the dual-write summary storage spec.
 - The write-boundary predicate that gates the claiming resolution mode, its refusal reasons and evaluation order, the three consumers that consult it and how each degrades, and the effective-state record and wording that make a refusal visible to the user are defined by the memory-bank write-boundary and effective-state-reporting spec. This spec defines the naming, reuse, adoption, and suffix rules that a resolution applies *after* the boundary allows, and the peek mode that report resolves through.
 - The durable repo-wide manual-disable opt-out, which suppresses the claim step's identity write, is defined by the manually-disabled zero-write-contract spec.

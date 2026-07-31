@@ -15,6 +15,7 @@ Select one of three storage configurations — version-controlled-ref-only, fold
 - Initialization of both backends in the composite and what happens when the secondary's initialization fails.
 - The dirty-flag protocol used to mark the shadow as out-of-sync after a failed shadow write, and to clear it on success.
 - The read-side fallback chain in the dual-write configuration: probes for the folder shadow's readiness and its dirty flag before serving reads from it.
+- The existence of a second, independent implementation of that fallback on one host, and the points at which its decision diverges from the canonical one (its internals belong to the direct hidden-layer reader spec, 307).
 - The position of the Memory Bank write-boundary precondition in both construction paths, and the degradation it produces — but not the boundary's own conditions.
 - Delegation of optional storage-provider methods that only the folder backend implements (visible-markdown delete / regenerate, plan-and-note visible delete, branch-mapping prune, heal-missing-visible-markdown, topic-wiki render, wiki-presence probe) to the shadow when in the composite configuration.
 
@@ -57,6 +58,8 @@ Two named slots:
 - `shadow`: a storage-provider instance that receives a copy of every write (always the folder-mirror backend in this configuration).
 
 Both slots implement the same storage-provider contract documented in "Orphan Branch Summary Storage" / "Folder-Based Summary Storage" (read one path, write a batch with a message, list under a prefix, check existence, ensure initialization, optional dirty-flag operations, optional visible-layer and wiki-layer entry points).
+
+The composite also carries the contract's optional **backend-identity** value, and reports **its own** identity — the composite's — rather than forwarding either slot's. A diagnostic naming the active backend therefore says "the composite" and not "the version-controlled-ref backend", even though every read the composite serves comes from that slot. The value is diagnostic only: nothing branches on it and it is never persisted. See "Orphan Branch Summary Storage" for why it is declared data rather than derived from an instance's runtime type.
 
 ### Write batch (forwarded to both backends)
 A list of file-write entries plus a message string, identical in shape to the contract documented in the per-backend specs.
@@ -106,8 +109,18 @@ Having passed the boundary, it dispatches as follows:
 
 Caller is responsible for caching when applicable — this resolution performs a fresh configuration load (and, in `"dual-write"`, a fresh folder-index probe and dirty-flag check) on every call. Long-lived host surfaces (e.g. a host-side bridge serving repeated reads) memoise and invalidate on a settings-save signal; one-shot CLI commands need no caching.
 
+### A second, independent implementation of the read-side fallback
+One host re-implements this read-side decision in its own language, over its own direct reader of the folder mirror's hidden layer (that reader's internals are defined by spec 307). It reaches the same *shape* of decision — try the mirror, fall back to the version-controlled ref — but every input to that decision is derived differently. Spec 307 tabulates the differences aspect by aspect and is the source of truth for them; the ones that matter from this side are:
+
+- **Readiness is probed by the existence of the mirror's summary-content directory**, not by a successful read of the mirror's summary-index document.
+- **Every configured mode value except the exact version-controlled-ref-only string is treated as mirror-eligible**, including an unrecognised one. The canonical resolution above degrades an unrecognised value to the version-controlled-ref backend; this one serves it from the mirror.
+- **The write boundary is not consulted at all** (see "Memory Bank Write Boundary and Effective-State Reporting").
+- **The mode gate — and the mirror root — are evaluated once, when the read path is attached** (at host activation, and again when the user saves settings on that host) rather than per read. A mode or folder change made outside those two moments, including one made from the command line, is therefore not observed for the rest of the session.
+- **The dirty marker is the one gate the two sides agree on**, and the second implementation is the stricter of the two: it re-checks the marker's presence on every individual read, where the canonical resolution checks it once per resolution (and a memoising host holds that answer until its next invalidation).
+- **The two sides do not even read the mirror's parent folder out of the same configuration entry**: that host resolves it from its own folder setting, which is not the entry the canonical write path resolves the same folder from, and no surface writes both. Re-targeting the folder on that host can therefore move where memories are *read* from without moving where they are *written*.
+
 ### `readFile(path)` (composite only)
-Forward unchanged to `primary.readFile(path)`. The shadow is **never read**.
+Forward unchanged to `primary.readFile(path)`. The shadow is **never read**. The composite adds no classification of its own: a null it returns means "absent" exactly as the contract says, and any genuine read failure behind it has already been reported by the primary at the point where the cause was still available (see "Orphan Branch Summary Storage").
 
 ### `batchReadFiles(paths)` (composite only)
 Forward to `primary.batchReadFiles(paths)` if the primary implements it; otherwise loop `primary.readFile(path)` and assemble the result map. The shadow is **never read**.
@@ -175,6 +188,8 @@ Triggers:
 - **Unknown-value handling differs between write and read sides.** On the write side, any unrecognised `storageMode` value silently falls back to the orphan-only configuration (so a typo cannot half-construct the composite). On the read side, any unrecognised value falls back to the orphan-only configuration **with a warning**. In both cases a config typo splits no state — both sides reach the same backend. (Notable; intentional safety-first asymmetry.)
 - **Read-side picks the folder shadow when it's ready.** In the dual-write configuration, the read-side resolution returns the folder backend rather than the version-controlled-ref backend whenever the folder layer has been initialised (its summary-index document is present) AND is not dirty. This is so any read-side surface (recall, compile, host extension's tree view) sees the exact bytes the user can see in their KB folder. Two documented fallbacks to the version-controlled-ref backend exist: (1) fresh install with the migration not yet run; (2) folder shadow is dirty after a suppressed shadow-write failure. (Notable.)
 - **Reads always go to the primary inside the composite.** The composite's own `readFile` / `listFiles` / `exists` paths consult only the primary. The read-side resolution above picks the folder backend directly (bypassing the composite) when the conditions hold; the composite itself never serves a read from its shadow. (Notable; intentional.)
+- **The read-side fallback has two independent implementations, and every input to the decision is derived differently.** One host re-derives the decision in its own language over its own direct reader of the mirror. Its readiness probe is a directory-existence check rather than a successful index read; it treats an unrecognised mode value as mirror-eligible where the canonical side degrades it to the version-controlled ref; it never consults the write boundary; it evaluates the mode gate and the mirror root once per attach rather than per read, so a change made anywhere but that host's own settings save is invisible to it; it is stricter on the one gate the two sides agree on, re-checking the dirty marker's presence on every read; and it does not even read the mirror's parent folder out of the same configuration entry the canonical write path uses. Spec 307 enumerates them aspect by aspect. The consequence worth holding on to: on a machine where both hosts share one mirror, a configuration the canonical side reads from the ref can still be read from the mirror by the other. (Surprising; observable divergence between two hosts sharing one mirror.)
+- **The composite names itself in diagnostics, not its primary.** The contract's optional backend-identity value on the composite reports the composite, even though every read it serves comes from its primary slot. A diagnostic that says "the composite" therefore tells you the configuration, not the slot that answered. (Notable.)
 - **Sequential, primary-first writes.** The two backends are written one after the other, not concurrently. A long-running primary write delays the shadow write. (Notable.)
 - **Primary failures abort the batch.** If the primary throws, the shadow is not even attempted. The caller sees the primary's error verbatim. (Notable.)
 - **Shadow failures are silent at the API surface.** A shadow write or shadow ensure that throws is logged at warning level and swallowed. The composite returns success. The dirty marker is the only observable trace. (Surprising; intentional.)
@@ -192,7 +207,8 @@ Triggers:
 ## Shared Behavior
 - The write-boundary predicate both construction paths consult, its refusal reasons, its evaluation order, and the effective-state record and wording derived from it are defined by **Memory Bank Write Boundary and Effective-State Reporting**.
 - The durable repo-wide manual-disable opt-out that suppresses the composite's batch write, and the full inventory of writes it suppresses, are defined by **Manually-Disabled Zero-Write Contract**.
-- The atomicity, plumbing, and ref-update semantics of the primary backend are defined by **Orphan Branch Summary Storage**.
+- The atomicity, plumbing, and ref-update semantics of the primary backend, the storage-provider contract's read semantics (a null means absent; the failing backend reports it), and the optional backend-identity value are defined by **Orphan Branch Summary Storage**.
+- The independent second reader of the folder mirror's hidden layer, over which one host re-implements this read-side fallback, is defined by the direct hidden-layer reader spec (307).
 - The three-layer file layout (hidden machine-readable, visible per-branch, generated topic-wiki), manifest, branch-mapping registry, atomic-write semantics, dirty-flag persistence, and the topic-wiki rebuild contract of the shadow backend are defined by **Folder-Based Summary Storage**.
 - The schema of the content carried by both backends is defined by **Summary Tree Structure**.
 - The wider per-repository folder layout — including the parent-folder identity registry and the read-side fallback's interaction with fresh-install state — is defined by **Memory Bank Folder Layout**.

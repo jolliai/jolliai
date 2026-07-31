@@ -22,6 +22,7 @@ Store summaries as plain files inside a user-chosen knowledge-base folder, mirro
 - The wider per-repository folder layout: the parent-folder identity registry, the user-placed Markdown classification rules, and the system-reserved-name policy that protects the hidden, visible, and wiki layers (covered by "Memory Bank Folder Layout").
 - UI surfaces that badge hand-edited visible or wiki files (covered by "VS Code Memory-File Divergence Decoration" and host-specific equivalents).
 - The version-controlled-ref backend that this storage can mirror (covered by "Orphan Branch Summary Storage").
+- The internals of the independent second reader of this storage's hidden layer — the host-side direct read path that bypasses this storage for latency — covered by the direct hidden-layer reader spec (307). Only the four-name subset it consumes, and the read contract it depends on, are stated here.
 - Combination semantics with the version-controlled-ref backend (covered by "Dual-Write Summary Storage").
 - The Memory Bank write boundary that callers must clear before invoking the claiming resolution path — its conditions, refusal reasons, and the effective-state report derived from it (covered by "Memory Bank Write Boundary and Effective-State Reporting").
 - The durable repo-wide manual-disable opt-out — how it is set, cleared, and stored, and the full inventory of writes it suppresses (covered by "Manually-Disabled Zero-Write Contract"). Only its position inside this storage's batch write, and which of this storage's other paths lack it, are stated here.
@@ -64,6 +65,8 @@ A separate "find fresh path" entry point skips the same-repo reuse step and alwa
 - `index.json` — Hidden copy of the summary index document, written verbatim.
 - `shadow-status.json` — Optional dirty marker (see below).
 - Any other relative path passed to `writeFiles` is created as-is under this hidden directory (notably: canonical topic pages and topic-index, plus the topic-ingest high-water mark; see "Topic Index and Page Storage").
+
+**A second, independent reader of this layer exists.** One host implements its own direct read path over the hidden layer, in its own language, bypassing this storage entirely for latency reasons. It reads a fixed **four-name subset** of the above: the per-commit summary documents, the plan bodies, the note bodies, and the dirty marker. It never writes anything — write-side consistency remains this storage's sole responsibility — and it fails soft: any read or parse failure yields nothing, so the caller falls back to the version-controlled ref. The **hidden copy of the summary index is explicitly not among the four**, and that boundary is the practical one: the four consumed names, their containing folder names, the dirty marker's semantics, and the document schema of anything the second reader parses cannot change without a coordinated change in two languages, whereas the hidden index's schema can evolve on this side alone for as long as nothing reads it there. Its internals are defined by the second reader's own spec (307); only the contract it depends on is stated here.
 
 ### Generated topic-wiki layer (under `<root>/_wiki/`)
 A reserved sub-folder, sibling to the hidden layer, containing the derived human-readable topic-knowledge wiki:
@@ -170,7 +173,13 @@ The standard resolution entry point is **not** a pure read despite its name: it 
 Returns whether the KB root directory exists on disk.
 
 ### `readFile(path)`
-Returns the textual content of `<root>/.<product-namespace>/<path>`, or null if absent or unreadable.
+Reads `<root>/.<product-namespace>/<path>` **directly**, with no existence pre-probe, and classifies any failure by its filesystem error code:
+- "no such entry" and "a path segment above the target is not a directory" are the routine nothing-here outcomes. They return null silently — absence is expected on a fresh repository, and equally expected when a cross-repository sweep touches a sibling repository that has none.
+- Everything else — a refused permission, an I/O failure, a busy file, the target turning out to be a directory, a concurrent truncation — is a genuine failure that the null return hides. It is logged at **production-visible warning level**, naming the path and the underlying cause, and then returns null.
+
+Both branches return null: the contract has no third state, so the reporting obligation sits here (see "Orphan Branch Summary Storage" for the contract wording).
+
+The removal of the existence pre-probe is load-bearing in two ways. First, correctness: the probe reports "does not exist" for an entry it merely cannot inspect, so a refused permission on a parent directory was previously indistinguishable from absence and fell through to a silent null — precisely the failure class the caller-side signal used to be the last line of defence for. Second, cost: reading first halves the syscalls per read, which matters on the index-heavy sweep paths (a cross-repository scan probing one index document per sibling repository).
 
 ### `writeFiles(files, message)`
 0. If the project is **manually disabled**, return immediately. The refusal sits **before** the `ensure()` in step 1, so a disabled project never has its folder tree created: neither the KB root, nor the hidden subdirectory, nor any default sidecar comes into existence as a side effect of a batch write.
@@ -244,9 +253,9 @@ A "wiki layer exists" probe is provided as an inspection-only entry point and re
 3. Return them sorted lexicographically.
 
 ### Dirty-flag operations
-- `markDirty(message)`: best-effort atomic-write of `<hiddenDir>/shadow-status.json` with `{dirty: true, lastFailedAt, message}`. Errors are swallowed silently.
-- `clearDirty()`: best-effort delete of that file. Errors are swallowed silently.
-- `isDirty()`: returns whether that file currently exists.
+- `markDirty(message)`: best-effort atomic-write of `<hiddenDir>/shadow-status.json` with `{dirty: true, lastFailedAt, message}`. A failure is **suppressed but logged at production-visible warning level** — the call never throws at its surface, but the suppressed marker update is named in the log, because a silently-dropped marker write turns a real shadow-write failure into a completely invisible one (the marker is the only trace that failure leaves).
+- `clearDirty()`: best-effort delete of that file. Errors are swallowed silently, with no log line.
+- `isDirty()`: returns whether that file currently exists. **Presence alone is the signal — the document body is never parsed by any consumer**, on this side or in the second, independent reader of the hidden layer. That reader gates every one of its reads on the marker's existence, which makes the marker a per-device *read* switch as well as a record of a failed write, and means it must remain an existence-signalling file of its own rather than becoming a field inside one of the aggregate documents.
 
 ### Manifest reconciliation (used by the metadata-management surface, not by writeFiles)
 Triggered by an explicit reconcile call against the KB root.
@@ -274,7 +283,7 @@ The KB folder progresses through four observable states:
 - **Absent**: directory does not exist; `exists()` is false.
 - **Present-uninitialized**: directory exists but the hidden subdirectory or its sidecars are missing or partial.
 - **Present-initialized**: hidden subdirectory exists with the four sidecars and a possibly empty set of summary/transcript/plan/note files.
-- **Dirty**: a `shadow-status.json` file exists in addition to Present-initialized.
+- **Dirty**: a `shadow-status.json` file exists in addition to Present-initialized. This state is not merely advisory: the independent second reader of the hidden layer refuses to serve any read while the marker is present, so the state gates reads on that host as well as recording a failed write.
 
 Transitions:
 - Absent → Present-initialized: `ensure()` (or implicit on first `writeFiles`).
@@ -290,6 +299,9 @@ The topic-wiki layer (`<root>/_wiki/`) has no explicit state transitions tracked
 
 - **The manual-disable gate sits on the batch write only.** Of this storage's mutating entry points, only the batch write refuses while the project is manually disabled. The initialization routine, the visible-markdown delete and regenerate paths, the plan-and-note visible deletes, the branch-mapping prune, the heal-missing-visible-markdown pass, the topic-wiki rebuild, the manifest reconciliation, and the dirty-marker write and clear all run normally. A disabled project therefore accumulates no new content through the batch write, but a repair, cleanup, or rebuild call that reaches this storage directly still touches disk. Whether such a call can be reached at all while disabled is decided by its own callers upstream, not here. (Surprising; the gate is per-entry-point, not per-storage-instance.)
 - **Two layers, one storage-provider surface.** Read/list operations apply only to the hidden layer; writes to the hidden layer additionally derive visible markdown for three known prefixes (`summaries/`, `plans/`, `notes/`). The hidden layer is the source of truth for `readFile` and `listFiles`. (Notable.)
+- **A null read means absent; anything else is warned here, not upstream.** This backend reads without an existence pre-probe and classifies the failure by error code, warning on everything that is not a routine missing-entry outcome. The reason the warning belongs at this depth is that the error code is still in hand here: the caller receives a bare null and is reduced to guessing between "fresh repository" and "the backend's read failed". The pre-probe was removed rather than kept alongside the classification because it actively produced the wrong answer — it reports absence for an entry it merely cannot inspect. (Notable; the reporting obligation is part of the storage-provider contract.)
+- **A second reader of the hidden layer exists, in another language, and it is read-only.** One host reads the per-commit summary documents, plan bodies, note bodies, and dirty marker straight off disk instead of going through this storage, to avoid its normal per-read process hop. It never writes, and every failure or parse error yields nothing so the caller falls back to the version-controlled ref. Those four names — plus their folder names, the dirty marker's presence-only semantics, and the schema of any document it parses — are consequently a two-language contract; the hidden index copy, which it does not read, is not. (Notable; the boundary of the lockstep obligation is exactly the set of names actually consumed.)
+- **This backend declares its identity as data.** Like every backend on the contract, it carries an optional identity value used only for diagnostics, because the shipped bundles are minified and a runtime type name would reach production mangled. (Notable.)
 - **Per-file atomicity, not batch atomicity.** Each entry in a `writeFiles` batch is atomic on its own (rename-from-temp), but a partial batch can leave the KB in a half-applied state. (Surprising; documented in the storage-provider contract.)
 - **Visible markdown invisibly updates the manifest.** Each visible-file write recomputes a content fingerprint and overwrites the manifest entry for that `fileId`. There is no separate "register file" step. (Notable.)
 - **Hand-edit detection by fingerprint.** Cleanup never deletes a visible file whose on-disk content no longer hashes to the recorded fingerprint; the assumption is that a human modified it and the change must be preserved. (Surprising; intentional.)
@@ -299,7 +311,7 @@ The topic-wiki layer (`<root>/_wiki/`) has no explicit state transitions tracked
 - **Repo-name worktree fix.** The repo-name resolver explicitly walks past a worktree pointer to the main repository's directory, so a worktree and its main checkout share one KB folder rather than getting parallel KBs under the worktree's own basename. (Notable; intentional.)
 - **Same-repo reuse on collision.** When a candidate KB root already exists, the resolver reuses it only if its KB-config records a remote URL (or absent-remote with matching repo name) that matches the host. Otherwise it skips to a numeric suffix. (Notable.)
 - **Last-resort timestamp suffix.** If 99 numbered suffix candidates are all in use and none match the host, the resolver returns a Unix-millisecond-suffixed path. (Surprising; data-preservation fallback.)
-- **Dirty-flag write swallows errors.** `markDirty` and `clearDirty` use a `try { ... } catch { /* best effort */ }` pattern; a failure to write the marker is silent. (Notable.)
+- **Dirty-flag writes are suppressed, but the marker write is not silent.** Both `markDirty` and `clearDirty` swallow their failures rather than propagating them. They differ in visibility on purpose: a failed `markDirty` is logged at production-visible warning level, because the marker is the *only* observable trace a suppressed shadow-write failure leaves, so losing the marker too would make a real failure invisible everywhere. A failed `clearDirty` is genuinely silent — its worst outcome is a stale marker, which degrades reads to the version-controlled ref rather than hiding anything. (Notable; asymmetric on purpose.)
 - **Slug fallback.** A commit message that produces an empty slug becomes `untitled`. (Notable.)
 - **Hidden listing skips dotfiles during reconciliation.** The reconciliation walk skips entries whose names begin with `.` so it does not descend into the hidden subdirectory itself. (Notable.)
 - **Plan/note slug-based branch fallback.** When a plan or note write does not specify a branch, the storage attempts to recover the branch from a hash suffix embedded in the slug; if recovery fails, the visible copy lands in the literal folder `_shared`. (Surprising.)
@@ -318,7 +330,8 @@ The topic-wiki layer (`<root>/_wiki/`) has no explicit state transitions tracked
 - The schema of canonical topic pages, the topic-index document, the slug-safety guard, and the orphan-purge cycle that produces the input to the wiki rebuild are defined by **Topic Index and Page Storage**.
 - The body composition of the per-topic wiki page and the wiki index page, and the cross-link resolution against the visible commit-summary layer, are defined by **Wiki Markdown Rendering**.
 - The UI surfaces that badge hand-edited visible or wiki files (using the same fingerprint comparison this storage records) are defined by **VS Code Memory-File Divergence Decoration** and host-specific equivalents.
-- The version-controlled-ref backend that this folder mirrors when paired in dual-write mode is defined by **Orphan Branch Summary Storage**.
+- The version-controlled-ref backend that this folder mirrors when paired in dual-write mode, and the storage-provider contract's read semantics (a null means absent; the failing backend reports) and optional backend-identity value, are defined by **Orphan Branch Summary Storage**.
+- The independent second reader of this storage's hidden layer — its four-name read subset, its fail-soft fallback, its path-containment guard, and its own readiness and mode gates — is defined by the direct hidden-layer reader spec (307). Only the contract that reader depends on is stated here.
 - The conditional combination of this folder mirror with that backend is defined by **Dual-Write Summary Storage**.
 - The write-boundary predicate that callers of the claiming resolution path must clear first, and the effective-state report that resolves through the peek path, are defined by **Memory Bank Write Boundary and Effective-State Reporting**.
 - The durable repo-wide manual-disable opt-out that suppresses this storage's batch write is defined by **Manually-Disabled Zero-Write Contract**.
