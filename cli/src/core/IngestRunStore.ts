@@ -11,6 +11,8 @@ import { getJolliMemoryDir } from "../Logger.js";
 import type { IngestOperation } from "../Types.js";
 import { atomicWriteFile } from "./AtomicWrite.js";
 import { INGEST_CODES, INGEST_NON_ERROR_OUTCOMES, type IngestCode } from "./IngestErrors.js";
+import { maybeEmitOnboardingProgress } from "./OnboardingFunnel.js";
+import { loadConfig } from "./SessionTracker.js";
 import { track, trackError } from "./Telemetry.js";
 
 const RUNS_FILE = "ingest-runs.json";
@@ -46,6 +48,13 @@ export async function appendIngestRun(cwd: string, record: IngestRunRecord): Pro
 	const next = [...existing, record].slice(-MAX_RUNS);
 	await atomicWriteFile(join(dir, RUNS_FILE), JSON.stringify(next, null, "\t"));
 	emitIngestTelemetry(record);
+	// Onboarding-funnel snapshot at the memories-generated transition: a drain
+	// that actually ingested something is the moment checkpoint 4 flips true.
+	// Idle drains (ingested=0, ~27% of runs) skip it — no state change and no
+	// reason to pay for a status probe. Fully guarded; never throws.
+	if (record.ingested > 0) {
+		await maybeEmitOnboardingProgress({ cwd, config: await loadConfig() });
+	}
 }
 
 /**

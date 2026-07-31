@@ -20,6 +20,7 @@ import {
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import { describeMemoryBank } from "../core/MemoryBankStatusText.js";
+import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import {
 	clearSpaceBindingCache,
@@ -523,6 +524,9 @@ export function registerStatusCommand(program: Command): void {
 			// persists `jolliUrl`.
 			const configDir = getGlobalConfigDir();
 			const config = await loadConfigFromDir(configDir);
+			// Onboarding-funnel snapshot from an already-computed status (no extra
+			// git work). `jolli status` is the periodic snapshot for active users.
+			await maybeEmitOnboardingProgress({ cwd: options.cwd, config, status });
 			const jolliSite = config?.jolliUrl;
 			// Use loadAuthToken() so JOLLI_AUTH_TOKEN env var is honored, matching `jolli auth status`.
 			const authToken = await loadAuthToken();

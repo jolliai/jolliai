@@ -1,0 +1,200 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+
+vi.mock("./GitOps.js", () => ({ isInsideGitRepo: vi.fn() }));
+vi.mock("./LlmClient.js", () => ({ resolveLlmCredentialSource: vi.fn() }));
+vi.mock("../install/Installer.js", () => ({ getStatus: vi.fn() }));
+vi.mock("../Logger.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../Logger.js")>();
+	return { ...actual, getJolliMemoryDir: vi.fn() };
+});
+vi.mock("./Telemetry.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./Telemetry.js")>();
+	// Keep the real `bucket`; only track + the consent gate are controllable.
+	return { ...actual, track: vi.fn(), getTelemetryContext: vi.fn() };
+});
+
+import { getStatus } from "../install/Installer.js";
+import { getJolliMemoryDir } from "../Logger.js";
+import { isInsideGitRepo } from "./GitOps.js";
+import { resolveLlmCredentialSource } from "./LlmClient.js";
+import { captureMethodOf, maybeEmitOnboardingProgress, resolveOnboardingFunnel } from "./OnboardingFunnel.js";
+import { getTelemetryContext, track } from "./Telemetry.js";
+
+const isGit = isInsideGitRepo as Mock;
+const resolveSrc = resolveLlmCredentialSource as Mock;
+const getStatusMock = getStatus as Mock;
+const jolliDir = getJolliMemoryDir as Mock;
+const trackMock = track as Mock;
+const ctxMock = getTelemetryContext as Mock;
+
+const LEDGER = "onboarding-progress.json";
+let tmp: string;
+
+beforeEach(async () => {
+	vi.clearAllMocks();
+	tmp = await mkdtemp(join(tmpdir(), "onboarding-funnel-"));
+	jolliDir.mockReturnValue(tmp);
+	ctxMock.mockReturnValue({ enabled: true });
+	isGit.mockResolvedValue(true);
+	resolveSrc.mockReturnValue(null);
+});
+
+afterEach(async () => {
+	await rm(tmp, { recursive: true, force: true });
+});
+
+describe("captureMethodOf", () => {
+	it("maps each credential source onto the coarse discriminator", () => {
+		const cases: Array<[unknown, string]> = [
+			["local-agent", "local-agent"],
+			["jolli-proxy", "jolli"],
+			["anthropic-config", "anthropic"],
+			["anthropic-env", "anthropic"],
+			[null, "none"],
+		];
+		for (const [source, expected] of cases) {
+			resolveSrc.mockReturnValue(source);
+			expect(captureMethodOf({})).toBe(expected);
+		}
+	});
+});
+
+describe("resolveOnboardingFunnel", () => {
+	it("short-circuits outside a git repo without touching getStatus()", async () => {
+		isGit.mockResolvedValue(false);
+		resolveSrc.mockReturnValue("anthropic-config");
+		const state = await resolveOnboardingFunnel({ cwd: tmp, config: {} });
+		expect(state).toEqual({
+			inGitRepo: false,
+			repoEnabled: false,
+			captureConfigured: true,
+			captureMethod: "anthropic",
+			memoriesGenerated: false,
+			memoriesBucket: "0",
+		});
+		expect(getStatusMock).not.toHaveBeenCalled();
+	});
+
+	it("uses a precomputed status without calling getStatus()", async () => {
+		resolveSrc.mockReturnValue("local-agent");
+		const state = await resolveOnboardingFunnel({
+			cwd: tmp,
+			config: {},
+			status: { enabled: true, summaryCount: 3 },
+		});
+		expect(state).toEqual({
+			inGitRepo: true,
+			repoEnabled: true,
+			captureConfigured: true,
+			captureMethod: "local-agent",
+			memoriesGenerated: true,
+			memoriesBucket: "1-5",
+		});
+		expect(getStatusMock).not.toHaveBeenCalled();
+	});
+
+	it("reports not-enabled and zero memories for a bare git repo", async () => {
+		const state = await resolveOnboardingFunnel({
+			cwd: tmp,
+			config: {},
+			status: { enabled: false, summaryCount: 0 },
+		});
+		expect(state.repoEnabled).toBe(false);
+		expect(state.captureConfigured).toBe(false);
+		expect(state.captureMethod).toBe("none");
+		expect(state.memoriesGenerated).toBe(false);
+		expect(state.memoriesBucket).toBe("0");
+	});
+
+	it("lazily computes status via getStatus() when none is provided", async () => {
+		resolveSrc.mockReturnValue("jolli-proxy");
+		getStatusMock.mockResolvedValue({ enabled: true, summaryCount: 50 });
+		const state = await resolveOnboardingFunnel({ cwd: tmp, config: {} });
+		expect(getStatusMock).toHaveBeenCalledWith(tmp);
+		expect(state.captureMethod).toBe("jolli");
+		expect(state.memoriesGenerated).toBe(true);
+		expect(state.memoriesBucket).toBe("21-100");
+	});
+
+	it("treats a missing summaryCount as zero", async () => {
+		getStatusMock.mockResolvedValue({ enabled: true });
+		const state = await resolveOnboardingFunnel({ cwd: tmp, config: {} });
+		expect(state.memoriesGenerated).toBe(false);
+		expect(state.memoriesBucket).toBe("0");
+	});
+});
+
+describe("maybeEmitOnboardingProgress", () => {
+	const ledgerPath = (): string => join(tmp, LEDGER);
+
+	it("does nothing (no git work, no ledger) when telemetry is inactive", async () => {
+		ctxMock.mockReturnValue(null);
+		await maybeEmitOnboardingProgress({ cwd: tmp, config: {}, status: { enabled: true, summaryCount: 1 } });
+		expect(trackMock).not.toHaveBeenCalled();
+		expect(isGit).not.toHaveBeenCalled();
+		await expect(readFile(ledgerPath(), "utf-8")).rejects.toThrow();
+	});
+
+	it("emits the content-free snapshot and writes the dedup ledger on first run", async () => {
+		resolveSrc.mockReturnValue("anthropic-config");
+		await maybeEmitOnboardingProgress({ cwd: tmp, config: {}, status: { enabled: true, summaryCount: 2 } });
+		expect(trackMock).toHaveBeenCalledTimes(1);
+		expect(trackMock).toHaveBeenCalledWith("onboarding_progressed", {
+			in_git_repo: true,
+			repo_enabled: true,
+			capture_configured: true,
+			capture_method: "anthropic",
+			memories_generated: true,
+			memories_bucket: "1-5",
+		});
+		const ledger = JSON.parse(await readFile(ledgerPath(), "utf-8"));
+		expect(typeof ledger.sig).toBe("string");
+		expect(typeof ledger.tsIso).toBe("string");
+	});
+
+	it("dedups an unchanged state within the heartbeat window", async () => {
+		const opts = { cwd: tmp, config: {}, status: { enabled: true, summaryCount: 2 } };
+		await maybeEmitOnboardingProgress(opts);
+		await maybeEmitOnboardingProgress(opts);
+		expect(trackMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("re-emits when the state tuple changes", async () => {
+		await maybeEmitOnboardingProgress({ cwd: tmp, config: {}, status: { enabled: true, summaryCount: 2 } });
+		await maybeEmitOnboardingProgress({ cwd: tmp, config: {}, status: { enabled: true, summaryCount: 30 } });
+		expect(trackMock).toHaveBeenCalledTimes(2);
+		expect(trackMock.mock.calls[1][1].memories_bucket).toBe("21-100");
+	});
+
+	it("re-emits an unchanged state once the daily heartbeat has elapsed", async () => {
+		const opts = { cwd: tmp, config: {}, status: { enabled: true, summaryCount: 2 } };
+		await maybeEmitOnboardingProgress(opts);
+		// Backdate the ledger past the 24h heartbeat, keeping the same signature.
+		const ledger = JSON.parse(await readFile(ledgerPath(), "utf-8"));
+		const dayAgo = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+		await writeFile(ledgerPath(), JSON.stringify({ sig: ledger.sig, tsIso: dayAgo }), "utf-8");
+		await maybeEmitOnboardingProgress(opts);
+		expect(trackMock).toHaveBeenCalledTimes(2);
+	});
+
+	it("treats a malformed ledger as a first emit", async () => {
+		await writeFile(ledgerPath(), "not json", "utf-8");
+		await maybeEmitOnboardingProgress({ cwd: tmp, config: {}, status: { enabled: true, summaryCount: 2 } });
+		expect(trackMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("treats a ledger missing fields as a first emit", async () => {
+		await writeFile(ledgerPath(), JSON.stringify({ sig: 123 }), "utf-8");
+		await maybeEmitOnboardingProgress({ cwd: tmp, config: {}, status: { enabled: true, summaryCount: 2 } });
+		expect(trackMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("never throws when state resolution fails", async () => {
+		isGit.mockRejectedValue(new Error("boom"));
+		await expect(maybeEmitOnboardingProgress({ cwd: tmp, config: {} })).resolves.toBeUndefined();
+		expect(trackMock).not.toHaveBeenCalled();
+	});
+});

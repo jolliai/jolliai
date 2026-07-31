@@ -38,6 +38,8 @@ export const TELEMETRY_EVENTS = {
 	signed_out: "User logged out. Props: none.",
 	ai_provider_selected: "User chose jolli vs anthropic for LLM. Props: provider (discriminator).",
 	memory_bank_migrated: "Migrate-to-Memory-Bank run. Props: outcome, repos, entries_bucket.",
+	onboarding_progressed:
+		"Per-install onboarding-funnel snapshot, emitted from a repo context and deduped by state tuple (+ daily heartbeat). Content-free — answers 'after install, where do people stall'. Props: in_git_repo, repo_enabled, capture_configured, capture_method (discriminator: local-agent/anthropic/jolli/none), memories_generated, memories_bucket.",
 	// ── feature usage / adoption ──
 	command_invoked:
 		'Any CLI command ran (auto-emitted). Props: command (discriminator), ok, duration_ms. MCP tool calls carry a `tool` property and are emitted per call (not per session); the session-level `command:"mcp"` event is suppressed.',

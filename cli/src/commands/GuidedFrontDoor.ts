@@ -23,6 +23,7 @@ import { basename } from "node:path";
 import { loadAuthToken } from "../auth/AuthConfig.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { localAgentToolLabel } from "../core/localagent/ToolMeta.js";
+import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getSummaryCount, setActiveStorage } from "../core/SummaryStore.js";
@@ -87,6 +88,10 @@ export async function runGuidedFrontDoor(): Promise<void> {
 		console.log("  Change into a repo and run `jolli` again:");
 		console.log("    % cd ~/code/your-repo");
 		console.log("    % jolli\n");
+		// Funnel signal: installed but landed outside a git repo (in_git_repo=false).
+		// This dead-end is the one trigger that fires in a non-git directory, so the
+		// "never got into a git repo" drop-off is captured rather than invisible.
+		await maybeEmitOnboardingProgress({ cwd, config: await loadConfig() });
 		process.exitCode = 1;
 		return;
 	}
@@ -104,6 +109,13 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	let token = await loadAuthToken();
 	let config = await loadConfig();
 	let { enabled, summaryCount } = await getGuidedFrontDoorStatus(cwd);
+
+	// Onboarding-funnel snapshot on entry, reusing the front door's lightweight
+	// status so the heavy `getStatus()` probe is skipped. Fires for every path
+	// past the git gate — including the user who declines to enable — so those
+	// early exits aren't blind spots. The enable *transition* is separately
+	// marked by `surface_enabled` below.
+	await maybeEmitOnboardingProgress({ cwd, config, status: { enabled, summaryCount } });
 
 	// Any of these counts as "has some credential" and skips the sign-in guide.
 	// `aiProvider: "local-agent"` is self-sufficient for generation — it drives the

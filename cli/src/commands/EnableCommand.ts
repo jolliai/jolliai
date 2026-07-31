@@ -18,6 +18,7 @@ import {
 	localAgentOverrideFrom,
 } from "../core/localagent/DetectAgents.js";
 import { LOCAL_AGENT_TOOLS, localAgentToolLabel, localAgentToolLoginHint } from "../core/localagent/ToolMeta.js";
+import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
 import { getGlobalConfigDir, loadConfig, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
 import { markSkipExitFlush } from "../core/TelemetryCommandHook.js";
@@ -549,6 +550,14 @@ async function reportEnableResult(
 			console.warn(`  Warning: ${warning}`);
 		}
 	}
+
+	// Onboarding-funnel snapshot: record where this install now sits (in-git →
+	// enabled → has-capture → memories). Fires on BOTH success and the non-git
+	// failure path (which reports in_git_repo=false), so the "installed but never
+	// got into a git repo" drop-off is visible. Config is reloaded because the
+	// interactive provider flow above may have just added a capture route. Fully
+	// guarded — never throws.
+	await maybeEmitOnboardingProgress({ cwd: options.cwd, config: await loadConfig() });
 }
 
 /** Registers the `disable` command on the given Commander program. */
