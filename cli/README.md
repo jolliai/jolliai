@@ -4,13 +4,19 @@ The `@jolli.ai/cli` package has two main uses:
 
 ## 1. Jolli Memory — automatic AI session summaries
 
-Turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort. When you work with AI agents like Claude Code, Codex, Gemini, OpenCode, Cursor IDE, GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+Turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort. When you work with AI agents like Claude Code, Codex, Gemini, Antigravity, OpenCode, Cursor IDE (Composer), Cursor CLI (`cursor-agent`), GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+
+**Why teams pick it:**
+
+- **100% open source** — the CLI, editor integrations, and on-disk memory format are all in the open, so you can inspect how Jolli works end to end.
+- **Bring your AI agent and key** — keep using the agent you already like, with your own Anthropic key, a Jolli account, or a local agent login depending on your setup.
+- **Local-first and private** — memories are written to your repo and Memory Bank on disk first, and you decide if or when anything is synced out.
 
 **What it does:**
 
 - **Automatic capture** — after each commit, reads your AI transcripts + diff, calls the LLM, and stores a structured summary alongside the commit. The commit returns instantly; the summary is generated in a detached background process (~10–20 s).
 - **Catch up on existing history** — `jolli backfill` creates memories for commits you made before enabling Jolli.
-- **Ten supported agents** — Claude Code, Codex, Gemini CLI, OpenCode, Cursor (Composer IDE + `cursor-agent` CLI), GitHub Copilot CLI, VS Code Copilot Chat, Cline (CLI + VS Code), Devin CLI, and Antigravity.
+- **Ten supported agents** — Claude Code, Codex, Gemini CLI, Antigravity, OpenCode, Cursor (Composer IDE + `cursor-agent` CLI), GitHub Copilot CLI, VS Code Copilot Chat, Cline (CLI + VS Code), and Devin CLI.
 - **Dual storage** — every memory is written to a dedicated git orphan branch (`jollimemory/summaries/v3`, the source of truth) **and** to a human-browsable Memory Bank folder on disk (canonical JSON + Markdown).
 - **Worktree-aware** — hooks and summaries work across `git worktree` checkouts.
 - **Squash / amend / rebase safe** — a unified operation queue migrates or consolidates summaries when commits are rewritten, so memories are never lost.
@@ -20,6 +26,8 @@ Turns your AI coding sessions into structured development documentation attached
 - **Knowledge wiki** — `jolli compile` folds the work scattered across many commits into per-topic pages and a browsable `_wiki/` folder in your Memory Bank, updated automatically after each commit.
 - **Knowledge graph** — `jolli graph` exports the wiki's topics as an interactive, self-contained HTML map of categories, knowledge units, and the typed links between them. Built incrementally alongside the wiki on every commit.
 - **Issue, page & conversation references** — Linear, Jira, GitHub, Notion, Slack, Zoom, Confluence, Asana, and monday.com items mentioned in your AI conversations are captured and attached to the relevant memory, along with context7 library-documentation lookups and Jolli's own memory lookups (`recall` / `search` / `get_decision_timeline` — the question asked is recorded, never the memory that came back). **Claude Code and Codex only:** every other supported agent's transcript format discards the tool calls this reads, so references are simply never captured there.
+- **Skill usage** — the agent skills entered while doing the work are captured alongside plans, notes, and references, with their token cost and the commit they belong to. **Claude Code and OpenCode** expose a real skill tool, so their rows are exact; **Codex** has none (its only signal is a shell command reading a `SKILL.md`), so its rows are flagged as heuristic and carry no token figure. Every other supported agent reports nothing, for one of two reasons: Gemini, Antigravity, Cline, and Devin CLI have no skill concept on disk at all, while Cursor and GitHub Copilot CLI do ship skills but leave no record of *entering* one in anything they write to disk.
+- **Per-repo push control** — `jolli push-control` decides whether *this* repo's memories are pushed to a Jolli Space. Capture keeps running locally either way, and memory retained while pushing was off is synced when you turn it back on.
 - **Privacy-first** — transcripts and diff go straight to Anthropic (with your `apiKey`) or via the Jolli LLM proxy (in-memory, never persisted). Raw transcripts are never uploaded to Jolli Space.
 
 Jump to: [Jolli Memory](#jolli-memory) · [How It Works](#how-it-works) · [Installation](#installation) · [CLI Commands](#cli-commands) · [Session Context Recall](#session-context-recall) · [Configuration](#configuration) · [Privacy](#privacy)
@@ -53,7 +61,7 @@ npm install -g @jolli.ai/cli
 jolli enable            # run from your project root
 ```
 
-`jolli enable` auto-registers a local MCP server named `jollimemory` into every AI host it detects on your machine (Claude Code, Cursor, Codex, Gemini CLI, OpenCode, GitHub Copilot CLI, VS Code Copilot Chat). MCP registration is automatic: nothing to opt into, and no separate MCP install. Restart your agent afterward so it picks up the new server.
+`jolli enable` auto-registers a local MCP server named `jollimemory` into every AI host it detects on your machine — ten of them: Claude Code, Cursor, Gemini, Antigravity, Codex, OpenCode, GitHub Copilot CLI, VS Code Copilot Chat, Cline (the VS Code extension), and Devin CLI. A host qualifies by being **installed on disk**, which is deliberately a weaker test than "Jolli can read its conversations" — a host whose session store this runtime can't open still gets the MCP server. MCP registration is automatic: nothing to opt into, and no separate MCP install. Restart your agent afterward so it picks up the new server.
 
 **CLI-hosted, not remote.** Jolli's MCP server is a local stdio process (`jolli mcp`) that each host spawns on your own machine. There is no remote URL and no `.well-known/mcp.json` to point a cloud MCP client at, and your memories never leave your machine to be queried.
 
@@ -82,15 +90,15 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | -- | -- |
 | **Claude Code** | A lightweight `StopHook` fires after each AI response; a `SessionStartHook` injects a mini-briefing at session start |
 | **Gemini** | An `AfterAgent` hook fires after each agent completion |
+| **Antigravity** | No hook needed — sessions are discovered automatically by reading the per-conversation SQLite for the workspace path and the sibling plaintext transcript log for the conversation content |
 | **Codex** | No hook needed — sessions are discovered automatically by scanning the filesystem. Linear/Jira/GitHub/Notion/Slack/Zoom/Confluence/Asana/monday.com/Jolli-Memory references in Codex MCP calls are extracted on the VS Code sidebar's 60s polling tick (not at commit time) |
 | **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database at `~/.local/share/opencode/opencode.db` (requires Node 22.5+) |
 | **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by reading Cursor's local SQLite stores (`globalStorage/state.vscdb` plus per-workspace `workspaceStorage/` databases under your platform's Cursor user-data directory) |
+| **Cursor CLI** (`cursor-agent`) | No hook needed — sessions are discovered automatically from Cursor's plaintext `~/.cursor` session store (`meta.json` + JSONL); shares the **Cursor** toggle with the Composer IDE |
 | **GitHub Copilot CLI** | No hook needed — sessions are discovered automatically by scanning Copilot CLI's session log |
 | **VS Code Copilot Chat** | No hook needed — sessions are discovered automatically by reading the Copilot Chat conversation cache |
-| **Cursor CLI** (`cursor-agent`) | No hook needed — sessions are discovered automatically from Cursor's plaintext `~/.cursor` session store (`meta.json` + JSONL); shares the **Cursor** toggle with the Composer IDE |
 | **Cline** (CLI + VS Code) | No hook needed — sessions are discovered automatically from Cline's local session store (the CLI's `~/.cline/data` plaintext session files and the VS Code extension's task store) |
 | **Devin CLI** | No hook needed — sessions are discovered automatically from Devin's local SQLite database (`~/.local/share/devin/cli/sessions.db`; `%APPDATA%\devin\cli` on Windows), scoped by working directory |
-| **Antigravity** | No hook needed — sessions are discovered automatically by reading the per-conversation SQLite for the workspace path and the sibling plaintext transcript log for the conversation content |
 
 ### Git Hooks — generating summaries on commit
 
@@ -147,7 +155,7 @@ Installs all hooks required for automatic summarization:
 - **Git post-rewrite hook** — migrates summaries on amend/rebase
 - **Git prepare-commit-msg hook** — detects squash operations
 - **Gemini AfterAgent hook** (if Gemini CLI detected) — tracks Gemini sessions
-- **MCP server registration** — registers the `jollimemory` MCP server into every AI host Jolli detects (Claude Code and Cursor per-repo; Gemini CLI, Codex, OpenCode, and Copilot machine-wide) so your agent can query your memories (see [`jolli mcp`](#jolli-mcp))
+- **MCP server registration** — registers the `jollimemory` MCP server into every AI host Jolli detects (Claude Code and Cursor per-repo; Gemini, Antigravity, Codex, OpenCode, Copilot CLI, Copilot Chat, Cline, and Devin CLI machine-wide) so your agent can query your memories (see [`jolli mcp`](#jolli-mcp))
 - **Skill preference** *(opt-in)* — can teach your AI agent to reach for Jolli by default when creating a PR, searching past work, or recalling a branch, by writing to your machine-global instruction files (`~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`). `jolli enable` no longer prompts — it only applies a decision you've already made. Turn it on with `jolli configure --set globalInstructions=enabled` (or the editor toggle); it stays off until you do.
 
 ```bash
@@ -166,7 +174,7 @@ jolli disable
 
 Machine-wide cleanup: finds and removes Jolli Memory installs and configuration across surfaces — VS Code–family extensions (including forks like Cursor, Windsurf, VSCodium), JetBrains/Android Studio plugins, the global `@jolli.ai/cli` package and `jolli` shim, the machine-global `~/.jolli/jollimemory/` and per-project `.jolli/jollimemory/` state, and the current repo's hooks and **repo-scoped** MCP registration. Prints a grouped inventory first and supports interactive selection.
 
-A few shared artifacts are deliberately left in place: **global-scope MCP registrations** (the Gemini / Codex / OpenCode / Copilot host files) and the **global instruction blocks** in `~/.claude/CLAUDE.md` / `~/.gemini/GEMINI.md` / `~/.codex/AGENTS.md` are shared by every repo on the machine, so removing them during one uninstall would break Jolli for your other repos; and the generated `SKILL.md` files are left untouched because they may sit alongside skills of your own. Remove those by hand if you want a completely bare machine.
+A few shared artifacts are deliberately left in place: **global-scope MCP registrations** (the Gemini / Antigravity / Codex / OpenCode / Copilot CLI / Copilot Chat / Cline / Devin CLI host files) and the **global instruction blocks** in `~/.claude/CLAUDE.md` / `~/.gemini/GEMINI.md` / `~/.codex/AGENTS.md` are shared by every repo on the machine, so removing them during one uninstall would break Jolli for your other repos; and the generated `SKILL.md` files are left untouched because they may sit alongside skills of your own. Remove those by hand if you want a completely bare machine.
 
 Your memories are never touched — the summaries orphan branch and Memory Bank content are excluded by construction.
 
@@ -197,12 +205,32 @@ The login flow opens your default browser for OAuth authentication. After comple
 
 ### `jolli status`
 
-Shows the current installation status, including CLI version, hook state, authentication state, active sessions, supported integrations (Claude, Codex, Gemini, OpenCode, Cursor, Copilot CLI, Copilot Chat), and summary count.
+Shows the current installation status, including CLI version, hook state, authentication state, active sessions, supported integrations (Claude, Codex, Gemini, Antigravity, OpenCode, Cursor, Copilot CLI, Copilot Chat, Cline, Devin CLI), Memory Bank state, whether this repo pushes to a Jolli Space, and summary count.
 
 ```bash
 jolli status
 jolli status --json   # machine-readable output
 ```
+
+### `jolli push-control`
+
+Shows or sets whether **this** repo's memories are pushed to a Jolli Space. Capture is unaffected either way — turning push off keeps recording memories locally and only blocks outbound sync, both automatic and manual. Repos are allowed by default; anything retained while push was off is synced on the repo's next activity after you re-enable it. The VS Code extension exposes the same control for every tracked repo under **Settings → Sync to Jolli**.
+
+```bash
+# Show this repo's state
+jolli push-control
+
+# Stop sending this repo's memories (they are still recorded locally)
+jolli push-control --disable
+
+# Resume, and sync whatever was retained while it was off
+jolli push-control --enable
+
+# Machine-readable
+jolli push-control --format json
+```
+
+If the setting store can't be read, every repo fails closed to **OFF** and the command tells you which file to repair. `--enable` also rebuilds the store, but from an empty set — it drops every repo's opt-out, so repair the file first if you have others turned off.
 
 ### `jolli view`
 
@@ -357,7 +385,7 @@ jolli configure --set excludePatterns=docs/**,*.log,node_modules
 jolli configure --remove jolliApiKey
 ```
 
-Supported keys: `apiKey`, `aiProvider`, `localAgentTool`, `localAgentPath`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `clineEnabled`, `devinEnabled`, `antigravityEnabled`, `globalInstructions`, `mcpPlatformToolsEnabled`, `localFolder`, `logLevel`, `excludePatterns`, `syncTranscripts`. `globalInstructions` (`enabled` / `disabled`, unset = undecided) records whether the skill-preference note is written into your machine-global AI instruction files. Setting it to `enabled` writes the block immediately; `disabled` removes it. `jolli enable` never prompts — it only applies the current value (`enabled` → write, `disabled` → remove, unset → no change). `aiProvider` pins the summarization backend (`"anthropic"`, `"jolli"`, or `"local-agent"`); when omitted, the dispatcher falls back to the legacy precedence (`apiKey` > `ANTHROPIC_API_KEY` > `jolliApiKey`). `local-agent` drives a locally-installed AI CLI (Claude Code today) to generate memories instead of calling an API — `localAgentTool` selects the tool (currently only `claude-code`) and `localAgentPath` optionally points at the binary when it isn't on your `PATH`. `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch, and `cursorEnabled` likewise covers both Cursor's Composer IDE and the `cursor-agent` CLI. `clineEnabled`, `devinEnabled`, and `antigravityEnabled` enable the Cline, Devin CLI, and Antigravity sources respectively. `mcpPlatformToolsEnabled` (boolean, on by default) controls whether the `jolli mcp` server surfaces the backend-defined platform tools; set it to `false` to expose only the built-in tools. `localFolder` is the Memory Bank root on disk where every memory is dual-written. `syncTranscripts` opts raw transcripts into cloud sync — see [Memory Bank cloud sync](#memory-bank-cloud-sync) below; run a round on demand with `jolli sync-memory-bank`. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
+Supported keys: `apiKey`, `aiProvider`, `localAgentTool`, `localAgentPath`, `model`, `maxTokens`, `jolliApiKey`, `authToken`, `claudeEnabled`, `codexEnabled`, `geminiEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `clineEnabled`, `devinEnabled`, `antigravityEnabled`, `globalInstructions`, `mcpPlatformToolsEnabled`, `localFolder`, `logLevel`, `excludePatterns`, `syncTranscripts`. `globalInstructions` (`enabled` / `disabled`, unset = undecided) records whether the skill-preference note is written into your machine-global AI instruction files. Setting it to `enabled` writes the block immediately; `disabled` removes it. `jolli enable` never prompts — it only applies the current value (`enabled` → write, `disabled` → remove, unset → no change). `aiProvider` pins the summarization backend (`"anthropic"`, `"jolli"`, or `"local-agent"`); when omitted, the dispatcher falls back to the legacy precedence (`apiKey` > `ANTHROPIC_API_KEY` > `jolliApiKey`). `local-agent` drives a locally-installed AI CLI to generate memories instead of calling an API — `localAgentTool` selects which one (`claude-code` (default), `codex`, `cursor-agent`, or `opencode`) and `localAgentPath` optionally points at the binary when it isn't on your `PATH`. Two things differ by tool: only `claude-code` is capability-probed with the real run flags and handed a resolved model id (the other three run whatever model they are configured with, even though the stored metadata still records the Claude alias), and `opencode` deliberately keeps your provider credentials in its environment, so it spends your own provider credit. `copilotEnabled` controls both GitHub Copilot CLI and VS Code Copilot Chat as a single switch, and `cursorEnabled` likewise covers both Cursor's Composer IDE and the `cursor-agent` CLI. `clineEnabled`, `devinEnabled`, and `antigravityEnabled` enable the Cline, Devin CLI, and Antigravity sources respectively. `mcpPlatformToolsEnabled` (boolean, on by default) controls whether the `jolli mcp` server surfaces the backend-defined platform tools; set it to `false` to expose only the built-in tools. `localFolder` is the Memory Bank root on disk where every memory is dual-written. `syncTranscripts` opts raw transcripts into cloud sync — see [Memory Bank cloud sync](#memory-bank-cloud-sync) below; run a round on demand with `jolli sync-memory-bank`. Run `jolli configure --list-keys` for descriptions and types. Unknown keys and malformed values (e.g. `maxTokens=8192abc`, `logLevel=banana`) are rejected with exit code 1.
 
 ### Memory Bank cloud sync
 
@@ -464,7 +492,7 @@ Settings are stored globally in `~/.jolli/jollimemory/config.json`. The recommen
 |-------|------|---------|-------------|
 | `apiKey` | string | `$ANTHROPIC_API_KEY` | Anthropic API key for summarization ([get one here](https://platform.anthropic.com/)) |
 | `aiProvider` | enum | (auto) | Pin which provider generates summaries: `"anthropic"` (use `apiKey` / `$ANTHROPIC_API_KEY`), `"jolli"` (use `jolliApiKey`), or `"local-agent"` (drive a locally-installed AI CLI). When unset, the resolver falls back to the legacy precedence (`apiKey` → `$ANTHROPIC_API_KEY` → `jolliApiKey`). Each generated summary records the chosen source in its `LlmCallMetadata.source` field (`anthropic-config` / `anthropic-env` / `jolli-proxy` / `local-agent`). |
-| `localAgentTool` | enum | `claude-code` | Which local Agent CLI to drive when `aiProvider` is `"local-agent"`. Currently only `claude-code`; reserved for future tools (Codex, Cursor). Ignored otherwise. |
+| `localAgentTool` | enum | `claude-code` | Which local Agent CLI to drive when `aiProvider` is `"local-agent"`: `claude-code`, `codex`, `cursor-agent`, or `opencode`. Only `claude-code` is capability-probed and given a resolved model id; `opencode` runs on your own provider credentials. Ignored when `aiProvider` is anything else. |
 | `localAgentPath` | string | (PATH) | Explicit path to the local agent binary, overriding `PATH` discovery. Used only when `aiProvider` is `"local-agent"`. |
 | `model` | string | `claude-sonnet-4-6` | Model used for summarization. Accepts an alias (`sonnet`, `haiku`) or a full model ID. |
 | `maxTokens` | integer | model default | Max output tokens per summarization call |
@@ -584,7 +612,7 @@ The generated summary is then dual-written locally — to the git orphan branch 
 
 ### Uploads to Jolli Space
 
-The CLI itself does not push summaries to Jolli Space — that action lives in the VS Code and IntelliJ extensions (**Share in Jolli** button). When triggered there, only the **generated summary** and its **associated plans and notes** are uploaded. The pushed article (and the clipboard export) carries a **Task usage** line — total tokens, a cost estimate, and the input / output / cached split, aggregated across squashed and amended commits. **Raw transcripts are never sent to Jolli Space.**
+The CLI itself does not push summaries to Jolli Space — that action lives in the VS Code and IntelliJ extensions (**Share in Jolli** button). When triggered there, only the **generated summary** and its **associated plans and notes** are uploaded, and only if this repo's outbound push is on (see [`jolli push-control`](#jolli-push-control)). The pushed article (and the clipboard export) carries a **Task usage** line — total tokens, a cost estimate, and the input / output / cached split, aggregated across squashed and amended commits. **Raw transcripts are never sent to Jolli Space.**
 
 ### Session metadata
 
@@ -594,8 +622,8 @@ Session IDs, transcript file paths, and timestamps are stored locally in `<proje
 
 Two `.jolli/jollimemory/` directories carry local state, both stay on your disk unless one of the specific actions above is triggered:
 
-- `~/.jolli/jollimemory/` (machine-global) — `config.json` (apiKey / authToken / jolliApiKey), hook entry scripts, dist-path indirection.
-- `<projectDir>/.jolli/jollimemory/` (per-project, gitignored) — `sessions.json` (session metadata), `plans.json`, `notes/`, `cursors.json`, `git-op-queue/`, `briefing-cache.json`, `debug.log`.
+- `~/.jolli/jollimemory/` (machine-global) — `config.json` (apiKey / authToken / jolliApiKey), `push-control.json` (which repos are allowed to push), hook entry scripts, dist-path indirection.
+- `<projectDir>/.jolli/jollimemory/` (per-project, gitignored) — `sessions.json` (session metadata), `plans.json`, `notes/`, `skills/` (captured skill usage), `cursors.json`, `git-op-queue/`, `briefing-cache.json`, `debug.log`.
 
 Every entry on the `jollimemory/summaries/v3` orphan branch — and its mirror inside the Memory Bank folder, including raw transcripts — also stays on your disk unless one of the specific actions above is triggered.
 
@@ -718,4 +746,3 @@ What it does: detects sidebar config, reorganizes directory structure, downgrade
 ## License
 
 [Apache License 2.0](https://github.com/jolliai/jolliai/blob/main/LICENSE)
-

@@ -1,6 +1,15 @@
 # Changelog
 
-<!-- Last synced commit: 4adbd12e | 2026-07-24 -->
+<!-- Last synced commit: 89a5cb46 | 2026-07-31 -->
+
+## 0.99.10
+
+- **See which skills your agent used** — memories now show a **Skills used** row in the sidebar and context details, so it's easier to see what tools were part of the work. On some hosts this is exact, and on others it is best-effort.
+- **Turn sync on or off per repo** — **Settings → Sync to Jolli** now lets you disable outbound sync for one repo without stopping local capture.
+- **Choose your local agent in Settings** — **Settings → AI Summary** now lets you pick **Claude Code**, **Codex**, **Cursor**, or **OpenCode** for local memory generation.
+- **Every memory has a short `JM-...` ID** — you can quote it in a PR, issue, or message.
+- **Memories match the commit more closely** — relevance is now based more on what actually changed, not just which files changed.
+- Bug fixes.
 
 ## 0.99.9
 

@@ -1,6 +1,17 @@
 # Changelog
 
-<!-- Last synced commit: 4adbd12e | 2026-07-24 -->
+<!-- Last synced commit: 89a5cb46 | 2026-07-31 -->
+
+## 0.99.10
+
+- **Skills used now show up in memory** — Jolli now saves which agent skills were used for a change, alongside plans, notes, and references. On some hosts this is exact, and on others it is best-effort.
+- **Choose per repo whether memory is synced out** — the new `jolli push-control` command lets you turn syncing to Jolli on or off for one repo. Local capture keeps running either way, and anything kept while sync was off is sent when you turn it back on.
+- **More local agents are supported** — `local-agent` can now use **Claude Code**, **Codex**, **Cursor**, or **OpenCode** to generate memories.
+- **MCP setup now covers more hosts** — Jolli can now register its MCP server in **Cline**, **Devin CLI**, and **Antigravity**, in addition to the hosts already supported.
+- **Jolli lookups are part of the record** — `recall`, `search`, and timeline lookups now appear as references on the memory, so it's clearer what context was used.
+- **Every memory gets a short `JM-...` ID** — you can quote that ID in a PR, issue, or message.
+- **Memories match the commit more closely** — relevance is now based more on what actually changed, not just which files changed.
+- Bug fixes.
 
 ## 0.99.9
 

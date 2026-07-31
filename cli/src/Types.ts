@@ -1152,9 +1152,10 @@ export interface SkillEntry {
 	 * its own increment, never a running total that would re-count earlier commits.
 	 *
 	 * Deliberately NOT solved by zeroing the row (or deleting the working file) at
-	 * archive time: the file at `sourcePath` is the ONLY dedup ledger. Discovery is
-	 * cursorless by design (see TranscriptSkillDiscovery) and re-emits invocations on
-	 * every pass, deduped by `at` against what is already on disk. Clearing it would
+	 * archive time: the file at `sourcePath` is the ONLY dedup ledger. Main transcripts
+	 * ride the `skills` extractor's own monotonic mark, but subagent files are re-scanned
+	 * in full on every pass by design (see TranscriptSkillDiscovery), so invocations are
+	 * re-emitted and deduped by `at` against what is already on disk. Clearing it would
 	 * make a re-scan of an already-archived transcript read as fresh usage.
 	 *
 	 * Absent on rows written before this existed; treated as an all-zero baseline,
