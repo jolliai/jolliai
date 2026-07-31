@@ -197,4 +197,16 @@ describe("maybeEmitOnboardingProgress", () => {
 		await expect(maybeEmitOnboardingProgress({ cwd: tmp, config: {} })).resolves.toBeUndefined();
 		expect(trackMock).not.toHaveBeenCalled();
 	});
+
+	it("serializes concurrent calls so one unchanged state emits exactly once", async () => {
+		const opts = { cwd: tmp, config: {}, status: { enabled: true, summaryCount: 2 } };
+		// Same tick, no in-flight guard at the caller (VS Code's fire-and-forget refresh):
+		// without per-ledger serialization these would race read→write and double-emit.
+		await Promise.all([
+			maybeEmitOnboardingProgress(opts),
+			maybeEmitOnboardingProgress(opts),
+			maybeEmitOnboardingProgress(opts),
+		]);
+		expect(trackMock).toHaveBeenCalledTimes(1);
+	});
 });

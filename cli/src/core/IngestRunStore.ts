@@ -48,10 +48,14 @@ export async function appendIngestRun(cwd: string, record: IngestRunRecord): Pro
 	const next = [...existing, record].slice(-MAX_RUNS);
 	await atomicWriteFile(join(dir, RUNS_FILE), JSON.stringify(next, null, "\t"));
 	emitIngestTelemetry(record);
-	// Onboarding-funnel snapshot at the memories-generated transition: a drain
-	// that actually ingested something is the moment checkpoint 4 flips true.
-	// Idle drains (ingested=0, ~27% of runs) skip it — no state change and no
-	// reason to pay for a status probe. Fully guarded; never throws.
+	// Onboarding-funnel snapshot after a real drain. A drain that ingested
+	// something is a natural point to re-report the funnel — the memories it
+	// folded in already exist, so this re-reports memories_generated=true rather
+	// than being the moment it flips. Ingest only runs with a working provider
+	// (runIngestFromQueue bails when resolveLlmCredentialSource is null), so this
+	// trigger structurally never reports capture_method:"none". Idle drains
+	// (ingested=0) skip it — no new state, no reason to pay for a status probe.
+	// Fully guarded; never throws.
 	if (record.ingested > 0) {
 		await maybeEmitOnboardingProgress({ cwd, config: await loadConfig() });
 	}

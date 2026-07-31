@@ -29,12 +29,26 @@
  * reached checkpoint N"). No repo identifier is attached — see the funnel
  * design notes; a salted repo hash was deliberately left out to keep the
  * snapshot maximally conservative.
+ *
+ * Dedup-ledger location: the ledger lives at `getJolliMemoryDir(cwd)` — the
+ * *literal* cwd, not the git root (the same cwd contract as the telemetry
+ * buffer, JOLLI-1957). The consequence points the OPPOSITE way from the
+ * buffer's: buffer fragmentation strands events, but ledger fragmentation
+ * *duplicates* sends — running from two subdirectories of one repo yields two
+ * ledgers and one extra emit (plus a daily heartbeat each). Accepted for now
+ * because every shipped trigger passes a repo-root / workspace-root cwd
+ * (`resolveProjectDir`, `bridge.cwd`, `project.basePath`, the QueueWorker cwd);
+ * if a subdirectory-cwd trigger is ever added, anchor the ledger to the git
+ * common-dir instead. Writes go through `atomicWriteFile` and a per-path
+ * in-flight guard so the read→decide→write cycle can't interleave (VS Code
+ * fires `refresh()` from ≥5 uncoordinated triggers).
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getJolliMemoryDir } from "../Logger.js";
 import type { JolliMemoryConfig, StatusInfo } from "../Types.js";
+import { atomicWriteFile } from "./AtomicWrite.js";
 import { isInsideGitRepo } from "./GitOps.js";
 import { resolveLlmCredentialSource } from "./LlmClient.js";
 import { type BucketLabel, bucket, getTelemetryContext, track } from "./Telemetry.js";
@@ -94,9 +108,11 @@ export interface ResolveFunnelOptions {
 }
 
 /**
- * Compute the onboarding snapshot for a repo context. Never throws. When the
- * cwd is not a git repo we short-circuit — no hooks, no summaries — and never
- * touch `getStatus()`.
+ * Compute the onboarding snapshot for a repo context. **Rejects** if the
+ * underlying `isInsideGitRepo` / `getStatus` calls fail — the caller
+ * (`maybeEmitOnboardingProgress`) is where the swallow-and-continue guard lives,
+ * so telemetry never breaks the command. When the cwd is not a git repo we
+ * short-circuit — no hooks, no summaries — and never touch `getStatus()`.
  */
 export async function resolveOnboardingFunnel(opts: ResolveFunnelOptions): Promise<OnboardingFunnelState> {
 	const captureMethod = captureMethodOf(opts.config);
@@ -165,6 +181,17 @@ async function readLedger(path: string): Promise<OnboardingLedger | undefined> {
 }
 
 /**
+ * Serializes the read→decide→write cycle per ledger path. VS Code drives
+ * `StatusStore.refresh()` (a fire-and-forget with no in-flight guard) from ≥5
+ * uncoordinated triggers — activation, the sessions/HEAD watchers, the manual
+ * refresh command, a fan-out — so two calls can land in the same tick. Without
+ * this they'd both read the same (or absent) ledger, both pass the dedup gate,
+ * and both emit for one state change. Keyed by ledger path so distinct repos
+ * still run concurrently.
+ */
+const ledgerLocks = new Map<string, Promise<unknown>>();
+
+/**
  * Emit an `onboarding_progressed` snapshot for this repo context, deduped so we
  * only send when the state tuple changed or a day has elapsed. Never throws —
  * telemetry must never break product code.
@@ -174,11 +201,37 @@ async function readLedger(path: string): Promise<OnboardingLedger | undefined> {
  * once an emit could actually have been buffered.
  */
 export async function maybeEmitOnboardingProgress(opts: ResolveFunnelOptions): Promise<void> {
+	let ledgerPath: string | undefined;
+	let run: Promise<unknown> | undefined;
+	// The WHOLE body is guarded — telemetry must never throw into the caller, even
+	// if `getTelemetryContext` itself is unavailable (e.g. a test that mocks the
+	// Telemetry module down to just `track`).
 	try {
+		// Short-circuit before any git/status work — and before taking the lock —
+		// when telemetry is off, so an opted-out user pays nothing.
 		if (!getTelemetryContext()?.enabled) return;
+		ledgerPath = join(getJolliMemoryDir(opts.cwd), LEDGER_FILE);
+		const path = ledgerPath;
+		run = (ledgerLocks.get(path) ?? Promise.resolve()).then(() => emitOnce(opts, path));
+		ledgerLocks.set(path, run);
+		await run;
+	} catch {
+		// Never let a telemetry snapshot break the command that triggered it.
+	} finally {
+		// Drop the entry once this run is the tail, so the map can't grow unbounded.
+		if (ledgerPath && run && ledgerLocks.get(ledgerPath) === run) ledgerLocks.delete(ledgerPath);
+	}
+}
+
+/**
+ * One dedup-gated snapshot emit for a single ledger path. Runs inside the
+ * per-path serialization above, so its read of the ledger always sees the
+ * previous winner's write. Never throws — a telemetry snapshot must not break
+ * the command (or the promise chain) that triggered it.
+ */
+async function emitOnce(opts: ResolveFunnelOptions, ledgerPath: string): Promise<void> {
+	try {
 		const state = await resolveOnboardingFunnel(opts);
-		const dir = getJolliMemoryDir(opts.cwd);
-		const ledgerPath = join(dir, LEDGER_FILE);
 		const sig = signatureOf(state);
 		const prev = await readLedger(ledgerPath);
 		const now = Date.now();
@@ -194,11 +247,13 @@ export async function maybeEmitOnboardingProgress(opts: ResolveFunnelOptions): P
 			memories_generated: state.memoriesGenerated,
 			memories_bucket: state.memoriesBucket,
 		});
+		const dir = getJolliMemoryDir(opts.cwd);
 		await mkdir(dir, { recursive: true });
-		await writeFile(
+		// Atomic write: a torn ledger would be read back as "first emit" (see
+		// readLedger), turning a crash mid-write into a duplicate rather than a skip.
+		await atomicWriteFile(
 			ledgerPath,
 			JSON.stringify({ sig, tsIso: new Date(now).toISOString() } satisfies OnboardingLedger),
-			"utf-8",
 		);
 	} catch {
 		// Never let a telemetry snapshot break the command that triggered it.

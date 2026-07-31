@@ -72,11 +72,16 @@ object OnboardingFunnel {
     fun maybeEmit(cwd: String, status: StatusInfo, env: HookEnv = HookEnv()) {
         try {
             if (!Telemetry.isEnabled()) return
-            val inGitRepo = File(cwd, ".git").exists()
+            // Always inside a git repo here: the only caller, JolliMemoryService.refreshStatus,
+            // has already verified `.git` at the project root and returned early otherwise. Hardcoded
+            // rather than a shallow File(cwd,".git").exists() — that check would wrongly report false
+            // if this ever became reachable from a subdirectory, disagreeing with the CLI's
+            // upward-walking isInsideGitRepo. Revisit if a non-root caller is added.
+            val inGitRepo = true
             val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
             val captureMethod = captureMethodOf(config, env)
             val captureConfigured = captureMethod != "none"
-            val repoEnabled = inGitRepo && status.enabled
+            val repoEnabled = status.enabled
             val summaryCount = status.summaryCount
             val memoriesBucket = Telemetry.bucket(summaryCount)
 
