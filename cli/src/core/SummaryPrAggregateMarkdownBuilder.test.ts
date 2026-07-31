@@ -16,6 +16,7 @@ import type {
 	NoteReference,
 	PlanReference,
 	ReferenceCommitRef,
+	SkillCommitRef,
 	TopicSummary,
 } from "../Types.js";
 
@@ -62,6 +63,7 @@ interface SummaryOpts {
 	plans?: ReadonlyArray<PlanReference>;
 	notes?: ReadonlyArray<NoteReference>;
 	references?: ReadonlyArray<ReferenceCommitRef>;
+	skills?: ReadonlyArray<SkillCommitRef>;
 	e2eTestGuide?: ReadonlyArray<E2eTestScenario>;
 	topics?: ReadonlyArray<TopicSummary>;
 }
@@ -81,6 +83,7 @@ function makeSummary(opts: SummaryOpts): CommitSummary {
 		plans: opts.plans,
 		notes: opts.notes,
 		references: opts.references,
+		skills: opts.skills,
 		e2eTestGuide: opts.e2eTestGuide,
 		topics: opts.topics,
 	} as unknown as CommitSummary;
@@ -356,6 +359,114 @@ describe("buildAggregatedPrMarkdown", () => {
 
 		expect(md).toContain("## Context");
 		expect(md.match(/Solo Linear/g)?.length).toBe(1);
+	});
+
+	it("carries skills into the aggregated Context section at all", () => {
+		// The merged summary handed to pushPlansAndNotesSection is synthetic. It used
+		// to be built with plans/notes/references only, so skills were silently dropped
+		// from every multi-commit PR body even though the shared renderer supports them.
+		const skill = (over: Partial<SkillCommitRef> = {}): SkillCommitRef =>
+			({
+				archivedKey: "claude:superpowers:brainstorming-aaaa1111",
+				source: "claude",
+				skill: "superpowers:brainstorming",
+				entryPaths: ["tool"],
+				invocationCount: 2,
+				firstUsedAt: "2026-05-06T00:00:00Z",
+				lastUsedAt: "2026-05-06T00:00:00Z",
+				usage: { input: 100, cached: 400, output: 500, confidence: "attributed" },
+				...over,
+			}) as SkillCommitRef;
+
+		const md = buildAggregatedPrMarkdown(
+			[makeSummary({ hash: "AAAA1234", skills: [skill()] }), makeSummary({ hash: "BBBB5678" })],
+			0,
+		);
+
+		expect(md).toContain("- Skills used — 1 skill · 1.0k tokens");
+	});
+
+	it("accumulates a skill used across several commits instead of first-wins", () => {
+		// Unlike plans / notes / references, the same skill in two commits is not a
+		// duplicate to drop — it is one skill used twice, and its tokens are the sum.
+		// The archivedKey cannot be the dedupe key: it appends a per-commit shortHash.
+		const at = (hash8: string, count: number): SkillCommitRef =>
+			({
+				archivedKey: `claude:superpowers:brainstorming-${hash8}`,
+				source: "claude",
+				skill: "superpowers:brainstorming",
+				entryPaths: ["tool"],
+				invocationCount: count,
+				firstUsedAt: "2026-05-06T00:00:00Z",
+				lastUsedAt: "2026-05-06T00:00:00Z",
+				usage: { input: 1000, cached: 0, output: 0, confidence: "attributed" },
+			}) as SkillCommitRef;
+
+		const md = buildAggregatedPrMarkdown(
+			[
+				makeSummary({ hash: "AAAA1234", skills: [at("aaaa1234", 2)] }),
+				makeSummary({ hash: "BBBB5678", skills: [at("bbbb5678", 3)] }),
+			],
+			0,
+		);
+
+		// ONE skill (deduped by source:skill), 2000 tokens (summed, not 1000).
+		expect(md).toContain("- Skills used — 1 skill · 2.0k tokens");
+	});
+
+	it("degrades a merged total to an estimate when either contributor was estimated", () => {
+		// A sum containing a guess is a guess — dropping the marker because the other
+		// half was measured would present a partly-guessed figure as measured.
+		const at = (confidence: "attributed" | "estimated"): SkillCommitRef =>
+			({
+				archivedKey: `claude:s-${confidence}`,
+				source: "claude",
+				skill: "s",
+				entryPaths: ["tool"],
+				invocationCount: 1,
+				firstUsedAt: "2026-05-06T00:00:00Z",
+				lastUsedAt: "2026-05-06T00:00:00Z",
+				usage: { input: 1000, cached: 0, output: 0, confidence },
+			}) as SkillCommitRef;
+
+		const md = buildAggregatedPrMarkdown(
+			[
+				makeSummary({ hash: "AAAA1234", skills: [at("attributed")] }),
+				makeSummary({ hash: "BBBB5678", skills: [at("estimated")] }),
+			],
+			0,
+		);
+
+		expect(md).toContain("- Skills used — 1 skill · ~2.0k tokens");
+	});
+
+	it("renders the Context section for a skills-only set of commits", () => {
+		// The early return used to consider only plans / notes / references, so a PR
+		// whose only captured context was skills emitted no Context section at all.
+		const md = buildAggregatedPrMarkdown(
+			[
+				makeSummary({
+					hash: "AAAA1234",
+					skills: [
+						{
+							archivedKey: "codex:x-aaaa1234",
+							source: "codex",
+							skill: "x",
+							entryPaths: ["tool"],
+							invocationCount: 1,
+							firstUsedAt: "2026-05-06T00:00:00Z",
+							lastUsedAt: "2026-05-06T00:00:00Z",
+							detection: "heuristic",
+						} as SkillCommitRef,
+					],
+				}),
+				makeSummary({ hash: "BBBB5678" }),
+			],
+			0,
+		);
+
+		expect(md).toContain("## Context");
+		expect(md).toContain("- Skills used — 1 skill · some inferred");
 	});
 
 	it("emits Quick recap blocks only for commits with non-empty recap, header carries the (N) count", () => {

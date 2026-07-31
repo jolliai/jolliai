@@ -9,7 +9,7 @@ import {
 	setExcluded,
 } from "../../../cli/src/core/CommitSelectionStore.js";
 import { JOLLI_DIR, JOLLIMEMORY_DIR } from "../../../cli/src/Logger.js";
-import type { SerializedTreeItem } from "../views/SidebarMessages.js";
+import { SKILLS_GROUP_ID, type SerializedTreeItem } from "../views/SidebarMessages.js";
 import {
 	type FilesSelectAll,
 	type SelectAllCtx,
@@ -82,6 +82,7 @@ function makeConversationCtx(
 		},
 		plansProvider: {
 			serialize: () => [],
+			skillMapKeys: () => [],
 			async refreshExclusions() {},
 		},
 		onChanged: async () => {
@@ -100,12 +101,14 @@ function makePlansCtx(
 	noteIds: string[],
 	changed: Array<() => void | Promise<void>> = [],
 	entityIds: string[] = [],
+	skillIds: string[] = [],
 ): SelectAllCtx {
-	let cachedExclusions = {
+	let cachedExclusions: Awaited<ReturnType<typeof readExclusions>> = {
 		plans: new Set<string>(),
 		notes: new Set<string>(),
 		conversations: new Set<string>(),
 		references: new Set<string>(),
+		skills: new Set<string>(),
 	};
 	return {
 		cwd,
@@ -134,8 +137,25 @@ function makePlansCtx(
 					contextValue: "reference",
 					isSelected: !cachedExclusions.references.has(id),
 				}));
-				return [...planRows, ...noteRows, ...entityRows];
+				// Skills collapse into ONE aggregate row carrying a sentinel id — the
+				// real per-skill keys reach the command through skillMapKeys(), not
+				// through a row. Checked only when every member is included.
+				const skillRows: SerializedTreeItem[] =
+					skillIds.length === 0
+						? []
+						: [
+								{
+									id: SKILLS_GROUP_ID,
+									label: "Skills",
+									contextValue: "skills",
+									isSelected: skillIds.every(
+										(id) => !(cachedExclusions.skills?.has(id) ?? false),
+									),
+								},
+							];
+				return [...planRows, ...noteRows, ...entityRows, ...skillRows];
 			},
+			skillMapKeys: () => skillIds,
 			async refreshExclusions() {
 				// Re-read so the next serialize() sees the new state.
 				cachedExclusions = await readExclusions(cwd);
@@ -236,6 +256,44 @@ describe("selectAllPlansAndNotesCommand", () => {
 		expect([...ex.notes]).toEqual(["note-1"]);
 	});
 
+	it("excludes skill rows alongside the other kinds", async () => {
+		// Skills were filtered out of the selectable set, so Select All left them
+		// checked — and they were also missing from the "is everything selected" test,
+		// which could put the button in a state the list contradicted.
+		const ctx = makePlansCtx(["plan-1"], [], [], [], ["claude:superpowers:brainstorming"]);
+		await selectAllPlansAndNotesCommand(ctx);
+		const ex = await readExclusions(cwd);
+		expect([...(ex.skills ?? [])]).toEqual(["claude:superpowers:brainstorming"]);
+		expect([...ex.plans]).toEqual(["plan-1"]);
+	});
+
+	it("re-selects skills when everything including them is excluded", async () => {
+		await setAllExcluded(cwd, "plans", ["plan-1"], true);
+		await setAllExcluded(cwd, "skills", ["claude:a:b"], true);
+
+		const ctx = makePlansCtx(["plan-1"], [], [], [], ["claude:a:b"]);
+		await ctx.plansProvider.refreshExclusions();
+		await selectAllPlansAndNotesCommand(ctx);
+
+		const ex = await readExclusions(cwd);
+		expect(ex.plans.size).toBe(0);
+		expect(ex.skills?.size ?? 0).toBe(0);
+	});
+
+	it("counts a skill row when deciding whether everything is already selected", async () => {
+		// A single excluded SKILL makes the set mixed, and mixed flips to all-selected
+		// (the same rule the mixed-plan test above pins). This is the property that was
+		// broken: with skill rows filtered out, the set looked fully selected, so the
+		// command would have flipped the other way and excluded everything.
+		await setExcluded(cwd, "skills", "claude:a:b", true);
+		const ctx = makePlansCtx(["plan-1"], [], [], [], ["claude:a:b"]);
+		await ctx.plansProvider.refreshExclusions();
+		await selectAllPlansAndNotesCommand(ctx);
+		const ex = await readExclusions(cwd);
+		expect(ex.plans.size).toBe(0);
+		expect(ex.skills?.size ?? 0).toBe(0);
+	});
+
 	it("selects all when every plan and note is excluded", async () => {
 		await setAllExcluded(cwd, "plans", ["plan-1", "plan-2"], true);
 		await setAllExcluded(cwd, "notes", ["note-1"], true);
@@ -292,6 +350,7 @@ describe("selectAllPlansAndNotesCommand", () => {
 				serialize() {
 					return [planRow, unknownRow];
 				},
+				skillMapKeys: () => [],
 				async refreshExclusions() {},
 			},
 			onChanged: async () => {},
@@ -396,6 +455,8 @@ function makeCurrentMemoryCtx(opts: {
 	planIds?: string[];
 	noteIds?: string[];
 	referenceIds?: string[];
+	/** plans.json.skills keys — surfaced as ONE aggregate row, like the real provider. */
+	skills?: string[];
 	files: ReturnType<typeof makeFilesFake>;
 	onChanged?: () => void | Promise<void>;
 }): SelectAllCurrentMemoryCtx {
@@ -403,11 +464,13 @@ function makeCurrentMemoryCtx(opts: {
 	const planIds = opts.planIds ?? [];
 	const noteIds = opts.noteIds ?? [];
 	const referenceIds = opts.referenceIds ?? [];
-	let lastExclusions = {
+	const skillIds = opts.skills ?? [];
+	let lastExclusions: Awaited<ReturnType<typeof readExclusions>> = {
 		plans: new Set<string>(),
 		notes: new Set<string>(),
 		conversations: new Set<string>(),
 		references: new Set<string>(),
+		skills: new Set<string>(),
 	};
 	return {
 		cwd,
@@ -455,8 +518,21 @@ function makeCurrentMemoryCtx(opts: {
 						contextValue: "reference" as const,
 						isSelected: !lastExclusions.references.has(id),
 					})),
+					...(skillIds.length === 0
+						? []
+						: [
+								{
+									id: SKILLS_GROUP_ID,
+									label: "Skills",
+									contextValue: "skills" as const,
+									isSelected: skillIds.every(
+										(id) => !(lastExclusions.skills?.has(id) ?? false),
+									),
+								},
+							]),
 				];
 			},
+			skillMapKeys: () => skillIds,
 			async refreshExclusions() {
 				lastExclusions = await readExclusions(cwd);
 			},

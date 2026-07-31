@@ -13,6 +13,29 @@ vi.mock("./SummaryMarkdownBuilder.js", () => ({
 	buildMarkdown: vi.fn().mockReturnValue("# Mock Markdown\n\nBody content"),
 }));
 
+/**
+ * Opt-in `unlinkSync` failure, keyed on a path substring.
+ *
+ * Inert by default (`pattern === null` delegates to the real call), so the rest of
+ * this suite — which does real filesystem work — is untouched. A spy on the module
+ * namespace would not do: FolderStorage binds `unlinkSync` as a named ESM import, so
+ * only a module mock reaches it.
+ */
+const unlinkFailure = vi.hoisted(() => ({ pattern: null as string | null }));
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return {
+		...actual,
+		unlinkSync: (path: Parameters<typeof actual.unlinkSync>[0]) => {
+			if (unlinkFailure.pattern !== null && String(path).includes(unlinkFailure.pattern)) {
+				throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+			}
+			return actual.unlinkSync(path);
+		},
+	};
+});
+
 // Suppress console output
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -311,6 +334,210 @@ describe("FolderStorage", () => {
 			const rootFiles = readdirSync(rootPath).filter((f: string) => !f.startsWith("."));
 			const mdFiles = rootFiles.filter((f: string) => f.endsWith(".md"));
 			expect(mdFiles).toHaveLength(0);
+		});
+	});
+
+	describe("skills visible aggregate", () => {
+		beforeEach(async () => {
+			await storage.ensure();
+		});
+
+		const withSkills = () =>
+			makeSummaryJson({
+				skills: [
+					{
+						archivedKey: "claude:superpowers:test-driven-development-abc12345",
+						source: "claude",
+						skill: "superpowers:test-driven-development",
+						plugin: "superpowers",
+						entryPaths: ["tool"],
+						invocationCount: 2,
+						firstUsedAt: "2026-07-30T06:00:00.000Z",
+						lastUsedAt: "2026-07-30T07:00:00.000Z",
+						usage: { input: 79, cached: 59796, output: 33944, confidence: "attributed" },
+					},
+					{
+						archivedKey: "claude:j:specs-plan-build-abc12345",
+						source: "claude",
+						skill: "j:specs-plan-build",
+						entryPaths: ["command"],
+						invocationCount: 1,
+						firstUsedAt: "2026-07-30T08:00:00.000Z",
+						lastUsedAt: "2026-07-30T08:00:00.000Z",
+						usage: { input: 10, cached: 12000, output: 300, confidence: "estimated" },
+					},
+				],
+			});
+
+		it("writes ONE aggregate file per commit, not one per skill", async () => {
+			// The whole reason this is emitted from the summary arm: the visible cascade
+			// runs per written file, so a `skills/*.md` arm would rewrite the aggregate
+			// once per skill and depend on whether storeSkills ran before storeSummary.
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: withSkills() }], "store");
+			const files = readdirSync(join(rootPath, "main")).filter((f: string) => f.startsWith("skills--"));
+			expect(files).toEqual(["skills--abc12345.md"]);
+		});
+
+		it("lists every skill with its count and tokens", async () => {
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: withSkills() }], "store");
+			const md = readFileSync(join(rootPath, "main", "skills--abc12345.md"), "utf-8");
+			expect(md).toContain("superpowers:test-driven-development");
+			expect(md).toContain("j:specs-plan-build");
+			// 79 + 59796 + 33944 = 93819
+			expect(md).toContain("93.8k");
+		});
+
+		it("marks an estimated figure so it is not read as measured", async () => {
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: withSkills() }], "store");
+			const md = readFileSync(join(rootPath, "main", "skills--abc12345.md"), "utf-8");
+			expect(md).toMatch(/12\.3k\s*~|~\s*12\.3k|12\.3k[^|]*\(est/);
+		});
+
+		it("writes no aggregate when the commit ran no skills", async () => {
+			await storage.writeFiles(
+				[{ path: "summaries/abc12345deadbeef.json", content: makeSummaryJson() }],
+				"store",
+			);
+			const files = readdirSync(join(rootPath, "main")).filter((f: string) => f.startsWith("skills--"));
+			expect(files).toEqual([]);
+		});
+
+		it("registers the aggregate in the manifest so stale cleanup can reach it", async () => {
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: withSkills() }], "store");
+			const entry = metadataManager.findByPath("main/skills--abc12345.md");
+			expect(entry?.type).toBe("skill");
+			expect(entry?.fileId).toBe("skill:abc12345deadbeef");
+		});
+
+		it("does not evict the summary's own manifest entry", async () => {
+			// updateManifest is keyed on fileId and REPLACES any entry sharing one, so a
+			// bare commit hash here would drop the summary's row — and findById(hash)
+			// would then hand this row to cleanupSupersededDescendants, whose
+			// `type !== "commit"` guard would skip cleaning the superseded summary.
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: withSkills() }], "store");
+			const summaryEntry = metadataManager.findById("abc12345deadbeef");
+			expect(summaryEntry?.type).toBe("commit");
+			expect(summaryEntry?.path).not.toContain("skills--");
+		});
+
+		it("removes the aggregate when the memory's visible markdown is deleted", async () => {
+			// The aggregate's lifecycle IS the summary's — that is why it needs no
+			// StorageProvider method of its own.
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: withSkills() }], "store");
+			await storage.deleteVisibleMarkdown({
+				commitHash: "abc12345deadbeef",
+				commitMessage: "Add login feature",
+				branch: "main",
+				commitDate: "2026-07-30T00:00:00.000Z",
+			} as Parameters<typeof storage.deleteVisibleMarkdown>[0]);
+			expect(existsSync(join(rootPath, "main", "skills--abc12345.md"))).toBe(false);
+		});
+
+		it("still deletes the memory when removing its aggregate fails", async () => {
+			// Ordering puts the sibling first so a half-done delete cannot leave an orphan
+			// claiming a memory that is gone — but deleteVisibleArtifact rethrows anything
+			// that is not ENOENT, so without isolation an unwritable sibling (permissions,
+			// a lock) would abort the deletion of the memory ITSELF. That trade is strictly
+			// worse: a stranded aggregate is swept by the next stale-child cleanup pass,
+			// while a memory that cannot be deleted stays reported as a failed cleanup.
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: withSkills() }], "store");
+			const aggregate = join(rootPath, "main", "skills--abc12345.md");
+			expect(existsSync(aggregate)).toBe(true);
+
+			unlinkFailure.pattern = "skills--";
+			try {
+				const deleted = await storage.deleteVisibleMarkdown({
+					commitHash: "abc12345deadbeef",
+					commitMessage: "Add login feature",
+					branch: "main",
+					commitDate: "2026-07-30T00:00:00.000Z",
+				} as Parameters<typeof storage.deleteVisibleMarkdown>[0]);
+				expect(deleted).toBe(true);
+			} finally {
+				unlinkFailure.pattern = null;
+			}
+
+			// The memory is gone; only the aggregate survived the failure.
+			expect(readdirSync(join(rootPath, "main")).filter((f: string) => f.endsWith(".md"))).toEqual([
+				"skills--abc12345.md",
+			]);
+		});
+
+		it("restores the aggregate when a memory's visible markdown is healed", async () => {
+			// Heal rebuilds the visible layer from the hidden JSON. Leaving the aggregate
+			// out would make healing a folder silently drop the skill record for every
+			// commit it repaired.
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: withSkills() }], "store");
+			unlinkSync(join(rootPath, "main", "skills--abc12345.md"));
+
+			await storage.regenerateVisibleMarkdown({
+				commitHash: "abc12345deadbeef",
+				commitMessage: "Add login feature",
+				branch: "main",
+				commitDate: "2026-07-30T00:00:00.000Z",
+			} as Parameters<typeof storage.regenerateVisibleMarkdown>[0]);
+
+			expect(existsSync(join(rootPath, "main", "skills--abc12345.md"))).toBe(true);
+		});
+
+		it("does not overwrite an aggregate the user edited by hand", async () => {
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: withSkills() }], "store");
+			const path = join(rootPath, "main", "skills--abc12345.md");
+			writeFileSync(path, "my own notes", "utf-8");
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: withSkills() }], "store");
+			expect(readFileSync(path, "utf-8")).toBe("my own notes");
+		});
+
+		it("marks an inferred skill and explains the dagger", async () => {
+			// A heuristic capture must not read as an observation. Codex has no skill
+			// tool, so its rows are inferred from a file read.
+			const json = makeSummaryJson({
+				skills: [
+					{
+						archivedKey: "codex:pr-review-abc12345",
+						source: "codex",
+						skill: "pr-review",
+						entryPaths: ["tool"],
+						invocationCount: 1,
+						firstUsedAt: "2026-07-30T08:00:00.000Z",
+						lastUsedAt: "2026-07-30T08:00:00.000Z",
+						detection: "heuristic",
+					},
+				],
+			});
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: json }], "store");
+			const md = readFileSync(join(rootPath, "main", "skills--abc12345.md"), "utf-8");
+			expect(md).toContain("pr-review †");
+			expect(md).toContain("Inferred from a file read");
+		});
+
+		it("adds no footnote when every skill was observed", async () => {
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: withSkills() }], "store");
+			const md = readFileSync(join(rootPath, "main", "skills--abc12345.md"), "utf-8");
+			expect(md).not.toContain("†");
+			expect(md).not.toContain("Inferred from");
+		});
+
+		it("omits the token column for a skill that reports no usage", async () => {
+			// Codex / Cursor heuristics attribute nothing. An absent figure must not
+			// render as a measured zero.
+			const json = makeSummaryJson({
+				skills: [
+					{
+						archivedKey: "codex:some-skill-abc12345",
+						source: "codex",
+						skill: "some-skill",
+						entryPaths: ["tool"],
+						invocationCount: 1,
+						firstUsedAt: "2026-07-30T08:00:00.000Z",
+						lastUsedAt: "2026-07-30T08:00:00.000Z",
+					},
+				],
+			});
+			await storage.writeFiles([{ path: "summaries/abc12345deadbeef.json", content: json }], "store");
+			const md = readFileSync(join(rootPath, "main", "skills--abc12345.md"), "utf-8");
+			expect(md).toContain("some-skill");
+			expect(md).not.toMatch(/\b0\b/);
 		});
 	});
 

@@ -121,6 +121,9 @@ export async function removeReference(cwd: string, mapKey: string): Promise<void
 			plans: registry.plans,
 			...(registry.notes !== undefined ? { notes: registry.notes } : {}),
 			references: existing,
+			// Carried, not dropped: removing one reference from the panel must not erase
+			// the skill registry. See PlansRegistryWriters.test.ts.
+			...(registry.skills !== undefined ? { skills: registry.skills } : {}),
 		};
 		await savePlansRegistry(out, cwd);
 		return entry.sourcePath;

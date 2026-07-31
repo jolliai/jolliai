@@ -28,6 +28,7 @@ import { discoverCodexSessions, isCodexInstalled } from "./CodexSessionDiscovere
 import { scanPlansFrom } from "./plans/TranscriptPlanDiscovery.js";
 import { scanReferencesFrom } from "./references/TranscriptReferenceDiscovery.js";
 import { loadConfig, loadDiscoveryCursor, migrateDiscoveryCursors, saveDiscoveryCursor } from "./SessionTracker.js";
+import { scanSkillsWithCursor } from "./skills/TranscriptSkillDiscovery.js";
 
 const log = createLogger("CodexDiscovery");
 
@@ -108,6 +109,13 @@ async function runOnce(cwd: string): Promise<void> {
 				} catch (err) {
 					log.warn("Codex plan discovery failed for %s: %s", session.sessionId, (err as Error).message);
 				}
+
+				// Skills scan on their OWN high-water mark, independently of the
+				// reference/plan window above. They can: the skills extractor has its own
+				// cursor, so it neither constrains nor is constrained by how far the
+				// shared cursor advances this pass. Capture from Codex is heuristic
+				// (a shell read of a SKILL.md), so a re-scan is idempotent by name.
+				await scanSkillsWithCursor(session.transcriptPath, cwd, "codex");
 
 				// Advance only when BOTH completed and the safe cursor moved — any
 				// throw holds this window so the next pass re-scans it (re-scan is

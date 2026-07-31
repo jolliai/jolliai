@@ -48,13 +48,29 @@
  * backfills `usage` onto legacy transcripts, attribute by `commitHash` here first.
  */
 
-import type { CommitSummary, ConversationTokenBreakdown, ModelTokenUsage } from "../Types.js";
+import type {
+	CommitSummary,
+	ConversationTokenBreakdown,
+	ModelTokenUsage,
+	SkillCommitRef,
+	SkillUsage,
+} from "../Types.js";
 import { estimateCostUsd, PRICES_AS_OF } from "./Pricing.js";
 
 /** One detached session's persisted attribution, as read back off the stored transcript. */
 export interface DetachedSessionUsage {
 	readonly usage?: ConversationTokenBreakdown;
 	readonly usageByModel?: ReadonlyArray<ModelTokenUsage>;
+	/**
+	 * `<source>:<sessionId>` — this session's identity, used to correct per-skill
+	 * figures (see {@link subtractSkillUsage}).
+	 *
+	 * Optional and independent of `usage`: a skill split can be corrected for a
+	 * session whose commit-level share was never recorded, and vice versa. Absent
+	 * means the skill figures are left as they are, the same forward-only stance the
+	 * aggregate path takes toward a memory with no stored per-session usage.
+	 */
+	readonly sessionKey?: string;
 }
 
 export interface DetachedUsageSubtractionResult {
@@ -236,6 +252,74 @@ function subtractFromNode(node: CommitSummary, removed: ReadonlyArray<DetachedSe
 }
 
 /**
+ * Drops the detached sessions from every skill's per-session split and re-totals.
+ *
+ * **Deliberately applied to EVERY node, not just the owning one** — the opposite of
+ * how the aggregate figures are handled, and for a structural reason rather than
+ * convenience. `conversationTokens` is a scalar sum with no record of who
+ * contributed what, so subtracting it at two nodes would remove the same tokens
+ * twice; that is what {@link resolveOwners} exists to prevent. A skill's
+ * `usageBySession` is an explicit map, so correcting it is a key DELETION —
+ * idempotent, and impossible to over-apply.
+ *
+ * That difference is not just permission, it is a requirement: amend hoists a
+ * child's skills onto the root, so one session's contribution is genuinely recorded
+ * in both places and both records are stale until each is corrected. Owner
+ * resolution would fix exactly one of them.
+ *
+ * A row whose split empties out keeps its identity and loses only its figure. The
+ * skill did run — the invocation count says so — and what a detach removes is the
+ * evidence of what it cost. An absent `usage` states that; a zero would claim the
+ * skill was free, and deleting the row would claim it never ran.
+ */
+function subtractSkillUsage(node: CommitSummary, detachedKeys: ReadonlySet<string>): CommitSummary {
+	if (node.skills === undefined || node.skills.length === 0 || detachedKeys.size === 0) return node;
+
+	let touched = false;
+	const next: SkillCommitRef[] = node.skills.map((ref): SkillCommitRef => {
+		// Forward-only: a row written before the split existed has nothing to subtract,
+		// and inventing a subtrahend is what the aggregate path already refuses to do.
+		if (ref.usageBySession === undefined) return ref;
+		const remaining: Record<string, SkillUsage> = {};
+		let dropped = false;
+		for (const [key, usage] of Object.entries(ref.usageBySession)) {
+			if (detachedKeys.has(key)) {
+				dropped = true;
+				continue;
+			}
+			remaining[key] = usage;
+		}
+		if (!dropped) return ref;
+		touched = true;
+
+		const { usage: _u, usageBySession: _s, ...withoutUsage } = ref;
+		const keys = Object.keys(remaining);
+		if (keys.length === 0) return withoutUsage;
+
+		let input = 0;
+		let cached = 0;
+		let output = 0;
+		let estimated = false;
+		for (const key of keys) {
+			input += remaining[key].input;
+			cached += remaining[key].cached;
+			output += remaining[key].output;
+			if (remaining[key].confidence !== "attributed") estimated = true;
+		}
+		// Confidence is re-derived, not carried over: dropping the only estimated
+		// session leaves a total that really is fully attributed, and keeping the old
+		// label would understate what we now know.
+		return {
+			...withoutUsage,
+			usage: { input, cached, output, confidence: estimated ? "estimated" : ("attributed" as const) },
+			usageBySession: remaining,
+		};
+	});
+
+	return touched ? { ...node, skills: next } : node;
+}
+
+/**
  * Applies `removedByTranscriptId` across the summary tree, subtracting each id's
  * share exactly once — at the single node that OWNS it (see {@link resolveOwners}
  * and the module header on why a node listing an id doesn't mean it owns it).
@@ -261,6 +345,16 @@ export function subtractDetachedUsage(
 	const owners = new Map<string, CommitSummary[]>();
 	resolveOwners(summary, new Set(removedByTranscriptId.keys()), owners);
 
+	// Skill correction is keyed on session identity, not on transcript ownership, so
+	// it is collected across the whole removal map at once. See subtractSkillUsage
+	// for why it may — and must — be applied at every node.
+	const detachedKeys = new Set<string>();
+	for (const sessions of removedByTranscriptId.values()) {
+		for (const session of sessions) {
+			if (session.sessionKey !== undefined) detachedKeys.add(session.sessionKey);
+		}
+	}
+
 	// Keyed by node identity — `walk` below receives the very objects `resolveOwners`
 	// recorded, since it reads children off the untouched input tree.
 	const byOwner = new Map<CommitSummary, DetachedSessionUsage[]>();
@@ -281,7 +375,10 @@ export function subtractDetachedUsage(
 
 	const walk = (node: CommitSummary): CommitSummary => {
 		const removed = byOwner.get(node);
-		const withOwn = removed !== undefined ? subtractFromNode(node, removed) : node;
+		const withAggregate = removed !== undefined ? subtractFromNode(node, removed) : node;
+		// Applied to every node, unconditionally on ownership — a key deletion cannot
+		// double-subtract, and amend genuinely records one session at several nodes.
+		const withOwn = subtractSkillUsage(withAggregate, detachedKeys);
 		if (withOwn !== node) changed = true;
 
 		const children = node.children;
@@ -292,6 +389,9 @@ export function subtractDetachedUsage(
 		return nextChildren.some((c, i) => c !== children[i]) ? { ...withOwn, children: nextChildren } : withOwn;
 	};
 
-	const next = byOwner.size > 0 ? walk(summary) : summary;
+	// Walk when EITHER correction has work to do: a memory can carry skill figures
+	// with no aggregate figure to fix, and skipping the walk would silently leave the
+	// skill numbers stale while reporting changed: false.
+	const next = byOwner.size > 0 || detachedKeys.size > 0 ? walk(summary) : summary;
 	return { summary: next, changed, unattributed: [...unattributed] };
 }

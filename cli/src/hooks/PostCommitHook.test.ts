@@ -1417,6 +1417,10 @@ describe("queue-driven Worker", () => {
 				expect.objectContaining({ commitType: "squash" }),
 				// runSquashPipeline passes a 5th `consolidated` arg to mergeManyToOne.
 				expect.objectContaining({ topics: expect.any(Array) }),
+				// 6th `storage` is left undefined; 7th carries the skill refs archived for
+				// THIS squash (see runSquashPipeline).
+				undefined,
+				expect.any(Array),
 			);
 			expect(generateSummary).not.toHaveBeenCalled();
 		});
@@ -1457,6 +1461,10 @@ describe("queue-driven Worker", () => {
 				"/test/project",
 				expect.anything(),
 				expect.objectContaining({ topics: expect.any(Array) }),
+				// 6th `storage` is left undefined; 7th carries the skill refs archived for
+				// THIS squash (see runSquashPipeline).
+				undefined,
+				expect.any(Array),
 			);
 			// Verify exactly 2 summaries were passed (not 3)
 			const summariesArg = vi.mocked(mergeManyToOne).mock.calls[0][0];
@@ -2331,6 +2339,10 @@ describe("queue-driven Worker", () => {
 				"/test/project",
 				expect.anything(),
 				expect.objectContaining({ topics: expect.any(Array) }),
+				// 6th `storage` is left undefined; 7th carries the skill refs archived for
+				// THIS squash (see runSquashPipeline).
+				undefined,
+				expect.any(Array),
 			);
 		});
 	});

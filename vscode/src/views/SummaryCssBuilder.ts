@@ -1367,6 +1367,12 @@ export function buildCss(): string {
   }
   .kb-tag.t-plan { background: var(--vscode-charts-green,  #388a34); }
   .kb-tag.t-note { background: var(--vscode-charts-orange, #d18616); }
+  /* Literal hue, not a --vscode-charts-* token: this must match the sidebar's
+     .mem-ctx-badge--skill (SidebarCssBuilder) exactly, and that one is literal
+     because the badge palette there is generated from SOURCE_META constants
+     rather than theme variables. A theme token here would drift per theme while
+     the sidebar's stayed fixed. */
+  .kb-tag.t-skill { background: #b180d7; }
   /* .t-ref is the KIND marker (layout rules below select on it) and now carries
      only the unknown-source fallback hue. It used to hardcode #5e6ad2, which is
      Linear's brand colour from SOURCE_META — a leftover from when Linear was the

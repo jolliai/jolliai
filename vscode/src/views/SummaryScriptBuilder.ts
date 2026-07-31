@@ -1989,6 +1989,15 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
         vscode.postMessage({ command: 'previewNote', id: previewNoteId, title: previewNoteTitle });
         break;
       }
+      case 'previewCommittedSkills': {
+        // The aggregate Context row. Keyed by commit hash, not an artifact id:
+        // the row stands for every skill in this memory and opens the commit's
+        // whole skills--<hash8>.md table.
+        var skillsCommitHash = target.getAttribute('data-commit-hash') || '';
+        e.preventDefault();
+        vscode.postMessage({ command: 'previewCommittedSkills', commitHash: skillsCommitHash });
+        break;
+      }
       case 'translateNote': {
         var translateNoteId = target.getAttribute('data-note-id') || '';
         vscode.postMessage({ command: 'translateNote', id: translateNoteId });

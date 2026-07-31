@@ -216,7 +216,7 @@ describe("KbFoldersService — single repo (under multi-repo parent)", () => {
 		expect(names).toEqual(["a-dir", "z-dir", "b-file.md", "z-file.md"]);
 	});
 
-	it("classifies file nodes via manifest.json (memory/plan/note/other)", async () => {
+	it("classifies file nodes via manifest.json (memory/plan/note/skill/other)", async () => {
 		mkdirSync(join(repoDir, "jolli", "main", "commits"), { recursive: true });
 		mkdirSync(join(repoDir, "jolli", "main", "plans"), { recursive: true });
 		mkdirSync(join(repoDir, "jolli", "main", "notes"), { recursive: true });
@@ -226,6 +226,7 @@ describe("KbFoldersService — single repo (under multi-repo parent)", () => {
 		);
 		writeFileSync(join(repoDir, "jolli", "main", "plans", "oauth.md"), "");
 		writeFileSync(join(repoDir, "jolli", "main", "notes", "note-1.md"), "");
+		writeFileSync(join(repoDir, "jolli", "main", "skills--abc12345.md"), "");
 		writeFileSync(join(repoDir, "user-dropped.md"), "");
 
 		writeFileSync(
@@ -241,6 +242,14 @@ describe("KbFoldersService — single repo (under multi-repo parent)", () => {
 						fileId: "abc12345deadbeef",
 						fingerprint: "sha256:aa",
 						twinPath: ".jolli/summaries/abc12345deadbeef.json",
+						updatedAt: "2026-04-28T00:00:00Z",
+					},
+					{
+						repo: "jm_x",
+						path: "jolli/main/skills--abc12345.md",
+						type: "skill",
+						fileId: "skill:abc12345deadbeef",
+						fingerprint: "sha256:dd",
 						updatedAt: "2026-04-28T00:00:00Z",
 					},
 					{
@@ -285,6 +294,13 @@ describe("KbFoldersService — single repo (under multi-repo parent)", () => {
 			(c) => c.name === "user-dropped.md",
 		);
 		expect(dropped?.fileKind).toBe("other");
+		// A skill aggregate is manifest-tracked, so it must classify as generated
+		// rather than falling through to "other" — which is what marks a file as
+		// user-written and exempts it from cleanup.
+		const skillMd = (await svc.listChildren("myrepo/jolli/main")).children?.find(
+			(c) => c.name === "skills--abc12345.md",
+		);
+		expect(skillMd?.fileKind).toBe("skill");
 		expect(dropped?.fileKey).toBeUndefined();
 	});
 

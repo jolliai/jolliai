@@ -4,7 +4,14 @@
  * keys, and budgets follow `docs/feature-allow-multi-commit-pr.md`.
  */
 
-import type { CommitSummary, E2eTestScenario, NoteReference, PlanReference, ReferenceCommitRef } from "../Types.js";
+import type {
+	CommitSummary,
+	E2eTestScenario,
+	NoteReference,
+	PlanReference,
+	ReferenceCommitRef,
+	SkillCommitRef,
+} from "../Types.js";
 import { escHtml, escMdLinkText } from "./MarkdownEscape.js";
 import { collectSortedTopics, padIndex, type TopicWithDate } from "./SummaryFormat.js";
 import { pushFooter, pushPlansAndNotesSection } from "./SummaryMarkdownBuilder.js";
@@ -18,6 +25,7 @@ import {
 	RECAP_SOFT_LIMIT,
 	wrapInGithubDetails,
 } from "./SummaryPrMarkdownBuilder.js";
+import { mergeSkillRef } from "./skills/SkillDelta.js";
 
 interface AggregatedScenario extends E2eTestScenario {
 	readonly sourceShortHash: string;
@@ -88,6 +96,12 @@ function pushMergedPlansAndNotes(lines: Array<string>, summaries: ReadonlyArray<
 	const mergedPlans: Array<PlanReference> = [];
 	const mergedNotes: Array<NoteReference> = [];
 	const mergedReferences: Array<ReferenceCommitRef> = [];
+	// Skills merge by ACCUMULATION, not first-wins like the three above: the same
+	// skill entered in three commits of a PR is one skill used three times, and its
+	// tokens are the sum. Keyed `<source>:<skill>` (the registry's own map key)
+	// rather than `archivedKey`, which appends a per-commit shortHash and so never
+	// collides across commits.
+	const mergedSkills = new Map<string, SkillCommitRef>();
 
 	for (const s of summaries) {
 		for (const p of s.plans ?? []) {
@@ -118,9 +132,18 @@ function pushMergedPlansAndNotes(lines: Array<string>, summaries: ReadonlyArray<
 				mergedReferences.push(e);
 			}
 		}
+		for (const k of s.skills ?? []) {
+			const key = `${k.source}:${k.skill}`;
+			mergedSkills.set(key, mergeSkillRef(mergedSkills.get(key), k));
+		}
 	}
 
-	if (mergedPlans.length === 0 && mergedNotes.length === 0 && mergedReferences.length === 0) {
+	if (
+		mergedPlans.length === 0 &&
+		mergedNotes.length === 0 &&
+		mergedReferences.length === 0 &&
+		mergedSkills.size === 0
+	) {
 		return;
 	}
 
@@ -130,6 +153,7 @@ function pushMergedPlansAndNotes(lines: Array<string>, summaries: ReadonlyArray<
 			plans: mergedPlans,
 			notes: mergedNotes,
 			references: mergedReferences,
+			skills: [...mergedSkills.values()],
 		} as unknown as CommitSummary,
 		{ includeReferences: true },
 	);

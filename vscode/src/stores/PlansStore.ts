@@ -25,7 +25,9 @@ import {
 	PlansDataService,
 	type PlansOrNote,
 } from "../services/data/PlansDataService.js";
-import type { NoteInfo, PlanInfo, ReferenceInfo } from "../Types.js";
+import type { NoteInfo, PlanInfo, ReferenceInfo,
+	SkillInfo,
+} from "../Types.js";
 import { log } from "../util/Logger.js";
 import { BaseStore, type Snapshot } from "./BaseStore.js";
 
@@ -40,6 +42,12 @@ export interface PlansSnapshot extends Snapshot<PlansChangeReason> {
 	 * This is the only reference-row source the panel tree consumes.
 	 */
 	readonly references: ReadonlyArray<ReferenceInfo>;
+	/**
+	 * Active skill-usage cache. Read from `bridge.listSkills()`, which filters to
+	 * uncommitted rows — a skill row is guarded on commit rather than deleted, so
+	 * the read side cannot just return everything the way references do.
+	 */
+	readonly skills: ReadonlyArray<SkillInfo>;
 	readonly merged: ReadonlyArray<PlansOrNote>;
 	readonly isEmpty: boolean;
 	readonly isEnabled: boolean;
@@ -49,6 +57,7 @@ const EMPTY: PlansSnapshot = {
 	plans: [],
 	notes: [],
 	references: [],
+	skills: [],
 	merged: [],
 	isEmpty: true,
 	isEnabled: true,
@@ -68,6 +77,7 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 	private plans: Array<PlanInfo> = [];
 	private notes: Array<NoteInfo> = [];
 	private references: Array<ReferenceInfo> = [];
+	private skills: Array<SkillInfo> = [];
 	private enabled = true;
 	private debounceTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -152,10 +162,11 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 			this.plans = [];
 			this.notes = [];
 			this.references = [];
+			this.skills = [];
 			this.rebuildSnapshot("refresh");
 			return;
 		}
-		const [plans, notes, references] = await Promise.all([
+		const [plans, notes, references, skills] = await Promise.all([
 			this.bridge.listPlans(),
 			this.bridge.listNotes(),
 			// Multi-source references (Linear / Jira / GitHub / Notion). Defaults
@@ -163,10 +174,15 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 			// or test fixture) so the panel still renders plans + notes.
 			this.bridge.listReferences?.() ??
 				Promise.resolve([] as ReadonlyArray<ReferenceInfo>),
+			// Same optional-call shape as references: an older host or a test fixture
+			// without listSkills() still renders the rest of the Context list.
+			this.bridge.listSkills?.() ??
+				Promise.resolve([] as ReadonlyArray<SkillInfo>),
 		]);
 		this.plans = plans;
 		this.notes = notes;
 		this.references = [...references];
+		this.skills = [...skills];
 		this.rebuildSnapshot("refresh");
 	}
 
@@ -179,6 +195,7 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 			this.plans = [];
 			this.notes = [];
 			this.references = [];
+			this.skills = [];
 		}
 		this.rebuildSnapshot("enabled");
 	}
@@ -240,16 +257,19 @@ export class PlansStore extends BaseStore<PlansChangeReason, PlansSnapshot> {
 			this.plans,
 			this.notes,
 			this.references,
+			this.skills,
 		);
 		this.snapshot = {
 			plans: this.plans,
 			notes: this.notes,
 			references: this.references,
+			skills: this.skills,
 			merged,
 			isEmpty: PlansDataService.isEmpty(
 				this.plans,
 				this.notes,
 				this.references,
+				this.skills,
 			),
 			isEnabled: this.enabled,
 			changeReason: reason,

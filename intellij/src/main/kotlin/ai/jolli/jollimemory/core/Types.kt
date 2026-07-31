@@ -330,6 +330,14 @@ data class CommitSummary(
     val plans: List<PlanReference>? = null,
     val notes: List<NoteReference>? = null,
     val references: List<ReferenceCommitRef>? = null,
+    /**
+     * Archived skill usage. Declared here for a WRITE reason, not a read one: this
+     * plugin does not render skills, but `SummaryTree.updateTopicInTree` round-trips a
+     * whole summary through Gson and `SummaryPanel` stores the result — and Gson drops
+     * every JSON member the data class does not declare. Without this field, editing
+     * one topic in the IntelliJ panel would silently erase the commit's skill record.
+     */
+    val skills: List<SkillCommitRef>? = null,
     val summaryError: String? = null,
     val transcripts: List<String>? = null,
     /**
@@ -395,6 +403,8 @@ data class PlansRegistry(
     val plans: Map<String, PlanEntry> = emptyMap(),
     val notes: Map<String, NoteEntry>? = null,
     val references: Map<String, ReferenceEntry>? = null,
+    /** Carried so a panel-side `copy()` + save cannot erase it — see [SkillEntry]. */
+    val skills: Map<String, SkillEntry>? = null,
 )
 
 // ── Note types ─────────────────────────────────────────────────────────────
@@ -420,6 +430,100 @@ data class NoteEntry(
 )
 
 /** Reference to a note associated with a commit (stored in CommitSummary.notes) */
+/**
+ * One measured entry into a skill — Kotlin port of `SkillInvocation`.
+ *
+ * Round-trip fidelity only; see [SkillEntry].
+ */
+data class SkillInvocation(
+    val at: String,
+    val args: String? = null,
+    val bodyChars: Int? = null,
+    val ok: Boolean = true,
+)
+
+/**
+ * Persisted `plans.json.skills` row — Kotlin port of `SkillEntry`.
+ *
+ * Declared for the SAME write-fidelity reason as [CommitSummary.skills], and here the
+ * consequence is worse: [PlansRegistry] is loaded, `.copy()`-mutated and saved by
+ * PlansPanel on every plan / note / reference edit, and the `plans-save` bridge action
+ * writes what it is given VERBATIM (no field-wise merge on the CLI side). An undeclared
+ * map is therefore not merely dropped from one summary — deleting a single plan in the
+ * IntelliJ panel would erase the project's entire captured skill history.
+ *
+ * That is the same defect class the CLI fixed by carrying `skills` explicitly through
+ * every field-by-field registry rebuild; a Gson data class is a field-by-field rebuild
+ * with no compiler to catch the omission.
+ */
+data class SkillEntry(
+    val source: String,
+    val skill: String,
+    val plugin: String? = null,
+    val entryPaths: List<String>? = null,
+    val invocations: List<SkillInvocation>? = null,
+    val invocationCount: Int = 0,
+    val firstUsedAt: String? = null,
+    val lastUsedAt: String? = null,
+    val usage: SkillUsage? = null,
+    val usageBySession: Map<String, SkillUsage>? = null,
+    val detection: String? = null,
+    val sourcePath: String? = null,
+    /** Null until archived onto a commit — the guard, same shape as [PlanEntry]. */
+    val commitHash: String? = null,
+    val contentHashAtCommit: String? = null,
+    val archivedTotals: SkillArchivedTotals? = null,
+)
+
+/** Counters as of a skill row's last archive — Kotlin port of `SkillArchivedTotals`. */
+data class SkillArchivedTotals(
+    val invocationCount: Int = 0,
+    val usage: SkillUsage? = null,
+    val usageBySession: Map<String, SkillUsage>? = null,
+)
+
+/**
+ * Snapshot of one skill's usage on a commit — Kotlin port of `SkillCommitRef`.
+ *
+ * Read-through only: nothing in this plugin renders these today. It exists so a
+ * summary can survive a Gson round-trip intact (see [CommitSummary.skills]), which
+ * means field names must match the TS interface exactly — a rename here does not
+ * fail to compile, it silently drops that member on the next topic edit.
+ *
+ * Every field except `archivedKey` is a value snapshot holding THIS commit's
+ * increment, not the registry row's running total.
+ */
+data class SkillCommitRef(
+    /** `<source>:<skill>-<shortHash>`; names the orphan-branch file, not a registry key. */
+    val archivedKey: String,
+    /** "claude" | "opencode" | "codex" | "cursor" — a String, not an enum, so an unknown source cannot NPE. */
+    val source: String,
+    val skill: String,
+    val plugin: String? = null,
+    /** "tool" | "command". */
+    val entryPaths: List<String>? = null,
+    val invocationCount: Int = 0,
+    val firstUsedAt: String? = null,
+    val lastUsedAt: String? = null,
+    val usage: SkillUsage? = null,
+    /** Keyed `<source>:<sessionId>`; kept so a post-commit detach can still subtract a session. */
+    val usageBySession: Map<String, SkillUsage>? = null,
+    /** "heuristic" when the invocation was inferred rather than observed. */
+    val detection: String? = null,
+)
+
+/**
+ * Tokens spent under a skill. `confidence` is "attributed" (the host tagged each
+ * response) or "estimated" (inferred from an interval) — a String rather than an
+ * enum for the same NPE-safety reason as [SkillCommitRef.source].
+ */
+data class SkillUsage(
+    val input: Int = 0,
+    val output: Int = 0,
+    val cached: Int = 0,
+    val confidence: String? = null,
+)
+
 data class NoteReference(
     val id: String,
     val title: String,

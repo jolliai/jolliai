@@ -100,6 +100,10 @@ export function buildNextMemoryCss(): string {
 		// rules win the background on the shared 'kb-tag mem-ctx-badge' element.
 		".mem-ctx-badge--plan      { background: #3fb950; }",
 		".mem-ctx-badge--note      { background: #d29922; }",
+		// Must match SidebarCssBuilder's .mem-ctx-badge--skill exactly — the same
+		// aggregate row renders in both panels and a hue split would read as two
+		// different kinds.
+		".mem-ctx-badge--skill     { background: #b180d7; }",
 		// Per-source colors generated from the single ./SourceLabels.ts
 		// SOURCE_META table so a new source's color lives in one place.
 		...Object.entries(SOURCE_META).map(([id, meta]) => `.mem-ctx-badge--${id} { background: ${meta.color}; }`),

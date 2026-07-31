@@ -223,31 +223,59 @@ function parseCodexAgentMessage(
  * several lines one response is written across (see `ParsedTurnUsage`). Empty
  * when absent, which makes the caller count the line unconditionally.
  */
-function extractClaudeUsage(
-	line: string,
-): { id: string; model: string; input: number; output: number; cached: number } | null {
+function extractClaudeUsage(line: string): ClaudeTurnUsage | null {
 	try {
-		const o = JSON.parse(line) as {
-			message?: { usage?: Record<string, unknown>; model?: unknown; id?: unknown };
-			usage?: Record<string, unknown>;
-			model?: unknown;
-		};
-		const u = o.message?.usage ?? o.usage;
-		if (!u || typeof u !== "object") return null;
-		const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
-		const rawModel = o.message?.model ?? o.model;
-		const model = typeof rawModel === "string" ? rawModel : "";
-		const rawId = o.message?.id;
-		return {
-			id: typeof rawId === "string" ? rawId : "",
-			model,
-			input: n("input_tokens"),
-			output: n("output_tokens"),
-			cached: n("cache_creation_input_tokens"),
-		};
+		return extractClaudeUsageFromRecord(JSON.parse(line));
 	} catch {
 		return null;
 	}
+}
+
+/** One Claude turn's spend plus the identity used to collapse its repeated lines. */
+export interface ClaudeTurnUsage {
+	/** `message.id`, or "" when absent — an empty id means "always count this line". */
+	readonly id: string;
+	readonly model: string;
+	readonly input: number;
+	readonly output: number;
+	readonly cached: number;
+}
+
+/**
+ * The record-level half of {@link extractClaudeUsage}, exported so a consumer that
+ * has ALREADY parsed the line can reuse these semantics without parsing twice.
+ *
+ * This is the single definition of what a Claude turn cost and of what identifies
+ * it. Both rules it encodes are easy to get subtly wrong in a second
+ * implementation, and both fail silently:
+ *
+ *   - excluding `cache_read_input_tokens` (a cumulative counter — summing it
+ *     re-counts the cached prefix on every turn), and
+ *   - keying dedupe on `message.id` (one response spans several lines, each
+ *     repeating the whole usage object).
+ *
+ * Any per-segment consumer — the commit-level reader, the per-model split, and
+ * per-skill attribution — must come through here, or its numbers will drift from
+ * the others' for the same transcript.
+ */
+export function extractClaudeUsageFromRecord(record: unknown): ClaudeTurnUsage | null {
+	const o = record as {
+		message?: { usage?: Record<string, unknown>; model?: unknown; id?: unknown };
+		usage?: Record<string, unknown>;
+		model?: unknown;
+	} | null;
+	const u = o?.message?.usage ?? o?.usage;
+	if (!u || typeof u !== "object") return null;
+	const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
+	const rawModel = o?.message?.model ?? o?.model;
+	const rawId = o?.message?.id;
+	return {
+		id: typeof rawId === "string" ? rawId : "",
+		model: typeof rawModel === "string" ? rawModel : "",
+		input: n("input_tokens"),
+		output: n("output_tokens"),
+		cached: n("cache_creation_input_tokens"),
+	};
 }
 
 // ─── Singleton instances (stateless parsers, safe to share) ──────────────────

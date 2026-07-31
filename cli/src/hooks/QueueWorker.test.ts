@@ -60,13 +60,18 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 // their real implementations.
 // CommitSelectionStore: readAiSelection is stubbed so tests can drive executePipeline's
 // fingerprint-reuse arm (buildDecisionFromAiExcluded) vs the recompute arm. Everything
-// else (readExclusions / writeAiSelection / …) keeps its real implementation.
+// else (writeAiSelection / …) keeps its real implementation.
+//
+// `readExclusions` is a spy WRAPPING the real implementation rather than a bare stub:
+// every existing test depends on its real "no selection file → empty sets" behaviour,
+// while the squash-exclusion test needs to override one call.
 vi.mock("../core/CommitSelectionStore.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../core/CommitSelectionStore.js")>();
 	return {
 		...actual,
 		readAiSelection: vi.fn(),
 		clearAiSelection: vi.fn(),
+		readExclusions: vi.fn(actual.readExclusions),
 	};
 });
 
@@ -283,6 +288,11 @@ vi.mock("../core/StaleChildMarkdownCleanup.js", () => ({
 	cleanupAllBranchesStaleChildMarkdown: vi.fn().mockResolvedValue({ deleted: 0, failed: 0 }),
 }));
 
+vi.mock("../core/skills/SkillArchive.js", () => ({
+	associateSkillsWithCommit: vi.fn().mockResolvedValue({ refs: [], filesToStore: [] }),
+	skillOrphanPath: (source: string, skill: string, hash: string) => `skills/${source}/${skill}-${hash}.md`,
+}));
+
 vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../core/SummaryStore.js")>();
 	return {
@@ -293,6 +303,7 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 		storePlans: vi.fn(),
 		storeNotes: vi.fn(),
 		storeReferences: vi.fn().mockResolvedValue(undefined),
+		storeSkills: vi.fn().mockResolvedValue(undefined),
 		setActiveStorage: vi.fn(),
 		// Passthrough spy for the ingest writeGuard's inner orphan-write.lock. Runs
 		// the body without touching the real lock file (the acquire/release contract
@@ -540,6 +551,7 @@ import { cleanupBranchStaleChildMarkdown } from "../core/StaleChildMarkdownClean
 import { createStorage } from "../core/StorageFactory.js";
 import { generateSummary } from "../core/Summarizer.js";
 import { storeSummary, withRequiredOrphanWriteLock } from "../core/SummaryStore.js";
+import { associateSkillsWithCommit } from "../core/skills/SkillArchive.js";
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
@@ -554,6 +566,7 @@ import type {
 	IngestOperation,
 	PlanReference,
 	ReferenceCommitRef,
+	SkillCommitRef,
 } from "../Types.js";
 import { __test__, buildWorkerStartupBanner, launchWorker, runWorker } from "./QueueWorker.js";
 
@@ -606,6 +619,11 @@ describe("QueueWorker", () => {
 			release: vi.fn().mockResolvedValue(undefined),
 			refresh: vi.fn().mockResolvedValue(undefined),
 		});
+		// Skill archival: re-establish the empty result after `resetAllMocks` wipes the
+		// factory default. Callers destructure `{ refs, filesToStore }`, so an
+		// un-stubbed mock returning undefined throws and takes the whole pipeline with
+		// it — which is exactly what it did before this line existed.
+		vi.mocked(associateSkillsWithCommit).mockResolvedValue({ refs: [], filesToStore: [] });
 		vi.mocked(dequeueAllGitOperations).mockResolvedValue([]);
 		vi.mocked(loadConfig).mockResolvedValue(
 			{} as ReturnType<typeof loadConfig> extends Promise<infer T> ? T : never,
@@ -3018,6 +3036,136 @@ describe("QueueWorker", () => {
 			});
 		});
 
+		it("archives uncommitted skill rows onto the squash commit and hoists them onto the root", async () => {
+			// The bug this covers: squash bypassed skills entirely, so a skill used
+			// during the squashed work was never written to the orphan branch and never
+			// appeared on the resulting summary. "reset then re-commit" is detected as
+			// a squash, which is how the gap surfaced in normal local development.
+			const { getSummary, mergeManyToOne, storeSkills } = await import("../core/SummaryStore.js");
+			const { associateSkillsWithCommit } = await import("../core/skills/SkillArchive.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 3,
+				commitHash: "oldhash",
+				commitMessage: "Old",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Old topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			const skillRef = {
+				archivedKey: "claude:superpowers:brainstorming-newhash1",
+				source: "claude" as const,
+				skill: "superpowers:brainstorming",
+				entryPaths: ["tool" as const],
+				invocationCount: 2,
+				firstUsedAt: "2026-04-01T09:00:00.000Z",
+				lastUsedAt: "2026-04-01T09:30:00.000Z",
+			};
+			vi.mocked(associateSkillsWithCommit).mockResolvedValue({
+				refs: [skillRef],
+				filesToStore: [{ path: "skills/claude/superpowers-brainstorming-newhash1.md", content: "# x" }],
+			});
+			setupPipelineMocks("newhash123");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "newhash123", sourceHashes: ["oldhash"] }),
+				"/test/cwd",
+			);
+
+			// Archived against the NEW hash and the source summaries' branch, with an
+			// empty exclusion set (no selection file in this fixture).
+			expect(associateSkillsWithCommit).toHaveBeenCalledWith(
+				"newhash123",
+				"/test/cwd",
+				"feature/test",
+				new Set(),
+			);
+			expect(storeSkills).toHaveBeenCalled();
+			// And handed to mergeManyToOne so the root it writes carries them.
+			expect(vi.mocked(mergeManyToOne).mock.calls[0]?.[6]).toEqual([skillRef]);
+		});
+
+		it("passes user skill exclusions INTO the squash association, not as a post-filter", async () => {
+			// The bug this covers: the squash path archived skills with no exclusion set,
+			// so a skill the user had unchecked in the Context panel was still written to
+			// the orphan branch. It has to reach associateSkillsWithCommit itself — that
+			// function guards the row and emits the bytes, so filtering its RESULT would
+			// hide the skill from the summary while still archiving it.
+			const { getSummary } = await import("../core/SummaryStore.js");
+			const { associateSkillsWithCommit } = await import("../core/skills/SkillArchive.js");
+			const { readExclusions } = await import("../core/CommitSelectionStore.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 3,
+				commitHash: "oldhash",
+				commitMessage: "Old",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Old topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			vi.mocked(readExclusions).mockResolvedValue({
+				conversations: new Set<string>(),
+				plans: new Set<string>(),
+				notes: new Set<string>(),
+				references: new Set<string>(),
+				skills: new Set(["claude:superpowers:brainstorming"]),
+			});
+			setupPipelineMocks("newhash123");
+
+			await __test__.handleSquashFromQueue(
+				makeCommitOp({ commitHash: "newhash123", sourceHashes: ["oldhash"] }),
+				"/test/cwd",
+			);
+
+			expect(associateSkillsWithCommit).toHaveBeenCalledWith(
+				"newhash123",
+				"/test/cwd",
+				"feature/test",
+				new Set(["claude:superpowers:brainstorming"]),
+			);
+		});
+
+		it("tolerates a selection file predating the skills field (absent set)", async () => {
+			// `CommitExclusions.skills` is optional because it postdates the persisted
+			// shape. An undefined set must read as "nothing excluded", not crash the
+			// squash pipeline on a `.has` of undefined.
+			const { getSummary } = await import("../core/SummaryStore.js");
+			const { associateSkillsWithCommit } = await import("../core/skills/SkillArchive.js");
+			const { readExclusions } = await import("../core/CommitSelectionStore.js");
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 3,
+				commitHash: "oldhash",
+				commitMessage: "Old",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [{ title: "Old topic", trigger: "t", response: "r", decisions: "d" }],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			vi.mocked(readExclusions).mockResolvedValue({
+				conversations: new Set<string>(),
+				plans: new Set<string>(),
+				notes: new Set<string>(),
+				references: new Set<string>(),
+			});
+			setupPipelineMocks("newhash123");
+
+			await expect(
+				__test__.handleSquashFromQueue(
+					makeCommitOp({ commitHash: "newhash123", sourceHashes: ["oldhash"] }),
+					"/test/cwd",
+				),
+			).resolves.not.toThrow();
+			expect(associateSkillsWithCommit).toHaveBeenCalledWith(
+				"newhash123",
+				"/test/cwd",
+				"feature/test",
+				new Set(),
+			);
+		});
+
 		it("should default squash commitSource to cli", async () => {
 			const { getSummary, mergeManyToOne } = await import("../core/SummaryStore.js");
 			vi.mocked(getSummary).mockResolvedValue({
@@ -3045,6 +3193,10 @@ describe("QueueWorker", () => {
 				"/test/cwd",
 				expect.objectContaining({ commitSource: "cli", commitType: "squash" }),
 				expect.objectContaining({ topics: expect.any(Array) }),
+				// 6th `storage` is left undefined; 7th carries the skill refs archived for
+				// THIS squash (see runSquashPipeline).
+				undefined,
+				expect.any(Array),
 			);
 		});
 
@@ -4621,6 +4773,75 @@ describe("QueueWorker", () => {
 					{ plans: [planNew] },
 				);
 				expect(root.plans?.map((p) => p.slug)).toEqual(["foo-9def5678"]);
+			});
+
+			it("keeps two skills apart when one id ends in 8 hex characters", () => {
+				// Regression: the skill merge key ran `<source>:<skill>` through
+				// REF_HASH_SUFFIX, the strip plans and notes need because THEIR identifier
+				// embeds the archive short hash. A skill ref keeps its hash in
+				// `archivedKey` and leaves `skill` raw, so stripping truncated any id
+				// ending in 8 hex chars and folded two distinct skills into one row —
+				// while attachedBaseKeys.skill and mergeSkillRefs both kept them apart.
+				const base = {
+					source: "claude" as const,
+					entryPaths: ["tool" as const],
+					invocationCount: 1,
+					firstUsedAt: "2026-04-01T09:00:00.000Z",
+					lastUsedAt: "2026-04-01T09:30:00.000Z",
+				};
+				const skillPlain: SkillCommitRef = {
+					...base,
+					archivedKey: "claude:pack:build-old12345",
+					skill: "pack:build",
+				};
+				const skillHexish: SkillCommitRef = {
+					...base,
+					archivedKey: "claude:pack:build-0abc1234-new67890",
+					skill: "pack:build-0abc1234",
+				};
+				const root = __test__.buildHoistedAmendRoot(
+					makeOld({ skills: [skillPlain] }),
+					newInfo,
+					hoisted,
+					{},
+					fullDiffStats,
+					undefined,
+					{ skills: [skillHexish] },
+				);
+				expect(root.skills?.map((s) => s.skill).sort()).toEqual(["pack:build", "pack:build-0abc1234"]);
+			});
+
+			it("merges old + new refs for the SAME skill with new winning", () => {
+				const base = {
+					source: "claude" as const,
+					entryPaths: ["tool" as const],
+					invocationCount: 1,
+					firstUsedAt: "2026-04-01T09:00:00.000Z",
+					lastUsedAt: "2026-04-01T09:30:00.000Z",
+				};
+				const oldRef: SkillCommitRef = {
+					...base,
+					archivedKey: "claude:superpowers:brainstorming-old12345",
+					skill: "superpowers:brainstorming",
+				};
+				const newRef: SkillCommitRef = {
+					...base,
+					archivedKey: "claude:superpowers:brainstorming-new67890",
+					skill: "superpowers:brainstorming",
+					invocationCount: 3,
+				};
+				const root = __test__.buildHoistedAmendRoot(
+					makeOld({ skills: [oldRef] }),
+					newInfo,
+					hoisted,
+					{},
+					fullDiffStats,
+					undefined,
+					{ skills: [newRef] },
+				);
+				expect(root.skills).toHaveLength(1);
+				expect(root.skills?.[0].archivedKey).toBe("claude:superpowers:brainstorming-new67890");
+				expect(root.skills?.[0].invocationCount).toBe(3);
 			});
 
 			it("writes the excludedContext audit when the soft-excluded item is NOT attached", () => {

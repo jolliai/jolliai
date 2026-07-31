@@ -54,6 +54,7 @@ import type { StorageProvider } from "./StorageProvider.js";
 import {
 	AmbiguousHashError,
 	collectChildReferences,
+	collectChildSkills,
 	deleteNoteVisibleArtifact,
 	deletePlanVisibleArtifact,
 	deleteTranscript,
@@ -73,6 +74,7 @@ import {
 	readPlanFromBranch,
 	readPlanProgress,
 	readReferenceFromBranch,
+	readSkillFromBranch,
 	readTranscript,
 	readTranscriptsForCommits,
 	removeFromIndex,
@@ -82,6 +84,7 @@ import {
 	storeNotes,
 	storePlans,
 	storeReferences,
+	storeSkills,
 	storeSummary,
 	stripFunctionalMetadata,
 } from "./SummaryStore.js";
@@ -1038,6 +1041,47 @@ describe("SummaryStore", () => {
 			expect(newSummaryContent.children?.[0].references).toBeUndefined();
 			// Post-Phase-B: legacy linearIssues field is never written.
 			expect((newSummaryContent as unknown as { linearIssues?: unknown }).linearIssues).toBeUndefined();
+		});
+
+		it("should hoist skills onto the rebase container node (regression: rebase-pick dropped the skill record)", async () => {
+			// Regression: migrateOneToOne carried plans / notes / references /
+			// e2eTestGuide forward but not `skills`, so any commit a plain
+			// `git rebase` re-picked lost its skill record from the ROOT. The refs
+			// survived only on the wrapped child, which the aggregate, the sidebar
+			// skill rows and the PR markdown table never walk — so the usage went
+			// invisible with no error anywhere.
+			const oldHash = "oldhash0000000000000001";
+			const newHash = "newhash0000000000000002";
+			const skillRef = {
+				archivedKey: "claude:superpowers:brainstorming-oldhash0",
+				source: "claude" as const,
+				skill: "superpowers:brainstorming",
+				plugin: "superpowers",
+				entryPaths: ["tool" as const],
+				invocationCount: 3,
+				firstUsedAt: "2026-07-30T09:00:00.000Z",
+				lastUsedAt: "2026-07-31T11:22:00.000Z",
+				usage: { input: 1200, cached: 800, output: 450, confidence: "attributed" as const },
+			};
+			const oldSummary: CommitSummary = {
+				...createMockSummary(oldHash, "Old message"),
+				skills: [skillRef],
+			};
+
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
+			expect(newSummaryContent.skills).toEqual([skillRef]);
+			// Unlike plans / notes / references, skills are deliberately NOT stripped
+			// off the wrapped child (stripFunctionalMetadata has no stripSkills). Root
+			// and child share one `archivedKey`, which is exactly the shape
+			// mergeSkillRefs dedupes on before accumulating — so a later squash of
+			// this tree still reports 3 invocations, not 6.
+			expect(newSummaryContent.children?.[0].skills).toEqual([skillRef]);
+			expect(collectChildSkills([newSummaryContent])).toEqual([skillRef]);
 		});
 
 		it("should hoist notes onto the rebase container node", async () => {
@@ -3717,6 +3761,47 @@ describe("SummaryStore", () => {
 
 				await expect(deleteNoteVisibleArtifact("note-42", "main")).resolves.toBeUndefined();
 			});
+		});
+	});
+
+	describe("storeSkills", () => {
+		it("writes skill markdown to skills/<source>/<stem>-<shortHash>.md", async () => {
+			await storeSkills(
+				[
+					{ path: "skills/claude/superpowers-brainstorming-a1b2c3d4-abc12345.md", content: "---\nbody-a" },
+					{ path: "skills/opencode/j-specs-e5f6a7b8-abc12345.md", content: "---\nbody-b" },
+				],
+				"Archive 2 skill(s) for commit abc12345",
+			);
+
+			expect(writeMultipleFilesToBranch).toHaveBeenCalledWith(
+				expect.any(String),
+				[
+					{ path: "skills/claude/superpowers-brainstorming-a1b2c3d4-abc12345.md", content: "---\nbody-a" },
+					{ path: "skills/opencode/j-specs-e5f6a7b8-abc12345.md", content: "---\nbody-b" },
+				],
+				"Archive 2 skill(s) for commit abc12345",
+				undefined,
+			);
+		});
+
+		it("is a no-op when given an empty list", async () => {
+			await storeSkills([], "Empty commit");
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("readSkillFromBranch returns the archived markdown", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce('---\nskill: "a:b"\n---\n');
+			await expect(readSkillFromBranch("skills/claude/a-b-1234abcd-abc12345.md")).resolves.toBe(
+				'---\nskill: "a:b"\n---\n',
+			);
+		});
+
+		it("readSkillFromBranch returns null when the file is absent", async () => {
+			// Must degrade rather than throw: callers render a preview and an archived
+			// skill can be missing on a branch whose orphan history was rewritten.
+			vi.mocked(readFileFromBranch).mockRejectedValueOnce(new Error("not found"));
+			await expect(readSkillFromBranch("skills/claude/gone-abc12345.md")).resolves.toBeNull();
 		});
 	});
 

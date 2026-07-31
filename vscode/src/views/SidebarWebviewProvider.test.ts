@@ -313,6 +313,13 @@ describe("SidebarWebviewProvider", () => {
 			{ archivedKey: "linear:X-1-ab12cd34", source: "linear", sourceRepoName: null, sourceRemoteUrl: null },
 			{ item_type: "reference" },
 		],
+		[
+			// SINGULAR item_type even though the row is an aggregate — the metric joins
+			// on the same vocabulary IntelliJ's CommitsPanel emits.
+			"kb:openEvidenceSkills",
+			{ commitHash: "abc1234", sourceRepoName: null, sourceRemoteUrl: null },
+			{ item_type: "skill" },
+		],
 	])("emits memory_item_opened from %s", (type, fields, expected) => {
 		const view = makeMockView();
 		provider.resolveWebviewView(view as unknown as never);
@@ -4281,6 +4288,94 @@ describe("SidebarWebviewProvider", () => {
 			expect(filePaths).toContain("src/widget.test.ts");
 		});
 
+		it("projects ALL archived skills into ONE aggregate context row keyed by commit hash", async () => {
+			// One row, not one per skill: the Timeline's evidence list mirrors the live
+			// Context list, which collapses a session's dozen-plus skills the same way.
+			// Its id is the commit hash rather than an artifact key, because what it
+			// opens is the commit's whole skills--<hash8>.md table.
+			const view = makeMockView();
+			const skill = (name: string) => ({
+				archivedKey: `claude:${name}-abc1234`,
+				source: "claude" as const,
+				skill: name,
+				entryPaths: ["tool"],
+				invocationCount: 1,
+				firstUsedAt: "2024-01-01T00:00:00Z",
+				lastUsedAt: "2024-01-01T00:00:00Z",
+			});
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+					currentRepoName: "myrepo",
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash: vi.fn().mockResolvedValue({
+					version: 5,
+					commitHash: "abc1234",
+					commitMessage: "feat: add widget",
+					commitAuthor: "Dev",
+					commitDate: "2024-01-01T00:00:00Z",
+					branch: "main",
+					generatedAt: "2024-01-01T00:01:00Z",
+					skills: [skill("superpowers:brainstorming"), skill("superpowers:writing-plans")],
+				}),
+				readTranscriptById: vi.fn().mockResolvedValue({ sessions: [] }),
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "abc1234" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+
+			expect(evidenceMsg.evidence.context).toHaveLength(1);
+			expect(evidenceMsg.evidence.context[0]).toMatchObject({
+				kind: "skill",
+				id: "abc1234",
+				title: "Skills used (2)",
+			});
+		});
+
+		it("emits no skills row for a memory that archived none", async () => {
+			// The absence must be an absent row, not a "0 skills" one.
+			const view = makeMockView();
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+					currentRepoName: "myrepo",
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash: vi.fn().mockResolvedValue({
+					version: 5,
+					commitHash: "abc1234",
+					commitMessage: "feat: add widget",
+					commitAuthor: "Dev",
+					commitDate: "2024-01-01T00:00:00Z",
+					branch: "main",
+					generatedAt: "2024-01-01T00:01:00Z",
+				}),
+				readTranscriptById: vi.fn().mockResolvedValue({ sessions: [] }),
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "abc1234" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+
+			expect(evidenceMsg.evidence.context).toHaveLength(0);
+		});
+
 		it("dedupes a session spanning multiple transcripts into a single conversation row, merging its entry slices", async () => {
 			// A long-running session is captured once per commit it spans: each
 			// transcript file holds only the unread turns consumed at THAT commit
@@ -4824,6 +4919,25 @@ describe("SidebarWebviewProvider", () => {
 				"jollimemory.previewNote",
 				"note-7",
 				"My Note",
+				"other-repo",
+				"https://github.com/org/other-repo",
+			);
+		});
+
+		it("kb:openEvidenceSkills routes to previewCommittedSkills by commit hash, not the live aggregate", () => {
+			// branch:openSkillsAggregate renders the WORKING registry, which no longer
+			// holds these skills once they are archived onto the commit — it would open
+			// an unrelated (or empty) table.
+			const { view, executeCommand } = makeEvidenceProvider();
+			view.webview.triggerMessage({
+				type: "kb:openEvidenceSkills",
+				commitHash: "abc1234",
+				sourceRepoName: "other-repo",
+				sourceRemoteUrl: "https://github.com/org/other-repo",
+			});
+			expect(executeCommand).toHaveBeenCalledWith(
+				"jollimemory.previewCommittedSkills",
+				"abc1234",
 				"other-repo",
 				"https://github.com/org/other-repo",
 			);

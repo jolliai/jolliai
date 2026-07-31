@@ -6,6 +6,42 @@ import {
 	SONNET_OUTPUT_PER_TOKEN,
 } from "./SummaryUtils";
 
+/**
+ * One Context-row kind's full spec, as declared in the generated script.
+ *
+ * Every per-kind decision a Context row makes lives in CONTEXT_ROW_KINDS —
+ * badge, checkbox, click target, inline actions, and each action's target. The
+ * tests below execute that table rather than string-matching the dispatch sites,
+ * because the bugs it exists to prevent (a kind falling through to the plan
+ * default) are invisible to a substring assertion: the fallback code is present
+ * and correct-looking, it is simply reached by the wrong kind.
+ */
+interface ContextRowSpec {
+	badge: string;
+	cls: string;
+	attr: string | null;
+	msg: string;
+	idKey: string | null;
+	openMsg: string;
+	openIdKey: string | null;
+	actions: string[];
+	editLabel: string | null;
+	editCmd: string | null;
+	editMsg: string | null;
+	removeCmd: string | null;
+	pinKind: string | null;
+}
+
+/** Evaluates CONTEXT_ROW_KINDS out of the generated script. */
+function contextRowTable(js: string): Record<string, ContextRowSpec> {
+	const start = js.indexOf("var CONTEXT_ROW_KINDS");
+	const end = js.indexOf("function renderPlanRow", start);
+	return new Function(`${js.slice(start, end)}\nreturn CONTEXT_ROW_KINDS;`)() as Record<
+		string,
+		ContextRowSpec
+	>;
+}
+
 describe("SidebarScriptBuilder", () => {
 	it("returns a JS string", () => {
 		const js = buildSidebarScript();
@@ -1716,10 +1752,14 @@ describe("SidebarScriptBuilder", () => {
 		});
 
 		it("reference row click posts branch:openReferencePreview (click = preview, edit via menu)", () => {
+			// The click target now comes from CONTEXT_ROW_KINDS rather than an if-chain,
+			// so assert the table entry plus the generic dispatch that reads it.
 			const js = buildSidebarScript();
-			expect(js).toContain(
-				"vscode.postMessage({ type: 'branch:openReferencePreview', mapKey: id });",
-			);
+			expect(contextRowTable(js).reference).toMatchObject({
+				openMsg: "branch:openReferencePreview",
+				openIdKey: "mapKey",
+			});
+			expect(js).toContain("openPayload[openSpec.openIdKey] = id");
 		});
 
 		it("Changes rows show a 'Discard Changes' entry that posts branch:discardFile", () => {
@@ -2591,7 +2631,9 @@ describe("SidebarScriptBuilder", () => {
 			const fnEnd = js.indexOf("function gitStatusToCodicon", fnStart);
 			const body = js.slice(fnStart, fnEnd);
 			// Leading glyph is the badge, not the old codicon-iconKey span.
-			expect(body).toContain("ctxBadge(badgeKind, badgeSource)");
+			// The badge kind now comes from the CONTEXT_ROW_KINDS table rather than an
+			// inline ternary, but it is still the shared letter badge.
+			expect(body).toContain("ctxBadge(rowKind ? rowKind.badge : ''");
 			expect(body).not.toContain("'codicon codicon-' + iconKey");
 			// References derive their provider from the forwarded referenceHover.
 			expect(body).toContain("item.referenceHover.source");
@@ -2758,16 +2800,18 @@ describe("SidebarScriptBuilder", () => {
 			// trash button silently no-op'd on entity rows while working on
 			// plan/note rows. The three-way ternary in the dispatch ensures
 			// each row type's trash routes to its own host-side handler.
+			// Now table-driven: each kind names its own remove command, and the
+			// dispatcher reads that field instead of re-deriving it from contextValue.
 			const js = buildSidebarScript();
-			expect(js).toContain("'jollimemory.removeNote'");
-			expect(js).toContain("'jollimemory.removePlan'");
-			expect(js).toContain("'jollimemory.ignoreReference'");
-			// The three branches must coexist in the same dispatch — a future
-			// regression that dropped any of them would re-introduce the
-			// silent-no-op symptom on the corresponding row type.
-			expect(js).toMatch(
-				/ctx\s*===\s*'note'[\s\S]{0,150}ctx\s*===\s*'reference'/,
-			);
+			const table = contextRowTable(js);
+			expect(table.plan.removeCmd).toBe("jollimemory.removePlan");
+			expect(table.note.removeCmd).toBe("jollimemory.removeNote");
+			expect(table.reference.removeCmd).toBe("jollimemory.ignoreReference");
+			// The skills aggregate stands for N skills, not a document — nothing to
+			// delete, and its row renders no trash button at all.
+			expect(table.skills.removeCmd).toBeNull();
+			expect(table.skills.actions).toEqual([]);
+			expect(js).toContain("ctxSpec.removeCmd");
 		});
 
 		it("edit button (data-inline='edit') renders left of the trash button with the small variant", () => {
@@ -2796,12 +2840,22 @@ describe("SidebarScriptBuilder", () => {
 		});
 
 		it("edit button click routes by row contextValue, mirroring the context menu's edit entry", () => {
+			// Pin the ctx → target PAIRING, not just co-occurrence. It now lives in the
+			// table, so a swap (note → editPlan) is a wrong value here rather than a
+			// reordered ternary.
 			const js = buildSidebarScript();
-			// Pin the ctx → target PAIRING, not just co-occurrence — a swapped
-			// ternary (note → editPlan) must fail these, so each regex requires
-			// the ctx check immediately before its own target.
-			expect(js).toMatch(/action\s*===\s*'edit'[\s\S]{0,400}ctx\s*===\s*'reference'[\s\S]{0,120}branch:openReferenceMarkdown/);
-			expect(js).toMatch(/action\s*===\s*'edit'[\s\S]{0,400}ctx\s*===\s*'note'\s*\?\s*'jollimemory\.editNote'\s*:\s*'jollimemory\.editPlan'/);
+			const table = contextRowTable(js);
+			expect(table.plan).toMatchObject({ editCmd: "jollimemory.editPlan", editMsg: null });
+			expect(table.note).toMatchObject({ editCmd: "jollimemory.editNote", editMsg: null });
+			// References resolve their markdown host-side, so they take the raw-message
+			// path instead of an editor command.
+			expect(table.reference).toMatchObject({
+				editCmd: null,
+				editMsg: "branch:openReferenceMarkdown",
+			});
+			expect(table.skills).toMatchObject({ editCmd: null, editMsg: null, editLabel: null });
+			expect(js).toContain("ctxSpec.editMsg");
+			expect(js).toContain("ctxSpec.editCmd");
 		});
 	});
 
@@ -2921,49 +2975,128 @@ describe("SidebarScriptBuilder", () => {
 			expect(fn).toMatch(/attachTextTip\(\s*el\('i',/);
 		});
 
-		it("renderPlanRow emits a jm-plan-check checkbox with data-plan-id for plan rows", () => {
+		it("resolves every context-row kind from one table, and an unknown kind to null", () => {
+			// Executed, not string-matched. The bug this guards was invisible to a
+			// substring assertion: a skill row fell through a ternary chain to 'plan',
+			// so it rendered a jm-plan-check checkbox whose click posted
+			// togglePlanSelection carrying the skill's key — the exclusion landed in the
+			// wrong set and silently did nothing.
 			const js = buildSidebarScript();
-			const fnStart = js.indexOf("function renderPlanRow");
-			const fnEnd = js.indexOf("\n  function ", fnStart + 1);
-			const fn =
-				fnEnd > fnStart
-					? js.slice(fnStart, fnEnd)
-					: js.slice(fnStart, fnStart + 3000);
-			expect(fn).toContain("'jm-plan-check'");
-			expect(fn).toContain("'data-plan-id'");
-			// The plan slug is stored in item.id and carried into 'data-plan-id'.
-			expect(fn).toMatch(/data-plan-id.*item\.id/);
+			const start = js.indexOf("var CONTEXT_ROW_KINDS");
+			const end = js.indexOf("function renderPlanRow", start);
+			const factory = new Function(
+				`${js.slice(start, end)}\nreturn { CONTEXT_ROW_KINDS, contextRowKind };`,
+			);
+			const { contextRowKind } = factory() as {
+				contextRowKind: (
+					v: string,
+				) => { badge: string; cls: string; attr: string; msg: string; idKey: string } | null;
+			};
+
+			expect(contextRowKind("plan")).toMatchObject({ badge: "plan", cls: "jm-plan-check" });
+			expect(contextRowKind("note")).toMatchObject({ badge: "note", cls: "jm-note-check" });
+			expect(contextRowKind("reference")).toMatchObject({
+				badge: "reference",
+				cls: "jm-reference-check",
+			});
+			// The kind that used to fall through. It now also carries a NULL attr/idKey,
+			// because the aggregate row stands for N skills and addresses no single one.
+			expect(contextRowKind("skills")).toMatchObject({
+				badge: "skill",
+				cls: "jm-skill-check",
+				attr: null,
+				idKey: null,
+				msg: "branch:toggleSkillSelection",
+			});
+			// An unrecognised kind gets NO checkbox rather than a plan one.
+			expect(contextRowKind("something-new")).toBeNull();
+			expect(contextRowKind("")).toBeNull();
 		});
 
-		it("renderPlanRow emits a jm-note-check checkbox with data-note-id for note rows", () => {
+		it("gives every kind a distinct checkbox class, attribute and message", () => {
+			// Two kinds sharing a class would make the dispatch loop resolve whichever
+			// came first in the table — the same cross-wiring, one level down.
 			const js = buildSidebarScript();
-			const fnStart = js.indexOf("function renderPlanRow");
-			const fnEnd = js.indexOf("\n  function ", fnStart + 1);
-			const fn =
-				fnEnd > fnStart
-					? js.slice(fnStart, fnEnd)
-					: js.slice(fnStart, fnStart + 3000);
-			expect(fn).toContain("'jm-note-check'");
-			expect(fn).toContain("'data-note-id'");
-			// The note id is stored in item.id and carried into 'data-note-id'.
-			expect(fn).toMatch(/data-note-id.*item\.id/);
+			const start = js.indexOf("var CONTEXT_ROW_KINDS");
+			const end = js.indexOf("function renderPlanRow", start);
+			const factory = new Function(`${js.slice(start, end)}\nreturn CONTEXT_ROW_KINDS;`);
+			const table = factory() as Record<string, { cls: string; attr: string; msg: string }>;
+			const specs = Object.values(table);
+			expect(new Set(specs.map((s) => s.cls)).size).toBe(specs.length);
+			expect(new Set(specs.map((s) => s.attr)).size).toBe(specs.length);
+			expect(new Set(specs.map((s) => s.msg)).size).toBe(specs.length);
 		});
 
-		it("renderPlanRow emits a jm-reference-check checkbox with data-reference-key for entity rows", () => {
+		it("dispatches context checkboxes from the same table the rows were built from", () => {
+			// Render and dispatch must not drift: a row rendered with one class and
+			// dispatched under another is exactly how the skill exclusion silently went
+			// to the plans set.
 			const js = buildSidebarScript();
-			const fnStart = js.indexOf("function renderPlanRow");
-			const fnEnd = js.indexOf("\n  function ", fnStart + 1);
-			const fn =
-				fnEnd > fnStart
-					? js.slice(fnStart, fnEnd)
-					: js.slice(fnStart, fnStart + 3000);
-			expect(fn).toContain("'jm-reference-check'");
-			expect(fn).toContain("'data-reference-key'");
-			// The mapKey is stored in item.id (entity.mapKey from PlansTreeProvider.serialize)
-			// and carried into 'data-reference-key'.
-			expect(fn).toMatch(/data-reference-key.*item\.id/);
-			// The isReference branch still discriminates which checkbox class is emitted.
-			expect(fn).toMatch(/isReference/);
+			expect(js).toContain("for (var ctxKey in CONTEXT_ROW_KINDS)");
+			expect(js).toContain("cb.classList.contains(spec.cls)");
+			// Guarded now: the aggregate row has no idKey, and writing the field anyway
+			// would post an explicit undefined the host would read as a real key.
+			expect(js).toContain("if (spec.idKey) payload[spec.idKey] = cb.getAttribute(spec.attr)");
+		});
+
+		it("the plan row uses jm-plan-check checkbox with data-plan-id for plan rows", () => {
+			const js = buildSidebarScript();
+			const start = js.indexOf("var CONTEXT_ROW_KINDS");
+			const end = js.indexOf("function renderPlanRow", start);
+			const table = new Function(`${js.slice(start, end)}\nreturn CONTEXT_ROW_KINDS`)() as Record<
+				string,
+				{ badge: string; cls: string; attr: string; msg: string; idKey: string }
+			>;
+			expect(table.plan).toMatchObject({
+				badge: "plan",
+				cls: "jm-plan-check",
+				attr: "data-plan-id",
+				msg: "branch:togglePlanSelection",
+				idKey: "planId",
+			});
+			// renderPlanRow builds the checkbox FROM this spec, so the class and
+			// attribute cannot drift from what the dispatcher looks for.
+			expect(js).toContain("if (rowKind.attr) attrs[rowKind.attr] = item.id");
+		});
+
+		it("the note row uses jm-note-check checkbox with data-note-id for note rows", () => {
+			const js = buildSidebarScript();
+			const start = js.indexOf("var CONTEXT_ROW_KINDS");
+			const end = js.indexOf("function renderPlanRow", start);
+			const table = new Function(`${js.slice(start, end)}\nreturn CONTEXT_ROW_KINDS`)() as Record<
+				string,
+				{ badge: string; cls: string; attr: string; msg: string; idKey: string }
+			>;
+			expect(table.note).toMatchObject({
+				badge: "note",
+				cls: "jm-note-check",
+				attr: "data-note-id",
+				msg: "branch:toggleNoteSelection",
+				idKey: "noteId",
+			});
+			// renderPlanRow builds the checkbox FROM this spec, so the class and
+			// attribute cannot drift from what the dispatcher looks for.
+			expect(js).toContain("if (rowKind.attr) attrs[rowKind.attr] = item.id");
+		});
+
+		it("the reference row uses jm-reference-check checkbox with data-reference-key for entity rows", () => {
+			const js = buildSidebarScript();
+			const start = js.indexOf("var CONTEXT_ROW_KINDS");
+			const end = js.indexOf("function renderPlanRow", start);
+			const table = new Function(`${js.slice(start, end)}\nreturn CONTEXT_ROW_KINDS`)() as Record<
+				string,
+				{ badge: string; cls: string; attr: string; msg: string; idKey: string }
+			>;
+			expect(table.reference).toMatchObject({
+				badge: "reference",
+				cls: "jm-reference-check",
+				attr: "data-reference-key",
+				msg: "branch:toggleReferenceSelection",
+				idKey: "mapKey",
+			});
+			// renderPlanRow builds the checkbox FROM this spec, so the class and
+			// attribute cannot drift from what the dispatcher looks for.
+			expect(js).toContain("if (rowKind.attr) attrs[rowKind.attr] = item.id");
 		});
 
 		it("change listener posts branch:toggleConversationSelection for jm-conv-check", () => {
@@ -2974,29 +3107,56 @@ describe("SidebarScriptBuilder", () => {
 
 		it("change listener posts branch:togglePlanSelection for jm-plan-check", () => {
 			const js = buildSidebarScript();
-			expect(js).toContain("type: 'branch:togglePlanSelection'");
-			expect(js).toContain("'jm-plan-check'");
+			const start = js.indexOf("var CONTEXT_ROW_KINDS");
+			const end = js.indexOf("function renderPlanRow", start);
+			const table = new Function(`${js.slice(start, end)}\nreturn CONTEXT_ROW_KINDS`)() as Record<
+				string,
+				{ badge: string; cls: string; attr: string; msg: string; idKey: string }
+			>;
+			expect(table.plan.msg).toBe("branch:togglePlanSelection");
+			expect(table.plan.cls).toBe("jm-plan-check");
 		});
 
 		it("change listener posts branch:toggleNoteSelection for jm-note-check", () => {
 			const js = buildSidebarScript();
-			expect(js).toContain("type: 'branch:toggleNoteSelection'");
-			expect(js).toContain("'jm-note-check'");
+			const start = js.indexOf("var CONTEXT_ROW_KINDS");
+			const end = js.indexOf("function renderPlanRow", start);
+			const table = new Function(`${js.slice(start, end)}\nreturn CONTEXT_ROW_KINDS`)() as Record<
+				string,
+				{ badge: string; cls: string; attr: string; msg: string; idKey: string }
+			>;
+			expect(table.note.msg).toBe("branch:toggleNoteSelection");
+			expect(table.note.cls).toBe("jm-note-check");
 		});
 
 		it("change listener posts branch:toggleReferenceSelection for jm-reference-check with mapKey from data-reference-key", () => {
 			const js = buildSidebarScript();
-			expect(js).toContain("type: 'branch:toggleReferenceSelection'");
-			expect(js).toContain("'jm-reference-check'");
-			// Confirm the mapKey is read from data-reference-key rather than
-			// being conflated with data-plan-id / data-note-id.
-			expect(js).toMatch(/mapKey:\s*cb\.getAttribute\(['"]data-reference-key['"]\)/);
+			const start = js.indexOf("var CONTEXT_ROW_KINDS");
+			const end = js.indexOf("function renderPlanRow", start);
+			const table = new Function(`${js.slice(start, end)}\nreturn CONTEXT_ROW_KINDS`)() as Record<
+				string,
+				{ badge: string; cls: string; attr: string; msg: string; idKey: string }
+			>;
+			expect(table.reference.msg).toBe("branch:toggleReferenceSelection");
+			expect(table.reference.attr).toBe("data-reference-key");
+			// The payload field carrying that attribute is mapKey, not a reference-specific name.
+			expect(table.reference.idKey).toBe("mapKey");
 		});
 
 		it("change listener sends planId from data-plan-id and noteId from data-note-id", () => {
 			const js = buildSidebarScript();
-			expect(js).toContain("getAttribute('data-plan-id')");
-			expect(js).toContain("getAttribute('data-note-id')");
+			const start = js.indexOf("var CONTEXT_ROW_KINDS");
+			const end = js.indexOf("function renderPlanRow", start);
+			const table = new Function(`${js.slice(start, end)}\nreturn CONTEXT_ROW_KINDS`)() as Record<
+				string,
+				{ badge: string; cls: string; attr: string; msg: string; idKey: string }
+			>;
+			// Each kind's id attribute is read into its own payload field. The dispatcher
+			// does this generically (payload[spec.idKey] = cb.getAttribute(spec.attr)), so
+			// the pairing lives here rather than in four hand-written branches.
+			expect(table.plan).toMatchObject({ attr: "data-plan-id", idKey: "planId" });
+			expect(table.note).toMatchObject({ attr: "data-note-id", idKey: "noteId" });
+			expect(js).toContain("payload[spec.idKey] = cb.getAttribute(spec.attr)");
 		});
 
 		it("change listener sends source and sessionId from data-source and data-session", () => {
@@ -3131,7 +3291,8 @@ describe("SidebarScriptBuilder", () => {
 		const js = buildSidebarScript();
 		// Inline pin handler: reference rows emit kind 'reference' keyed by the
 		// row's data-id (which is the reference mapKey).
-		expect(js).toMatch(/ctx === 'reference'[\s\S]{0,160}kind:\s*'reference',\s*id:\s*id/);
+		expect(contextRowTable(js).reference.pinKind).toBe("reference");
+		expect(js).toMatch(/ctxSpec\.pinKind[\s\S]{0,600}kind:\s*ctxSpec\.pinKind,\s*id:\s*id/);
 		// renderPinnedRow reopens a pinned reference through its preview path,
 		// passing pin.id as the mapKey.
 		expect(js).toMatch(/case 'reference':[\s\S]{0,300}type:\s*'branch:openReferencePreview',\s*mapKey:\s*pin\.id/);
@@ -3682,6 +3843,83 @@ describe("SidebarScriptBuilder", () => {
 			const js = buildSidebarScript();
 			expect(js).toContain("aiReasonById = Object.create(null)");
 			expect(js).not.toContain("aiReasonById = {}");
+		});
+	});
+
+	// ── Skills aggregate Context row ──────────────────────────────────────────
+	// Skills collapse into ONE Context row rather than one row per skill. The
+	// tests below pin the three interaction paths that shipped broken when the row
+	// was per-skill and every per-kind decision was a separate if/else chain ending
+	// in a plan default: the row showed an "Edit Plan" tooltip, its inline buttons
+	// dispatched plan commands against a key plan commands cannot resolve, and a
+	// plain click did nothing at all.
+	describe("skills aggregate row", () => {
+		it("declares no inline actions, so the row renders no pin / edit / trash", () => {
+			const spec = contextRowTable(buildSidebarScript()).skills;
+			expect(spec.actions).toEqual([]);
+			expect(spec.editLabel).toBeNull();
+			expect(spec.pinKind).toBeNull();
+			expect(spec.removeCmd).toBeNull();
+		});
+
+		it("opens the aggregate on a plain row click, carrying no id", () => {
+			// The regression: there was no 'skills' branch in the row-click dispatch at
+			// all, so clicking the row was a silent no-op.
+			const spec = contextRowTable(buildSidebarScript()).skills;
+			expect(spec.openMsg).toBe("branch:openSkillsAggregate");
+			expect(spec.openIdKey).toBeNull();
+		});
+
+		it("toggles every skill at once, sending no key", () => {
+			// The row stands for N skills, so the only selection it can express is all
+			// or none — the host reads the current keys from the store.
+			const spec = contextRowTable(buildSidebarScript()).skills;
+			expect(spec.msg).toBe("branch:toggleSkillSelection");
+			expect(spec.idKey).toBeNull();
+			expect(spec.attr).toBeNull();
+		});
+
+		it("renders a checkbox despite having no id attribute", () => {
+			// The guard must skip only the attribute, not the checkbox: leaving the row
+			// boxless would take away the one write it has.
+			const js = buildSidebarScript();
+			expect(js).toContain("if (rowKind.attr) attrs[rowKind.attr] = item.id");
+			expect(js).toMatch(/if \(rowKind\) \{[\s\S]{0,400}cb\.checked = !!item\.isSelected/);
+		});
+
+		it("offers one context-menu entry that mirrors the row click", () => {
+			const js = buildSidebarScript();
+			expect(js).toMatch(
+				/ctx === 'skills'[\s\S]{0,400}'Open Skills Used'[\s\S]{0,120}branch:openSkillsAggregate/,
+			);
+		});
+
+		it("reads skillsHover off the serialized row and renders the group card", () => {
+			const js = buildSidebarScript();
+			expect(js).toContain("items[i].skillsHover");
+			expect(js).toContain("renderSkillsHoverCard");
+			// Titled for the group, not for any one skill.
+			expect(js).toContain("el('span', { text: 'Skills used' })");
+			// The card lists members and says what it hid rather than growing unbounded.
+			expect(js).toContain("h.overflow");
+			expect(js).toContain("'…and ' + h.overflow + ' more'");
+		});
+
+		it("daggers inferred members in the card instead of labelling the whole group", () => {
+			// anyInferred qualifies SOME members. Labelling the card would claim the
+			// group was inferred; the dagger marks exactly the rows it applies to.
+			const js = buildSidebarScript();
+			expect(js).toMatch(/r\.inferred \? ' †' : ''/);
+			expect(js).toContain("h.anyInferred");
+		});
+
+		it("gives the card one action and no upstream link", () => {
+			// Skills are local acts — unlike a reference there is no page to open.
+			const js = buildSidebarScript();
+			expect(js).toMatch(
+				/renderSkillsHoverCard[\s\S]{0,4000}'data-cmd': 'jollimemory\.openSkillsAggregate'/,
+			);
+			expect(js).not.toContain("jollimemory.openSkillMarkdown");
 		});
 	});
 });

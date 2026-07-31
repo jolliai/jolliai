@@ -85,6 +85,7 @@ import { renderBlock } from "../core/references/SourceEngine.js";
 import {
 	associateNoteWithCommit,
 	associatePlanWithCommit,
+	associateSkillWithCommit,
 	deleteQueueEntry,
 	dequeueAllGitOperations,
 	detectActiveNotesForBranch,
@@ -123,11 +124,13 @@ import {
 	storeNotes,
 	storePlans,
 	storeReferences,
+	storeSkills,
 	storeSummary,
 	stripFunctionalMetadata,
 	withRequiredOrphanWriteLock,
 } from "../core/SummaryStore.js";
 import { resolveTranscriptIdsFiltered } from "../core/SummaryTree.js";
+import { associateSkillsWithCommit } from "../core/skills/SkillArchive.js";
 import { getTelemetryContext, track } from "../core/Telemetry.js";
 import { bootstrapTelemetry, flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { getCurrentTraceId, runWithTrace, TRACE_ID_ENV, traceIdFromEnv } from "../core/TraceContext.js";
@@ -171,6 +174,7 @@ import {
 	type Reference,
 	type ReferenceCommitRef,
 	type ReferenceEntry,
+	type SkillCommitRef,
 	type SourceId,
 	type StoredTranscript,
 	type SummaryErrorKind,
@@ -213,11 +217,24 @@ const WORKER_LOCK_REFRESH_INTERVAL_MS = 60_000;
  * Reference source resolution per old summary: `oldSummary.references` is the
  * canonical and only multi-source list.
  */
+/** Every commit hash in the subtree being folded away, roots included. */
+function collectCollapsedHashes(nodes: ReadonlyArray<CommitSummary>): string[] {
+	const out: string[] = [];
+	for (const n of nodes) {
+		out.push(n.commitHash);
+		if (n.children) out.push(...collectCollapsedHashes(n.children));
+	}
+	return out;
+}
+
 async function reassociateMetadata(
 	oldSummaries: ReadonlyArray<CommitSummary>,
 	newHash: string,
 	cwd: string,
 ): Promise<void> {
+	// Every hash being collapsed, including nested squash roots' own children: a guard
+	// may sit on any commit in the subtree this rewrite is folding away.
+	const collapsedHashes = collectCollapsedHashes(oldSummaries);
 	for (const oldSummary of oldSummaries) {
 		if (oldSummary.plans) {
 			for (const planRef of oldSummary.plans) {
@@ -227,6 +244,14 @@ async function reassociateMetadata(
 		if (oldSummary.notes) {
 			for (const noteRef of oldSummary.notes) {
 				await associateNoteWithCommit(noteRef.id, newHash, cwd);
+			}
+		}
+		if (oldSummary.skills) {
+			for (const skillRef of oldSummary.skills) {
+				// The collapsed hashes are needed alongside the ref: a hoisted ref carries
+				// the archivedKey of the commit that first archived it, which stops matching
+				// the guard as soon as an earlier squash moved it.
+				await associateSkillWithCommit(skillRef.archivedKey, newHash, cwd, collapsedHashes);
 			}
 		}
 		// References have no plans.json guard row (commit deletes the entry),
@@ -257,6 +282,7 @@ function hoistMetadataFromOldSummary(oldSummary: CommitSummary | null | undefine
 		...(oldSummary.plans && { plans: oldSummary.plans }),
 		...(oldSummary.notes && { notes: oldSummary.notes }),
 		...(oldSummary.references && { references: oldSummary.references }),
+		...(oldSummary.skills && { skills: oldSummary.skills }),
 		...(oldSummary.e2eTestGuide && { e2eTestGuide: oldSummary.e2eTestGuide }),
 	};
 }
@@ -1521,6 +1547,11 @@ async function finalizeReferenceArchive(
 			plans: freshRegistry.plans,
 			...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
 			references: mergedReferences,
+			// Skills MUST be carried: this rebuild runs one step before skill archival
+			// reads the registry, so omitting the map made every reference-bearing commit
+			// archive zero skills — a failure whose symptom named the wrong subsystem
+			// entirely. PlansRegistryWriters.test.ts now fails on any such omission.
+			...(freshRegistry.skills !== undefined ? { skills: freshRegistry.skills } : {}),
 		};
 		await savePlansRegistry(out, cwd);
 		return toDelete;
@@ -1582,6 +1613,7 @@ export interface ConsumedWorkspaceContext {
 	readonly planAssociation: PlanAssociationResult;
 	readonly noteRefs: ReadonlyArray<NoteReference>;
 	readonly referenceRefs: ReadonlyArray<ReferenceCommitRef>;
+	readonly skillRefs: ReadonlyArray<SkillCommitRef>;
 }
 
 /**
@@ -1619,6 +1651,8 @@ async function consumeWorkspaceContext(args: {
 		readonly plans: ReadonlySet<string>;
 		readonly notes: ReadonlySet<string>;
 		readonly references: ReadonlySet<string>;
+		/** Optional — postdates the persisted selection shape; absent means none excluded. */
+		readonly skills?: ReadonlySet<string>;
 	};
 	readonly excludedContext: ReadonlyArray<ExcludedContextItem>;
 	readonly archiveLabel?: "commit" | "amend";
@@ -1629,6 +1663,7 @@ async function consumeWorkspaceContext(args: {
 		plan: new Set<string>(),
 		note: new Set<string>(),
 		reference: new Set<string>(),
+		skill: new Set<string>(),
 	};
 	for (const e of excludedContext) {
 		// An explicit exclusion — whether a relevance verdict or a reused/persisted
@@ -1676,12 +1711,32 @@ async function consumeWorkspaceContext(args: {
 		await finalizeReferenceArchive(referenceCommitted, cwd);
 	}
 
+	// Skills: metadata about HOW the work happened. Archived and displayed, never
+	// fed to the summarizer — the same trackOnly contract references use.
+	// Exclusions go INTO the association, not onto its result: it guards rows and
+	// emits orphan-branch bytes, so a post-filter would archive an excluded skill.
+	const excludedSkillKeys = new Set([...(exclusions.skills ?? []), ...aiExcludedKeys.skill]);
+	const { refs: skillRefs, filesToStore: skillFiles } = await associateSkillsWithCommit(
+		commitHash,
+		cwd,
+		branch,
+		excludedSkillKeys,
+	);
+	if (skillFiles.length > 0) {
+		await storeSkills(
+			skillFiles,
+			`Archive ${skillFiles.length} skill(s) for ${archiveLabel} ${commitHash.substring(0, 8)}`,
+			cwd,
+			branch,
+		);
+	}
+
 	// Excluded working items are intentionally NOT discarded: "Leave out of this
 	// memory" means "skip this commit but keep the item on the panel so the user can
 	// re-check it later." Because they were filtered out of association above, they
 	// keep commitHash === null and their registry rows + backing files stay intact,
 	// so detectActive*ForBranch surfaces them again on the next refresh.
-	return { planAssociation, noteRefs, referenceRefs };
+	return { planAssociation, noteRefs, referenceRefs, skillRefs };
 }
 
 /**
@@ -1981,7 +2036,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// associate with this commit. User hard-excludes and AI soft-excludes
 	// (excludedContext) are skipped from association and stay uncommitted (kept on
 	// the panel). See consumeWorkspaceContext for the full archive-side rationale.
-	const { planAssociation, noteRefs, referenceRefs } = await consumeWorkspaceContext({
+	const { planAssociation, noteRefs, referenceRefs, skillRefs } = await consumeWorkspaceContext({
 		cwd,
 		branch,
 		commitHash: commitInfo.hash,
@@ -2070,6 +2125,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		...(planRefs.length > 0 ? { plans: planRefs } : {}),
 		...(noteRefs.length > 0 ? { notes: noteRefs } : {}),
 		...(referenceRefs.length > 0 ? { references: referenceRefs } : {}),
+		...(skillRefs.length > 0 ? { skills: skillRefs } : {}),
 		...(excludedContext.length > 0 ? { excludedContext } : {}),
 		...(contextRelevance.length > 0 ? { contextRelevance } : {}),
 		// v5 contract: `transcripts` is always present on a v5 root (empty array
@@ -2258,9 +2314,36 @@ async function runSquashPipeline(
 	// mergeManyToOne writes the v4 root with these consolidated topics + recap +
 	// stripped children. Hoist invariant always completes (consolidated is never
 	// undefined here, even on LLM failure thanks to mechanicalConsolidate).
-	await mergeManyToOne(oldSummaries, commitInfo, cwd, metadata, consolidated);
+	// A squash lands new work, so uncommitted skill rows belong on the squash commit
+	// exactly as they would on a plain commit. Done BEFORE mergeManyToOne so the refs
+	// can be hoisted onto the root it writes — there is no second write to patch them
+	// in afterwards. Unlike plans/notes there is no separate detect step:
+	// associateSkillsWithCommit reads the registry itself.
+	//
+	// User exclusions are honoured here exactly as on the plain-commit path. They
+	// MUST go into the association rather than filter its result: it guards the row
+	// and emits orphan-branch bytes, so a post-filter would leave an excluded skill
+	// archived on the branch while merely hiding it from the summary.
+	const branch = oldSummaries[0].branch;
+	const squashExclusions = await readExclusions(cwd);
+	const { refs: newSkillRefs, filesToStore: newSkillFiles } = await associateSkillsWithCommit(
+		commitInfo.hash,
+		cwd,
+		branch,
+		squashExclusions.skills ?? new Set<string>(),
+	);
+	if (newSkillFiles.length > 0) {
+		await storeSkills(
+			newSkillFiles,
+			`Archive ${newSkillFiles.length} skill(s) for squash ${commitInfo.hash.substring(0, 8)}`,
+			cwd,
+			branch,
+		);
+	}
 
-	// Re-associate plans and notes with the new squash commit hash.
+	await mergeManyToOne(oldSummaries, commitInfo, cwd, metadata, consolidated, undefined, newSkillRefs);
+
+	// Re-associate plans, notes and skill guards with the new squash commit hash.
 	await reassociateMetadata(oldSummaries, commitInfo.hash, cwd);
 
 	// Consolidated topic count for the caller's `stored` progress event — mirrors
@@ -2568,6 +2651,7 @@ function buildHoistedAmendRoot(
 		readonly plans?: ReadonlyArray<PlanReference>;
 		readonly notes?: ReadonlyArray<NoteReference>;
 		readonly references?: ReadonlyArray<ReferenceCommitRef>;
+		readonly skills?: ReadonlyArray<SkillCommitRef>;
 	},
 	excludedContext?: ReadonlyArray<ExcludedContextItem>,
 	contextRelevance?: ReadonlyArray<ContextRelevanceRef>,
@@ -2581,6 +2665,16 @@ function buildHoistedAmendRoot(
 		newRefs?.references,
 		(r) => `${r.source}:${r.nativeId}`,
 	);
+	// Skills merge on the registry mapKey `<source>:<skill>` verbatim — NOT via
+	// REF_HASH_SUFFIX like plans and notes above. Those two carry the archive short
+	// hash inside the identifier they are keyed on (`<slug>-<hash8>`), so it has to be
+	// stripped to recover a base key; a skill ref keeps its hash in `archivedKey` and
+	// leaves `skill` as the raw id, so there is nothing to strip. Stripping anyway
+	// silently truncated any id that happens to end in 8 hex characters, folding two
+	// distinct skills into one row here while `attachedBaseKeys.skill` below and
+	// `mergeSkillRefs` both kept them apart — three derivations of one key that have
+	// to agree.
+	const mergedSkills = mergeRefsNewWins(hoistedMeta.skills, newRefs?.skills, (s) => `${s.source}:${s.skill}`);
 	// Drop from the AI-exclude audit any item that is nonetheless ATTACHED to this
 	// summary via a hoisted (inherited) ref — otherwise the same item would appear
 	// in BOTH the attached list and the "AI excluded" list, a self-contradiction.
@@ -2592,6 +2686,7 @@ function buildHoistedAmendRoot(
 		plan: new Set(mergedPlans.map((p) => p.slug.replace(REF_HASH_SUFFIX, ""))),
 		note: new Set(mergedNotes.map((n) => n.id.replace(REF_HASH_SUFFIX, ""))),
 		reference: new Set(mergedReferences.map((r) => `${r.source}:${r.nativeId}`)),
+		skill: new Set(mergedSkills.map((s) => `${s.source}:${s.skill}`)),
 	};
 	const auditedExclusions = (excludedContext ?? []).filter((e) => !attachedBaseKeys[e.kind].has(e.key));
 	return {
@@ -2620,13 +2715,16 @@ function buildHoistedAmendRoot(
 		...(hoisted.summaryError && { summaryError: hoisted.summaryError }),
 		/* v8 ignore stop */
 		// hoistedMeta carries the non-ref hoist fields (jolliDocId, e2eTestGuide, …)
-		// plus the OLD plans/notes/references; the merged overrides below replace the
-		// three ref fields with "old ∪ new" (new wins). Set only when non-empty so the
+		// plus the OLD plans/notes/references/skills; the merged overrides below replace
+		// those ref fields with "old ∪ new" (new wins). Set only when non-empty so the
 		// "omit when absent" contract the hoist spread already honoured is preserved.
+		// Every merged field MUST be listed here: hoistedMeta alone would silently keep
+		// the OLD value, so an omission reads as "amend reverted this artifact".
 		...hoistedMeta,
 		...(mergedPlans.length > 0 ? { plans: mergedPlans } : {}),
 		...(mergedNotes.length > 0 ? { notes: mergedNotes } : {}),
 		...(mergedReferences.length > 0 ? { references: mergedReferences } : {}),
+		...(mergedSkills.length > 0 ? { skills: mergedSkills } : {}),
 		...(auditedExclusions.length > 0 ? { excludedContext: auditedExclusions } : {}),
 		...((contextRelevance ?? []).length > 0 ? { contextRelevance } : {}),
 		topics: hoisted.topics,
@@ -2721,7 +2819,12 @@ async function applyAmendShortCircuit(
 			conversationTokenBreakdown,
 			conversationModels,
 		},
-		{ plans: consumed.planAssociation.refs, notes: consumed.noteRefs, references: consumed.referenceRefs },
+		{
+			plans: consumed.planAssociation.refs,
+			notes: consumed.noteRefs,
+			references: consumed.referenceRefs,
+			skills: consumed.skillRefs,
+		},
 		// No excludedContext audit on short-circuit: it associates the full user
 		// selection, so there is no AI soft-exclude set to record.
 	);
@@ -3202,7 +3305,12 @@ async function handleAmendPipeline(
 				conversationTokenBreakdown,
 				conversationModels,
 			},
-			{ plans: consumed.planAssociation.refs, notes: consumed.noteRefs, references: consumed.referenceRefs },
+			{
+				plans: consumed.planAssociation.refs,
+				notes: consumed.noteRefs,
+				references: consumed.referenceRefs,
+				skills: consumed.skillRefs,
+			},
 			amendExcludedContext,
 			amendContextRelevance,
 		);

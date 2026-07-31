@@ -3,7 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { setExcluded } from "../../../cli/src/core/CommitSelectionStore.js";
-import type { NoteInfo, PlanInfo } from "../Types.js";
+import type { NoteInfo, PlanInfo,
+	SkillInfo,
+} from "../Types.js";
 
 const {
 	executeCommand,
@@ -83,6 +85,7 @@ import { PlansStore } from "../stores/PlansStore.js";
 import type { ReferenceInfo } from "../Types.js";
 import {
 	ReferenceItem,
+	SkillsGroupItem,
 	NoteItem,
 	PlanItem,
 	PlansTreeProvider,
@@ -811,5 +814,167 @@ describe("PlansTreeProvider", () => {
 				fs.rmSync(cwd, { recursive: true, force: true });
 			}
 		});
+	});
+});
+
+describe("SkillsGroupItem", () => {
+	const makeSkill = (over: Partial<SkillInfo> = {}): SkillInfo => ({
+		kind: "skill",
+		mapKey: "claude:superpowers:test-driven-development",
+		source: "claude",
+		skill: "superpowers:test-driven-development",
+		plugin: "superpowers",
+		entryPaths: ["tool"],
+		invocationCount: 2,
+		firstUsedAt: "2026-07-30T06:00:00.000Z",
+		lastUsedAt: "2026-07-30T07:00:00.000Z",
+		usage: { input: 79, cached: 59796, output: 33944, confidence: "attributed" },
+		sourcePath: "/tmp/skills/claude/x.md",
+		lastModified: "2026-07-30T07:00:00.000Z",
+		...over,
+	});
+
+	it("labels the row for the group, not for any one skill", () => {
+		const item = new SkillsGroupItem([makeSkill()]);
+		expect(item.label).toBe("Skills");
+		expect(item.contextValue).toBe("skills");
+		// 79 + 59796 + 33944 = 93819
+		expect(item.description).toBe("1 skill · 93.8k");
+	});
+
+	it("sums tokens across members and counts them", () => {
+		const item = new SkillsGroupItem([
+			makeSkill(),
+			makeSkill({
+				mapKey: "claude:other",
+				usage: { input: 100, cached: 0, output: 81, confidence: "attributed" },
+			}),
+		]);
+		// 93819 + 181 = 94000
+		expect(item.description).toBe("2 skills · 94.0k");
+		expect(item.skillsHover.count).toBe(2);
+		expect(item.skillsHover.totalTokensLabel).toBe("94.0k");
+		// input 79+100, output 33944+81, cached 59796+0 — the three-way split the
+		// aggregate table shows, summed on the same pass as the total above.
+		expect(item.skillsHover.totalBreakdownLabel).toBe("179 input · 34.0k output · 59.8k cached");
+	});
+
+	it("splits each member's own tokens as well as the group's", () => {
+		const item = new SkillsGroupItem([makeSkill()]);
+		expect(item.skillsHover.rows[0]?.tokensLabel).toBe("93.8k");
+		expect(item.skillsHover.rows[0]?.breakdownLabel).toBe("79 input · 33.9k output · 59.8k cached");
+	});
+
+	it("marks every component of an estimated split, not just the total", () => {
+		// The marker qualifies how the figure was arrived at. Leaving it on the total
+		// alone would present the three parts it was summed from as measurements.
+		const item = new SkillsGroupItem([
+			makeSkill({ usage: { input: 10, cached: 12000, output: 300, confidence: "estimated" } }),
+		]);
+		expect(item.skillsHover.totalTokensLabel).toBe("~12.3k");
+		expect(item.skillsHover.totalBreakdownLabel).toBe("~10 input · ~300 output · ~12.0k cached");
+	});
+
+	it("omits the split entirely, rather than zeroing it, for an unattributed member", () => {
+		// Same rule the aggregate table follows: three zeros would read as "measured,
+		// and it was nothing" for a source that measured nothing at all.
+		const item = new SkillsGroupItem([makeSkill({ detection: "heuristic", usage: undefined })]);
+		expect(item.skillsHover.rows[0]?.tokensLabel).toBeUndefined();
+		expect(item.skillsHover.rows[0]?.breakdownLabel).toBeUndefined();
+		expect(item.skillsHover.totalBreakdownLabel).toBeUndefined();
+	});
+
+	it("marks the SUM as an estimate when any single member is estimated", () => {
+		// The marker qualifies the whole figure — dropping it because the other members
+		// were measured would present a partly-guessed total as measured.
+		const item = new SkillsGroupItem([
+			makeSkill(),
+			makeSkill({
+				mapKey: "claude:other",
+				usage: { input: 10, cached: 12000, output: 300, confidence: "estimated" },
+			}),
+		]);
+		// 93819 + 12310 = 106129
+		expect(item.description).toBe("2 skills · ~106.1k");
+	});
+
+	it("shows only the count when nothing could be attributed", () => {
+		// Codex / Cursor heuristics attribute no tokens. A rendered zero would read as
+		// a measurement of nothing rather than as an absence of measurement.
+		const item = new SkillsGroupItem([makeSkill({ usage: undefined })]);
+		expect(item.description).toBe("1 skill");
+		expect(item.skillsHover.totalTokensLabel).toBeUndefined();
+	});
+
+	it("still totals the members that DID attribute when one member did not", () => {
+		// A heuristic member contributes no tokens but must not blank out the total for
+		// the observed ones alongside it.
+		const item = new SkillsGroupItem([
+			makeSkill(),
+			makeSkill({ mapKey: "codex:x", detection: "heuristic", usage: undefined }),
+		]);
+		expect(item.description).toBe("2 skills · 93.8k †");
+	});
+
+	it("opens the aggregate rather than any single record", () => {
+		// The row stands for N skills, so there is no per-skill argument to pass — and
+		// no upstream page either, unlike a reference.
+		const item = new SkillsGroupItem([makeSkill()]);
+		expect(item.command).toEqual({
+			command: "jollimemory.openSkillsAggregate",
+			title: "Open Skills Used",
+		});
+	});
+
+	it("flags an inferred member with a dagger on the row itself", () => {
+		// A reader scanning the list must be able to tell that something in the group was
+		// inferred rather than observed, without hovering.
+		const item = new SkillsGroupItem([makeSkill({ detection: "heuristic", usage: undefined })]);
+		expect(item.description).toBe("1 skill †");
+		expect(item.skillsHover.anyInferred).toBe(true);
+		expect(item.skillsHover.rows[0]?.inferred).toBe(true);
+	});
+
+	it("does not flag a group whose members were all observed", () => {
+		const item = new SkillsGroupItem([makeSkill()]);
+		expect(item.skillsHover.anyInferred).toBe(false);
+		expect(item.description).not.toContain("†");
+	});
+
+	it("orders hover rows heaviest first, matching the aggregate table", () => {
+		const item = new SkillsGroupItem([
+			makeSkill({ mapKey: "a", skill: "light", usage: { input: 1, cached: 0, output: 1, confidence: "attributed" } }),
+			makeSkill({ mapKey: "b", skill: "heavy" }),
+		]);
+		expect(item.skillsHover.rows.map((r) => r.skill)).toEqual(["heavy", "light"]);
+	});
+
+	it("caps the hover list and reports how many it hid", () => {
+		// The card is a popover, not a document — an unbounded list would run off it.
+		const many = Array.from({ length: 11 }, (_, i) =>
+			makeSkill({ mapKey: `k${i}`, skill: `s${i}`, usage: undefined }),
+		);
+		const item = new SkillsGroupItem(many);
+		expect(item.skillsHover.rows).toHaveLength(8);
+		expect(item.skillsHover.overflow).toBe(3);
+	});
+
+	it("takes its timestamp from the newest member", () => {
+		const item = new SkillsGroupItem([
+			makeSkill({ mapKey: "old", lastModified: "2020-01-01T00:00:00.000Z" }),
+			makeSkill({ mapKey: "new", lastModified: "2026-07-30T07:00:00.000Z" }),
+		]);
+		expect(item.skillsHover.relativeDate).toBe(
+			new SkillsGroupItem([makeSkill()]).skillsHover.relativeDate,
+		);
+	});
+
+	it("keeps every member reachable for the per-skill exclusion keys", () => {
+		// The row id is a sentinel, so the real plans.json keys have to come from here.
+		const item = new SkillsGroupItem([makeSkill(), makeSkill({ mapKey: "claude:other" })]);
+		expect(item.skillInfos.map((s) => s.mapKey)).toEqual([
+			"claude:superpowers:test-driven-development",
+			"claude:other",
+		]);
 	});
 });

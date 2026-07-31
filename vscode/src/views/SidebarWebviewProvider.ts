@@ -290,6 +290,12 @@ export interface SidebarWebviewDeps {
 	 */
 	codexDiscovery?: { discover(): void };
 	/**
+	 * Polling-path OpenCode skill discovery. OpenCode has no hook, so this tick is
+	 * the only thing that can surface its skills WHILE the work is happening —
+	 * waiting for the commit would leave working memory empty for the whole session.
+	 */
+	openCodeSkillDiscovery?: { discover(): void };
+	/**
 	 * Called once when the sidebar webview first becomes visible. Used to trigger
 	 * lazy-loaded data sources (e.g. MemoriesStore.ensureFirstLoad()) that the
 	 * original tree views populated via onDidChangeVisibility — replaced here
@@ -327,6 +333,11 @@ export interface SidebarWebviewDeps {
 		selected: boolean,
 	) => void | Promise<void>;
 	/** Toggle a single note's selection state in NotesStore. */
+	/**
+	 * Include/exclude EVERY captured skill at once — the Context list carries one
+	 * aggregate row, so there is no per-skill key to pass.
+	 */
+	applySkillCheckbox?: (selected: boolean) => void | Promise<void>;
 	applyNoteCheckbox?: (
 		noteId: string,
 		selected: boolean,
@@ -907,6 +918,18 @@ export class SidebarWebviewProvider
 				);
 				return;
 			}
+			case "kb:openEvidenceSkills":
+				// item_type stays SINGULAR to match the vocabulary the other four
+				// memory_item_opened calls (and IntelliJ's CommitsPanel) use, even though
+				// this row is an aggregate — the metric joins on that vocabulary.
+				track("memory_item_opened", { item_type: "skill" });
+				void this.deps.executeCommand(
+					"jollimemory.previewCommittedSkills",
+					msg.commitHash,
+					msg.sourceRepoName,
+					msg.sourceRemoteUrl,
+				);
+				return;
 			case "branch:openPlan":
 				// Sidebar row-click → markdown preview, not editor. Editing goes
 				// through the context menu's "Edit Plan" (editPlan).
@@ -936,7 +959,10 @@ export class SidebarWebviewProvider
 					msg.mapKey,
 				);
 				return;
-			case "branch:openReferencePreview":
+				case "branch:openSkillsAggregate":
+					void this.deps.executeCommand("jollimemory.openSkillsAggregate");
+					return;
+				case "branch:openReferencePreview":
 				// Sidebar row-click → rendered markdown preview, matching the
 				// plan/note rows. "Edit Markdown" in the context menu keeps the
 				// editor path (branch:openReferenceMarkdown).
@@ -1123,6 +1149,9 @@ export class SidebarWebviewProvider
 				return;
 			case "branch:toggleNoteSelection":
 				void this.deps.applyNoteCheckbox?.(msg.noteId, msg.selected);
+				return;
+			case "branch:toggleSkillSelection":
+				void this.deps.applySkillCheckbox?.(msg.selected);
 				return;
 			case "branch:dismissAiExclude":
 				void this.deps.applyDismissAiExclude?.(msg.kind, msg.key);
@@ -1613,6 +1642,18 @@ export class SidebarWebviewProvider
 				// source + archivedKey); the live openReferenceForPreview path is
 				// dead post-commit (registry row deleted, mapKey ≠ archivedKey).
 				context.push({ kind: "reference", id: ref.archivedKey, title: ref.title, source: ref.source });
+			}
+			// One aggregate row for ALL skills, matching the live Context list's single
+			// "Skills" row rather than the one-row-per-artifact shape the three kinds
+			// above use. `id` is the commit hash: the row opens the commit's whole
+			// `skills--<hash8>.md` table, and no individual skill is addressable here.
+			const skills = summary.skills ?? [];
+			if (skills.length > 0) {
+				context.push({
+					kind: "skill",
+					id: commitHash,
+					title: `Skills used (${skills.length})`,
+				});
 			}
 
 			// — files —
@@ -2133,6 +2174,14 @@ export class SidebarWebviewProvider
 		// to render.
 		try {
 			this.deps.codexDiscovery?.discover();
+		} catch {
+			// ignore — background discovery must never break the refresh.
+		}
+		// Same contract as Codex above: fire-and-forget, per-cwd single-flight inside
+		// the impl, non-throwing by construction, and guarded anyway so a regressed
+		// reader can never take down the conversation list this method exists to render.
+		try {
+			this.deps.openCodeSkillDiscovery?.discover();
 		} catch {
 			// ignore — background discovery must never break the refresh.
 		}

@@ -56,7 +56,7 @@ const log = createLogger("CommitSelection");
 const SELECTION_FILE = "commit-selection.json";
 const SELECTION_VERSION = 2 as const;
 
-export type ExclusionKind = "conversations" | "plans" | "notes" | "references";
+export type ExclusionKind = "conversations" | "plans" | "notes" | "references" | "skills";
 
 export interface CommitExclusions {
 	readonly conversations: ReadonlySet<string>;
@@ -64,6 +64,12 @@ export interface CommitExclusions {
 	readonly notes: ReadonlySet<string>;
 	/** Per-source reference key `<source>:<nativeId>`. */
 	readonly references: ReadonlySet<string>;
+	/**
+	 * Skill key `<source>:<skill>`. Optional because it postdates the persisted
+	 * shape: a selection file written before skills existed has no such field, and
+	 * defaulting it to empty is the correct reading of "nothing was excluded".
+	 */
+	readonly skills?: ReadonlySet<string>;
 }
 
 /**
@@ -115,6 +121,8 @@ interface PersistedShape {
 	readonly notes: readonly string[];
 	readonly plans: readonly string[];
 	readonly references: readonly string[];
+	/** Absent in files written before skills were a selectable artifact kind. */
+	readonly skills?: readonly string[];
 	readonly aiRelevance?: readonly AiRelevanceEntry[];
 	readonly changeFingerprint?: string;
 }
@@ -138,7 +146,7 @@ function asStringArray(v: unknown): readonly string[] {
 
 function asAiRelevanceEntries(v: unknown): readonly AiRelevanceEntry[] {
 	if (!Array.isArray(v)) return [];
-	const kinds = new Set<ExclusionKind>(["conversations", "plans", "notes", "references"]);
+	const kinds = new Set<ExclusionKind>(["conversations", "plans", "notes", "references", "skills"]);
 	const tiers = new Set(["high", "mid", "low"]);
 	const out: AiRelevanceEntry[] = [];
 	for (const x of v) {
@@ -209,6 +217,7 @@ async function readPersisted(projectDir: string): Promise<PersistedShape> {
 		notes: asStringArray(parsed.notes),
 		plans: asStringArray(parsed.plans),
 		references: asStringArray(parsed.references),
+		...(parsed.skills !== undefined ? { skills: asStringArray(parsed.skills) } : {}),
 		...(parsed.aiRelevance ? { aiRelevance: asAiRelevanceEntries(parsed.aiRelevance) } : {}),
 		...(typeof parsed.changeFingerprint === "string" ? { changeFingerprint: parsed.changeFingerprint } : {}),
 	};
@@ -222,6 +231,7 @@ export async function readExclusions(projectDir: string): Promise<CommitExclusio
 		plans: new Set(p.plans),
 		notes: new Set(p.notes),
 		references: new Set(p.references),
+		...(p.skills !== undefined ? { skills: new Set(p.skills) } : {}),
 	};
 }
 
@@ -243,6 +253,11 @@ function serializePersisted(p: PersistedShape): PersistedShape {
 		plans: p.plans,
 		notes: p.notes,
 		references: p.references,
+		// Carried explicitly: this function rebuilds the shape field-by-field, so an
+		// omitted field is silently dropped on the next write even though it round-trips
+		// through readPersisted. Empty stays absent, matching aiRelevance below — a user
+		// who never excludes a skill keeps a byte-identical file.
+		...(p.skills && p.skills.length > 0 ? { skills: p.skills } : {}),
 		...(p.aiRelevance && p.aiRelevance.length > 0 ? { aiRelevance: p.aiRelevance } : {}),
 		...(p.changeFingerprint ? { changeFingerprint: p.changeFingerprint } : {}),
 	};

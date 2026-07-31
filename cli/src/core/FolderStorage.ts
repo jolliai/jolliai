@@ -36,6 +36,7 @@ import type { CommitSummary, FileWrite, SummaryIndex, SummaryIndexEntry } from "
 import type { ManifestEntry } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
 import { toForwardSlash } from "./PathUtils.js";
+import { buildSkillsAggregateMarkdown, skillsAggregateFileName } from "./SkillsAggregateMarkdown.js";
 import type { HealOptions, HealResult, StorageKind, StorageProvider } from "./StorageProvider.js";
 import { buildMarkdown } from "./SummaryMarkdownBuilder.js";
 import type { TopicPage } from "./TopicKBTypes.js";
@@ -213,6 +214,21 @@ export class FolderStorage implements StorageProvider {
 	async deleteVisibleMarkdown(entry: SummaryIndexEntry): Promise<boolean> {
 		const slug = FolderStorage.slugify(entry.commitMessage);
 		const hash8 = entry.commitHash.substring(0, 8);
+		// The skills aggregate has the summary's lifecycle, not its own — that is the
+		// reason it needs no StorageProvider method pair. Removed first so a failure to
+		// delete the summary leaves no orphaned sibling claiming a memory that is gone.
+		//
+		// Isolated, because `deleteVisibleArtifact` rethrows anything that is not ENOENT:
+		// an unwritable sibling (permissions, a lock) would otherwise abort the deletion
+		// of the memory itself — trading the orphan this ordering avoids for a strictly
+		// worse failure. A stranded aggregate is swept by the next
+		// cleanupBranchStaleChildMarkdown pass; a memory that could not be deleted is
+		// reported as a failed cleanup forever.
+		try {
+			await this.deleteVisibleArtifact(`skill:${entry.commitHash}`, entry.branch, skillsAggregateFileName(hash8));
+		} catch (err) {
+			log.warn("Failed to delete skills aggregate for %s: %s", hash8, String(err));
+		}
 		return this.deleteVisibleArtifact(entry.commitHash, entry.branch, `${slug}-${hash8}.md`);
 	}
 
@@ -416,7 +432,15 @@ export class FolderStorage implements StorageProvider {
 		const hash8 = entry.commitHash.substring(0, 8);
 		const relativePath = `${branchFolder}/${slug}-${hash8}.md`;
 		const absPath = join(this.rootPath, relativePath);
-		if (existsSync(absPath)) return true;
+		if (existsSync(absPath)) {
+			// The memory itself is intact, so this is not a regeneration — but its
+			// generated skills sibling may still be missing, and reporting the memory
+			// healthy while leaving that gap makes "heal" only partly true. Healed on its
+			// own, best-effort: a failure here must not turn a healthy memory into a
+			// reported failure, which is why it does not touch the return value.
+			await this.healSkillsAggregate(entry, branchFolder, hash8);
+			return true;
+		}
 
 		const summaryJson = await this.readFile(`summaries/${entry.commitHash}.json`);
 		if (!summaryJson) {
@@ -457,6 +481,7 @@ export class FolderStorage implements StorageProvider {
 			},
 			title: existing?.title ?? summary.commitMessage,
 		});
+		this.generateSkillsAggregate(summary, branchFolder, hash8);
 		log.info("Regenerated visible MD: %s", relativePath);
 		return true;
 	}
@@ -727,6 +752,8 @@ export class FolderStorage implements StorageProvider {
 
 		log.info("Markdown generated: %s", relativePath);
 
+		this.generateSkillsAggregate(summary, branchFolder, hash8);
+
 		// After amend/squash, the new root's tree wraps the prior root(s) as
 		// children. Their visible MD copies were written by earlier writeFiles()
 		// calls; only the latest root surfaces in Memories now, so the prior
@@ -736,6 +763,79 @@ export class FolderStorage implements StorageProvider {
 		if (summary.children && summary.children.length > 0) {
 			this.cleanupSupersededDescendants(summary.children, relativePath);
 		}
+	}
+
+	/**
+	 * Writes `<branchFolder>/skills--<hash8>.md` — the per-commit skill-usage table.
+	 *
+	 * **Emitted from the summary arm, deliberately, not from a `skills/*.md` arm.**
+	 * The visible cascade in `writeFiles` runs once per written file, so a fourth arm
+	 * would rewrite this aggregate once per skill (a read-modify-write repeated N
+	 * times) and would acquire an ordering dependency on whether `storeSkills` ran
+	 * before or after `storeSummary`. The summary payload already carries
+	 * `CommitSummary.skills`, so there is one trigger, complete data, and a commit
+	 * hash that is inherently correct.
+	 *
+	 * One file per commit rather than one per skill: the visible layer exists to be
+	 * browsed by a human, and skills are auto-captured metadata arriving several per
+	 * commit. At three per commit, a hundred commits would bury the handful of memory
+	 * documents a user actually opens under three hundred files.
+	 *
+	 * Its lifecycle is the summary's, which is why it needs no `StorageProvider`
+	 * method of its own — `deleteVisibleMarkdown` / `regenerateVisibleMarkdown`
+	 * already take a `SummaryIndexEntry` and extend to this sibling.
+	 */
+	/**
+	 * Restores a missing `skills--<hash8>.md` without touching the memory's own
+	 * markdown. Silent on every failure: this runs on a path whose subject — the
+	 * memory — is already intact, so nothing here may downgrade that outcome.
+	 */
+	private async healSkillsAggregate(entry: SummaryIndexEntry, branchFolder: string, hash8: string): Promise<void> {
+		if (existsSync(join(this.rootPath, branchFolder, skillsAggregateFileName(hash8)))) return;
+		const summaryJson = await this.readFile(`summaries/${entry.commitHash}.json`);
+		if (!summaryJson) return;
+		try {
+			this.generateSkillsAggregate(JSON.parse(summaryJson) as CommitSummary, branchFolder, hash8);
+		} catch {
+			// Malformed hidden JSON is already reported by the regeneration path proper.
+		}
+	}
+
+	private generateSkillsAggregate(summary: CommitSummary, branchFolder: string, hash8: string): void {
+		const skills = summary.skills;
+		if (skills === undefined || skills.length === 0) return;
+
+		const relativePath = `${branchFolder}/${skillsAggregateFileName(hash8)}`;
+		const targetPath = join(this.rootPath, relativePath);
+
+		const existingEntry = this.metadataManager.findByPath(relativePath);
+		if (this.isUserEditedOnDisk(targetPath, existingEntry?.fingerprint)) {
+			log.info("FolderStorage: skip overwrite of user-edited %s", relativePath);
+			return;
+		}
+
+		const markdown = buildSkillsAggregateMarkdown(summary, skills);
+		this.atomicWrite(targetPath, markdown);
+
+		this.metadataManager.updateManifest({
+			path: relativePath,
+			// Namespaced `skill:<hash>`, NOT the bare commit hash. `updateManifest` is
+			// keyed on fileId and replaces any entry that shares one, so a bare hash here
+			// would evict the summary's own manifest entry — and `findById(hash)` would
+			// then hand this row to `cleanupSupersededDescendants`, whose `type !== "commit"`
+			// guard would silently skip cleaning up the superseded summary. Plans already
+			// namespace as `plan:<slug>` for the same reason.
+			fileId: `skill:${summary.commitHash}`,
+			type: "skill",
+			fingerprint: MetadataManager.sha256(markdown),
+			source: {
+				commitHash: summary.commitHash,
+				branch: summary.branch,
+				generatedAt: summary.generatedAt,
+			},
+			title: `Skills used — ${hash8}`,
+		});
+		log.info("Skills aggregate generated: %s", relativePath);
 	}
 
 	private cleanupSupersededDescendants(children: ReadonlyArray<CommitSummary>, newRootRelPath: string): void {

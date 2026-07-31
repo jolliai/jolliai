@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CommitSummary, ModelTokenUsage } from "../Types.js";
+import type { CommitSummary, ModelTokenUsage, SkillCommitRef } from "../Types.js";
 import { CURRENT_SCHEMA_VERSION } from "../Types.js";
 import { type DetachedSessionUsage, subtractDetachedUsage } from "./DetachedUsageSubtraction.js";
 import { PRICES_AS_OF } from "./Pricing.js";
@@ -455,5 +455,171 @@ describe("subtractDetachedUsage", () => {
 		// "unknown" instead of a misleading $0.00.
 		expect(result.summary.estimatedCostUsd).toBeUndefined();
 		expect(result.summary.pricesAsOf).toBeUndefined();
+	});
+});
+
+// ─── Skill usage subtraction ─────────────────────────────────────────────────
+
+describe("subtractDetachedUsage — skill figures", () => {
+	const skill = (over: Partial<SkillCommitRef> = {}): SkillCommitRef => ({
+		archivedKey: "claude:superpowers:brainstorming-abc12345",
+		source: "claude",
+		skill: "superpowers:brainstorming",
+		entryPaths: ["tool"],
+		invocationCount: 2,
+		firstUsedAt: "2026-07-29T00:00:00.000Z",
+		lastUsedAt: "2026-07-29T01:00:00.000Z",
+		usage: { input: 30, cached: 300, output: 3000, confidence: "attributed" },
+		usageBySession: {
+			"claude:sessA": { input: 10, cached: 100, output: 1000, confidence: "attributed" },
+			"claude:sessB": { input: 20, cached: 200, output: 2000, confidence: "attributed" },
+		},
+		...over,
+	});
+
+	/** A detached session carrying both its commit-level share and its identity. */
+	const detached = (sessionKey: string, usage?: { input: number; output: number; cached: number }) => [
+		{ ...(usage !== undefined ? { usage } : {}), sessionKey },
+	];
+
+	it("removes only the detached session's share and re-totals", () => {
+		const summary = node({
+			transcripts: ["t1"],
+			conversationTokens: 3330,
+			conversationTokenBreakdown: { input: 30, output: 3000, cached: 300 },
+			skills: [skill()],
+		});
+		const result = subtractDetachedUsage(
+			summary,
+			removed("t1", detached("claude:sessA", { input: 10, output: 1000, cached: 100 })),
+		);
+
+		const [remaining] = result.summary.skills ?? [];
+		expect(remaining.usageBySession).toEqual({
+			"claude:sessB": { input: 20, cached: 200, output: 2000, confidence: "attributed" },
+		});
+		expect(remaining.usage).toEqual({ input: 20, cached: 200, output: 2000, confidence: "attributed" });
+	});
+
+	it("is idempotent, unlike the aggregate figures", () => {
+		// A skill's split is an explicit per-session map, so removing a key twice lands
+		// on the same result. The scalar conversation total is not — which is why that
+		// one needs single-owner resolution and this does not.
+		const summary = node({ transcripts: ["t1"], conversationTokens: 3330, skills: [skill()] });
+		const once = subtractDetachedUsage(
+			summary,
+			removed("t1", detached("claude:sessA", { input: 10, output: 1000, cached: 100 })),
+		);
+		const twice = subtractDetachedUsage(
+			once.summary,
+			removed("t1", detached("claude:sessA", { input: 10, output: 1000, cached: 100 })),
+		);
+		expect(twice.summary.skills?.[0].usage).toEqual(once.summary.skills?.[0].usage);
+	});
+
+	it("keeps the skill row when its last session is detached, but drops the figure", () => {
+		// The skill DID run — the invocations recorded it. What is gone is the evidence
+		// of what it cost, and an absent usage says exactly that. A zero would claim
+		// the skill was free, and deleting the row would claim it never ran.
+		const summary = node({
+			transcripts: ["t1"],
+			skills: [
+				skill({
+					usage: { input: 10, cached: 100, output: 1000, confidence: "attributed" },
+					usageBySession: {
+						"claude:sessA": { input: 10, cached: 100, output: 1000, confidence: "attributed" },
+					},
+				}),
+			],
+		});
+		const result = subtractDetachedUsage(
+			summary,
+			removed("t1", detached("claude:sessA", { input: 10, output: 1000, cached: 100 })),
+		);
+		const [remaining] = result.summary.skills ?? [];
+		expect(remaining.skill).toBe("superpowers:brainstorming");
+		expect(remaining.invocationCount).toBe(2);
+		expect(remaining.usage).toBeUndefined();
+		expect(remaining.usageBySession).toBeUndefined();
+	});
+
+	it("leaves a skill alone when the detached session never contributed to it", () => {
+		const summary = node({ transcripts: ["t1"], skills: [skill()] });
+		const result = subtractDetachedUsage(
+			summary,
+			removed("t1", detached("claude:sessZ", { input: 1, output: 1, cached: 1 })),
+		);
+		expect(result.summary.skills?.[0]).toEqual(skill());
+	});
+
+	it("leaves a pre-split skill row untouched", () => {
+		// Forward-only, matching how the aggregate path treats a memory written before
+		// per-session usage existed: there is nothing to subtract, so nothing is
+		// invented. Zeroing it would replace a known-stale number with a wrong one.
+		const legacy = skill({ usageBySession: undefined });
+		const summary = node({ transcripts: ["t1"], skills: [legacy] });
+		const result = subtractDetachedUsage(
+			summary,
+			removed("t1", detached("claude:sessA", { input: 10, output: 1000, cached: 100 })),
+		);
+		expect(result.summary.skills?.[0]).toEqual(legacy);
+	});
+
+	it("corrects every node that recorded the session, not just the owner", () => {
+		// Amend hoists a child's skills onto the root, so the same session's
+		// contribution is recorded in both places. Both must be corrected — and can be,
+		// because removing a map key cannot double-subtract.
+		const child = node({ commitHash: "b".repeat(40), transcripts: ["t1"], skills: [skill()] });
+		const summary = node({ transcripts: ["t1"], children: [child], skills: [skill()] });
+		const result = subtractDetachedUsage(
+			summary,
+			removed("t1", detached("claude:sessA", { input: 10, output: 1000, cached: 100 })),
+		);
+
+		expect(result.summary.skills?.[0].usage?.output).toBe(2000);
+		expect(result.summary.children?.[0].skills?.[0].usage?.output).toBe(2000);
+	});
+
+	it("recomputes confidence from the sessions that remain", () => {
+		// Dropping the estimated session leaves a total that IS fully attributed, so it
+		// should stop being labelled an estimate.
+		const summary = node({
+			transcripts: ["t1"],
+			skills: [
+				skill({
+					usage: { input: 30, cached: 300, output: 3000, confidence: "estimated" },
+					usageBySession: {
+						"claude:sessA": { input: 10, cached: 100, output: 1000, confidence: "estimated" },
+						"claude:sessB": { input: 20, cached: 200, output: 2000, confidence: "attributed" },
+					},
+				}),
+			],
+		});
+		const result = subtractDetachedUsage(
+			summary,
+			removed("t1", detached("claude:sessA", { input: 10, output: 1000, cached: 100 })),
+		);
+		expect(result.summary.skills?.[0].usage?.confidence).toBe("attributed");
+	});
+
+	it("reports changed when only skill figures moved", () => {
+		// A memory can carry skill usage without any aggregate figure to correct; the
+		// caller still has to persist the summary.
+		const summary = node({ transcripts: ["t1"], skills: [skill()] });
+		const result = subtractDetachedUsage(
+			summary,
+			removed("t1", detached("claude:sessA", { input: 10, output: 1000, cached: 100 })),
+		);
+		expect(result.changed).toBe(true);
+	});
+
+	it("does nothing to skills when the detached session carries no identity", () => {
+		// A detach recorded before session keys existed cannot be matched to a split.
+		const summary = node({ transcripts: ["t1"], skills: [skill()] });
+		const result = subtractDetachedUsage(
+			summary,
+			removed("t1", [{ usage: { input: 10, output: 1000, cached: 100 } }]),
+		);
+		expect(result.summary.skills?.[0]).toEqual(skill());
 	});
 });

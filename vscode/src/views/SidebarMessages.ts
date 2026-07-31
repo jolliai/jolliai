@@ -254,6 +254,11 @@ export interface SerializedTreeItem {
 	 */
 	readonly noteHover?: NoteHover;
 	/**
+	 * Context list only (the single aggregate skills row): structured hover-card
+	 * data, same popover infrastructure as the other three kinds.
+	 */
+	readonly skillsHover?: SkillsHover;
+	/**
 	 * Plans & Notes panel only (multi-source reference rows): structured hover-card
 	 * data driven through the same popover infrastructure as `hover`/MemoryHover.
 	 * Lets reference rows (Linear / Jira / GitHub / Notion) display a rich tooltip
@@ -284,7 +289,13 @@ export interface SerializedTreeItem {
  * KB index). Directories always carry `undefined`. Files that aren't tracked in
  * the manifest (user-dropped notes, etc.) carry `"other"`.
  */
-export type FolderFileKind = "memory" | "plan" | "note" | "wiki" | "other";
+/**
+ * `"skill"` is the per-commit skill-usage aggregate (skills--<hash8>.md). It is
+ * manifest-tracked like any other generated file, and `classify` maps a manifest
+ * type straight through, so a new manifest type MUST appear here or the KB folders
+ * tree stops type-checking.
+ */
+export type FolderFileKind = "memory" | "plan" | "note" | "wiki" | "skill" | "other";
 
 export interface FolderNode {
 	readonly name: string;
@@ -481,12 +492,100 @@ export interface ReferenceHover {
 }
 
 /**
+ * Hover-card data for a skill-usage row.
+ *
+ * No `url`: unlike every other hover kind here, a skill invocation is a LOCAL act
+ * with no external destination to open. The card's only action opens the captured
+ * markdown record.
+ */
+/**
+ * The `id` carried by the single aggregate skills row.
+ *
+ * A sentinel, not a `plans.json.skills` map key: the row stands for every skill
+ * captured this session, so it addresses no one artifact. Anything that treats a
+ * Context row's id as an artifact key must special-case it and go back to the store
+ * for the real keys — writing this string into an exclusion set matches no skill and
+ * silently excludes nothing.
+ *
+ * Lives here, beside the wire types, rather than in PlansTreeProvider: the provider
+ * imports `vscode` at runtime, so consumers that must not (SelectAllSelection and
+ * its tests) cannot reach a constant declared there.
+ */
+export const SKILLS_GROUP_ID = "__skills__";
+
+/**
+ * Hover payload for the single aggregate skills row.
+ *
+ * Group-shaped, not skill-shaped: the Context list carries one row for every skill
+ * captured this session (see `PlansDataService.mergeByLastModified`), so there is no
+ * per-skill hover and no `mapKey` to open — the row's action opens the whole
+ * aggregate.
+ */
+export interface SkillsHover {
+	/** How many skills the row stands for. */
+	readonly count: number;
+	/** Pre-formatted sum ("93.8k"). Absent when no member attributed anything. */
+	readonly totalTokensLabel?: string;
+	/**
+	 * Pre-formatted three-way split of the same sum
+	 * ("79 input · 33.9k output · 59.8k cached"), matching the columns the aggregate
+	 * markdown shows. Present exactly when {@link totalTokensLabel} is.
+	 *
+	 * One pre-joined string rather than three numbers: the host already owns the
+	 * compact formatting and the `~` estimate marker for the total, and splitting
+	 * that decision across the message boundary is how the card and the document it
+	 * previews would drift apart.
+	 */
+	readonly totalBreakdownLabel?: string;
+	/**
+	 * True when at least one MEMBER was inferred from a file read rather than
+	 * observed. Qualifies some rows in the table, not the group — which is why the
+	 * card marks the individual rows with `†` rather than labelling the whole card.
+	 */
+	readonly anyInferred: boolean;
+	/** Relative time of the newest member. */
+	readonly relativeDate: string;
+	/** Heaviest-first, capped — see `overflow` for what was left out. */
+	readonly rows: ReadonlyArray<SkillsHoverRow>;
+	/** Members not present in `rows`, so the card can say what it hid. */
+	readonly overflow: number;
+}
+
+export interface SkillsHoverRow {
+	/** Fully-qualified skill id. */
+	readonly skill: string;
+	readonly invocationCount: number;
+	/** Pre-formatted total ("93.8k"). Absent when the source attributed nothing. */
+	readonly tokensLabel?: string;
+	/**
+	 * Pre-formatted three-way split of this row's own total
+	 * ("79 input · 33.9k output · 59.8k cached"). Present exactly when
+	 * {@link tokensLabel} is — an unattributed skill has no components either.
+	 */
+	readonly breakdownLabel?: string;
+	/**
+	 * True when this skill was INFERRED from a file read rather than observed. A
+	 * capture can be observed with estimated tokens, or inferred with no tokens at
+	 * all — the two qualifications are independent.
+	 */
+	readonly inferred: boolean;
+}
+
+/**
  * Minimal display shape for a single piece of evidence backing a memory.
  * Carries the information needed to dispatch the appropriate open command
  * when a user clicks the evidence row in the Timeline.
  */
 export interface MemoryEvidenceItem {
-	readonly kind: "conversation" | "plan" | "note" | "reference" | "file";
+	/**
+	 * `"skill"` is the odd one out: it is an AGGREGATE, one row standing for every
+	 * skill in the memory, where the other kinds are one row per artifact. Same
+	 * collapse the live Context list makes (see `PlansDataService.mergeByLastModified`)
+	 * and for the same reason — a session routinely enters a dozen skills, and this
+	 * panel is fixed-height. Its `id` is the memory's commit hash rather than an
+	 * artifact key, because what it opens is the commit's `skills--<hash8>.md`.
+	 */
+	readonly kind: "conversation" | "plan" | "note" | "reference" | "file" | "skill";
 	readonly id: string;
 	readonly title: string;
 	/**
@@ -616,6 +715,12 @@ export type SidebarOutboundMsg =
 	| { readonly type: "branch:openNote"; readonly noteId: string }
 	| { readonly type: "branch:openReference"; readonly mapKey: string }
 	| { readonly type: "branch:openReferenceMarkdown"; readonly mapKey: string }
+	/**
+	 * Opens the aggregate view of every skill captured this session. Carries no id:
+	 * the Context list holds one row for all of them, so there is nothing to
+	 * address — the host reads the current set from the store.
+	 */
+	| { readonly type: "branch:openSkillsAggregate" }
 	| { readonly type: "branch:openReferencePreview"; readonly mapKey: string }
 	| { readonly type: "branch:ignoreReference"; readonly mapKey: string }
 	| {
@@ -721,6 +826,20 @@ export type SidebarOutboundMsg =
 			readonly selected: boolean;
 	  }
 	| {
+			/**
+			 * Skills row checkbox toggle — ALL skills at once.
+			 *
+			 * Carries no id, unlike the other three toggles: the Context list holds one
+			 * aggregate row rather than one row per skill, so the only selection this
+			 * surface can express is "keep them all" or "drop them all". The host reads
+			 * the current `plans.json.skills` keys from the store and writes the whole
+			 * set. Per-skill exclusion is still representable in
+			 * `commit-selection.json` and stays reachable from the Commit Memory panel.
+			 */
+			readonly type: "branch:toggleSkillSelection";
+			readonly selected: boolean;
+	  }
+	| {
 			readonly type: "branch:dismissAiExclude";
 			readonly kind: "plan" | "note" | "reference";
 			readonly key: string;
@@ -809,6 +928,22 @@ export type SidebarOutboundMsg =
 			readonly type: "kb:openEvidenceReference";
 			readonly archivedKey: string;
 			readonly source: string;
+			readonly sourceRepoName: string | null;
+			readonly sourceRemoteUrl: string | null;
+	  }
+	| {
+			/**
+			 * Open a committed memory's SKILLS evidence row — the whole
+			 * `skills--<hash8>.md` table for that commit.
+			 *
+			 * Keyed by commit hash rather than an artifact id, because the row is an
+			 * aggregate with no per-skill target. Distinct from the live
+			 * `branch:openSkillsAggregate`, which renders the working registry: once
+			 * these skills are archived onto the commit the registry no longer holds
+			 * them, so the live message would open an empty (or unrelated) table.
+			 */
+			readonly type: "kb:openEvidenceSkills";
+			readonly commitHash: string;
 			readonly sourceRepoName: string | null;
 			readonly sourceRemoteUrl: string | null;
 	  }

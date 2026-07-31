@@ -22,6 +22,14 @@ vi.mock("../core/references/ReferenceExtractor.js", () => ({
 	extractReferencesFromTranscript: vi.fn().mockResolvedValue({ references: [], lastLineNumberScanned: 0 }),
 }));
 
+// Mock the skill discovery entry point. Asserted at this level rather than through a
+// real scan because the unit under test here is the WIRING: skill capture for Claude
+// exists only if this hook calls it, and the scanner itself is covered directly in
+// TranscriptSkillDiscovery.test.ts / ClaudeSkillScanner.test.ts.
+vi.mock("../core/skills/TranscriptSkillDiscovery.js", () => ({
+	scanSkillsWithCursor: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../core/RepoProfile.js", () => ({
 	readManualDisableFlag: vi.fn().mockResolvedValue(false),
 }));
@@ -107,6 +115,7 @@ import {
 	saveSession,
 	upsertReferenceEntry,
 } from "../core/SessionTracker.js";
+import { scanSkillsWithCursor } from "../core/skills/TranscriptSkillDiscovery.js";
 import { flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { isClaudeHookInstalled } from "../install/ClaudeHookInstaller.js";
 import type { PlanEntry } from "../Types.js";
@@ -561,6 +570,57 @@ describe("StopHook — plan discovery", () => {
 
 		expect(loadPlansRegistry).not.toHaveBeenCalled();
 		expect(savePlansRegistry).not.toHaveBeenCalled();
+		expect(scanSkillsWithCursor).not.toHaveBeenCalled();
+	});
+
+	it("scans the transcript for skills on every turn", async () => {
+		// Claude is the primary host AND the only source with a fully observed skill
+		// signal (a real `Skill` tool plus typed slash commands), but this hook was the
+		// site that never called the scanner — so skill capture was silently dead for it
+		// while the scanner, its attribution module and their fixtures all shipped.
+		// Turn-level, not commit-level: the panel has to show skills while the session
+		// is still running, which is when they are useful.
+		vi.mocked(existsSync).mockReturnValue(true);
+		mockTranscriptWithLines(['{"role":"assistant","content":"Hello"}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(scanSkillsWithCursor).toHaveBeenCalledWith(`${TRANSCRIPT_PATH}`, PROJECT_DIR, "claude");
+	});
+
+	it("scans for skills even when the plan scan throws and holds the shared cursor", async () => {
+		// The three extractors are independent: skills ride their own high-water mark, so
+		// a plan failure that pins the shared cursor must not also cost a skill pass.
+		vi.mocked(existsSync).mockReturnValue(true);
+		vi.mocked(loadDiscoveryCursor).mockResolvedValue(null);
+		mockTranscriptWithLines([
+			'{"type":"tool_use","name":"Write","input":{"file_path":"/home/user/.claude/plans/p.md"}}',
+		]);
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {
+				p: {
+					slug: "p",
+					title: "P",
+					sourcePath: "/home/user/.claude/plans/p.md",
+					addedAt: "2026-01-01T00:00:00Z",
+					updatedAt: "2026-01-01T00:00:00Z",
+					commitHash: "abc12345",
+					contentHashAtCommit: "guard-hash",
+				},
+			},
+		});
+		vi.mocked(readFileSync).mockImplementation((() => {
+			throw new Error("EBUSY: transient");
+		}) as unknown as typeof readFileSync);
+		vi.mocked(extractReferencesFromTranscript).mockResolvedValue({ references: [], lastLineNumberScanned: 5 });
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(saveDiscoveryCursor).not.toHaveBeenCalled();
+		expect(scanSkillsWithCursor).toHaveBeenCalledWith(`${TRANSCRIPT_PATH}`, PROJECT_DIR, "claude");
 	});
 
 	it("should update cursor but not write plans.json when no plan slugs found", async () => {

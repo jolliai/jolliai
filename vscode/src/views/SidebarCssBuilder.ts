@@ -771,6 +771,7 @@ export function buildSidebarCss(): string {
   .tree-node .icon.kb-icon-memory .codicon { color: var(--vscode-charts-blue,  #2f7adc); }
   .tree-node .icon.kb-icon-plan   .codicon { color: var(--vscode-charts-green, #388a34); }
   .tree-node .icon.kb-icon-note   .codicon { color: var(--vscode-charts-orange, #d18616); }
+  .tree-node .icon.kb-icon-skill  .codicon { color: var(--vscode-charts-purple, #b180d7); }
   /* Repo nodes inside the Memory Bank tree — one per discovered repo under
      <localFolder>. Bold label marks repos as a primary grouping in the now
      flat top-level listing. */
@@ -866,6 +867,7 @@ export function buildSidebarCss(): string {
   }
   .tree-node .kb-tag-plan { background: var(--vscode-charts-green,  #388a34); }
   .tree-node .kb-tag-note { background: var(--vscode-charts-orange, #d18616); }
+  .tree-node .kb-tag-skill { background: var(--vscode-charts-purple, #b180d7); }
   .tree-node .desc {
     color: var(--vscode-descriptionForeground);
     font-size: 11px;
@@ -1209,6 +1211,8 @@ export function buildSidebarCss(): string {
   }
   .mem-ctx-badge--plan      { background: #3fb950; }
   .mem-ctx-badge--note      { background: #d29922; }
+  .mem-ctx-badge--skill     { background: #b180d7; }
+  .hover-card .hc-row-muted { opacity: 0.75; font-size: 0.92em; }
   ${Object.entries(SOURCE_META)
 		// biome-ignore lint/style/useTemplate: must stay backtick-free (see file header re: the backtick trap)
 		.map(([id, meta]) => "  .mem-ctx-badge--" + id + " { background: " + meta.color + "; }")
@@ -1471,6 +1475,11 @@ export function buildSidebarCss(): string {
   }
   .hover-card .hc-row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
   .hover-card .hc-row .codicon { color: var(--vscode-icon-foreground); flex-shrink: 0; }
+  /* The skills card's input/output/cached line, indented under the figure it
+     decomposes. Its own row rather than an inline suffix because the card caps at
+     480px and a skill id already fills a line; the tightened margin keeps the pair
+     reading as one entry instead of two. */
+  .hover-card .hc-row.hc-skill-split { padding-left: 14px; margin: 0 0 3px; opacity: 0.6; }
   /* AI soft-exclude reason (appendAiReasonRow). Colours + the .ctx-tier--ex /
      .ai-say class names mirror the Review panel's buildExcludedRow
      (SummaryCssBuilder.ts) so a soft-excluded item reads identically in the

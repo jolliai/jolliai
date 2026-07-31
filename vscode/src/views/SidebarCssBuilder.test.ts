@@ -58,6 +58,7 @@ describe("SidebarCssBuilder", () => {
 		expect(css).toMatch(/\.tree-node\s+\.icon\.kb-icon-memory\s+\.codicon/);
 		expect(css).toMatch(/\.tree-node\s+\.icon\.kb-icon-plan\s+\.codicon/);
 		expect(css).toMatch(/\.tree-node\s+\.icon\.kb-icon-note\s+\.codicon/);
+		expect(css).toMatch(/\.tree-node\s+\.icon\.kb-icon-skill\s+\.codicon/);
 	});
 
 	it("declares trailing .kb-tag chips for plan / note files (no memory tag)", () => {
@@ -65,6 +66,7 @@ describe("SidebarCssBuilder", () => {
 		expect(css).toContain(".tree-node .kb-tag");
 		expect(css).toContain(".tree-node .kb-tag-plan");
 		expect(css).toContain(".tree-node .kb-tag-note");
+		expect(css).toContain(".tree-node .kb-tag-skill");
 		// Memory has no trailing tag — the tinted icon already conveys it.
 		expect(css).not.toContain(".kb-tag-memory");
 	});

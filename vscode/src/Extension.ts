@@ -12,8 +12,14 @@ import * as vscode from "vscode";
 import {
 	conversationKey,
 	dismissAiExclusion,
+	setAllExcluded,
 	setExcluded,
 } from "../../cli/src/core/CommitSelectionStore.js";
+import {
+	buildLiveSkillsMarkdown,
+	buildSkillsAggregateMarkdown,
+} from "../../cli/src/core/SkillsAggregateMarkdown.js";
+import { discoverOpenCodeSkills } from "../../cli/src/core/skills/OpenCodeSkillDiscovery.js";
 import { discoverCodexConversations } from "../../cli/src/core/CodexDiscovery.js";
 import { catchUpTranscriptDiscovery } from "../../cli/src/core/DiscoveryCatchUp.js";
 import type { FolderStorage, ForceRegenerateResult } from "../../cli/src/core/FolderStorage.js";
@@ -1336,6 +1342,25 @@ export function activate(context: vscode.ExtensionContext): void {
 			await setExcluded(workspaceRoot, "references", mapKey, !selected);
 			await plansProvider.refreshExclusions();
 		},
+		applySkillCheckbox: async (selected) => {
+			// All-or-nothing, because the Context list carries ONE aggregate row for every
+			// skill. The keys come from the store rather than the message: the row has no
+			// id to send, and reading them here means the write always covers the set as
+			// it stands at click time.
+			//
+			// Writes into the "skills" exclusion set — the one QueueWorker actually reads
+			// when deciding what to archive. (Before this callback existed the row's
+			// checkbox posted togglePlanSelection, so the key landed in "plans" and the
+			// exclusion silently did nothing.)
+			const skills = await bridge.listSkills();
+			await setAllExcluded(
+				workspaceRoot,
+				"skills",
+				skills.map((s) => s.mapKey),
+				!selected,
+			);
+			await plansProvider.refreshExclusions();
+		},
 		applyNoteCheckbox: async (noteId, selected) => {
 			await setExcluded(workspaceRoot, "notes", noteId, !selected);
 			await plansProvider.refreshExclusions();
@@ -1372,6 +1397,15 @@ export function activate(context: vscode.ExtensionContext): void {
 			discover: () => {
 				const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 				if (cwd) void discoverCodexConversations(cwd);
+			},
+		},
+		// Polling-path OpenCode skill discovery, ridden on the same 60s tick. OpenCode
+		// has no hook, so without this its skills would only appear after a commit.
+		// discoverOpenCodeSkills never rejects and single-flights per cwd.
+		openCodeSkillDiscovery: {
+			discover: () => {
+				const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+				if (cwd) void discoverOpenCodeSkills(cwd);
 			},
 		},
 		pinStore: { addPin, removePin, listPins },
@@ -3130,6 +3164,76 @@ export function activate(context: vscode.ExtensionContext): void {
 					"openReferenceMarkdown",
 				);
 				if (info) await bridge.openReferenceMarkdown(info);
+			},
+		),
+
+		// Opens the aggregate view of every skill captured but not yet committed —
+		// what the single Context "Skills" row and its hover card both point at.
+		//
+		// Rendered into an UNTITLED document rather than opened from disk. There is no
+		// file to open: on disk each skill is its own `skills/<source>/<stem>.md`, and
+		// the aggregate only becomes a real file (`skills--<hash8>.md`) once the work
+		// is committed and the summary's visible layer is written. Rendering through
+		// the same `buildSkillsTable` those committed files use keeps the two views
+		// identical, so the table does not change shape under the user at commit time.
+		vscode.commands.registerCommand("jollimemory.openSkillsAggregate", async () => {
+			const skills = await bridge.listSkills();
+			log.info("cmd", `openSkillsAggregate: ${skills.length} skill(s)`);
+			if (skills.length === 0) {
+				// Reachable: a commit landing between the panel render and the click
+				// archives every skill, which empties the active list. An empty table is
+				// more confusing than saying so.
+				void vscode.window.showInformationMessage(
+					"No skills have been captured for this working session yet.",
+				);
+				return;
+			}
+			const doc = await vscode.workspace.openTextDocument({
+				content: buildLiveSkillsMarkdown(skills),
+				language: "markdown",
+			});
+			await vscode.window.showTextDocument(doc, { preview: true });
+		}),
+
+		// The COMMITTED counterpart of openSkillsAggregate: the aggregate Context row
+		// on an expanded memory in the Timeline.
+		//
+		// Deliberately not routed through `listSkills()` like the live command above —
+		// that reads the working registry, which no longer holds these skills once they
+		// are archived onto the commit, so the live path would open an unrelated (or
+		// empty) table. The archived snapshot on the summary is the only correct source.
+		//
+		// Untitled document rather than the `skills--<hash8>.md` file on disk: that file
+		// exists only in the Memory Bank's visible layer, which is absent in
+		// orphan-branch-only storage mode and for a foreign repo whose folder this
+		// machine may never have seen. Rendering from the summary works in every mode,
+		// and `buildSkillsAggregateMarkdown` is the same renderer that wrote the file.
+		vscode.commands.registerCommand(
+			"jollimemory.previewCommittedSkills",
+			async (
+				commitHash: string,
+				// Provenance is accepted for signature parity with the other committed
+				// evidence commands, but is not needed to READ: getSummaryAnyRepoWithSource
+				// already searches every known repo by hash and reports which one owns it.
+				_foreignRepoName?: string | null,
+				_foreignRepoUrl?: string | null,
+			) => {
+				const { summary } = await bridge.getSummaryAnyRepoWithSource(commitHash);
+				const skills = summary?.skills ?? [];
+				log.info("cmd", `previewCommittedSkills: ${commitHash} — ${skills.length} skill(s)`);
+				if (!summary || skills.length === 0) {
+					// Reachable when the memory is squashed or amended away between the
+					// evidence push and the click; the row is rendered from a snapshot.
+					void vscode.window.showInformationMessage(
+						"This memory has no archived skill usage.",
+					);
+					return;
+				}
+				const doc = await vscode.workspace.openTextDocument({
+					content: buildSkillsAggregateMarkdown(summary, skills),
+					language: "markdown",
+				});
+				await vscode.window.showTextDocument(doc, { preview: true });
 			},
 		),
 

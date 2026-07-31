@@ -21,6 +21,7 @@
 
 import { backfillListRendererSource, COLD_START_CAP } from "./BackfillListRenderer.js";
 import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
+import { CONTEXT_ROW_KINDS } from "./ContextRowKinds.js";
 import { SOURCE_META, SOURCE_TITLES } from "./SourceLabels.js";
 import {
 	SONNET_CACHE_WRITE_PER_TOKEN,
@@ -2203,7 +2204,12 @@ export function buildSidebarScript(): string {
         iconCodicon = 'repo';
       } else if (isDir) {
         iconCodicon = 'folder';
-      } else if (fileKind === 'memory' || fileKind === 'plan' || fileKind === 'note') {
+      } else if (
+        fileKind === 'memory' ||
+        fileKind === 'plan' ||
+        fileKind === 'note' ||
+        fileKind === 'skill'
+      ) {
         iconCodicon = 'markdown';
       } else {
         iconCodicon = 'file';
@@ -2218,14 +2224,17 @@ export function buildSidebarScript(): string {
       const labelChildren = [
         el('span', { className: 'label', text: labelText }),
       ];
-      if (!isDir && (fileKind === 'plan' || fileKind === 'note')) {
+      // Tag letters and labels per tagged kind. A lookup rather than nested
+      // ternaries so adding a kind is one entry, not a re-read of the chain.
+      const KB_TAGS = { plan: ['P', 'Plan'], note: ['N', 'Note'], skill: ['S', 'Skills used'] };
+      if (!isDir && KB_TAGS[fileKind]) {
         labelChildren.push(
           attachTextTip(
             el('span', {
               className: 'kb-tag kb-tag-' + fileKind,
-              text: fileKind === 'plan' ? 'P' : 'N',
+              text: KB_TAGS[fileKind][0],
             }),
-            fileKind === 'plan' ? 'Plan' : 'Note',
+            KB_TAGS[fileKind][1],
           ),
         );
       }
@@ -2636,6 +2645,7 @@ export function buildSidebarScript(): string {
     let badgeKind = kind || '';
     if (kind === 'plan')      letter = 'P';
     else if (kind === 'note') letter = 'N';
+    else if (kind === 'skill') letter = 'S';
     else if (kind === 'reference') {
       const s = source || '';
       const meta = SOURCE_META[s];
@@ -2780,6 +2790,17 @@ export function buildSidebarScript(): string {
             type: 'kb:openEvidenceReference',
             archivedKey: item.id,
             source: item.source || '',
+            sourceRepoName: srcRepoName,
+            sourceRemoteUrl: srcRemoteUrl,
+          });
+        } else if (item.kind === 'skill') {
+          // Aggregate row: there is no per-skill id to pass, so this opens the
+          // commit's whole table. NOT branch:openSkillsAggregate — that renders the
+          // LIVE working registry, which no longer contains these skills once they
+          // are archived onto the commit.
+          vscode.postMessage({
+            type: 'kb:openEvidenceSkills',
+            commitHash: item.id,
             sourceRepoName: srcRepoName,
             sourceRemoteUrl: srcRemoteUrl,
           });
@@ -3096,6 +3117,87 @@ export function buildSidebarScript(): string {
   // and its CSS work unchanged. The card swaps the commit-specific fields
   // (date / commitType / branch / statsLine / hash) for a source badge, the
   // opaque per-source fields rows, and an Open-in-<Source> link.
+  function renderSkillsHoverCard(rowId, h) {
+    if (!h) return null;
+    const titleRow = el('div', { className: 'hc-title' }, [
+      ctxBadge('skill', ''),
+      el('span', { text: 'Skills used' }),
+    ]);
+    const kids = [titleRow];
+    // Summary line: how many, and what they cost in total. The per-skill table
+    // follows — the card is the group's, so the aggregate reads first.
+    const countText = h.count + (h.count === 1 ? ' skill' : ' skills');
+    kids.push(el('div', { className: 'hc-row' }, [
+      el('i', { className: 'codicon codicon-zap' }),
+      el('span', { text: h.totalTokensLabel ? countText + ' · ' + h.totalTokensLabel + ' tokens' : countText }),
+    ]));
+    // The input/output/cached split sits on its own indented line rather than
+    // inline. The card is 480px at most and a skill id already eats a row, so the
+    // three figures would wrap mid-figure if appended to the line above.
+    if (h.totalBreakdownLabel) {
+      kids.push(el('div', { className: 'hc-row hc-row-muted hc-skill-split' }, [
+        el('span', { text: h.totalBreakdownLabel }),
+      ]));
+    }
+    kids.push(el('div', { className: 'hc-row' }, [
+      el('i', { className: 'codicon codicon-clock' }),
+      el('span', { text: h.relativeDate }),
+    ]));
+    // One line per member, heaviest first (the host ordered them). Same three
+    // columns as the aggregate markdown this card's action opens, so the card is a
+    // preview of that document rather than a second, differently-shaped view.
+    const rows = h.rows || [];
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const marker = r.inferred ? ' †' : '';
+      const tokens = r.tokensLabel ? r.tokensLabel : '—';
+      kids.push(el('div', { className: 'hc-row hc-row-muted' }, [
+        el('span', { text: r.skill + marker }),
+        el('span', { text: '×' + r.invocationCount + ' · ' + tokens }),
+      ]));
+      // Same reason as the summary split above: its own line, indented under the
+      // skill it belongs to. Absent for an unattributed row, which has no
+      // components to show rather than three zeros.
+      if (r.breakdownLabel) {
+        kids.push(el('div', { className: 'hc-row hc-row-muted hc-skill-split' }, [
+          el('span', { text: r.breakdownLabel }),
+        ]));
+      }
+    }
+    if (h.overflow > 0) {
+      kids.push(el('div', { className: 'hc-row hc-row-muted' }, [
+        el('span', { text: '…and ' + h.overflow + ' more' }),
+      ]));
+    }
+    if (h.anyInferred) {
+      kids.push(el('div', { className: 'hc-row hc-row-muted' }, [
+        el('i', { className: 'codicon codicon-info' }),
+        el('span', {
+          text: '† Inferred from a file read — that host has no skill tool, so entries cannot be counted.',
+        }),
+      ]));
+    }
+    const tail = [];
+    appendAiReasonRow(tail, rowId);
+    // One action only. Skills have no upstream page to open, so there is no
+    // Open-in-Source equivalent here.
+    tail.push(el('div', { className: 'hc-actions' }, [
+      attachTextTip(
+        el('span', {
+          className: 'hc-link',
+          'data-cmd': 'jollimemory.openSkillsAggregate',
+          text: 'Open Skills Used',
+        }),
+        'Open the captured skill records',
+      ),
+    ]));
+    if (tail.length > 0) {
+      kids.push(el('div', { className: 'hc-rule' }));
+      for (let i = 0; i < tail.length; i++) kids.push(tail[i]);
+    }
+    return el('div', { className: 'hover-card-inner' }, kids);
+  }
+
   function renderReferenceHoverCard(mapKey, h) {
     if (!h) return null;
     // Title row: bold title prefixed by the shared per-source context badge
@@ -3378,6 +3480,7 @@ export function buildSidebarScript(): string {
       if (items[i].planHover) return { kind: 'plan', hover: items[i].planHover };
       if (items[i].noteHover) return { kind: 'note', hover: items[i].noteHover };
       if (items[i].referenceHover) return { kind: 'reference', hover: items[i].referenceHover };
+      if (items[i].skillsHover) return { kind: 'skills', hover: items[i].skillsHover };
       return null;
     }
     return null;
@@ -3418,9 +3521,14 @@ export function buildSidebarScript(): string {
     const found = lookupBranchHoverById(rowId);
     if (!found) return;
     let content;
+    // Exhaustive rather than falling through to the reference renderer: a new kind
+    // reaching that default would render with the wrong card and read h.source /
+    // h.url off a payload that has neither.
     if (found.kind === 'plan') content = renderPlanHoverCard(rowId, found.hover);
     else if (found.kind === 'note') content = renderNoteHoverCard(rowId, found.hover);
-    else content = renderReferenceHoverCard(rowId, found.hover);
+    else if (found.kind === 'reference') content = renderReferenceHoverCard(rowId, found.hover);
+    else if (found.kind === 'skills') content = renderSkillsHoverCard(rowId, found.hover);
+    else return;
     if (!content) return;
     scheduleShowBranchHoverCard(rowId, content, e.clientX, e.clientY);
   });
@@ -3490,7 +3598,7 @@ export function buildSidebarScript(): string {
         items.push({ label: 'Open in Claude Code', command: 'jollimemory.openInClaudeCode',  args: [key] });
         items.push({ separator: true });
         items.push({ label: 'View Memory',         command: 'jollimemory.viewMemorySummary', args: [key] });
-      } else if (fileKind !== 'plan' && fileKind !== 'note') {
+      } else if (fileKind !== 'plan' && fileKind !== 'note' && fileKind !== 'skill') {
         return;
       }
       // Append Revert when the renderer flagged this row as diverged. The
@@ -4392,8 +4500,16 @@ export function buildSidebarScript(): string {
     return [];
   }
 
+  // Context-row kinds, in ONE table — injected from ./ContextRowKinds.ts, which
+  // the Next Memory panel's script reads too. See that file for why the table
+  // exists and what each field drives.
+  var CONTEXT_ROW_KINDS = ${JSON.stringify(CONTEXT_ROW_KINDS)};
+
+  function contextRowKind(contextValue) {
+    return CONTEXT_ROW_KINDS[contextValue] || null;
+  }
+
   function renderPlanRow(item, depth) {
-    const isNote = item.contextValue === 'note';
     // isReference gates the title= suppression and the checkbox-omission guard
     // below. The legacy isLinearIssue field was renamed alongside the
     // ReferenceItem refactor — reference rows now cover Linear / Jira / GitHub /
@@ -4405,9 +4521,9 @@ export function buildSidebarScript(): string {
     // CONTEXT rows match the committed-memory evidence "Context" rows and the
     // Pinned rows 1:1 (mockup parity). References take their provider from the
     // forwarded referenceHover.source; plan / note ignore it.
-    const badgeKind = isReference ? 'reference' : isNote ? 'note' : 'plan';
+    const rowKind = contextRowKind(item.contextValue);
     const badgeSource = isReference && item.referenceHover ? item.referenceHover.source : '';
-    const iconEl = ctxBadge(badgeKind, badgeSource);
+    const iconEl = ctxBadge(rowKind ? rowKind.badge : '', badgeSource);
     // Selection checkbox — plan / note / reference rows all carry one (since
     // panel-level reference exclusion landed). 'data-checkbox="1"' opts into the
     // delegated click guard so clicking the checkbox does not also open the
@@ -4418,33 +4534,14 @@ export function buildSidebarScript(): string {
     // source:nativeId mapKey (item.id = reference.mapKey from the same
     // serialize path).
     let rowCheck = null;
-    if (isNote) {
-      const noteCb = el('input', {
-        type: 'checkbox',
-        className: 'jm-note-check',
-        'data-checkbox': '1',
-        'data-note-id': item.id,
-      });
-      noteCb.checked = !!item.isSelected;
-      rowCheck = noteCb;
-    } else if (isReference) {
-      const referenceCb = el('input', {
-        type: 'checkbox',
-        className: 'jm-reference-check',
-        'data-checkbox': '1',
-        'data-reference-key': item.id,
-      });
-      referenceCb.checked = !!item.isSelected;
-      rowCheck = referenceCb;
-    } else {
-      const planCb = el('input', {
-        type: 'checkbox',
-        className: 'jm-plan-check',
-        'data-checkbox': '1',
-        'data-plan-id': item.id,
-      });
-      planCb.checked = !!item.isSelected;
-      rowCheck = planCb;
+    if (rowKind) {
+      const attrs = { type: 'checkbox', className: rowKind.cls, 'data-checkbox': '1' };
+      // The skills aggregate stands for N skills and carries no artifact id, so it
+      // has no id attribute to write — its toggle means "all of them".
+      if (rowKind.attr) attrs[rowKind.attr] = item.id;
+      const cb = el('input', attrs);
+      cb.checked = !!item.isSelected;
+      rowCheck = cb;
     }
     // Wrap checkbox in .row-leading so plan / note / reference rows share the
     // same fixed 18px leading slot as Changes rows — column-aligns across
@@ -4463,12 +4560,20 @@ export function buildSidebarScript(): string {
     // 'Edit Note' / 'Edit Markdown') as a faster affordance. Both buttons use
     // the small iconbtn variant so the trailing icons read lighter than the
     // Memories rows' View Memory eye instead of dominating the row.
-    const editLabel = isReference ? 'Edit Markdown' : isNote ? 'Edit Note' : 'Edit Plan';
+    //
+    // WHICH buttons a row gets comes from CONTEXT_ROW_KINDS.actions, not from a
+    // ternary on contextValue. The skills aggregate declares none: it stands for N
+    // skills rather than one document, so there is nothing to pin, open in an
+    // editor, or delete. Its row-id is a sentinel, so a button that shipped anyway
+    // would post a key the host cannot resolve and fail silently — which is exactly
+    // what the pre-table code did.
+    const rowActions = rowKind ? rowKind.actions : [];
+    const editLabel = rowKind && rowKind.editLabel ? rowKind.editLabel : 'Edit';
     const planActions = [];
     // Pin (plan / note / reference) is suppressed only in foreign-readonly
     // mode. Leftmost so it reads as the row's primary "save for later" action
     // ahead of edit/remove. References pin by their mapKey (item.id).
-    if (!isViewingForeign()) {
+    if (rowActions.indexOf('pin') !== -1 && !isViewingForeign()) {
       planActions.push(attachTextTip(
         el('button', {
           type: 'button',
@@ -4480,26 +4585,30 @@ export function buildSidebarScript(): string {
         'Pin',
       ));
     }
-    planActions.push(attachTextTip(
-      el('button', {
-        type: 'button',
-        className: 'iconbtn iconbtn--sm',
-        'data-inline': 'edit',
-        'data-id': item.id,
-        'aria-label': editLabel,
-      }, [el('i', { className: 'codicon codicon-edit' })]),
-      editLabel,
-    ));
-    planActions.push(attachTextTip(
-      el('button', {
-        type: 'button',
-        className: 'iconbtn iconbtn--sm',
-        'data-inline': 'remove',
-        'data-id': item.id,
-        'aria-label': 'Remove',
-      }, [el('i', { className: 'codicon codicon-trash' })]),
-      'Remove',
-    ));
+    if (rowActions.indexOf('edit') !== -1) {
+      planActions.push(attachTextTip(
+        el('button', {
+          type: 'button',
+          className: 'iconbtn iconbtn--sm',
+          'data-inline': 'edit',
+          'data-id': item.id,
+          'aria-label': editLabel,
+        }, [el('i', { className: 'codicon codicon-edit' })]),
+        editLabel,
+      ));
+    }
+    if (rowActions.indexOf('remove') !== -1) {
+      planActions.push(attachTextTip(
+        el('button', {
+          type: 'button',
+          className: 'iconbtn iconbtn--sm',
+          'data-inline': 'remove',
+          'data-id': item.id,
+          'aria-label': 'Remove',
+        }, [el('i', { className: 'codicon codicon-trash' })]),
+        'Remove',
+      ));
+    }
     // Strikethrough-exclude toggle joins the hover action cluster (after the
     // trash Remove). Distinct from Remove: exclude just leaves the item out of
     // the next memory (reversible), Remove deletes the note/plan/reference.
@@ -5690,28 +5799,25 @@ export function buildSidebarScript(): string {
       const id = inline.getAttribute('data-id');
       const row = inline.closest('.tree-node');
       const ctx = row ? row.getAttribute('data-context') : '';
-      if (action === 'edit') {
-        // Same three-way routing as the context menu's edit entry: reference
-        // markdown is host-resolved by mapKey (branch:openReferenceMarkdown),
-        // plan / note go through their editor commands.
-        if (ctx === 'reference') {
-          vscode.postMessage({ type: 'branch:openReferenceMarkdown', mapKey: id });
-        } else {
-          const cmd = ctx === 'note' ? 'jollimemory.editNote' : 'jollimemory.editPlan';
-          vscode.postMessage({ type: 'command', command: cmd, args: [id] });
+      // Edit / Remove routing comes from CONTEXT_ROW_KINDS, the same table that
+      // decided whether to render these buttons at all. Both used to be if/else
+      // chains ending in a plan default, so a kind that reached them without an
+      // entry dispatched editPlan / removePlan against an id those commands cannot
+      // resolve — a button that looks live and silently does nothing. A kind with
+      // no entry now dispatches nothing, which is at least consistent with the
+      // button not being rendered for it.
+      const ctxSpec = contextRowKind(ctx);
+      if (action === 'edit' && ctxSpec) {
+        // Reference markdown is host-resolved by mapKey (a raw message); plan /
+        // note go through their editor commands.
+        if (ctxSpec.editMsg) {
+          vscode.postMessage({ type: ctxSpec.editMsg, mapKey: id });
+        } else if (ctxSpec.editCmd) {
+          vscode.postMessage({ type: 'command', command: ctxSpec.editCmd, args: [id] });
         }
       }
-      if (action === 'remove') {
-        // Plan / Note / Reference rows all share the trash button rendered by
-        // renderPlanRow, so the click handler has to route by contextValue.
-        // Before this branch existed, reference rows dispatched jollimemory.removePlan
-        // — which doesn't know about reference mapKeys, so the trash button
-        // silently no-op'd on those rows while working fine on plans/notes.
-        const cmd =
-          ctx === 'note'      ? 'jollimemory.removeNote' :
-          ctx === 'reference' ? 'jollimemory.ignoreReference' :
-                                'jollimemory.removePlan';
-        vscode.postMessage({ type: 'command', command: cmd, args: [id] });
+      if (action === 'remove' && ctxSpec && ctxSpec.removeCmd) {
+        vscode.postMessage({ type: 'command', command: ctxSpec.removeCmd, args: [id] });
       }
       if (action === 'pin') {
         // Inline Pin (replaces the old right-click Pin). Title comes off the
@@ -5727,11 +5833,12 @@ export function buildSidebarScript(): string {
           vscode.postMessage({ type: 'branch:pin', kind: 'conversation', id: id, title: pinTitle, source: convSource, transcriptPath: convTranscriptPath });
         } else if (ctx === 'commitWithMemory' || ctx === 'commit') {
           vscode.postMessage({ type: 'branch:pin', kind: 'memory', id: id, title: pinTitle });
-        } else if (ctx === 'reference') {
-          // References are addressed by mapKey, which is the row's data-id.
-          vscode.postMessage({ type: 'branch:pin', kind: 'reference', id: id, title: pinTitle });
-        } else {
-          vscode.postMessage({ type: 'branch:pin', kind: ctx === 'note' ? 'note' : 'plan', id: id, title: pinTitle });
+        } else if (ctxSpec && ctxSpec.pinKind) {
+          // Context rows pin by their own id — plan slug, note id, or reference
+          // mapKey — under the kind the table declares. A kind with no pinKind
+          // renders no Pin button, so reaching here with one would mean the two
+          // sides of the table disagreed.
+          vscode.postMessage({ type: 'branch:pin', kind: ctxSpec.pinKind, id: id, title: pinTitle });
         }
       }
       if (action === 'discard') {
@@ -5798,21 +5905,19 @@ export function buildSidebarScript(): string {
     if (row) {
       const ctx = row.getAttribute('data-context');
       const id = row.getAttribute('data-id');
-      // Plan vs note dispatch: the host preview commands differ
-      // (openPlanForPreview / openNoteForPreview), and routing them through
-      // the wrong message treats the id as the wrong kind of identifier
-      // (note id ≠ plan slug → the plan path would 404 on noteId.md).
-      if (ctx === 'plan') {
-        vscode.postMessage({ type: 'branch:openPlan', planId: id });
-      }
-      if (ctx === 'note') {
-        vscode.postMessage({ type: 'branch:openNote', noteId: id });
-      }
-      if (ctx === 'reference') {
-        // Row click previews the reference markdown — same click-equals-preview
-        // contract as plan / note rows. The editor path (openReferenceMarkdown)
-        // moved to the context menu's 'Edit Markdown'.
-        vscode.postMessage({ type: 'branch:openReferencePreview', mapKey: id });
+      // Context rows (plan / note / reference / skills) all preview on click, but
+      // through DIFFERENT messages carrying DIFFERENT id fields — routing one
+      // through another's message treats the id as the wrong kind of identifier
+      // (note id ≠ plan slug → the plan path would 404 on noteId.md). The pairing
+      // lives in CONTEXT_ROW_KINDS so a kind cannot be rendered as a row and then
+      // have no click behaviour at all, which is what happened to the skills row:
+      // it rendered, and clicking it did nothing.
+      const openSpec = contextRowKind(ctx);
+      if (openSpec && openSpec.openMsg) {
+        const openPayload = { type: openSpec.openMsg };
+        // The skills aggregate opens a view of ALL its members, so it sends no id.
+        if (openSpec.openIdKey) openPayload[openSpec.openIdKey] = id;
+        vscode.postMessage(openPayload);
       }
       if (ctx === 'file' || ctx === 'fileChange') {
         // Forward all three fields the openFileChange command needs.
@@ -5983,33 +6088,23 @@ export function buildSidebarScript(): string {
       });
       return;
     }
-    // Plan checkbox — class 'jm-plan-check'
-    if (cb.classList.contains('jm-plan-check')) {
-      vscode.postMessage({
-        type: 'branch:togglePlanSelection',
-        planId: cb.getAttribute('data-plan-id'),
-        selected: !!cb.checked,
-      });
-      return;
+    // Context-row checkboxes (plan / note / reference / skills) — driven by the SAME
+    // CONTEXT_ROW_KINDS table the rows were rendered from, so a kind can never be
+    // rendered with one class and dispatched as another.
+    var dispatched = false;
+    for (var ctxKey in CONTEXT_ROW_KINDS) {
+      var spec = CONTEXT_ROW_KINDS[ctxKey];
+      if (!cb.classList.contains(spec.cls)) continue;
+      var payload = { type: spec.msg, selected: !!cb.checked };
+      // A null idKey means the row addresses no single artifact (the skills
+      // aggregate). Writing the field anyway would post an explicit undefined and
+      // the host would read it as a real, unresolvable key.
+      if (spec.idKey) payload[spec.idKey] = cb.getAttribute(spec.attr);
+      vscode.postMessage(payload);
+      dispatched = true;
+      break;
     }
-    // Note checkbox — class 'jm-note-check'
-    if (cb.classList.contains('jm-note-check')) {
-      vscode.postMessage({
-        type: 'branch:toggleNoteSelection',
-        noteId: cb.getAttribute('data-note-id'),
-        selected: !!cb.checked,
-      });
-      return;
-    }
-    // Reference checkbox — class 'jm-reference-check'
-    if (cb.classList.contains('jm-reference-check')) {
-      vscode.postMessage({
-        type: 'branch:toggleReferenceSelection',
-        mapKey: cb.getAttribute('data-reference-key'),
-        selected: !!cb.checked,
-      });
-      return;
-    }
+    if (dispatched) return;
     const kind = cb.getAttribute('data-checkbox-kind') || 'file';
     if (kind === 'commit') {
       vscode.postMessage({
@@ -6188,6 +6283,15 @@ export function buildSidebarScript(): string {
       refItems.push({ separator: true });
       refItems.push({ label: 'Remove', rawMessage: { type: 'branch:ignoreReference', mapKey: id } });
       showContextMenu(e.clientX, e.clientY, refItems);
+      return;
+    }
+    if (ctx === 'skills') {
+      // One entry, mirroring the row click. No Edit / Remove: the row stands for N
+      // skills rather than a document, and leaving them out of the memory is the
+      // checkbox's job, not a destructive delete.
+      showContextMenu(e.clientX, e.clientY, [
+        { label: 'Open Skills Used', rawMessage: { type: 'branch:openSkillsAggregate' } },
+      ]);
       return;
     }
     if (ctx === 'file' || ctx === 'fileChange') {

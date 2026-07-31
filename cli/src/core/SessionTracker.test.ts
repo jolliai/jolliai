@@ -47,6 +47,8 @@ import type {
 	ReferenceEntry,
 	SessionInfo,
 	SessionsRegistry,
+	SkillEntry,
+	SkillUse,
 	SquashPendingState,
 	TranscriptCursor,
 } from "../Types.js";
@@ -54,6 +56,7 @@ import { formatAccumulatedEntry } from "./references/ReferenceStore.js";
 import {
 	associateNoteWithCommit,
 	associatePlanWithCommit,
+	associateSkillWithCommit,
 	checkStaleSquashPending,
 	countActiveQueueEntries,
 	countActiveQueueEntriesByKind,
@@ -66,6 +69,7 @@ import {
 	dequeueAllGitOperations,
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
+	detectActiveSkillsForBranch,
 	detectUncommittedReferenceIds,
 	enqueueGitOperation,
 	ensureJolliMemoryDir,
@@ -79,6 +83,7 @@ import {
 	loadConfigFromDir,
 	loadCursorForTranscript,
 	loadDiscoveryCursor,
+	loadExtractorCursorLine,
 	loadMostRecentSession,
 	loadPlanEntry,
 	loadPlansRegistry,
@@ -94,12 +99,15 @@ import {
 	saveConfigScoped,
 	saveCursor,
 	saveDiscoveryCursor,
+	saveExtractorCursor,
 	savePlansRegistry,
 	savePluginSource,
 	saveSession,
 	saveSquashPending,
 	upsertReferenceEntry,
+	upsertSkillEntry,
 } from "./SessionTracker.js";
+import { readSkillMarkdown } from "./skills/SkillStore.js";
 
 /**
  * Test-only narrowing helper: pull Linear-only reference rows out of a loaded
@@ -2855,5 +2863,429 @@ describe("normalizePlansRegistry", () => {
 		expect(registry).toEqual({ version: 1, plans: {} });
 		expect(registry.notes).toBeUndefined();
 		expect(registry.references).toBeUndefined();
+	});
+});
+
+// ─── Skill usage registry helpers ────────────────────────────────────────────
+
+describe("skills registry", () => {
+	let tempDir: string;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "jollimemory-skills-test-"));
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	const skillUse = (overrides: Partial<SkillUse> = {}): SkillUse => ({
+		source: "claude",
+		skill: "superpowers:brainstorming",
+		plugin: "superpowers",
+		entryPaths: ["tool"],
+		invocations: [{ at: "2026-07-30T06:01:57.000Z", ok: true, bodyChars: 10280 }],
+		...overrides,
+	});
+
+	const skillRow = (overrides: Partial<SkillEntry> = {}): SkillEntry => ({
+		source: "claude",
+		skill: "superpowers:brainstorming",
+		entryPaths: ["tool"],
+		invocations: [{ at: "2026-07-30T06:01:57.000Z", ok: true }],
+		invocationCount: 1,
+		firstUsedAt: "2026-07-30T06:01:57.000Z",
+		lastUsedAt: "2026-07-30T06:01:57.000Z",
+		sourcePath: "/tmp/whatever.md",
+		commitHash: null,
+		...overrides,
+	});
+
+	describe("associateSkillWithCommit", () => {
+		it("migrates the guard's commitHash and preserves the archive anchors", async () => {
+			// squash / rebase rewrites commit metadata, not file content: the guard's
+			// contentHashAtCommit and archivedTotals must survive so the row keeps
+			// reading as accounted-for instead of republishing its whole history.
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					skills: {
+						"claude:superpowers:brainstorming": skillRow({
+							commitHash: "424f5413aaaaaaaa",
+							contentHashAtCommit: "archivehash",
+							archivedTotals: { invocationCount: 1 },
+						}),
+					},
+				},
+				tempDir,
+			);
+
+			await associateSkillWithCommit("claude:superpowers:brainstorming-424f5413", "11de7b16cccccccc", tempDir);
+
+			const after = await loadPlansRegistry(tempDir);
+			const row = after.skills?.["claude:superpowers:brainstorming"];
+			expect(row?.commitHash).toBe("11de7b16cccccccc");
+			expect(row?.contentHashAtCommit).toBe("archivehash");
+			expect(row?.archivedTotals).toEqual({ invocationCount: 1 });
+		});
+
+		it("migrates a guard that an earlier squash already moved off the ref's own hash", async () => {
+			// A hoisted ref keeps its ORIGINAL archivedKey, so the hash embedded in it goes
+			// stale the moment the guard is migrated once. Matching only on that hash left
+			// the row pointing at a commit the second squash had already removed, and it
+			// could never be archived again. The squash knows which hashes it collapsed —
+			// a guard sitting on any of them must move.
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					skills: {
+						"claude:superpowers:brainstorming": skillRow({
+							commitHash: "e442290bbbbbbbbb",
+							contentHashAtCommit: "archivehash",
+							archivedTotals: { invocationCount: 1 },
+						}),
+					},
+				},
+				tempDir,
+			);
+
+			await associateSkillWithCommit(
+				// Embedded hash is the ORIGINAL archiving commit, not where the guard sits now.
+				"claude:superpowers:brainstorming-e2312515",
+				"796c6156dddddddd",
+				tempDir,
+				["e442290bbbbbbbbb"],
+			);
+
+			const row = (await loadPlansRegistry(tempDir)).skills?.["claude:superpowers:brainstorming"];
+			expect(row?.commitHash).toBe("796c6156dddddddd");
+			expect(row?.contentHashAtCommit).toBe("archivehash");
+		});
+
+		it("leaves the registry alone when no guard matches the old short hash", async () => {
+			const before = {
+				version: 1 as const,
+				plans: {},
+				skills: { "claude:superpowers:brainstorming": skillRow({ commitHash: "99999999aaaaaaaa" }) },
+			};
+			await savePlansRegistry(before, tempDir);
+			await associateSkillWithCommit("claude:superpowers:brainstorming-424f5413", "11de7b16cccccccc", tempDir);
+			await expect(loadPlansRegistry(tempDir)).resolves.toEqual(before);
+		});
+	});
+
+	describe("upsertSkillEntry", () => {
+		it("inserts a new row keyed <source>:<skill> and points it at the working file", async () => {
+			await upsertSkillEntry(skillUse(), tempDir);
+			const registry = await loadPlansRegistry(tempDir);
+			const entry = registry.skills?.["claude:superpowers:brainstorming"];
+			expect(entry?.skill).toBe("superpowers:brainstorming");
+			expect(entry?.plugin).toBe("superpowers");
+			expect(entry?.invocationCount).toBe(1);
+			expect(entry?.commitHash).toBeNull();
+			// The registry row is an index; the invocation history lives in the file.
+			expect(await readSkillMarkdown(entry?.sourcePath ?? "")).not.toBeNull();
+		});
+
+		it("folds a second pass into the existing row rather than adding one", async () => {
+			await upsertSkillEntry(skillUse(), tempDir);
+			await upsertSkillEntry(skillUse({ invocations: [{ at: "2026-07-30T07:00:00.000Z", ok: true }] }), tempDir);
+			const registry = await loadPlansRegistry(tempDir);
+			expect(Object.keys(registry.skills ?? {})).toEqual(["claude:superpowers:brainstorming"]);
+			expect(registry.skills?.["claude:superpowers:brainstorming"]?.invocationCount).toBe(2);
+			expect(registry.skills?.["claude:superpowers:brainstorming"]?.lastUsedAt).toBe("2026-07-30T07:00:00.000Z");
+		});
+
+		it("keeps the same skill from two sources as two rows", async () => {
+			await upsertSkillEntry(skillUse({ source: "claude" }), tempDir);
+			await upsertSkillEntry(skillUse({ source: "opencode" }), tempDir);
+			const registry = await loadPlansRegistry(tempDir);
+			expect(Object.keys(registry.skills ?? {}).sort()).toEqual([
+				"claude:superpowers:brainstorming",
+				"opencode:superpowers:brainstorming",
+			]);
+		});
+
+		it("preserves an unrelated skill row written by a concurrent pass", async () => {
+			await savePlansRegistry(
+				{ version: 1, plans: {}, skills: { "claude:other:skill": skillRow({ skill: "other:skill" }) } },
+				tempDir,
+			);
+			await upsertSkillEntry(skillUse(), tempDir);
+			const registry = await loadPlansRegistry(tempDir);
+			expect(Object.keys(registry.skills ?? {}).sort()).toEqual([
+				"claude:other:skill",
+				"claude:superpowers:brainstorming",
+			]);
+		});
+
+		it("does not disturb plans, notes or references already in the registry", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {
+						p1: {
+							slug: "p1",
+							title: "P",
+							sourcePath: "/p",
+							addedAt: "t",
+							updatedAt: "t",
+							commitHash: null,
+						},
+					},
+					notes: {
+						n1: {
+							id: "n1",
+							title: "N",
+							format: "markdown",
+							addedAt: "t",
+							updatedAt: "t",
+							commitHash: null,
+						},
+					},
+				},
+				tempDir,
+			);
+			await upsertSkillEntry(skillUse(), tempDir);
+			const registry = await loadPlansRegistry(tempDir);
+			expect(Object.keys(registry.plans)).toEqual(["p1"]);
+			expect(Object.keys(registry.notes ?? {})).toEqual(["n1"]);
+		});
+	});
+
+	describe("skills survive the other artifacts' write paths", () => {
+		it("is not erased by a reference upsert", async () => {
+			// upsertReferenceEntry rebuilds PlansRegistry field-by-field instead of
+			// spreading it. Before `skills` was added to that rebuild, a single
+			// reference write silently dropped every captured skill — and nothing
+			// failed to compile, because the field is optional.
+			await upsertSkillEntry(skillUse(), tempDir);
+			await upsertReferenceEntry(
+				{
+					mapKey: "linear:PROJ-1528",
+					source: "linear",
+					nativeId: "PROJ-1528",
+					title: "t",
+					url: "https://linear.app/x/PROJ-1528",
+					toolName: "mcp__linear__get_issue",
+					referencedAt: "2026-07-30T06:00:00Z",
+				},
+				tempDir,
+			);
+			const registry = await loadPlansRegistry(tempDir);
+			expect(registry.skills?.["claude:superpowers:brainstorming"]?.invocationCount).toBe(1);
+			expect(registry.references?.["linear:PROJ-1528"]).toBeDefined();
+		});
+
+		it("is not erased by loading the registry through normalization", async () => {
+			// normalizePlansRegistry runs on EVERY load and likewise rebuilds
+			// field-by-field, so an omission there loses skills on the next read even
+			// if nothing ever writes.
+			await upsertSkillEntry(skillUse(), tempDir);
+			const first = await loadPlansRegistry(tempDir);
+			await savePlansRegistry(first, tempDir);
+			const second = await loadPlansRegistry(tempDir);
+			expect(second.skills?.["claude:superpowers:brainstorming"]?.invocationCount).toBe(1);
+		});
+	});
+
+	describe("normalizePlansRegistry with skills", () => {
+		it("keeps a guarded (archived) skill row, unlike a reference row", () => {
+			// Skills follow the plan/note lifecycle: the row is GUARDED on commit, not
+			// deleted. Dropping guarded rows here would erase the archive guard that
+			// tells a re-commit the file has since changed.
+			const guarded = skillRow({ commitHash: "abc12345", contentHashAtCommit: "deadbeef" });
+			const { registry } = normalizePlansRegistry({
+				version: 1,
+				plans: {},
+				skills: { "claude:superpowers:brainstorming-abc12345": guarded },
+			});
+			expect(registry.skills?.["claude:superpowers:brainstorming-abc12345"]).toEqual(guarded);
+		});
+
+		it("leaves an absent skills section absent", () => {
+			const { registry, changed } = normalizePlansRegistry({ version: 1, plans: {} });
+			expect(changed).toBe(false);
+			expect(registry.skills).toBeUndefined();
+		});
+	});
+
+	describe("detectActiveSkillsForBranch", () => {
+		it("returns uncommitted skill rows", async () => {
+			await upsertSkillEntry(skillUse(), tempDir);
+			const active = await detectActiveSkillsForBranch(tempDir, "main");
+			expect(active.map((s) => s.skill)).toEqual(["superpowers:brainstorming"]);
+		});
+
+		it("excludes rows already archived onto a commit", async () => {
+			// Same filter plans and notes use, so a captured-but-unarchived skill is
+			// "active" by exactly the rule the sidebar Context group already applies.
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					skills: {
+						live: skillRow(),
+						archived: skillRow({ commitHash: "abc12345", contentHashAtCommit: "deadbeef" }),
+					},
+				},
+				tempDir,
+			);
+			const active = await detectActiveSkillsForBranch(tempDir, "main");
+			expect(active).toHaveLength(1);
+			expect(active[0]?.commitHash).toBeNull();
+		});
+
+		it("returns empty when no skills were ever captured", async () => {
+			await savePlansRegistry({ version: 1, plans: {} }, tempDir);
+			expect(await detectActiveSkillsForBranch(tempDir, "main")).toEqual([]);
+		});
+	});
+});
+
+// ─── Per-extractor discovery cursor high-water marks ─────────────────────────
+
+describe("per-extractor discovery cursors", () => {
+	let tempDir: string;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "jollimemory-extractor-cursor-"));
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	const T = "/path/session.jsonl";
+
+	it("reports line 0 for every extractor when the transcript has never been seen", async () => {
+		expect(await loadExtractorCursorLine(T, "plans", tempDir)).toBe(0);
+		expect(await loadExtractorCursorLine(T, "skills", tempDir)).toBe(0);
+	});
+
+	it("round-trips one extractor's high-water mark", async () => {
+		await saveExtractorCursor(T, "skills", 512, tempDir);
+		expect(await loadExtractorCursorLine(T, "skills", tempDir)).toBe(512);
+	});
+
+	it("advancing one extractor leaves the others where they were", async () => {
+		await saveExtractorCursor(T, "plans", 300, tempDir);
+		await saveExtractorCursor(T, "skills", 900, tempDir);
+		expect(await loadExtractorCursorLine(T, "plans", tempDir)).toBe(300);
+		expect(await loadExtractorCursorLine(T, "skills", tempDir)).toBe(900);
+	});
+
+	it("credits a legacy bare-lineNumber cursor to the extractors that predate skills", async () => {
+		// Every cursor already in the field is a bare `lineNumber` written before
+		// per-extractor marks existed. That number means "plans and references are
+		// both scanned this far" — crediting it to them is what stops this change
+		// from re-scanning the entire corpus on upgrade.
+		await saveDiscoveryCursor({ transcriptPath: T, lineNumber: 512, updatedAt: "t" }, tempDir);
+		expect(await loadExtractorCursorLine(T, "plans", tempDir)).toBe(512);
+		expect(await loadExtractorCursorLine(T, "references", tempDir)).toBe(512);
+	});
+
+	it("does NOT credit a legacy cursor to skills", async () => {
+		// The whole point of the high-water mark: a dist that never knew about skill
+		// extraction still advanced `lineNumber`, so trusting it would permanently
+		// strand every skill invocation in the lines it skipped.
+		await saveDiscoveryCursor({ transcriptPath: T, lineNumber: 512, updatedAt: "t" }, tempDir);
+		expect(await loadExtractorCursorLine(T, "skills", tempDir)).toBe(0);
+	});
+
+	it("keeps the legacy progress of the other extractors when skills is first recorded", async () => {
+		// Regression guard for the sharp edge in this design: if recording skills=0
+		// pulled the shared top-level `lineNumber` down to 0, an older dist reading
+		// that field would re-scan from the top; if it pushed the field up to the
+		// skills mark, an older dist would SKIP unscanned reference lines. Neither
+		// may happen.
+		await saveDiscoveryCursor({ transcriptPath: T, lineNumber: 512, updatedAt: "t" }, tempDir);
+		await saveExtractorCursor(T, "skills", 0, tempDir);
+		expect(await loadExtractorCursorLine(T, "plans", tempDir)).toBe(512);
+		expect(await loadExtractorCursorLine(T, "references", tempDir)).toBe(512);
+	});
+
+	it("holds the shared lineNumber at the slowest extractor so an older dist cannot skip data", async () => {
+		// The top-level field stays the contract for dists that only understand it.
+		// min() means such a dist re-reads lines some extractor already handled —
+		// safe, because every extractor is idempotent — rather than skipping lines
+		// no extractor has reached. max() would silently lose data.
+		await saveExtractorCursor(T, "plans", 800, tempDir);
+		await saveExtractorCursor(T, "references", 800, tempDir);
+		await saveExtractorCursor(T, "skills", 100, tempDir);
+		const cursor = await loadDiscoveryCursor(T, tempDir);
+		expect(cursor?.lineNumber).toBe(100);
+	});
+
+	it("never trusts a bare lineNumber written by a dist that did not run this extractor", async () => {
+		// Written the way an older dist actually writes it — a cursor object with no
+		// `extractors` key at all, because that field did not exist in its build.
+		// Resuming skills from 2000 would permanently strand every skill invocation
+		// in lines 1..2000. Rewinding to 0 re-reads them, which is safe: extraction
+		// is idempotent and invocations dedupe on their timestamp.
+		await mkdir(join(tempDir, ".jolli", "jollimemory"), { recursive: true });
+		await writeFile(
+			join(tempDir, ".jolli", "jollimemory", "discovery-cursors.json"),
+			JSON.stringify({
+				version: 1,
+				cursors: { [T]: { transcriptPath: T, lineNumber: 2000, updatedAt: "t" } },
+			}),
+			"utf-8",
+		);
+		expect(await loadExtractorCursorLine(T, "skills", tempDir)).toBe(0);
+	});
+
+	it("preserves extractor marks when our own code advances the shared cursor", async () => {
+		// `saveDiscoveryCursor` replaces the whole cursor object. Unlike an older
+		// dist's write, this path IS ours to control — dropping the marks here would
+		// make every extractor rewind on each shared-cursor advance, turning the
+		// high-water marks into dead weight.
+		await saveExtractorCursor(T, "skills", 900, tempDir);
+		await saveDiscoveryCursor({ transcriptPath: T, lineNumber: 2000, updatedAt: "t" }, tempDir);
+		expect(await loadExtractorCursorLine(T, "skills", tempDir)).toBe(900);
+	});
+
+	it("does not push the shared cursor past a sibling extractor that never recorded a mark", async () => {
+		// The dangerous mixed case. Codex advances the SHARED cursor for plans and
+		// references (via saveDiscoveryCursor) but records no per-extractor marks for
+		// them, while skills DOES record one. If min() were taken over the recorded
+		// marks alone it would see only skills=900 and drag the shared field from 300 to
+		// 900 — telling an older dist that references were scanned 600 lines further
+		// than they were, which is silent data loss.
+		await saveDiscoveryCursor({ transcriptPath: T, lineNumber: 300, updatedAt: "t" }, tempDir);
+		await saveExtractorCursor(T, "skills", 900, tempDir);
+		expect((await loadDiscoveryCursor(T, tempDir))?.lineNumber).toBe(300);
+		// The skills mark itself is unaffected — it just does not drag the shared field.
+		expect(await loadExtractorCursorLine(T, "skills", tempDir)).toBe(900);
+	});
+
+	it("does not claim shared progress when no cursor existed at all", async () => {
+		// A brand-new cursor cannot assert that the OTHER extractors have advanced. If
+		// recording skills=900 set the shared field to 900, a dist reading only that
+		// field would skip 900 lines nobody processed — and it would break the
+		// straddling-fetch protection the Codex discovery path depends on, which holds
+		// its cursor deliberately when a fetch spans two polls.
+		await saveExtractorCursor(T, "skills", 900, tempDir);
+		expect((await loadDiscoveryCursor(T, tempDir))?.lineNumber).toBe(0);
+		expect(await loadExtractorCursorLine(T, "skills", tempDir)).toBe(900);
+		expect(await loadExtractorCursorLine(T, "plans", tempDir)).toBe(0);
+	});
+
+	it("keeps extractor marks for one transcript out of another's", async () => {
+		await saveExtractorCursor(T, "skills", 10, tempDir);
+		await saveExtractorCursor("/path/other.jsonl", "skills", 77, tempDir);
+		expect(await loadExtractorCursorLine(T, "skills", tempDir)).toBe(10);
+		expect(await loadExtractorCursorLine("/path/other.jsonl", "skills", tempDir)).toBe(77);
+	});
+
+	it("never moves an extractor mark backwards on save", async () => {
+		// A monotonic mark is what makes a partially-failed scan safe to retry: the
+		// retry starts where the last SUCCESSFUL pass ended, and a stale in-flight
+		// value arriving late cannot undo real progress.
+		await saveExtractorCursor(T, "skills", 900, tempDir);
+		await saveExtractorCursor(T, "skills", 400, tempDir);
+		expect(await loadExtractorCursorLine(T, "skills", tempDir)).toBe(900);
 	});
 });

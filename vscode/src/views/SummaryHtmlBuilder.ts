@@ -28,9 +28,11 @@ import type {
 	NoteReference,
 	PlanReference,
 	ReferenceCommitRef,
+	SkillCommitRef,
 	SourceId,
 	TopicCategory,
 } from "../../../cli/src/Types.js";
+import { buildSkillsSummaryLabel } from "../../../cli/src/core/SkillsAggregateMarkdown.js";
 import { formatMemoryRefIdWithHashFallback } from "../../../cli/src/core/MemoryRefId.js";
 import { annotatePlans } from "../util/PlanGrouping.js";
 import { getSourceMeta, sourceClassToken } from "./SourceLabels.js";
@@ -818,7 +820,16 @@ function buildE2ePanel(summary: CommitSummary): string {
  * #plansAndNotesSection HTML that the refresh replaces.
  */
 export function contextChipCount(summary: CommitSummary): number {
-	return (summary.plans?.length ?? 0) + (summary.notes?.length ?? 0) + (summary.references?.length ?? 0);
+	// Skills contribute ONE, however many were captured: every Context surface
+	// renders them as a single aggregate "Skills used" row, so the chip counts rows
+	// on screen. Counting them individually would show `CONTEXT 14` above four
+	// visible rows.
+	return (
+		(summary.plans?.length ?? 0) +
+		(summary.notes?.length ?? 0) +
+		(summary.references?.length ?? 0) +
+		(summary.skills?.length ? 1 : 0)
+	);
 }
 
 /**
@@ -890,6 +901,36 @@ function buildRelevanceLine(rel: ContextRelevanceRef | undefined): string {
 }
 
 /**
+ * The single aggregate "Skills used" row: badge + title + a meta line summarising
+ * how many skills and what they cost.
+ *
+ * ONE row for all skills, matching every other Context surface — see
+ * {@link buildSkillsSummaryLabel} for why. The per-skill figures, including the
+ * input/output/cached split, are one click away in the table this row opens.
+ *
+ * Deliberately affordance-free — no edit, no remove, no translate, no relevance
+ * line. There is nothing to edit (the record is a measurement, not a document),
+ * nothing to dissociate (the row stands for a set, not an artifact), and the
+ * relevance ranker is never fed skills, so a verdict for one cannot exist.
+ *
+ * `inferred` is spelled out rather than daggered: this row has no footnote in
+ * reach for a reader to look the mark up in.
+ */
+function buildSkillsRow(skillList: ReadonlyArray<SkillCommitRef>, commitHash: string): string {
+	const inferred = skillList.some((s) => s.detection === "heuristic") ? ` &middot; some inferred` : "";
+	return `
+  <div class="plan-item" id="skillsAggregate">
+    <div class="row">
+      <span class="kb-tag t-skill">S</span>
+      <div class="r-main">
+        <a class="r-title plan-title plan-title-link" href="#" title="Click to open this memory's full skills table" data-action="previewCommittedSkills" data-commit-hash="${escAttr(commitHash)}">Skills used</a>
+        <div class="plan-meta">${escHtml(buildSkillsSummaryLabel(skillList))}${inferred}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+/**
  * One inline row for an AI soft-excluded context item: badge + struck-through
  * title + `Excluded` chip + reason, plus a SINGLE trailing action — a trash
  * button that drops this entry from THIS commit's excludedContext (see
@@ -951,6 +992,7 @@ export function buildContextPanel(
 		noteTranslateSet,
 		referenceTranslateSet,
 		{ refs: summary.contextRelevance, excluded: summary.excludedContext },
+		{ refs: summary.skills ?? [], commitHash: summary.commitHash },
 	);
 	const contextCount = contextChipCount(summary);
 	return `
@@ -1165,6 +1207,10 @@ export function buildPlansAndNotesSection(
 	noteTranslateSet?: ReadonlySet<string>,
 	referenceTranslateSet?: ReadonlySet<string>,
 	relevance?: ContextRelevanceDisplay,
+	// One object rather than two trailing params so the pairing is enforced by the
+	// type: every skill row's only action is "open this commit's aggregate table",
+	// so refs without a hash would render rows that cannot be opened.
+	skills?: { readonly refs: ReadonlyArray<SkillCommitRef>; readonly commitHash: string },
 ): string {
 	const planList = plans ?? [];
 	const noteList = notes ?? [];
@@ -1176,7 +1222,9 @@ export function buildPlansAndNotesSection(
 	const referenceList = references ?? [];
 	const relevanceMap = buildRelevanceLookup(relevance?.refs);
 	const excludedList = relevance?.excluded ?? [];
-	const totalCount = planList.length + noteList.length + referenceList.length;
+	const skillList = skills?.refs ?? [];
+	// One row for all skills — see contextChipCount, which must stay in step.
+	const totalCount = planList.length + noteList.length + referenceList.length + (skillList.length > 0 ? 1 : 0);
 
 	const planItems = annotatePlans(planList)
 		.map(({ plan: p, isLatest, isSuperseded }) => {
@@ -1271,11 +1319,22 @@ export function buildPlansAndNotesSection(
 		)
 		.join("\n");
 
+	// Skills last among the kept rows, matching the Markdown's ordering: they
+	// describe HOW the work happened, where everything above is what it was about.
+	//
+	// A skill row is deliberately affordance-free — no edit, no remove, no translate,
+	// no relevance line. There is nothing to edit (the record is a measurement, not a
+	// document), nothing to dissociate (a skill was either entered or it wasn't), and
+	// the relevance ranker is never fed skills, so a verdict for one cannot exist.
+	// Its single action opens the commit's whole `skills--<hash8>.md` table, which is
+	// the only place the per-skill input/output/cached split is shown.
+	const skillItems = skillList.length > 0 && skills ? buildSkillsRow(skillList, skills.commitHash) : "";
+
 	// AI soft-excluded items, inlined read-only after the kept rows (the old
 	// collapsed "AI excluded N" details block is gone — one unified list).
 	const excludedItems = excludedList.map((e) => buildExcludedRow(e)).join("\n");
 
-	const allItems = planItems + noteItems + referenceItems + excludedItems;
+	const allItems = planItems + noteItems + referenceItems + skillItems + excludedItems;
 	const hasAnyRow = totalCount > 0 || excludedList.length > 0;
 	const countBadge =
 		totalCount > 1 ? ` <span class="section-count">${totalCount}</span>` : "";

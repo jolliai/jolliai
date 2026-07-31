@@ -21,7 +21,11 @@
  *      `upsertReferenceEntry` into the `plans.json.references` map and rendered
  *      to per-reference markdown by `ReferenceStore`, so the VSCode panel surfaces
  *      them alongside plans and notes.
+ *   4. Incrementally scans the transcript for skill invocations (the `Skill` tool
+ *      and typed slash commands, plus each subagent transcript) and persists them
+ *      into `plans.json.skills`, on the `skills` extractor's own cursor mark.
  *
+
  * This hook runs with { "async": true } so it doesn't block Claude Code.
  */
 
@@ -41,6 +45,7 @@ import {
 	saveDiscoveryCursor,
 	saveSession,
 } from "../core/SessionTracker.js";
+import { scanSkillsWithCursor } from "../core/skills/TranscriptSkillDiscovery.js";
 import { flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { isClaudeHookInstalled } from "../install/ClaudeHookInstaller.js";
 import { createLogger, setLogDir } from "../Logger.js";
@@ -231,6 +236,12 @@ export async function handleStopHook(): Promise<void> {
  * guard revival) holds the cursor at `fromLine` so its window is retried next
  * time, instead of being skipped forever because the reference scan reached EOF.
  * Re-scanning on retry is safe: both scans are idempotent.
+ *
+ * Skills are the third extractor and ride their OWN high-water mark inside the same
+ * cursor record, so they are neither capped by nor capping the shared number above —
+ * see `scanSkillsWithCursor`. This is the turn-level site: Claude skill usage has to
+ * appear in working memory while the session is still running, which is when it is
+ * useful, not only once a commit lands.
  */
 async function discoverFromTranscript(sessionInfo: SessionInfo, cwd: string): Promise<void> {
 	const transcriptPath = sessionInfo.transcriptPath;
@@ -254,6 +265,10 @@ async function discoverFromTranscript(sessionInfo: SessionInfo, cwd: string): Pr
 	} catch (error: unknown) {
 		log.error("Reference discovery failed: %s", (error as Error).message);
 	}
+
+	// Own cursor, own error handling — a skill scan that throws must not hold the
+	// plan/reference cursor, and vice versa.
+	await scanSkillsWithCursor(transcriptPath, cwd, "claude");
 
 	// Hold the cursor if the plan scan threw: advancing past its window (the
 	// reference scan reaching EOF) would lose those lines for plan discovery.

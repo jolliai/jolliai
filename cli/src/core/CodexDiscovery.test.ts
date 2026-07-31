@@ -16,6 +16,12 @@ vi.mock("./SessionTracker.js", () => ({
 	migrateDiscoveryCursors: vi.fn(),
 	saveDiscoveryCursor: vi.fn(),
 }));
+// Skills own their high-water mark inside the shared cursor record; the helper that
+// implements that protocol is covered in TranscriptSkillDiscovery.test.ts, so this
+// suite asserts only that Codex sessions are handed to it.
+vi.mock("./skills/TranscriptSkillDiscovery.js", () => ({
+	scanSkillsWithCursor: vi.fn(),
+}));
 
 import { setManuallyDisabled } from "../Logger.js";
 import { discoverCodexConversations } from "./CodexDiscovery.js";
@@ -23,6 +29,7 @@ import { discoverCodexSessions, isCodexInstalled } from "./CodexSessionDiscovere
 import { scanPlansFrom } from "./plans/TranscriptPlanDiscovery.js";
 import { scanReferencesFrom } from "./references/TranscriptReferenceDiscovery.js";
 import { loadConfig, loadDiscoveryCursor, migrateDiscoveryCursors, saveDiscoveryCursor } from "./SessionTracker.js";
+import { scanSkillsWithCursor } from "./skills/TranscriptSkillDiscovery.js";
 
 const session = (id: string, path: string) => ({
 	sessionId: id,
@@ -41,6 +48,7 @@ beforeEach(() => {
 	vi.mocked(scanReferencesFrom).mockResolvedValue(0);
 	vi.mocked(scanPlansFrom).mockResolvedValue(0);
 	vi.mocked(saveDiscoveryCursor).mockResolvedValue(undefined);
+	vi.mocked(scanSkillsWithCursor).mockResolvedValue(undefined);
 });
 
 describe("discoverCodexConversations", () => {
@@ -118,6 +126,21 @@ describe("discoverCodexConversations", () => {
 		// s1's save threw (caught by the outer per-session guard); s2 still processed.
 		expect(scanReferencesFrom).toHaveBeenCalledTimes(2);
 		expect(saveDiscoveryCursor).toHaveBeenCalledTimes(2);
+	});
+
+	it("hands each session to skill discovery on its own mark", async () => {
+		vi.mocked(discoverCodexSessions).mockResolvedValue([session("s1", "/t/1.jsonl"), session("s2", "/t/2.jsonl")]);
+		await discoverCodexConversations("/repo/skills");
+		expect(scanSkillsWithCursor).toHaveBeenCalledWith("/t/1.jsonl", "/repo/skills", "codex");
+		expect(scanSkillsWithCursor).toHaveBeenCalledWith("/t/2.jsonl", "/repo/skills", "codex");
+	});
+
+	it("still runs skill discovery when the reference scan threw and held the shared cursor", async () => {
+		vi.mocked(discoverCodexSessions).mockResolvedValue([session("s1", "/t/1.jsonl")]);
+		vi.mocked(scanReferencesFrom).mockRejectedValue(new Error("ref boom"));
+		await discoverCodexConversations("/repo/reffail2");
+		expect(scanSkillsWithCursor).toHaveBeenCalledWith("/t/1.jsonl", "/repo/reffail2", "codex");
+		expect(saveDiscoveryCursor).not.toHaveBeenCalled();
 	});
 
 	it("when reference scan throws, plan scans 0 lines (toLine===fromLine) and the cursor holds", async () => {

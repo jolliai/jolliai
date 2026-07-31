@@ -1,0 +1,174 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { loadPlansRegistry } from "../SessionTracker.js";
+import { OC_ASSISTANT_MESSAGE, OC_NON_SKILL_TOOL, OC_SKILL_NO_TOP_METADATA } from "./__fixtures__/openCodeParts.js";
+
+/**
+ * The DB path is resolved by the OpenCode session discoverer; point it at a temp
+ * database built with the real schema so these tests exercise the actual SQL.
+ */
+const { dbPathRef } = vi.hoisted(() => ({ dbPathRef: { current: "" } }));
+vi.mock("../OpenCodeSessionDiscoverer.js", () => ({
+	getOpenCodeDbPath: () => dbPathRef.current,
+}));
+
+const { discoverOpenCodeSkills } = await import("./OpenCodeSkillDiscovery.js");
+
+/** Builds a DB with OpenCode's real table shapes for `session`, `part` and `message`. */
+async function buildDb(
+	path: string,
+	rows: {
+		sessions: Array<{ id: string; directory: string | null; timeCreated?: number }>;
+		parts: Array<{ id: string; sessionId: string; timeCreated: number; data: string }>;
+		messages?: Array<{ id: string; sessionId: string; timeCreated: number; data: string }>;
+	},
+): Promise<void> {
+	const { DatabaseSync } = await import("node:sqlite");
+	const db = new DatabaseSync(path);
+	db.exec("CREATE TABLE session (id TEXT, directory TEXT, time_created INTEGER)");
+	db.exec("CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)");
+	db.exec("CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT)");
+	const now = Date.now();
+	for (const s of rows.sessions) {
+		db.prepare("INSERT INTO session VALUES (?,?,?)").run(s.id, s.directory, s.timeCreated ?? now);
+	}
+	for (const p of rows.parts) {
+		db.prepare("INSERT INTO part VALUES (?,?,?,?,?)").run(p.id, "msg_x", p.sessionId, p.timeCreated, p.data);
+	}
+	for (const m of rows.messages ?? []) {
+		db.prepare("INSERT INTO message VALUES (?,?,?,?)").run(m.id, m.sessionId, m.timeCreated, m.data);
+	}
+	db.close();
+}
+
+describe("discoverOpenCodeSkills", () => {
+	let cwd: string;
+	let dbDir: string;
+
+	beforeEach(async () => {
+		cwd = await mkdtemp(join(tmpdir(), "oc-skill-cwd-"));
+		dbDir = await mkdtemp(join(tmpdir(), "oc-skill-db-"));
+		dbPathRef.current = join(dbDir, "opencode.db");
+	});
+
+	afterEach(async () => {
+		await rm(cwd, { recursive: true, force: true });
+		await rm(dbDir, { recursive: true, force: true });
+	});
+
+	it("persists a skill from a session run in this repo", async () => {
+		await buildDb(dbPathRef.current, {
+			sessions: [{ id: "ses_1", directory: cwd }],
+			parts: [{ id: "prt_1", sessionId: "ses_1", timeCreated: Date.now(), data: OC_SKILL_NO_TOP_METADATA }],
+		});
+
+		expect(await discoverOpenCodeSkills(cwd)).toBe(1);
+		const entry = (await loadPlansRegistry(cwd)).skills?.["opencode:jolli"];
+		expect(entry?.skill).toBe("jolli");
+		expect(entry?.source).toBe("opencode");
+		expect(entry?.commitHash).toBeNull();
+	});
+
+	it("includes a session started from a SUBDIRECTORY of the repo", async () => {
+		// Real data has exactly this: a session whose directory is <repo>/intellij. A
+		// SQL `directory = :cwd` test silently dropped every such session (JOLLI-2015),
+		// which is why the match runs through the shared helper instead.
+		await buildDb(dbPathRef.current, {
+			sessions: [{ id: "ses_sub", directory: join(cwd, "intellij") }],
+			parts: [{ id: "prt_1", sessionId: "ses_sub", timeCreated: Date.now(), data: OC_SKILL_NO_TOP_METADATA }],
+		});
+		expect(await discoverOpenCodeSkills(cwd)).toBe(1);
+	});
+
+	it("excludes a sibling directory that merely shares a name prefix", async () => {
+		// Real data has `<repo>-worktrees/...` alongside `<repo>`. A naive prefix test
+		// matches it; the separator boundary in the shared helper is what rejects it.
+		await buildDb(dbPathRef.current, {
+			sessions: [{ id: "ses_other", directory: `${cwd}-worktrees/feature/x` }],
+			parts: [{ id: "prt_1", sessionId: "ses_other", timeCreated: Date.now(), data: OC_SKILL_NO_TOP_METADATA }],
+		});
+		expect(await discoverOpenCodeSkills(cwd)).toBe(0);
+		expect((await loadPlansRegistry(cwd)).skills).toBeUndefined();
+	});
+
+	it("survives a session row with a null directory", async () => {
+		// One null directory used to throw out of the matcher and take the whole batch
+		// down — the same poison-row failure that broke Copilot capture.
+		await buildDb(dbPathRef.current, {
+			sessions: [
+				{ id: "ses_null", directory: null },
+				{ id: "ses_ok", directory: cwd },
+			],
+			parts: [{ id: "prt_1", sessionId: "ses_ok", timeCreated: Date.now(), data: OC_SKILL_NO_TOP_METADATA }],
+		});
+		expect(await discoverOpenCodeSkills(cwd)).toBe(1);
+	});
+
+	it("attributes spend from the same session only", async () => {
+		// Interval attribution is positional within ONE conversation. If two sessions
+		// shared a timeline, one session's turns would be billed to the other's skill.
+		const t = Date.now();
+		await buildDb(dbPathRef.current, {
+			sessions: [
+				{ id: "ses_a", directory: cwd },
+				{ id: "ses_b", directory: cwd },
+			],
+			parts: [{ id: "prt_1", sessionId: "ses_a", timeCreated: t, data: OC_SKILL_NO_TOP_METADATA }],
+			messages: [
+				{ id: "msg_a", sessionId: "ses_a", timeCreated: t + 100, data: OC_ASSISTANT_MESSAGE },
+				{ id: "msg_b", sessionId: "ses_b", timeCreated: t + 200, data: OC_ASSISTANT_MESSAGE },
+			],
+		});
+		await discoverOpenCodeSkills(cwd);
+		const entry = (await loadPlansRegistry(cwd)).skills?.["opencode:jolli"];
+		// One session's worth (89/151), not two.
+		expect(entry?.usage).toEqual({ input: 89, cached: 0, output: 151, confidence: "estimated" });
+	});
+
+	it("records the session key so a detached conversation can be subtracted", async () => {
+		const t = Date.now();
+		await buildDb(dbPathRef.current, {
+			sessions: [{ id: "ses_a", directory: cwd }],
+			parts: [{ id: "prt_1", sessionId: "ses_a", timeCreated: t, data: OC_SKILL_NO_TOP_METADATA }],
+			messages: [{ id: "msg_a", sessionId: "ses_a", timeCreated: t + 100, data: OC_ASSISTANT_MESSAGE }],
+		});
+		await discoverOpenCodeSkills(cwd);
+		const entry = (await loadPlansRegistry(cwd)).skills?.["opencode:jolli"];
+		expect(Object.keys(entry?.usageBySession ?? {})).toEqual(["opencode:ses_a"]);
+	});
+
+	it("ignores non-skill tool rows", async () => {
+		await buildDb(dbPathRef.current, {
+			sessions: [{ id: "ses_1", directory: cwd }],
+			parts: [{ id: "prt_1", sessionId: "ses_1", timeCreated: Date.now(), data: OC_NON_SKILL_TOOL }],
+		});
+		expect(await discoverOpenCodeSkills(cwd)).toBe(0);
+	});
+
+	it("is a silent no-op when OpenCode is not installed", async () => {
+		dbPathRef.current = join(dbDir, "does-not-exist.db");
+		await expect(discoverOpenCodeSkills(cwd)).resolves.toBe(0);
+	});
+
+	it("is a silent no-op when the database cannot be read", async () => {
+		// Runs fire-and-forget on a UI tick — a corrupt DB must never surface as an
+		// error on the surface it feeds.
+		const { writeFile } = await import("node:fs/promises");
+		await writeFile(dbPathRef.current, "definitely not sqlite", "utf-8");
+		await expect(discoverOpenCodeSkills(cwd)).resolves.toBe(0);
+	});
+
+	it("does not re-count an invocation on a second pass", async () => {
+		// The tick runs every 60 seconds against the same rows.
+		const t = Date.now();
+		await buildDb(dbPathRef.current, {
+			sessions: [{ id: "ses_1", directory: cwd }],
+			parts: [{ id: "prt_1", sessionId: "ses_1", timeCreated: t, data: OC_SKILL_NO_TOP_METADATA }],
+		});
+		await discoverOpenCodeSkills(cwd);
+		await discoverOpenCodeSkills(cwd);
+		expect((await loadPlansRegistry(cwd)).skills?.["opencode:jolli"]?.invocationCount).toBe(1);
+	});
+});

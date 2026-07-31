@@ -32,6 +32,7 @@ import type {
 	PlanProgressArtifact,
 	PlanReference,
 	ReferenceCommitRef,
+	SkillCommitRef,
 	SourceId,
 	StoredTranscript,
 	SummaryIndex,
@@ -55,6 +56,7 @@ import {
 	resolveDiffStats,
 	resolveTranscriptIdsFiltered,
 } from "./SummaryTree.js";
+import { mergeSkillRefs } from "./skills/SkillDelta.js";
 import { transcriptIdFromPath } from "./TranscriptId.js";
 
 let activeStorageOverride: StorageProvider | undefined;
@@ -454,6 +456,16 @@ async function migrateOneToOneLocked(
 		// at correctly-archived snapshot files. Root-only Copy, no merge needed.
 		...(oldSummary.references && { references: oldSummary.references }),
 		...(oldSummary.e2eTestGuide && { e2eTestGuide: oldSummary.e2eTestGuide }),
+		// Skills — same Copy-Hoist as references. Without this line a rebase-picked
+		// commit loses its skill record from the root, so the PR-wide aggregate, the
+		// sidebar skill rows and the PR markdown table all read nothing (the refs
+		// survive only on the wrapped child, which none of those read paths walk).
+		// Unlike references, skills are NOT stripped off the child — stripFunctionalMetadata
+		// has no stripSkills — so root and child end up holding the SAME ref. That is the
+		// established squash shape, not a leak: a later squash's collectChildSkills meets
+		// each ref from both ends and mergeSkillRefs dedupes by `archivedKey` before
+		// accumulating, precisely for this case. Copy, no merge needed.
+		...(oldSummary.skills && { skills: oldSummary.skills }),
 		// summaryError marker — rebase-pick doesn't run the LLM, so a degraded
 		// old summary stays degraded on the new hash. Use isSummaryError() so
 		// legacy summaries (only `llm.stopReason: "error"`, no summaryError
@@ -632,6 +644,26 @@ export function collectChildReferences(nodes: ReadonlyArray<CommitSummary>): Rea
 	return [...refMap.values()];
 }
 
+/**
+ * Recursively collects all SkillCommitRefs from a list of summaries, ACCUMULATED per
+ * skill rather than deduped. Parallel to collectChildPlans / collectChildNotes /
+ * collectChildReferences — without it a squash root inherits none of its sources'
+ * skill usage and the record is lost with the children.
+ *
+ * Accumulation, not dedupe, is the difference from the reference collector: each ref
+ * is one commit's INCREMENT (see uncommittedDelta), so collapsing three commits that
+ * each entered a skill once must report three entries, not one. `mergeSkillRefs` is
+ * the same fold the PR-wide aggregate uses, so the two cannot disagree.
+ */
+export function collectChildSkills(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<SkillCommitRef> {
+	const all: SkillCommitRef[] = [];
+	for (const node of nodes) {
+		all.push(...(node.skills ?? []));
+		if (node.children) all.push(...collectChildSkills(node.children));
+	}
+	return mergeSkillRefs(all);
+}
+
 /** Returns a deep copy of the summary tree with Jolli metadata stripped from all nodes. */
 function stripJolliMetadata(node: CommitSummary): CommitSummary {
 	const { jolliDocId: _d, jolliDocUrl: _u, orphanedDocIds: _o, unresolvedOrphanHashes: _h, ...rest } = node;
@@ -762,6 +794,7 @@ export function normalizeToV4(summary: CommitSummary): CommitSummary {
 	const hoistedPlans = collectChildPlans([summary]);
 	const hoistedNotes = collectChildNotes([summary]);
 	const hoistedReferences = collectChildReferences([summary]);
+	const hoistedSkills = collectChildSkills([summary]);
 	const jolliMeta = collectChildJolliMeta([summary]);
 	// Dedup orphanedDocIds across the tree: jolliMeta surfaces orphans from
 	// this normalize step's loser candidates; root + descendants may already
@@ -819,6 +852,7 @@ export function normalizeToV4(summary: CommitSummary): CommitSummary {
 		...(hoistedPlans.length > 0 ? { plans: hoistedPlans } : {}),
 		...(hoistedNotes.length > 0 ? { notes: hoistedNotes } : {}),
 		...(hoistedReferences.length > 0 ? { references: hoistedReferences } : {}),
+		...(hoistedSkills.length > 0 ? { skills: hoistedSkills } : {}),
 		...(jolliMeta.winner
 			? {
 					jolliDocId: jolliMeta.winner.jolliDocId,
@@ -1037,9 +1071,15 @@ export async function mergeManyToOne(
 	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
 	consolidated?: ConsolidatedTopics,
 	storage?: StorageProvider,
+	/**
+	 * Skill refs archived for THIS squash, on top of whatever the children carry.
+	 * A squash lands new work, so uncommitted skill rows belong on the root exactly
+	 * as they would on a plain commit; the children's own refs cannot supply them.
+	 */
+	extraSkills?: ReadonlyArray<SkillCommitRef>,
 ): Promise<{ orphanedDocIds: number[] }> {
 	return withRequiredOrphanWriteLock(cwd, "mergeManyToOne", () =>
-		mergeManyToOneLocked(oldSummaries, newCommitInfo, cwd, metadata, consolidated, storage),
+		mergeManyToOneLocked(oldSummaries, newCommitInfo, cwd, metadata, consolidated, storage, extraSkills),
 	);
 }
 
@@ -1050,6 +1090,7 @@ async function mergeManyToOneLocked(
 	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
 	consolidated?: ConsolidatedTopics,
 	storage?: StorageProvider,
+	extraSkills?: ReadonlyArray<SkillCommitRef>,
 ): Promise<{ orphanedDocIds: number[] }> {
 	log.info("Merging %d summaries into %s", oldSummaries.length, newCommitInfo.hash.substring(0, 8));
 
@@ -1069,6 +1110,10 @@ async function mergeManyToOneLocked(
 	const hoistedPlans = collectChildPlans(children);
 	const hoistedNotes = collectChildNotes(children);
 	const hoistedReferences = collectChildReferences(children);
+	// Newly-archived rows (squash lands new work) merge with the children's own refs
+	// through the same fold, so a skill entered both before and during the squash is
+	// one row carrying the sum.
+	const hoistedSkills = mergeSkillRefs([...collectChildSkills(children), ...(extraSkills ?? [])]);
 	const jolliMeta = collectChildJolliMeta(children);
 	const inheritedOrphanIds = children.flatMap((c) => c.orphanedDocIds ?? []);
 	const allOrphanedDocIds = [...jolliMeta.orphanedDocIds, ...inheritedOrphanIds];
@@ -1135,6 +1180,7 @@ async function mergeManyToOneLocked(
 		...(hoistedPlans.length > 0 && { plans: hoistedPlans }),
 		...(hoistedNotes.length > 0 && { notes: hoistedNotes }),
 		...(hoistedReferences.length > 0 && { references: hoistedReferences }),
+		...(hoistedSkills.length > 0 && { skills: hoistedSkills }),
 		...(jolliMeta.winner && {
 			jolliDocId: jolliMeta.winner.jolliDocId,
 			jolliDocUrl: jolliMeta.winner.jolliDocUrl,
@@ -2549,6 +2595,58 @@ export async function storeReferences(
 		await store.writeFiles(files, commitMessage);
 		log.info("Stored %d reference file(s) across sources", referenceFiles.length);
 	});
+}
+
+// ─── Skill usage storage ────────────────────────────────────────────────────
+
+/**
+ * Writes archived skill markdown to the orphan branch.
+ *
+ * Paths are built by `SkillArchive.skillOrphanPath` (which owns the sanitization),
+ * so this is a thin pass-through — deliberately, to keep one place responsible for
+ * turning an untrusted skill id into a path.
+ *
+ * The Memory Bank hidden layer comes free: `writeHiddenFile` runs unconditionally
+ * before FolderStorage's visible cascade, so `skills/...` lands under
+ * `<kbRoot>/.jolli/` with no code here. The visible layer is a per-commit
+ * aggregate emitted from the summary arm, not one file per skill — see
+ * FolderStorage.
+ */
+export async function storeSkills(
+	skillFiles: ReadonlyArray<{ path: string; content: string }>,
+	commitMessage: string,
+	cwd?: string,
+	branch?: string,
+	storage?: StorageProvider,
+): Promise<void> {
+	if (skillFiles.length === 0) return;
+	// Pre-lock gate — see storeSummary for why this sits before the lock.
+	if (isManuallyDisabled()) return;
+
+	const files: FileWrite[] = skillFiles.map((s) => ({ path: s.path, content: s.content, branch }));
+
+	await withRequiredOrphanWriteLock(cwd, "storeSkills", async () => {
+		const store = resolveStorage(storage, cwd);
+		await store.writeFiles(files, commitMessage);
+		log.info("Stored %d skill file(s)", skillFiles.length);
+	});
+}
+
+/**
+ * Reads an archived skill's markdown from the orphan branch.
+ * Returns `null` when the file is absent.
+ */
+export async function readSkillFromBranch(
+	orphanPath: string,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<string | null> {
+	try {
+		const store = resolveStorage(storage, cwd);
+		return await store.readFile(orphanPath);
+	} catch {
+		return null;
+	}
 }
 
 /**

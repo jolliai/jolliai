@@ -699,3 +699,124 @@ describe("referencesBySourceOrder", () => {
 		expect(referencesBySourceOrder(refs).map((r) => r.nativeId)).toEqual(["l1", "g1", "z1"]);
 	});
 });
+
+// ─── skills group inside the Context section ─────────────────────────────────
+
+describe("pushPlansAndNotesSection skills group", () => {
+	const skillRef = (over: Record<string, unknown> = {}) =>
+		({
+			archivedKey: "claude:superpowers:test-driven-development-abc12345",
+			source: "claude",
+			skill: "superpowers:test-driven-development",
+			plugin: "superpowers",
+			entryPaths: ["tool"],
+			invocationCount: 2,
+			firstUsedAt: "2026-07-30T06:00:00.000Z",
+			lastUsedAt: "2026-07-30T07:00:00.000Z",
+			usage: { input: 79, cached: 59796, output: 33944, confidence: "attributed" },
+			...over,
+		}) as never;
+
+	const withSkills = (skills: ReadonlyArray<unknown>) => ({ plans: [], notes: [], skills }) as never;
+
+	it("collapses skills into ONE aggregate row carrying the count and token total", () => {
+		// Not one row per skill: a session routinely enters a dozen, which would bury
+		// the plans and notes this section exists to list. Every Context surface in the
+		// UI collapses them the same way, and this Markdown is what those panels export.
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, withSkills([skillRef(), skillRef({ skill: "j:specs" })]));
+		const out = lines.join("\n");
+		// 2 × (79 + 59796 + 33944) = 187638
+		expect(out).toContain("- Skills used — 2 skills · 187.6k tokens");
+		expect(out).not.toContain("superpowers:test-driven-development");
+	});
+
+	it("singularises the aggregate row for a lone skill", () => {
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, withSkills([skillRef()]));
+		// 79 + 59796 + 33944 = 93819
+		expect(lines.join("\n")).toContain("- Skills used — 1 skill · 93.8k tokens");
+	});
+
+	it("marks an estimated total so it is not read as measured", () => {
+		const lines: string[] = [];
+		pushPlansAndNotesSection(
+			lines,
+			withSkills([skillRef({ usage: { input: 10, cached: 12000, output: 300, confidence: "estimated" } })]),
+		);
+		expect(lines.join("\n")).toContain("~12.3k");
+	});
+
+	it("drops the token figure entirely rather than inventing a zero", () => {
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, withSkills([skillRef({ usage: undefined })]));
+		const out = lines.join("\n");
+		expect(out).toContain("- Skills used — 1 skill");
+		expect(out).not.toContain("tokens");
+		expect(out).not.toContain("0");
+	});
+
+	it("states inline that some of the aggregated skills were inferred", () => {
+		// A footnote would be missed here: this section is read inline. "some", not
+		// "inferred" flat — the row stands for a set that may mix observed and inferred.
+		const lines: string[] = [];
+		pushPlansAndNotesSection(
+			lines,
+			withSkills([skillRef({ detection: "heuristic", usage: undefined }), skillRef()]),
+		);
+		expect(lines.join("\n")).toContain("· some inferred");
+	});
+
+	it("says nothing extra for an observed skill", () => {
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, withSkills([skillRef()]));
+		expect(lines.join("\n")).not.toContain("inferred");
+	});
+
+	it("never links a skill row", () => {
+		// A skill invocation is a local act with no external destination, so there is
+		// nothing to open — unlike a plan, note or reference row.
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, withSkills([skillRef()]));
+		expect(lines.join("\n")).not.toContain("](");
+	});
+
+	it("counts the whole skills set as ONE toward the section heading count", () => {
+		// The heading counts ROWS. Counting each skill would read `## Context (3)`
+		// above two visible bullets.
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, {
+			plans: [{ slug: "p", title: "Plan A", addedAt: "t", updatedAt: "t" }],
+			notes: [],
+			skills: [skillRef(), skillRef({ skill: "j:specs" })],
+		} as never);
+		expect(lines.join("\n")).toContain("## Context (2)");
+	});
+
+	it("opens the Context section for a skills-only summary", () => {
+		// Skills alone must be enough to render the section — a commit whose only
+		// captured context is which skills ran still has something to show.
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, withSkills([skillRef()]));
+		expect(lines.join("\n")).toContain("## Context");
+	});
+
+	it("stays silent when the summary carries no skills", () => {
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, { plans: [], notes: [] } as never);
+		expect(lines.join("\n")).toBe("");
+	});
+
+	it("puts skills after plans and notes", () => {
+		// Skills are metadata about HOW the work happened; the artifacts the work was
+		// about come first.
+		const lines: string[] = [];
+		pushPlansAndNotesSection(lines, {
+			plans: [{ slug: "p", title: "Plan A", addedAt: "t", updatedAt: "t" }],
+			notes: [],
+			skills: [skillRef()],
+		} as never);
+		const out = lines.join("\n");
+		expect(out.indexOf("Plan A")).toBeLessThan(out.indexOf("Skills used"));
+	});
+});

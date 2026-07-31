@@ -55,6 +55,14 @@ export interface SessionInfo {
 }
 
 /** Cursor tracking position in a transcript file */
+/**
+ * Independently-resumable transcript extractors sharing `discovery-cursors.json`.
+ *
+ * Each advances its own high-water mark, so adding one never strands data behind
+ * a mark advanced by a dist that did not know it existed.
+ */
+export type DiscoveryExtractor = "plans" | "references" | "skills";
+
 export interface TranscriptCursor {
 	readonly transcriptPath: string;
 	readonly lineNumber: number;
@@ -70,6 +78,21 @@ export interface TranscriptCursor {
 	 * `lineNumber`.
 	 */
 	readonly anchorId?: string;
+	/**
+	 * Per-extractor high-water marks for `discovery-cursors.json`.
+	 *
+	 * `lineNumber` alone is a single shared mark, which strands data across version
+	 * skew: a dist that knows nothing of a newer extractor still advances the shared
+	 * mark, and the newer dist resuming from it never re-reads those lines. Since
+	 * old dists are already in the field, the mark could not be added after the
+	 * extractor that needs it.
+	 *
+	 * A missing key means "this extractor has never run here" and reads as 0 — a
+	 * full rewind for that extractor ONLY, leaving its siblings' progress alone.
+	 * Legacy records carrying a bare `lineNumber` credit it to the extractors that
+	 * predate this field ({@link LEGACY_COVERED_EXTRACTORS}), never to newer ones.
+	 */
+	readonly extractors?: Readonly<Partial<Record<DiscoveryExtractor, number>>>;
 }
 
 /** A single parsed transcript entry from the JSONL file */
@@ -592,6 +615,20 @@ export interface CommitSummary {
 	 */
 	readonly references?: ReadonlyArray<ReferenceCommitRef>;
 	/**
+	 * Agent Skills that ran during the work leading to this commit.
+	 *
+	 * Metadata about HOW the work happened, not substance of it: this array is
+	 * archived and displayed but never fed to the summarizer, the same `trackOnly`
+	 * contract references use. Letting it steer the memory's content would be a
+	 * category error.
+	 *
+	 * Purely additive — no schema-version bump and no migration, matching how
+	 * `excludedContext` / `contextRelevance` shipped. (`transcripts` is the
+	 * counter-example: it needed a migration because it changed structural
+	 * semantics, not because it was new.)
+	 */
+	readonly skills?: ReadonlyArray<SkillCommitRef>;
+	/**
 	 * v5 schema: stable transcript IDs referenced by this summary. Each ID
 	 * corresponds to a file at `transcripts/{id}.json` on the orphan branch.
 	 *
@@ -674,8 +711,8 @@ export interface ContextRelevanceRef {
  * with the reason it was judged unrelated. Stored on CommitSummary.excludedContext.
  */
 export interface ExcludedContextItem {
-	readonly kind: "plan" | "note" | "reference";
-	/** slug (plan) / note id / reference mapKey. */
+	readonly kind: "plan" | "note" | "reference" | "skill";
+	/** slug (plan) / note id / reference mapKey / skill `<source>:<skill>` mapKey. */
 	readonly key: string;
 	readonly title: string;
 	/** One-line AI reason it was judged unrelated to this change. */
@@ -739,6 +776,23 @@ export interface PlansRegistry {
 	readonly plans: Readonly<Record<string, PlanEntry>>;
 	readonly notes?: Readonly<Record<string, NoteEntry>>;
 	readonly references?: Readonly<Record<string, ReferenceEntry>>;
+	/**
+	 * Skill usage rows, keyed `<source>:<skill>`.
+	 *
+	 * **Adding a FIFTH artifact map: update `ARTIFACT_MAPS` in
+	 * `core/PlansRegistryWriters.test.ts` and let it tell you which writers to fix.**
+	 * Every map here is optional, so a writer that rebuilds this object field-by-field
+	 * and forgets one erases it on the next write with nothing failing to compile.
+	 * That test scans for such rebuilds across `cli/src` and `vscode/src`; it exists
+	 * because the comment that used to sit here enumerated the writers by name, went
+	 * stale as writers were added, and two of them dropped `skills` — which made every
+	 * reference-bearing commit archive zero skills, a symptom that pointed at the skill
+	 * subsystem rather than at a reference write.
+	 *
+	 * Prefer `{ ...registry, oneMap: … }` over a field-by-field rebuild; spreads carry
+	 * maps they never name and are exempt from that test for exactly that reason.
+	 */
+	readonly skills?: Readonly<Record<string, SkillEntry>>;
 }
 
 // ─── Note types ─────────────────────────────────────────────────────────────
@@ -954,6 +1008,231 @@ export interface ReferenceCommitRef {
 	readonly jolliReferenceDocUrl?: string;
 	/** Server-side article ID for direct update on subsequent pushes of this reference. */
 	readonly jolliReferenceDocId?: number;
+}
+
+// ─── Skill usage types ──────────────────────────────────────────────────────
+
+/**
+ * Hosts whose on-disk transcript makes a skill invocation machine-identifiable.
+ *
+ * Deliberately NOT {@link SourceId}: that union is the *reference* source
+ * namespace (external systems reached through MCP), while this is the set of
+ * AI hosts we can read skill usage out of. Gemini, Antigravity, Cline and Devin
+ * are absent because they have no skill concept on disk at all — there is
+ * nothing to capture, as opposed to something we have not got round to.
+ */
+export type SkillSource = "claude" | "opencode" | "codex" | "cursor";
+
+/**
+ * How the agent entered the skill.
+ *
+ * `tool` — a `Skill` tool_use block (the agent decided to invoke it).
+ * `command` — a user-typed `/plugin:skill` slash command, which bypasses the
+ * `Skill` tool entirely and is only identifiable from the `<command-name>` tag
+ * block plus a following body record. There is no `SlashCommand` tool anywhere
+ * in the corpus, so an extractor keyed only on the tool misses this path.
+ */
+export type SkillEntryPath = "tool" | "command";
+
+/** One measured entry into a skill. */
+export interface SkillInvocation {
+	/** ISO 8601 — timestamp of the record that entered the skill. */
+	readonly at: string;
+	/** `Skill` tool `input.args` or `<command-args>`; frequently absent (the tag is optional AND can be present-but-empty). */
+	readonly args?: string;
+	/**
+	 * Length of the injected skill body, measured from the transcript's own body
+	 * record — NEVER re-derived from the `SKILL.md` on disk. Repeat invocations
+	 * inject a short "already loaded above" stub rather than the full text, and
+	 * bundled skills live under a temp path that no longer exists by the time a
+	 * post-commit hook runs, so disk is not a valid source for this number.
+	 */
+	readonly bodyChars?: number;
+	/** False for a failed invocation (the `is_error` tool results). */
+	readonly ok: boolean;
+}
+
+/**
+ * Tokens spent under a skill.
+ *
+ * `confidence` is user-visible, not an internal note: `attributed` means the
+ * host itself tagged each response with the owning skill, `estimated` means we
+ * inferred it from an interval between entry events. Sources that can do
+ * neither carry no `usage` at all — an absent field is honest, a zero is a lie.
+ */
+export interface SkillUsage {
+	readonly input: number;
+	readonly output: number;
+	readonly cached: number;
+	readonly confidence: "attributed" | "estimated";
+}
+
+/**
+ * SkillEntry — persisted registry row in the `plans.json.skills` map, keyed
+ * `<source>:<skill>`.
+ *
+ * Follows the Plan / Note lifecycle, not the Reference one: the row is GUARDED
+ * on commit (`commitHash` + `contentHashAtCommit` set) rather than deleted, so
+ * `detectActiveSkillsForBranch` can filter uncommitted rows by the same rule
+ * plans and notes already use.
+ *
+ * A skill entered five times is ONE row with `invocationCount: 5`, mirroring
+ * the accumulate-body precedent proven for the context7 and jollimemory
+ * reference sources.
+ */
+export interface SkillEntry {
+	readonly source: SkillSource;
+	/** Fully-qualified skill id as the host reports it, e.g. `superpowers:brainstorming`. */
+	readonly skill: string;
+	/** From `attributionPlugin` when the host supplies it, else the `<plugin>:` prefix of the id. Absent for unprefixed skills. */
+	readonly plugin?: string;
+	/** Distinct entry paths observed for this skill — a skill can be both agent-invoked and user-invoked. */
+	readonly entryPaths: ReadonlyArray<SkillEntryPath>;
+	/** Newest-first, capped at {@link SKILL_INVOCATION_CAP}. `invocationCount` stays exact when this is truncated. */
+	readonly invocations: ReadonlyArray<SkillInvocation>;
+	/** Total entries ever observed; may exceed `invocations.length`. */
+	readonly invocationCount: number;
+	readonly firstUsedAt: string;
+	readonly lastUsedAt: string;
+	/**
+	 * Total spend under this skill — the sum over {@link usageBySession}, computed at
+	 * write time so consumers do not each re-derive it.
+	 *
+	 * Absent when the source cannot attribute tokens at all (Codex / Cursor
+	 * heuristics). An absent field is honest; a zero would claim the skill was free.
+	 */
+	readonly usage?: SkillUsage;
+	/**
+	 * Per-session spend, keyed `<source>:<sessionId>`.
+	 *
+	 * This is the authoritative record, not a cache, for two reasons that a single
+	 * aggregate cannot serve:
+	 *
+	 *   - **Correct folding.** Capture runs once per transcript, so a skill used in
+	 *     several sessions is folded several times. Attribution recomputes a whole
+	 *     session from line 0 on every pass, so a session's contribution must
+	 *     REPLACE its prior entry — while a different session's must be added. One
+	 *     aggregate cannot distinguish those, and picking either rule alone gives an
+	 *     under-count or a double-count.
+	 *   - **Detach.** Committed conversation figures are corrected when a user
+	 *     detaches a conversation, using the per-session usage persisted at write
+	 *     time (see DetachedUsageSubtraction). Without the same split here, a skill's
+	 *     number goes stale the moment anything is detached.
+	 */
+	readonly usageBySession?: Readonly<Record<string, SkillUsage>>;
+	/**
+	 * Present only when the invocation was inferred rather than observed.
+	 *
+	 * Claude and OpenCode expose a real skill tool, so a capture from them IS the
+	 * act — nothing is inferred and this stays absent. Codex has no such tool: its
+	 * only signal is a shell command reading a `SKILL.md`, which cannot distinguish
+	 * an agent using a skill from a human reading the file, and cannot count entries
+	 * (one use is often several paged reads).
+	 *
+	 * Deliberately NOT folded into `SkillUsage.confidence`: that field qualifies a
+	 * token figure, and a heuristic source reports no tokens at all — there would be
+	 * nothing to hang it on. Detection quality and token quality are independent.
+	 */
+	readonly detection?: "heuristic";
+	/** Absolute path to `<jolliMemoryDir>/skills/<source>/<stem>.md`. */
+	readonly sourcePath: string;
+	/** Null until archived onto a commit — same guard shape as {@link PlanEntry}. */
+	readonly commitHash: string | null;
+	/** SHA-256 of the file at `sourcePath` when archived (archive guard). */
+	readonly contentHashAtCommit?: string;
+	/**
+	 * Counters as of the last archive. A skill is unlike a plan or a note: it can be
+	 * entered again after being frozen onto a commit, and the row keeps ACCUMULATING
+	 * (see {@link SkillEntry.invocationCount}). So the guard alone cannot answer
+	 * "what is uncommitted" — subtracting this snapshot can.
+	 *
+	 * Every consumer of "since the last commit" derives it as `current - archivedTotals`:
+	 * the ref written onto the next commit, and the sidebar's active-skill predicate.
+	 * That keeps the PR-wide aggregate a plain SUM across commits — each commit holds
+	 * its own increment, never a running total that would re-count earlier commits.
+	 *
+	 * Deliberately NOT solved by zeroing the row (or deleting the working file) at
+	 * archive time: the file at `sourcePath` is the ONLY dedup ledger. Discovery is
+	 * cursorless by design (see TranscriptSkillDiscovery) and re-emits invocations on
+	 * every pass, deduped by `at` against what is already on disk. Clearing it would
+	 * make a re-scan of an already-archived transcript read as fresh usage.
+	 *
+	 * Absent on rows written before this existed; treated as an all-zero baseline,
+	 * which makes the first archive after an upgrade carry the full history exactly
+	 * once.
+	 */
+	readonly archivedTotals?: SkillArchivedTotals;
+}
+
+/** Snapshot of a {@link SkillEntry}'s counters at its last archive. */
+export interface SkillArchivedTotals {
+	readonly invocationCount: number;
+	readonly usage?: SkillUsage;
+	readonly usageBySession?: Readonly<Record<string, SkillUsage>>;
+}
+
+/**
+ * SkillUse — ephemeral, in-memory shape a scanner produces for one skill within
+ * one scan pass. Already aggregated across repeat entries *inside* that pass;
+ * folding it against what is already on disk is `upsertSkillEntry`'s job.
+ *
+ * Stands to {@link SkillEntry} as {@link Reference} stands to {@link ReferenceEntry}.
+ */
+export interface SkillUse {
+	readonly source: SkillSource;
+	readonly skill: string;
+	readonly plugin?: string;
+	readonly entryPaths: ReadonlyArray<SkillEntryPath>;
+	/** Newest-first within this scan pass. */
+	readonly invocations: ReadonlyArray<SkillInvocation>;
+	readonly usage?: SkillUsage;
+	/** See {@link SkillEntry.detection}. */
+	readonly detection?: "heuristic";
+	/**
+	 * Which conversation this pass read, keyed `<source>:<sessionId>`.
+	 *
+	 * Required to fold `usage` correctly: the store replaces this session's prior
+	 * contribution and adds it to other sessions'. Absent only when the scanner
+	 * produced no usage at all, where there is nothing to attribute to a session.
+	 */
+	readonly sessionKey?: string;
+}
+
+/**
+ * SkillCommitRef — snapshot stored in `CommitSummary.skills`. Every field other
+ * than `archivedKey` is a value-snapshot at archive time, holding this commit's
+ * INCREMENT rather than the row's running total (see `SkillEntry.archivedTotals`).
+ */
+export interface SkillCommitRef {
+	/**
+	 * `<mapKey>-<shortHash>`: the `plans.json.skills` key plus the archiving commit's
+	 * short hash. NOT itself a key into that map — the registry row keeps the bare
+	 * `<source>:<skill>` mapKey, so consumers `splitArchivedKey` this to recover it
+	 * (that is how `associateSkillWithCommit` migrates a guard after squash/rebase).
+	 * It does name the orphan-branch file, via `skillOrphanPath`.
+	 */
+	readonly archivedKey: string;
+	readonly source: SkillSource;
+	readonly skill: string;
+	readonly plugin?: string;
+	readonly entryPaths: ReadonlyArray<SkillEntryPath>;
+	readonly invocationCount: number;
+	readonly firstUsedAt: string;
+	readonly lastUsedAt: string;
+	/** Total across every contributing session — the sum over {@link usageBySession}. */
+	readonly usage?: SkillUsage;
+	/**
+	 * Per-session spend keyed `<source>:<sessionId>`, snapshotted at archive time.
+	 *
+	 * Carried onto the commit, not left behind in the working registry, because
+	 * detach happens AFTER the commit: correcting a committed skill's figures needs
+	 * the split to still be reachable from the summary. Without it the only options
+	 * would be to leave a stale number or to invent a subtrahend, and the
+	 * commit-level path already rejected both.
+	 */
+	readonly usageBySession?: Readonly<Record<string, SkillUsage>>;
+	/** See {@link SkillEntry.detection}. */
+	readonly detection?: "heuristic";
 }
 
 // ─── Knowledge Compilation types ────────────────────────────────────────────

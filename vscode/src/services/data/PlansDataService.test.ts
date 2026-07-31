@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { NoteInfo, PlanInfo, ReferenceInfo } from "../../Types.js";
+import type { NoteInfo, PlanInfo, ReferenceInfo, SkillInfo } from "../../Types.js";
 import { PlansDataService } from "./PlansDataService.js";
 
 function makePlan(lastModified: string, slug = "plan"): PlanInfo {
@@ -240,5 +240,96 @@ describe("PlansDataService.mergeByLastModified — three-way merge", () => {
 			"notion:abc123def456",
 			"linear:PROJ-1",
 		]);
+	});
+});
+
+describe("PlansDataService — skills", () => {
+	const skill = (over: Partial<SkillInfo> = {}): SkillInfo => ({
+		kind: "skill",
+		mapKey: "claude:superpowers:brainstorming",
+		source: "claude",
+		skill: "superpowers:brainstorming",
+		entryPaths: ["tool"],
+		invocationCount: 2,
+		firstUsedAt: "2026-07-30T06:00:00.000Z",
+		lastUsedAt: "2026-07-30T07:00:00.000Z",
+		sourcePath: "/tmp/s.md",
+		lastModified: "2026-07-30T07:00:00.000Z",
+		...over,
+	});
+
+	it("collapses every skill into ONE entry carrying them all", () => {
+		// The Context list gets one aggregate row, not one row per skill — a session
+		// routinely enters a dozen and they would crowd out the plans / notes /
+		// references the work is actually about.
+		const merged = PlansDataService.mergeByLastModified(
+			[],
+			[],
+			[],
+			[
+				skill({ lastModified: "2026-07-30T09:00:00.000Z" }),
+				skill({ mapKey: "claude:other", lastModified: "2026-07-30T05:00:00.000Z" }),
+			],
+		);
+		expect(merged).toHaveLength(1);
+		expect(merged[0].kind).toBe("skills");
+		expect(merged[0].kind === "skills" ? merged[0].skills.map((s) => s.mapKey) : []).toEqual([
+			"claude:superpowers:brainstorming",
+			"claude:other",
+		]);
+	});
+
+	it("emits NO entry when nothing was captured", () => {
+		// An empty group must not produce a row that says "0 skills".
+		expect(PlansDataService.mergeByLastModified([], [], [], [])).toHaveLength(0);
+	});
+
+	it("sorts the group by its NEWEST member, not its first", () => {
+		// The group's timestamp is a reduction over members: a skill entered just now
+		// pulls the row above an artifact touched an hour ago, even when an older
+		// member happens to sit first in registry order. Reading [0] instead would
+		// sink the row on stale data — hence a plan between the two timestamps.
+		const merged = PlansDataService.mergeByLastModified(
+			[makePlan("2026-07-30T12:00:00.000Z", "mid")],
+			[],
+			[],
+			[
+				skill({ mapKey: "claude:old", lastModified: "2026-07-30T01:00:00.000Z" }),
+				skill({ mapKey: "claude:new", lastModified: "2026-07-30T23:00:00.000Z" }),
+			],
+		);
+		expect(merged.map((m) => m.kind)).toEqual(["skills", "plan"]);
+	});
+
+	it("ranks the skills group after a reference on an exact timestamp tie", () => {
+		// Skills are metadata about HOW the work happened; the artifacts it was about
+		// come first. A shared rank would make the order depend on insertion.
+		const at = "2026-07-30T09:00:00.000Z";
+		const merged = PlansDataService.mergeByLastModified(
+			[],
+			[],
+			[
+				{
+					kind: "reference",
+					source: "linear",
+					nativeId: "ENG-1",
+					mapKey: "linear:ENG-1",
+					title: "Fix",
+					url: "https://l/ENG-1",
+					sourcePath: "/tmp/r.md",
+					addedAt: at,
+					updatedAt: at,
+					lastModified: at,
+					sourceToolName: "mcp__linear__get_issue",
+				},
+			],
+			[skill({ lastModified: at })],
+		);
+		expect(merged.map((m) => m.kind)).toEqual(["reference", "skills"]);
+	});
+
+	it("is not empty when only skills were captured", () => {
+		expect(PlansDataService.isEmpty([], [], [], [skill()])).toBe(false);
+		expect(PlansDataService.isEmpty([], [], [], [])).toBe(true);
 	});
 });

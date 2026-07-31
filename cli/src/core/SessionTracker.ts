@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { createLogger, getJolliMemoryDir } from "../Logger.js";
 import {
 	type CursorsRegistry,
+	type DiscoveryExtractor,
 	type GitOperation,
 	isIngestOperation,
 	type JolliMemoryConfig,
@@ -29,6 +30,8 @@ import {
 	type ReferenceEntry,
 	type SessionInfo,
 	type SessionsRegistry,
+	type SkillEntry,
+	type SkillUse,
 	type SourceId,
 	type SquashPendingState,
 	type TranscriptCursor,
@@ -36,6 +39,8 @@ import {
 import { atomicWriteFile as atomicWrite } from "./AtomicWrite.js";
 import { withPlansLock } from "./Locks.js";
 import { writeReferenceMarkdown } from "./references/ReferenceStore.js";
+import { archivedTotalsOf, isLegacyArchived, uncommittedDelta } from "./skills/SkillDelta.js";
+import { writeSkillMarkdown } from "./skills/SkillStore.js";
 
 const log = createLogger("SessionTracker");
 
@@ -224,7 +229,18 @@ export async function saveCursor(cursor: TranscriptCursor, cwd?: string): Promis
  */
 export async function saveDiscoveryCursor(cursor: TranscriptCursor, cwd?: string): Promise<void> {
 	const dir = await ensureJolliMemoryDir(cwd);
-	await upsertCursorInFile(cursor, dir, DISCOVERY_CURSORS_FILE);
+	// Carry forward any per-extractor marks the incoming cursor does not name. This
+	// upsert replaces the whole cursor object, and callers on the shared-cursor path
+	// build a bare {path, lineNumber, updatedAt} — so without this merge every
+	// extractor's high-water mark would be erased on each advance of the shared
+	// cursor, and the marks would never survive long enough to do their job.
+	// (An OLDER dist writing this file still erases them; that is unavoidable and is
+	// why a missing mark reads as a full rewind rather than as the shared number.)
+	const registry = await loadCursorsRegistry(dir, DISCOVERY_CURSORS_FILE);
+	const priorMarks = registry.cursors[cursor.transcriptPath]?.extractors;
+	const merged: TranscriptCursor =
+		cursor.extractors === undefined && priorMarks !== undefined ? { ...cursor, extractors: priorMarks } : cursor;
+	await upsertCursorInFile(merged, dir, DISCOVERY_CURSORS_FILE);
 }
 
 /**
@@ -245,6 +261,100 @@ export async function loadDiscoveryCursor(transcriptPath: string, cwd?: string):
 	const dir = getJolliMemoryDir(cwd);
 	const registry = await loadCursorsRegistry(dir, DISCOVERY_CURSORS_FILE);
 	return registry.cursors[transcriptPath] ?? null;
+}
+
+/**
+ * Extractors that existed before per-extractor marks did, and are therefore
+ * covered by a legacy bare `lineNumber`.
+ *
+ * A legacy cursor's single number means "plans and references are both scanned
+ * this far" — that was the only pair sharing the file. Crediting it to them is
+ * what keeps this change from re-scanning every transcript in the corpus on
+ * upgrade. It must NEVER be extended to an extractor added later: that is exactly
+ * the stranding this mechanism exists to prevent, since the dist that wrote the
+ * legacy number could not have run the newer extractor.
+ */
+const LEGACY_COVERED_EXTRACTORS: ReadonlyArray<DiscoveryExtractor> = ["plans", "references"];
+
+/**
+ * Resolve a cursor's per-extractor marks, seeding legacy records.
+ *
+ * Returns marks for every extractor the record can account for. An extractor
+ * absent from the result has never run against this transcript and must resume
+ * from line 0.
+ */
+function effectiveExtractorMarks(cursor: TranscriptCursor | null): Partial<Record<DiscoveryExtractor, number>> {
+	if (cursor === null) return {};
+	if (cursor.extractors !== undefined) return { ...cursor.extractors };
+	const seeded: Partial<Record<DiscoveryExtractor, number>> = {};
+	for (const extractor of LEGACY_COVERED_EXTRACTORS) seeded[extractor] = cursor.lineNumber;
+	return seeded;
+}
+
+/**
+ * Line to resume `extractor` from for `transcriptPath`.
+ *
+ * Zero means "scan from the top", which is the correct answer both for a
+ * transcript never seen and for an extractor that has never run here — including
+ * when a bare `lineNumber` written by an older dist claims progress the extractor
+ * never actually made.
+ */
+export async function loadExtractorCursorLine(
+	transcriptPath: string,
+	extractor: DiscoveryExtractor,
+	cwd?: string,
+): Promise<number> {
+	const cursor = await loadDiscoveryCursor(transcriptPath, cwd);
+	return effectiveExtractorMarks(cursor)[extractor] ?? 0;
+}
+
+/**
+ * Advance `extractor`'s high-water mark for `transcriptPath`.
+ *
+ * Two invariants, both load-bearing:
+ *
+ *   - **Monotonic per extractor.** A mark never moves backwards, so a retry after
+ *     a partially-failed scan resumes where the last successful pass ended and a
+ *     late-arriving stale value cannot undo real progress.
+ *   - **The shared `lineNumber` tracks the SLOWEST extractor.** That field remains
+ *     the contract for dists that only understand it. `min()` makes such a dist
+ *     re-read lines some extractor already handled — harmless, every extractor is
+ *     idempotent — whereas `max()` would have it skip lines no extractor reached,
+ *     which is silent data loss. Same reasoning as `migrateDiscoveryCursors`.
+ */
+export async function saveExtractorCursor(
+	transcriptPath: string,
+	extractor: DiscoveryExtractor,
+	lineNumber: number,
+	cwd?: string,
+): Promise<void> {
+	const dir = await ensureJolliMemoryDir(cwd);
+	const registry = await loadCursorsRegistry(dir, DISCOVERY_CURSORS_FILE);
+	const existing = registry.cursors[transcriptPath] ?? null;
+
+	const marks = effectiveExtractorMarks(existing);
+	marks[extractor] = Math.max(marks[extractor] ?? 0, lineNumber);
+
+	// The shared field must not overtake an extractor that has no mark yet. Its floor
+	// is whatever the record already claimed (legacy seeding covers a bare
+	// lineNumber), or 0 when there is no record at all — a brand-new cursor cannot
+	// assert that the OTHER extractors have made progress, and claiming they have
+	// makes a dist reading only this field skip lines nobody processed. That is
+	// exactly the straddling-fetch protection the Codex discovery path relies on.
+	const legacyFloor = existing?.lineNumber ?? 0;
+	const values = [...LEGACY_COVERED_EXTRACTORS.map((e) => marks[e] ?? legacyFloor), marks[extractor] ?? lineNumber];
+	const next: TranscriptCursor = {
+		transcriptPath,
+		lineNumber: Math.min(...values),
+		updatedAt: new Date().toISOString(),
+		...(existing?.anchorId !== undefined ? { anchorId: existing.anchorId } : {}),
+		extractors: marks,
+	};
+	await writeCursorsRegistry(
+		{ version: 1, cursors: { ...registry.cursors, [transcriptPath]: next } },
+		dir,
+		DISCOVERY_CURSORS_FILE,
+	);
 }
 
 /**
@@ -1113,6 +1223,13 @@ export function normalizePlansRegistry(raw: Partial<PlansRegistry>): { registry:
 		plans,
 		...(notes !== undefined ? { notes } : {}),
 		...(references !== undefined ? { references } : {}),
+		// Passed through untouched, deliberately: skills are a post-legacy artifact
+		// type, so there are no dead fields to strip and no `ignored` rows to purge.
+		// They follow the plan/note lifecycle, so guarded (`commitHash` +
+		// `contentHashAtCommit`) rows MUST survive — the reference branch above drops
+		// those, and copying that here would delete every archive guard on load.
+		// NB this rebuild is field-by-field: omitting a map erases it on every load.
+		...(raw.skills !== undefined ? { skills: raw.skills } : {}),
 	};
 	return { registry, changed };
 }
@@ -1254,6 +1371,65 @@ export async function associateNoteWithCommit(noteId: string, commitHash: string
 }
 
 /**
+ * Updates the commitHash for a skill entry in the registry (used after squash/rebase).
+ *
+ * Same guard-entry migration semantics as {@link associatePlanWithCommit} — see that
+ * function's doc-comment for the rationale. `archivedKey` is the pointer stored on
+ * `CommitSummary.skills`, `<mapKey>-<oldShortHash>`, so splitting it yields the
+ * registry key directly.
+ *
+ * `archivedTotals` is preserved alongside `contentHashAtCommit`: it records how much
+ * of the row a commit already claimed, and a rewrite of commit metadata does not
+ * un-claim any of it. Dropping it here would make the row's whole history look
+ * uncommitted again and republish it onto the next commit.
+ */
+export async function associateSkillWithCommit(
+	archivedKey: string,
+	commitHash: string,
+	cwd?: string,
+	/**
+	 * Hashes this rewrite is collapsing. A guard sitting on any of them must move,
+	 * even when `archivedKey`'s own embedded hash no longer matches it.
+	 *
+	 * Needed because a hoisted ref keeps the archivedKey of the commit that ORIGINALLY
+	 * archived it, while the guard has since been migrated. Matching the embedded hash
+	 * alone therefore worked once and then silently stopped, stranding the row on a
+	 * commit that no longer existed — where nothing could ever archive it again.
+	 */
+	collapsedHashes?: ReadonlyArray<string>,
+): Promise<void> {
+	const split = splitArchivedKey(archivedKey);
+	if (!split) {
+		log.debug("associateSkillWithCommit: %s is not an archived key, skipping", archivedKey);
+		return;
+	}
+	await withPlansLock(cwd, async () => {
+		const registry = await loadPlansRegistry(cwd);
+		const skills = registry.skills;
+		const guard = skills?.[split.baseKey];
+		const at = guard?.commitHash;
+		const anchored =
+			at !== undefined &&
+			at !== null &&
+			(at.startsWith(split.oldShortHash) ||
+				(collapsedHashes ?? []).some((h) => h.startsWith(at) || at.startsWith(h)));
+		if (!guard?.contentHashAtCommit || !anchored) {
+			log.debug("associateSkillWithCommit: no matching guard for %s, skipping", archivedKey);
+			return;
+		}
+		const updated: PlansRegistry = {
+			...registry,
+			skills: {
+				...(skills as NonNullable<PlansRegistry["skills"]>),
+				[split.baseKey]: { ...guard, commitHash },
+			},
+		};
+		await savePlansRegistry(updated, cwd);
+		log.info("associateSkillWithCommit: migrated guard %s → %s", split.baseKey, commitHash.substring(0, 8));
+	});
+}
+
+/**
  * Loads a single plan entry from the registry by slug.
  * Returns null if not found.
  */
@@ -1376,9 +1552,99 @@ export async function upsertReferenceEntry(ref: Reference, cwd: string): Promise
 			plans: freshRegistry.plans,
 			...(freshRegistry.notes !== undefined ? { notes: freshRegistry.notes } : {}),
 			references,
+			// Carried explicitly because this object is rebuilt field-by-field rather
+			// than spread. A map omitted here is silently erased by any reference
+			// write, with nothing failing to compile — the field is optional.
+			...(freshRegistry.skills !== undefined ? { skills: freshRegistry.skills } : {}),
 		};
 		await savePlansRegistry(out, cwd);
 		log.info("upsertReferenceEntry: %s (%s)", mapKey, existing === undefined ? "new" : "updated");
+	});
+}
+
+// ─── Skill usage registry helpers ───────────────────────────────────────────
+
+/** Read `skills` from the registry, defaulting to an empty map when absent. */
+function skillsOf(reg: PlansRegistry): Readonly<Record<string, SkillEntry>> {
+	return reg.skills ?? {};
+}
+
+/**
+ * Upsert a skill usage row into plans.json.skills, keyed `<source>:<skill>`.
+ *
+ * A skill entered N times is ONE row: {@link writeSkillMarkdown} folds this pass
+ * into the file already on disk and returns the authoritative post-fold counters,
+ * which this function copies onto the row. The row is an index over that file —
+ * it never carries history the file does not.
+ *
+ * Skills follow the plan/note lifecycle: a committed row is GUARDED
+ * (`commitHash` + `contentHashAtCommit` set), not deleted, so `commitHash: null`
+ * is preserved on update and only archival sets it.
+ *
+ * The markdown write is inside `withPlansLock` for the same reason
+ * `writeReferenceMarkdown` is: it is a read-modify-write, so two unsynchronized
+ * writers each fold into the same pre-merge body and the later one drops the
+ * earlier one's invocations. Reachable in practice — the Claude Stop hook and the
+ * hookless discovery tick can both be capturing for one project at once.
+ */
+export async function upsertSkillEntry(use: SkillUse, cwd: string): Promise<void> {
+	const mapKey = `${use.source}:${use.skill}`;
+
+	await withPlansLock(cwd, async () => {
+		const folded = await writeSkillMarkdown(use, cwd);
+		const beforeRegistry = await loadPlansRegistry(cwd);
+		const existing = skillsOf(beforeRegistry)[mapKey];
+
+		const next: SkillEntry = {
+			source: use.source,
+			skill: use.skill,
+			...(use.plugin !== undefined || existing?.plugin !== undefined
+				? { plugin: use.plugin ?? existing?.plugin }
+				: {}),
+			entryPaths: folded.entryPaths,
+			invocations: folded.invocations,
+			invocationCount: folded.invocationCount,
+			firstUsedAt: folded.firstUsedAt,
+			lastUsedAt: folded.lastUsedAt,
+			// From the FOLD, not from `use`: the incoming value covers ONE session, while
+			// the row must carry the total across every session that used this skill.
+			// Reading `use.usage` here was an under-count — the last session scanned won.
+			...(folded.usage !== undefined ? { usage: folded.usage } : {}),
+			...(folded.usageBySession !== undefined ? { usageBySession: folded.usageBySession } : {}),
+			...(folded.detection !== undefined ? { detection: folded.detection } : {}),
+			sourcePath: folded.sourcePath,
+			// Never resurrect a guard: archival owns these three fields. What makes the
+			// row uncommitted again is the counters above growing past `archivedTotals`,
+			// not the guard being cleared — see uncommittedDelta.
+			commitHash: existing?.commitHash ?? null,
+			...(existing?.contentHashAtCommit !== undefined
+				? { contentHashAtCommit: existing.contentHashAtCommit }
+				: {}),
+			// Seed a baseline for a row guarded by a version that predates the field: the
+			// counters BEFORE this fold are exactly what that archive froze. Without this
+			// the row would keep reading as fully committed forever (uncommittedDelta's
+			// legacy rule), which is the bug the baseline exists to fix.
+			...(existing?.archivedTotals !== undefined
+				? { archivedTotals: existing.archivedTotals }
+				: existing !== undefined && isLegacyArchived(existing)
+					? { archivedTotals: archivedTotalsOf(existing) }
+					: {}),
+		};
+
+		// Near-write reread — only overwrites our own mapKey, so a concurrent writer
+		// touching other mapKeys between our two loads is preserved.
+		const freshRegistry = await loadPlansRegistry(cwd);
+		const out: PlansRegistry = {
+			...freshRegistry,
+			skills: { ...skillsOf(freshRegistry), [mapKey]: next },
+		};
+		await savePlansRegistry(out, cwd);
+		log.info(
+			"upsertSkillEntry: %s (%s, ×%d)",
+			mapKey,
+			existing === undefined ? "new" : "updated",
+			next.invocationCount,
+		);
 	});
 }
 
@@ -1391,6 +1657,24 @@ export async function detectActivePlansForBranch(cwd: string, _branch: string): 
 	for (const entry of Object.values(registry.plans)) {
 		if (entry.commitHash !== null) continue;
 		if (entry.contentHashAtCommit !== undefined) continue;
+		entries.push(entry);
+	}
+	return entries;
+}
+
+/**
+ * Active skills in the current worktree — those with usage no commit has claimed.
+ *
+ * Deliberately NOT the guard predicate plans and notes use. A plan is archived once
+ * and finished, so "has a commitHash" answers it; a skill can be entered again after
+ * being archived, and its row keeps accumulating. Gating on the guard therefore hid
+ * a re-used skill from this group forever after its first commit.
+ */
+export async function detectActiveSkillsForBranch(cwd: string, _branch: string): Promise<ReadonlyArray<SkillEntry>> {
+	const registry = await loadPlansRegistry(cwd);
+	const entries: SkillEntry[] = [];
+	for (const entry of Object.values(registry.skills ?? {})) {
+		if (uncommittedDelta(entry) === undefined) continue;
 		entries.push(entry);
 	}
 	return entries;

@@ -242,4 +242,73 @@ class TypesTest {
             out shouldNotContain "knowledgeBasePath"
         }
     }
+
+    /**
+     * Gson drops every JSON member the target data class does not declare, and this
+     * plugin does not only READ these payloads — `SummaryTree.updateTopicInTree` sends a
+     * whole re-serialised `CommitSummary` back to the CLI, and `PlansPanel` does
+     * load → `copy()` → `savePlansRegistry` (which the `plans-save` bridge action writes
+     * verbatim, with no field-wise merge on the CLI side).
+     *
+     * So an undeclared field is not a missing feature, it is silent data loss on the next
+     * edit: one topic edit would erase a commit's archived skills, and deleting one plan
+     * would erase the project's whole captured skill history. These round-trips are the
+     * regression guard for that.
+     */
+    @Nested
+    inner class GsonRoundTrip {
+        private val gson = com.google.gson.Gson()
+
+        @Test
+        fun `CommitSummary preserves skills through a serialise-deserialise cycle`() {
+            val json = """
+                {"version":5,"commitHash":"abc123","commitMessage":"m","commitAuthor":"a",
+                 "commitDate":"2026-07-31T00:00:00Z","branch":"main","generatedAt":"2026-07-31T00:00:00Z",
+                 "skills":[{"archivedKey":"claude:superpowers:brainstorming-abc12345",
+                 "source":"claude","skill":"superpowers:brainstorming","plugin":"superpowers",
+                 "entryPaths":["tool"],"invocationCount":3,"firstUsedAt":"2026-07-31T09:00:00Z",
+                 "lastUsedAt":"2026-07-31T09:30:00Z",
+                 "usage":{"input":79,"output":33944,"cached":59796,"confidence":"attributed"},
+                 "usageBySession":{"claude:sess1":{"input":79,"output":33944,"cached":59796,"confidence":"attributed"}},
+                 "detection":"heuristic"}]}
+            """.trimIndent()
+
+            val parsed = gson.fromJson(json, CommitSummary::class.java)
+            val skill = parsed.skills?.single()
+            skill?.skill shouldBe "superpowers:brainstorming"
+            skill?.invocationCount shouldBe 3
+            skill?.usage?.cached shouldBe 59796
+            skill?.usage?.confidence shouldBe "attributed"
+            skill?.usageBySession?.get("claude:sess1")?.output shouldBe 33944
+            skill?.detection shouldBe "heuristic"
+
+            // The half that actually regressed: what we would WRITE BACK.
+            val reparsed = gson.fromJson(gson.toJson(parsed), CommitSummary::class.java)
+            reparsed.skills shouldBe parsed.skills
+        }
+
+        @Test
+        fun `PlansRegistry preserves the skills map through a copy and re-serialise`() {
+            val json = """
+                {"version":1,"plans":{},
+                 "skills":{"claude:superpowers:brainstorming":{"source":"claude",
+                 "skill":"superpowers:brainstorming","entryPaths":["tool","command"],
+                 "invocations":[{"at":"2026-07-31T09:00:00Z","args":"x","bodyChars":120,"ok":true}],
+                 "invocationCount":3,"firstUsedAt":"2026-07-31T09:00:00Z","lastUsedAt":"2026-07-31T09:30:00Z",
+                 "sourcePath":"/p/.jolli/jollimemory/skills/claude/s.md","commitHash":null,
+                 "archivedTotals":{"invocationCount":2}}}}
+            """.trimIndent()
+
+            val parsed = gson.fromJson(json, PlansRegistry::class.java)
+            val entry = parsed.skills?.get("claude:superpowers:brainstorming")
+            entry?.invocationCount shouldBe 3
+            entry?.commitHash shouldBe null
+            entry?.invocations?.single()?.bodyChars shouldBe 120
+            entry?.archivedTotals?.invocationCount shouldBe 2
+
+            // Mirrors PlansPanel: mutate one map, save the whole registry.
+            val mutated = parsed.copy(plans = emptyMap())
+            gson.fromJson(gson.toJson(mutated), PlansRegistry::class.java).skills shouldBe parsed.skills
+        }
+    }
 }

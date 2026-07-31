@@ -238,6 +238,9 @@ type WebviewMessage =
 	| { command: "loadNoteContent"; id: string; format: string }
 	| { command: "saveNote"; id: string; content: string; format: string }
 	| { command: "previewNote"; id: string; title: string }
+	// The aggregate Context row: opens this commit's whole skills--<hash8>.md
+	// table. Keyed by commit hash because the row stands for a set, not an artifact.
+	| { command: "previewCommittedSkills"; commitHash: string }
 	| { command: "translateNote"; id: string }
 	| { command: "removeNote"; id: string; title: string }
 	| {
@@ -362,6 +365,10 @@ const FOREIGN_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set([
 	"openConversation",
 	"previewPlan",
 	"previewNote",
+	// Renders the skills table from the summary already read by
+	// getSummaryAnyRepoWithSource, which resolves a foreign hash to its owning
+	// repo — no workspace storage is touched, so it is safe in view-only mode.
+	"previewCommittedSkills",
 	// Reference previews / open-in-browser are read-only against the foreign
 	// repo's storage. The destructive reference actions (loadReferenceContent /
 	// saveReferenceEdit / removeReference / translateReference) are NOT here because
@@ -429,6 +436,9 @@ const REGENERATE_SAFE_COMMANDS: ReadonlySet<WebviewMessage["command"]> = new Set
 	"loadNoteContent",
 	"previewPlan",
 	"previewNote",
+	// Pure read of the stored summary — cannot race the in-flight regenerate's
+	// storeSummary the way savePlan would.
+	"previewCommittedSkills",
 	// Reference previews & open-in-browser are read-only — safe to keep
 	// reachable while regenerate is in flight. Write-side reference actions
 	// (loadReferenceContent / saveReferenceEdit / removeReference / translateReference)
@@ -925,6 +935,15 @@ export class SummaryWebviewPanel {
 					message.title,
 					this.foreignRepoName,
 					this.foreignRepoUrl,
+				);
+				break;
+			case "previewCommittedSkills":
+				// No foreign-provenance args: getSummaryAnyRepoWithSource inside the
+				// command already resolves which repo owns the hash, unlike the
+				// plan/note previews whose storage has to be selected up front.
+				void vscode.commands.executeCommand(
+					"jollimemory.previewCommittedSkills",
+					message.commitHash,
 				);
 				break;
 			case "translateNote":
@@ -1516,6 +1535,10 @@ export class SummaryWebviewPanel {
 				// without this the tier chips + inlined excluded rows would vanish
 				// after any plan/note/reference mutation re-render.
 				{ refs: summary.contextRelevance, excluded: summary.excludedContext },
+				// Same reason: this section replace rewrites every row, so omitting
+				// skills here would make the aggregate row disappear after any
+				// unrelated plan/note/reference mutation.
+				{ refs: summary.skills ?? [], commitHash: summary.commitHash },
 			),
 			// The visible "CONTEXT N" chip lives in #contextPanel's panel-header
 			// (buildContextPanel), OUTSIDE the #plansAndNotesSection HTML above —
@@ -4212,7 +4235,16 @@ export class SummaryWebviewPanel {
 			);
 			removedUsage.set(
 				commitHash,
-				dropped.map((s) => ({ usage: s.usage, usageByModel: s.usageByModel })),
+				// `sessionKey` is what lets per-skill figures be corrected too: a skill's
+				// usage is stored as an explicit per-session split, so the detached
+				// session's contribution can be removed exactly rather than estimated.
+				// Built from the detach request's own source + sessionId, which is the same
+				// key shape the split was written under at capture time.
+				dropped.map((s) => ({
+					usage: s.usage,
+					usageByModel: s.usageByModel,
+					sessionKey: `${s.source ?? "claude"}:${s.sessionId}`,
+				})),
 			);
 			if (kept.length === 0) {
 				deletes.push(commitHash);

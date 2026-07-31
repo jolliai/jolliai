@@ -10,6 +10,7 @@ import type { CommitSummary, E2eTestScenario, ReferenceCommitRef, SourceId } fro
 import { escMdLinkText, escMdStrikeText, escMdUrl } from "./MarkdownEscape.js";
 import { referenceDisplayTitle } from "./references/ReferenceDisplay.js";
 import { getRegistry } from "./references/SourceDefinitionRegistry.js";
+import { buildSkillsSummaryLabel } from "./SkillsAggregateMarkdown.js";
 import {
 	collectSortedTopics,
 	formatDate,
@@ -210,7 +211,14 @@ export function pushPlansAndNotesSection(
 			relevanceMap.set(`${r.kind}:${r.key}`, { tier: r.tier, reason: r.reason });
 		}
 	}
-	const totalCount = plans.length + notes.length + references.length;
+	// Skills always render — they are not gated by `includeReferences`, which exists
+	// to keep PR bodies free of external-tracker rows. A skill has no external
+	// destination and no relevance verdict, so neither concern applies.
+	const skills = summary.skills ?? [];
+	// Skills contribute ONE to the count, however many were captured: they render as
+	// a single aggregate row here, exactly as they do in every Context surface in the
+	// UI. The per-skill breakdown lives in the commit's `skills--<hash8>.md`.
+	const totalCount = plans.length + notes.length + references.length + (skills.length > 0 ? 1 : 0);
 	if (totalCount === 0 && excluded.length === 0) {
 		return;
 	}
@@ -242,6 +250,24 @@ export function pushPlansAndNotesSection(
 		const target = e.jolliReferenceDocUrl ?? e.url;
 		const suffix = relevanceSuffix(lookupRelevance(relevanceMap, "reference", `${e.source}:${e.nativeId}`));
 		lines.push((target ? `- [${label}](${escMdUrl(target)})` : `- ${label}`) + suffix);
+	}
+
+	// Skills last among the kept rows: they describe HOW the work happened, while the
+	// plans / notes / references above are what it was about. Never linked — a skill
+	// invocation is a local act with no external destination to open, unlike every
+	// other row here. No relevance suffix either: skills are never fed to the
+	// relevance ranker, so a verdict for one cannot exist.
+	//
+	// ONE aggregate row, not one per skill. A session routinely enters a dozen
+	// skills, which would bury the plans and notes this section exists to list; the
+	// per-skill figures are in the commit's `skills--<hash8>.md`. Every Context
+	// surface in the UI collapses them the same way, and this Markdown is what those
+	// panels export.
+	if (skills.length > 0) {
+		// "inferred" is stated on the row, not in a footnote: this section is read
+		// inline and a marker the reader has to look up would be missed.
+		const inferred = skills.some((s) => s.detection === "heuristic") ? " · some inferred" : "";
+		lines.push(`- Skills used — ${escMdLinkText(buildSkillsSummaryLabel(skills))}${inferred}`);
 	}
 
 	// AI-excluded items, inlined read-only after the kept rows: struck-through

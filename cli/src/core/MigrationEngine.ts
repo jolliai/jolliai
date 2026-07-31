@@ -14,7 +14,7 @@
 
 import { createLogger, errMsg, isManuallyDisabled } from "../Logger.js";
 import type { CommitSummary, SummaryIndex } from "../Types.js";
-import type { MigrationState } from "./KBTypes.js";
+import type { ManifestEntry, MigrationState } from "./KBTypes.js";
 import type { MetadataManager } from "./MetadataManager.js";
 import { cleanupAllBranchesStaleChildMarkdown } from "./StaleChildMarkdownCleanup.js";
 import type { StorageProvider } from "./StorageProvider.js";
@@ -372,16 +372,14 @@ export class MigrationEngine {
 
 	// ── Internal migration methods ─────────────────────────────────────────
 
-	private async backfillTitle(
-		commitHash: string,
-		existing: {
-			fileId: string;
-			path: string;
-			type: "commit" | "plan" | "note" | "wiki";
-			fingerprint: string;
-			source: { commitHash?: string; branch?: string; generatedAt?: string };
-		},
-	): Promise<void> {
+	/**
+	 * `existing` is a {@link ManifestEntry}, not a structural copy of one. It used to
+	 * be spelled out inline, which meant the manifest's `type` union was declared in
+	 * two places and adding a member to it broke this signature — the caller passes a
+	 * real entry straight through to `updateManifest`, so there was never a reason for
+	 * the shape to be restated.
+	 */
+	private async backfillTitle(commitHash: string, existing: ManifestEntry): Promise<void> {
 		const json = await this.orphanStorage.readFile(`summaries/${commitHash}.json`);
 		if (!json) return;
 		try {

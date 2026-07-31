@@ -20,7 +20,13 @@ export interface ManifestEntry {
 	 * entries are automatically excluded from "user-written" classification
 	 * the moment they land here.
 	 */
-	readonly type: "commit" | "plan" | "note" | "wiki";
+	/**
+	 * `"skill"` is `<branchFolder>/skills--<hash8>.md`, the per-commit skill-usage
+	 * aggregate. Registered like any other generated file so stale-cleanup can reach
+	 * it, and so MemoryBankScanner keeps classifying it as generated rather than
+	 * user-written. Its lifecycle is the summary's, not its own — see FolderStorage.
+	 */
+	readonly type: "commit" | "plan" | "note" | "wiki" | "skill";
 	readonly fingerprint: string;
 	readonly source: ManifestSource;
 	readonly title?: string; // human-readable display name

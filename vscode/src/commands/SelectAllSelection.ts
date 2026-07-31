@@ -11,8 +11,9 @@
  * `PlansTreeProvider.serialize()` returns `SerializedTreeItem[]` where the
  * `contextValue` field is `"plan"`, `"note"`, or `"reference"` (set by the
  * corresponding Item constructor in PlansTreeProvider). The `id` field carries
- * the raw plan slug (for plans), note id (for notes), or reference mapKey
- * `<source>:<nativeId>` (for references) — no prefix. We switch on
+ * the raw plan slug (for plans), note id (for notes), reference mapKey
+ * `<source>:<nativeId>` (for references), or skill mapKey `<source>:<skill>` (for
+ * skills) — no prefix. We switch on
  * `contextValue` to split the three groups. This is
  * **Option B-variant (contextValue)**: the discriminator already existed on
  * SerializedTreeItem; no schema changes were needed.
@@ -30,7 +31,7 @@ export interface SelectAllCtx {
 	readonly activeSessions: Pick<ActiveSessionsProvider, "listWithDiagnostics">;
 	readonly plansProvider: Pick<
 		PlansTreeProvider,
-		"serialize" | "refreshExclusions"
+		"serialize" | "refreshExclusions" | "skillMapKeys"
 	>;
 	readonly onChanged: () => Promise<void> | void;
 }
@@ -70,7 +71,7 @@ export async function selectAllConversationsCommand(
 }
 
 /**
- * Flip selection state for all visible plans, notes AND references in one shot.
+ * Flip selection state for all visible plans, notes, references AND skills in one shot.
  * The "all selected" check spans all three groups together (matching FilesStore
  * behaviour which considers the combined visible set). Name kept as
  * `selectAllPlansAndNotesCommand` for callsite stability — the panel header
@@ -79,17 +80,28 @@ export async function selectAllConversationsCommand(
 export async function selectAllPlansAndNotesCommand(
 	ctx: SelectAllCtx,
 ): Promise<void> {
-	// serialize() output: contextValue is "plan" | "note" | "reference";
+	// serialize() output: contextValue is "plan" | "note" | "reference" | "skills";
 	// id is the raw plan slug (plans), note id (notes), or mapKey (references).
 	const rows = ctx.plansProvider.serialize();
 	const planRows = rows.filter((r) => r.contextValue === "plan");
 	const noteRows = rows.filter((r) => r.contextValue === "note");
 	const referenceRows = rows.filter((r) => r.contextValue === "reference");
+	// Skills are selectable like the other three kinds. Filtering them out left them
+	// untouched by Select All / Deselect All AND excluded from the "is everything
+	// already selected" test below, so the button's own state could disagree with what
+	// the list showed.
+	//
+	// The one asymmetry: skills collapse into a SINGLE row whose id is a sentinel, so
+	// the exclusion keys come from the provider rather than from the row — mapping
+	// `r.id` here (as the other three do) would write the literal sentinel into the
+	// exclusion set, where it matches no skill and silently excludes nothing.
+	const skillRows = rows.filter((r) => r.contextValue === "skills");
 	const planKeys = planRows.map((r) => r.id);
 	const noteKeys = noteRows.map((r) => r.id);
 	const referenceKeys = referenceRows.map((r) => r.id);
+	const skillKeys = ctx.plansProvider.skillMapKeys();
 
-	const visibleSelectable = [...planRows, ...noteRows, ...referenceRows];
+	const visibleSelectable = [...planRows, ...noteRows, ...referenceRows, ...skillRows];
 	// `isSelected !== false` because "absence of a record means included".
 	const allCurrentlySelected =
 		visibleSelectable.length > 0 &&
@@ -99,6 +111,7 @@ export async function selectAllPlansAndNotesCommand(
 	await setAllExcluded(ctx.cwd, "plans", planKeys, target);
 	await setAllExcluded(ctx.cwd, "notes", noteKeys, target);
 	await setAllExcluded(ctx.cwd, "references", referenceKeys, target);
+	await setAllExcluded(ctx.cwd, "skills", skillKeys, target);
 	await ctx.plansProvider.refreshExclusions();
 	await ctx.onChanged();
 }
@@ -135,6 +148,12 @@ export async function selectAllCurrentMemoryCommand(
 	const referenceKeys = rows
 		.filter((r) => r.contextValue === "reference")
 		.map((r) => r.id);
+	// From the provider, not from a row id — the skills row is an aggregate carrying a
+	// sentinel id (see selectAllPlansAndNotesCommand). Skills were missing from this
+	// command entirely, so the unified button read them in its all-selected verdict
+	// (`rows.every` below covers the aggregate row) but never wrote them: clicking
+	// Deselect All struck the skills row through and then left the skills included.
+	const skillKeys = ctx.plansProvider.skillMapKeys();
 	const contextAllSelected = rows.every((r) => r.isSelected !== false);
 
 	const files = ctx.filesStore.selectionSummary();
@@ -155,6 +174,7 @@ export async function selectAllCurrentMemoryCommand(
 	await setAllExcluded(ctx.cwd, "plans", planKeys, target);
 	await setAllExcluded(ctx.cwd, "notes", noteKeys, target);
 	await setAllExcluded(ctx.cwd, "references", referenceKeys, target);
+	await setAllExcluded(ctx.cwd, "skills", skillKeys, target);
 	await ctx.plansProvider.refreshExclusions();
 	// Files use the inverse boolean — selectAll(true) = "select", whereas
 	// setAllExcluded(true) = "exclude / deselect".

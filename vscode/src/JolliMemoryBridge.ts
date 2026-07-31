@@ -112,12 +112,14 @@ import type {
 	NoteInfo,
 	PlanInfo,
 	ReferenceInfo,
+	SkillInfo,
 } from "./Types.js";
 import { mergeCommitMessages } from "./util/CommitMessageUtils.js";
 import {
 	type ForcePushSafety,
 	inspectForcePushSafety,
 } from "./util/ForcePushSafety.js";
+import { detectSkills } from "./core/SkillService.js";
 import { log } from "./util/Logger.js";
 import { loadGlobalConfig } from "./util/WorkspaceUtils.js";
 import { readManualDisableFlag } from "./services/ManualDisableFlag.js";
@@ -2912,6 +2914,17 @@ export class JolliMemoryBridge {
 	 */
 	listReferences(): Promise<ReadonlyArray<ReferenceInfo>> {
 		return detectReferences(this.cwd);
+	}
+
+	/**
+	 * Active (uncommitted) skill usage rows for the Context list.
+	 *
+	 * Unlike references, the read side FILTERS: a skill row is guarded on commit
+	 * rather than deleted, so returning every row would show every skill ever used
+	 * as if it were fresh working state. See SkillService.
+	 */
+	listSkills(): Promise<ReadonlyArray<SkillInfo>> {
+		return detectSkills(this.cwd);
 	}
 
 	/** Hard-removes a reference (registry row + backing markdown) by mapKey. Allows revival. */

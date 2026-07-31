@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
 	migrateDiscoveryCursors: vi.fn(),
 	scanPlansFrom: vi.fn(),
 	scanReferencesFrom: vi.fn(),
+	scanSkillsWithCursor: vi.fn(),
 	existsSync: vi.fn(),
 }));
 
@@ -23,6 +24,10 @@ vi.mock("./plans/TranscriptPlanDiscovery.js", () => ({
 
 vi.mock("./references/TranscriptReferenceDiscovery.js", () => ({
 	scanReferencesFrom: mocks.scanReferencesFrom,
+}));
+
+vi.mock("./skills/TranscriptSkillDiscovery.js", () => ({
+	scanSkillsWithCursor: mocks.scanSkillsWithCursor,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -42,6 +47,7 @@ describe("catchUpTranscriptDiscovery", () => {
 		mocks.saveDiscoveryCursor.mockResolvedValue(undefined);
 		mocks.scanPlansFrom.mockResolvedValue(10);
 		mocks.scanReferencesFrom.mockResolvedValue(10);
+		mocks.scanSkillsWithCursor.mockResolvedValue(undefined);
 		mocks.existsSync.mockReturnValue(true);
 	});
 
@@ -153,6 +159,43 @@ describe("catchUpTranscriptDiscovery", () => {
 
 		expect(mocks.saveDiscoveryCursor).not.toHaveBeenCalled();
 		expect(result).toEqual({ scanned: 0 });
+	});
+
+	it("drains the skills backlog too, per source", async () => {
+		// The backlog this function exists to drain is per-extractor. Skills were omitted,
+		// so a session that saw no further turns after re-enable kept its skill window
+		// unscanned forever — the same silent drop the plan/reference catch-up prevents.
+		mocks.loadAllSessions.mockResolvedValue([
+			{ transcriptPath: "/a.jsonl" },
+			{ transcriptPath: "/g.jsonl", source: "gemini" },
+		]);
+
+		await catchUpTranscriptDiscovery("/project");
+
+		expect(mocks.scanSkillsWithCursor).toHaveBeenCalledWith("/a.jsonl", "/project", "claude");
+		expect(mocks.scanSkillsWithCursor).toHaveBeenCalledWith("/g.jsonl", "/project", "gemini");
+	});
+
+	it("does not count a skills-only pass as an advanced shared cursor", async () => {
+		// `scanned` reports how many SHARED plan/reference cursors moved. Counting a
+		// skills advance there would make the enable command claim a plan/reference
+		// backlog it never drained.
+		mocks.loadAllSessions.mockResolvedValue([{ transcriptPath: "/a.jsonl" }]);
+		mocks.loadDiscoveryCursor.mockResolvedValue({ transcriptPath: "/a.jsonl", lineNumber: 9 });
+		mocks.scanReferencesFrom.mockResolvedValue(9);
+
+		const result = await catchUpTranscriptDiscovery("/project");
+
+		expect(mocks.scanSkillsWithCursor).toHaveBeenCalledTimes(1);
+		expect(result).toEqual({ scanned: 0 });
+	});
+
+	it("skips skills for a Codex session, which the sidebar tick owns", async () => {
+		mocks.loadAllSessions.mockResolvedValue([{ transcriptPath: "/c.jsonl", source: "codex" }]);
+
+		await catchUpTranscriptDiscovery("/project");
+
+		expect(mocks.scanSkillsWithCursor).not.toHaveBeenCalled();
 	});
 
 	it("swallows a per-session failure (loadDiscoveryCursor throws) and continues", async () => {

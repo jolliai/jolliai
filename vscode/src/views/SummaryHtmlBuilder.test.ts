@@ -197,6 +197,7 @@ import {
 	buildShipBar,
 	buildTokenMeter,
 	buildTopicsSection,
+	contextChipCount,
 	renderTopic,
 } from "./SummaryHtmlBuilder.js";
 import type { TopicWithDate } from "./SummaryUtils.js";
@@ -2553,6 +2554,75 @@ describe("buildAllConversationsSection — Regenerate button", () => {
 				new Set(),
 			);
 			expect(html).toContain('id="plansAndNotesSection"');
+		});
+
+		describe("skills aggregate row", () => {
+			const skillRef = (over: Record<string, unknown> = {}) =>
+				({
+					archivedKey: "claude:superpowers:brainstorming-abc12345",
+					source: "claude",
+					skill: "superpowers:brainstorming",
+					entryPaths: ["tool"],
+					invocationCount: 2,
+					firstUsedAt: "2026-07-30T06:00:00.000Z",
+					lastUsedAt: "2026-07-30T07:00:00.000Z",
+					usage: { input: 79, cached: 59796, output: 33944, confidence: "attributed" },
+					...over,
+				}) as never;
+
+			const withSkills = (refs: ReadonlyArray<unknown>) =>
+				buildPlansAndNotesSection(undefined, undefined, [], undefined, undefined, undefined, undefined, {
+					refs: refs as never,
+					commitHash: "abc12345def",
+				});
+
+			it("renders ONE row for all skills, summarising count and tokens", () => {
+				// Not one row per skill: a session routinely enters a dozen, and none of
+				// them carry the edit/remove/relevance affordances these rows are shaped
+				// around. 2 × 93819 = 187638.
+				const html = withSkills([skillRef(), skillRef({ skill: "j:specs" })]);
+				expect(html).toContain('id="skillsAggregate"');
+				expect(html).toContain(">Skills used<");
+				expect(html).toContain("2 skills · 187.6k tokens");
+				expect(html).not.toContain("superpowers:brainstorming");
+			});
+
+			it("opens the commit's whole table, keyed by commit hash", () => {
+				// There is no per-skill target, and the input/output/cached split only
+				// exists in that table.
+				const html = withSkills([skillRef()]);
+				expect(html).toContain('data-action="previewCommittedSkills"');
+				expect(html).toContain('data-commit-hash="abc12345def"');
+			});
+
+			it("gives the row no edit, remove, or translate affordance", () => {
+				// A skill record is a measurement, not a document, and the row stands for
+				// a set rather than an artifact — there is nothing to edit or dissociate.
+				const html = withSkills([skillRef()]);
+				expect(html).not.toContain("plan-edit-area");
+				expect(html).not.toContain("plan-remove-btn");
+			});
+
+			it("says 'some inferred' when any member was inferred rather than observed", () => {
+				const html = withSkills([skillRef({ detection: "heuristic", usage: undefined }), skillRef()]);
+				expect(html).toContain("some inferred");
+			});
+
+			it("renders nothing at all when the memory archived no skills", () => {
+				expect(withSkills([])).not.toContain("skillsAggregate");
+			});
+
+			it("counts the whole set as ONE toward the section count chip", () => {
+				// The chip counts ROWS. `contextChipCount` and this section must agree —
+				// the chip lives outside the HTML this section replaces on refresh.
+				const summary = {
+					plans: [],
+					notes: [],
+					references: [],
+					skills: [skillRef(), skillRef({ skill: "j:specs" })],
+				} as never;
+				expect(contextChipCount(summary)).toBe(1);
+			});
 		});
 
 		it("marks only the newest of same-named plan snapshots as Latest and renders it first", () => {

@@ -133,13 +133,21 @@ export type {
 	ReferenceCommitRef,
 	ReferenceEntry,
 	ReferenceField,
+	SkillCommitRef,
+	SkillEntry,
+	SkillEntryPath,
+	SkillSource,
+	SkillUsage,
 	SourceId,
 } from "../../cli/src/Types.js";
 
-// Import for use in NoteInfo / ReferenceInfo
+// Import for use in NoteInfo / ReferenceInfo / SkillInfo
 import type {
 	NoteFormat,
 	ReferenceField,
+	SkillEntryPath,
+	SkillSource,
+	SkillUsage,
 	SourceId,
 } from "../../cli/src/Types.js";
 
@@ -168,6 +176,33 @@ export interface NoteInfo {
  * `<source>:<nativeId>`) and a stable `lastModified` field (= updatedAt) for
  * sort consistency with PlanInfo / NoteInfo.
  */
+/**
+ * Panel-display projection of a captured skill usage row.
+ *
+ * `lastModified` mirrors `lastUsedAt` so a skill sorts against plans / notes /
+ * references in one list, the same way ReferenceInfo mirrors `updatedAt`.
+ */
+export interface SkillInfo {
+	readonly kind: "skill";
+	/** plans.json.skills map key — `<source>:<skill>`. */
+	readonly mapKey: string;
+	readonly source: SkillSource;
+	/** Fully-qualified skill id, e.g. `superpowers:brainstorming`. */
+	readonly skill: string;
+	readonly plugin?: string;
+	readonly entryPaths: ReadonlyArray<SkillEntryPath>;
+	readonly invocationCount: number;
+	readonly firstUsedAt: string;
+	readonly lastUsedAt: string;
+	/** Absent when the source could not attribute tokens — never rendered as a zero. */
+	readonly usage?: SkillUsage;
+	readonly sourcePath: string;
+	/** Present when the invocation was inferred rather than observed (Codex). */
+	readonly detection?: "heuristic";
+	/** ISO 8601 — same as lastUsedAt, for sort consistency with the other kinds. */
+	readonly lastModified: string;
+}
+
 export interface ReferenceInfo {
 	readonly kind: "reference";
 	readonly source: SourceId;

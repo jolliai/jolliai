@@ -128,8 +128,12 @@ describe("discoverCodexConversations — integration (real parser + scan + curso
 		writeFileSync(rollout, `${fnCall("mcp__codex_apps__atlassian_rovo", "_getjiraissue", "j1")}\n`, "utf-8");
 		await discoverCodexConversations(dir);
 		expect(upsertReferenceEntry).not.toHaveBeenCalled();
-		// Cursor was NOT advanced past the in-flight request.
-		expect(await loadDiscoveryCursor(rollout, dir)).toBeNull();
+		// The SHARED cursor was NOT advanced past the in-flight request — that is the
+		// property this protects. A cursor record does now exist, because the skills
+		// extractor keeps its own high-water mark in the same file, but the shared
+		// lineNumber (the only field the reference/plan path resumes from) is still at
+		// the start, which is equivalent to no record for that path.
+		expect((await loadDiscoveryCursor(rollout, dir))?.lineNumber ?? 0).toBe(0);
 
 		// Poll 2: the output arrives; the re-scan recovers the Jira ref (tenant webUrl).
 		appendFileSync(rollout, `${fnOutput("j1", JIRA, "bare")}\n`, "utf-8");
@@ -180,7 +184,9 @@ describe("discoverCodexConversations — integration (real parser + scan + curso
 		await discoverCodexConversations(dir);
 		await discoverCodexConversations(dir);
 		expect(Object.keys((await loadPlansRegistry(dir)).plans)).toHaveLength(0);
-		expect(await loadDiscoveryCursor(rollout, dir)).toBeNull();
+		// Shared cursor held at the start — see the note in the P1 test above on why a
+		// record can exist while the shared field has not moved.
+		expect((await loadDiscoveryCursor(rollout, dir))?.lineNumber ?? 0).toBe(0);
 		expect(existsSync(join(dir, ".jolli", "jollimemory", "plans.json"))).toBe(false); // never written
 
 		// Poll N: the fetch output lands → safe cursor advances past the plan line →

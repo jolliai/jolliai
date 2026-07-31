@@ -1,6 +1,6 @@
 /**
- * DiscoveryCatchUp — re-runs incremental plan + reference discovery for the
- * agent-hook-recorded sessions in `sessions.json`.
+ * DiscoveryCatchUp — re-runs incremental plan + reference + skill discovery for
+ * the agent-hook-recorded sessions in `sessions.json`.
  *
  * Scope: this helper only enumerates sessions recorded in `sessions.json`.
  * In current production paths, that registry is populated by the Claude hooks
@@ -41,6 +41,7 @@ import {
 	migrateDiscoveryCursors,
 	saveDiscoveryCursor,
 } from "./SessionTracker.js";
+import { scanSkillsWithCursor } from "./skills/TranscriptSkillDiscovery.js";
 
 const log = createLogger("DiscoveryCatchUp");
 
@@ -94,6 +95,12 @@ export async function catchUpTranscriptDiscovery(cwd: string): Promise<{ scanned
 			} catch (err) {
 				log.warn("Reference catch-up failed for %s: %s", session.transcriptPath, (err as Error).message);
 			}
+
+			// Skills ride their own high-water mark, so the backlog they have to drain is
+			// their own — a window the shared cursor may already have passed while this
+			// project was disabled. Not counted into `scanned`, which reports how many
+			// SHARED cursors advanced; a skills-only advance is not a plan/reference one.
+			await scanSkillsWithCursor(transcriptPath, cwd, source);
 
 			if (planScanCompleted && referenceLine > fromLine) {
 				await saveDiscoveryCursor(

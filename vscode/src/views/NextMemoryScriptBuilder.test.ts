@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { CONTEXT_ROW_KINDS } from "./ContextRowKinds.js";
 import { buildNextMemoryScript } from "./NextMemoryScriptBuilder.js";
 
 describe("buildNextMemoryScript", () => {
@@ -180,11 +181,27 @@ describe("click-to-open parity with the sidebar Working Memory rows", () => {
 		expect(js).toContain("if (!item.messageCount || item.messageCount <= 0) return;");
 	});
 
-	it("opens context rows via branch:openPlan / openNote / openReferencePreview by kind", () => {
+	it("opens context rows through the shared CONTEXT_ROW_KINDS table, per kind", () => {
 		const js = buildNextMemoryScript();
-		expect(js).toContain("type: 'branch:openPlan', planId: item.id");
-		expect(js).toContain("type: 'branch:openNote', noteId: item.id");
-		expect(js).toContain("type: 'branch:openReferencePreview', mapKey: item.id");
+		// The per-kind ternary chain is gone. It ended in a `reference` default, so
+		// the skills aggregate row — which this panel receives, because
+		// branch:plansData is broadcast to it verbatim — posted
+		// branch:openReferencePreview with the __skills__ sentinel as a mapKey.
+		expect(js).toContain("const openMsg = { type: kindSpec.openMsg };");
+		expect(js).toContain("if (kindSpec.openIdKey) openMsg[kindSpec.openIdKey] = item.id;");
+		// An unknown kind opens nothing rather than defaulting to some other kind.
+		expect(js).toContain("if (!kindSpec) return;");
+		expect(CONTEXT_ROW_KINDS.plan).toMatchObject({ openMsg: "branch:openPlan", openIdKey: "planId" });
+		expect(CONTEXT_ROW_KINDS.note).toMatchObject({ openMsg: "branch:openNote", openIdKey: "noteId" });
+		expect(CONTEXT_ROW_KINDS.reference).toMatchObject({
+			openMsg: "branch:openReferencePreview",
+			openIdKey: "mapKey",
+		});
+		// The aggregate row stands for a set, so there is no id to carry.
+		expect(CONTEXT_ROW_KINDS.skills).toMatchObject({
+			openMsg: "branch:openSkillsAggregate",
+			openIdKey: null,
+		});
 	});
 
 	it("opens a file row via branch:openChange with filePath / relativePath / statusCode", () => {
@@ -241,9 +258,18 @@ describe("footer + message contract parity", () => {
 		// mismatch here would silently no-op instead of erroring.
 		expect(js).toContain("source: item.source");
 		expect(js).toContain("sessionId: item.sessionId");
-		expect(js).toContain("planId: item.id");
-		expect(js).toContain("noteId: item.id");
-		expect(js).toContain("mapKey: item.id");
+		// Context-row toggles are table-driven now — same table the sidebar resolves
+		// against, so the two emitters cannot drift on a field name.
+		expect(js).toContain("toggleMsg = { type: kindSpec.msg };");
+		expect(js).toContain("if (kindSpec.idKey) toggleMsg[kindSpec.idKey] = item.id;");
+		expect(CONTEXT_ROW_KINDS.plan).toMatchObject({ msg: "branch:togglePlanSelection", idKey: "planId" });
+		expect(CONTEXT_ROW_KINDS.note).toMatchObject({ msg: "branch:toggleNoteSelection", idKey: "noteId" });
+		expect(CONTEXT_ROW_KINDS.reference).toMatchObject({
+			msg: "branch:toggleReferenceSelection",
+			idKey: "mapKey",
+		});
+		// Whole-set semantics: the host reads no id off this message.
+		expect(CONTEXT_ROW_KINDS.skills).toMatchObject({ msg: "branch:toggleSkillSelection", idKey: null });
 		// File toggle keys on the RELATIVE path (item.description) because
 		// FilesStore.selectedPaths is relative-keyed — sending item.id (absolute)
 		// silently no-ops the ✕ click. Mirrors the sidebar's data-rel-path||data-id.
@@ -269,10 +295,20 @@ describe("row destructive actions (discard on files, remove on context)", () => 
 		const js = buildNextMemoryScript();
 		expect(js).toContain("codicon-trash");
 		// plan → removePlan, note → removeNote, reference → ignoreReference.
-		expect(js).toContain("'jollimemory.removePlan'");
-		expect(js).toContain("'jollimemory.removeNote'");
-		expect(js).toContain("'jollimemory.ignoreReference'");
+		expect(CONTEXT_ROW_KINDS.plan.removeCmd).toBe("jollimemory.removePlan");
+		expect(CONTEXT_ROW_KINDS.note.removeCmd).toBe("jollimemory.removeNote");
+		expect(CONTEXT_ROW_KINDS.reference.removeCmd).toBe("jollimemory.ignoreReference");
 		expect(js).toContain("command: removeCmd, args: [item.id]");
+	});
+
+	it("gives the skills aggregate row no trash button, but keeps its exclude toggle", () => {
+		const js = buildNextMemoryScript();
+		// There is no single artifact to drop — the row stands for a set. Excluding it
+		// IS meaningful (it skips the whole set), so the checkbox stays.
+		expect(CONTEXT_ROW_KINDS.skills.removeCmd).toBeNull();
+		expect(CONTEXT_ROW_KINDS.skills.actions).toEqual([]);
+		expect(js).toContain("if (removeCmd && kindSpec.actions.indexOf('remove') !== -1)");
+		expect(js).toContain("if (toggleMsg) {");
 	});
 
 	it("puts the destructive action to the LEFT of the ✕/+ toggle in .row-actions", () => {

@@ -19,6 +19,7 @@
  * buildTokenMeter) and the sidebar's renderTokenBar; all three share this
  * exact-width, no-bucket approach so sub-10% segments never disappear.
  */
+import { CONTEXT_ROW_KINDS } from "./ContextRowKinds.js";
 import { SOURCE_META } from "./SourceLabels.js";
 
 export function buildNextMemoryScript(): string {
@@ -31,6 +32,15 @@ export function buildNextMemoryScript(): string {
   // source id missing from this table falls back to its own first letter
   // uppercased at the lookup site below.
   const SOURCE_META = ${JSON.stringify(SOURCE_META)};
+
+  // Per-kind Context-row behaviour, injected from ./ContextRowKinds.ts — the SAME
+  // table the sidebar's renderPlanRow resolves against. This panel used to key the
+  // badge, the toggle message, the remove command and the open message off four
+  // separate ternary chains that all ended in a 'reference' default, so the skills
+  // aggregate row (which this panel receives, because branch:plansData is
+  // broadcast to it verbatim) rendered as a reference and posted
+  // branch:toggleReferenceSelection carrying the __skills__ sentinel as a mapKey.
+  const CONTEXT_ROW_KINDS = ${JSON.stringify(CONTEXT_ROW_KINDS)};
   let conversations = [];
   let contextItems = [];
   let files = [];
@@ -304,6 +314,7 @@ export function buildNextMemoryScript(): string {
     let badgeKind = kind || '';
     if (kind === 'plan') letter = 'P';
     else if (kind === 'note') letter = 'N';
+    else if (kind === 'skill') letter = 'S';
     else if (kind === 'reference') {
       const s = source || '';
       const meta = SOURCE_META[s];
@@ -368,21 +379,22 @@ export function buildNextMemoryScript(): string {
     // falls back to a neutral 'D' badge. Mirrors the sidebar's renderPlanRow so
     // both surfaces show the identical per-source square (e.g. 'Z' for Zoom).
     const badgeSource = item.contextValue === 'reference' && item.referenceHover ? item.referenceHover.source : '';
-    row.appendChild(ctxBadge(item.contextValue, badgeSource));
+    // An unknown contextValue resolves to null and the row degrades to
+    // identity-only: badge, title, no checkbox, no actions, no click. Visibly
+    // inert beats the old 'reference' default, which silently wrote a foreign key
+    // into the reference exclusion set.
+    const kindSpec = CONTEXT_ROW_KINDS[item.contextValue] || null;
+    row.appendChild(ctxBadge(kindSpec ? kindSpec.badge : item.contextValue, badgeSource));
     row.appendChild(el('div', { className: 'r-main' }, [el('div', { className: 'r-title', text: item.label })]));
-    let toggleMsg;
-    let removeCmd;
-    if (item.contextValue === 'plan') {
-      toggleMsg = { type: 'branch:togglePlanSelection', planId: item.id };
-      removeCmd = 'jollimemory.removePlan';
-    } else if (item.contextValue === 'note') {
-      toggleMsg = { type: 'branch:toggleNoteSelection', noteId: item.id };
-      removeCmd = 'jollimemory.removeNote';
-    } else {
-      toggleMsg = { type: 'branch:toggleReferenceSelection', mapKey: item.id };
-      // References aren't deleted, they're ignored (dropped from this memory).
-      removeCmd = 'jollimemory.ignoreReference';
+    // The toggle message carries the row's id under a per-kind field name — except
+    // for the skills aggregate, whose idKey is null because it stands for the whole
+    // set and the host reads no id from it.
+    let toggleMsg = null;
+    if (kindSpec) {
+      toggleMsg = { type: kindSpec.msg };
+      if (kindSpec.idKey) toggleMsg[kindSpec.idKey] = item.id;
     }
+    const removeCmd = kindSpec ? kindSpec.removeCmd : null;
     // Action set differs by state. An AI-excluded row shows ONLY a labeled
     // "+ Include" button — no 🗑 (removing an item the AI already dropped is
     // pointless) and no ✕ (the item is already out of the summary, so toggling it
@@ -404,20 +416,27 @@ export function buildNextMemoryScript(): string {
         }),
       ];
     } else {
-      actions = [
-        rowIconButton('codicon-trash', 'Remove', function() {
+      actions = [];
+      // The skills aggregate has no 'remove' in its action list: it stands for a
+      // set, so there is no single artifact to drop from this memory. The checkbox
+      // below is still offered — excluding skips the whole set, which is meaningful.
+      if (removeCmd && kindSpec.actions.indexOf('remove') !== -1) {
+        actions.push(rowIconButton('codicon-trash', 'Remove', function() {
           vscode.postMessage({ type: 'command', command: removeCmd, args: [item.id] });
-        }),
-        excludeToggle(function(selected) {
+        }));
+      }
+      if (toggleMsg) {
+        actions.push(excludeToggle(function(selected) {
           vscode.postMessage(Object.assign({}, toggleMsg, { selected: selected }));
-        }, !!item.isSelected),
-      ];
+        }, !!item.isSelected));
+      }
     }
     row.appendChild(rowActions(actions));
     attachRowOpen(row, function() {
-      if (item.contextValue === 'plan') vscode.postMessage({ type: 'branch:openPlan', planId: item.id });
-      else if (item.contextValue === 'note') vscode.postMessage({ type: 'branch:openNote', noteId: item.id });
-      else vscode.postMessage({ type: 'branch:openReferencePreview', mapKey: item.id });
+      if (!kindSpec) return;
+      const openMsg = { type: kindSpec.openMsg };
+      if (kindSpec.openIdKey) openMsg[kindSpec.openIdKey] = item.id;
+      vscode.postMessage(openMsg);
     });
     // Wrapper: main row + a SECOND meta row for the AI overlay. Keeping the tier /
     // Excluded chip and the ✨ note OFF the hover-overlay .row-actions means they stay
