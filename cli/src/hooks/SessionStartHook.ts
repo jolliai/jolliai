@@ -27,7 +27,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { dirname, join } from "node:path";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { resolveClientKind } from "../core/ClientHeader.js";
-import { readFileFromBranch } from "../core/GitOps.js";
+import { readFileFromBranch, resolveStateRoot } from "../core/GitOps.js";
 import { hasLlmCredentials } from "../core/LlmCredentials.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig, normalizePlansRegistry, saveConfig } from "../core/SessionTracker.js";
@@ -246,7 +246,11 @@ export async function main(): Promise<void> {
 	try {
 		const input = await readStdin();
 		const { cwd } = JSON.parse(input) as { cwd?: string };
-		const projectDir = cwd ?? process.cwd();
+		// Anchor to the git worktree root: the session cwd may be a subdirectory,
+		// which would otherwise fork a stray `.jolli/` store (and this hook also
+		// writes briefing-cache / reads plans by joining `.jolli/` onto projectDir
+		// directly). See resolveStateRoot.
+		const projectDir = resolveStateRoot(cwd ?? process.cwd());
 		setLogDir(projectDir);
 
 		log.info("SessionStartHook invoked (cwd=%s)", projectDir);

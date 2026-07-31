@@ -32,6 +32,15 @@ vi.mock("../core/TelemetryStartup.js", () => ({
 	flushTelemetryNow: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Identity by default so the hook's git-root anchoring is deterministic and
+// spawns no git in-process (these tests use synthetic cwds like "/project"); the
+// real resolveStateRoot is covered in GitOps.test.ts. A `vi.fn` so a test can
+// override it to assert the ROOT (not the raw subdir) is what flows downstream.
+vi.mock("../core/GitOps.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/GitOps.js")>()),
+	resolveStateRoot: vi.fn((cwd: string) => cwd),
+}));
+
 // Mock Locks — these unit tests run with synthetic cwds (e.g. "/project"), so
 // the real per-worktree lock would create junk dirs off the drive root. Run the
 // plans.json RMW body inline; the lock contract is covered in Locks.test.ts.
@@ -85,6 +94,7 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { resolveStateRoot } from "../core/GitOps.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { extractReferencesFromTranscript } from "../core/references/ReferenceExtractor.js";
 import {
@@ -358,6 +368,45 @@ describe("StopHook", () => {
 				source: "claude",
 			}),
 			"/my/project",
+		);
+	});
+
+	it("anchors a subdirectory cwd to the git worktree root before saving the session", async () => {
+		// The session cwd is a subdirectory; resolveStateRoot maps it to the repo
+		// root. Without anchoring, the session would be written into a stray
+		// `<subdir>/.jolli/` store that never joins the main one.
+		vi.mocked(resolveStateRoot).mockReturnValueOnce("/repo/root");
+		mockStdin(
+			JSON.stringify({
+				session_id: "sub-dir-session",
+				transcript_path: "/home/user/.claude/projects/abc/session.jsonl",
+				cwd: "/repo/root/manager",
+			}),
+		);
+		await handleStopHook();
+		expect(resolveStateRoot).toHaveBeenCalledWith("/repo/root/manager");
+		expect(saveSession).toHaveBeenCalledWith(
+			expect.objectContaining({ sessionId: "sub-dir-session" }),
+			"/repo/root",
+		);
+	});
+
+	it("anchors a subdirectory CLAUDE_PROJECT_DIR to the git worktree root", async () => {
+		// The env var itself can point at a subdirectory; it must be anchored too.
+		process.env.CLAUDE_PROJECT_DIR = "/repo/root/manager";
+		vi.mocked(resolveStateRoot).mockReturnValueOnce("/repo/root");
+		mockStdin(
+			JSON.stringify({
+				session_id: "env-sub-session",
+				transcript_path: "/home/user/.claude/projects/abc/session.jsonl",
+				cwd: "/ignored",
+			}),
+		);
+		await handleStopHook();
+		expect(resolveStateRoot).toHaveBeenCalledWith("/repo/root/manager");
+		expect(saveSession).toHaveBeenCalledWith(
+			expect.objectContaining({ sessionId: "env-sub-session" }),
+			"/repo/root",
 		);
 	});
 

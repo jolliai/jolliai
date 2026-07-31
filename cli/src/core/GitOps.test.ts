@@ -16,18 +16,22 @@ const NUL = "\x00";
  *   returns a fake ChildProcess with stdin/stdout/stderr EventEmitters.
  *   Results are queued with `mockSpawnSuccess` / `mockSpawnFailure`.
  */
-const { mockExecFileAsync, mockSpawn } = vi.hoisted(() => ({
+const { mockExecFileAsync, mockSpawn, mockExecFileSync } = vi.hoisted(() => ({
 	mockExecFileAsync: vi.fn(),
 	mockSpawn: vi.fn(),
+	mockExecFileSync: vi.fn(),
 }));
 
 vi.mock("node:util", () => ({
 	promisify: vi.fn(() => mockExecFileAsync),
 }));
 
+// `execFileSync` is required by `resolveStateRoot` (via execFileSyncHidden); the
+// other GitOps helpers use `execFile` (async) / `spawn`.
 vi.mock("node:child_process", () => ({
 	execFile: vi.fn(),
 	spawn: mockSpawn,
+	execFileSync: mockExecFileSync,
 }));
 
 // Suppress console output
@@ -62,7 +66,9 @@ import {
 	orphanBranchExists,
 	readFileFromBranch,
 	readOrigHead,
+	resetStateRootCache,
 	resolveGitHooksDir,
+	resolveStateRoot,
 	writeFileToBranch,
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
@@ -1724,6 +1730,62 @@ describe("GitOps", () => {
 			await expect(writeFileToBranch("branch", "summaries/abc.json", "{}", "Add")).rejects.toThrow(
 				"Unexpected ls-tree output",
 			);
+		});
+	});
+
+	describe("resolveStateRoot", () => {
+		beforeEach(() => {
+			mockExecFileSync.mockReset();
+			resetStateRootCache();
+		});
+
+		it("anchors a subdirectory to the git worktree root", () => {
+			mockExecFileSync.mockReturnValue("/repo/root\n");
+			expect(resolveStateRoot("/repo/root/sub/deeper")).toBe("/repo/root");
+		});
+
+		it("invokes `git rev-parse --show-toplevel` with the input as cwd", () => {
+			mockExecFileSync.mockReturnValue("/repo/root\n");
+			resolveStateRoot("/repo/root/sub");
+			expect(mockExecFileSync).toHaveBeenCalledWith(
+				"git",
+				["rev-parse", "--show-toplevel"],
+				expect.objectContaining({ cwd: "/repo/root/sub" }),
+			);
+		});
+
+		it("falls back to the input path when not a git repo (git throws)", () => {
+			mockExecFileSync.mockImplementation(() => {
+				throw new Error("fatal: not a git repository");
+			});
+			expect(resolveStateRoot("/tmp/plain-dir")).toBe("/tmp/plain-dir");
+		});
+
+		it("falls back to the input path when git prints nothing", () => {
+			mockExecFileSync.mockReturnValue("   \n");
+			expect(resolveStateRoot("/tmp/empty-out")).toBe("/tmp/empty-out");
+		});
+
+		it("memoizes per input — a repeated call spawns git only once", () => {
+			mockExecFileSync.mockReturnValue("/repo/root\n");
+			expect(resolveStateRoot("/repo/root/a")).toBe("/repo/root");
+			expect(resolveStateRoot("/repo/root/a")).toBe("/repo/root");
+			expect(mockExecFileSync).toHaveBeenCalledTimes(1);
+		});
+
+		it("caches distinct inputs independently", () => {
+			mockExecFileSync.mockReturnValueOnce("/repo/one\n").mockReturnValueOnce("/repo/two\n");
+			expect(resolveStateRoot("/repo/one/x")).toBe("/repo/one");
+			expect(resolveStateRoot("/repo/two/y")).toBe("/repo/two");
+			expect(mockExecFileSync).toHaveBeenCalledTimes(2);
+		});
+
+		it("resetStateRootCache forces re-resolution", () => {
+			mockExecFileSync.mockReturnValue("/repo/root\n");
+			resolveStateRoot("/repo/root/z");
+			resetStateRootCache();
+			resolveStateRoot("/repo/root/z");
+			expect(mockExecFileSync).toHaveBeenCalledTimes(2);
 		});
 	});
 });

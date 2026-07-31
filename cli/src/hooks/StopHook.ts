@@ -29,6 +29,7 @@ import { existsSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
+import { resolveStateRoot } from "../core/GitOps.js";
 import { scanPlansFrom } from "../core/plans/TranscriptPlanDiscovery.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { scanReferencesFrom } from "../core/references/TranscriptReferenceDiscovery.js";
@@ -60,7 +61,10 @@ export async function handleStopHook(): Promise<void> {
 		log.info("Stop hook skipped — running inside a jollimemory-spawned local agent");
 		return;
 	}
-	const envProjectDir = process.env.CLAUDE_PROJECT_DIR;
+	// Anchor to the git worktree root: the session cwd (env or, below, the hook
+	// payload) may be a subdirectory, which would otherwise fork a stray `.jolli/`
+	// store. See resolveStateRoot.
+	const envProjectDir = process.env.CLAUDE_PROJECT_DIR ? resolveStateRoot(process.env.CLAUDE_PROJECT_DIR) : undefined;
 
 	// Set log directory early from env var (available before stdin parsing)
 	if (envProjectDir) {
@@ -88,8 +92,10 @@ export async function handleStopHook(): Promise<void> {
 		return;
 	}
 
-	// Use hookData.cwd as fallback when env var is not available
-	const projectDir = envProjectDir ?? hookData.cwd;
+	// Use hookData.cwd as fallback when env var is not available (also anchored).
+	// `?? process.cwd()` guards a payload that omits cwd (typed non-optional but
+	// JSON-sourced), matching SessionStartHook and the pre-fix behavior.
+	const projectDir = envProjectDir ?? resolveStateRoot(hookData.cwd ?? process.cwd());
 	if (!envProjectDir) {
 		setLogDir(projectDir);
 	}

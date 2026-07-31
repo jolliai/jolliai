@@ -34,6 +34,11 @@ vi.mock("../core/SummaryStore.js", () => ({
 
 vi.mock("../core/GitOps.js", () => ({
 	readFileFromBranch: vi.fn(),
+	// Identity by default so the hook's git-root anchoring is deterministic and
+	// spawns no git in-process; the real resolveStateRoot is covered in
+	// GitOps.test.ts. A `vi.fn` so a test can override it to assert the ROOT (not
+	// the raw subdir) is what feeds setLogDir / the direct `.jolli/` joins.
+	resolveStateRoot: vi.fn((cwd: string) => cwd),
 }));
 
 vi.mock("../core/RepoProfile.js", () => ({
@@ -61,11 +66,13 @@ vi.mock("../Logger.js", () => ({
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { readFileFromBranch } from "../core/GitOps.js";
+import { readFileFromBranch, resolveStateRoot } from "../core/GitOps.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig, saveConfig } from "../core/SessionTracker.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
+import { setLogDir } from "../Logger.js";
+import { readStdin } from "./HookUtils.js";
 
 const mockExecFileSync = vi.mocked(execFileSync);
 const mockGetIndex = vi.mocked(getIndex);
@@ -116,6 +123,18 @@ describe("SessionStartHook", () => {
 		mockReadFileFromBranch.mockResolvedValue(null);
 		mockExistsSync.mockReturnValue(false);
 		vi.mocked(readManualDisableFlag).mockResolvedValue(false);
+	});
+
+	it("anchors a subdirectory session cwd to the git worktree root", async () => {
+		// A session started from a subdirectory: resolveStateRoot maps it to the
+		// repo root. projectDir feeds setLogDir AND every direct `.jolli/` join in
+		// this hook (login marker, plans.json, briefing-cache), so anchoring it once
+		// keeps all of them out of a stray `<subdir>/.jolli/` store.
+		vi.mocked(readStdin).mockResolvedValueOnce(JSON.stringify({ cwd: "/repo/root/manager" }));
+		vi.mocked(resolveStateRoot).mockReturnValueOnce("/repo/root");
+		await main();
+		expect(resolveStateRoot).toHaveBeenCalledWith("/repo/root/manager");
+		expect(setLogDir).toHaveBeenCalledWith("/repo/root");
 	});
 
 	// ─── Skip conditions ────────────────────────────────────────────────────

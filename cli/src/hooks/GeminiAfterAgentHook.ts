@@ -20,6 +20,7 @@
 
 import { resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveStateRoot } from "../core/GitOps.js";
 import { saveSession } from "../core/SessionTracker.js";
 import { flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { createLogger, setLogDir } from "../Logger.js";
@@ -41,7 +42,11 @@ function writeStdout(): void {
  * Reads stdin, parses the hook payload, and saves session info with source="gemini".
  */
 export async function handleGeminiAfterAgentHook(): Promise<void> {
-	const envProjectDir = process.env.GEMINI_PROJECT_DIR ?? process.env.CLAUDE_PROJECT_DIR;
+	// Anchor to the git worktree root: the session cwd (env or, below, the hook
+	// payload) may be a subdirectory, which would otherwise fork a stray `.jolli/`
+	// store. See resolveStateRoot.
+	const envProjectDirRaw = process.env.GEMINI_PROJECT_DIR ?? process.env.CLAUDE_PROJECT_DIR;
+	const envProjectDir = envProjectDirRaw ? resolveStateRoot(envProjectDirRaw) : undefined;
 
 	// Set log directory early from env var (available before stdin parsing)
 	if (envProjectDir) {
@@ -73,8 +78,10 @@ export async function handleGeminiAfterAgentHook(): Promise<void> {
 		return;
 	}
 
-	// Use hookData.cwd as fallback when env var is not available
-	const projectDir = envProjectDir ?? hookData.cwd;
+	// Use hookData.cwd as fallback when env var is not available (also anchored).
+	// `?? process.cwd()` guards a payload that omits cwd (typed non-optional but
+	// JSON-sourced), matching SessionStartHook and the pre-fix behavior.
+	const projectDir = envProjectDir ?? resolveStateRoot(hookData.cwd ?? process.cwd());
 	if (!envProjectDir) {
 		setLogDir(projectDir);
 	}

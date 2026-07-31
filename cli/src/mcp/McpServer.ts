@@ -20,7 +20,7 @@ import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
-import { createLogger } from "../Logger.js";
+import { createLogger, setLogDir } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
 import {
 	buildJolliMenu,
@@ -237,6 +237,12 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 		log.info("Local-agent child detected; skipping MCP server startup to avoid a spurious Memory Bank repo");
 		return;
 	}
+
+	// Anchor the Logger's global dir to this (already git-root-resolved) cwd so the
+	// long-lived server's debug.log — written on every tool call — lands in the
+	// repo's `.jolli/`, not a stray store under the subdirectory it was launched
+	// from. `cwd` is resolved by the `jolli mcp` command via resolveProjectDir.
+	setLogDir(cwd);
 
 	// Establish the configured storage backend up front. The tool handlers read
 	// through the store APIs without threading `storage`, so without this they'd

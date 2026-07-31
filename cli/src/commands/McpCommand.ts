@@ -8,6 +8,7 @@ import { SearchIndex } from "../core/SearchIndex.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { startMcpServer } from "../mcp/McpServer.js";
+import { resolveProjectDir } from "./CliUtils.js";
 
 export function registerMcpCommand(program: Command): void {
 	program
@@ -15,7 +16,10 @@ export function registerMcpCommand(program: Command): void {
 		.description("Start the JolliMemory MCP server (stdio) for AI agents")
 		.option("--reindex", "Rebuild the local search index from source and exit")
 		.action(async (options: { reindex?: boolean }) => {
-			const cwd = process.cwd();
+			// Anchor to the git worktree root: an AI host may launch `jolli mcp` from
+			// a subdirectory, and this cwd drives storage / queue / telemetry for the
+			// whole (long-lived) server. See resolveStateRoot / resolveProjectDir.
+			const cwd = resolveProjectDir();
 			if (options.reindex) {
 				// Establish the configured backend before reading sources — mirrors
 				// startMcpServer. Without it, rebuild's reads fall through to the

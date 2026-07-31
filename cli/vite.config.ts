@@ -109,6 +109,7 @@ const copyGraphAssets = {
 const SLOW_TEST_FILES = [
 	"src/backfill/CommitTargetIndex.test.ts",
 	"src/core/BranchCommitLister.test.ts",
+	"src/core/GitOps.stateRoot.realgit.test.ts",
 	"src/core/KBPathResolver.test.ts",
 	"src/core/Locks.test.ts",
 	"src/core/RepoProfile.test.ts",

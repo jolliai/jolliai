@@ -8,10 +8,11 @@
  */
 
 import { main } from "./Api.js";
+import { resolveProjectDir } from "./commands/CliUtils.js";
 import { shouldSkipExitFlush, trackCommandFailureIfPending } from "./core/TelemetryCommandHook.js";
 import { bootstrapTelemetry, flushTelemetryNow, maybeShowCliTelemetryNotice } from "./core/TelemetryStartup.js";
 import { runWithTrace, traceIdFromEnv } from "./core/TraceContext.js";
-import { setSilentConsole } from "./Logger.js";
+import { setLogDir, setSilentConsole } from "./Logger.js";
 
 // Auto-execute when run as a script (skip in test environment).
 /* v8 ignore start */
@@ -23,6 +24,11 @@ if (!process.env.VITEST) {
 	// callers of `main()` (e.g. embedders) don't pick up the global side
 	// effect by accident.
 	setSilentConsole(true);
+	// Anchor the Logger's global dir to the git worktree root before anything logs
+	// or buffers telemetry, so a CLI invocation from a subdirectory never writes
+	// debug.log / telemetry into a stray `.jolli/` there. `resolveProjectDir` is
+	// cached, so the per-command `--cwd` defaults reuse this same resolution.
+	setLogDir(resolveProjectDir());
 	// One trace per CLI invocation. Adopt JOLLI_TRACE_ID if a parent process set
 	// it, else mint a fresh id; all logs + outbound backend calls for this
 	// command share it.
@@ -36,7 +42,7 @@ if (!process.env.VITEST) {
 			// Then prime telemetry before command dispatch so the commander preAction
 			// auto-emit and any in-command track() calls have a live context. Never
 			// throws; the VITEST guard keeps it (and its installId mint) out of tests.
-			await bootstrapTelemetry({ cwd: process.cwd() });
+			await bootstrapTelemetry({ cwd: resolveProjectDir() });
 			let failed = false;
 			try {
 				await main();
@@ -56,7 +62,7 @@ if (!process.env.VITEST) {
 			// subcommand. Bounded timeout (not the flusher's 10s default) so a slow
 			// network can't stall the prompt; best-effort and never throws.
 			if (!shouldSkipExitFlush()) {
-				await flushTelemetryNow(process.cwd(), { timeoutMs: 2_000 });
+				await flushTelemetryNow(resolveProjectDir(), { timeoutMs: 2_000 });
 			}
 			if (failed) process.exit(1);
 		})(),

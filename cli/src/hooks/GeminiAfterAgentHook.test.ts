@@ -14,11 +14,21 @@ vi.mock("../core/TelemetryStartup.js", () => ({
 	flushTelemetryNow: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Identity by default so the hook's git-root anchoring is deterministic and
+// spawns no git in-process (these tests use synthetic cwds); the real
+// resolveStateRoot is covered in GitOps.test.ts. A `vi.fn` so a test can override
+// it to assert the ROOT (not the raw subdir) is what feeds saveSession.
+vi.mock("../core/GitOps.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/GitOps.js")>()),
+	resolveStateRoot: vi.fn((cwd: string) => cwd),
+}));
+
 // Suppress console output
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
+import { resolveStateRoot } from "../core/GitOps.js";
 import { saveSession } from "../core/SessionTracker.js";
 import { flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { handleGeminiAfterAgentHook } from "./GeminiAfterAgentHook.js";
@@ -177,6 +187,27 @@ describe("GeminiAfterAgentHook", () => {
 			expect.objectContaining({ sessionId: "gemini-789" }),
 			"/claude/project",
 		);
+	});
+
+	it("anchors a subdirectory hookData.cwd to the git worktree root before saving", async () => {
+		// No env var → the payload cwd (a subdirectory) is anchored to the repo root.
+		vi.mocked(resolveStateRoot).mockReturnValueOnce("/repo/root");
+		mockStdin(JSON.stringify({ session_id: "g-sub", transcript_path: "/p", cwd: "/repo/root/backend" }));
+		captureStdout();
+		await handleGeminiAfterAgentHook();
+		expect(resolveStateRoot).toHaveBeenCalledWith("/repo/root/backend");
+		expect(saveSession).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "g-sub" }), "/repo/root");
+	});
+
+	it("anchors a subdirectory GEMINI_PROJECT_DIR to the git worktree root", async () => {
+		// The env var itself can point at a subdirectory; it must be anchored too.
+		process.env.GEMINI_PROJECT_DIR = "/repo/root/backend";
+		vi.mocked(resolveStateRoot).mockReturnValueOnce("/repo/root");
+		mockStdin(JSON.stringify({ session_id: "g-env", transcript_path: "/p", cwd: "/ignored" }));
+		captureStdout();
+		await handleGeminiAfterAgentHook();
+		expect(resolveStateRoot).toHaveBeenCalledWith("/repo/root/backend");
+		expect(saveSession).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "g-env" }), "/repo/root");
 	});
 
 	it("should write {} to stdout even on invalid JSON", async () => {

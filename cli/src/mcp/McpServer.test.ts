@@ -88,6 +88,7 @@ import type { PlatformToolManifestEntry } from "../core/JolliMemoryPushClient.js
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
+import { getLogDir, resetLogDir } from "../Logger.js";
 import { dispatchTool, type PlatformToolClient, startMcpServer, TOOL_DEFINITIONS } from "./McpServer.js";
 import {
 	runBindSpace,
@@ -202,12 +203,18 @@ describe("startMcpServer", () => {
 		fetchManifestMock.mockReset();
 		invokePlatformToolMock.mockReset();
 		vi.mocked(track).mockClear();
+		// Clean baseline for the log-dir anchoring assertions below.
+		resetLogDir();
 	});
 
 	it("connects the stdio transport and registers two request handlers", async () => {
 		await startMcpServer("/repo");
 		expect(connectMock).toHaveBeenCalledTimes(1);
 		expect(capturedHandlers).toHaveLength(2);
+		// The server anchors the Logger's global dir to its (git-root) cwd so every
+		// tool-call log line lands in the repo's `.jolli/`, not a stray store under a
+		// subdirectory it was launched from.
+		expect(getLogDir()).toBe("/repo");
 	});
 
 	it("advertises the tools capability only when no menu is active", async () => {
@@ -376,6 +383,9 @@ describe("startMcpServer", () => {
 		expect(createStorage).not.toHaveBeenCalled();
 		expect(setActiveStorage).not.toHaveBeenCalled();
 		expect(connectMock).not.toHaveBeenCalled();
+		// Order invariant: setLogDir(cwd) must run AFTER this early return, so the
+		// throwaway temp cwd never becomes the global log dir.
+		expect(getLogDir()).toBeUndefined();
 	});
 });
 

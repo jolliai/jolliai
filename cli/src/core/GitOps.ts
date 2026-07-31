@@ -13,13 +13,64 @@ import { readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { CommitInfo, DiffStats, FileWrite, GitCommandResult } from "../Types.js";
-import { execFileAsyncHidden, spawnHidden } from "../util/Subprocess.js";
+import { execFileAsyncHidden, execFileSyncHidden, spawnHidden } from "../util/Subprocess.js";
 
 const MAX_GIT_BUFFER_BYTES = 10 * 1024 * 1024; // 10MB
 /** NUL byte — used as entry separator in `git ls-tree -z` output. */
 const NUL = "\x00";
 
 const log = createLogger("GitOps");
+
+/** Memoized git-worktree-root cache, keyed by the candidate directory. */
+const _stateRootCache = new Map<string, string>();
+
+/** Test-only: clears the memo so cases don't leak resolved roots into each other. */
+export function resetStateRootCache(): void {
+	_stateRootCache.clear();
+}
+
+/**
+ * Anchors a project working directory to its git worktree root via
+ * `git rev-parse --show-toplevel`, memoized per input. Falls back to `cwd` on
+ * any failure (not a git repo, git missing).
+ *
+ * ONLY for project-cwd entry points whose cwd is implicit and may be a
+ * subdirectory — AI session hooks (payload cwd), CLI telemetry, the MCP server
+ * (`process.cwd()`). Without this, a session started from a subdirectory forks a
+ * second, independent `.jolli/` store there and its memory silently never joins
+ * the main one. NEVER call this on an explicit Memory Bank root (`kbRoot`): that
+ * path is already the exact target and must be used verbatim (see
+ * SearchIndex.resolveIndexDir / MultiRepoCompile), and rooting it would collapse
+ * multiple Memory Bank entries into an enclosing repo's `.jolli/`.
+ *
+ * `--show-toplevel` returns the *current worktree* root, so a `.claude/worktrees/*`
+ * checkout still resolves to its own root (no regression).
+ *
+ * Silent by design: successfully anchoring a subdir to its root is the correct
+ * path, and this runs (memoized) once per hook process, so a user-visible
+ * warning would repeat every process and pollute stderr (warn is never
+ * suppressed). Surfacing pre-existing stray stores to the user is a separate,
+ * marker-gated concern, not this function's job.
+ */
+export function resolveStateRoot(cwd: string): string {
+	const cached = _stateRootCache.get(cwd);
+	if (cached !== undefined) return cached;
+	let root = cwd;
+	try {
+		const out = execFileSyncHidden("git", ["rev-parse", "--show-toplevel"], {
+			cwd,
+			encoding: "utf-8",
+			// Capture git's stderr so a non-git cwd doesn't leak "fatal: not a git
+			// repository …" to the terminal; the throw is handled below.
+			stdio: ["ignore", "pipe", "pipe"],
+		}).trim();
+		if (out) root = out; // git prints the toplevel in forward-slash form on every platform
+	} catch {
+		// Not a git repo / git missing — keep the input path.
+	}
+	_stateRootCache.set(cwd, root);
+	return root;
+}
 
 /**
  * Executes a git command and returns the result.
