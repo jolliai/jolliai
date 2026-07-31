@@ -29,6 +29,11 @@ object TelemetryEvents {
             "signed_out" to "User logged out. Props: none.",
             "ai_provider_selected" to "User chose jolli vs anthropic for LLM. Props: provider (discriminator).",
             "memory_bank_migrated" to "Migrate-to-Memory-Bank run. Props: outcome, repos, entries_bucket.",
+            "onboarding_progressed" to
+                "Per-install onboarding-funnel snapshot, emitted from a repo context and deduped by state tuple " +
+                "(+ daily heartbeat). Content-free — answers 'after install, where do people stall'. Props: " +
+                "in_git_repo, repo_enabled, capture_configured, capture_method (discriminator: " +
+                "local-agent/anthropic/jolli/none), memories_generated, memories_bucket.",
             // ── feature usage / adoption ──
             "command_invoked" to "Any CLI command ran (auto-emitted). Props: command (discriminator), ok, duration_ms.",
             "recall_performed" to "A recall was run. Props: hit, result_count_bucket.",

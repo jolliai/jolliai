@@ -815,6 +815,11 @@ class JolliMemoryService(private val project: Project) : Disposable {
             cachedStatus = newStatus
             workerBusyCached = computeWorkerBusy()
             notifyListeners()
+            // Onboarding-funnel snapshot from the status just computed here (the
+            // IntelliJ analog of VS Code's StatusStore.refresh hook), carrying
+            // surface="intellij". Deduped per repo, gated on telemetry being on,
+            // and never throws.
+            basePath?.let { ai.jolli.jollimemory.core.telemetry.OnboardingFunnel.maybeEmit(it, newStatus) }
             cachedStatus
         } catch (e: Exception) {
             // Check if the error is because .git was removed
