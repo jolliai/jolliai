@@ -5,7 +5,10 @@ import "./BuiltinBackends.js";
 import { getBackend } from "./BackendRegistry.js";
 
 describe("BuiltinBackends", () => {
-	it.each(["claude-code", "codex", "cursor-agent", "opencode"])("registers %s without importing LlmClient", (id) => {
-		expect(getBackend(id).id).toBe(id);
-	});
+	it.each(["claude-code", "codex", "cursor-agent", "opencode", "kimi"])(
+		"registers %s without importing LlmClient",
+		(id) => {
+			expect(getBackend(id).id).toBe(id);
+		},
+	);
 });

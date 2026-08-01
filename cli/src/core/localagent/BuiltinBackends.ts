@@ -1,5 +1,5 @@
 /**
- * Registers the four shipped local-agent backends.
+ * Registers the five shipped local-agent backends.
  *
  * Importing this module for its side effect is the ONLY supported way to
  * populate the registry. It exists because registration used to live at module
@@ -16,9 +16,11 @@ import { registerBackend } from "./BackendRegistry.js";
 import { ClaudeCodeBackend } from "./ClaudeCodeBackend.js";
 import { CodexBackend } from "./CodexBackend.js";
 import { CursorAgentBackend } from "./CursorAgentBackend.js";
+import { KimiCodeBackend } from "./KimiCodeBackend.js";
 import { OpenCodeBackend } from "./OpenCodeBackend.js";
 
 registerBackend(new ClaudeCodeBackend());
 registerBackend(new CursorAgentBackend());
 registerBackend(new CodexBackend());
 registerBackend(new OpenCodeBackend());
+registerBackend(new KimiCodeBackend());

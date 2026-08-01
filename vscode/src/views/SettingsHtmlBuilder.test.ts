@@ -115,11 +115,12 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain('value="claude-code"');
 	});
 
-	it("agent-tool dropdown lists all four local agent tools with their display labels", () => {
+	it("agent-tool dropdown lists all local agent tools with their display labels", () => {
 		expect(html).toContain('<option value="claude-code">Claude Code</option>');
 		expect(html).toContain('<option value="codex">Codex</option>');
 		expect(html).toContain('<option value="cursor-agent">Cursor</option>');
 		expect(html).toContain('<option value="opencode">OpenCode</option>');
+		expect(html).toContain('<option value="kimi">Kimi Code</option>');
 	});
 
 	it("agent-tool hint is tool-agnostic, not Claude-specific", () => {

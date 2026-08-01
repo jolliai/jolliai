@@ -1,0 +1,7 @@
+{
+  "id": "kimi",
+  "note": "Captured from a real `kimi --output-format stream-json --prompt <text>` run (kimi-code v0.31.1). success.json is the JSONL stdout: one {role:assistant,content} line + a {role:meta} resume-hint line parseResult ignores. The content here is a stand-in JSON payload; the load-bearing part is the line SHAPE, which parseResult depends on.",
+  "status": 0,
+  "signal": null,
+  "stderrTail": ""
+}

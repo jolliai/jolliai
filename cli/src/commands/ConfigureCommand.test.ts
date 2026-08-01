@@ -192,11 +192,11 @@ describe("ConfigureCommand — settable keys", () => {
 		);
 	});
 
-	it("accepts all four localAgentTool ids (claude-code, codex, cursor-agent, opencode)", async () => {
-		// Widened from a claude-code-only allowlist now that Codex, Cursor, and
-		// OpenCode backends are registered too — the CLI must let users pick any
-		// of them via `configure --set`, not just hand-edit config.json.
-		for (const tool of ["claude-code", "codex", "cursor-agent", "opencode"]) {
+	it("accepts all localAgentTool ids (claude-code, codex, cursor-agent, opencode, kimi)", async () => {
+		// Widened from a claude-code-only allowlist now that Codex, Cursor, OpenCode,
+		// and Kimi backends are registered too — the CLI must let users pick any of
+		// them via `configure --set`, not just hand-edit config.json.
+		for (const tool of ["claude-code", "codex", "cursor-agent", "opencode", "kimi"]) {
 			mockSaveConfig.mockClear();
 			await runConfigure(["--set", `localAgentTool=${tool}`]);
 			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ localAgentTool: tool }));

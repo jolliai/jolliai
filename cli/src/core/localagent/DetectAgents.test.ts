@@ -45,15 +45,21 @@ afterEach(() => {
 });
 
 describe("listPresentLocalAgents", () => {
-	it("returns all four in LOCAL_AGENT_TOOLS order when all are present", () => {
-		stub({ "claude-code": true, codex: true, "cursor-agent": true, opencode: true });
-		expect(listPresentLocalAgents().map((a) => a.id)).toEqual(["claude-code", "codex", "cursor-agent", "opencode"]);
+	it("returns all present tools in LOCAL_AGENT_TOOLS order when all are present", () => {
+		stub({ "claude-code": true, codex: true, "cursor-agent": true, opencode: true, kimi: true });
+		expect(listPresentLocalAgents().map((a) => a.id)).toEqual([
+			"claude-code",
+			"codex",
+			"cursor-agent",
+			"opencode",
+			"kimi",
+		]);
 	});
 
 	it("uses LOCAL_AGENT_TOOLS order, NOT BackendRegistry order", () => {
-		// BuiltinBackends registers Claude, Cursor, Codex, OpenCode. If this ever
-		// starts reading the registry, Cursor would precede Codex and this fails.
-		stub({ "claude-code": true, codex: true, "cursor-agent": true, opencode: true });
+		// BuiltinBackends registers Claude, Cursor, Codex, OpenCode, Kimi. If this
+		// ever starts reading the registry, Cursor would precede Codex and this fails.
+		stub({ "claude-code": true, codex: true, "cursor-agent": true, opencode: true, kimi: true });
 		const ids = listPresentLocalAgents().map((a) => a.id);
 		expect(ids.indexOf("codex")).toBeLessThan(ids.indexOf("cursor-agent"));
 	});
@@ -78,7 +84,7 @@ describe("listPresentLocalAgents", () => {
 			if (id === "codex") throw new Error("registry exploded");
 			return fake(id, true) as never;
 		});
-		expect(listPresentLocalAgents().map((a) => a.id)).toEqual(["claude-code", "cursor-agent", "opencode"]);
+		expect(listPresentLocalAgents().map((a) => a.id)).toEqual(["claude-code", "cursor-agent", "opencode", "kimi"]);
 	});
 
 	/**

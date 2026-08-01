@@ -128,7 +128,7 @@ describe("EnableCommand — promptSetup local-agent tool selection", () => {
 		// Top-level menu choice "3" = local agent; second-level menu choice "2" =
 		// Codex, per LOCAL_AGENT_TOOLS insertion order (claude-code, codex, ...).
 		// No tools present (beforeEach default), so the picker falls back to all
-		// four with a note.
+		// tools with a note.
 		h.promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("2");
 
 		await promptSetup();
@@ -142,6 +142,26 @@ describe("EnableCommand — promptSetup local-agent tool selection", () => {
 		// Anthropic-key prompt (which would call promptText a 3rd time and/or
 		// re-load config for that step).
 		expect(h.promptText).toHaveBeenCalledTimes(2);
+	});
+
+	it("marks the currently-configured tool with (current) in the picker", async () => {
+		// Config already drives local-agent → codex; the picker must show which one
+		// is active so the user isn't guessing. Two tools present routes straight
+		// into the sub-menu (>1 detected), so a single pick answer is consumed.
+		h.loadConfigFromDir.mockResolvedValue({
+			aiProvider: "local-agent",
+			localAgentTool: "codex",
+		} as Partial<JolliMemoryConfig>);
+		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([
+			{ id: "codex", label: "Codex" },
+			{ id: "opencode", label: "OpenCode" },
+		]);
+		h.promptText.mockResolvedValueOnce("1"); // keep Codex
+
+		await promptSetup();
+
+		expect(output).toContain("1. Codex  (current)");
+		expect(output).not.toContain("OpenCode  (current)");
 	});
 
 	it("re-asks (never pins the first tool) when the tool sub-menu answer is blank", async () => {
@@ -159,7 +179,7 @@ describe("EnableCommand — promptSetup local-agent tool selection", () => {
 			GLOBAL_CONFIG_DIR,
 		);
 		// Never probed claude-code on the way through — the blank consumed no candidate.
-		expect(logs.join("\n")).toContain("Enter a number between 1 and 5");
+		expect(logs.join("\n")).toContain("Enter a number between 1 and 6");
 	});
 
 	it("gives up and skips (writing nothing) when the sub-menu answer stays blank", async () => {
@@ -180,7 +200,7 @@ describe("EnableCommand — promptSetup local-agent tool selection", () => {
 		await promptSetup();
 
 		const subMenuPrompt = h.promptText.mock.calls[1][0] as string;
-		expect(subMenuPrompt).toContain("Choice (1-5)");
+		expect(subMenuPrompt).toContain("Choice (1-6)");
 		expect(subMenuPrompt).not.toContain("[1]");
 	});
 
@@ -321,7 +341,7 @@ describe("menu choice 3 — explicit local agent", () => {
 		expect(output).not.toContain("Cursor");
 	});
 
-	it("falls back to all four with a note when none are present", async () => {
+	it("falls back to all tools with a note when none are present", async () => {
 		vi.spyOn(detect, "listPresentLocalAgents").mockReturnValue([]);
 		vi.spyOn(detect, "isLocalAgentUsable").mockResolvedValue(true);
 		promptText.mockResolvedValueOnce("3").mockResolvedValueOnce("1");

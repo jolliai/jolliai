@@ -12,6 +12,7 @@ export const LOCAL_AGENT_TOOLS: Record<LocalAgentToolId, LocalAgentToolMeta> = {
 	codex: { label: "Codex", loginHint: "Run `codex login` to sign in with your ChatGPT plan." },
 	"cursor-agent": { label: "Cursor", loginHint: "Run `cursor-agent login` to sign in to Cursor." },
 	opencode: { label: "OpenCode", loginHint: "Run `opencode auth login` to connect a provider." },
+	kimi: { label: "Kimi Code", loginHint: "Run `kimi login` to sign in to your Moonshot account." },
 };
 
 // The `?? …` fallbacks below are unreachable per the `LocalAgentToolId` type,

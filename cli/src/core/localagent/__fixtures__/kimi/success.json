@@ -1,0 +1,2 @@
+{"role":"assistant","content":"{\"ok\":true,\"n\":42}"}
+{"role":"meta","type":"session.resume_hint","session_id":"session_e853c215-17b9-4b50-bc18-8bddce2bce68","command":"kimi -r session_e853c215-17b9-4b50-bc18-8bddce2bce68","content":"To resume this session: kimi -r session_e853c215-17b9-4b50-bc18-8bddce2bce68"}

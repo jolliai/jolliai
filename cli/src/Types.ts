@@ -334,7 +334,7 @@ export function isIngestOperation(op: GitOperation): op is IngestOperation {
 export type LlmCredentialSource = "anthropic-config" | "anthropic-env" | "jolli-proxy" | "local-agent";
 
 /** Which local-agent CLI tool drives generation when aiProvider === "local-agent". */
-export type LocalAgentToolId = "claude-code" | "codex" | "cursor-agent" | "opencode";
+export type LocalAgentToolId = "claude-code" | "codex" | "cursor-agent" | "opencode" | "kimi";
 
 /** Metadata from the LLM API call that generated this summary */
 export interface LlmCallMetadata {

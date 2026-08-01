@@ -93,6 +93,11 @@ export async function promptSetup(): Promise<void> {
 	// done for Claude Code. Two or more → there is a real choice to make, so ask.
 	const noCredential = !config.apiKey && !process.env.ANTHROPIC_API_KEY;
 	const override = localAgentOverrideFrom(config);
+	// The local-agent tool the config currently drives (matching the default
+	// applied everywhere else — an unset tool under local-agent means claude-code),
+	// so the picker can mark it "(current)". Undefined when local-agent isn't the
+	// active provider, i.e. nothing is current to mark.
+	const current = config.aiProvider === "local-agent" ? (config.localAgentTool ?? "claude-code") : undefined;
 	if (noCredential) {
 		const present = listPresentLocalAgents(override);
 		if (present.length === 1) {
@@ -110,7 +115,7 @@ export async function promptSetup(): Promise<void> {
 			// Anthropic key / skip) is still owed to them. Only "exhausted" falls
 			// through: an explicit "Skip for now" is the user's own decision and has
 			// already printed where to configure later.
-			if ((await handleLocalAgent(configDir, present, override)) !== "exhausted") return;
+			if ((await handleLocalAgent(configDir, present, override, current)) !== "exhausted") return;
 			console.log("\n  No usable local agent CLI — here are the other ways to generate summaries.");
 		}
 	}
@@ -137,7 +142,7 @@ export async function promptSetup(): Promise<void> {
 		// Outcome deliberately ignored: the user picked the local-agent route from
 		// this very menu, so "exhausted" has nowhere better to fall through to —
 		// re-offering the menu here would loop.
-		await handleLocalAgent(configDir, undefined, override);
+		await handleLocalAgent(configDir, undefined, override, current);
 	} else if (choice === "4") {
 		console.log("\n  Skipped. Configure later with 'jolli auth login' or 'jolli configure'.");
 		console.log(`    ${join(configDir, "config.json")}\n`);
@@ -238,6 +243,7 @@ async function handleLocalAgent(
 	configDir: string,
 	candidates?: DetectedAgent[],
 	override?: LocalAgentOverride,
+	current?: LocalAgentToolId,
 ): Promise<LocalAgentPickOutcome> {
 	const detected = candidates ?? listPresentLocalAgents(override);
 	const none = detected.length === 0;
@@ -270,7 +276,10 @@ async function handleLocalAgent(
 		console.log("\n  Which local agent CLI would you like to use?\n");
 		if (none) console.log("    (None detected on this machine — pick one to configure anyway.)\n");
 		list.forEach((a, i) => {
-			console.log(`    ${i + 1}. ${a.label}`);
+			// Mark the tool the config already drives, so the user can see what they
+			// are on without leaving the menu (the picker otherwise gives no hint).
+			const marker = a.id === current ? "  (current)" : "";
+			console.log(`    ${i + 1}. ${a.label}${marker}`);
 		});
 		console.log(`    ${skipChoice}. Skip for now (configure later)`);
 
