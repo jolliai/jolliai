@@ -68,7 +68,7 @@ Pill color is chosen by:
 | Pin kind | Color source |
 | --- | --- |
 | conversations | Producer color map (claude=amber, gemini=emerald, codex=violet, opencode=cobalt, cursor=crimson), neutral gray otherwise. |
-| plans / notes / references / memories | Tag color map keyed by the letter tag (P=blue, N=green, S=amber, L=violet, GH=gray, J=blue, No=gray), neutral gray otherwise. |
+| plans / notes / references / memories | Tag color map keyed by the letter tag (P=blue, N=green, S=amber, L=violet, GH=gray, J=blue, No=gray), neutral gray otherwise. **Two of those keys are now unreachable** — see "Two dead keys in the tag color map" under Notable Behavior. |
 
 The pill is a rounded rectangle with bold white text, a minimum width, and a fixed small height.
 
@@ -214,6 +214,7 @@ The panel holds no timers or external listeners and releases nothing special on 
 - **Opening a memory pin replaces whatever memory was already showing.** Memory opening goes through the shared single-memory-tab opener, which allows at most one memory tab per project. Clicking through several memory pins in a row therefore reuses one tab rather than accumulating tabs, and there is no way to keep two pinned memories open side by side. (Notable; the list's "several pinned memories" framing does not suggest it.)
 - **The panel fits to content and owns no scroll bar.** It participates in the section's single shared scroll bar; every render revalidates the whole panel so the section re-measures.
 - **The lead is logo-first for conversation pins only.** Context-kind pins always render a colored letter pill, never a logo.
+- **Two dead keys in the tag color map, and one wrong colour, because the producer side moved and this map did not.** The map itself is unchanged, but the badges written into the store changed underneath it. The context panel that creates reference pins used to stamp its own letters; it now stamps the letter from the shared source-presentation table (spec 313), which is single-letter across all twelve sources. A GitHub reference is therefore pinned as `"G"` and a Notion reference as `"N"`. The map's `GH` and `No` entries can no longer be produced by any writer — they are dead keys — and the two affected pins resolve elsewhere: `G` misses the map entirely and falls through to the neutral gray fallback (which happens to be close to the intended GitHub gray), while `N` **hits the notes entry and paints a Notion reference pin green**, the colour reserved for notes. Nothing distinguishes the two on screen. This is observed behavior, not intent: the drift was introduced by the producer-side change and the consumer map was never updated. (Surprising.)
 - **The empty-state render path does not fire the count callback.** The count callback is fired from the data render path (which reports `0` for an empty list); the standalone empty-state render used at construction simply shows the label.
 
 ## Shared Behavior
@@ -226,4 +227,4 @@ The panel holds no timers or external listeners and releases nothing special on 
 - **Markdown preview utility** — renders plan/note/reference markdown.
 - **Terminal-resume utility** — resumes a Claude session; this panel only supplies session metadata.
 - **Tool-window section frame** — owns the PINNED header, count suffix, collapse, gear-menu visibility, and the shared scroll bar.
-- **Source panels (conversations / context / committed memories)** — own pin creation; this panel is the consumer surface.
+- **Source panels (conversations / context / committed memories)** — own pin creation; this panel is the consumer surface. The letter a reference pin carries is decided there, from the shared source-presentation table (spec 313); this panel only looks that letter up in its own colour map.

@@ -47,8 +47,23 @@ Regardless of which dispatch tier runs, these fields on the new root are copied 
 
 - Article-style metadata (a server-side article identifier and its public URL).
 - The accumulated list of orphaned article identifiers awaiting cleanup.
-- Plan references and note references.
+- Plan references, note references, external-entity references, and skill references.
 - End-to-end test guidance scenarios.
+
+### Merged reference fields (old ∪ new, new wins)
+
+The four reference kinds above are not copied blindly: the hoisted (prior) set is unioned with whatever the amend itself newly detected, keyed per kind, with the new entry winning a collision. Each merged field is written only when non-empty, and each must be listed explicitly on the new root — the hoist spread alone would silently keep the old value, and an omission would read as "the amend reverted this artifact".
+
+The key each kind merges on differs, and one of them differs deliberately:
+
+| Kind | Merge key |
+| --- | --- |
+| plan | the slug with its trailing archive-hash suffix stripped |
+| note | the identifier with its trailing archive-hash suffix stripped |
+| reference | `<source>:<nativeId>` |
+| skill | `<source>:<skill>`, **verbatim — no suffix strip** |
+
+Skills are the exception because they do not carry the archive hash in the identifier they are keyed on. A plan or note ref embeds it (`<slug>-<hash8>`), so the suffix has to be stripped to recover a base key; a skill ref keeps its hash in its separate archive key and leaves the skill id raw. Stripping anyway would silently truncate any skill id that happens to end in eight hex characters, folding two distinct skills into one row here while the exclusion audit below and the tree accumulation both kept them apart — three derivations of one key that have to agree.
 
 ### Regenerated or recomposed fields
 
@@ -108,6 +123,10 @@ When no prior summary exists for the prior commit hash (rare: the original commi
 - If the delta is trivial under the same threshold used for Tier A, the migration is skipped — there is nothing useful to record.
 - Otherwise, the delta-call output is stored as a fresh leaf summary at the new commit hash, with the new commit's own full-diff statistics and the captured transcript artifact, but with no children. The fresh leaf is filed under the enqueue-captured branch (legacy-entry fallback to the live branch), and the plans, notes, and references currently active on **that** branch — minus any the user deselected in the sidebar — are associated with the new commit hash (the prior-summary tiers migrate references via re-association instead, since a fresh leaf has no prior summary to migrate from).
 
+### AI-exclusion audit on the new root
+
+An item cannot be both attached to a summary and listed on it as AI-excluded — that is a self-contradiction the display surfaces would render twice. So before the new root is emitted, the AI-excluded list is filtered against the set of base keys that are actually attached, computed per kind from the merged reference fields above. All four kinds are audited — plan, note, reference and **skill** — even though only references collide in practice (a re-referenced item committed earlier has no guard row, so it can re-enter the soft-exclude set while its old snapshot is still hoisted; plans and notes skip committed guards upstream). The skill set is built from the same `<source>:<skill>` key the merge uses, which is why the three derivations of that key have to agree.
+
 ### Persistence
 
 In every tier the new root is written through the same summary-store entry point used by leaf commits, which atomically updates the index alongside the payload. Storing the new root never deletes the prior summary's payload file — the prior commit hash still resolves directly to its own original payload.
@@ -127,9 +146,17 @@ The prior summary's index entry transitions from a root to a descendant (its par
 
 The pipeline checks whether the new commit hash already has an index entry before writing. When it does, the migration is treated as already performed and no payload is rewritten.
 
-### Re-association of plan and note references is unconditional
+### Re-association of plan, note and skill references is unconditional
 
-Every tier ends with a re-association step that walks both the plan-reference list and the note-reference list on the prior summary, updating each entry in the corresponding registries to point at the new commit hash. The plan and note registries are independent of the summary store — they live in local state files — so the re-association is what keeps them in sync with the rewrite.
+Every tier ends with a re-association step that walks the plan-reference list, the note-reference list and the skill-reference list on the prior summary, updating each entry in the corresponding registries to point at the new commit hash. Those registries are independent of the summary store — they live in local state files — so the re-association is what keeps them in sync with the rewrite. The skill arm re-anchors a guard row rather than an artifact row and is driven by the reference's archive key, alongside the set of every collapsed hash in the subtree (a single-element set here, plus its descendants); its match rule is stated in full by the squash-consolidation topic, which shares the step.
+
+### Skill refs merge on the raw registry key, not through the archive-hash strip
+
+Plans and notes carry the archive short hash inside the identifier they are keyed on, so their merge key is that identifier with the suffix stripped. A skill ref does not: its hash lives in a separate archive key and its skill id stays raw. Applying the same strip to it would truncate any id ending in eight hex characters and silently fold two distinct skills into one row at this one site — while the exclusion audit and the tree-level accumulation, which both derive the same key without stripping, kept them apart. The deliberate asymmetry is what keeps those three derivations in agreement.
+
+### Skills are hoisted onto the new root and left on the child
+
+The child copy attached to the new root is hoist-stripped, but the strip has no skill arm, so the root and the wrapped prior summary hold the same skill references. The tree accumulation deduplicates by archive key before summing, precisely so a later squash's recursive walk — which meets each hoisted reference from both ends — does not inflate the counts. The field is emitted on the root only when the merged result is non-empty.
 
 ### Conservative thresholds favor running the model
 
@@ -150,7 +177,8 @@ The prior summary's payload file is never deleted by this pipeline. A subsequent
 ## Shared Behavior
 
 - **Operation queue** — the pipeline runs as the handler for an enqueued amend operation; it does not detect the rewrite itself.
-- **Summary-tree format** — the unified-format root, hoist-stripping rules for the embedded prior summary, the legacy-aware "effective topics" resolver, and the consolidation-source expansion.
+- **Summary-tree format** — the unified-format root, hoist-stripping rules for the embedded prior summary (and the absence of a skill arm in them), the skill accumulation and its archive-key deduplication, the legacy-aware "effective topics" resolver, and the consolidation-source expansion.
+- **Skill working record and archival** — the registry rows behind the merged skill references, and the guard migration the re-association step performs for them, are owned by specs 319 and 322.
 - **Summary index** — the index upsert that paired with the new payload write reclassifies the prior summary entry from root to descendant.
 - **Plan registry** and **note registry** — the independent state files updated by the unconditional re-association step.
 - **Transcript pipeline** — provides the conversational entries within the migration's time window and the persisted transcript artifact.

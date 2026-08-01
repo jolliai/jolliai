@@ -32,7 +32,7 @@ The machine-global configuration holds two coupled local-agent fields: **which a
 
 | Field | Meaning | Records its owner? |
 |---|---|---|
-| Agent-tool selection | One of four enumerated tool identifiers; absent means "the default tool". | n/a — it *is* the owner |
+| Agent-tool selection | One of the enumerated tool identifiers; absent means "the default tool". | n/a — it *is* the owner |
 | Explicit executable path | An absolute path that **replaces discovery** for one tool's binary. Absent means "discover automatically". | **No.** A bare string with nothing tying it to a tool. |
 
 The asymmetry is the whole problem. Two configurations that a reader cannot tell apart — one where the path is the current tool's own binary, one where it is a previous tool's — differ only in history, and history is not stored.
@@ -89,9 +89,9 @@ The rule only pays off because the readers assume it. Every read of the explicit
 
 ### Writers that reach the chokepoint carrying the tool key
 
-Three surfaces reach it, but they do not contribute comparable numbers of writers, and the asymmetry is the point. Two surfaces contribute **six** discrete, individually-authored writers, each carrying the tool key deliberately. The third — the IDE plugin — contributes **every write it makes**, because it does not author field sets at all: it serializes its whole configuration record on each save, so the tool key is present whether or not that save had anything to do with tool selection. Its settings dialog, its preferences page, its onboarding panel, its memory view, its authentication service and its telemetry and sign-off helpers all reach the chokepoint the same way, which is roughly ten more sites and grows silently with every new save path added on that surface.
+Three surfaces reach it, but they do not contribute comparable numbers of writers, and the asymmetry is the point. The command-line surface and the desktop editor extension contribute discrete, individually-authored writers — the ones enumerated in the table below — each carrying the tool key deliberately. The third — the IDE plugin — contributes **every write it makes**, because it does not author field sets at all: it serializes its whole configuration record on each save, so the tool key is present whether or not that save had anything to do with tool selection. Its settings dialog, its preferences page, its onboarding panel, its memory view, its authentication service and its telemetry and sign-off helpers all reach the chokepoint the same way, and the set grows silently with every new save path added on that surface.
 
-So the total is on the order of **sixteen**, and — unlike the other two surfaces — it is not a number worth maintaining: on the IDE plugin the correct statement is "all of them", and any future save there joins the set automatically. Only one writer can exercise the both-keys exemption on purpose:
+So there is no total worth maintaining: unlike the other two surfaces, the IDE plugin's contribution has no enumerable size — on it the correct statement is "all of them", and any future save there joins the set automatically. Only one writer can exercise the both-keys exemption on purpose:
 
 | Writer | Carries a path? | Effect on a stored path |
 |---|---|---|

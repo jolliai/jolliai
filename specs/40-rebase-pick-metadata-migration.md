@@ -8,10 +8,10 @@ The path that, when a rebase rewrites a commit hash without changing the commit'
 
 **In scope:**
 - Inputs identifying the one-to-one mapping from a prior commit hash to a new commit hash.
-- The data preserved verbatim from the prior summary.
+- The data preserved verbatim from the prior summary, including the skill references copied onto the new root.
 - The fields recomputed for the new commit.
-- The construction of a new root with the prior summary attached as a stripped child.
-- Re-association of plan references and note references with the new commit hash.
+- The construction of a new root with the prior summary attached as a stripped child, and the one metadata kind that is deliberately *not* stripped from it.
+- Re-association of plan references, note references and skill guard rows with the new commit hash.
 - Index reclassification of the prior entry from root to descendant.
 - Behavior when no prior summary exists for the source hash.
 
@@ -42,9 +42,11 @@ Copied from the prior summary onto the new root:
 - The prior ticket identifier, when present.
 - Article-style metadata (a server-side article identifier and its public URL).
 - The accumulated list of orphaned article identifiers awaiting cleanup.
-- Plan references and note references.
+- Plan references, note references, external-entity references, and skill references — all copied onto the new root, no merge needed.
 - End-to-end test guidance scenarios.
 - The branch name (rebase-pick is treated as branch-preserving for this purpose).
+
+Skill references are copied for the same reason references are: without the copy, a rebase-picked commit loses its skill record from the root, and the PR-wide aggregate, the sidebar skill rows and the exported skill table all read nothing — the references would survive only on the wrapped child, which none of those read paths walk. Each field is written only when the prior summary carried it.
 
 ### Recomputed fields
 
@@ -67,11 +69,19 @@ The new root is a unified-format summary node whose own children list is exactly
 3. Compute the new commit's full diff statistics against its parent; on diff failure (no parent reachable, etc.), fall back to a zeroed statistics record rather than aborting.
 4. Build the new root: copy the preserved fields, set the recomputed fields, set the commit-type marker to "rebase", and attach the prior summary, hoist-stripped, as the sole entry in the children list.
 5. Persist the new root and the updated index in one atomic batch under the new commit hash. The atomic batch checks for an existing index entry at the new hash and short-circuits if one is already present.
-6. Re-associate plan and note references from the prior summary with the new commit hash by updating each registry entry's commit-hash field in the local state files.
+6. Re-associate plan, note and skill references from the prior summary with the new commit hash by updating each registry entry's commit-hash field in the local state files. The skill arm re-anchors a guard row (not an artifact row), is driven by the reference's archive key, and is passed the set of every hash in the collapsed subtree — here the prior summary and its descendants — so a reference hoisted by an earlier rewrite still finds its already-migrated guard. The shared match rule is stated in full by the rebase-squash consolidation topic.
 
 ### No language-model call
 
 The migration is purely structural. No transcript is read. No diff content is sent to a language model. No new narrative is produced. The persisted topics, recap, and ticket identifier are byte-for-byte identical to those resolved off the prior summary.
+
+### No new skill archival
+
+Unlike the squash and plain-commit paths, this migration archives **no** new skill rows: a rebase-pick lands no new work, so there is nothing uncommitted to freeze. The only skill-related work is the copy onto the new root described above and the guard migration in the re-association step below.
+
+### Skills are copied to the root but NOT stripped from the child
+
+The hoist-strip applied to the embedded prior summary has no skill arm — unlike references, which it does strip — so the root and the child it wraps end up holding the same skill references. That is the established shape rather than a leak, and it is safe only because the tree-level skill accumulation deduplicates by archive key before summing: a later squash's recursive walk meets each of those references from both ends, and blind accumulation would inflate every count by one generation per collapse.
 
 ### Absent-prior-summary fallback
 
@@ -100,9 +110,9 @@ Because no diff content is sent to the model, the topics are not refreshed again
 
 The atomic batch checks the index for the new hash before writing. When the entry already exists, the migration treats itself as already performed and returns without rewriting either the payload or the index.
 
-### Re-association of plan and note references
+### Re-association of plan, note and skill references
 
-Plan-reference and note-reference entries from the prior summary are walked and the corresponding registry entries are updated to point at the new commit hash. This step is unconditional within the migration when the prior summary exists, and runs even though the embedded child copy retains the references — the user-facing registries live in independent local state files, not in the summary tree, so they need an explicit update.
+Plan-reference, note-reference and skill-reference entries from the prior summary are walked and the corresponding registry entries are updated to point at the new commit hash. This step is unconditional within the migration when the prior summary exists, and runs even though the embedded child copy retains the references — the user-facing registries live in independent local state files, not in the summary tree, so they need an explicit update.
 
 ### Operation-source propagation
 
@@ -111,8 +121,8 @@ The migration carries the operation-source marker forward onto the new root when
 ## Shared Behavior
 
 - **Operation queue** — the migration is the handler for an enqueued rebase-pick operation; one queue entry per one-to-one mapping group.
-- **Summary-tree format** — the unified-format root, the legacy-aware effective-topics resolver, the hoist-stripping rule applied to the embedded prior summary.
+- **Summary-tree format** — the unified-format root, the legacy-aware effective-topics resolver, the hoist-stripping rule applied to the embedded prior summary (and its lack of a skill arm), and the skill accumulation whose archive-key deduplication is what makes the duplicated root/child skill references safe.
 - **Summary index** — the upsert path that reclassifies the prior summary's entry from root to descendant during the same atomic batch as the payload write.
-- **Plan registry** and **note registry** — the local state files updated by the explicit re-association step.
+- **Plan registry** and **note registry** — the local state files updated by the explicit re-association step. The skill working record whose guard rows are migrated in the same step is owned by spec 319; the shared guard match rule is stated by the rebase-squash consolidation topic.
 - **Cross-process lock** — gates the atomic write of the new payload and updated index.
 - **Rebase-squash consolidation** — the sibling topic covering the N-to-one variant.

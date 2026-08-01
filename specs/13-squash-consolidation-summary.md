@@ -12,7 +12,8 @@ Produce a single summary for a new commit that resulted from squashing N source 
 - The mechanical fallback when the LLM call returns no usable content, fails, or repeatedly produces a format-incompliant response.
 - The post-call ticket-id resolution priority chain.
 - The atomic write of the consolidated root summary plus stripped-children placeholders, including hoisted functional metadata fields, in a single ref-update.
-- Re-association of plans and notes from the source commits to the new squash commit.
+- The archival of uncommitted skill usage onto the squash commit, its position **before** the merge, and the user-exclusion set it honors.
+- Re-association of plans, notes and skill guards from the source commits to the new squash commit, including the collapsed-hash set the skill guard match needs.
 - The two paths into this consolidation: a queue-driven squash entry, and a queue-driven squash-rebase entry — both served by one implementation, whichever host produced the squash.
 
 **Out of scope (boundaries):**
@@ -144,17 +145,37 @@ The same guarded scan is used in all three places that need a ticket: the prompt
 
 Either way the payload has the same shape; the only difference is whether `llm` metadata is present.
 
+### Step 7b — Archive uncommitted skill usage onto the squash commit
+
+A squash lands new work, so any skill usage the working-area registry has not yet frozen onto a commit belongs on the squash commit exactly as it would on a plain commit. This step runs **before** the atomic write below, not after it, because the resulting references have to be hoisted onto the root that write produces — there is no second write to patch them in afterwards. Unlike plans and notes there is no separate "detect what is active" step: the archival step reads the registry itself.
+
+1. Read the persisted user-exclusion selection for the project and take its skill set (absent means "nothing excluded").
+2. Invoke the shared skill-archival step with the new squash commit hash, the branch taken from the first source summary, and that exclusion set. It returns two things: a list of skill references to place on the new root, and a list of raw working-file bytes to store.
+3. If the byte list is non-empty, write it to the parallel ref under a message naming the count and the abbreviated squash hash.
+4. Pass the returned references into the merge step below as an **additional** set, alongside the ones collected from the children.
+
+The exclusions are applied **inside** the archival step, not as a filter on its result. The step both guards the working-area row and emits parallel-ref bytes, so post-filtering would leave an excluded skill archived on the ref while merely hiding it from the summary.
+
 ### Step 8 — Write the consolidated root atomically
 1. Compute the squash commit's diff-stats by diffing it against its parent.
-2. Hoist functional metadata from sources: most-recent-activity documentation-article identity, the union of orphaned-doc ids, the union of plans and notes, the combined E2E scenarios.
+2. Hoist functional metadata from sources: most-recent-activity documentation-article identity, the union of orphaned-doc ids, the union of plans and notes, the combined E2E scenarios, and the **accumulation** of every source's skill references together with the freshly-archived ones from Step 7b — folded through the shared skill accumulation, which deduplicates by archive key before summing (see the summary-tree spec). The field is written only when the result is non-empty.
 3. Strip the eight Hoist-managed fields (doc id, doc URL, orphaned-doc-ids, plans, notes, E2E scenarios, topics, recap) from each source so that the children list contains only un-hoisted summary skeletons. Stripping is recursive into descendants.
 4. Build the new root with the consolidated payload, the hoisted metadata, the stripped children sorted newest-first.
 5. Run an idempotency check: if the new commit hash is already an indexed root, skip the write.
 6. Flatten the new root into index entries (each child's commit hash reclassified with the new root as its parent), merge with the existing index entries in a map, and assemble a new index document.
 7. Issue a single atomic ref-update that writes the new root summary file, the updated index file, and any other related files as one commit on the parallel ref.
 
-### Step 9 — Re-associate plans and notes
+### Step 9 — Re-associate plans, notes and skill guards
 For every plan slug recorded on any source's plans field, update the plans registry to point that slug at the new commit hash. For every note id recorded on any source's notes field, update the notes registry to point that note at the new commit hash.
+
+For every skill reference recorded on any source, migrate that skill's **guard row** in the registry to the new commit hash. This differs from plans and notes in two ways:
+
+- The re-association is driven by the reference's **archive key**, whose embedded short hash is split off to recover the registry key directly.
+- It is passed, in addition, the set of **every** commit hash in the subtree being folded away — roots included, computed by a recursive walk over the source summaries and their children before the loop starts. A guard matches when its recorded hash either starts with the archive key's own embedded short hash **or** prefix-matches (in either direction) one of those collapsed hashes.
+
+The collapsed-hash set is what makes a repeated squash work. A hoisted reference keeps the archive key of the commit that *originally* archived it, while the guard has since been migrated by an earlier squash — so matching on the embedded hash alone worked once and then silently stopped, stranding the row on a commit that no longer existed, where nothing could ever archive it again.
+
+A row with no content-hash guard, or whose guard matches neither test, is skipped with a debug line. The guard's archived-totals baseline is preserved across the migration: it records how much of the row a commit already claimed, and rewriting commit metadata does not un-claim any of it — dropping it would make the row's whole history look uncommitted again and republish it onto the next commit.
 
 ### LLM-call decision summary
 The LLM is called in both the squash and squash-rebase paths whenever there is at least one source with non-empty topics or a non-empty recap, on every surface — all of them run this one pipeline. There is no scenario in which the squash path skips the LLM unconditionally — the README phrasing "the worker skips LLM for squash" is out of date relative to current behavior.
@@ -173,8 +194,9 @@ In every case the writer ends up with a non-null consolidated payload (either LL
 - Loaded → Decided (no-content): zero sources, or all sources empty → return null; no write performed.
 - Loaded → Decided (LLM): one LLM call (and possibly one strict retry) → success result, or null on failure.
 - Decided (null) → Mechanical: caller layer runs the mechanical fallback to produce a consolidated payload.
-- Consolidated → Persisted: single atomic ref-update writes the new root, the stripped children, the updated index, and the hoisted metadata.
-- Persisted → Re-associated: plan and note registries point at the new commit hash.
+- Consolidated → Archived: uncommitted skill rows are guarded at the new hash and their bytes stored on the parallel ref.
+- Consolidated → Persisted: single atomic ref-update writes the new root, the stripped children, the updated index, and the hoisted metadata (including the accumulated skill references).
+- Persisted → Re-associated: plan and note registries point at the new commit hash; skill guard rows are migrated to it.
 
 ### Index-level
 The new index entry tree replaces the existing entries: each previously-root source becomes a child entry of the new squash root. The old root summaries' files are NOT deleted from the parallel ref (the storage invariant), so a direct file read of an old hash continues to return that commit's original summary.
@@ -190,6 +212,10 @@ The new index entry tree replaces the existing entries: each previously-root sou
 - **Children are sorted newest-first before stripping.** Display layers iterate children in arrival order; sorting at write time keeps the most recent source first. (Notable.)
 - **Hoisting includes documentation-article identity from the most-recent-activity child only.** When several children carry their own doc id / URL, the one whose activity date is latest wins; the others' doc ids are appended to the orphaned-doc-ids accumulator for later cleanup. (Surprising; intentional.)
 - **Stripping is recursive.** Deeply nested squash trees (squash of squashes) have their Hoist-managed fields stripped at every depth, so only the new root carries authoritative copies. (Notable.)
+- **Skills are hoisted but NOT stripped off the children.** The strip function has no skill arm, so a root and the child it wraps end up holding the same reference. That is the established squash shape rather than a leak: the accumulation deduplicates by archive key before summing, precisely so a later squash's recursive walk — which meets each hoisted reference from both ends — does not inflate the count by one generation per squash. (Surprising; intentional, and it depends entirely on that deduplication.)
+- **Skill archival happens before the merge, not after it.** The consolidation writes the root once; there is no follow-up write that could attach references produced afterwards. So the freshly-archived references must exist before the merge runs and are handed to it as an extra input. (Notable; an ordering constraint, not a preference.)
+- **A user's skill exclusion is applied inside the archival step, never as a post-filter.** Archiving guards the working-area row *and* emits parallel-ref bytes, so filtering the returned references would leave an excluded skill's content on the ref while hiding it from the summary — the exclusion would be cosmetic. (Surprising; intentional, and the same rule the plain-commit path follows.)
+- **Skill guard re-association needs the whole collapsed subtree, not just the source roots.** A hoisted skill reference keeps the archive key of the commit that first archived it, while the guard has already moved. Matching on the key's embedded hash alone therefore worked for the first squash and silently stopped for the second, stranding the row on a commit that no longer existed — where nothing could ever archive that skill again. Passing every hash in the folded-away subtree, roots included, is the fix. (Surprising; a real regression-closer.)
 - **Old source summary files are never deleted.** The merge writes the new root and updates the index so that old hashes reclassify as children, but the per-hash summary file for each old hash remains in the parallel ref. A direct file read of an old hash continues to return its original (un-stripped) content. (Surprising; intentional.)
 - **Atomicity is at the batch level.** The new root, the updated index, and any companion files land in a single commit on the parallel ref. There is no partial-write state visible to a reader. (Notable.)
 - **No locking inside the consolidation primitive.** Concurrent writers race at the ref-update layer; one wins and the other's commit becomes unreachable. The queue worker serializes externally. (Notable.)
@@ -205,4 +231,5 @@ The new index entry tree replaces the existing entries: each previously-root sou
 - The recap content rules (forbidden subjects, forbidden connectives, paragraph balance) are shared with the per-commit and standalone-recap templates; see "Recap Paragraph Generation".
 - The Hoist-stripping function used to clean children is the same one used by amend and 1:1 rebase migration.
 - Persistence of the new root and its companion index entries is performed via the storage primitive described in "Orphan Branch Summary Storage".
-- The summary tree shape (root + stripped children, the eight Hoist-managed fields) is described in the summary tree structure spec.
+- The summary tree shape (root + stripped children, the eight Hoist-managed fields) and the skill accumulation this consolidation folds through — including why it accumulates rather than dedupes, and why it dedupes by archive key first — are described in the summary tree structure spec.
+- The skill-archival step invoked at Step 7b, the working-area registry row it guards, and the "uncommitted delta" rule that decides how much of a row belongs on this commit are owned by spec 322 (with the working record itself owned by spec 319). The user-exclusion selection it reads is owned by spec 188.

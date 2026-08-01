@@ -51,7 +51,7 @@ Exactly the following keys are accepted by `--set` / `--remove` / `--list-keys`.
 | `excludePatterns` | string array | Glob patterns, comma-separated on input. |
 | `localFolder` | string | Absolute path to the Memory Bank folder (per-machine). |
 | `aiProvider` | enum | AI summary provider. One of `anthropic`, `jolli`, `local-agent`. |
-| `localAgentTool` | enum | Which local agent CLI to drive when `aiProvider=local-agent`. One of `claude-code`, `codex`, `cursor-agent`, `opencode`. |
+| `localAgentTool` | enum | Which local agent CLI to drive when `aiProvider=local-agent`. One of `claude-code`, `codex`, `cursor-agent`, `opencode`, `kimi`. |
 | `localAgentPath` | string | Explicit path to the local agent binary, overriding search-path discovery. |
 | `syncTranscripts` | boolean | Include raw AI conversation transcripts in cloud sync. |
 | `syncPollIntervalSec` | number | Sync poll interval in seconds. Must be a positive integer clamped to the range `5400`–`86400` (90 min floor, 24h ceiling). |
@@ -77,7 +77,7 @@ The `value` portion of `--set key=value` is a single string from the command lin
 - **Boolean keys** (`codexEnabled`, `geminiEnabled`, `claudeEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `clineEnabled`, `devinEnabled`, `antigravityEnabled`, `mcpPlatformToolsEnabled`, `syncTranscripts`, `syncOnPush`) — case-insensitive. `true`, `1`, `yes` → `true`; `false`, `0`, `no` → `false`. Anything else is rejected: `<key> must be true/false (got: <raw>)`.
 - **`logLevel`** — must be exactly one of `debug`, `info`, `warn`, `error`. Failure: `logLevel must be one of: debug, info, warn, error (got: <raw>)`.
 - **`aiProvider`** — must be exactly one of `anthropic`, `jolli`, `local-agent`. Failure: `aiProvider must be one of: anthropic, jolli, local-agent (got: <raw>)`.
-- **`localAgentTool`** — must be exactly one of `claude-code`, `codex`, `cursor-agent`, `opencode`. Failure: `localAgentTool must be one of: claude-code, codex, cursor-agent, opencode (got: <raw>)`. The accepted set and the order it is listed in are **derived from the single agent-tool registry** that also supplies each tool's display name and sign-in hint, so this key's accepted values cannot drift from the tools the setup picker offers (spec 57) or the ones the runtime can actually drive (spec 280). Adding a tool to that registry widens this key with no edit here.
+- **`localAgentTool`** — must be exactly one of `claude-code`, `codex`, `cursor-agent`, `opencode`, `kimi`. Failure: `localAgentTool must be one of: claude-code, codex, cursor-agent, opencode, kimi (got: <raw>)`. The accepted set and the order it is listed in are **derived from the single agent-tool registry** that also supplies each tool's display name and sign-in hint, so this key's accepted values cannot drift from the tools the setup picker offers (spec 57) or the ones the runtime can actually drive (spec 280). Adding a tool to that registry widens this key with no edit here.
 - **`globalInstructions`** — must be exactly one of `enabled`, `disabled`. Failure: `globalInstructions must be one of: enabled, disabled (got: <raw>)`.
 - **`excludePatterns`** — split on `,`, each part trimmed, empty parts dropped. Stored as a string array.
 - **String keys** (`apiKey`, `model`, `jolliApiKey`, `authToken`, `localFolder`, `localAgentPath`) — stored as-is. The `=` sign that delimits key and value is matched on the **first** occurrence, so values containing `=` (e.g. base64-padded tokens) are preserved verbatim.

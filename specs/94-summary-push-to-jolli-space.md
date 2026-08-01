@@ -100,7 +100,7 @@ Used by the client to remove a server-side document whose local origin no longer
 | Path                  | `/api/push/jollimemory/<docId>`      |
 | Headers               | `Authorization`, `x-jolli-client`, and `x-tenant-slug` / `x-org-slug` under the same conditions as the push. No body is sent. |
 | Success status codes  | Any `2xx` is treated as success (the server may return `200` or `204`; the client does not distinguish). |
-| Failure              | `401`/`403` surface as a not-authenticated error (same category as on push); any other non-2xx is surfaced as a delete-failed error carrying the `<status>`. |
+| Failure              | `401`/`403` **both** surface as a not-authenticated error here (`cli/src/core/JolliMemoryPushClient.ts:701-702`) — deliberately *unlike* the push path, where `403` maps to permission-denied (see "Handle the response" step 6). Any other non-2xx is surfaced as a delete-failed error carrying the `<status>`. |
 
 ## Behavior
 
@@ -127,13 +127,17 @@ Used by the client to remove a server-side document whose local origin no longer
 
 1. On `2xx` with parseable JSON, resolve with `{ url, docId, jrn, created }`.
 2. On `412` with `error: "binding_required"`, surface the binding-required error with the echoed `repoUrl` (or the request's own `repoUrl` if the server did not echo one). See **Binding Required Flow** for what the caller does with that error.
-3. On `426`, surface the plugin-outdated error with the server's `message` (or a default if none). See **Plugin Outdated Flow**.
-4. On `409` with `error: "binding_already_exists"`, surface the body verbatim as a binding-already-exists error so the chooser flow can resolve it gracefully. See **Binding Required Flow**.
-5. On `401` or `403`, reject with a not-authenticated error (the saved credential is missing or was rejected by the server). The message carried in the body is not used here — the not-authenticated category is raised unconditionally on these two statuses.
-6. On any other non-2xx response, reject with the body's human-readable `message` if present, else its `error` code, else `HTTP <status>`.
-7. On a `2xx` whose body is empty / non-JSON / missing the required fields, reject rather than resolve: a 2xx with no numeric `docId` and no string `url` would otherwise poison the article link and force a re-create instead of an update on the next push. (CLI wording: `Push returned HTTP <status> but the response was missing a docId/url`.)
-8. On a body that does not parse as JSON, reject with `Invalid JSON response (HTTP <status>): <first 200 chars>`.
-9. On a transport error before any response is received, reject with `Network error: <message>`.
+3. On `412` with `error: "repo_not_allowlisted"`, surface a **permission-denied** error carrying the server's message — **not** binding-required. `412` is deliberately overloaded on this endpoint: the allowlist refusal is emitted as `412`, not `403` (that status is the *bind* path's `space_restricted`), so the discriminator is the body's `error` slug. Both clients map it, and both do so on **both** the single push and the batch push: CLI `cli/src/core/JolliMemoryPushClient.ts:596-597` (single) and `:656-657` (batch); editor extension `vscode/src/services/JolliPushService.ts:310-320`. The mapping is load-bearing rather than cosmetic — permission-denied is a non-incrementing category in the drain's retry classification (spec 269) and a member of the repo-wide refusal set (spec 327), so mis-mapping it to a generic `HTTP 412` would both hammer the server with doomed retries and turn one repo-wide condition into N per-item failures.
+4. On `426`, surface the plugin-outdated error with the server's `message` (or a default if none). See **Plugin Outdated Flow**.
+5. On `409` with `error: "binding_already_exists"`, surface the body verbatim as a binding-already-exists error so the chooser flow can resolve it gracefully. See **Binding Required Flow**.
+6. On `401`, reject with a not-authenticated error (the saved credential is missing or was rejected by the server); the body's message is not used. On `403`, the two statuses **part company** — this is *not* a single "auth failed" bucket on the push path:
+   - **CLI** (`cli/src/core/JolliMemoryPushClient.ts:602-606`, batch twin `:659-663`): `401` → not-authenticated, `403` → **permission-denied** carrying the server's message. On the push path a `403` means the credential is valid but the target doc belongs to another user / was not created by Jolli Memory — an ownership/admin problem, not a sign-in one.
+   - **Editor extension** (`vscode/src/services/JolliPushService.ts:322-332`): `403` → permission-denied, same rationale and message precedence. It has **no** `401` branch at all, so a `401` falls through to the generic non-2xx path (step 7) and surfaces the body's `message` / `error` / a raw-body snippet.
+   - The `401 || 403 →` not-authenticated pairing does still exist on the CLI, but only on **other** calls: `frontDoor` (`:503-504`) and `deleteDoc` (`:701-702`). Do not generalize it to the push.
+7. On any other non-2xx response, reject with the body's human-readable `message` if present, else its `error` code, else `HTTP <status>`.
+8. On a `2xx` whose body is empty / non-JSON / missing the required fields, reject rather than resolve: a 2xx with no numeric `docId` and no string `url` would otherwise poison the article link and force a re-create instead of an update on the next push. (CLI wording: `Push returned HTTP <status> but the response was missing a docId/url`.)
+9. On a body that does not parse as JSON, reject with `Invalid JSON response (HTTP <status>): <first 200 chars>`.
+10. On a transport error before any response is received, reject with `Network error: <message>`.
 
 ### Retry policy
 
@@ -162,6 +166,9 @@ A single push is a one-shot RPC: either it resolves with a `JolliPushResult`, or
 - **Transport differs by surface.** The editor extension uses a direct raw-socket HTTP/HTTPS request (not a fetch wrapper) so self-signed certificates on the local-development host need no extra trust step. The CLI uses the platform `fetch` client, which has **no** self-signed-cert override — so the CLI **cannot** reach a self-signed dev host the way the raw-socket editor client can. (Notable; a real per-surface capability gap.)
 - **The base URL's resolution sources differ by surface.** The editor extension / JVM plugin resolve explicit override → saved Jolli site URL → URL embedded in the API key. The **CLI has only two**: a test-only override, or the URL embedded in the API key — it never consults the saved Jolli site URL. The embedded fallback is why a freshly issued key can push without a site setting; rotating a key with a new embedded URL changes the push target. (Notable.)
 - **CLI push cannot recover from a missing embedded URL — a real bug.** Because the CLI push path ignores the saved Jolli site URL, an API key with no or a stale embedded URL fails to push even when a valid site URL is configured. Worse, the failure message tells the user to "set jolliUrl" — a knob the CLI push path does not read. (Bug; surfaced as behavior.)
+- **`412` is overloaded, and the slug is the discriminator.** `binding_required` and `repo_not_allowlisted` arrive on the *same* status; only the body's `error` field separates "you need to bind this repo" (recoverable — run the chooser) from "an administrator has to allowlist this repo" (repo-wide, not recoverable by the user). The allowlist refusal is emitted as `412` rather than the more obvious `403` because `403` is already taken on the *bind* path (`space_restricted`). A client that branches on status alone gets the recovery flow exactly backwards. (Surprising; the status is not the contract.)
+- **`401` and `403` are different categories on the push path, but the same one on delete and front-door.** Push maps `403` to permission-denied (valid credential, refused doc — an ownership or admin problem); `deleteDoc` and `frontDoor` still collapse `401 || 403` into not-authenticated. The asymmetry is real and per-call, not per-status. The editor extension goes further and has no `401` branch on push at all. (Surprising; easy to over-generalize.)
+- **The permission-denied mapping is load-bearing downstream.** It is a non-incrementing category in the pending-drain's retry classification (spec 269) *and* a member of the shared repo-wide refusal set (spec 327). Leaving `repo_not_allowlisted` as a generic `HTTP 412` would burn the retry budget on doomed pushes and turn one repo-wide condition into N per-attachment failures. (Notable; the mapping is not cosmetic.)
 - **`200` and `204` are both treated as delete success.** The server may return either; the client does not distinguish. (Notable.)
 - **No `x-tenant-slug` is sent for subdomain-based URLs.** The server resolves the tenant from the subdomain itself in that mode. Sending the header would be redundant and is omitted. (Notable.)
 - **`x-org-slug` is only sent when the bearer is an API key whose payload carries an `o` field.** OAuth-token bearers and old-format keys both omit it. (Notable.)
@@ -174,5 +181,6 @@ A single push is a one-shot RPC: either it resolves with a `JolliPushResult`, or
 - The `(origin, tenantSlug)` derivation from the saved Jolli site URL — including which form is path-based vs subdomain-based and how each maps to headers — is defined by **Tenant Resolution Modes**.
 - The `412` mapping to "binding required", the chooser, and the post-binding push retry are defined by **Binding Required Flow**.
 - The `426` mapping to "plugin outdated" and the user-facing message are defined by **Plugin Outdated Flow**.
+- What callers do with a permission-denied / client-outdated / push-disabled rejection — abort the whole loop rather than collect it per item — is defined by **Repo-Wide Push-Refusal Classification** (327); the retry-budget consequence is defined by spec 269.
 - The product API key shape and how `t`, `u`, and `o` are decoded from it are defined by **Jolli API Key Format and Parsing**.
 - The HTTPS allowlist that the resolved origin must satisfy is defined by **Jolli Origin Allowlist Enforcement**.

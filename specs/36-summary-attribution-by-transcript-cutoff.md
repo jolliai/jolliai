@@ -53,9 +53,9 @@ The cursor is written to disk per transcript, immediately after that transcript'
 
 ### Exclusion-set inputs
 
-Two of the four sets carried by the per-project commit-exclusion document affect this topic:
+Of the sets carried by the per-project commit-exclusion document, the conversation-exclusion and reference-exclusion sets affect this topic; the plan, note and skill sets do not:
 
-- A set of conversation-exclusion keys. Each key is the composite string `<source>:<sessionId>`, where `<source>` is the producer tag (one of the seven recognised transcript sources — Claude, Gemini, Codex, OpenCode, Cursor, Copilot CLI, Copilot Chat) and `<sessionId>` is the producer-assigned session identifier. The colon is reserved across the product: no source tag contains one, so the key splits unambiguously.
+- A set of conversation-exclusion keys. Each key is the composite string `<source>:<sessionId>`, where `<source>` is the producer tag of a recognised transcript source (Claude, Codex, Gemini, OpenCode, Cursor, Cursor CLI, Copilot CLI, Copilot Chat, Cline, Cline CLI, Devin, Antigravity) and `<sessionId>` is the producer-assigned session identifier. The colon is reserved across the product: no source tag contains one, so the key splits unambiguously.
 - A set of reference-exclusion keys. Each key is the composite string `<source>:<nativeId>`, where `<source>` is the integration source and `<nativeId>` is the integration-native identifier of the row. Same shape as the reference map key carried elsewhere; no translation is performed.
 
 Both sets are read once per queue-entry drain. They are never written by this topic — the exclusion document is invariant across a pipeline execution.

@@ -39,6 +39,8 @@ The log file lives at:
 
 `<project-state-dir>` resolves to `<cwd>/.jolli/jollimemory`, where `<cwd>` is the working directory the process configured at startup (entry points pass the resolved project root explicitly; otherwise it falls back to the OS-level current working directory).
 
+Entry points do not inject a raw directory. An **implicit** working directory — the process's own launch directory, or one recovered from a host-supplied environment variable or hook payload — is first anchored to its enclosing git worktree root, and that anchored path is what is injected. An **explicit** `--cwd` supplied by a caller is injected verbatim, on the principle that a caller naming a directory means that directory. The consequence is that a run started from a subdirectory of a repository logs into the repository's one state directory rather than forking a second `.jolli/` under the subdirectory. The anchoring rule (its git query, its fallback when the directory is not in a repository, and its caching) is owned by the project-state-root-resolution spec (311). The entry points that apply it before injecting are: the interactive CLI bin entry, the MCP server, the Claude stop hook (on both its environment-variable and its stdin-payload paths), the session-start hook, the Gemini after-agent hook (likewise on both paths), and the agent-plugin bootstrap hook.
+
 If `<project-state-dir>` does not exist on disk, the log writes are skipped — the directory is **not** created just for logging. The directory is created by the install/enable flow when the project is first enabled.
 
 ### Record format
@@ -205,7 +207,7 @@ A third setter controls the silent-console flag. Entry points configure it once 
 
 ### Working-directory injection
 
-A fourth setter sets the global working directory the log file path resolves against. Entry points set this once at startup after resolving the project root from arguments, env, or stdin. If unset, the path resolves against the OS-level current working directory of the process.
+A fourth setter sets the global working directory the log file path resolves against. Entry points set this once at startup after resolving the project root from arguments, env, or stdin — anchoring an implicit directory to its enclosing git worktree root first, and passing an explicit `--cwd` through unchanged (see "Log file location"). If unset, the path resolves against the OS-level current working directory of the process.
 
 ## State Transitions
 
@@ -216,6 +218,14 @@ A fourth setter sets the global working directory the log file path resolves aga
   silent-console = true
   log dir cwd = unset (falls back to process.cwd())
   write queue = empty resolved promise
+
+[interactive CLI bin entry — before command dispatch]
+  setLogDir(git-worktree-root of the launch directory)
+    ↑ runs ahead of the one-time telemetry notice and ahead of main(),
+      so nothing the invocation logs or buffers can land in a stray
+      state directory. Previously the log dir stayed unset until the
+      selected command ran its own setLogDir(options.cwd), so every
+      record emitted before that point resolved against process.cwd().
 
 [entry point runs]
   setLogDir(resolved project root)

@@ -257,9 +257,24 @@ On any exception during the flow: post the error message with the failure text a
 Only when a Jolli site key is configured and a base URL can be resolved (from the key, falling back to the saved site URL). For each included memory, newest-first, the view invokes the reusable share core (which pushes the memory's plans and the memory itself, persists the updated memory, and cleans up orphaned docs). It counts successes and failures and can stop the whole batch early:
 
 - **Binding required** on a memory: resolve the binding **at most once per submit**. The first time, list the available spaces and open the binding-chooser dialog (modal, resolved synchronously on the UI thread; skipped if a chooser for this repo is already open). If the user selects a space, retry that memory once and continue the batch with the binding treated as resolved for all remaining memories. If the user refuses or the binding cannot be resolved, stop the batch with reason "space not bound".
-- **Unauthorized** (key rejected): stop the batch with reason "sign-in rejected".
-- **Plugin outdated:** stop the batch with reason "plugin outdated".
+- **Any repo-wide refusal:** stop the batch with that refusal's own reason — see the classifier below.
 - **Any other per-memory failure:** count it as failed and continue to the next memory.
+
+#### The repo-wide stop classifier (`repoWideStopReason`)
+
+Every included memory belongs to the **same** repo, so a sign-in / permission / opt-out / gate verdict applies to all of them: continuing would fire N doomed requests and report one repo-wide condition as N per-memory failures. `CreatePrPanel.repoWideStopReason` (`intellij/src/main/kotlin/ai/jolli/jollimemory/toolwindow/CreatePrPanel.kt:481-493`) maps each such throwable to a user-facing stop reason, or `null` for "count it and move on":
+
+| Throwable | Stop reason |
+|---|---|
+| `UnauthorizedError` | `sign-in rejected` |
+| `PermissionDeniedError` | `not allowed — ask an administrator` (credential valid, server refused — e.g. the repo isn't allowlisted; an admin problem, not a sign-in one) |
+| `PluginOutdatedError` | `plugin outdated` |
+| `PushDisabledError` | `outbound push disabled` (the user opted this repo out — spec 310; **not** a failure) |
+| `PushGateUnavailableError` | `couldn't verify the push setting` (the gate could not be evaluated, fail-closed; nothing was sent) |
+
+`BindingRequiredError` is deliberately **absent**: it is recoverable here (the chooser runs, then the memory is retried), so it is handled by its own arm above rather than classified as a stop.
+
+It is a **function, not a chain of `catch` arms**, because the share loop has two failure sites — the first attempt (`:536`) and the post-binding retry (`:526`) — and each new repo-wide type would otherwise have to be added to both. It only ever got added to one, which is exactly how a repo-wide refusal raised by the retry ended up counted as a single per-memory failure. See spec 327 for the canonical set and how this classifier differs from the plugin's *other* one.
 
 The suffix reported back to the success toast is honest about partial results:
 
@@ -367,7 +382,9 @@ If a pooled embedded browser cannot be obtained — a refused lease (wrong threa
 - **The primary control carries an up-to-date marker attribute that nothing reads.** The page stamps the computed "no new commits to push" verdict onto the control as an attribute; no script, style rule, or handler on the page ever consults it. Inert — presumably a leftover from the dimming behaviour that was deliberately dropped. (Record as inert; do not build on it.)
 - **Entering the inline editor clears the primary control's disabled flag.** The page does this so a dimmed control would re-enable once the user starts editing — but nothing dims it any more, so the only reachable effect is during a submit in flight: clicking Edit then makes the control *look* enabled while a further click still does nothing, because the in-flight guard rejects it. In the loading state the Edit control is itself disabled, so the path cannot be reached there. (Vestigial; harmless.)
 - **Binding is resolved at most once per submit.** Even when several memories each hit a binding-required verdict, the chooser opens only for the first; once the user picks a space, the rest of the batch proceeds without re-prompting. A refusal stops the whole batch. (Notable.)
-- **The batch stop reasons are diagnosable, per-memory failures are merely counted.** Auth rejection, plugin-outdated, and binding refusal halt the batch with a named reason; any other memory's failure is counted and skipped, and the suffix always points at the log for detail. (Notable.)
+- **The batch stop reasons are diagnosable, per-memory failures are merely counted.** Auth rejection, permission-denied, plugin-outdated, the outbound-push opt-out, an unevaluable push gate, and binding refusal halt the batch with a named reason; any other memory's failure is counted and skipped, and the suffix always points at the log for detail. (Notable.)
+- **This is the plugin's SECOND repo-wide classifier, and it does not match the first.** `JolliPushOrchestrator.isFatalPushError` (spec 263) is a boolean over the attachment loops; `repoWideStopReason` is a reason-string map over the Create-PR share loop. They differ in **two** entries, not one: `BindingRequiredError` is fatal in the orchestrator (which cannot run a chooser) but recoverable here, and `UnauthorizedError` is a stop here but is **absent** from the orchestrator's set. The second asymmetry is not documented as deliberate anywhere — `repoWideStopReason`'s own comment asserts that "every other repo-wide type belongs in both", which makes the `UnauthorizedError` gap read as an instance of exactly the drift that comment warns about. (Surprising; a real divergence — see spec 327.)
+- **One stop reason is not an error at all.** `outbound push disabled` names the user's own per-repo opt-out (spec 310); the batch stops because nothing more can be sent, not because anything went wrong. (Notable.)
 - **The submit is honest about partial success.** The success toast never implies every memory shared when some failed or the batch stopped early. (Notable.)
 - **The tab is keyed by branch.** Re-triggering on the same branch reuses the tab; this is why the virtual file's identity is the branch name and nothing else. (Notable.)
 - **open-diff opens a file, not a diff.** The inbound message is named for a diff but the handler opens the working-tree file in the editor. The path is validated to be repo-relative (no leading separator, no parent-traversal segment) before opening. (Naming quirk; reality is a file open.)
@@ -404,3 +421,5 @@ If a pooled embedded browser cannot be obtained — a refused lease (wrong threa
 - **239. Create-PR Body Markdown Assembly** — the renderer the host invokes for the initial body and again for the post-edit round trip; the same contract is implemented independently in the editor extension.
 - **121. IntelliJ Summary Virtual-File Editor** — the one-live-memory-tab reuse rule an open-memory click goes through, and the destination it lands on.
 - **Summary-push, binding-required-flow, plugin-outdated-flow, tenant-resolution specs** — the wire-level contracts the share core rides on.
+- **327. Repo-Wide Push-Refusal Classification** — the canonical set `repoWideStopReason` covers, and the plugin's other Kotlin classifier (`JolliPushOrchestrator.isFatalPushError`, spec 263) it diverges from.
+- **310. Per-Repo Outbound-Push Control** — the opt-out behind the `outbound push disabled` / `couldn't verify the push setting` stop reasons.

@@ -113,7 +113,7 @@ The integration clause mirrors the STATUS panel's "MCP & Skills" row (spec 133) 
 
 ### Hover status popup — hooks line
 
-The hover status indicator renders a small HTML summary whose hooks line is a `+`-joined list of the installed hook families, in the same form the STATUS panel's Hooks row uses: `5 Git + 2 Claude + 1 Gemini` when all three families are present, `5 Git` when only the git hooks are, and `none installed` when none are. The bullet beside it is green when the git-hook flag is set and red otherwise. The count in `5 Git` is part of the literal string, not a computed number, and the git-hook flag it keys off is computed from only four of the five installed git hooks (see spec 133) — so a repository missing the push-time hook still shows a green bullet and `5 Git`.
+The hover status indicator renders a small HTML summary whose hooks line is a `+`-joined list of the installed hook families, in the same form the STATUS panel's Hooks row uses: `5 Git + 2 Claude + 1 Gemini` when all three families are present, `5 Git` when only the git hooks are, and `none installed` when none are. The bullet beside it is green when the git-hook flag is set and red otherwise. The count in `5 Git` is part of the literal string, not a computed number, and the git-hook flag it keys off is computed from every installed git hook except the push-time one (see spec 133) — so a repository missing the push-time hook still shows a green bullet and `5 Git`.
 
 ### Gear menu
 

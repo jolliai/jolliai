@@ -38,7 +38,7 @@ Shared Behavior.
 
 **In scope**
 
-- The per-response token-usage breakdown shape (input, output, cached) extracted from a raw transcript line.
+- The per-response token-usage breakdown shape (input, output, cached) extracted from a raw transcript line, and the record-level function that is the single definition of it — including the line-level wrapper that delegates to it and the consumers required to come through it.
 - The rule that the "cached" segment carries cache-creation tokens only, and why the cache-read counter is deliberately excluded.
 - The per-response de-duplication rule: one model response is written across several records that each repeat the whole usage object, so a response is counted exactly once per read; the optional response-identity key that drives it, and the first-seen-wins and no-identity-always-counts consequences.
 - The scope of the already-counted set (one read, never persisted) and the bounded cross-read double-count it accepts.
@@ -125,9 +125,27 @@ Cost Estimation] — but nothing in this estimator reads it.)
 
 ### Per-line usage extraction
 
-For each raw transcript line, the usage object (if any) is parsed and its
-counters mapped to the breakdown as described in the source-counter contract. A
-line that fails to parse, or that has no usage object, yields a breakdown whose
+Extraction is split into two layers, and the inner one is the contract:
+
+- A **record-level** function takes an already-parsed transcript record and
+  returns the identity plus the three mapped segments — or nothing when the
+  record carries no usage object. This is the single definition of what a Claude
+  turn cost and of what identifies it.
+- A **line-level** wrapper parses one raw line and delegates to it, returning
+  nothing when the parse throws.
+
+The split exists because both rules the record-level function encodes are easy to
+get subtly wrong in a second implementation, and both fail **silently**: excluding
+the cumulative cache-read counter (summing it re-counts the cached prefix on every
+turn), and keying de-duplication on the response identity (one response spans
+several lines, each repeating the whole usage object). Every per-segment consumer
+must come through this one function or its numbers will drift from the others' for
+the same transcript. Three do today: the commit-level reader, the per-model split,
+and per-skill attribution — the last of which has already parsed the line for its
+own skills-specific field and calls the record-level overload precisely so it does
+not parse twice (see [321 — Skill Token Attribution]).
+
+A line that fails to parse, or that has no usage object, yields a breakdown whose
 three segments are all zero and which carries **no** de-duplication key, rather
 than an error.
 
@@ -315,6 +333,7 @@ zero-fallback keeps a partial breakdown contributing its present segments.
   estimator's code flags that pairing — unlike the model-aware price table, whose
   duplication is documented as a lockstep contract. (Surprising; the drift risk is
   real and unguarded.)
+- **Extraction is record-level, with the line-level form as a thin wrapper — and that shape is the drift guard.** Both of this spec's silent-failure rules (drop the cumulative cache-read counter; dedupe on the response identity) live in exactly one function, and every per-segment consumer is required to reach it rather than re-read the usage object itself. Per-skill attribution is the reason the record-level form is exported at all: it has already parsed the line for a top-level field of its own, and re-parsing to get the counters would have been the moment a second, drifting implementation appeared. So per-skill totals cannot disagree with the commit total for the same transcript. (Notable; the guarantee is structural, not tested per consumer.)
 - **One response, several records, one whole usage object on each.** Summing per
   record multiplied real usage by the response's content-block count (measured
   2×–10×). De-duplicating on the response identity is what makes the figure
@@ -364,6 +383,11 @@ zero-fallback keeps a partial breakdown contributing its present segments.
   [245 — Commit-Pipeline Conversation Token Attribution]), and persisted per
   conversation so a later detach can subtract it (see [306 — Conversation Detach
   Usage Correction]).
+- The per-skill attribution that consumes the record-level extractor — how a turn
+  is assigned to a skill, and the per-session split it produces — is defined in
+  [321 — Skill Token Attribution]. It reuses this spec's counters and this spec's
+  de-duplication identity rather than deriving its own, which is what keeps a
+  commit's per-skill figures reconcilable with its commit-level total.
 - The de-duplication described here happens inside a single transcript read, so
   its scope, and the bookmark that cannot carry it across reads, belong to
   [16 — Claude Code Transcript Reading] and [24 — Transcript Cursor Resumption].

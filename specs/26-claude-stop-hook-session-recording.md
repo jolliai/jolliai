@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-Record one entry into the local session registry every time the Claude Code agent completes a response turn, by reading a small JSON payload from the hook's standard input and persisting only metadata, then trigger a single incremental discovery pass that runs the shared plan and reference scanners against the same transcript suffix — all without any language-model call.
+Record one entry into the local session registry every time the Claude Code agent completes a response turn, by reading a small JSON payload from the hook's standard input and persisting only metadata, then trigger a single incremental discovery pass that runs the shared plan, reference and skill scanners against the same transcript — the first two off one shared watermark, the third off its own — all without any language-model call.
 
 ## Scope
 
@@ -18,8 +18,9 @@ Record one entry into the local session registry every time the Claude Code agen
 - The set of conditions that cause the handler to do nothing (early-exit and skip cases).
 - The relationship between this handler and a separate plan-discovery scan that runs immediately after session recording.
 - The relationship between this handler and a separate reference-extraction scan that runs after plan discovery against the same transcript suffix.
+- The relationship between this handler and a third, skill-discovery scan that runs after the reference scan against its own independent watermark, and the ways it is deliberately decoupled from the other two.
 - The **single-owner gate** that decides whether *this* invocation performs the discovery pass at all, when the same repository has two possible runners of it.
-- The shared single-cursor coordination that lets both scans advance in lockstep across invocations.
+- The shared single-cursor coordination that lets the plan and reference scans advance in lockstep across invocations.
 - The opportunistic telemetry-buffer flush performed at the end of the handler.
 
 **Out of scope (boundaries):**
@@ -28,6 +29,7 @@ Record one entry into the local session registry every time the Claude Code agen
 - Any call to a language model.
 - Detecting plan-mode slugs or plan file edits inside the transcript (covered by spec 29). What this handler contributes is **only** the trigger — selecting the transcript source tag (Claude), passing the resolved project directory and transcript locator, and orchestrating the cursor write that both scans share.
 - Detecting external-entity references (Linear / Jira / GitHub / Notion items) inside the transcript (covered by spec 153). What this handler contributes is the same trigger as for plan discovery.
+- Detecting Agent Skill invocations inside the transcript, the working record they are folded into, and the token spend attributed to them (covered by specs 320, 319, and 321). What this handler contributes is the trigger — passing the resolved project directory, the transcript locator and the Claude source tag — and nothing else: the skill scan owns its own watermark read, its own advance, and its own error containment.
 - The per-source scanner contracts and the shared upsert drivers (a transcript-line-to-plan-candidates contract for plan discovery, an envelope-parser contract for references). The drivers and the per-source implementations are shared with the Codex polling path and are owned by their canonical specs (spec 29 for plans, spec 153 for references). The Claude-specific concerns that remain here are: (a) the host-invoked Stop event as the trigger, and (b) the Claude transcript format as the input both scans see.
 - Generating any briefing or summary (covered by spec 27).
 - The shape and behavior of the parallel handler for the other supported agent (covered by spec 28).
@@ -54,12 +56,16 @@ Other top-level fields on the payload are ignored.
 
 ### Project-directory resolution
 
-The directory used as the project root for all on-disk effects is selected as follows, in order:
+The directory used as the project root for all on-disk effects is selected in two steps: pick a candidate, then anchor it.
+
+**Pick a candidate**, in order:
 
 1. The value of an environment variable that the host agent sets to the active project directory, when present.
-2. Otherwise, the `cwd` field from the payload.
+2. Otherwise, the `cwd` field from the payload — or, when the payload omits it, the runtime's current working directory. (The field is typed non-optional but arrives from JSON, so the guard is explicit in code rather than assumed.)
 
-If neither is available, the handler proceeds against the runtime's current working directory.
+**Anchor the candidate.** Whichever source won is then resolved to the git worktree root that encloses it, falling back to the candidate verbatim when no worktree encloses it (not a repository, or the version-control binary is unavailable). The anchoring is applied to **both** branches — the environment variable is anchored at the moment it is read, before it is used to configure the diagnostic log directory, and the payload branch is anchored where it is resolved.
+
+Anchoring exists because either source can name a subdirectory of the project. Every on-disk effect below is addressed relative to the resolved root, so an unanchored subdirectory forks a second, stray per-project state directory inside the checkout. The resolution rule itself — including its per-input memoization and its silent tolerance of a non-repository path — is owned by spec 311.
 
 ### Session-registry record
 
@@ -82,7 +88,7 @@ This site consults the **inherited-environment channel only**; it passes no work
 
 Then, in order:
 
-1. If the project-directory environment variable is set, configure the diagnostic log directory under that path before any other work.
+1. If the project-directory environment variable is set, anchor its value to the enclosing worktree root and configure the diagnostic log directory under the **anchored** path, before any other work.
 2. Read all bytes from standard input as text. If the read fails, log the failure and return without writing anything.
 3. If the resulting string is empty (after trimming whitespace), log a warning and return.
 4. Parse the string as JSON. If parsing fails, log the failure and return.
@@ -93,12 +99,13 @@ Then, in order:
 9. Build the session-registry record with the source tag set to the Claude identifier and the timestamp set to "now".
 10. Save the record into the session registry. Log success on completion. On failure, log the error message, error code, and stack trace separately, then continue.
 11. Evaluate the **single-owner gate** (below). If it says another runner owns discovery, skip step 12 entirely and go to step 14.
-12. Run a single incremental discovery pass against the same transcript path. The pass first migrates any legacy per-scan cursors into one merged discovery cursor, then loads that cursor's line watermark, then runs the two scans in fixed order against the same starting line:
-    1. **Plan discovery** — invoke the shared plan-discovery driver with the Claude source tag and no upper-line cap (so it scans to end-of-file). Wrap the call in a try/catch and log on failure.
-    2. **Reference extraction** — invoke the shared reference-extraction driver with the Claude source tag against the same starting line. Wrap the call in a try/catch and log on failure. Capture the line number it reports as having traversed.
+12. Run a single incremental discovery pass against the same transcript path. The pass first migrates any legacy per-scan cursors into one merged discovery cursor, then loads that cursor's line watermark, then runs three scans in fixed order:
+    1. **Plan discovery** — invoke the shared plan-discovery driver with the Claude source tag and no upper-line cap (so it scans to end-of-file), starting at the shared watermark. Wrap the call in a try/catch and log on failure.
+    2. **Reference extraction** — invoke the shared reference-extraction driver with the Claude source tag against the **same** starting line. Wrap the call in a try/catch and log on failure. Capture the line number it reports as having traversed.
+    3. **Skill discovery** — invoke the shared skill-discovery driver with the Claude source tag. It is handed **no** starting line: it reads and advances its own `skills` per-extractor mark in the same cursor record (spec 24), and it never throws — it absorbs its own failures internally and leaves its mark where it was so the next invocation retries the same window. This call is therefore **not** wrapped in a try/catch here and its outcome is not captured.
     
-    After both scans, **only if the plan scan completed without throwing and the reference scan reported progress beyond the starting line**, persist the merged discovery cursor at the reference scan's reported line. Otherwise leave the cursor at its prior value.
-13. Treat any thrown error from either scan as a logged failure that must not propagate; the handler still returns success to its caller.
+    After the first two scans, **only if the plan scan completed without throwing and the reference scan reported progress beyond the starting line**, persist the merged discovery cursor at the reference scan's reported line. Otherwise leave the cursor at its prior value. The skill scan takes no part in that condition in either direction: a skill scan that failed cannot hold the shared cursor, and a plan scan that threw cannot hold the skills mark.
+13. Treat any thrown error from the plan or reference scan as a logged failure that must not propagate; the handler still returns success to its caller.
 14. Await an opportunistic flush of the shared telemetry buffer, bounded by a short per-batch timeout. This runs on **every** non-disabled invocation, including the ones that skipped the discovery pass on the single-owner gate, because the stop event fires far more often than a commit does and is the only reliable flush occasion for a user who works with the agent without committing. The flush re-checks consent itself, no-ops on an empty buffer, and never throws. It is awaited rather than fired-and-forgotten so the short-lived handler process does not exit mid-request; the short timeout keeps a slow network from holding the process open.
 
 ### Single-owner gate for the discovery pass
@@ -122,7 +129,7 @@ The gate is fail-safe in one direction only. Running when it could have deferred
 
 ### Branches
 
-- **All inputs valid** → record is upserted into the session registry, then the discovery pass runs (plan first, references second), then the merged cursor is advanced, then the telemetry buffer is flushed.
+- **All inputs valid** → record is upserted into the session registry, then the discovery pass runs (plan first, references second, skills third), then the merged cursor is advanced and — independently — the skills mark is advanced, then the telemetry buffer is flushed.
 - **Running inside a product-spawned local agent** → nothing at all happens; standard input is never read, so no payload check, no manual-disable read, no configuration load, no registry write, no discovery pass, no cursor write, and no telemetry flush; logged informational message.
 - **Standard input read fails** → no registry write, no discovery pass, no error propagation; only a logged error.
 - **Empty standard input** → no registry write, no discovery pass; logged warning.
@@ -134,8 +141,9 @@ The gate is fail-safe in one direction only. Running when it could have deferred
 - **Registry-write failure** → the failure is logged with code and stack but does not abort the handler; the discovery pass still runs.
 - **Plan scan throws, reference scan completes** → both failures are logged; the merged cursor is **held** at the prior watermark so the unscanned plan window is retried on the next invocation (the reference re-scan on retry is idempotent).
 - **Plan scan completes, reference scan throws** → the merged cursor is **held** at the prior watermark (the reference scan's reported line is whatever it had reached when it threw, which is at most the starting line because the captured value is initialized to the starting line and only overwritten by a successful scan; with no progress the cursor is not advanced).
-- **Both scans throw** → both failures are logged; the merged cursor is held; the handler returns success.
-- **Both scans complete, reference scan reports the same line as the start** → no cursor write; nothing to advance.
+- **Both scans throw** → both failures are logged; the merged cursor is held; the skill scan still runs; the handler returns success.
+- **Both scans complete, reference scan reports the same line as the start** → no cursor write; nothing to advance. The skill scan still runs and may still advance its own mark.
+- **Skill scan fails internally** → it logs its own warning, advances nothing, and returns normally; the plan and reference outcome and the merged-cursor decision are unaffected.
 
 ### Async / fire-and-forget contract
 
@@ -157,7 +165,8 @@ This is the property that makes it acceptable to run the handler on every single
 - One idempotent fold of legacy per-scan cursors (plan-prefixed, reference-prefixed) into the single merged discovery-cursor entry keyed by the bare transcript path. Runs unconditionally before either scan.
 - Possibly one or more plan-discovery side effects (covered by spec 29).
 - Possibly one or more reference-extraction side effects (covered by spec 153).
-- At most one write of the merged discovery cursor at the end of the pass, gated as described in Step 10. The recording step itself does not read the transcript or call any model; transcript reads, if any, happen inside the two scans.
+- Possibly one or more skill-discovery side effects (covered by specs 319 and 320), including reads of this session's subagent transcript files, which are scanned in full rather than cursor-tracked.
+- At most one write of the merged discovery cursor at the end of the pass, gated as described in Step 12, and — independently of it — at most one advance of the `skills` per-extractor mark in the same cursor record. The recording step itself does not read the transcript or call any model; transcript reads, if any, happen inside the three scans.
 
 ### Errors classified
 
@@ -173,6 +182,7 @@ This is the property that makes it acceptable to run the handler on every single
 | Registry write failure      | Filesystem error while persisting the record.    | Logged with error code and stack; the discovery pass still runs.   |
 | Plan-discovery failure      | Any error thrown during the post-recording plan scan. | Logged; reference extraction still runs; cursor is held at the prior watermark. |
 | Reference-extraction failure | Any error thrown during the post-recording reference scan. | Logged; cursor is held at the prior watermark.                     |
+| Skill-discovery failure     | Any error inside the post-recording skill scan.    | Absorbed by that scan, which never throws: logged at warning by it, its own mark is left where it was, and the merged cursor decision is unaffected. |
 | Discovery deferred to another runner | Plugin invocation, shared launcher present on disk, and both canonical agent hooks registered in the repository-local settings file. | Logged info; registry write and telemetry flush still happen; no discovery pass and no cursor write. Not an error condition. |
 | Telemetry-flush failure     | Any error inside the opportunistic buffer flush.   | Absorbed by the flush itself, which never throws and re-checks consent; the handler is unaffected. |
 | Unhandled top-level error   | Any error escaping the main function.             | Caught at the script entry point; a static message only (never the error value or anything derived from it) is written to standard error; exit code `1`. |
@@ -192,13 +202,16 @@ This handler never deletes a session record itself. It can only insert or refres
 - **Idempotent on repeat invocations.** Calling the handler twice for the same session identifier is harmless: the second call simply refreshes the timestamp.
 - **Source tag is fixed.** This handler always writes the Claude source tag. It never inspects which agent actually invoked it; the choice is structural (a sibling handler exists for the other agent).
 - **No standard-output writes.** Unlike the parallel handler for the other supported agent, this handler writes nothing to standard output. The host agent's "non-blocking" mode does not require a response.
-- **`cwd` is a fallback only.** The environment variable wins over the payload field when both are present, even if they disagree.
+- **`cwd` is a fallback only.** The environment variable wins over the payload field when both are present, even if they disagree. But it wins only as a *candidate*: it is anchored to its enclosing worktree root exactly as the payload value is, so an environment variable pointing at a subdirectory no longer wins as a subdirectory. Two settings that disagree only about depth within one worktree therefore now resolve to the same project root.
 - **Empty source tag is impossible.** The source tag is always populated; backwards-compatibility logic elsewhere in the codebase treats absent source tags as Claude, but this handler never produces such records.
 - **Registry-write failure is non-fatal.** A failure logs the error code (e.g. permission denied) and the stack, then the handler proceeds to the discovery pass anyway. The session-registry write and the discovery-pass writes are independent.
 - **One merged cursor for both scans.** Plan discovery and reference extraction share a single per-transcript discovery cursor keyed by the bare transcript path. Both scans read the same starting line and both read to end-of-file, so the reference scan's reported line is the authoritative cursor target. Legacy per-scan cursors (one prefixed for plans, one prefixed for references) from earlier versions are migrated into this merged key on every invocation before either scan runs; the migration is idempotent.
 - **Cursor advance gated on plan-scan completion, not on reference-scan success alone.** If the reference scan reaches end-of-file but the plan scan threw, the cursor is held at the prior watermark. Advancing past the unscanned plan window would lose those lines forever. Both scans are idempotent, so re-scanning on retry is safe.
-- **Plan scan runs first; reference scan runs second.** The order is fixed. The two scans are independent — each swallows its own errors and does not short-circuit the other — but the cursor-advance decision uses the plan scan's completion as the gate.
-- **Log directory is set twice in some paths.** First from the environment variable (if present), then from the resolved project directory after parsing. Subsequent setLogDir calls are idempotent.
+- **Plan scan runs first; reference scan runs second; skill scan runs third.** The order is fixed. All three are independent — each swallows its own errors and does not short-circuit the others — but only the plan and reference scans feed the merged-cursor advance decision, which uses the plan scan's completion as its gate.
+- **The third scan is deliberately outside the conjunctive gate, in both directions.** Skill discovery reads and advances its own per-extractor mark in the same cursor record, so a skill scan that throws cannot pin the plan/reference watermark, and a plan scan that throws cannot pin the skills mark. That independence is the entire reason per-extractor marks exist: the skills backlog is its own window, and on an upgrade it is a window the shared watermark may already have passed. (Surprising; load-bearing — see spec 24.)
+- **The skill scan is the one call in the pass with no try/catch at this site.** It does not need one: it absorbs its own failures and returns normally, leaving its mark unadvanced so the next stop retries the same window. Wrapping it here would be dead code, not defence. (Notable.)
+- **Both project-directory sources are anchored to the enclosing worktree root; neither is trusted verbatim.** A session started in a subdirectory — by the agent's own working directory or by an environment variable pointing at one — used to fork a stray per-project state directory inside the checkout, because every on-disk effect here is addressed relative to the resolved root. Anchoring resolves either candidate up to the worktree that contains it, and falls back to the candidate unchanged when nothing contains it, so a non-repository directory still works exactly as before. (Surprising; a real regression-closer — see spec 311.)
+- **Log directory is set twice in some paths.** First from the anchored environment variable (if present), then from the anchored project directory resolved after parsing. Subsequent setLogDir calls are idempotent.
 - **No transcript read for the session-recording write itself.** The recording step only stores the transcript-file path; it never reads the file. The plan-discovery and reference-extraction scans that run afterwards do read the transcript suffix beyond the merged cursor, but each scan reads only the new lines (the incremental cursor keeps the per-stop cost flat regardless of total transcript length). Reading the transcript for the purpose of model input (summary generation) is still deferred to a downstream consumer (the source-control commit pipeline).
 - **No model call at this stage.** The handler never contacts any language-model provider. The plan-discovery and reference-extraction scans are pure local processing — file reads, set operations, registry mutations. All model interactions for this product happen in the source-control commit pipeline, not in agent hooks.
 - **One implementation.** This handler is the single implementation of the stop-hook contract for every surface, including the agent-plugin surface, which invokes this same handler rather than carrying its own port. An earlier JVM-based port — which omitted the discovery pass entirely and treated the payload's working directory as required — no longer exists.
@@ -222,4 +235,6 @@ This handler never deletes a session record itself. It can only insert or refres
 - The parallel handler for the other supported agent (which differs in source tag, in the requirement to write a JSON response on standard output, in not running any post-recording scans, and in **not** carrying the repo-wide manual-disable gate) is defined by spec 28.
 - The plan-discovery scan that runs first in this handler's discovery pass — including the per-source scanner contract, the Claude slug-and-Write/Edit signal interpretation, the shared external-plan exclusion policy, the on-disk existence gate, the slug-collision resolution, and the locked re-read upsert — is defined by spec 29. The Codex sibling source-specific scanner for the same shared driver is defined by spec 181.
 - The reference-extraction scan that runs second in this handler's discovery pass — including the per-producer envelope-parser contract, the source-agnostic extraction pipeline, the dedup-and-upsert into the reference registry, and the Claude tool_use/tool_result block-pairing envelope — is defined by spec 153.
+- The skill-discovery scan that runs third — its recognition of a Claude skill invocation (spec 320), the working record it upserts into (spec 319), and the per-skill token attribution it computes (spec 321) — is owned by those specs. The `skills` per-extractor mark it reads and advances, its legacy-seeding rule, and its independence from the shared watermark are owned by spec 24.
+- The resolution of a candidate project directory to its enclosing worktree root, applied to both the environment variable and the payload's working directory here, is owned by spec 311.
 - The downstream consumer that actually reads the transcript locator stored here is the **source-control commit pipeline**.

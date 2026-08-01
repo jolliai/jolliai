@@ -13,7 +13,8 @@ The path that, when a rebase collapses N original commits into a single rewritte
 - Extraction of the outer ticket-identifier hint from the rewritten commit's message.
 - The language-model consolidation call and its mechanical fallback.
 - The construction of a new root with all source summaries attached as stripped children.
-- Re-association of plan references and note references with the new commit hash.
+- The archival of uncommitted skill usage onto the rewritten commit, ahead of that construction.
+- Re-association of plan references, note references and skill guard rows with the new commit hash.
 - Aggregation of orphaned article identifiers and other hoisted child-level metadata.
 
 **Out of scope:**
@@ -57,6 +58,7 @@ The new root is a unified-format summary node. Its children list contains every 
 - A commit-type marker set to "squash".
 - The operation-source marker when supplied.
 - Aggregated end-to-end test guidance, plans, notes, article-style metadata, and orphaned-article identifiers, inherited from the children via the standard hoist rules.
+- Accumulated skill references — every child's, plus the ones freshly archived onto the rewritten commit — folded through the shared skill accumulation. Present only when non-empty.
 - A diff-statistics field freshly computed against the new commit's own parent.
 
 ## Behavior
@@ -75,9 +77,13 @@ The new root is a unified-format summary node. Its children list contains every 
 4. On a successful call returning content, the result populates the new root's topics, recap, and resolved ticket identifier, and the call's metadata is recorded.
 5. On a transport-level failure or a result lacking content, the mechanical fallback synthesizes the topics-and-recap result by concatenating source content; the call metadata is omitted because no successful call ran.
 
+### Archiving uncommitted skill usage
+
+Before the new root is built, the working-area skill registry's uncommitted rows are frozen onto the rewritten commit — a rebase-squash lands work exactly as a plain squash does. The persisted user-exclusion selection's skill set is honored inside the archival step (never as a filter on its result, since archiving both guards the row and emits parallel-ref bytes). Any raw working-file bytes returned are stored on the parallel ref; the resulting references are handed to the root construction as an additional input, because there is no second write that could attach them afterwards.
+
 ### Building the new root
 
-1. Hoist child-level metadata up to the root: end-to-end test scenarios, plan references (deduped by slug, latest-update wins), note references (deduped by identifier, latest-update wins), the newest descendant's article-style metadata (with non-winners contributing to the orphaned-article-identifier list), and the existing orphaned-identifier list inherited from children.
+1. Hoist child-level metadata up to the root: end-to-end test scenarios, plan references (deduped by slug, latest-update wins), note references (deduped by identifier, latest-update wins), skill references (**accumulated**, not deduped — deduplicated by archive key first, then summed per skill, together with the freshly-archived set from the step above), the newest descendant's article-style metadata (with non-winners contributing to the orphaned-article-identifier list), and the existing orphaned-identifier list inherited from children.
 2. Sort children by display-date descending (most recent activity first).
 3. Hoist-strip each child copy attached to the new root.
 4. Compute the new commit's full diff statistics against its parent; fall back to a zeroed record on diff failure.
@@ -87,9 +93,11 @@ The new root is a unified-format summary node. Its children list contains every 
 
 The new payload and the updated index are written in one atomic batch. The atomic batch checks for an existing index entry at the new hash and short-circuits if one is already present. The prior summaries' payload files are never deleted; lookups by any prior commit hash continue to resolve directly to those originals.
 
-### Re-association of plan and note references
+### Re-association of plan, note and skill references
 
 After the new root is persisted, every plan reference on every loaded source summary is walked and the corresponding plan-registry entry is updated to point at the new commit hash; the same is done for note references against the note-registry portion of local state. This is unconditional within the operation when source summaries are loaded.
+
+Skill references are walked in the same pass but re-anchor a **guard row** rather than an artifact row, and they are given one extra input: the set of every commit hash in the subtree being collapsed, roots included, computed by a recursive walk before the loop. A guard matches when its recorded hash starts with the archive key's own embedded short hash, or prefix-matches one of those collapsed hashes in either direction. The collapsed set is required because a hoisted skill reference keeps the archive key of the commit that originally archived it while its guard has already been migrated by an earlier rewrite; matching the embedded hash alone therefore worked once and then stranded the row on a commit that no longer exists. The guard's archived-totals baseline survives the migration untouched — it records what a commit already claimed, and rewriting commit metadata does not un-claim it.
 
 ## State Transitions
 
@@ -122,9 +130,13 @@ A consolidation operation that loads only a subset of its source summaries still
 
 The atomic batch checks the index for the new hash before writing. When the entry already exists, the operation treats itself as already performed and returns without rewriting either the payload or the index.
 
-### Re-association of plan and note references
+### Re-association of plan, note and skill references
 
-Plan-reference and note-reference entries from each loaded source summary are walked and the corresponding registry entries are updated to point at the new commit hash. This is what keeps the plan and note registries in sync with the rewrite, since those registries are independent local state files rather than fields of the summary tree.
+Plan-reference and note-reference entries from each loaded source summary are walked and the corresponding registry entries are updated to point at the new commit hash. This is what keeps the plan and note registries in sync with the rewrite, since those registries are independent local state files rather than fields of the summary tree. Skill guard rows are migrated in the same walk, against the collapsed-hash set described above.
+
+### Skills are hoisted but not stripped from the children
+
+The hoist-strip applied to each attached child has no skill arm, so the root and the children it wraps hold the same skill references. That is the established shape, not a leak: the accumulation deduplicates by archive key before summing, so a later rewrite's recursive walk — which meets each hoisted reference from both ends — does not inflate the counts by one generation per collapse.
 
 ## Shared Behavior
 
@@ -132,7 +144,8 @@ Plan-reference and note-reference entries from each loaded source summary are wa
 - **Squash consolidation pipeline** — the language-model call, its prompt rules, the mechanical fallback, and the consolidation-source expansion rule are shared with the non-rebase squash path.
 - **Summary-tree format** — the unified-format root, hoist-stripping rules for embedded children, the legacy-aware expansion of nested formats.
 - **Summary index** — the upsert path that reclassifies each source summary's entry from root to descendant during the same atomic batch as the payload write.
-- **Plan registry** and **note registry** — the local state files updated by the explicit re-association step.
+- **Plan registry** and **note registry** — the local state files updated by the explicit re-association step. The skill working record whose guard rows are migrated in the same step is owned by spec 319; the archival step that freezes them onto the rewritten commit is spec 322; the user-exclusion selection it honors is spec 188.
+- **Summary-tree skill accumulation** — the fold that combines the children's and the freshly-archived references, its archive-key deduplication, and its usage / confidence / detection degradation rules.
 - **Cross-process lock** — gates the atomic write of the new payload and updated index.
 - **Rebase-pick migration** — the sibling topic covering the one-to-one variant.
 - **Squash-pending handoff** — the transient state file used to identify source hashes for non-rebase squashes; not used by this rebase-driven path.

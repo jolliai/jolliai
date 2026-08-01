@@ -18,6 +18,8 @@ on screen.
 - Per-node ownership resolution over the consolidation tree, and why the node's own transcript-id list is not itself the ownership record.
 - The three unattributable outcomes (no claimant, several claimants, a removed conversation with no recorded share) and the partial-subtraction case that both corrects and reports.
 - The subtraction itself: per-segment flooring, the scalar-only degrade, stripping the field group when nothing remains, and re-derivation (never scaling) of the cost.
+- The second, parallel correction applied to each skill row's per-session usage split — its unconditional per-node application, its re-derivation of the row's total and confidence from what survives, and its forward-only guard.
+- The condition under which the tree is walked at all, given that either correction can be the only one with work to do.
 - The write ordering — stored conversation records first, then one summary write carrying both the id removal and the figure correction — and what each failure leaves behind.
 - What the user is told when the summary write fails, why that outcome is permanent, and the notification's gate on there having been an attributable correction (so one of the two failure branches is silent).
 - The in-place meter replacement the panel performs on success, and the deliberate omission of it when nothing was attributable.
@@ -54,6 +56,20 @@ segment breakdown is load-bearing here: a removed conversation whose breakdown i
 absent is the "cannot attribute" case defined in [245], regardless of whether a
 per-model split accompanies it. The per-model split is read only to refine a
 subtraction the breakdown has already authorised.
+
+Each removed conversation additionally carries an optional **session key** — the
+same `<source>:<sessionId>` composite the rest of the product uses to identify a
+conversation across producers — built by the detach request itself from the
+producer and conversation id it already holds. It is the key under which a skill's
+per-session usage split was written at capture time, and it drives the per-skill
+correction below.
+
+The session key is **independent of the segment breakdown**: a skill split can be
+corrected for a conversation whose commit-level share was never recorded, and a
+commit-level share can be subtracted for a conversation that appears in no skill's
+split. When it is absent, the skill figures are simply left as they are — the same
+forward-only stance the aggregate path takes toward a memory with no stored
+per-conversation usage.
 
 This input is collected **before** the records are rewritten, because that is the
 last moment the removed conversations are readable at all.
@@ -96,6 +112,11 @@ the ids actually being detached so an unrelated tree-wide index costs nothing.
 
 Ownership is resolved over the whole tree **before** anything is subtracted, then
 each owner's subtrahends are applied in a second walk.
+
+That second walk runs when **either** correction has work to do — an owner was
+found, or the detach supplied any session key at all. A memory can carry skill
+figures with no aggregate figure to fix, and gating the walk on ownership alone
+would leave the skill numbers stale while reporting that nothing changed.
 
 ### The three unattributable outcomes
 
@@ -153,6 +174,32 @@ per model where a split exists), then:
 - If nothing remains, the **whole** usage/cost field group is stripped rather than
   written as zeros — so the display falls back to "not reported" instead of showing
   a measured nothing (see [04 — Summary Tree Structure]).
+
+### The per-skill correction, which is NOT ownership-resolved
+
+A memory's skill rows carry their own usage, stored as an explicit per-session
+split rather than as an opaque total. That split is what makes a second, parallel
+correction possible — and it is applied by a different rule from the one above:
+
+- **It runs on every node, unconditionally**, rather than only on the node that
+  owns the detached id. That difference is not merely permitted, it is required:
+  an amend hoists a child's skill rows onto the root, so one conversation's
+  contribution is genuinely recorded in **both** places and both records are stale
+  until each is corrected. Ownership resolution would fix exactly one of them.
+  Deleting a key cannot double-subtract, which is what makes the unconditional walk
+  safe where the aggregate correction's would not be.
+- **It subtracts by deletion, then re-derives.** For each row, the detached session
+  keys are dropped from the split, and the row's `usage` total is recomputed **from
+  what survives** rather than subtracted from. Confidence is re-derived too, never
+  carried over: dropping the only estimated session leaves a total that really is
+  fully attributed, and keeping the old label would understate what is now known.
+- **A row whose split empties out keeps its identity and loses only its figure.**
+  Both `usage` and the split are stripped; the row and its invocation count stay.
+  The skill did run — the count says so — and what a detach removes is the evidence
+  of what it cost. An absent usage states that; a zero would claim the skill was
+  free, and deleting the row would claim it never ran.
+- **A row with no per-session split is returned untouched.** Forward-only, for the
+  same reason the aggregate path refuses to invent a subtrahend.
 
 ### Cost is re-derived, never scaled
 
@@ -272,6 +319,29 @@ computation over the input tree; the tree itself is never mutated in place.
   list is a tree-wide index while the node's figures cover only its delta (or
   nothing). Ownership must be computed post-order — deepest claimant wins. (Surprising;
   intentional.)
+- **The per-skill correction deliberately ignores ownership, and the aggregate one
+  deliberately cannot.** The skill correction runs on every node because an amend
+  genuinely records one conversation's skill contribution at both the root and the
+  child it wraps, and deleting a key from a split cannot double-subtract the way
+  subtracting a total from two nodes would. So the two corrections in this one
+  operation apply opposite rules for good reasons, and neither rule is safe for the
+  other's data. (Surprising; load-bearing.)
+- **A skill row whose split empties keeps its identity and loses only its figure.**
+  The invocation count stays and both usage fields are stripped, because "it ran,
+  we can no longer say what it cost" is the honest reading. A zero would claim the
+  skill was free; removing the row would claim it never ran. (Notable; the same
+  strip-never-zero contract the aggregate group follows.)
+- **Skill confidence is re-derived, never carried.** Dropping the only estimated
+  session leaves a remainder that really is fully attributed, so keeping the old
+  label would understate what is now known. (Notable.)
+- **A skill row written before per-session splits existed is corrected not at all.**
+  It is returned untouched — the same refusal-to-invent-a-subtrahend the aggregate
+  path applies, and the reason a merged split is dropped rather than half-kept
+  upstream (see [04 — Summary Tree Structure]). (Notable; forward-only.)
+- **The tree is walked when EITHER correction has work.** Gating the walk on
+  ownership alone would leave a memory's skill figures stale while the result
+  reported that nothing changed — the exact "wrong number, no trace" outcome this
+  behavior exists to avoid. (Surprising; intentional.)
 - **A per-model split without a segment breakdown is treated as no share at all.**
   The two halves of a persisted share are gated independently at write time, so a
   record can carry the per-model split alone; this correction never looks past the
@@ -338,7 +408,12 @@ computation over the input tree; the tree itself is never mutated in place.
   Estimation].
 - The corrected fields, the "absent means not reported" contract, and the
   tree-aggregation helpers every display surface reads them through are defined in
-  [04 — Summary Tree Structure].
+  [04 — Summary Tree Structure]. That spec also owns the skill accumulation whose
+  all-or-nothing merge of per-session splits exists precisely so this correction's
+  re-derivation from the surviving split cannot silently under-report.
+- The per-skill usage split this correction deletes from — how it is captured, keyed
+  and attributed at write time — is owned by spec 321, and the row it sits on by
+  spec 319.
 - The transcript-id list whose per-node meaning drives ownership resolution is
   defined in [185 — V5 UUID Identity and Migration].
 - The panel that offers the detach control, gates it in read-only modes, hides

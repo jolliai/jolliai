@@ -82,6 +82,10 @@ A small file under the per-project memory dir, containing one optional ISO-8601 
 
 A bounded JSON array of at most 20 most recent ingest run records. Each record carries: start instant, duration in milliseconds, what triggered the run, the structured outcome code, batches processed, total sources folded, count of topics touched, route-call count, reconcile-call count, and a list of per-topic failures (slug plus structured code). Missing or corrupt file is treated as empty. Each successful or unsuccessful drain appends exactly one record; a no-op skip when no credentials are present appends a one-off zero-counts record carrying the credential-missing outcome.
 
+The append path is also an **onboarding-funnel emission point**. After writing the record and emitting the pipeline-health event, the append attempts an `onboarding_progressed` snapshot (spec 312) for the same cwd — but only when the record's folded-source count is greater than zero. An idle drain (nothing folded) and the credential-missing zero-counts record therefore never emit: neither moved the funnel, and the snapshot can cost an installation probe. A drain that did fold sources is a natural re-report point, since the memories it folded already exist — so this trigger re-affirms "memories generated" rather than being the moment that flips.
+
+Structurally, this trigger can **never** report a capture method of "none". The queue-worker dispatch bails out — appending the credential-missing record and returning — before the drain runs whenever the credential resolution yields nothing, so by the time a record with a non-zero folded count exists, a working credential is a precondition. That is a property of the call graph, not a check inside the emitter.
+
 ### Outcome code set
 
 The pipeline emits structured outcome codes (stable, append-only — never renumber):

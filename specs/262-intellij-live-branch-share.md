@@ -82,6 +82,15 @@ The request to reveal the overlay is asynchronous relative to the editor's own p
 
 Critically, step 2's reconcile check does **not** consult the record's expiry at all — it fires whenever a branch-collection record exists, live or lapsed. See Notable Behavior.
 
+### The per-repo outbound opt-out: mint aborts, reconcile skips quietly
+
+Both entry points converge on one push funnel, `pushSubjectAndBuildRef`, whose **first statement** is the outbound-push gate: `if (!outboundPushAllowed(ctx.workspaceRoot)) throw JolliShareService.PushDisabledError()` (`intellij/src/main/kotlin/ai/jolli/jollimemory/services/LiveShareController.kt:120-121`). Placing it in the single funnel is what stops a push-disabled repo leaking via *either* branch or commit live share. The predicate is injected (`deps.outboundPushAllowed`, defaulting to `JolliShareService::defaultOutboundPushAllowed`, `:65`), which is what makes it testable without JVM-global stubbing.
+
+The two callers then diverge:
+
+- **Mint** (`:259`) lets the refusal propagate; the overlay renders it as an error state.
+- **Reconcile** (`:331-336`) catches `PushDisabledError` specifically, logs `reconcile: outbound push disabled for this repo; skipping re-push`, and returns from the subject lock — leaving the cached record intact and rendering nothing. Reconcile is a best-effort background pass that fires on every open, so a push-disabled repo just means "nothing to sync outbound". Same shape as VS Code's reconcile branch (234).
+
 ### Ready state assembly
 
 - Read the subject's record (261). There is no separate "seed" read — only the subject's own record exists to render from.
@@ -132,6 +141,8 @@ These are confirmed by reading the live code, not inferred from absence of a men
 - **Invite grants access, then emails — and a mail failure keeps the grant.** Access is a server-side allowlist merge; the email is a notification. Losing the email does not lose access. (Notable.)
 - **Reconcile-on-open is gated by kind and by content fingerprint, but not by expiry.** Only an existing branch-collection record reconciles, and even then only when a content fingerprint shows the shared memory changed — ordinary re-opens of unchanged content don't re-push. But as noted above, an expired record reconciles exactly like a live one. (Notable; partial gate.)
 - **Every rendered/copied URL is origin-checked.** A record whose URL fails the Jolli allowlist renders as absent; copy asserts the origin before touching the clipboard. (Notable.)
+- **The outbound-push gate lives in the shared funnel, not at the two entry points.** One check in `pushSubjectAndBuildRef` covers branch *and* commit share, so neither can leak from a push-disabled repo — and because the predicate is injected rather than read statically, it stays testable under the plugin's ban on JVM-global stubbing. (Notable; spec 310.)
+- **A push-disabled repo makes reconcile a silent no-op, but still aborts a mint.** The same refusal from the same funnel is surfaced on the path the user initiated and swallowed on the path the overlay initiates for them, so a chosen setting never appears as a recurring error on open. Matches VS Code (234) exactly — unusually, since most of this feature's behavior diverges from its analog. (Surprising; intentional asymmetry.)
 - **The controller's dependency struct forwards a read-summary callback into every push.** Its injected dependencies gained a read-summary-by-commit-hash passthrough that is plumbed straight into the push context it builds — pure plumbing that enables the push orchestrator's delayed unresolved-orphan resolution (263); the controller itself does nothing else with it. (Footnote.)
 - **The org tier is capability-gated by the API key.** It is offered only when the key's decoded payload carries an org slug. (Notable.)
 - **The overlay lives inside the memory's own detail webview, never a separate window.** Both the whole-branch and single-commit entry points converge on the same overlay markup and script inside that one webview; there is no standalone share dialog or window in the current codebase (confirmed absent — see 263's Notable Behavior for the full account of what was removed).
@@ -159,6 +170,7 @@ For one subject:
 ## Shared Behavior
 
 - **Persistence, keying, single-slot invariant** — **IntelliJ Branch Share Store** (261); this overlay is its only reader/writer besides the reconcile path.
-- **Content push, cross-commit dedup, and covered-list construction** used by every mint/reconcile — **IntelliJ Push Orchestration** (263).
+- **Content push, cross-commit dedup, and covered-list construction** used by every mint/reconcile — **IntelliJ Push Orchestration** (263); its repo-wide fatal set is **Repo-Wide Push-Refusal Classification** (327).
+- **The per-repo outbound-push opt-out** behind `outboundPushAllowed` / `PushDisabledError`, and the `outbound-push-allowed` bridge call that evaluates it — **Per-Repo Outbound-Push Control** (310).
 - **Binding chooser** — injected as a callback; opened and its outcome mapped by the same repo-binding surface the ordinary summary push uses.
 - **VS Code analog** — **VS Code Live Branch Share** (234); this spec documents where the IntelliJ port narrows or diverges from it.

@@ -14,7 +14,7 @@ Two surfaces that together let an IntelliJ user edit their Jolli Memory configur
 - The Sync tab's own provider-independent card switching (signed-out / signed-in-no-key / signed-in) and its per-repo outbound-push toggle.
 - The `Sync transcripts` checkbox on the Memory Bank tab, and the two config fields (`autoSyncEnabled`, `syncPollIntervalSec`) that are **round-tripped without any control** on any tab.
 - The shared save target: a single global config directory; both surfaces read from and write to the same file.
-- The validation rules surfaced via the dialog's continuous validation (provider-specific requirements; max-tokens must be a positive integer when set; at least one of the six platform checkboxes must stay enabled).
+- The validation rules surfaced via the dialog's continuous validation (provider-specific requirements; max-tokens must be a positive integer when set; at least one platform checkbox must stay enabled).
 - The apply-vs-OK semantics: the IDE-native page exposes Apply (no dialog dismissal) plus OK (apply + close); the gear-icon dialog only has OK (relabeled `Apply Changes`) and Cancel, and defers its heaviest work (hook install/uninstall, Memory Bank init + migration, and re-pointing the session's memory-mirror read source) to a background task that runs **after** the dialog has already closed.
 - The privacy notice on the IDE-native page (an HTML label with a link to the privacy policy, marked copyable).
 
@@ -50,7 +50,7 @@ Both surfaces write to a single canonical global config file under the user's ho
 
 Fields the user did not edit are preserved unchanged. Tokens persisted by the OAuth flow (sign-in credentials) are written by the OAuth callback handler, not by these surfaces — both surfaces leave those fields alone.
 
-**A dialog Apply is four such writes, not one.** Five fields — the Anthropic key, the provider, the agent tool, the agent path, and the DCO sign-off flag — are deliberately excluded from the main merged write (written as explicit nulls) and then restored by follow-up partial writes: one for the provider-routing group, one for the sign-off flag, and one more for the telemetry choice. The sequence is not atomic and can be observed mid-way by another surface. Its full mechanics and consequences (including that the agent **path** is nulled and never actually restored) are owned by the configuration-file spec.
+**A dialog Apply is four such writes, not one.** The Anthropic key, the provider, the agent tool, the agent path, and the DCO sign-off flag are deliberately excluded from the main merged write (written as explicit nulls) and then restored by follow-up partial writes: one for the provider-routing group, one for the sign-off flag, and one more for the telemetry choice. The sequence is not atomic and can be observed mid-way by another surface. Its full mechanics and consequences (including that the agent **path** is nulled and never actually restored) are owned by the configuration-file spec.
 
 ### IDE-native page fields
 
@@ -95,7 +95,7 @@ The dialog's center panel is a tabbed pane. Selecting a tab is remembered (a pro
 
 ### Platform checkboxes (AI Agents tab)
 
-Six checkboxes, all default checked, each labeled with its detection mechanism:
+Every checkbox defaults to checked, and each is labeled with its detection mechanism:
 
 | Checkbox | Label |
 | --- | --- |
@@ -110,7 +110,7 @@ At least one must remain checked to save (see Validation).
 
 ### AI Summary provider cards
 
-The `Provider:` dropdown offers exactly three options: `Anthropic`, `Jolli`, and `Local Agent (subscription)` (no "unset" option on this tab — the dialog defaults the selection from existing config, or from sign-in state when no provider is saved). Beneath it, one of five cards is shown:
+The `Provider:` dropdown offers `Anthropic`, `Jolli`, and `Local Agent (subscription)` (no "unset" option on this tab — the dialog defaults the selection from existing config, or from sign-in state when no provider is saved). Beneath it, one of the following cards is shown:
 
 | Card | Shown when | Content |
 | --- | --- | --- |
@@ -118,13 +118,51 @@ The `Provider:` dropdown offers exactly three options: `Anthropic`, `Jolli`, and
 | Jolli — signed in, has key | Provider = Jolli, a Jolli API key already exists | A green-check line naming the signed-in site (or a generic "using Jolli" line when no site could be parsed from the key). |
 | Jolli — signed in, no key | Provider = Jolli, signed in but no Jolli API key saved | A warning line plus a `Sign Out & Re-login` button. |
 | Jolli — signed out | Provider = Jolli, not signed in | An explainer plus a `Sign In to Jolli` button. |
-| Local Agent | Provider = Local Agent (subscription) | An `Agent tool:` dropdown whose only option is `Claude Code`, with the tooltip "Uses your local Claude Code login (subscription). Sign in with the `claude` CLI if prompted." **No API key is collected** — the agent's own subscription sign-in is the credential. |
+| Local Agent | Provider = Local Agent (subscription) | An `Agent tool:` dropdown listing **every** supported tool, with the tooltip "Uses your local Claude Code login (subscription). Sign in with the `claude` CLI if prompted." **No API key is collected** — the agent's own subscription sign-in is the credential. |
 
-The Local Agent card collects no credential of its own, so this provider has no validation rule (unlike Anthropic's key-prefix check and Jolli's must-be-signed-in check). The agent-tool dropdown is single-valued, so it cannot be set to anything but the one supported tool.
+The Local Agent card collects no credential of its own, so this provider has no validation rule (unlike Anthropic's key-prefix check and Jolli's must-be-signed-in check).
 
-**Divergence from the desktop-editor settings panel.** That surface's provider dropdown now labels this option simply `Local Agent` (without the parenthetical), and its agent-tool dropdown is generated from the tool registry and offers all four supported tools. This dialog keeps the older parenthesised label and still offers only the default tool. The consequence is no longer cosmetic: because this dialog writes the default tool identifier on every Apply **regardless of what its dropdown shows** (see Field persistence semantics), applying settings from here **overwrites a non-default agent tool the user selected on the other surface**, silently reverting them to the default. That was harmless while no other tool could be chosen anywhere; it is a real cross-surface clobber now that one can.
+### Agent-tool dropdown: a two-tier list
 
-Below all four cards, an `Advanced` toggle link reveals/hides a Jolli-API-key text field (tooltip: auto-filled on sign-in, or paste a new one). The link and panel are force-hidden under the Anthropic card and under the signed-out card; they are shown collapsed (link visible, panel hidden until clicked) under the has-key card; they are force-expanded (link hidden, panel already open) under the no-key card, since that is precisely the field the user needs to fill in.
+(Corrected: this spec previously stated that the dropdown's only option was `Claude Code`. That has not been true since the picker was rebuilt as a two-tier list.)
+
+The dropdown is backed by two tiers, and the static one is always in effect first:
+
+- **Tier 1 — the static baseline.** The combo's model is constructed from a hand-maintained Kotlin list of every supported tool (currently Claude Code, Codex, Cursor, OpenCode, Kimi Code), in the command-line registry's order. This is both the picker's **initial model** and its **fallback**, so the dialog offers every backend from the first paint, before any I/O.
+- **Tier 2 — the delegated override.** A `local-agent-tools` call to the command-line surface is dispatched **off the interface thread** (the daemon fast path is milliseconds, but a cold one-shot spawn can take seconds and this IDE's slow-interface-thread threshold is well below that). On success the returned list **replaces** the model wholesale, so a newly added backend or a re-ordering appears without a plugin update. On any failure the baseline stays.
+
+**The saved selection is applied synchronously, from the baseline, before the fetch is dispatched.** Reopening the dialog therefore shows the persisted tool immediately. This ordering is the fix for a real defect: the selection used to be applied only inside the asynchronous callback, so a slow, hung, or failed fetch left the combo sitting on its first entry (Claude Code) and a correctly-persisted non-default tool looked forgotten. The selection is applied a second time after the override lands, against the new list. Selection is by matching the saved tool identifier against each row's identifier; no match selects index 0.
+
+The model stores **labels**; a parallel list preserves the matching identifiers so save-time can persist the command-line identifier rather than the human label.
+
+### Every way the tool list can degrade — all of them to the full list
+
+Four paths bypass the override, and none of them collapses the picker to Claude Code alone:
+
+1. The delegated reply carries no tool array → the static baseline.
+2. The array is present but every element is unusable (not an object, or missing an identifier or a label) → the per-element mapping drops them all, and the empty result is replaced by the static baseline.
+3. **Any exception** — the daemon is down, the installed command-line surface is too old to know this action, the reply is malformed or is not an object, an I/O error — → the static baseline.
+4. **Neither the project service's resolved repository root nor the project's base path resolves** → the method returns *after* applying the synchronous selection and **never dispatches the fetch at all**. The picker stays on the static baseline with the saved tool selected. This one is easy to miss because it is an early return in the middle of the method rather than a catch.
+
+**Notable:** the catch in path 3 is scoped to `Exception`, not `Throwable` — so a class-loading or other `Error` escapes it and propagates out of the pooled-thread task. That is pointed here, because the sibling embedded-browser pool made the opposite choice in the same period, deliberately widening its own catch to the whole throwable hierarchy for exactly that failure mode (spec 302).
+
+### How honest the lockstep actually is
+
+The static baseline is a hand-maintained Kotlin mirror of the command-line surface's tool registry, and a Kotlin test pins it — **but the test pins it against a third hard-coded Kotlin literal**, not against the registry's source. Its consequences are asymmetric:
+
+- Editing the baseline alone **fails** the test. That case is genuinely enforced.
+- Adding a tool to the command-line registry and leaving both Kotlin files untouched **passes**. Nothing in the build reads the registry's source.
+
+So the mirror is enforced by convention and code review, not by the test, and the test's real job is to stop the baseline drifting from its own expected literal. What limits the damage is tier 2: whenever the delegated fetch succeeds it is authoritative, so a drifted baseline only affects a fully-offline run or one where the fetch failed.
+
+**Divergence from the desktop-editor settings panel.** The remaining divergence is much smaller than it was. Two things differ:
+
+- **The provider label.** This dialog's dropdown reads `Local Agent (subscription)`; the desktop editor's reads `Local Agent`, without the parenthetical.
+- **No availability probe.** That surface probes the chosen tool's presence and capability and can tell the user a tool is not usable; this dialog performs no probe of any kind on any tier, so an unavailable tool is selectable and savable here with no feedback (spec 110).
+
+**The cross-surface clobber this spec previously recorded is resolved.** This dialog no longer writes a fixed identifier: save maps the combo's selected **label** back to an identifier through the live tool list (see Field persistence semantics), so a tool chosen on the other surface survives an Apply here. What remains is a narrower fallback, not a clobber — if the selected label matches no row in the current list (a stale label left over from a list that has since been replaced), the save falls back to the default `claude-code` identifier silently.
+
+Below the cards, an `Advanced` toggle link reveals/hides a Jolli-API-key text field (tooltip: auto-filled on sign-in, or paste a new one). The link and panel are force-hidden under the Anthropic card and under the signed-out card; they are shown collapsed (link visible, panel hidden until clicked) under the has-key card; they are force-expanded (link hidden, panel already open) under the no-key card, since that is precisely the field the user needs to fill in.
 
 ### Sync tab cards
 
@@ -136,9 +174,21 @@ A separate three-card panel, independent of the AI Summary tab's provider select
 | Signed in, no key | Signed in but no Jolli API key saved | A warning line, a `Sign Out & Re-login` button, and its own `Advanced` toggle revealing its own Jolli-API-key field. |
 | Signed in, has key | Signed in and a Jolli API key exists | A green-check "ready to push memories" line and a `Sign Out` button. |
 
-Below the card, after a separator, the **Push to Jolli Space (this repository)** section: a bold heading, a `Push this repository's memories to Jolli` checkbox, and a gray explainer ("Off = keep recording this repository's memory locally but never push it to its Jolli Space (auto or manual). Re-enabling syncs the backlog."). This is the IntelliJ face of the per-repo outbound-push control (spec 306) — it is **not** a config-file field: it is read via the `push-control-get` IDE bridge and written via `push-control-set`, against the machine-global push-control store.
+Below the card, after a separator, the **Push to Jolli Space (this repository)** section: a bold heading, a `Push this repository's memories to Jolli` checkbox, and a gray explainer ("Off = keep recording this repository's memory locally but never push it to its Jolli Space (auto or manual). Re-enabling syncs the backlog."). This is the IntelliJ face of the per-repo outbound-push control (spec 310) — it is **not** a config-file field: it is read via the `push-control-get` IDE bridge and written via `push-control-set`, against the machine-global push-control store.
 
-The checkbox starts **disabled** and is enabled only once the async read lands, so the dialog never asserts a state it does not have. A read that fails — or answers with a malformed reply — leaves it disabled with an explanatory tooltip and leaves the row marked *not loaded*, which suppresses the write in `doOKAction` entirely; the state is re-read next time Settings opens. The write fires only when the value actually changed, so re-saving Settings never re-triggers the re-enable drain, and a failed write raises a warning notification rather than being swallowed (the dialog has already closed by then).
+The checkbox starts **disabled** and is enabled only once the async read lands, so the dialog never asserts a state it does not have. There are **three** post-read outcomes, not two:
+
+| Outcome | How it arrives | Checkbox | Tooltip |
+| --- | --- | --- | --- |
+| Loaded | The reply carries this repository's disabled flag | enabled, set from the flag, tooltip cleared | none |
+| Unknown — this repository | The read failed or the reply was malformed | disabled, marked *not loaded* | "Couldn't read this repository's push setting — reopen Settings to retry." |
+| Unknown — **the whole store** | The reply carries a store-level error, meaning the machine-global store itself is unreadable | disabled, marked *not loaded* | Names the store error and directs the user to run the bare `push-control` command to repair it |
+
+The third outcome is a distinct state with its own message, and its wording is deliberate: it points at the plain repair command and **never** at the enable form, because enabling rebuilds an unreadable store from empty and would drop every other repository's opt-out. An unreadable store is fail-closed machine-wide, so this repository's own state genuinely is unknown rather than merely unread.
+
+Both unknown outcomes leave the row marked *not loaded*, which suppresses the write in `doOKAction` entirely; the state is re-read next time Settings opens. The write fires only when the value actually changed, so re-saving Settings never re-triggers the re-enable drain, and a failed write raises a warning notification rather than being swallowed (the dialog has already closed by then).
+
+**The write path has a second, undocumented notification.** When `push-control-set` reports that it recovered from a corrupt store, the dialog logs a warning and raises a warning-level IDE notification titled "Outbound push setting file was rebuilt", telling the user that every *other* repository's opt-out was reset to ON and that they must re-apply the ones they wanted off — naming the preserved copy's path when the reply carries one. This exists because the enable path can rebuild the store from empty, and reporting a bare success would hide a machine-wide settings reset behind one checkbox. The store contract requiring callers to surface this is owned by spec 310.
 
 `Auto-sync to Personal Space` and its paired `Poll interval (seconds):` field are **no longer surfaced** on any tab (not yet actionable); `Sync transcripts` moved to the **Memory Bank** tab, next to the other content-scope controls. See the field map below for how the two unsurfaced values are preserved.
 
@@ -173,11 +223,11 @@ Below the folder controls, a **Historical memory** section with a `Generate Miss
 | Model (alias or full ID)                 | `model` (null when the dropdown's alias resolves to the implicit default `sonnet`).                  |
 | Max tokens                               | `maxTokens` integer (null when blank).                                                                |
 | Provider                                 | `aiProvider` set to `"anthropic"`, `"local-agent"`, or — for anything else — `"jolli"`. |
-| Agent tool (Local Agent card)            | `localAgentTool`, always written as the single supported tool identifier regardless of the dropdown, since the dropdown has one option. |
+| Agent tool (Local Agent card)            | `localAgentTool`, resolved by matching the dropdown's selected **label** against the live tool list and writing that row's command-line identifier (e.g. `codex`, not `Codex`). Falls back to the default `claude-code` identifier only when no row matches — an unmatched or stale label, never a deliberate choice. The companion `localAgentPath` override is never touched by this dialog. |
 | DCO sign-off                             | `dcoSignoff` boolean.                                                                                  |
 | Jolli API key                            | `jolliApiKey`. Read from whichever tab's Advanced/Jolli-key field was actually made visible during this dialog session (Sync tab takes precedence over AI Summary tab when both were opened); if **neither** Advanced panel was ever opened, the existing saved value is kept untouched. If the resolved value is blank while a key previously existed, the key is cleared **and** the user is signed out. |
 | Session token (sign-out side effect)     | The token field is nulled **inside the same single configuration write that clears the key** — not by a separate asynchronous sign-out. The asynchronous sign-out is still fired, but only after every write this Apply performs on the interface thread has landed; by then the token and key are already absent on disk, so its own credential clearing is idempotent and its remaining jobs are the telemetry event, notifying the authentication listeners, and rolling the provider field back off the proxy choice. |
-| Six platform checkboxes                  | `claudeEnabled` / `codexEnabled` / `geminiEnabled` / `openCodeEnabled` / `cursorEnabled` / `copilotEnabled` booleans. |
+| Platform checkboxes                      | `claudeEnabled` / `codexEnabled` / `geminiEnabled` / `openCodeEnabled` / `cursorEnabled` / `copilotEnabled` booleans. |
 | Excluded patterns                        | `excludePatterns` array, comma-split/trim/drop-empty (null when no entries).                          |
 | Memory Bank folder path                  | `knowledgeBasePath` (defaults to the standard Memory Bank parent directory when left blank).           |
 | Memory Bank sort order                   | `knowledgeBaseSort` (`date` or `name`).                                                                |
@@ -185,7 +235,7 @@ Below the folder controls, a **Historical memory** section with a `Generate Miss
 | *(no control)*                           | `autoSyncEnabled` — **round-tripped verbatim**: `populateFields` snapshots the loaded value and `doOKAction` writes exactly that back. |
 | Sync transcripts *(Memory Bank tab)*     | `syncTranscripts` (true, or null when unchecked).                                                      |
 | *(no control)*                           | `syncPollIntervalSec` — **round-tripped verbatim**, same as `autoSyncEnabled`.                          |
-| Push this repository's memories to Jolli | **Not a config field.** Read/written through the `push-control-get` / `push-control-set` IDE bridge against the machine-global push-control store (spec 306); written only when changed, and only once the async read has landed. |
+| Push this repository's memories to Jolli | **Not a config field.** Read/written through the `push-control-get` / `push-control-set` IDE bridge against the machine-global push-control store (spec 310); written only when changed, and only once the async read has landed. |
 | Telemetry opt-in/out                     | Written to the shared telemetry flag immediately (not through the config load-merge-save cycle), and applied live to the running telemetry context in the same click — not deferred to IDE restart. |
 
 The IDE-native page edits only `apiKey`, `model`, and `jolliApiKey` — it does not touch provider, max-tokens, excluded patterns, platform toggles, Memory Bank fields, pause, or sync fields; those exist only in the gear-icon dialog.
@@ -197,7 +247,7 @@ Runs continuously as the framework re-validates on input change and on OK click:
 1. If the provider is Anthropic and a newly-typed key does not start with `sk-ant-`, reject bound to the Anthropic key field. (A saved key whose masked display is left untouched is never re-validated against this prefix.)
 2. If the provider is Jolli and the user is not signed in, reject bound to the provider dropdown.
 3. If max-tokens is a non-empty string that does not parse to a positive integer, reject bound to the max-tokens field.
-4. If all six platform checkboxes are unchecked, reject with `At least one platform must be enabled` bound to the Claude checkbox.
+4. If every platform checkbox is unchecked, reject with `At least one platform must be enabled` bound to the Claude checkbox.
 
 A non-null result blocks the OK action and displays the message inline.
 
@@ -258,7 +308,7 @@ Clicking the OK button (`Apply Changes`):
 1. Resolves the provider (`"anthropic"` / `"local-agent"` / `"jolli"`), the effective Anthropic key, parsed max-tokens, and the split/trimmed excluded-patterns list.
 2. Resolves the Jolli API key per the precedence in Field persistence semantics above, and records whether that resolution *clears* a previously-existing key. **No sign-out is dispatched at this point.**
 3. Resolves the Memory Bank folder path (falling back to the standard default when blank) and sort order.
-4. Builds the merged config from all of the above plus the six platform booleans, pause, sync-transcripts, and the two round-tripped values (`autoSyncEnabled`, `syncPollIntervalSec`, written back exactly as they were loaded — no control edits them) — **and, when the key was cleared, a nulled session token in the same record** — and saves it.
+4. Builds the merged config from all of the above plus the platform booleans, pause, sync-transcripts, and the two round-tripped values (`autoSyncEnabled`, `syncPollIntervalSec`, written back exactly as they were loaded — no control edits them) — **and, when the key was cleared, a nulled session token in the same record** — and saves it.
 5. Applies the telemetry opt-in/out choice immediately to the live telemetry context (not deferred to restart) and records a provider-selection event.
 6. **Only now**, after every interface-thread write has landed, fires the asynchronous sign-out if the key was cleared.
 7. Computes the auto-disable decision (see below).
@@ -285,7 +335,7 @@ The background task's first branch uninstalls hooks when credentials are absent.
 
 Two things the previous any-credential OR-check got wrong and this fixes: it accepted a lone Jolli key under the Anthropic provider, and it read the Anthropic key from the field that this Apply deliberately nulls (Anthropic credentials live only in the shared configuration now), so it always saw that key as absent and uninstalled hooks from users who had one.
 
-The provider is resolved to exactly one of the three values above, so a fourth "no provider selected" arm — which would fall back to the old any-of-three test — exists in the decision but cannot be reached from this dialog.
+The provider is always resolved to one of the values above, so the remaining "no provider selected" arm — which would fall back to the old any-credential test — exists in the decision but cannot be reached from this dialog.
 
 ### Sign-in flow from either surface
 
@@ -384,7 +434,7 @@ The IDE-native page **does** own a live authentication-listener subscription: it
 ## Notable Behavior
 
 - **Two surfaces, one config file — shared with two other products.** The IDE-native page and the gear-icon dialog write to the same global config file, and so do the command-line surface and the VS Code extension. Saving from any of them is observed by all the others on their next read. There is no IDE-private configuration file. They edit different field sets, but the load-merge-save cycle preserves untouched fields.
-- **The dialog's Apply is four non-atomic writes to that shared file.** Five fields are nulled by the first write and restored by later ones, so a concurrent reader on any surface — including a background summary worker — can observe the provider choice and API key as absent. See the configuration-file spec.
+- **The dialog's Apply is four non-atomic writes to that shared file.** The Anthropic key, the provider, the agent tool, the agent path and the DCO sign-off flag are nulled by the first write and restored by later ones, so a concurrent reader on any surface — including a background summary worker — can observe the provider choice and API key as absent. See the configuration-file spec.
 - **The IDE-native page does not edit provider, max-tokens, excluded patterns, platform toggles, Memory Bank fields, pause, or sync fields.** Those exist only in the gear-icon dialog. The IDE-native page is the slim surface (Anthropic key, model, Jolli API key) anchored at the standard IDE settings location.
 - **The gear-icon dialog builds its own sign-in and provider-selection UI inline, on each of two tabs, rather than reusing a single shared component.** A reusable sign-in-banner component and a reusable provider-picker component both exist elsewhere in the plugin's source, but neither is instantiated by the dialog (or by anything else in the live UI) — the dialog's AI Summary and Sync tabs each implement their own bespoke card-switching instead. (Notable / partially dead code — see Unreachable below.)
 - **Migrate to Memory Bank no longer blocks the UI thread.** It runs on a background task with progress text and delegates the migration itself to the command-line surface's one-shot migration command. It is still immediate and still not undone by Cancel; what changed is that the IDE stays responsive while it runs.
@@ -392,12 +442,15 @@ The IDE-native page **does** own a live authentication-listener subscription: it
 - **The dialog closes before its heaviest work runs.** Applying settings snapshots everything it needs off the UI thread, dismisses the dialog immediately, and only then runs hook install/uninstall and Memory Bank init/migration in one ordered background task — so the IDE is never blocked, and the enable/disable step is guaranteed to run before the migration step within that task.
 - **The Jolli API key's save value depends on dialog interaction, not just field contents.** If the user never opens either tab's Advanced disclosure, the field's displayed (pre-populated) value is ignored entirely and the existing saved key is kept — only opening the disclosure marks that tab's field as authoritative for save purposes.
 - **Generate Missing Summaries ignores the cold-start dismiss marker on the way in and does NOT clear it on the way out.** It always runs full scope regardless of whether the tool-window card was dismissed for this repo — but a successful run, even one that generates many summaries, leaves the dismiss marker in place. There is now **no** path that clears a dismissed cold-start card: once dismissed, it stays dismissed for the life of the marker (spec 260). (Corrected: the shared runner used to clear the marker on a successful run; it no longer does.)
-- **Provider is a three-way choice and only two of the three are validated.** Anthropic requires a well-formed typed key; Jolli requires an active sign-in; Local Agent requires nothing, because its credential is the agent's own subscription login. A user can therefore save the Local Agent provider with no credential of any kind configured in this dialog. This surface no longer punishes them for it: its own auto-disable decision branches on the selected provider and treats Local Agent as always-credentialed, so applying settings under that provider no longer uninstalls the hooks.
-- **This dialog silently reverts a non-default agent tool chosen elsewhere.** Its own dropdown offers only the default tool, and it writes the default tool identifier on every Apply regardless of the dropdown — so one Apply here overwrites a different tool selected in the desktop-editor settings panel. That write predates the other surface gaining more than one option; it was a no-op then and is a cross-surface clobber now. (Surprising; a real gap.)
+- **Of the provider choices, only Anthropic and Jolli are validated.** Anthropic requires a well-formed typed key; Jolli requires an active sign-in; Local Agent requires nothing, because its credential is the agent's own subscription login. A user can therefore save the Local Agent provider with no credential of any kind configured in this dialog. This surface no longer punishes them for it: its own auto-disable decision branches on the selected provider and treats Local Agent as always-credentialed, so applying settings under that provider no longer uninstalls the hooks.
+- **The cross-surface agent-tool clobber is fixed.** (Corrected: this spec previously recorded that the dialog offered only the default tool and wrote the default identifier on every Apply regardless of the dropdown, silently reverting a tool chosen in the desktop-editor settings panel. Both halves are now false — the dropdown lists every tool, and save maps the selected label back through the live list.) What survives is a **narrower** fallback: when the selected label matches no row in the current list, save writes `claude-code`. That is reachable only when the model was replaced by a delegated override after the selection was made, so it is a real but small window, and it is silent.
+- **The tool picker degrades to the full list on every failure path, and to Claude-only on none of them.** Every bypass path — no tool array, an all-unusable array, any exception, and an unresolvable project root — lands on the static Kotlin baseline. The last of those does not even dispatch the fetch. The previous behaviour, where any delegated hiccup left the picker showing Claude Code alone, was the defect this design closes.
+- **The tool-list catch is `Exception`, not `Throwable`.** An `Error` raised inside the pooled-thread fetch escapes it. This is worth naming because the plugin's embedded-browser pool made the opposite call in the same period, widening its own catch to the whole throwable hierarchy precisely so a class-loading `Error` could not escape (spec 302). The two surfaces do not agree on where that boundary sits.
+- **The tool-list lockstep is enforced by convention, not by the test that appears to enforce it.** The test compares the Kotlin baseline against another hard-coded Kotlin literal, so it catches an edit to the baseline alone and does not catch a tool added to the command-line registry with neither Kotlin file touched. Stated plainly: adding a backend upstream and forgetting this surface passes the build. The delegated override is what keeps that from being user-visible on any machine where the fetch succeeds.
 - **The sign-out that a cleared Jolli key implies is written, not dispatched.** The session token is nulled inside the same single configuration write that clears the key, and the asynchronous sign-out fires only after every interface-thread write of the Apply has landed. Previously the two ran concurrently against the same file, each doing its own load-modify-write, which produced two nondeterministic failures: users who cleared their key stayed signed in, and a stale in-flight snapshot clobbered settings the Apply had just saved. (Surprising; the ordering is the fix.)
 - **There is no in-flight sign-in state anywhere on this surface.** None of the three sign-in buttons is disabled or relabelled while the OAuth flow runs; all three are fire-and-forget and re-render from the authentication listener instead. Sign-out is asynchronous too, which is why the IDE-native page had to grow its own listener — an inline re-render right after the click reads a sign-in check whose answer is cached for 5 seconds and would repaint "Signed in". (Notable.)
 - **The auto-disable decision used to uninstall hooks from users who had an Anthropic key.** It read the key from the field this Apply deliberately nulls (Anthropic credentials live only in the shared configuration), so it always saw "no key" — and it also accepted a lone Jolli key under the Anthropic provider, where generation would have failed at call time. Branching on the selected provider fixes both directions. (Notable.)
-- **The DCO sign-off flag is explicitly cross-surface.** Its own tooltip says so. It is one of the five fields the Apply sequence nulls and then restores in a separate write.
+- **The DCO sign-off flag is explicitly cross-surface.** Its own tooltip says so. It is one of the fields the Apply sequence nulls and then restores in a separate write.
 - **The DCO sign-off checkbox has no effect on commits made by this IDE.** It is persisted to the shared configuration and honoured by the VS Code extension's commit, amend, and squash paths — but nothing on this surface reads it, and none of this IDE's own commit / amend / squash invocations adds a sign-off flag. The checkbox label names "commit / amend / squash" and the tooltip names the shared file, so the setting reads as effective here while in fact only the other surface acts on it. (Notable; a real gap, not a design choice we could find stated anywhere.)
 - **Migrate to Memory Bank archives before it resolves.** Every existing folder for this repo (including the canonical, non-suffixed one) is moved into a hidden archive location first, so migration always lands back on the canonical folder name instead of climbing to an ever-higher suffixed one.
 - **The OK button text is overridden in the gear-icon dialog.** It reads `Apply Changes`, not the default `OK`. The Cancel button is unchanged.
@@ -405,7 +458,7 @@ The IDE-native page **does** own a live authentication-listener subscription: it
 - **Saved-key masking is one-way for the user.** When a field still shows the masked form, saving persists the original unchanged. When the user types over the masked form, the typed value replaces the saved key wholesale — there is no partial edit.
 - **The Anthropic prefix check applies only to newly-typed keys.** A saved key whose mask is unchanged is never re-validated. A typed value is validated only when it does not exactly equal the masked display.
 - **Max-tokens is a positive-integer-or-blank field.** Zero, negative, and non-numeric strings reject. Blank means "use default" (`null` saved).
-- **At least one of the six platforms must stay enabled.** A user cannot save with every checkbox unchecked — the dialog rejects.
+- **At least one platform must stay enabled.** A user cannot save with every checkbox unchecked — the dialog rejects.
 - **Pause is stored as `true` or absent, never explicit `false`.** Unpausing clears the field rather than writing a negative value.
 - **Telemetry opt-in/out takes effect immediately**, live in the running process, rather than requiring an IDE restart — matching the first-run notification's own "Turn off" affordance.
 - **Origin allowlist enforcement is not in this surface, and no longer anywhere on this IDE's request path either.** It runs in the sign-in flow, at key-mint time. The claim that it also runs "in the Jolli API client at request time" was never true of this IDE — that client never asserted an origin — and is now definitively false, because the client makes no requests at all: it delegates every backend call to the bundled command-line surface's bridge. This IDE's own validating key helper has no production caller; only the non-asserting parser does. The settings surfaces therefore assume any saved Jolli API key is valid, and a bad one surfaces as a bridge-side failure rather than an edit-time error. (Surprising; a corrected claim.)
@@ -427,5 +480,8 @@ The IDE-native page **does** own a live authentication-listener subscription: it
 - **OAuth flow** — runs the browser launch, callback server, and token exchange (separate spec); writes the Jolli API key into the global config.
 - **The shared back-fill runner** — invoked identically by the Memory Bank tab's `Generate Missing Summaries` button (full scope) and by the tool-window cold-start card (a specific selection); its progress reporting, completion notifications, and cold-start bookkeeping are owned by **IntelliJ Cold-start Back-fill Card** (spec 260).
 - **JolliMemory service** — the dialog passes it through both to the shared back-fill runner and to resolve the project's repo root; the IDE-native page reads the same repo-root resolution solely for backwards-compatible config-load behavior.
+- **Per-repo outbound-push control** (spec 310) — owns the machine-global push-control store, its fail-closed-on-unreadable contract, the distinction between a repository-level and a store-level unknown, the backlog drain a re-enable triggers, and the caller obligation to surface a rebuilt-from-corrupt store. This surface owns only the checkbox, its three post-read states, and the two notifications.
+- **Local-agent tool registry** — the command-line surface owns the canonical tool list this dialog mirrors statically and fetches over the bridge. The mirror's lockstep obligation is stated above; the registry itself is not this spec's.
+- **Desktop-editor settings panel** (spec 110) — the sibling surface this dialog is compared against, and the one that carries the availability/capability probe this dialog has no equivalent of.
 - **Tool window gear icon** — the surface that constructs the dialog (one entry point per click).
 - **Status panel** — co-resident in the same tool window; holds no edit affordance for these fields itself. Settings edits are exclusively through these two surfaces.

@@ -96,6 +96,7 @@ Every event ships only bucketed or boolean properties:
 | `ai_source_detected` | `source` (the AI source kind). |
 | `settings_opened` | `tab` (e.g. `general`). |
 | `memory_bank_migrated` | `repos` (count), `outcome` (`completed`/`partial`), `entries_bucket` (bucketed migrated count). |
+| `onboarding_progressed` | `in_git_repo`, `repo_enabled`, `capture_configured`, `memories_generated` (booleans), `capture_method` (`local-agent`/`anthropic`/`jolli`/`none`), `memories_bucket` (bucketed stored-memory count). |
 | `ingest_completed` | `outcome` (terminal code), `duration_ms`, `batches`, `ingested`, `touched_slugs`, `route_calls`, `reconcile_calls`, `topic_failures` (count). |
 | `error_occurred` | `code` (the structured error/outcome code), `where` (the subsystem — `ingest`, `push`, or `signin`). |
 | `queue_drained` | `ops` (count of processed ops), `duration_ms`. |
@@ -110,10 +111,10 @@ The search query is never sent — only its length bucket. Counts are bucketed w
 On every command-line invocation, in order, before command dispatch:
 
 1. Show the once-per-machine first-run disclosure (see **Telemetry Consent and Opt-Out**) — placed first so a single-command user sees it before the first install event is buffered.
-2. Bootstrap telemetry for the current working directory, which loads config, mints-or-reads the install identifier, resolves the origin/environment, primes the context, and — if this run minted the identifier — emits `app_installed`.
+2. Bootstrap telemetry for the **resolved repository root** of the launch directory — not the raw process working directory (see spec 311) — which loads config, mints-or-reads the install identifier, resolves the origin/environment, primes the context, and — if this run minted the identifier — emits `app_installed`. This is the same value every command's `--cwd` option defaults to, which is what keeps the buffer this bootstrap writes to and the buffer the commands write to a single file (spec 204).
 3. Register the per-command auto-emit hooks on the root program.
 4. Dispatch the command. The post-action hook emits `command_invoked` on success.
-5. On process exit (after the command completes on either path), flush the shared telemetry buffer once with a short bounded timeout, unless the resolved command is in the telemetry group or the run explicitly opted out. On the failure path the `command_invoked { ok: false }` event is recorded before the flush. The skip keys off the parsed command, not an argv position.
+5. On process exit (after the command completes on either path), flush the shared telemetry buffer once with a short bounded timeout, addressed by the **same resolved repository root** the bootstrap used, unless the resolved command is in the telemetry group or the run explicitly opted out. On the failure path the `command_invoked { ok: false }` event is recorded before the flush. The skip keys off the parsed command, not an argv position.
 
 The bootstrap is wrapped so a telemetry error never blocks startup; the auto-emit hooks are harmless when telemetry was never bootstrapped (the choke point is a no-op until then).
 
@@ -139,6 +140,19 @@ The plugin bootstrap mints-or-reads the install identifier (firing the install e
 ### AI-source-detected deduplication
 
 When a transcript-processing pass encounters a session source, it fires `ai_source_detected { source }` only the **first time that machine ever** processes that source, using a machine-global first-seen ledger in the shared config that records each source once. This is additionally gated on telemetry being currently enabled, so an opted-out or un-bootstrapped run never even writes the ledger entry (keeping it out of tests and preventing a later opt-in from missing the event, while never skewing the source-mix view by re-firing).
+
+### Onboarding-funnel emission sites
+
+`onboarding_progressed` has no single choke point — it is emitted from **six** trigger sites, each of which already holds (or can cheaply obtain) a repo context. The dedup ledger, the state signature, the daily heartbeat, and the per-path serialization that make repeated triggers cheap are owned by spec 312; what belongs here is only *where and when* each emit is attempted:
+
+- **The enable command's report tail** — after the enable report is printed, on **both** the success and the error branch, so the "installed but never got into a git repo" drop-off is visible rather than silent. Config is **re-loaded** at this point rather than reused, because the interactive provider setup that may have run earlier in the same invocation can have just added the capture credential the snapshot reports on. The `--repo-hooks-only` mode never reaches this tail (it returns from the action before the report); `--integrations-only` does.
+- **The guided front door's non-git dead end** — emitted just before the exit code is set. This is the only trigger in the product that ever fires outside a git working tree, so `in_git_repo: false` is observable at all only because of it.
+- **The guided front door's entry past the git gate** — emitted for every path that clears the git gate, including the user who then declines to enable, using the front door's own lightweight status rather than the heavy installation probe.
+- **The status command** — emitted from the status object it has already computed, so it costs no extra git work. This is the periodic snapshot for an already-active user. It sits *after* the `--json` early return, so the machine-readable mode is silent (see spec 58).
+- **The ingest run store's append path** — emitted only when a drain actually ingested something (see spec 152). Idle drains and the credential-missing record do not emit.
+- **The two editor surfaces' status refresh** — the editor extension's status store and the JVM IDE's project service both emit from the status they just computed, on every refresh.
+
+One property of this event is a deliberate departure from the model used everywhere else in this spec, where call sites emit unconditionally and the shared recording choke point is what gates on consent: `onboarding_progressed` is the **first** emitter that reads the consent context *itself*. Its entry point short-circuits on "telemetry context absent or not enabled" **before** any git query, any installation probe, and before it takes its ledger lock. The reason is that this snapshot is not free — it can cost a `getStatus()` — and the ledger is a repo-local file write. Gating at the choke point alone would have made an opted-out user pay the probe and acquire a ledger file for an event that could never be sent. As specified, an opted-out user pays nothing and **no ledger is ever written**.
 
 ### Pipeline-health instrumentation
 

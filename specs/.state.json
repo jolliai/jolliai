@@ -1,9 +1,9 @@
 {
   "branches": {
     "main": {
-      "revision": "64f8bc6b8530f81b242acbf1e788622b1820cee0",
-      "subject": "Add IntelliJ FolderStorageReader for direct JSON reads",
-      "reviewedAt": "2026-07-31T01:04:12Z",
+      "revision": "9393372502a5d3ca0bf92036e12f41f2e5c71af9",
+      "subject": "Replace deprecated ReadAction.compute with runReadAction",
+      "reviewedAt": "2026-08-01T18:48:21Z",
       "actor": "doug.schroeder",
       "skill": "specs-update"
     }

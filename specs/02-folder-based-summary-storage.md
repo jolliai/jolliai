@@ -7,7 +7,8 @@ Store summaries as plain files inside a user-chosen knowledge-base folder, mirro
 **In scope:**
 - Resolution of the knowledge-base root directory from a configurable parent path and a derived repository name.
 - The three-layer file layout: a hidden subdirectory for machine-oriented data files, visible per-branch subdirectories for human-readable copies, and a reserved generated-topic-wiki subdirectory for derived per-topic Markdown pages.
-- The metadata sidecar (manifest of AI-generated files spanning commit, plan, note, and wiki entries, branch-to-folder mapping registry, KB-level configuration, migration progress).
+- The metadata sidecar (manifest of AI-generated files spanning commit, plan, note, wiki, and skill entries, branch-to-folder mapping registry, KB-level configuration, migration progress).
+- The per-commit skill-usage aggregate in the visible layer: which arm of the write cascade emits it, its namespaced manifest identifier, and the way its delete, regenerate, and heal behavior rides the summary's rather than its own.
 - The atomicity model for individual file writes and deletes.
 - How visible markdown copies are produced for summary, plan, and note inputs.
 - How the generated topic-wiki layer (per-topic page plus an index page) is rebuilt and registered.
@@ -22,7 +23,8 @@ Store summaries as plain files inside a user-chosen knowledge-base folder, mirro
 - The wider per-repository folder layout: the parent-folder identity registry, the user-placed Markdown classification rules, and the system-reserved-name policy that protects the hidden, visible, and wiki layers (covered by "Memory Bank Folder Layout").
 - UI surfaces that badge hand-edited visible or wiki files (covered by "VS Code Memory-File Divergence Decoration" and host-specific equivalents).
 - The version-controlled-ref backend that this storage can mirror (covered by "Orphan Branch Summary Storage").
-- The internals of the independent second reader of this storage's hidden layer — the host-side direct read path that bypasses this storage for latency — covered by the direct hidden-layer reader spec (307). Only the four-name subset it consumes, and the read contract it depends on, are stated here.
+- The internals of the independent second reader of this storage's hidden layer — the host-side direct read path that bypasses this storage for latency — covered by the direct hidden-layer reader spec (307), with its archived-reference arm covered by spec 317. Only the five-name subset it consumes, and the read contract it depends on, are stated here.
+- The **content** of the per-commit skill-usage table and of the single collapsed skills row in a summary's body (covered by spec 323); this storage owns only where those files land, when they are written, and how they are tracked.
 - Combination semantics with the version-controlled-ref backend (covered by "Dual-Write Summary Storage").
 - The Memory Bank write boundary that callers must clear before invoking the claiming resolution path — its conditions, refusal reasons, and the effective-state report derived from it (covered by "Memory Bank Write Boundary and Effective-State Reporting").
 - The durable repo-wide manual-disable opt-out — how it is set, cleared, and stored, and the full inventory of writes it suppresses (covered by "Manually-Disabled Zero-Write Contract"). Only its position inside this storage's batch write, and which of this storage's other paths lack it, are stated here.
@@ -61,12 +63,14 @@ A separate "find fresh path" entry point skips the same-repo reuse step and alwa
 - `transcripts/<commitHash>.json` — One file per transcript, written verbatim.
 - `plans/<slug>.md` — One file per plan, written verbatim.
 - `notes/<id>.md` — One file per note, written verbatim.
+- `references/<source>/<sanitizedNativeId>.md` — One file per archived external-entity reference, written verbatim.
+- `skills/<source>/<sanitizedSkillId>-<hash8>.md` — One file per archived skill invocation record, written verbatim. Lands here with no code in this storage: it is an ordinary batch-write path, and every batch path is mirrored into the hidden layer unconditionally.
 - `plan-progress/<slug>.json` — One file per plan-progress artifact, written verbatim.
 - `index.json` — Hidden copy of the summary index document, written verbatim.
 - `shadow-status.json` — Optional dirty marker (see below).
 - Any other relative path passed to `writeFiles` is created as-is under this hidden directory (notably: canonical topic pages and topic-index, plus the topic-ingest high-water mark; see "Topic Index and Page Storage").
 
-**A second, independent reader of this layer exists.** One host implements its own direct read path over the hidden layer, in its own language, bypassing this storage entirely for latency reasons. It reads a fixed **four-name subset** of the above: the per-commit summary documents, the plan bodies, the note bodies, and the dirty marker. It never writes anything — write-side consistency remains this storage's sole responsibility — and it fails soft: any read or parse failure yields nothing, so the caller falls back to the version-controlled ref. The **hidden copy of the summary index is explicitly not among the four**, and that boundary is the practical one: the four consumed names, their containing folder names, the dirty marker's semantics, and the document schema of anything the second reader parses cannot change without a coordinated change in two languages, whereas the hidden index's schema can evolve on this side alone for as long as nothing reads it there. Its internals are defined by the second reader's own spec (307); only the contract it depends on is stated here.
+**A second, independent reader of this layer exists.** One host implements its own direct read path over the hidden layer, in its own language, bypassing this storage entirely for latency reasons. It reads a fixed **five-name subset** of the above: the per-commit summary documents, the plan bodies, the note bodies, the archived reference bodies, and the dirty marker. It never writes anything — write-side consistency remains this storage's sole responsibility — and it fails soft: any read or parse failure yields nothing, so the caller falls back to the version-controlled ref. The **hidden copy of the summary index is explicitly not among the five**, and neither are the archived skill bodies; that boundary is the practical one: the five consumed names, their containing folder names, the sanitize rule that turns a reference's native identifier into its filename stem, the dirty marker's semantics, and the document schema of anything the second reader parses cannot change without a coordinated change in two languages, whereas the hidden index's schema and the skill layout can evolve on this side alone for as long as nothing reads them there. Its internals are defined by the second reader's own spec (307); only the contract it depends on is stated here.
 
 ### Generated topic-wiki layer (under `<root>/_wiki/`)
 A reserved sub-folder, sibling to the hidden layer, containing the derived human-readable topic-knowledge wiki:
@@ -85,7 +89,8 @@ Files in this layer are tracked in `manifest.json` under a dedicated row type (`
     - For notes: the literal string `note:<id>`.
     - For wiki topic pages: the literal string `wiki-topic-<stableSlug>`.
     - For the wiki index page: the literal string `wiki-index`.
-  - `type`: one of `commit`, `plan`, `note`, `wiki`.
+    - For the per-commit skill aggregate: the literal string `skill:<commitHash>` — **namespaced, not the bare hash**. Entries are keyed on `fileId` and a write replaces any entry sharing one, so a bare hash here would evict the summary's own entry; the superseded-descendant cleanup, which looks an entry up by hash and skips anything whose `type` is not `commit`, would then silently stop cleaning up the superseded summary. Plans namespace for the same reason.
+  - `type`: one of `commit`, `plan`, `note`, `wiki`, `skill`.
   - `fingerprint`: a 256-bit cryptographic hash (hex digest) of the generated file's textual content at write time.
   - `source`: object with optional `commitHash`, `branch`, `generatedAt`. For commits all three are populated; for plans and notes, only `branch` is populated when known (empty object otherwise); for wiki entries, only `generatedAt` is populated.
   - `title`: optional human-readable display name.
@@ -123,6 +128,7 @@ Per-branch directories rooted at the KB root:
 - `<branchFolder>/<slug>-<hash8>.md` — one visible markdown file per top-level summary, where `<slug>` is a 50-character-cap, lowercase, alphanumeric-and-hyphen slug of the commit message, and `<hash8>` is the first 8 characters of the commit hash.
 - `<branchFolder>/plan--<slug>.md` — one visible markdown copy per plan.
 - `<branchFolder>/note--<id>.md` — one visible markdown copy per note.
+- `<branchFolder>/skills--<hash8>.md` — the per-commit skill-usage table, one file per commit (not one per skill), emitted as a sibling of the summary markdown that shares its `<hash8>`.
 
 The branch folder is resolved from the branch name via the branch-mapping registry, creating a new mapping on first use. If a write occurs without an explicit branch and the slug embeds a hash suffix (≥7 characters), the branch is recovered by:
 1. Searching the manifest for a commit entry whose `source.commitHash` starts with that hash prefix.
@@ -211,7 +217,40 @@ The batch is **not** transactional: failures partway through leave a mix of appl
 7. Hand-edit guard: look up any existing manifest entry by the target relative path. If a file exists at the target and its on-disk content's fingerprint differs from the manifest entry's recorded fingerprint, log the skip and return without writing.
 8. Otherwise atomically write to `<root>/<branchFolder>/<fileName>`.
 9. Update the manifest with an entry whose `fileId` is the commit hash, `type` is `commit`, `fingerprint` is the cryptographic hash of the composed markdown, `source` records `commitHash`, `branch`, `generatedAt`, and `title` is the commit message.
-10. If the summary node has children, run "superseded-descendant cleanup".
+10. Generate the per-commit skill aggregate (see below).
+11. If the summary node has children, run "superseded-descendant cleanup".
+
+### Skill-aggregate generation
+
+`<branchFolder>/skills--<hash8>.md` is emitted from the **`summaries/` arm** of the visible cascade — deliberately, rather than from a fourth `skills/` arm:
+
+- The cascade runs once per written file, so a `skills/` arm would rewrite the aggregate once per archived skill (a read-modify-write repeated N times) and would acquire an ordering dependency on whether the skill batch was written before or after the summary batch.
+- The summary payload already carries the commit's skill references, so the summary arm has one trigger, complete data, and an inherently correct commit hash.
+
+One file per commit rather than one per skill: the visible layer exists to be browsed by a human, and skills are auto-captured metadata arriving several per commit — at three per commit, a hundred commits would bury the handful of memory documents a user actually opens under three hundred files.
+
+The steps:
+
+1. If the summary carries no skill references, or an empty array, return without writing. There is no empty-table file.
+2. Compute the relative path from the summary's own resolved branch folder and its `<hash8>`.
+3. Hand-edit guard: look up the manifest entry by that relative path. If the file exists and its on-disk fingerprint differs from the recorded fingerprint, log the skip and return **without writing** — the aggregate is protected exactly like the summary markdown it sits beside.
+4. Otherwise render the table and atomically write it.
+5. Update the manifest with `fileId = "skill:<commitHash>"`, `type = "skill"`, and the fingerprint of the rendered markdown.
+
+Because its lifecycle is the summary's rather than its own, the aggregate needs no storage-provider method pair of its own: the delete and regenerate entry points already take a summary-index entry and extend to this sibling.
+
+The aggregate is where the **per-skill** breakdown lives. The summary markdown beside it carries at most a single collapsed "skills used" row in its context section — a shape decided by the visible-summary body builder, whose content is out of scope here (see the boundaries) but whose split with this file is the reason the aggregate exists at all.
+
+The hidden-layer counterpart (`skills/<source>/<stem>-<hash8>.md`) needs no code in this storage: those paths arrive through the ordinary batch write and are mirrored into the hidden layer unconditionally, before the visible cascade runs. The batch that carries them is a dedicated write entry point that no-ops on an empty file list, refuses while the project is manually disabled (checked **before** it takes the write lock, mirroring the summary write), and then writes under the required parallel-ref write lock.
+
+### Deleting and regenerating the aggregate alongside its summary
+
+**Delete.** The per-entry visible-markdown delete removes the skills sibling **first**, then the summary markdown. The ordering means a failure to delete the summary cannot leave an orphaned aggregate claiming a memory that is gone. The sibling delete is additionally wrapped in its own error containment, because the underlying artifact delete rethrows anything that is not a missing-file condition: an unwritable sibling (permissions, an editor lock) would otherwise abort the deletion of the memory itself — trading the orphan the ordering avoids for a strictly worse failure. A sibling failure is logged and swallowed, so it does not count toward the caller's failure tally and does not block the ghost-branch prune that follows (see the stale-child cleanup spec).
+
+**Regenerate.** The regenerate path has two branches and both touch the aggregate:
+
+- **Summary markdown already on disk** — this is not a regeneration, but the generated sibling may still be missing, and reporting the memory healthy while leaving that gap makes "heal" only partly true. So a missing aggregate is re-emitted from the hidden summary document, best-effort: every failure on this arm is silent and **does not affect the return value**, because the subject of the call — the memory — is already intact and nothing here may downgrade that outcome.
+- **Summary markdown missing** — after re-emitting the summary markdown and updating its manifest row, the aggregate is generated by the same routine the write path uses (including its own empty-input and hand-edit guards).
 
 ### Superseded-descendant cleanup
 Triggered when a newly written summary has a non-empty `children` array (the new node is a squash or amend root that wraps prior root summaries).
@@ -299,6 +338,11 @@ The topic-wiki layer (`<root>/_wiki/`) has no explicit state transitions tracked
 
 - **The manual-disable gate sits on the batch write only.** Of this storage's mutating entry points, only the batch write refuses while the project is manually disabled. The initialization routine, the visible-markdown delete and regenerate paths, the plan-and-note visible deletes, the branch-mapping prune, the heal-missing-visible-markdown pass, the topic-wiki rebuild, the manifest reconciliation, and the dirty-marker write and clear all run normally. A disabled project therefore accumulates no new content through the batch write, but a repair, cleanup, or rebuild call that reaches this storage directly still touches disk. Whether such a call can be reached at all while disabled is decided by its own callers upstream, not here. (Surprising; the gate is per-entry-point, not per-storage-instance.)
 - **Two layers, one storage-provider surface.** Read/list operations apply only to the hidden layer; writes to the hidden layer additionally derive visible markdown for three known prefixes (`summaries/`, `plans/`, `notes/`). The hidden layer is the source of truth for `readFile` and `listFiles`. (Notable.)
+- **The skill aggregate is emitted from the `summaries/` arm, not from a fourth arm — and that is not a shortcut.** A `skills/` arm would fire once per archived skill, rewriting the same per-commit file N times, and would make the result depend on whether the skill batch or the summary batch was written first. The summary payload already names the commit's skills, so the summary arm is the one place with a single trigger, complete data, and a guaranteed-correct hash. (Surprising; intentional.)
+- **A skills sibling is never *overwritten* on divergence, only skipped.** It carries the same hand-edit fingerprint guard as the summary markdown, so a user-modified skill table survives every later write. (Notable.)
+- **The sibling is deleted first, and its failure is contained separately.** Removing the aggregate before the summary means a failed summary delete cannot strand an aggregate pointing at a memory that is gone; wrapping that removal separately means a locked or unwritable aggregate cannot abort the deletion of the memory itself. The two together are what make "delete the memory" robust in both directions. A swallowed sibling failure does not increment the caller's failure count, so it does not suppress the ghost-branch prune downstream. (Surprising; intentional pairing.)
+- **Regenerate heals a missing aggregate even on the "nothing to regenerate" branch, silently.** When the memory's own markdown is intact the call is not a regeneration at all — but the generated sibling may still be gone, and reporting the memory healthy while leaving that gap makes the heal only partly true. The repair is therefore attempted anyway and every failure in it is swallowed without touching the return value, because the call's subject is already intact and nothing here may downgrade that. (Notable.)
+- **The hidden `skills/` files need no code in this storage.** They arrive through the ordinary batch write and are mirrored into the hidden layer unconditionally before the visible cascade, so the only skill-specific code here is the visible aggregate. Their own write entry point no-ops on empty input and refuses while the project is manually disabled *before* taking the write lock. (Notable.)
 - **A null read means absent; anything else is warned here, not upstream.** This backend reads without an existence pre-probe and classifies the failure by error code, warning on everything that is not a routine missing-entry outcome. The reason the warning belongs at this depth is that the error code is still in hand here: the caller receives a bare null and is reduced to guessing between "fresh repository" and "the backend's read failed". The pre-probe was removed rather than kept alongside the classification because it actively produced the wrong answer — it reports absence for an entry it merely cannot inspect. (Notable; the reporting obligation is part of the storage-provider contract.)
 - **A second reader of the hidden layer exists, in another language, and it is read-only.** One host reads the per-commit summary documents, plan bodies, note bodies, and dirty marker straight off disk instead of going through this storage, to avoid its normal per-read process hop. It never writes, and every failure or parse error yields nothing so the caller falls back to the version-controlled ref. Those four names — plus their folder names, the dirty marker's presence-only semantics, and the schema of any document it parses — are consequently a two-language contract; the hidden index copy, which it does not read, is not. (Notable; the boundary of the lockstep obligation is exactly the set of names actually consumed.)
 - **This backend declares its identity as data.** Like every backend on the contract, it carries an optional identity value used only for diagnostics, because the shipped bundles are minified and a runtime type name would reach production mangled. (Notable.)

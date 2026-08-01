@@ -16,7 +16,8 @@ A background pass over each currently-recent Codex session's transcript extracts
 - The one-shot legacy-cursor migration that runs once per pass before any session is scanned.
 - The session-enumeration step that asks the Codex discovery layer "which Codex sessions are recent for this cwd?" and the per-session failure isolation that follows it.
 - The dual-scan order — reference scan first, plan scan second — and the rule that the reference scan's "safe cursor" caps the plan scan's window.
-- The merged-cursor advance rule: advance only when both scans completed and the safe cursor strictly moved past the previous cursor.
+- The third scan the same per-session loop runs (skill discovery), and the fact that it rides its own high-water mark **outside** the shared-cursor advance gate.
+- The merged-cursor advance rule: advance only when both cursor-sharing scans completed and the safe cursor strictly moved past the previous cursor.
 - The cursor-hold rule for in-flight requests, framed at this spec's level (what the reference scan promises and what this pass does about it).
 - How this composes with the parallel commit-time reference-extraction path used by another producer that does have a lifecycle hook (failure-isolation, side-by-side coexistence, shared persistence).
 - The end-to-end terminal outcomes of a single tick, including the no-op outcomes.
@@ -73,7 +74,9 @@ For each transcript path, persisted per project:
 | line number    | integer | 1-based count of lines that **both** the reference scan and the plan scan have safely processed past.        |
 | updated at     | string  | ISO-8601 timestamp of the last advance.                                                                      |
 
-The row is shared with markdown-plan discovery — one row per transcript covers both scans. Absence means "never scanned"; on first read it resolves to line zero.
+The row is shared with markdown-plan discovery — one line number per transcript covers both scans. Absence means "never scanned"; on first read it resolves to line zero.
+
+The same row additionally carries a map of **per-extractor** marks, one of which (`skills`) is read and advanced by the third scan below entirely independently of the line number above. This pass never reads or writes that map itself — it hands the whole concern to the skill-discovery driver. Its shape, its legacy-seeding rule, and its monotonicity are owned by **spec 24**.
 
 ### Reference-scan return
 
@@ -141,12 +144,16 @@ Inside the per-session try:
    - Call the shared markdown-plan discovery for this transcript, starting at `fromLine`, with `refLine` as the **upper bound** on lines the plan scan is allowed to consume (so the plan scan never processes lines the reference scan deliberately held).
    - On success set `planDone = true`.
    - If the plan scan throws, catch inside its own try/catch; leave `planDone === false`; log at warn (session id + message) and continue to step 5.
-5. **Cursor advance.** Save the cursor for this transcript **iff all three** hold:
+5. **Skill scan (third):**
+   - Call the shared skill-discovery driver for this transcript with the producer tag set to "Codex". It is handed **no** from-line: it reads and advances its **own** per-extractor mark inside the same cursor row (spec 24), independently of `fromLine` and `refLine`.
+   - It never throws — it absorbs its own failures and leaves its mark unadvanced so the next tick retries the same window — so this step has no try/catch of its own and contributes nothing to `refDone` / `planDone`.
+   - The scan sits inside the per-session loop but deliberately **outside** the shared-cursor advance gate below, in both directions: a skill scan that failed cannot hold the shared cursor, and a reference or plan scan that threw cannot hold the skills mark. Codex skill capture is heuristic (a shell read of a `SKILL.md`) and idempotent by name, so a re-scanned window costs work, not correctness. What it recognizes and what it writes are owned by **spec 326**.
+6. **Cursor advance.** Save the cursor for this transcript **iff all three** hold:
    - `refDone` is true (reference scan completed normally), AND
    - `planDone` is true (plan scan completed normally), AND
    - `refLine` strictly greater than `fromLine` (the safe cursor actually moved).
-   The saved row carries `lineNumber = refLine` and `updatedAt = now`. If any condition fails, the cursor is **held** — no change is persisted, so the next tick rescans the same window. Re-scan is idempotent (the persistence step is keyed by stable identifiers and gated on byte-equality), so a held window simply retries without producing duplicates.
-6. Per-session loop completes. The next session begins.
+   The saved row carries `lineNumber = refLine` and `updatedAt = now`. If any condition fails, the cursor is **held** — no change is persisted, so the next tick rescans the same window. Re-scan is idempotent (the persistence step is keyed by stable identifiers and gated on byte-equality), so a held window simply retries without producing duplicates. The skills mark is not part of this write and is not part of this condition.
+7. Per-session loop completes. The next session begins.
 
 ### What "safe cursor" implies for in-flight requests
 
@@ -183,6 +190,8 @@ A tick resolves with one of the following terminal outcomes:
 | Session: both scans clean, `refLine > fromLine`| Cursor advanced to `refLine`                           | Persist step's logs (upsert N of M, file writes)          |
 | Session: both scans clean, `refLine == fromLine`| Cursor held                                            | No persistence (zero references, idempotent re-read)      |
 | Session: per-session try/catch caught any other throw | Cursor held for that session                     | Warn log; next session still processed                    |
+| Session: skill scan found new lines             | Shared cursor unaffected; the session's `skills` mark advances | Skill working-record writes (spec 326)   |
+| Session: skill scan failed internally           | Nothing advances for it; shared cursor decision unaffected | Its own warn log; loop continues        |
 
 ## State Transitions
 
@@ -244,7 +253,8 @@ plan-scan succeeds ────────► planDone := true
 - **Default config-on.** A user with no config file has Codex extraction enabled. Only an explicit "off" disables this path.
 - **Installation gate is cheap.** Users with no Codex installation skip every subsequent step. Wiring this pass to a periodic tick has no observable cost for non-Codex users.
 - **Migration runs every tick but does work only once.** The legacy cursor migration is idempotent — a no-op once already done — so paying the (load + check) cost per tick is acceptable and saves a separate first-run code path.
-- **Cursor advance requires both scans to complete cleanly.** A reference-scan-succeeded / plan-scan-failed tick **holds** the cursor. The reference scan's safe cursor is not separately persisted; only the merged "both completed" advance writes the cursor file. This is intentional: separating the advance would let plan extraction permanently lag reference extraction on a transcript whose plan scan keeps throwing.
+- **A third scan rides this loop but not this cursor.** Skill discovery runs per session, after the plan scan, against its own per-extractor mark in the same row. It is deliberately outside the advance gate in both directions — a failed skill scan cannot hold the shared cursor, and a failed reference or plan scan cannot hold the skills mark — because the skills backlog is its own window and, on an upgrade, one the shared cursor may already have passed. It also never throws, so it needs no try/catch at this call site. (Surprising; see spec 24 for the mark and spec 326 for the scan.)
+- **Cursor advance requires both cursor-sharing scans to complete cleanly.** A reference-scan-succeeded / plan-scan-failed tick **holds** the cursor. The reference scan's safe cursor is not separately persisted; only the merged "both completed" advance writes the cursor file. This is intentional: separating the advance would let plan extraction permanently lag reference extraction on a transcript whose plan scan keeps throwing.
 - **`refLine == fromLine` holds the cursor.** A successful pass that produced no progress (typical when a transcript ends with an in-flight request, or when nothing new has been written since the last tick) does not rewrite the cursor file. This avoids needless writes — file watchers don't churn on a no-op tick.
 - **`refLine === fromLine` after a ref-scan failure makes the plan scan trivial.** Setting `refLine = fromLine` after a thrown ref-scan means the plan scan is asked to operate on the empty range `(fromLine, fromLine]`. The plan scan returns immediately without modifying any state, and the cursor stays held — the same window retries together on the next tick.
 - **Cursor reads / writes are per-transcript.** Two sessions for the same workspace each have their own cursor; advancing one does not advance the other.
@@ -266,7 +276,8 @@ plan-scan succeeds ────────► planDone := true
 - **The track-only carve-out downstream of this pass** — a Context7 reference is persisted, archived, and displayed exactly like any other reference this pass produces, but never reaches the summarization prompt block and never enters the relevance ranker's input. That is owned by **specs 12 and 258**; this pass draws no distinction and applies no filter of its own.
 - **The recent-Codex-session enumeration** this pass uses to choose which transcripts to scan is owned by **spec 18** (the discovery walk) and surfaced by **spec 155** (the active-session aggregator that drives the host UI).
 - **The merged plan-discovery scan** that walks the same transcript lines under the same cursor — its parsing of `apply_patch`, its on-disk existence guard, its title derivation — is owned by a separate plan-discovery spec.
-- **The cursor file format and locking** — the shared `discovery-cursors` table — and the legacy migration's idempotent fold rule are owned by the session-tracking spec family.
+- **The cursor file format and locking** — the shared `discovery-cursors` table, its per-extractor marks, and the legacy migration's idempotent fold rule — are owned by **spec 24**.
+- **The third scan this loop runs** — Codex skill inference from a shell read of a `SKILL.md`, its `heuristic` detection stamp, and what it writes — is owned by **spec 326**, with the working record it upserts into owned by **spec 319**.
 - **The host-UI refresh timer** (its interval, its visibility-gated pause, its message-protocol envelope to the webview) is owned by the sidebar specs.
 - **The commit-time hook path** that drives the same reference-extraction pipeline for a different producer is owned by the hook-recording spec for that producer.
 - **The manually-disabled zero-write contract** that this pass's first gate upholds is owned by **spec 304**; the one-shot re-enable catch-up that deliberately excludes this producer is owned by **spec 305**.

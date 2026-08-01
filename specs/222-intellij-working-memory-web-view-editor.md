@@ -84,7 +84,7 @@ For each entry in the plans/notes/references registry:
 
 - **Plans**: skipped if ignored, already committed (has a commit hash), on a different non-blank branch, or whose source file no longer exists; otherwise added with tag `P`.
 - **Notes**: skipped if ignored, already committed, or on a different non-blank branch; otherwise added with tag `N`.
-- **References**: always added, with a tag by source — Linear `L`, Jira `J`, GitHub `GH`, Notion `No`.
+- **References**: always added, with a tag taken from the shared source-presentation table rather than a local mapping — the panel calls that table's `of(source).tag` and uses whatever letter it returns. Every tag is a single letter (Linear `L`, Jira `J`, GitHub `G`, Notion `N`, and so on across all twelve sources), with a neutral `R` for a source this surface's enum does not yet cover. The table and its twelve rows are owned by spec 313.
 
 ### Rendered page (fixed structure and copy)
 
@@ -185,7 +185,7 @@ Remove the status listener, dispose the bridge query handler, and dispose the em
 - **The view is presentational and one-way.** It renders a snapshot; the only write path is the Commit Memory button, which runs the AI-commit action — the page itself edits nothing.
 - **The token label is always `N/A tokens` here.** Live sessions in this surface carry no token usage; the real token count is captured only when the memory is generated at commit time.
 - **Change stats are diff-vs-`HEAD`, staged + unstaged.** The shortstat is parsed textually; when it reports zero files (e.g. only untracked files exist) the file count falls back to the changed-files query, but insertions/deletions remain whatever the shortstat reported (zero in that case).
-- **The detected-ticket heuristic prefers a Linear/Jira context item over the branch name.** It scans the first `L`/`J`-tagged context title first, then the branch.
+- **The detected-ticket heuristic prefers a Linear/Jira context item over the branch name.** It scans the first `L`/`J`-tagged context title first, then the branch. The literal `"L"`/`"J"` comparison is unchanged, but the tags it now compares against come from the shared source table (spec 313), where `J` is deliberately shared by Jira **and** the product's own memory-lookup source — so a Jolli Memory reference can be selected as the "detected ticket" when it sorts first. (Surprising; observed, not intended.)
 - **Context excludes committed and cross-branch plans/notes, but never filters references.** A reference is always listed regardless of branch or commit state.
 - **Plans are also dropped if their source file is gone; notes are not file-existence-checked.** The two kinds have slightly different visibility rules in the context gather.
 - **External links escape the panel.** http/https navigation opens in the system browser; the embedded page never navigates away.

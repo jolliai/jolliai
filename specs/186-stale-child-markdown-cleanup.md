@@ -36,7 +36,7 @@ After every recorded version-control operation, delete visible-layer markdown fi
 ### Storage capability surface (consumed only)
 
 The cleanup helper consumes two optional capabilities from the storage backend:
-- A "delete visible markdown for one entry" operation that takes an index entry and returns a boolean: `true` when a file was actually unlinked, `false` when the file was already absent. May throw on I/O failure.
+- A "delete visible markdown for one entry" operation that takes an index entry and returns a boolean: `true` when a file was actually unlinked, `false` when the file was already absent. May throw on I/O failure. Its **scope is the entry's whole visible footprint**, not one file: on the local-mirror backend it removes the entry's per-commit skill-usage aggregate (`skills--<hash8>.md`) before removing the summary markdown itself, and the boolean it returns describes only the summary markdown.
 - A "prune branch-folder-mapping rows" operation that takes a list of branch-names and returns the count of mappings actually removed. May throw.
 
 A backend that exposes neither (e.g. a pure durable-store-only backend with no visible layer) is a valid target: both helpers no-op cleanly.
@@ -59,7 +59,7 @@ Entries with an absent parent-pointer field (legacy backward-compatibility shape
 
 ### Per-entry deletion loop
 
-The candidates are iterated and the storage's per-entry delete-visible-markdown operation is invoked for each one:
+The candidates are iterated and the storage's per-entry delete-visible-markdown operation is invoked for each one. The loop itself is unchanged by the addition of the skills sibling: the sweep makes exactly the same call it always did, and the sibling removal happens inside that call.
 
 - If the operation returns `true`, the `deleted` counter increments.
 - If the operation returns `false`, no counter increments. This is the steady-state outcome for any candidate whose visible markdown was already removed by a prior sweep. Index entries persist forever, so visiting and counting them would yield a perpetually non-zero result.
@@ -126,6 +126,7 @@ No invariant is maintained across invocations beyond the on-disk file system and
 
 ## Notable Behavior
 
+- **The sweep also removes each stale child's skill-usage aggregate, and this spec's contract did not have to change to get it.** The per-entry delete operation removes the `skills--<hash8>.md` sibling before the summary markdown, so the sweep inherits that behavior through the same call it already made. A sibling failure is logged and swallowed *inside* that operation, so it never reaches this helper: it does not increment `failed`, and therefore cannot suppress the single-branch ghost-branch prune, which is gated on `failed === 0`. The trade-off is deliberate and asymmetric — an undeletable *summary* markdown blocks the prune (the orphan would be invisible-but-present), while an undeletable *aggregate* does not, because a stranded aggregate is swept by the next pass and is not itself a memory. (Notable; the containment lives in the backend, not here — see the folder-based summary storage spec.)
 - **The deletion counter reflects real unlinks, not visits.** A perpetually non-zero "deleted" count on every activate would collapse the user's expanded folder tree in any UI that watches deletion events for cache invalidation. The contract therefore is: "the steady-state result on a quiet repo is `deleted = 0, failed = 0`." Backends MUST return `false` from the per-entry delete operation when the file is already gone. (Intentional.)
 - **Branch-scoped invocations never touch other branches' candidates.** A queue-worker tail step operates against the captured branch only. Even when other branches in the same index have stale-child candidates, they are deferred to either (a) a future operation on that branch, or (b) the recurring all-branches sweep at next activate. This guarantees a single operation's cleanup cost is proportional to its own branch, not the whole repo. (Intentional.)
 - **The ghost-branch precondition "branch appears in the index" is required.** A fresh checkout may have registered a branch-folder mapping before any summary was produced; without this precondition, the very first cleanup sweep would erase the mapping and the freshly checked-out branch would disappear from the sidebar. (Notable; intentional.)
@@ -141,7 +142,8 @@ No invariant is maintained across invocations beyond the on-disk file system and
 ## Shared Behavior
 
 - **Summary tree structure and the parent-pointer convention** — covered by the summary-tree-structure topic. The unified-hoist regime's rule that every new commit/amend/squash writes a fresh head with `parentCommitHash === null` and reassigns the prior version's index entry to `parentCommitHash = <new-head>` is the precondition that creates the candidates this helper deletes.
-- **Memory-bank folder layout** — covered by the memory-bank-folder-layout topic. Defines the visible-layer per-branch directory structure, the branch-name → folder-name deterministic transcoding, and the branch-folder-mapping registry (`branches.json`) that the ghost-branch prune step targets.
+- **Memory-bank folder layout** — covered by the memory-bank-folder-layout topic. Defines the visible-layer per-branch directory structure, the per-commit skill aggregate that sits beside each summary markdown, the branch-name → folder-name deterministic transcoding, and the branch-folder-mapping registry (`branches.json`) that the ghost-branch prune step targets.
+- **Folder-based summary storage** — owns the per-entry delete operation this helper calls, including the sibling-first ordering, the separate error containment around the sibling, and the manifest bookkeeping both removals perform.
 - **Git-operation queue worker** — covered by the git-operation-queue-worker topic. Owns the tail-step trigger site; this helper is invoked as the worker's final step on every drained operation after the worker has finished writing the new head's summary.
 - **Amend, rebase-pick, and rebase-squash migrations** — covered by their respective topics. Each is a producer of new candidates: every successful amend, pick-with-modification, or squash leaves the prior version with a non-null `parentCommitHash`, which this helper then sweeps from the visible layer.
 - **Summary schema migration** — covered by the summary-schema-migration topic. Owns the local-mirror migration engine's one-shot repair phases and the migration stamp. This helper is invoked as the engine's recurring (every-activate) reconcile phase, distinct from those one-shot phases and not gated by their stamp.

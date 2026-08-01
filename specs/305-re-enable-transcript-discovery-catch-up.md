@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-Re-run the incremental plan-discovery and reference-extraction pass over every session the project's own session registry still holds, starting from each session's frozen discovery watermark, so that a repository coming back from a manual opt-out recovers the plans and references authored during the window in which discovery could not run — including for sessions that will never see another agent turn. The drain is a single sequential pass with no work ceiling, per-session failure isolation, and one cursor write per transcript that actually had unscanned lines.
+Re-run the incremental plan-discovery, reference-extraction and skill-discovery scans over every session the project's own session registry still holds — the first two from each session's frozen shared discovery watermark, the third from its own per-extractor mark — so that a repository coming back from a manual opt-out recovers the plans, references and skill usage recorded during the window in which discovery could not run, including for sessions that will never see another agent turn. The drain is a single sequential pass with no work ceiling, per-session failure isolation, and one shared-cursor write per transcript that actually had unscanned lines.
 
 ## Scope
 
@@ -11,8 +11,9 @@ Re-run the incremental plan-discovery and reference-extraction pass over every s
 - The hole this pass exists to fill: which writers stop while a repository is opted out, and why the frozen watermark alone recovers some sessions but not all.
 - Which surface actually invokes the drain, and which surface does **not** (a re-enable from the command line does not drain).
 - The order of the whole-run steps: opt-out probe, session-registry load, one-time legacy-cursor fold, then the per-session loop.
-- The per-session decision sequence: the polling-agent skip, the transcript-existence skip, the watermark read, the source-tag resolution, the two scans, and the gated cursor write.
+- The per-session decision sequence: the polling-agent skip, the transcript-existence skip, the watermark read, the source-tag resolution, the three scans, and the gated cursor write.
 - The exact condition under which the merged discovery cursor is advanced, and what is retried when it is not.
+- The third scan's independence from that condition, and its absence from the returned count.
 - Per-session failure isolation and whole-run fail-soft behavior.
 - The returned count, what it counts, and who consumes it.
 - The absence of any cap on sessions scanned or lines read per run, and what does bound the work.
@@ -54,7 +55,7 @@ One line count per transcript, in the merged plan-plus-reference cursor purpose 
 
 ### Result
 
-A single count: how many transcripts had their merged watermark actually advanced by this run. It carries no per-session detail, no list of failures, and no indication of how many sessions were considered or skipped. The pass resolves with this value in every case — including the opt-out short-circuit, a registry-load failure, and a run in which every session failed — and never rejects.
+A single count: how many transcripts had their **merged** watermark actually advanced by this run. A transcript whose only progress was a skills-mark advance is not counted, so the figure is a strict under-report of the work the drain did. It carries no per-session detail, no list of failures, and no indication of how many sessions were considered or skipped. The pass resolves with this value in every case — including the opt-out short-circuit, a registry-load failure, and a run in which every session failed — and never rejects.
 
 ## Behavior
 
@@ -97,8 +98,9 @@ For each returned session record, in order:
 4. **Source resolution.** The second recorded agent's tag passes through as itself; every other value — including an absent tag — is resolved to the first agent.
 5. **Plan scan.** Scan from the watermark with **no upper line bound**, i.e. to end-of-file. A throw is caught and logged, and is remembered as "the plan scan did not complete". Its own reported line is not used.
 6. **Reference scan.** Scan from the **same** watermark, also to end-of-file, and capture the line it reports as reached. A throw is caught and logged, and leaves the captured line at the starting watermark (the variable is seeded with it and only overwritten by a completed scan).
-7. **Gated cursor write.** Persist the merged watermark at the reference scan's reported line **only if** the plan scan completed without throwing **and** that line is strictly greater than the starting watermark. When it is written, increment the count. Otherwise write nothing and leave the watermark where it was, so the whole window is re-offered on the next drain or the next agent turn.
-8. **Isolation.** The entire per-session body is additionally wrapped, so a failure outside the two scans — for example a failing watermark read or a failing watermark write — is logged and the loop continues with the next session. One unusable session never aborts the batch and never blocks another session's advance.
+7. **Skill scan.** Invoke the shared skill-discovery driver for the same transcript with the resolved source tag. It is handed **no** starting line: it reads and advances its own per-extractor mark in the same cursor record (spec 24), so the backlog it drains is its own — a window the shared watermark may already have passed while the repository was opted out. It never throws (it absorbs its own failures and leaves its mark unadvanced), so it carries no try/catch here and takes no part in the gate below. A source with no skill scanner — the second recorded agent among them — resolves to no scanner, reports zero lines consumed, and advances nothing.
+8. **Gated cursor write.** Persist the merged watermark at the reference scan's reported line **only if** the plan scan completed without throwing **and** that line is strictly greater than the starting watermark. When it is written, increment the count. Otherwise write nothing and leave the watermark where it was, so the whole window is re-offered on the next drain or the next agent turn. A skills-only advance is **not** counted here: the returned figure reports shared-watermark advances only.
+9. **Isolation.** The entire per-session body is additionally wrapped, so a failure outside the scans — for example a failing watermark read or a failing watermark write — is logged and the loop continues with the next session. One unusable session never aborts the batch and never blocks another session's advance.
 
 ### Branches
 
@@ -113,7 +115,9 @@ For each returned session record, in order:
 | Both scans complete, reference line equal to the watermark | No write; not counted (nothing new was in the file). |
 | Plan scan throws, reference scan completes | Both outcomes logged; watermark **held**, so the plan window is retried; not counted. The reference work already performed is not undone. |
 | Plan scan completes, reference scan throws | Watermark held (captured line never moved past the start); not counted. |
-| Both scans throw | Both logged; watermark held; not counted. |
+| Both scans throw | Both logged; watermark held; the skill scan still runs; not counted. |
+| Skill scan advances its own mark, nothing else did | Merged watermark untouched; **not counted**; the run can therefore report zero while having drained real backlog. |
+| Session's source has no skill scanner | The skill scan resolves to nothing, consumes zero lines, advances nothing; no log, no failure. |
 | Watermark read or write throws | Logged by the per-session wrapper; loop continues; not counted. |
 | Any of the above | The pass still resolves with a count and never rejects. |
 
@@ -157,7 +161,9 @@ The session registry itself has no transition here: the drain reads it, never wr
 - **The plan scan is uncapped here and capped on the polling surface.** Both scans read to end-of-file and only the reference scan's reported line becomes the new watermark, so the plan scan can process lines past the line the watermark is set to, and those lines are read again on the next pass. The polling surface deliberately caps its plan scan at the reference line to avoid exactly that churn; this pass mirrors the per-turn pass instead, which does not. Re-processing is safe because plan upserts are keyed and idempotent — it costs work, not correctness. (Surprising; deliberate mirroring of the per-turn ordering.)
 - **The two scans' line counts are never reconciled.** The cursor target is whatever the reference scan reports. The plan scan's own reported line is discarded, and no check compares them.
 - **The advance gate keys on the plan scan's completion, not on the reference scan alone.** Reaching end-of-file with references while the plan scan threw would, if the watermark advanced, strand that plan window permanently. Holding the watermark makes the next drain (or the next agent turn) re-scan it, and re-scanning is idempotent for both scans.
-- **The count is advisory.** It is consumed only by the pass's own conditional summary log and by tests; the enable command awaits the pass and discards the value. Nothing in the product reports to the user how much backlog was drained, and a run in which every session failed is indistinguishable from a run with nothing to do (both resolve zero, and both stay silent at the summary level).
+- **The count is advisory, and it under-reports.** It is consumed only by the pass's own conditional summary log and by tests; the enable command awaits the pass and discards the value. It counts shared-watermark advances only, so a run whose entire yield was skill backlog resolves zero and logs nothing. Nothing in the product reports to the user how much backlog was drained, and a run in which every session failed is indistinguishable both from a run with nothing to do and from a run that drained only skills.
+- **A third scan runs per session and is deliberately outside the gate.** Skill discovery rides its own per-extractor mark in the same cursor record, so the window it drains is its own — which is the point here: while the repository was opted out the shared watermark froze, but on an upgrade the skills mark may be behind a shared watermark that had already advanced past those lines. It never throws, so it needs no try/catch at this call site, and it neither holds nor is held by the plan/reference gate. (Surprising; see spec 24 for the mark, specs 319–320 for the scan.)
+- **A source with no skill scanner costs nothing and says nothing.** The second recorded agent has no skill extraction at all, so its skill scan resolves to no scanner, returns zero lines consumed, and advances nothing — no warning, no failure, no distinguishable outcome from a transcript that simply had no skills in it. (Notable.)
 - **A drain failure never fails the enable.** The pass swallows everything internally, and the caller additionally routes any escape through its error handler. The enable command reports success, refreshes its panels, and moves on regardless.
 - **The drain covers one working tree.** It reads the session registry of the directory it is handed, and that registry is per-working-tree. Other checkouts of the same repository keep their own frozen windows until they are themselves re-enabled from the editor — even though the opt-out flag that gated them is repository-wide.
 - **Registry staleness is a silent data boundary.** Because the load applies the staleness filter, "the sessions this run can possibly recover" is strictly the recent ones. A window longer than that threshold is partially unrecoverable by construction, and nothing surfaces that fact.
@@ -169,7 +175,8 @@ The session registry itself has no transition here: the drain reads it, never wr
 - The per-turn incremental pass this drain mirrors — its trigger, its own opt-out gate, its single-owner gate, its plan-then-reference order, and the identical advance condition — is defined by spec 26. This pass is deliberately the same pass driven over a batch instead of over one transcript, minus the single-owner gate.
 - The plan scan (per-agent announcement recognition, external-plan exclusion, existence gate, slug collision handling, archived-plan revival) is owned by spec 29, with per-source variants in spec 181 and spec 250.
 - The reference scan (per-producer envelope parsing, the source-agnostic extraction pipeline, dedup, and persistence) is owned by spec 153, with source adapters in spec 154 and persistence in spec 179.
-- The merged watermark's storage shape, its key convention, the legacy purpose prefixes the fold consumes, atomic replacement, and the "advance only after successful processing" convention are owned by spec 24.
+- The merged watermark's storage shape, its key convention, the per-extractor marks the third scan rides, the legacy purpose prefixes the fold consumes, atomic replacement, and the "advance only after successful processing" convention are owned by spec 24.
+- The third scan itself — what it recognizes, the working record it upserts into, and the usage it attributes — is owned by specs 320, 319 and 321; the sources that have no scanner at all are enumerated there.
 - The session registry that supplies the sessions, its staleness threshold, and the orphan-watermark pruning fan-out that eventually discards an undrained window are owned by spec 23.
 - The polling surface this pass skips — its recurring tick, its own recovery from the same watermark, and its references-first, capped-plan-scan order — is owned by spec 180 (session discovery in spec 18).
 - The in-memory zero-write gate whose release on the enable path makes this drain reachable, and the enumeration of the entry points that carry that gate, are owned by spec 304. The durable repository-wide opt-out flag behind it — storage, repo-wide anchoring, priority over every other signal, and the fact that only an explicit enable clears it — is owned by spec 145.

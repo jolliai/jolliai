@@ -111,6 +111,7 @@ Writes the marker-wrapped **drafted** body (not the edit-form contents) to the s
 The submit paths return a succeeded/failed outcome (spec 99). On **failure or block**, the submit path has already emitted the failure/block signal the buttons listen for; the pane stays put with the edit form open for a retry. On **success**:
 
 1. If signed in: post a progress message and share the branch's memories to the Memory Space (reference only — spec 94). A share failure is surfaced as a non-blocking toast and **never** rolls back the already-created PR. An unexpected throw here is caught so it can't skip the settle below.
+   - **A push-disabled refusal is rendered as INFORMATION, not failure.** `PushDisabledError` gets its own arm ahead of the generic handling and shows the error's own message via an *information* message, then returns (`vscode/src/views/CreatePrWebviewPanel.ts:492-499`). The PR is created and the memories stay recorded locally; a "sharing failed" warning would misrepresent the user's own per-repo opt-out (spec 310) as an error. This mirrors the summary panel's push button and IntelliJ's info dialog. Contrast the neighbouring arms: a plugin-outdated error raises a **modal** error, and a binding failure raises a warning/error toast.
 2. **Rebuild** the whole view-model from fresh storage. The share step persists freshly-minted document URLs back to each summary; a rebuild picks them up so the body now carries those links (absent at first render, nothing had been pushed yet). Best-effort: a rebuild failure logs and falls back to the prior view-model.
 3. **Re-resolve** the open PR for the branch. This flips a fresh create into update mode (clickable pill), and re-points an update that fell back to creating a new PR at the new one. Independently best-effort.
 4. Post a **single terminal settle signal** that re-enables the buttons, clears the progress line, and returns to read-only view.
@@ -158,6 +159,7 @@ Webview button states, driven by host messages:
 - **E2E scenarios aggregate across all summaries, not just the anchor.** A newest commit without scenarios doesn't blank the E2E section. (Notable.)
 - **The post-submit rebuild is what surfaces the freshly-minted memory links.** At first render nothing had been shared, so the body had no Memory-Space links; rebuilding from storage after the share step picks them up. (Notable.)
 - **Every post-submit step is independently best-effort.** Share, rebuild, and PR re-resolve each catch their own failures and fall back; the success toast already confirmed the PR, so none of them blanks the pane. (Notable; permissive.)
+- **Not every share refusal is a failure toast.** A push-disabled repo produces an *information* message, not a warning or error — the user's own opt-out is an expected outcome of this flow, and the PR was still created. It is the only branch of the share error handling that is not styled as a problem. (Surprising; intentional — spec 310.)
 - **The sign-in notice swaps in place to preserve edits.** A full re-render would discard anything typed into the edit form, so auth changes are applied via a targeted message. (Notable.)
 - **The malformed-summary render is guarded.** Because summaries are deserialized without read-time schema validation, the E2E section coerces each title/step/expected value to a string and tolerates a non-array field — a single synchronous build with no render try/catch would otherwise white-screen the whole pane on one bad summary. (Surprising; defensive.)
 
@@ -168,4 +170,5 @@ Webview button states, driven by host messages:
 - The branch classifier this pane deliberately skips is **Create-PR Branch Classification** (spec 213).
 - The per-file diff preview opened from the Files-changed list is **VS Code Create-PR Diff Preview** (spec 238).
 - The markdown→HTML rendering of the body panel is **Create-PR Body Markdown Assembly** (spec 239).
+- The per-repo outbound-push opt-out behind the informational refusal is **Per-Repo Outbound-Push Control** (spec 310); the shared classification that makes such a refusal abort the whole share rather than fail one memory is **Repo-Wide Push-Refusal Classification** (spec 327).
 - The post-success sharing of branch memories to the Memory Space is **Summary Push to Jolli Space** (spec 94).

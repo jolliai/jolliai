@@ -1,7 +1,8 @@
 # Spec corpus index
 
-310 behavioral specifications reverse-engineered from this repository's actual code, grouped below by
-theme and ordered by number within each group.
+Behavioral specifications reverse-engineered from this repository's actual code — one per topic,
+grouped below by theme and ordered by number within each group. The corpus size is deliberately not
+stated here: it is a number nobody decides anything on, and one more thing to keep true.
 
 **These specs document reality, not intent.** Every statement in them was derived from — and is meant
 to stay verified against — the code as it exists, not from a design doc, a ticket, or a plan. Where a
@@ -41,6 +42,7 @@ gate a change.
 - [195 — Memory Bank User-Knowledge Scanner](195-memory-bank-scanner.md) — surface user-authored markdown in a repo mirror, filtering system-emitted files and classifying survivors by depth.
 - [215 — Memory Bank Migration Engine](215-memory-bank-migration-engine.md) — copy the whole orphan-branch store into the Memory Bank folder resumably and idempotently, then keep the visible layer reconciled.
 - [232 — Canonical Repo URL and Name Derivation](232-canonical-repo-url-and-name-derivation.md) — normalize a git remote into one stable key across transports and casing, plus the derived repo name and branch slug.
+- [311 — Project State-Root Resolution](311-project-state-root-resolution.md) — anchor an implicitly-supplied working directory to its enclosing worktree root so a subdirectory can never fork a second per-project state store.
 
 ## Summary generation and the LLM path
 
@@ -188,6 +190,17 @@ gate a change.
 - [255 — Source-definition DSL and evaluation engine](255-source-definition-dsl-and-engine.md) — a pure engine over declarative extraction pipes, where a definition may only name allow-listed transforms — the security boundary.
 - [256 — Slack thread reference capture](256-slack-thread-reference-capture.md) — resolve a thread's shareable link from whatever the transcript offers and void the whole capture when no link can be established.
 
+## Skill usage capture and reporting
+
+- [319 — Skill Usage Working Record](319-skill-usage-working-record.md) — persist each captured skill as one accumulating markdown file per host-and-skill, the sole dedup ledger, indexed by a registry row that keeps accumulating after a commit freezes it.
+- [320 — Claude Skill Invocation Extraction](320-claude-skill-invocation-extraction.md) — recognize both entry paths into a skill from a Claude transcript, discriminated by one field and associated in line order rather than timestamp order.
+- [321 — Skill Token Attribution](321-skill-token-attribution.md) — report per-skill spend as either host-attributed or positionally estimated, choosing one path for the whole scan so a single figure never mixes confidences.
+- [322 — Skill Usage Commit Archival](322-skill-usage-commit-archival.md) — freeze onto each commit only the portion no earlier commit claimed, copying the working markdown and guarding the row instead of deleting it.
+- [323 — Skill-Usage Aggregate Rendering](323-skill-usage-aggregate-rendering.md) — one renderer over a deliberately narrow row contract emits a byte-identical table and summary label on both sides of the commit boundary.
+- [324 — VS Code Skills Context Row](324-vscode-skills-context-row.md) — one collapsed "Skills used" row carrying a sentinel id, filtered by the uncommitted delta, with every per-kind decision resolved from one injected table.
+- [325 — OpenCode Skill Invocation Capture](325-opencode-skill-invocation-capture.md) — read the host's embedded store for first-class skill-tool rows on a polling tick, with spend that can only ever be an estimate.
+- [326 — Codex Skill Inference From File Reads](326-codex-skill-inference-from-file-reads.md) — infer an entry from a shell command that reads a `SKILL.md`, matching the path shape rather than the verb and marking every record heuristic.
+
 ## Topic knowledge base (wiki)
 
 - [152 — Topic Ingest Pipeline](152-topic-ingest-pipeline.md) — classify each batch of sources to topics in one model call, then reconcile each affected page with a second call per topic.
@@ -214,6 +227,7 @@ gate a change.
 - [205 — Telemetry Event Catalog](205-telemetry-event-catalog.md) — the append-only event allowlist, the fixed envelope, the anonymization rules, and the transparency doc generated from the allowlist itself.
 - [206 — Telemetry Startup and Command Instrumentation](206-telemetry-startup-and-command-instrumentation.md) — bootstrap identity, consent, and environment once per process and emit the catalog's events across all three surfaces.
 - [208 — Trace Context Correlation](208-trace-context-correlation.md) — a private correlation id tying logs and outbound requests into one grep-able unit, propagated across processes via queue field and env var.
+- [312 — Onboarding Funnel Snapshot Event](312-onboarding-funnel-snapshot-event.md) — a content-free six-key snapshot of where one repo sits on the four-checkpoint path to generated memories, deduplicated against an on-disk ledger with a 24-hour heartbeat.
 
 ## Sync and the Memory Bank vault
 
@@ -243,6 +257,7 @@ gate a change.
 - [270 — Push-Pending Compensation Retry](270-push-pending-compensation-retry.md) — a fire-and-forget catch-up on activation or sign-in that retries every queued commit with no hash filter.
 - [301 — Memory Reference Identifier and Copy Chip](301-memory-reference-id-chip.md) — a memory's human-facing identifier, minted only once the backend has one, and the click-to-copy chip that surfaces it — always on detail panels, synced-only in lists, so a chip in a list is itself the "already pushed" signal.
 - [310 — Per-Repo Outbound-Push Control](310-per-repo-outbound-push-control.md) — a machine-global, identity-keyed `pushDisabled` store and one `isOutboundPushAllowed` predicate gating every CLI/VS Code/IntelliJ push path, plus a current-repo toggle on each surface.
+- [327 — Repo-Wide Push-Refusal Classification](327-repo-wide-push-refusal-classification.md) — one shared error-name set tells a whole-repository refusal from a per-document failure, so every push loop stops instead of firing N doomed requests.
 
 ## PR authoring
 
@@ -400,3 +415,9 @@ gate a change.
 - [298 — IntelliJ AI Commit Action](298-intellij-ai-commit-action.md) — stage the checked files, obtain a message from the command-line surface, offer a three-way review, then restore prior staging and force the IDE to re-read git state.
 - [299 — IntelliJ Squash Action](299-intellij-squash-action.md) — consolidate a selected commit range with a generated message behind a two-step gesture, warning before rewriting pushed history and writing the squash-pending marker before the reset.
 - [302 — IntelliJ Embedded-Browser Pool](302-intellij-jcef-browser-pool.md) — a project-scoped pool of reusable embedded-browser instances behind a checkout/hand-back discipline, prewarmed at project open, now shared by the memory tab and the branch-level PR draft, with a trim-on-hand-back population bound that is not admission control.
+- [313 — IntelliJ Source Presentation Table](313-intellij-source-presentation-table.md) — one table mapping each reference source to its badge letter, brand hue and label, plus the label-composition policy the five consuming panels share.
+- [314 — IntelliJ Native Memory Bank Metadata Read](314-intellij-native-memory-bank-metadata-read.md) — read the per-repo manifest and summary index straight off the hidden layer with no bridge round-trip, failing soft in both directions and carrying no dirty-gate.
+- [315 — IntelliJ Memory Bank Heal Pass Gating](315-intellij-memory-bank-heal-pass-gating.md) — delegate the visible-Markdown heal to the command-line surface, throttled per repository by a clean-repo cache and a failure cooldown.
+- [316 — IntelliJ Memory Bank Repo-Scope Filter](316-intellij-memory-bank-repo-scope-filter.md) — a synthetic "All repos" breadcrumb entry on its own callback, broadening the explorer through one volatile, never-persisted filter field.
+- [317 — IntelliJ Archived Reference Body Read](317-intellij-archived-reference-body-read.md) — derive the command-line surface's archived-reference file stem before either read leg, since the GitHub and context7 sources carry native ids that are not path-safe.
+- [318 — IntelliJ Memory Bank Folder Setting Key Migration](318-intellij-memory-bank-folder-setting-key-migration.md) — one field with a legacy-key alias recovers a pre-1.1 folder path on load and rewrites it under the canonical key on the next save.

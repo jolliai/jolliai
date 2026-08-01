@@ -42,6 +42,8 @@ Change into a repo and run `jolli` again:
   % jolli
 ```
 
+Between printing that block and setting the exit code, the failure branch emits an `onboarding_progressed` snapshot (spec 312) for the working directory. This is the **only** trigger anywhere in the product that ever fires outside a git working tree, so it is the sole reason the "installed but never landed in a repository" drop-off is observable at all rather than being a silent hole in the funnel.
+
 **On success** it prints the same header plus a positive confirmation, so the framing is identical either way:
 
 ```
@@ -57,6 +59,8 @@ Only after the repository gate passes, the flow initializes the active storage f
 - **summary count** — how many memories exist, read straight from the active storage. A repository with no index reports `0`, so a fresh repo and a folder-only repo that has memories but no orphan branch are both handled without gating on the orphan branch.
 
 Both values are read here but the **status line derived from them is printed later**, after the enable step, so that `✓ enabled` is always truthful. Both are re-read after a successful enable and after a back-fill build.
+
+Immediately after this opening read, the flow emits a second `onboarding_progressed` snapshot (spec 312), handing it the two values just read so the emitter skips its own heavy installation probe. It fires on **every** path past the repository gate — including the user who goes on to decline the enable prompt — so those early exits are not blind spots in the funnel. There is deliberately **no** third emit after a successful enable: the post-enable state is reported by whatever trigger fires next, and the enable *transition* itself is marked only by the `surface_enabled` event recorded in the enable step below.
 
 ## Capabilities tracked
 

@@ -81,8 +81,17 @@ Callers must therefore handle the two disciplines differently. A best-effort cal
 | `profile.lock` | Shared across worktrees | 5 seconds, polled | **Both disciplines exist over this one file** — see below |
 | `repo-hooks.lock` | Shared across worktrees | 5 seconds, polled; automatic (machine-initiated) callers use a much shorter budget of a fraction of a second | **Strict** |
 | `runtime-registry.lock` | Machine-global | 5 seconds, polled; automatic callers use the same shortened budget | **Strict** |
+| `push-control.lock` | Machine-global | 5 seconds, polled at 25 ms | **Strict primitive, best-effort at its one call site** — see below |
 
 The three oldest entries (`worker.lock`, `ingest.lock`, `orphan-write.lock`) and the sync lock are neither strict nor best-effort in the sense above: they hand the acquisition result back and let each caller decide, and every caller declines the work on failure. The strict/best-effort distinction applies to the wrappers that run a callback on the caller's behalf.
+
+### The push-control lock is strict by shape and best-effort by use
+
+`push-control.lock` guards the machine-global per-repo outbound-push store (`push-control.json`, spec 310) so a command-line toggle and an editor toggle of *different* repos cannot lose-update each other. It is machine-global like the runtime-registry lock, but deliberately a **separate file** so the two never contend.
+
+Its wrapper returns the strict acquisition result — on timeout it runs nothing and reports "not acquired". But its **single** caller, the store's read-modify-write, then re-runs the same guarded function unlocked rather than propagating the failure. The net user-visible discipline is therefore best-effort, for the best-effort rationale above: the critical section is a sub-millisecond read-modify-write that re-reads inside the lock and ends in an atomic write, so contention narrows to a small residual lost-update window — whereas dropping the write would silently discard a toggle the user just clicked, which on the *disable* direction means the repo keeps pushing after the user turned it off.
+
+This is worth stating explicitly because the shape and the behavior disagree: reading only the wrapper would classify this lock as strict, and a future second caller that forgets the fallback would silently start dropping toggles.
 
 ### The repository profile lock has two disciplines
 

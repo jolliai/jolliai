@@ -2,15 +2,15 @@
 
 ## Topic Statement
 
-A sticky per-project JSON file that holds two independent layers for the next pipeline run: the user's manual EXCLUDE set (the four kinds of items the user unchecked), which the queue worker reads read-only; and an AI-relevance layer (the relevance ranker's FULL per-item ranking — every ranked item's tier, reason, and the AI's exclude decision — plus a change fingerprint), which both the pre-commit review panel and the post-commit queue worker write.
+A sticky per-project JSON file that holds two independent layers for the next pipeline run: the user's manual EXCLUDE set (the five kinds of items the user unchecked, one of which is optional on disk), which the queue worker reads read-only; and an AI-relevance layer (the relevance ranker's FULL per-item ranking — every ranked item's tier, reason, and the AI's exclude decision — plus a change fingerprint), which both the pre-commit review panel and the post-commit queue worker write.
 
 ## Scope
 
 In scope:
 
 - The on-disk location of the file relative to a project root.
-- The four kinds of user exclusions the file holds: ongoing conversations, plans, notes, references.
-- The shape of an entry within each kind, including the composite key used for conversation entries and the composite key used for reference entries.
+- The five kinds of user exclusions the file holds: ongoing conversations, plans, notes, references, and skills — the last of which is optional on both the persisted shape and the read result, because it postdates the others.
+- The shape of an entry within each kind, including the composite key used for conversation entries, the composite key used for reference entries, and the composite key used for skill entries.
 - The second layer: the AI per-item ranking list (each entry: kind, key, tier, reason, the AI's original exclude decision, and an optional user "dismissed" veto flag — no score) and the change fingerprint, both optional and written only when non-empty/present.
 - The effective-exclude derivation (`excluded AND NOT dismissed`) exposed over an AI entry.
 - The version stamp staying fixed for forward compatibility, and why the new fields are added as optional keys rather than by bumping the version.
@@ -56,13 +56,14 @@ The file is per-project. Two project roots have two independent files and two in
 
 ### Persisted shape
 
-The file is a JSON object with the four user-exclude arrays plus a version stamp, and two optional AI-layer fields:
+The file is a JSON object with the four required user-exclude arrays plus a version stamp, and three optional fields:
 
-- A version stamp: a fixed integer constant. The current value is the second version of the schema. It **stays fixed** even though the AI-layer fields were added (see "Schema versions").
+- A version stamp: a fixed integer constant. The current value is the second version of the schema. It **stays fixed** even though the skill and AI-layer fields were added (see "Schema versions").
 - An array of conversation exclusion keys (strings).
 - An array of plan exclusion keys (strings).
 - An array of note exclusion keys (strings).
 - An array of reference exclusion keys (strings).
+- **Optional** — an array of skill exclusion keys (strings). Absent in files written before skills became a selectable artifact kind, and written only when non-empty (see "Skill key shape").
 - **Optional** — an array of AI per-item ranking entries (see "AI relevance entry"). Written only when non-empty; omitted otherwise.
 - **Optional** — a change-fingerprint string (see "Change fingerprint"). Written only when present.
 
@@ -74,7 +75,7 @@ The AI layer is **one list carrying the whole ranking** — every ranked item, k
 
 Each entry has:
 
-- **kind**: one of the four exclusion kinds (in practice the ranker produces only plan/note/reference).
+- **kind**: one of the five exclusion kinds. In practice the ranker produces only plan/note/reference — see the unreachable-kind note below.
 - **key**: the item key for that kind — a plan slug, a note identifier, or a `<source>:<nativeId>` reference key. Same key space as the corresponding user-exclude array.
 - **tier**: one of `high` / `mid` / `low`, the ranker's categorical relevance band for the item.
 - **reason**: the one-line explanation the ranker attached.
@@ -109,6 +110,14 @@ A reference entry is a string of the form `<source>:<nativeId>`, where:
 
 The composite shape is identical to the reference map key used by the plans-and-notes registry, which is intentional: a single key flows between the panel, this store, and the registry without translation.
 
+### Skill key shape
+
+A skill entry is a string of the form `<source>:<skill>`, where `<source>` is the producer that ran the skill and `<skill>` is that producer's own skill identifier. This is the same working-area map key the skill registry uses, and the same key the amend merge and the tree-level accumulation derive — deliberately, so an exclusion, a merge and an aggregate cannot disagree about which rows are the same skill.
+
+Note it is **not** the archive key: that carries a per-commit hash suffix and would make an exclusion apply to one commit's snapshot rather than to the skill.
+
+The kind is optional throughout: it is absent on the persisted shape when nothing has been excluded, absent on the returned read result when the file carried no such field, and its absence means "nothing excluded" rather than "unknown".
+
 ### Plan key and note key shapes
 
 A plan entry is a plan slug string. A note entry is a note identifier string. Both are opaque to this store — it does not interpret them, normalize them, or validate them against the registry. A "stale" key whose underlying row no longer exists is tolerated and round-trips cleanly.
@@ -122,20 +131,21 @@ The store recognises two version stamps:
 
 A read against a version-one file transparently fills the references set as empty. The next write upgrades the on-disk version stamp to two and writes the references array (empty if no references were excluded between the read and the write). Any version stamp that is neither one nor two causes the read to return an empty result and to log a warning; the file is left untouched on disk.
 
-The AI-layer fields (per-item ranking list, change fingerprint) were added **without** bumping the version stamp, on purpose. Bumping to a third version would make an older reader — which hard-rejects unknown versions and returns an empty set — silently **discard the user's manual excludes**. Keeping the stamp at two and adding the new fields as optional extra keys means an older reader still reads the four arrays it recognises and simply ignores the rest: true forward compatibility. The new fields are written only when non-empty, so for a user who never touches the AI-relevance feature the file shape is byte-for-byte the pre-feature shape.
+The skill array and the AI-layer fields (per-item ranking list, change fingerprint) were all added **without** bumping the version stamp, on purpose. Bumping to a third version would make an older reader — which hard-rejects unknown versions and returns an empty set — silently **discard the user's manual excludes**. Keeping the stamp at two and adding the new fields as optional extra keys means an older reader still reads the four arrays it recognises and simply ignores the rest: true forward compatibility. The new fields are written only when non-empty, so for a user who never touches the AI-relevance feature the file shape is byte-for-byte the pre-feature shape.
 
 Legacy keys from earlier in-development builds of this feature — `userIncluded`, `aiSuggestedExclude`, `aiRelevanceResults` — are intentionally **not** read and are dropped on the next write. The dismiss model sets a flag on the AI ranking entry directly (see below), so there is no separate persistent "include" layer to carry. This file is a short-lived local relay (cleared by the worker after each commit), so the sole cost of dropping an unrecognized legacy shape is one fingerprint miss → one fallback re-rank.
 
 ### Returned shape
 
-The read API returns a structure with exactly four read-only sets:
+The read API returns a structure with four always-present read-only sets plus one optional one:
 
 - The set of excluded conversation keys.
 - The set of excluded plan keys.
 - The set of excluded note keys.
 - The set of excluded reference keys.
+- **Optional** — the set of excluded skill keys. Present only when the file carried the field at all; an absent field yields an absent set rather than an empty one, and every consumer reads that as "nothing excluded" (the squash path, for example, substitutes an empty set).
 
-When the file is missing or unreadable, all four sets are empty.
+When the file is missing or unreadable, the four required sets are empty and the skill set is absent.
 
 ### AI-layer returned shape
 
@@ -148,9 +158,9 @@ When the file is missing, unreadable, or carries no AI layer, the list is empty 
 
 ### Defensive read coercion
 
-For each of the four user-exclude fields the reader requires an array of strings. If a field is present but not an array, that field's set is empty. If a field is present as an array containing some non-string elements, only the string elements are kept; the rest are silently dropped. This applies field-by-field — corruption of one field does not invalidate the others.
+For each of the four required user-exclude fields the reader requires an array of strings. If a field is present but not an array, that field's set is empty. If a field is present as an array containing some non-string elements, only the string elements are kept; the rest are silently dropped. This applies field-by-field — corruption of one field does not invalidate the others. The optional skill field is coerced the same way **only when it is present at all**: an absent field stays absent through the read rather than degrading to an empty set, which is what preserves the "written before skills existed" distinction.
 
-The AI per-item ranking array is coerced entry-by-entry: an element is kept only when it is an object whose `kind` is one of the four recognized kinds, whose `tier` is one of `high`/`mid`/`low`, whose `key` and `reason` are both strings, and whose `excluded` is a boolean. Any other element (null, non-object, wrong-typed or missing field) is silently dropped. Only `kind`/`key`/`tier`/`reason`/`excluded` are extracted, plus `dismissed` when it is exactly `true`; any extra field (e.g. a legacy `score`) is discarded. The change fingerprint is kept only when it is a string.
+The AI per-item ranking array is coerced entry-by-entry: an element is kept only when it is an object whose `kind` is one of the five recognized kinds (the four required ones plus skills), whose `tier` is one of `high`/`mid`/`low`, whose `key` and `reason` are both strings, and whose `excluded` is a boolean. Any other element (null, non-object, wrong-typed or missing field) is silently dropped. Only `kind`/`key`/`tier`/`reason`/`excluded` are extracted, plus `dismissed` when it is exactly `true`; any extra field (e.g. a legacy `score`) is discarded. The change fingerprint is kept only when it is a string.
 
 ## Behavior
 
@@ -226,7 +236,9 @@ Clearing after consume prevents a later commit over the **same** file set from s
 ### Atomic write protocol
 
 1. Ensure the state directory exists (create recursively if necessary).
-2. Build the persisted payload from the four sets, materializing them in this order: version stamp, conversations, plans, notes, references. Each set becomes an array; order within an array is the set's iteration order (insertion order in practice).
+2. Build the persisted payload from the sets, materializing them in this order: version stamp, conversations, plans, notes, references, then — **only when non-empty** — skills, then the optional AI-layer fields. Each set becomes an array; order within an array is the set's iteration order (insertion order in practice).
+
+   The serializer rebuilds the shape field by field rather than spreading the read result, so any field it does not name explicitly is dropped on the next write even though it round-tripped through the reader. Skills are carried explicitly for that reason, and are omitted when empty so a user who never excludes a skill keeps a byte-identical file — the same rule the AI-layer fields follow.
 3. Serialize the payload as JSON with tab indentation.
 4. Choose a temp file path: the final path with a suffix that combines the writer's process identifier and a millisecond timestamp. This makes the temp path unique across processes within a millisecond and unique across milliseconds within a process.
 5. Write the JSON to the temp file.
@@ -260,7 +272,7 @@ The cross-process lock: each chained operation additionally runs under a worktre
 2. If the unlink fails because the file does not exist, return without logging.
 3. If the unlink fails for any other reason, log a warning identifying the operation and the error message, then return.
 
-This helper is exposed for tests and manual operator use. It is not invoked by the pipeline. Deleting the file is equivalent to "un-exclude everything across all four kinds".
+This helper is exposed for tests and manual operator use. It is not invoked by the pipeline. Deleting the file is equivalent to "un-exclude everything, across every kind" — including the optional skills set, which a reader counting only the required kinds would miss.
 
 ### Consumption by the queue worker
 
@@ -277,6 +289,7 @@ The specific consumer behaviors are:
 - A plan key in the exclusions causes that plan to be dropped from the plans-block formatter input **and** from the archive-side registry scan, so it is neither summarized nor associated with this commit. Its uncommitted registry row and backing file are left **intact**, so it reappears on the panel for re-check on the next commit.
 - A note key behaves identically: dropped from the notes-block input and the archive-side scan; its row and backing file are left intact.
 - A reference key causes the reference's markdown not to be read into the prompt block and the reference not to be associated with this commit; its row and backing markdown are left intact.
+- A skill key causes that skill not to be archived onto this commit: the exclusion set is passed **into** the archival step rather than applied to its result, because archiving both guards the working-area row and emits parallel-ref bytes — a post-filter would leave the excluded skill's content archived while merely hiding it from the summary. The row is not deleted, so the skill reappears for re-check next time. Skills are never in the prompt block to begin with (they are track-only metadata), so there is no prompt-side arm to this exclusion.
 
 So the model is **mixed**: an excluded **conversation** is a one-time discard (consumed at its cursor, dropped downstream, never reappears), while an excluded **plan / note / reference** is a **sticky leave-out** — skip this commit only, never delete, reappears for re-check next time. The plan/note/reference treatment is now **identical** to how an AI soft-exclude is treated, and identical to the AI layer's own skip-only handling (see [258]).
 
@@ -325,6 +338,8 @@ The AI layer has a different, non-sticky lifecycle:
 - **Plan / note exclusion is skip-only; the row is kept (reverted).** An in-development build deleted the excluded plan/note's uncommitted row (and, for a note, its product-owned backing file) via a discard pass. That was **removed**. The current behavior filters both the prompt block and the archive-side scan but leaves the row (`commitHash === null`) and backing file intact, so the item *stays on the panel for the next commit*. This is the original behavior restored.
 - **Reference exclusion mirrors plan/note exclusion.** An excluded reference is dropped from the prompt-block read loop and the archive-side association, but its registry row and backing markdown are left intact — skip-only, same as plans/notes. It reappears for re-check on the next commit.
 - **The branch-scoping removal that shipped alongside these changes is IntelliJ-only.** No CLI/VS Code behavior changed for that half; the CLI exclusion store's per-project (not per-branch) scope is unchanged.
+- **The skills kind is DECLARED but no live writer ever emits it into the AI layer.** `skills` is a full member of the exclusion-kind enumeration and is accepted by the AI-ranking coercion, so a ranking entry carrying it would round-trip cleanly. Nothing produces one: the only writer of the AI layer maps the ranker's verdicts to `plans` / `notes` / `references` and has no fourth arm, and the ranker itself only ever builds items of those three kinds. Skills are never fed to the ranker at all — they are track-only metadata about *how* the work happened, with no relevance verdict to have. Treat the enumeration member as declared-but-unreachable on the AI layer; the **user** layer's skills array, by contrast, is written and read for real. (Notable; the asymmetry between the two layers is the point.)
+- **Skill exclusion is optional in a way the other four are not.** The other four arrays are always materialized on write and always yield a set on read. The skills array is written only when non-empty and read back as *absent* when the file lacks it — so a file written before skills existed is indistinguishable from one whose user has excluded nothing, and both are correct. Consumers substitute an empty set at the use site. This is what keeps the on-disk file byte-identical for users who never touch the feature, matching the AI layer's rule. (Notable; intentional.)
 - **Defensive coercion is per-field.** A file with one corrupted field (non-array, or array of non-strings) still surfaces the valid keys in the other three fields. This is a deliberate weakening of "all-or-nothing" parsing so a partially-damaged file is recoverable on the next write.
 - **Loud-but-safe on unknown version.** An unknown version stamp emits a warning and returns empty rather than throwing. This protects the user from being unable to make further selections after a downgrade, at the cost of silently masking the on-disk content until the next write overwrites it.
 - **Locking is now cross-process (reversed).** The earlier design serialized writes in-process only and accepted a possible cross-process lost update, on the theory that only one surface mutates selections at a time. That is no longer true: the pre-commit panel and the post-commit worker are separate processes that both write this file (the panel persists the AI ranking; the worker clears it after consume). Every write therefore now runs under a worktree-scoped, PID-tagged cross-process file lock in addition to the in-process chain. The lock is best-effort (a slow holder never permanently blocks a selection change) and the atomic temp+rename keeps the file from ever being observed half-written even when the lock is skipped.

@@ -79,7 +79,7 @@ The description is a one-line blurb (head commit's recap, else its subject line,
 ### Open
 
 1. No API key → **needs-API-key** and stop.
-2. If the subject already has a **live, unexpired branch** link that references a branch collection, swap to a "Syncing…" loading state and **reconcile** it (re-push current `base..HEAD` and rebuild the covered list — see 236 for the mechanics). Reconcile is skipped for commit links (fixed doc list) and for expired links (reconciling a dead link would re-push everything and could resurrect it). A reconcile failure is best-effort: report it and fall back to the cached record.
+2. If the subject already has a **live, unexpired branch** link that references a branch collection, swap to a "Syncing…" loading state and **reconcile** it (re-push current `base..HEAD` and rebuild the covered list — see 236 for the mechanics). Reconcile is skipped for commit links (fixed doc list) and for expired links (reconciling a dead link would re-push everything and could resurrect it). A reconcile failure is best-effort: report it and fall back to the cached record — **except a push-disabled refusal, which is skipped silently** (see below).
 3. Post the **ready** state (below). Opening **never mints** a link.
 
 ### Ready state assembly
@@ -123,6 +123,15 @@ Because the webview optimistically closes the popover on Send, invite errors are
 
 When a mint (link creation via the push pipeline) fails, the specific reason is posted into the error pane **and** returned so a caller whose pane is already closed can toast it. The message distinguishes: a Space-binding problem (chooser already open elsewhere / user cancelled / couldn't be set up), "nothing to share yet on this branch", or a generic create failure.
 
+### The per-repo outbound opt-out: mint aborts, reconcile skips quietly
+
+Both paths run through the same push funnel, which raises `PushDisabledError` at the orchestrator's entry gate when the repo's outbound push is off (spec 310). They treat it differently on purpose:
+
+- **Mint** (Copy / tier flip / invite) propagates it. The user just asked for a link and nothing was published, so the refusal must be reported.
+- **Reconcile** catches it and `return`s, leaving the cached record untouched (`vscode/src/services/LiveShareController.ts:550-559`). Reconcile is a best-effort background pass the modal runs on **every** view, so a push-disabled repo simply means "nothing to sync outbound". Letting it escape would render the user's own setting as the modal's red "Couldn't refresh the shared content" toast on every open. Mirrors IntelliJ's reconcile branch (262).
+
+The **whole-branch** share loop has its own repo-wide stop test on top of this — see 236.
+
 ## State Transitions
 
 For one subject:
@@ -150,6 +159,7 @@ For one subject:
 - **Invite grants access, then emails — and a mail failure keeps the grant.** Access is a server-side allowlist merge; the email is a notification. Losing the email does not lose access. (Notable.)
 - **The access flip trusts the request, not the echo.** After a successful PATCH the tier is taken from what was asked for; a stale or omitted server echo previously reverted the tier silently (e.g. a flip to public rendered back as org). Echo and existing value are only fallbacks. (Surprising; intentional.)
 - **Reconcile-on-open is gated twice.** Only a live, unexpired **branch** link reconciles, and even then only when a content fingerprint shows the shared memory changed — so ordinary re-opens don't re-push. The fingerprint hashes each summary's topics, recap, plan/note revisions, **and its references** (each reference's stamp bumps on a new/changed reference), so adding or updating a shared reference triggers a reconcile even when git HEAD hasn't moved. Commit links never reconcile. (Notable.)
+- **A push-disabled repo makes reconcile a silent no-op, but still blocks a mint loudly.** The same refusal from the same funnel is reported on the path the user initiated and swallowed on the path the modal initiates for them. Surfacing a user's own opt-out as a red "couldn't refresh" toast on every popover open would be noise about a setting they chose. (Surprising; intentional asymmetry — spec 310.)
 - **Rollback undoes a mint/flip done only to carry an invite.** If the invite fails, a link that existed solely to invite is revoked, or a tier bump is reverted, so a failed invite doesn't leave a stray or over-open link. (Notable.)
 - **Every URL is origin-checked before it's shown or copied.** A record whose URL fails the Jolli allowlist renders as absent, and copy asserts the origin before touching the clipboard — a defense against a tampered cache. (Notable.)
 - **The org tier is capability-gated by the API key.** It is offered only when the key's decoded payload carries an org; keys without one never see the org option. (Notable.)
@@ -162,7 +172,8 @@ For one subject:
 
 - **Origin allowlist** — the same HTTPS-only, suffix-boundary Jolli allowlist enforced everywhere (see 94's shared-behavior references); applied here to every rendered/copied share URL.
 - **Persistence, keying, single-slot invariant, and seed selection** — **Branch Share Store** (233).
-- **Content push, cross-commit dedup, and covered-list construction** used by every mint/reconcile — **VS Code Push Orchestration** (236).
+- **Content push, cross-commit dedup, and covered-list construction** used by every mint/reconcile — **VS Code Push Orchestration** (236); its repo-wide fatal set is **Repo-Wide Push-Refusal Classification** (327).
+- **The per-repo outbound-push opt-out** that raises the refusal both paths see — **Per-Repo Outbound-Push Control** (310).
 - **Binding chooser** — injected as a callback; the chooser webview and its outcomes are **VS Code Binding Chooser Webview** (117).
 - **Plugin-outdated mapping** on a `426` — **Plugin Outdated Flow** (96).
 - **Popover DOM/CSS and host↔webview messaging** — **VS Code Summary Webview Panel** (109).

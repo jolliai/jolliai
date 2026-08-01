@@ -2,7 +2,7 @@
 
 Operational reference for an agent about to change this repo: what the deliverables are, how to
 iterate on each, and the exact gate a change must pass. Every value here was read out of a manifest
-in this tree — not inferred. Recorded at `64f8bc6b`.
+in this tree — not inferred. Recorded at `93933725`.
 
 This is **not** a behavioral spec. Command names, file paths, and version numbers are the point.
 
@@ -10,13 +10,14 @@ This is **not** a behavioral spec. Command names, file paths, and version number
 
 ## 1. Deliverables and workspaces
 
-Three deliverables, one product model, one shared on-disk state.
+Four deliverables, two of which are npm workspaces. One product model, one shared on-disk state.
 
-| Deliverable | Directory | Build system | Coordinated by root? | Version at `64f8bc6b` |
+| Deliverable | Directory | Build system | Coordinated by root? | Version at `93933725` |
 |---|---|---|---|---|
-| `@jolli.ai/cli` | `cli/` | Vite multi-entry lib build + `tsc` declarations | **Yes** — npm workspace | `0.99.9` |
-| `jollimemory-vscode` | `vscode/` | esbuild → CJS bundles | **Yes** — npm workspace | `0.99.9` |
-| Jolli Memory IntelliJ plugin | `intellij/` | Gradle / Kotlin (`ai.jolli.jollimemory`) | **No** — independent build | `0.99.8` |
+| `@jolli.ai/cli` | `cli/` | Vite multi-entry lib build + `tsc` declarations | **Yes** — npm workspace | `0.99.10` |
+| `jollimemory-vscode` | `vscode/` | esbuild → CJS bundles | **Yes** — npm workspace | `0.99.10` |
+| Claude Code plugin | `claude-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.0` (`.claude-plugin/plugin.json`) |
+| Jolli Memory IntelliJ plugin | `intellij/` | Gradle / Kotlin (`ai.jolli.jollimemory`) | **No** — independent build | `0.99.10` |
 
 Root `package.json` (`"name": "jollimemory"`, `"version": "0.99.0"`, `"private": true`) declares
 exactly two workspaces:
@@ -30,12 +31,15 @@ root does not touch the IntelliJ plugin. It has its own CI workflow
 (`.github/workflows/build-intellij.yaml`) and its own gate (§5.4). One root script does reach into
 `intellij/`, but it is a developer launcher rather than a build stage: `intellij:sandbox` (§4.5).
 
-A fourth build target exists but is not a workspace: `claude-plugin/plugins/jolli/`, built by
-`node claude-plugin/plugins/jolli/scripts/build.mjs`. It is wired into the root `build` chain (§4).
+The Claude Code plugin is the fourth deliverable and the one that is a **build target without being a
+workspace**: `claude-plugin/plugins/jolli/`, built by `node claude-plugin/plugins/jolli/scripts/build.mjs`.
+It is wired into the root `build` chain (§4) and therefore gated by `npm run all`, but it has no
+`clean`/`typecheck`/`lint`/`test` stage of its own and no publish workflow (§7).
 
-Root version (`0.99.0`) tracks the workspace coordinator, not either shipped artifact. CLI and
+Root version (`0.99.0`) tracks the workspace coordinator, not any shipped artifact. CLI and
 VS Code versions move together in practice but are independent by policy; IntelliJ is independent of
-both and currently trails at `0.99.8`.
+both and currently happens to be level with them at `0.99.10`. The Claude Code plugin versions on its
+own `1.0.0` line entirely.
 
 ---
 
@@ -178,7 +182,7 @@ inlines `cli/src/**` at bundle time, so a stale `cli/` means a stale extension.
 
 ```bash
 npm run intellij:sandbox                            # from repo root
-npm run intellij:sandbox -- --clean --sync-hooks
+npm run intellij:sandbox -- --sync-hooks
 ```
 
 This is the **one root script that reaches into `intellij/`** — §1's "no root script touches it" governs
@@ -186,12 +190,15 @@ the build/lint/test stages, not this launcher. It is a thin cross-platform wrapp
 (`intellij/scripts/run-sandbox.mjs`); every step logs with an `[intellij:sandbox]` prefix and any
 failure exits 1.
 
+Five steps, and **`--sync-hooks` is the only flag** — there is no `--clean`:
+
 | Step | Default | What it does |
 |---|---|---|
-| npm deps | always | `npm install`, but **only if** root `node_modules/` is missing |
-| sandbox cache clean | **off** — `--clean` | removes `config/`, `system/`, `log/` under `intellij/build/idea-sandbox/<ide>/`. Off by default because deleting `config/` discards the sandbox IDE's settings and installed plugins on every launch |
-| build + hook sync | **off** — `--sync-hooks` | root `npm run build`, then copies `vscode/dist/*.js` (**except `Extension.js`**) into `~/.jolli/jollimemory/dist-intellij/`, failing if `PrePushWorker.js` is absent afterwards. Off by default because that destination is a machine-global path shared with your other repos |
-| launch | always | `./gradlew runIde` (`gradlew.bat runIde` on Windows) from `intellij/` |
+| 1. npm deps | always | `npm install`, but **only if** root `node_modules/` is missing |
+| 2. build | **always** | root `npm run build`, then asserts `vscode/dist/Cli.js` exists afterwards. Unconditional because Gradle's `prepareSandbox` copies `vscode/dist/*.js` into the sandbox plugin's `cli-dist/`, so any `cli/src/**` or `vscode/src/**` change must reach `vscode/dist/` before launch or the sandbox runs stale code. Incremental esbuild/vite is ~2 s, so it always rebuilds rather than staleness-detecting |
+| 3. sandbox cache clean | **always** | removes `config/`, `system/`, `log/` under `intellij/build/idea-sandbox/<ide>/` so every launch starts fresh. The script's own header flags the cost: this discards manually-installed sandbox plugins, keybindings, window layout, and the project index, so first-launch indexing runs every time |
+| 4. hook sync | **off** — `--sync-hooks` | copies `vscode/dist/*.js` (**except `Extension.js`**) into `~/.jolli/jollimemory/dist-intellij/`, failing if `PrePushWorker.js` is absent afterwards. Copy only — the build already happened in step 2. Off by default because that destination is a machine-global path shared with your other repos |
+| 5. launch | always | `./gradlew runIde` (`gradlew.bat runIde` on Windows) from `intellij/` |
 
 `--help` / `-h` prints the flag list. Gradle's own `~/.gradle/caches/` handles the SDK and Kotlin
 downloads, so the first launch is slow and later ones are not.
@@ -223,6 +230,13 @@ It requires each tool installed **and logged in** on this machine; a missing or 
 records that status in its `meta.json` and is skipped rather than failing the run. The fixtures are
 therefore recorded observations, not hand-written expectations — regenerate them rather than editing
 them by hand. They are excluded from Biome's scope (§6.1).
+
+The script's `TOOLS` array covers `cursor-agent`, `codex` and `opencode`. `claude-code` has no fixture
+(it is capability-probed with the real run flags at runtime instead), and `kimi/` was captured **by
+hand** from a real `kimi --output-format stream-json --prompt …` run: it holds only `meta.json` +
+`success.json`, no `help.txt`, and re-running the script will neither refresh nor delete it. So
+"regenerate rather than edit" holds for every fixture directory except `kimi/`, which has to be
+re-captured deliberately.
 
 ---
 
@@ -267,24 +281,20 @@ this one file can be committed while the per-developer state beside it is not; i
 CI runs the identical command: `.github/workflows/build-vscode.yaml` ("CI - CLI + VS Code") does
 `npm ci` then `npm run all`, then asserts the IntelliJ bundling contract on `vscode/dist/Cli.js`.
 
-> **⚠ Discrepancy with the repo's own prose.** `AGENTS.md` summarizes the gate as
-> **"clean → build → lint → test"**. The actual root script has **five** stages, not four, and two of
-> them are broader than the prose implies:
+> **⚠ One remaining gap in the repo's own prose.** `AGENTS.md` now summarizes the gate correctly as
+> **"clean → build → typecheck → lint → test"** and its layout section reads "build cli, then the
+> Claude Code plugin, then vscode" — both of those were fixed. One thing is still elided:
 >
-> 1. **`typecheck` is a real, separate stage** between `build` and `lint` — `tsc --noEmit` in the CLI
->    and `tsc --noEmit -p tsconfig.build.json` in the extension. It is absent from the prose summary.
->    Neither workspace's own `all` script includes it, so `npm run all -w @jolli.ai/cli` does **not**
->    typecheck; only the root `all` does.
-> 2. **`test` has three sub-stages, not two** — the CLI unit suite, then a separate CLI **acceptance**
->    suite (`test:acceptance -w @jolli.ai/cli`, config `cli/vitest.acceptance.config.ts`), then the
->    VS Code suite. The acceptance stage is absent from the prose summary.
-> 3. **`build` has three stages, not two** — `build:claude-plugin` sits between the CLI and VS Code
->    builds. The prose summary's "(clean → build → lint → test)" and the layout section's
->    "build cli, then vscode" both predate it.
+> - **`test` has three sub-stages, not two** — the CLI unit suite, then a separate CLI **acceptance**
+>   suite (`test:acceptance -w @jolli.ai/cli`, config `cli/vitest.acceptance.config.ts`), then the
+>   VS Code suite. `AGENTS.md` names the acceptance files elsewhere ("356 unit + 5 acceptance") but
+>   its one-line expansion of the gate still folds all three into a single `test`.
 >
-> Consequence for anyone verifying a change: running the two per-workspace `all` scripts is **not**
-> equivalent to the root gate. Both per-workspace `all` scripts are `clean && build && lint && test`
-> — no typecheck, and the CLI's omits the acceptance suite. Always run the root `npm run all`.
+> Consequence for anyone verifying a change — unchanged, and this is the part that actually bites:
+> running the two per-workspace `all` scripts is **not** equivalent to the root gate. Both
+> per-workspace `all` scripts are `clean && build && lint && test` — **no typecheck** (so
+> `npm run all -w @jolli.ai/cli` does not typecheck; only the root `all` does), and the CLI's omits
+> the acceptance suite. Always run the root `npm run all`.
 
 ### 5.2 Per-workspace and single-stage variants
 
@@ -462,20 +472,22 @@ the IntelliJ plugin in `build.gradle.kts`.
 
 ### 5.6 The two CLI test tiers — one list, two directions
 
-`npm run test` is the gate: the whole CLI unit suite with `--coverage`, measured at 3.5 min on a quiet
-box and 9+ min on a busy one (213 s and 552 s on the same commit). The cost is not spread evenly —
-profiling shows **12 files carrying ~96% of the runtime** against a **~14 ms median file**, and every
-one of the 12 drives real `git` subprocesses or real filesystem/lock work. The tiers split on exactly
-that line:
+`npm run test` is the gate: the whole CLI unit suite with `--coverage`, **measured at 3.5 min on a
+quiet box and 9+ min on a busy one (213 s and 552 s on the same commit) — a dated figure, taken when
+the list held 12 files and the suite was smaller; nothing since has re-measured it, and the suite has
+grown.** The shape of the cost is what matters and that has not changed: profiling showed a handful of
+files carrying ~96% of the runtime against a **~14 ms median file**, and every one of them drives real
+`git` subprocesses or real filesystem/lock work. `SLOW_TEST_FILES` now holds **13**. The tiers split on
+exactly that line:
 
 | Script | Vitest invocation | Files | Coverage |
 |---|---|---|---|
 | `npm run test` (gate) | `vitest run --coverage` | all of them | yes, 97/96/97/97 |
-| `npm run test:fast` | `vitest run --mode fast --coverage --reporter=dot` | all **but** the 12 | yes, **same** thresholds |
-| `npm run test:slow` | `vitest run --mode slow --reporter=dot` | **only** the 12 | no |
+| `npm run test:fast` | `vitest run --mode fast --coverage --reporter=dot` | all **but** the 13 | yes, **same** thresholds |
+| `npm run test:slow` | `vitest run --mode slow --reporter=dot` | **only** the 13 | no |
 
 **One list drives both.** `SLOW_TEST_FILES` in `cli/vite.config.ts` is the single source of truth:
-`--mode fast` appends it to `test.exclude`, `--mode slow` uses it as `test.include`. Adding a 13th slow
+`--mode fast` appends it to `test.exclude`, `--mode slow` uses it as `test.include`. Adding a 14th slow
 file is one edit. (It used to be two — the same paths were also spelled out in the `test:slow` npm
 script, where a one-sided edit silently left a file in both tiers or in neither.) Entries are **exact
 repo-relative paths**, not brace globs, so a future same-named file elsewhere cannot be captured by
@@ -486,9 +498,19 @@ script does not work under Windows `cmd`.
 a passing suite into a failing run — measured at 92.44/90.43/92.25/92.53 with **exit 1 and zero test
 failures**, because `sync/`, `install/` and friends are still counted while nothing exercises them. A
 permanently-red inner loop trains you to ignore its exit code, so the config drops **both halves
-together**: the 12 test files and the 16 source files they are responsible for (`SLOW_ONLY_SOURCES`).
-The mapping is deliberately **not** one-to-one — one installer test file is the only meaningful cover
-for four separate hook-installer modules — which is why 12 test files map to 16 sources.
+together**: the 13 test files and the 16 source files they are responsible for (`SLOW_ONLY_SOURCES`).
+The mapping is deliberately **not** one-to-one, and it now runs in **both** directions — which is why
+13 test files map to 16 sources:
+
+- **One → many.** One installer test file is the only meaningful cover for four separate
+  hook-installer modules, so `install/Installer.test.ts` pulls `ClaudeHookInstaller.ts`,
+  `GeminiHookInstaller.ts`, `GitHookInstaller.ts` and `HookSettingsHelper.ts` into the exclusion list
+  alongside `Installer.ts`.
+- **One → none.** The 13th entry, `src/core/GitOps.stateRoot.realgit.test.ts`, contributes **no**
+  `SLOW_ONLY_SOURCES` entry: `src/core/GitOps.ts` is deliberately absent, because a mocked sibling
+  (`src/core/GitOps.test.ts`) still covers the module in fast mode. That is correct, not an oversight
+  — but it breaks the tempting "every slow test file contributes its source" reading, and it means
+  fast-mode headroom absorbed a new uncovered branch set rather than excluding it.
 
 Two rules about that pair: **maintain them together, re-deriving from measurement rather than
 inspection** (`cli/vite.config.ts`'s header documents the regenerating commands), and **the coverage
@@ -496,16 +518,31 @@ exclusion must never leave the `fast` branch** (§5.5). Headroom is thin on purp
 against a 96% floor — so if `test:fast` goes red on coverage alone, the read is "the lists need
 re-deriving", not "lower the threshold".
 
-> **⚠ The file counts in the repo's own prose are stale.** `AGENTS.md` and `cli/DEVELOPMENT.md` both
-> say "324 + 12 = 336", exact when the tiers landed. At `64f8bc6b` there are **340** CLI unit test
-> files, so the fast tier is **328**. The partition itself is still exact by construction — "everything
-> except the 12" versus "the 12" — so treat any absolute count in that prose as a measurement with a
-> date on it, and the 12-entry list as the real definition.
+> **⚠ The file counts in the repo's own prose are stale, and the two documents now disagree with each
+> other as well as with the tree.** `AGENTS.md` says "361 files … (356 unit + 5 acceptance)", "the 343
+> light CLI files", "the 13 slow test files", "(343 + 13 = 356)". `cli/DEVELOPMENT.md` was not updated
+> alongside it and still says "all 340 unit files", "the other 328 files", "328 + 12 = 340 at
+> `64f8bc6b`", "12 files account for 96.4%" and "measured at all 340 files". Measured at `93933725`:
+> **357** CLI unit test files, **344** in the fast tier, **13** in the slow tier, plus **5** acceptance
+> files — so `AGENTS.md` is one short on every unit figure and `cli/DEVELOPMENT.md` is a whole tier
+> revision behind. Re-derive rather than trusting either:
+>
+> ```bash
+> cd cli
+> npx vitest list --filesOnly | grep -c 'test\.ts'               # 357 — unit suite
+> npx vitest list --filesOnly --mode fast | grep -c 'test\.ts'   # 344 — fast tier
+> npx vitest list --filesOnly --mode slow | grep -c 'test\.ts'   # 13  — slow tier
+> find src -name '*.test.ts' | wc -l                             # 357 — cross-check
+> ```
+>
+> The partition itself is still exact by construction — "everything except the 13" versus "the 13" —
+> so treat **any** absolute count in that prose (or in this box) as a measurement with a date on it,
+> and the 13-entry `SLOW_TEST_FILES` list as the real definition.
 
 ### 5.7 Real-`git` test isolation lives in one file, monorepo-wide
 
 About a dozen CLI test files spawn real `git` subprocesses on purpose (`sync/GitClient`,
-`sync/BootstrapMerge`, `install/GitExclude`, `core/{Locks,KBPathResolver,RepoProfile,BranchCommitLister}`,
+`sync/BootstrapMerge`, `install/GitExclude`, `core/{Locks,KBPathResolver,RepoProfile,BranchCommitLister,PushControl}`,
 …), the acceptance suite builds real bare repos and clones, and the vscode suite's bridge integration
 test runs a real `git commit`. **`test/gitEnv.ts` at the repo root** neutralizes the developer's git
 configuration for all of them, wired in as `setupFiles` by all three gating configs
@@ -525,6 +562,12 @@ config, so the two `GIT_CONFIG_*` vars do not cover it. A `.jolli/` line there m
 silently skip seeded `.jolli/…` fixtures, and conflict tests then resolve local-wins instead of
 remote-wins.
 
+**"Real-`git` file" and "slow-tier file" are no longer the same set.** `core/PushControl` — added to
+the list above by both `AGENTS.md` and `cli/DEVELOPMENT.md` — is **not** in `SLOW_TEST_FILES`, so
+`src/core/PushControl.test.ts` drives real `git` while running in the **fast** tier. Two things follow:
+`npm run test:slow` is not a way to run "all the git-touching tests", and a contention timeout (below)
+can surface in `test:fast` even though that tier was carved to move the expensive git work out of it.
+
 Two rules when touching it:
 
 - **Do not re-add a per-file isolation prologue.** The per-file copies had already drifted before this
@@ -537,7 +580,7 @@ Two rules when touching it:
   excludes-file neutralization.
 
 **Timeouts are a load signal, not a regression signal.** Triage by failure *shape*: a
-`Test timed out in NNNNms` in `sync/*`, `install/*` or `core/{Locks,KBPathResolver,BranchCommitLister}`
+`Test timed out in NNNNms` in `sync/*`, `install/*` or `core/{Locks,KBPathResolver,BranchCommitLister,PushControl}`
 is almost always CPU contention starving a real `git` subprocess — confirm by running that file alone
 with the stock timeout, where green is the proof. An assertion or thrown error is worth investigating.
 An unhandled rejection naming a `coverage/.tmp/coverage-N.json` path is infrastructure, not a result.
@@ -665,6 +708,10 @@ The rules in practice:
 - Legacy offenders are frozen in the baselines and carry `@Isolated`. When you migrate one, drop the
   annotation and regenerate the baseline via the script's `regen` mode
   (`bash intellij/scripts/check-global-state.sh regen`).
+- **The ratchet has actually shrunk** — this is not a theoretical mechanism.
+  `test-mutations-baseline.txt` lost `core/references/TranscriptReferenceDiscoveryTest.kt` between
+  `64f8bc6b` and `93933725` and now carries **5** entries (all under `services/`).
+  `main-globals-baseline.txt` is unchanged at **17**.
 - The script sets `export LC_ALL=C` because `comm(1)` needs both inputs sorted under identical
   collation rules — baselines written under one locale misalign under another.
 
@@ -751,7 +798,23 @@ third-party HTTP library, or by talking to a different vendor's host. It also sa
 | `.github/workflows/scorecard.yaml` | scheduled | OSSF scorecard |
 | `.github/workflows/publish-cli.yaml` | manual, with an existing signed tag | npm publish `@jolli.ai/cli` (tag prefix `release-cli-v`) |
 | `.github/workflows/publish-vscode.yaml` | manual, with an existing signed tag | VS Code Marketplace + Open VSX (tag prefix `release-vscode-v`); idempotent per-marketplace on retry |
-| `.github/workflows/publish-intellij.yaml` | manual | JetBrains Marketplace |
+| `.github/workflows/publish-intellij.yaml` | manual, **no tag input** | JetBrains Marketplace — publishes whatever `version` sits in `intellij/build.gradle.kts` on the branch you pick |
 
 There is no `build-cli.yaml` — the CLI is gated by `build-vscode.yaml`'s `npm run all`, which covers
 both npm workspaces despite the workflow's filename.
+
+Two asymmetries in this table are load-bearing, and `RELEASE.md` is the authority on both:
+
+- **The `claude-plugin/` deliverable has no publish workflow at all.** It is built and gated by the
+  normal `npm run all` chain (§5.1), but shipping it means running the bash scripts in
+  `claude-plugin/scripts/` (`publish-local.sh`, `publish-dev.sh`, `publish-prod.sh`, `publish-zip.sh`
+  over a shared `_publish-lib.sh`), which build the bundle, assert it is complete, and mirror it into
+  a **separate marketplace repo**. Nothing in `.github/workflows/` touches it.
+- **`publish-intellij.yaml` is the legacy publisher and is gated far more weakly than the other two.**
+  `publish-cli.yaml` and `publish-vscode.yaml` both declare `environment: Production` (a manual
+  approval gate), both take an existing sigstore-signed tag as input, and both pre-check whether the
+  version is already published. The IntelliJ workflow has **none** of the three: no environment gate,
+  no tag input, no already-published pre-check — `workflow_dispatch` with only a `dry_run` boolean,
+  publishing the `version` in `build.gradle.kts` on the selected ref. JetBrains Marketplace versions
+  are immutable, so re-running with an already-published version fails at `publishPlugin`. Migrating
+  it onto the other two's model is explicitly out of scope in `RELEASE.md`.

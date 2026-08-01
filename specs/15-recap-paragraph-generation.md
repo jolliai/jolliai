@@ -29,7 +29,7 @@ Produce a single short narrative — one to a few flowing-prose paragraphs — t
 3. **Standalone regeneration** — produced by a dedicated single-output LLM call whose only purpose is to (re)write the recap for an already-summarized commit. Invoked on demand from the UI; uses no diff input, only the existing topics + commit message.
 
 ### Storage location
-The recap is a top-level optional string field on the persisted commit summary, alongside topics and ticket id. It is one of the eight Hoist-managed fields (the other seven are documentation-article identity, orphaned-doc-ids, plans, notes, E2E scenarios, topics). Squash and amend roots carry the consolidated recap on the root; children are stripped.
+The recap is a top-level optional string field on the persisted commit summary, alongside topics and ticket id. It is a Hoist-managed field, alongside documentation-article identity, orphaned-doc-ids, unresolved-orphan-hashes, plans, notes, references, E2E scenarios, and topics. Squash and amend roots carry the consolidated recap on the root; children are stripped.
 
 ### Standalone-regeneration input
 A single object passed to the LLM call:
@@ -140,6 +140,6 @@ None at the recap level itself. The recap is produced as part of summarization o
 
 ## Shared Behavior
 - The recap content rules and the anti-pattern block are shared verbatim across all three production templates; modifications must update the single shared block.
-- The recap is one of the eight Hoist-managed fields; squash and amend pipelines move the recap to the new root and strip it from children. See "Squash Consolidation Summary" and the amend specs.
+- The recap is a Hoist-managed field; squash and amend pipelines move the recap to the new root and strip it from children. See "Squash Consolidation Summary" and the amend specs.
 - Persisting the recap into the summary file follows the parallel-ref atomic-write contract described in "Orphan Branch Summary Storage".
 - The two sites that emit recaps together with topics share the strict-retry path on format-compliance failures; see "Multi-Topic Commit Summary Generation" and "Squash Consolidation Summary".

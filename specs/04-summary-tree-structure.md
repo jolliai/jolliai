@@ -11,7 +11,8 @@ Define the in-memory hierarchical commit-summary tree, its per-node fields, the 
 - The shape of an embedded LLM-call metadata record and a diff-stats record.
 - The shape of an embedded per-model conversation-usage record, an estimated-cost field, and a price-table verification-date field.
 - The version-based discriminator that selects between the legacy regime (referred to as v3) and the unified-hoist regime (referred to as v4 onward).
-- Pure traversal helpers: collecting all topics in chronological order, aggregating diff statistics, summing conversation turns, summing conversation tokens (scalar and per-segment breakdown), merging per-model conversation usage across the tree, summing estimated cost across the tree, counting topics, collecting leaf-descendant source nodes, collecting transcript hashes, computing duration spans, collecting display-topics under each regime, collecting and deduplicating plans, updating one topic at a global tree-index, deleting one topic at a global tree-index.
+- The shape of an embedded skill commit reference, and the fact that it was added purely additively (no version bump, no migration).
+- Pure traversal helpers: collecting all topics in chronological order, aggregating diff statistics, summing conversation turns, summing conversation tokens (scalar and per-segment breakdown), merging per-model conversation usage across the tree, summing estimated cost across the tree, counting topics, collecting leaf-descendant source nodes, collecting transcript hashes, computing duration spans, collecting display-topics under each regime, collecting and deduplicating plans, collecting and **accumulating** skills, updating one topic at a global tree-index, deleting one topic at a global tree-index.
 - The leaf-vs-container rule used by the canonical diff-stats helper.
 - The read-time provider-attribution string derived by walking the tree's call-metadata records (what it returns; where the resulting string is rendered is a presentation concern owned elsewhere).
 - The lightweight summary-index entry shape and the parent-pointer convention.
@@ -76,6 +77,7 @@ Optional cross-storage / push fields:
 - `e2eTestGuide`: array of E2E test scenarios (defined below).
 - `plans`: array of plan references (defined below).
 - `notes`: array of note references (defined below).
+- `skills`: array of skill commit references — the Agent Skills that ran during the work leading to this commit. **Purely additive: no schema-version bump and no migration**, matching how `excludedContext` / `contextRelevance` shipped (`transcripts` is the counter-example — it needed a migration because it changed structural semantics, not because it was new). The array is metadata about *how* the work happened rather than substance of it: like references it carries a track-only contract, so it is archived and displayed but never fed to the summarizer and never entered into the relevance ranker's input. The record's own shape, and the working-area row each entry is frozen from, are owned by spec 322 (archival) and spec 319 (the working record).
 
 Optional back-fill classification fields (present only on summaries produced by the historical back-fill flow, not the live post-commit pipeline):
 - `backfilled`: boolean flag marking the summary as back-fill-produced. Absent on live-pipeline summaries.
@@ -347,6 +349,39 @@ Returns true when `children` is missing or empty.
 2. For each visited node's `plans` array (if present), insert each plan into a map keyed by `slug`. On collision, keep whichever entry has the larger `updatedAt` string (lexicographic ISO-8601 comparison).
 3. Return the map's values.
 
+### Collect child skills (`collectChildSkills`)
+1. Walk the given nodes and all their descendants in stored order, concatenating every node's `skills` array into one flat list.
+2. Fold that list through the shared skill accumulation (`mergeSkillRefs`, below) and return the result.
+
+**This collector ACCUMULATES rather than deduplicates, and that is the difference from every sibling collector here.** A plan or a reference ref is a snapshot of one artifact, so the plan collector keeps the newest and the reference collector dedupes outright. A skill ref is a single commit's **increment** — a skill's registry row keeps growing across sessions, and each commit freezes only the part no earlier commit claimed — so collapsing three commits that each entered the same skill once must report three invocations, not one. Without this collector a squash root would inherit none of its sources' skill usage and the record would be lost with the children.
+
+The same fold serves the PR-wide aggregate, so the two cannot disagree about what "the same skill across several commits" totals to.
+
+### Accumulate skill refs (`mergeSkillRefs`) and the pairwise fold (`mergeSkillRef`)
+
+`mergeSkillRefs` takes a flat list of skill refs and returns one row per skill, in insertion order, in two phases:
+
+1. **Deduplicate by archive key first.** A skill ref's archive key is unique per (skill, archiving commit), so the same value appearing twice is one archived record reached twice — which a squash tree does routinely, because a squash root carries its children's hoisted refs *and* keeps those children, so a recursive walk meets each hoisted ref from both ends. Accumulating blindly inflated every count by one generation per squash. Distinct archive keys **are** distinct commits' increments and must still sum.
+2. **Then accumulate**, keyed on the working-area identity `<source>:<skill>` (not the archive key, which carries a per-commit hash), folding pairwise.
+
+The pairwise fold's rules:
+
+| Field | Rule |
+| --- | --- |
+| invocation count | Summed. |
+| usage (the three token segments) | Summed when both sides have one; otherwise whichever side has one is taken as-is. |
+| usage confidence | Degrades to `estimated` if **either** side is — a sum containing a guess is a guess. |
+| detection | Degrades to `heuristic` if **either** side is — one inferred contributor makes "some inferred" true of the total. |
+| per-session usage split | Merged per key (the same session can span commits, so one key legitimately appears in two refs and its shares sum), but **dropped entirely** unless *every* usage-bearing contributor brought one. |
+| archive key | Taken from the ref folded **first**, not from the earliest commit. |
+
+Two of those deserve their reason stated:
+
+- **The per-session split is all-or-nothing on purpose.** Summing the totals while keeping only one side's split would be a silent under-report waiting for a detach, because the detach correction re-derives the total *from the surviving split* rather than subtracting from the total (306) — so detaching any one session would throw away the whole contribution of every ref whose split was missing. Dropping the split instead leaves the merged total stale on a detach, which that correction already handles explicitly (its forward-only guard returns a split-less ref untouched), and which is the honest degradation of the two. A ref that reports no usage at all is not a contributor and does not have to account for one: the merged total *is* the other side's total, which that side's split still decomposes exactly.
+- **The archive key comes from the first ref folded.** Both walks that reach this fold — the amend/squash re-association and the squash hoist — iterate their source summaries newest-first, so in practice the newest contributor's key survives. Either way it addresses a file that really is on the parallel ref, which is the property that matters; the other contributors' archived files stay there unreferenced, the same trade-off the plan collector already makes. Inventing a synthetic key would be worse — it would address nothing.
+
+The hoist paths that consume this collector are owned elsewhere: the legacy-to-unified normalization hoists a tree's skills onto the root it produces, and the N-to-1 consolidation takes an additional set of freshly-archived refs and folds them through this same accumulation alongside the collected child refs (see specs 06 and 13). Both emit the field only when the result is non-empty.
+
 ### Date helpers (used by display code, not by the tree primitives)
 - A canonical "display date" helper returns `entry.generatedAt || entry.commitDate` (using a falsy-OR fallback so an empty `generatedAt` falls through; documented as intentional given some legacy data persists `generatedAt` as an empty string).
 - Date-formatting helpers exist in two flavors: short (e.g. `Apr 5, 2026`) and full (e.g. `February 27, 2026 at 7:49 PM`). Both wrap the underlying date construction in a try/catch that returns the input string unchanged on error. The catch arms are marked unreachable in coverage tooling because the underlying APIs return `Invalid Date` instead of throwing. (Notable.)
@@ -372,6 +407,10 @@ There is no in-tree transition between regimes; each persisted summary fixes its
 - **`collectAllTranscriptHashes` walks ALL nodes** including the root and intermediate containers, not just leaves. A transcript file is keyed by every original commit hash that was touched by the work, regardless of whether that commit is now an intermediate container. (Notable.)
 - **`computeDurationDays` returns 1 for single-source trees.** Even if the lone source node spans multiple days conceptually, the helper returns 1 because it only computes a set across **multiple** sources. (Notable.)
 - **Plan deduplication keeps the lexicographically-greater `updatedAt`.** This works correctly only because `updatedAt` is ISO-8601 (which is lexicographically-orderable). (Notable.)
+- **Skill collection ACCUMULATES where every other collector deduplicates.** A skill ref is one commit's increment, not a snapshot of an artifact, so three commits that each entered the same skill must total three invocations. This is the one place the accumulate-vs-dedupe distinction bites: the sibling reference collector can recurse safely only *because* it dedupes outright. (Surprising; intentional.)
+- **The archive-key deduplication inside that accumulation is not redundant with it — it is what makes it safe.** A squash root carries its children's hoisted skill refs and still keeps those children, so a recursive walk meets each hoisted ref from both ends. Deduplicating by archive key *before* accumulating collapses that double sighting; without it every count inflated by one generation per squash. Distinct archive keys are distinct commits' increments and still sum. (Surprising; load-bearing ordering.)
+- **A merged per-session usage split is all-or-nothing, and dropping it is the deliberate degradation.** Keeping one contributor's split beside a summed total would silently under-report the first time a conversation was detached, because the detach correction re-derives the total from the surviving split rather than subtracting from it (306). A dropped split leaves the merged total stale on detach instead — a case that correction already handles explicitly. (Surprising; intentional.)
+- **`skills` shipped without a schema-version bump.** Purely additive, like `excludedContext` and `contextRelevance`; readers that predate it simply do not see it. `transcripts` is the counter-example on this node and needed a migration because it changed structural semantics, not because it was new. (Notable.)
 - **Tree mutation helpers structurally share.** When neither the topic-target nor any descendant of a child is modified, the helper returns the original child (by reference) instead of a copy, allowing identity comparisons up the call stack. (Notable.)
 - **Out-of-range index returns `null`.** Both the update and delete helpers return null if the requested global index is past the end of the tree's topics. The recursion is total (always returns a `consumed` count), so a `null` only ever propagates from the very top. The intermediate-recursion `null` paths are marked unreachable in coverage tooling. (Notable.)
 - **Tree-index addressing uses chronological order.** The `treeIndex` annotated on each topic by `collectSortedTopics` is assigned on the chronological list (the output of `collectDisplayTopics`, before sorting), so it matches the index used by `updateTopicInTree`/`deleteTopicInTree` regardless of presentation sort order. (Notable.)
@@ -393,4 +432,5 @@ There is no in-tree transition between regimes; each persisted summary fixes its
 - The persistence and read paths for nodes and the lightweight index document are defined by **Orphan Branch Summary Storage**, **Folder-Based Summary Storage**, and **Dual-Write Summary Storage**.
 - The `conversationTokens` / `conversationTokenBreakdown` fields are extracted and priced (Sonnet-only) by **Token Usage Extraction and Cost Estimation** and attributed per commit by **Commit-Pipeline Conversation Token Attribution**; the aggregation helpers here are the tree-walk those surfaces call. The `backfill*` fields are derived by the back-fill specs.
 - The `conversationModels` / `estimatedCostUsd` / `pricesAsOf` fields are attributed per commit by **Commit-Pipeline Conversation Token Attribution** (the write-time helper that decides which of them to stamp) and priced against the per-model table by **Multi-Provider Pricing and Cost Estimation**; the merge-per-model and cost-sum helpers here are the tree-walk the VS Code sidebar's branch token bar calls to build its primary, model-aware figure.
-- The post-write correction of the whole usage/cost group — how the owning node is identified across the tree, why ambiguous ownership corrects nothing, and how the cost is re-derived — is defined by **Conversation Detach Usage Correction** (306). That rule turns on the per-node transcript-id list owned by **V5 UUID Identity and Migration** (185), whose meaning differs between a leaf and a consolidated root; the tree walk it performs is a post-order over the `children` structure defined here.
+- The `skills` array's own record shape, the working-area row it is frozen from, the archival step that produces it, and the per-skill token attribution it carries are defined by specs 319, 321 and 322; the aggregate rendering that reads it is spec 323. This spec owns only the field's presence on the node and the accumulation walk over it.
+- The post-write correction of the whole usage/cost group — how the owning node is identified across the tree, why ambiguous ownership corrects nothing, and how the cost is re-derived — is defined by **Conversation Detach Usage Correction** (306). That spec also owns the separate, per-node correction applied to each skill ref's per-session usage split. That rule turns on the per-node transcript-id list owned by **V5 UUID Identity and Migration** (185), whose meaning differs between a leaf and a consolidated root; the tree walk it performs is a post-order over the `children` structure defined here.

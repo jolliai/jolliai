@@ -8,12 +8,15 @@ This topic previously described an **in-process model seam** owned by the IDE pl
 
 An earlier framing of this same topic — the IDE driving the knowledge-wiki ingest with a direct-vendor key, rendering route and reconcile prompts locally, and resolving plan/note source identifiers — had already stopped being live behavior before this. Its **source** outlived the behavior, and is now gone too: the local route and reconcile prompt templates, the route-plan response parser, the compiled-topic-page parser, and the reconciled-page assembler were all deleted in the same sweep. Each was already unreachable — nothing outside that cluster called any of them — so removing them changed source, not behavior. The IDE runs no ingest; wiki ingest is owned by the command-line surface and triggered from the IDE only as a delegated build.
 
+The same is now true one step further downstream: the plugin's own **visible-wiki markdown renderer** — the Kotlin builder that turned a compiled topic into the browsable wiki page — was likewise already unreachable and has now been deleted, together with its test. The source finally caught up with the behavior here too; no live behavior changed, because nothing on this surface had called it since the ingest moved. The renderer that actually produces wiki markdown is the command-line surface's (spec 158), which is untouched by this and still live.
+
 ## Scope
 
 **In scope:**
 - Recording that the in-process model seam and everything it comprised — credential-source selection with its preference override and fallback order, the direct-mode prompt guard, the direct-vendor HTTP call with its streaming threshold and per-mode timeouts, streamed-event accumulation with its mid-stream-error and missing-terminal-event rejections, the model alias resolver, and the platform-proxy leg — has been removed from the plugin.
 - Recording that the generators that shared that seam (multi-topic summary, commit message, squash message, squash consolidation) and the recap / end-to-end-test / translate prompt builders and parsers were removed with it, and that all four generators were already unreachable when they were removed.
 - Recording that the ingest-era leftovers this topic's earliest framing described — the local route and reconcile prompt templates, the route-plan parser, the compiled-topic-page parser, and the reconciled-page assembler — were deleted in the same sweep, and were also already unreachable.
+- Recording that the plugin's own visible-wiki markdown renderer was deleted for the same reason (already unreachable), and that the command-line surface's renderer (spec 158) is unaffected and remains the live one.
 - The supersession relationship: the three summary-viewer actions that used this seam — generate an end-to-end test guide, regenerate the quick recap, and translate a document to English — now spawn the command-line surface's generation subcommand and use its three corresponding actions.
 - Recording that a build gate now scans production sources on this surface and fails the build if a direct model-vendor call is reintroduced.
 

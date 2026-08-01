@@ -22,15 +22,16 @@ A multi-line report written to stdout. Lines are aligned with two-space leading 
 6. **Jolli Account** — `Signed in` or `Not signed in`.
 7. **Jolli API Key** — `Configured` or `Not configured`.
 8. **Jolli Space** — the repo's Space-binding state, printed unconditionally (even "not connected" / "unknown"). See "The Jolli Space: row" below.
-9. **AI Provider** — the provider the *next* commit would actually generate with, printed unconditionally. See "The AI Provider: row" below.
-10. **Anthropic Key** — `Configured` or `Not configured` (the env variable counts). Printed **only** when the configured provider is explicitly the Anthropic one; omitted for every other provider and when no provider is set. See "The AI Provider: row" below for why the two rows are coupled.
-11. **Sessions** — total active session count across all AI agents.
-12. **Per-agent breakdown** — one row per AI agent that was *detected* on this machine (see state model below). Undetected agents are omitted entirely to keep the output terse. The list is, in order: Claude, Codex, Gemini, OpenCode, Cursor, Devin, Copilot, Cline, Antigravity. Undetected agents are omitted.
-13. **Merged-row sub-lines** — three rows are each a merged dual-variant row that, when detected, renders an additional indented sub-line beneath itself showing whether its two variants are each present (`✓`/`✗`): Cursor (`↳ IDE: …, CLI: …`), Copilot (`↳ CLI: …, Chat: …`), and Cline (`↳ CLI: …, VS Code: …`). If a variant's scan failed, a further indented line reports that variant's failure kind and message without masking the other variant's working count.
-14. **Stored memories** — count of summaries on the orphan branch.
-15. **Memory Bank** — where folder-layer memory writes will actually land, or the blocker stopping them, printed unconditionally. The row prints only the *text* of the shared Memory-Bank display record; the record's severity is discarded here, so this row carries no icon and no colour. The state model, the three arms, and every string verbatim are owned by spec 300 — this spec adds only the row's position and unconditionality.
-16. **Jolli Site** / **Last signed-in site** — the host portion of the **persisted Jolli site URL** (with `http://` / `https://` scheme stripped), printed only when that URL is stored at all. The label is switched by whether an on-disk credential (an on-disk OAuth token or a Jolli API key) backs it: `Jolli Site:` when one does, `Last signed-in site:` when none does. The URL is **not** derived from the stored Jolli API key.
-17. **Orphan branch** — the orphan-branch name used for summary storage.
+9. **Outbound push** — printed **only** when outbound push is off for this repo; absent otherwise. See "The Outbound push: row" below.
+10. **AI Provider** — the provider the *next* commit would actually generate with, printed unconditionally. See "The AI Provider: row" below.
+11. **Anthropic Key** — `Configured` or `Not configured` (the env variable counts). Printed **only** when the configured provider is explicitly the Anthropic one; omitted for every other provider and when no provider is set. See "The AI Provider: row" below for why the two rows are coupled.
+12. **Sessions** — total active session count across all AI agents.
+13. **Per-agent breakdown** — one row per AI agent that was *detected* on this machine (see state model below). Undetected agents are omitted entirely to keep the output terse. The list is, in order: Claude, Codex, Gemini, OpenCode, Cursor, Devin, Copilot, Cline, Antigravity. Undetected agents are omitted.
+14. **Merged-row sub-lines** — three rows are each a merged dual-variant row that, when detected, renders an additional indented sub-line beneath itself showing whether its two variants are each present (`✓`/`✗`): Cursor (`↳ IDE: …, CLI: …`), Copilot (`↳ CLI: …, Chat: …`), and Cline (`↳ CLI: …, VS Code: …`). If a variant's scan failed, a further indented line reports that variant's failure kind and message without masking the other variant's working count.
+15. **Stored memories** — count of summaries on the orphan branch.
+16. **Memory Bank** — where folder-layer memory writes will actually land, or the blocker stopping them, printed unconditionally. The row prints only the *text* of the shared Memory-Bank display record; the record's severity is discarded here, so this row carries no icon and no colour. The state model, the three arms, and every string verbatim are owned by spec 300 — this spec adds only the row's position and unconditionality.
+17. **Jolli Site** / **Last signed-in site** — the host portion of the **persisted Jolli site URL** (with `http://` / `https://` scheme stripped), printed only when that URL is stored at all. The label is switched by whether an on-disk credential (an on-disk OAuth token or a Jolli API key) backs it: `Jolli Site:` when one does, `Last signed-in site:` when none does. The URL is **not** derived from the stored Jolli API key.
+18. **Orphan branch** — the orphan-branch name used for summary storage.
 
 ### Machine-readable format (`--json`)
 
@@ -114,12 +115,28 @@ Rendered values:
 | Bound, read-only (`canPush` false) | `Bound to Space "<name>" — read-only (memories won't sync; <fix>)` |
 | Unbound, ≥1 bindable Space | `Not bound — <n> Space(s) available (run jolli to bind)` |
 | Unbound, no Spaces | `Not bound — no Spaces available to you` |
+| Unbound, no Spaces, **allowlist-restricted** | `Not bound — this repo isn't registered in any Space (ask an administrator to add it)` |
 | No key configured | `Not connected — run jolli auth login` |
 | Key rejected by server | `Not connected — key rejected (run jolli auth login)` |
 | Client too old | `Unknown — client outdated, update the CLI` |
 | Server unreachable | `Unknown — Jolli not reachable (offline?)` |
 
 `<fix>` is `run jolli to rebind` when the server attached a non-empty bindable pool, else `ask for access`. `canPush: null` renders as healthy.
+
+The last two rows split the same server answer on one flag. The **restricted** wording is reserved for the server's genuine no-spaces answer carrying the allowlist flag — the same admin-action-required condition the push path reports when it refuses a repo that is not registered — so it points at an administrator rather than at creating a Space. An `unbound` answer that arrived with an *empty* list is contract drift (the server is supposed to answer no-spaces in that case); it is folded into the no-spaces arm with the flag forced off, so a folded-in answer can never claim to be allowlist-restricted and can never point the user at a bind offering zero choices.
+
+### The Outbound push: row (conditional)
+
+A row printed **only when outbound push is off for this repo** (spec 310) — a repo that is syncing normally prints nothing here. Suppressing the row in the healthy case is the point: a silently non-syncing repo is exactly what the setting has to make visible, and a row that is always present would be read past.
+
+Two distinct wordings, for two conditions that must not be conflated:
+
+| Condition | Rendered value |
+| ----- | --------------- |
+| The user turned push off for this repo | `Outbound push:    Disabled for this repo (memory recorded locally)` |
+| The push-control store could not be read (fail-closed) | `Outbound push:    Blocked — setting unreadable (<error>)` |
+
+The split is deliberate and the reasoning is worth keeping: attributing a fail-closed read of a corrupt store to the user is wrong twice over — they chose nothing, and the condition is not per-repo at all — and it hides the one file that would fix it, which is why the second wording names the read failure instead. The row prints immediately after the `Jolli Space:` row and before `AI Provider:`. The store, the gate, and the control surfaces behind it are owned by spec 310.
 
 ### The AI Provider: row
 
@@ -166,6 +183,7 @@ The project directory is auto-resolved to the enclosing git repository root when
 - **The `--json` payload is unfiltered**: it includes fields that the human-readable view never shows (e.g. the per-source session breakdown raw counts, scan-error objects). The VS Code extension reads it directly and renders its own panel.
 - **The Space-binding cache is shared with the guided front door**: a binding confirmed via bare `jolli` or a push renders `status`'s row with no network call, and vice versa; only a degraded state is never cached.
 - **`--json` mode makes no Space-binding call at all** — the JSON payload has no Space-binding field, so there is nothing to resolve or cache in that mode.
+- **`--json` mode also emits no onboarding-funnel snapshot.** The human-readable path emits an `onboarding_progressed` snapshot (spec 312) from the status object it has already computed, so the periodic funnel signal for an active user costs no extra work. But the emit sits *after* the `--json` early return, so the machine-readable mode — the one the editor surfaces call — is silent. This is the same shape as the Space-binding omission above: `--json` is not "the human report plus JSON", it is a separate, earlier exit that skips everything downstream of the snapshot. Those surfaces emit the snapshot themselves from their own status refresh, so the funnel is not blind there; it is simply not this command that reports it. (Notable.)
 
 ## Shared Behavior
 
@@ -174,4 +192,6 @@ The project directory is auto-resolved to the enclosing git repository root when
 - The per-agent state strings here intentionally match the labels used by the VS Code extension's sidebar STATUS tree (295) so users see the same wording in both surfaces. The merged-row masking rule is likewise identical across the three surfaces that render it: this command, that tree, and the MCP `status` tool (148).
 - The `Memory Bank:` row's state model, its three arms, the shared wording table with every string verbatim, its three severity levels (of which this surface uses none), and the identical required field in the `--json` snapshot are all owned by spec 300. This spec owns only the row's position in the report and the fact that it is unconditional. The same table also drives the desktop editor's Memory Bank settings line, which is why the two surfaces cannot disagree about whether folder writes are landing.
 - The credential-precedence resolution behind the `AI Provider:` row is the same resolution the LLM dispatcher applies per call (spec 10), and the same one the doctor's Config probe reports (spec 59) — the three surfaces share it so none of them can name a provider the others would not.
+- The per-repo outbound-push opt-out behind the `Outbound push:` row — its store, its fail-closed read, its gate, and the other surfaces that control it — is owned by spec 310. This spec owns only the row's two wordings, its position, and its conditionality.
+- The onboarding-funnel snapshot this command emits — its state tuple, dedup ledger, heartbeat, and consent gate — is owned by spec 312. This spec owns only that the human-readable path emits it from the already-computed status, and that `--json` returns before it.
 - The MCP `status` tool reports the same per-agent rows in structured form. Because its flat per-integration descriptor carries the merged reading, a single-channel failure — which this command shows as a sub-line — travels there in a separate per-channel scan-error list; see 148.
