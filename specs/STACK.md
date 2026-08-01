@@ -2,7 +2,8 @@
 
 Operational reference for an agent about to change this repo: what the deliverables are, how to
 iterate on each, and the exact gate a change must pass. Every value here was read out of a manifest
-in this tree — not inferred. Recorded at `93933725`.
+in this tree — not inferred. Recorded at `93933725`; sandbox launcher pipeline (§4.5) refreshed at
+`be2f67ab`.
 
 This is **not** a behavioral spec. Command names, file paths, and version numbers are the point.
 
@@ -182,26 +183,25 @@ inlines `cli/src/**` at bundle time, so a stale `cli/` means a stale extension.
 
 ```bash
 npm run intellij:sandbox                            # from repo root
-npm run intellij:sandbox -- --sync-hooks
 ```
 
 This is the **one root script that reaches into `intellij/`** — §1's "no root script touches it" governs
 the build/lint/test stages, not this launcher. It is a thin cross-platform wrapper
 (`intellij/scripts/run-sandbox.mjs`); every step logs with an `[intellij:sandbox]` prefix and any
-failure exits 1.
+failure exits 1. The launcher takes no flags other than `--help` / `-h` — every step below runs
+unconditionally.
 
-Five steps, and **`--sync-hooks` is the only flag** — there is no `--clean`:
+| Step | What it does |
+|---|---|
+| npm deps | `npm install`, but **only if** root `node_modules/` is missing |
+| build | root `npm run build` (CLI + Claude plugin + VS Code extension); fails if `vscode/dist/Cli.js` is absent afterwards. Unconditional because Gradle's `prepareSandbox` copies `vscode/dist/*.js` into the sandbox plugin's `cli-dist/`, so any `cli/src/**` or `vscode/src/**` change must reach `vscode/dist/` before launch or the sandbox runs stale code. Incremental esbuild/vite is ~2 s, so it always rebuilds rather than staleness-detecting |
+| sandbox cache clean | removes `config/`, `system/`, `log/` under `intellij/build/idea-sandbox/<ide>/` so every launch starts from a fresh sandbox IDE. The script's own header flags the cost: this discards manually-installed sandbox plugins, keybindings, window layout, and the project index, so first-launch indexing runs every time |
+| hook sync | copies `vscode/dist/*.js` (**except `Extension.js`**) into `~/.jolli/jollimemory/dist-intellij/`, failing if any required runtime file is absent afterwards. Unconditional because the plugin's `integrationsUpToDate()` gate is keyed on `.version == pluginVersion`, so on same-version relaunches it would skip `extractCliDist()` and keep running last launch's `Cli.js` — refreshing here decouples that from the version stamp |
+| force-register dist-paths | rewrites `~/.jolli/jollimemory/dist-paths/{cli,intellij}` to point at this repo's fresh build. Unconditional because a stale `dist-paths/cli` on the machine (from a global `@jolli.ai/cli` install, or an older sandbox run) can otherwise outrank this repo's build at equal version — `cli` wins the tie-break in `SOURCE_PREFERENCE_ORDER` |
+| launch | `./gradlew runIde` (`gradlew.bat runIde` on Windows) from `intellij/` |
 
-| Step | Default | What it does |
-|---|---|---|
-| 1. npm deps | always | `npm install`, but **only if** root `node_modules/` is missing |
-| 2. build | **always** | root `npm run build`, then asserts `vscode/dist/Cli.js` exists afterwards. Unconditional because Gradle's `prepareSandbox` copies `vscode/dist/*.js` into the sandbox plugin's `cli-dist/`, so any `cli/src/**` or `vscode/src/**` change must reach `vscode/dist/` before launch or the sandbox runs stale code. Incremental esbuild/vite is ~2 s, so it always rebuilds rather than staleness-detecting |
-| 3. sandbox cache clean | **always** | removes `config/`, `system/`, `log/` under `intellij/build/idea-sandbox/<ide>/` so every launch starts fresh. The script's own header flags the cost: this discards manually-installed sandbox plugins, keybindings, window layout, and the project index, so first-launch indexing runs every time |
-| 4. hook sync | **off** — `--sync-hooks` | copies `vscode/dist/*.js` (**except `Extension.js`**) into `~/.jolli/jollimemory/dist-intellij/`, failing if `PrePushWorker.js` is absent afterwards. Copy only — the build already happened in step 2. Off by default because that destination is a machine-global path shared with your other repos |
-| 5. launch | always | `./gradlew runIde` (`gradlew.bat runIde` on Windows) from `intellij/` |
-
-`--help` / `-h` prints the flag list. Gradle's own `~/.gradle/caches/` handles the SDK and Kotlin
-downloads, so the first launch is slow and later ones are not.
+Gradle's own `~/.gradle/caches/` handles the SDK and Kotlin downloads, so the first launch is slow and
+later ones are not.
 
 The underlying Gradle commands, if you would rather drive them directly:
 

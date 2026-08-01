@@ -403,6 +403,14 @@ vi.mock("../core/TelemetryConsent.js", () => ({
 	shouldShowTelemetryNotice: vi.fn().mockReturnValue(false),
 }));
 
+vi.mock("../core/localagent/DetectAgents.js", () => ({
+	isLocalAgentUsable: vi.fn(),
+	// The override return value is opaque to the bridge — `isLocalAgentUsable`
+	// is the only thing that reads it, and this file mocks that too. A plain
+	// stub keeps the tests decoupled from the real config shape.
+	localAgentOverrideFrom: vi.fn().mockReturnValue(undefined),
+}));
+
 vi.mock("./CliUtils.js", async (importActual) => {
 	// Only readStdin needs to be stubbed (test scaffolding pipes raw JSON via
 	// runIdeBridgeAction, not via stdin). Every other export — including the
@@ -930,6 +938,76 @@ describe("runIdeBridgeAction — local-agent-tools", () => {
 			loginHint: meta.loginHint,
 		}));
 		expect(result.tools).toEqual(expected);
+	});
+});
+
+describe("runIdeBridgeAction — local-agent-usable", () => {
+	beforeEach(async () => {
+		const { isLocalAgentUsable } = await import("../core/localagent/DetectAgents.js");
+		vi.mocked(isLocalAgentUsable).mockReset();
+	});
+
+	it("throws loudly on an unknown tool id (allow-list contract)", async () => {
+		await expect(runIdeBridgeAction("local-agent-usable", "/r", { tool: "not-a-tool" })).rejects.toThrow(
+			/Unknown local agent tool "not-a-tool"/,
+		);
+	});
+
+	it("rejects prototype-chain keys — hasOwnProperty guards the allow-list", async () => {
+		// Prototype-chain keys ("toString", "__proto__", "constructor") are
+		// truthy under naive `LOCAL_AGENT_TOOLS[tool]` indexing but must fail
+		// the allow-list. Regression guard for the L6 finding.
+		await expect(runIdeBridgeAction("local-agent-usable", "/r", { tool: "toString" })).rejects.toThrow(
+			/Unknown local agent tool "toString"/,
+		);
+	});
+
+	it("passes through `isLocalAgentUsable` and returns { available: true }", async () => {
+		const { isLocalAgentUsable } = await import("../core/localagent/DetectAgents.js");
+		vi.mocked(isLocalAgentUsable).mockResolvedValue(true);
+		const result = await runIdeBridgeAction("local-agent-usable", "/r", {
+			tool: "claude-code",
+		});
+		expect(result).toEqual({ available: true });
+		expect(vi.mocked(isLocalAgentUsable)).toHaveBeenCalledWith("claude-code", {
+			override: undefined,
+		});
+	});
+
+	it("forwards a foreign-tool override verbatim — filtering is isLocalAgentUsable's job", async () => {
+		// The bridge must NOT drop a mismatched override on the caller's behalf:
+		// the tool/path pairing check lives inside `isLocalAgentUsable`
+		// (`opts.override?.tool === tool`), so what the bridge forwards must be
+		// the untouched value `localAgentOverrideFrom` returned. Without this
+		// test the default mock (`localAgentOverrideFrom → undefined`) used by
+		// every other case in this file would make a mistaken drop-in-the-bridge
+		// invisible.
+		const detect = await import("../core/localagent/DetectAgents.js");
+		const foreignOverride = { tool: "codex" as const, path: "/opt/codex" };
+		vi.mocked(detect.localAgentOverrideFrom).mockReturnValueOnce(foreignOverride);
+		vi.mocked(detect.isLocalAgentUsable).mockResolvedValue(false);
+		const result = await runIdeBridgeAction("local-agent-usable", "/r", {
+			tool: "claude-code",
+		});
+		// Bridge answers with whatever `isLocalAgentUsable` returned; the
+		// mismatched override doesn't change that.
+		expect(result).toEqual({ available: false });
+		// Critical assertion: the bridge forwarded the override verbatim.
+		expect(vi.mocked(detect.isLocalAgentUsable)).toHaveBeenCalledWith("claude-code", {
+			override: foreignOverride,
+		});
+	});
+
+	it("swallows a discovery throw and answers { available: false }", async () => {
+		// UI contract: "unknown ≡ not usable". A crashing detector must never
+		// leak to the caller as an unhandled promise rejection — the settings
+		// dialog would show a red banner instead of a clean "not found" line.
+		const { isLocalAgentUsable } = await import("../core/localagent/DetectAgents.js");
+		vi.mocked(isLocalAgentUsable).mockRejectedValue(new Error("detector crashed"));
+		const result = await runIdeBridgeAction("local-agent-usable", "/r", {
+			tool: "codex",
+		});
+		expect(result).toEqual({ available: false });
 	});
 });
 

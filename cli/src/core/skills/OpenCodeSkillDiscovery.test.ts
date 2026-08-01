@@ -14,6 +14,24 @@ vi.mock("../OpenCodeSessionDiscoverer.js", () => ({
 	getOpenCodeDbPath: () => dbPathRef.current,
 }));
 
+/**
+ * Isolate the developer's real `~/.jolli/jollimemory/config.json` from the run.
+ * `discoverOpenCodeSkills` short-circuits when `config.openCodeEnabled === false`,
+ * so a developer who disabled OpenCode locally (a valid preference) would
+ * silently see every test in this file return 0 without any tooling clue —
+ * the failure surface looks identical to a bug in the SQL / matcher paths.
+ * Preserve every other export via `importOriginal` because the test itself
+ * calls `loadPlansRegistry` and the discovery under test calls
+ * `upsertSkillEntry`, both real, on top of `SessionTracker`.
+ */
+vi.mock("../SessionTracker.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../SessionTracker.js")>();
+	return {
+		...actual,
+		loadConfig: vi.fn().mockResolvedValue({}),
+	};
+});
+
 const { discoverOpenCodeSkills } = await import("./OpenCodeSkillDiscovery.js");
 
 /** Builds a DB with OpenCode's real table shapes for `session`, `part` and `message`. */

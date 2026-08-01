@@ -13,7 +13,7 @@ import { computeWatchTargets } from "../daemon/DaemonServer.js";
 import { DaemonWatcher } from "../daemon/DaemonWatcher.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { ConflictUi, Tier3Pick } from "../sync/ConflictResolver.js";
-import type { FileWrite, JolliMemoryConfig, TranscriptSource } from "../Types.js";
+import type { FileWrite, JolliMemoryConfig, LocalAgentToolId, TranscriptSource } from "../Types.js";
 import { TRANSCRIPT_SOURCES as ALL_TRANSCRIPT_SOURCES } from "../Types.js";
 import { IDE_BRIDGE_STDIN_MAX_BYTES, readStdin } from "./CliUtils.js";
 
@@ -1060,6 +1060,47 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 					loginHint: meta.loginHint,
 				})),
 			};
+		}
+		case "local-agent-usable": {
+			// IntelliJ mirror of the VS Code webview's `probeLocalAgent`
+			// (see `handleProbeLocalAgent` in `SettingsWebviewPanel.ts`, which imports
+			// `isLocalAgentUsable` in-process because VS Code bundles the CLI). Kotlin
+			// cannot import the TS core, so it asks the same question over the bridge.
+			//
+			// `tool` is untrusted input and is allow-listed against LOCAL_AGENT_TOOLS
+			// before it reaches `isLocalAgentUsable`. An unknown id is a bug in the
+			// caller, not a user-visible outcome, so it fails loudly rather than
+			// silently reporting unavailable. Uses `getOwnPropertyDescriptor` — a
+			// plain index-truthy check would leak prototype keys (`toString`,
+			// `__proto__`, `constructor`) through the allow-list, and biome rejects
+			// `hasOwnProperty.call` while `Object.hasOwn` only lands in ES2022 (this
+			// project targets ES2020). Same pattern PluginLoader.ts uses.
+			//
+			// Every other failure mode (config unreadable, discovery throws) is caught
+			// and answered as `available: false`, matching the VS Code sibling — the
+			// UI contract is "unknown ≡ not usable" so the user is never blocked on an
+			// unanswered probe, and never told a tool works when we could not verify.
+			const rawTool = stringField(request, "tool");
+			const { LOCAL_AGENT_TOOLS } = await import("../core/localagent/ToolMeta.js");
+			if (Object.getOwnPropertyDescriptor(LOCAL_AGENT_TOOLS, rawTool) === undefined) {
+				throw new Error(`Unknown local agent tool "${rawTool}".`);
+			}
+			const tool = rawTool as LocalAgentToolId;
+			let available = false;
+			try {
+				// Tool-scoped override: `localAgentPath` belongs to the CONFIGURED tool,
+				// so probing the dropdown's current pick must NOT borrow it. See
+				// `localAgentOverrideFrom` for why the pairing is required.
+				const tracker = await import("../core/SessionTracker.js");
+				const config = await tracker.loadConfigFromDir(tracker.getGlobalConfigDir());
+				const { isLocalAgentUsable, localAgentOverrideFrom } = await import(
+					"../core/localagent/DetectAgents.js"
+				);
+				available = await isLocalAgentUsable(tool, { override: localAgentOverrideFrom(config) });
+			} catch (err) {
+				log.error("IdeBridge", `local-agent-usable probe failed for ${tool}: ${String(err)}`);
+			}
+			return { available };
 		}
 		case "folder-heal-visible-markdown": {
 			// Regenerates missing `<branch>/<slug>.md` files from their canonical

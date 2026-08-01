@@ -26,6 +26,7 @@ import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.TextFieldWithBrowseButton
 import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.openapi.util.Disposer
+import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPasswordField
@@ -87,6 +88,63 @@ class SettingsDialog(
      * not the human label (`Codex`).
      */
     private var localAgentTools: List<LocalAgentToolOption> = LocalAgentTools.DEFAULT_TOOLS
+
+    /**
+     * Status line rendered under [localAgentToolCombo]. Mirrors the same line
+     * VS Code shows in its settings webview: empty while the selected tool
+     * probes clean, "Checking…" while a probe is in flight, and a red
+     * "<Tool> not found on this machine. Install it, or pick another tool."
+     * when the CLI's `local-agent-usable` bridge action reports the pick
+     * cannot run. Kept a JBLabel (not an inline error) so the layout height
+     * stays stable across states — a single space keeps a line's worth of
+     * vertical room reserved on first render.
+     */
+    private val localAgentStatusLabel = JBLabel(" ").apply {
+        alignmentX = JComponent.LEFT_ALIGNMENT
+    }
+
+    /**
+     * ID of the tool the most recent probe was fired for. The probe reply is
+     * discarded when this no longer matches — e.g. the user switched from
+     * Codex to Cursor before Codex's probe returned; without this guard the
+     * stale Codex verdict would overwrite the fresh Cursor "Checking…" line.
+     */
+    private var localAgentProbeTool: String? = null
+
+    /**
+     * Tri-state verdict: null = no evidence either way (initial state, probe in
+     * flight, OR probe landed on a permissively-unknown outcome — see the
+     * unknown-action / unknown-tool branches in [probeLocalAgentUsableAsync]);
+     * false = the last probe confirmed unavailable; true = confirmed usable.
+     *
+     * Both [doValidate] and [doOKAction] gate strictly on `== false`, so `null`
+     * is deliberately permissive at both chokepoints. This is the "we couldn't
+     * verify, don't block the user" contract — matches VS Code's `updateApplyBtn`
+     * where `localAgentBlocks()` is false while the probe result is null.
+     *
+     * "In flight" vs "landed as null" is distinguished by [localAgentProbeInFlight]
+     * — [awaitLocalAgentProbe] short-circuits when the latter is false so an
+     * unknown verdict can't leave the user stuck in an 8 s modal.
+     *
+     * @Volatile because [awaitLocalAgentProbe]'s modal-progress task polls this
+     * from a pooled thread while the probe's `invokeLater` writes it on the EDT.
+     * Volatile gives us cross-thread visibility without wrapping in an atomic.
+     */
+    @Volatile
+    private var localAgentAvailable: Boolean? = null
+
+    /**
+     * True from the moment [probeLocalAgentUsableAsync] hands work to the pool
+     * thread until its `invokeLater` reply lands (regardless of outcome). Lets
+     * [awaitLocalAgentProbe] tell "probe is genuinely running, worth waiting
+     * up to 8 s" apart from "no probe fired (early return) or already resolved"
+     * — both of the latter leave [localAgentAvailable] null, so waiting on
+     * that alone can't distinguish them.
+     *
+     * @Volatile for the same reason as [localAgentAvailable].
+     */
+    @Volatile
+    private var localAgentProbeInFlight: Boolean = false
     private val modelCombo = ComboBox(DefaultComboBoxModel(arrayOf(
         "haiku — fastest, cheapest",
         "sonnet — balanced (default)",
@@ -377,6 +435,10 @@ class SettingsDialog(
         // LOCAL_AGENT_TOOLS map via `refreshLocalAgentToolCombo`, so new backends
         // added to that map appear here automatically). Uses the tool's own
         // subscription sign-in, so no API key is collected here — mirrors the VS Code card.
+        //
+        // [localAgentStatusLabel] sits directly under the combo and carries the
+        // same "not found on this machine" line the VS Code webview shows when
+        // the selected tool cannot run.
         val localAgentContent = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             alignmentX = JComponent.LEFT_ALIGNMENT
@@ -385,6 +447,8 @@ class SettingsDialog(
                 .addLabeledComponent(JBLabel("Agent tool:"), localAgentToolCombo, 1, false)
                 .addTooltip("Uses your local agent's own login (subscription). Sign in with the corresponding CLI if prompted.")
                 .panel))
+            add(Box.createVerticalStrut(4))
+            add(localAgentStatusLabel)
         }
 
         anthropicCardPanel.add(anthropicContent, CARD_ANTHROPIC)
@@ -399,7 +463,27 @@ class SettingsDialog(
         panel.add(advancedLink)
         panel.add(advancedPanel)
 
-        providerCombo.addItemListener { syncProviderCard() }
+        providerCombo.addItemListener {
+            syncProviderCard()
+            // Switching TO local-agent must re-verify the current pick (a stale
+            // "unavailable" verdict from a previous provider selection must not
+            // silently keep OK disabled, and a never-probed pick must not
+            // silently pass). Matches VS Code's aiProviderSelect change handler.
+            if (it.stateChange == java.awt.event.ItemEvent.SELECTED &&
+                providerCombo.selectedItem == PROVIDER_LOCAL_AGENT
+            ) {
+                probeLocalAgentUsableAsync()
+            }
+        }
+        // Tool-combo edits trigger a fresh probe so the status line follows the
+        // dropdown. Guarded on SELECTED so we don't fire twice per user click.
+        localAgentToolCombo.addItemListener {
+            if (it.stateChange == java.awt.event.ItemEvent.SELECTED &&
+                providerCombo.selectedItem == PROVIDER_LOCAL_AGENT
+            ) {
+                probeLocalAgentUsableAsync()
+            }
+        }
 
         return wrapTabContent(panel)
     }
@@ -762,6 +846,19 @@ class SettingsDialog(
             }
         } else if (provider == "Jolli" && !JolliAuthService.isSignedIn()) {
             return ValidationInfo("Sign in to Jolli first to use it as AI provider", providerCombo)
+        } else if (provider == PROVIDER_LOCAL_AGENT && localAgentAvailable == false) {
+            // Only a confirmed-unavailable verdict blocks Apply — the null state
+            // (probe still in flight, or never fired) is deliberately permissive
+            // so the user can commit their pick without waiting on the daemon.
+            // Matches VS Code's `updateApplyBtn`, whose `localAgentBlocks()` is
+            // false while the probe result is null.
+            val toolLabel = currentSelectedLocalAgentToolId()
+                ?.let { toolId -> localAgentTools.firstOrNull { it.id == toolId }?.label ?: toolId }
+                ?: "The selected tool"
+            return ValidationInfo(
+                "$toolLabel not found on this machine. Install it, or pick another tool.",
+                localAgentToolCombo,
+            )
         }
 
         val maxTokensText = maxTokensField.text.trim()
@@ -783,6 +880,33 @@ class SettingsDialog(
     }
 
     override fun doOKAction() {
+        // Hold OK when a local-agent probe is still in flight. Mirrors VS Code's
+        // `pendingApply` mechanism (SettingsScriptBuilder.ts:672–698) — without
+        // it, a click landing in the ~500 ms – 2 s daemon cold-spawn window
+        // would save `aiProvider=local-agent` against a tool that nobody has
+        // verified. [doValidate] blocks a CONFIRMED unavailable pick but
+        // deliberately lets `null` (checking…) through so OK doesn't gray out
+        // mid-probe; this is the second gate at the actual save chokepoint.
+        if (providerCombo.selectedItem == PROVIDER_LOCAL_AGENT && localAgentAvailable == null) {
+            if (!awaitLocalAgentProbe()) {
+                // Watchdog fired or user canceled the modal — do NOT persist.
+                // Show the same wording VS Code shows on `pendingApplyTimer`
+                // (SettingsScriptBuilder.ts:689) so the two UIs read the same.
+                val toolLabel = currentSelectedLocalAgentToolId()
+                    ?.let { id -> localAgentTools.firstOrNull { it.id == id }?.label ?: id }
+                    ?: "the selected tool"
+                localAgentStatusLabel.text =
+                    "Couldn't verify $toolLabel — nothing was saved. Click Apply to try again."
+                localAgentStatusLabel.foreground = JBColor.RED
+                return
+            }
+            // Verdict landed during the wait. `false` will surface as a red
+            // ValidationInfo through the alarm the probe's `invokeLater`
+            // scheduled — return without calling super so the dialog stays
+            // open. `true` falls through to the regular save below.
+            if (localAgentAvailable == false) return
+        }
+
         val provider = when (providerCombo.selectedItem as String) {
             "Anthropic" -> "anthropic"
             PROVIDER_LOCAL_AGENT -> "local-agent"
@@ -1223,6 +1347,15 @@ class SettingsDialog(
                 localAgentTools = tools
                 localAgentToolCombo.model = DefaultComboBoxModel(tools.map { it.label }.toTypedArray())
                 applyLocalAgentSelection(tools, currentId)
+                // Fire a probe once the combo lands on its persisted selection.
+                // The [localAgentToolCombo] itemListener already probes on user
+                // clicks, but assigning the same index it currently holds is a
+                // no-op for the listener, so an already-selected tool would
+                // never verify itself. Only when local-agent is the active
+                // provider — no point probing a card the user cannot see.
+                if (providerCombo.selectedItem == PROVIDER_LOCAL_AGENT) {
+                    probeLocalAgentUsableAsync()
+                }
             }
         }
     }
@@ -1230,6 +1363,226 @@ class SettingsDialog(
     /** Selects the combo row whose tool id matches [currentId], else the first. */
     private fun applyLocalAgentSelection(tools: List<LocalAgentToolOption>, currentId: String) {
         localAgentToolCombo.selectedIndex = tools.indexOfFirst { it.id == currentId }.takeIf { it >= 0 } ?: 0
+    }
+
+    /**
+     * Verifies the currently-selected agent tool actually runs on this machine
+     * by asking the CLI over the `local-agent-usable` ide-bridge action.
+     * Mirrors VS Code's `probeLocalAgent` (`SettingsScriptBuilder.ts`) — the
+     * same UX shows the same wording, and [doValidate] blocks Apply while an
+     * unavailable pick is selected.
+     *
+     * Off-EDT because the daemon fast path is ~5-20 ms but the one-shot spawn
+     * fallback can hit hundreds of milliseconds; the dialog is already visible
+     * and IntelliJ's slow-EDT floor is 300 ms, so the wait must not block.
+     *
+     * Stale-reply guard: [localAgentProbeTool] pins the id the current probe
+     * was fired for. When the invokeLater lands it drops the verdict if the
+     * user has since switched off this tool, so a slow Codex answer cannot
+     * overwrite a fresh Cursor "Checking…" line.
+     */
+    private fun probeLocalAgentUsableAsync() {
+        val tool = currentSelectedLocalAgentToolId() ?: return
+        // Coalesce redundant probes for the SAME tool. On dialog open, three
+        // triggers can fire in ~ms succession for a saved local-agent config:
+        // the providerCombo item listener (populateFields sets it → SELECTED),
+        // the localAgentToolCombo item listener (applyLocalAgentSelection sets
+        // it → SELECTED, when savedId ≠ ctor-default claude-code), and
+        // refreshLocalAgentToolCombo's trailing explicit call. Without this
+        // guard the same tool gets probed 2-3 times per open, and on a machine
+        // with a cold daemon each probe is one node cold-start.
+        //
+        // Skip when the same tool is either still in flight OR already carries
+        // a verdict — the FIRST caller does the work and later callers reuse
+        // its result. `probeTool != tool` (user picked a different tool)
+        // always falls through and re-probes. Overrides don't change during
+        // the dialog's lifetime (`localAgentPath` is edited only at save), so
+        // a settled verdict for `tool` remains accurate until the pick moves.
+        if (localAgentProbeTool == tool && (localAgentProbeInFlight || localAgentAvailable != null)) {
+            return
+        }
+        // Resolve the repo root BEFORE mutating any UI — otherwise a null
+        // `mainRepoRoot` (no worktree open) would leave the status label
+        // stuck on "Checking…" forever.
+        val projectDir = service.mainRepoRoot ?: project.basePath ?: return
+        localAgentProbeTool = tool
+        localAgentAvailable = null
+        localAgentProbeInFlight = true
+        localAgentStatusLabel.text = "Checking…"
+        localAgentStatusLabel.foreground = JBColor.foreground()
+        // Refresh the OK button through DialogWrapper's validation pass so the
+        // "Checking…" state doesn't inherit a stale ValidationInfo from before.
+        initValidation()
+        ApplicationManager.getApplication().executeOnPooledThread {
+            // `Boolean?` return: null means "we couldn't verify — do not claim
+            // either verdict, be permissive downstream". See the catch below.
+            val available: Boolean? = try {
+                val body = JsonObject().apply { addProperty("tool", tool) }
+                val res = CliIntegrations.runIdeBridge(projectDir, "local-agent-usable", body.toString())
+                val obj = res.takeIf { it.isJsonObject }?.asJsonObject
+                obj?.get("available")
+                    ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }
+                    ?.asBoolean
+                    // Malformed reply: treat as unavailable — the "unknown ≡ not
+                    // usable" contract matches the CLI-side catch below and
+                    // VS Code's `handleProbeLocalAgent`. See the bridge action.
+                    ?: run {
+                        LOG.warn("local-agent-usable returned a malformed reply ($res)")
+                        false
+                    }
+            } catch (e: com.intellij.openapi.progress.ProcessCanceledException) {
+                // IntelliJ contract: PCE must never be swallowed by a generic
+                // Exception catch. Propagate so the pool-thread task unwinds
+                // cleanly on cancel.
+                throw e
+            } catch (e: Exception) {
+                val msg = e.message.orEmpty()
+                when {
+                    // Old CLI without this PR — the `local-agent-usable` action
+                    // was added in the same change as this Kotlin caller.
+                    // Users on a stale global `@jolli.ai/cli` install (that
+                    // outranks the plugin's own bundle via `cli` tie-break in
+                    // SOURCE_PREFERENCE_ORDER) hit this path. Reporting the
+                    // tool as "not found on this machine" would misdirect the
+                    // user: the tool may be perfectly installed — the CLI
+                    // just doesn't yet know how to answer. Return null and
+                    // let the caller be permissive.
+                    "Unknown IDE bridge action" in msg -> {
+                        LOG.info(
+                            "local-agent-usable: resolved CLI predates this action; " +
+                                "treating $tool as unknown/permissive"
+                        )
+                        null
+                    }
+                    // Kotlin's LocalAgentTools.DEFAULT_TOOLS mirror is ahead of
+                    // the resolved CLI's LOCAL_AGENT_TOOLS map. The CLI raises
+                    // this loudly by design — it's a caller bug worth ERROR
+                    // level for us — but the user cannot act on it and it is
+                    // NOT a fact about their environment, so still permissive.
+                    "Unknown local agent tool" in msg -> {
+                        LOG.error(
+                            "local-agent-usable: CLI does not recognize tool id \"$tool\" " +
+                                "(Kotlin DEFAULT_TOOLS / CLI LOCAL_AGENT_TOOLS drift?)",
+                            e,
+                        )
+                        null
+                    }
+                    // Everything else (config unreadable, discovery threw, IO
+                    // error) keeps the "unknown ≡ not usable" contract — same
+                    // as the CLI's own catch and the VS Code sibling.
+                    else -> {
+                        LOG.warn("local-agent-usable probe failed for $tool", e)
+                        false
+                    }
+                }
+            }
+            SwingUtilities.invokeLater {
+                // Drop when the dialog was closed (Cancel / window close) while
+                // the probe was in flight. `initValidation()` on a disposed
+                // DialogWrapper is a documented no-op, but skipping the whole
+                // body keeps us from touching the label at all.
+                if (isDisposed) return@invokeLater
+                // Drop the stale reply if the user has since switched off this tool.
+                if (localAgentProbeTool != tool) return@invokeLater
+                // Write order is load-bearing: `available` MUST be set before
+                // `probeInFlight` flips to false. [awaitProbeSettlement] polls
+                // `probeInFlight` first and returns as soon as it reads false;
+                // [doOKAction] then reads `available`. Both fields are @Volatile,
+                // so the volatile happens-before guarantees that a reader
+                // observing `probeInFlight = false` also sees the fresh write to
+                // `available`. Reversing these two lines opens a window where
+                // the reader sees a settled probe but stale `available`.
+                localAgentAvailable = available
+                localAgentProbeInFlight = false
+                when (available) {
+                    // Confirmed usable OR permissive-unknown: keep the status
+                    // line empty. Rendering red text for `null` would be a
+                    // factual lie ("not found on this machine") when we in
+                    // fact have no evidence of any such condition.
+                    true, null -> {
+                        localAgentStatusLabel.text = " "
+                        localAgentStatusLabel.foreground = JBColor.foreground()
+                    }
+                    false -> {
+                        val label = localAgentTools.firstOrNull { it.id == tool }?.label ?: tool
+                        localAgentStatusLabel.text =
+                            "$label not found on this machine. Install it, or pick another tool."
+                        localAgentStatusLabel.foreground = JBColor.RED
+                    }
+                }
+                initValidation()
+            }
+        }
+    }
+
+    /**
+     * Blocks OK with a cancelable modal progress until the in-flight probe
+     * returns or the 8 s watchdog trips — the same 8 s VS Code's
+     * `pendingApplyTimer` arms (SettingsScriptBuilder.ts:685). Returns true
+     * when a verdict landed inside the window OR when no probe is in flight
+     * to wait for; false on cancel or timeout.
+     *
+     * The no-in-flight fast path exists because `localAgentAvailable == null`
+     * (the state that got us here from [doOKAction]) has three sources:
+     *   1. Probe genuinely running — wait for it.
+     *   2. Probe never fired — [probeLocalAgentUsableAsync] can early-return
+     *      when there is no project root, or [refreshLocalAgentToolCombo]'s
+     *      up-stack guard swallowed the trigger.
+     *   3. Probe already landed on a permissive-unknown outcome — the
+     *      unknown-action / unknown-tool branches in
+     *      [probeLocalAgentUsableAsync] write `available = null`.
+     * (2) and (3) both leave [localAgentProbeInFlight] false, so waiting
+     * 8 s can only ever time out — the user then sees "Couldn't verify …"
+     * with no way to self-heal short of jiggling the combo. Short-circuit
+     * them to true here so the save proceeds — matches the "null is
+     * permissive" contract already used by [doValidate].
+     *
+     * Does NOT relaunch a probe. The pool-thread task from
+     * [probeLocalAgentUsableAsync] runs on independently; its
+     * `SwingUtilities.invokeLater` reply pumps while the modal is up, so
+     * [localAgentProbeInFlight] flips on the EDT. The polling task here
+     * runs on a separate pooled thread, so both @Volatile fields it reads
+     * ([localAgentProbeInFlight] and [localAgentAvailable]) must be
+     * @Volatile to make the EDT writes visible across threads.
+     */
+    private fun awaitLocalAgentProbe(): Boolean {
+        val toolId = currentSelectedLocalAgentToolId() ?: return true
+        if (!localAgentProbeInFlight) return true
+        val toolLabel = localAgentTools.firstOrNull { it.id == toolId }?.label ?: toolId
+        val landed = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            ProgressManager.getInstance().runProcessWithProgressSynchronously({
+                val indicator = ProgressManager.getInstance().progressIndicator
+                // Poll body lives in [awaitProbeSettlement], a top-level pure function
+                // so it can be unit-tested without spinning up IntelliJ's progress
+                // subsystem. See LocalAgentProbePollTest.
+                landed.set(
+                    awaitProbeSettlement(
+                        now = { System.currentTimeMillis() },
+                        sleepMillis = { ms -> Thread.sleep(ms) },
+                        inFlight = { localAgentProbeInFlight },
+                        isCanceled = { indicator?.isCanceled == true },
+                        deadlineMillis = 8000L,
+                    ),
+                )
+            }, "Checking $toolLabel…", true, project)
+        } catch (e: com.intellij.openapi.progress.ProcessCanceledException) {
+            // User canceled the modal — leave `landed` false so doOKAction
+            // reports "nothing was saved" and the dialog stays open.
+        }
+        return landed.get()
+    }
+
+    /**
+     * The id (e.g. `codex`) of the tool the combo currently displays. Returns
+     * null when the combo has no valid selection (should not happen once
+     * [refreshLocalAgentToolCombo] has landed, but the probe guards on this so
+     * an intermediate state never fires a bogus `local-agent-usable` request).
+     */
+    private fun currentSelectedLocalAgentToolId(): String? {
+        val idx = localAgentToolCombo.selectedIndex
+        if (idx < 0 || idx >= localAgentTools.size) return null
+        return localAgentTools[idx].id
     }
 
     private fun populateFields(config: JolliMemoryConfig) {
@@ -1428,4 +1781,38 @@ class SettingsDialog(
         private const val CARD_SYNC_NOKEY = "card.sync.nokey"
         private const val CARD_SYNC_SIGNEDIN = "card.sync.in"
     }
+}
+
+/**
+ * Pure poll loop that awaits an async probe reply. Extracted from
+ * [SettingsDialog.awaitLocalAgentProbe] so its "wait until settled OR deadline
+ * OR cancel" semantics can be unit-tested without the IntelliJ progress
+ * subsystem — every side-effecting dependency (clock, sleep, in-flight flag,
+ * cancel signal) is injected as a lambda, and the function itself has no
+ * global state.
+ *
+ * Returns `true` when [inFlight] is observed as false inside the window;
+ * `false` on deadline or when [isCanceled] reads true. The function body itself
+ * never throws — but it does not catch exceptions from the injected lambdas.
+ * In production `sleepMillis = { Thread.sleep(it) }`, which throws
+ * `InterruptedException` if the thread is interrupted; IntelliJ's cancellation
+ * goes through the polled [isCanceled] rather than an interrupt, so this is
+ * theoretical, but callers must not assume settlement on any exceptional exit.
+ *
+ * The [pollIntervalMillis] default matches what the production caller uses.
+ */
+internal fun awaitProbeSettlement(
+    now: () -> Long,
+    sleepMillis: (Long) -> Unit,
+    inFlight: () -> Boolean,
+    isCanceled: () -> Boolean,
+    deadlineMillis: Long,
+    pollIntervalMillis: Long = 50L,
+): Boolean {
+    val deadline = now() + deadlineMillis
+    while (now() < deadline && !isCanceled()) {
+        if (!inFlight()) return true
+        sleepMillis(pollIntervalMillis)
+    }
+    return false
 }
