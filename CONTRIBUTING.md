@@ -11,7 +11,7 @@ Thank you for your interest in contributing to Jolli Memory! This document expla
 
 ## Development Setup
 
-This is an npm workspaces monorepo containing the CLI (`cli/`) and the VS Code extension (`vscode/`).
+This is an npm workspaces monorepo. The workspaces are the CLI (`cli/`) and the VS Code extension (`vscode/`); the repo also builds the Claude Code plugin (`claude-plugin/`, non-workspace, built by the root `build` chain) and contains the IntelliJ plugin (`intellij/`, a separate Gradle project that the root build/lint/test chain does not cover; launch its sandbox with `npm run intellij:sandbox`).
 
 ```bash
 # Clone your fork
@@ -21,7 +21,7 @@ cd jolliai
 # Install dependencies for all workspaces
 npm ci
 
-# Clean, build, lint, and test the full monorepo
+# Clean, build, typecheck, lint, and test the full monorepo
 npm run all
 ```
 
@@ -54,7 +54,7 @@ This project uses the [Developer Certificate of Origin](https://developercertifi
 
 By making a contribution, you certify that you have the right to submit it under the open source license used by this project.
 
-All commits must include a `Signed-off-by` line with your real name and email address. Git makes this easy:
+All commits must include a `Signed-off-by` line with your real name and email address. The CI gate requires at least one sign-off carrying the commit author's address, compared case-insensitively. Git makes this easy:
 
 ```bash
 git commit -s -m "Your commit message"

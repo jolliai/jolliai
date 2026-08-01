@@ -63,7 +63,7 @@ JolliMemory installs hooks into the user's project, split into two categories:
 
 ### AI Agent Hooks — Session Tracking
 
-These hooks track which AI sessions are active. They only record session metadata (ID, transcript path, timestamp) — **they never read conversation content or make LLM calls.**
+These hooks track which AI sessions are active. Gemini's `AfterAgent` and Claude's `SessionStartHook` only record session metadata (ID, transcript path, timestamp). Claude's `StopHook` records that too, but **also reads the transcript**, incrementally scanning it for plans, references and skills. **None of them make LLM calls.**
 
 | Agent | Hook | How it works |
 |-------|------|-------------|
@@ -229,14 +229,14 @@ Test files are in `src/test/kotlin/ai/jolli/jollimemory/` mirroring the main sou
 The plugin version is set in `build.gradle.kts`:
 
 ```kotlin
-version = "0.97.9"
+version = "0.99.9"
 ```
 
 Compatibility range is also defined there:
 
 ```kotlin
 ideaVersion {
-    sinceBuild = "243"     // IntelliJ 2024.3
+    sinceBuild = "251"     // IntelliJ 2025.1
     untilBuild = "262.*"   // Up to IntelliJ 2026.2.x
 }
 ```

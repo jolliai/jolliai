@@ -6,8 +6,11 @@ end-user install and the list of what the plugin provides, see
 
 This is the **consumption + bootstrap** surface. The memory *generation* engine
 runs in git hooks (`post-commit` → QueueWorker → LLM), which the Claude Code
-plugin model does not cover — so the plugin's `SessionStart` hook shells the
-bundled CLI to install those git hooks into the active repo (idempotent).
+plugin model does not cover. The plugin's manifest therefore registers exactly one
+hook, `SessionStart` → `PluginBootstrapHook`, and that bootstrap installs the git
+hooks *and* the canonical Stop/SessionStart agent hooks into the active repo
+through `run-hook` (idempotent). Registering business hooks directly in the
+manifest is deliberately avoided — see AGENTS.md.
 
 ## Layout
 
@@ -17,10 +20,10 @@ claude-plugin/
 └── plugins/jolli/
     ├── .claude-plugin/plugin.json      # plugin manifest
     ├── .mcp.json                       # jolli MCP server (node dist/Cli.js mcp)
-    ├── hooks/hooks.json                # Stop + SessionStart (+ git-hook bootstrap)
+    ├── hooks/hooks.json                # SessionStart → PluginBootstrapHook (the only manifest hook)
     ├── skills/                         # /jolli:recall  /jolli:search  /jolli:push
     ├── commands/                       # /jolli:init  /jolli:status  /jolli:timeline  /jolli:login  /jolli:logout
-    ├── scripts/build.mjs               # esbuild → dist/ (Cli, Stop/SessionStart hooks, 5 git hooks, 2 workers)
+    ├── scripts/build.mjs               # esbuild → dist/ (Cli, PluginBootstrapHook, Stop/SessionStart hooks, 5 git hooks, 2 workers)
     └── dist/                           # built bundles (gitignored)
 ```
 
@@ -190,10 +193,10 @@ hooks are then live.
 
 ## Publish scripts
 
-All four scripts live in `claude-plugin/scripts/` and share `_publish-lib.sh`, so
-every one **builds `dist/` first and asserts the bundle is complete** — a missing
+All four scripts live in `claude-plugin/scripts/`. Three of them (`publish-local`, `publish-dev`, `publish-prod`) share `_publish-lib.sh`, so
+each **builds `dist/` first and asserts the bundle is complete** — a missing
 git-hook or worker script would resolve to `node <missing file>` at commit time
-and BLOCK the installing user's commits — before doing anything else. That shared
+and, on a plugin-only install, silently disable whatever that hook did — before doing anything else. `publish-zip.sh` is standalone and does not source the shared lib. That shared
 build+sync core is exactly why a prod release behaves the same as the local and
 dev rehearsals that preceded it.
 
@@ -236,15 +239,17 @@ must include **every runtime file the plugin loads**, not just the build output.
 There is no publishing `package.json` here yet; when you add one, a
 `prepublishOnly` should run `build.mjs`, and the `files` whitelist must list all of:
 
-- `dist/` — bundled `Cli.js`, the Stop/SessionStart hooks, the five git hooks
-  (`PostCommitHook.js` / `PostMergeHook.js` / `PostRewriteHook.js` /
+- `dist/` — bundled `Cli.js`, `PluginBootstrapHook.js`, the Stop/SessionStart hooks,
+  the five git hooks (`PostCommitHook.js` / `PostMergeHook.js` / `PostRewriteHook.js` /
   `PrepareMsgHook.js` / `PrePushHook.js`), and the `QueueWorker.js` /
-  `PrePushWorker.js` workers. Omitting any git-hook or worker file turns the
-  corresponding git hook into `node <missing file>` and BLOCKS the commit.
+  `PrePushWorker.js` workers (11 required bundles in total, asserted at publish time
+  by `_publish-lib.sh`). The whitelist entry is the `dist/` directory itself, not a
+  per-file list. Omitting any git-hook or worker file makes that
+  hook a no-op rather than blocking commits: `run-hook` skips a dist whose script is missing and falls through to the next complete source, so a plugin-only install silently loses whatever that hook did. The publish scripts assert the bundle is complete precisely so that never ships.
 - `.claude-plugin/plugin.json` — the manifest.
-- `.mcp.json` — the MCP server registration; without it the 10 MCP tools never load.
-- `hooks/`, `skills/`, `commands/` — the Stop/SessionStart hooks and the
-  `/jolli:*` skills and commands.
+- `.mcp.json` — the MCP server registration; without it the MCP tools never load.
+- `hooks/`, `skills/`, `commands/` — `hooks.json` (the SessionStart bootstrap that
+  makes everything else fire) plus the `/jolli:*` skills and commands.
 
 > ⚠️ **`files: ["dist"]` alone ships a broken plugin** — `dist/` is only the bundled
 > CLI; the manifest, `.mcp.json`, hooks, skills, and commands all live outside

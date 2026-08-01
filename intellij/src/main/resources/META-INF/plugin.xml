@@ -10,10 +10,15 @@
     <name>Jolli Memory</name>
     <vendor url="https://jolli.ai" email="support@jolli.ai">Jolli</vendor>
 
+    <!-- NOTE: this <description> is a dev-facing placeholder only. `patchPluginXml`
+         OVERWRITES it at build time with the `pluginConfiguration.description` block in
+         build.gradle.kts, which is what the JetBrains Marketplace actually renders. Edit
+         that block, not this one, and verify by unzipping build/distributions/*.zip. -->
     <description><![CDATA[
         AI-powered commit summaries and smart git operations.<br/>
-        Automatically captures your AI coding conversations (Claude Code, Gemini, Codex)
-        and generates structured summaries for each commit — so you always remember <em>why</em>.
+        Automatically captures your AI coding conversations (Claude Code, Gemini, Codex,
+        OpenCode, Cursor, Copilot, Cline, Devin, Antigravity) and generates structured
+        summaries for each commit — so you always remember <em>why</em>.
         <br/><br/>
         <a href="https://github.com/jolliai/jolliai">Source Code</a> |
         <a href="https://jolli.ai/privacy">Privacy Policy</a>
@@ -57,7 +62,9 @@
         <projectService
             serviceImplementation="ai.jolli.jollimemory.toolwindow.JcefBrowserPool"/>
 
-        <!-- Tool window: sidebar with collapsible STATUS, MEMORIES, PLANS & NOTES, CHANGES panels -->
+        <!-- Tool window: sidebar with a Current Branch / Memory Bank view switch. Current
+             Branch stacks the collapsible PINNED, WORKING MEMORY and COMMITTED MEMORIES
+             sections; Status and onboarding render as sibling cards. -->
         <toolWindow
             id="JOLLI"
             anchor="right"

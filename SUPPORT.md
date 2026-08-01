@@ -18,10 +18,11 @@ Open an issue using the **Bug report** template:
 
 Please include:
 
-- Which component is affected (CLI, VS Code extension, or IntelliJ plugin) and its version
+- Which component is affected (CLI, VS Code extension, IntelliJ plugin, or Claude Code plugin) and its version
   - CLI: `jolli --version`
   - VS Code extension: shown on the marketplace listing or in `Extensions › Jolli Memory`
   - IntelliJ plugin: `Settings › Plugins › Jolli Memory`
+  - Claude Code plugin: `/plugin` in Claude Code, or run `/jolli:status`. The plugin bundles its own CLI, so a global `jolli --version` may report a different build (or nothing at all if you never installed the CLI separately).
 - Operating system and shell (or IDE version)
 - Steps to reproduce
 - Expected vs actual behavior

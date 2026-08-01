@@ -80,7 +80,8 @@ intellijPlatform {
                 development documentation attached to every commit, without any extra effort.
             </p>
             <p>
-                When you work with AI agents like <b>Claude Code</b>, <b>Codex</b>, or <b>Gemini</b>,
+                When you work with AI agents like <b>Claude Code</b>, <b>Codex</b>, <b>Gemini</b>,
+                <b>Cursor</b> or <b>Copilot</b>,
                 the reasoning behind every decision lives in the conversation &mdash;
                 <em>why this approach was chosen, what alternatives were considered, what problems came up along the way</em>.
                 The moment you commit, that context is gone. Jolli Memory captures it automatically.
@@ -91,8 +92,19 @@ intellijPlatform {
                 After each commit, Jolli Memory reads your AI session transcripts and the code diff,
                 calls the LLM to produce a structured summary, and stores it alongside the commit
                 silently in the background. Your commit returns instantly &mdash; the summary is generated
-                in ~10&ndash;20 seconds. Everything is stored in a git orphan branch, completely separate
-                from your code history.
+                in ~10&ndash;20 seconds.
+            </p>
+            <p>
+                Every memory is written twice: to a git orphan branch that is completely separate from
+                your code history, and to a <b>Memory Bank</b> folder on disk that keeps a plain-Markdown
+                copy you can read, search, or feed to any other tool.
+            </p>
+            <p>
+                <b>Requires Node.js 18+</b> on your PATH, which the plugin uses to drive its bundled
+                Jolli CLI. Node 22.5+ is recommended: OpenCode, Devin, Antigravity,
+                Cursor's Composer IDE and the Copilot CLI discover sessions through
+                <code>node:sqlite</code>, which first ships in 22.5, and are skipped below it. The
+                cursor-agent CLI, Copilot Chat and Cline read plain files and are unaffected.
             </p>
 
             <h3>Key Features</h3>
@@ -100,7 +112,8 @@ intellijPlatform {
                 <li><b>AI Commit</b> &mdash; generate commit messages from staged diffs using the Anthropic API.
                     Review and edit before committing, with support for commit, amend, and amend-keep-message modes</li>
                 <li><b>Squash</b> &mdash; select two or more commits and squash them with an LLM-generated combined
-                    message. Existing memories are automatically merged &mdash; no extra AI call needed</li>
+                    message. The memories themselves are consolidated into one rich summary that preserves the
+                    decision detail from every source commit, with a mechanical merge as the offline fallback</li>
                 <li><b>Summary Viewer</b> &mdash; rich HTML viewer for each commit showing properties, AI summaries
                     (structured as <em>Why This Change &rarr; Decisions Behind the Code &rarr; What Was Implemented</em>),
                     E2E test guides, associated plans, and source commits</li>
@@ -109,52 +122,116 @@ intellijPlatform {
                 <li><b>E2E Test Generation</b> &mdash; AI-generated test scenarios with preconditions, steps, and
                     expected results, editable inline in the Summary Viewer</li>
                 <li><b>Session Context Recall</b> &mdash; a lightweight briefing (~300 tokens) is injected at each
-                    Claude Code session start. Run <code>/jolli-recall</code> for full branch history
-                    recall (~30,000 tokens) so your AI agent can pick up where you left off</li>
+                    Claude Code session start. The <code>jolli-recall</code> and <code>jolli-search</code> skills
+                    are installed for you, so your AI agent can load a branch's full history or search every
+                    branch's memories and pick up where you left off</li>
+                <li><b>Ask your agent directly (MCP)</b> &mdash; enabling a repo registers a local
+                    <code>jollimemory</code> MCP server into every AI host found on your machine, exposing ten built-in tools
+                    (search, recall, decision timeline, branch list, PR description, queue and install status, and
+                    Jolli Space binding / listing / push). The seven memory tools answer entirely
+                    from local storage; the three Jolli Space tools talk to your Jolli tenant, as their
+                    names imply</li>
+                <li><b>Memory Bank</b> &mdash; a browsable, cross-branch and cross-repo view of every memory on disk,
+                    in tree or timeline mode, with search. Point it anywhere you like from Settings</li>
+                <li><b>Knowledge wiki</b> &mdash; folds work scattered across many commits into per-topic pages, so a
+                    feature touched by ten commits reads as one evolving page. Built incrementally in the background</li>
+                <li><b>Backfill</b> &mdash; write memories for the commits you made before installing Jolli, so your
+                    existing history shows up too</li>
+                <li><b>Issue and conversation references</b> &mdash; Linear, Jira, GitHub, Notion and Slack items
+                    mentioned in your AI conversation are captured and attached to the relevant memory, with deep
+                    links back to the source</li>
+                <li><b>Cross-device sync</b> &mdash; a status-bar widget keeps your personal Memory Bank consistent
+                    across every device you sign in to</li>
                 <li><b>Create &amp; Update PR</b> &mdash; create or update GitHub PRs via <code>gh</code> CLI with
                     auto-generated descriptions and <code>&lt;!-- jollimemory-summary --&gt;</code> markers for
                     in-place updates</li>
                 <li><b>Push to Jolli Space</b> &mdash; publish summaries, plans, and notes to your team knowledge
                     base. Recall individual or shared memories across devices and team members</li>
-                <li><b>Search &amp; Filter</b> &mdash; search memories by commit message or branch name with
-                    real-time filtering</li>
             </ul>
 
             <h3>Multi-Agent Support</h3>
+            <p>
+                Twelve transcript sources are supported. Only two install a hook; the rest are discovered
+                automatically by scanning the tool's own local session store, so there is nothing to set up per tool.
+            </p>
             <table>
                 <tr><td><b>Claude Code</b></td><td>StopHook after each response + SessionStartHook briefing at startup</td></tr>
                 <tr><td><b>Gemini</b></td><td>AfterAgent hook after each agent completion</td></tr>
                 <tr><td><b>Codex</b></td><td>Automatic filesystem discovery &mdash; no hook needed</td></tr>
+                <tr><td><b>OpenCode</b></td><td>Automatic discovery from its local database &mdash; no hook needed</td></tr>
+                <tr><td><b>Cursor</b></td><td>Automatic discovery &mdash; covers both the Composer IDE and the <code>cursor-agent</code> CLI</td></tr>
+                <tr><td><b>GitHub Copilot</b></td><td>Automatic discovery &mdash; covers both the Copilot CLI and VS Code Copilot Chat</td></tr>
+                <tr><td><b>Cline</b></td><td>Automatic discovery &mdash; covers both the VS Code extension and the CLI</td></tr>
+                <tr><td><b>Devin CLI</b></td><td>Automatic discovery from its local database, scoped by working directory</td></tr>
+                <tr><td><b>Antigravity</b></td><td>Automatic discovery from its per-conversation store and transcript log</td></tr>
             </table>
 
             <h3>Tool Window</h3>
             <p>
-                A right-sidebar tool window with collapsible, resizable panels:
+                A right-sidebar tool window with a <b>Current Branch / Memory Bank</b> view switch.
+                Current Branch stacks three collapsible sections:
             </p>
             <table>
-                <tr><td><b>STATUS</b></td><td>Enable/disable hooks, active AI sessions, memory count, Jolli Space connection</td></tr>
-                <tr><td><b>MEMORIES</b></td><td>Every commit on the branch with click-to-open summaries and search/filter</td></tr>
-                <tr><td><b>PLANS &amp; NOTES</b></td><td>Auto-detected plans and custom notes with add/edit/remove</td></tr>
-                <tr><td><b>CHANGES</b></td><td>Changed files with staging checkboxes and AI Commit button</td></tr>
-                <tr><td><b>COMMITS</b></td><td>Branch commits with multi-select for squash operations</td></tr>
+                <tr><td><b>PINNED</b></td><td>Memories you have pinned for quick access</td></tr>
+                <tr><td><b>WORKING MEMORY</b></td><td>Everything feeding the next commit's memory: AI conversations, plans and notes, and changed files with staging checkboxes and the AI Commit button</td></tr>
+                <tr><td><b>COMMITTED MEMORIES</b></td><td>Every commit on the branch not yet in main, with click-to-open summaries and multi-select for squash</td></tr>
             </table>
+            <p>
+                <b>Memory Bank</b> browses every stored memory across branches and repos, in tree or timeline mode.
+                A <b>Status</b> card covers hook state, active AI sessions, stored-memory counts and detected
+                integrations, and a dismissible card offers to backfill a repo that already has history.
+            </p>
 
             <h3>Configuration</h3>
             <p>
-                <b>Settings &gt; Tools &gt; Jolli Memory</b> (or gear icon in the STATUS panel):
+                A five-tab dialog in the tool window (gear icon) covers <b>AI Agents</b> (six toggles: Claude Code, Codex, Gemini, OpenCode, Cursor, Copilot),
+                <b>AI Summary</b> (provider, model, token budget), <b>Sync to Jolli</b>, <b>Memory Bank</b>
+                (folder location) and <b>Others</b> (exclude patterns, telemetry, pause).
+            </p>
+            <p>
+                <b>Settings &gt; Tools &gt; Jolli Memory</b> additionally holds:
             </p>
             <ul>
+                <li><b>Account</b> &mdash; sign in or out of Jolli with browser OAuth</li>
                 <li><b>Anthropic API Key</b> &mdash; for AI summarization (falls back to <code>${'$'}ANTHROPIC_API_KEY</code> env var)</li>
                 <li><b>Model</b> &mdash; aliases (<code>haiku</code>, <code>sonnet</code>, <code>opus</code>) or full model ID</li>
                 <li><b>Jolli API Key</b> &mdash; for Push to Jolli Space (sign up at <a href="https://jolli.ai">jolli.ai</a>)</li>
+                <li><b>Slack Workspace URL</b> &mdash; used to build deep links for captured Slack references</li>
             </ul>
+            <p>
+                Settings are stored in <code>~/.jolli/jollimemory/config.json</code>, shared with the Jolli CLI and
+                the VS Code extension, so signing in once works everywhere.
+            </p>
 
             <h3>Privacy</h3>
             <p>
-                AI agent hooks <b>only record session metadata</b> (session ID and file path) &mdash;
-                they never read your conversation content. Transcripts are only read at commit time
-                by the background summary worker.
+                <b>Read locally.</b> Gemini's hook records only a session ID and file path.
+                Claude's hook also scans the transcript as you work, to pick up plan files and
+                issue references. The scan-based sources read transcript content too &mdash; at
+                commit time to build the summary, and on the sidebar's refresh to title your
+                recent conversations. All of that happens on your machine.
             </p>
+            <p>
+                <b>Sent when a memory is generated.</b> Writing a summary is an LLM call, so at
+                commit time the transcript slice for that commit and the diff go to whichever
+                provider you configured: Anthropic directly, the Jolli LLM proxy, or a local
+                agent CLI. The Jolli proxy holds the payload in memory for the request only and
+                never persists or logs it.
+            </p>
+            <p>
+                <b>Never sent to a team Jolli Space.</b> Sharing a memory uploads the summary,
+                its plans, notes and captured issue references &mdash; never the raw transcript.
+                Mirroring transcripts into your own personal space is a separate opt-in
+                (<code>syncTranscripts</code>), off by default.
+            </p>
+
+            <h3>Links</h3>
+            <ul>
+                <li><a href="https://github.com/jolliai/jolliai">Source code</a> (Apache-2.0)</li>
+                <li><a href="https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory">Documentation</a></li>
+                <li><a href="https://jolli.ai/privacy">Privacy policy</a></li>
+                <li><a href="https://github.com/jolliai/jolliai/issues">Report an issue</a></li>
+            </ul>
         """.trimIndent()
         // Source the marketplace "What's New" from CHANGELOG.md (single source of
         // truth). Render every released section so the full history ships with each build.

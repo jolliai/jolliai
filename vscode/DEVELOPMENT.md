@@ -11,7 +11,7 @@ npm install
 # 2. Build the jollimemory core (the extension bundles it at build time via esbuild)
 npm run build:cli
 
-# 3. Deploy (bumps patch version, builds, packages, and installs into your VS Code)
+# 3. Deploy (builds the core, builds + packages the VSIX, installs it)
 cd vscode
 npm run deploy
 ```
@@ -28,7 +28,7 @@ After making changes, run one command from `vscode/`:
 npm run deploy
 ```
 
-This automatically: bumps the patch version → builds → packages the VSIX → installs it into VS Code.
+`deploy` runs: build the CLI → `npm install -g ../cli` → build the extension → package the VSIX → install it. It does **not** bump any version; there is no `npm version` step in the chain.
 
 Then reload your VS Code window to pick up the changes:
 
@@ -53,7 +53,7 @@ Jolli Memory installs hooks into the user's project, split into two categories.
 
 ### AI Agent Hooks — Session Tracking
 
-These hooks track which AI sessions are active. They only record session metadata (ID, transcript path, timestamp) — **they never read conversation content or make LLM calls.**
+These hooks track which AI sessions are active. Gemini's `AfterAgent` and Claude's `SessionStartHook` only record session metadata (ID, transcript path, timestamp). Claude's `StopHook` records that too, but **also reads the transcript**, incrementally scanning it for plans, references and skills. **None of them make LLM calls.**
 
 | Agent | Mechanism | How it works |
 |-------|-----------|-------------|
@@ -118,7 +118,6 @@ src/
 │   ├── ActiveSessionsProvider.ts # Background poller over the seven per-source session aggregators. Powers the Branch tab's CONVERSATIONS section — emits `ActiveSession[]` snapshots that the sidebar webview renders without manual refresh.
 │   ├── ManualDisableFlag.ts      # Thin re-export of RepoProfile's repo-wide manual-disable flag (profile.json, main-worktree-root). Durable, highest-priority opt-out set by Disable (and `jolli disable`); respected on every activation, shared across worktrees
 │   ├── BackfillDismissFlag.ts    # Records a dismissal of the cold-start back-fill offer in the git common dir, so switching worktrees on the same repo doesn't re-nag
-│   ├── GlobalInstructionsPrompt.ts # One-time benefit-led notification asking whether Jolli may add its skill-preference note to the machine-global instruction files. Reuses the CLI's tri-state `globalInstructions` config + shared GLOBAL_INSTRUCTIONS_PROMPT string; the AI Agents settings toggle and the disable transition run through the same syncGlobalInstructions helper so a write and its removal stay symmetric.
 │   ├── JolliPushService.ts       # HTTP client for pushing summaries to a Jolli Space
 │   ├── PrCommentService.ts       # GitHub PR creation/update via gh CLI; PR section markers
 │   └── data/                     # Pure derivations consumed by providers (no VSCode imports, no state)
@@ -133,9 +132,7 @@ src/
 │   ├── MemoriesTreeProvider.ts
 │   ├── PlansTreeProvider.ts      # Plans + Notes (one panel)
 │   ├── FilesTreeProvider.ts
-│   ├── HistoryTreeProvider.ts    # Commits + per-commit file children + checkbox range logic
-│   └── KnowledgeBaseTreeProvider.ts  # Branch-aware Memory Bank folder tree (the class name keeps the legacy "KnowledgeBase" identifier)
-│
+│   └── HistoryTreeProvider.ts    # Commits + per-commit file children + checkbox range logic
 ├── views/                        # Webview panels (HTML + CSS + JS, served via webview API)
 │   ├── SidebarWebviewProvider.ts         # Top-level sidebar webview: the segmented Current Branch / Memory Bank switch, the repo/branch breadcrumb, the Status overlay (opened from the title bar), and the onboarding / api-key / disabled panels
 │   ├── SidebarHtmlBuilder.ts             # HTML assembly for the sidebar (onboarding panel, sections, Memory Bank tree)
@@ -212,7 +209,7 @@ The `services/data/` layer exists so derivation logic can be unit-tested without
 | Bundle | Source | Notes |
 |--------|--------|-------|
 | `Extension.js` | `vscode/src/Extension.ts` | The VSCode extension host. Inlines all of `cli/src/**` (Installer, SummaryStore, JolliApiUtils, …). `vscode` is the only `external`. |
-| `Cli.js` | `cli/src/Cli.ts` | The bundled CLI, invoked as a subprocess for enable/disable/status. Standalone — no global `jolli` install required. |
+| `Cli.js` | `cli/src/Cli.ts` | The bundled CLI. Enable/disable/status are direct in-process calls into the inlined `Installer`; this bundle is what `run-cli` and the MCP registrars exec, while the git/agent hooks exec the per-hook bundles (`PostCommitHook.js`, `PrepareMsgHook.js`, …) in the same `dist/`. Standalone — no global `jolli` install required. |
 | `StopHook.js` | `cli/src/hooks/StopHook.ts` | Claude Code stop hook. |
 | `SessionStartHook.js` | `cli/src/hooks/SessionStartHook.ts` | Claude Code session-start hook. |
 | `GeminiAfterAgentHook.js` | `cli/src/hooks/GeminiAfterAgentHook.ts` | Gemini `AfterAgent` hook. |
@@ -233,7 +230,7 @@ The `services/data/` layer exists so derivation logic can be unit-tested without
 
 **ESM/CJS bridging** — jollimemory core is pure ESM. The VSCode extension host requires CJS, so esbuild bundles every entry point as CJS and replaces `import.meta.url` with a real `__filename`-derived expression (via the `define` + `banner` shim in `esbuild.config.mjs`). This lets `Installer.ts` resolve hook scripts relative to the bundle at runtime.
 
-**Automatic hook path refresh on upgrade** — On every activation, the extension reads `.git/hooks/post-commit` and checks whether it references the current `extensionPath`. If the paths belong to an older version directory (e.g. after a VSIX upgrade), the extension silently re-runs `enable` to write fresh paths. Hook installation uses dist-path indirection: hooks call `node "$($HOME/.jolli/jollimemory/resolve-dist-path)/PostCommitHook.js"`, where `resolve-dist-path` reads `~/.jolli/jollimemory/dist-path`. CLI vs extension write the same version-tagged dist-path, so whichever surface was enabled most recently wins.
+**Automatic hook path refresh on upgrade** — On every activation, `refreshHookPathsIfStale()` compares the dist directory registered under its own `dist-paths/<source>` entry against `<extensionPath>/dist`. That is deliberately a path comparison, not a version one, because two sequential extension releases can bundle the same core version. It never opens `.git/hooks/post-commit`. A manual-disable flag is checked first, so an upgrade can never silently re-enable a repo the user opted out of. If the paths belong to an older version directory (e.g. after a VSIX upgrade), the extension silently re-runs `enable` to write fresh paths. Hook installation uses dist-path indirection: hooks call `node "$($HOME/.jolli/jollimemory/resolve-dist-path)/PostCommitHook.js"`, where `resolve-dist-path` reads `~/.jolli/jollimemory/dist-path`. CLI vs extension write the same version-tagged dist-path, so whichever surface was enabled most recently wins.
 
 ---
 
@@ -316,7 +313,7 @@ Both panels are singletons (one instance at a time, focused if reopened) and use
 
 **PR lookup uses `gh pr list` with history; fork PRs are excluded** — `PrCommentService.fetchBranchPrs` switched from `gh pr view` (which only returns the single open PR on the branch) to `gh pr list --state all --head <branch>` so historical closed / merged PRs on the same branch can be found. Fork PRs (where the head repo doesn't match the base repo) are filtered out before the panel offers an edit action — the foreign-denial assertion is pinned in `PrCommentService.test.ts` so the filter cannot regress. The `--arg-stdin` bridging that the extension uses to pass long arguments through the CLI also gained length / content guards so a stray block of `--help` output cannot be piped through as input.
 
-**Memory Bank folder mode** — Memory Bank is on by default. `StorageFactory.createStorage` defaults to `"dual-write"`, so every commit's hooks write the memory to **both** the orphan branch and the configured Memory Bank folder; no `setActiveStorage()` toggle is involved at runtime. The orphan branch stays the system of record (reads come from there); the folder mirror is derivable from it. Cross-repo reads from the MEMORY BANK tab go through `FolderStorage` instead of git plumbing so opening a memory from a sibling repo's subfolder never invokes `git show` in the wrong working tree. The Memory Bank sidebar tab renders a branch-aware folder view via `KnowledgeBaseTreeProvider` (the class name still uses the legacy "KnowledgeBase" identifier; the user-facing label is "Memory Bank").
+**Memory Bank folder mode** — Memory Bank is on by default. `StorageFactory.createStorage` defaults to `"dual-write"`, so every commit's hooks write the memory to **both** the orphan branch and the configured Memory Bank folder; no `setActiveStorage()` toggle is involved at runtime. The orphan branch stays the system of record (reads come from there); the folder mirror is derivable from it. Cross-repo reads from the MEMORY BANK tab go through `FolderStorage` instead of git plumbing so opening a memory from a sibling repo's subfolder never invokes `git show` in the wrong working tree. The Memory Bank sidebar tab renders its folder view from `KbFoldersService`, which walks the configured `localFolder` root lazily (the `Kb` prefix is a legacy "Knowledge Base" identifier; the user-facing label is "Memory Bank").
 
 Two migration paths populate the folder:
 

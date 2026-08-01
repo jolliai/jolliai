@@ -15,10 +15,11 @@ Please include:
 
 - A description of the issue and its impact.
 - Steps to reproduce, or a proof-of-concept where possible.
-- The affected component (CLI, VS Code extension, or IntelliJ plugin) and version.
+- The affected component (CLI, VS Code extension, IntelliJ plugin, or Claude Code plugin) and version.
   - CLI: `jolli --version`
   - VS Code extension: shown on the marketplace listing or in `Extensions › Jolli Memory`
   - IntelliJ plugin: `Settings › Plugins › Jolli Memory`
+  - Claude Code plugin: `/plugin` in Claude Code, or `/jolli:status`. It bundles its own CLI build, so report the plugin version rather than a global `jolli --version` (which may be a different build, or absent).
 - Whether the issue requires authentication, user interaction, or specific configuration.
 
 We aim to acknowledge reports within 5 business days. After triage we will share an indicative
@@ -37,6 +38,7 @@ prior versions.
 | `@jolli.ai/cli` | npm | latest published minor |
 | Jolli Memory (VS Code extension) | VS Code Marketplace, Open VSX | latest published minor |
 | Jolli Memory (IntelliJ plugin) | JetBrains Marketplace | latest published minor |
+| Jolli Memory (Claude Code plugin) | `jolliai/jolli-claude-plugin` marketplace repo | latest published version |
 
 ## Disclosure
 

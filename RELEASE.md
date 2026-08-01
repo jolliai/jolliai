@@ -9,7 +9,9 @@ Each artifact has its own workflow but they share the branch model, signing requ
 
 > **Site generation lives in a separate package.** The seven `new` / `build` / `dev` / `start` / `convert` / `reverse` / `theme` commands are provided by the `@jolli.ai/site-cli` plugin, which the host CLI discovers at runtime via [`PluginLoader`](cli/src/PluginLoader.ts) and [`KnownPlugins`](cli/src/KnownPlugins.ts). That plugin is built and released from a separate repository on its own cadence — releasing the host CLI does not require coordinating with it. When the plugin isn't installed, the host CLI registers stub commands ([`SiteCommandStubs.ts`](cli/src/commands/SiteCommandStubs.ts)) so `jolli --help` still lists the site commands and tells the user how to install the plugin.
 
-> **Out of scope: IntelliJ plugin.** The `intellij/` deliverable currently uses its own legacy [`publish-intellij.yaml`](.github/workflows/publish-intellij.yaml) workflow (Gradle-based JetBrains Marketplace publish, no maintenance branches, no sigstore tag signing). It is **not** covered by this document. Migrating it to the same model is a separate piece of work.
+> **Out of scope: IntelliJ plugin.** The `intellij/` deliverable currently uses its own legacy [`publish-intellij.yaml`](.github/workflows/publish-intellij.yaml) workflow (Gradle-based JetBrains Marketplace publish, no maintenance branches, no sigstore tag signing, no `Production` environment gate, and no already-published pre-check — it takes no tag input and publishes whatever `version` sits in `build.gradle.kts` on the selected branch). It is **not** covered by this document. Migrating it to the same model is a separate piece of work.
+
+> **Out of scope: Claude Code plugin.** The `claude-plugin/` deliverable is built and gated by the normal `npm run all` chain, but has **no publish workflow**. It is published by running the bash scripts in [`claude-plugin/scripts/`](claude-plugin/scripts/), which build the bundle, assert it is complete, and mirror it into a separate marketplace repo. See [`claude-plugin/DEVELOPMENT.md`](claude-plugin/DEVELOPMENT.md).
 
 ## Branch model
 
@@ -39,7 +41,7 @@ release/1.6.x                ●─●─●  every release-cli-v* AND release-v
 
     Your first `git tag -s` opens a browser for GitHub OAuth — authorize once. Subsequent tags reuse the cached OIDC session until it expires.
 
-- Membership in the `Production` GitHub Environment (manual approval gate; all three workflows use the same environment).
+- Membership in the `Production` GitHub Environment (manual approval gate). This covers the two workflows in scope here, `publish-cli.yaml` and `publish-vscode.yaml`; the IntelliJ workflow has no environment gate.
 - For CLI: npm trusted publishing is configured for `@jolli.ai/cli` against `jolliai/jolliai` + `publish-cli.yaml` + the `Production` environment. No `NPM_TOKEN` is required.
 - For VS Code: long-lived PATs in repo secrets (`JOLLIMEMORY_VSCE_PAT` for VS Code Marketplace, `JOLLIMEMORY_OVSX_PAT` for Open VSX). Neither marketplace currently supports OIDC trusted publishing.
 - Permission to push tags matching `release-cli-v*` and/or `release-vscode-v*`.
@@ -147,7 +149,7 @@ For both:
 1. Confirm in the relevant marketplace UI (npmjs.com / marketplace.visualstudio.com / open-vsx.org) what was actually published.
 2. GitHub Actions → corresponding workflow → **Run workflow** → re-enter the existing tag name.
 
-If a publish *did* succeed but a downstream step failed (e.g. tag-attestation upload), the version is already public and immutable on the registry — there is nothing to rerun. Address the breakage and ship the next patch.
+If every publish step succeeded and only a non-publish step afterwards failed, the published version is already public and immutable — there is nothing to rerun. Address the breakage and ship the next patch. This is *not* the VS Code partial-failure case: that job publishes to two marketplaces in sequence, each guarded by its own already-published probe, so re-running the same tag is safe and skips whichever one already landed.
 
 ### E. Dry run before a real release
 

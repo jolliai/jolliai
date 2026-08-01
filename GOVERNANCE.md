@@ -6,15 +6,16 @@ as the contributor base grows.
 
 ## Project structure
 
-The repository is a monorepo containing three deliverables that share the
+The repository is a monorepo containing four deliverables that share the
 same product model and storage:
 
 - `cli/` — the `@jolli.ai/cli` npm package (the canonical implementation)
 - `vscode/` — the VS Code extension (bundles the CLI internally)
 - `intellij/` — the IntelliJ plugin (independent Kotlin port)
+- `claude-plugin/` — the Claude Code plugin (bundles the CLI internally)
 
-A single set of issues, pull requests, releases, and security advisories
-covers all three artifacts.
+A single set of issues, pull requests, and security advisories covers all
+four artifacts. Releases are per-artifact and independently versioned.
 
 ## Roles
 
@@ -78,8 +79,14 @@ correspondingly scoped team in CODEOWNERS has final approval.
 ## Releases
 
 The release procedure (branches, tags, signing, marketplace publishing) is
-documented in [`RELEASE.md`](RELEASE.md). Releases are triggered by manually
-running the relevant publish workflow against a signed tag.
+documented in [`RELEASE.md`](RELEASE.md). The CLI and the VS Code extension are
+released by manually running their publish workflow against a signed tag. The
+IntelliJ plugin uses a different workflow, which publishes whatever version is on
+the selected branch and takes no tag. The Claude Code plugin's bundle is produced
+by the same `npm run all` build chain as everything else, but it has **no publish
+workflow**: it is released by running the bash scripts in
+`claude-plugin/scripts/`, which mirror the built plugin into a separate
+marketplace repo.
 
 ## Code of Conduct
 

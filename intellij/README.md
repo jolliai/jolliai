@@ -4,7 +4,24 @@
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort.
 
-When you work with AI agents like Claude Code, Codex, or Gemini, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+When you work with AI agents like Claude Code, Codex, Gemini, Cursor, or Copilot, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+
+---
+
+## Installation
+
+Install from the [JetBrains Marketplace](https://plugins.jetbrains.com/): open **Settings > Plugins > Marketplace**, search for **Jolli Memory**, and click **Install**. Restart the IDE when prompted (the plugin requires a restart; it does not support dynamic unloading).
+
+Then open the **Jolli Memory** tool window from the right sidebar and follow the onboarding panel.
+
+### Requirements
+
+- **A JetBrains IDE on 2025.1 or newer** (build 251 through 262.\*). Works in any IDE on the platform, not just IDEA: the plugin depends only on the core platform and Git4Idea.
+- **Node.js 18 or newer on your `PATH`.** The plugin drives the bundled Jolli CLI for storage, MCP registration, and the `jolli-recall` / `jolli-search` skills. Without it the tool window still loads, but those features are unavailable and the plugin says so. **Node 22.5+ is recommended**: five sources (OpenCode, Cursor Composer, GitHub Copilot, Devin, and Antigravity) discover sessions through `node:sqlite`, which first ships in 22.5; below that those five are skipped and the rest keep working.
+- **An Anthropic API key, a Jolli account, or a locally-installed agent CLI** for summary generation. The Local Agent provider drives that CLI on its own subscription login, so it needs no key. With none of the three, hooks still record session metadata but no summary is written.
+- **GitHub CLI (`gh`)** only for **Create & Update PR**.
+
+Building from source instead? See [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ---
 
@@ -12,41 +29,61 @@ When you work with AI agents like Claude Code, Codex, or Gemini, the reasoning b
 
 After each commit, Jolli Memory reads your selected AI session transcripts and the code diff, calls the LLM to produce a structured summary, and stores it alongside the commit silently in the background. The IntelliJ plugin surfaces everything in a tool window so you can manage plans, stage files, write AI-assisted commit messages, review summaries, and share them, without leaving your IDE.
 
-### The tool window has five panels
+### The tool window
 
-| Panel | What it shows |
+The tool window (right sidebar, titled **JOLLI MEMORY**) opens on a **Current Branch / Memory Bank** view switch.
+
+**Current Branch** is a stack of three collapsible sections:
+
+| Section | What it shows |
 | -- | -- |
-| **STATUS** | Whether Jolli Memory is enabled, active AI agent sessions (Claude, Codex, Gemini), and how many memories are stored. Toggle on/off with the Enable / Disable buttons; sign in or out of your Jolli account from the same panel toolbar. |
-| **MEMORIES** | Every stored memory across all branches, with search and pagination. Use the search action to filter by keyword, or click **Load More** at the bottom to fetch older entries. |
-| **PLANS & NOTES** | Plans auto-detected from Claude Code sessions, plus your own notes (text snippets or imported Markdown files). Edit, remove, or associate items with commits. Use the **+ Add** button to add a plan, a Markdown file, or a quick text snippet. |
-| **CHANGES** | All changed files with checkboxes to stage or unstage. |
-| **COMMITS** | Every commit on the current branch not yet in main. Click to open the full AI summary. |
+| **PINNED** | Memories you have pinned for quick access. Sizes to its content rather than taking an equal share of the panel. |
+| **WORKING MEMORY** | Everything feeding the *next* commit's memory, folded into one section: **Conversations** (recent AI sessions across every supported tool), **Context** (auto-detected Claude Code plans, your own notes, and issue references from the conversation), and **Files** (changed files with staging checkboxes). Each sub-list caps at 6 rows with a "Show N more" expander. |
+| **COMMITTED MEMORIES** | Every commit on the current branch not yet in main. Click one to open its full summary. Multi-select to squash. Switches to a read-only mode for branches already merged. |
+
+**Memory Bank** is a cross-branch, cross-repo browser of every stored memory on disk, with **Tree** and **Timeline** modes, a search box (Timeline mode), a **Build Knowledge Wiki** action, and per-memory actions.
+
+Two more surfaces sit outside the accordion: a **Status** card (hook state, active sessions, stored-memory counts, connected Jolli Site, detected integrations) toggled from the **Status** icon in the tool window's title bar, and an **onboarding** card shown until the plugin is configured. A dismissible **backfill** card appears at the top of the stack when you enable Jolli in a repo that already has history.
 
 ---
 
 ## How it works
 
-Jolli Memory runs entirely in the background using two types of hooks — you don't need to do anything special.
+Jolli Memory runs in the background using two kinds of hooks. You don't need to do anything special.
 
-### AI Agent Hooks: knowing which sessions are active
+### AI agent sources: knowing which sessions are active
 
-When you use an AI coding agent, Jolli Memory keeps track of your active sessions so it knows where to find conversation context at commit time. These hooks **only record session metadata** (like a session ID and file path) — they never read your conversation content.
+Twelve transcript sources are supported. Only two of them install a hook; the rest are discovered by scanning the tool's own local session store, so there is nothing to configure per tool.
 
 | Agent | How sessions are tracked |
 | -- | -- |
-| **Claude Code** | A lightweight `StopHook` fires after each AI response |
+| **Claude Code** | A lightweight `StopHook` fires after each AI response; a `SessionStartHook` injects a mini-briefing at session start |
 | **Gemini** | An `AfterAgent` hook fires after each agent completion |
-| **Codex** | No hook needed — sessions are discovered automatically by scanning the filesystem |
+| **Codex** | No hook needed, sessions are discovered by scanning the filesystem |
+| **OpenCode** | No hook needed, discovered by reading OpenCode's local SQLite database |
+| **Cursor** | No hook needed, covers both the Composer IDE (SQLite stores) and the `cursor-agent` CLI (plaintext session store) |
+| **GitHub Copilot** | No hook needed, covers both the Copilot CLI session store and VS Code Copilot Chat's workspace storage |
+| **Cline** | No hook needed, covers both the VS Code extension's task store and the Cline CLI's session files |
+| **Devin CLI** | No hook needed, discovered from Devin's local SQLite database, scoped by working directory |
+| **Antigravity** | No hook needed, discovered from its per-conversation SQLite plus the sibling plaintext transcript log |
 
-### Git Hooks — generating summaries on commit
+Gemini's hook records only a session ID and file path. Claude's hook also scans the transcript as you work, to pick up plan files and issue references. The scan-based sources read transcript content too, at commit time to build the summary and on the sidebar's refresh to title recent conversations. All of that is local; see [Privacy](#privacy) for what is sent when a memory is generated.
 
-When you run `git commit`, three standard git hooks handle the rest:
+The plugin's **Settings > AI Agents** tab exposes six toggles: Claude Code, Codex, Gemini, OpenCode, Cursor, and GitHub Copilot. Two cover a pair of sources each: Cursor covers the Composer IDE and the `cursor-agent` CLI, and Copilot covers the CLI and VS Code Chat. Cline, Devin, and Antigravity are detected and tracked, but have no toggle in this plugin yet.
 
-1. **Before the commit**: detects if this is a squash or amend (so existing memories can be merged instead of regenerated)
-2. **After the commit**: spawns a background process that reads the AI conversation + code diff, calls the LLM, and writes the summary. **Your commit returns instantly** — the summary is generated in the background (~10-20 seconds)
-3. **After rebase/amend**: migrates existing summaries to match the new commit hashes, so nothing is lost
+### Git hooks: generating summaries on commit
 
-Everything is stored in a git orphan branch (`jollimemory/summaries/v3`), completely separate from your code history. Raw AI conversations are optionally preserved alongside the summaries and can be viewed, edited, or deleted from the plugin.
+Enabling Jolli installs standard git hooks that handle the rest:
+
+1. **Before the commit** (`prepare-commit-msg`): detects a squash so existing memories can be consolidated rather than regenerated
+2. **After the commit** (`post-commit`): enqueues the operation and spawns a background worker that reads the AI conversation and code diff, calls the LLM, and writes the summary. **Your commit returns instantly**; the summary lands about 10 to 20 seconds later
+3. **After rebase or amend** (`post-rewrite`): migrates existing summaries onto the new commit hashes, so nothing is lost
+4. **After merge or pull** (`post-merge`): folds newly arrived memories into the knowledge wiki
+5. **Before push** (`pre-push`): syncs memories, and never blocks the push if it fails
+
+By default every memory is **dual-written**: to the git orphan branch `jollimemory/summaries/v3` (the source of truth, completely separate from your code history) **and** to the **Memory Bank** folder on disk, which keeps a plain-Markdown copy you can read, `grep`, or pipe into other tools without going through the plugin. Raw AI conversations are dual-written the same way and can be viewed, edited, or deleted from the plugin.
+
+**Worktree-aware:** hooks and summaries work across `git worktree` checkouts.
 
 ---
 
@@ -54,7 +91,7 @@ Everything is stored in a git orphan branch (`jollimemory/summaries/v3`), comple
 
 ### AI Commit
 
-Click the sparkle button in the Changes panel toolbar to generate a commit message from your staged changes. The LLM produces a focused one-line message; a dialog lets you review and edit it before committing.
+Click the sparkle button in the Changes toolbar to generate a commit message from your staged changes. The LLM produces a focused one-line message; a dialog lets you review and edit it before committing.
 
 ### Push
 
@@ -62,109 +99,126 @@ Click Push to push the branch. If the push is rejected, a Force Push option is o
 
 ### Squash
 
-Select two or more commits, then click Squash. The LLM generates a commit message using the topics and decisions captured in each commit's memory. Two actions are offered: squash only, or squash and push together.
+Select two or more memories, then click Squash. Squash is a deliberate two-step action: the first click enters squash mode so checkboxes appear, and the second runs the squash on what you picked. That guard exists because consolidating memories is irreversible.
 
-Existing memories for all squashed commits are automatically merged — no extra AI call needed for that step.
+The LLM generates the combined commit message from the topics and decisions captured in each commit's memory. The memories themselves are then consolidated by a second LLM call that produces one rich summary preserving decision detail from every source commit; a mechanical merge remains as the fallback when that call fails (offline, quota exhausted), so squash never silently drops memories.
 
 ### Summary Viewer
 
-Click on any commit to open a full memory panel. It shows:
+Click any commit to open a full memory panel. It shows:
 
 * **Properties**: commit hash, branch, author, date, duration (working days), conversation count, and code change stats
-* **Plans & Notes**: associated plans and notes with edit, remove, and add actions (plans, Markdown files, or inline text snippets)
+* **Plans & Notes**: associated plans and notes with edit, remove, and add actions
+* **Issue, page & conversation references**: Linear, Jira, GitHub, Notion, and Slack items referenced in the AI conversation are extracted and rendered as first-class items with a deep link back to the source. They follow the commit through squash and rebase the same way plans and notes do
 * **E2E Test Guide**: AI-generated test scenarios with preconditions, steps, and expected results
 * **Source Commits** (for squash/amend): all contributing commits with diff stats and conversation counts
-* **Summaries**: each topic structured as:
-  * ⚡ **Why This Change**: the trigger from the AI conversation
-  * 💡 **Decisions Behind the Code**: key technical trade-offs and choices
-  * ✅ **What Was Implemented**: what was actually built
+* **Summaries**: each topic structured as ⚡ **Why This Change** → 💡 **Decisions Behind the Code** → ✅ **What Was Implemented**
 
-Action buttons:
-
-* **Copy Markdown**: copies the full summary to clipboard
-* **Share in Jolli**: publishes the summary (and associated plans and notes) to your Jolli Space
-* **Create & Update PR**: manages a GitHub PR for this commit
-
-### Share in Jolli Space
-
-Click **Share in Jolli** to publish the summary to your team's Jolli Space knowledge base. Jolli Space allows you to recall individual or shared memory for multiple devices or for different coding agent setups. Space team members can recall specific commits within the team.
-
-Plans and notes (both Markdown files and text snippets) are each uploaded as separate articles first, so their URLs appear in the summary. The summary itself is published last.
-
-Requires a Jolli account (use **Sign In to Jolli** below) or a manually configured Jolli API Key in Settings.
-
-### Sign In to Jolli
-
-Open **Settings > Tools > Jolli Memory** (or click the Sign In button in the tool window banner) and click **Sign In**. The plugin opens your default browser at the Jolli sign-in page and listens for the OAuth callback locally. After you sign in, the plugin receives an `authToken` and a `jolliApiKey` (`sk-jol-…`) and stores them in `~/.jolli/jollimemory/config.json` — the same file the CLI uses, so signing in once works for both surfaces.
-
-The `jolliApiKey` covers two flows: it lets the LLM proxy handle summary generation (so you don't need to manage an Anthropic key directly), and it authorises pushing summaries to your Jolli Space. You can still set a manual Anthropic API key in Settings if you prefer your own account; that key takes precedence.
-
-Click **Sign Out** in the same place to clear the stored credentials.
-
-### Plans & Notes
-
-Jolli Memory automatically detects Claude Code Plan files from your session transcripts and displays them in the **PLANS & NOTES** panel. You can also add your own notes — short text snippets or imported Markdown files — to capture context that doesn't live in the AI conversation.
-
-When you commit, active plans and notes are archived as snapshots in the orphan branch and associated with the commit.
-
-**Adding items** — use the **+ Add** button in the panel toolbar or inside the Summary Viewer:
-
-| Option | What it does |
-| -- | -- |
-| **Add Plan** | Pick from detected plans in `~/.claude/plans/` |
-| **Add Markdown File** | Import an external `.md` file |
-| **Add Text Snippet** | Open an inline form to write a quick note (title + content) |
-
-From the Summary Viewer, you can:
-
-* **Preview** a committed plan or note
-* **Edit** the item inline (changes are saved to the orphan branch)
-* **Remove** a plan or note association from a commit
-* **Associate** additional plans or notes with a commit
-
-Text snippets display their content inline in the Summary Viewer; Markdown notes show the filename.
+Action buttons: **Copy Markdown**, **Share in Jolli**, and **Create & Update PR**.
 
 ### Create & Update PR
 
-At the bottom of every memory panel, Jolli Memory can create or update a GitHub Pull Request:
+Opens a dedicated **Create PR** editor tab where you can review and edit the generated PR before it is opened.
 
-* **Create PR**: pre-fills the PR description with a streamlined summary: Jolli Memory URL → Plans → E2E Test Guide → Summaries (Why → Decisions → What). Only includes information not already visible on the GitHub PR page.
-* **Update PR**: refreshes the summary section in place (using `<!-- jollimemory-summary -->` markers) without affecting any text you've added manually.
+* **Create PR** pre-fills the description from your branch's memories: a Jolli Memory URL, plans, an E2E test guide, and a topic-by-topic summary. It deliberately omits anything already visible on the GitHub PR page.
+* **Update PR** refreshes the summary section in place between the `<!-- jollimemory-summary-start -->` and `<!-- jollimemory-summary-end -->` markers, without touching text you wrote by hand.
 
-Requires the `gh` CLI to be installed and authenticated.
+Requires the `gh` CLI, installed and authenticated.
 
-### Session Context Recall
+### Share in Jolli Space
 
-Jolli Memory feeds prior development context back into your AI agent so it can pick up where you (or a teammate) left off. Run `/jolli-recall` inside Claude Code (or any agent that supports it) to load the complete branch history: summaries, plans, decisions, and file-change statistics (up to ~30 000 tokens). The agent then reports what the branch is implementing, key technical decisions, what was last worked on, and the main files involved — so you can continue without re-reading the code.
+Click **Share in Jolli** to publish the summary to your team's Jolli Space knowledge base, so teammates and your other devices can recall it. Plans and notes are uploaded as separate articles first so their URLs appear in the summary; the summary is published last. When token usage was recorded for a memory, the shared copy carries a **Task usage** line: total tokens, a cost estimate, and the input / output / cached split, aggregated across squashed and amended commits.
 
-The `/jolli-recall` slash command is installed automatically into `.claude/skills/jolli-recall/SKILL.md` when you enable Jolli Memory.
+Requires a Jolli account (**Sign In to Jolli**) or a manually configured Jolli API Key.
 
-If the current branch has no memories, the command shows a catalog of branches that do, letting you pick one to recall. You can also pass a branch name or keyword as an argument (e.g. `/jolli-recall auth-refactor`).
+### Memory Bank
+
+Every repo gets a plain-Markdown copy of every memory on disk, alongside the canonical orphan-branch copy. The **Memory Bank** view browses it across branches and repos, in **Tree** or **Timeline** mode.
+
+Set the folder location under **Settings > Memory Bank**. Existing memories on the orphan branch are migrated into it for you.
+
+### Knowledge wiki
+
+The **Build Knowledge Wiki** action in the Memory Bank toolbar folds work scattered across many commits into per-topic pages, so a feature touched by ten commits reads as one evolving page instead of ten disconnected entries. A browsable `_wiki/` folder is written into your Memory Bank, and the same topic pages back the MCP server's search and decision-timeline tools. Requires a Jolli sign-in or an Anthropic API key.
+
+You rarely need to click it: the wiki is folded forward incrementally in the background after each commit. The knowledge **graph** visualization is not yet available in the IntelliJ plugin; export one from the CLI with `jolli graph` or use the VS Code extension.
+
+### Backfill
+
+Enabling Jolli in a repo that already has commits offers to write memories for that existing history, so your past work shows up too. Dismissing the card is remembered.
+
+### Memory Bank sync
+
+A status-bar widget reports cross-device sync state for your personal Memory Bank, so you can see at a glance whether the last round succeeded, is in flight, hit conflicts, or is offline.
+
+### Sign In to Jolli
+
+Open **Settings > Tools > Jolli Memory** (or click the Sign In button in the tool window banner) and click **Sign In**. The plugin opens your browser at the Jolli sign-in page and listens for the OAuth callback locally. It then stores an `authToken` and a `jolliApiKey` (`sk-jol-…`) in `~/.jolli/jollimemory/config.json`, the same file the CLI and the VS Code extension use, so signing in once works for every surface.
+
+The `jolliApiKey` covers two flows: it lets the Jolli LLM proxy handle summary generation (so you don't need to manage an Anthropic key), and it authorises pushing summaries to your Jolli Space. A manual Anthropic API key takes precedence when no provider is pinned; explicitly choosing **Jolli** or **Local Agent** in Settings > AI Summary routes summaries there regardless.
+
+### Plans & Notes
+
+Jolli Memory auto-detects Claude Code plan files from your session transcripts and shows them in **WORKING MEMORY**. You can also add your own notes, either short text snippets or imported Markdown files, to capture context that doesn't live in the AI conversation. When you commit, active plans and notes are archived as snapshots in the orphan branch and associated with the commit.
+
+Add items with the **+ Add** button (**Add Plan** from `~/.claude/plans/`, **Add Markdown File**, or **Add Text Snippet**). From the Summary Viewer you can preview, edit inline, remove an association, or associate additional items.
+
+---
+
+## Use your memory from your AI agent (MCP)
+
+When you enable Jolli in a repo, the bundled CLI also registers a `jollimemory` **MCP server** into every AI host it detects: Claude Code and Cursor per-repo (via `.mcp.json` and `.cursor/mcp.json`), and Gemini, Codex, OpenCode, Copilot CLI, VS Code Copilot Chat, Cline, Devin and Antigravity machine-wide. Ten hosts in total. Restart your agent afterward so it picks up the server.
+
+Ten tools are exposed: `search`, `recall`, `get_decision_timeline`, `list_branches`, `get_pr_description`, `queue_status`, `status`, plus `bind_space`, `list_spaces` and `push_memory` for Jolli Space. When you are signed in, your Jolli tenant's own platform tools are surfaced alongside them; turn that off with `mcpPlatformToolsEnabled=false`. You never call these by name; you ask a question and the agent picks the tool.
+
+The server itself is a local stdio process your agent spawns. The seven memory tools answer entirely from local storage, so your memories are never uploaded to be queried. The three Jolli Space tools, and any tenant platform tools, do call your Jolli tenant, as their names imply.
+
+The plugin detects a stale MCP registration (one pointing at a build that no longer exists) and repairs it on startup.
+
+## Session Context Recall
+
+Jolli Memory feeds prior development context back into your AI agent so it can pick up where you (or a teammate) left off.
+
+Five skills are installed when you enable Jolli. The two you will reach for most are **`jolli-recall`** (load a branch's complete history: summaries, plans, decisions, and file-change statistics, default budget 20,000 tokens) and **`jolli-search`** (search across every branch's memories); the others are `jolli-local-run`, `jolli-remote-run`, and the `jolli` umbrella menu. If the current branch has no memories, recall shows a catalog of branches that do.
+
+From the tool window's overflow menu, **Recall in Claude Code** and **Copy recall prompt for other tools** both put the recall prompt on your clipboard to paste into your agent. Individual memories have their own **Copy recall prompt** action.
 
 ---
 
 ## Configuration
 
-All settings can be configured from **Settings > Tools > Jolli Memory** or via the gear icon in the STATUS panel. They are stored globally in `~/.jolli/jollimemory/config.json` and shared with the `@jolli.ai/cli` and the VS Code extension:
+Settings live in two places, and both write to `~/.jolli/jollimemory/config.json`, shared with `@jolli.ai/cli` and the VS Code extension.
+
+**In the tool window** (gear icon), a five-tab dialog:
+
+| Tab | What it controls |
+| -- | -- |
+| **AI Agents** | A toggle per source (Claude Code, Codex, Gemini, OpenCode, Cursor, Copilot), plus a **Global Instructions** toggle that controls whether Jolli adds its "prefer these skills" note to your machine-global AI instruction files (`~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`). Off until you turn it on; turning it off removes the note. |
+| **AI Summary** | **Provider** selector (Anthropic / Jolli / Local Agent). The Anthropic card adds the API key, model, and max-output-tokens; the Jolli card shows sign-in state; the Local Agent card picks which locally-installed AI CLI to drive, using its own subscription, so no API key is needed. |
+| **Sync to Jolli** | Sign-in state for pushing memories to your Jolli Space, plus a per-repository **Push this repository's memories to Jolli** toggle. Turning it off keeps capturing memory locally while blocking outbound sync for this repo. |
+| **Memory Bank** | The on-disk folder path and sort order for your Markdown copies. |
+| **Others** | Exclude patterns for the Changes list, commit options, telemetry, privacy, and a **Pause** switch that temporarily disables hooks without losing configuration. |
+
+**Under Settings > Tools > Jolli Memory**: account sign-in/out, Anthropic API Key, Model, Jolli API Key, and Slack Workspace URL (used to build deep links for captured Slack thread references).
 
 | Field | Type | Default | Description |
 | -- | -- | -- | -- |
 | `apiKey` | string | `$ANTHROPIC_API_KEY` | Your Anthropic API key for AI summarization (generate one at [platform.claude.com](https://platform.claude.com/)) |
 | `model` | string | `claude-sonnet-4-6` | Model used for summarization. Accepts an alias (`sonnet`, `haiku`) or a full model ID. |
-| `jolliApiKey` | string | — | Jolli Space API key for pushing summaries to your team knowledge base. Auto-managed when you use **Sign In to Jolli**. |
-| `authToken` | string | — | OAuth auth token set automatically by **Sign In to Jolli** — not edited manually. |
+| `jolliApiKey` | string | — | Jolli Space API key. Auto-managed when you use **Sign In to Jolli**. |
+| `authToken` | string | — | OAuth auth token set automatically by **Sign In to Jolli**, not edited manually. |
+| `localFolder` | string | — | Memory Bank root on disk, where every memory is dual-written as Markdown. Written by Settings > Memory Bank, and shared verbatim with the CLI and the VS Code extension. (Configs from older IntelliJ builds used `knowledgeBasePath`; it is still read once, then migrated.) |
+| `knowledgeBaseSort` | enum | `date` | Sort order for the Memory Bank tree: `date` or `name`. |
+| `slack.workspaceUrl` | string | — | Your Slack workspace URL, used to build deep links for captured Slack references. |
 
 ---
 
-## Prerequisites
+## Privacy
 
-- IntelliJ IDEA 2024.3+
-- JDK 21+
+**Read locally.** Gemini's hook records only a session ID and file path. Claude's hook also scans the transcript as you work, to pick up plan files and issue references. The scan-based sources read transcript content too: at commit time to build the summary, and on the sidebar's refresh to title your recent conversations. All of that happens on your machine.
 
-## Installation
+**Sent when a memory is generated.** Writing a summary is an LLM call, so at commit time the transcript slice for that commit and the diff go to whichever provider you configured: Anthropic directly, the Jolli LLM proxy, or a local agent CLI. The Jolli proxy holds the payload in memory for the request only and never persists or logs it.
 
-1. Build the plugin: `./gradlew buildPlugin`
-2. In IntelliJ: **Settings > Plugins > Install Plugin from Disk**
-3. Select `build/distributions/jollimemory-intellij-*.zip`
-4. Restart the IDE
-5. Open the **Jolli Memory** tool window (right sidebar) and click **Enable**
+**Never sent to a team Jolli Space.** Sharing a memory uploads the summary and its plans and notes, not the raw transcript. Mirroring transcripts into your own personal space is a separate opt-in (`syncTranscripts`), off by default.
+
+See the [root README](../README.md#how-it-works) and [`SECURITY.md`](../SECURITY.md) for the full picture.

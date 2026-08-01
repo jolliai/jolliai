@@ -22,6 +22,8 @@ Install from the VS Code Marketplace:
 code --install-extension jolli.jollimemory-vscode
 ```
 
+**On a VS Code fork** (Cursor, VSCodium, Windsurf), the same extension is published to [Open VSX](https://open-vsx.org/extension/jolli/jollimemory-vscode), which is the registry those editors search by default. Search **Jolli Memory** in Extensions, or download the `.vsix` from that page and use **Extensions: Install from VSIX…**.
+
 Or search for **Jolli Memory** in the Extensions sidebar (`⌘⇧X` / `Ctrl+Shift+X`) and click **Install**.
 
 ### Requirements
@@ -64,7 +66,7 @@ Jolli Memory runs entirely in the background using two types of hooks, you don't
 
 ### AI Agent Hooks: knowing which sessions are active
 
-When you use an AI coding agent, Jolli Memory keeps track of your active sessions so it knows where to find conversation context at commit time. These hooks **only record session metadata** (like a session ID and file path), they never read your conversation content.
+When you use an AI coding agent, Jolli Memory keeps track of your active sessions so it knows where to find conversation context at commit time. Gemini's hook records only a session ID and file path. Claude's hook also scans the transcript as you work, to pick up plan files and issue references. The scan-based sources read transcript content too, at commit time to build the summary and on the sidebar's background refresh to title recent conversations. All of it happens on your machine; see [Privacy](#privacy) for what is sent when a memory is generated.
 
 | Agent | How sessions are tracked |
 | -- | -- |
@@ -295,7 +297,7 @@ Jolli Memory feeds prior development context back into your AI agent so it can p
 
 If the current branch has no memories, the command shows a catalog of branches that do, letting you pick one to recall. You can also pass a branch name or keyword as an argument (e.g. `/jolli-recall auth-refactor`).
 
-**Ask your agent directly (MCP server)** — when the extension enables a repo, it also registers a JolliMemory **MCP server** in that project's `.mcp.json`. The next time Claude Code starts, it can query your history conversationally — search past memories, recall a branch, trace how a decision evolved, and list which branches have memories — without you running any command. The `.mcp.json` entry is added to `.git/info/exclude` so it never gets committed (it points at a machine-local path). The server is bundled with the extension, so no separate CLI install is required.
+**Ask your agent directly (MCP server)** — when the extension enables a repo, it also registers a JolliMemory **MCP server** into every AI host it detects: Claude Code and Cursor per-repo, and Gemini, Codex, OpenCode, Copilot CLI, VS Code Copilot Chat, Cline, Devin and Antigravity machine-wide. Ten hosts in total, exposing ten built-in tools. The next time Claude Code starts, it can query your history conversationally — search past memories, recall a branch, trace how a decision evolved, and list which branches have memories — without you running any command. The `.mcp.json` entry is added to `.git/info/exclude` so it never gets committed (it points at a machine-local path). The server is bundled with the extension, so no separate CLI install is required.
 
 ---
 
