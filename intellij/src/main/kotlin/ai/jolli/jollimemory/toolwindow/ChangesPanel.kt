@@ -9,7 +9,7 @@ import com.intellij.diff.requests.SimpleDiffRequest
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationActivationListener
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.application.runReadAction
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
@@ -315,7 +315,7 @@ class ChangesPanel(
      */
     private fun readChangesFromClm(repoRoot: String): List<FileChange>? {
         return try {
-            ReadAction.compute<List<FileChange>?, RuntimeException> {
+            runReadAction<List<FileChange>?> {
                 val clm = ChangeListManager.getInstance(project)
                 val root = Paths.get(repoRoot)
                 val out = mutableListOf<FileChange>()
