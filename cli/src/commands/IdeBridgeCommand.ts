@@ -1044,12 +1044,14 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 		}
 		case "local-agent-tools": {
 			// The `LOCAL_AGENT_TOOLS` map in cli/src/core/localagent/ToolMeta.ts is
-			// the single source of truth for the four supported local-agent CLIs
-			// (claude-code / codex / cursor-agent / opencode). VS Code renders its
-			// Agent-tool <select> from the same map at bundle time; the IntelliJ
-			// SettingsDialog pulls this action instead so a new backend added to
-			// the map appears in the IntelliJ picker automatically, with no Kotlin
-			// port and no lockstep rule to maintain.
+			// the single source of truth for the supported local-agent CLIs
+			// (claude-code / codex / cursor-agent / opencode / kimi). VS Code renders
+			// its Agent-tool <select> from the same map at bundle time. IntelliJ pulls
+			// this action too, but as an *override* on top of a static Kotlin baseline
+			// (`LocalAgentTools.DEFAULT_TOOLS`) so its picker still shows every tool
+			// when this fetch fails — that baseline is a hand-maintained mirror of this
+			// map (pinned by `LocalAgentToolsTest`), so a tool added here must be added
+			// there in the same change.
 			const { LOCAL_AGENT_TOOLS } = await import("../core/localagent/ToolMeta.js");
 			return {
 				tools: Object.entries(LOCAL_AGENT_TOOLS).map(([id, meta]) => ({

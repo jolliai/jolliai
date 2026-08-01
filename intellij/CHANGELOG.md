@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.99.10
+
+### New Features
+
+- **More local agents, including Kimi Code** — the **Settings → AI Summary → Local Agent** picker now offers **Claude Code**, **Codex**, **Cursor**, **OpenCode**, and **Kimi Code** (Moonshot) for memory generation, each driven by its own subscription login — no API key needed.
+- **Set up a local agent from first run** — the onboarding screen now offers **Use a local agent CLI** alongside the Anthropic-key and Jolli sign-in options, so you can get started without any key.
+
+### Fixes & Improvements
+
+- **The Local Agent picker is reliable** — it now always lists every supported tool and keeps your selection across reopens, instead of falling back to Claude Code when the background tool-list lookup is slow or unavailable.
+
 ## 0.99.9
 
 ### New Features

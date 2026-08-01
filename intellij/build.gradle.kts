@@ -17,7 +17,7 @@ plugins {
 }
 
 group = "ai.jolli"
-version = "0.99.9"
+version = "0.99.10"
 
 repositories {
     mavenCentral()
@@ -185,7 +185,9 @@ intellijPlatform {
             <h3>Configuration</h3>
             <p>
                 A five-tab dialog in the tool window (gear icon) covers <b>AI Agents</b> (six toggles: Claude Code, Codex, Gemini, OpenCode, Cursor, Copilot),
-                <b>AI Summary</b> (provider, model, token budget), <b>Sync to Jolli</b>, <b>Memory Bank</b>
+                <b>AI Summary</b> (provider &mdash; an Anthropic key, Jolli, or a local agent CLI such as
+                Claude Code, Codex, Cursor, OpenCode, or Kimi Code driven by its own login &mdash; plus model and token budget),
+                <b>Sync to Jolli</b>, <b>Memory Bank</b>
                 (folder location) and <b>Others</b> (exclude patterns, telemetry, pause).
             </p>
             <p>

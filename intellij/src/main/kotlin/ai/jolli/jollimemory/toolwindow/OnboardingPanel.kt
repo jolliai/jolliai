@@ -1,11 +1,13 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.JolliMemoryIcons
+import ai.jolli.jollimemory.core.LocalAgentTools
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.util.Disposer
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPasswordField
@@ -17,6 +19,7 @@ import java.awt.FlowLayout
 import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.BoxLayout
+import javax.swing.DefaultComboBoxModel
 import javax.swing.JButton
 import javax.swing.JPanel
 import javax.swing.JSeparator
@@ -26,9 +29,10 @@ import javax.swing.SwingUtilities
  * Onboarding screen shown when Jolli Memory is not yet configured
  * (no Anthropic API key and not signed in to Jolli).
  *
- * Presents two options:
- *   1. Enter an Anthropic API key (inline field + save)
- *   2. Sign in to Jolli (OAuth flow)
+ * Presents three options (matching VS Code's onboarding, local-agent first):
+ *   1. Use a local agent CLI (tool dropdown + "Use Local Agent Tool") — no API key
+ *   2. Enter an Anthropic API key (inline field + save)
+ *   3. Sign in to Jolli (OAuth flow)
  *
  * Sign-in is fire-and-forget (matches VS Code): clicking the button opens the
  * browser and immediately returns. The onboarding → main view flip is driven
@@ -59,6 +63,10 @@ class OnboardingPanel(
 		content.add(Box.createVerticalStrut(16))
 
 		// ── Option 1: Anthropic API Key (top) ───────────────────
+		content.add(createLocalAgentSection())
+		content.add(Box.createVerticalStrut(14))
+		content.add(createOrSeparator())
+		content.add(Box.createVerticalStrut(14))
 		content.add(createAnthropicSection())
 		content.add(Box.createVerticalStrut(14))
 
@@ -104,6 +112,73 @@ class OnboardingPanel(
 	private fun createDivider(): JSeparator = JSeparator().apply {
 		alignmentX = LEFT_ALIGNMENT
 		maximumSize = Dimension(Int.MAX_VALUE, 1)
+	}
+
+	private fun createLocalAgentSection(): JPanel {
+		val section = JPanel().apply {
+			layout = BoxLayout(this, BoxLayout.Y_AXIS)
+			alignmentX = LEFT_ALIGNMENT
+		}
+
+		section.add(createOptionCard(
+			icon = JolliMemoryIcons.JolliLogo,
+			title = "Use a local agent CLI",
+			description = "Drive a local agent CLI (Claude Code, Codex, Cursor, OpenCode, Kimi) with its own login — " +
+				"no API key needed. Memories are stored locally only.",
+		))
+		section.add(Box.createVerticalStrut(6))
+
+		section.add(JBLabel("Agent tool:").apply { alignmentX = LEFT_ALIGNMENT })
+		section.add(Box.createVerticalStrut(4))
+
+		// Full static list (mirrors LOCAL_AGENT_TOOLS), so every tool is offered even
+		// when the ide-bridge probe is unavailable — same reliability as VS Code.
+		val tools = LocalAgentTools.DEFAULT_TOOLS
+		val toolCombo = ComboBox(DefaultComboBoxModel(tools.map { it.label }.toTypedArray())).apply {
+			alignmentX = LEFT_ALIGNMENT
+			maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+		}
+		section.add(toolCombo)
+		section.add(Box.createVerticalStrut(4))
+
+		section.add(JBLabel(
+			"<html><span style='color:gray'>Make sure you're signed in to the tool.</span></html>",
+		).apply { alignmentX = LEFT_ALIGNMENT })
+
+		val useButton = createBlueButton("Use Local Agent Tool")
+		useButton.addActionListener {
+			val tool = tools[toolCombo.selectedIndex.coerceAtLeast(0)]
+			useButton.isEnabled = false
+			useButton.text = "Setting up..."
+
+			val configDir = SessionTracker.getGlobalConfigDir()
+			val existing = SessionTracker.loadConfigFromDir(configDir)
+			val updated = existing.copy(
+				aiProvider = "local-agent",
+				localAgentTool = tool.id,
+				paused = null, // clear paused state
+			)
+			SessionTracker.saveConfigToDir(updated, configDir)
+
+			// Auto-enable: initialize + install hooks so no separate step is needed,
+			// matching the Anthropic/Jolli buttons. The local agent uses its own
+			// subscription login, so there is no key to store.
+			ApplicationManager.getApplication().executeOnPooledThread {
+				if (!service.isInitialized) service.initialize()
+				service.install()
+				ai.jolli.jollimemory.core.telemetry.Telemetry.track("surface_enabled", mapOf("trigger" to "onboarding"))
+				service.refreshStatus()
+				SwingUtilities.invokeLater {
+					useButton.isEnabled = true
+					useButton.text = "Use Local Agent Tool"
+					onApiKeySaved()
+				}
+			}
+		}
+		section.add(Box.createVerticalStrut(6))
+		section.add(useButton)
+
+		return section
 	}
 
 	private fun createAnthropicSection(): JPanel {

@@ -65,14 +65,18 @@ class SettingsDialog(
     }
     private val anthropicKeyField = JBPasswordField()
     /**
-     * Agent tool picker for the Local Agent provider. Populated at load time from
-     * the CLI-owned `LOCAL_AGENT_TOOLS` map over `jolli ide-bridge local-agent-tools`
-     * (see [LocalAgentTools.load]) so every backend the CLI supports —
-     * claude-code / codex / cursor-agent / opencode today — appears here without
-     * a Kotlin port to keep in lockstep. Initial model holds the fallback entry
-     * only; the async fetch replaces it on the EDT once the tool list arrives.
+     * Agent tool picker for the Local Agent provider. The initial model holds the
+     * FULL static baseline ([LocalAgentTools.DEFAULT_TOOLS] — claude-code / codex /
+     * cursor-agent / opencode / kimi), so the picker always offers every backend
+     * exactly like VS Code, even before (or without) a successful bridge fetch. The
+     * async `jolli ide-bridge local-agent-tools` fetch (see [LocalAgentTools.load])
+     * then overrides it on the EDT — authoritative when reachable (picks up ordering
+     * and any brand-new backend), but a failure keeps the full baseline rather than
+     * collapsing to Claude Code alone.
      */
-    private val localAgentToolCombo = ComboBox(DefaultComboBoxModel(arrayOf(LocalAgentTools.FALLBACK.label))).apply {
+    private val localAgentToolCombo = ComboBox(
+        DefaultComboBoxModel(LocalAgentTools.DEFAULT_TOOLS.map { it.label }.toTypedArray()),
+    ).apply {
         maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
     }
 
@@ -82,7 +86,7 @@ class SettingsDialog(
      * values so save-time can persist the CLI-side identifier (e.g. `codex`),
      * not the human label (`Codex`).
      */
-    private var localAgentTools: List<LocalAgentToolOption> = listOf(LocalAgentTools.FALLBACK)
+    private var localAgentTools: List<LocalAgentToolOption> = LocalAgentTools.DEFAULT_TOOLS
     private val modelCombo = ComboBox(DefaultComboBoxModel(arrayOf(
         "haiku — fastest, cheapest",
         "sonnet — balanced (default)",
@@ -1203,18 +1207,29 @@ class SettingsDialog(
      * combo was initialised with stays in place.
      */
     private fun refreshLocalAgentToolCombo() {
-        val projectDir = service.mainRepoRoot ?: project.basePath ?: return
         val currentId = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir()).localAgentTool
             ?: LocalAgentTools.FALLBACK.id
+        // Restore the saved selection SYNCHRONOUSLY from the static baseline
+        // (`localAgentTools` is DEFAULT_TOOLS here), so a reopened dialog shows the
+        // saved tool immediately. The previous code applied the selection ONLY in
+        // the async callback below — so a slow / hung / failed ide-bridge fetch left
+        // the combo on its default (Claude, index 0) and a saved non-Claude tool
+        // (e.g. kimi) looked "forgotten" even though it was persisted correctly.
+        applyLocalAgentSelection(localAgentTools, currentId)
+        val projectDir = service.mainRepoRoot ?: project.basePath ?: return
         ApplicationManager.getApplication().executeOnPooledThread {
             val tools = LocalAgentTools.load(projectDir)
             ApplicationManager.getApplication().invokeLater {
                 localAgentTools = tools
                 localAgentToolCombo.model = DefaultComboBoxModel(tools.map { it.label }.toTypedArray())
-                val selectIdx = tools.indexOfFirst { it.id == currentId }.takeIf { it >= 0 } ?: 0
-                localAgentToolCombo.selectedIndex = selectIdx
+                applyLocalAgentSelection(tools, currentId)
             }
         }
+    }
+
+    /** Selects the combo row whose tool id matches [currentId], else the first. */
+    private fun applyLocalAgentSelection(tools: List<LocalAgentToolOption>, currentId: String) {
+        localAgentToolCombo.selectedIndex = tools.indexOfFirst { it.id == currentId }.takeIf { it >= 0 } ?: 0
     }
 
     private fun populateFields(config: JolliMemoryConfig) {

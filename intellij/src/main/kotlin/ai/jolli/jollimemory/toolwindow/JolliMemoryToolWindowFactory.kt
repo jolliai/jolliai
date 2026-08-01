@@ -614,6 +614,13 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         fun isConfigured(): Boolean {
             val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
             if (config.paused == true) return true
+            // A local agent drives its own subscription login — no jollimemory-held key
+            // — so choosing it in onboarding is a complete setup. Mirrors the CLI's
+            // resolveLlmCredentialSource, which returns "local-agent" whenever the
+            // provider is selected, with no presence/key check. Without this the
+            // onboarding "Use Local Agent Tool" button saved config but never flipped
+            // to the main view.
+            if (config.aiProvider == "local-agent") return true
             if (!config.apiKey.isNullOrBlank()) return true
             if (!System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) return true
             if (!config.jolliApiKey.isNullOrBlank()) return true

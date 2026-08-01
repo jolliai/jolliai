@@ -155,8 +155,17 @@ class JcefBrowserPool(private val project: Project) : Disposable {
             if (!needsBuild) return@invokeLater
             val entry = try {
                 buildEntry("top-up:$source")
-            } catch (e: Exception) {
-                log.warn("top-up build failed (non-fatal): %s", e.message ?: "")
+            } catch (e: Throwable) {
+                // Throwable, not Exception: on IntelliJ 2026.2+ (build 262) JCEF was
+                // split into a separate platform module the plugin does not yet
+                // declare, so referencing `com.intellij.ui.jcef.JBCefBrowser` throws
+                // NoClassDefFoundError — an Error, which a `catch (Exception)` misses,
+                // letting it escape and get flagged by the plugin verifier's IDE-run
+                // check. Catching Throwable keeps the eager warm-up non-fatal; on
+                // <=261 JCEF loads fine so this never triggers. (Full JCEF rendering
+                // on 262 still needs the module-dependency migration; this only stops
+                // the startup crash so the rest of the plugin loads.)
+                log.warn("top-up build failed (non-fatal): %s", e.message ?: e.javaClass.simpleName)
                 return@invokeLater
             }
             var disposeNow = false
