@@ -11,6 +11,7 @@
     "configFilesOffLimits": ["cli/vite.config.ts", "vscode/vite.config.ts"]
   },
   "vcs": {
-    "forbiddenTrailers": ["Co-Authored-By", "Generated with"]
+    "forbiddenTrailers": ["Co-Authored-By", "Generated with"],
+    "signOff": true
   }
 }
