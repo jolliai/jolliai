@@ -72,6 +72,14 @@ describe("resolveTelemetryEnv", () => {
 		expect(resolveTelemetryEnv("not a url")).toBe("unknown");
 		expect(resolveTelemetryEnv("https://evil.example.com")).toBe("unknown");
 	});
+	it("honors JOLLI_TELEMETRY_ENV=sandbox over origin (E2B self-tag)", () => {
+		expect(resolveTelemetryEnv("https://acme.jolli.ai", { JOLLI_TELEMETRY_ENV: "sandbox" })).toBe("sandbox");
+		expect(resolveTelemetryEnv(undefined, { JOLLI_TELEMETRY_ENV: "sandbox" })).toBe("sandbox");
+	});
+	it("ignores a non-'sandbox' JOLLI_TELEMETRY_ENV value", () => {
+		expect(resolveTelemetryEnv("https://acme.jolli.ai", { JOLLI_TELEMETRY_ENV: "prod" })).toBe("prod");
+		expect(resolveTelemetryEnv("https://acme.jolli.ai", {})).toBe("prod");
+	});
 });
 
 describe("parseSurface", () => {

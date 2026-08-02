@@ -31,7 +31,7 @@ import { isTelemetryEventName, type TelemetryEventName } from "./TelemetryEvents
 /** Envelope schema version — bump only on a breaking envelope-shape change. */
 export const SCHEMA_VERSION = 1;
 
-export type TelemetryEnv = "local" | "dev" | "preview" | "prod" | "unknown";
+export type TelemetryEnv = "local" | "dev" | "preview" | "prod" | "sandbox" | "unknown";
 
 /** Count buckets (JOLLI-1786 §7.D) — never ship a raw count that could fingerprint. */
 export type BucketLabel = "0" | "1-5" | "6-20" | "21-100" | "100+";
@@ -180,8 +180,16 @@ export function saltedHash(value: string, salt: string, length = 12): string {
 	return createHash("sha256").update(`${salt}\x00${value}`).digest("hex").slice(0, length);
 }
 
-/** Derive `env` from the resolved jolli origin via the host allowlist. */
-export function resolveTelemetryEnv(origin?: string): TelemetryEnv {
+/**
+ * Derive `env` from the resolved jolli origin via the host allowlist.
+ *
+ * `JOLLI_TELEMETRY_ENV=sandbox` overrides the origin logic: E2B sandboxes set it
+ * so their telemetry self-tags as `env="sandbox"` and can be excluded downstream.
+ * It's stamped once at init and flows to every event, so this one guard tags the
+ * whole session.
+ */
+export function resolveTelemetryEnv(origin?: string, env: NodeJS.ProcessEnv = process.env): TelemetryEnv {
+	if (env.JOLLI_TELEMETRY_ENV === "sandbox") return "sandbox";
 	if (!origin) return "unknown";
 	let host: string;
 	try {
