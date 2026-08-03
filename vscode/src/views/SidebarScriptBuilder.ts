@@ -3509,8 +3509,16 @@ export function buildSidebarScript(): string {
   tabContents.branch.addEventListener('mouseover', function(e) {
     const row = e.target.closest('.tree-node[data-id]');
     if (!row) return;
-    const ctx = row.getAttribute('data-context');
-    if (ctx !== 'plan' && ctx !== 'note' && ctx !== 'reference') return;
+    // No data-context allowlist here on purpose. One used to sit at this line
+    // naming plan/note/reference, which made it a SECOND list of hover kinds
+    // beside the dispatch below — and it was the one that went stale: the
+    // skills row (data-context 'skills') returned here before ever reaching
+    // its renderer, so renderSkillsHoverCard was unreachable and the tooltip
+    // was no fallback (the extension contributes only a webview view, never a
+    // createTreeView, so SerializedTreeItem.tooltip is inert for every kind).
+    // lookupBranchHoverById already answers "does this row have hover data",
+    // so it is the only list that needs maintaining.
+    //
     // Inline action buttons own their own visual feedback; dismiss the row
     // hover card to avoid stacking a popover on top of a button tooltip.
     if (e.target.closest('.inline-actions')) {
@@ -3535,8 +3543,10 @@ export function buildSidebarScript(): string {
   tabContents.branch.addEventListener('mouseout', function(e) {
     const row = e.target.closest('.tree-node[data-id]');
     if (!row) return;
-    const ctx = row.getAttribute('data-context');
-    if (ctx !== 'plan' && ctx !== 'note' && ctx !== 'reference') return;
+    // No ctx allowlist here either — it has to stay symmetric with the mouseover
+    // above or a kind that can OPEN a card cannot close it. Leaving a row that
+    // never had a card is a harmless no-op: the hide path is already a no-op on
+    // an element that is hidden.
     const to = e.relatedTarget;
     // Stay open if mouse moved onto the card itself or stayed on the row
     // (transitioning between child spans — label / desc / icon).

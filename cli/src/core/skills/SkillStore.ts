@@ -295,7 +295,17 @@ export function foldSkillUse(use: SkillUse, prior: SkillFileContent | undefined)
 		byAt.set(incoming.at, moreCompleteInvocation(existing, incoming));
 	}
 
-	const merged = [...byAt.values()].sort((a, b) => (a.at === b.at ? 0 : a.at < b.at ? 1 : -1));
+	const merged = [...byAt.values()].sort((a, b) => {
+		/* v8 ignore start -- unreachable today: `byAt` is keyed on `at`, so two surviving
+		   invocations can never carry the same one. Kept anyway, because dropping it makes
+		   the comparator INCONSISTENT for a duplicate key (both argument orders would
+		   return the same sign), and V8's TimSort answers an inconsistent comparator with
+		   an arbitrary order — so a future change that admits duplicates would silently
+		   reorder this invocation list with no test failing. */
+		if (a.at === b.at) return 0;
+		/* v8 ignore stop */
+		return a.at < b.at ? 1 : -1;
+	});
 	const kept = merged.slice(0, SKILL_INVOCATION_CAP);
 	const trimmed = (prior?.trimmed ?? false) || merged.length > kept.length;
 	if (merged.length > kept.length) {
@@ -481,8 +491,13 @@ function parseInvocationLine(line: string): SkillInvocation | null {
 	const argsMatch = /args: ("(?:[^"\\]|\\.)*")/.exec(tail);
 	if (argsMatch !== null) {
 		try {
-			const parsed: unknown = JSON.parse(argsMatch[1]);
-			if (typeof parsed === "string") args = parsed;
+			// The cast is sound ONLY because of the capture group above: `"(?:[^"\\]|\\.)*"`
+			// can match nothing but a well-formed JSON string literal (the `[^"\\]` class
+			// stops the greedy run at the first unescaped quote), so a parse that returns
+			// at all returns a string, and a `typeof` re-check would be a branch no input
+			// can take. Relaxing that regex invalidates this — restore the check if it
+			// ever admits a bare number, object, or array.
+			args = JSON.parse(argsMatch[1]) as string;
 		} catch {
 			// Unrecoverable args text is dropped; the invocation itself still counts.
 		}

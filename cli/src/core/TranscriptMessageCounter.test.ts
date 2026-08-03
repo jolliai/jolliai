@@ -396,6 +396,60 @@ describe("countTranscriptMessages", () => {
 			expect(entries).toHaveLength(2);
 		});
 
+		// Every source has to be routed to its own reader. These three were added
+		// after the switch and had no arm-level cover: a missing arm silently falls
+		// through to the Claude parser, which reads a Devin sqlite path or an
+		// Antigravity JSONL as Claude JSONL and reports zero messages forever.
+		it.each([
+			["devin", "sessions.db#sess-1"],
+			["cursor-cli", "chat.jsonl"],
+			["antigravity", "transcript_full.jsonl"],
+		] as const)("routes %s to its own reader and degrades to [] when unreadable", async (source, name) => {
+			// A projectDir is required or the loader short-circuits to the full-
+			// transcript path and never reaches the per-source switch. The temp dir
+			// has no cursors.json, so the reader is also handed a null cursor.
+			const projectDir = mkdtempSync(join(tmpdir(), "msg-counter-src-"));
+			try {
+				const entries = await loadUnreadTranscript(source, join(dir, "does-not-exist", name), projectDir);
+				expect(entries).toEqual([]);
+			} finally {
+				rmSync(projectDir, { recursive: true, force: true });
+			}
+		});
+
+		// The Antigravity reader takes `TranscriptCursor | undefined` (not `| null`),
+		// so the loader has to translate a "no cursor stored" null. Both sides of
+		// that translation need to hold.
+		it("passes a stored cursor through to the Antigravity reader", async () => {
+			const projectDir = mkdtempSync(join(tmpdir(), "msg-counter-agy-"));
+			try {
+				const file = join(dir, "agy-unread.jsonl");
+				writeFileSync(
+					file,
+					[
+						JSON.stringify({ type: "USER_INPUT", created_at: "2026-07-19T09:00:00Z", content: "used" }),
+						JSON.stringify({ type: "USER_INPUT", created_at: "2026-07-19T09:00:01Z", content: "fresh" }),
+						"",
+					].join("\n"),
+				);
+				const jmDir = join(projectDir, ".jolli", "jollimemory");
+				mkdirSync(jmDir, { recursive: true });
+				writeFileSync(
+					join(jmDir, "cursors.json"),
+					JSON.stringify({
+						version: 1,
+						cursors: {
+							[file]: { transcriptPath: file, lineNumber: 1, updatedAt: "2026-07-19T09:00:00Z" },
+						},
+					}),
+				);
+				const entries = await loadUnreadTranscript("antigravity", file, projectDir);
+				expect(entries.map((e) => e.content)).toEqual(["fresh"]);
+			} finally {
+				rmSync(projectDir, { recursive: true, force: true });
+			}
+		});
+
 		it("returns an empty array on read failure", async () => {
 			const projectDir = mkdtempSync(join(tmpdir(), "msg-counter-raw-err-"));
 			try {

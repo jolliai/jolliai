@@ -441,6 +441,73 @@ describe("readDevinTranscript", () => {
 		await rm(dir, { recursive: true, force: true });
 	});
 
+	// pickFallbackTip ranks leaves by `metadata.created_at`. A node that carries no
+	// metadata at all scores NaN → treated as -Infinity, so any timestamped leaf
+	// outranks it and the untimed one only wins on the node_id tie-break.
+	it("ranks a leaf with no created_at below every timestamped leaf when inferring the tip", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "devin-untimed-leaf-"));
+		const p = join(dir, "s.db");
+		const db = new DatabaseSync(p);
+		db.exec(
+			"CREATE TABLE sessions(id TEXT, main_chain_id INTEGER); CREATE TABLE message_nodes(session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message TEXT);",
+		);
+		db.prepare("INSERT INTO sessions VALUES('s', NULL)").run();
+		// Highest node_id, but NO metadata → NaN → must lose to the timestamped leaf.
+		db.prepare("INSERT INTO message_nodes VALUES('s',9,NULL,?)").run(
+			JSON.stringify({ role: "assistant", content: "untimed-loser" }),
+		);
+		db.prepare("INSERT INTO message_nodes VALUES('s',1,NULL,?)").run(
+			JSON.stringify({
+				role: "assistant",
+				content: "timestamped-winner",
+				metadata: { created_at: "2026-07-18T00:00:00Z" },
+			}),
+		);
+		db.close();
+
+		const { entries } = await readDevinTranscript(`${p}#s`);
+		expect(entries.map((e) => e.content)).toEqual(["timestamped-winner"]);
+
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	// A fully-cyclic graph (every node is someone's parent) has no leaves at all.
+	// Rather than crash on an empty candidate list, the tip is inferred from every
+	// node — and buildMainChain's `visited` set stops the walk from looping.
+	it("still infers a tip when the node graph is fully cyclic (no leaves)", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "devin-cyclic-"));
+		const p = join(dir, "s.db");
+		const db = new DatabaseSync(p);
+		db.exec(
+			"CREATE TABLE sessions(id TEXT, main_chain_id INTEGER); CREATE TABLE message_nodes(session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message TEXT);",
+		);
+		db.prepare("INSERT INTO sessions VALUES('s', NULL)").run();
+		const mk = (content: string, createdAt: string) =>
+			JSON.stringify({ role: "assistant", content, metadata: { created_at: createdAt } });
+		// 1 → 2 → 1: each node parents the other, so `parentIds` covers both.
+		db.prepare("INSERT INTO message_nodes VALUES('s',1,2,?)").run(mk("older", "2026-07-18T00:00:00Z"));
+		db.prepare("INSERT INTO message_nodes VALUES('s',2,1,?)").run(mk("newer-tip", "2026-07-18T01:00:00Z"));
+		db.close();
+
+		const { entries } = await readDevinTranscript(`${p}#s`);
+		// Tip is the newest node; the walk terminates after visiting both once.
+		expect(entries.map((e) => e.content)).toEqual(["older\n\nnewer-tip"]);
+
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	// Cursors are read back from JSON on disk, so a record written before
+	// `lineNumber` existed arrives without it. Resume from the start rather than
+	// producing `NaN` indices.
+	it("treats a cursor with no lineNumber at all as a read from the start", async () => {
+		const legacy = { transcriptPath, updatedAt: "2026-07-18T00:00:00Z" } as unknown as Parameters<
+			typeof readDevinTranscript
+		>[1];
+		const fromScratch = await readDevinTranscript(transcriptPath);
+		const resumed = await readDevinTranscript(transcriptPath, legacy);
+		expect(resumed.entries).toEqual(fromScratch.entries);
+	});
+
 	it("falls back to the positional lineNumber for a legacy cursor without an anchorId", async () => {
 		// A cursor persisted before anchors existed carries only lineNumber. The reader
 		// must still resume positionally (and clamp an over-long lineNumber to the chain).

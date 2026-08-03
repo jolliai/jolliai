@@ -249,4 +249,54 @@ describe("runInvocation", () => {
 			vi.useRealTimers();
 		}
 	});
+
+	// Mirror of the case above: the child wins the race, so the timeout must be
+	// cancelled — otherwise a finished run would still be SIGTERM'd (and a
+	// long-lived host would leak a kill timer per call).
+	it("cancels its timeout once the child has finished", async () => {
+		vi.useFakeTimers();
+		try {
+			const child = makeFakeChild();
+			const promise = runInvocation(inv, { timeoutMs: 50, spawnImpl: spawnReturning(child) });
+			child.stdout.write("done");
+			child.stdout.end();
+			child.stderr.end();
+			child.emit("close", 0);
+			await expect(promise).resolves.toBe("done");
+
+			// The late timer must not kill anything or reject a settled promise.
+			await vi.advanceTimersByTimeAsync(60);
+			expect(child.kill).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	// A stream configured with an encoding emits strings, not Buffers. Both
+	// pipes have to cope, or the output is `[object Object]`-ish garbage.
+	it("accepts string chunks on stdout and stderr, not just Buffers", async () => {
+		const child = makeFakeChild();
+		child.stdout.setEncoding("utf8");
+		child.stderr.setEncoding("utf8");
+		const promise = runInvocation(inv, { spawnImpl: spawnReturning(child) });
+		child.stdout.write("chunked ");
+		child.stdout.write("output");
+		child.stderr.write("a warning");
+		child.stdout.end();
+		child.stderr.end();
+		child.emit("close", 0);
+		await expect(promise).resolves.toBe("chunked output");
+	});
+
+	// No `spawnImpl` override: the production default really launches a process.
+	it("spawns for real when no spawnImpl is injected", async () => {
+		const out = await runInvocation({
+			file: process.execPath,
+			args: ["-e", "process.stdout.write('from a real child')"],
+			stdin: "",
+			env: {},
+			cwd: process.cwd(),
+		});
+		expect(out).toBe("from a real child");
+	});
 });

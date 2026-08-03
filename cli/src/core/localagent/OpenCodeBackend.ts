@@ -26,7 +26,8 @@ export function expandOpenCodeShim(shimPath: string, deps: ShimDeps): Candidate[
 	return deps.exists(exe) ? [{ file: exe }] : [];
 }
 
-const OPENCODE_SPEC = {
+/** Exported so the install-location rules can be asserted per platform in tests. */
+export const OPENCODE_SPEC = {
 	binName: "opencode",
 	knownPaths: (home: string, platform: NodeJS.Platform) =>
 		platform === "win32"

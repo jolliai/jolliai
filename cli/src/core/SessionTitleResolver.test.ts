@@ -150,6 +150,33 @@ describe("resolveSessionTitle", () => {
 	});
 });
 
+// Every source has an entry in PARSE_LINE, but the ones whose discoverer always
+// supplies a native title are deliberate no-op stubs — they exist so the record
+// stays exhaustive over TranscriptSource, not because a line format was ever
+// reverse-engineered for them. Pin that: the resolver must still hand the
+// fallback a parser, and that parser must decline every line rather than invent
+// a title from a transcript shape nobody verified.
+describe("PARSE_LINE stubs for discoverer-titled sources", () => {
+	it.each(["opencode", "cursor", "copilot", "cline", "cline-cli", "devin", "cursor-cli", "antigravity"] as const)(
+		"passes a parser for %s that declines every line",
+		async (source) => {
+			vi.mocked(readFirstUserMessageTitle).mockResolvedValueOnce("(untitled session)");
+			await resolveSessionTitle({
+				sessionId: "s1",
+				transcriptPath: "/tmp/x.jsonl",
+				updatedAt: "2026-05-15T00:00:00Z",
+				source,
+			});
+
+			const { parseLine } = vi.mocked(readFirstUserMessageTitle).mock.calls.at(-1)?.[0] ?? {};
+			expect(parseLine).toBeTypeOf("function");
+			for (const line of ['{"type":"user","content":"hello"}', "not json", ""]) {
+				expect(parseLine?.(line)).toBeUndefined();
+			}
+		},
+	);
+});
+
 // `firstUserMessageTitleFromEntries` is a pure helper exposed for the
 // sidebar aggregator's "load once, derive both count and title" shortcut.
 // Tested directly so the mergedEntries→title contract stays pinned even if

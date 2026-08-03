@@ -364,6 +364,45 @@ describe("subtractDetachedUsage", () => {
 		expect(result.summary.conversationTokenBreakdown).toEqual({ input: 150, output: 150, cached: 250 });
 	});
 
+	it("pools two transcripts owned by the same node into one subtraction", () => {
+		// A leaf routinely lists several transcript ids (one per conversation that fed
+		// the commit). Detaching from two of them must sum into a single correction of
+		// that node, not overwrite the first bucket with the second.
+		const summary = node({
+			transcripts: ["t1", "t2"],
+			conversationTokens: 3330,
+			conversationTokenBreakdown: { input: 30, output: 3000, cached: 300 },
+		});
+		const result = subtractDetachedUsage(
+			summary,
+			new Map([
+				["t1", [{ usage: { input: 10, output: 1000, cached: 100 } }]],
+				["t2", [{ usage: { input: 5, output: 500, cached: 50 } }]],
+			]),
+		);
+		expect(result.summary.conversationTokenBreakdown).toEqual({ input: 15, output: 1500, cached: 150 });
+		expect(result.summary.conversationTokens).toBe(1665);
+		expect(result.unattributed).toEqual([]);
+	});
+
+	it("keeps the children array itself when only the root changed", () => {
+		// The mirror of the case above: a rebuilt array on an unchanged subtree would
+		// defeat the reference comparison callers use to skip a rewrite.
+		const child = node({ commitHash: "b".repeat(40), transcripts: ["t2"], conversationTokens: 50 });
+		const summary = node({
+			transcripts: ["t1"],
+			conversationTokens: 3330,
+			conversationTokenBreakdown: { input: 30, output: 3000, cached: 300 },
+			children: [child],
+		});
+		const result = subtractDetachedUsage(
+			summary,
+			removed("t1", [{ usage: { input: 10, output: 1000, cached: 100 } }]),
+		);
+		expect(result.summary.conversationTokens).toBe(2220);
+		expect(result.summary.children).toBe(summary.children);
+	});
+
 	it("drops a model whose tokens are fully detached while keeping the others", () => {
 		const haiku: ModelTokenUsage = {
 			model: "claude-haiku-4-5",
@@ -625,6 +664,34 @@ describe("subtractDetachedUsage — skill figures", () => {
 			removed("t1", detached("claude:sessA", { input: 10, output: 1000, cached: 100 })),
 		);
 		expect(result.summary.skills?.[0].usage?.confidence).toBe("attributed");
+	});
+
+	it("keeps the estimate label when an estimated session is what survives", () => {
+		// The mirror of the case above. A total is only as trustworthy as its weakest
+		// contributor, so dropping the attributed session must not promote the remainder
+		// from "estimated" to "attributed".
+		const summary = node({
+			transcripts: ["t1"],
+			skills: [
+				skill({
+					usage: { input: 30, cached: 300, output: 3000, confidence: "estimated" },
+					usageBySession: {
+						"claude:sessA": { input: 10, cached: 100, output: 1000, confidence: "attributed" },
+						"claude:sessB": { input: 20, cached: 200, output: 2000, confidence: "estimated" },
+					},
+				}),
+			],
+		});
+		const result = subtractDetachedUsage(
+			summary,
+			removed("t1", detached("claude:sessA", { input: 10, output: 1000, cached: 100 })),
+		);
+		expect(result.summary.skills?.[0].usage).toEqual({
+			input: 20,
+			cached: 200,
+			output: 2000,
+			confidence: "estimated",
+		});
 	});
 
 	it("reports changed when only skill figures moved", () => {

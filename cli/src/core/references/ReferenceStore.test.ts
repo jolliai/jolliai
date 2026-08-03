@@ -9,6 +9,36 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // a real source's id would make an unrelated edit to that definition fail them.
 // Extending is safe: no other test in this file references this id, and every shipped
 // definition is left exactly as loaded.
+// Every SHIPPED source that sets either flag sets both, so the two single-flag
+// note variants are only reachable through synthetic definitions. They exist so
+// the note stays correct if a future source ever picks just one.
+const { ARGS_ONLY_DEF, TRACK_ONLY_DEF } = vi.hoisted(() => {
+	const base = (id: string, label: string) => ({
+		id,
+		label,
+		icon: "history",
+		match: { claude: { prefixes: [`mcp__${id}__`] } },
+		wrapperKeys: [],
+		reference: {
+			nativeId: { pipe: [{ op: "path", path: "tool" }] },
+			title: { pipe: [{ op: "path", path: "tool" }] },
+			description: { pipe: [{ op: "path", path: "query" }], optional: true },
+		},
+		fields: [],
+		storage: { nativeIdPathSafe: true },
+	});
+	return {
+		ARGS_ONLY_DEF: {
+			...base("argsonly", "Args Only"),
+			argumentsDerived: true,
+		} as unknown as import("./SourceDefinition.js").SourceDefinition,
+		TRACK_ONLY_DEF: {
+			...base("trackonly", "Track Only"),
+			trackOnly: true,
+		} as unknown as import("./SourceDefinition.js").SourceDefinition,
+	};
+});
+
 const { ACCUMULATING_DEF } = vi.hoisted(() => ({
 	ACCUMULATING_DEF: {
 		id: "acctest",
@@ -42,7 +72,12 @@ vi.mock("./SourceDefinitionRegistry.js", async (importOriginal) => {
 	return {
 		...actual,
 		getRegistry: (): SourceDefinitionRegistry => {
-			patched ??= new actual.SourceDefinitionRegistry([...actual.getRegistry().all(), ACCUMULATING_DEF]);
+			patched ??= new actual.SourceDefinitionRegistry([
+				...actual.getRegistry().all(),
+				ACCUMULATING_DEF,
+				ARGS_ONLY_DEF,
+				TRACK_ONLY_DEF,
+			]);
 			return patched;
 		},
 	};
@@ -485,6 +520,33 @@ describe("ReferenceStore", () => {
 			expect(ref?.fields).toBeUndefined();
 		});
 
+		it("skips a fields list item that parses to a scalar or null", async () => {
+			// Valid JSON, wrong shape: one corrupt row must not drop the reference.
+			const file = join(tempDir, "scalar-list.md");
+			await writeFile(
+				file,
+				[
+					"---",
+					'source: "linear"',
+					'nativeId: "PROJ-3"',
+					'title: "t"',
+					'url: "u"',
+					"fields:",
+					"  - 42",
+					"  - null",
+					'  - "a string"',
+					'  - {"key":"status","label":"Status","value":"open"}',
+					'referencedAt: ""',
+					'sourceToolName: "x"',
+					"---",
+					"",
+				].join("\n"),
+				"utf-8",
+			);
+			const ref = await readReferenceMarkdown(file);
+			expect(ref?.fields).toEqual([{ key: "status", label: "Status", value: "open" }]);
+		});
+
 		it("skips a fields list item whose key has unsafe characters, keeps valid items", async () => {
 			// `key` is interpolated raw into the prompt's <issue …> attribute name,
 			// which can't be quote-escaped — so a poisoned orphan-branch key like
@@ -725,6 +787,33 @@ describe("ReferenceStore", () => {
 			expect(content).toContain("bookmark, not a full copy");
 			expect(content).toContain("Track-only");
 		});
+
+		// The note is assembled from independent paragraphs, one per flag. Every
+		// shipped source sets both, so these pin the halves in isolation.
+		it("emits only the bookmark paragraph for an arguments-derived source", async () => {
+			const ref = linearRef({ mapKey: "argsonly:q", source: "argsonly", nativeId: "q", url: undefined });
+			const { sourcePath } = await writeReferenceMarkdown(ref, tempDir);
+			const content = await readFile(sourcePath, "utf-8");
+			expect(content).toContain("bookmark, not a full copy");
+			expect(content).not.toContain("Track-only");
+		});
+
+		it("emits only the track-only paragraph for a track-only source", async () => {
+			const ref = linearRef({ mapKey: "trackonly:q", source: "trackonly", nativeId: "q", url: undefined });
+			const { sourcePath } = await writeReferenceMarkdown(ref, tempDir);
+			const content = await readFile(sourcePath, "utf-8");
+			expect(content).toContain("Track-only");
+			expect(content).not.toContain("bookmark, not a full copy");
+		});
+	});
+
+	it("omits the body entirely when the description is only edge newlines", async () => {
+		// `stripBodyEdges` eats the newlines and leaves nothing — the render must
+		// then emit no body at all rather than a blank line, since the guard hash
+		// is taken over the exact bytes.
+		const { sourcePath } = await writeReferenceMarkdown(linearRef({ description: "\n\n\n" }), tempDir);
+		expect((await readFile(sourcePath, "utf-8")).trimEnd().endsWith("---")).toBe(true);
+		expect((await readReferenceMarkdown(sourcePath))?.description).toBeUndefined();
 	});
 
 	describe("mergeAccumulatedBody", () => {

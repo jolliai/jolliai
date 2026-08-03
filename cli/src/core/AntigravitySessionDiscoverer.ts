@@ -68,7 +68,12 @@ export function extractWorkspacePath(blob: Uint8Array): string | undefined {
 	if (len < FILE_URI_PREFIX.length || idx + len > buf.length) return undefined;
 
 	const value = buf.toString("utf8", idx, idx + len);
+	/* v8 ignore start -- unreachable: `idx` is a latin1 (byte-for-byte) match on the
+	   ASCII prefix and the guard above proves the slice is at least that long, so the
+	   utf8 re-decode always starts with it. Kept as a belt-and-braces guard in case
+	   the offset search above is ever changed to something lossier. */
 	if (!value.startsWith(FILE_URI_PREFIX)) return undefined;
+	/* v8 ignore stop */
 	// Antigravity is VS Code-based; the recorded URI is percent-encoded
 	// (`Uri.toString()`), so spaces / non-ASCII segments arrive as %XX and must
 	// be decoded before the on-disk path comparison. Fall back to the raw slice

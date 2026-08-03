@@ -5437,6 +5437,50 @@ describe("QueueWorker", () => {
 			expect(saved.references?.[0].archivedKey).toBe("linear:PROJ-1-abc12345");
 		});
 
+		it("amend fresh-leaf attaches archived skills to the summary (skills spread)", async () => {
+			// Regression: the fresh leaf spread plans/notes/references but NOT skills,
+			// while both other amend paths (short-circuit, full consolidation) did. The
+			// association had already guarded the registry row and emitted the orphan
+			// bytes by then, so the skills were archived and then referenced by nothing
+			// — gone from the working area AND absent from the summary.
+			const op = makeCommitOp({
+				type: "amend",
+				commitHash: "abc12345def67890",
+				branch: "feature/x",
+				sourceHashes: ["0123456789abcdef0123456789abcdef01234567"],
+			});
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks("abc12345def67890");
+			vi.mocked(getCurrentBranch).mockResolvedValue("feature/x");
+			// Non-trivial delta + no old summary → fresh-leaf path.
+			vi.mocked(getDiffStats).mockResolvedValue({ filesChanged: 1, insertions: 60, deletions: 1 });
+			const { associateSkillsWithCommit } = await import("../core/skills/SkillArchive.js");
+			vi.mocked(associateSkillsWithCommit).mockResolvedValue({
+				refs: [
+					{
+						archivedKey: "claude:superpowers:brainstorming-abc12345",
+						source: "claude",
+						skill: "superpowers:brainstorming",
+						plugin: "superpowers",
+						entryPaths: ["tool"],
+						invocationCount: 2,
+						firstUsedAt: "2026-05-14T06:00:00.000Z",
+						lastUsedAt: "2026-05-14T06:30:00.000Z",
+					},
+				],
+				filesToStore: [{ path: "skills/claude/superpowers-brainstorming-abc12345.md", content: "# skill" }],
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(storeSummary).toHaveBeenCalledTimes(1);
+			const saved = vi.mocked(storeSummary).mock.calls[0][0];
+			expect(saved.skills?.[0].archivedKey).toBe("claude:superpowers:brainstorming-abc12345");
+		});
+
 		it("clears the AI selection layer once, up front, on an amend", async () => {
 			// A `git commit --amend` moves HEAD → the panel's cached fingerprint is
 			// stale, so every amend path invalidates it (mirrors the normal pipeline's

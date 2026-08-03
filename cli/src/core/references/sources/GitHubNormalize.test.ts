@@ -72,6 +72,13 @@ describe("reshapeGitHubIssue", () => {
 		expect(out.assignees).toBeUndefined();
 	});
 
+	// GitHub search hits can arrive with a non-string (or absent) title; the
+	// reshaper must omit the key rather than carry `undefined`/a number through.
+	it("omits `title` when it is absent or not a string", () => {
+		expect("title" in reshape({ number: 1 })).toBe(false);
+		expect("title" in reshape({ number: 1, title: 42 })).toBe(false);
+	});
+
 	it("returns non-object input unchanged", () => {
 		expect(reshapeGitHubIssue(123)).toBe(123);
 		expect(reshapeGitHubIssue(null)).toBe(null);

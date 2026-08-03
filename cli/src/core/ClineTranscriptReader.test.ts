@@ -138,4 +138,38 @@ describe("readClineTranscript", () => {
 		const r = await readClineTranscript(join(dir, "nope.json"));
 		expect(r.entries).toEqual([]);
 	});
+
+	// Cline's own extension always writes block arrays, but the Anthropic
+	// message shape it mirrors permits a bare string `content`. Treat it as a
+	// single text block so a provider (or a future Cline version) emitting the
+	// short form still yields the human's words instead of an empty turn.
+	it("treats a bare string content as a single text block", async () => {
+		const stringContent = [
+			{ role: "user", content: "<task>\nsummarize the diff\n</task>", ts: 1000 },
+			{ role: "assistant", content: "Here is the summary.", ts: 2000 },
+		];
+		await writeFile(path, JSON.stringify(stringContent), "utf8");
+		const r = await readClineTranscript(path);
+		expect(r.entries).toEqual([
+			{ role: "human", content: "summarize the diff", timestamp: new Date(1000).toISOString() },
+			{ role: "assistant", content: "Here is the summary.", timestamp: new Date(2000).toISOString() },
+		]);
+	});
+
+	// A message with no `content` key at all (observed on aborted turns) must
+	// not throw — `textBlocks` iterates an empty list and the turn drops out.
+	it("tolerates a message with no content field", async () => {
+		await writeFile(path, JSON.stringify([{ role: "user", ts: 1000 }, { role: "assistant" }]), "utf8");
+		const r = await readClineTranscript(path);
+		expect(r.entries).toEqual([]);
+	});
+
+	// Valid JSON that is not an array (e.g. a `{ "error": … }` written by a
+	// crashed export) must degrade to "no messages", not throw.
+	it("returns empty for valid JSON that is not an array", async () => {
+		await writeFile(path, JSON.stringify({ messages: [] }), "utf8");
+		const r = await readClineTranscript(path);
+		expect(r.entries).toEqual([]);
+		expect(r.newCursor.lineNumber).toBe(0);
+	});
 });

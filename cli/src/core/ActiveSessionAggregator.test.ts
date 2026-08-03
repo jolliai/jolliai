@@ -8,6 +8,17 @@ vi.mock("./CopilotSessionDiscoverer.js", () => ({ scanCopilotSessions: vi.fn() }
 vi.mock("./CopilotChatSessionDiscoverer.js", () => ({ scanCopilotChatSessions: vi.fn() }));
 vi.mock("./ClineSessionDiscoverer.js", () => ({ scanClineSessions: vi.fn() }));
 vi.mock("./ClineCliSessionDiscoverer.js", () => ({ scanClineCliSessions: vi.fn() }));
+vi.mock("./DevinSessionDiscoverer.js", () => ({ scanDevinSessions: vi.fn() }));
+vi.mock("./CursorCliSessionDiscoverer.js", () => ({ scanCursorCliSessions: vi.fn() }));
+vi.mock("./AntigravitySessionDiscoverer.js", () => ({ scanAntigravitySessions: vi.fn() }));
+// Partial mock: `saveOverlay` (used by the edited-badge test) and everything
+// else stay real; only `loadOverlay` becomes overridable so the defensive
+// catch in `safeHasOverlayChanges` can be reached — the real `loadOverlay`
+// swallows every failure internally and never rejects.
+vi.mock("./ConversationOverlayStore.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./ConversationOverlayStore.js")>();
+	return { ...actual, loadOverlay: vi.fn(actual.loadOverlay) };
+});
 vi.mock("./SessionTracker.js", () => ({ loadAllSessions: vi.fn().mockResolvedValue([]) }));
 vi.mock("./SessionTitleResolver.js", () => ({
 	resolveSessionTitle: vi.fn().mockImplementation(async (s) => s.title ?? `resolved:${s.sessionId}`),
@@ -21,13 +32,17 @@ vi.mock("./TranscriptMessageCounter.js", () => ({
 }));
 
 import { listActiveConversations } from "./ActiveSessionAggregator.js";
+import { scanAntigravitySessions } from "./AntigravitySessionDiscoverer.js";
 import { scanClineCliSessions } from "./ClineCliSessionDiscoverer.js";
 import { scanClineSessions } from "./ClineSessionDiscoverer.js";
 import { discoverCodexSessions } from "./CodexSessionDiscoverer.js";
 import { conversationKey, setExcluded } from "./CommitSelectionStore.js";
+import { loadOverlay } from "./ConversationOverlayStore.js";
 import { scanCopilotChatSessions } from "./CopilotChatSessionDiscoverer.js";
 import { scanCopilotSessions } from "./CopilotSessionDiscoverer.js";
+import { scanCursorCliSessions } from "./CursorCliSessionDiscoverer.js";
 import { scanCursorSessions } from "./CursorSessionDiscoverer.js";
+import { scanDevinSessions } from "./DevinSessionDiscoverer.js";
 import { scanOpenCodeSessions } from "./OpenCodeSessionDiscoverer.js";
 import { loadMergedTranscript, loadUnreadMergedTranscript } from "./TranscriptMessageCounter.js";
 
@@ -54,6 +69,9 @@ beforeEach(() => {
 	vi.mocked(scanCopilotChatSessions).mockReset().mockResolvedValue(scan([]));
 	vi.mocked(scanClineSessions).mockReset().mockResolvedValue(scan([]));
 	vi.mocked(scanClineCliSessions).mockReset().mockResolvedValue(scan([]));
+	vi.mocked(scanDevinSessions).mockReset().mockResolvedValue(scan([]));
+	vi.mocked(scanCursorCliSessions).mockReset().mockResolvedValue(scan([]));
+	vi.mocked(scanAntigravitySessions).mockReset().mockResolvedValue(scan([]));
 	vi.mocked(discoverCodexSessions).mockReset().mockResolvedValue([]);
 	vi.mocked(loadMergedTranscript)
 		.mockReset()
@@ -612,6 +630,60 @@ describe("listActiveConversations", () => {
 			vi.mocked(scanCopilotChatSessions).mockRejectedValueOnce(new Error("copilot-chat blew up"));
 			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
 			expect(items).toEqual([]);
+		});
+
+		it("loadDevin catches throws from the discoverer module", async () => {
+			vi.mocked(scanDevinSessions).mockRejectedValueOnce(new Error("devin blew up"));
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+		});
+
+		it("loadCursorCli catches throws from the discoverer module", async () => {
+			vi.mocked(scanCursorCliSessions).mockRejectedValueOnce(new Error("cursor-cli blew up"));
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+		});
+
+		it("loadAntigravity catches throws from the discoverer module", async () => {
+			vi.mocked(scanAntigravitySessions).mockRejectedValueOnce(new Error("antigravity blew up"));
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+		});
+
+		// The five non-SQLite / late-added sources report failures through the same
+		// `r.error` envelope as cursor/opencode above. Each must land in
+		// `failedSources` while still contributing whatever rows it did return, so
+		// the UI can show partial data with a hint instead of a silent short list.
+		it.each([
+			["cline", scanClineSessions],
+			["cline-cli", scanClineCliSessions],
+			["devin", scanDevinSessions],
+			["cursor-cli", scanCursorCliSessions],
+			["antigravity", scanAntigravitySessions],
+		] as const)(
+			"loader for %s reports r.error via failedSources and keeps its rows",
+			async (source, discoverer) => {
+				const { listActiveConversationsWithDiagnostics } = await import("./ActiveSessionAggregator.js");
+				vi.mocked(discoverer).mockResolvedValueOnce({
+					sessions: [{ sessionId: `${source}-partial`, transcriptPath: "/x", updatedAt: iso(-HOUR), source }],
+					error: { kind: "fs", message: "half-read" },
+				} as never);
+				const result = await listActiveConversationsWithDiagnostics({ cwd: "/proj", windowMs: 2 * DAY });
+				expect(result.items.map((i) => i.sessionId)).toEqual([`${source}-partial`]);
+				expect(result.failedSources).toEqual([source]);
+			},
+		);
+
+		// `loadOverlay` swallows its own IO failures, so this catch is defensive —
+		// but if a future refactor lets one escape, the row must still render with
+		// `isEdited: false` rather than taking down the whole listing.
+		it("safeHasOverlayChanges falls back to isEdited=false when the overlay load rejects", async () => {
+			vi.mocked(loadOverlay).mockRejectedValueOnce(new Error("overlay store exploded"));
+			vi.mocked(scanCursorSessions).mockResolvedValueOnce(
+				scan([{ sessionId: "ov", transcriptPath: "/x", updatedAt: iso(-HOUR), source: "cursor" }]),
+			);
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([expect.objectContaining({ sessionId: "ov", isEdited: false })]);
 		});
 
 		// `err instanceof Error ? err.message : String(err)` — exercise the

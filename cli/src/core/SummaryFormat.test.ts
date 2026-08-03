@@ -10,6 +10,7 @@ import {
 	collectAllNotesWithHosts,
 	collectAllPlans,
 	collectAllPlansWithHosts,
+	collectLlmSources,
 	collectSortedTopics,
 	formatDate,
 	formatFullDate,
@@ -577,6 +578,40 @@ describe("collectAllNotesWithHosts", () => {
 
 	it("returns empty array when no notes exist", () => {
 		expect(collectAllNotesWithHosts(leaf())).toHaveLength(0);
+	});
+});
+
+// ─── collectLlmSources ──────────────────────────────────────────────────────
+
+// Consumed by the VS Code extension through `views/SummaryUtils` (the CLI is
+// bundled into it), so the contract is pinned here too rather than only in the
+// vscode suite.
+describe("collectLlmSources", () => {
+	it("returns an empty list when no node carries a source", () => {
+		expect(collectLlmSources({ children: [] } as never)).toEqual([]);
+	});
+
+	it("collects the root's own source", () => {
+		expect(collectLlmSources({ llm: { source: "anthropic-env" }, children: [] } as never)).toEqual([
+			"anthropic-env",
+		]);
+	});
+
+	// A plain (non-squash) commit summary has no `children` key at all.
+	it("handles a leaf with no children key", () => {
+		expect(collectLlmSources({ llm: { source: "local-agent" } } as never)).toEqual(["local-agent"]);
+	});
+
+	// A squash container has no `llm` of its own — the providers that actually
+	// produced the content live on its children, so the walk must recurse.
+	it("recurses into children and de-duplicates, in first-seen order", () => {
+		const squash = {
+			children: [
+				{ llm: { source: "jolli-proxy" }, children: [] },
+				{ llm: { source: "anthropic-config" }, children: [{ llm: { source: "jolli-proxy" }, children: [] }] },
+			],
+		};
+		expect(collectLlmSources(squash as never)).toEqual(["jolli-proxy", "anthropic-config"]);
 	});
 });
 

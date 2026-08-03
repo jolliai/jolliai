@@ -19,6 +19,7 @@ import {
 	STREAM_MAX_WALL_CLOCK_MS,
 } from "./LlmClient.js";
 import { registerBackend } from "./localagent/BackendRegistry.js";
+import { runInvocation } from "./localagent/LocalAgentRunner.js";
 import type { LocalAgentBackend } from "./localagent/Types.js";
 import { COMMIT_MSG_DIFF_BUDGET } from "./Summarizer.js";
 import { runWithTrace } from "./TraceContext.js";
@@ -72,6 +73,14 @@ vi.mock("../Logger.js", () => ({
 }));
 
 // Mock JolliApiUtils
+// The default spawner. Mocked (rather than always overridden via the
+// `__localAgentRun` seam) so the production default path can be exercised
+// without launching a real CLI.
+vi.mock("./localagent/LocalAgentRunner.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./localagent/LocalAgentRunner.js")>();
+	return { ...actual, runInvocation: vi.fn(async () => "stdout-from-default-runner") };
+});
+
 vi.mock("./JolliApiUtils.js", () => ({
 	parseBaseUrl: vi.fn().mockReturnValue({ origin: "https://jolli.app", tenantSlug: undefined }),
 	parseJolliApiKey: vi.fn().mockReturnValue({ t: "tenant1", u: "https://jolli.app", o: "eng" }),
@@ -515,6 +524,22 @@ describe("LlmClient", () => {
 
 		it("recognizes a premature close by message text (no code) and recovers", async () => {
 			mockStream.mockReturnValueOnce(rejectingStream(new Error("terminated: Premature close"), streamedMessage));
+			const result = await callLlm({
+				action: "translate",
+				params: { content: "x" },
+				apiKey: "sk-ant-test",
+				maxTokens: 8192,
+			});
+			expect(result.text).toBe("recovered response");
+		});
+
+		// undici surfaces the transport reason on `cause` and sometimes rejects with
+		// a bare object carrying no top-level `message`. Reading it must not stringify
+		// `undefined` into the haystack (which would make "undefined" matchable).
+		it("recognizes a premature close on `cause` when the outer error has no message", async () => {
+			mockStream.mockReturnValueOnce(
+				rejectingStream({ cause: { message: "terminated: Premature close" } }, streamedMessage),
+			);
 			const result = await callLlm({
 				action: "translate",
 				params: { content: "x" },
@@ -1535,6 +1560,89 @@ describe("callLlm — local-agent", () => {
 		expect(result.inputTokens).toBe(5);
 		expect(result.outputTokens).toBe(9);
 		expect(result.cachedTokens).toBe(4738);
+	});
+
+	// Three defaults that only apply when the caller leaves them off: the tool
+	// (claude-code), the spawner (the real runInvocation, not the test seam), and
+	// a fully-parameterised template (no unfilled-placeholder warning).
+	it("defaults to claude-code, the real runner, and warns about nothing when params are complete", async () => {
+		let seenPrompt: string | undefined;
+		let seenStdout: string | undefined;
+		const stub: LocalAgentBackend = {
+			id: "claude-code",
+			discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.210" }),
+			buildInvocation: (_exe, req) => {
+				seenPrompt = req.prompt;
+				return { file: "/x/claude", args: [], stdin: req.prompt, env: {}, cwd: "/tmp" };
+			},
+			parseResult: (stdout) => {
+				seenStdout = stdout;
+				return {
+					text: "SUMMARY",
+					inputTokens: 1,
+					outputTokens: 1,
+					cachedTokens: 0,
+					costUsd: 0,
+					stopReason: "end_turn",
+				};
+			},
+			isPresent: () => true,
+		};
+		registerBackend(stub);
+
+		const result = await callLlm({
+			action: "recap",
+			// The recap template's real placeholders — nothing left unfilled.
+			params: { commitMessage: "fix: thing", topicsSummary: "one topic" },
+			aiProvider: "local-agent",
+			// localAgentTool and __localAgentRun both intentionally omitted.
+		});
+
+		expect(result.text).toBe("SUMMARY");
+		expect(seenPrompt).not.toContain("{{");
+		// The default spawner ran, and its stdout reached the backend's parser.
+		expect(runInvocation).toHaveBeenCalledTimes(1);
+		expect(seenStdout).toBe("stdout-from-default-runner");
+		expect(mockLogWarn).not.toHaveBeenCalledWith(
+			expect.stringContaining("unfilled placeholders"),
+			expect.anything(),
+			expect.anything(),
+		);
+	});
+
+	// Only claude-code gets a resolved model id — its model selection is
+	// action-driven. Every other tool runs whatever model it is configured with,
+	// so passing an empty model tells the backend to emit no model flag at all.
+	it("passes an empty model to any tool other than claude-code", async () => {
+		let seenModel: string | undefined;
+		const stub: LocalAgentBackend = {
+			id: "codex",
+			discoverExecutable: async () => ({ file: "/x/codex", version: "0.1.0" }),
+			buildInvocation: (_exe, req) => {
+				seenModel = req.model;
+				return { file: "/x/codex", args: [], stdin: req.prompt, env: {}, cwd: "/tmp" };
+			},
+			parseResult: () => ({
+				text: "OK",
+				inputTokens: 0,
+				outputTokens: 0,
+				cachedTokens: 0,
+				costUsd: 0,
+				stopReason: "end_turn",
+			}),
+			isPresent: () => true,
+		};
+		registerBackend(stub);
+
+		await callLlm({
+			action: "recap",
+			params: { commitMessage: "m", topicsSummary: "t" },
+			aiProvider: "local-agent",
+			localAgentTool: "codex",
+			__localAgentRun: async () => "ignored-by-stub",
+		});
+
+		expect(seenModel).toBe("");
 	});
 
 	it("throws when the action has no known template", async () => {

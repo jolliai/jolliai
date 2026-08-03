@@ -432,6 +432,42 @@ describe("SessionTracker", () => {
 			await expect(migrateDiscoveryCursors(tempDir)).resolves.toBeUndefined();
 			expect(await loadDiscoveryCursor("/path/none.jsonl", tempDir)).toBeNull();
 		});
+
+		// The shared `lineNumber` must track the SLOWEST extractor. When a record
+		// already carries per-extractor marks but none for a legacy-covered
+		// extractor, that extractor's floor is whatever the record's own
+		// `lineNumber` claimed — advancing past it would make an older dist (which
+		// reads only `lineNumber`) skip lines nobody scanned.
+		it("floors the shared lineNumber at the record's own value for an unmarked legacy extractor", async () => {
+			const path = "/path/partial.jsonl";
+			await saveDiscoveryCursor(
+				{
+					transcriptPath: path,
+					lineNumber: 20,
+					updatedAt: "t",
+					// `skills` has run; neither legacy-covered extractor has a mark.
+					extractors: { skills: 400 },
+				},
+				tempDir,
+			);
+
+			await saveExtractorCursor(path, "skills", 500, tempDir);
+
+			const cursor = await loadDiscoveryCursor(path, tempDir);
+			expect(cursor?.lineNumber).toBe(20);
+			expect(await loadExtractorCursorLine(path, "skills", tempDir)).toBe(500);
+		});
+
+		// Devin's resume anchor lives on the cursor, not in `lineNumber`. Advancing
+		// an extractor must not drop it, or the next read re-scans the whole forest.
+		it("preserves an existing anchorId when advancing an extractor", async () => {
+			const path = "/devin/sessions.db#s1";
+			await saveDiscoveryCursor({ transcriptPath: path, lineNumber: 3, updatedAt: "t", anchorId: "42" }, tempDir);
+
+			await saveExtractorCursor(path, "references", 9, tempDir);
+
+			expect((await loadDiscoveryCursor(path, tempDir))?.anchorId).toBe("42");
+		});
 	});
 
 	describe("loadMostRecentSession", () => {
@@ -1598,6 +1634,20 @@ describe("SessionTracker", () => {
 
 				await saveConfigScoped({ localAgentTool: "opencode" }, targetDir);
 				expect((await readSaved(targetDir)).localAgentPath).toBeUndefined();
+			});
+
+			it("clears a legacy bare path on the FIRST switch away from the default", async () => {
+				// Same legacy shape as above, but switching straight to another tool
+				// without first re-saving claude-code — so the stored config still has
+				// no `localAgentTool` at the moment the orphan is detected.
+				const targetDir = join(tempDir, "orphan-legacy-direct");
+				await saveConfigScoped({ localAgentPath: "/opt/claude" }, targetDir);
+
+				await saveConfigScoped({ localAgentTool: "codex" }, targetDir);
+
+				const config = await readSaved(targetDir);
+				expect(config.localAgentTool).toBe("codex");
+				expect(config.localAgentPath).toBeUndefined();
 			});
 
 			it("keeps the path when the tool is re-saved unchanged", async () => {
@@ -3074,6 +3124,20 @@ describe("skills registry", () => {
 			expect(row?.contentHashAtCommit).toBe("archivehash");
 		});
 
+		it("ignores a key that is not an archived key at all", async () => {
+			// Hoisting feeds this every ref on a squashed commit, including plan and
+			// note refs whose keys carry no `-<shortHash>` suffix. Those must be
+			// skipped silently rather than treated as a missing skill guard.
+			const before = {
+				version: 1 as const,
+				plans: {},
+				skills: { "claude:superpowers:brainstorming": skillRow({ commitHash: "424f5413aaaaaaaa" }) },
+			};
+			await savePlansRegistry(before, tempDir);
+			await associateSkillWithCommit("not-an-archived-key", "11de7b16cccccccc", tempDir);
+			await expect(loadPlansRegistry(tempDir)).resolves.toEqual(before);
+		});
+
 		it("leaves the registry alone when no guard matches the old short hash", async () => {
 			const before = {
 				version: 1 as const,
@@ -3106,6 +3170,46 @@ describe("skills registry", () => {
 			expect(Object.keys(registry.skills ?? {})).toEqual(["claude:superpowers:brainstorming"]);
 			expect(registry.skills?.["claude:superpowers:brainstorming"]?.invocationCount).toBe(2);
 			expect(registry.skills?.["claude:superpowers:brainstorming"]?.lastUsedAt).toBe("2026-07-30T07:00:00.000Z");
+		});
+
+		// The plugin is discovered from the transcript envelope, which not every
+		// pass carries. A later pass without one must not erase the row's plugin.
+		it("keeps the row's plugin when a later pass reports none", async () => {
+			await upsertSkillEntry(skillUse(), tempDir);
+			await upsertSkillEntry(skillUse({ plugin: undefined }), tempDir);
+			expect((await loadPlansRegistry(tempDir)).skills?.["claude:superpowers:brainstorming"]?.plugin).toBe(
+				"superpowers",
+			);
+		});
+
+		// A row guarded by a build that predates `archivedTotals` has no baseline,
+		// so `uncommittedDelta`'s legacy rule reads it as fully committed forever.
+		// The next fold seeds the baseline from the pre-fold counters, which is
+		// exactly what that archive froze.
+		it("seeds archivedTotals from the pre-fold counters for a legacy-guarded row", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					skills: {
+						"claude:superpowers:brainstorming": skillRow({
+							commitHash: "424f5413aaaaaaaa",
+							contentHashAtCommit: "archivehash",
+							invocationCount: 1,
+							// no archivedTotals — the legacy shape
+						}),
+					},
+				},
+				tempDir,
+			);
+
+			await upsertSkillEntry(skillUse({ invocations: [{ at: "2026-07-30T07:00:00.000Z", ok: true }] }), tempDir);
+
+			const row = (await loadPlansRegistry(tempDir)).skills?.["claude:superpowers:brainstorming"];
+			// Seeded from the guarded row's counters — that is what the archive froze.
+			expect(row?.archivedTotals).toEqual({ invocationCount: 1 });
+			// The guard itself is never resurrected by a fold.
+			expect(row?.commitHash).toBe("424f5413aaaaaaaa");
 		});
 
 		it("keeps the same skill from two sources as two rows", async () => {

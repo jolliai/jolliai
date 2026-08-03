@@ -155,7 +155,11 @@ export function scanOpenCodeSkillRows(
 		});
 	}
 
-	if (entries.length === 0) return lastRowId !== undefined ? { uses: [], lastRowId } : { uses: [] };
+	// Resolved once: `lastRowId` is unset only when there were no part rows at all, so
+	// re-testing it at the second return would be a branch that arm can never take.
+	const cursor = lastRowId !== undefined ? { lastRowId } : {};
+
+	if (entries.length === 0) return { uses: [], ...cursor };
 
 	const spendBySkill = attributeByInterval(entries, messageRows);
 
@@ -181,7 +185,7 @@ export function scanOpenCodeSkillRows(
 	}
 
 	log.debug("Scanned %d OpenCode skill(s) from %d part row(s)", uses.length, partRows.length);
-	return lastRowId !== undefined ? { uses, lastRowId } : { uses };
+	return { uses, ...cursor };
 }
 
 /**

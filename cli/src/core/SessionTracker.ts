@@ -348,7 +348,10 @@ export async function saveExtractorCursor(
 		const existing = registry.cursors[transcriptPath] ?? null;
 
 		const marks = effectiveExtractorMarks(existing);
-		marks[extractor] = Math.max(marks[extractor] ?? 0, lineNumber);
+		// Kept in a local as well as on `marks`: reading it back out of the partial
+		// record below would need a `??` fallback that can never fire.
+		const advancedMark = Math.max(marks[extractor] ?? 0, lineNumber);
+		marks[extractor] = advancedMark;
 
 		// The shared field must not overtake an extractor that has no mark yet. Its floor
 		// is whatever the record already claimed (legacy seeding covers a bare
@@ -357,10 +360,7 @@ export async function saveExtractorCursor(
 		// makes a dist reading only this field skip lines nobody processed. That is
 		// exactly the straddling-fetch protection the Codex discovery path relies on.
 		const legacyFloor = existing?.lineNumber ?? 0;
-		const values = [
-			...LEGACY_COVERED_EXTRACTORS.map((e) => marks[e] ?? legacyFloor),
-			marks[extractor] ?? lineNumber,
-		];
+		const values = [...LEGACY_COVERED_EXTRACTORS.map((e) => marks[e] ?? legacyFloor), advancedMark];
 		const next: TranscriptCursor = {
 			transcriptPath,
 			lineNumber: Math.min(...values),

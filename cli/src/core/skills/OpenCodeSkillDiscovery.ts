@@ -14,7 +14,7 @@
  */
 
 import { stat } from "node:fs/promises";
-import { createLogger, isManuallyDisabled } from "../../Logger.js";
+import { createLogger, errMsg, isManuallyDisabled } from "../../Logger.js";
 import { getOpenCodeDbPath } from "../OpenCodeSessionDiscoverer.js";
 import { sessionDirBelongsToRepo } from "../SessionDirMatch.js";
 import { loadConfig, upsertSkillEntry } from "../SessionTracker.js";
@@ -132,7 +132,7 @@ async function runOnce(cwd: string): Promise<number> {
 		if (persisted > 0) log.info("Persisted %d OpenCode skill(s)", persisted);
 		return persisted;
 	} catch (err) {
-		log.debug("OpenCode skill discovery skipped: %s", err instanceof Error ? err.message : String(err));
+		log.debug("OpenCode skill discovery skipped: %s", errMsg(err));
 		return 0;
 	}
 }

@@ -55,6 +55,17 @@ describe("jiraCodexBinding.normalize (derive fields.summary from versionedRepres
 		expect(out.fields.summary).toBe("new");
 	});
 
+	// Jira's versionedRepresentations keys are version NUMBERS. A non-numeric key
+	// (schema drift, or a `$schema`-style annotation) must be skipped rather than
+	// coerced to NaN and silently allowed to win the comparison.
+	it("ignores non-numeric representation keys", () => {
+		const out = normalize({
+			key: "KAN-4",
+			versionedRepresentations: { summary: { latest: "bogus", "1": "real" } },
+		}) as { fields: { summary: string } };
+		expect(out.fields.summary).toBe("real");
+	});
+
 	it("leaves an already adapter-shaped node (with fields.summary) untouched", () => {
 		const shaped = {
 			key: "KAN-4",

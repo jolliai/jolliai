@@ -2770,25 +2770,29 @@ describe("SidebarScriptBuilder", () => {
 			expect(body).toContain("'jollimemory.openNoteForPreview'");
 		});
 
-		it("mouseover dispatches by data-context to plan / note / entity renderers", () => {
+		it("mouseover dispatches to every hover renderer with no data-context allowlist", () => {
 			const js = buildSidebarScript();
-			// Single selector + branch on ctx — three separate listeners would
-			// invite race conditions on the show / hide timers.
+			// Single selector + branch on the lookup result — separate listeners
+			// would invite race conditions on the show / hide timers.
 			expect(js).toContain("'.tree-node[data-id]'");
-			expect(js).toMatch(
-				/ctx\s*!==\s*'plan'\s*&&\s*ctx\s*!==\s*'note'\s*&&\s*ctx\s*!==\s*'reference'/,
-			);
 			expect(js).toContain("renderPlanHoverCard(rowId");
 			expect(js).toContain("renderNoteHoverCard(rowId");
 			expect(js).toContain("renderReferenceHoverCard(rowId");
+			expect(js).toContain("renderSkillsHoverCard(rowId");
+			// A ctx allowlist here would be a SECOND list of hover kinds beside the
+			// dispatch above, and it is the one that goes stale — it did, silently
+			// stranding the skills row. lookupBranchHoverById returning null is the
+			// only gate, so there is exactly one list to keep current.
+			expect(js).not.toMatch(/ctx\s*!==\s*'plan'/);
 		});
 
-		it("unified lookup reads planHover / noteHover / referenceHover off the matching serialized item", () => {
+		it("unified lookup reads every *Hover field off the matching serialized item", () => {
 			const js = buildSidebarScript();
 			expect(js).toContain("function lookupBranchHoverById");
 			expect(js).toContain("items[i].planHover");
 			expect(js).toContain("items[i].noteHover");
 			expect(js).toContain("items[i].referenceHover");
+			expect(js).toContain("items[i].skillsHover");
 		});
 
 		it("trash button (data-inline='remove') routes by row contextValue to the right command", () => {

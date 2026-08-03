@@ -3570,6 +3570,11 @@ async function handleAmendPipeline(
 	const freshLeafPlanRefs = consumed.planAssociation.refs;
 	const freshLeafNoteRefs = consumed.noteRefs;
 	const freshLeafReferenceRefs = consumed.referenceRefs;
+	// Skills must be spread below alongside the other three. `consumeWorkspaceContext`
+	// has already guarded the registry rows and written the orphan bytes, so a leaf
+	// that omits the refs does not merely under-report — it strands the archive:
+	// the rows are consumed (off the panel) and nothing addresses the stored files.
+	const freshLeafSkillRefs = consumed.skillRefs;
 
 	const freshLeaf: CommitSummary = {
 		version: CURRENT_SCHEMA_VERSION,
@@ -3589,6 +3594,7 @@ async function handleAmendPipeline(
 		...(freshLeafPlanRefs.length > 0 ? { plans: freshLeafPlanRefs } : {}),
 		...(freshLeafNoteRefs.length > 0 ? { notes: freshLeafNoteRefs } : {}),
 		...(freshLeafReferenceRefs.length > 0 ? { references: freshLeafReferenceRefs } : {}),
+		...(freshLeafSkillRefs.length > 0 ? { skills: freshLeafSkillRefs } : {}),
 		// AI soft-exclude audit, mirroring the normal commit pipeline: this path
 		// generated a new summary, so record what the relevance layer set aside.
 		...(amendExcludedContext.length > 0 ? { excludedContext: amendExcludedContext } : {}),

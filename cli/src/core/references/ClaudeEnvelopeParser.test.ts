@@ -536,3 +536,78 @@ describe("ClaudeEnvelopeParser jollimemory (self-referential, arguments-derived)
 		expect(results[0].payload).toEqual({ tool: "recall", title: "Recall", query: "(current branch)" });
 	});
 });
+
+describe("ClaudeEnvelopeParser confluence", () => {
+	// Confluence is a context-normalized source not because it needs out-of-payload
+	// context, but because the DSL cannot flatten its `{content:{nodes:[…]}}`
+	// wrapper (nor an ADF-object body) into the canonical page shape.
+	const PAGE_URL = "https://acme.atlassian.net/wiki/spaces/ENG/pages/557292/Per-Provider";
+
+	function confluenceLines(body: unknown): string[] {
+		return [
+			JSON.stringify({
+				message: {
+					role: "assistant",
+					content: [
+						{
+							type: "tool_use",
+							id: "c1",
+							name: "mcp__claude_ai_Atlassian__getConfluencePage",
+							input: { pageId: "557292" },
+						},
+					],
+				},
+			}),
+			JSON.stringify({
+				message: {
+					role: "user",
+					content: [
+						{
+							type: "tool_result",
+							tool_use_id: "c1",
+							content: JSON.stringify({
+								content: {
+									totalCount: 1,
+									nodes: [
+										{
+											id: "557292",
+											type: "page",
+											title: "Per-Provider pools",
+											space: { key: "ENG", name: "Engineering" },
+											author: { displayName: "Flyer Li" },
+											webUrl: PAGE_URL,
+											body,
+										},
+									],
+								},
+							}),
+						},
+					],
+				},
+			}),
+		];
+	}
+
+	it("flattens the nodes wrapper into the canonical page shape", () => {
+		const { results } = claudeEnvelopeParser.parse(confluenceLines("## TL;DR\n\nUse one pool."), {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("confluence");
+		expect(results[0].payload).toMatchObject({
+			pageId: "557292",
+			title: "Per-Provider pools",
+			url: PAGE_URL,
+			body: "## TL;DR\n\nUse one pool.",
+			space: "Engineering",
+			author: "Flyer Li",
+		});
+	});
+
+	it("renders an ADF-object body to text on the way through", () => {
+		const adf = {
+			type: "doc",
+			content: [{ type: "paragraph", content: [{ type: "text", text: "One pool per provider." }] }],
+		};
+		const { results } = claudeEnvelopeParser.parse(confluenceLines(adf), {});
+		expect((results[0].payload as { body?: string }).body).toBe("One pool per provider.");
+	});
+});

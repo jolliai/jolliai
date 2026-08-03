@@ -1,7 +1,15 @@
 import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// `discoverClineCliSessions` (the QueueWorker wrapper) takes no sessions-dir
+// override, so the only way to point it at a fixture is through the detector it
+// resolves the path from. Defaults to a path that does not exist, which keeps
+// the wrapper inert (ENOENT → empty, no error) for tests that don't opt in.
+const detector = vi.hoisted(() => ({ sessionsDir: "/no-such-cline-cli-sessions-dir" }));
+vi.mock("./ClineCliDetector.js", () => ({ getClineCliSessionsDir: () => detector.sessionsDir }));
+
 import { discoverClineCliSessions, scanClineCliSessions } from "./ClineCliSessionDiscoverer.js";
 
 async function writeSession(sessionsDir: string, id: string, sidecar: object): Promise<void> {
@@ -16,6 +24,7 @@ describe("scanClineCliSessions", () => {
 	const project = "/tmp/proj-a";
 	beforeEach(async () => {
 		sessionsDir = await mkdtemp(join(tmpdir(), "cline-cli-disc-"));
+		detector.sessionsDir = "/no-such-cline-cli-sessions-dir";
 	});
 	afterEach(async () => {
 		await rm(sessionsDir, { recursive: true, force: true });
@@ -101,12 +110,12 @@ describe("scanClineCliSessions", () => {
 	});
 
 	it("discoverClineCliSessions returns empty array on fs error (logs warn)", async () => {
-		// Pass a file path instead of directory to trigger fs error
+		// A FILE where the sessions dir should be → readdir fails with ENOTDIR,
+		// which is a genuine fs error (not ENOENT), so the scan populates the
+		// error channel that the wrapper must warn about and then drop.
 		const filePath = join(sessionsDir, "not-a-dir");
 		await writeFile(filePath, "test", "utf8");
-		const sessions = await discoverClineCliSessions(project);
-		// Should return array (not error) despite fs error
-		expect(Array.isArray(sessions)).toBe(true);
-		expect(sessions).toHaveLength(0);
+		detector.sessionsDir = filePath;
+		expect(await discoverClineCliSessions(project)).toEqual([]);
 	});
 });

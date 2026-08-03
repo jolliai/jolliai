@@ -19,7 +19,7 @@
  */
 import { readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
-import { createLogger } from "../Logger.js";
+import { createLogger, errMsg } from "../Logger.js";
 import { atomicWriteFile } from "./AtomicWrite.js";
 import { deriveRepoNameFromUrl } from "./GitRemoteUtils.js";
 import { withPushControlLock } from "./Locks.js";
@@ -241,12 +241,12 @@ export async function setRepoPushDisabled(
 				log.warn(
 					"setRepoPushDisabled: could not preserve the unreadable store at %s: %s",
 					path,
-					renameError instanceof Error ? renameError.message : String(renameError),
+					errMsg(renameError),
 				);
 			}
 			log.warn(
 				"setRepoPushDisabled: push-control store was unreadable (%s) — rebuilding from empty on the enable path; every other repo's opt-out is dropped%s",
-				error instanceof Error ? error.message : String(error),
+				errMsg(error),
 				preservedAt ? ` (previous file kept at ${preservedAt})` : "",
 			);
 			recoveredFromCorrupt = true;
@@ -267,9 +267,17 @@ export async function setRepoPushDisabled(
 		// `listPushControlRepos` pins "en" for the same reason). Identities are also
 		// case-sensitive keys — a collator with `sensitivity: "base"` would call two
 		// distinct identities equal and leave their relative order unstable.
-		const disabledList = [...current.values()].sort((a, b) =>
-			a.identity < b.identity ? -1 : a.identity > b.identity ? 1 : 0,
-		);
+		const disabledList = [...current.values()].sort((a, b) => {
+			/* v8 ignore start -- unreachable today: `current` is a Map keyed by identity, so
+			   two entries can never carry the same one. Kept anyway, because dropping it
+			   makes the comparator INCONSISTENT for a duplicate key (both argument orders
+			   would return the same sign), and V8's TimSort answers an inconsistent
+			   comparator with an arbitrary order — so a future change that admits duplicates
+			   would silently reshuffle this on-disk file with no test failing. */
+			if (a.identity === b.identity) return 0;
+			/* v8 ignore stop */
+			return a.identity < b.identity ? -1 : 1;
+		});
 		const file: PushControlFile = { version: PUSH_CONTROL_VERSION, disabled: disabledList };
 		await atomicWriteFile(getPushControlPath(dir), `${JSON.stringify(file, null, "\t")}\n`);
 	};

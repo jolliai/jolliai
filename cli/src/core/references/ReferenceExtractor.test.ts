@@ -41,6 +41,14 @@ const { ACCUMULATING_DEF } = vi.hoisted(() => ({
 	} as unknown as import("./SourceDefinition.js").SourceDefinition,
 }));
 
+// Partial mock so the Slack workspace-url config read can be made to throw. The
+// real `loadConfig` swallows a missing file, so the extractor's tolerate-a-throw
+// guard is only reachable by forcing one.
+vi.mock("../SessionTracker.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../SessionTracker.js")>();
+	return { ...actual, loadConfig: vi.fn(actual.loadConfig) };
+});
+
 vi.mock("./SourceDefinitionRegistry.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./SourceDefinitionRegistry.js")>();
 	let patched: SourceDefinitionRegistry | undefined;
@@ -54,6 +62,7 @@ vi.mock("./SourceDefinitionRegistry.js", async (importOriginal) => {
 });
 
 import type { Reference } from "../../Types.js";
+import { loadConfig } from "../SessionTracker.js";
 import { extractReferencesFromTranscript } from "./ReferenceExtractor.js";
 import { formatAccumulatedEntry } from "./ReferenceStore.js";
 import type { SourceDefinitionRegistry } from "./SourceDefinitionRegistry.js";
@@ -170,6 +179,28 @@ describe("extractReferencesFromTranscript", () => {
 		expect(fieldVal(references[0], "labels")).toBe("JolliMemory, Feature");
 		expect(references[0].description).toContain("Linear issues are high-density");
 		expect(lastLineNumberScanned).toBe(2);
+	});
+
+	// The config read only supplies Slack's fallback workspace URL. A failure
+	// there must never abort extraction of every other source in the transcript.
+	it("still extracts references when the config read throws", async () => {
+		const jsonl = makeJsonl(
+			toolUseLine({
+				toolUseId: "toolu_cfg",
+				toolName: "mcp__linear__get_issue",
+				timestamp: "2026-05-14T06:06:00.228Z",
+			}),
+			toolResultLine({
+				toolUseId: "toolu_cfg",
+				timestamp: "2026-05-14T06:06:01.123Z",
+				payload: SAMPLE_ISSUE_PAYLOAD,
+			}),
+		);
+		mockReadFile.mockResolvedValue(jsonl);
+		vi.mocked(loadConfig).mockRejectedValueOnce(new Error("config store unavailable"));
+
+		const { references } = await extractReferencesFromTranscript("/fake.jsonl");
+		expect(references.map((r) => r.nativeId)).toEqual(["PROJ-1528"]);
 	});
 
 	it("captures zero references from a list_issues enumeration result", async () => {

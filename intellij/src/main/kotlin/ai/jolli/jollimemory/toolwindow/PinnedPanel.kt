@@ -5,6 +5,8 @@ import ai.jolli.jollimemory.core.ActiveSessionAggregator
 import ai.jolli.jollimemory.core.CommitSelectionStore
 import ai.jolli.jollimemory.core.PinStore
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.references.SourceDisplay
+import ai.jolli.jollimemory.core.references.SourceIds
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
@@ -133,7 +135,7 @@ class PinnedPanel(
 		val badge: JComponent = if (sourceLogo != null) {
 			JLabel(sourceLogo).apply { toolTipText = entry.badge }
 		} else {
-			BadgePill(entry.badge, badgeColor(entry))
+			BadgePill(badgeText(entry), badgeColor(entry))
 		}
 		val west = JPanel(GridBagLayout()).apply {
 			isOpaque = false
@@ -284,11 +286,6 @@ class PinnedPanel(
 		}
 	}
 
-	private fun badgeColor(entry: PinStore.PinnedEntry): Color = when (entry.kind) {
-		"conversations" -> SOURCE_COLORS[entry.badge.lowercase()] ?: JBColor.GRAY
-		else -> TAG_COLORS[entry.badge] ?: JBColor.GRAY
-	}
-
 	// ── Open content on click ───────────────────────────────────────────────
 
 	private fun openPinned(entry: PinStore.PinnedEntry) {
@@ -373,7 +370,7 @@ class PinnedPanel(
 		}
 	}
 
-	private companion object {
+	internal companion object {
 
 		// Mirrors ConversationRowComponent.SourceBadge colors.
 		val SOURCE_COLORS = mapOf(
@@ -383,15 +380,67 @@ class PinnedPanel(
 			"opencode" to JBColor(Color(37, 99, 235), Color(37, 99, 235)),
 			"cursor" to JBColor(Color(220, 38, 38), Color(220, 38, 38)),
 		)
-		// Mirrors PlansPanel tag colors (P/N/S/L/GH/J/No).
+
+		/**
+		 * Colors for the two badge letters this panel owns outright: plan "P", and
+		 * note "N" / snippet "S". Reference letters are deliberately ABSENT — see
+		 * [badgeColor]. Keep this in step with PlansPanel's plan/note tag colors.
+		 */
 		val TAG_COLORS = mapOf(
 			"P" to JBColor(0x4C82F7, 0x4C82F7),
 			"N" to JBColor(0x3FA45B, 0x3FA45B),
 			"S" to JBColor(0xC9851E, 0xD18616),
-			"L" to JBColor(0x7A6FF0, 0x8A7FF5),
-			"GH" to JBColor(0x6E7681, 0x8B949E),
-			"J" to JBColor(0x2A78C8, 0x3B82D6),
-			"No" to JBColor(0x6B6B6B, 0x9B9B9B),
 		)
+
+		/**
+		 * Accent color for a pinned row's badge pill.
+		 *
+		 * A reference's color is resolved from its SOURCE, never from the letter
+		 * tag, because the tag is not a unique key: Jira and Jolli Memory both
+		 * stamp "J", Zoom Doc and Zoom Meeting both stamp "Z". A letter-keyed map
+		 * cannot be right for both members of such a pair, and it also silently
+		 * collides with the note/snippet letters this panel does own ("N" is both
+		 * Notion and note, "S" is both Slack and snippet) — so a Notion pin used to
+		 * paint note-green and a Slack pin snippet-amber, while the six letters
+		 * added since the map was written ("G", "C", "A", "M", "Z", "7") fell
+		 * through to gray.
+		 *
+		 * The pin's `key` IS the registry mapKey (`<wire>:<nativeId>`), so the
+		 * source is recoverable with no change to the stored shape, and
+		 * [SourceDisplay] stays the single place reference colors live — a new
+		 * source can never desync this panel again. An unparseable wire name lands
+		 * on [SourceDisplay.unknown]'s neutral gray, the same fallback the
+		 * reference rows themselves use.
+		 */
+		internal fun badgeColor(entry: PinStore.PinnedEntry): Color = when (entry.kind) {
+			"conversations" -> SOURCE_COLORS[entry.badge.lowercase()] ?: JBColor.GRAY
+			"references" -> SourceDisplay.of(SourceIds.parse(entry.key.substringBefore(":"))).color
+			else -> TAG_COLORS[entry.badge] ?: JBColor.GRAY
+		}
+
+		/**
+		 * Letter tag for a pinned row's badge pill.
+		 *
+		 * References re-derive it from the `key`'s wire name for the same reason
+		 * [badgeColor] does, and re-deriving BOTH is what actually closes the drift:
+		 * the stored letter is whatever the plugin version that created the pin
+		 * stamped, and that alphabet has since changed — pins written before the
+		 * single-letter scheme carry "GH" (GitHub) and "No" (Notion), and a pin
+		 * written before `badge` existed at all falls back to the raw source name
+		 * (see `PinStore.load`). Color-only derivation would render those forever
+		 * with the new, correct hue behind a stale letter. An unparseable wire name
+		 * takes [SourceDisplay.unknown]'s "R" together with its neutral gray, which
+		 * is exactly how the reference rows themselves render it.
+		 *
+		 * Every other kind keeps the stored badge: plan "P" / note "N" / snippet "S"
+		 * and the conversation source name are the row's own label, not a derived
+		 * view of the reference registry.
+		 */
+		internal fun badgeText(entry: PinStore.PinnedEntry): String =
+			if (entry.kind == "references") {
+				SourceDisplay.of(SourceIds.parse(entry.key.substringBefore(":"))).tag
+			} else {
+				entry.badge
+			}
 	}
 }

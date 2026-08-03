@@ -87,7 +87,17 @@ interface PendingCommandEntry {
 	readonly skill: string;
 	readonly at: string;
 	readonly args?: string;
-	bodyChars?: number;
+}
+
+/**
+ * A command-path entry validated by its body record.
+ *
+ * `bodyChars` is required, not optional: the body IS the promotion, so an entry that
+ * reaches this type has been measured. Carrying it as optional here would leave an
+ * absent-body case downstream that no input can produce.
+ */
+interface CompletedCommandEntry extends PendingCommandEntry {
+	readonly bodyChars: number;
 }
 
 /**
@@ -105,7 +115,7 @@ interface PendingCommandEntry {
  */
 export function scanClaudeSkillLines(lines: ReadonlyArray<string>, fromLine: number): SkillScanResult {
 	const pendingTools = new Map<string, PendingToolEntry>();
-	const commandEntries: PendingCommandEntry[] = [];
+	const commandEntries: CompletedCommandEntry[] = [];
 	/** Command-path entries still waiting to be validated by a following body record. */
 	let openCommand: PendingCommandEntry | undefined;
 	const toolEntries: PendingToolEntry[] = [];
@@ -146,8 +156,7 @@ export function scanClaudeSkillLines(lines: ReadonlyArray<string>, fromLine: num
 				if (pending !== undefined) pending.bodyChars = bodyChars;
 			} else if (openCommand !== undefined) {
 				// Command path: a body with no owning tool_use validates the open command.
-				openCommand.bodyChars = bodyChars;
-				commandEntries.push(openCommand);
+				commandEntries.push({ ...openCommand, bodyChars });
 				openCommand = undefined;
 			}
 			continue;
@@ -305,7 +314,7 @@ function tagValue(text: string, tag: string): string | undefined {
 /** Group entries by skill id into one {@link SkillUse} each, invocations newest-first. */
 function assemble(
 	toolEntries: ReadonlyArray<PendingToolEntry>,
-	commandEntries: ReadonlyArray<PendingCommandEntry>,
+	commandEntries: ReadonlyArray<CompletedCommandEntry>,
 	pluginBySkill: ReadonlyMap<string, string>,
 ): ReadonlyArray<SkillUse> {
 	const bySkill = new Map<string, { paths: Set<SkillEntryPath>; invocations: SkillInvocation[] }>();
@@ -336,7 +345,7 @@ function assemble(
 		bucket(entry.skill, "command").invocations.push({
 			at: entry.at,
 			...(entry.args !== undefined ? { args: entry.args } : {}),
-			...(entry.bodyChars !== undefined ? { bodyChars: entry.bodyChars } : {}),
+			bodyChars: entry.bodyChars,
 			ok: true,
 		});
 	}

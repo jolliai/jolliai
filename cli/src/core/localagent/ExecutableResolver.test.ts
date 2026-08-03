@@ -586,5 +586,59 @@ describe("discoverPresence", () => {
 			mkdirSync(join(dir, "mytool"));
 			expect(isPresent(SPEC, { overridePath: join(dir, "mytool"), platform: process.platform })).toBe(false);
 		});
+
+		// Windows has no execute bit and a presence hit is allowed to be a `.cmd` /
+		// `.ps1` shim, so the win32 predicate stops at "is a regular file". Pinned
+		// with an explicit platform so it holds on POSIX CI too.
+		it("accepts a non-executable regular file under win32 rules", () => {
+			const file = join(dir, "mytool");
+			writeFileSync(file, "");
+			chmodSync(file, 0o644);
+			expect(isPresent(SPEC, { overridePath: file, platform: "win32" })).toBe(true);
+			// The same file is rejected on POSIX, where the execute bit is the signal.
+			if (process.platform !== "win32") {
+				expect(isPresent(SPEC, { overridePath: file, platform: "linux" })).toBe(false);
+			}
+		});
+	});
+
+	// The three ambient defaults `discoverPresence` falls back to when the caller
+	// supplies no seams. Exercised through an empty PATH so the scan is bounded to
+	// the common-dir augmentation and cannot hit a real install.
+	describe("ambient defaults", () => {
+		it("falls back to the real home and an absent PATH without throwing", () => {
+			vi.stubEnv("PATH", undefined as unknown as string);
+			try {
+				expect(discoverPresence(SPEC, "darwin", { exists: () => false })).toEqual([]);
+			} finally {
+				vi.unstubAllEnvs();
+			}
+		});
+
+		// win32 only: `discoveryPath` already drops empty POSIX segments, but it
+		// returns the Windows PATH verbatim, so a doubled / trailing `;` survives
+		// to the scan and would otherwise join to a bare relative "faketool.exe".
+		it("skips empty PATH segments on win32 instead of probing a relative path", () => {
+			const probed: string[] = [];
+			discoverPresence(SPEC, "win32", {
+				basePath: "C:\\a;;C:\\b;",
+				home: "C:\\Users\\u",
+				exists: (f) => {
+					probed.push(f);
+					return false;
+				},
+			});
+			expect(probed.length).toBeGreaterThan(0);
+			expect(probed.every((p) => p.includes("\\"))).toBe(true);
+		});
+
+		it("falls back to an absent PATH inside discover() too", () => {
+			vi.stubEnv("PATH", undefined as unknown as string);
+			try {
+				expect(discover(SPEC, "darwin", { runFinder: () => "", exists: () => false })).toEqual([]);
+			} finally {
+				vi.unstubAllEnvs();
+			}
+		});
 	});
 });

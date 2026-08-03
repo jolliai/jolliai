@@ -12,6 +12,13 @@ vi.mock("./SessionTracker.js", async (orig) => {
 	return { ...actual, getGlobalConfigDir: () => globalDirRef.path };
 });
 
+// Real behaviour by default; wrapped so the identity memo can be observed (call
+// counting) and so a resolution failure can be injected.
+vi.mock("./GitRemoteUtils.js", async (orig) => {
+	const actual = await orig<typeof import("./GitRemoteUtils.js")>();
+	return { ...actual, getCanonicalRepoUrl: vi.fn(actual.getCanonicalRepoUrl) };
+});
+
 import { getCanonicalRepoUrl } from "./GitRemoteUtils.js";
 import {
 	__resetGateInputCache,
@@ -22,7 +29,7 @@ import {
 	readPushDisabledState,
 	setRepoPushDisabledByIdentity,
 } from "./PushControl.js";
-import { setRepoPushDisabled } from "./PushControlStore.js";
+import { getPushControlPath, setRepoPushDisabled } from "./PushControlStore.js";
 import { writeManualDisableFlag } from "./RepoProfile.js";
 
 describe("PushControl", () => {
@@ -106,6 +113,62 @@ describe("PushControl", () => {
 		expect(await readPushDisabledState(repo)).toEqual({ disabled: true });
 	});
 
+	it("readPushDisabledState fails closed and stringifies a non-Error throw", async () => {
+		// A thrown non-Error (a bare string from an over-eager `throw`) must still
+		// produce a readable `error` alongside the fail-closed `disabled: true`.
+		vi.mocked(getCanonicalRepoUrl).mockRejectedValueOnce("git exploded");
+		expect(await readPushDisabledState(repo)).toEqual({ disabled: true, error: "git exploded" });
+	});
+
+	// The memo is per-cwd and never shrinks on its own, so a long-lived host that
+	// walks many roots would grow it without bound. Past the cap, a miss also
+	// drops whatever has expired.
+	it("sweeps expired identities once the memo reaches its cap", async () => {
+		// Mirrors PushControl's IDENTITY_CACHE_SWEEP_AT / GATE_IDENTITY_TTL_MS.
+		const SWEEP_AT = 64;
+		const TTL_MS = 5_000;
+		// Distinct cwds inside ONE git repo: each is its own memo key, but only one
+		// `git init` is paid. The clock is pinned so nothing expires mid-fill.
+		const t0 = Date.now();
+		const nowSpy = vi.spyOn(Date, "now").mockReturnValue(t0);
+		const resolver = vi.mocked(getCanonicalRepoUrl);
+		const realResolver = resolver.getMockImplementation();
+		// Stub the resolution itself: filling the memo needs 65 distinct cwds, and
+		// paying a `git config` spawn for each would add ~15s to the suite for no
+		// extra coverage — the memo's behaviour is what's under test.
+		resolver.mockImplementation(async (cwd: string) => `file://${cwd}`);
+		try {
+			for (let i = 0; i <= SWEEP_AT; i++) {
+				const sub = join(repo, `sub-${i}`);
+				mkdirSync(sub, { recursive: true });
+				await readPushDisabledState(sub);
+			}
+			// The last iteration crossed the cap and swept — but nothing had expired,
+			// so every entry survived and a repeat read is still served from the memo.
+			const before = vi.mocked(getCanonicalRepoUrl).mock.calls.length;
+			await readPushDisabledState(join(repo, "sub-0"));
+			expect(vi.mocked(getCanonicalRepoUrl)).toHaveBeenCalledTimes(before);
+
+			// Past the TTL the next miss evicts them, and sub-0 has to be resolved again.
+			nowSpy.mockReturnValue(t0 + TTL_MS + 1);
+			const sweeper = join(repo, "sweeper");
+			mkdirSync(sweeper, { recursive: true });
+			await readPushDisabledState(sweeper);
+			await readPushDisabledState(join(repo, "sub-0"));
+			expect(vi.mocked(getCanonicalRepoUrl).mock.calls.length).toBeGreaterThan(before);
+		} finally {
+			nowSpy.mockRestore();
+			if (realResolver) resolver.mockImplementation(realResolver);
+		}
+	});
+
+	it("setRepoPushDisabledByIdentity reports a rebuild from an unreadable store", async () => {
+		await setRepoPushDisabledByIdentity("https://github.com/acme/other", true, "cli");
+		writeFileSync(getPushControlPath(globalDir), "{ not json");
+		const result = await setRepoPushDisabledByIdentity("https://github.com/acme/x", false, "vscode");
+		expect(result.recoveredFromCorrupt).toBe(true);
+	});
+
 	describe("listPushControlRepos", () => {
 		let localFolder: string;
 
@@ -168,6 +231,51 @@ describe("PushControl", () => {
 			expect(rows[0].isCurrentRepo).toBe(true);
 			expect(rows[0].repoIdentity).toBe("https://github.com/acme/other");
 			expect(rows[1].isCurrentRepo).toBe(false);
+		});
+
+		// Two non-current rows exercise the name tiebreak; the current repo (added
+		// last, so it starts out AFTER them) exercises the other side of the
+		// isCurrentRepo comparison.
+		it("sorts the current repo first, then the rest by name", async () => {
+			for (const name of ["alpha", "zulu"]) {
+				const kbRoot = join(localFolder, name);
+				mkdirSync(join(kbRoot, ".jolli"), { recursive: true });
+				writeFileSync(
+					join(kbRoot, ".jolli", "config.json"),
+					JSON.stringify({ repoName: name, remoteUrl: `https://github.com/acme/${name}.git` }),
+				);
+			}
+			execFileSync("git", ["remote", "add", "origin", "https://github.com/acme/mine.git"], { cwd: repo });
+
+			const rows = await listPushControlRepos({ localFolder, currentCwd: repo });
+			expect(rows.map((r) => r.repoName)).toEqual(["mine", "alpha", "widgets", "zulu"]);
+			expect(rows.map((r) => r.isCurrentRepo)).toEqual([true, false, false, false]);
+		});
+
+		// Same ordering rule from the other side: when the current repo COLLAPSES
+		// onto an existing Memory Bank row it keeps that row's position in the
+		// pre-sort list, so the comparator sees it as the second operand.
+		it("keeps a collapsed current-repo row first even when it started ahead of the others", async () => {
+			const kbRoot = join(localFolder, "alpha");
+			mkdirSync(join(kbRoot, ".jolli"), { recursive: true });
+			writeFileSync(
+				join(kbRoot, ".jolli", "config.json"),
+				JSON.stringify({ repoName: "alpha", remoteUrl: "https://github.com/acme/alpha.git" }),
+			);
+			execFileSync("git", ["remote", "add", "origin", "https://github.com/acme/alpha.git"], { cwd: repo });
+
+			const rows = await listPushControlRepos({ localFolder, currentCwd: repo });
+			expect(rows.map((r) => r.repoName)).toEqual(["alpha", "widgets"]);
+			expect(rows.map((r) => r.isCurrentRepo)).toEqual([true, false]);
+		});
+
+		it("still lists Memory Bank rows when the current repo's identity cannot be resolved", async () => {
+			// A cwd that is not a repo (or a git failure) must not sink the whole
+			// list — the current-repo row is simply omitted.
+			vi.mocked(getCanonicalRepoUrl).mockRejectedValueOnce(new Error("not a git repository"));
+			const rows = await listPushControlRepos({ localFolder, currentCwd: repo });
+			expect(rows.map((r) => r.repoName)).toEqual(["widgets"]);
+			expect(rows[0].isCurrentRepo).toBe(false);
 		});
 
 		it("still lists the current repo when it has no remote (file:// identity)", async () => {

@@ -2,8 +2,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { loadPlansRegistry } from "../SessionTracker.js";
-import { OC_ASSISTANT_MESSAGE, OC_NON_SKILL_TOOL, OC_SKILL_NO_TOP_METADATA } from "./__fixtures__/openCodeParts.js";
+import { setManuallyDisabled } from "../../Logger.js";
+import {
+	OC_ASSISTANT_MESSAGE,
+	OC_NON_SKILL_TOOL,
+	OC_SKILL_NO_TOP_METADATA,
+	OC_SKILL_WITH_TOP_METADATA,
+} from "./__fixtures__/openCodeParts.js";
 
 /**
  * The DB path is resolved by the OpenCode session discoverer; point it at a temp
@@ -16,10 +21,15 @@ vi.mock("../OpenCodeSessionDiscoverer.js", () => ({
 
 /**
  * Isolate the developer's real `~/.jolli/jollimemory/config.json` from the run.
+ * `loadConfig` reads the MACHINE-GLOBAL config, so the `openCodeEnabled` toggle
+ * cannot be exercised (or neutralised) through the temp project dir at all:
  * `discoverOpenCodeSkills` short-circuits when `config.openCodeEnabled === false`,
  * so a developer who disabled OpenCode locally (a valid preference) would
  * silently see every test in this file return 0 without any tooling clue —
  * the failure surface looks identical to a bug in the SQL / matcher paths.
+ * The empty default is a `mockResolvedValue`, not a `mockResolvedValueOnce`, so
+ * the toggle test below can still queue its own value on top for one call
+ * (`clearMocks` clears calls, not implementations).
  * Preserve every other export via `importOriginal` because the test itself
  * calls `loadPlansRegistry` and the discovery under test calls
  * `upsertSkillEntry`, both real, on top of `SessionTracker`.
@@ -31,6 +41,8 @@ vi.mock("../SessionTracker.js", async (importOriginal) => {
 		loadConfig: vi.fn().mockResolvedValue({}),
 	};
 });
+
+import { loadConfig, loadPlansRegistry } from "../SessionTracker.js";
 
 const { discoverOpenCodeSkills } = await import("./OpenCodeSkillDiscovery.js");
 
@@ -72,6 +84,7 @@ describe("discoverOpenCodeSkills", () => {
 	});
 
 	afterEach(async () => {
+		setManuallyDisabled(false);
 		await rm(cwd, { recursive: true, force: true });
 		await rm(dbDir, { recursive: true, force: true });
 	});
@@ -188,5 +201,62 @@ describe("discoverOpenCodeSkills", () => {
 		await discoverOpenCodeSkills(cwd);
 		await discoverOpenCodeSkills(cwd);
 		expect((await loadPlansRegistry(cwd)).skills?.["opencode:jolli"]?.invocationCount).toBe(1);
+	});
+
+	it("writes nothing while the project is manually disabled", async () => {
+		// The 60s tick keeps firing behind a disabled panel; a pass must not put
+		// files back into a project the user switched off.
+		await buildDb(dbPathRef.current, {
+			sessions: [{ id: "ses_1", directory: cwd }],
+			parts: [{ id: "prt_1", sessionId: "ses_1", timeCreated: Date.now(), data: OC_SKILL_NO_TOP_METADATA }],
+		});
+		setManuallyDisabled(true);
+		expect(await discoverOpenCodeSkills(cwd)).toBe(0);
+		expect((await loadPlansRegistry(cwd)).skills).toBeUndefined();
+	});
+
+	it("writes nothing when OpenCode discovery is switched off in config", async () => {
+		await buildDb(dbPathRef.current, {
+			sessions: [{ id: "ses_1", directory: cwd }],
+			parts: [{ id: "prt_1", sessionId: "ses_1", timeCreated: Date.now(), data: OC_SKILL_NO_TOP_METADATA }],
+		});
+		vi.mocked(loadConfig).mockResolvedValueOnce({ openCodeEnabled: false });
+		expect(await discoverOpenCodeSkills(cwd)).toBe(0);
+	});
+
+	it("de-duplicates a concurrent tick instead of running the scan twice", async () => {
+		// Two overlapping ticks must share ONE pass; a second scan would fold the
+		// same invocation in again before the first pass has written its cursor.
+		await buildDb(dbPathRef.current, {
+			sessions: [{ id: "ses_1", directory: cwd }],
+			parts: [{ id: "prt_1", sessionId: "ses_1", timeCreated: Date.now(), data: OC_SKILL_NO_TOP_METADATA }],
+		});
+		const [a, b] = await Promise.all([discoverOpenCodeSkills(cwd), discoverOpenCodeSkills(cwd)]);
+		expect([a, b]).toEqual([1, 1]);
+		expect((await loadPlansRegistry(cwd)).skills?.["opencode:jolli"]?.invocationCount).toBe(1);
+	});
+
+	it("collects several parts of one session into a single group", async () => {
+		// The grouper creates a session bucket on first sight and reuses it for every
+		// later part — a per-part bucket would split one conversation's timeline in
+		// two and mis-attribute the interval spend.
+		const t = Date.now();
+		await buildDb(dbPathRef.current, {
+			sessions: [{ id: "ses_a", directory: cwd }],
+			parts: [
+				{ id: "prt_1", sessionId: "ses_a", timeCreated: t, data: OC_SKILL_NO_TOP_METADATA },
+				{ id: "prt_2", sessionId: "ses_a", timeCreated: t + 50, data: OC_SKILL_WITH_TOP_METADATA },
+			],
+			messages: [{ id: "msg_1", sessionId: "ses_a", timeCreated: t + 100, data: OC_ASSISTANT_MESSAGE }],
+		});
+		expect(await discoverOpenCodeSkills(cwd)).toBe(2);
+		// Both parts land in ONE group, so both skills are scanned against the same
+		// session timeline (and both carry that session's key), rather than being
+		// split into two disjoint single-part groups.
+		const skills = (await loadPlansRegistry(cwd)).skills ?? {};
+		expect(Object.keys(skills).sort()).toEqual(["opencode:comprehensive-review-full-review", "opencode:jolli"]);
+		expect(Object.keys(skills["opencode:comprehensive-review-full-review"]?.usageBySession ?? {})).toEqual([
+			"opencode:ses_a",
+		]);
 	});
 });

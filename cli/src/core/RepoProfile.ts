@@ -239,11 +239,64 @@ export async function writeManualDisableFlag(cwd: string, disabled: boolean): Pr
 }
 
 /**
- * Synchronous, read-only variant of {@link readManualDisableFlag}. The VS Code
- * extension's `activate()` calls this to seed the in-memory zero-write flag
- * before any async work runs — a stray log line during early activation must
+ * Memo for the sync reader's main-worktree-root resolution, keyed by input `cwd`.
+ *
+ * Mirrors `GitOps._stateRootCache` and exists for the same reason: this is no
+ * longer a once-per-process seed. The onboarding-funnel gate calls
+ * {@link readManualDisableFlagSync} from `maybeEmitOnboardingProgress`, which VS
+ * Code runs on every `StatusStore.refresh()` — including two file watchers that
+ * fire repeatedly while an AI session is live — so an unmemoized
+ * `git rev-parse --git-common-dir` would spawn a subprocess per refresh on the
+ * extension host's event loop.
+ *
+ * Memoizing this cannot stale the flag: a repo's common dir is fixed for the life
+ * of a process, and the `profile.json` read that carries the actual answer stays
+ * uncached, so every enable/disable is still observed on the next call. The
+ * not-a-git-repo answer is memoized too — equally stable, and the case that pays
+ * the full subprocess cost.
+ */
+const _mainRootCache = new Map<string, string>();
+
+/** Test-only: clears the memo so cases don't leak resolved roots into each other. */
+export function resetRepoProfileRootCache(): void {
+	_mainRootCache.clear();
+}
+
+/** Resolves (and memoizes) the main worktree root for the sync reader. */
+function resolveMainRootSync(cwd: string): string {
+	const cached = _mainRootCache.get(cwd);
+	if (cached !== undefined) return cached;
+	let commonDir = "";
+	try {
+		const raw = execFileSyncHidden("git", ["rev-parse", "--git-common-dir"], {
+			cwd,
+			encoding: "utf-8",
+			// Capture git's stderr so a non-git cwd doesn't leak "fatal: not a git
+			// repository …" to the user's terminal; the throw is handled below. Load
+			// bearing since the onboarding-funnel gate calls this from the guided
+			// front door's non-git dead end, where the leak would print directly
+			// under jolli's own "not a git repository" message.
+			stdio: ["ignore", "pipe", "pipe"],
+		}).trim();
+		if (raw) {
+			commonDir = isAbsolute(raw) ? raw : join(cwd, raw);
+		}
+	} catch {
+		commonDir = "";
+	}
+	const mainRoot = commonDir ? dirname(commonDir) : cwd;
+	_mainRootCache.set(cwd, mainRoot);
+	return mainRoot;
+}
+
+/**
+ * Synchronous, read-only variant of {@link readManualDisableFlag}. Two callers:
+ * the VS Code extension's `activate()` seeds the in-memory zero-write flag with
+ * it before any async work runs (a stray log line during early activation must
  * not touch disk in a manually disabled repo, and the async reader can't be
- * awaited that early.
+ * awaited that early), and the onboarding-funnel telemetry gate uses it as the
+ * disk-backed truth that CLI processes — which never set the in-memory mirror —
+ * need. The funnel gate calls it repeatedly, hence the `_mainRootCache` memo.
  *
  * Best-effort by design: unlike the async reader it never migrates the legacy
  * marker or persists a decision (the async reader does that later); it only
@@ -254,16 +307,7 @@ export async function writeManualDisableFlag(cwd: string, disabled: boolean): Pr
  * in `cwd`, then to `false`.
  */
 export function readManualDisableFlagSync(cwd: string): boolean {
-	let commonDir = "";
-	try {
-		const raw = execFileSyncHidden("git", ["rev-parse", "--git-common-dir"], { cwd, encoding: "utf-8" }).trim();
-		if (raw) {
-			commonDir = isAbsolute(raw) ? raw : join(cwd, raw);
-		}
-	} catch {
-		commonDir = "";
-	}
-	const mainRoot = commonDir ? dirname(commonDir) : cwd;
+	const mainRoot = resolveMainRootSync(cwd);
 	try {
 		const parsed = JSON.parse(readFileSync(join(getJolliMemoryDir(mainRoot), PROFILE_FILE), "utf-8"));
 		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {

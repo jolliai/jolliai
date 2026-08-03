@@ -128,7 +128,28 @@ describe("scanClaudeSkillLines — Skill tool entry path", () => {
 		expect(uses[0].invocations[0].args).toBe("plan build");
 	});
 
-	it("takes the plugin from attributionPlugin when a later turn reports it", () => {
+	it("prefers the host's attributionPlugin over a guess from the id prefix", () => {
+		// `j:specs-pr-review` lives in the `jolli` plugin — the namespace is an alias, so
+		// the prefix guess reports `j`. The host's own answer only reaches this scanner on
+		// a line that also clears the pre-filter, and a NESTED Skill call is exactly that:
+		// it enters an inner skill while still attributed to the outer one.
+		const outerCall = TOOL_CALL.replace('"skill":"superpowers:brainstorming"', '"skill":"j:specs-pr-review"');
+		const outerResult = TOOL_RESULT.replace(
+			'"commandName":"superpowers:brainstorming"',
+			'"commandName":"j:specs-pr-review"',
+		);
+		const nestedCall = TOOL_CALL.replace('"toolu_019BtdUXtkPLcwtXEUiUv1Dc"', '"toolu_NESTED"').replace(
+			'"isSidechain":false',
+			'"isSidechain":false,"attributionSkill":"j:specs-pr-review","attributionPlugin":"jolli"',
+		);
+		const { uses } = scanClaudeSkillLines([outerCall, outerResult, nestedCall], 0);
+		expect(uses.find((u) => u.skill === "j:specs-pr-review")?.plugin).toBe("jolli");
+	});
+
+	it("still resolves a plugin when the attributed turn is filtered out before parsing", () => {
+		// ATTRIBUTED_TURN matches none of the pre-filter needles, so its attribution
+		// never reaches the map — the prefix guess is what answers here. Pinned so the
+		// prefix fallback is not mistaken for the attribution path working.
 		const { uses } = scanClaudeSkillLines([TOOL_CALL, TOOL_RESULT, TOOL_BODY, ATTRIBUTED_TURN], 0);
 		expect(uses[0].plugin).toBe("superpowers");
 	});
@@ -217,6 +238,21 @@ describe("scanClaudeSkillLines — slash-command entry path", () => {
 		expect(uses[0].invocations[0].args).toBeUndefined();
 	});
 
+	it("ignores a command block whose name tag is empty", () => {
+		// An empty name would bucket every such block under one blank skill id.
+		const empty = COMMAND_TAGS.replace(
+			"<command-name>/j:specs-pr-review</command-name>",
+			"<command-name></command-name>",
+		);
+		expect(scanClaudeSkillLines([empty, COMMAND_BODY], 0).uses).toEqual([]);
+	});
+
+	it("dates a command entry with no timestamp as empty rather than dropping it", () => {
+		const noTimestamp = COMMAND_TAGS.replace('"timestamp":"2026-07-30T03:42:11.043Z",', "");
+		const { uses } = scanClaudeSkillLines([noTimestamp, COMMAND_BODY], 0);
+		expect(uses[0].invocations[0].at).toBe("");
+	});
+
 	it("strips the leading slash from the command name", () => {
 		const { uses } = scanClaudeSkillLines([COMMAND_TAGS, COMMAND_BODY], 0);
 		expect(uses[0].skill).not.toContain("/");
@@ -295,6 +331,102 @@ describe("scanClaudeSkillLines — resumption and robustness", () => {
 		expect(uses).toHaveLength(1);
 	});
 
+	it("ignores a line that clears the pre-filter and then fails to parse", () => {
+		// The pre-filter is a substring test, so a truncated final line — the normal
+		// shape while a session is live — reaches `JSON.parse` and must be dropped there.
+		const truncated = '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Skill"';
+		const { uses } = scanClaudeSkillLines([truncated, TOOL_CALL, TOOL_RESULT], 0);
+		expect(uses).toHaveLength(1);
+	});
+
+	it("ignores a pre-filtered line whose JSON is not an object", () => {
+		const arrayLine = '[{"name":"Skill"}]';
+		const { uses } = scanClaudeSkillLines([arrayLine, TOOL_CALL, TOOL_RESULT], 0);
+		expect(uses).toHaveLength(1);
+	});
+
+	it("ignores a Skill tool_use missing the fields that identify it", () => {
+		// A block with no id cannot be joined to its result, and one with no
+		// `input.skill` names nothing — either way there is no invocation to report.
+		const noId =
+			'{"type":"assistant","timestamp":"2026-07-12T11:08:24.954Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Skill","input":{"skill":"superpowers:brainstorming"}}]}}';
+		const noInput =
+			'{"type":"assistant","timestamp":"2026-07-12T11:08:24.954Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_X","name":"Skill"}]}}';
+		expect(scanClaudeSkillLines([noId, noInput], 0).uses).toEqual([]);
+	});
+
+	it("dates a Skill tool_use with no timestamp as empty rather than dropping it", () => {
+		// The store identifies invocations by `at`, so an empty one folds them together —
+		// but the entry itself is real and reporting nothing would lose it outright.
+		const noTimestamp = TOOL_CALL.replace('"timestamp":"2026-07-12T11:08:24.954Z",', "");
+		const { uses } = scanClaudeSkillLines([noTimestamp], 0);
+		expect(uses[0].invocations[0].at).toBe("");
+	});
+
+	it("reads a tool_result whose toolUseResult is a bare string", () => {
+		// Not every tool writes an object there; the field is free-form. With no
+		// `success` flag and no `is_error` block the invocation stands as succeeded, and
+		// the resolved name simply is not available.
+		const stringResult = TOOL_RESULT.replace(
+			'"toolUseResult":{"success":true,"commandName":"superpowers:brainstorming"}',
+			'"toolUseResult":"Launching skill: superpowers:brainstorming"',
+		);
+		const { uses } = scanClaudeSkillLines([TOOL_CALL, stringResult], 0);
+		expect(uses[0].skill).toBe("superpowers:brainstorming");
+		expect(uses[0].invocations[0].ok).toBe(true);
+	});
+
+	it("ignores a toolUseResult record that carries no tool_result block", () => {
+		const noBlock =
+			'{"type":"user","timestamp":"2026-07-12T11:08:24.966Z","toolUseResult":{"success":true},"message":{"role":"user","content":[{"type":"text","text":"not a result"}]}}';
+		const { uses } = scanClaudeSkillLines([TOOL_CALL, noBlock], 0);
+		// The tool_use still stands on its own; it simply never got resolved.
+		expect(uses[0].invocations[0].ok).toBe(true);
+	});
+
+	it("ignores a body record whose content is neither a string nor a list", () => {
+		const objectBody = TOOL_BODY.replace(/"content":\[[\s\S]*?\]/, '"content":{"type":"text"}');
+		const noMessage = '{"type":"user","isMeta":true,"timestamp":"2026-07-12T11:08:24.965Z"}';
+		const { uses } = scanClaudeSkillLines([TOOL_CALL, TOOL_RESULT, objectBody, noMessage], 0);
+		expect(uses[0].invocations[0].bodyChars).toBeUndefined();
+	});
+
+	it("ignores a body record whose first block is not text", () => {
+		const imageBody = TOOL_BODY.replace(/"content":\[[\s\S]*?\]/, '"content":[{"type":"image","source":{}}]');
+		const { uses } = scanClaudeSkillLines([TOOL_CALL, TOOL_RESULT, imageBody], 0);
+		expect(uses[0].invocations[0].bodyChars).toBeUndefined();
+	});
+
+	it("does not measure a list-form local-command caveat as a skill body", () => {
+		// The caveat is isMeta too, and it appears in both content shapes. Measuring it
+		// would promote every client-side command into a skill with a plausible size.
+		const listCaveat = TOOL_BODY.replace(
+			/"content":\[[\s\S]*?\]/,
+			'"content":[{"type":"text","text":"<local-command-caveat>Caveat: …</local-command-caveat>"}]',
+		);
+		const { uses } = scanClaudeSkillLines([TOOL_CALL, TOOL_RESULT, listCaveat], 0);
+		expect(uses[0].invocations[0].bodyChars).toBeUndefined();
+	});
+
+	it("drops a body record that belongs to neither entry path", () => {
+		// No `sourceToolUseID` and no open command: the tag record that would have
+		// claimed it sits behind the resume point. There is nothing to attach it to.
+		const orphanBody = TOOL_BODY.replace('"sourceToolUseID":"toolu_019BtdUXtkPLcwtXEUiUv1Dc",', "");
+		expect(scanClaudeSkillLines([orphanBody], 0).uses).toEqual([]);
+	});
+
+	it("keeps both entries when one response calls the same skill twice", () => {
+		// Both tool_use blocks share the record's timestamp, so the newest-first sort
+		// sees a tie. Collapsing it here would drop one before the store ever folds them.
+		const twice = TOOL_CALL.replace(
+			'"content":[{"type":"tool_use","id":"toolu_019BtdUXtkPLcwtXEUiUv1Dc","name":"Skill","input":{"skill":"superpowers:brainstorming"}}]',
+			'"content":[{"type":"tool_use","id":"toolu_A","name":"Skill","input":{"skill":"superpowers:brainstorming"}},{"type":"tool_use","id":"toolu_B","name":"Skill","input":{"skill":"superpowers:brainstorming"}}]',
+		);
+		const { uses } = scanClaudeSkillLines([twice], 0);
+		expect(uses).toHaveLength(1);
+		expect(uses[0].invocations).toHaveLength(2);
+	});
+
 	it("ignores record types it has never seen", () => {
 		// `attachment` and `queue-operation` records appear in real transcripts and
 		// are not in any documented union — unknown types must be skipped, not
@@ -321,12 +453,22 @@ describe("scanClaudeSkillLines — resumption and robustness", () => {
 	});
 
 	it("orders invocations newest-first across the whole scan", () => {
-		const later = TOOL_CALL.replace(
-			'"timestamp":"2026-07-12T11:08:24.954Z"',
-			'"timestamp":"2026-07-12T23:00:00.000Z"',
-		).replace('"toolu_019BtdUXtkPLcwtXEUiUv1Dc"', '"toolu_LATER"');
-		const { uses } = scanClaudeSkillLines([TOOL_CALL, later], 0);
-		expect(uses[0].invocations[0].at).toBe("2026-07-12T23:00:00.000Z");
+		// Shuffled on purpose: line order in a transcript is write order, and a
+		// catch-up pass can surface an older invocation after a newer one.
+		const at = (stamp: string, id: string) =>
+			TOOL_CALL.replace('"timestamp":"2026-07-12T11:08:24.954Z"', `"timestamp":"${stamp}"`).replace(
+				'"toolu_019BtdUXtkPLcwtXEUiUv1Dc"',
+				`"toolu_${id}"`,
+			);
+		const { uses } = scanClaudeSkillLines(
+			[at("2026-07-12T23:00:00.000Z", "LATER"), TOOL_CALL, at("2026-07-11T09:00:00.000Z", "OLDEST")],
+			0,
+		);
+		expect(uses[0].invocations.map((i) => i.at)).toEqual([
+			"2026-07-12T23:00:00.000Z",
+			"2026-07-12T11:08:24.954Z",
+			"2026-07-11T09:00:00.000Z",
+		]);
 	});
 });
 

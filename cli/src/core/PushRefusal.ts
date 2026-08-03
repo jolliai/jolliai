@@ -42,11 +42,39 @@
  * Error `name`s that mean "this repo cannot push right now", for any credential
  * and for every document in it.
  *
- * Both spellings of the outdated-client condition are listed on purpose: the CLI
- * raises `ClientOutdatedError` while the VS Code and IntelliJ clients raise
- * `PluginOutdatedError` for the identical server response (HTTP 426). Since this
- * set is shared and errors also cross the IDE bridge by name, matching only one
- * spelling would silently classify the other as a per-item failure.
+ * Two conditions are listed under BOTH of their spellings on purpose, because the
+ * surfaces name the same server response differently and errors cross the IDE
+ * bridge by name — matching one spelling would silently classify the other as a
+ * per-item failure. HTTP 426: `ClientOutdatedError` (CLI) / `PluginOutdatedError`
+ * (VS Code + IntelliJ). HTTP 401: `NotAuthenticatedError` (CLI) /
+ * `UnauthorizedError` (IntelliJ).
+ *
+ * Note that 403 maps to whichever of the two auth names the endpoint can justify,
+ * and both are listed here because both are repo-wide: the read-shaped endpoints
+ * (`frontDoor`, `deleteDoc`) cannot tell a rejected credential from a forbidden
+ * repo and fold 403 into `NotAuthenticatedError`, while the push/bind endpoints
+ * distinguish it and raise `PermissionDeniedError`. Don't go looking for a single
+ * 403 branch — there isn't one (see `JolliMemoryPushClient`).
+ *
+ * A rejected credential is repo-wide for the same reason the others are: it is a
+ * property of the repo + credential, so every remaining document in a loop gets
+ * the identical rejection. It was the last classifier disagreement — IntelliJ's
+ * `CreatePrPanel.repoWideStopReason` already stopped the whole loop on it and
+ * reported "sign-in rejected", while `JolliPushOrchestrator.isFatalPushError` and
+ * the CLI's three attachment loops collected it as N separate `plan "X" failed`
+ * lines and fired N doomed requests on the way.
+ *
+ * **That 401 promotion reaches the CLI and IntelliJ, NOT VS Code** — membership
+ * here is necessary but not sufficient, because a surface also has to PRODUCE one
+ * of these names. `vscode/src/services/JolliPushService.ts` branches on 426, 412,
+ * 409 and 403 only, so a 401 falls through to its generic non-2xx arm and rejects
+ * with a plain `Error`, whose `name` is `"Error"` — a string this set cannot
+ * match. Its attachment loops therefore still collect a rejected credential as N
+ * per-item failures, exactly the shape the promotion removes elsewhere. A
+ * `status === 401` branch in that client, raising `UnauthorizedError`, is all it
+ * takes for VS Code to inherit the behaviour; until it exists, read "shared
+ * classifier" as shared membership, not as identical behaviour on this one
+ * condition.
  *
  * `BindingRequiredError` is deliberately ABSENT: it is recoverable — the caller
  * runs the binding chooser and retries — so it is fatal only to the loop that
@@ -56,6 +84,8 @@
 export const REPO_WIDE_REFUSAL_NAMES: ReadonlySet<string> = new Set([
 	"ClientOutdatedError",
 	"PluginOutdatedError",
+	"NotAuthenticatedError",
+	"UnauthorizedError",
 	"PushDisabledError",
 	"PermissionDeniedError",
 ]);

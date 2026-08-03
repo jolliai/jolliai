@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CLAUDE_SHELL_TOOL_NAMES, CLAUDE_TOOL_PREFIXES } from "./index.js";
+
+afterEach(() => {
+	vi.doUnmock("../../SourceDefinitionRegistry.js");
+	vi.resetModules();
+});
 
 describe("Claude producer binding", () => {
 	describe("CLAUDE_TOOL_PREFIXES", () => {
@@ -25,6 +30,25 @@ describe("Claude producer binding", () => {
 				"mcp__context7__",
 				"mcp__jollimemory__",
 			]);
+		});
+
+		// Every shipped definition happens to declare a Claude match today, but the
+		// registry is open: a Codex-only source (or one whose Claude match carries
+		// no prefixes) must contribute nothing here rather than injecting a hole
+		// into the pre-filter's needle list.
+		it("contributes no needle for a definition without Claude prefixes", async () => {
+			vi.resetModules();
+			vi.doMock("../../SourceDefinitionRegistry.js", () => ({
+				getRegistry: () => ({
+					all: () => [
+						{ match: { codex: { namespaces: ["mcp__codex_apps__acme"] } } },
+						{ match: { claude: {} } },
+						{ match: { claude: { prefixes: ["mcp__only_one__"] } } },
+					],
+				}),
+			}));
+			const { CLAUDE_TOOL_PREFIXES: prefixes } = await import("./index.js");
+			expect(prefixes).toEqual(["mcp__only_one__"]);
 		});
 	});
 

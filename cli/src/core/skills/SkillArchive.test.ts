@@ -79,6 +79,26 @@ describe("associateSkillsWithCommit", () => {
 		});
 	});
 
+	// A heuristically-detected skill must keep reading as inferred once archived.
+	// Dropping `detection` here would silently promote a guess to an observation
+	// the moment the commit landed.
+	it("carries the heuristic detection marker onto the commit ref", async () => {
+		await upsertSkillEntry(
+			{
+				source: "codex",
+				skill: "inferred-skill",
+				entryPaths: ["tool"],
+				invocations: [{ at: "2026-07-30T06:01:57.000Z", ok: true, bodyChars: 100 }],
+				detection: "heuristic",
+				sessionKey: "codex:sess-h",
+			},
+			tempDir,
+		);
+		const { refs } = await associateSkillsWithCommit(COMMIT, tempDir, "main");
+		expect(refs).toHaveLength(1);
+		expect(refs[0].detection).toBe("heuristic");
+	});
+
 	it("hands the caller the raw working-file bytes to store, not a re-render", async () => {
 		// Archival is a COPY. Rendering markdown again at archive time would put the
 		// display format in a second place and let the two drift.

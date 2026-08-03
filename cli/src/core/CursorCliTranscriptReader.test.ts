@@ -1,9 +1,17 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CURSOR_CLI_TRANSCRIPT_JSONL } from "../testUtils/cursorCliFixture.js";
 import { readCursorCliTranscript } from "./CursorCliTranscriptReader.js";
+
+// Partial mock: the fixture helpers below stay real; only `readFile` is made
+// steerable, so a failure with no `errno` code can be injected. Every real fs error
+// carries one, and the reader's code-copying guard has to survive one that does not.
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
+	return { ...actual, readFile: vi.fn(actual.readFile) };
+});
 
 // Real line shapes verified on a live cursor-agent install (JOLLI-2023):
 //   {role, message:{content:[{type:"text"|"tool_use", …}]}}  and  {type, status}
@@ -104,6 +112,59 @@ describe("readCursorCliTranscript", () => {
 
 	it("throws (with preserved code) when the file is missing", async () => {
 		await expect(readCursorCliTranscript(join(dir, "nope.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("still throws its own wrapper when the underlying error carries no code", async () => {
+		// Callers branch on `code` (ENOENT is routine, anything else is worth a warning),
+		// so the wrapper must not invent one — an absent code has to stay absent.
+		vi.mocked(readFile).mockRejectedValueOnce(new Error("something else went wrong"));
+		const err = await readCursorCliTranscript(join(dir, "t.jsonl")).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(Error);
+		expect((err as Error).message).toContain("Cannot read Cursor CLI transcript");
+		expect(err).not.toHaveProperty("code");
+	});
+
+	it("keeps a user turn that carries a stamp but no <user_query> wrapper", async () => {
+		// The wrapper marks a typed prompt; a resumed or injected turn arrives as bare
+		// text after the stamp, and dropping the stamp is all that is needed there.
+		const p = join(dir, "bare.jsonl");
+		await writeFile(
+			p,
+			`${JSON.stringify({
+				role: "user",
+				message: {
+					content: [
+						{
+							type: "text",
+							text: "<timestamp>Tuesday, Jul 21, 2026, 6:56 PM (UTC+8)</timestamp>\nbare prompt",
+						},
+					],
+				},
+			})}\n`,
+			"utf8",
+		);
+		const r = await readCursorCliTranscript(p);
+		expect(r.entries).toEqual([{ role: "human", content: "bare prompt" }]);
+	});
+
+	it("tolerates a user turn with no message body and a text part with no text", async () => {
+		// Both shapes are read twice per line under a cutoff — once to look for a
+		// timestamp and once to extract content — so neither may throw on either pass.
+		const p = join(dir, "sparse.jsonl");
+		await writeFile(
+			p,
+			[
+				JSON.stringify({ role: "user" }),
+				JSON.stringify({ role: "user", message: { content: [{ type: "text" }] } }),
+				asst("still here"),
+				"",
+			].join("\n"),
+			"utf8",
+		);
+		const r = await readCursorCliTranscript(p, null, new Date("2026-07-21T10:57:00Z").toISOString());
+		expect(r.entries).toEqual([{ role: "assistant", content: "still here" }]);
+		// Contentless turns are consumed, not deferred — nothing about them is pending.
+		expect(r.newCursor.lineNumber).toBe(3);
 	});
 
 	const userAt = (clock: string, q: string) =>

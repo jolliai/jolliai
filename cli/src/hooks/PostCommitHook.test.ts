@@ -527,6 +527,17 @@ describe("PostCommitHook", () => {
 		expect(spawn).not.toHaveBeenCalled();
 	});
 
+	it("delegates to the synchronous entry once the disable gate passes", async () => {
+		// The gate is the ONLY thing runPostCommitHook adds; past it, the result is
+		// whatever postCommitEntry decides. Drive it with GIT_REFLOG_ACTION=rebase —
+		// the one branch that resolves without reading git state or spawning — so the
+		// delegation is observable without pinning the whole enqueue pipeline here.
+		vi.mocked(readManualDisableFlag).mockResolvedValue(false);
+		vi.stubEnv("GIT_REFLOG_ACTION", "rebase");
+		await expect(runPostCommitHook("/test/project")).resolves.toBeNull();
+		expect(spawn).not.toHaveBeenCalled();
+	});
+
 	it("debounce-enqueues a post-commit ingest after processing a commit", async () => {
 		setupFullPipeline();
 

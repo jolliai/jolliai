@@ -1490,3 +1490,151 @@ describe("jollimemory local MCP (fallback path, three bare tool names)", () => {
 		expect(codexEnvelopeParser.parse([line], {}).results).toHaveLength(0);
 	});
 });
+
+// ─── envelope-level defensive paths ──────────────────────────────────────────
+//
+// Rollout files are appended live by another process, so the parser has to
+// survive blank lines, torn writes and rows whose optional keys are simply
+// absent — without dropping the well-formed rows around them.
+describe("CodexEnvelopeParser — malformed and partial rows", () => {
+	/** Minimal monday board payload — enough for the itemIds gate to pass. */
+	const MONDAY_ITEMS = {
+		board: { id: "18421599187", name: "Tasks" },
+		items: [
+			{
+				id: "12511130115",
+				name: "Add monday MCP integration",
+				url: "https://jolli-squad.monday.com/boards/18421599187/pulses/12511130115",
+			},
+		],
+	};
+
+	it("skips blank lines and JSON that is not an object, keeping the surrounding rows", () => {
+		const lines = [
+			"",
+			// Valid JSON that is a bare string. It carries the pre-filter needle, so
+			// it reaches JSON.parse and must be rejected on shape, not crash.
+			JSON.stringify("mcp_tool_call_end"),
+			fnCall("mcp__codex_apps__linear", "_get_issue", "c1"),
+			fnOutput("c1", LINEAR, { wrap: "array", prefix: true }),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.map((r) => r.def.id)).toEqual(["linear"]);
+	});
+
+	it("defaults referencedAt to the empty string when a row carries no timestamp", () => {
+		const call = JSON.stringify({
+			type: "response_item",
+			payload: { type: "function_call", name: "_get_issue", namespace: "mcp__codex_apps__linear", call_id: "c1" },
+		});
+		const out = JSON.stringify({
+			type: "response_item",
+			payload: {
+				type: "function_call_output",
+				call_id: "c1",
+				output: JSON.stringify([{ type: "text", text: JSON.stringify(LINEAR) }]),
+			},
+		});
+		const { results } = codexEnvelopeParser.parse([call, out], {});
+		expect(results).toHaveLength(1);
+		expect(results[0].referencedAt).toBe("");
+	});
+
+	it("ignores a result row that carries no call_id to correlate on", () => {
+		const orphanOutput = JSON.stringify({
+			type: "response_item",
+			timestamp: TS,
+			payload: { type: "function_call_output", output: JSON.stringify(LINEAR) },
+		});
+		const orphanEnd = JSON.stringify({
+			type: "event_msg",
+			timestamp: TS,
+			payload: {
+				type: "mcp_tool_call_end",
+				invocation: { server: "codex_apps", tool: "linear.get_issue" },
+				result: { Ok: { content: [{ type: "text", text: JSON.stringify(LINEAR) }] } },
+			},
+		});
+		// The event still yields its reference (correlation is only needed to reach
+		// back for the paired request's arguments); the bare output row does not.
+		expect(codexEnvelopeParser.parse([orphanOutput], {}).results).toHaveLength(0);
+		expect(codexEnvelopeParser.parse([orphanEnd], {}).results).toHaveLength(1);
+	});
+
+	it("drops an mcp_tool_call_end whose result content is not a text block", () => {
+		for (const content of [[42], ["text"], [null]]) {
+			const line = JSON.stringify({
+				type: "event_msg",
+				timestamp: TS,
+				payload: {
+					type: "mcp_tool_call_end",
+					call_id: "c1",
+					invocation: { server: "codex_apps", tool: "linear.get_issue" },
+					result: { Ok: { content } },
+				},
+			});
+			expect(codexEnvelopeParser.parse([line], {}).results).toHaveLength(0);
+		}
+	});
+
+	it("parses a JSON-string invocation.arguments the same as a pre-parsed object", () => {
+		// codex_apps events carry `arguments` pre-parsed; the sibling function_call
+		// serializes it. Both shapes must reach the gating normalizer identically.
+		const asString = toolCallEnd(
+			"monday_com.get_board_items_page",
+			"c1",
+			MONDAY_ITEMS,
+			JSON.stringify({ itemIds: [12511130115] }),
+		);
+		const asObject = toolCallEnd("monday_com.get_board_items_page", "c2", MONDAY_ITEMS, {
+			itemIds: [12511130115],
+		});
+		expect(codexEnvelopeParser.parse([asString], {}).results).toHaveLength(1);
+		expect(codexEnvelopeParser.parse([asObject], {}).results).toHaveLength(1);
+	});
+
+	it("treats unparsable function_call arguments as absent rather than throwing", () => {
+		// A torn `arguments` string on the request row must not sink the paired
+		// event; the gating normalizer just fails closed for lack of input.
+		const call = fnCall("mcp__codex_apps__monday_com", "_get_board_items_page", "c1", '{"itemIds":[1');
+		const end = toolCallEnd("monday_com.get_board_items_page", "c1", MONDAY_ITEMS);
+		expect(codexEnvelopeParser.parse([call, end], {}).results).toHaveLength(0);
+	});
+
+	it("drops an mcp_tool_call_end whose timestamp is past the cutoff", () => {
+		const line = toolCallEnd("linear.get_issue", "c1", LINEAR);
+		// Same line, read with a cutoff BEFORE its timestamp: the event is dropped,
+		// but its call is still marked answered so the cursor is not pinned on it.
+		expect(codexEnvelopeParser.parse([line], {}).results).toHaveLength(1);
+		const cut = codexEnvelopeParser.parse([line], { beforeTimestamp: "2026-01-01T00:00:00.000Z" });
+		expect(cut.results).toHaveLength(0);
+		expect(cut.lastLineNumberScanned).toBe(1);
+	});
+
+	it("keeps the event payload as-is when the recovery hook cannot salvage anything", () => {
+		// Jira's `recover` stitches a `webUrl` out of the raw output. When the raw
+		// output holds no webUrl at all it returns null, and the event's own
+		// (url-less) payload must be used unchanged rather than blanked.
+		const lines = [
+			toolCallEnd("atlassian_rovo.getJiraIssue", "c_jira", JIRA_BARE_NO_URL),
+			fnOutputRaw("c_jira", "Wall time: 0.4s\nOutput:\n<not json, and no webUrl anywhere>"),
+		];
+		const { results } = codexEnvelopeParser.parse(lines, {});
+		expect(results.map((r) => r.def.id)).toEqual(["jira"]);
+		// No tenant browse URL was salvaged, so the payload keeps the REST `self`
+		// the normalizer derives — not a stitched-in one.
+		expect((results[0].payload as { webUrl?: string }).webUrl).toBe(JIRA_BARE_NO_URL.self);
+	});
+
+	// The cursor must not advance past ANY in-flight request, so with several
+	// unanswered calls it holds at the earliest of them.
+	it("holds the cursor at the EARLIEST unanswered request, not the latest", () => {
+		const lines = [
+			fnCall("mcp__codex_apps__linear", "_get_issue", "first"),
+			fnCall("mcp__codex_apps__linear", "_get_issue", "second"),
+			fnCall("mcp__codex_apps__linear", "_get_issue", "third"),
+		];
+		const { lastLineNumberScanned } = codexEnvelopeParser.parse(lines, {});
+		expect(lastLineNumberScanned).toBe(0);
+	});
+});

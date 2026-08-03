@@ -99,11 +99,18 @@ function mergeUsageSplits(
 	contributors: ReadonlyArray<SkillCommitRef>,
 ): Readonly<Record<string, SkillUsage>> | undefined {
 	if (contributors.length === 0) return undefined;
-	if (contributors.some((ref) => ref.usageBySession === undefined)) return undefined;
+	// Collect while checking, rather than `some(...)` then re-reading the field in
+	// the merge loop: the second read would need a `?? {}` fallback that can never
+	// fire, since the check above already rejected every undefined split.
+	const splits: Array<Readonly<Record<string, SkillUsage>>> = [];
+	for (const ref of contributors) {
+		if (ref.usageBySession === undefined) return undefined;
+		splits.push(ref.usageBySession);
+	}
 
 	const merged: Record<string, SkillUsage> = {};
-	for (const ref of contributors) {
-		for (const [key, usage] of Object.entries(ref.usageBySession ?? {})) {
+	for (const split of splits) {
+		for (const [key, usage] of Object.entries(split)) {
 			const prior = merged[key];
 			merged[key] =
 				prior === undefined

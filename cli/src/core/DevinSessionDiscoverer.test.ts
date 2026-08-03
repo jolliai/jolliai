@@ -425,6 +425,24 @@ describe("DevinSessionDiscoverer", () => {
 			expect((await discoverDevinSessions(projectDir)).map((s) => s.sessionId)).toEqual(["wd-match"]);
 		});
 
+		// Same malformed payloads, but with a working_directory that does NOT
+		// match — so `parseWorkspaceDirs` is the only thing deciding, and its
+		// tolerance has to yield "no extra dirs" rather than throwing.
+		it.each([
+			["malformed JSON", "{not valid json"],
+			["a non-array payload", '{"dirs":[]}'],
+			["non-string entries", "[42, null, {}]"],
+			["an empty string", ""],
+		])("yields no extra dirs for %s when working_directory also misses", async (_label, raw) => {
+			const dbDir = join(fakeDataHome, "devin", "cli");
+			const nowSec = Math.floor(Date.now() / 1000);
+			await createDevinDb(dbDir, [
+				{ id: "wd-miss", workingDirectory: "/tmp/elsewhere", workspaceDirs: raw, lastActivityAt: nowSec - 100 },
+			]);
+
+			expect(await discoverDevinSessions(projectDir)).toEqual([]);
+		});
+
 		it("returns a silent empty result (no error) when the runtime lacks node:sqlite", async () => {
 			const dbDir = join(fakeDataHome, "devin", "cli");
 			const nowSec = Math.floor(Date.now() / 1000);

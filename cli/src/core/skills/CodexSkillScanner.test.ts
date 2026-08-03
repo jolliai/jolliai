@@ -204,4 +204,14 @@ describe("scanCodexSkillLines", () => {
 		const stray = CODEX_CAT_SKILL.split("/skills/comprehensive-review-full-review/").join("/docs/");
 		expect(scanCodexSkillLines([codexRecord(stray, T1)], 0).uses).toEqual([]);
 	});
+
+	// A torn write (Codex appends while the scan runs) leaves a half-flushed line
+	// that still carries the needle. Skip it and keep scanning — the lines after
+	// it are intact, and the cursor must still advance past the bad one.
+	it("skips an unparsable line that carries the needle and keeps scanning", () => {
+		const truncated = `{"payload":{"type":"function_call","arguments":"cat /x/skills/foo/SKILL.md`;
+		const { uses, lastLine } = scanCodexSkillLines([truncated, codexRecord(CODEX_CAT_SKILL, T1)], 0);
+		expect(uses.map((u) => u.skill)).toEqual(["comprehensive-review-full-review"]);
+		expect(lastLine).toBe(2);
+	});
 });

@@ -98,6 +98,28 @@ describe("buildSkillsTable", () => {
 		]);
 	});
 
+	it("still orders by name when NO row has a total to sort by", () => {
+		// Every unattributed row totals 0, so the name tie-break carries the whole
+		// ordering — the common shape for a host that attributes nothing at all.
+		const none = { usage: undefined };
+		const lines = buildSkillsTable([
+			row({ skill: "zebra", ...none }),
+			row({ skill: "alpha", ...none }),
+			row({ skill: "mango", ...none }),
+		]);
+		expect(lines.slice(2).map((l) => l.split(" | ")[0])).toEqual(["| alpha", "| mango", "| zebra"]);
+	});
+
+	it("keeps two rows that share a skill id instead of collapsing them", () => {
+		// The renderer takes an array, not a map: an equal-name tie must stay a tie so
+		// both rows reach the table and their counts stay distinguishable.
+		const lines = buildSkillsTable([
+			row({ skill: "same", invocationCount: 1, usage: undefined }),
+			row({ skill: "same", invocationCount: 7, usage: undefined }),
+		]);
+		expect(lines.slice(2)).toEqual(["| same | 1 | — | — | — | — |", "| same | 7 | — | — | — | — |"]);
+	});
+
 	it("daggers an inferred row and spells the footnote out once", () => {
 		const lines = buildSkillsTable([row({ detection: "heuristic", usage: undefined }), row()]);
 		expect(lines).toContain("| superpowers:brainstorming † | 2 | — | — | — | — |");

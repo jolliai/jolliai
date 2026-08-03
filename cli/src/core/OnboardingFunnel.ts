@@ -46,11 +46,12 @@
 
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { getJolliMemoryDir } from "../Logger.js";
+import { getJolliMemoryDir, isManuallyDisabled } from "../Logger.js";
 import type { JolliMemoryConfig, StatusInfo } from "../Types.js";
 import { atomicWriteFile } from "./AtomicWrite.js";
 import { isInsideGitRepo } from "./GitOps.js";
 import { resolveLlmCredentialSource } from "./LlmClient.js";
+import { readManualDisableFlagSync } from "./RepoProfile.js";
 import { type BucketLabel, bucket, getTelemetryContext, track } from "./Telemetry.js";
 
 /** Which route (if any) the user has configured to capture memory. */
@@ -210,6 +211,46 @@ export async function maybeEmitOnboardingProgress(opts: ResolveFunnelOptions): P
 		// Short-circuit before any git/status work — and before taking the lock —
 		// when telemetry is off, so an opted-out user pays nothing.
 		if (!getTelemetryContext()?.enabled) return;
+		// Same, for a repo the user durably opted out of (spec 304). The ledger is a
+		// NEW repo-local file, not an append to the buffer the telemetry primitive
+		// already owns, so the "telemetry recording is ungated" carve-out does not
+		// cover it — without this gate the Disable command's own status refresh
+		// writes into the repo it just disabled.
+		//
+		// BOTH readers are consulted because neither alone covers every trigger:
+		//   - `isManuallyDisabled()` is the free in-memory mirror the editor host
+		//     seeds at activate() and flips in lockstep with enable/disable. It is
+		//     the only reader available on VS Code's synchronous write paths, but
+		//     it is process-local — CLI processes never set it (see Logger.ts), so
+		//     on its own it left `jolli status` / bare `jolli` / `jolli enable` /
+		//     the QueueWorker's IngestRunStore recreating the ledger in a repo the
+		//     user had already disabled.
+		//   - `readManualDisableFlagSync` is the durable, disk-backed truth those
+		//     CLI processes need. It must be the SYNC variant: the async
+		//     `readManualDisableFlag` persists a legacy-marker migration decision,
+		//     i.e. a write, which is exactly what this gate exists to prevent.
+		//     Steady-state cost is one `readFileSync`: the `git rev-parse` it needs
+		//     to anchor on the main worktree runs once per `cwd` and is then served
+		//     from `_mainRootCache` (see `RepoProfile.ts`), because this gate is NOT
+		//     a once-per-process seed — VS Code reaches it from every
+		//     `StatusStore.refresh()`, including two file watchers that fire
+		//     repeatedly while an AI session is live, so an unmemoized subprocess
+		//     spawn per refresh would block the extension host's event loop. What
+		//     is left is charged only after the telemetry-consent short-circuit,
+		//     and is small next to the `isInsideGitRepo` / `getStatus` work
+		//     `resolveOnboardingFunnel` runs immediately after it.
+		//
+		// KNOWN TRADE-OFF, deliberate: this sits ahead of `track()`, not merely ahead
+		// of the ledger write, so disabling a repo silences the funnel INCLUDING the
+		// `repo_enabled: false` snapshot that would have recorded the disable itself.
+		// The last snapshot on record for that repo says "enabled" and nothing ever
+		// supersedes it — so the drop-off this funnel exists to observe is the one
+		// event it cannot see. Gating only the persist is NOT the fix: the dedup
+		// ledger would go unread, turning every status refresh into a fresh emit, and
+		// the zero-write contract (spec 304) is the stronger of the two promises.
+		// Recovering the signal needs a one-shot emit at the disable GESTURE itself,
+		// which is a separate design — not a relaxation of this gate.
+		if (isManuallyDisabled() || readManualDisableFlagSync(opts.cwd)) return;
 		ledgerPath = join(getJolliMemoryDir(opts.cwd), LEDGER_FILE);
 		const path = ledgerPath;
 		run = (ledgerLocks.get(path) ?? Promise.resolve()).then(() => emitOnce(opts, path));

@@ -102,6 +102,13 @@ describe("replaceMarkerRegion", () => {
 			`Before\n\n${MARKER_START}\n${payload}\n${MARKER_END}\n\nAfter`,
 		);
 	});
+
+	// An unwritten PR body is "" — appending with the usual blank-line separator
+	// would leave the body starting with two stray newlines.
+	it("emits the block alone when the current body is empty", () => {
+		const wrapped = wrapWithMarkers("Generated");
+		expect(replaceMarkerRegion("", wrapped)).toBe(wrapped);
+	});
 });
 
 describe("loadBranchSummaries", () => {

@@ -159,11 +159,14 @@ export function collectLlmSources(summary: CommitSummary): ReadonlyArray<LlmCred
  * Every other source renders through the static `PROVIDER_LABELS` map,
  * unchanged from before.
  */
-function nodeLabel(llm: NonNullable<CommitSummary["llm"]>): string {
-	if (llm.source === "local-agent") {
+// `source` is passed separately, already narrowed by the caller's truthiness
+// guard. Re-reading `llm.source` here would force a `?? "anthropic-config"`
+// fallback that no caller can ever reach.
+function nodeLabel(llm: NonNullable<CommitSummary["llm"]>, source: LlmCredentialSource): string {
+	if (source === "local-agent") {
 		return llm.localAgentTool ? `Local agent - ${localAgentToolLabel(llm.localAgentTool)}` : "Local agent";
 	}
-	return PROVIDER_LABELS[llm.source ?? "anthropic-config"];
+	return PROVIDER_LABELS[source];
 }
 
 /**
@@ -183,7 +186,8 @@ function nodeLabel(llm: NonNullable<CommitSummary["llm"]>): string {
 export function formatProviderLabel(summary: CommitSummary): string | undefined {
 	const labels = new Set<string>();
 	const visit = (node: CommitSummary): void => {
-		if (node.llm?.source) labels.add(nodeLabel(node.llm));
+		const llm = node.llm;
+		if (llm?.source) labels.add(nodeLabel(llm, llm.source));
 		for (const child of node.children ?? []) visit(child);
 	};
 	visit(summary);

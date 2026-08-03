@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import * as resolver from "./ExecutableResolver.js";
-import { expandOpenCodeShim, OpenCodeBackend } from "./OpenCodeBackend.js";
+import { expandOpenCodeShim, OPENCODE_SPEC, OpenCodeBackend } from "./OpenCodeBackend.js";
 import { LocalAgentSetupError } from "./Types.js";
 
 const fixture = readFileSync(join(__dirname, "__fixtures__/opencode/success.json"), "utf8");
@@ -109,5 +109,34 @@ describe("OpenCodeBackend.isPresent", () => {
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ binName: "opencode" }), {
 			overridePath: undefined,
 		});
+	});
+});
+
+describe("OpenCodeBackend.discoverExecutable", () => {
+	it("resolves through the shared resolver, forwarding the override path", async () => {
+		const spy = vi
+			.spyOn(resolver, "resolveExecutable")
+			.mockReturnValue({ file: "/opt/opencode", version: "1.2.3" });
+		await expect(b.discoverExecutable("/opt/opencode")).resolves.toEqual({
+			file: "/opt/opencode",
+			version: "1.2.3",
+		});
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ binName: "opencode" }), {
+			overridePath: "/opt/opencode",
+		});
+		spy.mockRestore();
+	});
+});
+
+describe("OPENCODE_SPEC.knownPaths", () => {
+	// Built with path.win32 / path.posix rather than the host `path`, so the
+	// expectations hold on a Windows dev machine and in POSIX CI alike. Windows
+	// lists the standalone installer's native binary first, then the npm layout.
+	it("lists the install locations for each platform", () => {
+		expect(OPENCODE_SPEC.knownPaths("C:\\Users\\u", "win32")).toEqual([
+			"C:\\Users\\u\\.opencode\\bin\\opencode.exe",
+			"C:\\Users\\u\\.local\\bin\\opencode.exe",
+		]);
+		expect(OPENCODE_SPEC.knownPaths("/home/u", "darwin")).toEqual(["/home/u/.local/bin/opencode"]);
 	});
 });

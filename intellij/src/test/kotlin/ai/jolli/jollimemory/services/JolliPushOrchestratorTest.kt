@@ -69,15 +69,15 @@ class JolliPushOrchestratorTest {
         }
 
         @Test
-        fun `KNOWN GAP - unauthorized is repo-wide but still takes the collect path`() {
-            // Pins current behavior, NOT an endorsement. A 401 is repo-wide (every
-            // remaining attachment gets the same rejection) and `CreatePrPanel`'s
-            // `repoWideStopReason` already classifies it as a whole-loop stop — so this
-            // is the one type the two classifiers disagree on beyond the deliberate
-            // `BindingRequiredError` exception. Promoting it here means promoting
-            // `NotAuthenticatedError` in vscode's `FATAL_PUSH_ERROR_NAMES` in the same
-            // change; until then this test is the record that the gap is known.
-            JolliPushOrchestrator.isFatalPushError(JolliApiClient.UnauthorizedError("no token")) shouldBe false
+        fun `unauthorized aborts the push instead of becoming N attachment failures`() {
+            // Repo-wide: a rejected credential rejects every remaining attachment
+            // identically. This used to be the one type the two classifiers disagreed
+            // on beyond the deliberate `BindingRequiredError` exception —
+            // `CreatePrPanel.repoWideStopReason` stopped the loop and said "sign-in
+            // rejected" while this one collected N `plan "X" failed` lines. Promoted
+            // alongside `NotAuthenticatedError` / `UnauthorizedError` in
+            // `cli/src/core/PushRefusal.ts`, which the CLI and VS Code loops share.
+            JolliPushOrchestrator.isFatalPushError(JolliApiClient.UnauthorizedError("no token")) shouldBe true
         }
     }
 }

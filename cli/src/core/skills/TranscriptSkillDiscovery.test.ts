@@ -1,8 +1,8 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { loadExtractorCursorLine, loadPlansRegistry } from "../SessionTracker.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { loadExtractorCursorLine, loadPlansRegistry, upsertSkillEntry } from "../SessionTracker.js";
 import {
 	ATTRIBUTED_TURN,
 	COMMAND_BODY,
@@ -16,6 +16,14 @@ import {
 	USAGE_SUBAGENT_TURN,
 } from "./__fixtures__/claudeTranscript.js";
 import { scanSkillsFrom, scanSkillsWithCursor } from "./TranscriptSkillDiscovery.js";
+
+// Partial mock: every other export stays real (the tests below read the registry and
+// the cursors back through them), only the persist call is made steerable so a
+// mid-scan failure can be injected.
+vi.mock("../SessionTracker.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../SessionTracker.js")>();
+	return { ...actual, upsertSkillEntry: vi.fn(actual.upsertSkillEntry) };
+});
 
 describe("scanSkillsFrom", () => {
 	let tempDir: string;
@@ -133,6 +141,26 @@ describe("scanSkillsFrom", () => {
 		await writeFile(join(dir, "agent-x.meta.json"), '{"agentType":"Explore"}', "utf-8");
 		await expect(scanSkillsFrom(path, 0, tempDir, "claude")).resolves.toBe(0);
 		expect((await loadPlansRegistry(tempDir)).skills).toBeUndefined();
+	});
+
+	it("skips an unreadable subagent file and still scans the rest", async () => {
+		// readdir lists the name, readFile then fails on it — the real case is a file
+		// removed between the listing and the read, reproduced deterministically here
+		// with a directory wearing the transcript name. One bad entry must not cost the
+		// session its own skills, nor the sibling subagent's.
+		const inSubagent = TOOL_CALL.replace(
+			'"skill":"superpowers:brainstorming"',
+			'"skill":"superpowers:test-driven-development"',
+		).replace('"toolu_019BtdUXtkPLcwtXEUiUv1Dc"', '"toolu_SUB"');
+		const path = await writeTranscript([TOOL_CALL, TOOL_RESULT, TOOL_BODY]);
+		await writeSubagent("zzz", [inSubagent]);
+		await mkdir(join(projectsDir, SESSION_ID, "subagents", "agent-broken.jsonl"), { recursive: true });
+
+		await expect(scanSkillsFrom(path, 0, tempDir, "claude")).resolves.toBe(3);
+		expect(Object.keys((await loadPlansRegistry(tempDir)).skills ?? {}).sort()).toEqual([
+			"claude:superpowers:brainstorming",
+			"claude:superpowers:test-driven-development",
+		]);
 	});
 
 	it("is a no-op for a transcript with no subagents directory", async () => {
@@ -276,6 +304,17 @@ describe("scanSkillsFrom", () => {
 			const missing = join(projectsDir, "does-not-exist.jsonl");
 			await expect(scanSkillsWithCursor(missing, tempDir, "claude")).resolves.toBeUndefined();
 			expect(await loadExtractorCursorLine(missing, "skills", tempDir)).toBe(0);
+		});
+
+		it("swallows a mid-scan failure and holds the mark", async () => {
+			// The scan itself can throw — a plans.lock timeout is the live example. The
+			// helper must neither propagate it into the hook nor advance the mark over
+			// lines it never finished persisting.
+			const path = await writeTranscript([TOOL_CALL, TOOL_RESULT, TOOL_BODY]);
+			vi.mocked(upsertSkillEntry).mockRejectedValueOnce(new Error("plans.lock timeout"));
+
+			await expect(scanSkillsWithCursor(path, tempDir, "claude")).resolves.toBeUndefined();
+			expect(await loadExtractorCursorLine(path, "skills", tempDir)).toBe(0);
 		});
 
 		it("is a no-op for a source with no skill scanner", async () => {

@@ -46,8 +46,15 @@ object JolliPushOrchestrator {
      * ("contact an admin") / quiet ("re-enable to push") handling they have for
      * exactly these two.
      *
-     * Mirrors vscode's `FATAL_PUSH_ERROR_NAMES`; shared by BOTH attachment loops so
-     * the fatal set cannot drift between them.
+     * Mirrors `REPO_WIDE_REFUSAL_NAMES` in `cli/src/core/PushRefusal.ts` — the shared
+     * source of truth the CLI and VS Code loops both read (it superseded vscode's old
+     * `FATAL_PUSH_ERROR_NAMES`, which no longer exists). Shared by BOTH attachment
+     * loops here so the fatal set cannot drift between them either.
+     *
+     * Sharing the set is not the same as sharing the behaviour: VS Code reads it but
+     * `JolliPushService` has no 401 branch, so a rejected credential still reaches its
+     * loops as a plain `Error` and is collected per attachment. The 401 stop described
+     * below is live on this surface and the CLI only.
      *
      * Membership must stay in step with `CreatePrPanel.repoWideStopReason`, the other
      * place this project decides "repo-wide or per-item". The two differ in exactly
@@ -55,7 +62,9 @@ object JolliPushOrchestrator {
      * cannot run a chooser) but RECOVERABLE there (the panel resolves the binding and
      * retries). Every other repo-wide type belongs in both — a type added to only one
      * is the bug shape that let a repo-wide refusal be counted as a single per-item
-     * failure. When adding one, update both.
+     * failure. When adding one, update both. `UnauthorizedError` was exactly that
+     * shape for a while: present only in `repoWideStopReason`, so a 401 mid-loop here
+     * became N per-attachment failures instead of one "sign-in rejected" stop.
      *
      * `internal` so the set is unit-testable: both loops reach it only through a
      * static [JolliApiClient.pushToJolli] call, which cannot be faked without the
@@ -64,6 +73,7 @@ object JolliPushOrchestrator {
     internal fun isFatalPushError(e: Throwable): Boolean =
         e is JolliApiClient.BindingRequiredError ||
             e is JolliApiClient.PluginOutdatedError ||
+            e is JolliApiClient.UnauthorizedError ||
             e is JolliApiClient.PermissionDeniedError ||
             e is JolliShareService.PushDisabledError ||
             // Not reachable from inside the attachment loops today (the gate that raises

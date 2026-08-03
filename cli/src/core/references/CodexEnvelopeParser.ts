@@ -513,7 +513,10 @@ function readInvocationTool(invocation: unknown): string | undefined {
  * thing separating its `search` from every other local server's `search`.
  */
 function readInvocationServer(invocation: unknown): string | undefined {
+	/* v8 ignore start -- unreachable: the sole call site runs only after
+	   readInvocationTool returned a tool name, which already proved this is an object. */
 	if (!isObject(invocation)) return undefined;
+	/* v8 ignore stop */
 	return readString(invocation.server);
 }
 
@@ -525,7 +528,10 @@ function readInvocationServer(invocation: unknown): string | undefined {
  * yield the same object downstream. Returns undefined when absent/unparsable.
  */
 function readInvocationArguments(invocation: unknown): unknown {
+	/* v8 ignore start -- unreachable: same call site as readInvocationServer, reached
+	   only once readInvocationTool has proved this is an object. */
 	if (!isObject(invocation)) return undefined;
+	/* v8 ignore stop */
 	const args = invocation.arguments;
 	return typeof args === "string" ? parseArguments(args) : args;
 }

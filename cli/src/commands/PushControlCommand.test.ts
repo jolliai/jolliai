@@ -98,6 +98,57 @@ describe("jolli push-control", () => {
 		expect(JSON.parse(stdout)).toEqual({ type: "set", pushDisabled: true, cwd: "/current/repo" });
 	});
 
+	it("warns that a rebuild reset every other repo's opt-out, naming the kept file", async () => {
+		// --enable is the documented recovery from a corrupt store, and it rebuilds from
+		// an EMPTY set. A plain success line would let the user walk away believing the
+		// other repos are still opted out.
+		mockApply.mockResolvedValue({
+			disabled: false,
+			recoveredFromCorrupt: true,
+			preservedAt: "/g/push-control.json.corrupt-1",
+		});
+		const { stdout } = await run(["--enable"]);
+		expect(stdout).toContain("rebuilt from scratch");
+		expect(stdout).toContain("every other repository's opt-out was reset to ON");
+		expect(stdout).toContain("/g/push-control.json.corrupt-1");
+	});
+
+	it("still warns about the rebuild when the unreadable file could not be kept", async () => {
+		// Preserving the corrupt copy is best-effort; the reset happened either way, so
+		// the warning must not be conditional on having somewhere to point.
+		mockApply.mockResolvedValue({ disabled: false, recoveredFromCorrupt: true });
+		const { stdout } = await run(["--enable"]);
+		expect(stdout).toContain("rebuilt from scratch");
+		expect(stdout).not.toContain("kept at:");
+	});
+
+	it("reports the rebuild in the JSON set payload too", async () => {
+		mockApply.mockResolvedValue({
+			disabled: false,
+			recoveredFromCorrupt: true,
+			preservedAt: "/g/push-control.json.corrupt-1",
+		});
+		const { stdout } = await run(["--enable", "--format", "json"]);
+		expect(JSON.parse(stdout)).toEqual({
+			type: "set",
+			pushDisabled: false,
+			cwd: "/current/repo",
+			recoveredFromCorrupt: true,
+			preservedAt: "/g/push-control.json.corrupt-1",
+		});
+	});
+
+	it("omits preservedAt from the JSON payload when there is none", async () => {
+		mockApply.mockResolvedValue({ disabled: false, recoveredFromCorrupt: true });
+		const { stdout } = await run(["--enable", "--format", "json"]);
+		expect(JSON.parse(stdout)).toEqual({
+			type: "set",
+			pushDisabled: false,
+			cwd: "/current/repo",
+			recoveredFromCorrupt: true,
+		});
+	});
+
 	it("rejects --enable and --disable together", async () => {
 		const { stderr, exitCode } = await run(["--enable", "--disable"]);
 		expect(stderr).toContain("mutually exclusive");
@@ -116,6 +167,15 @@ describe("jolli push-control", () => {
 		mockApply.mockRejectedValue(new Error("nope"));
 		const { stdout, exitCode } = await run(["--disable", "--format", "json"]);
 		expect(JSON.parse(stdout)).toEqual({ type: "error", message: "nope" });
+		expect(exitCode).toBe(1);
+	});
+
+	it("stringifies a rejection that is not an Error", async () => {
+		// The core is free to reject with anything; reading `.message` off a non-Error
+		// would print `undefined` as the whole explanation.
+		mockState.mockRejectedValue("store vanished");
+		const { stderr, exitCode } = await run([]);
+		expect(stderr).toContain("store vanished");
 		expect(exitCode).toBe(1);
 	});
 });

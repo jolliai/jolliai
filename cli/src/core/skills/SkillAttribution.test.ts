@@ -94,6 +94,21 @@ describe("attributeSkillUsage — attributed path", () => {
 		expect(usage.get("superpowers:brainstorming")?.output).toBe(797);
 	});
 
+	it("drops a usage-bearing line that is not parseable JSON", () => {
+		// The pre-filter is a substring test, so a truncated write — the shape a
+		// transcript takes while the host is mid-flush — reaches the parser. It has to
+		// fall out of the scan rather than take the whole pass down with it.
+		const truncated = '{"type":"assistant","message":{"id":"m","usage":{"output_tokens":5';
+		expect(attributeSkillUsage([truncated, USAGE_SPLIT_LINE_1]).get("superpowers:brainstorming")?.output).toBe(797);
+	});
+
+	it("drops a usage-bearing line whose JSON is not an object", () => {
+		// JSONL is one record per line by convention, not by enforcement; an array
+		// would satisfy `JSON.parse` and then read every field as undefined.
+		const arrayLine = '[{"usage":{"output_tokens":5}}]';
+		expect(attributeSkillUsage([arrayLine, USAGE_SPLIT_LINE_1]).get("superpowers:brainstorming")?.output).toBe(797);
+	});
+
 	it("tolerates a usage object missing the optional counters", () => {
 		const sparse =
 			'{"type":"assistant","timestamp":"2026-07-12T11:00:00.000Z","attributionSkill":"a:b","message":{"id":"m","usage":{"output_tokens":5}}}';
@@ -259,6 +274,60 @@ describe("attributeSkillUsage — interval fallback", () => {
 	it("still dedupes repeated lines on the fallback path", () => {
 		const repeated = turn("m1", "2026-07-12T11:09:00.000Z", 500);
 		const usage = attributeSkillUsage([TOOL_CALL, repeated, repeated, repeated]);
+		expect(usage.get("superpowers:brainstorming")?.output).toBe(500);
+	});
+
+	it("steps over unreadable lines without closing the open interval", () => {
+		// Both shapes clear the substring pre-filter and then fail: a truncated write,
+		// and a line that parses to an array. Neither is a user turn, so neither may
+		// end the interval — dropping the line is the whole of the correct response.
+		const truncated = '{"type":"assistant","message":{"id":"mX","usage":{"output_tokens":5';
+		const arrayLine = '[{"role":"user"}]';
+		// A blank line and a record the pre-filter rejects outright, for the same reason.
+		const uninteresting = '{"type":"summary","summary":"Skill coverage work"}';
+		const usage = attributeSkillUsage([
+			TOOL_CALL,
+			"",
+			uninteresting,
+			truncated,
+			arrayLine,
+			turn("m1", "2026-07-12T11:09:00.000Z", 500),
+		]);
+		expect(usage.get("superpowers:brainstorming")?.output).toBe(500);
+	});
+
+	it("counts every unidentified line in the interval, since none can be deduped", () => {
+		// A line with no `message.id` carries no response identity. Collapsing two of
+		// them onto each other would silently discard real spend, so the dedupe set is
+		// bypassed and both count — the same rule the attributed path follows.
+		const anon = (at: string, out: number) =>
+			`{"type":"assistant","timestamp":"${at}","message":{"role":"assistant","usage":{"input_tokens":1,"output_tokens":${out}},"content":[{"type":"text","text":"x"}]}}`;
+		const usage = attributeSkillUsage([
+			TOOL_CALL,
+			anon("2026-07-12T11:09:00.000Z", 500),
+			anon("2026-07-12T11:10:00.000Z", 300),
+		]);
+		expect(usage.get("superpowers:brainstorming")?.output).toBe(800);
+	});
+
+	it("ends the interval at a user record that carries no message body", () => {
+		const bare = '{"type":"user","timestamp":"2026-07-12T11:09:30.000Z"}';
+		const usage = attributeSkillUsage([
+			TOOL_CALL,
+			turn("m1", "2026-07-12T11:09:00.000Z", 500),
+			bare,
+			turn("m2", "2026-07-12T11:10:00.000Z", 9999),
+		]);
+		expect(usage.get("superpowers:brainstorming")?.output).toBe(500);
+	});
+
+	it("does not treat a Skill block that names no skill as an entry", () => {
+		// A `Skill` tool_use whose input never made it to disk resolves to no id. It
+		// must leave the open interval alone: closing it would strand the following
+		// turns under no skill at all, which is worse than billing them to the caller.
+		const noInput =
+			'{"type":"assistant","timestamp":"2026-07-12T11:08:30.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_TRUNC","name":"Skill"}]}}';
+		const usage = attributeSkillUsage([TOOL_CALL, noInput, turn("m1", "2026-07-12T11:09:00.000Z", 500)]);
 		expect(usage.get("superpowers:brainstorming")?.output).toBe(500);
 	});
 

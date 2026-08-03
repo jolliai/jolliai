@@ -1,8 +1,38 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Two seams for the recovery path, both defaulting to real behaviour:
+//  - `rename` so the "could not preserve the unreadable store" arm is reachable
+//    without making the whole directory unwritable (the rebuild must still run);
+//  - the file lock so the "never silently drop a toggle" fallback can be
+//    exercised without waiting out a real lock timeout.
+const seam = vi.hoisted(() => ({ renameError: undefined as unknown, lockUnavailable: false }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
+	return {
+		...actual,
+		// Scoped to the corrupt-store BACKUP rename only: `atomicWriteFile` renames
+		// too, and failing that would break the rebuild this test needs to observe.
+		rename: async (...args: Parameters<typeof actual.rename>) => {
+			if (seam.renameError !== undefined && String(args[1]).includes(".corrupt-")) throw seam.renameError;
+			return actual.rename(...args);
+		},
+	};
+});
+vi.mock("./Locks.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./Locks.js")>();
+	return {
+		...actual,
+		withPushControlLock: async <T>(
+			fn: () => Promise<T>,
+			opts?: Parameters<typeof actual.withPushControlLock>[1],
+		) => (seam.lockUnavailable ? { acquired: false as const } : actual.withPushControlLock(fn, opts)),
+	};
+});
+
 import {
 	CORRUPT_SUFFIX,
 	getPushControlPath,
@@ -17,6 +47,8 @@ describe("PushControlStore", () => {
 
 	beforeEach(() => {
 		dir = mkdtempSync(join(tmpdir(), "jolli-pcstore-"));
+		seam.renameError = undefined;
+		seam.lockUnavailable = false;
 	});
 	afterEach(() => {
 		rmSync(dir, { recursive: true, force: true });
@@ -123,6 +155,41 @@ describe("PushControlStore", () => {
 		// ...and the rebuilt store is valid but empty — the other repo's opt-out is
 		// gone, which is exactly why the flag above has to be surfaced.
 		expect((await loadDisabledRepos(dir)).size).toBe(0);
+	});
+
+	it("propagates a read fault that is not a missing file, naming the path", async () => {
+		// A DIRECTORY where the store should be → EISDIR. Unlike ENOENT ("nothing
+		// disabled yet") this is a real fault, so the gate must fail closed.
+		mkdirSync(getPushControlPath(dir), { recursive: true });
+		await expect(loadDisabledRepos(dir)).rejects.toThrow(getPushControlPath(dir));
+	});
+
+	it("treats a JSON `null` store as empty rather than dereferencing it", async () => {
+		writeFileSync(getPushControlPath(dir), "null");
+		expect((await loadDisabledRepos(dir)).size).toBe(0);
+	});
+
+	it("still rebuilds when the unreadable store cannot be moved aside", async () => {
+		// Preserving the bad bytes is best-effort. If the rename fails the user
+		// still asked to enable, so the rebuild must proceed — just without a
+		// `preservedAt` to report.
+		await setRepoPushDisabled("https://github.com/acme/other", true, { globalDir: dir });
+		writeFileSync(getPushControlPath(dir), "{ not json");
+		seam.renameError = Object.assign(new Error("EXDEV: cross-device link not permitted"), { code: "EXDEV" });
+
+		const result = await setRepoPushDisabled("https://github.com/acme/x", false, { globalDir: dir });
+		expect(result).toMatchObject({ disabled: false, recoveredFromCorrupt: true });
+		expect(result.preservedAt).toBeUndefined();
+		expect((await loadDisabledRepos(dir)).size).toBe(0);
+	});
+
+	it("writes the toggle anyway when the store lock cannot be acquired", async () => {
+		// Losing the lock must never silently drop a user's toggle — the write is
+		// re-run unlocked rather than skipped.
+		seam.lockUnavailable = true;
+		const result = await setRepoPushDisabled("https://github.com/acme/x", true, { globalDir: dir });
+		expect(result.disabled).toBe(true);
+		expect(await isRepoPushDisabled("https://github.com/acme/x", dir)).toBe(true);
 	});
 
 	it("refuses a NEWER-schema store both ways, and never rebuilds it", async () => {

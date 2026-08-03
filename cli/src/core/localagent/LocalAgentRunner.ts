@@ -81,7 +81,12 @@ export function runInvocation(inv: Invocation, opts: RunOpts = {}): Promise<stri
 		// created, so by construction it can never be un-set again before that
 		// timer fires — no need to track/clear it from the close/error handlers.
 		const timer = setTimeout(() => {
+			/* v8 ignore start -- unreachable: the close and error handlers each set `settled`
+			   and clearTimeout THIS timer within one synchronous turn, so there is no point
+			   at which a settled run still has a live timer to fire. Kept as a belt-and-braces
+			   guard against a future handler that sets `settled` but forgets to clear. */
 			if (settled) return;
+			/* v8 ignore stop */
 			settled = true;
 			child.kill("SIGTERM");
 			setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS).unref?.();

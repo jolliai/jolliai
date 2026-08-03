@@ -7,6 +7,7 @@ import {
 	readManualDisableFlag,
 	readManualDisableFlagSync,
 	readRepoProfile,
+	resetRepoProfileRootCache,
 	updateRepoProfile,
 	writeManualDisableFlag,
 } from "./RepoProfile.js";
@@ -25,6 +26,9 @@ describe("RepoProfile", () => {
 	beforeEach(() => {
 		cwd = mkdtempSync(join(tmpdir(), "jolli-repoprofile-"));
 		execFileSync("git", ["init", "-q"], { cwd });
+		// The sync reader memoizes its main-root resolution per cwd; clear it so a
+		// recycled temp path can't inherit a previous case's answer.
+		resetRepoProfileRootCache();
 	});
 	afterEach(() => {
 		rmSync(cwd, { recursive: true, force: true });
@@ -281,6 +285,25 @@ describe("RepoProfile", () => {
 				mkdirSync(join(cwd, ".jolli", "jollimemory"), { recursive: true });
 				writeFileSync(legacyMarker(cwd), new Date(0).toISOString());
 				expect(readManualDisableFlagSync(cwd)).toBe(true);
+			});
+
+			it("memoizes the main-root resolution so repeat calls spawn no further git", async () => {
+				// The funnel telemetry gate calls this on every VS Code status refresh, so
+				// the `git rev-parse` must be paid once per cwd. Proven behaviorally: read
+				// from a SUBDIR (where the resolution is what maps it back to the repo
+				// root), then remove `.git`. A memoized reader keeps answering from the
+				// main root; an unmemoized one would re-resolve, fail, and fall back to the
+				// subdir — where there is no profile.
+				const sub = join(cwd, "nested");
+				mkdirSync(sub, { recursive: true });
+				await writeManualDisableFlag(cwd, true);
+				expect(readManualDisableFlagSync(sub)).toBe(true);
+
+				rmSync(join(cwd, ".git"), { recursive: true, force: true });
+				expect(readManualDisableFlagSync(sub)).toBe(true);
+
+				resetRepoProfileRootCache();
+				expect(readManualDisableFlagSync(sub)).toBe(false);
 			});
 
 			it("returns false for a non-git dir with no profile or marker", () => {

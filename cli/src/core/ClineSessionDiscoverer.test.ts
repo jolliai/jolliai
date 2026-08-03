@@ -1,7 +1,15 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// `discoverClineSessions` (the QueueWorker wrapper) takes no storage-dir
+// override, so the only way to point it at a fixture is through the detector it
+// resolves the flavor dirs from. Defaults to an empty list, which keeps the
+// wrapper inert for every test that doesn't opt in.
+const detector = vi.hoisted(() => ({ dirs: [] as string[] }));
+vi.mock("./ClineDetector.js", () => ({ getClineStorageDirs: () => detector.dirs }));
+
 import { discoverClineSessions, scanClineSessions } from "./ClineSessionDiscoverer.js";
 
 async function writeHistory(storageDir: string, entries: object[]): Promise<void> {
@@ -15,6 +23,7 @@ describe("scanClineSessions", () => {
 	const project = "/tmp/proj-a";
 	beforeEach(async () => {
 		sd = await mkdtemp(join(tmpdir(), "cline-ext-disc-"));
+		detector.dirs = [];
 	});
 	afterEach(async () => {
 		await rm(sd, { recursive: true, force: true });
@@ -62,6 +71,34 @@ describe("scanClineSessions", () => {
 		]);
 		const r = await scanClineSessions(project, [sd]);
 		expect(r.sessions.map((s) => s.sessionId)).toEqual(["t2"]);
+	});
+
+	// Valid JSON that is not an array — Cline rewrites taskHistory.json wholesale,
+	// so a half-migrated or hand-edited file can legitimately hold an object.
+	// Treat it as "no history" rather than letting `for…of` throw.
+	it("treats a non-array taskHistory.json as empty (no error)", async () => {
+		await mkdir(join(sd, "state"), { recursive: true });
+		await writeFile(join(sd, "state", "taskHistory.json"), JSON.stringify({ tasks: [] }), "utf8");
+		expect(await scanClineSessions(project, [sd])).toEqual({ sessions: [] });
+	});
+
+	it("skips entries lacking a string id or cwdOnTaskInitialization", async () => {
+		await writeHistory(sd, [
+			{ ts: Date.now(), task: "no id", cwdOnTaskInitialization: project },
+			{ id: 42, ts: Date.now(), task: "numeric id", cwdOnTaskInitialization: project },
+			{ id: "no-cwd", ts: Date.now(), task: "no cwd" },
+			{ id: "ok", ts: Date.now(), task: "keeper", cwdOnTaskInitialization: project },
+		]);
+		const r = await scanClineSessions(project, [sd]);
+		expect(r.sessions.map((s) => s.sessionId)).toEqual(["ok"]);
+	});
+
+	it("discoverClineSessions logs and swallows a scan error from the detector's dirs", async () => {
+		// EISDIR on taskHistory.json — a genuine fs failure, so scanClineSessions
+		// populates the error channel that the wrapper must warn about and drop.
+		await mkdir(join(sd, "state", "taskHistory.json"), { recursive: true });
+		detector.dirs = [sd];
+		expect(await discoverClineSessions(project)).toEqual([]);
 	});
 
 	it("reports a fs-kind error (not parse) when the history path is unreadable", async () => {

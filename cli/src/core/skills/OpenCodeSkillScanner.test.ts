@@ -97,6 +97,65 @@ describe("scanOpenCodeSkillRows", () => {
 		expect(uses).toHaveLength(1);
 	});
 
+	it("skips a skill row that carries no state block", () => {
+		// Without `state` there is no status, and a row that has not reported completion
+		// is indistinguishable from one still loading.
+		const noState = '{"type":"tool","tool":"skill","callID":"call_x"}';
+		expect(scanOpenCodeSkillRows([part(noState)], []).uses).toEqual([]);
+	});
+
+	it("skips a completed row that names no skill", () => {
+		// Neither the resolved name nor the requested one survived. There is nothing to
+		// key a registry row on, so the invocation is dropped rather than filed under an
+		// empty id where it would merge with every other unnamed row.
+		const unnamed =
+			'{"type":"tool","tool":"skill","state":{"status":"completed","output":"x","time":{"start":1785216878468}}}';
+		expect(scanOpenCodeSkillRows([part(unnamed)], []).uses).toEqual([]);
+	});
+
+	it("falls back to the requested name when the resolved one is blank", () => {
+		// `state.metadata.name` is what the host resolved and is authoritative; on a row
+		// where it is empty, `state.input.name` is the only name there is.
+		const blank = OC_SKILL_NO_TOP_METADATA.replace('"metadata":{"name":"jolli"', '"metadata":{"name":""');
+		expect(scanOpenCodeSkillRows([part(blank)], []).uses[0].skill).toBe("jolli");
+	});
+
+	it("falls back to the row's storage clock when the state carries no times", () => {
+		// `state.time.start` is the event moment and is preferred, but a sparse row still
+		// describes a real invocation — dating it by `time_created` is better than
+		// dropping it, and an absent output means no body size rather than a zero one.
+		const sparse = '{"type":"tool","tool":"skill","state":{"status":"completed","metadata":{"name":"jolli"}}}';
+		const { uses } = scanOpenCodeSkillRows([part(sparse, 1785216878468)], []);
+		expect(uses[0].invocations[0]).toEqual({ at: new Date(1785216878468).toISOString(), ok: true });
+	});
+
+	it("orders invocations newest-first however the rows arrive", () => {
+		const older = OC_SKILL_NO_TOP_METADATA.replace('"start":1785216878468', '"start":1785216000000');
+		const { uses } = scanOpenCodeSkillRows(
+			[part(OC_SKILL_NO_TOP_METADATA, 1785216878468, "prt_a"), part(older, 1785216000000, "prt_b")],
+			[],
+		);
+		expect(uses[0].invocations.map((i) => i.at)).toEqual([
+			new Date(1785216878468).toISOString(),
+			new Date(1785216000000).toISOString(),
+		]);
+	});
+
+	it("keeps both rows when two invocations share a start timestamp", () => {
+		// Nothing dedupes at this layer — the store does, on `at`. Collapsing a tie in
+		// the comparator would drop one before it ever reached that fold.
+		const twin = OC_SKILL_NO_TOP_METADATA.replace('"call_a0d984da877148ac902f33bd"', '"call_twin"');
+		const { uses } = scanOpenCodeSkillRows(
+			[part(OC_SKILL_NO_TOP_METADATA, 1785216878468, "prt_a"), part(twin, 1785216878469, "prt_b")],
+			[],
+		);
+		expect(uses[0].invocations).toHaveLength(2);
+	});
+
+	it("reports no cursor when there were no rows to consume", () => {
+		expect(scanOpenCodeSkillRows([], [])).toEqual({ uses: [] });
+	});
+
 	it("reports the newest row id so the caller can resume", () => {
 		const { lastRowId } = scanOpenCodeSkillRows(
 			[part(OC_SKILL_NO_TOP_METADATA, 1, "prt_a"), part(OC_NON_SKILL_TOOL, 2, "prt_b")],
@@ -143,6 +202,13 @@ describe("openCodeTurnSpend", () => {
 		expect(openCodeTurnSpend(JSON.parse(OC_USER_MESSAGE))).toBeUndefined();
 	});
 
+	it("returns undefined for a message row that is not an object at all", () => {
+		// The column is free-form JSON; an array or a bare scalar reads every field as
+		// undefined and would otherwise report a turn that spent nothing.
+		expect(openCodeTurnSpend([{ tokens: { output: 5 } }])).toBeUndefined();
+		expect(openCodeTurnSpend(null)).toBeUndefined();
+	});
+
 	it("treats missing counters as zero rather than failing", () => {
 		expect(openCodeTurnSpend({ role: "assistant", tokens: { output: 5 } })).toEqual({
 			input: 0,
@@ -153,6 +219,21 @@ describe("openCodeTurnSpend", () => {
 });
 
 describe("scanOpenCodeSkillRows — interval attribution", () => {
+	it("steps over unreadable and token-less message rows inside an interval", () => {
+		// Both loops over the interval re-parse the same rows, so a corrupt row has to
+		// be survivable twice. A row with no token block is the normal case, not an
+		// error — user turns and tool acks carry none.
+		const { uses } = scanOpenCodeSkillRows(
+			[part(OC_SKILL_NO_TOP_METADATA, 1000, "prt_a")],
+			[
+				message("{not json", 1100, "msg_bad"),
+				message('{"role":"assistant"}', 1200, "msg_no_tokens"),
+				message(OC_ASSISTANT_MESSAGE, 1300, "msg_ok"),
+			],
+		);
+		expect(uses[0].usage).toEqual({ input: 89, output: 151, cached: 0, confidence: "estimated" });
+	});
+
 	it("estimates a skill's spend from the turns that follow it", () => {
 		// OpenCode carries NO per-skill attribution anywhere in its schema, so an
 		// interval is the only option — and it is therefore always "estimated", never

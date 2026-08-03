@@ -1,9 +1,42 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, utimesSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { describe, expect, it, vi } from "vitest";
+
+// Two of the discoverer's guards protect against a TOCTOU race — the file or db
+// disappearing between the existsSync/statSync probe and the read. The
+// filesystem cannot be made to lose that race on demand, so the two holders
+// below inject the exact error the race would produce. Both default to
+// `undefined`, i.e. fully real behaviour.
+const race = vi.hoisted(() => ({
+	readStreamError: undefined as Error | undefined,
+	sqliteError: undefined as Error | undefined,
+}));
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return {
+		...actual,
+		createReadStream: (...args: Parameters<typeof actual.createReadStream>) => {
+			if (race.readStreamError) throw race.readStreamError;
+			return actual.createReadStream(...args);
+		},
+	};
+});
+vi.mock("./SqliteHelpers.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./SqliteHelpers.js")>();
+	return {
+		...actual,
+		withSqliteDb: (...args: Parameters<typeof actual.withSqliteDb>) => {
+			if (race.sqliteError) throw race.sqliteError;
+			return actual.withSqliteDb(...args);
+		},
+	};
+});
+
 import { buildMetadataBlob, createAntigravityConvo, REAL_TRANSCRIPT_FULL } from "../testUtils/antigravityFixture.js";
+import { symlinksSupported } from "../testUtils/symlinkSupport.js";
 import {
 	discoverAntigravitySessions,
 	extractWorkspacePath,
@@ -11,10 +44,22 @@ import {
 } from "./AntigravitySessionDiscoverer.js";
 import { hasNodeSqliteSupport } from "./SqliteHelpers.js";
 
+function enoent(message: string): Error {
+	return Object.assign(new Error(message), { code: "ENOENT" });
+}
+
 const sqliteOnly = hasNodeSqliteSupport() ? describe : describe.skip;
+// The non-ENOENT-stat case needs a self-referential symlink (ELOOP); symlink()
+// throws EPERM on a non-elevated Windows account, so skip it there.
+const itIfSymlinks = symlinksSupported ? it : it.skip;
 
 function freshDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), prefix));
+}
+
+/** Overwrites a conversation's transcript_full.jsonl with raw (possibly malformed) text. */
+function overwriteTranscript(transcriptPath: string, text: string): void {
+	writeFileSync(transcriptPath, text);
 }
 
 describe("extractWorkspacePath", () => {
@@ -39,6 +84,34 @@ describe("extractWorkspacePath", () => {
 		// the extra slash must be dropped or the path never matches native "e:/jollimemory".
 		const blob = buildMetadataBlob("/e%3A/jollimemory");
 		expect(extractWorkspacePath(blob)).toBe("e:/jollimemory");
+	});
+
+	// A `file://` uri longer than 127 bytes needs a MULTI-byte protobuf length
+	// varint, so the backward walk over its continuation bytes (MSB set) has to
+	// run — a single-byte-only reader would misread the length and bail.
+	it("reads a length varint that spans multiple bytes (uri > 127 chars)", () => {
+		const deep = `/Users/x/${"nested-package-directory/".repeat(6)}repo`;
+		expect(`file://${deep}`.length).toBeGreaterThan(127);
+		expect(extractWorkspacePath(buildMetadataBlob(deep))).toBe(deep);
+	});
+
+	it("returns undefined when the length prefix is shorter than 'file://'", () => {
+		// tag 0x0a + length 0x03 — too short to be a uri, so the field is not one.
+		const blob = Buffer.concat([Buffer.from([0x0a, 0x03]), Buffer.from("file:///tmp/x")]);
+		expect(extractWorkspacePath(blob)).toBeUndefined();
+	});
+
+	it("returns undefined when the length prefix runs past the end of the blob", () => {
+		// tag 0x0a + length 0x7f (127) against a 12-byte payload — a truncated blob.
+		const blob = Buffer.concat([Buffer.from([0x0a, 0x7f]), Buffer.from("file://short")]);
+		expect(extractWorkspacePath(blob)).toBeUndefined();
+	});
+
+	it("keeps the raw slice when the uri carries a malformed %-escape", () => {
+		// `%zz` is not a valid escape — decodeURIComponent throws, and the extractor
+		// must fall back to the undecoded path rather than dropping the workspace.
+		const blob = buildMetadataBlob("/Users/x/repo%zz");
+		expect(extractWorkspacePath(blob)).toBe("/Users/x/repo%zz");
 	});
 });
 
@@ -182,5 +255,183 @@ sqliteOnly("AntigravitySessionDiscoverer", () => {
 		const sessions = await discoverAntigravitySessions(ws, home);
 		expect(sessions).toHaveLength(1);
 		expect(sessions[0].transcriptPath).toContain("antigravity-ide");
+	});
+
+	it("skips a conversation whose db was last touched more than 48h ago", async () => {
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		const { dbPath } = createAntigravityConvo(home, {
+			convId: "stale",
+			workspacePath: ws,
+			transcriptLines: REAL_TRANSCRIPT_FULL,
+		});
+		const old = new Date(Date.now() - 49 * 3600_000);
+		utimesSync(dbPath, old, old);
+		expect(await discoverAntigravitySessions(ws, home)).toHaveLength(0);
+	});
+
+	it("skips a variant whose conversations path is not a directory", async () => {
+		// existsSync() is happy with a FILE at conversations/, so the variant is
+		// listed; readdirSync then fails with ENOTDIR and the variant is skipped
+		// rather than aborting the whole scan.
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+		writeFileSync(join(home, ".gemini", "antigravity-cli", "conversations"), "not a dir");
+		createAntigravityConvo(home, {
+			convId: "healthy",
+			variant: "antigravity",
+			workspacePath: ws,
+			transcriptLines: REAL_TRANSCRIPT_FULL,
+		});
+		const { sessions, error } = await scanAntigravitySessions(ws, home);
+		expect(sessions.map((s) => s.sessionId)).toEqual(["healthy"]);
+		expect(error).toBeUndefined();
+	});
+
+	itIfSymlinks("skips a listed .db that cannot be stat'ed", async () => {
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		const { dbPath } = createAntigravityConvo(home, {
+			convId: "healthy",
+			workspacePath: ws,
+			transcriptLines: REAL_TRANSCRIPT_FULL,
+		});
+		// Self-referential symlink — readdirSync lists it, statSync chases the link
+		// into itself and throws ELOOP. Models the real race where a conversation
+		// is deleted between the listing and the stat.
+		const loop = join(dbPath, "..", "loop.db");
+		symlinkSync(loop, loop, "file");
+		const { sessions } = await scanAntigravitySessions(ws, home);
+		expect(sessions.map((s) => s.sessionId)).toEqual(["healthy"]);
+	});
+
+	it("surfaces a scan error for an unreadable db while keeping the healthy ones", async () => {
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		const { dbPath } = createAntigravityConvo(home, {
+			convId: "healthy",
+			workspacePath: ws,
+			transcriptLines: REAL_TRANSCRIPT_FULL,
+		});
+		// A .db that is not a SQLite file at all — node:sqlite throws on the query.
+		writeFileSync(join(dbPath, "..", "garbage.db"), "this is not a database");
+		const { sessions, error } = await scanAntigravitySessions(ws, home);
+		expect(sessions.map((s) => s.sessionId)).toEqual(["healthy"]);
+		expect(error).toBeDefined();
+	});
+
+	// The db passed statSync but was gone by the time SQLite opened it (the user
+	// deleted the conversation mid-scan). classifyScanError returns null for
+	// ENOENT, so this is benign: skip the conversation, surface NO error.
+	it("silently skips a conversation whose db vanished between the stat and the open", async () => {
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		createAntigravityConvo(home, {
+			convId: "vanished",
+			workspacePath: ws,
+			transcriptLines: REAL_TRANSCRIPT_FULL,
+		});
+		race.sqliteError = enoent("no such file or directory, open db");
+		try {
+			const { sessions, error } = await scanAntigravitySessions(ws, home);
+			expect(sessions).toEqual([]);
+			expect(error).toBeUndefined();
+		} finally {
+			race.sqliteError = undefined;
+		}
+	});
+
+	it("skips a db whose trajectory_metadata_blob has no 'main' row", async () => {
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		const convDir = join(home, ".gemini", "antigravity", "conversations");
+		mkdirSync(convDir, { recursive: true });
+		const db = new DatabaseSync(join(convDir, "no-main.db"));
+		db.exec("CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)");
+		db.close();
+		const { sessions, error } = await scanAntigravitySessions(ws, home);
+		expect(sessions).toEqual([]);
+		expect(error).toBeUndefined();
+	});
+});
+
+sqliteOnly("AntigravitySessionDiscoverer titles", () => {
+	/** Creates a matching conversation and rewrites its transcript with raw text. */
+	function convoWithRawTranscript(text: string): { ws: string; home: string; transcriptPath: string } {
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		const { transcriptPath } = createAntigravityConvo(home, {
+			convId: "titled",
+			workspacePath: ws,
+			transcriptLines: [],
+		});
+		overwriteTranscript(transcriptPath, text);
+		return { ws, home, transcriptPath };
+	}
+
+	it("skips blank lines, malformed JSON and non-USER_INPUT rows when reading the title", async () => {
+		const { ws, home } = convoWithRawTranscript(
+			[
+				"",
+				"   ",
+				'{"type":"USER_INPUT","content":',
+				JSON.stringify({ type: "CHECKPOINT", content: "{{ CHECKPOINT 0 }}" }),
+				// USER_INPUT whose content is not a string — cannot be a title.
+				JSON.stringify({ type: "USER_INPUT", content: { text: "structured" } }),
+				// An empty envelope yields no text, so the scan keeps looking.
+				JSON.stringify({ type: "USER_INPUT", content: "<USER_REQUEST></USER_REQUEST>" }),
+				JSON.stringify({ type: "USER_INPUT", content: "<USER_REQUEST>\nthe real one\n</USER_REQUEST>" }),
+			].join("\n"),
+		);
+		const sessions = await discoverAntigravitySessions(ws, home);
+		expect(sessions[0].title).toBe("the real one");
+	});
+
+	it("truncates a long title at 120 chars with an ellipsis", async () => {
+		const long = "查".repeat(200);
+		const { ws, home } = convoWithRawTranscript(
+			JSON.stringify({ type: "USER_INPUT", content: `<USER_REQUEST>${long}</USER_REQUEST>` }),
+		);
+		const sessions = await discoverAntigravitySessions(ws, home);
+		expect(sessions[0].title).toBe(`${"查".repeat(120)}…`);
+	});
+
+	it("leaves the title undefined when the transcript holds no USER_INPUT", async () => {
+		const { ws, home } = convoWithRawTranscript(
+			JSON.stringify({ type: "PLANNER_RESPONSE", content: "no user turn here" }),
+		);
+		const sessions = await discoverAntigravitySessions(ws, home);
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0].title).toBeUndefined();
+	});
+
+	// The transcript passed existsSync but was gone by the time the stream opened.
+	// ENOENT is the expected shape of that race, so readTitle stays silent (no
+	// debug log) and the session still surfaces — just without a title.
+	it("leaves the title undefined, without logging, when the transcript vanished mid-scan", async () => {
+		const { ws, home } = convoWithRawTranscript(
+			JSON.stringify({ type: "USER_INPUT", content: "<USER_REQUEST>gone</USER_REQUEST>" }),
+		);
+		race.readStreamError = enoent("no such file or directory, open transcript_full.jsonl");
+		try {
+			const sessions = await discoverAntigravitySessions(ws, home);
+			expect(sessions).toHaveLength(1);
+			expect(sessions[0].title).toBeUndefined();
+		} finally {
+			race.readStreamError = undefined;
+		}
+	});
+
+	it("leaves the title undefined when the transcript path is unreadable", async () => {
+		// A DIRECTORY named transcript_full.jsonl: existsSync() passes the
+		// materialization gate, then the read stream fails with EISDIR — a
+		// non-ENOENT error, so readTitle logs and degrades to no title.
+		const { ws, home, transcriptPath } = convoWithRawTranscript("");
+		rmSync(transcriptPath);
+		mkdirSync(transcriptPath);
+		const sessions = await discoverAntigravitySessions(ws, home);
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0].title).toBeUndefined();
 	});
 });

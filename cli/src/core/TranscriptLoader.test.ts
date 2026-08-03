@@ -23,13 +23,41 @@ vi.mock("./ClineTranscriptReader.js", () => ({
 vi.mock("./ClineCliTranscriptReader.js", () => ({
 	readClineCliTranscript: vi.fn(),
 }));
+vi.mock("./DevinTranscriptReader.js", () => ({
+	readDevinTranscript: vi.fn(),
+}));
+vi.mock("./CursorCliTranscriptReader.js", () => ({
+	readCursorCliTranscript: vi.fn(),
+}));
+// Partial: the antigravity happy path below reads a REAL jsonl file, so the
+// reader stays real and is only overridden for the throw cases.
+vi.mock("./AntigravityTranscriptReader.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./AntigravityTranscriptReader.js")>();
+	return { ...actual, readAntigravityTranscript: vi.fn(actual.readAntigravityTranscript) };
+});
 
+import { readAntigravityTranscript } from "./AntigravityTranscriptReader.js";
 import { readClineCliTranscript } from "./ClineCliTranscriptReader.js";
 import { readClineTranscript } from "./ClineTranscriptReader.js";
 import { readCopilotTranscript } from "./CopilotTranscriptReader.js";
+import { readCursorCliTranscript } from "./CursorCliTranscriptReader.js";
 import { readCursorTranscript } from "./CursorTranscriptReader.js";
+import { readDevinTranscript } from "./DevinTranscriptReader.js";
 import { readOpenCodeTranscript } from "./OpenCodeTranscriptReader.js";
 import { loadTranscript } from "./TranscriptLoader.js";
+
+/** An ENOENT-coded error — the shape every reader-level "file is gone" surfaces as. */
+function enoent(): Error {
+	return Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" });
+}
+
+function readResult(entries: Array<{ role: "human" | "assistant"; content: string }>, path: string) {
+	return {
+		entries,
+		newCursor: { transcriptPath: path, lineNumber: entries.length, updatedAt: "2026-07-19T00:00:00Z" },
+		totalLinesRead: entries.length,
+	};
+}
 
 describe("loadTranscript", () => {
 	let dir: string;
@@ -251,6 +279,41 @@ describe("loadTranscript", () => {
 	it("returns [] for a missing antigravity transcript", async () => {
 		const result = await loadTranscript({ source: "antigravity", transcriptPath: join(dir, "nope.jsonl") });
 		expect(result).toEqual([]);
+	});
+
+	it("dispatches devin source to readDevinTranscript with the synthetic db#session path", async () => {
+		const path = "/devin/sessions.db#sess-1";
+		vi.mocked(readDevinTranscript).mockResolvedValueOnce(
+			readResult([{ role: "human", content: "devin ask" }], path),
+		);
+		const result = await loadTranscript({ source: "devin", transcriptPath: path });
+		expect(readDevinTranscript).toHaveBeenCalledWith(path);
+		expect(result).toEqual([{ role: "human", content: "devin ask" }]);
+	});
+
+	it("dispatches cursor-cli source to readCursorCliTranscript", async () => {
+		const path = "/cursor/agent-transcripts/u1/u1.jsonl";
+		vi.mocked(readCursorCliTranscript).mockResolvedValueOnce(
+			readResult([{ role: "assistant", content: "cursor-cli reply" }], path),
+		);
+		const result = await loadTranscript({ source: "cursor-cli", transcriptPath: path });
+		expect(readCursorCliTranscript).toHaveBeenCalledWith(path);
+		expect(result).toEqual([{ role: "assistant", content: "cursor-cli reply" }]);
+	});
+
+	// Two arms per reader: a vanished file (ENOENT) is routine and must stay
+	// silent, while anything else is worth a warning. Both degrade to [] so a
+	// single unreadable session never takes down the panel.
+	it.each([
+		["devin", readDevinTranscript, "/devin/sessions.db#sess-1"],
+		["cursor-cli", readCursorCliTranscript, "/cursor/u1.jsonl"],
+		["antigravity", readAntigravityTranscript, "/agy/transcript_full.jsonl"],
+	] as const)("returns [] when the %s reader throws, ENOENT or otherwise", async (source, reader, path) => {
+		vi.mocked(reader).mockRejectedValueOnce(enoent(path));
+		expect(await loadTranscript({ source, transcriptPath: path })).toEqual([]);
+
+		vi.mocked(reader).mockRejectedValueOnce(new Error("schema drift"));
+		expect(await loadTranscript({ source, transcriptPath: path })).toEqual([]);
 	});
 
 	// Each sqlite-backed reader's catch branch — proves loader errors degrade

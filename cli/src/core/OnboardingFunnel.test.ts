@@ -15,12 +15,19 @@ vi.mock("./Telemetry.js", async (importOriginal) => {
 	// Keep the real `bucket`; only track + the consent gate are controllable.
 	return { ...actual, track: vi.fn(), getTelemetryContext: vi.fn() };
 });
+// The durable disable reader spawns a real `git rev-parse` — stubbed so this stays
+// in the fast tier; the two gate tests below drive it explicitly.
+vi.mock("./RepoProfile.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./RepoProfile.js")>();
+	return { ...actual, readManualDisableFlagSync: vi.fn() };
+});
 
 import { getStatus } from "../install/Installer.js";
-import { getJolliMemoryDir } from "../Logger.js";
+import { getJolliMemoryDir, setManuallyDisabled } from "../Logger.js";
 import { isInsideGitRepo } from "./GitOps.js";
 import { resolveLlmCredentialSource } from "./LlmClient.js";
 import { captureMethodOf, maybeEmitOnboardingProgress, resolveOnboardingFunnel } from "./OnboardingFunnel.js";
+import { readManualDisableFlagSync } from "./RepoProfile.js";
 import { getTelemetryContext, track } from "./Telemetry.js";
 
 const isGit = isInsideGitRepo as Mock;
@@ -29,6 +36,7 @@ const getStatusMock = getStatus as Mock;
 const jolliDir = getJolliMemoryDir as Mock;
 const trackMock = track as Mock;
 const ctxMock = getTelemetryContext as Mock;
+const durableDisabled = readManualDisableFlagSync as Mock;
 
 const LEDGER = "onboarding-progress.json";
 let tmp: string;
@@ -40,9 +48,12 @@ beforeEach(async () => {
 	ctxMock.mockReturnValue({ enabled: true });
 	isGit.mockResolvedValue(true);
 	resolveSrc.mockReturnValue(null);
+	durableDisabled.mockReturnValue(false);
 });
 
 afterEach(async () => {
+	// Module-level flag: leaking `true` would silently no-op every later test here.
+	setManuallyDisabled(false);
 	await rm(tmp, { recursive: true, force: true });
 });
 
@@ -136,6 +147,49 @@ describe("maybeEmitOnboardingProgress", () => {
 		expect(trackMock).not.toHaveBeenCalled();
 		expect(isGit).not.toHaveBeenCalled();
 		await expect(readFile(ledgerPath(), "utf-8")).rejects.toThrow();
+	});
+
+	it("does nothing (no git work, no ledger) when the repo is manually disabled", async () => {
+		// Spec 304: the in-memory suppression flag is the gate every write site in the
+		// editor host consults. This emitter used to skip it entirely, so the Disable
+		// command's own status refresh created `onboarding-progress.json` inside the
+		// repo it had just disabled — a second, undocumented write class.
+		setManuallyDisabled(true);
+		await maybeEmitOnboardingProgress({ cwd: tmp, config: {}, status: { enabled: true, summaryCount: 1 } });
+		expect(trackMock).not.toHaveBeenCalled();
+		expect(isGit).not.toHaveBeenCalled();
+		await expect(readFile(ledgerPath(), "utf-8")).rejects.toThrow();
+	});
+
+	it("does nothing (no git work, no ledger) when only the durable flag says disabled", async () => {
+		// The CLI half of spec 304. `setManuallyDisabled` is process-local and no CLI
+		// entry point ever calls it, so after `jolli disable` the in-memory mirror is
+		// still false in a fresh `jolli status` / bare `jolli` / QueueWorker process.
+		// Without the durable reader those recreated `onboarding-progress.json` in the
+		// repo the user had just disabled.
+		setManuallyDisabled(false);
+		durableDisabled.mockReturnValue(true);
+		await maybeEmitOnboardingProgress({ cwd: tmp, config: {}, status: { enabled: true, summaryCount: 1 } });
+		expect(durableDisabled).toHaveBeenCalledWith(tmp);
+		expect(trackMock).not.toHaveBeenCalled();
+		expect(isGit).not.toHaveBeenCalled();
+		await expect(readFile(ledgerPath(), "utf-8")).rejects.toThrow();
+	});
+
+	it("skips the durable read entirely when the in-memory mirror already says disabled", async () => {
+		// Short-circuit order matters: the editor host seeds the free mirror at
+		// activate() and fires this from ≥5 uncoordinated refresh triggers, so a
+		// disabled workspace must not pay a sync `git rev-parse` per refresh.
+		setManuallyDisabled(true);
+		await maybeEmitOnboardingProgress({ cwd: tmp, config: {}, status: { enabled: true, summaryCount: 1 } });
+		expect(durableDisabled).not.toHaveBeenCalled();
+	});
+
+	it("skips the durable read entirely when telemetry is inactive", async () => {
+		// The consent short-circuit stays first: an opted-out user pays no disk/git cost.
+		ctxMock.mockReturnValue(null);
+		await maybeEmitOnboardingProgress({ cwd: tmp, config: {}, status: { enabled: true, summaryCount: 1 } });
+		expect(durableDisabled).not.toHaveBeenCalled();
 	});
 
 	it("emits the content-free snapshot and writes the dedup ledger on first run", async () => {

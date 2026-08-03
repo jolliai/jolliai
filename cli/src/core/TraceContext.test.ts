@@ -5,7 +5,26 @@
  * *propagation semantics* (scope nesting, env adoption), never a specific id.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// The all-zero id is the sentinel the backend rejects, so `randomNonZeroHex`
+// loops until it draws something else. That draw is astronomically unlikely
+// (2^-128), so the retry arm is only reachable by forcing the first draw.
+const crypto = vi.hoisted(() => ({ forceZeroOnce: false }));
+vi.mock("node:crypto", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:crypto")>();
+	return {
+		...actual,
+		randomBytes: (size: number) => {
+			if (crypto.forceZeroOnce) {
+				crypto.forceZeroOnce = false;
+				return Buffer.alloc(size);
+			}
+			return actual.randomBytes(size);
+		},
+	};
+});
+
 import {
 	buildTraceHeader,
 	currentTraceHeader,
@@ -150,5 +169,21 @@ describe("traceIdFromEnv", () => {
 
 	it("ignores the all-zero sentinel env value", () => {
 		expect(traceIdFromEnv({ [TRACE_ID_ENV]: ALL_ZERO_TRACE_ID })).toBeUndefined();
+	});
+});
+
+describe("all-zero rejection at generation time", () => {
+	it("redraws a trace id when the first random draw is all-zero", () => {
+		crypto.forceZeroOnce = true;
+		const id = generateTraceId();
+		expect(id).toMatch(TRACE_ID_RE);
+		expect(id).not.toBe(ALL_ZERO_TRACE_ID);
+	});
+
+	it("redraws a span id when the first random draw is all-zero", () => {
+		crypto.forceZeroOnce = true;
+		const id = generateSpanId();
+		expect(id).toMatch(SPAN_ID_RE);
+		expect(id).not.toBe("0".repeat(16));
 	});
 });

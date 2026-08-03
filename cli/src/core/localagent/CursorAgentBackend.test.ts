@@ -59,6 +59,42 @@ describe("CursorAgentBackend", () => {
 	it("throws LocalAgentSetupError on non-JSON stdout", () => {
 		expect(() => b.parseResult("not json")).toThrow(LocalAgentSetupError);
 	});
+
+	// The error envelope's detail is best-effort: `result`, else `subtype`, else a
+	// placeholder. A message reading `Cursor returned an error: undefined` would
+	// tell the user nothing at all.
+	it("falls back through result → subtype → 'unknown' for the error detail", () => {
+		expect(() => b.parseResult(JSON.stringify({ is_error: true, subtype: "rate_limited" }))).toThrow(
+			"Cursor returned an error: rate_limited",
+		);
+		expect(() => b.parseResult(JSON.stringify({ is_error: true }))).toThrow("Cursor returned an error: unknown");
+	});
+
+	it("classifies an auth failure signalled only by the subtype", () => {
+		// `result` carries no auth wording; the subtype is the only signal.
+		expect(() =>
+			b.parseResult(JSON.stringify({ is_error: true, subtype: "auth_expired", result: "nope" })),
+		).toThrow(LocalAgentAuthError);
+	});
+
+	// A success envelope from an older/leaner CLI build carries neither `usage`
+	// nor `result`. Every numeric field must still come back as a number.
+	it("defaults every field when the success envelope is bare", () => {
+		const out = b.parseResult(JSON.stringify({ type: "result" }));
+		expect(out).toEqual({
+			text: "",
+			inputTokens: 0,
+			outputTokens: 0,
+			cachedTokens: 0,
+			costUsd: 0,
+			stopReason: null,
+		});
+	});
+
+	it("sums the two cache counters when only one is reported", () => {
+		const out = b.parseResult(JSON.stringify({ result: "hi", usage: { cacheReadTokens: 7 } }));
+		expect(out.cachedTokens).toBe(7);
+	});
 });
 
 /**
@@ -155,6 +191,20 @@ describe("CursorAgentBackend.buildInvocation with a resolved Windows launcher", 
 describe("CursorAgentBackend.isPresent", () => {
 	it("is false for an override path that does not exist", () => {
 		expect(new CursorAgentBackend().isPresent("/nonexistent/path/to/cursor-agent")).toBe(false);
+	});
+
+	it("resolves through the shared resolver, forwarding the override path", async () => {
+		const spy = vi
+			.spyOn(resolver, "resolveExecutable")
+			.mockReturnValue({ file: "/opt/cursor-agent", version: "1.0.0" });
+		await expect(new CursorAgentBackend().discoverExecutable("/opt/cursor-agent")).resolves.toEqual({
+			file: "/opt/cursor-agent",
+			version: "1.0.0",
+		});
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ binName: "cursor-agent" }), {
+			overridePath: "/opt/cursor-agent",
+		});
+		spy.mockRestore();
 	});
 
 	it("delegates to the CURSOR_SPEC discovery, not another tool's", () => {

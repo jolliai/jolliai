@@ -303,9 +303,71 @@ describe("foldSkillUse", () => {
 		);
 		expect(fresh.usage).toEqual({ input: 20, output: 30, cached: 40, confidence: "attributed" });
 	});
+	it("keeps a heuristic detection mark once a pass has set it", () => {
+		// Sticky like `trimmed`: a later pass that happens not to say "inferred" is not
+		// evidence the capture became observed, so downgrading would overstate it.
+		const first = foldSkillUse(use({ detection: "heuristic" }), undefined);
+		expect(first.detection).toBe("heuristic");
+
+		const second = foldSkillUse(use({ invocations: [inv("2026-07-30T07:00:00.000Z")] }), first);
+		expect(second.detection).toBe("heuristic");
+	});
+
+	it("keeps the prior plugin when a later pass reports none", () => {
+		const first = foldSkillUse(use(), undefined);
+		const second = foldSkillUse(use({ plugin: undefined, invocations: [inv("2026-07-30T07:00:00.000Z")] }), first);
+		expect(second.plugin).toBe("superpowers");
+	});
+
+	it("walks firstUsedAt backwards when a catch-up pass finds older invocations", () => {
+		// The prior file's bound is a candidate, not a floor: a rewound cursor can
+		// surface rows older than anything the file has ever seen.
+		const first = foldSkillUse(use({ invocations: [inv("2026-07-30T06:00:00.000Z")] }), undefined);
+		const second = foldSkillUse(
+			use({ invocations: [inv("2026-07-29T05:00:00.000Z"), inv("2026-07-31T08:00:00.000Z")] }),
+			first,
+		);
+		expect(second.firstUsedAt).toBe("2026-07-29T05:00:00.000Z");
+		expect(second.lastUsedAt).toBe("2026-07-31T08:00:00.000Z");
+	});
+
+	it("yields empty bounds for a fold with nothing to date it by", () => {
+		// No scanner emits this today. The folder is exported, so it must degrade to
+		// empty strings rather than writing `undefined` into the frontmatter.
+		const folded = foldSkillUse(use({ invocations: [] }), undefined);
+		expect(folded.firstUsedAt).toBe("");
+		expect(folded.lastUsedAt).toBe("");
+		expect(folded.invocationCount).toBe(0);
+	});
 });
 
 describe("renderSkillMarkdown / parseSkillMarkdownFromString", () => {
+	it("round-trips the heuristic detection mark", () => {
+		// The mark is what tells the UI a capture was inferred rather than observed;
+		// losing it on the round-trip would silently promote every reloaded skill.
+		const content = foldSkillUse(use({ detection: "heuristic" }), undefined);
+		expect(renderSkillMarkdown(content)).toContain('detection: "heuristic"');
+		expect(parseSkillMarkdownFromString(renderSkillMarkdown(content))?.detection).toBe("heuristic");
+	});
+
+	it("ignores a frontmatter line that carries no key/value separator", () => {
+		// A stray blank or continuation line inside the frontmatter block. `indexOf`
+		// also returns 0 for a line that opens with the separator, which is not a key.
+		const parsed = parseSkillMarkdownFromString(
+			["---", "", ": orphan", 'source: "claude"', 'skill: "a:b"', "---", ""].join("\n"),
+		);
+		expect(parsed?.skill).toBe("a:b");
+	});
+
+	it("drops an unparseable body count but keeps the invocation", () => {
+		// A half-written row still identifies a real invocation by its timestamp; only
+		// the field that cannot be read is discarded.
+		const parsed = parseSkillMarkdownFromString(
+			["---", 'source: "claude"', 'skill: "a:b"', "---", "", "- 2026-07-30T06:35:21.000Z · body: n/a"].join("\n"),
+		);
+		expect(parsed?.invocations).toEqual([{ at: "2026-07-30T06:35:21.000Z", ok: true }]);
+	});
+
 	it("round-trips a fully populated skill file", () => {
 		const content = foldSkillUse(
 			use({
@@ -449,6 +511,23 @@ describe("writeSkillMarkdown", () => {
 		const onDisk = await readSkillMarkdown(result.sourcePath);
 		expect(onDisk?.skill).toBe("superpowers:brainstorming");
 		expect(onDisk?.invocationCount).toBe(1);
+	});
+
+	it("reports both the usage total and its per-session split back to the caller", async () => {
+		// Same reason as the detection mark: the registry row is assembled from this
+		// return value, and the split is what a later detach subtracts from.
+		const usage = { input: 79, output: 33944, cached: 59796, confidence: "attributed" } as const;
+		const result = await writeSkillMarkdown(use({ usage }), tempDir);
+		expect(result.usage).toEqual(usage);
+		expect(result.usageBySession).toEqual({ "claude:sess-a": usage });
+	});
+
+	it("reports the detection mark back to the caller, not just to disk", async () => {
+		// The registry row is built from this return value, so a mark that only reached
+		// the markdown would leave the sidebar claiming the capture was observed.
+		const result = await writeSkillMarkdown(use({ detection: "heuristic" }), tempDir);
+		expect(result.detection).toBe("heuristic");
+		expect((await readSkillMarkdown(result.sourcePath))?.detection).toBe("heuristic");
 	});
 
 	it("folds a second pass into the file already on disk", async () => {

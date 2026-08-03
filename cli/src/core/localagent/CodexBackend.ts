@@ -30,7 +30,8 @@ interface CodexEvent {
 	message?: string;
 }
 
-const CODEX_SPEC = {
+/** Exported so the install-location rules can be asserted per platform in tests. */
+export const CODEX_SPEC = {
 	binName: "codex",
 	knownPaths: (home: string, platform: NodeJS.Platform) =>
 		platform === "win32"

@@ -455,6 +455,40 @@ describe("buildStatusSummary", () => {
 		expect(r.space).toBeNull();
 	});
 
+	it("omits the push-disabled pair when outbound push is allowed", () => {
+		// Spec 310's gate treats an absent flag as allowed, so absent is the honest
+		// encoding of "this repo pushes" — the same rule `jolli status` follows by
+		// printing the `Outbound push:` row only when push is off.
+		const r = buildStatusSummary(makeStatus({ pushDisabled: false }), {
+			version: "1",
+			isClaudePlugin: false,
+			account,
+		});
+		expect(r).not.toHaveProperty("pushDisabled");
+		expect(r).not.toHaveProperty("pushDisabledError");
+	});
+
+	it("projects pushDisabled so an AI host can learn why push_memory was refused", () => {
+		const r = buildStatusSummary(makeStatus({ pushDisabled: true }), {
+			version: "1",
+			isClaudePlugin: false,
+			account,
+		});
+		expect(r.pushDisabled).toBe(true);
+		expect(r).not.toHaveProperty("pushDisabledError");
+	});
+
+	it("carries pushDisabledError so a fail-closed read is not misattributed to the user", () => {
+		// An unreadable store reports OFF for EVERY repo. Reporting the boolean alone
+		// would tell the host "you turned this repo off" when the user chose nothing.
+		const r = buildStatusSummary(
+			makeStatus({ pushDisabled: true, pushDisabledError: "Push-control store at /x could not be read: EACCES" }),
+			{ version: "1", isClaudePlugin: false, account },
+		);
+		expect(r.pushDisabled).toBe(true);
+		expect(r.pushDisabledError).toBe("Push-control store at /x could not be read: EACCES");
+	});
+
 	it("surfaces anthropicKeyConfigured only for the anthropic provider (signed out)", () => {
 		const r = buildStatusSummary(makeStatus(), {
 			version: "1",

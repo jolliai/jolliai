@@ -247,6 +247,20 @@ export interface StatusResult {
 	 * pre-push hook, so this drives the `syncing · Space "<name>"` snapshot line.
 	 */
 	readonly space: { readonly name: string } | null;
+	/**
+	 * Present (and `true`) ONLY when this repo's outbound push to a Jolli Space is
+	 * off — spec 310's gate treats an absent flag as allowed, so absent is the
+	 * honest encoding of "this repo pushes". Without it an AI host whose
+	 * `push_memory` was refused has no channel for learning why.
+	 */
+	readonly pushDisabled?: boolean;
+	/**
+	 * Why {@link pushDisabled} is true when it is NOT the user's recorded choice:
+	 * the push-control store could not be read, which fails closed and reports OFF
+	 * for *every* repo machine-wide. Reporting the boolean alone would misattribute
+	 * a machine-wide read failure to a per-repo decision the user never made.
+	 */
+	readonly pushDisabledError?: string;
 }
 
 /**
@@ -345,6 +359,11 @@ export function buildStatusSummary(
 		storedMemories: status.summaryCount,
 		orphanBranch: status.orphanBranch,
 		space: ctx.space ?? null,
+		// Both halves or neither — the error explains which OFF this is, and a
+		// boolean without it reads as "you turned this repo off" even when the
+		// store was simply unreadable.
+		...(status.pushDisabled ? { pushDisabled: true } : {}),
+		...(status.pushDisabled && status.pushDisabledError ? { pushDisabledError: status.pushDisabledError } : {}),
 	};
 }
 

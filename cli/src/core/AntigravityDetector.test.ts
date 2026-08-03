@@ -1,7 +1,16 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// Partial mock: everything in SqliteHelpers stays real, but `hasNodeSqliteSupport`
+// becomes overridable so the Node-<22.5 arm of `isAntigravityInstalled` can be
+// exercised on this (22.5+) test runtime.
+vi.mock("./SqliteHelpers.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./SqliteHelpers.js")>();
+	return { ...actual, hasNodeSqliteSupport: vi.fn(actual.hasNodeSqliteSupport) };
+});
+
 import { getAntigravityVariants, isAntigravityInstalled, isAntigravityPresent } from "./AntigravityDetector.js";
 import { hasNodeSqliteSupport } from "./SqliteHelpers.js";
 
@@ -68,6 +77,20 @@ describe("AntigravityDetector", () => {
 		// …while `installed` stays false — status tree and session discovery have
 		// nothing to show for a host with no readable conversations.
 		expect(await isAntigravityInstalled(home)).toBe(false);
+	});
+
+	// A Node-18 VS Code extension host cannot load node:sqlite, so it must report
+	// "not installed" (nothing readable to show in the status tree / discovery)
+	// even with conversation dbs sitting right there on disk.
+	it("isAntigravityInstalled is false on a runtime without node:sqlite, even with a db present", async () => {
+		const home = freshHome();
+		const conv = join(home, ".gemini", "antigravity", "conversations");
+		mkdirSync(conv, { recursive: true });
+		writeFileSync(join(conv, "abc.db"), "");
+		vi.mocked(hasNodeSqliteSupport).mockReturnValueOnce(false);
+		expect(await isAntigravityInstalled(home)).toBe(false);
+		// …while MCP registration (presence-only, never reads the db) still sees it.
+		expect(await isAntigravityPresent(home)).toBe(true);
 	});
 
 	it("isAntigravityPresent ignores unrelated ~/.gemini content (Gemini CLI's own dirs)", async () => {

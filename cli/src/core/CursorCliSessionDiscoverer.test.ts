@@ -3,6 +3,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CURSOR_CLI_META_JSON, CURSOR_CLI_TRANSCRIPT_JSONL } from "../testUtils/cursorCliFixture.js";
+
+// `discoverCursorCliSessions` (the QueueWorker wrapper) takes no dir-override
+// params — it resolves ~/.cursor from `homedir()`. Redirect just that one export
+// (everything else in node:os, `tmpdir()` included, stays real) so the wrapper
+// can be aimed at a fixture home. `undefined` = delegate to the real homedir,
+// which is the state every test starts in.
+const os = vi.hoisted(() => ({ home: undefined as string | undefined }));
+vi.mock("node:os", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:os")>();
+	return { ...actual, homedir: () => os.home ?? actual.homedir() };
+});
+
 import {
 	discoverCursorCliSessions,
 	isCursorCliInstalled,
@@ -33,6 +45,7 @@ describe("scanCursorCliSessions", () => {
 		projectsDir = join(base, "projects");
 		await mkdir(chatsDir, { recursive: true });
 		await mkdir(projectsDir, { recursive: true });
+		os.home = undefined;
 	});
 	afterEach(async () => {
 		await rm(join(chatsDir, ".."), { recursive: true, force: true });
@@ -140,12 +153,26 @@ describe("scanCursorCliSessions", () => {
 		const scanned = await scanCursorCliSessions(project, filePath, projectsDir);
 		expect(scanned.error?.kind).toBe("fs");
 
-		// discoverCursorCliSessions (the QueueWorker wrapper) takes no dir-override params, so
-		// it can't be pointed at `filePath` — it always resolves against the real machine's
-		// ~/.cursor/chats. What we CAN assert deterministically is its documented contract: for
-		// a project with no matching sessions it resolves to the plain (error-stripped) array.
+		// discoverCursorCliSessions (the QueueWorker wrapper) takes no dir-override params —
+		// it resolves ~/.cursor/chats from homedir(). Its documented contract: for a project
+		// with no matching sessions it resolves to the plain (error-stripped) array.
 		const sessions = await discoverCursorCliSessions("/nope-does-not-exist");
 		expect(sessions).toEqual([]);
+	});
+
+	it("discoverCursorCliSessions logs and swallows a scan error", async () => {
+		// A FILE where ~/.cursor/chats should be → readdir fails with ENOTDIR, so the
+		// scan populates the error channel that the wrapper must warn about and drop.
+		const home = await mkdtemp(join(tmpdir(), "cursor-cli-home-"));
+		try {
+			await mkdir(join(home, ".cursor"), { recursive: true });
+			await writeFile(join(home, ".cursor", "chats"), "not a dir", "utf8");
+			os.home = home;
+			expect(await scanCursorCliSessions(project).then((r) => r.error?.kind)).toBe("fs");
+			expect(await discoverCursorCliSessions(project)).toEqual([]);
+		} finally {
+			await rm(home, { recursive: true, force: true });
+		}
 	});
 
 	it("isCursorCliInstalled is false when chats dir missing", async () => {

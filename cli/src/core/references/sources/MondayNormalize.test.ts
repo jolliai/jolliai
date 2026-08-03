@@ -153,4 +153,35 @@ describe("normalizeMonday", () => {
 		const p = { items: [ITEM_B_NO_DESC] };
 		expect(normalizeMonday(p, { itemIds: [1] })?.items[0].board).toBeUndefined();
 	});
+
+	it("treats a payload whose `items` is not an array as having none", () => {
+		expect(normalizeMonday({ board: { name: "B" }, items: { nope: 1 } }, { itemIds: [1] })).toEqual({ items: [] });
+		expect(normalizeMonday({ board: { name: "B" } }, { itemIds: [1] })).toEqual({ items: [] });
+	});
+
+	it("skips non-object entries in `items`", () => {
+		const p = { items: [null, 42, "x", ITEM_B_NO_DESC] };
+		expect(normalizeMonday(p, { itemIds: [1] })?.items).toHaveLength(1);
+	});
+
+	// The description flattener has to survive every shape monday's block list can
+	// take. None of these may throw, and none may surface as a partial body.
+	it.each([
+		["a non-object item_description", { item_description: "plain string" }],
+		["a non-array `blocks`", { item_description: { blocks: { nope: 1 } } }],
+		["a block that is not an object", { item_description: { blocks: [null, 7] } }],
+		["a block whose content is not a string", { item_description: { blocks: [{ content: 42 }] } }],
+		["a block whose content is blank", { item_description: { blocks: [{ content: "   " }] } }],
+		[
+			"a deltaFormat whose segments carry no insert string",
+			{ item_description: { blocks: [{ content: '{"deltaFormat":[{"x":1},"str",null]}' }] } },
+		],
+	])("yields no description for %s", (_label, descriptionShape) => {
+		const p = {
+			items: [
+				{ id: "1", name: "n", url: "https://monday.com/i/1", ...(descriptionShape as Record<string, unknown>) },
+			],
+		};
+		expect(normalizeMonday(p, { itemIds: [1] })?.items[0].description).toBeUndefined();
+	});
 });

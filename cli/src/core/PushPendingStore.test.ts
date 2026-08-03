@@ -56,6 +56,82 @@ describe("loadPushPending", () => {
 		expect(Object.keys(file.entries)).toHaveLength(0);
 	});
 
+	// The shape guard has to reject each way the file can be valid JSON yet not a
+	// pending file — a bad state file must never block the pre-push flow.
+	it.each([
+		["a bare JSON scalar", JSON.stringify("just a string")],
+		["JSON null", "null"],
+		["a non-object `entries`", JSON.stringify({ version: 1, entries: 5 })],
+		["a null `entries`", JSON.stringify({ version: 1, entries: null })],
+	])("returns empty for %s", async (_label, contents) => {
+		await writeFile(filePath(), contents, "utf8");
+		expect(Object.keys((await loadPushPending(cwd)).entries)).toHaveLength(0);
+	});
+
+	it("returns empty when the pending path is unreadable (not merely absent)", async () => {
+		// A DIRECTORY where the file should be → EISDIR, which is a real failure
+		// rather than the routine "nothing enqueued yet" ENOENT.
+		await rm(filePath(), { force: true });
+		await mkdir(filePath(), { recursive: true });
+		expect(Object.keys((await loadPushPending(cwd)).entries)).toHaveLength(0);
+	});
+
+	it("tolerates an unlink failure when the file becomes empty", async () => {
+		// Non-empty DIRECTORY at the pending path → the `rm` inside writeOrUnlink
+		// fails. Writing an empty entry set must still resolve, not reject.
+		await rm(filePath(), { force: true });
+		await mkdir(join(filePath(), "occupied"), { recursive: true });
+		await expect(__writeForTest(cwd, { version: 1, entries: {} })).resolves.toBeUndefined();
+	});
+
+	// The locked re-read exists because another process can refresh the entries
+	// between the optimistic read and the lock. When it has, there is nothing
+	// left to prune and the load must NOT rewrite the file it just re-read.
+	it("skips the prune write when a concurrent writer already refreshed the entries", async () => {
+		const old = new Date(Date.now() - PUSH_PENDING_STALE_MS - 1000).toISOString();
+		const fresh = new Date().toISOString();
+		await __writeForTest(cwd, {
+			version: 1,
+			entries: { [HASH_A]: { branch: "b", enqueuedAt: old, retryCount: 0 } },
+		});
+
+		let releaseHolder: () => void = () => {};
+		let markEntered: () => void = () => {};
+		const entered = new Promise<void>((resolve) => {
+			markEntered = resolve;
+		});
+		const holder = withPushPendingLock(cwd, async () => {
+			markEntered();
+			await new Promise<void>((resolve) => {
+				releaseHolder = resolve;
+			});
+			// Stand in for the concurrent enqueue: replace the stale entry with a
+			// fresh one AFTER the loader's optimistic read has already seen the
+			// stale file and queued behind this lock.
+			await writeFile(
+				filePath(),
+				JSON.stringify({
+					version: 1,
+					entries: { [HASH_B]: { branch: "b", enqueuedAt: fresh, retryCount: 0 } },
+				}),
+				"utf8",
+			);
+		});
+		await entered;
+
+		// Optimistic read happens here and sees the stale entry, so the loader
+		// takes the lock instead of returning early.
+		const loading = loadPushPending(cwd);
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		releaseHolder();
+		await holder;
+
+		expect(Object.keys((await loading).entries)).toEqual([HASH_B]);
+		// The refreshed file is left exactly as the concurrent writer wrote it.
+		const onDisk = JSON.parse(await readFile(filePath(), "utf8")) as PushPendingFile;
+		expect(Object.keys(onDisk.entries)).toEqual([HASH_B]);
+	});
+
 	it("reads back a valid file", async () => {
 		const now = new Date().toISOString();
 		await __writeForTest(cwd, {

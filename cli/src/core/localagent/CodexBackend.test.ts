@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { CodexBackend } from "./CodexBackend.js";
+import { CODEX_SPEC, CodexBackend } from "./CodexBackend.js";
 import * as resolver from "./ExecutableResolver.js";
 import { LocalAgentAuthError, LocalAgentSetupError } from "./Types.js";
 
@@ -31,6 +31,24 @@ describe("CodexBackend", () => {
 		].join("\n");
 		const out = b.parseResult(stream);
 		expect(out.text).toBe("hello 42");
+	});
+
+	it("tolerates a typeless event, an empty agent_message, and a usage-less turn", () => {
+		const stream = [
+			// No `type` at all (a bare handshake line) — must not be treated as an
+			// error just because the haystack is empty.
+			JSON.stringify({ thread_id: "abc" }),
+			JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "the answer" } }),
+			// A later empty agent_message must not blank the text already captured.
+			JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "" } }),
+			// turn.completed with a usage object that reports nothing.
+			JSON.stringify({ type: "turn.completed", usage: {} }),
+		].join("\n");
+		const out = b.parseResult(stream);
+		expect(out.text).toBe("the answer");
+		expect(out.inputTokens).toBe(0);
+		expect(out.outputTokens).toBe(0);
+		expect(out.cachedTokens).toBe(0);
 	});
 
 	it("scrubs OPENAI_API_KEY and OPENAI_BASE_URL, sets child-reentry env", () => {
@@ -107,5 +125,26 @@ describe("CodexBackend.isPresent", () => {
 		const spy = vi.spyOn(resolver, "isPresent").mockReturnValue(true);
 		expect(new CodexBackend().isPresent()).toBe(true);
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ binName: "codex" }), { overridePath: undefined });
+	});
+});
+
+describe("CodexBackend.discoverExecutable", () => {
+	it("resolves through the shared resolver, forwarding the override path", async () => {
+		const spy = vi.spyOn(resolver, "resolveExecutable").mockReturnValue({ file: "/opt/codex", version: "0.9.0" });
+		await expect(b.discoverExecutable("/opt/codex")).resolves.toEqual({ file: "/opt/codex", version: "0.9.0" });
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ binName: "codex" }), {
+			overridePath: "/opt/codex",
+		});
+		spy.mockRestore();
+	});
+});
+
+describe("CODEX_SPEC.knownPaths", () => {
+	// Built with path.win32 / path.posix rather than the host `path`, so the
+	// expectations hold on a Windows dev machine and in POSIX CI alike.
+	it("points at the standalone installer's location on each platform", () => {
+		expect(CODEX_SPEC.knownPaths("C:\\Users\\u", "win32")).toEqual(["C:\\Users\\u\\.local\\bin\\codex.exe"]);
+		expect(CODEX_SPEC.knownPaths("/home/u", "darwin")).toEqual(["/home/u/.local/bin/codex"]);
+		expect(CODEX_SPEC.knownPaths("/home/u", "linux")).toEqual(["/home/u/.local/bin/codex"]);
 	});
 });
