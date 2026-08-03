@@ -239,11 +239,12 @@ object WorkingMemoryHtmlBuilder {
     }
 
     private fun sourceIconSvg(source: String, isDark: Boolean): String {
-        // copilot-chat and cline-cli reuse their sibling's brand mark (Copilot,
-        // Cline) rather than shipping a duplicate source-*.svg resource.
+        // copilot-chat / cline-cli / cursor-cli reuse their sibling's brand mark
+        // (Copilot, Cline, Cursor) rather than shipping a duplicate source-*.svg.
         val name = when (source) {
             "copilot-chat" -> "copilot"
             "cline-cli" -> "cline"
+            "cursor-cli" -> "cursor"
             else -> source
         }
         val base = "/icons/source-$name"

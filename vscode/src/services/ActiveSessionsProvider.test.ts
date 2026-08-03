@@ -18,8 +18,22 @@ vi.mock("vscode", () => ({
 	},
 }));
 
-vi.mock("../../../cli/src/core/ActiveSessionAggregator.js", () => ({
+vi.mock("../../../cli/src/core/ActiveSessionAggregator.js", async (importActual) => ({
+	...(await importActual<typeof import("../../../cli/src/core/ActiveSessionAggregator.js")>()),
 	listActiveConversationsWithDiagnostics: vi.fn(),
+}));
+
+// Hermetic config: default {} means every source is enabled (isSourceEnabled
+// treats `undefined` as on), so the belt-and-suspenders filter in
+// listWithDiagnostics is a no-op unless a test opts out explicitly.
+//
+// Partial mock: keep the real `isSourceEnabled` (which ActiveSessionAggregator
+// re-exports from SessionTracker for VS Code's belt-and-suspenders filter);
+// only `loadConfig` is stubbed so we don't touch the developer's real config
+// on disk.
+vi.mock("../../../cli/src/core/SessionTracker.js", async (importActual) => ({
+	...(await importActual<typeof import("../../../cli/src/core/SessionTracker.js")>()),
+	loadConfig: vi.fn().mockResolvedValue({}),
 }));
 
 vi.mock("../util/Logger.js", () => ({
@@ -85,10 +99,29 @@ describe("ActiveSessionsProvider", () => {
 		expect(result.failedSources).toEqual(["cursor", "opencode"]);
 	});
 
+	it("listWithDiagnostics filters failedSources by the enabled-source config", async () => {
+		// Belt-and-suspenders parity with items: a source the user just
+		// disabled (or that drifted between the aggregator load and the
+		// config load) must not spike the "N sources unavailable" banner.
+		// The aggregator wouldn't normally return a disabled source in
+		// `failedSources` — its per-source loader short-circuits before
+		// touching disk — but under the same drift window that motivates
+		// filtering items, a stale entry is possible.
+		const { loadConfig } = await import("../../../cli/src/core/SessionTracker.js");
+		vi.mocked(loadConfig).mockResolvedValueOnce({ cursorEnabled: false } as never);
+		vi.mocked(listActiveConversationsWithDiagnostics).mockResolvedValueOnce({
+			items: [],
+			failedSources: ["cursor", "opencode"],
+		});
+		const p = new ActiveSessionsProvider({ getWorkspaceCwd: () => "/proj" });
+		const result = await p.listWithDiagnostics();
+		expect(result.failedSources).toEqual(["opencode"]);
+	});
+
 	it("listWithDiagnostics on aggregator-throw flags every known source as failed", async () => {
 		// When the aggregator itself throws (not just one source loader),
 		// every source is effectively unavailable. Returning failedSources:
-		// [] would tell the webview "0 of 8 failed" — indistinguishable from
+		// [] would tell the webview "0 of N failed" — indistinguishable from
 		// a healthy-but-empty list, so the partial-data banner never shows
 		// and users can't tell the feature is broken. Returning the full
 		// TRANSCRIPT_SOURCES set is honest: webview renders the banner and

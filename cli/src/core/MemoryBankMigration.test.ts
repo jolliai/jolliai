@@ -1,13 +1,12 @@
-import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FolderStorage } from "../core/FolderStorage.js";
-import * as KBPathResolver from "../core/KBPathResolver.js";
-import type { MigrationState } from "../core/KBTypes.js";
-import { MetadataManager } from "../core/MetadataManager.js";
-import { MigrationEngine } from "../core/MigrationEngine.js";
-import { OrphanBranchStorage } from "../core/OrphanBranchStorage.js";
-import * as SessionTracker from "../core/SessionTracker.js";
-import { registerMigrateMemoryBankCommand, runMemoryBankMigration } from "./MigrateMemoryBankCommand.js";
+import { FolderStorage } from "./FolderStorage.js";
+import * as KBPathResolver from "./KBPathResolver.js";
+import type { MigrationState } from "./KBTypes.js";
+import { runMemoryBankMigration } from "./MemoryBankMigration.js";
+import { MetadataManager } from "./MetadataManager.js";
+import { MigrationEngine } from "./MigrationEngine.js";
+import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
+import * as SessionTracker from "./SessionTracker.js";
 
 /** Stubs path resolution + config so no real repo/config is touched. */
 function stubResolution(localFolder?: string): void {
@@ -91,48 +90,5 @@ describe("runMemoryBankMigration", () => {
 		expect(result).toEqual({ status: "completed", totalEntries: 7, migratedEntries: 7 });
 		expect(runMigration).not.toHaveBeenCalled();
 		expect(reconcile).toHaveBeenCalledOnce();
-	});
-});
-
-/** Runs `jolli migrate-memory-bank` capturing stdout. */
-async function run(): Promise<string> {
-	const logs: string[] = [];
-	vi.spyOn(console, "log").mockImplementation((m?: unknown) => void logs.push(String(m)));
-	const program = new Command();
-	registerMigrateMemoryBankCommand(program);
-	await program.parseAsync(["node", "jolli", "migrate-memory-bank", "--cwd", "/repo"]);
-	return logs.join("\n");
-}
-
-describe("migrate-memory-bank command", () => {
-	it("prints the migration result as a single JSON line", async () => {
-		stubResolution();
-		vi.spyOn(OrphanBranchStorage.prototype, "exists").mockResolvedValue(false);
-
-		const out = await run();
-
-		expect(JSON.parse(out)).toEqual({
-			type: "migrate-memory-bank",
-			status: "completed",
-			totalEntries: 0,
-			migratedEntries: 0,
-		});
-		expect(process.exitCode).toBe(0);
-	});
-
-	it("prints a JSON error and sets exit code 1 when migration throws", async () => {
-		stubResolution();
-		vi.spyOn(OrphanBranchStorage.prototype, "exists").mockResolvedValue(true);
-		vi.spyOn(MetadataManager.prototype, "readMigrationState").mockReturnValue(null);
-		vi.spyOn(MigrationEngine.prototype, "runMigration").mockRejectedValue(new TypeError("index.json corrupt"));
-
-		const out = await run();
-
-		expect(JSON.parse(out)).toEqual({
-			type: "error",
-			message: "index.json corrupt",
-			errorName: "TypeError",
-		});
-		expect(process.exitCode).toBe(1);
 	});
 });

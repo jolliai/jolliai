@@ -118,6 +118,17 @@ class JolliMemoryStartupActivity : ProjectActivity {
             val service = project.getService(JolliMemoryService::class.java)
             service.initialize()
 
+            // VS Code parity (`kbInitPromise` + 60s watchdog): the first sync round
+            // waits for the now-async Memory Bank migration to settle, so sync
+            // never classifies/pushes half-written migration output. Bounded — a
+            // big first-install migration can take minutes, and one possibly-
+            // premature sync round beats hanging sync forever; the round after
+            // migration completes self-heals. This coroutine is off the EDT, so
+            // the wait never touches the UI thread.
+            if (!service.migrationGate.await(60, TimeUnit.SECONDS)) {
+                log.warn("Memory Bank migration still running after 60s — starting sync anyway")
+            }
+
             // Slice-1 daemon channel: replaces the in-process refresh signal the retired
             // Kotlin PostCommitHook used to fire. The client spawns `jolli daemon` and
             // dispatches `refresh` notifications to JolliMemoryService.refreshStatus.

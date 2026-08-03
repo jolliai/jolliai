@@ -975,6 +975,17 @@ private class StatusIndicatorLabel(
                 sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Cursor:</b> detected</p>")
             }
         }
+        if (status.devinDetected == true) {
+            val scanError = status.devinScanError
+            if (scanError != null) {
+                val detail = if (scanError.message != null) "${scanError.kind}: ${scanError.message}" else scanError.kind
+                sb.append("<p><span style='color:#F85149'>\u25CF</span> <b>Devin:</b> unavailable \u2014 $detail</p>")
+            } else if (status.devinEnabled == false) {
+                sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>Devin:</b> detected but disabled</p>")
+            } else {
+                sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Devin:</b> detected</p>")
+            }
+        }
         if (status.copilotDetected == true) {
             val scanError = status.copilotScanError
             if (scanError != null) {
@@ -995,6 +1006,31 @@ private class StatusIndicatorLabel(
                 sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>Copilot Chat:</b> detected but disabled</p>")
             } else {
                 sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Copilot Chat:</b> detected</p>")
+            }
+        }
+        if (status.clineVscodeDetected == true || status.clineCliDetected == true) {
+            val vscodeErr = status.clineVscodeScanError
+            val cliErr = status.clineCliScanError
+            if (vscodeErr != null || cliErr != null) {
+                val parts = mutableListOf<String>()
+                if (vscodeErr != null) parts.add("VS Code: ${vscodeErr.kind}")
+                if (cliErr != null) parts.add("CLI: ${cliErr.kind}")
+                sb.append("<p><span style='color:#F85149'>\u25CF</span> <b>Cline:</b> unavailable \u2014 ${parts.joinToString(", ")}</p>")
+            } else if (status.clineEnabled == false) {
+                sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>Cline:</b> detected but disabled</p>")
+            } else {
+                sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Cline:</b> detected</p>")
+            }
+        }
+        if (status.antigravityDetected == true) {
+            val scanError = status.antigravityScanError
+            if (scanError != null) {
+                val detail = if (scanError.message != null) "${scanError.kind}: ${scanError.message}" else scanError.kind
+                sb.append("<p><span style='color:#F85149'>\u25CF</span> <b>Antigravity:</b> unavailable \u2014 $detail</p>")
+            } else if (status.antigravityEnabled == false) {
+                sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>Antigravity:</b> detected but disabled</p>")
+            } else {
+                sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Antigravity:</b> detected</p>")
             }
         }
 

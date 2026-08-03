@@ -27,7 +27,6 @@ import { registerIdeBridgeCommand } from "./commands/IdeBridgeRegistration.js";
 import { registerBindCommand, registerPushCommand, registerSpacesCommand } from "./commands/JolliCloudCommands.js";
 import { registerMcpCommand } from "./commands/McpCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
-import { registerMigrateMemoryBankCommand } from "./commands/MigrateMemoryBankCommand.js";
 import { registerMovedCommandNotices } from "./commands/MovedCommandNotices.js";
 import { registerOpenUrlCommand } from "./commands/OpenUrlCommand.js";
 import { registerPrDescriptionCommand } from "./commands/PrDescriptionCommand.js";
@@ -391,7 +390,6 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerCompileCommand(program);
 	registerGraphCommand(program);
 	registerMigrateCommand(program);
-	registerMigrateMemoryBankCommand(program);
 	registerHealFolderCommand(program);
 	registerExportPromptCommand(program);
 	registerExportCommand(program);

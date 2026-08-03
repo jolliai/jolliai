@@ -171,7 +171,7 @@ gate a change.
 - [267 — Guided Front-Door Space-Binding Step](267-guided-front-door-space-binding-step.md) — resolve or establish the repo's Space binding in one backend round-trip, warning on unusable bindings, entirely best-effort.
 - [281 — CLI Machine-Wide Uninstall Command](281-cli-machine-wide-uninstall-command.md) — discover and selectively remove every install artifact across every editor, directory, and hook — never the user's memories.
 - [292 — `jolli generate`](292-cli-generate-bridge-command.md) — a hidden JSON-in/JSON-out bridge exposing five one-shot generation flows to hosts that cannot call the code in-process.
-- [293 — `jolli migrate-memory-bank`](293-cli-migrate-memory-bank-command.md) — a hidden bridge running the orphan-branch-to-folder migration for one project, reporting one JSON line, requiring no sign-in.
+- ~~[293 — `jolli migrate-memory-bank`](293-cli-migrate-memory-bank-command.md)~~ **(REMOVED)** — the dedicated hidden command is gone; IntelliJ now reaches the same migration engine through the ide-bridge `migrate-memory-bank` action (daemon fast path, one-shot spawn fallback), keeping the no-sign-in contract.
 - [296 — Moved-Command Notices](296-moved-command-notices.md) — keep three retired flat workflow command names registered as hidden soft-failing notices that name their namespaced replacement.
 
 ## Search and recall

@@ -142,8 +142,9 @@ class PinnedPanel(
 			add(badge, GridBagConstraints())
 		}
 
-		// Hover actions, right edge: Open (eye) · Resume (play, Claude/Codex only) · Unpin.
-		val openBtn = actionIcon(JolliMemoryIcons.Eye, "Open") { openPinned(entry) }
+		// Hover actions, right edge: Unpin. (Row body click opens the entry, so a
+		// dedicated Open button is redundant; Resume-in-terminal was Claude/Codex
+		// only — dropped for parity with VS Code, which has neither.)
 		val unpinBtn = actionIcon(AllIcons.Actions.Close, "Unpin") {
 			val dir = cwd() ?: return@actionIcon
 			ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_unpinned", mapOf("kind" to entry.kind))
@@ -152,13 +153,7 @@ class PinnedPanel(
 				refresh()
 			}
 		}
-		val canResume = entry.kind == "conversations" && TerminalUtils.canResumeSource(entry.badge)
-		val actions = if (canResume) {
-			val resumeBtn = actionIcon(AllIcons.Actions.Execute, "Resume session in terminal") { resumeInTerminal(entry) }
-			listOf(openBtn, resumeBtn, unpinBtn)
-		} else {
-			listOf(openBtn, unpinBtn)
-		}
+		val actions = listOf(unpinBtn)
 		val iconsRow = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(2), 0)).apply {
 			isOpaque = false
 			actions.forEach { add(it) }
@@ -274,16 +269,6 @@ class PinnedPanel(
 				onClick()
 			}
 		})
-	}
-
-	/** Resume a pinned conversation directly in terminal (Claude or Codex). */
-	private fun resumeInTerminal(entry: PinStore.PinnedEntry) {
-		val cwd = cwd() ?: return
-		val sessionId = entry.key.substringAfter(":")
-		if (sessionId.isNotBlank()) {
-			ai.jolli.jollimemory.core.telemetry.Telemetry.track("session_resumed", mapOf("source" to entry.badge.lowercase()))
-			TerminalUtils.resumeSession(project, entry.badge, sessionId, cwd, entry.title)
-		}
 	}
 
 	// ── Open content on click ───────────────────────────────────────────────

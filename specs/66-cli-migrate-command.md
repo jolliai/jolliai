@@ -8,7 +8,7 @@ The `jolli migrate` command upgrades a project's stored summaries from the legac
 
 This spec covers the user-facing behavior of `jolli migrate`: invocation form, the two-phase sequence, what is reported per phase, idempotency on already-migrated projects, the 48-hour legacy-retention window, and exit codes. It does not cover the in-format mapping rules between v1 and v3 (separate spec), the orphan-branch storage layout (separate spec), or the separate cleanup probe that deletes legacy data after 48 hours (separate spec).
 
-**Not to be confused with `jolli migrate-memory-bank`.** A second, hidden command shares the "migrate" verb but touches a disjoint subsystem: it copies the orphan-branch store into the on-disk Memory Bank folder. `jolli migrate` upgrades the *format* of what is stored on the orphan branch and never writes to the Memory Bank folder; `migrate-memory-bank` changes no format and never rewrites the orphan branch. They share no data, no marker, and no report; neither is a phase, split, or rename of the other. See the Memory Bank migration bridge spec.
+**Not to be confused with the Memory Bank migration bridge.** A disjoint subsystem copies the orphan-branch store into the on-disk Memory Bank folder — historically exposed as the hidden `jolli migrate-memory-bank` command (removed) and now as the `ide-bridge migrate-memory-bank` action. `jolli migrate` upgrades the *format* of what is stored on the orphan branch and never writes to the Memory Bank folder; the bridge action changes no format and never rewrites the orphan branch. They share no data, no marker, and no report; neither is a phase, split, or rename of the other. See the Memory Bank migration bridge spec (293, retired) for historical context.
 
 ## Data Contracts (output)
 

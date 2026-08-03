@@ -67,6 +67,9 @@ vi.mock("../Logger.js", () => ({
 	getJolliMemoryDir: (cwd: string) => `${cwd}/.jolli/jollimemory`,
 }));
 
+vi.mock("../core/MemoryBankMigration.js", () => ({
+	runMemoryBankMigration: vi.fn(async () => ({ status: "completed", totalEntries: 0, migratedEntries: 0 })),
+}));
 vi.mock("../core/StorageFactory.js", () => ({
 	createStorage: vi.fn(),
 }));
@@ -103,6 +106,11 @@ vi.mock("../core/Locks.js", () => ({
 	PLANS_LOCK_FILE: "plans.lock",
 	DEFAULT_PLANS_LOCK_TIMEOUT_MS: 5000,
 	DEFAULT_PLANS_LOCK_POLL_MS: 25,
+	// Serialises `sync-agent-hooks` against Installer's enable/disable — see the
+	// case in [IdeBridgeCommand.ts]. Default happy-path returns a handle whose
+	// release is a no-op; a per-test `mockResolvedValueOnce(null)` covers the
+	// contention branch that throws.
+	acquireRepoHooksLock: vi.fn().mockResolvedValue({ release: vi.fn().mockResolvedValue(undefined) }),
 }));
 
 vi.mock("../core/LockPrimitives.js", () => ({
@@ -191,6 +199,11 @@ vi.mock("../core/GitOps.js", () => ({
 	execGit: vi.fn().mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 }),
 	getProjectRootDir: vi.fn().mockResolvedValue("/repo/root"),
 	getCurrentBranch: vi.fn().mockResolvedValue("main"),
+	// The sync-agent-hooks case enumerates worktrees. Default to the repo root
+	// so tests that don't care about multi-worktree paths still cover one
+	// iteration; individual tests override with `.mockResolvedValueOnce([...])`
+	// when they need the branching two-worktree behaviour.
+	listWorktrees: vi.fn().mockResolvedValue(["/repo/root"]),
 }));
 
 vi.mock("../core/PinStore.js", () => ({
@@ -224,6 +237,10 @@ vi.mock("../core/PushPendingStore.js", () => ({
 vi.mock("../core/RepoProfile.js", () => ({
 	readRepoProfile: vi.fn().mockResolvedValue({ backfillDismissed: false, manuallyDisabled: false }),
 	updateRepoProfile: vi.fn().mockResolvedValue(undefined),
+	// sync-agent-hooks gates on the repo-wide manual-disable flag exactly like
+	// VS Code's syncHooks; a per-test `.mockResolvedValueOnce(true)` covers the
+	// manually-disabled early-return branch.
+	readManualDisableFlag: vi.fn().mockResolvedValue(false),
 }));
 
 // Spreads the real module on purpose: the jolli-api push/delete gate constructs
@@ -369,6 +386,17 @@ vi.mock("../core/MultiRepoCompile.js", () => ({
 
 vi.mock("../install/Installer.js", () => ({
 	getStatus: vi.fn().mockResolvedValue({ installed: true }),
+	// Hook installers driven by the sync-agent-hooks action. Default happy
+	// path: all four resolve; a per-test override injects failures to cover
+	// the failures[] shape.
+	installClaudeHook: vi.fn().mockResolvedValue({ ok: true }),
+	removeClaudeHook: vi.fn().mockResolvedValue({ ok: true }),
+	installGeminiHook: vi.fn().mockResolvedValue({ ok: true }),
+	removeGeminiHook: vi.fn().mockResolvedValue(undefined),
+	// Full uninstall driven by the `disable` bridge action. Default happy
+	// path returns a successful InstallResult; per-test overrides inject
+	// failure or non-empty warnings.
+	uninstall: vi.fn().mockResolvedValue({ success: true, message: "disabled", warnings: [] }),
 }));
 
 vi.mock("./SyncCommand.js", () => ({
@@ -767,6 +795,288 @@ describe("computeServeResponse", () => {
 });
 
 // ---------- 2. runIdeBridgeAction — per-action coverage ----------
+
+describe("runIdeBridgeAction — migrate-memory-bank", () => {
+	it("delegates to runMemoryBankMigration with the caller's cwd", async () => {
+		const { runMemoryBankMigration } = await import("../core/MemoryBankMigration.js");
+		vi.mocked(runMemoryBankMigration).mockResolvedValue({
+			status: "completed",
+			totalEntries: 4,
+			migratedEntries: 4,
+		});
+		const result = await runIdeBridgeAction("migrate-memory-bank", "/repo", {});
+		expect(runMemoryBankMigration).toHaveBeenCalledWith("/repo");
+		expect(result).toMatchObject({ status: "completed", totalEntries: 4, migratedEntries: 4 });
+	});
+});
+
+describe("runIdeBridgeAction — sync-agent-hooks", () => {
+	beforeEach(async () => {
+		// afterEach's restoreAllMocks strips the factory defaults set at
+		// top-of-file, so re-establish the happy-path baseline that every test
+		// below either accepts or overrides via mock*Once. Kept local to this
+		// describe so tests for other actions aren't affected.
+		const { listWorktrees, getProjectRootDir } = await import("../core/GitOps.js");
+		const { readManualDisableFlag } = await import("../core/RepoProfile.js");
+		const { installClaudeHook, removeClaudeHook, installGeminiHook, removeGeminiHook } = await import(
+			"../install/Installer.js"
+		);
+		const { acquireRepoHooksLock } = await import("../core/Locks.js");
+		vi.mocked(listWorktrees).mockResolvedValue(["/repo/root"]);
+		vi.mocked(getProjectRootDir).mockResolvedValue("/repo/root");
+		vi.mocked(readManualDisableFlag).mockResolvedValue(false);
+		vi.mocked(installClaudeHook).mockResolvedValue({ ok: true } as never);
+		vi.mocked(removeClaudeHook).mockResolvedValue({ ok: true } as never);
+		vi.mocked(installGeminiHook).mockResolvedValue({ ok: true } as never);
+		vi.mocked(removeGeminiHook).mockResolvedValue(undefined as never);
+		vi.mocked(acquireRepoHooksLock).mockResolvedValue({ release: vi.fn().mockResolvedValue(undefined) });
+	});
+
+	it("installs Claude and Gemini per-worktree when both toggles are on", async () => {
+		const { listWorktrees } = await import("../core/GitOps.js");
+		const { installClaudeHook, installGeminiHook, removeClaudeHook, removeGeminiHook } = await import(
+			"../install/Installer.js"
+		);
+		vi.mocked(listWorktrees).mockResolvedValueOnce(["/repo/root", "/repo/root-feature"]);
+
+		const result = await runIdeBridgeAction("sync-agent-hooks", "/repo/root", {
+			claudeEnabled: true,
+			geminiEnabled: true,
+		});
+
+		expect(installClaudeHook).toHaveBeenCalledTimes(2);
+		expect(installClaudeHook).toHaveBeenCalledWith("/repo/root");
+		expect(installClaudeHook).toHaveBeenCalledWith("/repo/root-feature");
+		expect(installGeminiHook).toHaveBeenCalledTimes(2);
+		expect(removeClaudeHook).not.toHaveBeenCalled();
+		expect(removeGeminiHook).not.toHaveBeenCalled();
+		expect(result).toEqual({
+			manuallyDisabled: false,
+			worktrees: ["/repo/root", "/repo/root-feature"],
+			failures: [],
+		});
+	});
+
+	it("removes hooks per-worktree when the toggles are off", async () => {
+		const { installClaudeHook, installGeminiHook, removeClaudeHook, removeGeminiHook } = await import(
+			"../install/Installer.js"
+		);
+		const result = await runIdeBridgeAction("sync-agent-hooks", "/repo/root", {
+			claudeEnabled: false,
+			geminiEnabled: false,
+		});
+		expect(removeClaudeHook).toHaveBeenCalledWith("/repo/root");
+		expect(removeGeminiHook).toHaveBeenCalledWith("/repo/root");
+		expect(installClaudeHook).not.toHaveBeenCalled();
+		expect(installGeminiHook).not.toHaveBeenCalled();
+		expect(result).toMatchObject({ manuallyDisabled: false, failures: [] });
+	});
+
+	it("mixes install/remove per-integration based on each flag", async () => {
+		const { installClaudeHook, installGeminiHook, removeClaudeHook, removeGeminiHook } = await import(
+			"../install/Installer.js"
+		);
+		await runIdeBridgeAction("sync-agent-hooks", "/repo/root", {
+			claudeEnabled: true,
+			geminiEnabled: false,
+		});
+		expect(installClaudeHook).toHaveBeenCalledWith("/repo/root");
+		expect(removeGeminiHook).toHaveBeenCalledWith("/repo/root");
+		expect(removeClaudeHook).not.toHaveBeenCalled();
+		expect(installGeminiHook).not.toHaveBeenCalled();
+	});
+
+	it("early-returns without touching hooks when the repo is manually disabled", async () => {
+		const { readManualDisableFlag } = await import("../core/RepoProfile.js");
+		const { installClaudeHook, installGeminiHook, removeClaudeHook, removeGeminiHook } = await import(
+			"../install/Installer.js"
+		);
+		vi.mocked(readManualDisableFlag).mockResolvedValueOnce(true);
+		const result = await runIdeBridgeAction("sync-agent-hooks", "/repo/root", {
+			claudeEnabled: true,
+			geminiEnabled: true,
+		});
+		expect(installClaudeHook).not.toHaveBeenCalled();
+		expect(installGeminiHook).not.toHaveBeenCalled();
+		expect(removeClaudeHook).not.toHaveBeenCalled();
+		expect(removeGeminiHook).not.toHaveBeenCalled();
+		expect(result).toEqual({ manuallyDisabled: true, worktrees: [], failures: [] });
+	});
+
+	it("collects per-worktree per-integration failures without aborting the loop", async () => {
+		const { listWorktrees } = await import("../core/GitOps.js");
+		const { installClaudeHook, installGeminiHook } = await import("../install/Installer.js");
+		vi.mocked(listWorktrees).mockResolvedValueOnce(["/repo/root", "/repo/root-feature"]);
+		// First worktree fails on Claude, second one fails on Gemini — verifies
+		// that both failures land in the same `failures` array and that later
+		// iterations still ran (i.e. no exception escaped the loop).
+		vi.mocked(installClaudeHook).mockRejectedValueOnce(new Error("boom-claude"));
+		vi.mocked(installGeminiHook)
+			.mockResolvedValueOnce({ ok: true } as never)
+			.mockRejectedValueOnce(new Error("boom-gemini"));
+
+		const result = (await runIdeBridgeAction("sync-agent-hooks", "/repo/root", {
+			claudeEnabled: true,
+			geminiEnabled: true,
+		})) as { failures: Array<{ worktree: string; integration: string; message: string }> };
+
+		expect(result.failures).toEqual([
+			{ worktree: "/repo/root", integration: "Claude", message: "boom-claude" },
+			{ worktree: "/repo/root-feature", integration: "Gemini", message: "boom-gemini" },
+		]);
+	});
+
+	it("falls back to the repo root when listWorktrees throws", async () => {
+		const { listWorktrees } = await import("../core/GitOps.js");
+		const { installClaudeHook } = await import("../install/Installer.js");
+		vi.mocked(listWorktrees).mockRejectedValueOnce(new Error("not a git dir"));
+		const result = (await runIdeBridgeAction("sync-agent-hooks", "/repo/root", {
+			claudeEnabled: true,
+			geminiEnabled: true,
+		})) as { worktrees: string[] };
+		// getProjectRootDir mock resolves to "/repo/root" (see top-of-file mock),
+		// so that's what the fallback iteration hits.
+		expect(installClaudeHook).toHaveBeenCalledWith("/repo/root");
+		expect(result.worktrees).toEqual(["/repo/root"]);
+	});
+
+	it("rejects non-boolean toggle fields", async () => {
+		await expect(
+			runIdeBridgeAction("sync-agent-hooks", "/repo/root", {
+				claudeEnabled: "yes",
+				geminiEnabled: true,
+			} as never),
+		).rejects.toThrow(/must be booleans/);
+	});
+
+	it("acquires and releases the repo-hooks lock around the per-worktree writes", async () => {
+		const { acquireRepoHooksLock } = await import("../core/Locks.js");
+		const { installClaudeHook } = await import("../install/Installer.js");
+		const release = vi.fn().mockResolvedValue(undefined);
+		vi.mocked(acquireRepoHooksLock).mockResolvedValueOnce({ release });
+
+		await runIdeBridgeAction("sync-agent-hooks", "/repo/root", {
+			claudeEnabled: true,
+			geminiEnabled: true,
+		});
+
+		expect(acquireRepoHooksLock).toHaveBeenCalledWith("/repo/root");
+		// Serialised against enable/disable — the SAME lock Installer takes in
+		// [install]/[uninstall]. Verified via a matching release; without the
+		// lock, the IntelliJ startup auto-install could race with a Settings
+		// Apply and clobber each other's `.claude/settings.local.json` writes.
+		expect(release).toHaveBeenCalledTimes(1);
+		expect(installClaudeHook).toHaveBeenCalledWith("/repo/root");
+	});
+
+	it("throws when the repo-hooks lock is already held (contention)", async () => {
+		const { acquireRepoHooksLock } = await import("../core/Locks.js");
+		const { installClaudeHook, installGeminiHook } = await import("../install/Installer.js");
+		vi.mocked(acquireRepoHooksLock).mockResolvedValueOnce(null);
+
+		// Lock timeout MUST surface as a bridge error — the IntelliJ caller's
+		// outer catch renders a "click Apply again" balloon, which is the
+		// correct recovery for a transient enable/disable race. Silently
+		// falling through to unlocked writes is what the lock exists to prevent.
+		await expect(
+			runIdeBridgeAction("sync-agent-hooks", "/repo/root", {
+				claudeEnabled: true,
+				geminiEnabled: true,
+			}),
+		).rejects.toThrow(/Another Jolli enable\/disable/);
+		expect(installClaudeHook).not.toHaveBeenCalled();
+		expect(installGeminiHook).not.toHaveBeenCalled();
+	});
+
+	it("still short-circuits on manual-disable without taking the lock", async () => {
+		const { readManualDisableFlag } = await import("../core/RepoProfile.js");
+		const { acquireRepoHooksLock } = await import("../core/Locks.js");
+		vi.mocked(readManualDisableFlag).mockResolvedValueOnce(true);
+
+		const result = await runIdeBridgeAction("sync-agent-hooks", "/repo/root", {
+			claudeEnabled: true,
+			geminiEnabled: true,
+		});
+		// The manual-disable flag is a stable per-repo opt-out; taking the
+		// enable/disable lock just to check it (and return without writing
+		// anything) would make a common no-op case contend with a real enable.
+		expect(acquireRepoHooksLock).not.toHaveBeenCalled();
+		expect(result).toEqual({ manuallyDisabled: true, worktrees: [], failures: [] });
+	});
+});
+
+describe("runIdeBridgeAction — disable", () => {
+	beforeEach(async () => {
+		// afterEach's restoreAllMocks strips the factory defaults; re-establish
+		// the happy-path uninstall() so each test either accepts it or overrides
+		// with a mockResolvedValueOnce.
+		const { uninstall } = await import("../install/Installer.js");
+		vi.mocked(uninstall).mockResolvedValue({
+			success: true,
+			message: "disabled",
+			warnings: [],
+		});
+	});
+
+	it("defaults to a full disable with persistManualDisable=true and preserveMenu=true", async () => {
+		const { uninstall } = await import("../install/Installer.js");
+		const result = await runIdeBridgeAction("disable", "/repo/root", {});
+		expect(uninstall).toHaveBeenCalledWith("/repo/root", {
+			integrationsOnly: false,
+			persistManualDisable: true,
+			preserveMenu: true,
+		});
+		expect(result).toEqual({ success: true, message: "disabled", warnings: [] });
+	});
+
+	it("integrations-only disable flips preserveMenu and persistManualDisable to false", async () => {
+		const { uninstall } = await import("../install/Installer.js");
+		await runIdeBridgeAction("disable", "/repo/root", { integrationsOnly: true });
+		expect(uninstall).toHaveBeenCalledWith("/repo/root", {
+			integrationsOnly: true,
+			persistManualDisable: false,
+			preserveMenu: false,
+		});
+	});
+
+	it("honors an explicit persistManualDisable=false override on a full disable", async () => {
+		const { uninstall } = await import("../install/Installer.js");
+		await runIdeBridgeAction("disable", "/repo/root", { persistManualDisable: false });
+		expect(uninstall).toHaveBeenCalledWith("/repo/root", {
+			integrationsOnly: false,
+			persistManualDisable: false,
+			preserveMenu: true,
+		});
+	});
+
+	it("propagates a failing uninstall result verbatim (success:false + message)", async () => {
+		const { uninstall } = await import("../install/Installer.js");
+		vi.mocked(uninstall).mockResolvedValueOnce({
+			success: false,
+			message: "Another Jolli enable/disable operation is still running; retry shortly",
+			warnings: [],
+		});
+		const result = await runIdeBridgeAction("disable", "/repo/root", {});
+		expect(result).toEqual({
+			success: false,
+			message: "Another Jolli enable/disable operation is still running; retry shortly",
+			warnings: [],
+		});
+	});
+
+	it("copies warnings out of the uninstall result", async () => {
+		const { uninstall } = await import("../install/Installer.js");
+		vi.mocked(uninstall).mockResolvedValueOnce({
+			success: true,
+			message: "disabled",
+			warnings: ["mcp entry not removed for cline (best-effort)"],
+		});
+		const result = (await runIdeBridgeAction("disable", "/repo/root", {})) as {
+			warnings: string[];
+		};
+		expect(result.warnings).toEqual(["mcp entry not removed for cline (best-effort)"]);
+	});
+});
 
 describe("runIdeBridgeAction — active-conversations", () => {
 	it("delegates to listActiveConversationsWithDiagnostics with a default 48h window", async () => {

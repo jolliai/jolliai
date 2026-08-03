@@ -109,19 +109,28 @@ object JolliMemoryIcons {
     private val sourceCursor: Icon = IconLoader.getIcon("/icons/source-cursor.svg", JolliMemoryIcons::class.java)
     private val sourceOpenCode: Icon = IconLoader.getIcon("/icons/source-opencode.svg", JolliMemoryIcons::class.java)
     private val sourceCopilot: Icon = IconLoader.getIcon("/icons/source-copilot.svg", JolliMemoryIcons::class.java)
+    private val sourceCline: Icon = IconLoader.getIcon("/icons/source-cline.svg", JolliMemoryIcons::class.java)
+    private val sourceDevin: Icon = IconLoader.getIcon("/icons/source-devin.svg", JolliMemoryIcons::class.java)
+    private val sourceAntigravity: Icon = IconLoader.getIcon("/icons/source-antigravity.svg", JolliMemoryIcons::class.java)
 
     /**
-     * Logo for an AI source by its transcript-source name (claude / codex / gemini
-     * / cursor / opencode / copilot / copilot-chat). Returns null for unknown
-     * names so callers can fall back to a generic badge.
+     * Logo for an AI source by its transcript-source name. Returns null for
+     * unknown names so callers can fall back to a color-coded text badge.
+     * Grouped variants:
+     *   cursor / cursor-cli → source-cursor.svg (cursor-cli falls back to the IDE brand)
+     *   copilot / copilot-chat → source-copilot.svg
+     *   cline / cline-cli → source-cline.svg
      */
     fun sourceLogo(name: String): Icon? = when (name) {
         "claude" -> sourceClaude
         "codex" -> sourceCodex
         "gemini" -> sourceGemini
-        "cursor" -> sourceCursor
+        "cursor", "cursor-cli" -> sourceCursor
         "opencode" -> sourceOpenCode
         "copilot", "copilot-chat" -> sourceCopilot
+        "cline", "cline-cli" -> sourceCline
+        "devin" -> sourceDevin
+        "antigravity" -> sourceAntigravity
         else -> null
     }
 }

@@ -35,6 +35,7 @@ import {
 	type SourceId,
 	type SquashPendingState,
 	type TranscriptCursor,
+	type TranscriptSource,
 } from "../Types.js";
 import { atomicWriteFile as atomicWrite } from "./AtomicWrite.js";
 import { withConfigLock, withPlansLock, withSessionsLock } from "./Locks.js";
@@ -164,39 +165,68 @@ export async function loadMostRecentSession(cwd?: string): Promise<SessionInfo |
 }
 
 /**
- * Filters sessions to only include those from enabled integrations.
- * Sessions without a source are treated as Claude sessions (backward compatibility).
+ * Source-to-config-flag decision shared by every layer that has to honor the
+ * AI Agents toggles:
+ *   - CLI [`ActiveSessionAggregator`] — primary source of truth, gates on-disk scans.
+ *     (Re-exports this function so historical importers keep working.)
+ *   - CLI [`filterSessionsByEnabledIntegrations`] — post-hoc filter over already-loaded
+ *     `sessions.json` rows (used by `getStatus` in `install/Installer.ts`).
+ *   - VS Code `ActiveSessionsProvider` — belt-and-suspenders post-filter.
+ *   - IntelliJ Kotlin `ActiveSessionAggregator` — same, via a hand-mirror.
+ *
+ * `xxxEnabled === false` is off; every other value (including `undefined`) is
+ * on, matching the QueueWorker convention. Grouping:
+ *   cursor / cursor-cli → cursorEnabled
+ *   copilot / copilot-chat → copilotEnabled
+ *   cline / cline-cli → clineEnabled
+ * A source not listed here defaults to enabled (fail-open) so a future source
+ * never disappears just because the switch statement isn't updated yet.
+ *
+ * Legacy sessions predating the `source` field (undefined) ride claudeEnabled —
+ * matches the historical StopHook-only behaviour.
+ */
+export function isSourceEnabled(source: TranscriptSource | undefined, config: JolliMemoryConfig): boolean {
+	const s = source ?? "claude";
+	switch (s) {
+		case "claude":
+			return config.claudeEnabled !== false;
+		case "codex":
+			return config.codexEnabled !== false;
+		case "gemini":
+			return config.geminiEnabled !== false;
+		case "opencode":
+			return config.openCodeEnabled !== false;
+		case "cursor":
+		case "cursor-cli":
+			return config.cursorEnabled !== false;
+		case "copilot":
+		case "copilot-chat":
+			return config.copilotEnabled !== false;
+		case "cline":
+		case "cline-cli":
+			return config.clineEnabled !== false;
+		case "devin":
+			return config.devinEnabled !== false;
+		case "antigravity":
+			return config.antigravityEnabled !== false;
+		default:
+			return true;
+	}
+}
+
+/**
+ * Filters sessions to only include those from enabled integrations. Sessions
+ * without a source are treated as Claude sessions (backward compatibility) —
+ * see [isSourceEnabled] for the shared mapping. Prior to that consolidation
+ * this function carried its own per-flag switch that had silently drifted
+ * (codex was missing), so the single-source rule matters: every AI-agent
+ * toggle now flows through one function.
  */
 export function filterSessionsByEnabledIntegrations(
 	sessions: ReadonlyArray<SessionInfo>,
 	config: JolliMemoryConfig,
 ): ReadonlyArray<SessionInfo> {
-	let filtered = [...sessions];
-	if (config.claudeEnabled === false) {
-		filtered = filtered.filter((s) => s.source !== undefined && s.source !== "claude");
-	}
-	if (config.geminiEnabled === false) {
-		filtered = filtered.filter((s) => s.source !== "gemini");
-	}
-	if (config.openCodeEnabled === false) {
-		filtered = filtered.filter((s) => s.source !== "opencode");
-	}
-	if (config.cursorEnabled === false) {
-		filtered = filtered.filter((s) => s.source !== "cursor" && s.source !== "cursor-cli");
-	}
-	if (config.copilotEnabled === false) {
-		filtered = filtered.filter((s) => s.source !== "copilot" && s.source !== "copilot-chat");
-	}
-	if (config.clineEnabled === false) {
-		filtered = filtered.filter((s) => s.source !== "cline" && s.source !== "cline-cli");
-	}
-	if (config.devinEnabled === false) {
-		filtered = filtered.filter((s) => s.source !== "devin");
-	}
-	if (config.antigravityEnabled === false) {
-		filtered = filtered.filter((s) => s.source !== "antigravity");
-	}
-	return filtered;
+	return sessions.filter((s) => isSourceEnabled(s.source, config));
 }
 
 /**

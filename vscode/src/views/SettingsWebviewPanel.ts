@@ -838,7 +838,24 @@ export class SettingsWebviewPanel {
 		};
 
 		const repoRoot = await getProjectRootDir(this.workspaceRoot);
-		await this.syncHooks(repoRoot, settings);
+		// Gate the per-worktree hook sync on an actual per-agent toggle
+		// transition. Rerunning on unrelated saves (excludePatterns,
+		// localFolder, model, …) would post the "Jolli Memory is paused —
+		// [Re-enable]" balloon every Apply in a manually-disabled repo,
+		// indistinguishable from a save failure and lobbying the user to undo
+		// the opt-out they set. Same transition-gated pattern as the global-
+		// instructions branch below; hook-drift healing on unrelated saves is
+		// already covered by the startup self-heal in `AutoInstaller`.
+		//
+		// Defaults match `isSourceEnabled`: undefined → enabled, so a fresh
+		// install whose user re-saves without touching the toggles is a no-op.
+		const wasClaudeEnabled = currentConfig.claudeEnabled !== false;
+		const wasGeminiEnabled = currentConfig.geminiEnabled !== false;
+		const hookToggleChanged =
+			settings.claudeEnabled !== wasClaudeEnabled || settings.geminiEnabled !== wasGeminiEnabled;
+		if (hookToggleChanged) {
+			await this.syncHooks(repoRoot, settings);
+		}
 
 		await saveConfigScoped(update, configDir);
 
@@ -900,7 +917,17 @@ export class SettingsWebviewPanel {
 		// global settings then must not reinstall per-project agent hooks —
 		// that would silently override the opt-out. Removals are equally
 		// unnecessary: disable already uninstalled the hooks.
-		if (isManuallyDisabled()) return;
+		//
+		// Prior behaviour was to return silently, so a user who flipped
+		// claudeEnabled/geminiEnabled and hit Apply saw their toggles saved
+		// but no hook change on disk — indistinguishable from the "worked"
+		// case. Surface it with an information notification carrying a
+		// direct action to re-enable, so the state is visible from the same
+		// dialog they just left.
+		if (isManuallyDisabled()) {
+			void this.notifyManuallyDisabled();
+			return;
+		}
 		let worktrees: ReadonlyArray<string>;
 		try {
 			worktrees = await listWorktrees(repoRoot);
@@ -943,6 +970,27 @@ export class SettingsWebviewPanel {
 			throw new Error(
 				`Hook sync failed for ${failures.length} worktree operation(s): ${summary}`,
 			);
+		}
+	}
+
+	/**
+	 * Non-blocking information notification that the just-saved
+	 * claudeEnabled / geminiEnabled toggles reached config.json but the
+	 * on-disk Claude Stop / Gemini AfterAgent hooks were not written,
+	 * because the repo carries the machine-owned manual-disable flag.
+	 * The action button routes to the standard `jollimemory.enableJolliMemory`
+	 * command — the same one the disabled-state sidebar banner uses — so
+	 * the user can lift the opt-out from the same dialog they just left,
+	 * without hunting for a re-enable entry point.
+	 */
+	private async notifyManuallyDisabled(): Promise<void> {
+		const REENABLE = "Re-enable Jolli Memory";
+		const choice = await vscode.window.showInformationMessage(
+			"Jolli Memory is paused for this repo — your Claude/Gemini toggles were saved, but the Stop/AfterAgent hooks won't install until you re-enable.",
+			REENABLE,
+		);
+		if (choice === REENABLE) {
+			await vscode.commands.executeCommand("jollimemory.enableJolliMemory");
 		}
 	}
 

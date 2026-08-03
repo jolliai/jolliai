@@ -40,6 +40,7 @@ import java.nio.file.Path
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.concurrent.withLock
 import javax.swing.Timer
 
 /**
@@ -330,6 +331,25 @@ class JolliMemoryService(private val project: Project) : Disposable {
         private set
 
     /**
+     * Serializes every Memory Bank migration run (startup auto-migrate,
+     * Settings-save catch-up, the "Migrate to Memory Bank" rebuild, Reset
+     * migration). VS Code parity: its `kbInitChain` exists for the same
+     * reason — the migration steps do unlocked read-modify-write on
+     * manifest.json / migration.json / index.json, so two concurrent runs
+     * would race.
+     */
+    private val migrationLock = java.util.concurrent.locks.ReentrantLock()
+
+    /**
+     * Released when this session's startup migration attempt settles (success,
+     * failure, or never dispatched — [initialize] counts it down on every
+     * early-return path too). The first sync round waits on it, bounded, so
+     * sync never classifies/pushes half-written migration output. Mirrors VS
+     * Code's `kbInitPromise` gate plus its 60s watchdog.
+     */
+    val migrationGate = java.util.concurrent.CountDownLatch(1)
+
+    /**
      * Resets initialization state so [initialize] can run again.
      * Called when `.git` reappears after being removed (e.g., user ran `git init`
      * after previously deleting the repo).
@@ -337,6 +357,78 @@ class JolliMemoryService(private val project: Project) : Disposable {
     fun resetForReinitialization() {
         gitRemoved = false
         isInitialized = false
+    }
+
+    /**
+     * Runs [action] under the migration serialization lock. Exposed so the
+     * "Migrate to Memory Bank" rebuild and Reset migration — which do more
+     * than just the CLI call (archive pile, migration-state reset) — still
+     * serialize against background migrations.
+     */
+    fun <T> withMigrationLock(action: () -> T): T = migrationLock.withLock(action)
+
+    /**
+     * Fire-and-forget orphan-branch → Memory Bank folder migration on a
+     * pooled thread — parity with VS Code's silent `initializeKB()` run:
+     * no progress UI, and the caller (startup, Settings save) is never
+     * blocked even when a full first-install migration takes minutes.
+     * Concurrent kicks serialize through [migrationLock].
+     *
+     * [onSettled] fires on the pooled thread AFTER the CLI call settles —
+     * whether it succeeded or threw. On success the callback receives the
+     * [CliIntegrations.MigrationBridgeResult]; on failure it receives
+     * `null` so callers can still run their post-migration refresh (VS
+     * Code parity: even a failed migration needs [refreshFolderReader] to
+     * pick up whatever the folder holds from a prior settled run, or the
+     * next session-wide read keeps forking `git show` needlessly). Pass
+     * `null` for [onSettled] when you only need the fire-and-forget side
+     * effect. A thrown error inside the callback only logs — like VS
+     * Code, the next startup / Settings save retries the migration
+     * itself. [migrationGate] counts down either way so the sync first-
+     * round wait can never hang.
+     */
+    fun migrateMemoryBankAsync(onSettled: ((CliIntegrations.MigrationBridgeResult?) -> Unit)? = null) {
+        val root = mainRepoRoot ?: project.basePath
+        if (root.isNullOrBlank()) {
+            migrationGate.countDown()
+            return
+        }
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            var result: CliIntegrations.MigrationBridgeResult? = null
+            try {
+                result = migrationLock.withLock {
+                    CliIntegrations.migrateMemoryBank(root).also {
+                        log.info("Memory Bank migration: ${it.status} (${it.migratedEntries}/${it.totalEntries})")
+                    }
+                }
+            } catch (e: Exception) {
+                log.warn("Memory Bank migration failed (silent; retried on next startup/Settings save): ${e.message}")
+            } finally {
+                try {
+                    onSettled?.invoke(result)
+                } catch (e: Exception) {
+                    log.warn("Post-migration callback failed (non-fatal): ${e.message}")
+                }
+                migrationGate.countDown()
+            }
+        }
+    }
+
+    /**
+     * Thread-safe append to [initLog] from off-[initialize] callers (namely
+     * the async migration completion). [initialize] builds [initLog] in a
+     * local [StringBuilder] then flips it in one assignment; if an async
+     * append lands BEFORE that assignment, the assignment wins and the
+     * appended line is lost. That race is only a diagnostic-log gap — the
+     * settled migration status is also written to `log.info` above — and
+     * the alternative (blocking the async thread on an initialize-done
+     * latch) risks hangs for a benefit no user ever sees.
+     */
+    @Synchronized
+    private fun appendInitLog(line: String) {
+        if (line.isEmpty()) return
+        val prefix = if (initLog.isEmpty() || initLog.endsWith("\n")) "" else "\n"
+        initLog = initLog + prefix + line + "\n"
     }
 
     /**
@@ -351,7 +443,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
      * THREADING: does file I/O (SessionTracker.loadConfig, KBPathResolver.resolve,
      * FolderStorageReader.forRoot → File.isDirectory). Must NOT be called on the
      * EDT. Current callers: SettingsDialog's Task.Backgroundable, initialize() on
-     * a pool thread.
+     * a pool thread, and the async migration completion callback (pooled).
      */
     fun refreshFolderReader() {
         val root = mainRepoRoot ?: project.basePath ?: return
@@ -379,6 +471,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
         if (basePath == null) {
             lastError = "Project has no base path"
             initLog = sb.toString()
+            migrationGate.countDown()
             return
         }
 
@@ -394,216 +487,239 @@ class JolliMemoryService(private val project: Project) : Disposable {
             sb.appendLine("BLOCKED: no usable Node.js runtime found")
             initLog = sb.toString()
             log.warn("Initialize blocked: no usable Node.js runtime")
+            migrationGate.countDown()
             return
         }
         nodeMissing = false
 
-        // Check .git entry
-        val gitEntry = java.io.File(basePath, ".git")
-        sb.appendLine(".git exists=${gitEntry.exists()}, isFile=${gitEntry.isFile}, isDir=${gitEntry.isDirectory}")
-        if (gitEntry.isFile) {
-            sb.appendLine(".git content=${gitEntry.readText().trim()}")
-        }
-
-        val gitOps = GitOps(basePath)
-        val resolvedRoot = gitOps.resolveWorktreeRoot() ?: basePath
-        mainRepoRoot = resolvedRoot
-        JmLogger.setLogDir(resolvedRoot)
-        sb.appendLine("resolvedRoot=$resolvedRoot")
-
-        // Check key files in resolved root
-        val claudeFile = java.io.File(resolvedRoot, ".claude/settings.local.json")
-        sb.appendLine("claudeSettings=${claudeFile.absolutePath} exists=${claudeFile.exists()}")
-        val sessionsFile = java.io.File(resolvedRoot, ".jolli/jollimemory/sessions.json")
-        sb.appendLine("sessions=${sessionsFile.absolutePath} exists=${sessionsFile.exists()}")
-        val configFile = java.io.File(resolvedRoot, ".jolli/jollimemory/config.json")
-        sb.appendLine("config=${configFile.absolutePath} exists=${configFile.exists()}")
-
-        git = gitOps
-        installer = HookInstaller(basePath, resolvedRoot)
-        // SummaryReader.getStatus forwards its dir to `jolli ide-bridge status`,
-        // which the CLI treats as worktree-local (reads Claude/Gemini hook
-        // configs, sessions.json, source detectors from that exact directory).
-        // Pass the CURRENT worktree (basePath) so linked worktrees report their
-        // own hook state — passing resolvedRoot here made every linked checkout
-        // read the main worktree's hooks and skip startup self-heal.
-        reader = SummaryReader(basePath, gitOps)
-
-        sb.appendLine("installerDebug=${installer!!.getDebugInfo()}")
-
+        // migrationGate contract: it MUST count down exactly once per initialize
+        // call so JolliMemoryStartupActivity's bounded first-round sync wait
+        // (60 s ceiling) can't hang. The two early returns above already fire
+        // it; from here down, the async migrateMemoryBankAsync counts it down
+        // when dispatched, so this finally only needs to catch paths that
+        // throw BEFORE the dispatch — resolveWorktreeRoot(),
+        // installer!!.getDebugInfo(), or anything in between. A redundant
+        // countDown() on a latch already at zero is a no-op, so the guard is a
+        // simple "did we dispatch?" flag.
+        var migrationDispatched = false
         try {
-            refreshStatus()
-            sb.appendLine("status=${cachedStatus}")
-        } catch (e: Exception) {
-            sb.appendLine("refreshStatus error: ${e.message}")
-            lastError = "Status check failed: ${e.message}"
-        }
+            // Check .git entry
+            val gitEntry = java.io.File(basePath, ".git")
+            sb.appendLine(".git exists=${gitEntry.exists()}, isFile=${gitEntry.isFile}, isDir=${gitEntry.isDirectory}")
+            if (gitEntry.isFile) {
+                sb.appendLine(".git content=${gitEntry.readText().trim()}")
+            }
 
-        // Skills are owned by the bundled CLI: written by the full `enable` on first
-        // install (auto-install below) and refreshed by the version-gated
-        // `enable --integrations-only` catch-up — no Kotlin-side skill writer remains.
+            val gitOps = GitOps(basePath)
+            val resolvedRoot = gitOps.resolveWorktreeRoot() ?: basePath
+            mainRepoRoot = resolvedRoot
+            JmLogger.setLogDir(resolvedRoot)
+            sb.appendLine("resolvedRoot=$resolvedRoot")
 
-        // Auto-initialize KB folder with repo identity + auto-migrate
-        try {
-            val repoName = KBPathResolver.extractRepoName(resolvedRoot)
-            val remoteUrl = KBPathResolver.getRemoteUrl(resolvedRoot)
-            val config = SessionTracker.loadConfig()
-            val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.localFolder)
-            KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
-            sb.appendLine("KB folder initialized: $kbRoot")
+            // Check key files in resolved root
+            val claudeFile = java.io.File(resolvedRoot, ".claude/settings.local.json")
+            sb.appendLine("claudeSettings=${claudeFile.absolutePath} exists=${claudeFile.exists()}")
+            val sessionsFile = java.io.File(resolvedRoot, ".jolli/jollimemory/sessions.json")
+            sb.appendLine("sessions=${sessionsFile.absolutePath} exists=${sessionsFile.exists()}")
+            val configFile = java.io.File(resolvedRoot, ".jolli/jollimemory/config.json")
+            sb.appendLine("config=${configFile.absolutePath} exists=${configFile.exists()}")
 
-            // Auto-migrate orphan-branch data into the Memory Bank folder via the
-            // bundled CLI (CliIntegrations.migrateMemoryBank → `jolli migrate-memory-bank`).
-            // The CLI decides whether an orphan branch exists and whether migration
-            // already completed (full migration vs idempotent stale-child reconcile),
-            // matching the VS Code activate path. The Kotlin MigrationEngine is gone.
-            val migration = CliIntegrations.migrateMemoryBank(resolvedRoot)
-            sb.appendLine("Auto-migration: ${migration.status} (${migration.migratedEntries}/${migration.totalEntries})")
+            git = gitOps
+            installer = HookInstaller(basePath, resolvedRoot)
+            // SummaryReader.getStatus forwards its dir to `jolli ide-bridge status`,
+            // which the CLI treats as worktree-local (reads Claude/Gemini hook
+            // configs, sessions.json, source detectors from that exact directory).
+            // Pass the CURRENT worktree (basePath) so linked worktrees report their
+            // own hook state — passing resolvedRoot here made every linked checkout
+            // read the main worktree's hooks and skip startup self-heal.
+            reader = SummaryReader(basePath, gitOps)
 
-            // Attach a direct filesystem reader for the hidden `.jolli/` layer
-            // so summary / plan / note reads bypass ide-bridge + `git show`.
-            // Null-safe: reader stays null when the folder isn't populated
-            // yet, everything falls back to the orphan-branch path unchanged.
-            //
-            // MUST run AFTER migrateMemoryBank: on a fresh install the folder
-            // exists but its .jolli/summaries/ is empty until migration copies
-            // the orphan-branch data across. Attaching before migration would
-            // make [FolderStorageReader.forRoot] return null (isReady() gates
-            // on the summaries dir existing), and the reader would stay null
-            // for the whole session — the reads that most benefit from the
-            // page-cache-fast path would keep forking `git show`.
-            //
-            // storageMode gate: if the repo is on `storageMode = "orphan"`
-            // (writes only to the orphan branch), the folder may still exist
-            // from a prior dual-write session but would serve stale JSON on
-            // amend/squash. forRoot returns null for that mode.
-            val folderReader = ai.jolli.jollimemory.bridge.FolderStorageReader.forRoot(kbRoot.toString(), config.storageMode)
-            reader?.attachFolder(folderReader)
-            sb.appendLine("Folder reader: ${if (folderReader != null) "attached" else "unavailable"}")
-        } catch (e: Exception) {
-            sb.appendLine("KB folder init/migration failed: ${e.message}")
-        }
+            sb.appendLine("installerDebug=${installer!!.getDebugInfo()}")
 
-        // Auto-install hooks if configured and not paused (eliminates the separate "Enable" step)
-        val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
-        val hasCredentials = hasSummaryCredentials(config)
-        val isPaused = config.paused == true
-        // `enabled` from the CLI is `gitHookInstalled` alone — deliberately so a
-        // dropped Claude/Gemini integration doesn't kill the whole extension. But
-        // that means `enabled == true` no longer implies "every desired hook is
-        // wired in THIS worktree". Git hooks are shared through .git/hooks so any
-        // worktree's install() satisfies them repo-wide; the Claude Stop hook,
-        // however, lives in `<worktree>/.claude/settings.local.json` and MUST be
-        // present per worktree. If the user has Claude Code and hasn't disabled
-        // it, but the current worktree is missing the Stop hook, run the full
-        // install() so the linked checkout is repaired. install() is idempotent
-        // on hooks already in place.
-        // `claudeEnabled` is the user's opt-in from JolliMemoryConfig (the config
-        // loaded a few lines above), NOT a StatusInfo field — the CLI's StatusInfo
-        // deliberately omits it because Claude is "always desired unless disabled"
-        // and only surfaces `claudeDetected` + `claudeHookInstalled`. Treat null
-        // (unset) as "user hasn't disabled Claude", matching the rest of the plugin.
-        val claudeHookMissing = cachedStatus?.claudeDetected == true &&
-            config.claudeEnabled != false &&
-            cachedStatus?.claudeHookInstalled != true
-        val needsInstall = cachedStatus?.enabled != true || claudeHookMissing
-        if (hasCredentials && !isPaused && needsInstall) {
-            val reason = if (cachedStatus?.enabled != true) "not yet enabled" else "claude hook missing in this worktree"
-            sb.appendLine("Auto-installing hooks (configured + not paused + $reason)")
-            install()
-            refreshStatus()
-            sb.appendLine("status after auto-install=${cachedStatus}")
-        } else if (hasCredentials && !isPaused) {
-            // Plugin-upgrade catch-up: hooks are already installed (so the block above is
-            // skipped), but the node integrations (MCP + skills + bundled Cli.js) may be
-            // absent or built for an older plugin version. Refresh them off the EDT so a
-            // plugin update activates MCP/skills without a manual re-enable. Version-gated,
-            // so this is a no-op once current.
-            com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
-                try {
-                    val issue = installer?.ensureIntegrations()
-                    if (issue != null) {
-                        refreshStatus() // so the StatusPanel row reflects the new integration state
-                        notifyIntegrationsIssue(issue)
+            try {
+                refreshStatus()
+                sb.appendLine("status=${cachedStatus}")
+            } catch (e: Exception) {
+                sb.appendLine("refreshStatus error: ${e.message}")
+                lastError = "Status check failed: ${e.message}"
+            }
+
+            // Skills are owned by the bundled CLI: written by the full `enable` on first
+            // install (auto-install below) and refreshed by the version-gated
+            // `enable --integrations-only` catch-up — no Kotlin-side skill writer remains.
+
+            // Auto-initialize KB folder with repo identity + auto-migrate
+            try {
+                val repoName = KBPathResolver.extractRepoName(resolvedRoot)
+                val remoteUrl = KBPathResolver.getRemoteUrl(resolvedRoot)
+                val config = SessionTracker.loadConfig()
+                val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.localFolder)
+                KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
+                sb.appendLine("KB folder initialized: $kbRoot")
+
+                // Auto-migrate orphan-branch data into the Memory Bank folder via the
+                // bundled CLI (CliIntegrations.migrateMemoryBank → ide-bridge
+                // `migrate-memory-bank` action, daemon fast path with spawn fallback).
+                // The CLI decides whether an orphan branch exists and whether migration
+                // already completed (full migration vs idempotent stale-child reconcile),
+                // matching the VS Code activate path. The Kotlin MigrationEngine is gone.
+                //
+                // Fire-and-forget on a pooled thread — parity with VS Code's silent
+                // `initializeKB()` run: no progress UI, and a full first-install
+                // migration (minutes on large repos) no longer blocks everything after
+                // this point in initialize() — hooks, status, isInitialized — nor the
+                // tool-window / onboarding callers that invoke initialize() directly.
+                // Reads until the folder is populated fall back to the orphan branch
+                // (the pre-0.99 path), unchanged.
+                //
+                // The folder reader attach moves into the completion callback
+                // ([refreshFolderReader]), keeping the old ordering contract: on a
+                // fresh install the folder exists but .jolli/summaries/ is empty until
+                // migration copies the orphan-branch data across, and attaching early
+                // makes [FolderStorageReader.forRoot] return null (isReady() gates on
+                // the summaries dir) — the reader would stay null for the whole
+                // session and the page-cache-fast reads would keep forking `git show`.
+                migrateMemoryBankAsync { result ->
+                    // Refresh runs on both success and failure paths — even a
+                    // failed migration can leave a partially-populated folder
+                    // (a prior settled run + interrupted retry), and without
+                    // the re-attach every read in this session keeps forking
+                    // `git show`. The callback receives null when the bridge
+                    // call itself threw.
+                    refreshFolderReader()
+                    refreshStatus()
+                    val summary = result?.let { "${it.status} (${it.migratedEntries}/${it.totalEntries})" } ?: "failed"
+                    appendInitLog("Auto-migration settled: $summary")
+                }
+                migrationDispatched = true
+                sb.appendLine("Auto-migration: dispatched (async, silent)")
+            } catch (e: Exception) {
+                sb.appendLine("KB folder init/migration failed: ${e.message}")
+            }
+
+            // Auto-install hooks if configured and not paused (eliminates the separate "Enable" step)
+            val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
+            val hasCredentials = hasSummaryCredentials(config)
+            val isPaused = config.paused == true
+            // `enabled` from the CLI is `gitHookInstalled` alone — deliberately so a
+            // dropped Claude/Gemini integration doesn't kill the whole extension. But
+            // that means `enabled == true` no longer implies "every desired hook is
+            // wired in THIS worktree". Git hooks are shared through .git/hooks so any
+            // worktree's install() satisfies them repo-wide; the Claude Stop hook,
+            // however, lives in `<worktree>/.claude/settings.local.json` and MUST be
+            // present per worktree. If the user has Claude Code and hasn't disabled
+            // it, but the current worktree is missing the Stop hook, run the full
+            // install() so the linked checkout is repaired. install() is idempotent
+            // on hooks already in place.
+            // `claudeEnabled` is the user's opt-in from JolliMemoryConfig (the config
+            // loaded a few lines above), NOT a StatusInfo field — the CLI's StatusInfo
+            // deliberately omits it because Claude is "always desired unless disabled"
+            // and only surfaces `claudeDetected` + `claudeHookInstalled`. Treat null
+            // (unset) as "user hasn't disabled Claude", matching the rest of the plugin.
+            val claudeHookMissing = cachedStatus?.claudeDetected == true &&
+                config.claudeEnabled != false &&
+                cachedStatus?.claudeHookInstalled != true
+            val needsInstall = cachedStatus?.enabled != true || claudeHookMissing
+            if (hasCredentials && !isPaused && needsInstall) {
+                val reason = if (cachedStatus?.enabled != true) "not yet enabled" else "claude hook missing in this worktree"
+                sb.appendLine("Auto-installing hooks (configured + not paused + $reason)")
+                install()
+                refreshStatus()
+                sb.appendLine("status after auto-install=${cachedStatus}")
+            } else if (hasCredentials && !isPaused) {
+                // Plugin-upgrade catch-up: hooks are already installed (so the block above is
+                // skipped), but the node integrations (MCP + skills + bundled Cli.js) may be
+                // absent or built for an older plugin version. Refresh them off the EDT so a
+                // plugin update activates MCP/skills without a manual re-enable. Version-gated,
+                // so this is a no-op once current.
+                com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+                    try {
+                        val issue = installer?.ensureIntegrations()
+                        if (issue != null) {
+                            refreshStatus() // so the StatusPanel row reflects the new integration state
+                            notifyIntegrationsIssue(issue)
+                        }
+                    } catch (e: Exception) {
+                        log.warn("Integrations catch-up failed (non-fatal): ${e.message}")
                     }
-                } catch (e: Exception) {
-                    log.warn("Integrations catch-up failed (non-fatal): ${e.message}")
                 }
             }
-        }
 
-        // Pre-push sync catch-up (JOLLI-1900): retry any commits left in
-        // push-pending.json from a previous session — an offline push, or a push
-        // that raced ahead of summary generation. Off the EDT; fully guarded and
-        // fire-and-forget (no-ops when nothing is pending, Node is absent, or the
-        // user isn't signed in). Mirrors VS Code's Extension.activate retry.
-        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
-            CliIntegrations.retryPendingPushes(basePath)
-        }
-
-        // Warm the CLI daemon's hot read paths on a pooled thread so the first memory
-        // click hits warm code instead of paying the cold-call penalty — the first few
-        // daemon calls after spawn cost 100-700ms (Node JIT + cold git/fs caches) vs
-        // 1-30ms warm, and opening a memory tab puts exactly these reads on the EDT.
-        // Covers the three operations a tab open performs: index, transcript-hashes
-        // and get. Fire-and-forget: every call is a read-only, idempotent round trip,
-        // so a failure only means the first click warms the path itself (old behavior).
-        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
-            try {
-                val t = System.currentTimeMillis()
-                val store = ai.jolli.jollimemory.core.SummaryStore(resolvedRoot, gitOps, StorageFactory.create(gitOps, resolvedRoot))
-                val index = store.loadIndex()
-                store.getTranscriptHashes()
-                index?.entries?.firstOrNull()?.commitHash?.let { store.getSummary(it) }
-                log.info("CLI daemon warm-up done in ${System.currentTimeMillis() - t}ms (indexEntries=${index?.entries?.size ?: 0})")
-            } catch (e: Exception) {
-                log.warn("CLI daemon warm-up failed (non-fatal): ${e.message}")
+            // Pre-push sync catch-up (JOLLI-1900): retry any commits left in
+            // push-pending.json from a previous session — an offline push, or a push
+            // that raced ahead of summary generation. Off the EDT; fully guarded and
+            // fire-and-forget (no-ops when nothing is pending, Node is absent, or the
+            // user isn't signed in). Mirrors VS Code's Extension.activate retry.
+            com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+                CliIntegrations.retryPendingPushes(basePath)
             }
+
+            // Warm the CLI daemon's hot read paths on a pooled thread so the first memory
+            // click hits warm code instead of paying the cold-call penalty — the first few
+            // daemon calls after spawn cost 100-700ms (Node JIT + cold git/fs caches) vs
+            // 1-30ms warm, and opening a memory tab puts exactly these reads on the EDT.
+            // Covers the three operations a tab open performs: index, transcript-hashes
+            // and get. Fire-and-forget: every call is a read-only, idempotent round trip,
+            // so a failure only means the first click warms the path itself (old behavior).
+            com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+                try {
+                    val t = System.currentTimeMillis()
+                    val store = ai.jolli.jollimemory.core.SummaryStore(resolvedRoot, gitOps, StorageFactory.create(gitOps, resolvedRoot))
+                    val index = store.loadIndex()
+                    store.getTranscriptHashes()
+                    index?.entries?.firstOrNull()?.commitHash?.let { store.getSummary(it) }
+                    log.info("CLI daemon warm-up done in ${System.currentTimeMillis() - t}ms (indexEntries=${index?.entries?.size ?: 0})")
+                } catch (e: Exception) {
+                    log.warn("CLI daemon warm-up failed (non-fatal): ${e.message}")
+                }
+            }
+
+            warmJcefRenderPath()
+
+            isInitialized = true
+            initLog = sb.toString()
+            log.info("Initialize complete:\n$initLog")
+
+            // Subscribe to Git repository changes (new commits, branch switches, etc.)
+            // This mirrors VS Code's .git/HEAD file watcher for auto-refresh.
+            val connection = project.messageBus.connect(this)
+            connection.subscribe(
+                GitRepository.GIT_REPO_CHANGE,
+                GitRepositoryChangeListener { refreshStatus() },
+            )
+
+            // ── Orphan branch ref + lock file watcher (IntelliJ VFS) ──────────
+            // The post-commit hook worker runs in the background and writes summaries
+            // to the orphan branch via `git update-ref`. IntelliJ's GIT_REPO_CHANGE
+            // does NOT fire for orphan branch ref updates (only working-tree changes),
+            // so we must arrange our own notification path.
+            //
+            // We route through IntelliJ's own VFS: LocalFileSystem.addRootsToWatch
+            // hands the paths to fsnotifier (JetBrains's native FS helper), which
+            // bridges platform-native events (FSEvents on macOS, inotify on Linux,
+            // ReadDirectoryChangesW on Windows). This matches VS Code's underlying
+            // FileSystemWatcher quality and replaces the previous Java NIO
+            // WatchService, which on macOS silently degrades to a 10s polling
+            // watcher that regularly misses git's brief atomic-rename events.
+            //
+            // .git/ subdirs are not part of the project index by default, so we
+            // also call refreshAndFindFileByPath to seed the VFS with the paths
+            // before subscribing to VFS_CHANGES.
+            //
+            // Watched:
+            //   .git/refs/heads/jollimemory/summaries/ (orphan ref parent dir)
+            //   .jolli/jollimemory/ (lock file dir — worker completion fallback)
+            startVfsFileWatchers(resolvedRoot)
+
+            // Write debug log to a temp file for easy access
+            try {
+                val logFile = java.io.File(System.getProperty("user.home") + "/.jolli/logs", "jollimemory-intellij-debug.log").also { it.parentFile.mkdirs() }
+                logFile.writeText("=== JolliMemory IntelliJ Init Log ===\n${java.time.Instant.now()}\n\n$initLog")
+                log.info("Debug log written to: ${logFile.absolutePath}")
+            } catch (_: Exception) { }
+        } finally {
+            if (!migrationDispatched) migrationGate.countDown()
         }
-
-        warmJcefRenderPath()
-
-        isInitialized = true
-        initLog = sb.toString()
-        log.info("Initialize complete:\n$initLog")
-
-        // Subscribe to Git repository changes (new commits, branch switches, etc.)
-        // This mirrors VS Code's .git/HEAD file watcher for auto-refresh.
-        val connection = project.messageBus.connect(this)
-        connection.subscribe(
-            GitRepository.GIT_REPO_CHANGE,
-            GitRepositoryChangeListener { refreshStatus() },
-        )
-
-        // ── Orphan branch ref + lock file watcher (IntelliJ VFS) ──────────
-        // The post-commit hook worker runs in the background and writes summaries
-        // to the orphan branch via `git update-ref`. IntelliJ's GIT_REPO_CHANGE
-        // does NOT fire for orphan branch ref updates (only working-tree changes),
-        // so we must arrange our own notification path.
-        //
-        // We route through IntelliJ's own VFS: LocalFileSystem.addRootsToWatch
-        // hands the paths to fsnotifier (JetBrains's native FS helper), which
-        // bridges platform-native events (FSEvents on macOS, inotify on Linux,
-        // ReadDirectoryChangesW on Windows). This matches VS Code's underlying
-        // FileSystemWatcher quality and replaces the previous Java NIO
-        // WatchService, which on macOS silently degrades to a 10s polling
-        // watcher that regularly misses git's brief atomic-rename events.
-        //
-        // .git/ subdirs are not part of the project index by default, so we
-        // also call refreshAndFindFileByPath to seed the VFS with the paths
-        // before subscribing to VFS_CHANGES.
-        //
-        // Watched:
-        //   .git/refs/heads/jollimemory/summaries/ (orphan ref parent dir)
-        //   .jolli/jollimemory/ (lock file dir — worker completion fallback)
-        startVfsFileWatchers(resolvedRoot)
-
-        // Write debug log to a temp file for easy access
-        try {
-            val logFile = java.io.File(System.getProperty("user.home") + "/.jolli/logs", "jollimemory-intellij-debug.log").also { it.parentFile.mkdirs() }
-            logFile.writeText("=== JolliMemory IntelliJ Init Log ===\n${java.time.Instant.now()}\n\n$initLog")
-            log.info("Debug log written to: ${logFile.absolutePath}")
-        } catch (_: Exception) { }
     }
 
     /**

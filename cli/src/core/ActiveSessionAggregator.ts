@@ -1,7 +1,10 @@
 /**
- * Aggregates active AI coding sessions across all 8 supported sources,
- * filters by recency window, resolves display titles, and returns a
- * sorted list ready for UI consumption.
+ * Aggregates active AI coding sessions across all supported transcript
+ * sources (see `TRANSCRIPT_SOURCES` in Types.ts — currently twelve:
+ * claude / codex / gemini / opencode / cursor / cursor-cli / copilot /
+ * copilot-chat / cline / cline-cli / devin / antigravity), filters by
+ * recency window, resolves display titles, and returns a sorted list
+ * ready for UI consumption.
  *
  * - Sessions older than `windowMs` (default 48h) are excluded.
  * - Sources fan out concurrently via Promise.allSettled — one failed
@@ -13,12 +16,21 @@
  */
 
 import { createLogger, errMsg } from "../Logger.js";
-import type { SessionInfo, TranscriptEntry, TranscriptSource } from "../Types.js";
+import type { JolliMemoryConfig, SessionInfo, TranscriptEntry, TranscriptSource } from "../Types.js";
 import { conversationKey, readExclusions } from "./CommitSelectionStore.js";
 import { hasOverlayChanges, loadOverlay } from "./ConversationOverlayStore.js";
 import { isStillHidden, loadHiddenConversations } from "./HiddenConversationsStore.js";
 import { resolveSessionTitle } from "./SessionTitleResolver.js";
+import { isSourceEnabled, loadConfig } from "./SessionTracker.js";
 import { loadMergedTranscript, loadUnreadMergedTranscript } from "./TranscriptMessageCounter.js";
+
+// The AI-agent-toggle gate now lives in SessionTracker so the aggregator's
+// per-source loaders and SessionTracker.filterSessionsByEnabledIntegrations
+// (the post-hoc filter for install/status) share one switch statement. Re-
+// exported here so pre-existing importers (VS Code ActiveSessionsProvider,
+// aggregator tests, external plugin surfaces) keep resolving from this
+// module's public API.
+export { isSourceEnabled };
 
 const log = createLogger("ActiveSessionAggregator");
 
@@ -70,8 +82,15 @@ export async function listActiveConversationsWithDiagnostics(
 	const windowMs = opts.windowMs ?? DEFAULT_WINDOW_MS;
 	const cutoff = Date.now() - windowMs;
 
+	// Load config first — every source loader below short-circuits when its
+	// matching xxxEnabled flag is false, so a disabled source never touches
+	// disk. Static import (SessionTracker is already loaded via the
+	// `isSourceEnabled` re-export above); the per-source discoverers below
+	// still lazy-load their own heavier modules (SQLite readers etc.) inside
+	// their `loadXxx` bodies.
+	const config = await loadConfig();
 	const [collected, hidden, exclusions] = await Promise.all([
-		collectFromAllSources(opts.cwd),
+		collectFromAllSources(opts.cwd, config),
 		loadHiddenConversations(opts.cwd),
 		readExclusions(opts.cwd),
 	]);
@@ -207,7 +226,7 @@ interface CollectResult {
 	readonly failedSources: readonly TranscriptSource[];
 }
 
-async function collectFromAllSources(cwd: string): Promise<CollectResult> {
+async function collectFromAllSources(cwd: string, config: JolliMemoryConfig): Promise<CollectResult> {
 	// Each loader catches its own errors and reports them via the `failed`
 	// field on `LoaderResult`. We aggregate both the sessions and the failure
 	// set so callers can render a partial-data hint instead of silently
@@ -215,18 +234,24 @@ async function collectFromAllSources(cwd: string): Promise<CollectResult> {
 	// its discoverer counts as failed even when `sessions` is non-empty —
 	// that's the "partial result" case (some rows came back before the
 	// underlying scan tripped).
+	//
+	// Every loader also inspects `config` and short-circuits to an empty
+	// result when its matching AI Agents toggle is off — no disk read, no
+	// SQLite open, no JSONL walk. `failed` stays empty for disabled sources
+	// so the UI does NOT flag them as "unavailable"; the user turned them
+	// off, not the scan.
 	const batches = await Promise.all([
-		loadClaudeAndGemini(cwd),
-		loadCursor(cwd),
-		loadCodex(cwd),
-		loadOpenCode(cwd),
-		loadCopilot(cwd),
-		loadCopilotChat(cwd),
-		loadCline(cwd),
-		loadClineCli(cwd),
-		loadDevin(cwd),
-		loadCursorCli(cwd),
-		loadAntigravity(cwd),
+		loadClaudeAndGemini(cwd, config),
+		loadCursor(cwd, config),
+		loadCodex(cwd, config),
+		loadOpenCode(cwd, config),
+		loadCopilot(cwd, config),
+		loadCopilotChat(cwd, config),
+		loadCline(cwd, config),
+		loadClineCli(cwd, config),
+		loadDevin(cwd, config),
+		loadCursorCli(cwd, config),
+		loadAntigravity(cwd, config),
 	]);
 	const sessions: SessionInfo[] = [];
 	const failedSources: TranscriptSource[] = [];
@@ -249,21 +274,32 @@ interface LoaderResult {
 	readonly failed: readonly TranscriptSource[];
 }
 
-async function loadClaudeAndGemini(cwd: string): Promise<LoaderResult> {
+async function loadClaudeAndGemini(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
 	// Claude + Gemini both write their session metadata to the per-project
 	// .jolli/jollimemory/sessions.json registry (StopHook / GeminiAfterAgentHook).
 	// SessionTracker.loadAllSessions is the canonical reader — when it
 	// throws, both sources are effectively unavailable, so flag both.
+	//
+	// Two independent toggles share one loader: both off → skip the read;
+	// only one off → read then drop that half. A missing `source` field is
+	// a legacy Claude session (predates the tag) and rides claudeEnabled —
+	// isSourceEnabled(undefined, ...) falls back to "claude" for exactly this.
+	const claudeOn = isSourceEnabled("claude", config);
+	const geminiOn = isSourceEnabled("gemini", config);
+	if (!claudeOn && !geminiOn) return { sessions: [], failed: [] };
 	try {
 		const { loadAllSessions } = await import("./SessionTracker.js");
-		return { sessions: await loadAllSessions(cwd), failed: [] };
+		const all = await loadAllSessions(cwd);
+		const sessions = claudeOn && geminiOn ? all : all.filter((s) => isSourceEnabled(s.source, config));
+		return { sessions, failed: [] };
 	} catch (err) {
 		log.warn("loadAllSessions (claude+gemini) failed: %s", errMsg(err));
 		return { sessions: [], failed: ["claude", "gemini"] };
 	}
 }
 
-async function loadCursor(cwd: string): Promise<LoaderResult> {
+async function loadCursor(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	if (!isSourceEnabled("cursor", config)) return { sessions: [], failed: [] };
 	try {
 		const { scanCursorSessions } = await import("./CursorSessionDiscoverer.js");
 		const r = await scanCursorSessions(cwd);
@@ -278,7 +314,8 @@ async function loadCursor(cwd: string): Promise<LoaderResult> {
 	}
 }
 
-async function loadCodex(cwd: string): Promise<LoaderResult> {
+async function loadCodex(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	if (!isSourceEnabled("codex", config)) return { sessions: [], failed: [] };
 	try {
 		const { discoverCodexSessions } = await import("./CodexSessionDiscoverer.js");
 		return { sessions: await discoverCodexSessions(cwd), failed: [] };
@@ -288,7 +325,8 @@ async function loadCodex(cwd: string): Promise<LoaderResult> {
 	}
 }
 
-async function loadOpenCode(cwd: string): Promise<LoaderResult> {
+async function loadOpenCode(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	if (!isSourceEnabled("opencode", config)) return { sessions: [], failed: [] };
 	try {
 		const { scanOpenCodeSessions } = await import("./OpenCodeSessionDiscoverer.js");
 		const r = await scanOpenCodeSessions(cwd);
@@ -303,7 +341,8 @@ async function loadOpenCode(cwd: string): Promise<LoaderResult> {
 	}
 }
 
-async function loadCopilot(cwd: string): Promise<LoaderResult> {
+async function loadCopilot(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	if (!isSourceEnabled("copilot", config)) return { sessions: [], failed: [] };
 	try {
 		const { scanCopilotSessions } = await import("./CopilotSessionDiscoverer.js");
 		const r = await scanCopilotSessions(cwd);
@@ -318,7 +357,11 @@ async function loadCopilot(cwd: string): Promise<LoaderResult> {
 	}
 }
 
-async function loadCopilotChat(cwd: string): Promise<LoaderResult> {
+async function loadCopilotChat(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	// Copilot Chat currently shares copilotEnabled with the Copilot CLI (one user-facing toggle for
+	// "GitHub Copilot"). Both paths go through `isSourceEnabled`, so a future split that maps
+	// "copilot-chat" to its own flag needs only one edit.
+	if (!isSourceEnabled("copilot-chat", config)) return { sessions: [], failed: [] };
 	try {
 		const { scanCopilotChatSessions } = await import("./CopilotChatSessionDiscoverer.js");
 		const r = await scanCopilotChatSessions(cwd);
@@ -333,7 +376,8 @@ async function loadCopilotChat(cwd: string): Promise<LoaderResult> {
 	}
 }
 
-async function loadCline(cwd: string): Promise<LoaderResult> {
+async function loadCline(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	if (!isSourceEnabled("cline", config)) return { sessions: [], failed: [] };
 	try {
 		const { scanClineSessions } = await import("./ClineSessionDiscoverer.js");
 		const r = await scanClineSessions(cwd);
@@ -348,7 +392,11 @@ async function loadCline(cwd: string): Promise<LoaderResult> {
 	}
 }
 
-async function loadClineCli(cwd: string): Promise<LoaderResult> {
+async function loadClineCli(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	// Cline CLI currently shares clineEnabled with the Cline VS Code extension. Both paths go
+	// through `isSourceEnabled`, so a future split that maps "cline-cli" to its own flag needs
+	// only one edit.
+	if (!isSourceEnabled("cline-cli", config)) return { sessions: [], failed: [] };
 	try {
 		const { scanClineCliSessions } = await import("./ClineCliSessionDiscoverer.js");
 		const r = await scanClineCliSessions(cwd);
@@ -363,7 +411,8 @@ async function loadClineCli(cwd: string): Promise<LoaderResult> {
 	}
 }
 
-async function loadDevin(cwd: string): Promise<LoaderResult> {
+async function loadDevin(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	if (!isSourceEnabled("devin", config)) return { sessions: [], failed: [] };
 	try {
 		const { scanDevinSessions } = await import("./DevinSessionDiscoverer.js");
 		const r = await scanDevinSessions(cwd);
@@ -378,7 +427,11 @@ async function loadDevin(cwd: string): Promise<LoaderResult> {
 	}
 }
 
-async function loadCursorCli(cwd: string): Promise<LoaderResult> {
+async function loadCursorCli(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	// cursor-agent CLI currently shares cursorEnabled with the Cursor IDE Composer source. Both
+	// paths go through `isSourceEnabled`, so a future split that maps "cursor-cli" to its own flag
+	// needs only one edit.
+	if (!isSourceEnabled("cursor-cli", config)) return { sessions: [], failed: [] };
 	try {
 		const { scanCursorCliSessions } = await import("./CursorCliSessionDiscoverer.js");
 		const r = await scanCursorCliSessions(cwd);
@@ -393,7 +446,8 @@ async function loadCursorCli(cwd: string): Promise<LoaderResult> {
 	}
 }
 
-async function loadAntigravity(cwd: string): Promise<LoaderResult> {
+async function loadAntigravity(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	if (!isSourceEnabled("antigravity", config)) return { sessions: [], failed: [] };
 	try {
 		const { scanAntigravitySessions } = await import("./AntigravitySessionDiscoverer.js");
 		const r = await scanAntigravitySessions(cwd);

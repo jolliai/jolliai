@@ -727,7 +727,122 @@ object CliIntegrations {
         else -> message
     }
 
-    /** Result of one `jolli migrate-memory-bank` run — the subset the UI status lines need. */
+    /** One per-worktree/per-integration failure from the [syncAgentHooks] bridge action. */
+    data class HookSyncFailure(
+        val worktree: String,
+        val integration: String,
+        val message: String,
+    )
+
+    /**
+     * Result of one `sync-agent-hooks` bridge call. `manuallyDisabled` mirrors
+     * VS Code's [SettingsWebviewPanel.syncHooks] early-return: the CLI-side
+     * handler refuses to install/remove hooks while [`profile.json`'s
+     * `manuallyDisabled` flag][ai.jolli.jollimemory.core.RepoProfile] is set, so
+     * the Settings dialog stays reachable during a manual disable without
+     * silently reinstating hooks.
+     */
+    data class SyncAgentHooksResult(
+        val manuallyDisabled: Boolean,
+        val worktrees: List<String>,
+        val failures: List<HookSyncFailure>,
+    )
+
+    /**
+     * Installs or removes the Claude Stop and Gemini AfterAgent hooks for every
+     * worktree of the given repo, matching the current per-agent toggles.
+     * Replaces the previous every-Settings-save `jolli enable --integrations-only`
+     * subprocess (500 ms – 2 s cold Node spawn) with a daemon RPC (~5-20 ms) and
+     * — for the first time on IntelliJ — brings **all** worktrees into sync on
+     * one Apply, matching VS Code's [`SettingsWebviewPanel.syncHooks`].
+     *
+     * The CLI-side handler reuses the exact same hook helpers VS Code calls
+     * in-process (`installClaudeHook` / `removeClaudeHook` / `installGeminiHook` /
+     * `removeGeminiHook`, exported from `cli/src/install/Installer.ts`), so the
+     * two surfaces cannot drift on hook wire format. Idempotent — re-running
+     * with the same flags rewrites the same JSON block, so callers can invoke
+     * it on every Apply without gating.
+     *
+     * Business errors propagate as [CliBridgeException] (same shape as every
+     * other bridge action). Per-worktree per-integration failures land in
+     * `failures[]` without aborting the loop, so a single bad worktree does not
+     * stop the rest from syncing.
+     */
+    fun syncAgentHooks(
+        projectDir: String,
+        claudeEnabled: Boolean,
+        geminiEnabled: Boolean,
+    ): SyncAgentHooksResult {
+        val body = com.google.gson.JsonObject().apply {
+            addProperty("claudeEnabled", claudeEnabled)
+            addProperty("geminiEnabled", geminiEnabled)
+        }.toString()
+        val result = parseSyncAgentHooksResponse(runIdeBridge(projectDir, "sync-agent-hooks", body))
+        log.info(
+            "sync-agent-hooks succeeded (manuallyDisabled=%s, worktrees=%d, failures=%d)",
+            result.manuallyDisabled,
+            result.worktrees.size,
+            result.failures.size,
+        )
+        return result
+    }
+
+    /**
+     * Parses the `sync-agent-hooks` action's JSON envelope. Split out for direct
+     * testing — the CLI-side handler carries the reference shape (see
+     * [`runIdeBridgeAction`][ai.jolli.jollimemory.bridge] case `"sync-agent-hooks"`
+     * in `cli/src/commands/IdeBridgeCommand.ts`) and this parser MUST tolerate
+     * every documented one: `manuallyDisabled=true` short-circuit,
+     * empty-worktrees / empty-failures, and a mixed `failures[]` of well-formed
+     * entries with the ordinary `{worktree,integration,message}` shape.
+     *
+     * All three documented fields (`manuallyDisabled`, `worktrees`, `failures`)
+     * are validated fail-loud: missing or wrong-typed → [RuntimeException]. The
+     * CLI-side handler writes every field on every return (see the
+     * `sync-agent-hooks` case in `cli/src/commands/IdeBridgeCommand.ts`), so an
+     * absent field signals wire drift, not a legitimate response, and silent-
+     * defaulting would hide it — a missing `manuallyDisabled` collapsed to
+     * `false` makes the caller SKIP the manual-disable balloon (an
+     * over-suppress the user cannot see); a missing `worktrees` collapsed to
+     * `[]` hides real per-worktree failures behind "everything looks fine".
+     */
+    internal fun parseSyncAgentHooksResponse(result: com.google.gson.JsonElement): SyncAgentHooksResult {
+        val obj = result.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw RuntimeException("sync-agent-hooks returned unreadable response: $result")
+        val manuallyDisabledEl = obj.get("manuallyDisabled")
+            ?: throw RuntimeException(
+                "sync-agent-hooks returned unreadable response: missing 'manuallyDisabled' field: $result",
+            )
+        if (!manuallyDisabledEl.isJsonPrimitive || !manuallyDisabledEl.asJsonPrimitive.isBoolean) {
+            throw RuntimeException(
+                "sync-agent-hooks returned unreadable response: 'manuallyDisabled' is not a boolean: $result",
+            )
+        }
+        val manuallyDisabled = manuallyDisabledEl.asBoolean
+        val worktreesEl = obj.get("worktrees")
+            ?: throw RuntimeException("sync-agent-hooks returned unreadable response: missing 'worktrees' field: $result")
+        if (!worktreesEl.isJsonArray) {
+            throw RuntimeException("sync-agent-hooks returned unreadable response: 'worktrees' is not an array: $result")
+        }
+        val worktrees = worktreesEl.asJsonArray
+            .mapNotNull { it.takeIf { el -> el.isJsonPrimitive && el.asJsonPrimitive.isString }?.asString }
+        val failuresEl = obj.get("failures")
+            ?: throw RuntimeException("sync-agent-hooks returned unreadable response: missing 'failures' field: $result")
+        if (!failuresEl.isJsonArray) {
+            throw RuntimeException("sync-agent-hooks returned unreadable response: 'failures' is not an array: $result")
+        }
+        val failures = failuresEl.asJsonArray.mapNotNull { el ->
+            val entry = el.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
+            HookSyncFailure(
+                worktree = entry.get("worktree")?.asString.orEmpty(),
+                integration = entry.get("integration")?.asString.orEmpty(),
+                message = entry.get("message")?.asString.orEmpty(),
+            )
+        }
+        return SyncAgentHooksResult(manuallyDisabled, worktrees, failures)
+    }
+
+    /** Result of one `ide-bridge migrate-memory-bank` action call — the subset the UI status lines need. */
     data class MigrationBridgeResult(
         val status: String,
         val migratedEntries: Int,
@@ -744,76 +859,49 @@ object CliIntegrations {
 
     /**
      * Runs the orphan-branch → Memory Bank folder migration via the bundled CLI's
-     * hidden `migrate-memory-bank` command (see
-     * cli/src/commands/MigrateMemoryBankCommand.ts). The CLI is the sole migration
-     * implementation: it resolves the Memory Bank root from the shared config,
-     * runs the full migration when it has not completed yet, and otherwise runs
-     * the idempotent stale-child reconcile — matching the VS Code activate path.
+     * `runMemoryBankMigration` (see cli/src/core/MemoryBankMigration.ts),
+     * delivered over the standard ide-bridge transport. The CLI is the sole
+     * migration implementation: it resolves the Memory Bank root from the shared
+     * config, runs the full migration when it has not completed yet, and otherwise
+     * runs the idempotent stale-child reconcile — matching the VS Code activate
+     * path.
      *
-     * The command needs no stdin and prints a single JSON line on stdout —
-     * `{"type":"migrate-memory-bank","status":…,"migratedEntries":…,"totalEntries":…}`
-     * on success, `{"type":"error", …}` on failure. stdout is redirected to a temp
-     * file so a chatty migration log can never fill the pipe and deadlock [waitFor].
+     * Transport: [runIdeBridge] prefers the long-lived daemon (~5-20 ms startup
+     * vs a dedicated cold Node spawn's ~500 ms-2 s) and falls back to a one-shot
+     * `ide-bridge` spawn when no daemon is bound — the pre-daemon startup path
+     * still works. The daemon dispatches requests concurrently, so a long
+     * migration cannot block hot-path actions (status, config reads).
      *
-     * Throws [RuntimeException] with a user-facing message on ANY failure (Node
-     * missing, bundle missing, timeout, CLI error) — callers surface `ex.message`.
+     * Timeout semantics: [MIGRATE_TIMEOUT_SECONDS] is passed through. On a daemon
+     * timeout the daemon KEEPS running the migration — a one-shot fallback would
+     * start the same side-effectful work twice, so the timeout surfaces as
+     * [CliDaemonClient.CliDaemonTimeoutException] and the next (idempotent) kick
+     * picks up whatever state the run reached.
+     *
+     * Business errors propagate as [CliBridgeException] (same shape as every
+     * other bridge action); callers surface `ex.message`.
      */
     fun migrateMemoryBank(projectDir: String): MigrationBridgeResult {
-        val node = resolveNode()
-            ?: throw RuntimeException(
-                "Node.js not found — it is required for Memory Bank migration. Install Node.js and reopen the project.",
-            )
-        val distDir = distIntellijDir().takeIf { File(it, "Cli.js").exists() }
-            ?: extractCliDist()
-            ?: throw RuntimeException("The bundled CLI was not found in the plugin. Try reinstalling the Jolli Memory plugin.")
-        val cliJs = File(distDir, "Cli.js")
-
-        val outFile = createSecureTempFile("jolli-migrate-", ".json")
-        try {
-            val proc = ProcessBuilder(node, cliJs.absolutePath, "migrate-memory-bank", "--cwd", projectDir)
-                .directory(File(projectDir))
-                .redirectOutput(outFile)
-                .redirectError(ProcessBuilder.Redirect.DISCARD)
-                .start()
-            if (!proc.waitFor(MIGRATE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                proc.destroyForcibly()
-                throw RuntimeException("Memory Bank migration timed out after ${MIGRATE_TIMEOUT_SECONDS}s")
-            }
-            return parseMigrateResponse(outFile.readText(Charsets.UTF_8), proc.exitValue())
-        } finally {
-            outFile.delete()
-        }
+        val result = parseMigrateResponse(runIdeBridge(projectDir, "migrate-memory-bank", null, MIGRATE_TIMEOUT_SECONDS))
+        log.info("migrate-memory-bank succeeded: %s (%d/%d)", result.status, result.migratedEntries, result.totalEntries)
+        return result
     }
 
     /**
-     * Parses the `migrate-memory-bank` stdout contract. Split out for direct
-     * testing — the response is the LAST non-blank line so stray Node runtime
-     * output (e.g. experimental-feature warnings) cannot break it.
+     * Parses the `migrate-memory-bank` action's JSON envelope. Split out for
+     * direct testing — the CLI-side reference shape lives in
+     * `cli/src/core/MemoryBankMigration.ts` (`{status, totalEntries,
+     * migratedEntries}`), and the parser tolerates the extra state keys the
+     * MigrationEngine may add (they are ignored). A non-object envelope
+     * (e.g. an empty response after a daemon timeout that still returned) is
+     * a hard error — the caller cannot proceed without a status.
      */
-    internal fun parseMigrateResponse(stdout: String, exitValue: Int): MigrationBridgeResult {
-        val line = stdout.lineSequence().lastOrNull { it.isNotBlank() }
-            ?: throw RuntimeException("Memory Bank migration produced no output (exit $exitValue)")
-        val obj = try {
-            JsonParser.parseString(line).asJsonObject
-        } catch (_: Exception) {
-            throw RuntimeException("Memory Bank migration returned unreadable output (exit $exitValue): ${line.take(200)}")
-        }
-        if (obj.get("type")?.asString == "error") {
-            // Preserve the CLI's classified errorName so downstream dialogs can
-            // route on the same key runIdeBridge already surfaces (e.g. auth
-            // failures) instead of degrading to a generic RuntimeException.
-            throw CliBridgeException(
-                obj.get("errorName")?.takeUnless { it.isJsonNull }?.asString,
-                obj.get("message")?.asString ?: "unknown error",
-            )
-        }
-        if (exitValue != 0) {
-            throw RuntimeException("Memory Bank migration failed (exit $exitValue)")
-        }
+    internal fun parseMigrateResponse(result: com.google.gson.JsonElement): MigrationBridgeResult {
+        val obj = result.takeIf { it.isJsonObject }?.asJsonObject
+            ?: throw RuntimeException("Memory Bank migration returned unreadable response: $result")
         val status = obj.get("status")?.asString ?: "unknown"
         val migrated = obj.get("migratedEntries")?.asInt ?: 0
         val total = obj.get("totalEntries")?.asInt ?: 0
-        log.info("migrate-memory-bank succeeded: %s (%d/%d)", status, migrated, total)
         return MigrationBridgeResult(status, migrated, total)
     }
 
@@ -864,39 +952,79 @@ object CliIntegrations {
     }
 
     /**
-     * Tears down the MCP registration via `disable --integrations-only` (best-effort).
-     * No-op when Node or the bundle is missing — nothing to undo that we could reach.
+     * Tears down the MCP registration via the `disable` bridge action with
+     * `integrationsOnly=true` — hooks stay put, only the repo-scoped MCP entries
+     * come out. Best-effort; propagates NodeMissing / BundleMissing sentinels so
+     * [warningFor] can render the same message it always did.
      */
     fun disableIntegrations(projectDir: String): Result =
-        runDisable(projectDir, listOf("disable", "--integrations-only"), "integrations disable")
+        runDisableBridge(projectDir, integrationsOnly = true, "integrations disable")
 
     /**
-     * FULL disable: the CLI removes the git hook sections (same markers regardless of
-     * which surface wrote them, including legacy `java -jar` bodies), the Claude and
-     * Gemini agent hooks, and the repo-scoped MCP registration. Global MCP entries
-     * stay, per the CLI's conservative uninstall policy.
+     * FULL disable via the [runIdeBridge] daemon (with a one-shot `ide-bridge`
+     * Node spawn as automatic fallback). The bridge action wraps the same
+     * exported [`uninstall`][ai.jolli-cli] that VS Code's `bridge.disable()`
+     * calls in-process — so IntelliJ and VS Code cannot drift on hook-removal
+     * semantics, but IntelliJ saves the ~500 ms – 2 s cold Node spawn of the
+     * old top-level `Cli.js disable` subprocess on the hot Apply path.
+     *
+     * Removes the git-hook sections (same markers regardless of which surface
+     * wrote them, including legacy `java -jar` bodies), the Claude / Gemini
+     * agent hooks, and the repo-scoped MCP registration, then persists the
+     * machine-owned manual-disable opt-out. Global MCP entries stay, per the
+     * CLI's conservative uninstall policy.
      */
     fun disableFull(projectDir: String): Result =
-        runDisable(projectDir, listOf("disable"), "full disable")
+        runDisableBridge(projectDir, integrationsOnly = false, "full disable")
 
-    /** Shared disable runner — spawns the bundled CLI; never touches the version stamp. */
-    private fun runDisable(projectDir: String, args: List<String>, label: String): Result {
-        val node = resolveNode() ?: return Result.NodeMissing
-        val distDir = extractCliDist() ?: return Result.BundleMissing
-        val cliJs = File(distDir, "Cli.js")
+    /**
+     * Shared disable runner — routes through [runIdeBridge] so the daemon can
+     * service the call in-process (~5-20 ms). Any local transport failure
+     * (daemon crash, socket broken) falls through to a one-shot `ide-bridge`
+     * spawn inside [runIdeBridge] itself; a genuine "no Node / no bundle"
+     * failure re-surfaces as the legacy [Result.NodeMissing] / [Result.BundleMissing]
+     * sentinels so [warningFor] keeps rendering the same guidance.
+     */
+    private fun runDisableBridge(projectDir: String, integrationsOnly: Boolean, label: String): Result {
+        val body = com.google.gson.JsonObject().apply {
+            addProperty("integrationsOnly", integrationsOnly)
+            // Match [`EnableCommand.ts`] `disable` branch: a full disable
+            // persists the machine-owned opt-out; an integrations-only teardown
+            // does not (it's not a real "user turned Jolli off" signal).
+            addProperty("persistManualDisable", !integrationsOnly)
+        }.toString()
         return try {
-            val proc = ProcessBuilder(listOf(node, cliJs.absolutePath) + args)
-                .directory(File(projectDir))
-                .redirectErrorStream(true)
-                .start()
-            proc.inputStream.bufferedReader().use { it.readText() }
-            if (!proc.waitFor(60, TimeUnit.SECONDS)) {
-                proc.destroyForcibly()
-                return Result.Failed("$label timed out")
+            val res = runIdeBridge(projectDir, "disable", body, timeoutSeconds = 60)
+            val obj = res.takeIf { it.isJsonObject }?.asJsonObject
+            val success = obj?.get("success")
+                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }
+                ?.asBoolean == true
+            if (success) {
+                Result.Ok
+            } else {
+                val msg = obj?.get("message")
+                    ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+                    ?.asString
+                    ?: "$label failed"
+                Result.Failed(msg)
             }
-            if (proc.exitValue() == 0) Result.Ok else Result.Failed("exit ${proc.exitValue()}")
+        } catch (e: RuntimeException) {
+            // Preserve the legacy NodeMissing / BundleMissing sentinels so
+            // [warningFor] surfaces the same "install Node" / "reinstall
+            // plugin" guidance it did in the ProcessBuilder path. Everything
+            // else (bridge protocol error, timeout, non-zero exit) is a
+            // generic Failed.
+            val msg = e.message ?: "unknown"
+            when {
+                msg.startsWith("Node.js not found") -> Result.NodeMissing
+                msg.startsWith("The bundled CLI was not found") -> Result.BundleMissing
+                else -> {
+                    log.warn("Failed to run bridge %s (non-fatal): %s", label, msg)
+                    Result.Failed(msg)
+                }
+            }
         } catch (e: Exception) {
-            log.warn("Failed to run bundled CLI %s (non-fatal): %s", label, e.message)
+            log.warn("Failed to run bridge %s (non-fatal): %s", label, e.message)
             Result.Failed(e.message ?: "unknown")
         }
     }

@@ -161,7 +161,6 @@ class ActiveConversationsPanel(
 				item = item,
 				onRowClicked = ::onRowClicked,
 				onPin = ::onPin,
-				onResume = ::onResume,
 				onSelectionChanged = ::onSelectionChanged,
 			)
 		}
@@ -185,12 +184,6 @@ class ActiveConversationsPanel(
 				editor.onSaved = { refresh() }
 			}
 		}
-	}
-
-	private fun onResume(item: ActiveConversationItem) {
-		if (!TerminalUtils.canResumeSource(item.source.name)) return
-		val cwd = project.basePath ?: service.mainRepoRoot ?: return
-		TerminalUtils.resumeSession(project, item.source.name, item.sessionId, cwd, item.title)
 	}
 
 	private fun onSelectionChanged(item: ActiveConversationItem, selected: Boolean) {

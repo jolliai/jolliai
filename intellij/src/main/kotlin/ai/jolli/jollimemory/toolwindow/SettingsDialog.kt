@@ -197,7 +197,10 @@ class SettingsDialog(
     private val geminiEnabledCheckbox = JBCheckBox("Gemini — Session tracking via AfterAgent hook", true)
     private val openCodeEnabledCheckbox = JBCheckBox("OpenCode — Session discovery via SQLite database scan", true)
     private val cursorEnabledCheckbox = JBCheckBox("Cursor IDE — Composer session discovery via SQLite database scan", true)
+    private val devinEnabledCheckbox = JBCheckBox("Devin — Session discovery via Devin CLI's global SQLite store (~/.local/share/devin/cli/sessions.db)", true)
     private val copilotEnabledCheckbox = JBCheckBox("GitHub Copilot — CLI session-store scan + VS Code Chat workspace storage", true)
+    private val clineEnabledCheckbox = JBCheckBox("Cline — Cline CLI (~/.cline/data/sessions) + Cline VS Code extension (globalStorage)", true)
+    private val antigravityEnabledCheckbox = JBCheckBox("Antigravity — Session discovery via Antigravity's per-conversation store (~/.gemini/antigravity*)", true)
     private val globalInstructionsCheckbox = JBCheckBox(
         "Let AI assistants use Jolli's skills automatically " +
             "(adds a preference block to ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md, ~/.codex/AGENTS.md)",
@@ -287,7 +290,10 @@ class SettingsDialog(
             .addComponent(geminiEnabledCheckbox, 4)
             .addComponent(openCodeEnabledCheckbox, 4)
             .addComponent(cursorEnabledCheckbox, 4)
+            .addComponent(devinEnabledCheckbox, 4)
             .addComponent(copilotEnabledCheckbox, 4)
+            .addComponent(clineEnabledCheckbox, 4)
+            .addComponent(antigravityEnabledCheckbox, 4)
             .panel))
 
         panel.add(JBLabel(
@@ -871,7 +877,9 @@ class SettingsDialog(
 
         if (!claudeEnabledCheckbox.isSelected && !codexEnabledCheckbox.isSelected &&
             !geminiEnabledCheckbox.isSelected && !openCodeEnabledCheckbox.isSelected &&
-            !cursorEnabledCheckbox.isSelected && !copilotEnabledCheckbox.isSelected
+            !cursorEnabledCheckbox.isSelected && !devinEnabledCheckbox.isSelected &&
+            !copilotEnabledCheckbox.isSelected && !clineEnabledCheckbox.isSelected &&
+            !antigravityEnabledCheckbox.isSelected
         ) {
             return ValidationInfo("At least one platform must be enabled", claudeEnabledCheckbox)
         }
@@ -973,7 +981,10 @@ class SettingsDialog(
             geminiEnabled = geminiEnabledCheckbox.isSelected,
             openCodeEnabled = openCodeEnabledCheckbox.isSelected,
             cursorEnabled = cursorEnabledCheckbox.isSelected,
+            devinEnabled = devinEnabledCheckbox.isSelected,
             copilotEnabled = copilotEnabledCheckbox.isSelected,
+            clineEnabled = clineEnabledCheckbox.isSelected,
+            antigravityEnabled = antigravityEnabledCheckbox.isSelected,
             excludePatterns = if (excludePatterns.isNotEmpty()) excludePatterns else null,
             aiProvider = null,
             localAgentTool = null,
@@ -1080,6 +1091,20 @@ class SettingsDialog(
         val pushControlWasLoaded = pushControlLoaded
         val pushDisabledNow = !pushEnabledCheckbox.isSelected
         val pushDisabledWas = savedPushDisabled
+        // Snapshot the per-agent toggles on the EDT so the sync-agent-hooks bridge
+        // call further down runs off-EDT without reading Swing state from a pool
+        // thread. `config` above already captured these via its data-class copy,
+        // but keeping named locals here makes the off-EDT call site self-evident
+        // and mirrors how [nowPaused] / [pushDisabledNow] are handled.
+        val claudeEnabledNow = claudeEnabledCheckbox.isSelected
+        val geminiEnabledNow = geminiEnabledCheckbox.isSelected
+        // Prior on-disk values — default `undefined → enabled` matches
+        // [SessionTracker.isSourceEnabled] and the checkbox init at
+        // [`refreshUiFromConfig`]. Used below to gate step 2b on an actual toggle
+        // transition so unrelated saves (excludePatterns, localFolder, …) don't
+        // trigger the manual-disable balloon in a paused repo — VS Code parity.
+        val wasClaudeEnabled = existing.claudeEnabled != false
+        val wasGeminiEnabled = existing.geminiEnabled != false
 
         // Resolve the tri-state global-instructions consent. Checked → "enabled". Unchecked
         // is an explicit opt-out ("disabled") ONLY when it was previously enabled; otherwise
@@ -1122,37 +1147,183 @@ class SettingsDialog(
                         // Migrate orphan-branch data into the Memory Bank folder via the
                         // bundled CLI; it no-ops when there is no orphan branch and runs
                         // the idempotent reconcile once migration has completed.
-                        indicator.text = "Migrating memories to Memory Bank…"
-                        CliIntegrations.migrateMemoryBank(projectPath)
-
-                        // Re-point the SummaryReader's folder attachment at the new
-                        // kbRoot / storageMode. Without this, changing the Memory Bank
-                        // path (or toggling storageMode to "orphan") in Settings keeps
-                        // reads served from the previous folder for the rest of the
-                        // session — [JolliMemoryService.initialize] is gated by
-                        // `isInitialized`, so it will not re-run.
-                        service.refreshFolderReader()
+                        // Fire-and-forget on a pooled thread — VS Code parity: silent,
+                        // and a large first-install migration never blocks the save task
+                        // for minutes. The config was persisted above, so the CLI reads
+                        // the fresh `localFolder`; the reader re-attach happens on
+                        // completion.
+                        service.migrateMemoryBankAsync { _ ->
+                            // Re-point the SummaryReader's folder attachment at the new
+                            // kbRoot / storageMode. Without this, changing the Memory Bank
+                            // path (or toggling storageMode to "orphan") in Settings keeps
+                            // reads served from the previous folder for the rest of the
+                            // session — [JolliMemoryService.initialize] is gated by
+                            // `isInitialized`, so it will not re-run.
+                            service.refreshFolderReader()
+                        }
                     }
 
-                    // 2b. Apply the global-instructions consent: persist a fresh decision to
+                    // 2b. Agent hook sync — install or remove the Claude Stop and Gemini
+                    // AfterAgent hooks in every worktree based on the per-agent toggles,
+                    // over the CLI daemon (~5-20 ms). Direct parity with VS Code's
+                    // SettingsWebviewPanel.syncHooks: it reuses the SAME installer helpers
+                    // (installClaudeHook / removeClaudeHook / installGeminiHook /
+                    // removeGeminiHook, [ClaudeHookInstaller.ts]/[GeminiHookInstaller.ts])
+                    // via the `sync-agent-hooks` ide-bridge action, so a toggle flip takes
+                    // effect immediately for every worktree instead of only the current
+                    // one (previous behavior via `enable --integrations-only`).
+                    //
+                    // Gated on a per-agent TOGGLE TRANSITION so unrelated saves
+                    // (excludePatterns, localFolder, model, …) never trigger the
+                    // manual-disable "Re-enable Jolli Memory" balloon in a paused
+                    // repo — same transition-gated pattern as steps 2c / 2d.
+                    // Hook-drift healing on unrelated saves is already handled at
+                    // startup by [JolliMemoryService.initialize] on every window
+                    // open, so gating this call trades a rare daemon round-trip
+                    // for a real bug: the pre-fix behavior fired the balloon on
+                    // any Apply in a manually-disabled repo, indistinguishable
+                    // from a save failure and lobbying the user to undo the
+                    // opt-out they set. VS Code has the same fix in its
+                    // [SettingsWebviewPanel.syncHooks] call site.
+                    //
+                    // Also skipped when this same Apply is the one that flipped
+                    // Pause on (`justPaused`). Step 1 above already ran
+                    // `service.uninstall()` → `jolli disable` → wrote the
+                    // machine-owned manually-disabled flag, so the CLI-side
+                    // handler would immediately return `manuallyDisabled=true`
+                    // and the branch below would post the same balloon three
+                    // seconds after the user chose Pause. VS Code side-steps
+                    // this because [SettingsHtmlBuilder.ts] omits the Pause
+                    // checkbox entirely — its Disable command lives on a
+                    // separate surface and never chains with syncHooks. Steps
+                    // 2c / 2d still run below regardless, so any global-
+                    // instructions or push-control transition on the same Apply
+                    // is still honored.
+                    val justPaused = nowPaused && !wasPaused
+                    val toggleChanged =
+                        claudeEnabledNow != wasClaudeEnabled || geminiEnabledNow != wasGeminiEnabled
+                    if (projectPath != null && !justPaused && toggleChanged) {
+                        indicator.text = "Syncing agent hooks…"
+                        try {
+                            val hookResult = CliIntegrations.syncAgentHooks(
+                                projectPath,
+                                claudeEnabled = claudeEnabledNow,
+                                geminiEnabled = geminiEnabledNow,
+                            )
+                            if (hookResult.manuallyDisabled) {
+                                // The repo carries the machine-owned manual-disable opt-out —
+                                // the CLI-side handler refused to touch hooks on any worktree,
+                                // and no worktree/failure detail arrived. Config was still
+                                // persisted just above (so the startup self-heal can honor the
+                                // fresh flags after a re-enable), but silently returning would
+                                // let the user believe their toggle flip took effect — indistin-
+                                // guishable from the "worked" case. Surface the state with a
+                                // NotificationAction that lifts the opt-out in place via
+                                // service.install() (the CLI's `enable`), so re-enable is one
+                                // click away from the dialog they just left. VS Code parity:
+                                // its SettingsWebviewPanel.notifyManuallyDisabled routes to the
+                                // jollimemory.enableJolliMemory command with the same intent.
+                                LOG.info("Agent hook sync skipped — repo manually disabled; toggles saved, hooks unchanged")
+                                val paused = com.intellij.notification.Notification(
+                                    "JolliMemory",
+                                    "Jolli Memory is paused for this repo",
+                                    "Your Claude/Gemini toggles were saved, but the Stop/AfterAgent hooks won't install until you re-enable Jolli Memory.",
+                                    com.intellij.notification.NotificationType.INFORMATION,
+                                ).addAction(
+                                    com.intellij.notification.NotificationAction.createSimpleExpiring(
+                                        "Re-enable Jolli Memory",
+                                    ) {
+                                        // install() re-runs `jolli enable`, which clears the
+                                        // opt-out and reinstalls hooks per-worktree. Must be
+                                        // off the EDT — same threading contract as the
+                                        // enable/disable branch in this Task.Backgroundable.
+                                        com.intellij.openapi.application.ApplicationManager.getApplication()
+                                            .executeOnPooledThread {
+                                                try {
+                                                    if (!service.isInitialized) service.initialize()
+                                                    service.install()
+                                                    ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+                                                        "surface_enabled",
+                                                        mapOf("trigger" to "manually_disabled_notification"),
+                                                    )
+                                                } catch (e: Exception) {
+                                                    LOG.warn("Re-enable from manual-disable notification failed: ${e.message}")
+                                                }
+                                            }
+                                    },
+                                )
+                                com.intellij.notification.Notifications.Bus.notify(paused, project)
+                            } else if (hookResult.failures.isNotEmpty()) {
+                                // config.json has already been persisted above with the new
+                                // claudeEnabled/geminiEnabled, but the hook block failed to
+                                // reach disk for one or more worktrees. Without a visible
+                                // hint the user would think tracking is on while the Stop /
+                                // AfterAgent hook is missing and nothing gets captured. VS
+                                // Code surfaces this by throwing from `syncHooks` so the
+                                // panel posts "Failed to save settings"; we take the same
+                                // stance by showing a balloon that names which
+                                // integrations / worktrees failed.
+                                val summary = hookResult.failures.joinToString(", ") {
+                                    "${it.integration}@${it.worktree}: ${it.message}"
+                                }
+                                LOG.warn("Agent hook sync completed with ${hookResult.failures.size} failure(s): $summary")
+                                com.intellij.notification.Notifications.Bus.notify(
+                                    com.intellij.notification.Notification(
+                                        "JolliMemory",
+                                        "Agent hook sync had ${hookResult.failures.size} failure(s)",
+                                        "Session tracking may not activate for the affected integrations until the next Settings save or IDE restart. Details: $summary",
+                                        com.intellij.notification.NotificationType.WARNING,
+                                    ),
+                                    project,
+                                )
+                            }
+                        } catch (e: Exception) {
+                            // The bridge call itself failed (daemon unreachable / one-shot
+                            // spawn crashed / JSON parse error). claudeEnabled /
+                            // geminiEnabled are already persisted to config.json above and
+                            // the CLI hook run-time re-reads those flags on every
+                            // invocation, so on-disk hooks stay in whatever shape the
+                            // previous save left them until the next Apply or the
+                            // startup self-heal in initialize(). Not throwing keeps that
+                            // recovery path open, but the user needs to know the current
+                            // toggle didn't reach disk.
+                            LOG.warn("Agent hook sync failed (non-fatal): ${e.message}")
+                            com.intellij.notification.Notifications.Bus.notify(
+                                com.intellij.notification.Notification(
+                                    "JolliMemory",
+                                    "Agent hook sync failed",
+                                    "Settings were saved but the Claude/Gemini hook state on disk was not updated: ${e.message ?: e.javaClass.simpleName}. Re-open Settings and click Apply again, or restart the IDE to let the startup self-heal retry.",
+                                    com.intellij.notification.NotificationType.WARNING,
+                                ),
+                                project,
+                            )
+                        }
+                    }
+
+                    // 2c. Apply the global-instructions consent: persist a fresh decision to
                     // the shared config, then let the bundled CLI write or remove the
                     // skill-preference block. `enable --integrations-only` runs the same
                     // syncGlobalInstructions as VS Code — it reads the just-persisted value
                     // and never prompts (undecided is a no-op, "disabled" heals stale blocks).
-                    // Unconditional so unrelated saves (e.g. a claudeEnabled flip) also heal.
+                    // Gated on an actual transition to match VS Code's own gate (its
+                    // SettingsWebviewPanel calls syncGlobalInstructions() only when the
+                    // checkbox toggled). MCP registration and skill drift are healed
+                    // separately at startup via the plugin-version stamp + mcpRegistrationStale
+                    // probe in [JolliMemoryService.initialize], so skipping the subprocess on
+                    // an untransitioned save saves 500 ms – 2 s of cold Node spawn per Apply.
                     if (newGlobalInstructions != null && newGlobalInstructions != prevGlobalInstructions) {
                         indicator.text = "Updating AI assistant instructions…"
                         SessionTracker.saveGlobalInstructions(newGlobalInstructions)
-                    }
-                    if (projectPath != null) {
-                        try {
-                            ai.jolli.jollimemory.bridge.CliIntegrations.enableIntegrations(projectPath)
-                        } catch (e: Exception) {
-                            // Fail-soft — instruction sync must never break settings save.
+                        if (projectPath != null) {
+                            try {
+                                CliIntegrations.enableIntegrations(projectPath)
+                            } catch (e: Exception) {
+                                // Fail-soft — instruction sync must never break settings save.
+                            }
                         }
                     }
 
-                    // 2c. Persist the per-repo outbound-push toggle (spec 306) via the CLI
+                    // 2d. Persist the per-repo outbound-push toggle (spec 306) via the CLI
                     // bridge — the single source of truth. Only when it actually changed, so
                     // merely re-saving Settings never re-triggers the toggle-on drain.
                     if (pushControlWasLoaded && pushDisabledNow != pushDisabledWas && projectPath != null) {
@@ -1630,7 +1801,10 @@ class SettingsDialog(
         globalInstructionsCheckbox.isSelected = config.globalInstructions == "enabled"
         openCodeEnabledCheckbox.isSelected = config.openCodeEnabled != false
         cursorEnabledCheckbox.isSelected = config.cursorEnabled != false
+        devinEnabledCheckbox.isSelected = config.devinEnabled != false
         copilotEnabledCheckbox.isSelected = config.copilotEnabled != false
+        clineEnabledCheckbox.isSelected = config.clineEnabled != false
+        antigravityEnabledCheckbox.isSelected = config.antigravityEnabled != false
         dcoSignoffCheckbox.isSelected = config.dcoSignoff == true
         pauseCheckbox.isSelected = config.paused == true
         // Telemetry: on unless the shared opt-out flag says "off" (default on).
@@ -1684,81 +1858,78 @@ class SettingsDialog(
                 // finishes (or fails), so a mid-flight click can't fire another round.
                 button.isEnabled = false
                 button.text = "Migrating..."
-                ProgressManager.getInstance().run(
-                    object : Task.Backgroundable(project, "Migrating memories to Memory Bank…", false) {
-                        override fun run(indicator: ProgressIndicator) {
-                            indicator.isIndeterminate = true
-                            try {
-                                indicator.text = "Checking git storage…"
-                                val gitOps = GitOps(projectPath)
-                                val storage = StorageFactory.create(gitOps, projectPath)
-                                if (!storage.exists()) {
-                                    SwingUtilities.invokeLater {
-                                        Messages.showInfoMessage(project, "No git storage found — nothing to migrate.", "Migration")
-                                    }
-                                    return
-                                }
-
-                                indicator.text = "Reading configuration…"
-                                val config = SessionTracker.loadConfig()
-                                val repoName = KBPathResolver.extractRepoName(projectPath)
-                                val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
-
-                                // Enumerate every folder that currently holds this repo, then
-                                // archive the whole pile FIRST — the canonical base `<repo>` slot
-                                // included — so migration lands back on the base name instead of
-                                // climbing to an ever-higher `<repo>-N`. Safe to archive up front:
-                                // the migration SOURCE is the orphan branch (system of record), not
-                                // these folders, so a crash mid-migrate self-heals on the next
-                                // activation, which re-migrates into the now-free base slot.
-                                // archiveKBFolder MOVES each folder into the hidden .jolli/archive/
-                                // (not an in-place identity rewrite, which left them visible and
-                                // still git-tracked). Mirrors the VS Code rebuildKnowledgeBase flow.
-                                val staleFolders = KBPathResolver.findRepoFolders(repoName, remoteUrl, config.localFolder)
-                                for (stale in staleFolders) {
-                                    indicator.text = "Archiving $stale…"
-                                    KBPathResolver.archiveKBFolder(stale, config.localFolder)
-                                }
-
-                                // With the pile archived, the base slot is free; resolve to it
-                                // (falling back to a fresh -N only if some folder survived archiving).
-                                indicator.text = "Initializing Memory Bank…"
-                                val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.localFolder)
-                                KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
-
-                                // Run the migration through the bundled CLI. The CLI resolves the
-                                // same freshly-archived base folder from the shared config and
-                                // copies the orphan-branch data onto disk.
-                                indicator.text = "Migrating memories…"
-                                val result = CliIntegrations.migrateMemoryBank(projectPath)
-
+                // Silent pooled-thread run — VS Code parity: rebuildKnowledgeBase shows
+                // no progress indicator; the result dialog below is the feedback
+                // (the analog of VS Code's inline button-state message). The
+                // migration lock serializes with background migrations (startup /
+                // Settings save) that would otherwise race on migration.json.
+                com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+                    try {
+                        service.withMigrationLock {
+                            val gitOps = GitOps(projectPath)
+                            val storage = StorageFactory.create(gitOps, projectPath)
+                            if (!storage.exists()) {
                                 SwingUtilities.invokeLater {
-                                    if (result.status == "completed") {
-                                        Messages.showInfoMessage(project,
-                                            "Migration completed: ${result.migratedEntries} memories migrated to\n$kbRoot",
-                                            "Migration")
-                                    } else {
-                                        Messages.showErrorDialog(project,
-                                            "Migration finished with status: ${result.status}\n" +
-                                                "${result.migratedEntries}/${result.totalEntries} entries processed.",
-                                            "Migration")
-                                    }
+                                    Messages.showInfoMessage(project, "No git storage found — nothing to migrate.", "Migration")
                                 }
-                            } catch (e: Exception) {
-                                SwingUtilities.invokeLater {
-                                    Messages.showErrorDialog(project,
-                                        "Migration failed: ${e.message}",
+                                return@withMigrationLock
+                            }
+
+                            val config = SessionTracker.loadConfig()
+                            val repoName = KBPathResolver.extractRepoName(projectPath)
+                            val remoteUrl = KBPathResolver.getRemoteUrl(projectPath)
+
+                            // Enumerate every folder that currently holds this repo, then
+                            // archive the whole pile FIRST — the canonical base `<repo>` slot
+                            // included — so migration lands back on the base name instead of
+                            // climbing to an ever-higher `<repo>-N`. Safe to archive up front:
+                            // the migration SOURCE is the orphan branch (system of record), not
+                            // these folders, so a crash mid-migrate self-heals on the next
+                            // activation, which re-migrates into the now-free base slot.
+                            // archiveKBFolder MOVES each folder into the hidden .jolli/archive/
+                            // (not an in-place identity rewrite, which left them visible and
+                            // still git-tracked). Mirrors the VS Code rebuildKnowledgeBase flow.
+                            val staleFolders = KBPathResolver.findRepoFolders(repoName, remoteUrl, config.localFolder)
+                            for (stale in staleFolders) {
+                                KBPathResolver.archiveKBFolder(stale, config.localFolder)
+                            }
+
+                            // With the pile archived, the base slot is free; resolve to it
+                            // (falling back to a fresh -N only if some folder survived archiving).
+                            val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.localFolder)
+                            KBPathResolver.initializeKBFolder(kbRoot, repoName, remoteUrl)
+
+                            // Run the migration through the bundled CLI. The CLI resolves the
+                            // same freshly-archived base folder from the shared config and
+                            // copies the orphan-branch data onto disk.
+                            val result = CliIntegrations.migrateMemoryBank(projectPath)
+
+                            SwingUtilities.invokeLater {
+                                if (result.status == "completed") {
+                                    Messages.showInfoMessage(project,
+                                        "Migration completed: ${result.migratedEntries} memories migrated to\n$kbRoot",
                                         "Migration")
-                                }
-                            } finally {
-                                SwingUtilities.invokeLater {
-                                    button.isEnabled = true
-                                    button.text = "Migrate to Memory Bank"
+                                } else {
+                                    Messages.showErrorDialog(project,
+                                        "Migration finished with status: ${result.status}\n" +
+                                            "${result.migratedEntries}/${result.totalEntries} entries processed.",
+                                        "Migration")
                                 }
                             }
                         }
-                    },
-                )
+                    } catch (e: Exception) {
+                        SwingUtilities.invokeLater {
+                            Messages.showErrorDialog(project,
+                                "Migration failed: ${e.message}",
+                                "Migration")
+                        }
+                    } finally {
+                        SwingUtilities.invokeLater {
+                            button.isEnabled = true
+                            button.text = "Migrate to Memory Bank"
+                        }
+                    }
+                }
             }
         }
     }

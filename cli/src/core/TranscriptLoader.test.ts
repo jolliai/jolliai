@@ -29,8 +29,14 @@ vi.mock("./DevinTranscriptReader.js", () => ({
 vi.mock("./CursorCliTranscriptReader.js", () => ({
 	readCursorCliTranscript: vi.fn(),
 }));
-// Partial: the antigravity happy path below reads a REAL jsonl file, so the
-// reader stays real and is only overridden for the throw cases.
+// Hybrid mocks for the two readers that some tests still exercise against real
+// files — the spy delegates to the actual implementation by default so dispatch
+// tests keep working, and individual tests can override with
+// `mockRejectedValueOnce` to force a non-ENOENT throw path.
+vi.mock("./GeminiTranscriptReader.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./GeminiTranscriptReader.js")>();
+	return { ...actual, readGeminiTranscript: vi.fn(actual.readGeminiTranscript) };
+});
 vi.mock("./AntigravityTranscriptReader.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./AntigravityTranscriptReader.js")>();
 	return { ...actual, readAntigravityTranscript: vi.fn(actual.readAntigravityTranscript) };
@@ -43,12 +49,18 @@ import { readCopilotTranscript } from "./CopilotTranscriptReader.js";
 import { readCursorCliTranscript } from "./CursorCliTranscriptReader.js";
 import { readCursorTranscript } from "./CursorTranscriptReader.js";
 import { readDevinTranscript } from "./DevinTranscriptReader.js";
+import { readGeminiTranscript } from "./GeminiTranscriptReader.js";
 import { readOpenCodeTranscript } from "./OpenCodeTranscriptReader.js";
 import { loadTranscript } from "./TranscriptLoader.js";
 
-/** An ENOENT-coded error — the shape every reader-level "file is gone" surfaces as. */
-function enoent(): Error {
-	return Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" });
+/** An ENOENT-coded error — the shape every reader-level "file is gone" surfaces as.
+ * Optional `path` is appended in the message form real Node errors carry, for tests
+ * that want a specific file mentioned. */
+function enoent(path?: string): NodeJS.ErrnoException {
+	const message = path ? `ENOENT: no such file or directory, open '${path}'` : "ENOENT: no such file or directory";
+	const err = new Error(message) as NodeJS.ErrnoException;
+	err.code = "ENOENT";
+	return err;
 }
 
 function readResult(entries: Array<{ role: "human" | "assistant"; content: string }>, path: string) {
@@ -68,6 +80,13 @@ describe("loadTranscript", () => {
 		vi.mocked(readCopilotTranscript).mockReset();
 		vi.mocked(readClineTranscript).mockReset();
 		vi.mocked(readClineCliTranscript).mockReset();
+		vi.mocked(readDevinTranscript).mockReset();
+		vi.mocked(readCursorCliTranscript).mockReset();
+		// Hybrid mocks: clear call history but keep the real implementation as
+		// the default so file-backed dispatch tests still work; individual tests
+		// override with `mockRejectedValueOnce` to force non-ENOENT throw paths.
+		vi.mocked(readGeminiTranscript).mockClear();
+		vi.mocked(readAntigravityTranscript).mockClear();
 	});
 	afterEach(() => {
 		rmSync(dir, { recursive: true, force: true });
@@ -350,14 +369,9 @@ describe("loadTranscript", () => {
 
 	// ENOENT is the "expected absence" branch — readers can race with the
 	// source app rotating / pruning the file, so a missing DB must not log
-	// at warn level. Mock the rejection with a real fs-shaped ENOENT object
-	// for each sqlite-backed dispatch so both halves of the `isEnoent`
-	// branch (warn / silent) are exercised.
-	const enoent = (path: string): NodeJS.ErrnoException => {
-		const e: NodeJS.ErrnoException = new Error(`ENOENT: no such file, open '${path}'`);
-		e.code = "ENOENT";
-		return e;
-	};
+	// at warn level. The shared `enoent(path)` helper at the top of the file
+	// produces the fs-shaped error; these tests exercise both halves of the
+	// `isEnoent` branch (warn / silent) per dispatch.
 
 	it("returns [] silently when readOpenCodeTranscript throws ENOENT (no warn branch)", async () => {
 		vi.mocked(readOpenCodeTranscript).mockRejectedValueOnce(enoent("/missing.db"));
@@ -611,6 +625,49 @@ describe("loadTranscript", () => {
 				'{"type":"telemetry.heartbeat","data":{"ts":1}}',
 				// Good row to anchor the assertion.
 				'{"type":"user.message","data":{"content":"kept"}}',
+				"",
+			].join("\n"),
+		);
+		const result = await loadTranscript({ source: "copilot-chat", transcriptPath: file });
+		expect(result).toEqual([{ role: "human", content: "kept" }]);
+	});
+
+	// Gemini reader swallows its own file-read errors and returns empty by
+	// default — so the outer catch in loadTranscript is normally not entered.
+	// Force each branch via the hybrid mock so both stay exercised.
+	// (devin / cursor-cli / antigravity are already covered by the it.each
+	// "returns [] when the %s reader throws, ENOENT or otherwise" above.)
+	it("returns [] and warns when readGeminiTranscript throws a non-ENOENT error", async () => {
+		vi.mocked(readGeminiTranscript).mockRejectedValueOnce(new Error("gemini: corrupted json"));
+		const result = await loadTranscript({
+			source: "gemini",
+			transcriptPath: "/some/path.json",
+		});
+		expect(result).toEqual([]);
+	});
+
+	it("returns [] silently when readGeminiTranscript throws ENOENT (no warn)", async () => {
+		vi.mocked(readGeminiTranscript).mockRejectedValueOnce(enoent("/missing.json"));
+		const result = await loadTranscript({
+			source: "gemini",
+			transcriptPath: "/missing.json",
+		});
+		expect(result).toEqual([]);
+	});
+
+	// copilot-chat's per-line parser throws on invalid JSON (JSON.parse), so
+	// unparseable lines increment `parseSkipped` inside the stream loop and
+	// the end-of-stream `parseSkipped > 0` debug log fires. This is the only
+	// source whose parser throws today — claude/codex parsers return
+	// undefined on schema drift instead.
+	it("increments the skip counter for unparseable copilot-chat lines and logs the total", async () => {
+		const file = join(dir, "cc-mixed.jsonl");
+		writeFileSync(
+			file,
+			[
+				"this is not json at all",
+				'{"value":{"message":{"text":"kept","role":"user"}}}',
+				"another bogus line ]}[",
 				"",
 			].join("\n"),
 		);

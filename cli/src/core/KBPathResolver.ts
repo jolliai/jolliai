@@ -104,7 +104,7 @@ export function assertValidLocalFolder(customPath: string | undefined): void {
  * gated callers: `StorageFactory.createStorage`, `ReadStorageResolver`
  * (via `createFolderStorage`), `MemoryBankScanner.tryResolveKBRoot`. Callers
  * exempt because their path comes from the user rather than a cwd guess:
- * `SyncCommand`, `MigrateMemoryBankCommand`, VS Code's repoint flow.
+ * `SyncCommand`, `MemoryBankMigration`, VS Code's repoint flow.
  *
  * Use {@link peekKBPath} when you only need the path and must not claim it.
  */

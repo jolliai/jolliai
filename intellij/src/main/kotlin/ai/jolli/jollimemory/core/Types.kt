@@ -606,6 +606,12 @@ data class JolliMemoryConfig(
     val openCodeEnabled: Boolean? = null,
     val cursorEnabled: Boolean? = null,
     val copilotEnabled: Boolean? = null,
+    /** Cline VS Code extension + Cline CLI — one shared toggle (cross-surface with CLI/VS Code). */
+    val clineEnabled: Boolean? = null,
+    /** Devin CLI (~/.local/share/devin/cli/sessions.db). */
+    val devinEnabled: Boolean? = null,
+    /** Antigravity — per-conversation store under the Gemini config dir (~/.gemini/antigravity variants). */
+    val antigravityEnabled: Boolean? = null,
     /**
      * Tri-state consent for the machine-global skill-preference block written into
      * ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md, ~/.codex/AGENTS.md: "enabled" /
@@ -742,11 +748,24 @@ data class StatusInfo(
     val cursorDetected: Boolean? = null,
     val cursorEnabled: Boolean? = null,
     val cursorScanError: SqliteScanError? = null,
+    val devinDetected: Boolean? = null,
+    val devinEnabled: Boolean? = null,
+    val devinScanError: SqliteScanError? = null,
     val copilotDetected: Boolean? = null,
     val copilotEnabled: Boolean? = null,
     val copilotScanError: SqliteScanError? = null,
     val copilotChatDetected: Boolean? = null,
     val copilotChatScanError: CopilotChatScanError? = null,
+    /** True when either flavor of Cline is present — the union of `clineCliDetected` and `clineVscodeDetected`. */
+    val clineDetected: Boolean? = null,
+    val clineCliDetected: Boolean? = null,
+    val clineVscodeDetected: Boolean? = null,
+    val clineEnabled: Boolean? = null,
+    val clineVscodeScanError: ClineScanError? = null,
+    val clineCliScanError: ClineScanError? = null,
+    val antigravityDetected: Boolean? = null,
+    val antigravityEnabled: Boolean? = null,
+    val antigravityScanError: SqliteScanError? = null,
     /** Node.js resolvable on PATH — required for the MCP server + full skill set. */
     val nodeAvailable: Boolean = true,
     /** MCP + full skills are set up (bundled CLI extracted and version-matched). */
@@ -797,3 +816,9 @@ data class SqliteScanError(val kind: SqliteScanErrorKind, val message: String)
  * "parse" / "fs" / "schema" / "unknown" tag chosen by the CLI (see CLI spec).
  */
 data class CopilotChatScanError(val kind: String, val message: String)
+
+/** Severity for Cline (VS Code extension + CLI) scan failures — file-shape, not SQLite. */
+enum class ClineScanErrorKind { parse, fs, schema, unknown }
+
+/** Scan-failure DTO for the Cline VS Code extension + Cline CLI sources. */
+data class ClineScanError(val kind: ClineScanErrorKind, val message: String)

@@ -1,3 +1,4 @@
+import type { FSWatcher } from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -104,6 +105,66 @@ describe("DaemonWatcher", () => {
 		watcher.stop();
 		await sleep(DEBOUNCE_MS * 5);
 
+		expect(trigger).not.toHaveBeenCalled();
+	});
+
+	it("start() is idempotent — a second call keeps the same FSWatcher and returns true", () => {
+		const target = join(root, "queue");
+		mkdirSync(target);
+		const trigger = vi.fn();
+		const watcher = new DaemonWatcher({
+			path: target,
+			debounceMs: DEBOUNCE_MS,
+			onTrigger: trigger,
+		});
+
+		expect(watcher.start()).toBe(true);
+		const inner = (watcher as unknown as { watcher: FSWatcher }).watcher;
+		expect(inner).not.toBeNull();
+		expect(watcher.start()).toBe(true);
+		expect((watcher as unknown as { watcher: FSWatcher }).watcher).toBe(inner);
+		watcher.stop();
+	});
+
+	it("tears the watcher down when its underlying 'error' event fires", () => {
+		const target = join(root, "queue");
+		mkdirSync(target);
+		const trigger = vi.fn();
+		const watcher = new DaemonWatcher({
+			path: target,
+			debounceMs: DEBOUNCE_MS,
+			onTrigger: trigger,
+		});
+
+		expect(watcher.start()).toBe(true);
+		const inner = (watcher as unknown as { watcher: FSWatcher }).watcher;
+		expect(inner).not.toBeNull();
+		inner.emit("error", new Error("simulated fs.watch failure"));
+		expect((watcher as unknown as { watcher: FSWatcher | null }).watcher).toBeNull();
+	});
+
+	it("stop() clears a pending debounce timer that never fires afterwards", async () => {
+		const target = join(root, "queue");
+		mkdirSync(target);
+		const trigger = vi.fn();
+		const watcher = new DaemonWatcher({
+			path: target,
+			debounceMs: DEBOUNCE_MS,
+			onTrigger: trigger,
+		});
+
+		expect(watcher.start()).toBe(true);
+		const inner = (watcher as unknown as { watcher: FSWatcher }).watcher;
+		// Emitting 'change' directly on the FSWatcher invokes the listener attached
+		// by `fs.watch()`, so schedule() runs and arms the debounce timer without
+		// depending on platform event delivery.
+		inner.emit("change", "change", "a");
+		expect((watcher as unknown as { timer: unknown }).timer).not.toBeNull();
+
+		watcher.stop();
+		expect((watcher as unknown as { timer: unknown }).timer).toBeNull();
+
+		await sleep(DEBOUNCE_MS * 3);
 		expect(trigger).not.toHaveBeenCalled();
 	});
 });

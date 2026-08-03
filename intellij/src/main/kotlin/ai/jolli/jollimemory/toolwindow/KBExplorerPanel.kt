@@ -1085,7 +1085,9 @@ class KBExplorerPanel(
             mm.saveMigrationState(MigrationState(status = "pending"))
 
             val projectPath = service.mainRepoRoot ?: project.basePath ?: return
-            val result = CliIntegrations.migrateMemoryBank(projectPath)
+            // Serialize with background migrations (startup / Settings save) —
+            // concurrent runs race on migration.json and the folder writes.
+            val result = service.withMigrationLock { CliIntegrations.migrateMemoryBank(projectPath) }
 
             LOG.info("Reset migration: ${result.status} (${result.migratedEntries}/${result.totalEntries})")
             // Re-migration writes fresh JSON/Markdown to the folder; force a heal

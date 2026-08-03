@@ -256,7 +256,31 @@ class StatusPanel(
             }
         }
 
-        // 11. Copilot Integration (no hooks needed — covers both CLI and VS Code Chat under one toggle)
+        // 11. Devin Integration (no hooks needed — just detection)
+        val devinDetected = status.devinDetected ?: false
+        if (devinDetected) {
+            val devinEnabled = config.devinEnabled != false
+            val devinScanError = status.devinScanError
+            if (devinEnabled && devinScanError != null) {
+                listModel.addElement(StatusRow(
+                    Icon.WARN,
+                    "Devin Integration",
+                    "unavailable — ${devinScanError.kind}",
+                    "Devin DB scan failed (${devinScanError.kind}): ${devinScanError.message}",
+                ))
+            } else {
+                addIntegrationRow(
+                    enabled = devinEnabled,
+                    hookInstalled = null,
+                    label = "Devin Integration",
+                    enabledTooltip = "Devin CLI detected — session discovery is enabled",
+                    disabledTooltip = "Devin CLI detected but session discovery is disabled in config",
+                    hookMissingTooltip = null,
+                )
+            }
+        }
+
+        // 12. Copilot Integration (no hooks needed — covers both CLI and VS Code Chat under one toggle)
         val copilotCliDetected = status.copilotDetected ?: false
         val copilotChatDetected = status.copilotChatDetected ?: false
         val copilotScanError = status.copilotScanError
@@ -289,6 +313,65 @@ class StatusPanel(
                 disabledTooltip = "GitHub Copilot detected (CLI: $cliMark, Chat: $chatMark) but session discovery is disabled in config",
                 hookMissingTooltip = null,
             )
+        }
+
+        // 13. Cline Integration (no hooks needed — covers both VS Code extension and CLI under one toggle)
+        val clineCliDetected = status.clineCliDetected ?: false
+        val clineVscodeDetected = status.clineVscodeDetected ?: false
+        val clineVscodeScanError = status.clineVscodeScanError
+        val clineCliScanError = status.clineCliScanError
+        if (clineVscodeScanError != null) {
+            listModel.addElement(StatusRow(
+                Icon.WARN,
+                "Cline (VS Code)",
+                "unavailable — ${clineVscodeScanError.kind}",
+                "Cline VS Code extension scan failed (${clineVscodeScanError.kind}): ${clineVscodeScanError.message}",
+            ))
+        }
+        if (clineCliScanError != null) {
+            listModel.addElement(StatusRow(
+                Icon.WARN,
+                "Cline CLI",
+                "unavailable — ${clineCliScanError.kind}",
+                "Cline CLI scan failed (${clineCliScanError.kind}): ${clineCliScanError.message}",
+            ))
+        }
+        if (clineCliDetected || clineVscodeDetected) {
+            val enabled = config.clineEnabled != false
+            val cliMark = if (clineCliDetected) "✓" else "✗"
+            val extMark = if (clineVscodeDetected) "✓" else "✗"
+            addIntegrationRow(
+                enabled = enabled,
+                hookInstalled = null,
+                label = "Cline Integration",
+                enabledTooltip = "Cline detected (CLI: $cliMark, VS Code: $extMark) — session discovery is enabled",
+                disabledTooltip = "Cline detected (CLI: $cliMark, VS Code: $extMark) but session discovery is disabled in config",
+                hookMissingTooltip = null,
+            )
+        }
+
+        // 14. Antigravity Integration (no hooks needed — just detection)
+        val antigravityDetected = status.antigravityDetected ?: false
+        if (antigravityDetected) {
+            val antigravityEnabled = config.antigravityEnabled != false
+            val antigravityScanError = status.antigravityScanError
+            if (antigravityEnabled && antigravityScanError != null) {
+                listModel.addElement(StatusRow(
+                    Icon.WARN,
+                    "Antigravity Integration",
+                    "unavailable — ${antigravityScanError.kind}",
+                    "Antigravity DB scan failed (${antigravityScanError.kind}): ${antigravityScanError.message}",
+                ))
+            } else {
+                addIntegrationRow(
+                    enabled = antigravityEnabled,
+                    hookInstalled = null,
+                    label = "Antigravity Integration",
+                    enabledTooltip = "Antigravity detected — session discovery is enabled",
+                    disabledTooltip = "Antigravity detected but session discovery is disabled in config",
+                    hookMissingTooltip = null,
+                )
+            }
         }
 
         add(JBScrollPane(statusList), BorderLayout.CENTER)

@@ -264,4 +264,208 @@ class CliIntegrationsTest {
             f.delete()
         }
     }
+
+    // ── parseSyncAgentHooksResponse — the `sync-agent-hooks` bridge contract ──
+    // The CLI-side shape lives in cli/src/commands/IdeBridgeCommand.ts under
+    // case "sync-agent-hooks". Keeping the parser as an internal fun lets the
+    // JSON envelope be exercised without spawning the daemon.
+
+    @Test
+    fun `parseSyncAgentHooksResponse returns the healthy no-worktree shape`() {
+        val json = com.google.gson.JsonParser.parseString(
+            """{"manuallyDisabled":false,"worktrees":[],"failures":[]}""",
+        )
+        val r = CliIntegrations.parseSyncAgentHooksResponse(json)
+        r.manuallyDisabled shouldBe false
+        r.worktrees shouldBe emptyList()
+        r.failures shouldBe emptyList()
+    }
+
+    @Test
+    fun `parseSyncAgentHooksResponse honours manuallyDisabled short-circuit`() {
+        val json = com.google.gson.JsonParser.parseString(
+            """{"manuallyDisabled":true,"worktrees":[],"failures":[]}""",
+        )
+        val r = CliIntegrations.parseSyncAgentHooksResponse(json)
+        // The CLI returns manuallyDisabled=true with empty arrays; the caller
+        // is expected to skip the notification and let the user re-enable.
+        r.manuallyDisabled shouldBe true
+    }
+
+    @Test
+    fun `parseSyncAgentHooksResponse collects multiple worktrees and failures`() {
+        val json = com.google.gson.JsonParser.parseString(
+            """{"manuallyDisabled":false,"worktrees":["/repo","/repo.wt/feature"],"""
+                + """"failures":["""
+                + """{"worktree":"/repo","integration":"Claude","message":"EACCES"},"""
+                + """{"worktree":"/repo.wt/feature","integration":"Gemini","message":"unreadable JSON"}"""
+                + "]}",
+        )
+        val r = CliIntegrations.parseSyncAgentHooksResponse(json)
+        r.worktrees shouldBe listOf("/repo", "/repo.wt/feature")
+        r.failures.size shouldBe 2
+        r.failures[0].worktree shouldBe "/repo"
+        r.failures[0].integration shouldBe "Claude"
+        r.failures[0].message shouldBe "EACCES"
+        r.failures[1].integration shouldBe "Gemini"
+    }
+
+    @Test
+    fun `parseSyncAgentHooksResponse rejects an envelope with manuallyDisabled field missing`() {
+        // Fail-loud, symmetric with worktrees/failures. Silent-default to false
+        // would make the caller SKIP the manual-disable balloon on a paused
+        // repo — an over-suppress the user cannot see. The CLI-side handler
+        // always writes the field (see the `sync-agent-hooks` case in
+        // `cli/src/commands/IdeBridgeCommand.ts`), so its absence signals wire
+        // drift, not a legitimate response.
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseSyncAgentHooksResponse(
+                com.google.gson.JsonParser.parseString("""{"worktrees":["/repo"],"failures":[]}"""),
+            )
+        }
+        ex.message shouldContain "unreadable"
+        ex.message shouldContain "manuallyDisabled"
+    }
+
+    @Test
+    fun `parseSyncAgentHooksResponse rejects manuallyDisabled not encoded as a boolean`() {
+        // Wire-shape defence: a string/number in the boolean slot must not be
+        // coerced. Matches the worktrees/failures typed-array checks.
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseSyncAgentHooksResponse(
+                com.google.gson.JsonParser.parseString(
+                    """{"manuallyDisabled":"true","worktrees":[],"failures":[]}""",
+                ),
+            )
+        }
+        ex.message shouldContain "unreadable"
+        ex.message shouldContain "manuallyDisabled"
+    }
+
+    @Test
+    fun `parseSyncAgentHooksResponse skips malformed failure entries without throwing`() {
+        // Wrong element types under failures[] must not break the whole envelope
+        // (one non-object failure entry cannot lose the whole worktree list).
+        val json = com.google.gson.JsonParser.parseString(
+            """{"manuallyDisabled":false,"worktrees":["/r"],"failures":["not-an-object",{"worktree":"/r","integration":"Claude","message":"x"}]}""",
+        )
+        val r = CliIntegrations.parseSyncAgentHooksResponse(json)
+        r.failures.size shouldBe 1
+        r.failures[0].message shouldBe "x"
+    }
+
+    @Test
+    fun `parseSyncAgentHooksResponse rejects a non-object envelope`() {
+        // A malformed response (e.g. a bare array or string) must throw so the
+        // caller's outer catch shows the "sync failed" notification instead of
+        // treating it as a healthy zero-worktree response.
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseSyncAgentHooksResponse(com.google.gson.JsonParser.parseString("""[]"""))
+        }
+        ex.message shouldContain "unreadable"
+    }
+
+    @Test
+    fun `parseSyncAgentHooksResponse rejects an envelope with worktrees field missing`() {
+        // A missing `worktrees` array is asymmetric with `manuallyDisabled`
+        // (which safely defaults to false): silently defaulting worktrees to []
+        // would collapse a malformed envelope into the healthy zero-worktree
+        // response and hide real per-worktree failures behind "everything's
+        // fine". The CLI-side handler always writes both worktrees and failures
+        // (empty arrays included), so their absence is wire drift.
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseSyncAgentHooksResponse(
+                com.google.gson.JsonParser.parseString("""{"manuallyDisabled":false,"failures":[]}"""),
+            )
+        }
+        ex.message shouldContain "unreadable"
+        ex.message shouldContain "worktrees"
+    }
+
+    @Test
+    fun `parseSyncAgentHooksResponse rejects an envelope with failures field missing`() {
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseSyncAgentHooksResponse(
+                com.google.gson.JsonParser.parseString("""{"manuallyDisabled":false,"worktrees":[]}"""),
+            )
+        }
+        ex.message shouldContain "unreadable"
+        ex.message shouldContain "failures"
+    }
+
+    @Test
+    fun `parseSyncAgentHooksResponse rejects worktrees not encoded as an array`() {
+        // Wire-shape defence: if the CLI ever regressed and shipped a string
+        // (or object) under `worktrees`, the earlier code would either
+        // silently return [] (via Gson's null-on-mismatch getAsJsonArray) or
+        // ClassCastException on `.asJsonArray`. Force the explicit
+        // "unreadable" contract instead.
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseSyncAgentHooksResponse(
+                com.google.gson.JsonParser.parseString(
+                    """{"manuallyDisabled":false,"worktrees":"oops","failures":[]}""",
+                ),
+            )
+        }
+        ex.message shouldContain "unreadable"
+        ex.message shouldContain "worktrees"
+    }
+
+    @Test
+    fun `parseSyncAgentHooksResponse rejects failures not encoded as an array`() {
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseSyncAgentHooksResponse(
+                com.google.gson.JsonParser.parseString(
+                    """{"manuallyDisabled":false,"worktrees":[],"failures":{"oops":1}}""",
+                ),
+            )
+        }
+        ex.message shouldContain "unreadable"
+        ex.message shouldContain "failures"
+    }
+
+    // ── parseMigrateResponse — the `migrate-memory-bank` bridge contract ─────
+    // CLI-side reference: cli/src/core/MemoryBankMigration.ts. Restores the
+    // testing seam that the internal-fun predecessor carried on `main`.
+
+    @Test
+    fun `parseMigrateResponse returns the settled counts on success`() {
+        val json = com.google.gson.JsonParser.parseString(
+            """{"status":"completed","totalEntries":42,"migratedEntries":42}""",
+        )
+        val r = CliIntegrations.parseMigrateResponse(json)
+        r.status shouldBe "completed"
+        r.totalEntries shouldBe 42
+        r.migratedEntries shouldBe 42
+    }
+
+    @Test
+    fun `parseMigrateResponse handles the fresh-install empty run`() {
+        val json = com.google.gson.JsonParser.parseString(
+            """{"status":"completed","totalEntries":0,"migratedEntries":0}""",
+        )
+        val r = CliIntegrations.parseMigrateResponse(json)
+        r.totalEntries shouldBe 0
+        r.migratedEntries shouldBe 0
+    }
+
+    @Test
+    fun `parseMigrateResponse defaults missing numeric counts to zero`() {
+        // Belt-and-suspenders: a partial in-progress state ("dispatched" without
+        // counts) is served by the migration engine before writes complete; the
+        // parser must not throw NPE on a missing number.
+        val json = com.google.gson.JsonParser.parseString("""{"status":"in_progress"}""")
+        val r = CliIntegrations.parseMigrateResponse(json)
+        r.status shouldBe "in_progress"
+        r.totalEntries shouldBe 0
+        r.migratedEntries shouldBe 0
+    }
+
+    @Test
+    fun `parseMigrateResponse rejects a non-object envelope`() {
+        val ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+            CliIntegrations.parseMigrateResponse(com.google.gson.JsonParser.parseString("null"))
+        }
+        ex.message shouldContain "unreadable"
+    }
 }

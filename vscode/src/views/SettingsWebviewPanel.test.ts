@@ -44,6 +44,12 @@ const { mockShowWarningMessage } = vi.hoisted(() => ({
 	mockShowWarningMessage: vi.fn(),
 }));
 
+// syncHooks routes here when the repo is manually disabled — return the
+// user's action selection from mockResolvedValue.
+const { mockShowInformationMessage } = vi.hoisted(() => ({
+	mockShowInformationMessage: vi.fn().mockResolvedValue(undefined),
+}));
+
 const { mockExecuteCommand } = vi.hoisted(() => ({
 	mockExecuteCommand: vi.fn().mockResolvedValue(undefined),
 }));
@@ -53,6 +59,7 @@ vi.mock("vscode", () => ({
 		createWebviewPanel,
 		showOpenDialog: mockShowOpenDialog,
 		showWarningMessage: mockShowWarningMessage,
+		showInformationMessage: mockShowInformationMessage,
 	},
 	commands: {
 		executeCommand: mockExecuteCommand,
@@ -263,6 +270,10 @@ describe("SettingsWebviewPanel", () => {
 		mockSaveConfigScoped.mockResolvedValue(undefined);
 		mockListWorktrees.mockResolvedValue(["/workspace"]);
 		mockIsLocalAgentUsable.mockResolvedValue(true);
+		// vi.clearAllMocks strips this back to a bare vi.fn(); restore the
+		// "no button clicked" default so notification tests are opt-in via
+		// mockResolvedValueOnce.
+		mockShowInformationMessage.mockResolvedValue(undefined);
 	});
 
 	// ── show() ───────────────────────────────────────────────────────────────
@@ -1704,7 +1715,15 @@ describe("SettingsWebviewPanel", () => {
 		});
 
 		it("installs Claude and Gemini hooks when enabled", async () => {
-			const dispatch = await setupWithLoadedConfig();
+			// Start with both toggles OFF so the applySettings below is a real
+			// transition (off → on). Post-#2-fix, syncHooks is gated on a
+			// per-agent transition so unrelated Applies never re-heal hooks or
+			// re-fire the manual-disable balloon (see [SettingsWebviewPanel] and
+			// its `hookToggleChanged` computation).
+			const dispatch = await setupWithLoadedConfig({
+				claudeEnabled: false,
+				geminiEnabled: false,
+			});
 
 			dispatch({
 				command: "applySettings",
@@ -1727,6 +1746,44 @@ describe("SettingsWebviewPanel", () => {
 			expect(mockInstallGeminiHook).toHaveBeenCalledWith("/workspace");
 			expect(mockRemoveClaudeHook).not.toHaveBeenCalled();
 			expect(mockRemoveGeminiHook).not.toHaveBeenCalled();
+		});
+
+		it("skips syncHooks when neither per-agent toggle transitioned", async () => {
+			// Post-#2-fix parity with IntelliJ SettingsDialog step 2b: an
+			// Apply that doesn't flip claudeEnabled or geminiEnabled must not
+			// re-run per-worktree hook writes — otherwise a paused repo would
+			// see the "Re-enable Jolli Memory" balloon on every unrelated save
+			// (excludePatterns, localFolder, model, …). Hook-drift healing on
+			// unrelated saves is covered by AutoInstaller at startup.
+			const dispatch = await setupWithLoadedConfig({
+				claudeEnabled: true,
+				geminiEnabled: true,
+			});
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "changed",
+				},
+			});
+			await flushPromises();
+
+			expect(mockInstallClaudeHook).not.toHaveBeenCalled();
+			expect(mockInstallGeminiHook).not.toHaveBeenCalled();
+			expect(mockRemoveClaudeHook).not.toHaveBeenCalled();
+			expect(mockRemoveGeminiHook).not.toHaveBeenCalled();
+			// Config write still lands — the point of the gate is to preserve
+			// non-hook settings on an untransitioned save, not block them.
+			expect(mockSaveConfigScoped).toHaveBeenCalled();
 		});
 
 		it("skips hook install/removal while the project is manually disabled but still saves global config", async () => {
@@ -1769,7 +1826,11 @@ describe("SettingsWebviewPanel", () => {
 				"/workspace-wt1",
 				"/workspace-wt2",
 			]);
-			const dispatch = await setupWithLoadedConfig();
+			// Force a transition so the post-#2-fix gate lets syncHooks run.
+			const dispatch = await setupWithLoadedConfig({
+				claudeEnabled: false,
+				geminiEnabled: false,
+			});
 
 			dispatch({
 				command: "applySettings",
@@ -1796,7 +1857,11 @@ describe("SettingsWebviewPanel", () => {
 
 		it("falls back to repoRoot when listWorktrees throws", async () => {
 			mockListWorktrees.mockRejectedValue(new Error("git not found"));
-			const dispatch = await setupWithLoadedConfig();
+			// Force a transition so the post-#2-fix gate lets syncHooks run.
+			const dispatch = await setupWithLoadedConfig({
+				claudeEnabled: false,
+				geminiEnabled: false,
+			});
 
 			dispatch({
 				command: "applySettings",
@@ -1821,7 +1886,12 @@ describe("SettingsWebviewPanel", () => {
 
 		it("posts settingsError when installClaudeHook throws for a worktree", async () => {
 			mockInstallClaudeHook.mockRejectedValue(new Error("permission denied"));
-			const dispatch = await setupWithLoadedConfig();
+			// Force a transition (off → on) so the post-#2-fix gate lets the
+			// install path run and hit the mocked failure.
+			const dispatch = await setupWithLoadedConfig({
+				claudeEnabled: false,
+				geminiEnabled: false,
+			});
 
 			dispatch({
 				command: "applySettings",
@@ -1890,7 +1960,12 @@ describe("SettingsWebviewPanel", () => {
 
 		it("posts settingsError when installGeminiHook throws for a worktree", async () => {
 			mockInstallGeminiHook.mockRejectedValue(new Error("disk full"));
-			const dispatch = await setupWithLoadedConfig();
+			// Force a transition (off → on) so the post-#2-fix gate lets the
+			// install path run and hit the mocked failure.
+			const dispatch = await setupWithLoadedConfig({
+				claudeEnabled: false,
+				geminiEnabled: false,
+			});
 
 			dispatch({
 				command: "applySettings",
@@ -1954,6 +2029,90 @@ describe("SettingsWebviewPanel", () => {
 				message: "Failed to save settings",
 			});
 			expect(mockSaveConfigScoped).not.toHaveBeenCalled();
+		});
+
+		// ── Manual-disable opt-out ────────────────────────────────────────────
+		// The Settings panel stays reachable while the repo is manually
+		// disabled (it's the sign-in / Memory Bank entry point), so
+		// syncHooks must not silently reinstall per-project hooks. Prior
+		// behaviour was to return silently; now the user is told and given
+		// a direct action to lift the opt-out.
+
+		it("skips hook install/remove and surfaces a re-enable notification when the repo is manually disabled", async () => {
+			setManuallyDisabled(true);
+			try {
+				// Force a per-agent transition so the post-#2-fix gate lets
+				// syncHooks run at all — the notification only surfaces
+				// through the manuallyDisabled short-circuit inside syncHooks,
+				// which is skipped entirely when no toggle changed.
+				const dispatch = await setupWithLoadedConfig({
+					claudeEnabled: false,
+					geminiEnabled: false,
+				});
+				dispatch({
+					command: "applySettings",
+					maskedApiKey: "",
+					maskedJolliApiKey: "",
+					settings: {
+						apiKey: "",
+						model: "sonnet",
+						maxTokens: null,
+						jolliApiKey: "",
+						claudeEnabled: true,
+						codexEnabled: true,
+						geminiEnabled: true,
+						excludePatterns: "",
+					},
+				});
+				await flushPromises();
+				// Hooks are NOT touched — the machine-owned opt-out overrides the toggle.
+				expect(mockInstallClaudeHook).not.toHaveBeenCalled();
+				expect(mockRemoveClaudeHook).not.toHaveBeenCalled();
+				expect(mockInstallGeminiHook).not.toHaveBeenCalled();
+				expect(mockRemoveGeminiHook).not.toHaveBeenCalled();
+				// … but the user is told their toggles won't take effect until re-enable.
+				expect(mockShowInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Jolli Memory is paused"),
+					"Re-enable Jolli Memory",
+				);
+				// Config still persists — the user's declared preference is stored so
+				// the startup self-heal can pick it up after re-enable.
+				expect(mockSaveConfigScoped).toHaveBeenCalled();
+			} finally {
+				setManuallyDisabled(false);
+			}
+		});
+
+		it("routes the 'Re-enable Jolli Memory' notification button to the enable command", async () => {
+			setManuallyDisabled(true);
+			mockShowInformationMessage.mockResolvedValueOnce("Re-enable Jolli Memory");
+			try {
+				// Force a per-agent transition so the post-#2-fix gate lets
+				// syncHooks run and surface the manually-disabled notification.
+				const dispatch = await setupWithLoadedConfig({
+					claudeEnabled: false,
+					geminiEnabled: false,
+				});
+				dispatch({
+					command: "applySettings",
+					maskedApiKey: "",
+					maskedJolliApiKey: "",
+					settings: {
+						apiKey: "",
+						model: "sonnet",
+						maxTokens: null,
+						jolliApiKey: "",
+						claudeEnabled: true,
+						codexEnabled: true,
+						geminiEnabled: true,
+						excludePatterns: "",
+					},
+				});
+				await flushPromises();
+				expect(mockExecuteCommand).toHaveBeenCalledWith("jollimemory.enableJolliMemory");
+			} finally {
+				setManuallyDisabled(false);
+			}
 		});
 	});
 

@@ -19,7 +19,20 @@ vi.mock("./ConversationOverlayStore.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./ConversationOverlayStore.js")>();
 	return { ...actual, loadOverlay: vi.fn(actual.loadOverlay) };
 });
-vi.mock("./SessionTracker.js", () => ({ loadAllSessions: vi.fn().mockResolvedValue([]) }));
+// loadConfig: empty config = every source enabled (the `!== false` fail-open
+// convention), matching the pre-toggle-filter behaviour these tests were written
+// against; toggle-specific tests override per case.
+// Partial mock: preserve the real `isSourceEnabled` (the aggregator's per-source
+// early-return uses it directly, and the toggle-specific tests below rely on
+// the true switch semantics). Only the two IO-heavy helpers are stubbed.
+vi.mock("./SessionTracker.js", async (importActual) => {
+	const actual = await importActual<typeof import("./SessionTracker.js")>();
+	return {
+		...actual,
+		loadAllSessions: vi.fn().mockResolvedValue([]),
+		loadConfig: vi.fn().mockResolvedValue({}),
+	};
+});
 vi.mock("./SessionTitleResolver.js", () => ({
 	resolveSessionTitle: vi.fn().mockImplementation(async (s) => s.title ?? `resolved:${s.sessionId}`),
 }));
@@ -31,7 +44,11 @@ vi.mock("./TranscriptMessageCounter.js", () => ({
 	loadUnreadMergedTranscript: vi.fn().mockResolvedValue([{ role: "human", content: "msg" }]),
 }));
 
-import { listActiveConversations } from "./ActiveSessionAggregator.js";
+import {
+	isSourceEnabled,
+	listActiveConversations,
+	listActiveConversationsWithDiagnostics,
+} from "./ActiveSessionAggregator.js";
 import { scanAntigravitySessions } from "./AntigravitySessionDiscoverer.js";
 import { scanClineCliSessions } from "./ClineCliSessionDiscoverer.js";
 import { scanClineSessions } from "./ClineSessionDiscoverer.js";
@@ -764,5 +781,196 @@ describe("listActiveConversations", () => {
 		} finally {
 			rmSync(projectDir, { recursive: true, force: true });
 		}
+	});
+
+	// ─── Per-source config disable ──────────────────────────────────────────
+	// Each xxxEnabled === false short-circuits the loader before it touches
+	// disk. One test per loader keeps the negative-toggle branch covered.
+	describe("config toggle: per-source disable", () => {
+		async function setConfigOnce(config: Record<string, unknown>): Promise<void> {
+			const { loadConfig } = await import("./SessionTracker.js");
+			vi.mocked(loadConfig).mockResolvedValueOnce(config);
+		}
+
+		it("skips scanCursorSessions when cursorEnabled=false", async () => {
+			await setConfigOnce({ cursorEnabled: false });
+			vi.mocked(scanCursorSessions).mockResolvedValueOnce(
+				scan([{ sessionId: "off", transcriptPath: "/x", updatedAt: iso(-HOUR), source: "cursor" }]),
+			);
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+			expect(scanCursorSessions).not.toHaveBeenCalled();
+		});
+
+		it("skips discoverCodexSessions when codexEnabled=false", async () => {
+			await setConfigOnce({ codexEnabled: false });
+			vi.mocked(discoverCodexSessions).mockResolvedValueOnce([
+				{ sessionId: "off", transcriptPath: "/x", updatedAt: iso(-HOUR), source: "codex" },
+			]);
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+			expect(discoverCodexSessions).not.toHaveBeenCalled();
+		});
+
+		it("skips scanOpenCodeSessions when openCodeEnabled=false", async () => {
+			await setConfigOnce({ openCodeEnabled: false });
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+			expect(scanOpenCodeSessions).not.toHaveBeenCalled();
+		});
+
+		it("skips scanCopilotSessions when copilotEnabled=false", async () => {
+			await setConfigOnce({ copilotEnabled: false });
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+			// copilot AND copilot-chat share the copilotEnabled toggle.
+			expect(scanCopilotSessions).not.toHaveBeenCalled();
+			expect(scanCopilotChatSessions).not.toHaveBeenCalled();
+		});
+
+		it("skips scanClineSessions when clineEnabled=false", async () => {
+			await setConfigOnce({ clineEnabled: false });
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+			// cline AND cline-cli share the clineEnabled toggle.
+			expect(scanClineSessions).not.toHaveBeenCalled();
+			expect(scanClineCliSessions).not.toHaveBeenCalled();
+		});
+
+		it("skips scanDevinSessions when devinEnabled=false", async () => {
+			await setConfigOnce({ devinEnabled: false });
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+			expect(scanDevinSessions).not.toHaveBeenCalled();
+		});
+
+		it("skips scanCursorCliSessions when cursorEnabled=false (shared toggle)", async () => {
+			await setConfigOnce({ cursorEnabled: false });
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+			expect(scanCursorCliSessions).not.toHaveBeenCalled();
+		});
+
+		it("skips scanAntigravitySessions when antigravityEnabled=false", async () => {
+			await setConfigOnce({ antigravityEnabled: false });
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+			expect(scanAntigravitySessions).not.toHaveBeenCalled();
+		});
+
+		it("loadClaudeAndGemini short-circuits when BOTH toggles are off", async () => {
+			await setConfigOnce({ claudeEnabled: false, geminiEnabled: false });
+			const { loadAllSessions } = await import("./SessionTracker.js");
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+			expect(loadAllSessions).not.toHaveBeenCalled();
+		});
+
+		it("loadClaudeAndGemini filters Claude rows out when only claudeEnabled=false", async () => {
+			await setConfigOnce({ claudeEnabled: false });
+			const { loadAllSessions } = await import("./SessionTracker.js");
+			vi.mocked(loadAllSessions).mockResolvedValueOnce([
+				{ sessionId: "keep-gemini", transcriptPath: "/g", updatedAt: iso(-HOUR), source: "gemini" },
+				{ sessionId: "drop-claude", transcriptPath: "/c", updatedAt: iso(-HOUR), source: "claude" },
+				// legacy row without an explicit source — treated as claude and dropped.
+				{ sessionId: "drop-legacy", transcriptPath: "/l", updatedAt: iso(-HOUR) } as SessionInfo,
+			]);
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items.map((i) => i.sessionId)).toEqual(["keep-gemini"]);
+		});
+
+		it("loadClaudeAndGemini filters Gemini rows out when only geminiEnabled=false", async () => {
+			await setConfigOnce({ geminiEnabled: false });
+			const { loadAllSessions } = await import("./SessionTracker.js");
+			vi.mocked(loadAllSessions).mockResolvedValueOnce([
+				{ sessionId: "keep-claude", transcriptPath: "/c", updatedAt: iso(-HOUR), source: "claude" },
+				{ sessionId: "drop-gemini", transcriptPath: "/g", updatedAt: iso(-HOUR), source: "gemini" },
+			]);
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items.map((i) => i.sessionId)).toEqual(["keep-claude"]);
+		});
+	});
+
+	// Extra coverage on top of `discoverer error envelope` above: cline-cli's
+	// standalone catch (target block covers cline but not cline-cli), and a
+	// two-source aggregation smoke check.
+	describe("extra discoverer catches", () => {
+		it("loadClineCli catches throws from the discoverer module", async () => {
+			vi.mocked(scanClineCliSessions).mockRejectedValueOnce(new Error("cline-cli blew up"));
+			const items = await listActiveConversations({ cwd: "/proj", windowMs: 2 * DAY });
+			expect(items).toEqual([]);
+		});
+
+		it("listActiveConversationsWithDiagnostics surfaces failedSources for the newly-covered loaders", async () => {
+			vi.mocked(scanDevinSessions).mockRejectedValueOnce(new Error("devin down"));
+			vi.mocked(scanAntigravitySessions).mockRejectedValueOnce(new Error("antigravity down"));
+			const result = await listActiveConversationsWithDiagnostics({
+				cwd: "/proj",
+				windowMs: 2 * DAY,
+			});
+			expect([...result.failedSources].sort()).toEqual(["antigravity", "devin"]);
+		});
+	});
+});
+
+// ─── isSourceEnabled unit tests ────────────────────────────────────────────
+// Direct decisions on the (source, config) pair — no aggregator plumbing.
+describe("isSourceEnabled", () => {
+	it("treats undefined source as claude and gates on claudeEnabled", () => {
+		expect(isSourceEnabled(undefined, {})).toBe(true);
+		expect(isSourceEnabled(undefined, { claudeEnabled: false })).toBe(false);
+	});
+
+	it("returns true by default (fail-open) for every source when no toggle is set", () => {
+		const sources = [
+			"claude",
+			"codex",
+			"gemini",
+			"opencode",
+			"cursor",
+			"cursor-cli",
+			"copilot",
+			"copilot-chat",
+			"cline",
+			"cline-cli",
+			"devin",
+			"antigravity",
+		] as const;
+		for (const s of sources) {
+			expect(isSourceEnabled(s, {})).toBe(true);
+		}
+	});
+
+	it("respects each source's xxxEnabled=false toggle", () => {
+		expect(isSourceEnabled("claude", { claudeEnabled: false })).toBe(false);
+		expect(isSourceEnabled("codex", { codexEnabled: false })).toBe(false);
+		expect(isSourceEnabled("gemini", { geminiEnabled: false })).toBe(false);
+		expect(isSourceEnabled("opencode", { openCodeEnabled: false })).toBe(false);
+		expect(isSourceEnabled("devin", { devinEnabled: false })).toBe(false);
+		expect(isSourceEnabled("antigravity", { antigravityEnabled: false })).toBe(false);
+	});
+
+	it("groups cursor + cursor-cli under a single cursorEnabled toggle", () => {
+		expect(isSourceEnabled("cursor", { cursorEnabled: false })).toBe(false);
+		expect(isSourceEnabled("cursor-cli", { cursorEnabled: false })).toBe(false);
+		expect(isSourceEnabled("cursor", { cursorEnabled: true })).toBe(true);
+		expect(isSourceEnabled("cursor-cli", { cursorEnabled: true })).toBe(true);
+	});
+
+	it("groups copilot + copilot-chat under a single copilotEnabled toggle", () => {
+		expect(isSourceEnabled("copilot", { copilotEnabled: false })).toBe(false);
+		expect(isSourceEnabled("copilot-chat", { copilotEnabled: false })).toBe(false);
+	});
+
+	it("groups cline + cline-cli under a single clineEnabled toggle", () => {
+		expect(isSourceEnabled("cline", { clineEnabled: false })).toBe(false);
+		expect(isSourceEnabled("cline-cli", { clineEnabled: false })).toBe(false);
+	});
+
+	it("returns true for a source that isn't in the switch (future-proof default arm)", () => {
+		// A hypothetical future TranscriptSource value that this file hasn't
+		// been taught about yet — the aggregator MUST fail open so the new
+		// source appears rather than vanishing behind a stale switch.
+		expect(isSourceEnabled("future-tool" as never, {})).toBe(true);
 	});
 });

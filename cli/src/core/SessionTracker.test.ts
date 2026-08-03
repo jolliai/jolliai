@@ -1756,13 +1756,43 @@ describe("SessionTracker", () => {
 			expect(result).toHaveLength(3);
 		});
 
-		it("should always pass through Codex sessions (filtered separately via discovery)", () => {
+		// codex has its own gate (codexEnabled) that is INDEPENDENT of claudeEnabled /
+		// geminiEnabled. This case pins the independence — flipping the sibling flags
+		// does not drop codex — but the flag now IS honored (see the codexEnabled=false
+		// case below) after the historical drift where filterSessions silently ignored
+		// codexEnabled.
+		it("keeps codex sessions when only claude/gemini are disabled", () => {
 			const result = filterSessionsByEnabledIntegrations([claudeSession, codexSession, geminiSession], {
 				claudeEnabled: false,
 				geminiEnabled: false,
 			});
 			expect(result).toHaveLength(1);
 			expect(result[0].source).toBe("codex");
+		});
+
+		it("drops codex sessions when codexEnabled is false", () => {
+			const result = filterSessionsByEnabledIntegrations([claudeSession, codexSession, geminiSession], {
+				codexEnabled: false,
+			});
+			expect(result.map((s) => s.source)).toEqual(["claude", "gemini"]);
+		});
+
+		it("keeps codex sessions when codexEnabled is unset or true", () => {
+			expect(filterSessionsByEnabledIntegrations([codexSession], {})).toEqual([codexSession]);
+			expect(filterSessionsByEnabledIntegrations([codexSession], { codexEnabled: true })).toEqual([codexSession]);
+		});
+
+		it("passes an unknown source through (default arm — fail-open for future sources)", () => {
+			// A source string not covered by the switch in isSourceEnabled must not
+			// be silently dropped: if a future TranscriptSource lands in production
+			// telemetry ahead of the switch being updated, we still want the row.
+			const future = {
+				sessionId: "f",
+				transcriptPath: "/f",
+				updatedAt: "2026-08-04T00:00:00Z",
+				source: "future-tool" as never,
+			};
+			expect(filterSessionsByEnabledIntegrations([future], {})).toEqual([future]);
 		});
 
 		it("should exclude Claude sessions when claudeEnabled is false", () => {

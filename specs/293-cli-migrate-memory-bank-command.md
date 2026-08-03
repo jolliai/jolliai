@@ -1,5 +1,7 @@
 # 293. `jolli migrate-memory-bank` — Memory Bank Migration Bridge
 
+> **REMOVED.** The hidden `jolli migrate-memory-bank` CLI command no longer exists. IntelliJ now reaches the same migration engine through the `ide-bridge migrate-memory-bank` action (daemon fast path, one-shot spawn fallback), keeping the no-sign-in contract. This document is preserved verbatim for historical context — the invocation form, exit-code contract, and JSON envelope described below apply to the retired CLI command, not the current bridge. See the ide-bridge command spec for the current shape.
+
 ## Topic Statement
 
 A hidden command that runs the orphan-branch-to-Memory-Bank-folder migration for one project and reports the outcome as a single JSON line, giving out-of-process hosts (a JVM-based IDE plugin, which spawns the command rather than importing the engine) the same on-startup migration behavior the bundling editor host performs in-process — and deliberately without requiring a product sign-in.

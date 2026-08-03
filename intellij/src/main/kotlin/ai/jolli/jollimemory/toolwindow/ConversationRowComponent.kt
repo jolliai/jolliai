@@ -18,7 +18,7 @@ import javax.swing.JTextArea
 /**
  * A single row in the [ActiveConversationsPanel]. Shows a color-coded source
  * badge and the conversation title, with an unread message count that swaps to
- * hover actions: Pin · Open (eye) · Continue · and a select toggle.
+ * hover actions: Pin · select toggle.
  *
  * Selection replaces the old checkbox: a selected row reads normally and shows a
  * ✕ (exclude) on hover; clicking it strikes the title through and the icon flips
@@ -30,7 +30,6 @@ class ConversationRowComponent(
 	val item: ActiveConversationItem,
 	private val onRowClicked: (ActiveConversationItem) -> Unit,
 	private val onPin: (ActiveConversationItem) -> Unit,
-	private val onResume: (ActiveConversationItem) -> Unit,
 	private val onSelectionChanged: (ActiveConversationItem, Boolean) -> Unit,
 ) : JPanel(BorderLayout()) {
 
@@ -63,13 +62,6 @@ class ConversationRowComponent(
 	private var rightWrap: JComponent? = null
 
 	private val pinLabel = actionIcon(AllIcons.General.Pin_tab, "Pin") { onPin(item) }
-	private val eyeLabel = actionIcon(JolliMemoryIcons.Eye, "Open conversation") { onRowClicked(item) }
-	private val resumeLabel = actionIcon(AllIcons.Actions.Execute, "Resume session in terminal") { onResume(item) }
-
-	// Resume runs `claude --resume <id>`, which only works for Claude sessions. For
-	// other sources (Codex, etc.) the icon was shown but the handler silently no-op'd,
-	// so hide it entirely for non-Claude rows (matches the Committed/Pinned panels).
-	private val canResume = item.source == TranscriptSource.claude
 	private val toggleLabel = JLabel().apply {
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
 		isVisible = false
@@ -116,8 +108,6 @@ class ConversationRowComponent(
 		background = if (hovered) RowStyle.HOVER_BG else null
 		countLabel.isVisible = !hovered
 		pinLabel.isVisible = hovered
-		eyeLabel.isVisible = hovered
-		resumeLabel.isVisible = hovered && canResume
 		toggleLabel.isVisible = hovered
 		repaint()
 	}
@@ -154,23 +144,20 @@ class ConversationRowComponent(
 		add(left, BorderLayout.WEST)
 		add(titleLabel, BorderLayout.CENTER)
 
-		// Right side: count (default) swaps to Pin · Open · Continue · toggle on hover.
+		// Right side: count (default) swaps to Pin · toggle on hover.
 		val rightPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false }
 		rightPanel.add(countLabel)
 		rightPanel.add(pinLabel)
-		rightPanel.add(eyeLabel)
-		if (canResume) rightPanel.add(resumeLabel)
 		rightPanel.add(toggleLabel)
 		// Reserve the widest state's width (hover actions) so the title's wrap width is
 		// stable whether or not the row is hovered. The toggle icon is set in
-		// applySelectionState() — give it one here first so its width is counted (else
-		// the 4th icon is clipped).
+		// applySelectionState() — give it one here first so its width is counted.
 		toggleLabel.icon = AllIcons.Actions.Close
 		countLabel.isVisible = false
-		pinLabel.isVisible = true; eyeLabel.isVisible = true; resumeLabel.isVisible = canResume; toggleLabel.isVisible = true
+		pinLabel.isVisible = true; toggleLabel.isVisible = true
 		val reservedRightW = rightPanel.preferredSize.width
 		countLabel.isVisible = true
-		pinLabel.isVisible = false; eyeLabel.isVisible = false; resumeLabel.isVisible = false; toggleLabel.isVisible = false
+		pinLabel.isVisible = false; toggleLabel.isVisible = false
 		val right = RowStyle.vCenter(rightPanel).apply {
 			preferredSize = Dimension(reservedRightW, JBUI.scale(16))
 			minimumSize = Dimension(reservedRightW, 0)
@@ -207,7 +194,7 @@ class ConversationRowComponent(
 		addMouseListener(hoverListener)
 		addMouseListener(clickListener)
 		// Icons handle their own clicks; the row body (badge/title/count) opens the conversation.
-		for (c in listOf(left, leftPanel, badge, titleLabel, right, rightPanel, countLabel, pinLabel, eyeLabel, resumeLabel, toggleLabel)) {
+		for (c in listOf(left, leftPanel, badge, titleLabel, right, rightPanel, countLabel, pinLabel, toggleLabel)) {
 			c.addMouseListener(hoverListener)
 			if (c === left || c === leftPanel || c === badge || c === titleLabel || c === rightPanel || c === countLabel) {
 				c.addMouseListener(clickListener)
@@ -298,14 +285,22 @@ internal class SourceBadge private constructor(label: String, private val badgeC
 			else -> name.replaceFirstChar { it.uppercase() }
 		}
 
+		// Palette mirrors VS Code's SidebarCssBuilder .transcript-source-* rules
+		// so a conversation's badge reads the same across IDEs when a source has
+		// no logo. Sources with a logo (see JolliMemoryIcons.sourceLogo) never
+		// hit this fallback; kept only for the "logo failed to load" edge case
+		// and for sources that ship without an SVG (devin, antigravity).
 		private val SOURCE_COLORS = mapOf(
 			TranscriptSource.claude to JBColor(Color(217, 119, 6), Color(217, 119, 6)),
 			TranscriptSource.gemini to JBColor(Color(5, 150, 105), Color(5, 150, 105)),
 			TranscriptSource.codex to JBColor(Color(124, 58, 237), Color(124, 58, 237)),
 			TranscriptSource.opencode to JBColor(Color(37, 99, 235), Color(37, 99, 235)),
 			TranscriptSource.cursor to JBColor(Color(220, 38, 38), Color(220, 38, 38)),
+			TranscriptSource.`cursor-cli` to JBColor(Color(220, 38, 38), Color(220, 38, 38)),
 			TranscriptSource.copilot to JBColor(Color(45, 164, 78), Color(45, 164, 78)),
 			TranscriptSource.`copilot-chat` to JBColor(Color(45, 164, 78), Color(45, 164, 78)),
+			TranscriptSource.devin to JBColor(Color(212, 212, 216), Color(212, 212, 216)),
+			TranscriptSource.antigravity to JBColor(Color(244, 114, 182), Color(244, 114, 182)),
 		)
 	}
 }

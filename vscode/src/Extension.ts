@@ -3904,6 +3904,12 @@ export function activate(context: vscode.ExtensionContext): void {
 						// requiring a window reload.
 						bridge.reloadStorage();
 						await statusStore.refresh();
+						// AI Agents toggles gate the Active Conversations list — push an
+						// immediate refresh so a saved toggle flip hides/shows rows now
+						// instead of on the next 60s poll tick. Parity with the IntelliJ
+						// settings dialog, whose save refreshes the panel via its status
+						// listener.
+						await sidebarProvider.refreshConversationsPanel();
 						// Re-resolve the sidebar's KB root in case the user changed
 						// "Local Folder". When it moves, drop the cached folder tree
 						// so the next listing reads from the new path.

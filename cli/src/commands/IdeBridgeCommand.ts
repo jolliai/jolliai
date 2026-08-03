@@ -1020,6 +1020,139 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 			const windowMs = typeof request.windowMs === "number" ? request.windowMs : 2 * 24 * 60 * 60 * 1000;
 			return listActiveConversationsWithDiagnostics({ cwd, windowMs });
 		}
+		case "migrate-memory-bank": {
+			// IntelliJ's migration route — the same runMemoryBankMigration the
+			// hidden `jolli migrate-memory-bank` one-shot command wraps, delivered
+			// over the standard ide-bridge transport so the long-lived daemon can
+			// serve it (~5-20ms startup vs a dedicated cold Node spawn's
+			// ~500ms-2s). Long-running (minutes on a large first-install): the
+			// daemon dispatches requests concurrently, so it cannot block
+			// hot-path actions, and callers pass a large timeout.
+			const { runMemoryBankMigration } = await import("../core/MemoryBankMigration.js");
+			return runMemoryBankMigration(cwd);
+		}
+		case "sync-agent-hooks": {
+			// Per-worktree Claude Stop + Gemini AfterAgent hook sync, called by
+			// the IntelliJ Settings dialog when the user flips a per-agent toggle.
+			// Mirrors VS Code's in-process `SettingsWebviewPanel.syncHooks`
+			// (vscode/src/views/SettingsWebviewPanel.ts) — same installers, same
+			// per-worktree iteration, same manual-disable early-return. Reuses the
+			// exported hook helpers from `install/Installer.js` so the two
+			// surfaces cannot drift.
+			//
+			// Runs on the daemon fast path (~5-20ms) instead of the previous
+			// unconditional `enable --integrations-only` subprocess spawn
+			// (~500ms-2s cold Node start) every Apply. Idempotent: re-saving with
+			// the same values re-writes the same hook block, matching how VS Code
+			// treats settings save.
+			//
+			// Serialized against enable/disable via [acquireRepoHooksLock] — the
+			// SAME lock the installer / uninstaller take (Installer.ts:327/868),
+			// so a Settings Apply that lands mid-way through the IntelliJ startup
+			// auto-install cannot interleave read-modify-writes on
+			// `.claude/settings.local.json`. `reconcileClaudeAgentHooks`'
+			// per-call atomicity is only intra-call; the lock is what prevents
+			// two callers (start-up install + Apply's sync-agent-hooks) from
+			// clobbering each other's Stop/SessionStart block. Lock timeout
+			// (default 60 s) throws — the caller renders a "click Apply again"
+			// balloon, which is the right recovery for a genuine contention.
+			if (typeof request.claudeEnabled !== "boolean" || typeof request.geminiEnabled !== "boolean") {
+				throw new Error('Request fields "claudeEnabled" and "geminiEnabled" must be booleans.');
+			}
+			const claudeEnabled = request.claudeEnabled;
+			const geminiEnabled = request.geminiEnabled;
+			const { readManualDisableFlag } = await import("../core/RepoProfile.js");
+			// Highest-priority opt-out is enforced by CLI/VS Code alike. The
+			// Settings dialog stays reachable while manually disabled (it's the
+			// re-enable entry point), so we must not silently reinstate hooks.
+			// Checked BEFORE taking the repo-hooks lock so a manually-disabled
+			// repo (the common case where this action fires from a Settings save
+			// on an unrelated field) doesn't contend with a concurrent
+			// enable/disable — the flag itself is stable across the lock.
+			if (await readManualDisableFlag(cwd)) {
+				return { manuallyDisabled: true, worktrees: [], failures: [] };
+			}
+			const { acquireRepoHooksLock } = await import("../core/Locks.js");
+			const repoLock = await acquireRepoHooksLock(cwd);
+			if (!repoLock) {
+				throw new Error("Another Jolli enable/disable operation is still running; retry shortly");
+			}
+			try {
+				const { getProjectRootDir, listWorktrees } = await import("../core/GitOps.js");
+				const repoRoot = await getProjectRootDir(cwd).catch(() => cwd);
+				let worktrees: ReadonlyArray<string>;
+				try {
+					worktrees = await listWorktrees(repoRoot);
+				} catch {
+					// Detached checkout or missing `git worktree` — fall back to the
+					// current dir, exactly like VS Code does.
+					worktrees = [repoRoot];
+				}
+				const { installClaudeHook, removeClaudeHook, installGeminiHook, removeGeminiHook } = await import(
+					"../install/Installer.js"
+				);
+				const failures: Array<{ worktree: string; integration: string; message: string }> = [];
+				for (const wt of worktrees) {
+					try {
+						if (claudeEnabled) {
+							await installClaudeHook(wt);
+						} else {
+							await removeClaudeHook(wt);
+						}
+					} catch (err) {
+						failures.push({
+							worktree: wt,
+							integration: "Claude",
+							message: err instanceof Error ? err.message : String(err),
+						});
+					}
+					try {
+						if (geminiEnabled) {
+							await installGeminiHook(wt);
+						} else {
+							await removeGeminiHook(wt);
+						}
+					} catch (err) {
+						failures.push({
+							worktree: wt,
+							integration: "Gemini",
+							message: err instanceof Error ? err.message : String(err),
+						});
+					}
+				}
+				return { manuallyDisabled: false, worktrees: [...worktrees], failures };
+			} finally {
+				await repoLock.release();
+			}
+		}
+		case "disable": {
+			// Full or integrations-only disable, driven by the IntelliJ Settings
+			// dialog's Pause checkbox and its auto-signout branch. Wraps the same
+			// exported [uninstall] that VS Code's `bridge.disable()` calls
+			// in-process — so IntelliJ can reach the identical hook-removal /
+			// manual-disable code path via the daemon (~5-20 ms) or a one-shot
+			// `ide-bridge` spawn (~500 ms fallback) instead of the ~500 ms – 2 s
+			// cold `Cli.js disable` subprocess it used before.
+			//
+			// `persistManualDisable` defaults to the inverse of
+			// `integrationsOnly`, mirroring [`EnableCommand.ts`] `disable`
+			// branch: a full disable persists the machine-owned opt-out; an
+			// integrations-only teardown does not.
+			const integrationsOnly = request.integrationsOnly === true;
+			const persistManualDisable =
+				typeof request.persistManualDisable === "boolean" ? request.persistManualDisable : !integrationsOnly;
+			const { uninstall } = await import("../install/Installer.js");
+			const result = await uninstall(cwd, {
+				integrationsOnly,
+				persistManualDisable,
+				preserveMenu: !integrationsOnly,
+			});
+			return {
+				success: result.success,
+				message: result.message,
+				warnings: [...result.warnings],
+			};
+		}
 		case "unread-transcript": {
 			const source = stringField(request, "source") as TranscriptSource;
 			if (!TRANSCRIPT_SOURCES.has(source)) throw new Error(`Unknown transcript source "${source}".`);

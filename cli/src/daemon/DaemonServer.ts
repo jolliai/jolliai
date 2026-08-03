@@ -134,7 +134,12 @@ export function runDaemonServer(options: DaemonServerOptions): Promise<void> {
 	});
 
 	const watchers: DaemonWatcher[] = [];
-	const armRetries: NodeJS.Timeout[] = [];
+	// Set (not array): the retry callback removes its own timer once armed, and
+	// Set.delete on an absent entry is a no-op. An array with splice(indexOf, 1)
+	// would silently drop armRetries's LAST element on a -1 index, so a future
+	// change that pushed the timer late (or removed it twice) would corrupt the
+	// list without any visible failure.
+	const armRetries = new Set<NodeJS.Timeout>();
 	for (const target of computeWatchTargets(cwd)) {
 		const watcher = new DaemonWatcher({
 			path: target.path,
@@ -156,16 +161,14 @@ export function runDaemonServer(options: DaemonServerOptions): Promise<void> {
 			// having to wait for the next queue event to notice.
 			log.debug("Watcher target absent, polling to arm: %s", target.path);
 			const retry = setInterval(() => {
-				if (watcher.start()) {
-					clearInterval(retry);
-					const idx = armRetries.indexOf(retry);
-					if (idx >= 0) armRetries.splice(idx, 1);
-				}
+				if (!watcher.start()) return;
+				clearInterval(retry);
+				armRetries.delete(retry);
 			}, ARM_RETRY_MS);
 			// Don't hold the event loop open on this timer's account — the daemon
 			// still exits when the parent closes stdin.
 			retry.unref?.();
-			armRetries.push(retry);
+			armRetries.add(retry);
 		}
 		watchers.push(watcher);
 	}
