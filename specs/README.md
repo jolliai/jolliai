@@ -294,6 +294,7 @@ gate a change.
 - [289 — IDE-Bridge Refresh Notification Channel](289-ide-bridge-refresh-notification-channel.md) — push coarse queue and orphan-ref change notices to the IDE host, multiplexed onto the response stream and distinguished by having no correlation id.
 - [290 — Claude Plugin Session Bootstrap](290-claude-plugin-session-bootstrap-hook.md) — the plugin's single manifest action: a per-session reconciler that restores canonical installation under short-budget locks and never overrides a deliberate disable.
 - [303 — Claude Plugin Front-Door Menu Content](303-claude-plugin-front-door-menu-content.md) — the body of the plugin companion's action menu: its revision-ordering invariant over the standalone menu, the status fields it reads, and its provider-aware "can generate memories" derivation.
+- [328 — Codex Plugin Package](328-codex-plugin-package.md) — the Claude plugin's structural sibling and the five places the two hosts diverge: manifest paths, a strict one-JSON-object hook envelope, no plugin MCP manifest, committed static skills, and tag-driven host isolation.
 
 ## Workflows
 

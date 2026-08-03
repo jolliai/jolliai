@@ -17,6 +17,7 @@ Persist a small bookmark per transcript, in one registry document per scanning p
 - Behavior when the underlying transcript file shrinks, is rotated, or disappears.
 - Pruning of orphaned cursors when their backing session is dropped from the session registry.
 - Behavior when a cursor registry document is absent, empty, or unparseable.
+- Cross-process serialization shared with session-registry writes and cursor migration.
 
 **Out of scope (boundaries):**
 - The format of the transcript itself (per-source line schemas, message merging, content cleaning).
@@ -67,9 +68,11 @@ The cursor reader's caller receives, alongside parsed entries, a freshly-built c
 
 ### Save (the upsert path)
 1. Ensure the project-scoped state directory exists.
-2. Load the current registry for the purpose's document (see "Load").
-3. Copy the cursor map and install the supplied cursor record under the transcript locator carried on that record.
-4. Wrap the result in a fresh registry document with schema version 1 and write it atomically via the temp-file + rename primitive.
+2. Acquire the worktree-local `sessions.lock`.
+3. Re-load the current registry for the purpose's document after acquisition (see "Load").
+4. Copy the cursor map and install the supplied cursor record under the transcript locator carried on that record.
+5. Wrap the result in a fresh registry document with schema version 1 and write it atomically via the temp-file + rename primitive.
+6. Release the lock in a `finally` path.
 
 There is no validation that the supplied locator actually exists on disk; the registry stores whatever the caller provided. The save entry points are per-purpose: a caller chooses the document by choosing which entry point it calls, not by decorating the key.
 
@@ -118,7 +121,7 @@ A third scan — skill discovery — rides the same merged discovery document an
 
 **Reading one extractor's line.** The resume line for an extractor is its own mark, or 0 when it has none. Zero is the correct answer both for a transcript never seen and for an extractor that has never run here — including when a bare line offset written by an older dist claims progress that extractor never actually made.
 
-**Advancing one extractor.** A save takes the locator, the extractor name, and a line, and:
+**Advancing one extractor.** A save takes the locator, the extractor name, and a line. The whole cycle runs under the same worktree-local `sessions.lock` as the shared-watermark save, and for the same reason: it is a read-modify-write over the *same document*, so an unlocked advance here would clobber a locked save there and defeat the lock for both. Monotonicity does not substitute for the lock — what a lost write drops is the *other* extractors' marks in that record, and a dropped mark reads as a full rewind for its extractor. Under the lock it:
 1. Sets that extractor's mark to the **maximum** of its existing mark and the supplied line, so a retry after a partially-failed scan resumes where the last successful pass ended and a late stale value cannot undo real progress.
 2. Recomputes the shared line offset as the **minimum** across the legacy-covered extractors and the one just advanced. A legacy-covered extractor with no mark of its own contributes the record's existing shared line offset instead — 0 when there is no record at all, because a brand-new record cannot assert that the *other* extractors have made progress.
 3. Carries the resume anchor forward when the record had one, and writes the whole record back atomically.
@@ -174,6 +177,7 @@ The line offset on a cursor is monotonically non-decreasing across normal use (e
 - **Resumption is line-count-based for most producers but not for all, and the exception changes the failure mode rather than refining it.** A producer whose stored conversation can be *re-pointed* by a regeneration resumes by an opaque anchor instead, and when that anchor is gone it re-reads the whole conversation rather than resuming positionally. So a non-append-only producer trades duplicate work for correctness, while every append-only producer keeps the silent-wrong-slice risk described below. (Surprising; the anchor is the only field here whose meaning this mechanism does not define.)
 - **The cursor counts lines, not entries.** A line that fails to parse, a blank line that was filtered out, and a comment line all advance the offset by one. The offset is therefore safe to compute against the raw split-by-newlines representation of the file but tells the caller nothing about how many useful entries lie below it.
 - **Advance-only-on-successful-processing is a caller convention, not enforced by the registry.** The registry has no transactional API. The reader returns a candidate "next cursor" alongside the entries; the caller must do its downstream work first and only then call save. If the caller saves before processing and the process crashes, the next run will skip those lines. This is a known trade-off and is the reason the read API returns the new cursor as a value rather than auto-persisting it.
+- **Concurrent saves merge rather than overwrite unrelated cursors.** Every read-modify-write over these documents — the save path, the per-extractor mark advance, legacy-cursor migration, session upsert, and orphan pruning — shares `sessions.lock` and re-reads under it. The set has to be exhaustive to be worth anything: one writer left outside would clobber the locked ones just as freely as two unlocked writers clobber each other. A lock timeout is best-effort and reopens a small residual last-writer-wins window, but ordinary Codex/Claude/worker overlap is serialized.
 - **No detection of file shrink, rotation, or replacement — except by the one producer that sets a resume anchor.** For every other producer the record carries only a line count and a recorded-at timestamp, so if the underlying transcript is truncated, replaced, or rotated such that line N is now different content, the next read resumes at the same line count into the new content and silently produces wrong results. No reader compares file size, modification time, or inode against the cursor's recorded-at timestamp. There is also no error path for "transcript is shorter than the cursor offset" — the read yields no entries and advances no further. The anchor-setting producer is the exception, and detecting exactly this class of change is why its anchor exists: it validates the anchor against the freshly-rebuilt sequence and re-reads from the start when it is gone. (Surprising; the design accepts the general case because the other supported transcript formats are all append-only in practice.)
 - **Read errors are flattened to empty (consistent with the session registry).** A missing or corrupt registry document yields an empty cursor map, and individual lookups return null. Callers see "no prior cursor" and start from the beginning; there is no error surface for "registry exists but is corrupt."
 - **The cutoff parameter changes the advancement mode.** When the caller passes a wall-clock cutoff (used by the queued-commit worker to attribute transcript lines to the correct commit), the reader advances only to the last line whose timestamp was at or below the cutoff. Without a cutoff, the reader advances to end-of-file. This means the same transcript file is read at two different cadences depending on whether the consumer is doing incremental scanning or commit-attributed scanning. The cursor's storage shape is identical in both cases.
@@ -184,6 +188,7 @@ The line offset on a cursor is monotonically non-decreasing across normal use (e
 
 ## Shared Behavior
 - The session-registry pruning pass that triggers orphan-cursor cleanup is defined by **Session Registry Pruning**. That topic also defines the staleness threshold, the cleanup fan-out point, and the join-key invariant (transcript locator).
+- The `sessions.lock` primitive characteristics and failure discipline are catalogued in **Lock Primitive Registry** (spec 297).
 - The atomic-write primitive (temp-file + rename, with Windows fallback) is shared with the session registry, plans registry, configuration, and pending-state files; see **Session Registry Pruning** for the full description.
 - The format and parsing of individual transcript lines (per-source) and the merging of consecutive same-role entries are owned by the per-source transcript-reader topics, not by this cursor mechanism.
 - The three surfaces that read and advance the merged discovery watermark are owned by spec 26 (the per-turn pass driven by the agent's turn-completion event), spec 180 (the recurring polling tick, whose reversed and capped scan order is its own), and spec 305 (the re-enable drain, including its per-session skips, its failure isolation, and its hoisting of the one-shot fold out of the per-session loop). Each of them states the same conjunctive advance rule from its own side; the storage of the watermark, its key form, its document, and the fold are owned here.

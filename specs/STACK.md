@@ -11,13 +11,14 @@ This is **not** a behavioral spec. Command names, file paths, and version number
 
 ## 1. Deliverables and workspaces
 
-Four deliverables, two of which are npm workspaces. One product model, one shared on-disk state.
+Five deliverables, two of which are npm workspaces. One product model, one shared on-disk state.
 
 | Deliverable | Directory | Build system | Coordinated by root? | Version at `93933725` |
 |---|---|---|---|---|
 | `@jolli.ai/cli` | `cli/` | Vite multi-entry lib build + `tsc` declarations | **Yes** — npm workspace | `0.99.10` |
 | `jollimemory-vscode` | `vscode/` | esbuild → CJS bundles | **Yes** — npm workspace | `0.99.10` |
 | Claude Code plugin | `claude-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.0` (`.claude-plugin/plugin.json`) |
+| Codex plugin | `codex-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.0` (`.codex-plugin/plugin.json`) |
 | Jolli Memory IntelliJ plugin | `intellij/` | Gradle / Kotlin (`ai.jolli.jollimemory`) | **No** — independent build | `0.99.10` |
 
 Root `package.json` (`"name": "jollimemory"`, `"version": "0.99.0"`, `"private": true`) declares
@@ -32,15 +33,24 @@ root does not touch the IntelliJ plugin. It has its own CI workflow
 (`.github/workflows/build-intellij.yaml`) and its own gate (§5.4). One root script does reach into
 `intellij/`, but it is a developer launcher rather than a build stage: `intellij:sandbox` (§4.5).
 
-The Claude Code plugin is the fourth deliverable and the one that is a **build target without being a
-workspace**: `claude-plugin/plugins/jolli/`, built by `node claude-plugin/plugins/jolli/scripts/build.mjs`.
-It is wired into the root `build` chain (§4) and therefore gated by `npm run all`, but it has no
-`clean`/`typecheck`/`lint`/`test` stage of its own and no publish workflow (§7).
+The two AI-host plugins are the deliverables that are **build targets without being workspaces**:
+`claude-plugin/plugins/jolli/` and `codex-plugin/plugins/jolli/`, each built by its own
+`node <plugin>/plugins/jolli/scripts/build.mjs`. Both are wired into the root `build` chain (§4) and
+therefore gated by `npm run all`, but neither has a `clean`/`typecheck`/`lint`/`test` stage of its own
+and neither has a publish workflow (§7). What covers them instead lives in the CLI suite —
+`CodexPluginManifest.test.ts` and `CodexPluginSkills.test.ts` — plus each build script's own
+entry-point assertion.
+
+The two are structurally siblings: each bundles the same `cli/src/**` into its own `dist/`, carries its
+own manifest and marketplace, and publishes by bash script. The Codex plugin's own spec records where
+it diverges (manifest path, its single manifest hook, the global MCP registration that replaces a
+plugin `.mcp.json`, its committed static skills, and its host-isolation rule) — see
+[328 — Codex Plugin Package](328-codex-plugin-package.md).
 
 Root version (`0.99.0`) tracks the workspace coordinator, not any shipped artifact. CLI and
 VS Code versions move together in practice but are independent by policy; IntelliJ is independent of
-both and currently happens to be level with them at `0.99.10`. The Claude Code plugin versions on its
-own `1.0.0` line entirely.
+both and currently happens to be level with them at `0.99.10`. Each AI-host plugin versions on its own
+`1.0.0` line entirely, independently of the other.
 
 ---
 
@@ -194,7 +204,7 @@ unconditionally.
 | Step | What it does |
 |---|---|
 | npm deps | `npm install`, but **only if** root `node_modules/` is missing |
-| build | root `npm run build` (CLI + Claude plugin + VS Code extension); fails if `vscode/dist/Cli.js` is absent afterwards. Unconditional because Gradle's `prepareSandbox` copies `vscode/dist/*.js` into the sandbox plugin's `cli-dist/`, so any `cli/src/**` or `vscode/src/**` change must reach `vscode/dist/` before launch or the sandbox runs stale code. Incremental esbuild/vite is ~2 s, so it always rebuilds rather than staleness-detecting |
+| build | root `npm run build` (CLI + both AI-host plugins + VS Code extension); fails if `vscode/dist/Cli.js` is absent afterwards. Unconditional because Gradle's `prepareSandbox` copies `vscode/dist/*.js` into the sandbox plugin's `cli-dist/`, so any `cli/src/**` or `vscode/src/**` change must reach `vscode/dist/` before launch or the sandbox runs stale code. Incremental esbuild/vite is ~2 s, so it always rebuilds rather than staleness-detecting |
 | sandbox cache clean | removes `config/`, `system/`, `log/` under `intellij/build/idea-sandbox/<ide>/` so every launch starts from a fresh sandbox IDE. The script's own header flags the cost: this discards manually-installed sandbox plugins, keybindings, window layout, and the project index, so first-launch indexing runs every time |
 | hook sync | copies `vscode/dist/*.js` (**except `Extension.js`**) into `~/.jolli/jollimemory/dist-intellij/`, failing if any required runtime file is absent afterwards. Unconditional because the plugin's `integrationsUpToDate()` gate is keyed on `.version == pluginVersion`, so on same-version relaunches it would skip `extractCliDist()` and keep running last launch's `Cli.js` — refreshing here decouples that from the version stamp |
 | force-register dist-paths | rewrites `~/.jolli/jollimemory/dist-paths/{cli,intellij}` to point at this repo's fresh build. Unconditional because a stale `dist-paths/cli` on the machine (from a global `@jolli.ai/cli` install, or an older sandbox run) can otherwise outrank this repo's build at equal version — `cli` wins the tie-break in `SOURCE_PREFERENCE_ORDER` |
@@ -259,12 +269,13 @@ Each stage fans out across the two npm workspaces:
 | Stage | Expansion (root `package.json`) |
 |---|---|
 | `clean` | `npm run clean -w @jolli.ai/cli && npm run clean -w vscode` |
-| `build` | `npm run build -w @jolli.ai/cli && npm run build:claude-plugin && npm run build -w vscode` |
+| `build` | `npm run build -w @jolli.ai/cli && npm run build:claude-plugin && npm run build:codex-plugin && npm run build -w vscode` |
 | `typecheck` | `npm run typecheck -w @jolli.ai/cli && npm run typecheck -w vscode` |
 | `lint` | `npm run lint -w @jolli.ai/cli && npm run lint -w vscode` |
 | `test` | `npm run test -w @jolli.ai/cli && npm run test:acceptance -w @jolli.ai/cli && npm run test -w vscode` |
 
-`build:claude-plugin` = `node claude-plugin/plugins/jolli/scripts/build.mjs`.
+`build:claude-plugin` = `node claude-plugin/plugins/jolli/scripts/build.mjs`; `build:codex-plugin` =
+`node codex-plugin/plugins/jolli/scripts/build.mjs`.
 
 This gate is also declared **machine-readably**, in the tree's one committed piece of `.jolli/`:
 `.jolli/agents.json` sets `verify.gate: ["npm run all"]`, `verify.scope: "repo-root"`,
@@ -299,6 +310,7 @@ CI runs the identical command: `.github/workflows/build-vscode.yaml` ("CI - CLI 
 ### 5.2 Per-workspace and single-stage variants
 
 Every stage has a per-workspace entry point at the root: `build:cli`, `build:claude-plugin`,
+`build:codex-plugin`,
 `build:vscode`, `typecheck:cli`, `typecheck:vscode`, `lint:cli`, `lint:vscode`, `lint:fix`,
 `test:cli` (unit **+** acceptance), `test:vscode`, `test:acceptance`.
 
@@ -805,11 +817,14 @@ both npm workspaces despite the workflow's filename.
 
 Two asymmetries in this table are load-bearing, and `RELEASE.md` is the authority on both:
 
-- **The `claude-plugin/` deliverable has no publish workflow at all.** It is built and gated by the
-  normal `npm run all` chain (§5.1), but shipping it means running the bash scripts in
-  `claude-plugin/scripts/` (`publish-local.sh`, `publish-dev.sh`, `publish-prod.sh`, `publish-zip.sh`
-  over a shared `_publish-lib.sh`), which build the bundle, assert it is complete, and mirror it into
-  a **separate marketplace repo**. Nothing in `.github/workflows/` touches it.
+- **Neither AI-host plugin deliverable has a publish workflow at all.** Both are built and gated by
+  the normal `npm run all` chain (§5.1), but shipping either means running the bash scripts in its own
+  `<plugin>/scripts/` (`publish-local.sh`, `publish-dev.sh`, `publish-prod.sh`, `publish-zip.sh` over a
+  per-plugin `_publish-lib.sh`), which build the bundle, assert it is complete, and mirror it into a
+  **separate marketplace repo** — a different repo per plugin. Nothing in `.github/workflows/` touches
+  either one. Both plugin globs are nonetheless in `build-vscode.yaml`'s path filter, because that job
+  is the only gate that builds them: without the globs a plugin-only PR reports success having
+  compiled nothing.
 - **`publish-intellij.yaml` is the legacy publisher and is gated far more weakly than the other two.**
   `publish-cli.yaml` and `publish-vscode.yaml` both declare `environment: Production` (a manual
   approval gate), both take an existing sigstore-signed tag as input, and both pre-check whether the

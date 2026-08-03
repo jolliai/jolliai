@@ -11,7 +11,8 @@ The per-user state directory at `~/.jolli/jollimemory/` keeps a small registry o
 - The two-line file format used by each entry.
 - How a source tag is derived (whitelist of known IDEs; auto-extraction from a recognizable extension-install path; hash fallback for unrecognized paths; the standalone-CLI tag is fixed).
 - The version-comparison rule in full: its two tiers, how each tier is entered, prerelease and build-metadata handling, and the special handling of placeholder versions (`dev`, `unknown`, empty).
-- The fact that there are **two** independent selection implementations — the shell dispatch resolver that decides what actually executes, and an in-process selector used for reporting and for one host-configuration writer — and the four ways they diverge.
+- The fact that there are **two** independent selection implementations — the shell dispatch resolver that decides what actually executes, and an in-process selector used for reporting and for one host-configuration writer — the four ways they diverge, and the fifth (registry-enumeration order) that both are required to keep aligned.
+- The tie-break among sources at an equal winning version: the fixed preference order, the lexicographic-by-tag rule that settles ties no preferred source is part of, and the fact that this only buys determinism and may never carry host semantics.
 - The optional required-entry-file argument that gates candidate eligibility in the dispatch resolver.
 - The soft source-preference environment override the dispatch resolver consults ahead of the fixed preference order.
 - The write-time "keep the existing entry" gate, its ten-file completeness definition, and the fact that it turns on completeness alone — never on a version comparison.
@@ -147,6 +148,8 @@ The two express the same intent but are not equivalent, and four divergences are
 4. **Tie matching and entry parsing.** The dispatch resolver decides "same version" by raw string equality — `0.99` and `0.99.0` are different versions to it — while the in-process rule uses the full comparison, under which they are equal. The dispatch resolver also reads the distribution directory strictly from the entry's second line, whereas the in-process reader takes the last non-empty line and additionally still understands the legacy `source=<tag>@<version>` first-line form inside a per-source entry file.
 
 The dispatch resolver decides what runs; the in-process selector only reports and, on Windows, records. A divergence therefore surfaces as a status report or a recorded configuration path that disagrees with the distribution a hook actually executed from.
+
+A fifth divergence — **registry-enumeration order** — is deliberately held closed rather than tolerated, and the requirement is on the in-process side. The dispatch resolver enumerates by expanding a filename pattern, which the shell collation-sorts for it; the in-process selector reads the directory, whose natural order is the filesystem's and therefore neither sorted nor stable across machines. It must sort by source tag to match. This only becomes observable at the last tie-break step — the one that takes the first tied entry in enumeration order — so for a long time it was latent, reachable only between two sources that are both outside the fixed preference order. Adding a second AI-host plugin makes exactly that pairing ordinary, which is why the sort is now stated as part of the contract: without it the resolver and the selector can disagree about the winner while both remain internally consistent, and the resulting mismatch looks precisely like a stale registry.
 
 ### Soft source-preference override
 
@@ -304,7 +307,14 @@ The same version-comparison rule used to pick the winning registry entry is also
 
 ### Tie-break preference among sources at the same version
 
-When two or more available entries are tied at the highest version, a fixed source-preference order decides: the standalone CLI (`cli`) wins first, then the canonical VS Code source (`vscode`), then `cursor`, then any other source in its enumeration position. The bundled product core is byte-for-byte identical at equal versions, so the tie-break only makes the winner deterministic; it does not change which behaviors are available. The standalone-CLI tag (`cli`) is the preferred winner whenever it is present and tied at the top, which gives the canonical CLI build precedence over any IDE-embedded copy of the same version.
+When two or more available entries are tied at the highest version, a fixed source-preference order decides: the standalone CLI (`cli`) wins first, then the canonical VS Code source (`vscode`), then `cursor`. The bundled product core is byte-for-byte identical at equal versions, so the tie-break only makes the winner deterministic; it does not change which behaviors are available. The standalone-CLI tag (`cli`) is the preferred winner whenever it is present and tied at the top, which gives the canonical CLI build precedence over any IDE-embedded copy of the same version.
+
+When **no** tied source appears in that order at all, the winner is the first tied entry in registry-enumeration order, and that order is defined to be **ascending lexicographic by source tag**. Both implementations must enumerate the registry that way; neither may fall back to whatever order the filesystem reports, because the two would then be free to pick different winners for the same registry (see **Two selection implementations, and where they diverge**).
+
+Two consequences are worth stating explicitly:
+
+- This last step is the *operative* rule for the AI-host plugin sources, not a rare edge. Plugin tags are deliberately absent from the fixed preference order, and two plugin bundles carrying the same product version is the normal state for a user who installs more than one host, so lexicographic order is what actually settles those ties.
+- It is a **stability** rule, not host isolation. It guarantees only that the choice does not flip between runs; it says nothing about which host's bundle *ought* to win. No behavior may be made conditional on which bundle wins a tie — at equal versions the cores are identical, and a rule that merely orders tags cannot be load-bearing for host semantics.
 
 The order is a **single declared list enforced in two places**: the in-process selector iterates it directly, and the dispatch resolver's tie-break loop is generated from the very same list when the resolver script is written, so the two can never drift apart in content (only in matching semantics — the resolver compares version strings literally, the in-process selector compares them by the full rule).
 

@@ -89,7 +89,13 @@ import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
 import { getLogDir, resetLogDir } from "../Logger.js";
-import { dispatchTool, type PlatformToolClient, startMcpServer, TOOL_DEFINITIONS } from "./McpServer.js";
+import {
+	dispatchTool,
+	isPluginBundleCwd,
+	type PlatformToolClient,
+	startMcpServer,
+	TOOL_DEFINITIONS,
+} from "./McpServer.js";
 import {
 	runBindSpace,
 	runDecisionTimeline,
@@ -386,6 +392,59 @@ describe("startMcpServer", () => {
 		// Order invariant: setLogDir(cwd) must run AFTER this early return, so the
 		// throwaway temp cwd never becomes the global log dir.
 		expect(getLogDir()).toBeUndefined();
+	});
+
+	/*
+	 * Same failure mode as the guard above, reached from the other direction: an AI
+	 * host launching this server from a plugin BUNDLE instead of the user's repo. Every
+	 * memory tool derives its repository from `cwd`, so such a server answers `recall`
+	 * / `search` / `status` for the plugin's cache directory — successfully, and empty
+	 * — and roots a placeholder Memory Bank repo named after the bundle's version
+	 * directory. Refusing is strictly better than answering for the wrong project.
+	 *
+	 * Measured on codex-cli 0.146.0: a plugin `.mcp.json` (which must pin `cwd: "."`
+	 * for its relative command to resolve) gets the plugin root as cwd, and neither the
+	 * `roots` capability nor the 7-variable env allowlist can recover the workspace. No
+	 * shipped Jolli plugin has such a manifest — this makes reintroducing one fail loud.
+	 */
+	it("refuses to start when launched from an AI-host plugin bundle", async () => {
+		vi.mocked(createStorage).mockClear();
+		vi.mocked(setActiveStorage).mockClear();
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		let written: string;
+		try {
+			await startMcpServer("/Users/dev/.codex/plugins/cache/jolli-marketplace/jolli/1.0.0");
+			// Read the calls BEFORE restoring: mockRestore also resets the call log.
+			written = stderr.mock.calls.map((call) => String(call[0])).join("");
+		} finally {
+			stderr.mockRestore();
+		}
+		expect(createStorage).not.toHaveBeenCalled();
+		expect(setActiveStorage).not.toHaveBeenCalled();
+		expect(connectMock).not.toHaveBeenCalled();
+		// Same order invariant as above — the bundle path must never become the log dir.
+		expect(getLogDir()).toBeUndefined();
+		// The host surfaces a server that would not start; the reason has to reach the
+		// developer somewhere, and stderr is the only channel a stdio server may use
+		// (stdout is the JSON-RPC stream).
+		expect(written).toContain("refusing to start");
+		expect(written).toContain(".codex/plugins/cache");
+	});
+});
+
+describe("isPluginBundleCwd", () => {
+	it.each([
+		["/Users/dev/.codex/plugins/cache/jolli-marketplace/jolli/1.0.0", true],
+		["/Users/dev/.claude/plugins/cache/jolli/jolli/2.3.4", true],
+		// Windows separators reach us verbatim from the host's spawn.
+		["C:\\Users\\dev\\.codex\\plugins\\cache\\mp\\jolli\\1.0.0", true],
+		["/Users/dev/work/jolliai", false],
+		// Near-misses: a repo that merely mentions plugins, and a host's config root
+		// that is not its plugin cache.
+		["/Users/dev/work/my-plugins/cache", false],
+		["/Users/dev/.codex/sessions", false],
+	])("%s → %s", (cwd, expected) => {
+		expect(isPluginBundleCwd(cwd)).toBe(expected);
 	});
 });
 

@@ -25,8 +25,9 @@ import { join } from "node:path";
 import { isPidAlive, readLockOwnerPid, releaseIfOwned } from "../core/LockPrimitives.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { getJolliMemoryDir } from "../Logger.js";
-import type { JolliMemoryConfig } from "../Types.js";
-import { AUTH_FAILURE_CAPTURE_TEXT } from "./AuthRemediation.js";
+import type { JolliMemoryConfig, LocalAgentToolId } from "../Types.js";
+import { buildAuthFailureCaptureText } from "./AuthRemediation.js";
+import { type BlockedSandboxId, buildSandboxFailureCaptureText } from "./SandboxRemediation.js";
 
 /** Lifecycle milestones a commit's capture passes through. */
 export type CaptureStep =
@@ -51,11 +52,12 @@ export interface CaptureEventData {
 	readonly topics?: number;
 	/**
 	 * Set on the `stored` event when the summary landed as an empty placeholder
-	 * because the local-agent `claude` login expired (a `local-agent-auth`
-	 * failure). The watcher then prints sign-in guidance instead of the success
-	 * line — memory was NOT really captured for this commit.
+	 * because the configured local-agent login expired (a `local-agent-auth`
+	 * failure). The watcher then prints tool-specific sign-in guidance.
 	 */
 	readonly authExpired?: boolean;
+	/** Tool whose authentication failed; absent on legacy progress events. */
+	readonly localAgentTool?: LocalAgentToolId;
 }
 
 /** One line in the per-commit progress stream. */
@@ -86,8 +88,25 @@ export const DEFAULT_FEEDBACK_TIMEOUT_MS = 90_000;
 export const AGENT_FEEDBACK_TIMEOUT_MS = 15_000;
 export const DEFAULT_FEEDBACK_POLL_MS = 300;
 
-/** Env vars whose presence marks an interactive AI-agent session (auto mode). */
-const AGENT_ENV_KEYS = ["CLAUDECODE", "AI_AGENT", "CURSOR_TRACE_ID", "GEMINI_CLI", "OPENCODE"] as const;
+/**
+ * Env vars whose presence marks an interactive AI-agent session (auto mode).
+ *
+ * `CODEX_THREAD_ID` is the Codex entry. Measured on codex-cli 0.146.0, it is the
+ * only marker present across every way Codex runs a command — interactive TUI and
+ * `codex exec`, sandboxed and `danger-full-access` alike — and it is scoped to the
+ * command-execution environment: Codex's own lifecycle hooks do NOT see it, so it
+ * cannot make a hook mistake itself for the agent's shell. The `CODEX_SANDBOX*`
+ * pair is deliberately not used as a marker: it is absent under full access and
+ * present for the plain `codex sandbox` subcommand, so it both misses and misfires.
+ */
+const AGENT_ENV_KEYS = [
+	"CLAUDECODE",
+	"AI_AGENT",
+	"CURSOR_TRACE_ID",
+	"GEMINI_CLI",
+	"OPENCODE",
+	"CODEX_THREAD_ID",
+] as const;
 
 /** `<jolliMemoryDir>/capture-progress`. */
 export function captureProgressDir(cwd?: string): string {
@@ -238,6 +257,17 @@ export function isAgentSession(env: Record<string, string | undefined>): boolean
 	return AGENT_ENV_KEYS.some((k) => isTruthyEnv(env[k]));
 }
 
+/**
+ * The sandbox denying this process network access, or `null` when nothing in the
+ * environment says one does. The hook and the worker it spawns share the commit's
+ * environment, so what the watcher reads here holds for the worker too — which is
+ * what lets the closing line speak for the background work as well as the watch.
+ * See {@link buildSandboxFailureCaptureText} for why that matters.
+ */
+export function networkBlockedSandbox(env: Record<string, string | undefined>): BlockedSandboxId | null {
+	return isTruthyEnv(env.CODEX_SANDBOX_NETWORK_DISABLED) ? "codex" : null;
+}
+
 function isTruthyEnv(v: string | undefined): boolean {
 	return v !== undefined && v !== "" && v !== "0" && v.toLowerCase() !== "false";
 }
@@ -248,8 +278,10 @@ function isTruthyEnv(v: string | undefined): boolean {
  * Precedence: the `JOLLI_COMMIT_FEEDBACK` env override beats the config
  * `commitFeedback`, which beats the `"auto"` default. In `"auto"` the hook
  * shows feedback only where a human will see stdout — a real TTY, or an
- * AI-agent session (Claude Code sets `CLAUDECODE`/`AI_AGENT`). GUI git clients
- * set none of these, so they keep the silent, non-blocking behavior.
+ * AI-agent session (Claude Code sets `CLAUDECODE`/`AI_AGENT`, Codex sets
+ * `CODEX_THREAD_ID`; see {@link AGENT_ENV_KEYS}). Note that no agent gives the
+ * command a TTY, so for those the marker is the only thing that opens the gate.
+ * GUI git clients set neither, so they keep the silent, non-blocking behavior.
  */
 export function shouldShowCommitFeedback(
 	mode: CommitFeedbackMode | undefined,
@@ -286,9 +318,11 @@ export function formatCaptureLine(event: CaptureProgressEvent): string | null {
 			return "  evaluating plan progress…";
 		case "stored":
 			// An auth-expired placeholder is NOT a real capture — show the fix
-			// instead of the success line. Shares wording with the SessionStart
-			// reminder via AuthRemediation.
-			return d.authExpired ? AUTH_FAILURE_CAPTURE_TEXT : "✓ Jolli Memory updated";
+			// instead of the success line. Legacy events did not carry the tool and
+			// therefore retain the historical Claude default.
+			return d.authExpired
+				? buildAuthFailureCaptureText(d.localAgentTool ?? "claude-code")
+				: "✓ Jolli Memory updated";
 		case "skipped":
 			return "  (no changes to capture)";
 		case "failed":
@@ -370,6 +404,9 @@ export interface CommitFeedbackDeps {
  *   - a terminal `stored`/`skipped`/`failed` already printed its own line;
  *   - a force-killed worker prints an interrupted notice (not "in background");
  *   - a timeout with the worker still alive prints "continues in the background".
+ * A network-denied sandbox overrides every unresolved ending above with one
+ * sandbox notice, because there the worker is provably doomed too and none of
+ * those three lines would be true — see {@link buildSandboxFailureCaptureText}.
  * All state comes through `deps` so this is fully testable.
  */
 export async function runCommitFeedback(cwd: string, hash: string, deps: CommitFeedbackDeps = {}): Promise<void> {
@@ -389,6 +426,9 @@ export async function runCommitFeedback(cwd: string, hash: string, deps: CommitF
 	let sawStored = false;
 	let sawSkipped = false;
 	let sawFailed = false;
+	// A sandbox that denies network access dooms the worker as surely as the watch,
+	// so its notice replaces (never joins) whichever unresolved ending we reach.
+	const blockedSandbox = networkBlockedSandbox(env);
 	// Agent sessions BLOCK `git commit` for the duration of the watch, so they
 	// get a much shorter ceiling than a human TTY (where the user sees live
 	// progress and voluntarily waits). Explicit deps.timeoutMs still wins (tests).
@@ -401,15 +441,34 @@ export async function runCommitFeedback(cwd: string, hash: string, deps: CommitF
 		now: deps.now,
 		workerDead: deps.workerDead,
 		onEvent: (ev) => {
-			if (ev.step === "stored") sawStored = true;
+			if (ev.step === "stored") {
+				// An auth-expired placeholder inside a network-denied sandbox is almost
+				// certainly the backend failing to reach its own auth endpoint, not a
+				// stale login. Telling the user to sign in again would send them to fix
+				// the wrong thing, so let the sandbox notice below speak for it.
+				if (ev.data?.authExpired === true && blockedSandbox !== null) return;
+				sawStored = true;
+			}
 			if (ev.step === "skipped") sawSkipped = true;
-			if (ev.step === "failed") sawFailed = true;
+			if (ev.step === "failed") {
+				sawFailed = true;
+				// Under a blocking sandbox the generic `failed` line is suppressed here
+				// so the sandbox notice below is the single, accurate account of it.
+				if (blockedSandbox !== null) return;
+			}
 			const line = formatCaptureLine(ev);
 			if (line !== null) write(line);
 		},
 	});
-	// A resolved capture (stored / skipped / failed) already printed its own line.
-	if (sawStored || sawSkipped || sawFailed) return;
+	// A capture that resolved with an outcome (stored / skipped) already printed its
+	// own line, and its success rules out the sandbox diagnosis below.
+	if (sawStored || sawSkipped) return;
+	if (blockedSandbox !== null) {
+		write(buildSandboxFailureCaptureText(blockedSandbox));
+		return;
+	}
+	// A `failed` event already printed its own line and needs no closing one.
+	if (sawFailed) return;
 	// Otherwise the watch ended without a resolution: distinguish a dead worker
 	// (nothing more is coming) from a still-running one (past the timeout).
 	if (ended === "worker-dead") {

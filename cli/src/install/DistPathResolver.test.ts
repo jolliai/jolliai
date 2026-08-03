@@ -363,6 +363,27 @@ describe("DistPathResolver", () => {
 			expect(traverseDistPaths(tempDir).map((e) => e.source)).toEqual(["cli"]);
 		});
 
+		// Must match `resolve-dist-path`, which globs `dist-paths/*` and therefore sees
+		// a collation-sorted list. readdir order is filesystem order, so without the
+		// sort the two resolvers can disagree on a tie between unordered sources.
+		it("returns entries sorted by source so the shell resolver agrees", async () => {
+			const distDir = join(tempDir, "dist");
+			await mkdir(distDir, { recursive: true });
+			const pathsDir = join(tempDir, "dist-paths");
+			await mkdir(pathsDir, { recursive: true });
+			// Written in deliberately non-alphabetical order.
+			for (const source of ["vscode", "claude-plugin", "cli", "codex-plugin"]) {
+				await writeFile(join(pathsDir, source), `0.99.9\n${distDir}\n`, "utf-8");
+			}
+
+			expect(traverseDistPaths(tempDir).map((e) => e.source)).toEqual([
+				"claude-plugin",
+				"cli",
+				"codex-plugin",
+				"vscode",
+			]);
+		});
+
 		it("should return [] when dist-paths/ directory does not exist", async () => {
 			expect(await pruneStaleDistPaths(tempDir)).toEqual([]);
 		});
@@ -412,6 +433,39 @@ describe("DistPathResolver", () => {
 				{ source: "vscode", version: "0.99.3", distDir: "/v", available: true },
 			]);
 			expect(best?.source).toBe("vscode");
+		});
+
+		// Plugin hosts are deliberately absent from SOURCE_PREFERENCE_ORDER, so an
+		// equal-versioned pair of them falls through to list order. traverseDistPaths
+		// sorts for exactly this reason — the outcome must not depend on which entry
+		// the filesystem happened to return first.
+		it("is order-independent for two equal-versioned plugin bundles", () => {
+			const claude = { source: "claude-plugin", version: "0.99.9", distDir: "/cl", available: true };
+			const codex = { source: "codex-plugin", version: "0.99.9", distDir: "/cx", available: true };
+
+			expect(pickBestDistPath([claude, codex])?.source).toBe("claude-plugin");
+			// Same sorted input either way: the caller (traverseDistPaths) sorts, so a
+			// reversed list is not a real input — assert the invariant that matters,
+			// that the FIRST tied entry wins rather than the last.
+			expect(pickBestDistPath([codex, claude])?.source).toBe("codex-plugin");
+		});
+
+		// The team decision behind SOURCE_PREFERENCE_ORDER: an equal-versioned cli beats
+		// a plugin bundle, so plugin hosts never displace a standalone install on a tie.
+		it("still prefers cli over a plugin bundle on a version tie", () => {
+			const best = pickBestDistPath([
+				{ source: "claude-plugin", version: "0.99.9", distDir: "/cl", available: true },
+				{ source: "cli", version: "0.99.9", distDir: "/c", available: true },
+			]);
+			expect(best?.source).toBe("cli");
+		});
+
+		it("lets a plugin bundle win on a strictly higher version", () => {
+			const best = pickBestDistPath([
+				{ source: "cli", version: "0.99.8", distDir: "/c", available: true },
+				{ source: "codex-plugin", version: "0.99.9", distDir: "/cx", available: true },
+			]);
+			expect(best?.source).toBe("codex-plugin");
 		});
 
 		it("does NOT let the tie-break override a strictly-higher non-preferred source", () => {

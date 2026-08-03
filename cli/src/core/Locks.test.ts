@@ -30,6 +30,7 @@ import {
 	acquireOrphanWriteLock,
 	acquireRepoHooksLock,
 	acquireWorkerLock,
+	CONFIG_LOCK_FILE,
 	DEFAULT_ORPHAN_WRITE_POLL_MS,
 	getWorkerBusyState,
 	INGEST_LOCK_FILE,
@@ -47,12 +48,15 @@ import {
 	releaseIngestLock,
 	releaseOrphanWriteLock,
 	releaseWorkerLock,
+	SESSIONS_LOCK_FILE,
 	WORKER_LOCK_FILE,
+	withConfigLock,
 	withPlansLock,
 	withProfileLock,
 	withPushPendingLock,
 	withRepoHooksLock,
 	withRuntimeRegistryLock,
+	withSessionsLock,
 	withStrictProfileLock,
 } from "./Locks.js";
 
@@ -81,6 +85,10 @@ function plansLockPath(tempDir: string): string {
 /** push-pending.lock dir = per-worktree (`<cwd>/.jolli/jollimemory/`), like worker.lock. */
 function pushPendingLockPath(tempDir: string): string {
 	return join(tempDir, ".jolli", "jollimemory", PUSH_PENDING_LOCK_FILE);
+}
+
+function sessionsLockPath(tempDir: string): string {
+	return join(tempDir, ".jolli", "jollimemory", SESSIONS_LOCK_FILE);
 }
 
 /**
@@ -121,6 +129,7 @@ describe("Locks", () => {
 		await rm(join(tempDir, ".jolli", "jollimemory", INGEST_LOCK_FILE), { force: true });
 		await rm(join(tempDir, ".git", "jollimemory", ORPHAN_WRITE_LOCK_FILE), { force: true });
 		await rm(plansLockPath(tempDir), { force: true });
+		await rm(sessionsLockPath(tempDir), { force: true });
 		await rm(profileLockPath(tempDir), { force: true });
 		await rm(repoHooksLockPath(tempDir), { force: true });
 	});
@@ -613,6 +622,40 @@ describe("Locks", () => {
 			expect(result).toBe("best-effort");
 			// The foreign-owned lock is untouched.
 			await expect(stat(plansLockPath(tempDir))).resolves.toBeDefined();
+		});
+	});
+
+	describe("state-file RMW serialisation", () => {
+		it("withSessionsLock holds and releases a worktree-local lock", async () => {
+			const result = await withSessionsLock(tempDir, async () => {
+				await expect(stat(sessionsLockPath(tempDir))).resolves.toBeDefined();
+				return "sessions";
+			});
+
+			expect(result).toBe("sessions");
+			await expect(stat(sessionsLockPath(tempDir))).rejects.toThrow();
+		});
+
+		it("withConfigLock holds and releases a lock in the explicit config directory", async () => {
+			const configDir = join(tempDir, "global-config");
+			const lockPath = join(configDir, CONFIG_LOCK_FILE);
+			const result = await withConfigLock(configDir, async () => {
+				await expect(stat(lockPath)).resolves.toBeDefined();
+				return "config";
+			});
+
+			expect(result).toBe("config");
+			await expect(stat(lockPath)).rejects.toThrow();
+		});
+
+		it("still runs a state-file update when lock acquisition times out", async () => {
+			await mkdir(dirname(sessionsLockPath(tempDir)), { recursive: true });
+			await writeFile(sessionsLockPath(tempDir), String(process.pid), "utf-8");
+
+			const body = vi.fn(async () => "best-effort");
+			await expect(withSessionsLock(tempDir, body, { timeoutMs: 30, pollMs: 10 })).resolves.toBe("best-effort");
+			expect(body).toHaveBeenCalledOnce();
+			await expect(stat(sessionsLockPath(tempDir))).resolves.toBeDefined();
 		});
 	});
 

@@ -9,7 +9,13 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { isClaudePluginBuild, JOLLI_CLIENT_HEADER, resolveClientKind } from "./ClientHeader.js";
+import {
+	isClaudePluginBuild,
+	isPluginBundleBuild,
+	isPluginBundleKind,
+	JOLLI_CLIENT_HEADER,
+	resolveClientKind,
+} from "./ClientHeader.js";
 
 describe("JOLLI_CLIENT_HEADER", () => {
 	it("resolves to <kind>/<version> from bundler-injected globals", () => {
@@ -30,5 +36,28 @@ describe("resolveClientKind", () => {
 describe("isClaudePluginBuild", () => {
 	it("returns false in the CLI build / vitest", () => {
 		expect(isClaudePluginBuild()).toBe(false);
+	});
+});
+
+describe("isPluginBundleKind", () => {
+	// Every plugin host must be recognized here. A host missing from this predicate
+	// silently inherits standalone-CLI behavior — e.g. PluginLoader would let the
+	// plugin's fixed-surface CLI scan the global npm root and warn about host-CLI
+	// plugins it never uses.
+	it("recognizes every embedded plugin bundle", () => {
+		expect(isPluginBundleKind("claude-plugin")).toBe(true);
+		expect(isPluginBundleKind("codex-plugin")).toBe(true);
+	});
+
+	it("rejects the standalone install kinds", () => {
+		expect(isPluginBundleKind("cli")).toBe(false);
+		expect(isPluginBundleKind("vscode-plugin")).toBe(false);
+		expect(isPluginBundleKind("intellij-plugin")).toBe(false);
+	});
+});
+
+describe("isPluginBundleBuild", () => {
+	it("returns false in the CLI build / vitest", () => {
+		expect(isPluginBundleBuild()).toBe(false);
 	});
 });

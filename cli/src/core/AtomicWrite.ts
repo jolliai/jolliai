@@ -19,16 +19,29 @@ import { rename, rm, writeFile } from "node:fs/promises";
  * of the same target — e.g. the post-commit worker and the VS Code 60s tick over
  * one worktree's telemetry buffer — never share a tmpfile and tear each other's
  * partial write before the rename.
+ *
+ * `mode` is for targets whose permissions matter. It is applied to the TMPFILE,
+ * which the rename then carries onto the target — so unlike a bare
+ * `writeFile(..., { mode })`, it takes effect even when the target already exists.
+ * That is the opposite default from `writeFile`, so a caller that wants to preserve
+ * an existing file's permissions must read them and pass them back in; see
+ * `CodexTomlWriter`, which does exactly that because the file belongs to another
+ * tool. Omit `mode` to keep node's default (umask-derived on creation, unchanged on
+ * overwrite) — every pre-existing caller does.
  */
-export async function atomicWriteFile(filePath: string, content: string): Promise<void> {
+export async function atomicWriteFile(filePath: string, content: string, mode?: number): Promise<void> {
 	const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-	await writeFile(tmpPath, content, "utf-8");
+	await writeFile(tmpPath, content, mode === undefined ? "utf-8" : { encoding: "utf-8", mode });
 	try {
 		await rename(tmpPath, filePath);
 	} catch (error: unknown) {
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code === "EPERM" || code === "EACCES") {
-			await writeFile(filePath, content, "utf-8");
+			// Windows fallback: a direct overwrite cannot carry `mode` onto an existing
+			// target (node ignores it there), which is acceptable — this branch exists
+			// because the target is held open by another process, and the permissions it
+			// already has are the ones its owner chose.
+			await writeFile(filePath, content, mode === undefined ? "utf-8" : { encoding: "utf-8", mode });
 			await rm(tmpPath, { force: true });
 		} else {
 			throw error;

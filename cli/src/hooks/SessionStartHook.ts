@@ -24,13 +24,15 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { resolveClientKind } from "../core/ClientHeader.js";
 import { readFileFromBranch, resolveStateRoot } from "../core/GitOps.js";
 import { hasLlmCredentials } from "../core/LlmCredentials.js";
+import { pluginDefaultLocalAgentTool } from "../core/localagent/PluginDefaults.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
-import { loadConfig, normalizePlansRegistry, saveConfig } from "../core/SessionTracker.js";
+import { loadConfig, normalizePlansRegistry, updateConfigTransactional } from "../core/SessionTracker.js";
 import { isLocalAgentAuthError } from "../core/SummaryErrorMarker.js";
 import { getDisplayDate } from "../core/SummaryFormat.js";
 import { getIndex } from "../core/SummaryStore.js";
@@ -38,7 +40,7 @@ import { collectAllTopics } from "../core/SummaryTree.js";
 import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
 import type { CommitSummary, DiffStats, JolliMemoryConfig, PlansRegistry, SummaryIndexEntry } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
-import { AUTH_FAILURE_REMINDER_TEXT } from "./AuthRemediation.js";
+import { buildAuthFailureReminderText } from "./AuthRemediation.js";
 import { readStdin } from "./HookUtils.js";
 
 const log = createLogger("SessionStartHook");
@@ -52,10 +54,16 @@ interface BriefingCache {
 	readonly branch: string;
 	readonly lastCommitHash: string;
 	readonly briefingText: string;
+	/**
+	 * The source tag of the host this text was rendered for. Part of the cache key —
+	 * see {@link checkBriefingCache}. Optional because caches written before this
+	 * field shipped lack it; absent reads as a miss.
+	 */
+	readonly clientKind?: string;
 	readonly generatedAt: string;
 }
 
-// ─── Login reminder (Claude Code plugin only) ────────────────────────────────
+// ─── Plugin setup reminder ───────────────────────────────────────────────────
 
 /**
  * Per-repo marker that silences the not-signed-in reminder. Lives beside the
@@ -66,62 +74,92 @@ interface BriefingCache {
 const LOGIN_REMINDER_DISMISS_MARKER = "login-reminder-dismissed";
 
 /**
- * Shown at session start when the Claude Code plugin has no way to generate
- * memories yet. Plain text — Claude Code displays it to the user AND injects it
- * into Claude's context, so it doubles as an instruction the agent can act on.
+ * Shown at session start when a plugin has no way to generate memories yet.
  */
-const LOGIN_REMINDER_TEXT = [
-	"[Jolli Memory] Not signed in — no memories are being generated for your commits.",
-	"→ Run /jolli:login to sign in to Jolli (AI summaries, no Anthropic API key needed).",
-	`(To stop this reminder without signing in, create an empty file at` +
-		` .jolli/jollimemory/${LOGIN_REMINDER_DISMISS_MARKER} in this repo.)`,
-].join("\n");
+function loginReminderText(clientKind: string): string | null {
+	const action =
+		clientKind === "claude-plugin"
+			? "Run /jolli:init to finish setup."
+			: clientKind === "codex-plugin"
+				? "Run $jolli:init to finish setup."
+				: null;
+	if (action === null) return null;
+	return [
+		"[Jolli Memory] Memory generation is not configured for this repository.",
+		`→ ${action}`,
+		`(To stop this reminder, create an empty file at .jolli/jollimemory/${LOGIN_REMINDER_DISMISS_MARKER}.)`,
+	].join("\n");
+}
 
 /**
  * Pure decision for whether to surface the not-signed-in reminder. Kept
  * side-effect-free so every branch is unit-testable regardless of the build's
  * `__JOLLI_CLIENT_KIND__` value (which is fixed to `"cli"` in the CLI build).
  *
- * Only the Claude Code plugin shows this: the CLI and VS Code surfaces have
- * their own sign-in UX, and gating here keeps the reminder out of their
- * session-start output.
+ * Plugin surfaces show this; CLI and IDE surfaces have their own setup UX.
  */
 export function computeLoginReminder(clientKind: string, hasCredential: boolean, dismissed: boolean): string | null {
-	if (clientKind !== "claude-plugin") return null;
 	if (hasCredential) return null;
 	if (dismissed) return null;
-	return LOGIN_REMINDER_TEXT;
+	return loginReminderText(clientKind);
 }
 
 /**
- * The Claude Code plugin defaults `aiProvider` to `"local-agent"`. A plugin user
- * is by definition running inside Claude Code, so a signed-in `claude` CLI is
- * already on hand — driving it through the local-agent backend generates memories
- * with zero extra setup: no Anthropic API key, no Jolli sign-in. We seed that
- * choice on the plugin's session start, but ONLY when the user has expressed no
- * explicit provider preference; an explicit "anthropic" / "jolli" / "local-agent"
- * pick is never overwritten. `localAgentTool` is seeded alongside so the runner
- * has its target tool.
+ * A plugin host defaults `aiProvider` to `"local-agent"`. A plugin user is by
+ * definition running inside that agent, so a signed-in CLI for it is already on
+ * hand — driving it through the local-agent backend generates memories with zero
+ * extra setup: no Anthropic API key, no Jolli sign-in. `localAgentTool` is seeded
+ * alongside so the runner has its target tool, and its value comes from the host's
+ * own source tag ({@link pluginDefaultLocalAgentTool}) rather than a hardcoded
+ * `claude-code`: seeding Claude's tool for a Codex user would send generation at a
+ * CLI they may not even have installed.
+ *
+ * This is the AUTOMATIC path, so it is strictly first-wins: it writes only when the
+ * user has expressed no provider preference at all, and an explicit "anthropic" /
+ * "jolli" / "local-agent" pick is never overwritten. That gate is also what keeps
+ * two installed plugin hosts from flipping the value on each other every session —
+ * the second host to start finds a value and does nothing. The authoritative
+ * override lives on the explicit `/jolli:init` path instead — see
+ * `applyPluginInitLocalAgentTool` in core/localagent/PluginDefaults.ts for why the
+ * two config fields get different overwrite policies.
+ *
+ * The gate is evaluated INSIDE `config.lock` (via `updateConfigTransactional`), not
+ * against the `config` argument. Two plugin hosts opening their first session
+ * together would otherwise both read "unset" from their own pre-lock snapshot, both
+ * pass a first-wins gate that is supposed to admit one of them, and settle
+ * `localAgentTool` on whichever wrote last. The `config` argument is now only a
+ * fast path: `aiProvider` is never cleared once set, so a snapshot showing it set
+ * lets us skip taking the lock at all — the common case on every session after the
+ * first.
  *
  * Called BEFORE {@link getLoginReminder} in `main()` so a brand-new plugin user is
  * immediately "credentialed" (`hasLlmCredentials` counts local-agent) and never
  * sees the spurious "Not signed in — no memories" reminder on their first session.
  *
- * Gated to the plugin build (`clientKind === "claude-plugin"`): the CLI and VS Code
- * surfaces keep their own default-derivation and are intentionally left untouched.
- * Returns whether it wrote the default. Swallows write failures — a config-write
- * hiccup must never block session startup or suppress the briefing; the fallback
- * (no write) just leaves the reminder armed, which is the safe direction.
+ * Gated to plugin source tags: the CLI, VS Code and IntelliJ surfaces keep their
+ * own default-derivation and are intentionally left untouched. Returns whether it
+ * wrote the default. Swallows write failures — a config-write hiccup must never
+ * block session startup or suppress the briefing; the fallback (no write) just
+ * leaves the reminder armed, which is the safe direction.
  */
 export async function ensurePluginDefaultProvider(
-	clientKind: string,
+	sourceTag: string,
 	config: Pick<JolliMemoryConfig, "aiProvider">,
 ): Promise<boolean> {
-	if (clientKind !== "claude-plugin") return false;
+	const tool = pluginDefaultLocalAgentTool(sourceTag);
+	if (tool === undefined) return false;
 	if (config.aiProvider !== undefined) return false;
 	try {
-		await saveConfig({ aiProvider: "local-agent", localAgentTool: "claude-code" });
-		log.info("Seeded default aiProvider=local-agent for the Claude Code plugin");
+		const seeded = await updateConfigTransactional((current) =>
+			current.aiProvider === undefined
+				? { update: { aiProvider: "local-agent", localAgentTool: tool }, result: true }
+				: { update: null, result: false },
+		);
+		if (!seeded) {
+			log.info("Skipped seeding the %s default — another writer set aiProvider first", sourceTag);
+			return false;
+		}
+		log.info("Seeded default aiProvider=local-agent tool=%s for the %s surface", tool, sourceTag);
 		return true;
 	} catch (error) {
 		log.info("Failed to seed default local-agent provider: %s", (error as Error).message);
@@ -164,7 +202,7 @@ export async function getLoginReminder(
 	return computeLoginReminder(clientKind, hasCredential, dismissed);
 }
 
-// ─── Local-agent auth-failure reminder (Claude Code plugin only) ──────────────
+// ─── Local-agent auth-failure reminder ────────────────────────────────────────
 
 /**
  * Reminder text is shared with the post-commit inline surface (see
@@ -196,27 +234,37 @@ async function isLatestCommitAuthFailure(commitHash: string, cwd: string): Promi
 
 /**
  * Returns the auth-failure reminder when the newest summarized commit on the
- * current branch failed on an expired local `claude` login, else null.
+ * current branch failed on local-agent authentication, else null.
  *
- * Plugin-only (like {@link getLoginReminder}): other surfaces have their own
- * failure UI. Checks only the NEWEST commit — a later healthy commit means the
- * login is working again, so nothing to remind about.
+ * Plugin-only (like {@link getLoginReminder}); other surfaces have their own
+ * failure UI. Checks only the NEWEST commit.
  *
  * Unlike the branch briefing, this deliberately does NOT skip main/master/etc.
  * (`SKIP_BRANCHES`): a broken local login fails generation on EVERY branch, so a
  * user who only ever commits on `main` must still be warned. The only branch
  * guard is a detached HEAD (no branch to scan).
  *
- * `clientKind` is injected (defaulting to the build's resolved kind) for the
+ * `surface` is injected (defaulting to the build's resolved client kind) for the
  * same reason {@link computeLoginReminder} takes it: the CLI test build pins
  * `__JOLLI_CLIENT_KIND__` to "cli", so a hard-coded `resolveClientKind()` here
  * would make the plugin path untestable.
+ *
+ * ONE lookup does both jobs — the plugin-only gate and the tool the message names.
+ * That is deliberate: this value arrives as a client kind from the settings-installed
+ * hook and as an install SOURCE TAG from a plugin bootstrap
+ * (`buildSessionStartContext(root, SOURCE_TAG, …)`), two vocabularies that happen to
+ * share their plugin literals. Consulting `PLUGIN_HOSTS` once means the gate and the
+ * tool can never disagree, and a third plugin host is picked up by adding one table
+ * row instead of also widening a hardcoded `!== "claude-plugin" && !== "codex-plugin"`
+ * condition here. It also drops a `?? "claude-code"` default that could only ever
+ * have fired on a non-plugin surface — which returns null one line earlier.
  */
 export async function getAuthFailureReminder(
 	projectDir: string,
-	clientKind: string = resolveClientKind(),
+	surface: string = resolveClientKind(),
 ): Promise<string | null> {
-	if (clientKind !== "claude-plugin") return null;
+	const surfaceTool = pluginDefaultLocalAgentTool(surface);
+	if (surfaceTool === undefined) return null;
 	const branch = getCurrentBranch(projectDir);
 	if (!branch) return null;
 	const index = await getIndex(projectDir);
@@ -228,7 +276,13 @@ export async function getAuthFailureReminder(
 	const newest = [...rootEntries].sort(
 		(a, b) => new Date(getDisplayDate(b)).getTime() - new Date(getDisplayDate(a)).getTime(),
 	)[0];
-	return (await isLatestCommitAuthFailure(newest.commitHash, projectDir)) ? AUTH_FAILURE_REMINDER_TEXT : null;
+	if (!(await isLatestCommitAuthFailure(newest.commitHash, projectDir))) return null;
+	// Current config wins over the surface default: this is guidance for the NEXT
+	// run, so it must name the tool that will actually be driven. (The inline
+	// post-commit line takes the opposite view and reports the tool recorded on the
+	// progress event — the one that really failed. See CaptureProgress.)
+	const config = await loadConfig();
+	return buildAuthFailureReminderText(config.localAgentTool ?? surfaceTool);
 }
 
 /**
@@ -288,7 +342,7 @@ export async function buildSessionStartContext(
 	const includePluginReminders = options.includePluginReminders !== false;
 	const [briefing, authReminder, reminder] = await Promise.all([
 		includeBriefing
-			? Promise.race([generateBriefing(projectDir), timeout(HARD_TIMEOUT_MS)])
+			? Promise.race([generateBriefing(projectDir, clientKind), timeout(HARD_TIMEOUT_MS)])
 			: Promise.resolve(null),
 		includePluginReminders
 			? Promise.race([getAuthFailureReminder(projectDir, clientKind), timeout(HARD_TIMEOUT_MS)])
@@ -305,8 +359,20 @@ export async function buildSessionStartContext(
 
 /**
  * Generates a briefing for the current branch, or returns null to skip.
+ *
+ * `clientKind` is the caller's source tag, threaded through rather than read from
+ * `resolveClientKind()` further down. The two are NOT interchangeable here: the
+ * resolved kind names whichever registered dist won the version race, not the host
+ * that started this session, so on the shared repo hook a Codex-plugin dist would
+ * hand a Claude user Codex's skill syntax. The tag is what the caller actually
+ * knows — `"shared"` when the host is genuinely unknown, which falls back to the
+ * universally valid CLI form.
+ *
+ * It is also part of the cache key — see {@link checkBriefingCache}. A briefing's
+ * body is host-neutral but its recall hint is not, so a cache keyed by branch +
+ * commit alone hands the second host the first host's syntax.
  */
-async function generateBriefing(projectDir: string): Promise<string | null> {
+async function generateBriefing(projectDir: string, clientKind: string): Promise<string | null> {
 	// Step 1: Get current branch
 	const branch = getCurrentBranch(projectDir);
 	if (!branch || SKIP_BRANCHES.has(branch)) {
@@ -314,7 +380,7 @@ async function generateBriefing(projectDir: string): Promise<string | null> {
 	}
 
 	// Step 2: Check briefing cache
-	const cacheResult = checkBriefingCache(projectDir, branch);
+	const cacheResult = checkBriefingCache(projectDir, branch, clientKind);
 	if (cacheResult) {
 		return cacheResult;
 	}
@@ -369,12 +435,13 @@ async function generateBriefing(projectDir: string): Promise<string | null> {
 		lastSummary,
 		planNames,
 		aggregatedDiffStats,
+		clientKind,
 	);
 
 	// Step 8: Cache the result (use HEAD hash as cache key, not index commit hash,
 	// because HEAD may be ahead of the last summarized commit during active development)
 	const headHash = getCurrentHeadHash(projectDir);
-	saveBriefingCache(projectDir, branch, headHash ?? lastEntry.commitHash, briefing);
+	saveBriefingCache(projectDir, branch, headHash ?? lastEntry.commitHash, briefing, clientKind);
 
 	return briefing;
 }
@@ -484,6 +551,7 @@ function buildBriefingText(
 	summaryData: LastSummaryData,
 	planNames: ReadonlyArray<string>,
 	diffStats: DiffStats | null,
+	clientKind: string,
 ): string {
 	const commitCount = entries.length;
 	const periodStart = formatDate(getDisplayDate(oldestEntry));
@@ -518,7 +586,7 @@ function buildBriefingText(
 	}
 
 	// Line 6: Recall suggestion based on time gap.
-	const recallSuggestion = formatRecallSuggestion(daysSinceLastCommit, resolveClientKind());
+	const recallSuggestion = formatRecallSuggestion(daysSinceLastCommit, clientKind);
 	if (recallSuggestion) lines.push(recallSuggestion);
 
 	return lines.join("\n");
@@ -528,11 +596,17 @@ function buildBriefingText(
  * Builds the session-start recall call-to-action, or null when the last commit is
  * same-day (nothing to suggest).
  *
- * The recall entry point differs by surface, so this deliberately NEVER names an
- * unnamespaced `jolli-recall` skill: the Claude Code plugin exposes recall as the
- * namespaced `/jolli:recall` skill, while every other surface reaches the same
- * capability through the `jolli recall` CLI (the `recall` MCP tool wraps the same
- * engine). Recall defaults to the current branch, so no argument is needed.
+ * The recall entry point differs by surface: the Claude Code plugin exposes
+ * `/jolli:recall`, the Codex plugin exposes `$jolli:recall`, and every other
+ * surface — including the shared repo hook, which cannot know its host — reaches
+ * the same capability through the `jolli recall` CLI (the `recall` MCP tool wraps
+ * the same engine). Recall defaults to the current branch, so no argument is needed.
+ *
+ * BOTH plugin forms are namespaced: Codex prefixes a plugin's skills with the
+ * plugin's own name exactly as Claude Code does, so the bundle's bare `recall`
+ * directory is invoked as `jolli:recall`. A bare `$jolli-recall` would name a skill
+ * that does not exist on a plugin-only install — it only appears to work in a repo
+ * that separately ran a full `jolli enable`, which is why it survives local testing.
  *
  * Pure and `clientKind`-parameterized (mirrors {@link computeLoginReminder}) so both
  * the plugin and non-plugin branches are unit-testable regardless of the build's
@@ -540,7 +614,12 @@ function buildBriefingText(
  */
 export function formatRecallSuggestion(daysSinceLastCommit: number, clientKind: string): string | null {
 	if (daysSinceLastCommit <= 0) return null;
-	const recallHint = clientKind === "claude-plugin" ? "/jolli:recall" : "`jolli recall`";
+	const recallHint =
+		clientKind === "claude-plugin"
+			? "/jolli:recall"
+			: clientKind === "codex-plugin"
+				? "$jolli:recall"
+				: "`jolli recall`";
 	return daysSinceLastCommit > 3
 		? `Warning: ${daysSinceLastCommit} days since last commit. Run ${recallHint} for full context.`
 		: `Tip: run ${recallHint} for full context`;
@@ -579,13 +658,29 @@ function getBriefingCachePath(projectDir: string): string {
 	return join(projectDir, ".jolli", "jollimemory", "briefing-cache.json");
 }
 
-function checkBriefingCache(projectDir: string, branch: string): string | null {
+/**
+ * The cached briefing for `branch` at the current HEAD, or null on any miss.
+ *
+ * `clientKind` is part of the key, not just recorded: the briefing text embeds a
+ * host-specific recall hint (`/jolli:recall` for the Claude plugin, `$jolli:recall`
+ * for Codex's, the `jolli recall` CLI form elsewhere — see
+ * {@link formatRecallSuggestion}),
+ * and each plugin form is inert in the other host. Keyed by branch + commit alone,
+ * whichever host started first would hand the other a command it cannot run until
+ * the next commit rolled the key.
+ *
+ * A cache written before this field existed has `clientKind: undefined`, which
+ * matches no live tag and so reads as a miss — one regenerated briefing per repo,
+ * no migration.
+ */
+function checkBriefingCache(projectDir: string, branch: string, clientKind: string): string | null {
 	const cachePath = getBriefingCachePath(projectDir);
 	if (!existsSync(cachePath)) return null;
 
 	try {
 		const cache = JSON.parse(readFileSync(cachePath, "utf-8")) as BriefingCache;
 		if (cache.branch !== branch) return null;
+		if (cache.clientKind !== clientKind) return null;
 
 		// Validate that HEAD hasn't moved since we cached the briefing
 		const currentHead = getCurrentHeadHash(projectDir);
@@ -597,12 +692,25 @@ function checkBriefingCache(projectDir: string, branch: string): string | null {
 	}
 }
 
-function saveBriefingCache(projectDir: string, branch: string, lastCommitHash: string, briefingText: string): void {
+/**
+ * Writes the briefing cache. Single-slot per repo, so in a two-host repo the hosts
+ * take turns evicting each other rather than each keeping their own entry — the
+ * `clientKind` check in {@link checkBriefingCache} makes that a miss-and-regenerate
+ * (correct, slower) instead of a hit on the wrong syntax.
+ */
+function saveBriefingCache(
+	projectDir: string,
+	branch: string,
+	lastCommitHash: string,
+	briefingText: string,
+	clientKind: string,
+): void {
 	const cachePath = getBriefingCachePath(projectDir);
 	const cache: BriefingCache = {
 		branch,
 		lastCommitHash,
 		briefingText,
+		clientKind,
 		generatedAt: new Date().toISOString(),
 	};
 
@@ -675,7 +783,33 @@ function formatDate(iso: string): string {
 	return iso.split("T")[0];
 }
 
-/* v8 ignore next 3 - script entry point */
-if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, "/"))) {
+/**
+ * True only when THIS module is the process entry point.
+ *
+ * The path comparison alone is not enough, and the difference is not theoretical.
+ * Both plugin bootstraps import `buildSessionStartContext` from here, and esbuild
+ * inlines this module into their bundles while rewriting `import.meta.url` to the
+ * bundle's own path — which is also `argv[1]`. So a bare path comparison is TRUE
+ * inside `PluginBootstrapHook.js` / `CodexPluginBootstrapHook.js`, and `main()` ran
+ * there as a side effect of the import, writing this hook's plain-text briefing to
+ * stdout ahead of the bootstrap's own JSON. Codex rejects the result outright
+ * (`hook: SessionStart Failed`, so no briefing reaches the model); Claude Code
+ * tolerates plain text and merely showed it twice, which is why this survived.
+ *
+ * The basename check is what actually distinguishes the two cases, and it mirrors
+ * the guard `QueueWorker` already carries for the same reason — that module is
+ * imported by three git hooks and would otherwise drain the queue on import.
+ */
+/* v8 ignore start - script entry point */
+function isMainScript(): boolean {
+	const argv1 = process.argv[1];
+	if (process.env.VITEST || !argv1) return false;
+	if (resolvePath(argv1) !== resolvePath(fileURLToPath(import.meta.url))) return false;
+	const entryName = basename(argv1).toLowerCase();
+	return entryName === "sessionstarthook.js" || entryName === "sessionstarthook.ts";
+}
+
+if (isMainScript()) {
 	main();
 }
+/* v8 ignore stop */

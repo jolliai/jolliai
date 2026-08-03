@@ -22,6 +22,7 @@ import {
 	registerMcpInClaude,
 	removeMcpFromClaude,
 	resolveCliJs,
+	resolveMcpLauncherJs,
 } from "../McpRegistration.js";
 import { removeCodexMcpServer, upsertCodexMcpServer } from "./CodexTomlWriter.js";
 import { removeJsonMcpServer, upsertJsonMcpServer } from "./JsonMcpWriter.js";
@@ -85,6 +86,31 @@ function jolliEntry() {
 }
 
 /**
+ * Codex's entry: {@link jolliEntry} plus an optional win32 upgrade.
+ *
+ * On win32 `jolliEntry` bakes in the winning dist's `Cli.js`, which freezes the
+ * runtime version until the next register. When that dist also ships
+ * `McpLauncher.js` we spawn the launcher instead — it re-resolves the winning dist
+ * on every MCP start, so a later upgrade is picked up with no re-register.
+ *
+ * **The launcher entry carries NO `mcp` argument.** That is its contract, not an
+ * omission: `McpLauncher.main()` appends `mcp` itself when it spawns the resolved
+ * `Cli.js`, so passing one here would produce `Cli.js mcp mcp`. Every other entry in
+ * this file — including this function's own fallback — DOES carry it, which is
+ * exactly why it is stated out loud. See cli/src/McpLauncher.ts.
+ *
+ * Codex-only because Codex is the one host with a plugin bundle competing against a
+ * standalone CLI on the same machine, so a frozen version is most likely to be the
+ * *wrong* one here. POSIX is unaffected — `run-cli` already resolves per launch.
+ */
+function codexEntry() {
+	const entry = jolliEntry();
+	if (process.platform !== "win32") return entry;
+	const launcher = resolveMcpLauncherJs(getGlobalConfigDir());
+	return launcher ? { command: "node", args: [launcher] } : entry;
+}
+
+/**
  * Cursor: project-scoped `<worktree>/.cursor/mcp.json`.
  * Format verified from Cursor app source (parseMcpServersFromFile in workbench.desktop.main.js):
  * top-level key `mcpServers`, entry shape `{ command, args?, env?, envFile?, cwd? }`.
@@ -121,11 +147,27 @@ const geminiRegistrar: McpHostRegistrar = {
  *   args = ["mcp"]
  * Table key is `mcp_servers` (underscore). Global config — never committed, so
  * gitExcludePaths returns [].
+ *
+ * This entry is also the ONLY way Jolli's MCP server reaches Codex, including for
+ * plugin-only users: the Codex plugin deliberately ships no `.mcp.json`. A plugin
+ * MCP entry must pin `cwd` to the plugin root for its relative command to resolve
+ * (verified against codex-cli 0.146.0 and OpenAI's own bundled plugins), and the
+ * server derives the repository it serves from its cwd — so a plugin-launched server
+ * answers `recall` / `search` / `status` for the plugin's cache directory instead of
+ * the user's repo, silently and with a placeholder Memory Bank folder to match. A
+ * `config.toml` entry carries no cwd and Codex launches it with the SESSION cwd
+ * (measured), which is the only correct one. Codex exposes no way to recover the
+ * workspace from inside a plugin-launched server: 0.146.0 declares no `roots`
+ * capability (a server-initiated `roots/list` returns an empty array) and passes MCP
+ * servers a 7-variable env allowlist — HOME, LOGNAME, PATH, SHELL, TMPDIR, USER,
+ * __CF_USER_TEXT_ENCODING — with nothing session-scoped in it. Do not "restore" the
+ * plugin's `.mcp.json`; see `McpServer.startMcpServer`'s plugin-cache guard, which
+ * refuses to serve such a launch at all.
  */
 const codexRegistrar: McpHostRegistrar = {
 	host: "codex",
 	scope: "global",
-	register: () => upsertCodexMcpServer(join(homedir(), ".codex", "config.toml"), jolliEntry()),
+	register: () => upsertCodexMcpServer(join(homedir(), ".codex", "config.toml"), codexEntry()),
 	remove: () => removeCodexMcpServer(join(homedir(), ".codex", "config.toml")),
 	gitExcludePaths: () => [],
 };

@@ -104,6 +104,7 @@ import {
 	savePluginSource,
 	saveSession,
 	saveSquashPending,
+	updateConfigTransactionalScoped,
 	upsertReferenceEntry,
 	upsertSkillEntry,
 } from "./SessionTracker.js";
@@ -188,6 +189,28 @@ describe("SessionTracker", () => {
 			expect(sessions).toHaveLength(2);
 			const ids = sessions.map((s) => s.sessionId).sort();
 			expect(ids).toEqual(["session-1", "session-2"]);
+		});
+
+		it("should preserve concurrent session writes from separate agent hooks", async () => {
+			const now = new Date().toISOString();
+			await Promise.all(
+				Array.from({ length: 8 }, (_, index) =>
+					saveSession(
+						{
+							sessionId: `session-${index}`,
+							transcriptPath: `/path/${index}.jsonl`,
+							updatedAt: now,
+							source: index % 2 === 0 ? "codex" : "claude",
+						},
+						tempDir,
+					),
+				),
+			);
+
+			const sessions = await loadAllSessions(tempDir);
+			expect(sessions.map((session) => session.sessionId).sort()).toEqual(
+				Array.from({ length: 8 }, (_, index) => `session-${index}`).sort(),
+			);
 		});
 
 		it("should upsert existing session by sessionId", async () => {
@@ -683,6 +706,79 @@ describe("SessionTracker", () => {
 			const merged = await loadConfigFromDir(dir);
 			expect(merged.excludePatterns).toEqual(["*.log"]);
 			expect(merged.apiKey).toBe("sk-test");
+		});
+
+		it("should preserve concurrent partial config updates", async () => {
+			const dir = join(tempDir, "config-concurrent");
+			await Promise.all([
+				saveConfigScoped({ apiKey: "sk-test" }, dir),
+				saveConfigScoped({ model: "test-model" }, dir),
+				saveConfigScoped({ maxTokens: 4096 }, dir),
+			]);
+
+			await expect(loadConfigFromDir(dir)).resolves.toMatchObject({
+				apiKey: "sk-test",
+				model: "test-model",
+				maxTokens: 4096,
+			});
+		});
+	});
+
+	describe("updateConfigTransactionalScoped", () => {
+		it("writes what the decision asks for and reports its result", async () => {
+			const dir = join(tempDir, "config-tx-write");
+			const result = await updateConfigTransactionalScoped(
+				() => ({ update: { model: "chosen" }, result: "wrote" }),
+				dir,
+			);
+			expect(result).toBe("wrote");
+			await expect(loadConfigFromDir(dir)).resolves.toMatchObject({ model: "chosen" });
+		});
+
+		it("writes nothing on a null update but still returns the result", async () => {
+			const dir = join(tempDir, "config-tx-noop");
+			await saveConfigScoped({ model: "untouched" }, dir);
+			const result = await updateConfigTransactionalScoped(() => ({ update: null, result: "skipped" }), dir);
+			expect(result).toBe("skipped");
+			await expect(loadConfigFromDir(dir)).resolves.toMatchObject({ model: "untouched" });
+		});
+
+		it("hands the decision the state on disk, not a caller-held snapshot", async () => {
+			const dir = join(tempDir, "config-tx-fresh");
+			await saveConfigScoped({ aiProvider: "jolli" }, dir);
+			const seen = await updateConfigTransactionalScoped(
+				(current) => ({ update: null, result: current.aiProvider }),
+				dir,
+			);
+			expect(seen).toBe("jolli");
+		});
+
+		// The reason this helper exists. Three writers race the SAME first-wins gate —
+		// the shape of the plugin provider seed with two plugin hosts installed. Decided
+		// from a pre-lock snapshot all three pass the gate and the last write wins, so
+		// the value the losers were told to expect is not the value on disk. Decided
+		// inside the lock, exactly one writes and the file agrees with the winner.
+		it("resolves a concurrent first-wins gate to exactly one winner", async () => {
+			const dir = join(tempDir, "config-tx-race");
+			const tools = ["claude-code", "codex", "opencode"] as const;
+			const outcomes = await Promise.all(
+				tools.map((tool) =>
+					updateConfigTransactionalScoped<string | null>(
+						(current) =>
+							current.aiProvider === undefined
+								? { update: { aiProvider: "local-agent", localAgentTool: tool }, result: tool }
+								: { update: null, result: null },
+						dir,
+					),
+				),
+			);
+
+			const winners = outcomes.filter((tool): tool is string => tool !== null);
+			expect(winners).toHaveLength(1);
+			await expect(loadConfigFromDir(dir)).resolves.toMatchObject({
+				aiProvider: "local-agent",
+				localAgentTool: winners[0],
+			});
 		});
 	});
 
@@ -1567,6 +1663,20 @@ describe("SessionTracker", () => {
 				expect(config.localAgentTool).toBe("cursor-agent");
 				expect(config.localAgentPath).toBeUndefined();
 			});
+		});
+
+		it("should merge concurrent first-seen source updates without losing either source", async () => {
+			const targetDir = join(tempDir, "seen-sources");
+			const results = await Promise.all([
+				markAiSourceSeenInDir(targetDir, "codex"),
+				markAiSourceSeenInDir(targetDir, "claude"),
+			]);
+
+			expect(results).toEqual([true, true]);
+			expect([...((await loadConfigFromDir(targetDir)).telemetrySeenSources ?? [])].sort()).toEqual([
+				"claude",
+				"codex",
+			]);
 		});
 	});
 

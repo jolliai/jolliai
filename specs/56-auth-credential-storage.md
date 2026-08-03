@@ -11,6 +11,7 @@ Persist the OAuth session token and the product API key together in a single per
 - The on-disk location of the config file.
 - The set of credential-related fields stored, their meaning, and which are required vs optional.
 - The atomic-write behavior used by every save: temp-file write, rename, and the EPERM/EACCES fallback path.
+- Cross-process serialization of the complete load-merge-write cycle through `config.lock`.
 - The merge semantics: a partial update preserves fields not included.
 - The env-var fallbacks consulted at read time.
 - The save-time validation that gates writing each credential field.
@@ -74,6 +75,12 @@ Every save uses a temp-file + rename pattern:
 4. **EPERM / EACCES fallback (Windows-friendly).** If the rename fails with `EPERM` or `EACCES` (e.g. because antivirus or a file-watcher is holding the target open), write the content directly to the target and remove the temp file. Other rename errors propagate.
 
 The rename branch is the atomic path; the fallback is a non-atomic but durable last resort to avoid losing writes on Windows hosts where rename-over-existing-file is unreliable.
+
+### Configuration lock
+
+Every partial save takes `config.lock` in the target config directory before loading the existing document, and releases it after the atomic write. Production saves therefore share `~/.jolli/jollimemory/config.lock` across CLI, plugin hooks, and editor surfaces; scoped test/migration saves use the same protocol in their explicit target directory.
+
+The wait budget is five seconds, polled every 25 ms. A timeout warns and proceeds best-effort rather than dropping a credential/config update. Under normal acquisition, concurrent partial updates re-read the latest file and preserve one another's unrelated fields. The machine-global first-seen telemetry ledger also holds this lock across its read/check/append/write so two newly-detected agent sources cannot overwrite each other.
 
 ### Merge semantics
 
@@ -154,10 +161,11 @@ A "clear all credentials" entry point removes `authToken` and `jolliApiKey` in a
 ### Save (partial)
 
 1. Ensure `~/.jolli/jollimemory/` exists; create it if missing.
-2. Read the existing `config.json`. If absent or malformed, start with an empty object (the malformed case is silently treated as "no existing config" — a partial save will overwrite it cleanly).
-3. Merge the partial into the existing object. `undefined` values cause key removal because keys whose value is undefined are omitted from the serialized form.
-4. Atomic write (temp + rename, EPERM/EACCES fallback).
-5. Log the save location.
+2. Acquire `config.lock`.
+3. Read the existing `config.json` **after acquisition**. If absent or malformed, start with an empty object (the malformed case is silently treated as "no existing config" — a partial save will overwrite it cleanly).
+4. Merge the partial into the existing object. `undefined` values cause key removal because keys whose value is undefined are omitted from the serialized form.
+5. Atomic write (temp + rename, EPERM/EACCES fallback).
+6. Release the lock in a `finally` path and log the save location.
 
 ### Save credentials (combined)
 
@@ -255,6 +263,7 @@ A corrupt `config.json` (e.g. truncated by a host crash mid-write — possible o
 - **A malformed `config.json` is silently treated as empty.** This is intentional: a corrupted file should not block the next save, and the next save overwrites it cleanly. The trade-off is that a load of a corrupt file silently loses the previously stored values. (Surprising; intentional.)
 - **Validation lives at the save boundary, not at the read boundary.** The save path validates the API key's structure and embedded origin. The load path returns whatever is in the file without revalidating. The save-time-only doctrine applies (see **Jolli Origin Allowlist Enforcement**). (Notable.)
 - **The credential file is the same file used for non-credential config.** Storing both in `~/.jolli/jollimemory/config.json` keeps the CLI and the editor extension in sync without a separate secret store. The trade-off is that the file must be merge-saved (never overwritten) to preserve unrelated fields. (Notable.)
+- **Concurrent partial saves preserve unrelated fields.** The lock wraps the initial load as well as the write, so a Codex bootstrap writing `localAgentTool` and a concurrent login writing credentials merge from the latest snapshot instead of both overwriting from a stale one. A five-second timeout deliberately degrades to best-effort, leaving only a pathological residual lost-update window rather than dropping the later write.
 - **The editor extension uses this same file, not the host IDE's secret store.** This is deliberate — using the IDE's secret store would split the credential between the CLI and the extension and break the "shared identity" contract. The trade-off is that the credential is only filesystem-protected, not OS-keychain-protected. (Surprising; intentional.)
 - **The tenant URL a sign-in persists can differ from the origin the browser was pointed at.** It is resolved from the minted key's embedded tenant, then the on-disk key's embedded tenant, then the launch origin — skipping any candidate that is off the allowlist. The second step is what stops an idempotent-replay callback from wiping a working key. (Surprising; intentional. See "Resolve which tenant URL a sign-in persists".)
 - **A cross-tenant sign-in either replaces the key or clears it — it never leaves a key pointed at the old tenant.** Supplying a key for a different tenant than the one being persisted refuses the whole write; supplying none while a different-tenant key sits on disk clears that key. Both outcomes are preferred to silent cross-tenant routing. (Notable, defensive.)
@@ -270,3 +279,4 @@ A corrupt `config.json` (e.g. truncated by a host crash mid-write — possible o
 - The HTTP exchange that mints the values is defined by **CLI Authorization Code Exchange**.
 - The structure of the product API key, its prefix, and its decoded payload are defined by **Jolli API Key Format and Parsing**.
 - The allowlist applied during save-time validation of the API key (and during the env-var read of `JOLLI_URL`) is defined by **Jolli Origin Allowlist Enforcement**.
+- The PID/mtime lock convention, wait budget, and best-effort timeout behavior are catalogued in **Lock Primitive Registry** (spec 297).

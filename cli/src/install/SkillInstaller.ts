@@ -203,15 +203,21 @@ export async function updateSkillsIfNeeded(
 ): Promise<void> {
 	// Clean up legacy skill directories from previous versions. These only
 	// ever lived under `.claude/skills/` — `.agents/skills/` is a new target.
+	//
+	// Ownership-guarded, like every other removal in this file. This used to
+	// `rm -rf` the two legacy names unconditionally, and they are ordinary enough
+	// (`jollimemory-recall`, `jolli-memory-recall`) that a user could plausibly own a
+	// hand-authored skill under one. The guard accepts the legacy
+	// `jolli-skill-version:` marker as well as the modern `vendor` one, so the old
+	// installs this exists to clean are still recognized.
+	//
+	// NOT redundant with `removeClaudeLegacySkills`, whose `CLAUDE_LEGACY_SKILL_DIRS`
+	// spans these same names: that one runs from a plugin bootstrap, this one from a
+	// full `jolli enable`. The two are reached by different entry points, so a user
+	// who never installs a plugin only ever passes through here — deleting this loop
+	// would strand their legacy directories forever.
 	for (const legacyName of LEGACY_SKILL_DIRS) {
-		const legacyDir = join(projectDir, ".claude", "skills", legacyName);
-		try {
-			await rm(legacyDir, { recursive: true, force: true });
-			/* v8 ignore start -- defensive: rm with force:true rarely throws */
-		} catch {
-			// Ignore — directory may not exist or already removed
-		}
-		/* v8 ignore stop */
+		await removeJolliOwnedSkillDir(join(projectDir, ".claude", "skills", legacyName), "legacy");
 	}
 
 	// Sweep away skills Jolli has retired before writing the current set, so an
@@ -242,23 +248,30 @@ export async function updateSkillsIfNeeded(
  *
  * The sweep is unconditional (NOT `enabled`-gated): a retired skill should be
  * deleted from a target regardless of whether new skills would be written there.
+ *
+ * RETIRED names only — this is the one thing that may be removed from the shared
+ * `.agents/skills/` directory, because a name the product no longer ships is dead
+ * for every host that reads it. A name a host still ships must NOT be removed here:
+ * `.agents/` is cross-platform, so deleting an ACTIVE skill on one host's behalf
+ * takes the only copy the other hosts have. See the Codex branch of the
+ * repo-hooks-only bootstrap in `Installer.ts` for the full history.
  */
 export async function removeRetiredSkills(projectDir: string): Promise<void> {
 	for (const target of SKILL_TARGETS) {
 		const targetDir = join(projectDir, ...target.relativeDir);
 		for (const name of REMOVED_SKILL_NAMES) {
-			await removeRetiredSkill(join(targetDir, name));
+			await removeJolliOwnedSkillDir(join(targetDir, name), "retired");
 		}
 	}
 }
 
 /**
- * Deletes a single retired-skill directory, but only when its SKILL.md carries a
+ * Deletes a single Jolli-owned skill directory, but only when its SKILL.md carries a
  * Jolli ownership marker — so a user's own hand-authored skill of the same name
  * is never removed. A missing directory is a no-op. Fail-soft: a read/remove
  * error is logged and swallowed, never thrown (mirrors {@link removeClaudeLegacySkills}).
  */
-async function removeRetiredSkill(skillDir: string): Promise<void> {
+async function removeJolliOwnedSkillDir(skillDir: string, reason: string): Promise<void> {
 	const skillPath = join(skillDir, "SKILL.md");
 	let content: string;
 	try {
@@ -272,10 +285,10 @@ async function removeRetiredSkill(skillDir: string): Promise<void> {
 	}
 	try {
 		await rm(skillDir, { recursive: true, force: true });
-		log.info("Removed retired Jolli skill at %s", skillDir);
+		log.info("Removed %s Jolli skill at %s", reason, skillDir);
 		/* v8 ignore start -- defensive: rm with force:true rarely throws */
 	} catch (error: unknown) {
-		log.warn("Failed to remove retired skill at %s: %s", skillDir, (error as Error).message);
+		log.warn("Failed to remove %s skill at %s: %s", reason, skillDir, (error as Error).message);
 	}
 	/* v8 ignore stop */
 }
@@ -1518,10 +1531,18 @@ text-list fallback keeps \`/jolli\` usable on every host that loads skills.
  * into `/jolli:init` — which owns sign-in → enable → bind-Space — rather than
  * dumping a menu. Once set up it prints a short `✓` snapshot and only THEN
  * presents the action menu, biased by state. It still never re-implements an
- * action; it only reads status and invokes an existing skill or MCP tool. Space
- * binding is deliberately not gated on here — `status` doesn't report it (it
- * only surfaces via `/jolli:push`'s `binding_required`), so binding stays
- * `/jolli:init`'s / `/jolli:push`'s job.
+ * action; it only reads status and invokes an existing skill or MCP tool.
+ *
+ * Both of the CLI ladder's axes are mirrored, not just generation: **can sync**
+ * (`signedIn || jolliApiKeyConfigured`) is orthogonal to **can generate**, so the
+ * default `local-agent` repo generates memories while unable to share them. That
+ * state gets the CLI's optional sign-in step as a one-line, non-blocking nudge
+ * toward `/jolli:login` (`offerOptionalJolliLogin`'s ask-once semantics, minus the
+ * persisted "don't ask again" — a static SKILL.md has nowhere to store it). It is
+ * a nudge, never a gate: an unsigned repo still gets the full menu. Space
+ * *binding* is deliberately still not gated on — `status.space` is display-only
+ * (unbound only surfaces via `/jolli:push`'s `binding_required`), so binding
+ * stays `/jolli:init`'s / `/jolli:push`'s job.
  *
  * Written by {@link installPluginJolliMenu} to `<repo>/.claude/skills/jolli/`,
  * which is the only way to surface a BARE `/jolli` from a plugin (plugin skills
@@ -1535,8 +1556,8 @@ text-list fallback keeps \`/jolli\` usable on every host that loads skills.
  * earlier revision) sitting in `.claude/skills/jolli/`, and both carry
  * `vendor: "jolli.ai"` so the ownership guard cannot tell them apart —
  * `upsertSkill` arbitrates purely by `metadata.revision`. This variant is
- * therefore revision **6** (above the standalone's current revision 5, and above
- * the ≤5 any legacy `.claude/` copy carries) so {@link installPluginJolliMenu}
+ * therefore revision **8** (above the standalone's current revision 6, and above
+ * the ≤6 any legacy `.claude/` copy carries) so {@link installPluginJolliMenu}
  * RECLAIMS that legacy slot, replacing a stale standalone menu that would
  * otherwise route to the unnamespaced `jolli-*` skills
  * {@link removeClaudeLegacySkills} just deleted. Keep this note and both revision
@@ -1546,10 +1567,10 @@ text-list fallback keeps \`/jolli\` usable on every host that loads skills.
 export function buildPluginJolliMenuSkillTemplate(): string {
 	return `---
 name: jolli
-description: The Jolli front door — checks how Jolli is set up in this repo, guides first-time setup through /jolli:init when something's missing, and otherwise shows a status snapshot and routes you to the right Jolli skill or MCP tool. Use when the user types /jolli or asks for Jolli / the Jolli menu.
+description: The Jolli front door — checks how Jolli is set up in this repo, guides first-time setup through /jolli:init when something's missing, reminds you to sign in when memories can't sync yet, and otherwise shows a status snapshot and routes you to the right Jolli skill or MCP tool. Use when the user types /jolli or asks for Jolli / the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 7
+  revision: 8
   vendor: "jolli.ai"
 ---
 
@@ -1557,12 +1578,14 @@ metadata:
 
 The single front door for Jolli. Rather than dumping a static list, it reads how
 Jolli is set up in THIS repo and guides the next step: if setup is incomplete it
-walks the user into \`/jolli:init\`; once everything is wired it shows a short
-status snapshot and routes the user's choice to the right skill or Jolli MCP
-tool. It is a friendly front door — it **never** re-implements any action, it
+walks the user into \`/jolli:init\`; if memories are being captured but cannot be
+shared yet it reminds the user to sign in; once everything is wired it shows a
+short status snapshot and routes the user's choice to the right skill or Jolli
+MCP tool. It is a friendly front door — it **never** re-implements any action, it
 only reads status and invokes an existing skill or an existing MCP tool. The
-standalone \`/jolli:init\`, \`/jolli:recall\`, \`/jolli:search\`, \`/jolli:push\`
-commands all keep working unchanged; this is layered on top of them, not a
+standalone \`/jolli:init\`, \`/jolli:recall\`, \`/jolli:search\`, \`/jolli:push\`,
+\`/jolli:login\`, \`/jolli:logout\`, \`/jolli:status\` and \`/jolli:timeline\`
+entry points all keep working unchanged; this is layered on top of them, not a
 replacement.
 
 ## Step 0 — confirm this menu can route
@@ -1616,6 +1639,11 @@ guessing. This is the state-aware front door — not a static list.
   is omitted once \`account.signedIn\` is true).
 - \`account.anthropicKeyConfigured\` — is an Anthropic key present? Surfaced ONLY
   when \`account.aiProvider === "anthropic"\`; omitted for every other provider.
+- \`account.aiProvider\` — \`"local-agent"\` | \`"jolli"\` | \`"anthropic"\` | \`null\`.
+  Drives the provider-aware generation check in Step 2.
+- \`account.localAgentTool\` — label of the local agent CLI that generates
+  summaries (e.g. "Claude Code"). Surfaced ONLY when
+  \`account.aiProvider === "local-agent"\`; feeds the snapshot's engine suffix.
 - \`account.site\` — the Jolli site host, for the snapshot line.
 - \`storedMemories\` — how many memories this repo already has.
 - \`space\` — the bound Jolli Space (\`{ name }\`) this repo's memories sync to, or
@@ -1653,6 +1681,11 @@ Derive two capabilities from Step 1, mirroring the CLI's guided front door:
   (For the Jolli proxy a sign-in DOES carry a generation credential — signing in
   mints a Jolli API key — which is why \`jolliApiKeyConfigured\` is omitted once
   signed in. For the \`anthropic\` provider, sign-in alone does NOT count.)
+- **can sync memories** = \`account.signedIn\` OR \`account.jolliApiKeyConfigured\`.
+  Provider-independent: syncing to a Jolli Space always needs a **Jolli**
+  credential, so an Anthropic key never satisfies it. This axis is orthogonal to
+  generation — the default \`local-agent\` repo generates fine while unable to
+  sync, which is exactly the state the Step 2 sign-in nudge below exists for.
 - **enabled** = the \`enabled\` flag.
 
 Then take exactly one branch:
@@ -1670,12 +1703,21 @@ Then take exactly one branch:
   then continue to Step 3 to present the action menu.
 
   \`\`\`
-  ✓ signed in · <account.site>        (or "✓ Jolli key set" / "✓ Anthropic key set" when not signed in)
+  ✓ signed in · <account.site> · summaries via <account.localAgentTool>
   ✓ enabled · <storedMemories> memories
   ✓ syncing · Space "<space.name>"    (ONLY when \`space\` is non-null; omit the whole line otherwise)
 
   Jolli is listening — last memory saved.
   \`\`\`
+
+  Pick the FIRST line by state, mirroring the CLI front door's wording exactly:
+
+  - signed in → \`✓ signed in · <account.site>\`, plus \` · summaries via
+    <account.localAgentTool>\` when \`account.aiProvider\` is \`local-agent\`. Drop
+    the \`· <site>\` segment when \`account.site\` is null.
+  - not signed in, \`local-agent\` → \`✓ local agent set (not signed in to Jolli)\`.
+  - not signed in, \`jolli\` → \`✓ Jolli API key set (not signed in to Jolli)\`.
+  - not signed in, \`anthropic\` → \`✓ Anthropic API key set (not signed in to Jolli)\`.
 
   Render the \`✓ syncing · Space "<space.name>"\` line **only when \`space\` is
   non-null** — it means a \`git push\` auto-publishes this branch's memories to that
@@ -1689,6 +1731,30 @@ Then take exactly one branch:
   If \`storedMemories\` is 0, still show the menu, but Step 3 leads it with
   \`/jolli:init\` (on a fresh repo recall / search would only return empty, so
   they must not be the default action).
+
+### Sign-in nudge — only when **can sync** is false
+
+Generation working does not mean memories are shared. When the user can generate
+but **can sync** is false (the normal state of a fresh \`local-agent\` install),
+add ONE line under the snapshot, mirroring the CLI front door's optional
+sign-in step:
+
+\`\`\`
+Sign in to Jolli to sync memories to a Space? (/jolli:login — memory generation keeps running locally either way)
+\`\`\`
+
+Rules for the nudge:
+
+- It is **non-blocking**. Never withhold the Step 3 menu waiting for an answer,
+  and never treat "not signed in" as broken — the repo is capturing memories.
+- Offer it **once** per invocation. If the user declines, drop it for the rest of
+  the session and do not repeat it after later actions.
+- If the user accepts, hand off to the existing login flow: tell them to run
+  \`/jolli:login\` (a skill cannot invoke a slash command for them), or invoke
+  \`jolli:init\` when they also want to bind a Space in the same pass. Do NOT run
+  \`auth login\` yourself here — \`/jolli:login\` owns that flow.
+- Skip the nudge entirely when **can sync** is true, and inside the "Not fully
+  set up" branch (there \`/jolli:init\` already walks sign-in).
 
 ## Step 3 — route the request / present the menu
 
@@ -1726,6 +1792,22 @@ List a plugin skill only if it was confirmed available in Step 0.
   invoking the \`jolli:push\` skill.
 
 Route a local choice by invoking that skill through the Skill tool.
+
+### Jolli plugin commands
+
+The plugin also ships these as slash **commands**, so they belong in the menu —
+but a skill cannot invoke a command. Route a choice by telling the user to run
+it (one line, with the command spelled out), or by calling the equivalent Jolli
+MCP tool when one exists.
+
+- **/jolli:login** — Sign in to Jolli so this repo can bind a Space and share
+  memories. Surface this whenever **can sync** is false, even if the user did not
+  pick it. Generation is unaffected by signing in.
+- **/jolli:logout** — Clear the stored Jolli credentials.
+- **/jolli:status** — Full installation / queue health. Prefer the \`status\` MCP
+  tool when it is registered.
+- **/jolli:timeline** — How one decision topic evolved. Prefer the
+  \`get_decision_timeline\` MCP tool when it is registered.
 
 ### Jolli MCP tools (whatever is registered this session)
 

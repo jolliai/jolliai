@@ -1,11 +1,24 @@
 # Release process
 
-This document describes the release process for **the CLI and the VS Code extension** — two artifacts that share one flow:
+This document describes the automated release process for **the CLI and the VS Code extension** — two artifacts that share one flow:
 
 - **CLI** — `@jolli.ai/cli` on npm. Tag prefix: `release-cli-v<version>`. Workflow: [`publish-cli.yaml`](.github/workflows/publish-cli.yaml).
 - **VS Code extension** — `jolli.jollimemory-vscode` on the VS Code Marketplace and Open VSX. Tag prefix: `release-vscode-v<version>`. Workflow: [`publish-vscode.yaml`](.github/workflows/publish-vscode.yaml).
 
 Each artifact has its own workflow but they share the branch model, signing requirements, and procedural shape below. The two artifacts can release at independent versions and on independent cadences.
+
+> **Codex plugin release.** The Codex plugin is an independent bundling surface with
+> its own version in
+> [`codex-plugin/plugins/jolli/.codex-plugin/plugin.json`](codex-plugin/plugins/jolli/.codex-plugin/plugin.json).
+> It is currently released through the audited scripts in `codex-plugin/scripts/`,
+> not a tag-triggered GitHub Actions publish workflow. The required progression is
+> `publish-local.sh` → `publish-dev.sh` → `publish-prod.sh`; every path rebuilds the
+> embedded CLI, validates all runtime/config/skill files, and the git-backed paths
+> create DCO-signed commits with a same-version guard. See
+> [`codex-plugin/DEVELOPMENT.md`](codex-plugin/DEVELOPMENT.md) for the acceptance and
+> release checklists. A public release also requires a clean Codex install smoke
+> test, confirmation that the backend accepts the `codex-plugin` client kind, and
+> the product assets required by the public Plugins Directory.
 
 > **Site generation lives in a separate package.** The seven `new` / `build` / `dev` / `start` / `convert` / `reverse` / `theme` commands are provided by the `@jolli.ai/site-cli` plugin, which the host CLI discovers at runtime via [`PluginLoader`](cli/src/PluginLoader.ts) and [`KnownPlugins`](cli/src/KnownPlugins.ts). That plugin is built and released from a separate repository on its own cadence — releasing the host CLI does not require coordinating with it. When the plugin isn't installed, the host CLI registers stub commands ([`SiteCommandStubs.ts`](cli/src/commands/SiteCommandStubs.ts)) so `jolli --help` still lists the site commands and tells the user how to install the plugin.
 

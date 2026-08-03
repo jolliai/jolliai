@@ -30,6 +30,7 @@ import { readClineCliTranscript } from "../core/ClineCliTranscriptReader.js";
 import { isClineInstalled } from "../core/ClineDetector.js";
 import { discoverClineSessions } from "../core/ClineSessionDiscoverer.js";
 import { readClineTranscript } from "../core/ClineTranscriptReader.js";
+import { discoverCodexConversations } from "../core/CodexDiscovery.js";
 import { discoverCodexSessions, isCodexInstalled } from "../core/CodexSessionDiscoverer.js";
 import {
 	type CommitExclusions,
@@ -210,6 +211,16 @@ const RETRY_DELAY_MS = 2000;
  * the lock alive against the stale-lock reclaimer.
  */
 const WORKER_LOCK_REFRESH_INTERVAL_MS = 60_000;
+
+/**
+ * How long the drain waits for Codex artifact discovery before proceeding without it.
+ *
+ * Sized against the post-commit watcher's 15 s agent-session ceiling: small enough
+ * that a slow first pass cannot swallow the window every summary milestone has to
+ * fit in, large enough for the cursor-bounded steady-state pass (a tail read plus a
+ * reference extraction) to finish well inside it.
+ */
+const CODEX_DISCOVERY_DEADLINE_MS = 3000;
 
 // ─── Shared helpers for plans & notes re-association ─────────────────────────
 
@@ -586,6 +597,85 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			// generation still gets its memory pushed once the summary lands.
 			const newlyGeneratedHashes = new Set<string>();
 			const MAX_ENTRIES_PER_RUN = 20; // Safety limit to prevent infinite loops
+
+			// Codex artifact discovery (plans + Linear/Jira/GitHub/Notion references).
+			//
+			// Claude gets these from its Stop hook, which fires every turn. Codex has no
+			// hook we can rely on: it does expose a `Stop` event, but Codex skips
+			// plugin-bundled hooks until the user reviews and trusts the *current* hook
+			// definition, and there is no programmatic way to pre-trust one — so a
+			// hook-driven path would silently do nothing for an unknown share of users.
+			// Until now the only driver was the VS Code sidebar's 60s tick, which means a
+			// Codex user without the extension (CLI-only, or the Codex plugin) got NO
+			// plans and NO references at all: the extraction code ran, but nobody called
+			// it, so `plans.json` stayed empty and every commit was associated with
+			// nothing.
+			//
+			// post-commit is the right baseline driver. It needs no hook and no trust
+			// prompt, and it fires exactly when the data is consumed — the association
+			// step below reads `plans.json`, it does not extract. Freshness is not lost:
+			// the only consumer that wants sub-minute updates is the sidebar, which keeps
+			// its own tick.
+			//
+			// AWAITED, unlike the sidebar's fire-and-forget: `processQueueEntry` →
+			// `loadPlansRegistry` must observe this pass's writes. Once per drain rather
+			// than per entry, since discovery is scoped to the cwd, not the commit. Needs
+			// no gating here — it self-checks manual-disable, `codexEnabled`, and whether
+			// Codex is installed.
+			//
+			// BOUNDED, because this await sits on a path the user waits on: post-commit
+			// tails this worker and blocks until a terminal event or its watch ceiling
+			// (15 s in an agent session). Steady state is cheap — the discovery cursor
+			// means only the transcript tail is read — but the FIRST pass against a large
+			// `~/.codex/sessions/` history is unbounded, and it sits AHEAD of every
+			// summary milestone. Blowing the ceiling would leave the user with no inline
+			// output at all for a commit whose summary was fine. So the deadline enforces
+			// the priority already stated above: a missing reference is worth far less
+			// than a missing summary.
+			//
+			// On timeout the pass is abandoned, NOT cancelled — it keeps running and its
+			// writes still land (atomic rename, so a concurrent `loadPlansRegistry` reads
+			// either the old or the new file, never a torn one). The only cost is that
+			// THIS commit may miss an artifact extracted moments later; its own cursor
+			// makes the next commit resume from where this pass stopped.
+			//
+			// Guarded even though the documented contract is "never rejects": awaiting it on
+			// the critical path means a contract regression would abort the whole drain and
+			// strand every queued summary. A missing reference is worth far less than a
+			// missing summary, so failure degrades instead of blocking.
+			//
+			// TWO guards, because they catch different failures and neither subsumes the
+			// other. The try/catch is the only thing that survives a SYNCHRONOUS throw out of
+			// `discoverCodexConversations` itself — there is no promise to attach to yet, so a
+			// rejection handler never runs. The rejection handler on the discovery promise
+			// covers what the try/catch cannot see: `deadline` winning FIRST and the abandoned
+			// pass failing later, after the race settled and `await` already returned. That
+			// late failure is not a crash risk — `Promise.race` subscribes to every input, so
+			// a losing input's rejection is consumed by the race itself and never reaches
+			// `unhandledRejection` — but it IS silently discarded, and a detached background
+			// worker whose only voice is this log must not lose its one report of a broken
+			// contract. The handler resolves `true` either way: the flag means "did not time
+			// out", and the failure has already been reported on its own line.
+			try {
+				const finished = await Promise.race([
+					discoverCodexConversations(cwd).then(
+						() => true,
+						(error: unknown) => {
+							log.warn("Codex artifact discovery failed (non-fatal): %s", (error as Error).message);
+							return true;
+						},
+					),
+					deadline(CODEX_DISCOVERY_DEADLINE_MS),
+				]);
+				if (!finished) {
+					log.info(
+						"Codex artifact discovery still running after %d ms — continuing the drain without it",
+						CODEX_DISCOVERY_DEADLINE_MS,
+					);
+				}
+			} catch (error: unknown) {
+				log.warn("Codex artifact discovery failed (non-fatal): %s", (error as Error).message);
+			}
 
 			while (processedCount < MAX_ENTRIES_PER_RUN) {
 				const entries = await dequeueAllGitOperations(cwd);
@@ -2180,10 +2270,12 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	emitCaptureProgress(cwd, op.commitHash, "stored", {
 		data: {
 			topics: summaryResult.topics.length,
-			// Surface the expired-login case inline: the watcher prints sign-in
-			// guidance instead of the success line, since this "stored" summary is
-			// an empty placeholder, not a real capture.
-			...(llmFailureKind === LOCAL_AGENT_AUTH && { authExpired: true }),
+			// Surface the expired-login case inline with the exact local-agent tool:
+			// the watcher prints its login remedy instead of the success line.
+			...(llmFailureKind === LOCAL_AGENT_AUTH && {
+				authExpired: true,
+				localAgentTool: config.localAgentTool ?? "claude-code",
+			}),
 		},
 	});
 
@@ -4208,6 +4300,19 @@ export const __test__ = {
  */
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Resolves `false` after `ms`, for racing a best-effort step against a deadline.
+ *
+ * `unref()`, unlike {@link delay}: this timer is abandoned as soon as the work it
+ * races wins, and a referenced one would hold the worker process alive for the rest
+ * of its duration after the drain is done.
+ */
+function deadline(ms: number): Promise<false> {
+	return new Promise((resolve) => {
+		setTimeout(() => resolve(false), ms).unref();
+	});
 }
 
 // --- Script entry point (only when run directly, not when imported) ---

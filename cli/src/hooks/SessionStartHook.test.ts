@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CommitSummary, PlansRegistry, SummaryIndex } from "../Types.js";
+import type { CommitSummary, JolliMemoryConfig, PlansRegistry, SummaryIndex } from "../Types.js";
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
@@ -17,14 +17,15 @@ vi.mock("node:fs", () => ({
 
 // Partial mock — keep the real `normalizePlansRegistry` (used by the briefing
 // path) but control `loadConfig` so the login-reminder credential check is
-// deterministic and never reads the dev machine's real config. `saveConfig` is
-// stubbed so the plugin default-provider seed never touches real disk.
+// deterministic and never reads the dev machine's real config.
+// `updateConfigTransactional` is stubbed so the plugin default-provider seed never
+// touches real disk; the tests that exercise it supply their own fake lock.
 vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../core/SessionTracker.js")>();
 	return {
 		...actual,
 		loadConfig: vi.fn().mockResolvedValue({}),
-		saveConfig: vi.fn().mockResolvedValue(undefined),
+		updateConfigTransactional: vi.fn(),
 	};
 });
 
@@ -68,7 +69,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFileFromBranch, resolveStateRoot } from "../core/GitOps.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
-import { loadConfig, saveConfig } from "../core/SessionTracker.js";
+import { loadConfig, updateConfigTransactional } from "../core/SessionTracker.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
 import { setLogDir } from "../Logger.js";
@@ -82,7 +83,7 @@ const mockExistsSync = vi.mocked(existsSync);
 const mockReadFileSync = vi.mocked(readFileSync);
 const mockRmSync = vi.mocked(rmSync);
 const mockLoadConfig = vi.mocked(loadConfig);
-const mockSaveConfig = vi.mocked(saveConfig);
+const mockUpdateConfig = vi.mocked(updateConfigTransactional);
 
 function makeIndex(entries: SummaryIndex["entries"]): SummaryIndex {
 	return { version: 3, entries };
@@ -399,6 +400,9 @@ describe("SessionStartHook", () => {
 				branch: "feature/test-branch",
 				lastCommitHash: "deadbeef123",
 				briefingText: "cached briefing text",
+				// `main()` runs the canonical source-neutral hook, which passes "shared";
+				// a cache written by a plugin bootstrap is a miss (see the cross-host case).
+				clientKind: "shared",
 				generatedAt: new Date().toISOString(),
 			}),
 		);
@@ -1321,6 +1325,9 @@ describe("SessionStartHook", () => {
 				branch: "feature/test-branch",
 				lastCommitHash: "deadbeef123",
 				briefingText: "cached briefing text",
+				// `main()` runs the canonical source-neutral hook, which passes "shared";
+				// a cache written by a plugin bootstrap is a miss (see the cross-host case).
+				clientKind: "shared",
 				generatedAt: new Date().toISOString(),
 			}),
 		);
@@ -1381,6 +1388,53 @@ describe("SessionStartHook", () => {
 		const output = writeSpy.mock.calls[0][0] as string;
 		expect(output).toContain("[Jolli Memory");
 		expect(output).not.toBe("stale cache");
+		writeSpy.mockRestore();
+	});
+
+	// Branch and HEAD both match — only the host differs. The briefing body is
+	// host-neutral but its recall hint is not (`$jolli:recall` vs `/jolli:recall` vs
+	// the CLI form), and each plugin form is inert in the other host, so serving this
+	// entry would hand the model a command it cannot run. A cache with NO clientKind
+	// (written before the field shipped) takes the same path.
+	it.each([["codex-plugin"], [undefined]])("should invalidate cache written for %s", async (writtenFor) => {
+		mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+			const a = args as string[];
+			if (a.includes("--show-current")) return "feature/test-branch\n";
+			if (a.includes("HEAD")) return "deadbeef123\n";
+			return "";
+		});
+
+		mockExistsSync.mockReturnValue(true);
+		mockReadFileSync.mockReturnValue(
+			JSON.stringify({
+				branch: "feature/test-branch",
+				lastCommitHash: "deadbeef123",
+				briefingText: "other host's cache",
+				clientKind: writtenFor,
+				generatedAt: new Date().toISOString(),
+			}),
+		);
+
+		const recentDate = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+		mockGetIndex.mockResolvedValue(
+			makeIndex([
+				{
+					commitHash: "aaa",
+					parentCommitHash: null,
+					commitMessage: "Commit 1",
+					commitDate: recentDate,
+					branch: "feature/test-branch",
+					generatedAt: recentDate,
+				},
+			]),
+		);
+
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		await main();
+
+		const output = writeSpy.mock.calls[0][0] as string;
+		expect(output).toContain("[Jolli Memory");
+		expect(output).not.toContain("other host's cache");
 		writeSpy.mockRestore();
 	});
 
@@ -1940,32 +1994,80 @@ describe("SessionStartHook", () => {
 // ─── Plugin default provider ─────────────────────────────────────────────────
 
 describe("ensurePluginDefaultProvider", () => {
+	/**
+	 * Stands in for the real `config.lock` critical section: hands `decide` the config
+	 * a fresh read under the lock would return and records what it asked to write.
+	 * `onDisk` is intentionally decoupled from the snapshot each test passes in — the
+	 * last case here turns that gap into the assertion.
+	 */
+	function fakeConfigLock(onDisk: JolliMemoryConfig = {}): { readonly writes: Array<Partial<JolliMemoryConfig>> } {
+		const writes: Array<Partial<JolliMemoryConfig>> = [];
+		mockUpdateConfig.mockImplementation(async (decide) => {
+			const { update, result } = decide(onDisk);
+			if (update !== null) writes.push(update);
+			return result;
+		});
+		return { writes };
+	}
+
 	beforeEach(() => {
 		vi.clearAllMocks();
-		mockSaveConfig.mockResolvedValue(undefined);
 	});
 
 	it("seeds aiProvider=local-agent + localAgentTool on the plugin surface when unset", async () => {
+		const { writes } = fakeConfigLock({});
 		const wrote = await ensurePluginDefaultProvider("claude-plugin", {});
 		expect(wrote).toBe(true);
-		expect(mockSaveConfig).toHaveBeenCalledWith({ aiProvider: "local-agent", localAgentTool: "claude-code" });
+		expect(writes).toEqual([{ aiProvider: "local-agent", localAgentTool: "claude-code" }]);
+	});
+
+	// Seeding Claude's CLI for a Codex user would point generation at a binary they
+	// may not have installed — the tool has to follow the host that is seeding.
+	it("seeds the initiating host's own agent tool, not a hardcoded claude-code", async () => {
+		const { writes } = fakeConfigLock({});
+		const wrote = await ensurePluginDefaultProvider("codex-plugin", {});
+		expect(wrote).toBe(true);
+		expect(writes).toEqual([{ aiProvider: "local-agent", localAgentTool: "codex" }]);
 	});
 
 	it("does nothing off the plugin build (cli / vscode keep their own default-derivation)", async () => {
+		fakeConfigLock({});
 		expect(await ensurePluginDefaultProvider("cli", {})).toBe(false);
 		expect(await ensurePluginDefaultProvider("vscode-plugin", {})).toBe(false);
-		expect(mockSaveConfig).not.toHaveBeenCalled();
+		expect(mockUpdateConfig).not.toHaveBeenCalled();
 	});
 
 	it("never overwrites an explicit provider choice", async () => {
+		fakeConfigLock({});
 		for (const aiProvider of ["anthropic", "jolli", "local-agent"] as const) {
 			expect(await ensurePluginDefaultProvider("claude-plugin", { aiProvider })).toBe(false);
 		}
-		expect(mockSaveConfig).not.toHaveBeenCalled();
+		// Fast path: a set provider is never cleared, so the snapshot alone settles it.
+		expect(mockUpdateConfig).not.toHaveBeenCalled();
+	});
+
+	// No-tug-of-war regression: with both plugins installed, whichever host starts
+	// a session second must find a value and leave it completely alone.
+	it("leaves the first host's seeded value untouched when the other host starts", async () => {
+		fakeConfigLock({});
+		expect(await ensurePluginDefaultProvider("codex-plugin", { aiProvider: "local-agent" })).toBe(false);
+		expect(await ensurePluginDefaultProvider("claude-plugin", { aiProvider: "local-agent" })).toBe(false);
+		expect(mockUpdateConfig).not.toHaveBeenCalled();
+	});
+
+	// The same tug-of-war one step tighter: both hosts open their FIRST session at
+	// once, so both snapshots legitimately read "unset" and both reach the lock. The
+	// gate has to be re-applied against the locked read, or both write and
+	// `localAgentTool` settles on whoever happened to go last.
+	it("stands down when another writer won the race between snapshot and lock", async () => {
+		const { writes } = fakeConfigLock({ aiProvider: "local-agent", localAgentTool: "claude-code" });
+		expect(await ensurePluginDefaultProvider("codex-plugin", {})).toBe(false);
+		expect(writes).toEqual([]);
+		expect(mockUpdateConfig).toHaveBeenCalledOnce();
 	});
 
 	it("swallows a config-write failure so session startup is never blocked", async () => {
-		mockSaveConfig.mockRejectedValueOnce(new Error("disk full"));
+		mockUpdateConfig.mockRejectedValueOnce(new Error("disk full"));
 		expect(await ensurePluginDefaultProvider("claude-plugin", {})).toBe(false);
 	});
 });
@@ -1975,8 +2077,15 @@ describe("ensurePluginDefaultProvider", () => {
 describe("computeLoginReminder", () => {
 	it("returns the reminder for the claude-plugin surface with no credential and no dismiss", () => {
 		const text = computeLoginReminder("claude-plugin", false, false);
-		expect(text).toContain("/jolli:login");
-		expect(text).toContain("Not signed in");
+		expect(text).toContain("/jolli:init");
+		expect(text).toContain("not configured");
+	});
+
+	it("uses the Codex setup skill on the codex-plugin surface", () => {
+		const text = computeLoginReminder("codex-plugin", false, false);
+		// Codex's own sigil, and the plugin-name namespace Codex adds to bundle names.
+		expect(text).toContain("$jolli:init");
+		expect(text).not.toContain("/jolli:init");
 	});
 
 	it("returns null for non-plugin surfaces (cli / vscode) even without a credential", () => {
@@ -2004,6 +2113,24 @@ describe("formatRecallSuggestion", () => {
 		expect(formatRecallSuggestion(9, "claude-plugin")).toBe(
 			"Warning: 9 days since last commit. Run /jolli:recall for full context.",
 		);
+	});
+
+	// Codex namespaces a plugin's skills by the plugin name just as Claude does, so
+	// the bundle's bare `recall` directory is invoked as `jolli:recall`. A bare
+	// `$jolli-recall` names nothing on a plugin-only install — and only appears to
+	// work in a repo that separately ran `jolli enable`, i.e. every dev machine.
+	it("uses the $jolli:recall namespaced skill on the Codex plugin surface", () => {
+		expect(formatRecallSuggestion(2, "codex-plugin")).toBe("Tip: run $jolli:recall for full context");
+		expect(formatRecallSuggestion(9, "codex-plugin")).toBe(
+			"Warning: 9 days since last commit. Run $jolli:recall for full context.",
+		);
+		expect(formatRecallSuggestion(2, "codex-plugin")).not.toContain("jolli-recall");
+	});
+
+	// "shared" is what the settings-installed repo hook passes: it cannot know which
+	// host started the session, so it must not guess at a plugin's syntax.
+	it("falls back to the CLI form on the shared repo-hook surface", () => {
+		expect(formatRecallSuggestion(2, "shared")).toBe("Tip: run `jolli recall` for full context");
 	});
 
 	it("uses the `jolli recall` CLI on non-plugin surfaces and never names a jolli-recall skill", () => {
@@ -2109,6 +2236,7 @@ describe("getAuthFailureReminder", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		mockExecFileSync.mockReturnValue("feature/test-branch\n" as never);
+		mockLoadConfig.mockResolvedValue({ localAgentTool: "claude-code" });
 	});
 
 	it("returns the reminder when the newest commit carries the auth marker", async () => {
@@ -2117,8 +2245,8 @@ describe("getAuthFailureReminder", () => {
 
 		const result = await getAuthFailureReminder("/test", "claude-plugin");
 
-		expect(result).toContain("the Claude login used for local generation has expired");
-		expect(result).toContain("claude auth login");
+		expect(result).toContain("Claude Code authentication expired or is unavailable");
+		expect(result).toContain("claude");
 		expect(result).toContain("jolli configure --set aiProvider");
 		// It read the newest commit's summary file.
 		expect(mockReadFileFromBranch).toHaveBeenCalledWith(
@@ -2160,13 +2288,25 @@ describe("getAuthFailureReminder", () => {
 		);
 	});
 
-	it("is gated to the Claude Code plugin — other client kinds never see it", async () => {
+	it("is gated to plugin surfaces — CLI never sees it", async () => {
 		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
 		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: AUTH })));
 
 		expect(await getAuthFailureReminder("/test", "cli")).toBeNull();
 		// Gated out before any git/index work.
 		expect(mockGetIndex).not.toHaveBeenCalled();
+	});
+
+	it("uses the configured Codex login remedy on the Codex plugin surface", async () => {
+		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
+		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: AUTH })));
+		mockLoadConfig.mockResolvedValue({ localAgentTool: "codex" });
+
+		const result = await getAuthFailureReminder("/test", "codex-plugin");
+
+		expect(result).toContain("Codex authentication expired or is unavailable");
+		expect(result).toContain("codex login");
+		expect(result).not.toContain("claude auth login");
 	});
 
 	it("fires on main too — an auth failure is branch-independent (NOT skipped like the briefing)", async () => {
@@ -2185,7 +2325,7 @@ describe("getAuthFailureReminder", () => {
 		);
 		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ branch: "main", summaryError: AUTH })));
 
-		expect(await getAuthFailureReminder("/test", "claude-plugin")).toContain("claude auth login");
+		expect(await getAuthFailureReminder("/test", "claude-plugin")).toContain("Claude Code");
 	});
 
 	it("returns null on a detached HEAD (no branch)", async () => {
@@ -2265,11 +2405,13 @@ describe("buildSessionStartContext — plugin reminder assembly", () => {
 
 		expect(result).not.toBeNull();
 		// Auth-failure section (from getAuthFailureReminder).
-		expect(result).toContain("the Claude login used for local generation has expired");
+		expect(result).toContain("Claude Code authentication expired or is unavailable");
 		// Not-signed-in section (from getLoginReminder → computeLoginReminder).
-		expect(result).toContain("/jolli:login");
+		expect(result).toContain("/jolli:init");
 		// Ordered auth-failure first, then not-signed-in, joined by a blank line.
-		expect((result as string).indexOf("has expired")).toBeLessThan((result as string).indexOf("/jolli:login"));
+		expect((result as string).indexOf("authentication expired")).toBeLessThan(
+			(result as string).indexOf("/jolli:init"),
+		);
 		expect(result).toContain("\n\n");
 	});
 
@@ -2298,5 +2440,35 @@ describe("buildSessionStartContext — plugin reminder assembly", () => {
 		expect(result).toBeNull();
 		// The reminder path never read the config/marker.
 		expect(mockLoadConfig).not.toHaveBeenCalled();
+	});
+});
+
+/*
+ * Source-shape guard, deliberately not a behavioural test.
+ *
+ * The failure it protects against only exists in a BUNDLE: both plugin bootstraps
+ * import `buildSessionStartContext` from this module, esbuild inlines the module and
+ * rewrites `import.meta.url` to the bundle's own path — which equals `argv[1]` — so a
+ * plain path comparison in the entry guard is true inside
+ * `PluginBootstrapHook.js` / `CodexPluginBootstrapHook.js`. `main()` then ran as an
+ * import side effect and wrote this hook's plain-text briefing to stdout ahead of the
+ * bootstrap's JSON: Codex rejected the whole hook (`SessionStart Failed`, no briefing
+ * reached the model) and Claude Code silently showed the briefing twice.
+ *
+ * Neither vitest nor any unit test can reproduce that (`process.env.VITEST` short-
+ * circuits the guard, and there is no bundle here), so the only cheap protection is to
+ * pin the shape of the guard itself — the same basename check `QueueWorker` carries for
+ * the same reason. Delete the basename check and this fails loudly instead of shipping
+ * a plugin whose briefing never arrives.
+ */
+describe("entry-point guard shape", () => {
+	it("gates auto-run on the entry file's basename, not just its path", async () => {
+		const { readFile } = await import("node:fs/promises");
+		const source = await readFile(new URL("./SessionStartHook.ts", import.meta.url), "utf-8");
+
+		expect(source).toMatch(/entryName === "sessionstarthook\.js"/);
+		expect(source).toMatch(/entryName === "sessionstarthook\.ts"/);
+		// The pre-fix form: a bare suffix comparison with no basename gate.
+		expect(source).not.toMatch(/import\.meta\.url\.endsWith\(process\.argv\[1\]/);
 	});
 });

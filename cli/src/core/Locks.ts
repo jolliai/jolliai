@@ -122,6 +122,8 @@ export const PLANS_LOCK_FILE = "plans.lock";
 export const COMMIT_SELECTION_LOCK_FILE = "commit-selection.lock";
 export const PUSH_PENDING_LOCK_FILE = "push-pending.lock";
 export const PROFILE_LOCK_FILE = "profile.lock";
+export const SESSIONS_LOCK_FILE = "sessions.lock";
+export const CONFIG_LOCK_FILE = "config.lock";
 export const REPO_HOOKS_LOCK_FILE = "repo-hooks.lock";
 export const RUNTIME_REGISTRY_LOCK_FILE = "runtime-registry.lock";
 export const PUSH_CONTROL_LOCK_FILE = "push-control.lock";
@@ -160,6 +162,7 @@ export const DEFAULT_PROFILE_LOCK_TIMEOUT_MS = 5000;
 
 /** Default poll interval while waiting for `profile.lock`. */
 export const DEFAULT_PROFILE_LOCK_POLL_MS = 25;
+export const DEFAULT_STATE_LOCK_TIMEOUT_MS = 5000;
 export const DEFAULT_REPO_HOOKS_LOCK_TIMEOUT_MS = 5000;
 export const DEFAULT_RUNTIME_REGISTRY_LOCK_TIMEOUT_MS = 5000;
 export const DEFAULT_PUSH_CONTROL_LOCK_TIMEOUT_MS = 5000;
@@ -548,6 +551,55 @@ export async function withProfileLock<T>(
 	} finally {
 		if (acquired) await releaseIfOwned(lockPath, PROFILE_LOCK_FILE);
 	}
+}
+
+async function withStateFileLock<T>(
+	dir: string,
+	lockFile: string,
+	fn: () => Promise<T>,
+	opts: OrphanWriteLockOpts,
+): Promise<T> {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_STATE_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_PROFILE_LOCK_POLL_MS;
+	await mkdir(dir, { recursive: true });
+	const lockPath = join(dir, lockFile);
+	const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+	if (!acquired) {
+		log.warn("Could not acquire %s within %d ms — proceeding best-effort", lockFile, timeoutMs);
+	}
+	try {
+		return await fn();
+	} finally {
+		if (acquired) await releaseIfOwned(lockPath, lockFile);
+	}
+}
+
+/**
+ * Serialises read-modify-write operations over the worktree-local session state:
+ * sessions.json, cursors.json, and discovery-cursors.json. One lock covers all
+ * three because pruning a stale session also removes its transcript cursor.
+ * The lock must wrap the load as well as the write, otherwise concurrent agent
+ * hooks and discovery ticks can merge from the same stale snapshot.
+ */
+export async function withSessionsLock<T>(
+	cwd: string | undefined,
+	fn: () => Promise<T>,
+	opts: OrphanWriteLockOpts = {},
+): Promise<T> {
+	return withStateFileLock(await ensureWorktreeLockDir(cwd), SESSIONS_LOCK_FILE, fn, opts);
+}
+
+/**
+ * Serialises config.json updates for an explicit config directory. This works
+ * for the machine-global config and the scoped directories used in tests and
+ * migrations without assuming they live under one fixed home path.
+ */
+export async function withConfigLock<T>(
+	targetDir: string,
+	fn: () => Promise<T>,
+	opts: OrphanWriteLockOpts = {},
+): Promise<T> {
+	return withStateFileLock(targetDir, CONFIG_LOCK_FILE, fn, opts);
 }
 
 export interface StrictLockResult<T> {

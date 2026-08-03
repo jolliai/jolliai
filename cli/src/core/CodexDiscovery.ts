@@ -1,23 +1,37 @@
 /**
- * CodexDiscovery — polling-path artifact discovery for Codex.
+ * CodexDiscovery — hook-free artifact discovery for Codex.
  *
- * Codex has no lifecycle hook we can use (the Stop hook needs per-user manual
- * trust and is broken under git worktrees — see the spike). So instead of a
- * hook, artifacts are discovered on the existing 60s polling path: the VS Code
- * sidebar's Active Conversations tick already discovers Codex sessions every
- * minute; this module rides that tick to scan each session's transcript and
- * persist what it finds — reusing the SAME `discovery-cursors.json` mechanism as
- * the Claude Stop path. It extracts Linear / Jira / GitHub / Notion references
- * AND markdown plans (apply_patch writes); both share the one per-session cursor
- * (the module was named generically so plans could join without another rename).
+ * Extracts Linear / Jira / GitHub / Notion references AND markdown plans
+ * (apply_patch writes) from Codex transcripts, reusing the SAME
+ * `discovery-cursors.json` mechanism as the Claude Stop path; both share the one
+ * per-session cursor (the module was named generically so plans could join without
+ * another rename).
  *
- * Concurrency: a per-cwd single-flight collapses overlapping calls (the tick,
- * panel re-open, manual refresh, detail-panel save all call this). A re-entrant
- * call marks the in-flight run "dirty" so it runs ONE more pass after the
- * current one — without this, a naive single-flight would miss rows written
- * after the in-flight run already passed `discoverCodexSessions`, deferring them
- * a full minute. Sessions are processed serially so multiple per-session cursor
- * writes never race each other within a batch.
+ * Why not a Codex hook. Codex DOES expose a `Stop` event equivalent to Claude's, and
+ * its hook input carries everything needed (`session_id`, `cwd`, `transcript_path`).
+ * It is unusable as a *baseline* anyway: Codex skips plugin-bundled hooks until the
+ * user reviews and trusts the current hook definition, re-prompts when that
+ * definition changes, and offers no programmatic way to pre-trust — so a hook-driven
+ * path would silently do nothing for an unknown share of users. Codex also runs hook
+ * commands with the session cwd, which is what broke an earlier repo-local-hook
+ * spike under git worktrees. A Stop hook may still be added later as a *freshness*
+ * enhancement on top of the drivers below.
+ *
+ * Drivers (both required — neither alone covers every user):
+ *   - VS Code sidebar's 60s Active Conversations tick — sub-minute freshness for the
+ *     panel. Fire-and-forget.
+ *   - QueueWorker at post-commit — the baseline. Awaited, because the association
+ *     step reads `plans.json` rather than extracting. This is the ONLY driver for a
+ *     CLI-only or Codex-plugin user; without it their `plans.json` stays empty and
+ *     every commit is associated with no plans and no references.
+ *
+ * Concurrency: a per-cwd single-flight collapses overlapping calls (the tick, panel
+ * re-open, manual refresh, detail-panel save, and the worker all call this). A
+ * re-entrant call marks the in-flight run "dirty" so it runs ONE more pass after the
+ * current one — without this, a naive single-flight would miss rows written after the
+ * in-flight run already passed `discoverCodexSessions`, deferring them a full minute.
+ * Sessions are processed serially so multiple per-session cursor writes never race
+ * each other within a batch.
  *
  * Contract: `discoverCodexConversations` NEVER rejects — all errors are swallowed
  * and logged, so callers can `void`-call it without an unhandled rejection.

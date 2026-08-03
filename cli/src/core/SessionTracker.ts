@@ -2,7 +2,7 @@
  * Session Tracker Module
  *
  * Manages .jolli/jollimemory/ state files:
- *   - sessions.json: Registry of all active Claude Code sessions (Map<sessionId, SessionInfo>)
+ *   - sessions.json: Registry of all active AI-agent sessions (Map<sessionId, SessionInfo>)
  *   - cursors.json: Per-transcript cursor positions (Map<transcriptPath, TranscriptCursor>)
  *   - config.json: Optional configuration (API key, model, etc.)
  *
@@ -37,7 +37,7 @@ import {
 	type TranscriptCursor,
 } from "../Types.js";
 import { atomicWriteFile as atomicWrite } from "./AtomicWrite.js";
-import { withPlansLock } from "./Locks.js";
+import { withConfigLock, withPlansLock, withSessionsLock } from "./Locks.js";
 import { writeReferenceMarkdown } from "./references/ReferenceStore.js";
 import { archivedTotalsOf, isLegacyArchived, uncommittedDelta } from "./skills/SkillDelta.js";
 import { writeSkillMarkdown } from "./skills/SkillStore.js";
@@ -76,25 +76,16 @@ export async function ensureJolliMemoryDir(cwd?: string): Promise<string> {
  */
 export async function saveSession(sessionInfo: SessionInfo, cwd?: string): Promise<void> {
 	const dir = await ensureJolliMemoryDir(cwd);
-
-	// Load existing registry
-	const registry = await loadSessionsRegistry(dir);
-	const sessions = { ...registry.sessions };
-
-	// Upsert current session
-	sessions[sessionInfo.sessionId] = sessionInfo;
-
-	// Prune stale sessions and their cursors
-	const { activeSessions, stalePaths } = pruneStale(sessions);
-
-	// Write updated sessions registry
-	const newRegistry: SessionsRegistry = { version: 1, sessions: activeSessions };
-	await atomicWrite(join(dir, SESSIONS_FILE), JSON.stringify(newRegistry, null, "\t"));
-
-	// If any sessions were pruned, also clean up their cursors
-	if (stalePaths.length > 0) {
-		await pruneOrphanedCursors(dir, stalePaths);
-	}
+	await withSessionsLock(cwd, async () => {
+		// Re-read after acquiring the lock so concurrent plugin/agent hook writers
+		// merge from the latest snapshot rather than overwriting one another.
+		const registry = await loadSessionsRegistry(dir);
+		const sessions = { ...registry.sessions, [sessionInfo.sessionId]: sessionInfo };
+		const { activeSessions, stalePaths } = pruneStale(sessions);
+		const newRegistry: SessionsRegistry = { version: 1, sessions: activeSessions };
+		await atomicWrite(join(dir, SESSIONS_FILE), JSON.stringify(newRegistry, null, "\t"));
+		if (stalePaths.length > 0) await pruneOrphanedCursors(dir, stalePaths);
+	});
 }
 
 /**
@@ -124,26 +115,35 @@ export async function countStaleSessions(cwd?: string): Promise<number> {
 /**
  * Prunes stale sessions from the registry and persists the result.
  * Also cleans up orphaned cursor entries. Returns the number of sessions pruned.
+ *
+ * `ensureJolliMemoryDir`, not `getJolliMemoryDir`: the lock file lives in that
+ * directory, so it has to exist before `withSessionsLock` can create one. The side
+ * effect is that `jolli clean` — the only caller — now creates an empty
+ * `.jolli/jollimemory/` in a repository that never had Jolli enabled. Harmless (the
+ * directory is git-excluded and clean is what the user asked for) but not free, so
+ * do not copy this pattern into a read-only path.
  */
 export async function pruneStaleSessions(cwd?: string): Promise<number> {
-	const dir = getJolliMemoryDir(cwd);
-	const registry = await loadSessionsRegistry(dir);
-	const totalCount = Object.keys(registry.sessions).length;
-	const { activeSessions, stalePaths } = pruneStale(registry.sessions);
-	const prunedCount = totalCount - Object.keys(activeSessions).length;
+	const dir = await ensureJolliMemoryDir(cwd);
+	return withSessionsLock(cwd, async () => {
+		const registry = await loadSessionsRegistry(dir);
+		const totalCount = Object.keys(registry.sessions).length;
+		const { activeSessions, stalePaths } = pruneStale(registry.sessions);
+		const prunedCount = totalCount - Object.keys(activeSessions).length;
 
-	if (prunedCount === 0) return 0;
+		if (prunedCount === 0) return 0;
 
-	const newRegistry: SessionsRegistry = { version: 1, sessions: activeSessions };
-	await atomicWrite(join(dir, SESSIONS_FILE), JSON.stringify(newRegistry, null, "\t"));
+		const newRegistry: SessionsRegistry = { version: 1, sessions: activeSessions };
+		await atomicWrite(join(dir, SESSIONS_FILE), JSON.stringify(newRegistry, null, "\t"));
 
-	/* v8 ignore start -- stalePaths is always non-empty when prunedCount > 0; the false branch is unreachable */
-	if (stalePaths.length > 0) {
-		await pruneOrphanedCursors(dir, stalePaths);
-	}
-	/* v8 ignore stop */
+		/* v8 ignore start -- stalePaths is always non-empty when prunedCount > 0; the false branch is unreachable */
+		if (stalePaths.length > 0) {
+			await pruneOrphanedCursors(dir, stalePaths);
+		}
+		/* v8 ignore stop */
 
-	return prunedCount;
+		return prunedCount;
+	});
 }
 
 /**
@@ -220,7 +220,7 @@ async function upsertCursorInFile(cursor: TranscriptCursor, dir: string, filenam
 
 export async function saveCursor(cursor: TranscriptCursor, cwd?: string): Promise<void> {
 	const dir = await ensureJolliMemoryDir(cwd);
-	await upsertCursorInFile(cursor, dir, CURSORS_FILE);
+	await withSessionsLock(cwd, () => upsertCursorInFile(cursor, dir, CURSORS_FILE));
 }
 
 /**
@@ -229,18 +229,25 @@ export async function saveCursor(cursor: TranscriptCursor, cwd?: string): Promis
  */
 export async function saveDiscoveryCursor(cursor: TranscriptCursor, cwd?: string): Promise<void> {
 	const dir = await ensureJolliMemoryDir(cwd);
-	// Carry forward any per-extractor marks the incoming cursor does not name. This
-	// upsert replaces the whole cursor object, and callers on the shared-cursor path
-	// build a bare {path, lineNumber, updatedAt} — so without this merge every
-	// extractor's high-water mark would be erased on each advance of the shared
-	// cursor, and the marks would never survive long enough to do their job.
-	// (An OLDER dist writing this file still erases them; that is unavoidable and is
-	// why a missing mark reads as a full rewind rather than as the shared number.)
-	const registry = await loadCursorsRegistry(dir, DISCOVERY_CURSORS_FILE);
-	const priorMarks = registry.cursors[cursor.transcriptPath]?.extractors;
-	const merged: TranscriptCursor =
-		cursor.extractors === undefined && priorMarks !== undefined ? { ...cursor, extractors: priorMarks } : cursor;
-	await upsertCursorInFile(merged, dir, DISCOVERY_CURSORS_FILE);
+	// The mark-carrying read below and the upsert's own read-modify-write have to be
+	// one critical section: two writers that each read the prior marks before either
+	// writes would still clobber one another, which is the exact race the lock is for.
+	await withSessionsLock(cwd, async () => {
+		// Carry forward any per-extractor marks the incoming cursor does not name. This
+		// upsert replaces the whole cursor object, and callers on the shared-cursor path
+		// build a bare {path, lineNumber, updatedAt} — so without this merge every
+		// extractor's high-water mark would be erased on each advance of the shared
+		// cursor, and the marks would never survive long enough to do their job.
+		// (An OLDER dist writing this file still erases them; that is unavoidable and is
+		// why a missing mark reads as a full rewind rather than as the shared number.)
+		const registry = await loadCursorsRegistry(dir, DISCOVERY_CURSORS_FILE);
+		const priorMarks = registry.cursors[cursor.transcriptPath]?.extractors;
+		const merged: TranscriptCursor =
+			cursor.extractors === undefined && priorMarks !== undefined
+				? { ...cursor, extractors: priorMarks }
+				: cursor;
+		await upsertCursorInFile(merged, dir, DISCOVERY_CURSORS_FILE);
+	});
 }
 
 /**
@@ -329,32 +336,44 @@ export async function saveExtractorCursor(
 	cwd?: string,
 ): Promise<void> {
 	const dir = await ensureJolliMemoryDir(cwd);
-	const registry = await loadCursorsRegistry(dir, DISCOVERY_CURSORS_FILE);
-	const existing = registry.cursors[transcriptPath] ?? null;
+	// Same critical section as saveDiscoveryCursor: both advance a record in
+	// discovery-cursors.json by reading it, folding new information in, and writing
+	// the whole registry back. Leaving either one outside the lock would defeat it
+	// for BOTH — an unlocked read-modify-write clobbers a locked one just as easily
+	// as two unlocked ones clobber each other. Monotonicity does not save us here:
+	// the marks that get lost are the OTHER extractors' entries in the same record,
+	// and losing one reads as a full rewind for that extractor.
+	await withSessionsLock(cwd, async () => {
+		const registry = await loadCursorsRegistry(dir, DISCOVERY_CURSORS_FILE);
+		const existing = registry.cursors[transcriptPath] ?? null;
 
-	const marks = effectiveExtractorMarks(existing);
-	marks[extractor] = Math.max(marks[extractor] ?? 0, lineNumber);
+		const marks = effectiveExtractorMarks(existing);
+		marks[extractor] = Math.max(marks[extractor] ?? 0, lineNumber);
 
-	// The shared field must not overtake an extractor that has no mark yet. Its floor
-	// is whatever the record already claimed (legacy seeding covers a bare
-	// lineNumber), or 0 when there is no record at all — a brand-new cursor cannot
-	// assert that the OTHER extractors have made progress, and claiming they have
-	// makes a dist reading only this field skip lines nobody processed. That is
-	// exactly the straddling-fetch protection the Codex discovery path relies on.
-	const legacyFloor = existing?.lineNumber ?? 0;
-	const values = [...LEGACY_COVERED_EXTRACTORS.map((e) => marks[e] ?? legacyFloor), marks[extractor] ?? lineNumber];
-	const next: TranscriptCursor = {
-		transcriptPath,
-		lineNumber: Math.min(...values),
-		updatedAt: new Date().toISOString(),
-		...(existing?.anchorId !== undefined ? { anchorId: existing.anchorId } : {}),
-		extractors: marks,
-	};
-	await writeCursorsRegistry(
-		{ version: 1, cursors: { ...registry.cursors, [transcriptPath]: next } },
-		dir,
-		DISCOVERY_CURSORS_FILE,
-	);
+		// The shared field must not overtake an extractor that has no mark yet. Its floor
+		// is whatever the record already claimed (legacy seeding covers a bare
+		// lineNumber), or 0 when there is no record at all — a brand-new cursor cannot
+		// assert that the OTHER extractors have made progress, and claiming they have
+		// makes a dist reading only this field skip lines nobody processed. That is
+		// exactly the straddling-fetch protection the Codex discovery path relies on.
+		const legacyFloor = existing?.lineNumber ?? 0;
+		const values = [
+			...LEGACY_COVERED_EXTRACTORS.map((e) => marks[e] ?? legacyFloor),
+			marks[extractor] ?? lineNumber,
+		];
+		const next: TranscriptCursor = {
+			transcriptPath,
+			lineNumber: Math.min(...values),
+			updatedAt: new Date().toISOString(),
+			...(existing?.anchorId !== undefined ? { anchorId: existing.anchorId } : {}),
+			extractors: marks,
+		};
+		await writeCursorsRegistry(
+			{ version: 1, cursors: { ...registry.cursors, [transcriptPath]: next } },
+			dir,
+			DISCOVERY_CURSORS_FILE,
+		);
+	});
 }
 
 /**
@@ -367,24 +386,28 @@ export async function saveExtractorCursor(
  */
 export async function migrateDiscoveryCursors(cwd?: string): Promise<void> {
 	const dir = await ensureJolliMemoryDir(cwd);
-	const legacy = await loadCursorsRegistry(dir, CURSORS_FILE);
-	const prefixedKeys = Object.keys(legacy.cursors).filter((k) => k.startsWith("plan:") || k.startsWith("linear:"));
-	if (prefixedKeys.length === 0) return; // already migrated / no legacy keys
+	await withSessionsLock(cwd, async () => {
+		const legacy = await loadCursorsRegistry(dir, CURSORS_FILE);
+		const prefixedKeys = Object.keys(legacy.cursors).filter(
+			(k) => k.startsWith("plan:") || k.startsWith("linear:"),
+		);
+		if (prefixedKeys.length === 0) return; // already migrated / no legacy keys
 
-	const discovery = await loadCursorsRegistry(dir, DISCOVERY_CURSORS_FILE);
-	const merged = { ...discovery.cursors };
-	const remaining = { ...legacy.cursors };
-	const now = new Date().toISOString();
-	for (const key of prefixedKeys) {
-		const path = key.startsWith("plan:") ? key.slice("plan:".length) : key.slice("linear:".length);
-		const line = legacy.cursors[key].lineNumber;
-		const existing = merged[path];
-		const folded = existing ? Math.min(existing.lineNumber, line) : line;
-		merged[path] = { transcriptPath: path, lineNumber: folded, updatedAt: now };
-		delete remaining[key];
-	}
-	await writeCursorsRegistry({ version: 1, cursors: merged }, dir, DISCOVERY_CURSORS_FILE);
-	await writeCursorsRegistry({ version: 1, cursors: remaining }, dir, CURSORS_FILE);
+		const discovery = await loadCursorsRegistry(dir, DISCOVERY_CURSORS_FILE);
+		const merged = { ...discovery.cursors };
+		const remaining = { ...legacy.cursors };
+		const now = new Date().toISOString();
+		for (const key of prefixedKeys) {
+			const path = key.startsWith("plan:") ? key.slice("plan:".length) : key.slice("linear:".length);
+			const line = legacy.cursors[key].lineNumber;
+			const existing = merged[path];
+			const folded = existing ? Math.min(existing.lineNumber, line) : line;
+			merged[path] = { transcriptPath: path, lineNumber: folded, updatedAt: now };
+			delete remaining[key];
+		}
+		await writeCursorsRegistry({ version: 1, cursors: merged }, dir, DISCOVERY_CURSORS_FILE);
+		await writeCursorsRegistry({ version: 1, cursors: remaining }, dir, CURSORS_FILE);
+	});
 }
 
 /**
@@ -501,13 +524,73 @@ function dropOrphanedLocalAgentPath(
  * @param targetDir - Directory to write config.json into
  */
 export async function saveConfigScoped(update: Partial<JolliMemoryConfig>, targetDir: string): Promise<void> {
-	await mkdir(targetDir, { recursive: true });
+	await withConfigLock(targetDir, async () => {
+		await saveConfigScopedUnlocked(update, targetDir);
+	});
+	log.info("Config saved to %s", targetDir);
+}
+
+/**
+ * What a {@link updateConfigTransactional} decision function returns: the fields to
+ * write (or null to write nothing) plus a value handed back to the caller.
+ */
+export interface ConfigTransaction<T> {
+	readonly update: Partial<JolliMemoryConfig> | null;
+	readonly result: T;
+}
+
+/**
+ * Read-decide-write against the machine-global config in ONE critical section.
+ *
+ * `saveConfig` alone is not enough for a conditional write. It re-reads under the
+ * lock so concurrent updates to *different* fields merge safely, but a caller that
+ * decides **whether** to write from a snapshot it loaded earlier has already left
+ * the lock: two processes both observe "unset", both pass the gate, and the second
+ * write wins. That is exactly the shape of the plugin provider seed — a first-wins
+ * gate on `aiProvider` — which two plugin hosts starting their first session
+ * together could resolve either way. `decide` runs INSIDE the lock against a fresh
+ * read, so the gate it applies is the state the write lands on.
+ *
+ * Returns `decide`'s own `result`, so a caller can report what it did (which field
+ * moved, what the previous value was) without re-reading afterwards.
+ *
+ * Caveat inherited from `withConfigLock`: the lock is best-effort with a timeout, so
+ * under heavy contention this degrades to the non-atomic behavior rather than
+ * failing. That is the right direction for a session-start path that must not block.
+ */
+export async function updateConfigTransactional<T>(
+	decide: (current: JolliMemoryConfig) => ConfigTransaction<T>,
+): Promise<T> {
+	return updateConfigTransactionalScoped(decide, getGlobalConfigDir());
+}
+
+/** {@link updateConfigTransactional} against an explicit config directory. */
+export async function updateConfigTransactionalScoped<T>(
+	decide: (current: JolliMemoryConfig) => ConfigTransaction<T>,
+	targetDir: string,
+): Promise<T> {
+	return withConfigLock(targetDir, async () => {
+		const { update, result } = decide(await loadConfigFromDir(targetDir));
+		if (update !== null) {
+			// Re-reads the file a second time inside the same lock. Harmless (the two
+			// reads cannot disagree) and worth the duplicate to keep the merge and the
+			// orphaned-path invariant in one place.
+			await saveConfigScopedUnlocked(update, targetDir);
+			log.info("Config saved to %s", targetDir);
+		}
+		return result;
+	});
+}
+
+/** Caller must hold `config.lock` for `targetDir`. */
+async function saveConfigScopedUnlocked(update: Partial<JolliMemoryConfig>, targetDir: string): Promise<void> {
+	// Re-read under the lock: two plugin SessionStart processes may update
+	// different provider fields at the same time.
 	const existing = await loadConfigFromDir(targetDir);
 	// Fields set to undefined are omitted by JSON.stringify, effectively
 	// removing them from the persisted config file.
 	const merged = { ...existing, ...dropOrphanedLocalAgentPath(existing, update) };
 	await atomicWrite(join(targetDir, CONFIG_FILE), JSON.stringify(merged, null, "\t"));
-	log.info("Config saved to %s", targetDir);
 }
 
 /**
@@ -605,12 +688,14 @@ export async function markAiSourceSeen(source: string): Promise<boolean> {
 
 /** Scoped variant of {@link markAiSourceSeen} for unit tests. */
 export async function markAiSourceSeenInDir(dir: string, source: string): Promise<boolean> {
-	const seen = (await loadConfigFromDir(dir)).telemetrySeenSources ?? [];
-	if (seen.includes(source)) {
-		return false;
-	}
-	await saveConfigScoped({ telemetrySeenSources: [...seen, source] }, dir);
-	return true;
+	return withConfigLock(dir, async () => {
+		const seen = (await loadConfigFromDir(dir)).telemetrySeenSources ?? [];
+		if (seen.includes(source)) {
+			return false;
+		}
+		await saveConfigScopedUnlocked({ telemetrySeenSources: [...seen, source] }, dir);
+		return true;
+	});
 }
 
 const SQUASH_PENDING_FILE = "squash-pending.json";

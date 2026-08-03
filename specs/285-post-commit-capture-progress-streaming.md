@@ -14,7 +14,7 @@ Give an interactive caller (a terminal user, or an AI-agent session) a live, mil
 - The tail-and-print loop: delivery order, replay of events written before the watch began, and the three ways the watch ends (terminal event, timeout, worker-dead).
 - The two distinct timeout ceilings (agent vs. terminal) and why they differ.
 - The rendering of each milestone to a human-readable line, including which milestones print nothing.
-- The accurate closing line chosen from how the watch ended.
+- The accurate closing line chosen from how the watch ended, including the network-denied-sandbox diagnosis that supersedes it.
 - The expired-local-login special case on the stored milestone.
 - Opportunistic pruning of aged progress and lock files.
 
@@ -74,6 +74,8 @@ Resolution:
 
 An AI-agent session is recognized by the presence of any one of a fixed set of environment markers (covering the major coding agents). A marker counts as present only when it is defined, non-empty, not `"0"`, and not `"false"` (case-insensitive). A real terminal is recognized from the standard-output stream being a TTY.
 
+No agent gives the command a TTY, so for an agent session the marker is the only thing that opens the gate. Each host's marker must therefore be one that is present however that host runs a command, and scoped to the command-execution environment — a variable that also appears where the host runs its own lifecycle hooks, or that a non-agent invocation of the host's tooling sets, would make a hook or a plain sandboxed command mistake itself for an agent session. A sandbox-state variable is specifically not such a marker: it is absent when the host runs unsandboxed and present when the host's sandbox is used without any agent behind it.
+
 ### Timeouts and poll cadence
 
 - **Terminal (human) ceiling:** 90 seconds — the user watches live progress and can voluntarily wait.
@@ -118,9 +120,19 @@ When the gate says yes, the hook tails the commit's progress file:
 ### Closing line (accurate to how the watch ended)
 
 After the loop, the closing line is chosen so the user is never left on a dangling "capturing…" nor wrongly told work continues:
-- if a `stored`, `skipped`, or `failed` milestone was seen, it already printed its own outcome line → print nothing more;
+- if a `stored` or `skipped` milestone was seen, it already printed its own outcome line → print nothing more (with one exception: an auth-expired `stored` under a network-denied sandbox is not treated as an outcome, and prints neither its own line nor nothing — see below);
+- else if the environment identifies a **network-denied sandbox** (see below), print the sandbox notice — it replaces, and is never printed alongside, any of the three endings below;
+- else if a `failed` milestone was seen, it already printed its own warning line → print nothing more;
 - else if the watch ended **worker-dead**, print a warning that capture was interrupted before finishing (pointing at the debug log);
 - else (timeout with the worker still alive) print "analysis continues in the background…".
+
+### Network-denied sandbox
+
+An agent that runs the commit inside a sandbox denying network access traps the entire pipeline with it: the hook, the detached worker it spawns, and the local-agent subprocess that worker spawns all inherit the sandbox, so the model call can never complete. Detaching does not escape it. The sandbox is identified from a single environment marker, distinct from the interactive-context markers above and never used as one.
+
+Both the `failed` line and the "continues in the background" line are wrong in this state — the first invites a retry that must fail identically, the second promises work that provably cannot happen — and the queue entry is discarded regardless of outcome, so no later drain recovers the commit. The notice therefore states that this commit has no memory and will not be retried, and points at the sandbox's network-access setting plus the option of committing outside the agent.
+
+A real `stored` or `skipped` outcome disproves the diagnosis and wins over it. An **auth-expired** `stored` does not: with no network the backend cannot reach its own authentication endpoint either, so that classification is a symptom of the sandbox rather than a stale login, and its sign-in guidance would send the user to fix the wrong thing. In that combination the sandbox notice replaces the expired-login remediation. Outside a blocking sandbox the expired-login remediation is unchanged.
 
 ### Pruning
 
@@ -149,6 +161,7 @@ At the start of processing each commit-typed entry the worker opportunistically 
 - **Events written before the watch began are still delivered.** Each poll re-reads from the start and skips already-delivered lines, so a watch that attaches slightly after the worker's first emissions still shows them in order.
 - **A force-killed worker is detected via the PID lock, not by waiting out the timeout.** Only a present-but-orphaned lock is "dead"; an absent lock is treated as "not started or already finished," never dead. This turns the worst case from a full-timeout block into a prompt, accurate "interrupted" message.
 - **The closing line distinguishes done / interrupted / still-running.** A resolved capture prints its own outcome; a dead worker prints an interrupted notice; a live-but-slow worker past the timeout prints "continues in the background." The user is never misinformed.
+- **A doomed capture is reported as doomed, not as pending.** Where the environment proves the pipeline cannot succeed — a sandbox denying the network to the worker as much as to the watch — the closing line says the memory does not exist and will not be retried, instead of the generic wording that would imply a retry or ongoing background work. This is the one case where the watcher speaks for the worker's fate rather than only for its own observation, and it is sound precisely because both inherit the same environment.
 - **An auth-expired `stored` is surfaced as a failure, not a success.** Because the stored summary is an empty placeholder when the local login expired, the watcher prints remediation guidance instead of the success line (see the local-agent login-expiry remediation spec).
 - **The gate is env-override → config → auto.** An explicit environment value beats the persisted setting, which beats the interactive-context default.
 

@@ -18,8 +18,9 @@ declare const __CLI_PKG_VERSION__: string;
  * Surface kind sent in the `x-jolli-client` header alongside the surface's
  * version: wire format is `<__JOLLI_CLIENT_KIND__>/<__PKG_VERSION__>`. The
  * kind mirrors `ClientInfo` in vscode/intellij — `"cli"`, `"vscode-plugin"`,
- * `"intellij-plugin"`, or `"claude-plugin"` (the Claude Code plugin bundle,
- * set by claude-plugin/plugins/jolli/scripts/build.mjs) — and lets the server
+ * `"intellij-plugin"`, or a plugin bundle (`"claude-plugin"` set by
+ * claude-plugin/plugins/jolli/scripts/build.mjs, `"codex-plugin"` by the Codex
+ * plugin's own build) — and lets the server
  * route min-version gating to the right surface. Without this, vscode-bundled hooks would self-identify
  * as `cli` and trip the wrong gate (a vscode-only user would be told to
  * upgrade a CLI they never installed, or worse, slip past the upgrade prompt
@@ -31,4 +32,4 @@ declare const __CLI_PKG_VERSION__: string;
  * also inject a separate `__JOLLI_CLIENT_VERSION__` — that would be a
  * structural duplicate.
  */
-declare const __JOLLI_CLIENT_KIND__: "cli" | "vscode-plugin" | "intellij-plugin" | "claude-plugin";
+declare const __JOLLI_CLIENT_KIND__: "cli" | "vscode-plugin" | "intellij-plugin" | "claude-plugin" | "codex-plugin";

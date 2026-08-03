@@ -96,7 +96,13 @@ vi.mock("node:fs", () => ({
 	createReadStream: mockCreateReadStream,
 }));
 
-vi.mock("node:os", () => ({
+// Spread the real module rather than listing exports: this mock is reached
+// through a deep transitive import graph (loadSessionTranscripts pulls in the
+// per-source discoverers, one of which reads `tmpdir()` at module load), so an
+// exhaustive list breaks whenever that graph widens — with a failure that points
+// at the newly-imported module rather than at this mock.
+vi.mock("node:os", async (importOriginal) => ({
+	...(await importOriginal<typeof import("node:os")>()),
 	homedir: mockHomedir,
 	// Cline detection (wired into loadSessionTranscripts) resolves VS Code flavor
 	// dirs via os.platform(); the mocked homedir points at a temp dir with no

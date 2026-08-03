@@ -550,3 +550,102 @@ describe("jolliEntry — Windows resolves Cli.js and spawns node", () => {
 		expect(entry.args).toEqual(["/dist/Cli.js", "mcp"]);
 	});
 });
+
+/*
+ * Codex's win32 entry prefers the launcher over a resolved Cli.js. Both bake in an
+ * absolute path (unavoidable in a static config file), but Cli.js also freezes the
+ * runtime VERSION until the next register, while the launcher re-resolves the winning
+ * dist on every MCP start. Codex is the one host where a plugin bundle and a
+ * standalone CLI compete on the same machine, so a frozen version is most likely to
+ * be the wrong one there.
+ */
+describe("codex registrar — win32 prefers the MCP launcher", () => {
+	const upsertMock = vi.fn().mockResolvedValue(undefined);
+	const originalPlatform = process.platform;
+
+	function mockRegistration(launcher: string | undefined): void {
+		vi.doMock("../McpRegistration.js", async (importOriginal) => {
+			const actual = await importOriginal<typeof import("../McpRegistration.js")>();
+			return { ...actual, resolveCliJs: () => "/dist/Cli.js", resolveMcpLauncherJs: () => launcher };
+		});
+	}
+
+	beforeEach(() => {
+		vi.resetModules();
+		Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+		vi.doMock("./CodexTomlWriter.js", () => ({
+			upsertCodexMcpServer: upsertMock,
+			removeCodexMcpServer: vi.fn(),
+		}));
+		upsertMock.mockClear();
+	});
+
+	afterEach(() => {
+		Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		vi.doUnmock("./CodexTomlWriter.js");
+		vi.doUnmock("../McpRegistration.js");
+		vi.resetModules();
+	});
+
+	// No trailing "mcp" argument: the launcher appends it when spawning the CLI.
+	it("spawns the launcher when the winning dist ships one", async () => {
+		mockRegistration("/dist/McpLauncher.js");
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		const [codex] = build({ ...NONE, codex: true });
+		await codex.register("/wt");
+		expect(upsertMock.mock.calls[0][1]).toEqual({ command: "node", args: ["/dist/McpLauncher.js"] });
+	});
+
+	// The normal case for a cli/vscode dist — only the Codex plugin's bundle ships a
+	// launcher today, so the fallback is the load-bearing branch.
+	it("falls back to node <Cli.js> mcp when the winning dist ships no launcher", async () => {
+		mockRegistration(undefined);
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		const [codex] = build({ ...NONE, codex: true });
+		await codex.register("/wt");
+		expect(upsertMock.mock.calls[0][1]).toEqual({ command: "node", args: ["/dist/Cli.js", "mcp"] });
+	});
+});
+
+// POSIX is unaffected by the launcher preference: `run-cli` already resolves the
+// winning dist at spawn time, so the entry must stay exactly what every other host
+// gets. Guards against the win32 branch leaking out of its platform check.
+describe("codex registrar — POSIX keeps the run-cli entry", () => {
+	const upsertMock = vi.fn().mockResolvedValue(undefined);
+	const originalPlatform = process.platform;
+
+	beforeEach(() => {
+		vi.resetModules();
+		Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+		vi.doMock("./CodexTomlWriter.js", () => ({
+			upsertCodexMcpServer: upsertMock,
+			removeCodexMcpServer: vi.fn(),
+		}));
+		vi.doMock("../McpRegistration.js", async (importOriginal) => {
+			const actual = await importOriginal<typeof import("../McpRegistration.js")>();
+			return {
+				...actual,
+				resolveMcpLauncherJs: () => {
+					throw new Error("resolveMcpLauncherJs must not be consulted on POSIX");
+				},
+			};
+		});
+		upsertMock.mockClear();
+	});
+
+	afterEach(() => {
+		Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		vi.doUnmock("./CodexTomlWriter.js");
+		vi.doUnmock("../McpRegistration.js");
+		vi.resetModules();
+	});
+
+	it("registers run-cli with the mcp argument", async () => {
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		const [codex] = build({ ...NONE, codex: true });
+		await codex.register("/wt");
+		const entry = upsertMock.mock.calls[0][1] as { command: string; args: string[] };
+		expect(entry.command).toBe(join(homedir(), ".jolli", "jollimemory", "run-cli"));
+		expect(entry.args).toEqual(["mcp"]);
+	});
+});

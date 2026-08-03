@@ -1,0 +1,25 @@
+{
+	"name": "jolli",
+	"version": "1.0.0",
+	"description": "Automatically captures and generates project memory from your development work — team-shareable and synced across devices, so you can recall and search past decisions and context across sessions and agents. Backed by the jolli CLI bundled with this plugin.",
+	"author": { "name": "jolli.ai", "url": "https://jolli.ai" },
+	"homepage": "https://jolli.ai",
+	"repository": "https://github.com/jolliai/jolliai",
+	"license": "Apache-2.0",
+	"keywords": ["memory", "recall", "pr", "git", "context"],
+	"skills": "./skills/",
+	"hooks": "./hooks/hooks.json",
+	"interface": {
+		"displayName": "Jolli Memory",
+		"shortDescription": "Recall decisions and preserve development context",
+		"developerName": "jolli.ai",
+		"category": "Productivity",
+		"capabilities": ["Read", "Write"],
+		"websiteURL": "https://jolli.ai",
+		"defaultPrompt": [
+			"Set up Jolli Memory for this repository.",
+			"Recall the context for this branch.",
+			"Search Jolli Memory for a prior decision."
+		]
+	}
+}

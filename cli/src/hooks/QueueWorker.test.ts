@@ -344,6 +344,10 @@ vi.mock("../core/CodexSessionDiscoverer.js", () => ({
 	isCodexInstalled: vi.fn().mockResolvedValue(false),
 }));
 
+vi.mock("../core/CodexDiscovery.js", () => ({
+	discoverCodexConversations: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
 	discoverOpenCodeSessions: vi.fn().mockResolvedValue([]),
 	isOpenCodeInstalled: vi.fn().mockResolvedValue(false),
@@ -699,6 +703,101 @@ describe("QueueWorker", () => {
 			// Three dequeues now: the capped drain (broke at 20), the chain-spawn
 			// probe, and the ingest-phase pre-check (which finds no ingest entries).
 			expect(vi.mocked(dequeueAllGitOperations)).toHaveBeenCalledTimes(3);
+		});
+	});
+
+	// Codex has no usable hook (plugin hooks stay untrusted until the user reviews
+	// them), so post-commit is the ONLY driver of Codex plans/references for a
+	// CLI-only or Codex-plugin user. If this stops running, their plans.json silently
+	// stays empty and every commit is associated with nothing.
+	describe("runWorker — Codex artifact discovery", () => {
+		it("discovers Codex artifacts once per drain, before any entry is processed", async () => {
+			const order: string[] = [];
+			const { discoverCodexConversations } = await import("../core/CodexDiscovery.js");
+			vi.mocked(discoverCodexConversations).mockImplementation(async () => {
+				order.push("discover");
+			});
+			const { deleteQueueEntry } = await import("../core/SessionTracker.js");
+			vi.mocked(deleteQueueEntry).mockImplementation(async () => {
+				order.push("entry");
+			});
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([
+					{ op: makeCommitOp({ commitHash: "aaa" }), filePath: "/tmp/queue/a.json" },
+					{ op: makeCommitOp({ commitHash: "bbb" }), filePath: "/tmp/queue/b.json" },
+				])
+				.mockResolvedValueOnce([]) // chain-spawn probe
+				.mockResolvedValueOnce([]); // ingest pre-check
+			setupPipelineMocks();
+
+			await runWorker("/test/cwd");
+
+			expect(vi.mocked(discoverCodexConversations)).toHaveBeenCalledWith("/test/cwd");
+			// Once per drain, not once per entry — discovery is scoped to the cwd.
+			expect(vi.mocked(discoverCodexConversations)).toHaveBeenCalledTimes(1);
+			// Awaited before the drain: the association step reads plans.json rather
+			// than extracting, so a fire-and-forget call would race the first commit.
+			expect(order[0]).toBe("discover");
+			expect(order).toEqual(["discover", "entry", "entry"]);
+		});
+
+		// The reason discovery is bounded rather than simply awaited: post-commit tails
+		// this worker on a 15 s ceiling, and the FIRST pass over a large
+		// ~/.codex/sessions/ history is unbounded work sitting ahead of every summary
+		// milestone. Without the deadline a slow scan costs the user all inline output
+		// for a commit whose summary was fine.
+		it("stops waiting on a hung discovery and drains anyway", async () => {
+			const { discoverCodexConversations } = await import("../core/CodexDiscovery.js");
+			let released: (() => void) | undefined;
+			// Never settles on its own — only this test releases it, at the end, so the
+			// pending promise cannot outlive the case and leak into the next one.
+			vi.mocked(discoverCodexConversations).mockImplementation(
+				() =>
+					new Promise<void>((resolve) => {
+						released = resolve;
+					}),
+			);
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op: makeCommitOp({ commitHash: "aaa" }), filePath: "/tmp/queue/a.json" }])
+				.mockResolvedValueOnce([]) // chain-spawn probe
+				.mockResolvedValueOnce([]); // ingest pre-check
+			setupPipelineMocks();
+
+			vi.useFakeTimers();
+			try {
+				const drained = runWorker("/test/cwd");
+				// Let the drain reach the race, then expire only the discovery deadline.
+				await vi.advanceTimersByTimeAsync(3000);
+				await drained;
+			} finally {
+				vi.useRealTimers();
+				released?.();
+			}
+
+			// The queue was processed even though discovery never finished — the whole
+			// point. A regression here (back to a bare await) hangs this test instead.
+			const { deleteQueueEntry } = await import("../core/SessionTracker.js");
+			expect(vi.mocked(deleteQueueEntry)).toHaveBeenCalledTimes(1);
+		});
+
+		it("still drains the queue when discovery throws", async () => {
+			// The real implementation never rejects, but the worker must not become
+			// hostage to that contract — a summary is worth more than a reference.
+			const { discoverCodexConversations } = await import("../core/CodexDiscovery.js");
+			vi.mocked(discoverCodexConversations).mockRejectedValueOnce(new Error("scan blew up"));
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op: makeCommitOp({ commitHash: "aaa" }), filePath: "/tmp/queue/a.json" }])
+				.mockResolvedValueOnce([]) // chain-spawn probe
+				.mockResolvedValueOnce([]); // ingest pre-check
+			setupPipelineMocks();
+
+			await runWorker("/test/cwd");
+
+			const { deleteQueueEntry } = await import("../core/SessionTracker.js");
+			expect(vi.mocked(deleteQueueEntry)).toHaveBeenCalledTimes(1);
 		});
 	});
 
@@ -1590,8 +1689,8 @@ describe("QueueWorker", () => {
 			expect(stored.summaryError).toBe("llm-failed");
 		});
 
-		it("writes the auth-specific marker when both attempts throw LocalAgentAuthError", async () => {
-			// The local `claude` login expired — both attempts throw
+		it("writes the auth-specific marker and failing tool when both attempts throw LocalAgentAuthError", async () => {
+			// The local Codex login expired — both attempts throw
 			// LocalAgentAuthError. The placeholder still lands, but the marker is
 			// the auth-specific kind so the SessionStart reminder + post-commit
 			// output can show sign-in guidance instead of a generic failure.
@@ -1601,6 +1700,10 @@ describe("QueueWorker", () => {
 				.mockResolvedValueOnce([])
 				.mockResolvedValueOnce([]);
 			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({
+				aiProvider: "local-agent",
+				localAgentTool: "codex",
+			} as Awaited<ReturnType<typeof loadConfig>>);
 			vi.mocked(generateSummary)
 				.mockRejectedValueOnce(new LocalAgentAuthError("OAuth session expired"))
 				.mockRejectedValueOnce(new LocalAgentAuthError("OAuth session expired"));
@@ -1613,6 +1716,10 @@ describe("QueueWorker", () => {
 			expect(stored.topics).toEqual([]);
 			expect(stored.llm?.stopReason).toBe("error");
 			expect(stored.summaryError).toBe("local-agent-auth");
+			const { emitCaptureProgress } = await import("./CaptureProgress.js");
+			expect(vi.mocked(emitCaptureProgress)).toHaveBeenCalledWith("/test/cwd", op.commitHash, "stored", {
+				data: { topics: 0, authExpired: true, localAgentTool: "codex" },
+			});
 		});
 	});
 

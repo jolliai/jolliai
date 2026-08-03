@@ -56,3 +56,40 @@ describe("atomicWriteFile", () => {
 		expect(h.rm).not.toHaveBeenCalled();
 	});
 });
+
+/*
+ * `mode` is applied to the TMPFILE so the rename carries it onto the target — the
+ * opposite of `writeFile(..., { mode })`, where mode is creation-only and an existing
+ * file keeps its permissions. That inversion is the whole reason the parameter exists
+ * (CodexTomlWriter needs to set 0600 on a file it creates while preserving the mode of
+ * one it does not own), and it is easy to "simplify" back into a plain writeFile mode,
+ * so both arms are pinned here.
+ */
+describe("atomicWriteFile — mode", () => {
+	it("applies mode to the tmpfile, so the rename carries it to the target", async () => {
+		await atomicWriteFile("/repo/state.json", "next", 0o600);
+
+		const tmpPath = `/repo/state.json.${process.pid}.uuid.tmp`;
+		expect(h.writeFile).toHaveBeenCalledWith(tmpPath, "next", { encoding: "utf-8", mode: 0o600 });
+	});
+
+	it("omits the mode option entirely when no mode is given", async () => {
+		await atomicWriteFile("/repo/state.json", "next");
+
+		const tmpPath = `/repo/state.json.${process.pid}.uuid.tmp`;
+		expect(h.writeFile).toHaveBeenCalledWith(tmpPath, "next", "utf-8");
+	});
+
+	// The win32 fallback cannot carry mode onto an existing target, but it must still
+	// pass it — the branch is also reached when the target does not exist.
+	it("passes mode through the EPERM fallback too", async () => {
+		h.rename.mockRejectedValueOnce(Object.assign(new Error("EPERM"), { code: "EPERM" }));
+
+		await atomicWriteFile("/repo/state.json", "next", 0o600);
+
+		expect(h.writeFile).toHaveBeenNthCalledWith(2, "/repo/state.json", "next", {
+			encoding: "utf-8",
+			mode: 0o600,
+		});
+	});
+});

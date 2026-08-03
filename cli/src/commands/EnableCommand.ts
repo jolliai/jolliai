@@ -373,7 +373,7 @@ export function registerEnableCommand(program: Command): void {
 		)
 		.option(
 			"--repo-hooks-only",
-			"Install only the shared runtime, source-neutral Git hooks, Claude agent hooks, and project /jolli menu",
+			"Install only the shared runtime, source-neutral Git hooks, and the acting host's agent hooks and menu",
 		)
 		.option("--source-tag <tag>", "Override the dist-paths source tag (e.g. 'intellij')")
 		.addOption(new Option("--automatic").hideHelp())
@@ -435,6 +435,7 @@ export function registerEnableCommand(program: Command): void {
 						console.error(`Jolli repo-hooks reconciliation failed: ${result.message}`);
 						process.exitCode = 1;
 					}
+					reportRepoHooksOnlyWarnings(result.warnings, options.automatic === true);
 					return;
 				}
 
@@ -444,8 +445,34 @@ export function registerEnableCommand(program: Command): void {
 }
 
 /**
+ * Emits `--repo-hooks-only` installer warnings, on **stderr** and only for a
+ * caller that is not `--automatic`.
+ *
+ * The mode's silence is deliberate and load-bearing: an automatic per-session
+ * bootstrap may inject this command's standard output into an agent's context (the
+ * Codex plugin's hook is stricter still — a single non-JSON byte on stdout fails its
+ * whole SessionStart schema). But that argument covers stdout on the automatic path,
+ * and it was over-applied: warnings were dropped on BOTH paths, so an explicit
+ * `/jolli:init` — which runs this mode WITHOUT `--automatic` and whose output the
+ * user reads — could replace a `localAgentTool` the user had deliberately configured,
+ * or fail to persist config at all, and report nothing but success.
+ *
+ * Split by destination and by caller, so each concern is served by the mechanism it
+ * needs: stderr keeps stdout byte-clean for the hook envelope, and the `automatic`
+ * gate keeps a per-session bootstrap from narrating a warning nobody asked for on
+ * every single session. What the automatic path suppresses is still in `debug.log`.
+ */
+function reportRepoHooksOnlyWarnings(warnings: ReadonlyArray<string>, automatic: boolean): void {
+	if (automatic || warnings.length === 0) return;
+	for (const warning of warnings) {
+		console.error(`  Warning: ${warning}`);
+	}
+}
+
+/**
  * Prints the human-facing outcome of a full `jolli enable` and, when
- * interactive, runs the API-key setup flow. Repo-hooks-only stays silent.
+ * interactive, runs the API-key setup flow. Repo-hooks-only prints only warnings,
+ * and only on stderr — see {@link reportRepoHooksOnlyWarnings}.
  */
 async function reportEnableResult(
 	result: InstallResult,

@@ -57,6 +57,12 @@ vi.mock("../core/GeminiSessionDetector.js", () => ({
 // in vi.fn so a single test can force `removeRepoMcpHosts` to reject and assert
 // uninstall still proceeds. `clearMocks: true` only clears call history, so the
 // real impl given to vi.fn() survives across tests.
+//
+// The GLOBAL registrars are safe to run for real here only because `homedir()` is
+// mocked to a temp dir above — they derive `~/.codex/config.toml` and friends from
+// it. Keep that mock in place: the Codex plugin bootstrap registers Codex without
+// consulting a detector, so this file now exercises a global registrar for real
+// rather than leaving every one of them detector-gated to false.
 vi.mock("./mcp/HostRegistrars.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./mcp/HostRegistrars.js")>();
 	return {
@@ -194,6 +200,15 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		},
 		saveConfig: async (update: Record<string, unknown>) => {
 			return original.saveConfigScoped(update, mockGlobalConfigDir());
+		},
+		// Same redirect as saveConfig, for the same reason: the real helper resolves
+		// the global dir itself, and a module's internal self-calls do not see this
+		// mock — so without this the plugin-init write would land in the developer's
+		// own ~/.jolli/jollimemory instead of the test's temp dir.
+		updateConfigTransactional: async <T>(
+			decide: Parameters<typeof original.updateConfigTransactionalScoped<T>>[0],
+		) => {
+			return original.updateConfigTransactionalScoped(decide, mockGlobalConfigDir());
 		},
 	};
 });
@@ -1298,6 +1313,229 @@ describe("Installer", () => {
 				expect(result.success).toBe(true);
 				expect(vi.mocked(migrateSchemaToV5)).toHaveBeenCalledTimes(1);
 			});
+		});
+	});
+
+	// `/jolli:init` runs `enable --repo-hooks-only --source-tag <plugin>` with no
+	// --automatic; the plugin's SessionStart bootstrap runs the same install() WITH
+	// automatic: true. Only the former may claim the local-agent tool.
+	describe("plugin init claims the local-agent tool", () => {
+		it("records the initiating host's tool on an explicit (non-automatic) plugin install", async () => {
+			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
+
+			expect(result.success).toBe(true);
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.aiProvider).toBe("local-agent");
+			expect(globalConfig.localAgentTool).toBe("codex");
+		});
+
+		// The overwrite is deliberate, but it must not be silent: the only other trace
+		// is a log.info that lands in debug.log, where the user never sees it.
+		it("overwrites a tool the other host had seeded, and reports the replacement", async () => {
+			await writeFile(
+				join(emptyGlobalDir, "config.json"),
+				JSON.stringify({ aiProvider: "local-agent", localAgentTool: "claude-code" }),
+				"utf-8",
+			);
+
+			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
+
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.localAgentTool).toBe("codex");
+			const notice = result.warnings.find((warning) => warning.includes("local agent"));
+			expect(notice).toContain("Codex");
+			expect(notice).toContain("was: Claude Code");
+			expect(notice).toContain("localAgentTool=claude-code");
+		});
+
+		// Filling in a blank is not a change the user needs told about.
+		it("stays quiet when it only fills in an unset tool", async () => {
+			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
+
+			expect(result.warnings.filter((warning) => warning.includes("local agent"))).toEqual([]);
+		});
+
+		it("leaves a paid provider alone while still recording the tool", async () => {
+			await writeFile(join(emptyGlobalDir, "config.json"), JSON.stringify({ aiProvider: "jolli" }), "utf-8");
+
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "claude-plugin" });
+
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.aiProvider).toBe("jolli");
+			expect(globalConfig.localAgentTool).toBe("claude-code");
+		});
+
+		// The no-tug-of-war guarantee: the automatic bootstrap must not touch the tool,
+		// or two installed plugins would flip it on each other every session.
+		it("writes nothing on the automatic bootstrap path", async () => {
+			await writeFile(
+				join(emptyGlobalDir, "config.json"),
+				JSON.stringify({ aiProvider: "local-agent", localAgentTool: "claude-code" }),
+				"utf-8",
+			);
+
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin", automatic: true });
+
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.localAgentTool).toBe("claude-code");
+		});
+
+		it("does not claim a tool for an ordinary non-plugin enable", async () => {
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "intellij" });
+
+			// loadConfigFromDir, not readFile: nothing here should have created config.json.
+			const { loadConfigFromDir, getGlobalConfigDir } = await import("../core/SessionTracker.js");
+			const globalConfig = await loadConfigFromDir(getGlobalConfigDir());
+			expect(globalConfig.localAgentTool).toBeUndefined();
+			expect(globalConfig.aiProvider).toBeUndefined();
+		});
+	});
+
+	// repo-hooks-only is shared by every plugin host, so only the host it acts for may
+	// have its own assets written. Without this a user running both plugins would get
+	// the Codex bootstrap rewriting / cleaning Claude-side files on every Codex session.
+	describe("repo-hooks-only writes only the acting host's assets", () => {
+		const exists = (p: string) =>
+			stat(p)
+				.then(() => true)
+				.catch(() => false);
+
+		it("writes no .claude/** for a codex-plugin bootstrap", async () => {
+			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
+
+			expect(result.success).toBe(true);
+			expect(await exists(join(tempDir, ".claude", "skills", "jolli", "SKILL.md"))).toBe(false);
+			expect(await exists(join(tempDir, ".claude", "settings.local.json"))).toBe(false);
+			expect(await exists(join(tempDir, ".claude"))).toBe(false);
+		});
+
+		it("still installs the source-neutral git hooks and runtime for codex-plugin", async () => {
+			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
+
+			expect(result.success).toBe(true);
+			for (const hook of ["post-commit", "post-rewrite", "prepare-commit-msg", "post-merge", "pre-push"]) {
+				expect(await exists(join(tempDir, ".git", "hooks", hook)), hook).toBe(true);
+			}
+			expect(await exists(join(fakeHomeDir, ".jolli", "jollimemory", "dist-paths", "codex-plugin"))).toBe(true);
+			expect(await exists(join(tempDir, ".jolli", "jollimemory", "sessions.json"))).toBe(true);
+		});
+
+		// `.agents/skills/` is the cross-platform dir Codex itself reads, and
+		// SKILL_TARGETS no longer includes `.claude/skills/` — so this sweep is
+		// host-neutral and must keep running for a non-Claude host.
+		it("still sweeps retired .agents/skills for codex-plugin", async () => {
+			await mkdir(join(tempDir, ".agents", "skills", "jolli-pr"), { recursive: true });
+			await writeFile(
+				join(tempDir, ".agents", "skills", "jolli-pr", "SKILL.md"),
+				'---\nname: jolli-pr\nmetadata:\n  vendor: "jolli.ai"\n---\nretired',
+				"utf-8",
+			);
+
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
+
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli-pr", "SKILL.md"))).toBe(false);
+		});
+
+		// `.agents/skills/` is CROSS-PLATFORM (Cursor, Gemini, OpenCode, Windsurf and
+		// Copilot read it too), so the Codex bootstrap must not delete an ACTIVE skill
+		// from it to de-duplicate its own picker — that takes the only copy those hosts
+		// have, and flaps against every later `jolli enable`. Duplication inside Codex is
+		// accepted instead. Only RETIRED names may go (covered by the case above).
+		it("leaves active Jolli .agents skills alone for codex-plugin", async () => {
+			const names = ["jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run", "jolli"];
+			for (const name of names) {
+				await mkdir(join(tempDir, ".agents", "skills", name), { recursive: true });
+				await writeFile(
+					join(tempDir, ".agents", "skills", name, "SKILL.md"),
+					`---\nname: ${name}\nmetadata:\n  vendor: "jolli.ai"\n---\ncli copy`,
+					"utf-8",
+				);
+			}
+
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
+
+			for (const name of names) {
+				expect(await exists(join(tempDir, ".agents", "skills", name, "SKILL.md")), name).toBe(true);
+			}
+		});
+
+		it("leaves a Claude-owned legacy skill alone for codex-plugin", async () => {
+			await mkdir(join(tempDir, ".claude", "skills", "jolli-search"), { recursive: true });
+			await writeFile(
+				join(tempDir, ".claude", "skills", "jolli-search", "SKILL.md"),
+				'---\nname: jolli-search\nmetadata:\n  vendor: "jolli.ai"\n---\nlegacy',
+				"utf-8",
+			);
+
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
+
+			// Claude's cleanup is Claude's business — a Codex bootstrap must not do it.
+			expect(await exists(join(tempDir, ".claude", "skills", "jolli-search", "SKILL.md"))).toBe(true);
+		});
+
+		it("still writes .claude/** for a claude-plugin bootstrap", async () => {
+			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "claude-plugin" });
+
+			expect(result.success).toBe(true);
+			expect(await exists(join(tempDir, ".claude", "skills", "jolli", "SKILL.md"))).toBe(true);
+			expect(await exists(join(tempDir, ".claude", "settings.local.json"))).toBe(true);
+		});
+
+		// Backward compatibility: this mode predates the host split, so an untagged
+		// hand-run must behave exactly as it did before.
+		it("defaults an untagged repo-hooks-only run to the Claude host", async () => {
+			const result = await install(tempDir, { repoHooksOnly: true });
+
+			expect(result.success).toBe(true);
+			expect(await exists(join(tempDir, ".claude", "skills", "jolli", "SKILL.md"))).toBe(true);
+			expect(await exists(join(tempDir, ".claude", "settings.local.json"))).toBe(true);
+		});
+
+		/*
+		 * The one global-MCP write repo-hooks-only makes, and the reason the Codex
+		 * plugin can ship without a `.mcp.json`. A plugin MCP entry must pin `cwd` to
+		 * the plugin root, and the server reads the repository it serves off its cwd,
+		 * so it would answer for the plugin's cache directory. The global
+		 * `~/.codex/config.toml` entry is launched with the session cwd instead.
+		 *
+		 * No detector is consulted: this path only runs from inside a Codex session,
+		 * and repo-hooks-only skips the filesystem probes to stay fast.
+		 */
+		it("registers the global Codex MCP entry for a codex-plugin bootstrap", async () => {
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
+
+			const toml = await readFile(join(fakeHomeDir, ".codex", "config.toml"), "utf-8");
+			expect(toml).toContain("[mcp_servers.jollimemory]");
+			// The entry carries no `cwd`, which is the whole point: Codex then launches
+			// the server with the SESSION directory.
+			expect(toml).not.toContain("cwd");
+		});
+
+		// ONLY Codex. Installing a Codex plugin must not go writing MCP config for
+		// Gemini, Copilot, Cline, Devin or Antigravity.
+		it("registers no other global host for a codex-plugin bootstrap", async () => {
+			const { registerGlobalMcpHosts } = await import("./mcp/HostRegistrars.js");
+
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
+
+			const detected = vi.mocked(registerGlobalMcpHosts).mock.calls[0][0];
+			const { codex, ...others } = detected;
+			expect(codex).toBe(true);
+			expect(Object.values(others).every((value) => value === false)).toBe(true);
+		});
+
+		it("registers no global MCP host for a claude-plugin bootstrap", async () => {
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "claude-plugin" });
+
+			expect(await exists(join(fakeHomeDir, ".codex", "config.toml"))).toBe(false);
+		});
+
+		// The Claude default for an untagged run must not quietly acquire a Codex MCP
+		// write — `pluginBootstrapHost` returning "claude" is what gates this.
+		it("registers no global MCP host for an untagged repo-hooks-only run", async () => {
+			await install(tempDir, { repoHooksOnly: true });
+
+			expect(await exists(join(fakeHomeDir, ".codex", "config.toml"))).toBe(false);
 		});
 	});
 

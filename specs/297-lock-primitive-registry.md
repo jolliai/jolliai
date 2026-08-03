@@ -78,6 +78,8 @@ Callers must therefore handle the two disciplines differently. A best-effort cal
 | `plans.lock` | Per-worktree | 5 seconds, polled | **Best-effort** |
 | `commit-selection.lock` | Per-worktree | 5 seconds, polled | **Best-effort** |
 | `push-pending.lock` | Per-worktree | 5 seconds, polled | **Best-effort** |
+| `sessions.lock` | Per-worktree | 5 seconds, polled | **Best-effort** |
+| `config.lock` | Machine-global in production; explicit target directory in scoped operations/tests | 5 seconds, polled | **Best-effort** |
 | `profile.lock` | Shared across worktrees | 5 seconds, polled | **Both disciplines exist over this one file** — see below |
 | `repo-hooks.lock` | Shared across worktrees | 5 seconds, polled; automatic (machine-initiated) callers use a much shorter budget of a fraction of a second | **Strict** |
 | `runtime-registry.lock` | Machine-global | 5 seconds, polled; automatic callers use the same shortened budget | **Strict** |
@@ -105,6 +107,7 @@ The consequence of that migration is visible to users: a profile write that cann
 ### Constraints the primitive cannot enforce
 
 - **`repo-hooks.lock` and `runtime-registry.lock` must never be held simultaneously.** They are deliberately separate — one is repository-scoped, one machine-global — and the install and uninstall paths acquire them strictly in sequence, completing and releasing the machine-global phase before entering the repository phase. Holding both would let two surfaces installing into two different repositories deadlock against each other. No lock here is re-entrant, so this constraint cannot be softened by nesting.
+- **One nesting exists, and only in one direction: repository hooks → configuration.** The explicit plugin-setup path (`/jolli:init`) writes the local-agent tool while it still holds the repository-hooks lock, and that write takes the machine-global configuration lock. The order is safe only because nothing guarded by the configuration lock ever reaches for a repository lock, so no cycle can form; a future configuration-guarded operation that acquired a repository lock would complete the deadlock. This is a different situation from the pair above, which must not overlap at all — here overlapping is permitted, and it is the *direction* that is load-bearing. The cost is that the configuration lock's best-effort budget can be spent inside the repository-lock critical section under contention.
 - **No lock is re-entrant.** A flow that already holds a lock and takes it again polls until its budget expires. On a best-effort lock that degrades into running the inner section unlocked; on a strict lock it fails outright. The rule is therefore to wrap the leaf read-modify-write, never a caller that already holds the lock — and, for the strict pair, to pass an explicit "already held" signal down to a nested operation rather than letting it try to acquire again.
 - **The staleness ceiling is a contract with long holders, not just a cleanup value.** Any new long-running holder must refresh its modification time on an interval well under half the ceiling, or it will be reclaimed while still working.
 
@@ -142,4 +145,4 @@ For any single lock file:
 - **Per-source dist-path version selection** requires every registry writer to hold the machine-global runtime-registry lock, and deliberately leaves its own read-modify-write internally unlocked in reliance on that.
 - **Npm postinstall dist-path refresh** turns a failure to acquire the machine-global lock into a complete silent skip.
 - **The repository-profile / manual-disable topic** owns the state guarded by the strict profile lock, including the abort-without-teardown behaviour on a lock timeout.
-- **Queue draining, orphan-branch writes, Memory Bank sync rounds, the plan/note registry, the commit-selection record, and the pending-push ledger** each own their guarded critical section; this topic owns only the lock characteristics.
+- **Queue draining, orphan-branch writes, Memory Bank sync rounds, the plan/note registry, the commit-selection record, the pending-push ledger, session/cursor registries, and machine-global configuration** each own their guarded critical section; this topic owns only the lock characteristics.

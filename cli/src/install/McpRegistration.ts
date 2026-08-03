@@ -5,6 +5,7 @@
  * version bumps don't strand the registration.
  */
 
+import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
@@ -76,6 +77,30 @@ export function resolveCliInvocation(args: string[], globalDir: string = getGlob
 export function resolveCliJs(globalDir?: string): string | undefined {
 	const best = pickBestDistPath(traverseDistPaths(globalDir));
 	return best ? join(best.distDir, "Cli.js") : undefined;
+}
+
+/**
+ * Absolute path to the winning dist's `McpLauncher.js`, or undefined when that dist
+ * does not ship one.
+ *
+ * Only for the win32 branch of a host entry, and only as an OPTIONAL upgrade over
+ * {@link resolveCliJs}. Both bake an absolute path in at registration time, but
+ * `Cli.js` freezes the *runtime version* too, while the launcher re-runs
+ * `pickBestDistPath` on every MCP start — so a later `jolli` upgrade is picked up
+ * without a re-register. POSIX gets that for free through `run-cli` and never needs
+ * this.
+ *
+ * Deliberately existence-checked and deliberately NOT added to
+ * `DistPathWriter.REQUIRED_RUNTIME_FILES`: only the Codex plugin's bundle ships
+ * `McpLauncher.js` today, and promoting it to a required file would make every
+ * already-installed dist fail `isCompleteRuntimeDist` and de-register itself. So a
+ * winning dist without one is normal, not an error — the caller falls back.
+ */
+export function resolveMcpLauncherJs(globalDir?: string): string | undefined {
+	const best = pickBestDistPath(traverseDistPaths(globalDir));
+	if (!best) return undefined;
+	const launcher = join(best.distDir, "McpLauncher.js");
+	return existsSync(launcher) ? launcher : undefined;
 }
 
 /**

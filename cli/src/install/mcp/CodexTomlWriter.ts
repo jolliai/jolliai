@@ -33,12 +33,28 @@
  * ENOENT -> create fresh file; any other read error -> log.warn + return (file untouched).
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat } from "node:fs/promises";
 import { dirname } from "node:path";
+import { atomicWriteFile } from "../../core/AtomicWrite.js";
 import { createLogger } from "../../Logger.js";
 
 const log = createLogger("CodexTomlWriter");
 const HEADER = "[mcp_servers.jollimemory]";
+
+/**
+ * The file's current permission bits, or `0o600` when it does not exist yet.
+ *
+ * Exists so a write can carry the file's OWN mode through the atomic rename (which
+ * would otherwise impose the tmpfile's). The 0600 default applies only to a file this
+ * code creates.
+ */
+async function currentMode(p: string): Promise<number> {
+	try {
+		return (await stat(p)).mode & 0o777;
+	} catch {
+		return 0o600;
+	}
+}
 
 function renderBlock(entry: { command: string; args?: string[] }): string {
 	return `${HEADER}\ncommand = ${JSON.stringify(entry.command)}\nargs = ${JSON.stringify(entry.args ?? [])}\n`;
@@ -87,8 +103,36 @@ export async function upsertCodexMcpServer(p: string, entry: { command: string; 
 	}
 	const base = stripBlock(text).replace(/\s*$/, "");
 	const next = base.length === 0 ? renderBlock(entry) : `${base}\n\n${renderBlock(entry)}`;
+
+	// Write nothing when nothing changes. This is the load-bearing guard, not an
+	// optimization: the Codex plugin's SessionStart bootstrap reaches this on EVERY
+	// session (`install` with `repoHooksOnly` registers Codex regardless of
+	// `automatic`), and this function rewrites the file WHOLE — a user's model
+	// settings, sandbox policy and other servers' `env` blocks included. Re-serialising
+	// all of that on every session start to produce identical bytes is pure risk: two
+	// sessions starting together are last-writer-wins over the entire file, not just
+	// over Jolli's table. In the steady state the entry already matches, so this
+	// returns before touching anything.
+	if (next === text) {
+		log.info("Codex MCP server already registered in %s — no write needed", p);
+		return;
+	}
+
 	await mkdir(dirname(p), { recursive: true });
-	await writeFile(p, next, "utf-8");
+	// Atomic, for the same reason the guard above exists: this file is mostly OTHER
+	// tools' configuration, so a write torn by a crash or a full disk truncates far
+	// more than Jolli's own table. A tmpfile + rename means a reader sees the old file
+	// or the new one.
+	//
+	// Permissions: a file we CREATE gets 0600 — it lists commands this machine will
+	// spawn and other tools' tokens, so a world-readable default is the wrong thing to
+	// leave on a fresh machine. A file that already exists keeps its own mode, which
+	// has to be read and passed back because `atomicWriteFile` applies `mode` to the
+	// tmpfile and the rename carries it over (unlike `writeFile`, where mode is
+	// creation-only). Silently re-chmod'ing another tool's config would be an
+	// overreach in either direction.
+	const mode = await currentMode(p);
+	await atomicWriteFile(p, next, mode);
 	log.info("Registered Codex MCP server in %s", p);
 }
 
@@ -104,6 +148,10 @@ export async function removeCodexMcpServer(p: string): Promise<void> {
 		return;
 	}
 	if (findBlockStart(text) === -1) return;
-	await writeFile(p, `${stripBlock(text).replace(/\s*$/, "")}\n`, "utf-8");
+	// Atomic and mode-preserving for the same reason as the upsert: most of this file
+	// is other tools' configuration. The `findBlockStart` check above already makes
+	// this a no-op when there is nothing to remove, so no separate short-circuit is
+	// needed here.
+	await atomicWriteFile(p, `${stripBlock(text).replace(/\s*$/, "")}\n`, await currentMode(p));
 	log.info("Removed Codex MCP server from %s", p);
 }

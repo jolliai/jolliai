@@ -16,6 +16,7 @@ import {
 import { VERSION } from "../commands/CliUtils.js";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { JolliMemoryPushClient, type PlatformToolManifestEntry } from "../core/JolliMemoryPushClient.js";
+import { normalizePathForCompare } from "../core/PathUtils.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
@@ -218,6 +219,28 @@ export interface StartMcpServerDeps {
 	readonly createPlatformClient?: () => PlatformToolClient;
 }
 
+/**
+ * Home-relative roots where AI hosts unpack installed plugin bundles. A server whose
+ * cwd sits under one of these was launched from a bundle, not from a repository.
+ *
+ * Path-matching only, with NO "and it isn't a git repo" refinement on purpose: a
+ * marketplace served over git leaves its cache as a real checkout, so the git test
+ * would pass there and let exactly the case this guards against through. The
+ * inverse mistake — a user keeping a working repository under `~/.codex/plugins/` —
+ * is far less likely, and its cost is a refusal that names the directory and says
+ * what to do, not a silent wrong answer.
+ */
+const PLUGIN_BUNDLE_PATH_MARKERS = ["/.codex/plugins/", "/.claude/plugins/"] as const;
+
+/**
+ * Whether `cwd` is inside an AI host's plugin-bundle cache rather than a repository.
+ * Exported for tests; see the call in {@link startMcpServer} for why it matters.
+ */
+export function isPluginBundleCwd(cwd: string): boolean {
+	const normalized = normalizePathForCompare(cwd);
+	return PLUGIN_BUNDLE_PATH_MARKERS.some((marker) => normalized.includes(marker));
+}
+
 /** Start the stdio MCP server. Resolves when the transport closes. */
 export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {}): Promise<void> {
 	// Re-entrancy guard (JOLLI-2033): the local-agent backend spawns an agent CLI in
@@ -229,12 +252,38 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 	//
 	// `cwd` is passed explicitly — unlike the hook guards, this process is spawned
 	// by the HOST rather than by our own child, so the env marker is subject to the
-	// host's env policy: Codex passes MCP servers an 11-variable allowlist that
-	// drops it, which is how 136 stray folders accumulated with the env-only guard
-	// already in place. The cwd sentinel is what actually survives that hop. See
-	// AgentReentry for the full two-channel rationale.
+	// host's env policy: Codex passes MCP servers a 7-variable allowlist (HOME,
+	// LOGNAME, PATH, SHELL, TMPDIR, USER, __CF_USER_TEXT_ENCODING — measured on
+	// codex-cli 0.146.0) that drops it, which is how 136 stray folders accumulated
+	// with the env-only guard already in place. The cwd sentinel is what actually
+	// survives that hop. See AgentReentry for the full two-channel rationale.
 	if (isLocalAgentChild(process.env, cwd)) {
 		log.info("Local-agent child detected; skipping MCP server startup to avoid a spurious Memory Bank repo");
+		return;
+	}
+
+	// Second cwd sentinel, same failure mode from the other direction: an AI host
+	// that launches this server from a PLUGIN BUNDLE rather than the user's repo.
+	// Every repo-scoped tool here derives its repository from `cwd`, so such a server
+	// would answer `recall` / `search` / `status` for the plugin's cache directory —
+	// silently, with empty-but-successful results, plus a placeholder Memory Bank repo
+	// named after the bundle's version directory. Refusing is strictly better: the
+	// host reports a server that would not start, and the skills' documented CLI
+	// fallback (`run-cli`, which inherits the session cwd) is correct.
+	//
+	// Reachable today only by a plugin manifest that pins `cwd` to its own root, which
+	// no shipped Jolli plugin does — Codex's MCP comes from the global
+	// `~/.codex/config.toml` entry precisely so it is launched with the session cwd
+	// (see codexRegistrar). This exists so that reintroducing such a manifest fails
+	// loudly instead of shipping a server that quietly serves the wrong repository.
+	if (isPluginBundleCwd(cwd)) {
+		process.stderr.write(
+			"jolli mcp: refusing to start — launched from an AI-host plugin bundle " +
+				`(${cwd}) rather than a repository, so every memory tool would answer for the wrong project. ` +
+				"Register the server through `jolli enable` (which lets the host launch it with the session " +
+				"directory) instead of from a plugin manifest that pins its cwd.\n",
+		);
+		log.warn("Refusing MCP startup: cwd %s is inside an AI-host plugin bundle, not a repository", cwd);
 		return;
 	}
 

@@ -21,7 +21,7 @@ Scan an AI agent's conversation transcript for mentions of referenceable entitie
 
 - How the producer-side conversation transcript is laid out on disk, opened, and read line-by-line. The extractor consumes a path; the act of reading the file as JSONL is shared infrastructure (see transcript reader specs, spec 16 and siblings).
 - The per-source payload interpretation — how to recognise a Linear-issue payload vs a Jira-issue payload, what fields each source emits, how each source renders itself into the prompt the LLM later sees. That is the **source-definition** concern: the DSL and engine are spec 255; the built-in catalog is spec 154.
-- The session registry that records "this transcript exists at this path for this commit" (see spec 26 for the Claude path; the Codex equivalent and its 60s polling tick live elsewhere).
+- The session registry that records "this transcript exists at this path for this commit" (see spec 26 for the Claude path; the Codex equivalent, and the two triggers that drive it, live elsewhere).
 - The mechanism that drives the polling tick on the sidebar (see sidebar specs 100–117).
 - The orphan-branch summary that an extracted reference is eventually snapshotted into — references live in a local registry until the commit they relate to lands.
 - The UI surface that displays references (sidebar panel, detail panel, open-in-browser action).
@@ -311,9 +311,18 @@ The caller orchestrates the cursor save based on both this pipeline's result **a
 | Producer | Trigger                                  | Source value passed | Cap on scan window               |
 | -------- | ---------------------------------------- | ------------------- | -------------------------------- |
 | Claude   | Per-stop hook fired by the agent itself.  | `claude`            | None — always scan to EOF.        |
-| Codex    | 60-second sidebar polling tick.           | `codex`             | Implicit — held cursor for in-flight requests. |
+| Codex    | Two triggers: the 60-second sidebar polling tick, **and** once per post-commit queue drain. | `codex`             | Implicit — held cursor for in-flight requests. |
 
-Codex has no usable lifecycle hook (Stop-hook trust is per-user and broken under git worktrees), so the polling tick rides the same path the sidebar already uses to discover Codex sessions. The discovery call is single-flighted per workspace cwd with a "dirty rerun" flag: a re-entrant call during an in-flight pass marks it dirty so one more pass runs after the current one, instead of deferring rows written mid-pass for a full minute. Sessions are processed serially within a pass so per-session cursor writes never race within a batch. The discovery call never rejects — all errors are logged and swallowed so callers can `void`-call it.
+Codex has no usable lifecycle hook (Stop-hook trust is per-user and broken under git worktrees), so both triggers ride the same path the sidebar already uses to discover Codex sessions. The discovery call is single-flighted per workspace cwd with a "dirty rerun" flag: a re-entrant call during an in-flight pass marks it dirty so one more pass runs after the current one, instead of deferring rows written mid-pass for a full minute. Sessions are processed serially within a pass so per-session cursor writes never race within a batch. The discovery call never rejects — all errors are logged and swallowed so callers can `void`-call it.
+
+**The post-commit trigger**, which exists so a repository driven by Codex alone (no editor sidebar running) still associates references with its commits, differs from the sidebar's in four ways that matter:
+
+- It is **awaited**, not fire-and-forget: the artifacts this pass writes have to be visible to the registry read that assembles the same drain's prompt.
+- It runs **once per drain, not once per queued commit**, because discovery is scoped to the working directory rather than to a commit.
+- It is **deadline-bounded**, because a person is waiting on it: the post-commit hook tails the worker and blocks until a terminal event or its own watch ceiling. Steady state is cheap (the cursor means only the transcript tail is read), but a first pass over a large session history is unbounded and sits ahead of every summary milestone. On timeout the pass is **abandoned, not cancelled** — its writes still land atomically, and its cursor makes the next commit resume where this one stopped. The trade-off is stated in one direction: a missing reference is worth far less than a missing summary.
+- Failure **degrades rather than blocks**. Two independent guards are needed and neither subsumes the other: a synchronous throw out of the discovery call has no promise to attach to, while a pass that loses the deadline race can fail *later*, after the race already settled — silently discarded otherwise, since a race consumes a losing input's rejection.
+
+**Attribution caveat, shared with every other artifact kind.** Consuming the working area associates whatever is active at consumption time with the commit then being processed; there is no per-commit time cutoff on the plan, note or reference registries. So a batch drain of several commits attributes to its *first* processed entry any artifact that appeared after the later commits were made, and an artifact extracted during the summarizing window is archived to that commit without having informed its prompt. This is a property of the artifact model as a whole, not of the Codex path — the Claude per-stop trigger has the same shape — and it is an attribution imprecision between adjacent commits on one branch, never a loss.
 
 ### Removal
 

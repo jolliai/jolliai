@@ -16,6 +16,7 @@ import {
 	formatCaptureLine,
 	isAgentSession,
 	isCaptureWorkerDead,
+	networkBlockedSandbox,
 	pruneStaleCaptureProgress,
 	readCaptureEvents,
 	releaseCaptureLock,
@@ -110,6 +111,7 @@ describe("isAgentSession", () => {
 		expect(isAgentSession({ CURSOR_TRACE_ID: "abc" })).toBe(true);
 		expect(isAgentSession({ GEMINI_CLI: "1" })).toBe(true);
 		expect(isAgentSession({ OPENCODE: "true" })).toBe(true);
+		expect(isAgentSession({ CODEX_THREAD_ID: "019fb74c-0470-7441-a578-8237457e0fba" })).toBe(true);
 	});
 
 	it("is false for empty / falsy / absent markers", () => {
@@ -117,6 +119,27 @@ describe("isAgentSession", () => {
 		expect(isAgentSession({ CLAUDECODE: "" })).toBe(false);
 		expect(isAgentSession({ CLAUDECODE: "0" })).toBe(false);
 		expect(isAgentSession({ AI_AGENT: "false" })).toBe(false);
+	});
+
+	it("does not treat Codex's sandbox markers as an agent session", () => {
+		// CODEX_SANDBOX is set by the plain `codex sandbox` subcommand (no agent) and
+		// absent under danger-full-access (agent present) — wrong in both directions,
+		// which is why CODEX_THREAD_ID is the marker.
+		expect(isAgentSession({ CODEX_SANDBOX: "seatbelt" })).toBe(false);
+		expect(isAgentSession({ CODEX_SANDBOX_NETWORK_DISABLED: "1" })).toBe(false);
+	});
+});
+
+describe("networkBlockedSandbox", () => {
+	it("identifies a network-denied Codex sandbox", () => {
+		expect(networkBlockedSandbox({ CODEX_SANDBOX_NETWORK_DISABLED: "1" })).toBe("codex");
+	});
+
+	it("is null when the sandbox allows network, or when there is no sandbox", () => {
+		expect(networkBlockedSandbox({})).toBeNull();
+		expect(networkBlockedSandbox({ CODEX_SANDBOX: "seatbelt" })).toBeNull();
+		expect(networkBlockedSandbox({ CODEX_SANDBOX_NETWORK_DISABLED: "0" })).toBeNull();
+		expect(networkBlockedSandbox({ CODEX_SANDBOX_NETWORK_DISABLED: "" })).toBeNull();
 	});
 });
 
@@ -226,6 +249,13 @@ describe("shouldShowCommitFeedback", () => {
 		expect(shouldShowCommitFeedback("auto", { AI_AGENT: "claude-code_x" }, undefined)).toBe(true);
 	});
 
+	it("auto shows in a Codex session, where the marker is the only signal", () => {
+		// Codex pipes command stdout and never allocates a TTY, in the interactive
+		// TUI as much as in `codex exec` — so isTTY is false and the marker decides.
+		expect(shouldShowCommitFeedback("auto", { CODEX_THREAD_ID: "019fb74c" }, false)).toBe(true);
+		expect(shouldShowCommitFeedback(undefined, { CODEX_THREAD_ID: "019fb74c" }, undefined)).toBe(true);
+	});
+
 	it("auto stays silent with no TTY and no agent env", () => {
 		expect(shouldShowCommitFeedback("auto", noEnv, false)).toBe(false);
 		expect(shouldShowCommitFeedback("auto", { CLAUDECODE: "" }, undefined)).toBe(false);
@@ -293,11 +323,16 @@ describe("formatCaptureLine", () => {
 	it("stored with authExpired shows sign-in guidance instead of the success line", () => {
 		const line = formatCaptureLine(ev("stored", { topics: 0, authExpired: true }));
 		expect(line).not.toBe("✓ Jolli Memory updated");
-		expect(line).toContain("the Claude login used for local generation has expired");
-		expect(line).toContain("claude auth login");
+		expect(line).toContain("Claude Code authentication expired or is unavailable");
+		expect(line).toContain("claude");
 		expect(line).toContain("jolli configure --set aiProvider");
-		// The SEPARATE-from-Desktop clarification must be present.
-		expect(line).toContain("SEPARATE from Claude Desktop");
+	});
+
+	it("stored with authExpired uses the failing Codex tool's remedy", () => {
+		const line = formatCaptureLine(ev("stored", { topics: 0, authExpired: true, localAgentTool: "codex" }));
+		expect(line).toContain("Codex authentication expired or is unavailable");
+		expect(line).toContain("codex login");
+		expect(line).not.toContain("claude auth login");
 	});
 });
 
@@ -522,6 +557,138 @@ describe("runCommitFeedback", () => {
 			"⚠ Jolli Memory: capture was interrupted before finishing (see .jolli/jollimemory/debug.log)",
 		]);
 		expect(lines).not.toContain("  analysis continues in the background…");
+	});
+
+	describe("under a network-denied sandbox", () => {
+		const SANDBOX_ENV = { CODEX_THREAD_ID: "019fb74c", CODEX_SANDBOX_NETWORK_DISABLED: "1" };
+		const SANDBOX_NOTICE = [
+			"⚠ Jolli Memory: no memory for this commit — most likely the Codex sandbox blocking network access.",
+			"  Background generation inherits the sandbox, so it cannot finish either, and this",
+			"  commit is not retried later. If the sandbox is not the cause, the real error is in",
+			"  .jolli/jollimemory/debug.log.",
+			"  → Allow network access in ~/.codex/config.toml:",
+			"        [sandbox_workspace_write]",
+			"        network_access = true",
+			"    Or run the commit from a terminal outside Codex.",
+		].join("\n");
+
+		it("replaces the generic failed line with the sandbox notice", async () => {
+			const lines: string[] = [];
+			await runCommitFeedback(tempDir, HASH, {
+				loadConfigFn: fakeConfig(),
+				env: SANDBOX_ENV, // auto mode: the Codex marker alone opens the gate (no TTY)
+				isTTY: false,
+				write: (l) => lines.push(l),
+				readEvents: () => [ev("start"), ev("failed"), { ...ev("end"), terminal: true }],
+				sleep: immediateSleep,
+				now: () => 0,
+			});
+			expect(lines).toEqual(["● Jolli Memory · capturing context for abc1234…", SANDBOX_NOTICE]);
+			expect(lines).not.toContain("⚠ Jolli Memory: capture did not complete (see .jolli/jollimemory/debug.log)");
+		});
+
+		it("replaces the background-continues line on timeout (the worker cannot finish either)", async () => {
+			const lines: string[] = [];
+			await runCommitFeedback(tempDir, HASH, {
+				loadConfigFn: fakeConfig(),
+				env: SANDBOX_ENV,
+				isTTY: false,
+				write: (l) => lines.push(l),
+				readEvents: () => [ev("start"), { ...ev("end"), terminal: true }],
+				sleep: immediateSleep,
+				now: () => 0,
+			});
+			expect(lines).toEqual(["● Jolli Memory · capturing context for abc1234…", SANDBOX_NOTICE]);
+			expect(lines).not.toContain("  analysis continues in the background…");
+		});
+
+		it("replaces the interrupted-worker line too", async () => {
+			const lines: string[] = [];
+			await runCommitFeedback(tempDir, HASH, {
+				loadConfigFn: fakeConfig(),
+				env: SANDBOX_ENV,
+				isTTY: false,
+				write: (l) => lines.push(l),
+				readEvents: () => [ev("start")],
+				workerDead: () => Promise.resolve(true),
+				timeoutMs: 1_000_000,
+				sleep: immediateSleep,
+				now: () => 0,
+			});
+			expect(lines).toEqual(["● Jolli Memory · capturing context for abc1234…", SANDBOX_NOTICE]);
+		});
+
+		it("stays silent about the sandbox when the capture stored anyway", async () => {
+			// Defensive: a stored outcome disproves the diagnosis, so success must win.
+			const lines: string[] = [];
+			await runCommitFeedback(tempDir, HASH, {
+				loadConfigFn: fakeConfig(),
+				env: SANDBOX_ENV,
+				isTTY: false,
+				write: (l) => lines.push(l),
+				readEvents: () => [ev("start"), ev("stored"), { ...ev("end"), terminal: true }],
+				sleep: immediateSleep,
+				now: () => 0,
+			});
+			expect(lines).toEqual(["● Jolli Memory · capturing context for abc1234…", "✓ Jolli Memory updated"]);
+		});
+
+		it("blames the sandbox, not the login, for an auth-expired placeholder", async () => {
+			// With no network the backend cannot reach its own auth endpoint either, so
+			// a `local-agent-auth` classification here is a symptom. Sending the user to
+			// re-run `codex login` would point them at the wrong thing entirely.
+			const lines: string[] = [];
+			await runCommitFeedback(tempDir, HASH, {
+				loadConfigFn: fakeConfig(),
+				env: SANDBOX_ENV,
+				isTTY: false,
+				write: (l) => lines.push(l),
+				readEvents: () => [
+					ev("start"),
+					ev("stored", { authExpired: true, localAgentTool: "codex" }),
+					{ ...ev("end"), terminal: true },
+				],
+				sleep: immediateSleep,
+				now: () => 0,
+			});
+			expect(lines).toEqual(["● Jolli Memory · capturing context for abc1234…", SANDBOX_NOTICE]);
+			expect(lines.join("\n")).not.toContain("codex login");
+		});
+
+		it("still shows the login remedy for an auth-expired placeholder outside a sandbox", async () => {
+			const lines: string[] = [];
+			await runCommitFeedback(tempDir, HASH, {
+				loadConfigFn: fakeConfig(),
+				env: { CODEX_THREAD_ID: "019fb74c" }, // agent session, no sandbox
+				isTTY: false,
+				write: (l) => lines.push(l),
+				readEvents: () => [
+					ev("start"),
+					ev("stored", { authExpired: true, localAgentTool: "codex" }),
+					{ ...ev("end"), terminal: true },
+				],
+				sleep: immediateSleep,
+				now: () => 0,
+			});
+			expect(lines.join("\n")).toContain("codex login");
+			expect(lines.join("\n")).not.toContain("blocking network access");
+		});
+
+		it("says nothing when a sandboxed commit is not an agent session and has no TTY", async () => {
+			// `codex sandbox <cmd>` sets the sandbox vars with no agent behind them —
+			// the gate must stay shut rather than print a sandbox notice to nobody.
+			const lines: string[] = [];
+			await runCommitFeedback(tempDir, HASH, {
+				loadConfigFn: fakeConfig(),
+				env: { CODEX_SANDBOX: "seatbelt", CODEX_SANDBOX_NETWORK_DISABLED: "1" },
+				isTTY: false,
+				write: (l) => lines.push(l),
+				readEvents: () => [ev("start"), ev("failed"), { ...ev("end"), terminal: true }],
+				sleep: immediateSleep,
+				now: () => 0,
+			});
+			expect(lines).toEqual([]);
+		});
 	});
 
 	it("treats a failing loadConfig as auto mode (silent without interactivity)", async () => {

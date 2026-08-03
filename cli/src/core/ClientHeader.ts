@@ -45,3 +45,31 @@ export function resolveClientKind(): typeof __JOLLI_CLIENT_KIND__ {
 export function isClaudePluginBuild(): boolean {
 	return resolveClientKind() === "claude-plugin";
 }
+
+/**
+ * Whether a client kind denotes an AI-host plugin's embedded CLI rather than a
+ * standalone install.
+ *
+ * Split from {@link isPluginBundleBuild} so the classification is reachable in tests:
+ * `__JOLLI_CLIENT_KIND__` is a bundler `define:` fixed to `"cli"` under vitest, so a
+ * predicate that reads it can only ever be observed returning false. Keeping the
+ * decision in a pure function over the kind lets every arm be pinned.
+ */
+export function isPluginBundleKind(kind: typeof __JOLLI_CLIENT_KIND__): boolean {
+	return kind === "claude-plugin" || kind === "codex-plugin";
+}
+
+/**
+ * True when this bundle is ANY AI-host plugin's embedded CLI, not a standalone
+ * install.
+ *
+ * Distinct from {@link isClaudePluginBuild} on purpose: use this one for decisions
+ * that follow from "this CLI is embedded in a plugin and exposes only a fixed
+ * command surface" (see the discovery gate in PluginLoader), and the Claude-specific
+ * predicate only for decisions about Claude's own assets. A new plugin host must be
+ * added to {@link isPluginBundleKind}, or it silently inherits standalone-CLI
+ * behavior — the exact bug this predicate exists to prevent.
+ */
+export function isPluginBundleBuild(): boolean {
+	return isPluginBundleKind(resolveClientKind());
+}

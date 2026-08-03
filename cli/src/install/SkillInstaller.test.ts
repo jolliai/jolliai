@@ -959,12 +959,37 @@ describe("English-only", () => {
 // ─── Legacy cleanup + idempotency ───────────────────────────────────────────
 
 describe("legacy directories", () => {
+	// The marker is required now: this cleanup used to `rm -rf` the legacy names
+	// unconditionally. `jolli-skill-version:` is the ancient form, which is what an
+	// install old enough to carry these directory names would actually have written.
 	it("removes legacy skill directories from previous versions", async () => {
 		const fs = await import("node:fs");
 		fs.mkdirSync(join(tempDir, ".claude/skills/jollimemory-recall"), { recursive: true });
-		fs.writeFileSync(join(tempDir, ".claude/skills/jollimemory-recall/SKILL.md"), "old");
+		fs.writeFileSync(
+			join(tempDir, ".claude/skills/jollimemory-recall/SKILL.md"),
+			"---\nname: jollimemory-recall\njolli-skill-version: 0.1.0\n---\nold",
+		);
 		await updateSkillsIfNeeded(tempDir);
 		expect(fs.existsSync(join(tempDir, ".claude/skills/jollimemory-recall"))).toBe(false);
+	});
+
+	// `jollimemory-recall` / `jolli-memory-recall` are ordinary enough names that a
+	// user could own one. This path runs on every full `jolli enable`, so an
+	// unguarded delete would silently eat their work — the same ownership rule every
+	// other removal in SkillInstaller already follows.
+	it("keeps a same-named skill the user owns (no Jolli marker)", async () => {
+		const fs = await import("node:fs");
+		for (const name of ["jollimemory-recall", "jolli-memory-recall"]) {
+			const dir = join(tempDir, ".claude", "skills", name);
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\n---\nmy own skill`);
+		}
+
+		await updateSkillsIfNeeded(tempDir);
+
+		for (const name of ["jollimemory-recall", "jolli-memory-recall"]) {
+			expect(fs.existsSync(join(tempDir, ".claude", "skills", name, "SKILL.md")), name).toBe(true);
+		}
 	});
 
 	it("upserts search even when recall already exists at the current version", async () => {
@@ -1136,6 +1161,40 @@ describe("buildPluginJolliMenuSkillTemplate", () => {
 		expect(tpl).toMatch(/sign-in alone does NOT count/);
 		// The setup branch keys off generation capability, not "no credential".
 		expect(tpl).toContain("OR memories can't be generated");
+	});
+
+	// Generation and sync are separate axes in the CLI front door: the default
+	// local-agent repo generates memories through the user's own subscription while
+	// holding no Jolli credential, so it can capture but not share. Checking only
+	// generation reported that repo as fully healthy and never mentioned sign-in.
+	it("treats sync as a second axis and nudges sign-in when it is missing", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		expect(tpl).toContain("can sync memories");
+		expect(tpl).toMatch(/= `account\.signedIn` OR `account\.jolliApiKeyConfigured`/);
+		// An Anthropic key generates but can never bind a Space.
+		expect(tpl).toMatch(/an Anthropic key never satisfies it/);
+		expect(tpl).toContain("Sign in to Jolli to sync memories to a Space?");
+		// A nudge, never a gate — an unsigned repo still gets the whole menu.
+		expect(tpl).toContain("non-blocking");
+		// Hands off to the existing command instead of re-running the login flow.
+		expect(tpl).toMatch(/tell them to run\s+`\/jolli:login`/);
+		expect(tpl).toMatch(/Do NOT run\s+`auth login` yourself here/);
+	});
+
+	it("surfaces the login / logout commands the old menu left unreachable", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		for (const command of ["/jolli:login", "/jolli:logout", "/jolli:status", "/jolli:timeline"]) {
+			expect(tpl).toContain(command);
+		}
+		// A skill cannot invoke a slash command, so the menu must say how to route one.
+		expect(tpl).toContain("a skill cannot invoke a command");
+	});
+
+	it("names the local-agent engine in the snapshot instead of only key/sign-in states", () => {
+		const tpl = buildPluginJolliMenuSkillTemplate();
+		expect(tpl).toContain("`account.localAgentTool`");
+		expect(tpl).toContain("summaries via <account.localAgentTool>");
+		expect(tpl).toContain("✓ local agent set (not signed in to Jolli)");
 	});
 });
 
@@ -1365,7 +1424,7 @@ describe("skill revision is kept in lockstep with the body", () => {
 		localRun: { build: buildLocalRunSkillTemplate, revision: 5, fingerprint: "81db78096bb6" },
 		remoteRun: { build: buildRemoteRunSkillTemplate, revision: 4, fingerprint: "9fd34e36c20e" },
 		menu: { build: buildJolliMenuSkillTemplate, revision: 6, fingerprint: "81cc5c34d91e" },
-		pluginMenu: { build: buildPluginJolliMenuSkillTemplate, revision: 7, fingerprint: "e39ea758cfcd" },
+		pluginMenu: { build: buildPluginJolliMenuSkillTemplate, revision: 8, fingerprint: "cf37465fecac" },
 	} as const;
 
 	for (const [name, want] of Object.entries(EXPECTED)) {

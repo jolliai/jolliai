@@ -29,6 +29,86 @@ describe("CodexTomlWriter", () => {
 		expect(t).toContain('command = "/h/.jolli/jollimemory/run-cli"');
 		expect(t).toContain('args = ["mcp"]');
 	});
+	/*
+	 * Codex's config lists commands this machine will spawn, and other tools' `env`
+	 * blocks routinely hold tokens — so when WE create the file, it should not be
+	 * world-readable. A file that already exists keeps whatever permissions its owner
+	 * chose: this writer goes through a tmpfile + rename, which WOULD impose the
+	 * tmpfile's mode, so the existing mode is read and passed back deliberately.
+	 * Silently re-chmod'ing another tool's config would be an overreach either way.
+	 *
+	 * POSIX-only: on Windows the mode bits are not meaningful and node reports 0666.
+	 */
+	it.skipIf(process.platform === "win32")("creates the file 0600, and never re-chmods an existing one", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "c-"));
+		const created = join(dir, "config.toml");
+		await upsertCodexMcpServer(created, entry);
+		const { stat, chmod } = await import("node:fs/promises");
+		expect((await stat(created)).mode & 0o777).toBe(0o600);
+
+		const preexisting = join(dir, "other.toml");
+		await writeFile(preexisting, 'model = "o4"\n', "utf-8");
+		await chmod(preexisting, 0o644);
+		await upsertCodexMcpServer(preexisting, entry);
+		expect((await stat(preexisting)).mode & 0o777).toBe(0o644);
+	});
+
+	/*
+	 * The load-bearing guard. The Codex plugin's SessionStart bootstrap reaches this
+	 * upsert on EVERY session — `install` with `repoHooksOnly` registers Codex whether
+	 * or not the call is `automatic` — and this function rewrites the file WHOLE,
+	 * including the user's model settings, sandbox policy and other servers' `env`
+	 * blocks. Re-serialising all of that to produce identical bytes on every session
+	 * start is pure risk: two sessions starting together would be last-writer-wins over
+	 * the entire file, not just over Jolli's own table.
+	 *
+	 * Asserted via mtime rather than content, because content is identical either way —
+	 * which is exactly why the bug would have been invisible.
+	 */
+	it("does not touch the file when the entry already matches", async () => {
+		const p = join(await mkdtemp(join(tmpdir(), "c-")), "config.toml");
+		await writeFile(p, 'model = "o4"\n\n[mcp_servers.other]\ncommand = "x"\n', "utf-8");
+		await upsertCodexMcpServer(p, entry);
+
+		const { stat, utimes } = await import("node:fs/promises");
+		const before = await readFile(p, "utf-8");
+		// Backdate so a rewrite is detectable even at coarse filesystem timestamp
+		// granularity.
+		const stale = new Date(Date.now() - 60_000);
+		await utimes(p, stale, stale);
+		const mtimeBefore = (await stat(p)).mtimeMs;
+
+		await upsertCodexMcpServer(p, entry);
+
+		expect((await stat(p)).mtimeMs).toBe(mtimeBefore);
+		expect(await readFile(p, "utf-8")).toBe(before);
+	});
+
+	// ...but a real change must still be written, or the guard above would have turned
+	// registration into a no-op for the case that matters (an upgrade whose command or
+	// args moved).
+	it("still writes when the entry's command changes", async () => {
+		const p = join(await mkdtemp(join(tmpdir(), "c-")), "config.toml");
+		await upsertCodexMcpServer(p, entry);
+		await upsertCodexMcpServer(p, { command: "/new/path/run-cli", args: ["mcp"] });
+		const t = await readFile(p, "utf-8");
+		expect(t).toContain('command = "/new/path/run-cli"');
+		expect(t).not.toContain('command = "/h/.jolli/jollimemory/run-cli"');
+		// Exactly one table — the replacement must not append a second one.
+		expect(t.match(/\[mcp_servers\.jollimemory\]/g)).toHaveLength(1);
+	});
+
+	// No tmpfile may survive a successful write; a leftover `config.toml.<pid>.<uuid>.tmp`
+	// beside the real config would be visible to the user and to Codex's own tooling.
+	it("leaves no tmpfile behind", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "c-"));
+		const p = join(dir, "config.toml");
+		await upsertCodexMcpServer(p, entry);
+		await upsertCodexMcpServer(p, { command: "/other", args: [] });
+		const { readdir } = await import("node:fs/promises");
+		expect(await readdir(dir)).toEqual(["config.toml"]);
+	});
+
 	it("preserves unrelated content and other tables", async () => {
 		const p = join(await mkdtemp(join(tmpdir(), "c-")), "config.toml");
 		await writeFile(p, 'model = "o4"\n\n[mcp_servers.other]\ncommand = "x"\n', "utf-8");

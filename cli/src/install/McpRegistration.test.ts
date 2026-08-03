@@ -9,6 +9,7 @@ import {
 	removeMcpFromClaude,
 	resolveCliInvocation,
 	resolveCliJs,
+	resolveMcpLauncherJs,
 } from "./McpRegistration.js";
 
 let dir: string;
@@ -164,6 +165,47 @@ describe("resolveCliJs", () => {
 		const globalDir = await mkdtemp(join(tmpdir(), "jolli-global-"));
 		try {
 			expect(resolveCliJs(globalDir)).toBeUndefined();
+		} finally {
+			await rm(globalDir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("resolveMcpLauncherJs", () => {
+	it("returns the winning dist's McpLauncher.js when it ships one", async () => {
+		const distDir = await mkdtemp(join(tmpdir(), "jolli-dist-"));
+		const globalDir = await mkdtemp(join(tmpdir(), "jolli-global-"));
+		try {
+			await mkdir(join(globalDir, "dist-paths"), { recursive: true });
+			await writeFile(join(globalDir, "dist-paths", "codex-plugin"), `1.2.3\n${distDir}\n`, "utf-8");
+			await writeFile(join(distDir, "McpLauncher.js"), "// stub", "utf-8");
+			expect(resolveMcpLauncherJs(globalDir)).toBe(join(distDir, "McpLauncher.js"));
+		} finally {
+			await rm(distDir, { recursive: true, force: true });
+			await rm(globalDir, { recursive: true, force: true });
+		}
+	});
+
+	// The normal case for every dist except the Codex plugin's, which is why this is
+	// existence-checked rather than assumed: promoting McpLauncher.js to a required
+	// runtime file would de-register every dist already installed.
+	it("returns undefined when the winning dist ships no launcher", async () => {
+		const distDir = await mkdtemp(join(tmpdir(), "jolli-dist-"));
+		const globalDir = await mkdtemp(join(tmpdir(), "jolli-global-"));
+		try {
+			await mkdir(join(globalDir, "dist-paths"), { recursive: true });
+			await writeFile(join(globalDir, "dist-paths", "cli"), `1.2.3\n${distDir}\n`, "utf-8");
+			expect(resolveMcpLauncherJs(globalDir)).toBeUndefined();
+		} finally {
+			await rm(distDir, { recursive: true, force: true });
+			await rm(globalDir, { recursive: true, force: true });
+		}
+	});
+
+	it("returns undefined when no dist path is registered", async () => {
+		const globalDir = await mkdtemp(join(tmpdir(), "jolli-global-"));
+		try {
+			expect(resolveMcpLauncherJs(globalDir)).toBeUndefined();
 		} finally {
 			await rm(globalDir, { recursive: true, force: true });
 		}

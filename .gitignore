@@ -78,6 +78,10 @@ settings.local.json
 **/node_modules/
 **/*.vsix
 .superpowers/
+# Marketplace zips. publish-zip.sh writes $HOME/Desktop by DEFAULT; this covers the
+# repo-relative path it resolves when given an explicit argument
+# (`publish-zip.sh outputs/jolli-codex-plugin-marketplace-1.0.0.zip`).
+/outputs/
 
 # Generated codicon assets (copied from node_modules at build time)
 vscode/assets/codicons/
@@ -96,3 +100,14 @@ notes.md
 # gitignore). Re-include them so the plugin is committed complete.
 !/claude-plugin/plugins/**/.mcp.json
 !/claude-plugin/plugins/**/SKILL.md
+
+# codex-plugin, same reason. It needs one rule claude-plugin does not: its
+# marketplace lives under `.agents/`, and that whole DIRECTORY is ignored above
+# (Jolli writes `.agents/skills/` into user repos). Git cannot re-include a file
+# whose parent directory is excluded — it never descends into it — so the
+# directory has to be un-excluded first, before any pattern inside it can match.
+# No `.mcp.json` rule: unlike claude-plugin, this plugin deliberately ships none
+# (MCP is registered into ~/.codex/config.toml so the host launches the server with
+# the session cwd — see cli/src/install/mcp/HostRegistrars.ts).
+!/codex-plugin/.agents/
+!/codex-plugin/plugins/**/SKILL.md

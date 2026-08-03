@@ -142,7 +142,16 @@ export function traverseDistPaths(globalDir?: string): DistPathInfo[] {
 	const dir = join(globalDir ?? join(homedir(), ".jolli", "jollimemory"), "dist-paths");
 	let names: string[];
 	try {
-		names = readdirSync(dir);
+		// SORTED, and that is load-bearing: `pickBestDistPath` breaks a version tie
+		// among sources that are not in SOURCE_PREFERENCE_ORDER by taking the first
+		// one it saw, so enumeration order IS the final tie-break. `resolve-dist-path`
+		// (DispatchScripts.ts) reaches the same decision by globbing
+		// `dist-paths/*`, and POSIX glob expansion is collation-sorted — so without
+		// this sort the shell resolver and this one can pick DIFFERENT winners for the
+		// same directory, since readdir order is filesystem order, not lexicographic.
+		// Latent today between `intellij` and `claude-plugin`; a second plugin host
+		// makes an equal-version tie between two unordered sources routine.
+		names = readdirSync(dir).sort();
 	} catch {
 		return [];
 	}
@@ -218,8 +227,17 @@ export const SOURCE_PREFERENCE_ORDER: ReadonlyArray<string> = ["cli", "vscode", 
 /**
  * Picks the best entry from a dist-paths list:
  *   1. highest core version, **strict** greater-than (a tie never overwrites, so
- *      enumeration order can't decide a tie), then
- *   2. among sources tied at that version, the first in {@link SOURCE_PREFERENCE_ORDER}.
+ *      enumeration order can't promote a later entry over an equal-versioned
+ *      earlier one), then
+ *   2. among sources tied at that version, the first in {@link SOURCE_PREFERENCE_ORDER},
+ *   3. and when NO tied source appears in that order — two plugin bundles at the same
+ *      version, say — the first tied entry in the caller's list order. That is why
+ *      {@link traverseDistPaths} sorts: this last step is only deterministic, and only
+ *      agrees with the `resolve-dist-path` shell resolver, if the list arrives sorted
+ *      by source name. Plugin hosts are deliberately absent from the preference order
+ *      (a team decision), so for them step 3 is the operative rule — and it is a
+ *      stability rule, NOT host isolation: never rely on which bundle wins to decide
+ *      host behavior, only that the choice does not flip between runs.
  * Returns undefined if the list is empty or no entries are available.
  */
 export function pickBestDistPath(entries: ReadonlyArray<DistPathInfo>): DistPathInfo | undefined {

@@ -43,6 +43,8 @@ import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
 import { getProjectRootDir, isInsideGitRepo, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
 import { resolveMemoryBankState } from "../core/KBPathResolver.js";
 import { acquireRepoHooksLock, type StrictLockHandle, withRuntimeRegistryLock } from "../core/Locks.js";
+import { applyPluginInitLocalAgentTool, pluginBootstrapHost } from "../core/localagent/PluginDefaults.js";
+import { localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import {
 	isOpenCodeInstalled,
 	isOpenCodePresent,
@@ -218,8 +220,17 @@ export async function install(
 	const integrationsOnly = options?.integrationsOnly === true;
 
 	// repo-hooks-only installs the repo-owned lifecycle: source-neutral Git hooks,
-	// canonical Claude Stop/SessionStart hooks, project-local menu and state. It
-	// skips host detection, MCP registration, and unrelated skills.
+	// project-local state, the `.agents/skills/` retired sweep, plus the acting
+	// host's own agent hooks and menu. It skips host detection, MCP registration,
+	// and unrelated skills.
+	//
+	// This is the PLUGIN BOOTSTRAP mode, and it is host-PARAMETERIZED, not
+	// Claude-specific: which host's assets get written comes from the source tag
+	// (see `pluginHost` below). The name predates the second plugin host and is
+	// kept only because `--repo-hooks-only` is a shipped CLI surface that older
+	// plugin bundles pass to newer CLIs — renaming it would break exactly the
+	// cross-version dispatch the dist registry exists to support. Read it as
+	// "repo-owned lifecycle for one host", not "Claude".
 	const repoHooksOnly = options?.repoHooksOnly === true;
 
 	if (integrationsOnly && repoHooksOnly) {
@@ -291,6 +302,13 @@ export async function install(
 			};
 		}
 
+		// Which AI host a repo-hooks-only bootstrap acts for. Only that host's own
+		// assets may be written, so a second plugin host can share this mode without
+		// touching the first one's files. Derived from the source tag (see
+		// pluginBootstrapHost); irrelevant outside repoHooksOnly, where the full
+		// lifecycle writes every enabled host's assets by design.
+		const pluginHost = pluginBootstrapHost(sourceTag);
+
 		const reconcileRuntime = async () => {
 			if (!(await installHookScripts())) return false;
 			try {
@@ -335,6 +353,55 @@ export async function install(
 			}
 			if (options?.respectManualDisable && (await readManualDisableFlag(projectDir))) {
 				return { success: true, message: "Repository remains manually disabled", warnings };
+			}
+
+			// EXPLICIT plugin setup: `/jolli:init` runs this command WITHOUT --automatic,
+			// so the host the user initialized from becomes the local-agent tool. Sits
+			// after the manual-disable early return so a disabled repo stays a true
+			// zero-write. Non-plugin source tags return null and write nothing, which is
+			// every ordinary `jolli enable`.
+			//
+			// LOCK ORDER — this nests: `saveConfig` takes the machine-global `config.lock`
+			// while this flow still holds the repository's `repo-hooks.lock`. That order
+			// (repo-hooks → config) is the only direction that exists, because nothing
+			// guarded by `config.lock` acquires a repository lock, so there is no cycle.
+			// Keep it that way: a `config.lock` holder that reached for `repo-hooks.lock`
+			// would complete the deadlock. Distinct from the `repo-hooks` ↔
+			// `runtime-registry` pair, which spec 297 forbids holding simultaneously at
+			// all. Cost of the nesting: `config.lock` is best-effort with a 5 s budget, so
+			// heavy contention can add that much inside the repo-lock critical section
+			// rather than failing.
+			//
+			// The `!automatic` gate is load-bearing, not a fast path: the plugin's
+			// SessionStart bootstrap reaches this same install() with a plugin sourceTag
+			// and automatic: true. Letting it through would overwrite localAgentTool on
+			// every session, which is precisely the two-host tug-of-war that the
+			// first-wins seed in ensurePluginDefaultProvider exists to avoid.
+			if (!options?.automatic) {
+				try {
+					const applied = await applyPluginInitLocalAgentTool(sourceTag, config);
+					if (applied !== null && (applied.changedTool || applied.seededProvider)) {
+						log.info(
+							"Plugin init recorded localAgentTool=%s (source %s, previous %s, seededProvider=%s)",
+							applied.tool,
+							sourceTag,
+							applied.previousTool ?? "unset",
+							applied.seededProvider,
+						);
+						// Replacing a tool the user had explicitly configured is a real config
+						// change, so say it out loud — the log line above only reaches
+						// `debug.log`. Filling in an unset value needs no notice.
+						if (applied.changedTool && applied.previousTool !== undefined) {
+							warnings.push(
+								`Recorded ${localAgentToolLabel(applied.tool)} as the local agent for memory generation ` +
+									`(was: ${localAgentToolLabel(applied.previousTool)}). Change it back with ` +
+									`jolli configure --set localAgentTool=${applied.previousTool}`,
+							);
+						}
+					}
+				} catch (error: unknown) {
+					warnings.push(`Could not record the local agent tool for this host: ${(error as Error).message}`);
+				}
 			}
 		}
 
@@ -402,35 +469,62 @@ export async function install(
 				/* v8 ignore stop */
 			}
 			if (repoHooksOnly) {
-				// A plugin skill can only be invoked as `/jolli:<name>`; a BARE `/jolli`
-				// front door has to come from a non-plugin project skill. Write just the
-				// umbrella menu (routing to the plugin's own `/jolli:*` skills) into
-				// .claude/skills/jolli/ and keep it out of `git status`.
-				await installPluginJolliMenu(wt);
-				// The plugin ships recall/search/run as namespaced `/jolli:*` skills,
-				// so the unnamespaced `.claude/skills/jolli-*` a pre-plugin `jolli enable`
-				// wrote are now duplicates in the `/` menu. Delete the Jolli-owned ones
-				// (a user's own same-named skill is left untouched). Ordered after the
-				// umbrella write so the plugin-variant umbrella (which outranks the
-				// standalone menu by revision) reclaims `.claude/skills/jolli/` and can't
-				// be left pointing at a skill this just removed.
-				await removeClaudeLegacySkills(wt);
-				// The plugin never calls updateSkillIfNeeded (below), which is where the
-				// `.agents/skills/` retired-skill sweep normally runs — so do it here too.
-				// Otherwise a repo that ran a full `jolli enable` before a skill was retired
-				// (e.g. `jolli-pr`) keeps exposing the dead `.agents/skills/*` copy to
-				// Codex/Cursor/Gemini after a plugin-only upgrade. Marker-guarded.
+				// The `.agents/skills/` retired-skill sweep is HOST-NEUTRAL and runs for
+				// every plugin host: `.agents/` is the cross-platform skills dir that
+				// Codex/Cursor/Gemini read, and `SKILL_TARGETS` deliberately no longer
+				// includes `.claude/skills/`. The plugin never calls updateSkillIfNeeded
+				// (below), which is where this sweep normally runs — so do it here too,
+				// or a repo that ran a full `jolli enable` before a skill was retired
+				// (e.g. `jolli-pr`) keeps exposing the dead copy after a plugin-only
+				// upgrade. Marker-guarded.
 				await removeRetiredSkills(wt);
-				// UNION (not replace): PluginBootstrapHook re-runs on every plugin
-				// SessionStart and only knows its own umbrella entry. Replacing the
-				// block would shrink a set a prior full `jolli enable` populated,
-				// un-hiding those paths in `git status` and churning the file each
-				// session. `addGitExcludePaths` merges, leaving other entries intact.
-				await addGitExcludePaths(wt, [...PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS]);
-				if (config.claudeEnabled !== false) {
-					const result = await reconcileClaudeAgentHooks(wt);
-					if (wt === projectDir || claudeResult.path === undefined) claudeResult = result;
+				// Everything below is Claude Code's OWN assets, so it is gated on the
+				// host this bootstrap acts for. Installing a Codex plugin must not
+				// modify `.claude/**` — a user with both plugins would otherwise see
+				// the Codex bootstrap rewrite, upgrade or clean Claude-side assets on
+				// every Codex session. The host comes from the source tag, the only
+				// signal that survives both the in-process SessionStart path and the
+				// `run-cli` init path (see pluginBootstrapHost).
+				if (pluginHost === "claude") {
+					// A plugin skill can only be invoked as `/jolli:<name>`; a BARE `/jolli`
+					// front door has to come from a non-plugin project skill. Write just the
+					// umbrella menu (routing to the plugin's own `/jolli:*` skills) into
+					// .claude/skills/jolli/ and keep it out of `git status`.
+					await installPluginJolliMenu(wt);
+					// The plugin ships recall/search/run as namespaced `/jolli:*` skills,
+					// so the unnamespaced `.claude/skills/jolli-*` a pre-plugin `jolli enable`
+					// wrote are now duplicates in the `/` menu. Delete the Jolli-owned ones
+					// (a user's own same-named skill is left untouched). Ordered after the
+					// umbrella write so the plugin-variant umbrella (which outranks the
+					// standalone menu by revision) reclaims `.claude/skills/jolli/` and can't
+					// be left pointing at a skill this just removed.
+					await removeClaudeLegacySkills(wt);
+					// UNION (not replace): PluginBootstrapHook re-runs on every plugin
+					// SessionStart and only knows its own umbrella entry. Replacing the
+					// block would shrink a set a prior full `jolli enable` populated,
+					// un-hiding those paths in `git status` and churning the file each
+					// session. `addGitExcludePaths` merges, leaving other entries intact.
+					await addGitExcludePaths(wt, [...PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS]);
+					if (config.claudeEnabled !== false) {
+						const result = await reconcileClaudeAgentHooks(wt);
+						if (wt === projectDir || claudeResult.path === undefined) claudeResult = result;
+					}
 				}
+				// No `else`: the Codex bootstrap deliberately owns NO skill assets. Codex loads
+				// its skills from the plugin bundle (namespaced `jolli:<name>`) and,
+				// independently, from the repository's `.agents/skills/` — so a repo that also
+				// ran a full `jolli enable` shows both. That is ACCEPTED duplication, not a bug
+				// to clean up. The names do not collide and neither shadows the other (verified
+				// on codex-cli 0.146.0: a repo-local `worktree` and a plugin's `j:worktree`
+				// coexist as separate entries), and `.agents/skills/` is the CROSS-PLATFORM
+				// directory Cursor, Gemini, OpenCode, Windsurf and Copilot read as well.
+				//
+				// An earlier revision removed the repo copies from here to de-duplicate one
+				// host's picker. It took the only copy those other hosts had, silently, and
+				// flapped against every later `jolli enable` — a functional loss traded for a
+				// cosmetic gain. The right fix is to stop shipping the four host-neutral
+				// skills in the bundle at all, not to delete a shared resource on one host's
+				// behalf. Do NOT reintroduce a `.agents/skills/` removal here.
 				continue;
 			}
 			// SKILL.md is written for every enabled target — the cross-platform
@@ -501,10 +595,32 @@ export async function install(
 		// files are machine-wide and shared across every repo, so we write them ONCE
 		// here rather than rewriting the same file on each worktree iteration above.
 		// Detection-gated only.
+		//
+		// ONE host escapes the repo-hooks-only skip: a Codex plugin bootstrap must
+		// register Codex's own global entry, because that entry is the only way the
+		// plugin gets a WORKING MCP server. The plugin ships no `.mcp.json` — a plugin
+		// MCP entry has to pin `cwd` to the plugin root, and the server reads the
+		// repository it serves off its cwd, so such a server answers for the plugin's
+		// cache directory rather than the user's repo (see the codexRegistrar comment
+		// for the measurements, and startMcpServer's guard for the backstop). No
+		// detector is consulted — this code is running inside a Codex session, so Codex
+		// is present by construction, and repo-hooks-only deliberately skips the
+		// filesystem probes to stay fast. Still ONLY codex: a Codex plugin install must
+		// not go writing MCP config for Gemini, Copilot, Cline, Devin or Antigravity.
+		//
+		// Deliberately NOT gated on `!automatic`: the SessionStart bootstrap is exactly
+		// the path that must keep the registration alive, and a user who removed the
+		// entry (or upgraded from a bundle that never wrote it) has no other way to get
+		// it back. The cost is that this runs on EVERY Codex session, which makes
+		// `upsertCodexMcpServer` a hot path over a file that is mostly other tools'
+		// configuration — so that writer short-circuits when the entry already matches
+		// and writes atomically when it does not. Keep it that way before adding
+		// anything else to this call.
+		const codexPluginBootstrap = repoHooksOnly && pluginHost === "codex";
 		await registerGlobalMcpHosts({
 			claude: false,
 			cursor: false,
-			codex: codexDetectedOnce,
+			codex: codexDetectedOnce || codexPluginBootstrap,
 			gemini: geminiDetectedOnce,
 			opencode: opencodePresentOnce,
 			copilot: copilotPresentOnce,
