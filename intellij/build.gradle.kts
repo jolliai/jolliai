@@ -81,7 +81,8 @@ intellijPlatform {
             </p>
             <p>
                 When you work with AI agents like <b>Claude Code</b>, <b>Codex</b>, <b>Gemini</b>,
-                <b>Cursor</b> or <b>Copilot</b>,
+                <b>Cursor</b>, <b>Copilot</b>, <b>Cline</b>, <b>Devin</b>, <b>OpenCode</b> or
+                <b>Antigravity</b>,
                 the reasoning behind every decision lives in the conversation &mdash;
                 <em>why this approach was chosen, what alternatives were considered, what problems came up along the way</em>.
                 The moment you commit, that context is gone. Jolli Memory captures it automatically.
@@ -137,9 +138,10 @@ intellijPlatform {
                     feature touched by ten commits reads as one evolving page. Built incrementally in the background</li>
                 <li><b>Backfill</b> &mdash; write memories for the commits you made before installing Jolli, so your
                     existing history shows up too</li>
-                <li><b>Issue and conversation references</b> &mdash; Linear, Jira, GitHub, Notion and Slack items
-                    mentioned in your AI conversation are captured and attached to the relevant memory, with deep
-                    links back to the source</li>
+                <li><b>Issue, page and conversation references</b> &mdash; Linear, Jira, GitHub, Notion, Slack,
+                    Confluence, Asana, monday.com and Zoom (meetings and docs) items mentioned in your AI
+                    conversation are captured and attached to the relevant memory, with deep links back to the
+                    source, alongside Context7 library-documentation lookups and Jolli's own memory lookups</li>
                 <li><b>Cross-device sync</b> &mdash; a status-bar widget keeps your personal Memory Bank consistent
                     across every device you sign in to</li>
                 <li><b>Create &amp; Update PR</b> &mdash; create or update GitHub PRs via <code>gh</code> CLI with
@@ -184,7 +186,8 @@ intellijPlatform {
 
             <h3>Configuration</h3>
             <p>
-                A five-tab dialog in the tool window (gear icon) covers <b>AI Agents</b> (six toggles: Claude Code, Codex, Gemini, OpenCode, Cursor, Copilot),
+                A five-tab dialog in the tool window (gear icon) covers <b>AI Agents</b> (nine toggles, one per source:
+                Claude Code, Codex, Gemini, OpenCode, Cursor IDE, Devin, GitHub Copilot, Cline, Antigravity),
                 <b>AI Summary</b> (provider &mdash; an Anthropic key, Jolli, or a local agent CLI such as
                 Claude Code, Codex, Cursor, OpenCode, or Kimi Code driven by its own login &mdash; plus model and token budget),
                 <b>Sync to Jolli</b>, <b>Memory Bank</b>

@@ -4,7 +4,7 @@
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort.
 
-When you work with AI agents like Claude Code, Codex, Gemini, Cursor, or Copilot, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+When you work with AI agents like Claude Code, Codex, Gemini, Cursor, Copilot, Cline, Devin, OpenCode, or Antigravity, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 ---
 
@@ -43,7 +43,7 @@ The tool window (right sidebar, titled **JOLLI MEMORY**) opens on a **Current Br
 
 **Memory Bank** is a cross-branch, cross-repo browser of every stored memory on disk, with **Tree** and **Timeline** modes, a search box (Timeline mode), a **Build Knowledge Wiki** action, and per-memory actions.
 
-Two more surfaces sit outside the accordion: a **Status** card (hook state, active sessions, stored-memory counts, connected Jolli Site, detected integrations) toggled from the **Status** icon in the tool window's title bar, and an **onboarding** card shown until the plugin is configured. A dismissible **backfill** card appears at the top of the stack when you enable Jolli in a repo that already has history.
+Two more surfaces sit outside the accordion: a **Status** card (hook state, active sessions, stored-memory counts, connected Jolli Site, detected integrations) toggled from the **Status** icon in the tool window's title bar, and an **onboarding** card shown until the plugin is configured, offering three ways to start: sign in to Jolli, paste an Anthropic API key, or pick a local agent CLI (Claude Code, Codex, Cursor, OpenCode, or Kimi Code) and drive it with its own login, which needs no API key at all. A dismissible **backfill** card appears at the top of the stack when you enable Jolli in a repo that already has history.
 
 ---
 
@@ -69,7 +69,7 @@ Twelve transcript sources are supported. Only two of them install a hook; the re
 
 Gemini's hook records only a session ID and file path. Claude's hook also scans the transcript as you work, to pick up plan files and issue references. The scan-based sources read transcript content too, at commit time to build the summary and on the sidebar's refresh to title recent conversations. All of that is local; see [Privacy](#privacy) for what is sent when a memory is generated.
 
-The plugin's **Settings > AI Agents** tab exposes six toggles: Claude Code, Codex, Gemini, OpenCode, Cursor, and GitHub Copilot. Two cover a pair of sources each: Cursor covers the Composer IDE and the `cursor-agent` CLI, and Copilot covers the CLI and VS Code Chat. Cline, Devin, and Antigravity are detected and tracked, but have no toggle in this plugin yet.
+The plugin's **Settings > AI Agents** tab exposes nine toggles, one per source: Claude Code, Codex, Gemini, OpenCode, Cursor IDE, Devin, GitHub Copilot, Cline, and Antigravity. Three of them cover a pair of sources each: Cursor covers the Composer IDE and the `cursor-agent` CLI, Copilot covers the CLI and VS Code Chat, and Cline covers the CLI and the VS Code extension.
 
 ### Git hooks: generating summaries on commit
 
@@ -109,7 +109,7 @@ Click any commit to open a full memory panel. It shows:
 
 * **Properties**: commit hash, branch, author, date, duration (working days), conversation count, and code change stats
 * **Plans & Notes**: associated plans and notes with edit, remove, and add actions
-* **Issue, page & conversation references**: Linear, Jira, GitHub, Notion, and Slack items referenced in the AI conversation are extracted and rendered as first-class items with a deep link back to the source. They follow the commit through squash and rebase the same way plans and notes do
+* **Issue, page & conversation references**: Linear, Jira, GitHub, Notion, Slack, Confluence, Asana, monday.com and Zoom (meetings and docs) items referenced in the AI conversation are extracted and rendered as first-class items with a deep link back to the source, alongside Context7 library-documentation lookups and Jolli's own memory lookups. They follow the commit through squash and rebase the same way plans and notes do. Extraction is **Claude Code and Codex only** — every other agent's transcript format discards the tool calls this reads
 * **E2E Test Guide**: AI-generated test scenarios with preconditions, steps, and expected results
 * **Source Commits** (for squash/amend): all contributing commits with diff stats and conversation counts
 * **Summaries**: each topic structured as ⚡ **Why This Change** → 💡 **Decisions Behind the Code** → ✅ **What Was Implemented**
@@ -193,8 +193,8 @@ Settings live in two places, and both write to `~/.jolli/jollimemory/config.json
 
 | Tab | What it controls |
 | -- | -- |
-| **AI Agents** | A toggle per source (Claude Code, Codex, Gemini, OpenCode, Cursor, Copilot), plus a **Global Instructions** toggle that controls whether Jolli adds its "prefer these skills" note to your machine-global AI instruction files (`~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`). Off until you turn it on; turning it off removes the note. |
-| **AI Summary** | **Provider** selector (Anthropic / Jolli / Local Agent). The Anthropic card adds the API key, model, and max-output-tokens; the Jolli card shows sign-in state; the Local Agent card picks which locally-installed AI CLI to drive, using its own subscription, so no API key is needed. |
+| **AI Agents** | A toggle per source (Claude Code, Codex, Gemini, OpenCode, Cursor IDE, Devin, GitHub Copilot, Cline, Antigravity), plus a **Global Instructions** toggle that controls whether Jolli adds its "prefer these skills" note to your machine-global AI instruction files (`~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`). Off until you turn it on; turning it off removes the note. |
+| **AI Summary** | **Provider** selector (Anthropic / Jolli / Local Agent). The Anthropic card adds the API key, model, and max-output-tokens; the Jolli card shows sign-in state; the Local Agent card picks which locally-installed AI CLI to drive (**Claude Code**, **Codex**, **Cursor**, **OpenCode**, or **Kimi Code**), using that tool's own subscription login, so no API key is needed. |
 | **Sync to Jolli** | Sign-in state for pushing memories to your Jolli Space, plus a per-repository **Push this repository's memories to Jolli** toggle. Turning it off keeps capturing memory locally while blocking outbound sync for this repo. |
 | **Memory Bank** | The on-disk folder path and sort order for your Markdown copies. |
 | **Others** | Exclude patterns for the Changes list, commit options, telemetry, privacy, and a **Pause** switch that temporarily disables hooks without losing configuration. |

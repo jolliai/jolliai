@@ -48,7 +48,7 @@ Full walkthrough: [Getting started with Jolli Memory](https://docs.jolli.ai/joll
 
 That gives your agent read access to memories you already have. To *record* new ones you still need `jolli` enabled in the repo, since capture runs off git hooks.
 
-Prefer an in-editor panel? The same memories show up in the [VS Code extension](vscode/) and the [JetBrains plugin](intellij/) (preview). Working in Claude Code? The [Claude Code plugin](claude-plugin/) installs the hooks and the MCP server for you, with no npm step. See [Which install is right for me?](#which-install-is-right-for-me) below.
+Prefer an in-editor panel? The same memories show up in the [VS Code extension](vscode/) and the [JetBrains plugin](intellij/) (preview). Working in Claude Code or Codex? The [Claude Code plugin](claude-plugin/) and the [Codex plugin](codex-plugin/) install the hooks and the MCP server for you, with no npm step. See [Which install is right for me?](#which-install-is-right-for-me) below.
 
 > **Before you start**
 > - **Node 22.5+** and a **git repository** (hooks live in `.git/hooks`).
@@ -100,6 +100,7 @@ Behind those questions are ten built-in MCP tools (`search`, `recall`, `get_deci
 | **Cursor, VSCodium, or Windsurf** | the same extension, from [Open VSX](https://open-vsx.org/extension/jolli/jollimemory-vscode) | search "Jolli Memory" in Extensions |
 | **A JetBrains IDE** | the [IntelliJ plugin](intellij/) (preview) | [JetBrains Marketplace](https://plugins.jetbrains.com/), search "Jolli Memory" |
 | **Claude Code, and want it to set itself up** | the [Claude Code plugin](claude-plugin/) | `/plugin marketplace add jolliai/jolli-claude-plugin` then `/plugin install jolli@jolli-marketplace` |
+| **Codex, and want it to set itself up** | the [Codex plugin](codex-plugin/) | `codex plugin add jolli@jolli-marketplace` after adding the marketplace — see [`codex-plugin/`](codex-plugin/) |
 | **Several editors** | the CLI globally, plus each editor plugin. They share the same data. | |
 
 Every surface writes to the same place, so mixing them is fine. The CLI is the only one you need; the editor plugins bundle it and add a panel on top.
@@ -138,7 +139,7 @@ Two more optional plugins install the same way: `@jolli.ai/space-cli` (Jolli Spa
 
 ## Repository layout
 
-Monorepo with four deliverables that share one product model and storage:
+Monorepo with five deliverables that share one product model and storage:
 
 ```
 jolliai/
@@ -146,11 +147,12 @@ jolliai/
 ├── vscode/         VS Code extension (npm workspace)
 ├── intellij/       IntelliJ plugin (Kotlin + Gradle)
 ├── claude-plugin/  Claude Code plugin (bundles the CLI, hooks, and MCP server)
+├── codex-plugin/   Codex plugin (bundles the CLI, hooks, and MCP server)
 ├── package.json    Root workspace config (coordinates cli + vscode)
 └── .nvmrc          Pinned Node version for development
 ```
 
-`cli/` and `vscode/` are npm workspaces coordinated from the root `package.json`. `intellij/` is a separate Gradle project. `claude-plugin/` is built by `npm run build:claude-plugin` and published to a separate marketplace repo.
+`cli/` and `vscode/` are npm workspaces coordinated from the root `package.json`. `intellij/` is a separate Gradle project. `claude-plugin/` and `codex-plugin/` are built by `npm run build:claude-plugin` and `npm run build:codex-plugin`, and each is published to its own marketplace repo.
 
 ### Development quick start
 
@@ -158,7 +160,7 @@ Requires the Node version in `.nvmrc` (currently 24.10.0, which is the developme
 
 ```bash
 npm install
-npm run build        # builds the CLI, the Claude Code plugin, then VS Code
+npm run build        # builds the CLI, the Claude Code plugin, the Codex plugin, then VS Code
 npm run all          # clean, build, lint, test (run this before committing)
 ```
 

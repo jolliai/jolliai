@@ -4,7 +4,7 @@
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort.
 
-When you work with AI agents like Claude Code, Codex, Gemini, Antigravity, OpenCode, Cursor IDE (Composer), Cursor CLI (`cursor-agent`), GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+When you work with AI agents like Claude Code, Codex, Gemini, Antigravity, OpenCode, Cursor IDE (Composer), Cursor CLI (`cursor-agent`), GitHub Copilot CLI, VS Code Copilot Chat, Cline (VS Code extension and CLI), or Devin CLI, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 **Why teams pick it:**
 
@@ -292,7 +292,7 @@ Jolli Memory feeds prior development context back into your AI agent so it can p
 
 **Automatic briefing** — every time a new Claude Code session starts, a `SessionStartHook` injects a lightweight briefing (~300–500 tokens) into the conversation: branch name, commit count, date range, and last commit message. If it has been more than 3 days since the last commit, it suggests running the full recall command. This runs in under 200 ms and never blocks session startup.
 
-**Full recall** — run `/jolli-recall` inside Claude Code (or any agent that supports it) to load the complete branch history: summaries, plans, decisions, and file-change statistics (default budget ≈ 50,000 tokens; pass `--budget` on the underlying `jolli recall` to adjust). The agent then reports what the branch is implementing, key technical decisions, what was last worked on, and the main files involved — so you can continue without re-reading the code.
+**Full recall** — run `/jolli-recall` inside Claude Code (or any agent that supports it) to load the complete branch history: summaries, plans, decisions, and file-change statistics (default budget 20,000 tokens; pass `--budget` on the underlying `jolli recall` to adjust). The agent then reports what the branch is implementing, key technical decisions, what was last worked on, and the main files involved — so you can continue without re-reading the code.
 
 If the current branch has no memories, the command shows a catalog of branches that do, letting you pick one to recall. You can also pass a branch name or keyword as an argument (e.g. `/jolli-recall auth-refactor`).
 
@@ -321,6 +321,10 @@ Most settings live behind the gear icon in the view's title bar. `authToken` is 
 | `openCodeEnabled` | boolean | auto-detect | Enable OpenCode session discovery (reads OpenCode's SQLite via the host's built-in `node:sqlite`) |
 | `cursorEnabled` | boolean | auto-detect | Enable Cursor IDE (Composer) session discovery |
 | `copilotEnabled` | boolean | auto-detect | Enable GitHub Copilot CLI **and** VS Code Copilot Chat session discovery (single shared switch) |
+| `clineEnabled` | boolean | auto-detect | Enable Cline session discovery (VS Code extension **and** the Cline CLI) |
+| `devinEnabled` | boolean | auto-detect | Enable Devin CLI session discovery (requires Node 22.5+) |
+| `antigravityEnabled` | boolean | auto-detect | Enable Antigravity session discovery (requires Node 22.5+) |
+| `mcpPlatformToolsEnabled` | boolean | `true` | When signed in, surface your Jolli tenant's own platform tools in the MCP server alongside the ten built-in tools. Set to `false` to expose only the built-ins. |
 | `localFolder` | string | — | Memory Bank folder root — every memory is dual-written here as Markdown alongside the orphan-branch copy. Set via Settings → Memory Bank → Browse…. |
 | `excludePatterns` | string[] | — | Glob patterns for hiding files from the Changes section in the Branch tab |
 | `syncTranscripts` | boolean | `false` | When syncing, also mirror raw conversation transcripts (not just summaries) into the personal vault. Off by default so transcripts stay local unless you opt in. |
@@ -330,7 +334,7 @@ Most settings live behind the gear icon in the view's title bar. `authToken` is 
 
 ## Summary Format
 
-Each memory uses a **v3 tree structure**: a single commit can cover multiple independent topics, and commits related through amend/squash operations form parent-child trees.
+A plain commit's memory is written as a **v3 tree**: a single commit can cover multiple independent topics, and commits related through amend/squash operations form parent-child trees. Amend and squash roots, and any memory you **Regenerate**, are normalized to **v4**, which hoists the authoritative topics, recap, plans, notes, references and skills onto the root so a consumer never has to walk the children to read them. Both versions carry the same topic fields.
 
 ```json
 {

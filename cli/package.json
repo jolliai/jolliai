@@ -1,7 +1,7 @@
 {
 	"name": "@jolli.ai/cli",
 	"version": "0.99.10",
-	"description": "AI development process auto-documentation tool - generates structured commit summaries from Claude Code, Codex, Gemini, OpenCode, Cursor, and Copilot sessions",
+	"description": "Automatic development memory for AI coding agents: turns your Claude Code, Codex, Gemini, Cursor, Copilot, Cline, Devin, OpenCode and Antigravity sessions into structured commit summaries your agent can recall over MCP",
 	"main": "./dist/Api.js",
 	"types": "./dist/Api.d.ts",
 	"type": "module",
@@ -58,10 +58,18 @@
 		"codex",
 		"gemini",
 		"opencode",
+		"kimi",
 		"cursor",
 		"copilot",
+		"cline",
+		"devin",
+		"antigravity",
 		"commit-summary",
-		"dev-memory"
+		"dev-memory",
+		"agent-memory",
+		"persistent-memory",
+		"recall",
+		"context-engineering"
 	],
 	"author": "Jolli",
 	"license": "Apache-2.0",

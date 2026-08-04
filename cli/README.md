@@ -4,7 +4,7 @@ The `@jolli.ai/cli` package has two main uses:
 
 ## 1. Jolli Memory — automatic AI session summaries
 
-Turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort. When you work with AI agents like Claude Code, Codex, Gemini, Antigravity, OpenCode, Cursor IDE (Composer), Cursor CLI (`cursor-agent`), GitHub Copilot CLI, or VS Code Copilot Chat, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+Turns your AI coding sessions into structured development documentation attached to every commit, without any extra effort. When you work with AI agents like Claude Code, Codex, Gemini, Antigravity, OpenCode, Cursor IDE (Composer), Cursor CLI (`cursor-agent`), GitHub Copilot CLI, VS Code Copilot Chat, Cline (VS Code extension and CLI), or Devin CLI, the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were considered, what problems came up along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 **Why teams pick it:**
 
@@ -130,7 +130,7 @@ jolli enable
 jolli status
 ```
 
-> **Prefer Claude Code?** Jolli also ships as a **Claude Code plugin** that packages the git hooks, the `jollimemory` MCP server, and the `/jolli` skills — add it from the plugin marketplace and it installs the same repo hooks (`jolli enable --repo-hooks-only`) without a separate CLI setup. Install surfaces (CLI, VS Code, and the plugin) compete on version, so whichever is newest drives your hooks.
+> **Prefer Claude Code or Codex?** Jolli also ships as a **Claude Code plugin** and a **Codex plugin**, each packaging the git hooks, the `jollimemory` MCP server, and the Jolli skills — add one from its plugin marketplace and it installs the same repo hooks (`jolli enable --repo-hooks-only`) without a separate CLI setup. On Codex the MCP tools are registered by the bootstrap rather than the manifest, so they become available from your second session onward. Install surfaces (CLI, VS Code, and the plugins) compete on version, so whichever is newest drives your hooks.
 
 ## Quick Start
 
@@ -534,7 +534,7 @@ Config file `apiKey` takes precedence over the environment variable. Running `jo
 
 ## Summary Format
 
-Each summary uses a **v3 tree structure**. A single commit can cover multiple independent topics, and commits related through amend/squash operations form parent-child trees:
+A plain commit's summary is written as a **v3 tree**. A single commit can cover multiple independent topics, and commits related through amend/squash operations form parent-child trees. Amend and squash roots, and any regenerated summary, are normalized to **v4**, which hoists the authoritative topics, recap, plans, notes, references and skills onto the root so a consumer never has to walk the children to read them. Both versions carry the same topic fields:
 
 ```json
 {
@@ -568,7 +568,7 @@ Each summary uses a **v3 tree structure**. A single commit can cover multiple in
 
 ## VSCode Extension
 
-The [Jolli Memory VS Code Extension](https://marketplace.visualstudio.com/items?itemName=jolli.jollimemory-vscode) adds a sidebar with three tabs (Branch / Memory Bank / Status) and a per-commit Summary Webview, plus a 5-tab Settings page. If you have both the CLI and the extension installed, they share the same data — the extension bundles the CLI inline so it works whether or not a global CLI install is also present.
+The [Jolli Memory VS Code Extension](https://marketplace.visualstudio.com/items?itemName=jolli.jollimemory-vscode) adds a sidebar with a **Current Branch / Memory Bank** view switch (plus a Status overlay) and a per-commit Summary Webview, plus a 5-tab Settings page. If you have both the CLI and the extension installed, they share the same data — the extension bundles the CLI inline so it works whether or not a global CLI install is also present.
 
 ## Plugins
 
