@@ -190,6 +190,13 @@ describe("track / initTelemetry", () => {
 		expect(e.eventId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
 	});
 
+	it("tags the session env=sandbox from an injected env, overriding a prod origin", async () => {
+		initTelemetry(baseInit({ env: { JOLLI_TELEMETRY_ENV: "sandbox" } }));
+		track("recall_performed", { hit: true });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.env).toBe("sandbox");
+	});
+
 	it("omits sessionId when none is provided", async () => {
 		initTelemetry(baseInit());
 		track("search_performed");

@@ -63,7 +63,7 @@ object Telemetry {
                 installId = installId,
                 sessionId = sessionId,
                 surfaceVersion = surfaceVersion,
-                env = resolveEnv(origin),
+                env = resolveEnv(origin, env),
             )
     }
 
@@ -174,8 +174,15 @@ object Telemetry {
         return digest.joinToString("") { "%02x".format(it) }.take(length)
     }
 
-    /** Derive `env` from the resolved jolli origin via the host allowlist. */
-    fun resolveEnv(origin: String?): String {
+    /**
+     * Derive `env` from the resolved jolli origin via the host allowlist.
+     *
+     * `JOLLI_TELEMETRY_ENV=sandbox` overrides the origin logic: E2B sandboxes set
+     * it so their telemetry self-tags as `env="sandbox"` and can be excluded
+     * downstream. Mirrors the CLI's `resolveTelemetryEnv` (kept in lockstep).
+     */
+    fun resolveEnv(origin: String?, env: Map<String, String> = System.getenv()): String {
+        if (env["JOLLI_TELEMETRY_ENV"] == "sandbox") return "sandbox"
         if (origin.isNullOrEmpty()) return "unknown"
         val host =
             try {

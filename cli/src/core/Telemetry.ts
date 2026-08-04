@@ -84,7 +84,7 @@ export function initTelemetry(init: TelemetryInit): void {
 		sessionId: init.sessionId,
 		surface,
 		surfaceVersion,
-		env: resolveTelemetryEnv(init.origin),
+		env: resolveTelemetryEnv(init.origin, init.env),
 	};
 }
 
