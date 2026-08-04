@@ -27,16 +27,17 @@ vi.mock("./util/Logger.js", () => ({
 
 import { JolliMemoryBridge } from "./JolliMemoryBridge.js";
 
+// NO per-file `vi.setConfig({ testTimeout, hookTimeout })` here, deliberately.
+//
 // The shared `beforeEach` below spawns real `git` subprocesses (init, config,
-// commit) and is file-scoped, so it applies across every `describe` block in
-// this file — a describe-level `{ timeout }` option would only cover the one
-// describe it wraps, not this hook. Under v8 coverage instrumentation plus a
-// large parallel suite, that subprocess chain can occasionally take longer
-// than Vitest's 5s/10s defaults, which is a load signal, not a correctness
-// one. Bump both timeouts file-wide so the suite stays robust under load
-// without hiding an actual hang (45s is far beyond any real subprocess
-// latency).
-vi.setConfig({ testTimeout: 45_000, hookTimeout: 45_000 });
+// commit), and under v8 coverage instrumentation plus the full parallel suite
+// that chain gets CPU-starved — a load signal, not a correctness one. The
+// timeouts that cover it live in `vitest.config.ts` (60s for both), and
+// `vi.setConfig` REPLACES those rather than widening them: the 45s this file
+// used to set was a CLAMP, so it timed out at 45s inside a suite the config had
+// already given 60s, and only in a full run — green in isolation, which reads
+// exactly like a flake. Tune the config file if this ever needs more; a value
+// here can only ever take time away.
 
 let repoDir: string;
 

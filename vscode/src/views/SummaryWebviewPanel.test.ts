@@ -5619,13 +5619,12 @@ describe("SummaryWebviewPanel", () => {
 				expect(meterArg.conversationTokens).toBe(710);
 			});
 
-			it("warns the user when a lost summary write leaves the token figures permanently stale", async () => {
+			it("warns the user when both the summary write and the self-heal that follows it fail", async () => {
 				// Files first, summary second — so a summary-write failure leaves the sessions
-				// gone from disk while the memory still counts their tokens. That is not
-				// recoverable: a retry finds nothing to remove (plain ack), the subtrahend was
-				// only readable while the sessions were still in the files, and Regenerate
-				// carries `conversationTokens` over verbatim. Logging it and posting a clean ack
-				// reported the operation as fully successful; the user must be told.
+				// gone from disk while the memory still counts their tokens. The panel then
+				// re-derives the figures from the surviving transcripts (see the self-heal test
+				// below); this is the case where that write fails too, and the user must be told
+				// rather than shown a clean ack for a memory whose figures stayed stale.
 				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
 				mockReadTranscriptsForCommits.mockResolvedValue(
 					new Map([
@@ -5659,7 +5658,14 @@ describe("SummaryWebviewPanel", () => {
 				} as ReturnType<typeof makeSummary>;
 				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
 				// Nothing is emptied, so the correction takes the rescue `storeSummary` path.
-				mockStoreSummary.mockRejectedValueOnce(new Error("orphan-write lock timeout"));
+				// Both writes fail — the correction's and the self-heal's that follows it — as
+				// they would while something else holds the orphan write lock. Two `…Once`s
+				// rather than a blanket `mockRejectedValue`: the latter survives
+				// `vi.clearAllMocks()` (which resets calls, not implementations) and would
+				// fail every later test in the file.
+				mockStoreSummary
+					.mockRejectedValueOnce(new Error("orphan-write lock timeout"))
+					.mockRejectedValueOnce(new Error("orphan-write lock timeout"));
 				const dispatch = captureMessageHandler();
 
 				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
@@ -5828,6 +5834,590 @@ describe("SummaryWebviewPanel", () => {
 				expect(written.conversationTokenBreakdown).toEqual({ input: 60, output: 150, cached: 500 });
 				expect(written.transcripts).toEqual([]);
 				expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			});
+
+			it("self-heals the figures from the surviving transcripts when the summary write fails", async () => {
+				// The unrecoverable window: the files have already lost the session, so the
+				// subtrahend is gone and a retry finds nothing to remove. Deriving from what is
+				// LEFT needs no subtrahend, so the correction is recoverable after all — the
+				// same 710 the subtraction would have produced, reached from the other side.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const detached = {
+					sessionId: "s1",
+					source: "claude" as const,
+					entries: [{ role: "human" as const, content: "A" }],
+					usage: { input: 40, output: 50, cached: 200 },
+				};
+				const kept = {
+					sessionId: "keep",
+					source: "claude" as const,
+					entries: [{ role: "human" as const, content: "K" }],
+					usage: { input: 60, output: 150, cached: 500 },
+					usageByModel: [
+						{ model: "claude-opus-5", provider: "anthropic" as const, input: 60, output: 150, cached: 500 },
+					],
+				};
+				mockReadTranscriptsForCommits
+					// The detach's own read still sees both sessions…
+					.mockResolvedValueOnce(new Map([["abc123", { sessions: [detached, kept] }]]))
+					// …and the self-heal's read sees the file the batch already rewrote.
+					.mockResolvedValue(new Map([["abc123", { sessions: [kept] }]]));
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 1000,
+					conversationTokenBreakdown: { input: 100, output: 200, cached: 700 },
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				// The correction's own write is lost; the self-heal's write lands.
+				mockStoreSummary.mockRejectedValueOnce(new Error("orphan-write lock timeout"));
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(written.conversationTokens).toBe(710);
+				expect(written.conversationTokenBreakdown).toEqual({ input: 60, output: 150, cached: 500 });
+				// Healed, so the user gets the meter rather than a warning about stale figures.
+				expect(showWarningMessage).not.toHaveBeenCalled();
+				const ack = postMessage.mock.calls
+					.map((c) => c[0])
+					.find((m: { command?: string }) => m?.command === "conversationDetached");
+				expect(ack.tokenMeterHtml).toBe('<div class="tmeter">meter</div>');
+			});
+
+			it("recomputeUsage derives the figures from the stored transcripts and swaps the meter", async () => {
+				// The manual escape hatch for a figure that is already stale — a detach whose
+				// summary write was lost, or a memory written before the per-response dedup fix
+				// (median 2.13× inflation). Nothing else in the product could repair either.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "keep",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "K" }],
+										usage: { input: 60, output: 150, cached: 500 },
+										usageByModel: [
+											{ model: "claude-opus-5", provider: "anthropic" as const, input: 60, output: 150, cached: 500 },
+										],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 2130,
+					conversationTokenBreakdown: { input: 128, output: 320, cached: 1682 },
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(written.conversationTokens).toBe(710);
+				expect(written.conversationTokenBreakdown).toEqual({ input: 60, output: 150, cached: 500 });
+				const ack = postMessage.mock.calls
+					.map((c) => c[0])
+					.find((m: { command?: string }) => m?.command === "usageRecomputed");
+				expect(ack.tokenMeterHtml).toBe('<div class="tmeter">meter</div>');
+			});
+
+			it("recomputeUsage strips the figures and the dangling id when the transcript file is gone", async () => {
+				// The other half of a lost detach write: the file that became empty was
+				// deleted, but the id it was listed under — and the tokens it contributed —
+				// are still on the summary. Both are corrected in one write.
+				mockGetTranscriptHashes.mockResolvedValue(new Set());
+				mockReadTranscriptsForCommits.mockResolvedValue(new Map());
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 710,
+					conversationTokenBreakdown: { input: 60, output: 150, cached: 500 },
+					estimatedCostUsd: 3.5,
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				// Absent, not zero: "this memory reports no usage" is the display contract, and
+				// a stored 0 renders as a real measurement of nothing.
+				expect(written.conversationTokens).toBeUndefined();
+				expect(written.estimatedCostUsd).toBeUndefined();
+				expect(written.transcripts).toEqual([]);
+				expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			});
+
+			it("recomputeUsage leaves a legacy summary's figures alone when a commit has no transcript file", async () => {
+				// A pre-v5 summary has no id list — `getTranscriptIds` walks commit hashes, and
+				// most commits never had an AI session. Reading those absences as "the file was
+				// deleted" would zero out every legacy memory's usage on one button press.
+				mockGetTranscriptHashes.mockResolvedValue(new Set());
+				mockReadTranscriptsForCommits.mockResolvedValue(new Map());
+				const summary = {
+					...makeSummary(),
+					version: 4,
+					transcripts: undefined,
+					conversationTokens: 710,
+					conversationTokenBreakdown: { input: 60, output: 150, cached: 500 },
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				// And says nothing was read, rather than "already match" — which would claim
+				// the figures were verified against evidence that was never there.
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("no archived conversations"),
+				);
+			});
+
+			it("recomputeUsage writes nothing and says so when the figures already match", async () => {
+				// Idempotence is what lets this be a button a user can press twice. A no-op that
+				// silently did nothing would read as a broken button, so it reports instead.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "keep",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "K" }],
+										usage: { input: 60, output: 150, cached: 500 },
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 710,
+					conversationTokenBreakdown: { input: 60, output: 150, cached: 500 },
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("already match"),
+				);
+			});
+
+			it("recomputeUsage reports the conversations it could not derive from", async () => {
+				// Forward-only: one session with no recorded usage makes the whole node
+				// unusable, and the user is told which conversations blocked it rather than
+				// being shown a figure derived from partial evidence.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{ sessionId: "legacy", source: "claude" as const, entries: [{ role: "human" as const, content: "L" }] },
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 2130,
+					conversationTokenBreakdown: { input: 128, output: 320, cached: 1682 },
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("no recorded per-conversation usage"),
+				);
+			});
+
+			it("recomputeUsage derives a child-listed transcript the root index omits", async () => {
+				// Evidence is gathered from every node's id list, not the root's index alone:
+				// attribution is per node, so a child-listed id that went unread would leave
+				// that child skipped — the shape the detach path already rescues around.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["child-t1"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"child-t1",
+							{
+								sessions: [
+									{
+										sessionId: "keep",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "K" }],
+										usage: { input: 1, output: 2, cached: 3 },
+									},
+								],
+							},
+						],
+					]),
+				);
+				const child = {
+					...makeSummary(),
+					commitHash: "child1",
+					version: 5,
+					transcripts: ["child-t1"],
+					conversationTokens: 2130,
+					conversationTokenBreakdown: { input: 128, output: 320, cached: 1682 },
+				} as ReturnType<typeof makeSummary>;
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: [],
+					children: [child],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(written.children?.[0].conversationTokens).toBe(6);
+				expect(written.children?.[0].conversationTokenBreakdown).toEqual({ input: 1, output: 2, cached: 3 });
+			});
+
+			it("recomputeUsage reports a dangling-id cleanup that changed no figure", async () => {
+				// The write happened even though the figures already matched, so "already
+				// match" alone would hide that the memory was modified and make the
+				// Conversations card losing a row look like a bug.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "keep",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "K" }],
+										usage: { input: 60, output: 150, cached: 500 },
+									},
+								],
+							},
+						],
+					]),
+				);
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123", "gone-t2"],
+					conversationTokens: 710,
+					conversationTokenBreakdown: { input: 60, output: 150, cached: 500 },
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(written.transcripts).toEqual(["abc123"]);
+				expect(written.conversationTokens).toBe(710);
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Dropped 1 stale conversation reference"),
+				);
+			});
+
+			it("recomputeUsage says a transcript could not be READ rather than that it records no usage", async () => {
+				// Two different facts about the memory: an unreadable archive may be fixable on
+				// this machine, while a readable one with no recorded usage never will be.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(new Map());
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 710,
+					conversationTokenBreakdown: { input: 60, output: 150, cached: 500 },
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
+				expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("could not be read"));
+			});
+
+			it("recomputeUsage drops a dangling id that only a CHILD lists", async () => {
+				// The malformed shape a lost detach write leaves: the root's index is empty
+				// while a child still claims an id whose file is gone. Filtering the root alone
+				// stripped the child's figures and left the dead id on disk, so the next press
+				// found the figures already correct and reported "already match" forever.
+				mockGetTranscriptHashes.mockResolvedValue(new Set<string>());
+				mockReadTranscriptsForCommits.mockResolvedValue(new Map());
+				const child = {
+					...makeSummary(),
+					commitHash: "child1",
+					version: 5,
+					transcripts: ["gone-t1"],
+					conversationTokens: 2130,
+					conversationTokenBreakdown: { input: 128, output: 320, cached: 1682 },
+				} as ReturnType<typeof makeSummary>;
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: [],
+					children: [child],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(written.children?.[0].transcripts).toEqual([]);
+				expect(written.children?.[0].conversationTokens).toBeUndefined();
+				// One write, not a recompute write followed by a rescue write.
+				expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			});
+
+			it("recomputeUsage leaves a child's version alone when filtering its transcript ids", async () => {
+				// Only the array is rewritten: a descendant's `version` records the schema it
+				// was written under, and the v5 migration never stamps descendants. Bumping it
+				// here would claim a migration that didn't run.
+				mockGetTranscriptHashes.mockResolvedValue(new Set<string>());
+				mockReadTranscriptsForCommits.mockResolvedValue(new Map());
+				const child = {
+					...makeSummary(),
+					commitHash: "child1",
+					version: 4,
+					transcripts: ["gone-t1"],
+					conversationTokens: 2130,
+					conversationTokenBreakdown: { input: 128, output: 320, cached: 1682 },
+				} as ReturnType<typeof makeSummary>;
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: [],
+					children: [child],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(written.children?.[0].version).toBe(4);
+				expect(written.version).toBe(5);
+			});
+
+			it("recomputeUsage says figures were PARTLY updated when one node derived and another skipped", async () => {
+				// `skipped` and `changed` co-occur on a tree with two owner nodes. Reporting
+				// only "left as they are" contradicts the meter the user watches change
+				// underneath the toast.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["root-t1", "child-t1"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"root-t1",
+							{
+								sessions: [
+									{
+										sessionId: "keep",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "K" }],
+										usage: { input: 1, output: 2, cached: 3 },
+									},
+								],
+							},
+						],
+						[
+							"child-t1",
+							{
+								sessions: [
+									{
+										sessionId: "legacy",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "L" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const child = {
+					...makeSummary(),
+					commitHash: "child1",
+					version: 5,
+					transcripts: ["child-t1"],
+					conversationTokens: 2130,
+					conversationTokenBreakdown: { input: 128, output: 320, cached: 1682 },
+				} as ReturnType<typeof makeSummary>;
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["root-t1", "child-t1"],
+					conversationTokens: 999,
+					conversationTokenBreakdown: { input: 100, output: 200, cached: 699 },
+					children: [child],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(written.conversationTokens).toBe(6);
+				// The child kept its stored figures — that is the share the toast must not
+				// claim was updated.
+				expect(written.children?.[0].conversationTokens).toBe(2130);
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("partly updated"),
+				);
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("the share covering it was left as it is"),
+				);
+			});
+
+			it("recomputeUsage reports a dangling drop alongside a skipped conversation", async () => {
+				// The two facts are independent, so the skipped-branch toast has to carry the
+				// dropped-reference note too — otherwise a press that modified the memory
+				// reports only "left as they are".
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "legacy",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "L" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const child = {
+					...makeSummary(),
+					commitHash: "child1",
+					version: 5,
+					transcripts: ["gone-t1"],
+					conversationTokens: 2130,
+					conversationTokenBreakdown: { input: 128, output: 320, cached: 1682 },
+				} as ReturnType<typeof makeSummary>;
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: ["abc123"],
+					conversationTokens: 2130,
+					conversationTokenBreakdown: { input: 128, output: 320, cached: 1682 },
+					children: [child],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "recomputeUsage" });
+				await flushPromises();
+
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("no recorded per-conversation usage"),
+				);
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("Dropped 1 stale conversation reference"),
+				);
+			});
+
+			it("detach drops a child-listed transcript id when the root index omits it", async () => {
+				// Detach shares the same helper, so the child-only shape must clear there too:
+				// otherwise the summary keeps referencing a transcript file the batch deleted.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				mockReadTranscriptsForCommits.mockResolvedValue(
+					new Map([
+						[
+							"abc123",
+							{
+								sessions: [
+									{
+										sessionId: "s1",
+										source: "claude" as const,
+										entries: [{ role: "human" as const, content: "A" }],
+									},
+								],
+							},
+						],
+					]),
+				);
+				const child = {
+					...makeSummary(),
+					commitHash: "child1",
+					version: 5,
+					transcripts: ["abc123"],
+				} as ReturnType<typeof makeSummary>;
+				const summary = {
+					...makeSummary(),
+					version: 5,
+					transcripts: [],
+					children: [child],
+				} as ReturnType<typeof makeSummary>;
+				await SummaryWebviewPanel.show(summary, extensionUri, workspaceRoot, stubBridge, mainBranch);
+				mockStoreSummary.mockClear();
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "conversationDetach", hash: "abc123", sessionId: "s1", source: "claude" });
+				await flushPromises();
+
+				const written = mockStoreSummary.mock.calls.at(-1)?.[0] as CommitSummary;
+				expect(written.children?.[0].transcripts).toEqual([]);
 			});
 
 			it("openConversation opens the archived transcript in a read-only ConversationDetailsPanel", async () => {
@@ -11552,6 +12142,34 @@ describe("SummaryWebviewPanel", () => {
 				expect(mockStoreSummary).not.toHaveBeenCalled();
 			});
 
+			it("filters a GRANDCHILD's transcript ids and leaves unrelated nodes by reference", async () => {
+				// The removal walks the whole tree because the shape it is called on is the one
+				// where the root index is NOT the tree-wide list it is supposed to be. Nodes
+				// that list nothing to remove keep their identity, so the write carries no
+				// gratuitous churn and the caller's reference check stays meaningful.
+				await openPanel();
+				const panel = firstCommitPanel<{
+					persistTranscriptIdRemoval(
+						summary: CommitSummary,
+						idsToRemove: ReadonlySet<string>,
+					): Promise<CommitSummary>;
+				}>();
+				const grandchild = makeSummary({ commitHash: "gc", version: 5, transcripts: ["dead", "live"] });
+				const sibling = makeSummary({ commitHash: "sib", version: 5, transcripts: ["live"], children: [] });
+				const parent = makeSummary({ commitHash: "p", version: 5, transcripts: ["live"], children: [grandchild] });
+				const summary = makeSummary({ version: 5, transcripts: ["live"], children: [parent, sibling] });
+				mockStoreSummary.mockClear();
+
+				const result = await panel.persistTranscriptIdRemoval(summary, new Set(["dead"]));
+
+				expect(result.children?.[0].children?.[0].transcripts).toEqual(["live"]);
+				// The parent itself listed nothing to drop — only its `children` field is new.
+				expect(result.children?.[0].transcripts).toEqual(["live"]);
+				expect(result.children?.[1]).toBe(sibling);
+				expect(result.transcripts).toEqual(["live"]);
+				expect(mockStoreSummary).toHaveBeenCalledTimes(1);
+			});
+
 			describe("no-summary early returns", () => {
 				it("editRecap returns early when currentSummary is null", async () => {
 					const dispatch = await openPanelThenClearSummary();
@@ -12579,6 +13197,35 @@ describe("SummaryWebviewPanel", () => {
 				// own foreign guard is exercised.
 				await instance.handleConversationDetach("abc123", "s1", "claude");
 
+				expect(showInformationMessage).toHaveBeenCalledWith(
+					expect.stringContaining("disabled"),
+				);
+			});
+
+			it("handleRecomputeUsage denies a foreign-repo panel at the handler level", async () => {
+				await SummaryWebviewPanel.show(
+					makeSummary(),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
+					"other-repo",
+					"https://github.com/x/foreign.git",
+				);
+				const instance = (
+					SummaryWebviewPanel as unknown as {
+						currentMemoryPanel: { handleRecomputeUsage: () => Promise<void> };
+					}
+				).currentMemoryPanel;
+				mockStoreSummary.mockClear();
+
+				// Direct call bypasses the dispatch-level foreign gate so the handler's own
+				// guard is exercised: the recompute writes to the orphan branch, which for a
+				// foreign-origin memory would be the WRONG repo's branch.
+				await instance.handleRecomputeUsage();
+
+				expect(mockStoreSummary).not.toHaveBeenCalled();
 				expect(showInformationMessage).toHaveBeenCalledWith(
 					expect.stringContaining("disabled"),
 				);

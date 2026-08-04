@@ -223,6 +223,31 @@ describe("subtractDetachedUsage", () => {
 		expect(result.summary.children?.[0].children?.[0].conversationTokens).toBe(260);
 	});
 
+	it("subtracts at the child a v5-migrated root merely indexes", () => {
+		// `SchemaV5Migration.upgradeOneSummary` lists every descendant commit hash on the
+		// ROOT and leaves the children without a `transcripts` field, so the root is the
+		// sole claimant of an id whose sessions a child's token fields cover. Attributing
+		// by claim alone would apply the subtraction to a root that carries no usage —
+		// silently dropping the correction while reporting nothing.
+		const childHash = "c".repeat(40);
+		const child = node({
+			commitHash: childHash,
+			conversationTokens: 1000,
+			conversationTokenBreakdown: { input: 400, output: 300, cached: 300 },
+		});
+		const summary = node({ transcripts: [childHash], children: [child] });
+
+		const result = subtractDetachedUsage(
+			summary,
+			removed(childHash, [{ usage: { input: 400, output: 0, cached: 0 } }]),
+		);
+
+		expect(result.changed).toBe(true);
+		expect(result.unattributed).toEqual([]);
+		expect(result.summary.children?.[0].conversationTokens).toBe(600);
+		expect(result.summary.conversationTokens).toBeUndefined();
+	});
+
 	it("reports an id two siblings both claim rather than subtracting it from both", () => {
 		// Ambiguous ownership: `mergeManyToOne` dedups ids at the squash root but cannot
 		// stop two source commits from carrying the same id (its own comment allows for

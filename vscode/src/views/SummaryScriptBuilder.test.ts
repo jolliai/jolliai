@@ -507,6 +507,27 @@ describe("SummaryScriptBuilder", () => {
 			expect(script).toContain("el.style.width = el.dataset.pct + '%'");
 		});
 
+		it("wires the recompute button to post recomputeUsage", () => {
+			expect(script).toContain("recomputeUsageBtn");
+			expect(script).toContain("command: 'recomputeUsage'");
+		});
+
+		it("re-binds the recompute button inside initTokenMeter so a swapped meter keeps it live", () => {
+			// The button sits inside .tmeter-head, so an outerHTML swap replaces the node and
+			// drops its listener. initTokenMeter is the re-init hook both swap paths already
+			// call — binding anywhere else leaves a dead button after the first recompute.
+			const initBody = script.slice(
+				script.indexOf("function initTokenMeter("),
+				script.indexOf("initTokenMeter(document);"),
+			);
+			expect(initBody).toContain("recomputeUsageBtn");
+		});
+
+		it("swaps the meter on usageRecomputed through the same helper as the detach ack", () => {
+			expect(script).toContain("msg.command === 'usageRecomputed'");
+			expect(script).toContain("function swapTokenMeter(");
+		});
+
 		it("wires the .tok-help button to toggle .pinned on its .tok-help-wrap", () => {
 			expect(script).toContain(".tok-help");
 			expect(script).toContain("closest('.tok-help-wrap')");

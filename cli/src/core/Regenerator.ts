@@ -1,5 +1,6 @@
 import { createLogger } from "../Logger.js";
 import type { CommitSummary, LlmConfig, Reference, ReferenceCommitRef } from "../Types.js";
+import { type RecomputeSession, recomputeConversationUsage } from "./ConversationUsageRecompute.js";
 import { getDiffContent } from "./GitOps.js";
 import { escapeForAttr, escapeForText } from "./PromptXmlEscape.js";
 import { truncate } from "./references/ReferenceExtractor.js";
@@ -15,7 +16,7 @@ import {
 	readReferenceFromBranch,
 	readTranscriptsForCommits,
 } from "./SummaryStore.js";
-import { getTranscriptIds } from "./SummaryTree.js";
+import { resolveTranscriptIdsForUsage } from "./SummaryTree.js";
 import { buildMultiSessionContext, type SessionTranscript } from "./TranscriptReader.js";
 
 const log = createLogger("Regenerator");
@@ -36,7 +37,13 @@ export interface RegenerateResult {
  * that callers pass to `storeSummary(_, _, true)` (force=true).
  *
  * Fields replaced:        topics, recap, diffStats, transcriptEntries,
- *                         conversationTurns, llm, generatedAt
+ *                         conversationTurns, llm, generatedAt, and — where the
+ *                         stored transcripts carry enough evidence to derive them —
+ *                         the conversation usage group (conversationTokens,
+ *                         conversationTokenBreakdown, conversationModels,
+ *                         estimatedCostUsd, pricesAsOf). See
+ *                         `recomputeConversationUsage`; without complete evidence
+ *                         the stored figures are preserved.
  * Fields preserved:       ticketId, e2eTestGuide, plans, notes, references,
  *                         commitType, commitSource, jolliDocUrl, jolliDocId,
  *                         orphanedDocIds, unresolvedOrphanHashes, everything
@@ -89,10 +96,17 @@ export async function regenerateSummary(
 	// fallback in resolveStorage — without it the LLM would see an empty
 	// conversation on every regenerate in folder-only mode.
 	//
-	// v5 schema: `getTranscriptIds` returns `summary.transcripts` (the v5
-	// authoritative ID array) when present, else falls back to walking
-	// children for v3/v4 data — both forms read correctly.
-	const transcriptIds = getTranscriptIds(normalized);
+	// v5 schema: the union of every node's `transcripts` array, falling back to
+	// walking children for v3/v4 data — both forms read correctly.
+	//
+	// The union (`resolveTranscriptIdsForUsage`) rather than the root's index alone
+	// (`getTranscriptIds`) because this read is now also the EVIDENCE for the usage
+	// derivation below, which attributes per node: a child-listed id the root index
+	// omits would leave that child skipped, i.e. unrepairable on the one path that
+	// rebuilds everything else. It is a superset on every well-formed v5 tree and
+	// equal to the old value on all the others, so the conversation fed to the LLM
+	// can only gain the sessions a malformed index was hiding.
+	const transcriptIds = resolveTranscriptIdsForUsage(normalized);
 	const transcriptMap = await readTranscriptsForCommits(transcriptIds, cwd, storage);
 	const sessions: SessionTranscript[] = [];
 	for (const stored of transcriptMap.values()) {
@@ -160,7 +174,27 @@ export async function regenerateSummary(
 		summaryError: undefined,
 	};
 
-	return { updated, result };
+	// Re-derive the conversation token/cost figures from the transcripts just read,
+	// rather than carrying the stored aggregate over with the spread above. Regenerate
+	// rebuilds every other field from the archive, and the stored aggregate can be
+	// wrong in two ways nothing else repairs: inflated by the pre-dedup counting bug,
+	// or left stale by a detach whose summary write failed after the files had already
+	// changed. `recomputeConversationUsage` is forward-only — a node with any
+	// usage-less session, or a transcript this read did not return, keeps its stored
+	// figures untouched (see that module's header), so legacy memories are unaffected.
+	//
+	// The evidence deliberately does NOT map a listed-but-unread id to `[]`: on this
+	// path a missing entry means "readTranscriptsForCommits didn't return it", which is
+	// indistinguishable from an unreadable file, and treating it as "the file is gone"
+	// would strip usage the memory still has.
+	const sessionsByTranscriptId = new Map<string, ReadonlyArray<RecomputeSession>>();
+	for (const [id, stored] of transcriptMap) sessionsByTranscriptId.set(id, stored.sessions);
+	const recomputed = recomputeConversationUsage(updated, sessionsByTranscriptId);
+	if (recomputed.skipped.length > 0) {
+		log.debug("Regenerate: kept stored usage figures for transcript(s) %s", recomputed.skipped.join(", "));
+	}
+
+	return { updated: recomputed.summary, result };
 }
 
 // ─── Prompt-block reconstruction from orphan-branch archives ────────────────

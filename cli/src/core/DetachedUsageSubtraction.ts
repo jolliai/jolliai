@@ -16,36 +16,24 @@
  * each carry their own token fields, so a session detached from a child must be
  * subtracted from that child — subtracting at the root would corrupt a node that
  * never carried those tokens while leaving the one that did untouched (and the
- * tree aggregation in `SummaryTree.ts` walks both).
+ * tree aggregation in `SummaryTree.ts` walks both). Which node owns an id is NOT
+ * readable off `summary.transcripts` (on a consolidated root that array is a
+ * tree-wide index, not an ownership record); it is resolved structurally by
+ * {@link resolveTranscriptOwnership}, whose header carries the full rationale and
+ * the v5-migration case. Each id is subtracted exactly once, at its owner.
  *
- * `summary.transcripts` is NOT that per-node ownership record, which is why
- * ownership is resolved by {@link resolveOwners} rather than read off the field.
- * The array means two different things depending on where it sits:
- *   - on a leaf — the ids whose sessions this node's token fields cover;
- *   - on a consolidated root — the tree-wide authoritative INDEX. Amend
- *     (`QueueWorker`'s `amendTranscripts` = inherited ∪ delta), rebase-pick
- *     (`migrateOneToOne`) and squash (`mergeManyToOne`, union over children) all
- *     re-list every descendant id at the root so `getTranscriptIds` finds every
- *     file — while the root's token fields cover its DELTA only (amend/pick), or
- *     nothing at all (squash).
- * A node therefore OWNS an id only when no descendant claims it, and each id must
- * be subtracted exactly once, at that owner.
+ * Deliberately forward-only. A removed session with no stored `usage` (written
+ * before the field existed, or a source that reports no usage) and an id with no
+ * single owner are both reported as unattributable and left EXACTLY as-is.
+ * Guessing a subtrahend — splitting the aggregate evenly, zeroing the node, or
+ * subtracting from every node that lists the id — would replace a known-stale
+ * number with an invented one.
  *
- * Deliberately forward-only. A node with no `transcripts` array (pre-v5), a
- * removed session with no stored `usage` (written before the field existed, or a
- * source that reports no usage), and an id with no single owner are all reported
- * as unattributable and left EXACTLY as-is. Guessing a subtrahend — splitting the
- * aggregate evenly, zeroing the node, or subtracting from every node that lists
- * the id — would replace a known-stale number with an invented one.
- *
- * One case ownership resolution deliberately does NOT special-case: a v5-MIGRATED
- * legacy tree, where `upgradeOneSummary` puts every descendant commit hash on the
- * root's `transcripts` and leaves the children without the field at all — so the
- * root is the sole claimant of an id whose sessions a child counted. Nothing is
- * mis-subtracted in practice because those transcript files predate
- * `StoredSession.usage` (migration rewrites the schema, not transcript content), so
- * every session there is unattributable and the subtrahend is zero. If a path ever
- * backfills `usage` onto legacy transcripts, attribute by `commitHash` here first.
+ * A subtraction is a one-shot correction: it can only run while the detached
+ * sessions are still readable, and it cannot repair an aggregate that was already
+ * wrong (pre-dedup inflation). {@link recomputeConversationUsage} derives the same
+ * figures from the surviving transcripts instead, and is what heals a memory whose
+ * detach write failed after the files had already changed.
  */
 
 import type {
@@ -56,6 +44,7 @@ import type {
 	SkillUsage,
 } from "../Types.js";
 import { estimateCostUsd, PRICES_AS_OF } from "./Pricing.js";
+import { resolveTranscriptOwnership } from "./TranscriptOwnership.js";
 
 /** One detached session's persisted attribution, as read back off the stored transcript. */
 export interface DetachedSessionUsage {
@@ -88,39 +77,6 @@ export interface DetachedUsageSubtractionResult {
 	 * partial case corrects part of the total and reports the rest.
 	 */
 	readonly unattributed: ReadonlyArray<string>;
-}
-
-/**
- * Finds, for each id of interest, the node(s) that OWN it — list it and have no
- * descendant that lists it. See the header on why the field alone can't say this.
- *
- * Post-order so a node only becomes an owner once its whole subtree has had the
- * chance to claim the id. The returned set is what the caller's subtree claimed,
- * restricted to `interest` so an unrelated tree-wide index costs nothing to walk.
- *
- * Sibling claimants both land in the list (neither is the other's descendant, so
- * there is no deepest one); the caller treats that ambiguity as unattributable
- * rather than subtracting twice.
- */
-function resolveOwners(
-	node: CommitSummary,
-	interest: ReadonlySet<string>,
-	owners: Map<string, CommitSummary[]>,
-): Set<string> {
-	const claimedBelow = new Set<string>();
-	for (const child of node.children ?? []) {
-		for (const id of resolveOwners(child, interest, owners)) claimedBelow.add(id);
-	}
-	const claimed = new Set(claimedBelow);
-	for (const id of node.transcripts ?? []) {
-		if (!interest.has(id)) continue;
-		claimed.add(id);
-		if (claimedBelow.has(id)) continue;
-		const existing = owners.get(id);
-		if (existing) existing.push(node);
-		else owners.set(id, [node]);
-	}
-	return claimed;
 }
 
 /**
@@ -258,7 +214,7 @@ function subtractFromNode(node: CommitSummary, removed: ReadonlyArray<DetachedSe
  * how the aggregate figures are handled, and for a structural reason rather than
  * convenience. `conversationTokens` is a scalar sum with no record of who
  * contributed what, so subtracting it at two nodes would remove the same tokens
- * twice; that is what {@link resolveOwners} exists to prevent. A skill's
+ * twice; that is what {@link resolveTranscriptOwnership} exists to prevent. A skill's
  * `usageBySession` is an explicit map, so correcting it is a key DELETION —
  * idempotent, and impossible to over-apply.
  *
@@ -321,8 +277,9 @@ function subtractSkillUsage(node: CommitSummary, detachedKeys: ReadonlySet<strin
 
 /**
  * Applies `removedByTranscriptId` across the summary tree, subtracting each id's
- * share exactly once — at the single node that OWNS it (see {@link resolveOwners}
- * and the module header on why a node listing an id doesn't mean it owns it).
+ * share exactly once — at the single node that OWNS it (see
+ * {@link resolveTranscriptOwnership} and the module header on why a node listing an
+ * id doesn't mean it owns it).
  *
  * @param removedByTranscriptId - Detached sessions keyed by the id of the stored
  *   transcript they were removed from (the same id space as
@@ -342,8 +299,10 @@ export function subtractDetachedUsage(
 	// Two passes rather than one because a node cannot tell whether it owns an id
 	// until its descendants have been inspected, and a consolidated root is visited
 	// first.
-	const owners = new Map<string, CommitSummary[]>();
-	resolveOwners(summary, new Set(removedByTranscriptId.keys()), owners);
+	const { ownerById, unresolved: unownedIds } = resolveTranscriptOwnership(
+		summary,
+		new Set(removedByTranscriptId.keys()),
+	);
 
 	// Skill correction is keyed on session identity, not on transcript ownership, so
 	// it is collected across the whole removal map at once. See subtractSkillUsage
@@ -355,22 +314,20 @@ export function subtractDetachedUsage(
 		}
 	}
 
-	// Keyed by node identity — `walk` below receives the very objects `resolveOwners`
-	// recorded, since it reads children off the untouched input tree.
+	// Keyed by node identity — `walk` below receives the very objects the ownership
+	// resolver recorded, since it reads children off the untouched input tree.
 	const byOwner = new Map<CommitSummary, DetachedSessionUsage[]>();
+	// No owner: either the summary and the transcript files disagree about what
+	// belongs to this memory, or ownership is ambiguous (sibling claimants). Neither
+	// is guessable, so report and correct nothing — see `resolveTranscriptOwnership`.
+	for (const id of unownedIds) unattributed.add(id);
 	for (const [id, sessions] of removedByTranscriptId) {
-		const claimants = owners.get(id) ?? [];
-		// Zero claimants: the summary and the transcript files disagree about what
-		// belongs to this memory. More than one: ambiguous ownership (see
-		// `resolveOwners`). Neither is guessable, so report and correct nothing.
-		if (claimants.length !== 1) {
-			unattributed.add(id);
-			continue;
-		}
+		const owner = ownerById.get(id);
+		if (owner === undefined) continue;
 		if (!sumRemoved(sessions).fullyAttributable) unattributed.add(id);
-		const bucket = byOwner.get(claimants[0]);
+		const bucket = byOwner.get(owner);
 		if (bucket) bucket.push(...sessions);
-		else byOwner.set(claimants[0], [...sessions]);
+		else byOwner.set(owner, [...sessions]);
 	}
 
 	const walk = (node: CommitSummary): CommitSummary => {

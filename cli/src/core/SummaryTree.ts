@@ -303,6 +303,47 @@ export function getTranscriptIds(summary: CommitSummary): ReadonlyArray<string> 
 }
 
 /**
+ * Every transcript id LISTED anywhere in the tree — the union over each node's
+ * own `transcripts` array, root included. Empty for a pre-v5 tree, where no node
+ * carries the field.
+ *
+ * Distinct from {@link getTranscriptIds} on purpose. That one answers "which ids
+ * does this summary advertise", and on a v5 root it stops at the root's index —
+ * which is the right answer for display, and for any caller that trusts the
+ * "a consolidated root re-lists every descendant id" invariant.
+ *
+ * This one answers "which ids does any node in this tree claim", which is what a
+ * caller must ask when it is about to REWRITE per-node figures: attribution is
+ * resolved per node (see `TranscriptOwnership`), so evidence gathered from the
+ * root index alone would silently miss a child-listed id and leave that child
+ * unrepairable — the exact failure shape the id lists can be in after a lost
+ * write, i.e. when the repair is needed most.
+ */
+export function collectListedTranscriptIds(summary: CommitSummary): ReadonlyArray<string> {
+	const ids = new Set<string>();
+	const walk = (node: CommitSummary): void => {
+		for (const id of node.transcripts ?? []) ids.add(id);
+		for (const child of node.children ?? []) walk(child);
+	};
+	walk(summary);
+	return [...ids];
+}
+
+/**
+ * The ids a usage-correcting caller must READ: every id any node lists, falling
+ * back to {@link getTranscriptIds} when the tree lists none (a pre-v5 tree, whose
+ * ids are commit hashes, and a v5 root whose index is legitimately empty).
+ *
+ * A superset of `getTranscriptIds` on every well-formed v5 tree, and equal to it
+ * on all the others — see {@link collectListedTranscriptIds} for why the root
+ * index alone is not enough on the write side.
+ */
+export function resolveTranscriptIdsForUsage(summary: CommitSummary): ReadonlyArray<string> {
+	const listed = collectListedTranscriptIds(summary);
+	return listed.length > 0 ? listed : getTranscriptIds(summary);
+}
+
+/**
  * Like `getTranscriptIds`, but for the WRITE side: when materializing an
  * authoritative v5 `transcripts` array from a (possibly legacy) summary, the
  * legacy tree-walk must be filtered to IDs that actually have a backing

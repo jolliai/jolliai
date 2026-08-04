@@ -101,6 +101,36 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
         if (!wasPinned) { wrap.classList.add('pinned'); }
       });
     });
+    // Re-derive figures from the archived conversations. Bound here rather than once
+    // at load because the button lives inside .tmeter-head: an outerHTML swap of the
+    // meter replaces the node and drops any listener bound to the old one, so the
+    // second press of the button would do nothing.
+    var recalc = scope.querySelector('#recomputeUsageBtn');
+    if (recalc) {
+      recalc.addEventListener('click', function() {
+        vscode.postMessage({ command: 'recomputeUsage' });
+      });
+    }
+  }
+  // Replaces the meter in place and re-inits the new node. Shared by every path that
+  // corrects the figures (detach ack, recompute reply) so they cannot drift on the
+  // re-init step, which is what keeps a swapped meter from rendering as an empty bar
+  // with dead buttons.
+  //
+  // outerHTML is safe here specifically: the html is composed host-side by
+  // buildTokenMeter from numeric aggregates and literal strings only — no summary
+  // text, path, or other repo content reaches it. Do not extend this to markup
+  // carrying commit/user strings.
+  function swapTokenMeter(html) {
+    if (typeof html !== 'string' || html === '') { return; }
+    var meterEl = document.querySelector('.tmeter');
+    if (!meterEl) { return; }
+    meterEl.outerHTML = html;
+    // Re-init scoped to the REPLACED meter, not the whole document: the help button
+    // gets its click listener bound per element, so re-scanning document-wide would
+    // hand a second listener to every other pinnable popover on the page and each
+    // click would toggle it twice (net no-op).
+    initTokenMeter(document.querySelector('.tmeter'));
   }
   initTokenMeter(document);
   document.addEventListener('click', function() {
@@ -2435,26 +2465,17 @@ ${buildSourceLabelScript()}
       // The detached conversation's tokens no longer belong to this memory, so
       // the meter is rebuilt host-side and swapped in with the row removal
       // rather than left showing the pre-detach total until the panel reopens.
-      // Absent when the host could not attribute the removed usage (memories
-      // written before per-session usage was recorded) — the meter then stays
-      // as-is, which is the honest reading of "we don't know".
-      if (typeof msg.tokenMeterHtml === 'string' && msg.tokenMeterHtml !== '') {
-        var meterEl = document.querySelector('.tmeter');
-        if (meterEl) {
-          // outerHTML is safe here specifically: tokenMeterHtml is composed
-          // host-side by buildTokenMeter from numeric aggregates and literal
-          // strings only — no summary text, path, or other repo content reaches
-          // it. Do not extend this to markup carrying commit/user strings.
-          meterEl.outerHTML = msg.tokenMeterHtml;
-          // Re-init scoped to the REPLACED meter, not the whole document: the help
-          // button gets its click listener bound per element, so re-scanning
-          // document-wide would hand a second listener to every other pinnable
-          // popover on the page and each click would toggle it twice (net no-op).
-          // Only .tmeter carries .tok-help today, but the scope keeps that from
-          // becoming a trap the next time one is added elsewhere.
-          initTokenMeter(document.querySelector('.tmeter'));
-        }
-      }
+      // Absent when the host could neither attribute the removed usage nor
+      // re-derive the figures (memories with a session that records no usage) —
+      // the meter then stays as-is, which is the honest reading of "we don't know".
+      swapTokenMeter(msg.tokenMeterHtml);
+    }
+    if (msg.command === 'usageRecomputed') {
+      // Manual re-derive finished and changed something. Only the meter moved, so
+      // the panel is not rebuilt (that would collapse scroll position and every
+      // expanded section). No message arrives when nothing changed — the host says
+      // so with a notification instead.
+      swapTokenMeter(msg.tokenMeterHtml);
     }
     if (msg.command === 'transcriptStatsLoaded') {
       if (conversationsStats) {

@@ -125,6 +125,63 @@ describe("regenerateSummary", () => {
 		);
 	});
 
+	it("re-derives conversation usage from the stored transcripts rather than carrying the stored figures", async () => {
+		// Pre-dedup memories are inflated (one response counted once per transcript
+		// line). Regenerate already rebuilds every other field from the archive, so
+		// carrying the aggregate over verbatim left the token bar permanently wrong
+		// with no way for the user to fix it.
+		const inflated: CommitSummary = {
+			...baseSummary,
+			conversationTokens: 5000,
+			conversationTokenBreakdown: { input: 1000, output: 2000, cached: 2000 },
+		};
+		vi.mocked(SummaryStore.readTranscriptsForCommits).mockResolvedValue(
+			new Map([
+				[
+					baseSummary.commitHash,
+					{
+						sessions: [
+							{
+								...storedTranscript.sessions[0],
+								usage: { input: 10, output: 20, cached: 30 },
+								usageByModel: [
+									{
+										model: "claude-opus-5",
+										provider: "anthropic" as const,
+										input: 10,
+										output: 20,
+										cached: 30,
+									},
+								],
+							},
+						],
+					},
+				],
+			]),
+		);
+
+		const { updated } = await regenerateSummary(inflated, "/repo", config);
+
+		expect(updated.conversationTokens).toBe(60);
+		expect(updated.conversationTokenBreakdown).toEqual({ input: 10, output: 20, cached: 30 });
+		expect(updated.estimatedCostUsd).toBeGreaterThan(0);
+	});
+
+	it("keeps the stored figures when a stored session reports no usage", async () => {
+		// Forward-only: a transcript written before per-session usage existed cannot be
+		// summed, and deriving from it would zero out usage the memory legitimately has.
+		const legacy: CommitSummary = {
+			...baseSummary,
+			conversationTokens: 5000,
+			conversationTokenBreakdown: { input: 1000, output: 2000, cached: 2000 },
+		};
+
+		const { updated } = await regenerateSummary(legacy, "/repo", config);
+
+		expect(updated.conversationTokens).toBe(5000);
+		expect(updated.conversationTokenBreakdown).toEqual({ input: 1000, output: 2000, cached: 2000 });
+	});
+
 	it("clears summaryError marker on successful regenerate", async () => {
 		const stale: CommitSummary = {
 			...baseSummary,

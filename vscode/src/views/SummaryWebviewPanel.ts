@@ -22,6 +22,10 @@ import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import { execFileSyncHidden } from "../../../cli/src/util/Subprocess.js";
 import {
+	type RecomputeSession,
+	recomputeConversationUsage,
+} from "../../../cli/src/core/ConversationUsageRecompute.js";
+import {
 	type DetachedSessionUsage,
 	subtractDetachedUsage,
 } from "../../../cli/src/core/DetachedUsageSubtraction.js";
@@ -129,7 +133,7 @@ import { ConversationDetailsPanel } from "./ConversationDetailsPanel.js";
 import { buildPanelTitle, collectSortedTopics, formatActiveProviderLabel } from "./SummaryUtils.js";
 import type { RegenerateContext } from "../../../cli/src/core/RegenerateContext.js";
 import { isSummaryError } from "../../../cli/src/core/SummaryErrorMarker.js";
-import { getTranscriptIds } from "../../../cli/src/core/SummaryTree.js";
+import { getTranscriptIds, resolveTranscriptIdsForUsage } from "../../../cli/src/core/SummaryTree.js";
 import type { LlmConfig } from "../../../cli/src/Types.js";
 
 const SHARE_KINDS = new Set<ShareKind>(["branch", "commit"]);
@@ -293,6 +297,13 @@ type WebviewMessage =
 			sessionId: string;
 			source: TranscriptSource;
 	  }
+	/**
+	 * Re-derives this memory's token / cost figures from its archived transcripts.
+	 * The user-reachable escape hatch for a figure that has gone stale — a detach
+	 * whose summary write was lost, or any other drift from the per-session usage the
+	 * transcripts record. Idempotent, so pressing it twice is harmless.
+	 */
+	| { command: "recomputeUsage" }
 	| { command: "translatePlan"; slug: string }
 	| { command: "editRecap"; recap: string }
 	| { command: "generateRecap" }
@@ -1106,6 +1117,9 @@ export class SummaryWebviewPanel {
 					this.handleConversationDetach(message.hash, message.sessionId, message.source),
 					"Detach conversation failed",
 				);
+				break;
+			case "recomputeUsage":
+				this.catchAndShow(this.handleRecomputeUsage(), "Recompute token figures failed");
 				break;
 			case "openConversation":
 				this.handleOpenConversation(message.sessionId, message.source).catch((err: unknown) => {
@@ -4350,9 +4364,9 @@ export class SummaryWebviewPanel {
 						? await this.persistTranscriptIdRemoval(summaryToPersist, new Set(deletes))
 						: summaryToPersist;
 				// A same-reference return means the id filter was a no-op and
-				// `persistTranscriptIdRemoval` wrote NOTHING — which happens when the root's
-				// `transcripts` list is empty because a CHILD node claims the detached id (the
-				// helper only inspects the root). The correction then still owes its own write;
+				// `persistTranscriptIdRemoval` wrote NOTHING — which happens when no node in the
+				// tree lists the detached id at all (a legacy summary whose file-backed set is
+				// empty, or a v5 tree whose arrays never named it). The correction still owes a write;
 				// without this the panel would publish a correction that never reached disk.
 				// Only the correction needs that rescue write: a no-op id filter with no
 				// correction to carry has nothing to persist.
@@ -4363,21 +4377,27 @@ export class SummaryWebviewPanel {
 				usageChanged = correctedSummary !== undefined;
 			} catch (err) {
 				log.warn(
-					"Detach succeeded but the summary could not be updated — transcript ids may dangle and the meter stays stale: %s",
+					"Detach succeeded but the summary could not be updated — transcript ids may dangle and the meter is stale; re-deriving from the surviving transcripts: %s",
 					err instanceof Error ? err.message : String(err),
 				);
-				// Surface it. The write is not retried and the outcome is NOT recoverable:
-				// the sessions are already gone from the transcript files, so a second attempt
-				// finds nothing to remove (`removedAny` false → plain ack) and the subtrahend
-				// this run held in memory is unrecoverable — `subtractDetachedUsage` is fed
+				// The subtraction this run held in memory is now unrecoverable: it was fed
 				// from the removed sessions' own stored `usage`, which is only readable while
-				// they are still in the files. Regenerate does not help either: it carries
-				// `conversationTokens` over verbatim (see Regenerator) rather than recomputing
-				// from transcripts. So the figures stay permanently high by the detached
-				// conversation's share, and a log line the user never opens is not an honest
-				// way to report that. The row is still acked below — the files really did
-				// change, and leaving the row on screen would only invite that no-op retry.
-				if (correctedSummary) {
+				// they are still in the files, and a retry finds nothing to remove
+				// (`removedAny` false → plain ack). Deriving the figures from the sessions
+				// that are LEFT needs no subtrahend, so it recovers the same correction from
+				// the other side — and it doubles as the fix for the dangling ids, since the
+				// heal writes the filtered id list too.
+				const healed = await this.selfHealUsageAfterFailedDetach();
+				if (healed) {
+					usageChanged = true;
+				} else if (correctedSummary) {
+					// Nothing else can repair it now: the heal is forward-only, so a memory
+					// with a usage-less archived session (pre-v5 file, or a source that
+					// reports none) legitimately has no derivable figure. The figures stay
+					// high by the detached conversation's share, and a log line the user
+					// never opens is not an honest way to report that. The row is still
+					// acked below — the files really did change, and leaving the row on
+					// screen would only invite that no-op retry.
 					vscode.window.showWarningMessage(
 						"Conversation detached, but this memory's token and cost figures could not be updated — they still include the detached conversation. See the Jolli Memory log for details.",
 					);
@@ -4398,13 +4418,276 @@ export class SummaryWebviewPanel {
 			// meter in place instead of rebuilding the whole panel (which would collapse
 			// scroll position and expanded sections for a single-row change). Omitted
 			// when nothing was attributable — the meter then keeps its current value.
-			...(usageChanged && this.currentSummary && { tokenMeterHtml: buildTokenMeter(this.currentSummary) }),
+			// `showRecompute` matches what the initial render emitted: this handler only
+			// runs on a writable panel (foreign is denied above), so the replacement
+			// markup must carry the action too or the swap would silently drop the button.
+			...(usageChanged &&
+				this.currentSummary && { tokenMeterHtml: buildTokenMeter(this.currentSummary, { showRecompute: true }) }),
 		});
 	}
 
 	/**
-	 * Removes the given transcript IDs from `summary.transcripts` and persists
-	 * the updated summary via `storeSummary(force=true)`. Returns the new
+	 * Re-derives this memory's conversation token / cost figures from the transcript
+	 * files that are on the orphan branch right now, and persists the result.
+	 *
+	 * A derivation rather than an adjustment, which is what makes it usable as both a
+	 * self-heal and a user-pressable button: it needs no record of what changed, and
+	 * running it on already-correct figures writes nothing (see
+	 * `recomputeConversationUsage`, which is idempotent and forward-only — a node
+	 * whose evidence is incomplete keeps its stored figures).
+	 *
+	 * Dangling ids (listed by a v5 summary, no file on disk) are dropped in the SAME
+	 * write. They are the other half of a lost detach write, so healing the figures
+	 * without them would leave the memory referencing transcripts that no longer exist.
+	 */
+	private async recomputeAndPersistUsage(): Promise<{
+		changed: boolean;
+		skipped: ReadonlyArray<string>;
+		/**
+		 * The subset of `skipped` that was skipped for lack of a readable transcript
+		 * rather than for lack of recorded usage in one. Two different facts about the
+		 * memory, so the caller reports them differently.
+		 */
+		unread: ReadonlyArray<string>;
+		/** Stale transcript ids dropped from the summary by this run. */
+		danglingRemoved: number;
+		/**
+		 * How many transcripts the derivation had to read. Zero means there was nothing
+		 * to derive FROM — distinct from "derived and unchanged", which is why the caller
+		 * can tell the user which of the two happened.
+		 */
+		evidenceCount: number;
+	}> {
+		const summary = this.currentSummary;
+		if (!summary) {
+			return { changed: false, skipped: [], unread: [], danglingRemoved: 0, evidenceCount: 0 };
+		}
+		const { evidence, danglingIds, unreadIds } = await this.readUsageEvidence(summary);
+		const recomputed = recomputeConversationUsage(summary, evidence);
+		const unread = recomputed.skipped.filter((id) => unreadIds.has(id));
+		if (!recomputed.changed && danglingIds.size === 0) {
+			return {
+				changed: false,
+				skipped: recomputed.skipped,
+				unread,
+				danglingRemoved: 0,
+				evidenceCount: evidence.size,
+			};
+		}
+
+		const persisted =
+			danglingIds.size > 0
+				? await this.persistTranscriptIdRemoval(recomputed.summary, danglingIds)
+				: recomputed.summary;
+		// Same rescue write the detach path needs, and here it is the ONLY write path for
+		// the common case: with no dangling ids there is no removal to fold the correction
+		// into, so `persisted` is the un-persisted recompute. It also covers a removal that
+		// turned out to be a no-op (no node listed any dangling id).
+		if (recomputed.changed && persisted === recomputed.summary) {
+			await this.bridge.storeSummary(recomputed.summary, true);
+		}
+		this.currentSummary = persisted;
+		await this.refreshTranscriptHashes(persisted);
+		return {
+			changed: recomputed.changed,
+			skipped: recomputed.skipped,
+			unread,
+			// Counted off the WRITE, not off `danglingIds`: a same-reference return means no
+			// node listed any of them, so reporting a removal would tell the user about a
+			// write that never happened. Now that the filter walks the whole tree, every id
+			// the read side saw listed does get dropped, so the count is exact rather than an
+			// upper bound on what the root happened to carry.
+			danglingRemoved: persisted !== recomputed.summary ? danglingIds.size : 0,
+			evidenceCount: evidence.size,
+		};
+	}
+
+	/**
+	 * Reads the transcript files this memory references and shapes them into
+	 * `recomputeConversationUsage` evidence: transcript id → the sessions that file
+	 * holds right now.
+	 *
+	 * Read failures are deliberately NOT swallowed here. `refreshTranscriptHashes`
+	 * falls back to an empty set because an incomplete list only under-renders the
+	 * panel; here the same fallback would look exactly like "every transcript file is
+	 * gone" and the recompute would strip usage the memory still has. The caller
+	 * aborts on a throw instead.
+	 *
+	 * The ids come from `resolveTranscriptIdsForUsage` — the union over every node's
+	 * `transcripts` array, not the root's index alone. The derivation attributes per
+	 * node, so an id only a CHILD lists would otherwise go unread and that child would
+	 * be skipped; the detach path already treats "root index empty, child claims the
+	 * id" as a shape that occurs (see its rescue write), which is precisely when a
+	 * repair is being asked for.
+	 *
+	 * A **v5** id with no file on disk maps to `[]`: that id list is authoritative and
+	 * file-backed by construction, so an absent file means the transcript really was
+	 * deleted (a detach that emptied it) — the case the self-heal exists for. That
+	 * inference assumes detach is the only writer that can leave the pair
+	 * inconsistent, which holds because every other path writes the files BEFORE the
+	 * id list; a future path that writes the id list first would make an absent file
+	 * mean "never written", and mapping it to `[]` would then strip usage the memory
+	 * legitimately has. On a legacy summary the same absence means nothing at all,
+	 * since the ids are commit hashes there and most commits never had an AI session;
+	 * those ids are left OUT of the evidence, so their owner keeps its stored figures
+	 * instead of being zeroed.
+	 *
+	 * @returns `unreadIds` — ids that were listed but produced no evidence (no file on
+	 *   a legacy summary, or a file that could not be parsed). Their owners keep their
+	 *   stored figures, and the caller words its report on "could not read" rather than
+	 *   on "records no usage", which is a different fact about the memory.
+	 */
+	private async readUsageEvidence(summary: CommitSummary): Promise<{
+		evidence: Map<string, ReadonlyArray<RecomputeSession>>;
+		danglingIds: Set<string>;
+		unreadIds: Set<string>;
+	}> {
+		const ids = resolveTranscriptIdsForUsage(summary);
+		const fileIds = await this.bridge.getTranscriptHashes();
+		const present = ids.filter((id) => fileIds.has(id));
+		const danglingIds = new Set(summary.transcripts !== undefined ? ids.filter((id) => !fileIds.has(id)) : []);
+		const transcripts = await this.bridge.readTranscriptsForCommits(present);
+
+		const evidence = new Map<string, ReadonlyArray<RecomputeSession>>();
+		for (const id of danglingIds) evidence.set(id, []);
+		for (const id of present) {
+			const stored = transcripts.get(id);
+			// An unreadable or unparsable file is "unknown", never "empty" — omitting it
+			// makes its owner skip, storing `[]` would wipe that owner's figures.
+			if (stored) evidence.set(id, stored.sessions);
+		}
+		const unreadIds = new Set(ids.filter((id) => !evidence.has(id)));
+		return { evidence, danglingIds, unreadIds };
+	}
+
+	/**
+	 * Last-resort recovery for the detach failure that used to be permanent (the
+	 * transcript files already changed, the summary write was lost). Never throws: it
+	 * runs inside the detach's own failure handler, whose next step is to warn the
+	 * user, so a second failure must not replace that warning with an error toast.
+	 *
+	 * @returns true when the figures were re-derived and persisted.
+	 */
+	private async selfHealUsageAfterFailedDetach(): Promise<boolean> {
+		try {
+			const outcome = await this.recomputeAndPersistUsage();
+			if (outcome.changed) {
+				log.info("SummaryPanel", "Detach: token figures re-derived from the surviving transcripts");
+			} else if (outcome.skipped.length > 0) {
+				log.info(
+					"SummaryPanel",
+					`Detach: cannot re-derive token figures — ${
+						outcome.unread.length > 0 ? "unreadable transcript(s)" : "no recorded per-session usage"
+					} for: ${outcome.skipped.join(", ")}`,
+				);
+			}
+			return outcome.changed;
+		} catch (err) {
+			log.warn(
+				"SummaryPanel",
+				`Detach: re-deriving the token figures failed too, figures stay stale: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			);
+			return false;
+		}
+	}
+
+	/**
+	 * The manual entry point behind the token meter's recompute button: re-derives the
+	 * figures on demand for a memory whose numbers are already stale — a detach whose
+	 * summary write was lost before the self-heal existed, or any other drift between
+	 * the stored aggregate and the per-session usage the transcripts record. No other
+	 * path repairs those without also re-running the LLM (regenerate).
+	 *
+	 * It does NOT repair the pre-dedup inflated history: those memories predate
+	 * `StoredSession.usage` entirely, so there is nothing to derive from and the button
+	 * reports exactly that (see `ConversationUsageRecompute`'s header).
+	 *
+	 * Always reports an outcome. A silent no-op reads as a broken button, and a partial
+	 * derivation the user isn't told about reads as a settled figure.
+	 */
+	private async handleRecomputeUsage(): Promise<void> {
+		if (this.foreignRepoName) {
+			this.notifyForeignDenied("recomputeUsage");
+			return;
+		}
+		// Same stale-commit guard the transcript write handlers use: after an
+		// amend/rebase this panel's hashes point at the orphaned tree, and writing
+		// would correct the wrong commit's figures.
+		if (!(await this.ensureCommitNotRewritten("recompute token figures"))) {
+			return;
+		}
+
+		const outcome = await this.recomputeAndPersistUsage();
+		// Appended to whichever branch reports, not owned by one: a dangling-id drop is a
+		// write the user must hear about even when the headline is "some conversations were
+		// skipped". Unreachable in the `evidenceCount === 0` branch, since dangling ids are
+		// themselves evidence entries (mapped to `[]`).
+		const droppedNote =
+			outcome.danglingRemoved > 0
+				? ` Dropped ${outcome.danglingRemoved} stale conversation reference${
+						outcome.danglingRemoved === 1 ? "" : "s"
+					}.`
+				: "";
+		if (outcome.skipped.length > 0) {
+			log.info("SummaryPanel", `Recompute: figures left as-is for transcript(s): ${outcome.skipped.join(", ")}`);
+			const count = outcome.skipped.length;
+			const plural = count === 1 ? "" : "s";
+			// Two distinct reasons, reported as such: an unreadable archive is a
+			// this-machine problem the user may be able to fix, while a readable archive
+			// with no recorded usage is a permanent property of when the memory was
+			// written. Collapsing both into "carries no recorded usage" told the user the
+			// wrong thing about half of them.
+			const subject =
+				outcome.unread.length > 0
+					? `${count} archived conversation${plural} on this memory could not be read`
+					: `${count} archived conversation${plural} on this memory ${
+							count === 1 ? "carries" : "carry"
+						} no recorded per-conversation usage`;
+			// A tree can skip one owner node and still re-derive another, so `skipped` and
+			// `changed` co-occur. Reporting only "left as they are" then contradicts the meter
+			// the user watches change underneath the toast — the figures WERE updated, just
+			// not the share these conversations account for.
+			void vscode.window.showInformationMessage(
+				`${
+					outcome.changed
+						? `Token and cost figures were partly updated: ${subject}, so the share covering ${
+								count === 1 ? "it" : "them"
+							} was left as it is.`
+						: `${subject}, so its token and cost figures were left as they are.`
+				}${droppedNote}${outcome.unread.length > 0 ? " See the Jolli Memory log for details." : ""}`,
+			);
+		} else if (outcome.evidenceCount === 0) {
+			// Nothing to derive FROM. The common case is a pre-v5 memory, whose transcript
+			// ids are commit hashes with no files behind them — reporting "already match"
+			// there would claim the figures were verified when nothing was read.
+			void vscode.window.showInformationMessage(
+				"This memory has no archived conversations to derive token and cost figures from.",
+			);
+		} else if (!outcome.changed) {
+			// A dangling-id cleanup with no figure change still WROTE. Saying only "already
+			// match" would hide that the memory was modified, and the Conversations card
+			// silently losing a row then looks like a bug.
+			void vscode.window.showInformationMessage(
+				`Token and cost figures already match the stored conversations.${droppedNote}`,
+			);
+		}
+		if (outcome.changed && this.currentSummary) {
+			this.panel.webview.postMessage({
+				command: "usageRecomputed",
+				// Swapped in place rather than rebuilt whole, for the same reason the detach
+				// ack carries the meter: a full rebuild collapses scroll position and every
+				// expanded section for what is a one-element change.
+				// Keeps the action in the replacement markup — see the detach ack above.
+				tokenMeterHtml: buildTokenMeter(this.currentSummary, { showRecompute: true }),
+			});
+		}
+	}
+
+	/**
+	 * Removes the given transcript IDs from **every** node's `transcripts` array and
+	 * persists the updated summary via `storeSummary(force=true)`. Returns the new
 	 * summary on success; **throws** on `storeSummary` failure so callers can
 	 * surface the abort decision (e.g. skip the file delete that would otherwise
 	 * leave a half-migration state).
@@ -4424,9 +4707,19 @@ export class SummaryWebviewPanel {
 	 *     just-deleted IDs via the legacy fallback and stamp them onto the new
 	 *     v5 root.
 	 *
-	 * No-op (returns same reference) when nothing references any of the
-	 * removal IDs — both for empty v5 arrays and for legacy summaries whose
-	 * file-backed set is empty.
+	 * **Descendants are filtered too, and that is not defensive breadth.** The root
+	 * index is *supposed* to re-list every descendant id, but the shape this helper
+	 * is called on is precisely the one where it doesn't — a lost detach write leaves
+	 * the root's array empty (or short) while a CHILD still claims the id. Filtering
+	 * the root alone then reports success, drops the child's usage, and leaves the
+	 * dead id on disk: the next press finds the figures already corrected, writes
+	 * nothing, and tells the user everything matches while the stale reference
+	 * survives forever. Mirrors the read side, which resolves ids tree-wide via
+	 * `resolveTranscriptIdsForUsage` for the same reason.
+	 *
+	 * No-op (returns same reference) when no node references any of the removal IDs —
+	 * both for empty v5 arrays and for legacy summaries whose file-backed set is
+	 * empty.
 	 */
 	private async persistTranscriptIdRemoval(
 		summary: CommitSummary,
@@ -4438,16 +4731,14 @@ export class SummaryWebviewPanel {
 		// the file-backed set the migration would produce — using it avoids
 		// re-baking dangling IDs. v5: the array is authoritative.
 		const current = isLegacy ? [...this.transcriptHashSet] : (summary.transcripts ?? []);
-		if (current.length === 0) {
-			return summary;
-		}
 		const filtered = current.filter((id) => !idsToRemove.has(id));
-		// Fast-path: nothing removed AND already v5-shaped → return as-is.
-		// Legacy summaries still need a write even when `filtered.length ===
-		// current.length` would normally short-circuit, because the legacy
-		// summary itself doesn't have a `transcripts` field / `version: 5` —
-		// writing it is the lazy-upgrade.
-		if (!isLegacy && filtered.length === current.length) {
+		// Legacy summaries need a write even when the filter removed nothing, because
+		// the legacy summary itself doesn't have a `transcripts` field / `version: 5`
+		// — writing it IS the lazy upgrade. The one exception is an empty file-backed
+		// set: there is no id list to upgrade and nothing to remove.
+		const rootChanged = isLegacy ? current.length > 0 : filtered.length !== current.length;
+		const children = removeTranscriptIdsFromChildren(summary.children, idsToRemove);
+		if (!rootChanged && children === summary.children) {
 			return summary;
 		}
 		// Write back as a real v5 record: stamp `version: 5` AND the
@@ -4456,13 +4747,56 @@ export class SummaryWebviewPanel {
 		// the version keeps the on-disk record from being a "version<5 but has
 		// transcripts" hybrid that a future version-routing read path would
 		// misclassify.
-		const updated: CommitSummary = { ...summary, version: CURRENT_SCHEMA_VERSION, transcripts: filtered };
+		const updated: CommitSummary = {
+			...summary,
+			version: CURRENT_SCHEMA_VERSION,
+			transcripts: filtered,
+			...(children !== summary.children && { children }),
+		};
 		await this.bridge.storeSummary(updated, true);
 		return updated;
 	}
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Filters `idsToRemove` out of every descendant's own `transcripts` array,
+ * returning the SAME array reference when no descendant listed any of them — the
+ * caller uses reference identity to decide whether a write is owed at all.
+ *
+ * Only the array is rewritten: a child's `version` is deliberately left alone. The
+ * v5 migration hoists ids to the root and never stamps descendants, so a child's
+ * version records the schema it was written under and nothing routes reads off it.
+ * Bumping it here would claim a migration that didn't happen. A child with no
+ * `transcripts` field is likewise left untouched rather than given an empty array —
+ * the field's absence is what marks it as pre-v5-nested.
+ */
+function removeTranscriptIdsFromChildren(
+	children: ReadonlyArray<CommitSummary> | undefined,
+	idsToRemove: ReadonlySet<string>,
+): ReadonlyArray<CommitSummary> | undefined {
+	if (!children || children.length === 0) {
+		return children;
+	}
+	let changed = false;
+	const next = children.map((child) => {
+		const own = child.transcripts;
+		const filteredOwn = own?.filter((id) => !idsToRemove.has(id));
+		const ownChanged = own !== undefined && filteredOwn !== undefined && filteredOwn.length !== own.length;
+		const grandchildren = removeTranscriptIdsFromChildren(child.children, idsToRemove);
+		if (!ownChanged && grandchildren === child.children) {
+			return child;
+		}
+		changed = true;
+		return {
+			...child,
+			...(ownChanged && { transcripts: filteredOwn }),
+			...(grandchildren !== child.children && { children: grandchildren }),
+		};
+	});
+	return changed ? next : children;
+}
 
 /**
  * Deep-equal comparison for two CommitSummary objects via JSON serialization.

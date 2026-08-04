@@ -1852,6 +1852,29 @@ describe("SummaryHtmlBuilder", () => {
 			expect(html).not.toContain("tmeter na");
 		});
 
+		it("offers the recompute action in both the reported and the not-reported state", () => {
+			// The escape hatch has to be reachable from BOTH states: a memory whose figures
+			// were wrongly stripped renders as "not reported", and that is exactly the memory
+			// a user needs to re-derive.
+			const reported = buildTokenMeter(
+				makeSummary({ conversationTokens: 5000, conversationTokenBreakdown: { input: 1, output: 2, cached: 4997 } }),
+				{ showRecompute: true },
+			);
+			const notReported = buildTokenMeter(makeSummary({ conversationTokens: undefined }), { showRecompute: true });
+
+			expect(reported).toContain('id="recomputeUsageBtn"');
+			expect(notReported).toContain('id="recomputeUsageBtn"');
+		});
+
+		it("omits the recompute action by default so read-only panels ship no write affordance", () => {
+			// Foreign (cross-repo) and stale-rewritten panels must not offer a button whose
+			// handler writes to this workspace's orphan branch — the dispatch guard denies it
+			// anyway, so shipping it would only promise something that cannot happen.
+			const html = buildTokenMeter(makeSummary({ conversationTokens: 5000 }));
+
+			expect(html).not.toContain("recomputeUsageBtn");
+		});
+
 		it("prefers the stored per-model cost over the flat Sonnet estimate", () => {
 			// This surface used to price every memory at Sonnet rates unconditionally
 			// while the sidebar preferred the stored per-model figure, so the same memory

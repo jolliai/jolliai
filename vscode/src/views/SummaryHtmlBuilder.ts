@@ -209,7 +209,7 @@ ${codiconLinkTag}
 ${buildSummaryErrorBanner(summary, { readOnly })}
 ${staleBannerHtml}
 ${buildPageTitleAndMetaStrip(summary)}
-${buildTokenMeter(summary)}
+${buildTokenMeter(summary, { showRecompute: !readOnly })}
 ${buildPropTable(summary, totalFiles, transcriptHashSet)}
 ${buildShipBar(summary)}
 ${buildMemoryPanel(summary, { readOnly }, !!opts.foreignRepoName)}
@@ -666,8 +666,14 @@ function estimateCost(summary: CommitSummary): { label: string; mode: "stored" |
  * `style="width"` \u2014 the webview's CSP has no `unsafe-inline` for styles, so
  * SummaryScriptBuilder sets `el.style.width` from `data-pct` after load (a
  * JS property write, not an inline attribute, so CSP allows it).
+ *
+ * `showRecompute` adds the re-derive action (see {@link buildRecomputeAction}). It
+ * defaults to OFF so a read-only panel ships no affordance for a handler that
+ * writes to this workspace's orphan branch; the caller that knows the panel is
+ * writable opts in.
  */
-export function buildTokenMeter(summary: CommitSummary): string {
+export function buildTokenMeter(summary: CommitSummary, opts: { readonly showRecompute?: boolean } = {}): string {
+	const recompute = opts.showRecompute ? buildRecomputeAction() : "";
 	// Aggregate across the WHOLE consolidation tree — NOT the root's own scalar.
 	// A squash/amend/rebase memory carries its conversation tokens on the folded
 	// child commits, so reading only `summary.conversationTokens` (the root's own
@@ -681,7 +687,7 @@ export function buildTokenMeter(summary: CommitSummary): string {
 <div class="tmeter na">
   <div class="tmeter-head"><span class="tmeter-total">Task usage not reported</span>
     <span class="tok-help-wrap"><button class="tok-help" type="button" data-foreign-safe>?</button>
-      <span class="tok-pop">No session on this memory reports token usage, so there's nothing to total.</span></span>
+      <span class="tok-pop">No session on this memory reports token usage, so there's nothing to total.</span></span>${recompute}
   </div>
 </div>`;
 	}
@@ -727,10 +733,28 @@ export function buildTokenMeter(summary: CommitSummary): string {
 <div class="tmeter">
   <div class="tmeter-head"><span class="tmeter-total">${formatTokensCompact(total)}</span> tokens &middot; <span class="tmeter-cost">${cost.label}</span> &middot; this task
     <span class="tok-help-wrap"><button class="tok-help" type="button" data-foreign-safe>?</button>
-      <span class="tok-pop">Counts input + output + cache-creation across sessions (cache reads are excluded \u2014 they double-count). ${costNote}</span></span>
+      <span class="tok-pop">Counts input + output + cache-creation across sessions (cache reads are excluded \u2014 they double-count). ${costNote}</span></span>${recompute}
   </div>
   ${bar}
 </div>`;
+}
+
+/**
+ * The meter's re-derive action: recomputes this memory's token / cost figures from
+ * its archived transcripts (`recomputeUsage` \u2192 `handleRecomputeUsage`).
+ *
+ * Deliberately reachable from BOTH meter states. A memory whose figures were
+ * stripped \u2014 or never corrected after a lost detach write \u2014 renders as
+ * "Task usage not reported", and that is precisely the memory a user wants to
+ * re-derive; an action attached only to the populated state would be missing
+ * exactly when it is needed.
+ *
+ * NOT `data-foreign-safe`: the handler writes to the orphan branch. Read-only
+ * panels never render it in the first place (`showRecompute` defaults to false).
+ */
+function buildRecomputeAction(): string {
+	return `
+    <button class="tmeter-recalc" id="recomputeUsageBtn" type="button" title="Recompute this memory's token and cost figures from its archived conversations">&#x21BB;</button>`;
 }
 
 // \u2500\u2500\u2500 Ship bar + content panels (presentation wrappers) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500

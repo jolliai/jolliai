@@ -10,6 +10,7 @@ import {
 	collectAllTopics,
 	collectAllTranscriptHashes,
 	collectDisplayTopics,
+	collectListedTranscriptIds,
 	collectSourceNodes,
 	computeDurationDays,
 	countTopics,
@@ -20,6 +21,7 @@ import {
 	isUnifiedHoistFormat,
 	resolveDiffStats,
 	resolveTranscriptIdsFiltered,
+	resolveTranscriptIdsForUsage,
 	updateTopicInTree,
 } from "./SummaryTree.js";
 
@@ -408,6 +410,50 @@ describe("SummaryTree", () => {
 		it("falls back to collectAllTranscriptHashes when transcripts is undefined (v3/v4 schema)", () => {
 			// transcripts field absent → v3/v4 schema → derive from the tree.
 			expect(getTranscriptIds(A)).toEqual(["aaa"]);
+		});
+	});
+
+	describe("collectListedTranscriptIds", () => {
+		it("unions every node's own transcripts array, root included", () => {
+			const child = { ...A, version: 5, transcripts: ["uuid-child"] } as CommitSummary;
+			const root = { ...C, version: 5, transcripts: ["uuid-root"], children: [child] } as CommitSummary;
+			expect(collectListedTranscriptIds(root)).toEqual(["uuid-root", "uuid-child"]);
+		});
+
+		it("de-duplicates an id a consolidated root re-lists from its child", () => {
+			const child = { ...A, version: 5, transcripts: ["uuid-1"] } as CommitSummary;
+			const root = { ...C, version: 5, transcripts: ["uuid-1", "uuid-2"], children: [child] } as CommitSummary;
+			expect(collectListedTranscriptIds(root)).toEqual(["uuid-1", "uuid-2"]);
+		});
+
+		it("finds a child-listed id the root index omits", () => {
+			// The malformed shape the usage derivation must still cover — the root index is
+			// empty, so `getTranscriptIds` sees nothing while the child still claims a file.
+			const child = { ...A, version: 5, transcripts: ["uuid-child"] } as CommitSummary;
+			const root = { ...C, version: 5, transcripts: [], children: [child] } as CommitSummary;
+			expect(getTranscriptIds(root)).toEqual([]);
+			expect(collectListedTranscriptIds(root)).toEqual(["uuid-child"]);
+		});
+
+		it("returns [] for a pre-v5 tree, where no node carries the field", () => {
+			expect(collectListedTranscriptIds(D)).toEqual([]);
+		});
+	});
+
+	describe("resolveTranscriptIdsForUsage", () => {
+		it("prefers the tree-wide union over the root index", () => {
+			const child = { ...A, version: 5, transcripts: ["uuid-child"] } as CommitSummary;
+			const root = { ...C, version: 5, transcripts: [], children: [child] } as CommitSummary;
+			expect(resolveTranscriptIdsForUsage(root)).toEqual(["uuid-child"]);
+		});
+
+		it("falls back to the legacy commit-hash walk when the tree lists nothing", () => {
+			expect(resolveTranscriptIdsForUsage(D)).toEqual(["ddd", "bbb", "ccc", "aaa"]);
+		});
+
+		it("returns [] for a v5 tree that genuinely references no transcript", () => {
+			const v5Empty = { ...A, version: 5, transcripts: [] } as CommitSummary;
+			expect(resolveTranscriptIdsForUsage(v5Empty)).toEqual([]);
 		});
 	});
 

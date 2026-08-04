@@ -1282,6 +1282,14 @@ export function buildCss(): string {
     white-space: normal;
   }
   .tok-help-wrap.pinned .tok-pop { display: block; }
+  /* Re-derive figures from the archived conversations. Sits after the '?' wrap,
+     which owns the 'margin-left: auto' that pushes both to the right edge. */
+  .tmeter-recalc {
+    background: none; border: 1px solid var(--border-light); border-radius: 50%;
+    width: 15px; height: 15px; line-height: 1; padding: 0; font-size: 0.8em;
+    color: var(--text-tertiary); cursor: pointer;
+  }
+  .tmeter-recalc:hover { color: var(--vscode-foreground); border-color: var(--text-secondary); }
 
   /* ── Ship bar (hero) ── */
   .ship-bar {
