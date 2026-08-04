@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-Bootstrap the telemetry context once per process by resolving the anonymous identity, the consent state, and the reporting environment, and emit the catalog's events at the lifecycle and feature points across all three surfaces — including an automatic per-command event — with each event carrying only bucketed or boolean properties.
+Bootstrap the telemetry context once per process by resolving the anonymous identity, the consent state, and the reporting environment, and emit the catalog's events at the lifecycle and feature points on every surface enumerated below — including an automatic per-command event — with each event carrying only bucketed or boolean properties.
 
 ## Scope
 
@@ -11,7 +11,7 @@ Bootstrap the telemetry context once per process by resolving the anonymous iden
 - The one-call startup bootstrap: what it resolves (config, install identifier, reporting origin/environment), the once-per-machine install event, and its never-throw guarantee.
 - The per-surface startup wiring (command-line, editor, JVM IDE) and the periodic/lifecycle flush hooks they install.
 - Minting and sharing of the per-machine anonymous install identifier, including the race-free first-run arbitration.
-- The reporting-origin resolution precedence and its mapping to the environment label.
+- The reporting-origin resolution precedence and its mapping to the environment label, plus the sandbox self-tag that precedes and overrides that mapping.
 - The automatic per-command instrumentation: what fires it, what it records, and why a failing command does not fire it.
 - The per-event property contracts for every emission site in the catalog (which bucket/boolean each carries).
 - The first-machine-only deduplication of the AI-source-detected event.
@@ -37,7 +37,7 @@ The bootstrap resolves and caches a process-level context for the recording chok
 | Install identifier | Minted-once-per-machine anonymous UUID. |
 | Session identifier | The current AI/editor session id, when known. |
 | Surface + version | Derived from the client-identification string. |
-| Environment label | Derived from the resolved reporting origin via the origin allowlist. |
+| Environment label | Derived from the resolved reporting origin via the origin allowlist — unless the run self-tagged as a sandbox, which wins outright. |
 
 Bootstrapping is idempotent — a later bootstrap replaces the cached context (used to pick up a changed origin after sign-in or a changed host signal mid-session).
 
@@ -57,9 +57,22 @@ The reporting origin (which maps to the environment label) is resolved in this o
 
 1. If a product API key is configured and decodes, its embedded tenant origin.
 2. Else, a configured product URL if present.
-3. Else, the default resolved product URL — unless that throws (off-allowlist or unset with no default), in which case the origin is undefined and the environment label becomes `unknown`.
+3. Else, the default resolved product URL — unless that throws (off-allowlist or unset with no default), in which case the origin is undefined and the environment label becomes `unknown` (unless the sandbox self-tag below applies, which never consults the origin at all).
 
-The environment label is derived from the origin's host against the allowlist: a `local`/`dev`/`preview`/`prod` host maps to the matching label; anything else (or no origin) is `unknown`. (The exact host-to-label mapping is owned by **Telemetry Event Catalog** / the origin allowlist.)
+### Environment label: the sandbox self-tag, then the origin
+
+The environment label is resolved in two stages, the first of which can end it:
+
+1. **Sandbox self-tag.** An environment variable named `JOLLI_TELEMETRY_ENV` is consulted **before** the origin is looked at. When its value is exactly the string `sandbox`, the label is `sandbox` and the origin is never examined — including the case where no origin resolved at all (which would otherwise be `unknown`). The comparison is verbatim string equality: the value is not trimmed and not lowercased, so any other value — a different environment name, a differently-cased `sandbox`, a value with surrounding whitespace, an empty value — is ignored entirely and stage 2 runs as though the variable were unset. The variable can therefore only ever *produce* `sandbox`; it cannot force any other label.
+2. **Origin host.** Otherwise the label is derived from the origin's host against the allowlist: a `local`/`dev`/`preview`/`prod` host maps to the matching label; anything else (or no origin) is `unknown`. (The exact host-to-label mapping is owned by **Telemetry Event Catalog** / the origin allowlist.)
+
+The complete label set is therefore `local`, `dev`, `preview`, `prod`, `sandbox`, `unknown`.
+
+The self-tag exists so that ephemeral sandboxed runs mark their own telemetry for exclusion downstream: such a run otherwise mints a fresh install identifier and reports whatever environment its origin points at, so it is indistinguishable from a real install and inflates install and activity counts.
+
+The label is resolved once per bootstrap and cached in the process context alongside the identity and consent, so one self-tag at process start labels every event that process records — the guard is never re-evaluated per event.
+
+The command-line surface and the JVM-IDE surface each resolve this label with their own independent implementation, kept in lockstep: same variable name, same exact-match semantics, same precedence over the origin, same label set. The graphical-editor surface has no resolution of its own — it bootstraps through the command-line surface's.
 
 ### Per-command instrumentation
 
@@ -143,7 +156,7 @@ When a transcript-processing pass encounters a session source, it fires `ai_sour
 
 ### Onboarding-funnel emission sites
 
-`onboarding_progressed` has no single choke point — it is emitted from **six** trigger sites, each of which already holds (or can cheaply obtain) a repo context. The dedup ledger, the state signature, the daily heartbeat, and the per-path serialization that make repeated triggers cheap are owned by spec 312; what belongs here is only *where and when* each emit is attempted:
+`onboarding_progressed` has no single choke point — it is emitted from every trigger site enumerated below, each of which already holds (or can cheaply obtain) a repo context. The dedup ledger, the state signature, the daily heartbeat, and the per-path serialization that make repeated triggers cheap are owned by spec 312; what belongs here is only *where and when* each emit is attempted:
 
 - **The enable command's report tail** — after the enable report is printed, on **both** the success and the error branch, so the "installed but never got into a git repo" drop-off is visible rather than silent. Config is **re-loaded** at this point rather than reused, because the interactive provider setup that may have run earlier in the same invocation can have just added the capture credential the snapshot reports on. The `--repo-hooks-only` mode never reaches this tail (it returns from the action before the report); `--integrations-only` does.
 - **The guided front door's non-git dead end** — emitted just before the exit code is set. This is the only trigger in the product that ever fires outside a git working tree, so `in_git_repo: false` is observable at all only because of it.
@@ -157,7 +170,7 @@ One property of this event is a deliberate departure from the model used everywh
 ### Pipeline-health instrumentation
 
 - Each ingest drain run flows through one choke point that emits `ingest_completed` with the run's health metrics, and — only when the terminal outcome is a genuine failure (not the normal "ok" or "nothing pending" states) — additionally emits `error_occurred { code, where: ingest }`.
-- `error_occurred` has **three** emitters today, not one: the ingest choke point above (`where: ingest`); the JVM IDE push path, on an **unclassified** push failure only (`where: push, code: push_failed`) — the classified push outcomes (binding-required, plugin-outdated, key-rejected) are handled by their own flows and do not raise it; and the JVM IDE sign-in path (`where: signin`, see below).
+- `error_occurred` is not raised only by the ingest path. Its emitters today are: the ingest choke point above (`where: ingest`); the JVM IDE push path, on an **unclassified** push failure only (`where: push, code: push_failed`) — the classified push outcomes (binding-required, plugin-outdated, key-rejected) are handled by their own flows and do not raise it; and the JVM IDE sign-in path (`where: signin`, see below), which raises it both for a failed callback and for the distinct reported-success-but-no-token case.
 - The post-commit worker emits `queue_drained` with the processed-op count and duration when a drain finishes.
 - A sync round emits `sync_completed` with the resulting state and duration on the success path, and emits it again with `outcome: failed` on the failure path so the sync-health view sees failures, not only successes.
 
@@ -179,6 +192,8 @@ One property of this event is a deliberate departure from the model used everywh
 - **The AI-source event fires once per source per machine and only while enabled.** The machine-global ledger dedupes across runs and surfaces; gating the ledger write on enabled consent keeps an opted-out run from recording it. (Notable.)
 - **The environment is re-resolved after sign-in.** A signed-in key's tenant origin overrides the startup origin, so the conversion event reports the right environment. (Notable.)
 - **The reporting origin falls back to `unknown` rather than failing.** If no origin can be resolved (off-allowlist, unset, no default), the environment label is `unknown` and telemetry still functions. (Notable.)
+- **A run can self-tag its environment as `sandbox`, and the tag beats the origin.** Setting `JOLLI_TELEMETRY_ENV` to exactly `sandbox` labels every event that process records `sandbox`, whichever product origin it resolved — or none. It exists because a throwaway sandboxed run mints its own install identifier and would otherwise report as a real install of whatever environment it pointed at; the self-tag makes those runs filterable downstream. Only that one exact value does anything: every other value is ignored and the origin derivation proceeds normally, so the variable cannot be used to claim a different environment. (Notable; intentional sharp edge.)
+- **The environment label is stamped once per bootstrap, not per event.** A single self-tag (or origin) resolution at process start covers the whole session; both the full re-bootstrap and the JVM IDE's lighter environment-only refresh re-apply the self-tag check, so a mid-session sign-in or host-setting toggle does not silently drop the tag. (Notable.)
 - **The sync failure path emits the same completion event with a failure outcome.** Without it the sync-health view would see only successes. (Notable.)
 - **The disclosure is printed before the install event is buffered.** Ordering ensures a single-command user sees the disclosure before any event is recorded. (Notable.)
 

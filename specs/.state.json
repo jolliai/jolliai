@@ -1,9 +1,9 @@
 {
   "branches": {
     "main": {
-      "revision": "9393372502a5d3ca0bf92036e12f41f2e5c71af9",
-      "subject": "Replace deprecated ReadAction.compute with runReadAction",
-      "reviewedAt": "2026-08-01T18:48:21Z",
+      "revision": "542c8804aed8acb9dafbab292d2ceaa6306ed965",
+      "subject": "telemetry: thread injected env into env resolution and mirror sandbox tag to Kotlin",
+      "reviewedAt": "2026-08-04T07:17:29Z",
       "actor": "doug.schroeder",
       "skill": "specs-update"
     }

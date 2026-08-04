@@ -21,7 +21,7 @@ The behavior, run as part of the per-commit summarization pipeline, that takes u
 - Note archival on commit (covered by its own topic).
 - Cross-commit plan progress evaluation (covered by the plan-progress topic).
 - The display-time filtering rules used by the panel (covered by the plan-service topic).
-- Re-association of plan references during amend, squash, or rebase (covered by those pipelines).
+- Re-association of plan references during amend, squash, or rebase — the separate step in those pipelines that moves a prior summary's plan references onto the new hash (covered by those pipelines). The amend and squash pipelines run that step *in addition to*, not instead of, the archival documented here; see "Which commits archive".
 
 ## Data Contracts
 
@@ -97,6 +97,20 @@ Re-association on amend, squash, or rebase splits the archived key carried on th
 
 ## Notable Behavior
 
+### Which commits archive
+
+Archival is not specific to a plain commit. It runs on every route that generates or rewrites a commit summary and can therefore carry plan references:
+
+- a plain commit, and the cherry-pick and revert variants that go through the same summarization;
+- every amend route, whichever tier the amend takes;
+- the squash-consolidation route — whether the squash was performed directly against the working tree or came from an interactive rebase's squash/fixup, since both go through one shared consolidation pipeline and therefore archive identically.
+
+The one summary-rewriting route that never archives is the 1:1 rebase reapply, which only moves the prior summary's plan references onto the new hash.
+
+The squash route was previously the gap. A plan the user activated during a session that ended in a squash was never snapshotted: its uncommitted registry row survived untouched and the consolidated summary held no plan reference to it, because the only plan work the route did was re-association — moving the squashed-away commits' *already-archived* references onto the new hash, which by construction can never reach a plan that was never archived. Such a plan is now archived like any other commit's, and the resulting plan reference is attached to the consolidated summary.
+
+Archival is bound to storing a summary, and every route carries at least one bail-out that reaches no summary — a plain commit with neither transcript activity nor file changes, an amend with nothing meaningful to record, a squash whose source commits have no stored summaries. None of those is an exception to the list above; they are the same rule seen from the other side: no summary, nothing for a plan reference to hang on, so nothing is archived and the registry entry stays uncommitted for the next commit.
+
 ### Panel-hide depends solely on the content-hash guard
 
 The panel-visibility rule is governed entirely by the content hash. A user can keep editing a plan after a commit; the guard's updated-at field advances as transcript scanning re-touches it, but the panel continues to hide the guard until the file's current SHA-256 no longer matches the stored content hash. This avoids re-surfacing plans that the user merely revisited without substantively changing.
@@ -129,11 +143,17 @@ Before invoking this path, the pipeline removes two kinds of slugs from the set 
 
 There is **no discard pass** for plans. An earlier design permanently deleted a user hard-excluded plan's registry row and product-owned backing file on the excluding commit; that behavior has been **removed entirely**. "Leave out of this memory" is a one-commit skip, not a delete — the user's hard-exclude and the AI's soft-exclude now converge on the same sticky leave-out.
 
+**A route that runs no relevance judgement has no soft-exclude set.** The soft-exclude set exists only where a relevance judgement was made for the commit being processed; where none was, the set handed to archival is empty and the user's full working-area selection is archived, minus only their hard excludes. The squash-consolidation route is one such route: it consolidates the topic structures the squashed-away commits already carry rather than re-deriving anything from the diff and transcript, so there is nothing for a relevance judgement to rank and none is made.
+
 **Contrast with conversations (the discard exception):** excluded *conversations* are the one item kind that is still a one-time discard — an excluded conversation is read only to advance its cursor to the commit boundary and is then dropped from the summary, so it never reappears. That discard is owned by the transcript-loading path, not this one; plans (like notes and references) are the sticky, skip-only kind.
 
 ### Branch attribution begins at archival
 
-Neither archival nor the panel filters by branch, because a registry entry carries no branch. A pending plan is worktree-scoped: it stays visible regardless of which branch is checked out, exactly like uncommitted code. Archival is where a branch first enters the picture, and it is the **commit's** branch — the one recorded on that commit's stored summary — not anything the registry ever held. Any branch value found on a row is purged when the registry is read, and the purge marks the registry as changed so the next write-back persists the cleaned shape; because this path reads through that same normalization, the guard rewrite has no branch to preserve.
+Neither archival nor the panel filters by branch, because a registry entry carries no branch. A pending plan is worktree-scoped: it stays visible regardless of which branch is checked out, exactly like uncommitted code. Archival is where a branch first enters the picture, and it is a branch the **calling pipeline** supplies, never anything the registry held. On the routes that generate a summary from scratch it is the commit's own branch, the same one recorded on that commit's stored summary. Any branch value found on a row is purged when the registry is read, and the purge marks the registry as changed so the next write-back persists the cleaned shape; because this path reads through that same normalization, the guard rewrite has no branch to preserve.
+
+**The branch label never gates archival.** On the squash-consolidation route the label is resolved from three sources in order, each a fallback for the one before: the branch recorded when the commit was queued for processing (preferred, because the queue drains asynchronously and the tip may have moved by the time archival runs); then a live read of the current branch; and finally the branch carried by the source summaries being consolidated, which is already in hand and cannot fail. A branch that cannot be read therefore never costs the archive. Degrading rather than skipping is deliberate: a sibling archival step on the same route takes its branch from the source summaries and would have proceeded regardless, so skipping here would have left the consolidated memory *partial* rather than merely smaller.
+
+Two consequences of that chain. The label can be stale relative to the tip — that is exactly why the live read is only the second choice, not the first. And it can differ from the branch recorded on the consolidated summary, which is always the source summaries' branch. Both are cheap: the label only affects how the snapshot is filed for human browsing, while the snapshot itself is stored and retrieved by its slug-and-hash key independently of any branch.
 
 ### Discovery is upstream
 
@@ -146,6 +166,6 @@ The registry entries that this path reads are populated by an entirely separate 
 - **Per-commit summary pipeline** — the caller that supplies the commit hash and consumes the returned plan-reference list to attach to the new summary.
 - **Plan progress evaluator** — the downstream consumer of the new-slug-to-raw-markdown map produced as a side-channel.
 - **Plan service display** — the panel-query layer that interprets the guard entries and hides them while their content hash matches.
-- **Re-association on rewrite** — the amend, squash, and rebase pipelines that walk a prior summary's plan-reference list and update each entry's commit-hash field in the registry.
+- **Re-association on rewrite** — the amend, squash, and rebase pipelines that walk a prior summary's plan-reference list and update each entry's commit-hash field in the registry. On the amend and squash routes that step runs alongside the archival documented here, and after it, so a guard revived and re-archived under the new hash is not migrated a second time.
 - **Note archival on commit** — the parallel path for note entries; this topic only covers plans.
 - **AI context-relevance filtering (spec 258)** and **commit-exclusion store (spec 188)** — a soft-excluded plan and a user hard-excluded plan are treated identically: both are removed from the candidate set fed here and neither is discarded (each stays uncommitted, row and file intact, for re-evaluation on the next commit). Only excluded conversations are a one-time discard, and that is owned elsewhere.

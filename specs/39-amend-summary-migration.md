@@ -65,6 +65,8 @@ The key each kind merges on differs, and one of them differs deliberately:
 
 Skills are the exception because they do not carry the archive hash in the identifier they are keyed on. A plan or note ref embeds it (`<slug>-<hash8>`), so the suffix has to be stripped to recover a base key; a skill ref keeps its hash in its separate archive key and leaves the skill id raw. Stripping anyway would silently truncate any skill id that happens to end in eight hex characters, folding two distinct skills into one row here while the exclusion audit below and the tree accumulation both kept them apart — three derivations of one key that have to agree.
 
+All four keys therefore name the logical **item**, never the archived file the item was last snapshotted into. That is what lets an artifact re-archived under the rewrite's new hash list once instead of twice, and it is sound here only because the union has exactly **one** prior summary to draw its old side from. The consolidation that folds *many* prior summaries into a single commit performs the same union with the same new-wins rule over its plan, note and external-reference fields, but keys it on the **archived file** (archive-hash suffix retained): two of its sources can legitimately hold the same logical item snapshotted at different commits, nothing in that pipeline renames or deletes a source's snapshot, so both archived files outlive the fold and both need a summary referring to them. This topic's keys used there would keep whichever source was walked last and leave the other archived file stranded on the parallel ref with nothing referring to it — the failure class the two key families exist to keep apart. They are not interchangeable in either direction; the consolidated variant's key rule is stated by the summary-tree topic and the pipeline that supplies its caller-side refs by the squash-consolidation topic.
+
 ### Regenerated or recomposed fields
 
 These fields on the new root are recomposed:
@@ -149,6 +151,10 @@ The pipeline checks whether the new commit hash already has an index entry befor
 ### Re-association of plan, note and skill references is unconditional
 
 Every tier ends with a re-association step that walks the plan-reference list, the note-reference list and the skill-reference list on the prior summary, updating each entry in the corresponding registries to point at the new commit hash. Those registries are independent of the summary store — they live in local state files — so the re-association is what keeps them in sync with the rewrite. The skill arm re-anchors a guard row rather than an artifact row and is driven by the reference's archive key, alongside the set of every collapsed hash in the subtree (a single-element set here, plus its descendants); its match rule is stated in full by the squash-consolidation topic, which shares the step.
+
+### The merge key is chosen for one prior summary, not for one snapshot per item
+
+Logical-item keying is chosen for the shape of the *pipeline* — one prior summary on the old side — not for the shape of that prior summary's own reference fields. When the prior summary is itself a consolidated root, its plan/note/reference field can already carry two archived snapshots of one logical item, which is precisely what the consolidation's own archived-file keying preserves. This union then collapses the pair, keeping whichever of the two is listed last in the prior summary's array (a newly-detected ref for the same item still wins over both), and the other snapshot's archived file survives on the parallel ref with nothing referring to it. Rewriting a consolidated commit in place is a supported tree shape, so this is reachable rather than theoretical. (Notable; a direct consequence of the key choice recorded in Data Contracts.)
 
 ### Skill refs merge on the raw registry key, not through the archive-hash strip
 
