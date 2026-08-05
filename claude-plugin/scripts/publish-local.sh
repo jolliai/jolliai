@@ -19,6 +19,9 @@ DEST="$(cd "$DEST" && pwd)"
 
 publish_build
 publish_sync "$DEST"
+# A local marketplace is added by path, so that path IS this copy's install source —
+# the mirrored README then matches the command printed below verbatim.
+publish_readme_source "$DEST" "$DEST"
 
 echo ""
 echo "Local marketplace ready at: $DEST"

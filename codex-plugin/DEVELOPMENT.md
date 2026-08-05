@@ -330,6 +330,15 @@ implements. Both stages use the SAME repository name in different orgs, which is
 why the dev checkout carries a `-dev` suffix locally; nothing but the local
 directory name differs.
 
+Because both stages share a repository name, the install command a reader should
+type differs per target while the source tree has only one README. `README.md`
+therefore keeps a neutral `<marketplace-source>` placeholder in its
+`codex plugin marketplace add` line, and every publish script resolves it on the
+**mirrored copy** (`publish_readme_source` in `_publish-lib.sh`) — the dev org slug,
+the prod org slug, the local directory, or a generic absolute path for the zip. The
+placeholder must survive in the source README: publishing fails loudly if it is
+missing, because the alternative is shipping users a command that cannot work.
+
 Clone them once before the first git-backed publish:
 
 ```bash

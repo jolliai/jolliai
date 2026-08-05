@@ -16,4 +16,4 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_publish-lib.sh"
 
 DEST="${MARKETPLACE_REPO:-${1:-$MONOREPO/../jolli-chatgpt-plugin-dev}}"
-publish_git_repo "$DEST"
+publish_git_repo "$DEST" "jolli-plugin-dev/jolli-chatgpt-plugin"

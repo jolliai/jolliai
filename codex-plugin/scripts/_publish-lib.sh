@@ -57,6 +57,11 @@ PUBLISH_REQUIRED_CONFIG=(
 	README.md
 )
 
+# The neutral token the SOURCE README carries in its install command. Every publish
+# target resolves it to something different — a dev org slug, the public org slug, a
+# local directory — so the monorepo copy cannot name any one of them.
+README_SOURCE_PLACEHOLDER='<marketplace-source>'
+
 # publish_build — build dist/, then assert it is complete on disk.
 publish_build() {
 	echo "==> Building dist/ (bundles current cli/src) ..."
@@ -157,6 +162,45 @@ publish_sync() {
 		"$SRC"/ "$dest"/
 }
 
+# publish_readme_source <dest-dir> <marketplace-source> — resolve the README's install
+# command on the MIRRORED copy, so each target names the marketplace its readers can
+# actually add.
+#
+# Run after publish_sync (which would overwrite it) and before the commit, so the
+# resolved text is what lands in the target repo. The source README keeps the neutral
+# placeholder: dev and prod are the same repository NAME in two different orgs, so a
+# hardcoded slug in the monorepo copy would send half of all readers to the wrong one.
+#
+# The placeholder MUST be present. Shipping the literal `<marketplace-source>` gives
+# users a command that cannot work, and it fails no other check here — so a README edit
+# that drops, renames or duplicates the token has to fail loudly at publish time rather
+# than reach the marketplace.
+publish_readme_source() {
+	local dest="$1" source_ref="$2" readme="$1/README.md"
+	[ -n "$source_ref" ] || { echo "error: publish_readme_source needs a marketplace source" >&2; return 1; }
+	[ -s "$readme" ] || { echo "error: mirrored README is missing or empty: '$readme'" >&2; return 1; }
+	if ! grep -Fq "$README_SOURCE_PLACEHOLDER" "$readme"; then
+		echo "error: '$readme' has no ${README_SOURCE_PLACEHOLDER} placeholder to resolve." >&2
+		echo "       codex-plugin/README.md must keep it in the 'marketplace add' command so" >&2
+		echo "       each publish target can name its own marketplace." >&2
+		return 1
+	fi
+	# Literal index-based replacement, not sed: the value is a slug or an absolute path,
+	# and both `/` (delimiter) and `&` (backreference) would need escaping in a sed
+	# replacement. awk's substr arithmetic treats it as plain text.
+	awk -v ph="$README_SOURCE_PLACEHOLDER" -v val="$source_ref" '
+		{ i = index($0, ph); if (i > 0) $0 = substr($0, 1, i - 1) val substr($0, i + length(ph)); print }
+	' "$readme" > "$readme.tmp" && mv "$readme.tmp" "$readme"
+	# One replacement per line above, so a second occurrence on the same line would
+	# survive silently. Assert the token is gone rather than trust the loop-free form.
+	if grep -Fq "$README_SOURCE_PLACEHOLDER" "$readme"; then
+		echo "error: '$readme' still contains ${README_SOURCE_PLACEHOLDER} after rewriting." >&2
+		echo "       Keep the placeholder to a single occurrence per line." >&2
+		return 1
+	fi
+	echo "==> README install source -> ${source_ref}"
+}
+
 publish_version() {
 	# Pass the path on argv rather than interpolating it into the JS source, so a
 	# repo path containing a quote or backslash cannot corrupt the expression.
@@ -215,8 +259,14 @@ publish_push() {
 }
 
 # Build, mirror, commit with DCO sign-off, and optionally push a marketplace repo.
+#
+# <marketplace-source> is the `owner/repo` slug readers of THIS target's README will
+# type into `codex plugin marketplace add`. It is passed in rather than derived from
+# the checkout's `origin` on purpose: the README is written before the push, and a
+# mistyped destination path should not silently produce a README that documents
+# whichever repo the wrong checkout happens to point at.
 publish_git_repo() {
-	local dest="$1"
+	local dest="$1" marketplace_source="$2"
 	if [ ! -d "$dest/.git" ]; then
 		echo "error: '$dest' is not a git checkout." >&2
 		echo "       Clone the target marketplace repository first." >&2
@@ -227,6 +277,7 @@ publish_git_repo() {
 	publish_build
 	publish_assert_skills
 	publish_sync "$dest"
+	publish_readme_source "$dest" "$marketplace_source"
 
 	# Subshell: this `cd` must not leak into the caller's shell. It does not today —
 	# publish_git_repo is the last statement in publish-dev.sh and publish-prod.sh — but

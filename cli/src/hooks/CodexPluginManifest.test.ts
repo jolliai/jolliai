@@ -176,6 +176,35 @@ describe("Codex publish inventory tracks the shipped skills", () => {
 	});
 });
 
+// The README's `marketplace add` argument differs per publish target, so the source
+// copy carries a placeholder that each publish script resolves on the mirror. Two
+// halves that can drift apart: the README could lose the token (the publish script
+// fails loudly, but only at release time), or a script could pass the WRONG slug —
+// and dev/prod are the same repository name in two orgs, so a swapped slug documents
+// a marketplace the reader has no access to while every other check passes.
+describe("Codex publish resolves the README install source", () => {
+	const readReadme = () => readFileSync(join(repoRoot, "codex-plugin", "README.md"), "utf-8");
+	const readScript = (name: string) => readFileSync(join(repoRoot, "codex-plugin", "scripts", name), "utf-8");
+
+	it("keeps a single resolvable placeholder in the marketplace add command", () => {
+		const readme = readReadme();
+		const libText = readScript("_publish-lib.sh");
+		const placeholder = libText.match(/^README_SOURCE_PLACEHOLDER='([^']+)'$/mu)?.[1] ?? "";
+
+		expect(placeholder).toBe("<marketplace-source>");
+		// One occurrence: publish_readme_source rewrites at most once per line.
+		expect(readme.split(placeholder)).toHaveLength(2);
+		expect(readme).toContain(`codex plugin marketplace add ${placeholder}`);
+	});
+
+	it("passes each target's own marketplace slug", () => {
+		expect(readScript("publish-dev.sh")).toContain(
+			'publish_git_repo "$DEST" "jolli-plugin-dev/jolli-chatgpt-plugin"',
+		);
+		expect(readScript("publish-prod.sh")).toContain('publish_git_repo "$DEST" "jolliai/jolli-chatgpt-plugin"');
+	});
+});
+
 describe("Codex plugin marketplace", () => {
 	it("is discoverable at .agents/plugins/marketplace.json", () => {
 		const marketplace = readJson(repoRoot, "codex-plugin", ".agents", "plugins", "marketplace.json");

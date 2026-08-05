@@ -48,6 +48,13 @@ PUBLISH_REQUIRED_CONFIG=(
 	plugins/jolli/.claude-plugin/plugin.json
 )
 
+# The neutral token the SOURCE README carries wherever it names the marketplace to
+# add. Each publish target resolves it to something different — the public release
+# repo, the dev dry-run repo, a local directory — so the monorepo copy cannot name
+# any one of them. (The dev mirror used to ship the PROD slug, telling dry-run
+# readers to install the public release.) Mirrors codex-plugin's mechanism.
+README_SOURCE_PLACEHOLDER='<marketplace-source>'
+
 # publish_assert_dist_built — every required dist file exists and is non-empty on
 # disk. Run right after the build so an incomplete bundle fails the publish here
 # instead of shipping a commit-breaking plugin to colleagues.
@@ -161,6 +168,45 @@ publish_sync() {
 		"$SRC"/ "$dest"/
 }
 
+# publish_readme_source <dest-dir> <marketplace-source> — resolve the README's
+# marketplace name on the MIRRORED copy, so each target names the marketplace its
+# readers can actually add.
+#
+# Run after publish_sync (which would overwrite it) and before the commit, so the
+# resolved text is what lands in the target repo. The source README keeps the
+# neutral placeholder; publish-zip.sh needs no call because it packs only
+# plugins/jolli/ and ships no README at all.
+#
+# The placeholder MUST be present. Shipping the literal `<marketplace-source>`
+# gives users a command that cannot work, and README.md is not even in
+# PUBLISH_REQUIRED_CONFIG — so nothing else here would notice a README edit that
+# drops, renames or duplicates the token.
+publish_readme_source() {
+	local dest="$1" source_ref="$2" readme="$1/README.md"
+	[ -n "$source_ref" ] || { echo "error: publish_readme_source needs a marketplace source" >&2; return 1; }
+	[ -s "$readme" ] || { echo "error: mirrored README is missing or empty: '$readme'" >&2; return 1; }
+	if ! grep -Fq "$README_SOURCE_PLACEHOLDER" "$readme"; then
+		echo "error: '$readme' has no ${README_SOURCE_PLACEHOLDER} placeholder to resolve." >&2
+		echo "       claude-plugin/README.md must keep it wherever it names the marketplace," >&2
+		echo "       so each publish target can name its own." >&2
+		return 1
+	fi
+	# Literal index-based replacement, not sed: the value is a slug or an absolute
+	# path, and both `/` (delimiter) and `&` (backreference) would need escaping in a
+	# sed replacement. awk's substr arithmetic treats it as plain text.
+	awk -v ph="$README_SOURCE_PLACEHOLDER" -v val="$source_ref" '
+		{ i = index($0, ph); if (i > 0) $0 = substr($0, 1, i - 1) val substr($0, i + length(ph)); print }
+	' "$readme" > "$readme.tmp" && mv "$readme.tmp" "$readme"
+	# One replacement per line above, so a second occurrence on the SAME line would
+	# survive silently. Assert the token is gone rather than trust the loop-free form.
+	if grep -Fq "$README_SOURCE_PLACEHOLDER" "$readme"; then
+		echo "error: '$readme' still contains ${README_SOURCE_PLACEHOLDER} after rewriting." >&2
+		echo "       Keep the placeholder to a single occurrence per line." >&2
+		return 1
+	fi
+	echo "==> README marketplace source -> ${source_ref}"
+}
+
 publish_version() {
 	# Pass the path on argv rather than interpolating it into the JS source, so a
 	# repo path containing a quote or backslash can't corrupt the expression.
@@ -177,8 +223,14 @@ publish_version() {
 # never hand-edited. Honors:
 #   NO_PUSH=1               commit but don't push
 #   JOLLI_PUBLISH_FORCE=1   allow a same-version republish (skips the version guard)
+#
+# <marketplace-source> is the `owner/repo` slug readers of THIS target's README will
+# type into `/plugin marketplace add`. Passed in rather than derived from the
+# checkout's `origin`: the README is written before the push, so a mistyped
+# destination path should not silently produce a README documenting whichever repo
+# the wrong checkout happens to point at.
 publish_git_repo() {
-	local dest="$1"
+	local dest="$1" marketplace_source="$2"
 	if [ ! -d "$dest/.git" ]; then
 		echo "error: '$dest' is not a git checkout." >&2
 		echo "       Clone the marketplace repo first:" >&2
@@ -189,6 +241,7 @@ publish_git_repo() {
 
 	publish_build
 	publish_sync "$dest"
+	publish_readme_source "$dest" "$marketplace_source"
 
 	cd "$dest"
 	# Publish exactly what rsync placed on disk. Neutralize the user's MACHINE-GLOBAL

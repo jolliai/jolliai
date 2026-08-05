@@ -25,6 +25,10 @@ publish_assert_skills
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 publish_sync "$STAGE"
+# The recipient chooses where they unzip, so no concrete source exists — but the
+# staging path must not leak into the README either (it is a temp dir that will not
+# exist on their machine). Name the shape of the command instead.
+publish_readme_source "$STAGE" "/absolute/path/to/unzipped-marketplace"
 
 rm -f "$OUT"
 (

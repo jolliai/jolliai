@@ -17,9 +17,11 @@ hooks are what generate the memory that the plugin surfaces let you consume.
 - **Commands** — `/jolli:init`, `/jolli:status`, `/jolli:timeline`,
   `/jolli:login`, `/jolli:logout`.
 - **Skills** — `/jolli:recall`, `/jolli:search`, `/jolli:push`.
-- **Umbrella** — a bare `/jolli` action menu that lists the above and routes to
-  your pick (written into `.claude/skills/jolli/` on first session; a plugin
-  can't expose a bare command itself, so this is a project-level skill).
+- **Umbrella** — a bare `/jolli` front door: it reads how Jolli is set up in this
+  repo, leads with setup when something is missing, and otherwise shows a status
+  snapshot and routes to your pick (written into `.claude/skills/jolli/` on first
+  session; a plugin can't expose a bare command itself, so this is a
+  project-level skill).
 - **Hooks** — one `SessionStart` bootstrap that installs the git hooks and the
   canonical agent hooks, which then build memory
   from your commits, and — until you sign in — remind you to run `/jolli:login`.
@@ -29,11 +31,11 @@ hooks are what generate the memory that the plugin surfaces let you consume.
 Install from Jolli's Claude Code marketplace:
 
 ```
-/plugin marketplace add jolliai/jolli-claude-plugin
+/plugin marketplace add <marketplace-source>
 /plugin install jolli@jolli-marketplace
 ```
 
-`jolliai/jolli-claude-plugin` is the marketplace repo (its `marketplace.json`
+`<marketplace-source>` is the marketplace repo (its `marketplace.json`
 names the marketplace `jolli-marketplace`, which is why the install target is
 `jolli@jolli-marketplace`).
 
@@ -42,6 +44,13 @@ source, then enable **Jolli Memory** under **Manage plugins**.
 
 After install the MCP tools, `/jolli:*` skills and commands, and the hooks are
 all live.
+
+Start with **`/jolli`**. It reads how Jolli is set up in this repository, leads
+with setup when something is missing, and otherwise shows a status snapshot and
+routes you to recall, search, a PR description, or a Space. In a brand-new repo
+the bare `/jolli` may not appear until the plugin has written it during its first
+session — **`/jolli:init`** always works directly, and is also what you run to
+re-run setup or change the bound Space.
 
 ## Memory generation works out of the box
 
@@ -69,8 +78,9 @@ other devices can recall them. It is not required to generate them.
 This opens your browser and, on success, saves a Jolli API Key. Run
 `/jolli:logout` to sign out.
 
-**`/jolli:init`** is the one-shot path: it signs you in if needed, enables the
-repo, and binds it to a Space.
+**`/jolli:init`** does all of it in one pass: it signs you in if needed, enables
+the repo, and binds it to a Space. `/jolli` routes there on its own whenever setup
+is incomplete.
 
 > **Prefer your own Anthropic key?** Setting `ANTHROPIC_API_KEY` on its own is not
 > enough once the plugin has seeded `local-agent`, because the provider choice is

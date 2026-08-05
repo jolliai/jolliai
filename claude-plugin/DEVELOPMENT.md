@@ -217,8 +217,15 @@ Shared knobs:
   for `publish-local.sh`; `publish-zip.sh` takes the output path as its argument).
 
 **`publish-dev.sh` and `publish-prod.sh` are the same flow** (`publish_git_repo` in
-`_publish-lib.sh`) and differ *only* in the default target repo, so a prod release can never
-behave differently from the dev dry-run that rehearsed it. Both **refuse a same-version
+`_publish-lib.sh`) and differ *only* in the default target repo plus the marketplace slug they
+pass for the README, so a prod release can never behave differently from the dev dry-run that
+rehearsed it. That slug is why [`README.md`](README.md) keeps a neutral `<marketplace-source>`
+placeholder wherever it names the marketplace to add: `publish_readme_source` resolves it on the
+**mirrored copy** (prod repo, dev repo, or the local directory), because a hardcoded slug in the
+source README made the dev mirror tell dry-run readers to install the public release. Publishing
+fails loudly if the placeholder is missing — shipping the literal token is an install command
+that cannot work. `publish-zip.sh` needs no resolution: it packs `plugins/jolli/` and ships no
+README. Both **refuse a same-version
 republish**: Claude Code's `/plugin update` compares `plugin.json` `version`, so re-publishing
 changed bytes under an unchanged version would leave installed users stuck on "up to date" and
 they'd never pull the fix. Bump `version` in

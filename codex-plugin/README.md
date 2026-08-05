@@ -45,13 +45,19 @@ bootstrap of the session that is already running.
 
 ## First-time setup
 
-Invoke `$jolli:init`. It:
+Invoke `$jolli`. It reads how Jolli is set up in this repository and, on a fresh
+repo, leads with setup — routing into `$jolli:init`, which:
 
 1. checks the current repository state;
 2. enables memory capture, records Codex as the local summarization agent, and
    registers the Jolli Memory MCP server (its tools load in your next session);
 3. optionally signs in to Jolli in the browser;
 4. binds the repository to a Jolli Space for team sharing.
+
+`$jolli` remains the entry point afterwards: once setup is complete it shows a
+status snapshot and routes to recall, search, PR descriptions and the rest.
+Invoke `$jolli:init` directly when you want to re-run setup or change the bound
+Space.
 
 Memory generation uses the local Codex/ChatGPT login by default and does not
 require a Jolli account or API key. Jolli sign-in is required only for Space
@@ -73,25 +79,19 @@ codex login
 - `$jolli:push` — publish memories to a Space.
 - `$jolli:local-run` / `$jolli:remote-run` — run Jolli workflows.
 
-## Development
-
-See [DEVELOPMENT.md](DEVELOPMENT.md) for architecture, build prerequisites,
-local acceptance testing, publishing, versioning, and the release checklist.
-
-From the monorepo root:
-
-```bash
-npm run build:codex-plugin
-bash codex-plugin/scripts/publish-local.sh
-```
-
-Reinstall the local plugin after publishing because Codex caches plugin
-versions under `~/.codex/plugins/cache/`.
-
 ## Requirements
 
 - Node.js must be available on `PATH`, or recorded by a supported Jolli IDE
   integration.
 - Codex must be installed and signed in for the default local-agent provider.
+
+## Support and source
+
+- Product: [jolli.ai](https://jolli.ai)
+- Source, issues, and security policy: [github.com/jolliai/jolliai](https://github.com/jolliai/jolliai)
+
+This repository is a generated release artifact — the plugin is built from the
+Jolli monorepo, so file changes here are overwritten by the next release. Report
+problems and send patches to the monorepo instead.
 
 Apache-2.0.
