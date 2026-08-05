@@ -144,9 +144,9 @@ export function buildSkillsAggregateMarkdown(summary: CommitSummary, skills: Rea
  * VS Code sidebar's single aggregate Context row opens.
  *
  * No frontmatter and no commit hash, because neither exists yet: this is a view
- * of the working registry, not a stored artifact, and it is opened as an untitled
- * document rather than written to disk. Once the work is committed the same rows
- * reappear as `skills--<hash8>.md` with the commit's identity attached.
+ * of the working registry, not a stored artifact, and it is rendered into a
+ * virtual document rather than written to disk. Once the work is committed the
+ * same rows reappear as `skills--<hash8>.md` with the commit's identity attached.
  */
 export function buildLiveSkillsMarkdown(skills: ReadonlyArray<SkillTableRow>): string {
 	const lines: string[] = [

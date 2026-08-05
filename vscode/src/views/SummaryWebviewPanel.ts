@@ -67,6 +67,8 @@ import type {
 	TranscriptSource,
 } from "../../../cli/src/Types.js";
 import { CURRENT_SCHEMA_VERSION } from "../../../cli/src/Types.js";
+import { showArchivedMarkdownPreview } from "../core/ArchivedMarkdownPreview.js";
+import { renderReferenceForPreview } from "../core/ReferencePreviewMarkdown.js";
 import { removeNote, saveNote } from "../core/NoteService.js";
 import {
 	listAvailablePlans,
@@ -3429,8 +3431,8 @@ export class SummaryWebviewPanel {
 	}
 
 	/**
-	 * Opens the captured-at-commit markdown snapshot for a reference in a
-	 * read-only editor.
+	 * Opens the captured-at-commit markdown snapshot for a reference as a
+	 * read-only rendered preview.
 	 *
 	 * Source: orphan branch `references/<source>/<sanitized>.md`. Once a
 	 * reference is associated with a commit, the local `.jolli/jollimemory/`
@@ -3441,7 +3443,7 @@ export class SummaryWebviewPanel {
 		archivedKey: string,
 		source: SourceId,
 		_nativeId: string,
-		_title: string,
+		title: string,
 	): Promise<void> {
 		if (!archivedKey) return;
 		const content = await readReferenceFromBranch(
@@ -3456,14 +3458,27 @@ export class SummaryWebviewPanel {
 			);
 			return;
 		}
-		// Untitled doc — same rationale as plan / note preview: never re-
+		// Virtual doc — same rationale as plan / note preview: never re-
 		// materialize on the user's disk. The orphan branch is the source of
 		// truth for archived snapshots.
-		const doc = await vscode.workspace.openTextDocument({
-			language: "markdown",
-			content,
-		});
-		await vscode.window.showTextDocument(doc);
+		//
+		// The ref carries this panel's provenance rather than its already-built
+		// `foreignStorage`, because the ref is all that survives a window reload —
+		// the provider rebuilds the storage from the name/url when VS Code restores
+		// the tab and re-asks for the body.
+		await showArchivedMarkdownPreview(
+			{
+				ns: "reference",
+				source,
+				archivedKey,
+				...(this.foreignRepoName ? { repoName: this.foreignRepoName } : {}),
+				...(this.foreignRepoName && this.foreignRepoUrl
+					? { remoteUrl: this.foreignRepoUrl }
+					: {}),
+			},
+			title || archivedKey,
+			renderReferenceForPreview(content),
+		);
 	}
 
 	/**

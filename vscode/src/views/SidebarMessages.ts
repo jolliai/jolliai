@@ -928,6 +928,13 @@ export type SidebarOutboundMsg =
 			readonly type: "kb:openEvidenceReference";
 			readonly archivedKey: string;
 			readonly source: string;
+			/**
+			 * The reference's human title, so the preview tab is named after it and
+			 * not after the storage key. The memory detail panel's route to the same
+			 * snapshot already passes one; without this the two entry points name the
+			 * same snapshot differently.
+			 */
+			readonly title: string;
 			readonly sourceRepoName: string | null;
 			readonly sourceRemoteUrl: string | null;
 	  }

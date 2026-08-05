@@ -155,6 +155,19 @@ vi.mock("../util/WorkspaceUtils.js", () => ({
 	loadGlobalConfig: mockLoadConfig,
 }));
 
+// The archived-snapshot preview registers a TextDocumentContentProvider and holds a
+// module-level EventEmitter, neither of which the lightweight `vscode` mock above
+// provides. Stub it: the panel's contract is "read from the orphan branch, hand the
+// body to the preview" — the rendering itself is covered in
+// core/ArchivedMarkdownPreview.test.ts.
+const { mockShowArchivedMarkdownPreview } = vi.hoisted(() => ({
+	mockShowArchivedMarkdownPreview: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../core/ArchivedMarkdownPreview.js", () => ({
+	showArchivedMarkdownPreview: mockShowArchivedMarkdownPreview,
+}));
+
 const { mockGenerateE2eTest, mockGenerateRecap, mockTranslateToEnglish } =
 	vi.hoisted(() => ({
 		mockGenerateE2eTest: vi.fn().mockResolvedValue([]),
@@ -8778,9 +8791,20 @@ describe("SummaryWebviewPanel", () => {
 
 			it("Linear: reads the snapshot from the orphan branch", async () => {
 				mockReadReferenceFromBranch.mockResolvedValueOnce(
-					'---\nticketId: "PROJ-1"\n---\nbody from orphan branch',
+					[
+						"---",
+						'source: "linear"',
+						'nativeId: "PROJ-1"',
+						'title: "T"',
+						'url: "https://linear.app/acme/issue/PROJ-1"',
+						'referencedAt: "2026-08-05T09:30:00.000Z"',
+						'sourceToolName: "get_issue"',
+						"---",
+						"",
+						"body from orphan branch",
+					].join("\n"),
 				);
-				openTextDocument.mockClear();
+				mockShowArchivedMarkdownPreview.mockClear();
 				const dispatch = await setupPanel();
 
 				dispatch({
@@ -8798,20 +8822,36 @@ describe("SummaryWebviewPanel", () => {
 					workspaceRoot,
 					undefined,
 				);
-				// Opens an untitled markdown doc with the orphan-branch content
-				// — does NOT re-materialize the local file. Orphan branch is
-				// the source of truth for archived snapshots.
-				expect(openTextDocument).toHaveBeenCalledWith({
-					language: "markdown",
-					content: '---\nticketId: "PROJ-1"\n---\nbody from orphan branch',
-				});
+				// Previews the orphan-branch content from an in-memory virtual
+				// document — does NOT re-materialize the local file. Orphan branch
+				// is the source of truth for archived snapshots.
+				//
+				// The ref is self-describing so the provider can re-read the snapshot
+				// after a window reload drops the in-memory body.
+				expect(mockShowArchivedMarkdownPreview).toHaveBeenCalledWith(
+					{
+						ns: "reference",
+						source: "linear",
+						archivedKey: "linear:PROJ-1-aaaaaaaa",
+					},
+					"T",
+					// Frontmatter is promoted into the body: VS Code's markdown preview
+					// hides it, and the url lives there.
+					expect.stringContaining(
+						"[https://linear.app/acme/issue/PROJ-1](https://linear.app/acme/issue/PROJ-1)",
+					),
+				);
+				const [, , renderedBody] = mockShowArchivedMarkdownPreview.mock
+					.calls[0] as [unknown, string, string];
+				expect(renderedBody).toContain("body from orphan branch");
+				expect(renderedBody.startsWith("---")).toBe(false);
 			});
 
 			it("Jira: reads the snapshot from the orphan branch", async () => {
 				mockReadReferenceFromBranch.mockResolvedValueOnce(
 					"# KAN-5\n\nJira ticket body",
 				);
-				openTextDocument.mockClear();
+				mockShowArchivedMarkdownPreview.mockClear();
 				const dispatch = await setupPanel();
 
 				dispatch({
@@ -8829,10 +8869,16 @@ describe("SummaryWebviewPanel", () => {
 					workspaceRoot,
 					undefined,
 				);
-				expect(openTextDocument).toHaveBeenCalledWith({
-					language: "markdown",
-					content: "# KAN-5\n\nJira ticket body",
-				});
+				// No frontmatter to promote — the body passes through untouched.
+				expect(mockShowArchivedMarkdownPreview).toHaveBeenCalledWith(
+					{
+						ns: "reference",
+						source: "jira",
+						archivedKey: "jira:KAN-5-aaaa1111",
+					},
+					"Jira ticket",
+					"# KAN-5\n\nJira ticket body",
+				);
 			});
 
 			it("shows an error when the orphan-branch lookup misses", async () => {

@@ -915,6 +915,7 @@ export class SidebarWebviewProvider
 					msg.source,
 					msg.sourceRepoName,
 					msg.sourceRemoteUrl,
+					msg.title,
 				);
 				return;
 			}

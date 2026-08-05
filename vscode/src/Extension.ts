@@ -82,6 +82,12 @@ import {
 	selectAllPlansAndNotesCommand,
 } from "./commands/SelectAllSelection.js";
 import { SquashCommand } from "./commands/SquashCommand.js";
+import {
+	registerArchivedMarkdownPreview,
+	showArchivedMarkdownPreview,
+} from "./core/ArchivedMarkdownPreview.js";
+import { decodePreviewRef, encodePreviewRef, sanitizeTitleForUriPath } from "./core/PreviewUri.js";
+import { renderReferenceForPreview } from "./core/ReferencePreviewMarkdown.js";
 import { getNotesDir } from "./core/NoteService.js";
 import {
 	addPlanToRegistry,
@@ -554,7 +560,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			this._onDidChange.fire(uri);
 		}
 		provideTextDocumentContent(uri: vscode.Uri): string {
-			const slug = new URLSearchParams(uri.query).get("slug") ?? "";
+			const slug = decodePreviewRef(uri.query)?.slug ?? "";
 			log.info(
 				"cmd",
 				`provideTextDocumentContent: slug="${slug}", found=${this.contents.has(slug)}`,
@@ -589,19 +595,15 @@ export function activate(context: vscode.ExtensionContext): void {
 			);
 			return;
 		}
-		const safeTitle = title.replace(/[/\\:*?"<>|#%&{}]/g, "-").substring(0, 80);
 		// Uri.from() correctly separates query from path (Uri.parse treats ?key=val as path for opaque URIs).
 		const uri = vscode.Uri.from({
 			scheme: PLAN_SCHEME,
-			path: `/${safeTitle}.md`,
-			query: `slug=${encodeURIComponent(slug)}`,
+			path: `/${sanitizeTitleForUriPath(title)}.md`,
+			query: encodePreviewRef({ slug }),
 		});
 		// Set content and fire onDidChange to invalidate any cached virtual document.
 		planContentProvider.setContent(slug, content, uri);
-		// Load virtual document (triggers provideTextDocumentContent) without showing a raw text tab.
-		await vscode.workspace.openTextDocument(uri);
-		// Open only the rendered markdown preview.
-		await vscode.commands.executeCommand("markdown.showPreview", uri);
+		await openRenderedPreview(uri);
 	}
 
 	// ── Note readonly preview ───────────────────────────────────────────────
@@ -618,7 +620,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			this._onDidChange.fire(uri);
 		}
 		provideTextDocumentContent(uri: vscode.Uri): string {
-			const id = new URLSearchParams(uri.query).get("id") ?? "";
+			const id = decodePreviewRef(uri.query)?.id ?? "";
 			log.info(
 				"cmd",
 				`provideTextDocumentContent (note): id="${id}", found=${this.contents.has(id)}`,
@@ -649,15 +651,88 @@ export function activate(context: vscode.ExtensionContext): void {
 			);
 			return;
 		}
-		const safeTitle = title.replace(/[/\\:*?"<>|#%&{}]/g, "-").substring(0, 80);
 		const uri = vscode.Uri.from({
 			scheme: NOTE_SCHEME,
-			path: `/${safeTitle}.md`,
-			query: `id=${encodeURIComponent(id)}`,
+			path: `/${sanitizeTitleForUriPath(title)}.md`,
+			query: encodePreviewRef({ id }),
 		});
 		noteContentProvider.setContent(id, content, uri);
-		await vscode.workspace.openTextDocument(uri);
-		await vscode.commands.executeCommand("markdown.showPreview", uri);
+		await openRenderedPreview(uri);
+	}
+
+	// ── In-memory snapshot previews (skills aggregate, archived references) ──
+	// Third registration, after plan and note — Extension.test.ts reaches for those
+	// two providers by registration index.
+	//
+	// The resolver is what lets a preview tab survive a window reload: VS Code
+	// restores the tab and re-asks the provider for a body the extension host no
+	// longer has cached. Every snapshot this scheme serves is recomputable, so the
+	// miss is re-read here rather than shown as a dead page.
+	context.subscriptions.push(
+		registerArchivedMarkdownPreview(async (ref) => {
+			if (ref.ns === "skills-live") {
+				const skills = await bridge.listSkills();
+				return skills.length > 0 ? buildLiveSkillsMarkdown(skills) : undefined;
+			}
+			if (ref.ns === "skills") {
+				const { summary } = await bridge.getSummaryAnyRepoWithSource(
+					ref.commitHash,
+				);
+				if (!summary || (summary.skills?.length ?? 0) === 0) return undefined;
+				return buildSkillsAggregateMarkdown(summary, summary.skills ?? []);
+			}
+			return await readReferenceForPreview(
+				ref.source as SourceId,
+				ref.archivedKey,
+				ref.repoName ?? null,
+				ref.remoteUrl ?? null,
+			);
+		}),
+	);
+
+	/**
+	 * Reads an archived reference snapshot and prepares it for RENDERED display.
+	 *
+	 * Single entry point on purpose: the frontmatter-to-header rewrite has to happen
+	 * on the first open and on every re-read after a reload, and doing it at only one
+	 * of the two would make a restored tab lose its link line.
+	 */
+	async function readReferenceForPreview(
+		source: SourceId,
+		archivedKey: string,
+		foreignRepoName: string | null,
+		foreignRepoUrl: string | null,
+	): Promise<string | undefined> {
+		const readStorageResult = foreignRepoName
+			? await bridge.createStorageForRepo(foreignRepoName, foreignRepoUrl)
+			: null;
+		const content = await readReferenceFromBranch(
+			source,
+			archivedKey,
+			workspaceRoot,
+			readStorageResult?.storage,
+		);
+		return content ? renderReferenceForPreview(content) : undefined;
+	}
+
+	/**
+	 * Loads a virtual document (so its provider is asked for content) and opens only
+	 * the rendered markdown preview — never a raw text tab.
+	 *
+	 * `markdown.showPreview` comes from the built-in markdown-language-features
+	 * extension. A user who disabled it would otherwise see a bare
+	 * "command 'markdown.showPreview' not found".
+	 */
+	async function openRenderedPreview(uri: vscode.Uri): Promise<void> {
+		try {
+			await vscode.workspace.openTextDocument(uri);
+			await vscode.commands.executeCommand("markdown.showPreview", uri);
+		} catch (e) {
+			log.warn("cmd", `openRenderedPreview failed — ${String(e)}`);
+			void vscode.window.showErrorMessage(
+				"Could not open the Markdown preview. The built-in Markdown extension may be disabled.",
+			);
+		}
 	}
 
 	// ── Add note helpers ─────────────────────────────────────────────────────
@@ -3170,7 +3245,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		// Opens the aggregate view of every skill captured but not yet committed —
 		// what the single Context "Skills" row and its hover card both point at.
 		//
-		// Rendered into an UNTITLED document rather than opened from disk. There is no
+		// Rendered into a virtual document rather than opened from disk. There is no
 		// file to open: on disk each skill is its own `skills/<source>/<stem>.md`, and
 		// the aggregate only becomes a real file (`skills--<hash8>.md`) once the work
 		// is committed and the summary's visible layer is written. Rendering through
@@ -3188,11 +3263,11 @@ export function activate(context: vscode.ExtensionContext): void {
 				);
 				return;
 			}
-			const doc = await vscode.workspace.openTextDocument({
-				content: buildLiveSkillsMarkdown(skills),
-				language: "markdown",
-			});
-			await vscode.window.showTextDocument(doc, { preview: true });
+			await showArchivedMarkdownPreview(
+				{ ns: "skills-live" },
+				"Skills used — uncommitted",
+				buildLiveSkillsMarkdown(skills),
+			);
 		}),
 
 		// The COMMITTED counterpart of openSkillsAggregate: the aggregate Context row
@@ -3203,11 +3278,11 @@ export function activate(context: vscode.ExtensionContext): void {
 		// are archived onto the commit, so the live path would open an unrelated (or
 		// empty) table. The archived snapshot on the summary is the only correct source.
 		//
-		// Untitled document rather than the `skills--<hash8>.md` file on disk: that file
-		// exists only in the Memory Bank's visible layer, which is absent in
-		// orphan-branch-only storage mode and for a foreign repo whose folder this
-		// machine may never have seen. Rendering from the summary works in every mode,
-		// and `buildSkillsAggregateMarkdown` is the same renderer that wrote the file.
+		// Rendered from the summary rather than opened from the `skills--<hash8>.md`
+		// file on disk: that file exists only in the Memory Bank's visible layer, which
+		// is absent in orphan-branch-only storage mode and for a foreign repo whose
+		// folder this machine may never have seen. Rendering works in every mode, and
+		// `buildSkillsAggregateMarkdown` is the same renderer that wrote the file.
 		vscode.commands.registerCommand(
 			"jollimemory.previewCommittedSkills",
 			async (
@@ -3229,11 +3304,11 @@ export function activate(context: vscode.ExtensionContext): void {
 					);
 					return;
 				}
-				const doc = await vscode.workspace.openTextDocument({
-					content: buildSkillsAggregateMarkdown(summary, skills),
-					language: "markdown",
-				});
-				await vscode.window.showTextDocument(doc, { preview: true });
+				await showArchivedMarkdownPreview(
+					{ ns: "skills", commitHash },
+					`Skills used — ${commitHash.substring(0, 8)}`,
+					buildSkillsAggregateMarkdown(summary, skills),
+				);
 			},
 		),
 
@@ -3268,32 +3343,41 @@ export function activate(context: vscode.ExtensionContext): void {
 				source: SourceId,
 				foreignRepoName?: string | null,
 				foreignRepoUrl?: string | null,
+				// The reference's human title. Optional so an older caller still works,
+				// but the sidebar passes it — without it the tab is named after the
+				// storage key (`linear-PROJ-1-ab12cd34.md`) while the SAME snapshot
+				// opened from the memory detail panel gets the real title, i.e. one
+				// snapshot showing up as two differently-named tabs.
+				title?: string,
 			) => {
 				log.info("cmd", `previewCommittedReference: ${source}:${archivedKey}`);
 				if (!archivedKey) return;
-				const readStorageResult = foreignRepoName
-					? await bridge.createStorageForRepo(foreignRepoName, foreignRepoUrl ?? null)
-					: null;
-				const content = await readReferenceFromBranch(
+				// Virtual doc — same rationale as plan/note preview elsewhere: never
+				// re-materialize an archived snapshot on the user's disk; the orphan
+				// branch is the source of truth.
+				const body = await readReferenceForPreview(
 					source,
 					archivedKey,
-					workspaceRoot,
-					readStorageResult?.storage,
+					foreignRepoName ?? null,
+					foreignRepoUrl ?? null,
 				);
-				if (!content) {
+				if (!body) {
 					vscode.window.showErrorMessage(
 						`Reference snapshot "${archivedKey}" not found on the orphan branch.`,
 					);
 					return;
 				}
-				// Untitled markdown doc — same rationale as plan/note/reference
-				// preview elsewhere: never re-materialize an archived snapshot on
-				// the user's disk; the orphan branch is the source of truth.
-				const doc = await vscode.workspace.openTextDocument({
-					language: "markdown",
-					content,
-				});
-				await vscode.window.showTextDocument(doc);
+				await showArchivedMarkdownPreview(
+					{
+						ns: "reference",
+						source,
+						archivedKey,
+						...(foreignRepoName ? { repoName: foreignRepoName } : {}),
+						...(foreignRepoUrl ? { remoteUrl: foreignRepoUrl } : {}),
+					},
+					title || archivedKey,
+					body,
+				);
 			},
 		),
 

@@ -4967,15 +4967,19 @@ describe("SidebarWebviewProvider", () => {
 				type: "kb:openEvidenceReference",
 				archivedKey: "linear:PROJ-1-ab12cd34",
 				source: "linear",
+				title: "Fix the login redirect",
 				sourceRepoName: null,
 				sourceRemoteUrl: null,
 			});
+			// The title rides along so the preview tab is named after the reference
+			// rather than after its storage key.
 			expect(executeCommand).toHaveBeenCalledWith(
 				"jollimemory.previewCommittedReference",
 				"linear:PROJ-1-ab12cd34",
 				"linear",
 				null,
 				null,
+				"Fix the login redirect",
 			);
 		});
 
@@ -4988,6 +4992,7 @@ describe("SidebarWebviewProvider", () => {
 				type: "kb:openEvidenceReference",
 				archivedKey: "slack:C0-123.456-ab12cd34",
 				source: "slack",
+				title: "#eng-standup thread",
 				sourceRepoName: null,
 				sourceRemoteUrl: null,
 			});
@@ -4997,6 +5002,7 @@ describe("SidebarWebviewProvider", () => {
 				"slack",
 				null,
 				null,
+				"#eng-standup thread",
 			);
 		});
 

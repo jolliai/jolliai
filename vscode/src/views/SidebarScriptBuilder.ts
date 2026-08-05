@@ -2790,6 +2790,7 @@ export function buildSidebarScript(): string {
             type: 'kb:openEvidenceReference',
             archivedKey: item.id,
             source: item.source || '',
+            title: item.title || item.id || '',
             sourceRepoName: srcRepoName,
             sourceRemoteUrl: srcRemoteUrl,
           });

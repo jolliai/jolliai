@@ -293,6 +293,10 @@ const {
 			sourceRemoteUrl: null,
 		}),
 		listPlans: vi.fn().mockResolvedValue([]),
+		// Working skill registry behind openSkillsAggregate. Empty by default:
+		// the command short-circuits with an information message, which is what
+		// most tests touching it want.
+		listSkills: vi.fn().mockResolvedValue([]),
 		removePlan: vi.fn().mockResolvedValue(undefined),
 		listNotes: vi.fn().mockResolvedValue([]),
 		removeNote: vi.fn().mockResolvedValue(undefined),
@@ -1146,6 +1150,7 @@ vi.mock("node:timers", () => ({
 
 import * as vscode from "vscode";
 import { runCopyBranchRecallPrompt, runRecallInClaudeCode } from "./commands/BranchRecallCommands.js";
+import { encodePreviewRef } from "./core/PreviewUri.js";
 import { activate, deactivate } from "./Extension.js";
 import { activateExtensionTelemetry, reinitExtensionTelemetry } from "./TelemetryActivation.js";
 import { loadBranchSummaries } from "./views/BranchSummaryLoader.js";
@@ -2668,10 +2673,11 @@ describe("Extension", () => {
 				expect(mockBridge.previewReferenceMarkdown).not.toHaveBeenCalled();
 			});
 
-			it("previewCommittedReference: reads the archived snapshot off the orphan branch and opens an untitled doc", async () => {
+			it("previewCommittedReference: reads the archived snapshot off the orphan branch and renders it", async () => {
 				readReferenceFromBranch.mockResolvedValueOnce("# PROJ-1\nArchived snapshot body");
 				openTextDocument.mockClear();
 				showTextDocument.mockClear();
+				executeCommand.mockClear();
 
 				const handler = getRegisteredCommand(
 					"jollimemory.previewCommittedReference",
@@ -2686,10 +2692,81 @@ describe("Extension", () => {
 					expect.anything(),
 					undefined,
 				);
+				// A named virtual document, then the rendered preview — never a raw
+				// text editor over an unnamed, dirty-on-birth untitled buffer.
 				expect(openTextDocument).toHaveBeenCalledWith(
-					expect.objectContaining({ language: "markdown", content: "# PROJ-1\nArchived snapshot body" }),
+					expect.objectContaining({
+						scheme: "jollimemory-archived",
+						path: "/linear-PROJ-1-ab12cd34.md",
+					}),
 				);
-				expect(showTextDocument).toHaveBeenCalled();
+				expect(executeCommand).toHaveBeenCalledWith(
+					"markdown.showPreview",
+					expect.objectContaining({ scheme: "jollimemory-archived" }),
+				);
+				expect(showTextDocument).not.toHaveBeenCalled();
+			});
+
+			// Both skills commands render an in-memory table. They previously opened it
+			// as an untitled document, which VS Code names `Untitled-1`, marks dirty on
+			// creation (so closing prompts to save), and shows as raw markdown source
+			// rather than the rendered table the clicked row promises.
+			it("openSkillsAggregate: previews the live table under its own name", async () => {
+				mockBridge.listSkills.mockResolvedValueOnce([
+					{ skill: "brainstorming", invocationCount: 2 },
+				]);
+				openTextDocument.mockClear();
+				showTextDocument.mockClear();
+				executeCommand.mockClear();
+
+				const handler = getRegisteredCommand("jollimemory.openSkillsAggregate");
+				await handler();
+
+				expect(openTextDocument).toHaveBeenCalledWith(
+					expect.objectContaining({
+						scheme: "jollimemory-archived",
+						path: "/Skills used — uncommitted.md",
+					}),
+				);
+				expect(executeCommand).toHaveBeenCalledWith(
+					"markdown.showPreview",
+					expect.objectContaining({ scheme: "jollimemory-archived" }),
+				);
+				expect(showTextDocument).not.toHaveBeenCalled();
+			});
+
+			it("previewCommittedSkills: previews the archived table titled by short hash", async () => {
+				mockBridge.getSummaryAnyRepoWithSource.mockResolvedValueOnce({
+					summary: {
+						commitHash: "ab12cd34ef567890",
+						branch: "feature/x",
+						generatedAt: "2026-08-05T00:00:00.000Z",
+						commitMessage: "Add the thing",
+						skills: [{ skill: "brainstorming", invocationCount: 1 }],
+					},
+					sourceRepoName: null,
+					sourceRemoteUrl: null,
+				} as never);
+				openTextDocument.mockClear();
+				showTextDocument.mockClear();
+				executeCommand.mockClear();
+
+				const handler = getRegisteredCommand(
+					"jollimemory.previewCommittedSkills",
+				);
+				await handler("ab12cd34ef567890");
+
+				expect(openTextDocument).toHaveBeenCalledWith(
+					expect.objectContaining({
+						scheme: "jollimemory-archived",
+						path: "/Skills used — ab12cd34.md",
+					}),
+				);
+				expect(executeCommand).toHaveBeenCalledWith(
+					"markdown.showPreview",
+					expect.objectContaining({ scheme: "jollimemory-archived" }),
+				);
+				expect(showTextDocument).not.toHaveBeenCalled();
 			});
 
 			it("previewCommittedReference: threads foreign FolderStorage when foreignRepoName is set", async () => {
@@ -2728,6 +2805,190 @@ describe("Extension", () => {
 					expect.stringContaining("linear:GONE-1"),
 				);
 				expect(openTextDocument).not.toHaveBeenCalled();
+			});
+
+			it("previewCommittedReference: names the tab after the title the sidebar passes", async () => {
+				// The sidebar's evidence row used to pass no title, so its tab was named
+				// after the storage key while the SAME snapshot opened from the memory
+				// detail panel got the real title — one snapshot, two differently-named
+				// tabs.
+				readReferenceFromBranch.mockResolvedValueOnce("# body");
+				openTextDocument.mockClear();
+
+				const handler = getRegisteredCommand(
+					"jollimemory.previewCommittedReference",
+				);
+				await handler(
+					"linear:PROJ-1-ab12cd34",
+					"linear",
+					null,
+					null,
+					"Fix the login redirect",
+				);
+
+				expect(openTextDocument).toHaveBeenCalledWith(
+					expect.objectContaining({ path: "/Fix the login redirect.md" }),
+				);
+			});
+
+			// The archived scheme's content provider — third registration, after plan
+			// and note. These cover the RE-READ path: VS Code restores a preview tab
+			// after a window reload and asks for a body the extension host no longer
+			// caches, so everything here must come back from source.
+			describe("archived snapshot re-read", () => {
+				function archivedProvider(): {
+					provideTextDocumentContent: (uri: {
+						query: string;
+					}) => Promise<string>;
+				} {
+					const call = registerTextDocumentContentProvider.mock.calls[2] as
+						| [
+								string,
+								{
+									provideTextDocumentContent: (uri: {
+										query: string;
+									}) => Promise<string>;
+								},
+						  ]
+						| undefined;
+					if (!call) throw new Error("archived provider was never registered");
+					return call[1];
+				}
+
+				it("re-renders the live skills table", async () => {
+					mockBridge.listSkills.mockResolvedValueOnce([
+						{ skill: "brainstorming", invocationCount: 2 },
+					]);
+
+					const body = await archivedProvider().provideTextDocumentContent({
+						query: encodePreviewRef({ ns: "skills-live" }),
+					});
+
+					expect(body).toContain("brainstorming");
+				});
+
+				it("reports the live table as unavailable once the registry is empty", async () => {
+					mockBridge.listSkills.mockResolvedValueOnce([]);
+
+					const body = await archivedProvider().provideTextDocumentContent({
+						query: encodePreviewRef({ ns: "skills-live" }),
+					});
+
+					expect(body).toContain("no longer available");
+				});
+
+				it("re-renders a committed skills table from the summary", async () => {
+					mockBridge.getSummaryAnyRepoWithSource.mockResolvedValueOnce({
+						summary: {
+							commitHash: "ab12cd34ef567890",
+							branch: "feature/x",
+							generatedAt: "2026-08-05T00:00:00.000Z",
+							commitMessage: "Add the thing",
+							skills: [{ skill: "writing-plans", invocationCount: 1 }],
+						},
+						sourceRepoName: null,
+						sourceRemoteUrl: null,
+					} as never);
+
+					const body = await archivedProvider().provideTextDocumentContent({
+						query: encodePreviewRef({
+							ns: "skills",
+							commitHash: "ab12cd34ef567890",
+						}),
+					});
+
+					expect(body).toContain("writing-plans");
+				});
+
+				it("reports a squashed-away commit as unavailable", async () => {
+					mockBridge.getSummaryAnyRepoWithSource.mockResolvedValueOnce({
+						summary: null,
+						sourceRepoName: null,
+						sourceRemoteUrl: null,
+					} as never);
+
+					const body = await archivedProvider().provideTextDocumentContent({
+						query: encodePreviewRef({ ns: "skills", commitHash: "deadbeef" }),
+					});
+
+					expect(body).toContain("no longer available");
+				});
+
+				it("re-reads a reference off the orphan branch and promotes its frontmatter", async () => {
+					readReferenceFromBranch.mockResolvedValueOnce(
+						[
+							"---",
+							'source: "linear"',
+							'nativeId: "PROJ-1"',
+							'title: "Fix the login redirect"',
+							'url: "https://linear.app/acme/issue/PROJ-1"',
+							'referencedAt: "2026-08-05T09:30:00.000Z"',
+							'sourceToolName: "get_issue"',
+							"---",
+							"",
+							"Body.",
+						].join("\n"),
+					);
+
+					const body = await archivedProvider().provideTextDocumentContent({
+						query: encodePreviewRef({
+							ns: "reference",
+							source: "linear",
+							archivedKey: "linear:PROJ-1-ab12cd34",
+						}),
+					});
+
+					// The rewrite has to happen on the re-read too — otherwise a restored
+					// tab silently loses the link line the first render had.
+					expect(body).toContain(
+						"[https://linear.app/acme/issue/PROJ-1](https://linear.app/acme/issue/PROJ-1)",
+					);
+					expect(body).toContain("Body.");
+				});
+
+				it("rebuilds a foreign repo's storage from the provenance in the ref", async () => {
+					// Nothing but the URI survives the reload, so the storage cannot be
+					// carried over — it has to be reconstructed from name + url.
+					mockBridge.createStorageForRepo.mockResolvedValueOnce({
+						storage: { tag: "foreign-storage" },
+					} as never);
+					readReferenceFromBranch.mockResolvedValueOnce("# body");
+
+					await archivedProvider().provideTextDocumentContent({
+						query: encodePreviewRef({
+							ns: "reference",
+							source: "linear",
+							archivedKey: "linear:PROJ-9-ffe1",
+							repoName: "other-repo",
+							remoteUrl: "https://github.com/org/other-repo",
+						}),
+					});
+
+					expect(mockBridge.createStorageForRepo).toHaveBeenCalledWith(
+						"other-repo",
+						"https://github.com/org/other-repo",
+					);
+					expect(readReferenceFromBranch).toHaveBeenCalledWith(
+						"linear",
+						"linear:PROJ-9-ffe1",
+						expect.anything(),
+						{ tag: "foreign-storage" },
+					);
+				});
+
+				it("reports an unarchived reference as unavailable", async () => {
+					readReferenceFromBranch.mockResolvedValueOnce(null);
+
+					const body = await archivedProvider().provideTextDocumentContent({
+						query: encodePreviewRef({
+							ns: "reference",
+							source: "linear",
+							archivedKey: "linear:GONE-1",
+						}),
+					});
+
+					expect(body).toContain("no longer available");
+				});
 			});
 
 			it("ignoreReference: marks the entity ignored and refreshes plans", async () => {
@@ -3332,10 +3593,14 @@ describe("Extension", () => {
 					| undefined;
 				expect(provider).toBeDefined();
 				expect(
-					provider?.provideTextDocumentContent({ query: "id=note-1" }),
+					provider?.provideTextDocumentContent({
+						query: encodePreviewRef({ id: "note-1" }),
+					}),
 				).toBe("# Note content");
 				expect(
-					provider?.provideTextDocumentContent({ query: "id=missing" }),
+					provider?.provideTextDocumentContent({
+						query: encodePreviewRef({ id: "missing" }),
+					}),
 				).toBe("# Note not found");
 				expect(provider?.provideTextDocumentContent({ query: "" })).toBe(
 					"# Note not found",
@@ -3459,10 +3724,14 @@ describe("Extension", () => {
 					| undefined;
 				expect(provider).toBeDefined();
 				expect(
-					provider?.provideTextDocumentContent({ query: "slug=my-plan" }),
+					provider?.provideTextDocumentContent({
+						query: encodePreviewRef({ slug: "my-plan" }),
+					}),
 				).toBe("# Plan content");
 				expect(
-					provider?.provideTextDocumentContent({ query: "slug=missing" }),
+					provider?.provideTextDocumentContent({
+						query: encodePreviewRef({ slug: "missing" }),
+					}),
 				).toBe("# Plan not found");
 				expect(provider?.provideTextDocumentContent({ query: "" })).toBe(
 					"# Plan not found",
@@ -4068,10 +4337,14 @@ describe("Extension", () => {
 					| undefined;
 				expect(provider).toBeDefined();
 				expect(
-					provider?.provideTextDocumentContent({ query: "id=note-abc" }),
+					provider?.provideTextDocumentContent({
+						query: encodePreviewRef({ id: "note-abc" }),
+					}),
 				).toBe("# Note content");
 				expect(
-					provider?.provideTextDocumentContent({ query: "id=missing" }),
+					provider?.provideTextDocumentContent({
+						query: encodePreviewRef({ id: "missing" }),
+					}),
 				).toBe("# Note not found");
 				expect(provider?.provideTextDocumentContent({ query: "" })).toBe(
 					"# Note not found",
