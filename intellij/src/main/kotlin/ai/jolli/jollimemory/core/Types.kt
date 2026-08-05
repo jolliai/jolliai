@@ -510,6 +510,25 @@ data class SkillCommitRef(
     val usageBySession: Map<String, SkillUsage>? = null,
     /** "heuristic" when the invocation was inferred rather than observed. */
     val detection: String? = null,
+    /**
+     * Push state of this skill's Jolli Space article, written by the CLI/VS Code push
+     * path. The UNIFORM field names, not `jolliSkillDoc*`: skill is a new context kind
+     * and takes the push registry's defaults (plan/note override them only because
+     * their stored data predates the registry). Mirrored here for the same reason as
+     * every other field on this class — a member missing from the DTO is silently
+     * dropped on the next Gson round-trip, which would lose the published article id.
+     */
+    val jolliDocUrl: String? = null,
+    val jolliDocId: Int? = null,
+    /**
+     * Article ids a merge superseded, pending cleanup — transient by design: the CLI
+     * drains it into the root summary's `orphanedDocIds` and strips the key in the same
+     * write, so a persisted ref should never carry one. Mirrored anyway because the
+     * round-trip hazard is the point: a ref read mid-flight (or written by a future CLI
+     * that defers the drain) would come back through Gson with the marker gone and the
+     * superseded articles stranded on the Space.
+     */
+    val supersededDocIds: List<Int>? = null,
 )
 
 /**

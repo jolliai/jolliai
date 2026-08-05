@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SkillCommitRef, SkillEntry, SkillUsage } from "../../Types.js";
-import { archivedTotalsOf, isLegacyArchived, mergeSkillRefs, uncommittedDelta } from "./SkillDelta.js";
+import { archivedTotalsOf, isLegacyArchived, mergeSkillRef, mergeSkillRefs, uncommittedDelta } from "./SkillDelta.js";
 
 const usage = (input: number, cached: number, output: number, confidence: SkillUsage["confidence"]): SkillUsage => ({
 	input,
@@ -209,6 +209,104 @@ describe("mergeSkillRefs", () => {
 		expect(merged).toHaveLength(1);
 		expect(merged[0].invocationCount).toBe(3);
 		expect(merged[0].usage).toEqual(usage(4, 30, 6, "attributed"));
+	});
+
+	// Regression: the merge spread `...prev`, so a published article id present only
+	// on the LATER ref was dropped. The next push then CREATEd a duplicate article
+	// instead of updating the existing one.
+	it("inherits a published article id the earlier ref lacks", () => {
+		const merged = mergeSkillRefs([
+			ref({ invocationCount: 1 }),
+			ref({
+				archivedKey: "claude:superpowers:brainstorming-700be509",
+				invocationCount: 1,
+				jolliDocId: 77,
+				jolliDocUrl: "https://acme.jolli.ai/articles?doc=77",
+			}),
+		]);
+		// The URL must travel WITH the id: the reuse gate reads its origin to decide
+		// which backend the id belongs to.
+		expect(merged[0]).toMatchObject({
+			jolliDocId: 77,
+			jolliDocUrl: "https://acme.jolli.ai/articles?doc=77",
+		});
+	});
+
+	it("never overwrites an article id the earlier ref already has", () => {
+		// Overwriting would push the merged content to the later ref's article and
+		// orphan (leak) the one already recorded — the same rule plan inheritance follows.
+		const merged = mergeSkillRefs([
+			ref({ invocationCount: 1, jolliDocId: 11, jolliDocUrl: "https://acme.jolli.ai/articles?doc=11" }),
+			ref({
+				archivedKey: "claude:superpowers:brainstorming-700be509",
+				invocationCount: 1,
+				jolliDocId: 77,
+				jolliDocUrl: "https://acme.jolli.ai/articles?doc=77",
+			}),
+		]);
+		expect(merged[0].jolliDocId).toBe(11);
+		expect(merged[0].jolliDocUrl).toBe("https://acme.jolli.ai/articles?doc=11");
+	});
+
+	// A skill article is one document per (skill, COMMIT), so the id the rule above
+	// declines to adopt belongs to a REAL published article that this fold has just
+	// made unreachable. Forgetting it leaves it on the Space forever, titled with a
+	// hash8 the branch no longer has. Under the previous cross-commit baseKey only one
+	// ref per skill was ever pushed, so the situation could not arise.
+	it("banks the article id it declined to adopt, for cleanup", () => {
+		const merged = mergeSkillRefs([
+			ref({ invocationCount: 1, jolliDocId: 11, jolliDocUrl: "https://acme.jolli.ai/articles?doc=11" }),
+			ref({
+				archivedKey: "claude:superpowers:brainstorming-700be509",
+				invocationCount: 1,
+				jolliDocId: 77,
+				jolliDocUrl: "https://acme.jolli.ai/articles?doc=77",
+			}),
+		]);
+		expect(merged[0].supersededDocIds).toEqual([77]);
+	});
+
+	it("never banks the id the merged ref still points at", () => {
+		// Would delete the live article. Reachable when the same ref is met from both
+		// ends of a squash tree with an id already on it.
+		const withId = ref({
+			invocationCount: 1,
+			jolliDocId: 11,
+			jolliDocUrl: "https://acme.jolli.ai/articles?doc=11",
+		});
+		const merged = mergeSkillRef(withId, ref({ ...withId, hash: "700be509" }));
+		expect(merged.jolliDocId).toBe(11);
+		expect(merged.supersededDocIds).toBeUndefined();
+	});
+
+	it("carries an inner fold's banked ids up through an outer fold", () => {
+		// Skills are folded at three levels on the way to a squash root
+		// (collectChildSkills → QueueWorker's extraSkills pre-merge → buildSquashSummary),
+		// so a fold that reported drops as a RETURN value would lose the inner ones.
+		const inner = mergeSkillRef(
+			ref({ invocationCount: 1, jolliDocId: 11, jolliDocUrl: "https://acme.jolli.ai/articles?doc=11" }),
+			ref({ hash: "700be509", invocationCount: 1, jolliDocId: 77 }),
+		);
+		const outer = mergeSkillRef(inner, ref({ hash: "8f2c1a04", invocationCount: 1, jolliDocId: 88 }));
+		expect(outer.supersededDocIds).toEqual([77, 88]);
+	});
+
+	it("drops a banked id that a later fold adopts as the survivor", () => {
+		// `prev` has no id, so `next`'s is ADOPTED — and an id the incoming ref had
+		// already banked must not then delete the article the merge just adopted.
+		const banked = { ...ref({ hash: "700be509", invocationCount: 1, jolliDocId: 77 }), supersededDocIds: [77] };
+		const merged = mergeSkillRef(ref({ invocationCount: 1 }), banked);
+		expect(merged.jolliDocId).toBe(77);
+		expect(merged.supersededDocIds).toBeUndefined();
+	});
+
+	it("leaves the field off entirely when nothing was superseded", () => {
+		// No churn in stored JSON for the overwhelmingly common case.
+		const merged = mergeSkillRefs([
+			ref({ invocationCount: 1 }),
+			ref({ archivedKey: "claude:superpowers:brainstorming-700be509", invocationCount: 1 }),
+		]);
+		expect(merged[0]).not.toHaveProperty("supersededDocIds");
 	});
 
 	it("counts one archived record once even when it is reached twice", () => {

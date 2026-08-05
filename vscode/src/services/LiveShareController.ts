@@ -26,7 +26,7 @@
  */
 
 import { createHash } from "node:crypto";
-import type { CommitSummary, PlanReference, NoteReference, ReferenceCommitRef } from "../../../cli/src/Types.js";
+import type { CommitSummary } from "../../../cli/src/Types.js";
 import { type LiveRef, getShare, putBranchShare } from "../../../cli/src/core/BranchShareStore.js";
 import { getDefaultBranch } from "../../../cli/src/core/GitOps.js";
 import { deriveJolliBackendKeyFromApiKey, parseJolliApiKey } from "../../../cli/src/core/JolliApiUtils.js";
@@ -34,12 +34,18 @@ import { extractRepoName } from "../../../cli/src/core/KBPathResolver.js";
 import { slugify } from "../../../cli/src/core/SummaryExporter.js";
 import { resolveEffectiveRecap, resolveEffectiveTopics } from "../../../cli/src/core/SummaryStore.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
+import { baseKeyOfItem, getContextKinds, selectItems } from "../../../cli/src/core/push/ContextKindRegistry.js";
+import { assignOwnedContext, selectionForCommit } from "../../../cli/src/core/push/ContextPush.js";
 import { deriveOwnerRepoFromUrl, getCanonicalRepoUrl } from "../util/GitRemoteUtils.js";
 import { log } from "../util/Logger.js";
-import { byUpdatedAtDesc, planBaseKey } from "../util/PlanGrouping.js";
 import { loadBranchSummaries } from "../views/BranchSummaryLoader.js";
 import { buildBranchRelativePath } from "../views/SummaryUtils.js";
-import type { BindingOutcome, PushAttachmentFailure, PushContext } from "./JolliPushOrchestrator.js";
+import type {
+	BindingOutcome,
+	PushAttachmentFailure,
+	PushContext,
+	PushedDoc,
+} from "./JolliPushOrchestrator.js";
 import { pushSummaryWithAttachments, ShareBindingError } from "./JolliPushOrchestrator.js";
 import { PushDisabledError } from "./JolliPushService.js";
 import { isRepoWideRefusal } from "../../../cli/src/core/PushRefusal.js";
@@ -149,138 +155,33 @@ async function loadSubjectSummaries(
 	return commitHash ? summaries.filter((s) => s.commitHash === commitHash) : summaries;
 }
 
-/** The winner revision of a recurring plan/note + which commit owns its push. */
-interface Winner<T> {
-	readonly ref: T;
-	readonly ownerCommit: string;
-	/** A known docId for this plan/note (from any commit's prior push) so the push updates in place. */
-	readonly seedDocId?: number;
-	/** Article URL the `seedDocId` was minted with — rides with the id so the reuse gate (`canReuseDocId`, keyed on the URL's origin) can tell which backend it belongs to, and so the woven URL matches the id. */
-	readonly seedDocUrl?: string;
-}
-
 /**
- * Cross-commit dedup: pick the winner revision per plan base-slug / note id
- * (latest updatedAt), remember the owner commit + any known docId to reuse, and
- * assign each winner (docId injected) to its owner commit. Shared by the
- * live-share push and the Create-PR branch push so both dedup identically.
+ * The published attachments of one push result, flattened out of the kind-agnostic
+ * `pushedDoc.attachments` map.
  *
- * Also returns the seed docId maps (winners that already have a known docId) so
- * `pushSubjectAndBuildRef` can pre-seed its `covered` resolution exactly as
- * before — the Create-PR path ignores these (it builds no `covered`).
+ * Reads ONLY that map — deliberately, even though `PushedDoc` still carries the
+ * legacy `plans`/`notes`/`references` views for other consumers. An earlier version
+ * fell back to those when `attachments` was absent, which is unreachable
+ * (`pushSummaryWithAttachments` always sets it) and cost more than the dead branch:
+ * the one caller that omitted the field was this file's own test double, so every
+ * `covered`-allowlist assertion in the suite was exercising the fallback rather than
+ * the path production takes. The double now builds the map.
  */
-function assignOwnedAttachments(subjectSummaries: ReadonlyArray<CommitSummary>): {
-	ownedPlans: Map<string, PlanReference[]>;
-	ownedNotes: Map<string, NoteReference[]>;
-	ownedReferences: Map<string, ReferenceCommitRef[]>;
-	seedPlanDocIds: Map<string, number>;
-	seedNoteDocIds: Map<string, number>;
-	seedReferenceDocIds: Map<string, number>;
-} {
-	const planWinners = new Map<string, Winner<PlanReference>>();
-	const noteWinners = new Map<string, Winner<NoteReference>>();
-	const referenceWinners = new Map<string, Winner<ReferenceCommitRef>>();
-	for (const summary of subjectSummaries) {
-		for (const plan of summary.plans ?? []) {
-			const key = planBaseKey(plan.slug);
-			const prev = planWinners.get(key);
-			// Use the SAME comparator as latestPlanPerName (updatedAt desc, slug
-			// tiebreak) so the two dedup paths never disagree on which snapshot is
-			// "latest" — a disagreement would push one slug but weave the URL against
-			// the other, dropping the plan's markdown link. String compare (via
-			// byUpdatedAtDesc) also avoids Date.parse's NaN-on-malformed-date pitfall.
-			if (!prev || byUpdatedAtDesc(plan, prev.ref) < 0) {
-				// This revision wins (or is the first seen). Its own docId is
-				// authoritative for the latest article; fall back to a docId a prior
-				// revision surfaced only when this one carries none. The URL tracks
-				// whichever revision actually supplied the docId.
-				const seedDocId = plan.jolliPlanDocId ?? prev?.seedDocId;
-				const seedDocUrl = plan.jolliPlanDocId !== undefined ? plan.jolliPlanDocUrl : prev?.seedDocUrl;
-				planWinners.set(key, { ref: plan, ownerCommit: summary.commitHash, seedDocId, seedDocUrl });
-			} else if (prev.seedDocId === undefined && plan.jolliPlanDocId !== undefined) {
-				// A losing (older) revision only fills in a docId the winner didn't
-				// already have. It must NEVER overwrite the winner's own docId —
-				// doing so would push the latest content to an older article and
-				// orphan (leak) the winner's real one.
-				planWinners.set(key, { ...prev, seedDocId: plan.jolliPlanDocId, seedDocUrl: plan.jolliPlanDocUrl });
-			}
-		}
-		for (const note of summary.notes ?? []) {
-			const prev = noteWinners.get(note.id);
-			// Notes are keyed by exact id, so no slug tiebreak is needed. Compare
-			// updatedAt as strings (newest wins, first-seen kept on a tie) to stay
-			// deterministic and NaN-free for a malformed/missing updatedAt.
-			if (!prev || note.updatedAt > prev.ref.updatedAt) {
-				const seedDocId = note.jolliNoteDocId ?? prev?.seedDocId;
-				const seedDocUrl = note.jolliNoteDocId !== undefined ? note.jolliNoteDocUrl : prev?.seedDocUrl;
-				noteWinners.set(note.id, { ref: note, ownerCommit: summary.commitHash, seedDocId, seedDocUrl });
-			} else if (prev.seedDocId === undefined && note.jolliNoteDocId !== undefined) {
-				noteWinners.set(note.id, { ...prev, seedDocId: note.jolliNoteDocId, seedDocUrl: note.jolliNoteDocUrl });
-			}
-		}
-		for (const ref of summary.references ?? []) {
-			// A reference is identified across commits by its stable `<source>:<nativeId>`,
-			// NOT its per-commit `archivedKey`, so the same ticket on two commits pushes to
-			// ONE Space article. Recency by `referencedAt` (newest wins, first-seen on tie).
-			const key = `${ref.source}:${ref.nativeId}`;
-			const prev = referenceWinners.get(key);
-			if (!prev || ref.referencedAt > prev.ref.referencedAt) {
-				const seedDocId = ref.jolliReferenceDocId ?? prev?.seedDocId;
-				const seedDocUrl = ref.jolliReferenceDocId !== undefined ? ref.jolliReferenceDocUrl : prev?.seedDocUrl;
-				referenceWinners.set(key, { ref, ownerCommit: summary.commitHash, seedDocId, seedDocUrl });
-			} else if (prev.seedDocId === undefined && ref.jolliReferenceDocId !== undefined) {
-				referenceWinners.set(key, {
-					...prev,
-					seedDocId: ref.jolliReferenceDocId,
-					seedDocUrl: ref.jolliReferenceDocUrl,
-				});
-			}
-		}
+function publishedAttachmentsOf(doc: PushedDoc): ReadonlyArray<{ docType: string; baseKey: string; docId: number }> {
+	const out: Array<{ docType: string; baseKey: string; docId: number }> = [];
+	for (const [docType, docs] of doc.attachments) {
+		for (const d of docs) out.push({ docType, baseKey: d.baseKey, docId: d.docId });
 	}
-
-	const ownedPlans = new Map<string, PlanReference[]>();
-	const ownedNotes = new Map<string, NoteReference[]>();
-	const ownedReferences = new Map<string, ReferenceCommitRef[]>();
-	const pushInto = <T>(map: Map<string, T[]>, commit: string, item: T): void => {
-		const arr = map.get(commit);
-		if (arr) arr.push(item);
-		else map.set(commit, [item]);
-	};
-	for (const w of planWinners.values()) {
-		pushInto(
-			ownedPlans,
-			w.ownerCommit,
-			w.seedDocId ? { ...w.ref, jolliPlanDocId: w.seedDocId, jolliPlanDocUrl: w.seedDocUrl } : w.ref,
-		);
-	}
-	for (const w of noteWinners.values()) {
-		pushInto(
-			ownedNotes,
-			w.ownerCommit,
-			w.seedDocId ? { ...w.ref, jolliNoteDocId: w.seedDocId, jolliNoteDocUrl: w.seedDocUrl } : w.ref,
-		);
-	}
-	for (const w of referenceWinners.values()) {
-		pushInto(
-			ownedReferences,
-			w.ownerCommit,
-			w.seedDocId ? { ...w.ref, jolliReferenceDocId: w.seedDocId, jolliReferenceDocUrl: w.seedDocUrl } : w.ref,
-		);
-	}
-
-	const seedPlanDocIds = new Map<string, number>();
-	const seedNoteDocIds = new Map<string, number>();
-	const seedReferenceDocIds = new Map<string, number>();
-	for (const w of planWinners.values()) if (w.seedDocId) seedPlanDocIds.set(planBaseKey(w.ref.slug), w.seedDocId);
-	for (const [id, w] of noteWinners) if (w.seedDocId) seedNoteDocIds.set(id, w.seedDocId);
-	for (const [key, w] of referenceWinners) if (w.seedDocId) seedReferenceDocIds.set(key, w.seedDocId);
-
-	return { ownedPlans, ownedNotes, ownedReferences, seedPlanDocIds, seedNoteDocIds, seedReferenceDocIds };
+	return out;
 }
 
 /**
  * Pushes the subject's summaries + deduped attachments and builds the live `ref`.
  * Shared by generate + reconcile so create-time and reconcile produce identical refs.
+ *
+ * Attachment dedup and the `covered` resolution are generic over the registered
+ * context kinds ({@link assignOwnedContext} / {@link getContextKinds}) — a new
+ * kind rides the share with no change here.
  */
 async function pushSubjectAndBuildRef(
 	subjectSummaries: ReadonlyArray<CommitSummary>,
@@ -289,50 +190,59 @@ async function pushSubjectAndBuildRef(
 	ctx: PushContext,
 ): Promise<LiveRef> {
 	// 1–2. Cross-commit dedup: winners + owned attachments + seed docId maps.
-	const { ownedPlans, ownedNotes, ownedReferences, seedPlanDocIds, seedNoteDocIds, seedReferenceDocIds } =
-		assignOwnedAttachments(subjectSummaries);
+	const owned = assignOwnedContext(subjectSummaries);
 
 	// 3. Push each summary oldest→newest with only its owned attachments. Capture the
-	//    pushed summary docId per commit and accumulate the branch-wide attachment map,
-	//    pre-seeded with any known docIds so a doc pushed under another commit still links.
-	const planDocIdByBase = new Map<string, number>(seedPlanDocIds);
-	const noteDocIdById = new Map<string, number>(seedNoteDocIds);
-	const referenceDocIdByBase = new Map<string, number>(seedReferenceDocIds);
+	//    pushed summary docId per commit and accumulate the branch-wide per-kind
+	//    docId maps, pre-seeded with any known docIds so a doc pushed under another
+	//    commit still links.
+	const docIdByKindBase = new Map<string, Map<string, number>>();
+	for (const [docType, forKind] of owned) docIdByKindBase.set(docType, new Map(forKind.seeds));
 
 	const summaryDocIds: number[] = [];
+	// Best-effort kinds the server would not take. NOT surfaced to the user here, and
+	// that is a deliberate split from the branch-push path: reconcile re-enters this
+	// function on every modal open as a background pass, so a notification would fire
+	// unprompted and repeatedly, and `LiveShareResult` — the only channel out of the
+	// interactive caller — is the server's own response shape, not a place for
+	// client-side diagnostics. One aggregated line so the share path has a single
+	// searchable record instead of only the per-summary logs.
+	const skippedLabels: string[] = [];
 	for (const summary of subjectSummaries) {
-		const result = await pushSummaryWithAttachments(summary, ctx, {
-			plans: ownedPlans.get(summary.commitHash) ?? [],
-			notes: ownedNotes.get(summary.commitHash) ?? [],
-			references: ownedReferences.get(summary.commitHash) ?? [],
-		}, {
+		const result = await pushSummaryWithAttachments(summary, ctx, selectionForCommit(owned, summary.commitHash), {
 			strictAttachments: true,
 		});
 		if (result.attachmentFailures.length > 0) {
 			throw new AttachmentPushError(result.attachmentFailures);
 		}
+		skippedLabels.push(...result.skippedAttachments.map((f) => f.label));
 		summaryDocIds.push(result.pushedDoc.summaryDocId);
-		for (const p of result.pushedDoc.plans) planDocIdByBase.set(planBaseKey(p.slug), p.docId);
-		for (const n of result.pushedDoc.notes) noteDocIdById.set(n.id, n.docId);
-		for (const r of result.pushedDoc.references) referenceDocIdByBase.set(r.baseKey, r.docId);
+		for (const a of publishedAttachmentsOf(result.pushedDoc)) {
+			const byBase = docIdByKindBase.get(a.docType);
+			if (byBase) byBase.set(a.baseKey, a.docId);
+			else docIdByKindBase.set(a.docType, new Map([[a.baseKey, a.docId]]));
+		}
 	}
 
-	// 4. Build covered: each commit references its OWN plans/notes/references' docids
-	//    (resolved via the shared maps, so a doc pushed under a different commit is
-	//    still linked — a reference keys on its stable `<source>:<nativeId>`).
+	if (skippedLabels.length > 0) {
+		log.warn(
+			"LiveShare",
+			`share of ${branch}: skipped ${skippedLabels.length} attachment(s): ${skippedLabels.join(", ")}`,
+		);
+	}
+
+	// 4. Build covered: each commit references its OWN attachments' docids, resolved
+	//    via the shared per-kind maps (so a doc pushed under a different commit is
+	//    still linked — each item keys on its kind's cross-commit baseKey).
 	const coveredFor = (summary: CommitSummary): number[] => {
 		const ids = new Set<number>();
-		for (const plan of summary.plans ?? []) {
-			const docId = planDocIdByBase.get(planBaseKey(plan.slug));
-			if (docId) ids.add(docId);
-		}
-		for (const note of summary.notes ?? []) {
-			const docId = noteDocIdById.get(note.id);
-			if (docId) ids.add(docId);
-		}
-		for (const ref of summary.references ?? []) {
-			const docId = referenceDocIdByBase.get(`${ref.source}:${ref.nativeId}`);
-			if (docId) ids.add(docId);
+		for (const contextKind of getContextKinds()) {
+			const byBase = docIdByKindBase.get(contextKind.docType);
+			if (byBase === undefined) continue;
+			for (const item of selectItems(contextKind, summary)) {
+				const docId = byBase.get(baseKeyOfItem(contextKind, item));
+				if (docId) ids.add(docId);
+			}
 		}
 		return [...ids];
 	};
@@ -597,6 +507,16 @@ export interface PushBranchMemoriesResult {
 	 * here; they propagate and abort. `pushedCount` counts only successes.
 	 */
 	readonly summaryFailures: ReadonlyArray<PushAttachmentFailure>;
+	/**
+	 * Best-effort attachments (reference / skill) the server would not take, already
+	 * aggregated one entry per kind per summary by the orchestrator.
+	 *
+	 * Reported rather than dropped for the same reason the summary panel reports them:
+	 * this is a button the user pressed, and returning plain success while publishing
+	 * fewer articles than the branch has context for misstates what happened. Kept out
+	 * of `attachmentFailures` because these must never turn the push into a failure.
+	 */
+	readonly skippedAttachments: ReadonlyArray<PushAttachmentFailure>;
 }
 
 /**
@@ -622,22 +542,20 @@ export function pushBranchMemoriesToSpace(deps: LiveShareDeps, branch: string): 
 		if (subjectSummaries.length === 0) throw new NothingToShareError(branch);
 
 		const ctx = buildPushContext(deps, baseUrl, repoUrl);
-		const { ownedPlans, ownedNotes, ownedReferences } = assignOwnedAttachments(subjectSummaries);
+		const owned = assignOwnedContext(subjectSummaries);
 
 		let pushedCount = 0;
 		let attachmentCount = 0;
 		const attachmentFailures: PushAttachmentFailure[] = [];
+		const skippedAttachments: PushAttachmentFailure[] = [];
 		const summaryFailures: PushAttachmentFailure[] = [];
 		for (const summary of subjectSummaries) {
 			try {
-				const result = await pushSummaryWithAttachments(summary, ctx, {
-					plans: ownedPlans.get(summary.commitHash) ?? [],
-					notes: ownedNotes.get(summary.commitHash) ?? [],
-					references: ownedReferences.get(summary.commitHash) ?? [],
-				});
+				const result = await pushSummaryWithAttachments(summary, ctx, selectionForCommit(owned, summary.commitHash));
 				pushedCount += 1;
 				attachmentCount += result.attachmentCount;
 				attachmentFailures.push(...result.attachmentFailures);
+				skippedAttachments.push(...result.skippedAttachments);
 			} catch (err) {
 				// Fatal for the whole batch: every summary here belongs to the SAME repo,
 				// so a repo-wide refusal (outdated plugin, this repo's push opt-out,
@@ -662,6 +580,6 @@ export function pushBranchMemoriesToSpace(deps: LiveShareDeps, branch: string): 
 				});
 			}
 		}
-		return { pushedCount, attachmentCount, attachmentFailures, summaryFailures };
+		return { pushedCount, attachmentCount, attachmentFailures, skippedAttachments, summaryFailures };
 	});
 }

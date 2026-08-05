@@ -6,12 +6,12 @@
  * Structure mirrors the webview layout.
  */
 
-import type { CommitSummary, E2eTestScenario, ReferenceCommitRef, SourceId } from "../Types.js";
+import type { CommitSummary, E2eTestScenario, ReferenceCommitRef, SkillCommitRef, SourceId } from "../Types.js";
 import { escMdLinkText, escMdStrikeText, escMdUrl } from "./MarkdownEscape.js";
 import { REF_HASH_SUFFIX } from "./RefMerge.js";
 import { referenceDisplayTitle } from "./references/ReferenceDisplay.js";
 import { getRegistry } from "./references/SourceDefinitionRegistry.js";
-import { buildSkillsSummaryLabel } from "./SkillsAggregateMarkdown.js";
+import { buildSkillsSummaryLabel, buildSkillsTable } from "./SkillsAggregateMarkdown.js";
 import {
 	collectSortedTopics,
 	formatDate,
@@ -19,6 +19,7 @@ import {
 	formatProviderLabel,
 	getDisplayDate,
 	padIndex,
+	skillSourceLabel,
 	type TopicWithDate,
 } from "./SummaryFormat.js";
 import {
@@ -314,6 +315,73 @@ export function buildReferencePushMarkdown(ref: ReferenceCommitRef, description?
 	if (body) {
 		lines.push("", body);
 	}
+	return lines.join("\n");
+}
+
+/**
+ * Builds the article body pushed for a single archived skill (docType `skill`).
+ *
+ * **Every figure is THIS COMMIT's increment, read off the `ref` alone.** That is
+ * the whole contract of this function, and it is a deliberate reversal: the body
+ * used to prefer the orphan-branch snapshot's frontmatter, whose counters are the
+ * registry row's RUNNING TOTAL across every commit that used the skill (see
+ * `SkillEntry.archivedTotals` and `foldSkillUse`'s accumulating
+ * `invocationCount`). A reader comparing the article against the same record in
+ * the VS Code panel — which renders `summary.skills` through
+ * {@link buildSkillsAggregateMarkdown}, i.e. the increment — saw two different
+ * numbers for one commit, and the article's were the larger, so the memory looked
+ * more expensive than it was.
+ *
+ * Making the increment win is only coherent because the article is now one
+ * document per (skill, commit): with the old cross-commit `baseKey` a single
+ * shared document would have shown whichever commit pushed last. The two changes
+ * are one change — see the `skill` definition's `baseKey` in `push/kinds/index.ts`.
+ *
+ * **Three things the old body carried are deliberately gone**, all for the same
+ * reason — they are cumulative and cannot be re-derived per commit, so in a
+ * per-commit article each one contradicted the table beside it:
+ *
+ *   - `## Invocations`, the snapshot's verbatim per-invocation rows. Cumulative by
+ *     construction (and capped), so it listed four entries under `Invocations: 1`.
+ *     No VS Code surface shows it either — neither {@link buildSkillsAggregateMarkdown}
+ *     nor `buildLiveSkillsMarkdown` renders invocation detail.
+ *   - `First used` / `Last used`. `SkillArchive` stamps these from the registry
+ *     ROW, not the delta, so they span the skill's whole life: an August commit's
+ *     article read `First used: July 30`.
+ *   - The `- **Invocations:** N` bullet, which the table's `×` column already
+ *     states. Removing it means the count exists in exactly one place.
+ *
+ * `entryPaths` and `plugin` stay despite also being cumulative unions: they are
+ * identity (HOW the skill is entered), not measurements, so they cannot be read as
+ * overstating what this commit cost.
+ */
+export function buildSkillPushMarkdown(ref: SkillCommitRef): string {
+	const lines: Array<string> = [];
+	lines.push(`- **Host:** ${escMdLinkText(skillSourceLabel(ref.source))}`);
+	if (ref.plugin !== undefined && ref.plugin !== "") {
+		lines.push(`- **Plugin:** ${escMdLinkText(ref.plugin)}`);
+	}
+	if (ref.entryPaths.length > 0) {
+		lines.push(`- **Entered via:** ${ref.entryPaths.map((p) => escMdLinkText(p)).join(", ")}`);
+	}
+
+	// The token figures go through the SAME renderer every other skill surface
+	// uses, rather than being re-formatted here: `buildSkillsTable` owns the
+	// em-dash-not-zero rule, the `~` estimate marker and the `†` inferred
+	// footnote, and its docstring is explicit that those must not be duplicated.
+	// Passing the ref straight through is what keeps this table byte-identical to
+	// the row the VS Code panel renders for the same commit.
+	lines.push(
+		"",
+		...buildSkillsTable([
+			{
+				skill: ref.skill,
+				invocationCount: ref.invocationCount,
+				...(ref.usage !== undefined && { usage: ref.usage }),
+				...(ref.detection !== undefined && { detection: ref.detection }),
+			},
+		]),
+	);
 	return lines.join("\n");
 }
 

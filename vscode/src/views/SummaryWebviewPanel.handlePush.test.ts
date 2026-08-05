@@ -114,7 +114,11 @@ vi.mock("../../../cli/src/core/Locks.js", () => ({
 	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
 }));
 
-vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
+vi.mock("../../../cli/src/core/SessionTracker.js", async (importActual) => ({
+	// Spread the REAL module rather than enumerating the three functions below: an
+	// enumerating factory silently drops every other export, which surfaces as a push
+	// failing with "No export is defined" rather than as a missing mock.
+	...(await importActual<typeof import("../../../cli/src/core/SessionTracker.js")>()),
 	loadPlansRegistry: mockLoadPlansRegistry,
 	savePlansRegistry: mockSavePlansRegistry,
 	saveConfig: mockSaveConfig,
@@ -214,6 +218,7 @@ vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	readReferenceFromBranch: mockReadEntityFromBranch,
 	readNoteFromBranch: mockReadNoteFromBranch,
 	readPlanFromBranch: mockReadPlanFromBranch,
+	readSkillFromBranch: vi.fn(async () => null),
 	readTranscriptsForCommits: mockReadTranscriptsForCommits,
 	saveTranscriptsBatch: mockSaveTranscriptsBatch,
 	storeReferences: mockStoreEntities,
@@ -462,7 +467,11 @@ const { mockRandomBytes } = vi.hoisted(() => ({
 		.mockReturnValue({ toString: () => "mocknonce1234567=" }),
 }));
 
-vi.mock("node:crypto", () => ({
+vi.mock("node:crypto", async (importActual) => ({
+	// Spread the REAL module and override only `randomBytes`: an enumerating factory
+	// drops `createHash`, which the push path uses, and the push then fails with
+	// "No export is defined".
+	...(await importActual<typeof import("node:crypto")>()),
 	randomBytes: mockRandomBytes,
 }));
 
@@ -689,11 +698,14 @@ describe("SummaryWebviewPanel handlePush", () => {
 					(c[2] as { docType?: string }).docType === "plan",
 			);
 			expect(planCalls).toHaveLength(1);
-			// The single upload reads the latest snapshot's content (push reads
-			// with the 2-arg signature; the translate-set refresh uses 3 args).
+			// The single upload reads the LATEST snapshot's content. The push path now
+			// reads through the shared context-kind definition, which threads an
+			// optional storage provider — undefined here — so assert on the slug rather
+			// than an exact argument count.
 			expect(mockReadPlanFromBranch).toHaveBeenCalledWith(
 				"refactor-auth-2222bbbb",
 				workspaceRoot,
+				undefined,
 			);
 			// The pushed summary markdown is built from the deduped plans, so the
 			// article's Plans & Notes list doesn't repeat the superseded snapshot.
@@ -702,6 +714,44 @@ describe("SummaryWebviewPanel handlePush", () => {
 			};
 			expect(mdSummary.plans).toHaveLength(1);
 			expect(mdSummary.plans[0].slug).toBe("refactor-auth-2222bbbb");
+		});
+
+		// Regression: `bestEffortPush` is about not ABORTING, not about staying quiet.
+		// A skill push rejected by the server used to reach only the debug log, so a
+		// manual "Update to Jolli" reported plain success while publishing fewer
+		// articles than the memory had context for.
+		it("warns (non-modally) when a best-effort attachment is skipped, instead of reporting plain success", async () => {
+			mockLoadConfig.mockResolvedValue({ apiKey: "test", jolliApiKey: "jk_valid" });
+			mockParseJolliApiKey.mockReturnValue({ u: "https://my.jolli.app" });
+			// The exact shape observed in production: the server rejects the docType
+			// with an anonymous 400 rather than a machine-readable refusal.
+			mockPushToJolli.mockImplementation(
+				(_base: unknown, _key: unknown, payload: { docType?: string }) =>
+					payload.docType === "skill"
+						? Promise.reject(new Error("Invalid request body (HTTP 400)"))
+						: Promise.resolve({ docId: 55 }),
+			);
+			const dispatch = await setupPanel({
+				skills: [
+					{
+						archivedKey: "claude:review-3dbc6f8c",
+						source: "claude",
+						skill: "review",
+						entryPaths: ["tool"],
+						invocationCount: 1,
+						firstUsedAt: "2026-08-01T10:00:00.000Z",
+						lastUsedAt: "2026-08-05T10:00:00.000Z",
+					},
+				],
+			});
+
+			dispatch({ command: "push" });
+			await flushPromises();
+
+			// Visible, but NOT modal — the push itself succeeded.
+			expect(showWarningMessage).toHaveBeenCalledWith(expect.stringContaining("were skipped"));
+			// And it must not also claim unqualified success.
+			expect(showInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("on Jolli Space."));
 		});
 
 		it("does not abort the push when a single plan fails — pushes the summary and warns", async () => {

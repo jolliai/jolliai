@@ -1174,6 +1174,56 @@ describe("pushBatch", () => {
 		expect(r.jmSpace).toBeUndefined();
 	});
 
+	it("carries a failed attachment's machine-readable errorCode through the parser", async () => {
+		// Regression: the parser used to drop `errorCode`, which made the orchestrator's
+		// `doctype_not_allowed` branch dead code in production while unit tests that
+		// hand-built an already-parsed result still passed. This asserts from the RAW
+		// JSON on purpose — the parser is the thing under test.
+		const c = client(async () =>
+			jsonResponse(200, {
+				results: [
+					{
+						commitHash: "a".repeat(40),
+						ok: true,
+						summary: { docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true },
+						attachments: [
+							{
+								clientKey: "skill-0",
+								ok: false,
+								error: 'docType "skill" is not enabled',
+								errorCode: "doctype_not_allowed",
+							},
+						],
+					},
+				],
+			}),
+		);
+		const r = await c.pushBatch(payload);
+		expect(r.results[0].attachments[0]).toMatchObject({
+			clientKey: "skill-0",
+			ok: false,
+			errorCode: "doctype_not_allowed",
+		});
+	});
+
+	it("omits errorCode when the server sends none (older servers)", async () => {
+		const c = client(async () =>
+			jsonResponse(200, {
+				results: [
+					{
+						commitHash: "a".repeat(40),
+						ok: true,
+						summary: { docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true },
+						attachments: [{ clientKey: "plan-0", ok: false, error: "boom" }],
+					},
+				],
+			}),
+		);
+		const r = await c.pushBatch(payload);
+		expect(r.results[0].attachments[0].errorCode).toBeUndefined();
+		expect(r.results[0].attachments[0].error).toBe("boom");
+	});
+
 	it("passes the top-level jmSpace echo through on a 200", async () => {
 		const c = client(async () =>
 			jsonResponse(200, {

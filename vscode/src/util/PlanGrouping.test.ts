@@ -1,6 +1,15 @@
+/**
+ * Tests for the panel-side plan annotation.
+ *
+ * `planBaseKey` / `byUpdatedAtDesc` / `latestPlanPerName` are NOT tested here: they
+ * live in the CLI's `core/push/PlanGrouping` and are covered by the CLI suite. This
+ * file used to test local copies of them, which is what kept two spellings of one
+ * grouping rule alive after the push path moved to the context-kind registry.
+ */
+
 import { describe, expect, it } from "vitest";
 import type { PlanReference } from "../../../cli/src/Types.js";
-import { annotatePlans, latestPlanPerName, planBaseKey } from "./PlanGrouping.js";
+import { annotatePlans } from "./PlanGrouping.js";
 
 function makePlan(overrides?: Partial<PlanReference>): PlanReference {
 	return {
@@ -13,22 +22,18 @@ function makePlan(overrides?: Partial<PlanReference>): PlanReference {
 }
 
 describe("PlanGrouping", () => {
-	describe("planBaseKey", () => {
-		it("strips an 8-hex archived commit-hash suffix", () => {
-			expect(planBaseKey("refactor-auth-1a2b3c4d")).toBe("refactor-auth");
-		});
-
-		it("leaves a base slug ending in real words alone", () => {
-			expect(planBaseKey("refactor-auth")).toBe("refactor-auth");
-			// 7 or 9 hex chars (not exactly 8) are not a hash suffix.
-			expect(planBaseKey("plan-1a2b3c4")).toBe("plan-1a2b3c4");
-			expect(planBaseKey("plan-1a2b3c4d5")).toBe("plan-1a2b3c4d5");
-			// A trailing word that is not hex is untouched.
-			expect(planBaseKey("plan-feature")).toBe("plan-feature");
-		});
-	});
-
 	describe("annotatePlans", () => {
+		it("groups by the CLI's base key, so an archived snapshot and its base collapse", () => {
+			// Pinned here (not just in the CLI suite) because this is the SEAM: the panel
+			// must group by the same key the push path dedupes by, and the only way that
+			// can now break is this file importing the wrong helper.
+			const archived = makePlan({ slug: "refactor-auth-1a2b3c4d", updatedAt: "2026-01-12T00:00:00Z" });
+			const base = makePlan({ slug: "refactor-auth", updatedAt: "2026-01-10T00:00:00Z" });
+			const result = annotatePlans([base, archived]);
+			expect(result[0]).toMatchObject({ isLatest: true });
+			expect(result[1]).toMatchObject({ isSuperseded: true });
+		});
+
 		it("orders newest-first and flags exactly one Latest per multi-snapshot group", () => {
 			const a = makePlan({ slug: "p-1111aaaa", updatedAt: "2026-01-10T00:00:00Z" });
 			const b = makePlan({ slug: "p-2222bbbb", updatedAt: "2026-01-12T00:00:00Z" });
@@ -68,43 +73,6 @@ describe("PlanGrouping", () => {
 			expect(result.map((r) => r.plan.slug)).toEqual(["dup-1111aaaa", "dup-1111aaaa"]);
 			expect(result[0]).toMatchObject({ isLatest: true, isSuperseded: false });
 			expect(result[1]).toMatchObject({ isLatest: false, isSuperseded: true });
-		});
-	});
-
-	describe("latestPlanPerName", () => {
-		it("returns one plan per base name — the latest", () => {
-			const a = makePlan({ slug: "p-1111aaaa", updatedAt: "2026-01-10T00:00:00Z" });
-			const b = makePlan({ slug: "p-2222bbbb", updatedAt: "2026-01-12T00:00:00Z" });
-			const c = makePlan({ slug: "other-3333cccc", updatedAt: "2026-01-09T00:00:00Z" });
-			const result = latestPlanPerName([a, b, c]);
-			expect(result.map((p) => p.slug)).toEqual(["p-2222bbbb", "other-3333cccc"]);
-		});
-
-		it("returns the input unchanged when all names are distinct", () => {
-			const result = latestPlanPerName([makePlan({ slug: "only-1111aaaa" })]);
-			expect(result.map((p) => p.slug)).toEqual(["only-1111aaaa"]);
-		});
-
-		it("inherits a pushed sibling's docId onto the latest snapshot so the push updates, not duplicates", () => {
-			const older = makePlan({
-				slug: "p-1111aaaa",
-				updatedAt: "2026-01-10T00:00:00Z",
-				jolliPlanDocId: 42,
-				jolliPlanDocUrl: "https://jolli.ai/articles?doc=42",
-			});
-			const latest = makePlan({ slug: "p-2222bbbb", updatedAt: "2026-01-12T00:00:00Z" });
-			const result = latestPlanPerName([older, latest]);
-			expect(result).toHaveLength(1);
-			expect(result[0].slug).toBe("p-2222bbbb");
-			expect(result[0].jolliPlanDocId).toBe(42);
-			expect(result[0].jolliPlanDocUrl).toBe("https://jolli.ai/articles?doc=42");
-		});
-
-		it("keeps the latest snapshot's own docId when it already has one", () => {
-			const older = makePlan({ slug: "p-1111aaaa", updatedAt: "2026-01-10T00:00:00Z", jolliPlanDocId: 42 });
-			const latest = makePlan({ slug: "p-2222bbbb", updatedAt: "2026-01-12T00:00:00Z", jolliPlanDocId: 99 });
-			const result = latestPlanPerName([older, latest]);
-			expect(result[0].jolliPlanDocId).toBe(99);
 		});
 	});
 });

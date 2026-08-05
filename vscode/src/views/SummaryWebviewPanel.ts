@@ -2214,15 +2214,31 @@ export class SummaryWebviewPanel {
 				result.attachmentCount > 0
 					? ` (with ${result.attachmentCount} attachment${result.attachmentCount > 1 ? "s" : ""})`
 					: "";
+			const skipped = result.skippedAttachments;
 			if (result.attachmentFailures.length > 0) {
 				// Modal (not a transient toast): a partial failure must be as visible as
 				// the old fail-fast error — the panel otherwise re-renders to "Synced".
+				// Skipped best-effort attachments ride along in the detail: they did not
+				// cause this modal, but the user is already being interrupted, so listing
+				// them costs nothing and completes the picture.
+				const lines = [
+					...result.attachmentFailures.map((f) => `• ${f.label}: ${f.message}`),
+					...skipped.map((f) => `• ${f.label}: ${f.message} (skipped)`),
+				];
 				vscode.window.showWarningMessage(
 					`${verb} the memory on Jolli Space${attachMsg}, but ${result.attachmentFailures.length} attachment(s) failed to push.`,
-					{
-						modal: true,
-						detail: result.attachmentFailures.map((f) => `• ${f.label}: ${f.message}`).join("\n"),
-					},
+					{ modal: true, detail: lines.join("\n") },
+				);
+			} else if (skipped.length > 0) {
+				// A best-effort kind (reference / skill) could not be published. The push
+				// itself succeeded, so this is NOT the modal — but it must not be reported
+				// as plain success either: the user clicked a push button and got fewer
+				// articles than the memory has context for, and only a log line would have
+				// said so. Non-modal warning: visible, not blocking.
+				vscode.window.showWarningMessage(
+					`${verb} on Jolli Space${attachMsg}, but ${skipped.length} attachment(s) were skipped: ${skipped
+						.map((f) => f.label)
+						.join(", ")}.`,
 				);
 			} else {
 				vscode.window.showInformationMessage(`${verb} on Jolli Space${attachMsg}.`);

@@ -5,10 +5,11 @@ const { mockPushToJolli, mockDeleteFromJolli } = vi.hoisted(() => ({
 	mockPushToJolli: vi.fn(),
 	mockDeleteFromJolli: vi.fn(),
 }));
-const { mockReadPlan, mockReadNote, mockReadReference } = vi.hoisted(() => ({
+const { mockReadPlan, mockReadNote, mockReadReference, mockReadSkill } = vi.hoisted(() => ({
 	mockReadPlan: vi.fn(),
 	mockReadNote: vi.fn(),
 	mockReadReference: vi.fn(),
+	mockReadSkill: vi.fn(),
 }));
 // spec 306: the outbound-push gate. Default allowed; the fail-fast test flips it.
 const { mockIsOutboundPushAllowed } = vi.hoisted(() => ({
@@ -27,6 +28,7 @@ vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	readPlanFromBranch: mockReadPlan,
 	readNoteFromBranch: mockReadNote,
 	readReferenceFromBranch: mockReadReference,
+	readSkillFromBranch: mockReadSkill,
 }));
 vi.mock("../views/SummaryMarkdownBuilder.js", () => ({ buildMarkdown: () => "# markdown" }));
 vi.mock("../../../cli/src/core/Telemetry.js", () => ({ track: vi.fn() }));
@@ -34,6 +36,7 @@ vi.mock("../util/Logger.js", () => ({
 	log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+import { DocTypeNotAllowedError } from "../../../cli/src/core/JolliMemoryPushClient.js";
 import {
 	BindingRequiredError,
 	PermissionDeniedError,
@@ -77,6 +80,7 @@ beforeEach(() => {
 	mockReadPlan.mockResolvedValue("plan body");
 	mockReadNote.mockResolvedValue("note body");
 	mockReadReference.mockResolvedValue(null);
+	mockReadSkill.mockResolvedValue(null);
 	mockIsOutboundPushAllowed.mockResolvedValue(true);
 });
 
@@ -261,6 +265,117 @@ describe("pushSummaryWithAttachments", () => {
 		// path would turn into a fatal AttachmentPushError).
 		expect(result.pushedDoc.references).toEqual([]);
 		expect(result.attachmentFailures).toEqual([]);
+	});
+
+	// Same best-effort contract as a reference, and for the same reason: a skill record
+	// is auto-extracted from a transcript, never attached by the user. Without it, one
+	// transient failure would abort a whole strict live share over metadata about HOW
+	// the work happened.
+	it("treats a skill push failure as best-effort — skipped, NOT a fatal attachment failure", async () => {
+		mockPushToJolli.mockImplementation((_b, _k, p: { docType: string }) => {
+			if (p.docType === "skill") return Promise.reject(new Error("skill 500"));
+			return Promise.resolve({ docId: 100 });
+		});
+		const skill = {
+			archivedKey: "claude:superpowers:brainstorming-a1b2c3d4",
+			source: "claude" as const,
+			skill: "superpowers:brainstorming",
+			entryPaths: ["tool" as const],
+			invocationCount: 1,
+			firstUsedAt: "2026-08-01T10:00:00.000Z",
+			lastUsedAt: "2026-08-05T10:00:00.000Z",
+		};
+		const result = await pushSummaryWithAttachments(
+			makeSummary({ skills: [skill] }),
+			makeContext(),
+			new Map([["skill", [skill]]]),
+			{ strictAttachments: true },
+		);
+		expect(result.pushedDoc.summaryDocId).toBe(100);
+		expect(result.attachmentFailures).toEqual([]);
+		expect(result.skippedAttachments).toHaveLength(1);
+	});
+
+	it("reports ONE skipped entry for a kind however many of its items failed", async () => {
+		// The caller renders these into a notification. Per-item entries made a commit
+		// with a dozen skills produce a dozen titles in one toast.
+		mockPushToJolli.mockImplementation((_b, _k, p: { docType: string }) => {
+			if (p.docType === "skill") return Promise.reject(new Error("skill 500"));
+			return Promise.resolve({ docId: 100 });
+		});
+		const skills = ["one", "two", "three"].map((name) => ({
+			archivedKey: `claude:${name}-a1b2c3d4`,
+			source: "claude" as const,
+			skill: name,
+			entryPaths: ["tool" as const],
+			invocationCount: 1,
+			firstUsedAt: "2026-08-01T10:00:00.000Z",
+			lastUsedAt: "2026-08-05T10:00:00.000Z",
+		}));
+		const result = await pushSummaryWithAttachments(
+			makeSummary({ skills }),
+			makeContext(),
+			new Map([["skill", skills]]),
+		);
+		expect(result.skippedAttachments).toHaveLength(1);
+		expect(result.skippedAttachments[0].label).toBe("3 skill article(s)");
+		expect(result.attachmentFailures).toEqual([]);
+	});
+
+	it("reports a docType refusal as skipped instead of only logging it", async () => {
+		// The CLEAN refusal — the server naming the unsupported type in machine-readable
+		// form — used to be the only path that told the user nothing at all, while a
+		// server returning a generic error produced a warning. Same visibility now.
+		mockPushToJolli.mockImplementation((_b, _k, p: { docType: string }) => {
+			if (p.docType === "skill") return Promise.reject(new DocTypeNotAllowedError("skill", "not enabled"));
+			return Promise.resolve({ docId: 100 });
+		});
+		const skills = ["one", "two"].map((name) => ({
+			archivedKey: `claude:${name}-a1b2c3d4`,
+			source: "claude" as const,
+			skill: name,
+			entryPaths: ["tool" as const],
+			invocationCount: 1,
+			firstUsedAt: "2026-08-01T10:00:00.000Z",
+			lastUsedAt: "2026-08-05T10:00:00.000Z",
+		}));
+		const result = await pushSummaryWithAttachments(
+			makeSummary({ skills }),
+			makeContext(),
+			new Map([["skill", skills]]),
+		);
+		// Short-circuited after the first item: the second was never attempted.
+		expect(mockPushToJolli.mock.calls.filter((c) => (c[2] as { docType: string }).docType === "skill")).toHaveLength(
+			1,
+		);
+		expect(result.skippedAttachments).toEqual([
+			{ label: "skill article(s)", message: 'The server does not have article type "skill" enabled.' },
+		]);
+		// The summary itself still publishes — a refusal is per KIND, never repo-wide.
+		expect(result.pushedDoc.summaryDocId).toBe(100);
+	});
+
+	it("pushes a skill when the caller passes a kind-agnostic selection", async () => {
+		mockPushToJolli.mockImplementation((_b, _k, p: { docType: string }) =>
+			Promise.resolve({ docId: p.docType === "summary" ? 100 : 501 }),
+		);
+		const skill = {
+			archivedKey: "claude:superpowers:brainstorming-a1b2c3d4",
+			source: "claude" as const,
+			skill: "superpowers:brainstorming",
+			entryPaths: ["tool" as const],
+			invocationCount: 1,
+			firstUsedAt: "2026-08-01T10:00:00.000Z",
+			lastUsedAt: "2026-08-05T10:00:00.000Z",
+		};
+		const result = await pushSummaryWithAttachments(
+			makeSummary({ skills: [skill] }),
+			makeContext(),
+			new Map([["skill", [skill]]]),
+		);
+		const skillCall = mockPushToJolli.mock.calls.find((c) => (c[2] as { docType: string }).docType === "skill");
+		expect(skillCall).toBeDefined();
+		expect(result.updatedSummary.skills?.[0]).toMatchObject({ jolliDocId: 501 });
 	});
 
 	it("skips a snippet note with no content and pushes a markdown note's body", async () => {
@@ -455,7 +570,10 @@ describe("pushSummaryWithAttachments", () => {
 		expect(result.attachmentFailures).toEqual([
 			{ label: 'plan "Plan"', message: "Plan content for p-abc12345 could not be read." },
 			{ label: 'note "Note"', message: "Note content for n1 could not be read." },
-			{ label: 'note "Snippet"', message: "Snippet note content for s1 is empty." },
+			// The generic attachment loop reports every unreadable body with one message
+			// shape; the old snippet-specific wording ("Snippet note content … is empty")
+			// was folded into it when the loop became kind-driven.
+			{ label: 'note "Snippet"', message: "Note content for s1 could not be read." },
 		]);
 		expect(result.pushedDoc.plans).toEqual([]);
 		expect(result.pushedDoc.notes).toEqual([]);

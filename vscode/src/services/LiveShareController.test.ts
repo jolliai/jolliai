@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { getContextKinds } from "../../../cli/src/core/push/ContextKindRegistry.js";
+// The CLI's plan grouping, not the panel-side `util/PlanGrouping` — the double must
+// derive the `plan` kind's baseKey the same way the production code under test does.
+import { planBaseKey } from "../../../cli/src/core/push/PlanGrouping.js";
 import type { CommitSummary, PlanReference } from "../../../cli/src/Types.js";
 
 const { mockPush } = vi.hoisted(() => ({ mockPush: vi.fn() }));
@@ -115,25 +119,24 @@ beforeEach(() => {
 	mockGetShare.mockResolvedValue(undefined);
 	mockPutShare.mockResolvedValue(undefined);
 	// Default push: echo a docId for the chosen plan/note attachments; summary doc per commit.
-	type Att = {
-		plans: PlanReference[];
-		notes: Array<{ id: string; title: string; jolliNoteDocId?: number }>;
-		references?: Array<{ archivedKey: string; source: string; nativeId: string; jolliReferenceDocId?: number }>;
-	};
-	mockPush.mockImplementation((s: CommitSummary, _ctx: unknown, attachments?: Att) => {
-		const plans = (attachments?.plans ?? []).map((p) => ({
+	// The selection is a kind-keyed map, so the double reads it the same way the
+	// production code does rather than through the retired named fields.
+	type NoteAtt = { id: string; title: string; jolliNoteDocId?: number };
+	type RefAtt = { archivedKey: string; source: string; nativeId: string; jolliReferenceDocId?: number };
+	mockPush.mockImplementation((s: CommitSummary, _ctx: unknown, attachments?: unknown) => {
+		const plans = sel<PlanReference>(attachments, "plan").map((p) => ({
 			slug: p.slug,
 			title: p.title,
 			docId: p.jolliPlanDocId ?? 9000 + p.slug.length,
 			url: "u",
 		}));
-		const notes = (attachments?.notes ?? []).map((n) => ({
+		const notes = sel<NoteAtt>(attachments, "note").map((n) => ({
 			id: n.id,
 			title: n.title,
 			docId: n.jolliNoteDocId ?? 8000 + n.id.length,
 			url: "u",
 		}));
-		const references = (attachments?.references ?? []).map((r) => ({
+		const references = sel<RefAtt>(attachments, "reference").map((r) => ({
 			archivedKey: r.archivedKey,
 			baseKey: `${r.source}:${r.nativeId}`,
 			title: r.nativeId,
@@ -144,17 +147,51 @@ beforeEach(() => {
 			pushedDoc: {
 				commitHash: s.commitHash,
 				summaryDocId: SUMMARY_DOC[s.commitHash as keyof typeof SUMMARY_DOC],
+				// The kind-keyed map production actually returns, alongside the legacy named
+				// views. Built here (rather than left out) because `publishedAttachmentsOf`
+				// reads THIS field: a double that omitted it sent the controller down a
+				// legacy fallback no production call can reach, so the `covered` allowlist
+				// was only ever asserted against dead code.
+				attachments: new Map([
+					["plan", plans.map((p) => ({ entryKey: p.slug, baseKey: planBaseKey(p.slug), ...p }))],
+					["note", notes.map((n) => ({ entryKey: n.id, baseKey: n.id, ...n }))],
+					["reference", references.map((r) => ({ entryKey: r.archivedKey, ...r }))],
+				]),
 				plans,
 				notes,
 				references,
 			},
 			updatedSummary: s,
 			attachmentFailures: [],
+			skippedAttachments: [],
 			isUpdate: false,
 			attachmentCount: plans.length + notes.length + references.length,
 		});
 	});
 });
+
+/**
+ * The items a push call was handed for one context kind.
+ *
+ * The selection is a kind-keyed map (`selectionForCommit`), not the old
+ * `{ plans, notes, references }` object — a hand-built named object silently meant
+ * "push zero" for every unnamed kind, which is what skipped `skill` here.
+ */
+/**
+ * Asserts a commit was handed nothing to push — for EVERY registered kind, not just
+ * the three that used to be named. Checking the whole map is what makes "this commit
+ * owns no attachments" a real claim instead of one about three fields.
+ */
+function expectOwnsNothing(selection: unknown): void {
+	for (const kind of getContextKinds()) {
+		expect(sel(selection, kind.docType)).toEqual([]);
+	}
+}
+
+function sel<T = Record<string, unknown>>(selection: unknown, docType: string): T[] {
+	const map = selection as ReadonlyMap<string, ReadonlyArray<T>> | undefined;
+	return [...(map?.get(docType) ?? [])];
+}
 
 describe("subjectFingerprint", () => {
 	it("moves when only the recap changes on a topics-less summary (share card stays fresh)", () => {
@@ -227,8 +264,8 @@ describe("generateLiveShare", () => {
 		// A (older) owns nothing; B (newer) owns the winner, pushed with the seed docId 500 so it updates in place.
 		const callA = mockPush.mock.calls.find((c) => c[0].commitHash === "A");
 		const callB = mockPush.mock.calls.find((c) => c[0].commitHash === "B");
-		expect(callA?.[2]).toEqual({ plans: [], notes: [], references: [] });
-		expect(callB?.[2].plans).toEqual([
+		expectOwnsNothing(callA?.[2]);
+		expect(sel(callB?.[2], "plan")).toEqual([
 			expect.objectContaining({ slug: "p-bbbbbbbb", jolliPlanDocId: 500 }),
 		]);
 
@@ -271,8 +308,8 @@ describe("generateLiveShare", () => {
 
 		const callA = mockPush.mock.calls.find((c) => c[0].commitHash === "A");
 		const callB = mockPush.mock.calls.find((c) => c[0].commitHash === "B");
-		expect(callA?.[2].notes).toEqual([]);
-		expect(callB?.[2].notes).toEqual([expect.objectContaining({ id: "n1", jolliNoteDocId: 700 })]);
+		expect(sel(callA?.[2], "note")).toEqual([]);
+		expect(sel(callB?.[2], "note")).toEqual([expect.objectContaining({ id: "n1", jolliNoteDocId: 700 })]);
 
 		const ref = mockCreate.mock.calls[0][2].ref;
 		expect(ref.covered).toEqual([
@@ -292,8 +329,8 @@ describe("generateLiveShare", () => {
 
 		// A owns the winners (newer updatedAt) but pushes them with B's seeded docIds.
 		const callA = mockPush.mock.calls.find((c) => c[0].commitHash === "A");
-		expect(callA?.[2].plans).toEqual([expect.objectContaining({ jolliPlanDocId: 900 })]);
-		expect(callA?.[2].notes).toEqual([expect.objectContaining({ jolliNoteDocId: 950 })]);
+		expect(sel(callA?.[2], "plan")).toEqual([expect.objectContaining({ jolliPlanDocId: 900 })]);
+		expect(sel(callA?.[2], "note")).toEqual([expect.objectContaining({ jolliNoteDocId: 950 })]);
 	});
 
 	it("invokes the push context's storeSummary passthrough", async () => {
@@ -302,9 +339,17 @@ describe("generateLiveShare", () => {
 		mockPush.mockImplementation((s: CommitSummary, ctx: { storeSummary: (x: unknown, b: boolean) => Promise<void> }) => {
 			ctx.storeSummary(s, true); // exercise the buildPushContext passthrough
 			return Promise.resolve({
-				pushedDoc: { commitHash: s.commitHash, summaryDocId: 1, plans: [], notes: [], references: [] },
+				pushedDoc: {
+					commitHash: s.commitHash,
+					summaryDocId: 1,
+					attachments: new Map(),
+					plans: [],
+					notes: [],
+					references: [],
+				},
 				updatedSummary: s,
 				attachmentFailures: [],
+				skippedAttachments: [],
 				isUpdate: false,
 				attachmentCount: 0,
 			});
@@ -334,7 +379,14 @@ describe("generateLiveShare", () => {
 
 		await generateLiveShare({ ...deps(), branch: "feature/x", visibility: "public" });
 
-		expect(mockPush.mock.calls[0][2]).toEqual({ plans: [], notes: [], references: [] });
+		// The selection must carry an entry for EVERY registered context kind, not just
+		// plan/note/reference: a selection that omits a kind's key means "push zero of
+		// that kind", so a hand-built three-key object silently skipped `skill` (and any
+		// future kind) on this path while the drains still pushed them. Compared against
+		// the registry rather than a hard-coded list so it cannot rot.
+		const selection = mockPush.mock.calls[0][2] as ReadonlyMap<string, readonly unknown[]>;
+		expect([...selection.keys()].sort()).toEqual(getContextKinds().map((k) => k.docType).sort());
+		expect([...selection.values()].every((items) => items.length === 0)).toBe(true);
 		const ref = mockCreate.mock.calls[0][2].ref;
 		expect(ref.covered).toEqual([{ commitHash: "A", summaryDocId: 1001, attachmentDocIds: [] }]);
 	});
@@ -350,10 +402,10 @@ describe("generateLiveShare", () => {
 
 		const callA = mockPush.mock.calls.find((c) => c[0].commitHash === "A");
 		const callB = mockPush.mock.calls.find((c) => c[0].commitHash === "B");
-		expect(callA?.[2].plans).toEqual([expect.objectContaining({ slug: "p-aaaaaaaa" })]);
-		expect(callA?.[2].plans[0].jolliPlanDocId).toBeUndefined();
-		expect(callA?.[2].notes[0].jolliNoteDocId).toBeUndefined();
-		expect(callB?.[2]).toEqual({ plans: [], notes: [], references: [] });
+		expect(sel(callA?.[2], "plan")).toEqual([expect.objectContaining({ slug: "p-aaaaaaaa" })]);
+		expect(sel(callA?.[2], "plan")[0].jolliPlanDocId).toBeUndefined();
+		expect(sel(callA?.[2], "note")[0].jolliNoteDocId).toBeUndefined();
+		expectOwnsNothing(callB?.[2]);
 
 		// B's covered still references the docs pushed under A (same live docs).
 		const ref = mockCreate.mock.calls[0][2].ref;
@@ -371,7 +423,7 @@ describe("generateLiveShare", () => {
 		await generateLiveShare({ ...deps(), branch: "feature/x", visibility: "public" });
 
 		const callA = mockPush.mock.calls[0];
-		expect(callA[2].plans.map((p: PlanReference) => p.jolliPlanDocId)).toEqual([501, 502]);
+		expect(sel<PlanReference>(callA[2], "plan").map((p) => p.jolliPlanDocId)).toEqual([501, 502]);
 	});
 
 	it("covers a commit whose attachments produced no docs with an empty allowlist", async () => {
@@ -380,9 +432,17 @@ describe("generateLiveShare", () => {
 		const a = summary("A", [plan("p-aaaaaaaa", "2026-01-01T00:00:00Z")], [note("n1", "2026-01-01T00:00:00Z")]);
 		mockLoad.mockResolvedValue({ summaries: [a], missingCount: 0 });
 		mockPush.mockResolvedValue({
-			pushedDoc: { commitHash: "A", summaryDocId: 1001, plans: [], notes: [], references: [] },
+			pushedDoc: {
+				commitHash: "A",
+				summaryDocId: 1001,
+				attachments: new Map(),
+				plans: [],
+				notes: [],
+				references: [],
+			},
 			updatedSummary: a,
 			attachmentFailures: [],
+			skippedAttachments: [],
 			isUpdate: false,
 			attachmentCount: 0,
 		});
@@ -397,7 +457,7 @@ describe("generateLiveShare", () => {
 		const a = summary("A", [plan("p-aaaaaaaa", "2026-01-01T00:00:00Z")], [note("n1", "2026-01-01T00:00:00Z")]);
 		mockLoad.mockResolvedValue({ summaries: [a], missingCount: 0 });
 		mockPush.mockResolvedValue({
-			pushedDoc: { commitHash: "A", summaryDocId: 1001, plans: [], notes: [], references: [] },
+			pushedDoc: { commitHash: "A", summaryDocId: 1001, plans: [], notes: [], references: [], attachments: new Map() },
 			updatedSummary: a,
 			attachmentFailures: [
 				{ label: 'plan "Plan"', message: "Network error: socket hang up" },
@@ -613,7 +673,7 @@ describe("reconcileLiveShare", () => {
 		});
 		mockLoad.mockResolvedValue({ summaries: [a], missingCount: 0 });
 		mockPush.mockResolvedValue({
-			pushedDoc: { commitHash: "A", summaryDocId: 1001, plans: [], notes: [], references: [] },
+			pushedDoc: { commitHash: "A", summaryDocId: 1001, plans: [], notes: [], references: [], attachments: new Map() },
 			updatedSummary: a,
 			attachmentFailures: [{ label: 'plan "Plan"', message: "unauthorized (HTTP 401)" }],
 			isUpdate: false,
@@ -728,11 +788,13 @@ describe("pushBranchMemoriesToSpace", () => {
 			.mockResolvedValueOnce({
 				pushedDoc: { summaryDocId: 1001, plans: [{ slug: "p", docId: 7, url: "u" }], notes: [] },
 				attachmentFailures: [],
+				skippedAttachments: [],
 				attachmentCount: 1,
 			})
 			.mockResolvedValueOnce({
 				pushedDoc: { summaryDocId: 1002, plans: [], notes: [] },
 				attachmentFailures: [],
+				skippedAttachments: [],
 				attachmentCount: 0,
 			});
 
@@ -752,6 +814,7 @@ describe("pushBranchMemoriesToSpace", () => {
 		mockPush.mockResolvedValue({
 			pushedDoc: { summaryDocId: 0, plans: [], notes: [] },
 			attachmentFailures: [],
+			skippedAttachments: [],
 			attachmentCount: 0,
 		});
 
@@ -761,8 +824,8 @@ describe("pushBranchMemoriesToSpace", () => {
 		// push (the latest-revision owner) — not A's.
 		const callA = mockPush.mock.calls.find((c) => c[0].commitHash === "A");
 		const callB = mockPush.mock.calls.find((c) => c[0].commitHash === "B");
-		expect(callA?.[2].plans).toEqual([]);
-		expect(callB?.[2].plans).toHaveLength(1);
+		expect(sel(callA?.[2], "plan")).toEqual([]);
+		expect(sel(callB?.[2], "plan")).toHaveLength(1);
 	});
 
 	it("is non-strict: omits strictAttachments so attachment failures are collected, not thrown", async () => {
@@ -770,6 +833,7 @@ describe("pushBranchMemoriesToSpace", () => {
 		mockPush.mockResolvedValue({
 			pushedDoc: { summaryDocId: 1001, plans: [], notes: [] },
 			attachmentFailures: [{ label: 'plan "x"', message: "unreadable" }],
+			skippedAttachments: [],
 			attachmentCount: 0,
 		});
 
@@ -780,6 +844,24 @@ describe("pushBranchMemoriesToSpace", () => {
 		expect(optionsArg?.strictAttachments).toBeUndefined();
 		expect(result.attachmentFailures).toHaveLength(1);
 		expect(result.pushedCount).toBe(1);
+	});
+
+	it("reports skipped best-effort attachments instead of dropping them", async () => {
+		// Regression: only `attachmentFailures` was collected, so a best-effort kind the
+		// server would not take reached the Create-PR panel as unqualified success.
+		mockLoad.mockResolvedValue({ summaries: [summary("A"), summary("B")] });
+		mockPush.mockResolvedValue({
+			pushedDoc: { summaryDocId: 1001, plans: [], notes: [] },
+			attachmentFailures: [],
+			skippedAttachments: [{ label: "1 skill article(s)", message: "skill 500" }],
+			attachmentCount: 0,
+		});
+
+		const result = await pushBranchMemoriesToSpace(deps(), "feature/x");
+
+		expect(result.attachmentFailures).toEqual([]);
+		expect(result.skippedAttachments).toHaveLength(2);
+		expect(result.pushedCount).toBe(2);
 	});
 
 	it("throws NothingToShareError when the branch has no summaries", async () => {
@@ -812,6 +894,7 @@ describe("pushBranchMemoriesToSpace", () => {
 		mockPush.mockRejectedValueOnce(new Error("HTTP 500")).mockResolvedValueOnce({
 			pushedDoc: { summaryDocId: 1002, plans: [], notes: [] },
 			attachmentFailures: [],
+			skippedAttachments: [],
 			attachmentCount: 0,
 		});
 

@@ -1455,6 +1455,81 @@ describe("SummaryStore", () => {
 			expect(merged.children?.[0].orphanedDocIds).toBeUndefined();
 		});
 
+		// A skill article is one document per (skill, COMMIT) — see the `skill` context
+		// kind's `baseKey`. So a squash that folds two commits' records of one skill into
+		// a single row supersedes a REAL published article: `mergeSkillRef` keeps the
+		// first docId and would otherwise forget the second, leaving it on the Space
+		// forever titled with a hash8 the branch no longer has. Under the previous
+		// cross-commit baseKey only one ref per skill was ever pushed, so this could not
+		// arise — which is why the cleanup had to be added alongside that change.
+		it("should route a skill article superseded by the fold into orphanedDocIds", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			const skill = (archivedKey: string, jolliDocId: number) => ({
+				archivedKey,
+				source: "claude" as const,
+				skill: "superpowers:brainstorming",
+				entryPaths: ["tool" as const],
+				invocationCount: 1,
+				firstUsedAt: "2026-07-30T09:00:00.000Z",
+				lastUsedAt: "2026-07-31T11:22:00.000Z",
+				jolliDocId,
+				jolliDocUrl: `https://team.jolli.app/articles?doc=${jolliDocId}`,
+			});
+			const s1: CommitSummary = {
+				...createMockSummary("old1", "First"),
+				commitDate: "2026-02-18T10:00:00Z",
+				generatedAt: "2026-02-18T10:00:05Z",
+				skills: [skill("claude:superpowers:brainstorming-11111111", 201)],
+			};
+			const s2: CommitSummary = {
+				...createMockSummary("old2", "Second"),
+				commitDate: "2026-02-19T10:00:00Z",
+				generatedAt: "2026-02-19T10:00:05Z",
+				skills: [skill("claude:superpowers:brainstorming-22222222", 202)],
+			};
+
+			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			// One row, pointing at the surviving article; the other id is queued for
+			// deletion alongside the superseded MEMORY articles. The survivor is the
+			// NEWER commit's (202) because `collectChildSkills` walks the children in the
+			// same newest-first order `pickWinnerSummary` uses for the memory article, so
+			// the skill article that lives on belongs to the same commit as the memory
+			// that lives on.
+			expect(merged.skills).toHaveLength(1);
+			expect(merged.skills?.[0].jolliDocId).toBe(202);
+			expect(result.orphanedDocIds).toContain(201);
+			expect(merged.orphanedDocIds).toContain(201);
+			// Drained, so a re-squash of this tree cannot re-report the same id — and the
+			// key is DELETED rather than set to undefined, since these refs round-trip
+			// through JSON on the orphan branch.
+			expect(merged.skills?.[0]).not.toHaveProperty("supersededDocIds");
+		});
+
+		it("should leave skills untouched when the fold supersedes no article", async () => {
+			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
+			const unpushed = {
+				archivedKey: "claude:superpowers:brainstorming-11111111",
+				source: "claude" as const,
+				skill: "superpowers:brainstorming",
+				entryPaths: ["tool" as const],
+				invocationCount: 1,
+				firstUsedAt: "2026-07-30T09:00:00.000Z",
+				lastUsedAt: "2026-07-31T11:22:00.000Z",
+			};
+			const s1: CommitSummary = { ...createMockSummary("old1", "First"), skills: [unpushed] };
+			const s2: CommitSummary = { ...createMockSummary("old2", "Second") };
+
+			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"));
+
+			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
+			const merged = JSON.parse(files[0].content) as CommitSummary;
+			expect(merged.skills).toEqual([unpushed]);
+			expect(result.orphanedDocIds).toEqual([]);
+		});
+
 		it("should accumulate orphanedDocIds from prior squashes (double-squash)", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 			const s1: CommitSummary = {

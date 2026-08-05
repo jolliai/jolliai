@@ -57,7 +57,7 @@ import {
 	resolveDiffStats,
 	resolveTranscriptIdsFiltered,
 } from "./SummaryTree.js";
-import { mergeSkillRefs } from "./skills/SkillDelta.js";
+import { mergeSkillRefs, stripSupersededDocIds } from "./skills/SkillDelta.js";
 import { transcriptIdFromPath } from "./TranscriptId.js";
 
 let activeStorageOverride: StorageProvider | undefined;
@@ -655,6 +655,9 @@ export function collectChildReferences(nodes: ReadonlyArray<CommitSummary>): Rea
  * is one commit's INCREMENT (see uncommittedDelta), so collapsing three commits that
  * each entered a skill once must report three entries, not one. `mergeSkillRefs` is
  * the same fold the PR-wide aggregate uses, so the two cannot disagree.
+ *
+ * The returned refs may carry `supersededDocIds` — every caller that persists them
+ * must drain those into the root's `orphanedDocIds` and {@link stripSupersededDocIds}.
  */
 export function collectChildSkills(nodes: ReadonlyArray<CommitSummary>): ReadonlyArray<SkillCommitRef> {
 	const all: SkillCommitRef[] = [];
@@ -806,7 +809,13 @@ export function normalizeToV4(summary: CommitSummary): CommitSummary {
 	const hoistedPlans = collectChildPlans([summary]);
 	const hoistedNotes = collectChildNotes([summary]);
 	const hoistedReferences = collectChildReferences([summary]);
-	const hoistedSkills = collectChildSkills([summary]);
+	// Folded skills, then the same drain `mergeManyToOneLocked` performs: the fold can
+	// collapse several commits' published skill articles into one row, and an id left
+	// on `supersededDocIds` here would be persisted as a live field pointing at an
+	// article nothing will ever delete. Unreachable in practice (v3 predates skills),
+	// but the fold's contract holds wherever it is called.
+	const foldedSkills = collectChildSkills([summary]);
+	const hoistedSkills = foldedSkills.map(stripSupersededDocIds);
 	const jolliMeta = collectChildJolliMeta([summary]);
 	// Dedup orphanedDocIds across the tree: jolliMeta surfaces orphans from
 	// this normalize step's loser candidates; root + descendants may already
@@ -816,6 +825,7 @@ export function normalizeToV4(summary: CommitSummary): CommitSummary {
 			...jolliMeta.orphanedDocIds,
 			...(summary.orphanedDocIds ?? []),
 			...collectDescendantOrphanedDocIds(summary.children),
+			...foldedSkills.flatMap((s) => s.supersededDocIds ?? []),
 		]),
 	);
 	const allUnresolvedOrphanHashes = Array.from(
@@ -1148,10 +1158,18 @@ async function mergeManyToOneLocked(
 	// through the same fold, so a skill entered both before and during the squash is
 	// one row carrying the sum. Skills need no snapshot-key union: mergeSkillRefs
 	// ACCUMULATES per skill instead of deduping, so nothing can be stranded.
-	const hoistedSkills = mergeSkillRefs([...collectChildSkills(children), ...(extraSkills ?? [])]);
+	const foldedSkills = mergeSkillRefs([...collectChildSkills(children), ...(extraSkills ?? [])]);
+	// A skill article is one document per (skill, COMMIT), so the fold above really
+	// does supersede published articles: three commits' refs for one skill collapse to
+	// one row that can only point at one of the three. `mergeSkillRef` banks the ids it
+	// discards on `supersededDocIds`; this is the single place they are drained, into
+	// the same `orphanedDocIds` list the superseded memory articles use, and stripped
+	// off the persisted refs so a re-squash cannot re-report them.
+	const hoistedSkills = foldedSkills.map(stripSupersededDocIds);
 	const jolliMeta = collectChildJolliMeta(children);
 	const inheritedOrphanIds = children.flatMap((c) => c.orphanedDocIds ?? []);
-	const allOrphanedDocIds = [...jolliMeta.orphanedDocIds, ...inheritedOrphanIds];
+	const supersededSkillDocIds = foldedSkills.flatMap((s) => s.supersededDocIds ?? []);
+	const allOrphanedDocIds = [...jolliMeta.orphanedDocIds, ...inheritedOrphanIds, ...supersededSkillDocIds];
 
 	// Children without jolliDocId may have been pushed to Space by a
 	// concurrent pre-push sync that hasn't written back the docId yet (race).

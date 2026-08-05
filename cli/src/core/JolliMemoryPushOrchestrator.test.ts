@@ -1,6 +1,27 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommitSummary, NoteReference, PlanReference, ReferenceCommitRef } from "../Types.js";
 
+/**
+ * Captures THIS module's `log.warn` / `log.error` so the batch attachment-failure
+ * reporting can be asserted rather than merely described.
+ *
+ * Scoped by module name and spread over the real Logger: every other module in the
+ * import graph keeps the real logger (and `getJolliMemoryDir` and friends keep
+ * working), so this cannot make an unrelated module's diagnostics disappear.
+ */
+const { mockLogWarn, mockLogError } = vi.hoisted(() => ({ mockLogWarn: vi.fn(), mockLogError: vi.fn() }));
+vi.mock("../Logger.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../Logger.js")>();
+	return {
+		...actual,
+		createLogger: (module: string) => {
+			const real = actual.createLogger(module);
+			return module === "JolliMemoryPushOrchestrator"
+				? { ...real, warn: mockLogWarn, error: mockLogError }
+				: real;
+		},
+	};
+});
 vi.mock("./GitOps.js", () => ({ getDefaultBranch: vi.fn() }));
 vi.mock("./PrDescription.js", () => ({ loadBranchSummaries: vi.fn() }));
 vi.mock("./PushPendingStore.js", () => ({ loadPushPending: vi.fn() }));
@@ -11,6 +32,7 @@ vi.mock("./SummaryStore.js", () => ({
 	readNoteFromBranch: vi.fn(),
 	readPlanFromBranch: vi.fn(),
 	readReferenceFromBranch: vi.fn(),
+	readSkillFromBranch: vi.fn(),
 	storeSummary: vi.fn(),
 }));
 vi.mock("./GitRemoteUtils.js", async (importOriginal) => {
@@ -39,6 +61,7 @@ import { getDefaultBranch } from "./GitOps.js";
 import { buildBranchRelativePath, getCanonicalRepoUrl } from "./GitRemoteUtils.js";
 import {
 	BATCH_MAX_ATTACHMENTS_PER_ITEM,
+	BATCH_MAX_CONTENT_CHARS,
 	type BatchItemResult,
 	BindingAlreadyExistsError,
 	BindingRequiredError,
@@ -69,6 +92,7 @@ import {
 import { loadBranchSummaries } from "./PrDescription.js";
 import { isOutboundPushAllowed } from "./PushControl.js";
 import { loadPushPending } from "./PushPendingStore.js";
+import { assignOwnedContext } from "./push/ContextPush.js";
 import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import { buildPushTitle } from "./SummaryFormat.js";
 import {
@@ -78,6 +102,7 @@ import {
 	readNoteFromBranch,
 	readPlanFromBranch,
 	readReferenceFromBranch,
+	readSkillFromBranch,
 	storeSummary,
 } from "./SummaryStore.js";
 
@@ -1450,6 +1475,35 @@ describe("pushBranchToJolli", () => {
 		expect(client.push).toHaveBeenCalledTimes(1);
 	});
 
+	// Regression: this path used to hand-build the legacy `{plans, notes, references}`
+	// selection. A selection that names only those three means "push ZERO of every
+	// other kind", so `skill` — and every future kind — was silently skipped here
+	// while the drain paths pushed them. The bug was invisible per-kind: it split
+	// behaviour by CODE PATH, which is why this asserts on the registry's own kinds
+	// rather than on a hard-coded list.
+	it("pushes EVERY registered context kind, not just plan/note/reference", async () => {
+		const skillRef = {
+			archivedKey: "claude:superpowers:brainstorming-a1b2c3d4",
+			source: "claude" as const,
+			skill: "superpowers:brainstorming",
+			entryPaths: ["tool" as const],
+			invocationCount: 1,
+			firstUsedAt: "2026-08-01T10:00:00.000Z",
+			lastUsedAt: "2026-08-05T10:00:00.000Z",
+		};
+		vi.mocked(loadBranchSummaries).mockResolvedValue({
+			summaries: [leaf({ skills: [skillRef] })],
+			missingCount: 0,
+		});
+		const client = fakeClient();
+
+		const result = await pushBranchToJolli({ cwd: "/repo", client });
+
+		expect(result.type).toBe("pushed");
+		const pushedDocTypes = vi.mocked(client.push).mock.calls.map(([p]) => p.docType);
+		expect(pushedDocTypes).toContain("skill");
+	});
+
 	it("persists the binding cache when a pushed summary echoes the bound Space", async () => {
 		vi.mocked(loadBranchSummaries).mockResolvedValue({ summaries: [leaf()], missingCount: 0 });
 		const client = fakeClient({
@@ -1793,7 +1847,7 @@ describe("buildBatchItems", () => {
 		// The placeholder is woven into the summary markdown where the plan URL goes.
 		expect(item.summary.content).toContain(docUrlPlaceholder("plan-0"));
 		// Write-back bookkeeping maps the clientKey to the plan's slug.
-		expect(built[0].attachmentKeys.get("plan-0")).toEqual({ kind: "plan", key: "p1" });
+		expect(built[0].attachmentKeys.get("plan-0")).toEqual({ docType: "plan", key: "p1" });
 		expect(built[0].batchContentChars).toBe(
 			item.summary.content.length + (item.summary.summaryJson?.length ?? 0) + item.attachments[0].content.length,
 		);
@@ -1815,6 +1869,19 @@ describe("buildBatchItems", () => {
 
 		expect(built[0].item.attachments).toHaveLength(BATCH_MAX_ATTACHMENTS_PER_ITEM + 1);
 		expect(built[0].batchIneligibleReason).toBe("attachment count exceeds the batch limit");
+	});
+
+	it("marks an item whose attachment body exceeds the per-doc limit for the per-commit fallback", async () => {
+		const summary = leaf({ plans: [plan()] });
+		vi.mocked(readPlanFromBranch).mockResolvedValue("x".repeat(BATCH_MAX_CONTENT_CHARS + 1));
+
+		const built = await buildBatchItems(
+			[summary],
+			owned({ plans: new Map([[summary.commitHash, [plan()]]]) }),
+			baseCtx(fakeClient()),
+		);
+
+		expect(built[0].batchIneligibleReason).toBe("attachment content exceeds the batch limit");
 	});
 
 	it("skips a plan whose content is unreadable (no attachment, no placeholder)", async () => {
@@ -1872,13 +1939,14 @@ describe("buildBatchItems", () => {
 		expect(built[0].item.summary.summaryJson).toBeDefined();
 	});
 
-	it("reads note bodies from the inline content field without hitting storage", async () => {
-		const summary = leaf({ notes: [note({ content: "inline note body" })] });
+	it("uses a snippet note's inline content instead of reading from the branch", async () => {
+		const snippet = note({ format: "snippet", content: "inline note body" });
+		const summary = leaf({ notes: [snippet] });
 		const ctx = baseCtx(fakeClient());
 
 		const built = await buildBatchItems(
 			[summary],
-			owned({ notes: new Map([[summary.commitHash, [note({ content: "inline note body" })]]]) }),
+			owned({ notes: new Map([[summary.commitHash, [snippet]]]) }),
 			ctx,
 		);
 
@@ -1888,6 +1956,31 @@ describe("buildBatchItems", () => {
 			content: "inline note body",
 		});
 		expect(readNoteFromBranch).not.toHaveBeenCalled();
+	});
+
+	/**
+	 * The other half of the format split, and the batch sibling of the individual
+	 * path's snippet case above: inline `content` is a SNIPPET-only field, so a
+	 * markdown note ignores whatever it carries and takes the orphan-branch copy.
+	 *
+	 * Pinned because the batch path used to read `note.content ?? branch` for BOTH
+	 * formats, and the test that covered it asserted only the inline half — so
+	 * narrowing the rule to snippets left the markdown half unpinned on this path.
+	 */
+	it("reads a markdown note's body from the branch even when it carries inline content", async () => {
+		const markdown = note({ format: "markdown", content: "stale inline copy" });
+		const summary = leaf({ notes: [markdown] });
+		vi.mocked(readNoteFromBranch).mockResolvedValue("# Branch body");
+		const ctx = baseCtx(fakeClient());
+
+		const built = await buildBatchItems(
+			[summary],
+			owned({ notes: new Map([[summary.commitHash, [markdown]]]) }),
+			ctx,
+		);
+
+		expect(built[0].item.attachments[0]).toMatchObject({ clientKey: "note-0", content: "# Branch body" });
+		expect(readNoteFromBranch).toHaveBeenCalledWith("n1", "/repo", undefined);
 	});
 });
 
@@ -2137,5 +2230,384 @@ describe("applyBatchResult", () => {
 
 		expect(ctx.client.deleteDoc).toHaveBeenCalledWith(201);
 		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0 });
+	});
+});
+
+// ─── Generic-forms + batch failure logging (table-driven push path) ─────────
+
+describe("kind-agnostic call forms", () => {
+	beforeEach(() => {
+		vi.mocked(storeSummary).mockReset().mockResolvedValue(undefined);
+		vi.mocked(getIndexEntryMap).mockReset().mockResolvedValue(new Map());
+		vi.mocked(loadPushPending).mockReset().mockResolvedValue({ version: 1, entries: {} });
+		vi.mocked(readPlanFromBranch).mockReset().mockResolvedValue("# Plan body");
+		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
+	});
+
+	it("pushSummary accepts a ContextSelection map (missing key = push none of that kind)", async () => {
+		const client = fakeClient();
+		const summary = leaf({ plans: [plan()], notes: [note()] });
+		// Only the plan kind is selected; the note key is absent, so no note pushes.
+		await pushSummary(summary, baseCtx(client), new Map([["plan", [plan()]]]));
+		const docTypes = vi.mocked(client.push).mock.calls.map(([p]) => p.docType);
+		expect(docTypes).toEqual(["plan", "summary"]);
+	});
+
+	it("a legacy named selection covers EVERY registered kind, pushing none of the ones it cannot name", async () => {
+		// The legacy `{plans, notes, references}` shape has no field for skill and never
+		// will (that per-kind field is what the registry removes), so it must expand to
+		// an explicit "push none" for skill — asserted against the registry's own kind
+		// list rather than a hard-coded one, since the point is that the expansion
+		// tracks registration. Safe only because no production caller passes this shape
+		// any more; the map form is how a kind beyond the three is selected.
+		const client = fakeClient();
+		const summary = leaf({
+			plans: [plan()],
+			skills: [
+				{
+					archivedKey: "claude:superpowers:brainstorming-a1b2c3d4",
+					source: "claude" as const,
+					skill: "superpowers:brainstorming",
+					entryPaths: ["tool" as const],
+					invocationCount: 1,
+					firstUsedAt: "2026-08-01T10:00:00.000Z",
+					lastUsedAt: "2026-08-05T10:00:00.000Z",
+				},
+			],
+		});
+		await pushSummary(summary, baseCtx(client), { plans: [plan()], notes: [] });
+		const docTypes = vi.mocked(client.push).mock.calls.map(([p]) => p.docType);
+		expect(docTypes).toEqual(["plan", "summary"]);
+		expect(docTypes).not.toContain("skill");
+	});
+
+	it("buildBatchItems accepts the kind-agnostic OwnedContext form", async () => {
+		const summary = leaf({ plans: [plan()] });
+		const built = await buildBatchItems(
+			[summary],
+			new Map([["plan", { owned: new Map([[summary.commitHash, [plan()]]]), seeds: new Map() }]]),
+			baseCtx(fakeClient()),
+		);
+		expect(built[0].item.attachments.map((a) => a.clientKey)).toEqual(["plan-0"]);
+	});
+});
+
+describe("applyBatchResult attachment-failure logging", () => {
+	beforeEach(() => {
+		vi.mocked(storeSummary).mockReset().mockResolvedValue(undefined);
+		vi.mocked(getIndexEntryMap).mockReset().mockResolvedValue(new Map());
+		vi.mocked(getSummary).mockReset().mockResolvedValue(null);
+		vi.mocked(loadPushPending).mockReset().mockResolvedValue({ version: 1, entries: {} });
+		vi.mocked(readPlanFromBranch).mockReset().mockResolvedValue("# Plan body");
+		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
+		mockLogWarn.mockReset();
+		mockLogError.mockReset();
+	});
+
+	it("write-back succeeds and failures are visible: doctype_not_allowed collapses to one line per kind, other errors log per item", async () => {
+		// Two failed plan attachments with errorCode doctype_not_allowed + one failed
+		// with plain error text + one successful. Batch attachment failures arrive as
+		// `ok: false` inside a 2xx body — they used to be dropped in SILENCE, which
+		// made a server-side rejection of a whole docType invisible on the default
+		// (batch-first) push path.
+		const p1 = plan({ slug: "p1-1234abcd", title: "P1" });
+		const p2 = plan({ slug: "p2-1234abcd", title: "P2" });
+		const p3 = plan({ slug: "p3-1234abcd", title: "P3" });
+		const p4 = plan({ slug: "p4-1234abcd", title: "P4" });
+		const summary = leaf({ plans: [p1, p2, p3, p4] });
+		const ctx = baseCtx(fakeClient());
+		const built = await buildBatchItems(
+			[summary],
+			{
+				ownedPlans: new Map([[summary.commitHash, [p1, p2, p3, p4]]]),
+				ownedNotes: new Map(),
+				ownedReferences: new Map(),
+			},
+			ctx,
+		);
+		const outcome = await applyBatchResult(
+			built,
+			[
+				{
+					commitHash: summary.commitHash,
+					ok: true,
+					summary: { docId: 9, url: "/articles/s-9", jrn: "jrn:9", created: true },
+					attachments: [
+						{ clientKey: "plan-0", ok: false, errorCode: "doctype_not_allowed", error: "not enabled" },
+						{ clientKey: "plan-1", ok: false, errorCode: "doctype_not_allowed", error: "not enabled" },
+						{ clientKey: "plan-2", ok: false, error: "boom" },
+						{
+							clientKey: "plan-3",
+							ok: true,
+							docId: 31,
+							url: "/articles/p-31",
+							jrn: "jrn:31",
+							created: true,
+						},
+					],
+				},
+			],
+			ctx,
+		);
+		expect(outcome.writtenBack).toBe(1);
+		// The successful attachment still gets woven back.
+		const stored = vi.mocked(storeSummary).mock.calls[0][0];
+		expect(stored.plans?.find((p) => p.slug === "p4-1234abcd")?.jolliPlanDocId).toBe(31);
+		expect(stored.plans?.find((p) => p.slug === "p1-1234abcd")?.jolliPlanDocId).toBeUndefined();
+
+		// The collapsing itself, asserted rather than described: TWO refused plan
+		// attachments produce exactly ONE warn naming the docType (a dozen skills on a
+		// server without that docType enabled must not emit a dozen identical lines),
+		// and it must name the kind, not the clientKey.
+		const docTypeWarnings = mockLogWarn.mock.calls.filter(([fmt]) => String(fmt).includes("docType"));
+		expect(docTypeWarnings).toHaveLength(1);
+		expect(docTypeWarnings[0]).toContain("plan");
+		// The plain failure keeps its own per-item line — it is not a kind-wide
+		// condition, so collapsing it would hide which attachment failed.
+		const itemErrors = mockLogError.mock.calls.filter(([fmt]) => String(fmt).includes("FAILED"));
+		expect(itemErrors).toHaveLength(1);
+		expect(itemErrors[0]).toContain("plan-2");
+		// And the successful attachment produced neither.
+		expect(mockLogError.mock.calls.some((call) => call.includes("plan-3"))).toBe(false);
+	});
+});
+
+describe("reference article body from the orphan snapshot", () => {
+	beforeEach(() => {
+		vi.mocked(storeSummary).mockReset().mockResolvedValue(undefined);
+		vi.mocked(getIndexEntryMap).mockReset().mockResolvedValue(new Map());
+		vi.mocked(loadPushPending).mockReset().mockResolvedValue({ version: 1, entries: {} });
+		vi.mocked(readPlanFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
+	});
+
+	it("appends the archived description when the snapshot parses", async () => {
+		const client = fakeClient();
+		const ref: ReferenceCommitRef = {
+			archivedKey: "linear:ENG-1-a1b2c3d4",
+			source: "linear",
+			nativeId: "ENG-1",
+			title: "Fix login",
+			url: "https://linear.app/x/ENG-1",
+			referencedAt: "2026-01-01T00:00:00.000Z",
+			sourceToolName: "Claude Code",
+		};
+		// A stored snapshot WITH a body: the pushed article must carry it, not just
+		// the synthesized header.
+		vi.mocked(readReferenceFromBranch)
+			.mockReset()
+			.mockResolvedValue(
+				[
+					"---",
+					'source: "linear"',
+					'nativeId: "ENG-1"',
+					'title: "Fix login"',
+					'url: "https://linear.app/x/ENG-1"',
+					'referencedAt: "2026-01-01T00:00:00.000Z"',
+					'sourceToolName: "Claude Code"',
+					"---",
+					"",
+					"The stored issue body.",
+				].join("\n"),
+			);
+		await pushSummary(leaf({ references: [ref] }), baseCtx(client), { plans: [], notes: [], references: [ref] });
+		const refPayload = vi.mocked(client.push).mock.calls.find(([p]) => p.docType === "reference")?.[0];
+		expect(refPayload?.content).toContain("The stored issue body.");
+	});
+
+	it("falls back to a header-only article when the snapshot parses but carries no body", async () => {
+		const client = fakeClient();
+		const ref: ReferenceCommitRef = {
+			archivedKey: "linear:ENG-3-a1b2c3d4",
+			source: "linear",
+			nativeId: "ENG-3",
+			title: "Body-less",
+			url: "https://linear.app/x/ENG-3",
+			referencedAt: "2026-01-01T00:00:00.000Z",
+			sourceToolName: "Claude Code",
+		};
+		// Valid frontmatter, empty body — `description` parses to undefined, which is
+		// a different path from "snapshot missing entirely" below.
+		vi.mocked(readReferenceFromBranch)
+			.mockReset()
+			.mockResolvedValue(
+				[
+					"---",
+					'source: "linear"',
+					'nativeId: "ENG-3"',
+					'title: "Body-less"',
+					'url: "https://linear.app/x/ENG-3"',
+					'referencedAt: "2026-01-01T00:00:00.000Z"',
+					'sourceToolName: "Claude Code"',
+					"---",
+					"",
+				].join("\n"),
+			);
+		await pushSummary(leaf({ references: [ref] }), baseCtx(client), { plans: [], notes: [], references: [ref] });
+		const refPayload = vi.mocked(client.push).mock.calls.find(([p]) => p.docType === "reference")?.[0];
+		expect(refPayload?.content).toContain("**Source:**");
+	});
+
+	it("falls back to a header-only article when the snapshot is absent", async () => {
+		const client = fakeClient();
+		const ref: ReferenceCommitRef = {
+			archivedKey: "linear:ENG-2-a1b2c3d4",
+			source: "linear",
+			nativeId: "ENG-2",
+			title: "No body",
+			url: "https://linear.app/x/ENG-2",
+			referencedAt: "2026-01-01T00:00:00.000Z",
+			sourceToolName: "Claude Code",
+		};
+		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
+		await pushSummary(leaf({ references: [ref] }), baseCtx(client), { plans: [], notes: [], references: [ref] });
+		const refPayload = vi.mocked(client.push).mock.calls.find(([p]) => p.docType === "reference")?.[0];
+		expect(refPayload?.content).toContain("**Source:**");
+	});
+});
+
+// ─── skill attachments end-to-end through the generic engine ────────────────
+
+describe("skill attachments", () => {
+	const skillRef = {
+		archivedKey: "claude:superpowers:brainstorming-a1b2c3d4",
+		source: "claude" as const,
+		skill: "superpowers:brainstorming",
+		entryPaths: ["tool" as const],
+		invocationCount: 2,
+		firstUsedAt: "2026-08-01T10:00:00.000Z",
+		lastUsedAt: "2026-08-05T10:00:00.000Z",
+	};
+
+	beforeEach(() => {
+		vi.mocked(storeSummary).mockReset().mockResolvedValue(undefined);
+		vi.mocked(getIndexEntryMap).mockReset().mockResolvedValue(new Map());
+		vi.mocked(loadPushPending).mockReset().mockResolvedValue({ version: 1, entries: {} });
+		vi.mocked(readPlanFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(readSkillFromBranch).mockReset().mockResolvedValue(null);
+	});
+
+	it("pushes a skill article and writes the id back onto the UNIFORM fields", async () => {
+		const client = fakeClient({
+			push: async (payload) => (payload.docType === "skill" ? fakePushResult({ docId: 77 }) : fakePushResult()),
+		});
+		const summary = leaf({ skills: [skillRef] });
+
+		await pushSummary(summary, baseCtx(client), new Map([["skill", [skillRef]]]));
+
+		expect(client.push).toHaveBeenCalledWith(
+			expect.objectContaining({ docType: "skill", commitHash: summary.commitHash }),
+		);
+		const stored = vi.mocked(storeSummary).mock.calls[0][0];
+		// A new kind takes the registry defaults, so the published id lands on
+		// `jolliDocId` / `jolliDocUrl` rather than a `jolliSkillDoc*` pair.
+		expect(stored.skills?.[0]).toMatchObject({ jolliDocId: 77, jolliDocUrl: `${BASE}/articles?doc=77` });
+	});
+
+	it("reuses a stored skill docId as an update target when the env matches", async () => {
+		const client = fakeClient();
+		const withDoc = { ...skillRef, jolliDocId: 66, jolliDocUrl: `${BASE}/articles?doc=66` };
+		await pushSummary(leaf({ skills: [withDoc] }), baseCtx(client), new Map([["skill", [withDoc]]]));
+		expect(client.push).toHaveBeenCalledWith(expect.objectContaining({ docType: "skill", docId: 66 }));
+	});
+
+	it("drops a stored skill docId minted against another backend", async () => {
+		const client = fakeClient();
+		const foreign = { ...skillRef, jolliDocId: 66, jolliDocUrl: "https://other.jolli.ai/articles?doc=66" };
+		await pushSummary(leaf({ skills: [foreign] }), baseCtx(client), new Map([["skill", [foreign]]]));
+		const skillPayload = vi.mocked(client.push).mock.calls.find(([p]) => p.docType === "skill")?.[0];
+		expect(skillPayload?.docId).toBeUndefined();
+	});
+
+	it("logs and continues past a failed skill push — the summary still publishes", async () => {
+		const client = fakeClient({
+			push: async (payload) => {
+				if (payload.docType === "skill") throw new Error("HTTP 500");
+				return fakePushResult();
+			},
+		});
+		const { summaryUrl } = await pushSummary(
+			leaf({ skills: [skillRef] }),
+			baseCtx(client),
+			new Map([["skill", [skillRef]]]),
+		);
+		expect(summaryUrl).toBe(`${BASE}/articles?doc=42`);
+	});
+
+	it("gives each commit its OWN skill article — the one kind that never dedupes across commits", () => {
+		// `baseKey` is `archivedKey`, which carries the archiving commit's hash, so two
+		// commits' records of one skill are two separate articles. Both are owned, and a
+		// push visits both. Under the previous `<source>:<skill>` baseKey only the
+		// newest survived, and the single shared article could report nothing but
+		// CUMULATIVE figures — disagreeing with the per-commit numbers VS Code shows.
+		const first = leaf({
+			commitHash: "1111111111111",
+			skills: [{ ...skillRef, archivedKey: "claude:superpowers:brainstorming-11111111" }],
+		});
+		const second = leaf({
+			commitHash: "2222222222222",
+			skills: [{ ...skillRef, archivedKey: "claude:superpowers:brainstorming-22222222" }],
+		});
+		const owned = assignOwnedContext([first, second]).get("skill");
+		expect(owned?.owned.get("1111111111111")).toHaveLength(1);
+		expect(owned?.owned.get("2222222222222")).toHaveLength(1);
+	});
+
+	it("still collapses ONE ref met from both ends of a squash tree", () => {
+		// The remaining job of the winner rule for this kind: a squash root carries its
+		// children's hoisted refs AND keeps the children, so the same `archivedKey` is
+		// reachable twice (see `mergeSkillRefs`). Identical baseKey → one article, owned
+		// by the newest `lastUsedAt`, so the hoist cannot double-publish.
+		const older = leaf({
+			commitHash: "1111111111111",
+			skills: [{ ...skillRef, lastUsedAt: "2026-08-01T00:00:00Z" }],
+		});
+		const newer = leaf({
+			commitHash: "2222222222222",
+			skills: [{ ...skillRef, lastUsedAt: "2026-08-05T00:00:00Z" }],
+		});
+		const owned = assignOwnedContext([older, newer]).get("skill");
+		expect(owned?.owned.get("1111111111111")).toBeUndefined();
+		expect(owned?.owned.get("2222222222222")).toHaveLength(1);
+	});
+
+	it("adds a batch attachment but mints NO placeholder for it", async () => {
+		const summary = leaf({ skills: [skillRef] });
+		const built = await buildBatchItems(
+			[summary],
+			new Map([["skill", { owned: new Map([[summary.commitHash, [skillRef]]]), seeds: new Map() }]]),
+			baseCtx(fakeClient()),
+		);
+		expect(built[0].item.attachments.map((a) => a.docType)).toEqual(["skill"]);
+		expect(built[0].attachmentKeys.get("skill-0")).toEqual({ docType: "skill", key: skillRef.archivedKey });
+		// linksInMarkdown:false — the body has no per-skill link site, so sending a
+		// token the server has no substitution rule for would risk persisting it.
+		expect(built[0].item.summary.content).not.toContain(docUrlPlaceholder("skill-0"));
+	});
+});
+
+describe("batch clientKey wire contract", () => {
+	it("emits `ref-N` for a reference, not `reference-N`", async () => {
+		// The clientKey is echoed by the server and is the payload of the
+		// `{{jolli:doc:<clientKey>}}` placeholder, whose format is a byte-for-byte
+		// lockstep contract with the server's substituter. Deriving it from `docType`
+		// once renamed this silently; `clientKeyPrefix` pins it and this asserts it.
+		const ref = reference();
+		const summary = leaf({ references: [ref] });
+		vi.mocked(readReferenceFromBranch).mockResolvedValue(null);
+
+		const built = await buildBatchItems(
+			[summary],
+			new Map([["reference", { owned: new Map([[summary.commitHash, [ref]]]), seeds: new Map() }]]),
+			baseCtx(fakeClient()),
+		);
+
+		expect(built[0].item.attachments.map((a) => a.clientKey)).toEqual(["ref-0"]);
+		expect(built[0].attachmentKeys.get("ref-0")).toEqual({ docType: "reference", key: ref.archivedKey });
+		expect(built[0].item.summary.content).toContain(docUrlPlaceholder("ref-0"));
 	});
 });

@@ -11,7 +11,7 @@ const mocks = vi.hoisted(() => ({
 		insertions: 1, deletions: 0, filesChanged: 1, title: "feat: x", bodyMarkdown: "B",
 		memories: [{ hash: "h", title: "t" }], files: [], e2eScenarios: [],
 	}),
-	pushBranchMemories: vi.fn().mockResolvedValue({ pushedCount: 2, attachmentCount: 0, attachmentFailures: [], summaryFailures: [] }),
+	pushBranchMemories: vi.fn().mockResolvedValue({ pushedCount: 2, attachmentCount: 0, attachmentFailures: [], skippedAttachments: [], summaryFailures: [] }),
 	openAndAwait: vi.fn().mockResolvedValue({ kind: "selected" }),
 	parseJolliApiKey: vi.fn(() => ({ u: "https://acme.jolli.ai" })),
 	loadGlobalConfig: vi.fn().mockResolvedValue({ jolliApiKey: "sk-jol-x" }),
@@ -157,7 +157,7 @@ beforeEach(() => {
 	mocks.isWorkerBusy.mockResolvedValue(false);
 	mocks.handleCreatePr.mockResolvedValue("succeeded");
 	mocks.handleUpdatePrWithPush.mockResolvedValue("succeeded");
-	mocks.pushBranchMemories.mockResolvedValue({ pushedCount: 2, attachmentCount: 0, attachmentFailures: [], summaryFailures: [] });
+	mocks.pushBranchMemories.mockResolvedValue({ pushedCount: 2, attachmentCount: 0, attachmentFailures: [], skippedAttachments: [], summaryFailures: [] });
 	mocks.openAndAwait.mockResolvedValue({ kind: "selected" });
 	mocks.parseJolliApiKey.mockReturnValue({ u: "https://acme.jolli.ai" });
 	mocks.loadGlobalConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x" });
@@ -794,7 +794,7 @@ describe("push memories to Space after a successful submit", () => {
 
 	it("shows a success toast with the pushed count", async () => {
 		const vscode = await import("vscode");
-		mocks.pushBranchMemories.mockResolvedValue({ pushedCount: 2, attachmentCount: 0, attachmentFailures: [], summaryFailures: [] });
+		mocks.pushBranchMemories.mockResolvedValue({ pushedCount: 2, attachmentCount: 0, attachmentFailures: [], skippedAttachments: [], summaryFailures: [] });
 		await CreatePrWebviewPanel.show(uri, "/repo", bridge, "main", true);
 		await created[0].onMsg({ command: "createPr" });
 		await flush();
@@ -866,6 +866,7 @@ describe("push memories to Space after a successful submit", () => {
 			pushedCount: 2,
 			attachmentCount: 0,
 			attachmentFailures: [{ label: 'plan "x"', message: "unreadable" }],
+			skippedAttachments: [],
 			summaryFailures: [],
 		});
 		await CreatePrWebviewPanel.show(uri, "/repo", bridge, "main", true);
@@ -877,12 +878,52 @@ describe("push memories to Space after a successful submit", () => {
 		);
 	});
 
+	it("skipped-only: warns non-modally instead of reporting plain success", async () => {
+		// The branch push used to drop `skippedAttachments` on the floor, so a best-effort
+		// kind the server would not take produced a clean "Shared 2 memories" — fewer
+		// articles than the branch has context for, reported as unqualified success.
+		const vscode = await import("vscode");
+		mocks.pushBranchMemories.mockResolvedValue({
+			pushedCount: 2,
+			attachmentCount: 0,
+			attachmentFailures: [],
+			skippedAttachments: [{ label: "2 skill article(s)", message: "skill 500" }],
+			summaryFailures: [],
+		});
+		await CreatePrWebviewPanel.show(uri, "/repo", bridge, "main", true);
+		await created[0].onMsg({ command: "createPr" });
+		await flush();
+		expect(vscode.window.showWarningMessage).toHaveBeenCalledWith(
+			expect.stringContaining("1 attachment(s) were skipped: 2 skill article(s)"),
+		);
+		expect(vscode.window.showInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("Shared 2"));
+	});
+
+	it("skipped items ride along in the detail of a hard-failure modal", async () => {
+		const vscode = await import("vscode");
+		mocks.pushBranchMemories.mockResolvedValue({
+			pushedCount: 2,
+			attachmentCount: 0,
+			attachmentFailures: [{ label: 'plan "x"', message: "unreadable" }],
+			skippedAttachments: [{ label: "1 skill article(s)", message: "skill 500" }],
+			summaryFailures: [],
+		});
+		await CreatePrWebviewPanel.show(uri, "/repo", bridge, "main", true);
+		await created[0].onMsg({ command: "createPr" });
+		await flush();
+		expect(vscode.window.showWarningMessage).toHaveBeenCalledWith(
+			expect.stringContaining("1 attachment(s) failed to push"),
+			expect.objectContaining({ modal: true, detail: expect.stringContaining("(skipped)") }),
+		);
+	});
+
 	it("partial memory failures: reports shared count plus the failed memories in the modal", async () => {
 		const vscode = await import("vscode");
 		mocks.pushBranchMemories.mockResolvedValue({
 			pushedCount: 2,
 			attachmentCount: 0,
 			attachmentFailures: [],
+			skippedAttachments: [],
 			summaryFailures: [{ label: 'memory "fix: y"', message: "HTTP 500" }],
 		});
 		await CreatePrWebviewPanel.show(uri, "/repo", bridge, "main", true);
@@ -944,7 +985,7 @@ describe("push memories to Space after a successful submit", () => {
 
 	it("uses the singular noun when exactly one memory is shared", async () => {
 		const vscode = await import("vscode");
-		mocks.pushBranchMemories.mockResolvedValue({ pushedCount: 1, attachmentCount: 0, attachmentFailures: [], summaryFailures: [] });
+		mocks.pushBranchMemories.mockResolvedValue({ pushedCount: 1, attachmentCount: 0, attachmentFailures: [], skippedAttachments: [], summaryFailures: [] });
 		await CreatePrWebviewPanel.show(uri, "/repo", bridge, "main", true);
 		await created[0].onMsg({ command: "createPr" });
 		await flush();

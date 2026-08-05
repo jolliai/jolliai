@@ -1,17 +1,25 @@
 /**
- * Grouping helpers for plans that share a logical name across commit snapshots.
+ * Display-side grouping for plans that share a logical name across commit
+ * snapshots.
  *
  * A plan committed to a commit is archived under a slug that embeds the commit
  * hash (`<base-slug>-<shortHash>`, shortHash = commitHash.substring(0,8) — see
  * QueueWorker.associatePlansWithCommit). Squash consolidation hoists every
  * source commit's plans into the consolidated commit, so the same logical plan
- * appears once per source commit — same title, different slug. These helpers
- * collapse those snapshots by base name and pick the latest, and are the single
- * source of truth shared by the detail-panel display (annotatePlans) and the
- * push-to-Jolli path (latestPlanPerName) so the two never drift.
+ * appears once per source commit — same title, different slug. {@link annotatePlans}
+ * flags which of those snapshots the detail panel should present as the latest.
+ *
+ * **The grouping RULE is not defined here.** `planBaseKey` and `byUpdatedAtDesc`
+ * are imported from the CLI's `core/push/PlanGrouping`, which is the single source
+ * of truth the push path (`latestPlanPerName`, and the `plan` context kind's
+ * `baseKey`/`tiebreak`) also uses. This file used to carry its own copies plus a
+ * `latestPlanPerName` of its own; once the push path moved to the shared context-kind
+ * registry those copies had no production caller left and were two divergeable
+ * spellings of one rule — a drift would have the panel group snapshots the push path
+ * keeps apart. Only the panel-specific annotation lives here now.
  */
 
-import { REF_HASH_SUFFIX } from "../../../cli/src/core/RefMerge.js";
+import { byUpdatedAtDesc, planBaseKey } from "../../../cli/src/core/push/PlanGrouping.js";
 import type { PlanReference } from "../../../cli/src/Types.js";
 
 /** A plan plus its standing among its same-named siblings. */
@@ -21,33 +29,6 @@ export interface AnnotatedPlan {
 	readonly isLatest: boolean;
 	/** True when this plan belongs to a multi-snapshot group but is NOT the latest. */
 	readonly isSuperseded: boolean;
-}
-
-/**
- * Strips a trailing archived commit-hash suffix (`-<8 hex>`) to get the base
- * name. Committed snapshots (`refactor-auth-a1b2c3d4`) and an uncommitted base
- * (`refactor-auth`) collapse to the same key.
- *
- * Shares `REF_HASH_SUFFIX` with cli's `baseKeyOf.plan` / `planBaseKey` rather than
- * re-spelling the pattern: this is the same base key the amend hoist dedupes by, and
- * a drift would have the panel group snapshots the summary kept apart.
- */
-export function planBaseKey(slug: string): string {
-	return slug.replace(REF_HASH_SUFFIX, "");
-}
-
-/**
- * Compares two plans newest-first by `updatedAt`, tiebroken by `slug` so the
- * order is deterministic across the standalone re-renders the panel performs.
- * Exported so the cross-commit dedup in LiveShareController picks the same
- * "latest" snapshot this module's display + push paths do — a disagreement drops
- * a plan's markdown link on an equal-timestamp tie.
- */
-export function byUpdatedAtDesc(a: PlanReference, b: PlanReference): number {
-	if (a.updatedAt !== b.updatedAt) {
-		return a.updatedAt < b.updatedAt ? 1 : -1;
-	}
-	return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
 }
 
 /**
@@ -76,52 +57,4 @@ export function annotatePlans(plans: ReadonlyArray<PlanReference>): ReadonlyArra
 		const isSuperseded = !isFirstOfGroup && hasSiblings;
 		return { plan, isLatest, isSuperseded };
 	});
-}
-
-/**
- * Returns exactly one plan per base name — the latest snapshot — preserving the
- * newest-first order. Used to avoid pushing duplicate same-named documents to
- * Jolli.
- *
- * Same-named plans share an identical server push identity (same title, branch,
- * relativePath, commit — the slug is NOT sent), so `jolliPlanDocId` is the only
- * thing that tells the server to UPDATE rather than CREATE. When a previously
- * pushed older snapshot carries the docId but the latest snapshot does not, the
- * latest inherits that docId/url so the push updates the existing article
- * instead of creating a duplicate (which the server rejects → push failure).
- */
-export function latestPlanPerName(plans: ReadonlyArray<PlanReference>): ReadonlyArray<PlanReference> {
-	const sorted = [...plans].sort(byUpdatedAtDesc);
-	// Newest already-pushed docId/url per base name (first hit wins = newest). The
-	// URL rides with the docId so the reuse gate downstream (`canReuseDocId`, keyed
-	// on the URL's origin) can tell which backend the inherited id belongs to.
-	const pushedDoc = new Map<string, { docId: number; url: string | undefined }>();
-	for (const plan of sorted) {
-		const key = planBaseKey(plan.slug);
-		if (plan.jolliPlanDocId !== undefined && !pushedDoc.has(key)) {
-			pushedDoc.set(key, { docId: plan.jolliPlanDocId, url: plan.jolliPlanDocUrl });
-		}
-	}
-	const seen = new Set<string>();
-	const result: PlanReference[] = [];
-	for (const plan of sorted) {
-		const key = planBaseKey(plan.slug);
-		if (seen.has(key)) {
-			continue;
-		}
-		seen.add(key);
-		if (plan.jolliPlanDocId === undefined) {
-			const inherited = pushedDoc.get(key);
-			if (inherited) {
-				result.push({
-					...plan,
-					jolliPlanDocId: inherited.docId,
-					jolliPlanDocUrl: inherited.url,
-				});
-				continue;
-			}
-		}
-		result.push(plan);
-	}
-	return result;
 }

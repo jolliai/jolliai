@@ -20,9 +20,10 @@
  * - Sends `repoUrl` (canonical, normalized — see GitRemoteUtils) and
  *   `relativePath` (flat — `<branchSlug>` for all kinds) in the body so the
  *   server can place the doc under `repoFolder → branchSlug`.
- * - Sends `docType: "summary" | "plan" | "note" | "reference"` in the body. With the flat
- *   path layout this is the sole disambiguator the server uses to set
- *   `sourceMetadata.docType` and route TreeItem icons on the frontend.
+ * - Sends `docType` in the body — `"summary"`, or a context kind's tag from the
+ *   shared registry (`cli/src/core/push/kinds/`). With the flat path layout this
+ *   is the sole disambiguator the server uses to set `sourceMetadata.docType`
+ *   and route TreeItem icons on the frontend.
  * - Maps `412 binding_required` → `BindingRequiredError` and
  *   `409 binding_already_exists` → `BindingAlreadyExistsError` so the call
  *   site can run the chooser flow.
@@ -35,6 +36,7 @@ import {
 	parseBaseUrl,
 	parseJolliApiKey,
 } from "../../../cli/src/core/JolliApiUtils.js";
+import { DocTypeNotAllowedError } from "../../../cli/src/core/JolliMemoryPushClient.js";
 import { isOutboundPushAllowed } from "../../../cli/src/core/PushControl.js";
 import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "../../../cli/src/core/TraceContext.js";
 import { type ClientInfo, VSCODE_CLIENT_INFO } from "./ClientInfo.js";
@@ -126,8 +128,15 @@ export interface JolliPushPayload {
 	 * With the flat per-branch layout, this is the sole disambiguator the
 	 * server uses to set `sourceMetadata.docType` and to drive TreeItem icons.
 	 * Required: a missing value would silently mis-tag every push.
+	 *
+	 * Typed as `string`, not a union, on purpose: `"summary"` is the reserved tag
+	 * for the memory itself, and every other value is a context kind's `docType`
+	 * from the shared registry (`cli/src/core/push/kinds/`) — a union here would
+	 * have to grow by one member per new kind, the exact per-kind edit the
+	 * registry exists to remove. The server's supported-docType configuration is
+	 * the authority; an unknown tag is rejected with `412 doctype_not_allowed`.
 	 */
-	readonly docType: "summary" | "plan" | "note" | "reference";
+	readonly docType: string;
 	readonly branch?: string;
 	/** Server-side document ID for direct update on subsequent pushes. */
 	readonly docId?: number;
@@ -317,6 +326,14 @@ export async function pushToJolli(
 								body.message ?? body.error ?? "You don't have permission to push to this Space.",
 							),
 						);
+					} else if (status === 412 && body.error === "doctype_not_allowed") {
+						// The server has no config row enabling this docType. Same 412 +
+						// machine-tag shape as `repo_not_allowlisted`, but deliberately NOT
+						// PermissionDeniedError: that class is a repo-wide refusal (see
+						// cli PushRefusal.ts) and would abort the whole attachment loop —
+						// one unconfigured kind must only short-circuit ITS kind (the
+						// orchestrator handles DocTypeNotAllowedError per kind).
+						reject(new DocTypeNotAllowedError(payload.docType, body.message));
 					} else if (status === 409 && body.error === "binding_already_exists") {
 						reject(new BindingAlreadyExistsError(body as unknown as BindingExistsBody, body.message));
 					} else if (status === 403) {

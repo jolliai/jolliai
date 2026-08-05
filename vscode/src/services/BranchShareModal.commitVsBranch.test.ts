@@ -105,9 +105,20 @@ beforeEach(async () => {
 	h.loadBranchSummaries.mockResolvedValue({ summaries: [summary(OLDER), summary(TIP)], missingCount: 0 });
 	h.push.mockImplementation((s: CommitSummary) =>
 		Promise.resolve({
-			pushedDoc: { commitHash: s.commitHash, summaryDocId: 100, plans: [], notes: [], references: [] },
+			// `attachments` and `skippedAttachments` are what production returns and what
+			// the controller reads (`publishedAttachmentsOf` / the skipped-label roll-up);
+			// omitting them made the double diverge from the shape under test.
+			pushedDoc: {
+				commitHash: s.commitHash,
+				summaryDocId: 100,
+				attachments: new Map(),
+				plans: [],
+				notes: [],
+				references: [],
+			},
 			updatedSummary: s,
 			attachmentFailures: [],
+			skippedAttachments: [],
 			isUpdate: false,
 			attachmentCount: 0,
 		}),

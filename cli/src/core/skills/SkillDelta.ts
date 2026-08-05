@@ -73,7 +73,10 @@ export function mergeSkillRef(prev: SkillCommitRef | undefined, next: SkillCommi
 	const usageBySession = mergeUsageSplits(contributors);
 	// `usageBySession` destructured out rather than left to `...prev`, so a dropped
 	// split really is dropped instead of surviving as prev's stale half.
-	const { usageBySession: _prevSplit, ...prevRest } = prev;
+	// `supersededDocIds` likewise: `supersededField` below recomputes the whole set
+	// (and drops the surviving id from it), so leaving prev's copy to the spread could
+	// resurrect an id this fold just decided not to delete.
+	const { usageBySession: _prevSplit, supersededDocIds: _prevSuperseded, ...prevRest } = prev;
 	return {
 		...prevRest,
 		invocationCount: prev.invocationCount + next.invocationCount,
@@ -82,7 +85,73 @@ export function mergeSkillRef(prev: SkillCommitRef | undefined, next: SkillCommi
 		...(prev.detection === "heuristic" || next.detection === "heuristic"
 			? { detection: "heuristic" as const }
 			: {}),
+		// Inherit the published-article id when `prev` has none, so a merge cannot lose
+		// a reusable id: without this, `...prevRest` alone would drop `next`'s and the
+		// following push would CREATE a duplicate article instead of updating the
+		// existing one. `prev`'s own id is never overwritten (same rule as
+		// `latestPlanPerName`'s inheritance — overwriting would orphan a live article),
+		// and the URL travels WITH the id because the doc-id reuse gate reads its origin
+		// to decide which backend the id belongs to.
+		...(prev.jolliDocId === undefined && next.jolliDocId !== undefined
+			? { jolliDocId: next.jolliDocId, jolliDocUrl: next.jolliDocUrl }
+			: {}),
+		// Whichever id did NOT survive is now unreachable — record it for cleanup
+		// rather than dropping it. See `SkillCommitRef.supersededDocIds`: a skill
+		// article is per (skill, commit), so a fold really does supersede published
+		// articles, and silently forgetting the id leaves one on the Space forever
+		// under a hash8 the branch no longer has.
+		...supersededField(prev, next),
 	};
+}
+
+/**
+ * The `supersededDocIds` entry for one fold: both sides' already-pending ids, plus
+ * `next`'s own id when `prev` also has one — the id {@link mergeSkillRef}'s
+ * inheritance rule discards.
+ *
+ * Deliberately NOT symmetric: `prev`'s id is never a casualty, because the merged ref
+ * keeps it.
+ *
+ * **The surviving id is then removed from the set**, which is a correctness guard, not
+ * tidiness — deleting it would destroy the very article the merged ref still points
+ * at. Two paths reach it: `prev` and `next` carrying the SAME id (a ref met from both
+ * ends of a squash tree, which `mergeSkillRefs` dedupes by `archivedKey` but the PR
+ * aggregate's own fold does not), and an inner fold having already banked an id that a
+ * later fold ends up inheriting as the survivor.
+ *
+ * Omitted entirely when nothing is pending, so a ref that superseded nothing carries
+ * no field and stored JSON sees no churn.
+ */
+function supersededField(prev: SkillCommitRef, next: SkillCommitRef): { supersededDocIds?: ReadonlyArray<number> } {
+	const pending = new Set<number>([...(prev.supersededDocIds ?? []), ...(next.supersededDocIds ?? [])]);
+	if (prev.jolliDocId !== undefined && next.jolliDocId !== undefined) pending.add(next.jolliDocId);
+	// `prev.jolliDocId ?? next.jolliDocId` mirrors the inheritance rule above exactly:
+	// prev's id wins, else next's is adopted. Reading only prev's would leave an
+	// adopted id marked for deletion.
+	const survivor = prev.jolliDocId ?? next.jolliDocId;
+	if (survivor !== undefined) pending.delete(survivor);
+	return pending.size > 0 ? { supersededDocIds: [...pending] } : {};
+}
+
+/**
+ * Drops the pending-cleanup marker once its ids have been drained into a summary's
+ * `orphanedDocIds`.
+ *
+ * A separate helper rather than an inline spread because it must DELETE the key, not
+ * set it to `undefined`: these refs are serialized to the orphan branch as JSON, and
+ * `"supersededDocIds": null` would read back as a field that exists.
+ *
+ * Lives beside the fold that produces the marker rather than at any one call site,
+ * because every consumer of {@link mergeSkillRefs} that persists the result owes the
+ * same drain — today `mergeManyToOneLocked` (squash) and `normalizeToV4`. The amend
+ * root is NOT a consumer: it unions on the mapKey instead of folding (see
+ * `buildHoistedAmendRoot`), so it mints no marker and carries the published id across
+ * by hand.
+ */
+export function stripSupersededDocIds(ref: SkillCommitRef): SkillCommitRef {
+	if (ref.supersededDocIds === undefined) return ref;
+	const { supersededDocIds: _drained, ...rest } = ref;
+	return rest;
 }
 
 /**

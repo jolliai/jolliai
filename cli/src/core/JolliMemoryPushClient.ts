@@ -98,6 +98,33 @@ export class PermissionDeniedError extends Error {
 	}
 }
 
+/**
+ * The server does not have this `docType` enabled (its supported-docType config
+ * has no row for it). Raised for `412` + `error: "doctype_not_allowed"`.
+ *
+ * **Deliberately NOT a `PermissionDeniedError`, and deliberately NOT a member of
+ * `REPO_WIDE_REFUSAL_NAMES`.** Mapping it onto the existing admin-action-required
+ * class — the way `repo_not_allowlisted` is mapped — reads as the natural choice
+ * and is wrong: `PermissionDeniedError` IS a repo-wide refusal, so one unconfigured
+ * context kind would abort the whole attachment loop and fail the summary push,
+ * i.e. a single missing config row would stop the repo pushing anything at all.
+ *
+ * Its correct scope is a third tier between "skip one item" and "abort everything":
+ * every item of THIS kind will fail for the same reason, so the push loop
+ * short-circuits that kind for the rest of the run and keeps pushing the others
+ * (see `ContextPush`). It must also not burn a retry budget or mark the commit
+ * failed — the summary itself pushes fine.
+ */
+export class DocTypeNotAllowedError extends Error {
+	constructor(
+		readonly docType: string,
+		message?: string,
+	) {
+		super(message ?? `The server does not have docType "${docType}" enabled.`);
+		this.name = "DocTypeNotAllowedError";
+	}
+}
+
 /** A space as returned by `GET /api/jolli-memory/spaces`. */
 export interface JolliMemorySpace {
 	readonly id: number;
@@ -281,7 +308,19 @@ export interface PushPayload {
 	readonly title: string;
 	readonly content: string;
 	readonly commitHash: string;
-	readonly docType: "summary" | "plan" | "note" | "reference";
+	/**
+	 * Document-type tag. `"summary"` is the reserved tag for the memory itself;
+	 * every other value is a context kind's `docType`, supplied by its
+	 * `ContextKindDefinition` (see `core/push/kinds/`).
+	 *
+	 * Typed as `string`, not a union, on purpose: a union here would have to grow by
+	 * one member for every new context kind — the exact per-kind edit the definition
+	 * table exists to remove. The authority on which tags are accepted is the server's
+	 * supported-docType configuration, which rejects an unknown one with
+	 * `412 doctype_not_allowed` → {@link DocTypeNotAllowedError}. The read path has
+	 * always typed this field as a plain string (`SyncTypes.docType`).
+	 */
+	readonly docType: string;
 	readonly branch?: string;
 	readonly docId?: number;
 	readonly repoUrl?: string;
@@ -355,7 +394,8 @@ export const BATCH_MAX_TOTAL_CONTENT_CHARS = 8_000_000;
 /** One attachment (plan/note/reference) inside a batch item. */
 export interface BatchPushAttachment {
 	readonly clientKey: string;
-	readonly docType: "plan" | "note" | "reference";
+	/** A context kind's `docType` — see the note on {@link PushPayload.docType} for why this is `string`. */
+	readonly docType: string;
 	readonly title: string;
 	readonly content: string;
 	readonly relativePath?: string;
@@ -391,6 +431,15 @@ export interface BatchAttachmentResult {
 	readonly jrn?: string;
 	readonly created?: boolean;
 	readonly error?: string;
+	/**
+	 * Machine-readable failure tag, mirroring the item-level `errorCode`.
+	 *
+	 * An attachment failure in a batch arrives as `ok: false` inside a 2xx body, so
+	 * there is no HTTP status to classify on — without a code the only signal is the
+	 * free-text `error`, which is too brittle to branch on. Absent on older servers,
+	 * in which case a failure degrades to "logged, skipped" exactly as before.
+	 */
+	readonly errorCode?: string;
 }
 
 /** Doc fields reported for a successfully pushed batch summary. */
@@ -595,6 +644,14 @@ export class JolliMemoryPushClient {
 		// budget instead of hammering the server with doomed pushes.
 		if (status === 412 && json.error === "repo_not_allowlisted") {
 			throw new PermissionDeniedError(errorMessage(json));
+		}
+		// The server has no config row enabling this docType. Same 412 + machine-tag
+		// shape as `repo_not_allowlisted` (it is likewise a configuration problem, not
+		// a transient one) but a DIFFERENT error class on purpose — see
+		// `DocTypeNotAllowedError` for why reusing PermissionDeniedError would stop
+		// the repo pushing anything at all.
+		if (status === 412 && json.error === "doctype_not_allowed") {
+			throw new DocTypeNotAllowedError(payload.docType, errorMessage(json));
 		}
 		if (status === 409 && json.error === "binding_already_exists") {
 			throw new BindingAlreadyExistsError(json.message ?? "binding_already_exists");
@@ -917,6 +974,7 @@ function toBatchAttachmentResult(value: unknown): BatchAttachmentResult | undefi
 		jrn?: unknown;
 		created?: unknown;
 		error?: unknown;
+		errorCode?: unknown;
 	};
 	if (typeof raw.clientKey !== "string" || typeof raw.ok !== "boolean") {
 		return undefined;
@@ -936,6 +994,11 @@ function toBatchAttachmentResult(value: unknown): BatchAttachmentResult | undefi
 		...(typeof raw.jrn === "string" && { jrn: raw.jrn }),
 		...(typeof raw.created === "boolean" && { created: raw.created }),
 		...(typeof raw.error === "string" && { error: raw.error }),
+		// Must be carried through: it is the ONLY machine-readable signal for an
+		// attachment failure (a batch failure arrives as `ok:false` inside a 2xx body,
+		// so there is no status to classify on). Dropping it here silently degrades a
+		// `doctype_not_allowed` config problem into an anonymous transient failure.
+		...(typeof raw.errorCode === "string" && { errorCode: raw.errorCode }),
 	};
 }
 

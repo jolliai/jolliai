@@ -1234,6 +1234,51 @@ export interface SkillCommitRef {
 	readonly usageBySession?: Readonly<Record<string, SkillUsage>>;
 	/** See {@link SkillEntry.detection}. */
 	readonly detection?: "heuristic";
+	/**
+	 * Full URL of the skill article on Jolli Space after pushing (docType `skill`);
+	 * its origin keys the doc-id reuse gate (see `CommitSummary.jolliDocUrl`).
+	 *
+	 * The UNIFORM name, not a `jolliSkillDocUrl` in the style of `jolliPlanDocUrl` /
+	 * `jolliNoteDocUrl` / `jolliReferenceDocUrl` — see
+	 * `core/push/ContextKindDefinition.ts` for why a new context kind takes the push
+	 * registry's defaults while those three override them.
+	 */
+	readonly jolliDocUrl?: string;
+	/** Jolli Space document id of the pushed skill article — the update-in-place target on a re-push. */
+	readonly jolliDocId?: number;
+	/**
+	 * Skill article ids this ref's fold SUPERSEDED — pending cleanup, the skill
+	 * counterpart of `CommitSummary.orphanedDocIds`.
+	 *
+	 * Exists because a skill article is one document per (skill, COMMIT) — see the
+	 * `skill` definition's `baseKey`. So when a squash folds three commits' refs for
+	 * one skill into a single row, three already-published articles collapse to one:
+	 * `mergeSkillRef` keeps the first docId it sees and the rest would simply vanish,
+	 * leaving articles on the Space titled with a `hash8` that no longer exists on
+	 * the branch. Under the previous cross-commit `baseKey` this could not happen —
+	 * only one ref per skill was ever pushed, so only one docId existed.
+	 *
+	 * Accumulated (unioned) through every fold rather than resolved at one site, and
+	 * for a specific reason: skills are folded at THREE levels on the way to a squash
+	 * root (`collectChildSkills`, QueueWorker's `extraSkills` pre-merge, and
+	 * `mergeManyToOneLocked`'s own union). Reporting drops as a fold RETURN value would
+	 * lose whatever the inner folds discarded; riding on the ref means the outermost
+	 * fold sees everything.
+	 *
+	 * Drained into the root's `orphanedDocIds` and stripped from the persisted ref (via
+	 * `stripSupersededDocIds`) so it never accumulates across re-squashes. Every consumer
+	 * of the fold owes that drain; today they are `mergeManyToOneLocked` (squash) and
+	 * `normalizeToV4`.
+	 *
+	 * **The amend root is deliberately NOT one of them** — it does not fold at all, so it
+	 * never mints this marker. `buildHoistedAmendRoot` unions on the mapKey with new
+	 * winning, carries `jolliDocId`/`jolliDocUrl` across by hand, and queues a displaced
+	 * id straight into `orphanedDocIds`. See that function for why folding there is
+	 * WRONG: the amended child is retained in the tree, so a row that absorbed another
+	 * `archivedKey`'s increment gets it counted a second time when a later squash walks
+	 * the tree.
+	 */
+	readonly supersededDocIds?: ReadonlyArray<number>;
 }
 
 // ─── Knowledge Compilation types ────────────────────────────────────────────

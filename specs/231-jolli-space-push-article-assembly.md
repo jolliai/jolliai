@@ -2,14 +2,19 @@
 
 ## Topic Statement
 
-Turn one commit summary — and, across a branch, its recurring plans, notes, and external references — into deduplicated summary/plan/note/reference articles for the push loop: push a summary's plans, notes, then references first, weave their published URLs back into the summary's rendered body, push the summary (carrying any prior document id so a re-push updates in place instead of duplicating), write the returned ids back into local storage, and best-effort delete any documents that have been orphaned — all while ensuring an attachment that recurs across many commits is pushed exactly once, "owned" by the commit holding its latest revision, and while only ever re-sending a document id to the same backend origin it was minted on.
+Turn one commit summary — and, across a branch, its recurring context artifacts — into deduplicated summary + per-artifact articles for the push loop: push a summary's context attachments first (in registry order), weave their published URLs back into the summary's rendered body, push the summary (carrying any prior document id so a re-push updates in place instead of duplicating), write the returned ids back into local storage, and best-effort delete any documents that have been orphaned — all while ensuring an attachment that recurs across many commits is pushed exactly once, "owned" by the commit holding its latest revision, and while only ever re-sending a document id to the same backend origin it was minted on.
+
+**The push path is table-driven.** Which *kinds* of context artifact exist — and their identity, dedup, recency and document-state fields — is declared once per kind in a **context-kind definition**; the push loop, batch assembly, URL write-back, ownership plumbing and the editor-extension push path are all generic over the definition registry. Plans, notes, external references and skills are four registered kinds, not four code paths. Adding a kind is a definition plus one registration entry, with no change to any behavior described below.
 
 ## Scope
 
 **In scope:**
 
-- The per-summary push order (plans → notes → references → summary), and the URL-weaving that links a summary's rendered body to its published plan/note/reference articles.
+- The **context-kind definition contract**: which properties a kind declares, which are data vs behavior, and the defaults an omitted property falls back to.
+- The per-summary push order (every registered kind's attachments in registry order → summary), and the URL-weaving that links a summary's rendered body to its published attachment articles.
 - Assembly of a standalone **reference** article (docType `reference`): its title (source label + display title joined by a middle dot) and its synthesized body (link/source header + escaped field table + the archived reference body read back from the orphan-branch snapshot).
+- Assembly of a standalone **skill** article (docType `skill`): its title, its synthesized body, its per-(skill, commit) identity, and the cleanup of articles a later fold supersedes.
+- The **document-type refusal** contract: how a server that does not have a docType enabled is reported, and why it short-circuits one kind rather than one item or the whole push.
 - Update-in-place: carrying a prior document id on a re-push so the server updates rather than creates.
 - The **env-key document-id reuse gate**: a stored id is re-sent as an update target only when the article URL it was minted with points at the current push's backend origin; otherwise it is dropped and the server mints a fresh document. Every propagated/seed id therefore travels with its minting URL.
 - The write-back of returned document ids/URLs into the stored summary, and into its plan/note/reference references.
@@ -30,9 +35,31 @@ Turn one commit summary — and, across a branch, its recurring plans, notes, an
 
 ## Data Contracts
 
-### Attachment reference (plan / note / reference)
+### Context-kind definition
 
-Each summary carries lists of plan references, note references, and external references. Relevant fields:
+One entry per kind of pushable context artifact. Identity and field names are **data** so a kind declares rather than implements them (and so a registry can validate them); only title and body are behavior, because a body must be read out of storage and a title must be escaped.
+
+| Property | Kind of value | Meaning |
+| --- | --- | --- |
+| document type | data | The wire `docType` tag, and the registry key. Must be unique. |
+| summary field | data | Name of the `CommitSummary` array holding these items. |
+| entry key field | data | Per-commit entry identity — the field a published URL is woven back onto. |
+| base key spec | data | Cross-commit dedup identity: a list of fields joined by `:`, optionally with a trailing archive stamp stripped. |
+| recency field | data | Field whose value picks the winner revision, **compared as a string**. |
+| document id / URL field names | data, optional | Where a published id/URL is stored on the item. **Omitted → the uniform `jolliDocId` / `jolliDocUrl` names.** A legacy kind overrides them with its historical per-kind names so existing stored summaries need no migration. |
+| title | behavior | The article title; the definition is responsible for sanitizing it for a document title. |
+| body | behavior | The article body. Returning "no body" means **skip this item** — never an error. |
+| per-summary reduction | behavior, optional | Collapses items within one summary before pushing (only plans need it, for same-named archived snapshots). |
+| recency tiebreak | behavior, optional | Deterministic order when two revisions share a recency value (only plans need it). |
+| links-in-markdown | data, optional | Defaults to true. False suppresses batch placeholder minting for the kind (see Batch placeholders). |
+| best-effort-push | data, optional | Defaults to false. Marks a kind as auto-extracted context rather than user-attached content, which changes failure handling in the editor extension (see Attachment failure handling). |
+| batch client-key prefix | data, optional | **Defaults to the document type.** Prefix of the per-item batch `clientKey` (`<prefix>-<index>`), which crosses the wire and is the payload of the URL placeholder token — so it is a declared value, not a derived one, and one legacy kind pins its historical prefix rather than adopting its docType. Must be unique across kinds: the index restarts per kind, so a shared prefix would emit the same key twice in one request. |
+
+**Registration.** The definition list is the single place a kind is registered, and its **order is user-visible** — it is the order attachments are pushed within one summary. A filesystem scan would remove even that entry, but the editor-extension and plugin bundles inline this source with a bundler that has no glob-import, so a static list is the floor for the dependency to be visible at all.
+
+### Attachment item fields (as declared by the registered kinds)
+
+Each summary carries lists of plan references, note references, external references, and skill records. Relevant fields:
 
 | Field                 | On        | Meaning                                                                                                      |
 | --------------------- | --------- | ------------------------------------------------------------------------------------------------------------ |
@@ -74,13 +101,16 @@ The env key is the lowercased origin (scheme + host + non-default port) of the U
 ### Push one summary
 
 1. Resolve the current push's backend env key up front (no network I/O). Every document id sent below is gated against it by the reuse gate.
-2. Determine the plans, notes, and references to push: either the caller-selected owned attachments, or — when none are supplied — the summary's own plans reduced by the per-summary latest-per-name rule, all of its notes, and all of its references. (The branch push loop always supplies the owned, cross-commit-deduped attachments explicitly.)
-3. **Push plans first, then notes, then references.** For each:
-   - Obtain its body: a plan's body is read from storage; a note's body is its inline content or, absent that, read from storage; a reference's body is synthesized (see Reference article assembly). A plan/note whose content can't be read is logged and skipped.
-   - Push it as its own document — docType `plan` / `note` / `reference` — carrying its prior document id **only when the reuse gate permits** (id present *and* env-key match).
-   - A single attachment whose push fails with a *transient* error is logged and skipped — it does not abort the summary. Two failures are **fatal and propagate**: binding-required and client-outdated.
-   - Record each successful push's published article URL (see Article URL resolution) and its returned document id. Plan results are keyed by slug, note results by id, reference results by archived key.
-4. **Weave published URLs into the summary body.** Merge the plan URLs (matched by slug), note URLs (matched by id), and reference URLs (matched by archived key) into a working copy of the summary, so the rendered "plans & notes" section links to the published articles. For weaving, the summary's plans are again reduced by the per-summary latest-per-name rule (only the latest snapshot was uploaded).
+2. Determine the items to push **per registered kind**: either the caller-supplied selection, or — when none is supplied — the summary's own items for that kind, passed through the kind's per-summary reduction if it declares one. (The branch push loop always supplies the owned, cross-commit-deduped attachments explicitly.)
+
+   **The selection is tri-state, and the distinction is load-bearing.** No selection at all means "push the summary's own items". A selection that is present but names no items for a kind means "push **none** of that kind" — not "fall back to the summary's own". Inverting this either silently pushes nothing or pushes an un-deduped duplicate set.
+3. **Push every kind's attachments, in registry order.** For each item:
+   - Obtain its body from the kind's body behavior: a plan's body is read from storage; a note's body is its inline content or, absent that, read from storage; a reference's body is synthesized (see Reference article assembly). An item whose body is absent or empty is logged and skipped.
+   - Push it as its own document, tagged with the kind's document type, carrying its prior document id **only when the reuse gate permits** (id present *and* env-key match).
+   - Re-read the per-repo outbound opt-out **immediately before every send**, so a mid-run opt-out stops the remaining uploads rather than only the next run.
+   - Record each successful push's published article URL (see Article URL resolution), its returned document id, its entry key, and its base key.
+   - Failure handling: see Attachment failure handling.
+4. **Weave published URLs into the summary body.** Merge each kind's published URLs into a working copy of the summary, matched by that kind's **entry key** — the exact per-commit array entry, so an item recurring across commits only updates the entry that actually pushed. The copy is first passed through every kind's per-summary reduction, because only the reduced set was uploaded and the rendered body must list the same set.
 5. Render the push markdown from the enriched copy, and serialize the summary-JSON sidecar from the *same* enriched copy.
 6. **Push the summary** with: title, rendered markdown, commit hash, a document-type discriminator of "summary", the branch, the prior summary document id **only when the reuse gate permits** (update-in-place), the canonical repo URL, the flat per-branch relative path, and the sidecar when present.
 7. Compute the summary's article URL (see Article URL resolution).
@@ -100,6 +130,24 @@ The browsable article URL for any pushed document (summary, plan, note, referenc
 
 This is the canonical article-path resolution shared by the summary, plan, note, and reference push results, and by the summary write-back. (Historically the URL was always the `?doc=<id>` alias; the server-URL preference supersedes that.)
 
+### Attachment failure handling
+
+Three tiers, deliberately distinct:
+
+1. **Per-item skip.** A transient failure (network, 5xx, an unreadable body) is logged and the item is skipped; the summary push proceeds. In the editor extension a user-attached kind's failure is additionally *collected*, and the strict branch-share path turns collected failures into a fatal share error — the user chose to attach it, so shipping silently without it would misrepresent the share. A **best-effort** kind's failure never joins that collection: it is auto-extracted context, so one item the server rejects must not abort a share the user never attached it to.
+2. **Per-kind short-circuit (document type not enabled).** When the server reports that a document type is not enabled in its supported-type configuration, **every remaining item of that same kind would fail identically**. The kind is therefore short-circuited **for the rest of that summary's push**, with **one** actionable log line naming the type; other kinds keep pushing and the summary still publishes. Per-item logging here would emit a dozen copies of one configuration problem, reading like transient failures.
+
+   The scope is one summary, not the whole run: a branch push re-attempts the refused kind on the next summary and so logs once per summary rather than once per branch. That is deliberate — the refusal is a per-request answer, and the alternative (a run-scoped refused-docType set threaded through the push seam) buys a quieter log at the cost of a summary never re-attempting a kind the server started accepting mid-run.
+3. **Whole-push abort.** Binding-required and every repo-wide refusal (client-outdated, push-disabled, permission-denied) propagate and abort the attachment loop.
+
+**"Best effort" means "does not abort the push", not "is hidden from the user".** The editor extension reports skipped attachments back to its caller on a channel separate from failures, and a caller the *user* triggered must surface them: a manual push that publishes fewer articles than the memory has context for, while reporting plain success, misstates what happened. The tiers of interruption are proportional — a hard failure is a modal (skipped items fold into its detail, since the user is already being interrupted), skipped-only is a non-blocking warning, and a background pass (share reconcile, which re-enters the push on every modal open) reports to the log only.
+
+**The report is per KIND, not per item.** Both routes into it are kind-wide conditions — a docType the server has not enabled, or N items of one kind failing for the same reason — and the report is rendered into a notification. One entry per item made the well-behaved server (which names the refusal in machine-readable form) the *silent* case while a server returning a generic error produced a notification a dozen titles long. The log keeps every title; the report keeps the count.
+
+**The document-type refusal must NOT be classified as a repo-wide refusal.** The permission-denied class *is* one, so reusing it — the natural-looking choice, since the repo-allowlist refusal is reported with the same status and machine-tag shape — would make a single missing configuration row abort every attachment and fail the summary push, i.e. stop the repo publishing anything at all. It also must not burn a retry budget or mark the commit failed: the summary itself pushes fine.
+
+**On the batch endpoint the same refusal arrives differently.** An attachment failure there is reported *inside a success response* as a per-attachment not-ok entry, so nothing throws. Those entries must be logged (a document-type refusal collapsed to one line per type), because the batch endpoint is the default push path and silently dropping them makes a server-side rejection of an entire kind invisible. A per-attachment machine-readable failure code is what makes the refusal distinguishable from a transient one; absent it (older servers) the failure degrades to a logged, skipped attachment.
+
 ### Reference article assembly
 
 A reference is pushed as a standalone `reference` article. Unlike a plan or note, it has no on-disk working file (the local reference markdown is deleted at commit time; the orphan-branch snapshot is the system of record), so both its title and body are synthesized.
@@ -112,18 +160,51 @@ A reference is pushed as a standalone `reference` article. Unlike a plan or note
 3. A **field/value table** (only when the reference has fields) — a two-column markdown table of the reference's source-specific fields. Each cell is escaped for table-safety in order: backslash → doubled, pipe → escaped, newline (CR/LF) → space. The order matters: escaping backslashes first prevents a trailing backslash from turning the escaped `\|` back into a live cell separator.
 4. The **archived reference body** — the stored source content (issue/PR/page body) read back from the orphan-branch snapshot, appended below the header with its leading/trailing blank lines trimmed. When the snapshot is missing or unparseable, the article is header-only; a missing body is never a failed push.
 
+### Skill article assembly
+
+A skill is pushed as a standalone `skill` article, and is the **first kind to take the registry's default document-state field names** — it has no stored data to stay compatible with, so its definition declares none and its published id/URL land on the uniform names.
+
+**One article per (skill, commit) — the only kind that does not dedup across commits.** Its base key IS its entry key, the per-commit archived key. This is the one place the ownership algorithm's identity choice changes what the article *means*. A plan or a reference is one artifact revised over time, so collapsing revisions is right. A skill record is a **measurement of one commit's work**, and two commits' measurements are different facts, not two revisions of one fact — a single shared document could only ever report the cumulative total, which permanently disagreed with the per-commit figures every editor surface renders from `summary.skills`. The trade is stated plainly under Notable Behavior: article count is now (commits × skills).
+
+**Title.** `Skill · <host label> · <skill id> — <hash8>`. Four segments, all load-bearing: the `Skill` prefix namespaces the generated slug so a skill never collides with a plan/note/summary of the same base title; the **host label is required for uniqueness**, because two hosts can hold the same skill id as two separate rows (same title + branch + path + commit is one server-side push identity, so dropping the host would make the second push collide with the first); the **commit `hash8`** distinguishes the per-commit articles from each other in a flat per-branch folder; and middle dots because the title sanitizer strips colons, which is also why a namespaced id renders with a space.
+
+**Body.** A synthesized header followed by the shared skill token table:
+
+1. Header rows — host, plugin (when present), entry paths.
+2. The **token table**, rendered by the same shared renderer every other skill surface uses, so the em-dash-not-zero rule, the estimate marker and the inferred footnote cannot drift between surfaces. The invocation count is the table's `×` column, not a header row.
+
+**Every figure comes from the commit ref; this is the one kind whose body reads no storage.** A ref carries exactly that commit's increment, which is precisely what a per-commit article should report — so there is nothing to reconcile against an archived snapshot and no orphan-branch read on the push path at all. (An earlier design pulled cumulative counters and a verbatim invocation list out of the snapshot's frontmatter; that only made sense while one article stood for every commit.) The body function is still `async` because the contract is.
+
+**No markdown link.** The summary's Context section renders all skills as a single unlinked aggregate row, so there is no site in the body for a per-skill URL — the kind therefore declares links-in-markdown false and mints no batch placeholder (see Batch placeholders). Published skill URLs reach consumers through the structured sidecar and the stored refs instead.
+
+### Superseded skill articles
+
+Because a skill article is per (skill, commit), a fold that collapses several commits' refs into one row collapses several *published articles* into one. The surviving row can point at only one document id; the rest become unreachable — articles left on the Space forever, titled with a `hash8` the branch no longer has.
+
+So the fold records what it discards. Each merge banks the losing ids on the merged ref (`supersededDocIds`), unions them through every nested fold rather than reporting them as a return value (skills are folded at three levels on the way to a squash root, and an inner fold's casualties would otherwise be lost), and **removes the surviving id from the set** — deleting that one would destroy the very article the merged ref still points at. Whichever id survives is decided by the same inherit-but-never-overwrite rule plans use, and the URL always travels with the id so the reuse gate can still tell which backend minted it.
+
+Every consumer of the fold must **drain** the marker into the root summary's `orphanedDocIds` (the same cleanup queue superseded *summary* articles use) and strip the key from the persisted ref, so a re-squash cannot re-report ids already queued. Two paths do: the squash merge and the v3→v4 normalizer. A consumer that folds without draining silently leaks articles.
+
+**The amend root reaches the same guarantee WITHOUT folding, and the difference is load-bearing in both directions.** It unions old and new refs on the skill's mapKey with the new ref winning, then carries `jolliDocId`/`jolliDocUrl` across by hand: a winner with no id of its own adopts the old one (so the next push retitles that article to the new `hash8` instead of creating a sibling), and when both sides carry an id the winner keeps its own while the displaced one goes straight into `orphanedDocIds`. No `supersededDocIds` marker is ever minted there.
+
+- Replacing the whole ref without that hand-off *was* a bug: it dropped the published id, so the next push created a second article and stranded the first under a `hash8` the branch no longer has — the same leak, arriving by a path that recorded nothing.
+- But **folding the amend union is also a bug**, in the opposite direction: the amended child is retained in the tree, and the squash-time walk dedupes by `archivedKey`, so a row that absorbed another key's increment has that increment added a *second* time the next time a squash walks the tree (measured: an amend folding `-oldhash ×1` into `-newhash ×4` made the later squash report 8 where 7 was true). Absorbing a key requires a record of the absorption the tree walk can see, which only `archivedKey` identity provides.
+
+So each amend row keeps its own key and its own per-commit increment, and accumulation across commits stays the tree walk's job. Both failures have shipped; changing this needs a test at the squash-after-amend level, not just at the merge function.
+
 ### Per-summary latest-per-name reduction
 
 Within one summary, collapse plans that share a base name (the slug with its trailing archived-commit suffix stripped) to a single latest snapshot, preserving newest-first order. Because same-named plans share an identical server push identity (same title, branch, path, commit — the slug is not sent), the published document id is the only thing that tells the server to update rather than create. So when an older already-pushed snapshot carries a document id but the latest snapshot lacks one, the latest **inherits** that id/URL — otherwise the re-push would create a duplicate, which the server rejects.
 
 ### Cross-commit attachment ownership
 
-Across all summaries in the push range, decide, per plan base-name, per note id, and per reference base-identity, exactly one winner revision and which commit owns pushing it:
+Across all summaries in the push range, decide — **for every registered kind**, per that kind's base key — exactly one winner revision and which commit owns pushing it:
 
-1. **Winner = latest revision** by last-updated time (compared as a string; newest wins; first-seen kept on a tie). The dedup **identities differ by kind**:
-   - **Plans** — keyed by base name (slug with its trailing archived-commit suffix stripped), tiebroken on slug for determinism.
-   - **Notes** — keyed by exact id (no tiebreak needed).
-   - **References** — keyed by the **stable base identity `<source>:<nativeId>`**, *not* the per-commit archived key. So the same ticket referenced on many commits collapses to **one** Space article. Recency uses the reference's referenced-at time (string compare; newest wins; first-seen on a tie).
+1. **Winner = latest revision** by the kind's recency field (compared as a string; newest wins; first-seen kept on a tie unless the kind declares a tiebreak). The dedup identity is whatever the kind's base key spec says, which is why the registered kinds differ without the algorithm differing:
+   - **Plans** — base name (slug with its trailing archived-commit suffix stripped), recency = last-updated time, tiebroken on slug for determinism.
+   - **Notes** — exact id (**no** archive-suffix strip, unlike the merge layer's note base key: a note id is already unique, so stripping would merge two distinct notes whose ids differ only by a trailing stamp), recency = last-updated time.
+   - **References** — the **stable base identity `<source>:<nativeId>`**, *not* the per-commit archived key. So the same ticket referenced on many commits collapses to **one** Space article. Recency = referenced-at time.
+   - **Skills** — the **per-commit archived key**, i.e. the base key IS the entry key. The one kind that does **not** collapse across commits (see Skill article assembly for why a measurement is not a revision). Recency = last-used time, and it is only ever consulted for the single case where one archived key appears on two summaries: a squash root carries its children's hoisted refs and also keeps the children, so the same record is met from both ends.
 
    The winner's owner is the commit that carries it.
 2. **Seed document id propagation.** The winner should push to the *one* existing article for that plan/note/reference, so it carries a "seed" document id **plus the URL that id was minted with**:
@@ -171,11 +252,25 @@ Structure mirrors the summary view: the commit-message heading, a properties tab
 
 **Negative fact:** the PR-body markdown builders are **not** used in this push path. The push markdown shares only the lower-level section builders with the PR path; it does not go through the PR-body assembly.
 
+### Batch placeholders
+
+In a single-request batch the client cannot know the article URLs up front, so summary content carries a placeholder token per attachment that the server substitutes after minting the ids. A placeholder is minted **only for kinds whose links-in-markdown is true**: it exists solely to mark where an attachment's final URL goes in the summary body, and the token format is a byte-for-byte lockstep contract with the server's substituter. Minting one for a kind the body never links would send a token the server has no rule for, risking the literal token string being persisted into the stored article — strictly worse than the absent URL it would replace. The post-push write-back still records the real document id either way, so the *next* push's structured sidecar carries the real URL.
+
+Placeholders are woven **URL-only**: an attachment's document-id fields inside the structured sidecar stay numeric or absent, because a placeholder string there would break the sidecar schema.
+
+The token's payload is the attachment's `clientKey`, `<prefix>-<index>` with the index restarting per kind. Because that value crosses the wire, the prefix is a **declared** property of the kind rather than its document type read out sideways — one kind pins its historical prefix for exactly this reason, and the registry rejects two kinds that would resolve to the same one.
+
 ## Notable Behavior
 
-- **Plans, notes, and references are pushed before the summary so their URLs can be woven in.** The summary body links to already-published attachment articles; reversing the order would leave dangling links. (Notable.)
-- **A reference is pushed as a third standalone attachment kind (docType `reference`).** It has no on-disk working file, so its title and body are synthesized and its body is read back from the orphan-branch snapshot. (Notable.)
+- **Attachments are pushed before the summary so their URLs can be woven in.** The summary body links to already-published attachment articles; reversing the order would leave dangling links. (Notable.)
+- **The set of attachment kinds is data, not code.** Identity, dedup, recency and document-state field names are declared per kind and interpreted by one generic engine, so plans/notes/references are configuration of the same algorithm rather than three parallel implementations — and the editor extension consumes the same registry instead of carrying its own copy. (Notable; central.)
+- **An omitted document-id/URL field name means the uniform names.** That is what lets a *new* kind declare almost nothing while legacy kinds keep their historical per-kind field names with zero data migration. (Notable.)
+- **A reference is pushed as a standalone attachment kind (docType `reference`).** It has no on-disk working file, so its title and body are synthesized and its body is read back from the orphan-branch snapshot. (Notable.)
+- **A document-type refusal short-circuits one KIND — not one item, and not the whole push.** Classifying it as a repo-wide refusal (which the same-shaped repo-allowlist refusal is) would let one missing server configuration row stop the repo publishing anything. (Surprising; safety-relevant.)
+- **A batch attachment failure is reported inside a 2xx body and used to be dropped silently.** Since the batch endpoint is the default push path, that made a server-side rejection of a whole kind invisible; those entries are now logged, with a document-type refusal collapsed to one line per type. (Surprising.)
 - **Reference cross-commit dedup uses a different identity than plans/notes.** References dedup on the stable base identity `<source>:<nativeId>` (not the per-commit archived key), so the same ticket on many commits collapses to one Space article — yet the woven-back URL is matched by the per-commit archived key so only the entry that actually pushed gets the link. (Surprising.)
+- **Skill is the one kind that does NOT dedup across commits, and that multiplies article count.** A branch of 20 commits each entering 5 skills publishes 100 skill articles, not 5. It also raises each batch item's attachment count, so a commit with enough context falls out of the batch endpoint's per-item cap and takes the per-commit push path instead. Accepted deliberately: a shared document could only report cumulative totals, which permanently contradicted the per-commit figures every editor surface shows. (Surprising; the cost is real.)
+- **A fold of skill refs supersedes already-published articles, so the discarded ids are banked rather than dropped.** This has no analogue in the other kinds — they dedup across commits, so only one article per artifact ever existed. Every consumer of the fold must drain the marker into `orphanedDocIds`; one that folds without draining leaks an article per fold. (Surprising; safety-relevant.)
 - **Update-in-place hinges on carrying the prior document id.** The slug is never sent, so same-named documents are indistinguishable to the server except by the id the client supplies — the id is the sole update-vs-create signal. (Surprising; central.)
 - **A stored id is only ever re-sent to the backend it was minted on.** The reuse gate compares the id's minting-URL origin against the current push's backend origin; a mismatch drops the id so the server mints a fresh document rather than overwriting a different backend's article. This is why every propagated/seed id travels with its minting URL. (Surprising; safety-relevant.)
 - **A losing revision may only fill a *missing* seed, never overwrite the winner's id.** Overwriting would push the latest content to a stale article and orphan the winner's real one. (Surprising; safety-critical.)

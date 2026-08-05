@@ -5285,7 +5285,12 @@ describe("QueueWorker", () => {
 				expect(root.skills?.map((s) => s.skill).sort()).toEqual(["pack:build", "pack:build-0abc1234"]);
 			});
 
-			it("merges old + new refs for the SAME skill with new winning", () => {
+			it("does NOT fold counts when merging old + new refs for the SAME skill", () => {
+				// Tempting to sum (each ref is an increment, not a revision) — but the old
+				// ref survives on the retained child node and `collectChildSkills` dedupes by
+				// `archivedKey`, so a row that absorbed another key's increment gets it added
+				// again the next time a squash walks the tree. Measured end-to-end: folding
+				// `-oldhash x1` into `-newhash x4` made the later squash report 8 for 7.
 				const base = {
 					source: "claude" as const,
 					entryPaths: ["tool" as const],
@@ -5314,8 +5319,95 @@ describe("QueueWorker", () => {
 					{ skills: [newRef] },
 				);
 				expect(root.skills).toHaveLength(1);
+				// The fresh archive wins the identity (its orphan file is the one just
+				// written) and keeps its OWN increment; the old key's increment stays
+				// reachable through the retained child.
 				expect(root.skills?.[0].archivedKey).toBe("claude:superpowers:brainstorming-new67890");
 				expect(root.skills?.[0].invocationCount).toBe(3);
+			});
+
+			it("carries the published article id across an amend fold", () => {
+				// Regression: `mergeRefsNewWins` replaced the whole ref, so a skill already
+				// pushed to a Space lost its `jolliDocId`/`jolliDocUrl` the moment the
+				// commit was amended. The next push then CREATED a second article and left
+				// the first stranded under a hash8 the branch no longer has.
+				const base = {
+					source: "claude" as const,
+					entryPaths: ["tool" as const],
+					invocationCount: 1,
+					firstUsedAt: "2026-04-01T09:00:00.000Z",
+					lastUsedAt: "2026-04-01T09:30:00.000Z",
+					skill: "superpowers:brainstorming",
+				};
+				const pushed: SkillCommitRef = {
+					...base,
+					archivedKey: "claude:superpowers:brainstorming-old12345",
+					jolliDocId: 77,
+					jolliDocUrl: "https://space.jolli.ai/articles/77",
+				};
+				const fresh: SkillCommitRef = {
+					...base,
+					archivedKey: "claude:superpowers:brainstorming-new67890",
+				};
+				const root = __test__.buildHoistedAmendRoot(
+					makeOld({ skills: [pushed] }),
+					newInfo,
+					hoisted,
+					{},
+					fullDiffStats,
+					undefined,
+					{ skills: [fresh] },
+				);
+				expect(root.skills?.[0].jolliDocId).toBe(77);
+				expect(root.skills?.[0].jolliDocUrl).toBe("https://space.jolli.ai/articles/77");
+				// Nothing was superseded (only one id existed), so no cleanup is queued and
+				// the transient marker never reaches disk.
+				expect(root.orphanedDocIds).toBeUndefined();
+				expect(root.skills?.[0]).not.toHaveProperty("supersededDocIds");
+			});
+
+			it("queues an article the merge made unreachable for cleanup", () => {
+				// Both sides already published: only one id can survive on the merged row,
+				// and the loser must land in `orphanedDocIds` rather than vanish.
+				const base = {
+					source: "claude" as const,
+					entryPaths: ["tool" as const],
+					invocationCount: 1,
+					firstUsedAt: "2026-04-01T09:00:00.000Z",
+					lastUsedAt: "2026-04-01T09:30:00.000Z",
+					skill: "superpowers:brainstorming",
+				};
+				const root = __test__.buildHoistedAmendRoot(
+					makeOld({
+						skills: [
+							{
+								...base,
+								archivedKey: "claude:superpowers:brainstorming-old12345",
+								jolliDocId: 77,
+								jolliDocUrl: "https://space.jolli.ai/articles/77",
+							},
+						],
+					}),
+					newInfo,
+					hoisted,
+					{},
+					fullDiffStats,
+					undefined,
+					{
+						skills: [
+							{
+								...base,
+								archivedKey: "claude:superpowers:brainstorming-new67890",
+								jolliDocId: 88,
+								jolliDocUrl: "https://space.jolli.ai/articles/88",
+							},
+						],
+					},
+				);
+				// Newest-first: the fresh ref's id survives, the older article is queued.
+				expect(root.skills?.[0].jolliDocId).toBe(88);
+				expect(root.orphanedDocIds).toEqual([77]);
+				expect(root.skills?.[0]).not.toHaveProperty("supersededDocIds");
 			});
 
 			it("writes the excludedContext audit when the soft-excluded item is NOT attached", () => {

@@ -13,13 +13,12 @@ import { createLogger } from "../Logger.js";
 import type { CommitSummary, NoteReference, PlanReference, ReferenceCommitRef } from "../Types.js";
 import { getDefaultBranch } from "./GitOps.js";
 import { buildBranchRelativePath, deriveRepoNameFromUrl, getCanonicalRepoUrl } from "./GitRemoteUtils.js";
-import { deriveJolliEnvKey, parseBaseUrl, resolveArticleUrl } from "./JolliApiUtils.js";
+import { parseBaseUrl, resolveArticleUrl } from "./JolliApiUtils.js";
 import {
 	BATCH_MAX_ATTACHMENTS_PER_ITEM,
 	BATCH_MAX_CONTENT_CHARS,
 	BATCH_MAX_TOTAL_CONTENT_CHARS,
 	type BatchItemResult,
-	type BatchPushAttachment,
 	type BatchPushItem,
 	BindingAlreadyExistsError,
 	BindingRequiredError,
@@ -30,20 +29,27 @@ import {
 import { loadBranchSummaries } from "./PrDescription.js";
 import { isOutboundPushAllowed, PushDisabledError } from "./PushControl.js";
 import { loadPushPending } from "./PushPendingStore.js";
-import { isRepoWideRefusal } from "./PushRefusal.js";
-import { REF_HASH_SUFFIX } from "./RefMerge.js";
-import { readReferenceMarkdownFromString } from "./references/ReferenceStore.js";
+import {
+	applyPublishedUrls,
+	assertOutboundStillAllowed,
+	assignOwnedContext,
+	type BatchAttachmentKey,
+	buildContextBatchAttachments,
+	type ContextSelection,
+	legacyNamedOwnership,
+	legacyNamedSelection,
+	type OwnedContext,
+	type PushContext,
+	pushContextAttachments,
+	reduceOwnItems,
+	selectionForCommit,
+} from "./push/ContextPush.js";
+import { canReuseDocId } from "./push/DocIdReuse.js";
+import { referenceBaseKey } from "./push/kinds/index.js";
+import { latestPlanPerName, planBaseKey } from "./push/PlanGrouping.js";
 import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
-import type { StorageProvider } from "./StorageProvider.js";
+import { buildPushTitle, collectSortedTopics } from "./SummaryFormat.js";
 import {
-	buildNotePushTitle,
-	buildPlanPushTitle,
-	buildPushTitle,
-	buildReferencePushTitle,
-	collectSortedTopics,
-} from "./SummaryFormat.js";
-import {
-	buildReferencePushMarkdown,
 	pushE2eTestSection,
 	pushFooter,
 	pushPlansAndNotesSection,
@@ -53,15 +59,17 @@ import {
 	pushTopicBody,
 	pushTopicsSection,
 } from "./SummaryMarkdownBuilder.js";
-import {
-	getActiveStorage,
-	getIndexEntryMap,
-	getSummary,
-	readNoteFromBranch,
-	readPlanFromBranch,
-	readReferenceFromBranch,
-	storeSummary,
-} from "./SummaryStore.js";
+import { getActiveStorage, getIndexEntryMap, getSummary, storeSummary } from "./SummaryStore.js";
+
+/**
+ * Re-exported so every existing importer (the ide-bridge, `PushExecutor`, the
+ * MCP tools, and the test suite) keeps resolving these from here after the push
+ * path became table-driven. Their implementations moved into `core/push/` because
+ * the kind definitions need them and this module imports the registry — leaving
+ * them here would close an import cycle.
+ */
+export { canReuseDocId, latestPlanPerName, planBaseKey, referenceBaseKey, assertOutboundStillAllowed };
+export type { BatchAttachmentKey, PushContext };
 
 const log = createLogger("JolliMemoryPushOrchestrator");
 
@@ -103,160 +111,75 @@ export function serializeSummaryJson(summary: CommitSummary): string | undefined
 }
 
 /**
- * A stored `jolliDocId` may be reused as an update target only when the article
- * URL it was minted with points at the current push env. The env is NOT stored
- * separately — the doc URL's origin already IS it, so `deriveJolliEnvKey(storedUrl)`
- * recovers the backend the id belongs to. A URL from a different origin means the
- * id lives on another backend, so we drop it and let the server create a fresh doc.
+ * Legacy per-kind URL weavers, kept as one-line delegates over the generic
+ * {@link applyPublishedUrls}.
  *
- * A missing URL is legacy / never-pushed data (nothing to conflict with) →
- * reuse allowed, preserving the pre-tagging always-reuse behavior. An unparseable
- * URL is likewise treated as env-agnostic rather than throwing.
+ * They have no remaining production caller — the push path is generic — but they
+ * are what the existing test suite asserts against, and those assertions are the
+ * evidence that the generic engine reproduces the old per-kind behaviour exactly.
+ * Deliberately NOT extended for a new context kind: a new kind is a definition in
+ * `core/push/kinds/`, nothing here.
  */
-export function canReuseDocId(storedDocUrl: string | undefined, currentEnv: string): boolean {
-	if (!storedDocUrl) return true;
-	try {
-		return deriveJolliEnvKey(storedDocUrl) === currentEnv;
-	} catch {
-		return true;
-	}
-}
-
-/** Merges published plan URLs/docIds into plan references (matched by exact slug). The URL's origin is the minting env — see {@link canReuseDocId}. */
 export function applyPlanUrls(
 	plans: ReadonlyArray<PlanReference> | undefined,
 	planUrls: ReadonlyArray<{ slug: string; url: string; docId: number }>,
 ): ReadonlyArray<PlanReference> | undefined {
 	if (!plans || planUrls.length === 0) return plans;
-	const urlMap = new Map(planUrls.map((p) => [p.slug, p]));
-	return plans.map((p) => {
-		const pushed = urlMap.get(p.slug);
-		return pushed ? { ...p, jolliPlanDocUrl: pushed.url, jolliPlanDocId: pushed.docId } : p;
-	});
+	return weaveLegacy(
+		"plans",
+		plans,
+		planUrls.map((p) => ({ entryKey: p.slug, url: p.url, docId: p.docId })),
+	);
 }
 
-/** Merges published note URLs/docIds into note references (matched by id). The URL's origin is the minting env — see {@link canReuseDocId}. */
+/** Legacy delegate — see {@link applyPlanUrls}. Matched by note id. */
 export function applyNoteUrls(
 	notes: ReadonlyArray<NoteReference>,
 	noteUrls: ReadonlyArray<{ id: string; url: string; docId: number }>,
 ): ReadonlyArray<NoteReference> {
-	const urlMap = new Map(noteUrls.map((n) => [n.id, n]));
-	return notes.map((n) => {
-		const pushed = urlMap.get(n.id);
-		return pushed ? { ...n, jolliNoteDocUrl: pushed.url, jolliNoteDocId: pushed.docId } : n;
-	});
+	return weaveLegacy(
+		"notes",
+		notes,
+		noteUrls.map((n) => ({ entryKey: n.id, url: n.url, docId: n.docId })),
+	);
 }
 
-/**
- * Merges published reference URLs/docIds into commit references, matched by
- * `archivedKey` — the exact per-commit array entry pointer
- * (`<source>:<nativeId>-<shortHash>`), so a reference recurring across commits
- * only weaves the URL into the entry that actually pushed. The URL's origin is
- * the minting env — see {@link canReuseDocId}.
- */
+/** Legacy delegate — see {@link applyPlanUrls}. Matched by the per-commit `archivedKey`. */
 export function applyReferenceUrls(
 	references: ReadonlyArray<ReferenceCommitRef>,
 	referenceUrls: ReadonlyArray<{ archivedKey: string; url: string; docId: number }>,
 ): ReadonlyArray<ReferenceCommitRef> {
 	if (referenceUrls.length === 0) return references;
-	const urlMap = new Map(referenceUrls.map((r) => [r.archivedKey, r]));
-	return references.map((r) => {
-		const pushed = urlMap.get(r.archivedKey);
-		return pushed ? { ...r, jolliReferenceDocUrl: pushed.url, jolliReferenceDocId: pushed.docId } : r;
-	});
+	return weaveLegacy(
+		"references",
+		references,
+		referenceUrls.map((r) => ({ entryKey: r.archivedKey, url: r.url, docId: r.docId })),
+	);
 }
 
 /**
- * Strips a trailing archived commit-hash suffix (`-<8 hex>`) to get the base
- * name. Committed snapshots (`refactor-auth-a1b2c3d4`) and an uncommitted base
- * (`refactor-auth`) collapse to the same key.
- *
- * Shares `REF_HASH_SUFFIX` with RefMerge's `baseKeyOf.plan` rather than re-spelling
- * the pattern: this is the same base key the amend hoist dedupes by, and a drift
- * between the two would have the push path group snapshots the summary kept apart.
+ * Runs one field's items through {@link applyPublishedUrls} by wrapping them in a
+ * throwaway summary. Only the named field is read back, so the rest of the shape
+ * is irrelevant.
  */
-export function planBaseKey(slug: string): string {
-	return slug.replace(REF_HASH_SUFFIX, "");
+function weaveLegacy<T>(
+	field: "plans" | "notes" | "references",
+	items: ReadonlyArray<T>,
+	docs: ReadonlyArray<{ entryKey: string; url: string; docId: number }>,
+): ReadonlyArray<T> {
+	const docType = field === "plans" ? "plan" : field === "notes" ? "note" : "reference";
+	const carrier = { [field]: items } as unknown as CommitSummary;
+	const woven = applyPublishedUrls(carrier, new Map([[docType, docs]]));
+	return (woven as unknown as Record<string, ReadonlyArray<T>>)[field];
 }
 
 /**
- * Compares two plans newest-first by `updatedAt`, tiebroken by `slug` so the
- * order is deterministic across repeated calls.
- */
-function byUpdatedAtDesc(a: PlanReference, b: PlanReference): number {
-	if (a.updatedAt !== b.updatedAt) {
-		return a.updatedAt < b.updatedAt ? 1 : -1;
-	}
-	return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
-}
-
-/**
- * Returns exactly one plan per base name — the latest snapshot — preserving the
- * newest-first order. Used to avoid pushing duplicate same-named documents to
- * Jolli.
+ * Legacy named-shape view of {@link assignOwnedContext}, kept so the existing
+ * assertions (15 destructuring sites) still pin the winner and seed rules.
  *
- * Same-named plans share an identical server push identity (same title, branch,
- * relativePath, commit — the slug is NOT sent), so `jolliPlanDocId` is the only
- * thing that tells the server to UPDATE rather than CREATE. When a previously
- * pushed older snapshot carries the docId but the latest snapshot does not, the
- * latest inherits that docId/url so the push updates the existing article
- * instead of creating a duplicate (which the server rejects → push failure).
- */
-export function latestPlanPerName(plans: ReadonlyArray<PlanReference>): ReadonlyArray<PlanReference> {
-	const sorted = [...plans].sort(byUpdatedAtDesc);
-	// Newest already-pushed docId/url per base name (first hit wins = newest). The
-	// URL rides with the docId so the reuse gate downstream (`canReuseDocId`, which
-	// reads the URL's origin) can tell which backend the inherited id belongs to.
-	const pushedDoc = new Map<string, { docId: number; url: string | undefined }>();
-	for (const plan of sorted) {
-		const key = planBaseKey(plan.slug);
-		if (plan.jolliPlanDocId !== undefined && !pushedDoc.has(key)) {
-			pushedDoc.set(key, { docId: plan.jolliPlanDocId, url: plan.jolliPlanDocUrl });
-		}
-	}
-	const seen = new Set<string>();
-	const result: PlanReference[] = [];
-	for (const plan of sorted) {
-		const key = planBaseKey(plan.slug);
-		if (seen.has(key)) {
-			continue;
-		}
-		seen.add(key);
-		if (plan.jolliPlanDocId === undefined) {
-			const inherited = pushedDoc.get(key);
-			if (inherited) {
-				result.push({
-					...plan,
-					jolliPlanDocId: inherited.docId,
-					jolliPlanDocUrl: inherited.url,
-				});
-				continue;
-			}
-		}
-		result.push(plan);
-	}
-	return result;
-}
-
-/** The winner revision of a recurring plan/note + which commit owns its push. */
-interface Winner<T> {
-	readonly ref: T;
-	readonly ownerCommit: string;
-	/** A known docId for this plan/note (from any commit's prior push) so the push updates in place. */
-	readonly seedDocId?: number;
-	/** Article URL the `seedDocId` was minted with — rides with the id so the reuse gate (`canReuseDocId`, keyed on the URL's origin) can tell which backend it belongs to, and so the woven URL matches the id. */
-	readonly seedDocUrl?: string;
-}
-
-/**
- * Cross-commit dedup: pick the winner revision per plan base-slug / note id
- * (latest updatedAt), remember the owner commit + any known docId to reuse, and
- * assign each winner (docId injected) to its owner commit. Shared by the
- * live-share push and the push-branch-to-Jolli path so both dedup identically.
- *
- * Also returns the seed docId maps (winners that already have a known docId) so
- * the caller can pre-seed its attachment-map resolution — a plan/note recurring
- * across commits pushes to ONE Space doc instead of a duplicate per commit.
+ * Deliberately NOT extended for a new context kind — read the generic
+ * {@link assignOwnedContext} output instead, which covers every registered kind
+ * without naming any of them.
  */
 export function assignOwnedAttachments(subjectSummaries: ReadonlyArray<CommitSummary>): {
 	ownedPlans: Map<string, PlanReference[]>;
@@ -266,111 +189,34 @@ export function assignOwnedAttachments(subjectSummaries: ReadonlyArray<CommitSum
 	seedNoteDocIds: Map<string, number>;
 	seedReferenceDocIds: Map<string, number>;
 } {
-	const planWinners = new Map<string, Winner<PlanReference>>();
-	const noteWinners = new Map<string, Winner<NoteReference>>();
-	const referenceWinners = new Map<string, Winner<ReferenceCommitRef>>();
-	for (const summary of subjectSummaries) {
-		for (const plan of summary.plans ?? []) {
-			const key = planBaseKey(plan.slug);
-			const prev = planWinners.get(key);
-			// Use the SAME comparator as latestPlanPerName (updatedAt desc, slug
-			// tiebreak) so the two dedup paths never disagree on which snapshot is
-			// "latest" — a disagreement would push one slug but weave the URL against
-			// the other, dropping the plan's markdown link. String compare (via
-			// byUpdatedAtDesc) also avoids Date.parse's NaN-on-malformed-date pitfall.
-			if (!prev || byUpdatedAtDesc(plan, prev.ref) < 0) {
-				// This revision wins (or is the first seen). Its own docId is
-				// authoritative for the latest article; fall back to a docId a prior
-				// revision surfaced only when this one carries none. The URL tracks
-				// whichever revision actually supplied the docId.
-				const seedDocId = plan.jolliPlanDocId ?? prev?.seedDocId;
-				const seedDocUrl = plan.jolliPlanDocId !== undefined ? plan.jolliPlanDocUrl : prev?.seedDocUrl;
-				planWinners.set(key, { ref: plan, ownerCommit: summary.commitHash, seedDocId, seedDocUrl });
-			} else if (prev.seedDocId === undefined && plan.jolliPlanDocId !== undefined) {
-				// A losing (older) revision only fills in a docId the winner didn't
-				// already have. It must NEVER overwrite the winner's own docId —
-				// doing so would push the latest content to an older article and
-				// orphan (leak) the winner's real one.
-				planWinners.set(key, { ...prev, seedDocId: plan.jolliPlanDocId, seedDocUrl: plan.jolliPlanDocUrl });
-			}
-		}
-		for (const note of summary.notes ?? []) {
-			const prev = noteWinners.get(note.id);
-			// Notes are keyed by exact id, so no slug tiebreak is needed. Compare
-			// updatedAt as strings (newest wins, first-seen kept on a tie) to stay
-			// deterministic and NaN-free for a malformed/missing updatedAt.
-			if (!prev || note.updatedAt > prev.ref.updatedAt) {
-				const seedDocId = note.jolliNoteDocId ?? prev?.seedDocId;
-				const seedDocUrl = note.jolliNoteDocId !== undefined ? note.jolliNoteDocUrl : prev?.seedDocUrl;
-				noteWinners.set(note.id, { ref: note, ownerCommit: summary.commitHash, seedDocId, seedDocUrl });
-			} else if (prev.seedDocId === undefined && note.jolliNoteDocId !== undefined) {
-				noteWinners.set(note.id, { ...prev, seedDocId: note.jolliNoteDocId, seedDocUrl: note.jolliNoteDocUrl });
-			}
-		}
-		for (const ref of summary.references ?? []) {
-			// A reference is identified across commits by its stable `<source>:<nativeId>`
-			// (Reference.mapKey), NOT its per-commit `archivedKey` — the same ticket
-			// referenced on two commits pushes to ONE Space article. Recency by
-			// `referencedAt` (string compare, newest wins, first-seen kept on a tie).
-			const key = referenceBaseKey(ref);
-			const prev = referenceWinners.get(key);
-			if (!prev || ref.referencedAt > prev.ref.referencedAt) {
-				const seedDocId = ref.jolliReferenceDocId ?? prev?.seedDocId;
-				const seedDocUrl = ref.jolliReferenceDocId !== undefined ? ref.jolliReferenceDocUrl : prev?.seedDocUrl;
-				referenceWinners.set(key, { ref, ownerCommit: summary.commitHash, seedDocId, seedDocUrl });
-			} else if (prev.seedDocId === undefined && ref.jolliReferenceDocId !== undefined) {
-				referenceWinners.set(key, {
-					...prev,
-					seedDocId: ref.jolliReferenceDocId,
-					seedDocUrl: ref.jolliReferenceDocUrl,
-				});
-			}
-		}
-	}
-
-	const ownedPlans = new Map<string, PlanReference[]>();
-	const ownedNotes = new Map<string, NoteReference[]>();
-	const ownedReferences = new Map<string, ReferenceCommitRef[]>();
-	const pushInto = <T>(map: Map<string, T[]>, commit: string, item: T): void => {
-		const arr = map.get(commit);
-		if (arr) arr.push(item);
-		else map.set(commit, [item]);
+	const owned = assignOwnedContext(subjectSummaries);
+	return {
+		ownedPlans: ownedMapOf<PlanReference>(owned, "plan"),
+		ownedNotes: ownedMapOf<NoteReference>(owned, "note"),
+		ownedReferences: ownedMapOf<ReferenceCommitRef>(owned, "reference"),
+		seedPlanDocIds: seedMapOf(owned, "plan"),
+		seedNoteDocIds: seedMapOf(owned, "note"),
+		seedReferenceDocIds: seedMapOf(owned, "reference"),
 	};
-	for (const w of planWinners.values()) {
-		pushInto(
-			ownedPlans,
-			w.ownerCommit,
-			w.seedDocId ? { ...w.ref, jolliPlanDocId: w.seedDocId, jolliPlanDocUrl: w.seedDocUrl } : w.ref,
-		);
-	}
-	for (const w of noteWinners.values()) {
-		pushInto(
-			ownedNotes,
-			w.ownerCommit,
-			w.seedDocId ? { ...w.ref, jolliNoteDocId: w.seedDocId, jolliNoteDocUrl: w.seedDocUrl } : w.ref,
-		);
-	}
-	for (const w of referenceWinners.values()) {
-		pushInto(
-			ownedReferences,
-			w.ownerCommit,
-			w.seedDocId ? { ...w.ref, jolliReferenceDocId: w.seedDocId, jolliReferenceDocUrl: w.seedDocUrl } : w.ref,
-		);
-	}
-
-	const seedPlanDocIds = new Map<string, number>();
-	const seedNoteDocIds = new Map<string, number>();
-	const seedReferenceDocIds = new Map<string, number>();
-	for (const w of planWinners.values()) if (w.seedDocId) seedPlanDocIds.set(planBaseKey(w.ref.slug), w.seedDocId);
-	for (const [id, w] of noteWinners) if (w.seedDocId) seedNoteDocIds.set(id, w.seedDocId);
-	for (const [key, w] of referenceWinners) if (w.seedDocId) seedReferenceDocIds.set(key, w.seedDocId);
-
-	return { ownedPlans, ownedNotes, ownedReferences, seedPlanDocIds, seedNoteDocIds, seedReferenceDocIds };
 }
 
-/** Cross-commit dedup key for a reference: its stable `<source>:<nativeId>` (Reference.mapKey). */
-export function referenceBaseKey(ref: ReferenceCommitRef): string {
-	return `${ref.source}:${ref.nativeId}`;
+function ownedMapOf<T>(owned: OwnedContext, docType: string): Map<string, T[]> {
+	const out = new Map<string, T[]>();
+	/* v8 ignore next -- the `?? []` is unreachable: assignOwnedContext seeds an entry for
+	   EVERY registered kind, and plan/note/reference are registered, so the lookup always
+	   hits. Kept so a future de-registration degrades to an empty map rather than throwing.
+	   Suppressed on this line ALONE, not around both functions: the wrapping form also
+	   excluded the loop and both function declarations, which the legacy-adapter tests do
+	   cover — the whole point of keeping those adapters. */
+	const forKind = owned.get(docType)?.owned ?? [];
+	for (const [hash, items] of forKind) out.set(hash, [...(items as ReadonlyArray<T>)]);
+	return out;
+}
+
+function seedMapOf(owned: OwnedContext, docType: string): Map<string, number> {
+	const forKind = owned.get(docType);
+	/* v8 ignore next -- unreachable `?? []`, see ownedMapOf. */
+	return new Map(forKind?.seeds ?? []);
 }
 
 // ── Push markdown ────────────────────────────────────────────────────────────
@@ -431,11 +277,29 @@ export function docUrlPlaceholder(clientKey: string): string {
 	return `{{jolli:doc:${clientKey}}}`;
 }
 
-/** Identity of one batch attachment for the post-push URL write-back. */
-export interface BatchAttachmentKey {
-	readonly kind: "plan" | "note" | "reference";
-	/** Plan slug / note id / reference archivedKey. */
-	readonly key: string;
+/**
+ * Legacy named-shape owner-assigned attachments.
+ *
+ * Accepted by {@link buildBatchItems} alongside the kind-agnostic
+ * {@link OwnedContext} so existing callers and tests keep working. Deliberately
+ * NOT extended for a new context kind — pass an {@link OwnedContext}.
+ */
+export interface OwnedAttachmentMaps {
+	readonly ownedPlans: ReadonlyMap<string, ReadonlyArray<PlanReference>>;
+	readonly ownedNotes: ReadonlyMap<string, ReadonlyArray<NoteReference>>;
+	readonly ownedReferences: ReadonlyMap<string, ReadonlyArray<ReferenceCommitRef>>;
+}
+
+/**
+ * Normalizes either ownership form into an {@link OwnedContext}.
+ *
+ * The named form is expanded by {@link legacyNamedOwnership}, which walks the
+ * registry rather than emitting three fixed entries — see there for why the
+ * hard-coded docType list lives in one place next to the registry.
+ */
+function toOwnedContext(owned: OwnedContext | OwnedAttachmentMaps): OwnedContext {
+	if (!("ownedPlans" in owned)) return owned;
+	return legacyNamedOwnership(owned);
 }
 
 /** One built batch item plus the bookkeeping `applyBatchResult` needs. */
@@ -449,37 +313,34 @@ export interface BuiltBatchItem {
 	readonly batchIneligibleReason?: string;
 }
 
-/** Owner-assigned attachments per commit hash (see {@link assignOwnedAttachments}). */
-export interface OwnedAttachmentMaps {
-	readonly ownedPlans: ReadonlyMap<string, ReadonlyArray<PlanReference>>;
-	readonly ownedNotes: ReadonlyMap<string, ReadonlyArray<NoteReference>>;
-	readonly ownedReferences: ReadonlyMap<string, ReadonlyArray<ReferenceCommitRef>>;
-}
-
 /**
  * Builds one `BatchPushItem` per summary for `pushBatch`: reads attachment
  * bodies, assigns per-item clientKeys, weaves placeholder URLs into the
  * summary markdown (+ summaryJson), and carries existing docIds (env-gated by
  * {@link canReuseDocId}) so the server updates instead of creating.
  *
+ * Attachment assembly is generic over the registered context kinds — see
+ * `buildContextBatchAttachments`.
+ *
  * Only URL fields carry placeholders — attachment docId fields inside the
  * summaryJson stay numeric/absent (a placeholder string there would break the
  * sidecar schema); the local write-back (`applyBatchResult`) records the real
  * ids for the next push.
  *
- * Unreadable/empty attachment bodies are skipped like `pushPlanList` — their
- * placeholder is never minted, so the woven copy keeps whatever URL state the
- * reference already had.
+ * Unreadable/empty attachment bodies are skipped exactly as in the individual
+ * path — their placeholder is never minted, so the woven copy keeps whatever URL
+ * state the item already had.
  */
 export async function buildBatchItems(
 	summaries: ReadonlyArray<CommitSummary>,
-	owned: OwnedAttachmentMaps,
+	owned: OwnedContext | OwnedAttachmentMaps,
 	ctx: PushContext,
 ): Promise<Array<BuiltBatchItem>> {
 	const envKey = await ctx.client.resolveEnvKey();
+	const ownership = toOwnedContext(owned);
 	const built: Array<BuiltBatchItem> = [];
 	for (const summary of summaries) {
-		built.push(await buildOneBatchItem(summary, owned, ctx, envKey));
+		built.push(await buildOneBatchItem(summary, selectionForCommit(ownership, summary.commitHash), ctx, envKey));
 	}
 	const attachmentCount = built.reduce((sum, item) => sum + item.item.attachments.length, 0);
 	const fallbackCount = built.filter((item) => item.batchIneligibleReason !== undefined).length;
@@ -513,100 +374,23 @@ function getBatchIneligibleReason(item: BatchPushItem, contentChars: number): st
 
 async function buildOneBatchItem(
 	summary: CommitSummary,
-	owned: OwnedAttachmentMaps,
+	selection: ContextSelection,
 	ctx: PushContext,
 	envKey: string,
 ): Promise<BuiltBatchItem> {
-	const attachments: Array<BatchPushAttachment> = [];
-	const attachmentKeys = new Map<string, BatchAttachmentKey>();
-	const relativePath = buildBranchRelativePath(summary.branch);
-	const placeholderBySlug = new Map<string, string>();
-	const placeholderByNoteId = new Map<string, string>();
-	const placeholderByArchivedKey = new Map<string, string>();
+	const { attachments, attachmentKeys, placeholders } = await buildContextBatchAttachments(
+		summary,
+		ctx,
+		envKey,
+		selection,
+		docUrlPlaceholder,
+	);
 
-	const plans = owned.ownedPlans.get(summary.commitHash) ?? [];
-	for (const [index, plan] of plans.entries()) {
-		const content = (await readPlanFromBranch(plan.slug, ctx.cwd, ctx.storage)) ?? "";
-		if (!content) {
-			log.info("Plan %s: no content found, skipping", plan.slug);
-			continue;
-		}
-		const clientKey = `plan-${index}`;
-		attachments.push({
-			clientKey,
-			docType: "plan",
-			title: buildPlanPushTitle(summary, plan.title),
-			content,
-			relativePath,
-			...(plan.jolliPlanDocId !== undefined &&
-				canReuseDocId(plan.jolliPlanDocUrl, envKey) && { docId: plan.jolliPlanDocId }),
-		});
-		attachmentKeys.set(clientKey, { kind: "plan", key: plan.slug });
-		placeholderBySlug.set(plan.slug, docUrlPlaceholder(clientKey));
-	}
-
-	const notes = owned.ownedNotes.get(summary.commitHash) ?? [];
-	for (const [index, note] of notes.entries()) {
-		const content = note.content ?? (await readNoteFromBranch(note.id, ctx.cwd, ctx.storage)) ?? "";
-		if (!content) {
-			log.info("Note %s: no content found, skipping", note.id);
-			continue;
-		}
-		const clientKey = `note-${index}`;
-		attachments.push({
-			clientKey,
-			docType: "note",
-			title: buildNotePushTitle(summary, note.title),
-			content,
-			relativePath,
-			...(note.jolliNoteDocId !== undefined &&
-				canReuseDocId(note.jolliNoteDocUrl, envKey) && { docId: note.jolliNoteDocId }),
-		});
-		attachmentKeys.set(clientKey, { kind: "note", key: note.id });
-		placeholderByNoteId.set(note.id, docUrlPlaceholder(clientKey));
-	}
-
-	const references = owned.ownedReferences.get(summary.commitHash) ?? [];
-	for (const [index, ref] of references.entries()) {
-		const storedMd = await readReferenceFromBranch(ref.source, ref.archivedKey, ctx.cwd, ctx.storage);
-		const description = storedMd
-			? (readReferenceMarkdownFromString(storedMd)?.description ?? undefined)
-			: undefined;
-		const clientKey = `ref-${index}`;
-		attachments.push({
-			clientKey,
-			docType: "reference",
-			title: buildReferencePushTitle(ref),
-			content: buildReferencePushMarkdown(ref, description),
-			relativePath,
-			...(ref.jolliReferenceDocId !== undefined &&
-				canReuseDocId(ref.jolliReferenceDocUrl, envKey) && { docId: ref.jolliReferenceDocId }),
-		});
-		attachmentKeys.set(clientKey, { kind: "reference", key: ref.archivedKey });
-		placeholderByArchivedKey.set(ref.archivedKey, docUrlPlaceholder(clientKey));
-	}
-
-	// Weave placeholder URLs into the enriched copy the markdown + summaryJson
-	// are built from — mirrors pushSummary's real-URL weave, minus docIds.
-	const dedupedPlans = latestPlanPerName(summary.plans ?? []);
-	const plansWithUrls = dedupedPlans.map((p) => {
-		const placeholder = placeholderBySlug.get(p.slug);
-		return placeholder ? { ...p, jolliPlanDocUrl: placeholder } : p;
-	});
-	const notesWithUrls = summary.notes?.map((n) => {
-		const placeholder = placeholderByNoteId.get(n.id);
-		return placeholder ? { ...n, jolliNoteDocUrl: placeholder } : n;
-	});
-	const referencesWithUrls = summary.references?.map((r) => {
-		const placeholder = placeholderByArchivedKey.get(r.archivedKey);
-		return placeholder ? { ...r, jolliReferenceDocUrl: placeholder } : r;
-	});
-	const summaryForMarkdown: CommitSummary = {
-		...summary,
-		plans: plansWithUrls,
-		...(notesWithUrls !== undefined && { notes: notesWithUrls }),
-		...(referencesWithUrls !== undefined && { references: referencesWithUrls }),
-	};
+	// Weave placeholder URLs into the enriched copy the markdown + summaryJson are
+	// built from — mirrors pushSummary's real-URL weave, minus docIds (`urlOnly`).
+	// `reduceOwnItems` first, because only the reduced set was uploaded and the
+	// rendered body must list the same set.
+	const summaryForMarkdown = applyPublishedUrls(reduceOwnItems(summary), placeholders, { urlOnly: true });
 	const markdown = buildPushMarkdown(summaryForMarkdown);
 	const summaryJson = serializeSummaryJson(summaryForMarkdown);
 
@@ -616,7 +400,7 @@ async function buildOneBatchItem(
 		summary: {
 			title: buildPushTitle(summary),
 			content: markdown,
-			relativePath,
+			relativePath: buildBranchRelativePath(summary.branch),
 			...(summary.jolliDocId !== undefined &&
 				canReuseDocId(summary.jolliDocUrl, envKey) && { docId: summary.jolliDocId }),
 			...(summaryJson && { summaryJson }),
@@ -801,32 +585,50 @@ async function writeBackBatchItem(
 	/* v8 ignore next -- callers only pass ok results, which always carry summary */
 	if (!summaryDoc) return undefined;
 	const summaryUrl = resolveArticleUrl(displayBase, summaryDoc.url, summaryDoc.docId);
-	const planUrls: Array<{ slug: string; url: string; docId: number }> = [];
-	const noteUrls: Array<{ id: string; url: string; docId: number }> = [];
-	const referenceUrls: Array<{ archivedKey: string; url: string; docId: number }> = [];
+	const published = new Map<string, Array<{ entryKey: string; url: string; docId: number }>>();
+	// A batch attachment failure arrives as `ok: false` inside a 2xx body, so nothing
+	// throws. These used to be dropped in silence, which made a server-side rejection
+	// of an entire docType invisible on the DEFAULT push path. `doctype_not_allowed`
+	// is collapsed to one line per docType — every attachment of that kind fails for
+	// the same reason, so one per item would be a dozen copies of one problem.
+	const unsupportedDocTypes = new Set<string>();
 	for (const att of result.attachments) {
-		if (!att.ok || att.docId === undefined || att.url === undefined) continue;
 		const identity = entry.attachmentKeys.get(att.clientKey);
+		if (!att.ok || att.docId === undefined || att.url === undefined) {
+			if (!att.ok) {
+				if (att.errorCode === "doctype_not_allowed") {
+					unsupportedDocTypes.add(identity?.docType ?? "?");
+				} else {
+					log.error(
+						"Batch push: attachment %s (%s) of %s FAILED: %s",
+						att.clientKey,
+						identity?.docType ?? "?",
+						entry.summary.commitHash.substring(0, 8),
+						att.error ?? att.errorCode ?? "no reason reported",
+					);
+				}
+			}
+			continue;
+		}
 		if (!identity) continue;
 		const url = resolveArticleUrl(displayBase, att.url, att.docId);
-		if (identity.kind === "plan") {
-			planUrls.push({ slug: identity.key, url, docId: att.docId });
-		} else if (identity.kind === "note") {
-			noteUrls.push({ id: identity.key, url, docId: att.docId });
-		} else {
-			referenceUrls.push({ archivedKey: identity.key, url, docId: att.docId });
-		}
+		const forKind = published.get(identity.docType);
+		const doc = { entryKey: identity.key, url, docId: att.docId };
+		if (forKind) forKind.push(doc);
+		else published.set(identity.docType, [doc]);
+	}
+	for (const docType of unsupportedDocTypes) {
+		log.warn(
+			"Batch push: the server does not have docType \"%s\" enabled, so none of %s's articles of that kind were created. Enable it in the server's supported-docType configuration.",
+			docType,
+			entry.summary.commitHash.substring(0, 8),
+		);
 	}
 	const summary = entry.summary;
 	const updatedSummary: CommitSummary = {
-		...summary,
+		...applyPublishedUrls(summary, published),
 		jolliDocUrl: summaryUrl,
 		jolliDocId: summaryDoc.docId,
-		...(planUrls.length > 0 ? { plans: applyPlanUrls(summary.plans, planUrls) } : {}),
-		...(noteUrls.length > 0 && summary.notes ? { notes: applyNoteUrls(summary.notes, noteUrls) } : {}),
-		...(referenceUrls.length > 0 && summary.references
-			? { references: applyReferenceUrls(summary.references, referenceUrls) }
-			: {}),
 	};
 	await storeSummary(updatedSummary, ctx.cwd, true, undefined, ctx.storage);
 	return updatedSummary;
@@ -835,31 +637,41 @@ async function writeBackBatchItem(
 // ── Push orchestration (network I/O) ─────────────────────────────────────────
 
 /**
- * Everything `pushSummary` needs that isn't on the summary itself. CLI analogue
- * of the VS Code `PushContext` (`JolliPushOrchestrator.ts:87-98`) — the binding
- * chooser callback is dropped (the CLI surfaces `BindingRequiredError` to its
- * caller instead of resolving it inline), and `storeSummary`/plan/note reads go
- * through the CLI's `SummaryStore` functions (with `storage`) rather than a
- * vscode bridge.
+ * The attachments to push for a summary — caller-chosen, or the summary's own when
+ * omitted.
+ *
+ * **Legacy named-field shape, deliberately frozen.** A new context kind does NOT
+ * add a field here: `pushSummary` accepts either this or the kind-agnostic
+ * {@link ContextSelection} map, and every in-repo caller now passes the map. This
+ * form only survives so the 48 existing `{ plans: [p], notes: [] }` test literals
+ * keep compiling — which is what makes them evidence that the generic engine
+ * reproduces the old behaviour.
  */
-export interface PushContext {
-	/** Worktree root — plan/note bodies and the summary write-back are scoped to this. */
-	readonly cwd: string;
-	/** Resolved site base URL (the API key's `u`); article links are `${baseUrl}/articles?doc=<id>`. */
-	readonly baseUrl: string;
-	/** Kept for interface parity with the VS Code `PushContext`; unused — `client` carries its own auth. */
-	readonly apiKey?: string;
-	readonly repoUrl: string;
-	readonly client: JolliMemoryPushClient;
-	readonly storage?: StorageProvider;
-}
-
-/** The plans/notes/references to push for a summary — caller-chosen, or the summary's own when omitted. */
 export interface AttachmentSelection {
 	readonly plans: ReadonlyArray<PlanReference>;
 	readonly notes: ReadonlyArray<NoteReference>;
-	/** Deduped (owner-commit) references; omit to push none for this summary (the branch path passes them explicitly). */
+	/** Deduped (owner-commit) references; omit to push none for this summary. */
 	readonly references?: ReadonlyArray<ReferenceCommitRef>;
+}
+
+/**
+ * Normalizes either selection form into a {@link ContextSelection}.
+ *
+ * The tri-state is load-bearing and easy to invert: **no selection at all** means
+ * "push the summary's own items", while a selection **present but missing a kind's
+ * key** means "push none of that kind". The legacy shape spelled the second case
+ * as `attachments.references ?? []`, so a `Map` must carry an explicit empty array
+ * for every registered kind the caller did not name — which is what
+ * {@link legacyNamedSelection} does by walking the registry.
+ */
+function toContextSelection(
+	attachments: AttachmentSelection | ContextSelection | undefined,
+): ContextSelection | undefined {
+	if (attachments === undefined) return undefined;
+	// Discriminate on a named field rather than `instanceof Map`: `ContextSelection`
+	// is a ReadonlyMap *interface*, which TS cannot narrow with instanceof.
+	if (!("plans" in attachments)) return attachments;
+	return legacyNamedSelection(attachments);
 }
 
 /** Result of pushing one summary: the persisted (write-back applied) summary, plus its article URL. */
@@ -875,89 +687,40 @@ export interface PushSummaryResult {
 }
 
 /**
- * Pushes one summary's plans → notes → summary(+summaryJson) to a Jolli Space,
- * then writes the returned `docId`/`docUrl` back into the stored summary. Port
- * of the VS Code `pushSummaryWithAttachments` (`JolliPushOrchestrator.ts:154-263`).
+ * Pushes one summary's context attachments (in registry order) and then the
+ * summary itself (+summaryJson) to a Jolli Space, writing the returned
+ * `docId`/`docUrl` back into the stored summary. Port of the VS Code
+ * `pushSummaryWithAttachments` (`JolliPushOrchestrator.ts:154-263`).
  *
- * Best-effort on attachments: a plan/note whose content can't be read, or whose
+ * Best-effort on attachments: an item whose content can't be read, or whose
  * individual push fails with a transient error, is skipped (logged) rather than
- * aborting the whole push. The two fatal errors — `BindingRequiredError` and
- * `ClientOutdatedError` (426; the CLI analogue of vscode's `PluginOutdatedError`)
- * — propagate from any push (summary, plan, or note); the caller
- * (`pushBranchToJolli`) surfaces `BindingRequiredError` as
- * `{ type: "binding_required" }` and `ClientOutdatedError` as `{ type: "error" }`,
- * rather than retrying inline (unlike the VS Code version, which resolves the
- * binding case via an injected chooser).
+ * aborting the whole push. `DocTypeNotAllowedError` short-circuits just that KIND
+ * (see `pushContextAttachments`). Two errors are fatal and propagate from any push
+ * — `BindingRequiredError` and `ClientOutdatedError` (426; the CLI analogue of
+ * vscode's `PluginOutdatedError`); the caller (`pushBranchToJolli`) surfaces them
+ * as `{ type: "binding_required" }` / `{ type: "error" }` rather than retrying
+ * inline (unlike the VS Code version, which resolves the binding case via an
+ * injected chooser).
  */
-/**
- * Errors that must ABORT an attachment loop instead of being collected per item:
- * every {@link isRepoWideRefusal} (see `PushRefusal.ts` — the shared, three-surface
- * source of truth for that membership), plus `BindingRequiredError`, which is
- * fatal *here* because these loops cannot run the binding chooser themselves and
- * so must propagate to the caller that can. Shared by all three loops so the set
- * cannot drift between them.
- */
-function isFatalAttachmentError(err: unknown): boolean {
-	return isRepoWideRefusal(err) || (err instanceof Error && err.name === "BindingRequiredError");
-}
-
-/**
- * Re-reads the per-repo opt-out immediately before an outbound send.
- *
- * The entry gates (`pushBranchToJolli`, the two drains) check once, up front —
- * that is what makes a disabled repo cheap to refuse. But a branch push is a
- * LOOP of network calls that can run for many seconds, and spec 306 requires the
- * flag be read LIVE: a user who disables push mid-run must stop the REMAINING
- * sends, not merely the next run. The VS Code client re-checks inside
- * `pushToJolli` / `deleteFromJolli` and IntelliJ re-checks inside the `jolli-api`
- * bridge, so without this the native CLI would be the one surface that keeps
- * leaking after the toggle.
- *
- * Cheap by construction: the repo identity is memoized per-cwd (see
- * `PushControl`), so the extra reads are a file read each, not a git spawn.
- */
-export async function assertOutboundStillAllowed(cwd: string): Promise<void> {
-	if (!(await isOutboundPushAllowed(cwd))) throw new PushDisabledError();
-}
-
 export async function pushSummary(
 	summary: CommitSummary,
 	ctx: PushContext,
-	attachments?: AttachmentSelection,
+	attachments?: AttachmentSelection | ContextSelection,
 ): Promise<PushSummaryResult> {
 	const displayBase = ctx.baseUrl.replace(/\/+$/, "");
 	// Env key of the tenant this push targets — every docId minted below is tagged
 	// with it, and an existing docId is reused as an update target only when its
 	// tag matches (see `canReuseDocId`). No network I/O.
 	const envKey = await ctx.client.resolveEnvKey();
-	const plansToPush = attachments ? attachments.plans : latestPlanPerName(summary.plans ?? []);
-	const notesToPush = attachments ? attachments.notes : (summary.notes ?? []);
-	const referencesToPush = attachments ? (attachments.references ?? []) : (summary.references ?? []);
+	const selection = toContextSelection(attachments);
 
-	const planUrls = await pushPlanList(plansToPush, summary, ctx, displayBase, envKey);
-	const noteUrls = await pushNoteList(notesToPush, summary, ctx, displayBase, envKey);
-	const referenceUrls = await pushReferenceList(referencesToPush, summary, ctx, displayBase, envKey);
+	const published = await pushContextAttachments(summary, ctx, envKey, selection);
 
-	// Weave the published URLs into the summary markdown (so the article's Plans
-	// & Notes list links to the published docs). Dedupe same-named plan
-	// snapshots — only the latest was uploaded.
-	const dedupedPlans = latestPlanPerName(summary.plans ?? []);
-	// `applyPlanUrls` only returns undefined when its `plans` argument is undefined;
-	// `dedupedPlans` is always a (possibly empty) array, so the `?? dedupedPlans`
-	// fallback can never actually trigger — kept for parity with the VS Code source.
-	const plansWithUrls =
-		applyPlanUrls(dedupedPlans, planUrls) ?? /* v8 ignore start -- unreachable: see comment above */ dedupedPlans;
-	/* v8 ignore stop */
-	const notesWithUrls = summary.notes ? applyNoteUrls(summary.notes, noteUrls) : summary.notes;
-	const referencesWithUrls = summary.references
-		? applyReferenceUrls(summary.references, referenceUrls)
-		: summary.references;
-	const summaryForMarkdown: CommitSummary = {
-		...summary,
-		plans: plansWithUrls,
-		...(notesWithUrls !== summary.notes && { notes: notesWithUrls }),
-		...(referencesWithUrls !== summary.references && { references: referencesWithUrls }),
-	};
+	// Weave the published URLs into the copy the markdown is rendered from, so the
+	// article's Context list links to the published docs. `reduceOwnItems` first:
+	// only the reduced set was uploaded (same-named plan snapshots collapse), so the
+	// rendered body must list the same set.
+	const summaryForMarkdown = applyPublishedUrls(reduceOwnItems(summary), published);
 	const markdown = buildPushMarkdown(summaryForMarkdown);
 	// The structured twin of the markdown article, from the same enriched copy —
 	// the share page renders it directly instead of regex-parsing the markdown.
@@ -1011,15 +774,12 @@ export async function pushSummary(
 		return { summary, summaryUrl, ...(result.jmSpace !== undefined ? { jmSpace: result.jmSpace } : {}) };
 	}
 
+	// Write-back weaves onto the summary's OWN items (not the reduced copy above), so
+	// an unpushed same-named plan snapshot keeps its place in stored history.
 	const updatedSummary: CommitSummary = {
-		...summary,
+		...applyPublishedUrls(summary, published),
 		jolliDocUrl: summaryUrl,
 		jolliDocId: result.docId,
-		...(planUrls.length > 0 ? { plans: applyPlanUrls(summary.plans, planUrls) } : {}),
-		...(noteUrls.length > 0 && summary.notes ? { notes: applyNoteUrls(summary.notes, noteUrls) } : {}),
-		...(referenceUrls.length > 0 && summary.references
-			? { references: applyReferenceUrls(summary.references, referenceUrls) }
-			: {}),
 	};
 	await storeSummary(updatedSummary, ctx.cwd, true, undefined, ctx.storage);
 
@@ -1037,157 +797,6 @@ export async function pushSummary(
 	}
 
 	return { summary: finalSummary, summaryUrl, ...(result.jmSpace !== undefined ? { jmSpace: result.jmSpace } : {}) };
-}
-
-/**
- * Uploads the given plans, returning their published URLs. A single plan's
- * unreadable content or transient push failure is logged and skipped;
- * {@link isFatalAttachmentError} ones propagate so the caller can surface the
- * binding / upgrade flow or the repo-wide refusal. Re-reads the outbound opt-out
- * before each send, so a mid-run disable stops the remaining uploads.
- */
-async function pushPlanList(
-	plans: ReadonlyArray<PlanReference>,
-	summary: CommitSummary,
-	ctx: PushContext,
-	displayBase: string,
-	envKey: string,
-): Promise<Array<{ slug: string; url: string; docId: number }>> {
-	const results: Array<{ slug: string; url: string; docId: number }> = [];
-	for (const plan of plans) {
-		const planContent = (await readPlanFromBranch(plan.slug, ctx.cwd, ctx.storage)) ?? "";
-		if (!planContent) {
-			log.info("Plan %s: no content found, skipping", plan.slug);
-			continue;
-		}
-		let planResult: Awaited<ReturnType<JolliMemoryPushClient["push"]>>;
-		try {
-			// Live re-read of the opt-out before EVERY send — see assertOutboundStillAllowed.
-			await assertOutboundStillAllowed(ctx.cwd);
-			planResult = await ctx.client.push({
-				title: buildPlanPushTitle(summary, plan.title),
-				content: planContent,
-				commitHash: summary.commitHash,
-				docType: "plan",
-				branch: summary.branch,
-				...(plan.jolliPlanDocId !== undefined &&
-					canReuseDocId(plan.jolliPlanDocUrl, envKey) && { docId: plan.jolliPlanDocId }),
-				repoUrl: ctx.repoUrl,
-				relativePath: buildBranchRelativePath(summary.branch),
-			});
-		} catch (err) {
-			if (isFatalAttachmentError(err)) throw err;
-			log.error("Plan %s push FAILED: %s", plan.slug, err instanceof Error ? err.message : String(err));
-			continue;
-		}
-		results.push({
-			slug: plan.slug,
-			url: resolveArticleUrl(displayBase, planResult.url, planResult.docId),
-			docId: planResult.docId,
-		});
-	}
-	return results;
-}
-
-/** Uploads the given notes; like {@link pushPlanList}, transient single-note failures are logged and skipped while {@link isFatalAttachmentError} ones propagate. */
-async function pushNoteList(
-	notes: ReadonlyArray<NoteReference>,
-	summary: CommitSummary,
-	ctx: PushContext,
-	displayBase: string,
-	envKey: string,
-): Promise<Array<{ id: string; url: string; docId: number }>> {
-	const results: Array<{ id: string; url: string; docId: number }> = [];
-	for (const note of notes) {
-		const noteContent = note.content ?? (await readNoteFromBranch(note.id, ctx.cwd, ctx.storage)) ?? "";
-		if (!noteContent) {
-			log.info("Note %s: no content found, skipping", note.id);
-			continue;
-		}
-		let noteResult: Awaited<ReturnType<JolliMemoryPushClient["push"]>>;
-		try {
-			// Live re-read of the opt-out before EVERY send — see assertOutboundStillAllowed.
-			await assertOutboundStillAllowed(ctx.cwd);
-			noteResult = await ctx.client.push({
-				title: buildNotePushTitle(summary, note.title),
-				content: noteContent,
-				commitHash: summary.commitHash,
-				docType: "note",
-				branch: summary.branch,
-				...(note.jolliNoteDocId !== undefined &&
-					canReuseDocId(note.jolliNoteDocUrl, envKey) && { docId: note.jolliNoteDocId }),
-				repoUrl: ctx.repoUrl,
-				relativePath: buildBranchRelativePath(summary.branch),
-			});
-		} catch (err) {
-			if (isFatalAttachmentError(err)) throw err;
-			log.error("Note %s push FAILED: %s", note.id, err instanceof Error ? err.message : String(err));
-			continue;
-		}
-		results.push({
-			id: note.id,
-			url: resolveArticleUrl(displayBase, noteResult.url, noteResult.docId),
-			docId: noteResult.docId,
-		});
-	}
-	return results;
-}
-
-/**
- * Uploads the given archived references as standalone `reference` articles,
- * returning their published URLs keyed by `archivedKey`. The body is synthesized
- * from the value snapshot ({@link buildReferencePushMarkdown}) since a reference
- * has no on-disk file. Like {@link pushPlanList}, a single transient failure is
- * logged and skipped while {@link isFatalAttachmentError} ones propagate.
- */
-async function pushReferenceList(
-	references: ReadonlyArray<ReferenceCommitRef>,
-	summary: CommitSummary,
-	ctx: PushContext,
-	displayBase: string,
-	envKey: string,
-): Promise<Array<{ archivedKey: string; url: string; docId: number }>> {
-	const results: Array<{ archivedKey: string; url: string; docId: number }> = [];
-	for (const ref of references) {
-		// Read the archived body from the orphan-branch snapshot so the pushed article
-		// carries the SAME content VS Code shows locally (the local `.md` is deleted at
-		// commit time; the orphan-branch snapshot is the system of record). Missing/
-		// unparseable → header-only, never a failed push.
-		const storedMd = await readReferenceFromBranch(ref.source, ref.archivedKey, ctx.cwd, ctx.storage);
-		const description = storedMd
-			? (readReferenceMarkdownFromString(storedMd)?.description ?? undefined)
-			: undefined;
-		let refResult: Awaited<ReturnType<JolliMemoryPushClient["push"]>>;
-		try {
-			// Live re-read of the opt-out before EVERY send — see assertOutboundStillAllowed.
-			await assertOutboundStillAllowed(ctx.cwd);
-			refResult = await ctx.client.push({
-				title: buildReferencePushTitle(ref),
-				content: buildReferencePushMarkdown(ref, description),
-				commitHash: summary.commitHash,
-				docType: "reference",
-				branch: summary.branch,
-				...(ref.jolliReferenceDocId !== undefined &&
-					canReuseDocId(ref.jolliReferenceDocUrl, envKey) && { docId: ref.jolliReferenceDocId }),
-				repoUrl: ctx.repoUrl,
-				relativePath: buildBranchRelativePath(summary.branch),
-			});
-		} catch (err) {
-			if (isFatalAttachmentError(err)) throw err;
-			log.error(
-				"Reference %s push FAILED: %s",
-				ref.archivedKey,
-				err instanceof Error ? err.message : String(err),
-			);
-			continue;
-		}
-		results.push({
-			archivedKey: ref.archivedKey,
-			url: resolveArticleUrl(displayBase, refResult.url, refResult.docId),
-			docId: refResult.docId,
-		});
-	}
-	return results;
 }
 
 function hasPendingOrphanCleanup(summary: CommitSummary): boolean {
@@ -1375,17 +984,16 @@ export async function pushBranchToJolli(opts: PushBranchOpts): Promise<PushBranc
 
 		// Mirror LiveShareController.pushBranchMemoriesToSpace: cross-commit dedup,
 		// then push oldest→newest passing each summary its OWNED (deduped) attachments.
-		// seedPlanDocIds/seedNoteDocIds are also returned (kept for vscode parity) but
-		// unused here — seeds are already applied to the owned plan/note refs.
-		const { ownedPlans, ownedNotes, ownedReferences } = assignOwnedAttachments(summaries);
+		//
+		// `selectionForCommit`, NOT the legacy named shape: a selection that names only
+		// plan/note/reference means "push ZERO of every other kind" (see
+		// `toContextSelection`), so building one by hand would silently skip skill —
+		// and every future kind — on this path while the drains still pushed them.
+		const owned = assignOwnedContext(summaries);
 		const urls: string[] = [];
 		let confirmedSpace: { id: number; name: string } | undefined;
 		for (const s of summaries) {
-			const attachments: AttachmentSelection = {
-				plans: ownedPlans.get(s.commitHash) ?? [],
-				notes: ownedNotes.get(s.commitHash) ?? [],
-				references: ownedReferences.get(s.commitHash) ?? [],
-			};
+			const attachments = selectionForCommit(owned, s.commitHash);
 			// BindingRequiredError propagates — fatal for the whole batch.
 			const { summaryUrl, jmSpace } = await pushSummary(s, ctx, attachments);
 			if (jmSpace) {

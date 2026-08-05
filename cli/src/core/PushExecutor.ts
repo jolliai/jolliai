@@ -54,9 +54,7 @@ import {
 	PermissionDeniedError,
 } from "./JolliMemoryPushClient.js";
 import {
-	type AttachmentSelection,
 	applyBatchResult,
-	assignOwnedAttachments,
 	type BatchWriteBackFailure,
 	type BuiltBatchItem,
 	buildBatchItems,
@@ -75,6 +73,7 @@ import {
 	type PushTarget,
 	updateBatch,
 } from "./PushPendingStore.js";
+import { assignOwnedContext, type OwnedContext, selectionForCommit } from "./push/ContextPush.js";
 import { loadConfig } from "./SessionTracker.js";
 import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import { createStorage } from "./StorageFactory.js";
@@ -214,11 +213,7 @@ async function buildAttachmentOwnership(
 	pendingEntries: Readonly<Record<string, PushPendingEntry>>,
 	hashes: ReadonlyArray<string>,
 	candidates: ReadonlyMap<string, CommitSummary>,
-): Promise<{
-	ownedPlans: Map<string, NonNullable<CommitSummary["plans"]>>;
-	ownedNotes: Map<string, NonNullable<CommitSummary["notes"]>>;
-	ownedReferences: Map<string, NonNullable<CommitSummary["references"]>>;
-}> {
+): Promise<OwnedContext> {
 	const branches = new Set(hashes.map((hash) => pendingEntries[hash].branch));
 	const contexts = new Map<string, Map<string, CommitSummary>>();
 	for (const branch of branches) contexts.set(branch, new Map());
@@ -250,17 +245,19 @@ async function buildAttachmentOwnership(
 		if (summary) contexts.get(pendingEntries[hash].branch)?.set(hash, summary);
 	}
 
-	const ownedPlans = new Map<string, NonNullable<CommitSummary["plans"]>>();
-	const ownedNotes = new Map<string, NonNullable<CommitSummary["notes"]>>();
-	const ownedReferences = new Map<string, NonNullable<CommitSummary["references"]>>();
+	// Merge each branch's ownership into one kind-agnostic map. Generic over the
+	// registered context kinds, so a new kind needs no change here.
+	const merged = new Map<string, { owned: Map<string, ReadonlyArray<unknown>>; seeds: Map<string, number> }>();
 	for (const context of contexts.values()) {
 		const summaries = [...context.values()].sort((a, b) => a.generatedAt.localeCompare(b.generatedAt));
-		const owned = assignOwnedAttachments(summaries);
-		for (const [hash, plans] of owned.ownedPlans) ownedPlans.set(hash, plans);
-		for (const [hash, notes] of owned.ownedNotes) ownedNotes.set(hash, notes);
-		for (const [hash, references] of owned.ownedReferences) ownedReferences.set(hash, references);
+		for (const [docType, forKind] of assignOwnedContext(summaries)) {
+			const target = merged.get(docType) ?? { owned: new Map(), seeds: new Map() };
+			for (const [hash, items] of forKind.owned) target.owned.set(hash, items);
+			for (const [key, docId] of forKind.seeds) target.seeds.set(key, docId);
+			merged.set(docType, target);
+		}
 	}
-	return { ownedPlans, ownedNotes, ownedReferences };
+	return merged;
 }
 
 /** Partitions batch-eligible items by both item count and total content size. */
@@ -800,11 +797,7 @@ async function pushCandidatesIndividually(args: {
 	readonly cwd: string;
 	readonly storage: StorageProvider;
 	readonly hashes: ReadonlyArray<string>;
-	readonly ownership: {
-		readonly ownedPlans: ReadonlyMap<string, NonNullable<CommitSummary["plans"]>>;
-		readonly ownedNotes: ReadonlyMap<string, NonNullable<CommitSummary["notes"]>>;
-		readonly ownedReferences: ReadonlyMap<string, NonNullable<CommitSummary["references"]>>;
-	};
+	readonly ownership: OwnedContext;
 	readonly claimedEntries: Readonly<Record<string, PushPendingEntry>>;
 	readonly ctx: PushContext;
 	readonly updates: Map<string, BatchUpdate>;
@@ -839,11 +832,9 @@ async function pushCandidatesIndividually(args: {
 			return "failed";
 		}
 		const summary = withRecoveredDocId(freshSummary, claimedEntries[hash]);
-		const attachments: AttachmentSelection = {
-			plans: ownership.ownedPlans.get(hash) ?? [],
-			notes: ownership.ownedNotes.get(hash) ?? [],
-			references: ownership.ownedReferences.get(hash) ?? [],
-		};
+		// Kind-agnostic: whatever kinds are registered, this commit pushes exactly the
+		// items it owns for each of them.
+		const attachments = selectionForCommit(ownership, hash);
 		try {
 			const { jmSpace } = await pushSummary(summary, ctx, attachments);
 			if (jmSpace) {

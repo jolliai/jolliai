@@ -456,10 +456,13 @@ export class CreatePrWebviewPanel {
 			const n = result.pushedCount;
 			const noun = n === 1 ? "memory" : "memories";
 			const failures = [...result.summaryFailures, ...result.attachmentFailures];
+			const skipped = result.skippedAttachments;
 			if (failures.length > 0) {
 				// Partial success: report how many shared plus the failures, so an
 				// early success is never masked by a later failure (modal, not toast,
-				// to match the visibility of the old fail-fast error path).
+				// to match the visibility of the old fail-fast error path). Skipped
+				// best-effort attachments ride along in the detail — they did not cause
+				// this modal, but the user is already being interrupted.
 				const tail =
 					result.summaryFailures.length > 0
 						? `${result.summaryFailures.length} memory/memories and ${result.attachmentFailures.length} attachment(s) failed to push`
@@ -468,8 +471,21 @@ export class CreatePrWebviewPanel {
 					`Shared ${n} ${noun} to your Jolli Space, but ${tail}.`,
 					{
 						modal: true,
-						detail: failures.map((f) => `• ${f.label}: ${f.message}`).join("\n"),
+						detail: [
+							...failures.map((f) => `• ${f.label}: ${f.message}`),
+							...skipped.map((f) => `• ${f.label}: ${f.message} (skipped)`),
+						].join("\n"),
 					},
+				);
+			} else if (skipped.length > 0) {
+				// Mirrors the summary panel: the push succeeded, so this is not the modal,
+				// but it must not be reported as plain success either — fewer articles
+				// were published than the branch has context for. Non-modal: visible,
+				// not blocking.
+				vscode.window.showWarningMessage(
+					`Shared ${n} ${noun} to your Jolli Space, but ${skipped.length} attachment(s) were skipped: ${skipped
+						.map((f) => f.label)
+						.join(", ")}.`,
 				);
 			} else {
 				vscode.window.showInformationMessage(`Shared ${n} ${noun} to your Jolli Space.`);

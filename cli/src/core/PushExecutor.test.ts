@@ -13,17 +13,12 @@ import {
 	NotAuthenticatedError,
 	PermissionDeniedError,
 } from "./JolliMemoryPushClient.js";
-import {
-	applyBatchResult,
-	assignOwnedAttachments,
-	type BuiltBatchItem,
-	buildBatchItems,
-	pushSummary,
-} from "./JolliMemoryPushOrchestrator.js";
+import { applyBatchResult, type BuiltBatchItem, buildBatchItems, pushSummary } from "./JolliMemoryPushOrchestrator.js";
 import { loadBranchSummaries } from "./PrDescription.js";
 import { isOutboundPushAllowed } from "./PushControl.js";
 import { classifyError, processPrePushInline, processPushPending, triggerPushForNewSummaries } from "./PushExecutor.js";
 import { claimForPush, loadPushPending, type PushPendingEntry, updateBatch } from "./PushPendingStore.js";
+import { assignOwnedContext, type OwnedContext } from "./push/ContextPush.js";
 import { loadConfig } from "./SessionTracker.js";
 import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import { createStorage } from "./StorageFactory.js";
@@ -58,11 +53,17 @@ vi.mock("./JolliMemoryPushOrchestrator.js", async (importOriginal) => {
 	return {
 		...actual,
 		pushSummary: vi.fn(),
-		assignOwnedAttachments: vi.fn(),
 		buildBatchItems: vi.fn(),
 		applyBatchResult: vi.fn(),
 	};
 });
+// Ownership is now computed by the generic context-kind engine, so that is what
+// these tests drive. `selectionForCommit` stays REAL: it is the pure projection of
+// whatever ownership we inject, and stubbing it would test nothing.
+vi.mock("./push/ContextPush.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("./push/ContextPush.js")>()),
+	assignOwnedContext: vi.fn(),
+}));
 // Mocked so these tests never touch a real `.jolli/jollimemory/space-binding.json`
 // (CWD is a fake path); the cache's own behavior is covered by SpaceBindingCache.test.ts.
 vi.mock("./SpaceBindingCache.js", () => ({
@@ -166,14 +167,7 @@ beforeEach(() => {
 		summaries: [summary(HASH_A), summary(HASH_B)],
 		missingCount: 0,
 	});
-	vi.mocked(assignOwnedAttachments).mockReturnValue({
-		ownedPlans: new Map(),
-		ownedNotes: new Map(),
-		ownedReferences: new Map(),
-		seedPlanDocIds: new Map(),
-		seedNoteDocIds: new Map(),
-		seedReferenceDocIds: new Map(),
-	});
+	vi.mocked(assignOwnedContext).mockReturnValue(new Map());
 	vi.mocked(pushSummary).mockResolvedValue({ summary: summary(HASH_A), summaryUrl: "https://acme.jolli.ai/a" });
 	vi.mocked(updateBatch).mockResolvedValue(undefined);
 	vi.mocked(buildBatchItems).mockImplementation(async (summaries) => summaries.map((s) => builtItem(s.commitHash)));
@@ -719,18 +713,13 @@ describe("processPushPending", () => {
 	});
 
 	it("passes owned attachments into the batch build (cross-commit dedup)", async () => {
-		vi.mocked(assignOwnedAttachments).mockReturnValue({
-			ownedPlans: new Map([[HASH_A, [{ slug: "p-1234abcd" }]]]) as never,
-			ownedNotes: new Map(),
-			ownedReferences: new Map(),
-			seedPlanDocIds: new Map(),
-			seedNoteDocIds: new Map(),
-			seedReferenceDocIds: new Map(),
-		});
+		vi.mocked(assignOwnedContext).mockReturnValue(
+			new Map([["plan", { owned: new Map([[HASH_A, [{ slug: "p-1234abcd" }]]]), seeds: new Map() }]]) as never,
+		);
 		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
 		await processPushPending(CWD, { source: "activation", client: fakeClient() });
-		const ownership = vi.mocked(buildBatchItems).mock.calls[0][1];
-		expect(ownership.ownedPlans.get(HASH_A)).toHaveLength(1);
+		const ownership = vi.mocked(buildBatchItems).mock.calls[0][1] as OwnedContext;
+		expect(ownership.get("plan")?.owned.get(HASH_A)).toHaveLength(1);
 	});
 
 	it("builds attachment ownership from an off-current branch context", async () => {
@@ -752,14 +741,9 @@ describe("processPushPending", () => {
 				],
 			]),
 		);
-		vi.mocked(assignOwnedAttachments).mockReturnValue({
-			ownedPlans: new Map([[HASH_A, [{ slug: "off-plan" }]]]) as never,
-			ownedNotes: new Map(),
-			ownedReferences: new Map(),
-			seedPlanDocIds: new Map(),
-			seedNoteDocIds: new Map(),
-			seedReferenceDocIds: new Map(),
-		});
+		vi.mocked(assignOwnedContext).mockReturnValue(
+			new Map([["plan", { owned: new Map([[HASH_A, [{ slug: "off-plan" }]]]), seeds: new Map() }]]) as never,
+		);
 		vi.mocked(loadPushPending).mockResolvedValue({
 			version: 1,
 			entries: { [HASH_A]: entry(0, { branch: offBranch }) },
@@ -767,9 +751,9 @@ describe("processPushPending", () => {
 
 		await processPushPending(CWD, { source: "activation", client: fakeClient() });
 
-		expect(assignOwnedAttachments).toHaveBeenCalledWith([offSummary]);
-		const ownership = vi.mocked(buildBatchItems).mock.calls[0][1];
-		expect(ownership.ownedPlans.get(HASH_A)).toHaveLength(1);
+		expect(assignOwnedContext).toHaveBeenCalledWith([offSummary]);
+		const ownership = vi.mocked(buildBatchItems).mock.calls[0][1] as OwnedContext;
+		expect(ownership.get("plan")?.owned.get(HASH_A)).toHaveLength(1);
 	});
 
 	it("increments retryCount when the batch request fails operationally", async () => {

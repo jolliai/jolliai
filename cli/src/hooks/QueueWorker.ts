@@ -2873,9 +2873,10 @@ function buildHoistedAmendRoot(
 	excludedContext?: ReadonlyArray<ExcludedContextItem>,
 	contextRelevance?: ReadonlyArray<ContextRelevanceRef>,
 ): CommitSummary {
-	// Old (hoisted) refs ∪ new refs, deduped by BASE key with new winning — sound
-	// here because an amend root has exactly one old summary (see RefMerge). The
-	// squash path deliberately keys the same union differently.
+	// Old (hoisted) refs ∪ new refs, deduped by BASE key with new winning — sound for
+	// plans/notes/references because an amend root has exactly one old summary (see
+	// RefMerge). The squash path deliberately keys the same union differently, and
+	// skills below do not take this union at all.
 	const hoistedMeta = hoistMetadataFromOldSummary(oldSummary);
 	const mergedPlans = mergeRefsNewWins(hoistedMeta.plans, newRefs?.plans, baseKeyOf.plan);
 	const mergedNotes = mergeRefsNewWins(hoistedMeta.notes, newRefs?.notes, baseKeyOf.note);
@@ -2888,7 +2889,48 @@ function buildHoistedAmendRoot(
 	// truncated any id that happens to end in 8 hex characters, folding two distinct
 	// skills into one row here while `attachedBaseKeys.skill` below and `mergeSkillRefs`
 	// both kept them apart — three derivations of one key that have to agree.
-	const mergedSkills = mergeRefsNewWins(hoistedMeta.skills, newRefs?.skills, (s) => `${s.source}:${s.skill}`);
+	//
+	// **New wins on the PAYLOAD, but the published article id is carried forward.**
+	// The union deliberately does NOT fold counts, even though a skill ref is an
+	// increment rather than a revision and folding looks more honest: the old ref
+	// survives on the retained child node, and `collectChildSkills` dedupes by
+	// `archivedKey`, so a row that absorbed another key's increment gets that increment
+	// added a SECOND time the next time a squash walks the tree. (Measured: amend
+	// folding `-oldhash x1` into `-newhash x4` made the later squash report 8 where 7
+	// was true.) Absorbing a key requires a record of the absorption that the tree walk
+	// can see, which only `archivedKey` identity provides — so the row keeps its own key
+	// and its own increment.
+	//
+	// What DOES cross over is `jolliDocId`/`jolliDocUrl`. Replacing the whole ref
+	// dropped them, so the next push created a second article and left the first on the
+	// Space forever under a `hash8` the branch no longer has — the leak
+	// `supersededDocIds` exists to prevent, arriving by a path that never recorded it.
+	const skillDocKey = (s: SkillCommitRef) => `${s.source}:${s.skill}`;
+	const priorSkillDocs = new Map<string, { id: number; url?: string }>();
+	for (const s of hoistedMeta.skills ?? []) {
+		if (s.jolliDocId !== undefined) {
+			priorSkillDocs.set(skillDocKey(s), { id: s.jolliDocId, ...(s.jolliDocUrl && { url: s.jolliDocUrl }) });
+		}
+	}
+	const supersededSkillDocIds: number[] = [];
+	const mergedSkills = mergeRefsNewWins(hoistedMeta.skills, newRefs?.skills, skillDocKey).map((s) => {
+		const prior = priorSkillDocs.get(skillDocKey(s));
+		if (prior === undefined) return s;
+		// The winner is a fresh archive with no id of its own: adopt the old one so the
+		// next push UPDATES that article (retitling it to the new hash8) instead of
+		// creating a sibling.
+		if (s.jolliDocId === undefined) {
+			return { ...s, jolliDocId: prior.id, ...(prior.url !== undefined && { jolliDocUrl: prior.url }) };
+		}
+		// Both sides published: the winner keeps its own id (overwriting would push this
+		// content to the older article), and the loser's is queued for cleanup rather
+		// than dropped.
+		if (s.jolliDocId !== prior.id) supersededSkillDocIds.push(prior.id);
+		return s;
+	});
+	// Must be spread AFTER `...hoistedMeta` below, which carries the old summary's own
+	// `orphanedDocIds` and would otherwise win.
+	const allOrphanedDocIds = [...(hoistedMeta.orphanedDocIds ?? []), ...supersededSkillDocIds];
 	// Drop from the AI-exclude audit any item that is nonetheless ATTACHED to this
 	// summary via a hoisted (inherited) ref — otherwise the same item would appear
 	// in BOTH the attached list and the "AI excluded" list, a self-contradiction.
@@ -2939,6 +2981,7 @@ function buildHoistedAmendRoot(
 		...(mergedNotes.length > 0 ? { notes: mergedNotes } : {}),
 		...(mergedReferences.length > 0 ? { references: mergedReferences } : {}),
 		...(mergedSkills.length > 0 ? { skills: mergedSkills } : {}),
+		...(allOrphanedDocIds.length > 0 ? { orphanedDocIds: allOrphanedDocIds } : {}),
 		...(auditedExclusions.length > 0 ? { excludedContext: auditedExclusions } : {}),
 		...((contextRelevance ?? []).length > 0 ? { contextRelevance } : {}),
 		topics: hoisted.topics,

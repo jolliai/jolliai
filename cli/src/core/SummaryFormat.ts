@@ -6,7 +6,7 @@
  * VS Code webview. This file has zero VS Code dependencies.
  */
 
-import type { CommitSummary, LlmCredentialSource, NoteReference, PlanReference } from "../Types.js";
+import type { CommitSummary, LlmCredentialSource, NoteReference, PlanReference, SkillSource } from "../Types.js";
 import { localAgentToolLabel } from "./localagent/ToolMeta.js";
 import {
 	type DisplayableReference,
@@ -260,6 +260,65 @@ export function buildReferencePushTitle(ref: DisplayableReference): string {
 	// Middle-dot (not a colon — sanitizeTitle strips `:`) so the source label stays
 	// visually distinct from the ` — ` referenceDisplayTitle puts before the title.
 	return sanitizeTitle(`${referenceSourceLabel(ref.source)} · ${referenceDisplayTitle(ref)}`);
+}
+
+/**
+ * Human label for the AI host a skill was captured from. Separate from
+ * {@link referenceSourceLabel}: {@link SkillSource} is the set of hosts whose
+ * transcripts make a skill invocation identifiable, not the reference-source
+ * namespace, so the two must not share a registry.
+ *
+ * An unknown source (older data, a host added to the union without a label)
+ * degrades to a capitalized form rather than rendering an empty segment.
+ */
+export function skillSourceLabel(source: string): string {
+	const label = SKILL_SOURCE_LABELS[source as SkillSource];
+	if (label !== undefined) return label;
+	return source ? source.charAt(0).toUpperCase() + source.slice(1) : source;
+}
+
+const SKILL_SOURCE_LABELS: Readonly<Record<SkillSource, string>> = {
+	claude: "Claude Code",
+	opencode: "OpenCode",
+	codex: "Codex",
+	cursor: "Cursor",
+};
+
+/**
+ * Builds the skill document title for pushing to Jolli Space:
+ * `Skill · <host label> · <skill id> — <hash8>`.
+ *
+ * Four segments, all load-bearing:
+ *
+ *   - The `Skill` prefix namespaces the generated slug, so a skill never collides
+ *     with a plan / note / summary sharing the same base title — the same job the
+ *     source prefix does for a reference.
+ *   - The **host label** is required for uniqueness, not decoration: the registry
+ *     key is `<source>:<skill>`, so two hosts can hold the same skill id as two
+ *     separate rows and therefore two separate articles. Same title + same branch +
+ *     same path + same commit is one server-side push identity, so dropping the
+ *     host would make the second push collide with the first.
+ *   - Middle dots, not colons: `sanitizeTitle` strips `:` (forbidden in document
+ *     titles), which is also why a namespaced id like `superpowers:brainstorming`
+ *     renders as `superpowers brainstorming` here.
+ *   - **The commit's `hash8`, after an em dash** — required since a skill article is
+ *     one document per (skill, commit) rather than one per skill (see the `skill`
+ *     definition's `baseKey`). A branch folder is flat, so a skill used on four
+ *     commits would otherwise show four indistinguishable siblings. The em-dash form
+ *     deliberately mirrors `buildSkillsAggregateMarkdown`'s `# Skills used — <hash8>`
+ *     heading, which is what the VS Code panel shows for the same record.
+ *
+ * `summary.commitHash`, NOT the `archivedKey`'s stamp: the two diverge after a
+ * squash (a ref is re-anchored onto the new root while the orphan file keeps its
+ * original name), and the commit a reader is holding is the one VS Code titles the
+ * record with.
+ */
+export function buildSkillPushTitle(
+	ref: { readonly source: string; readonly skill: string },
+	summary: CommitSummary,
+): string {
+	const hash8 = summary.commitHash.substring(0, 8);
+	return sanitizeTitle(`Skill · ${skillSourceLabel(ref.source)} · ${ref.skill} — ${hash8}`);
 }
 
 // ─── Topic collection ─────────────────────────────────────────────────────────
