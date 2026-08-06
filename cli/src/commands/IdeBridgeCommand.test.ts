@@ -2711,7 +2711,12 @@ describe("runIdeBridgeAction — shared-store", () => {
 		expect(addPin).toHaveBeenCalledWith("/repo-fallback", "repo-fallback", "main", expect.anything());
 	});
 
-	it("reads selection exclusions as arrays", async () => {
+	// `skills` is absent from the mocked value on purpose: it postdates the persisted
+	// shape, so `readExclusions` omits it for a selection file written before skills
+	// were selectable. The response must still carry the key as an empty array — a
+	// caller that saw it vanish could not tell "nothing excluded" from "this CLI is
+	// too old to know about skills".
+	it("reads selection exclusions as arrays, defaulting an absent skills set to empty", async () => {
 		const { readExclusions } = await import("../core/CommitSelectionStore.js");
 		vi.mocked(readExclusions).mockResolvedValue({
 			conversations: new Set(["c"]),
@@ -2720,7 +2725,20 @@ describe("runIdeBridgeAction — shared-store", () => {
 			references: new Set(),
 		} as never);
 		const result = await runIdeBridgeAction("shared-store", "/r", { operation: "selection-read" });
-		expect(result).toEqual({ conversations: ["c"], plans: [], notes: [], references: [] });
+		expect(result).toEqual({ conversations: ["c"], plans: [], notes: [], references: [], skills: [] });
+	});
+
+	it("reads an excluded skill key back out of the selection set", async () => {
+		const { readExclusions } = await import("../core/CommitSelectionStore.js");
+		vi.mocked(readExclusions).mockResolvedValue({
+			conversations: new Set(),
+			plans: new Set(),
+			notes: new Set(),
+			references: new Set(),
+			skills: new Set(["claude:brainstorming"]),
+		} as never);
+		const result = await runIdeBridgeAction("shared-store", "/r", { operation: "selection-read" });
+		expect(result).toMatchObject({ skills: ["claude:brainstorming"] });
 	});
 
 	it("computes a selection key", async () => {
@@ -2765,6 +2783,133 @@ describe("runIdeBridgeAction — shared-store", () => {
 			excluded: true,
 		});
 		expect(setAllExcluded).toHaveBeenCalledWith("/r", "plans", ["a", "b"], true);
+	});
+
+	// ---------- skills-* ----------
+	//
+	// These four operations are IntelliJ's ONLY skill surface — it renders no skill
+	// table of its own by design — so a break here is invisible to the VS Code
+	// suite. `SkillsAggregateMarkdown` is deliberately left unmocked: the point of
+	// routing IntelliJ through the bridge is that it gets the same renderer the
+	// Memory Bank file uses, and a mocked renderer would not prove that.
+
+	const skillRow = (over: Record<string, unknown> = {}) => ({
+		source: "claude",
+		skill: "brainstorming",
+		entryPaths: ["tool"],
+		invocations: [],
+		invocationCount: 2,
+		firstUsedAt: "2026-07-30T06:00:00.000Z",
+		lastUsedAt: "2026-07-30T07:00:00.000Z",
+		usage: { input: 100, cached: 900, output: 0, confidence: "attributed" },
+		sourcePath: "/tmp/x.md",
+		commitHash: null,
+		...over,
+	});
+
+	it("projects the active skills and the summary label that goes with them", async () => {
+		const { loadPlansRegistry } = await import("../core/SessionTracker.js");
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			skills: { "claude:brainstorming": skillRow() },
+		} as never);
+
+		const result = (await runIdeBridgeAction("shared-store", "/r", { operation: "skills-active" })) as {
+			skills: Array<{ mapKey: string; invocationCount: number }>;
+			summaryLabel: string;
+		};
+		expect(result.skills).toHaveLength(1);
+		expect(result.skills[0]).toMatchObject({ mapKey: "claude:brainstorming", invocationCount: 2 });
+		// The label rides along so the caller needs one round trip, not two.
+		expect(result.summaryLabel).toBe("1 skill · 1.0k tokens");
+	});
+
+	it("renders the live aggregate table for uncommitted skills", async () => {
+		const { loadPlansRegistry } = await import("../core/SessionTracker.js");
+		vi.mocked(loadPlansRegistry).mockResolvedValue({
+			skills: { "claude:brainstorming": skillRow() },
+		} as never);
+
+		const { markdown } = (await runIdeBridgeAction("shared-store", "/r", {
+			operation: "skills-live-markdown",
+		})) as { markdown: string };
+		expect(markdown).toContain("# Skills used — uncommitted");
+		expect(markdown).toContain("| brainstorming | 2 | 1.0k |");
+	});
+
+	// null rather than an empty table: committing archives every skill, so an empty
+	// registry is the normal post-commit state and the caller says so in words.
+	it("returns a null live markdown when nothing is captured", async () => {
+		const { loadPlansRegistry } = await import("../core/SessionTracker.js");
+		vi.mocked(loadPlansRegistry).mockResolvedValue({ skills: {} } as never);
+
+		expect(await runIdeBridgeAction("shared-store", "/r", { operation: "skills-live-markdown" })).toEqual({
+			markdown: null,
+		});
+	});
+
+	// Takes the rows off the request rather than reading the registry: the caller is
+	// summarising an ARCHIVED set off a CommitSummary, which the registry no longer holds.
+	it("labels an archived skill set passed in by the caller", async () => {
+		const result = await runIdeBridgeAction("shared-store", "/r", {
+			operation: "skills-label",
+			skills: [
+				{ skill: "a", invocationCount: 1, usage: { input: 1, cached: 2, output: 3, confidence: "estimated" } },
+				{ skill: "b", invocationCount: 2 },
+			],
+		});
+		expect(result).toEqual({ label: "2 skills · ~6 tokens" });
+	});
+
+	it("rejects a skills field that is not an array of objects", async () => {
+		await expect(
+			runIdeBridgeAction("shared-store", "/r", { operation: "skills-label", skills: ["a"] }),
+		).rejects.toThrow('Request field "skills" must be an array of objects.');
+		await expect(
+			runIdeBridgeAction("shared-store", "/r", { operation: "skills-label", skills: "nope" }),
+		).rejects.toThrow('Request field "skills" must be an array of objects.');
+		await expect(
+			runIdeBridgeAction("shared-store", "/r", { operation: "skills-label", skills: [null] }),
+		).rejects.toThrow('Request field "skills" must be an array of objects.');
+	});
+
+	it("renders a committed memory's skills table from the summary it is given", async () => {
+		const { markdown } = (await runIdeBridgeAction("shared-store", "/r", {
+			operation: "skills-committed-markdown",
+			summary: {
+				commitHash: "abcdef1234567890",
+				branch: "main",
+				generatedAt: "2026-07-30T08:00:00.000Z",
+				commitMessage: "do the thing",
+				skills: [{ skill: "a", invocationCount: 1 }],
+			},
+		})) as { markdown: string };
+		expect(markdown).toContain("# Skills used — abcdef12");
+		expect(markdown).toContain("commitHash: abcdef1234567890");
+		// Unattributed rows dash all four cells rather than showing a zero.
+		expect(markdown).toContain("| a | 1 | — | — | — | — |");
+	});
+
+	it("returns a null committed markdown when the summary archived no skills", async () => {
+		expect(
+			await runIdeBridgeAction("shared-store", "/r", {
+				operation: "skills-committed-markdown",
+				summary: { commitHash: "abcdef12", skills: [] },
+			}),
+		).toEqual({ markdown: null });
+		expect(await runIdeBridgeAction("shared-store", "/r", { operation: "skills-committed-markdown" })).toEqual({
+			markdown: null,
+		});
+	});
+
+	// The `skills-` prefix must not swallow an unknown operation into a silent
+	// success, and must not pay for a registry read before rejecting it.
+	it("rejects an unrecognised skills operation without reading the registry", async () => {
+		const { loadPlansRegistry } = await import("../core/SessionTracker.js");
+		vi.mocked(loadPlansRegistry).mockClear();
+		await expect(runIdeBridgeAction("shared-store", "/r", { operation: "skills-bogus" })).rejects.toThrow(
+			'Unknown shared-store operation "skills-bogus".',
+		);
+		expect(loadPlansRegistry).not.toHaveBeenCalled();
 	});
 
 	it("puts a branch share", async () => {

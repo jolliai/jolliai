@@ -141,15 +141,10 @@ export type {
 	SourceId,
 } from "../../cli/src/Types.js";
 
-// Import for use in NoteInfo / ReferenceInfo / SkillInfo
-import type {
-	NoteFormat,
-	ReferenceField,
-	SkillEntryPath,
-	SkillSource,
-	SkillUsage,
-	SourceId,
-} from "../../cli/src/Types.js";
+// Import for use in NoteInfo / ReferenceInfo
+import type { NoteFormat, ReferenceField, SourceId } from "../../cli/src/Types.js";
+// The skill row's shape lives with the projection that builds it — see SkillInfo below.
+import type { ActiveSkill } from "../../cli/src/core/skills/SkillProjection.js";
 
 /** Display-level note metadata for the VSCode tree view */
 export interface NoteInfo {
@@ -179,29 +174,12 @@ export interface NoteInfo {
 /**
  * Panel-display projection of a captured skill usage row.
  *
- * `lastModified` mirrors `lastUsedAt` so a skill sorts against plans / notes /
- * references in one list, the same way ReferenceInfo mirrors `updatedAt`.
+ * An ALIAS, not a declaration: the same rows are served to IntelliJ over the
+ * `skills-active` ide-bridge operation, so the shape belongs next to the projection
+ * that builds it. Re-declaring it here would let the two drift silently — a field
+ * this panel reads could disappear from the projection and still typecheck.
  */
-export interface SkillInfo {
-	readonly kind: "skill";
-	/** plans.json.skills map key — `<source>:<skill>`. */
-	readonly mapKey: string;
-	readonly source: SkillSource;
-	/** Fully-qualified skill id, e.g. `superpowers:brainstorming`. */
-	readonly skill: string;
-	readonly plugin?: string;
-	readonly entryPaths: ReadonlyArray<SkillEntryPath>;
-	readonly invocationCount: number;
-	readonly firstUsedAt: string;
-	readonly lastUsedAt: string;
-	/** Absent when the source could not attribute tokens — never rendered as a zero. */
-	readonly usage?: SkillUsage;
-	readonly sourcePath: string;
-	/** Present when the invocation was inferred rather than observed (Codex). */
-	readonly detection?: "heuristic";
-	/** ISO 8601 — same as lastUsedAt, for sort consistency with the other kinds. */
-	readonly lastModified: string;
-}
+export type SkillInfo = ActiveSkill;
 
 export interface ReferenceInfo {
 	readonly kind: "reference";

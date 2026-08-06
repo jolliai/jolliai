@@ -1,129 +1,123 @@
 package ai.jolli.jollimemory.core
 
-import ai.jolli.jollimemory.core.JmLogger.JOLLIMEMORY_DIR
-import ai.jolli.jollimemory.core.JmLogger.JOLLI_DIR
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import com.google.gson.Gson
+import com.google.gson.JsonArray
 import com.google.gson.JsonObject
-import java.io.File
 
 /**
- * CommitSelectionStore — persists the set of sidebar items the user wants
- * EXCLUDED from the next summary pipeline run.
+ * CommitSelectionStore — thin bridge adapter for CLI `CommitSelectionStore.ts`,
+ * holding the set of sidebar items the user wants EXCLUDED from the next summary
+ * pipeline run.
  *
- * Four kinds (conversations / plans / notes / references) live in a single
- * JSON file under `<projectDir>/.jolli/jollimemory/commit-selection.json`.
+ * Sticky semantics: an entry stays excluded until the user explicitly re-checks the
+ * row. No git operation or pipeline outcome modifies it — the PostCommitHook only
+ * ever READS.
  *
- * Sticky semantics: an entry stays in this file until the user explicitly
- * un-excludes the item (re-checks the row). No git operation or pipeline
- * outcome modifies the file — the PostCommitHook only ever READS it.
+ * **This used to read and write `commit-selection.json` itself, and the write half
+ * was silently destructive.** The file carries more than the exclusion kinds: an
+ * `aiRelevance` array (the relevance ranker's verdicts) and its `changeFingerprint`
+ * (what makes those verdicts still valid) live alongside them, and `skills` was
+ * added as a fifth kind after this port was written. The Kotlin writer rebuilt the
+ * payload field by field from the four kinds it knew about, so EVERY exclusion
+ * toggle — a conversation, a plan, a note, a reference — rewrote the file without
+ * the fields it had never heard of. A skill the user excluded in VS Code came back
+ * and was archived onto the next commit anyway, and the ranker's work was discarded.
+ * The CLI's own serializer carries those fields explicitly and says why; this had no
+ * counterpart to that guard.
+ *
+ * Delegating fixes it by construction rather than by remembering: there is one
+ * writer, in one language, and a field added to the persisted shape can no longer be
+ * dropped by a host that does not know it exists. Same reason [PinStore] is a bridge
+ * adapter — hand-porting the file format back here would be a regression, not an
+ * optimisation.
  */
 object CommitSelectionStore {
 
-	private val log = JmLogger.create("CommitSelection")
-	private const val SELECTION_FILE = "commit-selection.json"
-	private const val SELECTION_VERSION = 2
-	private val gson = Gson()
+    private val log = JmLogger.create("CommitSelection")
+    private val gson = Gson()
 
-	data class CommitExclusions(
-		val conversations: Set<String> = emptySet(),
-		val plans: Set<String> = emptySet(),
-		val notes: Set<String> = emptySet(),
-		val references: Set<String> = emptySet(),
-	)
+    data class CommitExclusions(
+        val conversations: Set<String> = emptySet(),
+        val plans: Set<String> = emptySet(),
+        val notes: Set<String> = emptySet(),
+        val references: Set<String> = emptySet(),
+        /** Skill key `<source>:<skill>` — one entry per captured skill, not per aggregate row. */
+        val skills: Set<String> = emptySet(),
+    )
 
-	private fun selectionFile(projectDir: String): File {
-		return File(projectDir, "$JOLLI_DIR/$JOLLIMEMORY_DIR/$SELECTION_FILE")
-	}
+    /**
+     * Reads every exclusion kind. Degrades to "nothing excluded" on a bridge failure,
+     * which keeps a panel rendering rather than blanking it.
+     *
+     * The write paths below deliberately do NOT swallow — but be aware that today
+     * nothing DOWNSTREAM surfaces what they throw either: every caller runs them on a
+     * pooled thread with no handler (or, in `WorkingMemoryPanel`, logs and returns),
+     * so a failed write reaches idea.log and nowhere else. The row is left showing the
+     * state the user clicked while the store still holds the old one, until the next
+     * refresh corrects it. That was near-unreachable while this wrote a local file;
+     * routing it through the bridge makes ordinary causes (daemon down, CLI missing)
+     * reach it. Not letting these throw would only make it quieter — the missing half
+     * is feedback at the call sites, not a catch here.
+     */
+    fun readExclusions(projectDir: String): CommitExclusions {
+        return try {
+            val json = run(projectDir, request("selection-read")).asJsonObject
+            CommitExclusions(
+                conversations = asStringSet(json, "conversations"),
+                plans = asStringSet(json, "plans"),
+                notes = asStringSet(json, "notes"),
+                references = asStringSet(json, "references"),
+                skills = asStringSet(json, "skills"),
+            )
+        } catch (ex: Exception) {
+            log.warn("readExclusions failed: %s", ex.message)
+            CommitExclusions()
+        }
+    }
 
-	fun readExclusions(projectDir: String): CommitExclusions {
-		val file = selectionFile(projectDir)
-		if (!file.exists()) return CommitExclusions()
+    fun setExcluded(projectDir: String, kind: String, key: String, excluded: Boolean) {
+        run(
+            projectDir,
+            request("selection-set").apply {
+                addProperty("kind", kind)
+                addProperty("key", key)
+                addProperty("excluded", excluded)
+            },
+        )
+    }
 
-		return try {
-			val json = gson.fromJson(file.readText(), JsonObject::class.java) ?: return CommitExclusions()
-			val version = json.get("version")?.asInt
-			if (version != SELECTION_VERSION && version != 1) {
-				log.warn("readExclusions version mismatch (got %s) — ignoring file", version)
-				return CommitExclusions()
-			}
-			CommitExclusions(
-				conversations = asStringSet(json, "conversations"),
-				plans = asStringSet(json, "plans"),
-				notes = asStringSet(json, "notes"),
-				references = asStringSet(json, "references"),
-			)
-		} catch (ex: Exception) {
-			log.warn("readExclusions failed: %s", ex.message)
-			CommitExclusions()
-		}
-	}
+    fun setAllExcluded(projectDir: String, kind: String, keys: List<String>, excluded: Boolean) {
+        run(
+            projectDir,
+            request("selection-set-all").apply {
+                addProperty("kind", kind)
+                add("keys", JsonArray().apply { keys.forEach { add(it) } })
+                addProperty("excluded", excluded)
+            },
+        )
+    }
 
-	fun setExcluded(projectDir: String, kind: String, key: String, excluded: Boolean) {
-		val current = readExclusions(projectDir)
-		val next = mutableMapOf(
-			"conversations" to current.conversations.toMutableSet(),
-			"plans" to current.plans.toMutableSet(),
-			"notes" to current.notes.toMutableSet(),
-			"references" to current.references.toMutableSet(),
-		)
-		val set = next[kind] ?: return
-		if (excluded) set.add(key) else set.remove(key)
+    /**
+     * Kept local rather than routed through the bridge's `selection-key` operation:
+     * it is a two-part string join that every rendered conversation row needs, so a
+     * round trip per row would cost more than the format is worth. The colon is
+     * reserved across jollimemory and [TranscriptSource] names never contain one, so
+     * this matches the CLI's `conversationKey` exactly.
+     */
+    fun conversationKey(source: TranscriptSource, sessionId: String): String {
+        return "${source.name}:$sessionId"
+    }
 
-		writeExclusions(projectDir, next)
-	}
+    private fun request(operation: String): JsonObject = JsonObject().apply { addProperty("operation", operation) }
 
-	fun setAllExcluded(projectDir: String, kind: String, keys: List<String>, excluded: Boolean) {
-		val current = readExclusions(projectDir)
-		val next = mutableMapOf(
-			"conversations" to current.conversations.toMutableSet(),
-			"plans" to current.plans.toMutableSet(),
-			"notes" to current.notes.toMutableSet(),
-			"references" to current.references.toMutableSet(),
-		)
-		val set = next[kind] ?: return
-		if (excluded) {
-			for (k in keys) set.add(k)
-		} else {
-			for (k in keys) set.remove(k)
-		}
+    private fun run(cwd: String, request: JsonObject) =
+        CliIntegrations.runIdeBridge(cwd, "shared-store", gson.toJson(request))
 
-		writeExclusions(projectDir, next)
-	}
-
-	fun conversationKey(source: TranscriptSource, sessionId: String): String {
-		return "${source.name}:$sessionId"
-	}
-
-	private fun writeExclusions(projectDir: String, data: Map<String, Set<String>>) {
-		val file = selectionFile(projectDir)
-		file.parentFile?.mkdirs()
-
-		val payload = mapOf(
-			"version" to SELECTION_VERSION,
-			"conversations" to (data["conversations"] ?: emptySet()).toList(),
-			"plans" to (data["plans"] ?: emptySet()).toList(),
-			"notes" to (data["notes"] ?: emptySet()).toList(),
-			"references" to (data["references"] ?: emptySet()).toList(),
-		)
-
-		val tmp = File(file.parentFile, "${file.name}.tmp-${ProcessHandle.current().pid()}-${System.currentTimeMillis()}")
-		try {
-			tmp.writeText(gson.toJson(payload))
-			if (!tmp.renameTo(file)) {
-				// renameTo can fail on Windows; fall back to overwrite
-				file.writeText(tmp.readText())
-				tmp.delete()
-			}
-		} catch (ex: Exception) {
-			tmp.delete()
-			throw ex
-		}
-	}
-
-	private fun asStringSet(json: JsonObject, key: String): Set<String> {
-		val arr = json.getAsJsonArray(key) ?: return emptySet()
-		return arr.mapNotNull { el ->
-			try { el.asString } catch (_: Exception) { null }
-		}.toSet()
-	}
+    private fun asStringSet(json: JsonObject, key: String): Set<String> {
+        val arr = json.getAsJsonArray(key) ?: return emptySet()
+        return arr.mapNotNull { el ->
+            try { el.asString } catch (_: Exception) { null }
+        }.toSet()
+    }
 }

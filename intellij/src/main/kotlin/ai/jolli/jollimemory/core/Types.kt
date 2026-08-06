@@ -331,11 +331,12 @@ data class CommitSummary(
     val notes: List<NoteReference>? = null,
     val references: List<ReferenceCommitRef>? = null,
     /**
-     * Archived skill usage. Declared here for a WRITE reason, not a read one: this
-     * plugin does not render skills, but `SummaryTree.updateTopicInTree` round-trips a
-     * whole summary through Gson and `SummaryPanel` stores the result — and Gson drops
-     * every JSON member the data class does not declare. Without this field, editing
-     * one topic in the IntelliJ panel would silently erase the commit's skill record.
+     * Archived skill usage. Read by [SkillsProjection] for the committed CONTEXT row,
+     * but the reason it must stay declared is still a WRITE one:
+     * `SummaryTree.updateTopicInTree` round-trips a whole summary through Gson and
+     * `SummaryPanel` stores the result — and Gson drops every JSON member the data
+     * class does not declare. Without this field, editing one topic in the IntelliJ
+     * panel would silently erase the commit's skill record.
      */
     val skills: List<SkillCommitRef>? = null,
     val summaryError: String? = null,
@@ -485,10 +486,12 @@ data class SkillArchivedTotals(
 /**
  * Snapshot of one skill's usage on a commit — Kotlin port of `SkillCommitRef`.
  *
- * Read-through only: nothing in this plugin renders these today. It exists so a
- * summary can survive a Gson round-trip intact (see [CommitSummary.skills]), which
- * means field names must match the TS interface exactly — a rename here does not
- * fail to compile, it silently drops that member on the next topic edit.
+ * Rendered only indirectly: [SkillsProjection] ships these BACK to the CLI, which
+ * owns both the summary label and the aggregate table, so no field here is read for
+ * display in Kotlin. That makes matching the TS interface exactly load-bearing twice
+ * over — a rename does not fail to compile, it silently drops that member both from
+ * the summary on the next topic edit (see [CommitSummary.skills]) and from the table
+ * the CLI renders back.
  *
  * Every field except `archivedKey` is a value snapshot holding THIS commit's
  * increment, not the registry row's running total.

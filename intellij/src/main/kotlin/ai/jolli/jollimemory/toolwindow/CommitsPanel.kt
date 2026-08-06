@@ -6,6 +6,7 @@ import ai.jolli.jollimemory.bridge.ConversationBrief
 import ai.jolli.jollimemory.core.ActiveConversationItem
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.NoteFormat
+import ai.jolli.jollimemory.core.SkillsProjection
 import ai.jolli.jollimemory.core.TranscriptSource
 import ai.jolli.jollimemory.core.KBDataCache
 import com.google.gson.Gson
@@ -500,6 +501,29 @@ class CommitsPanel(
                 // Collapse the list back to the first page on a new branch / new
                 // commit; a content-identical refresh leaves the count untouched.
                 visibleCommits = CappedRows.CAP
+            }
+
+            // Evict any detail bundled while its summary did not exist yet.
+            //
+            // The sequence check above cannot cover this: committing puts the hash in
+            // the list IMMEDIATELY, while the QueueWorker writes the summary seconds
+            // later after its LLM call. Expanding the new row in that window — the
+            // obvious thing to do right after committing — bundles `summary = null`,
+            // and because that future resolves WITHOUT error it is never evicted (the
+            // whenComplete handler only removes on `error != null`). Every later
+            // refresh then compares an unchanged hash list and keeps it, so the row
+            // served an empty CONTEXT for the life of the panel — no skills, no plans,
+            // no notes — until a branch switch or a new commit.
+            //
+            // `hasSummary` is re-derived from storage on every refresh, so its flip is
+            // exactly the moment the bundle went stale. Evicting only the affected
+            // hashes keeps this off the block above, whose other effects (clearing the
+            // selection, collapsing back to page one) must NOT fire when a summary
+            // merely lands.
+            val previousHasSummary = commits.associate { it.hash to it.hasSummary }
+            for (fresh in newCommits) {
+                val before = previousHasSummary[fresh.hash] ?: continue
+                if (before != fresh.hasSummary) detailCache.remove(fresh.hash)
             }
 
             // Detect merged state: branch HEAD is reachable from main
@@ -1374,10 +1398,15 @@ class CommitsPanel(
             CompletableFuture.supplyAsync(
                 {
                     val summary = service.getSummary(hash)
+                    val archivedSkills = summary?.skills ?: emptyList()
                     ExpansionDetail(
                         summary = summary,
                         conversations = gatherConversations(hash, summary),
                         files = service.listCommitFiles(hash),
+                        skillsLabel = archivedSkills.takeIf { it.isNotEmpty() }?.let { refs ->
+                            val cwd = service.mainRepoRoot ?: project.basePath
+                            cwd?.let { SkillsProjection.committedLabel(it, refs) }
+                        },
                     )
                 },
                 { cmd -> ApplicationManager.getApplication().executeOnPooledThread(cmd) },
@@ -1551,6 +1580,25 @@ class CommitsPanel(
                 }
             })
         }
+        // ONE row for however many skills this memory archived, matching the live
+        // CONTEXT list and VS Code — a commit routinely carries a dozen, and no
+        // Context surface can absorb a dozen rows whose only action is the same click.
+        // The per-skill figures are in the table that click opens.
+        val archivedSkills = summary?.skills ?: emptyList()
+        if (summary != null && archivedSkills.isNotEmpty()) {
+            contextRows.add(
+                contextRow(
+                    "S",
+                    detail.skillsLabel ?: "Skills used",
+                    isLink = false,
+                    tagColor = TagLabel.SKILL,
+                ) {
+                    trackItemOpened("skill")
+                    openCommittedSkills(summary)
+                },
+            )
+        }
+
         val contextCount = contextRows.size
         if (contextRows.isEmpty()) contextRows.add(plainDetailRow("No linked context"))
         addGroup(container, "CONTEXT", contextCount, contextRows)
@@ -1930,6 +1978,52 @@ class CommitsPanel(
         val safeName = if (name.endsWith(".md")) name else "$name.md"
         val vf = com.intellij.testFramework.LightVirtualFile(safeName, content).apply { isWritable = false }
         MarkdownPreview.open(project, vf)
+    }
+
+    /**
+     * Opens one committed memory's archived skills table.
+     *
+     * Rendered from the summary rather than opened from the `skills--<hash8>.md` file
+     * on disk: that file exists only in the Memory Bank's visible layer, which is
+     * absent in orphan-branch-only storage mode and for a foreign repo whose folder
+     * this machine has never synced. Rendering works in every mode, and it is the same
+     * renderer that wrote the file.
+     */
+    private fun openCommittedSkills(summary: CommitSummary) {
+        val cwd = service.mainRepoRoot ?: project.basePath ?: return
+        ApplicationManager.getApplication().executeOnPooledThread {
+            // The two failure shapes are kept apart deliberately. This row is drawn from
+            // `summary.skills` — data already read off disk — so reporting an
+            // unreachable CLI as "this memory has no archived skill usage" would have the
+            // panel contradict what it just rendered, and send the user looking for a
+            // missing memory instead of a stopped daemon.
+            val markdown = try {
+                SkillsProjection.committedMarkdown(cwd, summary)
+            } catch (ex: Exception) {
+                SwingUtilities.invokeLater { showSkillsMessage("Could not render this memory's skills: ${ex.message}") }
+                return@executeOnPooledThread
+            }
+            SwingUtilities.invokeLater {
+                if (markdown == null) {
+                    // Reachable when the memory was squashed or amended away between
+                    // render and click — the row is drawn from a snapshot.
+                    showSkillsMessage("This memory has no archived skill usage.")
+                    return@invokeLater
+                }
+                // Same tab name VS Code gives this document, and the same H1 the table
+                // itself opens with. Every other preview here is named after what the
+                // user clicked (a plan / note / reference title); `skills-<hash8>` was
+                // the one that leaked a file-slug instead. VS Code's tab reads
+                // "Preview Skills used — 709d49fa.md" — the "Preview" prefix is added by
+                // its `markdown.showPreview` command and has no IntelliJ counterpart, so
+                // the part we control is the name.
+                openMarkdownContent(markdown, "Skills used — ${summary.commitHash.take(8)}")
+            }
+        }
+    }
+
+    private fun showSkillsMessage(message: String) {
+        JOptionPane.showMessageDialog(this, message, "Skills", JOptionPane.INFORMATION_MESSAGE)
     }
 
     /**
@@ -2558,6 +2652,15 @@ class CommitsPanel(
         val summary: CommitSummary?,
         val conversations: List<ConversationBrief>,
         val files: List<CommitFileInfo>,
+        /**
+         * Label for the aggregate skills row, e.g. `3 skills · 93.8k tokens`.
+         *
+         * Resolved with the rest of this bundle rather than at render time, because
+         * that is a bridge round trip and [renderExpandedGroups] runs on the EDT — a
+         * cold daemon spawn there would freeze the UI for up to two seconds. Null when
+         * the commit archived no skills, or when the bridge could not answer.
+         */
+        val skillsLabel: String?,
     )
 
     private fun statusColor(code: String): Color {

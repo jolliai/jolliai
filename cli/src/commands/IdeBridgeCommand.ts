@@ -10,6 +10,7 @@
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { LiveSharePatch, LiveSharePayload } from "../core/JolliShareClient.js";
+import type { SkillTableRow } from "../core/SkillsAggregateMarkdown.js";
 import { runWithTrace } from "../core/TraceContext.js";
 import { computeWatchTargets } from "../daemon/DaemonServer.js";
 import { DaemonWatcher } from "../daemon/DaemonWatcher.js";
@@ -96,6 +97,23 @@ function booleanField(request: JsonObject, key: string): boolean {
 	const value = request[key];
 	if (typeof value !== "boolean") throw new Error(`Request field "${key}" must be a boolean.`);
 	return value;
+}
+
+/**
+ * The `skills` field as aggregate-table rows.
+ *
+ * Validated only as far as {@link buildSkillsSummaryLabel} actually reads it — the
+ * caller may send either side of the commit boundary (live `ActiveSkill` rows or
+ * archived `SkillCommitRef`s), and both are deliberately wider than the row type.
+ * Rejecting anything beyond "array of objects" would couple this to whichever of
+ * the two shapes was passed.
+ */
+function skillTableRows(request: JsonObject): SkillTableRow[] {
+	const value = request.skills;
+	if (!Array.isArray(value) || value.some((item) => typeof item !== "object" || item === null)) {
+		throw new Error('Request field "skills" must be an array of objects.');
+	}
+	return value as SkillTableRow[];
 }
 
 function numberField(request: JsonObject, key: string): number {
@@ -735,6 +753,10 @@ async function runSharedStoreAction(cwd: string, request: JsonObject): Promise<u
 				plans: [...value.plans],
 				notes: [...value.notes],
 				references: [...value.references],
+				// Optional on the persisted shape (it postdates the file), so an absent
+				// set reads as "nothing excluded" rather than being omitted from the
+				// response — a caller that saw the key vanish could not tell the two apart.
+				skills: [...(value.skills ?? [])],
 			};
 		}
 		if (operation === "selection-key") {
@@ -780,6 +802,42 @@ async function runSharedStoreAction(cwd: string, request: JsonObject): Promise<u
 			const key = (await loadConfig()).jolliApiKey;
 			const backendKey = deriveJolliBackendKey(key ? parseJolliApiKey(key)?.u : undefined);
 			return { record: (await shares.getShare(cwd, branch, backendKey, commitHash)) ?? null };
+		}
+	}
+	if (operation.startsWith("skills-")) {
+		// Every skill surface an IDE renders is served from here, so the aggregate table
+		// and the row that summarises it cannot disagree. IntelliJ has no Kotlin skill
+		// renderer by design — see the module header of SkillProjection.
+		const aggregate = await import("../core/SkillsAggregateMarkdown.js");
+		if (operation === "skills-label") {
+			// Takes the rows rather than reading them: the caller may be summarising an
+			// ARCHIVED set off a CommitSummary, which the working registry no longer holds.
+			return { label: aggregate.buildSkillsSummaryLabel(skillTableRows(request)) };
+		}
+		if (operation === "skills-committed-markdown") {
+			// Rendered from the summary rather than read from `skills--<hash8>.md`: that
+			// file only exists in the Memory Bank's visible layer, which is absent in
+			// orphan-branch-only mode and for a foreign repo this machine never synced.
+			const { buildSkillsAggregateMarkdown } = aggregate;
+			const summary = request.summary as Parameters<typeof buildSkillsAggregateMarkdown>[0];
+			const skills = summary?.skills ?? [];
+			if (skills.length === 0) return { markdown: null };
+			return { markdown: buildSkillsAggregateMarkdown(summary, skills) };
+		}
+		// Gated on the two operations that read the working registry rather than run
+		// for the whole `skills-` family: an unrecognised operation must fall through
+		// to the unknown-operation error without paying for a registry read first.
+		if (operation === "skills-active" || operation === "skills-live-markdown") {
+			const { projectActiveSkills } = await import("../core/skills/SkillProjection.js");
+			const active = await projectActiveSkills(cwd);
+			if (operation === "skills-active") {
+				// The label rides along because every caller of this needs both and it is
+				// derived from the rows already in hand — a second round trip would buy nothing.
+				return { skills: active, summaryLabel: aggregate.buildSkillsSummaryLabel(active) };
+			}
+			// null, not an empty table: committing archives every skill, so an empty list
+			// here is the normal post-commit state and the caller should say so in words.
+			return { markdown: active.length > 0 ? aggregate.buildLiveSkillsMarkdown(active) : null };
 		}
 	}
 	if (operation === "push-pending-hashes") {

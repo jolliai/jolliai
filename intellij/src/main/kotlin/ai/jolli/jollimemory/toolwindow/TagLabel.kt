@@ -24,6 +24,21 @@ import javax.swing.SwingConstants
  * (mirroring VSCode's `SOURCE_META`) — do not hard-code hex values at call sites.
  */
 class TagLabel : JLabel("", SwingConstants.CENTER) {
+
+	companion object {
+		/**
+		 * Skill accent, matching VS Code's `.kb-tag.t-skill`.
+		 *
+		 * It lives here rather than in either panel's companion because BOTH paint this
+		 * badge — the live CONTEXT list and a committed memory's CONTEXT sub-group — and
+		 * this class is where the module header says badge look has its single home. The
+		 * LETTER is "S" on both surfaces, matching VS Code, which collides with the
+		 * snippet-note tag; the two are told apart by colour, and relabelling a skill in
+		 * one IDE only would be the worse trade.
+		 */
+		val SKILL: Color = JBColor(0xB180D7, 0xB180D7)
+	}
+
 	private var badgeColor: Color = JBColor.GRAY
 
 	init {

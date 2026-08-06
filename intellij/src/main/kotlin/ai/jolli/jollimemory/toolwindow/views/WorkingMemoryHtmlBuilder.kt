@@ -43,9 +43,13 @@ object WorkingMemoryHtmlBuilder {
     )
 
     /**
-     * A linked context item (plan / note / reference). `tag` is the kb glyph;
-     * [kind] is the commit-selection kind (`plans` / `notes` / `references`) and
-     * [key] its selection key (slug / id / mapKey).
+     * A linked context item (plan / note / reference / the aggregate skills row).
+     * `tag` is the kb glyph; [kind] is the commit-selection kind (`plans` / `notes` /
+     * `references` / `skills`) and [key] its selection key (slug / id / mapKey).
+     *
+     * [key] is EMPTY for `skills`, and the toggle handler must recognise that: one row
+     * stands for every captured skill, so there is no single key to carry and the
+     * handler expands the write to all of them.
      */
     data class WmContext(
         val tag: String,
@@ -258,7 +262,7 @@ object WorkingMemoryHtmlBuilder {
 
     private fun contextPanel(v: WorkingMemoryView): String {
         val rows = if (v.context.isEmpty()) {
-            emptyRow("No linked plans, notes, or references.")
+            emptyRow("No linked plans, notes, references, or skills.")
         } else {
             v.context.joinToString("") { c ->
                 """

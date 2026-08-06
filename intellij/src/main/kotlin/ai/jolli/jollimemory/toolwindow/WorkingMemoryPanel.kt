@@ -4,6 +4,7 @@ import ai.jolli.jollimemory.core.ActiveConversationItem
 import ai.jolli.jollimemory.core.ActiveSessionAggregator
 import ai.jolli.jollimemory.core.CommitSelectionStore
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.SkillsProjection
 import ai.jolli.jollimemory.core.StoredSession
 import ai.jolli.jollimemory.core.ConversationUsage
 import ai.jolli.jollimemory.core.TranscriptMessageCounter
@@ -80,7 +81,17 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
                             val key = json.get("key")?.asString
                             val excluded = json.get("excluded")?.asBoolean ?: false
                             if (kind != null && key != null) {
-                                SwingUtilities.invokeLater { handleToggleExclude(kind, key, excluded) }
+                                // Pooled, NOT the EDT: the store this writes is now reached
+                                // over the ide-bridge, so a click costs a daemon round trip
+                                // (and a cold spawn's couple of seconds when none is warm).
+                                // `handleToggleExclude` touches no Swing directly — every
+                                // refresh it triggers re-pools and hops back via
+                                // invokeLater itself. Same reasoning as the first load in
+                                // createContent(); `commitMemory` stays on the EDT because
+                                // it opens dialogs.
+                                ApplicationManager.getApplication().executeOnPooledThread {
+                                    handleToggleExclude(kind, key, excluded)
+                                }
                             }
                         }
                     }
@@ -111,7 +122,16 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             b.component.isOpaque = true
             b.component.background = wmBg
             b.setPageBackgroundColor(wmBg.toCssHex())
-            b.loadHTML(buildHtml())
+            // First load goes through the same pooled thread as reload(): createContent()
+            // runs from init on the EDT, and buildHtml → gatherView makes several
+            // ide-bridge round trips (active conversations, exclusions, active skills).
+            // Doing them inline froze the EDT for as long as the daemon took to answer —
+            // up to a cold spawn's couple of seconds. The themed background above is what
+            // makes the brief pre-content moment invisible rather than a white flash.
+            ApplicationManager.getApplication().executeOnPooledThread {
+                val html = buildHtml()
+                SwingUtilities.invokeLater { b.loadHTML(html) }
+            }
             b.component
         } catch (e: Exception) {
             LOG.info("JCEF unavailable for Working Memory: ${e.message}")
@@ -260,10 +280,37 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         )
     }
 
-    /** Flips a working-memory item's commit-selection exclusion, then refreshes. */
+    /**
+     * Flips a working-memory item's commit-selection exclusion, then refreshes.
+     *
+     * Must be called OFF the EDT — every branch below makes at least one ide-bridge
+     * round trip. It touches no Swing itself, so that is safe: `reload()` and both
+     * panel `refresh()`es re-pool and hop back through `invokeLater` on their own.
+     */
     private fun handleToggleExclude(kind: String, key: String, excluded: Boolean) {
         try {
-            CommitSelectionStore.setExcluded(cwd, kind, key, excluded)
+            if (kind == "skills") {
+                // The aggregate row carries no key, so the keys come from the registry.
+                // All of them in one write: the row has no per-skill affordance, so
+                // leaving any behind would strand it in a state the user cannot see.
+                val keys = SkillsProjection.readActive(cwd).exclusionKeys
+                // Empty is never a legitimate "nothing to do" here — this row is only
+                // drawn when skills were captured. It means either the read failed
+                // (`readActive` degrades to empty instead of throwing, so the catch
+                // below cannot see it) or a commit in another window archived them
+                // between render and click. Either way `setAllExcluded` would rewrite
+                // the file unchanged and report ok, so the click would disappear with
+                // nothing in the log to explain it. Skip the pointless write but still
+                // fall through to the refresh, which resyncs the checkbox or drops the
+                // stale row.
+                if (keys.isEmpty()) {
+                    LOG.warn("toggleExclude skills: no active skills resolved; leaving selection unchanged")
+                } else {
+                    CommitSelectionStore.setAllExcluded(cwd, kind, keys, excluded)
+                }
+            } else {
+                CommitSelectionStore.setExcluded(cwd, kind, key, excluded)
+            }
         } catch (e: Exception) {
             LOG.warn("toggleExclude failed: ${e.message}")
             return
@@ -282,7 +329,8 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         svc.panelRegistry?.let { reg ->
             when (kind) {
                 "conversations" -> reg.activeConversationsPanel?.refresh()
-                else -> reg.plansPanel?.refresh() // plans / notes / references live in the CONTEXT (Plans) panel
+                // plans / notes / references / skills all live in the CONTEXT (Plans) panel
+                else -> reg.plansPanel?.refresh()
             }
         }
     }
@@ -363,6 +411,20 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             }
             registry.references?.forEach { (mapKey, r) ->
                 out.add(WmContext(referenceTag(r.source), r.title, "references", mapKey, mapKey in exclusions.references))
+            }
+            // ONE aggregate row for every captured skill, matching the sidebar CONTEXT
+            // list and VS Code. Not read off `registry.skills`: a skill row survives
+            // archival (guarded, not deleted, so a re-entry is still detectable), so the
+            // raw map would list every skill ever used as if it were pending. The CLI
+            // decides which are still uncommitted and reports the delta.
+            //
+            // The key is empty — see [WmContext]. It reads as excluded only when EVERY
+            // captured skill is, so a partial set shows as included and the next click
+            // excludes the remainder.
+            val skills = SkillsProjection.readActive(cwd)
+            if (!skills.isEmpty) {
+                val allExcluded = skills.exclusionKeys.all { it in exclusions.skills }
+                out.add(WmContext("S", skills.summaryLabel, "skills", "", allExcluded))
             }
         } catch (_: Exception) {
             // best-effort

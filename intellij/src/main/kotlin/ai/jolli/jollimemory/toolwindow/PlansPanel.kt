@@ -7,6 +7,7 @@ import ai.jolli.jollimemory.core.PlanEntry
 import ai.jolli.jollimemory.core.CommitSelectionStore
 import ai.jolli.jollimemory.core.PinStore
 import ai.jolli.jollimemory.core.SessionTracker
+import ai.jolli.jollimemory.core.SkillsProjection
 import ai.jolli.jollimemory.core.references.ReferenceEntry
 import ai.jolli.jollimemory.core.references.ReferenceStore
 import ai.jolli.jollimemory.core.references.SourceDisplay
@@ -38,6 +39,7 @@ import java.awt.event.MouseEvent
 import java.awt.font.TextAttribute
 import java.io.File
 import java.net.URI
+import java.util.Locale
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JComponent
@@ -86,6 +88,22 @@ class PlansPanel(
             ref.title,
             ref.updatedAt,
         )
+
+        /**
+         * The aggregate row standing for EVERY skill captured this session — one row,
+         * not one per skill, because a session routinely enters a dozen and this list
+         * caps at six before collapsing. The per-skill figures are one click away in
+         * the table the CLI renders.
+         *
+         * It carries no artifact id, which is what makes it different from the three
+         * above: there is nothing to pin, edit or remove, and its checkbox writes
+         * every captured skill's key at once. Sorted by the newest skill's timestamp
+         * so it interleaves with the other kinds rather than pinning to an end.
+         */
+        class SkillsItem(val skills: SkillsProjection.ActiveSkills) : ListItem(
+            "Skills used",
+            skills.skills.maxOfOrNull { it.lastModified } ?: "",
+        )
     }
 
     // ─── Sticky hover popup (JWindow, same pattern as CommitsPanel) ──────
@@ -98,17 +116,27 @@ class PlansPanel(
         const val HOVER_SHOW_DELAY_MS = 1000
         const val HOVER_HIDE_GRACE_MS = 200
 
+        /**
+         * Skills named in the aggregate row's hover card before it collapses to "+N more".
+         * Matches VS Code's `SKILLS_HOVER_ROW_CAP` so the same session does not show a
+         * different number of rows in the two IDEs.
+         */
+        const val SKILLS_POPUP_CAP = 8
+
         // Context type-tag accent colors for the three kinds authored *here*
         // (plans, notes, snippets); reference colors come from SourceDisplay so
         // there is one table for all sources.
         val TAG_PLAN = JBColor(0x4C82F7, 0x4C82F7)
         val TAG_NOTE = JBColor(0x3FA45B, 0x3FA45B)
         val TAG_SNIPPET = JBColor(0xC9851E, 0xD18616)
+        // Skill accent is NOT declared here: CommitsPanel paints the same badge for a
+        // committed memory, so it lives in TagLabel.SKILL where both can reach it.
     }
     private val emptyLabel = JBLabel("No plans or notes yet.", SwingConstants.CENTER)
     private var excludedReferences: Set<String> = emptySet()
     private var excludedPlans: Set<String> = emptySet()
     private var excludedNotes: Set<String> = emptySet()
+    private var excludedSkills: Set<String> = emptySet()
 
     /** Full item list + expand state for the 6-row cap ("Show N more"). */
     private var allContextItems: List<ListItem> = emptyList()
@@ -142,6 +170,9 @@ class PlansPanel(
             is ListItem.PlanItem -> "plan" to (selected.plan.title.ifBlank { selected.plan.slug })
             is ListItem.NoteItem -> "note" to selected.note.title
             is ListItem.ReferenceItem -> "reference" to selected.ref.title
+            // Skills are a record of what ran, not a document the user curates — there
+            // is nothing to delete. Excluding them from the next memory is the checkbox.
+            is ListItem.SkillsItem -> return
         }
 
         val result = Messages.showYesNoDialog(
@@ -158,6 +189,8 @@ class PlansPanel(
                 is ListItem.PlanItem -> doRemovePlan(selected.plan.slug, cwd)
                 is ListItem.NoteItem -> doRemoveNote(selected.note, cwd)
                 is ListItem.ReferenceItem -> doRemoveReference(selected.mapKey, selected.ref.sourcePath, cwd)
+                // Unreachable: the guard above returns before the confirm dialog.
+                is ListItem.SkillsItem -> Unit
             }
             service.refreshStatus()
         }
@@ -308,41 +341,78 @@ class PlansPanel(
         return sb.toString()
     }
 
-    /** (kind, key) used by CommitSelectionStore / PinStore for a given list item. */
-    private fun kindKeyOf(item: ListItem): Pair<String, String> = when (item) {
+    /**
+     * (kind, key) used by CommitSelectionStore / PinStore for a given list item, or
+     * null for a row that addresses no single artifact.
+     *
+     * Only the aggregate skills row returns null, and it has to: its checkbox stands
+     * for every captured skill, so there is no one key to carry.
+     */
+    private fun kindKeyOf(item: ListItem): Pair<String, String>? = when (item) {
         is ListItem.PlanItem -> "plans" to item.plan.slug
         is ListItem.NoteItem -> "notes" to item.note.id
         is ListItem.ReferenceItem -> "references" to item.mapKey
+        is ListItem.SkillsItem -> null
     }
 
-    private fun isExcluded(item: ListItem): Boolean {
-        val (kind, key) = kindKeyOf(item)
-        return when (kind) {
-            "plans" -> key in excludedPlans
-            "notes" -> key in excludedNotes
-            else -> key in excludedReferences
-        }
+    /**
+     * Exhaustive over the item type rather than over the kind STRING.
+     *
+     * The string form ended in `else -> key in excludedReferences`, so a kind added
+     * later was silently treated as a reference: the row rendered from the wrong
+     * exclude set, and its toggle wrote into it. VS Code shipped exactly that bug
+     * twice — once defaulting to `plan`, once to `reference` — which is why its
+     * per-kind decisions now live in one table instead of a ternary chain. Here the
+     * compiler enforces it: a new [ListItem] subclass fails to build until this
+     * `when` accounts for it.
+     */
+    private fun isExcluded(item: ListItem): Boolean = when (item) {
+        is ListItem.PlanItem -> item.plan.slug in excludedPlans
+        is ListItem.NoteItem -> item.note.id in excludedNotes
+        is ListItem.ReferenceItem -> item.mapKey in excludedReferences
+        // One checkbox for all captured skills, so it reads as excluded only when every
+        // one of them is. A partially-excluded set therefore shows as included, and the
+        // next click excludes the remainder instead of re-including what was already out.
+        is ListItem.SkillsItem ->
+            item.skills.exclusionKeys.isNotEmpty() && item.skills.exclusionKeys.all { it in excludedSkills }
     }
 
     /** Toggles include/exclude for any item kind (select toggle click). */
     private fun toggleExclusion(item: ListItem) {
-        val (kind, key) = kindKeyOf(item)
         val nowExcluded = !isExcluded(item)
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
         ApplicationManager.getApplication().executeOnPooledThread {
-            CommitSelectionStore.setExcluded(cwd, kind, key, nowExcluded)
+            when (item) {
+                // Every captured skill in one write: the aggregate row has no per-skill
+                // affordance, so leaving any key untouched would strand it in a state the
+                // user has no way to see or change.
+                is ListItem.SkillsItem ->
+                    CommitSelectionStore.setAllExcluded(cwd, "skills", item.skills.exclusionKeys, nowExcluded)
+                else -> {
+                    val (kind, key) = kindKeyOf(item) ?: return@executeOnPooledThread
+                    CommitSelectionStore.setExcluded(cwd, kind, key, nowExcluded)
+                }
+            }
             service.notifySelectionChanged()
             val ex = CommitSelectionStore.readExclusions(cwd)
             excludedReferences = ex.references
             excludedPlans = ex.plans
             excludedNotes = ex.notes
+            excludedSkills = ex.skills
             SwingUtilities.invokeLater { renderList() }
         }
     }
 
-    /** Pins an item so it appears in the Pinned section (pin hover action). */
+    /**
+     * Pins an item so it appears in the Pinned section (pin hover action).
+     *
+     * Unreachable for the aggregate skills row — [contextRow] gives it no pin icon,
+     * because Pinned addresses one artifact by key and this row has none. Its `when`
+     * branches below are still required: narrowing on the null key does not narrow the
+     * item type, so the compiler wants every subclass accounted for.
+     */
     private fun pinItem(item: ListItem) {
-        val (kind, key) = kindKeyOf(item)
+        val (kind, key) = kindKeyOf(item) ?: return
         val title = when (item) {
             is ListItem.PlanItem -> item.plan.title.ifBlank { item.plan.slug }
             is ListItem.NoteItem -> item.note.title
@@ -350,6 +420,7 @@ class PlansPanel(
             is ListItem.ReferenceItem -> SourceDisplay.displayTitle(
                 item.ref.source, item.ref.nativeId, item.ref.title,
             )
+            is ListItem.SkillsItem -> return
         }
         // Same letter tag the Context row shows, so the Pinned row mirrors the icon.
         // Reference letter comes from the shared SourceDisplay table so PlansPanel
@@ -358,6 +429,7 @@ class PlansPanel(
             is ListItem.PlanItem -> "P"
             is ListItem.NoteItem -> if (item.note.format == NoteFormat.snippet) "S" else "N"
             is ListItem.ReferenceItem -> SourceDisplay.of(item.ref.source).tag
+            is ListItem.SkillsItem -> return
         }
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
         ai.jolli.jollimemory.core.telemetry.Telemetry.track("memory_pinned", mapOf("kind" to kind))
@@ -373,7 +445,56 @@ class PlansPanel(
             is ListItem.PlanItem -> openPlan(item.plan)
             is ListItem.NoteItem -> openNote(item.note)
             is ListItem.ReferenceItem -> openReference(item.ref)
+            is ListItem.SkillsItem -> openSkillsAggregate()
         }
+    }
+
+    /**
+     * Opens the table of every skill captured but not yet committed.
+     *
+     * There is no file to open: on disk each skill is its own
+     * `skills/<source>/<stem>.md`, and the aggregate only becomes a real file
+     * (`skills--<hash8>.md`) once the work is committed. So this renders the same
+     * table through the CLI and shows it read-only, which is also what keeps the
+     * before-commit and after-commit views identical.
+     */
+    private fun openSkillsAggregate() {
+        val cwd = service.mainRepoRoot ?: project.basePath ?: return
+        ApplicationManager.getApplication().executeOnPooledThread {
+            // Separated from the empty case below: a bridge that cannot answer is not
+            // evidence about what was captured, and saying so would point the user at
+            // the wrong problem.
+            val markdown = try {
+                SkillsProjection.liveMarkdown(cwd)
+            } catch (ex: Exception) {
+                SwingUtilities.invokeLater { showSkillsMessage("Could not render the skills table: ${ex.message}") }
+                return@executeOnPooledThread
+            }
+            SwingUtilities.invokeLater {
+                if (markdown == null) {
+                    // Normal right after a commit: archival empties the working registry.
+                    // Worded as where they WENT, not as their absence — the row was on
+                    // screen a moment ago, so "none captured" would read as a loss.
+                    showSkillsMessage(
+                        "These skills are now archived on your latest memory — " +
+                            "nothing new has been captured for the current working session.",
+                    )
+                    return@invokeLater
+                }
+                MarkdownPreview.open(
+                    project,
+                    // Matches VS Code's tab for the same document, and the table's own
+                    // H1 — the committed counterpart in CommitsPanel is named the same
+                    // way, so the before-commit and after-commit tabs read as one pair.
+                    com.intellij.testFramework.LightVirtualFile("Skills used — uncommitted.md", markdown)
+                        .apply { isWritable = false },
+                )
+            }
+        }
+    }
+
+    private fun showSkillsMessage(message: String) {
+        JOptionPane.showMessageDialog(this, message, "Skills", JOptionPane.INFORMATION_MESSAGE)
     }
 
     private fun openReferenceInBrowser(url: String) {
@@ -415,6 +536,7 @@ class PlansPanel(
             excludedReferences = ex.references
             excludedPlans = ex.plans
             excludedNotes = ex.notes
+            excludedSkills = ex.skills
 
             val planItems = filterPlans(registry.plans, gitOps, currentBranch)
                 .map { ListItem.PlanItem(it) }
@@ -424,9 +546,18 @@ class PlansPanel(
             // (a commit deletes the row; there is no committed/guard state to filter).
             val refItems = (registry.references ?: emptyMap())
                 .map { (mapKey, entry) -> ListItem.ReferenceItem(entry, mapKey) }
+            // Not read off `registry.skills` like the three above: a skill row survives
+            // archival (it is guarded, not deleted, so a later re-entry is detectable),
+            // so the raw map would list every skill ever used as if it were fresh working
+            // state. The CLI decides which rows are still uncommitted, and reports the
+            // delta rather than each row's lifetime total.
+            val skillItems = SkillsProjection.readActive(cwd)
+                .takeIf { !it.isEmpty }
+                ?.let { listOf(ListItem.SkillsItem(it)) }
+                ?: emptyList()
 
             // Merge and sort by lastModified descending (newest first), matching VS Code
-            (planItems + noteItems + refItems).sortedByDescending { it.lastModified }
+            (planItems + noteItems + refItems + skillItems).sortedByDescending { it.lastModified }
         } catch (_: Exception) {
             emptyList()
         }
@@ -607,7 +738,10 @@ class PlansPanel(
             if (excluded) AllIcons.General.Add else AllIcons.Actions.Close,
             if (excluded) "Include in next memory" else "Exclude from next memory",
         ) { toggleExclusion(item) }
-        val icons = listOf(pin, edit, toggle)
+        // The aggregate skills row gets the checkbox and nothing else — matching VS
+        // Code, where its kind declares no inline actions. There is no single document
+        // to pin or edit, and Pin addresses one artifact by key, which this row lacks.
+        val icons = if (item is ListItem.SkillsItem) listOf(toggle) else listOf(pin, edit, toggle)
         val iconsRow = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
             isOpaque = false
             icons.forEach { add(it) }
@@ -716,6 +850,16 @@ class PlansPanel(
 
     private fun showRowContextMenu(item: ListItem, e: MouseEvent) {
         val popup = JPopupMenu()
+        // The aggregate skills row offers Preview only: it is a record of what ran, so
+        // there is nothing to remove, and a Remove item that silently did nothing would
+        // be worse than its absence.
+        if (item is ListItem.SkillsItem) {
+            popup.add(JMenuItem("Preview", JolliMemoryIcons.Eye).apply {
+                addActionListener { openSkillsAggregate() }
+            })
+            popup.show(e.component, e.x, e.y)
+            return
+        }
         if (item is ListItem.ReferenceItem) {
             popup.add(JMenuItem("Preview", JolliMemoryIcons.Eye).apply { addActionListener { openReference(item.ref) } })
             val refUrl = item.ref.url
@@ -739,6 +883,7 @@ class PlansPanel(
         // table; a source the enum hasn't caught up with yet gets the neutral
         // Reference placeholder instead of crashing the row renderer.
         is ListItem.ReferenceItem -> SourceDisplay.of(item.ref.source).let { it.tag to it.color }
+        is ListItem.SkillsItem -> "S" to TagLabel.SKILL
     }
 
     private fun titleFor(item: ListItem): String = when (item) {
@@ -758,6 +903,14 @@ class PlansPanel(
         is ListItem.ReferenceItem -> SourceDisplay.displayTitle(
             item.ref.source, item.ref.nativeId, item.ref.title,
         )
+        // The CLI's own label ("3 skills · 93.8k tokens"), not a Kotlin restatement of
+        // it: this row must read the same here, in VS Code, and in the committed
+        // `skills--<hash8>.md`. The "some inferred" suffix is appended per-surface
+        // because the table spells the same caveat as a `†` footnote instead.
+        is ListItem.SkillsItem -> {
+            val label = item.skills.summaryLabel.ifBlank { "Skills used" }
+            if (item.skills.anyInferred) "$label · some inferred" else label
+        }
     }
 
     private fun showMoreRow(remaining: Int): JPanel {
@@ -795,9 +948,10 @@ class PlansPanel(
 
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
         ApplicationManager.getApplication().executeOnPooledThread {
-            for (item in refItems) {
-                CommitSelectionStore.setExcluded(cwd, "references", item.mapKey, !select)
-            }
+            // One bulk write, not one per row. Same net effect — every reference gets
+            // the same `!select` — but the store is reached over the ide-bridge now, so
+            // a per-row loop paid one daemon round trip per reference.
+            CommitSelectionStore.setAllExcluded(cwd, "references", refItems.map { it.mapKey }, !select)
             service.notifySelectionChanged()
             excludedReferences = CommitSelectionStore.readExclusions(cwd).references
             SwingUtilities.invokeLater { renderList() }
@@ -839,6 +993,7 @@ class PlansPanel(
             is ListItem.PlanItem -> buildPlanPopupContent(content, item.plan, fg, dimFg)
             is ListItem.NoteItem -> buildNotePopupContent(content, item.note, fg, dimFg)
             is ListItem.ReferenceItem -> buildReferencePopupContent(content, item.ref, fg, dimFg)
+            is ListItem.SkillsItem -> buildSkillsPopupContent(content, item.skills, fg, dimFg)
         }
 
         popup.contentPane = JPanel(BorderLayout()).apply {
@@ -882,6 +1037,80 @@ class PlansPanel(
         content.add(JBLabel("${plan.editCount} edit${if (plan.editCount != 1) "s" else ""}").apply {
             foreground = dimFg; alignmentX = Component.LEFT_ALIGNMENT
         })
+    }
+
+    /**
+     * Names the skills behind the aggregate row, heaviest first.
+     *
+     * The row itself can only show a count and a token total, so without this the user
+     * has to open the table to learn WHICH skills ran. Capped at [SKILLS_POPUP_CAP]
+     * with an overflow line — a session can enter a dozen, and a popup taller than the
+     * panel is worse than a truncated one. Ordering matches the table's (by tokens,
+     * then name) so the two do not disagree about what dominated the work.
+     */
+    private fun buildSkillsPopupContent(
+        content: JPanel,
+        skills: SkillsProjection.ActiveSkills,
+        fg: Color,
+        dimFg: Color,
+    ) {
+        content.add(JBLabel(skills.summaryLabel.ifBlank { "Skills used" }).apply {
+            foreground = fg; font = font.deriveFont(Font.BOLD); alignmentX = Component.LEFT_ALIGNMENT
+        })
+        content.add(Box.createVerticalStrut(JBUI.scale(4)))
+
+        // Heaviest first, then by name — the aggregate table's own ordering, so the card
+        // and the table agree about what dominated the work. Deliberately not a
+        // locale-aware compare: the ambient locale would reorder rows for a colleague.
+        val ordered = skills.skills.sortedWith(
+            compareByDescending<SkillsProjection.ActiveSkill> { totalTokensOf(it) }.thenBy { it.skill },
+        )
+        for (skill in ordered.take(SKILLS_POPUP_CAP)) {
+            // Count AND tokens, the table's two columns. An unattributed skill shows an
+            // em dash for tokens, never a zero — Codex and Cursor heuristics measure
+            // nothing, and a rendered 0 reads as a measurement rather than its absence.
+            val tokens = skill.usage
+                ?.let { u -> formatTokens(totalTokensOf(skill), u.confidence != "attributed") }
+                ?: "—"
+            val inferred = if (skill.detection == "heuristic") " †" else ""
+            content.add(JBLabel("${skill.skill}$inferred — ${skill.invocationCount}× · $tokens").apply {
+                foreground = dimFg; alignmentX = Component.LEFT_ALIGNMENT
+            })
+        }
+        val hidden = ordered.size - SKILLS_POPUP_CAP
+        if (hidden > 0) {
+            content.add(JBLabel("+$hidden more — click to open the table").apply {
+                foreground = dimFg; alignmentX = Component.LEFT_ALIGNMENT
+            })
+        }
+        if (skills.anyInferred) {
+            content.add(Box.createVerticalStrut(JBUI.scale(2)))
+            content.add(JBLabel("† inferred from a file read, not an observed call").apply {
+                foreground = dimFg; alignmentX = Component.LEFT_ALIGNMENT
+            })
+        }
+    }
+
+    private fun totalTokensOf(skill: SkillsProjection.ActiveSkill): Int =
+        skill.usage?.let { it.input + it.cached + it.output } ?: 0
+
+    /**
+     * `93.8k` / `~12.3k` — the CLI table's compact form.
+     *
+     * Restated in Kotlin only because this is a PER-SKILL figure and the bridge exposes
+     * the aggregate label, not per-row text. VS Code's own hover card does the same for
+     * the same reason. Keep the formula identical to `formatCompact` in
+     * `SkillsAggregateMarkdown.ts` — the card sits one click from that table, and two
+     * roundings of the same number is a bug report.
+     */
+    private fun formatTokens(total: Int, estimated: Boolean): String {
+        val marker = if (estimated) "~" else ""
+        // Locale.ROOT, not the bare `String.format` extension: that one takes the
+        // ambient locale, so a comma-decimal IDE would render `93,8k` here while the
+        // table one click away — rendered by the CLI's `toFixed(1)`, which has no
+        // locale — still says `93.8k`. Same reason the sort above avoids a
+        // locale-aware compare.
+        return if (total < 1000) "$marker$total" else marker + String.format(Locale.ROOT, "%.1fk", total / 1000.0)
     }
 
     private fun buildNotePopupContent(content: JPanel, note: NoteEntry, fg: Color, dimFg: Color) {
