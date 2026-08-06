@@ -17,6 +17,7 @@ const NONE = {
 	cline: false,
 	devin: false,
 	antigravity: false,
+	kimi: false,
 } as const;
 
 let dir: string;
@@ -232,6 +233,64 @@ describe("codex registrar — register/remove target ~/.codex/config.toml", () =
 		await codex.remove("/some/wt");
 		expect(removeMock).toHaveBeenCalledOnce();
 		expect(removeMock.mock.calls[0][0]).toBe(codexConfigPath);
+	});
+});
+
+describe("kimi registrar — structure", () => {
+	it("appears in buildRegistrars when detected.kimi is true", () => {
+		const registrars = buildRegistrars({ ...NONE, kimi: true });
+		expect(registrars.map((r) => r.host)).toContain("kimi");
+	});
+
+	it("does not appear when detected.kimi is false", () => {
+		const registrars = buildRegistrars({ ...NONE });
+		expect(registrars.map((r) => r.host)).not.toContain("kimi");
+	});
+
+	it("gitExcludePaths() returns [] (global config, never committed)", () => {
+		const [kimi] = buildRegistrars({ ...NONE, kimi: true });
+		expect(kimi.gitExcludePaths()).toEqual([]);
+	});
+});
+
+describe("kimi registrar — register/remove target ~/.kimi-code/mcp.json", () => {
+	// Scoped JsonMcpWriter mock (same pattern as the gemini block above): verifies
+	// the path/writer without touching the developer's real ~/.kimi-code.
+	const upsertMock = vi.fn().mockResolvedValue(undefined);
+	const removeMock = vi.fn().mockResolvedValue(undefined);
+	const kimiMcpPath = join(homedir(), ".kimi-code", "mcp.json");
+
+	beforeEach(() => {
+		vi.resetModules();
+		vi.doMock("./JsonMcpWriter.js", () => ({
+			upsertJsonMcpServer: upsertMock,
+			removeJsonMcpServer: removeMock,
+		}));
+		upsertMock.mockClear();
+		removeMock.mockClear();
+	});
+
+	afterEach(() => {
+		vi.doUnmock("./JsonMcpWriter.js");
+		vi.resetModules();
+	});
+
+	it("register() calls upsertJsonMcpServer with ~/.kimi-code/mcp.json (default mcpServers key)", async () => {
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		const [kimi] = build({ ...NONE, kimi: true });
+		await kimi.register("/some/wt");
+		expect(upsertMock).toHaveBeenCalledOnce();
+		expect(upsertMock.mock.calls[0][0]).toBe(kimiMcpPath);
+		// No third arg → JsonMcpWriter's default `mcpServers` key, which is what Kimi wants.
+		expect(upsertMock.mock.calls[0][2]).toBeUndefined();
+	});
+
+	it("remove() calls removeJsonMcpServer with ~/.kimi-code/mcp.json", async () => {
+		const { buildRegistrars: build } = await import("./HostRegistrars.js");
+		const [kimi] = build({ ...NONE, kimi: true });
+		await kimi.remove("/some/wt");
+		expect(removeMock).toHaveBeenCalledOnce();
+		expect(removeMock.mock.calls[0][0]).toBe(kimiMcpPath);
 	});
 });
 

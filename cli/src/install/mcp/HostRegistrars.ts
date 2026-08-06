@@ -40,6 +40,7 @@ export interface DetectedHosts {
 	cline: boolean;
 	devin: boolean;
 	antigravity: boolean;
+	kimi: boolean;
 }
 
 export interface McpHostRegistrar {
@@ -316,6 +317,25 @@ const antigravityRegistrar: McpHostRegistrar = {
 };
 
 /**
+ * Kimi Code CLI: global `~/.kimi-code/mcp.json`.
+ * Format verified from the official Kimi Code docs
+ * (https://www.kimi.com/code/docs/en/kimi-code-cli/customization/mcp.html): the
+ * user-level file is `~/.kimi-code/mcp.json` (or `$KIMI_CODE_HOME/mcp.json`),
+ * top-level key `mcpServers`, stdio entry `{ command, args, env?, cwd? }` — the
+ * same JSON shape as Cursor, so `JsonMcpWriter`'s default key is exactly right.
+ * NOTE: MCP servers live in `mcp.json`, NOT in `config.toml` (which only carries
+ * `[mcp] startup_timeout_ms` / `tool_timeout_ms`) — do not route this through the
+ * Codex TOML writer. Global config — never committed, so gitExcludePaths returns [].
+ */
+const kimiRegistrar: McpHostRegistrar = {
+	host: "kimi",
+	scope: "global",
+	register: () => upsertJsonMcpServer(join(homedir(), ".kimi-code", "mcp.json"), { ...jolliEntry() }),
+	remove: () => removeJsonMcpServer(join(homedir(), ".kimi-code", "mcp.json")),
+	gitExcludePaths: () => [],
+};
+
+/**
  * Return the ordered list of registrars for the detected set of hosts.
  */
 export function buildRegistrars(detected: DetectedHosts): McpHostRegistrar[] {
@@ -330,6 +350,7 @@ export function buildRegistrars(detected: DetectedHosts): McpHostRegistrar[] {
 	if (detected.cline) out.push(clineRegistrar);
 	if (detected.devin) out.push(devinRegistrar);
 	if (detected.antigravity) out.push(antigravityRegistrar);
+	if (detected.kimi) out.push(kimiRegistrar);
 	return out;
 }
 
@@ -346,6 +367,7 @@ const ALL_DETECTED: DetectedHosts = {
 	cline: true,
 	devin: true,
 	antigravity: true,
+	kimi: true,
 };
 
 /** Run `fn` over `regs` with per-host error isolation — one failure is logged

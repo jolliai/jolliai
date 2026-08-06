@@ -475,6 +475,9 @@ export async function install(
 		const clinePresentOnce = repoHooksOnly ? false : await isClinePresent();
 		const devinPresentOnce = repoHooksOnly ? false : await isDevinPresent();
 		const antigravityPresentOnce = repoHooksOnly ? false : await isAntigravityPresent();
+		// Kimi is a file-based (mcp.json) MCP host, not SQLite-gated, so presence is a
+		// plain on-disk check (does ~/.kimi-code exist) — same as Codex/Gemini.
+		const kimiPresentOnce = repoHooksOnly ? false : await isKimiInstalled();
 
 		// Install .jolli/jollimemory/ state dir (always) and Claude Code hook (if enabled)
 		let claudeResult: HookOpResult = {};
@@ -582,6 +585,7 @@ export async function install(
 				cline: clinePresentOnce,
 				devin: devinPresentOnce,
 				antigravity: antigravityPresentOnce,
+				kimi: kimiPresentOnce,
 			};
 			// Keep the user's `git status` clean by adding Jolli-managed paths to
 			// `.git/info/exclude`. Worktree-aware: linked worktrees may have their
@@ -656,6 +660,7 @@ export async function install(
 			cline: clinePresentOnce,
 			devin: devinPresentOnce,
 			antigravity: antigravityPresentOnce,
+			kimi: kimiPresentOnce,
 		});
 
 		// Prefer Jolli's skills by default: write a standing rule into each
