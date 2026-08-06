@@ -48,6 +48,11 @@ const mockWorkspaceFolders: Array<{ uri: { fsPath: string } }> = [];
 const { clipboardWriteText } = vi.hoisted(() => ({
 	clipboardWriteText: vi.fn().mockResolvedValue(undefined),
 }));
+// Backs the "collapsed N duplicate folders" toast the KB refresh raises after
+// `kbFolders.dedupeFolders()` archives something.
+const { showInformationMessage } = vi.hoisted(() => ({
+	showInformationMessage: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock("vscode", () => ({
 	Uri: {
 		joinPath: vi.fn((_base: unknown, ...segments: string[]) => ({
@@ -63,6 +68,7 @@ vi.mock("vscode", () => ({
 			show: vi.fn(),
 			dispose: vi.fn(),
 		})),
+		showInformationMessage,
 	},
 	workspace: {
 		get workspaceFolders() {
@@ -1919,6 +1925,64 @@ describe("SidebarWebviewProvider", () => {
 		await new Promise((r) => setTimeout(r, 0));
 		expect(kbFolders.listChildren).toHaveBeenCalledWith("");
 		expect(exec).toHaveBeenCalledWith("jollimemory.refreshMemories");
+	});
+
+	/** Builds a kb-tab provider whose `kbFolders` carries a stubbed dedupe. */
+	function makeKbDedupeProvider(dedupeFolders: () => Promise<string[]>) {
+		const view = makeMockView();
+		const kbFolders = {
+			listChildren: vi.fn().mockResolvedValue([]),
+			dedupeFolders: vi.fn(dedupeFolders),
+		};
+		const provider = new SidebarWebviewProvider({
+			executeCommand: vi.fn().mockResolvedValue(undefined),
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			kbFolders,
+		});
+		provider.resolveWebviewView(view as unknown as never);
+		showInformationMessage.mockClear();
+		return { view, kbFolders };
+	}
+
+	it("toasts once per refresh when dedupeFolders archived duplicate folders", async () => {
+		const { view, kbFolders } = makeKbDedupeProvider(async () => [
+			"/kb/jolliai-2",
+		]);
+		view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(kbFolders.dedupeFolders).toHaveBeenCalledTimes(1);
+		expect(showInformationMessage).toHaveBeenCalledTimes(1);
+		// Singular noun for one folder; the count is what the user acts on.
+		expect(showInformationMessage.mock.calls[0][0]).toContain("1 duplicate folder");
+		expect(kbFolders.listChildren).toHaveBeenCalledWith("");
+	});
+
+	it("stays silent when dedupeFolders found nothing to archive", async () => {
+		const { view, kbFolders } = makeKbDedupeProvider(async () => []);
+		view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(showInformationMessage).not.toHaveBeenCalled();
+		expect(kbFolders.listChildren).toHaveBeenCalledWith("");
+	});
+
+	it("still re-lists the tree when dedupeFolders throws", async () => {
+		// Dedupe is best-effort: a failed archive (locked directory, permissions)
+		// must not cost the user the refresh they actually asked for.
+		const { view, kbFolders } = makeKbDedupeProvider(async () => {
+			throw new Error("EPERM");
+		});
+		view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(showInformationMessage).not.toHaveBeenCalled();
+		expect(kbFolders.listChildren).toHaveBeenCalledWith("");
 	});
 
 	it("handles refresh scope='branch' by invoking the three branch refresh commands", () => {

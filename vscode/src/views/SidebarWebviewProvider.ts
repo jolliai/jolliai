@@ -177,6 +177,14 @@ export interface SidebarWebviewDeps {
 		 * (which inject only `listChildren`) keep working.
 		 */
 		notifyDirty?: (kbRoot?: string) => void;
+		/**
+		 * Collapses duplicate KB folders that share one repo identity so the
+		 * Folders tab stops showing the same repo twice (the `jolliai` +
+		 * `jolliai-2` symptom). Optional so existing tests keep compiling.
+		 * Resolves to the list of folder paths that were archived; an empty
+		 * array means no duplicates were found.
+		 */
+		dedupeFolders?: () => Promise<string[]>;
 	};
 	/**
 	 * Source for the breadcrumb repo/branch dropdowns. `listRepos` enumerates
@@ -1166,7 +1174,10 @@ export class SidebarWebviewProvider
 				void this.deps.applyDismissAiExclude?.(msg.kind, msg.key);
 				return;
 			case "refresh":
-				this.handleRefresh(msg.scope);
+				// Now async (the KB scope awaits `dedupeFolders` before
+				// re-listing). It swallows its own failures, so the caller
+				// stays fire-and-forget like every other message handler.
+				void this.handleRefresh(msg.scope);
 				return;
 			case "selection:request":
 				this.handleSelectionRequest(msg.repoName, msg.branchName, msg.silent);
@@ -1816,7 +1827,7 @@ export class SidebarWebviewProvider
 	 * have no command equivalent (no upstream cache; we read fs each time), so
 	 * we call `handleExpandFolder("")` directly to push a fresh root listing.
 	 */
-	private handleRefresh(
+	private async handleRefresh(
 		scope:
 			| "kb"
 			| "branch"
@@ -1824,8 +1835,35 @@ export class SidebarWebviewProvider
 			| "branch-commits"
 			| "status"
 			| "all",
-	): void {
+	): Promise<void> {
 		if (scope === "kb" || scope === "all") {
+			// Dedupe first so a Refresh both re-lists AND collapses the
+			// `jolliai` + `jolliai-2` duplicate folders that share one repo
+			// identity. Dedupe is best-effort and recoverable (folders are
+			// moved into the hidden archive dir, not deleted), so a failure
+			// here must not block the following re-list — we report it and
+			// continue. The follow-up handleExpandFolder("") re-reads the
+			// trimmed directory so the dupes vanish from the tree on the
+			// same refresh.
+			if (this.deps.kbFolders?.dedupeFolders) {
+				try {
+					const archived = await this.deps.kbFolders.dedupeFolders();
+					if (archived.length > 0) {
+						const noun = archived.length === 1 ? "folder" : "folders";
+						const msg =
+							`Jolli Memory: collapsed ${archived.length} duplicate ` +
+							`${noun} sharing a repo identity. Moved to the archive folder (recoverable).`;
+						void vscode.window.showInformationMessage(msg);
+					}
+				} catch (err) {
+					log.warn(
+						"SidebarWebviewProvider",
+						`dedupeFolders failed: ${
+							err instanceof Error ? err.message : String(err)
+						}`,
+					);
+				}
+			}
 			void this.handleExpandFolder("");
 			void this.deps.executeCommand("jollimemory.refreshMemories");
 		}

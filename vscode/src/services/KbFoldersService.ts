@@ -53,6 +53,10 @@ import { isAbsolute, join, normalize } from "node:path";
 import type { SummaryIndex } from "../../../cli/src/Types.js";
 import { FolderStorage } from "../../../cli/src/core/FolderStorage.js";
 import {
+	archiveKBFolder,
+	normalizeRemoteUrl,
+} from "../../../cli/src/core/KBPathResolver.js";
+import {
 	type DiscoveredRepo,
 	discoverRepos,
 } from "../../../cli/src/core/KBRepoDiscoverer.js";
@@ -119,6 +123,102 @@ export class KbFoldersService {
 	notifyDirty(kbRoot?: string): void {
 		if (kbRoot) this.cleanRepos.delete(kbRoot);
 		else this.cleanRepos.clear();
+	}
+
+	/**
+	 * Collapses duplicate KB folders that share one repo identity so the Folders
+	 * tab stops showing the same repo twice (the `jolliai` + `jolliai-2` symptom).
+	 *
+	 * WHY dupes exist: `resolveKBPath` claims a folder per `(repoName, remoteUrl)`
+	 * at activation time. When the current project's `remoteUrl` reads back as
+	 * `null` (local-only repo, or a transient `git` timeout degrading
+	 * `extractRepoName` to a basename), it can spawn a `-2` sibling whose
+	 * `config.json` carries `remoteUrl: null` while the base folder holds the
+	 * real URL. Two folders, same on-disk repo, two Folders-tab rows. The other
+	 * classic cause is a LEGACY SSH-vs-HTTPS clone mismatch: `isSameRepo` folds
+	 * transports today, but folders claimed before that fold shipped still hold
+	 * `git@host:o/r.git` in one `config.json` and `https://host/o/r` in the
+	 * other, so their piles survive. Both configs are read verbatim here, which
+	 * is why the remote comparison below has to canonicalize.
+	 *
+	 * GROUPING RULE — group by `repoName`, then COLLAPSE only when every member
+	 * of the group is "the same repo":
+	 *   - two members with equal non-null remotes  → dupes (collapse).
+	 *   - a member with a real remote + a member with `null` remote → the null
+	 *     one is the auto-spawned shadow (collapse it, keep the one with a
+	 *     remote). This is the exact `jolliai`/`jolliai-2` case the user sees.
+	 *   - two members with DISTINCT non-null remotes → DIFFERENT repos that
+	 *     merely share a basename (forks) → NEVER collapse; that would merge two
+	 *     unrelated knowledge bases. The user's "no remote URL" heuristic is a
+	 *     SUBSET of this rule: a lone local-only folder legitimately has
+	 *     `remoteUrl: null` and must be preserved.
+	 *
+	 * KEEP PICK: see {@link pickCanonical} — most content first, then a non-null
+	 * remote, then the lowest `-N` suffix. Content leads because nothing here
+	 * merges the loser into the winner; archiving is a plain move, so the
+	 * populated folder has to be the survivor.
+	 *
+	 * ACTION: extra folders are MOVED into the hidden archive dir via
+	 * `archiveKBFolder` — the same recoverable path the Migrate-to-Memory-Bank
+	 * flow uses — rather than hard-deleted, so a mis-classification is undoable.
+	 * The orphan branch remains the system of record regardless.
+	 *
+	 * DISTINCT-REMOTE groups are left completely untouched (no archive, no
+	 * notification) so legitimate forks are never disturbed.
+	 *
+	 * @returns the list of folder paths that were archived (empty if none).
+	 */
+	async dedupeFolders(): Promise<string[]> {
+		const ctx = this.getContext();
+		const repos = discoverRepos(
+			ctx.currentRepoName,
+			ctx.currentRemoteUrl,
+			ctx.kbParent,
+		);
+		// Group by config repoName. Two DiscoveryRepos with the same dirName
+		// can't happen (discoverRepos scans distinct dirs), but two different
+		// dirNames (base + -N, or two forks) can share a repoName.
+		const byName = new Map<string, DiscoveredRepo[]>();
+		for (const r of repos) {
+			const key = r.repoName;
+			const group = byName.get(key);
+			if (group) group.push(r);
+			else byName.set(key, [r]);
+		}
+
+		const archived: string[] = [];
+		for (const group of byName.values()) {
+			if (group.length < 2) continue;
+			// Remotes must be compared CANONICALIZED, not raw: the SSH-vs-HTTPS
+			// clone mismatch this method exists to collapse stores
+			// `git@github.com:o/r.git` in one config and
+			// `https://github.com/o/r` in the other. Raw string equality calls
+			// those two "distinct remotes" and skips the group — i.e. the second
+			// of the two documented causes would never have been collapsed.
+			// `normalizeRemoteUrl` is the same comparer `KBPathResolver.isSameRepo`
+			// uses to decide folder reuse, imported rather than re-derived so the
+			// two can't drift (a divergent copy is what split `<repo>`/`<repo>-2`
+			// in the first place).
+			const distinctRemotes = new Set(
+				group
+					.map((r) => r.remoteUrl)
+					.filter((u): u is string => u != null)
+					.map(normalizeRemoteUrl),
+			);
+			if (distinctRemotes.size > 1) {
+				// Different repos sharing a basename — forks, not dupes.
+				continue;
+			}
+			// Collapsible group: pick the canonical survivor.
+			const keep = pickCanonical(group);
+			for (const r of group) {
+				if (r.kbRoot === keep.kbRoot) continue;
+				const dest = archiveKBFolder(r.kbRoot, ctx.kbParent);
+				if (dest) archived.push(r.kbRoot);
+			}
+		}
+		if (archived.length > 0) this.cleanRepos.clear();
+		return archived;
 	}
 
 	/**
@@ -600,6 +700,85 @@ function repoDisplayName(repo: DiscoveredRepo): string {
 	return repo.repoName === repo.dirName
 		? repo.repoName
 		: `${repo.repoName} (${repo.dirName})`;
+}
+
+/**
+ * Picks the canonical survivor from a dedup group, in priority order:
+ *
+ *   1. **Most content** (`.jolli/index.json` entry count). Nothing here
+ *      re-migrates the loser's contents into the winner — archiving is a pure
+ *      move — so the folder holding the memories must always be the one that
+ *      stays. Everything below is only a tiebreak between folders that hold
+ *      the same amount.
+ *   2. **A non-null `remoteUrl`**, so the folder carrying a real identity
+ *      survives over the degraded shadow.
+ *   3. **Lowest collision suffix** (base `<repo>` before `<repo>-2`).
+ *      `dirName` is always `<repoName>` or `<repoName>-N`, so the numeric
+ *      suffix parse is well-defined.
+ *
+ * Suffix used to be the FIRST key, which inverted rules 1 and 2 and produced a
+ * self-perpetuating loop: with a null-remote base and the real remote in
+ * `<repo>-2`, `resolveKBPath` resolves writes to `<repo>-2` (the base fails
+ * `isSameRepo` against a real remote), so suffix-first archived the *live*
+ * folder, the next write re-claimed an empty `<repo>-2`, and the following
+ * Refresh archived that one too — one archived directory per refresh, forever,
+ * with the populated folder buried each time.
+ */
+function pickCanonical(group: DiscoveredRepo[]): DiscoveredRepo {
+	let best = group[0];
+	let bestKey = canonicalKey(best);
+	for (let i = 1; i < group.length; i++) {
+		const key = canonicalKey(group[i]);
+		if (
+			key.entries > bestKey.entries ||
+			(key.entries === bestKey.entries &&
+				(key.hasRemote > bestKey.hasRemote ||
+					(key.hasRemote === bestKey.hasRemote && key.rank < bestKey.rank)))
+		) {
+			best = group[i];
+			bestKey = key;
+		}
+	}
+	return best;
+}
+
+/** Sort key for {@link pickCanonical}: higher `entries`/`hasRemote` and lower `rank` win. */
+function canonicalKey(repo: DiscoveredRepo): {
+	entries: number;
+	hasRemote: number;
+	rank: number;
+} {
+	return {
+		entries: countIndexEntries(repo.kbRoot),
+		hasRemote: repo.remoteUrl != null ? 1 : 0,
+		rank: suffixRank(repo.dirName),
+	};
+}
+
+/**
+ * Number of summaries recorded in `<kbRoot>/.jolli/index.json`, or `0` when the
+ * file is missing or unparseable. A missing index reads as "empty", which is
+ * the safe direction: an unreadable folder never outranks a readable populated
+ * one for survival.
+ */
+function countIndexEntries(kbRoot: string): number {
+	try {
+		const parsed = JSON.parse(
+			readFileSync(join(kbRoot, ".jolli", "index.json"), "utf-8"),
+		) as SummaryIndex;
+		return Array.isArray(parsed.entries) ? parsed.entries.length : 0;
+	} catch {
+		return 0;
+	}
+}
+
+/**
+ * Collision-suffix rank for a KB dir name: `0` for the base `<repo>`, `N` for
+ * `<repo>-N`. Extraction mirrors `KBPathResolver`'s `<repo>-N` ladder.
+ */
+function suffixRank(dirName: string): number {
+	const m = dirName.match(/-(\d+)$/);
+	return m ? Number(m[1]) : 0;
 }
 
 /**

@@ -4,6 +4,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	readdirSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
@@ -1788,5 +1789,190 @@ describe("parseMdTitle", () => {
 		expect(parseMdTitle('---\ntitle: ""\n---\n# Fallback Heading\n')).toBe(
 			"Fallback Heading",
 		);
+	});
+});
+
+// ─── dedupeFolders: collapse KB folders that share one repo identity ───────────
+// Archive target is `<parent>/.jolli/archive/` (hidden, recoverable) — same path
+// the Migrate-to-Memory-Bank flow uses. seedRepo writes a `.jolli/config.json`,
+// so the archive of that folder is deterministically under the parent's
+// `.jolli/archive` dir.
+
+describe("KbFoldersService.dedupeFolders", () => {
+	let tmpParent: string;
+	let svc: KbFoldersService;
+
+	beforeEach(() => {
+		tmpParent = mkdtempSync(join(tmpdir(), "kbfolders-dedupe-"));
+		svc = new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName: null,
+			currentRemoteUrl: null,
+		}));
+	});
+	afterEach(() => {
+		rmSync(tmpParent, { recursive: true, force: true });
+	});
+
+	function archivedDir(): string {
+		return join(tmpParent, ".jolli", "archive");
+	}
+	/** Give `<parent>/<dirName>` an `index.json` carrying `count` summaries. */
+	function seedIndex(parent: string, dirName: string, count: number): void {
+		writeFileSync(
+			join(parent, dirName, ".jolli", "index.json"),
+			JSON.stringify({
+				version: 3,
+				entries: Array.from({ length: count }, (_, i) => ({
+					commitHash: `${dirName}${i}`.padEnd(40, "0"),
+					parentCommitHash: null,
+				})),
+			}),
+			"utf-8",
+		);
+	}
+	function isArchived(dirName: string): boolean {
+		const a = archivedDir();
+		if (!existsSync(a)) return false;
+		return readdirSync(a).some((n) => n.startsWith(`${dirName}-`));
+	}
+
+	it("collapses the base + -2 duplicate where the shadow has a null remote", async () => {
+		// The classic symptom: `jolliai` carries the real URL, the auto-
+		// spawned `jolliai-2` got remoteUrl:null (e.g. a git timeout). Both
+		// share repoName `jolliai`. The null-remote shadow must be archived,
+		// the base kept.
+		seedRepo(tmpParent, "jolliai", {
+			repoName: "jolliai",
+			remoteUrl: "https://github.com/o/jolliai.git",
+		});
+		seedRepo(tmpParent, "jolliai-2", {
+			repoName: "jolliai",
+			remoteUrl: null,
+		});
+		const archived = await svc.dedupeFolders();
+		expect(archived).toHaveLength(1);
+		expect(archived[0]).toBe(join(tmpParent, "jolliai-2"));
+		expect(existsSync(join(tmpParent, "jolliai"))).toBe(true);
+		expect(isArchived("jolliai-2")).toBe(true);
+	});
+
+	it("collapses two folders that share an identical non-null remote", async () => {
+		// Same URL byte-for-byte in both configs — the simplest dupe shape.
+		seedRepo(tmpParent, "repo", {
+			repoName: "repo",
+			remoteUrl: "https://github.com/o/repo.git",
+		});
+		seedRepo(tmpParent, "repo-2", {
+			repoName: "repo",
+			remoteUrl: "https://github.com/o/repo.git",
+		});
+		const archived = await svc.dedupeFolders();
+		expect(archived).toEqual([join(tmpParent, "repo-2")]);
+		expect(existsSync(join(tmpParent, "repo"))).toBe(true);
+	});
+
+	it("collapses an SSH clone against its HTTPS twin (remotes canonicalized)", async () => {
+		// The legacy SSH-vs-HTTPS pile: two configs holding the SAME repo in
+		// two transports. Compared raw they look like distinct remotes and the
+		// group is skipped as "forks"; they only collapse because the remote
+		// comparison folds transports via `normalizeRemoteUrl`, the same
+		// comparer `isSameRepo` uses.
+		seedRepo(tmpParent, "repo", {
+			repoName: "repo",
+			remoteUrl: "git@github.com:o/repo.git",
+		});
+		seedRepo(tmpParent, "repo-2", {
+			repoName: "repo",
+			remoteUrl: "https://github.com/o/repo",
+		});
+		const archived = await svc.dedupeFolders();
+		expect(archived).toEqual([join(tmpParent, "repo-2")]);
+		expect(existsSync(join(tmpParent, "repo"))).toBe(true);
+	});
+
+	it("keeps the folder holding the real remote even when it is the suffixed one", async () => {
+		// Reversed shadow: the BASE was claimed while `git` returned no remote
+		// and `<repo>-2` carries the real URL — so `resolveKBPath` resolves
+		// writes to `-2` (the base fails `isSameRepo` against a real remote).
+		// Archiving `-2` here would bury the live folder, `resolveKBPath` would
+		// re-claim an empty `-2`, and the next Refresh would archive that one
+		// too — one archived directory per refresh, forever.
+		seedRepo(tmpParent, "shadow", { repoName: "shadow", remoteUrl: null });
+		seedRepo(tmpParent, "shadow-2", {
+			repoName: "shadow",
+			remoteUrl: "https://github.com/o/shadow.git",
+		});
+		const archived = await svc.dedupeFolders();
+		expect(archived).toEqual([join(tmpParent, "shadow")]);
+		expect(existsSync(join(tmpParent, "shadow-2"))).toBe(true);
+		expect(isArchived("shadow")).toBe(true);
+	});
+
+	it("keeps the folder with the most memories over the lower suffix", async () => {
+		// Archiving is a plain move — nothing re-migrates the loser into the
+		// winner — so the populated folder must always survive, even when the
+		// empty one owns the base slot and the real remote.
+		seedRepo(tmpParent, "rich", {
+			repoName: "rich",
+			remoteUrl: "https://github.com/o/rich.git",
+		});
+		seedIndex(tmpParent, "rich", 0);
+		seedRepo(tmpParent, "rich-2", {
+			repoName: "rich",
+			remoteUrl: "https://github.com/o/rich.git",
+		});
+		seedIndex(tmpParent, "rich-2", 12);
+		const archived = await svc.dedupeFolders();
+		expect(archived).toEqual([join(tmpParent, "rich")]);
+		expect(existsSync(join(tmpParent, "rich-2"))).toBe(true);
+	});
+
+	it("keeps the base folder when both have null remotes (local-only shadow)", async () => {
+		// Two local-only folders sharing a basename: keep the canonical base,
+		// archive the suffixed shadow. A lone local-only folder alone is NOT
+		// touched (covered below).
+		seedRepo(tmpParent, "local", { repoName: "local", remoteUrl: null });
+		seedRepo(tmpParent, "local-2", { repoName: "local", remoteUrl: null });
+		const archived = await svc.dedupeFolders();
+		expect(archived).toEqual([join(tmpParent, "local-2")]);
+		expect(existsSync(join(tmpParent, "local"))).toBe(true);
+	});
+
+	it("never merges two repos that share a basename but have distinct remotes", async () => {
+		// Forks named the same — different repos, must both survive. The
+		// user's "no remote URL" heuristic would wrongly delete one of these
+		// if applied naively; this rule protects them.
+		seedRepo(tmpParent, "shared", {
+			repoName: "shared",
+			remoteUrl: "https://github.com/a/shared.git",
+		});
+		seedRepo(tmpParent, "shared-2", {
+			repoName: "shared",
+			remoteUrl: "https://github.com/b/shared.git",
+		});
+		const archived = await svc.dedupeFolders();
+		expect(archived).toEqual([]);
+		expect(existsSync(join(tmpParent, "shared"))).toBe(true);
+		expect(existsSync(join(tmpParent, "shared-2"))).toBe(true);
+	});
+
+	it("leaves a single folder (no duplicate) untouched", async () => {
+		seedRepo(tmpParent, "solo", {
+			repoName: "solo",
+			remoteUrl: "https://github.com/o/solo.git",
+		});
+		const archived = await svc.dedupeFolders();
+		expect(archived).toEqual([]);
+		expect(existsSync(join(tmpParent, "solo"))).toBe(true);
+	});
+
+	it("preserves a lone local-only folder (no remote) — not all null-remote folders are dupes", async () => {
+		// Directly contradicts the naive "delete folders without a remote
+		// URL" rule: a single local-only repo is legitimate and must remain.
+		seedRepo(tmpParent, "lonely", { repoName: "lonely", remoteUrl: null });
+		const archived = await svc.dedupeFolders();
+		expect(archived).toEqual([]);
+		expect(existsSync(join(tmpParent, "lonely"))).toBe(true);
 	});
 });
