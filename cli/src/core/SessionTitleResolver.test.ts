@@ -177,6 +177,29 @@ describe("PARSE_LINE stubs for discoverer-titled sources", () => {
 	);
 });
 
+// Kimi's parser is NOT a no-op stub (state.json often carries no title, so the
+// fallback must recover the first user prompt from the ACP wire.jsonl). Pin that
+// it extracts a `session/prompt` frame's text and declines everything else.
+describe("PARSE_LINE for kimi", () => {
+	it("extracts the session/prompt text and declines other frames", async () => {
+		vi.mocked(readFirstUserMessageTitle).mockResolvedValueOnce("(untitled session)");
+		await resolveSessionTitle({
+			sessionId: "s1",
+			transcriptPath: "/tmp/wire.jsonl",
+			updatedAt: "2026-05-15T00:00:00Z",
+			source: "kimi",
+		});
+		const { parseLine } = vi.mocked(readFirstUserMessageTitle).mock.calls.at(-1)?.[0] ?? {};
+		expect(parseLine).toBeTypeOf("function");
+		expect(parseLine?.('{"type":"turn.prompt","input":[{"type":"text","text":"hi there"}],"time":1}')).toBe(
+			"hi there",
+		);
+		expect(parseLine?.('{"type":"turn.prompt","input":"bare"}')).toBe("bare");
+		expect(parseLine?.('{"type":"context.append_loop_event","event":{}}')).toBeUndefined();
+		expect(parseLine?.("not json")).toBeUndefined();
+	});
+});
+
 // `firstUserMessageTitleFromEntries` is a pure helper exposed for the
 // sidebar aggregator's "load once, derive both count and title" shortcut.
 // Tested directly so the mergedEntries→title contract stays pinned even if

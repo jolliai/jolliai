@@ -68,6 +68,7 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).toContain('id="copilotEnabled"');
 		expect(html).toContain('id="clineEnabled"');
 		expect(html).toContain('id="antigravityEnabled"');
+		expect(html).toContain('id="kimiEnabled"');
 	});
 
 	it("does not render a separate Cursor CLI toggle (shares the Cursor toggle)", () => {

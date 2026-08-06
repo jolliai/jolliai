@@ -2481,7 +2481,7 @@ ${buildSourceLabelScript()}
       if (conversationsStats) {
         var sessionCounts = msg.sessionCounts || {};
         var parts = [];
-        var sourceOrder = ['claude', 'codex', 'gemini', 'opencode', 'cursor', 'cursor-cli', 'copilot', 'copilot-chat', 'cline', 'cline-cli', 'devin', 'antigravity'];
+        var sourceOrder = ['claude', 'codex', 'gemini', 'opencode', 'cursor', 'cursor-cli', 'copilot', 'copilot-chat', 'cline', 'cline-cli', 'devin', 'antigravity', 'kimi'];
         for (var i = 0; i < sourceOrder.length; i++) {
           var source = sourceOrder[i];
           var count = sessionCounts[source] || 0;

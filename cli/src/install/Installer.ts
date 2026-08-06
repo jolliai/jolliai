@@ -42,6 +42,7 @@ import { isDevinInstalled, isDevinPresent, scanDevinSessions } from "../core/Dev
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
 import { getProjectRootDir, isInsideGitRepo, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
 import { resolveMemoryBankState } from "../core/KBPathResolver.js";
+import { isKimiInstalled } from "../core/KimiSessionDiscoverer.js";
 import { acquireRepoHooksLock, type StrictLockHandle, withRuntimeRegistryLock } from "../core/Locks.js";
 import { applyPluginInitLocalAgentTool, pluginBootstrapHost } from "../core/localagent/PluginDefaults.js";
 import { localAgentToolLabel } from "../core/localagent/ToolMeta.js";
@@ -1168,6 +1169,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	const clineCliDetected = await isClineCliInstalled();
 	const clineDetected = clineVscodeDetected || clineCliDetected;
 	const antigravityDetected = await isAntigravityInstalled();
+	const kimiDetected = await isKimiInstalled();
 
 	// Check if we can enumerate worktrees; falls back gracefully if not a git repo
 	let enabledWorktrees: number | undefined;
@@ -1403,6 +1405,8 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		antigravityDetected,
 		antigravityEnabled: config.antigravityEnabled,
 		antigravityScanError,
+		kimiDetected,
+		kimiEnabled: config.kimiEnabled,
 		globalConfigDir,
 		worktreeStatePath,
 		memoryBank,

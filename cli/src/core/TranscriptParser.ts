@@ -170,6 +170,133 @@ export class CodexTranscriptParser implements TranscriptParser {
 }
 
 /**
+ * Kimi Code CLI transcript parser.
+ *
+ * Kimi Code (`@kimi-code/cli`, `~/.kimi-code`) records the main agent's
+ * conversation to `agents/main/wire.jsonl` — its own JSON-lines wire protocol
+ * (NOT raw ACP), one event per line, each tagged with a top-level `type` and a
+ * millisecond-epoch `time`. Pinned to a real capture (kimi-code, Aug 2026), only
+ * two event kinds carry conversation text:
+ *
+ *   - USER turn — `turn.prompt`, whose `input` is an array of `{type:"text",text}`
+ *     content blocks (or a bare string):
+ *       {"type":"turn.prompt","input":[{"type":"text","text":"…"}],"origin":{"kind":"user"},"time":…}
+ *   - ASSISTANT turn — a `content.part` of `part.type:"text"`, delivered inside a
+ *     `context.append_loop_event` envelope (streamed, one part per line — merged
+ *     downstream by mergeConsecutiveEntries, exactly like Claude's streamed blocks):
+ *       {"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"…"}},"time":…}
+ *
+ * Deliberately skipped: `content.part` of `part.type:"think"` (the model's
+ * reasoning — noise, like Claude's thinking blocks), `context.append_message`
+ * (a replayed copy of the user prompt plus injected `<system-reminder>` blocks —
+ * parsing `turn.prompt` instead keeps the genuine input and drops the noise),
+ * `step.*`, `usage.record`, `llm.*`, `tools.*`, `config.update`, `metadata`,
+ * `permission.set_mode`. This mirrors the Claude/Codex rule: keep only human +
+ * assistant text; the git diff already captures the code. Parsing is defensive
+ * (unknown shapes → no entry, never a throw). Token/cost accounting is not
+ * attempted — the same gap OpenCode/Cursor carry.
+ *
+ * NOTE: the working directory is NOT in wire.jsonl at all — it lives in the
+ * session's sibling `state.json` (`workDir`), which is where
+ * {@link discoverKimiSessions} recovers it.
+ */
+export class KimiTranscriptParser implements TranscriptParser {
+	parseLine(line: string, lineNum: number): TranscriptEntry | null {
+		try {
+			const data = JSON.parse(line) as Record<string, unknown>;
+			const type = data.type;
+			const timestamp = kimiFrameTimestamp(data);
+
+			if (type === "turn.prompt") {
+				const text = extractKimiText(data.input)?.trim();
+				return text ? { role: "human", content: text, timestamp } : null;
+			}
+
+			// Assistant text arrives as a `content.part` (part.type "text"), normally
+			// wrapped in a `context.append_loop_event`. Accept the unwrapped form too.
+			const part = kimiContentPart(data);
+			if (part && part.type === "text") {
+				const text = typeof part.text === "string" ? part.text.trim() : "";
+				return text ? { role: "assistant", content: text, timestamp } : null;
+			}
+
+			return null;
+		} catch (error: unknown) {
+			log.debug("Failed to parse Kimi transcript line %d: %s", lineNum, (error as Error).message);
+			return null;
+		}
+	}
+
+	parseTimestamp(line: string, _lineNum?: number): string | undefined {
+		try {
+			return kimiFrameTimestamp(JSON.parse(line) as Record<string, unknown>);
+		} catch {
+			return undefined;
+		}
+	}
+}
+
+/**
+ * Extracts the `content.part` object from a Kimi wire event, whether it arrives
+ * wrapped in a `context.append_loop_event` (the observed shape) or as a bare
+ * top-level `content.part`. Returns null for any other event.
+ */
+function kimiContentPart(data: Record<string, unknown>): Record<string, unknown> | null {
+	if (data.type === "context.append_loop_event") {
+		const event = data.event as Record<string, unknown> | undefined;
+		if (event?.type === "content.part" && event.part && typeof event.part === "object") {
+			return event.part as Record<string, unknown>;
+		}
+		return null;
+	}
+	if (data.type === "content.part" && data.part && typeof data.part === "object") {
+		return data.part as Record<string, unknown>;
+	}
+	return null;
+}
+
+/**
+ * Extracts an ISO timestamp from a Kimi wire event. Every event carries a `time`
+ * field as a millisecond epoch; a string `timestamp` is also accepted. Returns
+ * undefined when neither is present — the reader then conservatively includes the
+ * line under a `beforeTimestamp` cutoff.
+ */
+function kimiFrameTimestamp(data: Record<string, unknown>): string | undefined {
+	const t = data.time ?? data.timestamp;
+	if (typeof t === "number" && Number.isFinite(t)) {
+		return new Date(t).toISOString();
+	}
+	return typeof t === "string" && t.length > 0 ? t : undefined;
+}
+
+/**
+ * Normalises a Kimi content value to plain text. Handles a bare string, a single
+ * `{ type: "text", text }` block, and an array of either (joining with newlines,
+ * mirroring the Claude reader's block join). Non-text blocks (image/resource) are
+ * dropped. Returns null when nothing textual is present.
+ */
+export function extractKimiText(value: unknown): string | null {
+	if (typeof value === "string") {
+		return value.length > 0 ? value : null;
+	}
+	if (Array.isArray(value)) {
+		const parts: string[] = [];
+		for (const block of value) {
+			const text = extractKimiText(block);
+			if (text) parts.push(text);
+		}
+		return parts.length > 0 ? parts.join("\n") : null;
+	}
+	if (value !== null && typeof value === "object") {
+		const b = value as Record<string, unknown>;
+		if ((b.type === "text" || b.type === undefined) && typeof b.text === "string" && b.text.length > 0) {
+			return b.text;
+		}
+	}
+	return null;
+}
+
+/**
  * Extracts user text from a Codex `event_msg/user_message` payload.
  * Returns null if the message field is missing or empty.
  */
@@ -282,16 +409,19 @@ export function extractClaudeUsageFromRecord(record: unknown): ClaudeTurnUsage |
 
 const claudeParser = new ClaudeTranscriptParser();
 const codexParser = new CodexTranscriptParser();
+const kimiParser = new KimiTranscriptParser();
 
 /**
  * Factory function returning the appropriate JSONL parser for a given transcript source.
  * Gemini uses a dedicated JSON reader (readGeminiTranscript) instead of this line-based parser.
  * Parsers are stateless singletons — safe to reuse across sessions.
  */
-export function getParserForSource(source: "claude" | "codex"): TranscriptParser {
+export function getParserForSource(source: "claude" | "codex" | "kimi"): TranscriptParser {
 	switch (source) {
 		case "codex":
 			return codexParser;
+		case "kimi":
+			return kimiParser;
 		case "claude":
 			return claudeParser;
 	}

@@ -301,6 +301,7 @@ internal class SourceBadge private constructor(label: String, private val badgeC
 			TranscriptSource.`copilot-chat` to JBColor(Color(45, 164, 78), Color(45, 164, 78)),
 			TranscriptSource.devin to JBColor(Color(212, 212, 216), Color(212, 212, 216)),
 			TranscriptSource.antigravity to JBColor(Color(244, 114, 182), Color(244, 114, 182)),
+			TranscriptSource.kimi to JBColor(Color(167, 139, 250), Color(167, 139, 250)),
 		)
 	}
 }

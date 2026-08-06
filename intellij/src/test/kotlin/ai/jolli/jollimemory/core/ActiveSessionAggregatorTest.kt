@@ -43,6 +43,7 @@ class ActiveSessionAggregatorTest {
 		"cline-cli",
 		"devin",
 		"antigravity",
+		"kimi",
 	)
 
 	@Test

@@ -201,6 +201,7 @@ class SettingsDialog(
     private val copilotEnabledCheckbox = JBCheckBox("GitHub Copilot — CLI session-store scan + VS Code Chat workspace storage", true)
     private val clineEnabledCheckbox = JBCheckBox("Cline — Cline CLI (~/.cline/data/sessions) + Cline VS Code extension (globalStorage)", true)
     private val antigravityEnabledCheckbox = JBCheckBox("Antigravity — Session discovery via Antigravity's per-conversation store (~/.gemini/antigravity*)", true)
+    private val kimiEnabledCheckbox = JBCheckBox("Kimi Code — Session discovery via Kimi Code CLI's store (~/.kimi-code/sessions)", true)
     private val globalInstructionsCheckbox = JBCheckBox(
         "Let AI assistants use Jolli's skills automatically " +
             "(adds a preference block to ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md, ~/.codex/AGENTS.md)",
@@ -293,6 +294,7 @@ class SettingsDialog(
             .addComponent(copilotEnabledCheckbox, 4)
             .addComponent(clineEnabledCheckbox, 4)
             .addComponent(antigravityEnabledCheckbox, 4)
+            .addComponent(kimiEnabledCheckbox, 4)
             .panel))
 
         panel.add(JBLabel(
@@ -872,7 +874,7 @@ class SettingsDialog(
             !geminiEnabledCheckbox.isSelected && !openCodeEnabledCheckbox.isSelected &&
             !cursorEnabledCheckbox.isSelected && !devinEnabledCheckbox.isSelected &&
             !copilotEnabledCheckbox.isSelected && !clineEnabledCheckbox.isSelected &&
-            !antigravityEnabledCheckbox.isSelected
+            !antigravityEnabledCheckbox.isSelected && !kimiEnabledCheckbox.isSelected
         ) {
             return ValidationInfo("At least one platform must be enabled", claudeEnabledCheckbox)
         }
@@ -978,6 +980,7 @@ class SettingsDialog(
             copilotEnabled = copilotEnabledCheckbox.isSelected,
             clineEnabled = clineEnabledCheckbox.isSelected,
             antigravityEnabled = antigravityEnabledCheckbox.isSelected,
+            kimiEnabled = kimiEnabledCheckbox.isSelected,
             excludePatterns = if (excludePatterns.isNotEmpty()) excludePatterns else null,
             aiProvider = null,
             localAgentTool = null,
@@ -1837,6 +1840,7 @@ class SettingsDialog(
         copilotEnabledCheckbox.isSelected = config.copilotEnabled != false
         clineEnabledCheckbox.isSelected = config.clineEnabled != false
         antigravityEnabledCheckbox.isSelected = config.antigravityEnabled != false
+        kimiEnabledCheckbox.isSelected = config.kimiEnabled != false
         dcoSignoffCheckbox.isSelected = config.dcoSignoff == true
         // Telemetry: on unless the shared opt-out flag says "off" (default on).
         telemetryCheckbox.isSelected = config.telemetry != "off"

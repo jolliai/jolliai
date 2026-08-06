@@ -26,6 +26,7 @@ export const TRANSCRIPT_SOURCE_LABELS: Readonly<Record<TranscriptSource, string>
 	"cline-cli": "Cline CLI",
 	devin: "Devin",
 	antigravity: "Antigravity",
+	kimi: "Kimi Code",
 };
 
 export function transcriptSourceLabel(source: TranscriptSource | undefined): string {

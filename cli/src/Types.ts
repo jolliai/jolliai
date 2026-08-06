@@ -29,6 +29,7 @@ export const TRANSCRIPT_SOURCES = [
 	"cline-cli",
 	"devin",
 	"antigravity",
+	"kimi",
 ] as const;
 
 /** Which AI coding agent produced the transcript. Derived from the runtime allowlist. */
@@ -1559,6 +1560,8 @@ export interface JolliMemoryConfig {
 	readonly devinEnabled?: boolean;
 	/** Enable Antigravity (Gemini agentic IDE/CLI) session discovery at post-commit time (default: auto-detect) */
 	readonly antigravityEnabled?: boolean;
+	/** Enable Kimi Code CLI (~/.kimi-code) session discovery at post-commit time (default: auto-detect) */
+	readonly kimiEnabled?: boolean;
 	/** Global minimum log level written to debug.log (default: "info") */
 	readonly logLevel?: LogLevel;
 	/** Per-module log level overrides (e.g. { "GitOps": "debug" }) */
@@ -1870,6 +1873,10 @@ export interface StatusInfo {
 	 * adjacent to the Antigravity row instead of silently rendering "0 sessions".
 	 */
 	readonly antigravityScanError?: SqliteScanError;
+	/** Whether the Kimi Code CLI data directory (~/.kimi-code) was detected */
+	readonly kimiDetected?: boolean;
+	/** Whether Kimi session discovery is enabled in config (undefined = auto-detect) */
+	readonly kimiEnabled?: boolean;
 	/** Directory path for global config (~/.jolli/jollimemory) */
 	readonly globalConfigDir?: string;
 	/** Path to the worktree state directory */

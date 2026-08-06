@@ -147,6 +147,7 @@ export function buildNextMemoryScript(): string {
       case 'devin': return 'Devin';
       case 'cursor-cli': return 'Cursor CLI';
       case 'antigravity': return 'Antigravity';
+      case 'kimi': return 'Kimi Code';
       default: return source;
     }
   }

@@ -19,7 +19,7 @@ import com.google.gson.annotations.SerializedName
  * non-null contract). A missing enum member here therefore crashes the sidebar
  * with an NPE the moment the user has a session from that source. Add new
  * members whenever the CLI adds a new agent; the lockstep is enforced by
- * ActiveSessionAggregatorTest's round-trip over all 12 members.
+ * ActiveSessionAggregatorTest's round-trip over all 13 members.
  */
 enum class TranscriptSource {
 	claude,
@@ -34,6 +34,7 @@ enum class TranscriptSource {
 	`cline-cli`,
 	devin,
 	antigravity,
+	kimi,
 }
 
 /** Metadata about an AI coding session */
@@ -649,6 +650,8 @@ data class JolliMemoryConfig(
     val devinEnabled: Boolean? = null,
     /** Antigravity — per-conversation store under the Gemini config dir (~/.gemini/antigravity variants). */
     val antigravityEnabled: Boolean? = null,
+    /** Kimi Code CLI (~/.kimi-code/sessions). */
+    val kimiEnabled: Boolean? = null,
     /**
      * Tri-state consent for the machine-global skill-preference block written into
      * ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md, ~/.codex/AGENTS.md: "enabled" /
@@ -803,6 +806,8 @@ data class StatusInfo(
     val antigravityDetected: Boolean? = null,
     val antigravityEnabled: Boolean? = null,
     val antigravityScanError: SqliteScanError? = null,
+    val kimiDetected: Boolean? = null,
+    val kimiEnabled: Boolean? = null,
     /** Node.js resolvable on PATH — required for the MCP server + full skill set. */
     val nodeAvailable: Boolean = true,
     /** MCP + full skills are set up (bundled CLI extracted and version-matched). */

@@ -467,6 +467,20 @@ function buildFullStatusItems(
 		);
 	}
 
+	// Kimi Code CLI: sessions discovered from ~/.kimi-code/sessions (plain JSONL,
+	// no agent hook, no SQLite — so no scan-error channel).
+	pushIntegrationItem(
+		items,
+		s.kimiDetected ?? false,
+		s.kimiEnabled !== false,
+		undefined,
+		"Kimi Code Integration",
+		"Kimi Code sessions found — session discovery is enabled",
+		"Kimi Code detected but session discovery is disabled in config",
+		undefined,
+		counts.kimi,
+	);
+
 	if (extensionOutdated) {
 		items.push(
 			new StatusItem(

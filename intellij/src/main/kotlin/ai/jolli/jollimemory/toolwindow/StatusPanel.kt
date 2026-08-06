@@ -394,6 +394,18 @@ class StatusPanel(
             }
         }
 
+        // 15. Kimi Code Integration (no hooks needed — just detection; no scan error channel)
+        if (status.kimiDetected == true) {
+            addIntegrationRow(
+                enabled = config.kimiEnabled != false,
+                hookInstalled = null,
+                label = "Kimi Code Integration",
+                enabledTooltip = "Kimi Code detected — session discovery is enabled",
+                disabledTooltip = "Kimi Code detected but session discovery is disabled in config",
+                hookMissingTooltip = null,
+            )
+        }
+
         add(JBScrollPane(statusList), BorderLayout.CENTER)
 
         revalidate(); repaint()

@@ -7,7 +7,13 @@ beforeAll(() => {
 	vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
-import { ClaudeTranscriptParser, CodexTranscriptParser, getParserForSource } from "./TranscriptParser.js";
+import {
+	ClaudeTranscriptParser,
+	CodexTranscriptParser,
+	extractKimiText,
+	getParserForSource,
+	KimiTranscriptParser,
+} from "./TranscriptParser.js";
 
 // ─── CodexTranscriptParser ───────────────────────────────────────────────────
 
@@ -483,6 +489,115 @@ describe("ClaudeTranscriptParser", () => {
 	});
 });
 
+// ─── KimiTranscriptParser ────────────────────────────────────────────────────
+
+describe("KimiTranscriptParser", () => {
+	const parser = new KimiTranscriptParser();
+
+	it("parses a turn.prompt event into a human entry (input array + ms-epoch time)", () => {
+		const line = JSON.stringify({
+			type: "turn.prompt",
+			input: [{ type: "text", text: "Refactor the reader" }],
+			origin: { kind: "user" },
+			time: 1785887000029,
+		});
+		expect(parser.parseLine(line, 0)).toEqual({
+			role: "human",
+			content: "Refactor the reader",
+			timestamp: new Date(1785887000029).toISOString(),
+		});
+	});
+
+	it("parses a content.part text (wrapped in context.append_loop_event) into an assistant entry", () => {
+		const line = JSON.stringify({
+			type: "context.append_loop_event",
+			event: { type: "content.part", part: { type: "text", text: "Done." } },
+			time: 1785887143120,
+		});
+		expect(parser.parseLine(line, 0)).toEqual({
+			role: "assistant",
+			content: "Done.",
+			timestamp: new Date(1785887143120).toISOString(),
+		});
+	});
+
+	it("accepts a bare (unwrapped) content.part and a string turn.prompt input", () => {
+		expect(
+			parser.parseLine(JSON.stringify({ type: "content.part", part: { type: "text", text: "yo" } }), 0),
+		).toEqual({ role: "assistant", content: "yo", timestamp: undefined });
+		expect(parser.parseLine(JSON.stringify({ type: "turn.prompt", input: "hello" }), 0)).toEqual({
+			role: "human",
+			content: "hello",
+			timestamp: undefined,
+		});
+	});
+
+	it("skips think parts, non-text parts, empty text, and non-conversation events", () => {
+		// reasoning
+		expect(
+			parser.parseLine(
+				JSON.stringify({
+					type: "context.append_loop_event",
+					event: { type: "content.part", part: { type: "think", think: "hmm" } },
+				}),
+				0,
+			),
+		).toBeNull();
+		// empty assistant text
+		expect(
+			parser.parseLine(
+				JSON.stringify({
+					type: "context.append_loop_event",
+					event: { type: "content.part", part: { type: "text", text: "  " } },
+				}),
+				0,
+			),
+		).toBeNull();
+		// a loop event that is not a content.part
+		expect(
+			parser.parseLine(JSON.stringify({ type: "context.append_loop_event", event: { type: "step.begin" } }), 0),
+		).toBeNull();
+		// the replayed user message copy is skipped (turn.prompt is the canonical user turn)
+		expect(
+			parser.parseLine(
+				JSON.stringify({ type: "context.append_message", message: { role: "user", content: [] } }),
+				0,
+			),
+		).toBeNull();
+		// unrelated events
+		expect(parser.parseLine(JSON.stringify({ type: "usage.record", time: 1 }), 0)).toBeNull();
+		expect(parser.parseLine(JSON.stringify({ type: "metadata" }), 0)).toBeNull();
+	});
+
+	it("returns null for malformed JSON", () => {
+		expect(parser.parseLine("{not json", 0)).toBeNull();
+	});
+
+	it("parseTimestamp reads the ms-epoch time, a string timestamp, and undefined otherwise", () => {
+		expect(parser.parseTimestamp(JSON.stringify({ time: 1785887143120 }))).toBe(
+			new Date(1785887143120).toISOString(),
+		);
+		expect(parser.parseTimestamp(JSON.stringify({ timestamp: "2026-08-06T00:00:00.000Z" }))).toBe(
+			"2026-08-06T00:00:00.000Z",
+		);
+		expect(parser.parseTimestamp(JSON.stringify({ foo: 1 }))).toBeUndefined();
+		expect(parser.parseTimestamp("nope")).toBeUndefined();
+	});
+});
+
+describe("extractKimiText", () => {
+	it("handles a string, a text block, an array, and drops non-text", () => {
+		expect(extractKimiText("hi")).toBe("hi");
+		expect(extractKimiText({ type: "text", text: "hi" })).toBe("hi");
+		expect(extractKimiText([{ type: "text", text: "a" }, { type: "image" }, { type: "text", text: "b" }])).toBe(
+			"a\nb",
+		);
+		expect(extractKimiText({ type: "image", data: "…" })).toBeNull();
+		expect(extractKimiText("")).toBeNull();
+		expect(extractKimiText(42)).toBeNull();
+	});
+});
+
 // ─── getParserForSource factory ──────────────────────────────────────────────
 
 describe("getParserForSource", () => {
@@ -494,6 +609,11 @@ describe("getParserForSource", () => {
 	it("returns CodexTranscriptParser for 'codex'", () => {
 		const parser = getParserForSource("codex");
 		expect(parser).toBeInstanceOf(CodexTranscriptParser);
+	});
+
+	it("returns KimiTranscriptParser for 'kimi'", () => {
+		const parser = getParserForSource("kimi");
+		expect(parser).toBeInstanceOf(KimiTranscriptParser);
 	});
 
 	it("returns the same singleton instances on repeated calls", () => {

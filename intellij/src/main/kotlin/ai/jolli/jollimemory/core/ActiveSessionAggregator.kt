@@ -33,6 +33,7 @@ object ActiveSessionAggregator {
 			TranscriptSource.`cline-cli` -> config.clineEnabled != false
 			TranscriptSource.devin -> config.devinEnabled != false
 			TranscriptSource.antigravity -> config.antigravityEnabled != false
+			TranscriptSource.kimi -> config.kimiEnabled != false
 		}
 	}
 

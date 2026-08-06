@@ -72,6 +72,7 @@ interface SettingsPayload {
 	readonly copilotEnabled: boolean;
 	readonly clineEnabled: boolean;
 	readonly antigravityEnabled: boolean;
+	readonly kimiEnabled: boolean;
 	/** Tri-state config switch (undecided | "enabled" | "disabled") flattened to a checkbox; see handleApplySettings for the enable/disable/preserve-undecided persistence rules. */
 	readonly globalInstructions: boolean;
 	readonly localFolder: string;
@@ -653,6 +654,7 @@ export class SettingsWebviewPanel {
 			copilotEnabled: config.copilotEnabled !== false,
 			clineEnabled: config.clineEnabled !== false,
 			antigravityEnabled: config.antigravityEnabled !== false,
+			kimiEnabled: config.kimiEnabled !== false,
 			globalInstructions: config.globalInstructions === "enabled",
 			localFolder: config.localFolder ?? "",
 			// `resolveMemoryBankState` peeks (never claims), so merely opening
@@ -813,6 +815,7 @@ export class SettingsWebviewPanel {
 			copilotEnabled: settings.copilotEnabled,
 			clineEnabled: settings.clineEnabled,
 			antigravityEnabled: settings.antigravityEnabled,
+			kimiEnabled: settings.kimiEnabled,
 			...giUpdate,
 			localFolder:
 				settings.localFolder && settings.localFolder.length > 0

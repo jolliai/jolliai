@@ -31,6 +31,7 @@ class TypesTest {
                 "cline-cli",
                 "devin",
                 "antigravity",
+                "kimi",
             )
         }
 

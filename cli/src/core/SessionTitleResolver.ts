@@ -37,6 +37,7 @@ const PARSE_LINE: Record<TranscriptSource, (line: string) => string | undefined>
 	devin: parseDevinUserLine,
 	"cursor-cli": parseCursorCliUserLine,
 	antigravity: parseAntigravityUserLine,
+	kimi: parseKimiUserLine,
 };
 
 /**
@@ -217,6 +218,17 @@ function parseCopilotChatUserLine(line: string): string | undefined {
 function parseClineUserLine(_line: string): string | undefined {
 	// Cline extension sessions carry SessionInfo.title from taskHistory.task.
 	return undefined;
+}
+
+function parseKimiUserLine(line: string): string | undefined {
+	// Kimi Code CLI wire.jsonl is Kimi's own JSON-lines wire protocol. A user turn
+	// is a `turn.prompt` event whose `input` is an array of content blocks
+	// (`{ type: "text", text }`) or a bare string. Only used as a fallback when
+	// state.json carried no title. See KimiTranscriptParser for the full schema.
+	const obj = safeParse(line);
+	if (!obj) return undefined;
+	if ((obj as { type?: unknown }).type !== "turn.prompt") return undefined;
+	return stringifyContent((obj as { input?: unknown }).input);
 }
 
 function parseClineCliUserLine(_line: string): string | undefined {

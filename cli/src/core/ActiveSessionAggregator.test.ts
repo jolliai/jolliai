@@ -935,6 +935,7 @@ describe("isSourceEnabled", () => {
 			"cline-cli",
 			"devin",
 			"antigravity",
+			"kimi",
 		] as const;
 		for (const s of sources) {
 			expect(isSourceEnabled(s, {})).toBe(true);
@@ -948,6 +949,7 @@ describe("isSourceEnabled", () => {
 		expect(isSourceEnabled("opencode", { openCodeEnabled: false })).toBe(false);
 		expect(isSourceEnabled("devin", { devinEnabled: false })).toBe(false);
 		expect(isSourceEnabled("antigravity", { antigravityEnabled: false })).toBe(false);
+		expect(isSourceEnabled("kimi", { kimiEnabled: false })).toBe(false);
 	});
 
 	it("groups cursor + cursor-cli under a single cursorEnabled toggle", () => {

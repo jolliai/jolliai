@@ -129,6 +129,7 @@ object SessionTitleResolver {
 		TranscriptSource.`cline-cli` -> { _ -> null }
 		TranscriptSource.devin -> { _ -> null }
 		TranscriptSource.antigravity -> { _ -> null }
+		TranscriptSource.kimi -> { _ -> null } // Kimi carries a discoverer-supplied title
 	}
 
 	private fun parseClaudeUserLine(line: String): String? {

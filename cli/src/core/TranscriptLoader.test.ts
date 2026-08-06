@@ -172,6 +172,24 @@ describe("loadTranscript", () => {
 		expect(result).toEqual([]);
 	});
 
+	it("loads kimi wire.jsonl extracting turn.prompt + content.part text (skipping think)", async () => {
+		const file = join(dir, "wire.jsonl");
+		writeFileSync(
+			file,
+			[
+				'{"type":"metadata","protocol_version":1}',
+				'{"type":"turn.prompt","input":[{"type":"text","text":"do it"}],"time":1785887000029}',
+				'{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"think","think":"planning"}},"time":1785887000030}',
+				'{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"done"}},"time":1785887000031}',
+				"",
+			].join("\n"),
+		);
+		const result = await loadTranscript({ source: "kimi", transcriptPath: file });
+		expect(result).toHaveLength(2);
+		expect(result[0]).toMatchObject({ role: "human", content: "do it" });
+		expect(result[1]).toMatchObject({ role: "assistant", content: "done" });
+	});
+
 	it("loads gemini (single JSON document, via GeminiTranscriptReader)", async () => {
 		const file = join(dir, "gemini-session.json");
 		writeFileSync(

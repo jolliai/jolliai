@@ -144,6 +144,7 @@ describe("ActiveSessionsProvider", () => {
 			"cursor-cli",
 			"devin",
 			"gemini",
+			"kimi",
 			"opencode",
 		]);
 		expect(log.warn).toHaveBeenCalledTimes(1);

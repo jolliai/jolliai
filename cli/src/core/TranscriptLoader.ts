@@ -197,6 +197,7 @@ type JsonlSource = Exclude<
 const PARSERS: Record<JsonlSource, (line: string) => TranscriptEntry | undefined> = {
 	claude: parseClaude,
 	codex: parseCodex,
+	kimi: parseKimi,
 	"copilot-chat": parseCopilotChat,
 };
 
@@ -215,6 +216,10 @@ function parseClaude(line: string): TranscriptEntry | undefined {
 
 function parseCodex(line: string): TranscriptEntry | undefined {
 	return getParserForSource("codex").parseLine(line, 0) ?? undefined;
+}
+
+function parseKimi(line: string): TranscriptEntry | undefined {
+	return getParserForSource("kimi").parseLine(line, 0) ?? undefined;
 }
 
 function parseCopilotChat(line: string): TranscriptEntry | undefined {

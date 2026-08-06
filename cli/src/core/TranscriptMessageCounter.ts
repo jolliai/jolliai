@@ -147,6 +147,8 @@ async function readUnreadTranscript(
 			return readAntigravityTranscript(transcriptPath, cursor ?? undefined);
 		case "codex":
 			return readTranscript(transcriptPath, cursor, getParserForSource("codex"));
+		case "kimi":
+			return readTranscript(transcriptPath, cursor, getParserForSource("kimi"));
 		default:
 			// Claude is the fallback parser; SessionInfo.source defaults to
 			// "claude" for back-compat, so unknown values flow through here

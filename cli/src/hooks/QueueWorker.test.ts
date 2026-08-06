@@ -451,6 +451,11 @@ vi.mock("../core/CursorCliSessionDiscoverer.js", () => ({
 	isCursorCliInstalled: vi.fn().mockResolvedValue(false),
 }));
 
+vi.mock("../core/KimiSessionDiscoverer.js", () => ({
+	discoverKimiSessions: vi.fn().mockResolvedValue([]),
+	isKimiInstalled: vi.fn().mockResolvedValue(false),
+}));
+
 vi.mock("../core/CursorCliTranscriptReader.js", () => ({
 	readCursorCliTranscript: vi.fn().mockResolvedValue({
 		entries: [],
@@ -533,6 +538,7 @@ import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from ".
 import { drainIngest } from "../core/IngestPipeline.js";
 import { appendCredentialMissingRun } from "../core/IngestRunStore.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
+import { discoverKimiSessions, isKimiInstalled } from "../core/KimiSessionDiscoverer.js";
 import { LlmCredentialError } from "../core/LlmClient.js";
 import { acquireIngestLock, acquireWorkerLock, releaseIngestLock, releaseWorkerLock } from "../core/Locks.js";
 import { LocalAgentAuthError } from "../core/localagent/Types.js";
@@ -2282,6 +2288,52 @@ describe("QueueWorker", () => {
 
 			expect(isDevinInstalled).not.toHaveBeenCalled();
 			expect(discoverDevinSessions).not.toHaveBeenCalled();
+		});
+
+		it("discovers Kimi sessions when Kimi is installed and kimiEnabled is not false", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/kimi.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isKimiInstalled).mockResolvedValue(true);
+			vi.mocked(discoverKimiSessions).mockResolvedValue([
+				{
+					sessionId: "kimi-1",
+					transcriptPath: "/tmp/kimi/sessions/wd_x/kimi-1/agents/main/wire.jsonl",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "kimi",
+				},
+			]);
+
+			await runWorker("/test/cwd");
+
+			expect(discoverKimiSessions).toHaveBeenCalledWith("/test/cwd");
+		});
+
+		it("does not call isKimiInstalled or discoverKimiSessions when kimiEnabled is false", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/kimi-disabled.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({
+				kimiEnabled: false,
+			} as Awaited<ReturnType<typeof loadConfig>>);
+
+			await runWorker("/test/cwd");
+
+			expect(isKimiInstalled).not.toHaveBeenCalled();
+			expect(discoverKimiSessions).not.toHaveBeenCalled();
 		});
 	});
 

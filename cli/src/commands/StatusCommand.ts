@@ -483,6 +483,15 @@ export function buildIntegrationRows(
 					scanError: status.antigravityScanError,
 				},
 			],
+			[
+				"Kimi Code",
+				status.kimiDetected ?? false,
+				{
+					enabled: status.kimiEnabled !== false,
+					hookInstalled: undefined,
+					sessionCount: counts.kimi,
+				},
+			],
 		];
 	return rows.filter(([, detected]) => detected).map(([name, , inputs]) => ({ name, inputs }));
 }

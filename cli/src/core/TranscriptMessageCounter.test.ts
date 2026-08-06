@@ -83,6 +83,25 @@ describe("countTranscriptMessages", () => {
 		expect(n).toBe(2);
 	});
 
+	it("counts kimi wire.jsonl turns", async () => {
+		const file = join(dir, "wire.jsonl");
+		writeFileSync(
+			file,
+			[
+				'{"type":"turn.prompt","input":"hi","time":1}',
+				'{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"yo"}},"time":2}',
+				"",
+			].join("\n"),
+		);
+		const n = await countTranscriptMessages({
+			sessionId: "k",
+			transcriptPath: file,
+			updatedAt: "2026-05-15T00:00:00Z",
+			source: "kimi",
+		});
+		expect(n).toBe(2);
+	});
+
 	it("uses GeminiTranscriptReader for gemini source", async () => {
 		// Real Gemini sessions are single-JSON-document, not JSONL.
 		const file = join(dir, "gemini-session.json");
@@ -412,6 +431,27 @@ describe("countTranscriptMessages", () => {
 			try {
 				const entries = await loadUnreadTranscript(source, join(dir, "does-not-exist", name), projectDir);
 				expect(entries).toEqual([]);
+			} finally {
+				rmSync(projectDir, { recursive: true, force: true });
+			}
+		});
+
+		// Kimi routes through the shared readTranscript with the ACP wire parser
+		// (its own switch arm) rather than falling through to the Claude parser.
+		it("routes kimi to the ACP wire parser", async () => {
+			const projectDir = mkdtempSync(join(tmpdir(), "msg-counter-kimi-"));
+			try {
+				const file = join(dir, "kimi-unread.jsonl");
+				writeFileSync(
+					file,
+					[
+						'{"type":"turn.prompt","input":[{"type":"text","text":"q"}],"time":1}',
+						'{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"a"}},"time":2}',
+						"",
+					].join("\n"),
+				);
+				const entries = await loadUnreadTranscript("kimi", file, projectDir);
+				expect(entries.map((e) => e.content)).toEqual(["q", "a"]);
 			} finally {
 				rmSync(projectDir, { recursive: true, force: true });
 			}

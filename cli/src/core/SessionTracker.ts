@@ -209,6 +209,8 @@ export function isSourceEnabled(source: TranscriptSource | undefined, config: Jo
 			return config.devinEnabled !== false;
 		case "antigravity":
 			return config.antigravityEnabled !== false;
+		case "kimi":
+			return config.kimiEnabled !== false;
 		default:
 			return true;
 	}

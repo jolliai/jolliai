@@ -229,6 +229,11 @@ vi.mock("../core/CodexSessionDiscoverer.js", () => ({
 	isCodexInstalled: vi.fn(),
 }));
 
+vi.mock("../core/KimiSessionDiscoverer.js", () => ({
+	discoverKimiSessions: vi.fn().mockResolvedValue([]),
+	isKimiInstalled: vi.fn().mockResolvedValue(false),
+}));
+
 vi.mock("../core/PlanProgressEvaluator.js", () => ({
 	evaluatePlanProgress: mockEvaluatePlanProgress,
 }));

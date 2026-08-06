@@ -63,6 +63,7 @@ const VALID_CONFIG_KEYS = [
 	"clineEnabled",
 	"devinEnabled",
 	"antigravityEnabled",
+	"kimiEnabled",
 	"mcpPlatformToolsEnabled",
 	"globalInstructions",
 	"logLevel",
@@ -141,6 +142,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		key === "clineEnabled" ||
 		key === "devinEnabled" ||
 		key === "antigravityEnabled" ||
+		key === "kimiEnabled" ||
 		key === "mcpPlatformToolsEnabled" ||
 		key === "syncTranscripts" ||
 		key === "syncOnPush"
@@ -243,6 +245,11 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "antigravityEnabled",
 		type: "boolean",
 		description: "Enable Antigravity session discovery (true/false; requires Node 22.5+ at runtime)",
+	},
+	{
+		key: "kimiEnabled",
+		type: "boolean",
+		description: "Enable Kimi Code CLI (~/.kimi-code) session discovery (true/false)",
 	},
 	{
 		key: "mcpPlatformToolsEnabled",

@@ -1,8 +1,8 @@
 /**
  * Aggregates active AI coding sessions across all supported transcript
- * sources (see `TRANSCRIPT_SOURCES` in Types.ts — currently twelve:
+ * sources (see `TRANSCRIPT_SOURCES` in Types.ts — currently thirteen:
  * claude / codex / gemini / opencode / cursor / cursor-cli / copilot /
- * copilot-chat / cline / cline-cli / devin / antigravity), filters by
+ * copilot-chat / cline / cline-cli / devin / antigravity / kimi), filters by
  * recency window, resolves display titles, and returns a sorted list
  * ready for UI consumption.
  *
@@ -252,6 +252,7 @@ async function collectFromAllSources(cwd: string, config: JolliMemoryConfig): Pr
 		loadDevin(cwd, config),
 		loadCursorCli(cwd, config),
 		loadAntigravity(cwd, config),
+		loadKimi(cwd, config),
 	]);
 	const sessions: SessionInfo[] = [];
 	const failedSources: TranscriptSource[] = [];
@@ -322,6 +323,17 @@ async function loadCodex(cwd: string, config: JolliMemoryConfig): Promise<Loader
 	} catch (err) {
 		log.warn("discoverCodexSessions threw: %s", errMsg(err));
 		return { sessions: [], failed: ["codex"] };
+	}
+}
+
+async function loadKimi(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	if (!isSourceEnabled("kimi", config)) return { sessions: [], failed: [] };
+	try {
+		const { discoverKimiSessions } = await import("./KimiSessionDiscoverer.js");
+		return { sessions: await discoverKimiSessions(cwd), failed: [] };
+	} catch (err) {
+		log.warn("discoverKimiSessions threw: %s", errMsg(err));
+		return { sessions: [], failed: ["kimi"] };
 	}
 }
 

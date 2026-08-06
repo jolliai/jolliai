@@ -63,6 +63,7 @@ import { readDevinTranscript } from "../core/DevinTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
+import { discoverKimiSessions, isKimiInstalled } from "../core/KimiSessionDiscoverer.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import {
 	acquireIngestLock,
@@ -3790,6 +3791,15 @@ async function loadSessionTranscripts(
 		if (antigravitySessions.length > 0) {
 			allSessions = [...allSessions, ...antigravitySessions];
 			log.info("Discovered %d Antigravity session(s)", antigravitySessions.length);
+		}
+	}
+	// Discover Kimi Code CLI sessions (on-demand scan of ~/.kimi-code/sessions/<workDirKey>/<sessionId>/,
+	// scoped by the working directory recovered from each session's transcript/state).
+	if (config.kimiEnabled !== false && (await isKimiInstalled())) {
+		const kimiSessions = await discoverKimiSessions(cwd);
+		if (kimiSessions.length > 0) {
+			allSessions = [...allSessions, ...kimiSessions];
+			log.info("Discovered %d Kimi session(s)", kimiSessions.length);
 		}
 	}
 
