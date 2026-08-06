@@ -178,13 +178,17 @@ export interface SidebarWebviewDeps {
 		 */
 		notifyDirty?: (kbRoot?: string) => void;
 		/**
-		 * Collapses duplicate KB folders that share one repo identity so the
-		 * Folders tab stops showing the same repo twice (the `jolliai` +
-		 * `jolliai-2` symptom). Optional so existing tests keep compiling.
-		 * Resolves to the list of folder paths that were archived; an empty
-		 * array means no duplicates were found.
+		 * Archives Memory Bank folders that hold nothing at all — the folders a
+		 * past bug claimed from a cwd that was never a useful repo (`system32`,
+		 * `tmp.XXXXXX`, an agent temp dir) plus checkouts opened once and never
+		 * committed to. Optional so existing tests keep compiling. Resolves to
+		 * the list of folder paths that were archived.
+		 *
+		 * Duplicate folders are NOT in scope — see the service method's contract:
+		 * a Refresh never moves a folder holding memories, so consolidating
+		 * duplicates is Migrate's job.
 		 */
-		dedupeFolders?: () => Promise<string[]>;
+		archiveUnusedFolders?: () => Promise<string[]>;
 	};
 	/**
 	 * Source for the breadcrumb repo/branch dropdowns. `listRepos` enumerates
@@ -1837,34 +1841,13 @@ export class SidebarWebviewProvider
 			| "all",
 	): Promise<void> {
 		if (scope === "kb" || scope === "all") {
-			// Dedupe first so a Refresh both re-lists AND collapses the
-			// `jolliai` + `jolliai-2` duplicate folders that share one repo
-			// identity. Dedupe is best-effort and recoverable (folders are
-			// moved into the hidden archive dir, not deleted), so a failure
-			// here must not block the following re-list — we report it and
-			// continue. The follow-up handleExpandFolder("") re-reads the
-			// trimmed directory so the dupes vanish from the tree on the
-			// same refresh.
-			if (this.deps.kbFolders?.dedupeFolders) {
-				try {
-					const archived = await this.deps.kbFolders.dedupeFolders();
-					if (archived.length > 0) {
-						const noun = archived.length === 1 ? "folder" : "folders";
-						const msg =
-							`Jolli Memory: collapsed ${archived.length} duplicate ` +
-							`${noun} sharing a repo identity. Moved to the archive folder (recoverable).`;
-						void vscode.window.showInformationMessage(msg);
-					}
-				} catch (err) {
-					log.warn(
-						"SidebarWebviewProvider",
-						`dedupeFolders failed: ${
-							err instanceof Error ? err.message : String(err)
-						}`,
-					);
-				}
-			}
-			void this.handleExpandFolder("");
+			// `void`, not `await`: the sweep is async and everything below this
+			// block must still run in the SAME tick as the user's click. Awaiting
+			// here pushed the branch/status refreshes past a microtask, which is a
+			// behaviour change for every other scope (the Codex discovery kick a
+			// scope="all" refresh owes `pushConversations` stopped being observable
+			// synchronously). The kb work keeps its own ordering inside the chain.
+			void this.tidyAndRelistKbFolders();
 			void this.deps.executeCommand("jollimemory.refreshMemories");
 		}
 		// Current Memory block: conversations + context (plans/notes) + files.
@@ -1897,6 +1880,56 @@ export class SidebarWebviewProvider
 		if (scope === "status" || scope === "all") {
 			void this.deps.executeCommand("jollimemory.refreshStatus");
 		}
+	}
+
+	/**
+	 * The Folders-tab half of a Refresh: sweep the Memory Bank, then re-list it.
+	 *
+	 * Sweep first so one Refresh both re-lists AND clears the rows the user can't
+	 * act on: folders a past bug claimed for something that never became a useful
+	 * repo and that never held anything (empty `system32` / `tmp.XXXXXX` /
+	 * agent-temp-dir claims, plus checkouts opened once and never committed to).
+	 * The trailing `handleExpandFolder("")` re-reads the trimmed directory, which
+	 * is what makes them vanish on the same click.
+	 *
+	 * Deliberately NOT a duplicate-collapsing pass. Refresh's contract is that it
+	 * never moves a folder holding memories — see
+	 * `KbFoldersService.archiveUnusedFolders` for why collapsing duplicates
+	 * requires rebuilding the survivor from the orphan branch and therefore
+	 * belongs to Migrate.
+	 *
+	 * Errors are logged and swallowed: the sweep is best-effort and recoverable
+	 * (folders are MOVED into the hidden archive dir, never deleted), so a locked
+	 * directory or a permission denial must not cost the user the re-list they
+	 * actually asked for. Nothing archived → no toast; a Refresh that found
+	 * nothing must not nag.
+	 */
+	private async tidyAndRelistKbFolders(): Promise<void> {
+		// Called as a method on the live `KbFoldersService` instance — it reads
+		// `this.getContext()` and clears `this.cleanRepos`, so the receiver has to
+		// survive the call.
+		const kb = this.deps.kbFolders;
+		if (kb?.archiveUnusedFolders) {
+			try {
+				const archived = await kb.archiveUnusedFolders();
+				if (archived.length > 0) {
+					const noun = archived.length === 1 ? "folder" : "folders";
+					void vscode.window.showInformationMessage(
+						`Jolli Memory: archived ${archived.length} unused Memory Bank ${noun} ` +
+							`with no memories in ${archived.length === 1 ? "it" : "them"}. ` +
+							`Moved to the archive folder (recoverable).`,
+					);
+				}
+			} catch (err) {
+				log.warn(
+					"SidebarWebviewProvider",
+					`archiveUnusedFolders failed: ${
+						err instanceof Error ? err.message : String(err)
+					}`,
+				);
+			}
+		}
+		await this.handleExpandFolder("");
 	}
 
 	/**

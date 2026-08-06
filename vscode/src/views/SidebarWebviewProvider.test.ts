@@ -48,8 +48,8 @@ const mockWorkspaceFolders: Array<{ uri: { fsPath: string } }> = [];
 const { clipboardWriteText } = vi.hoisted(() => ({
 	clipboardWriteText: vi.fn().mockResolvedValue(undefined),
 }));
-// Backs the "collapsed N duplicate folders" toast the KB refresh raises after
-// `kbFolders.dedupeFolders()` archives something.
+// Backs the toast the KB refresh raises after `kbFolders.archiveUnusedFolders()`
+// archives folders that hold no memories at all.
 const { showInformationMessage } = vi.hoisted(() => ({
 	showInformationMessage: vi.fn().mockResolvedValue(undefined),
 }));
@@ -1927,12 +1927,19 @@ describe("SidebarWebviewProvider", () => {
 		expect(exec).toHaveBeenCalledWith("jollimemory.refreshMemories");
 	});
 
-	/** Builds a kb-tab provider whose `kbFolders` carries a stubbed dedupe. */
-	function makeKbDedupeProvider(dedupeFolders: () => Promise<string[]>) {
+	/**
+	 * Builds a kb-tab provider whose `kbFolders` carries a stubbed unused-folder
+	 * sweep. Omitting `archiveUnusedFolders` leaves it ABSENT on the injected dep
+	 * (not stubbed to `[]`) — the shape every pre-existing test uses, and the
+	 * reason the dep declares it optional.
+	 */
+	function makeKbSweepProvider(archiveUnusedFolders?: () => Promise<string[]>) {
 		const view = makeMockView();
 		const kbFolders = {
 			listChildren: vi.fn().mockResolvedValue([]),
-			dedupeFolders: vi.fn(dedupeFolders),
+			...(archiveUnusedFolders
+				? { archiveUnusedFolders: vi.fn(archiveUnusedFolders) }
+				: {}),
 		};
 		const provider = new SidebarWebviewProvider({
 			executeCommand: vi.fn().mockResolvedValue(undefined),
@@ -1952,33 +1959,62 @@ describe("SidebarWebviewProvider", () => {
 		return { view, kbFolders };
 	}
 
-	it("toasts once per refresh when dedupeFolders archived duplicate folders", async () => {
-		const { view, kbFolders } = makeKbDedupeProvider(async () => [
-			"/kb/jolliai-2",
-		]);
+	it("sweeps unused folders then re-lists, toasting the singular form for one", async () => {
+		const { view, kbFolders } = makeKbSweepProvider(async () => ["/kb/system32"]);
 		view.webview.triggerMessage({ type: "refresh", scope: "kb" });
 		await new Promise((r) => setTimeout(r, 0));
-		expect(kbFolders.dedupeFolders).toHaveBeenCalledTimes(1);
+		expect(kbFolders.archiveUnusedFolders).toHaveBeenCalledTimes(1);
 		expect(showInformationMessage).toHaveBeenCalledTimes(1);
-		// Singular noun for one folder; the count is what the user acts on.
-		expect(showInformationMessage.mock.calls[0][0]).toContain("1 duplicate folder");
+		expect(showInformationMessage.mock.calls[0][0]).toContain(
+			"archived 1 unused Memory Bank folder with no memories in it",
+		);
 		expect(kbFolders.listChildren).toHaveBeenCalledWith("");
 	});
 
-	it("stays silent when dedupeFolders found nothing to archive", async () => {
-		const { view, kbFolders } = makeKbDedupeProvider(async () => []);
+	it("toasts the plural form when the sweep archived several folders", async () => {
+		const { view } = makeKbSweepProvider(async () => [
+			"/kb/system32",
+			"/kb/unknown",
+		]);
+		view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(showInformationMessage.mock.calls[0][0]).toContain(
+			"archived 2 unused Memory Bank folders with no memories in them",
+		);
+	});
+
+	it("stays silent when the sweep found nothing to archive", async () => {
+		const { view } = makeKbSweepProvider(async () => []);
+		view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(showInformationMessage).not.toHaveBeenCalled();
+	});
+
+	it("still re-lists the tree when the sweep throws", async () => {
+		// The sweep is best-effort: a failed archive (locked directory,
+		// permissions) must not cost the user the refresh they asked for.
+		const { view, kbFolders } = makeKbSweepProvider(async () => {
+			throw new Error("EPERM");
+		});
 		view.webview.triggerMessage({ type: "refresh", scope: "kb" });
 		await new Promise((r) => setTimeout(r, 0));
 		expect(showInformationMessage).not.toHaveBeenCalled();
 		expect(kbFolders.listChildren).toHaveBeenCalledWith("");
 	});
 
-	it("still re-lists the tree when dedupeFolders throws", async () => {
-		// Dedupe is best-effort: a failed archive (locked directory, permissions)
-		// must not cost the user the refresh they actually asked for.
-		const { view, kbFolders } = makeKbDedupeProvider(async () => {
-			throw new Error("EPERM");
-		});
+	it("runs the sweep on a scope='all' refresh too", async () => {
+		// The toolbar's whole-sidebar Refresh shares the kb branch; the user
+		// shouldn't have to pick the Folders-only scope to get the sweep.
+		const { view } = makeKbSweepProvider(async () => ["/kb/tmp.abc"]);
+		view.webview.triggerMessage({ type: "refresh", scope: "all" });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(showInformationMessage).toHaveBeenCalledTimes(1);
+	});
+
+	it("skips the sweep when the host didn't wire it", async () => {
+		// Absent dep must be a silent no-op, not a crash — the sweep is additive
+		// to a refresh that has to keep working without it.
+		const { view, kbFolders } = makeKbSweepProvider();
 		view.webview.triggerMessage({ type: "refresh", scope: "kb" });
 		await new Promise((r) => setTimeout(r, 0));
 		expect(showInformationMessage).not.toHaveBeenCalled();

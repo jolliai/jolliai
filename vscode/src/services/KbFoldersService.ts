@@ -48,14 +48,11 @@
  */
 
 import type { Dirent } from "node:fs";
-import { existsSync, promises as fs, readFileSync } from "node:fs";
+import { existsSync, promises as fs, readdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, normalize } from "node:path";
 import type { SummaryIndex } from "../../../cli/src/Types.js";
 import { FolderStorage } from "../../../cli/src/core/FolderStorage.js";
-import {
-	archiveKBFolder,
-	normalizeRemoteUrl,
-} from "../../../cli/src/core/KBPathResolver.js";
+import { archiveKBFolder } from "../../../cli/src/core/KBPathResolver.js";
 import {
 	type DiscoveredRepo,
 	discoverRepos,
@@ -126,96 +123,93 @@ export class KbFoldersService {
 	}
 
 	/**
-	 * Collapses duplicate KB folders that share one repo identity so the Folders
-	 * tab stops showing the same repo twice (the `jolliai` + `jolliai-2` symptom).
+	 * Archives Memory Bank folders that were claimed for something that never
+	 * turned out to be a useful repo, so the Folders tab stops listing rows the
+	 * user has no reason to browse. This is the ONLY mutation the sidebar's
+	 * Refresh performs.
 	 *
-	 * WHY dupes exist: `resolveKBPath` claims a folder per `(repoName, remoteUrl)`
-	 * at activation time. When the current project's `remoteUrl` reads back as
-	 * `null` (local-only repo, or a transient `git` timeout degrading
-	 * `extractRepoName` to a basename), it can spawn a `-2` sibling whose
-	 * `config.json` carries `remoteUrl: null` while the base folder holds the
-	 * real URL. Two folders, same on-disk repo, two Folders-tab rows. The other
-	 * classic cause is a LEGACY SSH-vs-HTTPS clone mismatch: `isSameRepo` folds
-	 * transports today, but folders claimed before that fold shipped still hold
-	 * `git@host:o/r.git` in one `config.json` and `https://host/o/r` in the
-	 * other, so their piles survive. Both configs are read verbatim here, which
-	 * is why the remote comparison below has to canonicalize.
+	 * REFRESH'S CONTRACT — Refresh clears folders that a past bug created and
+	 * that never held anything; it NEVER moves a folder holding memories. That is
+	 * the whole reason this sweep is keyed on emptiness and nothing else, and why
+	 * DUPLICATE folders are deliberately out of scope here even though they are
+	 * the more visible annoyance: collapsing duplicates means picking one of
+	 * several populated folders and burying the rest, since an archive is a plain
+	 * move that cannot merge them. The only correct survivor is one rebuilt from
+	 * the orphan branch (the system of record), which is Migrate's job — so
+	 * duplicates belong to Migrate, and a Refresh stays a safe, lossless action
+	 * the user can click without thinking. An earlier revision did wire a
+	 * duplicate-collapsing pass into Refresh; it was withdrawn for exactly this
+	 * reason. Do not re-add one here.
 	 *
-	 * GROUPING RULE — group by `repoName`, then COLLAPSE only when every member
-	 * of the group is "the same repo":
-	 *   - two members with equal non-null remotes  → dupes (collapse).
-	 *   - a member with a real remote + a member with `null` remote → the null
-	 *     one is the auto-spawned shadow (collapse it, keep the one with a
-	 *     remote). This is the exact `jolliai`/`jolliai-2` case the user sees.
-	 *   - two members with DISTINCT non-null remotes → DIFFERENT repos that
-	 *     merely share a basename (forks) → NEVER collapse; that would merge two
-	 *     unrelated knowledge bases. The user's "no remote URL" heuristic is a
-	 *     SUBSET of this rule: a lone local-only folder legitimately has
-	 *     `remoteUrl: null` and must be preserved.
+	 * WHY these folders exist: `resolveKBPath` CLAIMS the folder it returns
+	 * (writes `.jolli/config.json`) and takes its `repoName` from whatever cwd the
+	 * calling process happened to have. Every jollimemory process that ran outside
+	 * a real project therefore materialized a folder named after that cwd —
+	 * `system32`, `unknown`, `tmp.XXXXXX`, an agent's temp dir, a doc title a
+	 * local-agent run used as its working directory. `checkClaimable` is the gate
+	 * that stops NEW ones (see its docstring for the full taxonomy), but it can't
+	 * retract the pile already on disk from before it shipped, and users have to
+	 * clear those by hand today. The same shape also comes from browsing: opening
+	 * an unrelated checkout once claims its folder, and if no commit ever lands
+	 * there the folder stays forever empty.
 	 *
-	 * KEEP PICK: see {@link pickCanonical} — most content first, then a non-null
-	 * remote, then the lowest `-N` suffix. Content leads because nothing here
-	 * merges the loser into the winner; archiving is a plain move, so the
-	 * populated folder has to be the survivor.
+	 * RULE — archive only a folder that holds NOTHING (see {@link isEmptyKbFolder}):
+	 * no summaries in `index.json`, no rows in `manifest.json`, no visible files
+	 * or branch dirs, and nothing under `.jolli/` beyond the inert metadata stubs
+	 * `MetadataManager.ensure()` seeds. Emptiness is the whole test on purpose:
+	 *   - It cannot lose memories. Archiving is a move, and an empty folder has
+	 *     nothing to move; if the repo becomes active again `resolveKBPath`
+	 *     re-claims the same path on the next write.
+	 *   - It needs no name heuristics. Guessing junk from a *name* (`system32`,
+	 *     `tmp.*`, "looks like a doc title") would eventually archive someone's
+	 *     legitimately-named repo, and a populated `system32` folder means the
+	 *     user really does keep memories for a project by that name.
+	 *   - It covers the empty-but-real-remote rows too (a checkout opened once,
+	 *     never committed to). Those identify a real repo but hold nothing, so the
+	 *     row is pure noise; the folder returns the moment it earns content.
 	 *
-	 * ACTION: extra folders are MOVED into the hidden archive dir via
-	 * `archiveKBFolder` — the same recoverable path the Migrate-to-Memory-Bank
-	 * flow uses — rather than hard-deleted, so a mis-classification is undoable.
-	 * The orphan branch remains the system of record regardless.
+	 * Anything unrecognized under `.jolli/` — including the `shadow-status.json`
+	 * dirty marker, which means a write was attempted and hasn't landed — counts
+	 * as content and keeps the folder. Unknown state is never assumed disposable.
 	 *
-	 * DISTINCT-REMOTE groups are left completely untouched (no archive, no
-	 * notification) so legitimate forks are never disturbed.
+	 * NEVER touched: the current project's folder, or any folder carrying the
+	 * current project's `repoName`. A fresh install's own folder is legitimately
+	 * empty until the first commit lands, and archiving it on the Refresh the user
+	 * clicked to look at it would spawn one archive dir per click.
+	 *
+	 * Folders without `.jolli/config.json` are invisible to `discoverRepos` and so
+	 * never candidates — user-dropped notes and files under `<kbParent>` are out
+	 * of scope by construction.
+	 *
+	 * ACTION: a MOVE into the hidden `<kbParent>/.jolli/archive/` dir — the same
+	 * recoverable path the Migrate-to-Memory-Bank flow uses — never a delete, so
+	 * a mis-classification is undoable. The orphan branch remains the system of
+	 * record regardless.
 	 *
 	 * @returns the list of folder paths that were archived (empty if none).
 	 */
-	async dedupeFolders(): Promise<string[]> {
+	async archiveUnusedFolders(): Promise<string[]> {
 		const ctx = this.getContext();
 		const repos = discoverRepos(
 			ctx.currentRepoName,
 			ctx.currentRemoteUrl,
 			ctx.kbParent,
 		);
-		// Group by config repoName. Two DiscoveryRepos with the same dirName
-		// can't happen (discoverRepos scans distinct dirs), but two different
-		// dirNames (base + -N, or two forks) can share a repoName.
-		const byName = new Map<string, DiscoveredRepo[]>();
-		for (const r of repos) {
-			const key = r.repoName;
-			const group = byName.get(key);
-			if (group) group.push(r);
-			else byName.set(key, [r]);
-		}
-
 		const archived: string[] = [];
-		for (const group of byName.values()) {
-			if (group.length < 2) continue;
-			// Remotes must be compared CANONICALIZED, not raw: the SSH-vs-HTTPS
-			// clone mismatch this method exists to collapse stores
-			// `git@github.com:o/r.git` in one config and
-			// `https://github.com/o/r` in the other. Raw string equality calls
-			// those two "distinct remotes" and skips the group — i.e. the second
-			// of the two documented causes would never have been collapsed.
-			// `normalizeRemoteUrl` is the same comparer `KBPathResolver.isSameRepo`
-			// uses to decide folder reuse, imported rather than re-derived so the
-			// two can't drift (a divergent copy is what split `<repo>`/`<repo>-2`
-			// in the first place).
-			const distinctRemotes = new Set(
-				group
-					.map((r) => r.remoteUrl)
-					.filter((u): u is string => u != null)
-					.map(normalizeRemoteUrl),
-			);
-			if (distinctRemotes.size > 1) {
-				// Different repos sharing a basename — forks, not dupes.
+		for (const repo of repos) {
+			// Two-part current-repo guard. `isCurrentRepo` is remote-first, so it
+			// misses a same-repo folder whose config holds a different transport
+			// or host alias for the current project's remote — exactly the shape
+			// that spawns an extra empty folder in the first place. Matching the
+			// name as well keeps every folder that could be the one this session
+			// is about to write into.
+			if (repo.isCurrentRepo) continue;
+			if (ctx.currentRepoName != null && repo.repoName === ctx.currentRepoName) {
 				continue;
 			}
-			// Collapsible group: pick the canonical survivor.
-			const keep = pickCanonical(group);
-			for (const r of group) {
-				if (r.kbRoot === keep.kbRoot) continue;
-				const dest = archiveKBFolder(r.kbRoot, ctx.kbParent);
-				if (dest) archived.push(r.kbRoot);
-			}
+			if (!isEmptyKbFolder(repo.kbRoot)) continue;
+			const dest = archiveKBFolder(repo.kbRoot, ctx.kbParent);
+			if (dest) archived.push(repo.kbRoot);
 		}
 		if (archived.length > 0) this.cleanRepos.clear();
 		return archived;
@@ -703,63 +697,113 @@ function repoDisplayName(repo: DiscoveredRepo): string {
 }
 
 /**
- * Picks the canonical survivor from a dedup group, in priority order:
+ * Entries under `<kbRoot>/.jolli/` that carry no memories on their own — the
+ * schema stubs `MetadataManager.ensure()` seeds when a folder is claimed, plus
+ * the two bookkeeping files a claim can leave behind. Every other name (
+ * `summaries/`, `transcripts/`, `plans/`, `notes/`, `references/`, `catalog.json`,
+ * `topics/`, `graph/`, anything a future writer adds) counts as content and
+ * keeps the folder.
  *
- *   1. **Most content** (`.jolli/index.json` entry count). Nothing here
- *      re-migrates the loser's contents into the winner — archiving is a pure
- *      move — so the folder holding the memories must always be the one that
- *      stays. Everything below is only a tiebreak between folders that hold
- *      the same amount.
- *   2. **A non-null `remoteUrl`**, so the folder carrying a real identity
- *      survives over the degraded shadow.
- *   3. **Lowest collision suffix** (base `<repo>` before `<repo>-2`).
- *      `dirName` is always `<repoName>` or `<repoName>-N`, so the numeric
- *      suffix parse is well-defined.
+ * `index.json` / `manifest.json` are inert only in the sense that their
+ * PRESENCE proves nothing — {@link isEmptyKbFolder} still reads both and
+ * requires them to hold zero entries.
  *
- * Suffix used to be the FIRST key, which inverted rules 1 and 2 and produced a
- * self-perpetuating loop: with a null-remote base and the real remote in
- * `<repo>-2`, `resolveKBPath` resolves writes to `<repo>-2` (the base fails
- * `isSameRepo` against a real remote), so suffix-first archived the *live*
- * folder, the next write re-claimed an empty `<repo>-2`, and the following
- * Refresh archived that one too — one archived directory per refresh, forever,
- * with the populated folder buried each time.
+ * `shadow-status.json` is deliberately ABSENT: that is the dual-write dirty
+ * marker (`DualWriteStorage.markDirty`), so its presence means a folder write
+ * was attempted and hasn't completed. A folder mid-write is not disposable
+ * even while it still looks empty.
  */
-function pickCanonical(group: DiscoveredRepo[]): DiscoveredRepo {
-	let best = group[0];
-	let bestKey = canonicalKey(best);
-	for (let i = 1; i < group.length; i++) {
-		const key = canonicalKey(group[i]);
-		if (
-			key.entries > bestKey.entries ||
-			(key.entries === bestKey.entries &&
-				(key.hasRemote > bestKey.hasRemote ||
-					(key.hasRemote === bestKey.hasRemote && key.rank < bestKey.rank)))
-		) {
-			best = group[i];
-			bestKey = key;
-		}
+const INERT_JOLLI_ENTRIES: ReadonlySet<string> = new Set([
+	"config.json",
+	"branches.json",
+	"manifest.json",
+	"index.json",
+	"migration.json",
+]);
+
+/**
+ * OS-generated files that appear inside any browsed directory and say nothing
+ * about whether the user keeps memories there. Ignored when deciding emptiness
+ * so a single Finder/Explorer visit can't pin a junk folder in the tree
+ * forever.
+ */
+const OS_NOISE_FILES: ReadonlySet<string> = new Set([".DS_Store", "Thumbs.db"]);
+
+/**
+ * True when `kbRoot` is a claimed-but-empty Memory Bank folder: nothing the
+ * user could browse and nothing the system recorded. The emptiness test behind
+ * {@link KbFoldersService.archiveUnusedFolders} — see that method for why
+ * emptiness (rather than the folder's name or its missing remote) is the whole
+ * criterion.
+ *
+ * Every check is "keep unless proven empty", so an unreadable directory, an
+ * unparseable manifest, or any name this code doesn't recognize resolves to
+ * `false` (keep). A folder is only archived on positive evidence that it holds
+ * nothing.
+ */
+function isEmptyKbFolder(kbRoot: string): boolean {
+	let top: Dirent<string>[];
+	try {
+		top = readdirSync(kbRoot, { withFileTypes: true }) as Dirent<string>[];
+	} catch {
+		// Unreadable (permissions, vanished mid-scan) — not provably empty, and
+		// `archiveKBFolder` would fail on it anyway.
+		return false;
 	}
-	return best;
+	for (const e of top) {
+		if (e.name === ".jolli") continue;
+		if (OS_NOISE_FILES.has(e.name)) continue;
+		// A visible branch dir / `.md`, or a dotfile we don't recognize (a `.git`
+		// the user init'd here, an editor workspace file) — real content.
+		return false;
+	}
+
+	let jolli: Dirent<string>[];
+	try {
+		jolli = readdirSync(join(kbRoot, ".jolli"), {
+			withFileTypes: true,
+		}) as Dirent<string>[];
+	} catch {
+		// `discoverRepos` only yields folders whose `.jolli/config.json` parsed,
+		// so this is a vanished-mid-scan race, not a normal state.
+		return false;
+	}
+	for (const e of jolli) {
+		if (!INERT_JOLLI_ENTRIES.has(e.name)) return false;
+	}
+
+	// `countIndexEntries` reads a missing OR unparseable index as 0. That is safe
+	// here only because a folder holding real summaries also holds
+	// `.jolli/summaries/`, which the allowlist above already rejected — a corrupt
+	// index alone can never make a populated folder look empty.
+	if (countIndexEntries(kbRoot) > 0) return false;
+	return countManifestFiles(kbRoot) === 0;
 }
 
-/** Sort key for {@link pickCanonical}: higher `entries`/`hasRemote` and lower `rank` win. */
-function canonicalKey(repo: DiscoveredRepo): {
-	entries: number;
-	hasRemote: number;
-	rank: number;
-} {
-	return {
-		entries: countIndexEntries(repo.kbRoot),
-		hasRemote: repo.remoteUrl != null ? 1 : 0,
-		rank: suffixRank(repo.dirName),
-	};
+/**
+ * Number of rows in `<kbRoot>/.jolli/manifest.json`, or `-1` when the file
+ * exists but can't be read or parsed. The sentinel keeps
+ * {@link isEmptyKbFolder}'s `=== 0` test from treating a corrupt manifest as
+ * proof of emptiness; a missing manifest is a genuine `0` (nothing was ever
+ * written).
+ */
+function countManifestFiles(kbRoot: string): number {
+	const path = join(kbRoot, ".jolli", "manifest.json");
+	if (!existsSync(path)) return 0;
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf-8")) as Manifest;
+		return Array.isArray(parsed.files) ? parsed.files.length : -1;
+	} catch {
+		return -1;
+	}
 }
 
 /**
  * Number of summaries recorded in `<kbRoot>/.jolli/index.json`, or `0` when the
- * file is missing or unparseable. A missing index reads as "empty", which is
- * the safe direction: an unreadable folder never outranks a readable populated
- * one for survival.
+ * file is missing or unparseable. Reading a missing index as "empty" is what
+ * {@link isEmptyKbFolder} needs (a folder that never got an index never got a
+ * summary); the unparseable case is safe there because a folder holding real
+ * summaries also holds `.jolli/summaries/`, which that check rejects first.
  */
 function countIndexEntries(kbRoot: string): number {
 	try {
@@ -770,15 +814,6 @@ function countIndexEntries(kbRoot: string): number {
 	} catch {
 		return 0;
 	}
-}
-
-/**
- * Collision-suffix rank for a KB dir name: `0` for the base `<repo>`, `N` for
- * `<repo>-N`. Extraction mirrors `KBPathResolver`'s `<repo>-N` ladder.
- */
-function suffixRank(dirName: string): number {
-	const m = dirName.match(/-(\d+)$/);
-	return m ? Number(m[1]) : 0;
 }
 
 /**

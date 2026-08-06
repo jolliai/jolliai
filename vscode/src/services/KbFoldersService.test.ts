@@ -1792,187 +1792,302 @@ describe("parseMdTitle", () => {
 	});
 });
 
-// ─── dedupeFolders: collapse KB folders that share one repo identity ───────────
-// Archive target is `<parent>/.jolli/archive/` (hidden, recoverable) — same path
-// the Migrate-to-Memory-Bank flow uses. seedRepo writes a `.jolli/config.json`,
-// so the archive of that folder is deterministically under the parent's
-// `.jolli/archive` dir.
+// ─── archiveUnusedFolders: archive folders that were never a useful repo ───────
+// Same archive target as dedupeFolders (`<parent>/.jolli/archive/`, hidden and
+// recoverable). `seedRepo` writes only `.jolli/config.json`, which IS the empty
+// shape this sweep targets — so each "keeps" test has to add the specific piece
+// of content that must protect the folder.
 
-describe("KbFoldersService.dedupeFolders", () => {
+describe("KbFoldersService.archiveUnusedFolders", () => {
 	let tmpParent: string;
-	let svc: KbFoldersService;
 
 	beforeEach(() => {
-		tmpParent = mkdtempSync(join(tmpdir(), "kbfolders-dedupe-"));
-		svc = new KbFoldersService(() => ({
-			kbParent: tmpParent,
-			currentRepoName: null,
-			currentRemoteUrl: null,
-		}));
+		tmpParent = mkdtempSync(join(tmpdir(), "kbfolders-unused-"));
 	});
 	afterEach(() => {
 		rmSync(tmpParent, { recursive: true, force: true });
 	});
 
-	function archivedDir(): string {
-		return join(tmpParent, ".jolli", "archive");
+	/** Service whose "current project" is `repoName`/`remoteUrl` (both optional). */
+	function makeSvc(
+		currentRepoName: string | null = null,
+		currentRemoteUrl: string | null = null,
+	): KbFoldersService {
+		return new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName,
+			currentRemoteUrl,
+		}));
 	}
-	/** Give `<parent>/<dirName>` an `index.json` carrying `count` summaries. */
-	function seedIndex(parent: string, dirName: string, count: number): void {
+	function writeJolli(dirName: string, file: string, body: unknown): void {
 		writeFileSync(
-			join(parent, dirName, ".jolli", "index.json"),
-			JSON.stringify({
-				version: 3,
-				entries: Array.from({ length: count }, (_, i) => ({
-					commitHash: `${dirName}${i}`.padEnd(40, "0"),
-					parentCommitHash: null,
-				})),
-			}),
+			join(tmpParent, dirName, ".jolli", file),
+			typeof body === "string" ? body : JSON.stringify(body),
 			"utf-8",
 		);
 	}
 	function isArchived(dirName: string): boolean {
-		const a = archivedDir();
+		const a = join(tmpParent, ".jolli", "archive");
 		if (!existsSync(a)) return false;
 		return readdirSync(a).some((n) => n.startsWith(`${dirName}-`));
 	}
 
-	it("collapses the base + -2 duplicate where the shadow has a null remote", async () => {
-		// The classic symptom: `jolliai` carries the real URL, the auto-
-		// spawned `jolliai-2` got remoteUrl:null (e.g. a git timeout). Both
-		// share repoName `jolliai`. The null-remote shadow must be archived,
-		// the base kept.
-		seedRepo(tmpParent, "jolliai", {
-			repoName: "jolliai",
-			remoteUrl: "https://github.com/o/jolliai.git",
-		});
-		seedRepo(tmpParent, "jolliai-2", {
-			repoName: "jolliai",
-			remoteUrl: null,
-		});
-		const archived = await svc.dedupeFolders();
-		expect(archived).toHaveLength(1);
-		expect(archived[0]).toBe(join(tmpParent, "jolliai-2"));
-		expect(existsSync(join(tmpParent, "jolliai"))).toBe(true);
-		expect(isArchived("jolliai-2")).toBe(true);
+	it("archives an empty folder claimed from a cwd that was never a project", async () => {
+		// The `system32` / `unknown` / `tmp.XXXXXX` shape: `resolveKBPath` claimed
+		// a folder named after whatever cwd the process had, and nothing was ever
+		// written into it.
+		seedRepo(tmpParent, "system32", { repoName: "system32", remoteUrl: null });
+		const archived = await makeSvc().archiveUnusedFolders();
+		expect(archived).toEqual([join(tmpParent, "system32")]);
+		expect(existsSync(join(tmpParent, "system32"))).toBe(false);
+		// Moved, not deleted — a mis-classification stays recoverable.
+		expect(isArchived("system32")).toBe(true);
 	});
 
-	it("collapses two folders that share an identical non-null remote", async () => {
-		// Same URL byte-for-byte in both configs — the simplest dupe shape.
-		seedRepo(tmpParent, "repo", {
-			repoName: "repo",
-			remoteUrl: "https://github.com/o/repo.git",
+	it("archives an empty folder that carries a real remote (checkout opened once, never committed to)", async () => {
+		// Identifying a real repo is not the same as being useful: the row is
+		// pure noise until a memory lands, and the folder returns the moment
+		// `resolveKBPath` re-claims it.
+		seedRepo(tmpParent, "nextra", {
+			repoName: "nextra",
+			remoteUrl: "https://github.com/shuding/nextra.git",
 		});
-		seedRepo(tmpParent, "repo-2", {
-			repoName: "repo",
-			remoteUrl: "https://github.com/o/repo.git",
-		});
-		const archived = await svc.dedupeFolders();
-		expect(archived).toEqual([join(tmpParent, "repo-2")]);
-		expect(existsSync(join(tmpParent, "repo"))).toBe(true);
+		const archived = await makeSvc().archiveUnusedFolders();
+		expect(archived).toEqual([join(tmpParent, "nextra")]);
 	});
 
-	it("collapses an SSH clone against its HTTPS twin (remotes canonicalized)", async () => {
-		// The legacy SSH-vs-HTTPS pile: two configs holding the SAME repo in
-		// two transports. Compared raw they look like distinct remotes and the
-		// group is skipped as "forks"; they only collapse because the remote
-		// comparison folds transports via `normalizeRemoteUrl`, the same
-		// comparer `isSameRepo` uses.
-		seedRepo(tmpParent, "repo", {
-			repoName: "repo",
-			remoteUrl: "git@github.com:o/repo.git",
-		});
-		seedRepo(tmpParent, "repo-2", {
-			repoName: "repo",
-			remoteUrl: "https://github.com/o/repo",
-		});
-		const archived = await svc.dedupeFolders();
-		expect(archived).toEqual([join(tmpParent, "repo-2")]);
-		expect(existsSync(join(tmpParent, "repo"))).toBe(true);
+	it("archives several unused folders in one pass and reports each path", async () => {
+		seedRepo(tmpParent, "tmp.abc123", { remoteUrl: null });
+		seedRepo(tmpParent, "unknown", { remoteUrl: null });
+		seedRepo(tmpParent, "keeper", { remoteUrl: null });
+		seedIndexEntries("keeper", 3);
+		const archived = await makeSvc().archiveUnusedFolders();
+		expect(archived.sort()).toEqual(
+			[join(tmpParent, "tmp.abc123"), join(tmpParent, "unknown")].sort(),
+		);
+		expect(existsSync(join(tmpParent, "keeper"))).toBe(true);
 	});
 
-	it("keeps the folder holding the real remote even when it is the suffixed one", async () => {
-		// Reversed shadow: the BASE was claimed while `git` returned no remote
-		// and `<repo>-2` carries the real URL — so `resolveKBPath` resolves
-		// writes to `-2` (the base fails `isSameRepo` against a real remote).
-		// Archiving `-2` here would bury the live folder, `resolveKBPath` would
-		// re-claim an empty `-2`, and the next Refresh would archive that one
-		// too — one archived directory per refresh, forever.
-		seedRepo(tmpParent, "shadow", { repoName: "shadow", remoteUrl: null });
-		seedRepo(tmpParent, "shadow-2", {
-			repoName: "shadow",
-			remoteUrl: "https://github.com/o/shadow.git",
-		});
-		const archived = await svc.dedupeFolders();
-		expect(archived).toEqual([join(tmpParent, "shadow")]);
-		expect(existsSync(join(tmpParent, "shadow-2"))).toBe(true);
-		expect(isArchived("shadow")).toBe(true);
+	it("keeps a folder holding summaries", async () => {
+		seedRepo(tmpParent, "real", { remoteUrl: "https://github.com/o/real.git" });
+		seedIndexEntries("real", 12);
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+		expect(existsSync(join(tmpParent, "real"))).toBe(true);
 	});
 
-	it("keeps the folder with the most memories over the lower suffix", async () => {
-		// Archiving is a plain move — nothing re-migrates the loser into the
-		// winner — so the populated folder must always survive, even when the
-		// empty one owns the base slot and the real remote.
-		seedRepo(tmpParent, "rich", {
-			repoName: "rich",
-			remoteUrl: "https://github.com/o/rich.git",
+	it("keeps a folder whose manifest has rows even when the index is empty", async () => {
+		// Plans / notes land in the manifest without necessarily producing an
+		// index entry, so the manifest is checked independently.
+		seedRepo(tmpParent, "notesonly", { remoteUrl: null });
+		writeJolli("notesonly", "manifest.json", {
+			files: [{ path: "main/note.md", fileId: "n1", type: "note" }],
 		});
-		seedIndex(tmpParent, "rich", 0);
-		seedRepo(tmpParent, "rich-2", {
-			repoName: "rich",
-			remoteUrl: "https://github.com/o/rich.git",
-		});
-		seedIndex(tmpParent, "rich-2", 12);
-		const archived = await svc.dedupeFolders();
-		expect(archived).toEqual([join(tmpParent, "rich")]);
-		expect(existsSync(join(tmpParent, "rich-2"))).toBe(true);
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+		expect(existsSync(join(tmpParent, "notesonly"))).toBe(true);
 	});
 
-	it("keeps the base folder when both have null remotes (local-only shadow)", async () => {
-		// Two local-only folders sharing a basename: keep the canonical base,
-		// archive the suffixed shadow. A lone local-only folder alone is NOT
-		// touched (covered below).
-		seedRepo(tmpParent, "local", { repoName: "local", remoteUrl: null });
-		seedRepo(tmpParent, "local-2", { repoName: "local", remoteUrl: null });
-		const archived = await svc.dedupeFolders();
-		expect(archived).toEqual([join(tmpParent, "local-2")]);
-		expect(existsSync(join(tmpParent, "local"))).toBe(true);
+	it("keeps a folder holding a user-dropped visible file", async () => {
+		// The user put something here by hand. It isn't a memory, which is
+		// exactly why an emptiness test — not a manifest test — guards it.
+		seedRepo(tmpParent, "example1", { remoteUrl: null });
+		writeFileSync(join(tmpParent, "example1", "test.md"), "# mine", "utf-8");
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+		expect(existsSync(join(tmpParent, "example1"))).toBe(true);
 	});
 
-	it("never merges two repos that share a basename but have distinct remotes", async () => {
-		// Forks named the same — different repos, must both survive. The
-		// user's "no remote URL" heuristic would wrongly delete one of these
-		// if applied naively; this rule protects them.
-		seedRepo(tmpParent, "shared", {
-			repoName: "shared",
-			remoteUrl: "https://github.com/a/shared.git",
-		});
-		seedRepo(tmpParent, "shared-2", {
-			repoName: "shared",
-			remoteUrl: "https://github.com/b/shared.git",
-		});
-		const archived = await svc.dedupeFolders();
-		expect(archived).toEqual([]);
-		expect(existsSync(join(tmpParent, "shared"))).toBe(true);
-		expect(existsSync(join(tmpParent, "shared-2"))).toBe(true);
+	it("keeps a folder holding a visible branch directory", async () => {
+		seedRepo(tmpParent, "branchy", { remoteUrl: null });
+		mkdirSync(join(tmpParent, "branchy", "main"), { recursive: true });
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
 	});
 
-	it("leaves a single folder (no duplicate) untouched", async () => {
-		seedRepo(tmpParent, "solo", {
-			repoName: "solo",
-			remoteUrl: "https://github.com/o/solo.git",
+	it("keeps a folder with an unrecognized entry under .jolli (a summaries dir)", async () => {
+		// Allowlist, not denylist: anything this code doesn't recognize counts as
+		// content. An empty `summaries/` also covers the corrupt-index case —
+		// a populated folder can never look empty on the strength of its index
+		// alone.
+		seedRepo(tmpParent, "hassummaries", { remoteUrl: null });
+		mkdirSync(join(tmpParent, "hassummaries", ".jolli", "summaries"), {
+			recursive: true,
 		});
-		const archived = await svc.dedupeFolders();
-		expect(archived).toEqual([]);
-		expect(existsSync(join(tmpParent, "solo"))).toBe(true);
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
 	});
 
-	it("preserves a lone local-only folder (no remote) — not all null-remote folders are dupes", async () => {
-		// Directly contradicts the naive "delete folders without a remote
-		// URL" rule: a single local-only repo is legitimate and must remain.
-		seedRepo(tmpParent, "lonely", { repoName: "lonely", remoteUrl: null });
-		const archived = await svc.dedupeFolders();
-		expect(archived).toEqual([]);
-		expect(existsSync(join(tmpParent, "lonely"))).toBe(true);
+	it("keeps a folder carrying the dual-write dirty marker", async () => {
+		// `shadow-status.json` means a folder write was attempted and hasn't
+		// landed. Empty-looking, but mid-write — not disposable.
+		seedRepo(tmpParent, "midwrite", { remoteUrl: null });
+		writeJolli("midwrite", "shadow-status.json", { dirty: true });
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
 	});
+
+	it("keeps a folder whose manifest is unparseable", async () => {
+		// Corrupt state is never assumed empty.
+		seedRepo(tmpParent, "corrupt", { remoteUrl: null });
+		writeJolli("corrupt", "manifest.json", "{not json");
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+	});
+
+	it("keeps a folder whose manifest parses to a non-array `files`", async () => {
+		seedRepo(tmpParent, "weird", { remoteUrl: null });
+		writeJolli("weird", "manifest.json", { files: "nope" });
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+	});
+
+	it("never archives the current project's own folder even when empty", async () => {
+		// A fresh install's folder is legitimately empty until the first commit;
+		// archiving it on the Refresh the user clicked to look at it would spawn
+		// one archive dir per click.
+		seedRepo(tmpParent, "mine", {
+			repoName: "mine",
+			remoteUrl: "https://github.com/o/mine.git",
+		});
+		const svc = makeSvc("mine", "git@github.com:o/mine.git");
+		expect(await svc.archiveUnusedFolders()).toEqual([]);
+		expect(existsSync(join(tmpParent, "mine"))).toBe(true);
+	});
+
+	it("never archives an empty folder sharing the current repoName under a different remote", async () => {
+		// The host-alias shape (`git@github-jolli:o/repo.git` vs
+		// `github.com`): `isCurrentRepo` compares remotes and says "foreign", yet
+		// this is a folder the current session may be about to write into. The
+		// name guard is what keeps it.
+		seedRepo(tmpParent, "mine-2", {
+			repoName: "mine",
+			remoteUrl: "https://github.com/o/mine.git",
+		});
+		const svc = makeSvc("mine", "git@github-alias:o/mine.git");
+		expect(await svc.archiveUnusedFolders()).toEqual([]);
+		expect(existsSync(join(tmpParent, "mine-2"))).toBe(true);
+	});
+
+	it("ignores OS noise files when deciding emptiness", async () => {
+		// One Explorer/Finder visit must not pin a junk folder in the tree.
+		seedRepo(tmpParent, "visited", { remoteUrl: null });
+		writeFileSync(join(tmpParent, "visited", ".DS_Store"), "\0", "utf-8");
+		writeFileSync(join(tmpParent, "visited", "Thumbs.db"), "\0", "utf-8");
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([
+			join(tmpParent, "visited"),
+		]);
+	});
+
+	it("keeps a folder holding an unrecognized dotfile (e.g. a git repo the user init'd)", async () => {
+		seedRepo(tmpParent, "gitinit", { remoteUrl: null });
+		mkdirSync(join(tmpParent, "gitinit", ".git"), { recursive: true });
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+	});
+
+	it("leaves duplicate folders that hold memories alone — dedupe is Migrate's job", async () => {
+		// Refresh's contract: it never moves a folder holding memories. Two
+		// folders sharing one repo identity is the more visible annoyance, but
+		// collapsing them means burying one populated folder, and only Migrate can
+		// rebuild a merged survivor from the orphan branch. This test is the guard
+		// against a duplicate-collapsing pass being re-added to this sweep.
+		seedRepo(tmpParent, "dupe", {
+			repoName: "dupe",
+			remoteUrl: "https://github.com/o/dupe.git",
+		});
+		seedIndexEntries("dupe", 35);
+		seedRepo(tmpParent, "dupe-2", {
+			repoName: "dupe",
+			remoteUrl: "https://github.com/o/dupe.git",
+		});
+		seedIndexEntries("dupe-2", 751);
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+		expect(existsSync(join(tmpParent, "dupe"))).toBe(true);
+		expect(existsSync(join(tmpParent, "dupe-2"))).toBe(true);
+	});
+
+	it("archives an EMPTY duplicate sibling — emptiness is the test, not uniqueness", async () => {
+		// The flip side: a duplicate that never held anything is still just an
+		// empty folder, so it goes. No memory is buried, which is exactly the line
+		// this sweep draws.
+		seedRepo(tmpParent, "half", {
+			repoName: "half",
+			remoteUrl: "https://github.com/o/half.git",
+		});
+		seedIndexEntries("half", 12);
+		seedRepo(tmpParent, "half-2", {
+			repoName: "half",
+			remoteUrl: "https://github.com/o/half.git",
+		});
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([
+			join(tmpParent, "half-2"),
+		]);
+		expect(existsSync(join(tmpParent, "half"))).toBe(true);
+	});
+
+	it("never touches user-dropped top-level folders (no .jolli/config.json)", async () => {
+		// `discoverRepos` can't see them, so they're out of scope by construction
+		// — this pins that the sweep never grew its own directory scan.
+		mkdirSync(join(tmpParent, "notes"), { recursive: true });
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+		expect(existsSync(join(tmpParent, "notes"))).toBe(true);
+	});
+
+	// `chmod 0o111` is execute-without-read: traversal still resolves
+	// `.jolli/config.json` (so `discoverRepos` yields the folder as a candidate)
+	// while the directory listing itself fails. That is the only way to reach the
+	// two readdir catch paths without a filesystem race — and it's the real shape
+	// of a permission-restricted folder, which must be KEPT: emptiness has to be
+	// proven, never assumed. Windows ignores chmod for unprivileged access, same
+	// reason the deriveMdTitle chmod tests skip there.
+	skipIfWin32(
+		"keeps a folder whose contents cannot be listed (permissions)",
+		async () => {
+			const dir = seedRepo(tmpParent, "locked", { remoteUrl: null });
+			chmodSync(dir, 0o111);
+			try {
+				expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+			} finally {
+				// Restore before afterEach's rmSync, which can't remove an
+				// unreadable directory.
+				chmodSync(dir, 0o755);
+			}
+			expect(existsSync(dir)).toBe(true);
+		},
+	);
+
+	skipIfWin32(
+		"keeps a folder whose .jolli directory cannot be listed (permissions)",
+		async () => {
+			const dir = seedRepo(tmpParent, "lockedmeta", { remoteUrl: null });
+			const meta = join(dir, ".jolli");
+			chmodSync(meta, 0o111);
+			try {
+				expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+			} finally {
+				chmodSync(meta, 0o755);
+			}
+			expect(existsSync(dir)).toBe(true);
+		},
+	);
+
+	it("creates no archive directory when nothing qualifies", async () => {
+		seedRepo(tmpParent, "solo", { remoteUrl: null });
+		seedIndexEntries("solo", 1);
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+		expect(existsSync(join(tmpParent, ".jolli", "archive"))).toBe(false);
+	});
+
+	it("returns an empty list when the Memory Bank parent does not exist", async () => {
+		const gone = join(tmpParent, "nope");
+		const svc = new KbFoldersService(() => ({
+			kbParent: gone,
+			currentRepoName: null,
+			currentRemoteUrl: null,
+		}));
+		expect(await svc.archiveUnusedFolders()).toEqual([]);
+	});
+
+	/** Give `<parent>/<dirName>` an `index.json` carrying `count` summaries. */
+	function seedIndexEntries(dirName: string, count: number): void {
+		writeJolli(dirName, "index.json", {
+			version: 3,
+			entries: Array.from({ length: count }, (_, i) => ({
+				commitHash: `${dirName}${i}`.padEnd(40, "0"),
+				parentCommitHash: null,
+			})),
+		});
+	}
 });

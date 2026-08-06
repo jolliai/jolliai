@@ -551,13 +551,15 @@ function isSameRepo(config: KBConfig, remoteUrl: string | null, repoName: string
  * Canonical form of a git remote URL for identity comparison: SSH/git
  * transports folded to https, trailing slashes and `.git` stripped, lowercased.
  *
- * Exported (rather than kept private to `isSameRepo`) so consumers that need to
- * answer "are these two KB folders the same repo?" — VS Code's
- * `KbFoldersService.dedupeFolders` — reuse this exact comparer instead of
- * growing a fourth copy. The copies diverging is precisely what produced
- * duplicate `<repo>` / `<repo>-2` folders before.
+ * Deliberately module-private: "are these two folders the same repo?" is a
+ * question only the folder-claiming path should answer, and it must answer it
+ * through `isSameRepo`. A previous iteration exported this so the VS Code
+ * sidebar's Refresh could collapse duplicate folders on its own; that feature
+ * was withdrawn because Refresh must never move a folder holding memories —
+ * consolidating duplicates is Migrate's job (it can rebuild the survivor from
+ * the orphan branch, which a plain archive-the-loser move cannot).
  */
-export function normalizeRemoteUrl(url: string): string {
+function normalizeRemoteUrl(url: string): string {
 	return foldGitTransportToHttps(url)
 		.replace(/\/+$/, "")
 		.replace(/\.git$/, "")
