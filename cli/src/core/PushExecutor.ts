@@ -1,26 +1,26 @@
 /**
  * PushExecutor — the shared "drain push-pending.json to Jolli Space" core.
  *
- * Two drain flavors share the triage/claim/accounting machinery:
- *   - `processPushPending`   — compensation drain, called by QueueWorker
- *     post-drain (source="post-queue", hashFilter set) and plugin/CLI
- *     activation (source="activation"). Publishes only after the remote ref
- *     confirms the git push landed. Batch-first (chunks of BATCH_MAX_ITEMS
- *     through `pushBatch`, orphan cleanup included); falls back to the legacy
- *     per-commit `pushSummary` loop when the server predates the endpoint.
- *   - `processPrePushInline` — called synchronously INSIDE the pre-push hook,
- *     before git transfers objects. Pushes every with-memory candidate in ONE
- *     `pushBatch` HTTP request under a hard wall-clock budget, deliberately
- *     WITHOUT push confirmation (waiting for the remote ref inside the hook
- *     would deadlock — git waits for the hook to exit before transferring).
+ * One function, `processPushPending`, serves all three callers; they differ only
+ * in the options they pass:
+ *   - post-queue  — QueueWorker's post-drain trigger (hashFilter set to the
+ *     summaries it just generated). Confirmation gate and orphan cleanup on.
+ *   - activation  — plugin / CLI activation and sign-in. No filter: drains the
+ *     whole backlog. Confirmation gate and orphan cleanup on.
+ *   - pre-push    — the detached worker the pre-push hook spawns. Scoped to one
+ *     push's commits, and the only caller that sets `skipPushConfirmation` +
+ *     `skipOrphanCleanup`: it runs BEFORE git transfers objects, so no ref has
+ *     moved yet (`ls-remote` would refuse everything) and deleting orphaned
+ *     articles could strip memories from history that is still on the remote.
  *
- * Both reuse the existing push_memory building blocks — `pushSummary` /
- * `buildBatchItems` + `applyBatchResult` for uploads and
- * `assignOwnedAttachments` for cross-commit plan/note dedup — so nothing about
- * the Jolli Space contract is re-implemented here (JOLLI-1900 requirement 3).
- * `pushBranchToJolli` is intentionally NOT used: it pushes the whole branch as
- * one unit with no per-commit retry state, which is what the pending-file
- * model provides.
+ * Uploads go through `pushSummary` at commit granularity, `PUSH_CONCURRENCY` in
+ * flight. The batch endpoint this file used to prefer was removed: its 8 MB
+ * payload cap sat above a typical gateway's body limit, and the resulting 413
+ * was indistinguishable from a transient failure — it burned every retry and
+ * then aged out silently. Cross-commit context dedup still runs through
+ * `assignOwnedContext`, so concurrent commits never touch the same remote
+ * document. `pushBranchToJolli` is intentionally NOT used: it pushes a whole
+ * branch as one unit with no per-commit retry state.
  *
  * Cross-commit dedup requires the full branch context. The current branch uses
  * `base..HEAD`; off-current branches are reconstructed from root summaries in
@@ -30,10 +30,9 @@
  * Binding-cache maintenance rides along: a successful push persists the
  * server's `jmSpace` echo via SpaceBindingCache (a push proves the binding and
  * push rights — and the server auto-binds single-Space tenants during the push
- * itself; `pushBatch` echoes once at the top level, `pushSummary` per commit),
- * while a 412/401/403 rejection clears the cache on every drain flavor. Older
- * servers echo nothing and the cache is left as-is. The push chain never adds
- * extra requests for this.
+ * itself), while a 412/401/403 rejection clears the cache. Older servers echo
+ * nothing and the cache is left as-is. The push chain never adds extra requests
+ * for this.
  */
 
 import { createLogger, errMsg } from "../Logger.js";
@@ -41,36 +40,27 @@ import type { CommitSummary } from "../Types.js";
 import { mapWithConcurrency } from "./Concurrency.js";
 import { execGit, getCurrentBranch, getDefaultBranch } from "./GitOps.js";
 import { getCanonicalRepoUrl } from "./GitRemoteUtils.js";
-import { parseBaseUrl, resolveArticleUrl } from "./JolliApiUtils.js";
+import { parseBaseUrl } from "./JolliApiUtils.js";
 import {
-	BATCH_MAX_ITEMS,
-	BATCH_MAX_TOTAL_CONTENT_CHARS,
-	type BatchPushResult,
-	BatchUnsupportedError,
 	BindingRequiredError,
 	ClientOutdatedError,
 	JolliMemoryPushClient,
 	NotAuthenticatedError,
 	PermissionDeniedError,
 } from "./JolliMemoryPushClient.js";
-import {
-	applyBatchResult,
-	type BatchWriteBackFailure,
-	type BuiltBatchItem,
-	buildBatchItems,
-	type PushContext,
-	pushSummary,
-} from "./JolliMemoryPushOrchestrator.js";
+import { type PushContext, pushSummary } from "./JolliMemoryPushOrchestrator.js";
 import { loadBranchSummaries } from "./PrDescription.js";
 import { isOutboundPushAllowed, PushDisabledError } from "./PushControl.js";
 import {
 	type BatchUpdate,
+	CLAIM_RENEW_INTERVAL_MS,
 	claimForPush,
 	loadPushPending,
 	MAX_RETRY_COUNT,
 	PUSH_CONCURRENCY,
 	type PushPendingEntry,
 	type PushTarget,
+	renewClaims,
 	updateBatch,
 } from "./PushPendingStore.js";
 import { assignOwnedContext, type OwnedContext, selectionForCommit } from "./push/ContextPush.js";
@@ -83,21 +73,63 @@ import { getActiveStorage, getIndexEntryMap, getSummary, setActiveStorage } from
 const log = createLogger("PushExecutor");
 
 /**
- * Minimum wall-clock budget worth spending on the inline batch HTTP request.
- * Below this, `processPrePushInline` releases its claims instead of firing a
- * request that would almost certainly be aborted mid-flight.
+ * Where a `processPushPending` call originated — used only for logging, but that
+ * logging matters: all three paths share one function and the pre-push one runs
+ * in a detached process with no stdout, so `debug.log` is the only way to tell
+ * which drain produced a line.
  */
-export const INLINE_MIN_HTTP_BUDGET_MS = 500;
-
-/** Where a `processPushPending` call originated — used only for logging. */
-export type PushSource = "post-queue" | "activation";
+export type PushSource = "pre-push" | "post-queue" | "activation";
 
 export interface ProcessPushPendingOptions {
 	readonly source: PushSource;
 	/** When set, only these hashes are considered (QueueWorker post-drain path). */
 	readonly hashFilter?: ReadonlySet<string>;
-	/** Test seam — defaults to a real client. */
+	/**
+	 * Overrides the push client. A test seam, and also how the pre-push worker
+	 * raises its HTTP timeout above the client default — an aborted request
+	 * discards a docId the server already minted, which is the failure this whole
+	 * per-commit path exists to avoid.
+	 */
 	readonly client?: JolliMemoryPushClient;
+	/**
+	 * Skips the remote-ref confirmation gate.
+	 *
+	 * Only the pre-push worker sets this. Git calls the hook BEFORE transferring
+	 * objects, so while the hook is still alive the remote ref points at the old
+	 * sha and `ls-remote` would refuse every entry. The compensation drains keep
+	 * the gate.
+	 */
+	readonly skipPushConfirmation?: boolean;
+	/**
+	 * Suppresses orphan-article deletion; entries with pending cleanup are kept
+	 * (patched, not deleted) for a later confirmed drain.
+	 *
+	 * Set together with `skipPushConfirmation` and for the same reason: deleting
+	 * remote articles before git confirms the push can leave the remote history
+	 * intact while its memories are gone, with nothing left to restore them.
+	 */
+	readonly skipOrphanCleanup?: boolean;
+	/**
+	 * Epoch-ms after which no NEW commit push is started. Commits already in
+	 * flight run to completion; the rest are reported as deferred and left
+	 * pending for the compensation channels.
+	 *
+	 * Deliberately a start-gate rather than a cancellation: aborting a request
+	 * mid-flight discards a docId the server may already have minted, and the
+	 * retry would then CREATE a duplicate article — the exact failure the
+	 * per-commit path exists to avoid. Bounding *starts* caps the run without
+	 * ever reintroducing it.
+	 *
+	 * Omit for an unbounded drain (the compensation channels, which are already
+	 * bounded by how much backlog exists).
+	 */
+	readonly stopStartingAt?: number;
+	/**
+	 * Invoked as each commit reaches a terminal state, so a detached worker can
+	 * publish partial results while the rest is still in flight. Called from
+	 * concurrent tasks — keep the implementation synchronous and cheap.
+	 */
+	readonly onCommitSettled?: (outcome: CommitPushOutcome) => void;
 }
 
 export interface ProcessPushPendingResult {
@@ -112,6 +144,11 @@ export interface ProcessPushPendingResult {
 	 * Reported separately from `pushed`/`failed` — no network was attempted.
 	 */
 	readonly deletedChildren: number;
+	/**
+	 * Per-commit outcomes, populated whenever `onCommitSettled` is supplied — on
+	 * EVERY return path, including the early ones.
+	 */
+	readonly commits?: ReadonlyArray<CommitPushOutcome>;
 	/** Set when the whole run short-circuited (no work / not signed in). */
 	readonly note?: string;
 }
@@ -260,69 +297,12 @@ async function buildAttachmentOwnership(
 	return merged;
 }
 
-/** Partitions batch-eligible items by both item count and total content size. */
-function partitionBatchItems(items: ReadonlyArray<BuiltBatchItem>): BuiltBatchItem[][] {
-	const batches: BuiltBatchItem[][] = [];
-	let current: BuiltBatchItem[] = [];
-	let currentChars = 0;
-	for (const item of items) {
-		if (
-			current.length > 0 &&
-			(current.length >= BATCH_MAX_ITEMS || currentChars + item.batchContentChars > BATCH_MAX_TOTAL_CONTENT_CHARS)
-		) {
-			batches.push(current);
-			current = [];
-			currentChars = 0;
-		}
-		current.push(item);
-		currentChars += item.batchContentChars;
-	}
-	if (current.length > 0) batches.push(current);
-	return batches;
-}
-
-/** Keeps successful entries queued when their orphan cleanup is not finished. */
-function preserveCleanupPending(
-	updates: Map<string, BatchUpdate>,
-	cleanupPendingHashes: ReadonlyArray<string> | undefined,
-): void {
-	for (const hash of cleanupPendingHashes ?? []) {
-		if (updates.get(hash)?.kind === "delete") updates.set(hash, { kind: "patch", patch: {} });
-	}
-}
-
-/**
- * Keeps entries whose article was pushed but whose local docId write-back
- * failed: the patch records the minted docId/url so the next drain retries as
- * an UPDATE of the same article (never a duplicate CREATE) and the write-back
- * gets another chance. `retryCount` is deliberately untouched — the push
- * itself succeeded, so the operational retry budget must not shrink.
- */
-function preserveWriteBackFailures(
-	updates: Map<string, BatchUpdate>,
-	failures: ReadonlyArray<BatchWriteBackFailure> | undefined,
-	attemptedAtIso: string,
-): void {
-	for (const failure of failures ?? []) {
-		if (updates.get(failure.commitHash)?.kind !== "delete") continue;
-		updates.set(failure.commitHash, {
-			kind: "patch",
-			patch: {
-				lastAttemptAt: attemptedAtIso,
-				lastError: "pushed, but persisting the article id locally failed — will retry the write-back",
-				pushedDocId: failure.docId,
-				pushedUrl: failure.url,
-			},
-		});
-	}
-}
-
 /**
  * Grafts the docId/url a previous push minted — but failed to persist locally
  * (see `PushPendingEntry.pushedDocId`) — onto a summary that lacks one, so the
  * retry UPDATEs the existing article instead of CREATEing a duplicate. The
- * tenant gate stays where it always was: `buildBatchItems`/`pushSummary` only
- * reuse the id when `canReuseDocId` accepts the grafted url.
+ * tenant gate stays where it always was: `pushSummary` only reuses the id when
+ * `canReuseDocId` accepts the grafted url.
  */
 function withRecoveredDocId(summary: CommitSummary, entry: PushPendingEntry | undefined): CommitSummary {
 	if (summary.jolliDocId !== undefined) return summary;
@@ -374,6 +354,20 @@ export async function processPushPending(
 		deletedChildren: 0,
 	};
 
+	// Mirror every settled outcome into the result as well, so callers can choose
+	// between a live stream (the pre-push worker) and a plain list.
+	const settled: CommitPushOutcome[] = [];
+	const onCommitSettled = options.onCommitSettled
+		? (outcome: CommitPushOutcome): void => {
+				settled.push(outcome);
+				options.onCommitSettled?.(outcome);
+			}
+		: undefined;
+	// Every `return` goes through this so an early exit still reports whatever was
+	// settled. Without it the contract on `commits` would only hold on the happy path.
+	const withCommits = (result: ProcessPushPendingResult): ProcessPushPendingResult =>
+		onCommitSettled ? { ...result, commits: [...settled] } : result;
+
 	// Unlocked pre-flight read: cheap scan for eligible candidates. The actual
 	// commitment to process specific hashes happens via `claimForPush` below,
 	// which atomically stamps `claimedAt` under the file lock so concurrent
@@ -382,7 +376,7 @@ export async function processPushPending(
 	const allHashes = Object.keys(pending.entries);
 	if (allHashes.length === 0) {
 		log.debug("processPushPending(%s): no pending entries", options.source);
-		return { ...empty, note: "no pending entries" };
+		return withCommits({ ...empty, note: "no pending entries" });
 	}
 	log.info(
 		"processPushPending(%s): %d pending entr(ies)%s",
@@ -399,7 +393,7 @@ export async function processPushPending(
 	// post-queue, pre-push), not just the pre-push hook.
 	if (config.syncOnPush === false) {
 		log.info("processPushPending(%s): syncOnPush disabled — skipping %d entries", options.source, allHashes.length);
-		return { ...empty, note: "syncOnPush disabled" };
+		return withCommits({ ...empty, note: "syncOnPush disabled" });
 	}
 
 	// Per-repo opt-out gate (Story 2): the user disabled OUTBOUND push for this
@@ -411,7 +405,7 @@ export async function processPushPending(
 			options.source,
 			allHashes.length,
 		);
-		return { ...empty, note: "push disabled for this repo" };
+		return withCommits({ ...empty, note: "push disabled for this repo" });
 	}
 
 	// Auth gate: without a jolliApiKey there is nothing to push to. Keep the
@@ -422,7 +416,7 @@ export async function processPushPending(
 			options.source,
 			allHashes.length,
 		);
-		return { ...empty, note: "not signed in" };
+		return withCommits({ ...empty, note: "not signed in" });
 	}
 
 	// Eligible = under the retry ceiling, and (when a filter is set) in the filter.
@@ -433,22 +427,29 @@ export async function processPushPending(
 		const entry = pending.entries[hash];
 		if (entry.retryCount >= MAX_RETRY_COUNT) {
 			skippedRetryExhausted++;
+			onCommitSettled?.({ hash, status: "failed", reason: "failed repeatedly — giving up" });
 			continue;
 		}
 		eligible.push(hash);
 	}
-	if (eligible.length === 0) return { ...empty, skippedRetryExhausted, note: "no eligible entries" };
+	if (eligible.length === 0) return withCommits({ ...empty, skippedRetryExhausted, note: "no eligible entries" });
 
 	// Do not publish until the remote ref proves that the push succeeded.
 	// Failed/rejected pushes remain pending for a retry.
-	const confirmed = await waitForConfirmedPushes(cwd, eligible, pending.entries);
+	//
+	// The pre-push worker is the one caller that must skip this: it runs while git
+	// is still waiting for the hook to exit, so no ref has moved yet and every
+	// candidate would be refused.
+	const confirmed = options.skipPushConfirmation
+		? eligible
+		: await waitForConfirmedPushes(cwd, eligible, pending.entries);
 	if (confirmed.length === 0) {
 		log.info(
 			"processPushPending(%s): no candidate confirmed on the remote yet — keeping %d entr(ies)",
 			options.source,
 			eligible.length,
 		);
-		return { ...empty, skippedRetryExhausted, note: "push not confirmed" };
+		return withCommits({ ...empty, skippedRetryExhausted, note: "push not confirmed" });
 	}
 	log.debug(
 		"processPushPending(%s): %d/%d candidate(s) confirmed on the remote",
@@ -460,12 +461,20 @@ export async function processPushPending(
 	// Atomic claim: stamp `claimedAt` on every confirmed hash under the file
 	// lock. A concurrent `processPushPending` that races us will see a fresh
 	// `claimedAt` and skip the entry, preventing duplicate Space articles.
-	const { claimed, entries: claimedEntries } = await claimForPush(cwd, confirmed);
+	const { claimed, entries: claimedEntries, claimedAt: claimToken } = await claimForPush(cwd, confirmed);
 	if (claimed.size === 0) {
 		log.info("processPushPending(%s): all candidates already claimed by another process", options.source);
-		return { ...empty, skippedRetryExhausted, note: "all entries claimed by another process" };
+		return withCommits({ ...empty, skippedRetryExhausted, note: "all entries claimed by another process" });
 	}
 	const claimedHashes = confirmed.filter((h) => claimed.has(h));
+	// A hash we did not win is NOT silently dropped: the pre-push hook lists every
+	// commit of the push, and an unreported one would be rendered as "still
+	// running" long after this drain has exited.
+	for (const hash of confirmed) {
+		if (!claimed.has(hash)) {
+			onCommitSettled?.({ hash, status: "deferred", reason: "another sync is already handling this commit" });
+		}
+	}
 	log.info(
 		"processPushPending(%s): claimed %d/%d candidate(s)",
 		options.source,
@@ -504,6 +513,7 @@ export async function processPushPending(
 		if (indexEntry && indexEntry.parentCommitHash != null) {
 			preFlightUpdates.set(hash, { kind: "delete" });
 			deletedChildren++;
+			onCommitSettled?.({ hash, status: "merged", reason: "merged into another commit's memory" });
 			log.info(
 				"Skipping child entry %s (parent=%s) — already merged",
 				hash.substring(0, 8),
@@ -523,6 +533,7 @@ export async function processPushPending(
 		} else {
 			preFlightUpdates.set(hash, { kind: "patch", patch: {} });
 			skippedNoMemory++;
+			onCommitSettled?.({ hash, status: "generating", reason: "memory still generating — will sync later" });
 		}
 	}
 	if (preFlightUpdates.size > 0) {
@@ -540,7 +551,7 @@ export async function processPushPending(
 			deletedChildren > 0 && skippedNoMemory === 0
 				? "all candidates were merged children"
 				: "no candidates with memory";
-		return { ...empty, skippedNoMemory, skippedRetryExhausted, deletedChildren, note };
+		return withCommits({ ...empty, skippedNoMemory, skippedRetryExhausted, deletedChildren, note });
 	}
 
 	const ownership = await buildAttachmentOwnership(cwd, storage, claimedEntries, withMemory, candidateSummaries);
@@ -552,246 +563,70 @@ export async function processPushPending(
 
 	log.info("processPushPending(%s): pushing %d commit(s)", options.source, withMemory.length);
 
-	const updates = new Map<string, BatchUpdate>();
 	const counters = { pushed: 0, failed: 0 };
-	// The server's Space echo from any accepted batch request this run
-	// (concurrent writers all observe the same binding, so last-write-wins is
-	// fine). The per-commit fallback persists its own echo inside
-	// pushCandidatesIndividually.
-	let confirmedSpace: { readonly id: number; readonly name: string } | undefined;
 
-	// Batch-first: candidate windows are capped by item count, then split again
-	// by the server's total-content limit. Items that cannot pass the batch schema
-	// use the legacy per-commit path so one oversized memory cannot reject every
-	// otherwise-valid item in its batch.
-	let index = 0;
-	batchLoop: while (index < withMemory.length) {
-		const chunkHashes = withMemory.slice(index, index + BATCH_MAX_ITEMS);
-		index += chunkHashes.length;
-		const chunkSummaries: CommitSummary[] = [];
-		for (const hash of chunkHashes) {
-			const summary = candidateSummaries.get(hash);
-			if (summary) chunkSummaries.push(summary);
-		}
-		const built = await buildBatchItems(chunkSummaries, ownership, ctx);
-		const individualFallbackHashes = built
-			.filter((item) => item.batchIneligibleReason !== undefined)
-			.map((item) => item.item.commitHash);
-		for (const item of built) {
-			if (item.batchIneligibleReason) {
-				log.info(
-					"Commit %s requires individual push: %s",
-					item.item.commitHash.substring(0, 8),
-					item.batchIneligibleReason,
-				);
-			}
-		}
-		const batchGroups = partitionBatchItems(built.filter((item) => item.batchIneligibleReason === undefined));
+	// Single push path: one request group per commit, concurrency-limited.
+	//
+	// The batch endpoint was removed on purpose. Its payload cap
+	// (8 MB of combined content) sits well above a typical gateway's
+	// client_max_body_size, and the resulting 413 was indistinguishable from an
+	// ordinary transient failure: it burned all three retries and then aged out
+	// silently, so the user just saw memories never arrive. A per-commit request
+	// keeps the body proportional to one commit, and lets a settled commit be
+	// reported the moment it lands instead of all-or-nothing per batch.
+	await pushCandidatesIndividually({
+		cwd,
+		storage,
+		hashes: withMemory,
+		ownership,
+		claimedEntries,
+		claimToken,
+		ctx,
+		counters,
+		skipOrphanCleanup: options.skipOrphanCleanup === true,
+		...(options.stopStartingAt !== undefined && { stopStartingAt: options.stopStartingAt }),
+		onCommitSettled,
+	});
 
-		/**
-		 * Every claimed candidate this drain has not attempted yet, counted from
-		 * `fromGroupIndex`: that group onwards, this chunk's individual-fallback items
-		 * (they run only after the group loop finishes), and the chunks never reached.
-		 * Disjoint from the hashes already in `updates`, which belong to groups the
-		 * loop has passed.
-		 */
-		const unattemptedFrom = (fromGroupIndex: number): string[] => [
-			...batchGroups.slice(fromGroupIndex).flatMap((group) => group.map((item) => item.item.commitHash)),
-			...individualFallbackHashes,
-			...withMemory.slice(index),
-		];
-
-		for (let groupIndex = 0; groupIndex < batchGroups.length; groupIndex++) {
-			const batchBuilt = batchGroups[groupIndex];
-			const batchHashes = batchBuilt.map((item) => item.item.commitHash);
-			// Story 2 / spec 306: re-read the opt-out before EVERY batch so a user who
-			// disables push mid-drain stops the remaining sends. Nothing is marked failed
-			// and no retry is burned — but every unattempted entry must also have its
-			// CLAIM released, or the re-enable drain (which runs immediately on toggle-on)
-			// finds them still claimed by this run and skips them: `claimForPush` honours
-			// a claim for CLAIM_STALE_MS (5 min), and the drain is a single detached pass
-			// with no retry of its own, so the backlog would sit until some unrelated
-			// trigger. Same fix as the mirror site in `processPrePushInline`, folded into
-			// the run's existing single `updateBatch` write instead of a second one.
-			if (!(await isOutboundPushAllowed(cwd))) {
-				const held = unattemptedFrom(groupIndex);
-				releaseClaimsInto(updates, held);
-				log.info(
-					"processPushPending(%s): push disabled mid-drain — stopping before batch %d of %d, releasing %d claim(s)",
-					options.source,
-					groupIndex + 1,
-					batchGroups.length,
-					held.length,
-				);
-				break batchLoop;
-			}
-			let batchResult: BatchPushResult;
-			try {
-				batchResult = await client.pushBatch({ repoUrl, items: batchBuilt.map((item) => item.item) });
-			} catch (err) {
-				if (err instanceof BatchUnsupportedError) {
-					log.info(
-						"processPushPending(%s): server lacks batch support — falling back to per-commit pushes",
-						options.source,
-					);
-					const fallbackHashes = [
-						...batchGroups.slice(groupIndex).flatMap((group) => group.map((item) => item.item.commitHash)),
-						...individualFallbackHashes,
-						...withMemory.slice(index),
-					];
-					await pushCandidatesIndividually({
-						cwd,
-						storage,
-						hashes: fallbackHashes,
-						ownership,
-						claimedEntries,
-						ctx,
-						updates,
-						counters,
-					});
-					break batchLoop;
-				}
-				const { increment, message } = classifyError(err);
-				if (
-					err instanceof BindingRequiredError ||
-					err instanceof NotAuthenticatedError ||
-					err instanceof PermissionDeniedError
-				) {
-					// The server just contradicted any cached binding (unbound
-					// elsewhere, or auth/permission revoked) — drop the cache so
-					// `jolli status` / bare `jolli` stop rendering a stale bound row.
-					await clearSpaceBindingCache(cwd);
-				}
-				const failedAtIso = new Date().toISOString();
-				// Config failures affect every unsent item identically, so release all
-				// remaining claims without wasting more network requests.
-				const affected = increment ? batchHashes : [...batchHashes, ...unattemptedFrom(groupIndex + 1)];
-				for (const hash of affected) {
-					updates.set(hash, {
-						kind: "patch",
-						patch: {
-							lastAttemptAt: failedAtIso,
-							lastError: message,
-							...(increment ? { retryCount: claimedEntries[hash].retryCount + 1 } : {}),
-						},
-					});
-				}
-				counters.failed += affected.length;
-				log.warn(
-					"processPushPending(%s): batch request failed for %d commit(s): %s (retry %s)",
-					options.source,
-					affected.length,
-					message,
-					increment ? "counted" : "held",
-				);
-				if (!increment) break batchLoop;
-				continue;
-			}
-
-			if (batchResult.jmSpace) {
-				confirmedSpace = batchResult.jmSpace;
-			}
-			const resultByHash = new Map(batchResult.results.map((result) => [result.commitHash, result]));
-			const nowIso = new Date().toISOString();
-			for (const hash of batchHashes) {
-				const result = resultByHash.get(hash);
-				if (result?.ok) {
-					updates.set(hash, { kind: "delete" });
-					counters.pushed++;
-					continue;
-				}
-				counters.failed++;
-				const message = result?.error ?? result?.errorCode ?? "missing batch result";
-				updates.set(hash, {
-					kind: "patch",
-					patch: {
-						lastAttemptAt: nowIso,
-						lastError: message,
-						retryCount: claimedEntries[hash].retryCount + 1,
-					},
-				});
-				log.warn("Batch push failed for %s: %s", hash.substring(0, 8), message);
-			}
-
-			// Compensation has no wall-clock budget, so it resolves delayed orphan
-			// hashes and deletes known orphaned articles after each successful batch.
-			try {
-				const writeBack = await applyBatchResult(batchBuilt, batchResult.results, ctx, {
-					cleanupOrphans: true,
-				});
-				preserveCleanupPending(updates, writeBack.cleanupPendingHashes);
-				preserveWriteBackFailures(updates, writeBack.writeBackFailures, nowIso);
-				log.info(
-					"processPushPending(%s): write-back — writtenBack=%d childSkipped=%d cleanupPending=%d writeBackFailed=%d",
-					options.source,
-					writeBack.writtenBack,
-					writeBack.childSkipped,
-					writeBack.cleanupPendingHashes?.length ?? 0,
-					writeBack.writeBackFailures?.length ?? 0,
-				);
-			} catch (err) {
-				log.warn("processPushPending(%s): write-back failed: %s", options.source, errMsg(err));
-			}
-		}
-
-		if (individualFallbackHashes.length > 0) {
-			await pushCandidatesIndividually({
-				cwd,
-				storage,
-				hashes: individualFallbackHashes,
-				ownership,
-				claimedEntries,
-				ctx,
-				updates,
-				counters,
-			});
-		}
-	}
-
-	await updateBatch(cwd, updates);
-	await persistConfirmedSpace(ctx, confirmedSpace);
 	log.info("processPushPending(%s): pushed=%d failed=%d", options.source, counters.pushed, counters.failed);
 
-	return {
+	return withCommits({
 		attempted: withMemory.length,
 		pushed: counters.pushed,
 		failed: counters.failed,
 		skippedNoMemory,
 		skippedRetryExhausted,
 		deletedChildren,
-	};
+	});
 }
 
 /**
- * Per-commit outcome of the fallback loop. `held` means the push was skipped by
+ * Per-commit outcome of the push loop. `held` means the push was skipped by
  * the per-repo outbound opt-out (spec 306) — no attempt is recorded, so it is
  * deliberately counted as neither a success nor a failure; only the claim is
- * released (see {@link releaseClaimsInto}).
+ * released.
  */
 type PushOutcome = "pushed" | "failed" | "held";
 
 /**
- * Stages a claim-release-only update for `hashes`: an empty patch clears
- * `claimedAt` and touches nothing else (see `updateBatch`), so the entry becomes
- * indistinguishable from one this drain never reached — no `lastError`, no retry
- * burned — while any later drain can re-claim it immediately instead of waiting
- * out the 5-minute claim TTL.
+ * The push loop: one request group per commit, `PUSH_CONCURRENCY` of them in
+ * flight at a time. Re-reads each summary right before the network call
+ * (stale-summary race guard), pushes via `pushSummary` (attachments first, then
+ * the summary itself), and commits each entry's accounting AS IT SETTLES rather
+ * than in one batch at the end.
  *
- * The in-place variant of {@link releaseClaims}, for callers that already have an
- * `updates` map being flushed in one `updateBatch` write.
- */
-function releaseClaimsInto(updates: Map<string, BatchUpdate>, hashes: Iterable<string>): void {
-	for (const hash of hashes) updates.set(hash, { kind: "patch", patch: {} });
-}
-
-/**
- * Legacy per-commit push loop — retained as the fallback for servers that
- * predate the batch endpoint. Identical semantics to the pre-batch drain:
- * re-reads each summary right before the network call (stale-summary race
- * guard), pushes via `pushSummary` (orphan cleanup included), and fills
- * `updates`/`counters` in place. Binding-cache maintenance matches the batch
- * path: the `jmSpace` echo of a successful `pushSummary` is persisted, a
- * 412/401/403 rejection clears the cache.
+ * Per-commit persistence is load-bearing, not a style choice. At commit
+ * granularity a drain routinely runs for minutes — longer than the claim TTL —
+ * so buffering the whole ledger in memory would mean a mid-run crash replays
+ * commits that already published, creating duplicate articles. The claim
+ * heartbeat covers the other half of that race: it keeps this drain's own claims
+ * alive so no other channel can take them over while a push is still in flight.
+ *
+ * Concurrency is safe at commit granularity because context ownership is decided
+ * up front by `assignOwnedContext`: an item of any registered kind shared by
+ * several commits is pushed by exactly one of them, so concurrent commits never
+ * touch the same remote document. Local write-back is serialised by
+ * `storeSummary`'s orphan-write lock.
  */
 async function pushCandidatesIndividually(args: {
 	readonly cwd: string;
@@ -799,57 +634,128 @@ async function pushCandidatesIndividually(args: {
 	readonly hashes: ReadonlyArray<string>;
 	readonly ownership: OwnedContext;
 	readonly claimedEntries: Readonly<Record<string, PushPendingEntry>>;
+	/** The `claimedAt` stamp this drain owns — the heartbeat's compare-and-swap token. */
+	readonly claimToken: string;
 	readonly ctx: PushContext;
-	readonly updates: Map<string, BatchUpdate>;
 	readonly counters: { pushed: number; failed: number };
+	/** Defer orphan deletion and keep the entry — see ProcessPushPendingOptions. */
+	readonly skipOrphanCleanup: boolean;
+	/** Start-gate for new pushes — see ProcessPushPendingOptions.stopStartingAt. */
+	readonly stopStartingAt?: number;
+	readonly onCommitSettled?: (outcome: CommitPushOutcome) => void;
 }): Promise<void> {
-	const { cwd, storage, hashes, ownership, claimedEntries, ctx, updates, counters } = args;
-	const nowIso = new Date().toISOString();
+	const { cwd, storage, hashes, ownership, claimedEntries, ctx, skipOrphanCleanup, onCommitSettled } = args;
+	const { stopStartingAt } = args;
 	// The server's Space echo from any successful push this run (concurrent
 	// writers all observe the same binding, so last-write-wins is fine).
 	let confirmedSpace: { readonly id: number; readonly name: string } | undefined;
-	const results = await mapWithConcurrency(hashes, PUSH_CONCURRENCY, async (hash): Promise<PushOutcome> => {
+
+	// Commit one entry's accounting immediately. Single-entry writes take the same
+	// file lock as a batch, so ordering across concurrent tasks stays safe.
+	const commitEntry = async (hash: string, update: BatchUpdate): Promise<void> => {
+		try {
+			await updateBatch(cwd, new Map([[hash, update]]));
+		} catch (err) {
+			// The push already happened; a bookkeeping failure must not fail it.
+			// The entry stays claimed and a later drain re-reads the stored docId,
+			// so the retry UPDATEs rather than duplicates. The one case that loses the
+			// id is a `writeBackFailed` patch failing here — that patch IS the backup
+			// copy of an id the local summary never received. Two consecutive local
+			// write failures, so a duplicate article there is the accepted floor.
+			log.warn("Could not persist push accounting for %s: %s", hash.substring(0, 8), errMsg(err));
+		}
+	};
+
+	const inFlight = new Set(hashes);
+	let claimToken = args.claimToken;
+	// Heartbeat: keep this drain's claims from going stale mid-flight. unref() so
+	// a stuck timer can never keep the worker process alive past its work.
+	const heartbeat = setInterval(() => {
+		if (inFlight.size === 0) return;
+		void renewClaims(cwd, [...inFlight], claimToken)
+			.then((renewed) => {
+				// undefined means nothing matched our token any more — every entry is
+				// either finished or now held by someone else. Keep the old token so a
+				// later beat cannot resurrect a claim we no longer own.
+				if (renewed) claimToken = renewed;
+			})
+			.catch((err: unknown) => {
+				log.debug("Claim renewal failed (will retry next beat): %s", errMsg(err));
+			});
+	}, CLAIM_RENEW_INTERVAL_MS);
+	heartbeat.unref();
+
+	const pushOne = async (hash: string): Promise<PushOutcome> => {
+		// Runtime ceiling. Checked before anything else so a commit that never
+		// started leaves no trace: the claim is released, no attempt is recorded,
+		// and no retry is burned — indistinguishable from one this drain never
+		// reached. Commits already in flight are untouched (see stopStartingAt).
+		if (stopStartingAt !== undefined && Date.now() >= stopStartingAt) {
+			await commitEntry(hash, { kind: "patch", patch: {} });
+			onCommitSettled?.({ hash, status: "deferred", reason: "run time limit reached — will sync later" });
+			return "held";
+		}
 		// Story 2 / spec 306: the drain's entry gate ran once, before this loop.
 		// Re-read the opt-out per commit so a user who disables push mid-drain stops
-		// the REMAINING sends — the VS Code client and the IntelliJ bridge both
-		// re-check per outbound call, and this is where the native CLI matches them.
-		// "held" is deliberately neither pushed nor failed: no attempt is recorded and
-		// no retry is burned. The claim IS released, because the re-enable drain runs
-		// immediately on toggle-on and `claimForPush` would otherwise skip a claim this
-		// young for CLAIM_STALE_MS (5 min) — leaving the backlog for an unrelated later
-		// trigger, the opposite of the catch-up this branch exists to enable.
+		// the REMAINING sends. "held" is deliberately neither pushed nor failed: no
+		// attempt is recorded and no retry is burned. The claim IS released, because
+		// the re-enable drain runs immediately on toggle-on and would otherwise skip
+		// a claim this young for the full TTL.
 		if (!(await isOutboundPushAllowed(cwd))) {
-			releaseClaimsInto(updates, [hash]);
+			await commitEntry(hash, { kind: "patch", patch: {} });
+			onCommitSettled?.({ hash, status: "deferred", reason: "outbound push disabled for this repo" });
 			return "held";
 		}
 		// Re-read immediately before the network call so a concurrent rewrite or
 		// cleanup cannot make us publish a stale summary captured earlier.
 		const freshSummary = await getSummary(hash, cwd, storage);
 		if (!freshSummary || freshSummary.commitHash !== hash) {
-			// Raced away (deleted between the memory check and here), or
-			// tree-hash fallback resolved to another commit's summary. Drop it.
-			updates.set(hash, { kind: "delete" });
+			// Raced away (deleted between the memory check and here), or tree-hash
+			// fallback resolved to another commit's summary. Drop it.
+			await commitEntry(hash, { kind: "delete" });
+			onCommitSettled?.({ hash, status: "failed", reason: "summary changed mid-push" });
 			return "failed";
 		}
 		const summary = withRecoveredDocId(freshSummary, claimedEntries[hash]);
 		// Kind-agnostic: whatever kinds are registered, this commit pushes exactly the
-		// items it owns for each of them.
+		// items it owns for each of them. Never hand-build the legacy
+		// `{plans, notes, references}` shape here — naming only those three means
+		// "push ZERO of every other kind", which would silently skip skill and every
+		// future kind on this path.
 		const attachments = selectionForCommit(ownership, hash);
 		try {
-			const { jmSpace } = await pushSummary(summary, ctx, attachments);
-			if (jmSpace) {
-				confirmedSpace = jmSpace;
+			const pushed = await pushSummary(summary, ctx, attachments, { skipOrphanCleanup });
+			if (pushed.jmSpace) confirmedSpace = pushed.jmSpace;
+			if (pushed.writeBackFailed) {
+				// The article exists server-side but its id never reached local
+				// storage. Record the minted ids so the next drain UPDATEs the same
+				// article instead of CREATEing a duplicate, and leave retryCount alone:
+				// the push itself succeeded, only the bookkeeping needs another go.
+				await commitEntry(hash, {
+					kind: "patch",
+					patch: {
+						lastAttemptAt: new Date().toISOString(),
+						lastError: "pushed, but persisting the article id locally failed — will retry the write-back",
+						pushedDocId: pushed.docId,
+						pushedUrl: pushed.summaryUrl,
+					},
+				});
+			} else {
+				// An entry whose orphan cleanup is still outstanding must SURVIVE as a
+				// patch: deleting it would strand those articles with nothing left
+				// pointing at them.
+				await commitEntry(hash, pushed.cleanupPending ? { kind: "patch", patch: {} } : { kind: "delete" });
 			}
-			updates.set(hash, { kind: "delete" });
+			onCommitSettled?.({ hash, status: "pushed", ...(pushed.summaryUrl ? { url: pushed.summaryUrl } : {}) });
 			return "pushed";
 		} catch (err) {
 			// The orchestrator's live re-check tripped between attachments (the
-			// per-commit check above passed). Record no attempt — no lastError, no retry —
-			// so the entry is indistinguishable from one this drain never reached, and
-			// report it as held rather than failed. Releasing the claim is what makes that
-			// true for the re-enable drain as well; see the per-commit gate above.
+			// per-commit check above passed). Record no attempt — no lastError, no
+			// retry — so the entry is indistinguishable from one this drain never
+			// reached, and report it as held rather than failed.
 			if (err instanceof PushDisabledError) {
-				releaseClaimsInto(updates, [hash]);
+				await commitEntry(hash, { kind: "patch", patch: {} });
+				onCommitSettled?.({ hash, status: "deferred", reason: "outbound push disabled for this repo" });
 				return "held";
 			}
 			const { increment, message } = classifyError(err);
@@ -858,16 +764,19 @@ async function pushCandidatesIndividually(args: {
 				err instanceof NotAuthenticatedError ||
 				err instanceof PermissionDeniedError
 			) {
-				// The server just contradicted any cached binding (unbound
-				// elsewhere, or auth/permission revoked) — drop the cache so
-				// `jolli status` / bare `jolli` stop rendering a stale bound row.
+				// The server just contradicted any cached binding (unbound elsewhere,
+				// or auth/permission revoked) — drop the cache so `jolli status` / bare
+				// `jolli` stop rendering a stale bound row.
 				await clearSpaceBindingCache(cwd);
 			}
 			const entry = claimedEntries[hash];
-			updates.set(hash, {
+			// Stamped per failure rather than once per drain: at commit granularity a
+			// drain runs for minutes, so a shared timestamp would misdate late
+			// failures by the whole run length.
+			await commitEntry(hash, {
 				kind: "patch",
 				patch: {
-					lastAttemptAt: nowIso,
+					lastAttemptAt: new Date().toISOString(),
 					lastError: message,
 					...(increment ? { retryCount: entry.retryCount + 1 } : {}),
 				},
@@ -878,79 +787,42 @@ async function pushCandidatesIndividually(args: {
 				message,
 				increment ? "counted" : "held",
 			);
+			onCommitSettled?.({ hash, status: "failed", reason: friendlyPushFailure(message) });
 			return "failed";
 		}
-	});
-	for (const result of results) {
-		if (result === "pushed") counters.pushed++;
-		else if (result === "failed") counters.failed++;
-		// "held" (opt-out) is counted as neither: nothing was sent and nothing failed,
-		// and the entry stays pending for the re-enable drain.
+	};
+
+	try {
+		const results = await mapWithConcurrency(hashes, PUSH_CONCURRENCY, async (hash): Promise<PushOutcome> => {
+			try {
+				return await pushOne(hash);
+			} finally {
+				inFlight.delete(hash);
+			}
+		});
+		for (const result of results) {
+			if (result === "pushed") args.counters.pushed++;
+			else if (result === "failed") args.counters.failed++;
+			// "held" (opt-out) is counted as neither: nothing was sent and nothing
+			// failed, and the entry stays pending for the re-enable drain.
+		}
+	} finally {
+		clearInterval(heartbeat);
 	}
 	await persistConfirmedSpace(ctx, confirmedSpace);
 }
 
-// ─── Inline pre-push drain (synchronous, budget-bound, single batch request) ─
+/** Display status of one commit in a push result list. */
+export type CommitPushStatus = "pushed" | "generating" | "failed" | "deferred" | "merged";
 
-export interface ProcessPrePushInlineOptions {
-	/** Commits of the current push — the ONLY entries this drain considers, in push order. */
-	readonly priorityHashes: ReadonlyArray<string>;
-	/** Absolute epoch-ms deadline for the WHOLE inline phase (local reads + HTTP). */
-	readonly deadlineAt: number;
-	/** Test seam — defaults to a real client whose timeout is the remaining budget. */
-	readonly client?: JolliMemoryPushClient;
-}
-
-/** Display status of one commit in the inline pre-push sync result list. */
-export type InlineCommitStatus = "pushed" | "generating" | "failed" | "deferred" | "merged";
-
-/** Per-commit outcome, in push order — feeds the hook's `git push` result list. */
-export interface InlineCommitOutcome {
+/** Per-commit outcome — feeds the pre-push hook's `git push` result list. */
+export interface CommitPushOutcome {
 	readonly hash: string;
-	readonly status: InlineCommitStatus;
+	readonly status: CommitPushStatus;
 	/** Absolute article URL — set only for "pushed". */
 	readonly url?: string;
 	/** Short human-readable reason — set for every non-"pushed" status. */
 	readonly reason?: string;
-}
-
-export interface ProcessPrePushInlineResult {
-	readonly attempted: number;
-	readonly pushed: number;
-	readonly failed: number;
-	readonly skippedNoMemory: number;
-	readonly skippedRetryExhausted: number;
-	readonly deletedChildren: number;
-	/** Claimed candidates released untouched — budget/limit deferral, deadline abort, or no batch support. */
-	readonly notAttempted: number;
-	/** Per-commit outcomes of THIS push's commits, in push order. */
-	readonly commits: ReadonlyArray<InlineCommitOutcome>;
-	/** Set when the run short-circuited or the batch request failed as a whole. */
-	readonly note?: string;
-}
-
-const EMPTY_INLINE_RESULT: ProcessPrePushInlineResult = {
-	attempted: 0,
-	pushed: 0,
-	failed: 0,
-	skippedNoMemory: 0,
-	skippedRetryExhausted: 0,
-	deletedChildren: 0,
-	notAttempted: 0,
-	commits: [],
-};
-
-/** Orders the collected outcomes by the push's own commit order. */
-function commitsInPushOrder(
-	priorityHashes: ReadonlyArray<string>,
-	outcomes: ReadonlyMap<string, InlineCommitOutcome>,
-): InlineCommitOutcome[] {
-	const commits: InlineCommitOutcome[] = [];
-	for (const hash of priorityHashes) {
-		const outcome = outcomes.get(hash);
-		if (outcome) commits.push(outcome);
-	}
-	return commits;
 }
 
 /** Short, user-facing reason for a failed push — printed verbatim in the hook's result list. */
@@ -961,471 +833,6 @@ function friendlyPushFailure(message: string): string {
 	if (message === "client-outdated") return "Jolli client is outdated — please update";
 	const compact = message.trim().replace(/\s+/g, " ");
 	return compact.length > 60 ? `${compact.substring(0, 59)}…` : compact;
-}
-
-/** True for a fetch aborted by the client's own deadline timer — not a server failure. */
-function isAbortError(err: unknown): boolean {
-	return err instanceof Error && err.name === "AbortError";
-}
-
-/**
- * Releases claims without recording an attempt: an empty patch clears
- * `claimedAt` only, so any later drain (post-queue, activation, next push)
- * can pick the entry up immediately instead of waiting out the claim TTL.
- */
-async function releaseClaims(cwd: string, hashes: ReadonlyArray<string>): Promise<void> {
-	if (hashes.length === 0) return;
-	const updates = new Map<string, BatchUpdate>();
-	for (const hash of hashes) updates.set(hash, { kind: "patch", patch: {} });
-	await updateBatch(cwd, updates);
-}
-
-/**
- * Synchronous pre-push drain, called INSIDE the git pre-push hook while git is
- * waiting for the hook to exit. Key differences from {@link processPushPending}:
- *
- * - **No push confirmation.** The hook runs before git transfers objects, so
- *   waiting for the remote ref would deadlock (git waits for the hook; the
- *   hook would wait for the push). Publishing is optimistic by design — a
- *   rejected push can briefly leave Space articles for commits that never
- *   reached the remote; the user's retry converges them via docId reuse.
- * - **At most one HTTP request.** Batch-eligible memories that fit the server's
- *   total-content limit go out in one `pushBatch` call. Oversized or overflow
- *   items stay pending for the compensation path.
- * - **Hard wall-clock budget.** Every phase checks `deadlineAt`; when the
- *   budget runs out, unprocessed candidates release their claims and stay
- *   pending. The HTTP call's own timeout is the remaining budget, so a hung
- *   connection cannot keep the hook process (and therefore `git push`) alive.
- * - **This push only.** Only the commits of the current push are considered;
- *   leftover entries from earlier pushes stay for the compensation channels
- *   (QueueWorker post-drain, activation retry) so the blocking window stays
- *   proportional to the push at hand. Every considered commit gets a per-hash
- *   entry in `commits` for the hook's result list.
- */
-export async function processPrePushInline(
-	cwd: string,
-	options: ProcessPrePushInlineOptions,
-): Promise<ProcessPrePushInlineResult> {
-	const remainingMs = (): number => options.deadlineAt - Date.now();
-
-	const pending = await loadPushPending(cwd);
-	const allHashes = Object.keys(pending.entries);
-	log.info(
-		"processPrePushInline: %d commit(s) in this push, %d pending entr(ies) on disk",
-		options.priorityHashes.length,
-		allHashes.length,
-	);
-	if (allHashes.length === 0) return { ...EMPTY_INLINE_RESULT, note: "no pending entries" };
-
-	// Same gates as processPushPending — the hook checks these before calling,
-	// but the gates stay here so any future caller inherits them.
-	const config = await loadConfig();
-	if (config.syncOnPush === false) {
-		log.info("processPrePushInline: syncOnPush disabled — skipping %d entries", allHashes.length);
-		return { ...EMPTY_INLINE_RESULT, note: "syncOnPush disabled" };
-	}
-	// Per-repo opt-out gate (Story 2). Entries are recorded write-first by the
-	// hook before this call, so returning here keeps them pending (a later
-	// re-enable drains them) while uploading nothing — the "record locally, skip
-	// outbound" behavior. The hook surfaces the note.
-	if (!(await isOutboundPushAllowed(cwd))) {
-		log.info("processPrePushInline: push disabled for this repo — skipping %d entries", allHashes.length);
-		return { ...EMPTY_INLINE_RESULT, note: "push disabled for this repo" };
-	}
-	if (!config.jolliApiKey) {
-		log.info("processPrePushInline: not signed in — keeping %d entries for later", allHashes.length);
-		return { ...EMPTY_INLINE_RESULT, note: "not signed in" };
-	}
-
-	// Scope: ONLY this push's commits, in push order, capped to the server's
-	// batch limit. Leftover entries from earlier pushes are deliberately left
-	// for the compensation channels.
-	const outcomes = new Map<string, InlineCommitOutcome>();
-	let skippedRetryExhausted = 0;
-	const candidates: string[] = [];
-	for (const hash of options.priorityHashes) {
-		const entry = pending.entries[hash];
-		if (!entry) continue; // not recorded (pruned/raced away) — nothing to report
-		if (entry.retryCount >= MAX_RETRY_COUNT) {
-			skippedRetryExhausted++;
-			outcomes.set(hash, { hash, status: "failed", reason: "failed repeatedly — giving up" });
-			continue;
-		}
-		if (candidates.length < BATCH_MAX_ITEMS) {
-			candidates.push(hash);
-		} else {
-			outcomes.set(hash, { hash, status: "deferred", reason: "over the batch limit — will sync later" });
-		}
-	}
-	if (candidates.length === 0) {
-		log.info("processPrePushInline: no eligible candidates (%d retry-exhausted)", skippedRetryExhausted);
-		return {
-			...EMPTY_INLINE_RESULT,
-			skippedRetryExhausted,
-			commits: commitsInPushOrder(options.priorityHashes, outcomes),
-			note: "no eligible entries",
-		};
-	}
-
-	// Atomic claim — identical race protection to processPushPending.
-	const { claimed, entries: claimedEntries } = await claimForPush(cwd, candidates);
-	const claimedHashes: string[] = [];
-	for (const hash of candidates) {
-		if (claimed.has(hash)) {
-			claimedHashes.push(hash);
-		} else {
-			outcomes.set(hash, { hash, status: "deferred", reason: "another sync is already handling this commit" });
-		}
-	}
-	log.info("processPrePushInline: claimed %d/%d candidate(s)", claimedHashes.length, candidates.length);
-	if (claimedHashes.length === 0) {
-		return {
-			...EMPTY_INLINE_RESULT,
-			skippedRetryExhausted,
-			commits: commitsInPushOrder(options.priorityHashes, outcomes),
-			note: "all entries claimed by another process",
-		};
-	}
-
-	const deferAll = (hashes: ReadonlyArray<string>, reason: string): void => {
-		for (const hash of hashes) outcomes.set(hash, { hash, status: "deferred", reason });
-	};
-
-	if (remainingMs() <= 0) {
-		log.warn("processPrePushInline: budget exhausted before triage — deferring %d commit(s)", claimedHashes.length);
-		await releaseClaims(cwd, claimedHashes);
-		deferAll(claimedHashes, "timed out — will sync later");
-		return {
-			...EMPTY_INLINE_RESULT,
-			skippedRetryExhausted,
-			notAttempted: claimedHashes.length,
-			commits: commitsInPushOrder(options.priorityHashes, outcomes),
-			note: "budget exhausted",
-		};
-	}
-
-	const storage = await ensureStorage(cwd);
-
-	// Triage — same rules as processPushPending: merged children drop out, and
-	// only commits whose own summary exists go into the batch.
-	const indexEntries = await getIndexEntryMap(cwd, storage);
-	const withMemory: string[] = [];
-	const candidateSummaries = new Map<string, CommitSummary>();
-	let skippedNoMemory = 0;
-	let deletedChildren = 0;
-	const preFlightUpdates = new Map<string, BatchUpdate>();
-	for (const hash of claimedHashes) {
-		const indexEntry = indexEntries.get(hash);
-		if (indexEntry && indexEntry.parentCommitHash != null) {
-			preFlightUpdates.set(hash, { kind: "delete" });
-			deletedChildren++;
-			outcomes.set(hash, { hash, status: "merged", reason: "merged into another commit's memory" });
-			log.info(
-				"Skipping child entry %s (parent=%s) — already merged",
-				hash.substring(0, 8),
-				indexEntry.parentCommitHash.substring(0, 8),
-			);
-			continue;
-		}
-		const summary = await getSummary(hash, cwd, storage);
-		if (summary && summary.commitHash === hash) {
-			withMemory.push(hash);
-			candidateSummaries.set(hash, withRecoveredDocId(summary, claimedEntries[hash]));
-		} else {
-			// The empty patch releases the claim so QueueWorker's post-drain
-			// trigger can push the commit the moment its summary lands.
-			preFlightUpdates.set(hash, { kind: "patch", patch: {} });
-			skippedNoMemory++;
-			outcomes.set(hash, { hash, status: "generating", reason: "memory still generating — will sync later" });
-		}
-	}
-	if (preFlightUpdates.size > 0) {
-		await updateBatch(cwd, preFlightUpdates);
-	}
-	log.info(
-		"processPrePushInline: triage — withMemory=%d generating=%d mergedChildren=%d",
-		withMemory.length,
-		skippedNoMemory,
-		deletedChildren,
-	);
-	const baseResult: ProcessPrePushInlineResult = {
-		...EMPTY_INLINE_RESULT,
-		skippedNoMemory,
-		skippedRetryExhausted,
-		deletedChildren,
-	};
-	if (withMemory.length === 0) {
-		const note =
-			deletedChildren > 0 && skippedNoMemory === 0
-				? "all candidates were merged children"
-				: "no candidates with memory";
-		return { ...baseResult, commits: commitsInPushOrder(options.priorityHashes, outcomes), note };
-	}
-
-	if (remainingMs() <= INLINE_MIN_HTTP_BUDGET_MS) {
-		log.warn(
-			"processPrePushInline: budget exhausted before the batch request — deferring %d commit(s)",
-			withMemory.length,
-		);
-		await releaseClaims(cwd, withMemory);
-		deferAll(withMemory, "timed out — will sync later");
-		return {
-			...baseResult,
-			notAttempted: withMemory.length,
-			commits: commitsInPushOrder(options.priorityHashes, outcomes),
-			note: "budget exhausted",
-		};
-	}
-
-	// Payload preparation needs auth/env helpers but performs no network request.
-	// A fresh deadline-bound client is created immediately before pushBatch below,
-	// after git reads and attachment loading have consumed their share of the budget.
-	const preparationClient = options.client ?? new JolliMemoryPushClient();
-	const repoUrl = await getCanonicalRepoUrl(cwd);
-	const baseUrl = await preparationClient.resolveBaseUrl();
-	const displayBase = baseUrl.replace(/\/+$/, "");
-	const preparationCtx: PushContext = { cwd, baseUrl, repoUrl, client: preparationClient, storage };
-
-	const summaries: CommitSummary[] = [];
-	for (const hash of withMemory) {
-		const summary = candidateSummaries.get(hash);
-		if (summary) summaries.push(summary);
-	}
-	const ownership = await buildAttachmentOwnership(cwd, storage, claimedEntries, withMemory, candidateSummaries);
-	const built = await buildBatchItems(summaries, ownership, preparationCtx);
-
-	if (remainingMs() <= INLINE_MIN_HTTP_BUDGET_MS) {
-		log.warn(
-			"processPrePushInline: budget exhausted after payload build — deferring %d commit(s)",
-			withMemory.length,
-		);
-		await releaseClaims(cwd, withMemory);
-		deferAll(withMemory, "timed out — will sync later");
-		return {
-			...baseResult,
-			notAttempted: withMemory.length,
-			commits: commitsInPushOrder(options.priorityHashes, outcomes),
-			note: "budget exhausted",
-		};
-	}
-
-	// Inline mode is intentionally one request. Fill it greedily within the
-	// server's total-content cap; invalid/overflow items release their claims and
-	// stay pending for the confirmed compensation path, which can split batches or
-	// fall back to individual pushes without blocking git.
-	const batchBuilt: BuiltBatchItem[] = [];
-	const deferredByBatchLimit: string[] = [];
-	let batchContentChars = 0;
-	for (const item of built) {
-		const hash = item.item.commitHash;
-		if (item.batchIneligibleReason) {
-			deferredByBatchLimit.push(hash);
-			outcomes.set(hash, {
-				hash,
-				status: "deferred",
-				reason: `${item.batchIneligibleReason} — will sync separately`,
-			});
-			continue;
-		}
-		if (batchContentChars + item.batchContentChars > BATCH_MAX_TOTAL_CONTENT_CHARS) {
-			deferredByBatchLimit.push(hash);
-			outcomes.set(hash, {
-				hash,
-				status: "deferred",
-				reason: "batch content limit reached — will sync later",
-			});
-			continue;
-		}
-		batchBuilt.push(item);
-		batchContentChars += item.batchContentChars;
-	}
-	if (deferredByBatchLimit.length > 0) {
-		await releaseClaims(cwd, deferredByBatchLimit);
-		log.info(
-			"processPrePushInline: deferred %d commit(s) that exceed inline batch limits",
-			deferredByBatchLimit.length,
-		);
-	}
-	if (batchBuilt.length === 0) {
-		return {
-			...baseResult,
-			notAttempted: deferredByBatchLimit.length,
-			commits: commitsInPushOrder(options.priorityHashes, outcomes),
-			note: "batch limits require compensation",
-		};
-	}
-
-	const batchHashes = batchBuilt.map((item) => item.item.commitHash);
-	if (remainingMs() <= INLINE_MIN_HTTP_BUDGET_MS) {
-		log.warn(
-			"processPrePushInline: budget exhausted before the batch request — deferring %d commit(s)",
-			batchHashes.length,
-		);
-		await releaseClaims(cwd, batchHashes);
-		deferAll(batchHashes, "timed out — will sync later");
-		return {
-			...baseResult,
-			notAttempted: deferredByBatchLimit.length + batchHashes.length,
-			commits: commitsInPushOrder(options.priorityHashes, outcomes),
-			note: "budget exhausted",
-		};
-	}
-
-	// Capture the latest remaining budget immediately before the network call.
-	const requestClient = options.client ?? new JolliMemoryPushClient({ timeoutMs: remainingMs() });
-	const requestCtx: PushContext = { ...preparationCtx, client: requestClient };
-	// Story 2 / spec 306: re-read the opt-out immediately before the send. The entry
-	// gate ran at the top of this function, but preparation (summary reads, batch
-	// building) sits in between — a toggle in that window must stop this batch.
-	// Mirrors the BatchUnsupportedError path: release the claims and defer, so the
-	// hook-recorded entries stay pending for the re-enable drain with no retry burned.
-	if (!(await isOutboundPushAllowed(cwd))) {
-		log.info("processPrePushInline: push disabled mid-run — holding %d commit(s)", batchHashes.length);
-		await releaseClaims(cwd, batchHashes);
-		deferAll(batchHashes, "outbound push disabled for this repo");
-		return {
-			...baseResult,
-			notAttempted: deferredByBatchLimit.length + batchHashes.length,
-			commits: commitsInPushOrder(options.priorityHashes, outcomes),
-			note: "push disabled for this repo",
-		};
-	}
-	log.info("processPrePushInline: pushing %d commit(s) in one batch request", batchBuilt.length);
-	let batchResult: BatchPushResult;
-	try {
-		batchResult = await requestClient.pushBatch({ repoUrl, items: batchBuilt.map((item) => item.item) });
-	} catch (err) {
-		if (err instanceof BatchUnsupportedError) {
-			// Server predates the endpoint — leave everything pending without
-			// burning retries; a later server deploy (or the pushSummary-based
-			// compensation paths) picks the entries up.
-			log.warn("processPrePushInline: %s", err.message);
-			await releaseClaims(cwd, batchHashes);
-			deferAll(batchHashes, "server does not support batch push yet");
-			return {
-				...baseResult,
-				notAttempted: deferredByBatchLimit.length + batchHashes.length,
-				commits: commitsInPushOrder(options.priorityHashes, outcomes),
-				note: "server lacks batch support",
-			};
-		}
-		if (isAbortError(err)) {
-			// Our own deadline abort — not a server failure, so no retry burn.
-			log.warn("processPrePushInline: batch request aborted at the deadline");
-			await releaseClaims(cwd, batchHashes);
-			deferAll(batchHashes, "timed out — will sync later");
-			return {
-				...baseResult,
-				notAttempted: deferredByBatchLimit.length + batchHashes.length,
-				commits: commitsInPushOrder(options.priorityHashes, outcomes),
-				note: "deadline exceeded",
-			};
-		}
-		const { increment, message } = classifyError(err);
-		if (
-			err instanceof BindingRequiredError ||
-			err instanceof NotAuthenticatedError ||
-			err instanceof PermissionDeniedError
-		) {
-			// The server just contradicted any cached binding (unbound
-			// elsewhere, or auth/permission revoked) — drop the cache so
-			// `jolli status` / bare `jolli` stop rendering a stale bound row.
-			await clearSpaceBindingCache(cwd);
-		}
-		const failureUpdates = new Map<string, BatchUpdate>();
-		const failedAtIso = new Date().toISOString();
-		const reason = friendlyPushFailure(message);
-		for (const hash of batchHashes) {
-			failureUpdates.set(hash, {
-				kind: "patch",
-				patch: {
-					lastAttemptAt: failedAtIso,
-					lastError: message,
-					...(increment ? { retryCount: claimedEntries[hash].retryCount + 1 } : {}),
-				},
-			});
-			outcomes.set(hash, { hash, status: "failed", reason });
-		}
-		await updateBatch(cwd, failureUpdates);
-		log.warn(
-			"processPrePushInline: batch request failed for %d commit(s): %s (retry %s)",
-			batchHashes.length,
-			message,
-			increment ? "counted" : "held",
-		);
-		return {
-			...baseResult,
-			attempted: batchHashes.length,
-			failed: batchHashes.length,
-			notAttempted: deferredByBatchLimit.length,
-			commits: commitsInPushOrder(options.priorityHashes, outcomes),
-			note: message,
-		};
-	}
-
-	// Per-item accounting: ok → entry gone; failed → error + retry counted.
-	const updates = new Map<string, BatchUpdate>();
-	const nowIso = new Date().toISOString();
-	const resultByHash = new Map(batchResult.results.map((r) => [r.commitHash, r]));
-	let pushed = 0;
-	let failed = 0;
-	for (const hash of batchHashes) {
-		const result = resultByHash.get(hash);
-		if (result?.ok) {
-			updates.set(hash, { kind: "delete" });
-			pushed++;
-			const url = result.summary
-				? resolveArticleUrl(displayBase, result.summary.url, result.summary.docId)
-				: undefined;
-			outcomes.set(hash, { hash, status: "pushed", ...(url !== undefined && { url }) });
-			continue;
-		}
-		failed++;
-		const message = result?.error ?? result?.errorCode ?? "missing batch result";
-		updates.set(hash, {
-			kind: "patch",
-			patch: {
-				lastAttemptAt: nowIso,
-				lastError: message,
-				retryCount: claimedEntries[hash].retryCount + 1,
-			},
-		});
-		outcomes.set(hash, { hash, status: "failed", reason: friendlyPushFailure(message) });
-		log.warn("Batch push failed for %s: %s", hash.substring(0, 8), message);
-	}
-
-	// Local write-back (docId/url → stored summary) so the next push updates
-	// instead of creating. Keep successful entries pending when confirmed orphan
-	// cleanup still remains; the inline hook cannot safely delete old articles
-	// before git confirms that the push itself succeeded.
-	try {
-		const writeBack = await applyBatchResult(batchBuilt, batchResult.results, requestCtx);
-		preserveCleanupPending(updates, writeBack.cleanupPendingHashes);
-		preserveWriteBackFailures(updates, writeBack.writeBackFailures, nowIso);
-		log.debug(
-			"processPrePushInline: write-back — writtenBack=%d childSkipped=%d cleanupPending=%d writeBackFailed=%d",
-			writeBack.writtenBack,
-			writeBack.childSkipped,
-			writeBack.cleanupPendingHashes?.length ?? 0,
-			writeBack.writeBackFailures?.length ?? 0,
-		);
-	} catch (err) {
-		log.warn("processPrePushInline: write-back failed: %s", errMsg(err));
-	}
-	await updateBatch(cwd, updates);
-	// The server accepted the batch request (binding + push rights verified),
-	// so the top-level Space echo is trustworthy even on per-item failures.
-	await persistConfirmedSpace(requestCtx, batchResult.jmSpace);
-
-	log.info("processPrePushInline: pushed=%d failed=%d", pushed, failed);
-	return {
-		...baseResult,
-		attempted: batchHashes.length,
-		pushed,
-		failed,
-		notAttempted: deferredByBatchLimit.length,
-		commits: commitsInPushOrder(options.priorityHashes, outcomes),
-	};
 }
 
 /**

@@ -221,14 +221,25 @@ export function readCaptureEvents(path: string): CaptureProgressEvent[] {
 }
 
 /**
+ * Suffixes swept by {@link pruneStaleCaptureProgress} — every artifact kind that
+ * lands in this directory:
+ *   - `.ndjson` — the per-commit capture progress stream.
+ *   - `.lock`   — {@link acquireCaptureLock}'s per-hash lock, and the pre-push
+ *     worker's per-push lock. A force-killed worker leaves its lock behind and
+ *     that hash never re-runs, so it would otherwise linger forever.
+ *   - `.json`   — the pre-push worker's request/result hand-off files.
+ *   - `.tmp`    — a `write + rename` whose process died between the two steps.
+ *
+ * `.ndjson` does NOT match `.json` (the dot is part of the suffix), so both
+ * entries are required.
+ */
+const PRUNABLE_SUFFIXES = [".ndjson", ".lock", ".json", ".tmp"] as const;
+
+/**
  * Deletes stale files older than `maxAgeMs` from the capture-progress dir.
- * Best-effort. Covers both artifact kinds that live here:
- *   - `<hash>.ndjson` — the per-commit progress stream.
- *   - `<sha256>.lock`  — {@link acquireCaptureLock}'s per-hash lock file. A
- *     force-killed worker leaves its `.lock` behind and that hash never re-runs,
- *     so the lock would otherwise linger forever. The same mtime/age threshold
- *     is the safety margin: a live lock is refreshed well within `maxAgeMs`, so
- *     only genuinely abandoned locks age out.
+ * Best-effort. The mtime/age threshold is the safety margin: anything a live
+ * worker still touches is refreshed well within `maxAgeMs`, so only genuinely
+ * abandoned artifacts age out.
  */
 export function pruneStaleCaptureProgress(cwd: string | undefined, maxAgeMs: number, nowMs: number = Date.now()): void {
 	let names: string[];
@@ -238,7 +249,7 @@ export function pruneStaleCaptureProgress(cwd: string | undefined, maxAgeMs: num
 		return; // dir missing / unreadable — nothing to prune
 	}
 	for (const name of names) {
-		if (!name.endsWith(".ndjson") && !name.endsWith(".lock")) continue;
+		if (!PRUNABLE_SUFFIXES.some((suffix) => name.endsWith(suffix))) continue;
 		const full = join(captureProgressDir(cwd), name);
 		try {
 			if (nowMs - statSync(full).mtimeMs > maxAgeMs) unlinkSync(full);

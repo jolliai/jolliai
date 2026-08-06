@@ -15,11 +15,6 @@ import { getDefaultBranch } from "./GitOps.js";
 import { buildBranchRelativePath, deriveRepoNameFromUrl, getCanonicalRepoUrl } from "./GitRemoteUtils.js";
 import { parseBaseUrl, resolveArticleUrl } from "./JolliApiUtils.js";
 import {
-	BATCH_MAX_ATTACHMENTS_PER_ITEM,
-	BATCH_MAX_CONTENT_CHARS,
-	BATCH_MAX_TOTAL_CONTENT_CHARS,
-	type BatchItemResult,
-	type BatchPushItem,
 	BindingAlreadyExistsError,
 	BindingRequiredError,
 	JolliMemoryPushClient,
@@ -34,9 +29,7 @@ import {
 	assertOutboundStillAllowed,
 	assignOwnedContext,
 	type BatchAttachmentKey,
-	buildContextBatchAttachments,
 	type ContextSelection,
-	legacyNamedOwnership,
 	legacyNamedSelection,
 	type OwnedContext,
 	type PushContext,
@@ -277,363 +270,6 @@ export function docUrlPlaceholder(clientKey: string): string {
 	return `{{jolli:doc:${clientKey}}}`;
 }
 
-/**
- * Legacy named-shape owner-assigned attachments.
- *
- * Accepted by {@link buildBatchItems} alongside the kind-agnostic
- * {@link OwnedContext} so existing callers and tests keep working. Deliberately
- * NOT extended for a new context kind — pass an {@link OwnedContext}.
- */
-export interface OwnedAttachmentMaps {
-	readonly ownedPlans: ReadonlyMap<string, ReadonlyArray<PlanReference>>;
-	readonly ownedNotes: ReadonlyMap<string, ReadonlyArray<NoteReference>>;
-	readonly ownedReferences: ReadonlyMap<string, ReadonlyArray<ReferenceCommitRef>>;
-}
-
-/**
- * Normalizes either ownership form into an {@link OwnedContext}.
- *
- * The named form is expanded by {@link legacyNamedOwnership}, which walks the
- * registry rather than emitting three fixed entries — see there for why the
- * hard-coded docType list lives in one place next to the registry.
- */
-function toOwnedContext(owned: OwnedContext | OwnedAttachmentMaps): OwnedContext {
-	if (!("ownedPlans" in owned)) return owned;
-	return legacyNamedOwnership(owned);
-}
-
-/** One built batch item plus the bookkeeping `applyBatchResult` needs. */
-export interface BuiltBatchItem {
-	readonly item: BatchPushItem;
-	readonly summary: CommitSummary;
-	readonly attachmentKeys: ReadonlyMap<string, BatchAttachmentKey>;
-	/** Character count used by the server's batch-wide content limit. */
-	readonly batchContentChars: number;
-	/** Set when this item must use the legacy per-commit push path. */
-	readonly batchIneligibleReason?: string;
-}
-
-/**
- * Builds one `BatchPushItem` per summary for `pushBatch`: reads attachment
- * bodies, assigns per-item clientKeys, weaves placeholder URLs into the
- * summary markdown (+ summaryJson), and carries existing docIds (env-gated by
- * {@link canReuseDocId}) so the server updates instead of creating.
- *
- * Attachment assembly is generic over the registered context kinds — see
- * `buildContextBatchAttachments`.
- *
- * Only URL fields carry placeholders — attachment docId fields inside the
- * summaryJson stay numeric/absent (a placeholder string there would break the
- * sidecar schema); the local write-back (`applyBatchResult`) records the real
- * ids for the next push.
- *
- * Unreadable/empty attachment bodies are skipped exactly as in the individual
- * path — their placeholder is never minted, so the woven copy keeps whatever URL
- * state the item already had.
- */
-export async function buildBatchItems(
-	summaries: ReadonlyArray<CommitSummary>,
-	owned: OwnedContext | OwnedAttachmentMaps,
-	ctx: PushContext,
-): Promise<Array<BuiltBatchItem>> {
-	const envKey = await ctx.client.resolveEnvKey();
-	const ownership = toOwnedContext(owned);
-	const built: Array<BuiltBatchItem> = [];
-	for (const summary of summaries) {
-		built.push(await buildOneBatchItem(summary, selectionForCommit(ownership, summary.commitHash), ctx, envKey));
-	}
-	const attachmentCount = built.reduce((sum, item) => sum + item.item.attachments.length, 0);
-	const fallbackCount = built.filter((item) => item.batchIneligibleReason !== undefined).length;
-	log.debug(
-		"buildBatchItems: built %d item(s) with %d attachment(s), individualFallback=%d",
-		built.length,
-		attachmentCount,
-		fallbackCount,
-	);
-	return built;
-}
-
-/** Mirrors the server's batch content accounting exactly. */
-function countBatchContentChars(item: BatchPushItem): number {
-	let total = item.summary.content.length + (item.summary.summaryJson?.length ?? 0);
-	for (const attachment of item.attachments) total += attachment.content.length;
-	return total;
-}
-
-/** Returns why an item cannot pass the server's batch schema, if any. */
-function getBatchIneligibleReason(item: BatchPushItem, contentChars: number): string | undefined {
-	if (item.summary.content.length > BATCH_MAX_CONTENT_CHARS) return "summary content exceeds the batch limit";
-	if ((item.summary.summaryJson?.length ?? 0) > BATCH_MAX_CONTENT_CHARS)
-		return "summary JSON exceeds the batch limit";
-	if (item.attachments.length > BATCH_MAX_ATTACHMENTS_PER_ITEM) return "attachment count exceeds the batch limit";
-	if (item.attachments.some((attachment) => attachment.content.length > BATCH_MAX_CONTENT_CHARS))
-		return "attachment content exceeds the batch limit";
-	if (contentChars > BATCH_MAX_TOTAL_CONTENT_CHARS) return "item content exceeds the batch total limit";
-	return undefined;
-}
-
-async function buildOneBatchItem(
-	summary: CommitSummary,
-	selection: ContextSelection,
-	ctx: PushContext,
-	envKey: string,
-): Promise<BuiltBatchItem> {
-	const { attachments, attachmentKeys, placeholders } = await buildContextBatchAttachments(
-		summary,
-		ctx,
-		envKey,
-		selection,
-		docUrlPlaceholder,
-	);
-
-	// Weave placeholder URLs into the enriched copy the markdown + summaryJson are
-	// built from — mirrors pushSummary's real-URL weave, minus docIds (`urlOnly`).
-	// `reduceOwnItems` first, because only the reduced set was uploaded and the
-	// rendered body must list the same set.
-	const summaryForMarkdown = applyPublishedUrls(reduceOwnItems(summary), placeholders, { urlOnly: true });
-	const markdown = buildPushMarkdown(summaryForMarkdown);
-	const summaryJson = serializeSummaryJson(summaryForMarkdown);
-
-	const item: BatchPushItem = {
-		commitHash: summary.commitHash,
-		branch: summary.branch,
-		summary: {
-			title: buildPushTitle(summary),
-			content: markdown,
-			relativePath: buildBranchRelativePath(summary.branch),
-			...(summary.jolliDocId !== undefined &&
-				canReuseDocId(summary.jolliDocUrl, envKey) && { docId: summary.jolliDocId }),
-			...(summaryJson && { summaryJson }),
-		},
-		attachments,
-	};
-	const batchContentChars = countBatchContentChars(item);
-	const batchIneligibleReason = getBatchIneligibleReason(item, batchContentChars);
-	return {
-		summary,
-		attachmentKeys,
-		item,
-		batchContentChars,
-		...(batchIneligibleReason !== undefined && { batchIneligibleReason }),
-	};
-}
-
-/**
- * A pushed item whose local docId/url write-back failed. Carries the minted
- * ids so the caller can persist them in the pending entry — the next drain
- * then retries as an UPDATE of the same article instead of a duplicate CREATE.
- */
-export interface BatchWriteBackFailure {
-	readonly commitHash: string;
-	readonly docId: number;
-	readonly url: string;
-}
-
-/** Outcome counts of {@link applyBatchResult}, for the caller's logging. */
-export interface ApplyBatchResultOutcome {
-	readonly writtenBack: number;
-	readonly childSkipped: number;
-	/** Successful items that still need confirmed post-push orphan cleanup. */
-	readonly cleanupPendingHashes?: ReadonlyArray<string>;
-	/** Successful items whose write-back failed — keep pending with the minted ids recorded. */
-	readonly writeBackFailures?: ReadonlyArray<BatchWriteBackFailure>;
-}
-
-/**
- * Post-batch write-back: for every `ok` item, resolves the final article URL,
- * weaves attachment URLs/docIds into the stored summary and persists it so the
- * next push updates instead of creating. Mirrors `pushSummary`'s write-back
- * including its mid-push child guard: a commit that became a child (squash)
- * while the request was on the network gets its freshly-minted article deleted
- * best-effort instead of a force-store that would resurrect a zombie root —
- * along with any attachments this same batch item CREATEd (attachments that
- * UPDATEd a pre-existing doc keep their article).
- * Best-effort per item — a failed write-back is logged and never fails the
- * caller (the article is already published). Each failed item is reported in
- * `writeBackFailures` with its minted docId/url so the caller can keep the
- * pending entry and retry as an UPDATE instead of a duplicate CREATE.
- *
- * `opts.cleanupOrphans` additionally resolves `unresolvedOrphanHashes` and
- * deletes the orphaned articles recorded on each written-back summary. The
- * compensation drain opts in; the budget-bound pre-push flow leaves it off and
- * receives `cleanupPendingHashes` so those pending entries are preserved.
- */
-export async function applyBatchResult(
-	built: ReadonlyArray<BuiltBatchItem>,
-	results: ReadonlyArray<BatchItemResult>,
-	ctx: PushContext,
-	opts?: { readonly cleanupOrphans?: boolean },
-): Promise<ApplyBatchResultOutcome> {
-	const displayBase = ctx.baseUrl.replace(/\/+$/, "");
-	const builtByHash = new Map(built.map((b) => [b.item.commitHash, b]));
-	const postPushIndex = await getIndexEntryMap(ctx.cwd, ctx.storage).catch((err: unknown) => {
-		// Degrading to "no commit is a child" keeps parity with pushSummary, but
-		// it also disarms the mid-push child guard below — say so in the log.
-		log.warn(
-			"Could not read the summary index for the mid-push child guard — treating every commit as a root: %s",
-			err instanceof Error ? err.message : String(err),
-		);
-		return new Map<string, unknown>();
-	});
-	let writtenBack = 0;
-	let childSkipped = 0;
-	const cleanupPendingHashes: string[] = [];
-	const writeBackFailures: BatchWriteBackFailure[] = [];
-	for (const result of results) {
-		const summaryDoc = result.ok ? result.summary : undefined;
-		if (!summaryDoc) continue;
-		const entry = builtByHash.get(result.commitHash);
-		if (!entry) continue;
-		const indexEntry = postPushIndex.get(result.commitHash) as
-			| { readonly parentCommitHash?: string | null }
-			| undefined;
-		if (indexEntry?.parentCommitHash != null) {
-			childSkipped++;
-			log.warn(
-				"Commit %s became a child mid-push (parent=%s); deleting freshly-pushed article %d and skipping write-back",
-				result.commitHash.substring(0, 8),
-				indexEntry.parentCommitHash.substring(0, 8),
-				summaryDoc.docId,
-			);
-			try {
-				await ctx.client.deleteDoc(summaryDoc.docId);
-			} catch (err) {
-				log.warn(
-					"Best-effort delete of newly-orphaned article %d failed: %s",
-					summaryDoc.docId,
-					err instanceof Error ? err.message : String(err),
-				);
-			}
-			// Attachments this same batch item CREATEd must go too, or they leak
-			// as stray docs of a commit that no longer exists as a root. Only the
-			// created ones: an attachment that UPDATEd a pre-existing doc keeps
-			// its article — that doc predates this push and is cleaned up by the
-			// squash consolidation's own orphan machinery.
-			for (const att of result.attachments) {
-				if (!att.ok || att.created !== true || att.docId === undefined) continue;
-				try {
-					await ctx.client.deleteDoc(att.docId);
-				} catch (err) {
-					log.warn(
-						"Best-effort delete of newly-orphaned attachment %d failed: %s",
-						att.docId,
-						err instanceof Error ? err.message : String(err),
-					);
-				}
-			}
-			continue;
-		}
-		try {
-			const updated = await writeBackBatchItem(entry, result, displayBase, ctx);
-			writtenBack++;
-			let finalUpdated = updated;
-			if (opts?.cleanupOrphans && finalUpdated && hasPendingOrphanCleanup(finalUpdated)) {
-				try {
-					finalUpdated = await resolveUnresolvedOrphanHashes(finalUpdated, ctx);
-					const cleaned = await cleanupOrphanedDocs(finalUpdated, finalUpdated, ctx);
-					if (cleaned) finalUpdated = cleaned;
-				} catch (err) {
-					log.warn(
-						"Orphan cleanup after batch push failed for %s: %s",
-						result.commitHash.substring(0, 8),
-						err instanceof Error ? err.message : String(err),
-					);
-				}
-			}
-			if (finalUpdated && hasPendingOrphanCleanup(finalUpdated)) {
-				cleanupPendingHashes.push(result.commitHash);
-			}
-		} catch (err) {
-			// The article exists server-side but its id never reached local
-			// storage — report the minted ids so the caller keeps the pending
-			// entry and the retry UPDATEs instead of CREATEing a duplicate.
-			writeBackFailures.push({
-				commitHash: result.commitHash,
-				docId: summaryDoc.docId,
-				url: resolveArticleUrl(displayBase, summaryDoc.url, summaryDoc.docId),
-			});
-			log.warn(
-				"Write-back after batch push failed for %s: %s",
-				result.commitHash.substring(0, 8),
-				err instanceof Error ? err.message : String(err),
-			);
-		}
-	}
-	log.debug(
-		"applyBatchResult: writtenBack=%d childSkipped=%d cleanupPending=%d writeBackFailed=%d cleanupOrphans=%s",
-		writtenBack,
-		childSkipped,
-		cleanupPendingHashes.length,
-		writeBackFailures.length,
-		opts?.cleanupOrphans === true,
-	);
-	return {
-		writtenBack,
-		childSkipped,
-		...(cleanupPendingHashes.length > 0 && { cleanupPendingHashes }),
-		...(writeBackFailures.length > 0 && { writeBackFailures }),
-	};
-}
-
-async function writeBackBatchItem(
-	entry: BuiltBatchItem,
-	result: BatchItemResult,
-	displayBase: string,
-	ctx: PushContext,
-): Promise<CommitSummary | undefined> {
-	const summaryDoc = result.summary;
-	/* v8 ignore next -- callers only pass ok results, which always carry summary */
-	if (!summaryDoc) return undefined;
-	const summaryUrl = resolveArticleUrl(displayBase, summaryDoc.url, summaryDoc.docId);
-	const published = new Map<string, Array<{ entryKey: string; url: string; docId: number }>>();
-	// A batch attachment failure arrives as `ok: false` inside a 2xx body, so nothing
-	// throws. These used to be dropped in silence, which made a server-side rejection
-	// of an entire docType invisible on the DEFAULT push path. `doctype_not_allowed`
-	// is collapsed to one line per docType — every attachment of that kind fails for
-	// the same reason, so one per item would be a dozen copies of one problem.
-	const unsupportedDocTypes = new Set<string>();
-	for (const att of result.attachments) {
-		const identity = entry.attachmentKeys.get(att.clientKey);
-		if (!att.ok || att.docId === undefined || att.url === undefined) {
-			if (!att.ok) {
-				if (att.errorCode === "doctype_not_allowed") {
-					unsupportedDocTypes.add(identity?.docType ?? "?");
-				} else {
-					log.error(
-						"Batch push: attachment %s (%s) of %s FAILED: %s",
-						att.clientKey,
-						identity?.docType ?? "?",
-						entry.summary.commitHash.substring(0, 8),
-						att.error ?? att.errorCode ?? "no reason reported",
-					);
-				}
-			}
-			continue;
-		}
-		if (!identity) continue;
-		const url = resolveArticleUrl(displayBase, att.url, att.docId);
-		const forKind = published.get(identity.docType);
-		const doc = { entryKey: identity.key, url, docId: att.docId };
-		if (forKind) forKind.push(doc);
-		else published.set(identity.docType, [doc]);
-	}
-	for (const docType of unsupportedDocTypes) {
-		log.warn(
-			"Batch push: the server does not have docType \"%s\" enabled, so none of %s's articles of that kind were created. Enable it in the server's supported-docType configuration.",
-			docType,
-			entry.summary.commitHash.substring(0, 8),
-		);
-	}
-	const summary = entry.summary;
-	const updatedSummary: CommitSummary = {
-		...applyPublishedUrls(summary, published),
-		jolliDocUrl: summaryUrl,
-		jolliDocId: summaryDoc.docId,
-	};
-	await storeSummary(updatedSummary, ctx.cwd, true, undefined, ctx.storage);
-	return updatedSummary;
-}
-
 // ── Push orchestration (network I/O) ─────────────────────────────────────────
 
 /**
@@ -678,12 +314,49 @@ function toContextSelection(
 export interface PushSummaryResult {
 	readonly summary: CommitSummary;
 	readonly summaryUrl: string;
+	/** Article id minted (or updated) by this push — pairs with {@link summaryUrl}. */
+	readonly docId: number;
 	/**
 	 * The server's Space echo from the summary push (newer servers,
 	 * repoUrl-routed pushes only) — callers persist it as the local binding
 	 * cache. Absent on older servers.
 	 */
 	readonly jmSpace?: { readonly id: number; readonly name: string };
+	/**
+	 * The article was published but its docId never reached local storage. The
+	 * push itself SUCCEEDED — the caller must keep the pending entry and record
+	 * {@link docId} / {@link summaryUrl} on it (`pushedDocId` / `pushedUrl`) so
+	 * the next drain UPDATEs that article instead of CREATEing a duplicate, and
+	 * must NOT burn a retry: nothing about the push needs retrying, only the
+	 * local bookkeeping.
+	 */
+	readonly writeBackFailed?: boolean;
+	/**
+	 * Orphaned articles are still awaiting deletion — either because
+	 * {@link PushSummaryOptions.skipOrphanCleanup} deferred it, or because a
+	 * cleanup pass could not delete every id. The caller must keep the pending
+	 * entry (patch, not delete) so a later confirmed drain finishes the job;
+	 * dropping it would strand those articles with nothing pointing at them.
+	 */
+	readonly cleanupPending?: boolean;
+}
+
+export interface PushSummaryOptions {
+	/**
+	 * Skips orphan resolution and deletion, reporting
+	 * {@link PushSummaryResult.cleanupPending} instead.
+	 *
+	 * The pre-push worker sets this. Orphan cleanup issues real `deleteDoc`
+	 * calls, and pre-push runs BEFORE git has transferred objects: if the push is
+	 * then rejected, the remote history still contains those commits while their
+	 * articles are gone, and the pending entry that could have restored them was
+	 * deleted on success. Unrecoverable.
+	 *
+	 * The compensation drains leave this off — they confirm the push against the
+	 * remote first, so deleting is safe there. Only the unconfirmed pre-push flow
+	 * sets it.
+	 */
+	readonly skipOrphanCleanup?: boolean;
 }
 
 /**
@@ -706,6 +379,7 @@ export async function pushSummary(
 	summary: CommitSummary,
 	ctx: PushContext,
 	attachments?: AttachmentSelection | ContextSelection,
+	opts?: PushSummaryOptions,
 ): Promise<PushSummaryResult> {
 	const displayBase = ctx.baseUrl.replace(/\/+$/, "");
 	// Env key of the tenant this push targets — every docId minted below is tagged
@@ -771,7 +445,12 @@ export async function pushSummary(
 				err instanceof Error ? err.message : String(err),
 			);
 		}
-		return { summary, summaryUrl, ...(result.jmSpace !== undefined ? { jmSpace: result.jmSpace } : {}) };
+		return {
+			summary,
+			summaryUrl,
+			docId: result.docId,
+			...(result.jmSpace !== undefined ? { jmSpace: result.jmSpace } : {}),
+		};
 	}
 
 	// Write-back weaves onto the summary's OWN items (not the reduced copy above), so
@@ -781,7 +460,42 @@ export async function pushSummary(
 		jolliDocUrl: summaryUrl,
 		jolliDocId: result.docId,
 	};
-	await storeSummary(updatedSummary, ctx.cwd, true, undefined, ctx.storage);
+	// The article exists server-side from here on, so a write-back failure must
+	// NOT surface as a failed push. Report it instead: the caller records the
+	// minted docId/url on the pending entry so the retry UPDATEs that article
+	// rather than CREATEing a second one. Without this the id is lost exactly
+	// like an aborted request loses it.
+	let writeBackFailed = false;
+	try {
+		await storeSummary(updatedSummary, ctx.cwd, true, undefined, ctx.storage);
+	} catch (err) {
+		writeBackFailed = true;
+		log.warn(
+			"Local write-back after a successful push failed for %s: %s",
+			summary.commitHash.substring(0, 8),
+			err instanceof Error ? err.message : String(err),
+		);
+	}
+
+	const common = {
+		summaryUrl,
+		docId: result.docId,
+		...(writeBackFailed ? { writeBackFailed: true } : {}),
+		...(result.jmSpace !== undefined ? { jmSpace: result.jmSpace } : {}),
+	};
+
+	// Orphan cleanup issues real deleteDoc calls, so it only runs where the push
+	// is already known to have reached the remote. See PushSummaryOptions.
+	if (opts?.skipOrphanCleanup) {
+		const cleanupPending = hasPendingOrphanCleanup(updatedSummary);
+		if (cleanupPending) {
+			log.info(
+				"Deferring orphan cleanup for %s — this push is not confirmed on the remote yet",
+				summary.commitHash.substring(0, 8),
+			);
+		}
+		return { ...common, summary: updatedSummary, ...(cleanupPending ? { cleanupPending: true } : {}) };
+	}
 
 	const summaryForCleanup = await resolveUnresolvedOrphanHashes(updatedSummary, ctx);
 
@@ -796,7 +510,14 @@ export async function pushSummary(
 		log.warn("Orphan cleanup failed after a successful push: %s", err instanceof Error ? err.message : String(err));
 	}
 
-	return { summary: finalSummary, summaryUrl, ...(result.jmSpace !== undefined ? { jmSpace: result.jmSpace } : {}) };
+	// Reported from the FINAL state rather than from "did we skip cleanup":
+	// cleanupOrphanedDocs leaves ids it could not delete in orphanedDocIds for the
+	// next push, and the caller has to keep the pending entry for those too.
+	return {
+		...common,
+		summary: finalSummary,
+		...(hasPendingOrphanCleanup(finalSummary) ? { cleanupPending: true } : {}),
+	};
 }
 
 function hasPendingOrphanCleanup(summary: CommitSummary): boolean {
@@ -931,6 +652,12 @@ export type PushBranchResult =
  * is attempted. Without `opts.space`, an unbound repo surfaces as
  * `{ type: "binding_required" }` with the space list so the caller can prompt
  * and retry with `opts.space` set.
+ *
+ * A published summary whose local write-back failed
+ * ({@link PushSummaryResult.writeBackFailed}) stops the loop with
+ * `{ type: "error" }`. This path has no per-commit retry state to carry the
+ * minted docId forward, so a "pushed" verdict there would hide a lost id behind
+ * a success and duplicate the article on the next push.
  */
 export async function pushBranchToJolli(opts: PushBranchOpts): Promise<PushBranchResult> {
 	const client = opts.client ?? new JolliMemoryPushClient();
@@ -995,9 +722,23 @@ export async function pushBranchToJolli(opts: PushBranchOpts): Promise<PushBranc
 		for (const s of summaries) {
 			const attachments = selectionForCommit(owned, s.commitHash);
 			// BindingRequiredError propagates — fatal for the whole batch.
-			const { summaryUrl, jmSpace } = await pushSummary(s, ctx, attachments);
+			const { summaryUrl, jmSpace, writeBackFailed } = await pushSummary(s, ctx, attachments);
 			if (jmSpace) {
 				confirmedSpace = jmSpace;
+			}
+			if (writeBackFailed) {
+				// The article IS published, but its docId never reached local storage.
+				// Unlike the drains (see PushExecutor's `writeBackFailed` branch) this
+				// path owns no push-pending entry to record the minted id on, so nothing
+				// points at that article any more: reporting "pushed" would send the user
+				// into a re-push that CREATEs a second article for this commit. Report the
+				// loud failure this was before `pushSummary` started swallowing the
+				// write-back error, and leave the remaining summaries unsent — they all
+				// need the very write that just failed.
+				return {
+					type: "error",
+					message: `Pushed ${s.commitHash.substring(0, 8)} to ${summaryUrl}, but recording its article id locally failed, so a re-push would create a second article for that commit. Remaining summaries were not pushed — see .jolli/jollimemory/debug.log.`,
+				};
 			}
 			urls.push(summaryUrl);
 		}

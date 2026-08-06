@@ -7,8 +7,6 @@ const loadConfigMock = vi.fn(async () => ({ jolliApiKey: "sk-jol-cfg" }) as { jo
 vi.mock("./SessionTracker.js", () => ({ loadConfig: () => loadConfigMock() }));
 
 import {
-	type BatchPushPayload,
-	BatchUnsupportedError,
 	BindingAlreadyExistsError,
 	BindingRequiredError,
 	ClientOutdatedError,
@@ -536,6 +534,22 @@ describe("push", () => {
 		).rejects.toMatchObject({
 			name: "PermissionDeniedError",
 			message: "Ask an administrator to add this repo to the Space.",
+		});
+	});
+	// Same 412 status as the allowlist refusal above, but a DIFFERENT class on
+	// purpose: this one is not a repo-wide refusal, so one unconfigured context
+	// kind must not abort the whole attachment loop. Covered here because the
+	// batch parser that used to exercise `doctype_not_allowed` is gone.
+	it("maps 412 doctype_not_allowed to DocTypeNotAllowedError carrying the docType", async () => {
+		const c = client(async () =>
+			jsonResponse(412, { error: "doctype_not_allowed", message: 'docType "skill" is not enabled' }),
+		);
+		await expect(
+			c.push({ title: "t", content: "c", commitHash: "abc1234", docType: "skill" }),
+		).rejects.toMatchObject({
+			name: "DocTypeNotAllowedError",
+			docType: "skill",
+			message: 'docType "skill" is not enabled',
 		});
 	});
 	it("maps 426 to ClientOutdatedError", async () => {
@@ -1136,230 +1150,5 @@ describe("invokePlatformTool", () => {
 		expect(capturedMethod).toBe("POST");
 		expect(capturedUrl).toBe("https://jolli.ai/api/mcp/tools/list_tickets");
 		expect(capturedBody).toBe(JSON.stringify({ status: "open" }));
-	});
-});
-
-describe("pushBatch", () => {
-	const payload: BatchPushPayload = {
-		repoUrl: "https://github.com/acme/repo",
-		items: [
-			{
-				commitHash: "a".repeat(40),
-				branch: "main",
-				summary: { title: "feat: one", content: "# body" },
-				attachments: [],
-			},
-		],
-	};
-
-	it("returns validated per-item results on 200", async () => {
-		const c = client(async () =>
-			jsonResponse(200, {
-				results: [
-					{
-						commitHash: "a".repeat(40),
-						ok: true,
-						summary: { docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true },
-						attachments: [{ clientKey: "plan-0", ok: true, docId: 10, url: "/articles/p-10" }],
-					},
-				],
-			}),
-		);
-		const r = await c.pushBatch(payload);
-		expect(r.results).toHaveLength(1);
-		expect(r.results[0]).toMatchObject({ commitHash: "a".repeat(40), ok: true });
-		expect(r.results[0].summary).toEqual({ docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true });
-		expect(r.results[0].attachments[0]).toMatchObject({ clientKey: "plan-0", ok: true, docId: 10 });
-		// Older servers echo no Space — the field is simply absent.
-		expect(r.jmSpace).toBeUndefined();
-	});
-
-	it("carries a failed attachment's machine-readable errorCode through the parser", async () => {
-		// Regression: the parser used to drop `errorCode`, which made the orchestrator's
-		// `doctype_not_allowed` branch dead code in production while unit tests that
-		// hand-built an already-parsed result still passed. This asserts from the RAW
-		// JSON on purpose — the parser is the thing under test.
-		const c = client(async () =>
-			jsonResponse(200, {
-				results: [
-					{
-						commitHash: "a".repeat(40),
-						ok: true,
-						summary: { docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true },
-						attachments: [
-							{
-								clientKey: "skill-0",
-								ok: false,
-								error: 'docType "skill" is not enabled',
-								errorCode: "doctype_not_allowed",
-							},
-						],
-					},
-				],
-			}),
-		);
-		const r = await c.pushBatch(payload);
-		expect(r.results[0].attachments[0]).toMatchObject({
-			clientKey: "skill-0",
-			ok: false,
-			errorCode: "doctype_not_allowed",
-		});
-	});
-
-	it("omits errorCode when the server sends none (older servers)", async () => {
-		const c = client(async () =>
-			jsonResponse(200, {
-				results: [
-					{
-						commitHash: "a".repeat(40),
-						ok: true,
-						summary: { docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true },
-						attachments: [{ clientKey: "plan-0", ok: false, error: "boom" }],
-					},
-				],
-			}),
-		);
-		const r = await c.pushBatch(payload);
-		expect(r.results[0].attachments[0].errorCode).toBeUndefined();
-		expect(r.results[0].attachments[0].error).toBe("boom");
-	});
-
-	it("passes the top-level jmSpace echo through on a 200", async () => {
-		const c = client(async () =>
-			jsonResponse(200, {
-				results: [
-					{
-						commitHash: "a".repeat(40),
-						ok: true,
-						summary: { docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true },
-						attachments: [],
-					},
-				],
-				jmSpace: { id: 7, name: "Acme Core" },
-			}),
-		);
-		const r = await c.pushBatch(payload);
-		expect(r.jmSpace).toEqual({ id: 7, name: "Acme Core" });
-	});
-
-	it("drops a malformed top-level jmSpace echo instead of poisoning the binding cache", async () => {
-		const c = client(async () =>
-			jsonResponse(200, {
-				results: [
-					{
-						commitHash: "a".repeat(40),
-						ok: true,
-						summary: { docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true },
-						attachments: [],
-					},
-				],
-				jmSpace: { id: "7", name: "" },
-			}),
-		);
-		const r = await c.pushBatch(payload);
-		expect(r.jmSpace).toBeUndefined();
-	});
-
-	it("downgrades an ok:true attachment without docId/url to a failure (contract drift guard)", async () => {
-		const c = client(async () =>
-			jsonResponse(200, {
-				results: [
-					{
-						commitHash: "a".repeat(40),
-						ok: true,
-						summary: { docId: 9, url: "/articles/one-9", jrn: "jrn:9", created: true },
-						attachments: [
-							{ clientKey: "plan-0", ok: true },
-							{ clientKey: "note-0", ok: true, docId: 12 },
-						],
-					},
-				],
-			}),
-		);
-		const r = await c.pushBatch(payload);
-		expect(r.results[0].attachments).toEqual([
-			{ clientKey: "plan-0", ok: false, error: "Batch attachment result was missing docId/url" },
-			{ clientKey: "note-0", ok: false, error: "Batch attachment result was missing docId/url" },
-		]);
-	});
-
-	it("maps 404 to BatchUnsupportedError (server predates the endpoint)", async () => {
-		const c = client(async () => jsonResponse(404, { error: "Not found" }));
-		await expect(c.pushBatch(payload)).rejects.toBeInstanceOf(BatchUnsupportedError);
-	});
-
-	it("maps 426 to ClientOutdatedError", async () => {
-		const c = client(async () => jsonResponse(426, { error: "client_outdated" }));
-		await expect(c.pushBatch(payload)).rejects.toBeInstanceOf(ClientOutdatedError);
-	});
-
-	it("maps 412 binding_required to BindingRequiredError carrying the repoUrl", async () => {
-		const c = client(async () =>
-			jsonResponse(412, { error: "binding_required", repoUrl: "https://github.com/acme/repo" }),
-		);
-		await expect(c.pushBatch(payload)).rejects.toBeInstanceOf(BindingRequiredError);
-	});
-
-	it("maps 412 repo_not_allowlisted to PermissionDeniedError (the allowlist refusal, NOT 403)", async () => {
-		const c = client(async () => jsonResponse(412, { error: "repo_not_allowlisted" }));
-		await expect(c.pushBatch(payload)).rejects.toBeInstanceOf(PermissionDeniedError);
-	});
-
-	it("maps 401 to NotAuthenticatedError", async () => {
-		const c = client(async () => jsonResponse(401, { error: "unauthorized" }));
-		await expect(c.pushBatch(payload)).rejects.toBeInstanceOf(NotAuthenticatedError);
-	});
-
-	it("maps 403 to PermissionDeniedError (signed in, but no space permission)", async () => {
-		const c = client(async () =>
-			jsonResponse(403, { error: "Insufficient space permissions", requiredPermission: "articles.edit" }),
-		);
-		await expect(c.pushBatch(payload)).rejects.toBeInstanceOf(PermissionDeniedError);
-	});
-
-	it("throws on a generic non-2xx with the server message", async () => {
-		const c = client(async () => jsonResponse(500, { error: "Batch push failed" }));
-		await expect(c.pushBatch(payload)).rejects.toThrow("Batch push failed");
-	});
-
-	it("rejects a 2xx whose body has no results array (gateway/HTML body)", async () => {
-		const c = client(async () => textResponse(200, "<html>gateway</html>"));
-		await expect(c.pushBatch(payload)).rejects.toThrow(/missing results/);
-	});
-
-	it("rejects a garbage result entry outright", async () => {
-		const c = client(async () => jsonResponse(200, { results: [42] }));
-		await expect(c.pushBatch(payload)).rejects.toThrow(/malformed/);
-	});
-
-	it("downgrades an ok item with unusable summary fields to a failure (never delete blind)", async () => {
-		const c = client(async () =>
-			jsonResponse(200, {
-				results: [{ commitHash: "a".repeat(40), ok: true, summary: { docId: "nope" }, attachments: [] }],
-			}),
-		);
-		const r = await c.pushBatch(payload);
-		expect(r.results[0].ok).toBe(false);
-		expect(r.results[0].errorCode).toBe("malformed_response");
-	});
-
-	it("keeps failed items with their error/errorCode and filters malformed attachments", async () => {
-		const c = client(async () =>
-			jsonResponse(200, {
-				results: [
-					{
-						commitHash: "a".repeat(40),
-						ok: false,
-						error: "boom",
-						errorCode: "push_failed",
-						attachments: [{ clientKey: "k", ok: false, error: "att boom" }, { bogus: true }],
-					},
-				],
-			}),
-		);
-		const r = await c.pushBatch(payload);
-		expect(r.results[0]).toMatchObject({ ok: false, error: "boom", errorCode: "push_failed" });
-		expect(r.results[0].attachments).toHaveLength(1);
-		expect(r.results[0].attachments[0]).toMatchObject({ clientKey: "k", ok: false, error: "att boom" });
 	});
 });

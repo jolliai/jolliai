@@ -140,8 +140,23 @@ export type BatchUpdate =
  * timeout (30 s default) plus headroom for push-confirmation polling (60 s).
  * A crashed process's claims expire after this, so entries are not stuck
  * forever.
+ *
+ * A drain that legitimately runs longer than this keeps its claims alive with
+ * {@link renewClaims} rather than by widening the window — a wider window would
+ * also delay recovery from a genuinely crashed holder.
  */
 const CLAIM_STALE_MS = 5 * 60 * 1000;
+
+/**
+ * How often a long-running drain should call {@link renewClaims}.
+ *
+ * Derived from {@link CLAIM_STALE_MS} and declared next to it on purpose: the
+ * invariant "a missed beat still leaves room for the next one" only holds while
+ * these two move together, and nothing else enforces it. At 1/3 of the TTL one
+ * missed beat still renews at 2/3 of the window; a half-TTL interval would put
+ * the retry exactly on the expiry boundary.
+ */
+export const CLAIM_RENEW_INTERVAL_MS = Math.floor(CLAIM_STALE_MS / 3);
 
 // ─── Path helpers ───────────────────────────────────────────────────────────
 
@@ -332,11 +347,8 @@ export async function mergeEntries(
  * `loadPushPending` read let two processes both see the same entries and both
  * push them, creating duplicate Space articles.
  */
-export async function claimForPush(
-	cwd: string,
-	candidates: ReadonlyArray<string>,
-): Promise<{ claimed: ReadonlySet<string>; entries: Readonly<Record<string, PushPendingEntry>> }> {
-	if (candidates.length === 0) return { claimed: new Set(), entries: {} };
+export async function claimForPush(cwd: string, candidates: ReadonlyArray<string>): Promise<ClaimResult> {
+	if (candidates.length === 0) return { claimed: new Set(), entries: {}, claimedAt: new Date().toISOString() };
 	const path = pendingPath(cwd);
 	const candidateSet = new Set(candidates);
 	return withPushPendingLock(cwd, async () => {
@@ -361,7 +373,67 @@ export async function claimForPush(
 			await writeOrUnlink(path, next);
 			logPrunedEntries(current.prunedCount);
 		}
-		return { claimed, entries: current.file.entries };
+		return { claimed, entries: current.file.entries, claimedAt: nowIso };
+	});
+}
+
+export interface ClaimResult {
+	readonly claimed: ReadonlySet<string>;
+	readonly entries: Readonly<Record<string, PushPendingEntry>>;
+	/**
+	 * The exact `claimedAt` stamped on every hash in `claimed`. `claimedAt` is a
+	 * bare timestamp with no holder identity, so this value doubles as the
+	 * ownership token {@link renewClaims} compares against.
+	 */
+	readonly claimedAt: string;
+}
+
+/**
+ * Refreshes `claimedAt` on hashes this drain still holds, so a run that outlives
+ * {@link CLAIM_STALE_MS} does not have its claims stolen mid-flight. Returns the
+ * new token to compare against on the next beat, or `undefined` when nothing was
+ * renewed (every hash is finished, gone, or now held by someone else).
+ *
+ * Without this, a long drain — commit-granularity pushes routinely run for
+ * minutes — lets another channel re-claim a hash that is still in flight here.
+ * Both processes would then read a summary with no docId and CREATE two articles
+ * for the same commit.
+ *
+ * The refresh is a compare-and-swap on the timestamp, NOT a "is it still fresh"
+ * check. `claimedAt` carries no holder identity, so a claim someone else took
+ * over looks exactly like our own: if this process stalls (machine sleep,
+ * SIGSTOP, a long blocking write) past the TTL and another channel reclaims the
+ * entry, a freshness check would happily renew THEIR claim and put both
+ * processes back on the same hash. Only an exact match proves the stamp is
+ * still the one we wrote.
+ */
+export async function renewClaims(
+	cwd: string,
+	hashes: ReadonlyArray<string>,
+	expectedClaimedAt: string,
+): Promise<string | undefined> {
+	if (hashes.length === 0) return undefined;
+	const path = pendingPath(cwd);
+	const wanted = new Set(hashes);
+	return withPushPendingLock(cwd, async () => {
+		const current = await readPushPendingSnapshot(cwd);
+		const next: Record<string, PushPendingEntry> = { ...current.file.entries };
+		const nowIso = new Date().toISOString();
+		let renewed = 0;
+		for (const hash of wanted) {
+			const entry = next[hash];
+			// Exact match only — see the compare-and-swap note above.
+			if (!entry || entry.claimedAt !== expectedClaimedAt) continue;
+			next[hash] = { ...entry, claimedAt: nowIso };
+			renewed++;
+		}
+		if (renewed > 0 || current.prunedCount > 0) {
+			await writeOrUnlink(path, next);
+			logPrunedEntries(current.prunedCount);
+		}
+		if (renewed === 0) return undefined;
+		log.debug("Renewed %d push claim(s)", renewed);
+		return nowIso;
 	});
 }
 

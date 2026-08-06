@@ -44,29 +44,48 @@ function resolveWorkerInvocation(): WorkerInvocation | undefined {
 }
 
 /**
- * Starts an independent compensation drain when push-pending.json exists.
- * The detached child owns every network request and never inherits stdio.
- * Spawn failures are logged and left for the next trigger.
+ * Starts an independent drain as a detached child. The child owns every network
+ * request and never inherits stdio.
+ *
+ * Two callers, two shapes:
+ *   - compensation (default): drains whatever `push-pending.json` holds, and
+ *     skips entirely when there is no backlog file.
+ *   - pre-push (`extraArgs` carries `--push-id`): drains THIS push's commits and
+ *     publishes a result file. The backlog check is skipped — the hook has just
+ *     written those entries, and a stat race must not silently drop the spawn.
+ *
+ * The boolean return only reports SYNCHRONOUS failures (no worker script, or
+ * spawn throwing outright). The common ones — ENOENT on the node binary, EACCES
+ * — surface asynchronously on the child's `error` event, which is what
+ * `onSpawnError` is for: the pre-push hook uses it to publish a terminal result
+ * so its poll loop exits on the next tick instead of waiting out the budget.
  */
-export function triggerPendingPushRetry(cwd: string, trigger = "activation"): void {
+export function triggerPendingPushRetry(
+	cwd: string,
+	trigger = "activation",
+	extraArgs: ReadonlyArray<string> = [],
+	onSpawnError?: (error: Error) => void,
+): boolean {
 	try {
 		const projectDir = resolve(cwd);
-		const pendingPath = join(getJolliMemoryDir(projectDir), PUSH_PENDING_FILE);
-		if (!existsSync(pendingPath)) {
-			log.debug("Push compensation (%s): no push-pending backlog", trigger);
-			return;
+		if (extraArgs.length === 0) {
+			const pendingPath = join(getJolliMemoryDir(projectDir), PUSH_PENDING_FILE);
+			if (!existsSync(pendingPath)) {
+				log.debug("Push compensation (%s): no push-pending backlog", trigger);
+				return false;
+			}
 		}
 
 		const invocation = resolveWorkerInvocation();
 		if (!invocation) {
 			log.error("Push compensation (%s): PrePushWorker entry not found", trigger);
-			return;
+			return false;
 		}
 
 		const traceId = getCurrentTraceId();
 		const child = spawnHidden(
 			process.execPath,
-			[...invocation.nodeArgs, invocation.scriptPath, "--cwd", projectDir, "--trigger", trigger],
+			[...invocation.nodeArgs, invocation.scriptPath, "--cwd", projectDir, "--trigger", trigger, ...extraArgs],
 			{
 				detached: true,
 				stdio: "ignore",
@@ -76,9 +95,12 @@ export function triggerPendingPushRetry(cwd: string, trigger = "activation"): vo
 		);
 		child.once("error", (error) => {
 			log.debug("Push compensation (%s) worker failed to start: %s", trigger, errMsg(error));
+			onSpawnError?.(error);
 		});
 		child.unref();
+		return true;
 	} catch (error) {
 		log.debug("Push compensation (%s) trigger failed: %s", trigger, errMsg(error));
+		return false;
 	}
 }

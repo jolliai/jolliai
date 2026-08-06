@@ -6,6 +6,7 @@ import { JOLLI_DIR, JOLLIMEMORY_DIR } from "../Logger.js";
 import { withPushPendingLock } from "./Locks.js";
 import {
 	__writeForTest,
+	CLAIM_RENEW_INTERVAL_MS,
 	claimForPush,
 	deleteEntry,
 	loadPushPending,
@@ -13,6 +14,7 @@ import {
 	PUSH_ERROR_MSG_MAX_LEN,
 	PUSH_PENDING_STALE_MS,
 	type PushPendingFile,
+	renewClaims,
 	truncateError,
 	updateBatch,
 	updateEntry,
@@ -363,6 +365,75 @@ describe("updateBatch / updateEntry / deleteEntry", () => {
 		const file = await loadPushPending(cwd);
 		// The two from beforeEach plus the six new = 8 distinct entries.
 		expect(Object.keys(file.entries).length).toBe(8);
+	});
+});
+
+describe("renewClaims", () => {
+	const seed = async (over: Record<string, unknown> = {}) => {
+		const now = new Date().toISOString();
+		await __writeForTest(cwd, {
+			version: 1,
+			entries: { [HASH_A]: { branch: "feature/x", enqueuedAt: now, retryCount: 0, ...over } },
+		});
+	};
+
+	it("refreshes a claim this drain still holds and returns the new token", async () => {
+		await seed();
+		const claim = await claimForPush(cwd, [HASH_A]);
+		const renewed = await renewClaims(cwd, [HASH_A], claim.claimedAt);
+		expect(renewed).toBeDefined();
+		// A same-millisecond renewal legitimately produces an identical stamp, so
+		// the contract is "never goes backwards", not "always differs".
+		expect(Date.parse(renewed as string)).toBeGreaterThanOrEqual(Date.parse(claim.claimedAt));
+		const file = await loadPushPending(cwd);
+		expect(file.entries[HASH_A].claimedAt).toBe(renewed);
+	});
+
+	it("leaves a claim someone else took over untouched", async () => {
+		// `claimedAt` carries no holder identity, so a stale-but-fresh check would
+		// happily renew THEIR claim and put both processes on the same commit.
+		await seed();
+		const claim = await claimForPush(cwd, [HASH_A]);
+		const theirs = new Date(Date.now() + 1000).toISOString();
+		await updateEntry(cwd, HASH_A, {});
+		await __writeForTest(cwd, {
+			version: 1,
+			entries: {
+				[HASH_A]: {
+					branch: "feature/x",
+					enqueuedAt: new Date().toISOString(),
+					retryCount: 0,
+					claimedAt: theirs,
+				},
+			},
+		});
+		const renewed = await renewClaims(cwd, [HASH_A], claim.claimedAt);
+		expect(renewed).toBeUndefined();
+		const file = await loadPushPending(cwd);
+		expect(file.entries[HASH_A].claimedAt).toBe(theirs);
+	});
+
+	it("ignores entries with no claim at all", async () => {
+		await seed();
+		const renewed = await renewClaims(cwd, [HASH_A], new Date().toISOString());
+		expect(renewed).toBeUndefined();
+		const file = await loadPushPending(cwd);
+		expect(file.entries[HASH_A].claimedAt).toBeUndefined();
+	});
+
+	it("ignores hashes that are no longer pending", async () => {
+		const renewed = await renewClaims(cwd, [HASH_A], new Date().toISOString());
+		expect(renewed).toBeUndefined();
+	});
+
+	it("no-ops on an empty hash list without touching the file", async () => {
+		await expect(renewClaims(cwd, [], new Date().toISOString())).resolves.toBeUndefined();
+	});
+
+	it("beats the claim TTL with room for a missed beat", async () => {
+		// The heartbeat only protects a long drain while it stays comfortably
+		// inside the TTL; a half-TTL interval would retry exactly on the boundary.
+		expect(CLAIM_RENEW_INTERVAL_MS * 2).toBeLessThan(5 * 60 * 1000);
 	});
 });
 

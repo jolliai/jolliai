@@ -135,3 +135,47 @@ describe("triggerPendingPushRetry", () => {
 		);
 	});
 });
+
+describe("triggerPendingPushRetry — pre-push mode", () => {
+	it("forwards extra args and skips the backlog check", () => {
+		// The pre-push hook has just written those entries; a stat race must not
+		// silently drop the spawn.
+		h.existsSync.mockImplementation((path) => pathEndsWith(path, "/PrePushWorker.js"));
+
+		const started = triggerPendingPushRetry(CWD, "pre-push", ["--push-id", "trace-1"]);
+
+		expect(started).toBe(true);
+		const argv = h.spawnHidden.mock.calls[0][1] as string[];
+		expect(argv.slice(-4)).toEqual(["--trigger", "pre-push", "--push-id", "trace-1"]);
+	});
+
+	it("reports a synchronous failure through the return value", () => {
+		// No worker script on disk: the hook uses this to print a degraded notice
+		// immediately instead of waiting out its budget.
+		h.existsSync.mockReturnValue(false);
+
+		expect(triggerPendingPushRetry(CWD, "pre-push", ["--push-id", "trace-1"])).toBe(false);
+		expect(h.spawnHidden).not.toHaveBeenCalled();
+	});
+
+	it("routes an async spawn failure to onSpawnError", () => {
+		// ENOENT/EACCES arrive on the child's error event, after spawn returned —
+		// the return value cannot express them.
+		const onSpawnError = vi.fn();
+		let errorHandler: ((error: Error) => void) | undefined;
+		h.child.once.mockImplementation((event: string, handler: (error: Error) => void) => {
+			if (event === "error") errorHandler = handler;
+		});
+
+		const started = triggerPendingPushRetry(CWD, "pre-push", ["--push-id", "trace-1"], onSpawnError);
+		expect(started).toBe(true);
+
+		const failure = new Error("spawn ENOENT");
+		errorHandler?.(failure);
+		expect(onSpawnError).toHaveBeenCalledWith(failure);
+	});
+
+	it("still returns true for the compensation shape when a backlog exists", () => {
+		expect(triggerPendingPushRetry(CWD, "activation")).toBe(true);
+	});
+});

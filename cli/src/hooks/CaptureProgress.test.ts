@@ -205,6 +205,34 @@ describe("pruneStaleCaptureProgress", () => {
 		expect(() => readFileSync(join(dir, "recent.ndjson"), "utf-8")).not.toThrow();
 	});
 
+	it("sweeps the pre-push worker's json and tmp artifacts too", () => {
+		// Without these two suffixes every push leaves a request + result file
+		// behind forever, and a crashed `write + rename` leaks its scratch file.
+		const dir = captureProgressDir(tempDir);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "push-abc.request.json"), "{}", "utf-8");
+		writeFileSync(join(dir, "push-abc.result.json"), "{}", "utf-8");
+		writeFileSync(join(dir, "push-abc.result.json.tmp"), "{", "utf-8");
+		writeFileSync(join(dir, "push-abc.lock"), "1", "utf-8");
+		writeFileSync(join(dir, "keep.txt"), "z", "utf-8");
+		pruneStaleCaptureProgress(tempDir, 5_000, Date.now() + 10_000);
+		expect(existsSync(join(dir, "push-abc.request.json"))).toBe(false);
+		expect(existsSync(join(dir, "push-abc.result.json"))).toBe(false);
+		expect(existsSync(join(dir, "push-abc.result.json.tmp"))).toBe(false);
+		expect(existsSync(join(dir, "push-abc.lock"))).toBe(false);
+		expect(existsSync(join(dir, "keep.txt"))).toBe(true);
+	});
+
+	it("does not let the .json rule swallow the capture stream's .ndjson files", () => {
+		// `.ndjson` does not end with `.json`, so both entries are required — a
+		// single `.json` rule would silently stop sweeping progress streams.
+		const dir = captureProgressDir(tempDir);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "fresh.ndjson"), "x", "utf-8");
+		pruneStaleCaptureProgress(tempDir, 60_000, Date.now());
+		expect(existsSync(join(dir, "fresh.ndjson"))).toBe(true);
+	});
+
 	it("no-ops when the dir is missing", () => {
 		expect(() => pruneStaleCaptureProgress(tempDir, 1000)).not.toThrow();
 	});

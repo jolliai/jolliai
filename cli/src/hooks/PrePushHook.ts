@@ -3,19 +3,30 @@
  * PrePushHook — Git pre-push Event Handler.
  *
  * Invoked by git's pre-push hook before objects are transferred. Records the
- * commits being pushed into `push-pending.json`, then SYNCHRONOUSLY pushes the
- * batch-eligible memories that fit one request to Jolli Space
- * (`processPrePushInline`) — deliberately blocking the push, but never for
- * longer than {@link PRE_PUSH_SYNC_BUDGET_MS}. Commits without memory, items
- * beyond batch limits, and failed pushes stay in `push-pending.json` for the
- * compensation channels (QueueWorker post-drain, activation retry, the next
- * push).
+ * commits being pushed into `push-pending.json`, spawns a DETACHED worker to
+ * publish them to Jolli Space, and polls that worker's result for at most
+ * {@link PRE_PUSH_SYNC_BUDGET_MS} before letting git proceed.
  *
- * Publishing here is optimistic: it happens BEFORE git transfers objects, so a
- * subsequently rejected push can briefly leave Space articles for commits that
- * never reached the remote — accepted by design (the retry converges via docId
- * reuse). Waiting for push confirmation inside the hook would deadlock: git
- * waits for the hook to exit before transferring.
+ * The work is detached rather than inline because an aborted request is the
+ * worst outcome available: the server may already have minted a docId, the abort
+ * throws it away, and the next attempt CREATEs a duplicate article instead of
+ * UPDATEing (see `withRecoveredDocId`). The worker runs to completion with no
+ * wall-clock budget; only this hook's watch is bounded.
+ *
+ * The worker republishes after every settled commit, so a watch that times out
+ * still prints the commits that landed — one commit's push is a chain of
+ * requests (each plan, note and reference, then the summary), so a large push
+ * settles gradually rather than all at once.
+ *
+ * Publishing is optimistic: it happens BEFORE git transfers objects, so a
+ * rejected push can leave Space articles for commits that never reached the
+ * remote — accepted by design (the retry converges via docId reuse). What the
+ * worker must NOT do is the mirror image of that, and it does not: orphan
+ * deletion is deferred, so a rejected push can never strip articles from history
+ * that still exists on the remote. Waiting for push confirmation here would
+ * deadlock the watch — git waits for the hook to exit before transferring, so
+ * `ls-remote` cannot succeed while this process is alive. The worker's own tail
+ * pass and the compensation channels confirm, and they reconcile both directions.
  *
  * Failure policy: every error is caught, the exit code is always 0, and a
  * hard-exit timer (budget + grace) guarantees the hook can never hold
@@ -25,37 +36,44 @@
  *   <local-ref> <local-sha> <remote-ref> <remote-sha>
  */
 
+import { randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readPushDisabledState } from "../core/PushControl.js";
-import {
-	type InlineCommitStatus,
-	type ProcessPrePushInlineResult,
-	processPrePushInline,
-} from "../core/PushExecutor.js";
+import type { CommitPushOutcome, CommitPushStatus } from "../core/PushExecutor.js";
 import { mergeEntries, type PushTarget } from "../core/PushPendingStore.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getIndexEntryMap, getSummary } from "../core/SummaryStore.js";
-import { runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
+import { getCurrentTraceId, runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger, errMsg } from "../Logger.js";
 import { execFileAsyncHidden } from "../util/Subprocess.js";
 import { readStdin } from "./HookUtils.js";
+import { triggerPendingPushRetry } from "./PushCompensation.js";
+import {
+	type PushWatchEnd,
+	type PushWorkerResult,
+	reasonFromNote,
+	watchPushResult,
+	writePushRequest,
+	writePushResult,
+} from "./PushProgress.js";
 
 const log = createLogger("PrePushHook");
 
 /**
- * Total wall-clock budget for the synchronous portion of the hook — local git
- * reads, the pending-file write, and the single batch HTTP request all share
- * it. Anchored at process start.
+ * Total wall-clock budget for the blocking portion of the hook — local git
+ * reads, the pending-file write, the worker spawn, and the result watch all
+ * share it. Anchored at process start, so the node startup this process already
+ * paid for is not charged to the watch. The worker itself is NOT bounded by it.
  */
 export const PRE_PUSH_SYNC_BUDGET_MS = 3_000;
 
 /**
  * Grace on top of the budget before the hard-exit timer force-terminates the
- * process. Last-resort guard: cooperative deadline checks and the HTTP abort
- * normally end the hook well before this fires.
+ * process. Last-resort guard: the result watch honours the deadline on its own,
+ * so this only fires if something wedges outside it.
  */
 export const PRE_PUSH_HARD_EXIT_GRACE_MS = 1_000;
 
@@ -145,7 +163,7 @@ async function loadCommitSubjects(cwd: string, hashes: ReadonlyArray<string>): P
 }
 
 /** One marker per status: pushed / still coming / merged away / failed. */
-const STATUS_MARKERS: Record<InlineCommitStatus, string> = {
+const STATUS_MARKERS: Record<CommitPushStatus, string> = {
 	pushed: "✓",
 	generating: "…",
 	deferred: "…",
@@ -155,23 +173,35 @@ const STATUS_MARKERS: Record<InlineCommitStatus, string> = {
 
 /**
  * Prints the per-commit sync results to stderr — git forwards hook stderr, so
- * the list shows up inline in the user's `git push` output. One line per
- * commit of this push: marker, short hash, truncated subject, then the article
- * URL (pushed) or a short reason (everything else).
+ * the list shows up inline in the user's `git push` output.
+ *
+ * Iterates `hashes` (push order), NOT the outcome list: the worker settles
+ * commits concurrently and reports them in completion order, so rendering that
+ * order directly would scramble the list relative to the push. A hash with no
+ * outcome yet is rendered with `pendingLabel`.
  */
-async function printSyncResults(cwd: string, result: ProcessPrePushInlineResult): Promise<void> {
-	if (result.commits.length === 0) return;
-	const subjects = await loadCommitSubjects(
-		cwd,
-		result.commits.map((commit) => commit.hash),
-	);
+async function printSyncResults(
+	cwd: string,
+	hashes: ReadonlyArray<string>,
+	outcomes: ReadonlyMap<string, CommitPushOutcome>,
+	pendingLabel: string,
+): Promise<void> {
+	if (hashes.length === 0) return;
+	const subjects = await loadCommitSubjects(cwd, hashes);
 	const lines = ["jollimemory: push to Jolli Space"];
-	for (const commit of result.commits) {
-		const marker = STATUS_MARKERS[commit.status];
-		const shortHash = commit.hash.substring(0, 8);
-		const subject = formatSubject(subjects.get(commit.hash) ?? "");
-		const tail = commit.status === "pushed" ? (commit.url ?? "") : (commit.reason ?? "");
-		lines.push(`  ${marker} ${shortHash} ${subject} ${tail}`);
+	for (const hash of hashes) {
+		const outcome = outcomes.get(hash);
+		const marker = outcome ? STATUS_MARKERS[outcome.status] : STATUS_MARKERS.deferred;
+		const subject = formatSubject(subjects.get(hash) ?? "");
+		let tail: string;
+		if (!outcome) {
+			tail = pendingLabel;
+		} else if (outcome.status === "pushed") {
+			tail = outcome.url ?? "";
+		} else {
+			tail = outcome.reason ?? "";
+		}
+		lines.push(`  ${marker} ${hash.substring(0, 8)} ${subject} ${tail}`);
 	}
 	process.stderr.write(`${lines.join("\n")}\n`);
 }
@@ -252,9 +282,11 @@ async function printSignedOutMemoryNotice(
 
 /**
  * Core pre-push logic. Records pushed commits into push-pending.json and (when
- * signed in) synchronously batch-pushes the ones that already have memory,
- * within the remaining wall-clock budget. `startedAtMs` anchors the budget at
- * process start; it defaults to "now" for callers that don't track it.
+ * signed in) hands them to a detached worker that owns every network round-trip,
+ * then watches the worker's result file for as long as the remaining wall-clock
+ * budget allows. Nothing is pushed on this process's own time: the worker runs to
+ * completion whether or not the watch is still there. `startedAtMs` anchors the
+ * budget at process start; it defaults to "now" for callers that don't track it.
  */
 export async function prePushEntry(cwd: string, stdin: string, remote?: string, startedAtMs?: number): Promise<void> {
 	const deadlineAt = (startedAtMs ?? Date.now()) + PRE_PUSH_SYNC_BUDGET_MS;
@@ -298,8 +330,8 @@ export async function prePushEntry(cwd: string, stdin: string, remote?: string, 
 
 	// Per-repo outbound-push opt-out (spec 306). Entries are already recorded
 	// above, so a later re-enable catches up; skip the sync and tell the user why
-	// rather than leaving them in silence (processPrePushInline would also gate,
-	// but its empty result prints nothing).
+	// rather than leaving them in silence (the worker gates on this too, but its
+	// empty result would print nothing).
 	//
 	// Read the STATE, not the boolean: the gate fails CLOSED, so an unreadable
 	// store reports "disabled" for every repo on the machine. Pointing that user at
@@ -329,26 +361,77 @@ export async function prePushEntry(cwd: string, stdin: string, remote?: string, 
 		return;
 	}
 
-	// Synchronous inline sync — scoped to THIS push's commits only (leftover
-	// entries belong to the compensation channels). Entries are already
-	// recorded above (write-first), so any failure here just leaves them for
-	// those channels — never block or fail the push on sync problems.
+	// Detached sync — the worker owns every network round-trip and runs to
+	// completion; this hook only watches it for as long as the budget allows.
+	// Entries are already recorded above (write-first), so a spawn failure or an
+	// abandoned watch just leaves them for the compensation channels.
+	const pushId = getCurrentTraceId() ?? randomUUID();
+	const hashes = [...allHashes];
 	try {
-		log.info("pre-push: starting inline sync — %dms of budget remaining", deadlineAt - Date.now());
-		const result = await processPrePushInline(cwd, { priorityHashes: [...allHashes], deadlineAt });
-		log.info(
-			"pre-push: inline sync done — pushed=%d failed=%d noMemory=%d notAttempted=%d children=%d%s",
-			result.pushed,
-			result.failed,
-			result.skippedNoMemory,
-			result.notAttempted,
-			result.deletedChildren,
-			result.note ? ` (${result.note})` : "",
-		);
-		await printSyncResults(cwd, result);
+		writePushRequest(cwd, { pushId, hashes });
 	} catch (error: unknown) {
-		log.error("Inline pre-push sync failed: %s", errMsg(error));
+		// Without a work list the worker has nothing to drain. Skip the spawn and
+		// the watch rather than making the user wait out the budget for nothing.
+		log.error("Could not write the pre-push work list: %s", errMsg(error));
+		process.stderr.write("jollimemory: recorded locally — background sync could not start.\n");
+		return;
 	}
+
+	// An async spawn failure (missing node, EACCES) arrives through this callback,
+	// not the return value. Publishing a terminal result lets the poll loop below
+	// exit on its next tick instead of waiting out the whole budget.
+	const spawned = triggerPendingPushRetry(cwd, "pre-push", ["--push-id", pushId], (error) => {
+		writePushResult(cwd, {
+			pushId,
+			commits: [],
+			complete: true,
+			note: `sync worker could not start: ${error.message}`,
+		});
+	});
+	if (!spawned) {
+		log.error("Pre-push sync worker could not be spawned — %d commit(s) left pending", total);
+		process.stderr.write("jollimemory: recorded locally — background sync could not start.\n");
+		return;
+	}
+
+	log.info("pre-push: worker spawned (pushId=%s) — watching for %dms", pushId, deadlineAt - Date.now());
+	// The worker is already running and owns the work from here on, so nothing
+	// this watch does may fail the push. A broken watch degrades to the same
+	// outcome as a timeout: git proceeds, the worker finishes on its own.
+	let ended: PushWatchEnd = "timeout";
+	let result: PushWorkerResult | undefined;
+	try {
+		({ ended, result } = await watchPushResult(cwd, pushId, { deadlineAt }));
+	} catch (error: unknown) {
+		log.error("pre-push: result watch failed: %s", errMsg(error));
+	}
+	const outcomes = new Map((result?.commits ?? []).map((commit) => [commit.hash, commit]));
+
+	if (ended === "complete") {
+		// The worker guarantees a complete result covers every hash, so anything
+		// still missing is a genuine anomaly — label it from the note rather than
+		// claiming it is still syncing, which would be false: the worker is gone.
+		log.info("pre-push: worker finished — %d outcome(s)%s", outcomes.size, result?.note ? ` (${result.note})` : "");
+		await printSyncResults(cwd, hashes, outcomes, reasonFromNote(result?.note));
+		return;
+	}
+
+	if (ended === "worker-dead") {
+		log.warn("pre-push: sync worker died with %d of %d commit(s) settled", outcomes.size, hashes.length);
+		await printSyncResults(cwd, hashes, outcomes, "interrupted — still pending");
+		process.stderr.write("jollimemory: background sync was interrupted (see .jolli/jollimemory/debug.log).\n");
+		return;
+	}
+
+	// Timed out with the worker still alive — "in the background" is accurate here.
+	log.info("pre-push: watch timed out — %d of %d settled", outcomes.size, hashes.length);
+	if (outcomes.size > 0) {
+		await printSyncResults(cwd, hashes, outcomes, "syncing in the background");
+		return;
+	}
+	process.stderr.write(
+		`jollimemory: syncing ${total} commit(s) to Jolli Space in the background — results land shortly.\n`,
+	);
 }
 
 // --- Script entry point (only when run directly, not when imported) ---

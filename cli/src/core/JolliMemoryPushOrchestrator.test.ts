@@ -60,9 +60,6 @@ vi.mock("./PushControl.js", async (orig) => ({
 import { getDefaultBranch } from "./GitOps.js";
 import { buildBranchRelativePath, getCanonicalRepoUrl } from "./GitRemoteUtils.js";
 import {
-	BATCH_MAX_ATTACHMENTS_PER_ITEM,
-	BATCH_MAX_CONTENT_CHARS,
-	type BatchItemResult,
 	BindingAlreadyExistsError,
 	BindingRequiredError,
 	ClientOutdatedError,
@@ -72,12 +69,10 @@ import {
 	type PushResult,
 } from "./JolliMemoryPushClient.js";
 import {
-	applyBatchResult,
 	applyNoteUrls,
 	applyPlanUrls,
 	applyReferenceUrls,
 	assignOwnedAttachments,
-	buildBatchItems,
 	buildPushMarkdown,
 	canReuseDocId,
 	docUrlPlaceholder,
@@ -92,7 +87,7 @@ import {
 import { loadBranchSummaries } from "./PrDescription.js";
 import { isOutboundPushAllowed } from "./PushControl.js";
 import { loadPushPending } from "./PushPendingStore.js";
-import { assignOwnedContext } from "./push/ContextPush.js";
+import { assignOwnedContext, buildContextBatchAttachments } from "./push/ContextPush.js";
 import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import { buildPushTitle } from "./SummaryFormat.js";
 import {
@@ -1286,6 +1281,43 @@ describe("pushSummary", () => {
 		expect(summaryUrl).toBe(`${BASE}/articles?doc=42`);
 	});
 
+	// The article is already published when the local write fails, so this must be
+	// reported (with the minted id) rather than thrown: the drain records the id on
+	// its pending entry so the retry UPDATEs instead of CREATEing a duplicate.
+	it("reports writeBackFailed with the minted docId instead of failing the push", async () => {
+		const client = fakeClient();
+		vi.mocked(storeSummary).mockRejectedValueOnce(new Error("orphan branch lock busy"));
+
+		const result = await pushSummary(leaf(), baseCtx(client));
+
+		expect(result.writeBackFailed).toBe(true);
+		expect(result.docId).toBe(42);
+		expect(result.summaryUrl).toBe(`${BASE}/articles?doc=42`);
+	});
+
+	// The pre-push worker runs BEFORE git transfers objects, so deleting orphaned
+	// articles there could strip memories from history that is still on the remote.
+	it("defers orphan cleanup and reports cleanupPending when skipOrphanCleanup is set", async () => {
+		const client = fakeClient();
+		const summary = leaf({ orphanedDocIds: [1, 2] });
+
+		const result = await pushSummary(summary, baseCtx(client), undefined, { skipOrphanCleanup: true });
+
+		expect(result.cleanupPending).toBe(true);
+		expect(client.deleteDoc).not.toHaveBeenCalled();
+		// The write-back still happened — only the deletion was deferred.
+		expect(storeSummary).toHaveBeenCalledTimes(1);
+	});
+
+	it("reports no cleanupPending for a clean summary on the deferred path", async () => {
+		const client = fakeClient();
+
+		const result = await pushSummary(leaf(), baseCtx(client), undefined, { skipOrphanCleanup: true });
+
+		expect(result.cleanupPending).toBeUndefined();
+		expect(client.deleteDoc).not.toHaveBeenCalled();
+	});
+
 	it("does not fail the overall push when orphan cleanup throws a non-Error value", async () => {
 		const client = fakeClient();
 		vi.mocked(storeSummary)
@@ -1562,6 +1594,26 @@ describe("pushBranchToJolli", () => {
 		expect(client.push).toHaveBeenCalledTimes(2);
 	});
 
+	// pushSummary swallows a failed write-back and reports it as a flag, because the
+	// drains record the minted docId on their push-pending entry instead. This path
+	// keeps no such entry, so an ignored flag would report success while nothing
+	// points at the published article — and the next push would CREATE a second one.
+	it("reports an error (not a pushed count) when a published summary's local write-back failed", async () => {
+		const s1 = leaf({ commitHash: "aaa1111" });
+		const s2 = leaf({ commitHash: "bbb2222" });
+		vi.mocked(loadBranchSummaries).mockResolvedValue({ summaries: [s1, s2], missingCount: 0 });
+		vi.mocked(storeSummary).mockRejectedValueOnce(new Error("orphan branch lock busy"));
+		const client = fakeClient({ push: async () => fakePushResult({ docId: 42 }) });
+
+		const result = await pushBranchToJolli({ cwd: "/repo", client });
+
+		expect(result.type).toBe("error");
+		expect(result.type === "error" && result.message).toContain("aaa1111");
+		expect(result.type === "error" && result.message).toContain(`${BASE}/articles?doc=42`);
+		// The remaining summary is left unsent — it needs the same write that failed.
+		expect(client.push).toHaveBeenCalledTimes(1);
+	});
+
 	it("dedups a plan recurring across two commits to a single push (assignOwnedAttachments)", async () => {
 		const recurringPlan = plan({ slug: "refactor-a1b2c3d4", updatedAt: "2026-02-01T00:00:00.000Z" });
 		const s1 = leaf({
@@ -1800,7 +1852,7 @@ describe("pushBranchToJolli", () => {
 	});
 });
 
-// ─── Batch push helpers ──────────────────────────────────────────────────────
+// ─── Server placeholder contract ─────────────────────────────────────────────
 
 describe("docUrlPlaceholder", () => {
 	it("builds the lockstep placeholder shape", () => {
@@ -1808,432 +1860,35 @@ describe("docUrlPlaceholder", () => {
 	});
 });
 
-describe("buildBatchItems", () => {
-	beforeEach(() => {
-		vi.mocked(readPlanFromBranch).mockReset().mockResolvedValue(null);
-		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
-		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
-	});
+describe("context attachment clientKey wire contract", () => {
+	// The clientKey is echoed by the server and is the payload of the
+	// `{{jolli:doc:<clientKey>}}` placeholder, whose format is a byte-for-byte
+	// lockstep contract with the server's substituter. Deriving it from `docType`
+	// once renamed this silently; `clientKeyPrefix` pins it and this asserts it.
+	// Asserted against `buildContextBatchAttachments` because the batch builder
+	// that used to be the caller is gone (see the note in `PushExecutor`).
+	it("emits `ref-N` for a reference, not `reference-N`", async () => {
+		const ref = reference();
+		const summary = leaf({ references: [ref] });
+		vi.mocked(readReferenceFromBranch).mockResolvedValue(null);
 
-	function owned(overrides: {
-		plans?: Map<string, ReadonlyArray<PlanReference>>;
-		notes?: Map<string, ReadonlyArray<NoteReference>>;
-		references?: Map<string, ReadonlyArray<ReferenceCommitRef>>;
-	}) {
-		return {
-			ownedPlans: overrides.plans ?? new Map(),
-			ownedNotes: overrides.notes ?? new Map(),
-			ownedReferences: overrides.references ?? new Map(),
-		};
-	}
-
-	it("builds one item per summary with placeholder-woven markdown and attachment keys", async () => {
-		const summary = leaf({ plans: [plan()] });
-		vi.mocked(readPlanFromBranch).mockResolvedValue("# Plan body");
-		const ctx = baseCtx(fakeClient());
-
-		const built = await buildBatchItems(
-			[summary],
-			owned({ plans: new Map([[summary.commitHash, [plan()]]]) }),
-			ctx,
-		);
-
-		expect(built).toHaveLength(1);
-		const item = built[0].item;
-		expect(item.commitHash).toBe(summary.commitHash);
-		expect(item.branch).toBe(summary.branch);
-		expect(item.attachments).toHaveLength(1);
-		expect(item.attachments[0]).toMatchObject({ clientKey: "plan-0", docType: "plan", content: "# Plan body" });
-		// The placeholder is woven into the summary markdown where the plan URL goes.
-		expect(item.summary.content).toContain(docUrlPlaceholder("plan-0"));
-		// Write-back bookkeeping maps the clientKey to the plan's slug.
-		expect(built[0].attachmentKeys.get("plan-0")).toEqual({ docType: "plan", key: "p1" });
-		expect(built[0].batchContentChars).toBe(
-			item.summary.content.length + (item.summary.summaryJson?.length ?? 0) + item.attachments[0].content.length,
-		);
-		expect(built[0].batchIneligibleReason).toBeUndefined();
-	});
-
-	it("marks an item with too many attachments for the per-commit fallback", async () => {
-		const plans = Array.from({ length: BATCH_MAX_ATTACHMENTS_PER_ITEM + 1 }, (_, index) =>
-			plan({ slug: `p-${index}` }),
-		);
-		const summary = leaf({ plans });
-		vi.mocked(readPlanFromBranch).mockResolvedValue("# Plan body");
-
-		const built = await buildBatchItems(
-			[summary],
-			owned({ plans: new Map([[summary.commitHash, plans]]) }),
+		const built = await buildContextBatchAttachments(
+			summary,
 			baseCtx(fakeClient()),
+			ENV_KEY,
+			new Map([["reference", [ref]]]),
+			docUrlPlaceholder,
 		);
 
-		expect(built[0].item.attachments).toHaveLength(BATCH_MAX_ATTACHMENTS_PER_ITEM + 1);
-		expect(built[0].batchIneligibleReason).toBe("attachment count exceeds the batch limit");
-	});
-
-	it("marks an item whose attachment body exceeds the per-doc limit for the per-commit fallback", async () => {
-		const summary = leaf({ plans: [plan()] });
-		vi.mocked(readPlanFromBranch).mockResolvedValue("x".repeat(BATCH_MAX_CONTENT_CHARS + 1));
-
-		const built = await buildBatchItems(
-			[summary],
-			owned({ plans: new Map([[summary.commitHash, [plan()]]]) }),
-			baseCtx(fakeClient()),
-		);
-
-		expect(built[0].batchIneligibleReason).toBe("attachment content exceeds the batch limit");
-	});
-
-	it("skips a plan whose content is unreadable (no attachment, no placeholder)", async () => {
-		const summary = leaf({ plans: [plan()] });
-		vi.mocked(readPlanFromBranch).mockResolvedValue(null);
-		const ctx = baseCtx(fakeClient());
-
-		const built = await buildBatchItems(
-			[summary],
-			owned({ plans: new Map([[summary.commitHash, [plan()]]]) }),
-			ctx,
-		);
-
-		expect(built[0].item.attachments).toHaveLength(0);
-		expect(built[0].item.summary.content).not.toContain("{{jolli:doc:");
-	});
-
-	it("carries a reusable docId when the stored doc URL matches the push env", async () => {
-		const summary = leaf({ plans: [plan()] });
-		vi.mocked(readPlanFromBranch).mockResolvedValue("# Plan body");
-		const reusable = plan({ jolliPlanDocId: 42, jolliPlanDocUrl: `${BASE}/articles/p-42` });
-		const ctx = baseCtx(fakeClient());
-
-		const built = await buildBatchItems(
-			[summary],
-			owned({ plans: new Map([[summary.commitHash, [reusable]]]) }),
-			ctx,
-		);
-
-		expect(built[0].item.attachments[0].docId).toBe(42);
-	});
-
-	it("drops a docId minted on a different backend (env mismatch)", async () => {
-		const summary = leaf({ plans: [plan()] });
-		vi.mocked(readPlanFromBranch).mockResolvedValue("# Plan body");
-		const foreign = plan({ jolliPlanDocId: 42, jolliPlanDocUrl: "https://other.jolli.dev/articles/p-42" });
-		const ctx = baseCtx(fakeClient());
-
-		const built = await buildBatchItems(
-			[summary],
-			owned({ plans: new Map([[summary.commitHash, [foreign]]]) }),
-			ctx,
-		);
-
-		expect(built[0].item.attachments[0].docId).toBeUndefined();
-	});
-
-	it("carries the summary's own reusable docId and summaryJson", async () => {
-		const summary = leaf({ jolliDocId: 7, jolliDocUrl: `${BASE}/articles/s-7` });
-		const ctx = baseCtx(fakeClient());
-
-		const built = await buildBatchItems([summary], owned({}), ctx);
-
-		expect(built[0].item.summary.docId).toBe(7);
-		expect(built[0].item.summary.summaryJson).toBeDefined();
-	});
-
-	it("uses a snippet note's inline content instead of reading from the branch", async () => {
-		const snippet = note({ format: "snippet", content: "inline note body" });
-		const summary = leaf({ notes: [snippet] });
-		const ctx = baseCtx(fakeClient());
-
-		const built = await buildBatchItems(
-			[summary],
-			owned({ notes: new Map([[summary.commitHash, [snippet]]]) }),
-			ctx,
-		);
-
-		expect(built[0].item.attachments[0]).toMatchObject({
-			clientKey: "note-0",
-			docType: "note",
-			content: "inline note body",
-		});
-		expect(readNoteFromBranch).not.toHaveBeenCalled();
-	});
-
-	/**
-	 * The other half of the format split, and the batch sibling of the individual
-	 * path's snippet case above: inline `content` is a SNIPPET-only field, so a
-	 * markdown note ignores whatever it carries and takes the orphan-branch copy.
-	 *
-	 * Pinned because the batch path used to read `note.content ?? branch` for BOTH
-	 * formats, and the test that covered it asserted only the inline half — so
-	 * narrowing the rule to snippets left the markdown half unpinned on this path.
-	 */
-	it("reads a markdown note's body from the branch even when it carries inline content", async () => {
-		const markdown = note({ format: "markdown", content: "stale inline copy" });
-		const summary = leaf({ notes: [markdown] });
-		vi.mocked(readNoteFromBranch).mockResolvedValue("# Branch body");
-		const ctx = baseCtx(fakeClient());
-
-		const built = await buildBatchItems(
-			[summary],
-			owned({ notes: new Map([[summary.commitHash, [markdown]]]) }),
-			ctx,
-		);
-
-		expect(built[0].item.attachments[0]).toMatchObject({ clientKey: "note-0", content: "# Branch body" });
-		expect(readNoteFromBranch).toHaveBeenCalledWith("n1", "/repo", undefined);
+		expect(built.attachments.map((a) => a.clientKey)).toEqual(["ref-0"]);
+		expect(built.attachmentKeys.get("ref-0")).toEqual({ docType: "reference", key: ref.archivedKey });
+		expect(built.placeholders.get("reference")).toEqual([
+			{ entryKey: ref.archivedKey, url: docUrlPlaceholder("ref-0") },
+		]);
 	});
 });
 
-describe("applyBatchResult", () => {
-	beforeEach(() => {
-		vi.mocked(storeSummary).mockReset().mockResolvedValue(undefined);
-		vi.mocked(getIndexEntryMap).mockReset().mockResolvedValue(new Map());
-		vi.mocked(getSummary).mockReset().mockResolvedValue(null);
-		vi.mocked(loadPushPending).mockReset().mockResolvedValue({ version: 1, entries: {} });
-		vi.mocked(readPlanFromBranch).mockReset().mockResolvedValue("# Plan body");
-		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
-		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
-	});
-
-	async function buildOne(summary: CommitSummary, plans: ReadonlyArray<PlanReference> = []) {
-		const ctx = baseCtx(fakeClient());
-		const built = await buildBatchItems(
-			[summary],
-			{
-				ownedPlans: new Map(plans.length > 0 ? [[summary.commitHash, plans]] : []),
-				ownedNotes: new Map(),
-				ownedReferences: new Map(),
-			},
-			ctx,
-		);
-		return { ctx, built };
-	}
-
-	function okResult(summary: CommitSummary, attachments: BatchItemResult["attachments"] = []): BatchItemResult {
-		return {
-			commitHash: summary.commitHash,
-			ok: true,
-			summary: { docId: 9, url: "/articles/s-9", jrn: "jrn:9", created: true },
-			attachments,
-		};
-	}
-
-	it("writes back the summary docId/url and woven attachment URLs on success", async () => {
-		const summary = leaf({ plans: [plan()] });
-		const { ctx, built } = await buildOne(summary, [plan()]);
-
-		const outcome = await applyBatchResult(
-			built,
-			[okResult(summary, [{ clientKey: "plan-0", ok: true, docId: 11, url: "/articles/p-11" }])],
-			ctx,
-		);
-
-		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0 });
-		expect(storeSummary).toHaveBeenCalledTimes(1);
-		const stored = vi.mocked(storeSummary).mock.calls[0][0] as CommitSummary;
-		expect(stored.jolliDocId).toBe(9);
-		expect(stored.jolliDocUrl).toBe(`${BASE}/articles/s-9`);
-		expect(stored.plans?.[0]).toMatchObject({ jolliPlanDocId: 11, jolliPlanDocUrl: `${BASE}/articles/p-11` });
-	});
-
-	it("deletes the freshly-pushed article and skips write-back when the commit became a child mid-push", async () => {
-		const summary = leaf();
-		const { ctx, built } = await buildOne(summary);
-		vi.mocked(getIndexEntryMap).mockResolvedValue(
-			new Map([
-				[
-					summary.commitHash,
-					{
-						commitHash: summary.commitHash,
-						parentCommitHash: "def4567890",
-						commitMessage: "",
-						commitDate: "",
-						branch: summary.branch,
-						generatedAt: "",
-					},
-				],
-			]),
-		);
-
-		const outcome = await applyBatchResult(built, [okResult(summary)], ctx);
-
-		expect(outcome).toEqual({ writtenBack: 0, childSkipped: 1 });
-		expect(ctx.client.deleteDoc).toHaveBeenCalledWith(9);
-		expect(storeSummary).not.toHaveBeenCalled();
-	});
-
-	it("deletes only the CREATEd attachments alongside the article on the mid-push child guard", async () => {
-		const summary = leaf();
-		const { ctx, built } = await buildOne(summary);
-		vi.mocked(getIndexEntryMap).mockResolvedValue(
-			new Map([
-				[
-					summary.commitHash,
-					{
-						commitHash: summary.commitHash,
-						parentCommitHash: "def4567890",
-						commitMessage: "",
-						commitDate: "",
-						branch: summary.branch,
-						generatedAt: "",
-					},
-				],
-			]),
-		);
-
-		const outcome = await applyBatchResult(
-			built,
-			[
-				okResult(summary, [
-					{ clientKey: "plan-0", ok: true, docId: 11, url: "/articles/p-11", created: true },
-					{ clientKey: "note-0", ok: true, docId: 12, url: "/articles/n-12", created: false },
-					{ clientKey: "note-1", ok: true, created: true },
-					{ clientKey: "ref-0", ok: false, error: "boom" },
-				]),
-			],
-			ctx,
-		);
-
-		expect(outcome).toEqual({ writtenBack: 0, childSkipped: 1 });
-		expect(ctx.client.deleteDoc).toHaveBeenCalledWith(9);
-		expect(ctx.client.deleteDoc).toHaveBeenCalledWith(11);
-		expect(ctx.client.deleteDoc).toHaveBeenCalledTimes(2);
-		expect(storeSummary).not.toHaveBeenCalled();
-	});
-
-	it("tolerates a best-effort delete failure on the mid-push child guard", async () => {
-		const summary = leaf();
-		const ctx = baseCtx(fakeClient({ deleteDoc: async () => Promise.reject(new Error("network")) }));
-		const built = await buildBatchItems(
-			[summary],
-			{ ownedPlans: new Map(), ownedNotes: new Map(), ownedReferences: new Map() },
-			ctx,
-		);
-		vi.mocked(getIndexEntryMap).mockResolvedValue(
-			new Map([
-				[
-					summary.commitHash,
-					{
-						commitHash: summary.commitHash,
-						parentCommitHash: "def4567890",
-						commitMessage: "",
-						commitDate: "",
-						branch: summary.branch,
-						generatedAt: "",
-					},
-				],
-			]),
-		);
-
-		// The created attachment's delete fails too — both stay best-effort.
-		await expect(
-			applyBatchResult(
-				built,
-				[
-					okResult(summary, [
-						{ clientKey: "plan-0", ok: true, docId: 11, url: "/articles/p-11", created: true },
-					]),
-				],
-				ctx,
-			),
-		).resolves.toEqual({
-			writtenBack: 0,
-			childSkipped: 1,
-		});
-	});
-
-	it("skips failed items and items with no matching built entry", async () => {
-		const summary = leaf();
-		const { ctx, built } = await buildOne(summary);
-
-		const outcome = await applyBatchResult(
-			built,
-			[
-				{ commitHash: summary.commitHash, ok: false, attachments: [], error: "boom" },
-				{ ...okResult(summary), commitHash: "f".repeat(40) },
-			],
-			ctx,
-		);
-
-		expect(outcome).toEqual({ writtenBack: 0, childSkipped: 0 });
-		expect(storeSummary).not.toHaveBeenCalled();
-	});
-
-	it("reports a per-item write-back failure with the minted ids (article is already published)", async () => {
-		const summary = leaf();
-		const { ctx, built } = await buildOne(summary);
-		vi.mocked(storeSummary).mockRejectedValue(new Error("disk full"));
-
-		const outcome = await applyBatchResult(built, [okResult(summary)], ctx);
-
-		expect(outcome).toEqual({
-			writtenBack: 0,
-			childSkipped: 0,
-			writeBackFailures: [{ commitHash: summary.commitHash, docId: 9, url: `${BASE}/articles/s-9` }],
-		});
-	});
-
-	it("treats every commit as a root when the summary index cannot be read", async () => {
-		const summary = leaf();
-		const { ctx, built } = await buildOne(summary);
-		vi.mocked(getIndexEntryMap).mockRejectedValue(new Error("index unavailable"));
-
-		const outcome = await applyBatchResult(built, [okResult(summary)], ctx);
-
-		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0 });
-		expect(ctx.client.deleteDoc).not.toHaveBeenCalled();
-		expect(storeSummary).toHaveBeenCalledTimes(1);
-	});
-
-	it("deletes orphaned articles when cleanupOrphans is set (compensation path)", async () => {
-		const summary = leaf({ orphanedDocIds: [42] });
-		const { ctx, built } = await buildOne(summary);
-
-		const outcome = await applyBatchResult(built, [okResult(summary)], ctx, { cleanupOrphans: true });
-
-		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0 });
-		expect(ctx.client.deleteDoc).toHaveBeenCalledWith(42);
-		// Two persists: the docId/url write-back, then the cleaned orphan list.
-		expect(storeSummary).toHaveBeenCalledTimes(2);
-	});
-
-	it("skips orphan cleanup by default (budget-bound inline pre-push path)", async () => {
-		const summary = leaf({ orphanedDocIds: [42] });
-		const { ctx, built } = await buildOne(summary);
-
-		const outcome = await applyBatchResult(built, [okResult(summary)], ctx);
-
-		expect(ctx.client.deleteDoc).not.toHaveBeenCalled();
-		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0, cleanupPendingHashes: [summary.commitHash] });
-	});
-
-	it("keeps the write-back result when orphan cleanup itself fails", async () => {
-		const summary = leaf({ orphanedDocIds: [42] });
-		const ctx = baseCtx(fakeClient({ deleteDoc: async () => Promise.reject(new Error("network")) }));
-		const built = await buildBatchItems(
-			[summary],
-			{ ownedPlans: new Map(), ownedNotes: new Map(), ownedReferences: new Map() },
-			ctx,
-		);
-
-		const outcome = await applyBatchResult(built, [okResult(summary)], ctx, { cleanupOrphans: true });
-
-		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0, cleanupPendingHashes: [summary.commitHash] });
-	});
-
-	it("resolves orphan hashes before cleanup on the compensation batch path", async () => {
-		const summary = leaf({ unresolvedOrphanHashes: ["child1hash"] });
-		const { ctx, built } = await buildOne(summary);
-		vi.mocked(getSummary).mockResolvedValueOnce(leaf({ commitHash: "child1hash", jolliDocId: 201 }));
-
-		const outcome = await applyBatchResult(built, [okResult(summary)], ctx, { cleanupOrphans: true });
-
-		expect(ctx.client.deleteDoc).toHaveBeenCalledWith(201);
-		expect(outcome).toEqual({ writtenBack: 1, childSkipped: 0 });
-	});
-});
-
-// ─── Generic-forms + batch failure logging (table-driven push path) ─────────
+// ─── Generic call forms (table-driven push path) ─────────────────────────────
 
 describe("kind-agnostic call forms", () => {
 	beforeEach(() => {
@@ -2281,99 +1936,7 @@ describe("kind-agnostic call forms", () => {
 		expect(docTypes).toEqual(["plan", "summary"]);
 		expect(docTypes).not.toContain("skill");
 	});
-
-	it("buildBatchItems accepts the kind-agnostic OwnedContext form", async () => {
-		const summary = leaf({ plans: [plan()] });
-		const built = await buildBatchItems(
-			[summary],
-			new Map([["plan", { owned: new Map([[summary.commitHash, [plan()]]]), seeds: new Map() }]]),
-			baseCtx(fakeClient()),
-		);
-		expect(built[0].item.attachments.map((a) => a.clientKey)).toEqual(["plan-0"]);
-	});
 });
-
-describe("applyBatchResult attachment-failure logging", () => {
-	beforeEach(() => {
-		vi.mocked(storeSummary).mockReset().mockResolvedValue(undefined);
-		vi.mocked(getIndexEntryMap).mockReset().mockResolvedValue(new Map());
-		vi.mocked(getSummary).mockReset().mockResolvedValue(null);
-		vi.mocked(loadPushPending).mockReset().mockResolvedValue({ version: 1, entries: {} });
-		vi.mocked(readPlanFromBranch).mockReset().mockResolvedValue("# Plan body");
-		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
-		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
-		mockLogWarn.mockReset();
-		mockLogError.mockReset();
-	});
-
-	it("write-back succeeds and failures are visible: doctype_not_allowed collapses to one line per kind, other errors log per item", async () => {
-		// Two failed plan attachments with errorCode doctype_not_allowed + one failed
-		// with plain error text + one successful. Batch attachment failures arrive as
-		// `ok: false` inside a 2xx body — they used to be dropped in SILENCE, which
-		// made a server-side rejection of a whole docType invisible on the default
-		// (batch-first) push path.
-		const p1 = plan({ slug: "p1-1234abcd", title: "P1" });
-		const p2 = plan({ slug: "p2-1234abcd", title: "P2" });
-		const p3 = plan({ slug: "p3-1234abcd", title: "P3" });
-		const p4 = plan({ slug: "p4-1234abcd", title: "P4" });
-		const summary = leaf({ plans: [p1, p2, p3, p4] });
-		const ctx = baseCtx(fakeClient());
-		const built = await buildBatchItems(
-			[summary],
-			{
-				ownedPlans: new Map([[summary.commitHash, [p1, p2, p3, p4]]]),
-				ownedNotes: new Map(),
-				ownedReferences: new Map(),
-			},
-			ctx,
-		);
-		const outcome = await applyBatchResult(
-			built,
-			[
-				{
-					commitHash: summary.commitHash,
-					ok: true,
-					summary: { docId: 9, url: "/articles/s-9", jrn: "jrn:9", created: true },
-					attachments: [
-						{ clientKey: "plan-0", ok: false, errorCode: "doctype_not_allowed", error: "not enabled" },
-						{ clientKey: "plan-1", ok: false, errorCode: "doctype_not_allowed", error: "not enabled" },
-						{ clientKey: "plan-2", ok: false, error: "boom" },
-						{
-							clientKey: "plan-3",
-							ok: true,
-							docId: 31,
-							url: "/articles/p-31",
-							jrn: "jrn:31",
-							created: true,
-						},
-					],
-				},
-			],
-			ctx,
-		);
-		expect(outcome.writtenBack).toBe(1);
-		// The successful attachment still gets woven back.
-		const stored = vi.mocked(storeSummary).mock.calls[0][0];
-		expect(stored.plans?.find((p) => p.slug === "p4-1234abcd")?.jolliPlanDocId).toBe(31);
-		expect(stored.plans?.find((p) => p.slug === "p1-1234abcd")?.jolliPlanDocId).toBeUndefined();
-
-		// The collapsing itself, asserted rather than described: TWO refused plan
-		// attachments produce exactly ONE warn naming the docType (a dozen skills on a
-		// server without that docType enabled must not emit a dozen identical lines),
-		// and it must name the kind, not the clientKey.
-		const docTypeWarnings = mockLogWarn.mock.calls.filter(([fmt]) => String(fmt).includes("docType"));
-		expect(docTypeWarnings).toHaveLength(1);
-		expect(docTypeWarnings[0]).toContain("plan");
-		// The plain failure keeps its own per-item line — it is not a kind-wide
-		// condition, so collapsing it would hide which attachment failed.
-		const itemErrors = mockLogError.mock.calls.filter(([fmt]) => String(fmt).includes("FAILED"));
-		expect(itemErrors).toHaveLength(1);
-		expect(itemErrors[0]).toContain("plan-2");
-		// And the successful attachment produced neither.
-		expect(mockLogError.mock.calls.some((call) => call.includes("plan-3"))).toBe(false);
-	});
-});
-
 describe("reference article body from the orphan snapshot", () => {
 	beforeEach(() => {
 		vi.mocked(storeSummary).mockReset().mockResolvedValue(undefined);
@@ -2573,41 +2136,5 @@ describe("skill attachments", () => {
 		const owned = assignOwnedContext([older, newer]).get("skill");
 		expect(owned?.owned.get("1111111111111")).toBeUndefined();
 		expect(owned?.owned.get("2222222222222")).toHaveLength(1);
-	});
-
-	it("adds a batch attachment but mints NO placeholder for it", async () => {
-		const summary = leaf({ skills: [skillRef] });
-		const built = await buildBatchItems(
-			[summary],
-			new Map([["skill", { owned: new Map([[summary.commitHash, [skillRef]]]), seeds: new Map() }]]),
-			baseCtx(fakeClient()),
-		);
-		expect(built[0].item.attachments.map((a) => a.docType)).toEqual(["skill"]);
-		expect(built[0].attachmentKeys.get("skill-0")).toEqual({ docType: "skill", key: skillRef.archivedKey });
-		// linksInMarkdown:false — the body has no per-skill link site, so sending a
-		// token the server has no substitution rule for would risk persisting it.
-		expect(built[0].item.summary.content).not.toContain(docUrlPlaceholder("skill-0"));
-	});
-});
-
-describe("batch clientKey wire contract", () => {
-	it("emits `ref-N` for a reference, not `reference-N`", async () => {
-		// The clientKey is echoed by the server and is the payload of the
-		// `{{jolli:doc:<clientKey>}}` placeholder, whose format is a byte-for-byte
-		// lockstep contract with the server's substituter. Deriving it from `docType`
-		// once renamed this silently; `clientKeyPrefix` pins it and this asserts it.
-		const ref = reference();
-		const summary = leaf({ references: [ref] });
-		vi.mocked(readReferenceFromBranch).mockResolvedValue(null);
-
-		const built = await buildBatchItems(
-			[summary],
-			new Map([["reference", { owned: new Map([[summary.commitHash, [ref]]]), seeds: new Map() }]]),
-			baseCtx(fakeClient()),
-		);
-
-		expect(built[0].item.attachments.map((a) => a.clientKey)).toEqual(["ref-0"]);
-		expect(built[0].attachmentKeys.get("ref-0")).toEqual({ docType: "reference", key: ref.archivedKey });
-		expect(built[0].item.summary.content).toContain(docUrlPlaceholder("ref-0"));
 	});
 });
