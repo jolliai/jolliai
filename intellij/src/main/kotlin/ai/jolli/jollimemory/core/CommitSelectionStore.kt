@@ -8,35 +8,71 @@ import com.google.gson.JsonObject
 /**
  * CommitSelectionStore — thin bridge adapter for CLI `CommitSelectionStore.ts`,
  * holding the set of sidebar items the user wants EXCLUDED from the next summary
- * pipeline run.
+ * pipeline run ("Leave out of this memory").
+ *
+ * Every call is one `shared-store` round-trip into the same module the VS Code
+ * extension calls in-process, and it goes through the long-lived daemon when one is
+ * bound (~5-20 ms) rather than a cold `node` spawn.
  *
  * Sticky semantics: an entry stays excluded until the user explicitly re-checks the
  * row. No git operation or pipeline outcome modifies it — the PostCommitHook only
  * ever READS.
  *
  * **This used to read and write `commit-selection.json` itself, and the write half
- * was silently destructive.** The file carries more than the exclusion kinds: an
- * `aiRelevance` array (the relevance ranker's verdicts) and its `changeFingerprint`
- * (what makes those verdicts still valid) live alongside them, and `skills` was
- * added as a fifth kind after this port was written. The Kotlin writer rebuilt the
- * payload field by field from the four kinds it knew about, so EVERY exclusion
- * toggle — a conversation, a plan, a note, a reference — rewrote the file without
- * the fields it had never heard of. A skill the user excluded in VS Code came back
- * and was archived onto the next commit anyway, and the ranker's work was discarded.
- * The CLI's own serializer carries those fields explicitly and says why; this had no
- * counterpart to that guard.
+ * was silently destructive** — drifted in the way a JSON wire never reports. The file
+ * carries more than the exclusion kinds: an `aiRelevance` array (the relevance
+ * ranker's verdicts) and its `changeFingerprint` (what makes those verdicts still
+ * valid) live alongside them, and `skills` was added as a fifth kind after this port
+ * was written. The Kotlin writer rebuilt the payload field by field from the four
+ * kinds it knew about, so EVERY exclusion toggle — a conversation, a plan, a note, a
+ * reference — rewrote the file without the fields it had never heard of. One click on
+ * a row's ✕ erased the pre-commit Review panel's whole AI relevance ranking (including
+ * the user's per-item "Include" vetoes), forcing the QueueWorker to re-run the LLM on
+ * a fingerprint miss; a skill the user excluded in VS Code came back and was archived
+ * onto the next commit anyway. It was also a plain read-modify-write with no lock,
+ * while the CLI serialises every write under `withCommitSelectionLock` precisely
+ * because the pre-commit panel and the post-commit QueueWorker write the same file.
  *
- * Delegating fixes it by construction rather than by remembering: there is one
- * writer, in one language, and a field added to the persisted shape can no longer be
- * dropped by a host that does not know it exists. Same reason [PinStore] is a bridge
- * adapter — hand-porting the file format back here would be a regression, not an
- * optimisation.
+ * Delegating fixes it by construction rather than by remembering: there is one writer,
+ * in one language, and a field added to the persisted shape can no longer be dropped
+ * by a host that does not know it exists. Same reason [PinStore] is a bridge adapter —
+ * hand-porting the file format back here would be a regression, not an optimisation.
+ * No Kotlin-side notion of what a kind or a version means; presentation stays in the
+ * panels.
  */
 object CommitSelectionStore {
 
     private val log = JmLogger.create("CommitSelection")
     private val gson = Gson()
+    private const val ACTION = "shared-store"
 
+    /**
+     * The user's manual exclude set, one field per kind.
+     *
+     * EVERY parameter carries a default, and that is load-bearing rather than tidy.
+     * [readExclusions] below parses field by field and does not lean on it, but this
+     * shape is ALSO Gson-deserialized as a nested field: [WorkingContext.ContextList]
+     * and [WorkingContext.ActiveForCommit] each carry one and use `CommitExclusions()`
+     * as their own Gson-safe default. Kotlin only emits the synthetic no-arg
+     * constructor when every parameter has a default, and that constructor is the only
+     * reason Gson applies these defaults at all — without it Gson allocates through
+     * `Unsafe`, skips initializers, and writes null into whichever fields the payload
+     * omits, giving a non-null `Set` declaration that throws on first use. `skills` is
+     * the field that exercises this: the CLI omits it from a selection file written
+     * before skills were selectable. ([WorkingContext.PlanInfo] is the other shape —
+     * required parameters, so Gson does take the Unsafe path there, which is why its
+     * nullable fields are declared nullable.)
+     *
+     * So a parameter added WITHOUT a default does not just affect that parameter — it
+     * removes the synthetic constructor and takes the defaulting for `skills` and every
+     * sibling with it. `CommitSelectionStoreTest` pins the mechanism: it asserts the
+     * no-arg constructor still exists, so the failure names this cause instead of
+     * surfacing as an NPE in a panel.
+     *
+     * The CLI already spells all five out as `[]` on the wire (`selection-read`), which
+     * covers the current payload; the defaults cover the ones it cannot know about,
+     * such as an older dist serving a newer host.
+     */
     data class CommitExclusions(
         val conversations: Set<String> = emptySet(),
         val plans: Set<String> = emptySet(),
@@ -112,7 +148,7 @@ object CommitSelectionStore {
     private fun request(operation: String): JsonObject = JsonObject().apply { addProperty("operation", operation) }
 
     private fun run(cwd: String, request: JsonObject) =
-        CliIntegrations.runIdeBridge(cwd, "shared-store", gson.toJson(request))
+        CliIntegrations.runIdeBridge(cwd, ACTION, gson.toJson(request))
 
     private fun asStringSet(json: JsonObject, key: String): Set<String> {
         val arr = json.getAsJsonArray(key) ?: return emptySet()

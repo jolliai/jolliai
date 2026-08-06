@@ -11,9 +11,11 @@ import ai.jolli.jollimemory.core.HookEnv
 import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.JolliMemoryConfig
 import ai.jolli.jollimemory.core.KBPathResolver
+import ai.jolli.jollimemory.core.RefreshEscalator
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.StatusInfo
 import ai.jolli.jollimemory.core.StorageFactory
+import ai.jolli.jollimemory.core.WorkingContext
 import ai.jolli.jollimemory.sync.CliSyncOrchestrator
 import ai.jolli.jollimemory.sync.STATUS_AUTO_CLEAR_DELAY_MS
 import ai.jolli.jollimemory.sync.SyncState
@@ -26,6 +28,8 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.SystemInfo
+import com.intellij.openapi.util.io.FileUtil
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.openapi.vfs.newvfs.BulkFileListener
@@ -106,6 +110,38 @@ class JolliMemoryService(private val project: Project) : Disposable {
      */
     @Volatile
     private var orphanRefDebounceTimer: Timer? = null
+
+    /**
+     * Tracks whether the window [orphanRefDebounceTimer] is currently timing has
+     * seen a commit-time file (orphan ref / lock / profile.json / worker.lock) and
+     * therefore owes a full status recompute.
+     *
+     * The stickiness rule lives in [RefreshEscalator] rather than in a field here,
+     * because the daemon push channel needs the identical rule and the two used to
+     * be hand-copied — see that class. Recorded from the VFS listener thread,
+     * drained by the Swing timer on the EDT; the type is safe for both.
+     */
+    private val refreshEscalator = RefreshEscalator()
+
+    /**
+     * Separate from [orphanRefDebounceTimer] on purpose: a `.md` save and a
+     * plans.json write are independent events, and sharing one timer would let a
+     * burst of markdown saves keep cancelling a pending state refresh (or the
+     * reverse). Same @Volatile rationale.
+     */
+    @Volatile
+    private var noteSourceDebounceTimer: Timer? = null
+
+    /**
+     * Markdown paths saved since the last note-source check settled.
+     *
+     * Accumulated rather than replaced per burst: the VFS delivers a save as its
+     * own event batch, so two saves 100 ms apart arrive as two calls into
+     * [scheduleNoteSourceCheck], and overwriting would drop the first one's paths
+     * along with the reorder it should have triggered. Guarded by its own monitor
+     * — the VFS listener thread fills it, the pooled check drains it.
+     */
+    private val pendingMarkdownSaves = mutableSetOf<String>()
     /**
      * Watch-root tokens returned by [LocalFileSystem.addRootsToWatch]. Kept so
      * we can hand them back on [dispose] via `removeWatchedRoots`.
@@ -149,6 +185,53 @@ class JolliMemoryService(private val project: Project) : Disposable {
     }
     fun removeStatusListener(listener: () -> Unit) { listeners.remove(listener) }
     private fun notifyListeners() { listeners.forEach { it() } }
+
+    /**
+     * Listeners notified when working-area context moves — a plan, note or reference
+     * added, removed or edited. Kept separate from the status listeners because that
+     * list is fourteen subscribers wide and most of them answer a different question:
+     * [CommitsPanel] re-runs a full round of `rev-parse` + `merge-base` + `log` +
+     * per-commit orphan-branch reads, [ActiveConversationsPanel] re-aggregates every
+     * transcript source's SQLite, and the Memory Bank explorer rebuilds its tree —
+     * none of which can have a different answer because `plans.json` changed.
+     *
+     * Only the two surfaces that actually read working-area context subscribe: the
+     * CONTEXT list and the Working Memory review. [PinnedPanel] deliberately does
+     * NOT — it renders from `pins.json`, whose titles are snapshotted at pin time,
+     * so no working-context event can change what it paints.
+     *
+     * A panel may be on BOTH lists — [PlansPanel] is, because it also has to react
+     * to enabled/disabled status. That is not a double-refresh: [refreshStatus]
+     * fires only the status list and [refreshWorkingContext] only this one, so a
+     * given event reaches each panel exactly once.
+     *
+     * **Which makes membership of BOTH lists an obligation, not a convenience.**
+     * The two refreshes are strictly either/or — [scheduleDebouncedRefresh] picks
+     * one, and [refreshStatus] deliberately does not fan out to this list — so
+     * [refreshStatus] is NOT a superset of [refreshWorkingContext]. A subscriber
+     * here that is not also on the status list is therefore skipped entirely by
+     * any batch that escalated to a status recompute, which is exactly the batch a
+     * committing agent produces (`plans.json` and the orphan ref land together).
+     * Both current subscribers happen to be on both lists, so there is no symptom
+     * today; a working-context-only panel would silently miss those updates. Add
+     * such a panel to [addStatusListener] as well, or teach [refreshStatus] to
+     * call [notifyWorkingContextListeners] — but note the latter would double-fire
+     * every panel that is already on both, which is why it is not done here.
+     *
+     * So the asymmetry is KNOWN and deliberately left standing — not a review
+     * finding. Making [refreshStatus] a true superset would regress the two panels
+     * that sit on both lists into a double reload per event, and the structural
+     * alternative (take working-context subscribers off the status list and gate
+     * them some other way) is a refactor of how fourteen subscribers are wired.
+     * Both are out of scope here; the invariant above is the contract in the
+     * meantime, and it is currently satisfied.
+     */
+    private val workingContextListeners = CopyOnWriteArrayList<() -> Unit>()
+
+    /** @see workingContextListeners — no immediate invoke; subscribers load on their own init. */
+    fun addWorkingContextListener(listener: () -> Unit) { workingContextListeners.add(listener) }
+    fun removeWorkingContextListener(listener: () -> Unit) { workingContextListeners.remove(listener) }
+    private fun notifyWorkingContextListeners() { workingContextListeners.forEach { it() } }
 
     /**
      * Listeners notified whenever a commit-selection toggle changes — a conversation
@@ -947,18 +1030,23 @@ class JolliMemoryService(private val project: Project) : Disposable {
             busConnection.subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
                 override fun after(events: List<VFileEvent>) {
                     if (disposed) return
-                    for (event in events) {
-                        val path = event.path
-                        if (path == orphanRefPath ||
-                            path == workerLockPath ||
-                            path == lockPath ||
-                            path == plansJsonPath ||
-                            path == profileJsonPath
-                        ) {
-                            scheduleDebouncedOrphanRefresh()
-                            return
-                        }
+                    val batch = classifyVfsBatch(
+                        paths = events.map { it.path },
+                        plansJsonPath = plansJsonPath,
+                        // profile.json belongs with the commit-time paths, not with
+                        // plans.json: it carries the repo-wide `manuallyDisabled`
+                        // opt-out, which only [refreshStatus] reads (into
+                        // manuallyDisabledCached). Routing it to the cheap
+                        // working-context repaint would leave a `jolli disable` from
+                        // a terminal or a sibling VS Code window invisible here.
+                        commitTimePaths = listOfNotNull(orphanRefPath, workerLockPath, lockPath, profileJsonPath),
+                    )
+                    // One call, not one per signal: the kind is already resolved by
+                    // the classifier, and a second call would only restart the timer.
+                    if (batch.statusRefresh || batch.workingContextRefresh) {
+                        scheduleDebouncedRefresh(statusRecompute = batch.statusRefresh)
                     }
+                    if (batch.savedMarkdown.isNotEmpty()) scheduleNoteSourceCheck(batch.savedMarkdown)
                 }
             })
         } catch (ex: Exception) {
@@ -981,16 +1069,87 @@ class JolliMemoryService(private val project: Project) : Disposable {
     }
 
     /**
-     * Debounced refresh for orphan branch ref changes.
-     * The worker writes multiple git objects in sequence (blob → tree → commit → update-ref),
-     * which may trigger multiple events. A 500ms debounce collapses them into one refresh.
+     * Debounced "was one of those markdown files a note's source?" check.
+     *
+     * Any `.md` write reaches here — the subscription is on the APPLICATION message
+     * bus, so other open projects' saves arrive too — and the answer is usually no,
+     * hence the debounce and the pooled thread. It cannot be narrowed to the project
+     * root: a markdown note references the user's own file wherever it lives, which
+     * is frequently outside the workspace. The membership test asks the CLI for the
+     * note list rather than guessing from the path: which files back a note (and
+     * which of those are still visible) is `detectNotes`' decision, and the paths
+     * live in a registry this side does not own. VS Code's equivalent hook does the
+     * same, one `bridge.listNotes()` per save.
+     *
+     * Paths ACCUMULATE across bursts into [pendingMarkdownSaves] and are drained
+     * when the check runs — each VFS batch is its own call, so replacing the list
+     * would silently drop a note save that a later unrelated `.md` write pushed out
+     * of the window.
+     *
+     * The membership test itself is [noteSourceWasSaved] — the two sides do NOT
+     * arrive in a comparable form (VFS is always forward-slashed, the CLI stores
+     * whatever separator the creating host handed it), so both are normalised
+     * there. See that function for why comparing them raw silently broke this
+     * whole path on Windows.
      */
-    private fun scheduleDebouncedOrphanRefresh() {
+    private fun scheduleNoteSourceCheck(savedMarkdown: List<String>) {
+        if (disposed || cachedStatus?.enabled != true) return
+        val cwd = mainRepoRoot ?: return
+        synchronized(pendingMarkdownSaves) { pendingMarkdownSaves.addAll(savedMarkdown) }
+        noteSourceDebounceTimer?.stop()
+        noteSourceDebounceTimer = Timer(500) {
+            if (disposed) return@Timer
+            ApplicationManager.getApplication().executeOnPooledThread {
+                val touched = synchronized(pendingMarkdownSaves) {
+                    pendingMarkdownSaves.toSet().also { pendingMarkdownSaves.clear() }
+                }
+                if (touched.isEmpty()) return@executeOnPooledThread
+                val isNoteSource = try {
+                    noteSourceWasSaved(WorkingContext.detectNotes(cwd).map { it.filePath }, touched)
+                } catch (e: Exception) {
+                    log.warn("Note-source check failed: ${e.message}")
+                    false
+                }
+                if (isNoteSource) refreshWorkingContext()
+            }
+        }.apply {
+            isRepeats = false
+            start()
+        }
+    }
+
+    /**
+     * Debounced refresh for the watched files, ESCALATING when a window mixes them.
+     *
+     * The worker writes multiple git objects in sequence (blob → tree → commit →
+     * update-ref), so a 500 ms window collapses many events into one refresh. What
+     * that window must not do is let the LAST event decide which refresh runs:
+     * `plans.json` only moves working-area rows and takes the cheap repaint, while
+     * the commit-time files (orphan ref, lock, worker.lock) can change installation
+     * state and drive the status listeners the commits and memories panels sit on.
+     * A `plans.json` write landing on top of a pending status refresh would demote
+     * it, and nothing polls to recover — the sidebar would just stop reflecting the
+     * commit that had already happened.
+     *
+     * So the flag is sticky for the life of the window and cleared only when the
+     * timer fires. That rule is [RefreshEscalator], shared verbatim with the daemon
+     * channel's `DaemonNotificationClient.scheduleDebounced` — it used to be a
+     * second hand-written copy here, kept in step by a comment.
+     *
+     * @param statusRecompute true for the commit-time files, false for plans.json.
+     */
+    private fun scheduleDebouncedRefresh(statusRecompute: Boolean) {
         if (disposed) return
+        refreshEscalator.record(statusRecompute)
         orphanRefDebounceTimer?.stop()
         orphanRefDebounceTimer = Timer(500) {
             if (disposed) return@Timer
-            ApplicationManager.getApplication().executeOnPooledThread { refreshStatus() }
+            // Drain before the pooled hop so an event arriving mid-dispatch opens a
+            // fresh window instead of having its flag consumed by this one.
+            val recompute = refreshEscalator.drain()
+            ApplicationManager.getApplication().executeOnPooledThread {
+                if (recompute) refreshStatus() else refreshWorkingContext()
+            }
         }.apply {
             isRepeats = false
             start()
@@ -1010,6 +1169,26 @@ class JolliMemoryService(private val project: Project) : Disposable {
      * reflected in the UI without a tool-window rebuild.
      */
     fun isManuallyDisabled(): Boolean = manuallyDisabledCached
+
+    /**
+     * Reloads the working-area context surfaces — and nothing else.
+     *
+     * For a plan, note or reference appearing, leaving or being edited, this is
+     * the whole of the correct refresh. [refreshStatus] would additionally take a
+     * `@Synchronized` lock, run a full `ide-bridge status` round-trip, recompute
+     * the worker-busy flag and then wake all fourteen status listeners — none of
+     * which can have a different answer because `plans.json` changed. A plan
+     * showing up says nothing about whether hooks are installed, which commits
+     * exist, or what the transcript sources are doing.
+     *
+     * A no-op before initialization, where there is no cached status and the
+     * panels are still showing their "Initializing" state — reloading rows
+     * underneath that would only replace it with a misleading empty list.
+     */
+    fun refreshWorkingContext() {
+        if (disposed || cachedStatus == null) return
+        notifyWorkingContextListeners()
+    }
 
     /**
      * True when any credential capable of driving summary/wiki generation is set —
@@ -1837,6 +2016,10 @@ class JolliMemoryService(private val project: Project) : Disposable {
         orchestrator = null
         orphanRefDebounceTimer?.stop()
         orphanRefDebounceTimer = null
+        refreshEscalator.clear()
+        synchronized(pendingMarkdownSaves) { pendingMarkdownSaves.clear() }
+        noteSourceDebounceTimer?.stop()
+        noteSourceDebounceTimer = null
         if (vfsWatchRequests.isNotEmpty()) {
             try {
                 LocalFileSystem.getInstance().removeWatchedRoots(vfsWatchRequests)
@@ -1848,6 +2031,117 @@ class JolliMemoryService(private val project: Project) : Disposable {
         listeners.clear()
         syncListeners.clear()
     }
+}
+
+/** What one VFS batch asks for — see [classifyVfsBatch]. */
+internal data class VfsBatchOutcome(
+    /** A commit-time file moved: take the heavy `ide-bridge status` path. */
+    val statusRefresh: Boolean,
+    /** `plans.json` moved: the cheap working-area repaint is the whole correct refresh. */
+    val workingContextRefresh: Boolean,
+    /** `.md` writes to test for note-source membership. */
+    val savedMarkdown: List<String>,
+)
+
+/**
+ * Classify one VFS batch into the refreshes it should trigger.
+ *
+ * **Every path in the batch is examined.** Bailing out on the first match was
+ * harmless while all four watched paths funnelled into a single refresh, but the
+ * branches now have three different outcomes and the batches VFS hands over are
+ * merged — an agent that commits at the end of its turn writes `plans.json`
+ * (StopHook) and the orphan ref (post-commit worker) close enough together to
+ * land in one batch. Stopping at whichever appeared first would drop the other
+ * signal outright rather than demote it: the sticky escalation in
+ * [JolliMemoryService.scheduleDebouncedRefresh] can only merge calls that
+ * actually happen, and nothing polls to recover a status refresh that was never
+ * scheduled — the just-created memory would simply never appear in the sidebar.
+ * A `.md` save sitting behind a matched control file was lost the same way.
+ *
+ * Pure and `internal` so this is testable: the listener it serves is an anonymous
+ * object inside a project-level service, which no unit test can reach.
+ */
+internal fun classifyVfsBatch(
+    paths: List<String>,
+    plansJsonPath: String?,
+    commitTimePaths: List<String>,
+): VfsBatchOutcome {
+    var statusRefresh = false
+    var workingContextRefresh = false
+    val savedMarkdown = mutableListOf<String>()
+    for (path in paths) {
+        // plans.json is the odd one out: the commit-time paths describe state that
+        // can genuinely change install status, while a plans.json write only moves
+        // working-area rows. Route it to the cheap repaint for the same reason the
+        // daemon's `working-context` kind takes that path.
+        if (plansJsonPath != null && path == plansJsonPath) {
+            workingContextRefresh = true
+            continue
+        }
+        if (path in commitTimePaths) {
+            statusRefresh = true
+            continue
+        }
+        // A markdown note references the user's own file IN PLACE, and `NoteService`
+        // derives the row's lastModified from that file's mtime — so editing it
+        // reorders the CONTEXT list with no write to plans.json for the branches
+        // above to catch. This is the IntelliJ analogue of VS Code's
+        // onDidSaveTextDocument hook. Extension matched ignoring case: the file name
+        // is the user's, and `.MD` is a note source just as much as `.md`.
+        if (path.endsWith(".md", ignoreCase = true)) savedMarkdown.add(path)
+    }
+    return VfsBatchOutcome(statusRefresh, workingContextRefresh, savedMarkdown)
+}
+
+/**
+ * "Did one of these saved `.md` files back a note?" — the membership test behind
+ * [JolliMemoryService.scheduleNoteSourceCheck], extracted as a pure `internal`
+ * helper for the same reason [classifyVfsBatch] was: its caller runs inside a
+ * pooled runnable owned by a project-level service, and the platform difference it
+ * exists to absorb cannot be reproduced on the host CI runs on.
+ *
+ * BOTH sides are normalised because they come from different producers that only
+ * agree on POSIX. `touched` holds `VFileEvent.path`, and IntelliJ reports VFS paths
+ * forward-slashed on every OS — the same invariant [JolliMemoryService.canonicalize]
+ * already leans on. A note's `filePath` is whatever the CLI stored at creation time:
+ * `File.absolutePath` from [ai.jolli.jollimemory.actions.AddContextAction] on this
+ * host, `uri.fsPath` from VS Code's picker — i.e. the OS-native separator. So on
+ * Windows this comparison used to be a guaranteed miss, and the CONTEXT list simply
+ * stopped reordering when the user edited a note's source file. Nothing recovers
+ * that: it is the one working-context signal that does NOT ride the daemon push
+ * channel (see AGENTS.md → "One working-context signal does NOT come from this
+ * channel at all"), so there is no second path to notice.
+ *
+ * Case is folded only where the filesystem is case-insensitive — the same condition
+ * under which two spellings denote one file, so folding cannot introduce a match
+ * between genuinely distinct notes. This is a cross-HOST fix as much as a
+ * cross-platform one: VS Code's `fsPath` lower-cases the Windows drive letter, so a
+ * note added there and edited here would miss on case even after the separators
+ * agree. A false positive would cost one extra [JolliMemoryService.refreshWorkingContext]
+ * repaint and write nothing, which is the cheap direction to be wrong in.
+ *
+ * @param caseSensitive injected so both branches stay reachable from a test on any
+ *   host; production passes the platform's real answer.
+ */
+internal fun noteSourceWasSaved(
+    notePaths: List<String?>,
+    touched: Set<String>,
+    caseSensitive: Boolean = SystemInfo.isFileSystemCaseSensitive,
+): Boolean {
+    if (touched.isEmpty()) return false
+    val normalizedTouched = touched.mapTo(mutableSetOf()) { normalizeForPathCompare(it, caseSensitive) }
+    return notePaths.any { it != null && normalizeForPathCompare(it, caseSensitive) in normalizedTouched }
+}
+
+/**
+ * `\` → `/`, then case-folded when the filesystem does not distinguish case.
+ * [String.lowercase] is locale-invariant (unlike the deprecated `toLowerCase()`),
+ * so a Turkish locale cannot turn `I` into `ı` and break a path that matched
+ * everywhere else.
+ */
+private fun normalizeForPathCompare(path: String, caseSensitive: Boolean): String {
+    val forward = FileUtil.toSystemIndependentName(path)
+    return if (caseSensitive) forward else forward.lowercase()
 }
 
 data class FileChange(

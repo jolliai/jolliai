@@ -126,17 +126,15 @@
                     icon="AllIcons.Actions.Refresh"/>
         </group>
 
-        <!-- Plans & Notes panel actions -->
-        <group id="JolliMemory.PlansActions" text="JolliMemory Plans &amp; Notes">
-            <action id="JolliMemory.AddPlan"
-                    class="ai.jolli.jollimemory.actions.AddPlanAction"
-                    text="Add Plan"
-                    description="Add a plan from ~/.claude/plans/"
-                    icon="AllIcons.General.Add"/>
-            <action id="JolliMemory.AddNote"
-                    class="ai.jolli.jollimemory.actions.AddNoteAction"
-                    text="Add Note"
-                    description="Add a markdown file or text snippet note"/>
+        <!-- CONTEXT panel actions — ONE "+" whose dropdown carries Add Plan /
+             Add Markdown Note / Add Text Snippet, matching the VS Code sidebar's
+             ➕ menu. Do not add a second button here: the other surface has one. -->
+        <group id="JolliMemory.PlansActions" text="JolliMemory Context">
+            <action id="JolliMemory.AddContext"
+                    class="ai.jolli.jollimemory.actions.AddContextAction"
+                    text="Add"
+                    description="Add a plan, markdown note or text snippet"
+                    icon="/icons/add.svg"/>
         </group>
 
         <!-- Changes panel actions -->

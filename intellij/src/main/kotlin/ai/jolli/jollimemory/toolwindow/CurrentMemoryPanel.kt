@@ -50,10 +50,25 @@ class CurrentMemoryPanel(
 	private val consequenceLabel = JBLabel().apply { border = JBUI.Borders.empty(2, 6) }
 	private val statusLabel = JBLabel().apply { border = JBUI.Borders.empty(2, 6) }
 
-	private val statusListener: () -> Unit = { SwingUtilities.invokeLater { updateHeader() } }
+	private val statusListener: () -> Unit = {
+		SwingUtilities.invokeLater {
+			updateHeader()
+			// Every action in these toolbars gates `isEnabled` on
+			// `JolliMemoryService.getStatus()`, which is null until the first async
+			// refresh lands. A toolbar only re-runs `update()` when it is shown or
+			// when asked — 2025.1 dropped the platform's periodic re-poll — so
+			// without this the buttons keep whatever they resolved to at first
+			// paint. That is why the CONTEXT ➕ came up permanently greyed out on a
+			// cold start and only woke up on some unrelated UI event.
+			sectionToolbars.forEach { it.updateActionsAsync() }
+		}
+	}
 
 	/** The three section headers, normalized to a uniform height after construction. */
 	private val sectionHeaders = mutableListOf<JComponent>()
+
+	/** Section toolbars, kept so [statusListener] can re-run their `update()`. */
+	private val sectionToolbars = mutableListOf<ActionToolbar>()
 
 	init {
 		layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -128,6 +143,7 @@ class CurrentMemoryPanel(
 			toolbar.minimumButtonSize = Dimension(JBUI.scale(18), JBUI.scale(18))
 			toolbar.component.isOpaque = false
 			header.add(toolbar.component, BorderLayout.EAST)
+			sectionToolbars.add(toolbar)
 		}
 		// Recompute max height now that children are added.
 		header.maximumSize = Dimension(Int.MAX_VALUE, header.preferredSize.height)

@@ -120,7 +120,7 @@ object SummaryMarkdownBuilder {
                 lines.add("  $planUrl")
             } else if (includeEditInfo) {
                 lines.add("- ${plan.title}")
-                lines.add("  _(${plan.slug}.md \u00b7 edited ${plan.editCount} time${if (plan.editCount != 1) "s" else ""})_")
+                lines.add("  _(${plan.slug}.md)_")
             } else {
                 lines.add("- ${plan.title}")
             }

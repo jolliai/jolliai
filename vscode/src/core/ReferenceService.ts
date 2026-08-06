@@ -25,14 +25,11 @@ import { readFileSync } from "node:fs";
 import * as vscode from "vscode";
 import { withPlansLock } from "../../../cli/src/core/Locks.js";
 import {
-	loadPlansRegistry,
 	loadPlansRegistryWithStatus,
 	savePlansRegistry,
 } from "../../../cli/src/core/SessionTracker.js";
-import { deleteReferenceMarkdown } from "../../../cli/src/core/references/ReferenceStore.js";
 import { isManuallyDisabled } from "../../../cli/src/Logger.js";
 import type {
-	PlansRegistry,
 	ReferenceEntry,
 	ReferenceField,
 	SourceId,
@@ -88,56 +85,9 @@ export async function detectReferences(
 	return result;
 }
 
-/**
- * Hard-removes a reference, keyed by mapKey (`<source>:<nativeId>`): deletes the
- * registry row AND the backing
- * `.jolli/jollimemory/references/<source>/<key>.md` file.
- *
- * Reference markdown always lives inside the per-project `.jolli/jollimemory/`
- * directory, so the file is always safe to delete — no internal/external check
- * needed (contrast `PlanService.removePlan`, whose source files are usually
- * external). Idempotent: an unknown mapKey is a no-op, and a missing `.md` is
- * tolerated (`deleteReferenceMarkdown` uses `force`).
- *
- * Allows revival: removal leaves no tombstone, so a later re-reference of the
- * same entity is re-discovered and re-inserted. The registry's plans / notes
- * section is preserved verbatim.
- */
-export async function removeReference(cwd: string, mapKey: string): Promise<void> {
-	// Registry RMW under plans.lock so a concurrent writer (the Codex-discovery
-	// tick in this same host, or a cross-process StopHook/QueueWorker) can't clobber
-	// the removal (or be clobbered by it). The closure returns the removed entry's
-	// sourcePath; the markdown delete happens AFTER the lock — persisting the row
-	// removal first, then a best-effort file cleanup, is strictly safer than the
-	// reverse (a failed save would otherwise leave a row with no backing file).
-	const removedSourcePath = await withPlansLock(cwd, async () => {
-		const registry = await loadPlansRegistry(cwd);
-		const existing = { ...(registry.references ?? {}) };
-		const entry = existing[mapKey];
-		if (!entry) return null;
-		delete existing[mapKey];
-		const out: PlansRegistry = {
-			version: 1,
-			plans: registry.plans,
-			...(registry.notes !== undefined ? { notes: registry.notes } : {}),
-			references: existing,
-			// Carried, not dropped: removing one reference from the panel must not erase
-			// the skill registry. See PlansRegistryWriters.test.ts.
-			...(registry.skills !== undefined ? { skills: registry.skills } : {}),
-		};
-		await savePlansRegistry(out, cwd);
-		return entry.sourcePath;
-	});
-	if (removedSourcePath === null) return;
-	// Best-effort file delete — a permission/lock error (Windows EPERM/EBUSY)
-	// must not strand anything; mirrors PlanService.removePlan / NoteService.removeNote.
-	// deleteReferenceMarkdown already tolerates ENOENT.
-	try {
-		await deleteReferenceMarkdown(removedSourcePath);
-	} catch {
-		/* registry row is already removed */
-	}
-}
+// Registry-level removal lives in the CLI so IntelliJ runs the same rules over
+// the ide-bridge; re-exported here so this workspace's callers are unchanged.
+export { removeReference } from "../../../cli/src/core/references/ReferenceService.js";
 
 /**
  * Opens the reference's URL in the default browser.

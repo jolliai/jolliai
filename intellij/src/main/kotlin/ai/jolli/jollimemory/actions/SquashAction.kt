@@ -10,6 +10,7 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
+import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
@@ -40,7 +41,7 @@ import javax.swing.UIManager
  *   5. Execute the selected action
  *   6. Post-commit hook merges summaries via squash-pending.json
  */
-class SquashAction : AnAction() {
+class SquashAction : AnAction(), DumbAware {
     private val log = JmLogger.create("SquashAction")
 
     override fun actionPerformed(e: AnActionEvent) {

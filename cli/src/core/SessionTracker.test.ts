@@ -1499,8 +1499,16 @@ describe("SessionTracker", () => {
 	});
 
 	describe("detectActiveNotesForBranch", () => {
+		/** A real backing file — rows whose `sourcePath` is gone are not "active". */
+		const noteFile = async (name: string): Promise<string> => {
+			const filePath = join(tempDir, `${name}.md`);
+			await writeFile(filePath, `# ${name}\n`, "utf-8");
+			return filePath;
+		};
+
 		// Active = uncommitted (commitHash null) with no guard (contentHashAtCommit
-		// undefined). Branch / ignored scoping was removed, so neither field filters.
+		// undefined) and still file-backed. Branch / ignored scoping was removed, so
+		// neither field filters.
 		it("returns only active (uncommitted, un-guarded) notes", async () => {
 			const registry = {
 				version: 1 as const,
@@ -1513,6 +1521,7 @@ describe("SessionTracker", () => {
 						addedAt: "2026-04-01T00:00:00Z",
 						updatedAt: "2026-04-01T00:00:00Z",
 						commitHash: null,
+						sourcePath: await noteFile("note-active"),
 					},
 					"note-committed": {
 						id: "note-committed",
@@ -1521,6 +1530,7 @@ describe("SessionTracker", () => {
 						addedAt: "2026-04-01T00:00:00Z",
 						updatedAt: "2026-04-01T00:00:00Z",
 						commitHash: "deadbeefcafebabe",
+						sourcePath: await noteFile("note-committed"),
 					},
 					"note-guarded": {
 						id: "note-guarded",
@@ -1530,6 +1540,7 @@ describe("SessionTracker", () => {
 						updatedAt: "2026-04-01T00:00:00Z",
 						commitHash: null,
 						contentHashAtCommit: "fakehash",
+						sourcePath: await noteFile("note-guarded"),
 					},
 				},
 			};
@@ -2588,6 +2599,17 @@ describe("SessionTracker", () => {
 	});
 
 	describe("detectActivePlansForBranch / detectActiveNotesForBranch", () => {
+		/**
+		 * Writes a real markdown file and returns its path. Both detectors drop rows
+		 * whose `sourcePath` is gone (the archive loops cannot read content they do
+		 * not have), so a fixture pointing at a fake path would exercise nothing.
+		 */
+		const fixtureFile = async (name: string): Promise<string> => {
+			const filePath = join(tempDir, `${name}.md`);
+			await writeFile(filePath, `# ${name}\n`, "utf-8");
+			return filePath;
+		};
+
 		it("returns all uncommitted plans regardless of branch", async () => {
 			await savePlansRegistry(
 				{
@@ -2596,7 +2618,7 @@ describe("SessionTracker", () => {
 						"plan-1": {
 							slug: "plan-1",
 							title: "t",
-							sourcePath: "/p",
+							sourcePath: await fixtureFile("plan-1"),
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
@@ -2604,7 +2626,7 @@ describe("SessionTracker", () => {
 						"plan-2": {
 							slug: "plan-2",
 							title: "t",
-							sourcePath: "/p",
+							sourcePath: await fixtureFile("plan-2"),
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
@@ -2625,7 +2647,7 @@ describe("SessionTracker", () => {
 						"plan-active": {
 							slug: "plan-active",
 							title: "active",
-							sourcePath: "/p",
+							sourcePath: await fixtureFile("plan-active"),
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
@@ -2633,7 +2655,7 @@ describe("SessionTracker", () => {
 						"plan-committed": {
 							slug: "plan-committed",
 							title: "committed",
-							sourcePath: "/p",
+							sourcePath: await fixtureFile("plan-committed"),
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: "abcdef1234567890",
@@ -2641,7 +2663,7 @@ describe("SessionTracker", () => {
 						"plan-guarded": {
 							slug: "plan-guarded",
 							title: "guarded",
-							sourcePath: "/p",
+							sourcePath: await fixtureFile("plan-guarded"),
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
@@ -2657,6 +2679,41 @@ describe("SessionTracker", () => {
 			expect(plans.map((p) => p.slug)).toEqual(["plan-active"]);
 		});
 
+		// The archive loop in QueueWorker skips a row whose sourcePath is gone, so a
+		// row that fails this check is one the next commit provably will not claim.
+		// Keeping it in the set made every consumer of "what would the next commit
+		// archive?" wrong the same way — and grew a duplicate predicate in IntelliJ.
+		it("detectActivePlansForBranch drops an uncommitted plan whose source file is gone", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {
+						"plan-present": {
+							slug: "plan-present",
+							title: "present",
+							sourcePath: await fixtureFile("plan-present"),
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: null,
+						},
+						"plan-deleted": {
+							slug: "plan-deleted",
+							title: "deleted",
+							sourcePath: join(tempDir, "never-written.md"),
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: null,
+						},
+					},
+				},
+				tempDir,
+			);
+
+			const plans = await detectActivePlansForBranch(tempDir, "main");
+
+			expect(plans.map((p) => p.slug)).toEqual(["plan-present"]);
+		});
+
 		it("returns uncommitted notes for current branch", async () => {
 			await savePlansRegistry(
 				{
@@ -2670,6 +2727,7 @@ describe("SessionTracker", () => {
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: null,
+							sourcePath: await fixtureFile("note-1"),
 						},
 						"note-2": {
 							id: "note-2",
@@ -2678,6 +2736,7 @@ describe("SessionTracker", () => {
 							addedAt: "x",
 							updatedAt: "x",
 							commitHash: "abc",
+							sourcePath: await fixtureFile("note-2"),
 						},
 					},
 				},
@@ -2685,6 +2744,51 @@ describe("SessionTracker", () => {
 			);
 			const notes = await detectActiveNotesForBranch(tempDir, "main");
 			expect(notes.map((n) => n.id)).toEqual(["note-1"]);
+		});
+
+		// Same rule as the plans set: `associateNotesWithCommit` skips a row with no
+		// `sourcePath` or a missing file ("no readable source file — skipping"), so a
+		// row that fails it is one the next commit provably will not claim.
+		it("detectActiveNotesForBranch drops notes with no sourcePath and notes whose file is gone", async () => {
+			await savePlansRegistry(
+				{
+					version: 1,
+					plans: {},
+					notes: {
+						"note-present": {
+							id: "note-present",
+							title: "present",
+							format: "snippet",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: null,
+							sourcePath: await fixtureFile("note-present"),
+						},
+						"note-no-path": {
+							id: "note-no-path",
+							title: "legacy row, never file-backed",
+							format: "snippet",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: null,
+						},
+						"note-deleted": {
+							id: "note-deleted",
+							title: "file removed by the user",
+							format: "markdown",
+							addedAt: "x",
+							updatedAt: "x",
+							commitHash: null,
+							sourcePath: join(tempDir, "note-never-written.md"),
+						},
+					},
+				},
+				tempDir,
+			);
+
+			const notes = await detectActiveNotesForBranch(tempDir, "main");
+
+			expect(notes.map((n) => n.id)).toEqual(["note-present"]);
 		});
 
 		it("returns empty when registry has no notes section", async () => {

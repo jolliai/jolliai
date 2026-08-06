@@ -10,6 +10,7 @@ import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.project.DumbAware
 
 /**
  * Push current branch to remote with upstream tracking.
@@ -17,7 +18,7 @@ import com.intellij.openapi.ui.Messages
  * [ForcePushUtil.gateForcePush] with divergence inspection.
  * Matches VS Code PushCommand.ts.
  */
-class PushAction : AnAction() {
+class PushAction : AnAction(), DumbAware {
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
         val service = project.getService(JolliMemoryService::class.java)

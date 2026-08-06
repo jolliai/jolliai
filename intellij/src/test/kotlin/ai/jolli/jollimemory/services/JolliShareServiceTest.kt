@@ -177,7 +177,7 @@ class JolliShareServiceTest {
             summary(orphaned = listOf(7)).copy(
                 plans = listOf(
                     ai.jolli.jollimemory.core.PlanReference(
-                        slug = "p1", title = "Plan 1", editCount = 1, addedAt = "t", updatedAt = "t",
+                        slug = "p1", title = "Plan 1", addedAt = "t", updatedAt = "t",
                     ),
                 ),
             ),

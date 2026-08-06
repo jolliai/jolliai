@@ -5,9 +5,10 @@ import ai.jolli.jollimemory.toolwindow.CommitsPanel
 import ai.jolli.jollimemory.toolwindow.PanelRegistry
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.project.DumbAware
 
 /** Toggles selection of all commits in the Commits panel. */
-class SelectAllCommitsAction : AnAction() {
+class SelectAllCommitsAction : AnAction(), DumbAware {
 	override fun actionPerformed(e: AnActionEvent) {
 		val project = e.project ?: return
 		val registry = project.getService(JolliMemoryService::class.java).panelRegistry

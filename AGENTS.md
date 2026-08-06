@@ -21,6 +21,23 @@ npx tsx codex-plugin/plugins/jolli/scripts/generate-skills.ts
 
   Four builders serve both surfaces (`recall`, `search`, `local-run`, `remote-run`), so an edit there is an edit to two artifacts: bump the revision + fingerprint for the installed copy AND regenerate the bundled one. `CodexPluginSkills.test.ts` fails on drift, which is what forces the second step. Note the plugin copy is re-headed with a bare name and its sibling references rewritten to `jolli:<name>` — so never introduce a path-shaped `jolli-<name>` string (e.g. `.agents/skills/jolli-recall/SKILL.md`) into a shared builder: the rewrite is a plain substring replace and would corrupt it into `jolli:recall`.
 - **FolderStorage hidden-layer schema stays in lockstep with the IntelliJ reader.** [`cli/src/core/FolderStorage.ts`](cli/src/core/FolderStorage.ts) writes canonical JSON under `<localFolder>/<repo>/.jolli/` (`summaries/<hash>.json`, `plans/`, `notes/`, and the `index.json` manifest); IntelliJ has an independent Kotlin reader at [`intellij/src/main/kotlin/ai/jolli/jollimemory/bridge/FolderStorageReader.kt`](intellij/src/main/kotlin/ai/jolli/jollimemory/bridge/FolderStorageReader.kt) that reads that same tree directly to avoid forking a `git show` subprocess per read (each path falls back to `GitOps.readBranchFile` on a miss, not to an ide-bridge call). **What the Kotlin reader covers today** — five load-bearing paths: `summaries/<hash>.json` (Gson-parsed to `CommitSummary`), `plans/<slug>.md`, `notes/<id>.md`, `.jolli/references/<source>/<pathKey>.md` (whose stem mirrors the CLI's `sanitizeNativeIdForPath` via `SourceIds.pathKey`, so a layout or sanitize-rule change silently returns null for every archived reference), AND `.jolli/shadow-status.json` (the dirty marker — CLI writes it in `DualWriteStorage.markDirty` and unlinks it in `clearDirty`; the reader gates every read on `isDirty() = shadowStatusFile.isFile` so a swallowed shadow-write failure falls back to the orphan branch instead of serving stale JSON). Any change to those five paths, folder names, dirty-marker semantics, or the JSON schemas of files the reader parses MUST be mirrored in the Kotlin reader in the same PR. A **second** Kotlin reader, [`KBFolderReader.kt`](intellij/src/main/kotlin/ai/jolli/jollimemory/core/KBFolderReader.kt), natively parses `.jolli/manifest.json` (to `Manifest`) and `.jolli/index.json` (to `SummaryIndex`) for the Memory Bank sidebar's hot path, and `KBExplorerPanel` enumerates commit hashes from `index.entries`. Schema changes to either file, or to the Kotlin DTOs mirroring them, MUST update `KBFolderReader.kt` in the same PR. Unlike `FolderStorageReader` it carries no dirty-gate. Writes stay CLI-only (dual-write consistency).
+
+  These two readers are a **narrow, measured exception** to the rule below, not a precedent: they exist because a per-read `git show` subprocess is too slow for a sidebar hot path, and they only deserialize files. Nothing about "which rows are visible" or "what a delete also removes" lives in them.
+
+- **IDE hosts are adapters: product rules live in `cli/src`, not in the host.** A rule is anything that answers *what the data means* — which registry rows are visible, what counts as an archive guard, whether removing a row also unlinks its backing file, what a commit claims. Those belong in `cli/src/core` and reach the hosts one way each: VS Code imports them in-process (it bundles `cli/src/**`), IntelliJ calls them over `jolli ide-bridge`. What stays host-side is presentation only — row layout, icons, dialogs, keyboard handling.
+
+  **Why the asymmetry matters.** VS Code and the CLI share a language and a build, so a schema change breaks its compile. IntelliJ talks JSON over a pipe: Gson drops fields it does not know and writes null into ones it expects, so a Kotlin restatement of a CLI rule fails *silently* and stays wrong until a user reports it. Every drift found when the plan/note services were sunk had shipped this way — a "soft delete" that the CLI's normalizer turned into a hard delete, a delete predicate that unlinked a different set of files than VS Code's, a copy-on-add where VS Code referenced in place, a `PlanReference.editCount` the CLI has never written (rendered forever as "edited 0 times"), and a non-null `NoteEntry.branch` that would have thrown the first time the CLI stripped it.
+
+  Concretely, for working-area context (plans / notes / references):
+  - The rules live in [`cli/src/core/PlanService.ts`](cli/src/core/PlanService.ts), [`cli/src/core/NoteService.ts`](cli/src/core/NoteService.ts) and [`cli/src/core/references/ReferenceService.ts`](cli/src/core/references/ReferenceService.ts). `vscode/src/core/{Plan,Note}Service.ts` are **re-export shims** — adding a function to a shim instead of the CLI module makes it invisible to IntelliJ and re-opens the drift.
+  - IntelliJ reaches them through the `working-context` ide-bridge action ([`IdeBridgeCommand.ts`](cli/src/commands/IdeBridgeCommand.ts)) via the [`WorkingContext`](intellij/src/main/kotlin/ai/jolli/jollimemory/core/WorkingContext.kt) adapter. Do not reintroduce Kotlin-side registry mutation or filtering; `session-state`'s raw `plans-load` / `plans-save` pair is for callers that own a read-modify-write cycle, not a way around this.
+  - Two CLI-owned visibility rules exist and are **not** interchangeable: `detectPlans` / `detectNotes` drive the browsable panel (a revived guard — a committed row whose file changed again — stays visible), while `active-for-commit` is the archive-selection set (only rows no commit has claimed). Pick the one that matches the question; never post-filter either result in the host.
+
+  **Performance is not a reason to re-implement.** The bridge has been daemon-backed since [`CliDaemonClient`](intellij/src/main/kotlin/ai/jolli/jollimemory/bridge/CliDaemonClient.kt): a call is ~5-20 ms against a long-lived Node process, comfortably under IntelliJ's 300 ms slow-EDT floor. The ~500 ms-2 s figure that motivated earlier Kotlin ports was the cost of a *cold one-shot spawn*, which is now only the fallback when no daemon is bound.
+
+  **A missing bridge operation is the OTHER way this rule gets broken.** The asymmetry cuts both ways: VS Code gets every helper in `cli/src` for free by importing it, so a capability that was never given a `working-context` operation is silently "VS Code only" — no compile error, no failing test, just a JVM host that cannot do the thing. Mid-session plan discovery shipped that way for a year. `registerNewPlan` / `isPlanFromCurrentProject` existed in the CLI and were reachable only from [`PlansStore.ts`](vscode/src/stores/PlansStore.ts)'s plans-dir watcher, so VS Code registered a new plan the instant Claude Code wrote the file while IntelliJ had to wait for the StopHook at the END of the agent's turn. The fix was one bridge operation (`plans-register-new`) and two watch targets — not a line of Kotlin logic. **When adding a capability VS Code reaches by import, ask what the JVM host calls to get it**; if the answer is "nothing", that is the bug, and the fix belongs in [`IdeBridgeCommand.ts`](cli/src/commands/IdeBridgeCommand.ts), never in Kotlin.
+
+- **Working-area context belongs to the worktree, not to a branch.** Uncommitted plans, notes, references and Conversations follow the user across `git checkout` and bind to a branch only at commit (recorded on `CommitSummary.branch`) — exactly like an uncommitted code change. `plans.json` therefore carries no `branch` on these rows: `LEGACY_PLAN/NOTE/REFERENCE_FIELDS` in [`SessionTracker.ts`](cli/src/core/SessionTracker.ts) strip it on every load→save, alongside the other dead fields (`ignored`, `editCount`) — and an `ignored: true` row is **dropped wholesale**, so writing that field is a hard delete, not the soft one its name suggests. Do not add a `branch` field to a working-area row, stamp one on a creation path, filter a panel by one, or label a row with one. The Kotlin mirrors in [`core/Types.kt`](intellij/src/main/kotlin/ai/jolli/jollimemory/core/Types.kt) and [`references/ReferenceTypes.kt`](intellij/src/main/kotlin/ai/jolli/jollimemory/core/references/ReferenceTypes.kt) must stay field-for-field with the CLI's `PlanEntry` / `NoteEntry` / `ReferenceEntry`; a field the CLI strips deserializes to null forever, and a non-nullable declaration of one throws.
 - **Cross-package imports in `vscode/src/**` are intentional.** Paths like `../../../cli/src/core/JolliApiUtils.js` resolve at esbuild bundle time. Don't refactor them into a published-package import — VS Code currently bundles the CLI inline.
 - **Worktree-aware code only.** Hooks, summary storage, and lock files must work across `git worktree` checkouts. Don't assume a single working tree.
 - **`.jolli/` is excluded entry-by-entry, and `.jolli/agents.json` is committed.** That one file records decisions about *this* repo (verify gate, base branch, directory layout) that a teammate cannot regenerate; everything else under `.jolli/` is per-developer state. The ordering and the trailing `/*` in `.gitignore` are load-bearing — a bare `.jolli/` stops git descending, and a negation cannot re-include a file whose parent was never entered. Nested `*/.jolli/` stays excluded.
@@ -75,11 +92,11 @@ npm run build          # build cli, then the Claude Code and Codex plugins, then
 npm run typecheck      # tsc --noEmit in both
 npm run lint           # biome check --error-on-warnings (tab indent, 120 line width)
 npm run lint:fix       # biome check --write
-npm run test           # vitest run --coverage in both (cli enforces 97% threshold)
+npm run test           # vitest run --coverage in both (cli 97/96/97/97, vscode 97/97/97/97 — both enforced)
 npm run all            # clean → build → typecheck → lint → test (use before committing)
 ```
 
-`npm run all` is the **pre-commit gate, not the inner loop** — the CLI suite is 363 files / ~9.6k tests / 3.5-9 min with coverage depending on machine load (358 unit + 5 acceptance), plus the 109-file vscode suite (~4.5k tests). The cost is concentrated: **14 real-`git`/real-fs files carry the bulk of the runtime** and the median file takes 14 ms, so the tiers split along that line. Inner loop: `npm run test:fast` (the 344 light CLI files **with coverage**, ~25-45 s), then `npm run test:slow` when you touch `sync/`, `install/`, or git plumbing. Both exist at the repo root and delegate to the `cli` workspace; `test:fast` covers **CLI only** — the vscode suite has no tier worth carving (109 files, ~54 s with coverage), so run `npm run test:vscode` whole when you touch `vscode/`. `test:fast` runs as `vitest --mode fast`, which drops the 14 slow test files *and* the 17 source files they are responsible for (`SLOW_TEST_FILES` / `SLOW_ONLY_SOURCES` in `cli/vite.config.ts`) so the 97/96/97/97 thresholds stay enforced instead of failing on an absent denominator. That coverage exclusion must never leak out of the `fast` branch — in the gate it would silently stop the floor from protecting `sync/` and `install/`. `test:slow` is `vitest --mode slow`, which **inverts the same list** into `include`; `SLOW_TEST_FILES` is therefore the single source of truth for both tiers (it used to be duplicated into the npm script, where a one-sided edit silently left a file in both tiers or neither). Also available: `npm run test:changed`, `npx vitest related --run <src file>`, or a single file + `-t "<case>"`. The tiers partition the unit suite exactly (344 + 14 = 358) — see [`cli/DEVELOPMENT.md`](cli/DEVELOPMENT.md) → "Two tiers: inner loop vs gate" for the profile and how to re-derive it. Caveat: `--changed` implies `passWithNoTests`, so it exits **0** when nothing matched — check the file count before reading that as a pass.
+`npm run all` is the **pre-commit gate, not the inner loop** — the CLI suite is 363 files / ~9.6k tests / 3.5-9 min with coverage depending on machine load (358 unit + 5 acceptance), plus the 110-file vscode suite (~4.5k tests). The cost is concentrated: **14 real-`git`/real-fs files carry the bulk of the runtime** and the median file takes 14 ms, so the tiers split along that line. Inner loop: `npm run test:fast` (the 344 light CLI files **with coverage**, ~25-45 s), then `npm run test:slow` when you touch `sync/`, `install/`, or git plumbing. Both exist at the repo root and delegate to the `cli` workspace; `test:fast` covers **CLI only** — the vscode suite has no tier worth carving (110 files, ~54 s with coverage), so run `npm run test:vscode` whole when you touch `vscode/`. `test:fast` runs as `vitest --mode fast`, which drops the 14 slow test files *and* the 17 source files they are responsible for (`SLOW_TEST_FILES` / `SLOW_ONLY_SOURCES` in `cli/vite.config.ts`) so the 97/96/97/97 thresholds stay enforced instead of failing on an absent denominator. That coverage exclusion must never leak out of the `fast` branch — in the gate it would silently stop the floor from protecting `sync/` and `install/`. `test:slow` is `vitest --mode slow`, which **inverts the same list** into `include`; `SLOW_TEST_FILES` is therefore the single source of truth for both tiers (it used to be duplicated into the npm script, where a one-sided edit silently left a file in both tiers or neither). Also available: `npm run test:changed`, `npx vitest related --run <src file>`, or a single file + `-t "<case>"`. The tiers partition the unit suite exactly (344 + 14 = 358) — see [`cli/DEVELOPMENT.md`](cli/DEVELOPMENT.md) → "Two tiers: inner loop vs gate" for the profile and how to re-derive it. Caveat: `--changed` implies `passWithNoTests`, so it exits **0** when nothing matched — check the file count before reading that as a pass.
 
 Per-workspace variants exist for every script: `npm run build:cli`, `npm run test:vscode`, `npm run typecheck:cli`, etc. The two plugins have build variants only (`npm run build:claude-plugin`, `npm run build:codex-plugin`) — they carry no tests or typecheck of their own; what covers them lives in the CLI suite (`CodexPluginManifest.test.ts`, `CodexPluginSkills.test.ts`) plus each build script's own entry-point assertion.
 
@@ -108,6 +125,89 @@ The product is built on a hook pipeline that runs in the user's project, not in 
 1. **AI agent hooks.** `SessionStartHook` and Gemini's `AfterAgent` only record session metadata to `<projectDir>/.jolli/jollimemory/sessions.json`. Claude's `StopHook` records that too, but additionally **reads the transcript**: it incrementally scans for plans, references and skills and persists them (`plans.json`, per-reference files), so "metadata only" is false for it. None of the three call the LLM. Only the Stop hook is registered `async: true`. The other ten sources have **no hook** — Codex, OpenCode, Cursor (Composer IDE), Cursor CLI (`cursor-agent`), GitHub Copilot CLI, VS Code Copilot Chat, Cline (VS Code extension), Cline CLI, Devin CLI, and Antigravity. Each has a per-source session discoverer plus transcript reader under `cli/src/core/`, running at post-commit time. Detection is a separate `*Detector.ts` for Cursor (Composer), Copilot CLI, Copilot Chat, Cline, Cline CLI and Antigravity, and is colocated in the discoverer for Codex, OpenCode, Cursor CLI and Devin. Codex has no per-source reader and reuses the shared `TranscriptReader.ts`. The OpenCode reader uses Node 22.5+ `node:sqlite` and is lazy-imported + feature-gated so the VSCode bundle (which targets Node 18) tolerates the missing module; the Cursor, Copilot, Devin, and Antigravity triplets follow the same lazy-import pattern. Devin CLI reads its global WAL SQLite (`~/.local/share/devin/cli/sessions.db`), scoping sessions by the `working_directory` column; its `message_nodes` table is a **forest** (alternate regenerations are sibling nodes), so the canonical conversation is the main chain walked from `sessions.main_chain_id` up the `parent_node_id` pointers — its detection is colocated in `DevinSessionDiscoverer.ts` (OpenCode-style) rather than a separate detector file. Antigravity is the odd one out: its per-conversation SQLite (`~/.gemini/<variant>/conversations/<id>.db`) is read only to recover the workspace path (its own agent data is encrypted), while the conversation *content* is read from a sibling plaintext `brain/<id>/.system_generated/logs/transcript_full.jsonl`. Copilot CLI and Copilot Chat share a single `copilotEnabled` config flag — splitting them was rejected because users want them together. Codex additionally extracts **references** on the VS Code sidebar's 60s Active Conversations tick. `BUILTIN_DEFINITIONS` ([`cli/src/core/references/sources/definitions/index.ts`](cli/src/core/references/sources/definitions/index.ts)) holds twelve source definitions today (Linear, Confluence, Jira, GitHub, Notion, Slack, Zoom meetings, Zoom docs, Asana, monday.com, context7 doc lookups, and Jolli Memory's own lookups); Codex resolves only those carrying a `match.codex`, which is eleven of the twelve, since `zoom-doc` is Claude-only (not just summaries at post-commit): [`CodexDiscovery.discoverCodexConversations`](cli/src/core/CodexDiscovery.ts) reuses the shared per-source envelope parser ([`TranscriptEnvelopeParser`](cli/src/core/references/TranscriptEnvelopeParser.ts) → `CodexEnvelopeParser`) and the same `discovery-cursors.json` cursor as the Claude Stop path. References were Claude-StopHook-only before; the envelope layer is now source-agnostic.
 
 2. **Git hooks** drive a unified queue under `.jolli/jollimemory/git-op-queue/`. `post-commit` enqueues + spawns a detached `QueueWorker` in <5 ms; when the commit comes from an interactive context (a TTY or an AI-agent session — `CLAUDECODE`/`AI_AGENT`/`CURSOR_TRACE_ID`/`GEMINI_CLI`/`OPENCODE`), it then tails the worker's `capture-progress/<hash>.ndjson` stream and prints milestones inline, blocking until the worker emits a terminal event, the watch times out (15 s agent ceiling / 90 s TTY), or the worker is detected dead via its per-hash PID lock (`capture-progress/<sha256>.lock`, written by `acquireCaptureLock` in the worker, probed by `isCaptureWorkerDead` in the watcher). GUI git clients set none of these markers and keep the original fast, silent, non-blocking behavior. The worker holds a 5-min file lock, drains entries in timestamp order, runs the LLM where needed, and chain-spawns a successor if new entries appear after it finishes. Squash entries (and rebase-squash) now go through the LLM-driven `generateSquashConsolidation` pipeline (`cli/src/hooks/QueueWorker.ts runSquashPipeline`) — the old "skip LLM, mechanical merge only" behavior is now the **fallback** when the consolidation call fails. Rebase-pick entries skip the LLM and just migrate hashes 1:1. `prepare-commit-msg` writes `squash-pending.json` so the worker recognizes squash before picking a consolidation strategy. See [`cli/DEVELOPMENT.md`](cli/DEVELOPMENT.md) for the queue rationale (each op gets its own file precisely because the previous single-slot pending files lost summaries during rapid amend/rebase sequences).
+
+### Push channel: one watch list, two hosts, five kinds
+
+JVM hosts have no in-process way to notice a write, so the CLI pushes `refresh`
+notifications at them. [`computeWatchTargets`](cli/src/daemon/DaemonServer.ts) is
+the single list of what is watched, and it is armed by **two** processes:
+`jolli daemon` (standalone) and `jolli ide-bridge-serve` (the long-lived bridge
+`CliDaemonClient` owns, which is what actually runs today —
+`DaemonNotificationClient.start()` no longer spawns anything and survives purely
+as the plugin-wide listener registry, fed by `injectRefresh`). Both build their
+payload with `buildRefreshParams`, so a host receives the identical line
+whichever is running. Add a target in one place; never inline a second list.
+
+Three things about the five kinds are easy to get wrong:
+
+- **`queue` / `orphan-ref` / `memory-bank` are commit-time; `working-context` /
+  `claude-plans` are mid-session.** Only the first group can change installation
+  state, and only that group should reach IntelliJ's `refreshStatus()` — a
+  `@Synchronized` method wrapping a whole `ide-bridge status` round-trip that
+  then fans out to every status listener. The context kinds take
+  `JolliMemoryService.refreshWorkingContext()`. An **unknown** kind must keep
+  falling through to the status path: the protocol treats a new kind as a
+  compatible extension, and heavier-than-necessary is the safe way to be wrong.
+
+  **IntelliJ therefore has two listener lists, and which one a panel joins is a
+  real decision.** `addStatusListener` is fourteen subscribers wide and most of
+  them answer a question `plans.json` cannot change — `CommitsPanel` re-runs
+  `rev-parse` + `merge-base` + `log` + per-commit orphan reads, and
+  `ActiveConversationsPanel` re-aggregates every transcript source's SQLite. The
+  narrow `addWorkingContextListener` has exactly two: the CONTEXT list and the
+  Working Memory review. A panel may be on **both** — `PlansPanel` is, because it
+  also gates on `status.enabled` — and that is not a double-refresh:
+  `refreshStatus` fires only the status list and `refreshWorkingContext` only the
+  narrow one, so an event reaches each panel once. Putting a commit/memory panel
+  on the narrow list, or a context panel on only the status list, silently un-does
+  this. `PinnedPanel` is on **neither**, and that is deliberate rather than an
+  oversight: it renders entirely from `pins.json`, whose title and badge were
+  snapshotted at pin time, and touches `plans.json` only to resolve a click
+  target — so no working-context event can change what it paints. Whoever writes
+  `pins.json` refreshes it directly.
+
+  **Both debounces escalate, never overwrite.** `DaemonNotificationClient` (for
+  the push channel) and `JolliMemoryService.scheduleDebouncedRefresh` (for the
+  VFS fallback) each collapse a burst onto ONE timer, and each carries a sticky
+  `pendingStatusRecompute` that is OR-ed in and cleared only when the timer
+  fires. Last-writer-wins is the bug it looks like: an agent that commits at the
+  end of its turn emits `orphan-ref` when the summary lands and `working-context`
+  when the StopHook rewrites `plans.json` moments later, and demoting there drops
+  the status refresh with nothing polling to recover it — the just-created memory
+  simply never appears in the sidebar. Escalation is one-way on purpose.
+- **`claude-plans` is the one kind that carries a payload** (`params.names`), and
+  the one place this channel is not purely "reload from source of truth".
+  `~/.claude/plans/` is machine-global and holds every project's plans ever, so
+  re-listing it cannot answer "what is new?" — only the OS create event can, and
+  it dies with the event. Names are raw directory entries, never slugs: the
+  slug / markdown / existence / project-affinity decisions are rules and stay in
+  `plans-register-new`. Every open project's daemon sees every project's plans;
+  attribution is `isPlanFromCurrentProject`'s job, not the watcher's.
+- **Both context targets are filename-gated, and a gated watcher drops a nameless
+  event.** `.jolli/jollimemory/` also holds `debug.log`, which is written many
+  times a second — an ungated watcher there would refresh the client continuously.
+  `fs.watch` may omit the filename on some platforms; when it does, the gate
+  cannot be honored, so `DaemonWatcher` stays silent rather than firing blind.
+  IntelliJ's own VFS watcher on `plans.json` is deliberately kept as the
+  independent fallback for that case (and for a host with no Node at all).
+- **One working-context signal does NOT come from this channel at all.** A
+  markdown note references the user's own file *in place*, and `NoteService`
+  derives the row's `lastModified` from that file's mtime — so editing it
+  reorders the CONTEXT list with no write to `plans.json` and no event in
+  `~/.claude/plans/`. VS Code catches it with `onDidSaveTextDocument`
+  ([`Extension.ts`](vscode/src/Extension.ts)); IntelliJ catches it by matching
+  `.md` VFS writes against `detectNotes`' `filePath` set. Both ask the CLI which
+  files back a note rather than guessing from the path.
+
+The kind strings are a cross-language contract: `RefreshKind` in
+[`DaemonProtocol.ts`](cli/src/daemon/DaemonProtocol.ts) and `RefreshKinds` in
+[`DaemonNotificationClient.kt`](intellij/src/main/kotlin/ai/jolli/jollimemory/bridge/DaemonNotificationClient.kt).
+A rename on the TS side that is not mirrored fails **silently** — the kind stops
+matching, the light-refresh branch never runs, and the panel just goes back to
+being slow. `DaemonNotificationClientTest` pins the Kotlin literals; keep the two
+in lockstep. `DAEMON_PROTOCOL` does **not** need a bump for a new kind or a new
+optional param field — a bump makes old clients disconnect outright, which is a
+worse outcome than an old client falling through to the status path.
 
 ### Storage: orphan branch + pluggable `StorageProvider` + two `.jolli/jollimemory/` dirs
 

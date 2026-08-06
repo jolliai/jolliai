@@ -279,7 +279,7 @@ class SummaryUtilsTest {
                 commitHash = "abc", commitMessage = "msg", commitAuthor = "a",
                 commitDate = "2026-01-01T00:00:00Z", branch = "main",
                 generatedAt = "2026-01-01T00:00:00Z",
-                plans = listOf(PlanReference("plan1", "Plan One", 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")),
+                plans = listOf(PlanReference("plan1", "Plan One", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")),
             )
             val plans = SummaryUtils.collectAllPlans(summary)
             plans shouldHaveSize 1
@@ -292,13 +292,13 @@ class SummaryUtilsTest {
                 commitHash = "c1", commitMessage = "msg", commitAuthor = "a",
                 commitDate = "2026-01-01T00:00:00Z", branch = "main",
                 generatedAt = "2026-01-01T00:00:00Z",
-                plans = listOf(PlanReference("plan1", "Old Plan", 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")),
+                plans = listOf(PlanReference("plan1", "Old Plan", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")),
             )
             val parent = CommitSummary(
                 commitHash = "p1", commitMessage = "msg", commitAuthor = "a",
                 commitDate = "2026-01-02T00:00:00Z", branch = "main",
                 generatedAt = "2026-01-02T00:00:00Z",
-                plans = listOf(PlanReference("plan1", "New Plan", 2, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")),
+                plans = listOf(PlanReference("plan1", "New Plan", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")),
                 children = listOf(child1),
             )
             val plans = SummaryUtils.collectAllPlans(parent)

@@ -5,13 +5,14 @@ import ai.jolli.jollimemory.toolwindow.MemoryTabOpener
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.ui.Messages
 
 /**
  * View the JolliMemory summary for the most recent commit in an editor tab.
  * Opens the summary as an embedded webview panel (like VS Code).
  */
-class ViewSummaryAction : AnAction() {
+class ViewSummaryAction : AnAction(), DumbAware {
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
         val service = project.getService(JolliMemoryService::class.java)

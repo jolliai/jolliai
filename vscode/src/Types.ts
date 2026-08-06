@@ -87,42 +87,18 @@ export interface BranchCommitsResult {
 	readonly isMerged: boolean;
 }
 
-/** A Claude Code plan file detected from active session transcripts */
-export interface PlanInfo {
-	/** Plan slug (e.g. "abstract-jumping-church") — primary key */
-	readonly slug: string;
-	/** Plan filename (e.g. "abstract-jumping-church.md") */
-	readonly filename: string;
-	/** Editable file path: uncommitted → ~/.claude/plans/<slug>.md; committed → .jolli/jollimemory/plans/<slug>.md */
-	readonly filePath: string;
-	/** First # heading from the markdown file */
-	readonly title: string;
-	/** ISO 8601 — file mtime (uncommitted) or commit date (committed) */
-	readonly lastModified: string;
-	/** ISO 8601 — when this plan was first discovered */
-	readonly addedAt: string;
-	/** ISO 8601 — when this plan was last modified */
-	readonly updatedAt: string;
-	/** Commit hash if plan is associated with a commit, null if unassociated */
-	readonly commitHash: string | null;
-}
+// ─── Plan types ─────────────────────────────────────────────────────────────
 
-/** Persisted plan entry in plans.json registry */
-export interface PlanEntry {
-	readonly slug: string;
-	readonly title: string;
-	readonly sourcePath: string;
-	readonly addedAt: string;
-	readonly updatedAt: string;
-	readonly commitHash: string | null;
-	/** SHA-256 hash of the plan file content when associated with a commit. Used as a guard to detect if the file was overwritten with new content. */
-	readonly contentHashAtCommit?: string;
-}
+// Re-export core plan types to avoid duplication. `PlanInfo` is the projection
+// `cli/src/core/PlanService.detectPlans` returns, so it is owned there and
+// travels the ide-bridge wire to IntelliJ as well — a local copy here would
+// drift the moment a field is added.
+export type { PlanEntry, PlanInfo } from "../../cli/src/Types.js";
 
 // ─── Note types ─────────────────────────────────────────────────────────────
 
 // Re-export core note types to avoid duplication
-export type { NoteEntry, NoteFormat } from "../../cli/src/Types.js";
+export type { NoteEntry, NoteFormat, NoteInfo } from "../../cli/src/Types.js";
 
 // ─── Multi-source reference types ───────────────────────────────────────────
 
@@ -141,26 +117,10 @@ export type {
 	SourceId,
 } from "../../cli/src/Types.js";
 
-// Import for use in NoteInfo / ReferenceInfo
-import type { NoteFormat, ReferenceField, SourceId } from "../../cli/src/Types.js";
+// Import for use in ReferenceInfo
+import type { ReferenceField, SourceId } from "../../cli/src/Types.js";
 // The skill row's shape lives with the projection that builds it — see SkillInfo below.
 import type { ActiveSkill } from "../../cli/src/core/skills/SkillProjection.js";
-
-/** Display-level note metadata for the VSCode tree view */
-export interface NoteInfo {
-	readonly id: string;
-	readonly title: string;
-	readonly format: NoteFormat;
-	/** ISO 8601 — file mtime (markdown) or updatedAt (snippet) */
-	readonly lastModified: string;
-	readonly addedAt: string;
-	readonly updatedAt: string;
-	readonly commitHash: string | null;
-	/** Filename (e.g. "my-note.md") */
-	readonly filename?: string;
-	/** Absolute file path */
-	readonly filePath?: string;
-}
 
 /**
  * Display-level multi-source reference metadata for the VSCode panel.

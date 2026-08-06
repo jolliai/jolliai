@@ -823,7 +823,7 @@ $items
         <button class="topic-action-btn plan-remove-btn" title="Remove Plan" data-plan-slug="$key" data-plan-title="${escAttr(p.title)}" data-action="removePlan">&#x1F5D1;</button>
       </span>
     </div>
-    <div class="plan-meta">${escHtml(key)}.md &middot; edited ${p.editCount} time${if (p.editCount != 1) "s" else ""}</div>
+    <div class="plan-meta">${escHtml(key)}.md</div>
     <div class="plan-edit-area">
       <textarea class="plan-edit-textarea" data-plan-slug="$key" rows="20"></textarea>
       <div class="plan-edit-actions">

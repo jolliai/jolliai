@@ -12,6 +12,7 @@
  *      startRefreshWatchers retry loop reached through it.
  */
 
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -20,12 +21,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // ---------- module mocks (hoisted by vitest to top-of-file) ----------
 
 const daemonWatcherInstances: Array<{
-	opts: { path: string; onTrigger: () => void; debounceMs: number; ensureDir?: boolean };
+	opts: {
+		path: string;
+		onTrigger: (names: ReadonlySet<string>) => void;
+		debounceMs: number;
+		ensureDir?: boolean;
+		filter?: (name: string) => boolean;
+	};
 	start: ReturnType<typeof vi.fn>;
 	stop: ReturnType<typeof vi.fn>;
 }> = [];
 
-vi.mock("../daemon/DaemonServer.js", () => ({
+// Only `computeWatchTargets` is stubbed — the target list would otherwise shell
+// out to git and read the real `~/.claude/plans/`. `buildRefreshParams` stays
+// REAL so this suite asserts the payload shape the host actually receives
+// rather than a second copy of that rule maintained here.
+vi.mock("../daemon/DaemonServer.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../daemon/DaemonServer.js")>()),
 	computeWatchTargets: vi.fn((cwd: string) => [
 		{ kind: "queue", path: `${cwd}/queue`, ensureDir: true },
 		{ kind: "orphan-ref", path: `${cwd}/refs`, ensureDir: false },
@@ -37,9 +49,10 @@ vi.mock("../daemon/DaemonWatcher.js", () => ({
 		this: unknown,
 		opts: {
 			path: string;
-			onTrigger: () => void;
+			onTrigger: (names: ReadonlySet<string>) => void;
 			debounceMs: number;
 			ensureDir?: boolean;
+			filter?: (name: string) => boolean;
 		},
 	) {
 		const start = vi.fn().mockReturnValue(true);
@@ -97,6 +110,33 @@ vi.mock("../core/SessionTracker.js", () => ({
 	savePluginSource: vi.fn().mockResolvedValue(undefined),
 	saveSquashPending: vi.fn().mockResolvedValue(undefined),
 	getOrCreateInstallId: vi.fn().mockResolvedValue({ installId: "install-1", created: false }),
+	detectActivePlansForBranch: vi.fn().mockResolvedValue([]),
+	detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
+	detectUncommittedReferenceIds: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../core/PlanService.js", () => ({
+	detectPlans: vi.fn().mockResolvedValue([]),
+	listAvailablePlans: vi.fn().mockReturnValue([]),
+	addPlanToRegistry: vi.fn().mockResolvedValue(undefined),
+	removePlan: vi.fn().mockResolvedValue(undefined),
+	renamePlanTitle: vi.fn().mockResolvedValue(undefined),
+	archivePlanForCommit: vi.fn().mockResolvedValue(null),
+	// `getPlansDir` is pointed at a scratch dir by the plans-register-new suite;
+	// the default keeps every other test away from the real `~/.claude/plans/`.
+	getPlansDir: vi.fn().mockReturnValue("/nonexistent/claude/plans"),
+	isPlanFromCurrentProject: vi.fn().mockResolvedValue(true),
+	registerNewPlan: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../core/NoteService.js", () => ({
+	detectNotes: vi.fn().mockResolvedValue([]),
+	saveNote: vi.fn().mockResolvedValue(null),
+	removeNote: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../core/references/ReferenceService.js", () => ({
+	removeReference: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../core/Locks.js", () => ({
@@ -292,6 +332,7 @@ vi.mock("../core/SummaryStore.js", () => ({
 	readPlanProgress: vi.fn().mockResolvedValue([]),
 	readPlanFromBranch: vi.fn().mockResolvedValue("plan-content"),
 	storePlans: vi.fn().mockResolvedValue(undefined),
+	deletePlanVisibleArtifact: vi.fn().mockResolvedValue(undefined),
 	readReferenceFromBranch: vi.fn().mockResolvedValue("ref-content"),
 	storeReferences: vi.fn().mockResolvedValue(undefined),
 	getTranscriptHashes: vi.fn().mockResolvedValue(new Set<string>(["h1", "h2"])),
@@ -1510,6 +1551,439 @@ describe("runIdeBridgeAction — conversation-overlay", () => {
 				entries: [],
 			}),
 		).rejects.toThrow(/Unknown transcript source/);
+	});
+});
+
+describe("runIdeBridgeAction — working-context", () => {
+	it("plans-detect returns the CLI's filtered plan list", async () => {
+		const { detectPlans } = await import("../core/PlanService.js");
+		vi.mocked(detectPlans).mockResolvedValue([{ slug: "p1" }] as never);
+		const result = await runIdeBridgeAction("working-context", "/r", { operation: "plans-detect" });
+		expect(detectPlans).toHaveBeenCalledWith("/r");
+		expect(result).toEqual({ plans: [{ slug: "p1" }] });
+	});
+
+	it("plans-list-available forwards excludeSlugs as a Set", async () => {
+		const { listAvailablePlans } = await import("../core/PlanService.js");
+		vi.mocked(listAvailablePlans).mockReturnValue([{ slug: "a", title: "A", mtimeMs: 1 }]);
+		const result = await runIdeBridgeAction("working-context", "/r", {
+			operation: "plans-list-available",
+			excludeSlugs: ["taken"],
+		});
+		expect(listAvailablePlans).toHaveBeenCalledWith(new Set(["taken"]));
+		expect(result).toEqual({ plans: [{ slug: "a", title: "A", mtimeMs: 1 }] });
+	});
+
+	it("plans-add delegates to addPlanToRegistry", async () => {
+		const { addPlanToRegistry } = await import("../core/PlanService.js");
+		await runIdeBridgeAction("working-context", "/r", { operation: "plans-add", slug: "p1" });
+		expect(addPlanToRegistry).toHaveBeenCalledWith("p1", "/r");
+	});
+
+	describe("plans-register-new", () => {
+		// `existsSync` is deliberately NOT mocked in this file, so the stale-name
+		// guard is exercised against a real directory rather than a stub.
+		let plansDir: string;
+
+		beforeEach(async () => {
+			plansDir = mkdtempSync(join(tmpdir(), "ide-bridge-plans-"));
+			const { getPlansDir, isPlanFromCurrentProject, registerNewPlan } = await import("../core/PlanService.js");
+			const { loadPlansRegistry } = await import("../core/SessionTracker.js");
+			vi.mocked(getPlansDir).mockReturnValue(plansDir);
+			vi.mocked(isPlanFromCurrentProject).mockResolvedValue(true);
+			// Empty registry by default: the handler skips already-tracked slugs
+			// before the (expensive) attribution call, so the fixture has to say
+			// which slugs are tracked. Set explicitly rather than relying on the
+			// module-factory default — another test overrides this same mock.
+			vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} });
+			// The file-level afterEach only restores `vi.spyOn` spies, so call
+			// history on a module-factory `vi.fn()` survives into the next test —
+			// and every negative assertion below ("must not register") would then
+			// read the previous test's calls.
+			vi.mocked(registerNewPlan).mockClear();
+			vi.mocked(isPlanFromCurrentProject).mockClear();
+		});
+
+		afterEach(() => {
+			rmSync(plansDir, { recursive: true, force: true });
+		});
+
+		it("derives the slug from each name and registers it, reporting what it accepted", async () => {
+			writeFileSync(join(plansDir, "add-dark-mode.md"), "# Add dark mode");
+			writeFileSync(join(plansDir, "fix-login.md"), "# Fix login");
+			const { registerNewPlan } = await import("../core/PlanService.js");
+
+			const result = await runIdeBridgeAction("working-context", "/r", {
+				operation: "plans-register-new",
+				names: ["add-dark-mode.md", "fix-login.md"],
+			});
+
+			expect(registerNewPlan).toHaveBeenCalledWith("add-dark-mode", "/r");
+			expect(registerNewPlan).toHaveBeenCalledWith("fix-login", "/r");
+			expect(result).toEqual({ accepted: ["add-dark-mode", "fix-login"] });
+		});
+
+		it("skips a name whose file is gone — fs.watch reports deletes as the same event as creates", async () => {
+			const { registerNewPlan } = await import("../core/PlanService.js");
+
+			const result = await runIdeBridgeAction("working-context", "/r", {
+				operation: "plans-register-new",
+				names: ["just-deleted.md"],
+			});
+
+			expect(registerNewPlan).not.toHaveBeenCalled();
+			expect(result).toEqual({ accepted: [] });
+		});
+
+		it("skips non-markdown entries", async () => {
+			writeFileSync(join(plansDir, "scratch.txt"), "x");
+			writeFileSync(join(plansDir, ".md"), "x");
+			const { registerNewPlan } = await import("../core/PlanService.js");
+
+			const result = await runIdeBridgeAction("working-context", "/r", {
+				operation: "plans-register-new",
+				// `.md` alone would derive an empty slug.
+				names: ["scratch.txt", ".md"],
+			});
+
+			expect(registerNewPlan).not.toHaveBeenCalled();
+			expect(result).toEqual({ accepted: [] });
+		});
+
+		// `~/.claude/plans/` is machine-global: a plan another project's session
+		// wrote lands in the same directory and reaches every project's daemon.
+		it("skips a plan that does not belong to this project", async () => {
+			writeFileSync(join(plansDir, "someone-elses.md"), "# Theirs");
+			const { isPlanFromCurrentProject, registerNewPlan } = await import("../core/PlanService.js");
+			vi.mocked(isPlanFromCurrentProject).mockResolvedValue(false);
+
+			const result = await runIdeBridgeAction("working-context", "/r", {
+				operation: "plans-register-new",
+				names: ["someone-elses.md"],
+			});
+
+			expect(isPlanFromCurrentProject).toHaveBeenCalledWith(join(plansDir, "someone-elses.md"), "/r");
+			expect(registerNewPlan).not.toHaveBeenCalled();
+			expect(result).toEqual({ accepted: [] });
+		});
+
+		// The operation is reachable over the bridge, so a name is untrusted input
+		// even though the watcher that normally supplies it only reports direct
+		// children. Anything with a path component is dropped before the join.
+		it("drops a name carrying a path component instead of joining it", async () => {
+			const { registerNewPlan } = await import("../core/PlanService.js");
+
+			const result = await runIdeBridgeAction("working-context", "/r", {
+				operation: "plans-register-new",
+				names: ["../../etc/evil.md", "sub/dir.md"],
+			});
+
+			expect(registerNewPlan).not.toHaveBeenCalled();
+			expect(result).toEqual({ accepted: [] });
+		});
+
+		it("returns an empty result for an empty burst", async () => {
+			const result = await runIdeBridgeAction("working-context", "/r", {
+				operation: "plans-register-new",
+				names: [],
+			});
+			expect(result).toEqual({ accepted: [] });
+		});
+
+		// `fs.watch` fires on content edits too, not just creates, so a user
+		// iterating on one plan replays its name on every save. Attribution reads
+		// every active transcript in full to substring-match the path, so it must
+		// not run for a slug the registry already has — registerNewPlan would
+		// no-op on it anyway.
+		it("skips the attribution scan entirely for a slug the registry already tracks", async () => {
+			writeFileSync(join(plansDir, "already-known.md"), "# Known");
+			const { isPlanFromCurrentProject, registerNewPlan } = await import("../core/PlanService.js");
+			const { loadPlansRegistry } = await import("../core/SessionTracker.js");
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {
+					"already-known": {
+						slug: "already-known",
+						title: "Known",
+						sourcePath: join(plansDir, "already-known.md"),
+						addedAt: "x",
+						updatedAt: "x",
+						commitHash: null,
+					},
+				},
+			});
+
+			const result = await runIdeBridgeAction("working-context", "/r", {
+				operation: "plans-register-new",
+				names: ["already-known.md"],
+			});
+
+			expect(isPlanFromCurrentProject).not.toHaveBeenCalled();
+			expect(registerNewPlan).not.toHaveBeenCalled();
+			expect(result).toEqual({ accepted: [] });
+		});
+
+		// A rename + a change for one file is one burst with the name twice; the
+		// second occurrence must not buy a second plans.lock acquisition.
+		it("registers a repeated name only once within a burst", async () => {
+			writeFileSync(join(plansDir, "add-dark-mode.md"), "# Add dark mode");
+			const { registerNewPlan } = await import("../core/PlanService.js");
+
+			const result = await runIdeBridgeAction("working-context", "/r", {
+				operation: "plans-register-new",
+				names: ["add-dark-mode.md", "add-dark-mode.md"],
+			});
+
+			expect(registerNewPlan).toHaveBeenCalledTimes(1);
+			expect(result).toEqual({ accepted: ["add-dark-mode"] });
+		});
+	});
+
+	it("plans-remove passes expectedCommitHash through when present", async () => {
+		const { removePlan } = await import("../core/PlanService.js");
+		await runIdeBridgeAction("working-context", "/r", {
+			operation: "plans-remove",
+			slug: "p1",
+			expectedCommitHash: "abc123",
+		});
+		expect(removePlan).toHaveBeenCalledWith("p1", "/r", "abc123");
+	});
+
+	// Sidebar removal deletes unconditionally; the commit gate only applies when
+	// the caller names a commit, so an omitted field must stay undefined.
+	it("plans-remove leaves expectedCommitHash undefined when omitted", async () => {
+		const { removePlan } = await import("../core/PlanService.js");
+		await runIdeBridgeAction("working-context", "/r", { operation: "plans-remove", slug: "p1" });
+		expect(removePlan).toHaveBeenCalledWith("p1", "/r", undefined);
+	});
+
+	it("plans-rename-title delegates to renamePlanTitle", async () => {
+		const { renamePlanTitle } = await import("../core/PlanService.js");
+		await runIdeBridgeAction("working-context", "/r", {
+			operation: "plans-rename-title",
+			slug: "p1",
+			title: "New",
+		});
+		expect(renamePlanTitle).toHaveBeenCalledWith("p1", "New", "/r");
+	});
+
+	it("plans-archive-for-commit returns the PlanReference under `reference`", async () => {
+		const [{ archivePlanForCommit }, { createStorage }] = await Promise.all([
+			import("../core/PlanService.js"),
+			import("../core/StorageFactory.js"),
+		]);
+		vi.mocked(archivePlanForCommit).mockResolvedValue({ slug: "p1-abc12345" } as never);
+		vi.mocked(createStorage).mockResolvedValue({ tag: "storage" } as never);
+		const result = await runIdeBridgeAction("working-context", "/r", {
+			operation: "plans-archive-for-commit",
+			slug: "p1",
+			commitHash: "abc1234567",
+		});
+		// The 4th argument is the point of this assertion, not incidental detail.
+		// `resolveStorage` fails safe: with storage omitted it silently falls back to a
+		// bare OrphanBranchStorage, so a folder-mode user loses the Memory Bank copy
+		// with only a debug.log warn. A three-argument expectation here previously
+		// pinned that bug in place as the contract — keep storage in the assertion.
+		expect(archivePlanForCommit).toHaveBeenCalledWith("p1", "abc1234567", "/r", { tag: "storage" });
+		expect(result).toEqual({ reference: { slug: "p1-abc12345" } });
+	});
+
+	it("plans-cleanup-visible deletes the visible artifact with threaded storage", async () => {
+		const [{ deletePlanVisibleArtifact }, { createStorage }] = await Promise.all([
+			import("../core/SummaryStore.js"),
+			import("../core/StorageFactory.js"),
+		]);
+		vi.mocked(createStorage).mockResolvedValue({ tag: "storage" } as never);
+		const result = await runIdeBridgeAction("working-context", "/r", {
+			operation: "plans-cleanup-visible",
+			slug: "p1",
+			branch: "feature/x",
+		});
+		expect(deletePlanVisibleArtifact).toHaveBeenCalledWith("p1", "feature/x", "/r", { tag: "storage" });
+		expect(result).toEqual({ ok: true });
+	});
+
+	it("notes-detect returns the CLI's filtered note list", async () => {
+		const { detectNotes } = await import("../core/NoteService.js");
+		vi.mocked(detectNotes).mockResolvedValue([{ id: "n1" }] as never);
+		const result = await runIdeBridgeAction("working-context", "/r", { operation: "notes-detect" });
+		expect(result).toEqual({ notes: [{ id: "n1" }] });
+	});
+
+	it("notes-save forwards a create (no id) with its format", async () => {
+		const { saveNote } = await import("../core/NoteService.js");
+		vi.mocked(saveNote).mockResolvedValue({ id: "n1" } as never);
+		const result = await runIdeBridgeAction("working-context", "/r", {
+			operation: "notes-save",
+			title: "T",
+			content: "body",
+			format: "snippet",
+		});
+		expect(saveNote).toHaveBeenCalledWith(undefined, "T", "body", "snippet", "/r");
+		expect(result).toEqual({ note: { id: "n1" } });
+	});
+
+	it("notes-save forwards an update when an id is given", async () => {
+		const { saveNote } = await import("../core/NoteService.js");
+		vi.mocked(saveNote).mockResolvedValue({ id: "n1" } as never);
+		await runIdeBridgeAction("working-context", "/r", {
+			operation: "notes-save",
+			id: "n1",
+			title: "T",
+			content: "/abs/path.md",
+			format: "markdown",
+		});
+		expect(saveNote).toHaveBeenCalledWith("n1", "T", "/abs/path.md", "markdown", "/r");
+	});
+
+	// A bad format would otherwise reach saveNote and be persisted verbatim,
+	// producing a row no reader can classify.
+	it("notes-save rejects a format outside markdown/snippet", async () => {
+		await expect(
+			runIdeBridgeAction("working-context", "/r", {
+				operation: "notes-save",
+				title: "T",
+				content: "c",
+				format: "pdf",
+			}),
+		).rejects.toThrow(/must be "markdown" or "snippet"/);
+	});
+
+	it("notes-remove passes expectedCommitHash through", async () => {
+		const { removeNote } = await import("../core/NoteService.js");
+		await runIdeBridgeAction("working-context", "/r", {
+			operation: "notes-remove",
+			id: "n1",
+			expectedCommitHash: "abc123",
+		});
+		expect(removeNote).toHaveBeenCalledWith("n1", "/r", "abc123");
+	});
+
+	it("references-remove delegates to removeReference", async () => {
+		const { removeReference } = await import("../core/references/ReferenceService.js");
+		await runIdeBridgeAction("working-context", "/r", {
+			operation: "references-remove",
+			mapKey: "jira:KAN-5",
+		});
+		expect(removeReference).toHaveBeenCalledWith("/r", "jira:KAN-5");
+	});
+
+	describe("context-list", () => {
+		it("returns the four things the CONTEXT panel needs in one payload", async () => {
+			const { detectPlans } = await import("../core/PlanService.js");
+			const { detectNotes } = await import("../core/NoteService.js");
+			const { loadPlansRegistry } = await import("../core/SessionTracker.js");
+			const { readExclusions } = await import("../core/CommitSelectionStore.js");
+			vi.mocked(detectPlans).mockResolvedValue([{ slug: "p1" }] as never);
+			vi.mocked(detectNotes).mockResolvedValue([{ id: "n1" }] as never);
+			vi.mocked(loadPlansRegistry).mockResolvedValue({
+				version: 1,
+				plans: {},
+				references: { "jira:KAN-5": { source: "jira" } },
+			} as never);
+			vi.mocked(readExclusions).mockResolvedValue({
+				conversations: new Set(["c1"]),
+				plans: new Set(["p1"]),
+				notes: new Set<string>(),
+				references: new Set<string>(),
+				skills: new Set(["claude:brainstorming"]),
+			});
+
+			const result = await runIdeBridgeAction("working-context", "/r", { operation: "context-list" });
+
+			expect(result).toEqual({
+				plans: [{ slug: "p1" }],
+				notes: [{ id: "n1" }],
+				references: { "jira:KAN-5": { source: "jira" } },
+				exclusions: {
+					conversations: ["c1"],
+					plans: ["p1"],
+					notes: [],
+					references: [],
+					skills: ["claude:brainstorming"],
+				},
+			});
+		});
+
+		// A registry written before multi-source references existed has no such
+		// field; the panel must get `{}`, not a missing key Gson turns into null.
+		it("returns an empty references map when the registry omits the field", async () => {
+			const { loadPlansRegistry } = await import("../core/SessionTracker.js");
+			vi.mocked(loadPlansRegistry).mockResolvedValue({ version: 1, plans: {} } as never);
+			const result = (await runIdeBridgeAction("working-context", "/r", { operation: "context-list" })) as {
+				references: unknown;
+			};
+			expect(result.references).toEqual({});
+		});
+
+		// `skills` postdates the persisted shape. Absent on disk must still arrive
+		// as [] — a Kotlin `Set` field left null throws on first use.
+		it("materialises an absent skills exclude set as an empty array", async () => {
+			const { readExclusions } = await import("../core/CommitSelectionStore.js");
+			vi.mocked(readExclusions).mockResolvedValue({
+				conversations: new Set<string>(),
+				plans: new Set<string>(),
+				notes: new Set<string>(),
+				references: new Set<string>(),
+			});
+			const result = (await runIdeBridgeAction("working-context", "/r", { operation: "context-list" })) as {
+				exclusions: { skills: unknown };
+			};
+			expect(result.exclusions.skills).toEqual([]);
+		});
+	});
+
+	it("active-for-commit returns all three kinds plus the exclude set in one payload", async () => {
+		const tracker = await import("../core/SessionTracker.js");
+		const { readExclusions } = await import("../core/CommitSelectionStore.js");
+		vi.mocked(tracker.detectActivePlansForBranch).mockResolvedValue([{ slug: "p1" }] as never);
+		vi.mocked(tracker.detectActiveNotesForBranch).mockResolvedValue([{ id: "n1" }] as never);
+		vi.mocked(tracker.detectUncommittedReferenceIds).mockResolvedValue([
+			{ mapKey: "jira:KAN-5", source: "jira", sourcePath: "/p/KAN-5.md" },
+		] as never);
+		// The title is joined from the registry here so a host never re-reads
+		// plans.json to label a row.
+		vi.mocked(tracker.loadPlansRegistry).mockResolvedValue({
+			version: 1,
+			plans: {},
+			references: { "jira:KAN-5": { title: "Fix it" } },
+		} as never);
+		vi.mocked(readExclusions).mockResolvedValue({
+			conversations: new Set<string>(),
+			plans: new Set(["p1"]),
+			notes: new Set<string>(),
+			references: new Set<string>(),
+		});
+
+		const result = await runIdeBridgeAction("working-context", "/r", { operation: "active-for-commit" });
+
+		expect(result).toEqual({
+			plans: [{ slug: "p1" }],
+			notes: [{ id: "n1" }],
+			references: [{ mapKey: "jira:KAN-5", source: "jira", sourcePath: "/p/KAN-5.md", title: "Fix it" }],
+			exclusions: {
+				conversations: [],
+				plans: ["p1"],
+				notes: [],
+				references: [],
+				// Absent on disk must still arrive as [] — see context-list.
+				skills: [],
+			},
+		});
+	});
+
+	// The branch argument is vestigial in all three CLI functions (working-area
+	// context is not branch-scoped), but it must still be a string.
+	it("active-for-commit defaults the vestigial branch argument to an empty string", async () => {
+		const tracker = await import("../core/SessionTracker.js");
+		await runIdeBridgeAction("working-context", "/r", { operation: "active-for-commit" });
+		expect(tracker.detectActivePlansForBranch).toHaveBeenCalledWith("/r", "");
+	});
+
+	it("rejects an unknown operation", async () => {
+		await expect(runIdeBridgeAction("working-context", "/r", { operation: "nope" })).rejects.toThrow(
+			/Unknown working-context operation "nope"/,
+		);
 	});
 });
 
@@ -3953,6 +4427,24 @@ function makeFakeStdin(): NodeJS.ReadableStream {
 	return stream;
 }
 
+/**
+ * A scratch stand-in for the machine-global `~/.claude/plans/`, passed by every
+ * `runIdeBridgeServe` call below.
+ *
+ * Without it the `claude-plans` watch target arms on the developer's REAL plans
+ * dir: any Claude Code session on the machine saving a plan while these tests
+ * run would land a `refresh` notification on the captured stdout, between the
+ * handshake and the response line the assertions index into. Deliberately never
+ * created — an absent target just starts the (unref'd) arm-retry loop, which is
+ * exactly the "before the user's first plan" path.
+ */
+const SERVE_PLANS_DIR = join(tmpdir(), "ide-bridge-serve-plans-absent");
+
+/** `runIdeBridgeServe` with the plans-dir override every test needs. See [SERVE_PLANS_DIR]. */
+function runServe(cwd: string): Promise<void> {
+	return runIdeBridgeServe(cwd, { plansDir: SERVE_PLANS_DIR });
+}
+
 describe("runIdeBridgeServe", () => {
 	it("writes a handshake, dispatches one request line, and exits on stdin EOF", async () => {
 		const stdin = makeFakeStdin();
@@ -3960,7 +4452,7 @@ describe("runIdeBridgeServe", () => {
 		Object.defineProperty(process, "stdin", { value: stdin, configurable: true });
 		const cap = captureConsole();
 
-		const done = runIdeBridgeServe("/repo");
+		const done = runServe("/repo");
 		// Give readline a tick to arm.
 		await new Promise((r) => setTimeout(r, 5));
 
@@ -3995,7 +4487,7 @@ describe("runIdeBridgeServe", () => {
 		Object.defineProperty(process, "stdin", { value: stdin, configurable: true });
 		captureConsole();
 
-		const done = runIdeBridgeServe("/repo");
+		const done = runServe("/repo");
 		await new Promise((r) => setTimeout(r, 5));
 
 		(stdin as PassThrough).write("\n   \n\n");
@@ -4011,7 +4503,7 @@ describe("runIdeBridgeServe", () => {
 		Object.defineProperty(process, "stdin", { value: stdin, configurable: true });
 		const cap = captureConsole();
 
-		const done = runIdeBridgeServe("/repo");
+		const done = runServe("/repo");
 		await new Promise((r) => setTimeout(r, 5));
 
 		(stdin as PassThrough).write("not-json\n");
@@ -4036,12 +4528,12 @@ describe("runIdeBridgeServe", () => {
 		Object.defineProperty(process, "stdin", { value: stdin, configurable: true });
 		const cap = captureConsole();
 
-		const done = runIdeBridgeServe("/repo");
+		const done = runServe("/repo");
 		await new Promise((r) => setTimeout(r, 5));
 
 		// Fire the onTrigger on the queue watcher.
 		const queue = daemonWatcherInstances.find((w) => w.opts.path === "/repo/queue");
-		queue?.opts.onTrigger();
+		queue?.opts.onTrigger(new Set());
 
 		(stdin as PassThrough).end();
 		await done;
@@ -4084,7 +4576,7 @@ describe("runIdeBridgeServe", () => {
 		Object.defineProperty(process, "stdin", { value: stdin, configurable: true });
 		captureConsole();
 
-		const done = runIdeBridgeServe("/repo");
+		const done = runServe("/repo");
 		await new Promise((r) => setTimeout(r, 5));
 
 		// The 5000ms retry interval is armed exactly once.
@@ -4118,7 +4610,7 @@ describe("runIdeBridgeServe — process-level guards", () => {
 		Object.defineProperty(process, "stdin", { value: stdin, configurable: true });
 		captureConsole();
 
-		const done = runIdeBridgeServe("/repo");
+		const done = runServe("/repo");
 		await new Promise((r) => setTimeout(r, 5));
 		(stdin as PassThrough).end();
 		await done;

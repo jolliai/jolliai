@@ -3,14 +3,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ─── Hoisted mocks ──────────────────────────────────────────────────────────
 
-const { loadAllSessions, loadPlansRegistry, loadPlansRegistryWithStatus, savePlansRegistry } = vi.hoisted(
-	() => ({
-		loadAllSessions: vi.fn(),
-		loadPlansRegistry: vi.fn(),
-		loadPlansRegistryWithStatus: vi.fn(),
-		savePlansRegistry: vi.fn(),
-	}),
-);
+const { loadAllSessions, loadPlansRegistry, loadPlansRegistryWithStatus, savePlansRegistry } = vi.hoisted(() => ({
+	loadAllSessions: vi.fn(),
+	loadPlansRegistry: vi.fn(),
+	loadPlansRegistryWithStatus: vi.fn(),
+	savePlansRegistry: vi.fn(),
+}));
 
 const { storePlans } = vi.hoisted(() => ({
 	storePlans: vi.fn(),
@@ -23,21 +21,15 @@ const { info, warn, error, debug } = vi.hoisted(() => ({
 	debug: vi.fn(),
 }));
 
-const {
-	mockExistsSync,
-	mockReadFileSync,
-	mockReaddirSync,
-	mockStatSync,
-	mockCreateReadStream,
-	mockUnlinkSync,
-} = vi.hoisted(() => ({
-	mockExistsSync: vi.fn(),
-	mockReadFileSync: vi.fn(),
-	mockReaddirSync: vi.fn(),
-	mockStatSync: vi.fn(),
-	mockCreateReadStream: vi.fn(),
-	mockUnlinkSync: vi.fn(),
-}));
+const { mockExistsSync, mockReadFileSync, mockReaddirSync, mockStatSync, mockCreateReadStream, mockUnlinkSync } =
+	vi.hoisted(() => ({
+		mockExistsSync: vi.fn(),
+		mockReadFileSync: vi.fn(),
+		mockReaddirSync: vi.fn(),
+		mockStatSync: vi.fn(),
+		mockCreateReadStream: vi.fn(),
+		mockUnlinkSync: vi.fn(),
+	}));
 
 const { mockReadFile } = vi.hoisted(() => ({
 	mockReadFile: vi.fn(),
@@ -65,11 +57,11 @@ const { mockExecFileSync } = vi.hoisted(() => ({
 
 // plans.lock passthrough — run the RMW body inline (no real lock file I/O on the
 // synthetic CWD). The lock contract is covered in cli/src/core/Locks.test.ts.
-vi.mock("../../../cli/src/core/Locks.js", () => ({
+vi.mock("./Locks.js", () => ({
 	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
 }));
 
-vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
+vi.mock("./SessionTracker.js", () => ({
 	loadAllSessions,
 	loadPlansRegistry,
 	loadPlansRegistryWithStatus,
@@ -82,13 +74,17 @@ vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	},
 }));
 
-vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
+vi.mock("./SummaryStore.js", () => ({
 	storePlans,
 }));
 
-vi.mock("../util/Logger.js", () => ({
-	log: { info, warn, error, debug },
-}));
+// Partial mock: `setManuallyDisabled` / `isManuallyDisabled` / `getJolliMemoryDir`
+// stay real (the disabled-gate tests below drive them), only the module logger is
+// swapped for spies so the suite produces no console output.
+vi.mock("../Logger.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../Logger.js")>();
+	return { ...actual, createLogger: () => ({ info, warn, error, debug }) };
+});
 
 vi.mock("node:crypto", () => ({
 	createHash: mockCreateHash,
@@ -126,7 +122,7 @@ vi.mock("node:child_process", () => ({
 
 // ─── Import under test (after mocks) ────────────────────────────────────────
 
-import { setManuallyDisabled } from "../../../cli/src/Logger.js";
+import { setManuallyDisabled } from "../Logger.js";
 import {
 	addPlanToRegistry,
 	archivePlanForCommit,
@@ -138,6 +134,7 @@ import {
 	listUnassociatedPlans,
 	registerNewPlan,
 	removePlan,
+	renamePlanTitle,
 } from "./PlanService.js";
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
@@ -165,10 +162,7 @@ function makeEntry(overrides: Record<string, unknown> = {}) {
 
 /** Sets up sessions.json to return sessions with optional transcript paths. */
 function stubSessions(transcriptPaths: ReadonlyArray<string>) {
-	const sessions: Record<
-		string,
-		{ sessionId: string; transcriptPath: string; updatedAt: string }
-	> = {};
+	const sessions: Record<string, { sessionId: string; transcriptPath: string; updatedAt: string }> = {};
 	for (const [i, tp] of transcriptPaths.entries()) {
 		sessions[`session-${i}`] = {
 			sessionId: `session-${i}`,
@@ -183,10 +177,7 @@ function stubSessions(transcriptPaths: ReadonlyArray<string>) {
 function stubTranscript(lines: ReadonlyArray<string>) {
 	mockCreateReadStream.mockReturnValue("mock-stream");
 	mockCreateInterface.mockImplementation(() => {
-		const listeners: Record<
-			string,
-			Array<(...args: Array<unknown>) => void>
-		> = {};
+		const listeners: Record<string, Array<(...args: Array<unknown>) => void>> = {};
 		const rl = {
 			on(event: string, cb: (...args: Array<unknown>) => void) {
 				if (!listeners[event]) {
@@ -305,17 +296,12 @@ describe("PlanService", () => {
 
 			await removePlan("test-plan", CWD);
 
-			expect(savePlansRegistry).toHaveBeenCalledWith(
-				expect.objectContaining({ plans: {} }),
-				CWD,
-			);
+			expect(savePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ plans: {} }), CWD);
 			expect(mockUnlinkSync).not.toHaveBeenCalled();
 		});
 
 		it("deletes the backing file when the plan source is inside .jolli/jollimemory/", async () => {
-			const internalPath = normalize(
-				`${CWD}/.jolli/jollimemory/notes/inner.md`,
-			);
+			const internalPath = normalize(`${CWD}/.jolli/jollimemory/notes/inner.md`);
 			const entry = makeEntry({ sourcePath: internalPath });
 			loadPlansRegistry.mockResolvedValue({
 				version: 1,
@@ -326,10 +312,7 @@ describe("PlanService", () => {
 			await removePlan("test-plan", CWD);
 
 			expect(mockUnlinkSync).toHaveBeenCalledWith(internalPath);
-			expect(savePlansRegistry).toHaveBeenCalledWith(
-				expect.objectContaining({ plans: {} }),
-				CWD,
-			);
+			expect(savePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ plans: {} }), CWD);
 		});
 
 		it("does nothing when slug is not in registry", async () => {
@@ -417,9 +400,7 @@ describe("PlanService", () => {
 		});
 
 		it("still removes the entry when internal file deletion throws", async () => {
-			const internalPath = normalize(
-				`${CWD}/.jolli/jollimemory/notes/inner.md`,
-			);
+			const internalPath = normalize(`${CWD}/.jolli/jollimemory/notes/inner.md`);
 			const entry = makeEntry({ sourcePath: internalPath });
 			loadPlansRegistry.mockResolvedValue({
 				version: 1,
@@ -432,10 +413,76 @@ describe("PlanService", () => {
 
 			await removePlan("test-plan", CWD);
 
+			expect(savePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ plans: {} }), CWD);
+		});
+	});
+
+	// ─── renamePlanTitle ─────────────────────────────────────────────────────
+
+	describe("renamePlanTitle", () => {
+		it("writes the new title onto the existing row", async () => {
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": makeEntry({ title: "Old Title" }) },
+			});
+
+			await renamePlanTitle("test-plan", "New Title", CWD);
+
 			expect(savePlansRegistry).toHaveBeenCalledWith(
-				expect.objectContaining({ plans: {} }),
+				expect.objectContaining({
+					plans: expect.objectContaining({
+						"test-plan": expect.objectContaining({ slug: "test-plan", title: "New Title" }),
+					}),
+				}),
 				CWD,
 			);
+		});
+
+		it("leaves every other field on the row untouched", async () => {
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: {
+					"test-plan": makeEntry({
+						title: "Old Title",
+						commitHash: "abcdef1234",
+						contentHashAtCommit: "guard-hash",
+					}),
+				},
+			});
+
+			await renamePlanTitle("test-plan", "New Title", CWD);
+
+			const saved = savePlansRegistry.mock.calls[0][0] as { plans: Record<string, Record<string, unknown>> };
+			expect(saved.plans["test-plan"]).toMatchObject({
+				commitHash: "abcdef1234",
+				contentHashAtCommit: "guard-hash",
+				addedAt: "2025-01-01T00:00:00.000Z",
+			});
+		});
+
+		it("preserves sibling rows", async () => {
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: {
+					"test-plan": makeEntry({ title: "Old Title" }),
+					other: makeEntry({ slug: "other", title: "Other" }),
+				},
+			});
+
+			await renamePlanTitle("test-plan", "New Title", CWD);
+
+			const saved = savePlansRegistry.mock.calls[0][0] as { plans: Record<string, Record<string, unknown>> };
+			expect(saved.plans.other).toMatchObject({ title: "Other" });
+		});
+
+		// The summary-side rename stands on its own, so a registry row that was
+		// already removed must not turn the sync into an error.
+		it("is a no-op for an unknown slug", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+
+			await renamePlanTitle("missing-plan", "New Title", CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
 		});
 	});
 
@@ -554,9 +601,23 @@ describe("PlanService", () => {
 			const result = listAvailablePlans(new Set());
 
 			expect(result).toHaveLength(2);
-			expect(result.map((p) => p.slug)).toEqual(
-				expect.arrayContaining(["plan", "notes"]),
-			);
+			expect(result.map((p) => p.slug)).toEqual(expect.arrayContaining(["plan", "notes"]));
+		});
+
+		// `statSync().mtimeMs` carries sub-millisecond precision on every filesystem
+		// this ships to, and the raw float crosses the ide-bridge into a Kotlin
+		// `Long` — where Gson REJECTS a fractional literal instead of truncating,
+		// failing the whole response. Whole milliseconds are the wire contract.
+		it("truncates mtimeMs to whole milliseconds so the value stays integral on the wire", () => {
+			mockExistsSync.mockReturnValue(true);
+			mockReaddirSync.mockReturnValue(["plan.md"]);
+			mockReadFileSync.mockReturnValue("# Title");
+			mockStatSync.mockReturnValue({ mtimeMs: 1785768117378.9856 });
+
+			const result = listAvailablePlans(new Set());
+
+			expect(result[0]?.mtimeMs).toBe(1785768117378);
+			expect(Number.isInteger(result[0]?.mtimeMs)).toBe(true);
 		});
 	});
 
@@ -572,11 +633,7 @@ describe("PlanService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# Test Plan\nContent");
 
-			const result = await archivePlanForCommit(
-				"test-plan",
-				"06d0f729abcdef12",
-				CWD,
-			);
+			const result = await archivePlanForCommit("test-plan", "06d0f729abcdef12", CWD);
 
 			expect(result).toEqual(
 				expect.objectContaining({
@@ -620,11 +677,7 @@ describe("PlanService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# New Plan\nContent");
 
-			const result = await archivePlanForCommit(
-				"new-plan",
-				"aaaa1111bbbb2222",
-				CWD,
-			);
+			const result = await archivePlanForCommit("new-plan", "aaaa1111bbbb2222", CWD);
 
 			expect(result).not.toBeNull();
 			expect(result?.slug).toBe("new-plan-aaaa1111");
@@ -637,11 +690,7 @@ describe("PlanService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# New Plan\nContent");
 
-			const result = await archivePlanForCommit(
-				"new-plan",
-				"aaaa1111bbbb2222",
-				CWD,
-			);
+			const result = await archivePlanForCommit("new-plan", "aaaa1111bbbb2222", CWD);
 
 			expect(result).not.toBeNull();
 			expect(result?.slug).toBe("new-plan-aaaa1111");
@@ -675,11 +724,7 @@ describe("PlanService", () => {
 				return true;
 			});
 
-			const result = await archivePlanForCommit(
-				"test-plan",
-				"06d0f729abcdef12",
-				CWD,
-			);
+			const result = await archivePlanForCommit("test-plan", "06d0f729abcdef12", CWD);
 
 			expect(result).not.toBeNull();
 			const saved = savePlansRegistry.mock.calls[0][0];
@@ -701,11 +746,7 @@ describe("PlanService", () => {
 			mockReadFileSync.mockReturnValue("# Test Plan\nContent");
 			mockExistsSync.mockReturnValue(false);
 
-			const result = await archivePlanForCommit(
-				"test-plan",
-				"06d0f729abcdef12",
-				CWD,
-			);
+			const result = await archivePlanForCommit("test-plan", "06d0f729abcdef12", CWD);
 
 			expect(result).not.toBeNull();
 			expect(storePlans).not.toHaveBeenCalled();
@@ -724,12 +765,8 @@ describe("PlanService", () => {
 				version: 1,
 				plans: { "foo-plan": entry },
 			});
-			mockReadFileSync.mockImplementation((path: unknown) =>
-				path === externalPath ? "# External\nbody" : "",
-			);
-			mockExistsSync.mockImplementation(
-				(path: unknown) => path === externalPath,
-			);
+			mockReadFileSync.mockImplementation((path: unknown) => (path === externalPath ? "# External\nbody" : ""));
+			mockExistsSync.mockImplementation((path: unknown) => path === externalPath);
 
 			await archivePlanForCommit("foo-plan", "deadbeefcafebabe", CWD);
 
@@ -974,9 +1011,7 @@ describe("PlanService", () => {
 				plans: { "test-plan": entry },
 			});
 			stubSessions([]);
-			mockReadFile.mockResolvedValue(
-				JSON.stringify({ version: 1, sessions: {} }),
-			);
+			mockReadFile.mockResolvedValue(JSON.stringify({ version: 1, sessions: {} }));
 			// existsSync returns true, hashFileContent returns "mock-hash" (matches contentHashAtCommit)
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("content");
@@ -999,15 +1034,13 @@ describe("PlanService", () => {
 				mtime: new Date("2025-06-01T00:00:00.000Z"),
 			});
 			// isCommitOnCurrentBranch throws → commit not on branch
-			mockExecFileSync.mockImplementation(
-				(_cmd: string, args: Array<string>) => {
-					if (args[0] === "rev-parse") {
-						return "main\n";
-					}
-					// merge-base --is-ancestor throws for cross-branch
-					throw new Error("not ancestor");
-				},
-			);
+			mockExecFileSync.mockImplementation((_cmd: string, args: Array<string>) => {
+				if (args[0] === "rev-parse") {
+					return "main\n";
+				}
+				// merge-base --is-ancestor throws for cross-branch
+				throw new Error("not ancestor");
+			});
 
 			const plans = await detectPlans(CWD);
 
@@ -1023,9 +1056,7 @@ describe("PlanService", () => {
 				.mockResolvedValueOnce({ version: 1, plans: { orphan: entry } })
 				.mockResolvedValueOnce({ version: 1, plans: { orphan: entry } });
 			stubSessions([]);
-			mockReadFile.mockResolvedValue(
-				JSON.stringify({ version: 1, sessions: {} }),
-			);
+			mockReadFile.mockResolvedValue(JSON.stringify({ version: 1, sessions: {} }));
 			// existsSync returns false → orphan file is gone
 			mockExistsSync.mockReturnValue(false);
 
@@ -1077,9 +1108,7 @@ describe("PlanService", () => {
 				});
 
 			stubSessions([]);
-			mockReadFile.mockResolvedValue(
-				JSON.stringify({ version: 1, sessions: {} }),
-			);
+			mockReadFile.mockResolvedValue(JSON.stringify({ version: 1, sessions: {} }));
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# Title");
 			mockStatSync.mockImplementation((path: string) => {
@@ -1136,9 +1165,7 @@ describe("PlanService", () => {
 		});
 
 		it("skips discovered plan when plan file does not exist but transcript does", async () => {
-			loadPlansRegistry
-				.mockResolvedValueOnce(emptyRegistry())
-				.mockResolvedValueOnce(emptyRegistry());
+			loadPlansRegistry.mockResolvedValueOnce(emptyRegistry()).mockResolvedValueOnce(emptyRegistry());
 
 			stubSessions(["/mock-transcript.jsonl"]);
 			stubTranscript(['{"type":"message","slug":"no-file-plan"}']);
@@ -1194,12 +1221,8 @@ describe("PlanService", () => {
 				plans: { "foo-plan": guardEntry },
 			});
 
-			mockExistsSync.mockImplementation(
-				(path: unknown) => path === externalPath,
-			);
-			mockReadFileSync.mockImplementation((path: unknown) =>
-				path === externalPath ? "# Foo" : "",
-			);
+			mockExistsSync.mockImplementation((path: unknown) => path === externalPath);
+			mockReadFileSync.mockImplementation((path: unknown) => (path === externalPath ? "# Foo" : ""));
 
 			const plans = await detectPlans(CWD);
 
@@ -1252,9 +1275,7 @@ describe("PlanService", () => {
 				plans: { "deleted-plan": entry },
 			});
 			stubSessions([]);
-			mockReadFile.mockResolvedValue(
-				JSON.stringify({ version: 1, sessions: {} }),
-			);
+			mockReadFile.mockResolvedValue(JSON.stringify({ version: 1, sessions: {} }));
 			// The plan file does NOT exist anywhere.
 			mockExistsSync.mockReturnValue(false);
 
@@ -1273,9 +1294,7 @@ describe("PlanService", () => {
 				.mockResolvedValueOnce({ version: 1, plans: { "stat-fail": entry } });
 
 			stubSessions([]);
-			mockReadFile.mockResolvedValue(
-				JSON.stringify({ version: 1, sessions: {} }),
-			);
+			mockReadFile.mockResolvedValue(JSON.stringify({ version: 1, sessions: {} }));
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# Stat Fail Plan");
 			// statSync throws → catch ignores (line 234)
@@ -1292,9 +1311,7 @@ describe("PlanService", () => {
 		});
 
 		it("skips transcript discovery when plan file does not exist", async () => {
-			loadPlansRegistry
-				.mockResolvedValueOnce(emptyRegistry())
-				.mockResolvedValueOnce(emptyRegistry());
+			loadPlansRegistry.mockResolvedValueOnce(emptyRegistry()).mockResolvedValueOnce(emptyRegistry());
 
 			stubSessions(["/mock-transcript.jsonl"]);
 			stubTranscript(['{"type":"message","slug":"ghost-plan"}']);
@@ -1408,14 +1425,12 @@ describe("PlanService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# Test Plan");
 			// isCommitOnCurrentBranch succeeds (no throw)
-			mockExecFileSync.mockImplementation(
-				(_cmd: string, args: Array<string>) => {
-					if (args[0] === "rev-parse") {
-						return "main\n";
-					}
-					return ""; // merge-base --is-ancestor succeeds
-				},
-			);
+			mockExecFileSync.mockImplementation((_cmd: string, args: Array<string>) => {
+				if (args[0] === "rev-parse") {
+					return "main\n";
+				}
+				return ""; // merge-base --is-ancestor succeeds
+			});
 
 			await detectPlans(CWD);
 			expect(savePlansRegistry).not.toHaveBeenCalled();
@@ -1521,15 +1536,12 @@ describe("PlanService", () => {
 
 	describe("isPlanFromCurrentProject", () => {
 		const PLAN_ABS_PATH = "C:\\Users\\sanshi\\.claude\\plans\\my-plan.md";
-		const JSON_ESCAPED =
-			"C:\\\\Users\\\\sanshi\\\\.claude\\\\plans\\\\my-plan.md";
+		const JSON_ESCAPED = "C:\\\\Users\\\\sanshi\\\\.claude\\\\plans\\\\my-plan.md";
 
 		it("returns false when no sessions are tracked for the project", async () => {
 			loadAllSessions.mockResolvedValue([]);
 
-			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(
-				false,
-			);
+			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(false);
 		});
 
 		it("returns true when one of the project's transcripts mentions the plan path", async () => {
@@ -1545,9 +1557,7 @@ describe("PlanService", () => {
 				`{"type":"tool_use","name":"Write","input":{"file_path":"${JSON_ESCAPED}"}}\n`,
 			);
 
-			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(
-				true,
-			);
+			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(true);
 		});
 
 		it("returns false when no transcript mentions the plan path (cross-project leak)", async () => {
@@ -1563,9 +1573,7 @@ describe("PlanService", () => {
 				`{"type":"tool_use","name":"Read","input":{"file_path":"/some/other/file.ts"}}\n`,
 			);
 
-			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(
-				false,
-			);
+			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(false);
 		});
 
 		it("scans multiple transcripts and returns true on the first match", async () => {
@@ -1586,9 +1594,7 @@ describe("PlanService", () => {
 			// Second transcript: contains the plan path
 			mockReadFile.mockResolvedValueOnce(`"file_path":"${JSON_ESCAPED}"`);
 
-			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(
-				true,
-			);
+			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(true);
 			expect(mockReadFile).toHaveBeenCalledTimes(2);
 		});
 
@@ -1602,9 +1608,7 @@ describe("PlanService", () => {
 			]);
 			mockReadFile.mockRejectedValueOnce(new Error("ENOENT"));
 
-			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(
-				false,
-			);
+			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(false);
 		});
 	});
 });

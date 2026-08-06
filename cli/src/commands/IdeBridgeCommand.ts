@@ -12,7 +12,7 @@ import { isAbsolute } from "node:path";
 import type { LiveSharePatch, LiveSharePayload } from "../core/JolliShareClient.js";
 import type { SkillTableRow } from "../core/SkillsAggregateMarkdown.js";
 import { runWithTrace } from "../core/TraceContext.js";
-import { computeWatchTargets } from "../daemon/DaemonServer.js";
+import { buildRefreshParams, computeWatchTargets } from "../daemon/DaemonServer.js";
 import { DaemonWatcher } from "../daemon/DaemonWatcher.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { ConflictUi, Tier3Pick } from "../sync/ConflictResolver.js";
@@ -232,6 +232,378 @@ async function runConversationOverlayAction(cwd: string, request: JsonObject): P
 		return overlayStore.saveOverlay(key, merged);
 	}
 	throw new Error(`Unknown conversation-overlay operation "${operation}".`);
+}
+
+/**
+ * Working-area context CRUD — the plans / notes / references a worktree carries
+ * before they are claimed by a commit.
+ *
+ * Every operation here delegates to the shared services in `cli/src/core`
+ * (`PlanService`, `NoteService`, `references/ReferenceService`), which VS Code
+ * calls in-process. This action is the ONLY sanctioned way for a JVM host to
+ * mutate or list that state: a Kotlin re-implementation of these rules drifted
+ * silently from the TypeScript one (soft-delete that was really a hard delete,
+ * a different predicate deciding which backing files got unlinked), because
+ * nothing on the JSON wire fails when the two disagree.
+ *
+ * Note the deliberate asymmetry with `session-state`'s `plans-load` /
+ * `plans-save`: those move the whole registry and exist for callers that own a
+ * read-modify-write cycle. The operations here are the semantic ones — prefer
+ * them, and reach for the raw pair only when no semantic operation fits.
+ */
+async function runWorkingContextAction(cwd: string, request: JsonObject): Promise<unknown> {
+	const operation = stringField(request, "operation");
+	switch (operation) {
+		// ── Plans ──────────────────────────────────────────────────────────
+		case "plans-detect": {
+			const { detectPlans } = await import("../core/PlanService.js");
+			return { plans: await detectPlans(cwd) };
+		}
+		case "plans-list-available": {
+			const { listAvailablePlans } = await import("../core/PlanService.js");
+			return { plans: listAvailablePlans(new Set(stringArrayField(request, "excludeSlugs"))) };
+		}
+		case "plans-add": {
+			const { addPlanToRegistry } = await import("../core/PlanService.js");
+			await addPlanToRegistry(stringField(request, "slug"), cwd);
+			return { ok: true };
+		}
+		/**
+		 * Registers plan files that just APPEARED in the machine-global
+		 * `~/.claude/plans/`, so a plan shows up while the session is still
+		 * running instead of at the agent's next Stop.
+		 *
+		 * The JVM-host counterpart of the VS Code plans-dir watcher's
+		 * `onDidCreate` → `isPlanFromCurrentProject` → `registerNewPlan` chain
+		 * (`vscode/src/stores/PlansStore.ts`), and deliberately the same three
+		 * steps in the same order — the host contributes only the filenames the
+		 * OS reported, which is the one thing it has and the CLI does not.
+		 *
+		 * `names` are raw directory entries (`<slug>.md`), NOT slugs: deriving
+		 * the slug, skipping non-markdown, and deciding project affinity are
+		 * rules, and a Kotlin restatement of them is exactly the drift this
+		 * bridge exists to prevent. Unknown / stale / foreign names are dropped
+		 * silently — `~/.claude/plans/` is shared by every project on the
+		 * machine, so a name this project should ignore is the common case,
+		 * not an error.
+		 *
+		 * ONE host difference is inherent and is NOT drift to "fix": VS Code wires
+		 * this to `onDidCreate` only (its `onDidChange` just refreshes), while the
+		 * daemon feeds it from `fs.watch`, which cannot distinguish a create from a
+		 * content edit. So an edit to an already-known plan reaches here on the JVM
+		 * host and not on VS Code. It is invisible for a tracked slug (the fast path
+		 * below skips it) and for a foreign one (attribution says no). It is visible
+		 * in exactly one case: a plan the user explicitly REMOVED from the sidebar.
+		 * `removePlan` leaves no tombstone, so the slug is untracked again, and the
+		 * agent's next write to that file re-registers it here — where VS Code would
+		 * wait for the StopHook to do the same thing at turn end. Same end state,
+		 * earlier. Reviving on edit is a consequence of hard-delete semantics, not of
+		 * this handler; the place to change it would be a tombstone in `plans.json`,
+		 * which the working-area contract deliberately does not have.
+		 */
+		case "plans-register-new": {
+			// Validated and short-circuited before any I/O — an empty burst is a
+			// normal outcome of the caller's own filtering, not a reason to read
+			// the registry.
+			const names = stringArrayField(request, "names");
+			if (names.length === 0) return { accepted: [] };
+			const { existsSync } = await import("node:fs");
+			const { basename, join } = await import("node:path");
+			const { getPlansDir, isPlanFromCurrentProject, registerNewPlan } = await import("../core/PlanService.js");
+			const tracker = await import("../core/SessionTracker.js");
+			const plansDir = getPlansDir();
+			// One registry read for the whole burst, used purely as a fast path
+			// (see the `tracked` check below). `registerNewPlan` re-reads under
+			// plans.lock, so this snapshot never decides a write — going stale
+			// between here and there only costs a redundant no-op call.
+			const tracked = new Set(Object.keys((await tracker.loadPlansRegistry(cwd)).plans));
+			// `accepted`, not `registered`: these are the slugs that passed every
+			// filter and were handed to registerNewPlan. Claiming a write happened
+			// would be a guess — the caller uses this as a diagnostic, and its
+			// own refresh reads the registry back either way.
+			const accepted: string[] = [];
+			for (const name of names) {
+				// A directory entry has no path component. Anything else is
+				// either a client bug or an attempt to walk out of plansDir —
+				// both get dropped rather than joined.
+				if (name !== basename(name) || !name.endsWith(".md")) continue;
+				const slug = name.slice(0, -".md".length);
+				if (slug.length === 0) continue;
+				// Cheap checks BEFORE `isPlanFromCurrentProject`, which reads every
+				// active transcript in full (a Claude Code JSONL is routinely tens of
+				// MB) to substring-match the path. `fs.watch` fires on content edits
+				// too, not just creates, so a user iterating on one plan would
+				// otherwise re-scan every transcript on every save — in every open
+				// project, since the plans dir is machine-global. An already-tracked
+				// slug is the common case there and `registerNewPlan` would no-op on
+				// it anyway, so attribution has nothing left to decide.
+				//
+				// KNOWN LIMIT, deliberately left as-is — not a review finding. This fast
+				// path only covers slugs THIS project has registered, and a plan owned by
+				// another project never enters this registry, so every edit to one does
+				// reach the scan below. Bounded rather than unbounded: `loadAllSessions`
+				// prunes stale entries, so a project with no live session returns [] and
+				// `isPlanFromCurrentProject` exits before reading anything. Neither
+				// obvious mitigation is free — an mtime check cannot help (fs.watch fires
+				// BECAUSE the file changed, so mtime has always advanced), and a
+				// time-boxed negative cache would delay legitimate attribution, which is
+				// the one thing this path exists to make faster than the StopHook. Fixing
+				// it is a cost-vs-latency product call, so it is out of scope here.
+				if (tracked.has(slug)) continue;
+				const absPath = join(plansDir, name);
+				// `fs.watch` reports creates and deletes as the same event, so a
+				// deleted plan arrives here indistinguishable from a new one.
+				if (!existsSync(absPath)) continue;
+				if (!(await isPlanFromCurrentProject(absPath, cwd))) continue;
+				// Serial, not Promise.all: registerNewPlan is a load-modify-save
+				// under plans.lock, and concurrent calls would queue on that lock
+				// anyway. VS Code serialises the same burst through its own
+				// `registerQueue` for this reason.
+				await registerNewPlan(slug, cwd);
+				// Keep the fast path honest within this burst: `fs.watch` can report
+				// the same name twice (rename + change), and re-registering would be
+				// a second lock acquisition for nothing.
+				tracked.add(slug);
+				accepted.push(slug);
+			}
+			return { accepted };
+		}
+		case "plans-remove": {
+			const { removePlan } = await import("../core/PlanService.js");
+			await removePlan(stringField(request, "slug"), cwd, optionalString(request, "expectedCommitHash"));
+			return { ok: true };
+		}
+		case "plans-rename-title": {
+			const { renamePlanTitle } = await import("../core/PlanService.js");
+			await renamePlanTitle(stringField(request, "slug"), stringField(request, "title"), cwd);
+			return { ok: true };
+		}
+		/**
+		 * KNOWN ASYMMETRY, pre-existing and deliberately not closed here — not a
+		 * review finding. The plan operations below have no note counterparts:
+		 * neither `notes-archive-for-commit` nor a note visible-cleanup exists, so the
+		 * JVM host cannot attach a note to an existing commit's memory while VS Code
+		 * can (`SummaryWebviewPanel` has an add-markdown-note and an add-snippet flow
+		 * calling `archiveNoteForCommit`, plus `cleanupVisibleNoteArtifact` on removal).
+		 * This predates the working-context sink — the deleted Kotlin `PlanService` had
+		 * no note archive either — and it is a missing FEATURE, not a broken one:
+		 * IntelliJ's summary panel registers no note command at all, so nothing
+		 * silently no-ops.
+		 *
+		 * Closing it is two bridge operations plus the whole IntelliJ side (webview
+		 * commands, HTML affordances, note picker, rollback-on-archive-failure), which
+		 * is why it is not bundled in here. Adding the operations alone would just be
+		 * unreachable exports. See AGENTS.md → "A missing bridge operation is the
+		 * OTHER way this rule gets broken".
+		 */
+		case "plans-archive-for-commit": {
+			const [{ archivePlanForCommit }, { createStorage }] = await Promise.all([
+				import("../core/PlanService.js"),
+				import("../core/StorageFactory.js"),
+			]);
+			// Storage MUST be threaded. This is the only working-context operation that
+			// writes through SummaryStore, and `resolveStorage` fails SAFE rather than
+			// loud: with no storage and no `setActiveStorage` (this process never calls
+			// it) it falls back to a bare OrphanBranchStorage, which preserves the
+			// system of record but bypasses DualWriteStorage — so a folder-mode user
+			// silently loses both the hidden JSON and the visible
+			// `<branch>/plan--<slug>.md`, with nothing but one debug.log warn to show
+			// it. Reads come from the orphan branch, so the sidebar looks correct and
+			// the gap only surfaces as a phantom missing file later. `runStorageAction`
+			// and `runSummaryStoreAction` already build storage the same way.
+			return {
+				reference: await archivePlanForCommit(
+					stringField(request, "slug"),
+					stringField(request, "commitHash"),
+					cwd,
+					await createStorage(cwd, cwd),
+				),
+			};
+		}
+		/**
+		 * Deletes the user-visible `<branch>/plan--<slug>.md` from the Memory Bank
+		 * folder after a plan is dissociated from a commit, so the tree stops showing
+		 * a ghost file. No-op when the active backend has no visible layer
+		 * (orphan-only mode) — `deletePlanVisibleArtifact` checks for the method.
+		 *
+		 * Split from `plans-remove` rather than folded into it: that operation is also
+		 * the sidebar's "remove this live plan" path, where there is no commit and so
+		 * no branch folder to clean, and it is called by hosts that pass no branch at
+		 * all. Keeping them separate means neither has to guess.
+		 *
+		 * Same storage-threading requirement as the archive above, and the same
+		 * reason: without it this silently no-ops instead of failing.
+		 */
+		case "plans-cleanup-visible": {
+			const [{ deletePlanVisibleArtifact }, { createStorage }] = await Promise.all([
+				import("../core/SummaryStore.js"),
+				import("../core/StorageFactory.js"),
+			]);
+			await deletePlanVisibleArtifact(
+				stringField(request, "slug"),
+				stringField(request, "branch"),
+				cwd,
+				await createStorage(cwd, cwd),
+			);
+			return { ok: true };
+		}
+		// ── Notes ──────────────────────────────────────────────────────────
+		case "notes-detect": {
+			const { detectNotes } = await import("../core/NoteService.js");
+			return { notes: await detectNotes(cwd) };
+		}
+		case "notes-save": {
+			const { saveNote } = await import("../core/NoteService.js");
+			const format = stringField(request, "format");
+			if (format !== "markdown" && format !== "snippet") {
+				throw new Error(`Request field "format" must be "markdown" or "snippet", got "${format}".`);
+			}
+			return {
+				note: await saveNote(
+					optionalString(request, "id"),
+					stringField(request, "title"),
+					stringField(request, "content"),
+					format,
+					cwd,
+				),
+			};
+		}
+		case "notes-remove": {
+			const { removeNote } = await import("../core/NoteService.js");
+			await removeNote(stringField(request, "id"), cwd, optionalString(request, "expectedCommitHash"));
+			return { ok: true };
+		}
+		// ── References ─────────────────────────────────────────────────────
+		case "references-remove": {
+			const { removeReference } = await import("../core/references/ReferenceService.js");
+			await removeReference(cwd, stringField(request, "mapKey"));
+			return { ok: true };
+		}
+		// ── Cross-kind ─────────────────────────────────────────────────────
+		/**
+		 * Everything the browsable CONTEXT panel renders, in ONE round-trip.
+		 *
+		 * The panel needs four things together — visible plans, visible notes, the
+		 * raw reference rows, and the user's exclude set — and asking for them
+		 * separately made a single repaint four bridge calls and three independent
+		 * reads of `plans.json`. That was tolerable while the panel only refreshed
+		 * on a status recompute; it is not now that the working-context channel
+		 * repaints it whenever a plan file is saved anywhere on the machine.
+		 *
+		 * Deliberately NOT merged with `active-for-commit`. These are the two
+		 * CLI-owned visibility rules and they are not interchangeable: this one is
+		 * the browsable set (a revived guard — a committed row whose file changed
+		 * again — stays visible), that one is the archive-selection set (only rows
+		 * no commit has claimed at all). A host must pick the one that matches the
+		 * question, so they stay separate operations rather than one payload a
+		 * caller could take the wrong half of.
+		 *
+		 * `references` is the registry map verbatim: a reference has no committed
+		 * or guard state — a commit deletes the row — so every row is active.
+		 */
+		case "context-list": {
+			const [{ detectPlans }, { detectNotes }, tracker, selection] = await Promise.all([
+				import("../core/PlanService.js"),
+				import("../core/NoteService.js"),
+				import("../core/SessionTracker.js"),
+				import("../core/CommitSelectionStore.js"),
+			]);
+			// Serial, not Promise.all: `detectPlans` and `detectNotes` both perform a
+			// one-shot normalising write-back under plans.lock on the first refresh
+			// after an upgrade, and racing them would have each build its payload from
+			// a snapshot the other is about to replace.
+			const plans = await detectPlans(cwd);
+			const notes = await detectNotes(cwd);
+			const [registry, exclusions] = await Promise.all([
+				tracker.loadPlansRegistry(cwd),
+				selection.readExclusions(cwd),
+			]);
+			return {
+				plans,
+				notes,
+				references: registry.references ?? {},
+				// Same reason `selection-read` spells it out: `skills` is optional on
+				// disk, and Gson turns an absent key into a null Set that throws on
+				// first use, so "nothing excluded" has to arrive as [].
+				exclusions: {
+					conversations: [...exclusions.conversations],
+					plans: [...exclusions.plans],
+					notes: [...exclusions.notes],
+					references: [...exclusions.references],
+					skills: [...(exclusions.skills ?? [])],
+				},
+			};
+		}
+		/**
+		 * Everything the NEXT commit would claim, plus the exclude set that decides
+		 * which of it is struck through — in ONE round-trip.
+		 *
+		 * A narrower set than `plans-detect` / `notes-detect`: those drive a
+		 * browsable panel and therefore keep a revived guard (a committed row whose
+		 * file changed again) visible, while this is the archive-selection set and
+		 * keeps only rows no commit has claimed at all. The two rules are both
+		 * CLI-owned and must not be conflated by a host.
+		 *
+		 * `exclusions` rides along for the same reason it does on `context-list`:
+		 * every caller needs both together, and the Working Memory review was
+		 * paying a second round-trip for it. The references carry their `title`
+		 * (see `detectUncommittedReferenceIds`) so a host has no reason to re-read
+		 * `plans.json` on the side to label a row.
+		 */
+		case "active-for-commit": {
+			const [tracker, selection] = await Promise.all([
+				import("../core/SessionTracker.js"),
+				import("../core/CommitSelectionStore.js"),
+			]);
+			// `branch` is vestigial in all three — working-area context is not
+			// branch-scoped — but the signatures still take it.
+			const branch = optionalString(request, "branch") ?? "";
+			// KNOWN, deliberately not changed here — not a review finding. Four of these
+			// five read `plans.json` independently (each `detect*` loads the registry
+			// itself, plus the explicit load for the title join), so a write landing
+			// mid-flight can leave them on different snapshots. Display-only and
+			// self-healing on the next refresh: a reference whose row the registry read
+			// missed falls back to its bare `mapKey` for one paint, and the plans and
+			// notes lists can momentarily disagree about a row that was just added.
+			// Nothing is written from these, so no data is at risk.
+			//
+			// Collapsing it means threading one shared registry through all three
+			// `detect*` helpers — commit-path functions the QueueWorker also calls — so
+			// the change is materially riskier than the glitch it removes. Left for its
+			// own change; do not "fix" it by post-filtering or re-reading host-side.
+			const [plans, notes, referenceIds, exclusions, registry] = await Promise.all([
+				tracker.detectActivePlansForBranch(cwd, branch),
+				tracker.detectActiveNotesForBranch(cwd, branch),
+				tracker.detectUncommittedReferenceIds(cwd, branch),
+				selection.readExclusions(cwd),
+				tracker.loadPlansRegistry(cwd),
+			]);
+			// Join the display title on here rather than widening
+			// `detectUncommittedReferenceIds` (that triple is the QueueWorker's shape).
+			// The join has to happen SOMEWHERE CLI-side: IntelliJ was doing it host-side
+			// with its own `plans-load`, which is both a second round-trip and a second
+			// answer to "what is this reference called".
+			const referenceTitles = registry.references ?? {};
+			const references = referenceIds.map((r) => ({ ...r, title: referenceTitles[r.mapKey]?.title ?? r.mapKey }));
+			return {
+				plans,
+				notes,
+				references,
+				// Materialised the same way `context-list` and `selection-read` do —
+				// Gson turns an absent key into a null Set that throws on first use,
+				// so "nothing excluded" has to arrive as [].
+				exclusions: {
+					conversations: [...exclusions.conversations],
+					plans: [...exclusions.plans],
+					notes: [...exclusions.notes],
+					references: [...exclusions.references],
+					skills: [...(exclusions.skills ?? [])],
+				},
+			};
+		}
+		default:
+			throw new Error(`Unknown working-context operation "${operation}".`);
+	}
 }
 
 async function runSessionStateAction(cwd: string, request: JsonObject): Promise<unknown> {
@@ -753,9 +1125,13 @@ async function runSharedStoreAction(cwd: string, request: JsonObject): Promise<u
 				plans: [...value.plans],
 				notes: [...value.notes],
 				references: [...value.references],
-				// Optional on the persisted shape (it postdates the file), so an absent
-				// set reads as "nothing excluded" rather than being omitted from the
-				// response — a caller that saw the key vanish could not tell the two apart.
+				// Always present, even though `CommitExclusions.skills` is optional on the
+				// persisted shape — it postdates the file, so a selection written before
+				// skills were selectable has no such field. Omitting the key costs twice: a
+				// caller that saw it vanish could not tell "nothing excluded" from a CLI too
+				// old to know about skills, and the JVM adapter mirrors this shape
+				// field-for-field, where Gson turns an absent key into a null Set that throws
+				// on first use. So "nothing excluded" has to arrive as [], not as no key.
 				skills: [...(value.skills ?? [])],
 			};
 		}
@@ -1536,6 +1912,8 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 			return runConversationOverlayAction(cwd, request);
 		case "session-state":
 			return runSessionStateAction(cwd, request);
+		case "working-context":
+			return runWorkingContextAction(cwd, request);
 		case "repo-profile":
 			return runRepoProfileAction(cwd, request);
 		case "auth":
@@ -1846,7 +2224,19 @@ export function writeServeLine(obj: object): void {
  *     (shared by both the one-shot [executeIdeBridgeCommand] and the daemon
  *     loop below).
  */
-export async function runIdeBridgeServe(cwdDefault: string): Promise<void> {
+export interface RunIdeBridgeServeOptions {
+	/**
+	 * Override for the machine-global Claude plans dir. Mirrors
+	 * [DaemonServerOptions.plansDir], and for the same reason: every other watch
+	 * target is rooted at `cwdDefault`, but this one would otherwise arm on the
+	 * developer's real `~/.claude/plans/` and let an unrelated Claude Code
+	 * session write a `refresh` line into a test's captured stdout — between the
+	 * handshake and the response it is asserting on. Tests must set it.
+	 */
+	readonly plansDir?: string;
+}
+
+export async function runIdeBridgeServe(cwdDefault: string, options: RunIdeBridgeServeOptions = {}): Promise<void> {
 	setLogDir(cwdDefault);
 
 	// Last-resort guards — any un-caught throw would otherwise crash the daemon
@@ -1880,7 +2270,7 @@ export async function runIdeBridgeServe(cwdDefault: string): Promise<void> {
 	// Merging both into one process (scheme A') means the Kotlin host only
 	// spawns and manages a single Node child; notifications carry no `id`, so
 	// the host can route them by envelope `type` alone.
-	const watchers = startRefreshWatchers(cwdDefault);
+	const watchers = startRefreshWatchers(cwdDefault, options.plansDir);
 
 	const readline = await import("node:readline");
 	const rl = readline.createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
@@ -1909,18 +2299,26 @@ export async function runIdeBridgeServe(cwdDefault: string): Promise<void> {
 }
 
 /**
- * Debounced fs.watch on the two write outputs of the CLI-native git hooks:
- *   - `.jolli/jollimemory/git-op-queue/` (queue writes)
- *   - `<gitCommonDir>/refs/heads/jollimemory/summaries/` (orphan ref moves)
+ * Debounced fs.watch on the write outputs a host needs to hear about — the
+ * git-hook outputs (queue, orphan ref) plus the mid-session working-context
+ * pair (plans.json, `~/.claude/plans/`). The target list, its filename gates
+ * and the emitted payload all live in `computeWatchTargets` /
+ * `buildRefreshParams` so this server and the standalone `jolli daemon` cannot
+ * drift into watching or emitting different things.
  *
  * Bursts collapse into one refresh line per kind after the watcher's quiet
  * window. Notification envelope carries no `id` — the host distinguishes it
  * from a response by the absence of that field and routes by `type` alone.
  * When the target directory does not yet exist (typical for orphan-ref on a
- * fresh clone), start a retry timer that polls until the first summary lands
- * and arm the watcher then.
+ * fresh clone, or `~/.claude/plans/` before the user's first plan), start a
+ * retry timer that polls until it appears and arm the watcher then.
+ *
+ * `plansDir` is the test override — see [RunIdeBridgeServeOptions.plansDir].
  */
-function startRefreshWatchers(cwd: string): {
+function startRefreshWatchers(
+	cwd: string,
+	plansDir?: string,
+): {
 	watchers: DaemonWatcher[];
 	armRetries: NodeJS.Timeout[];
 } {
@@ -1928,17 +2326,18 @@ function startRefreshWatchers(cwd: string): {
 	const ARM_RETRY_MS = 5000;
 	const watchers: DaemonWatcher[] = [];
 	const armRetries: NodeJS.Timeout[] = [];
-	for (const target of computeWatchTargets(cwd)) {
+	for (const target of computeWatchTargets(cwd, { plansDir })) {
 		const watcher = new DaemonWatcher({
 			path: target.path,
 			debounceMs: DEBOUNCE_MS,
 			ensureDir: target.ensureDir,
-			onTrigger: () => {
+			filter: target.filter,
+			onTrigger: (names) => {
 				// JSON-RPC 2.0 server→client notification (no `id`).
 				writeServeLine({
 					jsonrpc: "2.0",
 					method: "refresh",
-					params: { kind: target.kind, cwd },
+					params: buildRefreshParams(target, cwd, names),
 				});
 			},
 		});

@@ -15,11 +15,11 @@ import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicUpdates
 import ai.jolli.jollimemory.core.TraceContext
 import ai.jolli.jollimemory.core.TranscriptEntry
+import ai.jolli.jollimemory.core.WorkingContext
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliMemoryService
 import ai.jolli.jollimemory.services.JolliShareService
-import ai.jolli.jollimemory.services.PlanService
 import ai.jolli.jollimemory.services.PrService
 import ai.jolli.jollimemory.toolwindow.views.SummaryHtmlBuilder
 import ai.jolli.jollimemory.toolwindow.views.SummaryMarkdownBuilder
@@ -2083,7 +2083,21 @@ class SummaryPanel(
                 service?.invalidateSummaryCache()
                 if (myGen != summaryGeneration) return@executeOnPooledThread
                 currentSummary = updatedSummary
-                PlanService.unassociatePlanFromCommit(slug, cwd)
+                // Dissociate from THIS commit: the CLI resolves the archive base
+                // and gates the delete on the row still belonging to `commitHash`,
+                // so dissociating an old summary can't wipe a row that has since
+                // been revived under the same slug. Read the hash off the local
+                // `updatedSummary`, not the `currentSummary` field — the field is
+                // mutable and the assignment above is generation-guarded, so on a
+                // late generation it still points at a DIFFERENT memory and the
+                // gate would be checked against the wrong commit.
+                WorkingContext.removePlan(cwd, slug, updatedSummary.commitHash)
+                // Then drop the visible `<branch>/plan--<slug>.md` from the Memory
+                // Bank folder, or it lingers as a ghost the memory no longer
+                // references. Registry removal does not imply it — the visible layer
+                // is generated, so nothing else prunes it. Branch comes off the same
+                // `updatedSummary` as the hash above, for the same reason.
+                WorkingContext.cleanupVisiblePlanArtifact(cwd, slug, updatedSummary.branch)
                 ApplicationManager.getApplication().invokeLater {
                     if (myGen != summaryGeneration) return@invokeLater
                     refreshHtml()
@@ -2238,52 +2252,89 @@ class SummaryPanel(
         }
     }
 
+    /**
+     * "+ Associate Plan" — enumerate `~/.claude/plans/`, then archive the pick
+     * onto this commit.
+     *
+     * The enumeration runs on a pooled thread and only the picker returns to the
+     * EDT. It is an ide-bridge round-trip, not the local `File.listFiles` it used
+     * to be: ~5-20 ms against a bound daemon, but 500 ms-2 s on the cold one-shot
+     * fallback, which on the EDT is a visible freeze and trips the platform's
+     * slow-operation assertion. `AddContextAction.addPlan` runs the same call the
+     * same way; keep the two in step.
+     */
     private fun handleAssociatePlan() {
-        ApplicationManager.getApplication().invokeLater {
-            val summary = currentSummary
-            val existingSlugs = (summary.plans ?: emptyList()).map { it.slug }.toSet()
-            val available = PlanService.listAvailablePlans(existingSlugs)
-            if (available.isEmpty()) {
-                Messages.showInfoMessage(project, "No plans available to associate.", "Associate Plan")
-                return@invokeLater
-            }
-            val items = available.map { "${it.title} (${it.slug}.md)" }
-            JBPopupFactory.getInstance()
-                .createPopupChooserBuilder(items)
-                .setTitle("Select a plan to associate")
-                .setItemChosenCallback { selectedItem ->
-                    val index = items.indexOf(selectedItem)
-                    if (index < 0) return@setItemChosenCallback
-                    val selected = available[index]
-                    // Snapshot AFTER the user picks — the popup itself may sit open
-                    // long enough for the identity to shift, and the write must
-                    // reflect the memory the picker was launched from (captured
-                    // in `summary` above).
-                    val myGen = summaryGeneration
-                    ApplicationManager.getApplication().executeOnPooledThread {
-                        if (myGen != summaryGeneration) return@executeOnPooledThread
-                        val planRef = PlanService.archivePlanForCommit(selected.slug, summary.commitHash, store, cwd)
-                        if (planRef == null) {
-                            ApplicationManager.getApplication().invokeLater {
-                                if (myGen != summaryGeneration) return@invokeLater
-                                Messages.showErrorDialog(project, "Failed to associate plan \"${selected.slug}\".", "Association Failed")
-                            }
-                            return@executeOnPooledThread
-                        }
-                        val updatedSummary = summary.copy(plans = (summary.plans ?: emptyList()) + planRef)
-                        store.storeSummary(updatedSummary, force = true)
-                        service?.invalidateSummaryCache()
-                        if (myGen != summaryGeneration) return@executeOnPooledThread
-                        currentSummary = updatedSummary
-                        ApplicationManager.getApplication().invokeLater {
-                            if (myGen != summaryGeneration) return@invokeLater
-                            refreshHtml()
-                        }
+        val summary = currentSummary
+        val existingSlugs = (summary.plans ?: emptyList()).map { it.slug }.toSet()
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val available = try {
+                WorkingContext.listAvailablePlans(cwd, existingSlugs)
+            } catch (e: Exception) {
+                LOG.warn("listAvailablePlans failed: ${e.message}")
+                ApplicationManager.getApplication().invokeLater {
+                    if (!project.isDisposed) {
+                        Messages.showErrorDialog(project, "Could not list plans: ${e.message}", "Associate Plan")
                     }
                 }
-                .createPopup()
-                .showInFocusCenter()
+                return@executeOnPooledThread
+            }
+            ApplicationManager.getApplication().invokeLater {
+                if (project.isDisposed) return@invokeLater
+                showAssociatePlanPicker(summary, available)
+            }
         }
+    }
+
+    /** EDT half of [handleAssociatePlan] — `summary` is the memory the picker was launched from. */
+    private fun showAssociatePlanPicker(
+        summary: CommitSummary,
+        available: List<WorkingContext.AvailablePlan>,
+    ) {
+        if (available.isEmpty()) {
+            Messages.showInfoMessage(project, "No plans available to associate.", "Associate Plan")
+            return
+        }
+        val items = available.map { "${it.title} (${it.slug}.md)" }
+        JBPopupFactory.getInstance()
+            .createPopupChooserBuilder(items)
+            .setTitle("Select a plan to associate")
+            .setItemChosenCallback { selectedItem ->
+                val index = items.indexOf(selectedItem)
+                if (index < 0) return@setItemChosenCallback
+                val selected = available[index]
+                // Snapshot AFTER the user picks — the popup itself may sit open
+                // long enough for the identity to shift, and the write must
+                // reflect the memory the picker was launched from (captured
+                // in `summary` above).
+                val myGen = summaryGeneration
+                ApplicationManager.getApplication().executeOnPooledThread {
+                    if (myGen != summaryGeneration) return@executeOnPooledThread
+                    val planRef = try {
+                        WorkingContext.archivePlanForCommit(cwd, selected.slug, summary.commitHash)
+                    } catch (e: Exception) {
+                        LOG.warn("archivePlanForCommit failed: ${e.message}")
+                        null
+                    }
+                    if (planRef == null) {
+                        ApplicationManager.getApplication().invokeLater {
+                            if (myGen != summaryGeneration) return@invokeLater
+                            Messages.showErrorDialog(project, "Failed to associate plan \"${selected.slug}\".", "Association Failed")
+                        }
+                        return@executeOnPooledThread
+                    }
+                    val updatedSummary = summary.copy(plans = (summary.plans ?: emptyList()) + planRef)
+                    store.storeSummary(updatedSummary, force = true)
+                    service?.invalidateSummaryCache()
+                    if (myGen != summaryGeneration) return@executeOnPooledThread
+                    currentSummary = updatedSummary
+                    ApplicationManager.getApplication().invokeLater {
+                        if (myGen != summaryGeneration) return@invokeLater
+                        refreshHtml()
+                    }
+                }
+            }
+            .createPopup()
+            .showInFocusCenter()
     }
 
     private fun handleCheckPrStatus() {
@@ -2706,11 +2757,9 @@ class SummaryPanel(
         if (guardedGen == null || guardedGen == summaryGeneration) {
             currentSummary = updatedSummary
         }
-        val registry = SessionTracker.loadPlansRegistry(cwd)
-        val entry = registry.plans[slug]
-        if (entry != null) {
-            SessionTracker.savePlansRegistry(registry.copy(plans = registry.plans + (slug to entry.copy(title = newTitle))), cwd)
-        }
+        // Registry-side sync is CLI-owned (it takes plans.lock and merges onto a
+        // fresh read) so this path runs the same write VS Code does.
+        WorkingContext.renamePlanTitle(cwd, slug, newTitle)
     }
 
     private fun getDiffForCommit(commitHash: String): String {

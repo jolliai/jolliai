@@ -67,6 +67,18 @@ class PinnedPanel(
 		border = JBUI.Borders.empty(6, 8)
 	}
 
+	// Deliberately on NEITHER listener list. A pinned row is rendered entirely from
+	// `pins.json` — [PinStore.readPins] is the only read [refresh] performs, and the
+	// title/badge it shows were snapshotted at pin time. `plans.json` is touched just
+	// once, in [openPinned], to resolve a click target. So a working-context event
+	// cannot change what this panel paints, and subscribing to one only bought a
+	// bridge round-trip plus a full row rebuild (which also drops hover state) on
+	// every mid-session plan edit in any project on the machine.
+	//
+	// The panel is refreshed explicitly by whoever writes pins.json — see
+	// `PlansPanel.pinItem` and the unpin path below. If pinned titles are ever made
+	// to resolve live out of the registry, THAT is when this joins the narrow list.
+
 	init {
 		add(rowsPanel, BorderLayout.NORTH)
 		renderEmpty()

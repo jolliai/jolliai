@@ -5,9 +5,10 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getPlansDir } from "../core/PlanService.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import { DAEMON_PROTOCOL } from "./DaemonProtocol.js";
-import { computeWatchTargets, runDaemonServer } from "./DaemonServer.js";
+import { buildRefreshParams, computeWatchTargets, runDaemonServer } from "./DaemonServer.js";
 
 // Mock the git subprocess helper so we can control `git rev-parse --git-common-dir`
 // output per-test. The default implementation delegates to the real function so
@@ -24,8 +25,11 @@ describe("computeWatchTargets", () => {
 		mockExec.mockReset();
 	});
 
-	it("returns the queue and orphan-ref targets rooted at cwd (main checkout)", () => {
-		const targets = computeWatchTargets("/repo", { gitCommonDir: join("/repo", ".git") });
+	it("returns the four watch targets rooted at cwd (main checkout)", () => {
+		const targets = computeWatchTargets("/repo", {
+			gitCommonDir: join("/repo", ".git"),
+			plansDir: "/home/u/.claude/plans",
+		});
 		expect(targets.map((t) => ({ kind: t.kind, path: t.path, ensureDir: t.ensureDir }))).toEqual([
 			{
 				kind: "queue",
@@ -39,7 +43,49 @@ describe("computeWatchTargets", () => {
 				path: join("/repo", ".git", "refs", "heads", "jollimemory", "summaries"),
 				ensureDir: false,
 			},
+			{
+				kind: "working-context",
+				path: join("/repo", ".jolli", "jollimemory"),
+				ensureDir: true,
+			},
+			{
+				kind: "claude-plans",
+				// Machine-global and not ours: never auto-created.
+				path: "/home/u/.claude/plans",
+				ensureDir: false,
+			},
 		]);
+	});
+
+	it("defaults the plans dir to the CLI's own getPlansDir() when no override is given", () => {
+		mockExec.mockReturnValueOnce("/repo/.git\n");
+		const targets = computeWatchTargets("/repo");
+		// Asserted against the shared helper rather than a second `~/.claude/plans`
+		// literal — the path is the CLI's to own, and a copy here would keep
+		// passing after the real one moved.
+		expect(targets.find((t) => t.kind === "claude-plans")?.path).toBe(getPlansDir());
+	});
+
+	it("gates the working-context target to plans.json so the dir's noisy neighbours never trigger", () => {
+		const filter = computeWatchTargets("/repo", { gitCommonDir: "/repo/.git" }).find(
+			(t) => t.kind === "working-context",
+		)?.filter;
+		expect(filter).toBeDefined();
+		expect(filter?.("plans.json")).toBe(true);
+		// The three files that share this directory and are written constantly.
+		expect(filter?.("debug.log")).toBe(false);
+		expect(filter?.("sessions.json")).toBe(false);
+		expect(filter?.("cursors.json")).toBe(false);
+	});
+
+	it("gates the claude-plans target to markdown and forwards the burst's filenames", () => {
+		const target = computeWatchTargets("/repo", { gitCommonDir: "/repo/.git" }).find(
+			(t) => t.kind === "claude-plans",
+		);
+		expect(target?.filter?.("my-plan.md")).toBe(true);
+		expect(target?.filter?.("notes.txt")).toBe(false);
+		// The only target that forwards names — see DaemonProtocol's `names`.
+		expect(target?.forwardNames).toBe(true);
 	});
 
 	it("uses the shared git common dir on a linked worktree", () => {
@@ -92,11 +138,51 @@ describe("computeWatchTargets", () => {
 	});
 });
 
+describe("buildRefreshParams", () => {
+	const target = { kind: "queue", path: "/p", ensureDir: true } as const;
+
+	it("omits `names` entirely for a target that does not forward them", () => {
+		const params = buildRefreshParams(target, "/repo", new Set(["a.md"]));
+		expect(params).toEqual({ kind: "queue", cwd: "/repo" });
+		// Absent, not empty — a client must be able to tell "this kind never
+		// carries names" from "this burst reported none".
+		expect("names" in params).toBe(false);
+	});
+
+	it("forwards the burst's names sorted so the wire is deterministic", () => {
+		const params = buildRefreshParams(
+			{ kind: "claude-plans", path: "/p", ensureDir: false, forwardNames: true },
+			"/repo",
+			// Insertion order is platform event-delivery order, which varies run
+			// to run; the emitted array must not.
+			new Set(["c.md", "a.md", "b.md"]),
+		);
+		expect(params).toEqual({ kind: "claude-plans", cwd: "/repo", names: ["a.md", "b.md", "c.md"] });
+	});
+
+	it("forwards an empty array when the platform reported no filenames", () => {
+		const params = buildRefreshParams(
+			{ kind: "claude-plans", path: "/p", ensureDir: false, forwardNames: true },
+			"/repo",
+			new Set(),
+		);
+		expect(params.names).toEqual([]);
+	});
+});
+
 describe("runDaemonServer", () => {
 	let root: string;
+	/**
+	 * Scratch stand-in for the machine-global `~/.claude/plans/`. Every test
+	 * passes it: without the override the daemon arms a real watcher on the
+	 * developer's own plans dir, and a Claude Code session running alongside the
+	 * suite would inject refresh lines into these assertions.
+	 */
+	let plansDir: string;
 
 	beforeEach(() => {
 		root = mkdtempSync(join(tmpdir(), "daemon-server-"));
+		plansDir = join(root, "claude-plans");
 		mockExec.mockReset();
 		// Default to "not a git repo" so tests don't depend on the host's git.
 		mockExec.mockImplementation(() => {
@@ -114,7 +200,7 @@ describe("runDaemonServer", () => {
 		const chunks: string[] = [];
 		stdout.on("data", (buf) => chunks.push(String(buf)));
 
-		const done = runDaemonServer({ cwd: root, stdin, stdout, debounceMs: 10 });
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 10 });
 
 		// End stdin to trigger shutdown once ready has been written.
 		stdin.end();
@@ -135,7 +221,7 @@ describe("runDaemonServer", () => {
 		const chunks: string[] = [];
 		stdout.on("data", (buf) => chunks.push(String(buf)));
 
-		const done = runDaemonServer({ cwd: root, stdin, stdout, debounceMs: 50 });
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 50 });
 
 		// The queue dir is ensureDir=true, so it exists right after start(). Give
 		// fs.watch a beat to arm on all platforms before writing.
@@ -167,12 +253,95 @@ describe("runDaemonServer", () => {
 		await done;
 	});
 
+	it("emits claude-plans with the new plan's filename, and stays silent for a non-markdown sibling", async () => {
+		mkdirSync(plansDir, { recursive: true });
+		const stdout = new PassThrough();
+		const stdin = new PassThrough();
+		const chunks: string[] = [];
+		stdout.on("data", (buf) => chunks.push(String(buf)));
+
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 50 });
+		await sleep(150);
+
+		// The noise first: if the `.md` gate were missing this would produce its
+		// own refresh, and the assertion below could not tell the two apart.
+		writeFileSync(join(plansDir, "scratch.txt"), "ignored");
+		writeFileSync(join(plansDir, "add-dark-mode.md"), "# Add dark mode");
+
+		await vi.waitFor(
+			() => {
+				const refresh = chunks
+					.join("")
+					.split("\n")
+					.filter(Boolean)
+					.map((l) => JSON.parse(l))
+					.find((m) => m.method === "refresh" && m.params.kind === "claude-plans");
+				expect(refresh).toBeTruthy();
+				// Raw directory entry, not a slug — turning `<slug>.md` into a slug
+				// is `plans-register-new`'s job, not the wire's.
+				expect(refresh.params).toEqual({
+					kind: "claude-plans",
+					cwd: root,
+					names: ["add-dark-mode.md"],
+				});
+			},
+			{ timeout: 10_000, interval: 20 },
+		);
+
+		stdin.end();
+		await done;
+	});
+
+	it("emits working-context for plans.json but not for the noisy files beside it", async () => {
+		const stateDir = join(root, ".jolli", "jollimemory");
+		const stdout = new PassThrough();
+		const stdin = new PassThrough();
+		const chunks: string[] = [];
+		stdout.on("data", (buf) => chunks.push(String(buf)));
+
+		// ensureDir=true on this target, so the dir exists right after start().
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 50 });
+		await sleep(150);
+
+		// debug.log is the reason this target is gated at all — it is written many
+		// times a second in a real session.
+		writeFileSync(join(stateDir, "debug.log"), "noise\n");
+		await sleep(200);
+		const kindsAfterNoise = chunks
+			.join("")
+			.split("\n")
+			.filter(Boolean)
+			.map((l) => JSON.parse(l))
+			.filter((m) => m.method === "refresh")
+			.map((m) => m.params.kind);
+		expect(kindsAfterNoise).not.toContain("working-context");
+
+		writeFileSync(join(stateDir, "plans.json"), "{}");
+		await vi.waitFor(
+			() => {
+				const refresh = chunks
+					.join("")
+					.split("\n")
+					.filter(Boolean)
+					.map((l) => JSON.parse(l))
+					.find((m) => m.method === "refresh" && m.params.kind === "working-context");
+				expect(refresh).toBeTruthy();
+				// This kind carries no names — the client re-reads plans.json.
+				expect(refresh.params).toEqual({ kind: "working-context", cwd: root });
+			},
+			{ timeout: 10_000, interval: 20 },
+		);
+
+		stdin.end();
+		await done;
+	});
+
 	it("keeps polling silently while the retry target remains absent", async () => {
 		vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
 		try {
 			const stdout = new PassThrough();
 			const stdin = new PassThrough();
-			const done = runDaemonServer({ cwd: root, stdin, stdout, debounceMs: 10 });
+			const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 10 });
 
 			// Target still doesn't exist — advance a couple of intervals so the
 			// retry callback runs, hits the `watcher.start() === false` path, and
@@ -192,7 +361,7 @@ describe("runDaemonServer", () => {
 		try {
 			const stdout = new PassThrough();
 			const stdin = new PassThrough();
-			const done = runDaemonServer({ cwd: root, stdin, stdout, debounceMs: 10 });
+			const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 10 });
 
 			// The orphan-ref target (`.git/refs/heads/jollimemory/summaries`) doesn't
 			// exist at startup, so a retry interval was armed. Create the dir now and
@@ -217,7 +386,7 @@ describe("runDaemonServer", () => {
 		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
 
 		try {
-			const done = runDaemonServer({ cwd: root });
+			const done = runDaemonServer({ cwd: root, plansDir });
 			// Fire 'end' on the real process.stdin so the daemon shuts down.
 			stdinRef.emit("end");
 			await done;
@@ -240,7 +409,7 @@ describe("runDaemonServer", () => {
 		// and shut down cleanly when we fire the `end` event.
 		const stdin = new EventEmitter() as unknown as NodeJS.ReadableStream;
 
-		const done = runDaemonServer({ cwd: root, stdin, stdout, debounceMs: 10 });
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 10 });
 		(stdin as unknown as EventEmitter).emit("end");
 		await done;
 	});
@@ -248,9 +417,46 @@ describe("runDaemonServer", () => {
 	it("treats a stdin 'close' event as shutdown", async () => {
 		const stdout = new PassThrough();
 		const stdin = new PassThrough();
-		const done = runDaemonServer({ cwd: root, stdin, stdout, debounceMs: 10 });
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 10 });
 
 		(stdin as unknown as EventEmitter).emit("close");
 		await done;
+	});
+});
+
+// A source-shape assertion, because nothing else can see this regress: a new static
+// import here keeps the types correct, passes lint, and leaves every test green —
+// the only thing that changes is the cold-start latency of `jolli ide-bridge`, which
+// imports this module statically while deferring all of its own handler work behind
+// `await import(...)` for exactly that reason. `getPlansDir` already leaked in once
+// through `PlanService`, making SummaryStore → OrphanBranchStorage / GitOps, plus
+// SessionTracker / ReferenceStore / Locks, eager for every such process (~4 ms of
+// leaf-only imports vs ~28 ms measured under tsx). Keep this list on leaves.
+describe("cold-start import graph", () => {
+	it("statically imports only node builtins and leaf modules", async () => {
+		const { readFile } = await import("node:fs/promises");
+		const source = await readFile(new URL("./DaemonServer.ts", import.meta.url), "utf-8");
+
+		// Deliberately narrow: each entry's own transitive imports are node builtins
+		// or other leaves. Widening this set is the decision the test exists to force
+		// someone to make on purpose rather than by autocomplete.
+		const ALLOWED_LEAF_MODULES = new Set([
+			"../core/PlanPaths.js",
+			"../Logger.js",
+			"../util/Subprocess.js",
+			"./DaemonNotifier.js",
+			"./DaemonProtocol.js",
+			"./DaemonWatcher.js",
+		]);
+
+		// Counted separately so a regex that fails to match a new import shape (a
+		// side-effect `import "./x.js"`, say) fails loudly instead of passing on an
+		// empty result.
+		const importStatements = [...source.matchAll(/^import\b/gm)].length;
+		const specifiers = [...source.matchAll(/^import\b[\s\S]*?from\s+"([^"]+)";/gm)].map((m) => m[1]);
+		expect(specifiers).toHaveLength(importStatements);
+
+		const offenders = specifiers.filter((s) => !s.startsWith("node:") && !ALLOWED_LEAF_MODULES.has(s));
+		expect(offenders).toEqual([]);
 	});
 });

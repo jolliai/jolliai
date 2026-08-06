@@ -3,12 +3,12 @@ package ai.jolli.jollimemory.toolwindow
 import ai.jolli.jollimemory.core.ActiveConversationItem
 import ai.jolli.jollimemory.core.ActiveSessionAggregator
 import ai.jolli.jollimemory.core.CommitSelectionStore
-import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.SkillsProjection
 import ai.jolli.jollimemory.core.StoredSession
 import ai.jolli.jollimemory.core.ConversationUsage
 import ai.jolli.jollimemory.core.TranscriptMessageCounter
 import ai.jolli.jollimemory.core.TranscriptSource
+import ai.jolli.jollimemory.core.WorkingContext
 import ai.jolli.jollimemory.core.references.SourceDisplay
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliMemoryService
@@ -36,7 +36,6 @@ import org.cef.handler.CefRequestHandlerAdapter
 import org.cef.network.CefRequest
 import java.awt.BorderLayout
 import java.awt.Font
-import java.io.File
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.JTextArea
@@ -62,6 +61,10 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         // Live-refresh when the user toggles a conversation / context / file selection
         // in the sidebar while this review is open.
         service?.addSelectionListener(statusListener)
+        // …and when the context itself moves. `gatherContext` reads `activeForCommit`,
+        // so a plan or reference landing mid-session changes what this review claims
+        // the next commit will archive — without touching status.
+        service?.addWorkingContextListener(statusListener)
     }
 
     private fun createContent(): JComponent {
@@ -186,14 +189,38 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         val (_, ins, del) = diffStats(branch)
         val selectedFiles = changedFiles()
 
-        // The review must show exactly what the next commit will save, so honor the
-        // same sidebar exclusions the PostCommitHook applies (conversations unchecked
-        // in the CONVERSATIONS list, plans/notes/references unchecked in CONTEXT).
-        val exclusions = try {
-            CommitSelectionStore.readExclusions(cwd)
-        } catch (_: Exception) {
-            CommitSelectionStore.CommitExclusions()
+        // ONE bridge round-trip for the whole review: what the next commit would
+        // claim AND the exclude set that decides which of it is struck through.
+        // This used to be three (`active-for-commit`, `selection-read`, and a raw
+        // `plans-load` purely to label the reference rows) — affordable when the
+        // panel only reloaded on demand, not now that it repaints whenever a plan
+        // file is saved anywhere on the machine.
+        //
+        // The review must show exactly what the next commit will save, so it honors
+        // the same sidebar exclusions the PostCommitHook applies (conversations
+        // unchecked in the CONVERSATIONS list, plans/notes/references in CONTEXT).
+        // KNOWN GAP, deliberately not addressed in this change — not a review finding.
+        //
+        // An empty fallback makes a transport hiccup read as "this memory will capture
+        // nothing", and this is now one bridge round-trip where it used to be local
+        // file reads, so the failure is likelier than it was. [PlansPanel] solves its
+        // version of this by keeping the last rendered rows, but that answer is WRONG
+        // here: this is a pre-commit review, so stale rows would tell the user a plan
+        // is included moments before they commit without it. Neither empty nor stale is
+        // honest — the panel needs a third, explicit "context unavailable" state, the
+        // way [ActiveConversationsPanel] marks failed sources rather than hiding them.
+        //
+        // That is new user-facing copy and a new render branch, i.e. a UI decision
+        // rather than a bug fix, so it is scoped out of this change on purpose. Until
+        // it lands, empty-and-logged is the lesser evil: it under-claims what the
+        // memory will hold instead of over-claiming it.
+        val active = try {
+            WorkingContext.activeForCommit(cwd)
+        } catch (e: Exception) {
+            LOG.warn("activeForCommit failed, review will show no context: ${e.message}")
+            WorkingContext.ActiveForCommit()
         }
+        val exclusions = active.exclusions
 
         // Show ALL active conversations, not just the included ones: excluded rows stay
         // visible (struck through) with a + to add them back — the mockup's inline
@@ -217,7 +244,7 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             )
         }
 
-        val context = gatherContext(exclusions)
+        val context = gatherContext(active)
         val detectedTicket = context.firstOrNull { it.tag == "L" || it.tag == "J" }
             ?.let { Regex("[A-Z]+-\\d+").find(it.title)?.value }
             ?: Regex("[A-Z]+-\\d+").find(branch)?.value
@@ -284,8 +311,10 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
      * Flips a working-memory item's commit-selection exclusion, then refreshes.
      *
      * Must be called OFF the EDT — every branch below makes at least one ide-bridge
-     * round trip. It touches no Swing itself, so that is safe: `reload()` and both
-     * panel `refresh()`es re-pool and hop back through `invokeLater` on their own.
+     * round trip (the CLI owns commit-selection.json and its lock), so even the
+     * daemon's ~5-20 ms would stall the EDT and a cold one-shot spawn far worse. The
+     * caller pools; this touches no Swing itself and hands the refresh back to the EDT
+     * through [afterToggleExclude].
      */
     private fun handleToggleExclude(kind: String, key: String, excluded: Boolean) {
         try {
@@ -315,6 +344,10 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             LOG.warn("toggleExclude failed: ${e.message}")
             return
         }
+        SwingUtilities.invokeLater { afterToggleExclude(kind) }
+    }
+
+    private fun afterToggleExclude(kind: String) {
         val svc = service
         if (svc == null) {
             reload()
@@ -387,30 +420,41 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
     }
 
     /**
-     * Uncommitted plans + notes on the current branch, plus all references —
-     * minus anything the user unchecked in the CONTEXT list (same exclusion keys
-     * the CONTEXT panel and PostCommitHook use: plan slug, note id, reference map key).
+     * Rows for the CONTEXT section of the review, built from the already-fetched
+     * [WorkingContext.ActiveForCommit] — minus nothing: anything the user unchecked
+     * stays listed and struck through (same exclusion keys the CONTEXT panel and
+     * PostCommitHook use: plan slug, note id, reference map key).
+     *
+     * Takes the payload rather than fetching it so the whole review is one
+     * round-trip; see [gatherView].
      */
-    private fun gatherContext(exclusions: CommitSelectionStore.CommitExclusions): List<WmContext> {
+    private fun gatherContext(active: WorkingContext.ActiveForCommit): List<WmContext> {
+        val exclusions = active.exclusions
         val out = mutableListOf<WmContext>()
         try {
-            val registry = SessionTracker.loadPlansRegistry(cwd)
-            // No branch filter on any kind: uncommitted working-area items follow the
-            // user across branches (matches CLI/VS Code). `branch` is stamped but not
-            // filtered on; only committed memory is branch-tagged.
-            // Excluded items stay listed (struck through, with a + to add back), so
-            // only committed/ignored ones are dropped. `excluded` drives the toggle.
-            registry.plans.values.forEach { p ->
-                if (p.ignored == true || p.commitHash != null) return@forEach
-                if (!File(p.sourcePath).exists()) return@forEach
+            // The CLI decides what the next commit would claim — this is the
+            // archive-selection set, deliberately narrower than the CONTEXT panel's
+            // browsable list, and it already drops plans and notes whose source file
+            // is gone (the archive loops cannot read content they do not have). Do
+            // NOT re-filter here: this list used to carry its own
+            // `File(sourcePath).exists()` check, which is a CLI rule restated in
+            // Kotlin and would go stale the moment the worker's skip condition
+            // changed. It applies no branch filter either — uncommitted working-area
+            // items follow the user across a checkout and bind to a branch only at
+            // commit. Excluded items stay listed (struck through, with a + to add
+            // back), so `excluded` drives the toggle rather than dropping the row.
+            active.plans.forEach { p ->
                 out.add(WmContext("P", p.title, "plans", p.slug, p.slug in exclusions.plans))
             }
-            registry.notes?.values?.forEach { n ->
-                if (n.ignored == true || n.commitHash != null) return@forEach
+            active.notes.forEach { n ->
                 out.add(WmContext("N", n.title, "notes", n.id, n.id in exclusions.notes))
             }
-            registry.references?.forEach { (mapKey, r) ->
-                out.add(WmContext(referenceTag(r.source), r.title, "references", mapKey, mapKey in exclusions.references))
+            // Title comes from the payload — the CLI reads it off the same registry
+            // row it derived the mapKey from. This used to be a second `plans-load`
+            // here purely to label these rows, i.e. a host-side title rule.
+            active.references.forEach { r ->
+                val title = r.title ?: r.mapKey
+                out.add(WmContext(referenceTag(r.source), title, "references", r.mapKey, r.mapKey in exclusions.references))
             }
             // ONE aggregate row for every captured skill, matching the sidebar CONTEXT
             // list and VS Code. Not read off `registry.skills`: a skill row survives
@@ -437,6 +481,7 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
     fun dispose() {
         service?.removeStatusListener(statusListener)
         service?.removeSelectionListener(statusListener)
+        service?.removeWorkingContextListener(statusListener)
         jsQuery?.dispose()
         browser?.dispose()
     }

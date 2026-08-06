@@ -8,6 +8,7 @@ import ai.jolli.jollimemory.core.TranscriptSource
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.ui.JBColor
@@ -53,6 +54,14 @@ class ActiveConversationsPanel(
 
 	private var conversations: List<ActiveConversationItem> = emptyList()
 	private var failedSources: List<TranscriptSource> = emptyList()
+
+	/**
+	 * The last exclude set successfully read from the CLI, reused when a later read
+	 * fails so a transient bridge error cannot flip every checkbox to "included".
+	 * Empty until the first successful read, where that is the honest answer.
+	 */
+	@Volatile
+	private var lastKnownExclusions = CommitSelectionStore.CommitExclusions()
 
 	/** Whether the user expanded past the 6-row cap (via "Show N more"). */
 	private var expanded = false
@@ -130,7 +139,20 @@ class ActiveConversationsPanel(
 		} catch (e: Exception) {
 			ActiveConversationsResult(emptyList(), TranscriptSource.entries.toList())
 		}
-		val exclusions = CommitSelectionStore.readExclusions(cwd)
+		// Reading the exclude set is an ide-bridge call (the CLI owns
+		// commit-selection.json). A transport failure must not blank the list that
+		// was just loaded above — but it must not silently INVERT the checkboxes
+		// either: falling back to an empty set renders every conversation as
+		// included, which is the opposite of what a user who excluded some of them
+		// has on disk, and one glance at that lies about what the next memory will
+		// capture. Reuse the last set we actually read instead; only the very first
+		// load has nothing to fall back to, and there "nothing excluded" is true.
+		val exclusions = try {
+			CommitSelectionStore.readExclusions(cwd).also { lastKnownExclusions = it }
+		} catch (e: Exception) {
+			LOG.warn("readExclusions failed, reusing the last known exclude set: ${e.message}")
+			lastKnownExclusions
+		}
 		val itemsWithSelection = result.items.map { item ->
 			val key = CommitSelectionStore.conversationKey(item.source, item.sessionId)
 			item.copy(isSelected = key !in exclusions.conversations)
@@ -218,5 +240,9 @@ class ActiveConversationsPanel(
 			ai.jolli.jollimemory.core.PinStore.pin(cwd, "conversations", key, title, item.source.name)
 			SwingUtilities.invokeLater { service.panelRegistry?.pinnedPanel?.refresh() }
 		}
+	}
+
+	private companion object {
+		val LOG: Logger = Logger.getInstance(ActiveConversationsPanel::class.java)
 	}
 }

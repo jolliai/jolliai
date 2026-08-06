@@ -171,6 +171,13 @@ data class Reference(
  * Holds one row per external reference, keyed `<source>:<nativeId>`.
  * A reference is DELETED from the registry when its commit lands — its
  * value-snapshot lives on in [ReferenceCommitRef].
+ *
+ * Deliberately carries NO `branch`: an uncommitted reference belongs to the
+ * worktree, follows the user across a checkout, and binds to a branch only when
+ * a commit claims it. The CLI strips any `branch` it finds on load (see
+ * `LEGACY_REFERENCE_FIELDS` in `cli/src/core/SessionTracker.ts`), so a field
+ * here would deserialize to null on every read anyway. Mirror of the CLI's
+ * `ReferenceEntry` in `cli/src/Types.ts` — keep the two in step.
  */
 data class ReferenceEntry(
 	val source: SourceId,
@@ -182,17 +189,6 @@ data class ReferenceEntry(
 	val addedAt: String,
 	val updatedAt: String,
 	val sourceToolName: String,
-	/**
-	 * Branch the reference was last captured on. Nullable/blank for legacy rows
-	 * written before branch-scoping; those are treated as visible on every branch
-	 * (same graceful fallback as [ai.jolli.jollimemory.core.PlanEntry.branch] /
-	 * [ai.jolli.jollimemory.core.NoteEntry.branch]). Stamped by the CLI's
-	 * `TranscriptReferenceDiscovery.upsertReferenceEntry`
-	 * (`cli/src/core/references/TranscriptReferenceDiscovery.ts`) and filtered
-	 * at the CONTEXT / Working Memory display sites + the post-commit archive
-	 * selection.
-	 */
-	val branch: String? = null,
 )
 
 /**

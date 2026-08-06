@@ -285,16 +285,23 @@ const {
 	mockListAvailablePlans,
 	mockArchivePlanForCommit,
 	mockRemovePlan,
+	mockRenamePlanTitle,
 } = vi.hoisted(() => ({
 	mockListAvailablePlans: vi.fn().mockReturnValue([]),
 	mockArchivePlanForCommit: vi.fn().mockResolvedValue(null),
 	mockRemovePlan: vi.fn().mockResolvedValue(undefined),
+	mockRenamePlanTitle: vi.fn().mockResolvedValue(undefined),
 }));
 
+// A factory mock replaces the module wholesale, so every named import the SUT
+// pulls from PlanService has to appear here — an omitted one throws at call
+// time ("No export is defined on the mock"), not at import time, so it surfaces
+// as an unrelated-looking assertion failure inside whichever handler used it.
 vi.mock("../core/PlanService.js", () => ({
 	listAvailablePlans: mockListAvailablePlans,
 	archivePlanForCommit: mockArchivePlanForCommit,
 	removePlan: mockRemovePlan,
+	renamePlanTitle: mockRenamePlanTitle,
 }));
 
 const {
@@ -3566,7 +3573,15 @@ describe("SummaryWebviewPanel", () => {
 					workspaceRoot,
 					true,
 				);
-				expect(mockSavePlansRegistry).toHaveBeenCalled();
+				// The registry-side rename is CLI-owned now: syncPlanTitle hands the
+				// new title to PlanService.renamePlanTitle (which takes plans.lock and
+				// merges onto a fresh read) instead of running its own
+				// loadPlansRegistry → mutate → savePlansRegistry cycle here.
+				expect(mockRenamePlanTitle).toHaveBeenCalledWith(
+					"my-plan",
+					"Updated Title",
+					workspaceRoot,
+				);
 			});
 		});
 

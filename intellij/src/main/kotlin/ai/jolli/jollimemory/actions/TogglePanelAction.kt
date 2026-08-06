@@ -3,6 +3,7 @@ package ai.jolli.jollimemory.actions
 import ai.jolli.jollimemory.toolwindow.CollapsiblePanel
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.ToggleAction
+import com.intellij.openapi.project.DumbAware
 
 /**
  * Toggle action for showing/hiding a collapsible panel in the tool window gear menu.
@@ -12,7 +13,7 @@ import com.intellij.openapi.actionSystem.ToggleAction
  */
 class TogglePanelAction(
     private val panel: CollapsiblePanel,
-) : ToggleAction(panel.getTitle(), "Show or hide the ${panel.getTitle()} panel", null) {
+) : ToggleAction(panel.getTitle(), "Show or hide the ${panel.getTitle()} panel", null), DumbAware {
 
     override fun isSelected(e: AnActionEvent): Boolean = panel.isPanelVisible()
 

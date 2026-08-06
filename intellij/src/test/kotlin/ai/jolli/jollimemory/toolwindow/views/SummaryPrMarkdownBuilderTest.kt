@@ -254,7 +254,7 @@ class SummaryPrMarkdownBuilderTest {
         @Test
         fun `includes plans with URLs as links`() {
             val plans = listOf(
-                PlanReference("p1", "My Plan", 2, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", jolliPlanDocUrl = "https://jolli.ai/plans/1"),
+                PlanReference("p1", "My Plan", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", jolliPlanDocUrl = "https://jolli.ai/plans/1"),
             )
             val md = SummaryPrMarkdownBuilder.buildPrMarkdown(makeSummary(plans = plans))
             md shouldContain "## Plans & Notes"
@@ -264,7 +264,7 @@ class SummaryPrMarkdownBuilderTest {
         @Test
         fun `includes plans without URLs as plain text`() {
             val plans = listOf(
-                PlanReference("p1", "Local Plan", 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+                PlanReference("p1", "Local Plan", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
             )
             val md = SummaryPrMarkdownBuilder.buildPrMarkdown(makeSummary(plans = plans))
             md shouldContain "- Local Plan"
@@ -281,7 +281,7 @@ class SummaryPrMarkdownBuilderTest {
 
         @Test
         fun `shows combined count for plans and notes`() {
-            val plans = listOf(PlanReference("p1", "Plan", 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))
+            val plans = listOf(PlanReference("p1", "Plan", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))
             val notes = listOf(NoteReference("n1", "Note", NoteFormat.markdown, addedAt = "2026-01-01T00:00:00Z", updatedAt = "2026-01-01T00:00:00Z"))
             val md = SummaryPrMarkdownBuilder.buildPrMarkdown(makeSummary(plans = plans, notes = notes))
             md shouldContain "## Plans & Notes (2)"

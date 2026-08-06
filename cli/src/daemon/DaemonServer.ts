@@ -18,15 +18,25 @@
  *     up would miss every `update-ref` after the very first `summaries/` dir
  *     creation. NOT auto-created — this is git-owned and only appears once the
  *     first summary lands.
+ *   - `.jolli/jollimemory/` gated to `plans.json` — working-area context
+ *     (plans / notes / references) changing MID-session. Gated because this
+ *     directory also carries `debug.log`, `sessions.json` and `cursors.json`,
+ *     which are written far too often to refresh a client on.
+ *   - `~/.claude/plans/` gated to `*.md` — new plan files, which is the only
+ *     signal that exists before the agent's turn ends (the StopHook writes
+ *     plans.json only at Stop). Machine-global, so EVERY project's daemon sees
+ *     every project's plans; attribution is the `plans-register-new` handler's
+ *     job, not this watcher's.
  *
  * All events collapse into a single `refresh` notification per kind after a
- * `debounceMs` quiet window (default 300ms). The notification carries only
- * `kind + cwd`; clients treat it as "reload from source of truth", not a diff.
- * That coarseness is deliberate — a byte-level diff channel is a read-side
- * feature and belongs to a later slice.
+ * `debounceMs` quiet window (default 300ms). The notification carries
+ * `kind + cwd`, and for `claude-plans` the burst's filenames; clients treat it
+ * as "reload from source of truth", not a diff. That coarseness is deliberate —
+ * a byte-level diff channel is a read-side feature and belongs to a later slice.
  */
 
 import { isAbsolute, join } from "node:path";
+import { getPlansDir } from "../core/PlanPaths.js";
 import { createLogger } from "../Logger.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import { DaemonNotifier } from "./DaemonNotifier.js";
@@ -50,12 +60,42 @@ export interface DaemonServerOptions {
 	readonly debounceMs?: number;
 	readonly stdout?: NodeJS.WritableStream;
 	readonly stdin?: NodeJS.ReadableStream;
+	/**
+	 * Override for the machine-global Claude plans dir. Tests must set this:
+	 * every other watch target is rooted at their scratch `cwd`, but this one
+	 * would otherwise arm on the developer's real `~/.claude/plans/` and let an
+	 * unrelated Claude Code session emit refresh lines into the assertions.
+	 */
+	readonly plansDir?: string;
 }
 
 export interface WatchTarget {
 	readonly kind: RefreshKind;
 	readonly path: string;
 	readonly ensureDir: boolean;
+	/** Per-event filename gate — see `DaemonWatcher.filter`. */
+	readonly filter?: (name: string) => boolean;
+	/** Emit the burst's filenames as `params.names`. See `DaemonProtocol`. */
+	readonly forwardNames?: boolean;
+}
+
+/**
+ * Builds the `refresh` notification params for one settled burst.
+ *
+ * Shared by both hosts of these watchers — `jolli daemon` (below) and
+ * `jolli ide-bridge-serve` (`IdeBridgeCommand.startRefreshWatchers`) — so the
+ * two cannot drift into emitting different payloads for the same target. A
+ * client receives the identical line whichever process is running.
+ */
+export function buildRefreshParams(
+	target: WatchTarget,
+	cwd: string,
+	names: ReadonlySet<string>,
+): { kind: RefreshKind; cwd: string; names?: ReadonlyArray<string> } {
+	if (!target.forwardNames) return { kind: target.kind, cwd };
+	// Sorted so the wire is deterministic: Set iteration follows insertion
+	// order, which is platform event-delivery order and varies run to run.
+	return { kind: target.kind, cwd, names: [...names].sort() };
 }
 
 /**
@@ -89,10 +129,17 @@ export interface ComputeWatchTargetsOptions {
 	 * omit it and let the function resolve it from the cwd.
 	 */
 	readonly gitCommonDir?: string;
+	/**
+	 * Override for the machine-global Claude plans dir. Same reason as
+	 * `gitCommonDir`: keeps the function pure for tests, which must not depend
+	 * on (or write to) the developer's real `~/.claude/plans/`.
+	 */
+	readonly plansDir?: string;
 }
 
 export function computeWatchTargets(cwd: string, options: ComputeWatchTargetsOptions = {}): ReadonlyArray<WatchTarget> {
 	const gitCommonDir = options.gitCommonDir ?? resolveGitCommonDir(cwd);
+	const plansDir = options.plansDir ?? getPlansDir();
 	return [
 		{
 			kind: "queue",
@@ -108,6 +155,26 @@ export function computeWatchTargets(cwd: string, options: ComputeWatchTargetsOpt
 			// inside. See `Logger.ORPHAN_BRANCH` for the branch name that shapes this.
 			path: join(gitCommonDir, "refs", "heads", "jollimemory", "summaries"),
 			ensureDir: false,
+		},
+		{
+			kind: "working-context",
+			// The per-project state dir, gated to the ONE file in it that carries
+			// working-area context. Everything else here (debug.log above all)
+			// changes constantly and must never reach a client.
+			path: join(cwd, ".jolli", "jollimemory"),
+			ensureDir: true,
+			filter: (name) => name === "plans.json",
+		},
+		{
+			kind: "claude-plans",
+			// Machine-global and NOT ours, so never auto-created — it appears the
+			// first time Claude Code writes a plan, and the caller's arm-retry
+			// loop picks it up then.
+			path: plansDir,
+			ensureDir: false,
+			filter: (name) => name.endsWith(".md"),
+			// The one target whose names matter: see DaemonProtocol's `names`.
+			forwardNames: true,
 		},
 	];
 }
@@ -140,16 +207,17 @@ export function runDaemonServer(options: DaemonServerOptions): Promise<void> {
 	// change that pushed the timer late (or removed it twice) would corrupt the
 	// list without any visible failure.
 	const armRetries = new Set<NodeJS.Timeout>();
-	for (const target of computeWatchTargets(cwd)) {
+	for (const target of computeWatchTargets(cwd, { plansDir: options.plansDir })) {
 		const watcher = new DaemonWatcher({
 			path: target.path,
 			debounceMs,
 			ensureDir: target.ensureDir,
-			onTrigger: () => {
+			filter: target.filter,
+			onTrigger: (names) => {
 				notifier.emit({
 					jsonrpc: "2.0",
 					method: "refresh",
-					params: { kind: target.kind, cwd },
+					params: buildRefreshParams(target, cwd, names),
 				});
 			},
 		});

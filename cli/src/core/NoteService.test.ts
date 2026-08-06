@@ -56,7 +56,7 @@ const { mockCreateHash, mockRandomBytes } = vi.hoisted(() => ({
 
 // ─── vi.mock declarations ────────────────────────────────────────────────────
 
-vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
+vi.mock("./SessionTracker.js", () => ({
 	loadPlansRegistry: mockLoadPlansRegistry,
 	loadPlansRegistryWithStatus: mockLoadPlansRegistryWithStatus,
 	savePlansRegistry: mockSavePlansRegistry,
@@ -69,21 +69,18 @@ vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 
 // plans.lock passthrough — run the RMW body inline (no real lock file I/O on the
 // synthetic CWD). The lock contract is covered in cli/src/core/Locks.test.ts.
-vi.mock("../../../cli/src/core/Locks.js", () => ({
+vi.mock("./Locks.js", () => ({
 	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
 }));
 
-vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
+vi.mock("./SummaryStore.js", () => ({
 	storeNotes: mockStoreNotes,
 }));
 
-vi.mock("../../../cli/src/Logger.js", () => ({
+vi.mock("../Logger.js", () => ({
 	getJolliMemoryDir: mockGetJolliMemoryDir,
 	isManuallyDisabled: () => false,
-}));
-
-vi.mock("../util/Logger.js", () => ({
-	log: { info, warn, error, debug },
+	createLogger: () => ({ info, warn, error, debug }),
 }));
 
 vi.mock("node:fs", () => ({
@@ -643,14 +640,7 @@ describe("NoteService", () => {
 
 			await detectNotes(CWD);
 
-			expect(info).toHaveBeenCalledWith(
-				"notes",
-				expect.stringContaining("1 notes"),
-			);
-			expect(info).toHaveBeenCalledWith(
-				"notes",
-				expect.stringContaining("2 in registry"),
-			);
+			expect(info).toHaveBeenCalledWith(expect.stringContaining("detectNotes found"), 1, 2);
 		});
 	});
 
@@ -671,13 +661,7 @@ describe("NoteService", () => {
 				mtime: new Date("2025-06-01T00:00:00.000Z"),
 			});
 
-			const result = await saveNote(
-				undefined,
-				"My Snippet",
-				"snippet content",
-				"snippet",
-				CWD,
-			);
+			const result = await saveNote(undefined, "My Snippet", "snippet content", "snippet", CWD);
 
 			// Should have called mkdirSync since dir doesn't exist
 			expect(mockMkdirSync).toHaveBeenCalledWith(NOTES_DIR, {
@@ -706,13 +690,7 @@ describe("NoteService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# My Markdown Note\nContent");
 
-			const result = await saveNote(
-				undefined,
-				"My Markdown",
-				"/source/path.md",
-				"markdown",
-				CWD,
-			);
+			const result = await saveNote(undefined, "My Markdown", "/source/path.md", "markdown", CWD);
 
 			// Should NOT copy — reference original file directly
 			expect(mockCopyFileSync).not.toHaveBeenCalled();
@@ -744,13 +722,7 @@ describe("NoteService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# Updated Title\nContent");
 
-			const result = await saveNote(
-				"existing-note",
-				"Updated Title",
-				"",
-				"snippet",
-				CWD,
-			);
+			const result = await saveNote("existing-note", "Updated Title", "", "snippet", CWD);
 
 			// Should not copy or write file — existing note just updates metadata
 			expect(mockCopyFileSync).not.toHaveBeenCalled();
@@ -766,13 +738,7 @@ describe("NoteService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# Extracted Heading\nBody text");
 
-			const result = await saveNote(
-				undefined,
-				"",
-				"# Extracted Heading\nBody text",
-				"snippet",
-				CWD,
-			);
+			const result = await saveNote(undefined, "", "# Extracted Heading\nBody text", "snippet", CWD);
 
 			expect(result.title).toBe("Extracted Heading");
 		});
@@ -782,13 +748,7 @@ describe("NoteService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("No heading here");
 
-			const result = await saveNote(
-				undefined,
-				"",
-				"No heading here",
-				"snippet",
-				CWD,
-			);
+			const result = await saveNote(undefined, "", "No heading here", "snippet", CWD);
 
 			// extractTitle returns basename without .md extension
 			expect(result.title).toContain("a1b2");
@@ -832,13 +792,7 @@ describe("NoteService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# Markdown Heading");
 
-			const result = await saveNote(
-				undefined,
-				"",
-				"/source/file.md",
-				"markdown",
-				CWD,
-			);
+			const result = await saveNote(undefined, "", "/source/file.md", "markdown", CWD);
 
 			expect(result.title).toBe("Markdown Heading");
 		});
@@ -869,13 +823,7 @@ describe("NoteService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("content");
 
-			const result = await saveNote(
-				undefined,
-				"New Note",
-				"content",
-				"snippet",
-				CWD,
-			);
+			const result = await saveNote(undefined, "New Note", "content", "snippet", CWD);
 
 			expect(result.commitHash).toBeNull();
 		});
@@ -888,8 +836,10 @@ describe("NoteService", () => {
 
 			await saveNote(undefined, "New", "content", "snippet", CWD);
 			expect(info).toHaveBeenCalledWith(
-				"notes",
-				expect.stringContaining("created"),
+				expect.stringContaining("saveNote"),
+				"created",
+				expect.any(String),
+				expect.any(String),
 			);
 
 			info.mockReset();
@@ -907,8 +857,10 @@ describe("NoteService", () => {
 
 			await saveNote("existing", "Updated", "", "snippet", CWD);
 			expect(info).toHaveBeenCalledWith(
-				"notes",
-				expect.stringContaining("updated"),
+				expect.stringContaining("saveNote"),
+				"updated",
+				expect.any(String),
+				expect.any(String),
 			);
 		});
 
@@ -920,13 +872,7 @@ describe("NoteService", () => {
 				mtime: new Date("2025-06-01T00:00:00.000Z"),
 			});
 
-			const result = await saveNote(
-				undefined,
-				"New Note",
-				"content",
-				"snippet",
-				CWD,
-			);
+			const result = await saveNote(undefined, "New Note", "content", "snippet", CWD);
 
 			expect(result).not.toBeNull();
 			expect(result.title).toBe("New Note");
@@ -937,13 +883,7 @@ describe("NoteService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("content");
 
-			const result = await saveNote(
-				"custom-id",
-				"Title",
-				"content",
-				"snippet",
-				CWD,
-			);
+			const result = await saveNote("custom-id", "Title", "content", "snippet", CWD);
 
 			expect(result.id).toBe("custom-id");
 			// Should NOT have called randomBytes since id was provided
@@ -982,10 +922,7 @@ describe("NoteService", () => {
 			await removeNote("my-note", CWD);
 
 			expect(mockUnlinkSync).toHaveBeenCalledWith(`${NOTES_DIR}/my-note.md`);
-			expect(mockSavePlansRegistry).toHaveBeenCalledWith(
-				expect.objectContaining({ notes: {} }),
-				CWD,
-			);
+			expect(mockSavePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ notes: {} }), CWD);
 		});
 
 		it("does not delete the original file for uncommitted markdown notes", async () => {
@@ -1005,10 +942,7 @@ describe("NoteService", () => {
 
 			// Markdown notes reference the user's original file — never delete it
 			expect(mockUnlinkSync).not.toHaveBeenCalled();
-			expect(mockSavePlansRegistry).toHaveBeenCalledWith(
-				expect.objectContaining({ notes: {} }),
-				CWD,
-			);
+			expect(mockSavePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ notes: {} }), CWD);
 		});
 
 		it("removes the entry but skips file deletion when the backing file is already gone", async () => {
@@ -1027,10 +961,7 @@ describe("NoteService", () => {
 			await removeNote("my-note", CWD);
 
 			expect(mockUnlinkSync).not.toHaveBeenCalled();
-			expect(mockSavePlansRegistry).toHaveBeenCalledWith(
-				expect.objectContaining({ notes: {} }),
-				CWD,
-			);
+			expect(mockSavePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ notes: {} }), CWD);
 		});
 
 		it("does nothing when id is not in registry", async () => {
@@ -1130,10 +1061,7 @@ describe("NoteService", () => {
 			await removeNote("my-note", CWD);
 
 			// Entry should still be removed from registry even if file delete fails
-			expect(mockSavePlansRegistry).toHaveBeenCalledWith(
-				expect.objectContaining({ notes: {} }),
-				CWD,
-			);
+			expect(mockSavePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ notes: {} }), CWD);
 		});
 
 		it("is a no-op when the resolved key maps to a null entry (L200 defensive guard)", async () => {
@@ -1168,11 +1096,7 @@ describe("NoteService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("snippet content");
 
-			const result = await archiveNoteForCommit(
-				"test-note",
-				"06d0f729abcdef12",
-				CWD,
-			);
+			const result = await archiveNoteForCommit("test-note", "06d0f729abcdef12", CWD);
 
 			expect(result).not.toBeNull();
 			expect(result?.id).toBe("test-note-06d0f729");
@@ -1198,9 +1122,7 @@ describe("NoteService", () => {
 			// Only the guard row (original id) survives — it carries the
 			// archive-time contentHashAtCommit and the commit hash.
 			expect(saved.notes["test-note"].commitHash).toBe("06d0f729abcdef12");
-			expect(saved.notes["test-note"].contentHashAtCommit).toBe(
-				"mock-sha256-hash",
-			);
+			expect(saved.notes["test-note"].contentHashAtCommit).toBe("mock-sha256-hash");
 			expect(saved.notes["test-note"].ignored).toBeUndefined();
 			// No per-commit archive row is created; the new id lives only in the
 			// returned NoteReference / orphan-branch snapshot.
@@ -1286,11 +1208,7 @@ describe("NoteService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("# Markdown content");
 
-			const result = await archiveNoteForCommit(
-				"test-note",
-				"06d0f729abcdef12",
-				CWD,
-			);
+			const result = await archiveNoteForCommit("test-note", "06d0f729abcdef12", CWD);
 
 			expect(result?.content).toBeUndefined();
 		});
@@ -1308,8 +1226,10 @@ describe("NoteService", () => {
 			await archiveNoteForCommit("test-note", "06d0f729abcdef12", CWD);
 
 			expect(info).toHaveBeenCalledWith(
-				"notes",
-				expect.stringContaining("Archived note test-note"),
+				expect.stringContaining("Archived note"),
+				"test-note",
+				expect.any(String),
+				expect.any(String),
 			);
 		});
 
@@ -1323,11 +1243,7 @@ describe("NoteService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("content");
 
-			const result = await archiveNoteForCommit(
-				"test-note",
-				"abcdef1234567890",
-				CWD,
-			);
+			const result = await archiveNoteForCommit("test-note", "abcdef1234567890", CWD);
 
 			expect(result?.id).toBe("test-note-abcdef12");
 		});
@@ -1347,9 +1263,7 @@ describe("NoteService", () => {
 
 			await archiveNoteForCommit("test-note", "06d0f729abcdef12", CWD);
 
-			expect(mockUnlinkSync).toHaveBeenCalledWith(
-				`${NOTES_DIR}/snippet-note.md`,
-			);
+			expect(mockUnlinkSync).toHaveBeenCalledWith(`${NOTES_DIR}/snippet-note.md`);
 		});
 
 		it("does not delete file for markdown notes after archiving", async () => {
@@ -1385,11 +1299,7 @@ describe("NoteService", () => {
 			mockExistsSync.mockReturnValue(true);
 			mockReadFileSync.mockReturnValue("content");
 
-			const result = await archiveNoteForCommit(
-				"test-note",
-				"06d0f729abcdef12",
-				CWD,
-			);
+			const result = await archiveNoteForCommit("test-note", "06d0f729abcdef12", CWD);
 
 			expect(result).not.toBeNull();
 			const saved = mockSavePlansRegistry.mock.calls[0][0];
@@ -1413,11 +1323,7 @@ describe("NoteService", () => {
 			});
 
 			// Should not throw even if cleanup fails
-			const result = await archiveNoteForCommit(
-				"test-note",
-				"06d0f729abcdef12",
-				CWD,
-			);
+			const result = await archiveNoteForCommit("test-note", "06d0f729abcdef12", CWD);
 
 			expect(result).not.toBeNull();
 			expect(result?.id).toBe("test-note-06d0f729");
@@ -1499,9 +1405,7 @@ describe("NoteService", () => {
 
 			const result = await listUnassociatedNotes(CWD);
 
-			expect(result).toEqual([
-				{ id: "md-note", title: "MD Note", format: "markdown" },
-			]);
+			expect(result).toEqual([{ id: "md-note", title: "MD Note", format: "markdown" }]);
 		});
 	});
 

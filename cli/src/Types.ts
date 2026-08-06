@@ -762,6 +762,32 @@ export interface PlanEntry {
 }
 
 /**
+ * Display projection of a {@link PlanEntry} for an IDE panel.
+ *
+ * Produced by `PlanService.detectPlans`; consumed in-process by the VS Code
+ * extension and over `jolli ide-bridge` by IntelliJ, so the shape is part of
+ * the bridge wire contract rather than a host-local view model.
+ */
+export interface PlanInfo {
+	/** Plan slug (e.g. "abstract-jumping-church") — primary key */
+	readonly slug: string;
+	/** Plan filename (e.g. "abstract-jumping-church.md") */
+	readonly filename: string;
+	/** Editable file path: uncommitted → ~/.claude/plans/<slug>.md; committed → .jolli/jollimemory/plans/<slug>.md */
+	readonly filePath: string;
+	/** First # heading from the markdown file */
+	readonly title: string;
+	/** ISO 8601 — file mtime (uncommitted) or commit date (committed) */
+	readonly lastModified: string;
+	/** ISO 8601 — when this plan was first discovered */
+	readonly addedAt: string;
+	/** ISO 8601 — when this plan was last modified */
+	readonly updatedAt: string;
+	/** Commit hash if plan is associated with a commit, null if unassociated */
+	readonly commitHash: string | null;
+}
+
+/**
  * plans.json registry structure.
  *
  * Multi-source: holds plans / notes / references (keyed by `<source>:<nativeId>`
@@ -812,6 +838,27 @@ export interface NoteEntry {
 	readonly contentHashAtCommit?: string;
 	/** File path in .jolli/jollimemory/notes/<id>.md (all notes are file-backed) */
 	readonly sourcePath?: string;
+}
+
+/**
+ * Display projection of a {@link NoteEntry} for an IDE panel.
+ *
+ * Same contract as {@link PlanInfo}: produced by `NoteService.detectNotes` and
+ * consumed by both IDE hosts, so it travels the `jolli ide-bridge` wire.
+ */
+export interface NoteInfo {
+	readonly id: string;
+	readonly title: string;
+	readonly format: NoteFormat;
+	/** ISO 8601 — file mtime (markdown) or updatedAt (snippet) */
+	readonly lastModified: string;
+	readonly addedAt: string;
+	readonly updatedAt: string;
+	readonly commitHash: string | null;
+	/** Filename (e.g. "my-note.md") */
+	readonly filename?: string;
+	/** Absolute file path */
+	readonly filePath?: string;
 }
 
 // ─── Plan progress types ────────────────────────────────────────────────────

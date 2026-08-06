@@ -89,22 +89,17 @@ Summaries are stored in a git orphan branch (`jollimemory/summaries/v3`) using a
 ```
 src/main/kotlin/ai/jolli/jollimemory/
 ├── JolliMemoryIcons.kt              # Icon resource loader
-├── actions/                         # IntelliJ AnAction classes (19 actions)
-│   ├── EnableAction.kt              # Install hooks and Claude Code stop hook
-│   ├── DisableAction.kt             # Uninstall hooks
+├── actions/                         # IntelliJ action classes (14: 13 AnAction + 1 ToggleAction, all DumbAware)
+│   ├── AddContextAction.kt          # The CONTEXT "+" — Add Plan / Add Markdown Note / Add Text Snippet
 │   ├── CommitAIAction.kt            # AI-powered commit message generation + commit
 │   ├── SquashAction.kt              # Squash selected commits with LLM message
 │   ├── PushAction.kt                # Git push with force-push confirmation
+│   ├── DiscardSelectedAction.kt     # Discard changes for all selected files in the Changes panel
 │   ├── ViewSummaryAction.kt         # Open commit summary in JCEF viewer
-│   ├── AddPlanAction.kt             # Add a plan from ~/.claude/plans/
-│   ├── AddNoteAction.kt             # Add a Markdown file or text snippet note
-│   ├── SelectAllFilesAction.kt      # Toggle selection of all changed files
 │   ├── SelectAllCommitsAction.kt    # Toggle selection of all commits
-│   ├── SearchMemoriesAction.kt      # Open the Memories panel keyword filter
-│   ├── ClearMemoryFilterAction.kt   # Clear the active Memories filter
 │   ├── StatusSettingsAction.kt      # Open settings dialog
 │   ├── TogglePanelAction.kt         # Toggle panel visibility
-│   └── Refresh*Action.kt            # Refresh individual panels (Status, Memories, Plans, Changes, Commits — 5 actions)
+│   └── Refresh*Action.kt            # Refresh individual panels (Status, Conversations, Plans, Changes, Commits — 5 actions)
 ├── auth/                            # Auth credential storage (shared with CLI/VSCode at ~/.jolli/jollimemory/config.json)
 │   ├── JolliConfigStore.kt          # Read/write authToken and space metadata
 │   └── JolliUrlConfig.kt            # Resolves the Jolli site URL from saved metadata
@@ -113,17 +108,20 @@ src/main/kotlin/ai/jolli/jollimemory/
 │   ├── HookInstaller.kt             # Hook script installation/removal (pure file I/O)
 │   ├── SkillInstaller.kt            # Installs the /jolli-recall slash command into Claude Code's skills directory
 │   └── SummaryReader.kt             # Read summaries from orphan branch
-├── core/                            # Pure Kotlin core (no IntelliJ dependencies)
+├── core/                            # Pure Kotlin core (no IntelliJ dependencies) — a selection, not the full listing
 │   ├── SummaryStore.kt              # Orphan branch read/write (git plumbing)
 │   ├── SummaryTree.kt               # Tree-structured summary index
-│   ├── PlanProgressEvaluator.kt     # Derives "active vs done" plan progress from transcript signals
-│   ├── TranscriptReader.kt          # JSONL transcript parser with cursor resumption
-│   ├── TranscriptParsers.kt         # Agent-specific transcript format parsers
 │   ├── SessionTracker.kt            # Active session registry (sessions.json) + global config dir resolution
-│   ├── CodexSessionDiscoverer.kt    # Auto-discover Codex sessions from filesystem
-│   ├── GeminiSupport.kt             # Gemini session integration
+│   ├── WorkingContext.kt            # Adapter over the CLI's `working-context` ide-bridge action (plans / notes / references)
+│   ├── CommitSelectionStore.kt      # Adapter over the CLI-owned "leave out of this memory" exclude set
+│   ├── KBFolderReader.kt            # Native reader for .jolli/manifest.json + index.json — LOCKSTEP with the CLI's schemas
+│   ├── LocalAgentTools.kt           # DEFAULT_TOOLS — hand-maintained mirror of the CLI's LOCAL_AGENT_TOOLS
+│   ├── HookEnv.kt                   # The ONLY place production code may touch JVM globals (see check-global-state.sh)
 │   ├── Types.kt                     # Data classes, enums, and type definitions (incl. JolliMemoryConfig with authToken)
-│   └── JmLogger.kt                  # File-based logger for hooks (no IDE dependency)
+│   ├── JmLogger.kt                  # File-based logger for hooks (no IDE dependency)
+│   ├── plans/                       # ClaudePlanScanner.kt — enumerates ~/.claude/plans
+│   ├── references/                  # ReferenceStore / ReferenceTypes / SourceDisplay — types field-for-field with the CLI
+│   └── telemetry/                   # Consent + buffering + flush (TelemetryFlusher is check-no-direct-llm-http's one allowlist entry)
 ├── hooks/                           # Standalone hook entry points (bundled in hooks JAR)
 │   ├── HookRunner.kt                # Main-Class entry point for jollimemory-hooks.jar; dispatches by first arg
 │   ├── PostCommitHook.kt            # Post-commit: spawn background summarization
@@ -137,7 +135,6 @@ src/main/kotlin/ai/jolli/jollimemory/
 │   ├── JolliMemoryStartupActivity.kt# Auto-detect and install hooks on project open
 │   ├── JolliAuthService.kt          # OAuth flow: opens browser, runs a local callback listener, stores credentials
 │   ├── JolliApiClient.kt            # HTTP client for Jolli Space API (Share in Jolli)
-│   ├── PlanService.kt               # Plan detection and registry management
 │   └── PrService.kt                 # GitHub PR creation/update via gh CLI
 ├── settings/
 │   └── JolliMemoryConfigurable.kt   # Preferences > Tools > Jolli Memory entry — bridge only, opens SettingsDialog
@@ -202,6 +199,16 @@ The summary viewer uses IntelliJ's built-in JCEF (Chromium Embedded Framework) t
 ### Accordion Layout
 
 The four-panel tool window uses a custom `AccordionLayout` where collapsed panels shrink to header-only height and expanded panels share the remaining space. `ResizeDivider` components between panels allow manual drag-to-resize.
+
+### Toolbar buttons: `DumbAware` + an explicit refresh
+
+Two platform behaviours conspire to leave the tool window's toolbar buttons dead, and every action in `actions/` needs both fixes. Both failed silently — the buttons simply looked disabled.
+
+**1. Every action must be `DumbAware`.** The platform force-disables a non-dumb-aware action for the whole of indexing, *ignoring whatever `update()` computes*. None of these actions read the PSI or an index — they run git, call the CLI bridge and drive Swing — so all of them carry the marker. On a large project this was minutes of a dead toolbar after every IDE open, and it read exactly like a broken button. Note the plugin's `FileEditorProvider`s were already dumb-aware; only the actions were missed.
+
+Enforced by [`scripts/check-actions-dumbaware.sh`](scripts/check-actions-dumbaware.sh), a `test` dependency alongside the global-state and no-direct-LLM-http gates. It exists because nothing else can see the regression: a new action without the marker compiles, lints and leaves the suite green, and only a human opening a freshly-indexed large project notices. The gate reads the *comment-stripped* source (one action explains its own `[DumbAware]` choice in KDoc, so a bare grep would pass a file that merely talks about the marker) and fails when it finds **zero** action classes, so a moved package or a supertype spelling it stops recognising can't report a cheerful pass having checked nothing. Its scope is `actions/` only — the `FileEditorProvider`s are not covered.
+
+**2. Something must ask the toolbar to re-run `update()`.** These actions gate `isEnabled` on `JolliMemoryService.getStatus()`, which is null until the first async `refreshStatus()` lands — and in a fresh linked worktree it then reports `enabled=false` until `initialize()`'s auto-install finishes and refreshes a second time. An `ActionToolbar` updates when it is shown or when asked; 2025.1 dropped the platform's periodic re-poll. So the panels that own toolbars (`CurrentMemoryPanel` for the three section headers, `JolliMemoryToolWindowFactory` for the three `CollapsiblePanel` headers) call `updateActionsAsync()` from a service status listener. Use the async form, not `updateActionsImmediately()` — these actions declare `ActionUpdateThread.BGT`.
 
 ---
 

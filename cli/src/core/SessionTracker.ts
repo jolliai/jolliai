@@ -1583,6 +1583,12 @@ export async function getReferenceEntriesForBranch(
  * Returns the {mapKey, source, sourcePath} triples for active references in the
  * current worktree — projection of `getReferenceEntriesForBranch` shaped for the
  * QueueWorker archive dispatch, which only needs these three fields.
+ *
+ * Deliberately NOT widened with `title` for the IDE payload: this shape is the
+ * worker's, ~20 of its test fixtures are typed against it, and a second caller's
+ * display need is not a reason to move it. The `active-for-commit` handler joins
+ * titles from the registry itself — CLI-side either way, which is the part that
+ * matters (see AGENTS.md → "IDE hosts are adapters").
  */
 export async function detectUncommittedReferenceIds(
 	cwd: string,
@@ -1765,16 +1771,42 @@ export async function upsertSkillEntry(use: SkillUse, cwd: string): Promise<void
 
 // ─── Active-entry queries for prompt assembly ───────────────────────────────
 
-/** Active plans in the current worktree — uncommitted, not guard-archived. */
+/**
+ * Active plans in the current worktree — uncommitted, not guard-archived, and
+ * still backed by a file on disk.
+ *
+ * The existence check is part of the rule, not a caller's optimisation: the
+ * archive loop in `QueueWorker.archivePlansForCommit` skips a row whose
+ * `sourcePath` is gone (it cannot read content it does not have), so a row that
+ * fails it is one the next commit provably will NOT claim. Leaving it in made
+ * every consumer of this "what would the next commit archive?" set wrong in the
+ * same way — VS Code's Next-Memory preview listed it and fed it to the relevance
+ * ranker, and IntelliJ's Working Memory review had grown its own Kotlin
+ * `File(sourcePath).exists()` filter to compensate. One predicate, here.
+ */
 export async function detectActivePlansForBranch(cwd: string, _branch: string): Promise<ReadonlyArray<PlanEntry>> {
 	const registry = await loadPlansRegistry(cwd);
-	const entries: PlanEntry[] = [];
+	const candidates: PlanEntry[] = [];
 	for (const entry of Object.values(registry.plans)) {
 		if (entry.commitHash !== null) continue;
 		if (entry.contentHashAtCommit !== undefined) continue;
-		entries.push(entry);
+		candidates.push(entry);
 	}
-	return entries;
+	// Registry filters first, disk last: the stat is the only I/O here, and the
+	// cheap predicates above usually leave nothing to stat. Concurrent because
+	// these are independent paths and the caller is on the commit path.
+	const onDisk = await Promise.all(candidates.map((entry) => pathExists(entry.sourcePath)));
+	return candidates.filter((_, index) => onDisk[index]);
+}
+
+/** `stat`-based existence probe — the module's async idiom, not `existsSync`. */
+async function pathExists(filePath: string): Promise<boolean> {
+	try {
+		await stat(filePath);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -1795,14 +1827,31 @@ export async function detectActiveSkillsForBranch(cwd: string, _branch: string):
 	return entries;
 }
 
-/** Active notes in the current worktree — uncommitted, not guard-archived. */
+/**
+ * Active notes in the current worktree — uncommitted, not guard-archived, and
+ * still backed by a readable file.
+ *
+ * The `sourcePath` check is the same rule, and for the same reason, as the one
+ * on {@link detectActivePlansForBranch}: `QueueWorker.associateNotesWithCommit`
+ * skips a row with no `sourcePath` or a missing file ("has no readable source
+ * file — skipping"), because there is no content to snapshot. A row that fails
+ * it is one the next commit provably will NOT claim, so leaving it in this set
+ * makes every consumer overstate the next memory — and feeds a phantom row to
+ * the relevance ranker.
+ */
 export async function detectActiveNotesForBranch(cwd: string, _branch: string): Promise<ReadonlyArray<NoteEntry>> {
 	const registry = await loadPlansRegistry(cwd);
-	const entries: NoteEntry[] = [];
+	// Paired with the resolved path so the disk probe below needs no non-null
+	// assertion — `NoteEntry.sourcePath` is optional, and absent means the same
+	// thing to the worker as missing-on-disk.
+	const candidates: Array<{ entry: NoteEntry; sourcePath: string }> = [];
 	for (const entry of Object.values(registry.notes ?? {})) {
 		if (entry.commitHash !== null) continue;
 		if (entry.contentHashAtCommit !== undefined) continue;
-		entries.push(entry);
+		if (entry.sourcePath === undefined) continue;
+		candidates.push({ entry, sourcePath: entry.sourcePath });
 	}
-	return entries;
+	// Registry filters first, disk last — see detectActivePlansForBranch.
+	const onDisk = await Promise.all(candidates.map((c) => pathExists(c.sourcePath)));
+	return candidates.filter((_, index) => onDisk[index]).map((c) => c.entry);
 }

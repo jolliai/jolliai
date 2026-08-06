@@ -365,6 +365,24 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         val memoriesCollapsible = CollapsiblePanel(
             "COMMITTED MEMORIES", "JolliMemory.CommitsActions", commitsPanel,
         )
+        // Accordion-header toolbars re-run their actions' `update()` when the
+        // service's status changes. Those actions (Squash, Select-All …) gate
+        // `isEnabled` on a status that is null until the first async refresh, and
+        // a toolbar only updates when shown or when asked — 2025.1 dropped the
+        // platform's periodic re-poll — so without this they stay greyed out from
+        // first paint. CurrentMemoryPanel does the same for its own three section
+        // toolbars, which is where the CONTEXT ➕ lives.
+        listOfNotNull(
+            pinnedCollapsible.headerToolbar,
+            currentMemoryCollapsible.headerToolbar,
+            memoriesCollapsible.headerToolbar,
+        ).let { headerToolbars ->
+            if (headerToolbars.isNotEmpty()) {
+                service.addStatusListener {
+                    SwingUtilities.invokeLater { headerToolbars.forEach { it.updateActionsAsync() } }
+                }
+            }
+        }
         // Cold-start "build memory from your history" card. Rendered as a BARE bordered card
         // at the top of the stack (matching VS Code's `.backfill-panel` div) — deliberately NOT
         // a titled accordion section, so there is no persistent "BUILD MEMORY" header: the card

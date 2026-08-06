@@ -143,6 +143,154 @@ describe("DaemonWatcher", () => {
 		expect((watcher as unknown as { watcher: FSWatcher | null }).watcher).toBeNull();
 	});
 
+	// These drive the FSWatcher's listener directly instead of waiting on the
+	// platform to deliver a real event, so nothing here touches async I/O and
+	// fake timers are safe (the tests above deliberately keep real ones —
+	// they DO depend on FSEvents/inotify delivery).
+	describe("burst payload and filename gate", () => {
+		beforeEach(() => {
+			vi.useFakeTimers();
+		});
+
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it("hands onTrigger the distinct filenames seen during the burst", () => {
+			const target = join(root, "queue");
+			mkdirSync(target);
+			const trigger = vi.fn();
+			const watcher = new DaemonWatcher({
+				path: target,
+				debounceMs: DEBOUNCE_MS,
+				onTrigger: trigger,
+			});
+			expect(watcher.start()).toBe(true);
+
+			const inner = (watcher as unknown as { watcher: FSWatcher }).watcher;
+			// Emitting on the FSWatcher directly drives the listener `fs.watch()`
+			// installed, so the accumulate/reset logic is exercised without waiting
+			// on platform event delivery.
+			inner.emit("change", "rename", "a.md");
+			inner.emit("change", "change", "a.md");
+			inner.emit("change", "rename", "b.md");
+			vi.advanceTimersByTime(DEBOUNCE_MS);
+
+			expect(trigger).toHaveBeenCalledTimes(1);
+			expect([...(trigger.mock.calls[0][0] as ReadonlySet<string>)].sort()).toEqual(["a.md", "b.md"]);
+
+			// The next burst starts from empty rather than accumulating forever.
+			inner.emit("change", "rename", "c.md");
+			vi.advanceTimersByTime(DEBOUNCE_MS);
+			expect([...(trigger.mock.calls[1][0] as ReadonlySet<string>)]).toEqual(["c.md"]);
+			watcher.stop();
+		});
+
+		it("passes an empty set when the platform reports no filename", () => {
+			const target = join(root, "queue");
+			mkdirSync(target);
+			const trigger = vi.fn();
+			const watcher = new DaemonWatcher({
+				path: target,
+				debounceMs: DEBOUNCE_MS,
+				onTrigger: trigger,
+			});
+			expect(watcher.start()).toBe(true);
+
+			const inner = (watcher as unknown as { watcher: FSWatcher }).watcher;
+			inner.emit("change", "rename", null);
+			vi.advanceTimersByTime(DEBOUNCE_MS);
+
+			// Still fires — an ungated watcher must not go silent just because the
+			// platform withheld the name.
+			expect(trigger).toHaveBeenCalledTimes(1);
+			expect((trigger.mock.calls[0][0] as ReadonlySet<string>).size).toBe(0);
+			watcher.stop();
+		});
+
+		it("decodes a Buffer filename", () => {
+			const target = join(root, "queue");
+			mkdirSync(target);
+			const trigger = vi.fn();
+			const watcher = new DaemonWatcher({
+				path: target,
+				debounceMs: DEBOUNCE_MS,
+				onTrigger: trigger,
+			});
+			expect(watcher.start()).toBe(true);
+
+			const inner = (watcher as unknown as { watcher: FSWatcher }).watcher;
+			inner.emit("change", "rename", Buffer.from("plan.md", "utf-8"));
+			vi.advanceTimersByTime(DEBOUNCE_MS);
+
+			expect([...(trigger.mock.calls[0][0] as ReadonlySet<string>)]).toEqual(["plan.md"]);
+			watcher.stop();
+		});
+
+		describe("filter", () => {
+			const armFiltered = (
+				target: string,
+				trigger: (names: ReadonlySet<string>) => void,
+			): { watcher: DaemonWatcher; inner: FSWatcher } => {
+				const watcher = new DaemonWatcher({
+					path: target,
+					debounceMs: DEBOUNCE_MS,
+					onTrigger: trigger,
+					filter: (name) => name === "plans.json",
+				});
+				expect(watcher.start()).toBe(true);
+				return { watcher, inner: (watcher as unknown as { watcher: FSWatcher }).watcher };
+			};
+
+			it("never arms the timer for a burst in which every event was filtered out", () => {
+				const target = join(root, "state");
+				mkdirSync(target);
+				const trigger = vi.fn();
+				const { watcher, inner } = armFiltered(target, trigger);
+
+				inner.emit("change", "change", "debug.log");
+				inner.emit("change", "change", "sessions.json");
+				// No pending timer at all — a noisy neighbour must not even schedule
+				// work, let alone fire.
+				expect((watcher as unknown as { timer: unknown }).timer).toBeNull();
+				vi.advanceTimersByTime(DEBOUNCE_MS * 3);
+				expect(trigger).not.toHaveBeenCalled();
+				watcher.stop();
+			});
+
+			it("fires with only the passing name when a burst mixes gated and ungated events", () => {
+				const target = join(root, "state");
+				mkdirSync(target);
+				const trigger = vi.fn();
+				const { watcher, inner } = armFiltered(target, trigger);
+
+				inner.emit("change", "change", "debug.log");
+				inner.emit("change", "change", "plans.json");
+				inner.emit("change", "change", "cursors.json");
+				vi.advanceTimersByTime(DEBOUNCE_MS);
+
+				expect(trigger).toHaveBeenCalledTimes(1);
+				expect([...(trigger.mock.calls[0][0] as ReadonlySet<string>)]).toEqual(["plans.json"]);
+				watcher.stop();
+			});
+
+			it("drops a nameless event rather than firing blind", () => {
+				const target = join(root, "state");
+				mkdirSync(target);
+				const trigger = vi.fn();
+				const { watcher, inner } = armFiltered(target, trigger);
+
+				// A gate cannot be honoured without a name, and this watcher only
+				// exists on directories whose other writers are noisy — so silence is
+				// the safer half of the trade.
+				inner.emit("change", "rename", null);
+				vi.advanceTimersByTime(DEBOUNCE_MS * 3);
+				expect(trigger).not.toHaveBeenCalled();
+				watcher.stop();
+			});
+		});
+	});
+
 	it("stop() clears a pending debounce timer that never fires afterwards", async () => {
 		const target = join(root, "queue");
 		mkdirSync(target);

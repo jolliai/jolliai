@@ -141,11 +141,14 @@ class SummaryHtmlBuilderTest {
 
         @Test
         fun `renders plans section`() {
-            val plans = listOf(PlanReference("p1", "My Plan", 2, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))
+            val plans = listOf(PlanReference("p1", "My Plan", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))
             val html = SummaryHtmlBuilder.buildHtml(makeSummary(plans = plans))
             html shouldContain "plansSection"
             html shouldContain "My Plan"
-            html shouldContain "edited 2 times"
+            // The meta line is the filename alone. It used to append "edited N
+            // times" from PlanReference.editCount — a field the CLI has never
+            // written, so every plan read "edited 0 times" in production.
+            html shouldContain "<div class=\"plan-meta\">p1.md</div>"
         }
 
         @Test
@@ -156,7 +159,7 @@ class SummaryHtmlBuilderTest {
 
         @Test
         fun `renders plans with translate button when in translateSet`() {
-            val plans = listOf(PlanReference("p1", "Plan", 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))
+            val plans = listOf(PlanReference("p1", "Plan", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))
             val html = SummaryHtmlBuilder.buildHtml(makeSummary(plans = plans), planTranslateSet = setOf("p1"))
             html shouldContain "plan-translate-btn"
         }

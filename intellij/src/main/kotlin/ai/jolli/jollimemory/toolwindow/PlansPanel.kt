@@ -1,21 +1,19 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.JolliMemoryIcons
-import ai.jolli.jollimemory.core.NoteEntry
 import ai.jolli.jollimemory.core.NoteFormat
-import ai.jolli.jollimemory.core.PlanEntry
 import ai.jolli.jollimemory.core.CommitSelectionStore
 import ai.jolli.jollimemory.core.PinStore
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.core.SkillsProjection
+import ai.jolli.jollimemory.core.WorkingContext
 import ai.jolli.jollimemory.core.references.ReferenceEntry
 import ai.jolli.jollimemory.core.references.ReferenceStore
 import ai.jolli.jollimemory.core.references.SourceDisplay
-import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliMemoryService
-import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.LocalFileSystem
@@ -33,7 +31,6 @@ import java.awt.Font
 import java.awt.Graphics
 import java.awt.Graphics2D
 import java.awt.Rectangle
-import java.awt.RenderingHints
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.font.TextAttribute
@@ -42,7 +39,6 @@ import java.net.URI
 import java.util.Locale
 import javax.swing.Box
 import javax.swing.BoxLayout
-import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JTextArea
 import javax.swing.JMenuItem
@@ -74,15 +70,22 @@ class PlansPanel(
     override var onRowCountChanged: ((Int) -> Unit)? = null
     override fun currentRowCount(): Int = allContextItems.size
 
-    /** Unified item wrapper for the merged plans+notes list */
+    /**
+     * Unified item wrapper for the merged plans+notes+references list.
+     *
+     * Plans and notes carry the CLI's display projections rather than raw
+     * registry rows: which rows are visible at all is decided by
+     * `PlanService.detectPlans` / `NoteService.detectNotes`, so this panel never
+     * sees a hidden row and has no filter of its own.
+     */
     private sealed class ListItem(val title: String, val lastModified: String) {
-        class PlanItem(val plan: PlanEntry) : ListItem(
+        class PlanItem(val plan: WorkingContext.PlanInfo) : ListItem(
             plan.title.ifBlank { plan.slug },
-            plan.updatedAt,
+            plan.lastModified,
         )
-        class NoteItem(val note: NoteEntry) : ListItem(
+        class NoteItem(val note: WorkingContext.NoteInfo) : ListItem(
             note.title,
-            note.updatedAt,
+            note.lastModified,
         )
         class ReferenceItem(val ref: ReferenceEntry, val mapKey: String) : ListItem(
             ref.title,
@@ -113,6 +116,8 @@ class PlansPanel(
     private val hoverDismissTimer = Timer(HOVER_HIDE_GRACE_MS) { dismissHoverPopup() }.apply { isRepeats = false }
 
     private companion object {
+        val LOG: Logger = Logger.getInstance(PlansPanel::class.java)
+
         const val HOVER_SHOW_DELAY_MS = 1000
         const val HOVER_HIDE_GRACE_MS = 200
 
@@ -148,11 +153,20 @@ class PlansPanel(
 
     private val statusListener: () -> Unit = { SwingUtilities.invokeLater { refresh() } }
 
+    /**
+     * Subscribed on BOTH channels on purpose: the status one because
+     * [refreshFromDisk] gates on `status.enabled`, the working-context one because
+     * a plan/note/reference moving does not go through a status recompute. The two
+     * are fired by different service methods, so an event never arrives twice.
+     */
+    private val workingContextListener: () -> Unit = { SwingUtilities.invokeLater { refresh() } }
+
     init {
         // Match PINNED's container insets (empty(2,4)) so all sections share the same
         // first-row/last-row edge gaps. Each row adds empty(2,4) → 4px edge, 8px sides.
         border = JBUI.Borders.empty(2, 4)
         service.addStatusListener(statusListener)
+        service.addWorkingContextListener(workingContextListener)
         ApplicationManager.getApplication().executeOnPooledThread { refreshFromDisk() }
     }
 
@@ -161,9 +175,14 @@ class PlansPanel(
     }
 
     /**
-     * Prompts the user to confirm removal of a plan / note / reference.
-     * Plans are soft-deleted (ignored: true); notes/references are removed from
-     * the registry (matching VS Code semantics).
+     * Prompts the user to confirm removal of a plan / note / reference, then
+     * hands the removal to the CLI.
+     *
+     * All three kinds are hard removals — the registry row is deleted, leaving no
+     * tombstone, so re-adding the same plan/note or re-referencing the same
+     * entity revives it. Whether the backing file is unlinked is the CLI's
+     * decision (it deletes only files inside `.jolli/jollimemory/`, never the
+     * user's own markdown), which is why nothing here touches the filesystem.
      */
     private fun removeItem(selected: ListItem) {
         val (itemType, itemName) = when (selected) {
@@ -185,65 +204,30 @@ class PlansPanel(
 
         ApplicationManager.getApplication().executeOnPooledThread {
             val cwd = service.mainRepoRoot ?: project.basePath ?: return@executeOnPooledThread
-            when (selected) {
-                is ListItem.PlanItem -> doRemovePlan(selected.plan.slug, cwd)
-                is ListItem.NoteItem -> doRemoveNote(selected.note, cwd)
-                is ListItem.ReferenceItem -> doRemoveReference(selected.mapKey, selected.ref.sourcePath, cwd)
-                // Unreachable: the guard above returns before the confirm dialog.
-                is ListItem.SkillsItem -> Unit
+            try {
+                when (selected) {
+                    is ListItem.PlanItem -> WorkingContext.removePlan(cwd, selected.plan.slug)
+                    is ListItem.NoteItem -> WorkingContext.removeNote(cwd, selected.note.id)
+                    is ListItem.ReferenceItem -> WorkingContext.removeReference(cwd, selected.mapKey)
+                    // Unreachable: the guard above returns before the confirm dialog.
+                    is ListItem.SkillsItem -> Unit
+                }
+            } catch (e: Exception) {
+                LOG.warn("Remove $itemType failed: ${e.message}")
+                SwingUtilities.invokeLater {
+                    Messages.showErrorDialog(project, "Could not remove $itemType: ${e.message}", "Remove Failed")
+                }
+                return@executeOnPooledThread
             }
-            service.refreshStatus()
-        }
-    }
-
-    /** Marks a plan as ignored in plans.json (soft delete — plan file untouched). */
-    private fun doRemovePlan(slug: String, cwd: String) {
-        val registry = SessionTracker.loadPlansRegistry(cwd)
-        val entry = registry.plans[slug] ?: return
-        val updatedPlans = registry.plans.toMutableMap()
-        updatedPlans[slug] = entry.copy(ignored = true)
-        SessionTracker.savePlansRegistry(registry.copy(plans = updatedPlans), cwd)
-    }
-
-    /** Removes a note from the registry entirely. Deletes snippet source file if uncommitted. */
-    private fun doRemoveNote(note: NoteEntry, cwd: String) {
-        val registry = SessionTracker.loadPlansRegistry(cwd)
-        val notes = (registry.notes ?: emptyMap()).toMutableMap()
-        if (!notes.containsKey(note.id)) return
-
-        // Delete source file only for uncommitted snippet notes (matching VS Code).
-        // Markdown note files are NOT deleted — they may reference user content.
-        val entry = notes[note.id]!!
-        if (entry.commitHash == null && entry.format == NoteFormat.snippet && entry.sourcePath != null) {
-            try {
-                val file = File(entry.sourcePath)
-                if (file.exists()) file.delete()
-            } catch (_: Exception) { /* best effort */ }
-        }
-
-        notes.remove(note.id)
-        SessionTracker.savePlansRegistry(registry.copy(notes = notes), cwd)
-    }
-
-    /** Removes a reference from plans.json and deletes the backing markdown file. */
-    private fun doRemoveReference(mapKey: String, sourcePath: String?, cwd: String) {
-        val registry = SessionTracker.loadPlansRegistry(cwd)
-        val refs = (registry.references ?: emptyMap()).toMutableMap()
-        if (!refs.containsKey(mapKey)) return
-        refs.remove(mapKey)
-        SessionTracker.savePlansRegistry(registry.copy(references = refs.takeIf { it.isNotEmpty() }), cwd)
-
-        // Best-effort delete the backing markdown file
-        if (sourcePath != null) {
-            try {
-                val file = File(sourcePath)
-                if (file.exists()) file.delete()
-            } catch (_: Exception) { /* best effort */ }
+            // Working-context refresh, not the full status round-trip: removing a row
+            // moves working-area state only. This panel is on both lists, so it still
+            // repaints; nothing on the status list can have a different answer.
+            service.refreshWorkingContext()
         }
     }
 
     private fun openReference(ref: ReferenceEntry) {
-        val sourcePath = ref.sourcePath ?: return
+        val sourcePath = ref.sourcePath
         val file = File(sourcePath)
         if (!file.exists()) {
             JOptionPane.showMessageDialog(this, "Reference file not found: $sourcePath", "Reference", JOptionPane.WARNING_MESSAGE)
@@ -382,19 +366,44 @@ class PlansPanel(
         val nowExcluded = !isExcluded(item)
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
         ApplicationManager.getApplication().executeOnPooledThread {
-            when (item) {
-                // Every captured skill in one write: the aggregate row has no per-skill
-                // affordance, so leaving any key untouched would strand it in a state the
-                // user has no way to see or change.
-                is ListItem.SkillsItem ->
-                    CommitSelectionStore.setAllExcluded(cwd, "skills", item.skills.exclusionKeys, nowExcluded)
-                else -> {
-                    val (kind, key) = kindKeyOf(item) ?: return@executeOnPooledThread
-                    CommitSelectionStore.setExcluded(cwd, kind, key, nowExcluded)
+            // Explicit handling because this is a bridge round-trip now, not the local
+            // file write it used to be: a dead daemon, a Node binary missing from PATH
+            // or a cold-spawn timeout all throw here. Unhandled, the pool swallows it,
+            // `renderList()` never runs, and the user's click on ✕ does nothing at all
+            // with no indication why — the row even keeps its old state, so it reads as
+            // a dead control. Same dialog as `removeItem`'s failure path.
+            try {
+                when (item) {
+                    // Every captured skill in one write: the aggregate row has no per-skill
+                    // affordance, so leaving any key untouched would strand it in a state the
+                    // user has no way to see or change.
+                    is ListItem.SkillsItem ->
+                        CommitSelectionStore.setAllExcluded(cwd, "skills", item.skills.exclusionKeys, nowExcluded)
+                    else -> {
+                        val (kind, key) = kindKeyOf(item) ?: return@executeOnPooledThread
+                        CommitSelectionStore.setExcluded(cwd, kind, key, nowExcluded)
+                    }
                 }
+            } catch (e: Exception) {
+                LOG.warn("Toggle exclude failed: ${e.message}")
+                SwingUtilities.invokeLater {
+                    Messages.showErrorDialog(
+                        project,
+                        "Could not update whether this item is left out of the next memory: ${e.message}",
+                        "Update Failed",
+                    )
+                }
+                return@executeOnPooledThread
             }
             service.notifySelectionChanged()
-            val ex = CommitSelectionStore.readExclusions(cwd)
+            // Re-read is best-effort: the write above already landed, so a failure here
+            // costs a stale checkbox until the next refresh, not a lost change.
+            val ex = try {
+                CommitSelectionStore.readExclusions(cwd)
+            } catch (e: Exception) {
+                LOG.warn("Re-reading exclusions after a toggle failed: ${e.message}")
+                return@executeOnPooledThread
+            }
             excludedReferences = ex.references
             excludedPlans = ex.plans
             excludedNotes = ex.notes
@@ -439,7 +448,14 @@ class PlansPanel(
         }
     }
 
-    /** Opens an item in its editor / detail view (edit hover action, row click). */
+    /**
+     * Row click → rendered **preview**, never the editor.
+     *
+     * Same split VS Code draws: a plain click posts `branch:openPlan` /
+     * `branch:openNote` / `branch:openReferencePreview`, all of which land on a
+     * read-only rendered preview, and editing is reached only through the row's
+     * ✎ button ([editItem]).
+     */
     private fun openItem(item: ListItem) {
         when (item) {
             is ListItem.PlanItem -> openPlan(item.plan)
@@ -497,6 +513,57 @@ class PlansPanel(
         JOptionPane.showMessageDialog(this, message, "Skills", JOptionPane.INFORMATION_MESSAGE)
     }
 
+    /** Per-kind ✎ tooltip — VS Code's `CONTEXT_ROW_KINDS[kind].editLabel`. */
+    private fun editLabelFor(item: ListItem): String = when (item) {
+        is ListItem.PlanItem -> "Edit Plan"
+        is ListItem.NoteItem -> "Edit Note"
+        is ListItem.ReferenceItem -> "Edit Markdown"
+        // Never shown: the aggregate skills row's hover cluster is the checkbox alone.
+        // The label is still built for every row, so this needs a value, not a throw.
+        is ListItem.SkillsItem -> "Edit"
+    }
+
+    /**
+     * ✎ hover action → the file's **source**, in an editable editor.
+     *
+     * The counterpart to [openItem]: VS Code's `jollimemory.editPlan` /
+     * `editNote` open the backing file with `showTextDocument`, and
+     * `openReferenceMarkdown` opens the archived `.md` raw so its YAML
+     * frontmatter stays visible. A reference edits the file on disk, not the
+     * frontmatter-table preview [openReference] synthesises.
+     */
+    private fun editItem(item: ListItem) {
+        val file = when (item) {
+            is ListItem.PlanItem -> resolvePlanFile(item.plan)
+            is ListItem.NoteItem -> resolveNoteFile(item.note)
+            is ListItem.ReferenceItem -> File(item.ref.sourcePath).takeIf { it.exists() }
+            // No single document behind the aggregate row, so there is nothing to edit —
+            // and no ✎ on it either. Preview (the row click) renders the table instead.
+            is ListItem.SkillsItem -> return
+        }
+        if (file == null) {
+            missingFileMessage(item)
+            return
+        }
+        val vf = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(file)
+        if (vf == null) {
+            missingFileMessage(item)
+            return
+        }
+        MarkdownPreview.openSource(project, vf)
+    }
+
+    private fun missingFileMessage(item: ListItem) {
+        val (kind, what) = when (item) {
+            is ListItem.PlanItem -> "Plan" to "${item.plan.slug}.md"
+            is ListItem.NoteItem -> "Note" to item.note.id
+            is ListItem.ReferenceItem -> "Reference" to item.ref.sourcePath
+            // Unreachable: [editItem] returns before it can get here for a skills row.
+            is ListItem.SkillsItem -> return
+        }
+        JOptionPane.showMessageDialog(this, "$kind file not found: $what", kind, JOptionPane.WARNING_MESSAGE)
+    }
+
     private fun openReferenceInBrowser(url: String) {
         try {
             val uri = URI(url)
@@ -524,33 +591,39 @@ class PlansPanel(
 
         val items = try {
             val cwd = service.mainRepoRoot ?: project.basePath ?: ""
-            val gitOps = service.getGitOps()
-            val currentBranch = gitOps?.getCurrentBranch()
-            // Plans enter the registry via the CLI's transcript discovery
-            // pipeline, mirroring VS Code — so a plan appears in CONTEXT only when
-            // the user actually created/edited it in a session, and is consumed on
-            // commit. We no longer directory-scan ~/.claude/plans/.
-            val registry = SessionTracker.loadPlansRegistry(cwd)
 
-            val ex = CommitSelectionStore.readExclusions(cwd)
-            excludedReferences = ex.references
-            excludedPlans = ex.plans
-            excludedNotes = ex.notes
-            excludedSkills = ex.skills
+            // TWO bridge round-trips for the whole repaint: one for plans / notes /
+            // references / exclusions, one for the skills projection (`contextList` does
+            // not carry skills). This used to be five — exclusions + plans + notes +
+            // registry + skills — over three separate reads of plans.json, affordable
+            // when the panel only refreshed on a status recompute, not now that a plan
+            // file saved anywhere on the machine repaints it through the working-context
+            // channel.
+            //
+            // Visibility is decided CLI-side: `detectPlans` / `detectNotes` behind
+            // this call already drop archive guards, committed snapshot copies and
+            // orphaned rows, and deliberately apply NO branch filter — working-area
+            // context belongs to the worktree and binds to a branch only at commit.
+            // Do not re-filter here; a second predicate in Kotlin is exactly the
+            // drift the sink of these services removed. References carry no
+            // committed/guard state (a commit deletes the row), so every row in the
+            // map is active.
+            val context = WorkingContext.contextList(cwd)
+            excludedReferences = context.exclusions.references
+            excludedPlans = context.exclusions.plans
+            excludedNotes = context.exclusions.notes
+            excludedSkills = context.exclusions.skills
 
-            val planItems = filterPlans(registry.plans, gitOps, currentBranch)
-                .map { ListItem.PlanItem(it) }
-            val noteItems = filterNotes(registry.notes ?: emptyMap(), gitOps, currentBranch)
-                .map { ListItem.NoteItem(it) }
-            // No branch filter: uncommitted references follow the user across branches
-            // (a commit deletes the row; there is no committed/guard state to filter).
-            val refItems = (registry.references ?: emptyMap())
-                .map { (mapKey, entry) -> ListItem.ReferenceItem(entry, mapKey) }
-            // Not read off `registry.skills` like the three above: a skill row survives
-            // archival (it is guarded, not deleted, so a later re-entry is detectable),
-            // so the raw map would list every skill ever used as if it were fresh working
-            // state. The CLI decides which rows are still uncommitted, and reports the
-            // delta rather than each row's lifetime total.
+            val planItems = context.plans.map { ListItem.PlanItem(it) }
+            val noteItems = context.notes.map { ListItem.NoteItem(it) }
+            val refItems = context.references.map { (mapKey, entry) -> ListItem.ReferenceItem(entry, mapKey) }
+            // Its own call, and deliberately not a raw `registry.skills` read: a skill row
+            // survives archival (it is guarded, not deleted, so a later re-entry is
+            // detectable), so the raw map would list every skill ever used as if it were
+            // fresh working state. The CLI decides which rows are still uncommitted, and
+            // reports the delta rather than each row's lifetime total. `readActive`
+            // degrades to empty rather than throwing, so a skills hiccup costs one row,
+            // not the whole repaint.
             val skillItems = SkillsProjection.readActive(cwd)
                 .takeIf { !it.isEmpty }
                 ?.let { listOf(ListItem.SkillsItem(it)) }
@@ -558,74 +631,33 @@ class PlansPanel(
 
             // Merge and sort by lastModified descending (newest first), matching VS Code
             (planItems + noteItems + refItems + skillItems).sortedByDescending { it.lastModified }
-        } catch (_: Exception) {
-            emptyList()
+        } catch (e: Exception) {
+            // Re-render what we already hold instead of repainting an empty list.
+            // This used to read plans.json directly, where a failure meant the file
+            // was genuinely unreadable; it is now one bridge round-trip, which a
+            // dead daemon, a Node binary missing from PATH, or a cold one-shot spawn
+            // timing out will all fail — and the working-context channel repaints
+            // this panel whenever a plan file is saved anywhere on the machine, so
+            // that low-frequency path is now a high-frequency one. One hiccup must
+            // not read as "the user has no context". Same reasoning as
+            // [ActiveConversationsPanel]'s lastKnownExclusions fallback, and the
+            // rows stay consistent with the exclude state because `excludedPlans` /
+            // `excludedNotes` / `excludedReferences` / `excludedSkills` are only
+            // reassigned on success.
+            //
+            // [renderList], NOT a bare return: it repaints from [allContextItems],
+            // which is `emptyList()` until the first success — so a first-refresh
+            // failure still lands on the real "No plans or notes yet." empty state
+            // instead of leaving the panel stuck on "Initializing Jolli Memory…".
+            // That is not a hypothetical ordering: the panel shows Initializing while
+            // status is null, and the first enabled refresh is exactly when the
+            // daemon is least likely to be bound yet.
+            LOG.warn("CONTEXT refresh failed, keeping the last loaded rows: ${e.message}")
+            SwingUtilities.invokeLater { renderList() }
+            return
         }
 
         SwingUtilities.invokeLater { updateList(items) }
-    }
-
-    /** Filter plans using the same visibility rules as VS Code PlanService.toPlanInfo */
-    private fun filterPlans(
-        plans: Map<String, PlanEntry>,
-        gitOps: ai.jolli.jollimemory.bridge.GitOps?,
-        currentBranch: String?,
-    ): List<PlanEntry> {
-        val plansDir = File(System.getProperty("user.home"), ".claude/plans")
-        return plans.values.filter { entry ->
-            if (entry.ignored == true) return@filter false
-            // No branch filter: uncommitted working-area plans follow the user across
-            // branches (matches CLI/VS Code). `branch` is stamped but not filtered on.
-            // Skip committed snapshot copies (slug-<shortHash> entries created by archivePlanForCommit).
-            // These exist only for orphan branch storage / Summary WebView, not for the sidebar panel.
-            if (entry.commitHash != null && entry.contentHashAtCommit == null) return@filter false
-            // Skip archive guards (committed plans whose source file is unchanged)
-            if (entry.contentHashAtCommit != null) {
-                val planFile = File(plansDir, "${entry.slug}.md")
-                if (!planFile.exists()) return@filter false
-                val hash = try {
-                    java.security.MessageDigest.getInstance("SHA-256")
-                        .digest(planFile.readBytes())
-                        .joinToString("") { "%02x".format(it) }
-                } catch (_: Exception) { null }
-                if (hash == entry.contentHashAtCommit) return@filter false
-            }
-            // Skip uncommitted plans whose source file was deleted
-            if (entry.commitHash == null && !File(entry.sourcePath).exists()) return@filter false
-            true
-        }
-    }
-
-    /** Filter notes using the same visibility rules as VS Code NoteService */
-    private fun filterNotes(
-        notes: Map<String, NoteEntry>,
-        gitOps: ai.jolli.jollimemory.bridge.GitOps?,
-        currentBranch: String?,
-    ): List<NoteEntry> {
-        return notes.values.filter { entry ->
-            if (entry.ignored == true) return@filter false
-            // No branch filter: uncommitted working-area notes follow the user across
-            // branches (matches CLI/VS Code). `branch` is stamped but not filtered on.
-            // Skip committed snapshot copies (created by archiveNoteForCommit).
-            // These exist only for orphan branch storage / Summary WebView, not for the sidebar panel.
-            if (entry.commitHash != null && entry.contentHashAtCommit == null) return@filter false
-            // Skip archive guards (committed notes whose content is unchanged)
-            if (entry.contentHashAtCommit != null && entry.sourcePath != null) {
-                val noteFile = File(entry.sourcePath)
-                if (!noteFile.exists()) return@filter false
-                val hash = try {
-                    java.security.MessageDigest.getInstance("SHA-256")
-                        .digest(noteFile.readBytes())
-                        .joinToString("") { "%02x".format(it) }
-                } catch (_: Exception) { null }
-                if (hash == entry.contentHashAtCommit) return@filter false
-            }
-            // Skip uncommitted notes whose source file was deleted
-            if (entry.commitHash == null && entry.sourcePath != null && !File(entry.sourcePath).exists()) {
-                return@filter false
-            }
-            true
-        }
     }
 
 
@@ -732,16 +764,23 @@ class PlansPanel(
             cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
         }
 
-        val pin = rowActionIcon(AllIcons.General.Pin_tab, "Pin") { pinItem(item) }
-        val edit = rowActionIcon(AllIcons.Actions.Edit, "Open") { openItem(item) }
+        // Hover cluster, in VS Code's order and with its labels: Pin → Edit →
+        // Remove → the ✕/+ leave-out toggle (`renderPlanRow` in
+        // SidebarScriptBuilder.ts). Remove and the toggle are NOT the same action:
+        // the toggle just leaves the item out of the next memory (reversible),
+        // Remove deletes the plan / note / reference row.
+        val pin = rowActionIcon(JolliMemoryIcons.Pin, "Pin") { pinItem(item) }
+        val edit = rowActionIcon(JolliMemoryIcons.Edit, editLabelFor(item)) { editItem(item) }
+        val remove = rowActionIcon(JolliMemoryIcons.Trash, "Remove") { removeItem(item) }
         val toggle = rowActionIcon(
-            if (excluded) AllIcons.General.Add else AllIcons.Actions.Close,
-            if (excluded) "Include in next memory" else "Exclude from next memory",
+            if (excluded) JolliMemoryIcons.Add else JolliMemoryIcons.Close,
+            if (excluded) "Add back to this memory" else "Leave out of this memory",
         ) { toggleExclusion(item) }
         // The aggregate skills row gets the checkbox and nothing else — matching VS
         // Code, where its kind declares no inline actions. There is no single document
-        // to pin or edit, and Pin addresses one artifact by key, which this row lacks.
-        val icons = if (item is ListItem.SkillsItem) listOf(toggle) else listOf(pin, edit, toggle)
+        // to pin, edit or remove, and Pin addresses one artifact by key, which this row
+        // lacks.
+        val icons = if (item is ListItem.SkillsItem) listOf(toggle) else listOf(pin, edit, remove, toggle)
         val iconsRow = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
             isOpaque = false
             icons.forEach { add(it) }
@@ -848,11 +887,17 @@ class PlansPanel(
         return row
     }
 
+    /**
+     * Right-click menu, mirroring VS Code's `ctx === 'plan' | 'note' |
+     * 'reference'` branches: Preview → Edit → (Open in Browser, references with
+     * a url only) → separator → Remove. Pin is deliberately absent from both
+     * surfaces — it lives on the row's hover cluster.
+     */
     private fun showRowContextMenu(item: ListItem, e: MouseEvent) {
         val popup = JPopupMenu()
         // The aggregate skills row offers Preview only: it is a record of what ran, so
-        // there is nothing to remove, and a Remove item that silently did nothing would
-        // be worse than its absence.
+        // there is nothing to edit or remove, and menu items that silently did nothing
+        // would be worse than their absence.
         if (item is ListItem.SkillsItem) {
             popup.add(JMenuItem("Preview", JolliMemoryIcons.Eye).apply {
                 addActionListener { openSkillsAggregate() }
@@ -860,16 +905,17 @@ class PlansPanel(
             popup.show(e.component, e.x, e.y)
             return
         }
+        popup.add(JMenuItem("Preview", JolliMemoryIcons.Eye).apply { addActionListener { openItem(item) } })
+        popup.add(JMenuItem(editLabelFor(item), JolliMemoryIcons.Edit).apply { addActionListener { editItem(item) } })
         if (item is ListItem.ReferenceItem) {
-            popup.add(JMenuItem("Preview", JolliMemoryIcons.Eye).apply { addActionListener { openReference(item.ref) } })
             val refUrl = item.ref.url
             if (!refUrl.isNullOrBlank()) {
                 popup.add(JMenuItem("Open in Browser", JolliMemoryIcons.Globe).apply {
                     addActionListener { openReferenceInBrowser(refUrl) }
                 })
             }
-            popup.add(JSeparator())
         }
+        popup.add(JSeparator())
         popup.add(JMenuItem("Remove", JolliMemoryIcons.Trash).apply { addActionListener { removeItem(item) } })
         popup.show(e.component, e.x, e.y)
     }
@@ -948,12 +994,35 @@ class PlansPanel(
 
         val cwd = service.mainRepoRoot ?: project.basePath ?: return
         ApplicationManager.getApplication().executeOnPooledThread {
-            // One bulk write, not one per row. Same net effect — every reference gets
-            // the same `!select` — but the store is reached over the ide-bridge now, so
-            // a per-row loop paid one daemon round trip per reference.
-            CommitSelectionStore.setAllExcluded(cwd, "references", refItems.map { it.mapKey }, !select)
+            // One bridge round-trip for the whole set, not one per row: `setExcluded`
+            // in a loop is N round-trips, N `withCommitSelectionLock` acquisitions and
+            // N rewrites of commit-selection.json — and N chances to be interrupted
+            // half-applied. `setAllExcluded` is the CLI operation that exists for this;
+            // ActiveConversationsPanel's select-all already uses it.
+            // Handled for the same reason as the single-row toggle above: one bridge
+            // round-trip, and a silent failure would leave every row unchanged with no
+            // feedback. Worth a dialog rather than a warn — the user just asked to flip
+            // the whole set, so doing nothing quietly is the most misleading outcome.
+            try {
+                CommitSelectionStore.setAllExcluded(cwd, "references", refItems.map { it.mapKey }, !select)
+            } catch (e: Exception) {
+                LOG.warn("Select-all exclude failed: ${e.message}")
+                SwingUtilities.invokeLater {
+                    Messages.showErrorDialog(
+                        project,
+                        "Could not update which references are left out of the next memory: ${e.message}",
+                        "Update Failed",
+                    )
+                }
+                return@executeOnPooledThread
+            }
             service.notifySelectionChanged()
-            excludedReferences = CommitSelectionStore.readExclusions(cwd).references
+            excludedReferences = try {
+                CommitSelectionStore.readExclusions(cwd).references
+            } catch (e: Exception) {
+                LOG.warn("Re-reading exclusions after select-all failed: ${e.message}")
+                return@executeOnPooledThread
+            }
             SwingUtilities.invokeLater { renderList() }
         }
     }
@@ -1019,22 +1088,17 @@ class PlansPanel(
         popup.isVisible = true
     }
 
-    private fun buildPlanPopupContent(content: JPanel, plan: PlanEntry, fg: Color, dimFg: Color) {
+    // No "Branch: …" row in either popup. An uncommitted plan/note belongs to the
+    // worktree, not to a branch — it follows the user across a checkout and gains
+    // a branch only when a commit claims it (recorded on `CommitSummary.branch`).
+    // Labelling it with the branch that happened to be current when it was created
+    // states something the model does not guarantee. See JOLLI-2058.
+    private fun buildPlanPopupContent(content: JPanel, plan: WorkingContext.PlanInfo, fg: Color, dimFg: Color) {
         content.add(JBLabel(plan.title.ifBlank { plan.slug }).apply {
             foreground = fg; font = font.deriveFont(java.awt.Font.BOLD); alignmentX = Component.LEFT_ALIGNMENT
         })
         content.add(Box.createVerticalStrut(JBUI.scale(4)))
-        content.add(JBLabel("${plan.slug}.md").apply {
-            foreground = dimFg; alignmentX = Component.LEFT_ALIGNMENT
-        })
-        if (plan.branch != null) {
-            content.add(Box.createVerticalStrut(JBUI.scale(2)))
-            content.add(JBLabel("Branch: ${plan.branch}").apply {
-                foreground = dimFg; alignmentX = Component.LEFT_ALIGNMENT
-            })
-        }
-        content.add(Box.createVerticalStrut(JBUI.scale(2)))
-        content.add(JBLabel("${plan.editCount} edit${if (plan.editCount != 1) "s" else ""}").apply {
+        content.add(JBLabel(plan.filename).apply {
             foreground = dimFg; alignmentX = Component.LEFT_ALIGNMENT
         })
     }
@@ -1113,7 +1177,7 @@ class PlansPanel(
         return if (total < 1000) "$marker$total" else marker + String.format(Locale.ROOT, "%.1fk", total / 1000.0)
     }
 
-    private fun buildNotePopupContent(content: JPanel, note: NoteEntry, fg: Color, dimFg: Color) {
+    private fun buildNotePopupContent(content: JPanel, note: WorkingContext.NoteInfo, fg: Color, dimFg: Color) {
         content.add(JBLabel(note.title).apply {
             foreground = fg; font = font.deriveFont(java.awt.Font.BOLD); alignmentX = Component.LEFT_ALIGNMENT
         })
@@ -1122,12 +1186,6 @@ class PlansPanel(
         content.add(JBLabel("Format: $formatStr").apply {
             foreground = dimFg; alignmentX = Component.LEFT_ALIGNMENT
         })
-        if (note.branch != null) {
-            content.add(Box.createVerticalStrut(JBUI.scale(2)))
-            content.add(JBLabel("Branch: ${note.branch}").apply {
-                foreground = dimFg; alignmentX = Component.LEFT_ALIGNMENT
-            })
-        }
     }
 
     private fun buildReferencePopupContent(content: JPanel, ref: ReferenceEntry, fg: Color, dimFg: Color) {
@@ -1157,18 +1215,16 @@ class PlansPanel(
         // Fields from the backing markdown file — separator + list. Skipped when
         // the file is missing (readReferenceMarkdown returns null) or the source
         // has no `fields` block (track-only sources like jollimemory).
-        if (ref.sourcePath != null) {
-            val parsed = ReferenceStore.readReferenceMarkdown(ref.sourcePath)
-            if (parsed?.fields != null && parsed.fields.isNotEmpty()) {
-                content.add(Box.createVerticalStrut(JBUI.scale(4)))
-                content.add(JSeparator().apply { alignmentX = Component.LEFT_ALIGNMENT; maximumSize = Dimension(Int.MAX_VALUE, 1) })
-                content.add(Box.createVerticalStrut(JBUI.scale(4)))
-                for (f in parsed.fields) {
-                    content.add(JBLabel("${f.label}: ${f.value}").apply {
-                        foreground = fg; alignmentX = Component.LEFT_ALIGNMENT
-                    })
-                    content.add(Box.createVerticalStrut(JBUI.scale(2)))
-                }
+        val parsed = ReferenceStore.readReferenceMarkdown(ref.sourcePath)
+        if (parsed?.fields != null && parsed.fields.isNotEmpty()) {
+            content.add(Box.createVerticalStrut(JBUI.scale(4)))
+            content.add(JSeparator().apply { alignmentX = Component.LEFT_ALIGNMENT; maximumSize = Dimension(Int.MAX_VALUE, 1) })
+            content.add(Box.createVerticalStrut(JBUI.scale(4)))
+            for (f in parsed.fields) {
+                content.add(JBLabel("${f.label}: ${f.value}").apply {
+                    foreground = fg; alignmentX = Component.LEFT_ALIGNMENT
+                })
+                content.add(Box.createVerticalStrut(JBUI.scale(2)))
             }
         }
 
@@ -1212,41 +1268,57 @@ class PlansPanel(
     override fun dispose() {
         dismissHoverPopup()
         service.removeStatusListener(statusListener)
+        service.removeWorkingContextListener(workingContextListener)
     }
 
-    private fun openPlan(plan: PlanEntry) {
-        val candidates = listOf(
-            File(plan.sourcePath),
-            File(System.getProperty("user.home"), ".claude/plans/${plan.slug}.md"),
-            File(service.mainRepoRoot ?: "", ".jolli/jollimemory/plans/${plan.slug}.md"),
-        )
-        val file = candidates.firstOrNull { it.exists() }
-        if (file != null) {
-            val vf = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(file)
-            if (vf != null) {
-                MarkdownPreview.open(project, vf)
-                return
-            }
-        }
-        JOptionPane.showMessageDialog(this, "Plan file not found: ${plan.slug}.md", "Plan", JOptionPane.WARNING_MESSAGE)
-    }
+    /**
+     * Resolves a plan row to an on-disk file for the open / preview actions.
+     *
+     * KNOWN restatement, pre-existing and deliberately left here — not a review
+     * finding. The two fallbacks spell out the CLI's own plan locations
+     * (uncommitted → `~/.claude/plans/<slug>.md`, committed →
+     * `.jolli/jollimemory/plans/<slug>.md`, exactly as `PlanEntry.filePath`
+     * documents), so a layout change CLI-side would leave them pointing at the old
+     * paths. It degrades gracefully rather than silently: `plan.filePath` — the
+     * authoritative value the CLI just handed us — is tried FIRST, so the fallbacks
+     * only run when that file is already gone, and the whole thing returns null
+     * instead of guessing wrong. Contrast [resolveNoteFile], which asks the bridge
+     * for the notes directory; that is the shape to converge on if this is ever
+     * revisited, and it needs a path-resolving bridge operation rather than a
+     * change here.
+     */
+    private fun resolvePlanFile(plan: WorkingContext.PlanInfo): File? = listOf(
+        File(plan.filePath),
+        File(System.getProperty("user.home"), ".claude/plans/${plan.slug}.md"),
+        File(service.mainRepoRoot ?: "", ".jolli/jollimemory/plans/${plan.slug}.md"),
+    ).firstOrNull { it.exists() }
 
-    private fun openNote(note: NoteEntry) {
-        // Notes are stored in .jolli/jollimemory/notes/<id>.md
+    /** Notes are stored in `.jolli/jollimemory/notes/<id>.md`. */
+    private fun resolveNoteFile(note: WorkingContext.NoteInfo): File? {
         val cwd = service.mainRepoRoot ?: project.basePath ?: ""
-        val candidates = listOfNotNull(
-            note.sourcePath?.let { File(it) },
+        return listOfNotNull(
+            note.filePath?.let { File(it) },
             File(SessionTracker.getNotesDir(cwd), "${note.id}.md"),
-        )
-        val file = candidates.firstOrNull { it.exists() }
-        if (file != null) {
-            val vf = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(file)
-            if (vf != null) {
-                MarkdownPreview.open(project, vf)
-                return
-            }
-        }
-        JOptionPane.showMessageDialog(this, "Note file not found: ${note.id}", "Note", JOptionPane.WARNING_MESSAGE)
+        ).firstOrNull { it.exists() }
     }
 
+    private fun openPlan(plan: WorkingContext.PlanInfo) {
+        val vf = resolvePlanFile(plan)?.let { LocalFileSystem.getInstance().refreshAndFindFileByIoFile(it) }
+        if (vf == null) {
+            JOptionPane.showMessageDialog(
+                this, "Plan file not found: ${plan.slug}.md", "Plan", JOptionPane.WARNING_MESSAGE,
+            )
+            return
+        }
+        MarkdownPreview.open(project, vf)
+    }
+
+    private fun openNote(note: WorkingContext.NoteInfo) {
+        val vf = resolveNoteFile(note)?.let { LocalFileSystem.getInstance().refreshAndFindFileByIoFile(it) }
+        if (vf == null) {
+            JOptionPane.showMessageDialog(this, "Note file not found: ${note.id}", "Note", JOptionPane.WARNING_MESSAGE)
+            return
+        }
+        MarkdownPreview.open(project, vf)
+    }
 }

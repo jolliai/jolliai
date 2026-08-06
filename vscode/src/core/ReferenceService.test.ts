@@ -81,7 +81,6 @@ import {
 	openReferenceInBrowser,
 	openReferenceMarkdown,
 	previewReferenceMarkdown,
-	removeReference,
 } from "./ReferenceService.js";
 
 const fieldVal = (r: ReferenceInfo | undefined, key: string): string | undefined =>
@@ -538,70 +537,6 @@ describe("detectReferences", () => {
 		const result = await detectReferences("/repo");
 		expect(result[0].fields).toBeUndefined();
 		expect(result[0].description).toBe("body");
-	});
-});
-
-describe("removeReference", () => {
-	it("removes the registry row and deletes the backing markdown", async () => {
-		const entry = makeJiraEntry();
-		mockLoadPlansRegistry.mockResolvedValue({
-			version: 1,
-			plans: {},
-			references: { "jira:KAN-5": entry },
-		});
-		await removeReference("/repo", "jira:KAN-5");
-		expect(mockDeleteReferenceMarkdown).toHaveBeenCalledWith(entry.sourcePath);
-		expect(mockSavePlansRegistry).toHaveBeenCalled();
-		const saved = mockSavePlansRegistry.mock.calls[0][0];
-		expect(saved.version).toBe(1);
-		expect(saved.references["jira:KAN-5"]).toBeUndefined();
-	});
-
-	it("is a no-op when mapKey is not in the registry", async () => {
-		mockLoadPlansRegistry.mockResolvedValue({
-			version: 1,
-			plans: {},
-			references: {},
-		});
-		await removeReference("/repo", "jira:UNKNOWN");
-		expect(mockSavePlansRegistry).not.toHaveBeenCalled();
-		expect(mockDeleteReferenceMarkdown).not.toHaveBeenCalled();
-	});
-
-	it("no-ops when the registry omits the references field entirely (?? {} fallback)", async () => {
-		mockLoadPlansRegistry.mockResolvedValue({ version: 1, plans: {} });
-		await removeReference("/repo", "jira:KAN-5");
-		expect(mockSavePlansRegistry).not.toHaveBeenCalled();
-		expect(mockDeleteReferenceMarkdown).not.toHaveBeenCalled();
-	});
-
-	it("preserves the plans / notes sections on save", async () => {
-		const notes = { "note-1": { foo: "bar" } };
-		mockLoadPlansRegistry.mockResolvedValue({
-			version: 1,
-			plans: { "plan-1": { slug: "x" } },
-			notes,
-			references: { "jira:KAN-5": makeJiraEntry() },
-		});
-		await removeReference("/repo", "jira:KAN-5");
-		const saved = mockSavePlansRegistry.mock.calls[0][0];
-		expect(saved.plans).toEqual({ "plan-1": { slug: "x" } });
-		expect(saved.notes).toEqual(notes);
-		expect(saved.references).toEqual({});
-	});
-
-	it("still removes the registry row when the markdown delete throws", async () => {
-		const entry = makeJiraEntry();
-		mockLoadPlansRegistry.mockResolvedValue({
-			version: 1,
-			plans: {},
-			references: { "jira:KAN-5": entry },
-		});
-		mockDeleteReferenceMarkdown.mockRejectedValueOnce(new Error("EACCES"));
-		await removeReference("/repo", "jira:KAN-5");
-		expect(mockSavePlansRegistry).toHaveBeenCalled();
-		const saved = mockSavePlansRegistry.mock.calls[0][0];
-		expect(saved.references["jira:KAN-5"]).toBeUndefined();
 	});
 });
 

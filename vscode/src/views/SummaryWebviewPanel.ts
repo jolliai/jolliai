@@ -30,12 +30,7 @@ import {
 	subtractDetachedUsage,
 } from "../../../cli/src/core/DetachedUsageSubtraction.js";
 import { isAncestor } from "../../../cli/src/core/GitOps.js";
-import { withPlansLock } from "../../../cli/src/core/Locks.js";
 import { toForwardSlash } from "../../../cli/src/core/PathUtils.js";
-import {
-	loadPlansRegistry,
-	savePlansRegistry,
-} from "../../../cli/src/core/SessionTracker.js";
 import {
 	generateE2eTest,
 	generateRecap,
@@ -73,6 +68,7 @@ import { removeNote, saveNote } from "../core/NoteService.js";
 import {
 	listAvailablePlans,
 	removePlan,
+	renamePlanTitle,
 } from "../core/PlanService.js";
 import type { JolliMemoryBridge } from "../JolliMemoryBridge.js";
 import { PluginOutdatedError, parseJolliApiKey, PushDisabledError } from "../services/JolliPushService.js";
@@ -2991,21 +2987,9 @@ export class SummaryWebviewPanel {
 			this.refreshPlansAndNotes(updatedSummary);
 		}
 
-		// plans.lock + fresh re-read so this title sync merges onto the latest state
-		// instead of clobbering a concurrent write (the Codex-discovery tick in this
-		// host, or a cross-process StopHook/QueueWorker).
-		await withPlansLock(this.workspaceRoot, async () => {
-			const registry = await loadPlansRegistry(this.workspaceRoot);
-			const entry = registry.plans[slug];
-			if (!entry) return;
-			await savePlansRegistry(
-				{
-					...registry,
-					plans: { ...registry.plans, [slug]: { ...entry, title: newTitle } },
-				},
-				this.workspaceRoot,
-			);
-		});
+		// Registry-side sync is CLI-owned (it takes plans.lock and merges onto a
+		// fresh read) so IntelliJ's equivalent path runs the same write.
+		await renamePlanTitle(slug, newTitle, this.workspaceRoot);
 	}
 
 	private async handleRemovePlan(slug: string, title: string): Promise<void> {

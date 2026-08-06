@@ -309,16 +309,20 @@ class CliDaemonClient(private val project: Project) : Disposable {
 	 * concurrent bridge calls. Without the pool hop a listener that reads a
 	 * file synchronously would stall every in-flight future.
 	 *
-	 * Wire shape: `{"jsonrpc":"2.0","method":"refresh","params":{"kind":<k>,"cwd":<p>}}`.
+	 * Wire shape: `{"jsonrpc":"2.0","method":"refresh","params":{"kind":<k>,"cwd":<p>}}`,
+	 * plus an optional `"names":[…]` that only the `claude-plans` kind carries.
+	 * `names` is read through [parseRefreshNames] — the same reader the standalone
+	 * `jolli daemon` path uses — so the two cannot disagree about the payload.
 	 */
 	private fun dispatchRefresh(obj: JsonObject) {
 		val params = obj.get("params")?.takeIf { it.isJsonObject }?.asJsonObject ?: return
 		val kind = params.get("kind")?.asString ?: return
 		val cwd = params.get("cwd")?.asString ?: ""
+		val names = parseRefreshNames(params)
 		ApplicationManager.getApplication().executeOnPooledThread {
 			try {
 				project.getService(DaemonNotificationClient::class.java)
-					?.injectRefresh(RefreshEvent(kind, cwd))
+					?.injectRefresh(RefreshEvent(kind, cwd, names))
 			} catch (e: Exception) {
 				log.warn("Failed to inject refresh: %s", e.message)
 			}

@@ -13,6 +13,7 @@ import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
+import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
@@ -51,7 +52,7 @@ import javax.swing.JScrollPane
  *  10. Nudge the IDE to re-read git state — the external `git` process bypasses
  *      the platform's own change tracker
  */
-class CommitAIAction : AnAction() {
+class CommitAIAction : AnAction(), DumbAware {
 
     private val log = JmLogger.create("CommitAIAction")
 

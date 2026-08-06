@@ -60,6 +60,16 @@ class CollapsiblePanel(
     private val titleLabel = JBLabel(title)
     private val headerPanel = JPanel(BorderLayout())
 
+    /**
+     * This section's header toolbar, or null when [actionGroupId] resolves to an
+     * empty group. Exposed so the owner can re-run its actions' `update()` when
+     * the service's status changes: those actions gate `isEnabled` on a status
+     * that is null until the first async refresh, and a toolbar does not re-poll
+     * on its own (2025.1 dropped the platform's periodic refresh).
+     */
+    var headerToolbar: ActionToolbar? = null
+        private set
+
     init {
         // Build header
         val separatorColor = UIManager.getColor("Separator.separatorColor")
@@ -145,6 +155,7 @@ class CollapsiblePanel(
                 border = JBUI.Borders.empty()
             }
             headerPanel.add(toolbar.component, BorderLayout.EAST)
+            headerToolbar = toolbar
         }
 
         // Click to toggle

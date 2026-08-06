@@ -377,25 +377,35 @@ data class E2eTestScenario(
 data class PlanReference(
     val slug: String,
     val title: String,
-    val editCount: Int,
     val addedAt: String,
     val updatedAt: String,
     val jolliPlanDocUrl: String? = null,
     val jolliPlanDocId: Int? = null,
 )
 
-/** Persisted plan entry in plans.json registry */
+/**
+ * Persisted plan entry in plans.json registry — mirror of the CLI's `PlanEntry`
+ * in `cli/src/Types.ts`; keep the two in step.
+ *
+ * Deliberately carries no `branch`, `editCount` or `ignored`. All three are in
+ * `LEGACY_PLAN_FIELDS` (`cli/src/core/SessionTracker.ts`) and the CLI purges
+ * them on every load→save, so declaring them here only invites code that reads
+ * a value the next CLI write erases. `ignored` was the sharpest edge: a row
+ * carrying it is DROPPED wholesale on load, so a panel that set `ignored = true`
+ * believing it was a recoverable soft delete was in fact hard-deleting the row.
+ *
+ * A plan's branch association is recorded on `CommitSummary.branch` at commit
+ * time — before that, an uncommitted plan belongs to the worktree and follows
+ * the user across a checkout, exactly like an uncommitted code change.
+ */
 data class PlanEntry(
     val slug: String,
     val title: String,
     val sourcePath: String,
     val addedAt: String,
     val updatedAt: String,
-    val branch: String? = null,
     val commitHash: String?,
-    val editCount: Int = 0,
     val contentHashAtCommit: String? = null,
-    val ignored: Boolean? = null,
 )
 
 /** plans.json registry structure (contains both plans and notes) */
@@ -413,19 +423,24 @@ data class PlansRegistry(
 /** Storage format for notes */
 enum class NoteFormat { markdown, snippet }
 
-/** Persisted note entry in plans.json registry */
+/**
+ * Persisted note entry in plans.json registry — mirror of the CLI's `NoteEntry`
+ * in `cli/src/Types.ts`; keep the two in step.
+ *
+ * Carries no `branch` or `ignored`, for the reasons spelled out on [PlanEntry].
+ * `branch` was additionally declared non-null here, which would have thrown the
+ * moment the CLI's strip made it absent — Gson writes null straight into a
+ * non-null Kotlin field.
+ */
 data class NoteEntry(
     val id: String,
     val title: String,
     val format: NoteFormat,
     val addedAt: String,
     val updatedAt: String,
-    val branch: String,
     val commitHash: String?,
     /** SHA-256 hash of note content when associated with a commit (archive guard) */
     val contentHashAtCommit: String? = null,
-    /** When true, note is hidden from the panel */
-    val ignored: Boolean? = null,
     /** File path in .jolli/jollimemory/notes/<id>.md (all notes are file-backed) */
     val sourcePath: String? = null,
 )

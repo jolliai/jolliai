@@ -10,7 +10,6 @@ src/main/kotlin/ai/jolli/jollimemory/core/WindowsHidden.kt
 src/main/kotlin/ai/jolli/jollimemory/core/telemetry/Telemetry.kt
 src/main/kotlin/ai/jolli/jollimemory/core/telemetry/TelemetryConsent.kt
 src/main/kotlin/ai/jolli/jollimemory/services/JolliMemoryService.kt
-src/main/kotlin/ai/jolli/jollimemory/services/PlanService.kt
 src/main/kotlin/ai/jolli/jollimemory/services/PrService.kt
 src/main/kotlin/ai/jolli/jollimemory/toolwindow/JolliMemoryToolWindowFactory.kt
 src/main/kotlin/ai/jolli/jollimemory/toolwindow/PlansPanel.kt

@@ -73,9 +73,6 @@ object JolliMemoryIcons {
     /** Note — matches VSCode codicon "note" for markdown notes. */
     val Note: Icon = IconLoader.getIcon("/icons/note.svg", JolliMemoryIcons::class.java)
 
-    /** Note with plus — used for the "Add Note" toolbar action. */
-    val NoteAdd: Icon = IconLoader.getIcon("/icons/note-add.svg", JolliMemoryIcons::class.java)
-
     /** Comment — matches VSCode codicon "comment" for text snippet notes. */
     val Comment: Icon = IconLoader.getIcon("/icons/comment.svg", JolliMemoryIcons::class.java)
 
@@ -84,6 +81,26 @@ object JolliMemoryIcons {
 
     /** Trash — matches VSCode codicon "trash" for delete/remove actions. */
     val Trash: Icon = IconLoader.getIcon("/icons/trash.svg", JolliMemoryIcons::class.java)
+
+    // ── CONTEXT row hover actions ────────────────────────────────────────────
+    // These four are the exact codicon glyphs the VS Code sidebar renders in a
+    // Context row's hover cluster (pin / edit / trash / close-or-add), traced
+    // from `@vscode/codicons` so the two surfaces show the same shapes rather
+    // than IntelliJ's near-equivalents (AllIcons.General.Pin_tab and friends
+    // read noticeably different at 16px). Keep the light/dark pair in step with
+    // the rest of this folder: #6C6C6C light, #C5C5C5 dark.
+
+    /** Pin — matches VSCode codicon "pin" for the row's Pin action. */
+    val Pin: Icon = IconLoader.getIcon("/icons/pin.svg", JolliMemoryIcons::class.java)
+
+    /** Pencil — matches VSCode codicon "edit" for the row's Edit action. */
+    val Edit: Icon = IconLoader.getIcon("/icons/edit.svg", JolliMemoryIcons::class.java)
+
+    /** ✕ — matches VSCode codicon "close" for "Leave out of this memory". */
+    val Close: Icon = IconLoader.getIcon("/icons/close.svg", JolliMemoryIcons::class.java)
+
+    /** + — matches VSCode codicon "add" for "Add back to this memory". */
+    val Add: Icon = IconLoader.getIcon("/icons/add.svg", JolliMemoryIcons::class.java)
 
     /**
      * Theme-adaptive pulse (heartbeat) glyph — the base of the tool window Status

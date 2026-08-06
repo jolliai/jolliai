@@ -94,7 +94,7 @@ class SummaryMarkdownBuilderTest {
 
         @Test
         fun `includes plans section when plans exist`() {
-            val plans = listOf(PlanReference("plan1", "My Plan", 2, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))
+            val plans = listOf(PlanReference("plan1", "My Plan", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))
             val md = SummaryMarkdownBuilder.buildMarkdown(makeSummary(plans = plans))
             md shouldContain "## Plans"
             md shouldContain "My Plan"

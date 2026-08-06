@@ -7,7 +7,7 @@ import org.junit.jupiter.api.Test
 class PlanGroupingTest {
 
     private fun plan(slug: String, updatedAt: String, docId: Int? = null, url: String? = null) =
-        PlanReference(slug = slug, title = "t", editCount = 1, addedAt = updatedAt, updatedAt = updatedAt, jolliPlanDocId = docId, jolliPlanDocUrl = url)
+        PlanReference(slug = slug, title = "t", addedAt = updatedAt, updatedAt = updatedAt, jolliPlanDocId = docId, jolliPlanDocUrl = url)
 
     @Test
     fun `planBaseKey strips an 8-hex commit suffix`() {

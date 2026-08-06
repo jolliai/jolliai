@@ -509,9 +509,22 @@ tasks {
         onlyIf { !System.getProperty("os.name").lowercase().contains("win") }
     }
 
+    // DumbAware gate: every action class in actions/ must declare DumbAware, or
+    // the platform disables it for the whole of indexing regardless of what
+    // update() computes. Wired like the two gates above so it runs on every test
+    // invocation with no extra CI step. Nothing else can see this regress — a
+    // missing marker compiles, lints and passes the suite. See
+    // scripts/check-actions-dumbaware.sh.
+    val checkActionsDumbAware = register<Exec>("checkActionsDumbAware") {
+        group = "verification"
+        description = "Enforce that every action in actions/ declares DumbAware"
+        commandLine("bash", "scripts/check-actions-dumbaware.sh")
+        onlyIf { !System.getProperty("os.name").lowercase().contains("win") }
+    }
+
     test {
         useJUnitPlatform()
-        dependsOn(checkGlobalState, checkNoDirectLlmHttp)
+        dependsOn(checkGlobalState, checkNoDirectLlmHttp, checkActionsDumbAware)
         // Parallelism now lives INSIDE one JVM: JUnit 5 runs test classes
         // concurrently on a work-stealing pool (src/test/resources/
         // junit-platform.properties). This is safe because tests no longer
