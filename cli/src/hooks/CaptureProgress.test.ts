@@ -362,6 +362,70 @@ describe("formatCaptureLine", () => {
 		expect(line).toContain("codex login");
 		expect(line).not.toContain("claude auth login");
 	});
+
+	// A non-auth LLM failure also lands as an empty placeholder, and used to print
+	// the plain success line — the commit LOOKED captured while its memory was
+	// blank. The reason is carried inline because it is the only place the user
+	// sees it: the webview banner shows a generic "regenerate me", and the actual
+	// message ("out of credits", a 5xx, a timeout) lives only in debug.log.
+	it("stored with an llmFailure reason replaces the success line and names the reason", () => {
+		const line = formatCaptureLine(
+			ev("stored", { topics: 0, llmFailure: "Codex run failed: Your workspace is out of credits." }),
+		);
+		expect(line).not.toBe("✓ Jolli Memory updated");
+		expect(line).toContain("Your workspace is out of credits.");
+		expect(line).toContain("Regenerate");
+	});
+
+	it("prefers the auth remedy over the generic reason when a run is both", () => {
+		// classifyLlmFailure already narrowed this to the auth subcase, which has
+		// actionable fix steps; the raw message would be strictly less useful.
+		const line = formatCaptureLine(
+			ev("stored", {
+				topics: 0,
+				authExpired: true,
+				localAgentTool: "codex",
+				llmFailure: "OAuth session expired",
+			}),
+		);
+		expect(line).toContain("codex login");
+	});
+
+	it("keeps a sprawling reason to one bounded line", () => {
+		// The reason is an arbitrary Error message — a multi-line stack or a wall of
+		// provider JSON would otherwise wreck the commit output it is printed into.
+		const line = formatCaptureLine(ev("stored", { topics: 0, llmFailure: `boom\n${"x".repeat(500)}` }));
+		const reasonLine = (line ?? "").split("\n")[0] ?? "";
+		expect(line).toContain("boom");
+		expect(reasonLine.length).toBeLessThanOrEqual(200);
+		expect(line).not.toContain("x".repeat(300));
+	});
+
+	it("strips ANSI colour and control sequences out of the reason", () => {
+		// The reason is frequently a LocalAgentSetupError, which carries a 2 KB tail
+		// of the agent CLI's own stderr — and those CLIs colour their output, so
+		// escape sequences here are the normal case. Printed raw they would leak
+		// styling into the rest of the commit block. Built from char codes so no
+		// literal control byte lands in this file (git would call it binary).
+		const esc = String.fromCharCode(0x1b);
+		const bel = String.fromCharCode(0x07);
+		const reason = `${esc}[31;1merror${esc}[0m: unknown option${esc}]0;retitled${bel}${String.fromCharCode(0x00)} '--x'`;
+
+		const line = formatCaptureLine(ev("stored", { topics: 0, llmFailure: reason })) ?? "";
+
+		expect(line).toContain("error: unknown option '--x'");
+		expect(line).not.toContain(esc);
+		expect(line).not.toContain(bel);
+		expect(line).not.toContain("31;1m");
+		expect(line).not.toContain("retitled");
+	});
+
+	it("keeps words separated when the reason is multi-line", () => {
+		// The whitespace controls are deliberately excluded from the strip and left
+		// to the collapse. Deleting them outright would weld the lines together.
+		const line = formatCaptureLine(ev("stored", { topics: 0, llmFailure: "line one\nline two\ttabbed" })) ?? "";
+		expect(line).toContain("line one line two tabbed");
+	});
 });
 
 const immediateSleep = () => Promise.resolve();

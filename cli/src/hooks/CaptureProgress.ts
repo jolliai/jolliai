@@ -58,6 +58,18 @@ export interface CaptureEventData {
 	readonly authExpired?: boolean;
 	/** Tool whose authentication failed; absent on legacy progress events. */
 	readonly localAgentTool?: LocalAgentToolId;
+	/**
+	 * Why a `stored` event landed as an empty `llm-failed` placeholder, for every
+	 * failure that is NOT the auth subcase (out of credits, 5xx, timeout, an
+	 * unparseable response). Absent on a healthy capture.
+	 *
+	 * Carried inline because this is the only surface that shows it: the stored
+	 * summary keeps a `SummaryErrorKind` and no message, so the webview banner can
+	 * only offer a generic "regenerate me", and the actual reason otherwise
+	 * survives in debug.log alone. Without it the commit printed the plain success
+	 * line over a blank memory.
+	 */
+	readonly llmFailure?: string;
 }
 
 /** One line in the per-commit progress stream. */
@@ -306,6 +318,62 @@ export function shouldShowCommitFeedback(
 	return AGENT_ENV_KEYS.some((k) => isTruthyEnv(env[k]));
 }
 
+/**
+ * Longest failure reason kept on the commit output's first line. The reason is
+ * an arbitrary `Error.message` — a multi-line stack or a wall of provider JSON
+ * would otherwise wreck the block this is printed into, so it is collapsed to
+ * one line and clipped.
+ */
+const MAX_CAPTURE_REASON_CHARS = 140;
+
+const ESC = String.fromCharCode(0x1b);
+const BEL = String.fromCharCode(0x07);
+/**
+ * ANSI escape sequences (OSC, CSI, the two-byte forms) and every other C0/C1
+ * control character, so none of them reach the terminal.
+ *
+ * Not paranoia about a hostile string: `LocalAgentSetupError` carries a 2 KB
+ * tail of the agent CLI's own **stderr**, and those CLIs colour their output, so
+ * colour codes in this reason are the expected case rather than an exotic one.
+ * Printed raw they leak styling into the rest of the commit block, and an OSC
+ * sequence retitles the terminal window. Collapsing whitespace does not catch
+ * any of it — ESC is not `\s`.
+ *
+ * Built with `RegExp` + `String.fromCharCode` so no literal control byte lands
+ * in this file: git would classify the source as binary and lose diff/blame on
+ * it. Same idiom, same reason, as `SAFE_SEGMENT_RE` in
+ * `sync/VaultPathClassifier.ts`.
+ */
+const CONTROL_SEQUENCES = new RegExp(
+	[
+		// OSC: ESC ] … terminated by BEL, by ST (ESC \), or by end of string.
+		`${ESC}\\][^${BEL}${ESC}]*(?:${BEL}|${ESC}\\\\)?`,
+		// CSI: ESC [ params intermediates final.
+		`${ESC}\\[[0-9;?]*[ -/]*[@-~]`,
+		// Two-byte escapes (ESC c, ESC 7, …).
+		`${ESC}[0-~]`,
+		// Anything else non-printable, including a stray ESC with no sequence —
+		// EXCEPT 0x09-0x0d, the whitespace controls. Those are left for the `\s`
+		// collapse below to turn into spaces, because they separate words: deleting
+		// a newline outright would weld "line one" and "line two" together.
+		`[${String.fromCharCode(0)}-${String.fromCharCode(8)}${String.fromCharCode(0x0e)}-${String.fromCharCode(0x1f)}${String.fromCharCode(0x7f)}-${String.fromCharCode(0x9f)}]`,
+	].join("|"),
+	"g",
+);
+
+function buildLlmFailureCaptureText(reason: string): string {
+	// Sequences are DELETED, not spaced out: an ANSI sequence is zero-width, and
+	// `error<ESC>[0m:` must not become `error :`. Word separation is preserved by
+	// leaving the whitespace controls to the collapse — see CONTROL_SEQUENCES.
+	const oneLine = reason.replace(CONTROL_SEQUENCES, "").replace(/\s+/g, " ").trim();
+	const clipped =
+		oneLine.length > MAX_CAPTURE_REASON_CHARS ? `${oneLine.slice(0, MAX_CAPTURE_REASON_CHARS - 1)}…` : oneLine;
+	return [
+		`⚠ Jolli Memory: couldn't generate memory — ${clipped}`,
+		"  → The commit was recorded; use Regenerate in the Jolli Memory panel to retry.",
+	].join("\n");
+}
+
 /** Renders one event as a stdout line, or `null` to print nothing for it. */
 export function formatCaptureLine(event: CaptureProgressEvent): string | null {
 	const d = event.data ?? {};
@@ -328,12 +396,14 @@ export function formatCaptureLine(event: CaptureProgressEvent): string | null {
 		case "plan-progress":
 			return "  evaluating plan progress…";
 		case "stored":
-			// An auth-expired placeholder is NOT a real capture — show the fix
-			// instead of the success line. Legacy events did not carry the tool and
-			// therefore retain the historical Claude default.
-			return d.authExpired
-				? buildAuthFailureCaptureText(d.localAgentTool ?? "claude-code")
-				: "✓ Jolli Memory updated";
+			// A placeholder is NOT a real capture — show what went wrong instead of
+			// the success line. Auth first: `classifyLlmFailure` already narrowed
+			// that subcase and its remedy has actionable fix steps, so the raw
+			// message would be strictly less useful. Legacy events did not carry the
+			// tool and therefore retain the historical Claude default.
+			if (d.authExpired) return buildAuthFailureCaptureText(d.localAgentTool ?? "claude-code");
+			if (d.llmFailure) return buildLlmFailureCaptureText(d.llmFailure);
+			return "✓ Jolli Memory updated";
 		case "skipped":
 			return "  (no changes to capture)";
 		case "failed":

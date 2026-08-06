@@ -20,7 +20,15 @@ import {
 } from "./LlmClient.js";
 import { registerBackend } from "./localagent/BackendRegistry.js";
 import { runInvocation } from "./localagent/LocalAgentRunner.js";
-import type { LocalAgentBackend } from "./localagent/Types.js";
+import type { OptionalFlag } from "./localagent/OptionalFlags.js";
+import { loadUnsupportedFlagIds } from "./localagent/OptionalFlags.js";
+import {
+	LocalAgentAuthError,
+	type LocalAgentBackend,
+	type LocalAgentRequest,
+	LocalAgentSetupError,
+	LocalAgentTransientError,
+} from "./localagent/Types.js";
 import { COMMIT_MSG_DIFF_BUDGET } from "./Summarizer.js";
 import { runWithTrace } from "./TraceContext.js";
 
@@ -1562,6 +1570,72 @@ describe("callLlm — local-agent", () => {
 		expect(result.cachedTokens).toBe(4738);
 	});
 
+	// A completion of zero characters is a failed run, not an answer: every
+	// jollimemory template asks for structured output, and no caller can do
+	// anything useful with "". Returning it silently is what let an exhausted
+	// codex workspace overwrite a good stored summary with an empty one — the
+	// backend parsed a failure envelope down to text:"" and nothing downstream
+	// could tell that apart from a model that chose to say nothing.
+	//
+	// Enforced here rather than per-backend so all five tools are covered, and
+	// so a backend that grows a new silent failure shape cannot reintroduce it.
+	it("rejects an empty completion instead of returning it as a successful result", async () => {
+		const stub: LocalAgentBackend = {
+			id: "codex",
+			discoverExecutable: async () => ({ file: "/x/codex", version: "0.146.0" }),
+			buildInvocation: () => ({ file: "/x/codex", args: [], stdin: "", env: {}, cwd: "/tmp" }),
+			parseResult: () => ({
+				text: "",
+				inputTokens: 0,
+				outputTokens: 0,
+				cachedTokens: 0,
+				costUsd: 0,
+				stopReason: null,
+			}),
+			isPresent: () => true,
+		};
+		registerBackend(stub);
+
+		await expect(
+			callLlm({
+				action: "recap",
+				params: { commitMessage: "fix: thing", topicsSummary: "one topic" },
+				aiProvider: "local-agent",
+				localAgentTool: "codex",
+				__localAgentRun: async () => "ignored-by-stub",
+			}),
+		).rejects.toThrow(LocalAgentTransientError);
+	});
+
+	it("names the tool and action in the empty-completion error so debug.log identifies the run", async () => {
+		const stub: LocalAgentBackend = {
+			id: "codex",
+			discoverExecutable: async () => ({ file: "/x/codex", version: "0.146.0" }),
+			buildInvocation: () => ({ file: "/x/codex", args: [], stdin: "", env: {}, cwd: "/tmp" }),
+			// Whitespace only — as empty as "" for every consumer downstream.
+			parseResult: () => ({
+				text: "  \n ",
+				inputTokens: 0,
+				outputTokens: 0,
+				cachedTokens: 0,
+				costUsd: 0,
+				stopReason: null,
+			}),
+			isPresent: () => true,
+		};
+		registerBackend(stub);
+
+		await expect(
+			callLlm({
+				action: "recap",
+				params: { commitMessage: "fix: thing", topicsSummary: "one topic" },
+				aiProvider: "local-agent",
+				localAgentTool: "codex",
+				__localAgentRun: async () => "ignored-by-stub",
+			}),
+		).rejects.toThrow(/codex.*recap|recap.*codex/s);
+	});
+
 	// Three defaults that only apply when the caller leaves them off: the tool
 	// (claude-code), the spawner (the real runInvocation, not the test seam), and
 	// a fully-parameterised template (no unfilled-placeholder warning).
@@ -1610,18 +1684,102 @@ describe("callLlm — local-agent", () => {
 		);
 	});
 
-	// Only claude-code gets a resolved model id — its model selection is
-	// action-driven. Every other tool runs whatever model it is configured with,
-	// so passing an empty model tells the backend to emit no model flag at all.
-	it("passes an empty model to any tool other than claude-code", async () => {
-		let seenModel: string | undefined;
+	// NO local-agent tool receives a resolved model id — every one of them runs
+	// whatever model its own CLI is configured with, and an empty model tells the
+	// backend to emit no model flag at all. This is deliberate parity with the
+	// Settings UI, whose local-agent card offers an "Agent tool" picker and NO
+	// model picker: honouring a jollimemory-side model choice for one tool only
+	// (claude-code used to be special-cased here) made the product claim a
+	// selection the user was never given.
+	it.each(["claude-code", "codex", "cursor-agent", "opencode", "kimi"] as const)(
+		"passes an empty model to %s so the tool's own configured default is used",
+		async (toolId) => {
+			let seenModel: string | undefined;
+			const stub: LocalAgentBackend = {
+				id: toolId,
+				discoverExecutable: async () => ({ file: `/x/${toolId}`, version: "0.1.0" }),
+				buildInvocation: (_exe, req) => {
+					seenModel = req.model;
+					return { file: `/x/${toolId}`, args: [], stdin: req.prompt, env: {}, cwd: "/tmp" };
+				},
+				parseResult: () => ({
+					text: "OK",
+					inputTokens: 0,
+					outputTokens: 0,
+					cachedTokens: 0,
+					costUsd: 0,
+					stopReason: "end_turn",
+				}),
+				isPresent: () => true,
+			};
+			registerBackend(stub);
+
+			await callLlm({
+				action: "recap",
+				params: { commitMessage: "m", topicsSummary: "t" },
+				aiProvider: "local-agent",
+				localAgentTool: toolId,
+				__localAgentRun: async () => "ignored-by-stub",
+			});
+
+			expect(seenModel).toBe("");
+		},
+	);
+
+	// Since no model is SENT, the alias jollimemory resolved is a guess about what
+	// ran. A backend that can name the model it actually used overrides it, so the
+	// stored metadata reflects the run rather than the config.
+	it("records the model the backend reports running, not the resolved alias", async () => {
+		const stub: LocalAgentBackend = {
+			id: "claude-code",
+			discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.220" }),
+			buildInvocation: (_exe, req) => ({
+				file: "/x/claude",
+				args: [],
+				stdin: req.prompt,
+				env: {},
+				cwd: "/tmp",
+			}),
+			parseResult: () => ({
+				text: "OK",
+				inputTokens: 0,
+				outputTokens: 0,
+				cachedTokens: 0,
+				costUsd: 0,
+				stopReason: "end_turn",
+				model: "claude-opus-5[1m]",
+			}),
+			isPresent: () => true,
+		};
+		registerBackend(stub);
+
+		const result = await callLlm({
+			action: "recap",
+			params: { commitMessage: "m", topicsSummary: "t" },
+			aiProvider: "local-agent",
+			localAgentTool: "claude-code",
+			// The alias that would have been recorded before — and which was never
+			// sent to the CLI, so recording it would misreport the run.
+			model: "haiku",
+			__localAgentRun: async () => "ignored-by-stub",
+		});
+
+		expect(result.model).toBe("claude-opus-5[1m]");
+	});
+
+	// codex/cursor-agent/opencode/kimi name no model in their output, so the alias
+	// remains the only value available — a guess, but not a silently wrong one.
+	it("falls back to the resolved alias when the backend reports no model", async () => {
 		const stub: LocalAgentBackend = {
 			id: "codex",
 			discoverExecutable: async () => ({ file: "/x/codex", version: "0.1.0" }),
-			buildInvocation: (_exe, req) => {
-				seenModel = req.model;
-				return { file: "/x/codex", args: [], stdin: req.prompt, env: {}, cwd: "/tmp" };
-			},
+			buildInvocation: (_exe, req) => ({
+				file: "/x/codex",
+				args: [],
+				stdin: req.prompt,
+				env: {},
+				cwd: "/tmp",
+			}),
 			parseResult: () => ({
 				text: "OK",
 				inputTokens: 0,
@@ -1634,15 +1792,230 @@ describe("callLlm — local-agent", () => {
 		};
 		registerBackend(stub);
 
-		await callLlm({
+		const result = await callLlm({
 			action: "recap",
 			params: { commitMessage: "m", topicsSummary: "t" },
 			aiProvider: "local-agent",
 			localAgentTool: "codex",
+			model: "haiku",
 			__localAgentRun: async () => "ignored-by-stub",
 		});
 
-		expect(seenModel).toBe("");
+		expect(result.model).toBe("claude-haiku-4-5-20251001");
+	});
+
+	// An agent CLI that does not recognise a flag exits non-zero BEFORE running,
+	// so one unrecognised optimization flag would otherwise fail every summary on
+	// the machine, non-retryably, with no probe able to catch it up front.
+	describe("optional-flag degradation", () => {
+		const FLAGS: readonly OptionalFlag[] = [
+			{ id: "--alpha", args: ["--alpha"] },
+			{ id: "--beta", args: ["--beta", ""] },
+		];
+
+		/** Backend whose arg vector honours `disabledFlagIds`, recording each attempt. */
+		function degradingStub(attempts: string[][]): LocalAgentBackend {
+			return {
+				id: "claude-code",
+				optionalFlags: FLAGS,
+				discoverExecutable: async () => ({ file: "/x/claude", version: "2.0.30" }),
+				buildInvocation: (_exe, req: LocalAgentRequest) => {
+					const args = [
+						...(req.disabledFlagIds?.has("--alpha") ? [] : ["--alpha"]),
+						...(req.disabledFlagIds?.has("--beta") ? [] : ["--beta", ""]),
+					];
+					attempts.push(args);
+					return { file: "/x/claude", args, stdin: req.prompt, env: {}, cwd: "/tmp" };
+				},
+				parseResult: () => ({
+					text: "OK",
+					inputTokens: 0,
+					outputTokens: 0,
+					cachedTokens: 0,
+					costUsd: 0,
+					stopReason: "end_turn",
+				}),
+				isPresent: () => true,
+			};
+		}
+
+		function callWith(backend: LocalAgentBackend, dir: string, run: typeof runInvocation) {
+			registerBackend(backend);
+			return callLlm({
+				action: "recap",
+				params: { commitMessage: "m", topicsSummary: "t" },
+				aiProvider: "local-agent",
+				localAgentTool: "claude-code",
+				__localAgentRun: run,
+				__localAgentGlobalDir: dir,
+			});
+		}
+
+		let flagDir: string;
+		beforeEach(() => {
+			flagDir = mkdtempSync(join(tmpdir(), "jolli-flags-"));
+		});
+
+		it("passes every optional flag and records nothing when the CLI accepts them", async () => {
+			const attempts: string[][] = [];
+			await callWith(degradingStub(attempts), flagDir, async () => "ok");
+
+			expect(attempts).toEqual([["--alpha", "--beta", ""]]);
+			expect(await loadUnsupportedFlagIds("claude-code", "2.0.30", flagDir)).toEqual(new Set());
+		});
+
+		it("drops only the flag the CLI named, then succeeds and remembers it", async () => {
+			const attempts: string[][] = [];
+			const result = await callWith(degradingStub(attempts), flagDir, async (inv) => {
+				if (inv.args.includes("--alpha")) {
+					throw new LocalAgentSetupError("Local agent exited with code 1. error: unknown option '--alpha'");
+				}
+				return "ok";
+			});
+
+			expect(result.text).toBe("OK");
+			// The retry keeps --beta: per-flag granularity is the whole point.
+			expect(attempts).toEqual([
+				["--alpha", "--beta", ""],
+				["--beta", ""],
+			]);
+			expect(await loadUnsupportedFlagIds("claude-code", "2.0.30", flagDir)).toEqual(new Set(["--alpha"]));
+		});
+
+		it("skips straight to the working shape on the next call, with no retry", async () => {
+			const first: string[][] = [];
+			await callWith(degradingStub(first), flagDir, async (inv) => {
+				if (inv.args.includes("--alpha")) {
+					throw new LocalAgentSetupError("Local agent exited with code 1. error: unknown option '--alpha'");
+				}
+				return "ok";
+			});
+			expect(first).toHaveLength(2);
+
+			// The persisted marker is what makes this one attempt instead of two.
+			const second: string[][] = [];
+			await callWith(degradingStub(second), flagDir, async () => "ok");
+			expect(second).toEqual([["--beta", ""]]);
+		});
+
+		it("drops every remaining flag at once when the failure names none, but records nothing", async () => {
+			// Wholesale degradation is the only way through an unattributable
+			// failure, so the RETRY still happens. What it does not do is persist:
+			// this backend names its flags when argv is genuinely the problem, so a
+			// failure that named none is more likely an argv-unrelated flake (a
+			// crash, a bad TMPDIR) that had simply passed by the time of the retry.
+			// Recording it would strip the isolation for this tool version
+			// permanently, invisibly, at ~48x the prompt cost.
+			const attempts: string[][] = [];
+			await callWith(degradingStub(attempts), flagDir, async (inv) => {
+				if (inv.args.length > 0) {
+					throw new LocalAgentSetupError(
+						"Local agent exited with code 1.   --thinking  show thinking blocks",
+					);
+				}
+				return "ok";
+			});
+
+			expect(attempts).toEqual([["--alpha", "--beta", ""], []]);
+			expect(await loadUnsupportedFlagIds("claude-code", "2.0.30", flagDir)).toEqual(new Set());
+		});
+
+		it("records a wholesale drop for a backend that declares unnamedFlagFailures (the opencode case)", async () => {
+			// opencode prints its whole yargs help and identifies nothing, so blind
+			// evidence is the only evidence it will ever produce. Without the
+			// opt-out it would re-probe and burn one failed spawn on every call.
+			const attempts: string[][] = [];
+			await callWith({ ...degradingStub(attempts), unnamedFlagFailures: true }, flagDir, async (inv) => {
+				if (inv.args.length > 0) {
+					throw new LocalAgentSetupError(
+						"Local agent exited with code 1.   --thinking  show thinking blocks",
+					);
+				}
+				return "ok";
+			});
+
+			expect(attempts).toEqual([["--alpha", "--beta", ""], []]);
+			expect(await loadUnsupportedFlagIds("claude-code", "2.0.30", flagDir)).toEqual(
+				new Set(["--alpha", "--beta"]),
+			);
+		});
+
+		it("records only the named flag when a later blind drop rides along", async () => {
+			// Mixed evidence in one call: --alpha is indicted by name, then the
+			// stripped retry fails with a message naming nothing and --beta goes
+			// blind. Only --alpha is durable — otherwise one unattributable failure
+			// would launder every other flag into the store alongside it.
+			const attempts: string[][] = [];
+			await callWith(degradingStub(attempts), flagDir, async (inv) => {
+				if (inv.args.includes("--alpha")) {
+					throw new LocalAgentSetupError("Local agent exited with code 1. error: unknown option '--alpha'");
+				}
+				if (inv.args.length > 0) {
+					throw new LocalAgentSetupError("Local agent exited with code 1. Usage: agent [options]");
+				}
+				return "ok";
+			});
+
+			expect(attempts).toEqual([["--alpha", "--beta", ""], ["--beta", ""], []]);
+			expect(await loadUnsupportedFlagIds("claude-code", "2.0.30", flagDir)).toEqual(new Set(["--alpha"]));
+		});
+
+		it("records nothing when even the fully-degraded invocation fails", async () => {
+			// The flags were never the problem, so blaming them would permanently
+			// strip a healthy install of its isolation.
+			const attempts: string[][] = [];
+			await expect(
+				callWith(degradingStub(attempts), flagDir, async () => {
+					throw new LocalAgentSetupError("Local agent exited with code 1. error: unknown option '--alpha'");
+				}),
+			).rejects.toThrow(LocalAgentSetupError);
+
+			expect(await loadUnsupportedFlagIds("claude-code", "2.0.30", flagDir)).toEqual(new Set());
+		});
+
+		it("does not degrade on an auth failure, which argv cannot fix", async () => {
+			const attempts: string[][] = [];
+			await expect(
+				callWith(degradingStub(attempts), flagDir, async () => {
+					throw new LocalAgentAuthError("Not logged in");
+				}),
+			).rejects.toThrow(LocalAgentAuthError);
+
+			expect(attempts).toHaveLength(1);
+			expect(await loadUnsupportedFlagIds("claude-code", "2.0.30", flagDir)).toEqual(new Set());
+		});
+
+		it("runs exactly once for a backend that declares no optional flags", async () => {
+			let calls = 0;
+			registerBackend({
+				id: "codex",
+				discoverExecutable: async () => ({ file: "/x/codex", version: "1" }),
+				buildInvocation: (_e, req) => ({ file: "/x/codex", args: [], stdin: req.prompt, env: {}, cwd: "/tmp" }),
+				parseResult: () => ({
+					text: "OK",
+					inputTokens: 0,
+					outputTokens: 0,
+					cachedTokens: 0,
+					costUsd: 0,
+					stopReason: "end_turn",
+				}),
+				isPresent: () => true,
+			});
+			await expect(
+				callLlm({
+					action: "recap",
+					params: { commitMessage: "m", topicsSummary: "t" },
+					aiProvider: "local-agent",
+					localAgentTool: "codex",
+					__localAgentGlobalDir: flagDir,
+					__localAgentRun: async () => {
+						calls++;
+						throw new LocalAgentSetupError("boom");
+					},
+				}),
+			).rejects.toThrow(LocalAgentSetupError);
+			expect(calls).toBe(1);
+		});
 	});
 
 	it("throws when the action has no known template", async () => {

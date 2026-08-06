@@ -20,6 +20,17 @@ import { getBackend } from "./localagent/BackendRegistry.js";
 import "./localagent/BuiltinBackends.js";
 import { describeCandidate } from "./localagent/ExecutableResolver.js";
 import { runInvocation as defaultRunInvocation } from "./localagent/LocalAgentRunner.js";
+import {
+	attributeUnsupportedFlag,
+	loadUnsupportedFlagIds,
+	recordUnsupportedFlagIds,
+} from "./localagent/OptionalFlags.js";
+import {
+	type LocalAgentBackend,
+	LocalAgentSetupError,
+	LocalAgentTransientError,
+	type ResolvedExecutable,
+} from "./localagent/Types.js";
 import { fillTemplate, findUnfilledPlaceholders, TEMPLATES } from "./PromptTemplates.js";
 import { resolveModelId } from "./Summarizer.js";
 import { currentTraceHeader, newTraceHeader, TRACE_HEADER_NAME } from "./TraceContext.js";
@@ -314,6 +325,11 @@ export interface LlmCallOptions extends LlmCredentials {
 	 * from config. Ignored outside the `local-agent` path.
 	 */
 	readonly __localAgentRun?: typeof defaultRunInvocation;
+	/**
+	 * Test-only override for the machine-global dir holding the unsupported-flag
+	 * store. Same test-seam convention as `__localAgentRun`; never set from config.
+	 */
+	readonly __localAgentGlobalDir?: string;
 }
 
 /** Result from an LLM call */
@@ -436,6 +452,155 @@ function isPrematureClose(err: unknown): boolean {
 	return text.includes("premature close");
 }
 
+interface FlagDegradationOpts {
+	readonly prompt: string;
+	readonly model: string;
+	readonly systemPrompt: string;
+	readonly timeoutMs?: number;
+	readonly globalDir?: string;
+	/**
+	 * Out-param collecting the cwd of EVERY invocation built here, including the
+	 * ones whose runs failed. `buildInvocation` mints a fresh temp dir per call
+	 * (`createLocalAgentCwd`), so a degrading retry creates one per attempt and
+	 * the caller's cleanup must see them all — returning only the last would leak
+	 * a directory per dropped flag. An out-param rather than a return value
+	 * because the caller needs the list on the throwing path too.
+	 */
+	readonly spawnedCwds: string[];
+}
+
+/**
+ * Removes a temp cwd that WE created. Callers pass arbitrary cwds (tests inject
+ * stubs with e.g. a bare "/tmp"), so the prefix check is what stops a blind
+ * recursive delete of an unrelated directory. LOCAL_AGENT_TMP_PREFIX is the
+ * single source of truth, shared with createLocalAgentCwd in AgentReentry.
+ */
+function removeLocalAgentCwd(cwd: string): void {
+	if (!cwd.startsWith(tmpdir()) || !basename(cwd).startsWith(LOCAL_AGENT_TMP_PREFIX)) return;
+	try {
+		rmSync(cwd, { recursive: true, force: true });
+	} catch (err) {
+		log.warn("Failed to remove local-agent temp cwd %s: %s", cwd, (err as Error).message);
+	}
+}
+
+/**
+ * Runs the invocation, dropping the backend's optional flags one at a time if
+ * the CLI turns out not to understand them, and remembering the outcome per
+ * tool+version so later calls skip straight to the working shape.
+ *
+ * The point is that an older agent CLI does not IGNORE a flag it does not know —
+ * it exits non-zero before running, so a single unrecognised optimization flag
+ * would otherwise fail every summary on the machine, non-retryably, with no
+ * probe able to catch it in advance (see `OptionalFlags.ts` for why).
+ *
+ * Three rules keep this from becoming a guessing game:
+ *
+ *   * Nothing is persisted until a degraded invocation SUCCEEDS. Attribution
+ *     from stderr only chooses what to drop first — a wrong guess just costs one
+ *     more attempt and is never written down. This is what lets opencode work at
+ *     all: it names no flag, so its failures degrade wholesale.
+ *   * A success is only written down for flags the CLI actually INDICTED, unless
+ *     the backend declares `unnamedFlagFailures`. Success alone is a weaker
+ *     signal than it looks: a setup error unrelated to argv (a crash, a bad
+ *     TMPDIR) also degrades wholesale, and if that flake has passed by the time
+ *     the stripped retry runs, the retry succeeds and would otherwise record
+ *     every isolation flag as unsupported for that tool version — permanently,
+ *     invisibly, and at ~48x the prompt cost. claude and codex both name the
+ *     flag when argv really is the problem, so requiring attribution costs them
+ *     nothing; opencode names nothing ever, which is exactly what its opt-out is
+ *     for.
+ *   * Only `LocalAgentSetupError` degrades. Auth and transient failures are not
+ *     about argv, and retrying them stripped would be noise. (`claude` reports
+ *     an expired login on STDOUT, so it arrives as an auth error from
+ *     `parseResult`, not here.)
+ *
+ * Attempts are bounded by the flag count: each round drops at least one, so the
+ * worst case is `optionalFlags.length + 1` spawns and only on a genuinely
+ * ancient CLI. A backend with no optional flags runs exactly once.
+ */
+async function runWithFlagDegradation(
+	backend: LocalAgentBackend,
+	exe: ResolvedExecutable,
+	run: typeof defaultRunInvocation,
+	opts: FlagDegradationOpts,
+): Promise<{ stdout: string; disabledFlagIds: ReadonlySet<string> }> {
+	const flags = backend.optionalFlags ?? [];
+	const known = await loadUnsupportedFlagIds(backend.id, exe.version, opts.globalDir);
+	// Only the ids learned in THIS call get written back; `known` is already on
+	// disk and re-recording it would rewrite the file after every single run.
+	let disabled = new Set(known);
+	// Subset of the above that the CLI's own failure text named. Everything else
+	// was dropped blind, and is not durable evidence — see the third rule above.
+	const indicted = new Set<string>();
+
+	for (;;) {
+		const invocation = backend.buildInvocation(exe, {
+			prompt: opts.prompt,
+			model: opts.model,
+			systemPrompt: opts.systemPrompt,
+			disabledFlagIds: disabled,
+		});
+		opts.spawnedCwds.push(invocation.cwd);
+		try {
+			const stdout = await run(invocation, { timeoutMs: opts.timeoutMs });
+			const learned = new Set([...disabled].filter((id) => !known.has(id)));
+			// Record the indicted ids only, unless this backend can never indict one.
+			const durable = backend.unnamedFlagFailures
+				? learned
+				: new Set([...learned].filter((id) => indicted.has(id)));
+			if (durable.size > 0) {
+				log.warn(
+					"Local agent %s@%s rejected %s; dropped and recorded — summaries keep working, without that isolation.",
+					backend.id,
+					exe.version,
+					[...durable].join(", "),
+				);
+				await recordUnsupportedFlagIds(backend.id, exe.version, durable, opts.globalDir);
+			}
+			// A blind drop that worked is NOT written down for a CLI that names its
+			// flags: the likeliest reading is a one-off setup failure that had nothing
+			// to do with argv, and the next call retries at full isolation. Logged
+			// because the alternative reading — a genuinely unrecognised flag that
+			// somehow went unnamed — costs one wasted spawn on every subsequent call,
+			// and this line is the only place that would ever show up.
+			const blind = new Set([...learned].filter((id) => !durable.has(id)));
+			if (blind.size > 0) {
+				log.warn(
+					"Local agent %s@%s succeeded after blindly dropping %s, but its failure named no flag — not recording; full isolation will be retried next call.",
+					backend.id,
+					exe.version,
+					[...blind].join(", "),
+				);
+			}
+			return { stdout, disabledFlagIds: disabled };
+		} catch (err) {
+			const remaining = flags.filter((f) => !disabled.has(f.id));
+			if (!(err instanceof LocalAgentSetupError) || remaining.length === 0) throw err;
+			// Narrow to the named flag when the CLI named one; otherwise drop every
+			// remaining optional flag at once. The wholesale step is what covers a CLI
+			// whose failure text identifies nothing, and it is why this loop always
+			// terminates even with no attribution at all.
+			const attribution = attributeUnsupportedFlag(err.message, remaining);
+			const dropping = attribution ? [attribution.flag] : remaining;
+			log.info(
+				"Local agent %s failed with a setup error; retrying without %s (%s)",
+				backend.id,
+				dropping.map((f) => f.id).join(", "),
+				// Which phrase indicted the flag, or that nothing did. Both halves are
+				// worth having in debug.log: codex indicts one flag two different ways
+				// (`--disable` vs `Unknown feature flag: plugins`) and they mean
+				// different things, while "named nothing" is the signal that this is the
+				// wholesale path — opencode's normal case, but on any other tool it means
+				// the failure was probably never about argv at all.
+				attribution ? `matched "${attribution.matched}"` : "failure named no flag; dropping all remaining",
+			);
+			if (attribution) indicted.add(attribution.flag.id);
+			disabled = new Set([...disabled, ...dropping.map((f) => f.id)]);
+		}
+	}
+}
+
 /**
  * Local-agent mode: drive a locally-installed agent CLI (v1: Claude Code)
  * headless, using the tool's own subscription login. Mirrors callDirect's
@@ -462,38 +627,100 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 	const tool = options.localAgentTool ?? "claude-code";
 	const backend = getBackend(tool);
 	const exe = await backend.discoverExecutable(options.localAgentPath);
-	// claude-code keeps the resolved alias (its model selection is action-driven);
-	// every other tool uses its own default model (empty ⇒ no model flag passed).
-	const effectiveModel = tool === "claude-code" ? model : "";
-	const invocation = backend.buildInvocation(exe, {
-		prompt,
-		model: effectiveModel,
-		systemPrompt: "You output only what the prompt asks for, with no preamble or commentary.",
-	});
-
+	// NO tool receives a resolved model id: every local-agent CLI runs whatever
+	// model it is configured with, and an empty model tells the backend to emit no
+	// model flag at all. claude-code used to be special-cased here and got the
+	// action-driven alias; the local-agent provider now defers to the tool
+	// uniformly, matching the Settings local-agent card, which offers an "Agent
+	// tool" picker and no model picker.
+	//
+	// Know what this gives up, because it is not nothing:
+	//
+	//   * `jolli configure --set model=…` is a real, documented setting
+	//     (ConfigureCommand.ts) and it no longer reaches this provider.
+	//   * `PlanProgressEvaluator` deliberately asks for `haiku` to keep a
+	//     high-frequency call cheap. That intent is discarded here too.
+	//   * The replacement is the user's own CLI default, which can be a much
+	//     bigger model — measured on one machine, claude-code ran `claude-opus-5[1m]`
+	//     where the jollimemory default alias would have picked sonnet. Cost and
+	//     latency both move, and the spend lands on the tool's subscription.
+	//
+	// The trade accepted: under a subscription the user, not jollimemory, is the
+	// one paying, so their configured default is the right authority — and it is
+	// the ONLY authority available for the other four tools regardless. If a
+	// per-action model ever matters again, the fix is a model picker on the
+	// local-agent card feeding a real per-tool model id, not a special case here.
+	//
+	// Metadata stays honest despite all of the above: backends that can name the
+	// model they ran report it in `LocalAgentOutcome.model`, which wins over this
+	// alias below. See the `resultModel` note at the return.
 	const run = options.__localAgentRun ?? defaultRunInvocation;
 	const startTime = Date.now();
+	// Collected across every attempt so the `finally` below cleans up the temp
+	// dirs of failed attempts too, not just the last one.
+	const spawnedCwds: string[] = [];
 	try {
-		const stdout = await run(invocation, { timeoutMs: options.timeoutMs });
+		const { stdout, disabledFlagIds } = await runWithFlagDegradation(backend, exe, run, {
+			prompt,
+			model: "",
+			systemPrompt: "You output only what the prompt asks for, with no preamble or commentary.",
+			timeoutMs: options.timeoutMs,
+			globalDir: options.__localAgentGlobalDir,
+			spawnedCwds,
+		});
 		const outcome = backend.parseResult(stdout);
+
+		// An empty completion is a FAILED run, not an answer. Every action's
+		// template asks for structured output, so no caller has a use for "" — and
+		// the ones that parse it produce a convincing empty artifact instead of an
+		// error. That is how an exhausted codex workspace overwrote a good stored
+		// summary: the backend reduced a failure envelope to text:"", the summarizer
+		// read 0 topics from 0 chars, and regenerate persisted the result as if the
+		// model had simply had nothing to say.
+		//
+		// Enforced at this seam rather than in each backend so all five tools are
+		// covered at once, and so the next silent-failure envelope some CLI invents
+		// cannot slip through a backend that has not learned to recognise it. The
+		// backends stay responsible for naming a failure they CAN see (they have the
+		// reason text); this only catches the ones that got past them.
+		if (outcome.text.trim() === "") {
+			throw new LocalAgentTransientError(
+				`Local agent "${tool}" returned an empty completion for action=${options.action}. ` +
+					`The tool exited without producing a response; see debug.log for its output.`,
+			);
+		}
+
+		// Prefer the model the tool reported actually running over the alias we
+		// resolved but never sent. Claude Code names it (`modelUsage`); codex,
+		// cursor-agent, opencode and kimi do not, so those still fall back to the
+		// alias — a guess, but the only value available, and the same one every
+		// other provider records.
+		const resultModel = outcome.model ?? model;
 
 		// Surface the subscription cost the backend parsed. `LlmCallResult` has no
 		// cost field (no provider carries one), so without this the value would be
 		// dead — and local-agent spend is otherwise invisible, since it bills the
-		// tool's own subscription rather than a jollimemory-metered key.
+		// tool's own subscription rather than a jollimemory-metered key. `model` is
+		// logged beside it because no model is sent any more: which one ran is the
+		// tool's decision, and this line is where that becomes observable.
 		log.info(
-			"Local-agent completion: action=%s tool=%s cost=$%s in=%d out=%d cached=%d",
+			"Local-agent completion: action=%s tool=%s model=%s cost=$%s in=%d out=%d cached=%d%s",
 			options.action,
 			tool,
+			resultModel,
 			outcome.costUsd.toFixed(4),
 			outcome.inputTokens,
 			outcome.outputTokens,
 			outcome.cachedTokens,
+			// Only present on a CLI too old for some isolation flag. Worth carrying
+			// on the success line: the run worked, so nothing else would ever hint
+			// that this machine is paying more prompt tokens than it needs to.
+			disabledFlagIds.size > 0 ? ` degraded=${[...disabledFlagIds].join(",")}` : "",
 		);
 
 		return {
 			text: outcome.text,
-			model,
+			model: resultModel,
 			inputTokens: outcome.inputTokens,
 			outputTokens: outcome.outputTokens,
 			cachedTokens: outcome.cachedTokens,
@@ -525,18 +752,9 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 		);
 		throw err;
 	} finally {
-		// Only remove a cwd WE created (createLocalAgentCwd's mkdtemp under tmpdir
-		// with our prefix); callLocalAgent is backend-generic and tests inject stubs
-		// with arbitrary cwds (e.g. a bare "/tmp"), so a blind rmSync here could
-		// delete an unrelated directory. LOCAL_AGENT_TMP_PREFIX is the single
-		// source of truth shared with createLocalAgentCwd in AgentReentry.
-		if (invocation.cwd.startsWith(tmpdir()) && basename(invocation.cwd).startsWith(LOCAL_AGENT_TMP_PREFIX)) {
-			try {
-				rmSync(invocation.cwd, { recursive: true, force: true });
-			} catch (err) {
-				log.warn("Failed to remove local-agent temp cwd %s: %s", invocation.cwd, (err as Error).message);
-			}
-		}
+		// Every attempt, not just the successful one: a flag-degrading retry builds
+		// a fresh invocation each round and each mints its own temp cwd.
+		for (const cwd of spawnedCwds) removeLocalAgentCwd(cwd);
 	}
 }
 

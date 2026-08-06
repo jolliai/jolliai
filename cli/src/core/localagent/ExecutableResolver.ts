@@ -474,12 +474,30 @@ function logDiscovery(
 	);
 }
 
+/**
+ * Pulls the version out of a `--version` line. Prefers the first token that
+ * looks numeric, falling back to the first token when none does.
+ *
+ * Taking token[0] unconditionally is wrong for any CLI that prints its own name
+ * first, and codex does: `codex-cli 0.146.0-alpha.3` yielded the literal
+ * `"codex-cli"` for EVERY codex build. Two things silently broke as a result —
+ * `isNewer` compared every codex candidate as equal (so PATH order picked the
+ * winner instead of the newest), and the version-keyed unsupported-flag store
+ * (`OptionalFlags.ts`) could never expire an entry on upgrade, permanently
+ * stranding a degraded invocation. Measured across all five tools; only codex
+ * changes, the other four already put the number first.
+ */
+export function extractProbeVersion(out: string): string | undefined {
+	const tokens = out.trim().split(/\s+/).filter(Boolean);
+	return tokens.find((t) => /^v?\d+\./.test(t)) ?? tokens[0];
+}
+
 /** Default probe: run launcher args + capability args via execFile (never shell). */
 function defaultProbe(candidate: Candidate, probeArgs: readonly string[]): { ok: boolean; version?: string } {
 	try {
 		const args = [...(candidate.launchArgs ?? []), ...probeArgs];
 		const out = execFileSyncHidden(candidate.file, args, { encoding: "utf8", timeout: 10_000 });
-		const version = out.trim().split(/\s+/)[0];
+		const version = extractProbeVersion(out);
 		return { ok: Boolean(version), version };
 	} catch {
 		return { ok: false };

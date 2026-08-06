@@ -31,7 +31,7 @@
  * coverage, and a temp cwd is not a git repo either way.
  */
 
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -65,7 +65,19 @@ export const LOCAL_AGENT_TMP_PREFIX = "jolli-localagent-";
  */
 export function createLocalAgentCwd(): string {
 	const cwd = mkdtempSync(join(tmpdir(), LOCAL_AGENT_TMP_PREFIX));
-	writeFileSync(join(cwd, LOCAL_AGENT_SENTINEL), "", "utf-8");
+	try {
+		writeFileSync(join(cwd, LOCAL_AGENT_SENTINEL), "", "utf-8");
+	} catch (err) {
+		// The ONLY path that can strand one of these directories. `LlmClient` cleans
+		// up every cwd it knows about, but it learns them from `buildInvocation`'s
+		// RETURN value — a throw in here means the directory was never registered, so
+		// its `finally` cannot see it. Undo our own half-built state and rethrow
+		// unchanged: the caller's classification (setup vs auth vs transient) is not
+		// ours to reinterpret, and a failure to write into a just-created temp dir is
+		// a broken TMPDIR, not something a retry without the sentinel could survive.
+		rmSync(cwd, { recursive: true, force: true });
+		throw err;
+	}
 	return cwd;
 }
 

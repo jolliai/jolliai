@@ -3,9 +3,10 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { CODEX_SPEC, CodexBackend } from "./CodexBackend.js";
 import * as resolver from "./ExecutableResolver.js";
-import { LocalAgentAuthError, LocalAgentSetupError } from "./Types.js";
+import { LocalAgentAuthError, LocalAgentSetupError, LocalAgentTransientError } from "./Types.js";
 
 const fixture = readFileSync(join(__dirname, "__fixtures__/codex/success.json"), "utf8");
+const outOfCredits = readFileSync(join(__dirname, "__fixtures__/codex/out-of-credits.json"), "utf8");
 const b = new CodexBackend();
 
 describe("CodexBackend", () => {
@@ -69,8 +70,59 @@ describe("CodexBackend", () => {
 			"read-only",
 			"-C",
 			inv.cwd,
+			"--disable",
+			"plugins",
 			"sys\n\nhi",
 		]);
+	});
+
+	it("disables plugins via the feature flag, as an adjacent --disable/plugins pair", () => {
+		// Measured on 0.146.0-alpha.3 (RUST_LOG=info stderr): this drops the 4
+		// codex_core_{plugins,skills} loader WARNs and the `plugins_enabled=true`
+		// line, while `model=` stays on the user's configured value.
+		const inv = b.buildInvocation({ file: "codex", version: "1" }, { prompt: "hi", model: "", systemPrompt: "" });
+		const at = inv.args.indexOf("--disable");
+		expect(at).toBeGreaterThanOrEqual(0);
+		expect(inv.args[at + 1]).toBe("plugins");
+	});
+
+	it("omits the --disable pair when the installed codex is known to reject it", () => {
+		// Both the flag AND its feature name have to go: a bare `--disable` would
+		// consume the prompt as its value.
+		const inv = b.buildInvocation(
+			{ file: "codex", version: "1" },
+			{ prompt: "hi", model: "", systemPrompt: "", disabledFlagIds: new Set(["--disable"]) },
+		);
+		expect(inv.args).not.toContain("--disable");
+		expect(inv.args).not.toContain("plugins");
+		expect(inv.args.at(-1)).toBe("hi");
+	});
+
+	it("matches codex's unknown-FEATURE failure too, which never writes the flag name", () => {
+		// `--disable` exists but the feature does not (exit 1, different phrasing).
+		// Same remedy, so the declaration must carry the phrase explicitly.
+		expect(b.optionalFlags?.[0]?.matches).toContain("Unknown feature flag: plugins");
+	});
+
+	it("never passes -c table overrides, which codex merges into a no-op", () => {
+		// `-c mcp_servers={}` / `-c plugins={}` were shipped as the isolation
+		// mechanism and do NOTHING: `-c` is a dotted-path set that MERGES, so an
+		// empty inline table merges nothing. Measured — both still loaded, stderr
+		// state byte-identical to baseline. Only scalar dotted paths (what
+		// `--disable plugins` expands to) take effect.
+		const inv = b.buildInvocation({ file: "codex", version: "1" }, { prompt: "hi", model: "", systemPrompt: "" });
+		expect(inv.args).not.toContain("mcp_servers={}");
+		expect(inv.args).not.toContain("plugins={}");
+	});
+
+	it("never passes --ignore-user-config, which would silently change the model", () => {
+		// It does genuinely drop the user's MCP servers (measured: 5 entries → the
+		// built-in `codex_apps` alone) but takes `model` with it: gpt-5.4 →
+		// gpt-5.6-sol on the same machine. LlmClient sends EVERY local-agent tool an
+		// empty model, so codex resolves it from `$CODEX_HOME/config.toml` — and
+		// ignoring that file silently changes which model writes every summary.
+		const inv = b.buildInvocation({ file: "codex", version: "1" }, { prompt: "hi", model: "", systemPrompt: "" });
+		expect(inv.args).not.toContain("--ignore-user-config");
 	});
 
 	it("includes -m when a model is requested", () => {
@@ -86,6 +138,8 @@ describe("CodexBackend", () => {
 			"read-only",
 			"-C",
 			inv.cwd,
+			"--disable",
+			"plugins",
 			"-m",
 			"gpt-5",
 			"hi",
@@ -95,6 +149,89 @@ describe("CodexBackend", () => {
 	it("classifies an auth-phrased error event", () => {
 		const stream = JSON.stringify({ type: "error", message: "please login to continue: unauthorized" });
 		expect(() => b.parseResult(stream)).toThrow(LocalAgentAuthError);
+	});
+
+	// Real capture from codex 0.146.0-alpha.3 on an exhausted workspace (exit 1,
+	// stderr only "Reading additional input from stdin..."). This shipped as a
+	// SILENT failure: the stream is well-formed JSONL, so `sawEvent` was true and
+	// the setup guard did not fire; "out of credits" names no login word, so the
+	// auth regex did not fire either. parseResult returned text:"", the summarizer
+	// parsed 0 topics from 0 chars, and regenerate OVERWROTE a good stored summary
+	// with an empty one.
+	it("throws on the real out-of-credits stream instead of returning an empty completion", () => {
+		expect(() => b.parseResult(outOfCredits)).toThrow(/out of credits/i);
+	});
+
+	it("classifies a non-auth failure event as transient, never as a setup fault", () => {
+		// Not LocalAgentSetupError specifically: that class is the ONLY one that
+		// triggers LlmClient's optional-flag degradation, and this failure has
+		// nothing to do with argv — degrading would drop `--disable plugins` and
+		// retry into the same exhausted workspace.
+		expect(() => b.parseResult(outOfCredits)).toThrow(LocalAgentTransientError);
+		expect(() => b.parseResult(outOfCredits)).not.toThrow(LocalAgentSetupError);
+	});
+
+	it("reads turn.failed's nested error.message, which is not the top-level `message` field", () => {
+		// codex reports a mid-turn failure twice, and the two events carry the text
+		// in different places: `error` uses `message`, `turn.failed` uses
+		// `error.message`. A parser that only reads the top level sees an empty
+		// reason on any stream where the standalone `error` event is absent.
+		const stream = JSON.stringify({ type: "turn.failed", error: { message: "model stream disconnected" } });
+		expect(() => b.parseResult(stream)).toThrow(/model stream disconnected/);
+	});
+
+	it("lets a recovered error event through when the turn still produced an answer", () => {
+		// An `error` event is a CANDIDATE reason, not a verdict: codex emits them
+		// for conditions it retries past (a dropped model stream). Throwing on
+		// sight would turn a run that recovered into a hard failure — and protects
+		// nothing extra, since a stream that errors and produces no text still
+		// throws, from the end-of-stream check below.
+		const stream = [
+			JSON.stringify({ type: "turn.started" }),
+			JSON.stringify({ type: "error", message: "stream disconnected; retrying" }),
+			JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "the answer" } }),
+			JSON.stringify({ type: "turn.completed", usage: { output_tokens: 3 } }),
+		].join("\n");
+
+		expect(() => b.parseResult(stream)).not.toThrow();
+		expect(b.parseResult(stream).text).toBe("the answer");
+	});
+
+	it("throws the held error reason when the stream ends with no assistant text and no turn.failed", () => {
+		// The other half of the split: nothing recovered it, so the held reason is
+		// the only explanation available. LlmClient's empty-completion guard would
+		// also catch this, but only generically — this is what puts codex's own
+		// words in front of the user.
+		const stream = [
+			JSON.stringify({ type: "turn.started" }),
+			JSON.stringify({ type: "error", message: "Your workspace is out of credits." }),
+		].join("\n");
+
+		expect(() => b.parseResult(stream)).toThrow(LocalAgentTransientError);
+		expect(() => b.parseResult(stream)).toThrow(/out of credits/i);
+	});
+
+	it("keeps the FIRST error reason, the root cause rather than a cascade from it", () => {
+		const stream = [
+			JSON.stringify({ type: "error", message: "Your workspace is out of credits." }),
+			JSON.stringify({ type: "error", message: "session aborted" }),
+		].join("\n");
+
+		expect(() => b.parseResult(stream)).toThrow(/out of credits/i);
+	});
+
+	it("does not mistake a successful turn for a failure just because an item mentions errors", () => {
+		// Guard against classifying on the wrong haystack: the assistant TEXT is
+		// free-form and routinely contains the word "error".
+		const stream = [
+			JSON.stringify({
+				type: "item.completed",
+				item: { type: "agent_message", text: "Fixed the unauthorized login error." },
+			}),
+			JSON.stringify({ type: "turn.completed", usage: { output_tokens: 7 } }),
+		].join("\n");
+		expect(() => b.parseResult(stream)).not.toThrow();
+		expect(b.parseResult(stream).text).toContain("unauthorized login error");
 	});
 
 	it("throws LocalAgentSetupError when no JSON event is parsed at all", () => {

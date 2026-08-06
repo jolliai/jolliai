@@ -2074,6 +2074,11 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// marker is auth-specific for an expired local `claude` login (drives the
 	// SessionStart reminder + post-commit sign-in guidance). Unset on success.
 	let llmFailureKind: SummaryErrorKind | undefined;
+	// The failing error's own message, kept for the `stored` progress event. The
+	// stored summary records only a `SummaryErrorKind`, so this is the last point
+	// at which the reason still exists — and the commit output is the only place
+	// the user is shown it.
+	let llmFailureReason: string | undefined;
 
 	try {
 		summaryResult = await generateSummary(summaryParams);
@@ -2101,6 +2106,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 			// A genuine empty response would have stopReason: "end_turn" and a real model ID.
 			log.error("API call failed after retry: %s", (retryError as Error).message);
 			llmFailureKind = classifyLlmFailure(retryError);
+			llmFailureReason = retryError instanceof Error ? retryError.message : String(retryError);
 			log.warn(
 				"Saving summary with empty topics + %s marker for commit %s",
 				llmFailureKind,
@@ -2276,6 +2282,12 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 				authExpired: true,
 				localAgentTool: config.localAgentTool ?? "claude-code",
 			}),
+			// Every OTHER failure carries its reason instead. Both are guarded
+			// spreads, so a healthy capture emits neither key and keeps printing the
+			// plain success line.
+			...(llmFailureKind !== undefined && llmFailureKind !== LOCAL_AGENT_AUTH && llmFailureReason !== undefined
+				? { llmFailure: llmFailureReason }
+				: {}),
 		},
 	});
 

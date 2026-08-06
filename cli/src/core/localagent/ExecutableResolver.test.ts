@@ -9,10 +9,50 @@ import {
 	discover,
 	discoverPresence,
 	discoveryPath,
+	extractProbeVersion,
 	isPresent,
 	resolveExecutable,
 } from "./ExecutableResolver.js";
 import { LocalAgentSetupError } from "./Types.js";
+
+describe("extractProbeVersion", () => {
+	// Real `--version` output from every shipped tool, captured on one machine.
+	// codex is the reason this function exists: it prints its NAME first, so the
+	// old token[0] rule returned the literal "codex-cli" for every build.
+	it.each([
+		["2.1.220 (Claude Code)", "2.1.220", "claude"],
+		["codex-cli 0.146.0-alpha.3", "0.146.0-alpha.3", "codex"],
+		["1.18.10", "1.18.10", "opencode"],
+		["2026.07.23-e383d2b", "2026.07.23-e383d2b", "cursor-agent"],
+		["0.31.1", "0.31.1", "kimi"],
+	])("extracts %s -> %s (%s)", (raw, expected) => {
+		expect(extractProbeVersion(raw)).toBe(expected);
+	});
+
+	it("keeps every codex build distinguishable, so a version-keyed cache can expire", () => {
+		// The concrete failure this prevents: identical keys meant `isNewer` saw
+		// every codex as equal AND the unsupported-flag store could never retry a
+		// flag after an upgrade.
+		expect(extractProbeVersion("codex-cli 0.146.0-alpha.3")).not.toBe(extractProbeVersion("codex-cli 0.200.0"));
+	});
+
+	it("tolerates a leading v", () => {
+		expect(extractProbeVersion("mytool v3.2.1")).toBe("v3.2.1");
+	});
+
+	it("falls back to the first token when nothing looks like a version", () => {
+		expect(extractProbeVersion("unknown-build")).toBe("unknown-build");
+	});
+
+	it("returns undefined for empty output, which the probe reads as a failure", () => {
+		expect(extractProbeVersion("   \n ")).toBeUndefined();
+	});
+
+	it("ignores a name that merely contains digits", () => {
+		// `s3cmd` has a digit but no dot, so it must not be mistaken for a version.
+		expect(extractProbeVersion("s3cmd 2.4.0")).toBe("2.4.0");
+	});
+});
 
 const spec = { binName: "codex", knownPaths: () => [], probeArgs: ["--version"] as const };
 

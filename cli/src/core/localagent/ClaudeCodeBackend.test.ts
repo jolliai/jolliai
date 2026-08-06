@@ -142,6 +142,50 @@ describe("ClaudeCodeBackend.parseResult", () => {
 		const out = backend.parseResult(json);
 		expect(out.cachedTokens).toBe(150);
 	});
+
+	// No model is sent to the CLI any more, so `modelUsage` is the only record of
+	// what actually ran — without reading it back, stored metadata would name a
+	// model that was never asked for. Key shape captured from a real 2.1.220 run.
+	it("reports the model the CLI actually ran, keeping the context-window variant", () => {
+		const json = JSON.stringify({
+			is_error: false,
+			result: "OK",
+			modelUsage: {
+				"claude-opus-5[1m]": { outputTokens: 4, canonicalModel: "claude-opus-5" },
+			},
+		});
+		// The `[1m]` suffix is a distinct SKU at a distinct price, so the map key
+		// wins over the tidier `canonicalModel`.
+		expect(backend.parseResult(json).model).toBe("claude-opus-5[1m]");
+	});
+
+	it("picks the highest-output model when the envelope names more than one", () => {
+		const json = JSON.stringify({
+			is_error: false,
+			result: "OK",
+			modelUsage: {
+				"claude-haiku-4-5": { outputTokens: 3 },
+				"claude-opus-5": { outputTokens: 900 },
+			},
+		});
+		expect(backend.parseResult(json).model).toBe("claude-opus-5");
+	});
+
+	it("leaves model unset when the envelope names none, so the caller can fall back", () => {
+		// Real runs emit `"modelUsage":{}` on an error turn, and an older CLI may
+		// omit the field entirely. Both must read as "unknown", not as a model id.
+		for (const envelope of [
+			{ is_error: false, result: "OK" },
+			{ is_error: false, result: "OK", modelUsage: {} },
+		]) {
+			expect(backend.parseResult(JSON.stringify(envelope)).model).toBeUndefined();
+		}
+	});
+
+	it("tolerates a null per-model entry rather than throwing", () => {
+		const json = JSON.stringify({ is_error: false, result: "OK", modelUsage: { "claude-opus-5": null } });
+		expect(backend.parseResult(json).model).toBe("claude-opus-5");
+	});
 });
 
 describe("ClaudeCodeBackend.buildInvocation", () => {
@@ -164,8 +208,107 @@ describe("ClaudeCodeBackend.buildInvocation", () => {
 			"--permission-mode",
 			"dontAsk",
 			"--no-session-persistence",
+			"--strict-mcp-config",
+			"--disable-slash-commands",
+			"--setting-sources",
+			"",
 		]);
 		expect(inv.stdin).toBe("PROMPT_BODY");
+	});
+
+	it("omits --model entirely when no model is requested, so the CLI's own default is used", () => {
+		// LlmClient sends every local-agent tool an EMPTY model, because the
+		// Settings UI offers no model picker for this provider. Passing `--model ""`
+		// would be an explicit empty selection rather than "no opinion", so the flag
+		// pair has to disappear — matching how codex/cursor-agent/kimi already do it.
+		const inv = backend.buildInvocation(exe, { ...req, model: "" });
+		expect(inv.args).not.toContain("--model");
+		expect(inv.args).toEqual([
+			"-p",
+			"--output-format",
+			"json",
+			"--system-prompt",
+			"SYS",
+			"--tools",
+			"",
+			"--permission-mode",
+			"dontAsk",
+			"--no-session-persistence",
+			"--strict-mcp-config",
+			"--disable-slash-commands",
+			"--setting-sources",
+			"",
+		]);
+	});
+
+	it("isolates the child from the user's MCP servers, skills and settings sources", () => {
+		const inv = backend.buildInvocation(exe, req);
+		// These three carry ~6.3k tokens of unusable tool/skill schema into a
+		// prompt that is forbidden from calling any tool (`--tools ""`), so they
+		// are load-bearing for cost, not cosmetic. Asserted by name as well as in
+		// the full vector above so a reordering refactor cannot silently drop one.
+		expect(inv.args).toContain("--strict-mcp-config");
+		expect(inv.args).toContain("--disable-slash-commands");
+		expect(inv.args.slice(inv.args.indexOf("--setting-sources"))).toEqual(["--setting-sources", ""]);
+	});
+
+	it("omits an isolation flag the installed CLI is known to reject, keeping the others", () => {
+		// An older `claude` exits non-zero on an unknown flag rather than ignoring
+		// it, so without this one stale install would fail every summary. Losing
+		// one flag only costs the tokens that flag was saving.
+		const inv = backend.buildInvocation(exe, { ...req, disabledFlagIds: new Set(["--disable-slash-commands"]) });
+		expect(inv.args).not.toContain("--disable-slash-commands");
+		expect(inv.args).toContain("--strict-mcp-config");
+		expect(inv.args.slice(inv.args.indexOf("--setting-sources"))).toEqual(["--setting-sources", ""]);
+	});
+
+	it("drops --setting-sources together with its empty value argument", () => {
+		// The flag and its "" are one unit; leaving the value behind would hand
+		// `claude` a stray empty positional.
+		const inv = backend.buildInvocation(exe, { ...req, disabledFlagIds: new Set(["--setting-sources"]) });
+		expect(inv.args).not.toContain("--setting-sources");
+		expect(inv.args.at(-1)).toBe("--disable-slash-commands");
+	});
+
+	it("falls back to the pre-isolation vector when every optional flag is rejected", () => {
+		const inv = backend.buildInvocation(exe, {
+			...req,
+			disabledFlagIds: new Set(["--strict-mcp-config", "--disable-slash-commands", "--setting-sources"]),
+		});
+		expect(inv.args).toEqual([
+			"-p",
+			"--output-format",
+			"json",
+			"--model",
+			"claude-haiku-4-5-20251001",
+			"--system-prompt",
+			"SYS",
+			"--tools",
+			"",
+			"--permission-mode",
+			"dontAsk",
+			"--no-session-persistence",
+		]);
+	});
+
+	it("declares its three isolation flags as individually droppable", () => {
+		// Pins the granularity contract: if these were ever collapsed into one
+		// entry, a single unsupported flag would cost all three.
+		expect(backend.optionalFlags?.map((f) => f.id)).toEqual([
+			"--strict-mcp-config",
+			"--disable-slash-commands",
+			"--setting-sources",
+		]);
+	});
+
+	it("never passes --bare, which would break subscription auth", () => {
+		// `--bare` reads as the ideal isolation flag (skips hooks, plugin sync,
+		// auto-memory, CLAUDE.md discovery) but it also stops `claude` reading
+		// OAuth/keychain — and this backend deliberately scrubs ANTHROPIC_API_KEY
+		// so keychain subscription auth is the ONLY credential path left. Measured:
+		// `--bare` returns `is_error` / "Not logged in · Please run /login".
+		const inv = backend.buildInvocation(exe, req);
+		expect(inv.args).not.toContain("--bare");
 	});
 
 	it("runs in a real, fresh temp cwd (no repo CLAUDE.md auto-discovery)", () => {

@@ -201,6 +201,11 @@ describe("resolveClaudeExecutable", () => {
 			mockedExecFileSync.mockImplementation((file: unknown, ...rest: unknown[]) => {
 				if (file === "which") return "/usr/local/bin/claude\n";
 				const args = rest[0] as string[];
+				// Load-bearing run flags only. The isolation flags are deliberately
+				// absent — see CLAUDE_SPEC.probeArgs: the probe cannot validate them
+				// (claude pre-scans `--version`), so listing them buys nothing while
+				// risking a hard "no compatible CLI" on an older claude that validates
+				// options before the pre-scan. Their absence is asserted below.
 				expect(args).toEqual(["--permission-mode", "dontAsk", "--version"]);
 				return "2.1.210\n";
 			});
@@ -208,6 +213,26 @@ describe("resolveClaudeExecutable", () => {
 			const out = resolveClaudeExecutable({ platform: "linux", now: () => 1000 });
 
 			expect(out).toEqual({ file: "/usr/local/bin/claude", version: "2.1.210" });
+		});
+
+		it("never probes with an isolation flag, so an older claude stays discoverable", () => {
+			// Regression guard. These three are optimizations, dropped and remembered
+			// at RUN time by LlmClient when a CLI rejects them. A failed PROBE has no
+			// such recovery — the candidate is discarded and the user gets "no
+			// compatible CLI found" — so putting an unvalidatable flag here converts a
+			// recoverable version mismatch into an undiscoverable tool.
+			let probeArgs: string[] = [];
+			mockedExecFileSync.mockImplementation((file: unknown, ...rest: unknown[]) => {
+				if (file === "which") return "/usr/local/bin/claude\n";
+				probeArgs = rest[0] as string[];
+				return "2.1.210\n";
+			});
+
+			resolveClaudeExecutable({ platform: "linux", now: () => 1000 });
+
+			expect(probeArgs).not.toContain("--strict-mcp-config");
+			expect(probeArgs).not.toContain("--disable-slash-commands");
+			expect(probeArgs).not.toContain("--setting-sources");
 		});
 
 		it("dedupes duplicate `which -a` lines before probing", () => {

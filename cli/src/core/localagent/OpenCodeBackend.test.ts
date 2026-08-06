@@ -48,7 +48,61 @@ describe("OpenCodeBackend", () => {
 		expect(inv.cwd).toContain("jolli-localagent-");
 		expect(inv.stdin).toBe("");
 		// system prompt is prepended into the prompt positional; no --model since empty
-		expect(inv.args).toEqual(["run", "sys\n\nhi"]);
+		expect(inv.args).toEqual(["run", "--pure", "sys\n\nhi"]);
+	});
+
+	it("disables Claude Code compatibility so ~/.claude skills and CLAUDE.md are not loaded", () => {
+		// Verified against a real run: without this, `opencode run` reads
+		// ~/.claude/skills (observed log: `duplicate skill name … existing=
+		// /Users/…/.claude/skills/context7-mcp/SKILL.md`). With it set, that
+		// disappears. `--pure` alone does NOT cover skills — only opencode's own
+		// external plugins.
+		const inv = b.buildInvocation(
+			{ file: "opencode", version: "1" },
+			{ prompt: "hi", model: "", systemPrompt: "" },
+		);
+		expect(inv.env.OPENCODE_DISABLE_CLAUDE_CODE).toBe("1");
+	});
+
+	it("omits --pure when the installed opencode is known to reject it", () => {
+		// opencode exits 1 on an unknown flag (printing its whole help and naming
+		// nothing), so an older install would otherwise fail every summary.
+		const inv = b.buildInvocation(
+			{ file: "opencode", version: "1" },
+			{ prompt: "hi", model: "", systemPrompt: "", disabledFlagIds: new Set(["--pure"]) },
+		);
+		expect(inv.args).toEqual(["run", "hi"]);
+	});
+
+	it("keeps OPENCODE_DISABLE_CLAUDE_CODE out of the droppable set", () => {
+		// An unrecognised env var is ignored by every version, so it can never fail
+		// a run — degrading it would give up the skills isolation for nothing.
+		expect(b.optionalFlags?.map((f) => f.id)).toEqual(["--pure"]);
+	});
+
+	it("passes the user's OPENCODE_CONFIG through untouched, rather than redirecting it", () => {
+		// Pointing OPENCODE_CONFIG at a minimal file would kill MCP servers too,
+		// but `model` can also live in the user's opencode.json and LlmClient sends
+		// EVERY local-agent tool an empty model — so it would silently change which
+		// model runs. Same trap as codex's --ignore-user-config (measured there).
+		// opencode exposes no CLI/env lever that drops MCP without also dropping
+		// model config, so MCP stays for this backend.
+		//
+		// The var is SET here on purpose: asserting against an unset
+		// `process.env.OPENCODE_CONFIG` compares undefined to undefined and passes
+		// even if the backend deleted it.
+		const prev = process.env.OPENCODE_CONFIG;
+		process.env.OPENCODE_CONFIG = "/tmp/user-opencode.json";
+		try {
+			const inv = b.buildInvocation(
+				{ file: "opencode", version: "1" },
+				{ prompt: "hi", model: "", systemPrompt: "" },
+			);
+			expect(inv.env.OPENCODE_CONFIG).toBe("/tmp/user-opencode.json");
+		} finally {
+			if (prev === undefined) delete process.env.OPENCODE_CONFIG;
+			else process.env.OPENCODE_CONFIG = prev;
+		}
 	});
 
 	it("includes --model when a model is requested", () => {
@@ -56,7 +110,7 @@ describe("OpenCodeBackend", () => {
 			{ file: "opencode", version: "1" },
 			{ prompt: "hi", model: "anthropic/claude-sonnet", systemPrompt: "" },
 		);
-		expect(inv.args).toEqual(["run", "--model", "anthropic/claude-sonnet", "hi"]);
+		expect(inv.args).toEqual(["run", "--pure", "--model", "anthropic/claude-sonnet", "hi"]);
 	});
 });
 
@@ -94,7 +148,7 @@ describe("OpenCodeBackend.buildInvocation with launcher args", () => {
 			{ file: "node.exe", version: "1", launchArgs: ["cli.js"] },
 			{ prompt: "hi", model: "", systemPrompt: "" },
 		);
-		expect(inv.args).toEqual(["cli.js", "run", "hi"]);
+		expect(inv.args).toEqual(["cli.js", "run", "--pure", "hi"]);
 	});
 });
 

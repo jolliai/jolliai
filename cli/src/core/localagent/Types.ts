@@ -1,3 +1,5 @@
+import type { OptionalFlag } from "./OptionalFlags.js";
+
 /** A resolved, capability-verified local agent executable. */
 export interface ResolvedExecutable {
 	readonly file: string;
@@ -25,6 +27,16 @@ export interface LocalAgentRequest {
 	readonly prompt: string;
 	readonly model: string;
 	readonly systemPrompt: string;
+	/**
+	 * Ids from the backend's {@link LocalAgentBackend.optionalFlags} that this
+	 * invocation must OMIT, because the installed CLI does not understand them.
+	 *
+	 * Passed in rather than read from disk by the backend so `buildInvocation`
+	 * stays a synchronous pure function: `LlmClient` loads the store once per
+	 * call and owns the degrade-and-retry loop. Undefined (the common path) means
+	 * "pass every optional flag".
+	 */
+	readonly disabledFlagIds?: ReadonlySet<string>;
 }
 
 /** Normalized result of one local-agent completion. */
@@ -35,6 +47,17 @@ export interface LocalAgentOutcome {
 	readonly cachedTokens: number;
 	readonly costUsd: number;
 	readonly stopReason: string | null;
+	/**
+	 * The model the tool ACTUALLY ran, when its response envelope reports one.
+	 * Optional because only Claude Code does today (`modelUsage`); codex, cursor,
+	 * opencode and kimi emit no model field, so their outcomes leave this unset.
+	 *
+	 * Load-bearing for metadata honesty: no local-agent tool is sent a model (see
+	 * `LlmClient.callLocalAgent`), so without this the stored `model` would be the
+	 * jollimemory-side alias — a value nothing in the call ever used. `LlmClient`
+	 * prefers this when present and falls back to the alias when absent.
+	 */
+	readonly model?: string;
 }
 
 /** A fully-specified child-process invocation. */
@@ -48,6 +71,31 @@ export interface Invocation {
 
 export interface LocalAgentBackend {
 	readonly id: string;
+	/**
+	 * Flags this backend passes as an optimization, which an older CLI may not
+	 * recognise — and would then exit non-zero over, before running anything.
+	 * `LlmClient` drops them one at a time on such a failure and remembers the
+	 * result per tool+version. Omit (or leave empty) when every flag the backend
+	 * passes is load-bearing. See `OptionalFlags.ts`.
+	 */
+	readonly optionalFlags?: readonly OptionalFlag[];
+	/**
+	 * True when this CLI does not NAME the offending flag on an argument-parsing
+	 * failure, so "dropped everything and it worked" is the only evidence its
+	 * flags will ever produce. opencode is the one such tool today: it prints its
+	 * whole yargs help and identifies nothing.
+	 *
+	 * Load-bearing for what gets PERSISTED, not for what gets retried — every
+	 * backend degrades wholesale when attribution finds nothing, because that is
+	 * the only way to make progress. But for a CLI that normally names the flag
+	 * (claude/commander, codex/clap), an UNattributed setup error is evidence the
+	 * failure was never about argv at all: a transient crash whose blind retry
+	 * then happens to succeed would otherwise write all three isolation flags off
+	 * permanently for that version, silently costing ~48x the prompt tokens with
+	 * nothing but a debug.log line to show for it. So those backends persist only
+	 * flags the CLI actually indicted; this flag opts out of that requirement.
+	 */
+	readonly unnamedFlagFailures?: boolean;
 	discoverExecutable(overridePath?: string): Promise<ResolvedExecutable>;
 	buildInvocation(exe: ResolvedExecutable, req: LocalAgentRequest): Invocation;
 	parseResult(stdout: string): LocalAgentOutcome;

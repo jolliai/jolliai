@@ -1721,6 +1721,46 @@ describe("QueueWorker", () => {
 				data: { topics: 0, authExpired: true, localAgentTool: "codex" },
 			});
 		});
+
+		it("carries the failure reason onto the stored event so the commit output can name it", async () => {
+			// Non-auth failures (out of credits, 5xx, timeout) previously reached the
+			// terminal as "✓ Jolli Memory updated" over an empty placeholder. The
+			// reason is only obtainable here — nothing downstream of storeSummary
+			// still holds the error.
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/credits.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+			vi.mocked(generateSummary)
+				.mockRejectedValueOnce(new Error("Codex run failed: Your workspace is out of credits."))
+				.mockRejectedValueOnce(new Error("Codex run failed: Your workspace is out of credits."));
+
+			await runWorker("/test/cwd");
+
+			const { emitCaptureProgress } = await import("./CaptureProgress.js");
+			expect(vi.mocked(emitCaptureProgress)).toHaveBeenCalledWith("/test/cwd", op.commitHash, "stored", {
+				data: { topics: 0, llmFailure: "Codex run failed: Your workspace is out of credits." },
+			});
+		});
+
+		it("omits llmFailure entirely on a successful capture", async () => {
+			// Guards the guarded-spread: an unconditional `llmFailure: undefined`
+			// would serialize into every healthy progress event.
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/ok.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+
+			await runWorker("/test/cwd");
+
+			const { emitCaptureProgress } = await import("./CaptureProgress.js");
+			const storedCall = vi.mocked(emitCaptureProgress).mock.calls.find((c) => c[2] === "stored");
+			expect(storedCall?.[3]?.data).not.toHaveProperty("llmFailure");
+		});
 	});
 
 	describe("assembleReferenceBlocks — track-only source filtering", () => {
