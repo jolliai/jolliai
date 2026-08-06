@@ -1,244 +1,81 @@
 package ai.jolli.jollimemory.settings
 
-import ai.jolli.jollimemory.bridge.CliIntegrations
-import ai.jolli.jollimemory.core.JolliMemoryConfig
-import ai.jolli.jollimemory.core.SessionTracker
-import ai.jolli.jollimemory.services.JolliAuthService
-import com.intellij.openapi.Disposable
+import ai.jolli.jollimemory.services.JolliMemoryService
+import ai.jolli.jollimemory.toolwindow.SettingsDialog
 import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.util.Disposer
 import com.intellij.ui.components.JBLabel
-import com.intellij.ui.components.JBPasswordField
-import com.intellij.ui.components.JBTextField
-import com.intellij.util.ui.FormBuilder
+import com.intellij.util.ui.JBUI
+import java.awt.BorderLayout
+import java.awt.FlowLayout
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
-import javax.swing.SwingUtilities
 
 /**
- * Settings page for JolliMemory — IntelliJ Preferences > Tools > JolliMemory.
+ * IntelliJ **Preferences → Tools → Jolli Memory** entry.
  *
- * Reads/writes to .jolli/jollimemory/config.json (same file used by hooks).
+ * This page used to be a second full settings form. It is now a discovery bridge
+ * only — it keeps the "Jolli Memory" name findable from Search Everywhere (`⇧⇧`)
+ * and from Preferences → Tools, and offers a single button that opens the real
+ * dialog. Every field it used to carry now lives in the tool window's
+ * [SettingsDialog] (title-bar gear icon) — with ONE deliberate exception.
  *
- * Settings:
- *   - Anthropic API Key (for AI summary generation)
- *   - Model (alias: haiku, sonnet, opus; or full model ID)
- *   - Jolli API Key (for Push to Jolli feature)
+ * **`slack.workspaceUrl` was dropped, not moved.** It has no field in
+ * [SettingsDialog] and no equivalent in the VS Code settings UI either, so it is
+ * now configurable only via `jolli configure --set slack.workspaceUrl=<origin>`.
+ * The value itself is still live and still read by the CLI
+ * (`ReferenceExtractor` → `ClaudeEnvelopeParser` / `CodexSlackBinding`), where it
+ * reconstructs a thread permalink for a Slack reference whose transcript never
+ * had one pasted in; without it such a reference has no URL and
+ * `slackDefinition` voids it rather than storing something un-clickable. An
+ * already-configured value survives a [SettingsDialog] save untouched, because
+ * that save is an `existing.copy(...)` that never names the `slack` field. Do not
+ * "restore" this docstring to a blanket "every editable field lives in
+ * SettingsDialog" claim — that was the wording that made the removal look like a
+ * de-duplication.
+ *
+ * Kept intentionally stateless: `isModified()` always returns false and `apply()`
+ * is a no-op, so IntelliJ's OK/Apply buttons on the Preferences dialog never do
+ * anything of their own — the *real* Save happens inside [SettingsDialog].
  */
 class JolliMemoryConfigurable(private val project: Project) : Configurable {
-
-    private var apiKeyField: JBPasswordField? = null
-    private var modelField: JBTextField? = null
-    private var jolliApiKeyField: JBPasswordField? = null
-    private var jolliApiKeyLabel: JBLabel? = null
-    private var accountStatusLabel: JBLabel? = null
-    private var accountButton: JButton? = null
-    private var slackWorkspaceUrlField: JBTextField? = null
-
-    private var savedApiKey: String? = null
-    private var savedModel: String? = null
-    private var savedJolliApiKey: String? = null
-    private var savedSlackWorkspaceUrl: String? = null
-
-    // Auth state is refreshed reactively: signOut() now runs off the EDT and
-    // fires notifyAuthListeners() only after the ide-bridge round-trip lands,
-    // so the button handler cannot re-read isSignedIn() synchronously and see
-    // the new value (the 5 s isSignedIn cache would also mask it). Subscribe
-    // like SettingsDialog / SignInBar / OnboardingPanel do.
-    private var authListenerDisposable: Disposable? = null
 
     override fun getDisplayName(): String = "Jolli Memory"
 
     override fun createComponent(): JComponent {
-        apiKeyField = JBPasswordField()
-        modelField = JBTextField()
-        jolliApiKeyField = JBPasswordField()
-        slackWorkspaceUrlField = JBTextField()
-        jolliApiKeyLabel = JBLabel("Jolli API Key:")
-        accountStatusLabel = JBLabel()
-        accountButton = JButton()
-
-        // Load current values first so updateAccountUI can check the API key field
-        loadFromConfig()
-        updateAccountUI()
-
-        authListenerDisposable?.let(Disposer::dispose)
-        authListenerDisposable = JolliAuthService.addAuthListener {
-            SwingUtilities.invokeLater {
-                loadFromConfig()
-                updateAccountUI()
-            }
+        val panel = JPanel(BorderLayout()).apply {
+            border = JBUI.Borders.empty(12)
         }
 
-        val privacyNotice = JBLabel(
-            "<html>By providing an API key, you consent to sending code diffs and AI session " +
-            "transcripts to third-party AI providers (e.g., Anthropic). " +
-            "<a href=\"https://github.com/Jolli-sample-repos/privacy/blob/main/privacy.md\">Privacy Policy</a></html>"
+        val message = JBLabel(
+            "<html>Jolli Memory settings live in the tool window. " +
+                "Use the button below (or click the gear icon in the Jolli Memory " +
+                "tool window's header) to open the full settings dialog.</html>",
         ).apply {
-            setCopyable(true)
+            border = JBUI.Borders.emptyBottom(12)
         }
 
-        return FormBuilder.createFormBuilder()
-            .addComponent(privacyNotice)
-            .addSeparator()
-            .addLabeledComponent(JBLabel("Account:"), accountPanel(), 1, false)
-            .addTooltip("Sign in with your Jolli account for Personal Space sync")
-            .addSeparator()
-            .addLabeledComponent(JBLabel("Anthropic API Key:"), apiKeyField!!, 1, false)
-            .addTooltip("Required for AI commit summaries. Get yours at console.anthropic.com")
-            .addLabeledComponent(JBLabel("Model:"), modelField!!, 1, false)
-            .addTooltip("Alias (haiku, sonnet, opus) or full model ID. Default: sonnet")
-            .addSeparator()
-            .addLabeledComponent(jolliApiKeyLabel!!, jolliApiKeyField!!, 1, false)
-            .addTooltip("For pushing summaries to Jolli Space (sk-jol-...). Fallback if not signed in.")
-            .addSeparator()
-            .addLabeledComponent(JBLabel("Slack Workspace URL:"), slackWorkspaceUrlField!!, 1, false)
-            .addTooltip("https://<workspace>.slack.com — reconstructs thread permalinks when none was pasted")
-            .addComponentFillVertically(JPanel(), 0)
-            .panel
-    }
-
-    private fun accountPanel(): JPanel {
-        return JPanel(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0)).apply {
-            add(accountStatusLabel)
-            add(accountButton)
-        }
-    }
-
-    private fun updateAccountUI() {
-        if (JolliAuthService.isSignedIn()) {
-            accountStatusLabel?.text = "Signed in"
-            accountButton?.text = "Sign Out"
-            accountButton?.actionListeners?.forEach { accountButton?.removeActionListener(it) }
-            accountButton?.addActionListener {
-                // `signOut()` runs off the EDT and returns immediately, so an
-                // inline `updateAccountUI()` here would read the stale
-                // (5 s cached) `isSignedIn()` value and re-render as "Signed
-                // in". The auth listener registered in `createComponent`
-                // already re-renders once the async sign-out actually lands.
-                JolliAuthService.signOut()
+        val openButton = JButton("Open Jolli Memory settings…").apply {
+            addActionListener {
+                val service = project.getService(JolliMemoryService::class.java)
+                SettingsDialog(project, service).show()
             }
-            jolliApiKeyLabel?.text = "Jolli API Key (optional — auto-managed via account):"
-            jolliApiKeyField?.toolTipText = "Optional. Your account key is used automatically. Enter a manual key here to override it."
-        } else {
-            accountStatusLabel?.text = "Not signed in"
-            accountButton?.text = "Sign In"
-            accountButton?.actionListeners?.forEach { accountButton?.removeActionListener(it) }
-            accountButton?.addActionListener {
-                // Fire-and-forget: `login()` opens the browser and returns.
-                // The auth listener already re-runs updateAccountUI() (via
-                // the parent's status listener chain); no per-attempt button
-                // state to reset. Matches VS Code's sign-in command.
-                JolliAuthService.login(
-                    // User-initiated sign-in: mint a fresh key so a revoked same-tenant key recovers.
-                    forceFreshApiKey = true,
-                    onSuccess = { _ ->
-                        SwingUtilities.invokeLater {
-                            loadFromConfig()
-                            updateAccountUI()
-                        }
-                        // Pre-push sync catch-up (JOLLI-1900): drain any commits
-                        // left in push-pending.json from pushes made while signed
-                        // out. Mirrors VS Code's post-login retry in Extension.ts.
-                        val basePath = project.getService(
-                            ai.jolli.jollimemory.services.JolliMemoryService::class.java
-                        ).mainRepoRoot ?: project.basePath
-                        if (basePath != null) {
-                            com.intellij.openapi.application.ApplicationManager
-                                .getApplication().executeOnPooledThread {
-                                    CliIntegrations.retryPendingPushes(basePath)
-                                }
-                        }
-                    },
-                    onError = { msg ->
-                        SwingUtilities.invokeLater {
-                            com.intellij.openapi.ui.Messages.showErrorDialog(msg, "Jolli Sign In")
-                        }
-                    },
-                )
-            }
-            jolliApiKeyLabel?.text = "Jolli API Key:"
-            jolliApiKeyField?.toolTipText = null
         }
+
+        val buttonRow = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+            add(openButton)
+        }
+
+        panel.add(message, BorderLayout.NORTH)
+        panel.add(buttonRow, BorderLayout.CENTER)
+        return panel
     }
 
-    override fun isModified(): Boolean {
-        return getApiKeyFieldText() != (savedApiKey ?: "") ||
-            (modelField?.text ?: "") != (savedModel ?: "") ||
-            getJolliApiKeyFieldText() != (savedJolliApiKey ?: "") ||
-            (slackWorkspaceUrlField?.text ?: "") != (savedSlackWorkspaceUrl ?: "")
-    }
+    override fun isModified(): Boolean = false
 
     override fun apply() {
-        val cwd = project.getService(ai.jolli.jollimemory.services.JolliMemoryService::class.java).mainRepoRoot ?: project.basePath ?: return
-        val apiKey = getApiKeyFieldText().ifBlank { null }
-        val model = modelField?.text?.trim()?.ifBlank { null }
-        val jolliApiKey = getJolliApiKeyFieldText().ifBlank { null }
-
-        // Slack workspace URL: blank clears it; otherwise validate + persist the
-        // normalized origin. A present-but-invalid value blocks the save (keeps the
-        // Settings dialog open) with a visible error rather than silently dropping it.
-        val slackRaw = slackWorkspaceUrlField?.text?.trim().orEmpty()
-        val slackWorkspaceUrl: String? = if (slackRaw.isEmpty()) {
-            null
-        } else {
-            SlackWorkspaceUrl.normalizeOrNull(slackRaw)
-                ?: throw com.intellij.openapi.options.ConfigurationException(
-                    "Slack Workspace URL must be an https://<workspace>.slack.com URL (got: $slackRaw)",
-                )
-        }
-
-        val globalDir = SessionTracker.getGlobalConfigDir()
-        val existing = SessionTracker.loadConfigFromDir(globalDir)
-        val merged = existing.copy(
-            apiKey = apiKey,
-            model = model,
-            jolliApiKey = jolliApiKey,
-            // Preserve any sibling slack fields; only workspaceUrl is user-editable here.
-            slack = (existing.slack ?: ai.jolli.jollimemory.core.SlackConfig()).copy(workspaceUrl = slackWorkspaceUrl),
-        )
-        SessionTracker.saveConfigToDir(merged, globalDir)
-
-        // Update saved values
-        savedApiKey = apiKey ?: ""
-        savedModel = model ?: ""
-        savedJolliApiKey = jolliApiKey ?: ""
-        savedSlackWorkspaceUrl = slackWorkspaceUrl ?: ""
-        // Reflect the normalized origin back into the field so the user sees what was saved.
-        slackWorkspaceUrlField?.text = savedSlackWorkspaceUrl
-    }
-
-    override fun reset() {
-        loadFromConfig()
-    }
-
-    override fun disposeUIResources() {
-        authListenerDisposable?.let(Disposer::dispose)
-        authListenerDisposable = null
-    }
-
-    private fun loadFromConfig() {
-        val cwd = project.getService(ai.jolli.jollimemory.services.JolliMemoryService::class.java).mainRepoRoot ?: project.basePath ?: return
-        val config = SessionTracker.loadConfig(cwd)
-
-        savedApiKey = config.apiKey ?: ""
-        savedModel = config.model ?: ""
-        savedJolliApiKey = config.jolliApiKey ?: ""
-        savedSlackWorkspaceUrl = config.slack?.workspaceUrl ?: ""
-
-        apiKeyField?.text = savedApiKey
-        modelField?.text = savedModel
-        jolliApiKeyField?.text = savedJolliApiKey
-        slackWorkspaceUrlField?.text = savedSlackWorkspaceUrl
-    }
-
-    private fun getApiKeyFieldText(): String {
-        return String(apiKeyField?.password ?: charArrayOf())
-    }
-
-    private fun getJolliApiKeyFieldText(): String {
-        return String(jolliApiKeyField?.password ?: charArrayOf())
+        // No-op: nothing on this page persists directly. All state changes flow
+        // through [SettingsDialog] and are applied when the user clicks OK there.
     }
 }

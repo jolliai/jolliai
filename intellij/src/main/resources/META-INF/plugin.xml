@@ -102,7 +102,13 @@
             id="JolliSyncStatus"
             implementation="ai.jolli.jollimemory.sync.SyncStatusBarWidgetFactory"/>
 
-        <!-- Settings page -->
+        <!-- Preferences → Tools → Jolli Memory entry. Bridge only: it just opens
+             the tool window's SettingsDialog, which is where the fields this page
+             used to duplicate now live. One field was dropped rather than moved
+             (slack.workspaceUrl, now settable only through the `jolli configure`
+             CLI); see the JolliMemoryConfigurable docstring for what still reads
+             it. This entry exists to keep the plugin findable from Search
+             Everywhere and Preferences → Tools. -->
         <projectConfigurable
             instance="ai.jolli.jollimemory.settings.JolliMemoryConfigurable"
             id="ai.jolli.jollimemory.settings"

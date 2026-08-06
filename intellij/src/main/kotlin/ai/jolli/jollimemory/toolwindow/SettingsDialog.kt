@@ -53,7 +53,7 @@ import javax.swing.SwingUtilities
  *      with contextual Anthropic settings, Jolli sign-in prompt, or agent-tool picker
  *   2. Sync to Jolli — cloud push settings, login-dependent
  *   3. Memory Bank — local storage folder, sort order, migration
- *   4. General — enabled platforms, exclude patterns, pause toggle
+ *   4. General — enabled platforms, exclude patterns
  */
 class SettingsDialog(
     private val project: Project,
@@ -207,7 +207,6 @@ class SettingsDialog(
         false,
     )
     private val excludePatternsField = JBTextField()
-    private val pauseCheckbox = JBCheckBox("Pause Jolli Memory (temporarily disable hooks without losing configuration)")
     private val telemetryCheckbox =
         JBCheckBox("Send anonymous usage telemetry (content-free — never code, paths, or memory content)", true)
     private val dcoSignoffCheckbox =
@@ -716,12 +715,6 @@ class SettingsDialog(
             .addTooltip("Adds a Signed-off-by trailer (git commit -s) to commits Jolli makes. Required by many open-source projects' CI. Shared with the VS Code extension via config.json.")
             .panel))
 
-        panel.add(Box.createVerticalStrut(12))
-        panel.add(createStretchedFormPanel(FormBuilder.createFormBuilder()
-            .addComponent(pauseCheckbox, 4)
-            .addTooltip("Uninstalls hooks while preserving all settings. Unpause to re-enable.")
-            .panel))
-
         // Privacy / telemetry consent (JetBrains Marketplace guideline 2.2).
         panel.add(Box.createVerticalStrut(12))
         panel.add(JBLabel("<html><b>Privacy</b></html>").apply {
@@ -1003,7 +996,11 @@ class SettingsDialog(
             // self-heals on the next save.
             localFolder = kbPath.ifBlank { null },
             knowledgeBaseSort = kbSort,
-            paused = if (pauseCheckbox.isSelected) true else null,
+            // Preserve any existing `paused` state — the checkbox that edited
+            // it was removed; disable is now driven by `manuallyDisabled` in
+            // .jolli/profile.json (spec 306), surfaced via the STATUS header
+            // Disable icon and the Disabled card, not this dialog.
+            paused = existing.paused,
             // Round-tripped, not edited — see savedAutoSyncEnabled's declaration.
             autoSyncEnabled = savedAutoSyncEnabled,
             syncTranscripts = if (syncTranscriptsCheckbox.isSelected) true else null,
@@ -1079,12 +1076,31 @@ class SettingsDialog(
                 !savedJolliKey.isNullOrBlank()
         }
 
+        // Snapshot the PRE-SAVE credential state under the same lens as [hasCredentials]
+        // so an unchanged "still has creds" save is a no-op — we only install when the
+        // user transitions from "no creds" → "has creds" via this save. Without this,
+        // a plain Settings save on a healthy repo would trigger a redundant install.
+        // Credentials removed via a previous save leave `manuallyDisabled=true` on disk
+        // (via [service.uninstall]'s `persistManualDisable`); re-adding them here needs
+        // an explicit install so the user doesn't have to hunt for the DisabledPanel's
+        // Enable button afterwards — mirrors the retired pause-checkbox's `!nowPaused
+        // && wasPaused` re-enable branch.
+        val existingProvider = existing.aiProvider?.lowercase()
+        val existingAnthropicKey = existing.apiKey?.ifBlank { null }
+        val existingJolliKey = existing.jolliApiKey?.ifBlank { null }
+        val wasHasCredentials = when (existingProvider) {
+            "local-agent" -> true
+            "jolli" -> !existingJolliKey.isNullOrBlank()
+            "anthropic" -> !existingAnthropicKey.isNullOrBlank() || !envAnthropicKey.isNullOrBlank()
+            else -> !existingAnthropicKey.isNullOrBlank() ||
+                !envAnthropicKey.isNullOrBlank() ||
+                !existingJolliKey.isNullOrBlank()
+        }
+
         // Snapshot the inputs needed off the EDT, then close the dialog immediately. All
         // the heavy work (git subprocesses, hook install/uninstall, Memory Bank init +
         // migration) runs in ONE ordered background task so the IDE never freezes and the
         // enable/disable and migration steps can't race each other.
-        val wasPaused = existing.paused == true
-        val nowPaused = pauseCheckbox.isSelected
         val projectPath = service.mainRepoRoot ?: project.basePath
         val kbCustomPath = config.localFolder
         // Per-repo outbound-push toggle (spec 306) — snapshot for the off-EDT write below.
@@ -1095,7 +1111,7 @@ class SettingsDialog(
         // call further down runs off-EDT without reading Swing state from a pool
         // thread. `config` above already captured these via its data-class copy,
         // but keeping named locals here makes the off-EDT call site self-evident
-        // and mirrors how [nowPaused] / [pushDisabledNow] are handled.
+        // and mirrors how [pushDisabledNow] is handled.
         val claudeEnabledNow = claudeEnabledCheckbox.isSelected
         val geminiEnabledNow = geminiEnabledCheckbox.isSelected
         // Prior on-disk values — default `undefined → enabled` matches
@@ -1124,12 +1140,23 @@ class SettingsDialog(
                 override fun run(indicator: ProgressIndicator) {
                     indicator.isIndeterminate = true
 
-                    // 1. Enable / disable hooks (was already off-EDT; now ordered before migration).
-                    if (!hasCredentials || (nowPaused && !wasPaused)) {
+                    // 1. Auto-disable hooks when the resolved provider has no credentials.
+                    // The former Pause checkbox was removed from this dialog; enable/disable
+                    // is driven by `manuallyDisabled` in .jolli/profile.json (spec 306),
+                    // surfaced via the STATUS header Disable icon and the Disabled card.
+                    if (!hasCredentials) {
                         indicator.text = "Disabling Jolli Memory…"
                         service.uninstall()
                         ai.jolli.jollimemory.core.telemetry.Telemetry.track("surface_disabled", mapOf("trigger" to "settings"))
-                    } else if (!nowPaused && wasPaused) {
+                    } else if (!wasHasCredentials) {
+                        // Credentials went from empty → present via this save. A previous
+                        // credential-removal save left `manuallyDisabled=true` on disk
+                        // (via [service.uninstall] with `persistManualDisable`), so re-enable
+                        // here — `enableFull` sends `clearManualDisableOnSuccess=true`,
+                        // which clears the opt-out and routes the tool window back to
+                        // CARD_MAIN without a separate DisabledPanel Enable click.
+                        // Mirrors the retired pause-checkbox's `!nowPaused && wasPaused`
+                        // re-enable branch.
                         indicator.text = "Enabling Jolli Memory…"
                         if (!service.isInitialized) service.initialize()
                         service.install()
@@ -1186,23 +1213,28 @@ class SettingsDialog(
                     // opt-out they set. VS Code has the same fix in its
                     // [SettingsWebviewPanel.syncHooks] call site.
                     //
-                    // Also skipped when this same Apply is the one that flipped
-                    // Pause on (`justPaused`). Step 1 above already ran
-                    // `service.uninstall()` → `jolli disable` → wrote the
-                    // machine-owned manually-disabled flag, so the CLI-side
-                    // handler would immediately return `manuallyDisabled=true`
-                    // and the branch below would post the same balloon three
-                    // seconds after the user chose Pause. VS Code side-steps
-                    // this because [SettingsHtmlBuilder.ts] omits the Pause
-                    // checkbox entirely — its Disable command lives on a
-                    // separate surface and never chains with syncHooks. Steps
+                    // Also skipped when this same Apply ran step 1's auto-disable
+                    // (`justAutoDisabled`). Step 1 already ran `service.uninstall()`
+                    // → `jolli disable` → wrote the machine-owned manually-disabled
+                    // flag, so the CLI-side handler would immediately return
+                    // `manuallyDisabled=true` and the branch below would post the
+                    // paused balloon three seconds after the save. VS Code side-steps
+                    // this because [SettingsHtmlBuilder.ts]'s Disable command lives on
+                    // a separate surface and never chains with syncHooks. Steps
                     // 2c / 2d still run below regardless, so any global-
                     // instructions or push-control transition on the same Apply
                     // is still honored.
-                    val justPaused = nowPaused && !wasPaused
+                    //
+                    // The predicate mirrors step 1's branch EXACTLY (`!hasCredentials`,
+                    // unconditional) — not the narrower credential-removal transition
+                    // `!hasCredentials && wasHasCredentials`. Step 1 disables on every
+                    // credential-less save, including one where credentials were
+                    // already absent, so gating on the transition let precisely that
+                    // case fall through to the balloon this comment exists to prevent.
+                    val justAutoDisabled = !hasCredentials
                     val toggleChanged =
                         claudeEnabledNow != wasClaudeEnabled || geminiEnabledNow != wasGeminiEnabled
-                    if (projectPath != null && !justPaused && toggleChanged) {
+                    if (projectPath != null && !justAutoDisabled && toggleChanged) {
                         indicator.text = "Syncing agent hooks…"
                         try {
                             val hookResult = CliIntegrations.syncAgentHooks(
@@ -1806,7 +1838,6 @@ class SettingsDialog(
         clineEnabledCheckbox.isSelected = config.clineEnabled != false
         antigravityEnabledCheckbox.isSelected = config.antigravityEnabled != false
         dcoSignoffCheckbox.isSelected = config.dcoSignoff == true
-        pauseCheckbox.isSelected = config.paused == true
         // Telemetry: on unless the shared opt-out flag says "off" (default on).
         telemetryCheckbox.isSelected = config.telemetry != "off"
 

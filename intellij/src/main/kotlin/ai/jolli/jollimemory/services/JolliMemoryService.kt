@@ -65,6 +65,15 @@ class JolliMemoryService(private val project: Project) : Disposable {
     private var reader: SummaryReader? = null
     @Volatile
     private var cachedStatus: StatusInfo? = null
+    /**
+     * Cached `manuallyDisabled` opt-out (repo-wide, anchored to the main worktree via
+     * [ai.jolli.jollimemory.core.RepoProfileBridge]). Refreshed by [refreshStatus] on
+     * the same fan-out as [cachedStatus] — startup, GIT_REPO_CHANGE, VFS events on
+     * `profile.json`, daemon `refresh` pushes — so cross-window / terminal writes
+     * become visible without a tool-window rebuild. Read on the EDT via
+     * [isManuallyDisabled] by the tool window's status listener. */
+    @Volatile
+    private var manuallyDisabledCached: Boolean = false
     /** Cached worker-busy flag. Read synchronously by AnAction.update() so the EDT
      *  never blocks on a node-bridge call. Refreshed by refreshStatus() and by the
      *  NIO watcher on worker.lock create/delete events. Mirrors VS Code's
@@ -537,7 +546,10 @@ class JolliMemoryService(private val project: Project) : Disposable {
             sb.appendLine("installerDebug=${installer!!.getDebugInfo()}")
 
             try {
-                refreshStatus()
+                // diskOnly: this runs on the EDT during tool-window open, and the
+                // manual-disable bridge read would be a second round-trip on top of
+                // `getStatus` (a cold start pays a one-shot Node spawn for each).
+                refreshStatus(manualDisableFromDiskOnly = true)
                 sb.appendLine("status=${cachedStatus}")
             } catch (e: Exception) {
                 sb.appendLine("refreshStatus error: ${e.message}")
@@ -597,10 +609,89 @@ class JolliMemoryService(private val project: Project) : Disposable {
                 sb.appendLine("KB folder init/migration failed: ${e.message}")
             }
 
-            // Auto-install hooks if configured and not paused (eliminates the separate "Enable" step)
+            // Auto-install hooks if configured (eliminates the separate "Enable" step).
+            // `val`, not `var`: the legacy-pause projection below no longer rewrites the
+            // global config, so nothing reassigns this after load.
             val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
+            // Legacy machine-global pause (config.json → `paused`). The Pause checkbox
+            // that wrote it is gone. Project any surviving `paused=true` from an older
+            // plugin onto the modern per-repo `manuallyDisabled` opt-out so those users
+            // get a UI escape (the DisabledPanel's Enable button) instead of being
+            // stranded on CARD_MAIN with a STATUS overlay reporting "not enabled" and
+            // no re-enable affordance.
+            //
+            // `paused` is MACHINE-GLOBAL (`~/.jolli/jollimemory/config.json`);
+            // `manuallyDisabled` is PER-REPO. That mapping is not injective, so the
+            // global flag is deliberately NEVER cleared here. Clearing it after
+            // converting the one repo that happens to be open first is lossy: on a
+            // machine with ten paused repos, opening repo A would clear the only record
+            // of the opt-out, and repos B..J would then read `paused=null` plus their
+            // own absent `manuallyDisabled` and fall straight into the
+            // `hasCredentials && needsInstall` branch below — hooks silently reinstalled
+            // in nine repos the user had explicitly turned off, with no notification.
+            // That is the same "restart silently re-enables" class of bug this opt-out
+            // exists to prevent, so the global flag stays as the standing answer for
+            // every repo that has not decided for itself yet.
+            //
+            // Which makes the per-repo decision the thing to check, not `paused`'s
+            // presence: convert only when this repo is still UNDECIDED
+            // (`readExplicitManualDisable == null`). Without that guard, leaving
+            // `paused` set would re-run this block on every start and re-write
+            // `manuallyDisabled=true`, undoing an explicit Enable each restart.
+            //
+            // Best-effort: on a write failure fall through to the legacyPaused gate
+            // below, which still honors the user's intent by skipping auto-install.
+            val cwdForLegacyPause = mainRepoRoot
+            val legacyPauseSet = config.paused == true
+            // Gate the tri-state read on `legacyPauseSet`: [readExplicitManualDisable]
+            // forks `git rev-parse --git-common-dir` and reads a file, and `paused` is
+            // null for every user who never touched the retired Pause checkbox. This
+            // method reaches the EDT via `createFullContent`'s `initialize()`, so an
+            // unconditional read here would put a subprocess on the tool-window open
+            // path for everyone to serve a shrinking legacy population. When
+            // `legacyPauseSet` is false, `legacyPaused` below is false regardless of
+            // this value, so skipping the read cannot change any outcome.
+            val explicitManualDisable = if (legacyPauseSet) {
+                cwdForLegacyPause?.let { ai.jolli.jollimemory.core.RepoProfileBridge.readExplicitManualDisable(it) }
+            } else {
+                null
+            }
+            if (legacyPauseSet && cwdForLegacyPause != null && explicitManualDisable == null) {
+                sb.appendLine("Detected legacy paused=true in an undecided repo, projecting onto manuallyDisabled")
+                try {
+                    ai.jolli.jollimemory.core.RepoProfileBridge.writeManuallyDisabled(cwdForLegacyPause, true)
+                    manuallyDisabledCached = true
+                    sb.appendLine("Legacy pause projection succeeded (global paused left intact for other repos)")
+                } catch (e: Exception) {
+                    sb.appendLine("Legacy pause projection failed (falling back to legacyPaused gate): ${e.message}")
+                }
+            }
             val hasCredentials = hasSummaryCredentials(config)
-            val isPaused = config.paused == true
+            // spec 306: the repo-wide manual opt-out is the highest-priority signal —
+            // once the user has explicitly disabled Jolli (from any surface: CLI, VS Code
+            // sidebar, IntelliJ STATUS Disable icon), a plugin restart MUST NOT silently
+            // re-install hooks. Because `enableFull` sends `clearManualDisableOnSuccess=true`,
+            // running install() here on a disabled repo would also wipe the on-disk flag,
+            // effectively "un-disabling" behind the user's back. `manuallyDisabledCached`
+            // was populated by the `refreshStatus()` call earlier in this method, so this
+            // read is free.
+            // Matches VS Code's Extension.ts activate gate on `!manuallyDisabled`.
+            val manuallyDisabled = manuallyDisabledCached
+            // Legacy machine-global pause (config.json → `paused`), which the projection
+            // above deliberately leaves set. It is the standing opt-out for every repo
+            // that has NOT recorded a decision of its own, so it gates auto-install only
+            // while this repo is undecided:
+            //   - projection ran on an earlier start → explicit `true` → the
+            //     `manuallyDisabled` branch below handles it, and DisabledPanel offers
+            //     Enable. (On the start where the projection itself runs this local is
+            //     still the pre-write `null`, which is harmless: the projection also set
+            //     `manuallyDisabledCached = true`, so the branch above wins either way.)
+            //   - user clicked Enable → explicit `false` → this gate steps aside so hook
+            //     self-heal keeps working in the repo they re-enabled, while the other
+            //     repos still see `paused` and stay off.
+            //   - projection failed to write → still `null` → this gate holds the line,
+            //     preserving the pre-migration behavior instead of auto-installing.
+            val legacyPaused = legacyPauseSet && explicitManualDisable == null
             // `enabled` from the CLI is `gitHookInstalled` alone — deliberately so a
             // dropped Claude/Gemini integration doesn't kill the whole extension. But
             // that means `enabled == true` no longer implies "every desired hook is
@@ -620,13 +711,27 @@ class JolliMemoryService(private val project: Project) : Disposable {
                 config.claudeEnabled != false &&
                 cachedStatus?.claudeHookInstalled != true
             val needsInstall = cachedStatus?.enabled != true || claudeHookMissing
-            if (hasCredentials && !isPaused && needsInstall) {
+            if (manuallyDisabled) {
+                sb.appendLine("Skipping auto-install: manuallyDisabled=true (spec 306 opt-out)")
+            } else if (legacyPaused) {
+                sb.appendLine("Skipping auto-install: config.paused=true (legacy opt-out)")
+            } else if (hasCredentials && needsInstall) {
                 val reason = if (cachedStatus?.enabled != true) "not yet enabled" else "claude hook missing in this worktree"
-                sb.appendLine("Auto-installing hooks (configured + not paused + $reason)")
-                install()
+                sb.appendLine("Auto-installing hooks (configured + $reason)")
+                // respectManualDisable=true: this is the ONLY automatic install path, and
+                // the `manuallyDisabled` / `legacyPaused` gates above are the only thing
+                // standing between a startup and a silent re-enable. Both read through
+                // caches that a bridge hiccup can push to a stale `false`, and this call
+                // carries `clearManualDisableOnSuccess`, so a wrong read would not just
+                // reinstall hooks — it would erase the opt-out that recorded the user's
+                // intent. Handing the check to the CLI too makes it fail closed: it
+                // re-reads `profile.json` under the profile lock and returns a zero-write
+                // "Repository remains manually disabled". Redundant whenever the caches
+                // are right, which is the point.
+                install(respectManualDisable = true)
                 refreshStatus()
                 sb.appendLine("status after auto-install=${cachedStatus}")
-            } else if (hasCredentials && !isPaused) {
+            } else if (hasCredentials) {
                 // Plugin-upgrade catch-up: hooks are already installed (so the block above is
                 // skipped), but the node integrations (MCP + skills + bundled Cli.js) may be
                 // absent or built for an older plugin version. Refresh them off the EDT so a
@@ -762,6 +867,10 @@ class JolliMemoryService(private val project: Project) : Disposable {
      *   .jolli/jollimemory/lock         (post-commit worker lifecycle)
      *   .jolli/jollimemory/worker.lock  (drives workerBusyCached — AI-Commit/Squash gate)
      *   .jolli/jollimemory/plans.json   (StopHook plan/reference discovery mid-session)
+     *   .jolli/jollimemory/profile.json (repo-wide manuallyDisabled — resolved via
+     *                                    git-common-dir so linked worktrees observe
+     *                                    the main worktree's file, same anchor the
+     *                                    CLI's RepoProfile.ts uses)
      */
     private fun startVfsFileWatchers(repoRoot: String) {
         val orphanBranch = JmLogger.ORPHAN_BRANCH
@@ -769,6 +878,12 @@ class JolliMemoryService(private val project: Project) : Disposable {
         val orphanRefFile = orphanRefDir.resolve(Path.of(orphanBranch).fileName.toString())
         val lockDir = Path.of(repoRoot, ".jolli", "jollimemory")
         val orphanRefFileName = orphanRefFile.fileName.toString()
+        // profile.json lives at the MAIN worktree, not necessarily `repoRoot` (which
+        // is the current worktree). Resolve via git-common-dir — RepoProfileBridge
+        // matches the CLI's `resolvePaths` exactly (dirname of common-dir). Null when
+        // not a git repo (no watch, same fallback as the sibling dirs).
+        val profileJsonFile = ai.jolli.jollimemory.core.RepoProfileBridge.resolveProfileJsonPath(repoRoot)
+        val profileDir = profileJsonFile?.parentFile?.toPath()
 
         try {
             val fs = LocalFileSystem.getInstance()
@@ -801,6 +916,21 @@ class JolliMemoryService(private val project: Project) : Disposable {
                 null
             }
 
+            // profile.json's parent dir is `<mainRoot>/.jolli/jollimemory/`. On the
+            // main worktree this equals [lockDir] and addRootsToWatch de-duplicates;
+            // on a linked worktree it points at the main worktree so we can observe
+            // repo-wide manualDisable writes from any worktree of this repo.
+            val profileDirVfsPath: String? = if (profileDir != null && Files.isDirectory(profileDir)) {
+                val vf = fs.refreshAndFindFileByPath(profileDir.toAbsolutePath().toString())
+                if (vf == null) log.warn("VFS refused to register profile dir: $profileDir")
+                rootsToWatch.add(profileDir.toAbsolutePath().toString())
+                log.info("VFS watcher registered on: $profileDir")
+                vf?.path ?: canonicalize(profileDir)
+            } else {
+                log.info("Profile dir does not exist yet or not a git repo, skipping VFS watch: $profileDir")
+                null
+            }
+
             if (rootsToWatch.isNotEmpty()) {
                 vfsWatchRequests = fs.addRootsToWatch(rootsToWatch, false)
             }
@@ -809,6 +939,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
             val workerLockPath = lockDirVfsPath?.let { "$it/worker.lock" }
             val lockPath = lockDirVfsPath?.let { "$it/lock" }
             val plansJsonPath = lockDirVfsPath?.let { "$it/plans.json" }
+            val profileJsonPath = profileDirVfsPath?.let { "$it/profile.json" }
 
             // Tie the message-bus subscription to the service's Disposable lifecycle
             // so IntelliJ tears it down automatically when the project closes.
@@ -821,7 +952,8 @@ class JolliMemoryService(private val project: Project) : Disposable {
                         if (path == orphanRefPath ||
                             path == workerLockPath ||
                             path == lockPath ||
-                            path == plansJsonPath
+                            path == plansJsonPath ||
+                            path == profileJsonPath
                         ) {
                             scheduleDebouncedOrphanRefresh()
                             return
@@ -868,6 +1000,18 @@ class JolliMemoryService(private val project: Project) : Disposable {
     fun getStatus(): StatusInfo? = cachedStatus
 
     /**
+     * Repo-wide `manuallyDisabled` opt-out — the highest-priority disable that wins
+     * over `enabled`/`isConfigured`. Returns the value observed by the most recent
+     * [refreshStatus]; `false` until the first refresh completes.
+     *
+     * The tool window reads this via the same [addStatusListener] fan-out that
+     * carries every other status field, so a `jolli disable` from a terminal or a
+     * sibling VS Code window is picked up by the VFS `profile.json` watcher and
+     * reflected in the UI without a tool-window rebuild.
+     */
+    fun isManuallyDisabled(): Boolean = manuallyDisabledCached
+
+    /**
      * True when any credential capable of driving summary/wiki generation is set —
      * config.apiKey, config.jolliApiKey, or the ANTHROPIC_API_KEY env var.
      *
@@ -895,8 +1039,58 @@ class JolliMemoryService(private val project: Project) : Disposable {
         }
     }
 
+    /**
+     * Reads the repo-wide `manuallyDisabled` opt-out and updates the cache, respecting
+     * the same install-protection window as [refreshStatus] (`true → false` always
+     * applies immediately; `false → true` is suppressed during an in-flight enable so
+     * the tool window's optimistic Enable flip doesn't bounce back).
+     *
+     * Kept as its own method so callers can refresh the opt-out even when [refreshStatus]'s
+     * main status probe fails — a bridge hiccup on `getStatus` must NOT hide a disk-side
+     * `manuallyDisabled=true` from the auto-install gate. [RepoProfileBridge.readManuallyDisabled]
+     * has its own bridge-then-disk fallback, so this call still lands correct data when the
+     * daemon is down.
+     *
+     * [diskOnly] skips the bridge and reads `profile.json` directly. Used by the
+     * [initialize] path, which runs synchronously on the EDT (`createToolWindowContent` →
+     * `createFullContent` → `initialize`): the bridge read is a full round-trip there, and
+     * a cold start with no daemon yet makes it a one-shot Node spawn (500 ms-2 s) — a
+     * second one, since `getStatus` below is also a bridge call. That is the same cost the
+     * legacy-pause read is gated against a few lines up in [initialize], and the same
+     * reasoning applies here.
+     *
+     * Sound because the disk read is not a degraded substitute for this particular
+     * question: the CLI writes `profile.json` with a temp-file + rename, so a direct read
+     * can never observe a torn write, and the auto-install gate wants exactly the on-disk
+     * truth. The bridge stays the default for every other caller (they run off-EDT, and it
+     * keeps reads mutex-serialized with the CLI's own writers).
+     */
+    private fun refreshManuallyDisabled(diskOnly: Boolean = false) {
+        val cwd = mainRepoRoot ?: return
+        try {
+            val fresh = if (diskOnly) {
+                ai.jolli.jollimemory.core.RepoProfileBridge.readManuallyDisabledFromDisk(cwd)
+            } else {
+                ai.jolli.jollimemory.core.RepoProfileBridge.readManuallyDisabled(cwd)
+            }
+            val isProtected = System.currentTimeMillis() < installProtectionUntil
+            if (isProtected && !manuallyDisabledCached && fresh) {
+                log.info("refreshManuallyDisabled: suppressed manuallyDisabled flap (install protection active)")
+            } else {
+                manuallyDisabledCached = fresh
+            }
+        } catch (e: Exception) {
+            log.warn("refreshManuallyDisabled: failed to read manuallyDisabled, keeping cached value: ${e.message}")
+        }
+    }
+
+    /**
+     * [manualDisableFromDiskOnly] forwards to [refreshManuallyDisabled] — see there for
+     * why the EDT-bound [initialize] path sets it. Defaults to false so the other 38 call
+     * sites, all off-EDT, keep the bridge read.
+     */
     @Synchronized
-    fun refreshStatus(): StatusInfo? {
+    fun refreshStatus(manualDisableFromDiskOnly: Boolean = false): StatusInfo? {
         lastError = null
 
         // Check if .git was removed since initialization
@@ -916,6 +1110,15 @@ class JolliMemoryService(private val project: Project) : Disposable {
             lastError = "Service not initialized"
             return null
         }
+
+        // Refresh the manuallyDisabled opt-out FIRST, before the main status probe.
+        // This runs unconditionally: a bridge failure on `getStatus` (daemon down,
+        // node blip) must NOT hide a disk-side `manuallyDisabled=true` from the
+        // auto-install gate — the previous inline read was inside the try/catch
+        // and got skipped whenever `getStatus` threw, silently un-disabling repos.
+        // The install-protection early return below also lives after this call so
+        // the opt-out cache doesn't stall during hook flapping windows.
+        refreshManuallyDisabled(diskOnly = manualDisableFromDiskOnly)
 
         return try {
             val newStatus = r.getStatus(i)
@@ -949,22 +1152,75 @@ class JolliMemoryService(private val project: Project) : Disposable {
             }
             lastError = "Status check failed: ${e.message}"
             log.warn(lastError!!)
+            // manuallyDisabledCached was already refreshed above, so listeners
+            // fired here observe an accurate opt-out even when getStatus failed.
             notifyListeners()
             null
         }
     }
 
-    fun install(): Boolean {
-        val result = installer?.install()
+    /**
+     * Runs the CLI's full enable for this repo.
+     *
+     * [respectManualDisable] hands the opt-out check to the CLI as well, making it the
+     * LAST gate rather than trusting [manuallyDisabledCached] alone — see
+     * [CliIntegrations.enableFull]. Automatic startup repair passes `true`; every
+     * explicit user Enable leaves it `false`, because there the whole intent is to lift
+     * the opt-out and a refusal would make the button a silent no-op.
+     */
+    fun install(respectManualDisable: Boolean = false): Boolean {
+        // Optimistically clear the cached opt-out to match what a successful install
+        // will achieve — the CLI writes `manuallyDisabled=false` at the END of install
+        // (via `clearManualDisableOnSuccess`), so a refreshStatus() firing mid-install
+        // would otherwise read stale `true`, keep the cache at `true`, and — via the
+        // tool window's `statusSyncListener` (which compares svc vs. its local flag)
+        // — undo the optimistic Enable flip back to CARD_DISABLED. Pair this with
+        // [installProtectionUntil] below so the suppression branch in [refreshStatus]
+        // (`isProtected && !manuallyDisabledCached && fresh`) keeps the cache at
+        // `false` even if a mid-install refresh reads the still-set disk flag.
+        // Rolled back on failure below so a real disabled state isn't hidden.
+        val previousManuallyDisabled = manuallyDisabledCached
+        manuallyDisabledCached = false
+        // Set install-protection EAGERLY, before the actual install work — the CLI
+        // writes `manuallyDisabled=false` at the END of a successful install, so
+        // any refreshStatus() firing during the window would otherwise read stale
+        // `true` and bounce the tool window's optimistic Enable flip back to
+        // CARD_DISABLED. Ceiling is generous: install is normally 500 ms–2 s but
+        // dist-extract can spike on cold cache. Cleared on failure so a genuine
+        // enabled→disabled elsewhere isn't held off.
+        installProtectionUntil = System.currentTimeMillis() + 10_000
+        val result = installer?.install(respectManualDisable)
         if (result != null && result.success) {
-            // Protect against GIT_REPO_CHANGE flapping: for 3 seconds after install,
-            // refreshStatus() will not downgrade enabled:true → enabled:false.
+            // Re-base the window to 3 s from NOW, so late-arriving VFS events (from the
+            // CLI's own writes) still can't flap the UI. GIT_REPO_CHANGE fires when
+            // .git/hooks/ is modified and can momentarily read stale hook state.
+            //
+            // Since install normally takes 500 ms-2 s, this usually SHORTENS the 10 s
+            // pre-install ceiling rather than extending it — deliberately: the ceiling
+            // has to cover a cold dist-extract spike, but once the install has actually
+            // returned, holding the cache against reality for the remaining ~8 s buys
+            // nothing and only delays a genuine enabled→disabled from elsewhere.
             installProtectionUntil = System.currentTimeMillis() + 3000
-            result.integrationsIssue?.let { notifyIntegrationsIssue(it) }
-            refreshStatus()
+            // Fire-and-forget: refreshStatus() costs 2+ bridge round-trips (getStatus +
+            // readManuallyDisabled) but nothing on the click path needs its result — the
+            // tool window's status listener will pick up the fresh values whenever they
+            // land. Blocking here made the Enable click wait ~30-60 ms of pure IPC before
+            // the UI could flip.
+            ApplicationManager.getApplication().executeOnPooledThread { refreshStatus() }
             return true
         }
-        lastError = result?.message ?: "Installer not available"
+        // Failure — roll back the optimistic cache flip and release the protection
+        // window so a real enabled→disabled elsewhere isn't held off. Releasing it also
+        // lets the caller's follow-up refreshStatus() re-read the disk flag immediately
+        // instead of being held at the optimistic `false` for the rest of the window.
+        manuallyDisabledCached = previousManuallyDisabled
+        installProtectionUntil = 0L
+        // A `manuallyDisabled` refusal is NOT an error: the CLI declined to touch a repo
+        // the user turned off, which is what we asked it to do. `lastError` is rendered to
+        // the user in red as "Error" (see buildStatusHtml), so recording it there would
+        // report a fault to someone who deliberately disabled Jolli. Everything else
+        // above still applies — nothing was installed, so this returns false.
+        lastError = if (result?.manuallyDisabled == true) null else result?.message ?: "Installer not available"
         return false
     }
 
@@ -995,7 +1251,10 @@ class JolliMemoryService(private val project: Project) : Disposable {
         if (result != null && result.success) {
             // Clear protection so disable takes effect immediately
             installProtectionUntil = 0L
-            refreshStatus()
+            // Fire-and-forget — same rationale as [install]: nothing on the click path
+            // needs the refreshed StatusInfo; the tool window's listener picks it up
+            // whenever it lands.
+            ApplicationManager.getApplication().executeOnPooledThread { refreshStatus() }
             return true
         }
         lastError = result?.message ?: "Installer not available"

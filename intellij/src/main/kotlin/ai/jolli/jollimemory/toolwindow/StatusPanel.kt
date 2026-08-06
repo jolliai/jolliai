@@ -8,7 +8,9 @@ import ai.jolli.jollimemory.core.SummaryStore
 import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliAuthService
 import ai.jolli.jollimemory.services.JolliMemoryService
+import ai.jolli.jollimemory.sync.SyncActivation
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
@@ -59,18 +61,31 @@ class StatusPanel(
     }
     private val statusListener: () -> Unit = { SwingUtilities.invokeLater { refreshUI() } }
 
+    // Auth changes (login callback, signOut) need to redraw the Jolli Account row and
+    // toggle the Sync Now / Jolli Site rows — same refresh path as status changes.
+    private val authListenerDisposable: Disposable =
+        JolliAuthService.addAuthListener { SwingUtilities.invokeLater { refreshUI() } }
+
     init {
         border = JBUI.Borders.empty(8)
 
-        // Double-click on clickable rows triggers the action (dialog input)
+        // Single-click on clickable rows triggers the action. The Account / Sync Now
+        // rows are the first clickable rows in this panel (existing informational
+        // rows carry `onClick = null`), so a single click matches the affordance
+        // — VS Code's tree provider uses the same single-click contract.
+        //
+        // Gate on BUTTON1 and clickCount == 1. Swing dispatches `mouseClicked` for
+        // BUTTON2/BUTTON3 too, so without the button check a right- or middle-click
+        // anywhere on the Sync Now row would fire [runManualSync] — a real push to
+        // Jolli Space, and the only row in this panel with an external side effect.
+        // The clickCount check keeps a double-click from firing the action twice.
         statusList.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
-                if (e.clickCount == 2) {
-                    val idx = statusList.locationToIndex(e.point)
-                    if (idx >= 0) {
-                        val row = listModel.getElementAt(idx)
-                        row.onClick?.invoke()
-                    }
+                if (e.button != MouseEvent.BUTTON1 || e.clickCount != 1) return
+                val idx = statusList.locationToIndex(e.point)
+                if (idx >= 0) {
+                    val row = listModel.getElementAt(idx)
+                    row.onClick?.invoke()
                 }
             }
         })
@@ -151,6 +166,11 @@ class StatusPanel(
             description = "$branchSummaryCount / ${status.summaryCount}",
             tooltip = "$branchSummaryCount on current branch, ${status.summaryCount} total across all branches",
         ))
+
+        // 4b. Jolli Account — Sign In / Sign Out lives in this panel (not the title
+        // bar) so the header stays a two-icon strip. Sync Now sits under the row
+        // so the manual-sync affordance is next to the account it belongs to.
+        addAccountRows()
 
         // 5. Jolli Site (from API key) — show site URL when configured
         if (!config.jolliApiKey.isNullOrBlank()) {
@@ -434,8 +454,56 @@ class StatusPanel(
         return store.filterCommitsWithSummary(hashes).size
     }
 
+    /**
+     * Adds the informational "Jolli Account" row and, when signed in, a
+     * clickable "Sync Now" row underneath. The Sign In / Sign Out toggle
+     * itself lives as an icon in the STATUS overlay header (see
+     * `buildStatusOverlay` in [JolliMemoryToolWindowFactory]) — this row is
+     * intentionally read-only so signing in has ONE affordance to hunt for.
+     */
+    private fun addAccountRows() {
+        val signedIn = JolliAuthService.isSignedIn()
+        if (signedIn) {
+            listModel.addElement(StatusRow(
+                icon = Icon.OK,
+                label = "Jolli Account",
+                description = "connected",
+                tooltip = "Signed in to Jolli. Use the sign-out icon in the STATUS header to disconnect.",
+            ))
+            listModel.addElement(StatusRow(
+                icon = Icon.PULSE,
+                label = "Sync Now",
+                description = "click to push memories to your Jolli Space",
+                tooltip = "Triggers a manual sync of committed memories to your Jolli Space.",
+                onClick = { runManualSync() },
+            ))
+        } else {
+            listModel.addElement(StatusRow(
+                icon = Icon.WARN,
+                label = "Jolli Account",
+                description = "not connected",
+                tooltip = "Sign in to Jolli via the sign-in icon in the STATUS header to enable cloud sync.",
+            ))
+        }
+    }
+
+    /**
+     * Requests a manual sync. Parity with the KB toolbar "Sync to Personal Space"
+     * button — lazy-builds the orchestrator if a Sign-in-then-Sync sequence has
+     * not gone through reconcileSync yet, so the sync actually runs.
+     */
+    private fun runManualSync() {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            if (!service.isSyncBuilt()) {
+                SyncActivation.reconcileSync(project, service)
+            }
+            service.requestManualSync()
+        }
+    }
+
     override fun dispose() {
         service.removeStatusListener(statusListener)
+        authListenerDisposable.dispose()
     }
 
     companion object {

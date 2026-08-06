@@ -2,6 +2,7 @@ package ai.jolli.jollimemory
 
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.util.IconLoader
+import java.awt.Color
 import javax.swing.Icon
 
 /**
@@ -84,14 +85,22 @@ object JolliMemoryIcons {
     /** Trash — matches VSCode codicon "trash" for delete/remove actions. */
     val Trash: Icon = IconLoader.getIcon("/icons/trash.svg", JolliMemoryIcons::class.java)
 
-    /** Green circle — status indicator for healthy/enabled state. */
-    val CircleGreen: Icon = IconLoader.getIcon("/icons/circle-green.svg", JolliMemoryIcons::class.java)
+    /**
+     * Theme-adaptive pulse (heartbeat) glyph — the base of the tool window Status
+     * button. Rendered gray on both themes so the colored health dot on top of it
+     * (green/yellow/red) is the piece that reads. Matches the design's
+     * codicon-pulse used with a currentColor mask.
+     */
+    val PulseNeutral: Icon = IconLoader.getIcon("/icons/pulse-neutral.svg", JolliMemoryIcons::class.java)
 
-    /** Yellow circle — status indicator for warnings/partial issues. */
-    val CircleYellow: Icon = IconLoader.getIcon("/icons/circle-yellow.svg", JolliMemoryIcons::class.java)
+    /** Pulse + green health dot — Status button when everything is OK. */
+    val PulseStatusGreen: Icon = PulseStatusIcon(PulseNeutral, Color(0x3F, 0xB9, 0x50))
 
-    /** Red circle — status indicator for errors/failed state. */
-    val CircleRed: Icon = IconLoader.getIcon("/icons/circle-red.svg", JolliMemoryIcons::class.java)
+    /** Pulse + yellow health dot — Status button when there are warnings. */
+    val PulseStatusYellow: Icon = PulseStatusIcon(PulseNeutral, Color(0xD2, 0x99, 0x22))
+
+    /** Pulse + red health dot — Status button when Jolli is disabled / failed. */
+    val PulseStatusRed: Icon = PulseStatusIcon(PulseNeutral, Color(0xF8, 0x51, 0x49))
 
     /** Jolli Memory logo — used for tool window icon and onboarding. */
     val JolliLogo: Icon = IconLoader.getIcon("/icons/jollimemory.svg", JolliMemoryIcons::class.java)

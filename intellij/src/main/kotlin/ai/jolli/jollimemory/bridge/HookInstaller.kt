@@ -225,8 +225,12 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
     /**
      * Install all hooks by running the bundled CLI's full `enable`.
      * Returns a result message.
+     *
+     * [respectManualDisable] forwards to [CliIntegrations.enableFull] — see there for
+     * why it belongs to automatic startup repair only and must stay `false` for
+     * explicit user Enable actions.
      */
-    fun install(): InstallResult {
+    fun install(respectManualDisable: Boolean = false): InstallResult {
         val installLog = StringBuilder()
         try {
             // Ensure .jolli/jollimemory directory
@@ -254,7 +258,7 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
 
             // The CLI owns ALL hook installation: git hooks + Claude + Gemini + skills
             // + global instructions + MCP + dispatch scripts, in one transaction-ish run.
-            val result = CliIntegrations.enableFull(projectDir)
+            val result = CliIntegrations.enableFull(projectDir, respectManualDisable)
             installLog.appendLine("CLI full enable result: $result")
             installLog.appendLine("claudeHook=${isClaudeHookInstalled()} gitHooks5=${areAllGitHooksInstalled()}")
             writeInstallLog(installLog.toString())
@@ -262,6 +266,18 @@ class HookInstaller(private val projectDir: String, private val mainRepoRoot: St
             return when (result) {
                 is CliIntegrations.Result.Ok ->
                     InstallResult(true, "JolliMemory hooks installed successfully", emptyList())
+                // Nothing was installed, so `success = false` — the caller must not run
+                // its did-install side effects. Given its own message because
+                // `warningFor` deliberately returns null here (it is not a warning), and
+                // the shared `else` would otherwise report the plain "enable failed",
+                // which is both wrong and alarming for a repo the user chose to disable.
+                is CliIntegrations.Result.RefusedManuallyDisabled ->
+                    InstallResult(
+                        false,
+                        "Repository is manually disabled — nothing was installed",
+                        emptyList(),
+                        manuallyDisabled = true,
+                    )
                 else ->
                     InstallResult(
                         false,
@@ -413,10 +429,12 @@ data class InstallResult(
     val message: String,
     val warnings: List<String>,
     /**
-     * Human-readable reason MCP + skills were not set up (Node missing, bundle missing, or
-     * the bundled CLI failed), or `null` when they succeeded. With the CLI owning the whole
-     * enable, a failure now fails the install as a whole — this stays for API compatibility
-     * and for the startup catch-up path's notifications.
+     * True when the CLI refused because the repo carries the `manuallyDisabled` opt-out
+     * (`respectManualDisable`). Reported with `success = false` so no did-install side
+     * effect fires, but callers must NOT treat it as an error: it is the intended outcome
+     * for a repo the user turned off. In particular do not park it in
+     * `JolliMemoryService.lastError`, which the tool window renders to the user in red as
+     * "Error" — telling someone who deliberately disabled Jolli that something broke.
      */
-    val integrationsIssue: String? = null,
+    val manuallyDisabled: Boolean = false,
 )

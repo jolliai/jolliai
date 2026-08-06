@@ -176,6 +176,65 @@ class CliIntegrationsTest {
         CliIntegrations.integrationsUpToDate(tempDir) shouldBe false // retries again
     }
 
+    // ── isDistComplete — the extractCliDist short-circuit's completeness gate ──
+    // Regression guard for the caching fast path: it used to check only `Cli.js` plus a
+    // matching extract stamp, so a dist that lost a per-hook entry script AFTER the
+    // stamp landed (external cleanup, AV quarantine) stayed broken for the rest of that
+    // plugin version — no number of Enable clicks re-copied it, and the CLI's own
+    // `isCompleteRuntimeDist` gate then refused to register the dist at all. The
+    // expected set is derived from the bundle listing so there is no hand-maintained
+    // mirror of REQUIRED_RUNTIME_FILES to drift.
+
+    /** Builds a fake bundle dir with the given entry-script names and returns the listing. */
+    private fun fakeBundle(vararg names: String): List<File> {
+        val src = File(tempDir, "cli-dist").apply { mkdirs() }
+        return names.map { File(src, it).apply { writeText("bundle") } }
+    }
+
+    @Test
+    fun `isDistComplete true when every bundled entry script is present`() {
+        val srcJs = fakeBundle("Cli.js", "StopHook.js", "QueueWorker.js")
+        val dist = File(tempDir, "dist-intellij").apply { mkdirs() }
+        srcJs.forEach { File(dist, it.name).writeText("copied") }
+        CliIntegrations.isDistComplete(dist, srcJs) shouldBe true
+    }
+
+    @Test
+    fun `isDistComplete false when a per-hook entry script is missing but Cli js is not`() {
+        // The exact shape the old Cli.js-only check waved through.
+        val srcJs = fakeBundle("Cli.js", "StopHook.js", "QueueWorker.js")
+        val dist = File(tempDir, "dist-intellij").apply { mkdirs() }
+        File(dist, "Cli.js").writeText("copied")
+        File(dist, "StopHook.js").writeText("copied")
+        // QueueWorker.js deliberately absent.
+        CliIntegrations.isDistComplete(dist, srcJs) shouldBe false
+    }
+
+    @Test
+    fun `isDistComplete false when the dist directory does not exist at all`() {
+        val srcJs = fakeBundle("Cli.js", "StopHook.js")
+        CliIntegrations.isDistComplete(File(tempDir, "never-extracted"), srcJs) shouldBe false
+    }
+
+    @Test
+    fun `isDistComplete false when a dist entry is a directory rather than a file`() {
+        // `isFile` (not `exists`) so a stray directory standing in for an entry script
+        // cannot certify the dist — `run-hook` could not execute it.
+        val srcJs = fakeBundle("Cli.js", "StopHook.js")
+        val dist = File(tempDir, "dist-intellij").apply { mkdirs() }
+        File(dist, "Cli.js").writeText("copied")
+        File(dist, "StopHook.js").mkdirs()
+        CliIntegrations.isDistComplete(dist, srcJs) shouldBe false
+    }
+
+    @Test
+    fun `isDistComplete false for an empty source listing (never certifies an empty dist)`() {
+        // A bundle we failed to list must fall through to the copy branch rather than
+        // vacuously satisfying `all {}` on an empty collection.
+        val dist = File(tempDir, "dist-intellij").apply { mkdirs() }
+        CliIntegrations.isDistComplete(dist, emptyList()) shouldBe false
+    }
+
     // ── mcpRegistrationStale — self-heal trigger for a dead .mcp.json ──────
     // Regression guard for the bug where .mcp.json's jollimemory entry pointed at a
     // `node <Cli.js>` under a removed VS Code extension dist. The version stamp stayed

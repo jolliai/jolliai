@@ -2,6 +2,8 @@ package ai.jolli.jollimemory.bridge
 
 import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.TraceContext
+import com.google.gson.Gson
+import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -17,6 +19,26 @@ object CliIntegrations {
     private val log = JmLogger.create("CliIntegrations")
 
     private const val IDE_BRIDGE_TIMEOUT_SECONDS = 300L
+
+    /**
+     * Tighter timeout for enable/disable — install typically completes in
+     * 500 ms–2 s and never legitimately runs for minutes. Matches the retired
+     * subprocess path's `proc.waitFor(60, TimeUnit.SECONDS)` so a stuck daemon
+     * fails within one minute instead of after the default 5-minute ceiling.
+     */
+    private const val INSTALL_BRIDGE_TIMEOUT_SECONDS = 60L
+
+    /**
+     * Name of the plugin-version stamp written after a successful [extractCliDist]
+     * copy. Sibling of the enable-success `.version` stamp but with a different
+     * meaning: this one just says "the on-disk `*.js` files are byte-identical to
+     * the bundled ones for this plugin version" and survives disable, so a later
+     * Enable click can skip the 50-300 ms lock-guarded copy on the hot path.
+     */
+    private const val EXTRACT_STAMP_FILE = ".extract-stamp"
+
+    /** Shared serializer for bridge payloads — no HTML escaping needed, no need for pretty printing. */
+    private val gson = Gson()
 
     /**
      * Creates an owner-only temp file (POSIX 0600) so a response containing
@@ -59,6 +81,21 @@ object CliIntegrations {
         /** The bundled Cli.js could not be located (packaging problem). */
         object BundleMissing : Result()
 
+        /**
+         * The CLI refused the install because the repo carries the `manuallyDisabled`
+         * opt-out and the request asked it to respect that (`respectManualDisable`).
+         *
+         * NOT [Ok] and not [Failed]: nothing was written, so no success side effect may
+         * fire — in particular no version stamp, since that would tell
+         * [integrationsUpToDate] the current plugin version is fully enabled and
+         * suppress every later integrations catch-up. Equally not a failure: refusing a
+         * disabled repo is the designed outcome, so it must not raise an error balloon.
+         *
+         * Only reachable from an automatic path; every explicit user Enable sends
+         * `respectManualDisable=false` precisely so the click can lift the opt-out.
+         */
+        object RefusedManuallyDisabled : Result()
+
         /** The bundled CLI ran but failed. */
         data class Failed(val message: String) : Result()
     }
@@ -70,6 +107,9 @@ object CliIntegrations {
      */
     fun warningFor(result: Result): String? = when (result) {
         is Result.Ok -> null
+        // Null like Ok: the repo is disabled on purpose, so there is nothing to warn
+        // about. The caller decides what to do with the state; it is not an error.
+        is Result.RefusedManuallyDisabled -> null
 		is Result.NodeMissing ->
 			"Node.js 22.5 or newer was not found — CLI-backed memory, MCP, /jolli-recall and /jolli-search are unavailable. " +
 				"Install Node.js and reopen the project."
@@ -256,19 +296,74 @@ object CliIntegrations {
      * Extracts the bundled Cli.js to `~/.jolli/jollimemory/dist-intellij/` (version-gated
      * on the plugin version) and returns that dist directory. `dist-paths/intellij` will
      * point here after [enableIntegrations] runs.
+     *
+     * Short-circuits when [EXTRACT_STAMP_FILE] already carries the current plugin version:
+     * the file copy costs 50-300 ms of lock-guarded I/O, so skipping it when the dist is
+     * byte-current is the single biggest saving on the Enable / Disable click path (both
+     * flows call `enableFull` / `disableFull` → `runInstallViaBridge` → this method).
+     * The stamp is written LAST inside the lock, after every `*.js` is copied, so any
+     * reader observing the current fingerprint is guaranteed the files are complete
+     * (no TOCTOU on partial writes).
+     *
+     * The short-circuit is additionally gated on [isDistComplete] — every bundled `*.js`
+     * must still be present on disk, not just `Cli.js`. Write ordering only rules out a
+     * copy that never finished; it says nothing about a file deleted AFTER the stamp
+     * landed (an external cleanup, a Windows AV quarantine). Before this method cached
+     * anything it re-copied unconditionally and therefore self-healed such a gap on the
+     * next Enable click; a stamp-only check would instead skip forever at the same plugin
+     * version, leaving a dist that `run-hook` cannot serve and that the CLI's
+     * `isCompleteRuntimeDist` gate in [DistPathWriter.ts] refuses to register. Deriving
+     * the expected set from the bundle keeps this honest with no hand-maintained mirror
+     * of `REQUIRED_RUNTIME_FILES` to drift — the bundle is a superset of it — and costs
+     * one `isFile` stat per entry (~µs) on the fast path.
+     *
+     * Fingerprint = plugin version + max mtime across every source `*.js`. Plugin
+     * version alone is too coarse: during dev iteration (edit CLI → `npm run build`
+     * → `gradle prepareSandbox`) the version string in `jollimemory-plugin-version.txt`
+     * stays put, but every source `.js` gets a fresh mtime from the copy. Encoding
+     * the max mtime makes any such rebuild — plus marketplace re-installs with the
+     * same version, and a `touch` of any single file — invalidate the cache and
+     * force a re-copy. `size` alone would miss pure whitespace/reformat changes,
+     * and hashing every read is slow; a stat per file (~µs) on the fast path is the
+     * cheap correct middle.
+     *
+     * Separate from the `.version` stamp: `.version` means "the last `jolli enable`
+     * ran green for this version" and is cleared on disable, whereas the extract stamp
+     * means "the on-disk files match the bundle we saw last" and survives disable —
+     * so a subsequent enable click can still skip the copy.
      */
     fun extractCliDist(): File? {
         val cliJs = resolveBundledCliJs() ?: return null
         val srcDir = cliJs.parentFile ?: return null // the bundled cli-dist directory
         val distDir = distIntellijDir()
+        val srcJs = listSourceJs(srcDir)
+        val currentFingerprint = computeExtractFingerprint(srcJs)
+        val extractStamp = File(distDir, EXTRACT_STAMP_FILE)
+        // Fast path — no lock, no I/O beyond a listFiles/stat pass on the source, one
+        // stat per expected dist entry, and one small stamp read. Reader-visible
+        // ordering: the stamp is the LAST write inside the lock, so if it matches,
+        // every `*.js` was fully written for this fingerprint — [isDistComplete] then
+        // covers the case of one going missing afterwards.
+        //
+        // Wrapped in a defensive try: on Windows a concurrent writer's truncate/write
+        // can trigger a sharing violation on `readText()`, which would otherwise bubble
+        // out of `extractCliDist()` unhandled (the outer try below only guards the
+        // copy branch). Fall through to the lock branch and let it serialize with the
+        // in-flight writer instead.
+        try {
+            if (isDistComplete(distDir, srcJs) &&
+                extractStamp.exists() &&
+                extractStamp.readText(Charsets.UTF_8).trim() == currentFingerprint
+            ) {
+                return distDir
+            }
+        } catch (e: Exception) {
+            log.info("Extract stamp fast-path read failed (falling through to lock): %s", e.message)
+        }
         return try {
             distDir.mkdirs()
             // Copy the WHOLE dist (Cli.js + the per-hook entry scripts) so this dist also
-            // satisfies `run-hook`, not just `run-cli`/MCP/skills. This runs only from
-            // [enableIntegrations]/[disableIntegrations] (i.e. when NOT already enabled),
-            // so an unconditional overwrite is off the hot path. Deliberately writes NO
-            // version stamp — the stamp means "enable succeeded" and is written by
-            // [markIntegrationsEnabled] only after the enable subprocess returns Ok.
+            // satisfies `run-hook`, not just `run-cli`/MCP/skills.
             //
             // OS-level file lock: two IntelliJ projects opening at once in the same
             // JVM (Recent Projects) both call extractCliDist() and both loop-copy
@@ -281,10 +376,25 @@ object CliIntegrations {
             java.io.RandomAccessFile(lockFile, "rw").use { raf ->
                 raf.channel.use { chan ->
                     chan.lock().use { _ ->
-                        val n = srcDir.listFiles { f -> f.isFile && f.name.endsWith(".js") }
-                            ?.onEach { it.copyTo(File(distDir, it.name), overwrite = true) }
-                            ?.size ?: 0
-                        log.info("Extracted bundled CLI dist (%d files) to %s", n, distDir.absolutePath)
+                        // Re-check the fingerprint under the lock — the process we
+                        // waited on may have just done the copy, so we can still skip.
+                        // Re-list in case another writer just landed a fresher source.
+                        val srcJsUnderLock = listSourceJs(srcDir)
+                        val fpUnderLock = computeExtractFingerprint(srcJsUnderLock)
+                        if (isDistComplete(distDir, srcJsUnderLock) &&
+                            extractStamp.exists() &&
+                            extractStamp.readText(Charsets.UTF_8).trim() == fpUnderLock
+                        ) {
+                            log.info("Bundled CLI dist already extracted for %s (skipped)", fpUnderLock)
+                            return@use
+                        }
+                        val n = srcJsUnderLock
+                            .onEach { it.copyTo(File(distDir, it.name), overwrite = true) }
+                            .size
+                        // Stamp AFTER every file lands so a reader can trust the stamp
+                        // implies the files are complete.
+                        extractStamp.writeText(fpUnderLock, Charsets.UTF_8)
+                        log.info("Extracted bundled CLI dist (%d files) to %s (fp=%s)", n, distDir.absolutePath, fpUnderLock)
                     }
                 }
             }
@@ -293,6 +403,46 @@ object CliIntegrations {
             log.error("Failed to extract bundled CLI: %s", e.message)
             null
         }
+    }
+
+    /**
+     * The bundled entry scripts to extract: every `*.js` directly under the plugin's
+     * `cli-dist/`. Both the cache key and the completeness check derive from this one
+     * listing, so they can never disagree about which files the dist owes.
+     */
+    private fun listSourceJs(srcDir: File): List<File> =
+        srcDir.listFiles { f: File -> f.isFile && f.name.endsWith(".js") }?.toList() ?: emptyList()
+
+    /**
+     * True when every bundled entry script from [listSourceJs] is present in [distDir].
+     *
+     * Guards the [extractCliDist] short-circuit: a stamp match alone would let a dist
+     * that lost a per-hook entry script after extraction stay broken for the rest of
+     * that plugin version. Empty source means "nothing known to be complete" → false,
+     * so a bundle we failed to list falls through to the copy branch rather than
+     * silently certifying an empty dist.
+     */
+    internal fun isDistComplete(distDir: File, srcJs: List<File>): Boolean =
+        srcJs.isNotEmpty() && srcJs.all { File(distDir, it.name).isFile }
+
+    /**
+     * Computes the extract cache key: plugin version + max mtime across every source
+     * `*.js`. A content change means a filesystem write on the bundle, which normally
+     * bumps at least one mtime and so invalidates the extract cache without needing a
+     * version bump. See [extractCliDist] for the design rationale.
+     *
+     * "Normally", not "always": on a volume with second-granularity mtimes, two
+     * rebuilds inside the same second yield the same fingerprint and the second one is
+     * skipped. That only reaches a developer running back-to-back builds — a
+     * marketplace or release install always crosses a version or a second — and the
+     * alternatives were weighed and rejected in [extractCliDist] (size misses
+     * reformats; hashing every file costs a full read on the hot path). Delete the
+     * stamp, or touch a source file, to force a re-copy.
+     */
+    private fun computeExtractFingerprint(srcJs: List<File>): String {
+        val version = readPluginVersion()
+        val maxMtime = srcJs.maxOfOrNull { it.lastModified() } ?: 0L
+        return "$version|$maxMtime"
     }
 
     private fun readPluginVersion(): String =
@@ -315,55 +465,138 @@ object CliIntegrations {
     fun isNodeAvailable(): Boolean = resolveNode() != null
 
     /**
-     * Sets up MCP + skills by running the bundled CLI's `enable --integrations-only`
-     * (tagged `intellij` so its dist-paths entry coexists with any CLI/VS Code install).
-     * Returns [Result.NodeMissing] when Node is absent — a clean skip, not an error.
+     * Sets up MCP + skills by calling the CLI's `install --integrations-only`
+     * bridge action (tagged `intellij` so its dist-paths entry coexists with any
+     * CLI/VS Code install). Returns [Result.NodeMissing] when Node is absent —
+     * a clean skip, not an error.
      */
     fun enableIntegrations(projectDir: String): Result =
-        runEnable(projectDir, listOf("enable", "--integrations-only", "--source-tag", "intellij"), "integrations enable")
+        runInstallViaBridge(
+            projectDir,
+            JsonObject().apply {
+                addProperty("source", "cli")
+                addProperty("sourceTag", "intellij")
+                addProperty("integrationsOnly", true)
+            },
+            "integrations enable",
+        )
 
     /**
-     * FULL enable: the CLI installs EVERYTHING — the five git hooks (post-commit,
-     * post-rewrite, prepare-commit-msg, post-merge, pre-push, all as Node `run-hook`
-     * dispatcher scripts), the Claude Stop/SessionStart hooks, the Gemini AfterAgent
-     * hook, skills, global instructions, MCP registration, and dispatch scripts.
-     * This replaced the plugin's own Kotlin fat-JAR hook installation: the CLI's
-     * GitHookInstaller uses the exact same section markers, so it replaces a legacy
-     * `java -jar` hook body in place. `--yes` keeps the run non-interactive.
+     * FULL enable: routes to the CLI's `install` bridge action, which installs
+     * EVERYTHING — the five git hooks (post-commit, post-rewrite,
+     * prepare-commit-msg, post-merge, pre-push, all as Node `run-hook` dispatcher
+     * scripts), the Claude Stop/SessionStart hooks, the Gemini AfterAgent hook,
+     * skills, global instructions, MCP registration, and dispatch scripts.
+     *
+     * Historically ran as a fresh `node Cli.js enable --yes --source-tag intellij`
+     * subprocess. Now travels the daemon fast path (with a one-shot spawn fallback
+     * baked into [runIdeBridge]), which saves the ~300-600 ms Node cold-start +
+     * Cli.js module-load per invocation. The `clearManualDisableOnSuccess=true`
+     * flag mirrors what `EnableCommand.ts` sets when neither `--integrations-only`
+     * nor `--automatic` is passed — namely, a successful enable clears any
+     * `manuallyDisabled` opt-out so the repo isn't left in a mixed state.
+     *
+     * [respectManualDisable] makes the CLI refuse the whole install when the repo
+     * carries that opt-out, turning `install` into a zero-write no-op
+     * (`Installer.ts` → "Repository remains manually disabled"). Pass `true` from
+     * AUTOMATIC paths only — an unattended startup repair has no business
+     * resurrecting a repo the user turned off, and pairing it with
+     * `clearManualDisableOnSuccess` is what makes the refusal necessary: without it
+     * the install would go on to clear the on-disk flag, silently un-disabling the
+     * repo. Leave it `false` (the default) for every EXPLICIT user action —
+     * DisabledPanel's Enable, onboarding, the Settings re-enable — where the whole
+     * point is to lift the opt-out; passing `true` there would make the button a
+     * no-op that reports success.
+     *
+     * The two flags are MUTUALLY EXCLUSIVE, matching `EnableCommand.ts`
+     * (`respectManualDisable: options.automatic` vs
+     * `clearManualDisableOnSuccess: !integrationsOnly && !automatic`). Sending both
+     * asks the CLI to honor the opt-out and then erase it — contradictory on its face,
+     * and in the reachable case (a stale cache let an automatic install run against a
+     * disabled repo) it also meant every such IDE start wrote `manuallyDisabled=false`
+     * to a `profile.json` that the VFS watcher is watching, burning a debounce refresh
+     * for nothing.
      */
-    fun enableFull(projectDir: String): Result =
-        runEnable(projectDir, listOf("enable", "--yes", "--source-tag", "intellij"), "full enable")
+    fun enableFull(projectDir: String, respectManualDisable: Boolean = false): Result =
+        runInstallViaBridge(
+            projectDir,
+            JsonObject().apply {
+                addProperty("source", "cli")
+                addProperty("sourceTag", "intellij")
+                if (respectManualDisable) {
+                    addProperty("respectManualDisable", true)
+                } else {
+                    addProperty("clearManualDisableOnSuccess", true)
+                }
+            },
+            "full enable",
+        )
 
-    /** Shared enable runner — spawns the bundled CLI and stamps the version on success. */
-    private fun runEnable(projectDir: String, args: List<String>, label: String): Result {
-        val node = resolveNode() ?: return Result.NodeMissing
+    /**
+     * Shared install runner — pre-checks Node + bundle (so this can still return
+     * the specific `NodeMissing` / `BundleMissing` results the UI branches on),
+     * ships one request to the daemon-hosted `install` action, and maps the
+     * returned [InstallResult] JSON envelope back to the Kotlin [Result] enum.
+     * Version-stamps the dist dir on success so [integrationsUpToDate] sees the
+     * successful enable — same lifecycle as the retired spawn path.
+     *
+     * Sets `distDir` on the request, and does it HERE rather than in the two callers so
+     * neither can forget it. The CLI's `installDistPath` otherwise defaults to the
+     * directory of the bundle executing the install, which under the retired
+     * `ProcessBuilder(node, dist-intellij/Cli.js, "enable")` path was the right answer
+     * by construction. It is not once the same code runs inside the daemon: that is
+     * launched via [resolveCliJs], which prefers `<plugin>/cli-dist`, so
+     * `dist-paths/intellij` would point into the IDE's version-scoped config directory
+     * and go stale on a plugin uninstall or an IDE major upgrade. `run-hook` exits
+     * silently by design (never block git), so the only symptom would be capture
+     * quietly stopping. [extractCliDist] copies the bundle to the stable
+     * `~/.jolli/…/dist-intellij` precisely so there is a location that survives both,
+     * and this is what makes the registry agree with it — which also keeps
+     * [markIntegrationsEnabled]'s `.version` stamp on the same dist that is registered.
+     */
+    private fun runInstallViaBridge(projectDir: String, request: JsonObject, label: String): Result {
+        resolveNode() ?: return Result.NodeMissing
         val distDir = extractCliDist() ?: return Result.BundleMissing
-        val cliJs = File(distDir, "Cli.js")
+        request.addProperty("distDir", distDir.absolutePath)
         return try {
-            val proc = ProcessBuilder(listOf(node, cliJs.absolutePath) + args)
-                .directory(File(projectDir))
-                .redirectErrorStream(true)
-                .start()
-            val out = proc.inputStream.bufferedReader().use { it.readText() }
-            if (!proc.waitFor(60, TimeUnit.SECONDS)) {
-                proc.destroyForcibly()
-                return Result.Failed("$label timed out")
-            }
-            if (proc.exitValue() == 0) {
-                // Stamp "enabled" ONLY now — after a confirmed success — so a later failure
-                // or an interrupted run is never mistaken for a completed one. A full enable
-                // is a superset of the integrations-only enable, so it stamps too.
+            val json = runIdeBridge(
+                projectDir,
+                "install",
+                gson.toJson(request),
+                INSTALL_BRIDGE_TIMEOUT_SECONDS,
+            ).asJsonObject
+            // A `manuallyDisabled` success is a ZERO-WRITE refusal, not an install —
+            // checked BEFORE the success arm because it arrives as `success: true`.
+            // Treating it as Ok stamped the version (making integrationsUpToDate
+            // permanently true for this plugin version, so the upgrade catch-up branch
+            // never ran again) and told the caller the install landed, which left the
+            // optimistically-cleared manuallyDisabled cache un-rolled-back.
+            if (json.get("manuallyDisabled")?.asBoolean == true) {
+                log.info("Bundled CLI %s refused: repository is manually disabled (nothing written)", label)
+                Result.RefusedManuallyDisabled
+            } else if (json.get("success")?.asBoolean == true) {
+                // Stamp "enabled" ONLY now — after a confirmed success — so a later
+                // failure or an interrupted run is never mistaken for a completed
+                // one. A full enable is a superset of the integrations-only enable,
+                // so it stamps too. Atomic-move implementation keeps concurrent
+                // readers (CliDaemonClient.currentDistVersion on every daemon call)
+                // from ever seeing a half-truncated stamp.
                 markIntegrationsEnabled(distDir)
-                log.info("Bundled CLI %s succeeded", label)
+                log.info("Bundled CLI %s succeeded (bridge)", label)
                 Result.Ok
             } else {
                 clearIntegrationsEnabled(distDir)
-                log.warn("Bundled CLI %s exited %d: %s", label, proc.exitValue(), out.take(500))
-                Result.Failed("exit ${proc.exitValue()}")
+                val message = json.get("message")?.asString ?: "$label failed"
+                log.warn("Bundled CLI %s failed (bridge): %s", label, message.take(500))
+                Result.Failed(message)
             }
+        } catch (e: CliBridgeException) {
+            clearIntegrationsEnabled(distDir)
+            log.error("Failed to run bundled CLI %s (bridge): %s", label, e.message)
+            Result.Failed(e.message ?: "bridge error")
         } catch (e: Exception) {
             clearIntegrationsEnabled(distDir)
-            log.error("Failed to run bundled CLI %s: %s", label, e.message)
+            log.error("Failed to run bundled CLI %s (bridge): %s", label, e.message)
             Result.Failed(e.message ?: "unknown")
         }
     }
@@ -952,79 +1185,73 @@ object CliIntegrations {
     }
 
     /**
-     * Tears down the MCP registration via the `disable` bridge action with
-     * `integrationsOnly=true` — hooks stay put, only the repo-scoped MCP entries
-     * come out. Best-effort; propagates NodeMissing / BundleMissing sentinels so
-     * [warningFor] can render the same message it always did.
+     * Tears down the MCP registration via the CLI's `uninstall` bridge action
+     * with `integrationsOnly=true` (best-effort). No-op when Node or the bundle
+     * is missing — nothing to undo that we could reach. Mirrors the shape
+     * `DisableCommand.ts` builds when passed `--integrations-only`:
+     * `preserveMenu=false`, `persistManualDisable=false` (neither is a full disable).
      */
     fun disableIntegrations(projectDir: String): Result =
-        runDisableBridge(projectDir, integrationsOnly = true, "integrations disable")
+        runUninstallViaBridge(
+            projectDir,
+            JsonObject().apply {
+                addProperty("integrationsOnly", true)
+            },
+            "integrations disable",
+        )
 
     /**
-     * FULL disable via the [runIdeBridge] daemon (with a one-shot `ide-bridge`
-     * Node spawn as automatic fallback). The bridge action wraps the same
-     * exported [`uninstall`][ai.jolli-cli] that VS Code's `bridge.disable()`
-     * calls in-process — so IntelliJ and VS Code cannot drift on hook-removal
-     * semantics, but IntelliJ saves the ~500 ms – 2 s cold Node spawn of the
-     * old top-level `Cli.js disable` subprocess on the hot Apply path.
-     *
-     * Removes the git-hook sections (same markers regardless of which surface
-     * wrote them, including legacy `java -jar` bodies), the Claude / Gemini
-     * agent hooks, and the repo-scoped MCP registration, then persists the
-     * machine-owned manual-disable opt-out. Global MCP entries stay, per the
+     * FULL disable: routes to the CLI's `uninstall` bridge action, which removes
+     * the git hook sections (same markers regardless of which surface wrote them,
+     * including legacy `java -jar` bodies), the Claude and Gemini agent hooks,
+     * and the repo-scoped MCP registration. Global MCP entries stay, per the
      * CLI's conservative uninstall policy.
+     *
+     * `preserveMenu=true` + `persistManualDisable=true` mirror what
+     * `DisableCommand.ts` sets from a plain `jolli disable` (no
+     * `--integrations-only`), so the daemon path is byte-equivalent to the
+     * spawn command line we retired.
      */
     fun disableFull(projectDir: String): Result =
-        runDisableBridge(projectDir, integrationsOnly = false, "full disable")
+        runUninstallViaBridge(
+            projectDir,
+            JsonObject().apply {
+                addProperty("preserveMenu", true)
+                addProperty("persistManualDisable", true)
+            },
+            "full disable",
+        )
 
     /**
-     * Shared disable runner — routes through [runIdeBridge] so the daemon can
-     * service the call in-process (~5-20 ms). Any local transport failure
-     * (daemon crash, socket broken) falls through to a one-shot `ide-bridge`
-     * spawn inside [runIdeBridge] itself; a genuine "no Node / no bundle"
-     * failure re-surfaces as the legacy [Result.NodeMissing] / [Result.BundleMissing]
-     * sentinels so [warningFor] keeps rendering the same guidance.
+     * Shared uninstall runner — same daemon-fast-path + spawn-fallback machinery
+     * as [runInstallViaBridge], but never touches the version stamp (a disable
+     * doesn't invalidate the last-successful-enable record; the next install
+     * will re-stamp cleanly if it succeeds, or the stale stamp keeps signalling
+     * "installed for version X" which is honest).
      */
-    private fun runDisableBridge(projectDir: String, integrationsOnly: Boolean, label: String): Result {
-        val body = com.google.gson.JsonObject().apply {
-            addProperty("integrationsOnly", integrationsOnly)
-            // Match [`EnableCommand.ts`] `disable` branch: a full disable
-            // persists the machine-owned opt-out; an integrations-only teardown
-            // does not (it's not a real "user turned Jolli off" signal).
-            addProperty("persistManualDisable", !integrationsOnly)
-        }.toString()
+    private fun runUninstallViaBridge(projectDir: String, request: JsonObject, label: String): Result {
+        resolveNode() ?: return Result.NodeMissing
+        extractCliDist() ?: return Result.BundleMissing
         return try {
-            val res = runIdeBridge(projectDir, "disable", body, timeoutSeconds = 60)
-            val obj = res.takeIf { it.isJsonObject }?.asJsonObject
-            val success = obj?.get("success")
-                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }
-                ?.asBoolean == true
-            if (success) {
+            val json = runIdeBridge(
+                projectDir,
+                "uninstall",
+                gson.toJson(request),
+                INSTALL_BRIDGE_TIMEOUT_SECONDS,
+            ).asJsonObject
+            if (json.get("success")?.asBoolean == true) {
+                log.info("Bundled CLI %s succeeded (bridge)", label)
                 Result.Ok
             } else {
-                val msg = obj?.get("message")
-                    ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
-                    ?.asString
-                    ?: "$label failed"
-                Result.Failed(msg)
+                val message = json.get("message")?.asString ?: "$label failed"
+                log.warn("Bundled CLI %s failed (bridge): %s", label, message.take(500))
+                Result.Failed(message)
             }
-        } catch (e: RuntimeException) {
-            // Preserve the legacy NodeMissing / BundleMissing sentinels so
-            // [warningFor] surfaces the same "install Node" / "reinstall
-            // plugin" guidance it did in the ProcessBuilder path. Everything
-            // else (bridge protocol error, timeout, non-zero exit) is a
-            // generic Failed.
-            val msg = e.message ?: "unknown"
-            when {
-                msg.startsWith("Node.js not found") -> Result.NodeMissing
-                msg.startsWith("The bundled CLI was not found") -> Result.BundleMissing
-                else -> {
-                    log.warn("Failed to run bridge %s (non-fatal): %s", label, msg)
-                    Result.Failed(msg)
-                }
-            }
+        } catch (e: CliBridgeException) {
+            log.warn("Failed to run bundled CLI %s (bridge, non-fatal): %s", label, e.message)
+            Result.Failed(e.message ?: "bridge error")
         } catch (e: Exception) {
-            log.warn("Failed to run bridge %s (non-fatal): %s", label, e.message)
+            log.warn("Failed to run bundled CLI %s (bridge, non-fatal): %s", label, e.message)
             Result.Failed(e.message ?: "unknown")
         }
     }

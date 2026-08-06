@@ -207,6 +207,20 @@ export async function install(
 		clearManualDisableOnSuccess?: boolean;
 		/** Automatic surface repair: short lock waits and current-worktree-only reconciliation. */
 		automatic?: boolean;
+		/**
+		 * Absolute path to register in `dist-paths/<sourceTag>` — the dist `run-hook`
+		 * will exec from. Defaults to THIS bundle's own directory, which is right only
+		 * when the process running the install IS the dist being registered.
+		 *
+		 * That holds for `jolli enable` and VS Code's in-process call, but NOT for a
+		 * long-lived server installing on another dist's behalf: the IntelliJ plugin
+		 * serves this from its own `cli-dist` inside the IDE's plugins directory, which
+		 * dies on plugin uninstall or an IDE major upgrade (that path is version-scoped),
+		 * while the dist it wants registered is the stable `~/.jolli/…/dist-intellij`
+		 * copy. Getting that wrong is invisible: `run-hook` exits silently by design
+		 * (never block git), so capture just stops.
+		 */
+		distDir?: string;
 	},
 ): Promise<InstallResult> {
 	/* v8 ignore next - process.cwd() fallback only used when called without cwd arg */
@@ -318,7 +332,10 @@ export async function install(
 				log.warn("Legacy dist-path migration failed (non-fatal): %s", (error as Error).message);
 			}
 			/* v8 ignore stop */
-			if (!(await installDistPath(sourceTag))) return false;
+			// `options?.distDir` (undefined for every in-process caller) keeps the
+			// historical "register my own directory" default while letting a daemon-hosted
+			// caller name the dist it is installing on behalf of. See the option's docs.
+			if (!(await installDistPath(sourceTag, options?.distDir))) return false;
 			try {
 				const pruned = await pruneStaleDistPaths();
 				if (pruned.length > 0) log.info("Pruned stale dist-paths entries: %s", pruned.join(", "));
@@ -352,7 +369,17 @@ export async function install(
 				};
 			}
 			if (options?.respectManualDisable && (await readManualDisableFlag(projectDir))) {
-				return { success: true, message: "Repository remains manually disabled", warnings };
+				// `manuallyDisabled: true` marks this as a zero-write success — see the
+				// field's docstring. Without it a caller cannot tell this apart from a
+				// real install, and the IntelliJ bridge stamped "enabled for this
+				// version" on the strength of `success` alone, which then suppressed
+				// every later integrations catch-up for that version.
+				return {
+					success: true,
+					message: "Repository remains manually disabled",
+					warnings,
+					manuallyDisabled: true,
+				};
 			}
 
 			// EXPLICIT plugin setup: `/jolli:init` runs this command WITHOUT --automatic,

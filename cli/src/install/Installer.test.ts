@@ -3682,6 +3682,33 @@ describe("Installer", () => {
 			claudeHookControl.forceRemoveError = null;
 		});
 
+		it("enable: respectManualDisable refuses a disabled repo and marks the result manuallyDisabled", async () => {
+			// The refusal returns `success: true` because declining to touch a repo the
+			// user turned off is the correct outcome, not an error. That makes `success`
+			// alone ambiguous, so the result carries `manuallyDisabled: true` as the
+			// discriminator. The IntelliJ bridge keys its version stamp and its cached
+			// opt-out rollback on this flag; reading `success` alone made it record an
+			// install that never happened, which then suppressed every later
+			// integrations catch-up for that plugin version.
+			const { writeManualDisableFlag } = await import("../core/RepoProfile.js");
+			await writeManualDisableFlag(tempDir, true);
+			const result = await install(tempDir, { respectManualDisable: true });
+			expect(result.success).toBe(true);
+			expect(result.manuallyDisabled).toBe(true);
+			expect(result.message).toMatch(/manually disabled/i);
+			// Zero-write: no hook may reach disk on this path.
+			expect((await getStatus(tempDir)).gitHookInstalled).toBe(false);
+		});
+
+		it("enable: respectManualDisable installs normally when the repo is not disabled", async () => {
+			// The flag must not become an unconditional refusal — the automatic startup
+			// path passes it on every run, so a false positive would stop all self-heal.
+			const result = await install(tempDir, { respectManualDisable: true });
+			expect(result.success).toBe(true);
+			expect(result.manuallyDisabled).toBeUndefined();
+			expect((await getStatus(tempDir)).gitHookInstalled).toBe(true);
+		});
+
 		it("enable: a failed clearManualDisableOnSuccess write is non-fatal — hooks stay installed and enable succeeds", async () => {
 			// The opt-out clear runs AFTER every hook is written. If it throws (e.g. a
 			// profile-lock timeout), the enable must still report success — otherwise a

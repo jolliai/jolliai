@@ -7,6 +7,8 @@
  * truth while the IntelliJ side remains a process/DTO adapter.
  */
 
+import { existsSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import type { LiveSharePatch, LiveSharePayload } from "../core/JolliShareClient.js";
 import { runWithTrace } from "../core/TraceContext.js";
 import { computeWatchTargets } from "../daemon/DaemonServer.js";
@@ -82,6 +84,17 @@ function stringArrayField(request: JsonObject, key: string): string[] {
 	if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
 		throw new Error(`Request field "${key}" must be an array of strings.`);
 	}
+	return value;
+}
+
+/**
+ * Required boolean. Throws rather than coercing, matching [stringField] /
+ * [numberField]: for a field that IS the payload of a state-changing write, there is
+ * no safe direction to default to, and a silent `false` would be the dangerous one.
+ */
+function booleanField(request: JsonObject, key: string): boolean {
+	const value = request[key];
+	if (typeof value !== "boolean") throw new Error(`Request field "${key}" must be a boolean.`);
 	return value;
 }
 
@@ -289,6 +302,128 @@ async function runSessionStateAction(cwd: string, request: JsonObject): Promise<
 			return { ok: true };
 		default:
 			throw new Error(`Unknown session-state operation "${operation}".`);
+	}
+}
+
+/**
+ * Bridge equivalent of `jolli enable`. The IntelliJ plugin routes its full-enable
+ * / integrations-enable through this action instead of a fresh `node Cli.js enable`
+ * subprocess (see `intellij/.../CliIntegrations.enableFull`), so the ~300-600 ms
+ * Node cold-start + Cli.js module-load happens ONCE per daemon lifetime rather than
+ * on every enable. The daemon's readline loop dispatches this concurrently with
+ * other in-flight bridge calls (fire-and-forget in the server, per-id futures on
+ * the Kotlin side), so a slow enable never blocks a hot-path status/config-load
+ * on the same daemon.
+ *
+ * Payload mirrors the CLI's `enable` flags (`--source-tag`, `--integrations-only`,
+ * `--repo-hooks-only`, `--automatic`) plus the two lock-ordering flags that
+ * `EnableCommand.ts` sets from the outside. Return shape is the full
+ * [InstallResult] — callers key on `success` / `message` / `warnings`.
+ *
+ * `distDir` exists because this action runs INSIDE the daemon. `install`'s default
+ * registers the running bundle's own directory, which is correct for every
+ * in-process caller but wrong here: the daemon is launched from the plugin's own
+ * `cli-dist` inside the IDE's plugins directory, so without this the plugin would
+ * register a path that dies on plugin uninstall or an IDE major upgrade, and
+ * `run-hook` exits silently by design — capture would just stop. See the `distDir`
+ * option's docs.
+ */
+async function runInstallAction(cwd: string, request: JsonObject): Promise<unknown> {
+	const { install } = await import("../install/Installer.js");
+	// Only accept the two documented source values — anything else falls back to
+	// "cli" so a malformed request can't smuggle a novel string into the dist-path
+	// writer's identity logic.
+	const rawSource = request.source;
+	const source: "cli" | "vscode-extension" = rawSource === "vscode-extension" ? "vscode-extension" : "cli";
+	return install(cwd, {
+		source,
+		sourceTag: optionalString(request, "sourceTag"),
+		integrationsOnly: request.integrationsOnly === true,
+		repoHooksOnly: request.repoHooksOnly === true,
+		respectManualDisable: request.respectManualDisable === true,
+		clearManualDisableOnSuccess: request.clearManualDisableOnSuccess === true,
+		automatic: request.automatic === true,
+		distDir: distDirField(request),
+	});
+}
+
+/**
+ * Validates an optional `distDir`. Absent → undefined, so `install` keeps its own
+ * directory as before.
+ *
+ * Validated rather than passed through because this string is written to
+ * `dist-paths/<tag>` and later handed to `run-hook`, which execs a script from it on
+ * the blocking git path — the same reason `sourceTag` is re-validated at its write
+ * boundary. A relative path would resolve against whatever cwd the hook happens to
+ * run in, and a non-existent directory would register a dead entry that fails
+ * silently, so both are rejected loudly here instead.
+ */
+function distDirField(request: JsonObject): string | undefined {
+	const value = optionalString(request, "distDir");
+	if (value === undefined) return undefined;
+	if (!isAbsolute(value)) throw new Error(`Request field "distDir" must be an absolute path.`);
+	if (!existsSync(value)) throw new Error(`Request field "distDir" does not exist: ${value}`);
+	return value;
+}
+
+/**
+ * Bridge equivalent of `jolli disable`. Same daemon-hosted rationale as
+ * [runInstallAction]. Mirrors the flags `DisableCommand.ts` passes: `preserveMenu`
+ * and `persistManualDisable` both derive from `!integrationsOnly`.
+ *
+ * Those two DERIVE rather than strict-cast (`=== true`) on purpose, even though
+ * every other flag on this action strict-casts. Strict casting is the right default
+ * for an untrusted field whose absence should mean "off", but these two invert that:
+ * omitting `preserveMenu` means "also delete the `/jolli` umbrella skill and strip
+ * the jolli section from `.git/info/exclude`", and omitting `persistManualDisable`
+ * means "tear the hooks out without recording that the user asked for it", so the
+ * next start silently reinstalls them. A caller that passes `{}` intending a plain
+ * full disable would get neither. Deriving makes the safe reading the default and
+ * still lets a caller opt out explicitly, which is exactly what the sibling
+ * `case "disable"` has always done — the two must not disagree, since they wrap the
+ * same [uninstall].
+ *
+ * Note `case "disable"` is retained rather than folded into this action despite
+ * having no caller left in this repo: dist-path indirection means an already-
+ * installed plugin build can resolve to a NEWER cli dist than itself, and plugin
+ * versions shipped before this action existed call `"disable"`. Removing it would
+ * break disable for those installs on the next CLI upgrade.
+ */
+async function runUninstallAction(cwd: string, request: JsonObject): Promise<unknown> {
+	const { uninstall } = await import("../install/Installer.js");
+	const integrationsOnly = request.integrationsOnly === true;
+	return uninstall(cwd, {
+		integrationsOnly,
+		preserveMenu: typeof request.preserveMenu === "boolean" ? request.preserveMenu : !integrationsOnly,
+		persistManualDisable:
+			typeof request.persistManualDisable === "boolean" ? request.persistManualDisable : !integrationsOnly,
+	});
+}
+
+/**
+ * Exposes the repo-scoped `RepoProfile` fields IntelliJ needs to keep in sync with
+ * VS Code — today just the `manuallyDisabled` opt-out. Kotlin has no independent
+ * reader/writer for `.jolli/profile.json`, so this action is the single write
+ * channel; the CLI file is the system of record and every writer takes the
+ * `profile.lock` mutex, so a Kotlin caller can't clobber a concurrent
+ * `jolli disable` from a terminal (or vice-versa).
+ *
+ * `disabled` is read with [booleanField], so a request that omits it fails loudly
+ * instead of being coerced. `=== true` would have quietly turned a malformed write
+ * into `manuallyDisabled=false` — a silent RE-ENABLE of the highest-priority opt-out,
+ * the one direction that must never happen by accident.
+ */
+async function runRepoProfileAction(cwd: string, request: JsonObject): Promise<unknown> {
+	const operation = stringField(request, "operation");
+	const { readManualDisableFlag, writeManualDisableFlag } = await import("../core/RepoProfile.js");
+	switch (operation) {
+		case "read-manual-disable":
+			return { disabled: await readManualDisableFlag(cwd) };
+		case "write-manual-disable":
+			await writeManualDisableFlag(cwd, booleanField(request, "disabled"));
+			return { ok: true };
+		default:
+			throw new Error(`Unknown repo-profile operation "${operation}".`);
 	}
 }
 
@@ -1335,10 +1470,16 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 			});
 			return { ...result, conflictDetails: ui.details };
 		}
+		case "install":
+			return runInstallAction(cwd, request);
+		case "uninstall":
+			return runUninstallAction(cwd, request);
 		case "conversation-overlay":
 			return runConversationOverlayAction(cwd, request);
 		case "session-state":
 			return runSessionStateAction(cwd, request);
+		case "repo-profile":
+			return runRepoProfileAction(cwd, request);
 		case "auth":
 			return runAuthAction(request);
 		case "jolli-api":

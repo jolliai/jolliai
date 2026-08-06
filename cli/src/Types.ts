@@ -1669,6 +1669,19 @@ export interface InstallResult {
 	readonly prePushHookPath?: string;
 	/** Absolute path to the Gemini settings file (set on successful install when Gemini detected) */
 	readonly geminiSettingsPath?: string;
+	/**
+	 * Set when `respectManualDisable` short-circuited the run: the repo carries the
+	 * manual opt-out, so NOTHING was installed even though `success` is `true`.
+	 *
+	 * The success is deliberate — refusing to touch a repo the user turned off IS the
+	 * correct outcome, not an error. But it means `success` alone cannot be read as
+	 * "the install happened". Any caller whose success path has a side effect —
+	 * stamping "enabled for this version", clearing a cached opt-out, holding a UI
+	 * state — MUST check this flag first, or it will record an install that never
+	 * occurred. Absent (undefined) on every other path, including a real install of a
+	 * repo that simply has no opt-out set.
+	 */
+	readonly manuallyDisabled?: boolean;
 }
 
 /** Registry of all active sessions, keyed by session ID */

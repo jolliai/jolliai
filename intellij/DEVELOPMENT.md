@@ -140,7 +140,7 @@ src/main/kotlin/ai/jolli/jollimemory/
 │   ├── PlanService.kt               # Plan detection and registry management
 │   └── PrService.kt                 # GitHub PR creation/update via gh CLI
 ├── settings/
-│   └── JolliMemoryConfigurable.kt   # Settings page (Settings > Tools > Jolli Memory) — Sign In/Out + API keys + model
+│   └── JolliMemoryConfigurable.kt   # Preferences > Tools > Jolli Memory entry — bridge only, opens SettingsDialog
 └── toolwindow/                      # UI components (Swing / JCEF)
     ├── JolliMemoryToolWindowFactory.kt # Tool window entry point + Sign In banner
     ├── AccordionLayout.kt           # Collapsed panels shrink to header-only

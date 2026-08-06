@@ -1,8 +1,8 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.JolliMemoryIcons
-import ai.jolli.jollimemory.actions.CloudSyncAction
 import ai.jolli.jollimemory.actions.TogglePanelAction
+import ai.jolli.jollimemory.bridge.CliIntegrations
 import ai.jolli.jollimemory.core.SessionTracker
 import ai.jolli.jollimemory.services.JolliApiClient
 import ai.jolli.jollimemory.services.JolliAuthService
@@ -440,7 +440,10 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         }
         toolWindow.setAdditionalGearActions(gearActions)
 
-        // ── Content cards: current accordion / KB / Knowledge / status full-pane ──
+        // ── Content cards: current accordion / KB / Knowledge ──
+        // (Status is NOT one of these — it lives above the whole normal sidebar
+        // layout as its own card, so it hides view switch + breadcrumb +
+        // accordion + action bar together; see [statusOverlayPanel] below.)
         val contentCardLayout = CardLayout()
         val contentCards = JPanel(contentCardLayout)
         contentCards.add(accordionPanel, CARD_ACCORDION)
@@ -451,33 +454,39 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         val knowledgePanel = buildKnowledgePlaceholder()
         contentCards.add(knowledgePanel, CARD_KNOWLEDGE)
 
-        // StatusPanel lives directly as a card so the status button can swap it in
-        // to occupy the full content area (matches VS Code's full-pane status view).
-        contentCards.add(statusPanel, CARD_STATUS)
-
         // Fixed bottom action bar (Current Branch view only): Commit · Create PR · ⋯ More
         val actionBar = ActionBarPanel(project, service)
 
-        // Status full-pane controller: shows the STATUS card over the accordion.
-        // Driven by the title-bar Status toggle and auto-shown when Jolli is disabled.
+        // Status full-pane controller — implemented as a var so the title-bar
+        // ToggleAction below (built before the widgets that Status hides) can
+        // capture it and pick up the real implementation once [mainCardLayout]
+        // exists. The placeholder still tracks [statusShown] so a very-early
+        // toggle keeps the ToggleAction's isSelected() coherent.
         var statusShown = false
-        fun setStatusShown(shown: Boolean) {
-            statusShown = shown
-            contentCardLayout.show(contentCards, if (shown) CARD_STATUS else CARD_ACCORDION)
-        }
+        var setStatusShown: (Boolean) -> Unit = { statusShown = it }
 
-        // ── Title-bar actions: Agents · Settings · Status · Cloud sync ──
+        // Repo-scoped opt-out (`manuallyDisabled` in `.jolli/profile.json`, spec 306).
+        // Seeded from the service's cache — refreshed on the same fan-out as the
+        // rest of the status (startup, VFS `profile.json`, GIT_REPO_CHANGE, daemon
+        // `refresh` pushes), so a `jolli disable` from a terminal or a sibling
+        // VS Code window flips the DisabledPanel without a tool-window rebuild.
+        // Also updated in-memory by the DisabledPanel's Enable click (optimistic UI
+        // flip — see below) and by [runStatusDisable]'s onDisabled callback after
+        // the CLI transaction returns success, so the card switches locally before
+        // the VFS-driven refresh from the CLI write catches up.
+        var manuallyDisabled = service.isManuallyDisabled()
+
+        // syncView() forward-reference — same pattern as [setStatusShown]. The
+        // STATUS header's Disable icon fires long after syncView is defined, but
+        // Kotlin resolves closures lexically; a placeholder here lets that
+        // closure capture the name now, and the real impl overwrites it below.
+        var syncView: () -> Unit = { }
+
+        // ── Title-bar actions: Settings · Status ──
         // These live in the tool window header (the "Jolli Memory" title bar),
-        // matching the mockup's view-title icon group.
-        val agentsAction = object : AnAction(
-            "Agent Access", "Agent access — what your AI tools can reach", AllIcons.Nodes.Plugin,
-        ), DumbAware {
-            override fun actionPerformed(e: com.intellij.openapi.actionSystem.AnActionEvent) {
-                com.intellij.openapi.ui.Messages.showInfoMessage(
-                    project, "Agent access settings are coming soon.", "Agent Access",
-                )
-            }
-        }
+        // matching the mockup's view-title icon group. Sign In / Sign Out /
+        // Sync Now live INSIDE the Status card (see [StatusPanel]) so the
+        // header stays a two-icon strip.
         val settingsAction = object : AnAction(
             "Settings", "Open Jolli Memory settings", AllIcons.General.GearPlain,
         ), DumbAware {
@@ -486,7 +495,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             }
         }
         val statusAction = object : com.intellij.openapi.actionSystem.ToggleAction(
-            "Status", "Toggle the Jolli Memory status panel", JolliMemoryIcons.CircleGreen,
+            "Status", "Toggle the Jolli Memory status panel", JolliMemoryIcons.PulseStatusGreen,
         ), DumbAware {
             override fun isSelected(e: com.intellij.openapi.actionSystem.AnActionEvent): Boolean = statusShown
             override fun setSelected(e: com.intellij.openapi.actionSystem.AnActionEvent, state: Boolean) {
@@ -502,15 +511,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
 
             override fun getActionUpdateThread() = com.intellij.openapi.actionSystem.ActionUpdateThread.BGT
         }
-        // "Agent Access" is a coming-soon stub — keep it out of the title bar until
-        // it does something (the action object stays defined so re-enabling is a flag flip).
-        val titleActions = buildList {
-            if (FeatureFlags.SHOW_UNFINISHED) add(agentsAction)
-            add(settingsAction)
-            add(statusAction)
-            add(CloudSyncAction())
-        }
-        toolWindow.setTitleActions(titleActions)
+        toolWindow.setTitleActions(listOf(settingsAction, statusAction))
 
         // Breadcrumb header: repo/branch selectors (icon buttons now live in the title bar)
         val breadcrumb = BreadcrumbHeaderPanel(
@@ -539,8 +540,11 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         // The switch logic is a named function so the back-fill card's "Open your Memory Bank"
         // button can drive it too (via `openMemoryBank`), keeping the switcher UI in sync.
         fun applyView(view: ViewSwitchPanel.View) {
-            // Switching views replaces the status card with a real view card.
-            statusShown = false
+            // Switching views hides the STATUS overlay. Uses setStatusShown() (not a
+            // raw statusShown assign) because STATUS now lives one layer up in
+            // mainCardLayout — a raw flag flip would leave the overlay visible while
+            // the toggle button reports "off", making the view switch appear inert.
+            setStatusShown(false)
             ai.jolli.jollimemory.core.telemetry.Telemetry.track(
                 "view_switched",
                 mapOf("view" to view.name.lowercase()),
@@ -572,11 +576,27 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             applyView(ViewSwitchPanel.View.BANK)
         }
 
-        // Auto-switch to the STATUS card when Jolli Memory is disabled (preserves
-        // the install/setup discoverability), and auto-return once it's enabled.
-        // When enabled, only dismiss the status card if it was being shown — don't
-        // disturb the Memory Bank / Knowledge views.
+        // Auto-switch to the STATUS card when Jolli Memory is degraded (preserves
+        // the install/setup discoverability), and auto-return once it recovers.
+        // The manually-disabled state has its own [DisabledPanel] one level up at
+        // the rootPanel, so the degraded/recovered arms are a no-op then —
+        // otherwise the STATUS overlay would fight the DisabledPanel and the
+        // mainCardLayout would flip pointlessly on every status refresh.
+        //
+        // It is NOT a plain early return though: the overlay must be COLLAPSED on
+        // the way into the disabled state. [mainCardLayout] survives underneath
+        // CARD_DISABLED, so a still-shown overlay is exactly what the user lands
+        // on when they click Enable (syncView shows CARD_MAIN, whose card layout
+        // is still on CARD_MAIN_STATUS) — the STATUS page instead of the sidebar.
+        // This arm covers the paths that route through the status listener (a
+        // cross-window / terminal `jolli disable`, the Settings credential-removal
+        // auto-disable); the STATUS header's own Disable icon collapses it inline
+        // so it doesn't wait on the async refresh.
         fun syncStatusCard() {
+            if (manuallyDisabled) {
+                if (statusShown) setStatusShown(false)
+                return
+            }
             val enabled = service.getStatus()?.enabled == true
             if (!enabled) {
                 setStatusShown(true)
@@ -585,7 +605,20 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             }
         }
         syncStatusCard()
-        val statusSyncListener: () -> Unit = { SwingUtilities.invokeLater { syncStatusCard() } }
+        // On every status refresh, pull the service's current manuallyDisabled and
+        // re-route via [syncView] iff it changed — that's what carries a cross-window
+        // `jolli disable` (or terminal `jolli disable`) into this IDE's UI. The
+        // syncStatusCard() call after handles the enabled/degraded overlay as before.
+        val statusSyncListener: () -> Unit = {
+            SwingUtilities.invokeLater {
+                val svcDisabled = service.isManuallyDisabled()
+                if (svcDisabled != manuallyDisabled) {
+                    manuallyDisabled = svcDisabled
+                    syncView()
+                }
+                syncStatusCard()
+            }
+        }
         service.addStatusListener(statusSyncListener)
         val statusListenerDisposable = com.intellij.openapi.Disposable {
             service.removeStatusListener(statusSyncListener)
@@ -601,11 +634,66 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             add(viewSwitch, BorderLayout.NORTH)
             add(breadcrumb, BorderLayout.SOUTH)
         }
-        val mainPanel = JPanel(BorderLayout()).apply {
+        // Normal sidebar surface — everything below IntelliJ's own title bar
+        // *except* the Status overlay: view switch + breadcrumb, accordion /
+        // Memory Bank / Knowledge content, and the bottom action bar.
+        val mainNormalPanel = JPanel(BorderLayout()).apply {
             add(northWrapper, BorderLayout.NORTH)
             add(contentCards, BorderLayout.CENTER)
             add(actionBar, BorderLayout.SOUTH)
         }
+
+        // Status overlay: wraps [statusPanel] with a "STATUS" header that carries
+        // three icon actions (Sign In/Out toggle · Disable · Close). Mirrors the
+        // design's `#ov-status` `.sb-overlay` — a full-sidebar overlay, not a
+        // card inside the normal layout — so it visually replaces every other
+        // widget when the Status toggle is on. The returned Disposable owns the
+        // header's auth listener; it's tied to [contentDisposable] below.
+        val (statusOverlayPanel, statusOverlayDisposable) = buildStatusOverlay(
+            statusPanel = statusPanel,
+            onSignInOrOut = { runStatusSignInOrOut(project) },
+            onDisable = {
+                runStatusDisable(project, service) {
+                    // Uninstall succeeded (flag persisted AND hooks removed via the
+                    // CLI's fail-atomic transaction) → flip UI to DisabledPanel.
+                    SwingUtilities.invokeLater {
+                        manuallyDisabled = true
+                        // Collapse this overlay before routing away. The Disable icon
+                        // only exists in the STATUS header, so reaching here means the
+                        // overlay is open and [mainCardLayout] is parked on
+                        // CARD_MAIN_STATUS; leaving it there would make the
+                        // DisabledPanel's Enable click land on the STATUS page rather
+                        // than the sidebar, and syncStatusCard's disabled arm would not
+                        // undo it until the async refreshStatus lands 0.5-2 s later.
+                        setStatusShown(false)
+                        syncView()
+                    }
+                }
+            },
+            onClose = { setStatusShown(false) },
+        )
+
+        // Two-card CardLayout at the mainPanel level: switching to "status"
+        // hides EVERYTHING in the normal panel (view switch, breadcrumb,
+        // accordion, action bar) in one flip.
+        val mainCardLayout = CardLayout()
+        val mainPanel = JPanel(mainCardLayout).apply {
+            add(mainNormalPanel, CARD_MAIN_NORMAL)
+            add(statusOverlayPanel, CARD_MAIN_STATUS)
+        }
+
+        // Now that mainCardLayout exists, replace the setStatusShown
+        // placeholder with the real implementation. The title-bar
+        // ToggleAction, applyView, and syncStatusCard all captured
+        // this var, so they pick up the swap automatically.
+        setStatusShown = { shown ->
+            statusShown = shown
+            mainCardLayout.show(mainPanel, if (shown) CARD_MAIN_STATUS else CARD_MAIN_NORMAL)
+        }
+        // Push the initial [statusShown] through the real impl — syncStatusCard
+        // ran earlier against the placeholder, so the flag may already be true
+        // (Jolli disabled) but the card layout is still on "normal".
+        setStatusShown(statusShown)
 
         // ── Onboarding / Main card layout ──────────────────────
         val rootCardLayout = CardLayout()
@@ -613,13 +701,15 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
 
         fun isConfigured(): Boolean {
             val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
-            if (config.paused == true) return true
             // A local agent drives its own subscription login — no jollimemory-held key
             // — so choosing it in onboarding is a complete setup. Mirrors the CLI's
             // resolveLlmCredentialSource, which returns "local-agent" whenever the
             // provider is selected, with no presence/key check. Without this the
             // onboarding "Use Local Agent Tool" button saved config but never flipped
             // to the main view.
+            // Note: the "user turned it off" state is handled one level up via
+            // manuallyDisabled → CARD_DISABLED, so isConfigured() only decides
+            // between onboarding and (main | disabled).
             if (config.aiProvider == "local-agent") return true
             if (!config.apiKey.isNullOrBlank()) return true
             if (!System.getenv("ANTHROPIC_API_KEY").isNullOrBlank()) return true
@@ -627,8 +717,16 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             return false
         }
 
-        fun syncView() {
-            rootCardLayout.show(rootPanel, if (isConfigured()) CARD_MAIN else CARD_ONBOARDING)
+        syncView = {
+            val card = when {
+                // Manual opt-out wins over configured/enabled: the user explicitly
+                // chose to turn Jolli off, so keep showing the DisabledPanel until
+                // they click Enable, even if creds are still on disk.
+                manuallyDisabled && isConfigured() -> CARD_DISABLED
+                isConfigured() -> CARD_MAIN
+                else -> CARD_ONBOARDING
+            }
+            rootCardLayout.show(rootPanel, card)
         }
 
         val onboardingPanel = OnboardingPanel(
@@ -646,24 +744,67 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
             },
         )
 
+        // "Get started with Jolli Memory" — VS Code `.disabled-panel` parity.
+        //
+        // OPTIMISTIC UI: flip to CARD_MAIN immediately on the EDT so the user
+        // sees a response in ~10 ms, then run the ~500 ms-2 s CLI install
+        // transaction (dist extract + bridge install + …) on a pooled thread.
+        // If install fails, roll the card back to CARD_DISABLED and let the
+        // notification fired by [runStatusEnable] explain why.
+        //
+        // Why this is safe: enable is a "convert to success or stay disabled"
+        // operation — a failed install leaves the repo genuinely disabled
+        // (no hooks written), and the CLI's install action clears the
+        // on-disk `manuallyDisabled` flag ONLY on success, so the roll-back
+        // in-memory flip lands on the same truth as disk. VS Code's flow is
+        // synchronous end-to-end because its total wall time is 50-300 ms;
+        // IntelliJ's out-of-process cost is ~5-10× higher, so optimistic is
+        // the equalizer.
+        val disabledPanel = DisabledPanel(onEnable = {
+            // Flip UI now, on whichever thread the click fires from (safely
+            // marshalled via invokeLater so the swing state changes are
+            // ordered even if the button already dispatches on the EDT).
+            SwingUtilities.invokeLater {
+                manuallyDisabled = false
+                syncView()
+            }
+            ApplicationManager.getApplication().executeOnPooledThread {
+                runStatusEnable(project, service, onFailure = {
+                    SwingUtilities.invokeLater {
+                        manuallyDisabled = true
+                        syncView()
+                    }
+                })
+            }
+        })
+
         rootPanel.add(onboardingPanel, CARD_ONBOARDING)
         rootPanel.add(mainPanel, CARD_MAIN)
+        rootPanel.add(disabledPanel, CARD_DISABLED)
+        // The initial manuallyDisabled read moved into [service.refreshStatus] —
+        // seeded by the sync initialize() at the top of createFullContent, and
+        // kept live by the status listener + `profile.json` VFS watcher.
 
         // Auth listener on the factory: handles sign-in → main, sign-out → onboarding
+        //
+        // VS Code parity: sign-out is JUST sign-out — it clears credentials via
+        // the shared `clearAuthCredentials` (through the ide-bridge) and lets
+        // syncView() re-route based on the fresh config. It does NOT chain an
+        // auto-uninstall that writes `manuallyDisabled=true`, because:
+        //   • The `.jolli` sign-in path already clears `aiProvider="jolli"` on
+        //     the CLI side, so `isConfigured()` naturally flips to false and
+        //     syncView() lands on CARD_ONBOARDING.
+        //   • For a `local-agent` user who signed in to Jolli, sign-out only
+        //     removes their Jolli Space access; `aiProvider` stays "local-agent"
+        //     and Jolli Memory is still fully functional — the correct next
+        //     surface is CARD_MAIN, not the DisabledPanel.
+        // A prior version fired `service.uninstall()` here when a stale
+        // `hasCredentials` check missed the local-agent case, wrongly writing
+        // `manuallyDisabled=true` and trapping the user on the DisabledPanel
+        // even though they still had a working provider. See VS Code's
+        // `jollimemory.signOut` command in Extension.ts for the equivalent —
+        // it only calls statusStore.refresh() plus panel notifications.
         val factoryAuthDisposable = JolliAuthService.addAuthListener {
-            if (!JolliAuthService.isSignedIn()) {
-                val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
-                val hasCredentials = !config.apiKey.isNullOrBlank() ||
-                    !System.getenv("ANTHROPIC_API_KEY").isNullOrBlank() ||
-                    !config.jolliApiKey.isNullOrBlank()
-                if (!hasCredentials) {
-                    ApplicationManager.getApplication().executeOnPooledThread {
-                        service.uninstall()
-                        ai.jolli.jollimemory.core.telemetry.Telemetry.track("surface_disabled", mapOf("trigger" to "auto_signout"))
-                        service.refreshStatus()
-                    }
-                }
-            }
             SwingUtilities.invokeLater { syncView() }
         }
 
@@ -683,6 +824,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
         Disposer.register(contentDisposable, onboardingPanel)
         Disposer.register(contentDisposable, factoryAuthDisposable)
         Disposer.register(contentDisposable, statusListenerDisposable)
+        Disposer.register(contentDisposable, statusOverlayDisposable)
         Disposer.register(contentDisposable, syncViewDisposable)
         Disposer.register(contentDisposable, statusPanel)
         Disposer.register(contentDisposable, plansPanel)
@@ -748,16 +890,326 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
     companion object {
         private const val CARD_ONBOARDING = "onboarding"
         private const val CARD_MAIN = "main"
+        // Shown when the user has explicitly disabled Jolli Memory via the
+        // STATUS header Disable icon (spec 306's `manuallyDisabled` opt-out).
+        // Mirrors VS Code's `.disabled-panel` — a distinct card from the
+        // onboarding flow so a re-enable is one click, not three-choice re-setup.
+        private const val CARD_DISABLED = "disabled"
         private const val CARD_ACCORDION = "accordion"
         private const val CARD_KB = "kb"
         private const val CARD_KNOWLEDGE = "knowledge"
-        private const val CARD_STATUS = "status"
+        // Inside mainPanel: swaps the whole normal sidebar surface for the
+        // Status overlay (view switch, breadcrumb, accordion, action bar are
+        // ALL hidden while Status is up).
+        private const val CARD_MAIN_NORMAL = "mainNormal"
+        private const val CARD_MAIN_STATUS = "mainStatus"
     }
 }
 
 /**
- * Picks the status-circle icon (green / yellow / red) for the current service state.
- * Shared by the title-bar Status action and the hover status indicator so both always agree:
+ * Wraps [statusPanel] with a "STATUS" header carrying three icon actions
+ * (Sign In/Out · Disable · Close) plus the composite body panel. Matches the
+ * design's `#ov-status` `.sb-overlay > .ov-header` — a distinct, labeled page
+ * inside the sidebar, not a card inside the normal layout.
+ *
+ * The Sign In/Sign Out icon flips based on [JolliAuthService.isSignedIn]; the
+ * returned [Disposable] owns the auth listener that drives the swap, and the
+ * caller MUST register it against the tool window's content disposable.
+ *
+ * [onClose] is invoked when the user clicks the X. The title-bar Status
+ * ToggleAction stays the primary close affordance; the X is a secondary one.
+ */
+private fun buildStatusOverlay(
+    statusPanel: JPanel,
+    onSignInOrOut: () -> Unit,
+    onDisable: () -> Unit,
+    onClose: () -> Unit,
+): Pair<JPanel, com.intellij.openapi.Disposable> {
+    val separatorColor = javax.swing.UIManager.getColor("Separator.separatorColor")
+        ?: javax.swing.UIManager.getColor("Component.borderColor")
+        ?: java.awt.Color.GRAY
+
+    val title = JBLabel("STATUS").apply {
+        font = font.deriveFont(java.awt.Font.BOLD, font.size2D - 2f)
+        border = JBUI.Borders.emptyLeft(4)
+    }
+
+    // Sign In / Sign Out toggle. Icon + tooltip driven by [JolliAuthService];
+    // the auth listener below re-runs [refreshSignInOut] on every state flip so
+    // this stays coherent without polling.
+    val signInOutButton = JBLabel().apply {
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        border = JBUI.Borders.empty(0, 4)
+        addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                e.consume()
+                onSignInOrOut()
+            }
+        })
+    }
+    val refreshSignInOut = {
+        val signedIn = JolliAuthService.isSignedIn()
+        signInOutButton.icon = if (signedIn) AllIcons.Actions.Exit else AllIcons.General.User
+        signInOutButton.toolTipText = if (signedIn) "Sign out of Jolli" else "Sign in to Jolli"
+    }
+    refreshSignInOut()
+    val authListenerDisposable = JolliAuthService.addAuthListener {
+        SwingUtilities.invokeLater(refreshSignInOut)
+    }
+
+    val disableButton = JBLabel(AllIcons.Actions.Suspend).apply {
+        toolTipText = "Disable Jolli Memory (removes hooks — the sidebar shows a card to turn it back on)"
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        border = JBUI.Borders.empty(0, 4)
+        addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                e.consume()
+                onDisable()
+            }
+        })
+    }
+
+    val closeButton = JBLabel(AllIcons.Actions.Close).apply {
+        toolTipText = "Close"
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        border = JBUI.Borders.empty(0, 4)
+        addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                e.consume()
+                onClose()
+            }
+        })
+    }
+
+    val actions = JPanel().apply {
+        layout = BoxLayout(this, BoxLayout.X_AXIS)
+        isOpaque = false
+        add(signInOutButton)
+        add(Box.createHorizontalStrut(2))
+        add(disableButton)
+        add(Box.createHorizontalStrut(2))
+        add(closeButton)
+    }
+
+    val header = JPanel(BorderLayout()).apply {
+        border = javax.swing.BorderFactory.createCompoundBorder(
+            JBUI.Borders.customLineBottom(separatorColor),
+            JBUI.Borders.empty(6, 8, 6, 4),
+        )
+        // Sit visually a shade off the sidebar background so the header reads
+        // as a chrome band — mirrors the accordion section header treatment.
+        background = com.intellij.ui.JBColor.lazy {
+            val panel = javax.swing.UIManager.getColor("Panel.background")
+                ?: com.intellij.ui.JBColor.background()
+            if (com.intellij.ui.ColorUtil.isDark(panel)) {
+                com.intellij.ui.ColorUtil.brighter(panel, 2)
+            } else {
+                com.intellij.ui.ColorUtil.darker(panel, 1)
+            }
+        }
+        isOpaque = true
+        add(title, BorderLayout.WEST)
+        add(actions, BorderLayout.EAST)
+    }
+    val overlay = JPanel(BorderLayout()).apply {
+        add(header, BorderLayout.NORTH)
+        add(statusPanel, BorderLayout.CENTER)
+    }
+    return overlay to authListenerDisposable
+}
+
+/**
+ * Fire-and-forget: if signed out, opens the browser-based sign-in flow (surfacing
+ * failures as a balloon). If signed in, signs out immediately — matching VS Code's
+ * `jollimemory.signOut` command semantics. Callable from the STATUS header icon.
+ *
+ * The success path retries pending pushes (JOLLI-1900). This is the surviving copy of
+ * what the retired Preferences panel's login handler did: commits whose push was
+ * refused for lack of credentials sit in `push-pending.json`, and signing in is the
+ * event that makes them sendable. Without it a mid-session sign-in left them queued
+ * until the next IDE start, since the only other caller is the startup catch-up in
+ * [JolliMemoryService.initialize]. Mirrors VS Code's post-login retry in
+ * `Extension.ts`.
+ */
+private fun runStatusSignInOrOut(project: Project) {
+    if (JolliAuthService.isSignedIn()) {
+        JolliAuthService.signOut()
+        return
+    }
+    JolliAuthService.login(
+        forceFreshApiKey = true,
+        onSuccess = {
+            // Off-EDT: retryPendingPushes spawns the CLI. Fire-and-forget — it no-ops when
+            // nothing is pending. The header icon is refreshed by the auth listener,
+            // independently of this.
+            //
+            // Everything, including the service lookup, sits inside the pooled block's
+            // try: sign-in completes on a browser-callback thread an arbitrary time after
+            // the click, so the user may have closed the project by then, and
+            // `getService` on a disposed project throws. This callback is invoked from
+            // JolliAuthService's own success path, so letting an exception escape here
+            // would surface as a failed sign-in for a login that actually worked.
+            ApplicationManager.getApplication().executeOnPooledThread {
+                try {
+                    if (project.isDisposed) return@executeOnPooledThread
+                    val cwd = project.getService(JolliMemoryService::class.java).mainRepoRoot
+                        ?: project.basePath
+                        ?: return@executeOnPooledThread
+                    CliIntegrations.retryPendingPushes(cwd)
+                } catch (e: Exception) {
+                    Logger.getInstance(JolliMemoryToolWindowFactory::class.java)
+                        .warn("Post-login pending-push retry failed (non-fatal): ${e.message}")
+                }
+            }
+        },
+        onError = { msg ->
+            SwingUtilities.invokeLater {
+                com.intellij.notification.Notifications.Bus.notify(
+                    com.intellij.notification.Notification(
+                        "JolliMemory",
+                        "Sign In Failed",
+                        msg,
+                        com.intellij.notification.NotificationType.ERROR,
+                    ),
+                    project,
+                )
+            }
+        },
+    )
+}
+
+/**
+ * Disables Jolli Memory in this project — parity with VS Code's
+ * `jollimemory.disableJolliMemory`. Runs off-EDT because `service.uninstall()`
+ * does file I/O.
+ *
+ * Delegates the fail-atomic guarantee to `service.uninstall()`, which through
+ * [ai.jolli.jollimemory.bridge.HookInstaller.uninstall] calls the CLI's
+ * `uninstall` bridge action with `persistManualDisable=true`. The CLI writes
+ * `manuallyDisabled=true` FIRST (see `cli/src/install/Installer.ts` line
+ * ~993), then removes hooks — a write failure aborts the whole transaction
+ * before any hook is touched, so no separate Kotlin-side write is needed.
+ *
+ * The UI flip therefore fires only when the whole transaction returned
+ * success — a small latency (500 ms–2 s) trade for eliminating the double
+ * write (bridge round trip + profile.json write) the two-step design carried.
+ *
+ * The `surface_disabled` telemetry `trigger` distinguishes this entry point
+ * (`status_button`) from `settings` so funnels can tell them apart.
+ */
+private fun runStatusDisable(
+    project: Project,
+    service: JolliMemoryService,
+    onDisabled: () -> Unit,
+) {
+    ApplicationManager.getApplication().executeOnPooledThread {
+        // Guard: service.uninstall() below needs a resolvable repo root; the CLI's
+        // uninstall action resolves it itself, but if both service.mainRepoRoot and
+        // project.basePath are null, the whole surface is unhealthy — bail loudly
+        // instead of letting the bridge fail with a less actionable error.
+        if (service.mainRepoRoot == null && project.basePath == null) {
+            Logger.getInstance(JolliMemoryToolWindowFactory::class.java)
+                .warn("runStatusDisable: no cwd (mainRepoRoot & basePath both null) — aborting")
+            SwingUtilities.invokeLater {
+                com.intellij.notification.Notifications.Bus.notify(
+                    com.intellij.notification.Notification(
+                        "JolliMemory",
+                        "Disable Failed",
+                        "Could not disable Jolli Memory: no repository root available.",
+                        com.intellij.notification.NotificationType.ERROR,
+                    ),
+                    project,
+                )
+            }
+            return@executeOnPooledThread
+        }
+        if (!service.uninstall()) {
+            Logger.getInstance(JolliMemoryToolWindowFactory::class.java)
+                .warn("Disable failed — service.uninstall() returned false: ${service.lastError}")
+            SwingUtilities.invokeLater {
+                com.intellij.notification.Notifications.Bus.notify(
+                    com.intellij.notification.Notification(
+                        "JolliMemory",
+                        "Disable Failed",
+                        service.lastError
+                            ?.let { "Could not disable Jolli Memory ($it). Nothing was changed." }
+                            ?: "Could not disable Jolli Memory. See the logs for details.",
+                        com.intellij.notification.NotificationType.ERROR,
+                    ),
+                    project,
+                )
+            }
+            return@executeOnPooledThread
+        }
+        onDisabled()
+        ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+            "surface_disabled",
+            mapOf("trigger" to "status_button"),
+        )
+    }
+}
+
+/**
+ * Re-enables Jolli Memory from the DisabledPanel — parity with VS Code's
+ * `jollimemory.enableJolliMemory`. MUST be called on a pooled thread; all
+ * work below is synchronous file / process I/O.
+ *
+ * The caller is expected to do an OPTIMISTIC UI flip *before* calling this
+ * (see [createFullContent]'s DisabledPanel wiring). We keep the CLI work on
+ * the critical path so hooks are actually installed by the time the flow
+ * finishes, but the user sees CARD_MAIN in ~10 ms regardless — 500 ms-2 s
+ * faster than waiting for the full install to return.
+ *
+ * The `install` bridge action clears `manuallyDisabled` internally when
+ * `clearManualDisableOnSuccess: true` is set — no separate RepoProfile write
+ * is issued, saving one bridge round-trip.
+ *
+ * @param onFailure fires on the CALLER'S thread (this function is already on
+ *   a pooled thread) when the install fails; the DisabledPanel path uses it
+ *   to roll the optimistic flip back to CARD_DISABLED. A user notification
+ *   is fired before [onFailure] so the caller doesn't need to.
+ */
+private fun runStatusEnable(
+    project: Project,
+    service: JolliMemoryService,
+    onFailure: () -> Unit = {},
+) {
+    val cwd = service.mainRepoRoot ?: project.basePath
+    if (cwd == null) {
+        Logger.getInstance(JolliMemoryToolWindowFactory::class.java)
+            .warn("runStatusEnable: no cwd (mainRepoRoot & basePath both null) — aborting")
+        onFailure()
+        return
+    }
+    if (!service.isInitialized) service.initialize()
+    val installed = service.install()
+    if (!installed) {
+        SwingUtilities.invokeLater {
+            com.intellij.notification.Notifications.Bus.notify(
+                com.intellij.notification.Notification(
+                    "JolliMemory",
+                    "Enable Failed",
+                    "Could not enable Jolli Memory. See the logs for details.",
+                    com.intellij.notification.NotificationType.ERROR,
+                ),
+                project,
+            )
+        }
+        onFailure()
+        return
+    }
+    ai.jolli.jollimemory.core.telemetry.Telemetry.track(
+        "surface_enabled",
+        mapOf("trigger" to "disabled_panel"),
+    )
+}
+
+/**
+ * Picks the Status glyph — a pulse (heartbeat) body plus a small colored health
+ * dot at the bottom-right, matching the design mockup's `#btn-status` composite
+ * (see `intellij-interactive.html`). Only the dot color changes with state; the
+ * pulse body stays theme-adaptive gray. Shared by the title-bar Status action
+ * and the hover status indicator so both always agree:
  *   - red    → not enabled / no status
  *   - yellow → enabled but degraded (missing creds/hooks, scan errors, Node/MCP unavailable)
  *   - green  → all good
@@ -765,9 +1217,9 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
 private fun statusCircleIcon(service: JolliMemoryService): javax.swing.Icon {
     val status = service.getStatus()
     return when {
-        status == null || !status.enabled -> JolliMemoryIcons.CircleRed
-        statusHasWarnings(service, status) -> JolliMemoryIcons.CircleYellow
-        else -> JolliMemoryIcons.CircleGreen
+        status == null || !status.enabled -> JolliMemoryIcons.PulseStatusRed
+        statusHasWarnings(service, status) -> JolliMemoryIcons.PulseStatusYellow
+        else -> JolliMemoryIcons.PulseStatusGreen
     }
 }
 

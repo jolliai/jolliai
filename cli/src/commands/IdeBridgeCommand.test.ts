@@ -12,6 +12,7 @@
  *      startRefreshWatchers retry loop reached through it.
  */
 
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -241,6 +242,7 @@ vi.mock("../core/RepoProfile.js", () => ({
 	// VS Code's syncHooks; a per-test `.mockResolvedValueOnce(true)` covers the
 	// manually-disabled early-return branch.
 	readManualDisableFlag: vi.fn().mockResolvedValue(false),
+	writeManualDisableFlag: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Spreads the real module on purpose: the jolli-api push/delete gate constructs
@@ -393,10 +395,11 @@ vi.mock("../install/Installer.js", () => ({
 	removeClaudeHook: vi.fn().mockResolvedValue({ ok: true }),
 	installGeminiHook: vi.fn().mockResolvedValue({ ok: true }),
 	removeGeminiHook: vi.fn().mockResolvedValue(undefined),
-	// Full uninstall driven by the `disable` bridge action. Default happy
-	// path returns a successful InstallResult; per-test overrides inject
-	// failure or non-empty warnings.
-	uninstall: vi.fn().mockResolvedValue({ success: true, message: "disabled", warnings: [] }),
+	// Install / uninstall bridge actions. Default happy path returns a
+	// successful InstallResult; per-test overrides inject failure or
+	// non-empty warnings.
+	install: vi.fn().mockResolvedValue({ success: true, message: "installed", warnings: [] }),
+	uninstall: vi.fn().mockResolvedValue({ success: true, message: "uninstalled", warnings: [] }),
 }));
 
 vi.mock("./SyncCommand.js", () => ({
@@ -1650,6 +1653,252 @@ describe("runIdeBridgeAction — session-state", () => {
 		expect(vi.mocked(releaseIfOwned)).toHaveBeenCalledWith(
 			join("/r", ".jolli", "jollimemory", "plans.lock"),
 			"plans.lock",
+		);
+	});
+});
+
+describe("runIdeBridgeAction — install / uninstall", () => {
+	it("install forwards the full option surface to Installer.install", async () => {
+		const { install } = await import("../install/Installer.js");
+		vi.mocked(install).mockResolvedValueOnce({
+			success: true,
+			message: "ok",
+			warnings: ["w1"],
+		});
+		const result = await runIdeBridgeAction("install", "/r", {
+			source: "cli",
+			sourceTag: "intellij",
+			integrationsOnly: false,
+			repoHooksOnly: false,
+			respectManualDisable: false,
+			clearManualDisableOnSuccess: true,
+			automatic: false,
+		});
+		expect(install).toHaveBeenCalledWith("/r", {
+			source: "cli",
+			sourceTag: "intellij",
+			integrationsOnly: false,
+			repoHooksOnly: false,
+			respectManualDisable: false,
+			clearManualDisableOnSuccess: true,
+			automatic: false,
+		});
+		expect(result).toEqual({ success: true, message: "ok", warnings: ["w1"] });
+	});
+
+	it("install coerces missing/non-boolean flags to false — a malformed request must NEVER accidentally opt into a mode", async () => {
+		const { install } = await import("../install/Installer.js");
+		vi.mocked(install).mockResolvedValueOnce({ success: true, message: "ok", warnings: [] });
+		await runIdeBridgeAction("install", "/r", {
+			source: "cli",
+			sourceTag: "intellij",
+			// integrationsOnly deliberately omitted — must land as false, not undefined
+			respectManualDisable: "true", // non-boolean must NOT be treated as true
+		});
+		expect(install).toHaveBeenLastCalledWith("/r", {
+			source: "cli",
+			sourceTag: "intellij",
+			integrationsOnly: false,
+			repoHooksOnly: false,
+			respectManualDisable: false,
+			clearManualDisableOnSuccess: false,
+			automatic: false,
+		});
+	});
+
+	it("install rejects unknown source values, falling back to 'cli' — the source string feeds dist-path identity, so smuggling a novel value would fork the registry", async () => {
+		const { install } = await import("../install/Installer.js");
+		vi.mocked(install).mockResolvedValueOnce({ success: true, message: "ok", warnings: [] });
+		await runIdeBridgeAction("install", "/r", { source: "windsurf-extension" });
+		expect(install).toHaveBeenLastCalledWith("/r", expect.objectContaining({ source: "cli" }));
+	});
+
+	it("install propagates Installer.install's failure envelope verbatim so the caller can distinguish lock-contention from a hard error", async () => {
+		const { install } = await import("../install/Installer.js");
+		vi.mocked(install).mockResolvedValueOnce({
+			success: false,
+			message: "Another Jolli enable/disable operation is still running; retry shortly",
+			warnings: [],
+		});
+		const result = await runIdeBridgeAction("install", "/r", { source: "cli", sourceTag: "intellij" });
+		expect(result).toMatchObject({ success: false, message: expect.stringContaining("still running") });
+	});
+
+	// `distDir` decides what lands in `dist-paths/<tag>` — the path `run-hook` execs on
+	// the blocking git path. `install`'s default is the running bundle's own directory,
+	// which is correct in-process but wrong inside the daemon: it is launched from
+	// `<IDE config>/plugins/**/cli-dist`, so the plugin would register a directory that
+	// dies on uninstall or an IDE major upgrade, and `run-hook` exits silently by design.
+	// These pin the forwarding, since nothing else in the suite covers where the entry
+	// points — which is exactly how the regression got in.
+	it("install forwards an explicit distDir to Installer.install", async () => {
+		const { install } = await import("../install/Installer.js");
+		vi.mocked(install).mockResolvedValueOnce({ success: true, message: "ok", warnings: [] });
+		// A real directory: the bridge rejects a path that does not exist.
+		await runIdeBridgeAction("install", "/r", { source: "cli", sourceTag: "intellij", distDir: tmpdir() });
+		expect(install).toHaveBeenCalledWith("/r", expect.objectContaining({ distDir: tmpdir() }));
+	});
+
+	it("install leaves distDir undefined when omitted (in-process callers keep the old default)", async () => {
+		const { install } = await import("../install/Installer.js");
+		vi.mocked(install).mockResolvedValueOnce({ success: true, message: "ok", warnings: [] });
+		await runIdeBridgeAction("install", "/r", { source: "cli", sourceTag: "cli" });
+		expect(install).toHaveBeenCalledWith("/r", expect.objectContaining({ distDir: undefined }));
+	});
+
+	it("install rejects a relative distDir", async () => {
+		// Relative would resolve against whatever cwd the hook happens to run in.
+		const { install } = await import("../install/Installer.js");
+		await expect(
+			runIdeBridgeAction("install", "/r", { source: "cli", sourceTag: "intellij", distDir: "relative/dist" }),
+		).rejects.toThrow(/"distDir" must be an absolute path/);
+		expect(install).not.toHaveBeenCalled();
+	});
+
+	it("install rejects a distDir that does not exist", async () => {
+		// A dead entry fails silently at hook time — reject it at the write boundary.
+		const { install } = await import("../install/Installer.js");
+		await expect(
+			runIdeBridgeAction("install", "/r", {
+				source: "cli",
+				sourceTag: "intellij",
+				distDir: join(tmpdir(), "jolli-definitely-not-here-12345"),
+			}),
+		).rejects.toThrow(/"distDir" does not exist/);
+		expect(install).not.toHaveBeenCalled();
+	});
+
+	it("uninstall forwards the full option surface to Installer.uninstall", async () => {
+		const { uninstall } = await import("../install/Installer.js");
+		vi.mocked(uninstall).mockResolvedValueOnce({ success: true, message: "removed", warnings: [] });
+		const result = await runIdeBridgeAction("uninstall", "/r", {
+			integrationsOnly: false,
+			preserveMenu: true,
+			persistManualDisable: true,
+		});
+		expect(uninstall).toHaveBeenCalledWith("/r", {
+			integrationsOnly: false,
+			preserveMenu: true,
+			persistManualDisable: true,
+		});
+		expect(result).toEqual({ success: true, message: "removed", warnings: [] });
+	});
+
+	// preserveMenu / persistManualDisable DERIVE from !integrationsOnly instead of
+	// strict-casting like every other flag on this action. Omitting them used to mean
+	// `false`, i.e. "a bare {} full disable also deletes the /jolli umbrella skill and
+	// strips the jolli section from .git/info/exclude, and does NOT record that the user
+	// asked for it" — so the next start silently reinstalled the hooks. The sibling
+	// `case "disable"` has always derived; the two wrap the same uninstall() and must
+	// not disagree.
+	it("uninstall defaults an omitted full disable to preserveMenu + persistManualDisable", async () => {
+		const { uninstall } = await import("../install/Installer.js");
+		vi.mocked(uninstall).mockResolvedValueOnce({ success: true, message: "ok", warnings: [] });
+		await runIdeBridgeAction("uninstall", "/r", {}); // all fields omitted
+		expect(uninstall).toHaveBeenLastCalledWith("/r", {
+			integrationsOnly: false,
+			preserveMenu: true,
+			persistManualDisable: true,
+		});
+	});
+
+	it("uninstall derives both flags to false for an integrations-only teardown", async () => {
+		const { uninstall } = await import("../install/Installer.js");
+		vi.mocked(uninstall).mockResolvedValueOnce({ success: true, message: "ok", warnings: [] });
+		await runIdeBridgeAction("uninstall", "/r", { integrationsOnly: true });
+		expect(uninstall).toHaveBeenLastCalledWith("/r", {
+			integrationsOnly: true,
+			preserveMenu: false,
+			persistManualDisable: false,
+		});
+	});
+
+	it("uninstall honors an explicit false override on a full disable", async () => {
+		// Deriving must not become "always true" — an explicit boolean still wins, which
+		// is what keeps this action a plain adapter for callers that mean it.
+		const { uninstall } = await import("../install/Installer.js");
+		vi.mocked(uninstall).mockResolvedValueOnce({ success: true, message: "ok", warnings: [] });
+		await runIdeBridgeAction("uninstall", "/r", { preserveMenu: false, persistManualDisable: false });
+		expect(uninstall).toHaveBeenLastCalledWith("/r", {
+			integrationsOnly: false,
+			preserveMenu: false,
+			persistManualDisable: false,
+		});
+	});
+
+	it("uninstall ignores a non-boolean flag and falls back to the derived default", async () => {
+		const { uninstall } = await import("../install/Installer.js");
+		vi.mocked(uninstall).mockResolvedValueOnce({ success: true, message: "ok", warnings: [] });
+		await runIdeBridgeAction("uninstall", "/r", { preserveMenu: "yes", persistManualDisable: 1 });
+		expect(uninstall).toHaveBeenLastCalledWith("/r", {
+			integrationsOnly: false,
+			preserveMenu: true,
+			persistManualDisable: true,
+		});
+	});
+});
+
+describe("runIdeBridgeAction — repo-profile", () => {
+	it("reads the manual-disable flag through RepoProfile.readManualDisableFlag", async () => {
+		const { readManualDisableFlag } = await import("../core/RepoProfile.js");
+		// `…Once`, not `mockResolvedValue`: the suite runs with `clearMocks` only
+		// (`restoreMocks` is deliberately omitted — see vite.config.ts), so history is
+		// cleared between tests but a persistent implementation is NOT. A sticky `true`
+		// here would silently become the default for every later test in this file.
+		vi.mocked(readManualDisableFlag).mockResolvedValueOnce(true);
+		const result = await runIdeBridgeAction("repo-profile", "/r", { operation: "read-manual-disable" });
+		expect(readManualDisableFlag).toHaveBeenCalledWith("/r");
+		expect(result).toEqual({ disabled: true });
+	});
+
+	it("writes the manual-disable flag through RepoProfile.writeManualDisableFlag", async () => {
+		const { writeManualDisableFlag } = await import("../core/RepoProfile.js");
+		const result = await runIdeBridgeAction("repo-profile", "/r", {
+			operation: "write-manual-disable",
+			disabled: true,
+		});
+		expect(writeManualDisableFlag).toHaveBeenCalledWith("/r", true);
+		expect(result).toEqual({ ok: true });
+	});
+
+	// `disabled` is required, not coerced. This used to default to `false`, guarding
+	// "an omitted field must never accidentally SET the opt-out" — but that trades the
+	// visible, recoverable failure for the silent one: an accidental `true` shows the
+	// DisabledPanel and is one click from undone, whereas an accidental `false` resumes
+	// capture in a repo the user turned off AND erases the record of that intent, with
+	// no UI signal anywhere. That is precisely the silent re-enable spec 306 exists to
+	// prevent. Neither default is right for a field that IS the write's payload, so a
+	// malformed request fails loudly and writes nothing — which preserves the original
+	// property (never accidentally disables) and closes the one it missed.
+	it("write-manual-disable rejects a missing `disabled` instead of coercing it", async () => {
+		const { writeManualDisableFlag } = await import("../core/RepoProfile.js");
+		await expect(runIdeBridgeAction("repo-profile", "/r", { operation: "write-manual-disable" })).rejects.toThrow(
+			/"disabled" must be a boolean/,
+		);
+		expect(writeManualDisableFlag).not.toHaveBeenCalled();
+	});
+
+	it("write-manual-disable rejects a non-boolean `disabled` instead of coercing it", async () => {
+		const { writeManualDisableFlag } = await import("../core/RepoProfile.js");
+		await expect(
+			runIdeBridgeAction("repo-profile", "/r", { operation: "write-manual-disable", disabled: "true" }),
+		).rejects.toThrow(/"disabled" must be a boolean/);
+		expect(writeManualDisableFlag).not.toHaveBeenCalled();
+	});
+
+	it("write-manual-disable forwards an explicit false (the re-enable path still works)", async () => {
+		const { writeManualDisableFlag } = await import("../core/RepoProfile.js");
+		const result = await runIdeBridgeAction("repo-profile", "/r", {
+			operation: "write-manual-disable",
+			disabled: false,
+		});
+		expect(writeManualDisableFlag).toHaveBeenCalledWith("/r", false);
+		expect(result).toEqual({ ok: true });
+	});
+
+	it("rejects an unknown repo-profile operation", async () => {
+		await expect(runIdeBridgeAction("repo-profile", "/r", { operation: "wat" })).rejects.toThrow(
+			/Unknown repo-profile operation/,
 		);
 	});
 });
