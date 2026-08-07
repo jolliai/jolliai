@@ -147,7 +147,7 @@ src/main/kotlin/ai/jolli/jollimemory/
     ├── StatusPanel.kt               # STATUS panel (hook status, sessions, summary count)
     ├── MemoriesPanel.kt             # MEMORIES panel (search + paginated list of stored summaries)
     ├── PlansPanel.kt                # PLANS & NOTES panel
-    ├── ChangesPanel.kt              # CHANGES panel (file selection with checkboxes)
+    ├── ChangesPanel.kt              # FILES panel (per-row discard + leave-out toggle)
     ├── CommitsPanel.kt              # COMMITS panel (branch history with metadata)
     ├── SummaryViewerDialog.kt       # JCEF-based HTML summary viewer dialog
     ├── SummaryEditorProvider.kt     # Editor tab provider for summary webview

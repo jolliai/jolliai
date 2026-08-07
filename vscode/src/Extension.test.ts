@@ -305,6 +305,18 @@ const {
 			.mockResolvedValue({ id: "note-1", filePath: "/test/notes/note.md" }),
 		unstageFiles: vi.fn().mockResolvedValue(undefined),
 		discardFiles: vi.fn().mockResolvedValue(undefined),
+		// Stands in for the CLI's real answer on the unambiguous shapes these
+		// tests use. Cases that need the ambiguous ones — a `DU` conflict reaching
+		// the host collapsed to "D" — override it, which is the whole reason the
+		// wording is a query rather than a letter test.
+		previewDiscardDeletions: vi.fn(
+			async (files: Array<{ relativePath: string; statusCode: string }>) =>
+				new Set(
+					files
+						.filter((file) => ["?", "A", "R", "C"].includes(file.statusCode))
+						.map((file) => file.relativePath),
+				),
+		),
 		refreshHookPathsIfStale: vi.fn().mockResolvedValue(undefined),
 		autoInstallForWorktree: vi.fn().mockResolvedValue(undefined),
 		listSummaryEntries: vi
@@ -6489,6 +6501,35 @@ describe("Extension", () => {
 			);
 		});
 
+		it("diffs the SOURCE path at HEAD against the working tree for copied files", async () => {
+			// `C` takes the same branch as `R`, and used to be excluded on the
+			// premise that `git status --porcelain` never emits one. It does, under
+			// `status.renames=copies` — so a copy fell through to the modified-file
+			// diff and was rendered against a HEAD blob that does not exist.
+			const handler = getRegisteredCommand("jollimemory.openFileChange");
+			await handler({
+				fileStatus: {
+					absolutePath: "/repo/Copy.ts",
+					statusCode: "C",
+					indexStatus: "C",
+					worktreeStatus: " ",
+					isSelected: false,
+					relativePath: "Copy.ts",
+					originalPath: "Source.ts",
+				},
+			});
+
+			expect(executeCommand).toHaveBeenCalledWith(
+				"vscode.diff",
+				expect.objectContaining({
+					fsPath: join("/test/workspace", "Source.ts"),
+					scheme: "git",
+				}),
+				expect.objectContaining({ fsPath: "/repo/Copy.ts", scheme: "file" }),
+				"Copy.ts (HEAD ↔ Working Tree)",
+			);
+		});
+
 		it("opens the working-tree file directly for a rename with no originalPath", async () => {
 			const handler = getRegisteredCommand("jollimemory.openFileChange");
 			await handler({
@@ -6790,6 +6831,89 @@ describe("Extension", () => {
 			expect(mockBridge.discardFiles).not.toHaveBeenCalled();
 		});
 
+		it("uses 'Delete' when the CLI says so, even though the row's letter says otherwise", async () => {
+			// A `DU` conflict — deleted by us, modified by them — reaches the host
+			// collapsed to "D", which is also a plain staged deletion, and discarding
+			// THAT restores the file. No letter rule can separate them, so the letter
+			// heuristic promised "discard all changes" while the file was removed.
+			mockBridge.previewDiscardDeletions.mockResolvedValueOnce(new Set(["conflict.ts"]));
+			showWarningMessage.mockResolvedValue("Delete");
+			const ctx = makeContext();
+			activate(ctx);
+			const handler = getRegisteredCommand("jollimemory.discardFileChanges");
+
+			await handler({
+				fileStatus: {
+					absolutePath: "/repo/conflict.ts",
+					relativePath: "conflict.ts",
+					statusCode: "D",
+					indexStatus: "D",
+					worktreeStatus: "U",
+					isSelected: false,
+				},
+			});
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Delete"),
+				expect.objectContaining({
+					modal: true,
+					detail: expect.stringContaining("permanently delete"),
+				}),
+				"Delete",
+			);
+			expect(mockBridge.discardFiles).toHaveBeenCalled();
+		});
+
+		it("asks before the user confirms, and does not discard when they decline", async () => {
+			// The query is read-only, which is what lets it run ahead of the dialog.
+			showWarningMessage.mockResolvedValue(undefined);
+			const ctx = makeContext();
+			activate(ctx);
+			const handler = getRegisteredCommand("jollimemory.discardFileChanges");
+
+			await handler({
+				fileStatus: {
+					absolutePath: "/repo/new.ts",
+					relativePath: "new.ts",
+					statusCode: "?",
+					indexStatus: "?",
+					worktreeStatus: "?",
+					isSelected: false,
+				},
+			});
+
+			expect(mockBridge.previewDiscardDeletions).toHaveBeenCalled();
+			expect(mockBridge.discardFiles).not.toHaveBeenCalled();
+		});
+
+		it("falls back to the status letter when the preview query fails", async () => {
+			// A bridge fault costs the accuracy the query adds and nothing more —
+			// the dialog still opens and the discard still runs.
+			mockBridge.previewDiscardDeletions.mockRejectedValueOnce(new Error("bridge down"));
+			showWarningMessage.mockResolvedValue("Delete");
+			const ctx = makeContext();
+			activate(ctx);
+			const handler = getRegisteredCommand("jollimemory.discardFileChanges");
+
+			await handler({
+				fileStatus: {
+					absolutePath: "/repo/new.ts",
+					relativePath: "new.ts",
+					statusCode: "?",
+					indexStatus: "?",
+					worktreeStatus: "?",
+					isSelected: false,
+				},
+			});
+
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Delete"),
+				expect.objectContaining({ modal: true }),
+				"Delete",
+			);
+			expect(mockBridge.discardFiles).toHaveBeenCalled();
+		});
+
 		it("returns early when called with item missing fileStatus", async () => {
 			const ctx = makeContext();
 			activate(ctx);
@@ -6802,41 +6926,44 @@ describe("Extension", () => {
 			expect(mockBridge.discardFiles).not.toHaveBeenCalled();
 		});
 
-		it("rejects malformed fileStatus where indexStatus / worktreeStatus are empty strings", async () => {
-			// DOM readers fall through to '' when an attribute is missing.
-			// Porcelain v1 columns are always exactly one character — the
-			// length===1 check rejects both undefined and '' so a future
-			// webview-side regression that drops one of the data-* attrs
-			// surfaces the same loud error.
+		it("uses 'Delete' verb for copied files", async () => {
+			// C reverts by unstaging then deleting the COPY, same as A. Wording it
+			// as a plain discard says the file stays while the button removes it.
+			showWarningMessage.mockResolvedValue("Delete");
 			const ctx = makeContext();
 			activate(ctx);
 			const handler = getRegisteredCommand("jollimemory.discardFileChanges");
 
 			await handler({
 				fileStatus: {
-					absolutePath: "/repo/file.ts",
-					relativePath: "file.ts",
-					statusCode: "M",
-					indexStatus: "",
-					worktreeStatus: "",
+					absolutePath: "/repo/copied.ts",
+					relativePath: "copied.ts",
+					statusCode: "C",
+					indexStatus: "C",
+					worktreeStatus: " ",
+					originalPath: "source.ts",
+					isSelected: false,
 				},
 			});
 
-			expect(showErrorMessage).toHaveBeenCalledWith(
-				expect.stringContaining('Cannot discard "file.ts" — internal error'),
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("Delete"),
+				expect.objectContaining({
+					modal: true,
+					detail: expect.stringContaining("permanently delete"),
+				}),
+				"Delete",
 			);
-			expect(mockBridge.discardFiles).not.toHaveBeenCalled();
+			expect(mockBridge.discardFiles).toHaveBeenCalled();
 		});
 
-		it("rejects malformed fileStatus that is missing indexStatus / worktreeStatus", async () => {
-			// Defense in depth: bridge.discardFiles dispatches on the raw
-			// porcelain columns. A previous version of branch:discardFile only
-			// forwarded statusCode, which silently routed every file (including
-			// untracked) into the `git restore --staged --worktree` branch and
-			// failed without surfacing — the activity-bar badge then showed the
-			// pre-discard count even though the user had "discarded" the file.
-			// The guard makes any future caller that strips the columns loud-fail
-			// at the boundary with an error toast, rather than corrupting state.
+		it("discards from a path-only fileStatus with no porcelain columns", async () => {
+			// The old handler rejected this shape, because bridge.discardFiles used
+			// to dispatch on indexStatus + worktreeStatus. The CLI service now reads
+			// the authoritative status from the path itself, so those columns are no
+			// longer an input and refusing the request would block one the service
+			// handles correctly. An absent statusCode just picks the milder verb.
+			showWarningMessage.mockResolvedValue("Discard");
 			const ctx = makeContext();
 			activate(ctx);
 			const handler = getRegisteredCommand("jollimemory.discardFileChanges");
@@ -6845,18 +6972,14 @@ describe("Extension", () => {
 				fileStatus: {
 					absolutePath: "/repo/untracked.ts",
 					relativePath: "untracked.ts",
-					statusCode: "?",
-					// intentionally missing indexStatus / worktreeStatus
+					// intentionally no statusCode / indexStatus / worktreeStatus
 				},
 			});
 
-			expect(showErrorMessage).toHaveBeenCalledWith(
-				expect.stringContaining(
-					'Cannot discard "untracked.ts" — internal error',
-				),
-			);
-			expect(showWarningMessage).not.toHaveBeenCalled();
-			expect(mockBridge.discardFiles).not.toHaveBeenCalled();
+			expect(showErrorMessage).not.toHaveBeenCalled();
+			expect(mockBridge.discardFiles).toHaveBeenCalledWith([
+				expect.objectContaining({ relativePath: "untracked.ts" }),
+			]);
 		});
 	});
 
@@ -6995,6 +7118,60 @@ describe("Extension", () => {
 					detail: expect.stringContaining(
 						"3 files will be permanently deleted",
 					),
+				}),
+				"Discard All",
+			);
+		});
+
+		it("counts a conflicted file the CLI flags, which no status letter reveals", async () => {
+			// `DU` arrives collapsed to "D" — the same letter a staged deletion has,
+			// and discarding THAT restores the file. The batch warning used to say
+			// nothing at all about this one while the discard removed it.
+			const selectedFiles = [
+				{
+					absolutePath: "/repo/mod.ts",
+					relativePath: "mod.ts",
+					statusCode: "M",
+					indexStatus: " ",
+					worktreeStatus: "M",
+					isSelected: true,
+				},
+				{
+					absolutePath: "/repo/conflict.ts",
+					relativePath: "conflict.ts",
+					statusCode: "D",
+					indexStatus: "D",
+					worktreeStatus: "U",
+					isSelected: true,
+				},
+			];
+			mockFilesStore.getSnapshot.mockReturnValue({
+				selectedFiles,
+				files: selectedFiles,
+				visibleFiles: selectedFiles,
+				excludedCount: 0,
+				visibleCount: selectedFiles.length,
+				isEmpty: false,
+				isEnabled: true,
+				isMigrating: false,
+				changeReason: "refresh",
+			});
+			mockBridge.previewDiscardDeletions.mockResolvedValueOnce(new Set(["conflict.ts"]));
+			showWarningMessage.mockResolvedValue("Discard All");
+			const ctx = makeContext();
+			activate(ctx);
+			const handler = getRegisteredCommand(
+				"jollimemory.discardSelectedChanges",
+			);
+
+			await handler();
+
+			expect(mockBridge.previewDiscardDeletions).toHaveBeenCalledWith(selectedFiles);
+			expect(showWarningMessage).toHaveBeenCalledWith(
+				expect.stringContaining("2 selected files"),
+				expect.objectContaining({
+					modal: true,
+					detail: expect.stringContaining("1 file will be permanently deleted"),
 				}),
 				"Discard All",
 			);

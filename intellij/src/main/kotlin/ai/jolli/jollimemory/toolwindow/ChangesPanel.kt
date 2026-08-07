@@ -1,6 +1,10 @@
 package ai.jolli.jollimemory.toolwindow
 
 import ai.jolli.jollimemory.JolliMemoryIcons
+import ai.jolli.jollimemory.core.FileDiscarder
+import ai.jolli.jollimemory.core.GitStatusCodes
+import ai.jolli.jollimemory.core.UnsavedEdits
+import ai.jolli.jollimemory.core.WorktreeRoot
 import ai.jolli.jollimemory.services.FileChange
 import ai.jolli.jollimemory.services.JolliMemoryService
 import com.intellij.diff.DiffContentFactory
@@ -275,7 +279,7 @@ class ChangesPanel(
         // yet saved to disk (the IDE's own Commit panel reads the same source), so the
         // list updates as the user types. Fall back to the on-disk `git status` path
         // only when the VCS layer can't produce a list (readChangesFromClm returns null).
-        val repoRoot = service.mainRepoRoot ?: project.basePath
+        val repoRoot = WorktreeRoot.of(project)
         val clmChanges = repoRoot?.let { readChangesFromClm(it) }
         val newChanges = try {
             clmChanges ?: service.getChangedFiles()
@@ -430,82 +434,25 @@ class ChangesPanel(
     /** Returns all files in the changes list (selected and unselected). */
     fun getFiles(): List<FileChange> = changes.toList()
 
-    /** Toggles all files — if any are deselected, select all; otherwise deselect all. */
-    fun toggleSelectAll() {
-        val anyUnselected = selectedStates.any { !it }
-        for (i in selectedStates.indices) selectedStates[i] = anyUnselected
-        updateFileList()
-        service.notifySelectionChanged()
-    }
-
-    /** Discards changes for all selected files after confirmation. */
-    fun discardSelected() {
-        val selected = getSelectedFiles()
-        if (selected.isEmpty()) return
-
-        val willDelete = selected.filter { it.statusCode in listOf("??", "A", "AM", "AD") }
-        val fileList = selected.take(10).joinToString("\n") { "  • ${it.relativePath}" }
-        val overflow = if (selected.size > 10) "\n  ...and ${selected.size - 10} more" else ""
-        val deleteWarning = if (willDelete.isNotEmpty()) {
-            "\n\n⚠ ${willDelete.size} file(s) will be permanently deleted (untracked/added)."
-        } else ""
-
-        val result = Messages.showYesNoDialog(
-            project,
-            "Discard changes to ${selected.size} file(s)?\n\n$fileList$overflow$deleteWarning\n\nThis action cannot be undone.",
-            "Discard Selected Changes",
-            "Discard All",
-            "Cancel",
-            Messages.getWarningIcon(),
-        )
-        if (result != Messages.YES) return
-
-        ApplicationManager.getApplication().executeOnPooledThread {
-            val gitOps = service.getGitOps() ?: return@executeOnPooledThread
-            val repoRoot = service.mainRepoRoot ?: project.basePath ?: return@executeOnPooledThread
-            discardFiles(selected, gitOps, repoRoot)
-            refreshFromGit()
-        }
-    }
-
-    /** Performs the git operations to discard a list of file changes. */
-    private fun discardFiles(files: List<FileChange>, gitOps: ai.jolli.jollimemory.bridge.GitOps, repoRoot: String) {
-        for (change in files) {
-            when (change.statusCode) {
-                "??" -> {
-                    try {
-                        val f = File(repoRoot, change.relativePath)
-                        if (f.isDirectory) f.deleteRecursively() else f.delete()
-                    } catch (_: Exception) { }
-                }
-                "A", "AM", "AD" -> {
-                    gitOps.exec("reset", "HEAD", "--", change.relativePath)
-                    try { File(repoRoot, change.relativePath).delete() } catch (_: Exception) { }
-                }
-                else -> {
-                    gitOps.exec("checkout", "HEAD", "--", change.relativePath)
-                }
-            }
-        }
-    }
-
     /**
      * Creates a VS Code-style file row:
-     *   [checkbox] [icon] filename parentDir/   M  [⤺ discard on hover]
+     *   filename / parentDir      [⤺ discard] [✕ leave out]  M
      *
      * Layout: BorderLayout
-     *   CENTER = checkbox + icon + filename + parentDir (FlowLayout, left-aligned, fills space)
-     *   EAST   = statusBadge + discardButton (FlowLayout, right-aligned)
+     *   CENTER = filename + parentDir (two stacked lines, fills the width)
+     *   EAST   = discard + exclude toggle (hover-only) then the status letter
      *
-     * The discard button is only visible when the mouse hovers over this row.
+     * Deliberately NO leading file-type icon: VS Code's Files rows drop it too
+     * (see renderChangeRow — "NO leading file-type codicon"), letting the tinted
+     * filename plus the trailing status letter carry the git state on their own.
+     *
+     * The trailing order is [discard] [✕] [letter], matching VS Code where the
+     * hover-action cluster sits left of the always-visible `.gs-letter` at the
+     * row's right edge. The two hover actions are the row's ONLY actions — there
+     * is no per-row menu beyond the right-click Discard Changes entry below.
      */
     private fun createFileRow(change: FileChange, index: Int): JPanel {
         val fileName = File(change.relativePath).name
-        val fileIcon = FileTypeManager.getInstance().getFileTypeByFileName(fileName).icon
-
-        val iconLabel = JLabel(fileIcon).apply {
-            border = JBUI.Borders.emptyRight(4)
-        }
 
         val displayStatus = displayStatusCode(change.statusCode)
 
@@ -534,16 +481,11 @@ class ChangesPanel(
             add(pathLabel)
         }
 
-        // Icon, vertically centered next to the two-line text.
-        val iconWrap = JPanel(java.awt.GridBagLayout()).apply {
-            isOpaque = false
-            add(iconLabel, java.awt.GridBagConstraints())
-        }
-
-        // Status badge (colored letter matching VS Code: M, A, D, U, R)
+        // Status badge (colored letter matching VS Code: M, A, D, U, R). Sits at the
+        // row's right edge, after the hover actions — VS Code's `.gs-letter` order.
         val statusLabel = JLabel(displayStatus).apply {
             foreground = statusColor(change.statusCode)
-            border = JBUI.Borders.emptyRight(4)
+            border = JBUI.Borders.emptyLeft(4)
             toolTipText = statusTooltip(change.statusCode)
         }
 
@@ -569,24 +511,37 @@ class ChangesPanel(
             border = JBUI.Borders.emptyLeft(2)
         }
 
-        // Right side: status badge + discard + select toggle, vertically centered with a
-        // reserved width measured with the hover actions visible (and the toggle icon set,
-        // so its width is counted) — otherwise the last icon is clipped.
-        val rightInner = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+        // Hover actions [⤺ discard] [✕ leave out], in a FIXED-width slot: the width is
+        // measured with both visible (and the toggle icon assigned, so its width
+        // counts), then they are hidden again. Reserving the space is what keeps the
+        // status letter still as they appear and disappear — VS Code gets the same
+        // effect by absolutely positioning its .inline-actions overlay.
+        val actionsInner = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
             isOpaque = false
-            add(statusLabel)
             add(discardLabel)
             add(toggleLabel)
         }
         toggleLabel.icon = AllIcons.Actions.Close
         discardLabel.isVisible = true; toggleLabel.isVisible = true
-        val reservedRightW = rightInner.preferredSize.width
+        val reservedActionsW = actionsInner.preferredSize.width
         discardLabel.isVisible = false; toggleLabel.isVisible = false
-        val rightWrap = JPanel(java.awt.GridBagLayout()).apply {
+        val actionsWrap = JPanel(java.awt.GridBagLayout()).apply {
             isOpaque = false
-            add(rightInner, java.awt.GridBagConstraints())
-            preferredSize = Dimension(reservedRightW, JBUI.scale(16))
-            minimumSize = Dimension(reservedRightW, 0)
+            add(actionsInner, java.awt.GridBagConstraints())
+            preferredSize = Dimension(reservedActionsW, JBUI.scale(16))
+            minimumSize = Dimension(reservedActionsW, 0)
+        }
+        // Status letter pinned to the row's right edge, past the action slot — the
+        // [discard] [✕] then .gs-letter order VS Code's change rows use. Both halves
+        // are GridBag-wrapped purely to centre them against the two-line filename.
+        val statusWrap = JPanel(java.awt.GridBagLayout()).apply {
+            isOpaque = false
+            add(statusLabel, java.awt.GridBagConstraints())
+        }
+        val rightWrap = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            add(actionsWrap, BorderLayout.CENTER)
+            add(statusWrap, BorderLayout.EAST)
         }
 
         val row = JPanel(BorderLayout()).apply {
@@ -594,7 +549,6 @@ class ChangesPanel(
             border = JBUI.Borders.empty(2, 4)
             alignmentX = Component.LEFT_ALIGNMENT
             cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-            add(iconWrap, BorderLayout.WEST)
             add(centerPanel, BorderLayout.CENTER)
             add(rightWrap, BorderLayout.EAST)
         }
@@ -605,7 +559,10 @@ class ChangesPanel(
             nameLabel.font = if (sel) baseNameFont else strikeNameFont
             nameLabel.foreground = if (sel) statusColor(change.statusCode) else JBColor.GRAY
             toggleLabel.icon = if (sel) AllIcons.Actions.Close else AllIcons.General.Add
-            toggleLabel.toolTipText = if (sel) "Exclude from commit" else "Include in commit"
+            // Same wording VS Code's excludeToggle uses — the row is included by
+            // default and this leaves it out of the NEXT memory (reversible), which
+            // "Exclude from commit" read as a staging operation it is not.
+            toggleLabel.toolTipText = if (sel) "Leave out of this memory" else "Add back to this memory"
             row.repaint()
         }
         applySelection()
@@ -653,12 +610,14 @@ class ChangesPanel(
                 }
             }
         }
-        for (child in listOf(iconLabel, nameLabel, pathLabel, statusLabel)) {
+        for (child in listOf(nameLabel, pathLabel, statusLabel)) {
             child.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
             child.addMouseListener(diffClickListener)
         }
 
-        // Right-click context menu
+        // Right-click context menu — ONE entry, matching VS Code's 'file' /
+        // 'fileChange' menu exactly. Leaving the row out of the memory is the hover
+        // ✕ toggle's job there and here; do not add it as a second menu entry.
         val contextMenuListener = object : MouseAdapter() {
             override fun mousePressed(e: MouseEvent) { maybeShowPopup(e) }
             override fun mouseReleased(e: MouseEvent) { maybeShowPopup(e) }
@@ -675,7 +634,7 @@ class ChangesPanel(
         // Attach hover listener to the row and all child components
         row.addMouseListener(hoverListener)
         row.addMouseListener(contextMenuListener)
-        for (child in listOf(iconWrap, rightWrap, rightInner, centerPanel, iconLabel, nameLabel, pathLabel, statusLabel, discardLabel, toggleLabel)) {
+        for (child in listOf(rightWrap, actionsWrap, actionsInner, statusWrap, centerPanel, nameLabel, pathLabel, statusLabel, discardLabel, toggleLabel)) {
             child.addMouseListener(hoverListener)
             child.addMouseListener(contextMenuListener)
         }
@@ -687,15 +646,47 @@ class ChangesPanel(
 
     /**
      * Discards changes for a single file after confirmation.
-     * - Modified (M) / Deleted (D): git checkout -- <file>
-     * - Untracked (??): deletes the file
-     * - Added (A): git reset HEAD <file>, then deletes the file
+     *
+     * WHICH git command each status needs is deliberately not documented here, and
+     * must not be: that rule lives in the CLI's `FileDiscardService`, this only
+     * sends a path. The list that used to sit in this comment ("checkout for M/D,
+     * reset for A") outlived the code by two rewrites and described neither the
+     * commands actually run nor the rename and copy cases at all — a restatement
+     * of a CLI rule rots the same way in a comment as it does in Kotlin.
      */
     private fun discardFile(change: FileChange) {
-        val action = when (change.statusCode) {
-            "??" -> "delete"
-            else -> "discard changes to"
+        // The prompt's verb is a CLI answer, so the dialog waits on a pooled-thread
+        // round trip (~5-20 ms against the bound daemon) instead of opening on the
+        // EDT immediately. [FileChange.statusCode] cannot be trusted for it: it is
+        // one collapsed letter, and the collapse is lossy in exactly the cases that
+        // decide the wording — see [FileDiscarder.preview].
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val previewRoot = WorktreeRoot.of(project)
+            val deletes = try {
+                previewRoot != null && change.relativePath in FileDiscarder.preview(previewRoot, listOf(change.relativePath))
+            } catch (_: Exception) {
+                // Bridge down, CLI missing, unreadable body: fall back to the letter
+                // heuristic this host used before the query existed. Wrong for a
+                // conflicted row, right for every other one — and strictly better
+                // than refusing to open the dialog over a wording detail.
+                GitStatusCodes.discardDeletesFile(change.statusCode)
+            }
+            SwingUtilities.invokeLater { confirmAndDiscard(change, deletes) }
         }
+    }
+
+    /**
+     * Shows the confirmation for [change] and, if accepted, runs the discard.
+     *
+     * [deletesFile] decides the verb only. Split out of [discardFile] so the
+     * dialog runs on the EDT after the preview round trip that produced it.
+     */
+    private fun confirmAndDiscard(change: FileChange, deletesFile: Boolean) {
+        // Say "delete" only when the file really is going away — an untracked file,
+        // a staged addition, a rename or copy revert, and a conflicted path with no
+        // HEAD version all have nothing to restore, so "discard changes to" would
+        // understate what the button does.
+        val action = if (deletesFile) "delete" else "discard changes to"
         val result = Messages.showYesNoDialog(
             project,
             "Are you sure you want to $action \"${change.relativePath}\"?\n\nThis action cannot be undone.",
@@ -704,27 +695,115 @@ class ChangesPanel(
         )
         if (result != Messages.YES) return
 
+        // Still on the EDT, and before any git runs: this list comes from
+        // ChangeListManager, which shows a file as changed while its edits live
+        // only in the editor's document — but the CLI resolves every path against
+        // `git status`, which cannot see those. Flushing first is what stops the
+        // discard reporting `not-found` + ok:true on a row the user can plainly
+        // see. [WorktreeRoot] is a plain field read, not a git call, so this costs
+        // the EDT nothing. See [UnsavedEdits].
+        WorktreeRoot.of(project)?.let { editorRoot ->
+            UnsavedEdits.flush(editorRoot, listOf(change.relativePath))
+        }
+
         ApplicationManager.getApplication().executeOnPooledThread {
-            val gitOps = service.getGitOps() ?: return@executeOnPooledThread
-            val repoRoot = service.mainRepoRoot ?: project.basePath ?: return@executeOnPooledThread
-            discardFiles(listOf(change), gitOps, repoRoot)
-            refreshFromGit()
+            // No repo root is a failure like any other, not a quiet return: the user
+            // already confirmed a destructive action, so nothing happening without a
+            // word is the exact symptom this whole path exists to remove.
+            val repoRoot = WorktreeRoot.of(project)
+            if (repoRoot == null) {
+                SwingUtilities.invokeLater {
+                    Messages.showErrorDialog(
+                        project,
+                        "Could not discard \"${change.relativePath}\".\n\nNo repository root is available for this project.",
+                        "Discard Changes Failed",
+                    )
+                }
+                return@executeOnPooledThread
+            }
+            // Branch on the OUTCOME, not on its message. `error` is nullable on the
+            // wire, so testing the string for emptiness silently drops any failure
+            // that arrives without one — the same silent success in a new costume.
+            var touched = listOf(change.relativePath)
+            val failure: String? = try {
+                val outcomes = FileDiscarder.discard(repoRoot, listOf(change.relativePath))
+                touched = outcomes.flatMap { it.touchedPaths }.distinct()
+                outcomes.firstOrNull { !it.ok }?.let { it.error ?: "unknown error" }
+            } catch (e: Exception) {
+                e.message ?: e.javaClass.simpleName
+            }
+            // A discard that did not happen must SAY so. Swallowing this is what
+            // made the old bug indistinguishable from a working button: the
+            // confirmation dialog appeared, the user clicked through, and the file
+            // was still there with nothing logged anywhere.
+            if (failure != null) {
+                SwingUtilities.invokeLater {
+                    Messages.showErrorDialog(
+                        project,
+                        "Could not discard \"${change.relativePath}\".\n\n$failure",
+                        "Discard Changes Failed",
+                    )
+                }
+            }
+            // Refresh either way: a partial failure still changed something, and the
+            // panel must show what is actually on disk now.
+            refreshDiscardedPaths(touched)
         }
     }
 
     /**
+     * Re-reads the working tree after a discard, refreshing the VFS first.
+     *
+     * The CLI deleted or rewrote these files behind IntelliJ's back, so its virtual
+     * file system still holds the old state — and [readChangesFromClm] reads
+     * ChangeListManager, which is built from the VFS. Without this the row survives
+     * its own successful discard until some unrelated event refreshes the VFS,
+     * which reads as "the button did nothing". The 2 s poll cannot rescue it: it
+     * short-circuits on an unchanged signature, and the signature is computed from
+     * that same stale ChangeListManager.
+     *
+     * Pass every path the discard TOUCHED, not just the one the user clicked. A
+     * rename revert also writes the original path back, and that file is invisible
+     * to the IDE until it is refreshed here.
+     */
+    private fun refreshDiscardedPaths(relativePaths: List<String>) {
+        val repoRoot = WorktreeRoot.of(project)
+        if (repoRoot != null) {
+            val files = relativePaths.map { File(repoRoot, it) }
+            LocalFileSystem.getInstance().refreshIoFiles(files, false, true, null)
+        }
+        refreshFromGit()
+    }
+
+    /**
      * Opens a diff or file view based on status, matching VS Code's jollimemory.openFileChange:
-     * - Modified/Renamed (M, R): diff HEAD ↔ Working Tree
-     * - Added/Untracked (A, ??): open file directly (no HEAD version to compare)
+     * - Modified (M): diff HEAD ↔ Working Tree
+     * - Added/Untracked/Renamed/Copied: open file directly (HEAD has no version of THIS path)
      * - Deleted (D): show HEAD version read-only (file no longer exists on disk)
+     *
+     * The untracked test goes through [GitStatusCodes] for the same reason discard
+     * does: a literal `"??"` never matches our collapsed `"?"`, which sent untracked
+     * files down the Modified branch and diffed them against an empty `git show`.
+     *
+     * Renames and copies join the open-directly branch for the same reason, one step
+     * removed: HEAD stores their content under the ORIGINAL path, and [FileChange]
+     * does not carry it (`getChangedFiles` discards it while parsing). So
+     * `git show HEAD:<thisPath>` resolves to nothing and the "diff" was the whole
+     * file rendered as an addition against a blank left pane. Opening the file is
+     * the honest degradation — the same one VS Code falls back to when its own
+     * `originalPath` is absent. Restoring a real rename diff means carrying the
+     * original path on the row first.
      */
     private fun openFileDiff(change: FileChange) {
         ApplicationManager.getApplication().executeOnPooledThread {
-            val repoRoot = service.mainRepoRoot ?: project.basePath ?: return@executeOnPooledThread
+            val repoRoot = WorktreeRoot.of(project) ?: return@executeOnPooledThread
 
-            when (change.statusCode) {
-                "A", "??" -> {
-                    // New/untracked — open the file directly (no HEAD version to diff against)
+            when {
+                change.statusCode == "A" ||
+                    GitStatusCodes.isUntracked(change.statusCode) ||
+                    GitStatusCodes.isRenamedOrCopied(change.statusCode) -> {
+                    // New/untracked/renamed/copied — open directly: HEAD has no
+                    // version of THIS path to diff against (see the KDoc above).
                     val vFile = LocalFileSystem.getInstance()
                         .refreshAndFindFileByIoFile(File(repoRoot, change.relativePath))
                     if (vFile != null) {
@@ -734,7 +813,7 @@ class ChangesPanel(
                         }
                     }
                 }
-                "D" -> {
+                change.statusCode == "D" -> {
                     // Deleted — show HEAD version read-only
                     val gitOps = service.getGitOps() ?: return@executeOnPooledThread
                     val headContent = gitOps.exec("show", "HEAD:${change.relativePath}") ?: ""
@@ -757,7 +836,8 @@ class ChangesPanel(
                     }
                 }
                 else -> {
-                    // Modified/Renamed — diff HEAD ↔ Working Tree
+                    // Modified — diff HEAD ↔ Working Tree. Renames and copies are
+                    // handled above; they have no HEAD blob at this path.
                     val gitOps = service.getGitOps() ?: return@executeOnPooledThread
                     val headContent = gitOps.exec("show", "HEAD:${change.relativePath}") ?: ""
                     val fileName = File(change.relativePath).name
@@ -791,40 +871,42 @@ class ChangesPanel(
     }
 
     /**
-     * Maps git porcelain status codes to VS Code-style single-letter display codes.
-     * Git uses "??" for untracked files, but VS Code displays "U".
+     * Maps a git status code to the VS Code-style single display letter. Git calls an
+     * untracked file `??` and VS Code shows it as `U`; our producers collapse that to
+     * `?`, so the untracked test goes through [GitStatusCodes] — matching `"??"` alone
+     * left the raw `?` on screen as an unexplained grey glyph.
      */
     private fun displayStatusCode(code: String): String {
-        return when (code) {
-            "??" -> "U"
+        return when {
+            GitStatusCodes.isUntracked(code) -> "U"
             else -> code
         }
     }
 
     /** Returns a color for the status code matching VS Code's git decoration colors. */
     private fun statusColor(code: String): Color {
-        return when (code) {
-            "M" -> Color(0xC08020)    // Modified — yellow/orange
-            "A" -> Color(0x20A040)    // Added — green
-            "??" -> Color(0x20A040)   // Untracked — green (displayed as U)
-            "D" -> Color(0xC02020)    // Deleted — red
-            "R" -> Color(0x6A9FD6)    // Renamed — blue
-            "C" -> Color(0x6A9FD6)    // Copied — blue
-            "U" -> Color(0xC02020)    // Unmerged/conflict — red
+        return when {
+            GitStatusCodes.isUntracked(code) -> Color(0x20A040) // Untracked — green (shown as U)
+            code == "M" -> Color(0xC08020)    // Modified — yellow/orange
+            code == "A" -> Color(0x20A040)    // Added — green
+            code == "D" -> Color(0xC02020)    // Deleted — red
+            code == "R" -> Color(0x6A9FD6)    // Renamed — blue
+            code == "C" -> Color(0x6A9FD6)    // Copied — blue
+            code == "U" -> Color(0xC02020)    // Unmerged/conflict — red
             else -> Color.GRAY
         }
     }
 
     /** Returns a human-readable tooltip for the status code. */
     private fun statusTooltip(code: String): String {
-        return when (code) {
-            "M" -> "Modified"
-            "A" -> "Index Added"
-            "??" -> "Untracked"
-            "D" -> "Deleted"
-            "R" -> "Renamed"
-            "C" -> "Copied"
-            "U" -> "Unmerged"
+        return when {
+            GitStatusCodes.isUntracked(code) -> "Untracked"
+            code == "M" -> "Modified"
+            code == "A" -> "Index Added"
+            code == "D" -> "Deleted"
+            code == "R" -> "Renamed"
+            code == "C" -> "Copied"
+            code == "U" -> "Unmerged"
             else -> code
         }
     }

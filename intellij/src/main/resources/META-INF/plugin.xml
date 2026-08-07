@@ -137,19 +137,13 @@
                     icon="/icons/add.svg"/>
         </group>
 
-        <!-- Changes panel actions -->
-        <group id="JolliMemory.ChangesActions" text="JolliMemory Changes">
-            <action id="JolliMemory.CommitAI"
-                    class="ai.jolli.jollimemory.actions.CommitAIAction"
-                    text="AI Commit"
-                    description="Generate AI commit message and commit selected files"
-                    icon="/icons/sparkle.svg"/>
-            <action id="JolliMemory.DiscardSelected"
-                    class="ai.jolli.jollimemory.actions.DiscardSelectedAction"
-                    text="Discard Selected"
-                    description="Discard changes for all selected files"
-                    icon="/icons/discard.svg"/>
-        </group>
+        <!-- FILES panel actions — deliberately EMPTY, matching the VS Code sidebar's
+             Files header (renderSectionActions returns [] for 'changes'). Committing
+             belongs to the Current Memory card's Commit button, discarding is a
+             per-row hover action, and Select-All is retired by the
+             included-by-default + per-row exclude model. Do not add a header button
+             here without changing the VS Code side too. -->
+        <group id="JolliMemory.ChangesActions" text="JolliMemory Files"/>
 
         <!-- Conversations panel actions -->
         <group id="JolliMemory.ConversationsActions" text="JolliMemory Conversations">
@@ -180,7 +174,20 @@
         <!-- Current Memory panel actions (redesign: top-level "Current Memory" section) -->
         <group id="JolliMemory.CurrentMemoryActions" text="JolliMemory Current Memory"/>
 
-        <!-- Standalone action (not in a panel toolbar) -->
+        <!-- Standalone actions (not in a panel toolbar).
+
+             CommitAI is invoked by the Current Memory card's Commit button and by the
+             Working Memory review's "Commit Memory" button, both of which resolve it
+             through ActionManager.getAction("JolliMemory.CommitAI") — so it must stay
+             REGISTERED even though no toolbar shows it. It used to live in
+             JolliMemory.ChangesActions, which is what put an "AI Commit" button on the
+             FILES header that VS Code does not have. -->
+        <action id="JolliMemory.CommitAI"
+                class="ai.jolli.jollimemory.actions.CommitAIAction"
+                text="AI Commit"
+                description="Generate AI commit message and commit selected files"
+                icon="/icons/sparkle.svg"/>
+
         <action id="JolliMemory.ViewSummary"
                 class="ai.jolli.jollimemory.actions.ViewSummaryAction"
                 text="View Commit Memory"

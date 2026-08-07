@@ -5021,11 +5021,12 @@ export function buildSidebarScript(): string {
       // Stash the fields the openFileChange / discardFile commands need but
       // can't recover from item.id alone (id is absolutePath; relativePath
       // and statusCode get dropped by the SerializedTreeItem → command
-      // bridge unless we surface them explicitly). indexStatus +
-      // worktreeStatus are the porcelain v1 raw columns — bridge.discardFiles
-      // routes on those (not on the collapsed gs letter), so omitting them
-      // would silently break discard for untracked / added / renamed files
-      // and leave the activity-bar badge stale post-click.
+      // bridge unless we surface them explicitly). relativePath is the one
+      // that matters for discard — the CLI resolves the real status from it.
+      // data-index-status / data-worktree-status / data-original-path are the
+      // raw porcelain v1 columns; the discard USED to dispatch on them, and
+      // no longer does. Nothing reads them today, so do not build a new
+      // decision on them — read the path and let the CLI classify it.
       'data-rel-path':       item.description || '',
       'data-status-code':    gs,
       'data-index-status':   item.indexStatus    || '',
@@ -5856,11 +5857,13 @@ export function buildSidebarScript(): string {
       if (action === 'discard') {
         // jollimemory.discardFileChanges expects a FileItem-shape (item.fileStatus.*),
         // not a bare id. Route through branch:discardFile so the host rebuilds
-        // {fileStatus:{absolutePath,relativePath,statusCode,indexStatus,worktreeStatus,...}}
-        // — same pattern as branch:openChange. data-* attrs live on the row
-        // (set by renderChangeRow). indexStatus + worktreeStatus must travel
-        // through because bridge.discardFiles routes on the raw porcelain
-        // columns, NOT on the collapsed gitStatus letter.
+        // {fileStatus:{absolutePath,relativePath,statusCode,...}} — same pattern
+        // as branch:openChange. data-* attrs live on the row (set by
+        // renderChangeRow). relativePath is what performs the discard; the
+        // porcelain columns ride along as dead payload (the CLI reads the real
+        // status itself). A row we cannot resolve yields '' for relativePath,
+        // which the service rejects as invalid-path rather than treating as a
+        // no-op success — do not "helpfully" substitute the id here.
         vscode.postMessage({
           type: 'branch:discardFile',
           filePath:        id,

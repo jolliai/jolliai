@@ -3,12 +3,16 @@ package ai.jolli.jollimemory.toolwindow
 import ai.jolli.jollimemory.core.ActiveConversationItem
 import ai.jolli.jollimemory.core.ActiveSessionAggregator
 import ai.jolli.jollimemory.core.CommitSelectionStore
+import ai.jolli.jollimemory.core.FileDiscarder
+import ai.jolli.jollimemory.core.GitStatusCodes
 import ai.jolli.jollimemory.core.SkillsProjection
 import ai.jolli.jollimemory.core.StoredSession
+import ai.jolli.jollimemory.core.UnsavedEdits
 import ai.jolli.jollimemory.core.ConversationUsage
 import ai.jolli.jollimemory.core.TranscriptMessageCounter
 import ai.jolli.jollimemory.core.TranscriptSource
 import ai.jolli.jollimemory.core.WorkingContext
+import ai.jolli.jollimemory.core.WorktreeRoot
 import ai.jolli.jollimemory.core.references.SourceDisplay
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliMemoryService
@@ -25,6 +29,8 @@ import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.jcef.JBCefBrowser
@@ -36,6 +42,7 @@ import org.cef.handler.CefRequestHandlerAdapter
 import org.cef.network.CefRequest
 import java.awt.BorderLayout
 import java.awt.Font
+import java.io.File
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.JTextArea
@@ -79,6 +86,16 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
                     val json = JsonParser.parseString(request).asJsonObject
                     when (json.get("command")?.asString) {
                         "commitMemory" -> SwingUtilities.invokeLater { runCommit() }
+                        "discardFile" -> {
+                            val relativePath = json.get("relativePath")?.asString
+                            val statusCode = json.get("statusCode")?.asString ?: ""
+                            // EDT like `commitMemory`, and for the same reason: the
+                            // first thing this does is raise a confirmation dialog.
+                            // The git work behind it pools itself.
+                            if (!relativePath.isNullOrBlank()) {
+                                SwingUtilities.invokeLater { handleDiscardFile(relativePath, statusCode) }
+                            }
+                        }
                         "toggleExclude" -> {
                             val kind = json.get("kind")?.asString
                             val key = json.get("key")?.asString
@@ -347,6 +364,106 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         SwingUtilities.invokeLater { afterToggleExclude(kind) }
     }
 
+    /**
+     * Reverts one file's working-tree changes from the review's Files row — the same
+     * action the sidebar's FILES row offers, and the same pairing VS Code's Next
+     * Memory panel shows. Confirms first (this is not undoable), then hands the git
+     * work to [FileDiscarder] on a pooled thread and refreshes both surfaces.
+     *
+     * Must be called ON the EDT: it opens a modal dialog.
+     *
+     * The verb is a CLI answer, so the dialog opens from a pooled-thread callback
+     * rather than immediately. [statusCode] is one collapsed letter and cannot
+     * separate a staged deletion (restored) from a conflict with no HEAD version
+     * (removed) — see [FileDiscarder.preview]. It survives only as the fallback.
+     */
+    private fun handleDiscardFile(relativePath: String, statusCode: String) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val previewRoot = WorktreeRoot.of(project)
+            val deletes = try {
+                previewRoot != null && relativePath in FileDiscarder.preview(previewRoot, listOf(relativePath))
+            } catch (e: Exception) {
+                LOG.warn("discard preview failed, wording from status code: ${e.message}")
+                GitStatusCodes.discardDeletesFile(statusCode)
+            }
+            SwingUtilities.invokeLater { confirmAndDiscardFile(relativePath, deletes) }
+        }
+    }
+
+    /**
+     * Shows the confirmation for [relativePath] and, if accepted, runs the discard.
+     * [deletesFile] decides the verb only. Must be called ON the EDT.
+     */
+    private fun confirmAndDiscardFile(relativePath: String, deletesFile: Boolean) {
+        val verb = if (deletesFile) "delete" else "discard changes to"
+        val confirmed = Messages.showYesNoDialog(
+            project,
+            "Are you sure you want to $verb \"$relativePath\"?\n\nThis action cannot be undone.",
+            "Discard Changes",
+            Messages.getWarningIcon(),
+        )
+        if (confirmed != Messages.YES) return
+
+        // Still on the EDT, and before any git runs — same reason as the sidebar's
+        // FILES row: this list can show a file whose edits exist only in the
+        // editor's document, which `git status` cannot see, so without the flush
+        // the discard comes back `not-found` + ok:true and nothing happens. See
+        // [UnsavedEdits].
+        WorktreeRoot.of(project)?.let { editorRoot ->
+            UnsavedEdits.flush(editorRoot, listOf(relativePath))
+        }
+
+        ApplicationManager.getApplication().executeOnPooledThread {
+            // No repo root is a failure like any other, not a quiet return: the user
+            // already confirmed a destructive action, so nothing happening without a
+            // word is the exact symptom this whole path exists to remove.
+            val repoRoot = WorktreeRoot.of(project)
+            if (repoRoot == null) {
+                SwingUtilities.invokeLater {
+                    Messages.showErrorDialog(
+                        project,
+                        "Could not discard \"$relativePath\".\n\nNo repository root is available for this project.",
+                        "Discard Changes Failed",
+                    )
+                }
+                return@executeOnPooledThread
+            }
+            // Branch on the OUTCOME, not on its message: `error` is nullable on the
+            // wire, so an empty-string test drops any failure that arrives without
+            // one and puts the silent success straight back.
+            var touched = listOf(relativePath)
+            val failure: String? = try {
+                val outcomes = FileDiscarder.discard(repoRoot, listOf(relativePath))
+                touched = outcomes.flatMap { it.touchedPaths }.distinct()
+                outcomes.firstOrNull { !it.ok }?.let { it.error ?: "unknown error" }
+            } catch (e: Exception) {
+                LOG.warn("discardFile failed: ${e.message}")
+                e.message ?: e.javaClass.simpleName
+            }
+            // The CLI touched these files behind IntelliJ's back, so the VFS still
+            // holds the old state; refresh before anything re-reads the working tree.
+            // A rename revert also restores its original path — refreshing only the
+            // clicked path leaves that file invisible to the IDE.
+            LocalFileSystem.getInstance()
+                .refreshIoFiles(touched.map { File(repoRoot, it) }, false, true, null)
+            SwingUtilities.invokeLater {
+                // Never silent: a discard that did not happen has to say why, or it
+                // is indistinguishable from one that worked.
+                if (failure != null) {
+                    Messages.showErrorDialog(
+                        project,
+                        "Could not discard \"$relativePath\".\n\n$failure",
+                        "Discard Changes Failed",
+                    )
+                }
+                // The sidebar's FILES list reads git directly, so it needs its own
+                // nudge; this review reloads off the same refresh.
+                service?.panelRegistry?.changesPanel?.refresh()
+                reload()
+            }
+        }
+    }
+
     private fun afterToggleExclude(kind: String) {
         val svc = service
         if (svc == null) {
@@ -413,7 +530,17 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
             val slash = fc.relativePath.lastIndexOf('/')
             val name = if (slash >= 0) fc.relativePath.substring(slash + 1) else fc.relativePath
             val dir = if (slash > 0) fc.relativePath.substring(0, slash) else ""
-            WmFile(name, dir, fc.statusCode.take(1).ifBlank { "M" })
+            // Untracked shows as "U" (VS Code's convention and the sidebar's), not as
+            // the raw "?" our producers emit — otherwise the row carries an
+            // unexplained glyph with no matching .wm-gs colour rule. The row's Discard
+            // still needs the untranslated code to pick the right git path, so both
+            // travel — see WmFile.
+            val display = if (GitStatusCodes.isUntracked(fc.statusCode)) {
+                "U"
+            } else {
+                fc.statusCode.take(1).ifBlank { "M" }
+            }
+            WmFile(name, dir, display, fc.relativePath, fc.statusCode)
         }
     } catch (_: Exception) {
         emptyList()

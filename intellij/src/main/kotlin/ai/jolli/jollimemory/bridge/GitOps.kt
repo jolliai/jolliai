@@ -283,16 +283,32 @@ class GitOps(private val projectDir: String) {
         return output.lines().filter { it.isNotBlank() }
     }
 
+    /**
+     * Wraps a repo-relative path as a LITERAL git pathspec.
+     *
+     * Git matches a bare pathspec as a GLOB, so `*`, `?` and `[…]` inside a real
+     * filename act as wildcards rather than characters. Measured: with `a1.txt`
+     * modified, `git restore -- 'a[1].txt'` touches `a1.txt`, leaves `a[1].txt`
+     * alone, and exits 0 — an operation reporting success for a file it never
+     * touched while changing a different one. `git add` globs the same way.
+     *
+     * Every path below comes from git itself or from a panel row built out of
+     * one, so it is already an exact filename and glob matching can only be
+     * wrong. Kotlin mirror of `literalPathspec` in `cli/src/core/GitOps.ts`; the
+     * JVM cannot import it, so the two are kept in step by hand.
+     */
+    private fun literalPathspec(path: String): String = ":(literal)$path"
+
     /** Stages one or more files in a single git command. */
     fun stageFiles(paths: List<String>) {
         if (paths.isEmpty()) return
-        exec(*( listOf("add", "--") + paths ).toTypedArray())
+        exec(*( listOf("add", "--") + paths.map(::literalPathspec) ).toTypedArray())
     }
 
     /** Unstages one or more tracked files in a single git command. */
     fun unstageFiles(paths: List<String>) {
         if (paths.isEmpty()) return
-        exec(*( listOf("restore", "--staged", "--") + paths ).toTypedArray())
+        exec(*( listOf("restore", "--staged", "--") + paths.map(::literalPathspec) ).toTypedArray())
     }
 
     /**
@@ -448,6 +464,32 @@ class GitOps(private val projectDir: String) {
      * The `JolliMemoryService.mainRepoRoot` field that stores this value is a
      * legacy misnomer (it holds the CURRENT worktree root, not the main one);
      * renaming that field is a separate 50-site cleanup.
+     *
+     * **Asked of git, because [projectDir] is not always the root.** A project
+     * opened on a SUBDIRECTORY — one module of a monorepo — is an ordinary IntelliJ
+     * setup, and there the two disagree in a way that is invisible until something
+     * joins a path to a root: `git status --porcelain` reports paths relative to the
+     * repository root no matter where it ran, while a pathspec (`git add`) and a
+     * `File(root, path)` join are relative to whatever we hand them. The CLI closes
+     * the same gap on its own side (`FileDiscardService.resolveWorktreeRoot`), so a
+     * host that keeps sending subdirectory-relative paths gets `not-found` with
+     * `ok: true` — the answer to a question about a file that, at that path, really
+     * does have nothing pending.
+     *
+     * The caller's own spelling wins whenever git names the SAME directory:
+     * `--show-toplevel` resolves symlinks (`/tmp` → `/private/tmp` on macOS), and
+     * adopting git's form for a project that was already at its root would silently
+     * change a string every other surface compares against `project.basePath`.
      */
-    fun resolveWorktreeRoot(): String? = projectDir
+    fun resolveWorktreeRoot(): String? {
+        val toplevel = exec("rev-parse", "--show-toplevel")?.trim()?.takeIf { it.isNotBlank() } ?: return projectDir
+        return try {
+            if (File(toplevel).canonicalPath == File(projectDir).canonicalPath) projectDir else File(toplevel).path
+        } catch (_: Exception) {
+            // canonicalPath does I/O and can fail on a path we cannot stat; the
+            // caller's directory is the safe answer, and it is what this returned
+            // unconditionally before.
+            projectDir
+        }
+    }
 }

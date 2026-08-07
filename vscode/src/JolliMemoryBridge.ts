@@ -11,11 +11,14 @@
  */
 
 import { existsSync, lstatSync, readFileSync } from "node:fs";
-import { lstat, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+	discardFiles as discardFilesInWorktree,
+	previewDiscard as previewDiscardInWorktree,
+} from "../../cli/src/core/FileDiscardService.js";
 import { FolderStorage } from "../../cli/src/core/FolderStorage.js";
-import { getDiffStats } from "../../cli/src/core/GitOps.js";
+import { getDiffStats, literalPathspec } from "../../cli/src/core/GitOps.js";
 import { sharedRepoIdentityMatches } from "../../cli/src/core/GitRemoteUtils.js";
 import { filterToBranchHeads } from "../../cli/src/core/HeadEntryFilter.js";
 import {
@@ -170,26 +173,6 @@ async function diffUntrackedFile(relPath: string, cwd: string): Promise<string> 
 
 function shortHash(hash: string | undefined): string | undefined {
 	return hash ? hash.substring(0, 8) : undefined;
-}
-
-/**
- * Removes a file or directory from disk. Silently ignores ENOENT
- * (path already deleted externally between confirmation and execution).
- */
-async function removeFromDisk(absolutePath: string): Promise<void> {
-	try {
-		const stat = await lstat(absolutePath);
-		if (stat.isDirectory()) {
-			await rm(absolutePath, { recursive: true });
-		} else {
-			await unlink(absolutePath);
-		}
-	} catch (err: unknown) {
-		if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-			return;
-		}
-		throw err;
-	}
 }
 
 function shortHashes(hashes: ReadonlyArray<string>): Array<string> {
@@ -759,8 +742,16 @@ export class JolliMemoryBridge {
 			return;
 		}
 
+		// `:(literal)` on every path below. These all come from git itself (status
+		// / diff --name-only) or from a UI row built out of one, so they are exact
+		// filenames and glob matching can only be wrong — a filename containing
+		// `[`, `*` or `?` would otherwise stage or unstage a DIFFERENT file and
+		// exit 0. Same measurement that put it on the discard path.
 		if (!opts.allowMissing) {
-			await execGit(["add", "--", ...relativePaths], this.cwd);
+			await execGit(
+				["add", "--", ...relativePaths.map(literalPathspec)],
+				this.cwd,
+			);
 			return;
 		}
 
@@ -777,103 +768,105 @@ export class JolliMemoryBridge {
 		}
 
 		if (existing.length > 0) {
-			await execGit(["add", "--", ...existing], this.cwd);
+			await execGit(
+				["add", "--", ...existing.map(literalPathspec)],
+				this.cwd,
+			);
 		}
 		if (missing.length > 0) {
 			await execGit(
-				["rm", "--cached", "--ignore-unmatch", "--", ...missing],
+				[
+					"rm",
+					"--cached",
+					"--ignore-unmatch",
+					"--",
+					...missing.map(literalPathspec),
+				],
 				this.cwd,
 			);
 		}
 	}
 
-	/** Unstages multiple files in a single git restore invocation to avoid index.lock contention. */
+	/**
+	 * Unstages multiple files in a single git restore invocation to avoid index.lock contention.
+	 *
+	 * Paths go through `:(literal)` for the same reason they do in `stageFiles`
+	 * and the discard path: a bare pathspec is a glob, so a filename containing
+	 * `[`, `*` or `?` would unstage a different file and report success.
+	 */
 	async unstageFiles(relativePaths: Array<string>): Promise<void> {
 		if (relativePaths.length === 0) {
 			return;
 		}
-		await execGit(["restore", "--staged", "--", ...relativePaths], this.cwd);
+		await execGit(
+			["restore", "--staged", "--", ...relativePaths.map(literalPathspec)],
+			this.cwd,
+		);
 	}
 
 	/**
 	 * Discards changes for a set of files, returning each to its HEAD state.
 	 *
-	 * Handles all index/worktree status combinations:
-	 * - Staged changes (M /D ): `git restore --staged --worktree`
-	 * - Unstaged changes ( M/ D): `git restore --`
-	 * - Both staged+unstaged (MM): `git restore --staged --worktree`
-	 * - Added files (A /AM): `git restore --staged` + remove from disk
-	 * - Untracked files (??): remove from disk (files and directories)
-	 * - Renames (R /RM): unstage both paths, restore old, remove new
+	 * Delegates to the CLI's {@link discardFilesInWorktree}, which owns every
+	 * index/worktree combination (staged, worktree-only, added, copied, untracked,
+	 * renamed) and is the SAME code the IntelliJ plugin reaches over
+	 * `ide-bridge discard-files`. This used to be a second implementation living
+	 * here; the JVM host's third one had drifted into handling only three of the
+	 * six cases, so the rule was moved to `cli/src` and both hosts now share it.
 	 *
-	 * Files are grouped by operation type so each git command runs once per group.
+	 * Only `relativePath` is read off each entry. The service resolves the real
+	 * status itself from one authoritative `git status`, so a caller cannot send a
+	 * stale or lossily-collapsed status code — which is what the porcelain-column
+	 * guard in `jollimemory.discardFileChanges` was defending against.
+	 *
+	 * Throws when any file could not be discarded, preserving the previous
+	 * contract: the command handler shows an error and the user learns the click
+	 * did not take effect.
 	 */
 	async discardFiles(files: ReadonlyArray<FileStatus>): Promise<void> {
-		// Group files by the required discard operation
-		const stagedWorktreePaths: Array<string> = [];
-		const worktreeOnlyPaths: Array<string> = [];
-		const addedFiles: Array<FileStatus> = [];
-		const untrackedFiles: Array<FileStatus> = [];
-		const renamedFiles: Array<FileStatus> = [];
-
-		for (const file of files) {
-			const { indexStatus, worktreeStatus } = file;
-
-			if (indexStatus === "R") {
-				renamedFiles.push(file);
-			} else if (indexStatus === "A" || indexStatus === "C") {
-				addedFiles.push(file);
-			} else if (indexStatus === "?" && worktreeStatus === "?") {
-				untrackedFiles.push(file);
-			} else if (indexStatus !== " " && indexStatus !== "?") {
-				// Staged change (M /D /MM) — restore both index and worktree
-				stagedWorktreePaths.push(file.relativePath);
-			} else {
-				// Worktree-only change ( M/ D) — restore worktree only
-				worktreeOnlyPaths.push(file.relativePath);
-			}
+		if (files.length === 0) {
+			return;
 		}
-
-		// 1. Restore staged+worktree files in one batch
-		if (stagedWorktreePaths.length > 0) {
-			await execGit(
-				["restore", "--staged", "--worktree", "--", ...stagedWorktreePaths],
-				this.cwd,
-			);
+		const outcomes = await discardFilesInWorktree(
+			this.cwd,
+			files.map((file) => file.relativePath),
+		);
+		const failures = outcomes.filter((outcome) => !outcome.ok);
+		if (failures.length > 0) {
+			const detail = failures
+				.map((failure) => `${failure.relativePath}: ${failure.error ?? "unknown error"}`)
+				.join("; ");
+			throw new Error(`Failed to discard ${failures.length} file(s) — ${detail}`);
 		}
+	}
 
-		// 2. Restore worktree-only files in one batch
-		if (worktreeOnlyPaths.length > 0) {
-			await execGit(["restore", "--", ...worktreeOnlyPaths], this.cwd);
+	/**
+	 * Which of [files] a discard would REMOVE from disk rather than restore in
+	 * place — the input to the confirmation prompt's wording.
+	 *
+	 * Answered by the CLI, not from `FileStatus.statusCode`, because that letter
+	 * is ambiguous exactly where it matters: a staged deletion (`D `, restored)
+	 * and the conflicts `DU` / `DD` (removed) all collapse to `"D"`. The raw
+	 * porcelain columns ride along on `FileStatus` and could resolve it here, but
+	 * a second copy of the rule in the host is what shipped the rename/copy
+	 * wording bug in both hosts at once — so the host asks instead of deciding.
+	 *
+	 * Read-only: nothing is written, so this is safe to call BEFORE the user has
+	 * confirmed. Returns the set of paths that would be deleted.
+	 */
+	async previewDiscardDeletions(
+		files: ReadonlyArray<FileStatus>,
+	): Promise<Set<string>> {
+		if (files.length === 0) {
+			return new Set();
 		}
-
-		// 3. Handle added files: unstage then remove from disk
-		if (addedFiles.length > 0) {
-			await execGit(
-				["restore", "--staged", "--", ...addedFiles.map((f) => f.relativePath)],
-				this.cwd,
-			);
-			for (const file of addedFiles) {
-				await removeFromDisk(file.absolutePath);
-			}
-		}
-
-		// 4. Handle renames: unstage both paths, restore old, remove new
-		for (const file of renamedFiles) {
-			const restorePaths = file.originalPath
-				? [file.relativePath, file.originalPath]
-				: [file.relativePath];
-			await execGit(["restore", "--staged", "--", ...restorePaths], this.cwd);
-			if (file.originalPath) {
-				await execGit(["restore", "--", file.originalPath], this.cwd);
-			}
-			await removeFromDisk(file.absolutePath);
-		}
-
-		// 5. Remove untracked files/directories
-		for (const file of untrackedFiles) {
-			await removeFromDisk(file.absolutePath);
-		}
+		const previews = await previewDiscardInWorktree(
+			this.cwd,
+			files.map((file) => file.relativePath),
+		);
+		return new Set(
+			previews.filter((preview) => preview.deletesFile).map((preview) => preview.relativePath),
+		);
 	}
 
 	// ── Commit message generation ─────────────────────────────────────────
@@ -2824,7 +2817,12 @@ export class JolliMemoryBridge {
 		);
 		const unmerged = output.split("\n").filter(Boolean);
 		if (unmerged.length > 0) {
-			await execGit(["add", "--", ...unmerged], this.cwd);
+			// `:(literal)` — these came straight out of `git diff --name-only`, so
+			// they are exact filenames and a glob match can only hit the wrong file.
+			await execGit(
+				["add", "--", ...unmerged.map(literalPathspec)],
+				this.cwd,
+			);
 			log.info("bridge", `Staged ${unmerged.length} unmerged file(s)`);
 		}
 	}

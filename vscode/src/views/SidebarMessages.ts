@@ -766,21 +766,27 @@ export type SidebarOutboundMsg =
 			 * bare id (which the command's `if (!item?.fileStatus) return;` guard
 			 * would silently drop).
 			 *
-			 * `indexStatus` / `worktreeStatus` are NOT optional — `bridge.discardFiles`
-			 * routes on those two columns (worktree-only restore vs staged-worktree
-			 * restore vs untracked unlink etc.). Sending only `statusCode` (the
-			 * collapsed display letter) used to land every file in the
-			 * `git restore --staged --worktree` branch, which silently failed for
-			 * untracked / added / renamed files and left the activity-bar badge
-			 * showing the pre-discard count. `originalPath` is required for rename
-			 * rows so both the old and new paths get unstaged in one shot.
+			 * `relativePath` is the only field the discard itself needs, and it must
+			 * be non-empty: `bridge.discardFiles` forwards the path to the CLI's
+			 * `FileDiscardService`, which resolves the real status from one
+			 * authoritative `git status` read. `statusCode` only picks the verb in
+			 * the confirmation prompt ("Delete" vs "Discard").
+			 *
+			 * `indexStatus` / `worktreeStatus` / `originalPath` are OPTIONAL and
+			 * currently read by nothing. They used to be load-bearing — the discard
+			 * dispatched on the raw porcelain columns, so a caller that dropped them
+			 * silently routed every file (untracked included) into the
+			 * `git restore --staged --worktree` branch and left the activity-bar
+			 * badge showing the pre-discard count. That dispatch is gone; a producer
+			 * that cannot supply the columns should simply omit them rather than
+			 * inventing values to satisfy the type.
 			 */
 			readonly type: "branch:discardFile";
 			readonly filePath: string;
 			readonly relativePath: string;
 			readonly statusCode: string;
-			readonly indexStatus: string;
-			readonly worktreeStatus: string;
+			readonly indexStatus?: string;
+			readonly worktreeStatus?: string;
 			readonly originalPath?: string;
 	  }
 	| {

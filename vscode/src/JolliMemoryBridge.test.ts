@@ -13,6 +13,11 @@ const { discoverRepos } = vi.hoisted(() => ({
 	discoverRepos: vi.fn().mockReturnValue([]),
 }));
 
+const { discardFilesInWorktree, previewDiscardInWorktree } = vi.hoisted(() => ({
+	discardFilesInWorktree: vi.fn().mockResolvedValue([]),
+	previewDiscardInWorktree: vi.fn().mockResolvedValue([]),
+}));
+
 const { extractRepoName, getRemoteUrl, resolveKbParent, isClaimableProject } = vi.hoisted(() => ({
 	extractRepoName: vi.fn().mockReturnValue("test-repo"),
 	getRemoteUrl: vi.fn().mockReturnValue(null),
@@ -315,6 +320,18 @@ vi.mock("../../cli/src/core/Regenerator.js", () => ({
 vi.mock("../../cli/src/core/GitOps.js", () => ({
 	getDiffStats,
 	resolveGitHooksDir,
+	// Real behaviour, not a stub: the stage / unstage assertions below are what
+	// pin that these paths reach git as LITERAL pathspecs, so a mock that dropped
+	// the prefix would keep them green while the glob bug came back.
+	literalPathspec: (relativePath: string) => `:(literal)${relativePath}`,
+}));
+
+// The discard rule itself is covered against a real repo in
+// cli/src/core/FileDiscardService.test.ts; here we only assert that the bridge
+// hands it the right cwd + paths and surfaces its failures.
+vi.mock("../../cli/src/core/FileDiscardService.js", () => ({
+	discardFiles: discardFilesInWorktree,
+	previewDiscard: previewDiscardInWorktree,
 }));
 
 vi.mock("../../cli/src/install/DistPathResolver.js", async (importOriginal) => {
@@ -1206,7 +1223,7 @@ describe("JolliMemoryBridge", () => {
 
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
-				["add", "--", "a.ts", "b.ts"],
+				["add", "--", ":(literal)a.ts", ":(literal)b.ts"],
 				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
@@ -1246,7 +1263,7 @@ describe("JolliMemoryBridge", () => {
 
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
-				["add", "--", "a.ts", "b.ts"],
+				["add", "--", ":(literal)a.ts", ":(literal)b.ts"],
 				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
@@ -1262,7 +1279,7 @@ describe("JolliMemoryBridge", () => {
 
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
-				["rm", "--cached", "--ignore-unmatch", "--", "a.ts", "b.ts"],
+				["rm", "--cached", "--ignore-unmatch", "--", ":(literal)a.ts", ":(literal)b.ts"],
 				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
@@ -1282,14 +1299,14 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenNthCalledWith(
 				1,
 				"git",
-				["add", "--", "a.ts"],
+				["add", "--", ":(literal)a.ts"],
 				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(execFileMock).toHaveBeenNthCalledWith(
 				2,
 				"git",
-				["rm", "--cached", "--ignore-unmatch", "--", "b.ts"],
+				["rm", "--cached", "--ignore-unmatch", "--", ":(literal)b.ts"],
 				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
@@ -1316,14 +1333,14 @@ describe("JolliMemoryBridge", () => {
 			expect(execFileMock).toHaveBeenNthCalledWith(
 				1,
 				"git",
-				["add", "--", "healthy.ts"],
+				["add", "--", ":(literal)healthy.ts"],
 				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
 			expect(execFileMock).toHaveBeenNthCalledWith(
 				2,
 				"git",
-				["rm", "--cached", "--ignore-unmatch", "--", "ignored-and-gone.ts"],
+				["rm", "--cached", "--ignore-unmatch", "--", ":(literal)ignored-and-gone.ts"],
 				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
@@ -1342,7 +1359,7 @@ describe("JolliMemoryBridge", () => {
 
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
-				["add", "--", "dangling-link"],
+				["add", "--", ":(literal)dangling-link"],
 				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
@@ -1407,7 +1424,7 @@ describe("JolliMemoryBridge", () => {
 
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
-				["restore", "--staged", "--", "src/main.ts"],
+				["restore", "--staged", "--", ":(literal)src/main.ts"],
 				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
@@ -1423,7 +1440,7 @@ describe("JolliMemoryBridge", () => {
 
 			expect(execFileMock).toHaveBeenCalledWith(
 				"git",
-				["restore", "--staged", "--", "a.ts", "b.ts"],
+				["restore", "--staged", "--", ":(literal)a.ts", ":(literal)b.ts"],
 				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
 				expect.any(Function),
 			);
@@ -1440,338 +1457,173 @@ describe("JolliMemoryBridge", () => {
 
 	// ── discardFiles ────────────────────────────────────────────────────
 
+	/**
+	 * These cover DELEGATION only. Which git command each index/worktree
+	 * combination needs used to be implemented here and asserted with execFile
+	 * spies; that rule now lives in cli/src/core/FileDiscardService.ts and is
+	 * covered there against a real git repository — a stronger check than
+	 * asserting we called what we said we would call. Re-adding per-status cases
+	 * here would re-create the second implementation this change removed.
+	 */
 	describe("discardFiles()", () => {
-		function makeFileStatus(
-			relativePath: string,
-			indexStatus: string,
-			worktreeStatus: string,
-			originalPath?: string,
-		) {
+		function makeFileStatus(relativePath: string, indexStatus: string, worktreeStatus: string) {
 			const hasIndexEntry = indexStatus !== " " && indexStatus !== "?";
-			const statusCode = hasIndexEntry ? indexStatus : worktreeStatus;
 			return {
 				absolutePath: `${TEST_CWD}/${relativePath}`,
 				relativePath,
-				statusCode,
+				statusCode: hasIndexEntry ? indexStatus : worktreeStatus,
 				indexStatus,
 				worktreeStatus,
-				...(originalPath ? { originalPath } : {}),
 				isSelected: false,
 			};
 		}
 
 		beforeEach(() => {
-			lstat.mockReset();
-			unlink.mockReset();
-			rm.mockReset();
+			discardFilesInWorktree.mockReset();
+			discardFilesInWorktree.mockResolvedValue([]);
 		});
 
-		it("restores worktree for unstaged modification ( M)", async () => {
-			mockExecFileSuccess("");
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([makeFileStatus("file.ts", " ", "M")]);
-
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--", "file.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-		});
-
-		it("restores staged+worktree for staged-only modification (M )", async () => {
-			mockExecFileSuccess("");
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([makeFileStatus("file.ts", "M", " ")]);
-
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--staged", "--worktree", "--", "file.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-		});
-
-		it("restores staged+worktree for staged+unstaged modification (MM)", async () => {
-			mockExecFileSuccess("");
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([makeFileStatus("file.ts", "M", "M")]);
-
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--staged", "--worktree", "--", "file.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-		});
-
-		it("restores worktree for unstaged deletion ( D)", async () => {
-			mockExecFileSuccess("");
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([makeFileStatus("file.ts", " ", "D")]);
-
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--", "file.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-		});
-
-		it("restores staged+worktree for staged deletion (D )", async () => {
-			mockExecFileSuccess("");
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([makeFileStatus("file.ts", "D", " ")]);
-
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--staged", "--worktree", "--", "file.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-		});
-
-		it("unstages and removes added file (A )", async () => {
-			mockExecFileSuccess(""); // git restore --staged
-			lstat.mockResolvedValue({ isDirectory: () => false });
-			unlink.mockResolvedValue(undefined);
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([makeFileStatus("new.ts", "A", " ")]);
-
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--staged", "--", "new.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/new.ts`);
-		});
-
-		it("unstages and removes added+modified file (AM)", async () => {
-			mockExecFileSuccess(""); // git restore --staged
-			lstat.mockResolvedValue({ isDirectory: () => false });
-			unlink.mockResolvedValue(undefined);
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([makeFileStatus("new.ts", "A", "M")]);
-
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--staged", "--", "new.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/new.ts`);
-		});
-
-		it("removes untracked file (??)", async () => {
-			lstat.mockResolvedValue({ isDirectory: () => false });
-			unlink.mockResolvedValue(undefined);
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([makeFileStatus("untracked.ts", "?", "?")]);
-
-			expect(execFileMock).not.toHaveBeenCalled();
-			expect(lstat).toHaveBeenCalledWith(`${TEST_CWD}/untracked.ts`);
-			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/untracked.ts`);
-		});
-
-		it("removes untracked directory with rm recursive (??)", async () => {
-			lstat.mockResolvedValue({ isDirectory: () => true });
-			rm.mockResolvedValue(undefined);
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([makeFileStatus("new-folder", "?", "?")]);
-
-			expect(lstat).toHaveBeenCalledWith(`${TEST_CWD}/new-folder`);
-			expect(rm).toHaveBeenCalledWith(`${TEST_CWD}/new-folder`, {
-				recursive: true,
-			});
-			expect(unlink).not.toHaveBeenCalled();
-		});
-
-		it("unstages and removes copied file (C )", async () => {
-			mockExecFileSuccess(""); // git restore --staged
-			lstat.mockResolvedValue({ isDirectory: () => false });
-			unlink.mockResolvedValue(undefined);
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([
-				makeFileStatus("copy.ts", "C", " ", "original.ts"),
+		it("forwards the cwd and every relative path to the shared service", async () => {
+			discardFilesInWorktree.mockResolvedValue([
+				{ relativePath: "staged.ts", ok: true, action: "restored" },
+				{ relativePath: "new.ts", ok: true, action: "deleted" },
 			]);
-
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--staged", "--", "copy.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/copy.ts`);
-		});
-
-		it("handles rename by unstaging both paths, restoring old, removing new (R )", async () => {
-			mockExecFileSuccess(""); // git restore --staged -- new.ts old.ts
-			mockExecFileSuccess(""); // git restore -- old.ts
-			lstat.mockResolvedValue({ isDirectory: () => false });
-			unlink.mockResolvedValue(undefined);
 			const bridge = makeBridge();
 
-			await bridge.discardFiles([makeFileStatus("new.ts", "R", " ", "old.ts")]);
+			await bridge.discardFiles([makeFileStatus("staged.ts", "M", " "), makeFileStatus("new.ts", "?", "?")]);
 
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--staged", "--", "new.ts", "old.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--", "old.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/new.ts`);
+			expect(discardFilesInWorktree).toHaveBeenCalledWith(TEST_CWD, ["staged.ts", "new.ts"]);
 		});
 
-		it("handles rename without originalPath by unstaging only new path and skipping restore (R )", async () => {
-			mockExecFileSuccess(""); // git restore --staged -- new.ts
-			lstat.mockResolvedValue({ isDirectory: () => false });
-			unlink.mockResolvedValue(undefined);
+		it("sends only the path — the service resolves the real status itself", async () => {
+			// Passing our own status columns is what let a stale or lossily-collapsed
+			// code reach the dispatch; the path is deliberately all we hand over.
+			discardFilesInWorktree.mockResolvedValue([{ relativePath: "f.ts", ok: true, action: "restored" }]);
 			const bridge = makeBridge();
 
-			await bridge.discardFiles([makeFileStatus("new.ts", "R", " ")]);
+			await bridge.discardFiles([makeFileStatus("f.ts", "R", " ")]);
 
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--staged", "--", "new.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-			// Should NOT call git restore -- (worktree restore, without --staged)
-			const restoreCalls = execFileMock.mock.calls.filter(
-				(c: Array<unknown>) =>
-					(c[1] as Array<string>)[0] === "restore" &&
-					!(c[1] as Array<string>).includes("--staged"),
-			);
-			expect(restoreCalls).toHaveLength(0);
-			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/new.ts`);
+			const [, paths] = discardFilesInWorktree.mock.calls[0] as [string, Array<string>];
+			expect(paths).toEqual(["f.ts"]);
 		});
 
-		it("handles rename+edit by unstaging both paths, restoring old, removing new (RM)", async () => {
-			mockExecFileSuccess(""); // git restore --staged -- new.ts old.ts
-			mockExecFileSuccess(""); // git restore -- old.ts
-			lstat.mockResolvedValue({ isDirectory: () => false });
-			unlink.mockResolvedValue(undefined);
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([makeFileStatus("new.ts", "R", "M", "old.ts")]);
-
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--staged", "--", "new.ts", "old.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--", "old.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-		});
-
-		it("ignores ENOENT when file already gone on lstat", async () => {
-			const enoent = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-			lstat.mockRejectedValue(enoent);
-			const bridge = makeBridge();
-
-			await expect(
-				bridge.discardFiles([makeFileStatus("gone.ts", "?", "?")]),
-			).resolves.toBeUndefined();
-		});
-
-		it("ignores ENOENT when file already gone on unlink", async () => {
-			const enoent = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-			lstat.mockResolvedValue({ isDirectory: () => false });
-			unlink.mockRejectedValue(enoent);
-			const bridge = makeBridge();
-
-			await expect(
-				bridge.discardFiles([makeFileStatus("gone.ts", "?", "?")]),
-			).resolves.toBeUndefined();
-		});
-
-		it("re-throws non-ENOENT errors", async () => {
-			const eperm = Object.assign(new Error("EPERM"), { code: "EPERM" });
-			lstat.mockRejectedValue(eperm);
-			const bridge = makeBridge();
-
-			await expect(
-				bridge.discardFiles([makeFileStatus("locked.ts", "?", "?")]),
-			).rejects.toThrow("EPERM");
-		});
-
-		it("handles rename without originalPath (unstages only new path, skips restore)", async () => {
-			mockExecFileSuccess(""); // git restore --staged -- new.ts (single path)
-			lstat.mockResolvedValue({ isDirectory: () => false });
-			unlink.mockResolvedValue(undefined);
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([makeFileStatus("new.ts", "R", " ")]);
-
-			// Only the new path should be unstaged (no second path)
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--staged", "--", "new.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-			// No separate restore for old path
-			expect(execFileMock).toHaveBeenCalledTimes(1);
-			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/new.ts`);
-		});
-
-		it("batches mixed status types into grouped git calls", async () => {
-			mockExecFileSuccess(""); // git restore --staged --worktree (for staged M)
-			mockExecFileSuccess(""); // git restore -- (for unstaged M)
-			lstat.mockResolvedValue({ isDirectory: () => false });
-			unlink.mockResolvedValue(undefined);
-			const bridge = makeBridge();
-
-			await bridge.discardFiles([
-				makeFileStatus("staged.ts", "M", " "),
-				makeFileStatus("unstaged.ts", " ", "M"),
-				makeFileStatus("new.ts", "?", "?"),
-			]);
-
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--staged", "--worktree", "--", "staged.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-			expect(execFileMock).toHaveBeenCalledWith(
-				"git",
-				["restore", "--", "unstaged.ts"],
-				{ cwd: TEST_CWD, encoding: "utf8", windowsHide: true },
-				expect.any(Function),
-			);
-			expect(unlink).toHaveBeenCalledWith(`${TEST_CWD}/new.ts`);
-		});
-
-		it("does nothing for empty file list", async () => {
+		it("does nothing for an empty file list", async () => {
 			const bridge = makeBridge();
 
 			await bridge.discardFiles([]);
 
-			expect(execFileMock).not.toHaveBeenCalled();
-			expect(unlink).not.toHaveBeenCalled();
+			expect(discardFilesInWorktree).not.toHaveBeenCalled();
+		});
+
+		it("resolves when every outcome succeeded", async () => {
+			discardFilesInWorktree.mockResolvedValue([{ relativePath: "f.ts", ok: true, action: "deleted" }]);
+			const bridge = makeBridge();
+
+			await expect(bridge.discardFiles([makeFileStatus("f.ts", "?", "?")])).resolves.toBeUndefined();
+		});
+
+		it("throws naming each failed path and its reason", async () => {
+			// A discard that did not happen must not resolve — the command handler
+			// turns this rejection into the error toast the user sees.
+			discardFilesInWorktree.mockResolvedValue([
+				{ relativePath: "ok.ts", ok: true, action: "deleted" },
+				{ relativePath: "locked.ts", ok: false, action: "deleted", error: "EPERM" },
+			]);
+			const bridge = makeBridge();
+
+			await expect(
+				bridge.discardFiles([makeFileStatus("ok.ts", "?", "?"), makeFileStatus("locked.ts", "?", "?")]),
+			).rejects.toThrow(/locked\.ts: EPERM/);
+		});
+
+		it("labels a failure with no reason rather than dropping it", async () => {
+			discardFilesInWorktree.mockResolvedValue([{ relativePath: "x.ts", ok: false, action: "deleted" }]);
+			const bridge = makeBridge();
+
+			await expect(bridge.discardFiles([makeFileStatus("x.ts", "?", "?")])).rejects.toThrow(
+				/x\.ts: unknown error/,
+			);
+		});
+	});
+
+	// ── previewDiscardDeletions ─────────────────────────────────────────
+
+	/**
+	 * Delegation again. WHICH statuses delete a file is covered against real git
+	 * in the CLI suite; what the bridge owes is to ask about the paths it was
+	 * given and to hand back exactly the ones the service flagged, so the prompt
+	 * cannot understate what the button does.
+	 */
+	describe("previewDiscardDeletions()", () => {
+		function makeFileStatus(relativePath: string, indexStatus: string, worktreeStatus: string) {
+			const hasIndexEntry = indexStatus !== " " && indexStatus !== "?";
+			return {
+				absolutePath: `${TEST_CWD}/${relativePath}`,
+				relativePath,
+				statusCode: hasIndexEntry ? indexStatus : worktreeStatus,
+				indexStatus,
+				worktreeStatus,
+				isSelected: false,
+			};
+		}
+
+		beforeEach(() => {
+			previewDiscardInWorktree.mockReset();
+			previewDiscardInWorktree.mockResolvedValue([]);
+		});
+
+		it("forwards the cwd and every relative path to the shared service", async () => {
+			const bridge = makeBridge();
+
+			await bridge.previewDiscardDeletions([
+				makeFileStatus("staged.ts", "M", " "),
+				makeFileStatus("new.ts", "?", "?"),
+			]);
+
+			expect(previewDiscardInWorktree).toHaveBeenCalledWith(TEST_CWD, ["staged.ts", "new.ts"]);
+		});
+
+		it("returns only the paths the service says get deleted", async () => {
+			previewDiscardInWorktree.mockResolvedValue([
+				{ relativePath: "staged.ts", deletesFile: false },
+				{ relativePath: "new.ts", deletesFile: true },
+			]);
+			const bridge = makeBridge();
+
+			const deletions = await bridge.previewDiscardDeletions([
+				makeFileStatus("staged.ts", "M", " "),
+				makeFileStatus("new.ts", "?", "?"),
+			]);
+
+			expect([...deletions]).toEqual(["new.ts"]);
+		});
+
+		it("trusts the service over the row's own status letter", async () => {
+			// The whole reason this is a query. `DU` reaches the host collapsed to
+			// "D" — indistinguishable from a staged deletion, which discard RESTORES
+			// — so a letter-based answer says "changes" while the file is removed.
+			previewDiscardInWorktree.mockResolvedValue([{ relativePath: "conflict.ts", deletesFile: true }]);
+			const bridge = makeBridge();
+
+			const deletions = await bridge.previewDiscardDeletions([makeFileStatus("conflict.ts", "D", "U")]);
+
+			expect(deletions.has("conflict.ts")).toBe(true);
+		});
+
+		it("does nothing for an empty file list", async () => {
+			const bridge = makeBridge();
+
+			expect([...(await bridge.previewDiscardDeletions([]))]).toEqual([]);
+			expect(previewDiscardInWorktree).not.toHaveBeenCalled();
+		});
+
+		it("never discards anything", async () => {
+			discardFilesInWorktree.mockClear();
+			const bridge = makeBridge();
+
+			await bridge.previewDiscardDeletions([makeFileStatus("f.ts", "?", "?")]);
+
+			expect(discardFilesInWorktree).not.toHaveBeenCalled();
 		});
 	});
 
@@ -5165,7 +5017,7 @@ describe("JolliMemoryBridge", () => {
 		it("stages unmerged files then returns tree SHA", async () => {
 			// diff --name-only --diff-filter=U returns unmerged files
 			mockExecFileSuccess("a.ts\nb.ts\n");
-			// git add -- a.ts b.ts
+			// git add -- :(literal)a.ts :(literal)b.ts
 			mockExecFileSuccess("");
 			// write-tree returns the tree SHA
 			mockExecFileSuccess("def789\n");

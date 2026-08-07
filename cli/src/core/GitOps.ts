@@ -73,6 +73,26 @@ export function resolveStateRoot(cwd: string): string {
 }
 
 /**
+ * Wraps a repo-relative path as a LITERAL git pathspec.
+ *
+ * Git matches a bare pathspec as a GLOB, so `*`, `?` and `[…]` inside a real
+ * filename act as wildcards rather than characters. Measured: with `a1.txt`
+ * modified, `git restore -- 'a[1].txt'` reverts `a1.txt`, leaves `a[1].txt`
+ * untouched, and exits 0 — an operation that reports success for a file it never
+ * touched while changing a DIFFERENT file. `git add` and `git rm --cached` glob
+ * the same way.
+ *
+ * Use it wherever a path came from git itself (`git status`, `git diff --name-only`)
+ * or from a UI row built out of one: such a path is already an exact filename, so
+ * literal matching is always what is meant, and glob matching can only be wrong.
+ *
+ * NOT for a caller-authored pattern — a user typing `src/*.ts` wants the glob.
+ */
+export function literalPathspec(relativePath: string): string {
+	return `:(literal)${relativePath}`;
+}
+
+/**
  * Executes a git command and returns the result.
  * Logs the command being executed and its outcome.
  *

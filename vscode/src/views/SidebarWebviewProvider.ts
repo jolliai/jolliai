@@ -1169,13 +1169,17 @@ export class SidebarWebviewProvider
 				// `if (!item?.fileStatus) return;` guard and the click would silently
 				// no-op, which is what the inline ↺ button hit before this case.
 				//
-				// indexStatus + worktreeStatus MUST be forwarded — `bridge.discardFiles`
-				// dispatches on the raw porcelain v1 columns (worktree-only restore vs
-				// staged-worktree restore vs unlink for untracked), not on the
-				// collapsed statusCode letter. Routing only statusCode used to land
-				// every file in the `git restore --staged --worktree` branch which
-				// silently failed for untracked files (pathspec unknown to git),
-				// leaving the activity-bar badge showing the pre-discard count.
+				// indexStatus / worktreeStatus / originalPath are forwarded as DEAD
+				// PAYLOAD — nothing downstream reads them any more. They are kept on
+				// the shape so it stays structurally a FileStatus, not because the
+				// discard needs them: the rule moved to the CLI's FileDiscardService,
+				// which resolves each path's real status from one authoritative `git
+				// status`. That is what makes a stale or lossily-collapsed column
+				// impossible here — routing only statusCode used to land every file
+				// in the `git restore --staged --worktree` branch, which silently
+				// failed for untracked files (pathspec unknown to git) and left the
+				// activity-bar badge showing the pre-discard count. Do not read them
+				// back into a decision; the path is the input.
 				void this.deps.executeCommand("jollimemory.discardFileChanges", {
 					fileStatus: {
 						absolutePath: msg.filePath,

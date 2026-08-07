@@ -568,9 +568,18 @@ class JolliMemoryService(private val project: Project) : Disposable {
                 sb.appendLine(".git content=${gitEntry.readText().trim()}")
             }
 
-            val gitOps = GitOps(basePath)
-            val resolvedRoot = gitOps.resolveWorktreeRoot() ?: basePath
+            val probe = GitOps(basePath)
+            val resolvedRoot = probe.resolveWorktreeRoot() ?: basePath
             mainRepoRoot = resolvedRoot
+            // Anchor the long-lived instance at the WORKTREE ROOT rather than at
+            // basePath. `stageFiles` / `unstageFiles` pass PATHSPECS, which git
+            // resolves against the process working directory, while every path this
+            // plugin holds is repo-root relative — that is what `git status
+            // --porcelain` emits wherever it runs, and what the CLI's discard service
+            // resolves against. A project opened on a monorepo SUBDIRECTORY is where
+            // the two diverge; opened at the root (the normal case, linked worktrees
+            // included) the two are the same directory and this reuses the probe.
+            val gitOps = if (resolvedRoot == basePath) probe else GitOps(resolvedRoot)
             JmLogger.setLogDir(resolvedRoot)
             sb.appendLine("resolvedRoot=$resolvedRoot")
 

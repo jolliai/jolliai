@@ -97,6 +97,7 @@ import {
 	listAvailablePlans,
 } from "./core/PlanService.js";
 import { JolliMemoryBridge } from "./JolliMemoryBridge.js";
+import type { FileStatus } from "./Types.js";
 import type { FileItem } from "./providers/FilesTreeProvider.js";
 import { FilesTreeProvider } from "./providers/FilesTreeProvider.js";
 import {
@@ -369,6 +370,55 @@ const ALL_DECLARED_COMMANDS: ReadonlyArray<string> = [
 	"jollimemory.shareBranch",
 	"jollimemory.shareMemory",
 ];
+
+/**
+ * FALLBACK answer to "does discarding this row delete the file?", used only when
+ * the CLI cannot be asked. {@link previewDiscardDeletions} is the real one.
+ *
+ * Untracked and index-added have no HEAD version to come back from; a rename
+ * revert deletes the new path (the content returns under the original name); a
+ * copy revert deletes the copy. `C` was missing from both call sites below and
+ * from IntelliJ's rule, which told the user the file would stay put while the
+ * button removed it.
+ *
+ * It stays a fallback rather than the answer because `statusCode` is one
+ * collapsed letter and the collapse is lossy exactly where this matters: a
+ * staged deletion (`D `, which discard RESTORES) and the conflicts `DU` / `DD`
+ * (whose file discard REMOVES) all arrive as `"D"`, and `UU` / `UD` (restored)
+ * and `UA` (removed) all arrive as `"U"`. No letter-based rule can separate
+ * those, so the accurate answer comes from `FileDiscardService.previewDiscard`,
+ * which reads the real status and asks git whether HEAD has the path.
+ */
+function discardDeletesFile(statusCode: string | undefined): boolean {
+	return (
+		statusCode === "?" ||
+		statusCode === "A" ||
+		statusCode === "R" ||
+		statusCode === "C"
+	);
+}
+
+/**
+ * Asks the CLI which of [files] a discard would delete, returning a predicate
+ * for the prompt to word itself with.
+ *
+ * Degrades to {@link discardDeletesFile} if the query throws, so a bridge fault
+ * costs the wording accuracy this adds and nothing more — never the discard
+ * itself. Read-only, so it is safe to run before the user has confirmed.
+ */
+async function previewDiscardDeletions(
+	bridge: JolliMemoryBridge,
+	files: ReadonlyArray<FileStatus>,
+): Promise<(file: FileStatus) => boolean> {
+	try {
+		const deletions = await bridge.previewDiscardDeletions(files);
+		return (file) => deletions.has(file.relativePath);
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		log.warn("cmd", `discard preview failed, wording from status code: ${message}`);
+		return (file) => discardDeletesFile(file.statusCode);
+	}
+}
 
 /**
  * Registers a SidebarWebviewProvider in degraded mode (no data providers, no
@@ -2864,17 +2914,24 @@ export function activate(context: vscode.ExtensionContext): void {
 					return;
 				}
 
-				// Renamed files — at HEAD the content lives under the OLD path, so
-				// the HEAD side of the diff must use `originalPath`. Using the new
-				// path at HEAD reads a nonexistent blob and the editor fails to open.
-				// (Copies aren't handled here: `git status --porcelain` never emits a
-				// `C` status — copy detection only exists in git's diff path, which
-				// the Commits-panel handler uses, not the working-tree `status` call.)
-				if (statusCode === "R") {
+				// Renamed and copied files — at HEAD the content lives under the OLD
+				// path, so the HEAD side of the diff must use `originalPath`. Using
+				// the new path at HEAD reads a nonexistent blob and the editor fails
+				// to open.
+				//
+				// `C` belongs here. A previous version of this comment claimed
+				// `git status --porcelain` never emits one and that copy detection
+				// only exists in git's diff path — it is not true: `status.renames=copies`
+				// makes status emit `C  ORIG -> NEW` for a copy whose source was
+				// modified in the same change set, which is exactly the row
+				// FileDiscardService's copy case is built around. Left out of this
+				// branch, a copy fell through to the modified-file diff below and was
+				// rendered against an empty HEAD blob.
+				if (statusCode === "R" || statusCode === "C") {
 					const { originalPath } = item.fileStatus;
 					if (originalPath === undefined) {
-						// Rename without a recorded source path: no reliable HEAD blob
-						// to diff against, so just open the working-tree file.
+						// Rename / copy with no recorded source path: no reliable HEAD
+						// blob to diff against, so just open the working-tree file.
 						await vscode.window.showTextDocument(fileUri);
 						return;
 					}
@@ -2955,37 +3012,23 @@ export function activate(context: vscode.ExtensionContext): void {
 				if (!item?.fileStatus) {
 					return;
 				}
-				// Defense in depth: `bridge.discardFiles` dispatches on indexStatus +
-				// worktreeStatus. A pre-fix bug routed `branch:discardFile` through
-				// here with those columns dropped, causing every file to land in the
-				// `git restore --staged --worktree` branch and silently failing for
-				// untracked files (pathspec unknown to git) — observable as a stale
-				// activity-bar badge. Surface the malformed shape immediately so any
-				// future caller that strips the porcelain columns is loud-failed at
-				// the boundary, not silently miscategorised inside the bridge.
+				// No porcelain-column guard here any more, deliberately.
+				// `bridge.discardFiles` used to dispatch on indexStatus +
+				// worktreeStatus, so a caller that dropped them silently
+				// miscategorised every file and the guard loud-failed that shape at
+				// the boundary. The rule now lives in the CLI's FileDiscardService,
+				// which reads the authoritative status itself from the path alone —
+				// so those columns are no longer an input, and rejecting a caller for
+				// omitting them would refuse a request the service handles correctly.
 				//
-				// Porcelain v1 columns are always exactly one character (' ' or one
-				// of the M/A/D/R/C/?/! status letters); checking length === 1 catches
-				// both `undefined` and the empty-string fallback DOM readers fall
-				// through to when an attribute is missing.
-				if (
-					typeof item.fileStatus.indexStatus !== "string" ||
-					item.fileStatus.indexStatus.length !== 1 ||
-					typeof item.fileStatus.worktreeStatus !== "string" ||
-					item.fileStatus.worktreeStatus.length !== 1
-				) {
-					log.error(
-						"cmd",
-						`discardFileChanges rejected: fileStatus missing indexStatus / worktreeStatus for ${item.fileStatus.relativePath}`,
-					);
-					vscode.window.showErrorMessage(
-						`Jolli Memory: Cannot discard "${item.fileStatus.relativePath}" — internal error (missing git status columns). Please report this.`,
-					);
-					return;
-				}
-				const { relativePath, statusCode } = item.fileStatus;
-				const willDelete =
-					statusCode === "?" || statusCode === "A" || statusCode === "R";
+				// The prompt's verb comes from the CLI, which reads the real status
+				// and asks git whether HEAD has the path — `statusCode` is one
+				// collapsed letter and cannot separate a staged deletion from a
+				// conflict whose file this removes. Read-only, so asking before the
+				// user has confirmed changes nothing.
+				const { relativePath } = item.fileStatus;
+				const deletes = await previewDiscardDeletions(bridge, [item.fileStatus]);
+				const willDelete = deletes(item.fileStatus);
 				const verb = willDelete ? "Delete" : "Discard";
 				const detail = willDelete
 					? `This will permanently delete "${relativePath}" from disk. This cannot be undone.`
@@ -3038,12 +3081,8 @@ export function activate(context: vscode.ExtensionContext): void {
 					return;
 				}
 				const count = selectedFiles.length;
-				const deletedFiles = selectedFiles.filter(
-					(f) =>
-						f.statusCode === "?" ||
-						f.statusCode === "A" ||
-						f.statusCode === "R",
-				);
+				const deletes = await previewDiscardDeletions(bridge, selectedFiles);
+				const deletedFiles = selectedFiles.filter(deletes);
 				const maxPreview = 10;
 				const fileList = selectedFiles
 					.slice(0, maxPreview)
@@ -3053,7 +3092,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					count > maxPreview ? `\n...and ${count - maxPreview} more` : "";
 				const deleteWarning =
 					deletedFiles.length > 0
-						? `\n\n⚠ ${deletedFiles.length} file${deletedFiles.length !== 1 ? "s" : ""} will be permanently deleted from disk (new/untracked/renamed).`
+						? `\n\n⚠ ${deletedFiles.length} file${deletedFiles.length !== 1 ? "s" : ""} will be permanently deleted from disk (nothing committed to restore them from).`
 						: "";
 				const detail = `${fileList}${overflow}${deleteWarning}\n\nThis cannot be undone.`;
 				const choice = await vscode.window.showWarningMessage(

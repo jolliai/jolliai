@@ -96,12 +96,13 @@ export class FilesTreeProvider
 					? it.resourceUri.fsPath
 					: undefined;
 			const base = treeItemToSerialized(it, idHint);
-			// indexStatus / worktreeStatus are forwarded raw so the webview's
-			// discard path can rebuild a complete FileStatus on the host side.
-			// Routing only `statusCode` (which collapses both columns into one
-			// display letter) silently breaks bridge.discardFiles's dispatch —
-			// untracked / added / renamed files all need both columns to land
-			// in the right git-command branch.
+			// indexStatus / worktreeStatus are forwarded raw so the webview can
+			// rebuild a structurally complete FileStatus on the host side. They
+			// are no longer an INPUT to anything: bridge.discardFiles used to
+			// dispatch on them, and now hands the path to the CLI's
+			// FileDiscardService, which reads the authoritative status itself.
+			// Kept so the serialized shape still matches FileStatus; a new
+			// consumer should read the path, not these columns.
 			return {
 				...base,
 				gitStatus: it.fileStatus.statusCode,

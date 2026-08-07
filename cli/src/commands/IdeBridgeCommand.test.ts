@@ -151,6 +151,15 @@ vi.mock("../core/references/ReferenceService.js", () => ({
 	removeReference: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Mocked rather than run for real: FileDiscardService is exercised end-to-end
+// against real git in its own (slow-tier) suite. What the bridge action owes is
+// narrower — parse the request, call the service with the paths, hand back its
+// outcomes untouched — and that is what these cases pin.
+vi.mock("../core/FileDiscardService.js", () => ({
+	discardFiles: vi.fn().mockResolvedValue([]),
+	previewDiscard: vi.fn().mockResolvedValue([]),
+}));
+
 vi.mock("../core/Locks.js", () => ({
 	getWorkerBusyState: vi.fn().mockResolvedValue({ held: false, blocking: false }),
 	// Constants consumed by the acquire-lock / release-lock bridge cases. Kept
@@ -1302,6 +1311,110 @@ describe("runIdeBridgeAction — folder-heal-visible-markdown", () => {
 
 	it("rejects when kbRoot is missing", async () => {
 		await expect(runIdeBridgeAction("folder-heal-visible-markdown", "/r", {})).rejects.toThrow(/"kbRoot"/);
+	});
+});
+
+describe("runIdeBridgeAction — discard-files", () => {
+	beforeEach(async () => {
+		const { discardFiles } = await import("../core/FileDiscardService.js");
+		vi.mocked(discardFiles).mockReset();
+		vi.mocked(discardFiles).mockResolvedValue([]);
+	});
+
+	it("forwards the requested paths to the service", async () => {
+		const { discardFiles } = await import("../core/FileDiscardService.js");
+
+		await runIdeBridgeAction("discard-files", "/repo", { relativePaths: ["a.txt", "dir/b.txt"] });
+
+		expect(discardFiles).toHaveBeenCalledWith("/repo", ["a.txt", "dir/b.txt"]);
+	});
+
+	it("returns the service's outcomes verbatim", async () => {
+		// The adapter must not filter, reorder, or reshape. `FileDiscarder` treats
+		// "one outcome per requested path" as the readability check on the whole
+		// response — a short or long list becomes one failure per path — so
+		// dropping even a successful outcome here would fail the entire batch.
+		const { discardFiles } = await import("../core/FileDiscardService.js");
+		const outcomes = [
+			{ relativePath: "a.txt", ok: true, action: "restored" as const },
+			{ relativePath: "b.txt", ok: false, action: "deleted" as const, error: "EACCES" },
+			{
+				relativePath: "new.txt",
+				ok: true,
+				action: "rename-reverted" as const,
+				additionalPaths: ["old.txt"],
+			},
+		];
+		vi.mocked(discardFiles).mockResolvedValue(outcomes);
+
+		const result = await runIdeBridgeAction("discard-files", "/repo", {
+			relativePaths: ["a.txt", "b.txt", "new.txt"],
+		});
+
+		expect(result).toEqual({ outcomes });
+	});
+
+	it("rejects a malformed request rather than discarding nothing quietly", async () => {
+		// A caller that sent the wrong shape gets an error, not an empty batch it
+		// would read as "all done". The host surfaces the thrown bridge error.
+		const { discardFiles } = await import("../core/FileDiscardService.js");
+
+		await expect(runIdeBridgeAction("discard-files", "/repo", {})).rejects.toThrow(/relativePaths/);
+		await expect(runIdeBridgeAction("discard-files", "/repo", { relativePaths: ["a.txt", 7] })).rejects.toThrow(
+			/relativePaths/,
+		);
+		expect(discardFiles).not.toHaveBeenCalled();
+	});
+});
+
+describe("runIdeBridgeAction — discard-preview", () => {
+	beforeEach(async () => {
+		const { previewDiscard } = await import("../core/FileDiscardService.js");
+		vi.mocked(previewDiscard).mockReset();
+		vi.mocked(previewDiscard).mockResolvedValue([]);
+	});
+
+	it("forwards the requested paths to the service", async () => {
+		const { previewDiscard } = await import("../core/FileDiscardService.js");
+
+		await runIdeBridgeAction("discard-preview", "/repo", { relativePaths: ["a.txt", "dir/b.txt"] });
+
+		expect(previewDiscard).toHaveBeenCalledWith("/repo", ["a.txt", "dir/b.txt"]);
+	});
+
+	it("returns the service's previews verbatim", async () => {
+		// Same contract as `discard-files`: one entry per requested path, in order.
+		// `FileDiscarder.preview` treats a short list as unreadable and answers "no
+		// deletions", so reshaping here would silently soften a prompt.
+		const { previewDiscard } = await import("../core/FileDiscardService.js");
+		const previews = [
+			{ relativePath: "a.txt", deletesFile: false },
+			{ relativePath: "gone.txt", deletesFile: true },
+		];
+		vi.mocked(previewDiscard).mockResolvedValue(previews);
+
+		const result = await runIdeBridgeAction("discard-preview", "/repo", {
+			relativePaths: ["a.txt", "gone.txt"],
+		});
+
+		expect(result).toEqual({ previews });
+	});
+
+	it("rejects a malformed request", async () => {
+		const { previewDiscard } = await import("../core/FileDiscardService.js");
+
+		await expect(runIdeBridgeAction("discard-preview", "/repo", {})).rejects.toThrow(/relativePaths/);
+		expect(previewDiscard).not.toHaveBeenCalled();
+	});
+
+	it("does not discard anything", async () => {
+		// The whole point of the action: it runs BEFORE the user has confirmed.
+		const { discardFiles } = await import("../core/FileDiscardService.js");
+		vi.mocked(discardFiles).mockClear();
+
+		await runIdeBridgeAction("discard-preview", "/repo", { relativePaths: ["a.txt"] });
+
+		expect(discardFiles).not.toHaveBeenCalled();
 	});
 });
 

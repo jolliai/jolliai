@@ -481,11 +481,12 @@ export function buildNextMemoryScript(): string {
     }
     // Destructive Discard (↺) + the reversible ✕/+ exclude toggle, in that
     // order — the same [discard] [✕] cluster the sidebar's file rows show.
-    // Discard posts branch:discardFile carrying the raw porcelain columns
-    // (indexStatus / worktreeStatus) bridge.discardFiles dispatches on — the
-    // collapsed gitStatus letter alone silently breaks untracked / added /
-    // renamed discards. filePath is the ABSOLUTE path (item.id); relativePath
-    // rides on item.description — same field split the sidebar's row uses.
+    // Discard posts branch:discardFile; relativePath is what actually performs
+    // it, since the CLI's FileDiscardService resolves the real status from the
+    // path. The raw porcelain columns still ride along, but nothing reads them
+    // — the dispatch they existed for is gone. filePath is the ABSOLUTE path
+    // (item.id); relativePath rides on item.description — same field split the
+    // sidebar's row uses.
     row.appendChild(rowActions([
       rowIconButton('codicon-discard', 'Discard Changes', function() {
         vscode.postMessage({

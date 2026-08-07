@@ -59,8 +59,27 @@ object WorkingMemoryHtmlBuilder {
         val excluded: Boolean,
     )
 
-    /** A changed file that will be committed. */
-    data class WmFile(val name: String, val dir: String, val status: String)
+    /**
+     * A changed file that will be committed.
+     *
+     * [status] is the single display letter (M / A / U / D / R). [relativePath] and
+     * [statusCode] are what the row's Discard button sends back. The path is what
+     * performs the discard — the CLI service resolves the real status itself, so
+     * nothing here dispatches on a code. [statusCode] is carried for the
+     * CONFIRMATION WORDING only: `GitStatusCodes.discardDeletesFile` decides whether
+     * the prompt says "delete" or "discard changes to", and the display letter
+     * cannot answer that (it collapses untracked and copied into shapes the rule
+     * needs to tell apart). Both default to empty so a caller that only renders
+     * (tests, previews) needs no extra arguments — a row with no relativePath simply
+     * renders without the Discard action.
+     */
+    data class WmFile(
+        val name: String,
+        val dir: String,
+        val status: String,
+        val relativePath: String = "",
+        val statusCode: String = "",
+    )
 
     /** Everything the Working Memory view renders. */
     data class WorkingMemoryView(
@@ -126,6 +145,19 @@ object WorkingMemoryHtmlBuilder {
                     // data-excluded holds the CURRENT state; clicking flips it.
                     var nowExcluded = btn.getAttribute('data-excluded') !== 'true';
                     __wmToggle(btn.getAttribute('data-kind'), btn.getAttribute('data-key'), nowExcluded);
+                  });
+                });
+                // Discard posts the path (which is what performs it) plus the status
+                // code (which only words the host's confirmation prompt). This
+                // reports intent; the host owns the prompt and the CLI owns the rule.
+                document.querySelectorAll('.wm-discard').forEach(function (btn) {
+                  btn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    if (window.__jbQuery) window.__jbQuery(JSON.stringify({
+                      command: 'discardFile',
+                      relativePath: btn.getAttribute('data-rel'),
+                      statusCode: btn.getAttribute('data-status'),
+                    }));
                   });
                 });
               </script>
@@ -277,16 +309,37 @@ object WorkingMemoryHtmlBuilder {
         return panel("Context", v.context.size, rows)
     }
 
+    /**
+     * Discard button for a file row — the destructive counterpart to [exclBtn], and
+     * the same pairing VS Code's Next Memory panel shows ([discard] then the status
+     * letter). Carries the raw status code, not the display letter, because the host
+     * words its confirmation prompt from it (see [WmFile]).
+     */
+    private fun discardBtn(relativePath: String, statusCode: String): String {
+        val title = "Discard Changes"
+        return """<button class="wm-discard" data-rel="${esc(relativePath)}" """ +
+            """data-status="${esc(statusCode)}" title="$title" aria-label="$title">$DISCARD_ICON</button>"""
+    }
+
     private fun filesPanel(v: WorkingMemoryView): String {
         val rows = if (v.files.isEmpty()) {
             emptyRow("No changed files.")
         } else {
             v.files.joinToString("") { f ->
                 val dir = if (f.dir.isNotEmpty()) "<div class=\"wm-rsub\">${esc(f.dir)}</div>" else ""
+                // No relativePath means the caller built a display-only row (tests,
+                // previews); there is nothing to discard, so the action is omitted
+                // rather than rendered as a button that would post an empty path.
+                val discard = if (f.relativePath.isNotEmpty()) discardBtn(f.relativePath, f.statusCode) else ""
+                // Discard sits AFTER the status letter, at the row's right edge —
+                // where VS Code's Next Memory panel puts it (its `.row-actions`
+                // overlay is positioned past the `.gs` letter) and where this page's
+                // conversation / context rows already put their ✕.
                 """
                 <div class="wm-row">
                   <div class="wm-rmain"><div class="wm-rtitle wm-fname">${esc(f.name)}</div>$dir</div>
                   <span class="wm-gs wm-gs-${esc(f.status)}">${esc(f.status)}</span>
+                  $discard
                 </div>
                 """.trimIndent()
             }
@@ -316,6 +369,16 @@ object WorkingMemoryHtmlBuilder {
         "kimi" -> "Kimi Code"
         else -> source.replaceFirstChar { it.uppercase() }
     }
+
+    /**
+     * The sidebar's discard glyph (`/icons/discard.svg`) inlined with `currentColor`
+     * instead of its baked `#6E7681`, so it picks up the row's hover state and both
+     * themes. Same shape both surfaces show, so the two read as one action.
+     */
+    private const val DISCARD_ICON =
+        "<svg class=\"wm-discard-svg\" viewBox=\"0 0 16 16\" fill=\"currentColor\">" +
+            "<path d=\"M5.56 1.25a6.5 6.5 0 1 1-1.97 11.59.75.75 0 0 1 1-1.12 5 5 0 1 0 1.54-8.9L7.28 4H4.75" +
+            "a.75.75 0 0 1-.75-.75V.75a.75.75 0 0 1 1.5 0v1.3l.06-.05Z\"/></svg>"
 
     private const val DB_ICON =
         "<svg class=\"wm-db\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.3\">" +
@@ -372,11 +435,18 @@ object WorkingMemoryHtmlBuilder {
         .wm-gs { font-size: 11px; font-weight: 700; }
         .wm-gs-M { color: var(--ship-warn); }
         .wm-gs-A { color: var(--stat-add); }
+        .wm-gs-U { color: var(--stat-add); }
         .wm-gs-D { color: var(--stat-del); }
+        .wm-gs-R { color: var(--link-fg); }
+        .wm-gs-C { color: var(--link-fg); }
         .wm-fname { font-family: ui-monospace, monospace; }
         /* ── Remove / add toggle ── */
         .wm-excl { flex-shrink: 0; width: 20px; height: 20px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: none; border: none; border-radius: 4px; cursor: pointer; color: var(--text-secondary); font-size: 14px; font-weight: 600; line-height: 1; }
         .wm-excl:hover { background: var(--surface-hover); color: var(--text-primary); }
+        /* ── Discard (file rows) ── shares the toggle's hit box so the pair lines up */
+        .wm-discard { flex-shrink: 0; width: 20px; height: 20px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: none; border: none; border-radius: 4px; cursor: pointer; color: var(--text-secondary); line-height: 1; }
+        .wm-discard:hover { background: var(--surface-hover); color: var(--text-primary); }
+        .wm-discard-svg { width: 13px; height: 13px; display: block; }
         .wm-excluded { opacity: 0.6; }
         .wm-excluded .wm-rtitle { text-decoration: line-through; }
         .wm-excluded .wm-excl { color: var(--link-fg); }

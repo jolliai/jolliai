@@ -2120,6 +2120,39 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 			const { execGit } = await import("../core/GitOps.js");
 			return execGit(stringArrayField(request, "args"), cwd);
 		}
+		/**
+		 * Reverts working-tree changes for a set of repo-relative paths.
+		 *
+		 * Takes PATHS, never statuses. The service resolves each path against one
+		 * authoritative `git status` read, which is what stops a host from
+		 * collapsing porcelain columns lossily on the way in — the IntelliJ port
+		 * this replaced did exactly that and silently no-opped on every untracked
+		 * file — and from sending a status that went stale between painting the
+		 * row and the user clicking it.
+		 *
+		 * Returns one outcome per requested path, in the order given. A per-file
+		 * failure is REPORTED, not thrown: discarding four files where the third
+		 * fails must still tell the caller about the other three, and the caller
+		 * must surface `ok: false` rather than assume the click worked.
+		 */
+		case "discard-files": {
+			const { discardFiles } = await import("../core/FileDiscardService.js");
+			return { outcomes: await discardFiles(cwd, stringArrayField(request, "relativePaths")) };
+		}
+		/**
+		 * Read-only companion to `discard-files`: would discarding these paths
+		 * delete the files, or restore them in place?
+		 *
+		 * The JVM host cannot answer this itself — its rows come from
+		 * `ChangeListManager`, which has no conflicted state, and every producer
+		 * collapses git's two porcelain columns to one ambiguous character. VS
+		 * Code gets the same rule by importing the module. Returns one preview per
+		 * requested path, in the order given.
+		 */
+		case "discard-preview": {
+			const { previewDiscard } = await import("../core/FileDiscardService.js");
+			return { previews: await previewDiscard(cwd, stringArrayField(request, "relativePaths")) };
+		}
 		case "git-main-worktree-root": {
 			const { getProjectRootDir } = await import("../core/GitOps.js");
 			return { path: await getProjectRootDir(cwd) };

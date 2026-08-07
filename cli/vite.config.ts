@@ -136,6 +136,7 @@ const copyDashboardAssets = {
 const SLOW_TEST_FILES = [
 	"src/backfill/CommitTargetIndex.test.ts",
 	"src/core/BranchCommitLister.test.ts",
+	"src/core/FileDiscardService.test.ts",
 	"src/core/GitOps.stateRoot.realgit.test.ts",
 	"src/core/KBPathResolver.test.ts",
 	"src/core/Locks.test.ts",
@@ -153,6 +154,7 @@ const SLOW_TEST_FILES = [
 const SLOW_ONLY_SOURCES = [
 	"src/backfill/CommitTargetIndex.ts",
 	"src/core/BranchCommitLister.ts",
+	"src/core/FileDiscardService.ts",
 	"src/core/KBPathResolver.ts",
 	"src/core/Locks.ts",
 	"src/core/RepoProfile.ts",
