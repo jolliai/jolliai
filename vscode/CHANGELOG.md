@@ -1,6 +1,16 @@
 # Changelog
 
-<!-- Last synced commit: 89a5cb46 | 2026-07-31 -->
+<!-- Last synced commit: 878524ae | 2026-08-06 -->
+
+## 0.99.11
+
+- **Kimi Code CLI memories** — sessions from Kimi Code CLI (`~/.kimi-code`) are now discovered automatically and folded into your memories, complete with references and skill usage.
+- **Rendered Markdown previews for context snapshots** — clicking a plan, note, skills aggregate, or archived reference opens directly to a rendered Markdown preview with no intermediate raw-text tab, and the preview tab survives a window reload.
+- **Recompute token and cost figures** — memories missing usage data now show a recompute action on the token meter to re-derive tokens and cost from the archived conversations.
+- **Smarter AI agent toggles** — **Settings → AI Agents** only reinstalls Claude Stop / Gemini AfterAgent hooks when the toggles actually change, and clearly tells you when the repo is manually disabled.
+- **Squash memories keep working-area context** — plans, notes, and references you activate during a session are now archived into squash and merge memories, not left behind in the working area.
+- **Skills push to Jolli Space** — when you share a memory or branch, the skills it used are pushed as separate articles alongside plans, notes, and references.
+- Bug fixes.
 
 ## 0.99.10
 
