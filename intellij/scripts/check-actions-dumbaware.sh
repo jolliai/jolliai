@@ -51,8 +51,12 @@ strip_comments() {
 # no output. A gate that silently declines to look at a file is worse than no
 # gate, because the pass line still says OK. Both predicates below accept the
 # same three shapes for that reason; keep them in step.
+#
+# Both helpers use <<< to avoid SIGPIPE: grep -Eq will close the pipe after
+# matching, causing sed's write to fail with 141 if it tries to continue. Pass
+# the full output via a here-string instead so sed finishes before grep reads.
 declares_action() {
-    strip_comments "$1" | grep -Eq '(^|[,:])[[:space:]]*(AnAction|ToggleAction)[[:space:]]*\('
+    grep -Eq '(^|[,:])[[:space:]]*(AnAction|ToggleAction)[[:space:]]*\(' <<<"$(strip_comments "$1")"
 }
 
 # Is DumbAware in a SUPERTYPE position? Accepts the three shapes Kotlin produces:
@@ -60,7 +64,7 @@ declares_action() {
 #   `... ), DumbAware {`                 → same, after a multi-line constructor
 #   `    DumbAware {`                    → a supertype list broken across lines
 declares_dumbaware() {
-    strip_comments "$1" | grep -Eq '(^|[,:])[[:space:]]*DumbAware[[:space:]]*(\{|,|$)'
+    grep -Eq '(^|[,:])[[:space:]]*DumbAware[[:space:]]*(\{|,|$)' <<<"$(strip_comments "$1")"
 }
 
 if [ ! -d "$ACTIONS_DIR" ]; then

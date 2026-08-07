@@ -53,12 +53,20 @@ const { mockExecFileSync } = vi.hoisted(() => ({
 	mockExecFileSync: vi.fn(),
 }));
 
+const { mockReadManualDisableFlagSync } = vi.hoisted(() => ({
+	mockReadManualDisableFlagSync: vi.fn(() => false),
+}));
+
 // ─── vi.mock declarations ────────────────────────────────────────────────────
 
 // plans.lock passthrough — run the RMW body inline (no real lock file I/O on the
 // synthetic CWD). The lock contract is covered in cli/src/core/Locks.test.ts.
 vi.mock("./Locks.js", () => ({
 	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+}));
+
+vi.mock("./RepoProfile.js", () => ({
+	readManualDisableFlagSync: mockReadManualDisableFlagSync,
 }));
 
 vi.mock("./SessionTracker.js", () => ({

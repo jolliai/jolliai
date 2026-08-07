@@ -150,7 +150,7 @@ Three things about the five kinds are easy to get wrong:
   compatible extension, and heavier-than-necessary is the safe way to be wrong.
 
   **IntelliJ therefore has two listener lists, and which one a panel joins is a
-  real decision.** `addStatusListener` is fourteen subscribers wide and most of
+  real decision.** `addStatusListener` is fifteen subscribers wide and most of
   them answer a question `plans.json` cannot change — `CommitsPanel` re-runs
   `rev-parse` + `merge-base` + `log` + per-commit orphan reads, and
   `ActiveConversationsPanel` re-aggregates every transcript source's SQLite. The
@@ -168,13 +168,15 @@ Three things about the five kinds are easy to get wrong:
 
   **Both debounces escalate, never overwrite.** `DaemonNotificationClient` (for
   the push channel) and `JolliMemoryService.scheduleDebouncedRefresh` (for the
-  VFS fallback) each collapse a burst onto ONE timer, and each carries a sticky
-  `pendingStatusRecompute` that is OR-ed in and cleared only when the timer
-  fires. Last-writer-wins is the bug it looks like: an agent that commits at the
-  end of its turn emits `orphan-ref` when the summary lands and `working-context`
-  when the StopHook rewrites `plans.json` moments later, and demoting there drops
-  the status refresh with nothing polling to recover it — the just-created memory
-  simply never appears in the sidebar. Escalation is one-way on purpose.
+  VFS fallback) each collapse a burst onto ONE timer. Rather than carrying
+  separate sticky flags, both share the rule in [`RefreshEscalator`]
+  (intellij/src/main/kotlin/ai/jolli/jollimemory/core/RefreshEscalator.kt), an
+  `AtomicBoolean` that records the pending refresh type. Last-writer-wins is the
+  bug it looks like: an agent that commits at the end of its turn emits
+  `orphan-ref` when the summary lands and `working-context` when the StopHook
+  rewrites `plans.json` moments later, and demoting there drops the status
+  refresh with nothing polling to recover it — the just-created memory simply
+  never appears in the sidebar. Escalation is one-way on purpose.
 - **`claude-plans` is the one kind that carries a payload** (`params.names`), and
   the one place this channel is not purely "reload from source of truth".
   `~/.claude/plans/` is machine-global and holds every project's plans ever, so
@@ -313,9 +315,12 @@ Everything a commit summary can push alongside itself (plans, notes, external re
 
 - **Biome** is the formatter and linter (config: [`cli/biome.json`](cli/biome.json)). Tabs, 4-wide, 120 column limit. Rules of note: `noExplicitAny: error`, `noUnusedImports/Variables: error`, `useImportType: warn`. CI runs `biome check --error-on-warnings` — warnings fail.
 
-- **`intellij/` tests run in ONE JVM with JUnit 5 parallel class execution** (`intellij/src/test/resources/junit-platform.properties`, `maxParallelForks = 1`). That is only safe while no test mutates JVM-global state, so two rules are gated by `intellij/scripts/check-global-state.sh` (ratcheting baselines — they may only shrink): (1) production code never touches JVM globals (`System.out/err/in`, `System.getProperty/getenv`, bare `println`) outside `core/HookEnv.kt` — functions that need them take an `env: HookEnv = HookEnv()` parameter; (2) tests never call `System.setProperty/setOut/setErr/setIn`, `mockkStatic`, `mockkObject`, or `mockkConstructor` — build a fake env via `fakeHookEnv(...)` (test sources, `core/TestEnvs.kt`) and pass it in. Legacy offenders carry `@Isolated` until migrated; when you migrate one, drop the annotation and run `check-global-state.sh regen`.
+- **`intellij/` tests run in ONE JVM with JUnit 5 parallel class execution** (`intellij/src/test/resources/junit-platform.properties`, `maxParallelForks = 1`). That is only safe while no test mutates JVM-global state, so one rule is gated by `intellij/scripts/check-global-state.sh` (ratcheting baselines — they may only shrink): (1) production code never touches JVM globals (`System.out/err/in`, `System.getProperty/getenv`, bare `println`) outside `core/HookEnv.kt` — functions that need them take an `env: HookEnv = HookEnv()` parameter; (2) tests never call `System.setProperty/setOut/setErr/setIn`, `mockkStatic`, `mockkObject`, or `mockkConstructor` — build a fake env via `fakeHookEnv(...)` (test sources, `core/TestEnvs.kt`) and pass it in. Legacy offenders carry `@Isolated` until migrated; when you migrate one, drop the annotation and run `check-global-state.sh regen`.
 
-- **A second Gradle gate rides `test`: `intellij/scripts/check-no-direct-llm-http.sh`.** All LLM traffic routes through `cli/src/core/LlmClient.ts` — the plugin's own Kotlin LLM stack was deleted, and every model-backed action now spawns `jolli generate`. The gate greps `src/main/**/*.kt` for `api.anthropic.com|java.net.http` against a one-entry `ALLOWLIST` (`core/telemetry/TelemetryFlusher.kt`). Unlike §check-global-state it has **no baseline** — a hit means fix the code, not record it — and it is **bidirectional**: an allowlist entry that stops matching also fails, forcing the list to shrink in the PR that removed the last use. Note the script's own header comment says "three known … consumers" and is stale; trust the array. Do not reintroduce an LLM or HTTP client in Kotlin.
+- **Three Gradle gates ride `test`** (see `build.gradle.kts:527`): 
+  - `checkGlobalState` — enforces the JVM-global-state rule (see above).
+  - `checkNoDirectLlmHttp` (`intellij/scripts/check-no-direct-llm-http.sh`) — all LLM traffic routes through `cli/src/core/LlmClient.ts` — the plugin's own Kotlin LLM stack was deleted, and every model-backed action now spawns `jolli generate`. The gate greps `src/main/**/*.kt` for `api.anthropic.com|java.net.http` against a one-entry `ALLOWLIST` (`core/telemetry/TelemetryFlusher.kt`). Unlike checkGlobalState it has **no baseline** — a hit means fix the code, not record it — and it is **bidirectional**: an allowlist entry that stops matching also fails, forcing the list to shrink in the PR that removed the last use. Do not reintroduce an LLM or HTTP client in Kotlin.
+  - `checkActionsDumbAware` (`intellij/scripts/check-actions-dumbaware.sh`) — every action class in `actions/` must declare `DumbAware`. A new action without the marker will fail `./gradlew test` with a hard error and zero compiler warning, so do not assume the IDE will catch it.
 
 - **Use `toForwardSlash` for `\` → `/` path normalization** ([`cli/src/core/PathUtils.ts`](cli/src/core/PathUtils.ts)); never inline `path.replace(/\\/g, "/")` or `path.split(sep).join("/")`. Forward-slash form is the [`StorageProvider.listFiles`](cli/src/core/StorageProvider.ts) contract and the input every downstream regex / prefix consumer expects — one forgotten inline normalization on Windows silently broke webview transcripts in production. The helper does **only** `\` → `/`: if you also need lowercasing or trailing-slash strip, use `normalizePathForCompare` instead. Biome cannot lint this pattern, so the rule is enforced socially — inline reintroduction is a review-blocker. Exempt: code already inside a domain helper that wraps the conversion (`normalizePathForCompare`, `normalizePathForMatch`, `toFileUrl`, `validateRelPath`); tests asserting on a specific separator; regexes whose `\\/g` is matching a literal backslash for non-path reasons.
 

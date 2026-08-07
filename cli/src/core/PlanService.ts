@@ -29,6 +29,7 @@ import type { PlanEntry, PlanInfo, PlanReference } from "../Types.js";
 import { withPlansLock } from "./Locks.js";
 import { isPathInside } from "./PathUtils.js";
 import { getPlansDir } from "./PlanPaths.js";
+import { readManualDisableFlagSync } from "./RepoProfile.js";
 import {
 	loadAllSessions,
 	loadPlansRegistry,
@@ -306,13 +307,16 @@ export async function addPlanToRegistry(slug: string, cwd: string): Promise<void
  *
  * - If the slug is already tracked, this is a no-op (it preserves the existing
  *   entry's committed/guard state rather than resetting it).
- * - Otherwise delegates to `addPlanToRegistry()` to create a fresh
- *   uncommitted entry.
+ * - Otherwise creates a fresh uncommitted entry.
  *
  * Designed to be called from the plans-dir watcher's `onDidCreate` callback:
  * the OS only fires create events for files appearing after the watcher is
  * subscribed, so historical plans from other projects/sessions in
  * ~/.claude/plans/ never reach this function.
+ *
+ * The check and write run under plans.lock to prevent a race where a concurrent
+ * StopHook write lands between the check and the add (the lock would ensure the
+ * final state is a consistent read-modify-write, not a reset to uncommitted).
  */
 export async function registerNewPlan(slug: string, cwd: string): Promise<void> {
 	// The plans-dir watcher keeps firing while the project is manually
@@ -320,12 +324,35 @@ export async function registerNewPlan(slug: string, cwd: string): Promise<void> 
 	// would write plans.json + plans.lock in the project dir. The plan is not
 	// lost — re-enabling and saving it again (or the StopHook once hooks are
 	// reinstalled) registers it.
-	if (isManuallyDisabled()) return;
-	const registry = await loadPlansRegistry(cwd);
-	if (slug in registry.plans) {
+	//
+	// isManuallyDisabled() is in-process only (inert in CLI/hook processes);
+	// readManualDisableFlagSync gates the durable on-disk flag that persists
+	// across process boundaries (esp. the long-lived ide-bridge-serve daemon).
+	if (isManuallyDisabled() || readManualDisableFlagSync(cwd)) return;
+
+	const planFile = join(getPlansDir(), `${slug}.md`);
+	if (!existsSync(planFile)) {
 		return;
 	}
-	await addPlanToRegistry(slug, cwd);
+
+	// Check and register under the lock to avoid a race where a concurrent StopHook
+	// write lands between the check and the add.
+	await withPlansLock(cwd, async () => {
+		const registry = await loadPlansRegistry(cwd);
+		if (slug in registry.plans) {
+			return;
+		}
+		const now = new Date().toISOString();
+		const entry: PlanEntry = {
+			slug,
+			title: extractTitle(planFile),
+			sourcePath: planFile,
+			addedAt: now,
+			updatedAt: now,
+			commitHash: null,
+		};
+		await savePlansRegistry({ ...registry, plans: { ...registry.plans, [slug]: entry } }, cwd);
+	});
 }
 
 /**
