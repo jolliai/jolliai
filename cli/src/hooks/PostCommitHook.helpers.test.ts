@@ -234,6 +234,10 @@ vi.mock("../core/KimiSessionDiscoverer.js", () => ({
 	isKimiInstalled: vi.fn().mockResolvedValue(false),
 }));
 
+vi.mock("../core/KimiDiscovery.js", () => ({
+	discoverKimiConversations: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../core/PlanProgressEvaluator.js", () => ({
 	evaluatePlanProgress: mockEvaluatePlanProgress,
 }));

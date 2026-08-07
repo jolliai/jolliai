@@ -28,6 +28,7 @@
 import type { SkillSource, TranscriptSource } from "../../Types.js";
 import { type SkillScanResult, scanClaudeSkillLines } from "./ClaudeSkillScanner.js";
 import { scanCodexSkillLines } from "./CodexSkillScanner.js";
+import { scanKimiSkillLines } from "./KimiSkillScanner.js";
 
 /** Scans already-read transcript lines for skill invocations. */
 export type SkillLineScanner = (lines: ReadonlyArray<string>, fromLine: number) => SkillScanResult;
@@ -37,6 +38,9 @@ const SCANNERS: Partial<Record<TranscriptSource, { source: SkillSource; scan: Sk
 	// Codex is HEURISTIC — it has no skill tool, only shell commands that read a
 	// SKILL.md. Every entry it produces carries `detection: "heuristic"`.
 	codex: { source: "codex", scan: scanCodexSkillLines },
+	// Kimi ships a real `Skill` tool, so its invocations are OBSERVED (no
+	// `detection` marker) — its wire.jsonl carries a `tool.call` named "Skill".
+	kimi: { source: "kimi", scan: scanKimiSkillLines },
 };
 
 /** The scanner for `source`, or undefined when that source has no skill extraction. */

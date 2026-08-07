@@ -290,6 +290,14 @@ export interface SidebarWebviewDeps {
 	 */
 	codexDiscovery?: { discover(): void };
 	/**
+	 * Polling-path Kimi artifact discovery. Same contract as {@link codexDiscovery}:
+	 * invoked fire-and-forget on every Active Conversations refresh so references and
+	 * skills from a Kimi session surface within ~60s without any hook. `discover()`
+	 * resolves cwd itself and MUST never throw/reject. Optional so existing tests can
+	 * omit it.
+	 */
+	kimiDiscovery?: { discover(): void };
+	/**
 	 * Polling-path OpenCode skill discovery. OpenCode has no hook, so this tick is
 	 * the only thing that can surface its skills WHILE the work is happening —
 	 * waiting for the commit would leave working memory empty for the whole session.
@@ -2181,6 +2189,11 @@ export class SidebarWebviewProvider
 		// Same contract as Codex above: fire-and-forget, per-cwd single-flight inside
 		// the impl, non-throwing by construction, and guarded anyway so a regressed
 		// reader can never take down the conversation list this method exists to render.
+		try {
+			this.deps.kimiDiscovery?.discover();
+		} catch {
+			// ignore — background discovery must never break the refresh.
+		}
 		try {
 			this.deps.openCodeSkillDiscovery?.discover();
 		} catch {

@@ -1,0 +1,158 @@
+/**
+ * McpBusinessNormalize — the shared MCP business-payload normalizer.
+ *
+ * Extracted verbatim from ClaudeEnvelopeParser so that any agent whose MCP calls
+ * use the Claude-style `mcp__<server>__<tool>` naming (Claude itself, and Kimi
+ * Code CLI, which uses the identical scheme) can normalise a tool result WITHOUT
+ * a divergent second copy of the context-normalizer machinery.
+ *
+ * The MCP payload for a given tool is identical regardless of which agent fired
+ * it, so the normalisation is genuinely source-agnostic: the only source-specific
+ * concern is the transcript ENVELOPE (how a line encodes "a call + its result"),
+ * which stays in each `TranscriptEnvelopeParser`.
+ *
+ * `normalizeMcpBusiness` is the single entry point:
+ *   - identity (returns `parsedPayload` unchanged) when the def has no
+ *     context-normalizer — the common case, matching the old `identity` hook;
+ *   - the registered context-normalizer otherwise (Slack / zoom-doc / confluence /
+ *     monday / context7 / jollimemory), which may return `null` to VOID the
+ *     reference.
+ *
+ * `CONTEXT_NORMALIZER_IDS` is exported too: the Claude parser reads it to decide
+ * whether to retain a tool_use's `input` (only context sources need it), and it
+ * is the membership gate a caller uses to tell a context source from an
+ * identity one.
+ */
+
+import { isObject } from "./guards.js";
+import type { SourceDefinition } from "./SourceDefinition.js";
+import { normalizeConfluence } from "./sources/ConfluenceNormalize.js";
+import { normalizeContext7 } from "./sources/Context7Normalize.js";
+import { normalizeJolliMemory } from "./sources/JolliMemoryNormalize.js";
+import { normalizeMonday, readItemIds } from "./sources/MondayNormalize.js";
+import { normalizeSlackThread } from "./sources/SlackNormalize.js";
+import { normalizeZoomDoc } from "./sources/ZoomDocNormalize.js";
+import type { ExtractOptions } from "./TranscriptEnvelopeParser.js";
+
+/** `{channel_id, message_ts}` off a Slack tool_use's `input`, or undefined if malformed. */
+function readSlackToolInput(input: unknown): { channelId: string; messageTs: string } | undefined {
+	/* v8 ignore start -- defensive: real `slack_read_thread` tool_use input always carries both string fields; guarded for totality against a malformed/future MCP shape. */
+	if (!isObject(input)) return undefined;
+	const channelId = (input as { channel_id?: unknown }).channel_id;
+	const messageTs = (input as { message_ts?: unknown }).message_ts;
+	if (typeof channelId !== "string" || typeof messageTs !== "string") return undefined;
+	/* v8 ignore stop */
+	return { channelId, messageTs };
+}
+
+/** `{fileId}` off a zoom-doc tool_use's `input`, or undefined if malformed. */
+function readZoomDocToolInput(input: unknown): { fileId: string } | undefined {
+	/* v8 ignore start -- defensive: real `hub_get_file_content` tool_use input always carries fileId; guarded for totality against a malformed/future MCP shape. */
+	if (!isObject(input)) return undefined;
+	const fileId = (input as { fileId?: unknown }).fileId;
+	if (typeof fileId !== "string" || fileId.length === 0) return undefined;
+	/* v8 ignore stop */
+	return { fileId };
+}
+
+/**
+ * Parse-scoped context a context-aware normalizer may read beyond the tool
+ * result payload: the pasted-permalink map and the caller's `ExtractOptions`
+ * (workspace url, etc.).
+ */
+interface ContextNormalizeEnv {
+	readonly permalinks: Map<string, string>;
+	readonly opts: ExtractOptions;
+	/**
+	 * The MCP tool name that produced this call. A source matching a SINGLE tool can
+	 * ignore it (every source here does today). A source matching several tools of one
+	 * server cannot always recover which one fired from the arguments alone — two tools
+	 * may take no arguments at all, making their inputs byte-identical — so the name
+	 * has to be threaded rather than inferred.
+	 */
+	readonly toolName: string;
+}
+
+/**
+ * Closed registry of context-aware normalizers, keyed by source id. A source
+ * belongs here IFF the default `identity` path cannot produce its canonical
+ * shape — either because that shape needs out-of-payload context (the
+ * originating tool_use `input`, and/or parse-scoped state like the permalink
+ * map / workspace url), OR because it requires a payload-internal shape
+ * coercion the DSL cannot express (e.g. Confluence's ADF-object → string body
+ * flattening). Every other MCP source's `normalize` is `identity` and never
+ * appears here.
+ *
+ * Returning null voids the reference. Adding a fourth such source is one entry
+ * here, not a new `def.id === …` branch in the caller.
+ */
+const CONTEXT_NORMALIZERS: Record<
+	string,
+	(payload: unknown, toolInput: unknown, env: ContextNormalizeEnv) => object | null
+> = {
+	slack: (payload, toolInput, env) => {
+		const slackInput = readSlackToolInput(toolInput);
+		/* v8 ignore start -- defensive: paired with a real slack_read_thread tool_use, input is always well-formed. */
+		if (slackInput === undefined) return null;
+		/* v8 ignore stop */
+		const { channelId, messageTs } = slackInput;
+		const url =
+			env.permalinks.get(`${channelId}:${messageTs}`) ??
+			(env.opts.slackWorkspaceUrl !== undefined
+				? `${env.opts.slackWorkspaceUrl}/archives/${channelId}/p${messageTs.replace(".", "")}`
+				: undefined);
+		return normalizeSlackThread(payload, { channelId, url });
+	},
+	"zoom-doc": (payload, toolInput) => {
+		const zoomInput = readZoomDocToolInput(toolInput);
+		/* v8 ignore start -- defensive: paired with a real hub_get_file_content tool_use, input is always well-formed. */
+		if (zoomInput === undefined) return null;
+		/* v8 ignore stop */
+		return normalizeZoomDoc(payload, { fileId: zoomInput.fileId });
+	},
+	confluence: (payload) => normalizeConfluence(payload),
+	monday: (payload, toolInput) => normalizeMonday(payload, { itemIds: readItemIds(toolInput) }),
+	context7: (_payload, toolInput) => normalizeContext7(toolInput),
+	// The only normalizer that reads `env.toolName`: this source matches three tools,
+	// and a bare `recall()` arrives with the same empty input as the tools it must NOT
+	// capture, so the name is the only thing that can distinguish them.
+	jollimemory: (_payload, toolInput, env) => normalizeJolliMemory(toolInput, env.toolName),
+};
+
+/**
+ * Own-key ids of {@link CONTEXT_NORMALIZERS}. Membership is checked through this
+ * set (own enumerable keys only) so a prototype-chain id (`toString`,
+ * `constructor`) can never resolve a normalizer — the same closed-registry
+ * boundary as SourceEngine's `TRANSFORM_NAMES`.
+ */
+export const CONTEXT_NORMALIZER_IDS: ReadonlySet<string> = new Set(Object.keys(CONTEXT_NORMALIZERS));
+
+/**
+ * Parse-scoped context passed to {@link normalizeMcpBusiness}. Identical to
+ * {@link ContextNormalizeEnv} minus `toolName`, which the helper threads in
+ * from its own argument.
+ */
+export interface McpNormalizeEnv {
+	readonly permalinks: Map<string, string>;
+	readonly opts: ExtractOptions;
+}
+
+/**
+ * Normalize one MCP tool result's business payload to its canonical shape.
+ *
+ * Identity (returns `parsedPayload`) when `def` has no registered
+ * context-normalizer; runs the context-normalizer otherwise. Returns `null`
+ * only when a context-normalizer voided the reference — an identity result is
+ * never null.
+ */
+export function normalizeMcpBusiness(
+	def: SourceDefinition,
+	toolName: string,
+	toolInput: unknown,
+	parsedPayload: unknown,
+	env: McpNormalizeEnv,
+): unknown | null {
+	const contextNormalize = CONTEXT_NORMALIZER_IDS.has(def.id) ? CONTEXT_NORMALIZERS[def.id] : undefined;
+	if (contextNormalize === undefined) return parsedPayload;
+	return contextNormalize(parsedPayload, toolInput, { ...env, toolName });
+}

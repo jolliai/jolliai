@@ -282,6 +282,7 @@ const SKILL_SOURCE_LABELS: Readonly<Record<SkillSource, string>> = {
 	opencode: "OpenCode",
 	codex: "Codex",
 	cursor: "Cursor",
+	kimi: "Kimi",
 };
 
 /**

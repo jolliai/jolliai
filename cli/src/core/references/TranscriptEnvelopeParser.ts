@@ -20,6 +20,7 @@
 import type { TranscriptSource } from "../../Types.js";
 import { claudeEnvelopeParser } from "./ClaudeEnvelopeParser.js";
 import { codexEnvelopeParser } from "./CodexEnvelopeParser.js";
+import { kimiEnvelopeParser } from "./KimiEnvelopeParser.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
 
 /**
@@ -111,6 +112,8 @@ export function getEnvelopeParser(source: TranscriptSource = "claude"): Transcri
 	switch (source) {
 		case "codex":
 			return codexEnvelopeParser;
+		case "kimi":
+			return kimiEnvelopeParser;
 		default:
 			return claudeEnvelopeParser;
 	}

@@ -21,6 +21,7 @@ import {
 } from "../../cli/src/core/SkillsAggregateMarkdown.js";
 import { discoverOpenCodeSkills } from "../../cli/src/core/skills/OpenCodeSkillDiscovery.js";
 import { discoverCodexConversations } from "../../cli/src/core/CodexDiscovery.js";
+import { discoverKimiConversations } from "../../cli/src/core/KimiDiscovery.js";
 import { catchUpTranscriptDiscovery } from "../../cli/src/core/DiscoveryCatchUp.js";
 import type { FolderStorage, ForceRegenerateResult } from "../../cli/src/core/FolderStorage.js";
 import { getDefaultBranch } from "../../cli/src/core/GitOps.js";
@@ -1472,6 +1473,16 @@ export function activate(context: vscode.ExtensionContext): void {
 			discover: () => {
 				const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 				if (cwd) void discoverCodexConversations(cwd);
+			},
+		},
+		// Polling-path Kimi artifact discovery, ridden on the same 60s tick. Kimi has
+		// no hook either, so without this its references/skills only appear post-commit.
+		// discoverKimiConversations never rejects (per-cwd single-flight + internal
+		// error swallowing), so this is a safe fire-and-forget.
+		kimiDiscovery: {
+			discover: () => {
+				const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+				if (cwd) void discoverKimiConversations(cwd);
 			},
 		},
 		// Polling-path OpenCode skill discovery, ridden on the same 60s tick. OpenCode

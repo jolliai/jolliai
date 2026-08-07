@@ -63,6 +63,7 @@ import { readDevinTranscript } from "../core/DevinTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
+import { discoverKimiConversations } from "../core/KimiDiscovery.js";
 import { discoverKimiSessions, isKimiInstalled } from "../core/KimiSessionDiscoverer.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import {
@@ -676,6 +677,34 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 				}
 			} catch (error: unknown) {
 				log.warn("Codex artifact discovery failed (non-fatal): %s", (error as Error).message);
+			}
+
+			// Kimi artifact discovery — same rationale, drivers, and guards as the
+			// Codex block above (Kimi has no lifecycle hook either, self-checks
+			// manual-disable / `kimiEnabled` / installed, and never rejects). Bounded
+			// by the same deadline because it sits on the same user-waited path, and
+			// double-guarded for the identical reason: the try/catch survives a
+			// synchronous throw, the rejection handler covers a late failure after the
+			// deadline already won the race.
+			try {
+				const finished = await Promise.race([
+					discoverKimiConversations(cwd).then(
+						() => true,
+						(error: unknown) => {
+							log.warn("Kimi artifact discovery failed (non-fatal): %s", (error as Error).message);
+							return true;
+						},
+					),
+					deadline(CODEX_DISCOVERY_DEADLINE_MS),
+				]);
+				if (!finished) {
+					log.info(
+						"Kimi artifact discovery still running after %d ms — continuing the drain without it",
+						CODEX_DISCOVERY_DEADLINE_MS,
+					);
+				}
+			} catch (error: unknown) {
+				log.warn("Kimi artifact discovery failed (non-fatal): %s", (error as Error).message);
 			}
 
 			while (processedCount < MAX_ENTRIES_PER_RUN) {

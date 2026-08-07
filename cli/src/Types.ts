@@ -1069,7 +1069,7 @@ export interface ReferenceCommitRef {
  * are absent because they have no skill concept on disk at all — there is
  * nothing to capture, as opposed to something we have not got round to.
  */
-export type SkillSource = "claude" | "opencode" | "codex" | "cursor";
+export type SkillSource = "claude" | "opencode" | "codex" | "cursor" | "kimi";
 
 /**
  * How the agent entered the skill.

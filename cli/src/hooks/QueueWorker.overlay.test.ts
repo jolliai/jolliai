@@ -75,6 +75,10 @@ vi.mock("../core/KimiSessionDiscoverer.js", () => ({
 	isKimiInstalled: vi.fn().mockResolvedValue(false),
 }));
 
+vi.mock("../core/KimiDiscovery.js", () => ({
+	discoverKimiConversations: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
 	discoverOpenCodeSessions: vi.fn().mockResolvedValue([]),
 	isOpenCodeInstalled: vi.fn().mockResolvedValue(false),

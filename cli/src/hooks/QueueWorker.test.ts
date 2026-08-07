@@ -348,6 +348,10 @@ vi.mock("../core/CodexDiscovery.js", () => ({
 	discoverCodexConversations: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("../core/KimiDiscovery.js", () => ({
+	discoverKimiConversations: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
 	discoverOpenCodeSessions: vi.fn().mockResolvedValue([]),
 	isOpenCodeInstalled: vi.fn().mockResolvedValue(false),
