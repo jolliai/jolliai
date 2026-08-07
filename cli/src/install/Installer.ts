@@ -42,7 +42,7 @@ import { isDevinInstalled, isDevinPresent, scanDevinSessions } from "../core/Dev
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
 import { getProjectRootDir, isInsideGitRepo, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
 import { resolveMemoryBankState } from "../core/KBPathResolver.js";
-import { isKimiInstalled } from "../core/KimiSessionDiscoverer.js";
+import { discoverKimiSessions, isKimiInstalled } from "../core/KimiSessionDiscoverer.js";
 import { acquireRepoHooksLock, type StrictLockHandle, withRuntimeRegistryLock } from "../core/Locks.js";
 import { applyPluginInitLocalAgentTool, pluginBootstrapHost } from "../core/localagent/PluginDefaults.js";
 import { localAgentToolLabel } from "../core/localagent/ToolMeta.js";
@@ -1290,6 +1290,15 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
 		}
 		antigravityScanError = scan.error;
+	}
+
+	// Discover Kimi Code CLI sessions on-demand (not stored in sessions.json).
+	// Plain array like Codex — Kimi is file-based, so no scan-error channel.
+	if (config.kimiEnabled !== false && kimiDetected) {
+		const kimiSessions = await discoverKimiSessions(projectDir);
+		if (kimiSessions.length > 0) {
+			allEnabledSessions = [...allEnabledSessions, ...kimiSessions];
+		}
 	}
 
 	// Compute per-source session counts for integration status rows

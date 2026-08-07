@@ -313,6 +313,7 @@ object WorkingMemoryHtmlBuilder {
         "opencode" -> "OpenCode"
         "cline" -> "Cline (VS Code)"
         "cline-cli" -> "Cline CLI"
+        "kimi" -> "Kimi Code"
         else -> source.replaceFirstChar { it.uppercase() }
     }
 

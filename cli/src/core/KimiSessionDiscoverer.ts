@@ -41,8 +41,18 @@ const log = createLogger("KimiDiscoverer");
 /** Sessions older than 48 hours are considered stale (matches Claude/Codex staleness). */
 const SESSION_STALE_MS = 48 * 60 * 60 * 1000;
 
-/** Base directory for Kimi Code CLI data. */
+/** Base directory for Kimi Code CLI data (default, before the KIMI_CODE_HOME override). */
 const KIMI_DIR_NAME = ".kimi-code";
+
+/**
+ * Kimi Code CLI's data root: `$KIMI_CODE_HOME` when set, else `~/.kimi-code`.
+ * Mirrors the CLI's own "Data locations" contract, so a user who relocates their
+ * Kimi home is still discovered (and gets the MCP server written to the right file).
+ * Exported so `HostRegistrars` resolves `<root>/mcp.json` from the same source.
+ */
+export function kimiCodeHome(): string {
+	return process.env.KIMI_CODE_HOME || join(homedir(), KIMI_DIR_NAME);
+}
 
 /**
  * Field names on state.json that carry the working directory. `workDir` is the
@@ -60,7 +70,7 @@ const CWD_STATE_FIELDS = ["workDir", "cwd", "workingDirectory", "workspaceRoot",
  * @returns Array of matching sessions with source="kimi"
  */
 export async function discoverKimiSessions(projectDir: string): Promise<ReadonlyArray<SessionInfo>> {
-	const sessionsDir = join(homedir(), KIMI_DIR_NAME, "sessions");
+	const sessionsDir = join(kimiCodeHome(), "sessions");
 	const resolvedProject = resolve(projectDir);
 	const sessions: SessionInfo[] = [];
 
@@ -99,7 +109,7 @@ export async function discoverKimiSessions(projectDir: string): Promise<Readonly
  * Used by the discovery gate / status tree to detect Kimi presence.
  */
 export async function isKimiInstalled(): Promise<boolean> {
-	const kimiDir = join(homedir(), KIMI_DIR_NAME);
+	const kimiDir = kimiCodeHome();
 	try {
 		const dirStat = await stat(kimiDir);
 		return dirStat.isDirectory();

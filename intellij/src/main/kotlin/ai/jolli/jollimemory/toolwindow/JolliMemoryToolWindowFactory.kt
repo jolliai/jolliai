@@ -1503,6 +1503,13 @@ private class StatusIndicatorLabel(
                 sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Antigravity:</b> detected</p>")
             }
         }
+        if (status.kimiDetected == true) {
+            if (status.kimiEnabled == false) {
+                sb.append("<p><span style='color:#D29922'>\u25CF</span> <b>Kimi Code:</b> detected but disabled</p>")
+            } else {
+                sb.append("<p><span style='color:#3FB950'>\u25CF</span> <b>Kimi Code:</b> detected</p>")
+            }
+        }
 
         // Error
         val err = service.lastError

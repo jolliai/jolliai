@@ -141,6 +141,26 @@ describe("scanKimiSkillLines", () => {
 		expect(uses[0].invocations).toEqual([{ at: iso(1_700_000_000_000), ok: true }]);
 	});
 
+	it("holds the cursor before an in-flight Skill call (toolCallId, result not yet landed)", () => {
+		// A Skill call whose tool.result has not appeared yet is reported optimistically
+		// (ok:true) BUT the cursor is rewound to before it, so the next pass re-reads the
+		// pair and the store's fold can correct `ok` if the result later says isError.
+		const lines = [toolCall("c1", "Skill", { skill: "in-flight" }, 1_700_000_000_100)];
+		const { uses, lastLine } = scanKimiSkillLines(lines, 0);
+		expect(uses).toHaveLength(1);
+		expect(uses[0].invocations[0].ok).toBe(true);
+		expect(lastLine).toBe(0); // held before the call (0-based line 0), not advanced to EOF (1)
+	});
+
+	it("does not rewind once a later call in the window is fully paired", () => {
+		// Only genuinely unpaired calls hold the cursor; a paired call advances normally.
+		const lines = [
+			toolCall("c1", "Skill", { skill: "done" }, 1_700_000_000_000),
+			toolResult("c1", { output: "ok" }, 1_700_000_000_100),
+		];
+		expect(scanKimiSkillLines(lines, 0).lastLine).toBe(2);
+	});
+
 	it("uses an empty `at` when the Skill call carries no numeric time", () => {
 		const noTime = JSON.stringify({
 			type: "context.append_loop_event",

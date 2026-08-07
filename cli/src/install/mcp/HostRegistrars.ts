@@ -13,6 +13,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { clineMcpSettingsPath, getClineStorageDirs, getInstalledClineStorageDirs } from "../../core/ClineDetector.js";
+import { kimiCodeHome } from "../../core/KimiSessionDiscoverer.js";
 import { getGlobalConfigDir } from "../../core/SessionTracker.js";
 import { getVscodeUserDataDir } from "../../core/VscodeWorkspaceLocator.js";
 import { createLogger } from "../../Logger.js";
@@ -330,8 +331,8 @@ const antigravityRegistrar: McpHostRegistrar = {
 const kimiRegistrar: McpHostRegistrar = {
 	host: "kimi",
 	scope: "global",
-	register: () => upsertJsonMcpServer(join(homedir(), ".kimi-code", "mcp.json"), { ...jolliEntry() }),
-	remove: () => removeJsonMcpServer(join(homedir(), ".kimi-code", "mcp.json")),
+	register: () => upsertJsonMcpServer(join(kimiCodeHome(), "mcp.json"), { ...jolliEntry() }),
+	remove: () => removeJsonMcpServer(join(kimiCodeHome(), "mcp.json")),
 	gitExcludePaths: () => [],
 };
 

@@ -282,6 +282,7 @@ internal class SourceBadge private constructor(label: String, private val badgeC
 			"copilot" -> "Copilot"
 			"copilot-chat" -> "Copilot Chat"
 			"opencode" -> "OpenCode"
+			"kimi" -> "Kimi Code"
 			else -> name.replaceFirstChar { it.uppercase() }
 		}
 

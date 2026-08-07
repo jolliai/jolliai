@@ -215,14 +215,18 @@ const RETRY_DELAY_MS = 2000;
 const WORKER_LOCK_REFRESH_INTERVAL_MS = 60_000;
 
 /**
- * How long the drain waits for Codex artifact discovery before proceeding without it.
+ * How long the drain waits for hookless-source artifact discovery (Codex + Kimi)
+ * before proceeding without it. This is a SHARED, TOTAL budget: all such sources
+ * run concurrently and race the pair against this one deadline, so adding another
+ * hookless source does not extend the user-waited path (they used to be awaited
+ * serially, each with its own copy of this deadline).
  *
  * Sized against the post-commit watcher's 15 s agent-session ceiling: small enough
  * that a slow first pass cannot swallow the window every summary milestone has to
  * fit in, large enough for the cursor-bounded steady-state pass (a tail read plus a
  * reference extraction) to finish well inside it.
  */
-const CODEX_DISCOVERY_DEADLINE_MS = 3000;
+const ARTIFACT_DISCOVERY_DEADLINE_MS = 3000;
 
 // ─── Shared helpers for plans & notes re-association ─────────────────────────
 
@@ -658,53 +662,35 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			// worker whose only voice is this log must not lose its one report of a broken
 			// contract. The handler resolves `true` either way: the flag means "did not time
 			// out", and the failure has already been reported on its own line.
+			//
+			// Codex and Kimi are BOTH hookless sources with no lifecycle hook, each
+			// self-checking manual-disable / `<source>Enabled` / installed and each
+			// contracted never to reject. They run CONCURRENTLY and race the pair against
+			// ONE shared deadline, so the total time on this user-waited path stays bounded
+			// no matter how many hookless sources exist — previously each was awaited in its
+			// own serial `Promise.race`, so two 3 s deadlines could consume 6 s (and a third
+			// source 9 s) of a 15 s window that every summary milestone also has to fit in.
+			// Per-source rejection handlers keep one source's failure from voiding the other.
 			try {
 				const finished = await Promise.race([
-					discoverCodexConversations(cwd).then(
-						() => true,
-						(error: unknown) => {
+					Promise.all([
+						discoverCodexConversations(cwd).then(undefined, (error: unknown) => {
 							log.warn("Codex artifact discovery failed (non-fatal): %s", (error as Error).message);
-							return true;
-						},
-					),
-					deadline(CODEX_DISCOVERY_DEADLINE_MS),
-				]);
-				if (!finished) {
-					log.info(
-						"Codex artifact discovery still running after %d ms — continuing the drain without it",
-						CODEX_DISCOVERY_DEADLINE_MS,
-					);
-				}
-			} catch (error: unknown) {
-				log.warn("Codex artifact discovery failed (non-fatal): %s", (error as Error).message);
-			}
-
-			// Kimi artifact discovery — same rationale, drivers, and guards as the
-			// Codex block above (Kimi has no lifecycle hook either, self-checks
-			// manual-disable / `kimiEnabled` / installed, and never rejects). Bounded
-			// by the same deadline because it sits on the same user-waited path, and
-			// double-guarded for the identical reason: the try/catch survives a
-			// synchronous throw, the rejection handler covers a late failure after the
-			// deadline already won the race.
-			try {
-				const finished = await Promise.race([
-					discoverKimiConversations(cwd).then(
-						() => true,
-						(error: unknown) => {
+						}),
+						discoverKimiConversations(cwd).then(undefined, (error: unknown) => {
 							log.warn("Kimi artifact discovery failed (non-fatal): %s", (error as Error).message);
-							return true;
-						},
-					),
-					deadline(CODEX_DISCOVERY_DEADLINE_MS),
+						}),
+					]).then(() => true),
+					deadline(ARTIFACT_DISCOVERY_DEADLINE_MS),
 				]);
 				if (!finished) {
 					log.info(
-						"Kimi artifact discovery still running after %d ms — continuing the drain without it",
-						CODEX_DISCOVERY_DEADLINE_MS,
+						"Artifact discovery still running after %d ms — continuing the drain without it",
+						ARTIFACT_DISCOVERY_DEADLINE_MS,
 					);
 				}
 			} catch (error: unknown) {
-				log.warn("Kimi artifact discovery failed (non-fatal): %s", (error as Error).message);
+				log.warn("Artifact discovery failed (non-fatal): %s", (error as Error).message);
 			}
 
 			while (processedCount < MAX_ENTRIES_PER_RUN) {

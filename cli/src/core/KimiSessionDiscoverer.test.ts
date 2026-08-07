@@ -18,7 +18,7 @@ vi.mock("node:os", async (importOriginal) => {
 	return { ...original, homedir: () => mockHomeDir() };
 });
 
-import { cwdFromState, discoverKimiSessions, isKimiInstalled } from "./KimiSessionDiscoverer.js";
+import { cwdFromState, discoverKimiSessions, isKimiInstalled, kimiCodeHome } from "./KimiSessionDiscoverer.js";
 
 let homeDir: string;
 
@@ -181,5 +181,35 @@ describe("cwdFromState", () => {
 		expect(cwdFromState({ title: "no dir" })).toBeNull();
 		expect(cwdFromState({ workDir: "" })).toBeNull();
 		expect(cwdFromState(null)).toBeNull();
+	});
+});
+
+describe("kimiCodeHome", () => {
+	const saved = process.env.KIMI_CODE_HOME;
+	afterEach(() => {
+		if (saved === undefined) delete process.env.KIMI_CODE_HOME;
+		else process.env.KIMI_CODE_HOME = saved;
+	});
+
+	it("defaults to ~/.kimi-code when KIMI_CODE_HOME is unset", () => {
+		delete process.env.KIMI_CODE_HOME;
+		expect(kimiCodeHome()).toBe(join(homeDir, ".kimi-code"));
+	});
+
+	it("honours KIMI_CODE_HOME when set", () => {
+		process.env.KIMI_CODE_HOME = join(homeDir, "relocated-kimi");
+		expect(kimiCodeHome()).toBe(join(homeDir, "relocated-kimi"));
+	});
+
+	it("discovers sessions under KIMI_CODE_HOME rather than ~/.kimi-code", async () => {
+		const repo = await mkdtemp(join(realTmpdir(), "kimi-repo-"));
+		const altHome = join(homeDir, "relocated-kimi");
+		process.env.KIMI_CODE_HOME = altHome;
+		const sessionDir = join(altHome, "sessions", "wd_x", "s1");
+		await mkdir(join(sessionDir, "agents", "main"), { recursive: true });
+		await writeFile(join(sessionDir, "state.json"), JSON.stringify({ workDir: repo }), "utf-8");
+		await writeFile(join(sessionDir, "agents", "main", "wire.jsonl"), '{"type":"metadata"}\n', "utf-8");
+		expect(await discoverKimiSessions(repo)).toHaveLength(1);
+		await rm(repo, { recursive: true, force: true });
 	});
 });

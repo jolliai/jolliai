@@ -21,9 +21,13 @@
  *
  * Only `name === "Skill"` calls matter — built-in tools (Read/Bash/Glob) and MCP
  * tools (`mcp__…`) are ignored. Kimi's events are cleaner than Claude's (no
- * three-record body triple, no slash-command entry path), so this scanner stays
- * simple: one pending entry per `tool.call`, its `ok` upgraded when the paired
- * `tool.result` lands, then grouped one {@link SkillUse} per skill.
+ * three-record body triple, no slash-command entry path): one pending entry per
+ * `tool.call`, its `ok` upgraded when the paired `tool.result` lands, then grouped
+ * one {@link SkillUse} per skill. When the scan window closes on a call whose
+ * result has not landed yet, the entry is still reported (optimistic `ok: true`)
+ * but the cursor is rewound to just before it — exactly as `ClaudeSkillScanner`
+ * and `KimiEnvelopeParser` do — so the next pass re-reads the pair and the store's
+ * fold corrects `ok` if the result ultimately says `isError`.
  */
 
 import { createLogger } from "../../Logger.js";
@@ -40,6 +44,11 @@ const SKILL_TOOL_NAME = "Skill";
 interface PendingSkill {
 	readonly skill: string;
 	readonly at: string;
+	/** 1-based line the tool.call was read from — the cursor rewinds here if the result never lands. */
+	readonly line: number;
+	/** Its paired tool.result has been seen. Until then a window-closing entry is a fragment
+	 *  carrying an optimistic `ok: true`, so the cursor is held before it for re-scan. */
+	sawResult: boolean;
 	ok: boolean;
 }
 
@@ -81,10 +90,17 @@ export function scanKimiSkillLines(lines: ReadonlyArray<string>, fromLine: numbe
 			const skill = typeof args?.skill === "string" && args.skill.length > 0 ? args.skill : undefined;
 			const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
 			if (skill === undefined) continue;
-			const entry: PendingSkill = { skill, at: isoFromTime(record.time), ok: true };
+			const entry: PendingSkill = {
+				skill,
+				at: isoFromTime(record.time),
+				line: i + 1,
+				sawResult: false,
+				ok: true,
+			};
 			entries.push(entry);
 			// Only a call carrying a toolCallId can be paired with its result; without
-			// one the entry stays optimistically ok (no way to learn otherwise).
+			// one the entry stays optimistically ok (no way to learn otherwise) and never
+			// holds the cursor.
 			if (toolCallId !== undefined) pending.set(toolCallId, entry);
 			continue;
 		}
@@ -96,12 +112,24 @@ export function scanKimiSkillLines(lines: ReadonlyArray<string>, fromLine: numbe
 			if (entry === undefined) continue;
 			const result = isRecord(event.result) ? event.result : undefined;
 			entry.ok = result?.isError !== true;
+			entry.sawResult = true;
 		}
 	}
 
+	// Window closed mid-pair: a Skill call whose tool.result has not landed yet carries an
+	// optimistic `ok: true` (failure is only knowable from the result). Hold the cursor just
+	// before the earliest such call so the next pass re-reads the whole pair and the store's
+	// fold upgrades the invocation in place — mirrors ClaudeSkillScanner and the safeCursor in
+	// KimiEnvelopeParser. Entries with no toolCallId can never be paired, so they never pin it.
+	let firstUnresolvedLine = Number.POSITIVE_INFINITY;
+	for (const entry of pending.values()) {
+		if (!entry.sawResult && entry.line < firstUnresolvedLine) firstUnresolvedLine = entry.line;
+	}
+	const cursorLine = firstUnresolvedLine === Number.POSITIVE_INFINITY ? lastLine : firstUnresolvedLine - 1;
+
 	const uses = assemble(entries);
-	if (uses.length > 0) log.debug("Scanned %d Kimi skill(s) from lines %d..%d", uses.length, fromLine + 1, lastLine);
-	return { uses, lastLine: Math.max(fromLine, lastLine) };
+	if (uses.length > 0) log.debug("Scanned %d Kimi skill(s) from lines %d..%d", uses.length, fromLine + 1, cursorLine);
+	return { uses, lastLine: Math.max(fromLine, cursorLine) };
 }
 
 /** Group entries by skill id into one {@link SkillUse} each, invocations newest-first. */
