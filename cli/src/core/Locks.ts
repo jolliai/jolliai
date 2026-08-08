@@ -72,6 +72,7 @@ import {
 	releaseIfOwned,
 	tryAcquireOnce,
 } from "./LockPrimitives.js";
+import { holdsOrphanWriteLock, runHoldingOrphanWriteLock } from "./OrphanWriteReentrancy.js";
 
 // Re-export so existing callers (Locks.test.ts, QueueWorker.ts, etc.) that
 // imported it from this module keep compiling.
@@ -127,9 +128,29 @@ export const CONFIG_LOCK_FILE = "config.lock";
 export const REPO_HOOKS_LOCK_FILE = "repo-hooks.lock";
 export const RUNTIME_REGISTRY_LOCK_FILE = "runtime-registry.lock";
 export const PUSH_CONTROL_LOCK_FILE = "push-control.lock";
+export const REPO_REGISTRY_LOCK_FILE = "repo-registry.lock";
 
 /** Default wait budget for `acquireOrphanWriteLock` (background callers). */
 export const DEFAULT_ORPHAN_WRITE_TIMEOUT_MS = 1000;
+
+/**
+ * Thrown when `orphan-write.lock` could not be acquired inside the budget.
+ *
+ * A distinct class rather than a bare `Error` because callers need to tell
+ * contention from a real fault and the only other signal is message text.
+ * `IngestPipeline` classifies a page write's failure into a benign
+ * PAGE_WRITE_CONFLICT (retried next drain) or a PAGE_WRITE_ERROR ("a real I/O
+ * fault, NOT lock contention"), and the compile commands exit cleanly with
+ * "try again shortly" on the former; before this existed, a lock timeout took
+ * the error branch in both — a stack trace out of `jolli compile`, and a
+ * contention event permanently recorded as an I/O failure in telemetry.
+ */
+export class OrphanWriteBusyError extends Error {
+	constructor(label: string, timeoutMs: number) {
+		super(`${label}: could not acquire orphan-write.lock within ${timeoutMs}ms`);
+		this.name = "OrphanWriteBusyError";
+	}
+}
 
 /** Default poll interval while waiting for `orphan-write.lock`. */
 export const DEFAULT_ORPHAN_WRITE_POLL_MS = 50;
@@ -166,6 +187,7 @@ export const DEFAULT_STATE_LOCK_TIMEOUT_MS = 5000;
 export const DEFAULT_REPO_HOOKS_LOCK_TIMEOUT_MS = 5000;
 export const DEFAULT_RUNTIME_REGISTRY_LOCK_TIMEOUT_MS = 5000;
 export const DEFAULT_PUSH_CONTROL_LOCK_TIMEOUT_MS = 5000;
+export const DEFAULT_REPO_REGISTRY_LOCK_TIMEOUT_MS = 5000;
 
 /** Optional knobs for `acquireOrphanWriteLock`. */
 export interface OrphanWriteLockOpts {
@@ -373,6 +395,52 @@ export async function acquireOrphanWriteLock(cwd?: string, opts: OrphanWriteLock
 	const pollMs = opts.pollMs ?? DEFAULT_ORPHAN_WRITE_POLL_MS;
 	const dir = await ensureSharedLockDir(cwd);
 	return acquireWithPoll(join(dir, ORPHAN_WRITE_LOCK_FILE), { timeoutMs, pollMs });
+}
+
+/**
+ * Runs `fn` under `orphan-write.lock`. The D6 invariant needs every orphan
+ * write path to hold this lock around its actual write — the cutover CAS
+ * holds ALL sources' locks while it verifies the frozen tips, so a write
+ * under the lock either lands before the tip check (and gets imported by the
+ * retry) or observes the fence. A new orphan write path that takes neither this
+ * nor `withRequiredOrphanWriteLock` is a review blocker.
+ *
+ * **Every current production write path uses the must-land wrapper instead**, so
+ * this one is the general form rather than a path anything reaches today: the
+ * topic stores, the processed set and the two ide-bridge write actions all moved
+ * to `withRequiredOrphanWriteLock` once it became clear that none of them has the
+ * "we will be re-invoked" property the 1 s budget assumes.
+ *
+ * Re-entrant within one async call chain — see `OrphanWriteReentrancy.ts`.
+ * Now that the topic stores lock their own writes, they are routinely called
+ * from inside a caller that already holds the lock (QueueWorker's ingest
+ * `writeGuard`), and a plain file lock would deadlock against itself there.
+ *
+ * **`opts.timeoutMs` is not a tuning knob, it is the caller's failure policy.**
+ * The 1 s default is the background budget: "defer on contention, we will be
+ * re-invoked". A caller whose write MUST land has no such re-invocation and
+ * needs the must-land budget instead — pass
+ * `SummaryStore.ORPHAN_WRITE_REQUIRED_TIMEOUT_MS`, or better, use
+ * `withRequiredOrphanWriteLock`, which is that policy with a label attached.
+ * Re-entrancy does NOT excuse getting this wrong: the store-level helpers here
+ * are also reached with no guard above them (a bridge write, a standalone
+ * `saveTopicIndex`), and there the budget is the whole story.
+ */
+export async function withOrphanWriteLock<T>(
+	cwd: string | undefined,
+	fn: () => Promise<T>,
+	opts: { readonly timeoutMs?: number; readonly label?: string } = {},
+): Promise<T> {
+	if (holdsOrphanWriteLock(cwd)) return await fn();
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_ORPHAN_WRITE_TIMEOUT_MS;
+	if (!(await acquireOrphanWriteLock(cwd, { timeoutMs }))) {
+		throw new OrphanWriteBusyError(opts.label ?? "withOrphanWriteLock", timeoutMs);
+	}
+	try {
+		return await runHoldingOrphanWriteLock(cwd, fn);
+	} finally {
+		await releaseOrphanWriteLock(cwd);
+	}
 }
 
 /**
@@ -714,5 +782,44 @@ export async function withPushControlLock<T>(
 		return { acquired: true, value: await fn() };
 	} finally {
 		await releaseIfOwned(lockPath, PUSH_CONTROL_LOCK_FILE);
+	}
+}
+
+/** Optional knobs for {@link withRepoRegistryLock}. */
+export interface RepoRegistryLockOpts extends OrphanWriteLockOpts {
+	/** Overrides the machine-global config dir (tests point this at a tempdir). */
+	readonly globalDir?: string;
+}
+
+/**
+ * Serialises the read-modify-write of `dashboard-repos.json` (RepoRegistry)
+ * across concurrently-registering repos/processes on one machine — a plain
+ * read → modify → whole-array overwrite would otherwise let a later writer's
+ * stale read silently drop an earlier writer's new/updated entry, and this
+ * file is the sole durable source used to rebuild the dashboard database.
+ *
+ * Best-effort, like `withPlansLock`/`withProfileLock`: the guarded section is
+ * a sub-millisecond JSON read+write, so a peer holder clears almost
+ * instantly; on a timeout `fn` still runs unlocked rather than dropping a
+ * registration outright.
+ */
+export async function withRepoRegistryLock<T>(fn: () => Promise<T>, opts: RepoRegistryLockOpts = {}): Promise<T> {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_REPO_REGISTRY_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_PROFILE_LOCK_POLL_MS;
+	const dir = opts.globalDir ?? join(homedir(), ".jolli", "jollimemory");
+	await mkdir(dir, { recursive: true });
+	const lockPath = join(dir, REPO_REGISTRY_LOCK_FILE);
+	const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+	if (!acquired) {
+		log.warn(
+			"withRepoRegistryLock: could not acquire %s within %d ms — proceeding best-effort",
+			REPO_REGISTRY_LOCK_FILE,
+			timeoutMs,
+		);
+	}
+	try {
+		return await fn();
+	} finally {
+		if (acquired) await releaseIfOwned(lockPath, REPO_REGISTRY_LOCK_FILE);
 	}
 }

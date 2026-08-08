@@ -108,6 +108,7 @@ import {
 	loadCursorForTranscript,
 	loadPlansRegistry,
 	markAiSourceSeen,
+	peekAllGitOperations,
 	saveCursor,
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
@@ -149,6 +150,8 @@ import { generateTranscriptId } from "../core/TranscriptId.js";
 import { getParserForSource } from "../core/TranscriptParser.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
+import { opportunisticSnapshot } from "../dashboard/Backup.js";
+import { recordCommitsFromWorker } from "../dashboard/ProducerHooks.js";
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { deriveSourceTag } from "../install/DistPathResolver.js";
 import { createLogger, errMsg, getJolliMemoryDir, setLogDir, setLogLevel } from "../Logger.js";
@@ -189,6 +192,7 @@ import {
 	type SourceId,
 	type StoredTranscript,
 	type SummaryErrorKind,
+	type ToolCallCount,
 	type TopicSummary,
 	type TranscriptReadResult,
 	type TranscriptSource,
@@ -430,6 +434,40 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 	if (await readManualDisableFlag(cwd)) {
 		log.info("Queue worker skipped — repository manually disabled");
 		return;
+	}
+	// The Node-floor gate for cut-over repos (plan G.4): once this repo's
+	// writes route to SQLite, a runtime without flag-free node:sqlite cannot
+	// process the queue — and letting the drain run would DELETE entries
+	// fire-and-forget while their summaries have nowhere to land. Leave the
+	// queue intact and exit loudly; entries drain when a capable runtime runs.
+	// Never gates un-fenced repos: their orphan path needs no database.
+	{
+		const { resolveCutoverRoute } = await import("../dashboard/CutoverRouter.js");
+		const route = await resolveCutoverRoute(cwd);
+		if (route.state === "blocked") {
+			log.error(
+				"Queue worker held — repo is fenced/cut over but the database is unavailable (%s). Entries stay queued.",
+				route.reason,
+			);
+			// The post-commit watcher tails capture-progress for a terminal event
+			// and treats an ABSENT capture lock as "worker still coming" — without
+			// these events every interactive commit in this state blocks git for
+			// the full feedback timeout (90 s TTY / 15 s agent). Pure fs appends,
+			// so they need none of the database this gate just found missing.
+			try {
+				// `peek`, not `dequeue`: the latter PRUNES entries older than 7 days
+				// as a side effect of reading, which is exactly the set this gate
+				// most needs to keep — a runtime that has been below the floor for a
+				// week is how the queue got that deep. Signalling the watcher must
+				// not cost the summaries this branch just promised to preserve.
+				for (const op of await peekAllGitOperations(cwd)) {
+					if ("commitHash" in op) emitCaptureProgress(cwd, op.commitHash, "failed", { terminal: true });
+				}
+			} catch {
+				// Queue unreadable — nothing to signal; the watcher's timeout still applies.
+			}
+			return;
+		}
 	}
 	const drainStart = Date.now();
 
@@ -770,6 +808,16 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			// and a slow/offline push just leaves the entries for the next trigger.
 			if (newlyGeneratedHashes.size > 0) {
 				triggerPushForNewSummaries(cwd, [...newlyGeneratedHashes]);
+				// Dashboard direct write (JOLLI-2069): project the drained commits +
+				// current worktree state into the local stats DB. Awaited — a few git
+				// reads and one short SQLite transaction, trivial next to the LLM work
+				// this drain just did — and internally guarded: it skips on runtimes
+				// without flag-free node:sqlite and never throws.
+				await recordCommitsFromWorker(cwd, newlyGeneratedHashes);
+				// Daily database snapshot rides the same post-COMMIT moment (the
+				// plan's "no daemon" schedule). Internally gated to once a day,
+				// floor-guarded, and never throws — a failure is a log line.
+				await opportunisticSnapshot();
 			}
 			/* v8 ignore start -- catch block only reached if dequeueAllGitOperations throws unexpectedly */
 		} catch (error: unknown) {
@@ -1910,6 +1958,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		conversationTokens,
 		conversationTokenBreakdown,
 		conversationModels,
+		consumedTranscripts,
 	} = await loadSessionTranscripts(cwd, config, op.createdAt);
 
 	// Step 5: Get git diff and stats (moved before guard to enable diff-only summaries)
@@ -1955,6 +2004,9 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// (Summarizer Rule 5 can infer topics from diff alone when transcript is empty)
 	if (totalEntries === 0 && diffStats.filesChanged === 0) {
 		log.info("No new transcript entries and no file changes. Skipping summary generation.");
+		// A deliberate skip still consumes what was read (nothing is lost —
+		// there were no entries), so the cursors advance here too.
+		await safeCommitConsumedTranscripts(consumedTranscripts, cwd, op.commitHash);
 		emitCaptureProgress(cwd, op.commitHash, "skipped", { terminal: true });
 		return;
 	}
@@ -2281,6 +2333,13 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 			: {}),
 		...(planProgressArtifacts.length > 0 ? { planProgress: planProgressArtifacts } : {}),
 	});
+	// Cursors advance only now that the write landed — a crash or LLM error
+	// above replays these transcript slices instead of silently losing them.
+	//
+	// Fire-and-forget via `safeCommitConsumedTranscripts`, which is where the
+	// reasoning now lives: nothing between the store and the terminal `stored`
+	// event may throw.
+	await safeCommitConsumedTranscripts(consumedTranscripts, cwd, commitInfo.hash);
 	log.info(
 		"Summary stored successfully for commit %s (%s, %d plans, %d notes, %d references)",
 		commitInfo.hash.substring(0, 8),
@@ -3195,6 +3254,7 @@ async function handleAmendPipeline(
 		conversationTokens,
 		conversationTokenBreakdown,
 		conversationModels,
+		consumedTranscripts,
 	} = await loadSessionTranscripts(cwd, amendConfig, beforeTimestamp);
 
 	// Get git diff and stats. diffOverride (Scenario 1) provides oldHash->newHash
@@ -3296,6 +3356,7 @@ async function handleAmendPipeline(
 			"pre-LLM trivial delta",
 			isSummaryError(oldSummary),
 		);
+		await safeCommitConsumedTranscripts(consumedTranscripts, cwd, commitInfo.hash);
 		return;
 	}
 
@@ -3307,6 +3368,7 @@ async function handleAmendPipeline(
 	// "no old summary -> fresh leaf" branch below, which persists the transcript artifact.
 	if (!oldSummary && !diffFetchFailed && totalEntries === 0 && isTrivialAmendDelta(deltaDiffStats)) {
 		log.info("Amend with no old summary AND no sessions AND trivial delta -- skipping");
+		await safeCommitConsumedTranscripts(consumedTranscripts, cwd, commitInfo.hash);
 		return;
 	}
 
@@ -3316,6 +3378,7 @@ async function handleAmendPipeline(
 	// to summarise. Skip rather than persist a misleading summary.
 	if (!oldSummary && diffFetchFailed) {
 		log.info("Amend with no old summary AND diff fetch failed -- skipping (no meaningful summary possible)");
+		await safeCommitConsumedTranscripts(consumedTranscripts, cwd, commitInfo.hash);
 		return;
 	}
 
@@ -3480,6 +3543,7 @@ async function handleAmendPipeline(
 			deltaLlmFailed ? "post-LLM error fallback" : "post-LLM empty topics",
 			deltaLlmFailed || isSummaryError(oldSummary),
 		);
+		await safeCommitConsumedTranscripts(consumedTranscripts, cwd, commitInfo.hash);
 		return;
 	}
 
@@ -3607,6 +3671,8 @@ async function handleAmendPipeline(
 				? { transcript: transcriptArtifact }
 				: undefined,
 		);
+		// Cursors only advance now that the write landed (write contract).
+		await safeCommitConsumedTranscripts(consumedTranscripts, cwd, commitInfo.hash);
 		// Associate (above) runs BEFORE reassociateMetadata so a revived guard's
 		// commitHash has already moved to the new hash — reassociate is then a no-op
 		// for it (its old-short-hash guard no longer matches), avoiding a double migration.
@@ -3683,6 +3749,9 @@ async function handleAmendPipeline(
 			: undefined,
 	);
 
+	// Cursors only advance now that the write landed (write contract).
+	await safeCommitConsumedTranscripts(consumedTranscripts, cwd, commitInfo.hash);
+
 	log.info(
 		"Amend with no old summary -> stored as fresh leaf for %s (%s)",
 		commitInfo.hash.substring(0, 8),
@@ -3714,6 +3783,14 @@ async function loadSessionTranscripts(
 	conversationTokens: number;
 	conversationTokenBreakdown: ConversationTokenBreakdown;
 	conversationModels: ModelTokenUsage[];
+	/**
+	 * What this read consumed — cursor positions from readAllTranscripts plus
+	 * the slices they walked past, INCLUDING excluded conversations' (discard
+	 * semantics need their cursors to advance). The pipeline commits the bundle
+	 * via {@link commitConsumedTranscripts} after its summary write lands or at
+	 * a deliberate skip, never on a thrown error.
+	 */
+	consumedTranscripts: ConsumedTranscripts;
 }> {
 	const trackedSessions = filterSessionsByEnabledIntegrations(await loadAllSessions(cwd), config);
 
@@ -3867,16 +3944,14 @@ async function loadSessionTranscripts(
 	// comparison — original content + original role + original timestamp.
 	const sessionTranscripts = (await applyOverlaysToSessions(raw.sessionTranscripts, cwd)) as SessionTranscript[];
 
-	// Cursor-aware overlay GC. Runs AFTER apply so the slice's overlay rules
-	// have already taken effect in `sessionTranscripts`; pruning here only
-	// drops rules that were just consumed (their `(role, content, timestamp)`
-	// identity matches an entry in `raw.sessionTranscripts`, the cursor-
-	// trimmed pre-apply slice). Cursor advance already happened inside
-	// readAllTranscripts and is decoupled from any downstream success — so
-	// the rules dropped here will never apply again no matter what the
-	// pipeline does next. GC is fire-and-forget; per-session errors only
-	// warn-log.
-	await pruneConsumedOverlayRules(raw.sessionTranscripts, cwd);
+	// Cursor-aware overlay GC is NOT run here. It drops the rules that produced
+	// the edit we just folded in, so it is only safe once the cursor that walked
+	// past those entries is committed — and the cursor is now DEFERRED to after
+	// the summary write. Pruning here would unlink the overlay while the cursor
+	// stayed put, so a failed LLM call would replay the same slice with the
+	// user's deletion gone: their removed message enters the stored summary and
+	// the persisted transcript. Both halves therefore land together, in
+	// `commitConsumedTranscripts`.
 	let totalEntries = 0;
 	let humanEntries = 0;
 	for (const s of sessionTranscripts) {
@@ -3969,6 +4044,10 @@ async function loadSessionTranscripts(
 		conversationTokens,
 		conversationTokenBreakdown,
 		conversationModels,
+		// Slices come from `rawAll`, not `raw`: an unchecked conversation's cursor
+		// advances (discard), so its overlay rules are just as spent as a kept
+		// one's — filtering them out here would leak rules that can never fire.
+		consumedTranscripts: { cursors: rawAll.pendingCursors, slices: rawAll.sessionTranscripts },
 	};
 }
 
@@ -3986,6 +4065,17 @@ export interface SessionTokenBucket {
 	tokens: number;
 	breakdown: { input: number; output: number; cached: number };
 	byModel: Map<string, ModelTokenUsage>;
+	/**
+	 * Tool calls seen in this conversation's slices, keyed `kind:name` — the same
+	 * identity `session_tool_use` is keyed on, so two slices calling one tool sum
+	 * instead of racing.
+	 *
+	 * Undefined (not empty) while no slice has REPORTED tool calls, which is how
+	 * "this source cannot see them" survives all the way to disk: an empty map
+	 * would serialize as `toolUse: []`, the positive claim that the session called
+	 * nothing. A source whose parser omits `parseToolUse` never creates it.
+	 */
+	byTool?: Map<string, ToolCallCount>;
 }
 
 /**
@@ -4031,6 +4121,10 @@ function attachPerSessionUsage(
 			...st,
 			usage: { ...bucket.breakdown },
 			...(bucket.byModel.size > 0 && { usageByModel: [...bucket.byModel.values()] }),
+			// Rides the same overlay gate as the usage above: a conversation whose
+			// entries were pruned had its slices excluded from the summary, so its
+			// tool calls are not this commit's either.
+			...(bucket.byTool && { toolUse: [...bucket.byTool.values()] }),
 		};
 	});
 }
@@ -4044,6 +4138,80 @@ function attachPerSessionUsage(
  *   Each commit's queue entry has a createdAt that acts as the time boundary.
  * @returns Session transcripts with entries and total entry count
  */
+/**
+ * Everything the pipeline consumed from the transcripts and must commit as ONE
+ * decision: the deferred cursor positions, and the pre-apply slices those
+ * cursors walked past.
+ *
+ * They are bundled rather than passed as two arguments because they are two
+ * halves of one fact ("this slice is spent") and committing only one of them is
+ * a data-loss bug in either direction — an advanced cursor with live overlay
+ * rules re-applies an edit to entries nobody will read again (harmless), while a
+ * pruned overlay under a cursor that stayed put resurrects content the user
+ * deleted (not harmless, and what shipped).
+ *
+ * Exported for the same reason as {@link SessionTokenBucket}: it names a
+ * `__test__` signature that `PostCommitHook._testHelpers` re-exports, and TS4023
+ * rejects a public declaration whose type is module-private.
+ */
+export interface ConsumedTranscripts {
+	readonly cursors: ReadonlyArray<Parameters<typeof saveCursor>[0]>;
+	/**
+	 * Cursor-trimmed, PRE-overlay-apply slices — the identity basis the overlay
+	 * GC matches on. Every session read, including the conversations the user
+	 * unchecked: their cursors advance too (unchecked ⇒ discard), so their rules
+	 * are equally spent.
+	 */
+	readonly slices: ReadonlyArray<SessionTranscript>;
+}
+
+/**
+ * Commits the consumed transcript slices — the write-contract's "游标推进必须
+ * 发生在 COMMIT 之后". Called after a summary write lands or at a
+ * deliberate skip; NEVER from an error path, so a failed pipeline replays
+ * the same transcript slices instead of silently losing them (the failure
+ * mode changes from invisible loss to visible duplication, which for a
+ * memory system is the right trade).
+ *
+ * Cursors first, then the overlay GC: the GC is fire-and-forget (per-session
+ * errors only warn-log), and a rule left behind under an advanced cursor is
+ * inert, whereas the reverse loses the user's edit.
+ */
+async function commitConsumedTranscripts(consumed: ConsumedTranscripts, cwd: string): Promise<void> {
+	for (const cursor of consumed.cursors) await saveCursor(cursor, cwd);
+	await pruneConsumedOverlayRules(consumed.slices, cwd);
+}
+
+/**
+ * {@link commitConsumedTranscripts} as every pipeline tail needs it: a cursor
+ * write that fails must not take the work that follows it down.
+ *
+ * `saveCursor` throws for reasons that have nothing to do with the memory — a
+ * sessions-lock timeout behind a sibling worktree's worker or the VS Code host,
+ * Windows EBUSY on the atomic rename, ENOSPC, an unparseable `cursors.json` — and
+ * every caller sits between a LANDED write (or a deliberate skip) and something
+ * that must still run: the terminal `stored`/`skipped` event the interactive
+ * post-commit watcher waits for, and `reassociateMetadata`, which moves the
+ * amended commit's plans/notes onto the new hash. Letting the throw escape blocked
+ * the user's `git commit` for the full watch ceiling (15 s agent / 90 s TTY) and
+ * left the working-area rows pointing at a hash that no longer exists.
+ *
+ * The cost of swallowing is one replayed transcript slice on the next run, which
+ * is the trade the whole write contract is built on: visible duplication beats
+ * invisible loss.
+ */
+async function safeCommitConsumedTranscripts(
+	consumed: ConsumedTranscripts,
+	cwd: string,
+	commitHash: string,
+): Promise<void> {
+	try {
+		await commitConsumedTranscripts(consumed, cwd);
+	} catch (err) {
+		log.warn("could not advance transcript cursors for %s: %s", commitHash.substring(0, 8), errMsg(err));
+	}
+}
+
 async function readAllTranscripts(
 	sessions: ReadonlyArray<{ sessionId: string; transcriptPath: string; source?: TranscriptSource }>,
 	cwd: string,
@@ -4063,8 +4231,11 @@ async function readAllTranscripts(
 	 * so the caller can aggregate models across surviving sessions for cost.
 	 */
 	perSessionTokens: Map<string, SessionTokenBucket>;
+	/** Cursor positions walked this read; persisted by the caller post-store. */
+	pendingCursors: Parameters<typeof saveCursor>[0][];
 }> {
 	const sessionTranscripts: SessionTranscript[] = [];
+	const pendingCursors: Parameters<typeof saveCursor>[0][] = [];
 	let totalEntries = 0;
 	let humanEntries = 0;
 	let conversationTokens = 0;
@@ -4241,6 +4412,19 @@ async function readAllTranscripts(
 					: { ...m },
 			);
 		}
+		// Merge this slice's tool calls into the session bucket. Gated on presence,
+		// not on length: `[]` from a Claude read is "called no tools in this slice"
+		// and must still create the map, or a commit whose last slice was tool-free
+		// would look like a source that cannot report tools at all.
+		if (result.toolUse) {
+			const byTool = bucket.byTool ?? new Map<string, ToolCallCount>();
+			for (const t of result.toolUse) {
+				const key = `${t.kind}:${t.name}`;
+				const prev = byTool.get(key);
+				byTool.set(key, prev ? { ...prev, calls: prev.calls + t.calls } : { ...t });
+			}
+			bucket.byTool = byTool;
+		}
 		perSessionTokens.set(convKey, bucket);
 
 		if (result.entries.length > 0) {
@@ -4262,8 +4446,11 @@ async function readAllTranscripts(
 			);
 		}
 
-		// Save cursor immediately for this transcript
-		await saveCursor(result.newCursor, cwd);
+		// Cursor advance is DEFERRED: the caller commits these only after the
+		// summary write lands (or at a deliberate skip). Saving here — before
+		// storeSummary — made a crash or LLM failure between this point and the
+		// store silently lose every entry the cursor had already walked past.
+		pendingCursors.push(result.newCursor);
 	}
 
 	// Give every conversation that spent tokens a persistence carrier, including the
@@ -4272,7 +4459,7 @@ async function readAllTranscripts(
 	// once every slice has been read.
 	appendUsageOnlyCarriers(sessionTranscripts, perSessionTokens, sessionIdentity);
 
-	return { sessionTranscripts, totalEntries, humanEntries, conversationTokens, perSessionTokens };
+	return { sessionTranscripts, totalEntries, humanEntries, conversationTokens, perSessionTokens, pendingCursors };
 }
 
 /**
@@ -4354,6 +4541,10 @@ function buildStoredTranscript(sessionTranscripts: ReadonlyArray<SessionTranscri
 			// while an absent one means "cannot attribute" (see StoredSession.usage).
 			...(st.usage && st.usage.input + st.usage.output + st.usage.cached > 0 && { usage: st.usage }),
 			...(st.usageByModel && st.usageByModel.length > 0 && { usageByModel: st.usageByModel }),
+			// Presence-gated, unlike `usage` above: `[]` is the meaningful claim
+			// "this session called no tools", which a reader must be able to tell
+			// apart from a source that cannot report them (see StoredSession.toolUse).
+			...(st.toolUse && { toolUse: st.toolUse }),
 		})),
 	};
 }
@@ -4373,6 +4564,7 @@ export const __test__ = {
 	handleSquashFromQueue,
 	handleRebaseSquashFromQueue,
 	loadSessionTranscripts,
+	commitConsumedTranscripts,
 	attachPerSessionUsage,
 	appendUsageOnlyCarriers,
 	buildStoredTranscript,

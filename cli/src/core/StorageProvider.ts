@@ -10,7 +10,7 @@ import type { TopicPage } from "./TopicKBTypes.js";
  * from the VS Code extension). Any diagnostic that needs to name the backend
  * must read {@link StorageProvider.kind} instead.
  */
-export type StorageKind = "orphan-branch" | "folder" | "dual-write";
+export type StorageKind = "orphan-branch" | "folder" | "dual-write" | "git-ref" | "sqlite";
 
 export interface StorageProvider {
 	/**

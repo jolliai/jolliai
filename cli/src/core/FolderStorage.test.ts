@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -2998,5 +3007,46 @@ describe("FolderStorage.renderTopicWiki", () => {
 
 			expect(existsSync(join(rootPath, ".jolli", "summaries", "abc12345deadbeef.json"))).toBe(true);
 		});
+	});
+});
+
+describe("no visible-only mode (cutover route writes both layers)", () => {
+	it("writes hidden JSON, visible Markdown and the manifest, and a delete reaches the hidden layer", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "jolli-both-layers-"));
+		try {
+			const manager = new MetadataManager(join(dir, ".jolli"));
+			const storage = new FolderStorage(dir, manager);
+			await storage.ensure();
+			const summary = {
+				version: "5",
+				commitHash: "a".repeat(40),
+				commitMessage: "feat: render me",
+				commitDate: "2026-08-04T00:00:00.000Z",
+				branch: "main",
+				commitType: "commit",
+				topics: [],
+				children: [],
+			};
+			await storage.writeFiles(
+				[{ path: `summaries/${"a".repeat(40)}.json`, content: JSON.stringify(summary, null, "\t") }],
+				"m",
+			);
+			// The hidden JSON is written past the fence too. Dual-write means one
+			// write to the system of record and one FULL write to the Memory Bank;
+			// skipping this layer silently starves the folder sync, the IntelliJ
+			// sidebar reader and mirror-based recovery.
+			const hidden = join(dir, ".jolli", "summaries", `${"a".repeat(40)}.json`);
+			expect(existsSync(hidden)).toBe(true);
+			// The visible Markdown and its manifest entry are there — losing the
+			// manifest would kill the self-heal machinery (silent failure #6).
+			const entry = manager.findById("a".repeat(40));
+			expect(entry?.path).toBeTruthy();
+			expect(existsSync(join(dir, entry?.path as string))).toBe(true);
+			// A delete reaches the hidden layer as well.
+			await storage.writeFiles([{ path: `summaries/${"a".repeat(40)}.json`, content: "", delete: true }], "m");
+			expect(existsSync(hidden)).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

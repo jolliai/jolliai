@@ -14,7 +14,9 @@ import { registerCleanCommand } from "./commands/CleanCommand.js";
 import { checkVersionMismatch, VERSION } from "./commands/CliUtils.js";
 import { registerCompileCommand } from "./commands/CompileCommand.js";
 import { registerConfigureCommand } from "./commands/ConfigureCommand.js";
+import { registerCutoverCommand } from "./commands/CutoverCommand.js";
 import { registerDaemonCommand } from "./commands/DaemonCommand.js";
+import { registerDashboardCommand } from "./commands/DashboardCommand.js";
 import { registerDoctorCommand } from "./commands/DoctorCommand.js";
 import { registerDisableCommand, registerEnableCommand } from "./commands/EnableCommand.js";
 import { registerExportCommand, registerExportPromptCommand } from "./commands/ExportCommand.js";
@@ -175,10 +177,12 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"configure",
 	"clean",
 	"doctor",
+	"cutover",
 	"view",
 	"recall",
 	"search",
 	"backfill",
+	"dashboard",
 	"pr-description",
 	"queue-status",
 	"open-url",
@@ -373,6 +377,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerDisableCommand(program);
 	registerUninstallCommand(program);
 	registerStatusCommand(program);
+	registerCutoverCommand(program);
 	registerConfigureCommand(program);
 	registerCleanCommand(program);
 	registerDoctorCommand(program);
@@ -388,6 +393,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerQueueStatusCommand(program);
 	registerOpenUrlCommand(program);
 	registerCompileCommand(program);
+	registerDashboardCommand(program);
 	registerGraphCommand(program);
 	registerMigrateCommand(program);
 	registerHealFolderCommand(program);

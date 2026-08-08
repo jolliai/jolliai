@@ -39,6 +39,7 @@ const h = vi.hoisted(() => ({
 	readManualDisableFlag: vi.fn(),
 	writeManualDisableFlag: vi.fn(),
 	getGlobalConfigDir: vi.fn(),
+	loadConfig: vi.fn(),
 	loadConfigFromDir: vi.fn(),
 	saveConfigScoped: vi.fn(),
 	track: vi.fn(),
@@ -49,6 +50,10 @@ const h = vi.hoisted(() => ({
 	promptText: vi.fn(),
 	isInteractive: vi.fn(),
 	resolveProjectDir: vi.fn(),
+	registerRepo: vi.fn(),
+	deregisterRepo: vi.fn(),
+	canUseDashboardDb: vi.fn(),
+	importDashboardHistory: vi.fn(),
 }));
 
 vi.mock("../auth/AuthConfig.js", () => ({ getJolliUrl: h.getJolliUrl }));
@@ -61,6 +66,7 @@ vi.mock("../core/RepoProfile.js", () => ({
 }));
 vi.mock("../core/SessionTracker.js", () => ({
 	getGlobalConfigDir: h.getGlobalConfigDir,
+	loadConfig: h.loadConfig,
 	loadConfigFromDir: h.loadConfigFromDir,
 	saveConfigScoped: h.saveConfigScoped,
 }));
@@ -69,6 +75,9 @@ vi.mock("../core/TelemetryCommandHook.js", () => ({ markSkipExitFlush: vi.fn() }
 vi.mock("../hooks/PushCompensation.js", () => ({ triggerPendingPushRetry: h.triggerPendingPushRetry }));
 vi.mock("../install/DistPathResolver.js", () => ({ isValidSourceTag: h.isValidSourceTag }));
 vi.mock("../install/Installer.js", () => ({ install: h.install, uninstall: h.uninstall }));
+vi.mock("../dashboard/RepoRegistry.js", () => ({ registerRepo: h.registerRepo, deregisterRepo: h.deregisterRepo }));
+vi.mock("../dashboard/DashboardDb.js", () => ({ canUseDashboardDb: h.canUseDashboardDb }));
+vi.mock("./DashboardCommand.js", () => ({ importDashboardHistory: h.importDashboardHistory }));
 vi.mock("./CliUtils.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./CliUtils.js")>();
 	return {
@@ -79,8 +88,9 @@ vi.mock("./CliUtils.js", async (importOriginal) => {
 	};
 });
 
+import { Command } from "commander";
 import * as detect from "../core/localagent/DetectAgents.js";
-import { promptSetup } from "./EnableCommand.js";
+import { promptSetup, registerDisableCommand, registerEnableCommand } from "./EnableCommand.js";
 
 const GLOBAL_CONFIG_DIR = "/global/config";
 const promptText = h.promptText;
@@ -113,6 +123,9 @@ beforeEach(() => {
 	// No jolliApiKey configured, so promptSetup shows the top-level menu
 	// instead of taking the early-return "already configured" branch.
 	h.loadConfigFromDir.mockResolvedValue({} as Partial<JolliMemoryConfig>);
+	// `reportEnableResult` reads the merged config for the onboarding-progress
+	// emit; it is fully guarded but still needs the export to exist.
+	h.loadConfig.mockResolvedValue({} as Partial<JolliMemoryConfig>);
 	h.saveConfigScoped.mockImplementation((partial: Partial<JolliMemoryConfig>) => {
 		savedConfig = partial;
 		return Promise.resolve(undefined);
@@ -490,5 +503,94 @@ describe("menu choice 3 — explicit local agent", () => {
 		expect(usable).toHaveBeenCalledWith("claude-code", {
 			override: { tool: "claude-code", path: "/custom/bin/codex" },
 		});
+	});
+});
+
+// ─── Dashboard wiring on enable / disable ──────────────────────────────────
+
+describe("EnableCommand — dashboard registration and history import", () => {
+	const okInstall = { success: true, message: "ok", warnings: [] };
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		h.resolveProjectDir.mockReturnValue("/repo");
+		h.getGlobalConfigDir.mockReturnValue(GLOBAL_CONFIG_DIR);
+		h.isLocalAgentChild.mockReturnValue(false);
+		h.install.mockResolvedValue(okInstall);
+		h.uninstall.mockResolvedValue({ success: true, message: "ok", warnings: [] });
+		h.registerRepo.mockResolvedValue({
+			repoIdentity: "id-1",
+			repoName: "repo",
+			worktreeRoot: "/repo",
+			enabledAt: "2026-07-30T00:00:00Z",
+		});
+		h.deregisterRepo.mockResolvedValue("id-1");
+		h.canUseDashboardDb.mockReturnValue(true);
+		h.importDashboardHistory.mockResolvedValue(undefined);
+		h.isInteractive.mockReturnValue(false);
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	async function runEnable(...extraArgs: Array<string>): Promise<void> {
+		const program = new Command();
+		registerEnableCommand(program);
+		await program.parseAsync(["node", "jolli", "enable", "--cwd", "/repo", ...extraArgs]);
+	}
+
+	async function runDisable(...extraArgs: Array<string>): Promise<void> {
+		const program = new Command();
+		registerDisableCommand(program);
+		await program.parseAsync(["node", "jolli", "disable", "--cwd", "/repo", ...extraArgs]);
+	}
+
+	it("registers the repo on a successful non-interactive enable, without importing history", async () => {
+		await runEnable("-y");
+
+		// Registration is unconditional (the machine-level registry must know
+		// every enabled repo)…
+		expect(h.registerRepo).toHaveBeenCalledWith({ cwd: "/repo" });
+		// …but the history import is interactive-only, and no server is ever started.
+		expect(h.importDashboardHistory).not.toHaveBeenCalled();
+	});
+
+	it("keeps enable green when repo registration fails", async () => {
+		h.registerRepo.mockRejectedValue(new Error("not a git repo"));
+
+		await runEnable("-y");
+
+		expect(process.exitCode ?? 0).toBe(0);
+	});
+
+	it("skips registration and history import for integrations-only repairs", async () => {
+		await runEnable("--integrations-only", "-y");
+
+		expect(h.registerRepo).not.toHaveBeenCalled();
+		expect(h.importDashboardHistory).not.toHaveBeenCalled();
+	});
+
+	it("marks the repo disabled in the dashboard registry on disable", async () => {
+		await runDisable();
+
+		expect(h.deregisterRepo).toHaveBeenCalledWith({ cwd: "/repo" });
+	});
+
+	it("does not touch the dashboard registry on integrations-only disable", async () => {
+		await runDisable("--integrations-only");
+
+		expect(h.deregisterRepo).not.toHaveBeenCalled();
+	});
+
+	it("keeps disable green when deregistration fails", async () => {
+		h.deregisterRepo.mockRejectedValue(new Error("registry unwritable"));
+
+		await runDisable();
+
+		expect(process.exitCode ?? 0).toBe(0);
+		expect(h.uninstall).toHaveBeenCalled();
 	});
 });

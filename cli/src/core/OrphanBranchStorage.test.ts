@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // OrphanBranchStorage is a thin wrapper; every method just forwards to GitOps.
+// The write-time fence check reads profile.json; a mutable holder lets each
+// test raise or drop the fence without re-mocking.
+const fenceState: { fence: { reason: string; at: string } | null } = { fence: null };
+vi.mock("./RepoProfile.js", () => ({
+	readCutoverFence: vi.fn(async () => fenceState.fence),
+}));
+
 vi.mock("./GitOps.js", () => ({
 	batchReadFilesFromBranch: vi.fn(),
 	ensureOrphanBranch: vi.fn(),
@@ -129,6 +136,24 @@ describe("OrphanBranchStorage", () => {
 			expect(mockedWriteFiles).not.toHaveBeenCalled();
 		} finally {
 			setManuallyDisabled(false);
+		}
+	});
+});
+
+describe("cutover fence at write time", () => {
+	it("refuses an orphan write while the fence is up — the frozen branch never moves", async () => {
+		// The scenario the invariant exists for: a long-lived process holds a
+		// pre-cutover storage object; routing can't reach it, only this check can.
+		fenceState.fence = { reason: "cutover", at: "t" };
+		try {
+			const storage = new OrphanBranchStorage("/repo");
+			await expect(storage.writeFiles([{ path: "summaries/x.json", content: "{}" }], "m")).rejects.toThrow(
+				/frozen/,
+			);
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+			expect(ensureOrphanBranch).not.toHaveBeenCalled();
+		} finally {
+			fenceState.fence = null;
 		}
 	});
 });

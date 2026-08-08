@@ -144,11 +144,12 @@ vi.mock("../core/GeminiTranscriptReader.js", () => ({
 
 // ConversationOverlayStore runs unmocked: saveOverlay / applyOverlaysToSessions /
 // loadOverlay / overlayPath / pruneConsumedOverlayRules all hit the real
-// implementation against on-disk JSON. The pipeline order in
-// loadSessionTranscripts is apply-then-prune (see QueueWorker.ts), so by the
-// time GC runs the planted overlay rules have already been observed by apply
-// and reflected in `result.*`. GC then unlinks fully-consumed overlay files —
-// which is exactly what the two trailing GC tests assert.
+// implementation against on-disk JSON.
+//
+// `loadSessionTranscripts` APPLIES overlays and stops there. The GC lives in
+// `commitConsumedTranscripts`, alongside the cursor advance, because that is the
+// moment the consumed slice actually becomes unreachable — the three trailing
+// tests pin both halves of that split.
 
 // We need a separate import for saveOverlay so the test fixture can plant
 // real overlay JSON without going through the panel.
@@ -163,7 +164,7 @@ import { readTranscript } from "../core/TranscriptReader.js";
 import type { SessionInfo, TranscriptReadResult } from "../Types.js";
 import { __test__ } from "./QueueWorker.js";
 
-const { loadSessionTranscripts } = __test__;
+const { loadSessionTranscripts, commitConsumedTranscripts } = __test__;
 
 describe("QueueWorker overlay path", () => {
 	let projectDir: string;
@@ -303,25 +304,44 @@ describe("QueueWorker overlay path", () => {
 		});
 	}
 
-	it("loadSessionTranscripts unlinks overlays whose rules all match entries in the cursor-trimmed slice", async () => {
-		const { sessionInfo } = stubSession();
-		// Both rule identities match entries returned by stubSession (msg-2 at t1, msg-4 at t3).
+	/** Two consumed rules, both matching entries stubSession returns (msg-2@t1, msg-4@t3). */
+	async function plantConsumedOverlay(sessionId: string): Promise<string> {
 		await saveOverlay(
-			{ projectDir, source: "claude", sessionId: sessionInfo.sessionId },
+			{ projectDir, source: "claude", sessionId },
 			{
 				deletes: [{ role: "assistant", content: "msg-2", timestamp: "t1" }],
 				edits: [{ role: "assistant", content: "msg-4", timestamp: "t3", newContent: "EDITED" }],
 			},
 		);
-		const file = overlayPath({ projectDir, source: "claude", sessionId: sessionInfo.sessionId });
+		return overlayPath({ projectDir, source: "claude", sessionId });
+	}
+
+	it("loadSessionTranscripts does NOT unlink a consumed overlay — the cursor has not landed yet", async () => {
+		// The regression guard for the data-loss bug: cursor advance is deferred to
+		// after the summary write, so pruning here left the overlay gone under a
+		// cursor that never moved. The next commit then re-read the identical slice
+		// with the user's deletion absent, and their removed message entered the
+		// stored summary and the persisted transcript.
+		const { sessionInfo } = stubSession();
+		const file = await plantConsumedOverlay(sessionInfo.sessionId);
 		expect(existsSync(file)).toBe(true);
 
 		await loadSessionTranscripts(projectDir, { codexEnabled: false } as never);
 
+		expect(existsSync(file)).toBe(true);
+	});
+
+	it("commitConsumedTranscripts unlinks overlays whose rules all match the consumed slice", async () => {
+		const { sessionInfo } = stubSession();
+		const file = await plantConsumedOverlay(sessionInfo.sessionId);
+
+		const result = await loadSessionTranscripts(projectDir, { codexEnabled: false } as never);
+		await commitConsumedTranscripts(result.consumedTranscripts, projectDir);
+
 		expect(existsSync(file)).toBe(false);
 	});
 
-	it("loadSessionTranscripts keeps the overlay when a rule's identity is outside the cursor-trimmed slice", async () => {
+	it("commitConsumedTranscripts keeps the overlay when a rule's identity is outside the consumed slice", async () => {
 		const { sessionInfo } = stubSession();
 		// "future-msg" / "t99" is NOT in stubSession's entries — rule must survive.
 		await saveOverlay(
@@ -333,7 +353,8 @@ describe("QueueWorker overlay path", () => {
 		);
 		const file = overlayPath({ projectDir, source: "claude", sessionId: sessionInfo.sessionId });
 
-		await loadSessionTranscripts(projectDir, { codexEnabled: false } as never);
+		const result = await loadSessionTranscripts(projectDir, { codexEnabled: false } as never);
+		await commitConsumedTranscripts(result.consumedTranscripts, projectDir);
 
 		expect(existsSync(file)).toBe(true);
 		const remaining = await loadOverlay({ projectDir, source: "claude", sessionId: sessionInfo.sessionId });

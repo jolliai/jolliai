@@ -299,22 +299,23 @@ export async function applyOverlaysToSessions<T extends OverlayableSession>(
 
 /**
  * Garbage-collects overlay rules whose identity matches an entry in the
- * QueueWorker's consumed slice. Called inside `loadSessionTranscripts`
- * after `applyOverlaysToSessions` has folded the rules into the in-memory
- * `sessionTranscripts`, just before the function returns — by that point,
- * `readAllTranscripts` has already `saveCursor`'d past every entry in the
- * slice, so any rule whose identity matches one of those entries can no
- * longer affect future summaries. Such rules are dead state: keep
- * dropping them here so overlay files don't accumulate.
+ * QueueWorker's consumed slice. Such rules are dead state — the entries they
+ * target will never be read again — so dropping them keeps overlay files from
+ * accumulating.
  *
- * Trade-off worth flagging: prune (and the cursor advance it tracks) run
- * unconditionally — they are NOT gated on a successful `storeSummary`
- * downstream. If the LLM call fails after this, both the cursor and the
- * overlay file have moved past the consumed entries, so those edits are
- * effectively lost. A transactional "advance cursor + drop overlays only
- * on storeSummary success" refactor would fix that, but the prune call
- * placement is downstream of the same trade-off — moving it alone would
- * just produce a stale "edited" badge without recovering the data.
+ * **Call this from `QueueWorker.commitConsumedTranscripts` and nowhere else.**
+ * The correctness precondition is not "the slice has been read", it is "the
+ * cursor past that slice has been PERSISTED", and those stopped being the same
+ * moment the cursor advance became deferred to after the summary write. Called
+ * any earlier — e.g. back inside `loadSessionTranscripts`, where it used to
+ * sit — a failed LLM call leaves the overlay file unlinked under a cursor that
+ * never moved, so the next commit re-reads the identical slice with the user's
+ * deletion gone and their removed message lands in the stored summary and the
+ * persisted transcript. The bundle in `ConsumedTranscripts` exists to keep the
+ * two halves from drifting apart again.
+ *
+ * Fire-and-forget by design: a rule left behind is inert, so per-session errors
+ * only warn-log rather than failing the commit that already succeeded.
  *
  * Per session:
  *   - Drops delete/edit rules whose `(role, content, timestamp)` identity

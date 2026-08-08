@@ -1,11 +1,12 @@
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getPlansDir } from "../core/PlanService.js";
+import { getDashboardDbPath } from "../dashboard/DashboardDb.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import { DAEMON_PROTOCOL } from "./DaemonProtocol.js";
 import { buildRefreshParams, computeWatchTargets, runDaemonServer } from "./DaemonServer.js";
@@ -25,10 +26,11 @@ describe("computeWatchTargets", () => {
 		mockExec.mockReset();
 	});
 
-	it("returns the four watch targets rooted at cwd (main checkout)", () => {
+	it("returns the five watch targets rooted at cwd (main checkout)", () => {
 		const targets = computeWatchTargets("/repo", {
 			gitCommonDir: join("/repo", ".git"),
 			plansDir: "/home/u/.claude/plans",
+			globalConfigDir: "/home/u/.jolli/jollimemory",
 		});
 		expect(targets.map((t) => ({ kind: t.kind, path: t.path, ensureDir: t.ensureDir }))).toEqual([
 			{
@@ -41,6 +43,13 @@ describe("computeWatchTargets", () => {
 				// The orphan branch is `jollimemory/summaries/v3`, so we watch its
 				// direct parent to catch update-ref writes with a non-recursive fs.watch.
 				path: join("/repo", ".git", "refs", "heads", "jollimemory", "summaries"),
+				ensureDir: false,
+			},
+			{
+				kind: "memory-db",
+				// Post-cutover the ref above stops moving and this is the only
+				// file a stored memory touches. Machine-global: never auto-created.
+				path: "/home/u/.jolli/jollimemory",
 				ensureDir: false,
 			},
 			{
@@ -76,6 +85,26 @@ describe("computeWatchTargets", () => {
 		expect(filter?.("debug.log")).toBe(false);
 		expect(filter?.("sessions.json")).toBe(false);
 		expect(filter?.("cursors.json")).toBe(false);
+	});
+
+	it("gates the memory-db target to the database and its WAL sidecars", () => {
+		const target = computeWatchTargets("/repo", { gitCommonDir: "/repo/.git" }).find((t) => t.kind === "memory-db");
+		expect(target?.filter?.("jollimemory.db")).toBe(true);
+		// `-wal` is the file that actually moves per write; the main `.db` mtime
+		// only changes at checkpoint, so gating it out would delay every push.
+		expect(target?.filter?.("jollimemory.db-wal")).toBe(true);
+		expect(target?.filter?.("jollimemory.db-shm")).toBe(true);
+		// The machine-global dir's other residents, none of which mean "a memory
+		// was stored" — `config.json` above all, rewritten on every settings save.
+		expect(target?.filter?.("config.json")).toBe(false);
+		expect(target?.filter?.("run-hook")).toBe(false);
+		expect(target?.filter?.("agent-unsupported-flags.json")).toBe(false);
+	});
+
+	it("defaults the memory-db dir to the machine-global config dir when no override is given", () => {
+		mockExec.mockReturnValueOnce("/repo/.git\n");
+		const targets = computeWatchTargets("/repo");
+		expect(targets.find((t) => t.kind === "memory-db")?.path).toBe(dirname(getDashboardDbPath()));
 	});
 
 	it("gates the claude-plans target to markdown and forwards the burst's filenames", () => {

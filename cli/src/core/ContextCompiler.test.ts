@@ -18,6 +18,10 @@ vi.mock("./SummaryStore.js", () => ({
 	readPlanFromBranch: vi.fn(),
 	readNoteFromBranch: vi.fn(),
 	readTranscript: vi.fn(),
+	// The typed hot path (phase H) probes the active storage; these tests
+	// exercise the file-shaped legacy branch, so no storage resolves. A plain
+	// function so mock resets can't strip it.
+	resolveStorage: () => undefined,
 }));
 
 vi.mock("./MemoryBankScanner.js", () => ({

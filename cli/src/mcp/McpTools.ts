@@ -30,7 +30,7 @@ import { type PushBranchResult, pushBranchToJolli, resolveSpaceId } from "../cor
 import { localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import { buildPrDescription, type PrDescriptionResult } from "../core/PrDescription.js";
 import { getQueueStatus, type QueueStatus, waitForQueueDrained } from "../core/QueueStatus.js";
-import { type RecallResult, resolveRecall } from "../core/RecallResolver.js";
+import { type RecallResult, recallOutcomeOf, resolveRecall } from "../core/RecallResolver.js";
 import { searchHits } from "../core/SearchHits.js";
 import type { SearchHitResult } from "../core/SearchIndex.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
@@ -38,6 +38,7 @@ import { compareSourceRefs } from "../core/SourceTimeline.js";
 import { clearSpaceBindingCache, loadSpaceBindingDisplay } from "../core/SpaceBindingCache.js";
 import { getActiveStorage } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
+import { recordRecallReceipt } from "../dashboard/ProducerHooks.js";
 import { getStatus } from "../install/Installer.js";
 import type { LocalAgentToolId, StatusInfo } from "../Types.js";
 
@@ -53,7 +54,14 @@ export async function runSearch(cwd: string, args: SearchArgs): Promise<{ hits: 
 }
 
 export async function runRecall(cwd: string, args: { branch?: string }): Promise<RecallResult> {
-	return resolveRecall(args.branch, cwd);
+	const result = await resolveRecall(args.branch, cwd);
+	// Fire-and-forget: the receipt is what makes this call visible on the
+	// dashboard's Recall card at the moment it happens rather than whenever the
+	// agent's transcript is next scanned (or never, for a non-Claude agent). It
+	// is worth strictly less than the answer's latency, and it never throws, so
+	// it is deliberately not awaited.
+	void recordRecallReceipt(cwd, recallOutcomeOf(result, Date.now()), "mcp");
+	return result;
 }
 
 export interface TimelineEntry {

@@ -13,10 +13,10 @@
  */
 
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createLogger, getJolliMemoryDir } from "../Logger.js";
+import { createLogger, errMsg, getJolliMemoryDir } from "../Logger.js";
 import {
 	type CursorsRegistry,
 	type DiscoveryExtractor,
@@ -682,19 +682,52 @@ export async function getOrCreateInstallIdInDir(
 	await mkdir(dir, { recursive: true });
 	let installId: string;
 	let created: boolean;
+	// Stage-then-link rather than a plain `writeFile(sentinel, …, "wx")`: the
+	// exclusive create publishes the path BEFORE the bytes land, so a loser that
+	// reads in that window sees an empty file and falls back to its own
+	// candidate — every caller then mints a different id. `link()` is equally
+	// atomic (EEXIST when someone else won) but publishes a file that already
+	// holds the winner's id, so there is no empty window to observe.
+	const staging = `${sentinel}.${randomUUID()}.tmp`;
 	try {
-		await writeFile(sentinel, candidate, { flag: "wx" });
-		installId = candidate;
-		created = true;
-	} catch {
+		await writeFile(staging, candidate, { flag: "wx" });
+		try {
+			await link(staging, sentinel);
+			installId = candidate;
+			created = true;
+		} catch {
+			installId = await readInstallIdSentinel(sentinel, candidate);
+			created = false;
+		}
+	} catch (err) {
+		// The STAGING write is the only step here with no fallback of its own, and
+		// it fails for reasons that have nothing to do with identity: an EACCES on
+		// `~/.jolli/jollimemory` (a root-owned directory from a `sudo npm` run is the
+		// common one), ENOSPC, a read-only volume. Every caller of this treats the
+		// install id as a detail of something else — `jolli login` builds a URL with
+		// it, `jolli telemetry status` prints it — so letting the throw escape turns
+		// an unwritable config directory into a failed sign-in.
+		//
+		// Degrade to whatever is already published, or to a process-local id when
+		// nothing is: `created` stays false either way, so the once-per-machine
+		// `app_installed` event cannot fire off an id that was never persisted.
+		log.warn("could not stage the install-id sentinel: %s", errMsg(err));
 		installId = await readInstallIdSentinel(sentinel, candidate);
 		created = false;
+	} finally {
+		// Same reasoning as the catch above — a cleanup failure must not be the
+		// thing that fails the caller. A leftover `.tmp` is inert (a fresh random
+		// name every run, and nothing reads the pattern).
+		await rm(staging, { force: true }).catch(() => {});
 	}
-	/* v8 ignore start -- reaching here means config.installId was falsy (a truthy value returns at line 378) while installId is always a non-empty string, so the guard is always true; its else branch is unreachable */
 	if (config.installId !== installId) {
-		await saveConfigScoped({ installId }, dir);
+		// Best-effort for the same reason: on the ENOSPC/EACCES path above the
+		// config write is likely to fail too, and the id is already usable in
+		// memory. The next run re-attempts both.
+		await saveConfigScoped({ installId }, dir).catch((err: unknown) => {
+			log.warn("could not persist the install id: %s", errMsg(err));
+		});
 	}
-	/* v8 ignore stop */
 	return { installId, created };
 }
 
@@ -1055,6 +1088,35 @@ export async function enqueueGitOperation(op: GitOperation, cwd?: string): Promi
 		log.error("Failed to enqueue queue operation type=%s tag=%s: %s", op.type, tag, (error as Error).message);
 		return false;
 	}
+}
+
+/**
+ * Reads all queued git operations, sorted by filename (timestamp order),
+ * WITHOUT touching the queue. Nothing is pruned and nothing is deleted.
+ *
+ * For callers that need to know what is queued but are not going to process it
+ * — the QueueWorker's blocked-route gate is the one that matters, since it
+ * exits leaving the entries for a capable runtime and must not quietly delete
+ * the oldest ones on the way out. Use {@link dequeueAllGitOperations} when you
+ * ARE the drain.
+ */
+export async function peekAllGitOperations(cwd?: string): Promise<ReadonlyArray<GitOperation>> {
+	const queueDir = join(getJolliMemoryDir(cwd), GIT_OP_QUEUE_DIR);
+	let files: string[];
+	try {
+		files = await readdir(queueDir);
+	} catch {
+		return [];
+	}
+	const results: GitOperation[] = [];
+	for (const file of files.filter((f) => f.endsWith(".json")).sort()) {
+		try {
+			results.push(JSON.parse(await readFile(join(queueDir, file), "utf-8")) as GitOperation);
+		} catch (error: unknown) {
+			log.warn("Failed to read queue entry %s: %s — skipping", file, (error as Error).message);
+		}
+	}
+	return results;
 }
 
 /**

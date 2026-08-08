@@ -47,13 +47,42 @@ export interface RepoProfile {
 	 */
 	backfillDismissed?: boolean;
 	/**
-	 * The user explicitly disabled Jolli Memory for this repo (`jolli disable` or
-	 * the VS Code "Disable" command). Repo-wide — it matches the shared git hook
-	 * that `status.enabled` reflects, so one disable holds across every worktree.
-	 * Highest priority: never auto-cleared by upgrades, window reloads, or hook
-	 * repair; only an explicit re-enable sets it back to false.
+	 * DERIVED bit for OLD runtimes only: `userDisabled OR cutoverFence present`.
+	 * Old clients (pre-cutover CLI/extensions) read this one field and stop
+	 * writing — that is the entire reason it still exists. It is recomputed on
+	 * every write of its two sources and NEVER hand-written; new runtime code
+	 * must not read it for decisions (the readers below consult
+	 * {@link userDisabled} instead). Kept as a field name because it is the only
+	 * flag already-shipped clients understand.
 	 */
 	manuallyDisabled?: boolean;
+	/**
+	 * The user's own disable (`jolli disable` / the VS Code command). When set,
+	 * EVERYTHING stops — orphan and SQLite writes alike. `jolli disable` sets it,
+	 * `jolli enable` clears it; neither touches {@link cutoverFence}. Highest
+	 * priority: userDisabled > cutoverFence.
+	 */
+	userDisabled?: boolean;
+	/**
+	 * The cutover fence (phase D): present means this repo's orphan branch is
+	 * FROZEN — new runtimes keep working but write SQLite and read the database;
+	 * old runtimes are stopped via the derived bit. `jolli enable` must NOT
+	 * clear it; only doctor's explicit manual path may. Never auto-revoked:
+	 * there is no legitimate "unfreeze" — old clients must never write the
+	 * frozen branch again.
+	 */
+	cutoverFence?: {
+		readonly reason: string;
+		readonly at: string;
+		/** Frozen orphan tips per source root, pinned when the fence went up —
+		 *  what the CAS (and its crash-resume) compares rev-parse against. */
+		readonly tips?: Readonly<Record<string, string>>;
+	};
+}
+
+/** Recomputes the old-runtime composite from its two sources — the ONLY writer. */
+function withDerivedDisable(profile: RepoProfile): RepoProfile {
+	return { ...profile, manuallyDisabled: profile.userDisabled === true || profile.cutoverFence !== undefined };
 }
 
 /** Resolved paths for a repo's profile, plus the legacy marker to migrate from. */
@@ -218,24 +247,107 @@ async function anyWorktreeHasLegacyDisableMarker(cwd: string): Promise<boolean> 
 export async function readManualDisableFlag(cwd: string): Promise<boolean> {
 	const { profilePath } = await resolvePaths(cwd);
 	const profile = await readRaw(profilePath);
+	if (profile.userDisabled !== undefined) {
+		return profile.userDisabled === true;
+	}
+	// Migration: a profile that predates the three-field split carries only the
+	// composite, and a pre-fence-era disable can only have been the USER's — so
+	// it migrates onto userDisabled. This is the one sanctioned read of the
+	// composite in new code (it IS the migration).
 	if (profile.manuallyDisabled !== undefined) {
-		return profile.manuallyDisabled === true;
+		return persistUserDisabled(cwd, profilePath, profile.manuallyDisabled === true);
 	}
 	const legacy = await anyWorktreeHasLegacyDisableMarker(cwd);
-	const migration = await withStrictProfileLock(cwd, async () => {
-		const current = await readRaw(profilePath);
-		if (current.manuallyDisabled === undefined) {
-			await writeProfile(profilePath, { ...current, manuallyDisabled: legacy });
-			return legacy;
-		}
-		return current.manuallyDisabled === true;
-	}).catch(() => null);
-	return migration?.acquired ? (migration.value ?? legacy) : legacy;
+	return persistUserDisabled(cwd, profilePath, legacy);
 }
 
-/** Sets (`true`) or clears (`false`) the repo-wide manual-disable flag. */
+/**
+ * Locked, clobber-safe persist of a migrated userDisabled decision — returning
+ * the value that WON, not the one that was proposed.
+ *
+ * The migration decides its value from an unlocked read, and the whole point of
+ * taking the lock is that an explicit `jolli disable` can land in between. Such a
+ * write is correctly kept (the guard below declines to overwrite it), so
+ * returning the pre-lock value made the caller answer "not disabled" against a
+ * profile that says otherwise — and this caller is the hook gate, so that answer
+ * captured the commit the user had just opted out of.
+ *
+ * On a lock failure — not acquired, or the write threw — the proposed value
+ * stands: nothing was written, so there is no winner to prefer, and the next call
+ * migrates again.
+ */
+async function persistUserDisabled(cwd: string, profilePath: string, value: boolean): Promise<boolean> {
+	const result = await withStrictProfileLock(cwd, async () => {
+		const current = await readRaw(profilePath);
+		if (current.userDisabled !== undefined) return current.userDisabled === true;
+		await writeProfile(profilePath, withDerivedDisable({ ...current, userDisabled: value }));
+		return value;
+	}).catch(() => undefined);
+	return result?.acquired && result.value !== undefined ? result.value : value;
+}
+
+/**
+ * Sets (`true`) or clears (`false`) the USER's own disable. Deliberately blind
+ * to the cutover fence: `jolli enable` clearing a fence would simultaneously
+ * unfreeze the orphan branch for every old runtime on the machine. The
+ * old-runtime composite is recomputed either way.
+ */
 export async function writeManualDisableFlag(cwd: string, disabled: boolean): Promise<void> {
-	await updateRepoProfile(cwd, { manuallyDisabled: disabled });
+	const { profilePath } = await resolvePaths(cwd);
+	const result = await withStrictProfileLock(cwd, async () => {
+		const current = await readRaw(profilePath);
+		await writeProfile(profilePath, withDerivedDisable({ ...current, userDisabled: disabled }));
+	});
+	if (!result.acquired) {
+		throw new Error("Timed out acquiring the repo profile lock");
+	}
+}
+
+/** The repo's cutover fence, or null when the orphan branch is not frozen. */
+export async function readCutoverFence(
+	cwd: string,
+): Promise<{ reason: string; at: string; tips?: Readonly<Record<string, string>> } | null> {
+	const { profilePath } = await resolvePaths(cwd);
+	return (await readRaw(profilePath)).cutoverFence ?? null;
+}
+
+/**
+ * Writes (or, on `null`, removes) the cutover fence, recomputing the composite.
+ * Removal exists ONLY for doctor's explicit manual path — no automatic caller
+ * may pass null, per the "封锁永不自动撤销" rule.
+ */
+export async function writeCutoverFence(
+	cwd: string,
+	fence: { reason: string; at: string; tips?: Readonly<Record<string, string>> } | null,
+): Promise<void> {
+	// Force `userDisabled` to a resolved, persisted boolean BEFORE the fence
+	// goes up. Without this, a profile that never had `userDisabled` written
+	// gets `manuallyDisabled: true` from the fence alone (via
+	// `withDerivedDisable` below) with `userDisabled` still absent — and
+	// `readManualDisableFlag`'s legacy-migration branch (it only ever sees a
+	// pre-three-field-split profile that way) would then wrongly fold that
+	// fence-only composite onto `userDisabled: true`, permanently disabling
+	// SQLite writes for a repo the user never actually disabled.
+	const resolvedUserDisabled = await readManualDisableFlag(cwd);
+	const { profilePath } = await resolvePaths(cwd);
+	const result = await withStrictProfileLock(cwd, async () => {
+		const current = await readRaw(profilePath);
+		const next = { ...current } as RepoProfile & { cutoverFence?: NonNullable<RepoProfile["cutoverFence"]> };
+		// The forcing call above persists through a fire-and-forget lock attempt
+		// (`persistUserDisabled` swallows a lock timeout without running), so its
+		// write can silently lose to contention — e.g. a concurrent
+		// `backfillDismissed` write holding the lock at exactly that moment.
+		// Materialize the split field in THE SAME locked write as the fence, so a
+		// fence can never land on a pre-split profile. Absence-only: a value a
+		// concurrent explicit enable/disable just persisted must win.
+		if (next.userDisabled === undefined) next.userDisabled = resolvedUserDisabled;
+		if (fence === null) delete next.cutoverFence;
+		else next.cutoverFence = fence;
+		await writeProfile(profilePath, withDerivedDisable(next));
+	});
+	if (!result.acquired) {
+		throw new Error("Timed out acquiring the repo profile lock");
+	}
 }
 
 /**
@@ -311,9 +423,15 @@ export function readManualDisableFlagSync(cwd: string): boolean {
 	try {
 		const parsed = JSON.parse(readFileSync(join(getJolliMemoryDir(mainRoot), PROFILE_FILE), "utf-8"));
 		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			const flag = (parsed as RepoProfile).manuallyDisabled;
-			if (flag !== undefined) {
-				return flag === true;
+			const profile = parsed as RepoProfile;
+			// userDisabled first (the axis new code decides on); the composite
+			// only as the read-only migration fallback for pre-split profiles —
+			// a fence must NOT stop this runtime, only old ones.
+			if (profile.userDisabled !== undefined) {
+				return profile.userDisabled === true;
+			}
+			if (profile.manuallyDisabled !== undefined) {
+				return profile.manuallyDisabled === true;
 			}
 		}
 	} catch {

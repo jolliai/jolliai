@@ -19,8 +19,17 @@ describe("hasNodeSqliteSupport", () => {
 
 	it("returns false on an earlier minor within the same major", () => {
 		// minor=0 covers the "earlier minor" branch even when NODE_SQLITE_MIN_VERSION.minor is 0
-		// (the comparison is `>=`, so 22.0.0 < 22.5.0 returns false).
+		// (the comparison is `>=`, so 22.0.0 < the floor returns false).
 		expect(hasNodeSqliteSupport(`${major}.0.0`)).toBe(false);
+	});
+
+	it("rejects the flag-gated 22.5–22.12 window (node:sqlite exists but needs --experimental-sqlite)", () => {
+		// The predicate means "import will succeed unflagged". The extension host
+		// and the git-hook dispatchers cannot pass a Node flag, so a true here
+		// would make those surfaces throw on import.
+		expect(hasNodeSqliteSupport("22.5.0")).toBe(false);
+		expect(hasNodeSqliteSupport("22.12.9")).toBe(false);
+		expect(hasNodeSqliteSupport("22.13.0")).toBe(true);
 	});
 
 	it("returns false on an earlier major", () => {
@@ -28,7 +37,7 @@ describe("hasNodeSqliteSupport", () => {
 	});
 
 	it("treats prerelease tags correctly (major.minor extracted from prefix)", () => {
-		expect(hasNodeSqliteSupport("22.5.0-nightly20260101")).toBe(true);
+		expect(hasNodeSqliteSupport("22.13.0-nightly20260101")).toBe(true);
 		expect(hasNodeSqliteSupport("20.15.0-nightly20260101")).toBe(false);
 	});
 });

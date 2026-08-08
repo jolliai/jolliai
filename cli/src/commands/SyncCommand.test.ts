@@ -37,12 +37,14 @@ vi.mock("../core/KBPathResolver.js", () => ({
 	resolveKBPath: mockResolveKBPath,
 }));
 
-vi.mock("../core/OrphanBranchStorage.js", () => ({
-	OrphanBranchStorage: class {
-		exists() {
-			return mockOrphanExists();
-		}
-	},
+// The migration source is now resolved by cutover route. Mocked here rather
+// than mocking `OrphanBranchStorage`: these cases are about SyncCommand's
+// wiring, and routing for real would drag in the dashboard DB and the repo
+// profile. `SotStorageResolver.test.ts` covers the routing itself.
+vi.mock("../core/SotStorageResolver.js", () => ({
+	resolveSotStorage: async () => ({
+		exists: () => mockOrphanExists(),
+	}),
 }));
 
 vi.mock("../core/MetadataManager.js", () => ({

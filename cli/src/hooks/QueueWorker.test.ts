@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 
 // ─── Mocks ──────────────────────────────────────────────────────────────────
@@ -16,7 +16,30 @@ vi.mock("../core/GitOps.js", () => ({
 }));
 
 vi.mock("../core/RepoProfile.js", () => ({
+	// Pre-cutover default: no fence (plain fn — survives mock resets).
+	readCutoverFence: async () => null,
 	readManualDisableFlag: vi.fn().mockResolvedValue(false),
+}));
+
+// The worker's Node-floor gate consults the cutover route at its entrance;
+// these tests exercise the pre-cutover drain, so pin the route there. A plain
+// function reading a mutable holder (not vi.fn) survives mock resets and lets
+// the gate test flip to "blocked".
+const cutoverRouteState: { state: string; reason?: string } = { state: "uncutover" };
+vi.mock("../dashboard/CutoverRouter.js", () => ({
+	resolveCutoverRoute: async () => ({ ...cutoverRouteState }),
+}));
+
+// Dashboard direct write (JOLLI-2069): inert here — it opens the machine-level
+// SQLite DB and spawns git, neither of which belongs in this unit suite. Its
+// own behaviour is covered by dashboard/ProducerHooks.test.ts.
+vi.mock("../dashboard/ProducerHooks.js", () => ({
+	recordCommitsFromWorker: vi.fn().mockResolvedValue(true),
+}));
+// The post-drain snapshot trigger must not reach the real machine database
+// (it loads global config and defaults to ~/jolli_back).
+vi.mock("../dashboard/Backup.js", () => ({
+	opportunisticSnapshot: vi.fn().mockResolvedValue({ status: "skipped", reason: "test" }),
 }));
 
 // CaptureProgress is the interactive-feedback stream (its own real behavior is
@@ -47,6 +70,7 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		getReferenceEntriesForBranch: vi.fn().mockResolvedValue([]),
 		filterSessionsByEnabledIntegrations: actual.filterSessionsByEnabledIntegrations,
 		dequeueAllGitOperations: vi.fn().mockResolvedValue([]),
+		peekAllGitOperations: vi.fn().mockResolvedValue([]),
 		deleteQueueEntry: vi.fn(),
 		enqueueGitOperation: vi.fn(),
 	};
@@ -558,6 +582,7 @@ import {
 	loadConfig,
 	loadCursorForTranscript,
 	loadPlansRegistry,
+	peekAllGitOperations,
 	saveCursor,
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
@@ -568,6 +593,7 @@ import { storeSummary, withRequiredOrphanWriteLock } from "../core/SummaryStore.
 import { associateSkillsWithCommit } from "../core/skills/SkillArchive.js";
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
+import { recordCommitsFromWorker } from "../dashboard/ProducerHooks.js";
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { recordPendingIngest, wakePendingIngest } from "../sync/PendingIngest.js";
 import { recordPendingWorker, wakePendingWorkers } from "../sync/PendingWorkers.js";
@@ -616,6 +642,45 @@ function setupPipelineMocks(hash = "abc12345def67890"): void {
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+describe("Node-floor gate for cut-over repos", () => {
+	beforeEach(() => {
+		vi.resetAllMocks();
+		vi.mocked(readManualDisableFlag).mockResolvedValue(false);
+	});
+	afterEach(() => {
+		cutoverRouteState.state = "uncutover";
+		cutoverRouteState.reason = undefined;
+	});
+
+	it("holds the drain on a blocked route — entries stay queued, nothing is deleted", async () => {
+		cutoverRouteState.state = "blocked";
+		cutoverRouteState.reason = "Node lacks flag-free node:sqlite";
+		const { deleteQueueEntry } = await import("../core/SessionTracker.js");
+		const { emitCaptureProgress } = await import("./CaptureProgress.js");
+		const { runWorker } = await import("./QueueWorker.js");
+		// `peek`, not `dequeue`: the gate reads the queue WITHOUT the stale-prune
+		// side effect `dequeueAllGitOperations` performs on every read.
+		vi.mocked(peekAllGitOperations).mockResolvedValue([
+			makeCommitOp({ commitHash: "feed1234" }),
+			{ type: "ingest", createdAt: "2026-04-01T12:00:00.000Z" } as IngestOperation,
+		]);
+		await runWorker("/repo");
+		// The gate exits BEFORE the drain: no lock taken, and above all no
+		// fire-and-forget entry deletion while summaries have nowhere to land.
+		// The queue IS read once — non-destructively — so each held commit can
+		// get a terminal capture event; without one, the post-commit watcher
+		// (which treats an absent capture lock as "worker still coming") blocks
+		// every interactive commit for the full feedback timeout.
+		expect(acquireWorkerLock).not.toHaveBeenCalled();
+		expect(deleteQueueEntry).not.toHaveBeenCalled();
+		// The prune lives inside `dequeueAllGitOperations`, so "nothing is deleted"
+		// is only true while the gate stays off that function entirely.
+		expect(dequeueAllGitOperations).not.toHaveBeenCalled();
+		expect(emitCaptureProgress).toHaveBeenCalledTimes(1);
+		expect(emitCaptureProgress).toHaveBeenCalledWith("/repo", "feed1234", "failed", { terminal: true });
+	});
+});
 
 describe("QueueWorker", () => {
 	beforeEach(() => {
@@ -987,6 +1052,30 @@ describe("QueueWorker", () => {
 			expect(storeSummary).toHaveBeenCalledTimes(1);
 			const savedSummary = vi.mocked(storeSummary).mock.calls[0][0];
 			expect(savedSummary.branch).toBe("feature/live");
+		});
+
+		it("projects the drained commits into the dashboard after a successful drain", async () => {
+			const op = makeCommitOp({ commitHash: "dash1234def67890" });
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/entry.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+			setupPipelineMocks();
+
+			await runWorker("/test/cwd");
+
+			expect(recordCommitsFromWorker).toHaveBeenCalledTimes(1);
+			const [cwd, hashes] = vi.mocked(recordCommitsFromWorker).mock.calls[0];
+			expect(cwd).toBe("/test/cwd");
+			expect([...(hashes as Set<string>)]).toEqual(["dash1234def67890"]);
+		});
+
+		it("does not touch the dashboard when the drain produced nothing", async () => {
+			vi.mocked(dequeueAllGitOperations).mockResolvedValue([]);
+
+			await runWorker("/test/cwd");
+
+			expect(recordCommitsFromWorker).not.toHaveBeenCalled();
 		});
 	});
 
@@ -2675,6 +2764,47 @@ describe("QueueWorker", () => {
 			expect(stored.sessions[0]).not.toHaveProperty("usage");
 			expect(stored.sessions[0]).not.toHaveProperty("usageByModel");
 		});
+
+		it("persists tool calls so the dashboard can read them after the transcript is gone", () => {
+			const stored = __test__.buildStoredTranscript([
+				{
+					sessionId: "s1",
+					transcriptPath: "/claude/s1.jsonl",
+					source: "claude",
+					entries: [],
+					toolUse: [
+						{ name: "Bash", kind: "builtin", calls: 3 },
+						{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory", calls: 1 },
+						{ name: "code-review", kind: "skill", calls: 2 },
+					],
+				},
+			]);
+
+			expect(stored.sessions[0].toolUse).toEqual([
+				{ name: "Bash", kind: "builtin", calls: 3 },
+				{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory", calls: 1 },
+				{ name: "code-review", kind: "skill", calls: 2 },
+			]);
+		});
+
+		it("keeps an empty toolUse, which claims 'called no tools' — unlike absent", () => {
+			// The two are different facts and the dashboard branches on which it got:
+			// `[]` replaces stored rows, absent leaves them alone. Length-gating this
+			// the way `usageByModel` is gated would collapse them.
+			const stored = __test__.buildStoredTranscript([
+				{ sessionId: "s1", transcriptPath: "/claude/s1.jsonl", source: "claude", entries: [], toolUse: [] },
+			]);
+
+			expect(stored.sessions[0].toolUse).toEqual([]);
+		});
+
+		it("omits toolUse for a source whose parser cannot report tool calls", () => {
+			const stored = __test__.buildStoredTranscript([
+				{ sessionId: "s1", transcriptPath: "/gemini/s1.json", source: "gemini", entries: [] },
+			]);
+
+			expect(stored.sessions[0]).not.toHaveProperty("toolUse");
+		});
 	});
 
 	describe("attachPerSessionUsage", () => {
@@ -2770,6 +2900,57 @@ describe("QueueWorker", () => {
 
 			expect(out[0].usage).toEqual({ input: 1, output: 2, cached: 0 });
 			expect(out[0]).not.toHaveProperty("usageByModel");
+		});
+
+		it("attaches the bucket's tool calls alongside its usage", () => {
+			const out = __test__.attachPerSessionUsage(
+				[{ sessionId: "s1", transcriptPath: "/a.jsonl", source: "claude" as const, entries: [] }],
+				new Map([
+					[
+						"claude:s1",
+						{
+							...bucket(1, 2, 3),
+							byTool: new Map([["builtin:Bash", { name: "Bash", kind: "builtin" as const, calls: 4 }]]),
+						},
+					],
+				]),
+				new Map(),
+				new Map(),
+			);
+
+			expect(out[0].toolUse).toEqual([{ name: "Bash", kind: "builtin", calls: 4 }]);
+		});
+
+		it("attaches no tool calls for a bucket that never recorded any", () => {
+			const out = __test__.attachPerSessionUsage(
+				[{ sessionId: "s1", transcriptPath: "/a.jsonl", source: "claude" as const, entries: [] }],
+				new Map([["claude:s1", bucket(1, 2, 3)]]),
+				new Map(),
+				new Map(),
+			);
+
+			expect(out[0]).not.toHaveProperty("toolUse");
+		});
+
+		it("drops tool calls for a session an overlay pruned, like its usage", () => {
+			// The pruned slices are not part of what this commit summarised, so their
+			// tool calls are not this commit's either.
+			const out = __test__.attachPerSessionUsage(
+				[{ sessionId: "s1", transcriptPath: "/a.jsonl", source: "claude" as const, entries: [] }],
+				new Map([
+					[
+						"claude:s1",
+						{
+							...bucket(100, 200, 700),
+							byTool: new Map([["builtin:Bash", { name: "Bash", kind: "builtin" as const, calls: 9 }]]),
+						},
+					],
+				]),
+				new Map([["claude:s1", 5]]),
+				new Map([["claude:s1", 2]]),
+			);
+
+			expect(out[0]).not.toHaveProperty("toolUse");
 		});
 	});
 

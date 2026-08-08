@@ -8,7 +8,7 @@
 import { createLogger } from "../Logger.js";
 import type { FileWrite } from "../Types.js";
 import type { StorageProvider } from "./StorageProvider.js";
-import { resolveStorage } from "./SummaryStore.js";
+import { resolveStorage, withRequiredOrphanWriteLock } from "./SummaryStore.js";
 import type { TopicPage } from "./TopicKBTypes.js";
 
 const log = createLogger("TopicPageStore");
@@ -32,7 +32,7 @@ export async function readTopicPage(slug: string, cwd?: string, storage?: Storag
 		log.warn("Refusing to read topic page with unsafe slug %s", slug);
 		return null;
 	}
-	const resolved = resolveStorage(storage, cwd);
+	const resolved = await resolveStorage(storage, cwd);
 	const raw = await resolved.readFile(`topics/${slug}.json`);
 	if (!raw) return null;
 	try {
@@ -48,14 +48,19 @@ export async function saveTopicPage(page: TopicPage, cwd?: string, storage?: Sto
 	if (!isSafeSlug(page.stableSlug)) {
 		throw new Error(`Refusing to write topic page with unsafe slug: ${page.stableSlug}`);
 	}
-	const resolved = resolveStorage(storage, cwd);
+	const resolved = await resolveStorage(storage, cwd);
 	const files: FileWrite[] = [{ path: `topics/${page.stableSlug}.json`, content: JSON.stringify(page, null, "\t") }];
-	await resolved.writeFiles(files, `Update topic page ${page.stableSlug}`);
+	// Under orphan-write.lock: the cutover CAS verifies frozen tips while
+	// holding every source's lock, so an unlocked write here could land on the
+	// branch after the compare and never reach the database (D6 invariant).
+	await withRequiredOrphanWriteLock(cwd, "saveTopicPage", () =>
+		resolved.writeFiles(files, `Update topic page ${page.stableSlug}`),
+	);
 }
 
 /** Lists all topic page slugs under `topics/`, excluding index.json / processed.json. */
 export async function listTopicPageSlugs(cwd?: string, storage?: StorageProvider): Promise<ReadonlyArray<string>> {
-	const resolved = resolveStorage(storage, cwd);
+	const resolved = await resolveStorage(storage, cwd);
 	const files = await resolved.listFiles("topics/");
 	return files
 		.filter((f) => f.startsWith("topics/") && f.endsWith(".json"))
@@ -81,13 +86,15 @@ export async function purgeTopicPagesExcept(
 	storage?: StorageProvider,
 ): Promise<string[]> {
 	const keep = new Set(keepSlugs);
-	const resolved = resolveStorage(storage, cwd);
+	const resolved = await resolveStorage(storage, cwd);
 	const slugs = await listTopicPageSlugs(cwd, resolved);
 	const orphans = slugs.filter((slug) => !keep.has(slug));
 	if (orphans.length > 0) {
-		await resolved.writeFiles(
-			orphans.map((slug) => ({ path: `topics/${slug}.json`, content: "", delete: true })),
-			`Purge ${orphans.length} orphaned topic page(s)`,
+		await withRequiredOrphanWriteLock(cwd, "purgeOrphanTopicPages", () =>
+			resolved.writeFiles(
+				orphans.map((slug) => ({ path: `topics/${slug}.json`, content: "", delete: true })),
+				`Purge ${orphans.length} orphaned topic page(s)`,
+			),
 		);
 		log.info("Purged %d orphaned topic page(s): %s", orphans.length, orphans.join(", "));
 	}

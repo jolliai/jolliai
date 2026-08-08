@@ -23,10 +23,26 @@ PLUGIN_DIR="$SRC/plugins/jolli"
 # <dist>/<Hook>.js` at commit time, so a missing hook/worker BLOCKS the
 # installing user's commit (see plugins/jolli/scripts/build.mjs header). Kept in
 # lockstep with that build's entryPoints AND with publish-zip.sh's REQUIRED_DIST.
+# The dashboard assets are listed FILE BY FILE, not by their index.html alone:
+# `assembleDashboardHtml` reads the stylesheet and every entry of its SCRIPT_FILES
+# at request time, so a marketplace-repo .gitignore matching `js/` or `*.css`
+# passed this gate and produced a 500 on the first `jolli dashboard` (this repo has
+# already lost a SKILL.md to exactly that). Keep in lockstep with SCRIPT_FILES in
+# cli/src/dashboard/DashboardServer.ts.
 PUBLISH_REQUIRED_DIST=(
 	Cli.js PluginBootstrapHook.js StopHook.js SessionStartHook.js
 	PostCommitHook.js PostMergeHook.js PostRewriteHook.js PrepareMsgHook.js PrePushHook.js
-	QueueWorker.js PrePushWorker.js
+	QueueWorker.js PrePushWorker.js DashboardServerEntry.js
+	dashboard-assets/index.html
+	dashboard-assets/styles/main.css
+	dashboard-assets/js/format.js
+	dashboard-assets/js/charts.js
+	dashboard-assets/js/shell.js
+	dashboard-assets/js/stats.js
+	dashboard-assets/js/standup.js
+	dashboard-assets/js/repositories.js
+	dashboard-assets/js/memories.js
+	dashboard-assets/js/main.js
 )
 
 # Skills the plugin ships (must match plugins/jolli/skills/ exactly). Used for

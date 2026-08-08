@@ -27,8 +27,8 @@ import { FolderStorage } from "../core/FolderStorage.js";
 import { extractRepoName, getRemoteUrl, resolveKBPath } from "../core/KBPathResolver.js";
 import { MetadataManager } from "../core/MetadataManager.js";
 import { MigrationEngine } from "../core/MigrationEngine.js";
-import { OrphanBranchStorage } from "../core/OrphanBranchStorage.js";
 import { loadConfig } from "../core/SessionTracker.js";
+import { resolveSotStorage } from "../core/SotStorageResolver.js";
 import { createLogger, errMsg, setLogDir } from "../Logger.js";
 import { CliConflictUi } from "../sync/CliConflictUi.js";
 import { buildSyncEngine } from "../sync/SyncBootstrap.js";
@@ -49,10 +49,10 @@ export async function runSync(options: SyncCommandOptions): Promise<number> {
 		return 1;
 	}
 
-	// Claim the Memory Bank folder for this repo and run the orphan→folder
-	// migration if needed. The VS Code activate path does this on every
+	// Claim the Memory Bank folder for this repo and run the system-of-record →
+	// folder migration if needed. The VS Code activate path does this on every
 	// window open; without an equivalent step here, a CLI-only user whose
-	// pre-0.99 memory still lives on the orphan branch would push an empty
+	// pre-0.99 memory still lives in the system of record would push an empty
 	// FolderStorage to Personal Space and never sync the real data (P3#7).
 	try {
 		await ensureKBInitAndMigrated(options.cwd, config.localFolder);
@@ -134,9 +134,9 @@ function reportResult(result: SyncRoundResult): number {
  *
  *   1. `resolveKBPath` claims `<localFolder>/<repo>/` and writes identity
  *      into `.jolli/config.json` so FolderStorage / sync see the same path.
- *   2. If an orphan branch exists and migration has not completed, run the
- *      full `MigrationEngine.runMigration()` to copy summaries / transcripts
- *      / plans / notes onto disk.
+ *   2. If the system of record holds data and migration has not completed, run
+ *      the full `MigrationEngine.runMigration()` to copy summaries /
+ *      transcripts / plans / notes onto disk.
  *   3. If migration already completed but the v3 stale-child cleanup has
  *      not, run that idempotent pass.
  *
@@ -150,15 +150,19 @@ export async function ensureKBInitAndMigrated(cwd: string, localFolder: string |
 	const remoteUrl = getRemoteUrl(cwd);
 	const kbRoot = resolveKBPath(repoName, remoteUrl, localFolder);
 
-	const orphan = new OrphanBranchStorage(cwd);
-	if (!(await orphan.exists())) return;
+	// The system of record, not the orphan branch: past a cutover the branch is
+	// frozen (and a post-cutover clone has none at all), so hard-coding it here
+	// rebuilt the folder from stale data — or returned "nothing to migrate" —
+	// while reporting success.
+	const sot = await resolveSotStorage(cwd);
+	if (!(await sot.exists())) return;
 
 	const mm = new MetadataManager(join(kbRoot, ".jolli"));
 	const migrationState = mm.readMigrationState();
 	if (!migrationState || migrationState.status !== "completed") {
 		const folder = new FolderStorage(kbRoot, mm);
 		await folder.ensure();
-		const engine = new MigrationEngine(orphan, folder, mm);
+		const engine = new MigrationEngine(sot, folder, mm);
 		const result = await engine.runMigration();
 		log.info("KB auto-migration: %s (%d/%d entries)", result.status, result.migratedEntries, result.totalEntries);
 	} else {
@@ -169,7 +173,7 @@ export async function ensureKBInitAndMigrated(cwd: string, localFolder: string |
 		// cleanup never revisits.
 		const folder = new FolderStorage(kbRoot, mm);
 		await folder.ensure();
-		const engine = new MigrationEngine(orphan, folder, mm);
+		const engine = new MigrationEngine(sot, folder, mm);
 		const result = await engine.runStaleChildCleanup();
 		log.info(
 			"KB stale-child reconcile: swept=%d completedAt=%s",

@@ -14,6 +14,7 @@ import type { SkillTableRow } from "../core/SkillsAggregateMarkdown.js";
 import { runWithTrace } from "../core/TraceContext.js";
 import { buildRefreshParams, computeWatchTargets } from "../daemon/DaemonServer.js";
 import { DaemonWatcher } from "../daemon/DaemonWatcher.js";
+import { recordMemoryEdit } from "../dashboard/ProducerHooks.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { ConflictUi, Tier3Pick } from "../sync/ConflictResolver.js";
 import type { FileWrite, JolliMemoryConfig, LocalAgentToolId, TranscriptSource } from "../Types.js";
@@ -173,15 +174,91 @@ function conflictChoices(request: JsonObject): Record<string, "mine" | "theirs">
 	return choices;
 }
 
+/**
+ * Bridge operations that put the user's data somewhere. Gated on the manual
+ * opt-out below; every other operation stays readable while disabled, exactly
+ * like the Settings dialog does (see `repo-hooks`' own gate).
+ *
+ * `ensure` is deliberately absent: it creates an empty container, and the
+ * install flow that calls it is already gated at its own action.
+ */
+const STORAGE_WRITE_OPERATIONS: ReadonlySet<string> = new Set(["write"]);
+const SUMMARY_STORE_WRITE_OPERATIONS: ReadonlySet<string> = new Set([
+	"store-summary",
+	"store-files",
+	"write-plan",
+	"write-reference",
+	"write-transcript-batch",
+]);
+
+/** What a refused write answers. See {@link refuseWriteIfManuallyDisabled}. */
+const MANUALLY_DISABLED_RESULT = { ok: false, manuallyDisabled: true } as const;
+
+/**
+ * `jolli disable` must stop bridge writes, and only this layer can enforce it.
+ *
+ * The providers' own `isManuallyDisabled()` gate cannot: it reads a
+ * process-local boolean in `Logger.ts` that ONLY the VS Code extension host
+ * ever sets (`Extension.ts` activate/enable/disable). `ide-bridge-serve` is a
+ * CLI process, where — as Logger's own docstring states — the in-memory flag is
+ * inert. Nothing else covers this path either: the argument that "disable
+ * uninstalls the git hooks, so no new writer starts" does not apply to a
+ * long-lived server the JVM host already has running, and every backend has the
+ * same bare in-memory gate, so the exposure is not specific to one route.
+ *
+ * `readManualDisableFlag` is the disk-backed, async read, and it answers
+ * `userDisabled` — NOT the composite `manuallyDisabled`, which also folds in the
+ * cutover fence. Reading the composite would stop the new runtime on exactly
+ * the repos whose orphan branch is frozen, i.e. the ones where SQLite is the
+ * only place a memory can go.
+ *
+ * Checked BEFORE the write path takes its orphan-write lock, same as the
+ * `repo-hooks` action: a disabled repo should not contend for a lock, and the
+ * flag is stable across it.
+ *
+ * The refusal is explicit (`ok: false`) rather than a silent `{ ok: true }`.
+ * A host told the write succeeded when nothing was written has no way to
+ * notice; an older plugin that drops the unknown `manuallyDisabled` field still
+ * sees a failed write, which is the safer of the two things to be wrong about.
+ */
+async function refuseWriteIfManuallyDisabled(
+	cwd: string,
+	operation: string,
+	writeOperations: ReadonlySet<string>,
+): Promise<typeof MANUALLY_DISABLED_RESULT | null> {
+	if (!writeOperations.has(operation)) return null;
+	const { readManualDisableFlag } = await import("../core/RepoProfile.js");
+	return (await readManualDisableFlag(cwd)) ? MANUALLY_DISABLED_RESULT : null;
+}
+
 async function runStorageAction(cwd: string, request: JsonObject): Promise<unknown> {
+	const operation = stringField(request, "operation");
+	const refused = await refuseWriteIfManuallyDisabled(cwd, operation, STORAGE_WRITE_OPERATIONS);
+	if (refused) return refused;
 	const { createStorage } = await import("../core/StorageFactory.js");
 	const storage = await createStorage(cwd, cwd);
-	const operation = stringField(request, "operation");
 	switch (operation) {
 		case "read":
 			return { content: await storage.readFile(stringField(request, "path")) };
 		case "list":
 			return { paths: await storage.listFiles(stringField(request, "prefix")) };
+		case "batch-read": {
+			// One bridge round trip for N paths. Without this, IntelliJ's move off
+			// the folder reader turns every list-then-read screen into N CLI
+			// subprocesses — the plan's G.3 calls this out as a same-PR requirement.
+			const paths = request.paths;
+			if (!Array.isArray(paths)) throw new Error('Request field "paths" must be an array.');
+			// batchReadFiles is optional on the interface; a provider without it
+			// still answers, just without the single-round-trip optimization.
+			const contents = storage.batchReadFiles
+				? await storage.batchReadFiles(paths as string[])
+				: new Map(
+						await Promise.all(
+							(paths as string[]).map(async (p) => [p, await storage.readFile(p)] as const),
+						),
+					);
+			return { contents: Object.fromEntries(contents) };
+		}
 		case "exists":
 			return { exists: await storage.exists() };
 		case "ensure":
@@ -190,7 +267,22 @@ async function runStorageAction(cwd: string, request: JsonObject): Promise<unkno
 		case "write": {
 			const files = request.files;
 			if (!Array.isArray(files)) throw new Error('Request field "files" must be an array.');
-			await storage.writeFiles(files as FileWrite[], stringField(request, "message"));
+			// Under orphan-write.lock: this action exposes bare writeFiles to the
+			// IDE, and an unlocked orphan write can land on the branch between
+			// the cutover's compare and its CAS tip-check (D6 invariant).
+			//
+			// MUST-LAND budget, not the background one. `ide-bridge-serve` dispatches
+			// request lines concurrently, and the re-entrancy store only propagates
+			// down the holder's own await chain — so a second write request in flight
+			// is a genuine competitor for a file lock that refuses even its own PID.
+			// On the 1 s background budget it simply failed, and the JVM host does not
+			// retry; 30 s waits out the ~50-200 ms held window instead.
+			// Lazily imported like every other SummaryStore use here — a static import
+			// would pull that module's graph into CLI startup.
+			const { withRequiredOrphanWriteLock } = await import("../core/SummaryStore.js");
+			await withRequiredOrphanWriteLock(cwd, "ide-bridge storage.write", () =>
+				storage.writeFiles(files as FileWrite[], stringField(request, "message")),
+			);
 			return { ok: true };
 		}
 		default:
@@ -1274,6 +1366,8 @@ async function runSharedStoreAction(cwd: string, request: JsonObject): Promise<u
 
 async function runSummaryStoreAction(cwd: string, request: JsonObject): Promise<unknown> {
 	const operation = stringField(request, "operation");
+	const refused = await refuseWriteIfManuallyDisabled(cwd, operation, SUMMARY_STORE_WRITE_OPERATIONS);
+	if (refused) return refused;
 	const [summaries, { createStorage }] = await Promise.all([
 		import("../core/SummaryStore.js"),
 		import("../core/StorageFactory.js"),
@@ -1355,6 +1449,11 @@ async function runSummaryStoreAction(cwd: string, request: JsonObject): Promise<
 				},
 				storage,
 			);
+			// The JVM host edits memories through this action; without the
+			// re-projection the local dashboard keeps serving the pre-edit
+			// conversations/plans (see `recordMemoryEdit`). VS Code gets the same
+			// call from its own bridge.
+			await recordMemoryEdit(cwd, [summary.commitHash]);
 			return { ok: true };
 		}
 		case "read-plan-progress":
@@ -1362,7 +1461,12 @@ async function runSummaryStoreAction(cwd: string, request: JsonObject): Promise<
 		case "store-files": {
 			const files = request.files;
 			if (!Array.isArray(files)) throw new Error('Request field "files" must be an array.');
-			await storage.writeFiles(files as FileWrite[], stringField(request, "message"));
+			// Same D6 rule — and the same must-land budget — as the storage action's
+			// "write" above.
+			const { withRequiredOrphanWriteLock } = await import("../core/SummaryStore.js");
+			await withRequiredOrphanWriteLock(cwd, "ide-bridge store-files", () =>
+				storage.writeFiles(files as FileWrite[], stringField(request, "message")),
+			);
 			return { ok: true };
 		}
 		case "read-plan":

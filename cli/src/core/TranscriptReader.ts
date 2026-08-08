@@ -24,6 +24,7 @@ import { createLogger } from "../Logger.js";
 import type {
 	ConversationTokenBreakdown,
 	ModelTokenUsage,
+	ToolCallCount,
 	TranscriptCursor,
 	TranscriptEntry,
 	TranscriptReadResult,
@@ -171,6 +172,10 @@ export async function readTranscript(
 	// a different line than the usage — see TranscriptParser.parseUsageByModel.
 	const consumedLines = newLines.slice(0, lastConsumedLineIndex - startLine);
 	const usageByModel = activeParser.parseUsageByModel?.(consumedLines);
+	// Tool calls over the same consumed lines. Absent (not empty) for a source
+	// whose parser cannot see them, so downstream can tell "this agent used no
+	// tools" apart from "this agent's transcripts do not record tools".
+	const toolUse = activeParser.parseToolUse?.(consumedLines);
 
 	// When beforeTimestamp is set, advance cursor only to the last consumed line.
 	// Without beforeTimestamp (legacy/CLI path), advance to EOF for backward compatibility.
@@ -187,6 +192,9 @@ export async function readTranscript(
 		usageTokens: usageInput + usageOutput + usageCached,
 		usageBreakdown: { input: usageInput, output: usageOutput, cached: usageCached },
 		...(usageByModel && usageByModel.length > 0 && { usageByModel }),
+		// Kept even when empty: an empty array is the positive fact "this slice
+		// called no tools", which absence cannot express.
+		...(toolUse && { toolUse }),
 	};
 }
 
@@ -357,6 +365,10 @@ export interface SessionTranscript {
 	readonly usage?: ConversationTokenBreakdown;
 	/** Per-model split of {@link usage}. */
 	readonly usageByModel?: ReadonlyArray<ModelTokenUsage>;
+	/** Tool/MCP/skill calls made in this commit's slices, attached alongside
+	 *  {@link usage} and persisted as {@link StoredSession.toolUse}. Absent for
+	 *  sources whose parser cannot report tool calls. */
+	readonly toolUse?: ReadonlyArray<ToolCallCount>;
 }
 
 /**

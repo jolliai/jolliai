@@ -2698,13 +2698,27 @@ class SummaryPanel(
                         if (session == null) {
                             val origSessions = originalTranscript?.sessions ?: emptyList()
                             val origSession = origSessions.find { "${it.source?.name ?: "claude"}:${it.sessionId ?: ""}" == key }
-                            session = RebuildSession(sessionId, source, origSession?.transcriptPath)
+                            session = RebuildSession(sessionId, source, origSession?.transcriptPath, orig = origSession)
                             sessionMap[key] = session
                         }
-                        session.entries.add(TranscriptEntry(role = e.get("role")?.asString ?: "assistant", content = e.get("content")?.asString ?: "", timestamp = e.get("timestamp")?.asString?.takeIf { it.isNotEmpty() }))
+                        // Per-entry usage travels with the entry, matched against the
+                        // stored session: the webview payload carries only role /
+                        // content / timestamp, so rebuilding blind stripped the token
+                        // record off EVERY message of every commit this editor saved —
+                        // including the sessions the user never touched. An entry the
+                        // user edited legitimately finds no match and keeps none.
+                        val rebuilt = TranscriptEntry(role = e.get("role")?.asString ?: "assistant", content = e.get("content")?.asString ?: "", timestamp = e.get("timestamp")?.asString?.takeIf { it.isNotEmpty() })
+                        session.entries.add(rebuilt.copy(usage = session.takeUsageFor(rebuilt)))
                     }
                     writes[commitHash] = StoredTranscript(sessions = sessionMap.values.map { s ->
-                        StoredSession(sessionId = s.sessionId, source = try { ai.jolli.jollimemory.core.TranscriptSource.valueOf(s.source) } catch (_: Exception) { ai.jolli.jollimemory.core.TranscriptSource.claude }, transcriptPath = s.transcriptPath, entries = s.entries)
+                        // usage / usageByModel / toolUse come from the stored session
+                        // unchanged. They are the commit's token attribution and its
+                        // only surviving tool record (the raw JSONL is gone within
+                        // days), and this path does not recompute the summary's own
+                        // conversation totals either — so carrying them through keeps
+                        // the two consistent, where rebuilding without them deleted
+                        // both for every session of the edited commit.
+                        StoredSession(sessionId = s.sessionId, source = try { ai.jolli.jollimemory.core.TranscriptSource.valueOf(s.source) } catch (_: Exception) { ai.jolli.jollimemory.core.TranscriptSource.claude }, transcriptPath = s.transcriptPath, entries = s.entries, usage = s.orig?.usage, usageByModel = s.orig?.usageByModel, toolUse = s.orig?.toolUse)
                     })
                 }
 
@@ -2776,7 +2790,29 @@ class SummaryPanel(
         } catch (_: Exception) { "" }
     }
 
-    private data class RebuildSession(val sessionId: String, val source: String, val transcriptPath: String?, val entries: MutableList<TranscriptEntry> = mutableListOf())
+    private data class RebuildSession(
+        val sessionId: String,
+        val source: String,
+        val transcriptPath: String?,
+        val entries: MutableList<TranscriptEntry> = mutableListOf(),
+        /** The stored session this one rebuilds, source of everything the webview cannot round-trip. */
+        val orig: StoredSession? = null,
+    ) {
+        /**
+         * The stored per-entry usage for [entry], consumed so two identical
+         * messages cannot both claim the same record (which would double-count
+         * the pair). Null when the entry is new or was edited.
+         */
+        private val unclaimedUsage: MutableList<TranscriptEntry> by lazy { (orig?.entries ?: emptyList()).toMutableList() }
+
+        fun takeUsageFor(entry: TranscriptEntry): ai.jolli.jollimemory.core.MessageUsage? {
+            val i = unclaimedUsage.indexOfFirst {
+                it.role == entry.role && it.content == entry.content && it.timestamp == entry.timestamp
+            }
+            if (i < 0) return null
+            return unclaimedUsage.removeAt(i).usage
+        }
+    }
 
     companion object {
         private val LOG = Logger.getInstance(SummaryPanel::class.java)

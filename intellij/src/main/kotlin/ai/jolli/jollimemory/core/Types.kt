@@ -91,12 +91,47 @@ data class TranscriptReadResult(
     val totalLinesRead: Int,
 )
 
-/** A session's transcript data as stored in the orphan branch */
+/**
+ * One tool / MCP / skill call bucket a session recorded. **Cross-implementation
+ * contract — field-for-field with the TS `ToolCallCount`.**
+ *
+ * `kind` is a plain String, not an enum: Gson deserializes an unrecognised enum
+ * constant to null, so a kind added by a newer CLI would blank the row here
+ * instead of passing through.
+ */
+data class ToolCallCount(
+    val name: String,
+    val kind: String,
+    /** MCP server the tool belongs to. Present only when [kind] is `"mcp"`. */
+    val server: String? = null,
+    val calls: Int = 0,
+)
+
+/**
+ * A session's transcript data as stored in the orphan branch.
+ *
+ * **Field-for-field with the TS `StoredSession`.** The three optional fields
+ * below are not decoration: this type is also the WRITE shape (the transcript
+ * editor rebuilds a whole `StoredTranscript` from it), and Gson drops what it
+ * does not know — so a field missing here is a field silently deleted from every
+ * session of every commit the editor saves, not merely one it cannot display.
+ *
+ * All three are forward-only, exactly as on the TS side: absent on memories
+ * written before they existed and on sources whose parser cannot see them.
+ * Absence means "not recorded" — never "this session used no tokens / called no
+ * tools", which is the positive fact an empty value carries.
+ */
 data class StoredSession(
     val sessionId: String,
     val source: TranscriptSource? = null,
     val transcriptPath: String? = null,
     val entries: List<TranscriptEntry>,
+    /** This session's own share of the commit's conversation tokens. */
+    val usage: ConversationTokenBreakdown? = null,
+    /** Per-model split of [usage], so a detach can also correct the cost estimate. */
+    val usageByModel: List<ModelTokenUsage>? = null,
+    /** Tool / MCP / skill calls this session made in the slices this commit owns. */
+    val toolUse: List<ToolCallCount>? = null,
 )
 
 /** Structured transcript data for a commit */

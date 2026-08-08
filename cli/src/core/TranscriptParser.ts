@@ -11,7 +11,7 @@
  */
 
 import { createLogger } from "../Logger.js";
-import type { ModelTokenUsage, ParsedTurnUsage, TranscriptEntry } from "../Types.js";
+import type { ModelTokenUsage, ParsedTurnUsage, ToolCallCount, TranscriptEntry } from "../Types.js";
 import { parseTranscriptLine } from "./TranscriptReader.js";
 
 const log = createLogger("TranscriptParser");
@@ -42,6 +42,35 @@ export interface TranscriptParser {
 	 *  token accumulation / cursor advance on such lines, not only on entry-bearing
 	 *  ones. Absent method = the cutoff falls back to entry timestamps only. */
 	parseTimestamp?(line: string, lineNum: number): string | undefined;
+	/** Tool calls over a whole consumed slice, one bucket per distinct tool.
+	 *  Whole-slice for the same reason as {@link parseUsageByModel}: one API
+	 *  response is written across several lines and a `tool_use` block must be
+	 *  counted once, which needs cross-line dedupe state. Absent method = the
+	 *  source's transcripts expose no tool records, and every consumer must
+	 *  report that source as UNCOVERED rather than as "used no tools". */
+	parseToolUse?(lines: ReadonlyArray<string>): ToolCallCount[];
+}
+
+/**
+ * Classifies a raw tool name from a transcript.
+ *
+ * MCP tools arrive as `mcp__<server>__<tool>` — the wire name, which is what
+ * makes the server extractable at all. The double underscore is the separator
+ * the MCP host itself uses, and a server or tool name may contain single
+ * underscores, so the split is on `__` and only the FIRST two segments are
+ * structural; anything after them is part of the tool name.
+ */
+export function classifyToolName(raw: string): ToolCallCount {
+	if (raw.startsWith("mcp__")) {
+		const rest = raw.slice("mcp__".length);
+		const sep = rest.indexOf("__");
+		// `mcp__server` with no tool segment is malformed; keep it attributed to
+		// the server rather than dropping the call.
+		const server = sep === -1 ? rest : rest.slice(0, sep);
+		const tool = sep === -1 ? "" : rest.slice(sep + 2);
+		return { name: tool ? `${server}.${tool}` : server, kind: "mcp", server, calls: 0 };
+	}
+	return { name: raw, kind: "builtin", calls: 0 };
 }
 
 /**
@@ -71,9 +100,10 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 	/**
 	 * Per-model split: one bucket per distinct `message.model`, summed over the
 	 * slice. Reuses {@link extractClaudeUsage} so the segment values can never
-	 * drift from {@link parseUsageTokens}. Lines with usage but no model string
-	 * are bucketed under an empty model id (provider "anthropic") — they still
-	 * count toward tokens; pricing will treat an unknown id as unpriced.
+	 * drift from {@link parseUsageTokens}. Lines with usage but no model string —
+	 * absent, or a sentinel such as `"<synthetic>"` (see {@link isSentinelModel})
+	 * — are bucketed under an empty model id (provider "anthropic"); they still
+	 * count toward tokens, and pricing will treat an unknown id as unpriced.
 	 *
 	 * De-duplicates by `message.id` for the same reason the reader does (see
 	 * {@link ParsedTurnUsage}) — and it must dedupe on the SAME identity, or the
@@ -108,7 +138,55 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 				});
 			}
 		}
-		return [...byModel.values()];
+		// A bucket whose three segments are all zero cannot move a token total or a
+		// cost, so keeping it only costs a legend slot in the dashboard's spend card
+		// — which is exactly what the normalised sentinel turns above would produce
+		// (an empty-id bucket of 0/0/0), pushing out a real low-spend model.
+		return [...byModel.values()].filter((m) => m.input + m.output + m.cached > 0);
+	}
+
+	/**
+	 * Counts `tool_use` blocks across a slice.
+	 *
+	 * Deduped on the block's own `toolu_…` id, not on the message id: one API
+	 * response can contain several distinct tool calls, so keying on the message
+	 * would collapse them to one, while the same response repeated across lines
+	 * would otherwise count each call several times. The block id is unique per
+	 * call and stable across those repeats — exactly the identity needed.
+	 *
+	 * A `Skill` call is re-attributed to the skill it ran (`input.skill`), since
+	 * "which skills does this person use" is the question being asked; counting
+	 * every skill invocation as one builtin named `Skill` would answer nothing.
+	 */
+	parseToolUse(lines: ReadonlyArray<string>): ToolCallCount[] {
+		const byName = new Map<string, ToolCallCount>();
+		const seen = new Set<string>();
+		for (const line of lines) {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			const content = (parsed as { message?: { content?: unknown } })?.message?.content;
+			if (!Array.isArray(content)) continue;
+			for (const block of content) {
+				const b = block as { type?: unknown; id?: unknown; name?: unknown; input?: { skill?: unknown } };
+				if (b.type !== "tool_use" || typeof b.name !== "string") continue;
+				if (typeof b.id === "string") {
+					if (seen.has(b.id)) continue;
+					seen.add(b.id);
+				}
+				const classified =
+					b.name === "Skill" && typeof b.input?.skill === "string"
+						? ({ name: b.input.skill, kind: "skill", calls: 0 } as ToolCallCount)
+						: classifyToolName(b.name);
+				const key = `${classified.kind}:${classified.name}`;
+				const existing = byName.get(key);
+				byName.set(key, existing ? { ...existing, calls: existing.calls + 1 } : { ...classified, calls: 1 });
+			}
+		}
+		return [...byName.values()];
 	}
 
 	parseTimestamp(line: string, _lineNum?: number): string | undefined {
@@ -343,8 +421,8 @@ function parseCodexAgentMessage(
  * carries `cache_creation_input_tokens` only. See the fixture-backed test.
  *
  * `model` is `message.model` (falling back to a top-level `model`), or an empty
- * string when absent; the turn still counts toward tokens and pricing treats an
- * empty/unknown id as unpriced.
+ * string when absent or a sentinel (see {@link isSentinelModel}); the turn still
+ * counts toward tokens and pricing treats an empty/unknown id as unpriced.
  *
  * `id` is `message.id` — the API response's identity, used to collapse the
  * several lines one response is written across (see `ParsedTurnUsage`). Empty
@@ -385,6 +463,25 @@ export interface ClaudeTurnUsage {
  * per-skill attribution — must come through here, or its numbers will drift from
  * the others' for the same transcript.
  */
+/**
+ * True for a placeholder the agent CLI writes where a model id would go.
+ *
+ * Claude Code fabricates an assistant line for turns that never reached a model
+ * (context overflow, `API Error: 529`, a dropped connection, an expired session)
+ * and stamps it `"<synthetic>"`. Angle brackets are the CLI telling downstream
+ * "this is not a model id", so the shape — not the one literal — is what is
+ * recognised here; a future sentinel of the same form is covered.
+ *
+ * Such a line still carries a `usage` object, all zeros, so the existence check
+ * above cannot reject it. Left alone it becomes its own per-model bucket: zero
+ * tokens, zero cost, and one legend slot in the dashboard's spend card taken
+ * from a real low-spend model. It is normalised to the same empty id an absent
+ * `model` produces, so the turn keeps counting toward tokens and stays unpriced.
+ */
+function isSentinelModel(model: string): boolean {
+	return model.startsWith("<") && model.endsWith(">");
+}
+
 export function extractClaudeUsageFromRecord(record: unknown): ClaudeTurnUsage | null {
 	const o = record as {
 		message?: { usage?: Record<string, unknown>; model?: unknown; id?: unknown };
@@ -398,7 +495,7 @@ export function extractClaudeUsageFromRecord(record: unknown): ClaudeTurnUsage |
 	const rawId = o?.message?.id;
 	return {
 		id: typeof rawId === "string" ? rawId : "",
-		model: typeof rawModel === "string" ? rawModel : "",
+		model: typeof rawModel === "string" && !isSentinelModel(rawModel) ? rawModel : "",
 		input: n("input_tokens"),
 		output: n("output_tokens"),
 		cached: n("cache_creation_input_tokens"),
@@ -426,3 +523,25 @@ export function getParserForSource(source: "claude" | "codex" | "kimi"): Transcr
 			return claudeParser;
 	}
 }
+
+/** The sources this module has a parser for. Others use dedicated readers. */
+const PARSER_BACKED_SOURCES = ["claude", "codex"] as const;
+
+/**
+ * Sources whose transcripts can report tool calls at all — i.e. whose parser
+ * implements {@link TranscriptParser.parseToolUse}.
+ *
+ * A per-SOURCE capability, never a per-session fact. Consumers need it to tell
+ * "this agent used no tools" (source present, no records) from "this agent's
+ * transcripts cannot express tool calls" (source absent) — the distinction the
+ * reader preserves by keeping an empty `toolUse` array rather than dropping the
+ * field. Zero records look identical without it.
+ *
+ * Derived by probing the parsers instead of listing source names, so adding
+ * `parseToolUse` to one of them cannot leave this behind. Sources served by a
+ * dedicated reader rather than a `TranscriptParser` are absent, which is correct
+ * today: none of them extracts tool calls.
+ */
+export const TOOL_RECORDING_SOURCES: ReadonlySet<string> = new Set(
+	PARSER_BACKED_SOURCES.filter((source) => getParserForSource(source).parseToolUse !== undefined),
+);

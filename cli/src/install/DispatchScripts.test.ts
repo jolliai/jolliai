@@ -95,6 +95,10 @@ describe("installHookScripts", () => {
 		expect(runHook).toContain("node-path");
 		expect(runHook).toContain('[ -x "$RECORDED" ]');
 		expect(runHook).not.toContain("RECORDED --version");
+		// Both silent-exit failure paths leave a breadcrumb (see the dispatch-failure
+		// breadcrumb describe block below for behavioral coverage).
+		expect(runHook).toContain("write_dispatch_failure");
+		expect(runHook).toContain("last-hook-dispatch-failure");
 
 		const runCli = await readFile(join(globalDir, "run-cli"), "utf-8");
 		expect(runCli).toContain("Cli.js");
@@ -251,17 +255,21 @@ describe("installHookScripts", () => {
 		// `... | tr -d '\r'`; without tr on PATH that pipeline silently produces an
 		// empty RECORDED and the fallback never fires, so the recorded-node tests
 		// would fail with an empty stdout even though the recorded runtime is fine.
-		async function setup(): Promise<void> {
+		async function setup(registerDist = true): Promise<void> {
 			await installHookScripts();
 			dist = join(tempDir, "dist");
 			await mkdir(join(globalDir(), "dist-paths"), { recursive: true });
 			await mkdir(dist, { recursive: true });
 			await writeFile(join(dist, "PostCommitHook.js"), "//", "utf-8");
 			await writeFile(join(dist, "Cli.js"), "//", "utf-8");
-			await writeFile(join(globalDir(), "dist-paths", "cli"), `1.0.0\n${dist}`, "utf-8");
+			if (registerDist) {
+				await writeFile(join(globalDir(), "dist-paths", "cli"), `1.0.0\n${dist}`, "utf-8");
+			}
 			cleanBin = join(tempDir, "cleanbin");
 			await mkdir(cleanBin, { recursive: true });
-			const tools = execFileSync("bash", ["-c", "command -v bash sed sort tail grep tr"], { encoding: "utf-8" })
+			const tools = execFileSync("bash", ["-c", "command -v bash sed sort tail grep tr date rm"], {
+				encoding: "utf-8",
+			})
 				.trim()
 				.split("\n");
 			for (const tool of tools) {
@@ -325,6 +333,42 @@ describe("installHookScripts", () => {
 			const fail = runDispatch("run-cli", ["recall"], [cleanBin]);
 			expect(fail.status).toBe(1);
 			expect(fail.stdout).toBe("");
+		});
+
+		// Regression: both silent-exit paths in run-hook are otherwise completely
+		// invisible (no debug.log entry, since Node never starts) — see
+		// last-hook-dispatch-failure in DispatchScripts.ts. These pin that the
+		// breadcrumb is written with the right hook type + reason, and cleared on
+		// the next successful dispatch, without changing the "never block" exit code.
+		describe("dispatch-failure breadcrumb", () => {
+			const breadcrumb = () => join(globalDir(), "last-hook-dispatch-failure");
+
+			it("records no-valid-dist when resolve-dist-path finds no candidate", async () => {
+				await setup(false);
+				const r = runDispatch("run-hook", ["post-commit"], [cleanBin]);
+				expect(r.status).toBe(0);
+				expect(r.stdout).toBe("");
+				const content = await readFile(breadcrumb(), "utf-8");
+				expect(content).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z post-commit no-valid-dist cwd=/);
+			});
+
+			it("records no-node-runtime when no node exists anywhere", async () => {
+				await setup();
+				const r = runDispatch("run-hook", ["post-commit"], [cleanBin]);
+				expect(r.status).toBe(0);
+				const content = await readFile(breadcrumb(), "utf-8");
+				expect(content).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z post-commit no-node-runtime cwd=/);
+			});
+
+			it("clears a stale breadcrumb on the next successful dispatch", async () => {
+				await setup();
+				await writeFile(breadcrumb(), "2020-01-01T00:00:00Z post-commit no-valid-dist cwd=/stale\n", "utf-8");
+				const pathBin = join(tempDir, "path-node");
+				await fakeNodeAt(pathBin);
+				const r = runDispatch("run-hook", ["post-commit"], [pathBin, cleanBin]);
+				expect(r.status).toBe(0);
+				await expect(readFile(breadcrumb(), "utf-8")).rejects.toThrow();
+			});
 		});
 	});
 

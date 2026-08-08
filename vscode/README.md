@@ -28,8 +28,7 @@ Or search for **Jolli Memory** in the Extensions sidebar (`⌘⇧X` / `Ctrl+Shif
 
 ### Requirements
 
-- **VS Code 1.80 or newer** for core features.
-- **VS Code ~1.99+ (bundled Node 22.5+)** only if you want **OpenCode** session discovery. On older hosts the extension runs normally — OpenCode is quietly skipped while every other integration works.
+- **VS Code 1.101 or newer** — its bundled Node (22.15+) is the first to load `node:sqlite` without a flag, which the local dashboard's in-host writes and the SQLite-backed session discoverers (OpenCode, Cursor, Copilot, Devin, Antigravity) require. 1.100 shipped Node 20.19, so it is below the floor and the extension will not install there.
 - **GitHub CLI (`gh`)** only for **Create & Update PR**; every other feature works without it.
 - An **Anthropic API key** *or* a **Jolli account** (via **Sign In to Jolli**) for summary generation — see [Sign In to Jolli](#sign-in-to-jolli) below.
 
@@ -74,7 +73,7 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | **Gemini** | An `AfterAgent` hook fires after each agent completion |
 | **Antigravity** | No hook needed — sessions are discovered automatically by reading the per-conversation SQLite for the workspace path and the sibling plaintext transcript log for the conversation content |
 | **Codex** | No hook needed — sessions are discovered automatically by scanning the filesystem |
-| **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database (requires a host VS Code with Node 22.5+) |
+| **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database (uses the host's built-in `node:sqlite`, covered by the VS Code 1.101 floor above) |
 | **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by reading Cursor's SQLite stores at `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (macOS; equivalent paths on Linux/Windows) and the corresponding per-workspace `workspaceStorage/` databases |
 | **Cursor CLI** (`cursor-agent`) | No hook needed — sessions are discovered automatically from Cursor's plaintext `~/.cursor` session store (`meta.json` + JSONL); shares the **Cursor** toggle with the Composer IDE |
 | **GitHub Copilot CLI** | No hook needed — sessions are discovered automatically by scanning the Copilot CLI session log |
@@ -319,7 +318,7 @@ Most settings live behind the gear icon in the view's title bar. `authToken` is 
 | `claudeEnabled` | boolean | auto-detect | Enable Claude Code session tracking |
 | `codexEnabled` | boolean | auto-detect | Enable Codex session discovery |
 | `geminiEnabled` | boolean | auto-detect | Enable Gemini session tracking |
-| `openCodeEnabled` | boolean | auto-detect | Enable OpenCode session discovery (requires a host VS Code with Node 22.5+) |
+| `openCodeEnabled` | boolean | auto-detect | Enable OpenCode session discovery (reads OpenCode's SQLite via the host's built-in `node:sqlite`) |
 | `cursorEnabled` | boolean | auto-detect | Enable Cursor IDE (Composer) session discovery |
 | `copilotEnabled` | boolean | auto-detect | Enable GitHub Copilot CLI **and** VS Code Copilot Chat session discovery (single shared switch) |
 | `localFolder` | string | — | Memory Bank folder root — every memory is dual-written here as Markdown alongside the orphan-branch copy. Set via Settings → Memory Bank → Browse…. |

@@ -184,7 +184,13 @@ fi
  * runs on the blocking commit path and must not pay an extra spawn.
  *
  * Exit policy: silent exit 0 on any failure (hooks must never block git,
- * Claude, or Gemini operations). Diagnostics go to stderr.
+ * Claude, or Gemini operations). Diagnostics go to stderr — but stderr from a
+ * detached git hook has no reader, so a dispatch failure (no valid dist,
+ * no node runtime) also overwrites `~/.jolli/jollimemory/last-hook-dispatch-
+ * failure` with a one-line breadcrumb (timestamp, hook type, reason, cwd), and
+ * a subsequent successful dispatch deletes it. This doesn't change the "never
+ * block" contract; it only makes an otherwise completely invisible failure
+ * mode discoverable after the fact.
  *
  * Designed so a future JAR / IntelliJ runtime can be supported by either:
  *   - Upgrading resolve-dist-path's output format (kind + target), or
@@ -205,6 +211,19 @@ const RUN_HOOK_CONTENT = `#!/bin/bash
 HOOK_TYPE="$1"
 shift
 
+# Both failure exits below are otherwise completely silent by design (hooks must
+# never block git), which means a dispatch failure — e.g. a dist mid-reinstall
+# and briefly missing a required script — leaves no trace anywhere: no debug.log
+# entry (Node never starts), no queue file, nothing. This breadcrumb is the one
+# place such a failure becomes visible after the fact. It's overwritten on every
+# invocation (last-failure only, not an append log) and cleared on the next
+# successful dispatch, so its mere existence means "the most recent hook run
+# failed," not "a hook failed at some point in history."
+BREADCRUMB="$HOME/.jolli/jollimemory/last-hook-dispatch-failure"
+write_dispatch_failure() {
+  printf '%s %s %s cwd=%s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$PWD" > "$BREADCRUMB"
+}
+
 case "$HOOK_TYPE" in
   post-commit)        SCRIPT="PostCommitHook.js" ;;
   post-merge)         SCRIPT="PostMergeHook.js" ;;
@@ -217,7 +236,10 @@ case "$HOOK_TYPE" in
   *)                  echo "ERROR: unknown hook type '$HOOK_TYPE'" >&2; exit 0 ;;
 esac
 
-DIST=$("$HOME/.jolli/jollimemory/resolve-dist-path" "$SCRIPT") || exit 0
+DIST=$("$HOME/.jolli/jollimemory/resolve-dist-path" "$SCRIPT") || {
+  write_dispatch_failure "$HOOK_TYPE" "no-valid-dist"
+  exit 0
+}
 
 # Resolve a usable node binary. The caller's PATH comes first so interactive
 # shells keep their own version-manager choice (nvm/volta/fnm/…). GUI git
@@ -242,9 +264,18 @@ fi
 
 if [ -z "$NODE_BIN" ]; then
   echo "ERROR: node runtime not found. Jolli Memory hooks require Node.js." >&2
+  write_dispatch_failure "$HOOK_TYPE" "no-node-runtime"
   exit 0
 fi
 
+# Guarded on existence because rm is NOT a shell builtin: unconditional, this
+# costs a fork+exec on EVERY dispatch, including prepare-commit-msg, which runs
+# on the blocking commit path this file is otherwise careful to keep spawn-free.
+# The test operator IS a builtin, so the common case (no prior failure) now
+# costs nothing, and the || : keeps a failed removal from ending the script
+# non-zero. exec follows immediately, so the guard's own false exit status
+# (1, when no breadcrumb exists) is never observable.
+[ -e "$BREADCRUMB" ] && { rm -f "$BREADCRUMB" || :; }
 exec "$NODE_BIN" "$DIST/$SCRIPT" "$@"
 `;
 

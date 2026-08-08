@@ -9,6 +9,7 @@
 
 import { main } from "./Api.js";
 import { resolveProjectDir } from "./commands/CliUtils.js";
+import { silenceSqliteExperimentalWarning } from "./core/SqliteWarning.js";
 import { shouldSkipExitFlush, trackCommandFailureIfPending } from "./core/TelemetryCommandHook.js";
 import { bootstrapTelemetry, flushTelemetryNow, maybeShowCliTelemetryNotice } from "./core/TelemetryStartup.js";
 import { runWithTrace, traceIdFromEnv } from "./core/TraceContext.js";
@@ -24,6 +25,10 @@ if (!process.env.VITEST) {
 	// callers of `main()` (e.g. embedders) don't pick up the global side
 	// effect by accident.
 	setSilentConsole(true);
+	// Before anything can load `node:sqlite` — the warning fires on load, and the
+	// dashboard commands load it. Only the SQLite line is dropped; every other
+	// warning still reaches Node's own printer.
+	silenceSqliteExperimentalWarning();
 	// Anchor the Logger's global dir to the git worktree root before anything logs
 	// or buffers telemetry, so a CLI invocation from a subdirectory never writes
 	// debug.log / telemetry into a stray `.jolli/` there. `resolveProjectDir` is

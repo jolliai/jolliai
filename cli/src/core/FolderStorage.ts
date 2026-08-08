@@ -60,6 +60,16 @@ export type ForceRegenerateResult = { ok: true } | { ok: false; reason: "missing
 export class FolderStorage implements StorageProvider {
 	readonly kind: StorageKind = "folder";
 
+	/**
+	 * There is deliberately no "visible-only" mode. Dual-write means one write
+	 * to the system of record and one FULL write to the Memory Bank — both
+	 * layers, hidden JSON included — and the cutover only changes WHICH backend
+	 * is the system of record (orphan branch → SQLite). A cutover-route variant
+	 * that rendered Markdown while skipping the hidden JSON silently stopped
+	 * `.jolli/summaries/*.json`, `plans/`, `notes/` and `index.json` at the
+	 * freeze: the layer the Memory Bank sync, the IntelliJ sidebar reader and
+	 * the mirror-based recovery all read. Do not reintroduce one.
+	 */
 	constructor(
 		private readonly rootPath: string,
 		private readonly metadataManager: MetadataManager,

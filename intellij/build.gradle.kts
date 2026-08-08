@@ -316,6 +316,13 @@ tasks.named<PrepareSandboxTask>("prepareSandbox") {
         include("*.js")
         exclude("Extension.js")
     }
+    // The dashboard page runtime is a DIRECTORY, so the `include("*.js")` filter
+    // above skips it entirely — and DashboardServerEntry.js reads these files from
+    // disk beside itself (resolveDashboardAssetsDir), so a dist without them serves
+    // a broken page. Copied as its own spec, preserving the subtree.
+    from(vscodeDistDir.dir("dashboard-assets")) {
+        into("${rootProject.name}/cli-dist/dashboard-assets")
+    }
 }
 
 // After buildPlugin creates the zip, strip unused sqlite-jdbc natives from lib/. The

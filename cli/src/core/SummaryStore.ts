@@ -41,10 +41,13 @@ import type {
 } from "../Types.js";
 import { CURRENT_SCHEMA_VERSION } from "../Types.js";
 import { getDiffStats, getTreeHash } from "./GitOps.js";
-import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
+import { acquireOrphanWriteLock, OrphanWriteBusyError, releaseOrphanWriteLock } from "./Locks.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
+import { holdsOrphanWriteLock, runHoldingOrphanWriteLock } from "./OrphanWriteReentrancy.js";
 import { mergeRefsNewWins, snapshotKeyOf } from "./RefMerge.js";
 import { isRegisteredSourceId, sanitizeNativeIdForPath } from "./references/ReferenceStore.js";
+import { resolveSotBackend } from "./SotStorageResolver.js";
+import { asSqliteStorage } from "./SqliteStorage.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import type { SquashConsolidationSource } from "./Summarizer.js";
 import { isSummaryError, LLM_FAILED } from "./SummaryErrorMarker.js";
@@ -77,22 +80,70 @@ export function getActiveStorage(): StorageProvider | undefined {
 	return activeStorageOverride;
 }
 
-export function resolveStorage(storage?: StorageProvider, cwd?: string): StorageProvider {
+/**
+ * Fail-safe fallback shared by both resolvers: the repo's SYSTEM OF RECORD.
+ *
+ * Not `new OrphanBranchStorage(cwd)`, which is what this used to be. That was
+ * correct only while the orphan branch was always the truth; past a cutover it
+ * hands back a frozen branch, and nothing downstream can tell. `vscode/src`
+ * never calls `setActiveStorage` (all 18 call sites are CLI process entry
+ * points), so every in-process `cli/src` call from the extension host lands
+ * here — the read side had no other line of defence at all.
+ *
+ * Union shape on purpose: a fallback that throws is not a fallback. A `blocked`
+ * repo degrades to the orphan backend with a warning, which is the same bet the
+ * old code made unconditionally, now narrowed to the one state where no safe
+ * backend exists.
+ */
+async function sotFallback(cwd?: string): Promise<StorageProvider> {
+	const backend = await resolveSotBackend(cwd);
+	if (backend.ok) return backend.storage;
+	log.warn("system-of-record unavailable (%s) — falling back to the orphan branch. cwd=%s", backend.reason, cwd);
+	return new OrphanBranchStorage(cwd);
+}
+
+export async function resolveStorage(storage?: StorageProvider, cwd?: string): Promise<StorageProvider> {
 	if (storage) return storage;
 	if (activeStorageOverride) return activeStorageOverride;
-	// Fail-safe fallback: orphan branch is the system of record, so a missed storage
-	// thread still preserves data. But it bypasses DualWriteStorage, so folder-mode
-	// users silently lose this write. Warn so the gap shows up in debug.log instead
-	// of as a phantom missing file weeks later. VITEST guard mirrors Logger.ts.
+	// A missed storage thread still preserves data, but it bypasses
+	// DualWriteStorage, so the Memory Bank side silently loses this write. Warn so
+	// the gap shows up in debug.log instead of as a phantom missing file weeks
+	// later. VITEST guard mirrors Logger.ts.
 	/* v8 ignore start -- warning only fires outside VITEST; coverage runs are always under VITEST. */
 	if (!process.env.VITEST) {
 		log.warn(
-			"resolveStorage fallback to OrphanBranchStorage — caller did not thread storage or call setActiveStorage. Folder-mode users will miss this write. cwd=%s",
+			"resolveStorage fell back to the system of record — caller did not thread storage or call setActiveStorage. The Memory Bank side will miss this write. cwd=%s",
 			cwd ?? "(undef)",
 		);
 	}
 	/* v8 ignore stop */
-	return new OrphanBranchStorage(cwd);
+	return sotFallback(cwd);
+}
+
+/**
+ * The read-side twin of {@link resolveStorage}: identical fallback, no warning.
+ *
+ * The same fallback means opposite things on the two sides. For a WRITE it is a
+ * defect — it bypasses DualWriteStorage and the Memory Bank side silently loses
+ * that write, which is exactly what the warning above exists to surface. For a
+ * READ it is the documented model: reads come from the system of record.
+ *
+ * One predicate served both, so every `jolli status` — a command that only ever
+ * reads — ended with "Folder-mode users will miss this write" about a write that
+ * was never attempted. A warning that fires on healthy behaviour is worse than
+ * no warning at all: it is the one people learn to scroll past, and it was
+ * sitting directly under the setup output a first-run user reads.
+ *
+ * Silencing reads cannot hide a write: every write resolves its own storage at
+ * its own call site, and still warns there.
+ *
+ * NOT to be confused with `ReadStorageResolver.createReadStorage`, which asks
+ * "which backend should I read from?" and answers `FolderStorage` before a
+ * cutover. This one resolves the SYSTEM OF RECORD, and only decides whether to
+ * warn — see `SotStorageResolver` for why the two must not be collapsed.
+ */
+export async function resolveReadStorage(storage?: StorageProvider, cwd?: string): Promise<StorageProvider> {
+	return storage ?? activeStorageOverride ?? (await sotFallback(cwd));
 }
 
 const log = createLogger("SummaryStore");
@@ -121,7 +172,7 @@ const CATALOG_FILE = "catalog.json";
  * modes (LLM call, network, user kill), so the practical loss risk is
  * negligible.
  */
-const ORPHAN_WRITE_REQUIRED_TIMEOUT_MS = 30_000;
+export const ORPHAN_WRITE_REQUIRED_TIMEOUT_MS = 30_000;
 
 /**
  * Wait budget for orphan-write lock on best-effort paths (background scans,
@@ -135,18 +186,60 @@ const ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS = 1000;
  * Acquires `orphan-write.lock` for a critical section that MUST land
  * (worker path). Throws on timeout — see `ORPHAN_WRITE_REQUIRED_TIMEOUT_MS`
  * for why "lose this entry" is the chosen failure mode.
+ *
+ * Re-entrant within one async call chain, on the same terms as
+ * `Locks.withOrphanWriteLock` — see `OrphanWriteReentrancy.ts`. This is the
+ * OUTER half of the nesting that matters in production: QueueWorker's ingest
+ * `writeGuard` wraps its callback here, and the callback reaches the topic
+ * stores, which lock their own writes.
  */
 export async function withRequiredOrphanWriteLock<T>(
 	cwd: string | undefined,
 	label: string,
 	fn: () => Promise<T>,
 ): Promise<T> {
+	if (holdsOrphanWriteLock(cwd)) return await fn();
 	const acquired = await acquireOrphanWriteLock(cwd, { timeoutMs: ORPHAN_WRITE_REQUIRED_TIMEOUT_MS });
 	if (!acquired) {
-		throw new Error(`${label}: could not acquire orphan-write lock within ${ORPHAN_WRITE_REQUIRED_TIMEOUT_MS}ms`);
+		throw new OrphanWriteBusyError(label, ORPHAN_WRITE_REQUIRED_TIMEOUT_MS);
 	}
 	try {
-		return await fn();
+		return await runHoldingOrphanWriteLock(cwd, fn);
+	} finally {
+		await releaseOrphanWriteLock(cwd);
+	}
+}
+
+/**
+ * The DEFERRABLE sibling of {@link withRequiredOrphanWriteLock}: on contention
+ * it answers `onBusy()` instead of throwing, for callers whose write is a
+ * background reconciliation that the next pass will redo.
+ *
+ * It exists so those callers stop hand-rolling `acquireOrphanWriteLock`. A
+ * hand-rolled acquire neither consults nor registers the async-context store,
+ * which breaks re-entrancy in BOTH directions: nested inside a caller that
+ * already holds the lock it polls out its whole budget against its own call
+ * chain and then "defers" — a self-block that logs identically to real
+ * contention, so it reads as normal in production while the write never lands
+ * (measured on `jolli compile`: the search-index rebuild runs inside
+ * `MultiRepoCompile`'s `writeGuard`, reaches `getCatalogWithLazyBuild`, and the
+ * catalog reconciliation is skipped every time) — and, holding the lock without
+ * registering, any wrapper BELOW it self-blocks in turn.
+ *
+ * `onBusy` may be async: a deferring caller often still has to build the
+ * in-memory answer it returns instead of the persisted one.
+ */
+export async function withDeferrableOrphanWriteLock<T>(
+	cwd: string | undefined,
+	onBusy: () => T | Promise<T>,
+	fn: () => Promise<T>,
+): Promise<T> {
+	if (holdsOrphanWriteLock(cwd)) return await fn();
+	if (!(await acquireOrphanWriteLock(cwd, { timeoutMs: ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS }))) {
+		return await onBusy();
+	}
+	try {
+		return await runHoldingOrphanWriteLock(cwd, fn);
 	} finally {
 		await releaseOrphanWriteLock(cwd);
 	}
@@ -355,7 +448,7 @@ export async function storeSummary(
 			}
 		}
 
-		const store = resolveStorage(storage, cwd);
+		const store = await resolveStorage(storage, cwd);
 		await store.writeFiles(
 			files,
 			`${verb} summary for ${summary.commitHash.substring(0, 8)}: ${summary.commitMessage.substring(0, 50)}`,
@@ -513,7 +606,7 @@ async function migrateOneToOneLocked(
 		buildCatalogFileWrite(existingCatalog, entryMap, newSummary),
 	];
 
-	const store = resolveStorage(storage, cwd);
+	const store = await resolveStorage(storage, cwd);
 	await store.writeFiles(
 		files,
 		`Migrate summary ${oldSummary.commitHash.substring(0, 8)} → ${newCommitInfo.hash.substring(0, 8)}`,
@@ -1278,7 +1371,7 @@ async function mergeManyToOneLocked(
 		buildCatalogFileWrite(existingCatalog, entryMap, mergedSummary),
 	];
 
-	const store = resolveStorage(storage, cwd);
+	const store = await resolveStorage(storage, cwd);
 	await store.writeFiles(files, `Merge summaries [${oldHashesStr}] → ${newCommitInfo.hash.substring(0, 8)}`);
 	log.info(
 		"Summaries merged: [%s] → %s (%d children, %d orphaned docs, %d unresolved orphan hashes)",
@@ -1310,46 +1403,45 @@ export async function removeFromIndex(commitHash: string, cwd?: string, storage?
 	// Best-effort path: defer when the lock is contended. removeFromIndex is an
 	// admin cleanup and the caller can retry; deferring beats stomping a fresher
 	// concurrent write.
-	const locked = await acquireOrphanWriteLock(cwd, { timeoutMs: ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS });
-	if (!locked) {
-		log.warn(
-			"removeFromIndex: could not acquire orphan-write lock within %dms — skipping removal of %s",
-			ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS,
-			commitHash.substring(0, 8),
-		);
-		return;
-	}
-	try {
-		const existingIndex = await loadIndex(cwd, storage);
-		if (!existingIndex) {
-			return;
-		}
+	await withDeferrableOrphanWriteLock(
+		cwd,
+		() => {
+			log.warn(
+				"removeFromIndex: could not acquire orphan-write lock within %dms — skipping removal of %s",
+				ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS,
+				commitHash.substring(0, 8),
+			);
+		},
+		async () => {
+			const existingIndex = await loadIndex(cwd, storage);
+			if (!existingIndex) {
+				return;
+			}
 
-		const filtered = existingIndex.entries.filter((e) => e.commitHash !== commitHash);
-		if (filtered.length === existingIndex.entries.length) {
-			return;
-		}
+			const filtered = existingIndex.entries.filter((e) => e.commitHash !== commitHash);
+			if (filtered.length === existingIndex.entries.length) {
+				return;
+			}
 
-		const newIndex: SummaryIndex = {
-			version: existingIndex.version,
-			entries: filtered,
-			commitAliases: existingIndex.commitAliases,
-		};
-		const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
+			const newIndex: SummaryIndex = {
+				version: existingIndex.version,
+				entries: filtered,
+				commitAliases: existingIndex.commitAliases,
+			};
+			const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
 
-		// Keep catalog aligned: drop the entry for this hash if catalog tracks it.
-		const existingCatalog = await loadCatalog(cwd, storage);
-		const catalogWrite = buildCatalogRemoveFileWrite(existingCatalog, commitHash);
-		if (catalogWrite) {
-			files.push(catalogWrite);
-		}
+			// Keep catalog aligned: drop the entry for this hash if catalog tracks it.
+			const existingCatalog = await loadCatalog(cwd, storage);
+			const catalogWrite = buildCatalogRemoveFileWrite(existingCatalog, commitHash);
+			if (catalogWrite) {
+				files.push(catalogWrite);
+			}
 
-		const store = resolveStorage(storage, cwd);
-		await store.writeFiles(files, `Remove index entry for ${commitHash.substring(0, 8)}`);
-		log.info("Removed %s from index", commitHash.substring(0, 8));
-	} finally {
-		await releaseOrphanWriteLock(cwd);
-	}
+			const store = await resolveStorage(storage, cwd);
+			await store.writeFiles(files, `Remove index entry for ${commitHash.substring(0, 8)}`);
+			log.info("Removed %s from index", commitHash.substring(0, 8));
+		},
+	);
 }
 
 // ─── Transcript API ──────────────────────────────────────────────────────────
@@ -1363,7 +1455,7 @@ export async function readTranscript(
 	cwd?: string,
 	storage?: StorageProvider,
 ): Promise<StoredTranscript | null> {
-	const store = resolveStorage(storage, cwd);
+	const store = await resolveStorage(storage, cwd);
 	const raw = await store.readFile(`transcripts/${commitHash}.json`);
 	if (!raw) return null;
 	try {
@@ -1434,7 +1526,7 @@ export async function saveTranscriptsBatch(
 		.join(", ");
 
 	await withRequiredOrphanWriteLock(cwd, "saveTranscriptsBatch", async () => {
-		const store = resolveStorage(storage, cwd);
+		const store = await resolveStorage(storage, cwd);
 		await store.writeFiles(files, `Update transcripts: ${summary}`);
 		log.info("Transcript batch: %s", summary);
 	});
@@ -1461,7 +1553,7 @@ export async function deleteTranscript(commitHash: string, cwd?: string, storage
  * conversations for v5-written summaries.
  */
 export async function getTranscriptHashes(cwd?: string, storage?: StorageProvider): Promise<Set<string>> {
-	const store = resolveStorage(storage, cwd);
+	const store = await resolveStorage(storage, cwd);
 	const files = await store.listFiles("transcripts/");
 	const hashes = new Set<string>();
 	for (const filePath of files) {
@@ -1620,6 +1712,33 @@ export async function getSummary(
 	// shorter inputs in production.
 	const direct = await readSummaryFile(hash, cwd, storage);
 	if (direct) return direct;
+
+	// Typed fallback (phase H): on the database backend, steps 2, 3 and 4 are
+	// one SELECT each — loading the index here would synthesize a whole
+	// document per miss.
+	const typed = asSqliteStorage(await resolveStorage(storage, cwd));
+	if (typed) {
+		if (hash.length === FULL_HASH_LENGTH) {
+			const alias = await typed.lookupAlias(hash);
+			if (alias) return readSummaryFile(alias, cwd, storage);
+		} else {
+			const matches = await typed.findHashesByPrefix(hash);
+			if (matches.length === 1) return readSummaryFile(matches[0], cwd, storage);
+			if (matches.length >= 2) throw new AmbiguousHashError(hash, matches);
+		}
+		// Step 4 on the typed path too. Returning null here instead (which is
+		// what this used to do) silently dropped the cross-tree fallback for
+		// every cut-over repo: a cherry-pick or rebase copy that shares a tree
+		// with an indexed commit resolved before the cutover and stopped after,
+		// until some later `scanTreeHashAliases` pass happened to write the
+		// alias row.
+		const treeHash = await getTreeHash(hash, cwd);
+		if (treeHash) {
+			const match = await typed.findShallowestByTreeHash(treeHash);
+			if (match) return readSummaryFile(match, cwd, storage);
+		}
+		return null;
+	}
 
 	const index = await loadIndex(cwd, storage);
 	if (!index) return null;
@@ -1857,78 +1976,78 @@ export async function scanTreeHashAliases(
 	// Background path: deferring is acceptable on contention — the next UI
 	// refresh re-enters scanTreeHashAliases. log.debug, not warn, because
 	// deferral is the expected outcome under contention.
-	const locked = await acquireOrphanWriteLock(cwd, { timeoutMs: ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS });
-	if (!locked) {
-		log.debug("scanTreeHashAliases: orphan-write lock contention — alias write deferred");
-		return false;
-	}
-	try {
-		// Re-anchor the inside-lock re-read on the WRITE storage, not the
-		// read side. The `newIndex` blob below carries `freshIndex.entries`
-		// verbatim and gets persisted via dual-write to BOTH backends — so
-		// the entries array we write must already match what the write
-		// storage's primary holds. Using the read side here would let the
-		// write payload's entries diverge from the primary (e.g. when the
-		// read storage is a FolderStorage shadow that lacks rows the
-		// primary still has), and the dual-write would then clobber those
-		// rows on the primary. Candidate freshness for `freshAliases` and
-		// `freshEntryHashSet` is intentionally a write-storage check.
-		const freshIndex = await loadIndex(cwd, storage);
-		if (!freshIndex || freshIndex.version !== 3) return false;
+	return await withDeferrableOrphanWriteLock(
+		cwd,
+		() => {
+			log.debug("scanTreeHashAliases: orphan-write lock contention — alias write deferred");
+			return false;
+		},
+		async () => {
+			// Re-anchor the inside-lock re-read on the WRITE storage, not the
+			// read side. The `newIndex` blob below carries `freshIndex.entries`
+			// verbatim and gets persisted via dual-write to BOTH backends — so
+			// the entries array we write must already match what the write
+			// storage's primary holds. Using the read side here would let the
+			// write payload's entries diverge from the primary (e.g. when the
+			// read storage is a FolderStorage shadow that lacks rows the
+			// primary still has), and the dual-write would then clobber those
+			// rows on the primary. Candidate freshness for `freshAliases` and
+			// `freshEntryHashSet` is intentionally a write-storage check.
+			const freshIndex = await loadIndex(cwd, storage);
+			if (!freshIndex || freshIndex.version !== 3) return false;
 
-		// Symmetric protection: anchoring on writeStorage protects the
-		// primary's rows, but the same dual-write that lands the alias
-		// also overwrites the shadow's index.json with freshIndex.entries.
-		// If the read storage (typically the FolderStorage shadow) holds
-		// rows the write storage doesn't (e.g. cross-machine cloud sync
-		// landed rows in the folder before the orphan branch caught up),
-		// that write deletes them on the shadow. Defer the alias scan in
-		// that case — aliases are a cross-branch tree-hash optimization,
-		// not load-bearing, and the next refresh retries once both sides
-		// reconcile (heal, push/pull of orphan, etc.).
-		if (effectiveReadStorage !== storage) {
-			const readSideIndex = await loadIndex(cwd, effectiveReadStorage);
-			if (readSideIndex && readSideIndex.version === 3) {
-				const writeHashes = new Set(freshIndex.entries.map((e) => e.commitHash));
-				const readOnlyCount = readSideIndex.entries.reduce(
-					(n, e) => (writeHashes.has(e.commitHash) ? n : n + 1),
-					0,
-				);
-				if (readOnlyCount > 0) {
-					log.warn(
-						"scanTreeHashAliases: read side has %d row(s) write side lacks — deferring alias write to avoid shadow clobber",
-						readOnlyCount,
+			// Symmetric protection: anchoring on writeStorage protects the
+			// primary's rows, but the same dual-write that lands the alias
+			// also overwrites the shadow's index.json with freshIndex.entries.
+			// If the read storage (typically the FolderStorage shadow) holds
+			// rows the write storage doesn't (e.g. cross-machine cloud sync
+			// landed rows in the folder before the orphan branch caught up),
+			// that write deletes them on the shadow. Defer the alias scan in
+			// that case — aliases are a cross-branch tree-hash optimization,
+			// not load-bearing, and the next refresh retries once both sides
+			// reconcile (heal, push/pull of orphan, etc.).
+			if (effectiveReadStorage !== storage) {
+				const readSideIndex = await loadIndex(cwd, effectiveReadStorage);
+				if (readSideIndex && readSideIndex.version === 3) {
+					const writeHashes = new Set(freshIndex.entries.map((e) => e.commitHash));
+					const readOnlyCount = readSideIndex.entries.reduce(
+						(n, e) => (writeHashes.has(e.commitHash) ? n : n + 1),
+						0,
 					);
-					return false;
+					if (readOnlyCount > 0) {
+						log.warn(
+							"scanTreeHashAliases: read side has %d row(s) write side lacks — deferring alias write to avoid shadow clobber",
+							readOnlyCount,
+						);
+						return false;
+					}
 				}
 			}
-		}
 
-		const freshAliases = freshIndex.commitAliases ?? {};
-		const freshEntryHashSet = new Set(freshIndex.entries.map((e) => e.commitHash));
+			const freshAliases = freshIndex.commitAliases ?? {};
+			const freshEntryHashSet = new Set(freshIndex.entries.map((e) => e.commitHash));
 
-		// Drop candidates a concurrent writer has resolved (now in entries) or
-		// already aliased; only persist ones still genuinely missing.
-		const finalAliases: Record<string, string> = { ...freshAliases };
-		let added = 0;
-		for (const [aliasHash, targetHash] of Object.entries(candidates)) {
-			if (freshEntryHashSet.has(aliasHash)) continue;
-			if (finalAliases[aliasHash]) continue;
-			finalAliases[aliasHash] = targetHash;
-			added++;
-		}
-		if (added === 0) return false;
+			// Drop candidates a concurrent writer has resolved (now in entries) or
+			// already aliased; only persist ones still genuinely missing.
+			const finalAliases: Record<string, string> = { ...freshAliases };
+			let added = 0;
+			for (const [aliasHash, targetHash] of Object.entries(candidates)) {
+				if (freshEntryHashSet.has(aliasHash)) continue;
+				if (finalAliases[aliasHash]) continue;
+				finalAliases[aliasHash] = targetHash;
+				added++;
+			}
+			if (added === 0) return false;
 
-		// Build newIndex from freshIndex (not preflightIndex) so any entries the
-		// worker added between preflight and lock-acquire are preserved.
-		const newIndex: SummaryIndex = { ...freshIndex, commitAliases: finalAliases };
-		const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
-		const store = resolveStorage(storage, cwd);
-		await store.writeFiles(files, `Add ${added} tree hash alias(es)`);
-		return true;
-	} finally {
-		await releaseOrphanWriteLock(cwd);
-	}
+			// Build newIndex from freshIndex (not preflightIndex) so any entries the
+			// worker added between preflight and lock-acquire are preserved.
+			const newIndex: SummaryIndex = { ...freshIndex, commitAliases: finalAliases };
+			const files: FileWrite[] = [{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") }];
+			const store = await resolveStorage(storage, cwd);
+			await store.writeFiles(files, `Add ${added} tree hash alias(es)`);
+			return true;
+		},
+	);
 }
 
 /**
@@ -2026,7 +2145,7 @@ async function migrateIndexToV3Locked(
 		{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
 		{ path: CATALOG_FILE, content: JSON.stringify(newCatalog, null, "\t") },
 	];
-	const store = resolveStorage(storage, cwd);
+	const store = await resolveStorage(storage, cwd);
 	await store.writeFiles(files, `Migrate index v1 → v3 (${migrated} entries)`);
 
 	log.info("Index migrated to v3: %d migrated, %d skipped", migrated, skipped);
@@ -2106,7 +2225,7 @@ async function readSummaryFile(
 	cwd?: string,
 	storage?: StorageProvider,
 ): Promise<CommitSummary | null> {
-	const store = resolveStorage(storage, cwd);
+	const store = await resolveStorage(storage, cwd);
 	const content = await store.readFile(`summaries/${commitHash}.json`);
 	if (!content) return null;
 
@@ -2178,7 +2297,10 @@ export async function getIndex(cwd?: string, storage?: StorageProvider): Promise
  * Loads the index file from the orphan branch.
  */
 async function loadIndex(cwd?: string, storage?: StorageProvider): Promise<SummaryIndex | null> {
-	const store = resolveStorage(storage, cwd);
+	// Read-side resolution: this function only ever calls `readFile`. Write
+	// flows that load the index first still resolve their own storage for the
+	// write itself, so the write-miss warning is not lost by silencing it here.
+	const store = await resolveReadStorage(storage, cwd);
 	const content = await store.readFile(INDEX_FILE);
 	if (!content) {
 		// DEBUG, not WARN. A null here now carries exactly one meaning — the
@@ -2243,7 +2365,7 @@ export function toCatalogEntry(summary: CommitSummary): CatalogEntry {
  * build / bootstrap (see `getCatalogWithLazyBuild`).
  */
 export async function loadCatalog(cwd?: string, storage?: StorageProvider): Promise<CommitCatalog | null> {
-	const store = resolveStorage(storage, cwd);
+	const store = await resolveStorage(storage, cwd);
 	const content = await store.readFile(CATALOG_FILE);
 	if (!content) {
 		return null;
@@ -2296,7 +2418,7 @@ export async function getCatalog(cwd?: string, storage?: StorageProvider): Promi
  * writes converge to the same content.
  */
 export async function getCatalogWithLazyBuild(cwd?: string, storage?: StorageProvider): Promise<CommitCatalog> {
-	const store = resolveStorage(storage, cwd);
+	const store = await resolveStorage(storage, cwd);
 
 	// Pre-flight read OUTSIDE the lock to detect the no-op case cheaply.
 	const preflightCatalog = (await loadCatalog(cwd, store)) ?? { version: 1, entries: [] };
@@ -2323,62 +2445,61 @@ export async function getCatalogWithLazyBuild(cwd?: string, storage?: StoragePro
 	// can't race with our update; if the lock is contended, fall back to the
 	// preflight in-memory result (a stale-but-coherent view is better than
 	// stomping a fresher write).
-	const locked = await acquireOrphanWriteLock(cwd, { timeoutMs: ORPHAN_WRITE_BEST_EFFORT_TIMEOUT_MS });
-	if (!locked) {
-		log.debug(
-			"getCatalogWithLazyBuild: orphan-write lock contention — returning in-memory catalog without writeback",
-		);
-		// Build the in-memory updated view so caller still sees current roots.
-		const cleaned = preflightCatalog.entries.filter((e) => preflightRoots.has(e.commitHash));
-		const newEntries: CatalogEntry[] = [];
-		for (const hash of preflightMissing) {
-			const summary = await readSummaryFile(hash, cwd, store);
-			if (summary) newEntries.push(toCatalogEntry(summary));
-		}
-		return { version: 1, entries: [...cleaned, ...newEntries] };
-	}
-
-	try {
-		// Re-read inside the lock — the previously-blocking writer may have
-		// just finished, making our preflight view obsolete.
-		const catalog = (await loadCatalog(cwd, store)) ?? { version: 1, entries: [] };
-		const index = await loadIndex(cwd, store);
-		if (!index || index.entries.length === 0) {
-			return catalog;
-		}
-
-		const currentRoots = new Set(index.entries.filter(isRootEntry).map((e) => e.commitHash));
-		const cleaned = catalog.entries.filter((e) => currentRoots.has(e.commitHash));
-		const haveHashes = new Set(cleaned.map((e) => e.commitHash));
-		const missing: string[] = [];
-		for (const hash of currentRoots) {
-			if (!haveHashes.has(hash)) missing.push(hash);
-		}
-
-		// Re-check fast path under the lock — another writer may have already
-		// reconciled while we waited.
-		if (cleaned.length === catalog.entries.length && missing.length === 0) {
-			return catalog;
-		}
-
-		const newEntries: CatalogEntry[] = [];
-		for (const hash of missing) {
-			const summary = await readSummaryFile(hash, cwd, store);
-			if (summary) {
-				newEntries.push(toCatalogEntry(summary));
-			} else {
-				log.warn("Catalog lazy build: summary file missing for root %s", hash.substring(0, 8));
+	return await withDeferrableOrphanWriteLock(
+		cwd,
+		async () => {
+			log.debug(
+				"getCatalogWithLazyBuild: orphan-write lock contention — returning in-memory catalog without writeback",
+			);
+			// Build the in-memory updated view so caller still sees current roots.
+			const cleaned = preflightCatalog.entries.filter((e) => preflightRoots.has(e.commitHash));
+			const newEntries: CatalogEntry[] = [];
+			for (const hash of preflightMissing) {
+				const summary = await readSummaryFile(hash, cwd, store);
+				if (summary) newEntries.push(toCatalogEntry(summary));
 			}
-		}
+			return { version: 1, entries: [...cleaned, ...newEntries] };
+		},
+		async () => {
+			// Re-read inside the lock — the previously-blocking writer may have
+			// just finished, making our preflight view obsolete.
+			const catalog = (await loadCatalog(cwd, store)) ?? { version: 1, entries: [] };
+			const index = await loadIndex(cwd, store);
+			if (!index || index.entries.length === 0) {
+				return catalog;
+			}
 
-		const updated: CommitCatalog = { version: 1, entries: [...cleaned, ...newEntries] };
-		const removed = catalog.entries.length - cleaned.length;
-		const message = `catalog: reconcile (+${newEntries.length}, -${removed})`;
-		await store.writeFiles([{ path: CATALOG_FILE, content: JSON.stringify(updated, null, "\t") }], message);
-		return updated;
-	} finally {
-		await releaseOrphanWriteLock(cwd);
-	}
+			const currentRoots = new Set(index.entries.filter(isRootEntry).map((e) => e.commitHash));
+			const cleaned = catalog.entries.filter((e) => currentRoots.has(e.commitHash));
+			const haveHashes = new Set(cleaned.map((e) => e.commitHash));
+			const missing: string[] = [];
+			for (const hash of currentRoots) {
+				if (!haveHashes.has(hash)) missing.push(hash);
+			}
+
+			// Re-check fast path under the lock — another writer may have already
+			// reconciled while we waited.
+			if (cleaned.length === catalog.entries.length && missing.length === 0) {
+				return catalog;
+			}
+
+			const newEntries: CatalogEntry[] = [];
+			for (const hash of missing) {
+				const summary = await readSummaryFile(hash, cwd, store);
+				if (summary) {
+					newEntries.push(toCatalogEntry(summary));
+				} else {
+					log.warn("Catalog lazy build: summary file missing for root %s", hash.substring(0, 8));
+				}
+			}
+
+			const updated: CommitCatalog = { version: 1, entries: [...cleaned, ...newEntries] };
+			const removed = catalog.entries.length - cleaned.length;
+			const message = `catalog: reconcile (+${newEntries.length}, -${removed})`;
+			await store.writeFiles([{ path: CATALOG_FILE, content: JSON.stringify(updated, null, "\t") }], message);
+			return updated;
+		},
+	);
 }
 
 /**
@@ -2451,7 +2572,7 @@ export async function storePlans(
 	}));
 
 	await withRequiredOrphanWriteLock(cwd, "storePlans", async () => {
-		const store = resolveStorage(storage, cwd);
+		const store = await resolveStorage(storage, cwd);
 		await store.writeFiles(files, commitMessage);
 		log.info("Stored %d plan file(s)", planFiles.length);
 	});
@@ -2467,7 +2588,7 @@ export async function readPlanFromBranch(
 	storage?: StorageProvider,
 ): Promise<string | null> {
 	try {
-		const store = resolveStorage(storage, cwd);
+		const store = await resolveStorage(storage, cwd);
 		return await store.readFile(`plans/${slug}.md`);
 	} catch {
 		return null;
@@ -2491,7 +2612,7 @@ export async function deletePlanVisibleArtifact(
 	cwd?: string,
 	storage?: StorageProvider,
 ): Promise<void> {
-	const store = resolveStorage(storage, cwd);
+	const store = await resolveStorage(storage, cwd);
 	if (!store.deletePlanVisible) return;
 	await store.deletePlanVisible(slug, branch);
 }
@@ -2506,7 +2627,7 @@ export async function readPlanProgress(
 	storage?: StorageProvider,
 ): Promise<PlanProgressArtifact | null> {
 	try {
-		const store = resolveStorage(storage, cwd);
+		const store = await resolveStorage(storage, cwd);
 		const json = await store.readFile(`plan-progress/${slug}.json`);
 		if (!json) return null;
 		return JSON.parse(json) as PlanProgressArtifact;
@@ -2539,7 +2660,7 @@ export async function storeNotes(
 	}));
 
 	await withRequiredOrphanWriteLock(cwd, "storeNotes", async () => {
-		const store = resolveStorage(storage, cwd);
+		const store = await resolveStorage(storage, cwd);
 		await store.writeFiles(files, commitMessage);
 		log.info("Stored %d note file(s)", noteFiles.length);
 	});
@@ -2559,7 +2680,7 @@ export async function deleteNoteVisibleArtifact(
 	cwd?: string,
 	storage?: StorageProvider,
 ): Promise<void> {
-	const store = resolveStorage(storage, cwd);
+	const store = await resolveStorage(storage, cwd);
 	if (!store.deleteNoteVisible) return;
 	await store.deleteNoteVisible(id, branch);
 }
@@ -2570,7 +2691,7 @@ export async function deleteNoteVisibleArtifact(
  */
 export async function readNoteFromBranch(id: string, cwd?: string, storage?: StorageProvider): Promise<string | null> {
 	try {
-		const store = resolveStorage(storage, cwd);
+		const store = await resolveStorage(storage, cwd);
 		return await store.readFile(`notes/${id}.md`);
 	} catch {
 		return null;
@@ -2644,7 +2765,7 @@ export async function storeReferences(
 	}));
 
 	await withRequiredOrphanWriteLock(cwd, "storeReferences", async () => {
-		const store = resolveStorage(storage, cwd);
+		const store = await resolveStorage(storage, cwd);
 		await store.writeFiles(files, commitMessage);
 		log.info("Stored %d reference file(s) across sources", referenceFiles.length);
 	});
@@ -2679,7 +2800,7 @@ export async function storeSkills(
 	const files: FileWrite[] = skillFiles.map((s) => ({ path: s.path, content: s.content, branch }));
 
 	await withRequiredOrphanWriteLock(cwd, "storeSkills", async () => {
-		const store = resolveStorage(storage, cwd);
+		const store = await resolveStorage(storage, cwd);
 		await store.writeFiles(files, commitMessage);
 		log.info("Stored %d skill file(s)", skillFiles.length);
 	});
@@ -2695,7 +2816,7 @@ export async function readSkillFromBranch(
 	storage?: StorageProvider,
 ): Promise<string | null> {
 	try {
-		const store = resolveStorage(storage, cwd);
+		const store = await resolveStorage(storage, cwd);
 		return await store.readFile(orphanPath);
 	} catch {
 		return null;
@@ -2714,7 +2835,7 @@ export async function readReferenceFromBranch(
 	cwd?: string,
 	storage?: StorageProvider,
 ): Promise<string | null> {
-	const store = resolveStorage(storage, cwd);
+	const store = await resolveStorage(storage, cwd);
 	try {
 		return await store.readFile(orphanPathFor(source, archivedKey));
 	} catch {

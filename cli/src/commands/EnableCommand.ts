@@ -22,12 +22,15 @@ import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
 import { getGlobalConfigDir, loadConfig, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
 import { markSkipExitFlush } from "../core/TelemetryCommandHook.js";
+import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
+import { deregisterRepo, registerRepo } from "../dashboard/RepoRegistry.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
 import { isValidSourceTag } from "../install/DistPathResolver.js";
 import { install, uninstall } from "../install/Installer.js";
-import { createLogger, setLogDir } from "../Logger.js";
+import { createLogger, errMsg, setLogDir } from "../Logger.js";
 import type { InstallResult, JolliMemoryConfig, LocalAgentToolId } from "../Types.js";
 import { isInteractive, promptText, resolveProjectDir } from "./CliUtils.js";
+import { importDashboardHistory } from "./DashboardCommand.js";
 import { canGenerateNow, promptGenerationFix } from "./GenerationFix.js";
 import { offerOptionalJolliLogin } from "./OptionalLogin.js";
 
@@ -376,6 +379,7 @@ export function registerEnableCommand(program: Command): void {
 			"Install only the shared runtime, source-neutral Git hooks, and the acting host's agent hooks and menu",
 		)
 		.option("--source-tag <tag>", "Override the dist-paths source tag (e.g. 'intellij')")
+		.option("--no-dashboard", "Do not import history into the local dashboard database after enabling")
 		.addOption(new Option("--automatic").hideHelp())
 		.action(
 			async (options: {
@@ -385,6 +389,7 @@ export function registerEnableCommand(program: Command): void {
 				repoHooksOnly?: boolean;
 				sourceTag?: string;
 				automatic?: boolean;
+				dashboard?: boolean;
 			}) => {
 				setLogDir(options.cwd);
 
@@ -476,7 +481,7 @@ function reportRepoHooksOnlyWarnings(warnings: ReadonlyArray<string>, automatic:
  */
 async function reportEnableResult(
 	result: InstallResult,
-	options: { cwd: string; yes?: boolean; integrationsOnly?: boolean },
+	options: { cwd: string; yes?: boolean; integrationsOnly?: boolean; dashboard?: boolean },
 ): Promise<void> {
 	if (result.success) {
 		track("surface_enabled", { trigger: "cli" });
@@ -575,6 +580,28 @@ async function reportEnableResult(
 			triggerPendingPushRetry(options.cwd, "cli-enable");
 		}
 
+		// Local dashboard (JOLLI-2069). Two independent pieces:
+		//   - Registration is unconditional (any full enable, including `-y`):
+		//     the machine-level registry must know every enabled repo or a later
+		//     multi-repo bootstrap cannot find its worktree.
+		//   - The history IMPORT is interactive-only, opt-out via --no-dashboard,
+		//     and skipped on runtimes without flag-free node:sqlite. It brings the
+		//     dashboard database up to date so `jolli dashboard` later opens on a
+		//     populated page; enable deliberately does NOT start the local web
+		//     service or open a browser — binding a port and taking over the
+		//     browser is a `jolli dashboard` decision, not a side effect of
+		//     enabling capture. importDashboardHistory never throws.
+		if (!options.integrationsOnly) {
+			try {
+				await registerRepo({ cwd: options.cwd });
+			} catch (err) {
+				log.info("dashboard repo registration skipped: %s", errMsg(err));
+			}
+			if (isInteractive() && !options.yes && options.dashboard !== false && canUseDashboardDb()) {
+				await importDashboardHistory(options.cwd);
+			}
+		}
+
 		// Historical back-fill is no longer kicked off automatically at enable
 		// time — it is user-driven now (VS Code cold-start card, or the manual
 		// `jolli backfill` command) so nothing spends LLM budget without an
@@ -626,6 +653,16 @@ export function registerDisableCommand(program: Command): void {
 
 			if (result.success) {
 				track("surface_disabled", { reason: "manual" });
+				// Mark the repo disabled in the dashboard registry (kept, not
+				// deleted — its history stays queryable and re-enable restores it).
+				// Best-effort: a registry hiccup must not fail the disable.
+				if (!options.integrationsOnly) {
+					try {
+						await deregisterRepo({ cwd: options.cwd });
+					} catch (err) {
+						log.info("dashboard repo deregistration skipped: %s", errMsg(err));
+					}
+				}
 				console.log(
 					options.integrationsOnly
 						? "\n  Jolli Memory integrations removed (MCP).\n"

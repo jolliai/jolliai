@@ -36,10 +36,13 @@ const base = {
 	bundle: true,
 	platform: "node",
 	format: "cjs",
-	// Target the Node bundled with the oldest supported VS Code (Electron 25 / Node 18).
-	// node:sqlite (Node 22.5+) is lazy-imported and gated by hasNodeSqliteSupport(), so
-	// this bundle loads fine on older hosts — OpenCode scanning just stays disabled.
-	target: "node18",
+	// Target the Node bundled with the oldest supported VS Code — `engines.vscode`
+	// is pinned to ^1.101.0, whose Electron ships Node 22.15 (the release where the
+	// host first crossed the flag-free `node:sqlite` floor of 22.13; 1.100.0 was
+	// still on Node 20.19). See vscode/package.json for why that floor is required:
+	// the extension host writes the dashboard DB IN-PROCESS and Electron gives us no
+	// way to pass `--experimental-sqlite`.
+	target: "node22",
 	sourcemap: false,
 	minify: true,
 	logLevel: "info",
@@ -92,6 +95,12 @@ const cliOptions = {
 		{ in: `${jmSrc}/hooks/PrePushWorker.ts`,           out: "PrePushWorker" },
 		{ in: `${jmSrc}/hooks/GeminiAfterAgentHook.ts`,   out: "GeminiAfterAgentHook" },
 		{ in: `${jmSrc}/hooks/SessionStartHook.ts`,       out: "SessionStartHook" },
+		// Read-only dashboard server, spawned detached by `jolli dashboard` (and
+		// later the extension). Serves dist/dashboard-assets/, mirrored from the
+		// CLI build by scripts/copy-dashboard-assets.mjs. node:sqlite is
+		// lazy-imported and gated, so this entry imposes no floor of its own —
+		// the shared node22 target above is set by the extension host, not here.
+		{ in: `${jmSrc}/dashboard/ServerEntry.ts`,        out: "DashboardServerEntry" },
 	],
 	outdir: "dist",
 	// CLI entry points live under ../cli/src/, so esbuild's Node module

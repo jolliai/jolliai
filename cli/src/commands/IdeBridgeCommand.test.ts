@@ -79,6 +79,8 @@ vi.mock("../Logger.js", () => ({
 	setLogDir: vi.fn(),
 	createLogger: () => _mockedLoggerCalls,
 	getJolliMemoryDir: (cwd: string) => `${cwd}/.jolli/jollimemory`,
+	errMsg: (err: unknown) => (err instanceof Error ? err.message : String(err)),
+	isManuallyDisabled: () => false,
 }));
 
 vi.mock("../core/MemoryBankMigration.js", () => ({
@@ -323,6 +325,15 @@ vi.mock("../core/references/ReferenceStore.js", () => ({
 }));
 
 vi.mock("../core/SummaryStore.js", () => ({
+	// Pass-through: the must-land D6 lock wrapper's own behavior is covered in
+	// SummaryStore/Locks tests; here only "the write happens under it" matters.
+	// It lives on THIS mock, not on Locks' — the two bridge write actions take the
+	// must-land budget (30 s), not the background one, because `ide-bridge-serve`
+	// dispatches request lines concurrently and a competing write must wait rather
+	// than fail unretried.
+	withRequiredOrphanWriteLock: vi.fn(async (_cwd: string | undefined, _label: string, fn: () => Promise<unknown>) =>
+		fn(),
+	),
 	getIndex: vi.fn(),
 	getSummary: vi.fn().mockResolvedValue({ commitHash: "abc" }),
 	listSummaries: vi.fn().mockResolvedValue([]),
@@ -3672,6 +3683,10 @@ describe("runIdeBridgeAction — summary-store", () => {
 
 	it("store-summary passes optional transcript / planProgress / referenceFiles", async () => {
 		const { storeSummary } = await import("../core/SummaryStore.js");
+		const { createStorage } = await import("../core/StorageFactory.js");
+		// `…Once`, not `mockResolvedValue`: the suite runs with `clearMocks` only,
+		// so a persistent implementation would leak into every later test.
+		vi.mocked(createStorage).mockResolvedValueOnce({} as never);
 		await runIdeBridgeAction("summary-store", "/r", {
 			operation: "store-summary",
 			summary: { commitHash: "h" },
@@ -3691,6 +3706,8 @@ describe("runIdeBridgeAction — summary-store", () => {
 
 	it("store-summary works without any optional extras", async () => {
 		const { storeSummary } = await import("../core/SummaryStore.js");
+		const { createStorage } = await import("../core/StorageFactory.js");
+		vi.mocked(createStorage).mockResolvedValueOnce({} as never);
 		await runIdeBridgeAction("summary-store", "/r", {
 			operation: "store-summary",
 			summary: { commitHash: "h" },
@@ -4104,6 +4121,33 @@ describe("runIdeBridgeAction — storage", () => {
 		expect(await runIdeBridgeAction("storage", "/r", { operation: "list", prefix: "p/" })).toEqual({
 			paths: ["a", "b"],
 		});
+	});
+
+	it("batch-reads N paths in one round trip, absent paths as null", async () => {
+		const batchReadFiles = vi.fn().mockResolvedValue(
+			new Map([
+				["a.json", "A"],
+				["gone.json", null],
+			]),
+		);
+		const { createStorage } = await import("../core/StorageFactory.js");
+		vi.mocked(createStorage).mockResolvedValue({ batchReadFiles } as never);
+		expect(
+			await runIdeBridgeAction("storage", "/r", { operation: "batch-read", paths: ["a.json", "gone.json"] }),
+		).toEqual({ contents: { "a.json": "A", "gone.json": null } });
+		expect(batchReadFiles).toHaveBeenCalledWith(["a.json", "gone.json"]);
+		await expect(runIdeBridgeAction("storage", "/r", { operation: "batch-read", paths: "x" })).rejects.toThrow(
+			/must be an array/,
+		);
+	});
+
+	it("batch-read falls back to per-path reads on a provider without the method", async () => {
+		const readFile = vi.fn().mockImplementation(async (p: string) => (p === "a.json" ? "A" : null));
+		const { createStorage } = await import("../core/StorageFactory.js");
+		vi.mocked(createStorage).mockResolvedValue({ readFile } as never);
+		expect(
+			await runIdeBridgeAction("storage", "/r", { operation: "batch-read", paths: ["a.json", "gone.json"] }),
+		).toEqual({ contents: { "a.json": "A", "gone.json": null } });
 	});
 
 	it("checks existence", async () => {

@@ -22,11 +22,12 @@ import {
 	listBranchCatalog,
 	renderContextMarkdown,
 } from "../core/ContextCompiler.js";
-import { resolveRecall } from "../core/RecallResolver.js";
+import { recallOutcomeOf, resolveRecall } from "../core/RecallResolver.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
 import { bucket, track } from "../core/Telemetry.js";
+import { recordRecallReceipt } from "../dashboard/ProducerHooks.js";
 import { setLogDir } from "../Logger.js";
 import type { CommitSummary } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
@@ -184,6 +185,20 @@ async function writeOutputFile(outputPath: string, body: string): Promise<void> 
  * action. When combined with `--output`, the JSON path writes the JSON payload
  * to the file (see the command action), so `--output` is never silently dropped.
  */
+/**
+ * Records a recall that served nothing — the text-mode counterpart of the
+ * `catalog` / `error` arms `recallOutcomeOf` produces for `--format json`.
+ *
+ * Text mode reaches those answers through its own dispatch rather than through
+ * `resolveRecall`, so without this the card would count a human's fruitless
+ * recall as no recall at all and quietly overstate the hit rate. An explicit
+ * `--catalog` is deliberately NOT one of these: that is a request for a
+ * listing, not a recall that came back empty.
+ */
+function recordRecallMiss(projectDir: string): void {
+	void recordRecallReceipt(projectDir, { hit: false, commitCount: 0, commits: [], atMs: Date.now() }, "cli");
+}
+
 async function outputRecall(
 	branch: string,
 	options: {
@@ -209,6 +224,20 @@ async function outputRecall(
 	);
 
 	track("recall_performed", { result_count_bucket: bucket(ctx.commitCount), hit: ctx.commitCount > 0 });
+	// The human-readable paths recall just as much as `--format json` does, and
+	// they are reached through a different code path (compileTaskContext here,
+	// resolveRecall there), so the receipt is written in both rather than once
+	// at a shared choke point that does not exist.
+	void recordRecallReceipt(
+		projectDir,
+		{
+			hit: ctx.commitCount > 0,
+			commitCount: ctx.commitCount,
+			commits: ctx.summaries.map((s) => ({ hash: s.commitHash, date: s.commitDate })),
+			atMs: Date.now(),
+		},
+		"cli",
+	);
 
 	if (ctx.commitCount === 0) {
 		console.log(`No Jolli Memory records found for branch "${branch}".`);
@@ -333,6 +362,9 @@ export function registerRecallCommand(program: Command): void {
 						includeTranscripts: options.includeTranscripts,
 						includePlans: options.plans !== false,
 					});
+					// Same receipt the MCP tool writes (see runRecall) — this is the
+					// path the jolli-recall skill takes when the host has no MCP.
+					void recordRecallReceipt(projectDir, recallOutcomeOf(result, Date.now()), "cli");
 					const payload = JSON.stringify(result);
 					// `--output` is honored in JSON mode too: write the SAME payload
 					// that would go to stdout to the file. Previously this branch
@@ -376,12 +408,14 @@ export function registerRecallCommand(program: Command): void {
 					}
 
 					// No exact match — show catalog with query hint for text mode
+					recordRecallMiss(projectDir);
 					console.log(renderCatalogText(catalog, branch));
 					return;
 				}
 
 				// No branch at all — check current branch in catalog, else return catalog
 				if (catalog.branches.length === 0) {
+					recordRecallMiss(projectDir);
 					console.log(
 						'No Jolli Memory records found in this repository.\nRun "jolli enable" to start recording.',
 					);
@@ -389,6 +423,7 @@ export function registerRecallCommand(program: Command): void {
 				}
 
 				// Fallback: return catalog
+				recordRecallMiss(projectDir);
 				console.log(renderCatalogText(catalog));
 			} catch (error: unknown) {
 				const message = error instanceof Error ? error.message : String(error);

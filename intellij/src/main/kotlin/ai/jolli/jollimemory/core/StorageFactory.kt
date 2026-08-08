@@ -36,6 +36,18 @@ private class CliStorageProvider(private val projectPath: String) : StorageProvi
 		CliIntegrations.runIdeBridge(projectPath, "storage", gson.toJson(request))
 	}
 
+	override fun batchReadFiles(paths: List<String>): Map<String, String?> {
+		val request = JsonObject().apply {
+			addProperty("operation", "batch-read")
+			add("paths", gson.toJsonTree(paths))
+		}
+		val contents = CliIntegrations.runIdeBridge(projectPath, "storage", gson.toJson(request))
+			.asJsonObject.getAsJsonObject("contents") ?: return paths.associateWith { null }
+		return paths.associateWith { path ->
+			contents.get(path)?.takeUnless { it.isJsonNull }?.asString
+		}
+	}
+
 	override fun listFiles(prefix: String): List<String> {
 		val paths = run("list", "prefix" to prefix).asJsonObject.getAsJsonArray("paths") ?: return emptyList()
 		return paths.map { it.asString }

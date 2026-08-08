@@ -20,7 +20,7 @@ vi.mock("../util/Subprocess.js", async () => {
 
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import { buildRecallPayload, compileTaskContext, listBranchCatalog } from "./ContextCompiler.js";
-import { resolveRecall } from "./RecallResolver.js";
+import { recallOutcomeOf, resolveRecall } from "./RecallResolver.js";
 
 const mockListBranchCatalog = vi.mocked(listBranchCatalog);
 const mockCompileTaskContext = vi.mocked(compileTaskContext);
@@ -156,5 +156,49 @@ describe("resolveRecall", () => {
 		});
 		const r = await resolveRecall(undefined, "/repo");
 		expect(r.type).toBe("catalog");
+	});
+});
+
+describe("recallOutcomeOf", () => {
+	const AT = 1_700_000_000_000;
+
+	it("reports a served payload as a hit, keeping each commit's hash and date", () => {
+		const result = {
+			type: "recall",
+			commitCount: 2,
+			commits: [
+				{ fullHash: "a".repeat(40), commitDate: "2026-07-01" },
+				{ fullHash: "b".repeat(40), commitDate: "2026-07-15" },
+			],
+		} as unknown as RecallPayload;
+		expect(recallOutcomeOf(result, AT)).toEqual({
+			hit: true,
+			commitCount: 2,
+			commits: [
+				{ hash: "a".repeat(40), date: "2026-07-01" },
+				{ hash: "b".repeat(40), date: "2026-07-15" },
+			],
+			atMs: AT,
+		});
+	});
+
+	it("reports a catalog answer as a miss — the caller got no commit content", () => {
+		expect(recallOutcomeOf(makeEmptyCatalog(), AT)).toEqual({ hit: false, commitCount: 0, commits: [], atMs: AT });
+	});
+
+	it("reports an error answer as a miss", () => {
+		expect(recallOutcomeOf({ type: "error", message: "nothing recorded" }, AT)).toMatchObject({ hit: false });
+	});
+
+	it("treats a zero-commit recall payload as a miss rather than a served call", () => {
+		const result = { type: "recall", commitCount: 0, commits: [] } as unknown as RecallPayload;
+		expect(recallOutcomeOf(result, AT)).toMatchObject({ hit: false, commitCount: 0 });
+	});
+
+	it("survives a payload whose commits array is missing", () => {
+		// It runs in front of the answer the caller is waiting for, so it must
+		// degrade rather than throw.
+		const result = { type: "recall", commitCount: 1 } as unknown as RecallPayload;
+		expect(recallOutcomeOf(result, AT)).toEqual({ hit: true, commitCount: 1, commits: [], atMs: AT });
 	});
 });

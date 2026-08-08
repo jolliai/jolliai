@@ -11,7 +11,8 @@
  * Flow (order is fixed and identical across states — a run only shows the steps
  * its state still needs):
  *   git repo? → onboarding (fresh only) → repair broken provider → Sign in? →
- *   Enable? → status line → cloud side-effects → backfill → listening / Next steps
+ *   Enable? → status line → cloud side-effects → backfill → listening →
+ *   import dashboard history → Next steps
  *
  * `Sign in?` deliberately precedes `Enable?`. The opening status line moved to
  * AFTER `Enable?` so `✓ enabled` is always truthful. Non-git directories are a
@@ -28,12 +29,14 @@ import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getSummaryCount, setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
+import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
 import { isGitHookInstalled } from "../install/GitHookInstaller.js";
 import { install } from "../install/Installer.js";
 import { setLogDir } from "../Logger.js";
 import { runBackfillFrontDoorStep } from "./BackfillFrontDoorStep.js";
 import { isAffirmative, isInsideGitWorkTree, promptText, resolveProjectDir } from "./CliUtils.js";
+import { importDashboardHistory } from "./DashboardCommand.js";
 import { promptSetup } from "./EnableCommand.js";
 import { canGenerateNow, promptGenerationFix } from "./GenerationFix.js";
 import { offerOptionalJolliLogin } from "./OptionalLogin.js";
@@ -244,6 +247,10 @@ export async function runGuidedFrontDoor(): Promise<void> {
 				? "Jolli is listening — your next commit is your first memory"
 				: "Jolli is listening — last memory saved.";
 		console.log(`\n  ${listening}`);
+		// Whatever the back-fill offer did (built memories, was declined, or never
+		// appeared), the memories it may have just written reach the dashboard
+		// database only through this import — so run one here. See below.
+		await importLocalDashboardHistory(cwd);
 	}
 
 	// Next steps orientation — printed on EVERY path that reaches here, for new
@@ -255,6 +262,39 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	//   2. enable declined at the [Y/n] prompt → returned early (a valid choice)
 	//   3. install failure             → returned early with exitCode 1
 	printNextSteps();
+}
+
+/**
+ * Registers this repo and imports its memory into the dashboard database — the
+ * same `importDashboardHistory` call `jolli enable` makes, so the two entry
+ * points leave the machine in the same state.
+ *
+ * Placed AFTER the back-fill step on purpose. `backfillRepos` (which this
+ * wraps) is the ONLY production caller of the source-of-truth import: memories
+ * the back-fill just wrote would otherwise sit outside the dashboard database
+ * until the user happened to run `jolli dashboard` by hand. Running it here
+ * means the page is already populated whenever they do open it. Registration
+ * alone is not the point — the hooks self-register from the write path on the
+ * next commit (see ProducerHooks) — the import is.
+ *
+ * It stops there: no port is bound, no server spawned, no browser opened. The
+ * front door installs hooks and builds memories; deciding to run a local web
+ * service is a separate, explicit `jolli dashboard`.
+ *
+ * Deliberately triggered by the STEP COMPLETING, not by it having built
+ * anything: `runBackfillFrontDoorStep` returns `void` by contract (it reports
+ * nothing to the front door), and `jolli enable` imports unconditionally too.
+ *
+ * Never fails the front door: `importDashboardHistory` never throws, and
+ * `process.exitCode` must stay untouched here — the front door's exit code is
+ * non-zero only for a hard blocker (not a repo, install failure).
+ */
+async function importLocalDashboardHistory(cwd: string): Promise<void> {
+	// No flag-free `node:sqlite` → nothing to import into. `importDashboardHistory`
+	// self-gates on the same check; kept here so the intent is readable at the
+	// call site. Same gate as `jolli enable`.
+	if (!canUseDashboardDb()) return;
+	await importDashboardHistory(cwd);
 }
 
 /** Prints the closing orientation shown on every non-dead-end front-door run. */

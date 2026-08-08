@@ -12,6 +12,7 @@ import { mapWithConcurrency } from "./Concurrency.js";
 import { INGEST_CODES, type IngestCode } from "./IngestErrors.js";
 import { appendIngestRun } from "./IngestRunStore.js";
 import { callLlm, llmCredentials, llmFanoutLimit } from "./LlmClient.js";
+import { OrphanWriteBusyError } from "./Locks.js";
 import { addProcessed, readProcessedSet, saveProcessedSet } from "./ProcessedSourceStore.js";
 import { createReadStorage } from "./ReadStorageResolver.js";
 import { parseReconciledPage } from "./ReconciledPage.js";
@@ -304,9 +305,13 @@ export async function ingestPendingBatch(cwd: string, config: LlmConfig, opts?: 
 			});
 		} catch (e) {
 			held = true;
-			if (e instanceof VaultWriteBusyError) {
-				// Lock busy in budget — benign, retried next drain (PAGE_WRITE_CONFLICT).
-				log.warn("Topic %s page write could not acquire vault-write.lock in budget -- holding sources", o.slug);
+			if (e instanceof VaultWriteBusyError || e instanceof OrphanWriteBusyError) {
+				// Either lock busy in budget — benign, retried next drain
+				// (PAGE_WRITE_CONFLICT). The orphan lock belongs in this branch for the
+				// same reason the vault lock does: it is contention, and recording it as
+				// PAGE_WRITE_ERROR ("a real I/O fault") makes a StopHook holding the lock
+				// for 200 ms indistinguishable in telemetry from a corrupt write.
+				log.warn("Topic %s page write could not acquire a write lock in budget -- holding sources", o.slug);
 			} else {
 				// A real I/O / serialisation / plumbing fault, NOT lock contention. Hold
 				// the source so the batch continues, but surface it as an ERROR (not a

@@ -61,7 +61,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
     private var git: GitOps? = null
     private var installer: HookInstaller? = null
     // Written once by initialize() on a pool thread; read from EDT (SummaryPanel
-    // hovers), other pool threads (refreshFolderReader, hook status refresh) and
+    // hovers), other pool threads (migration completion, hook status refresh) and
     // Task.Backgroundable actions. Executor happens-before covers the common case,
     // but the @Volatile matches the convention used for cachedStatus/workerBusy/
     // installProtectionUntil below and documents cross-thread intent.
@@ -93,7 +93,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
     /**
      * The resolved main repo root (handles worktrees). Written on the initialize
      * pool thread; read from many surfaces (EDT + pool) including
-     * [refreshFolderReader], hook-driven callers, and `getStatus` consumers. Kept
+     * hook-driven callers and `getStatus` consumers. Kept
      * @Volatile so late readers see the assignment without relying on executor
      * happens-before, and to match the convention on the other cross-thread fields
      * in this class.
@@ -287,12 +287,10 @@ class JolliMemoryService(private val project: Project) : Disposable {
     }
 
     // ── Summary in-memory LRU ────────────────────────────────────────────
-    // Reads on the orphan branch cost a `git show` fork (100-200 ms cold);
-    // this cache eliminates repeated forks for the same hash across the
-    // three read paths (commits-list hover-expand, viewSummary tab open,
-    // memory-state refresh). Aligns with the effect VS Code gets for free
-    // via FolderStorage.readFileSync + OS page cache; Stage 3.1 adds the
-    // Kotlin folder reader for even tighter parity.
+    // Reads go through the ide-bridge `storage` action (one CLI subprocess per
+    // call); this cache eliminates repeated round trips for the same hash
+    // across the three read paths (commits-list hover-expand, viewSummary tab
+    // open, memory-state refresh).
     private val summaryCache: MutableMap<String, CommitSummary> =
         java.util.Collections.synchronizedMap(
             object : LinkedHashMap<String, CommitSummary>(128, 0.75f, /*accessOrder=*/true) {
@@ -469,10 +467,9 @@ class JolliMemoryService(private val project: Project) : Disposable {
      * [onSettled] fires on the pooled thread AFTER the CLI call settles —
      * whether it succeeded or threw. On success the callback receives the
      * [CliIntegrations.MigrationBridgeResult]; on failure it receives
-     * `null` so callers can still run their post-migration refresh (VS
-     * Code parity: even a failed migration needs [refreshFolderReader] to
-     * pick up whatever the folder holds from a prior settled run, or the
-     * next session-wide read keeps forking `git show` needlessly). Pass
+     * `null` so callers can still run their post-migration refresh — even a
+     * failed migration can leave the Memory Bank folder partially populated,
+     * and the status line should reflect whatever settled. Pass
      * `null` for [onSettled] when you only need the fire-and-forget side
      * effect. A thrown error inside the callback only logs — like VS
      * Code, the next startup / Settings save retries the migration
@@ -521,37 +518,6 @@ class JolliMemoryService(private val project: Project) : Disposable {
         if (line.isEmpty()) return
         val prefix = if (initLog.isEmpty() || initLog.endsWith("\n")) "" else "\n"
         initLog = initLog + prefix + line + "\n"
-    }
-
-    /**
-     * Re-attach the folder reader against the CURRENT `config.localFolder`
-     * + `config.storageMode`. Call after Settings persists a change to either —
-     * without this, the reader keeps pointing at the previous Memory Bank
-     * directory (so summaries/plans/notes are read from a stale folder) or keeps
-     * serving folder JSON after storageMode flips to "orphan". Passing null is a
-     * valid outcome (folder isn't populated, or storageMode="orphan") — the
-     * SummaryReader falls back to orphan-branch reads for the rest of the session.
-     *
-     * THREADING: does file I/O (SessionTracker.loadConfig, KBPathResolver.resolve,
-     * FolderStorageReader.forRoot → File.isDirectory). Must NOT be called on the
-     * EDT. Current callers: SettingsDialog's Task.Backgroundable, initialize() on
-     * a pool thread, and the async migration completion callback (pooled).
-     */
-    fun refreshFolderReader() {
-        val root = mainRepoRoot ?: project.basePath ?: return
-        val r = reader ?: return
-        try {
-            val repoName = KBPathResolver.extractRepoName(root)
-            val remoteUrl = KBPathResolver.getRemoteUrl(root)
-            val config = SessionTracker.loadConfig()
-            val kbRoot = KBPathResolver.resolve(repoName, remoteUrl, config.localFolder)
-            val folderReader = ai.jolli.jollimemory.bridge.FolderStorageReader.forRoot(kbRoot.toString(), config.storageMode)
-            r.attachFolder(folderReader)
-        } catch (e: Exception) {
-            // Best effort — a failed re-attach just leaves the previous reader in
-            // place, and read paths still fall back to the orphan branch.
-            log.warn("refreshFolderReader failed: ${e.message}")
-        }
     }
 
     fun initialize() {
@@ -624,7 +590,7 @@ class JolliMemoryService(private val project: Project) : Disposable {
             // Pass the CURRENT worktree (basePath) so linked worktrees report their
             // own hook state — passing resolvedRoot here made every linked checkout
             // read the main worktree's hooks and skip startup self-heal.
-            reader = SummaryReader(basePath, gitOps)
+            reader = SummaryReader(basePath, StorageFactory.create(gitOps, basePath))
 
             sb.appendLine("installerDebug=${installer!!.getDebugInfo()}")
 
@@ -667,21 +633,14 @@ class JolliMemoryService(private val project: Project) : Disposable {
                 // Reads until the folder is populated fall back to the orphan branch
                 // (the pre-0.99 path), unchanged.
                 //
-                // The folder reader attach moves into the completion callback
-                // ([refreshFolderReader]), keeping the old ordering contract: on a
-                // fresh install the folder exists but .jolli/summaries/ is empty until
-                // migration copies the orphan-branch data across, and attaching early
-                // makes [FolderStorageReader.forRoot] return null (isReady() gates on
-                // the summaries dir) — the reader would stay null for the whole
-                // session and the page-cache-fast reads would keep forking `git show`.
+                // No folder reader is mounted any more (cutover gate G.3): every
+                // read goes through the bridge-backed storage stack, so the plugin
+                // inherits the CLI's backend routing instead of a second read path
+                // that would keep serving stale mirror JSON after the cutover.
                 migrateMemoryBankAsync { result ->
-                    // Refresh runs on both success and failure paths — even a
-                    // failed migration can leave a partially-populated folder
-                    // (a prior settled run + interrupted retry), and without
-                    // the re-attach every read in this session keeps forking
-                    // `git show`. The callback receives null when the bridge
-                    // call itself threw.
-                    refreshFolderReader()
+                    // Refresh runs on both success and failure paths — the status
+                    // line should reflect whatever the migration settled at. The
+                    // callback receives null when the bridge call itself threw.
                     refreshStatus()
                     val summary = result?.let { "${it.status} (${it.migratedEntries}/${it.totalEntries})" } ?: "failed"
                     appendInitLog("Auto-migration settled: $summary")

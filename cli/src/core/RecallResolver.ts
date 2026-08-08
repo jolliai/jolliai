@@ -5,6 +5,7 @@
  * results are byte-identical by construction.
  */
 import { SAFE_ARGUMENT_PATTERN } from "../commands/CliUtils.js";
+import type { RecallOutcome } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import {
 	type BranchCatalog,
@@ -16,6 +17,27 @@ import {
 } from "./ContextCompiler.js";
 
 export type RecallResult = RecallPayload | BranchCatalog | { type: "error"; message: string };
+
+/**
+ * Reduces a served result to the {@link RecallOutcome} the dashboard records.
+ *
+ * Pure, and deliberately here rather than in the producer: this is a statement
+ * about what the recall *union* means, and both surfaces that can answer a
+ * recall (the MCP tool and the CLI) must agree on it for the same reason they
+ * share `resolveRecall` itself. `catalog` and `error` are both misses — the
+ * caller got no commit content either way — and so is the `recall` shape with
+ * zero commits, which should not occur but must not count as served if it does.
+ */
+export function recallOutcomeOf(result: RecallResult, atMs: number): RecallOutcome {
+	if (result.type !== "recall") return { hit: false, commitCount: 0, commits: [], atMs };
+	// Defensive on a field the type says is always there: this runs on the live
+	// recall path, in front of the answer the caller is waiting for, so a
+	// malformed payload must cost a figure on a card and never the recall.
+	const commits = Array.isArray(result.commits)
+		? result.commits.map((c) => ({ hash: c.fullHash, date: c.commitDate }))
+		: [];
+	return { hit: result.commitCount > 0, commitCount: result.commitCount, commits, atMs };
+}
 
 export interface ResolveRecallOptions {
 	budget?: number;

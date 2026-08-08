@@ -3,6 +3,9 @@ import type { CommitSummary, JolliMemoryConfig, PlansRegistry, SummaryIndex } fr
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
+/** Hoisted: referenced from the `SotStorageResolver` factory below. */
+const mockReadSummaryFile = vi.hoisted(() => vi.fn<(path: string) => Promise<string | null>>());
+
 vi.mock("node:child_process", () => ({
 	execFileSync: vi.fn(),
 }));
@@ -34,7 +37,6 @@ vi.mock("../core/SummaryStore.js", () => ({
 }));
 
 vi.mock("../core/GitOps.js", () => ({
-	readFileFromBranch: vi.fn(),
 	// Identity by default so the hook's git-root anchoring is deterministic and
 	// spawns no git in-process; the real resolveStateRoot is covered in
 	// GitOps.test.ts. A `vi.fn` so a test can override it to assert the ROOT (not
@@ -42,7 +44,17 @@ vi.mock("../core/GitOps.js", () => ({
 	resolveStateRoot: vi.fn((cwd: string) => cwd),
 }));
 
+// The briefing reads its summaries through the system of record, not a raw
+// `git show` of the orphan branch — past a cutover that branch is frozen. One
+// shared `readFile` stands in for whichever backend the route picks; the
+// routing itself is `SotStorageResolver.test.ts`'s job.
+vi.mock("../core/SotStorageResolver.js", () => ({
+	resolveSotStorage: vi.fn(async () => ({ readFile: mockReadSummaryFile })),
+}));
+
 vi.mock("../core/RepoProfile.js", () => ({
+	// Pre-cutover default: no fence (plain fn — survives mock resets).
+	readCutoverFence: async () => null,
 	readManualDisableFlag: vi.fn().mockResolvedValue(false),
 }));
 
@@ -67,7 +79,7 @@ vi.mock("../Logger.js", () => ({
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { readFileFromBranch, resolveStateRoot } from "../core/GitOps.js";
+import { resolveStateRoot } from "../core/GitOps.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig, updateConfigTransactional } from "../core/SessionTracker.js";
 import { getIndex } from "../core/SummaryStore.js";
@@ -77,7 +89,7 @@ import { readStdin } from "./HookUtils.js";
 
 const mockExecFileSync = vi.mocked(execFileSync);
 const mockGetIndex = vi.mocked(getIndex);
-const mockReadFileFromBranch = vi.mocked(readFileFromBranch);
+
 const mockCollectAllTopics = vi.mocked(collectAllTopics);
 const mockExistsSync = vi.mocked(existsSync);
 const mockReadFileSync = vi.mocked(readFileSync);
@@ -121,7 +133,7 @@ describe("SessionStartHook", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		mockExecFileSync.mockReturnValue("feature/test-branch\n" as never);
-		mockReadFileFromBranch.mockResolvedValue(null);
+		mockReadSummaryFile.mockResolvedValue(null);
 		mockExistsSync.mockReturnValue(false);
 		vi.mocked(readManualDisableFlag).mockResolvedValue(false);
 	});
@@ -181,7 +193,7 @@ describe("SessionStartHook", () => {
 			vi.clearAllMocks();
 			mockExecFileSync.mockReturnValue(`${branch}\n` as never);
 			mockExistsSync.mockReturnValue(false);
-			mockReadFileFromBranch.mockResolvedValue(null);
+			mockReadSummaryFile.mockResolvedValue(null);
 
 			const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 			await main();
@@ -871,7 +883,7 @@ describe("SessionStartHook", () => {
 				},
 			]),
 		);
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ commitHash: "bbb" })));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary({ commitHash: "bbb" })));
 		mockCollectAllTopics.mockReturnValue([
 			{
 				title: "Implement token refresh flow",
@@ -911,7 +923,7 @@ describe("SessionStartHook", () => {
 				},
 			]),
 		);
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary()));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary()));
 		mockCollectAllTopics.mockReturnValue([
 			{
 				title: "Auth implementation",
@@ -1080,7 +1092,7 @@ describe("SessionStartHook", () => {
 				},
 			]),
 		);
-		mockReadFileFromBranch.mockResolvedValue(null);
+		mockReadSummaryFile.mockResolvedValue(null);
 
 		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 		await main();
@@ -1115,12 +1127,8 @@ describe("SessionStartHook", () => {
 		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 		await main();
 
-		expect(mockReadFileFromBranch).toHaveBeenCalledTimes(1);
-		expect(mockReadFileFromBranch).toHaveBeenCalledWith(
-			"jollimemory/summaries/v3",
-			"summaries/new-hash.json",
-			"/test",
-		);
+		expect(mockReadSummaryFile).toHaveBeenCalledTimes(1);
+		expect(mockReadSummaryFile).toHaveBeenCalledWith("summaries/new-hash.json");
 		writeSpy.mockRestore();
 	});
 
@@ -1147,7 +1155,7 @@ describe("SessionStartHook", () => {
 		);
 		const longDecision1 = "A".repeat(120);
 		const longDecision2 = "B".repeat(120);
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary()));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary()));
 		mockCollectAllTopics.mockReturnValue([
 			{ title: "Topic A", trigger: "t", response: "r", decisions: longDecision1, commitDate: "2026-03-29" },
 			{ title: "Topic B", trigger: "t", response: "r", decisions: longDecision2, commitDate: "2026-03-29" },
@@ -1185,7 +1193,7 @@ describe("SessionStartHook", () => {
 			]),
 		);
 		const hugeDecision = "X".repeat(300);
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary()));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary()));
 		mockCollectAllTopics.mockReturnValue([
 			{ title: "Topic", trigger: "t", response: "r", decisions: hugeDecision, commitDate: "2026-03-29" },
 		]);
@@ -1887,7 +1895,7 @@ describe("SessionStartHook", () => {
 			]),
 		);
 		// Return malformed JSON to trigger the catch block in loadLastSummary
-		mockReadFileFromBranch.mockResolvedValue("{ not valid json ::::");
+		mockReadSummaryFile.mockResolvedValue("{ not valid json ::::");
 
 		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
@@ -1914,7 +1922,7 @@ describe("SessionStartHook", () => {
 			]),
 		);
 		// Return valid summary JSON for loadLastSummary
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary()));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary()));
 		// Return topics with decisions
 		mockCollectAllTopics.mockReturnValue([
 			{ title: "Add dark mode", trigger: "Requested", response: "Done", decisions: "Used CSS variables" },
@@ -1952,7 +1960,7 @@ describe("SessionStartHook", () => {
 			]),
 		);
 		// Valid summary JSON but topics are empty
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary()));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary()));
 		mockCollectAllTopics.mockReturnValue([]);
 
 		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -2241,7 +2249,7 @@ describe("getAuthFailureReminder", () => {
 
 	it("returns the reminder when the newest commit carries the auth marker", async () => {
 		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: AUTH })));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: AUTH })));
 
 		const result = await getAuthFailureReminder("/test", "claude-plugin");
 
@@ -2249,23 +2257,19 @@ describe("getAuthFailureReminder", () => {
 		expect(result).toContain("claude");
 		expect(result).toContain("jolli configure --set aiProvider");
 		// It read the newest commit's summary file.
-		expect(mockReadFileFromBranch).toHaveBeenCalledWith(
-			"jollimemory/summaries/v3",
-			"summaries/newest.json",
-			"/test",
-		);
+		expect(mockReadSummaryFile).toHaveBeenCalledWith("summaries/newest.json");
 	});
 
 	it("returns null once the newest commit is healthy again (auto-clear)", async () => {
 		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: undefined })));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: undefined })));
 
 		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
 	});
 
 	it("does not fire for a generic llm-failed marker (auth-specific only)", async () => {
 		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: "llm-failed" })));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: "llm-failed" })));
 
 		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
 	});
@@ -2278,19 +2282,15 @@ describe("getAuthFailureReminder", () => {
 			),
 		);
 		// The hook must read the newest ("newest-ok"), which is healthy → no reminder.
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: undefined })));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: undefined })));
 
 		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
-		expect(mockReadFileFromBranch).toHaveBeenCalledWith(
-			"jollimemory/summaries/v3",
-			"summaries/newest-ok.json",
-			"/test",
-		);
+		expect(mockReadSummaryFile).toHaveBeenCalledWith("summaries/newest-ok.json");
 	});
 
 	it("is gated to plugin surfaces — CLI never sees it", async () => {
 		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: AUTH })));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: AUTH })));
 
 		expect(await getAuthFailureReminder("/test", "cli")).toBeNull();
 		// Gated out before any git/index work.
@@ -2299,7 +2299,7 @@ describe("getAuthFailureReminder", () => {
 
 	it("uses the configured Codex login remedy on the Codex plugin surface", async () => {
 		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: AUTH })));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: AUTH })));
 		mockLoadConfig.mockResolvedValue({ localAgentTool: "codex" });
 
 		const result = await getAuthFailureReminder("/test", "codex-plugin");
@@ -2323,7 +2323,7 @@ describe("getAuthFailureReminder", () => {
 				},
 			]),
 		);
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ branch: "main", summaryError: AUTH })));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary({ branch: "main", summaryError: AUTH })));
 
 		expect(await getAuthFailureReminder("/test", "claude-plugin")).toContain("Claude Code");
 	});
@@ -2346,7 +2346,7 @@ describe("getAuthFailureReminder", () => {
 
 	it("returns null (not throw) when the summary file is missing", async () => {
 		mockGetIndex.mockResolvedValue(indexWith({ hash: "newest", date: "2026-03-29T12:00:00.000Z" }));
-		mockReadFileFromBranch.mockResolvedValue(null);
+		mockReadSummaryFile.mockResolvedValue(null);
 		expect(await getAuthFailureReminder("/test", "claude-plugin")).toBeNull();
 	});
 });
@@ -2365,7 +2365,7 @@ describe("buildSessionStartContext — plugin reminder assembly", () => {
 		// ANTHROPIC_API_KEY env var — clear it so a dev machine's key can't suppress it.
 		delete process.env.ANTHROPIC_API_KEY;
 		mockExecFileSync.mockReturnValue("feature/test-branch\n" as never);
-		mockReadFileFromBranch.mockResolvedValue(null);
+		mockReadSummaryFile.mockResolvedValue(null);
 		mockExistsSync.mockReturnValue(false);
 		mockLoadConfig.mockResolvedValue({});
 		vi.mocked(readManualDisableFlag).mockResolvedValue(false);
@@ -2393,7 +2393,7 @@ describe("buildSessionStartContext — plugin reminder assembly", () => {
 				},
 			]),
 		);
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: "local-agent-auth" })));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: "local-agent-auth" })));
 		// No credential + no dismiss marker → not-signed-in reminder fires too.
 		mockLoadConfig.mockResolvedValue({});
 		mockExistsSync.mockReturnValue(false);
@@ -2430,7 +2430,7 @@ describe("buildSessionStartContext — plugin reminder assembly", () => {
 				},
 			]),
 		);
-		mockReadFileFromBranch.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: "local-agent-auth" })));
+		mockReadSummaryFile.mockResolvedValue(JSON.stringify(makeSummary({ summaryError: "local-agent-auth" })));
 
 		const result = await buildSessionStartContext("/test", "claude-plugin", {
 			includeBriefing: false,

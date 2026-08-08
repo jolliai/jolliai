@@ -16,6 +16,7 @@ import type { JolliMemoryConfig } from "../Types.js";
 
 const h = vi.hoisted(() => ({
 	orphanBranchExists: vi.fn(),
+	resolveSotBackend: vi.fn(),
 	resolveLlmCredentialSource: vi.fn(),
 	isWorkerLockStale: vi.fn(),
 	releaseWorkerLock: vi.fn(),
@@ -32,20 +33,31 @@ const h = vi.hoisted(() => ({
 	resolveProjectDir: vi.fn(),
 }));
 
-vi.mock("../core/GitOps.js", () => ({ orphanBranchExists: h.orphanBranchExists }));
+vi.mock("../core/GitOps.js", () => ({
+	orphanBranchExists: h.orphanBranchExists,
+	// Backup's default-folder guard probes whether $HOME is a git worktree (git
+	// clean -xdf there would delete every snapshot). The fake HOME is a tmpdir, so
+	// "false" is the honest answer and the snapshot proceeds.
+	execGit: vi.fn(async () => ({ exitCode: 0, stdout: "false", stderr: "" })),
+}));
 vi.mock("../core/LlmClient.js", () => ({ resolveLlmCredentialSource: h.resolveLlmCredentialSource }));
 vi.mock("../core/Locks.js", () => ({
 	isWorkerLockStale: h.isWorkerLockStale,
 	releaseWorkerLock: h.releaseWorkerLock,
 }));
 vi.mock("../core/localagent/BackendRegistry.js", () => ({ getBackend: h.getBackend }));
-vi.mock("../core/RepoProfile.js", () => ({ readManualDisableFlag: h.readManualDisableFlag }));
+vi.mock("../core/RepoProfile.js", () => ({
+	// Pre-cutover default: no fence (plain fn — survives mock resets).
+	readCutoverFence: async () => null,
+	readManualDisableFlag: h.readManualDisableFlag,
+}));
 vi.mock("../core/SessionTracker.js", () => ({
 	countActiveQueueEntries: h.countActiveQueueEntries,
 	getGlobalConfigDir: h.getGlobalConfigDir,
 	loadAllSessions: h.loadAllSessions,
 	loadConfig: h.loadConfig,
 }));
+vi.mock("../core/SotStorageResolver.js", () => ({ resolveSotBackend: h.resolveSotBackend }));
 vi.mock("../install/DistPathResolver.js", () => ({ traverseDistPaths: h.traverseDistPaths }));
 vi.mock("../install/Installer.js", () => ({ getStatus: h.getStatus, install: h.install }));
 vi.mock("../PluginLoader.js", () => ({ inspectPlugins: h.inspectPlugins }));
@@ -94,6 +106,7 @@ describe("DoctorCommand — local-agent tool diagnostic", () => {
 		h.readManualDisableFlag.mockResolvedValue(false);
 		h.getStatus.mockResolvedValue({ gitHookInstalled: true, claudeHookInstalled: true, geminiHookInstalled: true });
 		h.orphanBranchExists.mockResolvedValue(true);
+		h.resolveSotBackend.mockResolvedValue({ ok: true, state: "uncutover", storage: {} });
 		h.isWorkerLockStale.mockResolvedValue(false);
 		h.loadAllSessions.mockResolvedValue([]);
 		h.countActiveQueueEntries.mockResolvedValue(0);
@@ -208,5 +221,118 @@ describe("DoctorCommand — local-agent tool diagnostic", () => {
 
 		expect(h.getBackend).not.toHaveBeenCalled();
 		expect(lines.join("\n")).not.toContain("Local agent CLI");
+	});
+
+	// ─── System-of-record / orphan-branch rows ───────────────────────────────
+	// The orphan row is informational in every state; what changes is whether it
+	// says the branch is coming or frozen. Getting that backwards points the one
+	// reader with a broken repo at the wrong explanation.
+
+	it("names the backend that holds the truth on an un-cutover repo", async () => {
+		const lines = (await runDoctor()).join("\n");
+		expect(lines).toContain("System of record");
+		expect(lines).toContain("orphan branch (jollimemory/summaries/v3)");
+		expect(lines).toContain("exists");
+	});
+
+	it("names SQLite and calls the surviving branch frozen once the repo is cut over", async () => {
+		h.resolveSotBackend.mockResolvedValue({ ok: true, state: "cutover", storage: {} });
+
+		const lines = (await runDoctor()).join("\n");
+
+		expect(lines).toContain("SQLite (cutover)");
+		expect(lines).toContain("present but frozen");
+	});
+
+	it("reports a fenced repo with an absent branch as expected, not as a pending first commit", async () => {
+		h.resolveSotBackend.mockResolvedValue({ ok: true, state: "legacy-fenced", storage: {} });
+		h.orphanBranchExists.mockResolvedValue(false);
+
+		const lines = (await runDoctor()).join("\n");
+
+		expect(lines).toContain("SQLite (legacy-fenced)");
+		expect(lines).toContain("absent (expected");
+		expect(lines).not.toContain("will be created on first commit");
+	});
+
+	it("fails the system-of-record row (and still explains the branch) when no backend is available", async () => {
+		// `blocked` is reported only for a repo that IS fenced, so the branch row
+		// must read as cut over here — telling this user the branch "will be
+		// created on first commit" promises what the fence forbids.
+		h.resolveSotBackend.mockResolvedValue({ ok: false, reason: "database file does not exist" });
+		h.orphanBranchExists.mockResolvedValue(false);
+
+		const lines = (await runDoctor()).join("\n");
+
+		expect(lines).toContain("unavailable — database file does not exist");
+		expect(lines).toContain("absent (expected");
+		expect(lines).not.toContain("will be created on first commit");
+	});
+});
+
+describe("doctor --recover", () => {
+	it("lists candidates under a fake HOME and reports a failed restore", async () => {
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { runRecover } = await import("./DoctorCommand.js");
+		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-recover-"));
+		const realHome = process.env.HOME;
+		process.env.HOME = home;
+		// This file mocks SessionTracker wholesale; point the two functions the
+		// recovery path uses at the fake HOME.
+		const st = await import("../core/SessionTracker.js");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(join(home, ".jolli", "jollimemory"));
+		vi.mocked(st.loadConfig).mockResolvedValue({});
+		const logs: string[] = [];
+		const errs: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation((m) => void logs.push(String(m)));
+		const errSpy = vi.spyOn(console, "error").mockImplementation((m) => void errs.push(String(m)));
+		try {
+			// Survey-only: absent database, fresh-install verdict, zero candidates.
+			await runRecover();
+			const out = logs.join("\n");
+			expect(out).toContain("Snapshot candidates (0)");
+			expect(out).toContain("fresh-install");
+			expect(out).toContain("--from <snapshot path>");
+			// A restore attempt from a missing snapshot fails loudly, not silently.
+			await runRecover(join(home, "missing.db"));
+			expect(errs.join("\n")).toContain("Restore failed");
+			expect(process.exitCode).toBe(1);
+			process.exitCode = 0;
+
+			// End to end under the fake HOME: build a real database at the machine
+			// default path, snapshot it, delete it, and recover via --from.
+			const { withDashboardDb } = await import("../dashboard/DashboardDb.js");
+			const { maybeSnapshot } = await import("../dashboard/Backup.js");
+			const dbPath = join(home, ".jolli", "jollimemory", "jollimemory.db");
+			const snap = await withDashboardDb(
+				(db) => maybeSnapshot(db, { dbPath, nowMs: Date.UTC(2026, 7, 4), config: {}, force: true }),
+				{ dbPath },
+			);
+			expect(snap.status).toBe("created");
+			// Healthy database + listed candidates: the non-absent, non-empty arms,
+			// including a pre-migration tag and an unparsable-stamp age.
+			const { writeFileSync, mkdirSync } = await import("node:fs");
+			mkdirSync(join(home, "jolli_back"), { recursive: true });
+			writeFileSync(join(home, "jolli_back", "memory-premigration-20260101T000000Z-aaaaaaaa.db"), "x");
+			writeFileSync(join(home, "jolli_back", "memory-99999999T999999Z-bbbbbbbb.db"), "x");
+			logs.length = 0;
+			await runRecover();
+			const listed = logs.join("\n");
+			expect(listed).toContain("Snapshot candidates (3)");
+			expect(listed).toContain("[pre-migration]");
+			expect(listed).toContain("(unparsable stamp)");
+			rmSync(dbPath, { force: true });
+			logs.length = 0;
+			await runRecover((snap as { path: string }).path);
+			expect(logs.join("\n")).toContain("Restored from");
+		} finally {
+			process.exitCode = 0;
+			logSpy.mockRestore();
+			errSpy.mockRestore();
+			process.env.HOME = realHome;
+			rmSync(home, { recursive: true, force: true });
+		}
 	});
 });

@@ -44,6 +44,8 @@ import { createLogger, ORPHAN_BRANCH } from "../Logger.js";
 import type { CommitSummary, FileWrite } from "../Types.js";
 import { execGit } from "./GitOps.js";
 import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
+import { holdsOrphanWriteLock, runHoldingOrphanWriteLock } from "./OrphanWriteReentrancy.js";
+import { resolveSotBackend } from "./SotStorageResolver.js";
 import { createStorage } from "./StorageFactory.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { normalizeToV4 } from "./SummaryStore.js";
@@ -107,12 +109,16 @@ export async function readSchemaV5State(
 }
 
 async function withMigrationLock<T>(cwd: string | undefined, label: string, fn: () => Promise<T>): Promise<T> {
+	// Re-entrant, same as `SummaryMigration`'s twin of this helper: without the
+	// check a nested call self-blocks for the full budget and reports it as
+	// contention; without the registration a wrapper below `fn` does.
+	if (holdsOrphanWriteLock(cwd)) return await fn();
 	const acquired = await acquireOrphanWriteLock(cwd, { timeoutMs: MIGRATION_LOCK_TIMEOUT_MS });
 	if (!acquired) {
 		throw new Error(`${label}: could not acquire orphan-write lock within ${MIGRATION_LOCK_TIMEOUT_MS}ms`);
 	}
 	try {
-		return await fn();
+		return await runHoldingOrphanWriteLock(cwd, fn);
 	} finally {
 		await releaseOrphanWriteLock(cwd);
 	}
@@ -225,9 +231,20 @@ async function migrateSchemaToV5Locked(
 	// `git reflog refs/heads/<orphan-branch>` provides the same information
 	// (default 90-day retention) but a single logged SHA is much faster to
 	// reference from a bug report than walking the reflog.
-	const preMigrationSHA = await execGit(["rev-parse", `refs/heads/${ORPHAN_BRANCH}`], cwd)
-		.then((r) => r.stdout.trim())
-		.catch(() => null);
+	//
+	// Only while the branch IS the system of record. Past a cutover this
+	// migration rewrites SQLite rows and the branch is frozen, so resetting the
+	// ref would undo NOTHING while looking like a documented recovery step —
+	// a worse artifact than no hint at all. `storage.kind` cannot answer this:
+	// both sides of the cutover route to `dual-write`, differing only in which
+	// backend is primary.
+	const sot = await resolveSotBackend(cwd);
+	const preMigrationSHA =
+		sot.ok && sot.state === "uncutover"
+			? await execGit(["rev-parse", `refs/heads/${ORPHAN_BRANCH}`], cwd)
+					.then((r) => r.stdout.trim())
+					.catch(() => null)
+			: null;
 
 	// Enumerate every summary file in the active storage. Empty list = fresh
 	// install (or wiped repo); we still write the "completed" state so

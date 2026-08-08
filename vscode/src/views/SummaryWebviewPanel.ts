@@ -37,6 +37,10 @@ import {
 	translateToEnglish,
 } from "../../../cli/src/core/Summarizer.js";
 import { getRepoContributors, type RepoContributor } from "../../../cli/src/core/GitOps.js";
+import {
+	type GroupedArchivedSessions,
+	groupArchivedSessions,
+} from "../../../cli/src/core/ArchivedConversations.js";
 import { resolveSessionTitle } from "../../../cli/src/core/SessionTitleResolver.js";
 import { track } from "../../../cli/src/core/Telemetry.js";
 import { runWithTrace } from "../../../cli/src/core/TraceContext.js";
@@ -57,7 +61,6 @@ import type {
 	E2eTestScenario,
 	ReferenceCommitRef,
 	SourceId,
-	StoredSession,
 	StoredTranscript,
 	TranscriptSource,
 } from "../../../cli/src/Types.js";
@@ -109,7 +112,6 @@ import { listOrgMembers } from "../services/JolliShareService.js";
 import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
 import { resolveBindingViaChooser } from "./BindingResolver.js";
 import { loadBranchSummaries } from "./BranchSummaryLoader.js";
-import { sliceStartTime } from "./TranscriptSliceOrder.js";
 import { getSourceMeta, SOURCE_META } from "./SourceLabels.js";
 import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";
 import {
@@ -3913,100 +3915,21 @@ export class SummaryWebviewPanel {
 	}
 
 	/**
-	 * Reads the archived transcripts and collapses them into per-conversation
-	 * rows for the inline Conversations panel. One row per `source:sessionId`
-	 * (a session may be split across several commits' transcript files — its
-	 * entries are merged, mirroring SidebarWebviewProvider.readArchivedSessions
-	 * / computeMemoryEvidence). The title goes through the SAME
-	 * `resolveSessionTitle` the sidebar uses, so the two surfaces show identical
-	 * labels — that consistency is the point. Titles/counts are only knowable at
-	 * runtime, so the build-time `buildConversationsSection` only renders the
-	 * panel shell + a Loading placeholder; this fills it.
+	 * Reads the archived transcripts and hands them to the shared
+	 * `groupArchivedSessions` rule (cli/src/core): one row per `source:sessionId`,
+	 * slices merged in timestamp order, usage-only carriers dropped. The rule
+	 * lives in the CLI so the dashboard's memory detail collapses the same
+	 * conversation the same way — it used to count a three-commit amend chain as
+	 * three conversations. Titles/counts are only knowable at runtime, so the
+	 * build-time `buildConversationsSection` renders only the panel shell +
+	 * a Loading placeholder; this fills it.
 	 */
-	/**
-	 * Reads the archived transcripts and collapses the same session across
-	 * transcript files into one entry per `source:sessionId`, keeping first-seen
-	 * order and the first-seen owning commit hash (the row's data-hash). The
-	 * "claude" default mirrors the reader's back-compat for a source-less stored
-	 * session (matches getSourceLabel + the detach match key). Shared by the
-	 * Conversations list render (handleLoadConversations) and the row-click
-	 * open (handleOpenConversation) so both agree on session identity + merged
-	 * entries — that consistency is the point.
-	 */
-	private async readGroupedArchivedSessions(): Promise<{
-		order: string[];
-		grouped: Map<
-			string,
-			{ session: StoredSession; hash: string; entries: StoredSession["entries"][number][] }
-		>;
-	}> {
+	private async readGroupedArchivedSessions(): Promise<GroupedArchivedSessions> {
 		const hashes = [...this.transcriptHashSet];
 		const transcriptMap = this.foreignStorage
 			? await coreReadTranscriptsForCommits(hashes, this.workspaceRoot, this.foreignStorage)
 			: await this.bridge.readTranscriptsForCommits(hashes);
-
-		const order: string[] = [];
-		// Collect each session's slices separately first; a consolidated memory's
-		// transcript set is NOT in time order, so appending slices as they arrive
-		// would interleave turns wrong. We sort the slices chronologically below.
-		const collected = new Map<
-			string,
-			{ session: StoredSession; hash: string; parts: StoredSession["entries"][number][][] }
-		>();
-		for (const [commitHash, transcript] of transcriptMap) {
-			for (const session of transcript.sessions) {
-				const key = `${session.source ?? "claude"}:${session.sessionId}`;
-				const slice = [...(session.entries ?? [])];
-				const existing = collected.get(key);
-				if (existing) {
-					existing.parts.push(slice);
-				} else {
-					order.push(key);
-					collected.set(key, { session, hash: commitHash, parts: [slice] });
-				}
-			}
-		}
-
-		// Reassemble each session by ordering its slices by first-known timestamp,
-		// then flattening — the same sliceStartTime + stable-sort the sidebar's
-		// readArchivedSessions uses, so the inline Conversations list and its
-		// row-click transcript show turns in true chronological order (slices with
-		// no parseable timestamp keep first-seen order via the 0-return comparator).
-		const grouped = new Map<
-			string,
-			{ session: StoredSession; hash: string; entries: StoredSession["entries"][number][] }
-		>();
-		for (const key of order) {
-			const g = collected.get(key) as NonNullable<ReturnType<typeof collected.get>>;
-			const sorted = [...g.parts].sort((a, b) => {
-				const ta = sliceStartTime(a);
-				const tb = sliceStartTime(b);
-				if (ta === undefined || tb === undefined) return 0;
-				return ta - tb;
-			});
-			const entries = sorted.flat();
-			// Hide a usage-only conversation: it exists on disk only so `detach` has a
-			// per-session subtrahend (the queue worker persists a zero-entry carrier for
-			// a conversation that spent tokens without producing a readable turn), so a
-			// row for it would render as an empty conversation.
-			//
-			// The `usage` half of the predicate is load-bearing. "No entries at all" is a
-			// DIFFERENT case: a legacy/malformed stored session can omit `entries`
-			// entirely, and those are real conversations this panel deliberately still
-			// lists (turn count 0). Only a carrier is identifiable by empty-entries AND a
-			// recorded `usage`.
-			//
-			// Filtered on the MERGED entries, not per slice: a conversation split across
-			// commits can legitimately be entry-less in one transcript and real in
-			// another, and that one must still show. Detach reads `transcript.sessions`
-			// directly and is deliberately NOT filtered — the record stays subtractable.
-			if (entries.length === 0 && g.session.usage !== undefined) continue;
-			grouped.set(key, { session: g.session, hash: g.hash, entries });
-		}
-		// Keep `order` in sync with `grouped` so callers can zip the two without
-		// hitting a key that was just filtered out (handleLoadConversations maps over
-		// `order` and non-null-asserts the lookup).
-		return { order: order.filter((key) => grouped.has(key)), grouped };
+		return groupArchivedSessions(transcriptMap);
 	}
 
 	private async handleLoadConversations(): Promise<void> {

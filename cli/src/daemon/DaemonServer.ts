@@ -35,6 +35,7 @@
  * a byte-level diff channel is a read-side feature and belongs to a later slice.
  */
 
+import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { getPlansDir } from "../core/PlanPaths.js";
 import { createLogger } from "../Logger.js";
@@ -135,11 +136,23 @@ export interface ComputeWatchTargetsOptions {
 	 * on (or write to) the developer's real `~/.claude/plans/`.
 	 */
 	readonly plansDir?: string;
+	/**
+	 * Override for the machine-global `~/.jolli/jollimemory/` dir that holds the
+	 * dashboard database. Same purity reason as the two above.
+	 */
+	readonly globalConfigDir?: string;
 }
 
 export function computeWatchTargets(cwd: string, options: ComputeWatchTargetsOptions = {}): ReadonlyArray<WatchTarget> {
 	const gitCommonDir = options.gitCommonDir ?? resolveGitCommonDir(cwd);
 	const plansDir = options.plansDir ?? getPlansDir();
+	// Restated rather than imported from `SessionTracker.getGlobalConfigDir`,
+	// which is the canonical definition: this module's static import list is
+	// pinned to leaves by the "cold-start import graph" suite, and SessionTracker
+	// is one of the chains that pin names as too expensive for a cold
+	// `jolli ide-bridge` spawn. Safe to restate because that function takes no
+	// input and reads no config — it is this exact join.
+	const globalConfigDir = options.globalConfigDir ?? join(homedir(), ".jolli", "jollimemory");
 	return [
 		{
 			kind: "queue",
@@ -155,6 +168,30 @@ export function computeWatchTargets(cwd: string, options: ComputeWatchTargetsOpt
 			// inside. See `Logger.ORPHAN_BRANCH` for the branch name that shapes this.
 			path: join(gitCommonDir, "refs", "heads", "jollimemory", "summaries"),
 			ensureDir: false,
+		},
+		{
+			kind: "memory-db",
+			// The ref above stops moving at the cutover — from then on a new
+			// memory only touches the database, so watching the ref alone left a
+			// cut-over repo with no commit-time push at all. Both are watched
+			// because a repo can be on either side of the fence, and neither
+			// watcher can tell which.
+			//
+			// Directory + filename gate, not the file itself: `fs.watch` on a
+			// path follows the inode, and SQLite's checkpoint/recovery replaces
+			// these files rather than only appending. The `-wal` sibling is the
+			// one that actually moves per write — the main `.db` mtime changes
+			// only at checkpoint, so gating on it alone would delay the push by
+			// an unbounded amount.
+			//
+			// Machine-global, so this fires for writes belonging to OTHER repos
+			// too. Accepted: the client's response is a repo-scoped status
+			// refresh, and the events are debounced into one timer on the client
+			// side. Over-refreshing is the safe way to be wrong here; the
+			// alternative is a sidebar that silently stops updating.
+			path: globalConfigDir,
+			ensureDir: false,
+			filter: (name) => name.startsWith("jollimemory.db"),
 		},
 		{
 			kind: "working-context",

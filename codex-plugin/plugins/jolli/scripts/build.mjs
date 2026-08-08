@@ -30,7 +30,7 @@
  * allowlist before release, the same way `vscode-plugin` and `claude-plugin` are).
  */
 
-import { readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
@@ -65,10 +65,13 @@ const options = {
 	bundle: true,
 	platform: "node",
 	format: "cjs",
-	// node:sqlite (Node 22.5+) is lazy-imported + feature-gated in the CLI, so a
-	// conservative target keeps the bundle loadable on older node; OpenCode
-	// scanning simply stays off there.
-	target: "node18",
+	// Node 22.13 is the product floor (see AGENTS.md — node:sqlite throws on
+	// import below it unless given --experimental-sqlite, which neither the
+	// extension host nor the git-hook dispatchers can supply). This dist ships
+	// the same QueueWorker/StopHook that write the dashboard DB, so it must not
+	// advertise a lower target than its siblings. Pinned by
+	// cli/src/core/NodeFloorLockstep.test.ts.
+	target: "node22",
 	minify: true,
 	logLevel: "info",
 	entryPoints: [
@@ -96,6 +99,14 @@ const options = {
 		// + "/<Worker>.js" — must exist as their own files in this dist.
 		{ in: resolve(jmSrc, "hooks", "QueueWorker.ts"), out: "QueueWorker" },
 		{ in: resolve(jmSrc, "hooks", "PrePushWorker.ts"), out: "PrePushWorker" },
+		// Read-only dashboard server. Needed because this dist can WIN dist-paths
+		// arbitration: `run-cli` would then launch THIS Cli.js for
+		// `jolli dashboard`, and DashboardCommand spawns its sibling
+		// DashboardServerEntry.js by name (same dirname+filename contract as
+		// QueueWorker.launchWorker). Without it `jolli enable`'s auto-open throws
+		// "Dashboard server entry not found" at the end of a successful enable.
+		// Its assets are copied below.
+		{ in: resolve(jmSrc, "dashboard", "ServerEntry.ts"), out: "DashboardServerEntry" },
 	],
 	outdir: resolve(pluginDir, "dist"),
 	// Entry points resolve their imports from cli/src, so start module resolution
@@ -115,9 +126,10 @@ const options = {
 // Guard the dist against a silently-dropped entry point. esbuild only fails on a
 // missing *source* file, not on a removed `entryPoints` line. Asserting here means
 // `build:codex-plugin` — and therefore CI — catches the drift. Kept in lockstep with
-// cli/src/install/DistPathWriter.ts REQUIRED_RUNTIME_FILES (those 10, plus
-// CodexPluginBootstrapHook, which the manifest launches directly and so never
-// resolves through dist-paths/).
+// cli/src/install/DistPathWriter.ts REQUIRED_RUNTIME_FILES (those 10, plus three
+// entries that never resolve through dist-paths/: CodexPluginBootstrapHook, which
+// the manifest launches directly; McpLauncher; and DashboardServerEntry, which
+// Cli.js spawns by name).
 const EXPECTED_ENTRY_OUTS = [
 	"Cli",
 	"CodexPluginBootstrapHook",
@@ -131,6 +143,7 @@ const EXPECTED_ENTRY_OUTS = [
 	"PrePushHook",
 	"QueueWorker",
 	"PrePushWorker",
+	"DashboardServerEntry",
 ];
 const actualOuts = options.entryPoints.map((e) => e.out).sort();
 const expectedOuts = [...EXPECTED_ENTRY_OUTS].sort();
@@ -143,6 +156,10 @@ if (actualOuts.length !== expectedOuts.length || actualOuts.some((out, i) => out
 }
 
 if (isWatch) {
+	// Assets first: esbuild's watch never returns, so anything after `ctx.watch()`
+	// is unreachable. Without this a `--watch` dist had every hook but no
+	// dashboard-assets/, and the server threw "assets not found" the whole session.
+	copyDashboardAssets();
 	const ctx = await esbuild.context(options);
 	await ctx.watch();
 	console.log("Watching for changes...");
@@ -152,8 +169,33 @@ if (isWatch) {
 	rmSync(resolve(pluginDir, "dist"), { recursive: true, force: true });
 	const result = await esbuild.build(options);
 	if (result.errors.length > 0) process.exit(1);
+	copyDashboardAssets();
 	console.log(
 		`Built Codex plugin dist/ v${pluginPkg.version} — ${options.entryPoints.length} entries ` +
-			"(Cli.js, CodexPluginBootstrapHook.js, Stop/SessionStart hooks, the 5 git hooks, and both workers)",
+			"(Cli.js, CodexPluginBootstrapHook.js, Stop/SessionStart hooks, the 5 git hooks, both workers, " +
+			"and the dashboard server + assets)",
 	);
+}
+
+/**
+ * Mirrors the CLI's compiled dashboard page runtime into this dist.
+ *
+ * The assets are minified ONCE by the CLI's vite build (cli/dist/dashboard-assets)
+ * and copied verbatim here — same DRY arrangement as claude-plugin's build.mjs and
+ * vscode's scripts/copy-dashboard-assets.mjs. The server reads them from disk
+ * relative to its own bundle (resolveDashboardAssetsDir), so they must sit beside
+ * DashboardServerEntry.js.
+ *
+ * Hard-fails rather than shipping a server with no pages: a silently asset-less
+ * dist would only surface as a 500 the first time a user ran `jolli dashboard`.
+ */
+function copyDashboardAssets() {
+	const src = resolve(cliDir, "dist", "dashboard-assets");
+	if (!existsSync(src)) {
+		throw new Error(
+			`Dashboard assets not found at ${src} — build the CLI first (npm run build -w @jolli.ai/cli), ` +
+				"then rebuild this plugin.",
+		);
+	}
+	cpSync(src, resolve(pluginDir, "dist", "dashboard-assets"), { recursive: true });
 }

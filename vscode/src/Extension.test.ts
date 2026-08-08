@@ -718,7 +718,7 @@ vi.mock("../../cli/src/core/KBPathResolver.js", () => ({
 
 const {
 	mockMetadataManagerInstance,
-	mockOrphanInstance,
+	mockSotInstance,
 	mockFolderStorageInstance,
 	mockMigrationEngineInstance,
 } = vi.hoisted(() => {
@@ -727,7 +727,7 @@ const {
 		readConfig: vi.fn(() => ({})),
 		saveConfig: vi.fn(),
 	};
-	const orphan = { exists: vi.fn(async () => false) };
+	const sot = { exists: vi.fn(async () => false) };
 	const folder = { ensure: vi.fn(async () => undefined) };
 	const engine = {
 		runMigration: vi.fn(async () => ({
@@ -744,7 +744,7 @@ const {
 	};
 	return {
 		mockMetadataManagerInstance: meta,
-		mockOrphanInstance: orphan,
+		mockSotInstance: sot,
 		mockFolderStorageInstance: folder,
 		mockMigrationEngineInstance: engine,
 	};
@@ -756,10 +756,11 @@ vi.mock("../../cli/src/core/MetadataManager.js", () => ({
 	}),
 }));
 
-vi.mock("../../cli/src/core/OrphanBranchStorage.js", () => ({
-	OrphanBranchStorage: vi.fn(function MockOrphanBranchStorage() {
-		return mockOrphanInstance;
-	}),
+// The migration source is resolved by cutover route now, not constructed as
+// OrphanBranchStorage. Mocking the resolver keeps these cases about Extension's
+// wiring; the routing itself is covered by cli SotStorageResolver.test.ts.
+vi.mock("../../cli/src/core/SotStorageResolver.js", () => ({
+	resolveSotStorage: vi.fn(async () => mockSotInstance),
 }));
 
 vi.mock("../../cli/src/core/FolderStorage.js", () => ({
@@ -1894,7 +1895,7 @@ describe("Extension", () => {
 	// 0.99.2 users must re-run the corrective pass.
 	describe("activate — KB v3 stale-child cleanup", () => {
 		beforeEach(() => {
-			mockOrphanInstance.exists.mockReset();
+			mockSotInstance.exists.mockReset();
 			mockMigrationEngineInstance.runMigration.mockReset();
 			mockMigrationEngineInstance.runMigration.mockResolvedValue({
 				status: "completed",
@@ -1915,7 +1916,7 @@ describe("Extension", () => {
 		});
 
 		it("runs runStaleChildCleanup when v1 migration is completed but staleChildCleanup has never run", async () => {
-			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockSotInstance.exists.mockResolvedValue(true);
 			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
 				status: "completed",
 				totalEntries: 5,
@@ -1938,7 +1939,7 @@ describe("Extension", () => {
 		// children hoisted on dormant / merged branches get their orphaned visible
 		// .md cleaned even after the branch goes inactive.
 		it("still runs runStaleChildCleanup when staleChildCleanup.completedAt is already set", async () => {
-			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockSotInstance.exists.mockResolvedValue(true);
 			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
 				status: "completed",
 				totalEntries: 5,
@@ -1963,7 +1964,7 @@ describe("Extension", () => {
 		// fall back to "n/a" rather than logging "completedAt=undefined". Covers
 		// the right-hand `?? "n/a"` arm of the template literal.
 		it("logs `completedAt=n/a` when runStaleChildCleanup returns no staleChildCleanup field", async () => {
-			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockSotInstance.exists.mockResolvedValue(true);
 			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
 				status: "completed",
 				totalEntries: 5,
@@ -1992,7 +1993,7 @@ describe("Extension", () => {
 			// Critical regression: 0.99.2 users carry leafCleanup.completedAt
 			// from the inverted pass. They must NOT be short-circuited — the
 			// new step has to run to undo the damage.
-			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockSotInstance.exists.mockResolvedValue(true);
 			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
 				status: "completed",
 				totalEntries: 5,
@@ -2010,7 +2011,7 @@ describe("Extension", () => {
 		});
 
 		it("runs full runMigration (not runStaleChildCleanup) on fresh install with no migration state", async () => {
-			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockSotInstance.exists.mockResolvedValue(true);
 			mockMetadataManagerInstance.readMigrationState.mockReturnValue(null);
 
 			activate(makeContext());
@@ -2032,7 +2033,7 @@ describe("Extension", () => {
 		// and asserting the catch-side log.error gets fired with the right
 		// log key.
 		it("logs the catch path when initializeKB throws (orphan.exists rejects)", async () => {
-			mockOrphanInstance.exists.mockRejectedValueOnce(new Error("git failed"));
+			mockSotInstance.exists.mockRejectedValueOnce(new Error("git failed"));
 
 			activate(makeContext());
 
@@ -2051,7 +2052,7 @@ describe("Extension", () => {
 			// watchdog releases it anyway so sync can't hang forever. Hang the first
 			// await (orphan.exists) so `.finally` never clears the watchdog, then fire
 			// the captured timeout callback to simulate the 60s elapse.
-			mockOrphanInstance.exists.mockReturnValueOnce(new Promise<boolean>(() => {}));
+			mockSotInstance.exists.mockReturnValueOnce(new Promise<boolean>(() => {}));
 			capturedWatchdog.fn = null;
 			activate(makeContext());
 
@@ -2063,7 +2064,7 @@ describe("Extension", () => {
 		});
 
 		it("does nothing when orphan branch does not exist", async () => {
-			mockOrphanInstance.exists.mockResolvedValue(false);
+			mockSotInstance.exists.mockResolvedValue(false);
 			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
 				status: "completed",
 				totalEntries: 5,
@@ -2073,7 +2074,7 @@ describe("Extension", () => {
 			activate(makeContext());
 
 			await vi.waitFor(() => {
-				expect(mockOrphanInstance.exists).toHaveBeenCalled();
+				expect(mockSotInstance.exists).toHaveBeenCalled();
 			});
 			expect(mockMigrationEngineInstance.runMigration).not.toHaveBeenCalled();
 			expect(
@@ -2088,7 +2089,7 @@ describe("Extension", () => {
 			// migration completion and the session stays stuck on orphan
 			// reads — any folder-only (e.g. cross-machine cloud-synced)
 			// rows stay invisible until window reload.
-			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockSotInstance.exists.mockResolvedValue(true);
 			mockMetadataManagerInstance.readMigrationState.mockReturnValue(null);
 
 			activate(makeContext());
@@ -2106,7 +2107,7 @@ describe("Extension", () => {
 			// actually deletes visible .md it mutates the folder's index.json;
 			// any bridge cache that snapshotted pre-cleanup state would keep
 			// serving stale rows. Default mock returns swept=2.
-			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockSotInstance.exists.mockResolvedValue(true);
 			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
 				status: "completed",
 				totalEntries: 5,
@@ -2129,7 +2130,7 @@ describe("Extension", () => {
 		// cache or refresh the sidebar in that case — doing so on every window
 		// reload would collapse the user's expanded folder tree.
 		it("does NOT bust cache or refresh the sidebar when the sweep deletes nothing (swept = 0)", async () => {
-			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockSotInstance.exists.mockResolvedValue(true);
 			mockMetadataManagerInstance.readMigrationState.mockReturnValue({
 				status: "completed",
 				totalEntries: 5,
@@ -9012,8 +9013,8 @@ describe("Extension", () => {
 		beforeEach(() => {
 			existsSync.mockReset();
 			existsSync.mockImplementation(() => true);
-			mockOrphanInstance.exists.mockReset();
-			mockOrphanInstance.exists.mockResolvedValue(true);
+			mockSotInstance.exists.mockReset();
+			mockSotInstance.exists.mockResolvedValue(true);
 			mockMigrationEngineInstance.runMigration.mockReset();
 			mockMigrationEngineInstance.runMigration.mockResolvedValue({
 				status: "completed",
@@ -9106,13 +9107,13 @@ describe("Extension", () => {
 			expect(mockMemoriesStore.refresh).toHaveBeenCalled();
 		});
 
-		it("returns not-ok with No git storage found when orphan branch is missing", async () => {
-			mockOrphanInstance.exists.mockResolvedValueOnce(false);
+		it("returns not-ok when the system of record holds nothing", async () => {
+			mockSotInstance.exists.mockResolvedValueOnce(false);
 			activate(makeContext());
 			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
 			const result = (await handler()) as { ok: boolean; message: string };
 			expect(result.ok).toBe(false);
-			expect(result.message).toContain("No git storage");
+			expect(result.message).toContain("No stored memories");
 		});
 
 		it("returns not-ok when rebuild migration is only partial", async () => {

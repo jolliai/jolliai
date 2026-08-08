@@ -24,6 +24,8 @@ const h = vi.hoisted(() => ({
 	saveUserProfile: vi.fn(),
 	isInsideGitWorkTree: vi.fn(),
 	isLocalAgentUsable: vi.fn(),
+	importDashboardHistory: vi.fn(),
+	canUseDashboardDb: vi.fn(),
 }));
 
 vi.mock("../auth/AuthConfig.js", () => ({ loadAuthToken: h.loadAuthToken, getJolliUrl: h.getJolliUrl }));
@@ -44,9 +46,11 @@ vi.mock("../core/UserProfile.js", () => ({
 	loadUserProfile: h.loadUserProfile,
 	saveUserProfile: h.saveUserProfile,
 }));
+vi.mock("../dashboard/DashboardDb.js", () => ({ canUseDashboardDb: h.canUseDashboardDb }));
 vi.mock("../hooks/PushCompensation.js", () => ({ triggerPendingPushRetry: h.triggerPendingPushRetry }));
 vi.mock("../install/GitHookInstaller.js", () => ({ isGitHookInstalled: h.isGitHookInstalled }));
 vi.mock("../install/Installer.js", () => ({ install: h.install }));
+vi.mock("./DashboardCommand.js", () => ({ importDashboardHistory: h.importDashboardHistory }));
 vi.mock("./EnableCommand.js", () => ({ promptSetup: h.promptSetup }));
 vi.mock("./SpaceSyncStep.js", () => ({ runSpaceSyncStep: h.runSpaceSyncStep }));
 vi.mock("./BackfillFrontDoorStep.js", () => ({ runBackfillFrontDoorStep: h.runBackfillFrontDoorStep }));
@@ -115,6 +119,8 @@ describe("GuidedFrontDoor", () => {
 		h.saveUserProfile.mockResolvedValue(undefined);
 		h.isInsideGitWorkTree.mockReturnValue(true);
 		h.isLocalAgentUsable.mockResolvedValue(true);
+		h.canUseDashboardDb.mockReturnValue(true);
+		h.importDashboardHistory.mockResolvedValue(undefined);
 	});
 
 	afterEach(() => {
@@ -775,6 +781,71 @@ describe("GuidedFrontDoor", () => {
 		await runGuidedFrontDoor();
 		expect(out()).toContain("Not enabled");
 		expect(out()).not.toContain("Next steps");
+	});
+
+	// ── Importing history into the dashboard database. Triggered by the back-fill
+	// STEP COMPLETING (not by it having built anything), because that step reports
+	// nothing back, and because this import is the only thing that moves freshly
+	// built memories into the dashboard database. No web service is started. ──
+
+	describe("dashboard history import", () => {
+		it("imports after the back-fill step, before Next steps", async () => {
+			await runGuidedFrontDoor();
+
+			expect(h.importDashboardHistory).toHaveBeenCalledWith("/repo");
+			// Order matters: the import is what picks up whatever the back-fill just wrote.
+			expect(h.runBackfillFrontDoorStep.mock.invocationCallOrder[0]).toBeLessThan(
+				h.importDashboardHistory.mock.invocationCallOrder[0] as number,
+			);
+			// And it lands before the closing orientation.
+			expect(logs.findIndex((l) => l.includes("Jolli is listening"))).toBeLessThan(
+				logs.findIndex((l) => l.includes("Next steps")),
+			);
+		});
+
+		it("imports even when the back-fill offer was declined or never appeared", async () => {
+			// The step is a no-op in both cases and returns void either way — the import
+			// is deliberately not conditional on it having built anything.
+			h.runBackfillFrontDoorStep.mockResolvedValue(undefined);
+			await runGuidedFrontDoor();
+			expect(h.importDashboardHistory).toHaveBeenCalledTimes(1);
+		});
+
+		it("runtime without flag-free node:sqlite → skipped silently", async () => {
+			h.canUseDashboardDb.mockReturnValue(false);
+			await runGuidedFrontDoor();
+			expect(h.importDashboardHistory).not.toHaveBeenCalled();
+			expect(out()).not.toContain("Dashboard");
+			expect(out()).toContain("Next steps");
+			expect(process.exitCode).toBeUndefined();
+		});
+
+		it("generation not configured → no back-fill step and no import", async () => {
+			h.loadAuthToken.mockResolvedValue(undefined);
+			h.loadConfig.mockResolvedValue({});
+			await runGuidedFrontDoor();
+			expect(h.runBackfillFrontDoorStep).not.toHaveBeenCalled();
+			expect(h.importDashboardHistory).not.toHaveBeenCalled();
+		});
+
+		it("dead ends (not a repo / enable declined) never import", async () => {
+			h.isInsideGitWorkTree.mockReturnValue(false);
+			await runGuidedFrontDoor();
+			expect(h.importDashboardHistory).not.toHaveBeenCalled();
+
+			vi.clearAllMocks();
+			h.isInsideGitWorkTree.mockReturnValue(true);
+			h.canUseDashboardDb.mockReturnValue(true);
+			h.isGitHookInstalled.mockResolvedValue(false);
+			h.promptText.mockResolvedValue("n");
+			h.loadAuthToken.mockResolvedValue("oauth-token");
+			h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-default" });
+			h.resolveProjectDir.mockReturnValue("/repo");
+			h.createStorage.mockResolvedValue({});
+			h.getSummaryCount.mockResolvedValue(0);
+			await runGuidedFrontDoor();
+			expect(h.importDashboardHistory).not.toHaveBeenCalled();
+		});
 	});
 
 	describe("getGuidedFrontDoorStatus", () => {

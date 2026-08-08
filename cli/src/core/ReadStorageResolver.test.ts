@@ -5,6 +5,21 @@ vi.mock("./SessionTracker.js", () => ({
 	loadConfig: vi.fn(),
 }));
 
+vi.mock("../dashboard/CutoverRouter.js", () => ({
+	resolveCutoverRoute: vi.fn().mockResolvedValue({ state: "uncutover" }),
+}));
+
+vi.mock("../dashboard/RepoRegistry.js", () => ({
+	resolveRepoIdentity: vi.fn().mockResolvedValue({ identity: "https://github.com/test/repo.git" }),
+	resolveRepoIdentityForCwd: vi.fn().mockResolvedValue({ identity: "https://github.com/test/repo.git" }),
+}));
+
+vi.mock("./SqliteStorage.js", () => {
+	const SqliteStorage = vi.fn();
+	SqliteStorage.prototype.type = "sqlite";
+	return { SqliteStorage };
+});
+
 vi.mock("./OrphanBranchStorage.js", () => {
 	const OrphanBranchStorage = vi.fn();
 	OrphanBranchStorage.prototype.type = "orphan";
@@ -26,10 +41,12 @@ vi.mock("./KBPathResolver.js", () => ({
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 
+import { resolveCutoverRoute } from "../dashboard/CutoverRouter.js";
 import { isClaimableProject } from "./KBPathResolver.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 import { createReadStorage } from "./ReadStorageResolver.js";
 import { loadConfig } from "./SessionTracker.js";
+import { SqliteStorage } from "./SqliteStorage.js";
 import { createFolderStorage } from "./StorageFactory.js";
 
 const mockLoadConfig = vi.mocked(loadConfig);
@@ -50,8 +67,63 @@ describe("createReadStorage", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		// `clearAllMocks` wipes recorded calls but keeps implementations, so a
-		// per-test `mockReturnValue(false)` would otherwise leak forward.
+		// per-test `mockReturnValue(false)` (or a cutover-state override below)
+		// would otherwise leak forward.
 		mockIsClaimableProject.mockReturnValue(true);
+		vi.mocked(resolveCutoverRoute).mockResolvedValue({ state: "uncutover" });
+	});
+
+	describe("cutover routing", () => {
+		it("routes legacy-fenced and cutover straight to SqliteStorage, ignoring storageMode", async () => {
+			for (const state of ["legacy-fenced", "cutover"] as const) {
+				vi.clearAllMocks();
+				mockIsClaimableProject.mockReturnValue(true);
+				vi.mocked(resolveCutoverRoute).mockResolvedValue(
+					state === "cutover"
+						? { state, record: { tips: {}, cutoverVersion: 1, committedAt: "t", schemaVersion: 1 } }
+						: { state },
+				);
+				// A residual storageMode must not steer this route — the read side
+				// answers straight off the cutover state, same as the write side.
+				mockLoadConfig.mockResolvedValue({ storageMode: "folder" } as unknown as Awaited<
+					ReturnType<typeof loadConfig>
+				>);
+
+				const storage = await createReadStorage("/project/path");
+
+				expect(SqliteStorage).toHaveBeenCalledWith("https://github.com/test/repo.git");
+				expect((storage as unknown as Record<string, unknown>).type).toBe("sqlite");
+				expect(mockCreateFolderStorage).not.toHaveBeenCalled();
+				expect(OrphanBranchStorage).not.toHaveBeenCalled();
+				// The SQLite routes never touch createFolderStorage, so they don't
+				// need the write-boundary claimable gate either.
+				expect(mockIsClaimableProject).not.toHaveBeenCalled();
+			}
+		});
+
+		it("throws on blocked instead of degrading to the frozen orphan branch", async () => {
+			vi.mocked(resolveCutoverRoute).mockResolvedValue({
+				state: "blocked",
+				reason: "database file does not exist",
+			});
+			mockLoadConfig.mockResolvedValue({});
+
+			await expect(createReadStorage("/project/path")).rejects.toThrow(/doctor --recover/);
+			expect(OrphanBranchStorage).not.toHaveBeenCalled();
+			expect(mockCreateFolderStorage).not.toHaveBeenCalled();
+		});
+
+		it("falls through to the storageMode dispatch on uncutover", async () => {
+			vi.mocked(resolveCutoverRoute).mockResolvedValue({ state: "uncutover" });
+			mockLoadConfig.mockResolvedValue({ storageMode: "orphan" } as unknown as Awaited<
+				ReturnType<typeof loadConfig>
+			>);
+
+			const storage = await createReadStorage("/project/path");
+
+			expect((storage as unknown as Record<string, unknown>).type).toBe("orphan");
+			expect(SqliteStorage).not.toHaveBeenCalled();
+		});
 	});
 
 	it('returns OrphanBranchStorage when storageMode is "orphan"', async () => {

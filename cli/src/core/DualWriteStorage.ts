@@ -17,7 +17,8 @@ export class DualWriteStorage implements StorageProvider {
 	readonly kind: StorageKind = "dual-write";
 
 	constructor(
-		private readonly primary: StorageProvider,
+		/** Public so backend-specific fast paths (asSqliteStorage) can unwrap. */
+		readonly primary: StorageProvider,
 		private readonly shadow: StorageProvider,
 	) {}
 

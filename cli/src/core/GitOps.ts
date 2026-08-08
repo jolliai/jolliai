@@ -239,6 +239,24 @@ export async function getCommitRange(
 }
 
 /**
+ * Returns every commit hash reachable from a local branch tip (`git rev-list
+ * --branches`), the set a rebase/reset/squash can drop a commit out of. Not
+ * `--all`: tags and remote-tracking refs would keep a rewritten-away commit
+ * looking "live" long after no local branch points anywhere near it.
+ * Returns null on a git failure (missing repo, corrupt refs) so a caller can
+ * fail open — treating "we could not ask git" as "everything is reachable"
+ * is safer than hiding real data because of a transient error.
+ */
+export async function listReachableCommits(cwd?: string): Promise<ReadonlyArray<string> | null> {
+	const result = await execGit(["rev-list", "--branches"], cwd);
+	if (result.exitCode !== 0) return null;
+	return result.stdout
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((h) => h.length > 0);
+}
+
+/**
  * Gets information about a specific commit by hash.
  * Unlike getHeadCommitInfo, this queries a specific hash rather than HEAD.
  */

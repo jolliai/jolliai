@@ -106,6 +106,34 @@ class NodeRuntimeTest {
     }
 
     @Test
+    fun `isSupportedVersion enforces the major-dot-minor floor, not just the major`() {
+        // node:sqlite exists from 22.5 but throws on import without
+        // --experimental-sqlite until 22.13, and the git-hook dispatchers this
+        // plugin installs run `node <Hook>.js` with no flags. A major-only gate
+        // would record a 22.5 whose dashboard writes then throw.
+        NodeRuntime.isSupportedVersion("v22.13.0") shouldBe true
+        NodeRuntime.isSupportedVersion("v22.22.1") shouldBe true
+        NodeRuntime.isSupportedVersion("v24.0.0") shouldBe true
+        NodeRuntime.isSupportedVersion("v22.12.9") shouldBe false
+        NodeRuntime.isSupportedVersion("v22.5.0") shouldBe false
+        NodeRuntime.isSupportedVersion("v20.19.0") shouldBe false
+    }
+
+    @Test
+    fun `isSupportedVersion rejects an unparseable version rather than trusting it`() {
+        NodeRuntime.isSupportedVersion("garbage") shouldBe false
+        NodeRuntime.isSupportedVersion("22.13.0") shouldBe false
+        NodeRuntime.isSupportedVersion("") shouldBe false
+    }
+
+    @Test
+    fun `versionMinor parses the minor component`() {
+        NodeRuntime.versionMinor("v22.13.0") shouldBe 13
+        NodeRuntime.versionMinor("v22.5.0-nightly") shouldBe 5
+        NodeRuntime.versionMinor("garbage").shouldBeNull()
+    }
+
+    @Test
     fun `versionMajor is null for unparseable input`() {
         NodeRuntime.versionMajor("garbage").shouldBeNull()
         NodeRuntime.versionMajor("22.14.0").shouldBeNull()

@@ -10,6 +10,13 @@ vi.mock("../core/StorageFactory.js", () => ({
 vi.mock("../core/SummaryStore.js", () => ({
 	setActiveStorage: vi.fn(),
 	getActiveStorage: vi.fn(() => null),
+	// Pass-through: the must-land D6 lock wrapper is covered in SummaryStore/Locks
+	// tests. It belongs on the compile guard so a topic page and its index entry
+	// share ONE orphan critical section — two acquisitions could land the page and
+	// then fail the index, orphaning it (recoverable only by --rebuild).
+	withRequiredOrphanWriteLock: vi.fn(async (_cwd: string | undefined, _label: string, fn: () => Promise<unknown>) =>
+		fn(),
+	),
 }));
 vi.mock("../core/IngestPipeline.js", () => ({
 	drainIngest: vi.fn(async () => ({ batches: 1, ingested: 3, outcome: "OK", topicFailures: [] })),
@@ -269,7 +276,15 @@ describe("registerCompileCommand", () => {
 		// The purge is wrapped in a non-fatal catch that stringifies a non-Error
 		// throw (`String(purgeErr)`). A non-Error rejection from the purge body
 		// exercises that arm — the derived layer lags but the command completes.
-		vi.mocked(purgeTopicPagesExcept).mockRejectedValueOnce("purge exploded (string, not Error)" as never);
+		// The FIRST purge call is the rebuild's own reset (discarding the pages,
+		// which on SQLite is what makes the reset mean anything — writing an empty
+		// index cannot, since `topics/index.json` is synthesized from `topic_pages`
+		// on every read). That one is a PREREQUISITE and propagates by design, the
+		// same policy the empty-index write beside it already follows. The non-fatal
+		// stringifying catch under test is the SECOND, post-drain converge purge.
+		vi.mocked(purgeTopicPagesExcept)
+			.mockResolvedValueOnce([])
+			.mockRejectedValueOnce("purge exploded (string, not Error)" as never);
 		const { stdout } = await runCompile(["--cwd", "/repo", "--rebuild"]);
 		expect(stdout).toContain("Done:");
 		expect(process.exitCode).not.toBe(1);
@@ -396,7 +411,10 @@ describe("registerCompileCommand", () => {
 			topics: [{ stableSlug: "auth-flow" }, { stableSlug: "storage-layer" }],
 		} as never);
 		await runCompile(["--cwd", "/repo", "--rebuild"]);
-		expect(vi.mocked(purgeTopicPagesExcept)).toHaveBeenCalledWith(
+		// Twice: the reset's own discard (keep nothing), then the post-drain
+		// converge against the index the drain produced.
+		expect(vi.mocked(purgeTopicPagesExcept)).toHaveBeenNthCalledWith(1, [], "/repo", expect.anything());
+		expect(vi.mocked(purgeTopicPagesExcept)).toHaveBeenLastCalledWith(
 			["auth-flow", "storage-layer"],
 			"/repo",
 			expect.anything(),

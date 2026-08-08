@@ -3,13 +3,14 @@ package ai.jolli.jollimemory.bridge
 import ai.jolli.jollimemory.core.CommitSummary
 import ai.jolli.jollimemory.core.JmLogger
 import ai.jolli.jollimemory.core.StatusInfo
+import ai.jolli.jollimemory.core.StorageProvider
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.core.references.SourceIds
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 
 /**
- * Reads JolliMemory data from the filesystem and git — pure Kotlin, no Node.js.
+ * Reads JolliMemory data through the CLI-owned storage stack (ide-bridge).
  *
  * `worktreeDir` MUST be the CURRENT worktree root (project.basePath), not the
  * shared main-repo root. The CLI's `getStatus` treats its cwd as the target
@@ -18,34 +19,24 @@ import com.google.gson.JsonParser
  * directory. Passing the main worktree root here would make every linked
  * worktree report the main checkout's hook state instead of its own, keep the
  * Claude Stop hook forever "installed" from the linked worktree's point of
- * view, and skip the startup self-heal that should repair it. Orphan-branch
- * reads (listSummaries / getSummary) go through `git` (GitOps), which resolves
- * the shared common-dir automatically, so they aren't affected by this choice.
+ * view, and skip the startup self-heal that should repair it.
+ *
+ * Every data read goes through [storage] — the bridge-backed provider — so
+ * the plugin inherits whatever backend the CLI routes to (orphan branch
+ * today, SQLite after the cutover) instead of hard-coding git plumbing or a
+ * folder mirror here. The retired folder-first path is the cutover gate's
+ * G.3: any surviving direct read would keep serving plausible-looking stale
+ * data after the orphan branch freezes, which is worse than no data.
+ * List-then-read flows use [StorageProvider.batchReadFiles] so N files cost
+ * one bridge round trip, not N subprocesses.
  */
 class SummaryReader(
     private val worktreeDir: String,
-    private val git: GitOps,
-    /**
-     * Optional local Memory Bank reader. When present AND ready, every
-     * summary/plan/note read tries the folder first (page-cache-fast) and
-     * only falls back to the orphan branch (`git show`, 100-200 ms cold fork)
-     * on a miss. When null, behaviour is unchanged: everything goes through
-     * git plumbing.
-     *
-     * See [FolderStorageReader] for the lockstep contract with the CLI's
-     * `FolderStorage.ts`. Attached via [attachFolder] once the KB folder
-     * path is known (which itself costs an ide-bridge round-trip), so init
-     * can create the reader before that resolve completes.
-     */
-    @Volatile private var folder: FolderStorageReader? = null,
+    private val storage: StorageProvider,
 ) {
 
     private val log = JmLogger.create("SummaryReader")
     private val gson = Gson()
-
-    /** Attach or detach the folder reader after construction. Safe to call
-     *  from any thread; reads see the new value on the next lookup. */
-    fun attachFolder(reader: FolderStorageReader?) { folder = reader }
 
     /** Read the full installation and data status. */
     fun getStatus(@Suppress("UNUSED_PARAMETER") installer: HookInstaller): StatusInfo {
@@ -60,14 +51,15 @@ class SummaryReader(
     }
 
     private fun countSummaries(): Int {
-        return git.listBranchFiles(ORPHAN_BRANCH, "summaries/").size
+        return storage.listFiles("summaries/").size
     }
 
-    /** List commit summaries on the orphan branch. */
+    /** List commit summaries — one list call plus one batch read. */
     fun listSummaries(): List<CommitSummaryBrief> {
-        val files = git.listBranchFiles(ORPHAN_BRANCH, "summaries/")
+        val files = storage.listFiles("summaries/")
+        val contents = storage.batchReadFiles(files)
         return files.mapNotNull { path ->
-            val json = git.readBranchFile(ORPHAN_BRANCH, path) ?: return@mapNotNull null
+            val json = contents[path] ?: return@mapNotNull null
             parseSummaryBrief(json).also {
                 // Unreadable file vs unparseable content: only the latter is worth a line.
                 if (it == null) log.debug("Failed to parse summary %s", path)
@@ -77,11 +69,7 @@ class SummaryReader(
 
     /** Get full summary object for a commit. */
     fun getSummary(commitHash: String): CommitSummary? {
-        // Folder-first: on 0.99.0+ (dual-write default) this hits the OS page
-        // cache in microseconds and avoids a `git show` fork entirely.
-        folder?.getSummary(commitHash)?.let { return it }
-        val path = "summaries/$commitHash.json"
-        val json = git.readBranchFile(ORPHAN_BRANCH, path) ?: return null
+        val json = storage.readFile("summaries/$commitHash.json") ?: return null
         return try {
             gson.fromJson(json, CommitSummary::class.java)
         } catch (e: Exception) {
@@ -91,25 +79,23 @@ class SummaryReader(
     }
 
     /** Get raw JSON for a commit summary. */
-    fun getSummaryJson(commitHash: String): String? {
-        folder?.getSummaryJson(commitHash)?.let { return it }
-        return git.readBranchFile(ORPHAN_BRANCH, "summaries/$commitHash.json")
-    }
+    fun getSummaryJson(commitHash: String): String? =
+        storage.readFile("summaries/$commitHash.json")
 
-    /** Reads an archived plan body (`plans/<slug>.md`) from the orphan branch. */
+    /** Reads an archived plan body (`plans/<slug>.md`). */
     fun readPlanBody(slug: String): String? =
-        folder?.readPlanBody(slug) ?: git.readBranchFile(ORPHAN_BRANCH, "plans/$slug.md")
+        storage.readFile("plans/$slug.md")
 
-    /** Reads an archived markdown-note body (`notes/<id>.md`) from the orphan branch. */
+    /** Reads an archived markdown-note body (`notes/<id>.md`). */
     fun readNoteBody(id: String): String? =
-        folder?.readNoteBody(id) ?: git.readBranchFile(ORPHAN_BRANCH, "notes/$id.md")
+        storage.readFile("notes/$id.md")
 
     /**
      * Reads an archived reference body from
      * `references/<source>/<pathKey>.md` — the layout the CLI's
-     * `SummaryStore.storeReferences` writes on commit. Tries the folder mirror
-     * first for latency (mirrors [readPlanBody]/[readNoteBody]), then falls
-     * back to the orphan branch. Returns null when the archived md is absent.
+     * `SummaryStore.storeReferences` writes on commit. Goes through [storage]
+     * like every other read (mirrors [readPlanBody]/[readNoteBody]). Returns
+     * null when the archived md is absent.
      *
      * `pathKey` is the CLI-side `sanitizeNativeIdForPath` applied to the bare
      * archivedKey. For GitHub / Context7 (`nativeIdPathSafe: false`) that
@@ -121,7 +107,6 @@ class SummaryReader(
      * sanitized stem instead.
      */
     fun readReferenceBody(source: SourceId, archivedKey: String): String? {
-        folder?.readReferenceBody(source, archivedKey)?.let { return it }
         val wire = SourceIds.wireName(source)
         val bareKey = SourceIds.stripPrefix(wire, archivedKey)
         val stem = SourceIds.pathKey(source, bareKey)
@@ -131,7 +116,7 @@ class SummaryReader(
         // is unreachable on well-formed data. Kept for tampered / older-format
         // data that predates the sanitize contract.
         if (".." in stem || "/" in stem || "\\" in stem) return null
-        return git.readBranchFile(ORPHAN_BRANCH, "references/$wire/$stem.md")
+        return storage.readFile("references/$wire/$stem.md")
     }
 
     /**
@@ -145,14 +130,11 @@ class SummaryReader(
         val resolved = summary ?: getSummary(commitHash)
         val ids = resolved?.transcripts
         if (!ids.isNullOrEmpty()) {
-            return ids.flatMap { id ->
-                val json = git.readBranchFile(ORPHAN_BRANCH, "transcripts/$id.json")
-                parseConversations(json)
-            }
+            val contents = storage.batchReadFiles(ids.map { "transcripts/$it.json" })
+            return ids.flatMap { id -> parseConversations(contents["transcripts/$id.json"]) }
         }
         // Legacy fallback: transcript file named by commit hash.
-        val json = git.readBranchFile(ORPHAN_BRANCH, "transcripts/$commitHash.json")
-        return parseConversations(json)
+        return parseConversations(storage.readFile("transcripts/$commitHash.json"))
     }
 
     /**
@@ -164,9 +146,10 @@ class SummaryReader(
         val resolved = summary ?: getSummary(commitHash)
         val ids = resolved?.transcripts
         val jsons = if (!ids.isNullOrEmpty()) {
-            ids.map { git.readBranchFile(ORPHAN_BRANCH, "transcripts/$it.json") }
+            val contents = storage.batchReadFiles(ids.map { "transcripts/$it.json" })
+            ids.map { contents["transcripts/$it.json"] }
         } else {
-            listOf(git.readBranchFile(ORPHAN_BRANCH, "transcripts/$commitHash.json"))
+            listOf(storage.readFile("transcripts/$commitHash.json"))
         }
         for (json in jsons) {
             val md = sessionToMarkdown(json, sessionId)
@@ -176,8 +159,6 @@ class SummaryReader(
     }
 
     companion object {
-        const val ORPHAN_BRANCH = JmLogger.ORPHAN_BRANCH
-
         /**
          * Parses one stored `summaries/<hash>.json` body into a list row. Pure and
          * tolerant — returns null for null/blank/malformed input rather than throwing,

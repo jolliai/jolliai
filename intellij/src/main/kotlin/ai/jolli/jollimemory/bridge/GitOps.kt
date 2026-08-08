@@ -240,7 +240,7 @@ class GitOps(private val projectDir: String) {
     /** True when [ref] has a first parent (so `<ref>~1` resolves). */
     private fun hasParent(ref: String): Boolean = exec("rev-parse", "--verify", "-q", "$ref~1") != null
 
-    /** Get commit info (hash subject author authorDate) for [ref] (defaults to HEAD). */
+    /** Get commit info (hash\u0000subject\u0000author\u0000authorDate) for [ref] (defaults to HEAD). */
     fun getHeadCommitInfo(ref: String = "HEAD"): String? {
         return exec("log", "-1", "--pretty=format:%H%x00%s%x00%an%x00%aI", ref)
     }

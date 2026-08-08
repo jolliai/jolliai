@@ -213,6 +213,11 @@ vi.mock("./core/RepoProfile.js", async (importOriginal) => {
 });
 
 vi.mock("./core/SummaryStore.js", () => ({
+	// Pass-through: `compile`'s writeGuard nests this inside vault-write.lock so a
+	// topic page and its index entry share ONE orphan critical section.
+	withRequiredOrphanWriteLock: vi.fn(async (_cwd: string | undefined, _label: string, fn: () => Promise<unknown>) =>
+		fn(),
+	),
 	listSummaries: vi.fn().mockResolvedValue([]),
 	getSummary: vi.fn().mockResolvedValue(null),
 	getSummaryCount: vi.fn().mockResolvedValue(0),
@@ -4663,10 +4668,20 @@ describe("CLI", () => {
 			expect(output).toContain("No compatible Claude Code CLI found.");
 		});
 
-		it("should warn when orphan branch does not exist", async () => {
+		it("reports a missing orphan branch as information, not a warning", async () => {
+			// It used to warn, which read as "no memories yet" — wrong past a
+			// cutover, where the branch is frozen or was never cloned precisely
+			// because the database took over. The data question is the separate
+			// "System of record" row, so this one stays green either way.
 			const output = (await runDoctor(["doctor"], { orphanBranch: false, apiKey: "sk-ant-test" })).join("\n");
-			expect(output).toContain("⚠ Orphan branch");
+			expect(output).toContain("✓ Orphan branch");
 			expect(output).toContain("not yet created");
+			expect(output).not.toContain("⚠ Orphan branch");
+		});
+
+		it("reports which backend is the system of record", async () => {
+			const output = (await runDoctor(["doctor"], { orphanBranch: true, apiKey: "sk-ant-test" })).join("\n");
+			expect(output).toContain("✓ System of record");
 		});
 
 		it("should flag missing dist-paths as fail", async () => {

@@ -24,6 +24,7 @@ import { appendFileSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkS
 import { join } from "node:path";
 import { isPidAlive, readLockOwnerPid, releaseIfOwned } from "../core/LockPrimitives.js";
 import { loadConfig } from "../core/SessionTracker.js";
+import type { CutoverRoute } from "../dashboard/CutoverRouter.js";
 import { getJolliMemoryDir } from "../Logger.js";
 import type { JolliMemoryConfig, LocalAgentToolId } from "../Types.js";
 import { buildAuthFailureCaptureText } from "./AuthRemediation.js";
@@ -475,6 +476,8 @@ export interface CommitFeedbackDeps {
 	readonly readEvents?: (path: string) => CaptureProgressEvent[];
 	readonly now?: () => number;
 	readonly workerDead?: () => Promise<boolean>;
+	/** Test seam for the blocked-route pre-check; defaults to the real router. */
+	readonly resolveRoute?: () => Promise<CutoverRoute | null>;
 }
 
 /**
@@ -503,6 +506,23 @@ export async function runCommitFeedback(cwd: string, hash: string, deps: CommitF
 		mode = undefined;
 	}
 	if (!shouldShowCommitFeedback(mode, env, isTTY)) return;
+
+	// A blocked repo's worker exits without taking the capture lock or emitting
+	// any event, and `isCaptureWorkerDead` deliberately reads an absent lock as
+	// "not started yet" — a watch here could only end by timeout, blocking every
+	// interactive commit for the full ceiling while the repo stays in that
+	// state. Same hook-side pattern as the manual-disable check in
+	// runPostCommitHook; the worker's own terminal `failed` events are the
+	// belt to this braces (either side alone unblocks the commit).
+	const resolveRoute =
+		deps.resolveRoute ??
+		(async (): Promise<CutoverRoute | null> =>
+			(await import("../dashboard/CutoverRouter.js")).resolveCutoverRoute(cwd));
+	const route = await resolveRoute().catch(() => null);
+	if (route?.state === "blocked") {
+		write("⚠ Jolli Memory: commit queued, but the local database is unavailable — capture deferred (jolli doctor)");
+		return;
+	}
 
 	let sawStored = false;
 	let sawSkipped = false;

@@ -10,7 +10,7 @@
  * never breaks functionality, only wastes space. Those belong to `clean`.
  */
 
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Command } from "commander";
 import { orphanBranchExists } from "../core/GitOps.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
@@ -20,6 +20,14 @@ import { describeCandidate } from "../core/localagent/ExecutableResolver.js";
 import { localAgentToolLabel, localAgentToolLoginHint } from "../core/localagent/ToolMeta.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfig } from "../core/SessionTracker.js";
+import { resolveSotBackend } from "../core/SotStorageResolver.js";
+import { backupHealthCheck } from "../dashboard/Backup.js";
+import {
+	fillMemoriesFromFrozenOrphans,
+	fillMemoriesFromMirrors,
+	restoreFromSnapshot,
+	surveyRecovery,
+} from "../dashboard/Recovery.js";
 import { traverseDistPaths } from "../install/DistPathResolver.js";
 import { getStatus, install } from "../install/Installer.js";
 import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
@@ -92,12 +100,46 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 		/* v8 ignore stop */
 	});
 
-	// 2. Orphan branch
+	// 2a. System of record — which backend holds this repo's truth, and is it
+	// reachable. This is the check that answers "can memories be stored";
+	// `resolveSotBackend` is the diagnostic-shaped resolver precisely so a
+	// doctor can REPORT `blocked` instead of throwing on the one state a user
+	// runs doctor to understand.
+	const sot = await resolveSotBackend(cwd);
+	checks.push({
+		name: "System of record",
+		status: sot.ok ? "ok" : "fail",
+		message: sot.ok
+			? sot.state === "uncutover"
+				? `orphan branch (${ORPHAN_BRANCH})`
+				: `SQLite (${sot.state})`
+			: `unavailable — ${sot.reason}`,
+	});
+
+	// 2b. Orphan branch — informational only. Its absence used to be reported as
+	// a warning meaning "no memories yet", which is wrong past a cutover: the
+	// branch is frozen (or was never cloned) precisely because the database
+	// took over, so warning about it sends the user looking for a fault that
+	// does not exist. The data question is the check above.
+	// `!sot.ok` counts as cut over, not as "unknown": the resolver reports
+	// `blocked` only for a repo that IS fenced, so telling that user the branch
+	// "will be created on first commit" promises something the fence forbids —
+	// and that is precisely the reader who has a broken repo and is looking for
+	// the reason. (An un-cutover repo with no database resolves `ok` — verified:
+	// the router reports "orphan remains authoritative" and lands here as
+	// `uncutover`.)
 	const branchExists = await orphanBranchExists(ORPHAN_BRANCH, cwd);
+	const cutOver = !sot.ok || sot.state !== "uncutover";
 	checks.push({
 		name: "Orphan branch",
-		status: branchExists ? "ok" : "warn",
-		message: branchExists ? "exists" : "not yet created (will be created on first commit)",
+		status: "ok",
+		message: branchExists
+			? cutOver
+				? "present but frozen (this repo is cut over to SQLite)"
+				: "exists"
+			: cutOver
+				? "absent (expected — this repo is cut over to SQLite)"
+				: "not yet created (will be created on first commit)",
 	});
 
 	// 3. Worker lock (stuck = exists AND older than LOCK_HEARTBEAT_TIMEOUT_MS; a normal worker
@@ -266,6 +308,30 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 		}
 	}
 
+	// 9. Database backup health — the cutover gate's reporting row. An illegal
+	// stored folder or week-stale snapshots are failures; "drive unplugged" is
+	// a warning that escalates after seven days.
+	const backup = await backupHealthCheck(Date.now());
+	checks.push({
+		name: "Database backup",
+		status: backup.status,
+		message: backup.message,
+		// A `fail` with no fixer is a dead end: `doctor` exits 1 and `doctor --fix`
+		// has nothing to run, which is what a week without a commit produced on an
+		// otherwise healthy install. Staleness is fixable here and says so; an
+		// invalid folder or an unreachable drive is not, and offers no button.
+		...(backup.fixable
+			? {
+					fixer: async (): Promise<string> => {
+						const { opportunisticSnapshot } = await import("../dashboard/Backup.js");
+						const result = await opportunisticSnapshot();
+						if (result.status === "created") return `snapshot written to ${result.path}`;
+						return `snapshot not taken: ${result.reason}`;
+					},
+				}
+			: {}),
+	});
+
 	// Print results
 	console.log("\n  Jolli Memory Doctor");
 	console.log("  ──────────────────────────────────────");
@@ -323,16 +389,79 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 	console.log("");
 }
 
+/**
+ * `doctor --recover` — the plan's single disambiguation entry for a missing
+ * or damaged database. Lists every candidate source with its identity and
+ * age (snapshots carry both in the filename, so one carried in from any
+ * drive still matches), states the verdict, and with `--from <snapshot>`
+ * performs restore step ① (refuse-by-default over a healthy database;
+ * `--fix` is the explicit overwrite consent).
+ */
+export async function runRecover(fromPath?: string, force?: boolean): Promise<void> {
+	const survey = await surveyRecovery({ extraFolder: fromPath ? dirname(fromPath) : undefined });
+	console.log(`\nDatabase: ${survey.dbPath}`);
+	console.log(`  state: ${survey.fileState}`);
+	if (survey.fileState === "absent") {
+		console.log(`  identity verdict: ${survey.identity}`);
+		console.log(`  registry id: ${survey.registryId ?? "(none)"}  mirror id: ${survey.mirrorId ?? "(none)"}`);
+	}
+	console.log(`\nSnapshot candidates (${survey.candidates.length}), newest first:`);
+	for (const c of survey.candidates) {
+		const when = c.takenAtMs !== 0 ? new Date(c.takenAtMs).toISOString() : "(unparsable stamp)";
+		console.log(`  ${when}  id=${c.id8}${c.premigration ? "  [pre-migration]" : ""}  ${c.path}`);
+	}
+	if (survey.candidates.length === 0) {
+		console.log(`  (none found — folders scanned: ${survey.foldersScanned.join(", ")})`);
+	}
+	if (!fromPath) {
+		console.log(
+			"\nTo restore: jolli doctor --recover --from <snapshot path> (add --fix to overwrite a healthy database)",
+		);
+		return;
+	}
+	const result = await restoreFromSnapshot(fromPath, { force });
+	if (result.status === "restored") {
+		console.log(`\nRestored from ${result.from}.`);
+		// Step ② of the fixed order: mirrors fill memory gaps the snapshot
+		// predates. catch-up mode never deletes and never touches activity
+		// data, so this cannot make the restore worse.
+		const filled = await fillMemoriesFromMirrors();
+		console.log(
+			`Mirror gap-fill: ${filled.nodes} memory node(s) across ${filled.repos} repo mirror(s), ${filled.skipped} skipped.`,
+		);
+		// Step ③, last resort: fenced repos' frozen orphan branches. Recovers
+		// only what existed before the freeze — which is why it ranks below
+		// snapshots and mirrors — and leaves those repos legacy-fenced, so
+		// 'jolli cutover' finishes their CAS afterwards.
+		const frozen = await fillMemoriesFromFrozenOrphans();
+		if (frozen.repos > 0) {
+			console.log(
+				`Frozen-orphan gap-fill: ${frozen.nodes} memory node(s) across ${frozen.repos} fenced repo(s) — run 'jolli cutover' in each to finish the CAS.`,
+			);
+		}
+		console.log("Re-run 'jolli doctor' to verify.");
+	} else {
+		console.error(`\nRestore ${result.status}: ${result.reason}`);
+		process.exitCode = 1;
+	}
+}
+
 /** Registers the `doctor` sub-command on the given Commander program. */
 export function registerDoctorCommand(program: Command): void {
 	program
 		.command("doctor")
 		.description("Diagnose Jolli Memory health; optionally auto-fix issues")
 		.option("--fix", "Auto-fix detected issues (release stale lock, clear stuck queue, reinstall missing hooks)")
+		.option("--recover", "List database recovery candidates (snapshots with identity and age)")
+		.option("--from <path>", "With --recover: restore the database from this snapshot file")
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
-		.action(async (options: { cwd: string; fix?: boolean }) => {
+		.action(async (options: { cwd: string; fix?: boolean; recover?: boolean; from?: string }) => {
 			setLogDir(options.cwd);
 			log.info("Running 'doctor' command");
+			if (options.recover === true) {
+				await runRecover(options.from, options.fix === true);
+				return;
+			}
 			await runDoctor(options.cwd, options.fix === true);
 		});
 }

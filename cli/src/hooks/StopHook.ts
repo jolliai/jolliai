@@ -47,6 +47,7 @@ import {
 } from "../core/SessionTracker.js";
 import { scanSkillsWithCursor } from "../core/skills/TranscriptSkillDiscovery.js";
 import { flushTelemetryNow } from "../core/TelemetryStartup.js";
+import { recordSessionFromHook } from "../dashboard/ProducerHooks.js";
 import { isClaudeHookInstalled } from "../install/ClaudeHookInstaller.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { ClaudeHookInput, SessionInfo } from "../Types.js";
@@ -148,6 +149,13 @@ export async function handleStopHook(): Promise<void> {
 			log.error("  stack: %s", err.stack);
 		}
 	}
+
+	// Dashboard direct write (JOLLI-2069): project this session into the local
+	// stats DB so the dashboard is fresh without waiting for a recovery pass.
+	// Fully guarded — skips on runtimes without flag-free node:sqlite and never
+	// throws (this hook is async:true, but a crash here would still lose the
+	// discovery pass below).
+	await recordSessionFromHook(projectDir, sessionInfo);
 
 	// Single incremental discovery pass — plan + reference scanning share
 	// one discovery-cursors.json line per transcript. Each inner scan swallows

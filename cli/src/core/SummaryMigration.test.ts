@@ -10,6 +10,13 @@ vi.mock("./GitOps.js", () => ({
 	execGit: vi.fn(),
 }));
 
+// The raw-branch-write gate. Mocked rather than left to resolve for real: the
+// real resolver opens the machine's dashboard DB and reads the repo profile of
+// whatever cwd the suite happens to run in, which makes every case here depend
+// on the developer's own cutover state.
+const mockResolveSotBackend = vi.hoisted(() => vi.fn());
+vi.mock("./SotStorageResolver.js", () => ({ resolveSotBackend: mockResolveSotBackend }));
+
 // Mock Locks so we can simulate lock-acquisition failure without touching the
 // real filesystem. Default behavior matches a happy-path acquire.
 vi.mock("./Locks.js", () => ({
@@ -60,6 +67,27 @@ function createMockSummary(hash = "abc123def456", message = "Fix bug"): CommitSu
 describe("SummaryMigration", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		mockResolveSotBackend.mockResolvedValue({ ok: true, state: "uncutover", storage: {} });
+	});
+
+	describe("cutover gate", () => {
+		it("refuses to migrate onto a frozen branch and never acquires the lock", async () => {
+			// The route, not `readCutoverFence`: profile.json fails open, so a repo
+			// whose local fence was wiped must still be caught by the database row.
+			mockResolveSotBackend.mockResolvedValue({ ok: true, state: "cutover", storage: {} });
+			vi.mocked(orphanBranchExists).mockResolvedValueOnce(true);
+
+			await expect(migrateV1toV3()).rejects.toThrow(/orphan branch is frozen/);
+			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+		});
+
+		it("refuses when no safe backend exists at all (blocked)", async () => {
+			mockResolveSotBackend.mockResolvedValue({ ok: false, reason: "database unavailable" });
+
+			await expect(writeMigrationMeta()).rejects.toThrow(/database unavailable/);
+			expect(writeFileToBranch).not.toHaveBeenCalled();
+		});
 	});
 
 	describe("migrateV1toV3", () => {

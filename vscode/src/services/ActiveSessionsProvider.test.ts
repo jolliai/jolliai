@@ -36,6 +36,14 @@ vi.mock("../../../cli/src/core/SessionTracker.js", async (importActual) => ({
 	loadConfig: vi.fn().mockResolvedValue({}),
 }));
 
+// Dashboard direct write: the provider pushes each tick's
+// sessions into the local stats DB. Mocked so tests neither spawn git nor
+// touch the machine-level SQLite file; the real behaviour is covered by the
+// CLI's dashboard/ProducerHooks.test.ts.
+vi.mock("../../../cli/src/dashboard/ProducerHooks.js", () => ({
+	recordSessionsFromTick: vi.fn().mockResolvedValue(true),
+}));
+
 vi.mock("../util/Logger.js", () => ({
 	log: {
 		warn: vi.fn(),
@@ -43,12 +51,14 @@ vi.mock("../util/Logger.js", () => ({
 }));
 
 import { listActiveConversationsWithDiagnostics } from "../../../cli/src/core/ActiveSessionAggregator.js";
+import { recordSessionsFromTick } from "../../../cli/src/dashboard/ProducerHooks.js";
 import { log } from "../util/Logger.js";
 import { ActiveSessionsProvider } from "./ActiveSessionsProvider.js";
 
 describe("ActiveSessionsProvider", () => {
 	beforeEach(() => {
 		vi.mocked(listActiveConversationsWithDiagnostics).mockReset();
+		vi.mocked(recordSessionsFromTick).mockReset().mockResolvedValue(true);
 		vi.mocked(log.warn).mockReset();
 	});
 
@@ -222,6 +232,84 @@ describe("ActiveSessionsProvider", () => {
 		const result = await p.list();
 		expect(result).toHaveLength(1);
 		expect(result[0].isSelected).toBe(true);
+	});
+
+	it("pushes each successful tick's sessions to the dashboard writer", async () => {
+		const items = [
+			{
+				sessionId: "dash1",
+				source: "claude" as const,
+				title: "T",
+				messageCount: 2,
+				updatedAt: "2026-07-30T08:00:00Z",
+				transcriptPath: "/t1.jsonl",
+				isEdited: false,
+				isSelected: true,
+			},
+		];
+		vi.mocked(listActiveConversationsWithDiagnostics).mockResolvedValueOnce({
+			items,
+			failedSources: [],
+		});
+
+		const p = new ActiveSessionsProvider({ getWorkspaceCwd: () => "/proj" });
+		await p.listWithDiagnostics();
+
+		expect(recordSessionsFromTick).toHaveBeenCalledWith("/proj", [
+			{
+				sessionId: "dash1",
+				transcriptPath: "/t1.jsonl",
+				updatedAt: "2026-07-30T08:00:00Z",
+				source: "claude",
+				title: "T",
+			},
+		]);
+	});
+
+	it("prefers an injected dashboard writer seam over the default", async () => {
+		vi.mocked(listActiveConversationsWithDiagnostics).mockResolvedValueOnce({
+			items: [],
+			failedSources: [],
+		});
+		const seam = vi.fn().mockResolvedValue(false);
+
+		const p = new ActiveSessionsProvider({
+			getWorkspaceCwd: () => "/proj",
+			recordDashboardSessions: seam,
+		});
+		await p.listWithDiagnostics();
+
+		expect(seam).toHaveBeenCalledWith("/proj", []);
+		expect(recordSessionsFromTick).not.toHaveBeenCalled();
+	});
+
+	it("does not push to the dashboard when the aggregator throws", async () => {
+		vi.mocked(listActiveConversationsWithDiagnostics).mockRejectedValueOnce(
+			new Error("boom"),
+		);
+		const p = new ActiveSessionsProvider({ getWorkspaceCwd: () => "/proj" });
+		await p.listWithDiagnostics();
+
+		expect(recordSessionsFromTick).not.toHaveBeenCalled();
+	});
+
+	it("survives a rejecting dashboard writer seam", async () => {
+		vi.mocked(listActiveConversationsWithDiagnostics).mockResolvedValueOnce({
+			items: [],
+			failedSources: [],
+		});
+		const seam = vi.fn().mockRejectedValue(new Error("seam defect"));
+
+		const p = new ActiveSessionsProvider({
+			getWorkspaceCwd: () => "/proj",
+			recordDashboardSessions: seam,
+		});
+		const result = await p.listWithDiagnostics();
+
+		expect(result.items).toEqual([]);
+		// Give the fire-and-forget rejection a microtask to settle; an unhandled
+		// rejection here would fail the test run.
+		await new Promise((resolve) => setImmediate(resolve));
 	});
 
 	it("passes isSelected through from the aggregator to listWithDiagnostics()", async () => {

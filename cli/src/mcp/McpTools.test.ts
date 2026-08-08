@@ -13,6 +13,9 @@ vi.mock("../core/ContextCompiler.js", () => ({
 	DEFAULT_TOKEN_BUDGET: 80000,
 }));
 vi.mock("../core/TopicPageStore.js", () => ({ readTopicPage: vi.fn() }));
+// Recall writes a dashboard receipt. Mocked so this suite never touches the
+// developer's real machine-level database (see ProducerHooks' configDirFor).
+vi.mock("../dashboard/ProducerHooks.js", () => ({ recordRecallReceipt: vi.fn().mockResolvedValue(true) }));
 vi.mock("../core/SummaryStore.js", () => ({ getActiveStorage: vi.fn() }));
 vi.mock("../core/PrDescription.js", () => ({ buildPrDescription: vi.fn() }));
 vi.mock("../util/Subprocess.js", () => ({ execFileSyncHidden: vi.fn() }));
@@ -64,6 +67,7 @@ import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js
 import { clearSpaceBindingCache, loadSpaceBindingDisplay } from "../core/SpaceBindingCache.js";
 import { getActiveStorage } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
+import { recordRecallReceipt } from "../dashboard/ProducerHooks.js";
 import { getStatus } from "../install/Installer.js";
 import type { StatusInfo } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
@@ -175,6 +179,49 @@ describe("runRecall", () => {
 		vi.mocked(buildRecallPayload).mockReturnValue({ type: "recall", branch: seededBranch } as never);
 		const r = await runRecall("/repo", { branch: seededBranch });
 		expect(r.type).toBe("recall");
+	});
+});
+
+describe("runRecall receipts", () => {
+	const seed = (branch: string, commits: ReadonlyArray<{ fullHash: string; commitDate: string }>) => {
+		vi.mocked(listBranchCatalog).mockResolvedValue({
+			type: "catalog",
+			branches: [{ branch, commitCount: commits.length, period: { start: "2026-01-01", end: "2026-01-02" } }],
+		} as never);
+		vi.mocked(compileTaskContext).mockResolvedValue({ branch, commitCount: commits.length } as never);
+		vi.mocked(buildRecallPayload).mockReturnValue({
+			type: "recall",
+			branch,
+			commitCount: commits.length,
+			commits,
+		} as never);
+	};
+
+	it("records a served call so the dashboard sees it without waiting for a transcript scan", async () => {
+		seed("main", [{ fullHash: "a".repeat(40), commitDate: "2026-07-25" }]);
+		await runRecall("/repo", { branch: "main" });
+		expect(recordRecallReceipt).toHaveBeenCalledWith(
+			"/repo",
+			expect.objectContaining({
+				hit: true,
+				commitCount: 1,
+				commits: [{ hash: "a".repeat(40), date: "2026-07-25" }],
+			}),
+			"mcp",
+		);
+	});
+
+	it("records a catalog answer as a call that served nothing", async () => {
+		vi.mocked(listBranchCatalog).mockResolvedValue({
+			type: "catalog",
+			branches: [{ branch: "main", commitCount: 1, period: { start: "2026-01-01", end: "2026-01-01" } }],
+		} as never);
+		await runRecall("/repo", { branch: "no-such-frag" });
+		expect(recordRecallReceipt).toHaveBeenCalledWith(
+			"/repo",
+			expect.objectContaining({ hit: false, commitCount: 0, commits: [] }),
+			"mcp",
+		);
 	});
 });
 

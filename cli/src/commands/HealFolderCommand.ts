@@ -8,7 +8,6 @@
  */
 
 import type { Command } from "commander";
-import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import type { HealResult } from "../core/StorageProvider.js";
 import { createLogger, errMsg, setLogDir } from "../Logger.js";
@@ -16,19 +15,36 @@ import { resolveProjectDir } from "./CliUtils.js";
 
 const log = createLogger("heal-folder");
 
-async function readStorageMode(): Promise<"dual-write" | "folder" | "orphan"> {
+/**
+ * May heal DELETE a manifest row whose hidden JSON is gone?
+ *
+ * Only when something can put that memory back. Before cutover the orphan
+ * branch is the system of record, so migration / enable repopulate it. Once the
+ * repo is fenced or cut over, that branch is frozen and no re-projection from
+ * the database into the folder exists yet, so a drop is permanent data loss
+ * dressed up as a repair. (Dual-write still writes the hidden JSON past the
+ * fence — but that only keeps NEW rows present; it cannot restore one whose
+ * file is already gone. Revisit when a SQLite → folder rebuild lands.)
+ *
+ * Decided from the cutover route, NOT from `config.storageMode`: that key is
+ * retired and `createStorage` ignores it outright, so reading it here answered
+ * "dual-write" for every repo including the cut-over ones this must protect.
+ */
+async function mayDropOrphanedManifestEntries(cwd: string): Promise<boolean> {
 	try {
-		const cfg = (await loadConfig()) as Record<string, unknown>;
-		const mode = cfg.storageMode as string | undefined;
-		if (mode === "folder" || mode === "orphan") return mode;
-		return "dual-write";
-	} catch {
-		return "dual-write";
+		const { resolveCutoverRoute } = await import("../dashboard/CutoverRouter.js");
+		const route = await resolveCutoverRoute(cwd);
+		return route.state === "uncutover";
+	} catch (err) {
+		// Unknown route: keep every manifest row. A stale row costs a "failed"
+		// count in this command's own report; a wrong drop costs the memory.
+		log.warn("cutover route unavailable — heal will not drop manifest entries: %s", errMsg(err));
+		return false;
 	}
 }
 
 async function runHealFolder(cwd: string): Promise<number> {
-	const mode = await readStorageMode();
+	const dropOrphaned = await mayDropOrphanedManifestEntries(cwd);
 
 	let storage: Awaited<ReturnType<typeof createStorage>>;
 	try {
@@ -42,18 +58,18 @@ async function runHealFolder(cwd: string): Promise<number> {
 
 	if (!storage.healMissingVisibleMarkdown) {
 		console.log(
-			"\n  Heal not available: this repo is configured for orphan-only storage. " +
-				"Run `jolli configure --set storageMode=dual-write` (or `folder`) first.\n",
+			"\n  Heal not available: this repo has no visible Memory Bank folder to heal " +
+				"(orphan-only storage, or a fenced/cut-over repo not yet paired with the folder layer). " +
+				"Run `jolli doctor` to check this repo's storage state.\n",
 		);
 		return 0;
 	}
 
 	console.log("\n  Scanning Memory Bank manifest for missing visible Markdown files...");
-	// In dual-write mode the orphan branch is the system of record, so it's
-	// safe to drop manifest rows whose hidden JSON is also missing. In
-	// folder-only mode there is no truth source to repopulate from, so
-	// preserve every manifest row (heal-folder still counts them as failed
-	// for visibility, but never deletes).
+	// Whether a manifest row whose hidden JSON is also missing may be dropped —
+	// see mayDropOrphanedManifestEntries. When there is no truth source to
+	// repopulate from, every manifest row is preserved (heal-folder still counts
+	// them as failed for visibility, but never deletes).
 	//
 	// DualWriteStorage catches its own delegated throws and surfaces them as
 	// `result.error`. Folder-only mode calls FolderStorage directly — which
@@ -64,7 +80,7 @@ async function runHealFolder(cwd: string): Promise<number> {
 	let result: HealResult;
 	try {
 		result = await storage.healMissingVisibleMarkdown({
-			dropOrphanedManifestEntries: mode === "dual-write",
+			dropOrphanedManifestEntries: dropOrphaned,
 		});
 	} catch (err) {
 		const code = (err as NodeJS.ErrnoException)?.code;
@@ -117,8 +133,8 @@ async function runHealFolder(cwd: string): Promise<number> {
 				.join(", ");
 			console.log(`              ${preview}${dropped.length > 5 ? ", ..." : ""}`);
 			console.log("            Re-run `jolli enable` to repopulate from the orphan branch.");
-		} else if (mode === "folder") {
-			console.log("            Manifest entries kept (folder-only mode has no truth source to repopulate).");
+		} else if (!dropOrphaned) {
+			console.log("            Manifest entries kept (no truth source to repopulate from).");
 			console.log(
 				"            Inspect `.jolli/manifest.json` and restore the hidden JSON, or remove the row manually.",
 			);

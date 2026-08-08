@@ -31,6 +31,8 @@ vi.mock("../core/skills/TranscriptSkillDiscovery.js", () => ({
 }));
 
 vi.mock("../core/RepoProfile.js", () => ({
+	// Pre-cutover default: no fence (plain fn — survives mock resets).
+	readCutoverFence: async () => null,
 	readManualDisableFlag: vi.fn().mockResolvedValue(false),
 }));
 
@@ -61,6 +63,12 @@ vi.mock("../core/Locks.js", () => ({
 // CLI/settings Stop hook when this process is the claude-plugin's Stop hook.
 vi.mock("../install/ClaudeHookInstaller.js", () => ({
 	isClaudeHookInstalled: vi.fn().mockResolvedValue(false),
+}));
+
+// Dashboard direct write (JOLLI-2069): inert here — it opens the machine-level
+// SQLite DB and spawns git. Covered by dashboard/ProducerHooks.test.ts.
+vi.mock("../dashboard/ProducerHooks.js", () => ({
+	recordSessionFromHook: vi.fn().mockResolvedValue(true),
 }));
 
 // Mock node:fs so we can control existsSync / readFileSync / createReadStream
@@ -117,6 +125,7 @@ import {
 } from "../core/SessionTracker.js";
 import { scanSkillsWithCursor } from "../core/skills/TranscriptSkillDiscovery.js";
 import { flushTelemetryNow } from "../core/TelemetryStartup.js";
+import { recordSessionFromHook } from "../dashboard/ProducerHooks.js";
 import { isClaudeHookInstalled } from "../install/ClaudeHookInstaller.js";
 import type { PlanEntry } from "../Types.js";
 import { withPlatform } from "../testUtils/withPlatform.js";
@@ -416,6 +425,22 @@ describe("StopHook", () => {
 		expect(saveSession).toHaveBeenCalledWith(
 			expect.objectContaining({ sessionId: "env-sub-session" }),
 			"/repo/root",
+		);
+	});
+
+	it("projects the session into the dashboard DB after saving it", async () => {
+		const hookData = {
+			session_id: "dash-session-1",
+			transcript_path: "/home/user/.claude/projects/abc/session.jsonl",
+			cwd: "/my/project",
+		};
+
+		mockStdin(JSON.stringify(hookData));
+		await handleStopHook();
+
+		expect(recordSessionFromHook).toHaveBeenCalledWith(
+			"/my/project",
+			expect.objectContaining({ sessionId: "dash-session-1", source: "claude" }),
 		);
 	});
 

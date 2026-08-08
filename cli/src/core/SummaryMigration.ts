@@ -20,6 +20,8 @@ import {
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
 import { acquireOrphanWriteLock, releaseOrphanWriteLock } from "./Locks.js";
+import { holdsOrphanWriteLock, runHoldingOrphanWriteLock } from "./OrphanWriteReentrancy.js";
+import { resolveSotBackend } from "./SotStorageResolver.js";
 
 const log = createLogger("SummaryMigration");
 
@@ -46,12 +48,40 @@ async function withMigrationOrphanWriteLock<T>(
 	label: string,
 	fn: () => Promise<T>,
 ): Promise<T> {
+	// These are the only orphan writes in the tree that call
+	// `writeMultipleFilesToBranch` / `writeFileToBranch` directly rather than
+	// through `OrphanBranchStorage.writeFiles`, so they miss its write-time
+	// fence check — the D6 invariant's last line. Pre-CAS the tip check would
+	// catch the write and retry; post-CAS it would land as unnoticed drift on a
+	// branch nothing reads again. Narrow (a manual command on a v1-era repo that
+	// also cut over) but there is no reason for it to be the one exception.
+	//
+	// Asked as a ROUTE, not as `readCutoverFence` alone. The fence lives in
+	// per-project `profile.json`, which `readRaw` fails OPEN — a wiped or corrupt
+	// file reads as `{}` — and per-project state is exactly what users delete.
+	// The route also consults the database's `cutover` row, so a repo whose
+	// local fence is gone is still recognised. `blocked` refuses too: no safe
+	// backend exists there, and this path's whole job is a raw branch write.
+	const sot = await resolveSotBackend(cwd ?? process.cwd());
+	if (!sot.ok || sot.state !== "uncutover") {
+		const why = sot.ok ? `this repo is ${sot.state}` : sot.reason;
+		throw new Error(
+			`${label}: the orphan branch is frozen (${why}) — v1 data cannot be migrated onto it. ` +
+				"Migrate before cutting over, or use jolli doctor.",
+		);
+	}
+	// Re-entrant: a hand-rolled acquire would poll out its whole 30 s budget
+	// against a lock its own call chain already holds and then report it as
+	// contention — a hard abort with a message naming a writer that does not
+	// exist. Registering is the other half: a wrapper reached from inside `fn`
+	// must see the lock as held, or it self-blocks in turn.
+	if (holdsOrphanWriteLock(cwd)) return await fn();
 	const acquired = await acquireOrphanWriteLock(cwd, { timeoutMs: MIGRATION_LOCK_TIMEOUT_MS });
 	if (!acquired) {
 		throw new Error(`${label}: could not acquire orphan-write lock within ${MIGRATION_LOCK_TIMEOUT_MS}ms`);
 	}
 	try {
-		return await fn();
+		return await runHoldingOrphanWriteLock(cwd, fn);
 	} finally {
 		await releaseOrphanWriteLock(cwd);
 	}

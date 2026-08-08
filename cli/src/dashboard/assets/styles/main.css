@@ -1,0 +1,1092 @@
+/*
+ * Dashboard stylesheet — the design system from the `jolli stats` / `jolli standup`
+ * mockups, adopted verbatim rather than re-derived so the shipped pages and the
+ * design artifacts cannot drift.
+ *
+ * Everything is scoped under `.jd`, which is also where the light/dark token sets
+ * live: the page renders in the viewer's system theme with no JS involved.
+ * Sections below map 1:1 to the mockup's own banners, so a change there can be
+ * located here by the same name.
+ */
+
+/* Page reset — the mockup lived inside an artifact frame that supplied this. */
+html,
+body {
+	margin: 0;
+	padding: 0;
+}
+
+  /* ---------- tokens ----------
+     Two layers: the `--v2-*` custom properties are the App V2 palette, copied
+     verbatim from the `local-web-server` design mockup's own `:root`/`.dark`
+     block (that mockup has no bundler and no external component library —
+     its inline CSS IS the source of truth, so these values are taken directly
+     from it rather than from the `web/app-mock` React/shadcn library it cites,
+     which does not exist anywhere in this workspace). The legacy `--page`/
+     `--surface`/`--ink`/… names are then ALIASED onto `--v2-*` rather than
+     replaced, so every existing page and chart picks up the new palette with
+     no per-file change — same doctrine as this stylesheet's own header
+     comment, extended to a second design artifact.
+
+     `--s1..--s5` is the one alias that is NOT a free choice: it reproduces the
+     mockup's validated categorical order (cat-1, cat-3, cat-4, cat-2, cat-5),
+     not the palette's own declared order (cat-1..cat-5), because the adjacent
+     pair cat-1/cat-2 fails CVD separation (ΔE 2.3 under deuteranopia, 12.2
+     normal vision — both below the floor of 15) while cat-1/cat-3 passes in
+     both themes. Re-ordering these for looks re-breaks that check. */
+  .jd {
+    color-scheme: light;
+    --v2-background:            220 20% 97%;
+    --v2-card:                  0 0% 100%;
+    --v2-foreground:            222 24% 16%;
+    --v2-secondary:              220 17% 95%;
+    --v2-secondary-foreground:  222 20% 25%;
+    --v2-muted:                 220 17% 95%;
+    --v2-muted-foreground:      220 9% 46%;
+    --v2-border:                220 18% 90%;
+    --v2-border-soft:           220 20% 94%;
+    --v2-destructive:           0 74% 52%;
+    --v2-link:      #2b73ee;
+    --v2-positive:  #12996b;
+    --v2-negative:  #e5484d;
+    --v2-warning:   #c2740a;
+    --v2-cat-1: #3f85f5; --v2-cat-2: #8b5cf6; --v2-cat-3: #ef9a1e; --v2-cat-4: #0d9488; --v2-cat-5: #d6409f;
+
+    --page:        hsl(var(--v2-background));
+    --surface:     hsl(var(--v2-card));
+    --ink:         hsl(var(--v2-foreground));
+    --ink-2:       hsl(var(--v2-secondary-foreground));
+    --muted:       hsl(var(--v2-muted-foreground));
+    --grid:        hsl(var(--v2-border-soft));
+    --baseline:    hsl(var(--v2-border));
+    --border:      hsl(var(--v2-border));
+    --accent:      var(--v2-link);
+    --accent-soft: color-mix(in srgb, var(--v2-link) 10%, transparent);
+    --good-text:   var(--v2-positive);
+    --good:        var(--v2-positive);
+    --warn:        var(--v2-warning);
+    --serious:     var(--v2-warning);
+    --crit:        var(--v2-negative);
+    --s1: var(--v2-cat-1); --s2: var(--v2-cat-3); --s3: var(--v2-cat-4); --s4: var(--v2-cat-2); --s5: var(--v2-cat-5);
+    --heat-track:  hsl(var(--v2-muted));
+    --lock-bg:     hsl(var(--v2-muted));
+    --shadow-sm: 0 1px 2px rgba(20,28,48,.05), 0 1px 3px rgba(20,28,48,.04);
+    --shadow-md: 0 4px 12px rgba(20,28,48,.06), 0 2px 4px rgba(20,28,48,.04);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page);
+    color: var(--ink);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .jd {
+      color-scheme: dark;
+      --v2-background:            222 16% 7%;
+      --v2-card:                  222 13% 11%;
+      --v2-foreground:            220 16% 90%;
+      --v2-secondary:              222 12% 15%;
+      --v2-secondary-foreground:  220 16% 88%;
+      --v2-muted:                 222 12% 14%;
+      --v2-muted-foreground:      220 9% 58%;
+      --v2-border:                222 12% 19%;
+      --v2-border-soft:           222 12% 15%;
+      --v2-destructive:           0 70% 62%;
+      --v2-link:      #8ab9fa;
+      --v2-positive:  #2fd39a;
+      --v2-negative:  #ff6b6b;
+      --v2-warning:   #fbbf24;
+      --v2-cat-1: #6ba5f8; --v2-cat-2: #a78bfa; --v2-cat-3: #fbbf24; --v2-cat-4: #2dd4bf; --v2-cat-5: #f472b6;
+
+      --page:        hsl(var(--v2-background));
+      --surface:     hsl(var(--v2-card));
+      --ink:         hsl(var(--v2-foreground));
+      --ink-2:       hsl(var(--v2-secondary-foreground));
+      --muted:       hsl(var(--v2-muted-foreground));
+      --grid:        hsl(var(--v2-border-soft));
+      --baseline:    hsl(var(--v2-border));
+      --border:      hsl(var(--v2-border));
+      --accent:      var(--v2-link);
+      --accent-soft: color-mix(in srgb, var(--v2-link) 16%, transparent);
+      --good-text:   var(--v2-positive);
+      --good:        var(--v2-positive);
+      --warn:        var(--v2-warning);
+      --serious:     var(--v2-warning);
+      --crit:        var(--v2-negative);
+      --s1: var(--v2-cat-1); --s2: var(--v2-cat-3); --s3: var(--v2-cat-4); --s4: var(--v2-cat-2); --s5: var(--v2-cat-5);
+      --heat-track:  hsl(var(--v2-muted));
+      --lock-bg:     hsl(var(--v2-muted));
+      --shadow-sm: 0 1px 2px rgba(0,0,0,.5);
+      --shadow-md: 0 4px 14px rgba(0,0,0,.5);
+    }
+  }
+  :root[data-theme="dark"] .jd {
+    color-scheme: dark;
+    --v2-background:            222 16% 7%;
+    --v2-card:                  222 13% 11%;
+    --v2-foreground:            220 16% 90%;
+    --v2-secondary:              222 12% 15%;
+    --v2-secondary-foreground:  220 16% 88%;
+    --v2-muted:                 222 12% 14%;
+    --v2-muted-foreground:      220 9% 58%;
+    --v2-border:                222 12% 19%;
+    --v2-border-soft:           222 12% 15%;
+    --v2-destructive:           0 70% 62%;
+    --v2-link:      #8ab9fa;
+    --v2-positive:  #2fd39a;
+    --v2-negative:  #ff6b6b;
+    --v2-warning:   #fbbf24;
+    --v2-cat-1: #6ba5f8; --v2-cat-2: #a78bfa; --v2-cat-3: #fbbf24; --v2-cat-4: #2dd4bf; --v2-cat-5: #f472b6;
+
+    --page:        hsl(var(--v2-background));
+    --surface:     hsl(var(--v2-card));
+    --ink:         hsl(var(--v2-foreground));
+    --ink-2:       hsl(var(--v2-secondary-foreground));
+    --muted:       hsl(var(--v2-muted-foreground));
+    --grid:        hsl(var(--v2-border-soft));
+    --baseline:    hsl(var(--v2-border));
+    --border:      hsl(var(--v2-border));
+    --accent:      var(--v2-link);
+    --accent-soft: color-mix(in srgb, var(--v2-link) 16%, transparent);
+    --good-text:   var(--v2-positive);
+    --good:        var(--v2-positive);
+    --warn:        var(--v2-warning);
+    --serious:     var(--v2-warning);
+    --crit:        var(--v2-negative);
+    --s1: var(--v2-cat-1); --s2: var(--v2-cat-3); --s3: var(--v2-cat-4); --s4: var(--v2-cat-2); --s5: var(--v2-cat-5);
+    --heat-track:  hsl(var(--v2-muted));
+    --lock-bg:     hsl(var(--v2-muted));
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.5);
+    --shadow-md: 0 4px 14px rgba(0,0,0,.5);
+  }
+
+  .jd * { box-sizing: border-box; }
+  .jd { margin: 0; padding: 0; min-height: 100vh; display: flex; align-items: stretch; position: relative; }
+  .main { flex: 1; min-width: 0; padding-bottom: 48px; }
+  .jd svg text { font-family: inherit; }
+  .num { font-variant-numeric: tabular-nums; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+
+  /* ---------- top bar ---------- */
+  .topbar {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 14px 24px; border-bottom: 1px solid var(--border);
+    background: var(--surface); position: sticky; top: 0; z-index: 30;
+  }
+  .wordmark { display: flex; align-items: baseline; gap: 8px; }
+  .wordmark b { font-size: 16px; letter-spacing: -.01em; }
+  .wordmark span { font-size: 12px; color: var(--muted); }
+  .repo-pill {
+    font-size: 12px; color: var(--ink-2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; background: transparent;
+  }
+  .spacer { flex: 1; }
+  .tiers-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--page); }
+  /* `.seg`'s own `display: inline-flex` otherwise beats the UA `[hidden] { display: none }`
+     rule (same specificity, author over UA) — the same gotcha `.dx-answer[hidden]` documents
+     below. Without this, `rangeSeg.hidden = true` (shell.js, for views with no time window —
+     Memories, Knowledge, Repositories, Settings) sets the attribute but the control stays
+     visibly flexed on screen. */
+  .seg[hidden] { display: none; }
+  .seg button {
+    appearance: none; border: 0; background: transparent; color: var(--ink-2);
+    font: inherit; font-size: 12.5px; padding: 6px 14px; cursor: pointer; position: relative;
+  }
+  .seg button + button { border-left: 1px solid var(--border); }
+  /* Solid ink pill, not accent-soft — jolli-design's real segmented controls
+     (range picker, card tabs) use a dark filled pill for the active state, not
+     a tinted accent; confirmed against a screenshot of its Dashboard route. */
+  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); font-weight: 600; }
+  .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  /* Custom range picker. This is a real range calendar rather than two browser
+     date fields: native pickers differ materially across browsers and cannot
+     show the selected span, which made the control look unlike the dashboard. */
+  .range-custom {
+    position: fixed; z-index: 40; width: min(720px, calc(100vw - 32px));
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: 0 14px 32px rgba(20,28,48,.16); overflow: hidden;
+  }
+  .range-custom[hidden] { display: none; }
+  .range-calendar-head { display: grid; grid-template-columns: 42px 1fr 42px; align-items: start; padding: 18px 20px 14px; }
+  .range-calendar-months { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; }
+  .range-nav {
+    appearance: none; width: 32px; height: 32px; margin-top: 2px; border: 1px solid var(--border);
+    border-radius: 9px; background: var(--surface); color: var(--muted); font: inherit; font-size: 28px;
+    line-height: 24px; cursor: pointer; box-shadow: var(--shadow-sm);
+  }
+  .range-nav:last-child { justify-self: end; }
+  .range-nav:hover { color: var(--ink); background: var(--lock-bg); }
+  .range-nav:focus-visible, .range-day:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .range-month-title { margin: 3px 0 14px; text-align: center; font-size: 14px; font-weight: 600; }
+  .range-weekdays, .range-days { display: grid; grid-template-columns: repeat(7, 1fr); }
+  .range-weekdays span { padding-bottom: 6px; text-align: center; font-size: 11px; color: var(--muted); }
+  .range-day {
+    appearance: none; position: relative; height: 34px; border: 0; border-radius: 8px; background: transparent;
+    color: var(--ink-2); font: inherit; font-size: 12.5px; cursor: pointer; z-index: 0;
+  }
+  .range-day:hover:not(:disabled) { background: var(--lock-bg); }
+  .range-day:disabled { color: color-mix(in srgb, var(--muted) 45%, transparent); cursor: not-allowed; }
+  .range-day.in-range { border-radius: 0; background: var(--accent-soft); }
+  .range-day.range-start, .range-day.range-end { background: var(--ink); color: var(--surface); font-weight: 600; }
+  .range-day.range-start { border-radius: 8px 0 0 8px; }
+  .range-day.range-end { border-radius: 0 8px 8px 0; }
+  .range-day.range-start.range-end { border-radius: 8px; }
+  .range-calendar-foot { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+  .range-calendar-foot > div { display: flex; gap: 8px; }
+  @media (max-width: 620px) {
+    .range-calendar-head { grid-template-columns: 34px 1fr 34px; padding: 14px 12px; }
+    .range-calendar-months { grid-template-columns: 1fr; gap: 16px; }
+    .range-calendar-months .range-month:nth-child(2) { display: none; }
+    .range-calendar-foot { padding: 10px 12px; }
+  }
+
+  .machines-chip { display: none; font-size: 12px; color: var(--ink-2); border: 1px dashed var(--border); border-radius: 999px; padding: 4px 10px; }
+  .jd[data-tier="2"] .machines-chip { display: inline-block; }
+  .local-chip { font-size: 12px; color: var(--ink-2); border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; }
+  .jd[data-tier="2"] .local-chip { display: none; }
+
+  /* ---------- sidebar ---------- */
+  .sidebar {
+    width: 212px; flex: none; position: sticky; top: 0; height: 100vh; align-self: flex-start;
+    background: var(--surface); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; padding: 14px 10px 12px; overflow-y: auto;
+  }
+  .sb-brand { display: flex; align-items: baseline; gap: 7px; padding: 2px 10px 10px; }
+  .sb-brand b { font-size: 16px; letter-spacing: -.01em; }
+  .sb-brand span { font-size: 11px; color: var(--muted); }
+  .sb-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; padding: 12px 10px 6px; }
+  .sb-label small { font-size: 11px; text-transform: none; letter-spacing: 0; }
+  .sb-list { display: grid; gap: 2px; }
+  .sb-item {
+    appearance: none; border: 0; background: transparent; font: inherit; text-align: left; cursor: pointer;
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 6px 10px; border-radius: 7px; font-size: 13px; color: var(--ink-2);
+  }
+  .sb-item:hover { background: var(--lock-bg); color: var(--ink); }
+  .sb-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .sb-item[aria-current="page"], .sb-item[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .sb-icon { width: 16px; height: 16px; display: inline-flex; flex: none; }
+  .sb-icon svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .sb-item .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sb-item .meta { margin-left: auto; font-size: 11px; color: var(--muted); flex: none; }
+  .sb-item .jmark { margin-left: auto; }
+  @media (max-width: 899px) { .sidebar { display: none; } }
+
+  /* The bottom slot is a standing destination, not the tail end of the menu
+     list — pin it to the sidebar's bottom edge (flex column + margin-top: auto)
+     and set it off with the same rule used for .footnote elsewhere on the page. */
+  .sb-bottom { margin-top: auto; padding-top: 10px; border-top: 1px solid var(--border); }
+
+  /* ---------- nav: Dashboard's two children + gated rows ----------
+     Six-destination nav (Repositories top slot, Dashboard/Memories/Knowledge/
+     Graph gated middle group, Settings bottom slot). Children render indented
+     under a group label rather than behind an expand/collapse toggle — that
+     interaction is a later polish pass over the same markup, not a routing
+     concern. Gating mirrors DashboardServer's GATED_PATHS: a disabled row is
+     the SAME "no repo enabled yet" fact the server's 302 already enforces. */
+  .sb-group-label { display: flex; align-items: center; gap: 8px; color: var(--ink-2); padding: 8px 10px 2px; font-size: 13px; }
+  .sb-group-label .sb-group-chevron { width: 14px; height: 14px; margin-left: auto; color: var(--accent); }
+  .sb-item.child { padding-left: 34px; font-size: 12.5px; }
+  .sb-item[aria-disabled="true"] { color: var(--muted); opacity: .55; cursor: not-allowed; }
+  .sb-item[aria-disabled="true"]:hover { background: transparent; color: var(--muted); }
+
+  /* ---------- layout ---------- */
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 20px 24px 0; }
+  .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+  .card {
+    grid-column: span 12; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px 16px;
+    box-shadow: var(--shadow-sm); min-width: 0; position: relative;
+  }
+  @media (min-width: 900px) {
+    .span7 { grid-column: span 7; } .span5 { grid-column: span 5; }
+    .span6 { grid-column: span 6; }
+    /* Equal-third band — Skills / MCP servers / Where your tokens went, matching
+       jolli-design's own three-up row: three widgets of the same weight, so
+       none of them leads. */
+    .span4 { grid-column: span 4; }
+  }
+  .card h2 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .01em; }
+  .card .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .card-head { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+  .card-head .spacer { flex: 1; }
+
+  /* ---------- widget icon badge + footer (jolli-design chrome, 2026-08) ----------
+     Each card's icon badge is tinted to that card's own theme colour (soft
+     background, solid icon) rather than one accent reused everywhere — the
+     visual signature confirmed against jolli-design's real rendered Dashboard
+     page (fetched via Basic Auth, screenshotted headless, not guessed from
+     tokens alone). `.w-foot` is the same real page's repeated closing row:
+     a few caveat chips, an optional "how this is measured" note, and a
+     right-aligned deep link — new cards should use it instead of inventing
+     a one-off footer. */
+  .w-icon {
+    width: 28px; height: 28px; border-radius: 8px; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .w-icon svg { width: 15px; height: 15px; }
+  .w-foot { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-top: 14px; padding-top: 11px; border-top: 1px solid var(--grid); }
+  .w-chip { font-size: 10.5px; color: var(--muted); background: var(--lock-bg); border-radius: 999px; padding: 2px 9px; }
+  .w-measure { font-size: 11px; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; }
+  /* A sentence with inline <b> content must not be an inline flex container:
+     each text fragment becomes a separate flex item and wraps into columns on
+     narrow MCP cards. */
+  .mcp-card-note { display: block; width: 100%; line-height: 1.45; }
+  .w-deep { margin-left: auto; font-size: 11.5px; font-weight: 600; color: var(--accent); white-space: nowrap; }
+
+  /* ---------- header strip ---------- */
+  .strip { display: flex; gap: 0; flex-wrap: wrap; padding: 4px 0 0; }
+  .stat { padding: 10px 22px 10px 0; margin-right: 22px; border-right: 1px solid var(--grid); }
+  .stat:last-child { border-right: 0; }
+  .stat .v { font-size: 22px; font-weight: 650; letter-spacing: -.01em; }
+  .stat .v small { font-size: 13px; font-weight: 500; color: var(--ink-2); }
+  .stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-top: 2px; }
+  .stat .d { font-size: 11.5px; margin-top: 2px; color: var(--ink-2); }
+  .stat .d.good { color: var(--good-text); }
+  .agent-dots { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
+  .agent-dot { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ink-2); border: 1px solid var(--border); padding: 3px 9px; border-radius: 999px; }
+  .agent-dot i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .agent-dot em { font-style: normal; font-size: 10px; color: var(--muted); }
+
+  /* ---------- chips / group-by ---------- */
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    appearance: none; font: inherit; font-size: 12px; cursor: pointer;
+    border: 1px solid var(--border); background: transparent; color: var(--ink-2);
+    border-radius: 999px; padding: 4px 12px; display: inline-flex; align-items: center; gap: 6px;
+  }
+  /* Same dark solid pill as .seg's active state — group-by chips and card tabs
+     read as one control family in jolli-design, not two different colour
+     languages for what is functionally the same toggle. */
+  .chip[aria-pressed="true"] { background: var(--ink); border-color: transparent; color: var(--surface); font-weight: 600; }
+  .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .chip.locked { color: var(--muted); background: var(--lock-bg); border-style: dashed; }
+  .chip.locked[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+
+  /* ---------- jolli mark & locked previews ---------- */
+  .jmark {
+    display: inline-flex; align-items: center; justify-content: center; flex: none;
+    width: 13px; height: 13px; border-radius: 4px;
+    background: var(--accent); color: #fff;
+    font-size: 9px; font-weight: 700; line-height: 1; font-style: normal;
+  }
+  .m1-lockwrap { position: relative; }
+  .m1-teaser { filter: grayscale(1); opacity: .38; pointer-events: none; user-select: none; }
+  .m1-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 12px; }
+  .lockbox {
+    width: min(300px, 100%); background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px; box-shadow: 0 8px 28px rgba(0,0,0,.16);
+  }
+  .lockbox h3 { margin: 0 0 5px; font-size: 13px; display: flex; align-items: center; gap: 7px; }
+  .lockbox p { margin: 0 0 10px; font-size: 12px; color: var(--ink-2); }
+
+  /* ---------- legend ---------- */
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 2px 0 0; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); max-width: 100%; }
+  .legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+  /* A legend key is data (a model id, a repo name), so it can be arbitrarily
+     long — the swatch and the number are fixed, the key is what truncates. Its
+     full text is on a `title`. */
+  .legend .lg-key { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 180px; }
+  .legend b { flex: none; }
+
+  .chart-box { position: relative; }
+  .chart-note { font-size: 11.5px; color: var(--muted); margin-top: 8px; }
+  .chart-note b { color: var(--ink-2); font-weight: 600; }
+  /* "nothing here yet" inside a card. Used by every view; it had no rule at all,
+     so these lines were rendering at body size and full contrast — reading as
+     content rather than as the absence of it. */
+  .empty-note { font-size: 12.5px; color: var(--muted); margin-top: 12px; line-height: 1.55; }
+
+  /* ---------- ranked bars ---------- */
+  .ranked { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
+  .rrow { display: grid; grid-template-columns: 190px 1fr 92px; gap: 10px; align-items: center; }
+  .rrow .lbl { font-size: 12.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rrow .bar { height: 18px; border-radius: 0 4px 4px 0; background: var(--s1); min-width: 2px; position: relative; }
+  .rrow .track { background: transparent; border-left: 2px solid var(--baseline); padding-left: 0; height: 18px; display:flex; align-items:center; }
+  .rrow .val { font-size: 12.5px; text-align: right; color: var(--ink); }
+  .rrow .meta { font-size: 11px; color: var(--muted); display: block; }
+
+  /* ---------- table view ---------- */
+  .ttable { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 12.5px; }
+  .ttable th { text-align: left; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+  .ttable td { padding: 7px 8px; border-bottom: 1px solid var(--grid); color: var(--ink-2); }
+  .ttable td.r, .ttable th.r { text-align: right; }
+  .ttable td:first-child { color: var(--ink); }
+
+  /* ---------- heatmap & records ---------- */
+  .heat-legend { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); flex-wrap: wrap; }
+  .heat-legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .dist { display: flex; gap: 2px; height: 10px; border-radius: 5px; overflow: hidden; max-width: 420px; }
+  .dist i { display: block; }
+  .dist-labels { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 6px; font-size: 11px; color: var(--muted); }
+  .dist-labels span { display: inline-flex; align-items: center; }
+  .dist-labels i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; margin-right: 5px; }
+  .records { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 7px; }
+  .records li { display: flex; justify-content: space-between; gap: 10px; font-size: 12.5px; color: var(--ink-2); }
+  .records li b { color: var(--ink); font-weight: 600; }
+
+  /* ---------- feed ---------- */
+  .feed { display: grid; gap: 10px; }
+  .fcard { border: 1px solid var(--grid); border-radius: 8px; padding: 12px 14px; display: grid; gap: 7px; }
+  .fcard .row1 { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .fcard .title { font-size: 13.5px; font-weight: 600; }
+  .fcard .when { font-size: 11.5px; color: var(--muted); margin-left: auto; white-space: nowrap; }
+  .fcard .decision { font-size: 12.5px; color: var(--ink-2); }
+  .fcard .decision b { font-weight: 600; color: var(--ink-2); }
+  .fchips { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--ink-2); display: inline-flex; align-items: center; gap: 5px; }
+  .tag i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .tag.metric { border-color: transparent; background: var(--lock-bg); }
+  .tag.reuse { display: none; border-color: transparent; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .jd[data-tier="2"] .tag.reuse { display: inline-flex; }
+  .sess-row { display: flex; gap: 12px; align-items: center; border: 1px solid var(--grid); border-radius: 8px; padding: 10px 14px; font-size: 12.5px; color: var(--ink-2); }
+  .sess-row .t { color: var(--ink); font-weight: 550; }
+  .sess-row .when { margin-left: auto; color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+
+  /* ---------- tiles (M4) ---------- */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile { border: 1px solid var(--grid); border-radius: 8px; padding: 12px 14px 10px; }
+  .tile .v { font-size: 20px; font-weight: 650; }
+  .tile .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-top: 1px; }
+  .tile .d { font-size: 11.5px; color: var(--ink-2); margin-top: 3px; }
+  .tile .d.good { color: var(--good-text); }
+
+  /* ---------- M5 ---------- */
+  .m5-stats { display: flex; gap: 22px; flex-wrap: wrap; margin-bottom: 10px; }
+  .receipt { border: 1px dashed var(--border); border-radius: 8px; padding: 10px 12px; font-size: 12.5px; color: var(--ink-2); display: grid; gap: 5px; }
+  .receipt .rk { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .reuse-list { display: grid; gap: 8px; margin-top: 12px; }
+  .reuse-row { display: flex; gap: 10px; align-items: center; font-size: 12.5px; color: var(--ink-2); border: 1px solid var(--grid); border-radius: 8px; padding: 9px 12px; }
+  .reuse-row b { color: var(--ink); }
+  .reuse-row .when { margin-left: auto; color: var(--muted); font-size: 11.5px; }
+  .t2only { display: none; }
+  .jd[data-tier="2"] .t2only { display: block; }
+  .jd[data-tier="2"] .t2hide { display: none; }
+
+  /* ---------- decisions ----------
+     Paired with the Recall lockedCard (both span6) so the row reads as one
+     idea: what got kept vs. what got reused. Carries no "recalled" figure of
+     its own — see DecisionsCard's doc comment. */
+  .hdr-stat { margin-left: auto; text-align: right; }
+  .hdr-stat b { display: block; font-size: 19px; font-weight: 650; letter-spacing: -.01em; }
+  .hdr-stat span { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+  .stepchart { margin-top: 10px; }
+  .stepchart svg { display: block; width: 100%; height: 60px; }
+  .dec-quote {
+    font-size: 12.5px; color: var(--ink-2); border-left: 2px solid var(--border); padding-left: 10px;
+    margin-top: 12px; line-height: 1.55; font-style: italic;
+  }
+  .dec-quote .qlab { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-style: normal; display: block; margin-bottom: 3px; }
+
+  /* ---------- do next (M6) ---------- */
+  .donext { display: grid; gap: 10px; }
+  @media (min-width: 900px) { .donext { grid-template-columns: repeat(3, 1fr); } }
+  .icard {
+    border: 1px solid var(--grid); border-radius: 8px; padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 7px; position: relative; min-width: 0;
+  }
+  .icard.leaving { opacity: 0; transform: translateY(-6px); }
+  .icard.done { opacity: .74; }
+  .icard .ifind { font-size: 13px; font-weight: 600; line-height: 1.35; padding-right: 14px; }
+  .icard .iimpact { font-size: 12.5px; font-weight: 650; color: var(--good-text); }
+  .icard .iwhy { font-size: 12px; color: var(--ink-2); line-height: 1.5; flex: 1; }
+  .icard .iev { font-size: 11px; color: var(--muted); }
+  .icard .irow { margin-top: 3px; }
+  .icard .idone { font-size: 12px; font-weight: 600; color: var(--good-text); }
+  .idismiss {
+    position: absolute; top: 7px; right: 7px; appearance: none; background: none; border: 0;
+    color: var(--muted); font: inherit; font-size: 12px; line-height: 1; cursor: pointer; padding: 4px 5px; border-radius: 5px;
+  }
+  .idismiss:hover { color: var(--ink); background: var(--lock-bg); }
+  .idismiss:focus-visible { outline: 2px solid var(--accent); }
+  .iempty { grid-column: 1 / -1; }
+  .iteaser {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    border: 1px dashed var(--border); background: var(--lock-bg); border-radius: 8px;
+    padding: 9px 13px; font-size: 12px; color: var(--ink-2); margin-top: 10px;
+  }
+  .iteaser b { color: var(--ink); }
+  .iteaser .cta { margin-left: auto; }
+  .cta.sm { font-size: 12px; padding: 5px 11px; }
+
+  /* ---------- collapsed-list footer (JD.moreToggle) ---------- */
+  .more-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
+  .more-count { font-size: 11.5px; color: var(--muted); }
+  .more-row .cta { margin-left: auto; }
+
+  /* ---------- outcome tag (M6 do next) ---------- */
+  .tag.outc { border-color: transparent; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
+  /* ---------- small segmented control + callout ---------- */
+  .seg.seg-sm button { padding: 5px 12px; font-size: 12px; }
+  .callout { display: flex; gap: 10px; border: 1px solid var(--border); background: var(--lock-bg); border-radius: 8px; padding: 11px 13px; font-size: 12px; line-height: 1.5; color: var(--ink-2); }
+  .callout b { color: var(--ink); }
+  .callout .link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+
+  /* ---------- repositories: the setup/receipt card ----------
+     Same card renders first-run and "add another repository later" — see
+     repositories.js's header. Reuses the app's own empty-state / option-row
+     idioms rather than inventing new containers per region. */
+  .empty { border: 1px solid var(--border); background: var(--surface); border-radius: 12px; padding: 40px; box-shadow: var(--shadow-sm, none); }
+  .empty .inner { max-width: 28rem; margin: 0 auto; display: flex; flex-direction: column; align-items: center; text-align: center; }
+  .empty .chip { width: 3.5rem; height: 3.5rem; border-radius: 12px; display: grid; place-items: center; margin-bottom: 20px; background: var(--accent-soft); color: var(--accent); font-size: 22px; }
+  .empty h2 { margin: 0; font-size: 18px; font-weight: 600; }
+  .empty p { margin-top: 8px; color: var(--ink-2); }
+  .empty .acts { margin-top: 20px; display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+
+  .rh { display: flex; align-items: flex-start; gap: 12px; }
+  .rh .g { flex: 1 1 auto; min-width: 0; }
+  .rh .nm { font-size: 15px; font-weight: 600; }
+  .rh .where { margin-top: 3px; font-size: 11.5px; color: var(--muted); }
+  .rh .where.plain { font-family: inherit; font-size: 12px; }
+  .rh .acts { flex: none; }
+
+  .optionrow { display: flex; align-items: flex-start; gap: 10px; margin-top: 8px; }
+  .optionrow .g { flex: 1 1 auto; min-width: 0; }
+  .optionrow .t { font-size: 13.5px; font-weight: 500; }
+  .optionrow .t input[type="number"] { font: inherit; padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; background: var(--page); color: var(--ink); }
+  .optionrow .n { margin-top: 3px; font-size: 12px; color: var(--muted); }
+
+  .check {
+    flex: none; width: 16px; height: 16px; margin-top: 3px; border-radius: 4px;
+    border: 1px solid var(--accent); background: transparent; color: #fff;
+    display: grid; place-items: center; cursor: pointer; padding: 0; font-size: 11px; line-height: 1;
+  }
+  .check[aria-checked="true"] { background: var(--accent); }
+
+  .footnote { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--grid); font-size: 12px; color: var(--muted); }
+  .cardact { display: flex; align-items: center; gap: 10px; }
+  .cardact .why { flex: 1 1 auto; }
+  .okmark { color: var(--good-text); }
+  @keyframes jd-spin { to { transform: rotate(360deg); } }
+  .spin { display: inline-flex; animation: jd-spin 1s linear infinite; }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+
+  /* ---------- locked overlays ---------- */
+  .locked-panel { border: 1px dashed var(--border); border-radius: 8px; background: var(--lock-bg); padding: 22px 20px; text-align: center; }
+  .locked-panel p { margin: 0 0 4px; font-size: 13px; color: var(--ink-2); max-width: 46ch; margin-inline: auto; }
+  .locked-panel .why { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+  .cta {
+    appearance: none; font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: #fff; border: 0; border-radius: 7px; padding: 7px 14px;
+  }
+  .cta:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  .cta.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+
+  /* ---------- standup view ---------- */
+  .ctx { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
+  .ctx .date { font-size: 15px; font-weight: 650; }
+  .sprint-chips { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .schip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); border: 1px solid var(--border); border-radius: 999px; padding: 4px 11px; }
+  .schip .st { font-weight: 650; display: inline-flex; align-items: center; gap: 4px; }
+  .st.ok   { color: var(--good-text); }
+  .st.risk { color: var(--serious); }
+  .st.done { color: var(--good-text); }
+  .copybtn {
+    appearance: none; font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: #fff; border: 0; border-radius: 7px; padding: 7px 14px;
+    display: inline-flex; align-items: center; gap: 7px;
+  }
+  .copybtn:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  .share-note { font-size: 11.5px; color: var(--muted); }
+
+  .cols { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  @media (min-width: 980px) { .cols { grid-template-columns: 1fr 1fr 1fr; } }
+  .cols > .card { grid-column: auto; }
+  .col h2 { display: flex; align-items: baseline; gap: 8px; }
+  .col h2 .cnt { font-size: 11px; color: var(--muted); font-weight: 500; }
+  .col-list { display: grid; gap: 8px; margin-top: 12px; }
+
+  .ghead { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin: 6px 0 -2px; display: flex; gap: 8px; align-items: center; }
+  .ghead .mono { text-transform: none; letter-spacing: 0; }
+
+  .item { border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px; display: grid; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
+  .item .r1 { display: flex; gap: 8px; align-items: baseline; }
+  .item .glyph { flex: 0 0 auto; width: 16px; text-align: center; }
+  .item .t { color: var(--ink); font-weight: 550; }
+  .item .when { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .item .meta { display: flex; gap: 6px; flex-wrap: wrap; padding-left: 24px; }
+  .item .note { padding-left: 24px; font-size: 12px; }
+  .item .note b { font-weight: 600; }
+  .item[role="button"] { cursor: pointer; }
+  .item[aria-current="true"] { border-color: var(--accent); background: var(--accent-soft); }
+  .item[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  /* ---------- memories: browser + reading pane ----------
+     Memories is deliberately not a generic dashboard card. The mockup gives
+     browsing a stable, narrow column and makes the selected memory the page's
+     reading surface; putting both inside `.graph-shell` made the list consume
+     most of the width and reduced the actual memory to a sidebar. */
+  /* The browser begins directly at the sidebar edge. Only the far edge keeps
+     breathing room for the reading pane; a left inset reads as an accidental
+     gap between the app navigation and this second-level navigator. */
+  .wrap:has(.memories-page) { max-width: none; padding: 0 56px 0 0; }
+  .grid:has(.memories-page) { display: block; }
+  .memories-page {
+    display: grid; grid-template-columns: 344px minmax(0, 1fr);
+    gap: 6px; min-height: calc(100vh - 58px);
+  }
+  .mem-navigator {
+    min-width: 0; height: calc(100vh - 58px); align-self: start; margin-top: 0; overflow: hidden;
+    border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+    box-shadow: 0 2px 5px rgba(20, 30, 50, .05); display: flex; flex-direction: column;
+  }
+  .mem-tree {
+    min-width: 0; min-height: 0; flex: 1; overflow-y: auto; display: grid; gap: 0;
+    align-content: start; padding: 6px; border-top: 1px solid var(--grid);
+  }
+  .mem-toolbar { display: grid; gap: 18px; margin: 20px 20px 16px; }
+  .mem-toolbar .seg { width: max-content; border-radius: 9px; }
+  .mem-toolbar .seg button { padding: 9px 18px; font-size: 13px; }
+  .mem-toolbar .dx-input { min-width: 0; width: 100%; }
+  /* Same min-width:auto chain as .ranklist above: .mem-tree is a grid and .item
+     is a grid, so the head, the row and the row's flex line each have to opt
+     out before the label's ellipsis can take effect. */
+  .mem-tree > * { min-width: 0; }
+  .mem-tree .item .r1 { min-width: 0; }
+  .mem-group-head {
+    display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;
+    height: 32px; font-size: 13px; color: var(--muted); padding: 0 6px; min-width: 0;
+  }
+  /* Same rule as .rl-name: a long repo or branch name truncates here instead of
+     shoving its count off the panel. `.cnt` keeps its margin-left:auto below. */
+  .mem-group-head .lbl {
+    color: var(--ink); font-weight: 500;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
+  .mem-group-head .chev { width: 15px; height: 15px; display: inline-grid; place-items: center; flex: none; }
+  .mem-group-head .chev svg {
+    width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2;
+    stroke-linecap: round; stroke-linejoin: round; transition: transform .18s ease;
+  }
+  .mem-group-head .tree-kind {
+    width: 15px; height: 15px; flex: none; color: var(--muted); fill: none;
+    stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+  }
+  .mem-group-head[aria-expanded="false"] .chev svg { transform: rotate(-90deg); }
+  .mem-group-head .cnt { margin-left: auto; flex: none; }
+  .mem-group-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .mem-group-head.mem-branch-head { padding-left: 18px; }
+  .mem-group-head.mem-branch-head .lbl { font-weight: 500; }
+  .mem-tree .item { border-color: transparent; border-radius: 6px; padding: 5px 6px 5px 32px; gap: 3px; background: transparent; font-size: 12.5px; }
+  .mem-tree .item:hover { background: var(--lock-bg); }
+  .mem-tree .item[aria-current="true"] { border-color: transparent; background: var(--accent-soft); }
+  .mem-tree .item .glyph { display: none; }
+  .mem-tree .item .r1 { align-items: center; }
+  .mem-tree .tree-short-hash { flex: none; color: var(--muted); font-size: 11px; }
+  .mem-tree .item .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 400; min-width: 0; }
+  .mem-tree .item .when { display: none; }
+  .mem-tree .item .meta { display: none; }
+  .mem-detail {
+    width: 100%; min-width: 0; height: calc(100vh - 58px); overflow-y: auto;
+    border: 1px solid var(--border); border-radius: 10px; background: var(--page);
+  }
+  .mem-read-inner { width: min(100%, 768px); margin: 0 auto; padding: 32px 40px 48px; display: flex; flex-direction: column; gap: 14px; }
+  .mem-detail .gd-empty { max-width: 420px; margin: 120px auto; font-size: 14px; text-align: center; }
+  .mem-icon {
+    width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8;
+    stroke-linecap: round; stroke-linejoin: round;
+  }
+  .mem-detail-head { display: flex; justify-content: flex-end; min-height: 30px; margin-bottom: -34px; }
+  .mem-recall-copy {
+    appearance: none; border: 1px solid var(--border); border-radius: 7px; background: var(--surface);
+    color: var(--ink-2); padding: 7px 12px; font: inherit; font-size: 12.5px; cursor: pointer;
+    box-shadow: 0 1px 3px rgba(20, 30, 50, .08); display: inline-flex; align-items: center; gap: 8px;
+  }
+  .mem-recall-copy:hover { background: var(--lock-bg); color: var(--ink); }
+  .mem-recall-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mem-eyebrow { margin-bottom: 10px; }
+  .mem-eyebrow .tag { border-color: transparent; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .mem-eyebrow .mem-sync { padding-inline: 0; background: transparent; color: var(--muted); font-weight: 500; }
+  .mem-sync .mem-icon { width: 14px; height: 14px; }
+  .mem-title { display: flex; align-items: center; gap: 14px; }
+  .mem-title-mark {
+    width: 48px; height: 48px; display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 12px; color: var(--accent); background: var(--accent-soft); flex: none;
+  }
+  .mem-title-mark .mem-icon { width: 25px; height: 25px; stroke-width: 2; }
+  .mem-short-hash { display: block; margin-bottom: 2px; font-size: 11px; color: var(--muted); }
+  .mem-detail .gd-title { font-size: 26px; line-height: 1.2; letter-spacing: -.02em; }
+  .mem-meta { padding-bottom: 8px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+  .mem-meta > span { display: inline-flex; align-items: center; gap: 4px; }
+  .mem-meta .mem-icon { width: 14px; height: 14px; }
+  .mem-pos { color: var(--good-text); font-weight: 600; }
+  .mem-neg { color: var(--crit); font-weight: 600; }
+  .mem-token-meter {
+    border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+    padding: 18px 20px 16px; box-shadow: 0 2px 5px rgba(20, 30, 50, .05);
+  }
+  .mem-token-meter .gd-sec { display: none; }
+  .mem-token-meter .gd-row { align-items: baseline; color: var(--muted); }
+  .mem-token-meter .num { font-size: 32px; color: var(--ink); line-height: 1; }
+  .mem-token-meter .tok-bar { margin-top: 14px; height: 10px; }
+  .mem-token-meter .dist-labels { margin-top: 10px; }
+  .mem-counts { padding: 2px 0 12px; font-size: 13px; color: var(--muted); }
+  .mem-recap { border-left: 3px solid var(--accent); padding: 3px 0 3px 18px; color: var(--ink-2); font-size: 16px; line-height: 1.55; }
+  .mem-detail-sections { display: flex; flex-direction: column; gap: 16px; padding-top: 18px; border-top: 1px solid var(--grid); }
+  .mem-detail-sections .gd-sec { margin-top: 4px; font-size: 11px; font-weight: 650; display: inline-flex; align-items: center; gap: 6px; }
+  .mem-detail-sections .gd-sec .mem-icon { width: 15px; height: 15px; }
+  .mem-detail-sections .gd-row { font-size: 13px; }
+  .mem-section { display: flex; flex-direction: column; gap: 8px; }
+  .mem-section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .mem-private { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; }
+  .mem-private .mem-icon { width: 14px; height: 14px; }
+  .mem-conversations .gd-links, .mem-context .gd-links { gap: 8px; width: 100%; }
+  .mem-conversations .gd-row, .mem-context .gd-row {
+    width: 100%; align-items: center; min-height: 46px; padding: 9px 12px; border: 1px solid var(--border);
+    border-radius: 9px; background: var(--surface); box-shadow: 0 1px 2px rgba(20, 30, 50, .04);
+  }
+  /* An openable Context row (plan/note). Reference rows stay inert, so the
+     affordance is on the class, not on `.mem-context .gd-row`. */
+  .gd-row-open { cursor: pointer; }
+  .gd-row-open:hover { border-color: var(--accent); }
+  .gd-row-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mem-row-icon {
+    display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; flex: none;
+    border-radius: 5px; background: var(--lock-bg); color: var(--muted);
+  }
+  .mem-row-icon .mem-icon { width: 14px; height: 14px; }
+  .mem-row-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+  .mem-row-meta { color: var(--muted); white-space: nowrap; font-size: 11px; }
+  .mem-topic-list { display: flex; flex-direction: column; gap: 16px; }
+  .mem-topics .topic {
+    margin: 0; padding: 20px; border: 1px solid var(--border); border-radius: 10px;
+    background: var(--surface); box-shadow: 0 1px 3px rgba(20, 30, 50, .05);
+  }
+  .mem-topics .topic-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .mem-topics .topic h3 { margin: 0; color: var(--ink); font-size: 15px; font-weight: 600; }
+  .mem-topics .topic-trigger { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .mem-topics .decide {
+    margin-top: 16px; padding: 16px; border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+    border-radius: 8px; background: color-mix(in srgb, var(--accent) 7%, transparent);
+  }
+  .mem-topics .decide-title { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 650; letter-spacing: .05em; text-transform: uppercase; }
+  .mem-topics .decide-title .mem-icon { width: 14px; height: 14px; color: var(--accent); }
+  .mem-topics .decide ul { display: flex; flex-direction: column; gap: 6px; margin: 8px 0 0; padding: 0; list-style: none; color: var(--ink-2); font-size: 14px; }
+  /* A list item is a text BLOCK, not a flex row: its content now carries inline
+     <strong> (JD.mdInline), and under `display:flex` every inline child becomes
+     a flex item — the bold run breaks onto its own column and the `gap` shows up
+     as a hole mid-sentence. The bullet is absolutely positioned instead. */
+  .mem-topics .decide li { position: relative; padding-left: 12px; }
+  .mem-topics .decide li::before { content: ""; position: absolute; left: 0; top: .6em; width: 4px; height: 4px; border-radius: 50%; background: var(--accent); }
+  .mem-topics .topic-block { margin-top: 12px; }
+  .mem-topics .topic-block p { margin: 4px 0 0; color: var(--ink-2); font-size: 14px; line-height: 1.55; }
+  /* Markdown prose (JD.mdText): the field is a bullet list as often as it is a
+     paragraph, so the container is a <div> — a <ul> cannot live inside a <p>,
+     and the browser would silently close the paragraph and orphan the list. */
+  .mem-topics .topic-block .prose { margin: 4px 0 0; color: var(--ink-2); font-size: 14px; line-height: 1.55; }
+  .mem-topics .topic-trigger.prose { margin: 8px 0 0; }
+  .mem-topics .prose ul { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 0; padding: 0; list-style: none; }
+  .mem-topics .prose li { position: relative; padding-left: 12px; }
+  .mem-topics .prose li::before { content: ""; position: absolute; left: 0; top: .6em; width: 4px; height: 4px; border-radius: 50%; background: var(--muted); }
+  .mem-topics .prose strong, .mem-topics .decide strong { color: var(--ink); font-weight: 620; }
+  .mem-recap p { margin: 0 0 8px; }
+  .mem-recap p:last-child { margin-bottom: 0; }
+  .mem-topics .fchips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+  .mem-topics .fchip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 4px; background: var(--lock-bg); color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 11px; }
+  .mem-topics .fchip .mem-icon { width: 12px; height: 12px; }
+  @media (max-width: 1180px) {
+    .wrap:has(.memories-page) { padding: 0 24px 0 0; }
+    .memories-page { grid-template-columns: 320px minmax(0, 1fr); gap: 6px; }
+    .mem-read-inner { padding-left: 24px; padding-right: 24px; }
+  }
+  @media (max-width: 899px) {
+    .wrap:has(.memories-page) { padding: 0 16px; }
+    .memories-page { grid-template-columns: 1fr; gap: 0; }
+    .mem-navigator { height: auto; border-bottom: 1px solid var(--border); }
+    .mem-tree { flex: none; height: min(42vh, 360px); }
+    .mem-detail { height: auto; overflow: visible; border-radius: 0; border-inline: 0; }
+    .mem-read-inner { padding: 28px 4px 48px; }
+  }
+  .tok-bar { margin-top: 6px; display: flex; height: 8px; border-radius: 999px; overflow: hidden; background: var(--heat-track); }
+  .tok-bar i { display: block; height: 100%; }
+  .decide { margin-top: 8px; padding: 10px 12px; border-radius: 8px; background: var(--accent-soft); }
+  .decide ul { margin: 6px 0 0; padding-left: 18px; }
+  .topic { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--grid); }
+  .topic h3 { margin: 0 0 4px; font-size: 13.5px; }
+  .mem-files .filelist { margin: 6px 0 0; padding: 0; list-style: none; display: grid; gap: 9px; font-size: 13px; color: var(--ink-2); }
+  .mem-files .filelist li { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .mem-files .filelist .p { min-width: 0; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mem-file-icon {
+    width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; flex: none;
+    border-radius: 6px; color: var(--accent); background: var(--accent-soft);
+  }
+  .mem-file-icon .mem-icon { width: 15px; height: 15px; }
+  .mem-file-diff { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .mem-e2e { gap: 14px; }
+  .mem-e2e .e2e {
+    padding: 24px 28px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+    box-shadow: 0 2px 5px rgba(20, 30, 50, .05);
+  }
+  .mem-e2e .e2e h3 { margin: 0 0 22px; color: var(--ink); font-size: 18px; line-height: 1.35; }
+  .mem-e2e .e2e .gd-sec { margin-top: 18px; }
+  .mem-e2e .e2e ol, .mem-e2e .e2e ul { margin: 8px 0 0; padding-left: 24px; font-size: 14px; color: var(--ink-2); line-height: 1.6; }
+  .mem-e2e .e2e li::marker { color: var(--good-text); }
+  .tag.kind-gotcha    { border-color: transparent; background: var(--lock-bg); font-weight: 600; }
+  .tag.kind-blocker   { border-color: transparent; background: color-mix(in srgb, var(--crit) 12%, transparent); color: var(--crit); font-weight: 600; }
+  .tag.kind-question  { border-color: transparent; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .tag.age { border-style: dashed; }
+  .tag.age.old { color: var(--crit); border-color: var(--crit); }
+  /* ---------- hot files ---------- */
+  /* Four columns: path (elides), a proportional bar, the commit count, churn.
+     The path column is min-width:0 so a long path shrinks rather than pushing
+     the numbers off the card. */
+  .hotfiles { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 7px; }
+  .hotfiles li {
+    display: grid; grid-template-columns: minmax(0, 1fr) 70px 28px auto;
+    align-items: center; gap: 10px; font-size: 12px; color: var(--ink-2);
+  }
+  .hotfiles .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hotfiles .bar { height: 6px; border-radius: 3px; background: var(--heat-track); overflow: hidden; }
+  .hotfiles .bar i { display: block; height: 100%; background: var(--s1); }
+  .hotfiles .n { text-align: right; color: var(--ink); font-weight: 600; }
+  .hotfiles .ch { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+  /* ---------- knowledge graph ---------- */
+  /* Layout adopted verbatim from the mockup's graph view (.graph-shell /
+     .graph-stage / .gdetail / .gd-* / .gnode / .gedge), so the stage + node-detail
+     pane reads the same here as it does there.
+
+     Unit-kind and edge-type colours are COPIES of cli/src/graph/assets/styles/
+     main.css (--kind-* / --edge-*). This page inlines only its own stylesheet,
+     so it has to declare them — but the values must stay in step with that file:
+     one knowledge graph, one visual language, or the dashboard and the VS Code
+     panel colour the same decision differently. Declared on the shell (not per
+     element) because the stage, the kind chips and the detail pane all paint from
+     the same palette. */
+  .jd {
+    --kind-decision: #6eaaef; --kind-mechanism: #4ece8d; --kind-fix: #e0ac2b;
+    --kind-constraint: #f47067; --kind-gotcha: #b494f0; --kind-non-goal: #8a94a6;
+    --kind-convention: #56b6c2;
+    --edge-extends: #6eaaef; --edge-caused-by: #e0ac2b; --edge-supersedes: #f47067;
+    --edge-related-to: #4ece8d; --edge-contradicts: #b494f0; --edge-co-change: #9a9aa8;
+  }
+  @media (prefers-color-scheme: dark) {
+    .jd {
+      --kind-decision: #1f5a91; --kind-mechanism: #1b6340; --kind-fix: #96680e;
+      --kind-constraint: #c0392b; --kind-gotcha: #5c35a0; --kind-non-goal: #5a6472;
+      --kind-convention: #1a7f8e;
+      --edge-extends: #1f5a91; --edge-caused-by: #96680e; --edge-supersedes: #c0392b;
+      --edge-related-to: #1b6340; --edge-contradicts: #5c35a0; --edge-co-change: #6b6b76;
+    }
+  }
+  .graph-shell { display: flex; gap: 14px; margin-top: 12px; }
+  @media (max-width: 899px) { .graph-shell { flex-direction: column; } .gdetail { width: auto; } }
+  .graph-stage {
+    position: relative; flex: 1; min-width: 0; height: 520px;
+    border: 1px solid var(--grid); border-radius: 8px; background: var(--page); overflow: hidden;
+  }
+  .graph-stage svg { display: block; width: 100%; height: 100%; touch-action: none; }
+  .gnode { cursor: pointer; }
+  .gnode circle { stroke: var(--surface); stroke-width: 1.5; }
+  .gnode.sel circle { stroke: var(--accent); stroke-width: 2.5; }
+  .gnode text { font-size: 10px; fill: var(--ink-2); text-anchor: middle; pointer-events: none; }
+  .gnode:focus { outline: none; }
+  .gnode:focus-visible circle { stroke: var(--accent); stroke-width: 2.5; }
+  .gedge { stroke: var(--edge-related-to); stroke-width: 1.1; opacity: .55; }
+  .gedge.co-change { stroke: var(--edge-co-change); stroke-dasharray: 2 3; opacity: .6; }
+  .gdetail {
+    width: 300px; flex: none; border: 1px solid var(--grid); border-radius: 8px;
+    padding: 12px 14px; max-height: 520px; overflow: auto;
+    display: flex; flex-direction: column; gap: 9px; align-items: flex-start;
+  }
+  .gd-title { font-size: 13.5px; font-weight: 600; line-height: 1.35; }
+  .gd-sec { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-top: 2px; }
+  .gd-row { display: flex; gap: 8px; font-size: 12px; color: var(--ink-2); line-height: 1.45; }
+  .gd-row .g { flex: none; width: 15px; text-align: center; color: var(--muted); }
+  .gd-links { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+  .gd-empty { font-size: 12px; color: var(--muted); line-height: 1.55; }
+  .gd-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .lg-line { display: inline-block; width: 18px; height: 0; border-top: 2px solid var(--edge-related-to); vertical-align: middle; margin: 0 5px 0 1px; }
+  .lg-line.dash { border-top-style: dashed; }
+  .lg-line.mut { border-top-color: var(--edge-co-change); }
+  .lg-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; vertical-align: middle; margin: 0 5px 0 1px; }
+
+  /* ---------- skills & tools ---------- */
+  .tool-group { margin-top: 14px; }
+  .toollist { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 6px; }
+  .toollist li {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: baseline; gap: 10px; font-size: 12px; color: var(--ink-2);
+  }
+  .toollist .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+  .toollist .n { color: var(--ink); font-weight: 600; white-space: nowrap; }
+  .toollist .ch { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+  /* Ranked rows for the split Skills / MCP servers cards — same track+fill
+     idiom as .hotfiles .bar, with the label/value pair above the bar instead
+     of beside it, matching jolli-design's per-row anatomy. */
+  .ranklist { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 16px; }
+  /* The whole chain has to opt out of min-width:auto, not just the label: a
+     grid item (this li) and a flex item (.rl-name) both refuse by default to
+     shrink below their content, so one missing link puts the row back outside
+     the card. Verified in a real browser — jsdom cannot measure this. */
+  .ranklist li { min-width: 0; }
+  .ranklist .rl-top { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; min-width: 0; }
+  /* min-width:0 is what makes the ellipsis work: a flex item's default
+     min-width is auto, i.e. "never shrink below my content", so a long skill
+     name pushed the run count out of the card instead of truncating. The
+     siblings are flex:none so the name is the only thing that gives. Every
+     truncating label in this file carries its full text in a `title`. */
+  .ranklist .rl-name { color: var(--ink); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .ranklist .rl-kind { color: var(--muted); font-size: 11px; flex: none; }
+  .ranklist .rl-val { margin-left: auto; color: var(--ink-2); white-space: nowrap; flex: none; }
+  .ranklist .rl-bar { height: 10px; margin-top: 10px; border-radius: 5px; background: var(--heat-track); overflow: hidden; }
+  .ranklist .rl-bar i { display: block; height: 100%; }
+
+  /* Memory Activity's two views share the same rows, but their grouping answers
+     different questions: branches cluster work streams; time preserves the
+     chronological scan. The open link stays on every captured memory. */
+  .mem-activity { padding-bottom: 20px; }
+  .mem-activity-stats { display: flex; align-items: baseline; gap: 24px; padding: 4px 0 16px; flex-wrap: wrap; }
+  .mas-item { display: flex; align-items: baseline; gap: 6px; }
+  .mas-item b { font-size: 18px; font-weight: 650; color: var(--ink); }
+  .mas-item span { font-size: 12.5px; color: var(--muted); }
+  .mas-warn b { color: var(--warn); }
+  .mem-activity-list { display: grid; gap: 18px; }
+  .mem-activity-group { display: grid; gap: 8px; }
+  .mem-activity-group h3 { margin: 0; font-size: 11.5px; color: var(--muted); font-weight: 600; }
+  .mem-activity-row {
+    display: flex; align-items: center; gap: 18px; min-width: 0; padding: 10px 0 10px 14px;
+    border-left: 3px solid var(--memory-color); border-bottom: 1px solid var(--grid);
+  }
+  .mem-activity-copy { min-width: 0; }
+  .mem-activity-title { font-size: 13px; font-weight: 600; color: var(--ink); line-height: 1.4; }
+  .mem-activity-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .mem-activity-category { color: var(--memory-color); font-size: 11.5px; font-weight: 600; }
+  .mem-activity-action { display: flex; align-items: center; gap: 14px; margin-left: auto; flex: none; white-space: nowrap; }
+  .mem-activity-action time { font-size: 11.5px; color: var(--muted); }
+  .mem-activity-action a { color: var(--accent); font-size: 12.5px; font-weight: 600; }
+  @media (max-width: 620px) {
+    .mem-activity-row { align-items: flex-start; flex-direction: column; gap: 8px; }
+    .mem-activity-action { margin-left: 0; }
+  }
+
+  /* ---------- decisions: ask the corpus ---------- */
+  /* Adopted verbatim from the mockup's `Ask the corpus` card (.dx-ask / .dx-input
+     / .dx-answer / .dx-dcard / .claim / .dx-why), so the search box and its answer
+     cards read the same here. `.dx-answer[hidden]` needs the explicit rule because
+     `display: grid` beats the UA [hidden] rule. */
+  .dx-ask { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .dx-input {
+    flex: 1; min-width: 240px; display: flex; align-items: center; gap: 9px;
+    border: 1px solid var(--border); background: var(--page); border-radius: 8px; padding: 8px 12px;
+  }
+  .dx-input .pfx { color: var(--muted); flex: none; }
+  .dx-input input { flex: 1; appearance: none; border: 0; background: transparent; font: inherit; font-size: 13px; color: var(--ink); min-width: 0; }
+  .dx-input input:focus { outline: none; }
+  .dx-input:focus-within { border-color: var(--accent); }
+  .dx-answer { margin-top: 12px; display: grid; gap: 10px; }
+  .dx-answer[hidden] { display: none; }
+  .dx-dcard { border: 1px solid var(--grid); border-radius: 8px; padding: 11px 13px; display: grid; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
+  .dx-dcard .r1 { display: flex; gap: 9px; align-items: baseline; flex-wrap: wrap; }
+  .dx-dcard .claim { color: var(--ink); font-weight: 600; font-size: 13px; }
+  .dx-dcard .when { margin-left: auto; font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .dx-why { font-size: 11.5px; color: var(--muted); font-style: italic; }
+
+  /* ---------- decisions corpus ---------- */
+  /* One group per commit: a header carrying the commit's identity, then its
+     insights indented under it, so a reader can see at a glance which decisions
+     came out of the same change. */
+  .dx-group { margin-top: 14px; }
+  .dx-group:first-of-type { margin-top: 4px; }
+  .dx-commit {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    padding: 0 0 8px; border-bottom: 1px solid var(--grid); font-size: 12.5px;
+  }
+  .dx-commit .hash { color: var(--muted); flex: 0 0 auto; }
+  .dx-commit .t { color: var(--ink); font-weight: 550; }
+  .dx-commit .when { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .dx-items { display: grid; gap: 8px; margin-top: 10px; padding-left: 12px; }
+
+  .glyph.done { color: var(--good-text); }
+  .glyph.next { color: var(--accent); }
+  .glyph.todo { color: var(--muted); }
+  .glyph.commit { color: var(--muted); }
+
+  .team { margin-top: 16px; display: none; }
+  .jd[data-tier="2"] .team { display: block; }
+  .team-grid { display: grid; gap: 12px; margin-top: 12px; }
+  @media (min-width: 980px) { .team-grid { grid-template-columns: 1fr 1fr; } }
+  .mate { border: 1px solid var(--grid); border-radius: 8px; padding: 12px 14px; display: grid; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
+  .mate .r1 { display: flex; align-items: center; gap: 8px; }
+  .mate .avatar { width: 22px; height: 22px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: 10.5px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
+  .mate .name { font-weight: 600; color: var(--ink); }
+  .mate .last { margin-left: auto; font-size: 11px; color: var(--muted); }
+  .mate .line b { font-weight: 600; color: var(--ink-2); }
+  .qinbox { border: 1px solid var(--accent); border-radius: 8px; padding: 12px 14px; display: grid; gap: 8px; }
+  .qinbox .qi { display: flex; gap: 10px; align-items: center; font-size: 12.5px; color: var(--ink-2); flex-wrap: wrap; }
+  .qinbox .qi b { color: var(--ink); }
+  .qinbox .qi .cta { margin-left: auto; }
+  .rollup { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; align-items: center; justify-content: center; z-index: 80; padding: 20px; }
+  .overlay.open { display: flex; }
+  .sheet { background: var(--surface); color: var(--ink); border: 1px solid var(--border); border-radius: 12px; width: min(640px, 100%); padding: 18px; }
+  .sheet h3 { margin: 0 0 2px; font-size: 14px; }
+  .sheet .sub { font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
+  .sheet textarea {
+    width: 100%; height: 300px; resize: vertical; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px; color: var(--ink-2); background: var(--page); border: 1px solid var(--grid); border-radius: 8px; padding: 12px;
+  }
+  .ctx-body {
+    max-height: 60vh; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; line-height: 1.6;
+    color: var(--ink-2); background: var(--page); border: 1px solid var(--grid); border-radius: 8px; padding: 12px;
+  }
+  .sheet .row { display: flex; gap: 10px; margin-top: 10px; align-items: center; }
+  .toast { font-size: 12px; color: var(--good-text); font-weight: 600; visibility: hidden; }
+  .toast.show { visibility: visible; }
+
+  /* ---------- popover ---------- */
+  .pop {
+    position: absolute; z-index: 40; width: 264px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; padding: 14px;
+    box-shadow: 0 8px 28px rgba(0,0,0,.14); display: none;
+  }
+  .pop.open { display: block; }
+  .pop h3 { margin: 0 0 4px; font-size: 13px; }
+  .pop p { margin: 0 0 10px; font-size: 12px; color: var(--ink-2); }
+  .range-fields { display: grid; gap: 8px; margin-bottom: 12px; }
+  .range-fields label { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-2); }
+  .range-fields input[type="date"] {
+    font: inherit; font-size: 12px; color: var(--ink); background: var(--page);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; color-scheme: inherit;
+  }
+  .range-fields input[type="date"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  /* ---------- tooltip ---------- */
+  .tip {
+    position: fixed; z-index: 60; pointer-events: none; display: none;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font-size: 12px; color: var(--ink-2);
+    box-shadow: 0 6px 20px rgba(0,0,0,.16); min-width: 130px;
+  }
+  .tip b { color: var(--ink); }
+  .tip .trow { display: flex; align-items: center; gap: 6px; justify-content: space-between; margin-top: 2px; }
+  .tip .trow i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  .tip .trow span { display: inline-flex; align-items: center; gap: 6px; }
+
+  .link-btn { appearance: none; background: none; border: 0; font: inherit; font-size: 12px; color: var(--accent); cursor: pointer; padding: 0; }
+  .link-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+
+  /* ---------- team visibility (Team view, T2) ---------- */
+  .grid.team-viz { display: none; margin-top: 16px; }
+  .jd[data-tier="2"] .grid.team-viz { display: grid; }
+  .team-viz-teaser { margin-top: 16px; }
+  .jd[data-tier="2"] .team-viz-teaser { display: none; }
+
+  /* ---------- manager view (coaching) ---------- */
+  .mg-av { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: 9.5px; font-weight: 700; flex: none; }
+  .mg-move { border-top: 1px dashed var(--grid); margin-top: 9px; padding-top: 9px; font-size: 12px; color: var(--ink-2); line-height: 1.5; }
+  .mg-move b { color: var(--ink); }
+  .mate .trend { font-size: 10.5px; color: var(--muted); font-weight: 400; }
+  .ttable .ok { color: var(--good-text); font-weight: 600; }
+  .ttable .no { color: var(--muted); }
+
+  .footer-note { max-width: 1200px; margin: 18px auto 0; padding: 0 24px; font-size: 11.5px; color: var(--muted); }
+  @media (prefers-reduced-motion: no-preference) {
+    .chip, .seg button, .cta, .copybtn { transition: background .12s ease, color .12s ease; }
+    .icard { transition: opacity .18s ease, transform .18s ease; }
+  }

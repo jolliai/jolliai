@@ -1,14 +1,27 @@
 /**
- * MigrationEngine — migrates data from OrphanBranchStorage to FolderStorage.
+ * MigrationEngine — migrates data from the SYSTEM OF RECORD to FolderStorage.
  *
- * Reads all summaries, transcripts, plans, and plan-progress from the orphan
- * branch and writes them through FolderStorage, which automatically generates
- * visible markdown files and stores hidden JSON.
+ * Reads all summaries, transcripts, plans, and plan-progress from whichever
+ * backend currently holds the truth and writes them through FolderStorage,
+ * which automatically generates visible markdown files and stores hidden JSON.
+ *
+ * The source is a plain `StorageProvider` and callers resolve it with
+ * `resolveSotStorage` — not the orphan backend, which every caller used to
+ * construct directly. Past a cutover that hard-coding rebuilt the folder from a
+ * FROZEN branch: every memory written since the fence was silently absent, and
+ * a clone made after the cutover (no branch at all) reported "nothing to
+ * migrate" and produced an empty Memory Bank, both while reporting success.
+ * Nothing in this class is orphan-specific — `SqliteStorage` synthesizes
+ * `index.json` and serves every family read below — so the fix was entirely at
+ * the call sites.
+ *
+ * Do NOT resolve the source with `createReadStorage`: un-cutover that returns
+ * `FolderStorage`, which is this engine's DESTINATION.
  *
  * Features:
  * - Idempotent: skips files already in the manifest (by fileId/commitHash)
  * - Resumable: tracks progress in .jolli/migration.json
- * - Non-destructive: orphan branch data is never modified or deleted
+ * - Non-destructive: the source is never modified or deleted
  * - Backfills missing titles on re-migration
  */
 
@@ -26,13 +39,13 @@ export class MigrationEngine {
 	private index: SummaryIndex | null = null;
 
 	constructor(
-		private readonly orphanStorage: StorageProvider,
+		private readonly sotStorage: StorageProvider,
 		private readonly folderStorage: StorageProvider,
 		private readonly metadataManager: MetadataManager,
 	) {}
 
 	/**
-	 * Runs the full migration from orphan branch to KB folder.
+	 * Runs the full migration from the system of record to the KB folder.
 	 * @param onProgress callback with (migrated, total) counts
 	 */
 	async runMigration(onProgress?: (migrated: number, total: number) => void): Promise<MigrationState> {
@@ -42,9 +55,9 @@ export class MigrationEngine {
 		}
 		log.info("=== Migration started ===");
 
-		const indexJson = await this.orphanStorage.readFile("index.json");
+		const indexJson = await this.sotStorage.readFile("index.json");
 		if (!indexJson) {
-			log.info("No index.json on orphan branch — nothing to migrate");
+			log.info("No index.json in the system of record — nothing to migrate");
 			return this.saveMigrationState({ status: "completed", totalEntries: 0, migratedEntries: 0 });
 		}
 
@@ -175,7 +188,7 @@ export class MigrationEngine {
 			return false;
 		}
 
-		const indexJson = await this.orphanStorage.readFile("index.json");
+		const indexJson = await this.sotStorage.readFile("index.json");
 		if (!indexJson) return true;
 
 		let index: SummaryIndex;
@@ -192,7 +205,7 @@ export class MigrationEngine {
 		const valid = commitEntries.length >= rootEntries.length;
 		if (!valid) {
 			log.warn(
-				"Validation failed: orphan has %d root entries, manifest has %d commit entries",
+				"Validation failed: the system of record has %d root entries, manifest has %d commit entries",
 				rootEntries.length,
 				commitEntries.length,
 			);
@@ -380,7 +393,7 @@ export class MigrationEngine {
 	 * the shape to be restated.
 	 */
 	private async backfillTitle(commitHash: string, existing: ManifestEntry): Promise<void> {
-		const json = await this.orphanStorage.readFile(`summaries/${commitHash}.json`);
+		const json = await this.sotStorage.readFile(`summaries/${commitHash}.json`);
 		if (!json) return;
 		try {
 			const summary = JSON.parse(json) as CommitSummary;
@@ -392,7 +405,7 @@ export class MigrationEngine {
 	}
 
 	private async migrateSummary(commitHash: string): Promise<void> {
-		const json = await this.orphanStorage.readFile(`summaries/${commitHash}.json`);
+		const json = await this.sotStorage.readFile(`summaries/${commitHash}.json`);
 		if (!json) return;
 		await this.folderStorage.writeFiles(
 			[{ path: `summaries/${commitHash}.json`, content: json }],
@@ -401,7 +414,7 @@ export class MigrationEngine {
 	}
 
 	private async migrateTranscript(commitHash: string): Promise<void> {
-		const json = await this.orphanStorage.readFile(`transcripts/${commitHash}.json`);
+		const json = await this.sotStorage.readFile(`transcripts/${commitHash}.json`);
 		if (!json) return;
 		await this.folderStorage.writeFiles(
 			[{ path: `transcripts/${commitHash}.json`, content: json }],
@@ -410,9 +423,9 @@ export class MigrationEngine {
 	}
 
 	private async migratePlans(): Promise<void> {
-		const planFiles = await this.orphanStorage.listFiles("plans/");
+		const planFiles = await this.sotStorage.listFiles("plans/");
 		for (const path of planFiles) {
-			const content = await this.orphanStorage.readFile(path);
+			const content = await this.sotStorage.readFile(path);
 			if (!content) continue;
 			const branch = this.resolveBranchFromPath(path);
 			await this.folderStorage.writeFiles([{ path, content, branch }], `Migration: plan ${path}`);
@@ -421,9 +434,9 @@ export class MigrationEngine {
 	}
 
 	private async migratePlanProgress(): Promise<void> {
-		const progressFiles = await this.orphanStorage.listFiles("plan-progress/");
+		const progressFiles = await this.sotStorage.listFiles("plan-progress/");
 		for (const path of progressFiles) {
-			const content = await this.orphanStorage.readFile(path);
+			const content = await this.sotStorage.readFile(path);
 			if (!content) continue;
 			await this.folderStorage.writeFiles([{ path, content }], `Migration: plan-progress ${path}`);
 		}
@@ -431,12 +444,12 @@ export class MigrationEngine {
 	}
 
 	private async migrateAllSummaries(): Promise<void> {
-		const summaryFiles = await this.orphanStorage.listFiles("summaries/");
+		const summaryFiles = await this.sotStorage.listFiles("summaries/");
 		let migrated = 0;
 		for (const path of summaryFiles) {
 			const existingContent = await this.folderStorage.readFile(path);
 			if (existingContent) continue;
-			const content = await this.orphanStorage.readFile(path);
+			const content = await this.sotStorage.readFile(path);
 			if (!content) continue;
 			await this.folderStorage.writeFiles([{ path, content }], `Migration: child summary ${path}`);
 			migrated++;
@@ -445,9 +458,9 @@ export class MigrationEngine {
 	}
 
 	private async migrateNotes(): Promise<void> {
-		const noteFiles = await this.orphanStorage.listFiles("notes/");
+		const noteFiles = await this.sotStorage.listFiles("notes/");
 		for (const path of noteFiles) {
-			const content = await this.orphanStorage.readFile(path);
+			const content = await this.sotStorage.readFile(path);
 			if (!content) continue;
 			const branch = this.resolveBranchFromPath(path);
 			await this.folderStorage.writeFiles([{ path, content, branch }], `Migration: note ${path}`);
@@ -456,13 +469,13 @@ export class MigrationEngine {
 	}
 
 	private async migrateAllTranscripts(): Promise<void> {
-		const transcriptFiles = await this.orphanStorage.listFiles("transcripts/");
+		const transcriptFiles = await this.sotStorage.listFiles("transcripts/");
 		let migrated = 0;
 		for (const path of transcriptFiles) {
 			// Skip if already migrated by per-root migration
 			const existingContent = await this.folderStorage.readFile(path);
 			if (existingContent) continue;
-			const content = await this.orphanStorage.readFile(path);
+			const content = await this.sotStorage.readFile(path);
 			if (!content) continue;
 			await this.folderStorage.writeFiles([{ path, content }], `Migration: transcript ${path}`);
 			migrated++;

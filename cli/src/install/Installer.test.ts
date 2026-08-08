@@ -2149,10 +2149,12 @@ describe("Installer", () => {
 			expect(status.claudeHookInstalled).toBe(false);
 		});
 
-		it("should return summary count when orphan branch exists", async () => {
-			const { orphanBranchExists } = await import("../core/GitOps.js");
+		it("reports the summary count with no orphan branch present", async () => {
+			// The count is whatever the system of record answers. It used to be
+			// gated on `orphanBranchExists`, which zeroed a cut-over repo's real
+			// count — a post-cutover clone has no orphan branch at all. The mock
+			// default for that helper is `false`, so this case IS the regression.
 			const { getSummaryCount } = await import("../core/SummaryStore.js");
-			vi.mocked(orphanBranchExists).mockResolvedValueOnce(true);
 			vi.mocked(getSummaryCount).mockResolvedValueOnce(42);
 
 			const status = await getStatus(tempDir);

@@ -60,6 +60,33 @@ const copyGraphAssets = {
 	},
 };
 
+// The dashboard runtime (HTML/CSS/JS) follows the exact same model as the
+// graph viz above: authored assets under src/dashboard/assets/ are minified
+// into dist/dashboard-assets/, read at runtime by DashboardServer relative to
+// the bundle (resolveDashboardAssetsDir). No vendor/ tier — every file is ours.
+const dashboardAssetsSrc = resolve(__dirname, "src/dashboard/assets");
+const dashboardAssetsDest = resolve(__dirname, "dist/dashboard-assets");
+
+const copyDashboardAssets = {
+	name: "copy-dashboard-assets",
+	async closeBundle() {
+		rmSync(dashboardAssetsDest, { recursive: true, force: true });
+		for (const abs of walkGraphAssets(dashboardAssetsSrc)) {
+			const out = join(dashboardAssetsDest, relative(dashboardAssetsSrc, abs));
+			mkdirSync(dirname(out), { recursive: true });
+			if (shouldMinifyGraphAsset(abs)) {
+				const { code } = await transform(readFileSync(abs, "utf8"), {
+					minify: true,
+					loader: extname(abs) === ".css" ? "css" : "js",
+				});
+				writeFileSync(out, code, "utf8");
+			} else {
+				cpSync(abs, out);
+			}
+		}
+	},
+};
+
 /**
  * The two lists below define the two test tiers, and they MUST be maintained
  * together. Profiling the suite with `--reporter=json` shows 12 files carrying
@@ -152,7 +179,7 @@ export default defineConfig(({ mode }) => {
 	const slow = mode === "slow";
 
 	return {
-		plugins: [copyGraphAssets],
+		plugins: [copyGraphAssets, copyDashboardAssets],
 		define: {
 			__PKG_VERSION__: JSON.stringify(pkg.version),
 			__CLI_PKG_VERSION__: JSON.stringify(pkg.version),
@@ -174,6 +201,9 @@ export default defineConfig(({ mode }) => {
 					PrePushHook: resolve(__dirname, "src/hooks/PrePushHook.ts"),
 					PrePushWorker: resolve(__dirname, "src/hooks/PrePushWorker.ts"),
 					QueueWorker: resolve(__dirname, "src/hooks/QueueWorker.ts"),
+					// Spawned detached by DashboardCommand — "dist contains
+					// DashboardServerEntry.js" is a build contract, same as QueueWorker.
+					DashboardServerEntry: resolve(__dirname, "src/dashboard/ServerEntry.ts"),
 				},
 				formats: ["es"],
 			},
@@ -284,6 +314,7 @@ export default defineConfig(({ mode }) => {
 					"vite.config.ts",
 					"test/**",
 					"src/graph/assets/**",
+					"src/dashboard/assets/**",
 					// Only in `--mode fast`; never in the gate. See SLOW_ONLY_SOURCES.
 					...(fast ? SLOW_ONLY_SOURCES : []),
 				],

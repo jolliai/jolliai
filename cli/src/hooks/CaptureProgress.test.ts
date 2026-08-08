@@ -2,7 +2,15 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// runCommitFeedback consults the cutover route before starting a watch; mocked
+// so tests never open the developer's real machine-global dashboard DB. Tests
+// that need a different route pass the `resolveRoute` seam instead.
+vi.mock("../dashboard/CutoverRouter.js", () => ({
+	resolveCutoverRoute: vi.fn().mockResolvedValue({ state: "uncutover" }),
+}));
+
 import { getJolliMemoryDir } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
 import type { CaptureProgressEvent } from "./CaptureProgress.js";
@@ -519,6 +527,49 @@ describe("runCommitFeedback", () => {
 			now: () => 0,
 		});
 		expect(lines).toEqual([]);
+	});
+
+	it("skips the watch on a blocked route — the worker there can never signal", async () => {
+		// A blocked repo's worker exits without taking the capture lock or
+		// emitting events, and an absent lock reads as "not started yet" — a
+		// watch could only end by timeout, blocking git for the full ceiling.
+		const lines: string[] = [];
+		let t = 0;
+		await runCommitFeedback(tempDir, HASH, {
+			loadConfigFn: fakeConfig("on"),
+			env: {},
+			isTTY: true,
+			write: (l) => lines.push(l),
+			readEvents: () => [],
+			sleep: immediateSleep,
+			// Advancing clock: if the route check regresses, the watch times out
+			// and appends its closing line, failing the assertion instead of hanging.
+			now: () => {
+				t += 30_000;
+				return t;
+			},
+			resolveRoute: async () => ({ state: "blocked", reason: "database unavailable" }),
+		});
+		expect(lines).toEqual([
+			"⚠ Jolli Memory: commit queued, but the local database is unavailable — capture deferred (jolli doctor)",
+		]);
+	});
+
+	it("a route probe failure never blocks the watch — feedback degrades to normal", async () => {
+		const lines: string[] = [];
+		await runCommitFeedback(tempDir, HASH, {
+			loadConfigFn: fakeConfig("on"),
+			env: {},
+			isTTY: false,
+			write: (l) => lines.push(l),
+			readEvents: () => [ev("start"), ev("stored"), { ...ev("end"), terminal: true }],
+			sleep: immediateSleep,
+			now: () => 0,
+			resolveRoute: async () => {
+				throw new Error("router exploded");
+			},
+		});
+		expect(lines).toContain("✓ Jolli Memory updated");
 	});
 
 	it("prints the lifecycle and no closing line once stored", async () => {

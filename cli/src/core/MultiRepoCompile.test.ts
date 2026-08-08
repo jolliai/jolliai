@@ -30,7 +30,17 @@ vi.mock("./IngestPipeline.js", () => ({
 vi.mock("./TopicWikiRenderer.js", () => ({ renderTopicKBWiki: vi.fn(async () => {}) }));
 vi.mock("./TopicPageStore.js", () => ({ purgeTopicPagesExcept: vi.fn(async () => []) }));
 vi.mock("./StorageFactory.js", () => ({ createFolderStorageAtRoot: vi.fn((kbRoot: string) => ({ kbRoot })) }));
-vi.mock("./SummaryStore.js", () => ({ setActiveStorage: vi.fn(), getActiveStorage: vi.fn(() => undefined) }));
+vi.mock("./SummaryStore.js", () => ({
+	setActiveStorage: vi.fn(),
+	getActiveStorage: vi.fn(() => undefined),
+	// Pass-through: the must-land D6 lock wrapper is covered in SummaryStore/Locks
+	// tests. It belongs on the compile guard so a topic page and its index entry
+	// share ONE orphan critical section — two acquisitions could land the page and
+	// then fail the index, orphaning it (recoverable only by --rebuild).
+	withRequiredOrphanWriteLock: vi.fn(async (_cwd: string | undefined, _label: string, fn: () => Promise<unknown>) =>
+		fn(),
+	),
+}));
 vi.mock("./MemoryBankRepoDiscovery.js", () => ({
 	discoverRepos: vi.fn(async (_localFolder: string, exclude: string[]) => {
 		const all = [

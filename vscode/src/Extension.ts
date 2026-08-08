@@ -71,6 +71,7 @@ import {
 	aggregateEstimatedCost,
 } from "../../cli/src/core/SummaryTree.js";
 import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
+import { getDashboardDbPath } from "../../cli/src/dashboard/DashboardDb.js";
 import { isManuallyDisabled, ORPHAN_BRANCH, setManuallyDisabled } from "../../cli/src/Logger.js";
 import type { LocalAgentToolId, SourceId, StatusInfo } from "../../cli/src/Types.js";
 import { execFileSyncHidden } from "../../cli/src/util/Subprocess.js";
@@ -1830,8 +1831,8 @@ export function activate(context: vscode.ExtensionContext): void {
 			const { MetadataManager } = await import(
 				"../../cli/src/core/MetadataManager.js"
 			);
-			const { OrphanBranchStorage } = await import(
-				"../../cli/src/core/OrphanBranchStorage.js"
+			const { resolveSotStorage } = await import(
+				"../../cli/src/core/SotStorageResolver.js"
 			);
 			const { FolderStorage } = await import(
 				"../../cli/src/core/FolderStorage.js"
@@ -1870,14 +1871,18 @@ export function activate(context: vscode.ExtensionContext): void {
 			//       intentionally do NOT look at state.leafCleanup — that
 			//       legacy flag tracked the inverted pass and must not block
 			//       the corrective re-run.
-			const orphan = new OrphanBranchStorage(workspaceRoot);
-			if (await orphan.exists()) {
+			// Resolved by cutover route rather than hard-coded to the orphan
+			// branch: past a cutover that branch is frozen, so rebuilding the
+			// folder from it silently omits every memory written since the
+			// fence, and a clone made after one has no branch at all.
+			const sot = await resolveSotStorage(workspaceRoot);
+			if (await sot.exists()) {
 				const mm = new MetadataManager(join(kbRoot, ".jolli"));
 				const migrationState = mm.readMigrationState();
 				if (!migrationState || migrationState.status !== "completed") {
 					const folder = new FolderStorage(kbRoot, mm);
 					await folder.ensure();
-					const engine = new MigrationEngine(orphan, folder, mm);
+					const engine = new MigrationEngine(sot, folder, mm);
 					const result = await engine.runMigration();
 					log.info(
 						"activate",
@@ -1912,7 +1917,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					// self-heals for dormant branches.
 					const folder = new FolderStorage(kbRoot, mm);
 					await folder.ensure();
-					const engine = new MigrationEngine(orphan, folder, mm);
+					const engine = new MigrationEngine(sot, folder, mm);
 					const result = await engine.runStaleChildCleanup();
 					log.info(
 						"activate",
@@ -2058,21 +2063,23 @@ export function activate(context: vscode.ExtensionContext): void {
 		workspaceRoot,
 		`refs/heads/${ORPHAN_BRANCH}`,
 	);
+	// Shared by the ref watcher and the database watcher below: the panels do
+	// not care WHICH backend just gained a memory, only that one did.
+	const onMemoryStored = (source: string) => () => {
+		bridge.invalidateEntriesCache();
+		commitsStore.refresh().catch(handleError(source));
+		// Lazy-load gate: if the user never opened Memories, do NOT silently
+		// wake it up in the background (would trigger listSummaryEntries).
+		if (memoriesStore.hasFirstLoaded()) {
+			memoriesStore.refresh().catch(handleError(`${source}.memories`));
+		}
+	};
+
 	if (orphanRefPath) {
 		const orphanRefWatcher = watchFile(
 			vscode.Uri.file(dirname(orphanRefPath)),
 			ORPHAN_BRANCH,
-			() => {
-				bridge.invalidateEntriesCache();
-				commitsStore.refresh().catch(handleError("orphanRefWatcher"));
-				// Lazy-load gate: if the user never opened Memories, do NOT silently
-				// wake it up in the background (would trigger listSummaryEntries).
-				if (memoriesStore.hasFirstLoaded()) {
-					memoriesStore
-						.refresh()
-						.catch(handleError("orphanRefWatcher.memories"));
-				}
-			},
+			onMemoryStored("orphanRefWatcher"),
 		);
 		context.subscriptions.push(orphanRefWatcher);
 	} else {
@@ -2179,6 +2186,29 @@ export function activate(context: vscode.ExtensionContext): void {
 	// Check initial state — an ingest might already be running on activation.
 	void refreshIngestState();
 
+	// ── Memory database watcher ──────────────────────────────────────────────
+	// The orphan-ref watcher above stops moving at the cutover: from then on a stored memory
+	// touches only the machine-global database, so the ref watcher alone left a
+	// cut-over workspace with no auto-refresh at all — COMMITS and Memories
+	// just went stale until the user clicked refresh, with nothing logged.
+	// Both are watched because a repo can be on either side of the fence.
+	//
+	// The `-wal` sibling is what actually moves per write (the main `.db` mtime
+	// only changes at checkpoint), hence the glob. Machine-global, so writes
+	// from OTHER repos wake this too; the refreshes are cheap and idempotent,
+	// and over-refreshing is the safe way to be wrong.
+	//
+	// Created LAST on purpose: `Extension.test.ts` addresses watchers by their
+	// `createFileSystemWatcher` call index, so inserting one mid-sequence
+	// silently re-points half those assertions at the wrong watcher.
+	const memoryDbWatcher = watchFile(
+		vscode.Uri.file(dirname(getDashboardDbPath())),
+		"jollimemory.db*",
+		onMemoryStored("memoryDbWatcher"),
+	);
+	context.subscriptions.push(memoryDbWatcher);
+
+
 	// COMMITS title updates are handled by the commitsStore.onChange subscription
 	// the sidebar webview wires up — no provider hook needed.
 
@@ -2276,8 +2306,8 @@ export function activate(context: vscode.ExtensionContext): void {
 					const { MetadataManager } = await import(
 						"../../cli/src/core/MetadataManager.js"
 					);
-					const { OrphanBranchStorage } = await import(
-						"../../cli/src/core/OrphanBranchStorage.js"
+					const { resolveSotStorage } = await import(
+						"../../cli/src/core/SotStorageResolver.js"
 					);
 					const { FolderStorage } = await import(
 						"../../cli/src/core/FolderStorage.js"
@@ -2293,11 +2323,11 @@ export function activate(context: vscode.ExtensionContext): void {
 						| string
 						| undefined;
 
-					const orphan = new OrphanBranchStorage(workspaceRoot);
-					if (!(await orphan.exists())) {
+					const sot = await resolveSotStorage(workspaceRoot);
+					if (!(await sot.exists())) {
 						return {
 							ok: false,
-							message: "No git storage found — nothing to rebuild.",
+							message: "No stored memories found — nothing to rebuild.",
 						};
 					}
 
@@ -2339,7 +2369,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					const newMm = new MetadataManager(join(newKbRoot, ".jolli"));
 					const folder = new FolderStorage(newKbRoot, newMm);
 					await folder.ensure();
-					const engine = new MigrationEngine(orphan, folder, newMm);
+					const engine = new MigrationEngine(sot, folder, newMm);
 					const result = await engine.runMigration();
 
 					// Rebuild's new folder lives under the SAME Memory Bank parent

@@ -40,7 +40,7 @@ import { isCursorInstalled, isCursorPresent } from "../core/CursorDetector.js";
 import { scanCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { isDevinInstalled, isDevinPresent, scanDevinSessions } from "../core/DevinSessionDiscoverer.js";
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
-import { getProjectRootDir, isInsideGitRepo, listWorktrees, orphanBranchExists } from "../core/GitOps.js";
+import { getProjectRootDir, isInsideGitRepo, listWorktrees } from "../core/GitOps.js";
 import { resolveMemoryBankState } from "../core/KBPathResolver.js";
 import { discoverKimiSessions, isKimiInstalled } from "../core/KimiSessionDiscoverer.js";
 import { acquireRepoHooksLock, type StrictLockHandle, withRuntimeRegistryLock } from "../core/Locks.js";
@@ -54,7 +54,7 @@ import {
 } from "../core/OpenCodeSessionDiscoverer.js";
 import { readPushDisabledState } from "../core/PushControl.js";
 import { readManualDisableFlag, writeManualDisableFlag } from "../core/RepoProfile.js";
-import { readSchemaV5State } from "../core/SchemaV5Migration.js";
+import { migrateSchemaToV5, readSchemaV5State } from "../core/SchemaV5Migration.js";
 import {
 	ensureJolliMemoryDir,
 	filterSessionsByEnabledIntegrations,
@@ -828,7 +828,6 @@ export async function install(
 			log.info("Skipping v5 migration in repo-hooks-only mode — runs on every session start");
 		} else {
 			try {
-				const { migrateSchemaToV5 } = await import("../core/SchemaV5Migration.js");
 				const v5Result = await migrateSchemaToV5(projectDir);
 				log.info(
 					"Schema v5 migration: alreadyDone=%s fresh=%s migrated=%d skipped=%d",
@@ -1158,8 +1157,15 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		(await isHookSectionInstalled(projectDir, "post-merge", POST_MERGE_MARKER_START));
 	const prePushHookInstalled = await isHookSectionInstalled(projectDir, "pre-push", PRE_PUSH_MARKER_START);
 	const sessions = await loadAllSessions(projectDir);
-	const branchExists = await orphanBranchExists(ORPHAN_BRANCH, projectDir);
-	const summaryCount = branchExists ? await getSummaryCount(projectDir, storage) : 0;
+	// No `orphanBranchExists` gate. It used to short-circuit the count to 0
+	// whenever that branch was absent, which reads as "this repo has no
+	// memories" — true only while the branch IS the system of record. A clone
+	// made after a cutover carries no orphan branch at all, so a fully
+	// populated repo reported 0 summaries in `jolli status`, the MCP `status`
+	// tool and both IDE surfaces. `getSummaryCount` resolves the system of
+	// record itself and already answers 0 when there is no index, so the gate
+	// only ever subtracted truth.
+	const summaryCount = await getSummaryCount(projectDir, storage);
 	const geminiHookInstalled = await isGeminiHookInstalled(projectDir);
 	const claudeDetected = await isClaudeInstalled();
 	const codexDetected = await isCodexInstalled();

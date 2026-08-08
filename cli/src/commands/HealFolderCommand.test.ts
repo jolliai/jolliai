@@ -5,9 +5,10 @@ import { registerHealFolderCommand } from "./HealFolderCommand.js";
 
 // Mock the storage factory so the command never touches a real ~/.jolli config
 // or a real git repo. Each test installs its own implementation via mockResolvedValue.
-const { mockCreateStorage, mockLoadConfig } = vi.hoisted(() => ({
+const { mockCreateStorage, mockLoadConfig, mockResolveCutoverRoute } = vi.hoisted(() => ({
 	mockCreateStorage: vi.fn(),
 	mockLoadConfig: vi.fn(),
+	mockResolveCutoverRoute: vi.fn(),
 }));
 
 vi.mock("../core/StorageFactory.js", () => ({
@@ -16,6 +17,16 @@ vi.mock("../core/StorageFactory.js", () => ({
 
 vi.mock("../core/SessionTracker.js", async () => ({
 	loadConfig: mockLoadConfig,
+}));
+
+// The cutover route, not `config.storageMode`, decides whether heal may DELETE a
+// manifest row whose hidden JSON is gone: only `uncutover` still has the orphan
+// branch to repopulate from. `storageMode` is retired and `createStorage` ignores
+// it, so reading it here answered "dual-write" for cut-over repos too — and the
+// drop it then authorised is permanent, because the branch it would be
+// re-sourced from is frozen.
+vi.mock("../dashboard/CutoverRouter.js", () => ({
+	resolveCutoverRoute: mockResolveCutoverRoute,
 }));
 
 // Logger writes to disk in setLogDir; skip that path so tests don't create files.
@@ -80,7 +91,8 @@ function makeStorageWith(result: HealResult | null): StorageProvider {
 describe("registerHealFolderCommand", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
-		mockLoadConfig.mockResolvedValue({ storageMode: "dual-write" });
+		mockLoadConfig.mockResolvedValue({});
+		mockResolveCutoverRoute.mockResolvedValue({ state: "uncutover" });
 	});
 
 	afterEach(() => {
@@ -91,7 +103,7 @@ describe("registerHealFolderCommand", () => {
 		mockCreateStorage.mockResolvedValue(makeStorageWith(null));
 		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-orphan"]);
 		expect(stdout).toContain("Heal not available");
-		expect(stdout).toContain("storageMode=dual-write");
+		expect(stdout).toContain("jolli doctor");
 	});
 
 	it("prints 'Manifest is empty' when the manifest had no entries", async () => {
@@ -160,14 +172,27 @@ describe("registerHealFolderCommand", () => {
 		expect(stdout).toContain("Re-run `jolli enable`");
 	});
 
-	it("folder-only mode keeps failed entries and tells the user not to expect orphan repopulation", async () => {
-		mockLoadConfig.mockResolvedValue({ storageMode: "folder" });
+	it("a cut-over repo keeps failed entries and tells the user not to expect orphan repopulation", async () => {
+		// Past the fence the orphan branch is frozen and no SQLite → folder
+		// rebuild exists yet, so a row whose hidden JSON is already gone has
+		// nothing to regenerate from and a drop would be pure loss.
+		mockResolveCutoverRoute.mockResolvedValue({ state: "cutover" });
 		mockCreateStorage.mockResolvedValue(makeStorageWith({ healed: 0, skipped: 4, failed: 2 }));
-		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-folder-only"]);
+		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-cutover"]);
 		expect(stdout).toContain("Failed:   2");
 		expect(stdout).not.toContain("Dropped from manifest");
-		expect(stdout).toContain("folder-only mode has no truth source");
+		expect(stdout).toContain("no truth source to repopulate from");
 		expect(stdout).not.toContain("Re-run `jolli enable`");
+		expect(mockCreateStorage).toHaveBeenCalled();
+	});
+
+	it("refuses to drop manifest rows when the cutover route cannot be read", async () => {
+		// Unknown route is not evidence that dropping is safe. A stale row costs a
+		// line in this command's own report; a wrong drop costs the memory.
+		mockResolveCutoverRoute.mockRejectedValue(new Error("profile.json unreadable"));
+		mockCreateStorage.mockResolvedValue(makeStorageWith({ healed: 0, skipped: 4, failed: 2 }));
+		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-route-unknown"]);
+		expect(stdout).toContain("no truth source to repopulate from");
 	});
 
 	it("reports both healed and failed counts together", async () => {
@@ -209,7 +234,6 @@ describe("registerHealFolderCommand", () => {
 	// same "Heal errored:" exit-1 path as a DualWriteStorage-surfaced error,
 	// instead of bubbling up as an uncaught promise rejection.
 	it("catches a synchronous throw from healMissingVisibleMarkdown (folder-only path)", async () => {
-		mockLoadConfig.mockResolvedValue({ storageMode: "folder" });
 		const base: StorageProvider = {
 			readFile: vi.fn(),
 			writeFiles: vi.fn(),
@@ -234,13 +258,13 @@ describe("registerHealFolderCommand", () => {
 		mockLoadConfig.mockRejectedValue(new Error("EACCES reading config"));
 		mockCreateStorage.mockResolvedValue(makeStorageWith(null));
 		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-config-throw"]);
-		expect(stdout).toContain("storageMode=dual-write");
+		expect(stdout).toContain("Heal not available");
 	});
 
-	it("prints 'transient read error' note when dual-write mode has failed rows but no droppedIds", async () => {
-		// Failed-but-not-dropped on dual-write is the "transient" case: heal saw a
-		// fail per-entry (e.g. EBUSY mid-read) but didn't ask the manifest to drop
-		// the row. The CLI must hint at re-running rather than telling the user to
+	it("prints 'transient read error' note when an uncutover repo has failed rows but no droppedIds", async () => {
+		// Failed-but-not-dropped while the orphan branch is still authoritative is
+		// the "transient" case: heal saw a fail per-entry (e.g. EBUSY mid-read) but
+		// didn't ask the manifest to drop the row. The CLI must hint at re-running rather than telling the user to
 		// touch the manifest manually (that's the folder-only branch).
 		mockCreateStorage.mockResolvedValue(makeStorageWith({ healed: 0, skipped: 4, failed: 2 }));
 		const { stdout } = await runCommand(["--cwd", "/tmp/jolli-heal-test-transient"]);
@@ -263,7 +287,6 @@ describe("registerHealFolderCommand", () => {
 	// the CLI must surface it so operators see the failure category, not just
 	// a bare message.
 	it("prepends the errno to the message when the thrown error has a `code`", async () => {
-		mockLoadConfig.mockResolvedValue({ storageMode: "folder" });
 		const eaccesError = Object.assign(new Error("permission denied opening manifest"), { code: "EACCES" });
 		const base: StorageProvider = {
 			readFile: vi.fn(),

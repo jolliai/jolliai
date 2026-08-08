@@ -360,6 +360,12 @@ async function importDisplayOnly(
 				);
 			}
 		}
+		// No orphan-write.lock here on purpose: every storage this function
+		// receives is folder-backed (a foreign repo's Memory Bank folder or the
+		// share sandbox) — the current-repo ingest path goes through
+		// bridge.storeSummary, whose SummaryStore write sites hold the lock.
+		// If a future caller hands this an orphan-capable storage, it must take
+		// withOrphanWriteLock (D6) — unlocked orphan writes are a review blocker.
 		if (toWrite.length > 0) await storage.writeFiles(toWrite, "shared branch import (display)");
 	}
 

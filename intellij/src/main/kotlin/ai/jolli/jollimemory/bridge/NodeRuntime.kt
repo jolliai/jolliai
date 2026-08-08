@@ -14,7 +14,7 @@ data class NodeInfo(val path: String, val version: String)
 /**
  * A Node install found during detection but rejected as unusable.
  *
- * Currently the only rejection reason is "runs, but version below [NodeRuntime.MIN_SUPPORTED_MAJOR]".
+ * Currently the only rejection reason is "runs, but below [NodeRuntime.MIN_SUPPORTED_MAJOR].[NodeRuntime.MIN_SUPPORTED_MINOR]".
  * Surfaced so the UI can tell the user "we saw v14.21.3 at /opt/homebrew/bin/node — please upgrade"
  * instead of a bare "no Node found", which is confusing on a machine that clearly has Node.
  */
@@ -47,7 +47,7 @@ data class RejectedCandidate(val path: String, val version: String)
  *     asdf, mise, nodenv, n; on Windows: Program Files, scoop, chocolatey,
  *     nvm-windows, Volta).
  *
- * Verification also enforces [MIN_SUPPORTED_MAJOR]: the plugin's bundled Cli.js
+ * Verification also enforces [MIN_SUPPORTED_MAJOR].[MIN_SUPPORTED_MINOR]: the bundled Cli.js
  * cannot run on ancient Node, so a v12 on PATH must count as "not usable", not as a
  * successful detection — a newer install elsewhere can still win via later channels.
  *
@@ -70,7 +70,7 @@ data class RejectedCandidate(val path: String, val version: String)
  * `--version` + minimum-version proof before adopting.
  *
  * When detection returns null, callers can read [rejectedFromLastDetection] to explain
- * WHY — currently: Node installs that ran but were below [MIN_SUPPORTED_MAJOR] — so the
+ * WHY — currently: Node installs that ran but were below the supported floor — so the
  * UI can be specific ("v14.21.3 at /opt/homebrew/bin/node — too old") instead of a
  * generic "no Node found" that reads as a bug on machines that clearly have Node.
  *
@@ -116,11 +116,26 @@ object NodeRuntime {
     internal const val PATH_FILE_NAME = "node-path"
 
     /**
-     * Oldest Node major the bundled Cli.js runs on (the esbuild bundle targets Node 18;
-     * `node:sqlite`-dependent features degrade gracefully above that). Older binaries
-     * are rejected during verification so "detected" always means "actually usable".
+     * Oldest Node the bundled Cli.js runs on, as major.minor.
+     *
+     * 22.13 — the release where `node:sqlite` loads WITHOUT
+     * `--experimental-sqlite`. A major-only floor is not sufficient here: 22.5
+     * through 22.12 ship the module but throw on import unless flagged, and the
+     * git-hook dispatchers this plugin installs deliberately exec `node <Hook>.js`
+     * with no flags (an unknown flag would make an old Node die before running any
+     * code). So a recorded 22.5 would leave `run-hook` resolving to a runtime whose
+     * dashboard writes throw.
+     *
+     * This must stay in lockstep with the CLI's `engines.node`, its
+     * `NODE_SQLITE_MIN_VERSION`, and the esbuild targets of the VS Code and Claude
+     * plugin bundles — every surface that can *provide* a runtime has to agree on
+     * what a usable one is.
+     *
+     * Older binaries are rejected during verification so "detected" always means
+     * "actually usable".
      */
-    internal const val MIN_SUPPORTED_MAJOR = 18
+    internal const val MIN_SUPPORTED_MAJOR = 22
+    internal const val MIN_SUPPORTED_MINOR = 13
 
     private const val PATH_MARK_START = "__JOLLI_PATH_START__"
     private const val PATH_MARK_END = "__JOLLI_PATH_END__"
@@ -150,7 +165,7 @@ object NodeRuntime {
 
     /**
      * Non-blocking: candidates that ran during the last [detect] pass but were rejected
-     * (currently: Node installs below [MIN_SUPPORTED_MAJOR]). Empty when detection has
+     * (currently: Node installs below the supported floor). Empty when detection has
      * never run, when detection succeeded via the fast path or on the first candidate,
      * or when no candidate answered `--version` at all. Read by UI code to explain why
      * automatic detection failed on a machine that clearly has Node.
@@ -237,7 +252,7 @@ object NodeRuntime {
         /** The pick is a usable Node runtime and is now the recorded one. */
         data class Accepted(val info: NodeInfo) : ManualSelectionResult()
 
-        /** The pick runs, but its version is below [MIN_SUPPORTED_MAJOR]. */
+        /** The pick runs, but its version is below [MIN_SUPPORTED_MAJOR].[MIN_SUPPORTED_MINOR]. */
         data class TooOld(val version: String) : ManualSelectionResult()
 
         /** The pick exists but `--version` failed or printed no Node version. */
@@ -269,8 +284,7 @@ object NodeRuntime {
             val f = File(binPath)
             if (!f.isFile || !f.canExecute()) return ManualSelectionResult.NotExecutable
             val version = probeVersion(f) ?: return ManualSelectionResult.NotNode
-            val major = versionMajor(version)
-            if (major == null || major < MIN_SUPPORTED_MAJOR) return ManualSelectionResult.TooOld(version)
+            if (!isSupportedVersion(version)) return ManualSelectionResult.TooOld(version)
             val info = NodeInfo(f.absolutePath, version)
             writeRecordedInfo(recordFile, info, source = "manual")
             log.info("Node runtime adopted from manual selection: %s (%s)", info.path, info.version)
@@ -499,11 +513,10 @@ object NodeRuntime {
         val f = File(binPath)
         if (!f.isFile || !f.canExecute()) return VerifyResult.NotUsable
         val version = probeVersion(f) ?: return VerifyResult.NotUsable
-        val major = versionMajor(version) ?: return VerifyResult.NotUsable
-        if (major < MIN_SUPPORTED_MAJOR) {
+        if (!isSupportedVersion(version)) {
             log.info(
-                "Rejecting %s: %s is below the minimum supported v%d",
-                f.absolutePath, version, MIN_SUPPORTED_MAJOR,
+                "Rejecting %s: %s is below the minimum supported v%d.%d",
+                f.absolutePath, version, MIN_SUPPORTED_MAJOR, MIN_SUPPORTED_MINOR,
             )
             return VerifyResult.TooOld(f.absolutePath, version)
         }
@@ -536,6 +549,22 @@ object NodeRuntime {
     /** Major component of a "vX.Y.Z" version string, or null when unparseable. */
     internal fun versionMajor(version: String): Int? =
         Regex("^v(\\d+)\\.").find(version.trim())?.groupValues?.get(1)?.toIntOrNull()
+
+    /** Minor component of a `vX.Y.Z` string, or null when unparseable. */
+    internal fun versionMinor(version: String): Int? =
+        Regex("^v\\d+\\.(\\d+)").find(version.trim())?.groupValues?.get(1)?.toIntOrNull()
+
+    /**
+     * True when `version` is at or above [MIN_SUPPORTED_MAJOR].[MIN_SUPPORTED_MINOR].
+     * An unparseable version is NOT supported — treating it as usable would record a
+     * runtime we could not vouch for.
+     */
+    internal fun isSupportedVersion(version: String): Boolean {
+        val major = versionMajor(version) ?: return false
+        if (major > MIN_SUPPORTED_MAJOR) return true
+        if (major < MIN_SUPPORTED_MAJOR) return false
+        return (versionMinor(version) ?: return false) >= MIN_SUPPORTED_MINOR
+    }
 
     // ── Persistence (~/.jolli/jollimemory/node-info.json) ───────────────────
 

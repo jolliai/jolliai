@@ -350,6 +350,74 @@ describe("ClaudeTranscriptParser", () => {
 		});
 	});
 
+	describe("parseToolUse", () => {
+		const line = (blocks: Array<Record<string, unknown>>) =>
+			JSON.stringify({ type: "assistant", message: { id: "msg_1", role: "assistant", content: blocks } });
+
+		it("counts each tool_use block once even when a response repeats across lines", () => {
+			// Claude writes one API response across several lines, each repeating the
+			// whole content array. Keying on the block id — not the message id — is
+			// what keeps two DISTINCT calls in one response from collapsing to one
+			// while still deduping the repeats.
+			const dup = line([
+				{ type: "tool_use", id: "toolu_a", name: "Bash", input: {} },
+				{ type: "tool_use", id: "toolu_b", name: "Read", input: {} },
+			]);
+			expect(parser.parseToolUse([dup, dup])).toEqual([
+				{ name: "Bash", kind: "builtin", calls: 1 },
+				{ name: "Read", kind: "builtin", calls: 1 },
+			]);
+		});
+
+		it("splits an MCP tool into server and tool, keeping underscores inside each", () => {
+			const result = parser.parseToolUse([
+				line([{ type: "tool_use", id: "t1", name: "mcp__claude_ai_Linear__list_issues", input: {} }]),
+				line([{ type: "tool_use", id: "t2", name: "mcp__claude_ai_Linear__list_issues", input: {} }]),
+			]);
+			expect(result).toEqual([
+				{ name: "claude_ai_Linear.list_issues", kind: "mcp", server: "claude_ai_Linear", calls: 2 },
+			]);
+		});
+
+		it("keeps a malformed mcp name attributed to its server rather than dropping the call", () => {
+			// `mcp__server` with no tool segment should not vanish from the counts —
+			// an under-reported server is worse than an oddly-labelled one.
+			expect(
+				parser.parseToolUse([line([{ type: "tool_use", id: "t1", name: "mcp__linear", input: {} }])]),
+			).toEqual([{ name: "linear", kind: "mcp", server: "linear", calls: 1 }]);
+		});
+
+		it("attributes a Skill call to the skill it ran, not to the Skill tool", () => {
+			expect(
+				parser.parseToolUse([
+					line([{ type: "tool_use", id: "t1", name: "Skill", input: { skill: "code-review" } }]),
+				]),
+			).toEqual([{ name: "code-review", kind: "skill", calls: 1 }]);
+		});
+
+		it("falls back to the builtin name when a Skill call carries no skill id", () => {
+			expect(parser.parseToolUse([line([{ type: "tool_use", id: "t1", name: "Skill", input: {} }])])).toEqual([
+				{ name: "Skill", kind: "builtin", calls: 1 },
+			]);
+		});
+
+		it("ignores non-tool blocks, string content and unparseable lines", () => {
+			expect(
+				parser.parseToolUse([
+					"not json",
+					JSON.stringify({ message: { content: "plain string content" } }),
+					line([{ type: "text", text: "hello" }]),
+				]),
+			).toEqual([]);
+		});
+
+		it("counts a block with no id rather than dropping it", () => {
+			expect(parser.parseToolUse([line([{ type: "tool_use", name: "Bash", input: {} }])])).toEqual([
+				{ name: "Bash", kind: "builtin", calls: 1 },
+			]);
+		});
+	});
+
 	describe("parseUsageByModel", () => {
 		const turn = (model: string | undefined, usage: Record<string, number>): string =>
 			JSON.stringify({
@@ -485,6 +553,45 @@ describe("ClaudeTranscriptParser", () => {
 
 		it("returns an empty array when no line carries usage", () => {
 			expect(parser.parseUsageByModel(["{not json", ""])).toEqual([]);
+		});
+
+		// Real-shape regression: a turn that never reached a model (context
+		// overflow, a 529, a dropped connection) is still written to the JSONL as
+		// an assistant line, stamped `<synthetic>` and carrying an all-zero but
+		// present `usage` object — so the "has a usage object" check cannot reject
+		// it. Left alone it became its own bucket and took a legend slot in the
+		// dashboard's spend card, showing $0.00 next to the real models.
+		it("drops the zero-token <synthetic> bucket a failed turn writes", () => {
+			const lines = [
+				turn("claude-opus-5", { input_tokens: 10, output_tokens: 1 }),
+				JSON.stringify({
+					type: "assistant",
+					message: {
+						role: "assistant",
+						model: "<synthetic>",
+						content: [{ type: "text", text: "Prompt is too long" }],
+						usage: {
+							input_tokens: 0,
+							output_tokens: 0,
+							cache_creation_input_tokens: 0,
+							cache_read_input_tokens: 0,
+						},
+					},
+					isApiErrorMessage: true,
+				}),
+			];
+			expect(parser.parseUsageByModel(lines)).toEqual([
+				{ model: "claude-opus-5", provider: "anthropic", input: 10, output: 1, cached: 0 },
+			]);
+		});
+
+		// The sentinel is normalised to the empty id an absent model produces, not
+		// discarded: only the all-zero rule drops it. A sentinel line that somehow
+		// carried real tokens still counts them, as unpriced.
+		it("counts a token-bearing sentinel line under the empty model id", () => {
+			expect(parser.parseUsageByModel([turn("<synthetic>", { input_tokens: 5, output_tokens: 2 })])).toEqual([
+				{ model: "", provider: "anthropic", input: 5, output: 2, cached: 0 },
+			]);
 		});
 	});
 });

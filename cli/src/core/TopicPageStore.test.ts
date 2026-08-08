@@ -1,6 +1,10 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { FileWrite } from "../Types.js";
 import type { StorageProvider } from "./StorageProvider.js";
+import { saveTopicIndex } from "./TopicIndexStore.js";
 import type { TopicPage } from "./TopicKBTypes.js";
 import { listTopicPageSlugs, purgeTopicPagesExcept, readTopicPage, saveTopicPage } from "./TopicPageStore.js";
 
@@ -108,5 +112,48 @@ describe("TopicPageStore", () => {
 		const purged = await purgeTopicPagesExcept(["a", "b", "extra"], "/tmp/x", storage);
 		expect(purged).toEqual([]);
 		expect(writeCalls).toBe(0);
+	});
+
+	// Regression, and the one shape the rest of this file cannot see: in
+	// production `saveTopicPage`/`saveTopicIndex` are called from INSIDE
+	// QueueWorker's ingest writeGuard, which already holds `orphan-write.lock`
+	// via withRequiredOrphanWriteLock. `orphan-write.lock` is a plain file lock,
+	// so before it was made re-entrant the inner acquire polled out its budget
+	// against its own call chain and threw — the page, its index entry and the
+	// processed set failed to write on every single ingest, with no test able to
+	// notice (QueueWorker.test mocks Locks.js, IngestPipeline.test mocks these
+	// stores). Uses the REAL lock and the REAL store together, deliberately.
+	it("writes from inside a caller that already holds orphan-write.lock", async () => {
+		const { withRequiredOrphanWriteLock } = await import("./SummaryStore.js");
+		const dir = await mkdtemp(join(tmpdir(), "jolli-topic-lock-"));
+		try {
+			const storage = makeFakeStorage();
+			// Exactly the ingest writeGuard's shape: one guarded section that
+			// persists the page and its index entry together.
+			await withRequiredOrphanWriteLock(dir, "ingest-write", async () => {
+				await saveTopicPage(page, dir, storage);
+				await saveTopicIndex(
+					{
+						schemaVersion: 1,
+						topics: [
+							{
+								stableSlug: page.stableSlug,
+								title: page.title,
+								summary: "s",
+								lastUpdatedAt: page.lastUpdatedAt,
+								relatedBranches: page.relatedBranches,
+								sourceRefs: page.sourceRefs,
+							},
+						],
+					},
+					dir,
+					storage,
+				);
+			});
+			expect(await readTopicPage(page.stableSlug, dir, storage)).toEqual(page);
+			expect(await storage.readFile("topics/index.json")).toContain(page.stableSlug);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
 	});
 });

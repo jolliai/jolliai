@@ -225,6 +225,104 @@ describe("Locks", () => {
 			await releaseOrphanWriteLock(tempDir);
 		});
 
+		it("withOrphanWriteLock holds the lock across fn and releases after — even on a throw", async () => {
+			const { withOrphanWriteLock } = await import("./Locks.js");
+			let heldInside = false;
+			await withOrphanWriteLock(tempDir, async () => {
+				// A second acquire with a zero budget must fail while fn runs.
+				heldInside = !(await acquireOrphanWriteLock(tempDir, { timeoutMs: 0, pollMs: 1 }));
+			});
+			expect(heldInside).toBe(true);
+			// Released: an immediate acquire succeeds.
+			expect(await acquireOrphanWriteLock(tempDir, { timeoutMs: 0, pollMs: 1 })).toBe(true);
+			await releaseOrphanWriteLock(tempDir);
+			await expect(
+				withOrphanWriteLock(tempDir, async () => {
+					throw new Error("boom");
+				}),
+			).rejects.toThrow("boom");
+			expect(await acquireOrphanWriteLock(tempDir, { timeoutMs: 0, pollMs: 1 })).toBe(true);
+			await releaseOrphanWriteLock(tempDir);
+		});
+
+		// Regression: the topic stores started locking their own writes while
+		// QueueWorker's ingest writeGuard already held the same lock around them.
+		// `orphan-write.lock` is a plain file lock, so the inner acquire polled out
+		// its whole budget against its own chain and threw — every topic page,
+		// index and processed-set write failed on every ingest. Invisible to the
+		// suite because QueueWorker.test mocks Locks.js and IngestPipeline.test
+		// mocks the topic stores, so the real lock never met the real write path.
+		it("withOrphanWriteLock is re-entrant inside its own call chain", async () => {
+			const { withOrphanWriteLock } = await import("./Locks.js");
+			const order: string[] = [];
+			await withOrphanWriteLock(tempDir, async () => {
+				order.push("outer");
+				// This is the exact nesting saveTopicPage/saveTopicIndex perform.
+				await withOrphanWriteLock(tempDir, async () => {
+					order.push("inner");
+					await withOrphanWriteLock(tempDir, async () => {
+						order.push("innermost");
+					});
+				});
+				// Still genuinely held against everyone else while nested.
+				expect(await acquireOrphanWriteLock(tempDir, { timeoutMs: 0, pollMs: 1 })).toBe(false);
+			});
+			expect(order).toEqual(["outer", "inner", "innermost"]);
+			// The nested exits must not have released the outer holder's lock early:
+			// exactly one release happened, so a fresh acquire now succeeds.
+			expect(await acquireOrphanWriteLock(tempDir, { timeoutMs: 0, pollMs: 1 })).toBe(true);
+			await releaseOrphanWriteLock(tempDir);
+		});
+
+		it("withOrphanWriteLock re-entry does not leak the lock when the inner body throws", async () => {
+			const { withOrphanWriteLock } = await import("./Locks.js");
+			await expect(
+				withOrphanWriteLock(tempDir, async () => {
+					await withOrphanWriteLock(tempDir, async () => {
+						throw new Error("inner boom");
+					});
+				}),
+			).rejects.toThrow("inner boom");
+			expect(await acquireOrphanWriteLock(tempDir, { timeoutMs: 0, pollMs: 1 })).toBe(true);
+			await releaseOrphanWriteLock(tempDir);
+		});
+
+		// The re-entrancy key must not be so loose that an UNRELATED chain walks
+		// through the lock. Only the holder's own await chain gets a free pass.
+		it("withOrphanWriteLock re-entry does not leak into a concurrent chain", async () => {
+			const { withOrphanWriteLock } = await import("./Locks.js");
+			let release!: () => void;
+			const gate = new Promise<void>((r) => {
+				release = r;
+			});
+			let entered!: () => void;
+			const holderEntered = new Promise<void>((r) => {
+				entered = r;
+			});
+			let outsiderRan = false;
+			const holder = withOrphanWriteLock(tempDir, async () => {
+				entered();
+				await gate;
+			});
+			// Wait for the holder to be genuinely inside its critical section.
+			// Racing the two acquisitions instead would let the outsider win the
+			// file lock outright under load and assert nothing about re-entrancy.
+			await holderEntered;
+			// Started OUTSIDE the holder's chain: it must block on the real file
+			// lock, not inherit the holder's re-entrancy grant.
+			const outsider = withOrphanWriteLock(tempDir, async () => {
+				outsiderRan = true;
+			});
+			await new Promise((r) => setTimeout(r, 50));
+			expect(outsiderRan).toBe(false);
+			release();
+			await holder;
+			await outsider;
+			expect(outsiderRan).toBe(true);
+			expect(await acquireOrphanWriteLock(tempDir, { timeoutMs: 0, pollMs: 1 })).toBe(true);
+			await releaseOrphanWriteLock(tempDir);
+		});
+
 		it("isWorkerLockStale returns false when no lock exists", async () => {
 			expect(await isWorkerLockStale(tempDir)).toBe(false);
 		});

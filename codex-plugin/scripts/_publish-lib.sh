@@ -28,7 +28,17 @@ PLUGIN_DIR="$SRC/plugins/jolli"
 PUBLISH_REQUIRED_DIST=(
 	Cli.js CodexPluginBootstrapHook.js McpLauncher.js StopHook.js SessionStartHook.js
 	PostCommitHook.js PostMergeHook.js PostRewriteHook.js PrepareMsgHook.js PrePushHook.js
-	QueueWorker.js PrePushWorker.js
+	QueueWorker.js PrePushWorker.js DashboardServerEntry.js
+	dashboard-assets/index.html
+	dashboard-assets/styles/main.css
+	dashboard-assets/js/format.js
+	dashboard-assets/js/charts.js
+	dashboard-assets/js/shell.js
+	dashboard-assets/js/stats.js
+	dashboard-assets/js/standup.js
+	dashboard-assets/js/repositories.js
+	dashboard-assets/js/memories.js
+	dashboard-assets/js/main.js
 )
 
 # Skills the plugin ships (must match plugins/jolli/skills/ exactly). The EXACT

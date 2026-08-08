@@ -162,6 +162,45 @@ export interface ModelTokenUsage {
 }
 
 /** Result from reading a transcript file */
+/** How a tool call is attributed on the dashboard. */
+export type ToolCallKind = "builtin" | "mcp" | "skill";
+
+/** One tool, with how many times a slice called it. */
+export interface ToolCallCount {
+	/** Display name: `Bash`, `linear.list_issues`, `code-review`. */
+	readonly name: string;
+	readonly kind: ToolCallKind;
+	/** MCP server the tool belongs to. Present only when `kind` is `"mcp"`. */
+	readonly server?: string;
+	readonly calls: number;
+}
+
+/**
+ * One recall call's outcome, as the code that SERVED it saw it.
+ *
+ * Derived from the `RecallResult` union `resolveRecall` returned (see
+ * `recallOutcomeOf`) at the moment of the call, by whichever surface answered
+ * it — the MCP `recall` tool or the `jolli recall` CLI. `hit` is false for both
+ * `catalog` (branch had no exact match) and `error` (nothing recorded at all):
+ * either way the caller got no commit content to work with.
+ *
+ * This used to be recovered afterwards by parsing Claude's transcript for the
+ * `tool_result` answering each `mcp__jollimemory__recall` block, which made
+ * three whole classes of recall invisible — every CLI run, every non-Claude
+ * agent, and anything older than the 48 h `sessions.json` retention window
+ * that no live hook happened to catch. Observing the call where it is answered
+ * covers all three and lands the row immediately instead of at the end of the
+ * agent's turn.
+ */
+export interface RecallOutcome {
+	readonly hit: boolean;
+	readonly commitCount: number;
+	/** Hash + date of each commit served. Empty for a miss. */
+	readonly commits: ReadonlyArray<{ readonly hash: string; readonly date: string }>;
+	/** Epoch ms of the call itself. */
+	readonly atMs?: number;
+}
+
 export interface TranscriptReadResult {
 	readonly entries: ReadonlyArray<TranscriptEntry>;
 	readonly newCursor: TranscriptCursor;
@@ -178,6 +217,12 @@ export interface TranscriptReadResult {
 	 *  Powers the USD cost estimate. Absent for sources whose parser exposes no
 	 *  usage; the summed segments equal {@link usageBreakdown}. */
 	readonly usageByModel?: ReadonlyArray<ModelTokenUsage>;
+	/** Tool calls over the slice, one bucket per distinct tool. ABSENT means the
+	 *  source's transcripts carry no tool records at all (only Claude's do
+	 *  today); an EMPTY array means the slice genuinely called no tools. Consumers
+	 *  must keep the two apart — reporting an uncovered agent as "used no tools"
+	 *  is the failure mode this distinction exists to prevent. */
+	readonly toolUse?: ReadonlyArray<ToolCallCount>;
 }
 
 // ─── Stored transcript types (orphan branch persistence) ─────────────────────
@@ -206,6 +251,25 @@ export interface StoredSession {
 	/** Per-model split of {@link usage}, so a detach can also correct the cost
 	 *  estimate (which is priced per model, not from the aggregate). */
 	readonly usageByModel?: ReadonlyArray<ModelTokenUsage>;
+	/**
+	 * Tool / MCP / skill calls this session made in the slices this commit owns.
+	 *
+	 * Persisted because the raw transcript is the ONLY other place this exists,
+	 * and it outlives the commit by weeks at most: `sessions.json` is pruned to
+	 * what is live, and the agent clears its own JSONL on its own retention
+	 * schedule. Measured before this field existed — a machine with a month of
+	 * transcripts on disk had tool records for the last 3 days and nothing
+	 * before, because whatever slice first recorded a session was all any later
+	 * pass ever saw.
+	 *
+	 * Forward-only, exactly like {@link usageByModel}: absent on every memory
+	 * written before this field, and absent for sources whose parser cannot see
+	 * tool calls at all (`TOOL_RECORDING_SOURCES`). Consumers must treat absence
+	 * as "not recorded" and leave what they already have alone — never as "this
+	 * session called no tools", which is the positive fact an empty array
+	 * carries.
+	 */
+	readonly toolUse?: ReadonlyArray<ToolCallCount>;
 }
 
 /** Structured transcript data for a commit, stored as `transcripts/{commitHash}.json` in the orphan branch */
@@ -1505,6 +1569,22 @@ export interface JolliMemoryConfig {
 	readonly excludePatterns?: ReadonlyArray<string>;
 	/** Folder names (under localFolder) to skip during multi-repo `jolli compile`. Exact name or `*` glob. Default: none. */
 	readonly compileExcludeFolders?: ReadonlyArray<string>;
+	/**
+	 * Where database snapshots go. Default `~/jolli_back` — deliberately OUTSIDE
+	 * `~/.jolli` (a backup must not share fate with the disaster) and independent
+	 * of `localFolder` (no Memory Bank must not mean no backup). Validated at
+	 * SAVE time; the snapshot engine never falls back to another folder when the
+	 * configured one is unreachable — a removable drive being unplugged is a
+	 * legitimate state, and scattering snapshots across fallbacks would corrupt
+	 * the recovery candidate list.
+	 */
+	readonly backupFolder?: string;
+	/**
+	 * Snapshot retention in days (default 20, integer >= 1 — zero is refused
+	 * rather than given a "no backups" meaning). The size cap follows this value
+	 * (`max(2 GiB, days x current db size)`), so the two never veto each other.
+	 */
+	readonly backupRetentionDays?: number;
 	/** Jolli Space API key for pushing summaries and proxy LLM calls (sk-jol-...) */
 	readonly jolliApiKey?: string;
 	/**

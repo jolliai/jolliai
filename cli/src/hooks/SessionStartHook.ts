@@ -28,16 +28,17 @@ import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { resolveClientKind } from "../core/ClientHeader.js";
-import { readFileFromBranch, resolveStateRoot } from "../core/GitOps.js";
+import { resolveStateRoot } from "../core/GitOps.js";
 import { hasLlmCredentials } from "../core/LlmCredentials.js";
 import { pluginDefaultLocalAgentTool } from "../core/localagent/PluginDefaults.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig, normalizePlansRegistry, updateConfigTransactional } from "../core/SessionTracker.js";
+import { resolveSotStorage } from "../core/SotStorageResolver.js";
 import { isLocalAgentAuthError } from "../core/SummaryErrorMarker.js";
 import { getDisplayDate } from "../core/SummaryFormat.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
-import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
+import { createLogger, setLogDir } from "../Logger.js";
 import type { CommitSummary, DiffStats, JolliMemoryConfig, PlansRegistry, SummaryIndexEntry } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import { buildAuthFailureReminderText } from "./AuthRemediation.js";
@@ -215,14 +216,34 @@ export async function getLoginReminder(
  */
 
 /**
+ * One summary read from whichever backend currently holds the truth.
+ *
+ * NOT a raw `readFileFromBranch` against the summaries branch, which both
+ * callers used to do directly (the guard test matches that constant's name in
+ * prose too, so it is spelled around here rather than quoted). Past a cutover
+ * that branch is frozen, so the briefing would quote
+ * whatever this commit's summary said before the freeze — or nothing at all in
+ * a clone made after one — while the database holds the real text. Silent in
+ * both directions: a briefing has no "no data" state a user would notice, it
+ * just gets vaguer.
+ *
+ * Not `createReadStorage` either: un-cutover that answers `FolderStorage`, and
+ * a user with no Memory Bank folder yet would lose the briefing entirely.
+ */
+async function readSummaryFromSot(commitHash: string, cwd: string): Promise<string | null> {
+	const sot = await resolveSotStorage(cwd);
+	return sot.readFile(`summaries/${commitHash}.json`);
+}
+
+/**
  * Reads the newest summarized commit on the current branch and reports whether
- * it carries the local-agent auth-failure marker. One git read (mirrors
+ * it carries the local-agent auth-failure marker. One read (mirrors
  * {@link loadLastSummary}); reads current truth, so the reminder self-clears
  * after a successful regeneration without any persisted dismiss state.
  */
 async function isLatestCommitAuthFailure(commitHash: string, cwd: string): Promise<boolean> {
 	try {
-		const raw = await readFileFromBranch(ORPHAN_BRANCH, `summaries/${commitHash}.json`, cwd);
+		const raw = await readSummaryFromSot(commitHash, cwd);
 		if (!raw) return false;
 		return isLocalAgentAuthError(JSON.parse(raw) as CommitSummary);
 	} catch (error: unknown) {
@@ -455,12 +476,13 @@ interface LastSummaryData {
 }
 
 /**
- * Loads the last commit's summary file directly (one git call).
- * Extracts topic title and key decisions without loading the full tree.
+ * Loads the last commit's summary file directly (one read against the system
+ * of record). Extracts topic title and key decisions without loading the full
+ * tree.
  */
 async function loadLastSummary(commitHash: string, cwd: string): Promise<LastSummaryData> {
 	try {
-		const raw = await readFileFromBranch(ORPHAN_BRANCH, `summaries/${commitHash}.json`, cwd);
+		const raw = await readSummaryFromSot(commitHash, cwd);
 		if (!raw) {
 			return { lastTopicTitle: null, keyDecisions: [] };
 		}

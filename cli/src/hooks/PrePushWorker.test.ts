@@ -11,7 +11,16 @@ import { runPrePushSync, runPushWorker } from "./PrePushWorker.js";
 import { type PushWorkerResult, readPushRequest, releasePushLock, writePushResult } from "./PushProgress.js";
 
 vi.mock("../core/PushExecutor.js", () => ({ processPushPending: vi.fn() }));
-vi.mock("../core/RepoProfile.js", () => ({ readManualDisableFlag: vi.fn().mockResolvedValue(false) }));
+vi.mock("../dashboard/CutoverRouter.js", () => ({
+	// Pre-cutover default (plain fn — survives mock resets).
+	resolveCutoverRoute: async () => ({ state: "uncutover" }),
+}));
+
+vi.mock("../core/RepoProfile.js", () => ({
+	// Pre-cutover default: no fence (plain fn — survives mock resets).
+	readCutoverFence: async () => null,
+	readManualDisableFlag: vi.fn().mockResolvedValue(false),
+}));
 vi.mock("../core/PushPendingStore.js", () => ({ loadPushPending: vi.fn() }));
 vi.mock("./CaptureProgress.js", () => ({
 	CAPTURE_PROGRESS_MAX_AGE_MS: 3_600_000,

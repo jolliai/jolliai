@@ -26,7 +26,11 @@ vi.mock("../core/GitOps.js", () => ({
 	execGit: mocks.execGit,
 }));
 vi.mock("../core/Locks.js", () => ({ withRepoHooksLock: mocks.withRepoHooksLock }));
-vi.mock("../core/RepoProfile.js", () => ({ readManualDisableFlag: mocks.readManualDisableFlag }));
+vi.mock("../core/RepoProfile.js", () => ({
+	// Pre-cutover default: no fence (plain fn — survives mock resets).
+	readCutoverFence: async () => null,
+	readManualDisableFlag: mocks.readManualDisableFlag,
+}));
 vi.mock("../core/SessionTracker.js", () => ({ loadConfig: mocks.loadConfig, saveSession: mocks.saveSession }));
 vi.mock("../install/GitExclude.js", () => ({ addGitExcludePaths: mocks.addGitExcludePaths }));
 vi.mock("../install/ClaudeHookInstaller.js", () => ({

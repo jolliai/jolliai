@@ -367,7 +367,7 @@ class ChangesPanel(
      * dedupe in [refreshFromGit] can skip the second one.
      */
     private fun changesSignature(list: List<FileChange>): String =
-        list.joinToString("\n") { "${it.statusCode} ${it.relativePath}" }
+        list.joinToString("\n") { "${it.statusCode}\u0000${it.relativePath}" }
 
     private fun showInitializing() {
         // Force the next data refresh to render even if the file set matches what

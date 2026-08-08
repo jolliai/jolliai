@@ -18,6 +18,15 @@ vi.mock("./GitOps.js", () => ({
 vi.mock("./Locks.js", () => ({
 	acquireOrphanWriteLock: vi.fn(),
 	releaseOrphanWriteLock: vi.fn(),
+	// The REAL class, not a stub: callers (IngestPipeline, the compile commands)
+	// branch on `instanceof` to tell contention from an I/O fault, so a fake would
+	// make this suite agree with a shape production does not have.
+	OrphanWriteBusyError: class OrphanWriteBusyError extends Error {
+		constructor(label: string, timeoutMs: number) {
+			super(`${label}: could not acquire orphan-write.lock within ${timeoutMs}ms`);
+			this.name = "OrphanWriteBusyError";
+		}
+	},
 }));
 
 // Suppress console output
@@ -79,6 +88,8 @@ import {
 	readTranscript,
 	readTranscriptsForCommits,
 	removeFromIndex,
+	resolveReadStorage,
+	resolveStorage,
 	saveTranscriptsBatch,
 	scanTreeHashAliases,
 	setActiveStorage,
@@ -4280,10 +4291,18 @@ describe("SummaryStore", () => {
 		// (SummaryStore.ts L122-123). The same throw shape is shared by every
 		// public write API (storeReferences/storeNotes/storePlans/saveTranscriptsBatch
 		// /migrate*); pinning one caller's path is enough for the helper.
-		it("throws when acquireOrphanWriteLock returns false within timeout", async () => {
+		it("throws a typed OrphanWriteBusyError when the lock is not acquired in budget", async () => {
 			vi.mocked(acquireOrphanWriteLock).mockResolvedValueOnce(false);
 
-			await expect(storeSummary(createMockSummary())).rejects.toThrow(/could not acquire orphan-write lock/);
+			// Typed, because downstream callers classify on it: `IngestPipeline` needs
+			// contention to land as a benign PAGE_WRITE_CONFLICT rather than a
+			// PAGE_WRITE_ERROR, and `jolli compile` reports it as "try again shortly"
+			// instead of letting a stack trace escape the command.
+			await expect(storeSummary(createMockSummary())).rejects.toMatchObject({
+				name: "OrphanWriteBusyError",
+				// 30 s, the must-land budget — not the 1 s background one.
+				message: expect.stringContaining("could not acquire orphan-write.lock within 30000ms"),
+			});
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 			expect(releaseOrphanWriteLock).not.toHaveBeenCalled();
 		});
@@ -4509,5 +4528,34 @@ describe("SummaryStore", () => {
 			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
+	});
+});
+
+describe("resolveReadStorage", () => {
+	afterEach(() => setActiveStorage(undefined));
+
+	it("resolves identically to resolveStorage — it differs only in whether it warns", async () => {
+		// The write-side twin warns on fallback because a write that bypasses
+		// DualWriteStorage is silently lost on the Memory Bank side. A read that
+		// falls back to the system of record is the documented model, so it must
+		// not warn — but it must still pick the SAME provider, or the two sides
+		// of one command would read and write different backends.
+		const explicit = { kind: "folder" } as unknown as StorageProvider;
+		expect(await resolveReadStorage(explicit, "/w")).toBe(await resolveStorage(explicit, "/w"));
+
+		const active = { kind: "dual-write" } as unknown as StorageProvider;
+		setActiveStorage(active);
+		expect(await resolveReadStorage(undefined, "/w")).toBe(active);
+		expect(await resolveReadStorage(undefined, "/w")).toBe(await resolveStorage(undefined, "/w"));
+
+		setActiveStorage(undefined);
+		expect((await resolveReadStorage(undefined, "/w")).kind).toBe((await resolveStorage(undefined, "/w")).kind);
+	});
+
+	it("prefers an explicitly threaded provider over the active override", async () => {
+		const active = { kind: "dual-write" } as unknown as StorageProvider;
+		const explicit = { kind: "folder" } as unknown as StorageProvider;
+		setActiveStorage(active);
+		expect(await resolveReadStorage(explicit, "/w")).toBe(explicit);
 	});
 });

@@ -29,6 +29,7 @@ import {
 	tenantOriginForKey,
 } from "../core/SpaceBindingCache.js";
 import type { SqliteScanError } from "../core/SqliteHelpers.js";
+import { describeImportState, readImportState } from "../dashboard/ImportState.js";
 import { getStatus } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { JolliMemoryConfig, StatusInfo } from "../Types.js";
@@ -546,6 +547,9 @@ export function registerStatusCommand(program: Command): void {
 				config?.jolliApiKey,
 				options.refresh === true,
 			);
+			// Null outside a git repo — `resolveRepoIdentity` has nothing to key on,
+			// and a row that cannot mean anything is better omitted than guessed.
+			const importState = await readImportState(options.cwd).catch(() => null);
 
 			console.log(`\n  Jolli Memory Status (v${VERSION})`);
 			console.log("  ──────────────────────────────────────");
@@ -554,6 +558,18 @@ export function registerStatusCommand(program: Command): void {
 				console.log(`  Hook runtime:     ${hookRuntime}`);
 			}
 			console.log(`  Data migration:   ${describeSchemaV5Status(status.schemaV5)}`);
+			// A separate row from `Data migration:` on purpose — that one belongs to
+			// the schema-v5 upgrade of the orphan branch, and folding two unrelated
+			// migrations into one label would make either verdict unreadable.
+			//
+			// Read here rather than projected onto `StatusInfo`: adding a field there
+			// carries it into getStatus() → the MCP `status` tool → the VS Code
+			// panel, and then owes IntelliJ an ide-bridge operation. Nothing consumes
+			// it yet, so it stays local — the same call `describeSchemaV5Status`
+			// documents.
+			if (importState) {
+				console.log(`  Memory database:  ${describeImportState(importState)}`);
+			}
 			/* v8 ignore next -- ternary: auth token presence depends on external config/env */
 			console.log(`  Jolli Account:    ${authToken ? "Signed in" : "Not signed in"}`);
 			console.log(`  Jolli API Key:    ${config?.jolliApiKey ? "Configured" : "Not configured"}`);

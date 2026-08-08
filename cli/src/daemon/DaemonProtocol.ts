@@ -31,8 +31,17 @@ export const DAEMON_PROTOCOL = "jolli-daemon-notify-v1";
  * context the user creates while a session is still running — it had to wait
  * for the agent's turn to end. See `params.names` for why the second one is
  * the only kind that carries a payload.
+ *
+ * `memory-db` is `orphan-ref`'s successor, and both are watched because a repo
+ * can be on either side of the cutover: before it, memories land on the orphan
+ * ref and the database is a projection; after it, the ref is FROZEN and the
+ * only file that moves is the database. Watching just the ref meant a cut-over
+ * repo pushed nothing at all — a JVM host's sidebar simply stopped updating,
+ * with no error anywhere. Deliberately NOT given a Kotlin constant: clients
+ * branch only on the two mid-session kinds and everything else falls through to
+ * the status refresh, which is exactly the handling this kind wants.
  */
-export type RefreshKind = "queue" | "orphan-ref" | "memory-bank" | "working-context" | "claude-plans";
+export type RefreshKind = "queue" | "orphan-ref" | "memory-db" | "memory-bank" | "working-context" | "claude-plans";
 
 export interface DaemonReadyNotification {
 	readonly jsonrpc: "2.0";

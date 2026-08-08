@@ -292,6 +292,22 @@ Rules:
 4. Do NOT include multi-line bodies -- just the single subject line.
 5. Ticket prefix: examine the branch name above. If it contains a recognizable ticket pattern (e.g. "proj-123", "FEAT-456", or a bare number like "fix/42-login"), extract the ticket identifier, uppercase the project prefix, and prefix the commit message with "Part of <TICKET>: ". Examples: branch "feature/proj-123-foo" -> "Part of PROJ-123: ...", branch "fix/FEAT-42-bar" -> "Part of FEAT-42: ...". If no ticket number is found in the branch name, do not add any prefix.`;
 
+/**
+ * Compresses a mined `decisions` field (1 sentence to a multi-bullet paragraph,
+ * see SUMMARIZE rule 2 above) into a single sentence for display-time use in
+ * the dashboard's Decisions card. Called on demand, not during summary
+ * generation -- see cli/src/dashboard/DecisionGist.ts.
+ */
+const DECISION_GIST = `You are Jolli Memory. Compress the following engineering decision into exactly ONE sentence (max ~140 characters).
+
+## Decision
+{{text}}
+
+## Instructions
+1. Return ONLY the one-sentence summary -- no explanation, no quotes, no markdown, no leading label like "Decision:".
+2. Preserve the core trade-off or choice; drop supporting detail.
+3. Plain prose, imperative or declarative -- do not just copy the first sentence verbatim if the text opens with a markdown bullet.`;
+
 const SQUASH_MESSAGE = `You are Jolli Memory, an AI development assistant. Generate a concise git commit message that summarizes the following commits being squashed into one.
 
 ## Ticket
@@ -944,6 +960,7 @@ export const TEMPLATES: ReadonlyMap<string, PromptTemplate> = new Map<string, Pr
 		{ action: "squash-consolidate-strict", version: 2, template: SQUASH_CONSOLIDATE_STRICT },
 	],
 	["commit-message", { action: "commit-message", version: 2, template: COMMIT_MESSAGE }],
+	["decision-gist", { action: "decision-gist", version: 1, template: DECISION_GIST }],
 	["squash-message", { action: "squash-message", version: 2, template: SQUASH_MESSAGE }],
 	["e2e-test", { action: "e2e-test", version: 2, template: E2E_TEST }],
 	["recap", { action: "recap", version: 1, template: RECAP }],

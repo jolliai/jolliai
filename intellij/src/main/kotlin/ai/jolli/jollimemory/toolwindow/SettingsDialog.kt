@@ -1180,17 +1180,13 @@ class SettingsDialog(
                         // Fire-and-forget on a pooled thread — VS Code parity: silent,
                         // and a large first-install migration never blocks the save task
                         // for minutes. The config was persisted above, so the CLI reads
-                        // the fresh `localFolder`; the reader re-attach happens on
-                        // completion.
-                        service.migrateMemoryBankAsync { _ ->
-                            // Re-point the SummaryReader's folder attachment at the new
-                            // kbRoot / storageMode. Without this, changing the Memory Bank
-                            // path (or toggling storageMode to "orphan") in Settings keeps
-                            // reads served from the previous folder for the rest of the
-                            // session — [JolliMemoryService.initialize] is gated by
-                            // `isInitialized`, so it will not re-run.
-                            service.refreshFolderReader()
-                        }
+                        // the fresh `localFolder`.
+                        //
+                        // No reader re-point is needed any more: reads go through the
+                        // bridge-backed storage stack, which resolves the Memory Bank
+                        // path per call (cutover gate G.3 retired the folder reader and
+                        // its stale-attachment failure mode).
+                        service.migrateMemoryBankAsync()
                     }
 
                     // 2b. Agent hook sync — install or remove the Claude Stop and Gemini

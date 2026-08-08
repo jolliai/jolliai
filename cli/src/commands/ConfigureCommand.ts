@@ -11,6 +11,7 @@ import { validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { LOCAL_AGENT_TOOLS } from "../core/localagent/ToolMeta.js";
 import { getGlobalConfigDir, loadConfig, saveConfig } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
+import { validateBackupFolder, validateBackupRetentionDays } from "../dashboard/Backup.js";
 import { syncGlobalInstructions } from "../install/Installer.js";
 import { createLogger } from "../Logger.js";
 import type { JolliMemoryConfig, LogLevel } from "../Types.js";
@@ -75,6 +76,8 @@ const VALID_CONFIG_KEYS = [
 	"syncOnPush",
 	"localAgentTool",
 	"localAgentPath",
+	"backupFolder",
+	"backupRetentionDays",
 	"slack.workspaceUrl",
 ] as const satisfies ReadonlyArray<keyof JolliMemoryConfig | "slack.workspaceUrl">;
 
@@ -102,6 +105,12 @@ function maskSecret(value: string): string {
 /** Coerces a string value from the CLI into the appropriate type for the given config key. */
 function coerceConfigValue(key: ConfigKey, raw: string): string | number | boolean | ReadonlyArray<string> {
 	// Numeric fields
+	if (key === "backupRetentionDays") {
+		const n = Number(raw);
+		const problem = validateBackupRetentionDays(n);
+		if (problem) throw new Error(`${problem} (got: ${raw})`);
+		return n;
+	}
 	if (key === "syncPollIntervalSec") {
 		const n = Number(raw);
 		if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
@@ -372,6 +381,19 @@ export function registerConfigureCommand(program: Command): void {
 							validateJolliApiKey(update[key] as string);
 						} catch (err) {
 							console.error(`\n  Error: ${(err as Error).message}\n`);
+							process.exitCode = 1;
+							return;
+						}
+					}
+					// backupFolder is validated at SAVE time (the cutover gate's
+					// rule); the snapshot engine itself never re-routes a bad value.
+					if (key === "backupFolder" && typeof update[key] === "string") {
+						const existing = await loadConfig();
+						const problem = await validateBackupFolder(update[key] as string, {
+							localFolder: existing.localFolder,
+						});
+						if (problem) {
+							console.error(`\n  Error: ${problem}\n`);
 							process.exitCode = 1;
 							return;
 						}

@@ -92,7 +92,7 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | **Gemini** | An `AfterAgent` hook fires after each agent completion |
 | **Antigravity** | No hook needed — sessions are discovered automatically by reading the per-conversation SQLite for the workspace path and the sibling plaintext transcript log for the conversation content |
 | **Codex** | No hook needed — sessions are discovered automatically by scanning the filesystem. Linear/Jira/GitHub/Notion/Slack/Zoom/Confluence/Asana/monday.com/Jolli-Memory references in Codex MCP calls are extracted on the VS Code sidebar's 60s polling tick (not at commit time) |
-| **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database at `~/.local/share/opencode/opencode.db` (requires Node 22.5+) |
+| **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database at `~/.local/share/opencode/opencode.db` (requires Node 22.13+) |
 | **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by reading Cursor's local SQLite stores (`globalStorage/state.vscdb` plus per-workspace `workspaceStorage/` databases under your platform's Cursor user-data directory) |
 | **Cursor CLI** (`cursor-agent`) | No hook needed — sessions are discovered automatically from Cursor's plaintext `~/.cursor` session store (`meta.json` + JSONL); shares the **Cursor** toggle with the Composer IDE |
 | **GitHub Copilot CLI** | No hook needed — sessions are discovered automatically by scanning Copilot CLI's session log |
@@ -114,7 +114,7 @@ Every memory is dual-written to **both** the git orphan branch `jollimemory/summ
 
 ## Installation
 
-**Requirements** — **Node.js 22.5 or later**. OpenCode session discovery uses Node's built-in `node:sqlite`, which first ships in Node 22.5; the `engines` field refuses installation on older runtimes. If you use Node 18 or 20, please upgrade before installing.
+**Requirements** — **Node.js 22.13 or later**. SQLite-backed features (the local dashboard, plus OpenCode/Cursor/Copilot/Devin session discovery) use Node's built-in `node:sqlite`. That module first appears in 22.5 but needs `--experimental-sqlite` until **22.13**, where it loads unflagged — and two surfaces cannot pass a Node flag at all (the VS Code extension host, and the git hooks, which run `node <Hook>.js` deliberately flag-free). So 22.13 is the floor the `engines` field enforces. If you are on Node 18 or 20, please upgrade before installing.
 
 ```bash
 npm install -g @jolli.ai/cli
@@ -502,7 +502,7 @@ Settings are stored globally in `~/.jolli/jollimemory/config.json`. The recommen
 | `claudeEnabled` | boolean | auto-detect | Enable Claude Code session tracking |
 | `codexEnabled` | boolean | auto-detect | Enable Codex session discovery |
 | `geminiEnabled` | boolean | auto-detect | Enable Gemini session tracking |
-| `openCodeEnabled` | boolean | auto-detect | Enable OpenCode session discovery (requires Node 22.5+) |
+| `openCodeEnabled` | boolean | auto-detect | Enable OpenCode session discovery (requires Node 22.13+) |
 | `cursorEnabled` | boolean | auto-detect | Enable Cursor session discovery — covers both the Composer IDE and the `cursor-agent` CLI (single shared switch) |
 | `copilotEnabled` | boolean | auto-detect | Enable GitHub Copilot CLI **and** VS Code Copilot Chat session discovery (single shared switch) |
 | `clineEnabled` | boolean | auto-detect | Enable Cline session discovery (CLI + VS Code extension) |

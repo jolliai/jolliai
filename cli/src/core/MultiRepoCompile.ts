@@ -79,12 +79,24 @@ export async function compileAllRepos(
 	// must NOT hold the vault lock or it re-starves the commit-summary workers this
 	// fix unblocks. Two overlapping sweeps are safe (optimistic-concurrency / RMW).
 	const { launchWorker } = await import("../hooks/QueueWorker.js");
-	const writeGuard = async (fn: () => Promise<void>): Promise<void> => {
-		const r = await withVaultWriteLock(vaultRoot, { wait: DEFAULT_VAULT_WRITE_WAIT_MS }, fn, {
-			launch: launchWorker,
-		});
-		if (!r.ran) throw new VaultWriteBusyError();
-	};
+	const { withRequiredOrphanWriteLock } = await import("./SummaryStore.js");
+	// Built PER REPO, not once for the sweep: the inner orphan lock is keyed on the
+	// same `cwd` the topic stores are called with (`t.kbRoot`), and a guard holding
+	// a different key would leave those stores taking the lock again on their own —
+	// the very split this guard exists to close.
+	const makeWriteGuard =
+		(repoCwd: string) =>
+		async (fn: () => Promise<void>): Promise<void> => {
+			const r = await withVaultWriteLock(
+				vaultRoot,
+				{ wait: DEFAULT_VAULT_WRITE_WAIT_MS },
+				// Inner orphan-write.lock — see CompileCommand's identical guard for why a
+				// page and its index entry must share ONE orphan critical section.
+				() => withRequiredOrphanWriteLock(repoCwd, "compile-write", fn),
+				{ launch: launchWorker },
+			);
+			if (!r.ran) throw new VaultWriteBusyError();
+		};
 
 	const targets = await discoverRepos(localFolder, config.compileExcludeFolders ?? []);
 	const repos: CompileAllRepoResult[] = [];
@@ -109,6 +121,7 @@ export async function compileAllRepos(
 				opts?.onProgress?.(detail ? `${label} — ${t.folder} (${detail})` : `${label} — ${t.folder}`);
 			try {
 				setLogDir(t.kbRoot);
+				const writeGuard = makeWriteGuard(t.kbRoot);
 				const storage = createFolderStorageAtRoot(t.kbRoot);
 				setActiveStorage(storage);
 				// ingest + render are one user-facing phase: "Building knowledge wiki".

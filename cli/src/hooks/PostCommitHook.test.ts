@@ -29,8 +29,23 @@ vi.mock("../core/GitOps.js", () => ({
 	getProjectRootDir: vi.fn().mockImplementation((cwd: string) => Promise.resolve(cwd)),
 }));
 
+vi.mock("../dashboard/CutoverRouter.js", () => ({
+	// Pre-cutover default (plain fn — survives mock resets).
+	resolveCutoverRoute: async () => ({ state: "uncutover" }),
+}));
+
 vi.mock("../core/RepoProfile.js", () => ({
+	// Pre-cutover default: no fence (plain fn — survives mock resets).
+	readCutoverFence: async () => null,
 	readManualDisableFlag: vi.fn().mockResolvedValue(false),
+}));
+
+// Dashboard direct write (JOLLI-2069): inert here — the worker's post-drain
+// projection would otherwise hit the machine-level SQLite DB and call
+// getCommitInfo, which several assertions in this file treat as proof that the
+// summary pipeline itself ran. Covered by dashboard/ProducerHooks.test.ts.
+vi.mock("../dashboard/ProducerHooks.js", () => ({
+	recordCommitsFromWorker: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock("../core/SessionTracker.js", async (importOriginal) => {

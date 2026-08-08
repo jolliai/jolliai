@@ -6,7 +6,7 @@
 import { createLogger } from "../Logger.js";
 import type { FileWrite } from "../Types.js";
 import type { StorageProvider } from "./StorageProvider.js";
-import { resolveStorage } from "./SummaryStore.js";
+import { resolveStorage, withRequiredOrphanWriteLock } from "./SummaryStore.js";
 import type { TopicIndex } from "./TopicKBTypes.js";
 
 const log = createLogger("TopicIndexStore");
@@ -19,7 +19,7 @@ export function emptyTopicIndex(): TopicIndex {
 
 /** Reads `topics/index.json`; missing or unparseable → empty index (never throws). */
 export async function readTopicIndex(cwd?: string, storage?: StorageProvider): Promise<TopicIndex> {
-	const resolved = resolveStorage(storage, cwd);
+	const resolved = await resolveStorage(storage, cwd);
 	const raw = await resolved.readFile(INDEX_PATH);
 	if (!raw) return emptyTopicIndex();
 	try {
@@ -33,7 +33,10 @@ export async function readTopicIndex(cwd?: string, storage?: StorageProvider): P
 
 /** Persists the index via the active StorageProvider. */
 export async function saveTopicIndex(index: TopicIndex, cwd?: string, storage?: StorageProvider): Promise<void> {
-	const resolved = resolveStorage(storage, cwd);
+	const resolved = await resolveStorage(storage, cwd);
 	const files: FileWrite[] = [{ path: INDEX_PATH, content: JSON.stringify(index, null, "\t") }];
-	await resolved.writeFiles(files, `Update topic KB index (${index.topics.length} topics)`);
+	// Under orphan-write.lock — see TopicPageStore.saveTopicPage (D6 invariant).
+	await withRequiredOrphanWriteLock(cwd, "saveTopicIndex", () =>
+		resolved.writeFiles(files, `Update topic KB index (${index.topics.length} topics)`),
+	);
 }

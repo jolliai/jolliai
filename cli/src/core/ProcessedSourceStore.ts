@@ -9,7 +9,7 @@
 import { createLogger } from "../Logger.js";
 import type { FileWrite } from "../Types.js";
 import type { StorageProvider } from "./StorageProvider.js";
-import { resolveStorage } from "./SummaryStore.js";
+import { resolveStorage, withRequiredOrphanWriteLock } from "./SummaryStore.js";
 import type { ProcessedSet, SourceRef, SourceType } from "./TopicKBTypes.js";
 
 const log = createLogger("ProcessedSourceStore");
@@ -22,7 +22,7 @@ export function emptyProcessedSet(): ProcessedSet {
 
 /** Reads `topics/processed.json`; missing or unparseable → empty set (never throws). */
 export async function readProcessedSet(cwd?: string, storage?: StorageProvider): Promise<ProcessedSet> {
-	const resolved = resolveStorage(storage, cwd);
+	const resolved = await resolveStorage(storage, cwd);
 	const raw = await resolved.readFile(PROCESSED_PATH);
 	if (!raw) return emptyProcessedSet();
 	try {
@@ -72,7 +72,10 @@ export function addProcessed(set: ProcessedSet, refs: ReadonlyArray<SourceRef>):
 
 /** Persists the set via the active StorageProvider. */
 export async function saveProcessedSet(set: ProcessedSet, cwd?: string, storage?: StorageProvider): Promise<void> {
-	const resolved = resolveStorage(storage, cwd);
+	const resolved = await resolveStorage(storage, cwd);
 	const files: FileWrite[] = [{ path: PROCESSED_PATH, content: JSON.stringify(set, null, "\t") }];
-	await resolved.writeFiles(files, "Update topic KB processed-source set");
+	// Under orphan-write.lock — see TopicPageStore.saveTopicPage (D6 invariant).
+	await withRequiredOrphanWriteLock(cwd, "saveProcessedSet", () =>
+		resolved.writeFiles(files, "Update topic KB processed-source set"),
+	);
 }

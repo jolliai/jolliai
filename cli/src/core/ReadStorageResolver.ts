@@ -11,21 +11,34 @@
  * snapshot than what the user sees, and downstream wiki / cache fingerprints
  * drift between the two surfaces.
  *
- * Three legitimate fallback-to-orphan paths in dual-write mode:
+ * Three legitimate fallback-to-orphan paths in the pre-cutover (`uncutover`)
+ * state:
  *   1. Fresh install where MigrationEngine hasn't run yet.
  *   2. User wiped `<localFolder>/<repo>/.jolli/` while orphan still has data.
  *   3. Folder shadow is dirty (last write to shadow failed) — orphan holds
  *      the authoritative copy.
  *
- * Unknown `storageMode` values fall back to orphan on both read and write
- * sides (see `StorageFactory.createStorage`) so a config typo doesn't split
- * the storage layer mid-pipeline.
+ * Unknown `storageMode` values fall back to orphan in that state (see
+ * `StorageFactory.createStorage`) so a config typo doesn't split the storage
+ * layer mid-pipeline.
+ *
+ * `storageMode`-driven dispatch below only runs in `uncutover` — the same gate
+ * `StorageFactory.createStorage` applies on the write side. `legacy-fenced`
+ * and `cutover` route straight to `SqliteStorage` regardless of `storageMode`
+ * (a residual value there is retired, not a live read-mode switch): without
+ * this, `GenerateCommand` / `SourceTimeline` / `IngestPipeline` would keep
+ * reading FolderStorage/OrphanBranchStorage off a stale config key after the
+ * repo's orphan branch froze, silently working from the wrong backend instead
+ * of the SQLite database the write side already cut over to.
  */
 
+import { resolveCutoverRoute } from "../dashboard/CutoverRouter.js";
+import { resolveRepoIdentityForCwd } from "../dashboard/RepoRegistry.js";
 import { createLogger } from "../Logger.js";
 import { isClaimableProject } from "./KBPathResolver.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 import { loadConfig } from "./SessionTracker.js";
+import { SqliteStorage } from "./SqliteStorage.js";
 import { createFolderStorage } from "./StorageFactory.js";
 import type { StorageProvider } from "./StorageProvider.js";
 
@@ -47,9 +60,23 @@ const log = createLogger("ReadStorageResolver");
  * `createFolderStorage`, not just `StorageFactory.createStorage`. Degrading to
  * orphan costs nothing here: in dual-write the folder probe would have missed
  * (`index.json` absent in a folder that only just came into existence) and
- * fallen back to orphan anyway — just after leaving the folder behind.
+ * fallen back to orphan anyway — just after leaving the folder behind. The
+ * SQLite routes below never touch `createFolderStorage`, so they need no
+ * claimable check at all.
  */
 export async function createReadStorage(cwd: string): Promise<StorageProvider> {
+	const route = await resolveCutoverRoute(cwd);
+	if (route.state === "blocked") {
+		throw new Error(
+			`storage unavailable: ${route.reason} — this repo's orphan branch is frozen (cutover), ` +
+				"so reads cannot fall back to it; run 'jolli doctor --recover' or upgrade this surface",
+		);
+	}
+	if (route.state === "legacy-fenced" || route.state === "cutover") {
+		const { identity } = await resolveRepoIdentityForCwd(cwd);
+		return new SqliteStorage(identity);
+	}
+
 	const config = (await loadConfig()) as Record<string, unknown>;
 	const mode = (config.storageMode as string | undefined) ?? "dual-write";
 

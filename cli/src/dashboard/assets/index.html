@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>jolli dashboard</title>
+<link rel="stylesheet" href="styles/main.css" />
+</head>
+<body>
+<!--
+  Shell markup mirrors the `jolli stats` / `jolli standup` mockups: a sticky
+  sidebar (dashboards + repo filter), a topbar carrying the page identity,
+  repo pill and time-range control, and one `.wrap` per view.
+
+  `data-tier` on `.jd` is load-bearing, not decorative — the stylesheet keys the
+  local/synced chips and the locked-preview treatments off it, so the shell
+  reflects the adoption tier without any JS branching in the page modules.
+-->
+<div class="jd" data-tier="0" id="jdRoot">
+	<aside class="sidebar" aria-label="Jolli local web server">
+		<div class="sb-brand"><b>jolli</b><span>local web server</span></div>
+		<div class="sb-label">Menu</div>
+		<nav class="sb-list" id="sbNav" aria-label="Menu"></nav>
+		<div class="sb-bottom" id="sbBottom"></div>
+	</aside>
+
+	<div class="main">
+		<header class="topbar">
+			<div class="wordmark"><b id="pageTitle">My stats</b><span id="pageSub">individual · local</span></div>
+			<div class="seg seg-sm" role="group" aria-label="Time range" id="rangeSeg">
+				<button type="button" data-range="week">7d</button>
+				<button type="button" data-range="month">30d</button>
+				<button type="button" data-range="3m">90d</button>
+				<button type="button" data-range="custom" aria-expanded="false" aria-controls="rangeCustom">Custom</button>
+			</div>
+			<!-- The form keeps Apply keyboard-submittable while the calendar provides
+			     an explicit, visible start-to-end selection. Future days are disabled
+			     from the model's own zone, rather than being silently clamped later. -->
+			<form class="range-custom" id="rangeCustom" hidden aria-label="Custom date range">
+				<div class="range-calendar-head">
+					<button class="range-nav" type="button" id="rangePrevious" aria-label="Previous months">‹</button>
+					<div class="range-calendar-months" id="rangeCalendarMonths"></div>
+					<button class="range-nav" type="button" id="rangeNext" aria-label="Next months">›</button>
+				</div>
+				<div class="range-calendar-foot">
+					<span id="rangeSelection">Select a start and end date</span>
+					<div><button type="button" class="cta ghost sm" id="rangeCancel">Cancel</button><button type="submit" class="cta sm">Apply</button></div>
+				</div>
+			</form>
+			<span class="local-chip" id="localChip">Runs locally. Nothing leaves this machine.</span>
+			<span class="machines-chip" id="machinesChip">⟳ synced</span>
+			<div class="spacer"></div>
+		</header>
+
+		<div class="wrap"><div class="grid" id="app"></div></div>
+		<div class="footer-note" id="coverageNote"></div>
+	</div>
+
+	<!--
+	  Two page-level layers, both `position: fixed`: a tooltip (positioned by
+	  JD.showTip) and the standup draft sheet. They sit OUTSIDE `.main` so a hover or
+	  a dialog near the edge of a scrolled card is not clipped by that card, but
+	  INSIDE `.jd` — that is the element carrying the colour tokens, and a layer
+	  outside it renders with every `var(--surface)` / `var(--border)` unresolved,
+	  i.e. as unstyled text on a transparent background.
+
+	  The sheet's textarea is EDITABLE on purpose and is this page's actual product:
+	  the mockup's whole claim for the standup view is "everyone edits before it
+	  posts", so the draft has to be visible and correctable, not just written to the
+	  clipboard behind a click.
+	-->
+	<div class="tip" id="tip"></div>
+	<div class="overlay" id="ovStandup" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+		<div class="sheet">
+			<h3 id="sheetTitle">Your standup, drafted</h3>
+			<div class="sub" id="sheetSub"></div>
+			<textarea id="mdOut" spellcheck="false" aria-label="Standup markdown"></textarea>
+			<div class="row">
+				<button class="cta" type="button" id="copyMd">Copy markdown</button>
+				<span class="toast" id="mdToast" role="status">Copied ✓</span>
+				<div class="spacer"></div>
+				<button class="cta ghost" type="button" id="closeOv">Close</button>
+			</div>
+		</div>
+	</div>
+	<!--
+	  The Memories page's Context viewer. Same layer rules as the sheet above.
+	  Its body is a read-only <pre>, filled with textContent — the document is
+	  markdown an agent wrote, and this page has no renderer for it.
+	-->
+	<div class="overlay" id="ovContext" role="dialog" aria-modal="true" aria-labelledby="ctxTitle">
+		<div class="sheet">
+			<h3 id="ctxTitle">Context</h3>
+			<div class="sub" id="ctxSub"></div>
+			<pre id="ctxBody" class="ctx-body"></pre>
+			<div class="row">
+				<div class="spacer"></div>
+				<button class="cta ghost" type="button" id="ctxClose">Close</button>
+			</div>
+		</div>
+	</div>
+</div>
+<!-- scripts:start -->
+<script src="js/format.js"></script>
+<script src="js/charts.js"></script>
+<script src="js/shell.js"></script>
+<script src="js/stats.js"></script>
+<script src="js/standup.js"></script>
+<script src="js/repositories.js"></script>
+<script src="js/memories.js"></script>
+<script src="js/main.js"></script>
+<!-- scripts:end -->
+</body>
+</html>

@@ -7,7 +7,14 @@ vi.mock("../core/GitOps.js", () => ({
 	execGit: vi.fn(),
 }));
 
+vi.mock("../dashboard/CutoverRouter.js", () => ({
+	// Pre-cutover default (plain fn — survives mock resets).
+	resolveCutoverRoute: async () => ({ state: "uncutover" }),
+}));
+
 vi.mock("../core/RepoProfile.js", () => ({
+	// Pre-cutover default: no fence (plain fn — survives mock resets).
+	readCutoverFence: async () => null,
 	readManualDisableFlag: mockReadManualDisableFlag,
 }));
 

@@ -312,6 +312,24 @@ export function latestAccumulatedQuery(body: string | undefined): string | undef
 }
 
 /**
+ * Every entry timestamp in an accumulating body, as written (ISO-8601 UTC).
+ *
+ * The count is a LOWER BOUND on the calls behind the body, in two ways
+ * {@link mergeAccumulatedBody} makes on purpose: the same query text asked
+ * twice collapses to one entry, and only the newest {@link
+ * ACCUMULATED_BODY_CAP} survive. A caller may say "at least N", never "exactly
+ * N".
+ *
+ * Parsed here rather than by the caller for the reason {@link
+ * latestAccumulatedQuery} states: the regex that reads an entry line belongs
+ * beside the one that writes it.
+ */
+export function accumulatedEntryTimes(body: string | undefined): ReadonlyArray<string> {
+	if (body === undefined) return [];
+	return parseAccumulatedBody(body).entries.map((e) => e.at);
+}
+
+/**
  * {@link latestAccumulatedQuery} gated on the source actually accumulating —
  * `undefined` for every entity-shaped source, whose body is prose rather than an
  * entry list and whose row title already carries the information.

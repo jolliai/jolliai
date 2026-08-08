@@ -13,6 +13,7 @@ import { filterToBranchHeads } from "./HeadEntryFilter.js";
 import { listUserKnowledge } from "./MemoryBankScanner.js";
 import { extractBaseSlug } from "./PlanSlug.js";
 import type { SearchHit } from "./Search.js";
+import { asSqliteStorage } from "./SqliteStorage.js";
 import { collectAllNotesWithHosts, collectAllPlansWithHosts, getDisplayDate } from "./SummaryFormat.js";
 import { buildHit } from "./SummaryProjection.js";
 import {
@@ -21,6 +22,7 @@ import {
 	getSummary,
 	readNoteFromBranch,
 	readPlanFromBranch,
+	resolveStorage,
 } from "./SummaryStore.js";
 import { collectAllTopics, resolveDiffStats } from "./SummaryTree.js";
 
@@ -206,6 +208,14 @@ import { estimateTokens } from "./TokenEstimator.js";
  * is sized for /jolli-search and easily fits in memory.
  */
 export async function listBranchCatalog(cwd?: string): Promise<BranchCatalog> {
+	// Typed path (phase H): heads ARE the parent_hash IS NULL rows, and the
+	// catalog enrichment is one memory_topics query — no index/catalog
+	// documents synthesized per recall.
+	const typed = asSqliteStorage(await resolveStorage(undefined, cwd));
+	if (typed) {
+		const [heads, titlesByHash] = await Promise.all([typed.listHeadEntries(), typed.topicTitlesByHash()]);
+		return buildBranchCatalog(heads as unknown as SummaryIndexEntry[], (hash) => titlesByHash.get(hash) ?? []);
+	}
 	const index = await getIndex(cwd);
 	if (!index) {
 		return { type: "catalog", branches: [] };
@@ -218,16 +228,6 @@ export async function listBranchCatalog(cwd?: string): Promise<BranchCatalog> {
 	// version that has been superseded.
 	const headEntries = filterToBranchHeads(index.entries);
 
-	const branchMap = new Map<string, SummaryIndexEntry[]>();
-	for (const entry of headEntries) {
-		const list = branchMap.get(entry.branch);
-		if (list) {
-			list.push(entry);
-		} else {
-			branchMap.set(entry.branch, [entry]);
-		}
-	}
-
 	// Build hash → topic titles map from catalog.json so we can enrich each
 	// branch entry without N additional file reads.
 	const catalog = await getCatalogWithLazyBuild(cwd);
@@ -239,6 +239,23 @@ export async function listBranchCatalog(cwd?: string): Promise<BranchCatalog> {
 		}
 	}
 
+	return buildBranchCatalog(headEntries, (hash) => titlesByHash.get(hash) ?? []);
+}
+
+/** Shared branch-catalog assembly over head entries + a titles lookup. */
+function buildBranchCatalog(
+	headEntries: ReadonlyArray<SummaryIndexEntry>,
+	titlesFor: (hash: string) => ReadonlyArray<string>,
+): BranchCatalog {
+	const branchMap = new Map<string, SummaryIndexEntry[]>();
+	for (const entry of headEntries) {
+		const list = branchMap.get(entry.branch);
+		if (list) {
+			list.push(entry);
+		} else {
+			branchMap.set(entry.branch, [entry]);
+		}
+	}
 	const branches: BranchCatalogEntry[] = [];
 	for (const [branch, entries] of branchMap) {
 		const sorted = entries.sort(
@@ -249,9 +266,8 @@ export async function listBranchCatalog(cwd?: string): Promise<BranchCatalog> {
 		const seen = new Set<string>();
 		const topicTitles: string[] = [];
 		for (const e of sorted) {
-			const titles = titlesByHash.get(e.commitHash);
-			if (!titles) continue;
-			for (const title of titles) {
+			for (const title of titlesFor(e.commitHash)) {
+				if (title.length === 0) continue;
 				if (!seen.has(title)) {
 					seen.add(title);
 					topicTitles.push(title);
@@ -375,17 +391,24 @@ export const RECALL_LARGE_BRANCH_THRESHOLD = 8;
 export async function compileTaskContext(options: ContextOptions, cwd?: string): Promise<CompiledContext> {
 	const { branch, depth, includePlans = true, includeNotes = includePlans, includeUserKnowledge = true } = options;
 
-	const index = await getIndex(cwd);
-	if (!index) {
-		return emptyContext(branch);
+	// Typed path (phase H): one branch-scoped SELECT over roots instead of a
+	// synthesized index document per recall.
+	const typedStorage = asSqliteStorage(await resolveStorage(undefined, cwd));
+	let headEntries: SummaryIndexEntry[];
+	if (typedStorage) {
+		headEntries = (await typedStorage.listHeadEntries(branch)) as unknown as SummaryIndexEntry[];
+	} else {
+		const index = await getIndex(cwd);
+		if (!index) {
+			return emptyContext(branch);
+		}
+		// Step 1: Filter to v4 Hoist heads (parent==null — see HeadEntryFilter) on
+		// the requested branch. Heads are the live tips of commit history — what
+		// `git log` currently shows — and serve as the narrative anchors for LLM
+		// context. Superseded versions live as children and are excluded so the
+		// model isn't fed multiple variants of the same logical commit.
+		headEntries = [...filterToBranchHeads(index.entries.filter((e) => e.branch === branch))];
 	}
-
-	// Step 1: Filter to v4 Hoist heads (parent==null — see HeadEntryFilter) on
-	// the requested branch. Heads are the live tips of commit history — what
-	// `git log` currently shows — and serve as the narrative anchors for LLM
-	// context. Superseded versions live as children and are excluded so the
-	// model isn't fed multiple variants of the same logical commit.
-	let headEntries = filterToBranchHeads(index.entries.filter((e) => e.branch === branch));
 
 	// Step 2: Sort by activity date (oldest first for narrative).
 	// Uses getDisplayDate so amended old commits surface as recent activity.

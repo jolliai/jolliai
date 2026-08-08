@@ -14,6 +14,7 @@ import type { Command } from "commander";
 import { drainIngest } from "../core/IngestPipeline.js";
 import { appendCredentialMissingRun } from "../core/IngestRunStore.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
+import { OrphanWriteBusyError } from "../core/Locks.js";
 import { compileAllRepos } from "../core/MultiRepoCompile.js";
 import { emptyProcessedSet, saveProcessedSet } from "../core/ProcessedSourceStore.js";
 import { loadConfig } from "../core/SessionTracker.js";
@@ -64,10 +65,20 @@ async function compileSingleRepo(cwd: string, rebuild: boolean): Promise<void> {
 		// transcript-reader/detector graph in. A busy miss throws VaultWriteBusyError
 		// (caught for the rebuild prerequisite below).
 		const { launchWorker } = await import("../hooks/QueueWorker.js");
+		const { withRequiredOrphanWriteLock } = await import("../core/SummaryStore.js");
 		const writeGuard = async (fn: () => Promise<void>): Promise<void> => {
-			const r = await withVaultWriteLock(vaultRoot, { wait: DEFAULT_VAULT_WRITE_WAIT_MS }, fn, {
-				launch: launchWorker,
-			});
+			const r = await withVaultWriteLock(
+				vaultRoot,
+				{ wait: DEFAULT_VAULT_WRITE_WAIT_MS },
+				// Inner orphan-write.lock, matching QueueWorker's ingest guard. Without
+				// it this guard sets no re-entrancy context, so `saveTopicPage` and
+				// `saveTopicIndex` each took and released the orphan lock on their own —
+				// two critical sections where the design requires one. A StopHook holding
+				// the lock between them lands the page and fails the index, which is
+				// exactly the orphaned page recoverable only by `--rebuild`.
+				() => withRequiredOrphanWriteLock(cwd, "compile-write", fn),
+				{ launch: launchWorker },
+			);
 			if (!r.ran) throw new VaultWriteBusyError();
 		};
 
@@ -88,9 +99,26 @@ async function compileSingleRepo(cwd: string, rebuild: boolean): Promise<void> {
 				await writeGuard(async () => {
 					await saveProcessedSet(emptyProcessedSet(), cwd);
 					await saveTopicIndex(emptyTopicIndex(), cwd);
+					// The pages go too, not just the index that lists them.
+					//
+					// Writing an empty index was the whole reset on a file-backed
+					// store, where the index IS a file. It is not on SQLite:
+					// `topics/index.json` there is SYNTHESIZED from `topic_pages` on
+					// every read, so the empty index evaporated the moment anything
+					// read it back, `route` saw every topic as already existing, and
+					// `--rebuild` silently degraded to an ordinary incremental compile
+					// — reporting a rebuild it had not done. Discarding the pages is
+					// what makes the reset mean the same thing on both, and it is what
+					// the flag says it does. Safe to do up front: the summaries these
+					// pages are derived FROM are untouched, so a rebuild that fails
+					// midway is re-runnable.
+					await purgeTopicPagesExcept([], cwd, storage);
 				});
 			} catch (e) {
-				if (e instanceof VaultWriteBusyError) {
+				// Either write lock busy in budget is the same user-facing situation:
+				// somebody else holds it, try again shortly. Only the orphan lock was
+				// missing here, and it escaped as an uncaught stack trace.
+				if (e instanceof VaultWriteBusyError || e instanceof OrphanWriteBusyError) {
 					console.error(
 						"\n  Error: another vault writer (a background worker or sync) is busy — try again shortly.\n",
 					);

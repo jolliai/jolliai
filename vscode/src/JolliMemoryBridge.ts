@@ -36,7 +36,9 @@ import {
 	savePluginSource,
 	saveSquashPending,
 } from "../../cli/src/core/SessionTracker.js";
+import { invalidateSotRouteCache } from "../../cli/src/core/SotStorageResolver.js";
 import { createStorage } from "../../cli/src/core/StorageFactory.js";
+import { recordMemoryEdit } from "../../cli/src/dashboard/ProducerHooks.js";
 import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
 import { resolveLlmCredentialSource } from "../../cli/src/core/LlmClient.js";
 import {
@@ -347,12 +349,19 @@ export class JolliMemoryBridge {
 	 * flip would silently keep reads on the previous mode's storage.
 	 * Entries cache is cleared because `localFolder` changes the
 	 * discoverable set of foreign repos under the Memory Bank parent.
+	 *
+	 * The system-of-record route memo goes too. The extension host is the
+	 * longest-lived process in the product and it never calls
+	 * `setActiveStorage`, so every in-process `cli/src` read resolves through
+	 * that memo; leaving it hot after a storage reload is the same staleness
+	 * this method exists to clear, one layer down.
 	 */
 	reloadStorage(): void {
 		this.storagePromise = null;
 		this.readStoragePromise = null;
 		this.cachedRootEntries = null;
 		this.discoveryCache = null;
+		invalidateSotRouteCache();
 	}
 
 	/**
@@ -2515,6 +2524,12 @@ export class JolliMemoryBridge {
 		const storage = await this.getStorage();
 		const readStorage = await this.getReadStorage();
 		await storeSummary(summary, this.cwd, force, artifacts, storage, readStorage);
+		// The dashboard's `memories` rows are a projection of these files that
+		// only the post-commit worker refreshes; a webview edit (detach a
+		// conversation, remove a plan, delete a topic, regenerate) would otherwise
+		// keep serving the pre-edit memory on the local dashboard forever.
+		// Never throws — see `recordMemoryEdit`.
+		await recordMemoryEdit(this.cwd, [summary.commitHash]);
 	}
 
 	/**

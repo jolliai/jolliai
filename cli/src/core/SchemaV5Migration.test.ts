@@ -42,6 +42,13 @@ vi.mock("./StorageFactory.js", () => ({
 	}),
 }));
 
+// Gate for the pre-migration rollback SHA. Mocked so these cases do not depend
+// on the developer's own cutover state — the real resolver opens the machine's
+// dashboard DB. Default `uncutover`: the branch is the system of record, which
+// is the state the SHA is meaningful in.
+const mockResolveSotBackend = vi.hoisted(() => vi.fn());
+vi.mock("./SotStorageResolver.js", () => ({ resolveSotBackend: mockResolveSotBackend }));
+
 vi.mock("./Locks.js", () => ({
 	acquireOrphanWriteLock: vi.fn().mockResolvedValue(true),
 	releaseOrphanWriteLock: vi.fn().mockResolvedValue(undefined),
@@ -66,6 +73,7 @@ const baseNode = {
 describe("SchemaV5Migration", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		mockResolveSotBackend.mockResolvedValue({ ok: true, state: "uncutover", storage: {} });
 	});
 
 	// ─── upgradeOneSummary (pure unit) ────────────────────────────────────────
@@ -538,6 +546,20 @@ describe("SchemaV5Migration", () => {
 
 			await expect(migrateSchemaToV5()).rejects.toThrow(/orphan-write lock/);
 			expect(mockStorageWriteFiles).not.toHaveBeenCalled();
+		});
+
+		it("does not capture a rollback SHA once the repo is cut over", async () => {
+			// Past the fence this migration rewrites SQLite rows and the branch is
+			// frozen, so resetting the ref would undo nothing while reading as a
+			// documented recovery step. Skipping the rev-parse is the assertion:
+			// a SHA that cannot roll anything back is worse than none.
+			mockResolveSotBackend.mockResolvedValue({ ok: true, state: "cutover", storage: {} });
+			const gitops = await import("./GitOps.js");
+			mockStorageListFiles.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+
+			const result = await migrateSchemaToV5();
+			expect(result.fresh).toBe(true);
+			expect(vi.mocked(gitops.execGit)).not.toHaveBeenCalled();
 		});
 
 		it("tolerates execGit rejection when capturing pre-migration SHA (recovery log is best-effort)", async () => {

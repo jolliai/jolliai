@@ -237,6 +237,15 @@ vi.mock("../../cli/src/core/KBRepoDiscoverer.js", () => ({
 	discoverRepos,
 }));
 
+// createStorage now routes by cutover state; pin these tests to the
+// pre-cutover default so they exercise the dual-write path they always did.
+vi.mock("../../cli/src/dashboard/CutoverRouter.js", () => ({
+	// A plain function, not vi.fn(): this suite resets mock implementations
+	// between tests, which would strip a mockResolvedValue and make the route
+	// resolve to undefined.
+	resolveCutoverRoute: async () => ({ state: "uncutover" }),
+}));
+
 vi.mock("../../cli/src/core/KBPathResolver.js", async (importOriginal) => {
 	const actual =
 		await importOriginal<
@@ -343,6 +352,7 @@ vi.mock("../../cli/src/Logger.js", () => ({
 	})),
 	setLogDir: vi.fn(),
 	isManuallyDisabled: () => false,
+	errMsg: (err: unknown) => (err instanceof Error ? err.message : String(err)),
 }));
 
 vi.mock("./core/PlanService.js", () => ({

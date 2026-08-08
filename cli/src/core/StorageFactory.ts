@@ -1,13 +1,34 @@
 /**
- * StorageFactory — creates the appropriate StorageProvider based on config.
+ * StorageFactory — creates the StorageProvider the CUTOVER STATE dictates.
  *
- * Storage modes:
- * - "orphan" (default): OrphanBranchStorage only
- * - "dual-write": writes to both orphan branch and folder, reads from orphan
- * - "folder": FolderStorage only
+ * `storageMode` is retired (phase D): a residual config value is ignored with
+ * a log line — it was a config-only backdoor that could route writes around
+ * the source of truth ("folder" never wrote the database at all). Routing is
+ * now the four-state cutover table:
+ *
+ * - `uncutover`      → orphan + FolderStorage dual-write (the orphan branch
+ *                       is the source of truth)
+ * - `legacy-fenced`  → SqliteStorage + FolderStorage dual-write: the orphan
+ *                       branch is frozen while the CAS is pending, and writing
+ *                       it would strand data
+ * - `cutover`        → SqliteStorage + FolderStorage dual-write
+ * - `blocked`        → throw: a fenced/cut-over repo whose database is
+ *                       unavailable has NOWHERE safe to write — falling back
+ *                       to orphan is exactly the loss the fence prevents
+ *
+ * DUAL-WRITE IS INVARIANT across all three writable states: one write to the
+ * system of record, one full write to the Memory Bank folder. The cutover only
+ * swaps WHICH backend is the system of record; it never narrows the folder
+ * side. (The folder side is skipped only when the project is not claimable —
+ * a temp dir must not materialize a Memory Bank folder.)
+ *
+ * Neither fenced state is reachable in production until the cutover engine
+ * (D4) starts writing fences, so landing the routing first is safe.
  */
 
 import { join } from "node:path";
+import { resolveCutoverRoute } from "../dashboard/CutoverRouter.js";
+import { resolveRepoIdentityForCwd } from "../dashboard/RepoRegistry.js";
 import { createLogger } from "../Logger.js";
 import { DualWriteStorage } from "./DualWriteStorage.js";
 import { FolderStorage } from "./FolderStorage.js";
@@ -15,6 +36,7 @@ import { extractRepoName, getRemoteUrl, isClaimableProject, resolveKBPath } from
 import { MetadataManager } from "./MetadataManager.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 import { loadConfig } from "./SessionTracker.js";
+import { SqliteStorage } from "./SqliteStorage.js";
 import type { StorageProvider } from "./StorageProvider.js";
 
 const log = createLogger("StorageFactory");
@@ -27,44 +49,54 @@ export async function createStorage(projectPath: string, cwd?: string): Promise<
 		log.warn("Failed to load config, falling back to defaults: %s", (err as Error).message);
 		config = {};
 	}
-	const mode = (config.storageMode as string | undefined) ?? "dual-write";
-	// `localFolder` is the user-configured KB parent directory (set via the
-	// VS Code Settings panel's "Local Folder" input). `resolveKBPath` appends
-	// the repo name as a subfolder, so `localFolder=~/MyKB` puts this repo at
-	// `~/MyKB/<repoName>/`.
+	if (config.storageMode !== undefined) {
+		// Retired key. "folder" users revert to dual-write until this repo cuts
+		// over — acceptable, because folder-only meant the memories were never
+		// in the source of truth to begin with.
+		log.info("ignoring retired storageMode=%s — routing is decided by the cutover state", config.storageMode);
+	}
 	const customKBPath = config.localFolder as string | undefined;
 
-	log.info("StorageFactory.create: storageMode=%s, projectPath=%s", mode, projectPath);
+	const route = await resolveCutoverRoute(projectPath);
+	log.info("StorageFactory.create: route=%s, projectPath=%s", route.state, projectPath);
 
+	if (route.state === "blocked") {
+		throw new Error(
+			`storage unavailable: ${route.reason} — this repo's orphan branch is frozen (cutover), ` +
+				"so writes cannot fall back to it; run 'jolli doctor --recover' or upgrade this surface",
+		);
+	}
+	if (route.state === "legacy-fenced" || route.state === "cutover") {
+		const { identity } = await resolveRepoIdentityForCwd(projectPath);
+		const sqlite = new SqliteStorage(identity);
+		// Dual-write is INVARIANT across the cutover: one write to the system of
+		// record, one full write to the Memory Bank. All the cutover changes is
+		// which backend is the system of record — SQLite here instead of the
+		// orphan branch. The folder side stays identical to the uncutover route,
+		// hidden JSON included, because that layer is what the Memory Bank sync,
+		// the IntelliJ sidebar reader and mirror-based recovery consume. Same
+		// claimable gate as below — a temp dir must not claim a Memory Bank folder.
+		if (isClaimableProject(projectPath, customKBPath)) {
+			return new DualWriteStorage(sqlite, createFolderStorage(projectPath, customKBPath));
+		}
+		return sqlite;
+	}
+
+	// uncutover — today's behavior, orphan branch authoritative.
 	// Write-boundary gate: a non-project cwd (an agent's throwaway temp dir, the
 	// Memory Bank folder itself, a bare `/tmp`) must never claim a folder under
 	// `localFolder`. Degrade to orphan-only instead of materializing junk that
 	// only the user can clean up. See KBPathResolver.isClaimableProject.
-	if (mode !== "orphan" && !isClaimableProject(projectPath, customKBPath)) {
+	if (!isClaimableProject(projectPath, customKBPath)) {
 		log.warn(
-			"Not a claimable project (no git worktree, or inside the Memory Bank folder): %s — using orphan-only storage instead of %s",
+			"Not a claimable project (no git worktree, or inside the Memory Bank folder): %s — using orphan-only storage",
 			projectPath,
-			mode,
 		);
 		return new OrphanBranchStorage(cwd);
 	}
-
-	switch (mode) {
-		case "dual-write": {
-			const orphan = new OrphanBranchStorage(cwd);
-			const folder = createFolderStorage(projectPath, customKBPath);
-			log.info("Storage mode: dual-write (primary=orphan, shadow=folder)");
-			return new DualWriteStorage(orphan, folder);
-		}
-		case "folder": {
-			log.info("Storage mode: folder");
-			return createFolderStorage(projectPath, customKBPath);
-		}
-		default: {
-			log.info("Storage mode: orphan (default)");
-			return new OrphanBranchStorage(cwd);
-		}
-	}
+	const orphan = new OrphanBranchStorage(cwd);
+	const folder = createFolderStorage(projectPath, customKBPath);
+	return new DualWriteStorage(orphan, folder);
 }
 
 /**

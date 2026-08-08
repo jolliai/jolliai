@@ -71,14 +71,26 @@ export async function withSqliteDb<T>(
 }
 
 /**
- * Minimum Node version that ships `node:sqlite`. SQLite-based agent support
- * requires this built-in module; older runtimes cannot load it even if the DB
- * file is present.
+ * Minimum Node version that loads `node:sqlite` **without a flag**. SQLite-based
+ * agent support requires this built-in module; older runtimes cannot load it
+ * even if the DB file is present.
+ *
+ * 22.13, not 22.5: the module first *exists* in 22.5, but 22.5–22.12 require
+ * `--experimental-sqlite` and throw on import without it. Two surfaces cannot
+ * supply that flag — the VS Code extension host (launched by Electron) and the
+ * git-hook dispatchers (`exec node <Hook>.js`, deliberately flag-free so an old
+ * Node cannot fail on an unknown option). Gating on the flag-free floor is what
+ * makes this predicate mean "the import will succeed" on every surface.
+ *
+ * Consequence worth stating: a standalone CLI on 22.5–22.12 that DOES pass the
+ * flag would technically be able to read these stores, and this returns false
+ * there. That is deliberate — the alternative is a predicate that lies on the
+ * hosts we cannot flag. The CLI's `engines` floor is 22.13 for the same reason.
  *
  * Exported for unit tests; callers should use the agent-specific `isInstalled`
  * helper.
  */
-export const NODE_SQLITE_MIN_VERSION = { major: 22, minor: 5 } as const;
+export const NODE_SQLITE_MIN_VERSION = { major: 22, minor: 13 } as const;
 
 /**
  * Returns true when the current runtime can load `node:sqlite`. Compares the

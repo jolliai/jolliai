@@ -13,6 +13,8 @@ vi.mock("../core/SessionTracker.js", () => ({
 }));
 
 vi.mock("../core/RepoProfile.js", () => ({
+	// Pre-cutover default: no fence (plain fn — survives mock resets).
+	readCutoverFence: async () => null,
 	readManualDisableFlag: mockReadManualDisableFlag,
 }));
 

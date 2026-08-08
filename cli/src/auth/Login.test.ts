@@ -622,26 +622,24 @@ describe("Login", () => {
 	});
 
 	it("returns 404 for non-callback paths", async () => {
-		let responseStatus = 0;
-
-		server = createLoginServer({
-			port: 0,
-			jolliUrl: TEST_JOLLI_URL,
-			expectedState: TEST_STATE,
-			onListen() {
-				const addr = server?.address();
-				if (!addr || typeof addr === "string") return;
-				fetch(`http://127.0.0.1:${addr.port}/other`).then((res) => {
-					responseStatus = res.status;
-				});
-			},
-			onSuccess: vi.fn(),
-			onError: vi.fn(),
+		// Await the fetch itself instead of sleeping a fixed 100ms — under a
+		// full-suite coverage run the loopback round-trip regularly exceeds a
+		// fixed budget and the assertion reads a status that never arrived.
+		const status = await new Promise<number>((resolve, reject) => {
+			server = createLoginServer({
+				port: 0,
+				jolliUrl: TEST_JOLLI_URL,
+				expectedState: TEST_STATE,
+				onListen() {
+					const addr = server?.address();
+					if (!addr || typeof addr === "string") return;
+					fetch(`http://127.0.0.1:${addr.port}/other`).then((res) => resolve(res.status), reject);
+				},
+				onSuccess: vi.fn(),
+				onError: vi.fn(),
+			});
 		});
-
-		// Give the request time to complete
-		await new Promise((r) => setTimeout(r, 100));
-		expect(responseStatus).toBe(404);
+		expect(status).toBe(404);
 	});
 
 	it("propagates an exchange failure as the onError reason", async () => {

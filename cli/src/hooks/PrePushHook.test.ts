@@ -13,7 +13,14 @@ const mockReadManualDisableFlag = vi.hoisted(() => vi.fn().mockResolvedValue(fal
 const mockReadPushDisabledState = vi.hoisted(() => vi.fn().mockResolvedValue({ disabled: false }));
 
 vi.mock("../core/SessionTracker.js", () => ({ loadConfig: vi.fn() }));
+vi.mock("../dashboard/CutoverRouter.js", () => ({
+	// Pre-cutover default (plain fn — survives mock resets).
+	resolveCutoverRoute: async () => ({ state: "uncutover" }),
+}));
+
 vi.mock("../core/RepoProfile.js", () => ({
+	// Pre-cutover default: no fence (plain fn — survives mock resets).
+	readCutoverFence: async () => null,
 	readManualDisableFlag: mockReadManualDisableFlag,
 }));
 vi.mock("../core/PushControl.js", () => ({

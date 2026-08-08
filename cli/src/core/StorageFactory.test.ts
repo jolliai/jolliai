@@ -6,6 +6,21 @@ vi.mock("./SessionTracker.js", () => ({
 	loadConfig: vi.fn(),
 }));
 
+vi.mock("../dashboard/CutoverRouter.js", () => ({
+	resolveCutoverRoute: vi.fn().mockResolvedValue({ state: "uncutover" }),
+}));
+
+vi.mock("../dashboard/RepoRegistry.js", () => ({
+	resolveRepoIdentity: vi.fn().mockResolvedValue({ identity: "https://github.com/test/repo.git" }),
+	resolveRepoIdentityForCwd: vi.fn().mockResolvedValue({ identity: "https://github.com/test/repo.git" }),
+}));
+
+vi.mock("./SqliteStorage.js", () => {
+	const SqliteStorage = vi.fn();
+	SqliteStorage.prototype.type = "sqlite";
+	return { SqliteStorage };
+});
+
 vi.mock("./KBPathResolver.js", () => ({
 	extractRepoName: vi.fn().mockReturnValue("test-repo"),
 	getRemoteUrl: vi.fn().mockReturnValue("https://github.com/test/repo.git"),
@@ -43,11 +58,13 @@ vi.mock("./DualWriteStorage.js", () => {
 vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 
+import { resolveCutoverRoute } from "../dashboard/CutoverRouter.js";
 import { DualWriteStorage } from "./DualWriteStorage.js";
 import { FolderStorage } from "./FolderStorage.js";
 import { MetadataManager } from "./MetadataManager.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
 import { loadConfig } from "./SessionTracker.js";
+import { SqliteStorage } from "./SqliteStorage.js";
 import { createFolderStorageAtRoot, createStorage } from "./StorageFactory.js";
 
 const mockLoadConfig = vi.mocked(loadConfig);
@@ -55,6 +72,7 @@ const mockLoadConfig = vi.mocked(loadConfig);
 describe("StorageFactory", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		vi.mocked(resolveCutoverRoute).mockResolvedValue({ state: "uncutover" });
 	});
 
 	it("returns DualWriteStorage when no storageMode is configured (default)", async () => {
@@ -66,28 +84,64 @@ describe("StorageFactory", () => {
 		expect((storage as unknown as Record<string, unknown>).type).toBe("dual-write");
 	});
 
-	it('returns OrphanBranchStorage when storageMode is "orphan"', async () => {
-		// `storageMode` is read off the config via a cast in StorageFactory.ts;
-		// the type doesn't declare the field but the implementation tolerates it.
-		mockLoadConfig.mockResolvedValue({ storageMode: "orphan" } as unknown as Awaited<
-			ReturnType<typeof loadConfig>
-		>);
-
-		const storage = await createStorage("/project/path");
-
-		expect(OrphanBranchStorage).toHaveBeenCalledOnce();
-		expect((storage as unknown as Record<string, unknown>).type).toBe("orphan");
+	it("ignores a residual storageMode — the key is retired, routing decides", async () => {
+		// "orphan" and "folder" both revert to the uncutover default
+		// (dual-write) until this repo cuts over; folder-only meant the
+		// memories were never in the source of truth anyway.
+		for (const residual of ["orphan", "folder"]) {
+			vi.clearAllMocks();
+			vi.mocked(resolveCutoverRoute).mockResolvedValue({ state: "uncutover" });
+			mockLoadConfig.mockResolvedValue({ storageMode: residual } as unknown as Awaited<
+				ReturnType<typeof loadConfig>
+			>);
+			const storage = await createStorage("/project/path");
+			expect((storage as unknown as Record<string, unknown>).type).toBe("dual-write");
+		}
 	});
 
-	it('returns FolderStorage when storageMode is "folder"', async () => {
-		mockLoadConfig.mockResolvedValue({ storageMode: "folder" } as unknown as Awaited<
-			ReturnType<typeof loadConfig>
-		>);
+	it("routes legacy-fenced and cutover to SqliteStorage + the visible-layer renderer", async () => {
+		for (const state of ["legacy-fenced", "cutover"] as const) {
+			vi.clearAllMocks();
+			vi.mocked(resolveCutoverRoute).mockResolvedValue(
+				state === "cutover"
+					? { state, record: { tips: {}, cutoverVersion: 1, committedAt: "t", schemaVersion: 1 } }
+					: { state },
+			);
+			mockLoadConfig.mockResolvedValue({});
+			const kbResolver = await import("./KBPathResolver.js");
+			(kbResolver.isClaimableProject as ReturnType<typeof vi.fn>).mockReturnValue(true);
+			const storage = await createStorage("/project/path");
+			expect(SqliteStorage).toHaveBeenCalledWith("https://github.com/test/repo.git");
+			// Dual-write is invariant across the cutover: the folder side is the
+			// SAME full FolderStorage the uncutover route builds (hidden JSON
+			// included — the layer sync, the IntelliJ reader and mirror recovery
+			// consume), only the system of record changed. The frozen branch is
+			// never touched.
+			expect((storage as unknown as Record<string, unknown>).type).toBe("dual-write");
+			expect(FolderStorage).toHaveBeenCalledWith(expect.anything(), expect.anything());
+			expect(OrphanBranchStorage).not.toHaveBeenCalled();
+		}
+	});
 
-		const storage = await createStorage("/project/path");
+	it("fenced route without a claimable project stays SqliteStorage-only", async () => {
+		vi.mocked(resolveCutoverRoute).mockResolvedValue({ state: "legacy-fenced" });
+		mockLoadConfig.mockResolvedValue({});
+		const kbResolver = await import("./KBPathResolver.js");
+		(kbResolver.isClaimableProject as ReturnType<typeof vi.fn>).mockReturnValue(false);
+		try {
+			const storage = await createStorage("/var/folders/xx/jolli-localagent-abc123");
+			expect((storage as unknown as Record<string, unknown>).type).toBe("sqlite");
+			expect(kbResolver.resolveKBPath).not.toHaveBeenCalled();
+		} finally {
+			(kbResolver.isClaimableProject as ReturnType<typeof vi.fn>).mockReturnValue(true);
+		}
+	});
 
-		expect(FolderStorage).toHaveBeenCalledOnce();
-		expect((storage as unknown as Record<string, unknown>).type).toBe("folder");
+	it("throws on blocked — a fenced repo with no database has nowhere safe to write", async () => {
+		vi.mocked(resolveCutoverRoute).mockResolvedValue({ state: "blocked", reason: "database file does not exist" });
+		mockLoadConfig.mockResolvedValue({});
+		await expect(createStorage("/project/path")).rejects.toThrow(/doctor --recover/);
+		expect(OrphanBranchStorage).not.toHaveBeenCalled();
 	});
 
 	it("resolves the KB path via resolveKBPath (which claims identity internally)", async () => {
@@ -96,9 +150,7 @@ describe("StorageFactory", () => {
 		// `.jolli/config.json`. StorageFactory no longer needs an explicit
 		// follow-up `initializeKBFolder` call; verifying `resolveKBPath` is
 		// invoked with the repo identity is what pins this contract.
-		mockLoadConfig.mockResolvedValue({ storageMode: "folder" } as unknown as Awaited<
-			ReturnType<typeof loadConfig>
-		>);
+		mockLoadConfig.mockResolvedValue({});
 		const kbResolver = await import("./KBPathResolver.js");
 		(kbResolver.resolveKBPath as ReturnType<typeof vi.fn>).mockClear();
 
@@ -142,9 +194,7 @@ describe("StorageFactory", () => {
 		}
 
 		it("returns OrphanBranchStorage instead of DualWriteStorage", async () => {
-			mockLoadConfig.mockResolvedValue({ storageMode: "dual-write" } as unknown as Awaited<
-				ReturnType<typeof loadConfig>
-			>);
+			mockLoadConfig.mockResolvedValue({});
 			const kbResolver = await withUnclaimable();
 
 			const storage = await createStorage("/var/folders/xx/jolli-localagent-abc123");
@@ -157,35 +207,19 @@ describe("StorageFactory", () => {
 			expect(FolderStorage).not.toHaveBeenCalled();
 		});
 
-		it("returns OrphanBranchStorage instead of folder-only FolderStorage", async () => {
-			mockLoadConfig.mockResolvedValue({ storageMode: "folder" } as unknown as Awaited<
-				ReturnType<typeof loadConfig>
-			>);
-			const kbResolver = await withUnclaimable();
-
-			const storage = await createStorage("/var/folders/xx/jolli-localagent-abc123");
-
-			expect((storage as unknown as Record<string, unknown>).type).toBe("orphan");
-			expect(kbResolver.resolveKBPath).not.toHaveBeenCalled();
-		});
-
-		it('does not consult the gate at all in "orphan" mode', async () => {
-			// Orphan mode never touches the Memory Bank folder, so the git
-			// subprocess the gate runs would be pure overhead on that path.
-			mockLoadConfig.mockResolvedValue({ storageMode: "orphan" } as unknown as Awaited<
-				ReturnType<typeof loadConfig>
-			>);
+		it("consults the gate on the SQLite routes before pairing the renderer", async () => {
+			vi.mocked(resolveCutoverRoute).mockResolvedValue({ state: "legacy-fenced" });
+			mockLoadConfig.mockResolvedValue({});
 			const kbResolver = await import("./KBPathResolver.js");
 			(kbResolver.isClaimableProject as ReturnType<typeof vi.fn>).mockClear();
 
 			await createStorage("/project/path");
 
-			expect(kbResolver.isClaimableProject).not.toHaveBeenCalled();
+			expect(kbResolver.isClaimableProject).toHaveBeenCalled();
 		});
 
 		it("passes the configured localFolder to the gate so the nested-bank case is detectable", async () => {
 			mockLoadConfig.mockResolvedValue({
-				storageMode: "dual-write",
 				localFolder: "/Users/me/Documents/bank",
 			} as unknown as Awaited<ReturnType<typeof loadConfig>>);
 			const kbResolver = await import("./KBPathResolver.js");
