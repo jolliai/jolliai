@@ -1,5 +1,7 @@
-import { posix as pathPosix, win32 as pathWin32 } from "node:path";
+import { writeFileSync } from "node:fs";
+import { join, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { createLocalAgentCwd, LOCAL_AGENT_CHILD_ENV } from "../AgentReentry.js";
+import { truncate } from "../references/RenderUtils.js";
 import { isPresent, resolveExecutable } from "./ExecutableResolver.js";
 import {
 	type Invocation,
@@ -41,7 +43,54 @@ import {
  *    `{"role":"meta",…}` resume-hint line we ignore — so `parseResult` recovers
  *    exactly the assistant text, Codex-style. Token/cost accounting is not carried
  *    in that stream, so it is reported as zero (the same gap OpenCode/Cursor have).
+ *
+ * 3. **Two prompt-delivery channels, chosen by size.** kimi exposes no stdin
+ *    (`-p -` treats `-` as a literal prompt) and no `--prompt-file`, so a small
+ *    prompt is passed as the `--prompt` argv value. But the `summarize` prompt is
+ *    ~400 KB worst case (150 KB diff + 150 KB conversation + plans + notes + refs
+ *    + ~21 KB template), which blows the Windows ~32,767-char `CreateProcess`
+ *    command-line limit → `spawn ENAMETOOLONG`, and the summary silently fails
+ *    while the short `commit-message` prompt succeeds. So above
+ *    {@link KIMI_ARGV_PROMPT_BUDGET} the body moves into a `--agent-file` (a
+ *    Markdown agent definition, which REQUIRES YAML frontmatter — see
+ *    {@link KIMI_AGENT_FRONTMATTER}) and `--prompt` keeps only a short directive.
+ *    Verified against kimi 0.34.0: `--agent-file` injects the whole file into the
+ *    model's context (NOT subject to the 50 KB tool-output cap that a `Read` would
+ *    hit) and carries 600 KB+ comfortably. Small calls (`commit-message`, route,
+ *    reconcile) keep the proven argv path unchanged, so the regression surface is
+ *    just the large-prompt branch. As a final backstop the body is truncated to
+ *    {@link KIMI_AGENT_FILE_BUDGET} so a pathological prompt degrades instead of
+ *    exceeding the model's context. `parseResult` is unchanged: `--agent-file`
+ *    produces no tool calls, just the same `{"role":"assistant",…}` line.
  */
+
+/** Max prompt length passed on the argv. Below the Windows 32,767 CreateProcess
+ *  limit with headroom for the rest of the command line; larger prompts route to
+ *  the `--agent-file` channel instead of failing with `spawn ENAMETOOLONG`. */
+const KIMI_ARGV_PROMPT_BUDGET = 24_000;
+
+/** Backstop cap on the body written to the agent file. `--agent-file` was verified
+ *  to carry 600 KB+ (worst-case summarize prompt is ~400 KB), so this only guards a
+ *  pathological input from overrunning the model context — it virtually never fires. */
+const KIMI_AGENT_FILE_BUDGET = 1_000_000;
+
+/** The agent-file name. Deliberately NOT `AGENTS.md`/`CLAUDE.md`, which kimi would
+ *  auto-discover from the cwd (the reason the run uses a fresh empty cwd). */
+const KIMI_CONTEXT_FILE = "jolli-context.md";
+
+/** `--agent-file` rejects a file with no YAML frontmatter ("Missing frontmatter"),
+ *  so the body is prefixed with this minimal block. The name/description are inert —
+ *  the file is loaded explicitly by path, never auto-discovered. */
+const KIMI_AGENT_FRONTMATTER = [
+	"---",
+	"name: jolli-task",
+	"description: Full task context for this run; follow the instructions it contains.",
+	"---",
+].join("\n");
+
+/** The `--prompt` value in file mode: the real instructions live in the agent file. */
+const KIMI_FILE_MODE_PROMPT =
+	"Follow the instructions in your agent definition and output only what they ask for — no preamble, no commentary.";
 
 /**
  * Install locations to check directly, for when `kimi` is not on the search PATH.
@@ -90,8 +139,8 @@ export class KimiCodeBackend implements LocalAgentBackend {
 		const cwd = createLocalAgentCwd();
 		// kimi prompt mode has no separate system-prompt flag, so it is prepended to
 		// the user prompt — same as Codex / Cursor / OpenCode.
-		const prompt = req.systemPrompt ? `${req.systemPrompt}\n\n${req.prompt}` : req.prompt;
-		const args = [
+		const full = req.systemPrompt ? `${req.systemPrompt}\n\n${req.prompt}` : req.prompt;
+		const baseArgs = [
 			...(exe.launchArgs ?? []), // interpreter args when `exe.file` is a launcher, not the CLI itself
 			// `--model` (= -m) is honored only when set; non-claude tools pass an empty
 			// model, so kimi then falls back to its own `default_model` from config.toml.
@@ -100,12 +149,20 @@ export class KimiCodeBackend implements LocalAgentBackend {
 			// resume-session trailer — see the header). parseResult reads the assistant line.
 			"--output-format",
 			"stream-json",
-			// `--prompt` (= -p): run one prompt non-interactively. Must be last — its
-			// value is the prompt.
-			"--prompt",
-			prompt,
 		];
-		// The prompt is the value of --prompt, not stdin.
+
+		// Small prompts stay on the argv (the proven path). Above the budget the body
+		// would blow the Windows command-line limit (`spawn ENAMETOOLONG`), so it moves
+		// into a `--agent-file` and `--prompt` keeps only a short directive. See header §3.
+		if (full.length <= KIMI_ARGV_PROMPT_BUDGET) {
+			// `--prompt` (= -p): one non-interactive turn; its value is the prompt (not stdin).
+			return { file: exe.file, args: [...baseArgs, "--prompt", full], stdin: "", env, cwd };
+		}
+		const contextPath = join(cwd, KIMI_CONTEXT_FILE);
+		// Synchronous write, matching createLocalAgentCwd's own sync style; the run's
+		// cwd is rmSync'd in LlmClient's finally, so no separate cleanup is needed.
+		writeFileSync(contextPath, `${KIMI_AGENT_FRONTMATTER}\n${truncate(full, KIMI_AGENT_FILE_BUDGET)}`, "utf-8");
+		const args = [...baseArgs, "--agent-file", contextPath, "--prompt", KIMI_FILE_MODE_PROMPT];
 		return { file: exe.file, args, stdin: "", env, cwd };
 	}
 

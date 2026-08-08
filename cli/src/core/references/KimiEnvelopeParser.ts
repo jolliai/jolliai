@@ -33,10 +33,13 @@
  * permalink map passed to the shared normalizer is always EMPTY; a Slack
  * reference still gets its URL from `opts.slackWorkspaceUrl` when configured.
  *
- * Cursor semantics are the simple form: an MCP `tool.call` whose result has not
- * yet appeared in this scan window rewinds the cursor to that call's line, so the
- * next pass re-reads from there and can correlate it (re-scan is idempotent via
- * the shared dedupe + upsert-by-mapKey). Every other call advances to EOF.
+ * Cursor semantics: an MCP `tool.call` in the TRAILING suffix (after the last
+ * paired result) whose result has not yet appeared rewinds the cursor to that
+ * call's line, so the next pass re-reads from there and can correlate it (re-scan
+ * is idempotent via the shared dedupe + upsert-by-mapKey). The rewind is scoped to
+ * that suffix, NOT the global-minimum unpaired call: an earlier call that never
+ * gets a result (tool cancelled, session killed) sits before the last paired
+ * result and must not pin the cursor. Every other case advances to EOF.
  */
 
 import { createLogger } from "../../Logger.js";
@@ -74,6 +77,12 @@ class KimiEnvelopeParser implements TranscriptEnvelopeParser {
 		const pending = new Map<string, PendingCall>();
 		const results: NormalizedToolResult[] = [];
 		let lastConsumed = fromLine;
+		// 0-based line index of the last tool.result that paired with a pending call.
+		// The cursor rewind below is scoped to calls AFTER this line, so a call that
+		// never gets a result (tool cancelled, session killed) sitting BEFORE a later
+		// paired result cannot pin the cursor forever — mirrors ClaudeEnvelopeParser's
+		// `lastResultLineIndex` scoping (a bug it documents having fixed).
+		let lastResultLineIndex = fromLine - 1;
 
 		for (let i = fromLine; i < lines.length; i++) {
 			const line = lines[i];
@@ -120,6 +129,8 @@ class KimiEnvelopeParser implements TranscriptEnvelopeParser {
 				if (toolCallId === undefined) continue;
 				const call = pending.get(toolCallId);
 				if (call === undefined) continue;
+				// A result for a tracked call landed at line i: this is the tail boundary.
+				lastResultLineIndex = i;
 				// Drop a result past the cutoff, but delete the pending entry first so it
 				// does not pin the cursor as an in-flight call forever.
 				if (afterCutoff(timestamp, opts.beforeTimestamp)) {
@@ -132,13 +143,21 @@ class KimiEnvelopeParser implements TranscriptEnvelopeParser {
 					pending.delete(toolCallId);
 					continue;
 				}
-				const business = tryParse(output);
+				let business = tryParse(output);
 				if (business === null) {
-					// A non-JSON output cannot be normalised. Dropping is safe — the call
-					// has been answered, so deleting the pending entry lets the cursor
-					// advance past it rather than treating it as in-flight.
-					pending.delete(toolCallId);
-					continue;
+					// An arguments-derived source (context7) returns PROSE, not JSON — its
+					// reference is built from the tool INPUT, so an unparseable result is
+					// expected. Hand the normalizer an empty payload rather than dropping it
+					// (mirrors ClaudeEnvelopeParser / CodexEnvelopeParser); without this every
+					// context7 reference from Kimi is silently lost. Every other source
+					// genuinely needs its payload, so those still drop. Either way the call
+					// has been answered, so the pending entry is removed and the cursor advances.
+					if (call.def.argumentsDerived === true) {
+						business = {};
+					} else {
+						pending.delete(toolCallId);
+						continue;
+					}
 				}
 				const payload = normalizeMcpBusiness(call.def, call.toolName, call.args, business, {
 					permalinks: EMPTY_PERMALINKS,
@@ -159,14 +178,22 @@ class KimiEnvelopeParser implements TranscriptEnvelopeParser {
 		// Emit in transcript line order so the shared dedupe's tie-break is stable.
 		results.sort((a, b) => a.lineNumber - b.lineNumber);
 
-		// Hold the cursor before the earliest MCP call whose result never appeared in
-		// this window (an in-flight fetch, or a tail flushed mid-pair): advancing past
-		// it would strand its result next pass. Every answered call has been deleted
-		// from `pending`, so whatever remains is genuinely unpaired.
+		// Hold the cursor before the earliest unpaired MCP call in the TRAILING suffix —
+		// after the last paired result (an in-flight fetch, or a tail flushed mid-pair):
+		// advancing past it would strand its result next pass. Scoping to
+		// `> lastResultLineIndex` (not the global minimum) is load-bearing: an earlier
+		// call that never gets a result (tool cancelled, session killed) sits before the
+		// last paired result and must NOT drag the cursor back — otherwise it pins the
+		// cursor forever and the whole tail is re-scanned every tick. Same fix, and same
+		// rationale, as ClaudeEnvelopeParser's tail-rewind.
 		let safeCursor = lastConsumed;
+		let earliestTailUnpaired = Number.POSITIVE_INFINITY;
 		for (const call of pending.values()) {
-			if (call.lineIndex < safeCursor) safeCursor = call.lineIndex;
+			if (call.lineIndex > lastResultLineIndex && call.lineIndex < earliestTailUnpaired) {
+				earliestTailUnpaired = call.lineIndex;
+			}
 		}
+		if (earliestTailUnpaired !== Number.POSITIVE_INFINITY) safeCursor = earliestTailUnpaired;
 		return { results, lastLineNumberScanned: safeCursor };
 	}
 }

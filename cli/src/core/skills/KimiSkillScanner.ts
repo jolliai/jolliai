@@ -65,6 +65,11 @@ export function scanKimiSkillLines(lines: ReadonlyArray<string>, fromLine: numbe
 	/** Preserves first-seen order of skill entries; grouping happens at assemble time. */
 	const entries: PendingSkill[] = [];
 	let lastLine = fromLine;
+	// 1-based line of the last Skill result that paired with a pending call. The
+	// cursor rewind below is scoped to unpaired calls AFTER this line, so an earlier
+	// call that never gets a result (cancelled tool, killed session) cannot pin the
+	// cursor forever — same scoping (and same past bug) as ClaudeEnvelopeParser.
+	let lastResultLine = fromLine;
 
 	for (let i = fromLine; i < lines.length; i++) {
 		lastLine = i + 1;
@@ -113,6 +118,7 @@ export function scanKimiSkillLines(lines: ReadonlyArray<string>, fromLine: numbe
 			const result = isRecord(event.result) ? event.result : undefined;
 			entry.ok = result?.isError !== true;
 			entry.sawResult = true;
+			lastResultLine = i + 1; // tail boundary: a result paired at this line
 		}
 	}
 
@@ -123,7 +129,12 @@ export function scanKimiSkillLines(lines: ReadonlyArray<string>, fromLine: numbe
 	// KimiEnvelopeParser. Entries with no toolCallId can never be paired, so they never pin it.
 	let firstUnresolvedLine = Number.POSITIVE_INFINITY;
 	for (const entry of pending.values()) {
-		if (!entry.sawResult && entry.line < firstUnresolvedLine) firstUnresolvedLine = entry.line;
+		// Only unpaired calls in the TRAILING suffix (after the last paired result) hold
+		// the cursor; an earlier abandoned call sits before `lastResultLine` and must not
+		// drag it back, or it pins the cursor forever and the tail re-scans every tick.
+		if (!entry.sawResult && entry.line > lastResultLine && entry.line < firstUnresolvedLine) {
+			firstUnresolvedLine = entry.line;
+		}
 	}
 	const cursorLine = firstUnresolvedLine === Number.POSITIVE_INFINITY ? lastLine : firstUnresolvedLine - 1;
 

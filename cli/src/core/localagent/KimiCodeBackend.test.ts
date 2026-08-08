@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import * as resolver from "./ExecutableResolver.js";
@@ -73,6 +73,45 @@ describe("KimiCodeBackend", () => {
 			{ prompt: "hi", model: "", systemPrompt: "" },
 		);
 		expect(inv.args).toEqual(["cli.js", "--output-format", "stream-json", "--prompt", "hi"]);
+	});
+
+	it("routes a large prompt to --agent-file with frontmatter, keeping the body off the argv", () => {
+		// > KIMI_ARGV_PROMPT_BUDGET (24_000): the argv path would blow the Windows
+		// command-line limit (spawn ENAMETOOLONG), so the body moves into --agent-file.
+		const bigPrompt = "D".repeat(30_000);
+		const inv = b.buildInvocation(
+			{ file: "kimi", version: "0.1" },
+			{ prompt: bigPrompt, model: "kimi-k3", systemPrompt: "sys" },
+		);
+		try {
+			// The body is NOT on the argv; --agent-file points at jolli-context.md in the run cwd.
+			expect(inv.args).not.toContain(bigPrompt);
+			const contextPath = inv.args[inv.args.indexOf("--agent-file") + 1];
+			expect(contextPath).toBe(join(inv.cwd, "jolli-context.md"));
+			// --prompt carries only the short directive, not the body.
+			const promptValue = inv.args[inv.args.lastIndexOf("--prompt") + 1];
+			expect(promptValue).not.toContain("DDDD");
+			expect(promptValue.length).toBeLessThan(200);
+			// The file holds YAML frontmatter (required by --agent-file) + system+prompt body.
+			const written = readFileSync(contextPath, "utf8");
+			expect(written.startsWith("---\nname: jolli-task")).toBe(true);
+			expect(written).toContain(`sys\n\n${bigPrompt}`);
+			expect(inv.stdin).toBe("");
+			expect(inv.args.slice(0, 2)).toEqual(["--model", "kimi-k3"]); // model still honored
+		} finally {
+			rmSync(inv.cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("truncates a pathologically large body to the agent-file budget", () => {
+		const huge = "Z".repeat(1_000_050); // > KIMI_AGENT_FILE_BUDGET (1_000_000)
+		const inv = b.buildInvocation({ file: "kimi", version: "0.1" }, { prompt: huge, model: "", systemPrompt: "" });
+		try {
+			const contextPath = inv.args[inv.args.indexOf("--agent-file") + 1];
+			expect(readFileSync(contextPath, "utf8")).toContain("…[truncated,");
+		} finally {
+			rmSync(inv.cwd, { recursive: true, force: true });
+		}
 	});
 });
 

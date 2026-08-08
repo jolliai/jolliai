@@ -62,7 +62,10 @@ export const CHARS_PER_TOKEN = 3;
  *  ~128 KiB (MAX_ARG_STRLEN); items (up to this budget) + diff can exceed that and
  *  the spawn fails with E2BIG → caught → keepAll (a safe fallback, identical to the
  *  pre-ranking local-agent behavior). The robust fix (feed the prompt via stdin like
- *  ClaudeCodeBackend, or a local-agent-specific smaller budget) is deferred. */
+ *  ClaudeCodeBackend, or a local-agent-specific smaller budget) is deferred for those
+ *  three. `kimi` was a fourth argv backend but no longer belongs here: above a 24 KB
+ *  budget KimiCodeBackend routes the body to a `--agent-file` (see its header §3), so
+ *  it does not hit the argv limit even for the worst-case ~400 KB summarize prompt. */
 export const TOTAL_ITEMS_CHAR_BUDGET = 160_000;
 
 /** Character budget for the diff body embedded in the <change> block. The diff

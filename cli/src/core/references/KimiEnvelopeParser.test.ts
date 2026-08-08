@@ -144,6 +144,40 @@ describe("KimiEnvelopeParser MCP correlation", () => {
 		expect(kimiEnvelopeParser.parse(lines, {}).results).toEqual([]);
 	});
 
+	it("keeps a context7 reference whose result is prose (arguments-derived escape hatch)", () => {
+		// context7's query-docs returns markdown prose, not JSON. Because context7 is
+		// argumentsDerived, an unparseable output must NOT drop — the reference is built
+		// from the tool ARGS (libraryId/query). Mirrors Claude/Codex; without the escape
+		// hatch every context7 reference from Kimi is silently lost.
+		const lines = [
+			toolCall(
+				"c1",
+				"mcp__context7__query-docs",
+				{ libraryId: "/vercel/next.js", query: "routing" },
+				1_700_000_000_000,
+			),
+			toolResult("c1", "Here are the Next.js routing docs…\n(markdown prose, not JSON)", 1_700_000_000_100),
+		];
+		const { results } = kimiEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("context7");
+		expect(results[0].payload).toEqual({ libraryId: "/vercel/next.js", query: "routing" });
+	});
+
+	it("does not let an earlier abandoned call pin the cursor once a later call is paired", () => {
+		const payload = { number: 9, title: "t", url: "https://github.com/o/r/issues/9" };
+		const lines = [
+			toolCall("c1", "mcp__github__get_issue", { number: 8 }, 1_700_000_000_000), // line 0: abandoned, no result
+			toolCall("c2", "mcp__github__get_issue", { number: 9 }, 1_700_000_000_100), // line 1
+			toolResult("c2", payload, 1_700_000_000_200), // line 2: pairs c2 → tail boundary
+		];
+		const { results, lastLineNumberScanned } = kimiEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		// c1 (line 0) is BEFORE the last paired result (line 2), so it must NOT pin the
+		// cursor: it advances to EOF (3) instead of rewinding to 0.
+		expect(lastLineNumberScanned).toBe(3);
+	});
+
 	it("rewinds the cursor to an in-flight call whose result has not landed yet", () => {
 		const lines = [
 			toolCall("c1", "mcp__github__get_issue", { number: 1 }, 1_700_000_000_000), // line index 0, no result

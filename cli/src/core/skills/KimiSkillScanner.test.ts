@@ -161,6 +161,17 @@ describe("scanKimiSkillLines", () => {
 		expect(scanKimiSkillLines(lines, 0).lastLine).toBe(2);
 	});
 
+	it("does not let an earlier abandoned Skill call pin the cursor once a later one is paired", () => {
+		const lines = [
+			toolCall("c1", "Skill", { skill: "abandoned" }, 1_700_000_000_000), // line 0: no result
+			toolCall("c2", "Skill", { skill: "done" }, 1_700_000_000_100), // line 1
+			toolResult("c2", { output: "ok" }, 1_700_000_000_200), // line 2: pairs c2 → tail boundary
+		];
+		// c1 (1-based line 1) precedes the paired result → not in the trailing suffix, so it
+		// must NOT pin the cursor; it advances to EOF (3) rather than rewinding to 0.
+		expect(scanKimiSkillLines(lines, 0).lastLine).toBe(3);
+	});
+
 	it("uses an empty `at` when the Skill call carries no numeric time", () => {
 		const noTime = JSON.stringify({
 			type: "context.append_loop_event",

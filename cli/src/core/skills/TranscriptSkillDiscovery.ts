@@ -23,7 +23,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { createLogger } from "../../Logger.js";
-import type { TranscriptSource } from "../../Types.js";
+import type { SkillSource, TranscriptSource } from "../../Types.js";
 import { loadExtractorCursorLine, saveExtractorCursor, upsertSkillEntry } from "../SessionTracker.js";
 import { attributeSkillUsage } from "./SkillAttribution.js";
 import { getSkillScanner } from "./SkillTranscriptScanner.js";
@@ -108,7 +108,12 @@ export async function scanSkillsFrom(
 	// Codex reports no usage (its capture is heuristic), so the key below is never
 	// attached — the field is only set when `usage` is present. If Codex ever gains
 	// usage, resolve its real session id here first, or detach will fail to match.
-	const sessionKey = `${scanner.source}:${basename(transcriptPath).replace(/\.jsonl$/, "")}`;
+	//
+	// Kimi is worse: its file basename is ALWAYS "wire" (the identity lives in the
+	// session directory, not the filename), so every Kimi session would collide on
+	// `kimi:wire`. `sessionStemFor` resolves the real id from the path for it. Also
+	// dormant today (Kimi reports no usage), fixed here so it stays correct if it does.
+	const sessionKey = `${scanner.source}:${sessionStemFor(scanner.source, transcriptPath)}`;
 
 	for (const use of all) {
 		const usage = usageBySkill.get(use.skill);
@@ -123,6 +128,18 @@ export async function scanSkillsFrom(
 
 	if (all.length > 0) log.info("Persisted %d skill(s) from %s", all.length, basename(transcriptPath));
 	return lastLine;
+}
+
+/**
+ * Session-id stem for the `<source>:<sessionId>` key. Every source names its
+ * transcript file after the session id EXCEPT Kimi, whose transcript is always
+ * `.../sessions/<workDirKey>/<sessionId>/agents/main/wire.jsonl` — the basename is
+ * the constant "wire", so the id has to come from the session directory (three
+ * levels up) instead, or all Kimi sessions collide on `kimi:wire`.
+ */
+function sessionStemFor(source: SkillSource, transcriptPath: string): string {
+	if (source === "kimi") return basename(dirname(dirname(dirname(transcriptPath))));
+	return basename(transcriptPath).replace(/\.jsonl$/, "");
 }
 
 /** Read a transcript's lines, or undefined when it cannot be read. */
