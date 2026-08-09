@@ -50,12 +50,20 @@ export interface DashboardOptions {
 export interface DashboardDeps {
 	readonly configDir?: string;
 	readonly dbPath?: string;
-	readonly spawnServer?: (port: number | undefined) => void;
+	/**
+	 * Spawns the detached server. `cwd` is the launcher's resolved repo directory
+	 * (`--cwd` or the process cwd): the child runs there so its telemetry buffer
+	 * lands under that repo's `.jolli` rather than wherever the launcher happened
+	 * to be invoked from.
+	 */
+	readonly spawnServer?: (port: number | undefined, cwd: string) => void;
 	readonly openBrowser?: (url: string) => Promise<void>;
 	readonly fetchHealth?: (port: number) => Promise<{ ok: boolean; pid?: number }>;
 	readonly killPid?: (pid: number) => boolean;
 	readonly now?: () => number;
 	readonly sleep?: (ms: number) => Promise<void>;
+	/** Launcher's resolved repo directory, threaded to {@link spawnServer}. Defaults to `process.cwd()`. */
+	readonly cwd?: string;
 }
 
 /* v8 ignore start -- default seams do real process/network/browser work; tests inject fakes */
@@ -73,7 +81,7 @@ async function defaultFetchHealth(port: number): Promise<{ ok: boolean; pid?: nu
 	}
 }
 
-function defaultSpawnServer(port: number | undefined): void {
+function defaultSpawnServer(port: number | undefined, cwd: string): void {
 	// Resolve the entry by directory + filename, not import.meta.url alone —
 	// same rationale as QueueWorker.launchWorker: this function gets inlined
 	// into whichever bundle imports it, and the sibling file is the contract.
@@ -87,6 +95,10 @@ function defaultSpawnServer(port: number | undefined): void {
 	const child = spawnHidden(process.execPath, [scriptPath], {
 		detached: true,
 		stdio: "ignore",
+		// Run the server in the launcher's resolved repo dir so its telemetry
+		// buffer (ServerTelemetry uses process.cwd()) lands under that repo's
+		// `.jolli`, not wherever `jolli dashboard` was invoked from.
+		cwd,
 		env: {
 			...process.env,
 			...(port !== undefined ? { JOLLI_DASHBOARD_PORT: String(port) } : {}),
@@ -133,7 +145,7 @@ function resolveSeams(deps: DashboardDeps): ResolvedSeams {
 /** {@link DashboardDeps} with every optional seam filled in. */
 interface ResolvedSeams {
 	readonly configDir: string;
-	readonly spawnServer: (port: number | undefined) => void;
+	readonly spawnServer: (port: number | undefined, cwd: string) => void;
 	readonly openBrowser: (url: string) => Promise<void>;
 	readonly fetchHealth: (port: number) => Promise<{ ok: boolean; pid?: number }>;
 	readonly killPid: (pid: number) => boolean;
@@ -265,7 +277,7 @@ export async function ensureServerRunning(
 		throw new Error("Another process is starting the dashboard but it never became healthy.");
 	}
 	try {
-		seams.spawnServer(requestedPort);
+		seams.spawnServer(requestedPort, deps.cwd ?? process.cwd());
 		for (let waited = 0; waited < STARTUP_TIMEOUT_MS; waited += 250) {
 			await sleep(250);
 			const state = await readDashboardState(configDir);
@@ -637,7 +649,7 @@ export async function executeDashboard(
 
 	let state: DashboardServerState;
 	try {
-		state = await ensureServerRunning(port, { ...deps, configDir: seams.configDir });
+		state = await ensureServerRunning(port, { ...deps, configDir: seams.configDir, cwd });
 	} catch (err) {
 		console.error(`\n  Error: ${errMsg(err)}\n`);
 		return false;

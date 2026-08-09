@@ -93,6 +93,7 @@ disk **before** they are sent.
 | `key_rejected` | The server rejected the API key (401/403). Props: retried, where. |
 | `reauth_completed` | Re-authentication after a rejected key finished. Props: outcome. |
 | `dashboard_opened` | The local web dashboard was opened in a browser (surface web-local). Props: first_run (bool — first open on this install). |
+| `dashboard_view_switched` | The local web dashboard's left-nav view was switched. Props: view (discriminator: stats/standup/repositories/memories). Distinct from view_switched, which is the IDE tool-window event with its own view vocabulary. |
 | `range_changed` | The dashboard time-range control was changed. Props: range (discriminator: 7d/30d/90d/custom). |
 | `chart_split_changed` | A dashboard card's split-by control was changed. Props: card (discriminator: tokens/spend/mcp), split (discriminator). |
 

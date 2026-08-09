@@ -312,7 +312,11 @@ window.JD = window.JD || {};
 				return;
 			}
 			button.onclick = () => {
-				JD.track("range_changed", { range: value });
+				/* Emit the user-facing label token (7d/30d/90d), not the internal
+				   DashboardRange token (week/month/3m), so the telemetry discriminator
+				   matches the registry doc and the button labels. `custom` is handled
+				   by its own branch above and reported as "custom" on Apply. */
+				JD.track("range_changed", { range: { week: "7d", month: "30d", "3m": "90d" }[value] || value });
 				window.location.href = JD.viewPath(model.view) + JD.query(model, { range: value });
 			};
 		});
@@ -359,7 +363,7 @@ window.JD = window.JD || {};
 			var path = button.getAttribute("data-nav-path");
 			var navView = button.getAttribute("data-nav-view");
 			button.onclick = () => {
-				if (navView && navView !== model.view) JD.track("view_switched", { view: navView });
+				if (navView && navView !== model.view) JD.track("dashboard_view_switched", { view: navView });
 				window.location.href = path + JD.query(model, { range: undefined, repo: undefined });
 			};
 		});

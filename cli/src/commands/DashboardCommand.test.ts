@@ -150,6 +150,19 @@ describe("ensureServerRunning", () => {
 		expect(d.spawned).toEqual([]);
 	});
 
+	it("passes the resolved cwd through to the spawned server", async () => {
+		let spawnedCwd: string | undefined;
+		const d = deps({
+			cwd: "/repo/root",
+			spawnServer: (port, cwd) => {
+				spawnedCwd = cwd;
+				void writeDashboardState(state({ port: port ?? 1818 }), configDir);
+			},
+		});
+		await ensureServerRunning(undefined, d);
+		expect(spawnedCwd).toBe("/repo/root");
+	});
+
 	it("reuses a healthy server when --port names the port it is already on", async () => {
 		await writeDashboardState(state({ port: 1818 }), configDir);
 		const d = deps();
