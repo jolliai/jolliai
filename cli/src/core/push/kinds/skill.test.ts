@@ -6,8 +6,10 @@
  * and is NOT re-tested per kind — that is the point of the table. What is specific
  * to skill, and therefore tested here:
  *
- *  - the article title, its collision-avoidance shape, and the `hash8` segment that
- *    keeps per-commit articles distinguishable,
+ *  - `aggregate`: ONE article per commit rather than one per skill, and the reason
+ *    its identity is borrowed from a real ref rather than invented,
+ *  - the article title and the `hash8` segment that keeps per-commit articles
+ *    distinguishable,
  *  - the per-commit-increment figure rule: every number in the body must match what
  *    the VS Code panel renders for the SAME commit,
  *  - per-commit `baseKey` (this is the only kind that does not dedupe across
@@ -22,7 +24,15 @@
 import { describe, expect, it } from "vitest";
 import type { CommitSummary, SkillCommitRef } from "../../../Types.js";
 import type { AnyContextKind } from "../ContextKindDefinition.js";
-import { baseKeyOfItem, docIdFieldOf, docUrlFieldOf, entryKeyOf, linksInMarkdown } from "../ContextKindRegistry.js";
+import {
+	baseKeyOfItem,
+	docIdFieldOf,
+	docIdOf,
+	docUrlFieldOf,
+	entryKeyOf,
+	isSummaryScoped,
+	linksInMarkdown,
+} from "../ContextKindRegistry.js";
 import { CONTEXT_KIND_DEFINITIONS } from "./index.js";
 
 /** The `skill` definition, looked up from the registry list it is declared in. */
@@ -50,9 +60,14 @@ function summary(commitHash = "a1b2c3d4e5f6789012345678901234567890abcd"): Commi
 }
 
 describe("declaration", () => {
-	it("uses the uniform doc-state field names (the first kind to take the defaults)", () => {
-		expect(docIdFieldOf(skillKind)).toBe("jolliDocId");
-		expect(docUrlFieldOf(skillKind)).toBe("jolliDocUrl");
+	it("keeps its published id on the COMMIT, under names that cannot collide with the memory's", () => {
+		// Summary-scoped because the article covers the commit. The names are overridden
+		// rather than inherited precisely because the defaults (`jolliDocId` /
+		// `jolliDocUrl`) are the MEMORY article's own fields on a summary — taking them
+		// would overwrite the memory's published identity with its attachment's.
+		expect(isSummaryScoped(skillKind)).toBe(true);
+		expect(docIdFieldOf(skillKind)).toBe("jolliSkillsDocId");
+		expect(docUrlFieldOf(skillKind)).toBe("jolliSkillsDocUrl");
 	});
 
 	it("does not link in the summary markdown, so a batch push mints no placeholder", () => {
@@ -93,17 +108,57 @@ describe("declaration", () => {
 	});
 });
 
-describe("title", () => {
-	it("is namespaced by `Skill`, the host label, and the commit's hash8", () => {
-		// The host segment is required for uniqueness, not decoration: the registry key
-		// is `<source>:<skill>`, so two hosts can hold the same skill id as two rows.
-		// Colons become spaces because sanitizeTitle strips them from document titles.
-		expect(skillKind.title(ref(), summary())).toBe("Skill · Claude Code · superpowers brainstorming — a1b2c3d4");
+describe("aggregate", () => {
+	it("publishes ONE article for a commit's whole skill set", () => {
+		// The mismatch this exists to fix: every local surface shows a commit's skills as
+		// ONE artifact (`skills--<hash8>.md`, one "Skills used" Context row), so a commit
+		// whose Context listed a single file used to arrive at the backend as N documents.
+		const refs = [
+			ref({ archivedKey: "claude:a-a1b2c3d4", skill: "a" }),
+			ref({ archivedKey: "claude:b-a1b2c3d4", skill: "b" }),
+		];
+		expect(skillKind.aggregate?.(refs, summary())).toHaveLength(1);
 	});
 
-	it("distinguishes the same skill on two commits, which a flat branch folder needs", () => {
+	it("takes its identity from the COMMIT, so no change to the skill set can move it", () => {
+		// `skills--<hash8>`, the same key the Memory Bank names the local aggregate with.
+		// Deriving it from a representative ref instead made the article's identity
+		// depend on which skills the commit happened to hold — a squash that folds three
+		// refs into one, or a skill entered after the first push, silently re-pointed it.
+		const refs = [ref({ archivedKey: "claude:b-a1b2c3d4" }), ref({ archivedKey: "claude:a-a1b2c3d4" })];
+		const [aggregated] = skillKind.aggregate?.(refs, summary()) ?? [];
+		expect(entryKeyOf(skillKind, aggregated)).toBe("skills--a1b2c3d4");
+		const fewer = skillKind.aggregate?.([refs[0]], summary()) ?? [];
+		expect(entryKeyOf(skillKind, fewer[0])).toBe("skills--a1b2c3d4");
+	});
+
+	it("carries no per-ref docId, so nothing can mistake a stale id for the article's", () => {
+		// The published id lives on the summary (`docScope: "summary"`). A legacy id left
+		// on the carrier ref would be a second, stale answer to "which article is this?".
+		const refs = [{ ...ref(), jolliDocId: 501, jolliDocUrl: "https://acme.jolli.ai/articles?doc=501" }];
+		const [aggregated] = skillKind.aggregate?.(refs, summary()) ?? [];
+		expect((aggregated as { jolliDocId?: number }).jolliDocId).toBeUndefined();
+		expect((aggregated as { jolliDocUrl?: string }).jolliDocUrl).toBeUndefined();
+		// And the engine's own reader finds nothing either — it looks at the summary.
+		expect(docIdOf(skillKind, aggregated)).toBeUndefined();
+	});
+
+	it("leaves an empty set empty, so a commit with no skills pushes nothing", () => {
+		expect(skillKind.aggregate?.([], summary())).toEqual([]);
+	});
+});
+
+describe("title", () => {
+	it("names the COMMIT, not a skill — one article covers all of them", () => {
+		// Deliberately the same wording as `buildSkillsAggregateMarkdown`'s heading and
+		// the Memory Bank's `skills--<hash8>.md`: the pushed article and the local file
+		// are the same document and must not be findable under two names.
+		expect(skillKind.title(ref(), summary())).toBe("Skills used — a1b2c3d4");
+	});
+
+	it("distinguishes two commits' aggregates, which a flat branch folder needs", () => {
 		// Per-commit articles are siblings in one flat folder, so without the hash8 a
-		// skill used on four commits would show four indistinguishable entries.
+		// branch would show N indistinguishable "Skills used" entries.
 		const first = skillKind.title(ref(), summary("a1b2c3d4000000000000000000000000000000ff"));
 		const second = skillKind.title(ref(), summary("deadbeef000000000000000000000000000000ff"));
 		expect(first).toContain("— a1b2c3d4");
@@ -121,12 +176,6 @@ describe("title", () => {
 		);
 		expect(title).toContain("— a1b2c3d4");
 		expect(title).not.toContain("deadbeef");
-	});
-
-	it("distinguishes the same skill id captured from different hosts", () => {
-		const claude = skillKind.title(ref({ source: "claude" }), summary());
-		const codex = skillKind.title(ref({ source: "codex" }), summary());
-		expect(claude).not.toBe(codex);
 	});
 });
 
@@ -146,9 +195,9 @@ describe("body", () => {
 
 	it("includes the host, plugin and entry paths", async () => {
 		const body = await skillKind.body(ref(), { cwd: CWD });
-		expect(body).toContain("**Host:** Claude Code");
-		expect(body).toContain("**Plugin:** superpowers");
-		expect(body).toContain("**Entered via:** tool");
+		expect(body).toContain("Host: Claude Code");
+		expect(body).toContain("Plugin: superpowers");
+		expect(body).toContain("Entered via: tool");
 	});
 
 	it("renders the token table through the shared skills-table renderer", async () => {
@@ -181,14 +230,14 @@ describe("body", () => {
 		// such case now: the body is pure, so pre-archival and foreign data render
 		// identically to anything else.
 		const body = await skillKind.body(ref({ archivedKey: "claude:superpowers:brainstorming" }), { cwd: CWD });
-		expect(body).toContain("**Host:** Claude Code");
+		expect(body).toContain("Host: Claude Code");
 	});
 
 	it("marks an inferred skill and omits an absent plugin", async () => {
 		const body = await skillKind.body(ref({ plugin: undefined, detection: "heuristic", usage: undefined }), {
 			cwd: CWD,
 		});
-		expect(body).not.toContain("**Plugin:**");
+		expect(body).not.toContain("Plugin:");
 		// The dagger + footnote come from the shared table; an unattributed row shows
 		// em dashes rather than zeros.
 		expect(body).toContain("†");
@@ -197,11 +246,27 @@ describe("body", () => {
 
 	it("omits `Entered via` when the ref records no entry path", async () => {
 		const body = await skillKind.body(ref({ entryPaths: [] }), { cwd: CWD });
-		expect(body).not.toContain("**Entered via:**");
+		expect(body).not.toContain("Entered via:");
 	});
 
 	it("omits `Plugin` for an empty-string plugin, not just an absent one", async () => {
 		const body = await skillKind.body(ref({ plugin: "" }), { cwd: CWD });
-		expect(body).not.toContain("**Plugin:**");
+		expect(body).not.toContain("Plugin:");
+	});
+
+	it("lists EVERY skill of the commit — one table plus one detail line each", async () => {
+		const refs = [
+			ref({ archivedKey: "claude:a-a1b2c3d4", skill: "a" }),
+			ref({ archivedKey: "claude:b-a1b2c3d4", skill: "b", source: "codex", plugin: undefined }),
+		];
+		const [aggregated] = skillKind.aggregate?.(refs, summary()) ?? [];
+		const body = await skillKind.body(aggregated, { cwd: CWD });
+		expect(body).toContain("| a | 1 |");
+		expect(body).toContain("| b | 1 |");
+		// Identity sits below the table because it has no column there — and it is
+		// per-skill, so two hosts on one commit both survive.
+		expect(body).toContain("## Skill details");
+		expect(body).toContain("- **a** — Host: Claude Code");
+		expect(body).toContain("- **b** — Host: Codex");
 	});
 });

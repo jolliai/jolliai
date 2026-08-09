@@ -79,6 +79,36 @@ class RepoProfileBridgeTest {
         RepoProfileBridge.readManuallyDisabledFromDisk(repo.absolutePath) shouldBe false
     }
 
+    // ── The cutover split: userDisabled is the axis, manuallyDisabled is derived ──
+    // `manuallyDisabled` is recomputed on every write as `userDisabled OR a cutover
+    // fence is present`, so a merely-FENCED repo carries manuallyDisabled=true while
+    // the user disabled nothing. Reading the composite would show the DisabledPanel
+    // and skip auto-install for that repo. The CLI's readManualDisableFlagSync
+    // prefers `userDisabled`; this mirror must too.
+
+    @Test
+    fun `userDisabled=false wins over a fence-derived manuallyDisabled=true`() {
+        writeProfileJson("""{"userDisabled":false,"cutoverFence":{"reason":"cutover","at":"t"},"manuallyDisabled":true}""")
+        RepoProfileBridge.readManuallyDisabledFromDisk(repo.absolutePath) shouldBe false
+        RepoProfileBridge.readExplicitManualDisable(repo.absolutePath) shouldBe false
+    }
+
+    @Test
+    fun `userDisabled=true still reads as disabled`() {
+        writeProfileJson("""{"userDisabled":true,"manuallyDisabled":true}""")
+        RepoProfileBridge.readManuallyDisabledFromDisk(repo.absolutePath) shouldBe true
+        RepoProfileBridge.readExplicitManualDisable(repo.absolutePath) shouldBe true
+    }
+
+    @Test
+    fun `a pre-split profile still honours the composite as the migration fallback`() {
+        // Pre-split profile written by an OLD runtime, then fenced: the composite is
+        // all there is, so it is honoured — this is the migration fallback, and the
+        // reason the composite read cannot simply be deleted.
+        writeProfileJson("""{"manuallyDisabled":true}""")
+        RepoProfileBridge.readManuallyDisabledFromDisk(repo.absolutePath) shouldBe true
+    }
+
     @Test
     fun `profile json missing the field falls through to the legacy marker`() {
         // The classic "profile.json exists (backfillDismissed only) but the async

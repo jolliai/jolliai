@@ -434,3 +434,126 @@ describe("OpenCodeTranscriptReader", () => {
 		expect(second.entries[1].content).toBe("Reply 2");
 	});
 });
+
+describe("OpenCodeTranscriptReader toolUse", () => {
+	let tempDir: string;
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), "opencode-tools-"));
+	});
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	// A `part` row with `data.type === "tool"` IS a call and `data.tool` is its
+	// name — the same evidence OpenCodeSkillScanner is built on.
+	it("counts tool parts as builtins, including on a message with no text", async () => {
+		const now = Date.now();
+		const transcriptPath = await createTestDb(tempDir, "sess-t1", [
+			{
+				id: "m1",
+				role: "assistant",
+				parts: [
+					{ type: "text", text: "Looking." },
+					{ type: "tool", tool: "bash", callID: "c1" },
+					{ type: "tool", tool: "read", callID: "c2" },
+				],
+				time_created: now,
+			},
+			{
+				id: "m2",
+				role: "assistant",
+				parts: [{ type: "tool", tool: "bash", callID: "c3" }],
+				time_created: now + 1,
+			},
+		]);
+
+		const result = await readOpenCodeTranscript(transcriptPath);
+
+		expect(result.toolUse).toEqual([
+			{ name: "bash", kind: "builtin", calls: 2 },
+			{ name: "read", kind: "builtin", calls: 1 },
+		]);
+	});
+
+	it("re-attributes the first-class skill tool to the skill it loaded", async () => {
+		const now = Date.now();
+		const transcriptPath = await createTestDb(tempDir, "sess-t2", [
+			{
+				id: "m1",
+				role: "assistant",
+				parts: [
+					{
+						type: "tool",
+						tool: "skill",
+						callID: "c1",
+						state: { status: "completed", metadata: { name: "brainstorming" } },
+					},
+				],
+				time_created: now,
+			},
+		]);
+
+		const result = await readOpenCodeTranscript(transcriptPath);
+
+		expect(result.toolUse).toEqual([{ name: "brainstorming", kind: "skill", calls: 1 }]);
+	});
+
+	it("falls back to the requested skill name when metadata carries none", async () => {
+		const now = Date.now();
+		const transcriptPath = await createTestDb(tempDir, "sess-t3", [
+			{
+				id: "m1",
+				role: "assistant",
+				parts: [{ type: "tool", tool: "skill", callID: "c1", state: { input: { name: "code-review" } } }],
+				time_created: now,
+			},
+		]);
+
+		const result = await readOpenCodeTranscript(transcriptPath);
+
+		expect(result.toolUse).toEqual([{ name: "code-review", kind: "skill", calls: 1 }]);
+	});
+
+	it("keeps a nameless skill call as a builtin rather than dropping it", async () => {
+		const now = Date.now();
+		const transcriptPath = await createTestDb(tempDir, "sess-t4", [
+			{ id: "m1", role: "assistant", parts: [{ type: "tool", tool: "skill", callID: "c1" }], time_created: now },
+		]);
+
+		const result = await readOpenCodeTranscript(transcriptPath);
+
+		expect(result.toolUse).toEqual([{ name: "skill", kind: "builtin", calls: 1 }]);
+	});
+
+	it("reports an empty array — not undefined — for a tool-free slice", async () => {
+		const now = Date.now();
+		const transcriptPath = await createTestDb(tempDir, "sess-t5", [
+			{ id: "m1", role: "user", parts: [{ type: "text", text: "hi" }], time_created: now },
+		]);
+
+		const result = await readOpenCodeTranscript(transcriptPath);
+
+		expect(result.toolUse).toEqual([]);
+	});
+
+	it("counts only the calls inside the consumed slice", async () => {
+		const now = Date.now();
+		const transcriptPath = await createTestDb(tempDir, "sess-t6", [
+			{ id: "m1", role: "assistant", parts: [{ type: "tool", tool: "bash", callID: "c1" }], time_created: now },
+			{
+				id: "m2",
+				role: "assistant",
+				parts: [{ type: "tool", tool: "read", callID: "c2" }],
+				time_created: now + 600_000,
+			},
+		]);
+
+		const first = await readOpenCodeTranscript(transcriptPath, null, new Date(now + 1000).toISOString());
+		expect(first.toolUse).toEqual([{ name: "bash", kind: "builtin", calls: 1 }]);
+
+		const second = await readOpenCodeTranscript(transcriptPath, first.newCursor);
+		expect(second.toolUse).toEqual([{ name: "read", kind: "builtin", calls: 1 }]);
+	});
+});

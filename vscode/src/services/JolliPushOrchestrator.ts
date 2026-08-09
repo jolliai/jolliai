@@ -35,8 +35,7 @@ import { isOutboundPushAllowed } from "../../../cli/src/core/PushControl.js";
 import { isRepoWideRefusal } from "../../../cli/src/core/PushRefusal.js";
 import {
 	baseKeyOfItem,
-	docIdOf,
-	docUrlOf,
+	storedDocOf,
 	entryKeyOf,
 	getContextKinds,
 } from "../../../cli/src/core/push/ContextKindRegistry.js";
@@ -48,6 +47,7 @@ import {
 	reduceOwnItems,
 } from "../../../cli/src/core/push/ContextPush.js";
 import { canReuseDocId } from "../../../cli/src/core/push/DocIdReuse.js";
+import { adoptLegacySkillDocIds } from "../../../cli/src/core/push/LegacySkillDocIds.js";
 import { track } from "../../../cli/src/core/Telemetry.js";
 import { log } from "../util/Logger.js";
 import { buildBranchRelativePath, buildPushTitle } from "../views/SummaryUtils.js";
@@ -100,14 +100,24 @@ const MAX_SUMMARY_JSON_BYTES = 1_572_864;
 /**
  * Serializes a summary for the `summaryJson` push field: the enriched
  * `summaryForMarkdown` copy (plan/note URLs woven in) minus the client push-state
- * fields — `jolliDocId`/`jolliDocUrl` churn per push and `orphanedDocIds` is
+ * fields — `jolliDocId`/`jolliDocUrl` and their skill-article siblings
+ * `jolliSkillsDocId`/`jolliSkillsDocUrl` churn per push and `orphanedDocIds` is
  * cleanup bookkeeping, none of which is commit content the share page should see
  * (stripping them also keeps a re-push of unchanged content byte-identical, so
- * the server upsert can no-op). Returns undefined (with a warning) above
+ * the server upsert can no-op). The skill aggregate is pushed BEFORE the summary
+ * in the same run, so `applyPublishedUrls` has already woven its id/URL onto the
+ * summary by the time we serialize. Returns undefined (with a warning) above
  * {@link MAX_SUMMARY_JSON_BYTES}.
  */
 export function serializeSummaryJson(summary: CommitSummary): string | undefined {
-	const { jolliDocId: _docId, jolliDocUrl: _docUrl, orphanedDocIds: _orphaned, ...content } = summary;
+	const {
+		jolliDocId: _docId,
+		jolliDocUrl: _docUrl,
+		jolliSkillsDocId: _skillsDocId,
+		jolliSkillsDocUrl: _skillsDocUrl,
+		orphanedDocIds: _orphaned,
+		...content
+	} = summary;
 	const json = JSON.stringify(content);
 	if (Buffer.byteLength(json, "utf-8") > MAX_SUMMARY_JSON_BYTES) {
 		log.warn(
@@ -245,12 +255,16 @@ export interface PushSummaryOptions {
  * orphans, and returns the doc ids + renderable result. UI-free — see file header.
  */
 export async function pushSummaryWithAttachments(
-	summary: CommitSummary,
+	original: CommitSummary,
 	ctx: PushContext,
 	attachments?: AttachmentSelection | ContextSelection,
 	options: PushSummaryOptions = {},
 	retried = false,
 ): Promise<PushSummaryResult> {
+	// Convert any per-skill article ids published by an older version into the
+	// commit-level one before anything reads them — see `adoptLegacySkillDocIds`.
+	// Idempotent, so the `retried` re-entry below costs nothing.
+	const summary = adoptLegacySkillDocIds(original);
 	// Story 2: fail fast for a push-disabled repo before uploading anything.
 	// Checking here (not only inside each HTTP call) avoids issuing a doomed
 	// per-attachment push that would be mislabeled as an attachment failure. The
@@ -458,7 +472,7 @@ async function pushAttachmentKinds(
 				}
 				continue;
 			}
-			const storedDocId = docIdOf(kind, item);
+			const stored = storedDocOf(kind, summary, item);
 			let pushResult: Awaited<ReturnType<typeof pushToJolli>>;
 			try {
 				pushResult = await pushToJolli(
@@ -470,8 +484,8 @@ async function pushAttachmentKinds(
 						commitHash: summary.commitHash,
 						docType: kind.docType,
 						branch: summary.branch,
-						...(storedDocId !== undefined &&
-							canReuseDocId(docUrlOf(kind, item), envKey) && { docId: storedDocId }),
+						...(stored.docId !== undefined &&
+							canReuseDocId(stored.docUrl, envKey) && { docId: stored.docId }),
 						repoUrl: ctx.repoUrl,
 						relativePath: buildBranchRelativePath(summary.branch),
 					},

@@ -22,8 +22,9 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { writeFileAtomic } from "../core/AtomicJsonFile.js";
 import { getProjectRootDir } from "../core/GitOps.js";
 import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../core/GitRemoteUtils.js";
 import { withRepoRegistryLock } from "../core/Locks.js";
@@ -153,39 +154,65 @@ export function getRepoRegistryPath(configDir: string = getGlobalConfigDir()): s
  * down every read path with it.
  */
 export async function readRepoRegistry(configDir?: string): Promise<RepoRegistryFile> {
-	const path = getRepoRegistryPath(configDir);
 	try {
-		const raw = JSON.parse(await readFile(path, "utf-8")) as RepoRegistryFile;
-		if (!Array.isArray(raw?.repos)) {
-			log.warn("repo registry at %s has no repos array — treating as empty", path);
-			return EMPTY;
-		}
-		return {
-			version: 1,
-			repos: raw.repos,
-			// Preserve the identity stamp: every registry rewrite goes through a
-			// read-modify-write, and dropping it here would erase the deletion
-			// detector's witness on the next repo registration.
-			...(typeof raw.instanceId === "string" && { instanceId: raw.instanceId }),
-		};
+		return await readRepoRegistryStrict(configDir);
 	} catch (err) {
-		if (!isEnoent(err)) log.warn("repo registry unreadable (%s) — treating as empty", errMsg(err));
+		log.warn("repo registry unreadable (%s) — treating as empty", errMsg(err));
 		return EMPTY;
 	}
 }
 
+/**
+ * The same read, but it THROWS on a registry it could not read.
+ *
+ * Every writer below is a read-modify-write over the returned value, so a read
+ * that fails open is not a graceful degradation there — it is a delete. One
+ * transient EACCES / EMFILE / Windows AV hold, or a single truncated file, and
+ * the next `registerRepo` writes back a registry containing only the repo it
+ * happens to be handling, dropping every other repo AND `instanceId`. The
+ * damage is silent and lands where it hurts most: `readRegistryInstanceId`
+ * returns null, so `classifyIdentity` calls a genuinely deleted database a
+ * `fresh-install` and suppresses the alarm, while `doctor --recover` iterates
+ * none of the lost repos. Failing the one operation is strictly better.
+ *
+ * "Absent" is NOT a failure: a registry that does not exist yet is genuinely
+ * empty, and that is the case the fail-open contract was written for.
+ */
+export async function readRepoRegistryStrict(configDir?: string): Promise<RepoRegistryFile> {
+	const path = getRepoRegistryPath(configDir);
+	let text: string;
+	try {
+		text = await readFile(path, "utf-8");
+	} catch (err) {
+		if (isEnoent(err)) return EMPTY;
+		throw err;
+	}
+	const raw = JSON.parse(text) as RepoRegistryFile;
+	if (!Array.isArray(raw?.repos)) throw new Error(`repo registry at ${path} has no repos array`);
+	return {
+		version: 1,
+		repos: raw.repos,
+		// Preserve the identity stamp: every registry rewrite goes through a
+		// read-modify-write, and dropping it here would erase the deletion
+		// detector's witness on the next repo registration.
+		...(typeof raw.instanceId === "string" && { instanceId: raw.instanceId }),
+	};
+}
+
 /** Writes the registry with user-only permissions (it lists local paths). */
 async function writeRepoRegistry(file: RepoRegistryFile, configDir?: string): Promise<void> {
-	const path = getRepoRegistryPath(configDir);
-	await mkdir(join(path, ".."), { recursive: true });
-	await writeFile(path, `${JSON.stringify(file, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
+	// Atomic: a torn write reads back as corrupt JSON, and the very next writer
+	// would cement that loss through its read-modify-write (see
+	// `readRepoRegistryStrict`). This file outranks `profile.json`, which has
+	// used temp+rename for the same reason since it shipped.
+	await writeFileAtomic(getRepoRegistryPath(configDir), `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
 }
 
 /** Records the database's instance id; no-op when already current. */
 export async function stampRegistryInstanceId(id: string, configDir?: string): Promise<void> {
 	await withRepoRegistryLock(
 		async () => {
-			const registry = await readRepoRegistry(configDir);
+			const registry = await readRepoRegistryStrict(configDir);
 			if (registry.instanceId === id) return;
 			await writeRepoRegistry({ ...registry, instanceId: id }, configDir);
 		},
@@ -284,7 +311,7 @@ export async function registerRepo(opts: RegisterRepoOptions): Promise<Registere
 		async () => {
 			// Re-read INSIDE the lock: a concurrent registrar's write between our
 			// git resolution above and here must not be lost-updated by ours.
-			const registry = await readRepoRegistry(opts.configDir);
+			const registry = await readRepoRegistryStrict(opts.configDir);
 			const existing = registry.repos.find((r) => r.repoIdentity === identity);
 			// Union rather than replace: two clones of one remote share an identity, and
 			// overwriting would leave the other clone's commits uncollected with nothing to
@@ -324,7 +351,7 @@ export async function ensureWorktreeListed(opts: RegisterRepoOptions): Promise<R
 	const { identity } = await resolveRepoIdentity(worktreeRoot);
 	return withRepoRegistryLock(
 		async () => {
-			const registry = await readRepoRegistry(opts.configDir);
+			const registry = await readRepoRegistryStrict(opts.configDir);
 			const existing = registry.repos.find((r) => r.repoIdentity === identity);
 			// No entry to extend: the identity-unknown case belongs to registerRepo,
 			// which builds the full row. Racing a concurrent deregister here is fine —
@@ -356,7 +383,7 @@ export async function deregisterRepo(opts: RegisterRepoOptions): Promise<string 
 	const now = (opts.now ?? (() => new Date()))().toISOString();
 	return withRepoRegistryLock(
 		async () => {
-			const registry = await readRepoRegistry(opts.configDir);
+			const registry = await readRepoRegistryStrict(opts.configDir);
 			const existing = registry.repos.find((r) => r.repoIdentity === identity);
 			if (!existing) return null;
 			const repos = registry.repos.map((r) => (r.repoIdentity === identity ? { ...r, disabledAt: now } : r));

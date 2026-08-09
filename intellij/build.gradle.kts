@@ -307,11 +307,24 @@ tasks.named<PrepareSandboxTask>("prepareSandbox") {
     // Fail fast with an actionable message instead of silently syncing an empty
     // cli-dist (which only surfaces much later as a runtime BundleMissing).
     doFirst {
-        val cliJs = vscodeDistDir.file("Cli.js").asFile
-        if (!cliJs.exists()) {
+        // Both are checked, because Gradle's `from(<missing dir>)` is a silent
+        // no-op: a vscode/dist produced before the dashboard existed — or by
+        // `build:watch`, which used to skip the asset copy — has Cli.js and
+        // DashboardServerEntry.js but no dashboard-assets/, and that ships a
+        // plugin whose `jolli dashboard` throws "Dashboard assets not found" at
+        // runtime instead of failing here where the message is actionable.
+        // index.html stands in for the tree: the copy is all-or-nothing, and the
+        // per-file inventory is asserted by the plugins' own publish scripts.
+        val required = listOf(
+            vscodeDistDir.file("Cli.js").asFile,
+            vscodeDistDir.file("dashboard-assets/index.html").asFile,
+        )
+        val missing = required.filterNot { it.exists() }
+        if (missing.isNotEmpty()) {
             throw GradleException(
-                "Bundled CLI not found at ${cliJs.path}. Run `npm run build` at the repo root " +
-                    "first (it builds vscode/dist/*.js), then re-run the Gradle build.",
+                "Bundled CLI incomplete — missing ${missing.joinToString(", ") { it.path }}. " +
+                    "Run `npm run build` at the repo root first (it builds vscode/dist/ including " +
+                    "dashboard-assets/), then re-run the Gradle build.",
             )
         }
     }

@@ -139,6 +139,40 @@ window.JD = window.JD || {};
 		);
 	}
 
+	/**
+	 * The tree's footer: how much of the corpus is loaded, and the button that
+	 * fetches the next page.
+	 *
+	 * Deliberately NOT {@link JD.moreToggle}, which the detail pane's lists use:
+	 * that one only expands rows the server already sent, so its label can
+	 * promise "Show all N". This button costs a round trip per click, so it says
+	 * what it will actually do and never claims to finish the list in one.
+	 *
+	 * Nothing at all once everything is loaded — a footer that only ever reads
+	 * "N of N" is noise on the far more common small-corpus page.
+	 */
+	function loadMoreRow(memories) {
+		var loaded = (memories.items || []).length;
+		if (!loaded || loaded >= memories.totalCount) return "";
+		var label = memories.loadingPage ? "Loading…" : memories.loadError ? "Try again" : "Load more";
+		return (
+			'<div class="more-row"><span class="more-count">' +
+			loaded +
+			" of " +
+			memories.totalCount +
+			" memories loaded" +
+			/* The failure is stated in the footer rather than a toast: it is the
+			   reason this button is still here, and it belongs next to the count it
+			   stopped from growing. */
+			(memories.loadError && !memories.loadingPage ? " — could not load more" : "") +
+			'</span><button type="button" class="cta ghost sm" id="memLoadMore"' +
+			(memories.loadingPage ? " disabled" : "") +
+			">" +
+			label +
+			"</button></div>"
+		);
+	}
+
 	/** The tree body only — toolbar (tabs + search) is rendered once and left alone,
 	    so re-filtering on every keystroke never steals focus from the search input. */
 	function renderTreeBody(model) {
@@ -180,24 +214,21 @@ window.JD = window.JD || {};
 				});
 			});
 		}
-		/* Skipped when the search filter itself is why nothing is showing — pairing
-		   "no matches" with "showing 200 of 773" would claim two different counts
-		   of what's on screen at once. */
-		if (memories.truncated && filtered.length) {
-			/* `items.length` is the SERVER's page, not what survived the client-side
-			   filter — the two are only equal with an empty query. Report the page size
-			   against the total (both server-side figures) so the sentence stays one
-			   consistent statement about the fetch; `filtered.length` above is what the
-			   tree actually shows and belongs to a different claim. */
+		/* Never merged into one count with the footer below: the filter ran over what
+		   is LOADED, so both of its numbers are client-side, while the footer compares
+		   two server-side figures. Pairing "showing N" with `totalCount` would state a
+		   match count against a set the filter never saw — and until every page is in,
+		   those two sets genuinely differ. Skipped when nothing matched; that branch
+		   already says so. */
+		if (filtered.length && filtered.length !== items.length) {
 			html +=
-				'<p class="empty-note">Showing the ' +
+				'<p class="empty-note">Showing ' +
+				filtered.length +
+				" of " +
 				items.length +
-				" most recent of " +
-				memories.totalCount +
-				" memories" +
-				(filtered.length !== items.length ? " (" + filtered.length + " match the filter)" : "") +
-				".</p>";
+				" loaded memories matching the filter.</p>";
 		}
+		html += loadMoreRow(memories);
 		return html;
 	}
 
@@ -228,6 +259,11 @@ window.JD = window.JD || {};
 				}
 			};
 		});
+		/* Rebound on every tree repaint, including the one `loadMoreMemories`
+		   itself triggers — the footer is part of the tree body, so each page
+		   replaces this element rather than updating it. */
+		var loadMore = document.getElementById("memLoadMore");
+		if (loadMore) loadMore.onclick = () => loadMoreMemories(model);
 	}
 
 	function refreshTree(model) {
@@ -665,6 +701,94 @@ window.JD = window.JD || {};
 		};
 	}
 
+	/**
+	 * Fetches ONE more page and appends it — the "Load more" button's handler,
+	 * and the only thing that grows the loaded set.
+	 *
+	 * Never chained or auto-fired. A render-driven chain (each arriving page
+	 * re-rendering, which then asks for the next) reads as jank: the tree grows
+	 * and reflows under the reader's cursor mid-click, and it spends a request
+	 * per page on history the reader may never scroll into. The inlined first
+	 * page is already a working tree; anything past it earns its round trip only
+	 * when asked for.
+	 *
+	 * Repaints the tree ONLY, through `refreshTree` rather than
+	 * `JD.renderMemories`: the toolbar keeps its focus and caret, and the detail
+	 * pane — a full memory read that has nothing to do with this list — is left
+	 * alone instead of being rebuilt under the reader.
+	 *
+	 * All the paging state lives ON `memories`, never on JD: a `/api/model`
+	 * refresh replaces that object with a fresh one from the server, which then
+	 * starts again from its own first page. Module-level flags would survive the
+	 * swap and either strand the new model at page 1 or append its pages onto
+	 * the old one's items.
+	 */
+	function loadMoreMemories(model) {
+		var memories = model.memories;
+		if (!memories || memories.loadingPage) return;
+		var items = memories.items || [];
+		if (items.length >= memories.totalCount) return;
+		memories.loadingPage = true;
+		memories.loadError = false;
+		refreshTree(model);
+		/* A cursor, not an offset: the server pages over the memories git still
+		   reaches, so a rebase mid-browse shortens that list and an offset would
+		   step over whichever row moved onto the boundary — a gap the client
+		   cannot even detect. "Continue after this exact memory" survives rows
+		   appearing or vanishing on either side of it. */
+		var last = items[items.length - 1];
+		var query = JD.query(model, {});
+		JD.getJson(
+			"/api/memories" +
+				(query ? query + "&" : "?") +
+				"afterRepo=" +
+				encodeURIComponent(last.repoIdentity) +
+				"&afterHash=" +
+				encodeURIComponent(last.commitHash),
+		)
+			.then((page) => {
+				memories.loadingPage = false;
+				/* An empty page while `items.length < totalCount` means those two
+				   disagree — the total moved under us. Believe the page: there is
+				   nothing after this cursor, so retire the footer rather than leave a
+				   button that answers every click with nothing. */
+				if (!page.items || !page.items.length) {
+					memories.totalCount = items.length;
+					refreshTree(model);
+					return;
+				}
+				if (page.cursorMissing) {
+					/* The memory we were paging from is gone (a rebase during the
+					   session), so the server answered with the first page instead.
+					   REPLACE rather than append: appending would re-add rows the dedupe
+					   then drops, and the next click would send the same dead cursor
+					   again — a button that does nothing forever. Re-seating on page 1
+					   is exactly what a reload would give, and paging works from there. */
+					memories.items = page.items;
+				} else {
+					/* Deduped even so: rows can shift under a commit landing between two
+					   clicks, and a repeat is cheap to drop where a gap would be
+					   invisible. */
+					var seen = new Set(items.map((item) => item.repoIdentity + " " + item.commitHash));
+					memories.items = items.concat(
+						page.items.filter((item) => !seen.has(item.repoIdentity + " " + item.commitHash)),
+					);
+				}
+				/* Adopted from the page, not left at the value the HTML was rendered
+				   with: it is what the footer states and what decides whether there is
+				   more to ask for, and a commit (or a rebase) moves it. */
+				memories.totalCount = page.totalCount;
+				refreshTree(model);
+			})
+			.catch(() => {
+				/* Kept, not cleared: every page that did arrive stays usable, and the
+				   footer turns into a retry instead of a dead end. */
+				memories.loadingPage = false;
+				memories.loadError = true;
+				refreshTree(model);
+			});
+	}
+
 	JD.renderMemories = (model) => {
 		/* The 30s page tick calls this again. Rebuilding the whole page then
 		   replaces the live #memSearch input, so a user mid-filter silently
@@ -680,7 +804,7 @@ window.JD = window.JD || {};
 			if (detail) detail.innerHTML = '<div class="mem-read-inner">' + renderDetail(model) + "</div>";
 			wireTree(model);
 			wireDetail(model);
-			return;
+				return;
 		}
 		document.getElementById("app").innerHTML =
 			'<section class="memories-page"><aside class="mem-navigator" aria-label="Memory browser">' +

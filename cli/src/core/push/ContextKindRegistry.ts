@@ -70,6 +70,15 @@ function validateDefinitions(definitions: ReadonlyArray<AnyContextKind>): Readon
 		if (kind.clientKeyPrefix === "") {
 			throw new Error(`ContextKindDefinition ${label}: clientKeyPrefix must be a non-empty string when set`);
 		}
+		if (kind.docScope === "summary" && (kind.docIdField === undefined || kind.docUrlField === undefined)) {
+			// The defaults are `CommitSummary.jolliDocId` / `jolliDocUrl` — the memory
+			// article's OWN fields — so a summary-scoped kind that inherits them would
+			// overwrite the memory's published identity with its attachment's. The
+			// authoring type already requires both; this covers the erased form.
+			throw new Error(
+				`ContextKindDefinition ${label}: a summary-scoped kind must override both docIdField and docUrlField`,
+			);
+		}
 		const prefix = clientKeyPrefixOf(kind);
 		if (seenPrefixes.has(prefix)) {
 			throw new Error(`ContextKindDefinition ${label}: duplicate clientKeyPrefix ${JSON.stringify(prefix)}`);
@@ -91,6 +100,44 @@ export function docIdFieldOf(kind: AnyContextKind): string {
 
 export function docUrlFieldOf(kind: AnyContextKind): string {
 	return kind.docUrlField ?? DEFAULT_DOC_URL_FIELD;
+}
+
+/** True when this kind's published id/URL live on the `CommitSummary` rather than on each item. */
+export function isSummaryScoped(kind: AnyContextKind): boolean {
+	return kind.docScope === "summary";
+}
+
+/**
+ * The id/URL a prior push recorded for `item`, read from whichever carrier the
+ * kind's `docScope` names.
+ *
+ * The one accessor every push path uses, so the scope decision is made once. Reading
+ * `docIdOf(kind, item)` directly is correct ONLY where the carrier really is the item
+ * (the cross-commit winner rule, which a summary-scoped kind does not participate in).
+ */
+export function storedDocOf(
+	kind: AnyContextKind,
+	summary: CommitSummary,
+	item: unknown,
+): { docId?: number; docUrl?: string } {
+	const carrier = isSummaryScoped(kind) ? summary : item;
+	return { docId: docIdOf(kind, carrier), docUrl: docUrlOf(kind, carrier) };
+}
+
+/** Returns a copy of `summary` carrying a summary-scoped kind's published id + URL. */
+export function withSummaryDoc(
+	kind: AnyContextKind,
+	summary: CommitSummary,
+	url: string,
+	docId: number | undefined,
+): CommitSummary {
+	return {
+		...summary,
+		[docUrlFieldOf(kind)]: url,
+		// A batch push weaves a placeholder URL before the server has minted an id, so
+		// the id stays absent rather than being written as the placeholder string.
+		...(docId !== undefined && { [docIdFieldOf(kind)]: docId }),
+	} as CommitSummary;
 }
 
 /** Whether the summary markdown links these items — drives batch placeholder minting. */

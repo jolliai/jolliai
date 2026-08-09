@@ -146,6 +146,21 @@ describe("applyStatsEvents — projection", () => {
 		expect(rows[0]).toEqual({ input_tokens: 7, est_cost_usd: 0.1 });
 	});
 
+	it("keeps the model split when a usage-less re-read sends models: []", async () => {
+		await applyStatsEvents([envelope(session())], { producerKind: "cli", dbPath });
+		const before = await query<{ n: number }>("SELECT COUNT(*) AS n FROM session_model_usage");
+		expect(before[0].n).toBeGreaterThan(0);
+		// `models: []` with no scalar token fields is "tokens unobserved", the
+		// same shape the carry-forward above recognises. Deleting the split on it
+		// left the session reporting tokens in the KPI row while the model
+		// dimension reported none — the orphaned state this guard exists for.
+		await applyStatsEvents([envelope(session({ models: [] }))], { producerKind: "cli", dbPath });
+		expect(await query<{ n: number }>("SELECT COUNT(*) AS n FROM session_model_usage")).toEqual(before);
+		expect(await query<{ input_tokens: number }>("SELECT input_tokens FROM sessions")).toEqual([
+			{ input_tokens: 100 },
+		]);
+	});
+
 	it("leaves session cost NULL when no model carries an estimate and the event has none", async () => {
 		await applyStatsEvents(
 			[
@@ -319,12 +334,139 @@ describe("write-ahead log", () => {
 			{ dbPath },
 		);
 		const result = await applyStatsEvents([], { producerKind: "cli", dbPath });
-		expect(result).toMatchObject({ projected: 0, pending: 1 });
+		// pending: 0, not 1 — the row is parked in the table (asserted below) but
+		// is not part of the backlog this build can ever work off, and `pending` is
+		// a cursor gate rather than a table census. See the head-of-line test.
+		expect(result).toMatchObject({ projected: 0, pending: 0 });
 		const rows = await query<{ projection_status: string; attempts: number }>(
 			"SELECT projection_status, attempts FROM events_raw",
 		);
 		// Untouched: no attempt burned on an event this build cannot understand.
 		expect(rows).toEqual([{ projection_status: "pending", attempts: 0 }]);
+	});
+
+	it("reports the rows the claim LIMIT never reached as pending", async () => {
+		// `Backfill.applyBatches` refuses to advance the summaries cursor while
+		// anything is unprojected, so `pending` has to mean exactly that. The
+		// tally it replaces counted only future-schema rows plus this pass's own
+		// failures — so a first tick with more sessions than one batch reported a
+		// clean drain over hundreds of events that were still waiting.
+		await withDashboardDb(
+			(db) => {
+				for (let i = 0; i < 505; i++) {
+					db.prepare(
+						`INSERT INTO events_raw (event_id, repo_identity, type, schema_version, received_at, data_json)
+					 VALUES (?, 'repo-1', 'session.upserted', ?, 't', ?)`,
+					).run(
+						`session:repo-1:claude:s${i}`,
+						STATS_EVENT_SCHEMA_VERSION,
+						JSON.stringify(session({ sessionId: `s${i}` })),
+					);
+				}
+			},
+			{ dbPath },
+		);
+		const result = await applyStatsEvents([], { producerKind: "cli", dbPath });
+		expect(result.projected).toBe(500);
+		expect(result.pending).toBe(5);
+	});
+
+	it("scopes pending to the repos the caller is reporting on", async () => {
+		// `events_raw` is machine-global but the caller's gate is per-repo:
+		// `Backfill` asks "may I advance repo-1's summaries cursor?". Counting
+		// another repo's in-flight rows answers a question nobody asked and holds
+		// repo-1 back for a reason repo-1 cannot act on. Unlike the future-schema
+		// case this one is self-healing, so it is scoped rather than an error.
+		await withDashboardDb(
+			(db) => {
+				const insert = db.prepare(
+					`INSERT INTO events_raw (event_id, repo_identity, type, schema_version, received_at, data_json)
+					 VALUES (?, ?, 'session.upserted', ?, 't', ?)`,
+				);
+				// repo-1's own row goes in FIRST: the claim is `ORDER BY seq LIMIT n`,
+				// so seeding it behind repo-2's overflow would leave it genuinely
+				// undrained and `pending: 1` would be the right answer for the wrong
+				// reason — the assertion has to fail only when the SCOPE is missing.
+				insert.run(
+					"session:repo-1:claude:mine",
+					"repo-1",
+					STATS_EVENT_SCHEMA_VERSION,
+					JSON.stringify(session({ sessionId: "mine" })),
+				);
+				for (let i = 0; i < 505; i++) {
+					insert.run(
+						`session:repo-2:claude:o${i}`,
+						"repo-2",
+						STATS_EVENT_SCHEMA_VERSION,
+						JSON.stringify(session({ repoIdentity: "repo-2", sessionId: `o${i}` })),
+					);
+				}
+			},
+			{ dbPath },
+		);
+		// One drain: 500 rows claimed — repo-1's, plus 499 of repo-2's. repo-2 is
+		// left with 6 undrained, which are none of repo-1's business.
+		const scoped = await withDashboardDb((db) => drainPending(db, { pendingScope: ["repo-1"] }), { dbPath });
+		expect(scoped.projected).toBe(500);
+		expect(scoped.pending).toBe(0);
+		// Asserted against the table, not a second drain: re-running the drain to
+		// prove the backlog exists would consume it, and `pending: 0` above would
+		// then pass for the trivial reason that nothing was left either way. The
+		// empty-scope fallback to a global count is covered by the LIMIT test.
+		expect(
+			await query<{ n: number }>(
+				"SELECT COUNT(*) AS n FROM events_raw WHERE projection_status = 'pending' AND repo_identity = 'repo-2'",
+			),
+		).toEqual([{ n: 6 }]);
+	});
+
+	it("un-parks an unknown-type event once a build that understands it drains", async () => {
+		// The promise `projectEvent`'s default throw makes — "the event survives
+		// for a build that understands it" — was not kept: the claim selects
+		// 'pending' and nothing reset 'failed'. Only THAT reason is revivable; a
+		// genuinely defective event must stay parked rather than burn its attempt
+		// budget again on every drain.
+		await withDashboardDb(
+			(db) => {
+				db.prepare(
+					`INSERT INTO events_raw (event_id, type, schema_version, received_at, data_json)
+				 VALUES ('future', 'commit.vibes', ?, 't', '{"type":"commit.vibes"}')`,
+				).run(STATS_EVENT_SCHEMA_VERSION);
+				db.prepare(
+					`INSERT INTO events_raw (event_id, type, schema_version, received_at, data_json)
+				 VALUES ('bad', 'session.upserted', ?, 't', 'not json')`,
+				).run(STATS_EVENT_SCHEMA_VERSION);
+			},
+			{ dbPath },
+		);
+		for (let i = 0; i < 5; i++) await applyStatsEvents([], { producerKind: "cli", dbPath });
+		expect(
+			await query<{ event_id: string; failed_kind: string | null }>(
+				"SELECT event_id, failed_kind FROM events_raw WHERE projection_status = 'failed' ORDER BY event_id",
+			),
+		).toEqual([
+			{ event_id: "bad", failed_kind: "error" },
+			{ event_id: "future", failed_kind: "unknown-type" },
+		]);
+
+		// Now this build knows the type: the row returns to the queue, attempts
+		// reset. The defective one is untouched.
+		await withDashboardDb(
+			(db) => db.prepare("UPDATE events_raw SET type = 'session.upserted' WHERE event_id = 'future'").run(),
+			{ dbPath },
+		);
+		await withDashboardDb(
+			(db) =>
+				db
+					.prepare("UPDATE events_raw SET data_json = ? WHERE event_id = 'future'")
+					.run(JSON.stringify(session())),
+			{ dbPath },
+		);
+		const result = await applyStatsEvents([], { producerKind: "cli", dbPath });
+		expect(result.projected).toBe(1);
+		expect(await query("SELECT event_id FROM events_raw WHERE projection_status = 'failed'")).toEqual([
+			{ event_id: "bad" },
+		]);
 	});
 
 	it("poison-pills an event that keeps failing, without blocking the rest", async () => {
@@ -446,8 +588,13 @@ describe("write-ahead log", () => {
 
 		const result = await withDashboardDb((db) => drainPending(db), { dbPath });
 		expect(result.projected).toBe(1);
-		// Every future row is still pending — deferred, never dropped or guessed.
-		expect(result.pending).toBe(600);
+		// Reported as a CLEAR backlog even though 600 rows are still pending in the
+		// table. `pending` gates `Backfill`'s summaries cursor, and a future-schema
+		// row can never be claimed by this build — `attempts` stays 0, so it never
+		// ages out either. Counting it stalls that cursor permanently, for every
+		// repo, and each pass then re-collects the whole index. The rows staying
+		// parked is asserted below; that is the "deferred, never dropped" promise.
+		expect(result.pending).toBe(0);
 		const rows = await withDashboardDb(
 			(db) =>
 				db

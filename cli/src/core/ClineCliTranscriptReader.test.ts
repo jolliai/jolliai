@@ -111,3 +111,79 @@ describe("readClineCliTranscript", () => {
 		expect(r.totalLinesRead).toBe(0);
 	});
 });
+
+describe("readClineCliTranscript toolUse", () => {
+	let dir: string;
+	let path: string;
+	beforeEach(async () => {
+		dir = await mkdtemp(join(tmpdir(), "cline-cli-tools-"));
+		path = join(dir, "m.messages.json");
+	});
+	afterEach(async () => {
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	it("counts the fixture's tool_use block without counting its tool_result", async () => {
+		await writeFile(path, JSON.stringify(FIXTURE), "utf8");
+		const r = await readClineCliTranscript(path);
+		// m3 makes one `run_commands` call; m4 is that call's result, echoed back
+		// as a `tool_result` block carrying the same `name`.
+		expect(r.toolUse).toEqual([{ name: "run_commands", kind: "builtin", calls: 1 }]);
+	});
+
+	it("classifies an MCP call by its mcp__ prefix", async () => {
+		await writeFile(
+			path,
+			JSON.stringify({
+				messages: [
+					{
+						id: "m1",
+						role: "assistant",
+						content: [{ type: "tool_use", id: "c1", name: "mcp__jollimemory__recall", input: {} }],
+						ts: 1000,
+					},
+				],
+			}),
+			"utf8",
+		);
+		const r = await readClineCliTranscript(path);
+		expect(r.toolUse).toEqual([{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory", calls: 1 }]);
+	});
+
+	it("reports an empty array — not undefined — for a tool-free slice", async () => {
+		await writeFile(
+			path,
+			JSON.stringify({ messages: [{ id: "m1", role: "user", content: [{ type: "text", text: "hi" }], ts: 1 }] }),
+			"utf8",
+		);
+		const r = await readClineCliTranscript(path);
+		expect(r.toolUse).toEqual([]);
+	});
+
+	it("counts only the calls inside the consumed slice", async () => {
+		await writeFile(
+			path,
+			JSON.stringify({
+				messages: [
+					{
+						id: "m1",
+						role: "assistant",
+						content: [{ type: "tool_use", id: "c1", name: "read_file", input: {} }],
+						ts: 1000,
+					},
+					{
+						id: "m2",
+						role: "assistant",
+						content: [{ type: "tool_use", id: "c2", name: "run_commands", input: {} }],
+						ts: 9000,
+					},
+				],
+			}),
+			"utf8",
+		);
+		const first = await readClineCliTranscript(path, null, new Date(5000).toISOString());
+		expect(first.toolUse).toEqual([{ name: "read_file", kind: "builtin", calls: 1 }]);
+		const second = await readClineCliTranscript(path, first.newCursor);
+		expect(second.toolUse).toEqual([{ name: "run_commands", kind: "builtin", calls: 1 }]);
+	});
+});

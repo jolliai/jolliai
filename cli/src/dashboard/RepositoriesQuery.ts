@@ -12,6 +12,7 @@
 
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import type { RepositoriesModel, RepositoryRow } from "./DashboardModel.js";
+import { isReachable, type ReachableCommits } from "./MemoriesQuery.js";
 import { type RegisteredRepo, readRepoRegistry } from "./RepoRegistry.js";
 
 /** The setup card's "what gets installed" manifest — shared by Repositories and Settings → Hooks. */
@@ -22,38 +23,66 @@ export const HOOKS_MANIFEST: ReadonlyArray<{ readonly title: string; readonly de
 	{ title: "Memory branch", detail: "an orphan branch in this repo, so memories travel with it" },
 ];
 
-interface CountsRow {
+interface SessionCountsRow {
 	readonly repo_identity: string;
-	readonly memories: number;
 	readonly sessions: number;
 }
 
-function readCounts(db: DashboardDbHandle): Map<string, { memories: number; sessions: number }> {
-	const rows = db
+interface RootMemoryRow {
+	readonly repo_identity: string;
+	readonly commit_hash: string;
+}
+
+function readCounts(
+	db: DashboardDbHandle,
+	reachable: ReachableCommits | undefined,
+): Map<string, { memories: number; sessions: number }> {
+	const counts = new Map<string, { memories: number; sessions: number }>();
+	const sessionRows = db
 		.prepare(
-			// Both counted live off the detail tables, over their repo_id indexes.
-			// `sessions` used to read a stored aggregate that the projection path
-			// maintained for this one query; counting it here the same way memories
-			// were already counted removed that whole write path, and with it the
-			// window where a prune left the aggregate describing rows it had just
-			// deleted. This page lists a handful of repos — two indexed COUNTs.
-			//
-			// `parent_hash IS NULL` counts MEMORIES, not memory ROWS: `memories` is
-			// a tree (amend/squash/rebase file the follow-up under the original as a
-			// child — see SotSchema's root_hash/depth), so a plain COUNT(*) inflated
-			// every repo by its rewrite history and disagreed with the Memories
-			// browser, which lists roots only (`buildMemoriesList`). Keep the two
-			// predicates in step. The browser additionally drops roots no local
-			// branch can still reach, which needs a `git rev-list` per repo and so
-			// is not reproduced here — this count can therefore still read high for
-			// a repo whose history was rewritten away.
+			// Counted live off the detail table, over its repo_id index. `sessions`
+			// used to read a stored aggregate that the projection path maintained
+			// for this one query; counting it here removed that whole write path,
+			// and with it the window where a prune left the aggregate describing
+			// rows it had just deleted. This page lists a handful of repos.
 			`SELECT r.repo_identity,
-			        (SELECT COUNT(*) FROM memories m WHERE m.repo_id = r.id AND m.parent_hash IS NULL) AS memories,
 			        (SELECT COUNT(*) FROM sessions s WHERE s.repo_id = r.id) AS sessions
 			   FROM repos r`,
 		)
-		.all() as ReadonlyArray<CountsRow>;
-	return new Map(rows.map((row) => [row.repo_identity, { memories: row.memories, sessions: row.sessions }]));
+		.all() as ReadonlyArray<SessionCountsRow>;
+	for (const row of sessionRows) counts.set(row.repo_identity, { memories: 0, sessions: row.sessions });
+
+	// Memories are counted by the SAME two rules the Memories browser applies —
+	// keep the pair in step, or the badge and the tree report different totals
+	// for one repo (they did: the badge read ~2.5x high on a machine whose
+	// branches had been rebased away).
+	//
+	// (1) `parent_hash IS NULL` counts MEMORIES, not memory ROWS: `memories` is
+	// a tree (amend/squash/rebase file the follow-up under the original as a
+	// child — see SotSchema's root_hash/depth), so a plain COUNT(*) inflates
+	// every repo by its rewrite history.
+	//
+	// (2) git reachability drops roots no local branch can still reach. That
+	// cannot be expressed in SQL, so — exactly like `buildMemoriesList` — the
+	// hashes are fetched and filtered here rather than COUNTed. The row set is
+	// one machine's root memories, not the whole `memories` tree. `reachable`
+	// is undefined for callers that did not pay for the `git rev-list` (and
+	// `isReachable` fails open per repo), which restores the old raw count.
+	const rootRows = db
+		.prepare(
+			`SELECT r.repo_identity, m.commit_hash
+			   FROM memories m
+			   JOIN repos r ON r.id = m.repo_id
+			  WHERE m.parent_hash IS NULL`,
+		)
+		.all() as ReadonlyArray<RootMemoryRow>;
+	for (const row of rootRows) {
+		if (!isReachable(reachable, row.repo_identity, row.commit_hash)) continue;
+		const entry = counts.get(row.repo_identity);
+		if (entry) entry.memories += 1;
+		else counts.set(row.repo_identity, { memories: 1, sessions: 0 });
+	}
+	return counts;
 }
 
 function toRow(repo: RegisteredRepo, counts: Map<string, { memories: number; sessions: number }>): RepositoryRow {
@@ -69,9 +98,13 @@ function toRow(repo: RegisteredRepo, counts: Map<string, { memories: number; ses
 	};
 }
 
-export async function buildRepositoriesModel(db: DashboardDbHandle, configDir?: string): Promise<RepositoriesModel> {
+export async function buildRepositoriesModel(
+	db: DashboardDbHandle,
+	configDir?: string,
+	reachable?: ReachableCommits,
+): Promise<RepositoriesModel> {
 	const registry = await readRepoRegistry(configDir);
-	const counts = readCounts(db);
+	const counts = readCounts(db, reachable);
 	return {
 		repos: registry.repos.map((repo) => toRow(repo, counts)),
 		hooksManifest: HOOKS_MANIFEST,

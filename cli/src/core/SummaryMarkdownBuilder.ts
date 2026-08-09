@@ -319,9 +319,26 @@ export function buildReferencePushMarkdown(ref: ReferenceCommitRef, description?
 }
 
 /**
- * Builds the article body pushed for a single archived skill (docType `skill`).
+ * Builds the article body pushed for ONE COMMIT's whole skill aggregate (docType
+ * `skill`).
  *
- * **Every figure is THIS COMMIT's increment, read off the `ref` alone.** That is
+ * **One article per commit, listing every skill** — the same set, in the same
+ * table, as the Memory Bank's `skills--<hash8>.md` and the single "Skills used"
+ * Context row every IDE surface renders. It used to be one article per (skill,
+ * commit), so a commit that entered six skills published six documents against a
+ * local Context that shows exactly one file. The local aggregate is the shape the
+ * user already reads; the push now matches it rather than inventing a second
+ * decomposition of the same data.
+ *
+ * The table goes through {@link buildSkillsTable} — the same renderer the local
+ * aggregate and the sidebar use, which owns the em-dash-not-zero rule, the `~`
+ * estimate marker, the `†` inferred footnote and the heaviest-first ordering. That
+ * is what keeps this body byte-identical to the table VS Code shows for the same
+ * commit, and it is also why the per-skill identity (host / plugin / entry paths)
+ * is appended BELOW the table as a detail list rather than folded into it: those
+ * are not measurements and have no column.
+ *
+ * **Every figure is THIS COMMIT's increment, read off the refs alone.** That is
  * the whole contract of this function, and it is a deliberate reversal: the body
  * used to prefer the orphan-branch snapshot's frontmatter, whose counters are the
  * registry row's RUNNING TOTAL across every commit that used the skill (see
@@ -332,10 +349,10 @@ export function buildReferencePushMarkdown(ref: ReferenceCommitRef, description?
  * numbers for one commit, and the article's were the larger, so the memory looked
  * more expensive than it was.
  *
- * Making the increment win is only coherent because the article is now one
- * document per (skill, commit): with the old cross-commit `baseKey` a single
- * shared document would have shown whichever commit pushed last. The two changes
- * are one change — see the `skill` definition's `baseKey` in `push/kinds/index.ts`.
+ * Making the increment win is only coherent because the article is per COMMIT:
+ * with the old cross-commit `baseKey` a single shared document would have shown
+ * whichever commit pushed last. The two changes are one change — see the `skill`
+ * definition's `baseKey` and `aggregate` in `push/kinds/index.ts`.
  *
  * **Three things the old body carried are deliberately gone**, all for the same
  * reason — they are cumulative and cannot be re-derived per commit, so in a
@@ -355,33 +372,42 @@ export function buildReferencePushMarkdown(ref: ReferenceCommitRef, description?
  * identity (HOW the skill is entered), not measurements, so they cannot be read as
  * overstating what this commit cost.
  */
-export function buildSkillPushMarkdown(ref: SkillCommitRef): string {
-	const lines: Array<string> = [];
-	lines.push(`- **Host:** ${escMdLinkText(skillSourceLabel(ref.source))}`);
-	if (ref.plugin !== undefined && ref.plugin !== "") {
-		lines.push(`- **Plugin:** ${escMdLinkText(ref.plugin)}`);
-	}
-	if (ref.entryPaths.length > 0) {
-		lines.push(`- **Entered via:** ${ref.entryPaths.map((p) => escMdLinkText(p)).join(", ")}`);
-	}
-
+export function buildSkillsPushMarkdown(refs: ReadonlyArray<SkillCommitRef>): string {
 	// The token figures go through the SAME renderer every other skill surface
 	// uses, rather than being re-formatted here: `buildSkillsTable` owns the
-	// em-dash-not-zero rule, the `~` estimate marker and the `†` inferred
-	// footnote, and its docstring is explicit that those must not be duplicated.
-	// Passing the ref straight through is what keeps this table byte-identical to
-	// the row the VS Code panel renders for the same commit.
-	lines.push(
-		"",
-		...buildSkillsTable([
-			{
+	// em-dash-not-zero rule, the `~` estimate marker, the `†` inferred footnote and
+	// the heaviest-first ordering, and its docstring is explicit that those must not
+	// be duplicated. Passing the refs straight through is what keeps this table
+	// byte-identical to the one the VS Code panel renders for the same commit.
+	const lines: Array<string> = [
+		...buildSkillsTable(
+			refs.map((ref) => ({
 				skill: ref.skill,
 				invocationCount: ref.invocationCount,
 				...(ref.usage !== undefined && { usage: ref.usage }),
 				...(ref.detection !== undefined && { detection: ref.detection }),
-			},
-		]),
-	);
+			})),
+		),
+	];
+
+	// Identity, not measurement — see the header for why it sits below the table.
+	// Ordered by skill id rather than by weight: this list is looked up by name, and
+	// a stable order keeps a re-push from producing a spurious diff.
+	const detailed = [...refs].sort((a, b) => (a.skill < b.skill ? -1 : a.skill > b.skill ? 1 : 0));
+	const details: Array<string> = [];
+	for (const ref of detailed) {
+		const bits: Array<string> = [`Host: ${escMdLinkText(skillSourceLabel(ref.source))}`];
+		if (ref.plugin !== undefined && ref.plugin !== "") {
+			bits.push(`Plugin: ${escMdLinkText(ref.plugin)}`);
+		}
+		if (ref.entryPaths.length > 0) {
+			bits.push(`Entered via: ${ref.entryPaths.map((p) => escMdLinkText(p)).join(", ")}`);
+		}
+		details.push(`- **${escMdLinkText(ref.skill)}** — ${bits.join(" · ")}`);
+	}
+	if (details.length > 0) {
+		lines.push("", "## Skill details", "", ...details);
+	}
 	return lines.join("\n");
 }
 

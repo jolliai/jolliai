@@ -73,7 +73,7 @@ export function commitCategoryLabels(db: DashboardDbHandle, scope: DashboardScop
 	const filter = scopeFilter(scopeToRepoId(db, scope), "t.repo_id");
 	const rows = db
 		.prepare(
-			`SELECT r.repo_name, ranked.commit_hash, ranked.category
+			`SELECT r.repo_identity, ranked.commit_hash, ranked.category
 			   FROM (SELECT t.repo_id, t.commit_hash, t.category,
 			                COUNT(*) AS n, MIN(t.pos) AS first_pos,
 			                ROW_NUMBER() OVER (PARTITION BY t.repo_id, t.commit_hash ORDER BY COUNT(*) DESC, MIN(t.pos) ASC) AS rn
@@ -83,8 +83,14 @@ export function commitCategoryLabels(db: DashboardDbHandle, scope: DashboardScop
 			   JOIN repos r ON r.id = ranked.repo_id
 			  WHERE ranked.rn = 1`,
 		)
-		.all(...filter.params) as ReadonlyArray<{ repo_name: string; commit_hash: string; category: string }>;
-	return new Map(rows.map((row) => [`${row.repo_name}\0${row.commit_hash}`, row.category]));
+		.all(...filter.params) as ReadonlyArray<{ repo_identity: string; commit_hash: string; category: string }>;
+	// Keyed by repo_identity, NOT repo_name: the name is a display label and two
+	// registered repos can share one (an upstream and its fork, two clones of the
+	// same project). Their hashes overlap by construction, so in the all-repos
+	// scope a name-keyed map collided and painted one repo's category label onto
+	// the other's memories and standup rows. `CommitRow.repo_identity` carries
+	// the same warning for the same reason.
+	return new Map(rows.map((row) => [`${row.repo_identity}\0${row.commit_hash}`, row.category]));
 }
 
 /**

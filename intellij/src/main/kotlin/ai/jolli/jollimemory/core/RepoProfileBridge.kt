@@ -106,12 +106,34 @@ object RepoProfileBridge {
         val profileFile = resolveProfileJsonPath(cwd) ?: return null
         if (!profileFile.isFile) return null
         return try {
-            val flag = JsonParser.parseString(profileFile.readText(Charsets.UTF_8))
-                ?.asJsonObject?.get("manuallyDisabled")
-            if (flag == null || flag.isJsonNull) null else flag.asBoolean
+            readUserDisabled(JsonParser.parseString(profileFile.readText(Charsets.UTF_8))?.asJsonObject)
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * The disable axis, in the CLI's own precedence order — see
+     * [readManualDisableFlagSync in RepoProfile.ts].
+     *
+     * `userDisabled` FIRST, and `manuallyDisabled` only when it is absent. The
+     * two are not synonyms since the cutover split them: `manuallyDisabled` is a
+     * DERIVED composite (`userDisabled OR a cutover fence is present`), recomputed
+     * on every write and never authored by hand. Reading it as the answer means a
+     * repo that was merely fenced — a normal, non-user-initiated cutover state —
+     * reads back as "the user disabled this", so IntelliJ shows the DisabledPanel
+     * and skips auto-install for a repo nobody disabled. The composite survives
+     * only as the migration fallback for a profile written before the split.
+     *
+     * Returns null for "undecided" (absent or malformed), so the caller falls back
+     * rather than inventing a decision.
+     */
+    private fun readUserDisabled(obj: JsonObject?): Boolean? {
+        val user = obj?.get("userDisabled")
+        if (user != null && !user.isJsonNull) return user.asBoolean
+        val legacy = obj?.get("manuallyDisabled")
+        if (legacy != null && !legacy.isJsonNull) return legacy.asBoolean
+        return null
     }
 
     /**
@@ -140,11 +162,13 @@ object RepoProfileBridge {
         if (profileFile != null && profileFile.isFile) {
             try {
                 val parsed = JsonParser.parseString(profileFile.readText(Charsets.UTF_8))
-                val flag = parsed?.asJsonObject?.get("manuallyDisabled")
-                if (flag != null && !flag.isJsonNull) {
-                    return flag.asBoolean
+                // userDisabled first, composite only as the pre-split fallback —
+                // see [readUserDisabled] for why the two are not interchangeable.
+                val flag = readUserDisabled(parsed?.asJsonObject)
+                if (flag != null) {
+                    return flag
                 }
-                // profile.json exists but the field is absent — fall through
+                // profile.json exists but neither field is present — fall through
                 // to the legacy per-worktree marker so a pre-migration disable
                 // still counts as disabled.
             } catch (_: Exception) {

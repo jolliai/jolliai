@@ -208,10 +208,17 @@ describe("runDaemonServer", () => {
 	 * suite would inject refresh lines into these assertions.
 	 */
 	let plansDir: string;
+	/**
+	 * Same for the machine-global `~/.jolli/jollimemory/` the `memory-db` target
+	 * watches: a dashboard write from any other repo on this machine would
+	 * otherwise emit a `memory-db` refresh into these assertions.
+	 */
+	let globalConfigDir: string;
 
 	beforeEach(() => {
 		root = mkdtempSync(join(tmpdir(), "daemon-server-"));
 		plansDir = join(root, "claude-plans");
+		globalConfigDir = join(root, "global-config");
 		mockExec.mockReset();
 		// Default to "not a git repo" so tests don't depend on the host's git.
 		mockExec.mockImplementation(() => {
@@ -229,7 +236,7 @@ describe("runDaemonServer", () => {
 		const chunks: string[] = [];
 		stdout.on("data", (buf) => chunks.push(String(buf)));
 
-		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 10 });
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, globalConfigDir, debounceMs: 10 });
 
 		// End stdin to trigger shutdown once ready has been written.
 		stdin.end();
@@ -250,7 +257,7 @@ describe("runDaemonServer", () => {
 		const chunks: string[] = [];
 		stdout.on("data", (buf) => chunks.push(String(buf)));
 
-		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 50 });
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, globalConfigDir, debounceMs: 50 });
 
 		// The queue dir is ensureDir=true, so it exists right after start(). Give
 		// fs.watch a beat to arm on all platforms before writing.
@@ -289,7 +296,7 @@ describe("runDaemonServer", () => {
 		const chunks: string[] = [];
 		stdout.on("data", (buf) => chunks.push(String(buf)));
 
-		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 50 });
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, globalConfigDir, debounceMs: 50 });
 		await sleep(150);
 
 		// The noise first: if the `.md` gate were missing this would produce its
@@ -329,7 +336,7 @@ describe("runDaemonServer", () => {
 		stdout.on("data", (buf) => chunks.push(String(buf)));
 
 		// ensureDir=true on this target, so the dir exists right after start().
-		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 50 });
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, globalConfigDir, debounceMs: 50 });
 		await sleep(150);
 
 		// debug.log is the reason this target is gated at all — it is written many
@@ -370,7 +377,7 @@ describe("runDaemonServer", () => {
 		try {
 			const stdout = new PassThrough();
 			const stdin = new PassThrough();
-			const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 10 });
+			const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, globalConfigDir, debounceMs: 10 });
 
 			// Target still doesn't exist — advance a couple of intervals so the
 			// retry callback runs, hits the `watcher.start() === false` path, and
@@ -390,7 +397,7 @@ describe("runDaemonServer", () => {
 		try {
 			const stdout = new PassThrough();
 			const stdin = new PassThrough();
-			const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 10 });
+			const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, globalConfigDir, debounceMs: 10 });
 
 			// The orphan-ref target (`.git/refs/heads/jollimemory/summaries`) doesn't
 			// exist at startup, so a retry interval was armed. Create the dir now and
@@ -415,7 +422,7 @@ describe("runDaemonServer", () => {
 		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
 
 		try {
-			const done = runDaemonServer({ cwd: root, plansDir });
+			const done = runDaemonServer({ cwd: root, plansDir, globalConfigDir });
 			// Fire 'end' on the real process.stdin so the daemon shuts down.
 			stdinRef.emit("end");
 			await done;
@@ -438,7 +445,7 @@ describe("runDaemonServer", () => {
 		// and shut down cleanly when we fire the `end` event.
 		const stdin = new EventEmitter() as unknown as NodeJS.ReadableStream;
 
-		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 10 });
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, globalConfigDir, debounceMs: 10 });
 		(stdin as unknown as EventEmitter).emit("end");
 		await done;
 	});
@@ -446,7 +453,7 @@ describe("runDaemonServer", () => {
 	it("treats a stdin 'close' event as shutdown", async () => {
 		const stdout = new PassThrough();
 		const stdin = new PassThrough();
-		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, debounceMs: 10 });
+		const done = runDaemonServer({ cwd: root, stdin, stdout, plansDir, globalConfigDir, debounceMs: 10 });
 
 		(stdin as unknown as EventEmitter).emit("close");
 		await done;

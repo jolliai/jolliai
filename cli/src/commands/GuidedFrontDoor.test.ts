@@ -25,7 +25,7 @@ const h = vi.hoisted(() => ({
 	saveUserProfile: vi.fn(),
 	isInsideGitWorkTree: vi.fn(),
 	isLocalAgentUsable: vi.fn(),
-	importDashboardHistory: vi.fn(),
+	executeDashboard: vi.fn(),
 	canUseDashboardDb: vi.fn(),
 }));
 
@@ -54,7 +54,7 @@ vi.mock("../dashboard/DashboardDb.js", () => ({ canUseDashboardDb: h.canUseDashb
 vi.mock("../hooks/PushCompensation.js", () => ({ triggerPendingPushRetry: h.triggerPendingPushRetry }));
 vi.mock("../install/GitHookInstaller.js", () => ({ isGitHookInstalled: h.isGitHookInstalled }));
 vi.mock("../install/Installer.js", () => ({ install: h.install }));
-vi.mock("./DashboardCommand.js", () => ({ importDashboardHistory: h.importDashboardHistory }));
+vi.mock("./DashboardCommand.js", () => ({ executeDashboard: h.executeDashboard }));
 vi.mock("./EnableCommand.js", () => ({ promptSetup: h.promptSetup }));
 vi.mock("./SpaceSyncStep.js", () => ({ runSpaceSyncStep: h.runSpaceSyncStep }));
 vi.mock("./BackfillFrontDoorStep.js", () => ({ runBackfillFrontDoorStep: h.runBackfillFrontDoorStep }));
@@ -125,7 +125,7 @@ describe("GuidedFrontDoor", () => {
 		h.isInsideGitWorkTree.mockReturnValue(true);
 		h.isLocalAgentUsable.mockResolvedValue(true);
 		h.canUseDashboardDb.mockReturnValue(true);
-		h.importDashboardHistory.mockResolvedValue(undefined);
+		h.executeDashboard.mockResolvedValue(true);
 	});
 
 	afterEach(() => {
@@ -790,19 +790,19 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).not.toContain("Next steps");
 	});
 
-	// ── Importing history into the dashboard database. Triggered by the back-fill
-	// STEP COMPLETING (not by it having built anything), because that step reports
-	// nothing back, and because this import is the only thing that moves freshly
-	// built memories into the dashboard database. No web service is started. ──
+	// ── Waking the local web service. Triggered by the back-fill STEP COMPLETING
+	// (not by it having built anything), because that step reports nothing back,
+	// and because this call is the only thing that moves freshly built memories
+	// into the dashboard database AND puts them on screen. ──
 
-	describe("dashboard history import", () => {
-		it("imports after the back-fill step, before Next steps", async () => {
+	describe("local dashboard wake-up", () => {
+		it("wakes the dashboard after the back-fill step, before Next steps", async () => {
 			await runGuidedFrontDoor();
 
-			expect(h.importDashboardHistory).toHaveBeenCalledWith("/repo");
-			// Order matters: the import is what picks up whatever the back-fill just wrote.
+			expect(h.executeDashboard).toHaveBeenCalledWith("stats", { cwd: "/repo" });
+			// Order matters: the import half is what picks up whatever the back-fill just wrote.
 			expect(h.runBackfillFrontDoorStep.mock.invocationCallOrder[0]).toBeLessThan(
-				h.importDashboardHistory.mock.invocationCallOrder[0] as number,
+				h.executeDashboard.mock.invocationCallOrder[0] as number,
 			);
 			// And it lands before the closing orientation.
 			expect(logs.findIndex((l) => l.includes("Jolli is listening"))).toBeLessThan(
@@ -810,35 +810,51 @@ describe("GuidedFrontDoor", () => {
 			);
 		});
 
-		it("imports even when the back-fill offer was declined or never appeared", async () => {
-			// The step is a no-op in both cases and returns void either way — the import
+		it("wakes even when the back-fill offer was declined or never appeared", async () => {
+			// The step is a no-op in both cases and returns void either way — the wake-up
 			// is deliberately not conditional on it having built anything.
 			h.runBackfillFrontDoorStep.mockResolvedValue(undefined);
 			await runGuidedFrontDoor();
-			expect(h.importDashboardHistory).toHaveBeenCalledTimes(1);
+			expect(h.executeDashboard).toHaveBeenCalledTimes(1);
+		});
+
+		it("a dashboard that refuses or throws prints a retry hint and finishes cleanly", async () => {
+			// `executeDashboard` reports failure as `false` (it prints its own reason);
+			// the front door's exit code stays reserved for hard blockers either way.
+			h.executeDashboard.mockResolvedValue(false);
+			await runGuidedFrontDoor();
+			expect(out()).toContain("run 'jolli dashboard' to retry");
+			expect(out()).toContain("Next steps");
+			expect(process.exitCode).toBeUndefined();
+
+			logs.length = 0;
+			h.executeDashboard.mockRejectedValue(new Error("port in use"));
+			await runGuidedFrontDoor();
+			expect(out()).toContain("run 'jolli dashboard' to retry");
+			expect(process.exitCode).toBeUndefined();
 		});
 
 		it("runtime without flag-free node:sqlite → skipped silently", async () => {
 			h.canUseDashboardDb.mockReturnValue(false);
 			await runGuidedFrontDoor();
-			expect(h.importDashboardHistory).not.toHaveBeenCalled();
+			expect(h.executeDashboard).not.toHaveBeenCalled();
 			expect(out()).not.toContain("Dashboard");
 			expect(out()).toContain("Next steps");
 			expect(process.exitCode).toBeUndefined();
 		});
 
-		it("generation not configured → no back-fill step and no import", async () => {
+		it("generation not configured → no back-fill step and no wake-up", async () => {
 			h.loadAuthToken.mockResolvedValue(undefined);
 			h.loadConfig.mockResolvedValue({});
 			await runGuidedFrontDoor();
 			expect(h.runBackfillFrontDoorStep).not.toHaveBeenCalled();
-			expect(h.importDashboardHistory).not.toHaveBeenCalled();
+			expect(h.executeDashboard).not.toHaveBeenCalled();
 		});
 
-		it("dead ends (not a repo / enable declined) never import", async () => {
+		it("dead ends (not a repo / enable declined) never wake the dashboard", async () => {
 			h.isInsideGitWorkTree.mockReturnValue(false);
 			await runGuidedFrontDoor();
-			expect(h.importDashboardHistory).not.toHaveBeenCalled();
+			expect(h.executeDashboard).not.toHaveBeenCalled();
 
 			vi.clearAllMocks();
 			h.isInsideGitWorkTree.mockReturnValue(true);
@@ -851,7 +867,7 @@ describe("GuidedFrontDoor", () => {
 			h.createStorage.mockResolvedValue({});
 			h.getSummaryCount.mockResolvedValue(0);
 			await runGuidedFrontDoor();
-			expect(h.importDashboardHistory).not.toHaveBeenCalled();
+			expect(h.executeDashboard).not.toHaveBeenCalled();
 		});
 	});
 

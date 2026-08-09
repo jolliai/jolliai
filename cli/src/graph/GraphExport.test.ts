@@ -38,12 +38,14 @@ afterEach(() => {
 });
 
 describe("escapeForInlineScript", () => {
-	it("neutralizes </script and the U+2028/U+2029 terminators", () => {
+	// The behaviour itself is pinned in core/InlineScript.test.ts — this only
+	// holds the re-export, since assembleGraphHtml below depends on it.
+	it("re-exports the shared escape and leaves no raw < in the output", () => {
 		const ls = String.fromCharCode(0x2028),
 			ps = String.fromCharCode(0x2029);
 		const out = escapeForInlineScript(`{"x":"</script>${ls}${ps}"}`);
-		expect(out).toContain("<\\/script");
-		expect(out).not.toContain("</script>");
+		expect(out).not.toContain("<");
+		expect(out).toContain("\\u003c");
 		expect(out).toContain("\\u2028");
 		expect(out).toContain("\\u2029");
 		expect(out).not.toContain(ls);
@@ -78,7 +80,7 @@ describe("assembleGraphHtml", () => {
 
 	it("escapes </script inside the embedded graph data", () => {
 		const html = assembleGraphHtml({ ...PARTS, graphJson: '{"x":"</script>bad"}' });
-		expect(html).toContain("<\\/script");
+		expect(html).toContain("\\u003c/script");
 		expect(html).not.toContain("</script>bad");
 	});
 

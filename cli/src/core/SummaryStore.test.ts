@@ -63,8 +63,10 @@ import { MetadataManager } from "./MetadataManager.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import {
 	AmbiguousHashError,
+	collectChildJolliMeta,
 	collectChildReferences,
 	collectChildSkills,
+	collectChildSkillsDocMeta,
 	deleteNoteVisibleArtifact,
 	deletePlanVisibleArtifact,
 	deleteTranscript,
@@ -4283,6 +4285,102 @@ describe("SummaryStore", () => {
 				nativeId: "KAN-3",
 				title: "Jira ticket",
 			});
+		});
+	});
+
+	describe("collectChildSkillsDocMeta", () => {
+		function node(hash: string, date: string, docId?: number): CommitSummary {
+			return {
+				...createMockSummary(hash, "child"),
+				commitDate: date,
+				generatedAt: date,
+				...(docId !== undefined && {
+					jolliSkillsDocId: docId,
+					jolliSkillsDocUrl: `https://acme.jolli.ai/articles?doc=${docId}`,
+				}),
+			};
+		}
+
+		it("adopts the newest child's skill article and orphans the rest", () => {
+			// Same rule as the memory article's own hoist, deliberately: the merged root's
+			// skill table is the FOLD of its children's, so no child's article is still the
+			// same document — but updating one in place beats deleting N and creating one,
+			// because `cleanupOrphanedDocs` is best-effort and a failed delete would
+			// otherwise leave N stale articles beside the new one instead of N-1 beside a
+			// live one.
+			const result = collectChildSkillsDocMeta([
+				node("c1", "2026-08-01T00:00:00.000Z", 501),
+				node("c2", "2026-08-05T00:00:00.000Z", 502),
+				node("c3", "2026-08-03T00:00:00.000Z", 503),
+			]);
+			expect(result.winner).toEqual({
+				jolliSkillsDocId: 502,
+				jolliSkillsDocUrl: "https://acme.jolli.ai/articles?doc=502",
+			});
+			expect(result.orphanedDocIds.sort()).toEqual([501, 503]);
+		});
+
+		it("ignores a child with an id but no URL", () => {
+			// The URL's origin is what the reuse gate reads to decide which backend an id
+			// belongs to, so an id without one cannot be reused — adopting it would push
+			// the aggregate at whichever backend happened to be configured.
+			const orphanUrl = { ...node("c1", "2026-08-01T00:00:00.000Z"), jolliSkillsDocId: 501 };
+			expect(collectChildSkillsDocMeta([orphanUrl]).winner).toBeNull();
+		});
+
+		it("reaches a grandchild, so a squash of squashes strands nothing", () => {
+			const parent: CommitSummary = {
+				...node("c1", "2026-08-01T00:00:00.000Z"),
+				children: [node("g1", "2026-08-02T00:00:00.000Z", 601)],
+			};
+			const result = collectChildSkillsDocMeta([parent, node("c2", "2026-07-01T00:00:00.000Z", 502)]);
+			expect(result.winner?.jolliSkillsDocId).toBe(601);
+			expect(result.orphanedDocIds).toEqual([502]);
+		});
+
+		it("reports nothing when no child was ever pushed", () => {
+			expect(collectChildSkillsDocMeta([node("c1", "2026-08-01T00:00:00.000Z")])).toEqual({
+				winner: null,
+				orphanedDocIds: [],
+			});
+		});
+
+		it("judges a grandchild on ITS OWN date, not its parent's", () => {
+			// The case that separates this from a parent-stamped hoist: the grandchild
+			// is the newest article in the tree, but its parent is the OLDEST node.
+			// Re-stamping the inner winner with the parent's date (which the
+			// implementation used to do, having no dates to pass up the recursion)
+			// makes it lose to a sibling it should beat — a real divergence from
+			// `collectChildJolliMeta`, which this helper's docstring claims to match.
+			const parent: CommitSummary = {
+				...node("c1", "2026-08-01T00:00:00.000Z"),
+				children: [node("g1", "2026-08-10T00:00:00.000Z", 601)],
+			};
+			const result = collectChildSkillsDocMeta([parent, node("c2", "2026-08-05T00:00:00.000Z", 502)]);
+			expect(result.winner?.jolliSkillsDocId).toBe(601);
+			expect(result.orphanedDocIds).toEqual([502]);
+		});
+
+		it("picks the same node as collectChildJolliMeta on the same tree", () => {
+			// The two documents ride together: one memory article and one skill-usage
+			// article per commit. "Same rule, deliberately" is only true if a single
+			// tree elects the same child for both, so pin it on the tree shape that
+			// used to elect two different ones.
+			const withBoth = (hash: string, date: string, docId: number): CommitSummary => ({
+				...node(hash, date, docId),
+				jolliDocId: docId,
+				jolliDocUrl: `https://acme.jolli.ai/articles?doc=${docId}`,
+			});
+			const tree = [
+				{
+					...node("c1", "2026-08-01T00:00:00.000Z"),
+					children: [withBoth("g1", "2026-08-10T00:00:00.000Z", 601)],
+				},
+				withBoth("c2", "2026-08-05T00:00:00.000Z", 502),
+			];
+			expect(collectChildSkillsDocMeta(tree).winner?.jolliSkillsDocId).toBe(
+				collectChildJolliMeta(tree).winner?.jolliDocId,
+			);
 		});
 	});
 

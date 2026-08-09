@@ -68,6 +68,14 @@ export interface DaemonServerOptions {
 	 * unrelated Claude Code session emit refresh lines into the assertions.
 	 */
 	readonly plansDir?: string;
+	/**
+	 * Override for the machine-global `~/.jolli/jollimemory/` dir holding the
+	 * dashboard database. Same reason as `plansDir`: it is watched for real, and
+	 * a dashboard write from ANY repo on the machine (this suite's own git-backed
+	 * tests included) would otherwise emit `memory-db` refresh lines into a test's
+	 * assertions.
+	 */
+	readonly globalConfigDir?: string;
 }
 
 export interface WatchTarget {
@@ -244,7 +252,10 @@ export function runDaemonServer(options: DaemonServerOptions): Promise<void> {
 	// change that pushed the timer late (or removed it twice) would corrupt the
 	// list without any visible failure.
 	const armRetries = new Set<NodeJS.Timeout>();
-	for (const target of computeWatchTargets(cwd, { plansDir: options.plansDir })) {
+	for (const target of computeWatchTargets(cwd, {
+		plansDir: options.plansDir,
+		globalConfigDir: options.globalConfigDir,
+	})) {
 		const watcher = new DaemonWatcher({
 			path: target.path,
 			debounceMs,

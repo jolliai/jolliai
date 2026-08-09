@@ -22,6 +22,20 @@ export function emptyProcessedSet(): ProcessedSet {
 
 /** Reads `topics/processed.json`; missing or unparseable → empty set (never throws). */
 export async function readProcessedSet(cwd?: string, storage?: StorageProvider): Promise<ProcessedSet> {
+	return (await readProcessedSetOrNull(cwd, storage)) ?? emptyProcessedSet();
+}
+
+/**
+ * The same read, but `null` when the file EXISTS and could not be parsed.
+ *
+ * `readProcessedSet` collapses "nothing processed yet" and "could not read it"
+ * into the same empty set, which is right for an ingest decision (re-processing
+ * a source is idempotent) and wrong for anything that RECONCILES against the
+ * value: taking an unreadable file as an empty live-set deletes every row it
+ * was supposed to describe. Callers that prune must use this one and skip the
+ * prune on `null` — the same distinction the alias index already draws.
+ */
+export async function readProcessedSetOrNull(cwd?: string, storage?: StorageProvider): Promise<ProcessedSet | null> {
 	const resolved = await resolveStorage(storage, cwd);
 	const raw = await resolved.readFile(PROCESSED_PATH);
 	if (!raw) return emptyProcessedSet();
@@ -38,8 +52,8 @@ export async function readProcessedSet(cwd?: string, storage?: StorageProvider):
 			},
 		};
 	} catch {
-		log.warn("Failed to parse %s — treating as empty", PROCESSED_PATH);
-		return emptyProcessedSet();
+		log.warn("Failed to parse %s — treating as unreadable", PROCESSED_PATH);
+		return null;
 	}
 }
 

@@ -319,6 +319,80 @@ describe("routes", () => {
 		expect(((await res.json()) as DashboardModel).view).toBe("stats");
 	});
 
+	// A cross-site `no-cors` GET reaches this route (no Origin to reject, a
+	// loopback Host to accept), so the token is what separates our own page's
+	// poll from one — and only the money-spending part of the answer depends
+	// on it. The route itself stays open: `curl /api/model` must keep working.
+	describe("/api/model model-spend gate", () => {
+		const spendFlags: Array<boolean | undefined> = [];
+		const spyServer = () =>
+			testServer({
+				token: "tok",
+				buildModel: async (req) => {
+					spendFlags.push(req.allowModelSpend);
+					return model(req.view);
+				},
+			});
+
+		beforeEach(() => spendFlags.splice(0));
+
+		it("withholds spend from a token-free call but still answers it", async () => {
+			const port = await listen(spyServer());
+			const res = await get(port, "/api/model?view=stats");
+			expect(res.status).toBe(200);
+			expect(((await res.json()) as DashboardModel).view).toBe("stats");
+			expect(spendFlags).toEqual([false]);
+		});
+
+		it("withholds spend when the token is wrong", async () => {
+			const port = await listen(spyServer());
+			await get(port, "/api/model?view=stats", { "X-Jolli-Dashboard-Token": "nope" });
+			expect(spendFlags).toEqual([false]);
+		});
+
+		it("allows spend for our own page's poll, which carries the token", async () => {
+			const port = await listen(spyServer());
+			await get(port, "/api/model?view=stats", { "X-Jolli-Dashboard-Token": "tok" });
+			expect(spendFlags).toEqual([true]);
+		});
+
+		// `/repositories` rather than a GATED_PATH: the shared `model()` helper
+		// has no repos, so /dashboard would 302 before rendering.
+		it("allows spend for a page render — the by-hand URL keeps its full payload", async () => {
+			const port = await listen(spyServer());
+			expect((await get(port, "/repositories")).status).toBe(200);
+			expect(spendFlags).toEqual([true]);
+		});
+
+		// The page routes take no token (that is the product call), so this is
+		// the only thing standing between `<img src="…/stats">` on a hostile tab
+		// and a real LLM call.
+		it("withholds spend from a cross-site page load", async () => {
+			const port = await listen(spyServer());
+			const res = await get(port, "/repositories", { "Sec-Fetch-Site": "cross-site" });
+			expect(res.status).toBe(200);
+			expect(spendFlags).toEqual([false]);
+		});
+
+		it("withholds spend from a cross-site /api/model even with a valid token", async () => {
+			const port = await listen(spyServer());
+			await get(port, "/api/model?view=stats", {
+				"X-Jolli-Dashboard-Token": "tok",
+				"Sec-Fetch-Site": "cross-site",
+			});
+			expect(spendFlags).toEqual([false]);
+		});
+
+		it("still allows spend for our own page's same-origin poll", async () => {
+			const port = await listen(spyServer());
+			await get(port, "/api/model?view=stats", {
+				"X-Jolli-Dashboard-Token": "tok",
+				"Sec-Fetch-Site": "same-origin",
+			});
+			expect(spendFlags).toEqual([true]);
+		});
+	});
+
 	it("serves every view as a page and over the API, and rejects an unknown one", async () => {
 		const port = await listen(testServer());
 		const page = await get(port, "/repositories");
@@ -533,7 +607,18 @@ describe("assembleDashboardHtml", () => {
 	it("neutralizes </script> breakouts in the embedded model", () => {
 		const html = assembleDashboardHtml(assetsDir, JSON.stringify({ title: "</script><script>alert(1)" }));
 		expect(html).not.toContain("</script><script>alert(1)");
-		expect(html).toContain("<\\/script>");
+		expect(html).toContain("\\u003c/script>");
+	});
+
+	// A `<!--` in model text used to survive the escape and put the tokenizer
+	// into script-data-escaped state, so the data block's own `</script>` no
+	// longer closed it and every app script after it was swallowed as text.
+	it("neutralizes a <!-- comment opener in the embedded model", () => {
+		const html = assembleDashboardHtml(assetsDir, JSON.stringify({ title: "<!--<script>" }));
+		expect(html).not.toContain("<!--");
+		// The model block still closes: the app scripts after it stay real tags.
+		expect(html).toContain("/* main.js */");
+		expect(html.indexOf("window.__JOLLI_DASHBOARD__")).toBeLessThan(html.indexOf("/* main.js */"));
 	});
 });
 
@@ -1125,6 +1210,73 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect((body.memories?.items ?? []).map((item) => item.commitHash)).toEqual(["reachable-hash"]);
 	});
 
+	// The "Load more" fetch. Filtered by the SAME reachability the page render
+	// uses — that is what makes the cursor a position in the list the client is
+	// actually holding, rather than in a longer one only this route can see.
+	it("serves one page of memories after a cursor, and rejects half a cursor", async () => {
+		const dbPath = join(dir, "memories-page.db");
+		const configDir = join(dir, "config-page");
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as {
+					id: number;
+				};
+				// `listReachableCommits` is stubbed to return "reachable-hash" only, so
+				// the second row is here to prove the route filters like the page does.
+				for (const [hash, dateMs] of [
+					["reachable-hash", 2],
+					["rewritten-hash", 1],
+				] as const) {
+					db.prepare(
+						`INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, depth,
+						                       summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+						 VALUES (?, ?, NULL, NULL, ?, 0, ?, 1, 1, ?)`,
+					).run(id, hash, hash, JSON.stringify({ commitHash: hash, topics: [] }), dateMs);
+				}
+			},
+			{ dbPath },
+		);
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+
+		const first = await get(port, "/api/memories");
+		expect(first.status).toBe(200);
+		expect(
+			((await first.json()) as { items: Array<{ commitHash: string }> }).items.map((i) => i.commitHash),
+		).toEqual(["reachable-hash"]);
+
+		// Cursor on the only reachable row — nothing follows it.
+		const after = await get(port, "/api/memories?afterRepo=repo-1&afterHash=reachable-hash");
+		expect(after.status).toBe(200);
+		const afterBody = (await after.json()) as { items: unknown[]; cursorMissing?: true };
+		expect(afterBody.items).toEqual([]);
+		expect(afterBody.cursorMissing).toBeUndefined();
+
+		// The unreachable row is not a position in this list.
+		const missing = await get(port, "/api/memories?afterRepo=repo-1&afterHash=rewritten-hash");
+		expect(((await missing.json()) as { cursorMissing?: true }).cursorMissing).toBe(true);
+
+		// Half a cursor cannot identify a row, and paging from the top instead
+		// would look like a working button that repeats the first page.
+		expect((await get(port, "/api/memories?afterHash=reachable-hash")).status).toBe(400);
+		expect((await get(port, "/api/memories?afterRepo=repo-1")).status).toBe(400);
+	});
+
 	// The Context dialog's fetch. A read like every other GET here — no token —
 	// and it opens the database itself rather than going through buildModel,
 	// because a document body is not part of any page payload.
@@ -1239,9 +1391,9 @@ describe("Decisions card gist (Stats view only)", () => {
 		mockGetDecisionGist.mockResolvedValueOnce("Picked SQLite for local durability.");
 
 		const port = await listen(
-			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config") }),
+			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config"), token: "tok" }),
 		);
-		const res = await get(port, "/api/model?view=stats");
+		const res = await get(port, "/api/model?view=stats", { "X-Jolli-Dashboard-Token": "tok" });
 
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as DashboardModel;
@@ -1254,6 +1406,26 @@ describe("Decisions card gist (Stats view only)", () => {
 			"- **Picked SQLite**: needed local durability without a server.",
 			expect.anything(),
 		);
+	});
+
+	// The actual protection: this is the only browser-reachable route that can
+	// spend money, and a cross-site tab can reach it. It must answer — with the
+	// decision, un-compressed — without ever calling the model.
+	it("serves a token-free /api/model?view=stats without calling getDecisionGist", async () => {
+		const dbPath = join(dir, "dashboard.db");
+		await seedDecisionCommit(dbPath, "mem1", "- **Picked SQLite**: needed local durability without a server.");
+		mockGetDecisionGist.mockResolvedValue("should never be reached");
+
+		const port = await listen(
+			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config"), token: "tok" }),
+		);
+		const res = await get(port, "/api/model?view=stats");
+
+		expect(res.status).toBe(200);
+		const latest = ((await res.json()) as DashboardModel).stats?.decisions?.latest;
+		expect(latest).toMatchObject({ commitHash: "mem1" });
+		expect(latest).not.toHaveProperty("gist");
+		expect(mockGetDecisionGist).not.toHaveBeenCalled();
 	});
 
 	it("falls back to the raw decision text when getDecisionGist fails open", async () => {

@@ -5,7 +5,7 @@
  * Called by VSCode when the extension activates (workspaceContains:.git).
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { clearTimeout, setTimeout } from "node:timers";
 import * as vscode from "vscode";
@@ -319,6 +319,15 @@ function revertFailureHint(reason: "missing" | "malformed" | "unlinkFailed"): st
 const divergenceMessageShown = new Set<string>();
 
 // ─── activate ─────────────────────────────────────────────────────────────────
+
+/**
+ * How long a burst of memory-database file events is collapsed before one
+ * refresh runs. A stored memory is many small writes (the queue worker lands a
+ * summary, its topics and the index in one transaction each), and every one of
+ * them is a separate watcher event; the user-visible latency of waiting this
+ * long is nil next to the refresh itself.
+ */
+const MEMORY_DB_WATCH_DEBOUNCE_MS = 300;
 
 /**
  * Commands the extension may receive in degraded mode (no workspace / no git).
@@ -1834,6 +1843,9 @@ export function activate(context: vscode.ExtensionContext): void {
 			const { resolveSotStorage } = await import(
 				"../../cli/src/core/SotStorageResolver.js"
 			);
+			const { detectStoredMemories } = await import(
+				"../../cli/src/core/StoredMemories.js"
+			);
 			const { FolderStorage } = await import(
 				"../../cli/src/core/FolderStorage.js"
 			);
@@ -1876,7 +1888,11 @@ export function activate(context: vscode.ExtensionContext): void {
 			// folder from it silently omits every memory written since the
 			// fence, and a clone made after one has no branch at all.
 			const sot = await resolveSotStorage(workspaceRoot);
-			if (await sot.exists()) {
+			// `detectStoredMemories`, not `exists()`: a 0-entry run here writes a
+			// `completed` migration state, which then suppresses the real migration
+			// once memories do arrive. Past a cutover `exists()` is true from the
+			// first `jolli enable`, so that became reachable on every fresh repo.
+			if ((await detectStoredMemories(sot)) === "some") {
 				const mm = new MetadataManager(join(kbRoot, ".jolli"));
 				const migrationState = mm.readMigrationState();
 				if (!migrationState || migrationState.status !== "completed") {
@@ -2065,14 +2081,31 @@ export function activate(context: vscode.ExtensionContext): void {
 	);
 	// Shared by the ref watcher and the database watcher below: the panels do
 	// not care WHICH backend just gained a memory, only that one did.
-	const onMemoryStored = (source: string) => () => {
+	//
+	// Failures are LOGGED, not surfaced. `handleError` exists for commands — it
+	// pops a modal, which is right when a user action failed and wrong here:
+	// nothing the user did triggered this, and the database watcher below is
+	// machine-global, so a write from an unrelated repo could pop an error
+	// toast in a window whose own repo is merely mid-rebase.
+	const onBackgroundRefreshError = (source: string) => (err: unknown) => {
+		log.warn("watcher", `${source} refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+	};
+	// Awaitable form. Only the database watcher below needs to know when the
+	// refresh has SETTLED — its echo guard compares a stat signature taken after
+	// the reads this refresh performs, so it must not sample mid-flight.
+	const refreshStoredMemory = async (source: string): Promise<void> => {
 		bridge.invalidateEntriesCache();
-		commitsStore.refresh().catch(handleError(source));
-		// Lazy-load gate: if the user never opened Memories, do NOT silently
-		// wake it up in the background (would trigger listSummaryEntries).
-		if (memoriesStore.hasFirstLoaded()) {
-			memoriesStore.refresh().catch(handleError(`${source}.memories`));
-		}
+		await Promise.allSettled([
+			commitsStore.refresh().catch(onBackgroundRefreshError(source)),
+			// Lazy-load gate: if the user never opened Memories, do NOT silently
+			// wake it up in the background (would trigger listSummaryEntries).
+			memoriesStore.hasFirstLoaded()
+				? memoriesStore.refresh().catch(onBackgroundRefreshError(`${source}.memories`))
+				: Promise.resolve(),
+		]);
+	};
+	const onMemoryStored = (source: string) => () => {
+		void refreshStoredMemory(source);
 	};
 
 	if (orphanRefPath) {
@@ -2194,19 +2227,107 @@ export function activate(context: vscode.ExtensionContext): void {
 	// Both are watched because a repo can be on either side of the fence.
 	//
 	// The `-wal` sibling is what actually moves per write (the main `.db` mtime
-	// only changes at checkpoint), hence the glob. Machine-global, so writes
-	// from OTHER repos wake this too; the refreshes are cheap and idempotent,
-	// and over-refreshing is the safe way to be wrong.
+	// only changes at checkpoint), hence both are watched. Machine-global, so
+	// writes from OTHER repos wake this too; over-refreshing is the safe way to
+	// be wrong — but only up to a point, see the echo guard below.
+	//
+	// `-shm` is deliberately NOT watched, and the callback is deliberately not
+	// `onMemoryStored` directly. Once a repo is cut over, the refresh this
+	// watcher triggers reads through `SqliteStorage`, and every such read is an
+	// open → query → close against this very database; in WAL mode that rewrites
+	// `-shm`. A `jollimemory.db*` glob therefore made the refresh re-trigger
+	// itself with nothing to damp it: measured at ~5 refresh rounds per second,
+	// each doing the full multi-repo re-read (`invalidateEntriesCache` denies it
+	// the cache), pegging the extension host at 75% CPU indefinitely. Nothing
+	// looked broken — the sidebar kept painting — but every user command queued
+	// behind the storm, so `Commit Memory` took minutes to open its QuickPick.
+	// The `.db` / `-wal` mtimes stayed frozen throughout that loop, which is the
+	// evidence that a read-only cycle touches `-shm` and nothing else, and why
+	// dropping it from the glob is the narrow fix rather than a heuristic.
+	//
+	// Two more layers, because a WRITABLE handle checkpoints on close and can
+	// delete + recreate `-wal`, which would close the loop again: coalesce a
+	// burst onto one refresh, and skip a refresh whose signature matches what we
+	// last saw. The signature is sampled AFTER the refresh settles, so our own
+	// read churn is already folded into it — an echo compares equal and stops,
+	// while a real write from the queue worker moves it again.
 	//
 	// Created LAST on purpose: `Extension.test.ts` addresses watchers by their
 	// `createFileSystemWatcher` call index, so inserting one mid-sequence
 	// silently re-points half those assertions at the wrong watcher.
+	const memoryDbDir = dirname(getDashboardDbPath());
+	const memoryDbSignature = (): string =>
+		["jollimemory.db", "jollimemory.db-wal"]
+			.map((name) => {
+				try {
+					const s = statSync(join(memoryDbDir, name));
+					return `${s.mtimeMs}:${s.size}`;
+				} catch {
+					// Absent is a signature too — a repo that has not been cut over
+					// has no database, and it appearing later is a real change.
+					return "-";
+				}
+			})
+			.join("|");
+	let memoryDbSeen = memoryDbSignature();
+	let memoryDbTimer: ReturnType<typeof setTimeout> | undefined;
+	let memoryDbRefreshing = false;
+	// An event that lands DURING a refresh must not be dropped. The post-refresh
+	// signature is taken after that write, so the echo guard would then treat the
+	// write as already-seen and suppress it permanently — the refresh would only
+	// come back on some later, unrelated write. Remembering the event and
+	// re-arming the timer once the refresh settles is what keeps the guard's
+	// "ignore our own churn" from also swallowing somebody else's.
+	//
+	// Re-arming alone is NOT enough, and that is the subtle half: the `finally`
+	// used to publish the post-refresh signature unconditionally, so the very
+	// write we re-armed for was already folded into `memoryDbSeen` and the next
+	// tick compared equal and returned. When an event was missed we therefore
+	// KEEP the pre-refresh signature, which guarantees the next tick sees a
+	// difference and refreshes once more. The cost is one extra refresh when the
+	// missed event was only our own read churn; the alternative is a sidebar that
+	// stays stale until some unrelated write happens to come along.
+	let memoryDbMissedEvent = false;
+	const onMemoryDbChanged = (): void => {
+		if (memoryDbRefreshing) {
+			memoryDbMissedEvent = true;
+			return;
+		}
+		if (memoryDbTimer) clearTimeout(memoryDbTimer);
+		memoryDbTimer = setTimeout(() => {
+			memoryDbTimer = undefined;
+			const signature = memoryDbSignature();
+			if (signature === memoryDbSeen) return;
+			memoryDbRefreshing = true;
+			memoryDbMissedEvent = false;
+			void refreshStoredMemory("memoryDbWatcher").finally(() => {
+				const missed = memoryDbMissedEvent;
+				// Only publish the post-refresh signature when nothing landed while we
+				// were reading — otherwise it would absorb the missed write and make
+				// the re-armed tick a no-op (see the note on `memoryDbMissedEvent`).
+				if (!missed) memoryDbSeen = memoryDbSignature();
+				memoryDbRefreshing = false;
+				// Re-arm rather than refresh immediately: the debounce still collapses a
+				// burst, and the signature check on the next tick still runs — it just
+				// compares against the pre-refresh signature now, so a real write cannot
+				// compare equal.
+				if (missed) {
+					memoryDbMissedEvent = false;
+					onMemoryDbChanged();
+				}
+			});
+		}, MEMORY_DB_WATCH_DEBOUNCE_MS);
+	};
 	const memoryDbWatcher = watchFile(
-		vscode.Uri.file(dirname(getDashboardDbPath())),
-		"jollimemory.db*",
-		onMemoryStored("memoryDbWatcher"),
+		vscode.Uri.file(memoryDbDir),
+		"{jollimemory.db,jollimemory.db-wal}",
+		onMemoryDbChanged,
 	);
-	context.subscriptions.push(memoryDbWatcher);
+	context.subscriptions.push(memoryDbWatcher, {
+		dispose: () => {
+			if (memoryDbTimer) clearTimeout(memoryDbTimer);
+		},
+	});
 
 
 	// COMMITS title updates are handled by the commitsStore.onChange subscription
@@ -2309,6 +2430,9 @@ export function activate(context: vscode.ExtensionContext): void {
 					const { resolveSotStorage } = await import(
 						"../../cli/src/core/SotStorageResolver.js"
 					);
+					const { detectStoredMemories } = await import(
+						"../../cli/src/core/StoredMemories.js"
+					);
 					const { FolderStorage } = await import(
 						"../../cli/src/core/FolderStorage.js"
 					);
@@ -2324,10 +2448,20 @@ export function activate(context: vscode.ExtensionContext): void {
 						| undefined;
 
 					const sot = await resolveSotStorage(workspaceRoot);
-					if (!(await sot.exists())) {
+					// NOT `exists()`: this branch archives every existing Memory
+					// Bank folder for the repo before re-migrating, and past a
+					// cutover `exists()` is true for any enabled repo — memories
+					// or not. `unknown` (a read failure) takes the same exit as
+					// `none`, because the destructive path must never run on a
+					// guess. See cli/src/core/StoredMemories.ts.
+					const presence = await detectStoredMemories(sot);
+					if (presence !== "some") {
 						return {
 							ok: false,
-							message: "No stored memories found — nothing to rebuild.",
+							message:
+								presence === "none"
+									? "No stored memories found — nothing to rebuild."
+									: "Could not read stored memories — leaving the Memory Bank untouched.",
 						};
 					}
 

@@ -127,6 +127,60 @@ describe("buildRepositoriesModel", () => {
 		expect(model.repos[0].sessions).toBeGreaterThanOrEqual(1);
 	});
 
+	// The badge and the Memories tree must answer the same question. The tree
+	// drops roots no local branch can still reach; without the same filter here
+	// the badge read high for every repo whose history had been rebased away.
+	it("drops roots no local branch can still reach, and fails open without a set", async () => {
+		writeRegistry(configDir, {
+			version: 1,
+			repos: [{ repoIdentity: "repo-1", repoName: "jolli", worktreeRoot: "/w", enabledAt: "t" }],
+		});
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const live = "a".repeat(40);
+		const rewrittenAway = "c".repeat(40);
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+					id: number;
+				};
+				const insert = db.prepare(
+					`INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, depth, summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+					 VALUES (?, ?, NULL, NULL, ?, 0, '{}', 1, 1, 1)`,
+				);
+				insert.run(id, live, live);
+				insert.run(id, rewrittenAway, rewrittenAway);
+			},
+			{ dbPath },
+		);
+
+		const filtered = await withDashboardDb(
+			(db) => buildRepositoriesModel(db, configDir, new Map([["repo-1", new Set([live])]])),
+			{ dbPath },
+		);
+		expect(filtered.repos[0].memories).toBe(1);
+
+		// No set computed for the repo (git failed, or a view that does not pay
+		// for `git rev-list`): count everything rather than hide real memories.
+		const failOpen = await withDashboardDb((db) => buildRepositoriesModel(db, configDir, new Map()), { dbPath });
+		expect(failOpen.repos[0].memories).toBe(2);
+		const noArg = await withDashboardDb((db) => buildRepositoriesModel(db, configDir), { dbPath });
+		expect(noArg.repos[0].memories).toBe(2);
+	});
+
 	// The model carries repos and the manifest, nothing else: there is no job
 	// field to rejoin because this server starts no long-running work.
 	it("returns only repos and the hooks manifest", async () => {

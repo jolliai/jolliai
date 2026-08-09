@@ -27,6 +27,7 @@
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
+import { classifyToolName, ToolUseTally } from "./ToolNameClassify.js";
 import { mergeConsecutiveEntries } from "./TranscriptReader.js";
 
 const log = createLogger("CursorCliReader");
@@ -34,6 +35,9 @@ const log = createLogger("CursorCliReader");
 interface CursorCliPart {
 	readonly type?: string;
 	readonly text?: unknown;
+	/** Anthropic-block `tool_use` fields — present only on `type:"tool_use"` parts. */
+	readonly id?: unknown;
+	readonly name?: unknown;
 }
 interface CursorCliLine {
 	readonly role?: string;
@@ -138,6 +142,7 @@ export async function readCursorCliTranscript(
 	const cutoffMs = beforeTimestamp ? Date.parse(beforeTimestamp) : Number.NaN;
 	const hasCutoff = !Number.isNaN(cutoffMs);
 	const rawEntries: TranscriptEntry[] = [];
+	const tally = new ToolUseTally();
 	// Advances only across lines we actually consumed — so the cursor never moves
 	// past a deferred (post-cutoff) turn or a trailing partial line (see below).
 	let lastConsumed = Math.min(startLine, lines.length);
@@ -166,6 +171,14 @@ export async function readCursorCliTranscript(
 			const content = role === "human" ? unwrapUser(text) : text;
 			if (content.length > 0) rawEntries.push({ role, content });
 		}
+		// The `tool_use` parts this reader drops from the CONTENT are still counted
+		// here — a pure tool-call turn yields no entry but is real agent activity.
+		// cursor-agent speaks the Anthropic block format, so blocks carry a
+		// `toolu_…` id (dedupe key) and MCP tools are named `mcp__<server>__<tool>`.
+		for (const p of parsed.message?.content ?? []) {
+			if (p.type !== "tool_use" || typeof p.name !== "string" || p.name.length === 0) continue;
+			tally.addOnce(typeof p.id === "string" ? p.id : undefined, classifyToolName(p.name));
+		}
 		lastConsumed = i + 1;
 	}
 
@@ -175,5 +188,6 @@ export async function readCursorCliTranscript(
 		lineNumber: lastConsumed,
 		updatedAt: new Date().toISOString(),
 	};
-	return { entries, newCursor, totalLinesRead: lastConsumed - startLine };
+	// Always present, even when empty — see TOOL_RECORDING_SOURCES.
+	return { entries, newCursor, totalLinesRead: lastConsumed - startLine, toolUse: tally.values() };
 }

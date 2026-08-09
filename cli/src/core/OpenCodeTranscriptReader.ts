@@ -17,11 +17,15 @@
  */
 
 import { createLogger } from "../Logger.js";
-import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
+import type { ToolCallCount, TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
 import { withSqliteDb } from "./SqliteHelpers.js";
+import { builtinTool, skillTool, ToolUseTally } from "./ToolNameClassify.js";
 import { mergeConsecutiveEntries } from "./TranscriptReader.js";
 
 const log = createLogger("OpenCodeTranscriptReader");
+
+/** OpenCode's tool name for loading a skill (see `OpenCodeSkillScanner`). */
+const SKILL_TOOL = "skill";
 
 /** A single part row's parsed data from the `part` table */
 interface OpenCodePartData {
@@ -49,6 +53,7 @@ export async function readOpenCodeTranscript(
 	const { dbPath, sessionId } = parseSyntheticPath(transcriptPath);
 	const startIndex = cursor?.lineNumber ?? 0;
 	const cutoffTime = beforeTimestamp ? new Date(beforeTimestamp).getTime() : undefined;
+	const tally = new ToolUseTally();
 
 	try {
 		const { rawEntries, totalMessages, lastConsumedIndex } = await withSqliteDb(dbPath, (db) => {
@@ -105,6 +110,9 @@ export async function readOpenCodeTranscript(
 				if (entry) {
 					rawEntries.push(entry);
 				}
+				// Independent of `entry`: an assistant message whose only parts are
+				// tool calls yields no text entry but is real agent activity.
+				tallyOpenCodeToolParts(tally, msg.parts);
 				lastConsumedIndex = startIndex + i + 1;
 			}
 
@@ -131,11 +139,60 @@ export async function readOpenCodeTranscript(
 			newCursor.lineNumber,
 		);
 
-		return { entries, newCursor, totalLinesRead };
+		// Always present, even when empty — see TOOL_RECORDING_SOURCES for why an
+		// empty array and an absent field mean opposite things.
+		return { entries, newCursor, totalLinesRead, toolUse: tally.values() };
 	} catch (error: unknown) {
 		log.error("Failed to read OpenCode session %s: %s", sessionId.substring(0, 8), (error as Error).message);
 		throw new Error(`Cannot read OpenCode session: ${sessionId}`);
 	}
+}
+
+/**
+ * Counts one message's tool `part` rows into `tally`.
+ *
+ * A `part` row with `data.type === "tool"` IS a tool call and `data.tool` is its
+ * name — nothing heuristic, read off a real `~/.local/share/opencode/opencode.db`
+ * (the same evidence `OpenCodeSkillScanner` is built on). Names are bare, with no
+ * prefix or server field anywhere on the row, so every call is a builtin except
+ * the first-class `skill` tool, which is re-attributed to the skill it loaded.
+ *
+ * The skill name resolves the way the scanner resolves it: `state.metadata.name`
+ * is authoritative and `state.input.name` is the request. A `skill` call with
+ * neither stays a builtin named `skill` rather than being dropped — the call
+ * happened, only its subject is unknown.
+ *
+ * De-duplication is on `data.callID` when present. The join already yields one
+ * row per part, so this only guards against a part row repeated across the
+ * message grouping; a row without a call id is counted unconditionally.
+ */
+function tallyOpenCodeToolParts(tally: ToolUseTally, partDataJsons: ReadonlyArray<string>): void {
+	for (const json of partDataJsons) {
+		let data: Record<string, unknown>;
+		try {
+			data = JSON.parse(json) as Record<string, unknown>;
+		} catch {
+			continue;
+		}
+		if (data.type !== "tool" || typeof data.tool !== "string" || data.tool.length === 0) continue;
+		const callId = typeof data.callID === "string" ? data.callID : undefined;
+		tally.addOnce(callId, openCodeToolCall(data));
+	}
+}
+
+/** One OpenCode tool part's identity: the `skill` tool names its skill, everything else is a builtin. */
+function openCodeToolCall(data: Record<string, unknown>): ToolCallCount {
+	const tool = data.tool as string;
+	if (tool !== SKILL_TOOL) return builtinTool(tool);
+	const state = isRecord(data.state) ? data.state : undefined;
+	const metadata = isRecord(state?.metadata) ? state.metadata : undefined;
+	const input = isRecord(state?.input) ? state.input : undefined;
+	const name = typeof metadata?.name === "string" ? metadata.name : input?.name;
+	return typeof name === "string" && name.length > 0 ? skillTool(name) : builtinTool(tool);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**

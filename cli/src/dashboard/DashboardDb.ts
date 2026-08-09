@@ -29,7 +29,13 @@ import { dirname, join } from "node:path";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import { classifyScanError } from "../core/SqliteHelpers.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
-import { ACTIVITY_DDL, MEMORY_SOT_DDL, RECALL_RECEIPTS_DDL, SKILL_CONTEXT_KIND_DDL } from "./SotSchema.js";
+import {
+	ACTIVITY_DDL,
+	EVENT_FAILED_KIND_DDL,
+	MEMORY_SOT_DDL,
+	RECALL_RECEIPTS_DDL,
+	SKILL_CONTEXT_KIND_DDL,
+} from "./SotSchema.js";
 
 const log = createLogger("DashboardDb");
 
@@ -41,8 +47,10 @@ const log = createLogger("DashboardDb");
  * able to `SELECT` the columns it knows about after a newer build has migrated
  * up.
  *
- * It is 3. Entry 0 is the whole schema as it first landed; entry 1 adds
- * `recall_receipts`; entry 2 registers `skill` as the fourth `context` kind.
+ * It is 4. Entry 0 is the whole schema as it first landed; entry 1 adds
+ * `recall_receipts`; entry 2 registers `skill` as the fourth `context` kind;
+ * entry 3 adds `events_raw.failed_kind` so an event parked by an older build
+ * that did not know its type can be un-parked by one that does.
  * Nothing has shipped yet, so entry 0 could in principle
  * have absorbed the new table — it deliberately does not, because dev
  * databases (including the one every developer on this repo is using) are
@@ -57,7 +65,7 @@ const log = createLogger("DashboardDb");
  * user's database (other processes may hold the file open, and the memory half
  * is the only copy there is).
  */
-export const DASHBOARD_SCHEMA_VERSION = 3;
+export const DASHBOARD_SCHEMA_VERSION = 4;
 
 /**
  * Minimum Node that ships `node:sqlite` **without** `--experimental-sqlite`.
@@ -222,6 +230,7 @@ BEGIN SELECT RAISE(ABORT, 'repos are never deleted: set disabled_at instead'); E
 		MEMORY_SOT_DDL,
 	RECALL_RECEIPTS_DDL,
 	SKILL_CONTEXT_KIND_DDL,
+	EVENT_FAILED_KIND_DDL,
 ];
 
 /** Reads the stored schema version, treating a fresh DB as 0. */

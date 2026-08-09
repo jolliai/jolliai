@@ -173,3 +173,37 @@ describe("readClineTranscript", () => {
 		expect(r.newCursor.lineNumber).toBe(0);
 	});
 });
+
+describe("readClineTranscript toolUse", () => {
+	let dir: string;
+	let path: string;
+	beforeEach(async () => {
+		dir = await mkdtemp(join(tmpdir(), "cline-tools-"));
+		path = join(dir, "api_conversation_history.json");
+	});
+	afterEach(async () => {
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	it("omits toolUse entirely — the extension's tool records are prose, not structure", async () => {
+		// Cline (VS Code) replays tool results as `[execute_command …] Result:` text
+		// inside role:"user" turns. That is a heuristic signal, so this source stays
+		// out of TOOL_RECORDING_SOURCES and must report ABSENT rather than `[]` —
+		// `[]` would be read downstream as "this agent called no tools".
+		await writeFile(path, JSON.stringify(FIXTURE), "utf8");
+		const r = await readClineTranscript(path);
+		expect(r.toolUse).toBeUndefined();
+	});
+
+	it("still omits toolUse when the file does happen to carry tool_use blocks", async () => {
+		await writeFile(
+			path,
+			JSON.stringify([
+				{ role: "assistant", content: [{ type: "tool_use", id: "c1", name: "read_file", input: {} }], ts: 1 },
+			]),
+			"utf8",
+		);
+		const r = await readClineTranscript(path);
+		expect(r.toolUse).toBeUndefined();
+	});
+});

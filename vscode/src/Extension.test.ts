@@ -727,7 +727,14 @@ const {
 		readConfig: vi.fn(() => ({})),
 		saveConfig: vi.fn(),
 	};
-	const sot = { exists: vi.fn(async () => false) };
+	// `detectStoredMemories` asks `exists()` first and only then lists, so these
+	// cases keep steering on `exists` alone: a test that sets it true means "this
+	// repo has memories", which the non-empty default listing preserves. A case
+	// that wants the new "initialized but empty" state overrides `listFiles`.
+	const sot = {
+		exists: vi.fn(async () => false),
+		listFiles: vi.fn(async () => ["summaries/aaa.json"]),
+	};
 	const folder = { ensure: vi.fn(async () => undefined) };
 	const engine = {
 		runMigration: vi.fn(async () => ({
@@ -2028,12 +2035,17 @@ describe("Extension", () => {
 
 		// initializeKB is a fire-and-forget async block at activate time —
 		// any throw inside must funnel through the surrounding catch so the
-		// extension doesn't unhandled-reject during activation. Pinned by
-		// rejecting orphan.exists() (the first await inside the try block)
-		// and asserting the catch-side log.error gets fired with the right
-		// log key.
-		it("logs the catch path when initializeKB throws (orphan.exists rejects)", async () => {
-			mockSotInstance.exists.mockRejectedValueOnce(new Error("git failed"));
+		// extension doesn't unhandled-reject during activation. Driven from
+		// readMigrationState rather than the storage probe: the probe's own
+		// failures are absorbed by `detectStoredMemories` on purpose (see the
+		// case below), so it can no longer stand in for "something threw".
+		it("logs the catch path when initializeKB throws", async () => {
+			mockSotInstance.exists.mockResolvedValueOnce(true);
+			mockMetadataManagerInstance.readMigrationState.mockImplementationOnce(
+				() => {
+					throw new Error("migration state unreadable");
+				},
+			);
 
 			activate(makeContext());
 
@@ -2044,6 +2056,26 @@ describe("Extension", () => {
 					expect.any(Error),
 				);
 			});
+		});
+
+		// A storage read that fails must NOT be read as "this repo has no
+		// memories": that is the branch which runs a 0-entry migration and marks
+		// it `completed`, suppressing the real one once memories do arrive.
+		it("skips the migration entirely when the storage probe fails", async () => {
+			mockSotInstance.exists.mockRejectedValueOnce(new Error("db gone"));
+			mockMigrationEngineInstance.runMigration.mockClear();
+
+			activate(makeContext());
+
+			await vi.waitFor(() => {
+				expect(mockSotInstance.exists).toHaveBeenCalled();
+			});
+			expect(mockMigrationEngineInstance.runMigration).not.toHaveBeenCalled();
+			expect(error).not.toHaveBeenCalledWith(
+				"activate",
+				"KB folder init/migration failed",
+				expect.any(Error),
+			);
 		});
 
 		it("releases the sync gate via the 60s watchdog when initializeKB never settles", () => {
@@ -5801,6 +5833,28 @@ describe("Extension", () => {
 			await vi.waitFor(() => {
 				expect(mockMemoriesStore.refresh).toHaveBeenCalled();
 			});
+		});
+
+		// A memory-store refresh is background work, not a command: nothing the
+		// user did triggered it, and the database watcher that shares this
+		// handler is MACHINE-GLOBAL, so a write from an unrelated repo could pop
+		// a modal in a window whose own repo is merely mid-rebase. `handleError`
+		// (which does pop one) is for commands.
+		it("logs a failed background refresh instead of popping an error toast", async () => {
+			mockCommitsStore.refresh.mockRejectedValueOnce(new Error("git index locked"));
+			showErrorMessage.mockClear();
+			// Watcher indices: 0=sessions, 1=head, 2=orphan-ref, 3=lock.
+			const orphanWatcher = createFileSystemWatcher.mock.results[2]?.value;
+			const onChange = orphanWatcher?.onDidChange.mock.calls[0]?.[0] as
+				| (() => void)
+				| undefined;
+
+			onChange?.();
+
+			await vi.waitFor(() => {
+				expect(mockCommitsStore.refresh).toHaveBeenCalled();
+			});
+			expect(showErrorMessage).not.toHaveBeenCalled();
 		});
 
 		it("refreshes memories on orphan-ref change when hasFirstLoaded is true", async () => {

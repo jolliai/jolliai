@@ -582,10 +582,16 @@ window.JD = window.JD || {};
 			},
 		);
 
-	/* One model re-fetch (same params the page was rendered with). */
+	/* One model re-fetch (same params the page was rendered with).
+
+	   Carries the token like JD.getJson does, even though /api/model answers
+	   without one: the token is what tells the server this is our own page
+	   rather than a cross-site GET, and a token-free answer omits the parts
+	   that cost model budget (the Decisions gist). Without it a poll would
+	   silently drop the gist the page was rendered with. */
 	JD.refreshNow = (render) => {
 		var model = window.__JOLLI_DASHBOARD__;
-		fetch(JD.modelUrl(model))
+		fetch(JD.modelUrl(model), { headers: { "X-Jolli-Dashboard-Token": window.__JOLLI_DASHBOARD_TOKEN__ || "" } })
 			.then((res) => {
 				if (!res.ok) throw new Error("refresh failed: " + res.status);
 				return res.json();
@@ -605,7 +611,14 @@ window.JD = window.JD || {};
 				render(fresh);
 			})
 			.catch(() => {
-				/* transient — the next tick retries; the page keeps its last data */
+				/* Transient — keep the last data, but still REPAINT it. Callers clear
+				   local UI state before calling this and depend on the re-render to
+				   show it: repoAction sets `busyRepo = null` and then hands the
+				   repaint to us, so swallowing this silently left the row stuck on
+				   "Working…" with no buttons until a manual reload. Only Stats has a
+				   poll to recover on the next tick; every other view calls this once,
+				   on a user action. Re-rendering the same model is idempotent. */
+				render(window.__JOLLI_DASHBOARD__);
 			});
 	};
 

@@ -27,6 +27,7 @@ import { fileURLToPath } from "node:url";
 import type { Command } from "commander";
 import { getProjectRootDir } from "../core/GitOps.js";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
+import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { type BackfillProgress, backfillRepos } from "../dashboard/Backfill.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { canUseDashboardDb, DASHBOARD_SQLITE_MIN_VERSION, ensureDashboardDbExists } from "../dashboard/DashboardDb.js";
@@ -377,6 +378,16 @@ async function stopServer(deps: DashboardDeps): Promise<void> {
  *
  * Never throws: a failed import is a warning, not a failed enable.
  */
+/**
+ * Block headers, chosen by whichever tier reveals the block.
+ *
+ * Separate strings because they describe different work: `commits` re-sweeps git
+ * whenever any branch tip moves, while `memories` is cursor-gated on the orphan
+ * tip and normally does nothing at all.
+ */
+const MIGRATION_HEADER = "\n  Migrating your memories to the Jolli Memory database…";
+const HISTORY_HEADER = "\n  Indexing your git history…";
+
 async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 	try {
 		const repos = await listActiveRepos(deps.configDir);
@@ -387,14 +398,14 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 		// doing.
 		const quiet = repos.length === 0;
 		// Held, not printed: on a steady-state pass the whole block is noise. The
-		// import itself is now cursor-gated (see Backfill's `sot-import`), so a
-		// converged run does no memory work at all — but the phase markers still
-		// fire for the tiers that DO run every time (sessions), and a header
-		// announcing a migration that will not happen is exactly what made this
-		// look like it re-migrated on every launch. The closing ✓ line is the
+		// import itself is cursor-gated (see Backfill's `sot-import`), so a converged
+		// run does no memory work at all — but the phase markers still fire for the
+		// tiers that DO run every time (sessions), and a header announcing a
+		// migration that will not happen is exactly what made this look like it
+		// re-migrated on every launch. The header is therefore chosen at reveal time
+		// by the tier that had work, not written up front. The closing ✓ line is the
 		// honest report and prints either way.
 		const out = createDeferredWriter();
-		if (!quiet) out.write("\n  Migrating your memories to the Jolli Memory database…");
 		const printer = createProgressPrinter({ log: out.write });
 		const results = await backfillRepos(repos, {
 			...(deps.dbPath ? { dbPath: deps.dbPath } : {}),
@@ -413,13 +424,18 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 			// now fires only inside its own gate, so it cannot reach here ungated
 			// anyway.
 			onProgress: (progress) => {
-				if (progress.kind === "commits" || progress.kind === "memories") out.reveal();
+				// The header names the tier that actually has work. Scanning git history
+				// is NOT migrating memories, and titling it that way is what made a
+				// routine commit sweep read as "it re-migrates everything on every
+				// launch" — the memory tier had converged and said so on the next line.
+				if (progress.kind === "commits") out.reveal(HISTORY_HEADER);
+				else if (progress.kind === "memories") out.reveal(MIGRATION_HEADER);
 				printer.onProgress(progress);
 			},
 		});
 		if (quiet) return;
 		// A failure has to be shown in context — which repo, under which header.
-		if (results.some((r) => r.mode === "skipped")) out.reveal();
+		if (results.some((r) => r.mode === "skipped")) out.reveal(MIGRATION_HEADER);
 		// A repo that threw used to reach `log.error` and nothing else, so on
 		// screen it was indistinguishable from a repo with nothing to do.
 		for (const failed of results.filter((r) => r.mode === "skipped")) {
@@ -440,7 +456,7 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 		if (bootstrapped > 0 || newMemories > 0) {
 			// Something landed, so the progress that produced it belongs on screen —
 			// including the runs too fast to have tripped the elapsed-time reveal.
-			out.reveal();
+			out.reveal(MIGRATION_HEADER);
 			console.log(`  ✓ Migrated ${migrated} ${migrated === 1 ? "memory" : "memories"}${across}.\n`);
 		} else {
 			// Previously this branch printed NOTHING, which is the bug that started
@@ -475,8 +491,15 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 export function createDeferredWriter(): {
 	/** Print if revealed, otherwise hold. */
 	readonly write: (line: string) => void;
-	/** Flush everything held and print directly from here on. Idempotent. */
-	readonly reveal: () => void;
+	/**
+	 * Flush everything held and print directly from here on. Idempotent.
+	 *
+	 * `header` is printed once, ahead of the held lines — which is why it is a
+	 * reveal argument rather than a line written up front: WHICH tier turned out
+	 * to have work is discovered inside the run, and the header names it. The
+	 * first reveal wins; later ones cannot retitle a block already on screen.
+	 */
+	readonly reveal: (header?: string) => void;
 } {
 	const held: string[] = [];
 	let revealed = false;
@@ -485,9 +508,10 @@ export function createDeferredWriter(): {
 			if (revealed) console.log(line);
 			else held.push(line);
 		},
-		reveal: (): void => {
+		reveal: (header?: string): void => {
 			if (revealed) return;
 			revealed = true;
+			if (header) console.log(header);
 			for (const line of held) console.log(line);
 			held.length = 0;
 		},
@@ -543,7 +567,13 @@ export function createProgressPrinter(deps: { readonly log?: (line: string) => v
 					// printing "the first run can take a few minutes" up front was
 					// wrong on exactly the runs where it was most visible. Emitting it
 					// with the first git scan makes it true whenever it appears.
-					if (progress.kind === "commits" && !warnedSlow) {
+					//
+					// `firstRun` narrows it further, and has to: a sweep triggered by a
+					// moved branch tip re-reads the commit list but skips `--numstat`
+					// for everything already stored, so it finishes in well under a
+					// second on a 2.5k-commit history. Only a real bootstrap can take
+					// minutes, and only a bootstrap sets the flag.
+					if (progress.kind === "commits" && progress.firstRun && !warnedSlow) {
 						warnedSlow = true;
 						write("  Scanning your whole history — this can take a few minutes.");
 						write("  Interrupting is safe: progress is saved and the next run resumes.");
@@ -623,6 +653,15 @@ const PHASE_LABELS: Record<"commits" | "summaries" | "sessions", string> = {
  * runtime without flag-free `node:sqlite` there is no database to import into,
  * and staying silent is better than an error at the end of a successful setup.
  * Never throws and never touches `process.exitCode`.
+ *
+ * Ends by attempting the cutover, for the same reason the import runs here at
+ * all: this is the moment the database has just been filled from the orphan
+ * branch, so it is the moment the containment compare is most likely to pass.
+ * Without a caller here the engine was only ever reachable by typing `jolli
+ * cutover`, and every repo stayed `uncutover` — reads served from the folder
+ * layer, `SqliteStorage` never on the path. `maybeAutoCutover` reports nothing
+ * and cannot throw, so it cannot turn a successful setup into a failure; the
+ * two states short of `cutover` are both workable and converge later.
  */
 export async function importDashboardHistory(cwd: string, deps: DashboardDeps = {}): Promise<void> {
 	if (!canUseDashboardDb()) return;
@@ -632,6 +671,8 @@ export async function importDashboardHistory(cwd: string, deps: DashboardDeps = 
 		log.info("not registering a repo from %s: %s", cwd, errMsg(err));
 	}
 	await runHistoryImport(deps);
+	// No throttle: a fresh import is the one attempt worth making unconditionally.
+	await maybeAutoCutover(cwd, deps.dbPath ? { dbPath: deps.dbPath } : {});
 }
 
 /**
@@ -720,6 +761,20 @@ export async function executeDashboard(
 	// Write side last: the page is already up and polling, so history fills in
 	// as this lands. Runs in this command process — the server never writes.
 	await runHistoryImport(deps);
+	// Attempted for the same reason {@link importDashboardHistory} does it: the
+	// import above has just filled the database from the orphan branch, so this is
+	// when the containment compare is most likely to pass. Without a call here the
+	// guided front door — which wakes the dashboard through this function rather
+	// than the import-only entry point — would be the one setup path that never
+	// converges past `uncutover`.
+	//
+	// THROTTLED, unlike that caller, and the difference is the invocation
+	// frequency rather than the moment: `jolli dashboard` is a reopen command a
+	// user can type many times a day, the import is cursor-gated so a steady-state
+	// reopen fills nothing in, and the engine's compare reads every file the
+	// frozen tip lists. Unthrottled, a repo that keeps answering `not-ready` would
+	// pay that sweep on every launch. Reports nothing and cannot throw.
+	await maybeAutoCutover(cwd, { throttle: true, ...(deps.dbPath ? { dbPath: deps.dbPath } : {}) });
 	// The "dashboard start" half of the no-daemon backup schedule (the other is
 	// the post-commit QueueWorker). It belongs here, not in the server: taking a
 	// snapshot needs a WRITABLE handle, which runs schema migrations, and the

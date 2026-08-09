@@ -19,9 +19,33 @@
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
+import { builtinTool, ToolUseTally } from "./ToolNameClassify.js";
 import { mergeConsecutiveEntries } from "./TranscriptReader.js";
 
 const log = createLogger("GeminiTranscriptReader");
+
+/**
+ * One entry of a `gemini` message's `toolCalls` array.
+ *
+ * Read off real `~/.gemini/tmp/<project>/chats/session-*.json` files: the array
+ * hangs off the ASSISTANT message that made the calls (alongside `model`,
+ * `thoughts` and `tokens`), and each entry carries
+ * `{id, name, args, result, status, timestamp, resultDisplay, displayName,
+ * description}`. Only `id` (dedupe) and `name` (identity) are read here.
+ *
+ * Names in that corpus are bare and undecorated — `run_shell_command`,
+ * `read_file`, `list_directory`, `grep_search` — with no prefix, namespace or
+ * server field anywhere on the entry, so every call is classified as a builtin.
+ * Nothing here guesses at an MCP shape Gemini has not been observed writing.
+ *
+ * `status` is NOT filtered on. A `cancelled` call (present in the corpus) was
+ * still a call the agent decided to make, which is the question this counter
+ * answers; filtering would silently under-report the agent's activity.
+ */
+interface GeminiToolCall {
+	readonly id?: unknown;
+	readonly name?: unknown;
+}
 
 /** Gemini message record structure (subset of fields we care about) */
 interface GeminiMessageRecord {
@@ -29,6 +53,7 @@ interface GeminiMessageRecord {
 	readonly type: string;
 	readonly timestamp: string;
 	readonly content: GeminiContent;
+	readonly toolCalls?: ReadonlyArray<GeminiToolCall>;
 }
 
 /** Gemini content can be a string, an array of parts, or absent */
@@ -84,6 +109,7 @@ export async function readGeminiTranscript(
 	const rawEntries: TranscriptEntry[] = [];
 	const cutoffTime = beforeTimestamp ? new Date(beforeTimestamp).getTime() : undefined;
 	let lastConsumedIndex = startIndex;
+	const tally = new ToolUseTally();
 
 	for (let i = 0; i < newMessages.length; i++) {
 		const msg = newMessages[i];
@@ -99,6 +125,13 @@ export async function readGeminiTranscript(
 		const entry = parseGeminiMessage(msg);
 		if (entry) {
 			rawEntries.push(entry);
+		}
+		// Counted independently of `entry`: a message whose text was empty (or
+		// whose type is not conversational) can still carry tool calls, and those
+		// are real agent activity. Gating on the entry would drop them.
+		for (const tc of msg.toolCalls ?? []) {
+			if (typeof tc?.name !== "string" || tc.name.length === 0) continue;
+			tally.addOnce(typeof tc.id === "string" ? tc.id : undefined, builtinTool(tc.name));
 		}
 		lastConsumedIndex = startIndex + i + 1;
 	}
@@ -123,7 +156,11 @@ export async function readGeminiTranscript(
 		newCursor.lineNumber,
 	);
 
-	return { entries, newCursor, totalLinesRead };
+	// Always present (never conditional): Gemini's transcripts CAN express tool
+	// calls, so an empty array is the positive claim "this slice called none".
+	// Dropping the field would make the source look incapable — see
+	// TOOL_RECORDING_SOURCES.
+	return { entries, newCursor, totalLinesRead, toolUse: tally.values() };
 }
 
 /** Returns null for non-conversational message types (info, error, warning). */

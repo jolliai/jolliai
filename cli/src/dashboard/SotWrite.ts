@@ -217,6 +217,29 @@ function classify(files: ReadonlyArray<FileWrite>): Classified {
 	return c;
 }
 
+/**
+ * Drops one unparsable artifact from the batch, loudly, instead of throwing.
+ *
+ * The whole `writeFiles` batch is ONE transaction, and a commit's context files
+ * ride in it alongside its own `summaries/<hash>.json` — so a throw does not
+ * reject the bad file, it rolls back the memory the file was attached to. The
+ * orphan backend stored these bytes verbatim and could not fail this way at
+ * all, which makes it a cutover regression rather than a stricter check: one
+ * odd legacy reference took every reference for that commit with it.
+ *
+ * This is the rule `landProgress` already reached on its own for an orphaned
+ * artifact (see the comment there); the rest of this module now follows it.
+ * `SotImport` has always skipped-and-counted the same files, so the importer
+ * and the writer finally converge — a repo could otherwise import cleanly and
+ * then fail to re-write what it had just imported.
+ *
+ * Deliberately NOT silent: an unparsable artifact still means a producer bug,
+ * and `warn` is what makes it visible without costing the user their memory.
+ */
+function dropUnparsable(what: string, detail: string): void {
+	log.warn("SotWrite: dropping unparsable %s (%s) -- keeping the rest of the batch", what, detail);
+}
+
 /** `branch` for a `<key>-<hash8>` context key, from the memories table. */
 function branchFromMemories(db: DashboardDbHandle, repoId: number, key: string): string | null {
 	const match = /-([0-9a-f]{8})$/.exec(key);
@@ -250,6 +273,22 @@ function landSummaries(db: DashboardDbHandle, repoId: number, c: Classified, now
 	);
 	for (const parent of rewritten) shift.run(repoId, parent);
 
+	// The child positions this batch's trees CLAIM, per parent. A top node that
+	// re-anchors itself below needs this to tell three cases apart, and getting
+	// it wrong is a lost write rather than a lost position: `applyMemoryWrites`
+	// runs the batch in one transaction, so a UNIQUE(repo_id, parent_hash,
+	// child_pos) violation rolls back the memory plus every transcript, plan and
+	// reference riding along with it.
+	const claimed = new Map<string, Map<string, number>>();
+	for (const tree of c.summaryTrees) {
+		for (const node of tree) {
+			if (node.parentInFile === null || node.pos === null) continue;
+			const siblings = claimed.get(node.parentInFile) ?? new Map<string, number>();
+			siblings.set(node.hash, node.pos);
+			claimed.set(node.parentInFile, siblings);
+		}
+	}
+
 	const upsert = db.prepare(
 		`INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, depth,
 		                       summary_json, tree_hash, first_seen_ms, written_at_ms, commit_date_ms)
@@ -275,10 +314,41 @@ function landSummaries(db: DashboardDbHandle, repoId: number, c: Classified, now
 				if (existing) {
 					parent = existing.parent_hash;
 					pos = existing.child_pos;
-					// The mount point may itself sit in the offset region (its
-					// parent's set is being rewritten and settles later in this
-					// same batch); strip the offset so the settled value wins.
-					if (pos !== null && pos >= REORDER_OFFSET) pos -= REORDER_OFFSET;
+					// The mount point may itself sit in the offset region: its
+					// parent's set is being rewritten and settles later in this same
+					// batch. What to do with it then depends on whether that new set
+					// still claims this node, and stripping unconditionally (as this
+					// used to) is wrong when it does -- it drops the row into the live
+					// position space while its siblings are still parked, so the walk
+					// below hands the same position to a different sibling and the
+					// UNIQUE constraint rolls the whole batch back. Correctness then
+					// depended on the caller ordering the parent's file ahead of the
+					// child's, which this module's header explicitly does not promise
+					// (measured: `ProducerHooks.refreshMemoryRows` emits a commit and
+					// its later amend child-first).
+					//
+					// A parked position always means the parent IS being rewritten
+					// (only `rewritten` parents get shifted), so "nobody will settle
+					// it" is never the case: either the new set claims the node, or the
+					// set dropped it and the module's rule applies -- re-ground, never
+					// keep an edge the file model no longer claims. Restoring the
+					// stored mount here (which this used to do whenever the ground slot
+					// happened to be free) left the database carrying an edge
+					// `<parent>.json` does not list, so a seed import from the same
+					// files converged to a different tree.
+					if (pos !== null && pos >= REORDER_OFFSET) {
+						const siblings = parent === null ? undefined : claimed.get(parent);
+						if (siblings?.has(node.hash)) {
+							// The new set still claims this node -- stay parked and let
+							// the parent's own walk place it.
+						} else {
+							// Dropped from the set. Re-ground it, which is what
+							// `reground` below would do for the same row had its own
+							// file not been in the batch.
+							parent = null;
+							pos = null;
+						}
+					}
 				}
 			}
 			const summaryJson = JSON.stringify(
@@ -354,7 +424,8 @@ function landAliases(db: DashboardDbHandle, repoId: number, c: Classified, nowMs
 }
 
 /** Lands transcript rows + their session projection. */
-function landTranscripts(db: DashboardDbHandle, repoId: number, c: Classified, nowMs: number): void {
+function landTranscripts(db: DashboardDbHandle, repoId: number, c: Classified, nowMs: number): ReadonlySet<string> {
+	const landed = new Set<string>();
 	for (const id of c.transcriptDeletes) {
 		db.prepare("DELETE FROM transcript_sessions WHERE repo_id = ? AND transcript_id = ?").run(repoId, id);
 		db.prepare("DELETE FROM memory_transcripts WHERE repo_id = ? AND transcript_id = ?").run(repoId, id);
@@ -362,7 +433,10 @@ function landTranscripts(db: DashboardDbHandle, repoId: number, c: Classified, n
 	}
 	for (const { id, content } of c.transcriptWrites) {
 		const parsed = tryParse<StoredTranscript>(content);
-		if (!parsed || !Array.isArray(parsed.sessions)) throw new Error(`SotWrite: unparsable transcript ${id}`);
+		if (!parsed || !Array.isArray(parsed.sessions)) {
+			dropUnparsable("transcript", id);
+			continue;
+		}
 		db.prepare(
 			`INSERT INTO transcripts (repo_id, transcript_id, sessions_blob, written_at_ms) VALUES (?, ?, ?, ?)
 			 ON CONFLICT(repo_id, transcript_id) DO UPDATE SET sessions_blob = excluded.sessions_blob,
@@ -375,6 +449,79 @@ function landTranscripts(db: DashboardDbHandle, repoId: number, c: Classified, n
 				`INSERT INTO transcript_sessions (repo_id, transcript_id, session_id, source) VALUES (?, ?, ?, ?)
 				 ON CONFLICT(repo_id, transcript_id, session_id) DO UPDATE SET source = excluded.source`,
 			).run(repoId, id, session.sessionId, session.source ?? null);
+		}
+		landed.add(id);
+	}
+	return landed;
+}
+
+/**
+ * Links a newly stored transcript to memories that ALREADY reference it.
+ *
+ * `landLinks` below can only link the summaries in its own batch, so it covers
+ * exactly one ordering: transcript first, summary second. The other order —
+ * `saveTranscriptsBatch` storing a transcript for a commit whose summary landed
+ * earlier, reachable from the ide-bridge `transcripts-save` action — dropped the
+ * link permanently, because the id was not yet in `transcripts` when the summary
+ * was written (logged as "dangling") and nothing ever re-derived it. The file
+ * backend had no such dependency: it resolved links from `summary.transcripts`
+ * at READ time, so order never mattered there.
+ *
+ * The `LIKE` is a candidate filter only — cheap narrowing over `summary_json`,
+ * with `resolveTranscriptIdsFiltered` making the actual decision, so a pattern
+ * metacharacter inside an id can only widen the candidate set, never shrink it.
+ */
+function backfillLinksForNewTranscripts(
+	db: DashboardDbHandle,
+	repoId: number,
+	c: Classified,
+	written: ReadonlySet<string>,
+): void {
+	// `landTranscripts`' landed set, NOT `c.transcriptWrites`: an unparsable
+	// transcript is dropped there and never reaches the `transcripts` table, so
+	// linking it here inserts a `memory_transcripts` row whose parent does not
+	// exist. `defer_foreign_keys` only moves that violation to COMMIT, which
+	// rolls back the WHOLE batch — re-creating exactly the data loss the drop
+	// exists to avoid, and doing it to every other memory in the same write.
+	// The set is also the filter passed to `resolveTranscriptIdsFiltered`, so a
+	// dropped id would otherwise pass its own membership test.
+	if (written.size === 0) return;
+	// Nodes this batch also wrote already had their link set REPLACED wholesale
+	// by landLinks; re-adding here would resurrect a link that write removed.
+	const replaced = new Set(c.summaryTrees.flat().map((n) => n.hash));
+	// Ids this batch's own summaries claim. `landLinks` has already resolved those
+	// links against the `transcripts` rows `landTranscripts` just wrote, so the
+	// scan below can only re-derive what it already did — and the `LIKE` is an
+	// unindexable full scan of `memories`' JSON blobs, paid once per id on
+	// EVERY ordinary commit, where the summary and its transcript always arrive in
+	// the same batch. The orderings this function exists for are the ones where a
+	// transcript arrives without its summary (the ide-bridge `transcripts-save`
+	// action writes transcripts alone, so `summaryTrees` is empty and nothing here
+	// is skipped). Residual: a transcript claimed by BOTH a batch summary and an
+	// older memory outside the batch keeps only the batch link until that
+	// transcript is written again — a bounded, self-healing gap, and far cheaper
+	// than a full scan on every commit that by construction finds nothing.
+	const claimedByBatch = new Set(
+		c.summaryTrees.flat().flatMap((n) => [...resolveTranscriptIdsFiltered(n.summary, written)]),
+	);
+	const pending = [...written].filter((id) => !claimedByBatch.has(id));
+	if (pending.length === 0) return;
+	const candidates = db.prepare(
+		"SELECT commit_hash, summary_json FROM memories WHERE repo_id = ? AND summary_json LIKE ?",
+	);
+	const insert = db.prepare(
+		`INSERT INTO memory_transcripts (repo_id, commit_hash, transcript_id) VALUES (?, ?, ?)
+		 ON CONFLICT(repo_id, commit_hash, transcript_id) DO NOTHING`,
+	);
+	for (const id of pending) {
+		const rows = candidates.all(repoId, `%${id}%`) as Array<{ commit_hash: string; summary_json: string }>;
+		for (const row of rows) {
+			if (replaced.has(row.commit_hash)) continue;
+			const summary = tryParse<CommitSummary>(row.summary_json);
+			if (!summary) continue;
+			if (!resolveTranscriptIdsFiltered(summary, written).includes(id)) continue;
+			insert.run(repoId, row.commit_hash, id);
+			log.info("linked stored transcript %s to memory %s written earlier", id, row.commit_hash);
 		}
 	}
 }
@@ -434,7 +581,10 @@ function landContext(db: DashboardDbHandle, repoId: number, c: Classified, nowMs
 	for (const { kind, key, body } of c.contextWrites) {
 		if (kind === "reference") {
 			const parsed = readReferenceMarkdownFromString(body);
-			if (!parsed) throw new Error(`SotWrite: unparsable reference frontmatter at references/${key}.md`);
+			if (!parsed) {
+				dropUnparsable("reference frontmatter", `references/${key}.md`);
+				continue;
+			}
 			upsert.run(
 				repoId,
 				kind,
@@ -484,7 +634,11 @@ function landProgress(db: DashboardDbHandle, repoId: number, c: Classified, nowM
 	}
 	for (const { pathSlug, content } of c.progressWrites) {
 		const parsed = tryParse<{ planSlug?: string }>(content);
-		if (!parsed) throw new Error(`SotWrite: unparsable plan-progress at plan-progress/${pathSlug}.json`);
+		// Same reasoning as the orphaned-plan skip below — and the same batch.
+		if (!parsed) {
+			dropUnparsable("plan-progress", `plan-progress/${pathSlug}.json`);
+			continue;
+		}
 		const slug = parsed.planSlug ?? pathSlug;
 		// A live write whose plan is missing IS a caller bug — but throwing here is
 		// the wrong way to say so. This batch is one transaction, and a commit's
@@ -530,7 +684,8 @@ function landTopics(db: DashboardDbHandle, repoId: number, c: Classified, nowMs:
 	for (const { slug, content } of c.topicPageWrites) {
 		const page = tryParse<PageFile>(content);
 		if (!page?.stableSlug || page.title === undefined || page.content === undefined || !page.lastUpdatedAt) {
-			throw new Error(`SotWrite: unparsable topic page topics/${slug}.json`);
+			dropUnparsable("topic page", `topics/${slug}.json`);
+			continue;
 		}
 		db.prepare(
 			`INSERT INTO topic_pages (repo_id, stable_slug, title, summary, content_md,
@@ -571,16 +726,23 @@ function landTopics(db: DashboardDbHandle, repoId: number, c: Classified, nowMs:
 	}
 	if (c.processedSet !== null) {
 		const parsed = tryParse<{ processed?: Record<string, string[]> }>(c.processedSet);
-		if (!parsed?.processed) throw new Error("SotWrite: unparsable topics/processed.json");
-		// The file is the WHOLE high-water mark, so landing it is set
-		// replacement — an upsert-only pass could never shrink it.
-		db.prepare("DELETE FROM topic_processed_sources WHERE repo_id = ?").run(repoId);
-		const insert = db.prepare(
-			`INSERT INTO topic_processed_sources (repo_id, source_type, source_id) VALUES (?, ?, ?)
-			 ON CONFLICT(repo_id, source_type, source_id) DO NOTHING`,
-		);
-		for (const [type, ids] of Object.entries(parsed.processed)) {
-			for (const id of ids) insert.run(repoId, type, id);
+		// Skipping keeps the PREVIOUS high-water set, which is the safe direction:
+		// re-processing a source is idempotent, where a rolled-back batch would
+		// have cost the memories written alongside it. Not an early return — the
+		// v5-state write below is an unrelated part of this same batch.
+		if (!parsed?.processed) {
+			dropUnparsable("processed set", "topics/processed.json");
+		} else {
+			// The file is the WHOLE high-water mark, so landing it is set
+			// replacement — an upsert-only pass could never shrink it.
+			db.prepare("DELETE FROM topic_processed_sources WHERE repo_id = ?").run(repoId);
+			const insert = db.prepare(
+				`INSERT INTO topic_processed_sources (repo_id, source_type, source_id) VALUES (?, ?, ?)
+				 ON CONFLICT(repo_id, source_type, source_id) DO NOTHING`,
+			);
+			for (const [type, ids] of Object.entries(parsed.processed)) {
+				for (const id of ids) insert.run(repoId, type, id);
+			}
 		}
 	}
 	if (c.v5State !== null) {
@@ -610,8 +772,11 @@ export function applyMemoryWrites(
 		db.exec("PRAGMA defer_foreign_keys = ON");
 		landSummaries(db, repoId, c, nowMs);
 		landAliases(db, repoId, c, nowMs);
-		landTranscripts(db, repoId, c, nowMs);
+		const landedTranscripts = landTranscripts(db, repoId, c, nowMs);
 		landLinks(db, repoId, c);
+		// AFTER landLinks: it replaces the link set of the summaries in this
+		// batch, so the backfill must not run first and have its rows deleted.
+		backfillLinksForNewTranscripts(db, repoId, c, landedTranscripts);
 		landContext(db, repoId, c, nowMs);
 		landProgress(db, repoId, c, nowMs);
 		landTopics(db, repoId, c, nowMs);

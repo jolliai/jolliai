@@ -17,6 +17,9 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as vscode from "vscode";
+// Cross-package import resolved at esbuild bundle time (see AGENTS.md): the
+// inline-script escape is a security primitive and must not be a fourth copy.
+import { escapeForInlineScript } from "../../../cli/src/core/InlineScript.js";
 
 const VENDOR_FILES = ["panzoom.min.js", "elk.bundled.js", "marked.min.js"];
 const SCRIPT_FILES = ["data.js", "state.js", "edges.js", "camera.js", "drag.js", "views.js", "panel.js", "main.js"];
@@ -63,18 +66,6 @@ export function renderGraphHtml(template: string, a: GraphHtmlAssets): string {
 	);
 	html = replaceMarker(html, /<!-- scripts:start -->[\s\S]*?<!-- scripts:end -->/, scriptsBlock, "scripts block");
 	return html;
-}
-
-/**
- * Neutralizes inline-script breakout in the embedded graph JSON: the `</script`
- * close sequence (any case) plus the two legacy JS line terminators U+2028/U+2029
- * that JSON.stringify leaves raw (inert on ES2019+ engines, cheap defense in depth).
- */
-function escapeForInlineScript(json: string): string {
-	return json
-		.replace(/<\/script/gi, "<\\/script")
-		.replace(new RegExp(String.fromCharCode(0x2028), "g"), "\\u2028")
-		.replace(new RegExp(String.fromCharCode(0x2029), "g"), "\\u2029");
 }
 
 /** Replaces a single template marker, throwing if it is absent (no silent no-op). */

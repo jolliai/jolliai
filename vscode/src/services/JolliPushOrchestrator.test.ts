@@ -298,11 +298,38 @@ describe("pushSummaryWithAttachments", () => {
 
 	it("reports ONE skipped entry for a kind however many of its items failed", async () => {
 		// The caller renders these into a notification. Per-item entries made a commit
-		// with a dozen skills produce a dozen titles in one toast.
+		// with a dozen references produce a dozen titles in one toast.
 		mockPushToJolli.mockImplementation((_b, _k, p: { docType: string }) => {
-			if (p.docType === "skill") return Promise.reject(new Error("skill 500"));
+			if (p.docType === "reference") return Promise.reject(new Error("ref 500"));
 			return Promise.resolve({ docId: 100 });
 		});
+		const references = ["ENG-1", "ENG-2", "ENG-3"].map((id) => ({
+			archivedKey: `linear:${id}-a1b2c3d4`,
+			source: "linear",
+			nativeId: id,
+			title: `Fix ${id}`,
+			url: "https://linear.app/x",
+			referencedAt: "t",
+			sourceToolName: "Claude Code",
+		}));
+		const result = await pushSummaryWithAttachments(makeSummary({ references }), makeContext(), {
+			plans: [],
+			notes: [],
+			references,
+		});
+		expect(result.skippedAttachments).toHaveLength(1);
+		expect(result.skippedAttachments[0].label).toBe("3 reference article(s)");
+		expect(result.attachmentFailures).toEqual([]);
+	});
+
+	it("publishes ONE aggregate article for a commit's whole skill set", async () => {
+		// The mismatch this kind's `aggregate` exists to fix: the Context surfaces show a
+		// commit's skills as ONE artifact (`skills--<hash8>.md` / a single "Skills used"
+		// row), so a commit that entered three skills used to arrive at the backend as
+		// three documents the user had no local counterpart for.
+		mockPushToJolli.mockImplementation((_b, _k, p: { docType: string }) =>
+			Promise.resolve({ docId: p.docType === "summary" ? 100 : 501 }),
+		);
 		const skills = ["one", "two", "three"].map((name) => ({
 			archivedKey: `claude:${name}-a1b2c3d4`,
 			source: "claude" as const,
@@ -317,9 +344,16 @@ describe("pushSummaryWithAttachments", () => {
 			makeContext(),
 			new Map([["skill", skills]]),
 		);
-		expect(result.skippedAttachments).toHaveLength(1);
-		expect(result.skippedAttachments[0].label).toBe("3 skill article(s)");
-		expect(result.attachmentFailures).toEqual([]);
+		const skillCalls = mockPushToJolli.mock.calls.filter((c) => (c[2] as { docType: string }).docType === "skill");
+		expect(skillCalls).toHaveLength(1);
+		const payload = skillCalls[0][2] as { title: string; content: string };
+		// One article, named for the commit, listing every skill in the shared table.
+		expect(payload.title).toBe("Skills used — abc123");
+		for (const name of ["one", "two", "three"]) expect(payload.content).toContain(name);
+		// The id lands on the COMMIT, not on any skill entry — the article covers all of
+		// them, so a re-push updates it no matter how the skill set changes.
+		expect(result.updatedSummary.jolliSkillsDocId).toBe(501);
+		expect(result.updatedSummary.skills?.some((s) => s.jolliDocId !== undefined)).toBe(false);
 	});
 
 	it("reports a docType refusal as skipped instead of only logging it", async () => {
@@ -344,7 +378,8 @@ describe("pushSummaryWithAttachments", () => {
 			makeContext(),
 			new Map([["skill", skills]]),
 		);
-		// Short-circuited after the first item: the second was never attempted.
+		// One call either way — the kind aggregates a commit's skills into a single
+		// article — and the refusal short-circuits the rest of the kind.
 		expect(mockPushToJolli.mock.calls.filter((c) => (c[2] as { docType: string }).docType === "skill")).toHaveLength(
 			1,
 		);
@@ -375,7 +410,7 @@ describe("pushSummaryWithAttachments", () => {
 		);
 		const skillCall = mockPushToJolli.mock.calls.find((c) => (c[2] as { docType: string }).docType === "skill");
 		expect(skillCall).toBeDefined();
-		expect(result.updatedSummary.skills?.[0]).toMatchObject({ jolliDocId: 501 });
+		expect(result.updatedSummary.jolliSkillsDocId).toBe(501);
 	});
 
 	it("skips a snippet note with no content and pushes a markdown note's body", async () => {
@@ -648,6 +683,21 @@ describe("serializeSummaryJson", () => {
 		expect(Object.keys(parsed)).not.toEqual(
 			expect.arrayContaining(["jolliDocId", "jolliDocUrl", "orphanedDocIds"]),
 		);
+	});
+
+	it("strips the skill-article publish state too (the skill push runs first and weaves it on)", () => {
+		const json = serializeSummaryJson(
+			makeSummary({
+				jolliSkillsDocId: 42,
+				jolliSkillsDocUrl: "https://acme.jolli.ai/articles?doc=42",
+				skills: [{ source: "claude", skill: "jolli-recall", uses: 2 }],
+			} as unknown as Partial<CommitSummary>),
+		);
+		const parsed = JSON.parse(json ?? "");
+		expect(parsed.jolliSkillsDocId).toBeUndefined();
+		expect(parsed.jolliSkillsDocUrl).toBeUndefined();
+		// The skill rows themselves are commit content and stay.
+		expect(parsed.skills).toHaveLength(1);
 	});
 
 	it("keeps nested plan/note/reference docId/url (needed to render the article links)", () => {

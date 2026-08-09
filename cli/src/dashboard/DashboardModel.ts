@@ -413,11 +413,18 @@ export interface SettingsModel {
 // ── Memories page ───────────────────────────────────────────────────────────
 
 /**
- * Most rows one Memories list payload carries — same reasoning as
- * {@link DECISIONS_LIMIT}: the model is inlined into the HTML, so this is a
- * page budget, not a data-retention statement.
+ * Rows per Memories list page — the size of the inlined first page, and of
+ * every `/api/memories` page the browser pulls after it.
+ *
+ * A page budget, not a cap: the whole model is inlined into a `<script>` block,
+ * so the full set cannot ride the HTML (an all-repos scope is the sum of every
+ * enabled repo's entire history), but the tree's search box filters the loaded
+ * array client-side, so dropping the tail outright would turn "search my
+ * memories" into "search my recent memories". Paging satisfies both — and the
+ * later pages are fetched on a "Load more" click, never prefetched, so a reader
+ * who never asks pays for exactly one page.
  */
-export const MEMORIES_LIST_LIMIT = 200;
+export const MEMORIES_PAGE_SIZE = 250;
 
 /** One row in the Memories tree — a repo>branch>memory browser groups these client-side. */
 export interface MemoryListItem {
@@ -580,11 +587,14 @@ export interface MemoryDetail {
 
 /** The Memories page payload. */
 export interface MemoriesModel {
-	/** Newest first, across every repo in scope. */
+	/**
+	 * Newest first, across every repo in scope — the first {@link MEMORIES_PAGE_SIZE}
+	 * rows. `items.length < totalCount` is the client's "another page exists" test:
+	 * it is what puts the tree's "Load more" button on screen, and each click pulls
+	 * one more page from `/api/memories`.
+	 */
 	readonly items: ReadonlyArray<MemoryListItem>;
 	readonly totalCount: number;
-	/** True when `items` hit {@link MEMORIES_LIST_LIMIT} and more were dropped. */
-	readonly truncated: boolean;
 	readonly vitals: { readonly memories: number; readonly topics: number; readonly repos: number };
 	/** Present only when the request named a `?hash=` this scope can resolve. */
 	readonly selected?: MemoryDetail;
@@ -1021,12 +1031,14 @@ export const RECALL_SKILL_NAMES: ReadonlyArray<string> = [RECALL_SKILL_NAME, "jo
 /**
  * Tool, skill and MCP-server usage over the window.
  *
- * Coverage is the load-bearing part of this shape. Only Claude transcripts
- * record tool calls today, so `sessionsWithTools` / `sessionsInWindow` and the
- * explicit `uncoveredSources` list travel with every payload: without them a
- * machine that runs one Claude session and forty Codex ones would present
- * Claude's tool mix as the whole team's, and an unused MCP server would be
- * indistinguishable from one used only from an unreadable agent.
+ * Coverage is the load-bearing part of this shape. Not every source's
+ * transcripts can be read for tool calls (`TOOL_RECORDING_SOURCES` is the
+ * authority, and it is deliberately evidence-gated rather than aspirational), so
+ * `sessionsWithTools` / `sessionsInWindow` and the explicit `uncoveredSources`
+ * list travel with every payload: without them a machine that runs one covered
+ * session and forty uncovered ones would present the covered agent's tool mix as
+ * the whole team's, and an unused MCP server would be indistinguishable from one
+ * used only from an unreadable agent.
  *
  * There is deliberately no "unused servers" figure. Knowing a server was never
  * called requires knowing which servers are REGISTERED, which lives in each

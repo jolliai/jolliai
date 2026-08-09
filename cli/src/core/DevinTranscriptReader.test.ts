@@ -587,3 +587,100 @@ describe("readDevinTranscript", () => {
 		await expect(readDevinTranscript("/no/hash/here")).rejects.toThrow();
 	});
 });
+
+describe("readDevinTranscript toolUse", () => {
+	/** Builds a one-chain Devin DB from raw chat_message objects. */
+	async function seed(messages: ReadonlyArray<Record<string, unknown>>): Promise<{ path: string; dir: string }> {
+		const dir = await mkdtemp(join(tmpdir(), "devin-tools-"));
+		const p = join(dir, "s.db");
+		const db = new DatabaseSync(p);
+		db.exec(
+			"CREATE TABLE sessions(id TEXT, main_chain_id INTEGER); CREATE TABLE message_nodes(session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message TEXT);",
+		);
+		db.prepare("INSERT INTO sessions VALUES('s', ?)").run(messages.length);
+		const insert = db.prepare("INSERT INTO message_nodes VALUES('s',?,?,?)");
+		for (let i = 0; i < messages.length; i++) {
+			insert.run(i + 1, i === 0 ? null : i, JSON.stringify(messages[i]));
+		}
+		db.close();
+		return { path: `${p}#s`, dir };
+	}
+
+	// Devin's chat_message is an OpenAI chat-completions message: its live rows
+	// carry `tool_calls` next to `tool_call_id`, so an entry is
+	// {id, type:"function", function:{name, arguments}}.
+	it("counts tool_calls on an assistant turn whose content is empty", async () => {
+		const { path, dir } = await seed([
+			{
+				role: "assistant",
+				content: "",
+				metadata: { created_at: "2026-07-18T00:00:00Z" },
+				tool_calls: [
+					{ id: "call_1", type: "function", function: { name: "exec", arguments: "{}" } },
+					{ id: "call_2", type: "function", function: { name: "exec", arguments: "{}" } },
+					{ id: "call_3", type: "function", function: { name: "str_replace", arguments: "{}" } },
+				],
+			},
+		]);
+		const result = await readDevinTranscript(path);
+		// The turn itself is dropped (empty content) — the calls are the only
+		// surviving record of it.
+		expect(result.entries).toEqual([]);
+		expect(result.toolUse).toEqual([
+			{ name: "exec", kind: "builtin", calls: 2 },
+			{ name: "str_replace", kind: "builtin", calls: 1 },
+		]);
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	it("accepts a flattened entry and de-duplicates on the call id", async () => {
+		const { path, dir } = await seed([
+			{
+				role: "assistant",
+				content: "x",
+				metadata: { created_at: "2026-07-18T00:00:00Z" },
+				tool_calls: [
+					{ id: "call_1", name: "exec" },
+					{ id: "call_1", name: "exec" },
+					{ name: "exec" },
+					null,
+					{ id: "call_9", function: {} },
+				],
+			},
+		]);
+		const result = await readDevinTranscript(path);
+		expect(result.toolUse).toEqual([{ name: "exec", kind: "builtin", calls: 2 }]);
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	it("reports an empty array — not undefined — for a tool-free slice", async () => {
+		const { path, dir } = await seed([
+			{ role: "user", content: "hi", metadata: { created_at: "2026-07-18T00:00:00Z" } },
+		]);
+		const result = await readDevinTranscript(path);
+		expect(result.toolUse).toEqual([]);
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	it("counts only the calls inside the consumed slice", async () => {
+		const { path, dir } = await seed([
+			{
+				role: "assistant",
+				content: "a",
+				metadata: { created_at: "2026-07-18T00:00:00Z" },
+				tool_calls: [{ id: "call_1", function: { name: "exec" } }],
+			},
+			{
+				role: "assistant",
+				content: "b",
+				metadata: { created_at: "2026-07-19T00:00:00Z" },
+				tool_calls: [{ id: "call_2", function: { name: "str_replace" } }],
+			},
+		]);
+		const first = await readDevinTranscript(path, null, "2026-07-18T12:00:00Z");
+		expect(first.toolUse).toEqual([{ name: "exec", kind: "builtin", calls: 1 }]);
+		const second = await readDevinTranscript(path, first.newCursor);
+		expect(second.toolUse).toEqual([{ name: "str_replace", kind: "builtin", calls: 1 }]);
+		await rm(dir, { recursive: true, force: true });
+	});
+});

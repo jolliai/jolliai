@@ -649,7 +649,9 @@ body {
     height: 32px; font-size: 13px; color: var(--muted); padding: 0 6px; min-width: 0;
   }
   /* Same rule as .rl-name: a long repo or branch name truncates here instead of
-     shoving its count off the panel. `.cnt` keeps its margin-left:auto below. */
+     shoving its count off the panel. The count sits immediately after the name
+     (see `.cnt` below), so the ellipsis is what keeps the pair together on a
+     narrow panel — the label shrinks, the count never moves. */
   .mem-group-head .lbl {
     color: var(--ink); font-weight: 500;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
@@ -664,7 +666,11 @@ body {
     stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
   }
   .mem-group-head[aria-expanded="false"] .chev svg { transform: rotate(-90deg); }
-  .mem-group-head .cnt { margin-left: auto; flex: none; }
+  /* Reads as part of the name ("local_web_service 2"), not as a right-hand
+     column: right-aligning it put the number against the scrollbar and, with
+     one branch per row at different name lengths, left a ragged gap that made
+     the count look unrelated to the row it belongs to. */
+  .mem-group-head .cnt { flex: none; }
   .mem-group-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .mem-group-head.mem-branch-head { padding-left: 18px; }
   .mem-group-head.mem-branch-head .lbl { font-weight: 500; }
@@ -826,7 +832,6 @@ body {
   .tag.kind-blocker   { border-color: transparent; background: color-mix(in srgb, var(--crit) 12%, transparent); color: var(--crit); font-weight: 600; }
   .tag.kind-question  { border-color: transparent; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
   .tag.age { border-style: dashed; }
-  .tag.age.old { color: var(--crit); border-color: var(--crit); }
   /* ---------- hot files ---------- */
   /* Four columns: path (elides), a proportional bar, the commit count, churn.
      The path column is min-width:0 so a long path shrinks rather than pushing

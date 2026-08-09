@@ -286,6 +286,120 @@ describe("collectCommitEvents", () => {
 		}
 	});
 
+	it("scans --numstat only for commits the caller has not stored", async () => {
+		// The one expensive step in this collection (6.3 s → 0.44 s on a real 2.5k
+		// commit history), and the reason a moved branch tip no longer costs a
+		// whole-history scan. A commit's diff is immutable, so a stored hash can
+		// never need re-scanning.
+		const calls: string[][] = [];
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			calls.push([...args]);
+			if (args[0] === "log") {
+				return git(
+					[
+						`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x.com${SEP}new`,
+						`bbb${SEP}2026-07-29T08:00:00+08:00${SEP}F${SEP}f@x.com${SEP}old`,
+					].join("\n"),
+				);
+			}
+			if (args[0] === "for-each-ref") return git("main\n");
+			if (args[0] === "rev-list") return git("aaa\nbbb\n");
+			if (args[0] === "-c") return git([`${REC}aaa`, "1\t0\tsrc/a.ts"].join("\n"));
+			throw new Error(`unexpected git ${args.join(" ")}`);
+		});
+		vi.mocked(getIndex).mockResolvedValue(null);
+
+		const events = await collectCommitEvents({
+			repoIdentity: "r",
+			cwd: "/w",
+			knownHashes: new Set(["bbb"]),
+		});
+
+		// `--no-walk <hash>` for the new commit only — never the whole-history form.
+		const numstat = calls.find((c) => c[0] === "-c");
+		expect(numstat).toContain("--no-walk");
+		expect(numstat).toContain("aaa");
+		expect(numstat).not.toContain("bbb");
+		// Both commits are still emitted: the commit list is what the prune is
+		// computed against, and branch reachability changes for OLD commits every
+		// time a branch moves — neither may be narrowed to the new arrivals.
+		expect(events.map((e) => e.hash)).toEqual(["aaa", "bbb"]);
+		expect(events[0].files).toHaveLength(1);
+		// ABSENT, not empty: absent means "keep the stored rows", while `[]` would
+		// claim the commit touches no files and delete them.
+		expect(events[1]).not.toHaveProperty("files");
+	});
+
+	it("falls back to the whole-history scan when too many commits are new", async () => {
+		// The incremental form passes every hash as an argv entry, and Windows caps a
+		// command line at ~32 KB — so past the limit it does not run slower, it fails
+		// to spawn.
+		const many = Array.from({ length: 401 }, (_, i) => `h${i}`);
+		const calls: string[][] = [];
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			calls.push([...args]);
+			if (args[0] === "log") {
+				return git(
+					many.map((h) => `${h}${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x.com${SEP}m`).join("\n"),
+				);
+			}
+			if (args[0] === "for-each-ref") return git("main\n");
+			return git("");
+		});
+		vi.mocked(getIndex).mockResolvedValue(null);
+		await collectCommitEvents({ repoIdentity: "r", cwd: "/w", knownHashes: new Set() });
+		const numstat = calls.find((c) => c[0] === "-c");
+		expect(numstat).not.toContain("--no-walk");
+		expect(numstat).toContain("--branches");
+	});
+
+	// The `--count` cap is a documented reachability gap, but it must not be
+	// expressed as the CLAIM `branches: []` — that array is replace-when-present,
+	// so a commit only the branches past the cap reach would have its correct
+	// stored attribution deleted on every pass.
+	it("omits branches for a commit no listed branch reaches when the ref list was truncated", async () => {
+		const listed = Array.from({ length: 51 }, (_, i) => `b${i}`);
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			if (args[0] === "log") {
+				return git(
+					[
+						`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x${SEP}one`,
+						`bbb${SEP}2026-07-29T08:00:00+08:00${SEP}F${SEP}f@x${SEP}two`,
+					].join("\n"),
+				);
+			}
+			// One past the cap: this is what makes truncation detectable at all.
+			if (args[0] === "for-each-ref") {
+				expect(args).toContain("--count=51");
+				return git(`${listed.join("\n")}\n`);
+			}
+			if (args[0] === "rev-list" && args[1] === "b0") return git("aaa\n");
+			return git("");
+		});
+		vi.mocked(getIndex).mockResolvedValue(null);
+		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
+		// Reached by a listed branch → its (capped) attribution still refreshes.
+		expect(events[0]).toMatchObject({ hash: "aaa", branches: ["b0"] });
+		// Reached by nothing listed → could be on a branch past the cap, so the
+		// stored value is left alone rather than claimed empty.
+		expect(events[1]).not.toHaveProperty("branches");
+		// Only the branches WITHIN the cap are walked.
+		expect(vi.mocked(execGit).mock.calls.filter((c) => c[0][0] === "rev-list")).toHaveLength(50);
+	});
+
+	it("still emits an empty branches array when the ref list exactly fills the cap", async () => {
+		// 50 listed is not truncation — asking for 51 and getting 50 proves it.
+		const listed = Array.from({ length: 50 }, (_, i) => `b${i}`);
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x${SEP}one`);
+			if (args[0] === "for-each-ref") return git(`${listed.join("\n")}\n`);
+			return git("");
+		});
+		vi.mocked(getIndex).mockResolvedValue(null);
+		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
+		expect(events[0]?.branches).toEqual([]);
+	});
+
 	it("still emits commits when only the numstat pass fails, without a files field", async () => {
 		// The numstat pass is deliberately separate so its failure costs file
 		// detail and nothing else — this is the test that pins that down.
@@ -311,17 +425,50 @@ describe("collectCommitEvents", () => {
 		await expect(collectCommitEvents({ repoIdentity: "r", cwd: "/w" })).rejects.toThrow(/git log failed/);
 	});
 
-	it("still tolerates a rev-list failure per branch once the log itself succeeded", async () => {
+	// `branches` is REPLACE-when-present in the projection, so the distinction
+	// this asserts is the whole guard: `[]` claims no branch reaches the commit
+	// (and deletes its rows), `undefined` says "not observed" and leaves them.
+	it("omits branches entirely when a per-branch rev-list failed", async () => {
 		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
 			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x${SEP}feat: one`);
 			if (args[0] === "for-each-ref") return git("main\n");
-			// The per-branch reachability pass fails; the commit survives unattributed.
+			// The per-branch reachability pass fails; the commit survives, but its
+			// stored attribution must not be replaced by a partial union.
 			return gitFail("rev-list exploded");
 		});
 		vi.mocked(getIndex).mockResolvedValue(null);
 		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
 		expect(events).toHaveLength(1);
-		expect(events[0].branches ?? []).toEqual([]);
+		expect(events[0]).not.toHaveProperty("branches");
+	});
+
+	// The worse half of the same bug: one failed ref listing used to emit `[]`
+	// for EVERY commit, wiping the repo's whole branch attribution in one pass.
+	it("omits branches entirely when the ref listing itself failed", async () => {
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x${SEP}feat: one`);
+			if (args[0] === "for-each-ref") return gitFail("boom");
+			return git("");
+		});
+		vi.mocked(getIndex).mockResolvedValue(null);
+		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
+		expect(events).toHaveLength(1);
+		expect(events[0]).not.toHaveProperty("branches");
+	});
+
+	// And the case that must keep emitting `[]`: a clean scan where no branch
+	// reaches the commit is a real answer, and the only thing that can prune a
+	// branch the commit has genuinely left.
+	it("emits an empty branches array when the scan succeeded and found none", async () => {
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x${SEP}feat: one`);
+			if (args[0] === "for-each-ref") return git("main\n");
+			if (args[0] === "rev-list") return git("zzz\n"); // reaches some other commit
+			return git("");
+		});
+		vi.mocked(getIndex).mockResolvedValue(null);
+		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
+		expect(events[0].branches).toEqual([]);
 	});
 
 	it("skips malformed log lines and survives a missing summary index", async () => {
@@ -795,15 +942,53 @@ describe("summaryEventFromCommitSummary", () => {
 		});
 		vi.mocked(readTranscriptsForCommits).mockResolvedValue(transcripts);
 
-		const events = await collectSummaryEvents({ repoIdentity: "repo-1", cwd: "/w" });
+		const { events, complete } = await collectSummaryEvents({ repoIdentity: "repo-1", cwd: "/w" });
 
 		expect(events).toHaveLength(1);
 		expect(events[0].hash).toBe("abc123");
 		expect(getSummary).toHaveBeenCalledTimes(2); // roots only, never the child
+		// The whole point of surviving it: the caller must NOT advance its cursor,
+		// or this sweep's blind spot becomes permanent.
+		expect(complete).toBe(false);
 	});
 
-	it("collectSummaryEvents returns empty when there is no index", async () => {
+	it("collectSummaryEvents reports a clean sweep as complete", async () => {
+		vi.mocked(getIndex).mockResolvedValue({
+			version: 3,
+			// biome-ignore lint/suspicious/noExplicitAny: minimal index fixture
+			entries: [{ commitHash: "abc123", parentCommitHash: null }] as any,
+		});
+		vi.mocked(getSummary).mockResolvedValue(baseSummary);
+		vi.mocked(readTranscriptsForCommits).mockResolvedValue(new Map());
+
+		const { events, complete } = await collectSummaryEvents({ repoIdentity: "repo-1", cwd: "/w" });
+		expect(events).toHaveLength(1);
+		expect(complete).toBe(true);
+	});
+
+	// A root the index names but the store no longer has is "not there", not a
+	// failure — pruning is normal, and treating it as a failure would stall the
+	// cursor forever on a repo that has one.
+	it("collectSummaryEvents treats a null summary as absent, not a failed read", async () => {
+		vi.mocked(getIndex).mockResolvedValue({
+			version: 3,
+			// biome-ignore lint/suspicious/noExplicitAny: minimal index fixture
+			entries: [{ commitHash: "gone", parentCommitHash: null }] as any,
+		});
+		vi.mocked(getSummary).mockResolvedValue(null);
+
+		const { events, complete } = await collectSummaryEvents({ repoIdentity: "repo-1", cwd: "/w" });
+		expect(events).toEqual([]);
+		expect(complete).toBe(true);
+	});
+
+	it("collectSummaryEvents returns empty and incomplete when there is no index", async () => {
 		vi.mocked(getIndex).mockResolvedValue(null);
-		expect(await collectSummaryEvents({ repoIdentity: "repo-1", cwd: "/w" })).toEqual([]);
+		// Incomplete, not complete-and-empty: an unreadable index says nothing
+		// about what is stored, so the cursor must not move past it.
+		expect(await collectSummaryEvents({ repoIdentity: "repo-1", cwd: "/w" })).toEqual({
+			events: [],
+			complete: false,
+		});
 	});
 });

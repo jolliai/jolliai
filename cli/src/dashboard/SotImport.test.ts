@@ -900,6 +900,24 @@ describe("importRepoMemory — prune (set reconciliation)", () => {
 		).toBe(0);
 	});
 
+	it("skips the processed-sources prune when the file is unparsable, not deleting the mark", async () => {
+		const files = fixture();
+		await runImport(files);
+		const before = await withDashboardDb(
+			(db) => (db.prepare("SELECT COUNT(*) AS n FROM topic_processed_sources").get() as { n: number }).n,
+			{ dbPath },
+		);
+		expect(before).toBeGreaterThan(0);
+		// A truncated file must not read as "nothing is processed" — that would
+		// wipe the topic KB's high-water mark and make every ingested source look
+		// unprocessed again, silently.
+		const damaged = fixture();
+		damaged.set("topics/processed.json", "{ truncated");
+		const { result, query } = await runImport(damaged, 2_000);
+		expect((await query<{ n: number }>("SELECT COUNT(*) AS n FROM topic_processed_sources"))[0].n).toBe(before);
+		expect(result.skipped).toBeGreaterThan(0);
+	});
+
 	it("converges — a further run over the same shrunken branch prunes nothing", async () => {
 		const files = fixture();
 		await runImport(files);

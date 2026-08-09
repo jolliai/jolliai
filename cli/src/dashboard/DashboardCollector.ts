@@ -293,7 +293,25 @@ export interface CollectCommitsOptions {
 	readonly sinceMs?: number;
 	/** Storage for the summary-index enrichment read. See {@link CollectSummariesOptions.storage}. */
 	readonly storage?: StorageProvider;
+	/**
+	 * Commit hashes whose file rows are already stored — their `--numstat` is
+	 * skipped. See {@link INCREMENTAL_NUMSTAT_LIMIT} for the whole rationale;
+	 * omit it (bootstrap) to scan every commit.
+	 */
+	readonly knownHashes?: ReadonlySet<string>;
 }
+
+/**
+ * Above this many NEW commits, the incremental `--no-walk` pass is abandoned for
+ * the whole-history one.
+ *
+ * Two reasons, and the first is a hard limit rather than a tuning choice: the
+ * incremental form passes every hash as an argv entry (40 bytes each), and
+ * Windows caps a command line at ~32 KB — so a large enough set does not run
+ * slower, it fails to spawn. The second is that past a few hundred commits the
+ * two forms cost about the same anyway, and one `git log` beats a long argv.
+ */
+const INCREMENTAL_NUMSTAT_LIMIT = 400;
 
 /** Field separator for the git log format string (US, U+001F) — cannot appear in a commit subject. */
 const SEP = "\u001f";
@@ -441,7 +459,9 @@ export async function collectFilesForCommits(
  * branch at all, because `refs/heads` could never explain where it came from.
  * Aligning them means "in the dashboard" and "attributable to a local branch"
  * are one statement. The one gap left is {@link MAX_BRANCHES}: a commit reachable
- * only from a branch past the cap is collected but unattributed.
+ * only from a branch past the cap is collected but unattributed — left absent, not
+ * emitted as `branches: []`, so the replace-when-present projection keeps whatever
+ * a fuller earlier pass stored instead of erasing it.
  *
  * Summary-index metadata (recorded branch, diff stats) enriches commits the
  * memory pipeline saw; plain `git log` fields cover the rest.
@@ -479,14 +499,44 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 
 	// Branch reachability: newest-committed branches first, capped.
 	const refsResult = await execGit(
-		["for-each-ref", "refs/heads", "--sort=-committerdate", "--format=%(refname:short)", `--count=${MAX_BRANCHES}`],
+		// One past the cap, so truncation is DETECTABLE rather than inferred from a
+		// full page: `--count=${MAX_BRANCHES}` returning exactly that many is
+		// indistinguishable from a repo with exactly that many branches.
+		[
+			"for-each-ref",
+			"refs/heads",
+			"--sort=-committerdate",
+			"--format=%(refname:short)",
+			`--count=${MAX_BRANCHES + 1}`,
+		],
 		opts.cwd,
 	);
-	const branches = refsResult.exitCode === 0 ? refsResult.stdout.split("\n").filter(Boolean) : [];
+	// Tracked for the same reason `files` is (see below): `branches` is
+	// REPLACE-when-present in the projection, so emitting a partial union is a
+	// claim that the missing branches no longer reach the commit. A failed
+	// `for-each-ref` would have emitted `[]` for every commit and wiped the
+	// repo's whole branch attribution in one pass; a single branch that was
+	// deleted or repacked between the ref list and its own `rev-list` (an
+	// ordinary concurrent rebase) would silently have stripped just that one.
+	// Incomplete means: emit nothing, keep what is stored.
+	let branchScanComplete = refsResult.exitCode === 0;
+	const listed = refsResult.exitCode === 0 ? refsResult.stdout.split("\n").filter(Boolean) : [];
+	// A repo past {@link MAX_BRANCHES} is the documented reachability gap, but it
+	// must not be expressed as the CLAIM `branches: []`. The union is
+	// replace-when-present, so emitting an empty array for a commit that only the
+	// branches past the cap reach would delete a correct stored attribution on
+	// every pass. Truncated therefore behaves like a partially failed scan for the
+	// commits nothing listed reaches — see the emit below — while the commits the
+	// listed branches DO reach keep getting their (capped) attribution refreshed.
+	const branchesTruncated = listed.length > MAX_BRANCHES;
+	const branches = branchesTruncated ? listed.slice(0, MAX_BRANCHES) : listed;
 	const branchesByHash = new Map<string, string[]>();
 	for (const branch of branches) {
 		const revs = await execGit(["rev-list", branch, ...sinceArgs], opts.cwd);
-		if (revs.exitCode !== 0) continue;
+		if (revs.exitCode !== 0) {
+			branchScanComplete = false;
+			continue;
+		}
 		for (const hash of revs.stdout.split("\n")) {
 			if (!hash) continue;
 			const list = branchesByHash.get(hash);
@@ -495,13 +545,50 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 		}
 	}
 
+	if (!branchScanComplete) {
+		log.warn("branch scan incomplete for %s -- leaving stored branch attribution untouched", opts.cwd);
+	} else if (branchesTruncated) {
+		log.warn(
+			"branch list truncated at %d for %s -- commits reached only by older branches keep their stored attribution",
+			MAX_BRANCHES,
+			opts.cwd,
+		);
+	}
+
 	// Summary-index enrichment, keyed by commit hash.
 	const index = await getIndex(opts.cwd, opts.storage).catch(() => null);
 	const summaryByHash = new Map(index?.entries.map((e) => [e.commitHash, e]) ?? []);
-	const filesByHash = await collectCommitFiles(opts.cwd, sinceArgs);
+
+	const logLines = logResult.stdout.split("\n").filter(Boolean);
+	// **The one expensive step, and the only one made incremental.**
+	//
+	// `git log --numstat` over the whole history is where this collection's wall
+	// clock goes (6-12 s per checkout, measured), and it is pure waste for a commit
+	// whose file rows are already stored: a commit's diff is immutable, so a hash
+	// already in the database can never need a re-scan. Everything ELSE here stays
+	// whole-history on purpose — the commit list is what the prune is computed
+	// against, and branch reachability changes for OLD commits every time a branch
+	// moves, so neither can be narrowed to the new arrivals.
+	//
+	// Omitting `files` for a known commit is not a downgrade: absent means "keep
+	// what is stored" in the projection (the same contract a failed numstat pass
+	// relies on), while an empty array would mean "this commit touches nothing".
+	//
+	// The one thing it gives up: a commit whose file rows were never stored (its
+	// numstat failed once) is never revisited while it stays known. That is a
+	// bounded, self-correcting gap — a bootstrap re-scan restores it — and paying
+	// a full-history numstat on every launch to close it is the cost this exists
+	// to remove.
+	const newHashes = opts.knownHashes
+		? logLines.map((line) => line.split(SEP)[0] ?? "").filter((hash) => hash && !opts.knownHashes?.has(hash))
+		: null;
+	const filesByHash =
+		newHashes !== null && newHashes.length <= INCREMENTAL_NUMSTAT_LIMIT
+			? await collectFilesForCommits(newHashes, opts.cwd)
+			: await collectCommitFiles(opts.cwd, sinceArgs);
 
 	const events: CommitCreatedEvent[] = [];
-	for (const line of logResult.stdout.split("\n")) {
+	for (const line of logLines) {
 		if (!line) continue;
 		const [hash, dateIso, authorName, authorEmail, subject] = line.split(SEP);
 		const committedAtMs = Date.parse(dateIso ?? "");
@@ -518,7 +605,15 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 			// The summary's recorded branch is where the commit was actually made;
 			// reachability can only say where it is visible NOW.
 			...(summary?.branch ? { branch: summary.branch } : {}),
-			branches: branchesByHash.get(hash) ?? [],
+			// Absent (not empty) when the scan above was incomplete — an empty
+			// array here is the meaningful claim "no branch reaches this commit",
+			// and it is only true when every local branch was actually walked. Under
+			// truncation the same reasoning applies per commit: a hit is still a hit,
+			// but "nothing reached it" may just mean the branch that does sits past
+			// the cap, so that case falls back to leaving the stored value alone.
+			...(branchScanComplete && (!branchesTruncated || branchesByHash.has(hash))
+				? { branches: branchesByHash.get(hash) ?? [] }
+				: {}),
 			// Absent (not empty) when the numstat pass failed, so a transient git
 			// failure leaves previously collected file rows in place.
 			...(filesByHash.has(hash) ? { files: filesByHash.get(hash) } : {}),
@@ -553,6 +648,14 @@ export function summaryEventFromCommitSummary(
 	summary: CommitSummary,
 	transcripts: ReadonlyMap<string, { readonly sessions: ReadonlyArray<StoredSessionLike> }>,
 ): CommitSummaryEvent | null {
+	// PROVISIONAL. `summary.commitDate` is the AUTHOR date (`GitOps` reads it
+	// with `%aI`), and this feeds a committer-date column. It is the best this
+	// event can do — a stored summary carries no committer date — and it is
+	// self-correcting: `projectCommit` overwrites `committed_at_ms` from the
+	// `%cI` collection, and only a commit that never gets a `commit.created`
+	// event (outside the `--since` window, or pruned from `git log`) keeps the
+	// approximation. Queries that window memories therefore prefer the `commits`
+	// row and fall back to this — see `buildMemoryCards`.
 	const committedAtMs = Date.parse(summary.commitDate);
 	if (!Number.isFinite(committedAtMs)) return null;
 
@@ -709,6 +812,21 @@ export interface CollectSummariesOptions {
 	readonly storage?: StorageProvider;
 }
 
+/** {@link collectSummaryEvents}' result: the events, plus whether the sweep saw everything. */
+export interface SummaryCollection {
+	readonly events: ReadonlyArray<CommitSummaryEvent>;
+	/**
+	 * False when the index was unreadable, or any single summary failed to read.
+	 *
+	 * The caller's cursor is the whole index's content hash, so advancing it
+	 * after a partial sweep makes every LATER pass skip collection entirely —
+	 * one transient `git show` failure would hide that memory from the dashboard
+	 * permanently, until `index.json` itself happened to change. The commit tier
+	 * has carried this guard (`collectionComplete`) from the start.
+	 */
+	readonly complete: boolean;
+}
+
 /**
  * Collects one `commit.summary` per ROOT summary in the store.
  *
@@ -716,18 +834,21 @@ export interface CollectSummariesOptions {
  * turns/tokens the root already aggregates — projecting them too would double
  * count every consolidated commit.
  */
-export async function collectSummaryEvents(opts: CollectSummariesOptions): Promise<ReadonlyArray<CommitSummaryEvent>> {
+export async function collectSummaryEvents(opts: CollectSummariesOptions): Promise<SummaryCollection> {
 	const storage = opts.storage;
 	const index = await getIndex(opts.cwd, storage).catch(() => null);
-	if (!index) return [];
+	if (!index) return { events: [], complete: false };
 	const rootHashes = index.entries
 		.filter((e) => e.parentCommitHash === null || e.parentCommitHash === undefined)
 		.map((e) => e.commitHash);
 
 	const events: CommitSummaryEvent[] = [];
+	let complete = true;
 	for (const hash of rootHashes) {
 		try {
 			const summary = await getSummary(hash, opts.cwd, storage);
+			// A null read is "not there" per the StorageProvider contract, not a
+			// failure — the index can name a summary a prune has since removed.
 			if (!summary) continue;
 			const transcriptIds = getTranscriptIds(summary);
 			const transcripts =
@@ -737,10 +858,11 @@ export async function collectSummaryEvents(opts: CollectSummariesOptions): Promi
 			const event = summaryEventFromCommitSummary(opts.repoIdentity, summary, transcripts);
 			if (event) events.push(event);
 		} catch (err) {
+			complete = false;
 			log.warn("summary %s unreadable for dashboard: %s", hash.slice(0, 8), errMsg(err));
 		}
 	}
-	return events;
+	return { events, complete };
 }
 
 /** Collects the current worktree dirty-state, or null when unreadable. */

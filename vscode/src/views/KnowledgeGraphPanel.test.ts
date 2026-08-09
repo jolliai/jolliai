@@ -96,10 +96,15 @@ describe("renderGraphHtml", () => {
 		expect(html).not.toContain("<!-- scripts:start -->");
 	});
 
-	it("escapes </script sequences in the embedded graph data", () => {
+	// Behaviour is pinned in the CLI's core/InlineScript.test.ts — this panel
+	// shares that implementation rather than carrying its own copy.
+	it("escapes < in the embedded graph data, including a <!-- comment opener", () => {
 		const html = renderGraphHtml(TEMPLATE, { ...ASSETS, graphJson: '{"x":"</script>BAD"}' });
-		expect(html).toContain("<\\/script");
+		expect(html).toContain("\\u003c/script");
 		expect(html).not.toContain("</script>BAD");
+
+		const commented = renderGraphHtml(TEMPLATE, { ...ASSETS, graphJson: '{"x":"<!--<script>"}' });
+		expect(commented).not.toContain("<!--<script>");
 	});
 
 	it("permits inline styles (style-src 'unsafe-inline') so per-category colors survive", () => {

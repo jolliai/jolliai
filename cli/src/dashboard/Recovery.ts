@@ -19,6 +19,7 @@
  * - Same-directory temp + rename, exactly like snapshot creation.
  */
 
+import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { peekKBPath } from "../core/KBPathResolver.js";
@@ -275,9 +276,35 @@ export async function restoreFromSnapshot(
 		// the one path that has to work is the one that cannot. Same helper as
 		// `openDb`, so the restored file lands under an owner-only directory.
 		ensureOwnerOnlyDir(dbPath);
-		const temp = join(dirname(dbPath), `.${basename(dbPath)}.restore-tmp`);
-		rmSync(temp, { force: true });
-		copyFileSync(snapshotPath, temp);
+		// PID + nonce, never a shared fixed name. Two overlapping recoveries (two
+		// terminals, or a script re-invoking after a perceived hang) on one temp
+		// path interleave as: A removes it, A starts copying, B removes it and
+		// starts its own copy, A renames a partially-copied file over the LIVE
+		// database — with the sidecars already gone and nothing left to restore
+		// from. `Backup.ts` carries the same suffix after being bitten by exactly
+		// this; here the blast radius is a corrupt database rather than a missed
+		// snapshot.
+		const temp = join(
+			dirname(dbPath),
+			`.${basename(dbPath)}.restore-${process.pid}-${randomUUID().slice(0, 8)}.tmp`,
+		);
+		try {
+			copyFileSync(snapshotPath, temp);
+			// Verify the COPY, not just the source: the check above proves the
+			// snapshot was sound, not that it arrived intact (a short write on a full
+			// disk does not throw here). Installing an unverified file is the one
+			// failure this function cannot walk back from.
+			if (!(await verifySnapshotFile(temp))) {
+				rmSync(temp, { force: true });
+				return {
+					status: "failed",
+					reason: "restored copy failed integrity_check — the database was left untouched",
+				};
+			}
+		} catch (err) {
+			rmSync(temp, { force: true });
+			throw err;
+		}
 		// The dead database's WAL must not be replayed over the restored file —
 		// and the sidecars have to go BEFORE the rename: a concurrent opener in
 		// the gap would otherwise pair the fresh file with the dead WAL. Removing

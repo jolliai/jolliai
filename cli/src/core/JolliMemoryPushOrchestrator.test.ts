@@ -191,6 +191,20 @@ describe("serializeSummaryJson", () => {
 		expect(json.commitHash).toBe("a");
 	});
 
+	it("strips the skill-article publish state too (the skill push runs first and weaves it on)", () => {
+		const s = {
+			commitHash: "a",
+			jolliSkillsDocId: 42,
+			jolliSkillsDocUrl: "https://acme.jolli.ai/articles?doc=42",
+			skills: [{ source: "claude", skill: "jolli-recall", uses: 2 }],
+		} as unknown as CommitSummary;
+		const json = JSON.parse(serializeSummaryJson(s) ?? "{}");
+		expect(json.jolliSkillsDocId).toBeUndefined();
+		expect(json.jolliSkillsDocUrl).toBeUndefined();
+		// The skill rows themselves are commit content and stay.
+		expect(json.skills).toHaveLength(1);
+	});
+
 	it("keeps nested plan/note/reference docId/url (needed for rendering the article links)", () => {
 		const s = {
 			commitHash: "a",
@@ -2068,36 +2082,69 @@ describe("skill attachments", () => {
 		vi.mocked(readSkillFromBranch).mockReset().mockResolvedValue(null);
 	});
 
-	it("pushes a skill article and writes the id back onto the UNIFORM fields", async () => {
+	it("pushes ONE skill article and writes its id back onto the COMMIT", async () => {
 		const client = fakeClient({
 			push: async (payload) => (payload.docType === "skill" ? fakePushResult({ docId: 77 }) : fakePushResult()),
 		});
-		const summary = leaf({ skills: [skillRef] });
+		const second = { ...skillRef, archivedKey: "claude:other-a1b2c3d4", skill: "other" };
+		const summary = leaf({ skills: [skillRef, second] });
 
-		await pushSummary(summary, baseCtx(client), new Map([["skill", [skillRef]]]));
+		await pushSummary(summary, baseCtx(client), new Map([["skill", [skillRef, second]]]));
 
-		expect(client.push).toHaveBeenCalledWith(
-			expect.objectContaining({ docType: "skill", commitHash: summary.commitHash }),
-		);
+		// Two skills, one article — the commit's skills are ONE artifact everywhere else
+		// (the Memory Bank writes a single `skills--<hash8>.md`), and the push now matches.
+		const skillPushes = vi.mocked(client.push).mock.calls.filter(([p]) => p.docType === "skill");
+		expect(skillPushes).toHaveLength(1);
+		expect(skillPushes[0][0]).toMatchObject({ commitHash: summary.commitHash });
 		const stored = vi.mocked(storeSummary).mock.calls[0][0];
-		// A new kind takes the registry defaults, so the published id lands on
-		// `jolliDocId` / `jolliDocUrl` rather than a `jolliSkillDoc*` pair.
-		expect(stored.skills?.[0]).toMatchObject({ jolliDocId: 77, jolliDocUrl: `${BASE}/articles?doc=77` });
+		// On the SUMMARY, because the article covers the commit. Parking it on a
+		// representative ref put a commit-level id inside `mergeSkillRef`'s per-ref fold.
+		expect(stored).toMatchObject({ jolliSkillsDocId: 77, jolliSkillsDocUrl: `${BASE}/articles?doc=77` });
+		expect(stored.skills?.[0]).not.toHaveProperty("jolliDocId");
 	});
 
-	it("reuses a stored skill docId as an update target when the env matches", async () => {
+	it("reuses the commit's stored skill docId as an update target when the env matches", async () => {
 		const client = fakeClient();
-		const withDoc = { ...skillRef, jolliDocId: 66, jolliDocUrl: `${BASE}/articles?doc=66` };
-		await pushSummary(leaf({ skills: [withDoc] }), baseCtx(client), new Map([["skill", [withDoc]]]));
+		const summary = {
+			...leaf({ skills: [skillRef] }),
+			jolliSkillsDocId: 66,
+			jolliSkillsDocUrl: `${BASE}/articles?doc=66`,
+		};
+		await pushSummary(summary, baseCtx(client), new Map([["skill", [skillRef]]]));
 		expect(client.push).toHaveBeenCalledWith(expect.objectContaining({ docType: "skill", docId: 66 }));
 	});
 
 	it("drops a stored skill docId minted against another backend", async () => {
 		const client = fakeClient();
-		const foreign = { ...skillRef, jolliDocId: 66, jolliDocUrl: "https://other.jolli.ai/articles?doc=66" };
-		await pushSummary(leaf({ skills: [foreign] }), baseCtx(client), new Map([["skill", [foreign]]]));
+		const summary = {
+			...leaf({ skills: [skillRef] }),
+			jolliSkillsDocId: 66,
+			jolliSkillsDocUrl: "https://other.jolli.ai/articles?doc=66",
+		};
+		await pushSummary(summary, baseCtx(client), new Map([["skill", [skillRef]]]));
 		const skillPayload = vi.mocked(client.push).mock.calls.find(([p]) => p.docType === "skill")?.[0];
 		expect(skillPayload?.docId).toBeUndefined();
+	});
+
+	it("migrates a legacy per-skill article id onto the commit and orphans the others", async () => {
+		// A shipped version published one article per (skill, commit). Ignoring those ids
+		// would leak every one of them — `cleanupOrphanedDocs` only ever sees
+		// `orphanedDocIds` — so the newest is adopted as the commit's aggregate and the
+		// rest are queued for deletion. N articles converge to 1 in a single push.
+		const client = fakeClient();
+		const older = { ...skillRef, jolliDocId: 61, jolliDocUrl: `${BASE}/articles?doc=61` };
+		const newer = {
+			...skillRef,
+			archivedKey: "claude:other-a1b2c3d4",
+			skill: "other",
+			lastUsedAt: "2026-08-09T10:00:00.000Z",
+			jolliDocId: 62,
+			jolliDocUrl: `${BASE}/articles?doc=62`,
+		};
+		await pushSummary(leaf({ skills: [older, newer] }), baseCtx(client), new Map([["skill", [older, newer]]]));
+		expect(client.push).toHaveBeenCalledWith(expect.objectContaining({ docType: "skill", docId: 62 }));
+		const stored = vi.mocked(storeSummary).mock.calls[0][0];
+		expect(stored.orphanedDocIds).toContain(61);
 	});
 
 	it("logs and continues past a failed skill push — the summary still publishes", async () => {

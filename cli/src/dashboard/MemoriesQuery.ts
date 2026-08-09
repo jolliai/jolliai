@@ -42,7 +42,7 @@ import type { DashboardDbHandle } from "./DashboardDb.js";
 import {
 	type ContextDoc,
 	type DashboardScope,
-	MEMORIES_LIST_LIMIT,
+	MEMORIES_PAGE_SIZE,
 	type MemoriesModel,
 	type MemoryActivityRow,
 	type MemoryContextRow,
@@ -97,18 +97,29 @@ export function isReachable(reachable: ReachableCommits | undefined, repoIdentit
 	return set == null || set.has(hash);
 }
 
-/** The tree's list of rows and the sidebar's vitals — no per-memory detail. */
-export function buildMemoriesList(
+/**
+ * The reachable root memories for a scope, newest first — the whole set, before
+ * any page is cut from it.
+ *
+ * No SQL LIMIT and no SQL OFFSET, both for the same reason: reachability can
+ * only be checked in JS (git, not the DB), so a row the filter drops would make
+ * a database-level window skip a different memory on every page. The set is
+ * small (one row per root memory), and the cost this page cares about is bytes
+ * on the wire, not rows read.
+ *
+ * `commit_hash` is the second sort key, and it is load-bearing rather than
+ * cosmetic: two memories can share a `commit_date_ms` to the millisecond (a
+ * squash, a scripted series of commits), and the page cursor is a position in
+ * THIS order. Ordering by the date alone leaves those rows in whatever order
+ * SQLite happens to produce, so the same cursor could land on either side of the
+ * pair between two requests — dropping one memory or repeating it.
+ */
+function reachableMemoryRows(
 	db: DashboardDbHandle,
-	scope: DashboardScope,
+	resolved: ReturnType<typeof scopeToRepoId>,
 	reachable?: ReachableCommits,
-): Omit<MemoriesModel, "selected"> {
-	const resolved = scopeToRepoId(db, scope);
+): ReadonlyArray<MemoryListRow> {
 	const listFilter = scopeFilter(resolved, "m.repo_id");
-	// No SQL LIMIT: reachability can only be checked in JS (git, not the DB),
-	// so the full root-memory set for this scope is fetched, filtered, then
-	// paged — `memories` only grows with real commits, so this scales with a
-	// single repo's history, not with the git-cost of the check itself.
 	const allRows = db
 		.prepare(
 			`SELECT m.commit_hash, m.branch, m.commit_message, m.commit_date_ms, m.ticket_id, m.jolli_doc_id,
@@ -117,32 +128,82 @@ export function buildMemoriesList(
 			   JOIN repos r ON r.id = m.repo_id
 			  WHERE m.parent_hash IS NULL
 				${listFilter.sql}
-			  ORDER BY m.commit_date_ms DESC`,
+			  ORDER BY m.commit_date_ms DESC, m.commit_hash DESC`,
 		)
 		.all(...listFilter.params) as ReadonlyArray<MemoryListRow>;
-	const rows = allRows.filter((row) => isReachable(reachable, row.repo_identity, row.commit_hash));
+	return allRows.filter((row) => isReachable(reachable, row.repo_identity, row.commit_hash));
+}
 
-	const truncated = rows.length > MEMORIES_LIST_LIMIT;
-	const page = truncated ? rows.slice(0, MEMORIES_LIST_LIMIT) : rows;
-	const categoryLabels = commitCategoryLabels(db, scope);
+/**
+ * One page of tree rows — what `/api/memories` answers, and what the inlined
+ * model's first page is cut with.
+ *
+ * Paged rather than capped: the tree's search box filters this array in the
+ * browser, so a hard cap would quietly turn "search my memories" into "search
+ * my recent memories". But the model is inlined into a `<script>` block on
+ * every render, so the whole set cannot ride there either — an all-repos scope
+ * is the sum of every enabled repo's entire history. The HTML carries the first
+ * {@link MEMORIES_PAGE_SIZE} rows and the tree's "Load more" button pulls each
+ * further page from this same function over HTTP.
+ *
+ * `totalCount` is the reachable total, so `items.length < totalCount` is the
+ * client's "there is another page" test — no separate truncation flag to keep
+ * in step with it.
+ *
+ * **Keyed on the last row the client holds, never on an offset.** The set this
+ * pages over is filtered by git reachability at request time, so it SHRINKS
+ * under a rebase mid-browse: with an offset, every row after the vanished one
+ * moves up a slot, and the one that lands on the boundary falls inside the
+ * already-loaded range and is never shown again. A gap is the failure mode that
+ * matters here, because the client can dedupe a repeat but cannot notice
+ * something it was never sent. A cursor has no such window — it says "continue
+ * after this exact memory" and stays correct however the rows around it move.
+ */
+export function buildMemoriesPage(
+	db: DashboardDbHandle,
+	scope: DashboardScope,
+	cursor: MemoriesPageCursor | undefined,
+	reachable?: ReachableCommits,
+): {
+	readonly items: ReadonlyArray<MemoryListItem>;
+	readonly totalCount: number;
+	readonly cursorMissing?: true;
+} {
+	const resolved = scopeToRepoId(db, scope);
+	const rows = reachableMemoryRows(db, resolved, reachable);
+	const at = cursor
+		? rows.findIndex((row) => row.repo_identity === cursor.repoIdentity && row.commit_hash === cursor.commitHash)
+		: -1;
+	// A cursor whose memory is gone (rebased away while the reader browsed) gets
+	// the FIRST page plus a flag — not an empty page, and not a silent restart.
+	// Empty would strand the tree at what it had loaded; a silent restart would
+	// return rows the client already holds, which its dedupe drops, leaving a
+	// "Load more" button that visibly does nothing however often it is clicked.
+	// The flag is what lets the client re-seat itself on a list it can page.
+	const cursorMissing = cursor !== undefined && at < 0;
+	const start = cursorMissing ? 0 : at + 1;
+	return {
+		items: toListItems(db, scope, rows.slice(start, start + MEMORIES_PAGE_SIZE)),
+		totalCount: rows.length,
+		...(cursorMissing ? { cursorMissing: true as const } : {}),
+	};
+}
 
-	const items: MemoryListItem[] = page.map((row) => {
-		const category = categoryLabels.get(`${row.repo_name}\0${row.commit_hash}`);
-		const memoryRefId = formatMemoryRefId(row.jolli_doc_id == null ? undefined : Number(row.jolli_doc_id));
-		return {
-			repoIdentity: row.repo_identity,
-			repoName: row.repo_name,
-			commitHash: row.commit_hash,
-			shortHash: row.commit_hash.slice(0, 7),
-			...(memoryRefId ? { memoryRefId } : {}),
-			title: row.commit_message ?? "",
-			...(row.branch ? { branch: row.branch } : {}),
-			committedAtMs: row.commit_date_ms,
-			...(row.ticket_id ? { ticketId: row.ticket_id } : {}),
-			...(category ? { category } : {}),
-			synced: row.jolli_doc_id != null,
-		};
-	});
+/** Position in the list: the last row the client already holds. */
+export interface MemoriesPageCursor {
+	readonly repoIdentity: string;
+	readonly commitHash: string;
+}
+
+/** The tree's first page and the sidebar's vitals — no per-memory detail. */
+export function buildMemoriesList(
+	db: DashboardDbHandle,
+	scope: DashboardScope,
+	reachable?: ReachableCommits,
+): Omit<MemoriesModel, "selected"> {
+	const resolved = scopeToRepoId(db, scope);
+	const rows = reachableMemoryRows(db, resolved, reachable);
+	const items = toListItems(db, scope, rows.slice(0, MEMORIES_PAGE_SIZE));
 
 	const plainFilter = scopeFilter(resolved);
 	const memoriesTotal = rows.length;
@@ -162,9 +223,34 @@ export function buildMemoriesList(
 	return {
 		items,
 		totalCount: memoriesTotal,
-		truncated,
 		vitals: { memories: memoriesTotal, topics: topicsTotal, repos: reposTotal },
 	};
+}
+
+/** Row → tree item. Shared by the inlined first page and every `/api/memories` page. */
+function toListItems(
+	db: DashboardDbHandle,
+	scope: DashboardScope,
+	rows: ReadonlyArray<MemoryListRow>,
+): ReadonlyArray<MemoryListItem> {
+	const categoryLabels = commitCategoryLabels(db, scope);
+	return rows.map((row) => {
+		const category = categoryLabels.get(`${row.repo_identity}\0${row.commit_hash}`);
+		const memoryRefId = formatMemoryRefId(row.jolli_doc_id == null ? undefined : Number(row.jolli_doc_id));
+		return {
+			repoIdentity: row.repo_identity,
+			repoName: row.repo_name,
+			commitHash: row.commit_hash,
+			shortHash: row.commit_hash.slice(0, 7),
+			...(memoryRefId ? { memoryRefId } : {}),
+			title: row.commit_message ?? "",
+			...(row.branch ? { branch: row.branch } : {}),
+			committedAtMs: row.commit_date_ms,
+			...(row.ticket_id ? { ticketId: row.ticket_id } : {}),
+			...(category ? { category } : {}),
+			synced: row.jolli_doc_id != null,
+		};
+	});
 }
 
 interface MemoryDetailRow {
@@ -381,7 +467,7 @@ export function buildMemoryDetail(
 	const summary = (assembleMemoryTree(db, row.repo_id, hash) ?? JSON.parse(row.summary_json)) as CommitSummary;
 
 	const categoryLabels = commitCategoryLabels(db, scope);
-	const category = categoryLabels.get(`${row.repo_name}\0${row.commit_hash}`);
+	const category = categoryLabels.get(`${row.repo_identity}\0${row.commit_hash}`);
 
 	const filesRows = db
 		.prepare(

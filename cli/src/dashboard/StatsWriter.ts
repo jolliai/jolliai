@@ -134,7 +134,12 @@ export function applyToDb(
 	// how any writer picks up rows a crashed predecessor committed but never
 	// projected. The batch just inserted is itself pending, so this is also what
 	// projects it.
-	const drained = drainPending(db, { now });
+	// The repos this call speaks for, so `drainPending`'s pending tally answers
+	// "is MY backlog clear?" rather than the machine's — see the note there.
+	const pendingScope = [...new Set(envelopes.map((e) => e.event.repoIdentity))].filter(
+		(id): id is string => typeof id === "string" && id.length > 0,
+	);
+	const drained = drainPending(db, { now, pendingScope });
 	return { accepted: envelopes.length, projected: drained.projected, pending: drained.pending };
 }
 
@@ -188,7 +193,7 @@ interface PendingRow {
  */
 export function drainPending(
 	db: DashboardDbHandle,
-	opts: { readonly now?: () => number } = {},
+	opts: { readonly now?: () => number; readonly pendingScope?: ReadonlyArray<string> } = {},
 ): { projected: number; pending: number } {
 	const now = opts.now ?? Date.now;
 	// Future-schema rows are excluded from the CLAIM, not just skipped in the
@@ -198,6 +203,21 @@ export function drainPending(
 	// build can never reach its own newer pending rows, and its projections
 	// stall silently until a new-build writer happens to drain. They still stay
 	// `pending` and are still counted, so nothing is lost or guessed at.
+	// Un-park what THIS build can now project. A row reaches `failed_kind =
+	// 'unknown-type'` only via `projectEvent`'s default throw — an older build
+	// draining a newer producer's event — and that comment promises the event
+	// survives for a build that understands it. It did not: the claim below
+	// selects `pending`, and nothing reset `failed`, so upgrading never
+	// recovered it. Scoped to types this build knows and to that one reason, so
+	// a genuinely defective event stays parked instead of burning its attempt
+	// budget again on every drain.
+	const revivable = KNOWN_EVENT_TYPES.map(() => "?").join(", ");
+	db.prepare(
+		`UPDATE events_raw SET projection_status = 'pending', attempts = 0, failed_kind = NULL
+		  WHERE projection_status = 'failed' AND failed_kind = 'unknown-type'
+		    AND type IN (${revivable})`,
+	).run(...KNOWN_EVENT_TYPES);
+
 	const rows = db
 		.prepare(
 			`SELECT seq, type, schema_version, data_json, attempts
@@ -207,19 +227,8 @@ export function drainPending(
 			  LIMIT ?`,
 		)
 		.all(MAX_PROJECTION_ATTEMPTS, STATS_EVENT_SCHEMA_VERSION, DRAIN_BATCH_SIZE) as ReadonlyArray<PendingRow>;
-	// Counted separately so the returned `pending` still reports them (the loop
-	// below no longer sees them at all).
-	const deferred = db
-		.prepare(
-			`SELECT COUNT(*) AS n FROM events_raw
-			  WHERE projection_status = 'pending' AND attempts < ? AND schema_version > ?`,
-		)
-		.get(MAX_PROJECTION_ATTEMPTS, STATS_EVENT_SCHEMA_VERSION) as { n: number };
 
 	let projected = 0;
-	// An event from a newer producer stays pending rather than being dropped or
-	// guessed at: a later build that understands the shape will project it.
-	let pending = deferred.n;
 	for (const row of rows) {
 		try {
 			inTransaction(db, () => {
@@ -249,7 +258,6 @@ export function drainPending(
 			// anyway, so there is no queue to starve.
 			if (classifyScanError(err)?.kind === "locked") {
 				log.warn("event seq=%d (%s) deferred — database busy: %s", row.seq, row.type, errMsg(err));
-				pending++;
 				continue;
 			}
 			// The attempt counter was rolled back with the transaction, so bump it
@@ -257,20 +265,111 @@ export function drainPending(
 			// forever and starve the rest of the queue.
 			const attempts = row.attempts + 1;
 			const status = attempts >= MAX_PROJECTION_ATTEMPTS ? "failed" : "pending";
-			db.prepare("UPDATE events_raw SET attempts = ?, projection_status = ? WHERE seq = ?").run(
+			// The reason is recorded, not just the verdict: only an unknown TYPE is
+			// recoverable by a later build (see the revival above).
+			const kind = isUnknownTypeError(err) ? "unknown-type" : "error";
+			db.prepare("UPDATE events_raw SET attempts = ?, projection_status = ?, failed_kind = ? WHERE seq = ?").run(
 				attempts,
 				status,
+				status === "failed" ? kind : null,
 				row.seq,
 			);
 			if (status === "failed") {
 				log.error("event seq=%d (%s) failed %d times — parked: %s", row.seq, row.type, attempts, errMsg(err));
 			} else {
 				log.warn("event seq=%d (%s) projection failed, will retry: %s", row.seq, row.type, errMsg(err));
-				pending++;
 			}
 		}
 	}
-	return { projected, pending };
+	// Counted from the table, never accumulated. `pending` is what
+	// `Backfill.applyBatches` consults before advancing the summaries cursor, so
+	// it has to mean "events still unprojected" — the tally it replaces counted
+	// only future-schema rows plus this pass's own failures, and said 0 while
+	// everything the `LIMIT` did not reach was still waiting. One first tick on a
+	// machine with more sessions than DRAIN_BATCH_SIZE was enough to report a
+	// clean drain over hundreds of unprojected events.
+	//
+	// The two filters below are what keep "unprojected" from meaning
+	// "unprojectABLE", and the caller's gate is `pending === 0` — so a row this
+	// runtime can never claim is not a delay, it is a permanent cursor stall.
+	//
+	//  - `schema_version <= ?` mirrors the claim query above EXACTLY. A row
+	//    written by a newer CLI is never selected for projection, so `attempts`
+	//    stays 0 and it can never age out: without this the summaries cursor
+	//    stops advancing forever (for every repo), and each pass re-collects the
+	//    whole index from scratch. Any change to the claim predicate has to be
+	//    made here too, or the gate silently stops matching what drains.
+	//  - `repo_identity IN (…)` scopes the answer to the repos the caller is
+	//    actually reporting on (`pendingScope`). `events_raw` is machine-global,
+	//    so another repo's in-flight rows would otherwise hold back THIS repo's
+	//    cursor. That kind is self-healing (the other repo drains, the next pass
+	//    advances), which is why it is scoped rather than counted as an error.
+	//    An empty scope means the caller has no repo to attribute this to, and
+	//    the global count is then the honest answer.
+	const scoped = (opts.pendingScope ?? []).filter((id) => id.length > 0);
+	const remaining = (
+		scoped.length > 0
+			? db
+					.prepare(
+						`SELECT COUNT(*) AS n FROM events_raw
+						  WHERE projection_status = 'pending' AND attempts < ? AND schema_version <= ?
+						    AND repo_identity IN (${scoped.map(() => "?").join(",")})`,
+					)
+					.get(MAX_PROJECTION_ATTEMPTS, STATS_EVENT_SCHEMA_VERSION, ...scoped)
+			: db
+					.prepare(
+						`SELECT COUNT(*) AS n FROM events_raw
+						  WHERE projection_status = 'pending' AND attempts < ? AND schema_version <= ?`,
+					)
+					.get(MAX_PROJECTION_ATTEMPTS, STATS_EVENT_SCHEMA_VERSION)
+	) as { n: number };
+	return { projected, pending: remaining.n };
+}
+
+/**
+ * Every event type {@link projectEvent} can dispatch — the revival's allowlist.
+ *
+ * `as const satisfies` rather than a plain `ReadonlyArray<StatsEvent["type"]>`
+ * annotation, so {@link KnownEventTypesAreExhaustive} below can see the literals.
+ * The annotation widened every element to the full union, which made that check
+ * vacuously true.
+ */
+const KNOWN_EVENT_TYPES = [
+	"repo.enabled",
+	"repo.disabled",
+	"session.upserted",
+	"commit.created",
+	"commit.summary",
+	"worktree.status",
+	"recall.observed",
+] as const satisfies ReadonlyArray<StatsEvent["type"]>;
+
+/**
+ * Compile error the day a member of `StatsEvent["type"]` is missing from
+ * {@link KNOWN_EVENT_TYPES} — the mirror of the `never` assignment in
+ * {@link projectEvent}'s `default` arm.
+ *
+ * The two together are what keep the list and the switch in lockstep: the switch
+ * cannot fall behind `StatsEvent` (that arm), and the list cannot fall behind it
+ * either (this one), so neither can drift from the other. Only the switch was
+ * guarded before, and the asymmetry was silent by construction — a type missing
+ * from the list is not an error anywhere, it just means `reviveStuckEvents` never
+ * offers that type a second attempt, so a transient failure becomes permanent for
+ * that one kind of event and nothing says so.
+ *
+ * On a mismatch the error names the missing member rather than reading
+ * `true is not assignable to never`.
+ */
+type MissingEventType = Exclude<StatsEvent["type"], (typeof KNOWN_EVENT_TYPES)[number]>;
+const KnownEventTypesAreExhaustive: [MissingEventType] extends [never]
+	? true
+	: ["KNOWN_EVENT_TYPES is missing", MissingEventType] = true;
+void KnownEventTypesAreExhaustive;
+
+const UNKNOWN_TYPE_MARKER = "StatsWriter: no projection for event type";
+
+function isUnknownTypeError(err: unknown): boolean {
+	return err instanceof Error && err.message.startsWith(UNKNOWN_TYPE_MARKER);
 }
 
 /** Dispatches one event to its projection. Must run inside a transaction. */
@@ -312,7 +411,7 @@ function projectEvent(db: DashboardDbHandle, event: StatsEvent): void {
 			// through the attempt counter to `failed`, which is retained forever and
 			// logged loudly — the event survives for a build that understands it.
 			const unknown: never = event;
-			throw new Error(`StatsWriter: no projection for event type ${(unknown as StatsEvent).type}`);
+			throw new Error(`${UNKNOWN_TYPE_MARKER} ${(unknown as StatsEvent).type}`);
 		}
 	}
 }
@@ -478,7 +577,15 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): voi
 	// before. Only when the event actually OBSERVED usage, though: a usage-less
 	// event carried the tokens forward above, and deleting the split here would
 	// leave the scalars orphaned from an empty split.
-	if (event.models !== undefined) {
+	//
+	// The condition is `hasUsage`, the SAME predicate the carry-forward used.
+	// Testing `event.models !== undefined` instead let one shape fall between
+	// them: `models: []` with no scalar token fields is "unobserved" to the
+	// carry-forward (which keeps the stored 175 tokens) and "provided" to this
+	// delete (which empties the split), leaving a session whose KPI reports
+	// tokens while the model-dimension series reports none. `models: []` is an
+	// accepted producer shape, so the gap was one producer away from shipping.
+	if (hasUsage && event.models !== undefined) {
 		db.prepare("DELETE FROM session_model_usage WHERE session_event_id = ?").run(eventId);
 		const insertModel = db.prepare(
 			`INSERT INTO session_model_usage

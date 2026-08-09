@@ -218,8 +218,9 @@ export interface TranscriptReadResult {
 	 *  usage; the summed segments equal {@link usageBreakdown}. */
 	readonly usageByModel?: ReadonlyArray<ModelTokenUsage>;
 	/** Tool calls over the slice, one bucket per distinct tool. ABSENT means the
-	 *  source's transcripts carry no tool records at all (only Claude's do
-	 *  today); an EMPTY array means the slice genuinely called no tools. Consumers
+	 *  source's transcripts carry no tool records this runtime can read — see
+	 *  `TOOL_RECORDING_SOURCES` for which sources those are and why the list is
+	 *  evidence-gated; an EMPTY array means the slice genuinely called no tools. Consumers
 	 *  must keep the two apart — reporting an uncovered agent as "used no tools"
 	 *  is the failure mode this distinction exists to prevent. */
 	readonly toolUse?: ReadonlyArray<ToolCallCount>;
@@ -651,6 +652,36 @@ export interface CommitSummary {
 	readonly jolliDocUrl?: string;
 	/** Server-side article ID for direct update on subsequent pushes (set after first push) */
 	readonly jolliDocId?: number;
+	/**
+	 * Full URL / id of the pushed SKILL-USAGE article (docType `skill`) — the commit's
+	 * whole skill aggregate, one document per commit.
+	 *
+	 * **On the summary, not on a `SkillCommitRef`, and that is the point.** The article
+	 * covers the commit, exactly like the Memory Bank's `skills--<hash8>.md` and the
+	 * single "Skills used" Context row; there is no one skill it belongs to. Holding the
+	 * id on a representative ref instead — as this briefly did — put a commit-level
+	 * identity inside `mergeSkillRef`'s per-ref inheritance rules, which fold refs by
+	 * `<source>:<skill>`: a squash whose root and child had each been pushed left TWO
+	 * refs carrying an id from two different aggregate articles, the push reused
+	 * whichever sorted first (silently retitling another commit's article) and the other
+	 * became an orphan no cleanup path could see, because `supersededDocIds` only fires
+	 * when both sides of ONE fold carry an id.
+	 *
+	 * Squash/rebase treat it exactly like `jolliDocId`: 1:1 migration copies it (same
+	 * refs, same article), and a many-to-one merge adopts the NEWEST child's id and
+	 * routes the rest into `orphanedDocIds` for deletion. The merged root's skill table
+	 * is the fold of every child's, so no child's article is still the same document —
+	 * but updating one in place beats minting a new one, because `cleanupOrphanedDocs`
+	 * is best-effort and a failed delete then strands N stale articles instead of N-1
+	 * (see `collectChildSkillsDocMeta`, which is where the rule lives).
+	 *
+	 * The name is NOT the registry's uniform `jolliDocId` default: on a `CommitSummary`
+	 * that name is already taken by the memory article itself, so the `skill` kind
+	 * overrides both field names (see `core/push/ContextKindDefinition.ts`).
+	 */
+	readonly jolliSkillsDocUrl?: string;
+	/** See {@link CommitSummary.jolliSkillsDocUrl}. */
+	readonly jolliSkillsDocId?: number;
 	/**
 	 * Memory summary article IDs (NOT plan article IDs) superseded during squash/rebase merge.
 	 * Deleted from Jolli Space after a successful push. Accumulated across re-squashes.

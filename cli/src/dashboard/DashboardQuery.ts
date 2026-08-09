@@ -577,24 +577,37 @@ function buildSeries(
 		// COUNT(*) is 1 and their whole spend lands in '(uncategorised)'.
 		rows = db
 			.prepare(
-				`SELECT m.commit_date_ms AS at_ms, COALESCE(t.category, '(uncategorised)') AS key,
+				`SELECT COALESCE(cm.committed_at_ms, m.commit_date_ms) AS at_ms,
+				        COALESCE(t.category, '(uncategorised)') AS key,
 				        COALESCE(m.tokens, 0) * 1.0
 				          / COUNT(*) OVER (PARTITION BY m.repo_id, m.commit_hash) AS tokens,
 				        COALESCE(m.est_cost_usd, 0) * 1.0
 				          / COUNT(*) OVER (PARTITION BY m.repo_id, m.commit_hash) AS cost
 				   FROM memories m
 				   LEFT JOIN memory_topics t ON t.repo_id = m.repo_id AND t.commit_hash = m.commit_hash
-				  WHERE m.tokens IS NOT NULL AND m.commit_date_ms >= ? AND m.commit_date_ms < ?${filter.sql}`,
+				   LEFT JOIN commits cm ON cm.repo_id = m.repo_id AND cm.hash = m.commit_hash
+				  WHERE m.tokens IS NOT NULL
+				    AND COALESCE(cm.committed_at_ms, m.commit_date_ms) >= ?
+				    AND COALESCE(cm.committed_at_ms, m.commit_date_ms) < ?${filter.sql}`,
 			)
 			.all(fromMs, toMs, ...filter.params) as UsageRow[];
 	} else if (effective === "branch") {
 		const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
 		// A commit reachable from several branches contributes to each — the axis
-		// answers "where did the spend land", not "sum to the exact total".
+		// answers "where did the spend land", not "sum to the exact total". That
+		// licenses duplication ACROSS SERIES, never in the day totals, which is
+		// why the spend is apportioned exactly as the category axis apportions
+		// across topics. `commit_branches` is a per-branch `git rev-list` union,
+		// so every commit on `main` is also listed under every feature branch
+		// based off it: unapportioned, one 10k-token commit on a repo with five
+		// such branches added 60k tokens (and 6x the cost) to the day.
 		rows = db
 			.prepare(
 				`SELECT c.committed_at_ms AS at_ms, br.name AS key,
-				        COALESCE(m.tokens, 0) AS tokens, COALESCE(m.est_cost_usd, 0) AS cost
+				        COALESCE(m.tokens, 0) * 1.0
+				          / COUNT(*) OVER (PARTITION BY c.repo_id, c.hash) AS tokens,
+				        COALESCE(m.est_cost_usd, 0) * 1.0
+				          / COUNT(*) OVER (PARTITION BY c.repo_id, c.hash) AS cost
 				   FROM commits c JOIN commit_branches b ON b.commit_id = c.id
 			                        JOIN branches br ON br.id = b.branch_id
 			                        JOIN memories m ON m.repo_id = c.repo_id AND m.commit_hash = c.hash
@@ -999,7 +1012,7 @@ function buildStandup(
 
 	const categoryLabels = commitCategoryLabels(db, scope);
 	const toStandupCommit = (c: CommitRow): StandupCommit => {
-		const workCategory = categoryLabels.get(`${c.repo_name}\0${c.hash}`);
+		const workCategory = categoryLabels.get(`${c.repo_identity}\0${c.hash}`);
 		return {
 			hash: c.hash,
 			message: c.message ?? "",
@@ -1076,7 +1089,7 @@ interface MemoryCardRow {
 	readonly repo_identity: string;
 	readonly commit_hash: string;
 	readonly commit_message: string | null;
-	readonly commit_date_ms: number;
+	readonly committed_at_ms: number;
 	readonly recap: string | null;
 	readonly turns: number | null;
 	readonly est_cost_usd: number | null;
@@ -1147,14 +1160,25 @@ function buildMemoryCards(
 		// showing the two survivors of the twenty most recent rows instead of the
 		// twenty most recent surviving memories. Step one is deliberately narrow —
 		// the payload blob is only read for the page that is actually rendered.
+		// Windowed on the COMMITTER date, falling back to the memory's own
+		// `commit_date_ms` only when no `commits` row exists yet. Those two are
+		// different clocks: `commit_date_ms` comes from `CommitSummary.commitDate`,
+		// which `GitOps.getHeadCommitInfo` reads with `%aI` (author date), while
+		// `commits.committed_at_ms` is collected with `%cI` — deliberately, since
+		// every other window in this file is a committer-date window. Filtering
+		// the cards on the author date put a rebased or cherry-picked commit in a
+		// different bucket from the "N of M captured" line directly above the
+		// list, so the header counted memories the feed did not show.
 		const keys = db
 			.prepare(
 				`SELECT c.commit_hash, r.repo_identity
 				   FROM memories c
 				   JOIN repos r ON r.id = c.repo_id
+				   LEFT JOIN commits cm ON cm.repo_id = c.repo_id AND cm.hash = c.commit_hash
 				  WHERE c.parent_hash IS NULL
-				    AND c.commit_date_ms >= ? AND c.commit_date_ms < ?${filter.sql}
-				  ORDER BY c.commit_date_ms DESC`,
+				    AND COALESCE(cm.committed_at_ms, c.commit_date_ms) >= ?
+				    AND COALESCE(cm.committed_at_ms, c.commit_date_ms) < ?${filter.sql}
+				  ORDER BY COALESCE(cm.committed_at_ms, c.commit_date_ms) DESC`,
 			)
 			.all(window.startMs, window.endMs, ...filter.params) as ReadonlyArray<{
 			commit_hash: string;
@@ -1167,12 +1191,21 @@ function buildMemoryCards(
 		const holes = page.map(() => "?").join(",");
 		rows = db
 			.prepare(
-				`SELECT c.commit_hash, c.commit_message, c.commit_date_ms, c.recap, c.turns, c.est_cost_usd,
+				// Same COALESCE as the key query above, for both the sort and the
+				// timestamp the card renders. Ordering on `c.commit_date_ms` alone
+				// re-sorted the page by AUTHOR date after it had been selected and
+				// windowed on the committer date, so a rebased or cherry-picked commit
+				// landed out of order and rendered a timestamp that could fall outside
+				// the window it was selected for.
+				`SELECT c.commit_hash, c.commit_message,
+				        COALESCE(cm.committed_at_ms, c.commit_date_ms) AS committed_at_ms,
+				        c.recap, c.turns, c.est_cost_usd,
 				        c.branch, c.insertions, c.deletions, c.summary_json, r.repo_identity, r.repo_name
 				   FROM memories c
 				   JOIN repos r ON r.id = c.repo_id
+				   LEFT JOIN commits cm ON cm.repo_id = c.repo_id AND cm.hash = c.commit_hash
 				  WHERE c.parent_hash IS NULL AND c.commit_hash IN (${holes})${filter.sql}
-				  ORDER BY c.commit_date_ms DESC`,
+				  ORDER BY COALESCE(cm.committed_at_ms, c.commit_date_ms) DESC`,
 			)
 			.all(...page.map((k) => k.commit_hash), ...filter.params) as ReadonlyArray<MemoryCardRow>;
 		// `IN (hashes)` is keyed on the hash alone, so an unscoped dashboard whose
@@ -1208,7 +1241,7 @@ function buildMemoryCards(
 			title: row.commit_message ?? "",
 			...(category ? { category } : {}),
 			severity: changed >= MEMORY_CARD_MAJOR_LINES ? ("major" as const) : ("minor" as const),
-			committedAtMs: row.commit_date_ms,
+			committedAtMs: row.committed_at_ms,
 			...(decision ? { decision } : {}),
 			...(row.est_cost_usd != null ? { estCostUsd: row.est_cost_usd } : {}),
 			...(row.turns != null ? { turns: row.turns } : {}),
@@ -1467,25 +1500,38 @@ function buildRecallUsage(
 
 	const totalCalls = usedCalls + setAsideCalls;
 
-	// Coverage denominator: sessions in the window, PLUS any session a receipt in
-	// the window points at. The second arm is what keeps `sessionsWithContext`
-	// (counted off the receipts above) from ever exceeding it — a session last
-	// touched before the window can still have made an in-window recall call.
+	// Coverage denominator: the UNION of sessions touched in the window and the
+	// sessions in-window receipts point at, counted by identity so the two arms
+	// cannot double-count. It has to be a union rather than a filter over
+	// `sessions`, because the numerator (`sessionsWithContext`, taken off the
+	// receipts) can name a session that has NO `sessions` row yet: a receipt is
+	// written at the edge the moment `recall` is called, while the row appears
+	// only when StopHook or the editor's 60 s tick runs. A fresh agent calling
+	// recall on its first turn therefore rendered "1 of 0 sessions got prior
+	// context" — an EXISTS arm cannot rescue a session that is not in the table
+	// being filtered.
 	const sessionFilter = scopeFilter(repoId, "s.repo_id");
+	const receiptScope = scopeFilter(repoId, "r.repo_id");
 	const sessionRows = db
 		.prepare(
-			`SELECT COUNT(*) AS total
-			   FROM sessions s
-			  WHERE (
-			          (s.updated_at_ms >= ? AND s.updated_at_ms < ?)
-			          OR EXISTS (
-			               SELECT 1 FROM recall_receipts r
-			                WHERE r.repo_id = s.repo_id AND r.session_id = s.session_id
-			                  AND r.at_ms >= ? AND r.at_ms < ?
-			             )
-			        )${sessionFilter.sql}`,
+			`SELECT COUNT(*) AS total FROM (
+			   SELECT s.repo_id AS repo_id, s.session_id AS session_id
+			     FROM sessions s
+			    WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${sessionFilter.sql}
+			   UNION
+			   SELECT r.repo_id, r.session_id
+			     FROM recall_receipts r
+			    WHERE r.at_ms >= ? AND r.at_ms < ?${receiptScope.sql}
+			 )`,
 		)
-		.get(window.startMs, window.endMs, window.startMs, window.endMs, ...sessionFilter.params) as { total: number };
+		.get(
+			window.startMs,
+			window.endMs,
+			...sessionFilter.params,
+			window.startMs,
+			window.endMs,
+			...receiptScope.params,
+		) as { total: number };
 
 	// Skill invocations: the `jolli-recall` skill being run, which is NOT a
 	// recall call (see RecallUsage.skillInvocations for why it stays out of the

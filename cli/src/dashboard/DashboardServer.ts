@@ -59,6 +59,18 @@
  *      file. GET-only readers (session counts, tokens, cost, commit subjects,
  *      mined insights) still need no credential — nothing there is a
  *      secret, and the API key is never part of any model this serves.
+ *   4. `Sec-Fetch-Site` gates the one thing a GET can do that is NOT free:
+ *      building the Stats payload can fire a DecisionGist LLM call. Layers
+ *      1+2 do not stop a hostile tab from ISSUING a GET (a `no-cors` request
+ *      carries no `Origin` to reject and a loopback `Host` to accept) — they
+ *      only stop it reading the reply, which is enough when the reply is the
+ *      only thing at stake and not enough when producing it spends money. So
+ *      a cross-site request still gets its answer, minus the parts that cost
+ *      anything; see {@link ModelRequest.allowModelSpend}. This layer is what
+ *      covers the PAGE routes, which deliberately demand no token, and it
+ *      degrades to the token check on a client that sends no Fetch-Metadata.
+ *      An absent header is trusted as `curl` — a local process spending the
+ *      local user's own budget, which needs no help from us to do that.
  */
 
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -68,6 +80,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { dirname, join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
 import { getProjectRootDir, listReachableCommits } from "../core/GitOps.js";
+import { escapeForInlineScript } from "../core/InlineScript.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import { trackAs } from "../core/Telemetry.js";
 import { isTelemetryEventName, type TelemetryEventName } from "../core/TelemetryEvents.js";
@@ -91,7 +104,7 @@ import type {
 } from "./DashboardModel.js";
 import { buildDashboardModel, type QueryOptions } from "./DashboardQuery.js";
 import { getDecisionGist } from "./DecisionGist.js";
-import { type ReachableCommits, readContextDoc } from "./MemoriesQuery.js";
+import { buildMemoriesPage, type ReachableCommits, readContextDoc } from "./MemoriesQuery.js";
 import { probeRepo } from "./RepoProbe.js";
 import { deregisterRepo, existingWorktrees, readRepoRegistry, registerRepo } from "./RepoRegistry.js";
 import { buildRepositoriesModel } from "./RepositoriesQuery.js";
@@ -215,14 +228,6 @@ export function resolveDashboardAssetsDir(baseDir: string = HERE): string {
 	throw new Error("Dashboard assets not found — reinstall @jolli.ai/cli (the dashboard needs its bundled assets).");
 }
 
-/** Same inline-script hardening as GraphExport: no `</script` breakout. */
-function escapeForInlineScript(json: string): string {
-	return json
-		.replace(/<\/script/gi, "<\\/script")
-		.replace(new RegExp(String.fromCharCode(0x2028), "g"), "\\u2028")
-		.replace(new RegExp(String.fromCharCode(0x2029), "g"), "\\u2029");
-}
-
 /**
  * Assembles one self-contained page: template + inlined CSS + the model behind
  * `window.__JOLLI_DASHBOARD__` + inlined app scripts. No external fetches, so
@@ -259,20 +264,40 @@ export function assembleDashboardHtml(assetsDir: string, modelJson: string, toke
  * because the query layer keeps gaining optional axes, and each new one would
  * otherwise be a positional argument every caller has to thread through.
  */
-export type ModelRequest = Omit<QueryOptions, "timeZone" | "nowMs">;
+export type ModelRequest = Omit<QueryOptions, "timeZone" | "nowMs"> & {
+	/**
+	 * Whether this request may spend model budget (today: the Decisions gist).
+	 * Set for a page render, and for an `/api/model` call that presented the
+	 * token — i.e. one our own page made. A token-free `/api/model` still gets
+	 * the full payload, minus the parts that cost money.
+	 *
+	 * The gate exists because `/api/model` is reachable cross-site in a way the
+	 * page routes are not: a `no-cors` GET carries no `Origin` (so layer 2 never
+	 * fires) and `Host: 127.0.0.1:<port>` passes layer 1, so a background tab
+	 * could loop `?view=stats` with varied window params — each miss on
+	 * DecisionGist's 256-entry cache being a real LLM call the user never sees.
+	 * The `/` redirect below already avoids this one view for the same reason;
+	 * this closes the route that redirect cannot cover.
+	 */
+	readonly allowModelSpend?: boolean;
+};
 
 /** Builds the model for one request. Injectable so tests skip the real DB. */
 export type ModelBuilder = (request: ModelRequest) => Promise<DashboardModel>;
 
 /**
- * Views whose payload renders per-MEMORY rows, and therefore pay for one
- * `git rev-list --branches` per repo. Deliberately not `standup`: its commit
- * lists — like the stats heatmap and KPI row — report activity, and a commit
- * that has since been squashed away still happened. Only the memory-facing
- * rows are filtered, because a rewritten commit's `memories` row is a
- * DUPLICATE of the surviving one, not a record of separate work.
+ * Views whose payload counts or renders per-MEMORY rows, and therefore pay for
+ * one `git rev-list --branches` per repo. Deliberately not `standup`: its
+ * commit lists — like the stats heatmap and KPI row — report activity, and a
+ * commit that has since been squashed away still happened. Only the
+ * memory-facing rows are filtered, because a rewritten commit's `memories` row
+ * is a DUPLICATE of the surviving one, not a record of separate work.
+ *
+ * `repositories` is here for its per-repo memory badge alone: that number must
+ * answer the same question the Memories tree does, or the two pages contradict
+ * each other for any repo whose history was rewritten away.
  */
-const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>(["stats", "memories"]);
+const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>(["stats", "memories", "repositories"]);
 
 /**
  * One `git rev-list --branches` per enabled repo, mapped to {@link ReachableCommits}.
@@ -320,14 +345,14 @@ async function defaultModelBuilder(
 	await ensureDashboardDbExists(dbPath ? { dbPath } : {});
 	return withReadonlyDashboardDb(
 		async (db) => {
-			const repositories =
-				request.view === "repositories" ? await buildRepositoriesModel(db, configDir) : undefined;
 			// A rebase/reset/squash that rewrites history away leaves the old
 			// commits' rows in `commits` and `memories` forever, since nothing
 			// else notices they dropped off every branch — see `ReachableCommits`.
 			// Every view that renders per-commit rows pays for the check: the
 			// memories tree, the stats page's Memory Activity feed and captured
-			// counts, and standup's yesterday/today commit lists.
+			// counts, and the Repositories page's per-repo memory badge.
+			//
+			// Computed BEFORE the repositories model, which consumes it.
 			const reachableCommits = REACHABILITY_VIEWS.has(request.view)
 				? await readReachableCommitsByRepo(
 						db
@@ -335,6 +360,10 @@ async function defaultModelBuilder(
 							.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
 					)
 				: undefined;
+			const repositories =
+				request.view === "repositories"
+					? await buildRepositoriesModel(db, configDir, reachableCommits)
+					: undefined;
 			const model = buildDashboardModel(db, {
 				...request,
 				...(repositories ? { repositoriesModel: repositories } : {}),
@@ -353,12 +382,17 @@ async function defaultModelBuilder(
  * compress isn't known until that call returns the `latest` decision. Fails
  * open — a missing API key, LLM error, or timeout just leaves `latest.text`
  * as-is; see DecisionGist.ts.
+ *
+ * This is the ONLY place a browser-reachable route can spend model budget, so
+ * it is also where `allowModelSpend` is enforced; skipping it degrades the card
+ * to its un-compressed text, which is what a gist failure already does.
  */
 async function attachDecisionGist(
 	model: DashboardModel,
 	request: ModelRequest,
 	configDir: string | undefined,
 ): Promise<DashboardModel> {
+	if (!request.allowModelSpend) return model;
 	const stats = request.view === "stats" ? model.stats : undefined;
 	const decisions = stats?.decisions;
 	const latest = decisions?.latest;
@@ -474,6 +508,30 @@ function hasValidToken(req: IncomingMessage, token: string): boolean {
 	const expected = Buffer.from(token, "utf-8");
 	if (given.length !== expected.length) return false;
 	return timingSafeEqual(given, expected);
+}
+
+/**
+ * Whether a request may build a payload that costs money — see
+ * {@link ModelRequest.allowModelSpend}. Two independent signals, because
+ * neither covers the whole surface on its own:
+ *
+ *   - `Sec-Fetch-Site` (sent by every current browser, and by nothing else)
+ *     names the initiator. `cross-site`/`same-site` is a page we did not
+ *     serve, whatever it is loading us as — and it is the ONLY signal that
+ *     covers the PAGE routes, which an `<img src="…/stats">` reaches just as
+ *     easily as `/api/model` and where no token can be demanded without
+ *     breaking "open the URL by hand".
+ *   - The token covers `/api/model` for a client that sends no Fetch-Metadata
+ *     at all (an old browser), where the header's absence is indistinguishable
+ *     from `curl`.
+ *
+ * An absent header therefore means "not a browser" and is trusted: that is
+ * `curl` on the user's own machine, which can spend the user's own budget by
+ * a hundred easier routes than this one.
+ */
+function isCrossSiteRequest(req: IncomingMessage): boolean {
+	const site = req.headers["sec-fetch-site"];
+	return typeof site === "string" && site !== "same-origin" && site !== "none";
 }
 
 /** Caps a POST body — this is a local settings form, never a file upload. */
@@ -764,7 +822,16 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 
 		const pageView = VIEW_PATHS[url.pathname];
 		if (pageView) {
-			const model = await buildModel({ view: pageView, scope: parseScope(url), ...parseWindow(url) });
+			// A page render is a top-level navigation the user can see, and it is
+			// what the product call ("opening the URL by hand just works") is about
+			// — so no token here. A cross-site `<img src="…/stats">` reaches this
+			// route too, though, and only Fetch-Metadata can tell the two apart.
+			const model = await buildModel({
+				view: pageView,
+				scope: parseScope(url),
+				...parseWindow(url),
+				allowModelSpend: !isCrossSiteRequest(req),
+			});
 			if (GATED_PATHS.has(url.pathname) && model.repos.length === 0) {
 				res.writeHead(302, { Location: "/repositories" });
 				res.end();
@@ -783,7 +850,60 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		if (url.pathname === "/api/model") {
 			const requested = url.searchParams.get("view") ?? "";
 			const view: DashboardView = VIEW_TOKENS.has(requested) ? (requested as DashboardView) : "stats";
-			sendJson(res, 200, await buildModel({ view, scope: parseScope(url), ...parseWindow(url) }));
+			// Deliberately NOT a 403 without the token: this route stays open, as
+			// the module header's layer 3 promises. The token only decides whether
+			// the answer may cost money — see `ModelRequest.allowModelSpend`.
+			sendJson(
+				res,
+				200,
+				await buildModel({
+					view,
+					scope: parseScope(url),
+					...parseWindow(url),
+					allowModelSpend: hasValidToken(req, token) && !isCrossSiteRequest(req),
+				}),
+			);
+			return;
+		}
+
+		// One page of the Memories tree, behind that page's "Load more" button.
+		// Same reasoning as `/api/context` below — the model is inlined into the
+		// page HTML, so only the first page can ride there, and the rest is
+		// fetched when the reader asks for it. A read like every other GET here:
+		// no token, and a cursor naming a memory that no longer exists restarts
+		// from the top rather than erroring.
+		if (url.pathname === "/api/memories") {
+			// Both halves or neither: a hash without the repo it belongs to cannot
+			// identify a row in an all-repos scope, and silently paging from the top
+			// would look like a working "Load more" that repeats the first page.
+			const afterRepo = url.searchParams.get("afterRepo");
+			const afterHash = url.searchParams.get("afterHash");
+			if (!afterRepo !== !afterHash) {
+				sendJson(res, 400, { error: "afterRepo and afterHash must be given together" });
+				return;
+			}
+			const cursor = afterRepo && afterHash ? { repoIdentity: afterRepo, commitHash: afterHash } : undefined;
+			const scope = parseScope(url);
+			try {
+				// Recomputed per page rather than cached with the page's first
+				// render: reachability is what decides which rows exist at all, so
+				// a stale set would page over memories a rebase already removed.
+				const page = await withReadonlyDashboardDb(
+					async (db) => {
+						const reachable = await readReachableCommitsByRepo(
+							db
+								.prepare("SELECT repo_identity, worktree_root FROM repos WHERE disabled_at IS NULL")
+								.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
+						);
+						return buildMemoriesPage(db, scope, cursor, reachable);
+					},
+					{ ...(options.dbPath ? { dbPath: options.dbPath } : {}) },
+				);
+				sendJson(res, 200, page);
+			} catch (err) {
+				log.warn("memories page read failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not read that page of memories" });
+			}
 			return;
 		}
 

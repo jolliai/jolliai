@@ -16,6 +16,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { escapeForInlineScript } from "../core/InlineScript.js";
 import { createStorage } from "../core/StorageFactory.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -43,16 +44,11 @@ export interface GraphHtmlParts {
 }
 
 /**
- * Neutralize an inline-script breakout in the embedded JSON: the `</script`
- * close sequence (any case) plus the two raw JS line terminators U+2028/U+2029
- * that JSON leaves unescaped (inert on ES2019+, cheap defense in depth).
+ * Re-exported so this module's own callers (and its tests) keep their import,
+ * while the implementation stays single-sourced — see `core/InlineScript.ts`
+ * for why three private copies of it was the bug.
  */
-export function escapeForInlineScript(json: string): string {
-	return json
-		.replace(/<\/script/gi, "<\\/script")
-		.replace(new RegExp(String.fromCharCode(0x2028), "g"), "\\u2028")
-		.replace(new RegExp(String.fromCharCode(0x2029), "g"), "\\u2029");
-}
+export { escapeForInlineScript };
 
 /** Replace a single template marker, throwing if it is absent (no silent no-op). */
 function replaceMarker(html: string, marker: RegExp, replacement: () => string, label: string): string {

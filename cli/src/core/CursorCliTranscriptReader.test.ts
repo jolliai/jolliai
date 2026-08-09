@@ -298,3 +298,72 @@ describe("readCursorCliTranscript", () => {
 		expect(r2.entries).toEqual([{ role: "assistant", content: "second" }]);
 	});
 });
+
+describe("readCursorCliTranscript toolUse", () => {
+	let dir: string;
+	beforeEach(async () => {
+		dir = await mkdtemp(join(tmpdir(), "cursor-cli-tools-"));
+	});
+	afterEach(async () => {
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	// cursor-agent speaks the Anthropic block format, so a tool call is a
+	// `type:"tool_use"` part with a `toolu_…` id — the same parts the reader
+	// deliberately drops from the conversation text.
+	const withTools = [
+		JSON.stringify({
+			role: "assistant",
+			message: {
+				content: [
+					{ type: "text", text: "Checking." },
+					{ type: "tool_use", id: "toolu_1", name: "read_file", input: {} },
+					{ type: "tool_use", id: "toolu_2", name: "mcp__jollimemory__search", input: {} },
+				],
+			},
+		}),
+		JSON.stringify({
+			role: "assistant",
+			message: { content: [{ type: "tool_use", id: "toolu_3", name: "read_file", input: {} }] },
+		}),
+		"",
+	].join("\n");
+
+	it("counts tool_use parts, classifying MCP names by their mcp__ prefix", async () => {
+		const p = join(dir, "t.jsonl");
+		await writeFile(p, withTools);
+		const result = await readCursorCliTranscript(p);
+		expect(result.toolUse).toEqual([
+			{ name: "read_file", kind: "builtin", calls: 2 },
+			{ name: "jollimemory.search", kind: "mcp", server: "jollimemory", calls: 1 },
+		]);
+	});
+
+	it("counts a turn that is nothing but tool calls, which produces no entry", async () => {
+		const p = join(dir, "t.jsonl");
+		await writeFile(
+			p,
+			`${JSON.stringify({
+				role: "assistant",
+				message: { content: [{ type: "tool_use", id: "toolu_1", name: "read_file", input: {} }] },
+			})}\n`,
+		);
+		const result = await readCursorCliTranscript(p);
+		expect(result.entries).toEqual([]);
+		expect(result.toolUse).toEqual([{ name: "read_file", kind: "builtin", calls: 1 }]);
+	});
+
+	it("reports an empty array — not undefined — for a tool-free slice", async () => {
+		const p = join(dir, "t.jsonl");
+		await writeFile(p, REAL_JSONL);
+		const result = await readCursorCliTranscript(p);
+		expect(result.toolUse).toEqual([]);
+	});
+
+	it("counts only the calls inside the consumed slice", async () => {
+		const p = join(dir, "t.jsonl");
+		await writeFile(p, withTools);
+		const first = await readCursorCliTranscript(p, { transcriptPath: p, lineNumber: 1, updatedAt: "" });
+		expect(first.toolUse).toEqual([{ name: "read_file", kind: "builtin", calls: 1 }]);
+	});
+});

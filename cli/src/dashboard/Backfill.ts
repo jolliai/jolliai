@@ -48,7 +48,7 @@ import {
 	resolveProtectNewerThanMs,
 	type SotImportResult,
 } from "./SotImport.js";
-import { applyToDb } from "./StatsWriter.js"; // recordRepoGraph parked — see SotSchema
+import { applyToDb, pruneProjectedEvents } from "./StatsWriter.js"; // recordRepoGraph parked — see SotSchema
 
 const log = createLogger("Backfill");
 
@@ -153,6 +153,16 @@ export interface RepoProgress {
 	 * two are one motionless line.
 	 */
 	readonly detail?: string;
+	/**
+	 * Set on a `commits` phase-start marker when this repo has never completed a
+	 * bootstrap — i.e. when the sweep really will read the whole history.
+	 *
+	 * The caller's "this can take a few minutes" warning is gated on it. Since the
+	 * sweep skips `--numstat` for commits already stored, a steady-state pass over
+	 * a 2.5k-commit history is well under a second (measured 6.3 s → 0.44 s), and
+	 * warning about minutes there is simply false.
+	 */
+	readonly firstRun?: boolean;
 }
 
 /** {@link RepoProgress} plus the repo's place in a multi-repo run. */
@@ -205,6 +215,21 @@ function writeCursor(db: DashboardDbHandle, repoIdentity: string, source: string
 }
 
 /**
+ * Commit hashes already stored for this repo.
+ *
+ * Two callers, two uses of the same set: the prune asks which stored hashes are
+ * no longer reachable, and the collection asks which reachable hashes it can skip
+ * the `--numstat` for (see `CollectCommitsOptions.knownHashes`). Deriving both
+ * from one query keeps them from disagreeing about what "already stored" means.
+ */
+function storedCommitHashes(db: DashboardDbHandle, repoIdentity: string): Set<string> {
+	const rows = db
+		.prepare("SELECT c.hash FROM commits c JOIN repos r ON r.id = c.repo_id WHERE r.repo_identity = ?")
+		.all(repoIdentity) as ReadonlyArray<{ hash: string }>;
+	return new Set(rows.map((r) => r.hash));
+}
+
+/**
  * Prunes commit rows that are no longer reachable from any tracked ref — the
  * delete half of set reconciliation, run whenever a full commit collection has
  * the complete reachable set in hand. FK CASCADE removes branch links and
@@ -215,12 +240,9 @@ export function pruneUnreachableCommits(
 	repoIdentity: string,
 	reachable: ReadonlySet<string>,
 ): number {
-	const rows = db
-		.prepare("SELECT c.hash FROM commits c JOIN repos r ON r.id = c.repo_id WHERE r.repo_identity = ?")
-		.all(repoIdentity) as ReadonlyArray<{
-		hash: string;
-	}>;
-	const stale = rows.filter((r) => !reachable.has(r.hash));
+	const stale = [...storedCommitHashes(db, repoIdentity)]
+		.filter((hash) => !reachable.has(hash))
+		.map((hash) => ({ hash }));
 	if (stale.length === 0) return 0;
 	const remove = db.prepare(
 		"DELETE FROM commits WHERE repo_id = (SELECT id FROM repos WHERE repo_identity = ?) AND hash = ?",
@@ -232,6 +254,91 @@ export function pruneUnreachableCommits(
 	return stale.length;
 }
 
+/**
+ * The commit rows this repo already has, in the shape {@link unchangedCommitEvent}
+ * compares against — one query for the columns, one for the branch sets.
+ */
+function storedCommitRows(
+	db: DashboardDbHandle,
+	repoIdentity: string,
+): Map<string, { row: Record<string, unknown>; branches: Set<string> }> {
+	const rows = db
+		.prepare(
+			`SELECT c.id, c.hash, c.branch, c.message, c.author_name, c.author_email, c.committed_at_ms,
+			        c.files_changed, c.insertions, c.deletions
+			   FROM commits c JOIN repos r ON r.id = c.repo_id
+			  WHERE r.repo_identity = ?`,
+		)
+		.all(repoIdentity) as ReadonlyArray<Record<string, unknown> & { id: number; hash: string }>;
+	const byId = new Map<number, { row: Record<string, unknown>; branches: Set<string> }>();
+	const byHash = new Map<string, { row: Record<string, unknown>; branches: Set<string> }>();
+	for (const row of rows) {
+		const entry = { row, branches: new Set<string>() };
+		byId.set(row.id, entry);
+		byHash.set(row.hash, entry);
+	}
+	const links = db
+		.prepare(
+			`SELECT cb.commit_id, b.name
+			   FROM commit_branches cb
+			   JOIN branches b ON b.id = cb.branch_id
+			   JOIN repos r    ON r.id = b.repo_id
+			  WHERE r.repo_identity = ?`,
+		)
+		.all(repoIdentity) as ReadonlyArray<{ commit_id: number; name: string }>;
+	for (const link of links) byId.get(link.commit_id)?.branches.add(link.name);
+	return byHash;
+}
+
+/**
+ * True when projecting `event` would write nothing new.
+ *
+ * **This is what makes a routine sweep cheap.** The collection has to produce an
+ * event for EVERY reachable commit — that list is what the prune is computed
+ * against, and branch reachability changes for old commits whenever a branch
+ * moves — but on a normal day only the handful of commits on the branch being
+ * worked on have actually changed. Projecting the other 2,450 re-ran an UPSERT,
+ * a DELETE and a re-INSERT per commit to arrive at the bytes already there.
+ *
+ * The comparison MIRRORS {@link projectCommit}'s write, and has to stay in step
+ * with it — a column added there without a case here would silently stop being
+ * updated on any commit that matched on the others:
+ *
+ *  - The nullable columns are written with `COALESCE(excluded.x, commits.x)`, so
+ *    an ABSENT value on the event cannot change anything and is not a difference.
+ *    A present one must equal what is stored.
+ *  - `committed_at_ms` is written unconditionally, so it is compared even when
+ *    every other field matches.
+ *  - `branches` is replace-when-present, so a present set must match exactly;
+ *    absent (a failed branch scan) means "leave the rows alone".
+ *  - `files` present is never skipped. It is replace-when-present too, and the
+ *    stored file rows are not read here — a commit whose files this pass actually
+ *    scanned is by construction a new one, so this costs nothing in practice.
+ */
+function unchangedCommitEvent(
+	event: CommitCreatedEvent,
+	stored: { row: Record<string, unknown>; branches: Set<string> } | undefined,
+): boolean {
+	if (!stored) return false;
+	if (event.files) return false;
+	const { row, branches } = stored;
+	if (row.committed_at_ms !== event.committedAtMs) return false;
+	const sameNullable = (column: string, value: string | number | undefined): boolean =>
+		value === undefined || row[column] === value;
+	if (!sameNullable("branch", event.branch)) return false;
+	if (!sameNullable("message", event.message)) return false;
+	if (!sameNullable("author_name", event.authorName)) return false;
+	if (!sameNullable("author_email", event.authorEmail)) return false;
+	if (!sameNullable("files_changed", event.filesChanged)) return false;
+	if (!sameNullable("insertions", event.insertions)) return false;
+	if (!sameNullable("deletions", event.deletions)) return false;
+	if (event.branches) {
+		if (event.branches.length !== branches.size) return false;
+		for (const branch of event.branches) if (!branches.has(branch)) return false;
+	}
+	return true;
+}
+
 /** Wraps events in envelopes and applies them in small batches. */
 function applyBatches(
 	db: DashboardDbHandle,
@@ -239,17 +346,29 @@ function applyBatches(
 	producerKind: ProducerKind,
 	now: () => number,
 	onChunk?: (done: number, total: number) => void,
-): number {
+): { applied: number; pending: number } {
 	let applied = 0;
+	let pending = 0;
 	for (let start = 0; start < events.length; start += BATCH_SIZE) {
 		const batch: StatsEventEnvelope[] = events
 			.slice(start, start + BATCH_SIZE)
 			.map((event) => ({ event, producerKind }));
 		const result = applyToDb(db, batch, { producerKind, now });
 		applied += result.projected;
+		// Reported, not just discarded: an event that stayed pending did NOT
+		// reach the projection tables, so a caller whose cursor would skip the
+		// next sweep has to treat it the same as a failed read.
+		//
+		// OVERWRITTEN, never accumulated: `drainPending` counts the rows still
+		// unprojected for these repos at the end of each call — an absolute
+		// backlog, not this batch's delta. Summing it makes a backlog that batch
+		// 1 reported and batch 2 drained keep a non-zero total forever, so the
+		// summaries cursor never advances and every later pass re-collects the
+		// whole index. The last batch's count is the state that survives the loop.
+		pending = result.pending;
 		onChunk?.(Math.min(start + BATCH_SIZE, events.length), events.length);
 	}
-	return applied;
+	return { applied, pending };
 }
 
 /** The `repo.enabled` projection for a registry entry. */
@@ -345,7 +464,7 @@ export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResul
 	return withDashboardDb(
 		async (db) => {
 			// Project the registry entry first so FK targets exist with real names.
-			let applied = applyBatches(db, [repoEnabledEvent(repo)], producerKind, now);
+			let applied = applyBatches(db, [repoEnabledEvent(repo)], producerKind, now).applied;
 
 			// After the repo row (FK target), and idempotent on the artifact's own
 			// build stamp — so every recovery pass can offer it unconditionally and
@@ -388,6 +507,10 @@ export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResul
 				// other clone knows. Observed on a two-clone repo: 7 of 26 branches
 				// unique to the second checkout vanished that way.
 				const merged = new Map<string, CommitCreatedEvent>();
+				// Read ONCE for the whole checkout loop, before any of them writes: a
+				// per-checkout read would let the first checkout's upserts mark the
+				// second one's commits "known" and skip their file scan.
+				const knownHashes = storedCommitHashes(db, repo.repoIdentity);
 				// A checkout whose `git log` failed contributes nothing, which is
 				// indistinguishable from "this checkout reaches no commits" once the events
 				// are merged. Prune and the cursor advance are therefore both gated on a
@@ -401,11 +524,19 @@ export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResul
 						repoName: repo.repoName,
 						kind: "commits",
 						done: 0,
+						...(isBootstrap ? { firstRun: true } : {}),
 						...(worktrees.length > 1 ? { detail: `checkout ${i + 1} of ${worktrees.length}` } : {}),
 					});
 					let events: ReadonlyArray<CommitCreatedEvent>;
 					try {
-						events = await collectCommitEvents({ repoIdentity: repo.repoIdentity, cwd: worktree });
+						events = await collectCommitEvents({
+							repoIdentity: repo.repoIdentity,
+							cwd: worktree,
+							// Skips the whole-history `--numstat` for commits already stored —
+							// the step this sweep's wall clock is made of. A bootstrap has an
+							// empty set and so still scans everything.
+							knownHashes,
+						});
 					} catch (err) {
 						// Not fatal for the repo: sessions and memories still import, and the
 						// commits already stored stay stored. Only this pass's destructive half
@@ -429,9 +560,24 @@ export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResul
 					}
 				}
 				const commitEvents = [...merged.values()];
-				applied += applyBatches(db, commitEvents, producerKind, now, (done, total) =>
-					opts.onProgress?.({ repoName: repo.repoName, kind: "commits", done, total }),
+				// Only the events that would actually change a row are projected. The
+				// prune below still uses the COMPLETE set — see `unchangedCommitEvent`
+				// for why the collection cannot be narrowed but the projection can.
+				const storedRows = storedCommitRows(db, repo.repoIdentity);
+				const changed = commitEvents.filter(
+					(event) => !unchangedCommitEvent(event, storedRows.get(event.hash)),
 				);
+				if (changed.length !== commitEvents.length) {
+					log.info(
+						"%s: %d of %d commit events unchanged, skipping their projection",
+						repo.repoName,
+						commitEvents.length - changed.length,
+						commitEvents.length,
+					);
+				}
+				applied += applyBatches(db, changed, producerKind, now, (done, total) =>
+					opts.onProgress?.({ repoName: repo.repoName, kind: "commits", done, total }),
+				).applied;
 				if (collectionComplete) {
 					const reachable = new Set(commitEvents.map((e) => e.hash));
 					// Prune against the UNION: pruning per worktree would delete commits that
@@ -465,13 +611,29 @@ export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResul
 				// then did nothing — and a phase marker is the caller's evidence that
 				// there is work worth narrating.
 				opts.onProgress?.({ repoName: repo.repoName, kind: "summaries", done: 0 });
-				const summaryEvents = await collectSummaryEvents({
+				const summaries = await collectSummaryEvents({
 					repoIdentity: repo.repoIdentity,
 					cwd,
 					storage: orphanStorage,
 				});
-				applied += applyBatches(db, summaryEvents, producerKind, now);
-				writeCursor(db, repo.repoIdentity, CURSOR_SUMMARIES, indexFingerprint, now());
+				const summaryApply = applyBatches(db, summaries.events, producerKind, now);
+				applied += summaryApply.applied;
+				// Same rule as the commit tier's `collectionComplete` above, and for
+				// the same reason: this cursor is the index's content hash, so
+				// advancing it after a partial sweep makes every later pass skip
+				// collection outright. A summary that failed to read (or to project)
+				// would then be missing from the dashboard forever, since a re-read
+				// is only ever triggered by index.json itself changing.
+				if (summaries.complete && summaryApply.pending === 0) {
+					writeCursor(db, repo.repoIdentity, CURSOR_SUMMARIES, indexFingerprint, now());
+				} else {
+					log.warn(
+						"skipping summaries cursor advance for %s -- %d unreadable, %d unprojected",
+						repo.repoName,
+						summaries.complete ? 0 : 1,
+						summaryApply.pending,
+					);
+				}
 			}
 
 			// Sessions: always re-project the currently discoverable set. A global
@@ -486,7 +648,7 @@ export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResul
 			});
 			applied += applyBatches(db, sessionEvents, producerKind, now, (done, total) =>
 				opts.onProgress?.({ repoName: repo.repoName, kind: "sessions", done, total }),
-			);
+			).applied;
 			const maxUpdated = sessionEvents.reduce((max, e) => Math.max(max, e.updatedAtMs), 0);
 			if (maxUpdated > 0) writeCursor(db, repo.repoIdentity, CURSOR_SESSIONS, String(maxUpdated), now());
 
@@ -498,7 +660,7 @@ export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResul
 			// state needs the worktree path in that primary key — a schema change, and
 			// deliberately not smuggled into a defect fix.
 			const worktree = await collectWorktreeEvent(repo.repoIdentity, cwd, now);
-			if (worktree) applied += applyBatches(db, [worktree], producerKind, now);
+			if (worktree) applied += applyBatches(db, [worktree], producerKind, now).applied;
 
 			// SOT tables (v7): the orphan branch imported verbatim into
 			// memory_nodes/revisions, transcripts, docs, plan_progress and the topic
@@ -665,6 +827,17 @@ export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResul
 				new Date(now()).toISOString(),
 				repo.repoIdentity,
 			);
+
+			// The write-ahead log's retention pass. It normally rides `applyStatsEvents`,
+			// which this path does NOT use — `applyBatches` calls `applyToDb` directly to
+			// stay inside the one handle this whole pass holds. `events_raw.event_id` is
+			// deliberately not unique (see SotSchema: the same event may be written
+			// repeatedly, and idempotency lives in the projection tables), so without a
+			// prune here a machine that only ever runs `jolli dashboard` / `jolli enable`
+			// grows the log without bound. Bounded per pass and inside the lock we already
+			// hold, exactly as on the writer path.
+			const pruned = pruneProjectedEvents(db, now);
+			if (pruned > 0) log.debug("pruned %d projected event rows for %s", pruned, repo.repoName);
 
 			const mode = isBootstrap ? "bootstrapped" : "recovered";
 			log.info("%s %s: %d events applied", mode, repo.repoName, applied);

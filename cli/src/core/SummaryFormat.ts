@@ -287,39 +287,31 @@ const SKILL_SOURCE_LABELS: Readonly<Record<SkillSource, string>> = {
 
 /**
  * Builds the skill document title for pushing to Jolli Space:
- * `Skill · <host label> · <skill id> — <hash8>`.
+ * `Skills used — <hash8>`.
  *
- * Four segments, all load-bearing:
+ * **One title per COMMIT, not per skill** — it names the commit's whole skill
+ * aggregate, because that is what is pushed (see the `skill` definition's
+ * `aggregate` in `push/kinds/index.ts`). The wording is deliberately
+ * `buildSkillsAggregateMarkdown`'s own `# Skills used — <hash8>` heading: the
+ * pushed article and the Memory Bank's `skills--<hash8>.md` are the same document,
+ * so they must not be findable under two different names.
  *
- *   - The `Skill` prefix namespaces the generated slug, so a skill never collides
- *     with a plan / note / summary sharing the same base title — the same job the
- *     source prefix does for a reference.
- *   - The **host label** is required for uniqueness, not decoration: the registry
- *     key is `<source>:<skill>`, so two hosts can hold the same skill id as two
- *     separate rows and therefore two separate articles. Same title + same branch +
- *     same path + same commit is one server-side push identity, so dropping the
- *     host would make the second push collide with the first.
- *   - Middle dots, not colons: `sanitizeTitle` strips `:` (forbidden in document
- *     titles), which is also why a namespaced id like `superpowers:brainstorming`
- *     renders as `superpowers brainstorming` here.
- *   - **The commit's `hash8`, after an em dash** — required since a skill article is
- *     one document per (skill, commit) rather than one per skill (see the `skill`
- *     definition's `baseKey`). A branch folder is flat, so a skill used on four
- *     commits would otherwise show four indistinguishable siblings. The em-dash form
- *     deliberately mirrors `buildSkillsAggregateMarkdown`'s `# Skills used — <hash8>`
- *     heading, which is what the VS Code panel shows for the same record.
+ * The `hash8` is what keeps the articles apart in a flat branch folder — every
+ * commit contributes exactly one, so without it a branch would show N
+ * indistinguishable "Skills used" siblings. It comes from `summary.commitHash`,
+ * NOT from any `archivedKey`'s stamp: the two diverge after a squash (a ref is
+ * re-anchored onto the new root while the orphan file keeps its original name),
+ * and the commit a reader is holding is the one VS Code titles the record with.
  *
- * `summary.commitHash`, NOT the `archivedKey`'s stamp: the two diverge after a
- * squash (a ref is re-anchored onto the new root while the orphan file keeps its
- * original name), and the commit a reader is holding is the one VS Code titles the
- * record with.
+ * No host or skill-id segment any more. Both existed to keep one-article-per-skill
+ * titles unique (two hosts can hold the same skill id as two registry rows, and
+ * same title + branch + path + commit is one server-side push identity); with one
+ * article per commit the hash8 alone carries that uniqueness, and the host lives in
+ * the body's detail list instead.
  */
-export function buildSkillPushTitle(
-	ref: { readonly source: string; readonly skill: string },
-	summary: CommitSummary,
-): string {
+export function buildSkillsPushTitle(summary: CommitSummary): string {
 	const hash8 = summary.commitHash.substring(0, 8);
-	return sanitizeTitle(`Skill · ${skillSourceLabel(ref.source)} · ${ref.skill} — ${hash8}`);
+	return sanitizeTitle(`Skills used — ${hash8}`);
 }
 
 // ─── Topic collection ─────────────────────────────────────────────────────────

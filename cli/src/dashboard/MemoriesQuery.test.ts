@@ -5,8 +5,13 @@ import { deflateSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { withDashboardDb } from "./DashboardDb.js";
 import type { DashboardScope } from "./DashboardModel.js";
-import { MEMORIES_LIST_LIMIT } from "./DashboardModel.js";
-import { buildMemories, buildMemoriesList, buildMemoryDetail, readContextDoc } from "./MemoriesQuery.js";
+import {
+	buildMemories,
+	buildMemoriesList,
+	buildMemoriesPage,
+	buildMemoryDetail,
+	readContextDoc,
+} from "./MemoriesQuery.js";
 import { applyStatsEvents } from "./StatsWriter.js";
 
 const ALL: DashboardScope = { kind: "all" };
@@ -274,15 +279,42 @@ describe("MemoriesQuery", () => {
 			expect(list.items[1].memoryRefId).toBeUndefined();
 			expect(list.items[1].category).toBeUndefined();
 			expect(list.totalCount).toBe(2);
-			expect(list.truncated).toBe(false);
 			expect(list.vitals).toEqual({ memories: 2, topics: 1, repos: 1 });
 		});
 
-		it("scopes to one repo and truncates past MEMORIES_LIST_LIMIT", async () => {
+		// Two registered repos can share a display NAME — an upstream and its fork,
+		// or two clones of the same project — and their commit hashes then overlap
+		// by construction. `commitCategoryLabels` used to key its map by repo_name,
+		// so in the all-repos scope one repo's category was painted onto the
+		// other's memory. Keyed by repo_identity, each keeps its own.
+		it("keeps category labels apart for two repos that share a display name", async () => {
+			const hash = "d".repeat(40);
+			await seedRepo(dbPath, "repo-upstream", "jolliai");
+			await seedRepo(dbPath, "repo-fork", "jolliai");
+			await seedMemory(dbPath, "repo-upstream", hash, "same hash, upstream", {
+				commitDateMs: 2000,
+				topics: [{ title: "t", category: "feature" }],
+			});
+			await seedMemory(dbPath, "repo-fork", hash, "same hash, fork", {
+				commitDateMs: 1000,
+				topics: [{ title: "t", category: "bugfix" }],
+			});
+
+			const list = await withDashboardDb((db) => buildMemoriesList(db, ALL), { dbPath });
+
+			const byRepo = new Map(list.items.map((i) => [i.repoIdentity, i.category]));
+			expect(byRepo.get("repo-upstream")).toBe("feature");
+			expect(byRepo.get("repo-fork")).toBe("bugfix");
+		});
+
+		// The list used to be capped at 200 rows. It no longer is: a repo with more
+		// history than that must still render every memory, not a "most recent" page.
+		it("scopes to one repo and lists every memory past the old 200-row cap", async () => {
+			const total = 205;
 			await seedRepo(dbPath, "repo-1", "acme-api");
 			await seedRepo(dbPath, "repo-2", "acme-web");
 			await seedMemory(dbPath, "repo-2", "c".repeat(40), "other repo's commit", { commitDateMs: 1 });
-			for (let n = 0; n < MEMORIES_LIST_LIMIT + 5; n++) {
+			for (let n = 0; n < total; n++) {
 				await seedMemory(dbPath, "repo-1", n.toString(16).padStart(40, "0"), `commit ${n}`, {
 					commitDateMs: n + 100,
 				});
@@ -294,9 +326,8 @@ describe("MemoriesQuery", () => {
 					dbPath,
 				},
 			);
-			expect(scoped.items).toHaveLength(MEMORIES_LIST_LIMIT);
-			expect(scoped.truncated).toBe(true);
-			expect(scoped.totalCount).toBe(MEMORIES_LIST_LIMIT + 5);
+			expect(scoped.items).toHaveLength(total);
+			expect(scoped.totalCount).toBe(total);
 			expect(scoped.items.every((i) => i.repoIdentity === "repo-1")).toBe(true);
 		});
 
@@ -326,6 +357,74 @@ describe("MemoriesQuery", () => {
 			const list = await withDashboardDb((db) => buildMemoriesList(db, ALL), { dbPath });
 			expect(list.items.map((item) => item.commitHash)).toEqual([current]);
 			expect(list.totalCount).toBe(1);
+		});
+	});
+
+	describe("buildMemoriesPage", () => {
+		/** Three memories, newest first: c > b > a. */
+		async function seedThree(): Promise<void> {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", "a".repeat(40), "oldest", { commitDateMs: 1000 });
+			await seedMemory(dbPath, "repo-1", "b".repeat(40), "middle", { commitDateMs: 2000 });
+			await seedMemory(dbPath, "repo-1", "c".repeat(40), "newest", { commitDateMs: 3000 });
+		}
+
+		it("continues after the cursor's memory, and reports the whole reachable total", async () => {
+			await seedThree();
+
+			const page = await withDashboardDb(
+				(db) => buildMemoriesPage(db, ALL, { repoIdentity: "repo-1", commitHash: "c".repeat(40) }),
+				{ dbPath },
+			);
+
+			expect(page.items.map((i) => i.commitHash)).toEqual(["b".repeat(40), "a".repeat(40)]);
+			// The total is the LIST's length, not the page's — it is what the client
+			// compares its loaded count against to decide there is more to ask for.
+			expect(page.totalCount).toBe(3);
+			expect(page.cursorMissing).toBeUndefined();
+		});
+
+		it("starts at the top when no cursor is given", async () => {
+			await seedThree();
+
+			const page = await withDashboardDb((db) => buildMemoriesPage(db, ALL, undefined), { dbPath });
+
+			expect(page.items.map((i) => i.commitHash)).toEqual(["c".repeat(40), "b".repeat(40), "a".repeat(40)]);
+			expect(page.cursorMissing).toBeUndefined();
+		});
+
+		it("flags a cursor whose memory is gone and answers with the first page", async () => {
+			// The rebase case: the reader's last-loaded memory dropped off every
+			// branch mid-session. Answering an empty page would strand the tree;
+			// restarting SILENTLY would return rows the client already holds, which
+			// its dedupe drops — a "Load more" that does nothing however often it is
+			// clicked. The flag is what lets the client re-seat itself.
+			await seedThree();
+
+			const page = await withDashboardDb(
+				(db) => buildMemoriesPage(db, ALL, { repoIdentity: "repo-1", commitHash: "f".repeat(40) }),
+				{ dbPath },
+			);
+
+			expect(page.cursorMissing).toBe(true);
+			expect(page.items.map((i) => i.commitHash)).toEqual(["c".repeat(40), "b".repeat(40), "a".repeat(40)]);
+		});
+
+		it("does not treat an unreachable memory as a valid cursor", async () => {
+			// Same row, two answers: the cursor names a memory that IS in the table
+			// but which git no longer reaches, so it is not in the list being paged
+			// and cannot be a position in it.
+			await seedThree();
+			const reachable = new Map([["repo-1", new Set(["a".repeat(40), "b".repeat(40)])]]);
+
+			const page = await withDashboardDb(
+				(db) => buildMemoriesPage(db, ALL, { repoIdentity: "repo-1", commitHash: "c".repeat(40) }, reachable),
+				{ dbPath },
+			);
+
+			expect(page.cursorMissing).toBe(true);
+			expect(page.items.map((i) => i.commitHash)).toEqual(["b".repeat(40), "a".repeat(40)]);
+			expect(page.totalCount).toBe(2);
 		});
 	});
 
@@ -477,18 +576,19 @@ describe("MemoriesQuery", () => {
 			await seedRepo(dbPath, "repo-1", "acme-api");
 			const hash = "a".repeat(40);
 			await seedMemory(dbPath, "repo-1", hash, "feat: x");
-			// codex cannot record tool calls today — a linked codex session with no
+			// The Cline VS Code extension cannot record tool calls (its tool results
+			// are prose, not structure) — a linked session of its with no
 			// session_tool_use rows must not read as "this memory used no tools".
 			await seedLinkedSession(dbPath, "repo-1", hash, {
-				source: "codex",
+				source: "cline",
 				sessionId: "s1",
-				title: "Codex session",
+				title: "Cline session",
 				messageCount: 5,
 			});
 
 			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
 			expect(detail?.activity).toEqual([]);
-			expect(detail?.activityUncoveredSources).toEqual(["codex"]);
+			expect(detail?.activityUncoveredSources).toEqual(["cline"]);
 		});
 
 		it("reads per-file diffs from commit_files, and e2e scenarios verbatim", async () => {

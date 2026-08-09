@@ -80,8 +80,49 @@ export interface ContextBaseKeySpec<F extends string = string> {
 	readonly stripArchiveSuffix?: boolean;
 }
 
+/**
+ * Where a kind's published id/URL live, as a discriminated pair of field names.
+ *
+ * **`"item"` (the default) — one article per item.** The names are checked against
+ * the item type, so a typo or a `Types.ts` rename is a compile error rather than a
+ * silent degradation (see the file header). Omitting them takes the uniform
+ * {@link DEFAULT_DOC_ID_FIELD} / {@link DEFAULT_DOC_URL_FIELD}.
+ *
+ * **`"summary"` — ONE article per commit**, so its id belongs to the commit and the
+ * names are checked against `CommitSummary` instead. Today only `skill`, via
+ * {@link ContextKindDefinition.aggregate}.
+ *
+ * Parking a commit-level id on a representative item is not a harmless shortcut,
+ * which is why this is a scope rather than a convention: the item then travels
+ * through that kind's own per-item merge rules (for skills, `mergeSkillRef`'s fold
+ * by `<source>:<skill>`), which inherit, displace and register-for-deletion an id
+ * under rules written for per-item articles. A squash whose root and child had each
+ * been pushed ended up with TWO refs carrying an id from two different aggregate
+ * articles: the push reused whichever sorted first — retitling another commit's
+ * article in place — and the other became an orphan no cleanup path could see,
+ * since `supersededDocIds` only fires when both sides of ONE fold carry an id.
+ *
+ * Both names are REQUIRED under `"summary"`, deliberately: the uniform defaults are
+ * `CommitSummary.jolliDocId` / `jolliDocUrl`, i.e. the memory article's own fields,
+ * and inheriting them would overwrite it.
+ */
+export type ContextKindDocState<T> =
+	| {
+			readonly docScope?: "item";
+			readonly docIdField?: ItemField<T>;
+			readonly docUrlField?: ItemField<T>;
+	  }
+	| {
+			readonly docScope: "summary";
+			readonly docIdField: ItemField<CommitSummary>;
+			readonly docUrlField: ItemField<CommitSummary>;
+	  };
+
 /** One kind of pushable commit-context artifact, written against its real item type. */
-export interface ContextKindDefinition<T> {
+export type ContextKindDefinition<T> = ContextKindBase<T> & ContextKindDocState<T>;
+
+/** The scope-independent half of a {@link ContextKindDefinition}. */
+interface ContextKindBase<T> {
 	/** Wire `docType` tag, and the registry key. Must be unique across definitions. */
 	readonly docType: string;
 	/** The `CommitSummary` array field holding these items, e.g. `"plans"`. Deliberately unchecked — see the file header. */
@@ -97,10 +138,6 @@ export interface ContextKindDefinition<T> {
 	readonly baseKey: ContextBaseKeySpec<ItemField<T>>;
 	/** Field holding the recency used to pick the winner revision (compared as a STRING, newest wins). */
 	readonly recency: ItemField<T>;
-	/** Defaults to {@link DEFAULT_DOC_ID_FIELD}. */
-	readonly docIdField?: ItemField<T>;
-	/** Defaults to {@link DEFAULT_DOC_URL_FIELD}. */
-	readonly docUrlField?: ItemField<T>;
 	/** Article title. Must be sanitized for a document title by the definition. */
 	readonly title: (item: T, summary: CommitSummary) => string;
 	/** Article body. `undefined` means "skip this item" (unreadable or empty content) — never an error. */
@@ -110,6 +147,32 @@ export interface ContextKindDefinition<T> {
 	 * (only plans need it, to collapse same-named archived snapshots).
 	 */
 	readonly reduce?: (items: ReadonlyArray<T>) => ReadonlyArray<T>;
+	/**
+	 * Optional N→1 (or N→M) collapse applied to the items ONE commit is about to
+	 * push, whichever path selected them. Only `skill` needs it, to publish one
+	 * aggregate article per commit instead of one per skill.
+	 *
+	 * **Deliberately not {@link reduce}.** The two run at different points and mean
+	 * different things:
+	 *
+	 *   - `reduce` runs only on a summary's OWN items, and `reduceOwnItems` applies
+	 *     the same call to the copy the summary markdown is rendered from — because
+	 *     for a plan the collapse is a statement about which items EXIST for that
+	 *     commit. A skill aggregate is not: every skill still exists and the Context
+	 *     section still summarises all of them, so folding it into the rendered copy
+	 *     would delete rows from the memory itself.
+	 *   - `reduce` is skipped when a caller passes an explicit selection, since the
+	 *     cross-commit winner rule has already done that job. An aggregate must run
+	 *     on BOTH paths, or the branch-push path (which always selects) would keep
+	 *     publishing one article per skill.
+	 *
+	 * The returned items must be assignable to `T` and must carry the identity the
+	 * engine reads off them (`entryKey`, `docIdField`, `docUrlField`) from a REAL
+	 * item of the group, so the published URL/docId weaves back onto an entry the
+	 * summary actually holds — otherwise every push mints a fresh article instead of
+	 * updating the one it minted last time.
+	 */
+	readonly aggregate?: (items: ReadonlyArray<T>, summary: CommitSummary) => ReadonlyArray<T>;
 	/** Optional deterministic tiebreak when two revisions share a `recency` value. */
 	readonly tiebreak?: (a: T, b: T) => number;
 	/**
@@ -163,11 +226,13 @@ export interface AnyContextKind {
 	readonly entryKey: string;
 	readonly baseKey: ContextBaseKeySpec;
 	readonly recency: string;
+	readonly docScope?: "item" | "summary";
 	readonly docIdField?: string;
 	readonly docUrlField?: string;
 	readonly title: (item: unknown, summary: CommitSummary) => string;
 	readonly body: (item: unknown, ctx: ContextBodyCtx) => Promise<string | undefined>;
 	readonly reduce?: (items: ReadonlyArray<unknown>) => ReadonlyArray<unknown>;
+	readonly aggregate?: (items: ReadonlyArray<unknown>, summary: CommitSummary) => ReadonlyArray<unknown>;
 	readonly tiebreak?: (a: unknown, b: unknown) => number;
 	readonly linksInMarkdown?: boolean;
 	readonly bestEffortPush?: boolean;
@@ -181,6 +246,7 @@ export interface AnyContextKind {
  */
 export function defineContextKind<T>(def: ContextKindDefinition<T>): AnyContextKind {
 	const reduce = def.reduce;
+	const aggregate = def.aggregate;
 	const tiebreak = def.tiebreak;
 	return {
 		docType: def.docType,
@@ -188,11 +254,16 @@ export function defineContextKind<T>(def: ContextKindDefinition<T>): AnyContextK
 		entryKey: def.entryKey,
 		baseKey: def.baseKey,
 		recency: def.recency,
+		...(def.docScope !== undefined && { docScope: def.docScope }),
 		...(def.docIdField !== undefined && { docIdField: def.docIdField }),
 		...(def.docUrlField !== undefined && { docUrlField: def.docUrlField }),
 		title: (item, summary) => def.title(item as T, summary),
 		body: (item, ctx) => def.body(item as T, ctx),
 		...(reduce !== undefined && { reduce: (items: ReadonlyArray<unknown>) => reduce(items as ReadonlyArray<T>) }),
+		...(aggregate !== undefined && {
+			aggregate: (items: ReadonlyArray<unknown>, summary: CommitSummary) =>
+				aggregate(items as ReadonlyArray<T>, summary),
+		}),
 		...(tiebreak !== undefined && { tiebreak: (a: unknown, b: unknown) => tiebreak(a as T, b as T) }),
 		...(def.linksInMarkdown !== undefined && { linksInMarkdown: def.linksInMarkdown }),
 		...(def.bestEffortPush !== undefined && { bestEffortPush: def.bestEffortPush }),

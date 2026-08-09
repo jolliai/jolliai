@@ -791,7 +791,7 @@ describe("buildDashboardModel — tool usage", () => {
 	const sessionWith = (
 		sessionId: string,
 		tools?: ReadonlyArray<{ name: string; kind: "builtin" | "mcp" | "skill"; server?: string; calls: number }>,
-		source: "claude" | "codex" = "claude",
+		source: "claude" | "codex" | "cline" = "claude",
 	): StatsEventEnvelope => ({
 		producerKind: "cli",
 		event: {
@@ -935,9 +935,10 @@ describe("buildDashboardModel — tool usage", () => {
 			[
 				repoEvent,
 				sessionWith("s1", [{ name: "Bash", kind: "builtin", calls: 4 }]),
-				// Codex sessions are counted but carry no tool records at all.
-				sessionWith("s2", undefined, "codex"),
-				sessionWith("s3", undefined, "codex"),
+				// Cline (VS Code) sessions are counted but carry no tool records at all
+				// — its transcripts express tool results only as prose.
+				sessionWith("s2", undefined, "cline"),
+				sessionWith("s3", undefined, "cline"),
 			],
 			{ producerKind: "cli", dbPath },
 		);
@@ -946,7 +947,7 @@ describe("buildDashboardModel — tool usage", () => {
 		// have seen the one session that has rows.
 		expect(result?.sessionsWithTools).toBe(1);
 		expect(result?.sessionsInWindow).toBe(3);
-		expect(result?.uncoveredSources).toEqual(["codex"]);
+		expect(result?.uncoveredSources).toEqual(["cline"]);
 	});
 
 	it("does not call a readable source uncovered just because it used no tools", async () => {
@@ -957,12 +958,12 @@ describe("buildDashboardModel — tool usage", () => {
 				// record tool calls, so this zero is a real zero — reporting "claude"
 				// as uncovered made the page claim its transcripts cannot be read.
 				sessionWith("s1", undefined, "claude"),
-				sessionWith("s2", undefined, "codex"),
+				sessionWith("s2", undefined, "cline"),
 			],
 			{ producerKind: "cli", dbPath },
 		);
 		const result = await usage();
-		expect(result?.uncoveredSources).toEqual(["codex"]);
+		expect(result?.uncoveredSources).toEqual(["cline"]);
 		expect(result?.sessionsWithTools).toBe(0);
 		expect(result?.sessionsInWindow).toBe(2);
 	});
@@ -1112,6 +1113,20 @@ describe("buildDashboardModel — recall usage", () => {
 		const result = await recallUsage();
 		expect(result?.sessionsWithContext).toBe(1);
 		expect(result?.sessionsInWindow).toBe(3);
+	});
+
+	it("counts a recalling session that has no sessions row yet", async () => {
+		// A receipt is written at the edge the moment `recall` is called; the
+		// `sessions` row only appears when StopHook or the editor tick runs. With
+		// the denominator taken from `sessions` alone, a fresh agent that recalled
+		// on its first turn rendered "1 of 0 sessions got prior context".
+		await applySummaryEvents(
+			[repoEvent, recall(hit("a".repeat(40), "2026-07-25"), { sessionId: "brand-new", atMs: nowMs - 60_000 })],
+			{ producerKind: "cli", dbPath },
+		);
+		const result = await recallUsage();
+		expect(result?.sessionsWithContext).toBe(1);
+		expect(result?.sessionsInWindow).toBe(1);
 	});
 
 	it("counts a session-less call in the totals but attributes it to no session", async () => {
@@ -1319,6 +1334,61 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		expect(model.stats?.memoriesCreated).toBe(2);
 	});
 
+	it("windows memory cards on the committer date, matching the captured count", async () => {
+		await seedMemory();
+		// A rebased commit: authored days ago (what `CommitSummary.commitDate`
+		// records, via `%aI`), landed today (what the collector records, via
+		// `%cI`). The captured count has always used the committer date; the card
+		// list used the author date, so the header counted a memory the feed
+		// below it did not render.
+		await withDashboardDb(
+			(db) => {
+				const { id: repoId } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+					id: number;
+				};
+				db.prepare("UPDATE memories SET commit_date_ms = ? WHERE repo_id = ? AND commit_hash = 'mem1'").run(
+					nowMs - 400 * 24 * 3_600_000,
+					repoId,
+				);
+			},
+			{ dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		expect(model.stats?.memoriesCreated).toBe(2);
+		expect(model.stats?.memoryCards?.map((c) => c.commitHash).sort()).toEqual(["mem1", "mem2"]);
+	});
+
+	it("orders and stamps memory cards on the committer date the page was selected by", async () => {
+		await seedMemory();
+		// Same rebased shape as above: mem1 landed today but was AUTHORED 400 days
+		// ago. The page is selected and windowed on the committer date, so ordering
+		// the payload query by `commit_date_ms` re-sorted it by author date behind
+		// the selection — and the card then rendered a timestamp outside the very
+		// window it was chosen for.
+		await withDashboardDb(
+			(db) => {
+				const { id: repoId } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+					id: number;
+				};
+				db.prepare("UPDATE memories SET commit_date_ms = ? WHERE repo_id = ? AND commit_hash = 'mem1'").run(
+					nowMs - 400 * 24 * 3_600_000,
+					repoId,
+				);
+			},
+			{ dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		// mem1 is the most recently LANDED commit, so it leads the feed.
+		expect(model.stats?.memoryCards?.map((c) => c.commitHash)).toEqual(["mem1", "mem2"]);
+		expect(model.stats?.memoryCards?.[0]?.committedAtMs).toBe(nowMs - 3 * 3_600_000);
+	});
+
 	it("credits a rewritten commit as captured through commit_aliases, decision included", async () => {
 		await seedMemory();
 		// Simulate mem1 getting rebased/amended after it was summarized: the live
@@ -1385,6 +1455,47 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		expect(stats.seriesKeys).toEqual(["feature/dash", "main"]);
 		const total = stats.series.reduce((sum, p) => sum + p.tokens, 0);
 		expect(total).toBe(28000);
+	});
+
+	it("apportions a multi-branch commit so the day totals do not multiply", async () => {
+		await seedMemory();
+		// `commit_branches` is a per-branch `git rev-list` union, so a commit on
+		// `main` is also listed under every feature branch based off it. Without
+		// apportionment each extra branch added the commit's whole spend to the
+		// day again — five branches turned a 20k-token commit into 120k.
+		await applySummaryEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "commit.created",
+						repoIdentity: "repo-1",
+						hash: "mem1",
+						committedAtMs: nowMs - 3 * 3_600_000,
+						branches: ["feature/dash", "main", "release/1.x"],
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					dimension: "branch",
+					timeZone: "UTC",
+					nowMs,
+				}),
+			{ dbPath },
+		);
+		const stats = model.stats;
+		if (!stats) throw new Error("stats missing");
+		expect(stats.seriesKeys).toEqual(["feature/dash", "main", "release/1.x"]);
+		// Still the real total, with mem1's 20k split three ways across the axis.
+		expect(stats.series.reduce((sum, p) => sum + p.tokens, 0)).toBe(28000);
+		const today = stats.series[stats.series.length - 1];
+		expect(today.tokens).toBe(20000);
 	});
 
 	it("builds the category dimension from memory_topics, sharing a commit's tokens across them", async () => {

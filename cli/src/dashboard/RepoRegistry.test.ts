@@ -279,3 +279,21 @@ describe("instance id stamp", () => {
 		expect(await readRegistryInstanceId(configDir)).toBe("id-1");
 	});
 });
+
+describe("a registry the writers could not read", () => {
+	it("refuses the write instead of read-modify-writing over an empty one", async () => {
+		await registerRepo({ cwd: "/home/dev/jolli", configDir, now: () => new Date(0) });
+		await stampRegistryInstanceId("id-1", configDir);
+		// A torn write leaves unparsable JSON. Reads still fail open (nothing is
+		// lost by showing no repos); a WRITER must not, or it cements the loss.
+		writeFileSync(getRepoRegistryPath(configDir), "{ truncated");
+		vi.mocked(getProjectRootDir).mockResolvedValue("/home/dev/other");
+		await expect(registerRepo({ cwd: "/home/dev/other", configDir })).rejects.toThrow();
+		await expect(stampRegistryInstanceId("id-2", configDir)).rejects.toThrow();
+		await expect(deregisterRepo({ cwd: "/home/dev/other", configDir })).rejects.toThrow();
+		await expect(ensureWorktreeListed({ cwd: "/home/dev/other", configDir })).rejects.toThrow();
+		// The damaged file is still there to be repaired, not overwritten.
+		expect(readFileSync(getRepoRegistryPath(configDir), "utf-8")).toBe("{ truncated");
+		expect((await readRepoRegistry(configDir)).repos).toEqual([]);
+	});
+});

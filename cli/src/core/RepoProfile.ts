@@ -19,10 +19,11 @@
  */
 
 import { readFileSync, statSync } from "node:fs";
-import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { readFile, stat, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { getJolliMemoryDir } from "../Logger.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
+import { writeFileAtomic } from "./AtomicJsonFile.js";
 import { execGit, listWorktrees } from "./GitOps.js";
 import { withStrictProfileLock } from "./Locks.js";
 
@@ -71,6 +72,18 @@ export interface RepoProfile {
 	 * there is no legitimate "unfreeze" — old clients must never write the
 	 * frozen branch again.
 	 */
+	/**
+	 * When the automatic cutover attempt last RAN for this clone (epoch ms).
+	 *
+	 * Only a throttle, never evidence of state: the two witnesses that decide
+	 * routing are {@link cutoverFence} and the database's `repo_state.cutover`
+	 * row, and this field is deliberately not consulted by either. It exists
+	 * because the attempt's step 3 reads every file the frozen tip lists, which
+	 * is far too expensive to repeat on every commit for a repo that keeps
+	 * answering `not-ready`. Absent means "never attempted", which is what every
+	 * repo enabled before auto-cutover shipped reads back.
+	 */
+	cutoverAttemptedAtMs?: number;
 	cutoverFence?: {
 		readonly reason: string;
 		readonly at: string;
@@ -148,19 +161,11 @@ async function fileExists(path: string): Promise<boolean> {
 }
 
 async function writeProfile(profilePath: string, profile: RepoProfile): Promise<void> {
-	await mkdir(dirname(profilePath), { recursive: true });
 	// Atomic write: a torn/partial file reads back as `{}` (corrupt JSON), which
-	// would silently drop a durable opt-out. Write a PID-scoped temp then rename
-	// (atomic on the same volume; replaces the target on Windows). The PID suffix
-	// avoids a temp-file collision if two writers ever race without the lock.
-	const tmpPath = `${profilePath}.${process.pid}.tmp`;
-	await writeFile(tmpPath, `${JSON.stringify(profile, null, "\t")}\n`);
-	try {
-		await rename(tmpPath, profilePath);
-	} catch (err) {
-		await unlink(tmpPath).catch(() => {});
-		throw err;
-	}
+	// would silently drop a durable opt-out. `writeFileAtomic` is the shared
+	// temp-then-rename writer -- see its header for why every fail-open JSON
+	// state file in this codebase goes through it.
+	await writeFileAtomic(profilePath, `${JSON.stringify(profile, null, "\t")}\n`);
 }
 
 /**

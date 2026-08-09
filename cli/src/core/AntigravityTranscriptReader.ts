@@ -21,6 +21,7 @@
 
 import { readFile } from "node:fs/promises";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
+import { builtinTool, ToolUseTally } from "./ToolNameClassify.js";
 import { mergeConsecutiveEntries } from "./TranscriptReader.js";
 
 const USER_REQUEST_RE = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/;
@@ -72,6 +73,7 @@ export async function readAntigravityTranscript(
 	const entries: TranscriptEntry[] = [];
 	let lastTs = cursor?.updatedAt ?? new Date().toISOString();
 	let lineNumber = startLine;
+	const tally = new ToolUseTally();
 
 	for (let i = startLine; i < lines.length; i++) {
 		lineNumber = i + 1;
@@ -100,6 +102,16 @@ export async function readAntigravityTranscript(
 			const tcs = Array.isArray(obj.tool_calls)
 				? (obj.tool_calls as { name?: string; args?: Record<string, unknown> }[])
 				: [];
+			// Same array the summary line is built from — the calls were already
+			// parsed here and only ever folded into prose; this counts them too.
+			// Entries carry `{name, args}` and no id, prefix or server field, so
+			// every call is a builtin and none can be de-duplicated. A repeated
+			// PLANNER_RESPONSE line is not a shape this transcript produces (it is
+			// append-only and each step_index appears once), so counting every
+			// occurrence is correct rather than merely tolerable.
+			for (const tc of tcs) {
+				if (typeof tc?.name === "string" && tc.name.length > 0) tally.add(builtinTool(tc.name));
+			}
 			const parts = [content, ...tcs.map(toolCallSummary)].filter((p) => p.length > 0);
 			if (parts.length) entries.push({ role: "assistant", content: parts.join("\n"), timestamp: ts });
 		} else if (type === "RUN_COMMAND") {
@@ -114,5 +126,7 @@ export async function readAntigravityTranscript(
 		// Lines actually consumed this pass (matches the other readers' convention);
 		// on an early `beforeTimestamp` break `lineNumber` is the unconsumed cutoff line.
 		totalLinesRead: lineNumber - startLine,
+		// Always present, even when empty — see TOOL_RECORDING_SOURCES.
+		toolUse: tally.values(),
 	};
 }

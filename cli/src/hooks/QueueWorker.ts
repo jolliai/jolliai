@@ -150,6 +150,7 @@ import { generateTranscriptId } from "../core/TranscriptId.js";
 import { getParserForSource } from "../core/TranscriptParser.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
+import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { recordCommitsFromWorker } from "../dashboard/ProducerHooks.js";
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
@@ -306,6 +307,11 @@ function hoistMetadataFromOldSummary(oldSummary: CommitSummary | null | undefine
 	return {
 		...(oldSummary.jolliDocId != null && { jolliDocId: oldSummary.jolliDocId }),
 		...(oldSummary.jolliDocUrl && { jolliDocUrl: oldSummary.jolliDocUrl }),
+		// The skill-usage article's id travels exactly like the memory article's, and
+		// for the same reason: an amend is the SAME commit rewritten, so the next push
+		// must update those two articles rather than mint siblings and strand them.
+		...(oldSummary.jolliSkillsDocId != null && { jolliSkillsDocId: oldSummary.jolliSkillsDocId }),
+		...(oldSummary.jolliSkillsDocUrl && { jolliSkillsDocUrl: oldSummary.jolliSkillsDocUrl }),
 		...(oldSummary.orphanedDocIds && { orphanedDocIds: oldSummary.orphanedDocIds }),
 		...(oldSummary.unresolvedOrphanHashes && { unresolvedOrphanHashes: oldSummary.unresolvedOrphanHashes }),
 		...(oldSummary.plans && { plans: oldSummary.plans }),
@@ -593,6 +599,9 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 	// backstop in the outer finally).
 	let workerRefreshTimer: ReturnType<typeof setInterval> | undefined;
 	let workerLockReleased = true;
+	// Set by the drain, consumed AFTER both locks are released — see the
+	// auto-cutover call below for why it cannot run inside the lock window.
+	let summariesLandedThisRun = false;
 	const releaseWorker = async (): Promise<void> => {
 		if (workerLockReleased) return;
 		workerLockReleased = true;
@@ -818,6 +827,8 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 				// plan's "no daemon" schedule). Internally gated to once a day,
 				// floor-guarded, and never throws — a failure is a log line.
 				await opportunisticSnapshot();
+				// Auto-cutover runs after the locks come off, not here.
+				summariesLandedThisRun = true;
 			}
 			/* v8 ignore start -- catch block only reached if dequeueAllGitOperations throws unexpectedly */
 		} catch (error: unknown) {
@@ -920,6 +931,34 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 				// `wakePendingIngest` will re-spawn us once it releases.
 			}
 		}
+
+		// Auto-cutover's SECOND chance. `importDashboardHistory` covers a repo being
+		// enabled; nothing covers the repos enabled before auto-cutover shipped, which
+		// never pass through the front door again and would sit `uncutover` forever
+		// with the whole SQLite read path unreachable. The post-commit drain is where
+		// they get another opportunity — the database was just written, so the compare
+		// has as good a chance here as it does after an import.
+		//
+		// **Deliberately AFTER both releases.** Its step 3 reads every file the frozen
+		// tip lists, which on a large repo is seconds — and `vault-write.lock` is
+		// per-VAULT, held across this worker's whole drain, so waiting for that scan
+		// inside the lock window stalls the summary worker of every OTHER repo sharing
+		// the Memory Bank. It needs neither lock: the engine takes its own per-source
+		// locks for the CAS. The 6 h throttle bounds how often a `not-ready` repo pays
+		// the scan at all, but bounding frequency is not the same as bounding who
+		// waits. Never throws, reports nothing.
+		//
+		// **And deliberately after the ingest phase**, not between the releases and the
+		// chain-spawn. `storage` was resolved once at the top of this run, while the
+		// repo was still `uncutover` — a `DualWriteStorage` whose system of record is
+		// the orphan branch. Landing the fence first would leave the ingest below
+		// writing through that stale provider, and `OrphanBranchStorage.writeFiles`
+		// re-reads the fence from disk and throws on a frozen branch: the ingest's LLM
+		// work is discarded (the catch above logs it as non-fatal), its queue entries
+		// survive un-deleted, and the next worker redoes it. Cutting over after the
+		// ingest costs one drain's delay on a 6 h-throttled, opportunistic step and
+		// keeps every write in this run on the provider that matches the repo's state.
+		if (summariesLandedThisRun) await maybeAutoCutover(cwd, { throttle: true });
 	} finally {
 		// Backstops (idempotent): cover the early-return and mid-run-throw paths
 		// where the explicit releases above didn't run. worker.lock is released

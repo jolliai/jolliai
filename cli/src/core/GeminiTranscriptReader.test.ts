@@ -274,3 +274,91 @@ describe("readGeminiTranscript", () => {
 		expect(result.newCursor.lineNumber).toBe(2);
 	});
 });
+
+describe("readGeminiTranscript toolUse", () => {
+	// Shape read off real ~/.gemini/tmp/<project>/chats/session-*.json files: the
+	// array hangs off the `gemini` message and its entries are bare-named.
+	it("counts a gemini message's toolCalls as builtins", async () => {
+		const filePath = await createSession([
+			{ id: "1", type: "user", timestamp: "2026-03-20T10:00:00.000Z", content: "list the folder" },
+			{
+				id: "2",
+				type: "gemini",
+				timestamp: "2026-03-20T10:00:05.000Z",
+				content: "Done.",
+				toolCalls: [
+					{ id: "ww9tmu6j", name: "list_directory", status: "success" },
+					{ id: "s5tfezrm", name: "read_file", status: "success" },
+				],
+			} as never,
+		]);
+		const result = await readGeminiTranscript(filePath);
+		expect(result.toolUse).toEqual([
+			{ name: "list_directory", kind: "builtin", calls: 1 },
+			{ name: "read_file", kind: "builtin", calls: 1 },
+		]);
+	});
+
+	it("counts a cancelled call — the agent still made it", async () => {
+		const filePath = await createSession([
+			{
+				id: "1",
+				type: "gemini",
+				timestamp: "2026-03-20T10:00:05.000Z",
+				content: "",
+				toolCalls: [{ id: "47ff01hw", name: "run_shell_command", status: "cancelled" }],
+			} as never,
+		]);
+		const result = await readGeminiTranscript(filePath);
+		expect(result.toolUse).toEqual([{ name: "run_shell_command", kind: "builtin", calls: 1 }]);
+	});
+
+	it("counts a repeated call id once and distinct ids separately", async () => {
+		const filePath = await createSession([
+			{
+				id: "1",
+				type: "gemini",
+				timestamp: "2026-03-20T10:00:05.000Z",
+				content: "a",
+				toolCalls: [
+					{ id: "a", name: "run_shell_command" },
+					{ id: "a", name: "run_shell_command" },
+					{ id: "b", name: "run_shell_command" },
+				],
+			} as never,
+		]);
+		const result = await readGeminiTranscript(filePath);
+		expect(result.toolUse).toEqual([{ name: "run_shell_command", kind: "builtin", calls: 2 }]);
+	});
+
+	it("reports an empty array — not undefined — for a tool-free slice", async () => {
+		const filePath = await createSession([
+			{ id: "1", type: "user", timestamp: "2026-03-20T10:00:00.000Z", content: "hi" },
+		]);
+		const result = await readGeminiTranscript(filePath);
+		expect(result.toolUse).toEqual([]);
+	});
+
+	it("counts only the calls inside the consumed slice", async () => {
+		const filePath = await createSession([
+			{
+				id: "1",
+				type: "gemini",
+				timestamp: "2026-03-20T10:00:00.000Z",
+				content: "a",
+				toolCalls: [{ id: "a", name: "read_file" }],
+			} as never,
+			{
+				id: "2",
+				type: "gemini",
+				timestamp: "2026-03-20T12:00:00.000Z",
+				content: "b",
+				toolCalls: [{ id: "b", name: "grep_search" }],
+			} as never,
+		]);
+		const first = await readGeminiTranscript(filePath, null, "2026-03-20T11:00:00.000Z");
+		expect(first.toolUse).toEqual([{ name: "read_file", kind: "builtin", calls: 1 }]);
+		const second = await readGeminiTranscript(filePath, first.newCursor);
+		expect(second.toolUse).toEqual([{ name: "grep_search", kind: "builtin", calls: 1 }]);
+	});
+});

@@ -12,7 +12,19 @@
 
 import { createLogger } from "../Logger.js";
 import type { ModelTokenUsage, ParsedTurnUsage, ToolCallCount, TranscriptEntry } from "../Types.js";
+import {
+	builtinTool,
+	classifyCodexToolName,
+	classifyToolName,
+	mcpTool,
+	skillTool,
+	ToolUseTally,
+} from "./ToolNameClassify.js";
 import { parseTranscriptLine } from "./TranscriptReader.js";
+
+// Re-exported for the callers that already imported it from here; the shared
+// classifiers now live in ToolNameClassify.ts alongside the other dialects.
+export { classifyToolName } from "./ToolNameClassify.js";
 
 const log = createLogger("TranscriptParser");
 
@@ -49,28 +61,6 @@ export interface TranscriptParser {
 	 *  source's transcripts expose no tool records, and every consumer must
 	 *  report that source as UNCOVERED rather than as "used no tools". */
 	parseToolUse?(lines: ReadonlyArray<string>): ToolCallCount[];
-}
-
-/**
- * Classifies a raw tool name from a transcript.
- *
- * MCP tools arrive as `mcp__<server>__<tool>` — the wire name, which is what
- * makes the server extractable at all. The double underscore is the separator
- * the MCP host itself uses, and a server or tool name may contain single
- * underscores, so the split is on `__` and only the FIRST two segments are
- * structural; anything after them is part of the tool name.
- */
-export function classifyToolName(raw: string): ToolCallCount {
-	if (raw.startsWith("mcp__")) {
-		const rest = raw.slice("mcp__".length);
-		const sep = rest.indexOf("__");
-		// `mcp__server` with no tool segment is malformed; keep it attributed to
-		// the server rather than dropping the call.
-		const server = sep === -1 ? rest : rest.slice(0, sep);
-		const tool = sep === -1 ? "" : rest.slice(sep + 2);
-		return { name: tool ? `${server}.${tool}` : server, kind: "mcp", server, calls: 0 };
-	}
-	return { name: raw, kind: "builtin", calls: 0 };
 }
 
 /**
@@ -159,8 +149,7 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 	 * every skill invocation as one builtin named `Skill` would answer nothing.
 	 */
 	parseToolUse(lines: ReadonlyArray<string>): ToolCallCount[] {
-		const byName = new Map<string, ToolCallCount>();
-		const seen = new Set<string>();
+		const tally = new ToolUseTally();
 		for (const line of lines) {
 			let parsed: unknown;
 			try {
@@ -173,20 +162,15 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 			for (const block of content) {
 				const b = block as { type?: unknown; id?: unknown; name?: unknown; input?: { skill?: unknown } };
 				if (b.type !== "tool_use" || typeof b.name !== "string") continue;
-				if (typeof b.id === "string") {
-					if (seen.has(b.id)) continue;
-					seen.add(b.id);
-				}
-				const classified =
+				tally.addOnce(
+					typeof b.id === "string" ? b.id : undefined,
 					b.name === "Skill" && typeof b.input?.skill === "string"
-						? ({ name: b.input.skill, kind: "skill", calls: 0 } as ToolCallCount)
-						: classifyToolName(b.name);
-				const key = `${classified.kind}:${classified.name}`;
-				const existing = byName.get(key);
-				byName.set(key, existing ? { ...existing, calls: existing.calls + 1 } : { ...classified, calls: 1 });
+						? skillTool(b.input.skill)
+						: classifyToolName(b.name),
+				);
 			}
 		}
-		return [...byName.values()];
+		return tally.values();
 	}
 
 	parseTimestamp(line: string, _lineNum?: number): string | undefined {
@@ -245,7 +229,111 @@ export class CodexTranscriptParser implements TranscriptParser {
 			return null;
 		}
 	}
+
+	/**
+	 * Tool calls over a slice of a Codex rollout.
+	 *
+	 * Codex writes a call across up to three rows sharing one `call_id`, so a call
+	 * is resolved per id and counted once at the end — see
+	 * {@link CODEX_TOOL_CALL_TYPES} for the row types and the evidence behind each.
+	 *
+	 * Identity is NOT read out of the name: Codex names its builtins bare
+	 * (`exec_command`, `wait`, `write_stdin`, `update_plan`, `exec`,
+	 * `apply_patch` — every name present across 40 real 2026-07/08 rollouts) and
+	 * carries MCP identity in a sibling field instead. Running these through the
+	 * Claude `mcp__` test would file every Codex MCP call as a builtin, so
+	 * `classifyCodexToolName` takes the namespace explicitly.
+	 *
+	 * **The last row wins, not the first, and that ordering is load-bearing.** A
+	 * real MCP call is written as a namespace-less `function_call` FIRST and an
+	 * `mcp_tool_call_end` carrying `invocation.{server,tool}` after it — measured
+	 * on a live rollout:
+	 *
+	 *   function_call      call_00_2Rw… name=list_mcp_resources namespace=∅
+	 *   mcp_tool_call_end  call_00_2Rw… invocation={server:"codex", tool:"list_mcp_resources"}
+	 *
+	 * The request row alone is indistinguishable from a builtin, so a
+	 * first-write-wins dedupe files every such call under `builtin` and the server
+	 * is lost — the exact silent mis-bucketing this parser's name-agnostic
+	 * classification exists to prevent. Later rows may only UPGRADE the identity:
+	 * an `mcp_tool_call_end` replaces a builtin guess, and nothing downgrades an
+	 * MCP identity back.
+	 *
+	 * A row missing `call_id` is counted immediately (an unidentifiable call is a
+	 * real call); it just cannot be deduped or upgraded.
+	 */
+	parseToolUse(lines: ReadonlyArray<string>): ToolCallCount[] {
+		const byCallId = new Map<string, ToolCallCount>();
+		const anonymous: ToolCallCount[] = [];
+		for (const line of lines) {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			const payload = (parsed as { payload?: unknown })?.payload;
+			if (payload === null || typeof payload !== "object") continue;
+			const p = payload as {
+				type?: unknown;
+				name?: unknown;
+				namespace?: unknown;
+				call_id?: unknown;
+				invocation?: { server?: unknown; tool?: unknown };
+			};
+			if (typeof p.type !== "string" || !CODEX_TOOL_CALL_TYPES.has(p.type)) continue;
+
+			// `mcp_tool_call_end` states the server outright — the one shape where
+			// no namespace parsing is needed or wanted.
+			const invocationTool = typeof p.invocation?.tool === "string" ? p.invocation.tool : undefined;
+			const server = typeof p.invocation?.server === "string" ? p.invocation.server : "";
+			let call: ToolCallCount;
+			if (invocationTool !== undefined) {
+				call = server ? mcpTool(server, invocationTool) : builtinTool(invocationTool);
+			} else if (typeof p.name === "string" && p.name.length > 0) {
+				call = classifyCodexToolName(p.name, typeof p.namespace === "string" ? p.namespace : undefined);
+			} else {
+				continue;
+			}
+
+			const callId = typeof p.call_id === "string" ? p.call_id : undefined;
+			if (callId === undefined) {
+				anonymous.push(call);
+				continue;
+			}
+			const known = byCallId.get(callId);
+			// Upgrade-only: a builtin guess yields to a resolved MCP identity, and a
+			// later builtin row (the request written after an event, or a result row
+			// echoing the bare name) never overwrites one.
+			if (known === undefined || (known.kind !== "mcp" && call.kind === "mcp")) byCallId.set(callId, call);
+		}
+		const tally = new ToolUseTally();
+		for (const call of [...byCallId.values(), ...anonymous]) tally.add(call);
+		return tally.values();
+	}
 }
+
+/**
+ * The `payload.type` values that represent one Codex tool call.
+ *
+ * Counted from real rollouts under `~/.codex/sessions` (40 files, Jul–Aug 2026):
+ * `custom_tool_call` (804) and `function_call` (415) are the bulk; `web_search_call`
+ * (2) is rarer but is still the agent calling a tool. `mcp_tool_call_end` carries
+ * `invocation.{server,tool}` and is the MCP shape `CodexEnvelopeParser` documents
+ * against 2026-06 connector rollouts (that capture had no MCP traffic, hence no
+ * local count).
+ *
+ * The `*_output` siblings are deliberately absent: they are the SAME call's result
+ * row, and counting them would double every call. `mcp_tool_call_begin` is absent
+ * for the same reason — it pairs with the `_end` row already listed.
+ */
+const CODEX_TOOL_CALL_TYPES: ReadonlySet<string> = new Set([
+	"function_call",
+	"custom_tool_call",
+	"local_shell_call",
+	"web_search_call",
+	"mcp_tool_call_end",
+]);
 
 /**
  * Kimi Code CLI transcript parser.
@@ -305,6 +393,48 @@ export class KimiTranscriptParser implements TranscriptParser {
 		}
 	}
 
+	/**
+	 * Tool calls over a slice of a Kimi `wire.jsonl`.
+	 *
+	 * The signal is a `tool.call` event inside the `context.append_loop_event`
+	 * envelope, correlated elsewhere by `toolCallId` — the same shape
+	 * {@link KimiEnvelopeParser} and {@link KimiSkillScanner} are pinned to
+	 * against real `~/.kimi-code` captures. Only the CALL is counted; the paired
+	 * `tool.result` is the same call's answer and would double it.
+	 *
+	 * Kimi names MCP tools Claude-style (`mcp__<server>__<tool>`), which is why
+	 * `KimiEnvelopeParser` reuses Claude's registry match path verbatim — so the
+	 * Claude classifier is correct here rather than merely close. `Skill` calls
+	 * are re-attributed to `args.skill`, the first-class skill tool
+	 * `KimiSkillScanner` reads.
+	 */
+	parseToolUse(lines: ReadonlyArray<string>): ToolCallCount[] {
+		const tally = new ToolUseTally();
+		for (const line of lines) {
+			// Cheap pre-filter: only the loop-event envelope carries tool activity.
+			if (!line.includes(KIMI_LOOP_EVENT_TYPE)) continue;
+			let parsed: Record<string, unknown>;
+			try {
+				parsed = JSON.parse(line) as Record<string, unknown>;
+			} catch {
+				continue;
+			}
+			if (parsed.type !== KIMI_LOOP_EVENT_TYPE) continue;
+			const event = parsed.event as
+				| { type?: unknown; name?: unknown; toolCallId?: unknown; args?: { skill?: unknown } }
+				| undefined;
+			if (event === null || typeof event !== "object") continue;
+			if (event.type !== "tool.call" || typeof event.name !== "string") continue;
+			tally.addOnce(
+				typeof event.toolCallId === "string" ? event.toolCallId : undefined,
+				event.name === KIMI_SKILL_TOOL_NAME && typeof event.args?.skill === "string"
+					? skillTool(event.args.skill)
+					: classifyToolName(event.name),
+			);
+		}
+		return tally.values();
+	}
+
 	parseTimestamp(line: string, _lineNum?: number): string | undefined {
 		try {
 			return kimiFrameTimestamp(JSON.parse(line) as Record<string, unknown>);
@@ -313,6 +443,11 @@ export class KimiTranscriptParser implements TranscriptParser {
 		}
 	}
 }
+
+/** Kimi's envelope for every loop event, including tool activity. */
+const KIMI_LOOP_EVENT_TYPE = "context.append_loop_event";
+/** Kimi's first-class skill tool — its `args.skill` names the skill that ran. */
+const KIMI_SKILL_TOOL_NAME = "Skill";
 
 /**
  * Extracts the `content.part` object from a Kimi wire event, whether it arrives
@@ -524,8 +659,47 @@ export function getParserForSource(source: "claude" | "codex" | "kimi"): Transcr
 	}
 }
 
-/** The sources this module has a parser for. Others use dedicated readers. */
-const PARSER_BACKED_SOURCES = ["claude", "codex"] as const;
+/**
+ * The sources this module has a parser for. Others use dedicated readers.
+ *
+ * MUST list every case `getParserForSource` accepts. It is the domain the
+ * capability probe below iterates, so a source missing here can never enter
+ * {@link TOOL_RECORDING_SOURCES} no matter what its parser implements — the
+ * probe would report the parser's `parseToolUse` as if it did not exist. `kimi`
+ * was missing for exactly that reason; the compile-time annotation now ties the
+ * list to the factory's parameter type, so adding a parser without extending it
+ * fails to build.
+ */
+const PARSER_BACKED_SOURCES: ReadonlyArray<Parameters<typeof getParserForSource>[0]> = [
+	"claude",
+	"codex",
+	"kimi",
+] as const;
+
+/**
+ * Sources whose tool calls come from a DEDICATED READER rather than a
+ * `TranscriptParser`, and whose reader is known to populate
+ * `TranscriptReadResult.toolUse`.
+ *
+ * This half of the set cannot be probed the way the parser half is: a reader is
+ * a bare async function, not an object with an optional method, so there is
+ * nothing to feature-test. The list is therefore hand-maintained, and the bar
+ * for joining it is deliberately high — **a source belongs here only once its
+ * reader has been written against a real capture of that host's transcripts.**
+ *
+ * Listing a source whose reader silently extracts nothing is strictly worse than
+ * omitting it: every slice would report `toolUse: []`, and the consumers read
+ * that as the positive claim "this agent called no tools" (see the `with_tools`
+ * filters in `DashboardQuery` / `MemoriesQuery`). Omission degrades to
+ * "unavailable", which is merely incomplete rather than false.
+ *
+ * Two layers of test hold this honest, and neither alone would: the membership
+ * of this list is pinned in `TranscriptParserToolUse.test.ts` (which also pins
+ * the sources deliberately kept OUT), while the evidence that each reader really
+ * extracts something lives in that reader's own test file, asserting a non-empty
+ * extraction over a real capture. Adding a source here means adding both.
+ */
+const READER_BACKED_TOOL_SOURCES = ["gemini", "opencode", "antigravity", "cursor-cli", "cline-cli", "devin"] as const;
 
 /**
  * Sources whose transcripts can report tool calls at all — i.e. whose parser
@@ -537,11 +711,14 @@ const PARSER_BACKED_SOURCES = ["claude", "codex"] as const;
  * reader preserves by keeping an empty `toolUse` array rather than dropping the
  * field. Zero records look identical without it.
  *
- * Derived by probing the parsers instead of listing source names, so adding
- * `parseToolUse` to one of them cannot leave this behind. Sources served by a
- * dedicated reader rather than a `TranscriptParser` are absent, which is correct
- * today: none of them extracts tool calls.
+ * The parser half is derived by probing, so adding `parseToolUse` to one of them
+ * cannot leave this behind — provided the source is in
+ * {@link PARSER_BACKED_SOURCES}, which is what makes that list's completeness
+ * load-bearing. The reader half cannot be probed and is listed explicitly; see
+ * {@link READER_BACKED_TOOL_SOURCES} for why the bar for joining it is a real
+ * capture rather than a plausible-looking extractor.
  */
-export const TOOL_RECORDING_SOURCES: ReadonlySet<string> = new Set(
-	PARSER_BACKED_SOURCES.filter((source) => getParserForSource(source).parseToolUse !== undefined),
-);
+export const TOOL_RECORDING_SOURCES: ReadonlySet<string> = new Set<string>([
+	...PARSER_BACKED_SOURCES.filter((source) => getParserForSource(source).parseToolUse !== undefined),
+	...READER_BACKED_TOOL_SOURCES,
+]);

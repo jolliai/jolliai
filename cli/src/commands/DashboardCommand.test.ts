@@ -17,6 +17,13 @@ vi.mock("../dashboard/Backfill.js", () => ({
 vi.mock("../dashboard/Backup.js", () => ({
 	opportunisticSnapshot: vi.fn().mockResolvedValue({ status: "skipped", reason: "test" }),
 }));
+// The launcher ends with an auto-cutover attempt. Unmocked it would run against
+// the REAL repo this suite executes in (several tests pass no `cwd`, so it falls
+// back to `process.cwd()`): reading its profile, stamping an attempt into it, and
+// possibly running a cutover CAS against a throwaway test database.
+vi.mock("../dashboard/AutoCutover.js", () => ({
+	maybeAutoCutover: vi.fn().mockResolvedValue("skipped"),
+}));
 vi.mock("../dashboard/RepoRegistry.js", () => ({
 	registerRepo: vi.fn(
 		async (): Promise<RegisteredRepo> => ({
@@ -33,6 +40,7 @@ vi.mock("../dashboard/DashboardDb.js", async (importOriginal) => {
 	return { ...original, canUseDashboardDb: vi.fn(() => true) };
 });
 
+import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { backfillRepos } from "../dashboard/Backfill.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
@@ -303,6 +311,26 @@ describe("executeDashboard", () => {
 		expect(backfillRepos).toHaveBeenCalledTimes(1);
 	});
 
+	it("attempts a THROTTLED auto-cutover after the import", async () => {
+		// The import is what makes the compare likely to pass, so the attempt belongs
+		// after it — but this is a reopen command, so it must not pay the compare on
+		// every launch the way the one-shot import entry point does.
+		const d = deps();
+		await executeDashboard("stats", { cwd: "/w" }, d);
+		expect(maybeAutoCutover).toHaveBeenCalledWith("/w", expect.objectContaining({ throttle: true }));
+		expect(vi.mocked(backfillRepos).mock.invocationCallOrder[0]).toBeLessThan(
+			vi.mocked(maybeAutoCutover).mock.invocationCallOrder[0] as number,
+		);
+	});
+
+	it("a launch that never got a server does not attempt a cutover", async () => {
+		// Everything past `ensureServerRunning` is skipped on the failure return, so
+		// a repo whose dashboard cannot start is not silently fenced either.
+		const d = deps({ fetchHealth: async () => ({ ok: false }) });
+		await expect(executeDashboard("stats", {}, d)).resolves.toBe(false);
+		expect(maybeAutoCutover).not.toHaveBeenCalled();
+	});
+
 	it("takes the daily snapshot here, not in the read-only server process", async () => {
 		// The trigger used to live in `startDashboardServer`, where it opened a
 		// WRITABLE handle (and so could run schema migrations) from the one
@@ -495,7 +523,10 @@ describe("createProgressPrinter", () => {
 		// motionless minute is the worse problem.
 		const lines: string[] = [];
 		const printer = createProgressPrinter({ log: (line) => lines.push(line) });
-		printer.onProgress(event({ kind: "commits", done: 0, total: undefined }));
+		// `firstRun` — only a bootstrap can take minutes. A sweep triggered by a
+		// moved branch tip skips `--numstat` for stored commits and finishes in under
+		// a second, so the patience note must not ride along with it.
+		printer.onProgress(event({ kind: "commits", done: 0, total: undefined, firstRun: true }));
 		for (let done = 200; done <= 4_000; done += 200)
 			printer.onProgress(event({ kind: "commits", done, total: 4_000 }));
 		printer.onProgress(event({ kind: "summaries", done: 0, total: undefined }));
@@ -538,7 +569,15 @@ describe("createProgressPrinter", () => {
 			["jolliai", 2],
 		] as const) {
 			printer.onProgress(
-				event({ repoName, repoIndex, repoTotal: 2, kind: "commits", done: 0, total: undefined }),
+				event({
+					repoName,
+					repoIndex,
+					repoTotal: 2,
+					kind: "commits",
+					done: 0,
+					total: undefined,
+					firstRun: true,
+				}),
 			);
 			printer.onProgress(
 				event({ repoName, repoIndex, repoTotal: 2, kind: "sessions", done: 0, total: undefined }),

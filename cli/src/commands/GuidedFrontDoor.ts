@@ -12,7 +12,7 @@
  * its state still needs):
  *   git repo? → onboarding (fresh only) → repair broken provider → Sign in? →
  *   Enable? → status line → cloud side-effects → backfill → listening →
- *   import dashboard history → Next steps
+ *   wake the local dashboard (import history, serve, open) → Next steps
  *
  * `Sign in?` deliberately precedes `Enable?`. The opening status line moved to
  * AFTER `Enable?` so `✓ enabled` is always truthful. Non-git directories are a
@@ -33,14 +33,16 @@ import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
 import { isGitHookInstalled } from "../install/GitHookInstaller.js";
 import { install } from "../install/Installer.js";
-import { setLogDir } from "../Logger.js";
+import { createLogger, errMsg, setLogDir } from "../Logger.js";
 import { runBackfillFrontDoorStep } from "./BackfillFrontDoorStep.js";
 import { isAffirmative, isInsideGitWorkTree, promptText, resolveProjectDir } from "./CliUtils.js";
-import { importDashboardHistory } from "./DashboardCommand.js";
+import { executeDashboard } from "./DashboardCommand.js";
 import { promptSetup } from "./EnableCommand.js";
 import { canGenerateNow, promptGenerationFix } from "./GenerationFix.js";
 import { offerOptionalJolliLogin } from "./OptionalLogin.js";
 import { runSpaceSyncStep } from "./SpaceSyncStep.js";
+
+const log = createLogger("GuidedFrontDoor");
 
 /** Lightweight front-door status. Deliberately avoids the heavy `getStatus()`. */
 export interface GuidedFrontDoorStatus {
@@ -249,8 +251,9 @@ export async function runGuidedFrontDoor(): Promise<void> {
 		console.log(`\n  ${listening}`);
 		// Whatever the back-fill offer did (built memories, was declined, or never
 		// appeared), the memories it may have just written reach the dashboard
-		// database only through this import — so run one here. See below.
-		await importLocalDashboardHistory(cwd);
+		// database only through this import — and the guided front door is the one
+		// entry point that finishes by SHOWING them. See below.
+		await wakeLocalDashboard(cwd);
 	}
 
 	// Next steps orientation — printed on EVERY path that reaches here, for new
@@ -265,36 +268,49 @@ export async function runGuidedFrontDoor(): Promise<void> {
 }
 
 /**
- * Registers this repo and imports its memory into the dashboard database — the
- * same `importDashboardHistory` call `jolli enable` makes, so the two entry
- * points leave the machine in the same state.
+ * Wakes the local web service: registers this repo, imports its memory into the
+ * dashboard database, brings up (or reuses) the read-only server and opens the
+ * browser on it — one `executeDashboard` call, which is exactly what `jolli
+ * dashboard` runs.
  *
- * Placed AFTER the back-fill step on purpose. `backfillRepos` (which this
- * wraps) is the ONLY production caller of the source-of-truth import: memories
- * the back-fill just wrote would otherwise sit outside the dashboard database
- * until the user happened to run `jolli dashboard` by hand. Running it here
- * means the page is already populated whenever they do open it. Registration
- * alone is not the point — the hooks self-register from the write path on the
- * next commit (see ProducerHooks) — the import is.
+ * Placed AFTER the back-fill step on purpose. `backfillRepos` (which the import
+ * half wraps) is the ONLY production caller of the source-of-truth import:
+ * memories the back-fill just wrote would otherwise sit outside the dashboard
+ * database until the user happened to run `jolli dashboard` by hand.
+ * Registration alone is not the point — the hooks self-register from the write
+ * path on the next commit (see ProducerHooks) — the import is.
  *
- * It stops there: no port is bound, no server spawned, no browser opened. The
- * front door installs hooks and builds memories; deciding to run a local web
- * service is a separate, explicit `jolli dashboard`.
+ * Opening the browser is the point of doing it HERE rather than reusing
+ * `importDashboardHistory`. This is the guided setup, the one path a new user
+ * walks to completion, and the memories it just spent LLM budget building have
+ * no surface until something shows them. `ensureServerRunning` probes `/health`
+ * first, so a second `jolli` run reuses the live server instead of spawning a
+ * second one. `jolli enable` deliberately stays import-only — there the server
+ * is a side effect of a narrower request.
  *
  * Deliberately triggered by the STEP COMPLETING, not by it having built
  * anything: `runBackfillFrontDoorStep` returns `void` by contract (it reports
- * nothing to the front door), and `jolli enable` imports unconditionally too.
+ * nothing to the front door).
  *
- * Never fails the front door: `importDashboardHistory` never throws, and
- * `process.exitCode` must stay untouched here — the front door's exit code is
- * non-zero only for a hard blocker (not a repo, install failure).
+ * Never fails the front door: `executeDashboard` reports success as a boolean
+ * precisely so soft callers can shrug a failure off, and `process.exitCode` must
+ * stay untouched here — the front door's exit code is non-zero only for a hard
+ * blocker (not a repo, install failure). A browser that will not open is already
+ * non-fatal inside the launcher, which prints the URL either way.
  */
-async function importLocalDashboardHistory(cwd: string): Promise<void> {
-	// No flag-free `node:sqlite` → nothing to import into. `importDashboardHistory`
-	// self-gates on the same check; kept here so the intent is readable at the
-	// call site. Same gate as `jolli enable`.
+async function wakeLocalDashboard(cwd: string): Promise<void> {
+	// No flag-free `node:sqlite` → no database to import into and nothing to
+	// serve. Gated here rather than left to `executeDashboard`, which reports that
+	// runtime as an ERROR — correct when the user typed `jolli dashboard`, wrong
+	// as the closing line of a successful setup. Same gate as `jolli enable`.
 	if (!canUseDashboardDb()) return;
-	await importDashboardHistory(cwd);
+	try {
+		const opened = await executeDashboard("stats", { cwd });
+		if (!opened) console.log("  (Dashboard did not open — run 'jolli dashboard' to retry.)\n");
+	} catch (err) {
+		log.warn("dashboard wake failed (non-fatal): %s", errMsg(err));
+		console.log("  (Dashboard did not open — run 'jolli dashboard' to retry.)\n");
+	}
 }
 
 /** Prints the closing orientation shown on every non-dead-end front-door run. */

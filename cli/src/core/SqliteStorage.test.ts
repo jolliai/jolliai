@@ -296,7 +296,13 @@ describe("SqliteStorage reads", () => {
 
 	it("reads a child leaf directly and keeps its own empty children array", async () => {
 		const text = await storage.readFile(`summaries/${"c".repeat(40)}.json`);
-		expect(JSON.parse(text as string).children).toEqual([]);
+		const parsed = JSON.parse(text as string) as { commitHash: string; children: unknown[] };
+		expect(parsed.children).toEqual([]);
+		// A non-root is assembled from its SUBTREE, not from its root's whole
+		// family: the sibling `b…` shares a root_hash with it and must not leak
+		// in. That is also why the two shapes exist — see assembleMemoryTree.
+		expect(parsed.commitHash).toBe("c".repeat(40));
+		expect(text).not.toContain("b".repeat(40));
 	});
 
 	it("keeps siblings in child_pos order — the array order the parent file had", async () => {

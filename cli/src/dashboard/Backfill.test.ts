@@ -114,7 +114,7 @@ beforeEach(() => {
 	vi.mocked(listFilesInBranch).mockResolvedValue([]);
 	vi.mocked(collectCommitEvents).mockResolvedValue([commitEvent("aaa"), commitEvent("bbb")]);
 	vi.mocked(collectSessionEvents).mockResolvedValue([sessionEvent]);
-	vi.mocked(collectSummaryEvents).mockResolvedValue([]);
+	vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [], complete: true });
 	vi.mocked(collectWorktreeEvent).mockResolvedValue(worktreeEvent);
 	// No knowledge graph by default — it is opt-in per test, like the summaries.
 	vi.mocked(collectRepoGraph).mockResolvedValue(null);
@@ -223,6 +223,55 @@ describe("backfillRepo — bootstrap", () => {
 		await backfillRepo({ repo, dbPath });
 		expect((await query("SELECT hash FROM commits")).length).toBe(2);
 	});
+
+	// The write-ahead log's retention pass rides `applyStatsEvents`, which this
+	// path does not use (it calls `applyToDb` directly to stay inside one
+	// handle). `events_raw.event_id` is deliberately not unique, so without a
+	// prune of its own a machine that only ever runs `jolli dashboard` grows the
+	// log forever.
+	it("prunes aged projected events on the way out", async () => {
+		const OLD = new Date(Date.parse("2026-01-01T00:00:00Z")).toISOString();
+		await withDashboardDb(
+			(db) => {
+				db.prepare(
+					`INSERT INTO events_raw (event_id, repo_identity, type, schema_version, received_at,
+					                         data_json, projection_status)
+					 VALUES ('stale', ?, 'session.upserted', 1, ?, '{}', 'projected')`,
+				).run(repo.repoIdentity, OLD);
+			},
+			{ dbPath },
+		);
+		expect((await query("SELECT event_id FROM events_raw WHERE event_id = 'stale'")).length).toBe(1);
+
+		await backfillRepo({ repo, dbPath, now: () => Date.parse("2026-08-09T00:00:00Z") });
+
+		expect((await query("SELECT event_id FROM events_raw WHERE event_id = 'stale'")).length).toBe(0);
+	});
+
+	// `pending` and `failed` are never pruned regardless of age: pending is the
+	// crash-recovery record a later writer drains, failed is the evidence.
+	it("leaves aged pending and failed events alone", async () => {
+		const OLD = new Date(Date.parse("2026-01-01T00:00:00Z")).toISOString();
+		await withDashboardDb(
+			(db) => {
+				for (const status of ["pending", "failed"]) {
+					db.prepare(
+						`INSERT INTO events_raw (event_id, repo_identity, type, schema_version, received_at,
+						                         data_json, projection_status)
+						 VALUES (?, ?, 'unknown.type', 1, ?, '{}', ?)`,
+					).run(status, repo.repoIdentity, OLD, status);
+				}
+			},
+			{ dbPath },
+		);
+
+		await backfillRepo({ repo, dbPath, now: () => Date.parse("2026-08-09T00:00:00Z") });
+
+		const kept = await query<{ event_id: string }>(
+			"SELECT event_id FROM events_raw WHERE event_id IN ('pending','failed') ORDER BY event_id",
+		);
+		expect(kept.map((r) => r.event_id)).toEqual(["failed", "pending"]);
+	});
 });
 
 describe("backfillRepo — recovery", () => {
@@ -249,6 +298,49 @@ describe("backfillRepo — recovery", () => {
 		});
 		await backfillRepo({ repo, dbPath });
 		expect(collectCommitEvents).toHaveBeenCalled();
+	});
+
+	it("projects only the commits a re-sweep actually changed", async () => {
+		// The daily case: a commit lands on the branch being worked on. The sweep has
+		// to LIST every reachable commit (the prune is computed against that set, and
+		// branch reachability changes for old commits whenever a branch moves), but
+		// projecting the unchanged ones re-ran an UPSERT + DELETE + re-INSERT per
+		// commit to arrive at the bytes already there. Measured on a real 2.5k-commit
+		// repo: one new commit went from 2457 projections to 1.
+		await backfillRepo({ repo, dbPath });
+		// A pass with nothing to do still re-projects the always-on tiers, so THAT is
+		// the baseline to compare against rather than a hard-coded count.
+		const idle = await backfillRepo({ repo, dbPath });
+		vi.mocked(getHeadHash).mockResolvedValue("head-2");
+		vi.mocked(collectCommitEvents).mockResolvedValue([commitEvent("aaa"), commitEvent("bbb"), commitEvent("ccc")]);
+		const result = await backfillRepo({ repo, dbPath });
+		// Exactly one more: `ccc`. `aaa` and `bbb` are listed by the sweep and used
+		// for the prune, but neither reaches the projection.
+		expect(result.eventsApplied).toBe(idle.eventsApplied + 1);
+		const hashes = (await query<{ hash: string }>("SELECT hash FROM commits ORDER BY hash")).map((r) => r.hash);
+		expect(hashes).toEqual(["aaa", "bbb", "ccc"]);
+	});
+
+	it("re-projects a commit whose branch reachability changed", async () => {
+		// `branches` is replace-when-present, so a stale set is a wrong answer to
+		// "group by branch" — this is the one field that legitimately changes for an
+		// OLD commit, and skipping it is what a naive "already stored" test would do.
+		await backfillRepo({ repo, dbPath });
+		vi.mocked(getHeadHash).mockResolvedValue("head-2");
+		vi.mocked(collectCommitEvents).mockResolvedValue([
+			{ ...commitEvent("aaa"), branches: ["main", "feature/x"] },
+			commitEvent("bbb"),
+		]);
+		await backfillRepo({ repo, dbPath });
+		const names = (
+			await query<{ name: string }>(
+				`SELECT b.name FROM commit_branches cb
+				   JOIN branches b ON b.id = cb.branch_id
+				   JOIN commits c  ON c.id = cb.commit_id
+				  WHERE c.hash = 'aaa' ORDER BY b.name`,
+			)
+		).map((r) => r.name);
+		expect(names).toEqual(["feature/x", "main"]);
 	});
 
 	it("prunes commits that a rewrite made unreachable (set reconciliation)", async () => {
@@ -533,7 +625,7 @@ describe("backfillRepo — summaries sweep (memory tier)", () => {
 
 	it("sweeps summaries during bootstrap and enriches the commit row", async () => {
 		vi.mocked(getIndex).mockResolvedValue({ version: 3, entries: [] });
-		vi.mocked(collectSummaryEvents).mockResolvedValue([summaryEvent]);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [summaryEvent], complete: true });
 
 		await backfillRepo({ repo, dbPath });
 
@@ -546,7 +638,7 @@ describe("backfillRepo — summaries sweep (memory tier)", () => {
 
 	it("skips the sweep when the index fingerprint is unchanged, re-sweeps when it changes", async () => {
 		vi.mocked(getIndex).mockResolvedValue({ version: 3, entries: [] });
-		vi.mocked(collectSummaryEvents).mockResolvedValue([summaryEvent]);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [summaryEvent], complete: true });
 
 		await backfillRepo({ repo, dbPath });
 		expect(collectSummaryEvents).toHaveBeenCalledTimes(1);
@@ -578,12 +670,35 @@ describe("backfillRepo — summaries sweep (memory tier)", () => {
 		expect(collectSummaryEvents).not.toHaveBeenCalled();
 	});
 
+	// The cursor is the index's content hash, so advancing it after a partial
+	// sweep makes every later pass skip collection outright — one transient
+	// `git show` failure would hide that memory from the dashboard forever.
+	it("does not advance the summaries cursor after an incomplete sweep", async () => {
+		vi.mocked(getIndex).mockResolvedValue({ version: 3, entries: [] });
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [summaryEvent], complete: false });
+
+		await backfillRepo({ repo, dbPath });
+		expect(collectSummaryEvents).toHaveBeenCalledTimes(1);
+
+		// Same index content, but the cursor never moved — so the next pass
+		// re-reads instead of trusting an incomplete result.
+		await backfillRepo({ repo, dbPath });
+		expect(collectSummaryEvents).toHaveBeenCalledTimes(2);
+
+		// A clean sweep finally parks it.
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [summaryEvent], complete: true });
+		await backfillRepo({ repo, dbPath });
+		expect(collectSummaryEvents).toHaveBeenCalledTimes(3);
+		await backfillRepo({ repo, dbPath });
+		expect(collectSummaryEvents).toHaveBeenCalledTimes(3);
+	});
+
 	it("announces the sweep only when it is going to run", async () => {
 		// The marker is the caller's evidence that something is worth narrating, so
 		// a skipped sweep has to be silent — announcing "Indexing stored memories…"
 		// and then doing nothing is what made every launch look like a re-migration.
 		vi.mocked(getIndex).mockResolvedValue({ version: 3, entries: [] });
-		vi.mocked(collectSummaryEvents).mockResolvedValue([summaryEvent]);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [summaryEvent], complete: true });
 		const kinds = async (): Promise<string[]> => {
 			const seen: string[] = [];
 			await backfillRepo({

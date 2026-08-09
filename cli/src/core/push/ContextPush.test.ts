@@ -49,7 +49,26 @@ vi.mock("./kinds/index.js", async () => {
 		reduce: (items) => items.filter((w) => w.keep !== false),
 		tiebreak: (a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0),
 	});
-	return { CONTEXT_KIND_DEFINITIONS: [widget, gadget] };
+	// A summary-scoped, aggregating kind — the shape `skill` uses. Synthetic for the
+	// same reason as the two above: it is the only way to reach `docScope: "summary"`
+	// and `aggregate` through the generic engine rather than through one real kind's
+	// data. It reuses the REAL `jolliSkillsDocId`/`jolliSkillsDocUrl` names because
+	// those fields must exist on `CommitSummary` for the scope to mean anything.
+	const banner = defineContextKind<BannerItem>({
+		docType: "banner",
+		field: "banners",
+		entryKey: "bid",
+		baseKey: { fields: ["bid"] },
+		recency: "at",
+		docScope: "summary",
+		docIdField: "jolliSkillsDocId",
+		docUrlField: "jolliSkillsDocUrl",
+		linksInMarkdown: false,
+		title: () => "Banners",
+		body: async (b) => b.body,
+		aggregate: (items) => [{ ...items[0], bid: "all", body: items.map((i) => i.body ?? "").join("+") }],
+	});
+	return { CONTEXT_KIND_DEFINITIONS: [widget, gadget, banner] };
 });
 
 import { DocTypeNotAllowedError, type JolliMemoryPushClient } from "../JolliMemoryPushClient.js";
@@ -76,6 +95,12 @@ interface GadgetItem {
 	readonly jolliDocUrl?: string;
 }
 
+interface BannerItem {
+	readonly bid: string;
+	readonly at: string;
+	readonly body?: string;
+}
+
 interface WidgetItem {
 	readonly slug: string;
 	readonly updatedAt: string;
@@ -89,6 +114,7 @@ const BASE = "https://acme.jolli.ai";
 const ENV_KEY = "https://acme.jolli.ai";
 
 interface TestSummary extends CommitSummary {
+	readonly banners?: ReadonlyArray<BannerItem>;
 	readonly gadgets?: ReadonlyArray<GadgetItem>;
 	readonly widgets?: ReadonlyArray<WidgetItem>;
 }
@@ -341,6 +367,46 @@ describe("pushContextAttachments", () => {
 
 // ─── Weaving + reduction ─────────────────────────────────────────────────────
 
+describe("aggregate + summary-scoped doc state", () => {
+	it("pushes ONE article for an aggregating kind and reuses the SUMMARY's id", async () => {
+		const client = fakeClient();
+		const s = summary({
+			banners: [
+				{ bid: "b1", at: "2026-01-01T00:00:00Z", body: "one" },
+				{ bid: "b2", at: "2026-01-02T00:00:00Z", body: "two" },
+			],
+			jolliSkillsDocId: 55,
+			jolliSkillsDocUrl: `${BASE}/articles?doc=55`,
+		});
+		await pushContextAttachments(s, ctxOf(client), ENV_KEY, undefined);
+		const calls = (
+			client.push as unknown as { mock: { calls: Array<[{ docType: string; docId?: number }]> } }
+		).mock.calls.filter((c) => c[0].docType === "banner");
+		expect(calls).toHaveLength(1);
+		// The stored id comes off the summary, not off any item — that is the whole
+		// point of `docScope`, and it is what makes a re-push update in place.
+		expect(calls[0][0].docId).toBe(55);
+	});
+
+	it("aggregates on the SELECTION path too, which is the one branch push always takes", async () => {
+		// `reduce` is skipped for an explicit selection (the winner rule already
+		// collapsed revisions); an aggregate is a per-commit presentation decision no
+		// selection can make, so skipping it there would leave the branch-push path
+		// publishing the un-aggregated set.
+		const client = fakeClient();
+		const banners = [
+			{ bid: "b1", at: "2026-01-01T00:00:00Z", body: "one" },
+			{ bid: "b2", at: "2026-01-02T00:00:00Z", body: "two" },
+		];
+		await pushContextAttachments(summary({ banners }), ctxOf(client), ENV_KEY, new Map([["banner", banners]]));
+		const calls = (
+			client.push as unknown as { mock: { calls: Array<[{ docType: string; content: string }]> } }
+		).mock.calls.filter((c) => c[0].docType === "banner");
+		expect(calls).toHaveLength(1);
+		expect(calls[0][0].content).toBe("one+two");
+	});
+});
+
 describe("applyPublishedUrls / reduceOwnItems", () => {
 	it("weaves onto the default jolliDocId/jolliDocUrl fields, matched by entryKey", () => {
 		const s = summary({
@@ -368,6 +434,33 @@ describe("applyPublishedUrls / reduceOwnItems", () => {
 		) as TestSummary;
 		expect(woven.gadgets?.[0].jolliDocUrl).toBe("{{jolli:doc:gadget-0}}");
 		expect(woven.gadgets?.[0].jolliDocId).toBeUndefined();
+	});
+
+	it("weaves a summary-scoped kind onto the SUMMARY, leaving its items untouched", () => {
+		// One article for the whole commit, so there is no entry that owns it. Holding
+		// the id on a representative item instead put a commit-level identity inside
+		// that kind's per-item merge rules, where a squash could retitle another
+		// commit's article and strand a second one with no cleanup path.
+		const s = summary({ banners: [{ bid: "b1", at: "2026-01-01T00:00:00Z" }] });
+		const woven = applyPublishedUrls(
+			s,
+			new Map([["banner", [{ entryKey: "all", url: `${BASE}/articles?doc=7`, docId: 7 }]]]),
+		) as TestSummary;
+		expect(woven.jolliSkillsDocId).toBe(7);
+		expect(woven.jolliSkillsDocUrl).toBe(`${BASE}/articles?doc=7`);
+		expect(woven.banners?.[0]).not.toHaveProperty("jolliSkillsDocId");
+	});
+
+	it("urlOnly leaves a summary-scoped docId absent too (batch placeholder path)", () => {
+		// A placeholder string in a numeric docId field would break the sidecar schema
+		// exactly as it would on an item.
+		const woven = applyPublishedUrls(
+			summary({ banners: [{ bid: "b1", at: "2026-01-01T00:00:00Z" }] }),
+			new Map([["banner", [{ entryKey: "all", url: "{{jolli:doc:banner-0}}" }]]]),
+			{ urlOnly: true },
+		) as TestSummary;
+		expect(woven.jolliSkillsDocUrl).toBe("{{jolli:doc:banner-0}}");
+		expect(woven.jolliSkillsDocId).toBeUndefined();
 	});
 
 	it("returns the summary by identity when nothing was published for its kinds", () => {

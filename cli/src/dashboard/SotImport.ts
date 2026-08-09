@@ -31,7 +31,7 @@
 import { deflateSync } from "node:zlib";
 
 import { GitRefStorage, resolveCommittish } from "../core/GitRefStorage.js";
-import { readProcessedSet } from "../core/ProcessedSourceStore.js";
+import { readProcessedSetOrNull } from "../core/ProcessedSourceStore.js";
 import { readCutoverFence } from "../core/RepoProfile.js";
 import { readReferenceMarkdownFromString } from "../core/references/ReferenceStore.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
@@ -708,6 +708,22 @@ export function remountRepo(db: DashboardDbHandle, repoId: number): void {
  * writes the `repo_state key='orphan-import'` marker on completion.
  */
 export async function importRepoMemory(db: DashboardDbHandle, opts: SotImportOptions): Promise<SotImportResult> {
+	// Seed and protect are mutually exclusive by MEANING, and the check belongs
+	// here rather than as a guard inside `writeMemorySeed`. Protect exists for a
+	// FROZEN source: rows the database stamped after the freeze outrank anything
+	// the import can read back. A seed reconciles against the source as the whole
+	// truth — pruning rows it does not list — so a seed that is also protecting
+	// rows is asking for two contradictory things. Today's callers derive
+	// `seedLegal` from the same fence witnesses that leave `protectNewerThanMs`
+	// unset, but nothing in the option type says so, and the failure would be
+	// silent: `writeMemorySeed` overwrites unconditionally, rolling a post-fence
+	// regenerated summary back to its pre-fence body with a frozen branch as the
+	// only place to recover it from.
+	if (opts.mode === "seed" && opts.protectNewerThanMs !== undefined) {
+		throw new Error(
+			"importRepoMemory: seed mode implies an unfrozen source — protectNewerThanMs is not applicable",
+		);
+	}
 	try {
 		return await runRepoImport(db, opts);
 	} catch (err) {
@@ -1725,8 +1741,14 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 		topics++;
 	});
 
-	const processed = await readProcessedSet(cwd, storage);
-	const processedRows = Object.entries(processed.processed).flatMap(([type, ids]) =>
+	// `null` = the file is there and unparsable. It must NOT reconcile as an
+	// empty live-set: seed mode would then delete every `topic_processed_sources`
+	// row for the repo, losing the topic KB's high-water mark silently (one
+	// log line, `skipped` unaffected) and making every ingested source look
+	// unprocessed again. Same treatment the alias index gets a few families up.
+	const processed = await readProcessedSetOrNull(cwd, storage);
+	if (processed === null) skip("processed sources", `topics/processed.json is unparsable — prune skipped`);
+	const processedRows = Object.entries(processed?.processed ?? {}).flatMap(([type, ids]) =>
 		ids.map((id) => [type, id] as const),
 	);
 	inChunkedTransactions(db, processedRows, ([type, id]) => {
@@ -1796,13 +1818,15 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 		pruned += pruneTable(db, "context", ["kind", "context_key"], repoId, liveDocs);
 		pruned += pruneTable(db, "plan_progress", ["plan_slug"], repoId, liveProgress);
 		pruned += pruneTable(db, "topic_pages", ["stable_slug"], repoId, new Set(slugs));
-		pruned += pruneTable(
-			db,
-			"topic_processed_sources",
-			["source_type", "source_id"],
-			repoId,
-			new Set(processedRows.map(([type, id]) => keyOf(type, id))),
-		);
+		if (processed !== null) {
+			pruned += pruneTable(
+				db,
+				"topic_processed_sources",
+				["source_type", "source_id"],
+				repoId,
+				new Set(processedRows.map(([type, id]) => keyOf(type, id))),
+			);
+		}
 	}
 
 	// ── completion marker ──────────────────────────────────────────────────

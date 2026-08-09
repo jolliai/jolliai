@@ -180,6 +180,96 @@ describe("summary trees", () => {
 		]);
 	});
 
+	it("reorders siblings when the batch lists a child's own file before the parent's", async () => {
+		// The child file re-anchors itself from its stored mount point, which at
+		// that moment is parked in the offset region. Leaving it parked is what
+		// keeps the parent's walk from colliding with it — see landSummaries.
+		await storage.writeFiles(
+			[
+				file(
+					`summaries/${H("a")}.json`,
+					summary(H("a"), { children: [summary(H("b")), summary(H("c")), summary(H("d"))] }),
+				),
+			],
+			"m",
+		);
+		await storage.writeFiles(
+			[
+				file(`summaries/${H("c")}.json`, summary(H("c"))),
+				file(
+					`summaries/${H("a")}.json`,
+					summary(H("a"), { children: [summary(H("d")), summary(H("b")), summary(H("c"))] }),
+				),
+			],
+			"m",
+		);
+		const kids = await rows<{ commit_hash: string; child_pos: number }>(
+			"SELECT commit_hash, child_pos FROM memories WHERE parent_hash = ? ORDER BY child_pos",
+			H("a"),
+		);
+		expect(kids).toEqual([
+			{ commit_hash: H("d"), child_pos: 0 },
+			{ commit_hash: H("b"), child_pos: 1 },
+			{ commit_hash: H("c"), child_pos: 2 },
+		]);
+		expect(await rows("SELECT COUNT(*) AS n FROM memories WHERE child_pos >= 1000000")).toEqual([{ n: 0 }]);
+	});
+
+	it("re-grounds a re-anchoring top node whose ground position the new set took", async () => {
+		await storage.writeFiles(
+			[file(`summaries/${H("a")}.json`, summary(H("a"), { children: [summary(H("b")), summary(H("c"))] }))],
+			"m",
+		);
+		// b's own file rides in the same batch that drops b from a's children and
+		// moves c onto b's old position 0.
+		await storage.writeFiles(
+			[
+				file(`summaries/${H("b")}.json`, summary(H("b"))),
+				file(`summaries/${H("a")}.json`, summary(H("a"), { children: [summary(H("c"))] })),
+			],
+			"m",
+		);
+		expect(await rows("SELECT parent_hash, child_pos FROM memories WHERE commit_hash = ?", H("b"))).toEqual([
+			{ parent_hash: null, child_pos: null },
+		]);
+		expect(await rows("SELECT child_pos FROM memories WHERE commit_hash = ?", H("c"))).toEqual([{ child_pos: 0 }]);
+		expect(await rows("SELECT COUNT(*) AS n FROM memories WHERE child_pos >= 1000000")).toEqual([{ n: 0 }]);
+	});
+
+	it("re-grounds a re-anchoring top node the new set dropped, free ground slot or not", async () => {
+		// Same shape as above except b sat LAST, so nothing in the new set takes
+		// its position 2. A free slot is not a reason to keep the edge: `a.json`
+		// no longer lists b, and a seed import of these same files makes b a root.
+		await storage.writeFiles(
+			[
+				file(
+					`summaries/${H("a")}.json`,
+					summary(H("a"), { children: [summary(H("c")), summary(H("d")), summary(H("b"))] }),
+				),
+			],
+			"m",
+		);
+		await storage.writeFiles(
+			[
+				file(`summaries/${H("b")}.json`, summary(H("b"))),
+				file(`summaries/${H("a")}.json`, summary(H("a"), { children: [summary(H("c")), summary(H("d"))] })),
+			],
+			"m",
+		);
+		expect(await rows("SELECT parent_hash, child_pos, depth FROM memories WHERE commit_hash = ?", H("b"))).toEqual([
+			{ parent_hash: null, child_pos: null, depth: 0 },
+		]);
+		const kids = await rows<{ commit_hash: string; child_pos: number }>(
+			"SELECT commit_hash, child_pos FROM memories WHERE parent_hash = ? ORDER BY child_pos",
+			H("a"),
+		);
+		expect(kids).toEqual([
+			{ commit_hash: H("c"), child_pos: 0 },
+			{ commit_hash: H("d"), child_pos: 1 },
+		]);
+		expect(await rows("SELECT COUNT(*) AS n FROM memories WHERE child_pos >= 1000000")).toEqual([{ n: 0 }]);
+	});
+
 	it("remounts an old root as a child, moving its whole subtree", async () => {
 		// b is a root with child c (depth 1). An amend then claims b under a.
 		await storage.writeFiles(
@@ -255,11 +345,15 @@ describe("summary trees", () => {
 			[file(`summaries/${H("a")}.json`, summary(H("a"), { children: [summary(H("b"))] }))],
 			"m",
 		);
-		// b's file now claims a as ITS child: with a's stored mount under b kept,
-		// the edges form a↔b and neither is a root.
+		// The batch claims both directions at once -- a.json keeps b as its child
+		// while b.json claims a as ITS child -- so the edges form a↔b and neither
+		// is a root.
 		await expect(
 			storage.writeFiles(
-				[file(`summaries/${H("b")}.json`, summary(H("b"), { children: [summary(H("a"))] }))],
+				[
+					file(`summaries/${H("a")}.json`, summary(H("a"), { children: [summary(H("b"))] })),
+					file(`summaries/${H("b")}.json`, summary(H("b"), { children: [summary(H("a"))] })),
+				],
 				"m",
 			),
 		).rejects.toThrow(/cycle/);
@@ -297,6 +391,47 @@ describe("links", () => {
 		]);
 	});
 
+	// The reverse write order — summary first, transcript later — is what
+	// `saveTranscriptsBatch` (ide-bridge `transcripts-save`) produces. The link
+	// used to be dropped as "dangling" and nothing re-derived it, so the
+	// dashboard's session↔commit join silently lost the commit.
+	it("links a transcript stored AFTER the summary that references it", async () => {
+		await storage.writeFiles([file(`summaries/${H("a")}.json`, summary(H("a"), { transcripts: ["t-1"] }))], "m");
+		expect(await rows("SELECT COUNT(*) AS n FROM memory_transcripts")).toEqual([{ n: 0 }]);
+
+		await storage.writeFiles([file("transcripts/t-1.json", { sessions: [{ sessionId: "s1" }] })], "m");
+		expect(await rows("SELECT commit_hash, transcript_id FROM memory_transcripts")).toEqual([
+			{ commit_hash: H("a"), transcript_id: "t-1" },
+		]);
+	});
+
+	it("does not link a transcript to a memory that never referenced it", async () => {
+		await storage.writeFiles([file(`summaries/${H("a")}.json`, summary(H("a"), { transcripts: ["t-9"] }))], "m");
+		await storage.writeFiles([file("transcripts/t-1.json", { sessions: [{ sessionId: "s1" }] })], "m");
+		expect(await rows("SELECT COUNT(*) AS n FROM memory_transcripts")).toEqual([{ n: 0 }]);
+	});
+
+	// A batch carrying both must keep landLinks' replacement authoritative:
+	// the backfill runs after it and must not resurrect a dropped link.
+	it("lets a same-batch summary write remain the authority on its link set", async () => {
+		await storage.writeFiles(
+			[
+				file("transcripts/t-1.json", { sessions: [{ sessionId: "s1" }] }),
+				file(`summaries/${H("a")}.json`, summary(H("a"), { transcripts: ["t-1"] })),
+			],
+			"m",
+		);
+		// Re-written with an empty transcript list, alongside the transcript again.
+		await storage.writeFiles(
+			[
+				file("transcripts/t-1.json", { sessions: [{ sessionId: "s1" }] }),
+				file(`summaries/${H("a")}.json`, summary(H("a"), { transcripts: [] })),
+			],
+			"m",
+		);
+		expect(await rows("SELECT COUNT(*) AS n FROM memory_transcripts")).toEqual([{ n: 0 }]);
+	});
+
 	it("deleting a transcript clears its links and sessions first", async () => {
 		await storage.writeFiles(
 			[
@@ -311,10 +446,16 @@ describe("links", () => {
 		expect(await rows("SELECT COUNT(*) AS n FROM transcript_sessions")).toEqual([{ n: 0 }]);
 	});
 
-	it("rejects an unparsable transcript", async () => {
-		await expect(storage.writeFiles([file("transcripts/t-1.json", "{]")], "m")).rejects.toThrow(
-			/unparsable transcript/,
+	// The batch is ONE transaction, so throwing on a bad artifact rolls back the
+	// memory riding alongside it — the orphan backend stored these bytes verbatim
+	// and could not fail this way at all. Skip loudly, keep the rest.
+	it("skips an unparsable transcript without losing the memory in the same batch", async () => {
+		await storage.writeFiles(
+			[file(`summaries/${H("a")}.json`, summary(H("a"))), file("transcripts/t-1.json", "{]")],
+			"m",
 		);
+		expect(await rows("SELECT commit_hash FROM memories")).toEqual([{ commit_hash: H("a") }]);
+		expect(await rows("SELECT COUNT(*) AS n FROM transcripts")).toEqual([{ n: 0 }]);
 	});
 });
 
@@ -424,10 +565,15 @@ describe("context and topics", () => {
 		expect(await rows("SELECT COUNT(*) AS n FROM context WHERE kind = 'note'")).toEqual([{ n: 0 }]);
 	});
 
-	it("rejects a reference with unparsable frontmatter", async () => {
-		await expect(storage.writeFiles([file("references/x/y.md", "no frontmatter")], "m")).rejects.toThrow(
-			/frontmatter/,
+	// One odd legacy reference used to take EVERY reference for that commit with
+	// it, plus the memory itself. SotImport has always skipped the same file.
+	it("skips a reference with unparsable frontmatter and keeps its batch", async () => {
+		await storage.writeFiles(
+			[file(`summaries/${H("a")}.json`, summary(H("a"))), file("references/x/y.md", "no frontmatter")],
+			"m",
 		);
+		expect(await rows("SELECT commit_hash FROM memories")).toEqual([{ commit_hash: H("a") }]);
+		expect(await rows("SELECT COUNT(*) AS n FROM context WHERE kind = 'reference'")).toEqual([{ n: 0 }]);
 	});
 
 	it("round-trips a topic page and applies the index-borne summary", async () => {
@@ -482,11 +628,28 @@ describe("context and topics", () => {
 		expect(await rows("SELECT COUNT(*) AS n FROM topic_source_refs")).toEqual([{ n: 0 }]);
 	});
 
-	it("rejects unparsable topic artifacts", async () => {
-		await expect(storage.writeFiles([file("topics/bad.json", "{}")], "m")).rejects.toThrow(/unparsable topic page/);
-		await expect(storage.writeFiles([file("topics/processed.json", "{}")], "m")).rejects.toThrow(
-			/unparsable topics\/processed/,
+	it("skips unparsable topic artifacts and keeps its batch", async () => {
+		await storage.writeFiles(
+			[file(`summaries/${H("a")}.json`, summary(H("a"))), file("topics/bad.json", "{}")],
+			"m",
 		);
+		expect(await rows("SELECT commit_hash FROM memories")).toEqual([{ commit_hash: H("a") }]);
+		expect(await rows("SELECT COUNT(*) AS n FROM topic_pages")).toEqual([{ n: 0 }]);
+	});
+
+	// Skipping keeps the PREVIOUS high-water set — the safe direction, since
+	// re-processing a source is idempotent. And it must not swallow the
+	// unrelated v5-state write that rides in the same batch.
+	it("skips an unparsable processed set, keeping the stored one and the rest of the batch", async () => {
+		await storage.writeFiles([file("topics/processed.json", { processed: { summary: ["s1"] } })], "m");
+		expect(await rows("SELECT source_id FROM topic_processed_sources")).toEqual([{ source_id: "s1" }]);
+
+		await storage.writeFiles(
+			[file("topics/processed.json", "{}"), file("schema-v5-migration.json", { done: true })],
+			"m",
+		);
+		expect(await rows("SELECT source_id FROM topic_processed_sources")).toEqual([{ source_id: "s1" }]);
+		expect(await rows("SELECT COUNT(*) AS n FROM repo_state WHERE key = 'v5-migration'")).toEqual([{ n: 1 }]);
 	});
 
 	it("refuses writes for an unregistered repo", async () => {
@@ -541,9 +704,10 @@ describe("edge shapes the main flows never hit", () => {
 
 	it("progress: delete, unparsable content and path-slug fallback", async () => {
 		await storage.writeFiles([file("plans/p1.md", "# p1")], "m");
-		await expect(storage.writeFiles([file("plan-progress/p1.json", "{]")], "m")).rejects.toThrow(
-			/unparsable plan-progress/,
-		);
+		// Skipped, not thrown: same one-transaction reasoning as the orphaned-plan
+		// case this function already handled that way.
+		await storage.writeFiles([file("plan-progress/p1.json", "{]")], "m");
+		expect(await rows("SELECT COUNT(*) AS n FROM plan_progress")).toEqual([{ n: 0 }]);
 		// No planSlug in the artifact: the path names the plan.
 		await storage.writeFiles([file("plan-progress/p1.json", { version: 2 })], "m");
 		expect(await rows("SELECT plan_slug FROM plan_progress")).toEqual([{ plan_slug: "p1" }]);

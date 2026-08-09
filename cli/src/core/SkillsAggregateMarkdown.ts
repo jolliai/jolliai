@@ -9,9 +9,20 @@
 
 import type { CommitSummary, SkillCommitRef, SkillUsage } from "../Types.js";
 
+/**
+ * `skills--<hash8>` — the per-commit skill aggregate's identity.
+ *
+ * Shared by the Memory Bank file name below and the pushed article's `entryKey`
+ * (see the `skill` context kind), so the same aggregate is not named two ways: one
+ * commit's skills are ONE artifact locally and ONE article remotely.
+ */
+export function skillsAggregateKey(hash8: string): string {
+	return `skills--${hash8}`;
+}
+
 /** `skills--<hash8>.md` — the visible aggregate's file name for one commit. */
 export function skillsAggregateFileName(hash8: string): string {
-	return `skills--${hash8}.md`;
+	return `${skillsAggregateKey(hash8)}.md`;
 }
 
 /**

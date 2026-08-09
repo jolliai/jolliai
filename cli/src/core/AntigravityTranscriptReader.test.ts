@@ -134,3 +134,65 @@ describe("unwrapUserRequest", () => {
 		expect(unwrapUserRequest("  plain user text  ")).toBe("plain user text");
 	});
 });
+
+describe("readAntigravityTranscript toolUse", () => {
+	it("counts the PLANNER_RESPONSE tool_calls it also summarizes into the text", async () => {
+		const path = writeTranscript(REAL_TRANSCRIPT_FULL);
+		const result = await readAntigravityTranscript(path);
+		expect(result.toolUse).toEqual([{ name: "run_command", kind: "builtin", calls: 1 }]);
+	});
+
+	it("sums repeated calls to the same tool across steps", async () => {
+		const path = writeTranscript([
+			{
+				step_index: 0,
+				type: "PLANNER_RESPONSE",
+				created_at: "2026-07-19T09:46:50Z",
+				tool_calls: [
+					{ name: "run_command", args: {} },
+					{ name: "view_file", args: {} },
+				],
+			},
+			{
+				step_index: 1,
+				type: "PLANNER_RESPONSE",
+				created_at: "2026-07-19T09:46:51Z",
+				tool_calls: [{ name: "run_command", args: {} }],
+			},
+		]);
+		const result = await readAntigravityTranscript(path);
+		expect(result.toolUse).toEqual([
+			{ name: "run_command", kind: "builtin", calls: 2 },
+			{ name: "view_file", kind: "builtin", calls: 1 },
+		]);
+	});
+
+	it("reports an empty array — not undefined — for a tool-free slice", async () => {
+		const path = writeTranscript([
+			{ step_index: 0, type: "USER_INPUT", created_at: "2026-07-19T09:46:50Z", content: "hi" },
+		]);
+		const result = await readAntigravityTranscript(path);
+		expect(result.toolUse).toEqual([]);
+	});
+
+	it("counts only the calls inside the consumed slice", async () => {
+		const path = writeTranscript([
+			{
+				step_index: 0,
+				type: "PLANNER_RESPONSE",
+				created_at: "2026-07-19T09:46:50Z",
+				tool_calls: [{ name: "run_command", args: {} }],
+			},
+			{
+				step_index: 1,
+				type: "PLANNER_RESPONSE",
+				created_at: "2026-07-19T10:00:00Z",
+				tool_calls: [{ name: "view_file", args: {} }],
+			},
+		]);
+		const first = await readAntigravityTranscript(path, undefined, "2026-07-19T09:50:00Z");
+		expect(first.toolUse).toEqual([{ name: "run_command", kind: "builtin", calls: 1 }]);
+		const second = await readAntigravityTranscript(path, first.newCursor);
+		expect(second.toolUse).toEqual([{ name: "view_file", kind: "builtin", calls: 1 }]);
+	});
+});

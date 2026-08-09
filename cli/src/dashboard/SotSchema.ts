@@ -428,6 +428,28 @@ INSERT INTO context_kinds (kind) VALUES ('skill');
 `;
 
 /**
+ * Records WHY a `failed` event was parked, so the one recoverable reason can be
+ * un-parked later.
+ *
+ * `projectEvent`'s `default:` throw exists as the runtime backstop for an older
+ * build draining a NEWER producer's event — `schema_version` gates payload
+ * changes and cannot gate a new event TYPE. The comment there promises the row
+ * "survives for a build that understands it", but the claim query selects
+ * `pending` only and nothing ever reset `failed`, so upgrading did not recover
+ * it: the event was lost permanently, which is the exact outcome the two-phase
+ * WAL was built to prevent. A genuine defect must NOT be revived the same way
+ * (it would burn the attempt budget on every drain forever), hence a reason
+ * rather than a bare flag.
+ *
+ * Additive column with no default backfill: rows parked by an older build read
+ * back NULL, which is treated as "unknown reason — leave parked", the same
+ * conservative answer they get today.
+ */
+export const EVENT_FAILED_KIND_DDL = `
+ALTER TABLE events_raw ADD COLUMN failed_kind TEXT;
+`;
+
+/**
  * The memory tables, `context`, plan progress and the topic KB.
  *
  * Applied as one statement batch inside the caller's transaction. Ordering

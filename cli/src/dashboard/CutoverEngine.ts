@@ -52,7 +52,7 @@ import { SqliteStorage } from "../core/SqliteStorage.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
 import type { CutoverRecord } from "./CutoverRouter.js";
-import { DashboardSchemaAheadError, inTransaction, withDashboardDb } from "./DashboardDb.js";
+import { DashboardSchemaAheadError, inTransaction, withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
 import { existingWorktrees, type RegisteredRepo, readRepoRegistry, resolveRepoIdentityForCwd } from "./RepoRegistry.js";
 import { countMemoriesAbsentFromListing, importRepoMemory } from "./SotImport.js";
 
@@ -143,13 +143,21 @@ export async function compareSourceContainment(
 			if (a === b) continue;
 			if (a == null || b == null) return { ok: false, detail: `${path}: missing from the database` };
 			if (path.startsWith("summaries/") && summariesEquivalent(a, b)) continue;
-			// `topics/index.json` ALONE. It is a synthesized view whose entry order
-			// falls out of a query, so order-insensitive equality is the right
-			// criterion there. A topic PAGE is not that: `topic_source_refs.pos`
-			// exists precisely to preserve its array order, and the `startsWith`
-			// this used to carry swallowed every page into the loose compare,
-			// certifying a reordered page as contained.
-			if (path === "topics/index.json" && jsonSetEquivalent(a, b)) continue;
+			// `topics/index.json` and `topics/processed.json` ALONE. Both are
+			// synthesized UNION views: they are rendered from every row of the repo
+			// id, and step 2 imports every registered source into that one id
+			// (identity is the shared remote). So for a repo with two clones — which
+			// `collectSources` supports — the database renders A∪B and equality
+			// against A's file, or B's, can never hold; byte-comparing them made such
+			// a repo answer `not-ready` on every attempt and never converge. The
+			// criterion is CONTAINMENT (every entry the source lists is in the
+			// database), which is the same thing the family loop asserts for every
+			// other path and is why `index.json` / `catalog.json` are skipped below.
+			// A topic PAGE is not one of these: `topic_source_refs.pos` exists
+			// precisely to preserve its array order, and the `startsWith` this used
+			// to carry swallowed every page into the loose compare, certifying a
+			// reordered page as contained.
+			if (TOPIC_UNION_VIEWS.has(path) && jsonContains(a, b)) continue;
 			return { ok: false, detail: `${path}: content differs` };
 		}
 	}
@@ -184,27 +192,65 @@ function summariesEquivalent(a: string, b: string): boolean {
 }
 
 /** Order-insensitive JSON equivalence for the synthesized topic index. */
-function jsonSetEquivalent(a: string, b: string): boolean {
+/**
+ * The reason string for a step 2 / step 3 failure, told from the caller's side.
+ *
+ * Once ANY source is fenced the repo is already `legacy-fenced` — a working
+ * state, not a broken one (it writes SQLite and reads the database) — so the
+ * only thing the user needs is that re-running finishes the CAS.
+ */
+function importOrCompareFailure(err: unknown, fenced: boolean): string {
+	const detail = err instanceof DashboardSchemaAheadError ? errMsg(err) : `import/compare failed: ${errMsg(err)}`;
+	return fenced ? `${detail} — this repo is legacy-fenced; re-run \`jolli cutover\` to finish` : detail;
+}
+
+/** The two synthesized union views — see the containment note in the compare. */
+const TOPIC_UNION_VIEWS = new Set(["topics/index.json", "topics/processed.json"]);
+
+/**
+ * Does `db` contain everything `source` lists?
+ *
+ * Arrays are compared as SETS (their order in a synthesized view falls out of a
+ * query, and a union interleaves two sources' rows); objects need every key the
+ * source carries, and may carry more; leaves must be equal. Deliberately one-
+ * directional: extra entries in `db` are the whole point of a union view, and
+ * an entry only the database has is never a reason to refuse a cutover — the
+ * frozen tips are what must be readable back, nothing more.
+ */
+function jsonContains(source: string, db: string): boolean {
 	try {
-		const canon = (x: unknown): string => {
-			if (Array.isArray(x)) {
-				return JSON.stringify(x.map(canon).sort());
-			}
-			if (x && typeof x === "object") {
-				return JSON.stringify(
-					Object.fromEntries(
-						Object.entries(x as Record<string, unknown>)
-							.sort()
-							.map(([k, v]) => [k, canon(v)]),
-					),
-				);
-			}
-			return JSON.stringify(x);
-		};
-		return canon(JSON.parse(a)) === canon(JSON.parse(b));
+		return contains(JSON.parse(source), JSON.parse(db));
 	} catch {
 		return false;
 	}
+}
+
+function contains(a: unknown, b: unknown): boolean {
+	if (Array.isArray(a)) {
+		if (!Array.isArray(b)) return false;
+		const have = new Set(b.map((v) => canonJson(v)));
+		return a.every((v) => have.has(canonJson(v)));
+	}
+	if (a && typeof a === "object") {
+		if (!b || typeof b !== "object" || Array.isArray(b)) return false;
+		const other = b as Record<string, unknown>;
+		return Object.entries(a as Record<string, unknown>).every(([k, v]) => k in other && contains(v, other[k]));
+	}
+	return canonJson(a) === canonJson(b);
+}
+
+function canonJson(x: unknown): string {
+	if (Array.isArray(x)) return JSON.stringify(x.map(canonJson).sort());
+	if (x && typeof x === "object") {
+		return JSON.stringify(
+			Object.fromEntries(
+				Object.entries(x as Record<string, unknown>)
+					.sort()
+					.map(([k, v]) => [k, canonJson(v)]),
+			),
+		);
+	}
+	return JSON.stringify(x);
 }
 
 /**
@@ -265,16 +311,28 @@ export async function probeCutoverDrift(
 ): Promise<DriftReport[]> {
 	const { identity } = await resolveRepoIdentityForCwd(cwd);
 	const dbOpts = opts.dbPath ? { dbPath: opts.dbPath } : {};
-	const record = await withDashboardDb((db) => {
-		const row = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as
-			| { id: number }
-			| undefined;
-		if (!row) return null;
-		const state = db.prepare("SELECT value FROM repo_state WHERE repo_id = ? AND key = 'cutover'").get(row.id) as
-			| { value: string }
-			| undefined;
-		return state ? (JSON.parse(state.value) as CutoverRecord) : null;
-	}, dbOpts);
+	// READ-ONLY, and tolerant of a database this build cannot open. A writable
+	// open runs `migrateDashboardDb`, so a probe would migrate the schema as a
+	// side effect; and on a database a NEWER surface already migrated, every
+	// writable open throws — which `runCutover` guards for and `--probe` did not,
+	// so it stack-traced out of `CutoverCommand`'s uncaught action. An absent or
+	// unreadable database has no cutover record, which is "no drift to report".
+	let record: CutoverRecord | null;
+	try {
+		record = await withReadonlyDashboardDb((db) => {
+			const row = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as
+				| { id: number }
+				| undefined;
+			if (!row) return null;
+			const state = db
+				.prepare("SELECT value FROM repo_state WHERE repo_id = ? AND key = 'cutover'")
+				.get(row.id) as { value: string } | undefined;
+			return state ? (JSON.parse(state.value) as CutoverRecord) : null;
+		}, dbOpts);
+	} catch (err) {
+		log.info("cutover probe: no readable dashboard database (%s)", errMsg(err));
+		return [];
+	}
 	if (!record) return [];
 	const registry = await readRepoRegistry();
 	const repo = registry.repos.find((r) => r.repoIdentity === identity);
@@ -507,29 +565,44 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 		// trade — legacy-fenced writes SQLite and reads the database, so it costs
 		// a stuck cutover and a named path in the reason, where importing anyway
 		// costs the regenerated memory with nothing to recover it from.
-		for (const source of sources) {
-			const pinned = new GitRefStorage(source.tip, source.root);
-			const fenceMs = fencedRoots.get(source.root);
-			await withDashboardDb(
-				(db) =>
-					importRepoMemory(db, {
-						repo,
-						storage: pinned,
-						nowMs,
-						mode: seedLegal ? "seed" : "catch-up",
-						...(fenceMs !== undefined && Number.isFinite(fenceMs) ? { protectNewerThanMs: fenceMs } : {}),
-					}),
-				dbOpts,
-			);
-		}
-
-		// 3. Full compare at the pinned tips (containment — see header).
-		const sqlite = new SqliteStorage(identity, opts.dbPath);
-		for (const source of sources) {
-			const verdict = await compare(new GitRefStorage(source.tip, source.root), sqlite);
-			if (!verdict.ok) {
-				return { status: "not-ready", reason: `compare failed for ${source.root}: ${verdict.detail}` };
+		// Steps 2 and 3 answer `not-ready` rather than throwing. On a RETRY they
+		// run with the fence already up, and both can fail for reasons that have
+		// nothing to do with this repo's readiness — `DashboardSchemaAheadError`, a
+		// concurrent QueueWorker holding the writer past `busy_timeout`, a git read
+		// failure. Letting that escape lands in `CutoverCommand`'s uncaught
+		// commander action: a stack trace, and no word to the user that the repo is
+		// now `legacy-fenced` and that re-running finishes the CAS. That is the one
+		// outcome the lock-timeout and null-row guards below were both written to
+		// prevent; they just never covered the two steps the retry re-executes.
+		try {
+			for (const source of sources) {
+				const pinned = new GitRefStorage(source.tip, source.root);
+				const fenceMs = fencedRoots.get(source.root);
+				await withDashboardDb(
+					(db) =>
+						importRepoMemory(db, {
+							repo,
+							storage: pinned,
+							nowMs,
+							mode: seedLegal ? "seed" : "catch-up",
+							...(fenceMs !== undefined && Number.isFinite(fenceMs)
+								? { protectNewerThanMs: fenceMs }
+								: {}),
+						}),
+					dbOpts,
+				);
 			}
+
+			// 3. Full compare at the pinned tips (containment — see header).
+			const sqlite = new SqliteStorage(identity, opts.dbPath);
+			for (const source of sources) {
+				const verdict = await compare(new GitRefStorage(source.tip, source.root), sqlite);
+				if (!verdict.ok) {
+					return { status: "not-ready", reason: `compare failed for ${source.root}: ${verdict.detail}` };
+				}
+			}
+		} catch (err) {
+			return { status: "not-ready", reason: importOrCompareFailure(err, fencedRoots.size > 0) };
 		}
 
 		// Fence: every source gets the pair, or the fence did not go up. Only

@@ -39,6 +39,7 @@ import {
 } from "./push/ContextPush.js";
 import { canReuseDocId } from "./push/DocIdReuse.js";
 import { referenceBaseKey } from "./push/kinds/index.js";
+import { adoptLegacySkillDocIds } from "./push/LegacySkillDocIds.js";
 import { latestPlanPerName, planBaseKey } from "./push/PlanGrouping.js";
 import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
 import { buildPushTitle, collectSortedTopics } from "./SummaryFormat.js";
@@ -77,7 +78,8 @@ const MAX_SUMMARY_JSON_BYTES = 1_572_864;
 /**
  * Serializes a summary for the `summaryJson` push field: the enriched
  * `summaryForMarkdown` copy (plan/note URLs woven in) minus the client push-state
- * fields — `jolliDocId`/`jolliDocUrl` churn per push, while `orphanedDocIds`
+ * fields — `jolliDocId`/`jolliDocUrl` and their skill-article siblings
+ * `jolliSkillsDocId`/`jolliSkillsDocUrl` churn per push, while `orphanedDocIds`
  * and `unresolvedOrphanHashes` are cleanup bookkeeping. None of them are
  * commit content the share page should see
  * (stripping them also keeps the top-level fields of a re-push byte-identical for
@@ -89,6 +91,13 @@ export function serializeSummaryJson(summary: CommitSummary): string | undefined
 	const {
 		jolliDocId: _docId,
 		jolliDocUrl: _docUrl,
+		// The skill aggregate is pushed BEFORE the summary in the same run, so
+		// `applyPublishedUrls` has already woven the freshly minted id/URL onto the
+		// summary by the time we serialize — leaving them in would put this push's
+		// own publish state into the sidecar (and make the same commit's JSON differ
+		// per environment, since the ids are per-backend).
+		jolliSkillsDocId: _skillsDocId,
+		jolliSkillsDocUrl: _skillsDocUrl,
 		orphanedDocIds: _orphaned,
 		unresolvedOrphanHashes: _unresolved,
 		...content
@@ -376,11 +385,15 @@ export interface PushSummaryOptions {
  * injected chooser).
  */
 export async function pushSummary(
-	summary: CommitSummary,
+	original: CommitSummary,
 	ctx: PushContext,
 	attachments?: AttachmentSelection | ContextSelection,
 	opts?: PushSummaryOptions,
 ): Promise<PushSummaryResult> {
+	// Convert any per-skill article ids published by an older version into the
+	// commit-level one before anything reads them — see `adoptLegacySkillDocIds`.
+	// Persisted by this function's own write-back, like every other field it updates.
+	const summary = adoptLegacySkillDocIds(original);
 	const displayBase = ctx.baseUrl.replace(/\/+$/, "");
 	// Env key of the tenant this push targets — every docId minted below is tagged
 	// with it, and an existing docId is reused as an update target only when its

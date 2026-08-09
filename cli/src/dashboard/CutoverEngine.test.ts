@@ -471,6 +471,67 @@ describe("runCutover", () => {
 		expect(ok.ok).toBe(true);
 	});
 
+	it("accepts a union view that CONTAINS the source, for both topics/ views", async () => {
+		const { SqliteStorage } = await import("../core/SqliteStorage.js");
+		const { compareSourceContainment } = await import("./CutoverEngine.js");
+		void SqliteStorage;
+		const provider = (files: Record<string, string>) => ({
+			async readFile(path: string): Promise<string | null> {
+				return files[path] ?? null;
+			},
+			async batchReadFiles(paths: string[]): Promise<Map<string, string | null>> {
+				return new Map(paths.map((p) => [p, files[p] ?? null]));
+			},
+			async listFiles(prefix: string): Promise<string[]> {
+				return Object.keys(files).filter((p) => p.startsWith(prefix));
+			},
+			async writeFiles(): Promise<void> {},
+			async exists(): Promise<boolean> {
+				return true;
+			},
+			async ensure(): Promise<void> {},
+		});
+		// Two clones of one remote import into ONE repo id, so both synthesized
+		// views render A∪B. Equality could never hold against either clone's
+		// file, which left such a repo permanently un-cutoverable.
+		const cloneA = {
+			"topics/index.json": JSON.stringify({ schemaVersion: 1, topics: [{ stableSlug: "a" }] }),
+			"topics/processed.json": JSON.stringify({
+				schemaVersion: 1,
+				processed: { summary: ["s1"], plan: [], note: [], userfile: [] },
+			}),
+		};
+		const union = {
+			"topics/index.json": JSON.stringify({
+				schemaVersion: 1,
+				topics: [{ stableSlug: "b" }, { stableSlug: "a" }],
+			}),
+			"topics/processed.json": JSON.stringify({
+				schemaVersion: 1,
+				processed: { summary: ["s2", "s1"], plan: ["p1"], note: [], userfile: [] },
+			}),
+		};
+		const contained = await compareSourceContainment(
+			provider(cloneA),
+			provider(union) as unknown as InstanceType<typeof SqliteStorage>,
+		);
+		expect(contained.ok).toBe(true);
+
+		// Containment is one-directional: an entry the SOURCE lists and the
+		// database lacks is still drift.
+		const missing = await compareSourceContainment(
+			provider(cloneA),
+			provider({
+				...union,
+				"topics/processed.json": JSON.stringify({
+					schemaVersion: 1,
+					processed: { summary: ["s2"], plan: [], note: [], userfile: [] },
+				}),
+			}) as unknown as InstanceType<typeof SqliteStorage>,
+		);
+		expect(missing).toMatchObject({ ok: false, detail: "topics/processed.json: content differs" });
+	});
+
 	it("increments the cutover version over a prior generation", async () => {
 		await writeOrphanSummary(HASH, "seed");
 		const identity = await resolveIdentity();

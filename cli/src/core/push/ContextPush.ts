@@ -36,13 +36,16 @@ import {
 	entryKeyOf,
 	getContextKinds,
 	hasField,
+	isSummaryScoped,
 	linksInMarkdown,
 	recencyOf,
 	replaceItems,
 	selectItems,
+	storedDocOf,
 	withDoc,
 	withDocUrl,
 	withSeedDoc,
+	withSummaryDoc,
 } from "./ContextKindRegistry.js";
 import { canReuseDocId } from "./DocIdReuse.js";
 
@@ -174,8 +177,26 @@ function itemWins(kind: AnyContextKind, item: unknown, prev: unknown): boolean {
 	return kind.tiebreak !== undefined && kind.tiebreak(item, prev) < 0;
 }
 
-/** The items one commit should push for `kind`: the caller's selection, or the summary's own (reduced). */
+/**
+ * The items one commit should push for `kind`: the caller's selection, or the
+ * summary's own (reduced) — then the kind's `aggregate`, if it declares one.
+ *
+ * `aggregate` runs on BOTH branches on purpose, unlike `reduce`. `reduce` is
+ * skipped for an explicit selection because the cross-commit winner rule has
+ * already collapsed revisions; an aggregate is a per-commit presentation decision
+ * that no selection can make, so skipping it on the selection branch would leave
+ * the branch-push path (which always selects) publishing the un-aggregated set.
+ */
 export function itemsToPush(
+	kind: AnyContextKind,
+	summary: CommitSummary,
+	selection: ContextSelection | undefined,
+): ReadonlyArray<unknown> {
+	const selected = selectedItems(kind, summary, selection);
+	return kind.aggregate !== undefined && selected.length > 0 ? kind.aggregate(selected, summary) : selected;
+}
+
+function selectedItems(
 	kind: AnyContextKind,
 	summary: CommitSummary,
 	selection: ContextSelection | undefined,
@@ -351,7 +372,7 @@ export async function pushContextAttachments(
 				continue;
 			}
 			const title = kind.title(item, summary);
-			const storedDocId = docIdOf(kind, item);
+			const stored = storedDocOf(kind, summary, item);
 			try {
 				// Live re-read of the opt-out before EVERY send — see assertOutboundStillAllowed.
 				await assertOutboundStillAllowed(ctx.cwd);
@@ -361,8 +382,7 @@ export async function pushContextAttachments(
 					commitHash: summary.commitHash,
 					docType: kind.docType,
 					branch: summary.branch,
-					...(storedDocId !== undefined &&
-						canReuseDocId(docUrlOf(kind, item), envKey) && { docId: storedDocId }),
+					...(stored.docId !== undefined && canReuseDocId(stored.docUrl, envKey) && { docId: stored.docId }),
 					repoUrl: ctx.repoUrl,
 					relativePath: buildBranchRelativePath(summary.branch),
 				});
@@ -409,6 +429,9 @@ function logDocTypeNotAllowed(docType: string, message: string): void {
  * `entryKey` — the exact per-commit array entry, so an item recurring across commits
  * only updates the entry that actually pushed.
  *
+ * A **summary-scoped** kind writes onto the summary's own fields instead: its article
+ * covers the commit, so there is no entry that owns it (see `ContextKindDocState`).
+ *
  * `opts.urlOnly` writes the URL but not the docId: the batch path uses it to weave
  * server-substituted PLACEHOLDER urls into the copy the markdown and summaryJson
  * are built from, where a placeholder string in a numeric docId field would break
@@ -427,6 +450,15 @@ export function applyPublishedUrls(
 	for (const kind of getContextKinds()) {
 		const docs = published.get(kind.docType);
 		if (docs === undefined || docs.length === 0) continue;
+		if (isSummaryScoped(kind)) {
+			// One article for the whole commit, so there is no entry to match: the id/URL
+			// go on the summary itself. `docs` holds exactly one doc for such a kind (its
+			// `aggregate` produced one item), and taking the first keeps that assumption
+			// visible rather than silently letting a later doc win.
+			const doc = docs[0];
+			out = withSummaryDoc(kind, out, doc.url, opts?.urlOnly === true ? undefined : doc.docId);
+			continue;
+		}
 		if (!hasField(kind, out)) continue;
 		const byEntryKey = new Map(docs.map((d) => [d.entryKey, d]));
 		const items = selectItems(kind, out).map((item) => {
@@ -514,14 +546,14 @@ export async function buildContextBatchAttachments(
 			}
 			const clientKey = `${clientKeyPrefixOf(kind)}-${index}`;
 			index++;
-			const storedDocId = docIdOf(kind, item);
+			const stored = storedDocOf(kind, summary, item);
 			attachments.push({
 				clientKey,
 				docType: kind.docType,
 				title: kind.title(item, summary),
 				content,
 				relativePath,
-				...(storedDocId !== undefined && canReuseDocId(docUrlOf(kind, item), envKey) && { docId: storedDocId }),
+				...(stored.docId !== undefined && canReuseDocId(stored.docUrl, envKey) && { docId: stored.docId }),
 			});
 			attachmentKeys.set(clientKey, { docType: kind.docType, key: entryKey });
 			if (linksInMarkdown(kind)) forKind.push({ entryKey, url: docUrlPlaceholder(clientKey) });

@@ -35,11 +35,32 @@ node "$PLUGIN_DIR/scripts/build.mjs"
 # never consults .gitignore, so a complete dist on disk IS a complete dist in the
 # archive — but an incomplete BUILD would silently ship a plugin whose missing
 # git-hook/worker scripts block the installing user's commits (see build.mjs
-# header). Kept in lockstep with build.mjs entryPoints AND _publish-lib.sh's
-# PUBLISH_REQUIRED_DIST.
-REQUIRED_DIST="Cli.js PluginBootstrapHook.js StopHook.js SessionStartHook.js PostCommitHook.js PostMergeHook.js PostRewriteHook.js PrepareMsgHook.js PrePushHook.js QueueWorker.js PrePushWorker.js DashboardServerEntry.js dashboard-assets/index.html"
+# header).
+#
+# SOURCED from _publish-lib.sh rather than restated. This file used to carry its
+# own copy, and the copy drifted the moment the dashboard arrived: it checked
+# `dashboard-assets/index.html` alone while the server's own door check
+# (resolveDashboardAssetsDir) requires the stylesheet and all eight scripts — so
+# the zip path could still ship the exact partial asset tree the shared list was
+# expanded file-by-file to prevent.
+# shellcheck source=./_publish-lib.sh
+. "$SCRIPT_DIR/_publish-lib.sh"
+
+# The lib re-defines PLUGIN_DIR from ITS own location, so this source silently
+# repoints a variable this script already set — and the source sits between the
+# two uses of it: `node "$PLUGIN_DIR/scripts/build.mjs"` above ran against the
+# original, while the completeness check and the packing below use the lib's.
+# They resolve to the same directory today only because both files live in
+# scripts/. Moving either one would build one plugin and ship another, with
+# nothing on screen to say so — so assert the agreement rather than rely on it.
+if [ "$(cd "$PLUGIN_DIR" && pwd)" != "$(cd "$SCRIPT_DIR/../plugins/jolli" && pwd)" ]; then
+	echo "error: _publish-lib.sh re-pointed PLUGIN_DIR to $PLUGIN_DIR" >&2
+	echo "       (expected $SCRIPT_DIR/../plugins/jolli — the build above used that one)" >&2
+	exit 1
+fi
+
 missing=""
-for f in $REQUIRED_DIST; do
+for f in "${PUBLISH_REQUIRED_DIST[@]}"; do
 	[ -s "$PLUGIN_DIR/dist/$f" ] || missing="$missing $f"
 done
 if [ -n "$missing" ]; then

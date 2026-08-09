@@ -12,9 +12,6 @@ window.JD = window.JD || {};
 	   supposed to be a to-do list under things nobody can act on today. */
 	var TODAY_KINDS = ["todo"];
 	var RISK_KINDS = ["blocker", "question", "gotcha"];
-	/* Past this many days an age tag turns critical; the mockup marks its 4-day
-	   blocker `.old` and leaves the 2-day one plain. */
-	var STALE_DAYS = 3;
 
 	/* ---- rows -------------------------------------------------------------- */
 
@@ -162,12 +159,16 @@ window.JD = window.JD || {};
 
 	/* Age, in the mockup's own tag shape. It reads from the commit the insight came
 	   out of, which is the only date on record — an unanswered question is as old as
-	   the commit that asked it. */
+	   the commit that asked it.
+	   No critical/stale variant: the mockup's red 4-day blocker cannot occur here,
+	   because buildStandupInsights only selects commits from [yesterday, tomorrow),
+	   so this label is bounded at "2 days". Reintroducing a threshold means widening
+	   that window first — an unclosed blocker is only interesting once it is old. */
 	function ageTag(insight, model) {
 		if (insight.committedAtMs == null) return "";
 		var days = Math.floor((model.generatedAtMs - insight.committedAtMs) / 86400000);
 		var label = days < 1 ? "today" : days === 1 ? "1 day" : days + " days";
-		return '<span class="tag age' + (days > STALE_DAYS ? " old" : "") + '">' + label + "</span>";
+		return '<span class="tag age">' + label + "</span>";
 	}
 
 	function riskItem(insight, model) {
@@ -257,12 +258,17 @@ window.JD = window.JD || {};
 		});
 
 		var lines = ["## Standup — " + standup.today, "", "**Yesterday**"];
-		if (standup.yesterdayCommits.length === 0 && standup.yesterdaySessions.length === 0)
-			lines.push("- (nothing recorded)");
+		/* Built into its own array first, so the "nothing recorded" test asks what
+		   this section will ACTUALLY emit. Counting the raw inputs instead was one
+		   filter out of date: at the memory tier the session loop below is skipped,
+		   so a day with agent sessions but no commits counted as non-empty and then
+		   printed nothing — `**Yesterday**` immediately followed by `**Today**`,
+		   while the board column correctly said "Nothing recorded." */
+		var yesterday = [];
 		standup.yesterdayCommits.forEach((commit) => {
 			var prefix = commit.ticketId ? commit.ticketId + ": " : "";
 			var decisions = decisionsByHash[commit.hash] || [];
-			lines.push(
+			yesterday.push(
 				"- " +
 					prefix +
 					commit.message +
@@ -278,31 +284,27 @@ window.JD = window.JD || {};
 		   are outcomes, the session trail is noise in a standup. */
 		if (!standup.insights) {
 			standup.yesterdaySessions.forEach((session) => {
-				lines.push("- [" + session.source + "] " + session.title);
+				yesterday.push("- [" + session.source + "] " + session.title);
 			});
 		}
+		lines.push(yesterday.length > 0 ? yesterday.join("\n") : "- (nothing recorded)");
 
 		lines.push("", "**Today**");
-		if (
-			standup.todayCommits.length === 0 &&
-			standup.todaySessions.length === 0 &&
-			standup.workspaces.length === 0 &&
-			todos.length === 0
-		) {
-			lines.push("- (nothing yet)");
-		}
+		/* Same construction as Yesterday, and for the same reason: the session loop
+		   drops non-live rows at the memory tier, so the raw counts overstate it. */
+		var today = [];
 		standup.todayCommits.forEach((commit) => {
-			lines.push("- " + commit.message + " (`" + commit.hash.slice(0, 7) + "`)");
+			today.push("- " + commit.message + " (`" + commit.hash.slice(0, 7) + "`)");
 		});
 		standup.todaySessions.forEach((session) => {
 			if (standup.insights && !session.isLive) return;
-			lines.push("- [" + session.source + "] " + session.title + (session.isLive ? " (in progress)" : ""));
+			today.push("- [" + session.source + "] " + session.title + (session.isLive ? " (in progress)" : ""));
 		});
 		todos.forEach((todo) => {
-			lines.push("- TODO: " + todo.text + " (`" + todo.commitHash.slice(0, 7) + "`)");
+			today.push("- TODO: " + todo.text + " (`" + todo.commitHash.slice(0, 7) + "`)");
 		});
 		standup.workspaces.forEach((workspace) => {
-			lines.push(
+			today.push(
 				"- Uncommitted on " +
 					(workspace.branch || "detached HEAD") +
 					" · +" +
@@ -316,6 +318,7 @@ window.JD = window.JD || {};
 					")",
 			);
 		});
+		lines.push(today.length > 0 ? today.join("\n") : "- (nothing yet)");
 
 		if (risks.length > 0) {
 			lines.push("", "**Risks · Blockers · Questions**");

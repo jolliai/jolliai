@@ -18,15 +18,22 @@
  * same ordering every Context surface uses.
  */
 
-import type { NoteReference, PlanReference, ReferenceCommitRef, SkillCommitRef } from "../../../Types.js";
+import type {
+	CommitSummary,
+	NoteReference,
+	PlanReference,
+	ReferenceCommitRef,
+	SkillCommitRef,
+} from "../../../Types.js";
 import { readReferenceMarkdownFromString } from "../../references/ReferenceStore.js";
+import { skillsAggregateKey } from "../../SkillsAggregateMarkdown.js";
 import {
 	buildNotePushTitle,
 	buildPlanPushTitle,
 	buildReferencePushTitle,
-	buildSkillPushTitle,
+	buildSkillsPushTitle,
 } from "../../SummaryFormat.js";
-import { buildReferencePushMarkdown, buildSkillPushMarkdown } from "../../SummaryMarkdownBuilder.js";
+import { buildReferencePushMarkdown, buildSkillsPushMarkdown } from "../../SummaryMarkdownBuilder.js";
 import { readNoteFromBranch, readPlanFromBranch, readReferenceFromBranch } from "../../SummaryStore.js";
 import { type ContextKindDefinition, defineContextKind } from "../ContextKindDefinition.js";
 import { byUpdatedAtDesc, latestPlanPerName } from "../PlanGrouping.js";
@@ -134,21 +141,88 @@ const referenceDefinition: ContextKindDefinition<ReferenceCommitRef> = {
 };
 
 /**
- * `skill` — agent-skill usage recorded on a commit, and the **first kind to take the
- * registry defaults**: it declares no `docIdField`/`docUrlField`, so its published
- * id/URL land on the uniform `jolliDocId`/`jolliDocUrl` (rationale in
- * `ContextKindDefinition`), unlike the three kinds above.
+ * The synthetic item the skill kind pushes: one commit's whole skill set, under a
+ * commit-level identity.
  *
- * It is also the only kind that does NOT dedupe across commits — see `baseKey`.
+ * It extends `SkillCommitRef` only so the definition stays typed against its own
+ * item type; **no field of it is a real ref's**. `archivedKey` is the commit-level
+ * `skills--<hash8>`, matching the Memory Bank file name for the same data, and there
+ * is deliberately no `jolliDocId` on it — this kind is `docScope: "summary"`, so the
+ * published id lives on `CommitSummary.jolliSkillsDocId` and the engine never reads
+ * one off this object.
+ *
+ * That combination is the whole fix. Borrowing a representative ref's `archivedKey`
+ * (as the first cut did) made the aggregate's identity depend on which skills the
+ * commit happened to hold, and put a commit-level docId inside `mergeSkillRef`'s
+ * per-ref fold — see `ContextKindDocState` for the two failures that produced.
+ *
+ * Never stored: it exists only between `itemsToPush` and the push call.
+ */
+interface AggregatedSkillRef extends SkillCommitRef {
+	readonly aggregatedSkills: ReadonlyArray<SkillCommitRef>;
+}
+
+/**
+ * Collapses a commit's skill refs into the single aggregate article it publishes.
+ *
+ * **Why one article per commit.** Every local surface shows a commit's skills as
+ * ONE artifact — the Memory Bank writes `skills--<hash8>.md`, and the Context
+ * section renders one unlinked "Skills used" row (see `SummaryMarkdownBuilder`).
+ * Pushing one article per skill meant a commit whose Context listed a single
+ * `skill.md` arrived at the backend as six documents. The decomposition was never
+ * a product decision; it fell out of the engine being item-per-document.
+ *
+ * The identity is derived from the COMMIT, not from any ref, so it is stable no
+ * matter how the skill set changes between pushes — a squash that folds three refs
+ * into one, or a skill entered after the first push, leaves it untouched.
+ */
+function aggregateSkillRefs(
+	refs: ReadonlyArray<SkillCommitRef>,
+	summary: CommitSummary,
+): ReadonlyArray<SkillCommitRef> {
+	if (refs.length === 0) return refs;
+	// Sorted so the body's detail list and the pushed content are byte-stable across
+	// runs; `buildSkillsTable` does its own ordering for the table itself.
+	const ordered = [...refs].sort((a, b) =>
+		a.archivedKey < b.archivedKey ? -1 : a.archivedKey > b.archivedKey ? 1 : 0,
+	);
+	// The legacy per-ref doc fields are dropped rather than spread through: this kind
+	// is summary-scoped, so an id riding on the synthetic item would be a second,
+	// stale answer to "which article is this?" that a future reader could act on.
+	const { jolliDocId: _legacyId, jolliDocUrl: _legacyUrl, ...carrier } = ordered[0];
+	const hash8 = summary.commitHash.substring(0, 8);
+	const aggregated: AggregatedSkillRef = {
+		...carrier,
+		archivedKey: skillsAggregateKey(hash8),
+		aggregatedSkills: ordered,
+	};
+	return [aggregated];
+}
+
+/** The set an aggregate carries, or the lone ref itself when a caller hands over a plain one. */
+function aggregatedSkillsOf(ref: SkillCommitRef): ReadonlyArray<SkillCommitRef> {
+	const carried = (ref as AggregatedSkillRef).aggregatedSkills;
+	return Array.isArray(carried) && carried.length > 0 ? carried : [ref];
+}
+
+/**
+ * `skill` — agent-skill usage recorded on a commit, and the odd one out in three ways:
+ *
+ *  - it publishes ONE article for many items (see `aggregate`), because that is what
+ *    every local surface already shows;
+ *  - therefore its published id/URL live on the COMMIT (`docScope: "summary"`), not
+ *    on any item — see `ContextKindDocState` for what went wrong when they rode on a
+ *    representative ref;
+ *  - and it does not dedupe across commits (see `baseKey`).
  */
 const skillDefinition: ContextKindDefinition<SkillCommitRef> = {
 	docType: "skill",
 	field: "skills",
-	// The per-commit archive id `<source>:<skill>-<shortHash>`.
+	// `archivedKey`, which on the pushed item is the aggregate's own commit-level
+	// `skills--<hash8>` (see `aggregateSkillRefs`), never a single skill's archive id.
 	entryKey: "archivedKey",
-	// **Per-commit identity, unlike every other kind.** `archivedKey` carries the
-	// archiving commit's hash, so this is `entryKey` — i.e. one Space article per
-	// (skill, commit) rather than one per skill.
+	// **Per-commit identity, unlike every other kind** — equal to `entryKey`, so the
+	// article belongs to one commit and is never shared with another.
 	//
 	// It used to be the registry mapKey `<source>:<skill>`, which collapsed a skill
 	// used across many commits into ONE article. That could only ever report
@@ -160,14 +234,20 @@ const skillDefinition: ContextKindDefinition<SkillCommitRef> = {
 	// A skill is not a plan or a reference: those are one artifact revised over time,
 	// so collapsing revisions is right. A skill record is a MEASUREMENT of one
 	// commit's work, and measurements from different commits are different facts, not
-	// revisions of one. `buildSkillPushTitle` appends the commit's `hash8` so the
-	// per-commit articles are distinguishable in a flat branch folder.
+	// revisions of one. `buildSkillsPushTitle` names the article by the commit's
+	// `hash8` so the per-commit articles are distinguishable in a flat branch folder.
 	baseKey: { fields: ["archivedKey"] },
 	// Only reached now for the one case where the SAME archivedKey appears on two
 	// summaries: a squash root carries its children's hoisted refs and keeps the
 	// children, so a ref can be met from both ends (see `mergeSkillRefs`). Newest
 	// `lastUsedAt` wins, which keeps that collapsing to a single article.
 	recency: "lastUsedAt",
+	// **The published id/URL belong to the COMMIT, not to a skill.** The names are
+	// overridden because the summary-scope defaults would be `jolliDocId`/`jolliDocUrl`
+	// — the memory article's own fields — and taking them would overwrite it.
+	docScope: "summary",
+	docIdField: "jolliSkillsDocId",
+	docUrlField: "jolliSkillsDocUrl",
 	// Auto-extracted context, exactly like `reference`: a skill record is captured
 	// from a transcript, never attached by the user. So a failed skill push must not
 	// abort a strict live share — without this, one transient failure would throw
@@ -178,12 +258,16 @@ const skillDefinition: ContextKindDefinition<SkillCommitRef> = {
 	// aggregate row (see SummaryMarkdownBuilder), so there is no site in the summary
 	// body for a per-skill URL — and therefore no placeholder to mint in a batch push.
 	linksInMarkdown: false,
-	title: (ref, summary) => buildSkillPushTitle(ref, summary),
+	// The ONLY kind that publishes one article for many items — see
+	// `aggregateSkillRefs`, and `docScope` above for where its id then lives.
+	aggregate: aggregateSkillRefs,
+	// Named for the commit, not for a skill: the article covers all of them.
+	title: (_ref, summary) => buildSkillsPushTitle(summary),
 	// The only kind whose body needs no storage read: every figure it prints is on
-	// the ref itself. It used to read the orphan-branch snapshot for the CUMULATIVE
-	// counters and the verbatim invocation list, both of which are gone (see
-	// `buildSkillPushMarkdown`). Still `async` because the contract is.
-	body: async (ref) => buildSkillPushMarkdown(ref),
+	// the refs themselves. It used to read the orphan-branch snapshot for the
+	// CUMULATIVE counters and the verbatim invocation list, both of which are gone
+	// (see `buildSkillsPushMarkdown`). Still `async` because the contract is.
+	body: async (ref) => buildSkillsPushMarkdown(aggregatedSkillsOf(ref)),
 };
 
 /** Cross-commit dedup key for a reference: its stable `<source>:<nativeId>` (Reference.mapKey). */

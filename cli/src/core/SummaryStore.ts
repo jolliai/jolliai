@@ -540,6 +540,13 @@ async function migrateOneToOneLocked(
 		...(oldSummary.ticketId && { ticketId: oldSummary.ticketId }),
 		...(oldSummary.jolliDocId && { jolliDocId: oldSummary.jolliDocId }),
 		...(docUrl && { jolliDocUrl: docUrl }),
+		// Skill-usage article — Copy-Hoist beside `skills` below, and for the same
+		// reason the memory article's id is copied: a 1:1 migration carries the SAME
+		// refs onto the new hash, so the article's content is unchanged and the next
+		// push must update it in place. Dropping the id would publish a duplicate and
+		// leave the original stranded under a hash the branch no longer has.
+		...(oldSummary.jolliSkillsDocId && { jolliSkillsDocId: oldSummary.jolliSkillsDocId }),
+		...(oldSummary.jolliSkillsDocUrl && { jolliSkillsDocUrl: oldSummary.jolliSkillsDocUrl }),
 		...(oldSummary.orphanedDocIds && { orphanedDocIds: oldSummary.orphanedDocIds }),
 		...(oldSummary.unresolvedOrphanHashes && { unresolvedOrphanHashes: oldSummary.unresolvedOrphanHashes }),
 		...(oldSummary.plans && { plans: oldSummary.plans }),
@@ -774,7 +781,18 @@ export interface NewlyAssociatedRefs {
 
 /** Returns a deep copy of the summary tree with Jolli metadata stripped from all nodes. */
 function stripJolliMetadata(node: CommitSummary): CommitSummary {
-	const { jolliDocId: _d, jolliDocUrl: _u, orphanedDocIds: _o, unresolvedOrphanHashes: _h, ...rest } = node;
+	const {
+		jolliDocId: _d,
+		jolliDocUrl: _u,
+		// Stripped alongside them: the merge above has already adopted one child's
+		// skill-usage article and orphaned the rest, so leaving an id on a retained
+		// child would make a later squash re-report an article that is gone.
+		jolliSkillsDocId: _sd,
+		jolliSkillsDocUrl: _su,
+		orphanedDocIds: _o,
+		unresolvedOrphanHashes: _h,
+		...rest
+	} = node;
 	if (!rest.children) return rest as CommitSummary;
 	return { ...rest, children: rest.children.map(stripJolliMetadata) } as CommitSummary;
 }
@@ -832,6 +850,90 @@ export function collectChildJolliMeta(nodes: ReadonlyArray<CommitSummary>): Joll
 	const winner = candidates[0];
 	const orphanedDocIds = candidates.slice(1).map((c) => c.jolliDocId);
 	return { winner, orphanedDocIds };
+}
+
+/**
+ * The squash counterpart of {@link collectChildJolliMeta} for the per-commit
+ * SKILL-USAGE article (`CommitSummary.jolliSkillsDocId`).
+ *
+ * **Same rule, deliberately: newest child wins, the rest are orphaned.** A squash
+ * root's skill table is the FOLD of its children's, so no child's article is still
+ * the same document — but exactly one of them can be updated in place instead of
+ * being deleted and replaced, which is both fewer round-trips and one less way to
+ * fail: `cleanupOrphanedDocs` is best-effort, and until a failed delete is retried,
+ * a mint-a-new-one policy leaves N stale articles beside the new one rather than
+ * N-1 beside the live one.
+ *
+ * Adopting the winner also keeps this identical to how the memory article itself
+ * behaves across a squash, which is what makes the two comprehensible together — a
+ * reader does not have to learn a second rule for the sibling document. The winner
+ * is picked by `getDisplayDate` for the same reason, so in practice both ids come
+ * from the same child.
+ *
+ * Recurses like its sibling, so a grandchild's article is not stranded by a squash
+ * of squashes.
+ */
+export function collectChildSkillsDocMeta(nodes: ReadonlyArray<CommitSummary>): {
+	winner: { jolliSkillsDocId: number; jolliSkillsDocUrl: string } | null;
+	orphanedDocIds: number[];
+} {
+	const { winner, orphanedDocIds } = collectDatedChildSkillsDocMeta(nodes);
+	// Dates dropped only HERE, at the outermost call: they exist to be compared,
+	// and the caller stores none of them.
+	return {
+		winner: winner && { jolliSkillsDocId: winner.jolliSkillsDocId, jolliSkillsDocUrl: winner.jolliSkillsDocUrl },
+		orphanedDocIds,
+	};
+}
+
+/** One skill-article candidate, carrying the dates the competition is decided on. */
+interface DatedSkillsDocMeta {
+	readonly jolliSkillsDocId: number;
+	readonly jolliSkillsDocUrl: string;
+	readonly commitDate: string;
+	readonly generatedAt: string;
+}
+
+/**
+ * The recursion behind {@link collectChildSkillsDocMeta}, kept separate for one
+ * reason: a winner must travel with ITS OWN dates.
+ *
+ * This mirrors `JolliMetaHoistResult.winner`, which carries them for exactly the
+ * same purpose, and the mirroring is the point — the two helpers claim to apply
+ * one rule, so a difference here is a difference in which document gets updated
+ * in place. Re-stamping an inner winner with the parent node's dates (which this
+ * used to do, having no dates to pass up) diverges in two ways at once: a
+ * grandchild that won on a fresh `generatedAt` re-enters the outer round wearing
+ * its parent's older date and loses to a sibling it should beat, and a node that
+ * holds an article AND has children produces two candidates with identical dates,
+ * where the stable sort silently prefers the shallower one.
+ */
+function collectDatedChildSkillsDocMeta(nodes: ReadonlyArray<CommitSummary>): {
+	winner: DatedSkillsDocMeta | null;
+	orphanedDocIds: number[];
+} {
+	const candidates: DatedSkillsDocMeta[] = [];
+	for (const node of nodes) {
+		const url = node.jolliSkillsDocUrl;
+		if (node.jolliSkillsDocId && url) {
+			candidates.push({
+				jolliSkillsDocId: node.jolliSkillsDocId,
+				jolliSkillsDocUrl: url,
+				commitDate: node.commitDate,
+				generatedAt: node.generatedAt,
+			});
+		}
+		if (node.children) {
+			// The deeper merge already orphaned its own losers; only its winner
+			// competes here, with the dates that won it that round.
+			const inner = collectDatedChildSkillsDocMeta(node.children);
+			if (inner.winner) candidates.push(inner.winner);
+		}
+	}
+	if (candidates.length === 0) return { winner: null, orphanedDocIds: [] };
+	candidates.sort((a, b) => new Date(getDisplayDate(b)).getTime() - new Date(getDisplayDate(a)).getTime());
+	const [winner, ...losers] = candidates;
+	return { winner, orphanedDocIds: losers.map((c) => c.jolliSkillsDocId) };
 }
 
 /**
@@ -1260,9 +1362,20 @@ async function mergeManyToOneLocked(
 	// off the persisted refs so a re-squash cannot re-report them.
 	const hoistedSkills = foldedSkills.map(stripSupersededDocIds);
 	const jolliMeta = collectChildJolliMeta(children);
+	// The commit's skill-usage article follows the same newest-wins rule as the memory
+	// article — see `collectChildSkillsDocMeta`. Losers join the same orphan list.
+	const skillsDocMeta = collectChildSkillsDocMeta(children);
 	const inheritedOrphanIds = children.flatMap((c) => c.orphanedDocIds ?? []);
+	// LEGACY: ids left on refs from when a skill article was one document per (skill,
+	// commit). Nothing writes them any more (the id lives on the summary), but stored
+	// summaries still carry them and they must still be cleaned up.
 	const supersededSkillDocIds = foldedSkills.flatMap((s) => s.supersededDocIds ?? []);
-	const allOrphanedDocIds = [...jolliMeta.orphanedDocIds, ...inheritedOrphanIds, ...supersededSkillDocIds];
+	const allOrphanedDocIds = [
+		...jolliMeta.orphanedDocIds,
+		...skillsDocMeta.orphanedDocIds,
+		...inheritedOrphanIds,
+		...supersededSkillDocIds,
+	];
 
 	// Children without jolliDocId may have been pushed to Space by a
 	// concurrent pre-push sync that hasn't written back the docId yet (race).
@@ -1331,6 +1444,7 @@ async function mergeManyToOneLocked(
 			jolliDocId: jolliMeta.winner.jolliDocId,
 			jolliDocUrl: jolliMeta.winner.jolliDocUrl,
 		}),
+		...(skillsDocMeta.winner && skillsDocMeta.winner),
 		...(allOrphanedDocIds.length > 0 && { orphanedDocIds: allOrphanedDocIds }),
 		...(unresolvedOrphanHashes.length > 0 && { unresolvedOrphanHashes }),
 		topics: consolidatedTopics,

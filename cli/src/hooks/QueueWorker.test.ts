@@ -19,6 +19,19 @@ vi.mock("../core/RepoProfile.js", () => ({
 	// Pre-cutover default: no fence (plain fn — survives mock resets).
 	readCutoverFence: async () => null,
 	readManualDisableFlag: vi.fn().mockResolvedValue(false),
+	// The drain's opportunistic auto-cutover reads the attempt stamp and writes
+	// it back. Stubbed as "never attempted" so the throttle is not what stops it
+	// — the pinned `uncutover` route below is, via `runCutover`'s own checks.
+	readRepoProfile: async () => ({}),
+	updateRepoProfile: async () => {},
+}));
+
+// The drain's opportunistic auto-cutover. Stubbed so the tests never reach the
+// real compare (git + the machine database), and so its call ORDER relative to
+// the ingest phase is observable — see "lands the cutover fence only after the
+// ingest phase".
+vi.mock("../dashboard/AutoCutover.js", () => ({
+	maybeAutoCutover: vi.fn().mockResolvedValue("skipped"),
 }));
 
 // The worker's Node-floor gate consults the cutover route at its entrance;
@@ -593,6 +606,7 @@ import { storeSummary, withRequiredOrphanWriteLock } from "../core/SummaryStore.
 import { associateSkillsWithCommit } from "../core/skills/SkillArchive.js";
 import { renderTopicKBWiki } from "../core/TopicWikiRenderer.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
+import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { recordCommitsFromWorker } from "../dashboard/ProducerHooks.js";
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { recordPendingIngest, wakePendingIngest } from "../sync/PendingIngest.js";
@@ -1076,6 +1090,40 @@ describe("QueueWorker", () => {
 			await runWorker("/test/cwd");
 
 			expect(recordCommitsFromWorker).not.toHaveBeenCalled();
+		});
+
+		it("lands the cutover fence only after the ingest phase, not before it", async () => {
+			// `storage` is resolved once at the top of the run, while the repo is still
+			// `uncutover` — a provider whose system of record is the orphan branch.
+			// Fencing the branch first leaves the ingest below writing through that
+			// stale provider, and `OrphanBranchStorage.writeFiles` re-reads the fence
+			// and throws: the ingest's LLM work is discarded as "non-fatal" and its
+			// queue entries survive for a redo.
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-test" } as never);
+			const order: string[] = [];
+			vi.mocked(drainIngest).mockImplementation(async () => {
+				order.push("drainIngest");
+				return { batches: 1, ingested: 1, outcome: "OK", topicFailures: [] };
+			});
+			vi.mocked(maybeAutoCutover).mockImplementation(async () => {
+				order.push("maybeAutoCutover");
+				return "skipped";
+			});
+
+			const ingestEntry = {
+				op: { type: "ingest", triggeredBy: "post-commit", createdAt: "2026-04-01T12:00:00.000Z" },
+				filePath: "/tmp/queue/ingest.json",
+			};
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op: makeCommitOp(), filePath: "/tmp/queue/entry.json" }])
+				// Everything after the drain: the chain-spawn check (ingest-only, so it
+				// spawns nothing), the ingest pre-check and the re-read under ingest.lock.
+				.mockResolvedValue([ingestEntry] as never);
+			setupPipelineMocks();
+
+			await runWorker("/test/cwd");
+
+			expect(order).toEqual(["drainIngest", "maybeAutoCutover"]);
 		});
 	});
 

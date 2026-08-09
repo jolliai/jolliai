@@ -14,15 +14,18 @@
  * Envelope verified against a live `~/.local/share/devin/cli/sessions.db`
  * install: `content` is always a plain string (assistant turns that are pure
  * tool calls carry `content: ""`, which the empty-content skip already
- * handles), and `metadata.created_at` is an ISO 8601 string. Other fields the
- * live rows carry (`tool_calls`, `thinking`, `tool_call_id`, `telemetry`,
- * `extensions`, …) are ignored — only `role`/`content`/`metadata.created_at`
- * are read here.
+ * handles), and `metadata.created_at` is an ISO 8601 string. Beyond
+ * `role`/`content`/`metadata.created_at`, one more live field is read:
+ * `tool_calls`, counted into `TranscriptReadResult.toolUse` (see
+ * {@link tallyDevinToolCalls}) — which is the only record left of a pure
+ * tool-call turn, since the empty-content skip drops the turn itself. The rest
+ * (`thinking`, `tool_call_id`, `telemetry`, `extensions`, …) are ignored.
  */
 
 import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
 import { withSqliteDb } from "./SqliteHelpers.js";
+import { builtinTool, ToolUseTally } from "./ToolNameClassify.js";
 import { mergeConsecutiveEntries } from "./TranscriptReader.js";
 
 const log = createLogger("DevinReader");
@@ -37,6 +40,35 @@ interface ChatMessage {
 	readonly role?: string;
 	readonly content?: unknown;
 	readonly metadata?: { readonly created_at?: unknown } | null;
+	readonly tool_calls?: unknown;
+}
+
+/**
+ * Counts one node's `tool_calls` into `tally`.
+ *
+ * Devin's `chat_message` is an OpenAI chat-completions message — the live rows
+ * carry `tool_calls` alongside `tool_call_id`, which is that API's pairing field
+ * and is what fixes the envelope: an entry is
+ * `{id, type:"function", function:{name, arguments}}`. A bare `{name}` is
+ * accepted too so a schema that flattens the wrapper still counts rather than
+ * silently reporting zero.
+ *
+ * Names are bare (`exec` and friends) with no prefix or server field, so every
+ * call is a builtin; nothing here guesses at an MCP shape Devin has not been
+ * observed writing. De-duplication is on the entry's own `id` — an assistant
+ * turn that is pure tool calls carries `content: ""` and is dropped from the
+ * conversation by the empty-content skip, so these counts are the only place
+ * that activity survives.
+ */
+function tallyDevinToolCalls(tally: ToolUseTally, msg: ChatMessage): void {
+	if (!Array.isArray(msg.tool_calls)) return;
+	for (const raw of msg.tool_calls) {
+		if (raw === null || typeof raw !== "object") continue;
+		const tc = raw as { id?: unknown; name?: unknown; function?: { name?: unknown } };
+		const name = typeof tc.function?.name === "string" ? tc.function.name : tc.name;
+		if (typeof name !== "string" || name.length === 0) continue;
+		tally.addOnce(typeof tc.id === "string" ? tc.id : undefined, builtinTool(name));
+	}
 }
 
 const ROLE_MAP: Readonly<Record<string, "human" | "assistant">> = {
@@ -155,6 +187,7 @@ export async function readDevinTranscript(
 ): Promise<TranscriptReadResult> {
 	const { dbPath, sessionId } = parseSyntheticPath(transcriptPath);
 	const cutoffTime = beforeTimestamp ? Date.parse(beforeTimestamp) : undefined;
+	const tally = new ToolUseTally();
 
 	try {
 		const { rawEntries, totalNodes, startIndex, lastConsumedIndex, anchorId } = await withSqliteDb(dbPath, (db) => {
@@ -212,6 +245,7 @@ export async function readDevinTranscript(
 				if (role !== undefined && content.length > 0) {
 					rawEntries.push({ role, content, timestamp });
 				}
+				tallyDevinToolCalls(tally, msg);
 				lastConsumedIndex = startIndex + i + 1;
 			}
 
@@ -239,7 +273,8 @@ export async function readDevinTranscript(
 			startIndex,
 			newCursor.lineNumber,
 		);
-		return { entries, newCursor, totalLinesRead };
+		// Always present, even when empty — see TOOL_RECORDING_SOURCES.
+		return { entries, newCursor, totalLinesRead, toolUse: tally.values() };
 	} catch (error: unknown) {
 		log.error("Failed to read Devin session %s: %s", sessionId, (error as Error).message);
 		// Preserve an ENOENT code so callers (e.g. TranscriptLoader) can treat a
