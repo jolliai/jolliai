@@ -73,6 +73,15 @@ object TelemetryEvents {
             "memory_shared" to "User invoked Share for a branch's memories (read-only share link). Props: none.",
             "key_rejected" to "The server rejected the API key (401/403). Props: retried, where.",
             "reauth_completed" to "Re-authentication after a rejected key finished. Props: outcome.",
+            // ── local web dashboard UI (web-local surface) ──
+            "dashboard_opened" to
+                "The local web dashboard was opened in a browser (surface web-local). " +
+                "Props: first_run (bool — first open on this install).",
+            "range_changed" to
+                "The dashboard time-range control was changed. Props: range (discriminator: 7d/30d/90d/custom).",
+            "chart_split_changed" to
+                "A dashboard card's split-by control was changed. " +
+                "Props: card (discriminator: tokens/spend/mcp), split (discriminator).",
         )
 
     /** `object_action`: lowercase snake_case with at least two words. */

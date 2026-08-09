@@ -11,6 +11,14 @@ vi.mock("./DashboardDb.js", async (importOriginal) => {
 	const original = await importOriginal<typeof import("./DashboardDb.js")>();
 	return { ...original, canUseDashboardDb: vi.fn(() => true) };
 });
+// Keep the real telemetry lifecycle (fs reads, timers) out of these tests; its
+// own behaviour is covered by ServerTelemetry.test.ts. Here we only assert the
+// wiring: it is started at boot and stopped on shutdown.
+const { telemetryStop, startServerTelemetrySpy } = vi.hoisted(() => {
+	const stop = vi.fn(async () => {});
+	return { telemetryStop: stop, startServerTelemetrySpy: vi.fn(async () => ({ stop })) };
+});
+vi.mock("./ServerTelemetry.js", () => ({ startServerTelemetry: startServerTelemetrySpy }));
 
 import { canUseDashboardDb } from "./DashboardDb.js";
 import { clearDashboardState, startDashboardServer } from "./DashboardServer.js";
@@ -26,6 +34,8 @@ beforeEach(() => {
 		server: { closeAllConnections: vi.fn(), close: vi.fn() } as never,
 		port: 1818,
 	});
+	// clearMocks wipes implementations too — re-arm the telemetry handle.
+	startServerTelemetrySpy.mockResolvedValue({ stop: telemetryStop });
 });
 
 afterEach(() => {
@@ -76,6 +86,17 @@ describe("runServerEntry", () => {
 		options.onIdleShutdown?.();
 		await new Promise((resolve) => setImmediate(resolve));
 		expect(clearDashboardState).toHaveBeenCalled();
+		expect(exit).toHaveBeenCalledWith(0);
+	});
+
+	it("primes telemetry at boot and stops it on shutdown (before exit)", async () => {
+		const exit = vi.fn();
+		const { shutdown } = await runServerEntry({}, exit);
+		expect(startServerTelemetrySpy).toHaveBeenCalledTimes(1);
+		expect(telemetryStop).not.toHaveBeenCalled();
+		shutdown();
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(telemetryStop).toHaveBeenCalledTimes(1);
 		expect(exit).toHaveBeenCalledWith(0);
 	});
 });

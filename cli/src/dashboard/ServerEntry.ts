@@ -15,6 +15,7 @@
 import { createLogger, errMsg } from "../Logger.js";
 import { canUseDashboardDb, DashboardRuntimeError } from "./DashboardDb.js";
 import { clearDashboardState, startDashboardServer } from "./DashboardServer.js";
+import { startServerTelemetry } from "./ServerTelemetry.js";
 
 const log = createLogger("DashboardServerEntry");
 
@@ -41,20 +42,30 @@ export async function runServerEntry(
 	}
 	const portRaw = env[DASHBOARD_PORT_ENV];
 	const port = portRaw !== undefined ? Number.parseInt(portRaw, 10) : undefined;
+	// Prime telemetry for this long-lived process and start its periodic flush,
+	// so the `/api/telemetry` beacon's `web-local` events are actually recorded
+	// and shipped (see ServerTelemetry). Best-effort; never blocks serving.
+	const telemetry = await startServerTelemetry();
 	// Both teardown paths clear the state file guarded by our own pid: if the
 	// record has moved on to another server, it is that server's now and deleting
-	// it would leave a live dashboard no launcher can find.
+	// it would leave a live dashboard no launcher can find. The final telemetry
+	// flush runs first so a clean shutdown ships what the last interval did not.
+	const finish = async (): Promise<void> => {
+		await telemetry.stop();
+		await clearOwnState();
+		exit(0);
+	};
 	const clearOwnState = () => clearDashboardState(undefined, process.pid);
 	const { server } = await startDashboardServer({
 		...(port !== undefined && Number.isFinite(port) ? { port } : {}),
 		onIdleShutdown: () => {
-			void clearOwnState().finally(() => exit(0));
+			void finish();
 		},
 	});
 	const shutdown = () => {
 		server.closeAllConnections();
 		server.close();
-		void clearOwnState().finally(() => exit(0));
+		void finish();
 	};
 	process.on("SIGINT", shutdown);
 	process.on("SIGTERM", shutdown);

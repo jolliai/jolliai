@@ -184,6 +184,8 @@ window.JD = window.JD || {};
 			(item.child ? " child" : "") +
 			'" data-nav-path="' +
 			item.path +
+			'" data-nav-view="' +
+			(item.view || "") +
 			'"' +
 			(active ? ' aria-current="page"' : "") +
 			(disabled ? ' aria-disabled="true" title="Available once a repository is enabled"' : "") +
@@ -310,6 +312,7 @@ window.JD = window.JD || {};
 				return;
 			}
 			button.onclick = () => {
+				JD.track("range_changed", { range: value });
 				window.location.href = JD.viewPath(model.view) + JD.query(model, { range: value });
 			};
 		});
@@ -318,6 +321,7 @@ window.JD = window.JD || {};
 			custom.onsubmit = (event) => {
 				event.preventDefault();
 				if (!selectedFrom || !selectedTo) return;
+				JD.track("range_changed", { range: "custom" });
 				window.location.href =
 					JD.viewPath(model.view) +
 					JD.query(model, { range: "custom", from: selectedFrom, to: selectedTo });
@@ -353,7 +357,9 @@ window.JD = window.JD || {};
 		Array.prototype.forEach.call(document.querySelectorAll("#sbNav .sb-item, #sbBottom .sb-item"), (button) => {
 			if (button.getAttribute("aria-disabled") === "true") return;
 			var path = button.getAttribute("data-nav-path");
+			var navView = button.getAttribute("data-nav-view");
 			button.onclick = () => {
+				if (navView && navView !== model.view) JD.track("view_switched", { view: navView });
 				window.location.href = path + JD.query(model, { range: undefined, repo: undefined });
 			};
 		});
@@ -522,6 +528,33 @@ window.JD = window.JD || {};
 	 * page that needs it — see `DashboardServer.ts`'s module header for why the
 	 * header carries it and a query string never does.
 	 */
+	/**
+	 * Fire-and-forget UI telemetry beacon → POST /api/telemetry (the server
+	 * stamps it with the `web-local` surface). Content-free: pass only bucketed
+	 * values and fixed discriminators, never raw counts or user text. Prefers
+	 * `navigator.sendBeacon` so the event survives the full-page navigation a
+	 * nav/range click triggers, falling back to keepalive fetch. Never throws,
+	 * and needs no token — the endpoint sits ahead of the mutation-token gate
+	 * (see DashboardServer.handleTelemetry).
+	 */
+	JD.track = (event, properties) => {
+		try {
+			var body = JSON.stringify({ event: event, properties: properties || {} });
+			if (navigator.sendBeacon) {
+				navigator.sendBeacon("/api/telemetry", new Blob([body], { type: "application/json" }));
+				return;
+			}
+			fetch("/api/telemetry", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: body,
+				keepalive: true,
+			}).catch(function () {});
+		} catch (e) {
+			/* telemetry must never break the UI */
+		}
+	};
+
 	JD.post = (path, body) =>
 		fetch(path, {
 			method: "POST",

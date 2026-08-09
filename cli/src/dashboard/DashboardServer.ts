@@ -69,6 +69,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
 import { getProjectRootDir, listReachableCommits } from "../core/GitOps.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
+import { trackAs } from "../core/Telemetry.js";
+import { isTelemetryEventName } from "../core/TelemetryEvents.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
 import { projectRepoRegistryState } from "./Backfill.js";
@@ -433,6 +435,14 @@ function sendText(res: ServerResponse, status: number, text: string): void {
 const TOKEN_HEADER = "x-jolli-dashboard-token";
 
 /**
+ * Surface stamped on telemetry forwarded from the local web view. Distinct from
+ * the hosting process's own `cli` surface (see `trackAs`) and from the future
+ * hosted `web` frontend. Must be in the backend's `SURFACES` allowlist or the
+ * event is dropped at ingest.
+ */
+const WEB_LOCAL_SURFACE = "web-local";
+
+/**
  * Constant-time token check. A length mismatch is checked first (bailing out
  * before `timingSafeEqual`, which throws on unequal-length buffers) — that
  * branch leaks only the token's length, which is fixed and public (every
@@ -467,6 +477,35 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 	}
 	const raw = Buffer.concat(chunks).toString("utf-8");
 	return raw ? JSON.parse(raw) : {};
+}
+
+/**
+ * The `/api/telemetry` beacon. Forwards ONE content-free, already-bucketed event
+ * from the local web view into the shared telemetry buffer, stamped `web-local`.
+ *
+ * Fire-and-forget by contract: any bad input — an unreadable/oversized body, a
+ * non-object payload, or an unregistered event name — is dropped and answered
+ * 204, so a browser beacon is never taught to retry. Property scrubbing and the
+ * opt-out/uninitialized no-op both live in `trackAs`, so this handler only has
+ * to validate the event NAME (the one thing the registry gates on).
+ */
+async function handleTelemetry(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	try {
+		const body = await readJsonBody(req);
+		if (typeof body === "object" && body !== null) {
+			const b = body as Record<string, unknown>;
+			const event = typeof b.event === "string" ? b.event : "";
+			const properties =
+				typeof b.properties === "object" && b.properties !== null
+					? (b.properties as Record<string, unknown>)
+					: {};
+			if (isTelemetryEventName(event)) trackAs(WEB_LOCAL_SURFACE, event, properties);
+		}
+	} catch {
+		// Unreadable / oversized body, or a socket error — drop silently. The
+		// payload is content-free and a beacon must never learn to retry.
+	}
+	res.writeHead(204).end();
 }
 
 function parseScope(url: URL): DashboardScope {
@@ -621,6 +660,17 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		res.setHeader("X-Frame-Options", "DENY");
 		res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
 
+		// The telemetry beacon is deliberately handled BEFORE `handlePost`'s
+		// mutation-token gate. The token is inlined only into the write-surface
+		// pages (Repositories/Settings), so a token-gated beacon would silently
+		// drop every event fired from the stats/memories pages. It is safe to
+		// leave ungated: the host-allowlist + Origin + `frame-ancestors` checks
+		// above already reject cross-site callers, and the payload is content-free
+		// and non-mutating. `handleTelemetry` never rejects a beacon (always 204).
+		if (req.method === "POST" && url.pathname === "/api/telemetry") {
+			await handleTelemetry(req, res);
+			return;
+		}
 		if (req.method === "POST") {
 			await handlePost(req, res, url);
 			return;

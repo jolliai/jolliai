@@ -20,5 +20,18 @@
 	if (model) {
 		render(model);
 		window.JD.startRefresh(render);
+		/* Fire once per browser SESSION — nav is a full page reload, so a naive
+		   call would re-fire on every page. `first_run` is the first-ever open in
+		   this browser profile: a content-free proxy for a fresh install. */
+		try {
+			if (window.JD.track && !sessionStorage.getItem("jdOpened")) {
+				sessionStorage.setItem("jdOpened", "1");
+				var everOpened = !!localStorage.getItem("jdEverOpened");
+				localStorage.setItem("jdEverOpened", "1");
+				window.JD.track("dashboard_opened", { first_run: !everOpened });
+			}
+		} catch (e) {
+			/* storage blocked (private mode) — skip; telemetry never breaks boot */
+		}
 	}
 })();

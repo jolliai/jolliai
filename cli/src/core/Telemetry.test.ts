@@ -12,6 +12,7 @@ import {
 	scrubProperties,
 	shutdownTelemetry,
 	track,
+	trackAs,
 	trackError,
 } from "./Telemetry.js";
 import { readTelemetryEvents } from "./TelemetryBuffer.js";
@@ -274,5 +275,51 @@ describe("trackError (JOLLI-1961)", () => {
 		trackError("sync", "conflict", { retryable: false });
 		const [e] = await readTelemetryEvents(cwd);
 		expect(e.properties).toEqual({ where: "sync", code: "conflict", retryable: false });
+	});
+});
+
+describe("trackAs", () => {
+	const init = () => initTelemetry({ cwd, installId: "install-1", origin: "https://acme.jolli.ai", config: {} });
+
+	it("stamps the overridden surface while keeping every other envelope field", async () => {
+		init();
+		trackAs("web-local", "range_changed", { range: "30d" });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e).toMatchObject({
+			eventName: "range_changed",
+			surface: "web-local", // overridden — the process itself is `cli`
+			installId: "install-1",
+			env: "prod",
+			accountId: null,
+			properties: { range: "30d" },
+		});
+	});
+
+	it("does not disturb the process's own surface — a following track() is still cli", async () => {
+		init();
+		trackAs("web-local", "dashboard_opened", { first_run: true });
+		track("search_performed");
+		const [webEvent, cliEvent] = await readTelemetryEvents(cwd);
+		expect(webEvent.surface).toBe("web-local");
+		expect(cliEvent.surface).toBe("cli");
+	});
+
+	it("is a no-op before initialization", async () => {
+		trackAs("web-local", "dashboard_opened");
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
+	});
+
+	it("does not emit when consent is off", async () => {
+		initTelemetry({ cwd, installId: "install-1", origin: "https://acme.jolli.ai", config: { telemetry: "off" } });
+		trackAs("web-local", "dashboard_opened");
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
+	});
+
+	it("scrubs properties like track() does", async () => {
+		init();
+		trackAs("web-local", "chart_split_changed", { card: "tokens", split: "model", token: "sk-secret" });
+		const [e] = await readTelemetryEvents(cwd);
+		// The always-drop `token` key is gone; the safe discriminators survive.
+		expect(e.properties).toEqual({ card: "tokens", split: "model" });
 	});
 });

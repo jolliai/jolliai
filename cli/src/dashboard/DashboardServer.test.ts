@@ -49,6 +49,8 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 
 import { unlink } from "node:fs/promises";
 import * as gitOps from "../core/GitOps.js";
+import { initTelemetry, shutdownTelemetry } from "../core/Telemetry.js";
+import { readTelemetryEvents } from "../core/TelemetryBuffer.js";
 import * as installer from "../install/Installer.js";
 import { withDashboardDb } from "./DashboardDb.js";
 import type { DashboardModel, DashboardScope, DashboardView } from "./DashboardModel.js";
@@ -1281,5 +1283,67 @@ describe("Decisions card gist (Stats view only)", () => {
 
 		expect(res.status).toBe(200);
 		expect(mockGetDecisionGist).not.toHaveBeenCalled();
+	});
+});
+
+describe("telemetry beacon", () => {
+	// The endpoint sits BEFORE the mutation-token gate on purpose (the token is
+	// inlined only into the write-surface pages), so it must accept a tokenless
+	// POST — the exact opposite of every /api/repos/* route above.
+	async function post(port: number, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
+		return fetch(`http://127.0.0.1:${port}/api/telemetry`, {
+			method: "POST",
+			headers: { "content-type": "application/json", ...headers },
+			body: typeof body === "string" ? body : JSON.stringify(body),
+		});
+	}
+
+	afterEach(() => {
+		// The telemetry context is a module singleton — never leak it between tests.
+		shutdownTelemetry();
+	});
+
+	it("accepts a tokenless beacon (204) and forwards it stamped web-local", async () => {
+		initTelemetry({ cwd: dir, installId: "install-1", origin: "https://acme.jolli.ai", config: {}, env: {} });
+		const port = await listen(testServer());
+		const res = await post(port, { event: "dashboard_opened", properties: { first_run: true } });
+		expect(res.status).toBe(204);
+		const events = await readTelemetryEvents(dir);
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({
+			eventName: "dashboard_opened",
+			surface: "web-local",
+			properties: { first_run: true },
+		});
+	});
+
+	it("drops an unregistered event name but still answers 204", async () => {
+		initTelemetry({ cwd: dir, installId: "install-1", origin: "https://acme.jolli.ai", config: {}, env: {} });
+		const port = await listen(testServer());
+		const res = await post(port, { event: "totally_made_up_event", properties: {} });
+		expect(res.status).toBe(204);
+		expect(await readTelemetryEvents(dir)).toEqual([]);
+	});
+
+	it("answers 204 on a malformed body — a beacon is never taught to retry", async () => {
+		initTelemetry({ cwd: dir, installId: "install-1", origin: "https://acme.jolli.ai", config: {}, env: {} });
+		const port = await listen(testServer());
+		const res = await post(port, "}{ not json");
+		expect(res.status).toBe(204);
+		expect(await readTelemetryEvents(dir)).toEqual([]);
+	});
+
+	it("answers 204 for a valid event even when telemetry is opted out, buffering nothing", async () => {
+		initTelemetry({
+			cwd: dir,
+			installId: "install-1",
+			origin: "https://acme.jolli.ai",
+			config: { telemetry: "off" },
+			env: {},
+		});
+		const port = await listen(testServer());
+		const res = await post(port, { event: "range_changed", properties: { range: "7d" } });
+		expect(res.status).toBe(204);
+		expect(await readTelemetryEvents(dir)).toEqual([]);
 	});
 });

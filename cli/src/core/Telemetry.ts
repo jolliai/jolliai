@@ -104,6 +104,38 @@ export function getTelemetryContext(): Readonly<TelemetryContext> | null {
  * guard additionally drops any name that slips through an `as`-cast.
  */
 export function track(eventName: TelemetryEventName, properties: Readonly<Record<string, unknown>> = {}): void {
+	emit(eventName, properties, undefined);
+}
+
+/**
+ * Like {@link track}, but stamps an explicit `surface` instead of the process's
+ * own. The one caller is the local dashboard server's `/api/telemetry` beacon
+ * (see `DashboardServer.ts`): that process self-identifies as the `cli` surface,
+ * but the events it forwards describe user interactions in the local web view,
+ * which are the `web-local` surface. Every OTHER envelope field (installId,
+ * env, surfaceVersion, sessionId) still comes from the initialized context —
+ * only the surface dimension is overridden — so a browser click is attributed
+ * to `web-local` while the same process's own `command_invoked` stays `cli`.
+ *
+ * `surface` is not constrained to the client's own `parseSurface` output: it is
+ * whatever the caller knows the originating surface to be. The backend gates it
+ * against its own closed `SURFACES` allowlist, so an unknown value is dropped
+ * there rather than here.
+ */
+export function trackAs(
+	surface: string,
+	eventName: TelemetryEventName,
+	properties: Readonly<Record<string, unknown>> = {},
+): void {
+	emit(eventName, properties, surface);
+}
+
+/** Shared body of {@link track} / {@link trackAs}. No-op when uninitialized or opted out; never throws. */
+function emit(
+	eventName: TelemetryEventName,
+	properties: Readonly<Record<string, unknown>>,
+	surfaceOverride: string | undefined,
+): void {
 	const ctx = context;
 	if (!ctx || !ctx.enabled) return;
 	if (!isTelemetryEventName(eventName)) return;
@@ -115,7 +147,7 @@ export function track(eventName: TelemetryEventName, properties: Readonly<Record
 			// backend dedups on (event_id, ts) — see TelemetryEnvelope (JOLLI-1966).
 			eventId: randomUUID(),
 			eventName,
-			surface: ctx.surface,
+			surface: surfaceOverride ?? ctx.surface,
 			surfaceVersion: ctx.surfaceVersion,
 			installId: ctx.installId,
 			...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),

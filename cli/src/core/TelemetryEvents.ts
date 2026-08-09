@@ -78,6 +78,12 @@ export const TELEMETRY_EVENTS = {
 	memory_shared: "User invoked Share for a branch's memories (read-only share link). Props: none.",
 	key_rejected: "The server rejected the API key (401/403). Props: retried, where.",
 	reauth_completed: "Re-authentication after a rejected key finished. Props: outcome.",
+	// ── local web dashboard UI (web-local surface) ──
+	dashboard_opened:
+		"The local web dashboard was opened in a browser (surface web-local). Props: first_run (bool — first open on this install).",
+	range_changed: "The dashboard time-range control was changed. Props: range (discriminator: 7d/30d/90d/custom).",
+	chart_split_changed:
+		"A dashboard card's split-by control was changed. Props: card (discriminator: tokens/spend/mcp), split (discriminator).",
 } as const;
 
 /** Union of every registered event name. */
