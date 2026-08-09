@@ -47,6 +47,7 @@ import {
 	importDashboardHistory,
 	registerDashboardCommand,
 	releaseSpawnLock,
+	resolveServerCwd,
 } from "./DashboardCommand.js";
 
 let configDir: string;
@@ -588,5 +589,44 @@ describe("createDeferredWriter", () => {
 		const quiet = createDeferredWriter();
 		quiet.write("  never shown");
 		expect(log2).not.toHaveBeenCalled();
+	});
+});
+
+describe("resolveServerCwd", () => {
+	let tmp: string;
+	beforeEach(() => {
+		tmp = mkdtempSync(join(tmpdir(), "jolli-servercwd-"));
+	});
+	afterEach(() => {
+		rmSync(tmp, { recursive: true, force: true });
+	});
+
+	it("resolves to the git top level when the cwd is inside a repo", async () => {
+		const root = mkdtempSync(join(tmpdir(), "jolli-root-"));
+		try {
+			const resolved = await resolveServerCwd(tmp, async () => root);
+			expect(resolved).toBe(root);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("falls back to process.cwd() when --cwd does not exist", async () => {
+		const missing = join(tmp, "does-not-exist");
+		// base becomes process.cwd(); the injected getRoot echoes it back.
+		const resolved = await resolveServerCwd(missing, async (c) => c);
+		expect(resolved).toBe(process.cwd());
+	});
+
+	it("keeps the validated dir when it is not inside a git repo", async () => {
+		const resolved = await resolveServerCwd(tmp, async () => {
+			throw new Error("not a git repository");
+		});
+		expect(resolved).toBe(tmp);
+	});
+
+	it("ignores a git root that no longer exists", async () => {
+		const resolved = await resolveServerCwd(tmp, async () => join(tmp, "gone"));
+		expect(resolved).toBe(tmp);
 	});
 });

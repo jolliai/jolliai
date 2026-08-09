@@ -70,7 +70,7 @@ import { fileURLToPath, URL } from "node:url";
 import { getProjectRootDir, listReachableCommits } from "../core/GitOps.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import { trackAs } from "../core/Telemetry.js";
-import { isTelemetryEventName } from "../core/TelemetryEvents.js";
+import { isTelemetryEventName, type TelemetryEventName } from "../core/TelemetryEvents.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
 import { projectRepoRegistryState } from "./Backfill.js";
@@ -443,6 +443,21 @@ const TOKEN_HEADER = "x-jolli-dashboard-token";
 const WEB_LOCAL_SURFACE = "web-local";
 
 /**
+ * The only events the beacon may stamp `web-local`. The endpoint is reachable by
+ * any same-origin script — and, lacking an Origin header, by any local process —
+ * so gating on {@link isTelemetryEventName} alone would let a caller forge an
+ * unrelated registered event (e.g. `search_performed`) under this surface.
+ * Restricting to the four dashboard-UI events matches the documented contract:
+ * this endpoint forwards local-web-view interactions, nothing else.
+ */
+const WEB_LOCAL_EVENTS: ReadonlySet<TelemetryEventName> = new Set([
+	"dashboard_opened",
+	"dashboard_view_switched",
+	"range_changed",
+	"chart_split_changed",
+]);
+
+/**
  * Constant-time token check. A length mismatch is checked first (bailing out
  * before `timingSafeEqual`, which throws on unequal-length buffers) — that
  * branch leaks only the token's length, which is fixed and public (every
@@ -499,7 +514,8 @@ async function handleTelemetry(req: IncomingMessage, res: ServerResponse): Promi
 				typeof b.properties === "object" && b.properties !== null
 					? (b.properties as Record<string, unknown>)
 					: {};
-			if (isTelemetryEventName(event)) trackAs(WEB_LOCAL_SURFACE, event, properties);
+			if (isTelemetryEventName(event) && WEB_LOCAL_EVENTS.has(event))
+				trackAs(WEB_LOCAL_SURFACE, event, properties);
 		}
 	} catch {
 		// Unreadable / oversized body, or a socket error — drop silently. The

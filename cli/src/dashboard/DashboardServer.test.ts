@@ -1325,6 +1325,16 @@ describe("telemetry beacon", () => {
 		expect(await readTelemetryEvents(dir)).toEqual([]);
 	});
 
+	it("drops a registered event that is NOT a dashboard event (no forging via web-local)", async () => {
+		initTelemetry({ cwd: dir, installId: "install-1", origin: "https://acme.jolli.ai", config: {}, env: {} });
+		const port = await listen(testServer());
+		// `search_performed` is a real registered event, but not one the local web
+		// view emits — the beacon must refuse to stamp it web-local.
+		const res = await post(port, { event: "search_performed", properties: { hit: true } });
+		expect(res.status).toBe(204);
+		expect(await readTelemetryEvents(dir)).toEqual([]);
+	});
+
 	it("answers 204 on a malformed body — a beacon is never taught to retry", async () => {
 		initTelemetry({ cwd: dir, installId: "install-1", origin: "https://acme.jolli.ai", config: {}, env: {} });
 		const port = await listen(testServer());

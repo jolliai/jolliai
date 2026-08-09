@@ -312,11 +312,14 @@ window.JD = window.JD || {};
 				return;
 			}
 			button.onclick = () => {
-				/* Emit the user-facing label token (7d/30d/90d), not the internal
-				   DashboardRange token (week/month/3m), so the telemetry discriminator
-				   matches the registry doc and the button labels. `custom` is handled
-				   by its own branch above and reported as "custom" on Apply. */
-				JD.track("range_changed", { range: { week: "7d", month: "30d", "3m": "90d" }[value] || value });
+				/* Only a real change is a change: clicking the already-active range
+				   must not emit range_changed. Emit the user-facing label token
+				   (7d/30d/90d), not the internal DashboardRange token (week/month/3m),
+				   so the discriminator matches the registry doc and the button labels.
+				   `custom` is handled by its own branch above and reported on Apply. */
+				if (value !== activeRange) {
+					JD.track("range_changed", { range: { week: "7d", month: "30d", "3m": "90d" }[value] || value });
+				}
 				window.location.href = JD.viewPath(model.view) + JD.query(model, { range: value });
 			};
 		});

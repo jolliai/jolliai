@@ -979,7 +979,6 @@ window.JD = window.JD || {};
 		document.querySelectorAll(".chips .chip[data-dim]").forEach((chip) => {
 			chip.onclick = () => {
 				JD.dimension = chip.getAttribute("data-dim");
-				JD.track("chart_split_changed", { card: "spend", split: JD.dimension });
 				JD.refreshNow(JD.renderPage);
 			};
 		});
@@ -1007,8 +1006,8 @@ window.JD = window.JD || {};
 		document.querySelectorAll("[data-toksplit]").forEach((button) => {
 			button.onclick = () => {
 				var view = button.getAttribute("data-toksplit");
+				if (view !== (JD.tokSplitView || "type")) JD.track("chart_split_changed", { card: "tokens", split: view });
 				JD.tokSplitView = view;
-				JD.track("chart_split_changed", { card: "tokens", split: view });
 				var wantDim = view === "model" ? "model" : view === "repo" ? "project" : null;
 				if (wantDim && JD.dimension !== wantDim) {
 					JD.dimension = wantDim;
@@ -1025,8 +1024,9 @@ window.JD = window.JD || {};
 		   instead of rolled up — so this is pure view state, never a re-fetch. */
 		document.querySelectorAll("[data-mcpsplit]").forEach((button) => {
 			button.onclick = () => {
-				JD.mcpSplitView = button.getAttribute("data-mcpsplit");
-				JD.track("chart_split_changed", { card: "mcp", split: JD.mcpSplitView });
+				var value = button.getAttribute("data-mcpsplit");
+				if (value !== (JD.mcpSplitView || "server")) JD.track("chart_split_changed", { card: "mcp", split: value });
+				JD.mcpSplitView = value;
 				JD.renderPage(model);
 			};
 		});

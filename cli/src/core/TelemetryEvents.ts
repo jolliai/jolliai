@@ -80,12 +80,12 @@ export const TELEMETRY_EVENTS = {
 	reauth_completed: "Re-authentication after a rejected key finished. Props: outcome.",
 	// ── local web dashboard UI (web-local surface) ──
 	dashboard_opened:
-		"The local web dashboard was opened in a browser (surface web-local). Props: first_run (bool — first open on this install).",
+		"The local web dashboard was opened in a browser (surface web-local). Props: first_run (bool — first open in this browser profile; per-origin localStorage, so it re-reports across ports, browsers, or a storage clear).",
 	dashboard_view_switched:
 		"The local web dashboard's left-nav view was switched. Props: view (discriminator: stats/standup/repositories/memories). Distinct from view_switched, which is the IDE tool-window event with its own view vocabulary.",
 	range_changed: "The dashboard time-range control was changed. Props: range (discriminator: 7d/30d/90d/custom).",
 	chart_split_changed:
-		"A dashboard card's split-by control was changed. Props: card (discriminator: tokens/spend/mcp), split (discriminator).",
+		"A dashboard card's split-by control was changed. Props: card (discriminator: tokens/mcp), split (discriminator).",
 } as const;
 
 /** Union of every registered event name. */

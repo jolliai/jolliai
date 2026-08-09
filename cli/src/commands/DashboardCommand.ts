@@ -21,10 +21,11 @@
  * open v11 is pure ESM and the VS Code bundle is CJS.
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Command } from "commander";
+import { getProjectRootDir } from "../core/GitOps.js";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import { type BackfillProgress, backfillRepos } from "../dashboard/Backfill.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
@@ -104,6 +105,11 @@ function defaultSpawnServer(port: number | undefined, cwd: string): void {
 			...(port !== undefined ? { JOLLI_DASHBOARD_PORT: String(port) } : {}),
 		},
 	});
+	// A detached spawn emits `error` asynchronously (e.g. a cwd that vanished
+	// between the resolve and the spawn); with no listener Node re-throws it as an
+	// uncaught exception and kills the launcher. Swallow it — a failed spawn means
+	// no dashboard, and the /health probe already reports that to the user.
+	child.on("error", (err) => log.warn("dashboard server failed to spawn: %s", errMsg(err)));
 	child.unref();
 }
 
@@ -238,6 +244,45 @@ export function releaseSpawnLock(configDir: string): void {
 async function isRecordedServerLive(state: DashboardServerState, seams: ResolvedSeams): Promise<boolean> {
 	const health = await seams.fetchHealth(state.port);
 	return health.ok && health.pid === state.pid;
+}
+
+/**
+ * Resolves the working directory the detached server should run in, from the
+ * launcher's raw `--cwd`/process cwd.
+ *
+ * Two review-driven guarantees, both about the fact that the server inherits its
+ * cwd and that the telemetry buffer's identity IS the literal cwd (JOLLI-1957):
+ *
+ *  - **Always a real directory.** A bad `--cwd` (nonexistent, or a file) would
+ *    make the detached `spawn` emit an `error` (ENOENT) and — before the
+ *    `child.on("error")` guard — crash the whole launcher. An invalid path falls
+ *    back to `process.cwd()`, which is always valid.
+ *  - **The repo ROOT, not a subdir.** Launched from `repo/sub`, the raw cwd is
+ *    `repo/sub`, whose buffer no other surface (hooks, QueueWorker, `jolli
+ *    compile`, VS Code) drains — the server's own 60 s flush would be the only
+ *    thing shipping it. Resolving to the git top level lets the server share the
+ *    one repo-root buffer everything else uses.
+ *
+ * `getRoot` is injected for tests; production uses the real `getProjectRootDir`.
+ * Non-repo directories (and any git failure) keep the validated base dir.
+ */
+export async function resolveServerCwd(
+	rawCwd: string,
+	getRoot: (cwd: string) => Promise<string> = getProjectRootDir,
+): Promise<string> {
+	let base = process.cwd();
+	try {
+		if (statSync(rawCwd).isDirectory()) base = rawCwd;
+	} catch {
+		// nonexistent path or a file — keep the always-valid process.cwd()
+	}
+	try {
+		const root = await getRoot(base);
+		if (statSync(root).isDirectory()) return root;
+	} catch {
+		// `base` is not inside a git repo (or git is unavailable) — use it as-is
+	}
+	return base;
 }
 
 /**
@@ -647,9 +692,12 @@ export async function executeDashboard(
 		return false;
 	}
 
+	// The server runs at the repo root and only at a real directory — see
+	// resolveServerCwd. `registerRepo` above keeps using the raw `cwd`.
+	const serverCwd = await resolveServerCwd(cwd);
 	let state: DashboardServerState;
 	try {
-		state = await ensureServerRunning(port, { ...deps, configDir: seams.configDir, cwd });
+		state = await ensureServerRunning(port, { ...deps, configDir: seams.configDir, cwd: serverCwd });
 	} catch (err) {
 		console.error(`\n  Error: ${errMsg(err)}\n`);
 		return false;

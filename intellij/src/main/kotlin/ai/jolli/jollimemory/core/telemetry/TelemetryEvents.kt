@@ -76,7 +76,8 @@ object TelemetryEvents {
             // ── local web dashboard UI (web-local surface) ──
             "dashboard_opened" to
                 "The local web dashboard was opened in a browser (surface web-local). " +
-                "Props: first_run (bool — first open on this install).",
+                "Props: first_run (bool — first open in this browser profile; per-origin localStorage, " +
+                "so it re-reports across ports, browsers, or a storage clear).",
             "dashboard_view_switched" to
                 "The local web dashboard's left-nav view was switched. " +
                 "Props: view (discriminator: stats/standup/repositories/memories). " +
@@ -85,7 +86,7 @@ object TelemetryEvents {
                 "The dashboard time-range control was changed. Props: range (discriminator: 7d/30d/90d/custom).",
             "chart_split_changed" to
                 "A dashboard card's split-by control was changed. " +
-                "Props: card (discriminator: tokens/spend/mcp), split (discriminator).",
+                "Props: card (discriminator: tokens/mcp), split (discriminator).",
         )
 
     /** `object_action`: lowercase snake_case with at least two words. */

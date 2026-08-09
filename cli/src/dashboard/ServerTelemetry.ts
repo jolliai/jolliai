@@ -28,6 +28,14 @@ const log = createLogger("ServerTelemetry");
 /** Default periodic flush cadence for the long-lived server. */
 export const DEFAULT_SERVER_FLUSH_MS = 60_000;
 
+/**
+ * Per-flush network cap. Well under the flusher's 10 s default: the final flush
+ * runs on the shutdown path (idle timeout / SIGTERM) before `exit(0)`, and a
+ * slow network must not hold the process — and `dashboard.json` — open for ten
+ * seconds. A dropped batch is best-effort and recovered on the next run.
+ */
+export const SERVER_FLUSH_TIMEOUT_MS = 2_000;
+
 export interface ServerTelemetryDeps {
 	/** Prime the telemetry context. Defaults to the real `bootstrapTelemetry`. */
 	readonly bootstrap?: (cwd: string) => Promise<void>;
@@ -52,7 +60,7 @@ export interface ServerTelemetryHandle {
 export async function startServerTelemetry(deps: ServerTelemetryDeps = {}): Promise<ServerTelemetryHandle> {
 	const cwd = deps.cwd ?? process.cwd();
 	const bootstrap = deps.bootstrap ?? ((c: string) => bootstrapTelemetry({ cwd: c }));
-	const flush = deps.flush ?? flushTelemetryNow;
+	const flush = deps.flush ?? ((c: string) => flushTelemetryNow(c, { timeoutMs: SERVER_FLUSH_TIMEOUT_MS }));
 	const intervalMs = deps.flushIntervalMs ?? DEFAULT_SERVER_FLUSH_MS;
 
 	try {
