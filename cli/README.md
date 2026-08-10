@@ -10,7 +10,7 @@ Turns your AI coding sessions into structured development documentation attached
 
 - **100% open source** — the CLI, editor integrations, and on-disk memory format are all in the open, so you can inspect how Jolli works end to end.
 - **Bring your AI agent and key** — keep using the agent you already like, with your own Anthropic key, a Jolli account, or a local agent login depending on your setup.
-- **Local-first and private** — memories are written to your repo and Memory Bank on disk first, and you decide if or when anything is synced out.
+- **Local-first, and explicit about what leaves** — memories are written to your repo and Memory Bank on disk first. Two things do go out: the summarization LLM call itself, and — once you sign in and bind a Jolli Space — an automatic sync of pushed commits' memories on `git push`, which you can turn off. See [Privacy](#privacy) for the full picture.
 
 **What it does:**
 
@@ -67,7 +67,7 @@ jolli enable            # run from your project root
 
 **Tools your agent gets** (invoked in plain language, never called by name): `recall` and `search` (load or search your history), `get_decision_timeline`, `list_branches`, `get_pr_description`, `queue_status`, `status`, plus `bind_space`, `list_spaces`, and `push_memory` for Jolli Space.
 
-`@jolli.ai/space-cli` is optional and only needed for git-backed local workflow runs; it is not required for MCP.
+`@jolli.ai/space-cli` is optional — it adds the `jolli space` command family (Space management, synchronization, sources, impact analysis, and agents) and backs git-backed local workflow runs. It is not required for MCP.
 
 **Full onboarding docs:**
 
@@ -91,7 +91,7 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | **Claude Code** | A lightweight `StopHook` fires after each AI response; a `SessionStartHook` injects a mini-briefing at session start |
 | **Gemini** | An `AfterAgent` hook fires after each agent completion |
 | **Antigravity** | No hook needed — sessions are discovered automatically by reading the per-conversation SQLite for the workspace path and the sibling plaintext transcript log for the conversation content |
-| **Codex** | No hook needed — sessions are discovered automatically by scanning the filesystem. Linear/Jira/GitHub/Notion/Slack/Zoom/Confluence/Asana/monday.com/Jolli-Memory references in Codex MCP calls are extracted on the VS Code sidebar's 60s polling tick (not at commit time) |
+| **Codex** | No hook needed — sessions are discovered automatically by scanning the filesystem. Linear/Jira/GitHub/Notion/Slack/Zoom/Confluence/Asana/monday.com/Jolli-Memory references in Codex MCP calls are extracted by the post-commit queue worker, and additionally on the VS Code sidebar's 60s polling tick when you use the extension |
 | **OpenCode** | No hook needed — sessions are discovered automatically by reading OpenCode's global SQLite database at `~/.local/share/opencode/opencode.db` (requires Node 22.13+) |
 | **Cursor IDE** (Composer) | No hook needed — sessions are discovered automatically by reading Cursor's local SQLite stores (`globalStorage/state.vscdb` plus per-workspace `workspaceStorage/` databases under your platform's Cursor user-data directory) |
 | **Cursor CLI** (`cursor-agent`) | No hook needed — sessions are discovered automatically from Cursor's plaintext `~/.cursor` session store (`meta.json` + JSONL); shares the **Cursor** toggle with the Composer IDE |
@@ -109,7 +109,7 @@ When you run `git commit`, three standard git hooks handle the rest:
 2. **After the commit** (`post-commit`): detects the operation type (commit, amend, squash, cherry-pick, revert), enqueues it, and spawns a background worker that reads the AI conversation + code diff, calls the LLM, and writes the summary
 3. **After rebase/amend** (`post-rewrite`): enqueues migration entries so summaries are re-associated with the new commit hashes
 
-Every memory is dual-written to **both** the git orphan branch `jollimemory/summaries/v3` (the source of truth — completely separate from your code history) and the **Memory Bank** folder on disk, so you always have a plain-Markdown copy you can read, `grep`, or pipe into other tools without going through the CLI. The Memory Bank folder has two layers — a hidden `<localFolder>/<repo>/.jolli/summaries/<commitHash>.json` for canonical JSON, and a visible `<localFolder>/<repo>/<branch>/<slug>-<hash8>.md` for human-readable Markdown — and `<localFolder>` is your configured Memory Bank root (one root can hold multiple repos, each in its own `<repo>/` subfolder). Raw AI conversation transcripts are dual-written the same way — to `transcripts/<commitHash>.json` on the orphan branch and to `<localFolder>/<repo>/.jolli/transcripts/<commitHash>.json` in the Memory Bank folder.
+Every memory is dual-written to **both** the git orphan branch `jollimemory/summaries/v3` (the source of truth — completely separate from your code history) and the **Memory Bank** folder on disk, so you always have a plain-Markdown copy you can read, `grep`, or pipe into other tools without going through the CLI. The Memory Bank folder has two layers — a hidden `<localFolder>/<repo>/.jolli/summaries/<commitHash>.json` for canonical JSON, and a visible `<localFolder>/<repo>/<branch>/<slug>-<hash8>.md` for human-readable Markdown — and `<localFolder>` is your configured Memory Bank root (one root can hold multiple repos, each in its own `<repo>/` subfolder). Raw AI conversation transcripts are dual-written the same way — to `transcripts/<transcriptId>.json` on the orphan branch and to `<localFolder>/<repo>/.jolli/transcripts/<transcriptId>.json` in the Memory Bank folder, where `<transcriptId>` is an opaque UUID (entries migrated from the older schema keep their original commit-hash filename).
 
 **Worktree-aware:** hooks and summaries work across `git worktree` checkouts — each worktree tracks its own current branch and its memories stay consistent.
 
@@ -155,8 +155,10 @@ Installs all hooks required for automatic summarization:
 - **Git post-commit hook** — triggers summary generation
 - **Git post-rewrite hook** — migrates summaries on amend/rebase
 - **Git prepare-commit-msg hook** — detects squash operations
+- **Git post-merge hook** — queues a repo-wide knowledge ingest after a merge lands
+- **Git pre-push hook** — syncs pushed commits' memories to your bound Jolli Space (governed by `syncOnPush` and [`jolli push-control`](#jolli-push-control))
 - **Gemini AfterAgent hook** (if Gemini CLI detected) — tracks Gemini sessions
-- **MCP server registration** — registers the `jollimemory` MCP server into every AI host Jolli detects (Claude Code and Cursor per-repo; Gemini, Antigravity, Codex, OpenCode, Copilot CLI, Copilot Chat, Cline, and Devin CLI machine-wide) so your agent can query your memories (see [`jolli mcp`](#jolli-mcp))
+- **MCP server registration** — registers the `jollimemory` MCP server into every AI host Jolli detects (Claude Code and Cursor per-repo; Gemini, Antigravity, Codex, OpenCode, Copilot CLI, Copilot Chat, Cline, Devin CLI, and Kimi Code machine-wide) so your agent can query your memories (see [`jolli mcp`](#jolli-mcp))
 - **Skill preference** *(opt-in)* — can teach your AI agent to reach for Jolli by default when creating a PR, searching past work, or recalling a branch, by writing to your machine-global instruction files (`~/.claude/CLAUDE.md`, `~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`). `jolli enable` no longer prompts — it only applies a decision you've already made. Turn it on with `jolli configure --set globalInstructions=enabled` (or the editor toggle); it stays off until you do.
 
 ```bash
@@ -175,7 +177,7 @@ jolli disable
 
 Machine-wide cleanup: finds and removes Jolli Memory installs and configuration across surfaces — VS Code–family extensions (including forks like Cursor, Windsurf, VSCodium), JetBrains/Android Studio plugins, the global `@jolli.ai/cli` package and `jolli` shim, the machine-global `~/.jolli/jollimemory/` and per-project `.jolli/jollimemory/` state, and the current repo's hooks and **repo-scoped** MCP registration. Prints a grouped inventory first and supports interactive selection.
 
-A few shared artifacts are deliberately left in place: **global-scope MCP registrations** (the Gemini / Antigravity / Codex / OpenCode / Copilot CLI / Copilot Chat / Cline / Devin CLI host files) and the **global instruction blocks** in `~/.claude/CLAUDE.md` / `~/.gemini/GEMINI.md` / `~/.codex/AGENTS.md` are shared by every repo on the machine, so removing them during one uninstall would break Jolli for your other repos; and the generated `SKILL.md` files are left untouched because they may sit alongside skills of your own. Remove those by hand if you want a completely bare machine.
+A few shared artifacts are deliberately left in place: **global-scope MCP registrations** (the Gemini / Antigravity / Codex / OpenCode / Copilot CLI / Copilot Chat / Cline / Devin CLI / Kimi Code host files) and the **global instruction blocks** in `~/.claude/CLAUDE.md` / `~/.gemini/GEMINI.md` / `~/.codex/AGENTS.md` are shared by every repo on the machine, so removing them during one uninstall would break Jolli for your other repos; and the generated `SKILL.md` files are left untouched because they may sit alongside skills of your own. Remove those by hand if you want a completely bare machine.
 
 Your memories are never touched — the summaries orphan branch and Memory Bank content are excluded by construction.
 
@@ -206,7 +208,7 @@ The login flow opens your default browser for OAuth authentication. After comple
 
 ### `jolli status`
 
-Shows the current installation status, including CLI version, hook state, authentication state, active sessions, supported integrations (Claude, Codex, Gemini, Antigravity, OpenCode, Cursor, Copilot CLI, Copilot Chat, Cline, Devin CLI), Memory Bank state, whether this repo pushes to a Jolli Space, and summary count.
+Shows the current installation status, including CLI version, hook state, authentication state, active sessions, supported integrations (Claude, Codex, Gemini, Antigravity, OpenCode, Cursor, Copilot CLI, Copilot Chat, Cline, Devin CLI, Kimi Code), Memory Bank state, whether this repo pushes to a Jolli Space, and summary count.
 
 ```bash
 jolli status
@@ -400,7 +402,7 @@ jolli sync-memory-bank
 jolli sync-memory-bank --transcripts
 ```
 
-…or, in the VS Code extension, click **Sync to Personal Space Now** in Settings. The CLI bundles the same engine (`cli/src/sync/` compiles into `dist/Cli.js` and is inlined into the VS Code extension). The only precondition is a valid `jolliApiKey`. Because the terminal has no diff viewer, the CLI **skips** conflicting files rather than prompting and prints their paths so you can resolve them in your editor.
+…or, in the VS Code extension, click **Sync to Personal Space Now** in Settings. The CLI bundles the same engine (`cli/src/sync/` compiles into `dist/Cli.js` and is inlined into the VS Code extension). The only precondition is a valid `jolliApiKey`. In a real terminal the CLI prompts once per conflicting file — use mine, use theirs, view diff, or skip. Outside a TTY (CI, hook-driven runs, redirected stdin) it **skips** instead, so the conflict resurfaces on the next sync round when someone can act on it.
 
 The vault is an implementation detail; the user-facing surface is an on/off toggle, a "Sync now" button, and a four-state status indicator (`synced` / `syncing` / `conflicts` / `offline`). Conflicts on the four `.jolli/<aggregate>.json` files (manifest, index, branches, catalog) auto-merge deterministically; other-file conflicts run through an AI merge (when `apiKey` is set) and finally a manual binary pick.
 
@@ -416,14 +418,12 @@ jolli doctor
 jolli doctor --fix
 ```
 
-Doctor is deliberately narrow — it only flags conditions that *break* Jolli Memory. Stale-but-harmless data (old sessions, orphan files from amend/squash) is handled by `clean`.
+Doctor is deliberately narrow — it only flags conditions that *break* Jolli Memory. Stale-but-harmless local state (old sessions, leftover queue entries) is handled by `clean`.
 
 ### `jolli clean`
 
-Removes redundant/expired data that accumulates over time but never breaks functionality:
+Removes redundant/expired local state that accumulates over time but never breaks functionality:
 
-- **Orphan summary files** — after amend/squash, old commits' summary files remain on the orphan branch but their content is already embedded as `children` in the new root's summary
-- **Orphan transcript files** — same story for transcripts
 - **Stale sessions** — session tracking entries older than 48 hours
 - **Stale git queue entries** — older than 7 days
 - **Stale squash-pending.json** — older than 48 hours
@@ -514,9 +514,9 @@ jolli cutover --probe
 
 Jolli Memory feeds prior development context back into your AI agent so it can pick up where you (or a teammate) left off.
 
-**Automatic briefing** — every time a new Claude Code session starts, a lightweight briefing (~300–500 tokens) is injected into the conversation: branch name, commit count, date range, and last commit message. If it has been more than 3 days since the last commit, it suggests running the full recall command. This runs in under 200 ms and never blocks session startup.
+**Automatic briefing** — every time a new Claude Code session starts, a lightweight briefing (~300–500 tokens) is injected into the conversation: branch name, commit count, date range, and last commit message. Whenever a day or more has passed since the last commit it suggests running the full recall command, escalating from a tip to a warning past three days. This runs in under 200 ms and never blocks session startup.
 
-**Full recall** — run `/jolli-recall` inside Claude Code (or any agent that supports it) to load the complete branch history: summaries, plans, decisions, and file-change statistics (default budget ≈ 50,000 tokens; pass `--budget` to adjust). The agent then reports what the branch is implementing, key technical decisions, what was last worked on, and the main files involved — so you can continue without re-reading the code.
+**Full recall** — run `/jolli-recall` inside Claude Code (or any agent that supports it) to load the complete branch history: summaries, plans, decisions, and file-change statistics (default budget ≈ 20,000 tokens; pass `--budget` to adjust). The agent then reports what the branch is implementing, key technical decisions, what was last worked on, and the main files involved — so you can continue without re-reading the code.
 
 If the current branch has no memories, the command shows a catalog of branches that do, letting you pick one to recall. You can also pass a branch name or keyword as an argument (e.g. `/jolli-recall auth-refactor`).
 
@@ -642,16 +642,22 @@ If something looks off, run `jolli doctor` to check for faults (stuck locks, mis
 
 ### At summary generation time (after each commit)
 
-To produce a summary, Jolli Memory reads your active AI session transcripts and the git diff locally, then sends them together to a summarization backend:
+To produce a summary, Jolli Memory reads your active AI session transcripts and the git diff locally, then sends them together to a summarization backend. Which backend depends on `aiProvider` (`jolli configure --set aiProvider=...`):
 
-- If an **Anthropic `apiKey`** is configured — transcripts + diff are sent **directly to Anthropic**.
-- If only a **`jolliApiKey`** is configured (you signed in with `jolli auth login`) — transcripts + diff are sent to the **Jolli LLM proxy**, which forwards them to Anthropic on your behalf. The proxy **does not persist the transcripts or diff, and does not write them to any Jolli-side log** — payloads are held in memory only for the duration of the request and discarded once Anthropic responds.
+- **`local-agent`** — transcripts + diff are handed to a locally installed agent CLI (Claude Code, Codex, Cursor, OpenCode, or Kimi Code) and go out through *that tool's* own login. Jolli Memory itself sends nothing to Anthropic or to Jolli.
+- **`jolli`** — transcripts + diff are sent to the **Jolli LLM proxy**, which forwards them to Anthropic on your behalf. The proxy **does not persist the transcripts or diff, and does not write them to any Jolli-side log** — payloads are held in memory only for the duration of the request and discarded once Anthropic responds.
+- **`anthropic`** — transcripts + diff are sent **directly to Anthropic**, using the configured `apiKey` or the `ANTHROPIC_API_KEY` environment variable.
+- **unset** — the first credential present wins, in order: `apiKey`, then `ANTHROPIC_API_KEY`, then `jolliApiKey` (the proxy).
 
-The generated summary is then dual-written locally — to the git orphan branch (the source of truth) and to the Memory Bank folder on disk (canonical JSON at `<localFolder>/<repo>/.jolli/summaries/<commitHash>.json` plus human-readable Markdown at `<localFolder>/<repo>/<branch>/<slug>-<hash8>.md`). Raw transcripts are dual-written the same way: to `transcripts/<commitHash>.json` on the orphan branch and to `<localFolder>/<repo>/.jolli/transcripts/<commitHash>.json` in the Memory Bank folder.
+The generated summary is then dual-written locally — to the git orphan branch (the source of truth) and to the Memory Bank folder on disk (canonical JSON at `<localFolder>/<repo>/.jolli/summaries/<commitHash>.json` plus human-readable Markdown at `<localFolder>/<repo>/<branch>/<slug>-<hash8>.md`). Raw transcripts are dual-written the same way: to `transcripts/<transcriptId>.json` on the orphan branch and to `<localFolder>/<repo>/.jolli/transcripts/<transcriptId>.json` in the Memory Bank folder.
 
 ### Uploads to Jolli Space
 
-`jolli push` sends a branch's memories to your bound Jolli Space from the CLI, and the VS Code and IntelliJ extensions expose the same action as a **Share in Jolli** button. `jolli push-control` decides whether this repo pushes at all. When triggered there, only the **generated summary** and its **associated plans and notes** are uploaded, and only if this repo's outbound push is on (see [`jolli push-control`](#jolli-push-control)). The pushed article (and the clipboard export) carries a **Task usage** line — total tokens, a cost estimate, and the input / output / cached split, aggregated across squashed and amended commits. **Raw transcripts are never sent to Jolli Space.**
+`jolli push` sends a branch's memories to your bound Jolli Space from the CLI, and the VS Code and IntelliJ extensions expose the same action as a **Share in Jolli** button. `jolli push-control` decides whether this repo pushes at all. When triggered there, only the **generated summary** and its **associated plans, notes, captured references and skill-usage records** are uploaded, and only if this repo's outbound push is on (see [`jolli push-control`](#jolli-push-control)). The pushed article (and the clipboard export) carries a **Task usage** line — total tokens, a cost estimate, and the input / output / cached split, aggregated across squashed and amended commits. **Raw transcripts are never sent to Jolli Space.**
+
+### Memory Bank sync to your personal Space
+
+`jolli sync-memory-bank` (and the editor extensions' **Sync to Personal Space Now**) mirrors this repo's Memory Bank to your own private Personal Space vault. It needs a valid `jolliApiKey`, and the mirror **excludes raw transcripts** unless you opt in — per round with `jolli sync-memory-bank --transcripts`, or persistently with `jolli configure --set syncTranscripts=true` (off by default). Recurring background sync is governed by a separate `autoSyncEnabled` flag that `jolli configure` deliberately rejects — from the CLI, every sync round is one you ran yourself.
 
 ### Session metadata
 

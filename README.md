@@ -66,7 +66,7 @@ Prefer an in-editor panel? The same memories show up in the [VS Code extension](
 - **Ask your agent about past work.** `jolli mcp` exposes your history over the Model Context Protocol (10 tools: search, recall a branch, trace a decision's timeline, list branches, draft a PR description, check installation health, and more), so your agent can answer "how did we handle X?" and draft PRs without leaving the chat. Registered automatically into the AI hosts Jolli detects when you enable, and when you are signed in your Jolli Space's own platform tools are surfaced alongside them.
 - **Catch up on history.** `jolli backfill` writes memories for commits you made before installing Jolli.
 - **Knowledge wiki and graph.** `jolli compile` folds work scattered across many commits into per-topic pages; `jolli graph` renders them as an interactive, shareable map of decisions and how they connect. Both build in the background.
-- **Local-first, and explicit about what leaves.** Every memory is written to your own repo and to a plain-Markdown folder on disk you can read or `grep`. Two things do leave: at commit time the transcript slice and diff go to whichever AI provider you configured, because that is the summarization call itself (the Jolli LLM proxy holds them in memory only and never persists or logs them); and once you are signed in, `git push` syncs that branch's memories to your bound Jolli Space. Turn the second off per repo with `jolli push-control`, or globally with `syncOnPush`. Raw transcripts are never part of it.
+- **Local-first, and explicit about what leaves.** Every memory is written to your own repo and to a plain-Markdown folder on disk you can read or `grep`. Two things leave by default: at commit time the transcript slice and diff go to whichever AI provider you configured, because that is the summarization call itself (the Jolli LLM proxy holds them in memory only and never persists or logs them); and once you are signed in, `git push` syncs that branch's memories to your bound Jolli Space. That push carries the summary and its attachments (plans, notes, captured references, skill-usage records), never the raw transcript. Turn it off per repo with `jolli push-control`, or globally with `syncOnPush`. One further path is opt-in only: `jolli sync-memory-bank` mirrors your Memory Bank to your own private Personal Space. That mirror excludes raw transcripts unless you explicitly enable `syncTranscripts`.
 
 Free and open source (Apache-2.0). A hosted **Jolli Space** for team sharing is optional.
 
@@ -100,7 +100,7 @@ Behind those questions are ten built-in MCP tools (`search`, `recall`, `get_deci
 | **Cursor, VSCodium, or Windsurf** | the same extension, from [Open VSX](https://open-vsx.org/extension/jolli/jollimemory-vscode) | search "Jolli Memory" in Extensions |
 | **A JetBrains IDE** | the [IntelliJ plugin](intellij/) (preview) | [JetBrains Marketplace](https://plugins.jetbrains.com/), search "Jolli Memory" |
 | **Claude Code, and want it to set itself up** | the [Claude Code plugin](claude-plugin/) | `/plugin marketplace add jolliai/jolli-claude-plugin` then `/plugin install jolli@jolli-marketplace` |
-| **Codex, and want it to set itself up** | the [Codex plugin](codex-plugin/) | `codex plugin add jolli@jolli-marketplace` after adding the marketplace — see [`codex-plugin/`](codex-plugin/) |
+| **Codex, and want it to set itself up** | the [Codex plugin](codex-plugin/) | `codex plugin marketplace add jolliai/jolli-chatgpt-plugin` then `codex plugin add jolli@jolli-marketplace` |
 | **Several editors** | the CLI globally, plus each editor plugin. They share the same data. | |
 
 Every surface writes to the same place, so mixing them is fine. The CLI is the only one you need; the editor plugins bundle it and add a panel on top.
@@ -161,7 +161,7 @@ Requires the Node version in `.nvmrc` (currently 24.10.0, which is the developme
 ```bash
 npm install
 npm run build        # builds the CLI, the Claude Code plugin, the Codex plugin, then VS Code
-npm run all          # clean, build, lint, test (run this before committing)
+npm run all          # clean, build, typecheck, lint, test (run this before committing)
 ```
 
 Per-workspace variants exist (`npm run build:cli`, `npm run test:vscode`, and so on). IntelliJ: see [`intellij/DEVELOPMENT.md`](intellij/DEVELOPMENT.md).

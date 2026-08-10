@@ -10,8 +10,9 @@ collected — generated from the event registry the code actually uses.
 
 ## What we collect
 
-- A random per-machine identifier (`installId`) and the surface (`cli`,
-  `vscode`, or `intellij`) + version.
+- A random per-machine identifier (`installId`) and the surface that sent the
+  event (`cli`, `vscode`, `intellij`, `claude-plugin`, `codex-plugin`, or
+  `web-local` for the local dashboard) + version.
 - Coarse environment facts: OS, architecture, runtime version, and which Jolli
   environment your client is pointed at (`local` / `dev` / `preview` / `prod`).
 - The events listed below, each with a small bag of **bucketed or boolean**
@@ -30,14 +31,14 @@ collected — generated from the event registry the code actually uses.
 
 Telemetry is on by default, but is silenced when any of these is true:
 
-- The `DO_NOT_TRACK` environment variable is set to anything other than `0`.
+- The `DO_NOT_TRACK` environment variable is set to a non-empty value other than `0`.
 - You run `jolli telemetry off` (re-enable with `jolli telemetry on`).
 - (VS Code) your editor telemetry is disabled (`telemetry.telemetryLevel`).
 - (IntelliJ) the IDE data-sharing consent is declined.
 
 The off switch (`telemetry`) and `installId` live in the machine-global
-`~/.jolli/jollimemory/config.json`, so the choice is shared across all three
-surfaces. Run `jolli telemetry inspect` to print the exact events buffered on
+`~/.jolli/jollimemory/config.json`, so the choice is shared across every
+surface. Run `jolli telemetry inspect` to print the exact events buffered on
 disk **before** they are sent.
 
 ## What identifies you
