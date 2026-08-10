@@ -1933,16 +1933,21 @@ describe("SidebarWebviewProvider", () => {
 	 * (not stubbed to `[]`) — the shape every pre-existing test uses, and the
 	 * reason the dep declares it optional.
 	 */
-	function makeKbSweepProvider(archiveUnusedFolders?: () => Promise<string[]>) {
+	function makeKbSweepProvider(
+		archiveUnusedFolders?: () => Promise<string[]>,
+		archiveDir?: string,
+	) {
 		const view = makeMockView();
+		const executeCommand = vi.fn().mockResolvedValue(undefined);
 		const kbFolders = {
 			listChildren: vi.fn().mockResolvedValue([]),
 			...(archiveUnusedFolders
 				? { archiveUnusedFolders: vi.fn(archiveUnusedFolders) }
 				: {}),
+			...(archiveDir ? { archiveDir: vi.fn(() => archiveDir) } : {}),
 		};
 		const provider = new SidebarWebviewProvider({
-			executeCommand: vi.fn().mockResolvedValue(undefined),
+			executeCommand,
 			getInitialState: () => ({
 				enabled: true,
 				authenticated: false,
@@ -1956,7 +1961,7 @@ describe("SidebarWebviewProvider", () => {
 		});
 		provider.resolveWebviewView(view as unknown as never);
 		showInformationMessage.mockClear();
-		return { view, kbFolders };
+		return { view, kbFolders, executeCommand };
 	}
 
 	it("sweeps unused folders then re-lists, toasting the singular form for one", async () => {
@@ -2009,6 +2014,43 @@ describe("SidebarWebviewProvider", () => {
 		view.webview.triggerMessage({ type: "refresh", scope: "all" });
 		await new Promise((r) => setTimeout(r, 0));
 		expect(showInformationMessage).toHaveBeenCalledTimes(1);
+	});
+
+	it("offers a Reveal Archive action and reveals the archive dir in the OS on click", async () => {
+		// "(recoverable)" should be an action, not just a claim about a hidden
+		// dir the user would never find on their own.
+		const { view, executeCommand } = makeKbSweepProvider(
+			async () => ["/kb/system32"],
+			"/kb/.jolli/archive",
+		);
+		showInformationMessage.mockResolvedValueOnce("Reveal Archive");
+		view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+		await new Promise((r) => setTimeout(r, 0));
+		await new Promise((r) => setTimeout(r, 0));
+		// The button was offered as the toast's action.
+		expect(showInformationMessage.mock.calls[0][1]).toBe("Reveal Archive");
+		// Clicking it revealed the hidden archive dir in the OS file manager.
+		const reveal = executeCommand.mock.calls.find(
+			(c) => c[0] === "revealFileInOS",
+		);
+		expect(reveal).toBeDefined();
+		expect((reveal?.[1] as { toString(): string }).toString()).toBe(
+			"file:///kb/.jolli/archive",
+		);
+	});
+
+	it("offers no Reveal Archive action when the host didn't wire archiveDir", async () => {
+		// Backward-compat: a host that wires only the sweep still toasts, just
+		// without the reveal button.
+		const { view, executeCommand } = makeKbSweepProvider(async () => [
+			"/kb/system32",
+		]);
+		view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(showInformationMessage.mock.calls[0][1]).toBeUndefined();
+		expect(
+			executeCommand.mock.calls.some((c) => c[0] === "revealFileInOS"),
+		).toBe(false);
 	});
 
 	it("skips the sweep when the host didn't wire it", async () => {

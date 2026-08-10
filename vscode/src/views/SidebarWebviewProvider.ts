@@ -189,6 +189,13 @@ export interface SidebarWebviewDeps {
 		 * duplicates is Migrate's job.
 		 */
 		archiveUnusedFolders?: () => Promise<string[]>;
+		/**
+		 * Absolute path of the hidden `<kbParent>/.jolli/archive/` dir that
+		 * `archiveUnusedFolders` moves swept folders into. Used to offer a
+		 * "Reveal Archive" action on the post-sweep toast. Optional so existing
+		 * tests (which inject only `listChildren`) keep working.
+		 */
+		archiveDir?: () => string;
 	};
 	/**
 	 * Source for the breadcrumb repo/branch dropdowns. `listRepos` enumerates
@@ -1178,10 +1185,11 @@ export class SidebarWebviewProvider
 				void this.deps.applyDismissAiExclude?.(msg.kind, msg.key);
 				return;
 			case "refresh":
-				// Now async (the KB scope awaits `dedupeFolders` before
-				// re-listing). It swallows its own failures, so the caller
-				// stays fire-and-forget like every other message handler.
-				void this.handleRefresh(msg.scope);
+				// Fire-and-forget like every other message handler. The KB
+				// scope's folder sweep is async but `handleRefresh` void-calls
+				// it rather than awaiting (so the other scopes stay same-tick),
+				// so nothing here needs to wait on it.
+				this.handleRefresh(msg.scope);
 				return;
 			case "selection:request":
 				this.handleSelectionRequest(msg.repoName, msg.branchName, msg.silent);
@@ -1829,9 +1837,14 @@ export class SidebarWebviewProvider
 	 * data via the same `jollimemory.refresh*` commands that the section-level
 	 * refresh buttons use — keeps the refresh contract in one place. KB folders
 	 * have no command equivalent (no upstream cache; we read fs each time), so
-	 * we call `handleExpandFolder("")` directly to push a fresh root listing.
+	 * the KB scope runs `tidyAndRelistKbFolders()` (sweep unused folders, then
+	 * re-list the root) directly.
+	 *
+	 * Returns `void`, not a promise: every call in the body is `void`-ed on
+	 * purpose (see the kb-scope note below), so the method never awaits and its
+	 * completion carries no meaning worth handing back to the caller.
 	 */
-	private async handleRefresh(
+	private handleRefresh(
 		scope:
 			| "kb"
 			| "branch"
@@ -1839,7 +1852,7 @@ export class SidebarWebviewProvider
 			| "branch-commits"
 			| "status"
 			| "all",
-	): Promise<void> {
+	): void {
 		if (scope === "kb" || scope === "all") {
 			// `void`, not `await`: the sweep is async and everything below this
 			// block must still run in the SAME tick as the user's click. Awaiting
@@ -1914,11 +1927,28 @@ export class SidebarWebviewProvider
 				const archived = await kb.archiveUnusedFolders();
 				if (archived.length > 0) {
 					const noun = archived.length === 1 ? "folder" : "folders";
-					void vscode.window.showInformationMessage(
-						`Jolli Memory: archived ${archived.length} unused Memory Bank ${noun} ` +
-							`with no memories in ${archived.length === 1 ? "it" : "them"}. ` +
-							`Moved to the archive folder (recoverable).`,
-					);
+					// Offer a way to the archive so "(recoverable)" is an action,
+					// not just a claim about a hidden dir the user would never
+					// find on their own. Only when the service can tell us where
+					// the archive is; the dir exists here — the sweep just moved
+					// a folder into it.
+					const archiveDir = kb.archiveDir?.();
+					const REVEAL = "Reveal Archive";
+					void vscode.window
+						.showInformationMessage(
+							`Jolli Memory: archived ${archived.length} unused Memory Bank ${noun} ` +
+								`with no memories in ${archived.length === 1 ? "it" : "them"}. ` +
+								`Moved to the archive folder (recoverable).`,
+							...(archiveDir ? [REVEAL] : []),
+						)
+						.then((choice) => {
+							if (choice === REVEAL && archiveDir) {
+								void this.deps.executeCommand(
+									"revealFileInOS",
+									vscode.Uri.file(archiveDir),
+								);
+							}
+						});
 				}
 			} catch (err) {
 				log.warn(

@@ -169,8 +169,9 @@ export class KbFoldersService {
 	 *     row is pure noise; the folder returns the moment it earns content.
 	 *
 	 * Anything unrecognized under `.jolli/` — including the `shadow-status.json`
-	 * dirty marker, which means a write was attempted and hasn't landed — counts
-	 * as content and keeps the folder. Unknown state is never assumed disposable.
+	 * dirty marker, which records that a shadow write to this folder FAILED
+	 * (`DualWriteStorage` writes it only from a write's `catch`) — counts as
+	 * content and keeps the folder. Unknown state is never assumed disposable.
 	 *
 	 * NEVER touched: the current project's folder, or any folder carrying the
 	 * current project's `repoName`. A fresh install's own folder is legitimately
@@ -213,6 +214,17 @@ export class KbFoldersService {
 		}
 		if (archived.length > 0) this.cleanRepos.clear();
 		return archived;
+	}
+
+	/**
+	 * Absolute path of the hidden archive directory
+	 * (`<kbParent>/.jolli/archive/`) that {@link archiveUnusedFolders} moves
+	 * swept folders into — the same recoverable location the Migrate flow uses
+	 * (`archiveKBFolder`). Exposed so the sidebar's post-sweep toast can offer a
+	 * "Reveal Archive" action: the folders are recoverable, and this is where.
+	 */
+	archiveDir(): string {
+		return join(this.getContext().kbParent, ".jolli", "archive");
 	}
 
 	/**
@@ -709,9 +721,10 @@ function repoDisplayName(repo: DiscoveredRepo): string {
  * requires them to hold zero entries.
  *
  * `shadow-status.json` is deliberately ABSENT: that is the dual-write dirty
- * marker (`DualWriteStorage.markDirty`), so its presence means a folder write
- * was attempted and hasn't completed. A folder mid-write is not disposable
- * even while it still looks empty.
+ * marker, and `DualWriteStorage` writes it ONLY from a write's `catch`, so its
+ * presence means the last shadow write to this folder FAILED — not that one is
+ * currently in flight. Either way a write meant to land here didn't, so the
+ * folder is not the inert-empty shape this sweep targets and is kept.
  */
 const INERT_JOLLI_ENTRIES: ReadonlySet<string> = new Set([
 	"config.json",
@@ -725,9 +738,15 @@ const INERT_JOLLI_ENTRIES: ReadonlySet<string> = new Set([
  * OS-generated files that appear inside any browsed directory and say nothing
  * about whether the user keeps memories there. Ignored when deciding emptiness
  * so a single Finder/Explorer visit can't pin a junk folder in the tree
- * forever.
+ * forever. Names are stored lowercase and matched case-insensitively via
+ * {@link isOsNoise}: `Thumbs.db` is often written lowercase (`thumbs.db`) on
+ * Windows, and macOS filesystems are case-insensitive by default.
  */
-const OS_NOISE_FILES: ReadonlySet<string> = new Set([".DS_Store", "Thumbs.db"]);
+const OS_NOISE_FILES: ReadonlySet<string> = new Set([".ds_store", "thumbs.db"]);
+
+function isOsNoise(name: string): boolean {
+	return OS_NOISE_FILES.has(name.toLowerCase());
+}
 
 /**
  * True when `kbRoot` is a claimed-but-empty Memory Bank folder: nothing the
@@ -752,7 +771,7 @@ function isEmptyKbFolder(kbRoot: string): boolean {
 	}
 	for (const e of top) {
 		if (e.name === ".jolli") continue;
-		if (OS_NOISE_FILES.has(e.name)) continue;
+		if (isOsNoise(e.name)) continue;
 		// A visible branch dir / `.md`, or a dotfile we don't recognize (a `.git`
 		// the user init'd here, an editor workspace file) — real content.
 		return false;
@@ -769,6 +788,10 @@ function isEmptyKbFolder(kbRoot: string): boolean {
 		return false;
 	}
 	for (const e of jolli) {
+		// Same OS-noise skip as the top-level loop: a `.jolli/.DS_Store` a
+		// Finder visit dropped is not content, and without this it would pin the
+		// junk folder permanently (the strict allowlist below rejects it).
+		if (isOsNoise(e.name)) continue;
 		if (!INERT_JOLLI_ENTRIES.has(e.name)) return false;
 	}
 

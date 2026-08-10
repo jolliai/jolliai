@@ -1793,7 +1793,7 @@ describe("parseMdTitle", () => {
 });
 
 // ─── archiveUnusedFolders: archive folders that were never a useful repo ───────
-// Same archive target as dedupeFolders (`<parent>/.jolli/archive/`, hidden and
+// Same archive target as archiveUnusedFolders (`<parent>/.jolli/archive/`, hidden and
 // recoverable). `seedRepo` writes only `.jolli/config.json`, which IS the empty
 // shape this sweep targets — so each "keeps" test has to add the specific piece
 // of content that must protect the folder.
@@ -1914,10 +1914,11 @@ describe("KbFoldersService.archiveUnusedFolders", () => {
 	});
 
 	it("keeps a folder carrying the dual-write dirty marker", async () => {
-		// `shadow-status.json` means a folder write was attempted and hasn't
-		// landed. Empty-looking, but mid-write — not disposable.
-		seedRepo(tmpParent, "midwrite", { remoteUrl: null });
-		writeJolli("midwrite", "shadow-status.json", { dirty: true });
+		// `shadow-status.json` records that a shadow write to this folder FAILED
+		// (`DualWriteStorage` writes it only from a write's `catch`). Empty-looking,
+		// but a write meant to land here didn't — not disposable.
+		seedRepo(tmpParent, "failedwrite", { remoteUrl: null });
+		writeJolli("failedwrite", "shadow-status.json", { dirty: true });
 		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
 	});
 
@@ -1969,6 +1970,32 @@ describe("KbFoldersService.archiveUnusedFolders", () => {
 		expect(await makeSvc().archiveUnusedFolders()).toEqual([
 			join(tmpParent, "visited"),
 		]);
+	});
+
+	it("ignores OS noise nested under .jolli/ too (a .DS_Store a Finder visit dropped)", async () => {
+		// Same skip as the top-level loop. Without it a single Finder visit that
+		// wrote `.jolli/.DS_Store` would pin the junk folder permanently, because
+		// the strict `.jolli` allowlist rejects every unrecognized name.
+		seedRepo(tmpParent, "visited-jolli", { remoteUrl: null });
+		writeJolli("visited-jolli", ".DS_Store", "\0");
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([
+			join(tmpParent, "visited-jolli"),
+		]);
+	});
+
+	it("treats OS noise names case-insensitively (lowercase thumbs.db, uppercase .DS_STORE)", async () => {
+		// Windows commonly writes `thumbs.db` lowercase; a case-sensitive match
+		// would let it pin the folder. Checked at both levels.
+		seedRepo(tmpParent, "winvisited", { remoteUrl: null });
+		writeFileSync(join(tmpParent, "winvisited", "thumbs.db"), "\0", "utf-8");
+		writeJolli("winvisited", ".DS_STORE", "\0");
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([
+			join(tmpParent, "winvisited"),
+		]);
+	});
+
+	it("archiveDir() points at the hidden recoverable archive under the parent", async () => {
+		expect(makeSvc().archiveDir()).toBe(join(tmpParent, ".jolli", "archive"));
 	});
 
 	it("keeps a folder holding an unrecognized dotfile (e.g. a git repo the user init'd)", async () => {
