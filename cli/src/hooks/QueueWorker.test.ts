@@ -4,6 +4,9 @@ import { readManualDisableFlag } from "../core/RepoProfile.js";
 // ─── Mocks ──────────────────────────────────────────────────────────────────
 
 vi.mock("../core/GitOps.js", () => ({
+	// null → the plan-source classifier treats every path as "unknown" (kept),
+	// preserving this suite's pre-foreign-filter behavior.
+	resolveContainingRepoCommonDir: vi.fn().mockResolvedValue(null),
 	getCommitInfo: vi.fn(),
 	getHeadHash: vi.fn(),
 	getParentHash: vi.fn(),

@@ -83,6 +83,7 @@ import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
 import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
 import { estimateCostUsd, PRICES_AS_OF } from "../core/Pricing.js";
 import { triggerPushForNewSummaries } from "../core/PushExecutor.js";
+import { createPlanSourceClassifier, partitionForeignPlans } from "../core/plans/PlanContainment.js";
 import { baseKeyOf, mergeRefsNewWins } from "../core/RefMerge.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import {
@@ -810,14 +811,14 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 				await enqueueIngestOperation(cwd, "post-commit");
 			}
 
-			// Pre-push sync follow-up (JOLLI-1900): if any of the commits summarized
+			// Pre-push sync follow-up: if any of the commits summarized
 			// this drain are waiting in push-pending.json (a `git push` fired before
 			// their memory existed), push them now. Fire-and-forget on the next tick —
 			// it must never extend this worker's lock hold or delay the ingest phase,
 			// and a slow/offline push just leaves the entries for the next trigger.
 			if (newlyGeneratedHashes.size > 0) {
 				triggerPushForNewSummaries(cwd, [...newlyGeneratedHashes]);
-				// Dashboard direct write (JOLLI-2069): project the drained commits +
+				// Dashboard direct write: project the drained commits +
 				// current worktree state into the local stats DB. Awaited — a few git
 				// reads and one short SQLite transaction, trivial next to the LLM work
 				// this drain just did — and internally guarded: it skips on runtimes
@@ -1249,15 +1250,36 @@ function safeHashFileSync(path: string): string | null {
 async function detectPlanSlugsFromRegistry(cwd: string, branch: string): Promise<Set<string>> {
 	const registry = await loadPlansRegistry(cwd);
 	const slugs = new Set<string>();
+	// A plan whose sourcePath belongs to a DIFFERENT git repo
+	// (a sibling checkout the agent incidentally touched) is deterministically
+	// excluded here — this is the single archive chokepoint every path (normal /
+	// squash / amend / rebase) funnels through, so filtering here keeps foreign
+	// files off the commit on ALL of them, with no LLM involved.
+	const classifyPlanSource = createPlanSourceClassifier(cwd);
 	for (const [slug, entry] of Object.entries(registry.plans)) {
 		// No branch filter — uncommitted plans bind to the current worktree
 		// (its own plans.json) and commit associates all of them. Cross-worktree
 		// leakage is impossible because each worktree has a separate plans.json.
 		if (entry.commitHash === null && !entry.contentHashAtCommit) {
+			if ((await classifyPlanSource(entry.sourcePath)) === "foreign") {
+				log.info("Plan registry scan: %s (%s) is foreign — excluding from archive", slug, entry.sourcePath);
+				continue;
+			}
 			slugs.add(slug);
 			continue;
 		}
 		if (entry.commitHash !== null && entry.contentHashAtCommit && entry.sourcePath) {
+			// Classify before hashing so a foreign file is never read at all. The
+			// classifier short-circuits an in-worktree path without a git call, so
+			// this adds no cost on the common local case.
+			if ((await classifyPlanSource(entry.sourcePath)) === "foreign") {
+				log.info(
+					"Plan registry scan: committed %s (%s) is foreign — excluding from archive",
+					slug,
+					entry.sourcePath,
+				);
+				continue;
+			}
 			const liveHash = safeHashFileSync(entry.sourcePath);
 			if (liveHash && liveHash !== entry.contentHashAtCommit) {
 				slugs.add(slug);
@@ -2083,6 +2105,16 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		(e) => getRegistry().byId(e.source)?.trackOnly !== true,
 	);
 
+	// Split off foreign-repo plans BEFORE ranking so their
+	// content never reaches the summarizer prompt, and surface them in
+	// excludedContext so the panel shows why they were left out. The archive
+	// chokepoint (detectPlanSlugsFromRegistry) drops them again — that is what
+	// covers the squash/amend paths, which never reach this prompt-side split.
+	const { localPlans, foreignExcludedContext } = await partitionForeignPlans(
+		userKeptPlans,
+		createPlanSourceClassifier(cwd),
+	);
+
 	// AI relevance: rank the user-kept context against this change and soft-exclude
 	// clearly-unrelated items. Wrapped so ANY failure (git / content-read / LLM /
 	// parse) falls back to the full user-kept set — a relevance problem must never
@@ -2090,14 +2122,14 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// additionally covers the git + content-read steps around it. Soft-excluded items are
 	// recorded on the summary's excludedContext; like user hard-excludes they are skipped
 	// from association but kept in the working area (never discarded).
-	let activePlanEntries = userKeptPlans;
+	let activePlanEntries = localPlans;
 	let activeNoteEntries = userKeptNotes;
 	let activeReferenceEntries = userKeptReferences;
-	let excludedContext: ReadonlyArray<ExcludedContextItem> = [];
+	let excludedContext: ReadonlyArray<ExcludedContextItem> = foreignExcludedContext;
 	let contextRelevance: ReadonlyArray<ContextRelevanceRef> = [];
 	try {
 		const changeSignal = await buildChangeSignal(commitInfo.message, `${op.commitHash}~1`, op.commitHash, cwd);
-		const raw = { plans: userKeptPlans, notes: userKeptNotes, references: relevanceCandidateReferences };
+		const raw = { plans: localPlans, notes: userKeptNotes, references: relevanceCandidateReferences };
 		// Reuse the pre-commit panel's full-text ranking when its change fingerprint
 		// matches (so the excluded set the user saw is exactly what lands, and we skip
 		// a redundant LLM call). Otherwise — panel not opened, or the change moved
@@ -2111,7 +2143,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		activePlanEntries = [...relevance.plans];
 		activeNoteEntries = [...relevance.notes];
 		activeReferenceEntries = [...relevance.references, ...trackOnlyReferences];
-		excludedContext = relevance.excludedContext;
+		excludedContext = [...foreignExcludedContext, ...relevance.excludedContext];
 		// Kept items' tier+reason for the summary artifact (a user-dismissed
 		// exclusion lands here with its ORIGINAL verdict attached). Empty when the
 		// reuse path read a legacy selection file with no aiRelevance — the summary
@@ -3446,6 +3478,10 @@ async function handleAmendPipeline(
 	const relevanceCandidateAmendRefs = userKeptAmendRefs.filter(
 		(e) => getRegistry().byId(e.source)?.trackOnly !== true,
 	);
+	// Same foreign-repo plan split as executePipeline, so an
+	// amend's regenerated summary never carries a sibling repo's plan content.
+	const { localPlans: localAmendPlans, foreignExcludedContext: amendForeignExcludedContext } =
+		await partitionForeignPlans(userKeptAmendPlans, createPlanSourceClassifier(cwd));
 	// AI relevance filtering, mirroring executePipeline's Stage 2 (wrapped so any
 	// git / content-read / LLM / parse failure falls back to the full user-kept set).
 	// assessContextRelevance is fail-open and unit-tested; this call site is amend-only,
@@ -3456,10 +3492,10 @@ async function handleAmendPipeline(
 	// re-evaluation — and they're recorded on the amend summary's excludedContext
 	// audit, matching executePipeline. `amendExcludedContext` is hoisted out of the
 	// try so the full path and fresh-leaf branch further down can read it.
-	let amendPlanEntries = userKeptAmendPlans;
+	let amendPlanEntries = localAmendPlans;
 	let amendNoteEntries = userKeptAmendNotes;
 	let amendReferenceEntries = userKeptAmendRefs;
-	let amendExcludedContext: ReadonlyArray<ExcludedContextItem> = [];
+	let amendExcludedContext: ReadonlyArray<ExcludedContextItem> = amendForeignExcludedContext;
 	let amendContextRelevance: ReadonlyArray<ContextRelevanceRef> = [];
 	try {
 		const amendChangeSignal = await buildChangeSignal(
@@ -3469,14 +3505,14 @@ async function handleAmendPipeline(
 			cwd,
 		);
 		const amendRelevance = await assessContextRelevance(
-			{ plans: userKeptAmendPlans, notes: userKeptAmendNotes, references: relevanceCandidateAmendRefs },
+			{ plans: localAmendPlans, notes: userKeptAmendNotes, references: relevanceCandidateAmendRefs },
 			amendChangeSignal,
 			amendConfig,
 		);
 		amendPlanEntries = [...amendRelevance.plans];
 		amendNoteEntries = [...amendRelevance.notes];
 		amendReferenceEntries = [...amendRelevance.references, ...trackOnlyAmendRefs];
-		amendExcludedContext = amendRelevance.excludedContext;
+		amendExcludedContext = [...amendForeignExcludedContext, ...amendRelevance.excludedContext];
 		// Kept items' tier+reason for the amend summary artifact (amend always
 		// re-ranks fresh, so results are always populated on success).
 		amendContextRelevance = keptContextRelevanceRefs(amendRelevance);
@@ -4296,7 +4332,7 @@ async function readAllTranscripts(
 		const startLine = cursor?.lineNumber ?? 0;
 		const source = session.source ?? "claude";
 
-		// JOLLI-1785: fire ai_source_detected the first time this machine ever
+		// Fire ai_source_detected the first time this machine ever
 		// processes a transcript from `source` (markAiSourceSeen dedupes globally,
 		// so it never re-fires on later runs and can't skew the AI-source-mix view).
 		// Gated on telemetry being enabled so an opted-out/uninitialized run never

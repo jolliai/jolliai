@@ -37,7 +37,7 @@
 
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { getPlansDir } from "../core/PlanPaths.js";
+import { getClaudePlansDir } from "../core/PlanPaths.js";
 import { createLogger } from "../Logger.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import { DaemonNotifier } from "./DaemonNotifier.js";
@@ -153,7 +153,7 @@ export interface ComputeWatchTargetsOptions {
 
 export function computeWatchTargets(cwd: string, options: ComputeWatchTargetsOptions = {}): ReadonlyArray<WatchTarget> {
 	const gitCommonDir = options.gitCommonDir ?? resolveGitCommonDir(cwd);
-	const plansDir = options.plansDir ?? getPlansDir();
+	const plansDir = options.plansDir ?? getClaudePlansDir();
 	// Restated rather than imported from `SessionTracker.getGlobalConfigDir`,
 	// which is the canonical definition: this module's static import list is
 	// pinned to leaves by the "cold-start import graph" suite, and SessionTracker

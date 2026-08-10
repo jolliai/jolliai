@@ -37,6 +37,7 @@ vi.mock("../core/StorageFactory.js", () => ({
 }));
 
 vi.mock("../core/GitOps.js", () => ({
+	resolveContainingRepoCommonDir: vi.fn().mockResolvedValue(null),
 	getProjectRootDir: vi.fn().mockImplementation((cwd: string) => Promise.resolve(cwd)),
 	getCommitInfo: vi.fn(),
 	getHeadHash: vi.fn(),

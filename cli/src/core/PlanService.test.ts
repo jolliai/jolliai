@@ -136,7 +136,7 @@ import {
 	archivePlanForCommit,
 	detectPlans,
 	extractTitle,
-	getPlansDir,
+	getClaudePlansDir,
 	isPlanFromCurrentProject,
 	listAvailablePlans,
 	listUnassociatedPlans,
@@ -253,11 +253,11 @@ describe("PlanService", () => {
 		mockExecFileSync.mockReturnValue("main\n");
 	});
 
-	// ─── getPlansDir ─────────────────────────────────────────────────────────
+	// ─── getClaudePlansDir ─────────────────────────────────────────────────────────
 
-	describe("getPlansDir", () => {
+	describe("getClaudePlansDir", () => {
 		it("returns path ending in .claude/plans", () => {
-			const dir = getPlansDir();
+			const dir = getClaudePlansDir();
 			expect(dir).toBe(PLANS_DIR);
 		});
 	});

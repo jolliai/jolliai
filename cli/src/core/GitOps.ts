@@ -974,6 +974,48 @@ export async function getGitCommonDir(cwd: string): Promise<string> {
 }
 
 /**
+ * The location env vars git exports to hook processes so every child `git`
+ * invocation targets the CURRENT repo. A detached process spawned from a hook
+ * (e.g. the queue worker) inherits them, and `execGit` forwards `process.env` —
+ * so they must be stripped when asking which repo ANOTHER directory belongs to,
+ * or `rev-parse` reports the ambient (hook) repo for every path regardless of
+ * its cwd.
+ */
+const GIT_LOCATION_ENV_VARS = [
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_INDEX_FILE",
+	"GIT_COMMON_DIR",
+	"GIT_PREFIX",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_NAMESPACE",
+] as const;
+
+/**
+ * Resolves the absolute git-common-dir of the repository that CONTAINS `dir`,
+ * using cwd-based discovery even when running inside a git hook. Unlike
+ * {@link getGitCommonDir} it strips the ambient `GIT_DIR`/`GIT_WORK_TREE`/… that
+ * git sets for hooks — with those present, `rev-parse` would pin every lookup to
+ * the hook's own repo (measured: a sibling repo resolved to the current repo's
+ * `.git`, defeating foreign-repo detection). Returns null when `dir` is not
+ * inside any git repository (or cannot be resolved).
+ */
+export async function resolveContainingRepoCommonDir(dir: string): Promise<string | null> {
+	const env: NodeJS.ProcessEnv = { ...process.env, LC_ALL: "C" };
+	for (const v of GIT_LOCATION_ENV_VARS) delete env[v];
+	try {
+		const { stdout } = await execFileAsyncHidden("git", ["rev-parse", "--git-common-dir"], {
+			cwd: dir,
+			maxBuffer: MAX_GIT_BUFFER_BYTES,
+			env,
+		});
+		return resolve(dir, stdout.trim());
+	} catch {
+		return null;
+	}
+}
+
+/**
  * Returns the root directory of the main repository from the git common directory.
  * For regular repos: resolves `.git` → parent directory.
  * For worktrees: resolves the shared `.git` → main repo root.

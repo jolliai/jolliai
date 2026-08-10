@@ -11,12 +11,13 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../../Logger.js";
 import type { PlanEntry, TranscriptSource } from "../../Types.js";
 import { withPlansLock } from "../Locks.js";
 import { normalizePathForCompare } from "../PathUtils.js";
+import { getClaudePlansDir } from "../PlanPaths.js";
 import { loadPlansRegistry, savePlansRegistry } from "../SessionTracker.js";
 import { getPlanScanner } from "./PlanTranscriptScanner.js";
 
@@ -279,7 +280,7 @@ export async function scanPlansFrom(
 	//    `~/.claude/plans/foo.md` as a note via "Add Markdown File" (file
 	//    picker is unrestricted), so the same dedup applies.
 	for (const rawSlug of slugs) {
-		const planFile = join(homedir(), ".claude", "plans", `${rawSlug}.md`);
+		const planFile = join(getClaudePlansDir(), `${rawSlug}.md`);
 		if (!existsSync(planFile)) continue;
 		if (noteSourcePaths.has(normalizePathForCompare(planFile))) {
 			log.info("Plan discovery: %s already a note — skipping plan registration", planFile);

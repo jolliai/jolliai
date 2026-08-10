@@ -120,13 +120,13 @@ const {
 
 const {
 	addPlanToRegistry,
-	getPlansDir,
+	getClaudePlansDir,
 	isPlanFromCurrentProject,
 	listAvailablePlans,
 	registerNewPlan,
 } = vi.hoisted(() => ({
 	addPlanToRegistry: vi.fn(),
-	getPlansDir: vi.fn(() => "/home/user/.claude/plans"),
+	getClaudePlansDir: vi.fn(() => "/home/user/.claude/plans"),
 	// Default: attribution check passes (backward-compat for existing tests
 	// that don't explicitly exercise the cross-project gate).
 	isPlanFromCurrentProject: vi.fn(async () => true),
@@ -841,7 +841,7 @@ vi.mock("./commands/SelectAllSelection.js", () => ({
 
 vi.mock("./core/PlanService.js", () => ({
 	addPlanToRegistry,
-	getPlansDir,
+	getClaudePlansDir,
 	isPlanFromCurrentProject,
 	listAvailablePlans,
 	registerNewPlan,

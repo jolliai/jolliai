@@ -17,7 +17,7 @@ export {
 	archivePlanForCommit,
 	detectPlans,
 	extractTitle,
-	getPlansDir,
+	getClaudePlansDir,
 	isPlanFromCurrentProject,
 	listAvailablePlans,
 	listUnassociatedPlans,

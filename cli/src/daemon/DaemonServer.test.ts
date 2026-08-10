@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getPlansDir } from "../core/PlanService.js";
+import { getClaudePlansDir } from "../core/PlanService.js";
 import { getDashboardDbPath } from "../dashboard/DashboardDb.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import { DAEMON_PROTOCOL } from "./DaemonProtocol.js";
@@ -66,13 +66,13 @@ describe("computeWatchTargets", () => {
 		]);
 	});
 
-	it("defaults the plans dir to the CLI's own getPlansDir() when no override is given", () => {
+	it("defaults the plans dir to the CLI's own getClaudePlansDir() when no override is given", () => {
 		mockExec.mockReturnValueOnce("/repo/.git\n");
 		const targets = computeWatchTargets("/repo");
 		// Asserted against the shared helper rather than a second `~/.claude/plans`
 		// literal — the path is the CLI's to own, and a copy here would keep
 		// passing after the real one moved.
-		expect(targets.find((t) => t.kind === "claude-plans")?.path).toBe(getPlansDir());
+		expect(targets.find((t) => t.kind === "claude-plans")?.path).toBe(getClaudePlansDir());
 	});
 
 	it("gates the working-context target to plans.json so the dir's noisy neighbours never trigger", () => {
@@ -464,7 +464,7 @@ describe("runDaemonServer", () => {
 // import here keeps the types correct, passes lint, and leaves every test green —
 // the only thing that changes is the cold-start latency of `jolli ide-bridge`, which
 // imports this module statically while deferring all of its own handler work behind
-// `await import(...)` for exactly that reason. `getPlansDir` already leaked in once
+// `await import(...)` for exactly that reason. `getClaudePlansDir` already leaked in once
 // through `PlanService`, making SummaryStore → OrphanBranchStorage / GitOps, plus
 // SessionTracker / ReferenceStore / Locks, eager for every such process (~4 ms of
 // leaf-only imports vs ~28 ms measured under tsx). Keep this list on leaves.

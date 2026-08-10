@@ -93,7 +93,7 @@ import { renderReferenceForPreview } from "./core/ReferencePreviewMarkdown.js";
 import { getNotesDir } from "./core/NoteService.js";
 import {
 	addPlanToRegistry,
-	getPlansDir,
+	getClaudePlansDir,
 	listAvailablePlans,
 } from "./core/PlanService.js";
 import { JolliMemoryBridge } from "./JolliMemoryBridge.js";
@@ -837,7 +837,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	const memoriesStore = new MemoriesStore(bridge);
 	const plansStore = new PlansStore(bridge, {
 		workspaceRoot,
-		plansDir: getPlansDir(),
+		plansDir: getClaudePlansDir(),
 		notesDir: getNotesDir(workspaceRoot),
 	});
 	const filesStore = new FilesStore(bridge, workspaceRoot, excludeFilter);

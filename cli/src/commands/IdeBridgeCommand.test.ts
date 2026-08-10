@@ -124,9 +124,9 @@ vi.mock("../core/PlanService.js", () => ({
 	removePlan: vi.fn().mockResolvedValue(undefined),
 	renamePlanTitle: vi.fn().mockResolvedValue(undefined),
 	archivePlanForCommit: vi.fn().mockResolvedValue(null),
-	// `getPlansDir` is pointed at a scratch dir by the plans-register-new suite;
+	// `getClaudePlansDir` is pointed at a scratch dir by the plans-register-new suite;
 	// the default keeps every other test away from the real `~/.claude/plans/`.
-	getPlansDir: vi.fn().mockReturnValue("/nonexistent/claude/plans"),
+	getClaudePlansDir: vi.fn().mockReturnValue("/nonexistent/claude/plans"),
 	isPlanFromCurrentProject: vi.fn().mockResolvedValue(true),
 	registerNewPlan: vi.fn().mockResolvedValue(undefined),
 }));
@@ -135,6 +135,16 @@ vi.mock("../core/NoteService.js", () => ({
 	detectNotes: vi.fn().mockResolvedValue([]),
 	saveNote: vi.fn().mockResolvedValue(null),
 	removeNote: vi.fn().mockResolvedValue(undefined),
+}));
+
+// active-for-commit classifies each plan's source repo; the real resolver spawns
+// `git`. Stub it to classify by sourcePath so the folding logic is exercised
+// without real repos: a path containing "foreign" is a different repo, anything
+// else (including a missing sourcePath) is local.
+vi.mock("../core/plans/PlanContainment.js", () => ({
+	createPlanSourceClassifier: vi.fn(
+		() => async (sourcePath?: string) => (sourcePath?.includes("foreign") ? "foreign" : "local"),
+	),
 }));
 
 vi.mock("../core/references/ReferenceService.js", () => ({
@@ -1602,9 +1612,11 @@ describe("runIdeBridgeAction — working-context", () => {
 
 		beforeEach(async () => {
 			plansDir = mkdtempSync(join(tmpdir(), "ide-bridge-plans-"));
-			const { getPlansDir, isPlanFromCurrentProject, registerNewPlan } = await import("../core/PlanService.js");
+			const { getClaudePlansDir, isPlanFromCurrentProject, registerNewPlan } = await import(
+				"../core/PlanService.js"
+			);
 			const { loadPlansRegistry } = await import("../core/SessionTracker.js");
-			vi.mocked(getPlansDir).mockReturnValue(plansDir);
+			vi.mocked(getClaudePlansDir).mockReturnValue(plansDir);
 			vi.mocked(isPlanFromCurrentProject).mockResolvedValue(true);
 			// Empty registry by default: the handler skips already-tracked slugs
 			// before the (expensive) attribution call, so the fixture has to say
@@ -1985,6 +1997,34 @@ describe("runIdeBridgeAction — working-context", () => {
 				skills: [],
 			},
 		});
+	});
+
+	it("active-for-commit folds foreign-repo plans into the plan exclusions so the panel strikes them", async () => {
+		const tracker = await import("../core/SessionTracker.js");
+		const { readExclusions } = await import("../core/CommitSelectionStore.js");
+		vi.mocked(tracker.detectActivePlansForBranch).mockResolvedValue([
+			{ slug: "local-plan", sourcePath: "/r/docs/local.md" },
+			{ slug: "foreign-plan", sourcePath: "/elsewhere/foreign-repo/plan.md" },
+		] as never);
+		vi.mocked(tracker.detectActiveNotesForBranch).mockResolvedValue([]);
+		vi.mocked(tracker.detectUncommittedReferenceIds).mockResolvedValue([]);
+		vi.mocked(tracker.loadPlansRegistry).mockResolvedValue({ version: 1, plans: {}, references: {} } as never);
+		vi.mocked(readExclusions).mockResolvedValue({
+			conversations: new Set<string>(),
+			plans: new Set(["already-excluded"]),
+			notes: new Set<string>(),
+			references: new Set<string>(),
+		});
+
+		const result = (await runIdeBridgeAction("working-context", "/r", { operation: "active-for-commit" })) as {
+			plans: { slug: string }[];
+			exclusions: { plans: string[] };
+		};
+
+		// The foreign plan stays in the row list (the panel needs a row to strike),
+		// its slug joins the existing manual excludes, and the local one is untouched.
+		expect(result.plans.map((p) => p.slug)).toEqual(["local-plan", "foreign-plan"]);
+		expect([...result.exclusions.plans].sort()).toEqual(["already-excluded", "foreign-plan"]);
 	});
 
 	// The branch argument is vestigial in all three CLI functions (working-area

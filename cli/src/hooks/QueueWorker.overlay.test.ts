@@ -22,6 +22,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // --- Module stubs (every external IO the pipeline touches, kept minimal) ---
 
 vi.mock("../core/GitOps.js", () => ({
+	resolveContainingRepoCommonDir: vi.fn().mockResolvedValue(null),
 	getProjectRootDir: vi.fn().mockImplementation((cwd: string) => Promise.resolve(cwd)),
 	getCommitInfo: vi.fn(),
 	getHeadHash: vi.fn(),

@@ -401,9 +401,11 @@ async function runWorkingContextAction(cwd: string, request: JsonObject): Promis
 			if (names.length === 0) return { accepted: [] };
 			const { existsSync } = await import("node:fs");
 			const { basename, join } = await import("node:path");
-			const { getPlansDir, isPlanFromCurrentProject, registerNewPlan } = await import("../core/PlanService.js");
+			const { getClaudePlansDir, isPlanFromCurrentProject, registerNewPlan } = await import(
+				"../core/PlanService.js"
+			);
 			const tracker = await import("../core/SessionTracker.js");
-			const plansDir = getPlansDir();
+			const plansDir = getClaudePlansDir();
 			// One registry read for the whole burst, used purely as a fast path
 			// (see the `tracked` check below). `registerNewPlan` re-reads under
 			// plans.lock, so this snapshot never decides a write — going stale
@@ -677,6 +679,21 @@ async function runWorkingContextAction(cwd: string, request: JsonObject): Promis
 			// answer to "what is this reference called".
 			const referenceTitles = registry.references ?? {};
 			const references = referenceIds.map((r) => ({ ...r, title: referenceTitles[r.mapKey]?.title ?? r.mapKey }));
+			// A plan whose sourcePath belongs to a DIFFERENT git repo is dropped at the
+			// archive chokepoint (`detectPlanSlugsFromRegistry`), so this op — "what the
+			// next commit will claim" — must not present it as claimable. Fold the
+			// foreign slugs into the returned `exclusions.plans` so the panel strikes
+			// them through with the render path it already has (no host change), keeping
+			// them VISIBLE rather than silently includable. Return-value only: the
+			// user's on-disk manual-exclude set is untouched. Same classifier the commit
+			// path uses, so pre-commit and commit agree.
+			const { createPlanSourceClassifier } = await import("../core/plans/PlanContainment.js");
+			const classifyPlanSource = createPlanSourceClassifier(cwd);
+			const planClasses = await Promise.all(plans.map((p) => classifyPlanSource(p.sourcePath)));
+			const excludedPlanSlugs = new Set(exclusions.plans);
+			plans.forEach((p, i) => {
+				if (planClasses[i] === "foreign") excludedPlanSlugs.add(p.slug);
+			});
 			return {
 				plans,
 				notes,
@@ -686,7 +703,7 @@ async function runWorkingContextAction(cwd: string, request: JsonObject): Promis
 				// so "nothing excluded" has to arrive as [].
 				exclusions: {
 					conversations: [...exclusions.conversations],
-					plans: [...exclusions.plans],
+					plans: [...excludedPlanSlugs],
 					notes: [...exclusions.notes],
 					references: [...exclusions.references],
 					skills: [...(exclusions.skills ?? [])],

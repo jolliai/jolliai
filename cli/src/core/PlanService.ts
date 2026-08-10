@@ -28,7 +28,7 @@ import { createLogger, getJolliMemoryDir, isManuallyDisabled } from "../Logger.j
 import type { PlanEntry, PlanInfo, PlanReference } from "../Types.js";
 import { withPlansLock } from "./Locks.js";
 import { isPathInside } from "./PathUtils.js";
-import { getPlansDir } from "./PlanPaths.js";
+import { getClaudePlansDir } from "./PlanPaths.js";
 import { readManualDisableFlagSync } from "./RepoProfile.js";
 import {
 	loadAllSessions,
@@ -48,7 +48,7 @@ const log = createLogger("PlanService");
 // handler's dynamic import) is unchanged. The definition lives in the leaf
 // `PlanPaths` module because `DaemonServer` needs it statically and must not pull
 // this module's chain into a cold `ide-bridge` spawn — see PlanPaths' header.
-export { getPlansDir };
+export { getClaudePlansDir };
 
 /**
  * Reads plans.json and returns a filtered, sorted list of PlanInfo.
@@ -274,7 +274,7 @@ export async function renamePlanTitle(slug: string, title: string, cwd: string):
  * Resets any prior committed/guard state so the plan becomes editable again.
  */
 export async function addPlanToRegistry(slug: string, cwd: string): Promise<void> {
-	const planFile = join(getPlansDir(), `${slug}.md`);
+	const planFile = join(getClaudePlansDir(), `${slug}.md`);
 	if (!existsSync(planFile)) {
 		return;
 	}
@@ -330,7 +330,7 @@ export async function registerNewPlan(slug: string, cwd: string): Promise<void> 
 	// across process boundaries (esp. the long-lived ide-bridge-serve daemon).
 	if (isManuallyDisabled() || readManualDisableFlagSync(cwd)) return;
 
-	const planFile = join(getPlansDir(), `${slug}.md`);
+	const planFile = join(getClaudePlansDir(), `${slug}.md`);
 	if (!existsSync(planFile)) {
 		return;
 	}
@@ -412,11 +412,11 @@ export async function isPlanFromCurrentProject(absPath: string, cwd: string): Pr
 export function listAvailablePlans(
 	excludeSlugs: ReadonlySet<string>,
 ): ReadonlyArray<{ slug: string; title: string; mtimeMs: number }> {
-	if (!existsSync(getPlansDir())) {
+	if (!existsSync(getClaudePlansDir())) {
 		return [];
 	}
 
-	const files = readdirSync(getPlansDir()).filter((f) => f.endsWith(".md"));
+	const files = readdirSync(getClaudePlansDir()).filter((f) => f.endsWith(".md"));
 	const available: Array<{ slug: string; title: string; mtimeMs: number }> = [];
 
 	for (const file of files) {
@@ -424,7 +424,7 @@ export function listAvailablePlans(
 		if (excludeSlugs.has(slug)) {
 			continue;
 		}
-		const filePath = join(getPlansDir(), file);
+		const filePath = join(getClaudePlansDir(), file);
 		try {
 			const mtime = Math.trunc(statSync(filePath).mtimeMs);
 			available.push({ slug, title: extractTitle(filePath), mtimeMs: mtime });
@@ -457,7 +457,7 @@ export async function archivePlanForCommit(
 	// If slug is not in the registry (e.g., picked from ~/.claude/plans/ directory but
 	// never auto-discovered from transcript), create a fresh entry first.
 	if (!entry) {
-		const planFile = join(getPlansDir(), `${slug}.md`);
+		const planFile = join(getClaudePlansDir(), `${slug}.md`);
 		if (!existsSync(planFile)) {
 			return null;
 		}
