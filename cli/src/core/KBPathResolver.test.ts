@@ -23,6 +23,7 @@ import {
 	resolveKBPath,
 	resolveMemoryBankState,
 } from "./KBPathResolver.js";
+import { __setSshRunnerForTests } from "./SshAliasResolver.js";
 
 function git(cwd: string, args: string[]): void {
 	execFileSync("git", args, { cwd, stdio: "ignore" });
@@ -387,6 +388,36 @@ esac
 			expect(foldGitTransportToHttps("C:/repos/foo")).toBe("C:/repos/foo");
 			expect(foldGitTransportToHttps("my-notes")).toBe("my-notes");
 			expect(foldGitTransportToHttps("mygit.local:repos/foo")).toBe("mygit.local:repos/foo");
+		});
+
+		describe("ssh host alias resolution (~/.ssh/config)", () => {
+			afterEach(() => {
+				__setSshRunnerForTests(null);
+			});
+
+			it("folds an ssh alias to its real HostName so aliased and direct clones match", () => {
+				__setSshRunnerForTests((host) =>
+					host === "github-jolli" ? "user git\nhostname github.com\nport 22\n" : `hostname ${host}\n`,
+				);
+				expect(foldGitTransportToHttps("git@github-jolli:jolliai/jolliai.git")).toBe(
+					"https://github.com/jolliai/jolliai.git",
+				);
+				expect(foldGitTransportToHttps("ssh://git@github-jolli/jolliai/jolliai")).toBe(
+					"https://github.com/jolliai/jolliai",
+				);
+			});
+
+			it("leaves the host unchanged when ssh -G fails or reports no alias", () => {
+				__setSshRunnerForTests(() => null);
+				expect(foldGitTransportToHttps("git@github.com:user/repo.git")).toBe(
+					"https://github.com/user/repo.git",
+				);
+			});
+
+			it("does not resolve bare host:path (no user@) — passthrough stays literal even with an alias runner", () => {
+				__setSshRunnerForTests(() => "hostname github.com\n");
+				expect(foldGitTransportToHttps("mygit.local:repos/foo")).toBe("mygit.local:repos/foo");
+			});
 		});
 	});
 

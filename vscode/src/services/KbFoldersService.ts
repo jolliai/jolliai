@@ -51,6 +51,12 @@ import type { Dirent } from "node:fs";
 import { existsSync, promises as fs, readdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, normalize } from "node:path";
 import type { SummaryIndex } from "../../../cli/src/Types.js";
+import {
+	classifyDuplicateFolders,
+	type ConsolidationPlan,
+	type ConsolidationResult,
+	executeConsolidation,
+} from "../../../cli/src/core/FolderConsolidation.js";
 import { FolderStorage } from "../../../cli/src/core/FolderStorage.js";
 import { archiveKBFolder } from "../../../cli/src/core/KBPathResolver.js";
 import {
@@ -78,6 +84,14 @@ export interface KbFoldersContext {
 	 */
 	readonly currentRepoName: string | null;
 	readonly currentRemoteUrl: string | null;
+	/**
+	 * Working-tree root of the currently opened project. Needed to read this
+	 * repo's orphan branch (the system of record) when deciding how to
+	 * consolidate duplicate folders. Null/absent for a non-git / no-workspace
+	 * host (duplicate consolidation is then skipped). Optional so callers that
+	 * don't use consolidation need not supply it.
+	 */
+	readonly currentProjectRoot?: string | null;
 }
 
 /**
@@ -225,6 +239,44 @@ export class KbFoldersService {
 	 */
 	archiveDir(): string {
 		return join(this.getContext().kbParent, ".jolli", "archive");
+	}
+
+	/**
+	 * Detects duplicate Memory Bank folders for the CURRENTLY OPEN repo and, if
+	 * there are two or more, returns a plan describing how they would be merged
+	 * (see {@link classifyDuplicateFolders}). Returns `null` when there is
+	 * nothing to consolidate, or when the host has no current git project (a
+	 * duplicate set only makes sense relative to a specific repo identity).
+	 *
+	 * Split from {@link runConsolidation} so the caller can show a case-specific
+	 * confirmation between detection and the (folder-moving) execution.
+	 */
+	async planDuplicateConsolidation(): Promise<ConsolidationPlan | null> {
+		const ctx = this.getContext();
+		if (!ctx.currentRepoName || !ctx.currentProjectRoot) return null;
+		return classifyDuplicateFolders(
+			ctx.currentProjectRoot,
+			ctx.currentRepoName,
+			ctx.currentRemoteUrl,
+			ctx.kbParent,
+		);
+	}
+
+	/**
+	 * Executes a plan from {@link planDuplicateConsolidation} — the folder merge
+	 * / rebuild + archive. Drops the "clean repo" memo afterwards so the next
+	 * listing re-reads the survivor. Returns what happened.
+	 */
+	async runConsolidation(plan: ConsolidationPlan): Promise<ConsolidationResult> {
+		const ctx = this.getContext();
+		const result = await executeConsolidation(
+			plan,
+			ctx.currentProjectRoot ?? ctx.kbParent,
+			ctx.currentRemoteUrl,
+			ctx.kbParent,
+		);
+		this.cleanRepos.clear();
+		return result;
 	}
 
 	/**

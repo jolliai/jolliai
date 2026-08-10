@@ -24,6 +24,7 @@ import { execFileSyncHidden } from "../util/Subprocess.js";
 import type { ClaimVerdict, KBConfig, MemoryBankConfig, MemoryBankState } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
 import { isPathInside } from "./PathUtils.js";
+import { resolveHostAlias } from "./SshAliasResolver.js";
 
 const log = createLogger("KBPathResolver");
 
@@ -588,6 +589,14 @@ function normalizeRemoteUrl(url: string): string {
  *     distinction of the SCP path is preserved (`host:/srv/repo` →
  *     `…host//srv/repo` vs `host:srv/repo` → `…host/srv/repo`).
  *
+ * The host token of every SSH/git transport is passed through
+ * {@link resolveHostAlias}, which resolves a `~/.ssh/config` `Host` alias to
+ * its real `HostName` (`git@github-jolli:owner/repo` → `https://github.com/
+ * owner/repo` when `github-jolli` aliases `github.com`). Without this, a repo
+ * cloned via an ssh alias and the same repo via `git@github.com:` folded to
+ * different keys and split into `<repo>` / `<repo>-2` folders. The bare
+ * `host:path` passthrough is unaffected — it never reaches the fold.
+ *
  * Anything else (https, file paths, bare names) passes through unchanged.
  *
  * Shared by the local folder-reuse predicate (`isSameRepo` above) and the
@@ -596,10 +605,11 @@ function normalizeRemoteUrl(url: string): string {
  * repo cloned via SSH on one device and https on another produced duplicate
  * `repos.json` rows plus a split local folder (`<repo>` / `<repo>-2`).
  *
- * The IntelliJ plugin carries a Kotlin port (`KBPathResolver.kt
- * foldGitTransportToHttps`) that must stay in lockstep — both IDEs resolve
- * folders in the same Memory Bank, and divergent folding sends them to
- * different folders for the same repo.
+ * The IntelliJ plugin resolves folder identity by calling this function over
+ * the `kb` ide-bridge action (see `KBPathResolver.kt`, a thin adapter), so
+ * this fix reaches IntelliJ with no Kotlin change. The *separate* server
+ * binding-key normalizer in `cli/src/core/GitRemoteUtils.ts` and its Kotlin
+ * twin `GitRemoteUtils.kt` are NOT alias-aware yet — a follow-up.
  */
 /**
  * Hosts whose owner/repo path is case-insensitive on the wire — clones typed
@@ -617,11 +627,11 @@ export const CASE_INSENSITIVE_PATH_HOSTS: ReadonlySet<string> = new Set(["github
 
 export function foldGitTransportToHttps(url: string): string {
 	const ssh = url.match(/^(?:git\+)?ssh:\/\/(?:[^@/]+@)?([^/:]+)(?::(\d+))?\/(.+)$/i);
-	if (ssh) return `https://${ssh[1]}${nonDefaultPortSegment(ssh[2], "22")}/${ssh[3]}`;
+	if (ssh) return `https://${resolveHostAlias(ssh[1])}${nonDefaultPortSegment(ssh[2], "22")}/${ssh[3]}`;
 	const git = url.match(/^git:\/\/([^/:]+)(?::(\d+))?\/(.+)$/i);
-	if (git) return `https://${git[1]}${nonDefaultPortSegment(git[2], "9418")}/${git[3]}`;
+	if (git) return `https://${resolveHostAlias(git[1])}${nonDefaultPortSegment(git[2], "9418")}/${git[3]}`;
 	const scp = url.match(/^[^@/:]+@([^/:]+):(.+)$/);
-	if (scp) return `https://${scp[1]}/${scp[2]}`;
+	if (scp) return `https://${resolveHostAlias(scp[1])}/${scp[2]}`;
 	return url;
 }
 

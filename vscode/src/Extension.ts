@@ -920,6 +920,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			kbParent: sidebarKbParent,
 			currentRepoName: sidebarRepoName,
 			currentRemoteUrl: sidebarRemoteUrl,
+			currentProjectRoot: workspaceRoot || null,
 		}),
 		(info) => {
 			// Heal recovered files during this listChildren — the call itself

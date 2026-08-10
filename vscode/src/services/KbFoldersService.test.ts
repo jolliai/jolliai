@@ -12,7 +12,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { __setSotResolverForTests } from "../../../cli/src/core/FolderConsolidation";
 import { MetadataManager } from "../../../cli/src/core/MetadataManager";
+import type { StorageProvider } from "../../../cli/src/core/StorageProvider";
 import { KbFoldersService, parseMdTitle } from "./KbFoldersService";
 
 // Windows ignores chmod for unprivileged file accesses, so a `chmod 0o000`
@@ -2117,4 +2119,81 @@ describe("KbFoldersService.archiveUnusedFolders", () => {
 			})),
 		});
 	}
+});
+
+describe("KbFoldersService — duplicate consolidation", () => {
+	let tmpParent: string;
+
+	// Empty source of truth → classify takes the safe `union-largest` branch
+	// without touching a real git repo.
+	const emptySot: StorageProvider = {
+		readFile: async () => null,
+		writeFiles: async () => {},
+		listFiles: async () => [],
+		exists: async () => false,
+		ensure: async () => {},
+	};
+
+	beforeEach(() => {
+		tmpParent = mkdtempSync(join(tmpdir(), "kbconsol-"));
+		__setSotResolverForTests(async () => emptySot);
+	});
+	afterEach(() => {
+		__setSotResolverForTests(null);
+		rmSync(tmpParent, { recursive: true, force: true });
+	});
+
+	function makeRepo(dirName: string, hashes: string[]): string {
+		const root = join(tmpParent, dirName);
+		mkdirSync(join(root, ".jolli", "summaries"), { recursive: true });
+		writeFileSync(
+			join(root, ".jolli", "config.json"),
+			JSON.stringify({ version: 1, sortOrder: "date", repoName: "app" }),
+		);
+		for (const h of hashes) {
+			writeFileSync(join(root, ".jolli", "summaries", `${h}.json`), JSON.stringify({ commitHash: h }));
+		}
+		writeFileSync(
+			join(root, ".jolli", "index.json"),
+			JSON.stringify({ version: 3, entries: hashes.map((h) => ({ commitHash: h, parentCommitHash: null })) }),
+		);
+		return root;
+	}
+
+	function svc(currentRepoName: string | null, currentProjectRoot: string | null): KbFoldersService {
+		return new KbFoldersService(() => ({
+			kbParent: tmpParent,
+			currentRepoName,
+			currentRemoteUrl: null,
+			currentProjectRoot,
+		}));
+	}
+
+	it("returns null when the host has no current git project", async () => {
+		makeRepo("app", ["a1"]);
+		makeRepo("app-2", ["a2"]);
+		expect(await svc(null, "/cwd").planDuplicateConsolidation()).toBeNull();
+		expect(await svc("app", null).planDuplicateConsolidation()).toBeNull();
+	});
+
+	it("returns null when the repo has only one folder", async () => {
+		makeRepo("app", ["a1"]);
+		expect(await svc("app", "/cwd").planDuplicateConsolidation()).toBeNull();
+	});
+
+	it("plans a union-largest merge and executes it", async () => {
+		makeRepo("app", ["a1", "a2", "a3"]);
+		makeRepo("app-2", ["a1", "z9"]);
+		const service = svc("app", "/cwd");
+
+		const plan = await service.planDuplicateConsolidation();
+		expect(plan?.kind).toBe("union-largest");
+		expect(plan?.survivor).toBe(join(tmpParent, "app"));
+		if (!plan) throw new Error("expected a consolidation plan");
+
+		const result = await service.runConsolidation(plan);
+		expect(result.summariesAfter).toBe(4);
+		expect(existsSync(join(tmpParent, "app-2"))).toBe(false);
+		expect(existsSync(join(tmpParent, "app", ".jolli", "summaries", "z9.json"))).toBe(true);
+	});
 });

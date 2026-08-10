@@ -8,7 +8,13 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { basename } from "node:path";
 import * as vscode from "vscode";
+import type {
+	ConsolidationKind,
+	ConsolidationPlan,
+	ConsolidationResult,
+} from "../../../cli/src/core/FolderConsolidation.js";
 import type { DetectedAgent } from "../../../cli/src/core/localagent/DetectAgents.js";
 import type { PinEntry, PinKind } from "../../../cli/src/core/PinStore.js";
 import { resolveSessionTitle } from "../../../cli/src/core/SessionTitleResolver.js";
@@ -130,6 +136,32 @@ function isAllowedWebviewCommandArgs(command: string, args: ReadonlyArray<unknow
 	}
 }
 
+/**
+ * Builds the case-specific confirmation shown before a duplicate-folder merge.
+ * Each `ConsolidationKind` states exactly what will happen and the counts, so
+ * the user is agreeing to a concrete action, not a vague "merge".
+ */
+export function describeConsolidationPlan(plan: ConsolidationPlan): string {
+	const n = plan.folders.length;
+	const survivor = basename(plan.survivor);
+	const messages: Record<ConsolidationKind, string> = {
+		identical:
+			`Jolli found ${n} Memory Bank folders for "${plan.repoName}" with identical contents ` +
+			`(${plan.counts.survivor} memories). Keep "${survivor}" and archive the ${n - 1} duplicate ` +
+			`${n - 1 === 1 ? "folder" : "folders"}?`,
+		"orphan-superset":
+			`Jolli found ${n} Memory Bank folders for "${plan.repoName}". The orphan branch already ` +
+			`contains all ${plan.counts.orphan} memories, so a single clean "${survivor}" folder will be ` +
+			`rebuilt from it and the ${n} duplicates archived. Proceed?`,
+		"union-largest":
+			`Jolli found ${n} Memory Bank folders for "${plan.repoName}" with different contents. ` +
+			`"${survivor}" (${plan.counts.survivor} memories) will absorb ${plan.counts.added} more from the ` +
+			`others (total ${plan.counts.union}), then the ${n - 1} duplicate ` +
+			`${n - 1 === 1 ? "folder" : "folders"} will be archived. Proceed?`,
+	};
+	return messages[plan.kind];
+}
+
 export interface SidebarWebviewDeps {
 	executeCommand: (
 		command: string,
@@ -196,6 +228,15 @@ export interface SidebarWebviewDeps {
 		 * tests (which inject only `listChildren`) keep working.
 		 */
 		archiveDir?: () => string;
+		/**
+		 * Detects duplicate Memory Bank folders for the current repo and returns a
+		 * merge plan, or `null` when there is nothing to consolidate. Split from
+		 * `runConsolidation` so Refresh can show a case-specific confirmation
+		 * before moving any folder. Optional so trimmed-down test hosts compile.
+		 */
+		planDuplicateConsolidation?: () => Promise<ConsolidationPlan | null>;
+		/** Executes a plan from `planDuplicateConsolidation` (merge/rebuild + archive). */
+		runConsolidation?: (plan: ConsolidationPlan) => Promise<ConsolidationResult>;
 	};
 	/**
 	 * Source for the breadcrumb repo/branch dropdowns. `listRepos` enumerates
@@ -1905,11 +1946,15 @@ export class SidebarWebviewProvider
 	 * The trailing `handleExpandFolder("")` re-reads the trimmed directory, which
 	 * is what makes them vanish on the same click.
 	 *
-	 * Deliberately NOT a duplicate-collapsing pass. Refresh's contract is that it
-	 * never moves a folder holding memories — see
-	 * `KbFoldersService.archiveUnusedFolders` for why collapsing duplicates
-	 * requires rebuilding the survivor from the orphan branch and therefore
-	 * belongs to Migrate.
+	 * After the empty-folder sweep, Refresh ALSO offers to consolidate DUPLICATE
+	 * folders for the current repo (`<repo>` + `<repo>-2`, typically split by an
+	 * ssh host alias). Unlike the empty sweep this can move folders holding
+	 * memories, so it is gated behind a modal confirmation whose text depends on
+	 * how the merge will be done (identical → keep shortest; orphan-superset →
+	 * rebuild one folder from the orphan branch; union-largest → fold into the
+	 * largest, preserving summaries the orphan branch lacks). This supersedes the
+	 * older "duplicates belong to Migrate, not Refresh" stance: the merge is real
+	 * (not a lossy archive-the-loser move) and the user confirms it explicitly.
 	 *
 	 * Errors are logged and swallowed: the sweep is best-effort and recoverable
 	 * (folders are MOVED into the hidden archive dir, never deleted), so a locked
@@ -1959,7 +2004,59 @@ export class SidebarWebviewProvider
 				);
 			}
 		}
+		await this.consolidateDuplicateKbFolders();
 		await this.handleExpandFolder("");
+	}
+
+	/**
+	 * The duplicate-folder half of a Refresh: detect two-or-more folders for the
+	 * current repo, ask the user (with a case-specific prompt) whether to merge
+	 * them, and execute on confirm. No-op when nothing is duplicated or the host
+	 * did not wire the consolidation callbacks. Best-effort: any failure is
+	 * logged and swallowed so the re-list the user asked for still happens.
+	 */
+	private async consolidateDuplicateKbFolders(): Promise<void> {
+		const kb = this.deps.kbFolders;
+		if (!kb?.planDuplicateConsolidation || !kb.runConsolidation) return;
+		try {
+			const plan = await kb.planDuplicateConsolidation();
+			if (!plan) return;
+
+			const MERGE = "Merge";
+			const choice = await vscode.window.showWarningMessage(
+				describeConsolidationPlan(plan),
+				{ modal: true },
+				MERGE,
+			);
+			if (choice !== MERGE) return;
+
+			const result = await kb.runConsolidation(plan);
+
+			// The merged/rebuilt survivor's contents changed even when its path did
+			// not, so drop the "clean repo" memo before the re-list picks it up.
+			kb.notifyDirty?.();
+
+			const archiveDir = kb.archiveDir?.();
+			const REVEAL = "Reveal Archive";
+			const noun = result.archived.length === 1 ? "folder" : "folders";
+			void vscode.window
+				.showInformationMessage(
+					`Jolli Memory: merged duplicate Memory Bank folders into ` +
+						`"${basename(result.survivor)}" (${result.summariesAfter} memories). ` +
+						`Archived ${result.archived.length} duplicate ${noun} (recoverable).`,
+					...(archiveDir ? [REVEAL] : []),
+				)
+				.then((c) => {
+					if (c === REVEAL && archiveDir) {
+						void this.deps.executeCommand("revealFileInOS", vscode.Uri.file(archiveDir));
+					}
+				});
+		} catch (err) {
+			log.warn(
+				"SidebarWebviewProvider",
+				`consolidateDuplicateKbFolders failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
 	}
 
 	/**

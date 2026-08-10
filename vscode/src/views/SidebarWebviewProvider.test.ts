@@ -8,7 +8,8 @@ import type {
 	SidebarState,
 } from "./SidebarMessages";
 import { setManuallyDisabled } from "../../../cli/src/Logger.js";
-import { SidebarWebviewProvider } from "./SidebarWebviewProvider";
+import type { ConsolidationPlan } from "../../../cli/src/core/FolderConsolidation.js";
+import { describeConsolidationPlan, SidebarWebviewProvider } from "./SidebarWebviewProvider";
 
 interface MockWebview {
 	html: string;
@@ -50,8 +51,11 @@ const { clipboardWriteText } = vi.hoisted(() => ({
 }));
 // Backs the toast the KB refresh raises after `kbFolders.archiveUnusedFolders()`
 // archives folders that hold no memories at all.
-const { showInformationMessage } = vi.hoisted(() => ({
+const { showInformationMessage, showWarningMessage } = vi.hoisted(() => ({
 	showInformationMessage: vi.fn().mockResolvedValue(undefined),
+	// Backs the modal confirmation the KB refresh raises before merging duplicate
+	// folders. Default: user cancels (resolves undefined).
+	showWarningMessage: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("vscode", () => ({
 	Uri: {
@@ -69,6 +73,7 @@ vi.mock("vscode", () => ({
 			dispose: vi.fn(),
 		})),
 		showInformationMessage,
+		showWarningMessage,
 	},
 	workspace: {
 		get workspaceFolders() {
@@ -2061,6 +2066,98 @@ describe("SidebarWebviewProvider", () => {
 		await new Promise((r) => setTimeout(r, 0));
 		expect(showInformationMessage).not.toHaveBeenCalled();
 		expect(kbFolders.listChildren).toHaveBeenCalledWith("");
+	});
+
+	describe("duplicate-folder consolidation on refresh", () => {
+		function makePlan(over: Partial<ConsolidationPlan> = {}): ConsolidationPlan {
+			return {
+				kind: "union-largest",
+				repoName: "app",
+				folders: ["/kb/app", "/kb/app-2"],
+				survivor: "/kb/app",
+				archived: ["/kb/app-2"],
+				counts: { perFolder: { "/kb/app": 3, "/kb/app-2": 2 }, orphan: 0, union: 4, survivor: 3, added: 1 },
+				...over,
+			};
+		}
+
+		function makeConsolidationProvider(plan: ConsolidationPlan | null) {
+			const view = makeMockView();
+			const executeCommand = vi.fn().mockResolvedValue(undefined);
+			const runConsolidation = vi.fn().mockResolvedValue({
+				kind: plan?.kind ?? "union-largest",
+				survivor: plan?.survivor ?? "/kb/app",
+				archived: plan?.archived ?? ["/kb/app-2"],
+				summariesAfter: 4,
+			});
+			const kbFolders = {
+				listChildren: vi.fn().mockResolvedValue([]),
+				notifyDirty: vi.fn(),
+				archiveDir: vi.fn(() => "/kb/.jolli/archive"),
+				planDuplicateConsolidation: vi.fn().mockResolvedValue(plan),
+				runConsolidation,
+			};
+			const provider = new SidebarWebviewProvider({
+				executeCommand,
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				kbFolders,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			showInformationMessage.mockClear();
+			showWarningMessage.mockClear();
+			return { view, kbFolders, executeCommand, runConsolidation };
+		}
+
+		it("prompts, merges on confirm, and toasts the survivor", async () => {
+			const { view, runConsolidation, kbFolders } = makeConsolidationProvider(makePlan());
+			showWarningMessage.mockResolvedValueOnce("Merge");
+			view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+			await new Promise((r) => setTimeout(r, 0));
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showWarningMessage).toHaveBeenCalledTimes(1);
+			expect(showWarningMessage.mock.calls[0][1]).toEqual({ modal: true });
+			expect(runConsolidation).toHaveBeenCalledTimes(1);
+			expect(kbFolders.notifyDirty).toHaveBeenCalled();
+			expect(showInformationMessage).toHaveBeenCalledTimes(1);
+			expect(showInformationMessage.mock.calls[0][0]).toContain('merged duplicate Memory Bank folders into "app"');
+		});
+
+		it("does nothing when the user cancels the prompt", async () => {
+			const { view, runConsolidation } = makeConsolidationProvider(makePlan());
+			showWarningMessage.mockResolvedValueOnce(undefined); // dismissed
+			view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+			await new Promise((r) => setTimeout(r, 0));
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showWarningMessage).toHaveBeenCalledTimes(1);
+			expect(runConsolidation).not.toHaveBeenCalled();
+			expect(showInformationMessage).not.toHaveBeenCalled();
+		});
+
+		it("stays silent when there are no duplicates to consolidate", async () => {
+			const { view, runConsolidation } = makeConsolidationProvider(null);
+			view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showWarningMessage).not.toHaveBeenCalled();
+			expect(runConsolidation).not.toHaveBeenCalled();
+		});
+
+		it("phrases the prompt per case", () => {
+			expect(describeConsolidationPlan(makePlan({ kind: "identical", counts: makePlan().counts }))).toContain(
+				"identical contents",
+			);
+			expect(describeConsolidationPlan(makePlan({ kind: "orphan-superset" }))).toContain(
+				"rebuilt from it",
+			);
+			expect(describeConsolidationPlan(makePlan({ kind: "union-largest" }))).toContain("will absorb 1 more");
+		});
 	});
 
 	it("handles refresh scope='branch' by invoking the three branch refresh commands", () => {
