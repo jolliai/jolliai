@@ -1,8 +1,22 @@
 import { describe, expect, it } from "vitest";
 import { getParserForSource, TOOL_RECORDING_SOURCES } from "./TranscriptParser.js";
 
-/** Shorthand: run a parser's parseToolUse over pre-serialized events. */
+/**
+ * Shorthand: run a parser's parseToolUse over pre-serialized events, with the
+ * per-call timestamp dropped.
+ *
+ * Every case below is about tool IDENTITY — which bucket a shape lands in, what
+ * de-duplicates, what upgrades — and `lastCallAtMs` is orthogonal to all of it.
+ * Left in, it would appear in ~20 expected objects that are not about it, and
+ * changing a fixture's timestamp would fail tests that never mentioned time.
+ * The stamping itself is asserted by {@link timedToolUse}'s cases instead.
+ */
 function toolUse(source: "claude" | "codex" | "kimi", events: ReadonlyArray<unknown>) {
+	return timedToolUse(source, events).map(({ lastCallAtMs: _dropped, ...rest }) => rest);
+}
+
+/** The same, keeping `lastCallAtMs` — for the cases that are about it. */
+function timedToolUse(source: "claude" | "codex" | "kimi", events: ReadonlyArray<unknown>) {
 	const parser = getParserForSource(source);
 	if (parser.parseToolUse === undefined) throw new Error(`${source} parser has no parseToolUse`);
 	return parser.parseToolUse(events.map((e) => JSON.stringify(e)));
@@ -251,5 +265,87 @@ describe("TOOL_RECORDING_SOURCES", () => {
 		for (const source of ["cursor", "copilot", "copilot-chat", "cline"]) {
 			expect(TOOL_RECORDING_SOURCES.has(source)).toBe(false);
 		}
+	});
+});
+
+describe("parseToolUse — the call's own time", () => {
+	// Why the field exists: the dashboard used to window tool rows by their
+	// SESSION's `updated_at_ms`, which files a months-old recall under today and
+	// a call made minutes ago under whenever its long-running session started.
+	it("stamps a Claude call with the timestamp of the line that recorded it", () => {
+		expect(
+			timedToolUse("claude", [
+				{
+					timestamp: "2026-08-06T16:03:08.019Z",
+					message: { content: [{ type: "tool_use", id: "toolu_1", name: "Bash" }] },
+				},
+			]),
+		).toEqual([{ name: "Bash", kind: "builtin", calls: 1, lastCallAtMs: Date.parse("2026-08-06T16:03:08.019Z") }]);
+	});
+
+	it("keeps the LAST call's time when a bucket holds several", () => {
+		const rows = timedToolUse("claude", [
+			{
+				timestamp: "2026-08-06T10:00:00.000Z",
+				message: { content: [{ type: "tool_use", id: "a", name: "Bash" }] },
+			},
+			{
+				timestamp: "2026-08-06T12:00:00.000Z",
+				message: { content: [{ type: "tool_use", id: "b", name: "Bash" }] },
+			},
+		]);
+		expect(rows).toEqual([
+			{ name: "Bash", kind: "builtin", calls: 2, lastCallAtMs: Date.parse("2026-08-06T12:00:00.000Z") },
+		]);
+	});
+
+	it("leaves the field absent — not zero — when the line carries no timestamp", () => {
+		// Absent means "this parser had no instant to offer", which every consumer
+		// falls back on. A zero would be the claim "called at the epoch", which
+		// windows would silently believe.
+		expect(
+			timedToolUse("claude", [{ message: { content: [{ type: "tool_use", id: "a", name: "Bash" }] } }]),
+		).toEqual([{ name: "Bash", kind: "builtin", calls: 1 }]);
+	});
+
+	it("stamps a Codex call from its envelope, and a Kimi call from its epoch `time`", () => {
+		expect(
+			timedToolUse("codex", [codexRow({ type: "function_call", call_id: "c1", name: "wait", arguments: "{}" })]),
+		).toEqual([{ name: "wait", kind: "builtin", calls: 1, lastCallAtMs: Date.parse("2026-08-06T16:03:08.019Z") }]);
+		expect(timedToolUse("kimi", [kimiRow({ type: "tool.call", name: "Bash", toolCallId: "k1" })])).toEqual([
+			{ name: "Bash", kind: "builtin", calls: 1, lastCallAtMs: 1786000000000 },
+		]);
+	});
+
+	it("carries a Codex call's later row time even when an earlier row won the identity", () => {
+		// The request row and its `mcp_tool_call_end` are written at different
+		// instants, and the row that wins the identity is not necessarily the later
+		// one — so the bucket takes the later time regardless of which won.
+		expect(
+			timedToolUse("codex", [
+				{
+					timestamp: "2026-08-06T10:00:00.000Z",
+					type: "response_item",
+					payload: {
+						type: "mcp_tool_call_end",
+						call_id: "m1",
+						invocation: { server: "jollimemory", tool: "recall" },
+					},
+				},
+				{
+					timestamp: "2026-08-06T12:00:00.000Z",
+					type: "response_item",
+					payload: { type: "function_call", call_id: "m1", name: "recall", arguments: "{}" },
+				},
+			]),
+		).toEqual([
+			{
+				name: "jollimemory.recall",
+				kind: "mcp",
+				server: "jollimemory",
+				calls: 1,
+				lastCallAtMs: Date.parse("2026-08-06T12:00:00.000Z"),
+			},
+		]);
 	});
 });

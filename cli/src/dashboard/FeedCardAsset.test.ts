@@ -17,6 +17,7 @@ interface JDNamespace {
 	renderStats: (model: unknown) => void;
 	scopeChip: (model: unknown) => string;
 	repoToken: (model: unknown, identity: string) => string;
+	withParams: (query: string, params: Record<string, string | undefined>) => string;
 }
 
 /** Minimal element stub: enough for the renderer to write into and be read back. */
@@ -128,6 +129,7 @@ function model(over: Record<string, unknown> = {}, statsOver: Record<string, unk
 				distinctMemoriesUsed: 0,
 				staleMemoriesUsed: 0,
 				sessionsWithContext: 0,
+				callsWithoutSession: 0,
 				sessionsInWindow: 0,
 				bySurface: [],
 				skillInvocations: 0,
@@ -165,7 +167,9 @@ describe("Memory Activity — memory tier", () => {
 		expect(html).toContain("3 turns");
 		expect(html).toContain("fix-auth-refresh");
 		expect(html).toContain("Open memory →");
-		expect(html).toContain("/memories?repo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai&hash=h1");
+		// `detailRepo`, not `repo`: the link names which repo owns the memory
+		// without scoping the Memories tree to it (see wireTree in memories.js).
+		expect(html).toContain("&hash=h1&detailRepo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai");
 		expect(html).toContain('" target="_blank" rel="noopener">Open memory →');
 		// The whole point of the runtime test: a renamed model field would show up here.
 		expect(html).not.toContain("undefined");
@@ -302,7 +306,7 @@ describe("Memory Activity", () => {
 		expect(app.innerHTML).toContain('aria-label="Memory Activity"');
 		expect(app.innerHTML).toContain('data-memory-activity-view="branch"');
 		expect(app.innerHTML).toContain('data-memory-activity-view="time"');
-		expect(app.innerHTML).toContain("/memories?repo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai&hash=h1");
+		expect(app.innerHTML).toContain("&hash=h1&detailRepo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai");
 		expect(app.innerHTML).toContain("Open memory →");
 	});
 });
@@ -394,11 +398,81 @@ describe("Recall card", () => {
 			daily: [{ date: "2026-07-30", used: 3, setAside: 1 }],
 		});
 		expect(html).toContain("3 used");
-		expect(html).toContain("<b>3</b> via the recall tool");
-		expect(html).toContain("<b>1</b> via the CLI");
-		expect(html).toContain("belongs to no session");
+		// The footnote is ONE line now — the coverage ratio. The surface split moved
+		// into the ⓘ's hover, as plain text (a `title` attribute renders no tags).
+		expect(html).toContain("<b>2</b> of 4 sessions got prior context");
+		expect(html).toContain("3 via the recall tool, 1 via the CLI");
+		expect(html).not.toContain("<b>3</b> via the recall tool");
+		// Two sessions DO account for the calls here, so the session-less caveat
+		// does not apply and must not be raised.
+		expect(html).not.toContain("belongs to no session");
 		expect(html).not.toContain("undefined");
 		expect(html).not.toContain("NaN");
+	});
+
+	it("raises the session-less caveat exactly when such a call exists", () => {
+		const withSessions = recallHtml({
+			usedCalls: 2,
+			setAsideCalls: 0,
+			contextServedPct: 100,
+			sessionsWithContext: 2,
+			callsWithoutSession: 0,
+			sessionsInWindow: 3,
+			bySurface: [{ surface: "cli", calls: 2 }],
+			daily: [{ date: "2026-07-30", used: 2, setAside: 0 }],
+		});
+		expect(withSessions).not.toContain("belonging to no session");
+		// `jolli recall` from a plain shell, or a host that publishes no session id.
+		const sessionless = recallHtml({
+			usedCalls: 2,
+			setAsideCalls: 0,
+			contextServedPct: 100,
+			sessionsWithContext: 0,
+			callsWithoutSession: 2,
+			sessionsInWindow: 3,
+			bySurface: [{ surface: "cli", calls: 2 }],
+			daily: [{ date: "2026-07-30", used: 2, setAside: 0 }],
+		});
+		expect(sessionless).toContain("2 recalls ran outside an agent session");
+	});
+
+	it("raises it in a MIXED window too — the case the old condition stayed silent for", () => {
+		// The condition used to be `sessionsWithContext === 0`, which reads as "no
+		// session claims these calls" but means "not ONE receipt names a session".
+		// A window with both kinds of call — the very situation the caveat exists to
+		// explain — therefore never showed it.
+		const mixed = recallHtml({
+			usedCalls: 5,
+			setAsideCalls: 0,
+			contextServedPct: 100,
+			sessionsWithContext: 3,
+			callsWithoutSession: 1,
+			sessionsInWindow: 4,
+			bySurface: [{ surface: "cli", calls: 5 }],
+			daily: [{ date: "2026-07-30", used: 5, setAside: 0 }],
+		});
+		expect(mixed).toContain("1 recall ran outside an agent session");
+	});
+
+	it("says `call is` for one receipt-less call and `calls are` for several", () => {
+		const one = recallHtml({
+			usedCalls: 1,
+			setAsideCalls: 0,
+			contextServedPct: 100,
+			callsWithoutReceipt: 1,
+			bySurface: [{ surface: "cli", calls: 1 }],
+			daily: [{ date: "2026-07-30", used: 1, setAside: 0 }],
+		});
+		expect(one).toContain("1 further call is in the transcripts");
+		const many = recallHtml({
+			usedCalls: 1,
+			setAsideCalls: 0,
+			contextServedPct: 100,
+			callsWithoutReceipt: 3,
+			bySurface: [{ surface: "cli", calls: 1 }],
+			daily: [{ date: "2026-07-30", used: 1, setAside: 0 }],
+		});
+		expect(many).toContain("3 further calls are in the transcripts");
 	});
 
 	it("flags skill runs that outnumber the recalls they were supposed to make", () => {
@@ -410,7 +484,8 @@ describe("Recall card", () => {
 			bySurface: [{ surface: "mcp", calls: 1 }],
 			daily: [{ date: "2026-07-30", used: 1, setAside: 0 }],
 		});
-		expect(html).toContain("more often than recall was actually called");
+		// In the hover detail now, and reworded to fit a plain-text attribute.
+		expect(html).toContain("the jolli-recall skill ran 4×, more often than recall was called");
 	});
 
 	it("stays quiet about the skill when every invocation did recall", () => {
@@ -423,5 +498,21 @@ describe("Recall card", () => {
 			daily: [{ date: "2026-07-30", used: 2, setAside: 0 }],
 		});
 		expect(html).not.toContain("more often than recall");
+	});
+});
+
+describe("JD.withParams (shell.js)", () => {
+	// The separator is the whole point: `JD.query` returns "" for an unscoped page
+	// and "?repo=…" for a scoped one, and appending "&hash=…" to the empty form
+	// produces a URL whose params are silently dropped.
+	it("opens the query string when there is none and extends it when there is", () => {
+		expect(JD.withParams("", { hash: "h1" })).toBe("?hash=h1");
+		expect(JD.withParams("?repo=jolliai", { hash: "h1" })).toBe("?repo=jolliai&hash=h1");
+	});
+	it("url-encodes values and drops empty ones", () => {
+		expect(JD.withParams("", { hash: "h1", detailRepo: "https://github.com/jolliai/jolliai" })).toBe(
+			"?hash=h1&detailRepo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai",
+		);
+		expect(JD.withParams("?repo=x", { hash: "", detailRepo: undefined })).toBe("?repo=x");
 	});
 });

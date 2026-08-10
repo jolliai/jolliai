@@ -79,7 +79,7 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
-import { getProjectRootDir, listReachableCommits } from "../core/GitOps.js";
+import { getProjectRootDir, listReachableCommits, readLocalGitIdentity } from "../core/GitOps.js";
 import { escapeForInlineScript } from "../core/InlineScript.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import { trackAs } from "../core/Telemetry.js";
@@ -95,12 +95,13 @@ import {
 	withDashboardDb,
 	withReadonlyDashboardDb,
 } from "./DashboardDb.js";
-import type {
-	DashboardModel,
-	DashboardRange,
-	DashboardScope,
-	DashboardView,
-	SeriesDimension,
+import {
+	CONTEXT_DOC_KINDS,
+	type DashboardModel,
+	type DashboardRange,
+	type DashboardScope,
+	type DashboardView,
+	type SeriesDimension,
 } from "./DashboardModel.js";
 import { buildDashboardModel, type QueryOptions } from "./DashboardQuery.js";
 import { getDecisionGist } from "./DecisionGist.js";
@@ -280,6 +281,20 @@ export type ModelRequest = Omit<QueryOptions, "timeZone" | "nowMs"> & {
 	 * this closes the route that redirect cannot cover.
 	 */
 	readonly allowModelSpend?: boolean;
+	/**
+	 * Set when the caller reads only the parts of the model every view carries —
+	 * today just `repos.length`, for the `/` redirect — and must not pay for the
+	 * per-repo `git rev-list --branches` fan-out {@link REACHABILITY_VIEWS} would
+	 * otherwise trigger.
+	 *
+	 * The redirect builds the `repositories` model to stay clear of the stats
+	 * view's LLM call, and that became the expensive choice the moment
+	 * `repositories` joined the reachability set: one git subprocess per enabled
+	 * repo plus every root memory hash materialized in JS, to decide a 302 whose
+	 * destination then does the same work again. `isReachable` fails open, so the
+	 * counts this skips revert to their raw values — which the redirect discards.
+	 */
+	readonly skipReachability?: boolean;
 };
 
 /** Builds the model for one request. Injectable so tests skip the real DB. */
@@ -298,6 +313,40 @@ export type ModelBuilder = (request: ModelRequest) => Promise<DashboardModel>;
  * each other for any repo whose history was rewritten away.
  */
 const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>(["stats", "memories", "repositories"]);
+
+/**
+ * Every `user.email` / `user.name` this machine commits under, unioned across
+ * the registered repos — the standup board's "mine only" filter.
+ *
+ * Per repo rather than once globally because `git config user.email` is
+ * routinely overridden inside a worktree (a work identity in one checkout, a
+ * personal one in another), and a global-only read would filter the overridden
+ * repo's own commits away. Unioning is the right shape for the same reason it is
+ * safe: the alternative — per-repo identities applied only to that repo's rows —
+ * costs a correlated filter to separate identities that belong to one person
+ * anyway.
+ *
+ * Concurrent, two `git config` reads per repo, and only for the standup view.
+ * An unreadable or unconfigured repo contributes nothing rather than failing the
+ * request: `authorFilter` then fails open on an empty identity.
+ */
+async function readLocalAuthorIdentity(
+	repos: ReadonlyArray<{ worktree_root: string }>,
+): Promise<{ emails: string[]; names: string[] }> {
+	const identities = await Promise.all(
+		// An empty `worktree_root` is a placeholder row (see readReachableCommitsByRepo):
+		// `cwd: ''` silently runs in the PARENT process's directory, which would read
+		// whichever repo the server happens to be launched from.
+		repos.map(async (repo) => (repo.worktree_root ? readLocalGitIdentity(repo.worktree_root) : null)),
+	);
+	const emails = new Set<string>();
+	const names = new Set<string>();
+	for (const identity of identities) {
+		if (identity?.email) emails.add(identity.email);
+		if (identity?.name) names.add(identity.name);
+	}
+	return { emails: [...emails], names: [...names] };
+}
 
 /**
  * One `git rev-list --branches` per enabled repo, mapped to {@link ReachableCommits}.
@@ -352,22 +401,37 @@ async function defaultModelBuilder(
 			// memories tree, the stats page's Memory Activity feed and captured
 			// counts, and the Repositories page's per-repo memory badge.
 			//
-			// Computed BEFORE the repositories model, which consumes it.
-			const reachableCommits = REACHABILITY_VIEWS.has(request.view)
-				? await readReachableCommitsByRepo(
-						db
-							.prepare("SELECT repo_identity, worktree_root FROM repos WHERE disabled_at IS NULL")
-							.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
-					)
-				: undefined;
+			// Computed BEFORE the repositories model, which consumes it. Skipped
+			// for a caller that never looks at the filtered rows — see
+			// `ModelRequest.skipReachability`.
+			const reachableCommits =
+				REACHABILITY_VIEWS.has(request.view) && !request.skipReachability
+					? await readReachableCommitsByRepo(
+							db
+								.prepare("SELECT repo_identity, worktree_root FROM repos WHERE disabled_at IS NULL")
+								.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
+						)
+					: undefined;
 			const repositories =
 				request.view === "repositories"
 					? await buildRepositoriesModel(db, configDir, reachableCommits)
+					: undefined;
+			// Standup is a FIRST-PERSON report, unlike every other view: its columns
+			// feed a Copy-as-standup draft the user posts as their own work, so a
+			// shared branch's teammate commits are a false claim rather than noise.
+			const authorIdentity =
+				request.view === "standup"
+					? await readLocalAuthorIdentity(
+							db
+								.prepare("SELECT worktree_root FROM repos WHERE disabled_at IS NULL")
+								.all() as ReadonlyArray<{ worktree_root: string }>,
+						)
 					: undefined;
 			const model = buildDashboardModel(db, {
 				...request,
 				...(repositories ? { repositoriesModel: repositories } : {}),
 				...(reachableCommits ? { reachableCommits } : {}),
+				...(authorIdentity ? { authorIdentity } : {}),
 			});
 			return attachDecisionGist(model, request, configDir);
 		},
@@ -623,12 +687,20 @@ function parseWindow(url: URL): Omit<ModelRequest, "view" | "scope"> {
 	// unresolvable hash just means no memory matched (buildMemoryDetail
 	// returns undefined), never a query to sanitize here.
 	const hash = url.searchParams.get("hash") ?? undefined;
+	// Which repo owns that hash — NOT a page scope. It is a separate param from
+	// `repo=` precisely because `repo=` narrows every page, and opening one
+	// memory used to collapse the whole tree to its repository. Same forwarding
+	// rules as `hash`: it reaches SQL only through `resolveScope`'s bound
+	// parameters, and an unresolvable value means the detail falls back to the
+	// page scope rather than erroring.
+	const detailRepo = url.searchParams.get("detailRepo") ?? undefined;
 	return {
 		...(dimension ? { dimension } : {}),
 		...(range ? { range } : {}),
 		...(customFrom ? { customFrom } : {}),
 		...(customTo ? { customTo } : {}),
 		...(hash ? { hash } : {}),
+		...(detailRepo ? { detailRepoIdentity: detailRepo } : {}),
 	};
 }
 
@@ -806,7 +878,16 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			// the whole stats query set and can fire a DecisionGist LLM call — so
 			// merely opening the base URL by hand used to spend model budget on a
 			// redirect. Same gate as the destination pages below, one model each.
-			const model = await buildModel({ view: "repositories", scope: parseScope(url), ...parseWindow(url) });
+			// `skipReachability` because only `repos.length` is read here: the
+			// per-repo git fan-out the `repositories` view otherwise pays for would
+			// buy a memory badge this response throws away, and the page it
+			// redirects to computes it again anyway.
+			const model = await buildModel({
+				view: "repositories",
+				scope: parseScope(url),
+				...parseWindow(url),
+				skipReachability: true,
+			});
 			res.writeHead(302, { Location: model.repos.length === 0 ? "/repositories" : "/dashboard" });
 			res.end();
 			return;
@@ -914,10 +995,11 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		// usually never opens. A read like every other GET here — no token.
 		if (url.pathname === "/api/context") {
 			const repo = url.searchParams.get("repo") ?? "";
-			const kind = url.searchParams.get("kind") ?? "";
+			const kindParam = url.searchParams.get("kind") ?? "";
 			const key = url.searchParams.get("key") ?? "";
-			if (!repo || !key || (kind !== "plan" && kind !== "note")) {
-				sendJson(res, 400, { error: "repo, kind (plan|note) and key are required" });
+			const kind = CONTEXT_DOC_KINDS.find((k) => k === kindParam);
+			if (!repo || !key || !kind) {
+				sendJson(res, 400, { error: `repo, kind (${CONTEXT_DOC_KINDS.join("|")}) and key are required` });
 				return;
 			}
 			try {

@@ -69,6 +69,13 @@ const BRANCH_NAME_ALLOWLIST: ReadonlyMap<string, string> = new Map([
 	["cli/src/Logger.ts", "the constant is declared here"],
 	["cli/src/core/OrphanBranchStorage.ts", "the backend itself"],
 	["cli/src/core/GitRefStorage.ts", "the backend itself"],
+	[
+		"cli/src/core/JolliRefs.ts",
+		// The opposite of a system-of-record decision: it names the constant in a
+		// `@see` so a reader of the ref-namespace rule can find the branch it
+		// derives from, and its whole job is telling git to IGNORE that namespace.
+		"names the constant in a doc cross-reference; reads and writes nothing",
+	],
 	["cli/src/dashboard/CutoverEngine.ts", "the cutover machinery: tips, fence, CAS"],
 	["cli/src/dashboard/SotImport.ts", "the orphan → SQLite importer"],
 	["cli/src/dashboard/Recovery.ts", "reads the fenced root's tip"],

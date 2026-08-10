@@ -25,6 +25,7 @@
 import { createHash } from "node:crypto";
 import { execGit, getHeadHash } from "../core/GitOps.js";
 import { GitRefStorage, resolveCommittish } from "../core/GitRefStorage.js";
+import { isJolliInternalRef } from "../core/JolliRefs.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
@@ -98,6 +99,17 @@ async function summaryIndexFingerprint(cwd: string, storage: StorageProvider): P
  * A `for-each-ref` failure degrades to HEAD alone — a cursor that is too
  * conservative only costs an extra sweep, which is idempotent (see the module
  * header), whereas one that is too eager loses data.
+ *
+ * Jolli's own storage refs are excluded, by the same rule the collector applies
+ * (see {@link isJolliInternalRef}) — and it is this signal, not the collector,
+ * that made their inclusion visible. The orphan branch gains a commit on every
+ * memory write, so hashing its tip meant the fingerprint moved whenever a
+ * summary, a regenerate, a plan edit or a squash consolidation landed. It could
+ * therefore never converge in a repo that is actually being used, and every
+ * `jolli dashboard` launch re-swept git history — the sweep this cursor exists
+ * to skip. Excluding them costs nothing in the direction that matters: those
+ * commits are not collected either, so a tip this no longer watches cannot
+ * change any row the sweep would have written.
  */
 async function checkoutFingerprint(path: string): Promise<string | null> {
 	const head = await getHeadHash(path).catch((err) => {
@@ -110,7 +122,14 @@ async function checkoutFingerprint(path: string): Promise<string | null> {
 		log.debug("branch tips unreadable for %s: %s", path, refs.stderr.trim());
 		return head;
 	}
-	return `${head}+${createHash("sha256").update(refs.stdout).digest("hex")}`;
+	// Hashed over the FILTERED lines, joined back with the separator git used, so
+	// the value stays a hash of the same shape of text — one `<ref> <oid>` per
+	// line — as before.
+	const tips = refs.stdout
+		.split("\n")
+		.filter((line) => line && !isJolliInternalRef(line.split(" ")[0] ?? ""))
+		.join("\n");
+	return `${head}+${createHash("sha256").update(tips).digest("hex")}`;
 }
 
 export interface BackfillOptions {
@@ -215,16 +234,43 @@ function writeCursor(db: DashboardDbHandle, repoIdentity: string, source: string
 }
 
 /**
- * Commit hashes already stored for this repo.
+ * Commit hashes already stored for this repo — the set the prune reconciles
+ * against.
  *
- * Two callers, two uses of the same set: the prune asks which stored hashes are
- * no longer reachable, and the collection asks which reachable hashes it can skip
- * the `--numstat` for (see `CollectCommitsOptions.knownHashes`). Deriving both
- * from one query keeps them from disagreeing about what "already stored" means.
+ * Deliberately NOT the set the `--numstat` skip is computed from: see
+ * {@link commitsWithStoredFiles} for why "the row exists" and "its file rows
+ * were collected" have to be two different questions.
  */
 function storedCommitHashes(db: DashboardDbHandle, repoIdentity: string): Set<string> {
 	const rows = db
 		.prepare("SELECT c.hash FROM commits c JOIN repos r ON r.id = c.repo_id WHERE r.repo_identity = ?")
+		.all(repoIdentity) as ReadonlyArray<{ hash: string }>;
+	return new Set(rows.map((r) => r.hash));
+}
+
+/**
+ * Commits whose FILE ROWS are stored — what `CollectCommitsOptions.knownHashes`
+ * means, and the only sound basis for skipping a commit's `--numstat`.
+ *
+ * Keyed off `commit_files` rather than off `commits`, because the two diverge
+ * exactly where it matters: `collectFilesForCommits` returns an empty map when
+ * its `git log --numstat --no-walk` fails, and the commits of that batch are
+ * inserted anyway (deliberately — the commit list is what the prune runs
+ * against). Asking `commits` would then mark them known and skip their numstat
+ * forever: the retry only ever came back on a bootstrap, and `bootstrap_state`
+ * is `done` after the first sweep, so those file rows were gone until someone
+ * rebuilt the database. Asking `commit_files` retries them on the next sweep,
+ * which is the self-correction the whole-history scan used to provide for free.
+ *
+ * `EXISTS` rather than a `DISTINCT` join: one PK probe per commit against
+ * `commit_files(commit_id, path)` instead of materializing every file row.
+ */
+function commitsWithStoredFiles(db: DashboardDbHandle, repoIdentity: string): Set<string> {
+	const rows = db
+		.prepare(
+			`SELECT c.hash FROM commits c JOIN repos r ON r.id = c.repo_id
+			  WHERE r.repo_identity = ? AND EXISTS (SELECT 1 FROM commit_files f WHERE f.commit_id = c.id)`,
+		)
 		.all(repoIdentity) as ReadonlyArray<{ hash: string }>;
 	return new Set(rows.map((r) => r.hash));
 }
@@ -510,7 +556,7 @@ export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResul
 				// Read ONCE for the whole checkout loop, before any of them writes: a
 				// per-checkout read would let the first checkout's upserts mark the
 				// second one's commits "known" and skip their file scan.
-				const knownHashes = storedCommitHashes(db, repo.repoIdentity);
+				const knownHashes = commitsWithStoredFiles(db, repo.repoIdentity);
 				// A checkout whose `git log` failed contributes nothing, which is
 				// indistinguishable from "this checkout reaches no commits" once the events
 				// are merged. Prune and the cursor advance are therefore both gated on a
@@ -553,9 +599,23 @@ export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResul
 						}
 						// Union the reachability; keep the first checkout's metadata, which
 						// is identical for a given hash apart from `branches`.
+						//
+						// ABSENT ON EITHER SIDE POISONS THE UNION. A checkout omits
+						// `branches` when its own branch scan was incomplete (a failed
+						// `for-each-ref`/`rev-list`, or a commit only branches past
+						// MAX_BRANCHES reach), and absent means "keep what is stored".
+						// Coercing that to `[]` and unioning turns two omissions into the
+						// CLAIM "no branch reaches this commit" — which the projection
+						// honours by deleting every `commit_branches` row for the commit —
+						// and turns one omission into a partial claim that drops the
+						// branches only the unreadable checkout knew. Either way the merged
+						// event must stay silent, exactly like the single-checkout case.
+						const { branches: seenBranches, ...seenRest } = seen;
 						merged.set(event.hash, {
-							...seen,
-							branches: [...new Set([...(seen.branches ?? []), ...(event.branches ?? [])])],
+							...seenRest,
+							...(seenBranches && event.branches
+								? { branches: [...new Set([...seenBranches, ...event.branches])] }
+								: {}),
 						});
 					}
 				}

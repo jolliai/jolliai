@@ -8,7 +8,8 @@
  * constants and formatters live here rather than in the VS Code layer.
  */
 
-import type { ConversationTokenBreakdown } from "../Types.js";
+import type { CommitSummary, ConversationTokenBreakdown, ModelTokenUsage } from "../Types.js";
+import { estimateModelCostUsd } from "./Pricing.js";
 
 /** Formats a token count compactly (e.g. `1443000` -> `1.4M`, `2000000` -> `2M`, `96000` -> `96k`). */
 export function formatTokensCompact(n: number): string {
@@ -82,4 +83,100 @@ export function estimateConversationCostUsd(breakdown: ConversationTokenBreakdow
 				breakdown.output * SONNET_OUTPUT_PER_TOKEN +
 				breakdown.cached * SONNET_CACHE_WRITE_PER_TOKEN
 		: total * SONNET_INPUT_PER_TOKEN;
+}
+
+/**
+ * Sums the token segments of a node's per-model buckets whose model has no entry
+ * in the host price table, or null when every bucket is priced (or the node
+ * records no buckets to inspect).
+ *
+ * These are exactly the tokens `estimatedCostUsd` deliberately left out of its
+ * total rather than guessing a rate for, so they are what a stored cost still
+ * owes. Membership is probed through `estimateModelCostUsd`'s null return — the
+ * same predicate the write-time estimate uses — rather than by reading
+ * `MODEL_PRICES` here, so the two can never disagree about what "unpriced" means.
+ *
+ * A node carrying a cost but no `conversationModels` (hand-edited or otherwise
+ * off-contract data — write time only stores a cost alongside buckets) returns
+ * null: there is nothing to inspect, so the stored figure is taken at face value.
+ */
+function unpricedSegments(models: ReadonlyArray<ModelTokenUsage> | undefined): ConversationTokenBreakdown | null {
+	let input = 0;
+	let output = 0;
+	let cached = 0;
+	for (const m of models ?? []) {
+		if (estimateModelCostUsd(m) !== null) continue;
+		input += m.input;
+		output += m.output;
+		cached += m.cached;
+	}
+	return input + output + cached > 0 ? { input, output, cached } : null;
+}
+
+/** What fed {@link estimateSummaryCostUsd}'s figure, so a caller's tooltip can describe it honestly. */
+export type SummaryCostMode = "stored" | "sonnet" | "mixed";
+
+/**
+ * A memory's cache-aware $ estimate over its WHOLE consolidation tree,
+ * preferring the cost computed at WRITE time from each node's actual model(s)
+ * via the host price table, and falling back to the flat Sonnet-rate estimate
+ * for whatever the stored cost does not cover — legacy memories, or a
+ * conversation whose model is absent from the price table.
+ *
+ * Lives here, not on a surface, because every surface showing a memory's cost
+ * must show the same number: the editor's token meter and the local web
+ * dashboard disagreed by two orders of magnitude ($12.21 against $0.06) for
+ * exactly as long as the dashboard read the ROOT node's own `estimatedCostUsd`
+ * while the editor summed the tree. A squash root's own cost is a fraction of
+ * the work folded beneath it.
+ *
+ * The preference is resolved PER NODE, not once for the whole tree. A tree-wide
+ * "any stored cost wins" test silently under-reports a mixed consolidation: the
+ * token headline beside this figure aggregates EVERY node, so a squash whose root
+ * carries a stored cost while a folded legacy child does not would price only the
+ * root and show that total next to the full tree's tokens. Summing per node keeps
+ * the two figures over the same set. (The Sonnet formula is linear per segment, so
+ * summing per-node fallbacks equals estimating from their aggregate — no drift
+ * against pricing from the aggregate for an all-fallback tree.)
+ *
+ * A stored cost is a LOWER bound, not proof of full coverage, so the per-node
+ * preference is resolved per MODEL bucket rather than per node — see
+ * {@link unpricedSegments}.
+ */
+export function estimateSummaryCostUsd(summary: CommitSummary): { usd: number; mode: SummaryCostMode } {
+	let usd = 0;
+	let storedNodes = 0;
+	let fallbackNodes = 0;
+	const walk = (node: CommitSummary): void => {
+		const own = node.estimatedCostUsd ?? 0;
+		const tokens = node.conversationTokens ?? 0;
+		if (own > 0) {
+			usd += own;
+			storedNodes++;
+			// A positive stored cost does NOT mean the node is fully priced. Write time
+			// records `estimatedCostUsd` as a lower bound: `estimateCostUsd` prices only
+			// the buckets present in the host price table and EXCLUDES the rest rather
+			// than guessing (see Pricing.ts's `-pro` note, Types.ts on
+			// `estimatedCostUsd`, and conversationUsageFields in QueueWorker). Treating
+			// `own > 0` as full coverage therefore under-reports every node that mixed a
+			// priced model with an unpriced one — the unpriced bucket's tokens sit in the
+			// headline total beside this figure while contributing $0 to it. Price
+			// exactly those buckets at the flat rate, the same treatment a wholly
+			// unpriced node gets below, and let them tip the mode to "mixed" so the
+			// tooltip stops claiming the figure is fully model-priced.
+			const unpriced = unpricedSegments(node.conversationModels);
+			if (unpriced) {
+				usd += estimateConversationCostUsd(unpriced, unpriced.input + unpriced.output + unpriced.cached);
+				fallbackNodes++;
+			}
+		} else if (tokens > 0) {
+			// No stored cost but real tokens — this node needs the flat-rate fallback.
+			// Nodes with neither contribute nothing and must NOT tip the mode either way.
+			usd += estimateConversationCostUsd(node.conversationTokenBreakdown, tokens);
+			fallbackNodes++;
+		}
+		for (const child of node.children ?? []) walk(child);
+	};
+	walk(summary);
+	return { usd, mode: storedNodes > 0 ? (fallbackNodes > 0 ? "mixed" : "stored") : "sonnet" };
 }

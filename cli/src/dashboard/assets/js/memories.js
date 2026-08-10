@@ -237,8 +237,17 @@ window.JD = window.JD || {};
 			row.onclick = () => {
 				var repo = row.getAttribute("data-repo");
 				var hash = row.getAttribute("data-hash");
+				/* `detailRepo`, never `repo`: the owning repo says which memory to
+				   open, and `repo` is the PAGE scope — carrying it here collapsed the
+				   tree to that one repository on every click, so opening a memory cost
+				   the reader every other repo's memories. Whatever scope the page
+				   already has rides along through JD.query untouched. */
 				window.location.href =
-					"/memories?repo=" + encodeURIComponent(JD.repoToken(model, repo)) + "&hash=" + encodeURIComponent(hash);
+					"/memories" +
+					JD.withParams(JD.query(model, {}), {
+						hash: hash,
+						detailRepo: JD.repoToken(model, repo),
+					});
 			};
 			row.onkeydown = (event) => {
 				if (event.key === "Enter" || event.key === " ") row.onclick();
@@ -315,9 +324,16 @@ window.JD = window.JD || {};
 
 	function tokenMeter(tokens) {
 		if (!tokens) return "";
-		var total = tokens.input + tokens.output + tokens.cached;
+		/* Headline and bar have DIFFERENT denominators, matching the editor's meter:
+		   `total` counts every node's reported usage, while the bar's three widths
+		   must fill it exactly, so they divide by the segments' own sum. Dividing
+		   the widths by `total` underfills the bar whenever a folded session
+		   reported a scalar count with no breakdown. */
+		var total = tokens.total;
+		var segTotal = tokens.input + tokens.output + tokens.cached;
 		var esc = JD.esc;
-		var seg = (n, color) => (total > 0 ? '<i style="width:' + (n / total) * 100 + '%;background:' + color + '"></i>' : "");
+		var seg = (n, color) =>
+			segTotal > 0 ? '<i style="width:' + (n / segTotal) * 100 + '%;background:' + color + '"></i>' : "";
 		var cost = tokens.costUsd != null ? " · " + JD.fmtUsd(tokens.costUsd) : "";
 		var asOf = tokens.pricesAsOf ? " (est. at " + esc(tokens.pricesAsOf) + " prices)" : "";
 		return (
@@ -379,40 +395,67 @@ window.JD = window.JD || {};
 	// cards in `stats.js`. `detail.activity` / `detail.activityUncoveredSources`
 	// stay in the payload, so restoring it is a render change only.
 
-	function referencesAndContext(detail) {
+	/* Per-kind row furniture, mirroring the editor's CONTEXT_ROW_KINDS table
+	   (vscode/src/views/ContextRowKinds.ts) — same badge letters, same singular
+	   labels. A kind the server adds later falls back to its own initial rather
+	   than being mislabelled as one of these. */
+	const CONTEXT_KIND_META = {
+		plan: { letter: "P", label: "Plan" },
+		note: { letter: "N", label: "Note" },
+		reference: { letter: "R", label: "Reference" },
+		skills: { letter: "S", label: "Skills" },
+	};
+
+	function contextKindMeta(kind) {
+		return CONTEXT_KIND_META[kind] || { letter: (kind || "?").charAt(0).toUpperCase(), label: kind };
+	}
+
+	/* The Context section. Order, titles and the one-row skills aggregate all
+	   come from the server (`buildContextRows`), which resolves them with the
+	   same CLI helpers the editor's Context panel uses — so this renderer holds
+	   layout only and cannot re-order or re-title anything.
+
+	   Every row with a `contextKey` is openable: plan / note / reference bodies
+	   are archived documents in the dashboard database, and the skills row's
+	   table is rendered on demand from the summary. A row without one (a
+	   reference whose source has left the registry) renders inert instead of as
+	   a button that would always 404. */
+	function contextSection(detail) {
 		var esc = JD.esc;
-		var refRows = detail.references.map(
-			(r) =>
-				'<div class="gd-row"><span class="mem-row-icon">' +
-				memoryIcon("link") +
-				'</span><span class="mem-row-meta mono">' +
-				esc(r.nativeId) +
-				'</span><span class="mem-row-title">' +
-				esc(r.title) +
-				'</span><span class="mem-row-meta">' +
-				esc(r.source) +
-				"</span></div>",
-		);
-		// Plans and notes are openable: the body lives in the dashboard database
-		// (`context.body_md`), so the row is a button that fetches it into the
-		// viewer dialog rather than a dead label. A reference stays a plain row —
-		// its content is an external system's, not ours to render.
-		var ctxRows = detail.context.map(
-			(c) =>
-				'<div class="gd-row gd-row-open" role="button" tabindex="0" data-context-kind="' +
+		var rows = detail.context.map((c) => {
+			var meta = contextKindMeta(c.kind);
+			var openable = !!c.contextKey;
+			return (
+				'<div class="gd-row' +
+				(openable ? " gd-row-open" : "") +
+				'"' +
+				(openable
+					? ' role="button" tabindex="0" data-context-kind="' +
+						esc(c.kind) +
+						'" data-context-key="' +
+						esc(c.contextKey) +
+						'"'
+					: "") +
+				'><span class="mem-ctx-badge mem-ctx-badge--' +
 				esc(c.kind) +
-				'" data-context-key="' +
-				esc(c.contextKey) +
-				'"><span class="mem-row-icon">' +
-				memoryIcon("document") +
-				'</span><span class="mem-row-meta">' +
-				esc(c.kind.toUpperCase()) +
+				'">' +
+				esc(meta.letter) +
 				'</span><span class="mem-row-title">' +
 				esc(c.title) +
-				'</span><span class="mem-row-meta">Open →</span></div>',
-		);
-		var all = refRows.concat(ctxRows);
-		var body = all.length ? '<div class="gd-links">' + all.join("") + "</div>" : '<div class="gd-empty">None.</div>';
+				"</span>" +
+				(c.meta ? '<span class="mem-row-meta mem-ctx-sub">' + esc(c.meta) + "</span>" : "") +
+				(c.url
+					? '<a class="mem-ctx-link" href="' +
+						esc(c.url) +
+						'" target="_blank" rel="noreferrer noopener" title="Open upstream">' +
+						memoryIcon("link") +
+						"</a>"
+					: "") +
+				(openable ? '<span class="mem-row-meta">Open →</span>' : "") +
+				"</div>"
+			);
+		});
+		var body = rows.length ? '<div class="gd-links">' + rows.join("") + "</div>" : '<div class="gd-empty">None.</div>';
 		var excluded = detail.excluded.length
 			? '<div class="gd-sec">Automatically set aside</div><div class="gd-links">' +
 				detail.excluded
@@ -420,7 +463,16 @@ window.JD = window.JD || {};
 					.join("") +
 				"</div>"
 			: "";
-		return '<section class="mem-section mem-context"><div class="gd-sec">' + memoryIcon("link") + "Context · " + all.length + "</div>" + body + excluded + "</section>";
+		return (
+			'<section class="mem-section mem-context"><div class="gd-sec">' +
+			memoryIcon("document") +
+			"Context " +
+			rows.length +
+			"</div>" +
+			body +
+			excluded +
+			"</section>"
+		);
 	}
 
 	function topicsSection(detail) {
@@ -571,7 +623,7 @@ window.JD = window.JD || {};
 			'<div class="gd-row mem-counts">' +
 			detail.conversations.length +
 			" conversations, " +
-			(detail.references.length + detail.context.length) +
+			detail.context.length +
 			" context, " +
 			detail.files.length +
 			" files" +
@@ -589,7 +641,12 @@ window.JD = window.JD || {};
 			memoryIcon("database") +
 			'</span><div><span class="mem-short-hash mono">' +
 			esc(detail.shortHash) +
-			'</span><div class="gd-title">' +
+			/* `JM-…:` leads the title, as it does in the editor's page header — the
+			   handle a reader cites, present on every memory (hash-derived until the
+			   memory syncs to a Space). */
+			'</span><div class="gd-title"><span class="mem-title-ref">' +
+			esc(detail.memoryRefId) +
+			":</span> " +
 			esc(detail.title) +
 			"</div></div></div>" +
 			'<div class="gd-row mem-meta">' +
@@ -600,7 +657,7 @@ window.JD = window.JD || {};
 			(detail.recap ? '<div class="mem-recap">' + JD.mdParagraphs(detail.recap) + "</div>" : "") +
 			'<div class="mem-detail-sections">' +
 			conversationsSection(detail) +
-			referencesAndContext(detail) +
+			contextSection(detail) +
 			topicsSection(detail) +
 			filesSection(detail) +
 			e2eSection(detail) +
@@ -620,7 +677,7 @@ window.JD = window.JD || {};
 		var sub = document.getElementById("ctxSub");
 		var body = document.getElementById("ctxBody");
 		if (!overlay || !title || !sub || !body) return;
-		title.textContent = kind === "plan" ? "Plan" : "Note";
+		title.textContent = contextKindMeta(kind).label;
 		sub.textContent = "Loading…";
 		body.textContent = "";
 		overlay.classList.add("open");
@@ -635,7 +692,7 @@ window.JD = window.JD || {};
 			.then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
 			.then((doc) => {
 				title.textContent = doc.title;
-				sub.textContent = doc.kind === "plan" ? "Plan" : "Note";
+				sub.textContent = contextKindMeta(doc.kind).label;
 				body.textContent = doc.bodyMd;
 			})
 			.catch((err) => {
@@ -664,7 +721,13 @@ window.JD = window.JD || {};
 		document.querySelectorAll("[data-context-key]").forEach((row) => {
 			var open = () =>
 				openContextDialog(detail, row.getAttribute("data-context-kind"), row.getAttribute("data-context-key"));
-			row.onclick = open;
+			row.onclick = (e) => {
+				/* The upstream-link glyph is a real navigation nested inside a row that
+				   is itself a button; without this, clicking it would ALSO open the
+				   archived snapshot behind the new tab. */
+				if (e && e.target && e.target.closest && e.target.closest(".mem-ctx-link")) return;
+				open();
+			};
 			row.onkeydown = (e) => {
 				if (e.key === "Enter" || e.key === " ") {
 					e.preventDefault();
@@ -748,32 +811,42 @@ window.JD = window.JD || {};
 		)
 			.then((page) => {
 				memories.loadingPage = false;
-				/* An empty page while `items.length < totalCount` means those two
-				   disagree — the total moved under us. Believe the page: there is
-				   nothing after this cursor, so retire the footer rather than leave a
-				   button that answers every click with nothing. */
-				if (!page.items || !page.items.length) {
-					memories.totalCount = items.length;
-					refreshTree(model);
-					return;
-				}
+				var pageItems = page.items || [];
+				/* Checked BEFORE the empty-page branch below, and it must stay that
+				   way: the two conditions overlap when the last reachable memory is
+				   the one that vanished, and the flag is the more specific answer.
+				   Falling into the empty-page branch there kept the dead rows on
+				   screen and set the total to their count, so the tree went on
+				   listing memories git can no longer reach with no way to notice. */
 				if (page.cursorMissing) {
 					/* The memory we were paging from is gone (a rebase during the
 					   session), so the server answered with the first page instead.
 					   REPLACE rather than append: appending would re-add rows the dedupe
 					   then drops, and the next click would send the same dead cursor
 					   again — a button that does nothing forever. Re-seating on page 1
-					   is exactly what a reload would give, and paging works from there. */
-					memories.items = page.items;
-				} else {
-					/* Deduped even so: rows can shift under a commit landing between two
-					   clicks, and a repeat is cheap to drop where a gap would be
-					   invisible. */
-					var seen = new Set(items.map((item) => item.repoIdentity + " " + item.commitHash));
-					memories.items = items.concat(
-						page.items.filter((item) => !seen.has(item.repoIdentity + " " + item.commitHash)),
-					);
+					   is exactly what a reload would give, and paging works from there.
+					   An EMPTY first page is the same answer, not a special case: the
+					   scope has no reachable memories left, so the tree empties. */
+					memories.items = pageItems;
+					memories.totalCount = page.totalCount;
+					refreshTree(model);
+					return;
 				}
+				/* An empty page while `items.length < totalCount` means those two
+				   disagree — the total moved under us. Believe the page: there is
+				   nothing after this cursor, so retire the footer rather than leave a
+				   button that answers every click with nothing. */
+				if (!pageItems.length) {
+					memories.totalCount = items.length;
+					refreshTree(model);
+					return;
+				}
+				/* Deduped: rows can shift under a commit landing between two clicks,
+				   and a repeat is cheap to drop where a gap would be invisible. */
+				var seen = new Set(items.map((item) => item.repoIdentity + " " + item.commitHash));
+				memories.items = items.concat(
+					pageItems.filter((item) => !seen.has(item.repoIdentity + " " + item.commitHash)),
+				);
 				/* Adopted from the page, not left at the value the HTML was rendered
 				   with: it is what the footer states and what decides whether there is
 				   more to ask for, and a commit (or a rebase) moves it. */
@@ -804,7 +877,7 @@ window.JD = window.JD || {};
 			if (detail) detail.innerHTML = '<div class="mem-read-inner">' + renderDetail(model) + "</div>";
 			wireTree(model);
 			wireDetail(model);
-				return;
+			return;
 		}
 		document.getElementById("app").innerHTML =
 			'<section class="memories-page"><aside class="mem-navigator" aria-label="Memory browser">' +

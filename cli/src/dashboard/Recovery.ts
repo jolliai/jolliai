@@ -23,6 +23,7 @@ import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { peekKBPath } from "../core/KBPathResolver.js";
+import { isPidAlive } from "../core/LockPrimitives.js";
 import { toForwardSlash } from "../core/PathUtils.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import type { StorageKind, StorageProvider } from "../core/StorageProvider.js";
@@ -245,6 +246,66 @@ export async function fillMemoriesFromMirrors(
 	return { repos, nodes, skipped };
 }
 
+/**
+ * A restore temp older than this is swept even though its PID looks alive.
+ *
+ * The PID gate alone cannot be the whole answer, because a leftover only exists
+ * when its writer DIED between the copy and the rename — so by the time anything
+ * sweeps, that PID is free to have been reused, and once it is, `isPidAlive`
+ * says "alive" about an unrelated process and the file is skipped forever. On a
+ * machine that recycles PIDs quickly (a busy container) the leftover is a
+ * database-sized file nothing will ever remove. A live restore is a file copy
+ * plus one `integrity_check`, so an hour is orders of magnitude past the longest
+ * honest one — and being wrong here costs a concurrent restore its temp copy,
+ * which fails that restore's own verify and leaves the live database untouched.
+ */
+const RESTORE_TEMP_MAX_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * Whether a temp is old enough to override its PID looking alive. An unreadable
+ * mtime answers NO — the file is then left to the PID gate, which is the
+ * conservative half of the pair.
+ */
+function isOlderThanMaxAge(path: string, nowMs: number): boolean {
+	try {
+		return nowMs - statSync(path).mtimeMs > RESTORE_TEMP_MAX_AGE_MS;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Removes `.<db>.restore-<pid>-<nonce>.tmp` files whose writer is gone.
+ *
+ * Best-effort by design: a leftover is wasted disk, never a correctness problem,
+ * so an unreadable directory or an undeletable file is logged and ignored rather
+ * than failing a recovery. A file whose PID is still alive AND is younger than
+ * {@link RESTORE_TEMP_MAX_AGE_MS} is another restore in flight (`isPidAlive`
+ * also treats EPERM as alive) and is never touched — that is what the PID in the
+ * name is for. A name without a parseable PID is swept: only this function's own
+ * format matches the prefix, and `isPidAlive` reports a non-numeric owner as
+ * dead.
+ */
+function sweepDeadRestoreTemps(folder: string, dbName: string): void {
+	const nowMs = Date.now();
+	const prefix = `.${dbName}.restore-`;
+	try {
+		for (const name of readdirSync(folder)) {
+			if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
+			const pid = name.slice(prefix.length, -".tmp".length).split("-")[0] ?? "";
+			if (isPidAlive(pid) && !isOlderThanMaxAge(join(folder, name), nowMs)) continue;
+			try {
+				rmSync(join(folder, name), { force: true });
+				log.info("removed abandoned restore temp %s", name);
+			} catch (err) {
+				log.debug("could not remove restore temp %s: %s", name, errMsg(err));
+			}
+		}
+	} catch (err) {
+		log.debug("could not scan %s for restore temps: %s", folder, errMsg(err));
+	}
+}
+
 export type RestoreResult =
 	| { readonly status: "restored"; readonly from: string }
 	| { readonly status: "refused"; readonly reason: string }
@@ -284,6 +345,13 @@ export async function restoreFromSnapshot(
 		// from. `Backup.ts` carries the same suffix after being bitten by exactly
 		// this; here the blast radius is a corrupt database rather than a missed
 		// snapshot.
+		// The flip side of a unique name: nothing overwrites the previous run's
+		// leftover any more, so it has to be swept. A restore killed between the
+		// copy and the rename (the `try/catch` only covers a THROWN failure) leaves
+		// a database-sized file behind, and the only thing that used to remove it
+		// was the fixed name being reused. Swept by PID, so a concurrent restore's
+		// temp — the whole reason the name carries one — is left alone.
+		sweepDeadRestoreTemps(dirname(dbPath), basename(dbPath));
 		const temp = join(
 			dirname(dbPath),
 			`.${basename(dbPath)}.restore-${process.pid}-${randomUUID().slice(0, 8)}.tmp`,

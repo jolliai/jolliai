@@ -328,6 +328,16 @@ function resolveWindow(
 
 // ── Query plumbing ──────────────────────────────────────────────────────────
 
+/**
+ * Every git identity that counts as "me", unioned across the registered repos
+ * (each can carry its own `user.email`). Emails and names are kept apart
+ * because they are matched differently — see {@link authorFilter}.
+ */
+export interface AuthorIdentity {
+	readonly emails: ReadonlyArray<string>;
+	readonly names: ReadonlyArray<string>;
+}
+
 export interface QueryOptions {
 	readonly view: DashboardView;
 	readonly scope: DashboardScope;
@@ -345,6 +355,11 @@ export interface QueryOptions {
 	/** Memories view: which memory's detail to build. Absent renders the tree with no selection. */
 	readonly hash?: string;
 	/**
+	 * Memories view: which repo owns {@link hash}, when two clones share it.
+	 * Narrows the DETAIL only — see `buildMemories` for why this is not `scope`.
+	 */
+	readonly detailRepoIdentity?: string;
+	/**
 	 * The async-read per-repo git reachability sets, keyed by `repo_identity`.
 	 * Absent (or a repo missing from the map) renders every row unfiltered —
 	 * see {@link ReachableCommits}. Read by the memories tree, and by the
@@ -354,10 +369,56 @@ export interface QueryOptions {
 	 * "N of M captured" line counts commits that no longer exist.
 	 */
 	readonly reachableCommits?: ReachableCommits;
+	/**
+	 * Standup view: the local git identity, read async per repo by the server.
+	 * Absent — or present with nothing usable in it — leaves the board
+	 * unfiltered; see {@link authorFilter} for why that fail-open matters.
+	 */
+	readonly authorIdentity?: AuthorIdentity;
 	/** Repositories view: the async-read registry + job state. Absent renders an empty list. */
 	readonly repositoriesModel?: RepositoriesModel;
 	readonly timeZone?: string;
 	readonly nowMs?: number;
+}
+
+/**
+ * WHERE fragment + params restricting `commits` to the local user's own work.
+ *
+ * Standup only, and deliberately not applied to the stats page: "how much did
+ * this repo do" is a repo question, while a standup is a first-person report —
+ * the page draws a Copy-as-standup draft the user posts as their own, so a
+ * teammate's commit in it is a false claim, not just noise. The two are easy to
+ * conflate because a single-developer repo makes them identical.
+ *
+ * Matches email OR name, both taken from `git config` rather than from any
+ * commit: the same person legitimately appears under a work email locally and a
+ * noreply address after a remote rewrite, and a name-only identity is all some
+ * imports carry. Emails compare case-folded (they are case-insensitive in
+ * practice and git does not normalise them); names compare exactly, since a name
+ * is display text and two people can differ only by case.
+ *
+ * FAILS OPEN. An identity with nothing usable in it — no git, an unconfigured
+ * machine, a `repos` row with no worktree — returns no filter, so the board
+ * shows every commit rather than going blank. A blank standup reads as "you did
+ * nothing", which is a worse lie than an unfiltered one, and the unfiltered case
+ * is visible (the header states whose commits are shown) where an empty page
+ * would be silent.
+ */
+function authorFilter(identity: AuthorIdentity | undefined, alias: string): { sql: string; params: unknown[] } {
+	const emails = (identity?.emails ?? []).map((email) => email.trim().toLowerCase()).filter((email) => email !== "");
+	const names = (identity?.names ?? []).map((name) => name.trim()).filter((name) => name !== "");
+	if (emails.length === 0 && names.length === 0) return { sql: "", params: [] };
+	const clauses: string[] = [];
+	const params: unknown[] = [];
+	if (emails.length > 0) {
+		clauses.push(`LOWER(${alias}.author_email) IN (${placeholders(emails.length)})`);
+		params.push(...emails);
+	}
+	if (names.length > 0) {
+		clauses.push(`${alias}.author_name IN (${placeholders(names.length)})`);
+		params.push(...names);
+	}
+	return { sql: ` AND (${clauses.join(" OR ")})`, params };
 }
 
 interface SessionRow {
@@ -416,8 +477,16 @@ interface CommitRow {
 	readonly root_hash: string | null;
 }
 
-function commitsInRange(db: DashboardDbHandle, scope: DashboardScope, fromMs: number, toMs: number): CommitRow[] {
+function commitsInRange(
+	db: DashboardDbHandle,
+	scope: DashboardScope,
+	fromMs: number,
+	toMs: number,
+	/** Standup only — every other caller reports repo-wide activity. See {@link authorFilter}. */
+	identity?: AuthorIdentity,
+): CommitRow[] {
 	const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
+	const author = authorFilter(identity, "c");
 	// The memory-tier columns come from `memories` (A3b): the commits copies
 	// fall behind whenever a memory regenerates, while the memory row is
 	// refreshed live by the same worker pass that emits commit.summary.
@@ -442,10 +511,10 @@ function commitsInRange(db: DashboardDbHandle, scope: DashboardScope, fromMs: nu
 			   LEFT JOIN memories m ON m.repo_id = c.repo_id AND m.commit_hash = c.hash
 			   LEFT JOIN commit_aliases al ON al.repo_id = c.repo_id AND al.old_hash = c.hash
 			   LEFT JOIN memories ma ON ma.repo_id = al.repo_id AND ma.commit_hash = al.target_hash
-			  WHERE c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}
+			  WHERE c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}${author.sql}
 			  ORDER BY c.committed_at_ms DESC`,
 		)
-		.all(fromMs, toMs, ...filter.params) as CommitRow[];
+		.all(fromMs, toMs, ...filter.params, ...author.params) as CommitRow[];
 }
 
 /**
@@ -961,8 +1030,14 @@ function buildStandupInsights(
 	scope: DashboardScope,
 	fromMs: number,
 	toMs: number,
+	identity: AuthorIdentity | undefined,
 ): StandupInsight[] {
 	const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
+	// Same filter as the commit columns, and for a stronger reason: the Risks
+	// column is a list of things the reader is expected to answer for. A
+	// teammate's blocker rendered here is work silently reassigned to whoever
+	// reads the board.
+	const author = authorFilter(identity, "c");
 	const rows = db
 		.prepare(
 			`${TOPIC_INSIGHTS_CTE}
@@ -976,10 +1051,10 @@ function buildStandupInsights(
 			   -- vanish from Standup while its decisions still render on the Decisions
 			   -- card, which reads the same table through the alias.
 			   JOIN topic_insights i ON i.repo_id = c.repo_id AND (i.commit_hash = c.hash OR i.commit_hash = al.target_hash)
-			  WHERE c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}
+			  WHERE c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}${author.sql}
 			  ORDER BY c.committed_at_ms DESC, i.ord`,
 		)
-		.all(fromMs, toMs, ...filter.params) as ReadonlyArray<{
+		.all(fromMs, toMs, ...filter.params, ...author.params) as ReadonlyArray<{
 		kind: string;
 		text: string;
 		addressed_to: string | null;
@@ -1005,10 +1080,19 @@ function buildStandup(
 	timeZone: string,
 	nowMs: number,
 	tier: AdoptionTier,
+	identity: AuthorIdentity | undefined,
 ): StandupModel {
 	const todayStart = startOfLocalDay(nowMs, timeZone);
 	const tomorrowStart = addLocalDays(nowMs, 1, timeZone);
 	const yesterdayStart = addLocalDays(nowMs, -1, timeZone);
+
+	/* What the header states the board is filtered to. Derived from the SAME
+	   identity the queries were given (and by the same emptiness rule), so the
+	   label can never claim a filter that did not run — including the fail-open
+	   case, where it stays absent and the page says so. */
+	const authoredBy = authorFilter(identity, "c").sql
+		? (identity?.emails.find((email) => email.trim() !== "") ?? identity?.names.find((name) => name.trim() !== ""))
+		: undefined;
 
 	const categoryLabels = commitCategoryLabels(db, scope);
 	const toStandupCommit = (c: CommitRow): StandupCommit => {
@@ -1064,12 +1148,18 @@ function buildStandup(
 	return {
 		today: localDayKey(nowMs, timeZone),
 		yesterday: localDayKey(yesterdayStart, timeZone),
+		/* Sessions and workspaces carry no author filter, and need none: an agent
+		   session and an uncommitted diff are this machine's own working state, so
+		   they are already first-person. Only `commits` can hold a teammate's row. */
 		yesterdaySessions: sessionsInRange(db, scope, yesterdayStart, todayStart).map((s) => toRecentSession(s, nowMs)),
-		yesterdayCommits: commitsInRange(db, scope, yesterdayStart, todayStart).map(toStandupCommit),
+		yesterdayCommits: commitsInRange(db, scope, yesterdayStart, todayStart, identity).map(toStandupCommit),
 		todaySessions: sessionsInRange(db, scope, todayStart, tomorrowStart).map((s) => toRecentSession(s, nowMs)),
-		todayCommits: commitsInRange(db, scope, todayStart, tomorrowStart).map(toStandupCommit),
+		todayCommits: commitsInRange(db, scope, todayStart, tomorrowStart, identity).map(toStandupCommit),
 		workspaces,
-		...(tier !== "installed" ? { insights: buildStandupInsights(db, scope, yesterdayStart, tomorrowStart) } : {}),
+		...(authoredBy ? { authoredBy } : {}),
+		...(tier !== "installed"
+			? { insights: buildStandupInsights(db, scope, yesterdayStart, tomorrowStart, identity) }
+			: {}),
 	};
 }
 
@@ -1417,6 +1507,27 @@ function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: Re
 const RECALL_STALE_MS = 30 * 86_400_000;
 
 /**
+ * When a `session_tool_use` bucket happened, for windowing — the call's own
+ * time when the parser that read it could supply one, the session's otherwise.
+ *
+ * Both halves are load-bearing. `last_call_at_ms` is the honest answer and the
+ * reason the column exists: a session's `updated_at_ms` moves every time the
+ * conversation is touched again, so windowing by it filed a three-week-old
+ * recall under today and a call made minutes ago under whenever its
+ * long-running session happened to last update. The COALESCE is what keeps that
+ * an improvement rather than a regression: rows written before the column
+ * existed hold NULL and can never be backfilled (their transcripts are behind a
+ * cursor, or gone), as do rows from sources whose parsers cannot stamp a time
+ * (`TOOL_CALL_TIME_SOURCES`) — and a bare comparison against NULL is false, so
+ * without the fallback every one of those rows would silently leave every
+ * window rather than keep its old, coarser placement.
+ *
+ * Written as a fragment used in BOTH bounds of each range test, so a row cannot
+ * be admitted by one clock and excluded by the other.
+ */
+const TOOL_CALL_TIME_SQL = "COALESCE(t.last_call_at_ms, s.updated_at_ms)";
+
+/**
  * The Recall card: how often recall actually served usable commit context.
  *
  * Reads `recall_receipts` — one row per call, written by whoever served it
@@ -1456,20 +1567,27 @@ function buildRecallUsage(
 		commits_json: string | null;
 	}>;
 
-	const daily = new Map<string, { used: number; setAside: number }>();
+	const daily = new Map<string, { used: number; setAside: number; estimated: number }>();
 	for (let dayStart = window.startMs; dayStart < window.endMs; dayStart = addLocalDays(dayStart, 1, timeZone)) {
-		daily.set(localDayKey(dayStart, timeZone), { used: 0, setAside: 0 });
+		daily.set(localDayKey(dayStart, timeZone), { used: 0, setAside: 0, estimated: 0 });
 	}
 
 	let usedCalls = 0;
 	let setAsideCalls = 0;
 	const sessionsWithContext = new Set<string>();
+	// Counted over EVERY receipt, used or set aside: both halves count in the
+	// figures the caveat qualifies, and both are equally unattributable to a
+	// session. Counted here rather than derived from `sessionsWithContext` — a
+	// zero there means "no receipt named a session at all", which is a different
+	// (and much rarer) statement than "some receipt named none".
+	let callsWithoutSession = 0;
 	const callsBySurface = new Map<string, number>();
 	// hash → date, first occurrence wins — the same commit served twice always
 	// carries the same date, so "first" is just "any".
 	const memoriesUsed = new Map<string, string>();
 	for (const row of rows) {
 		callsBySurface.set(row.surface, (callsBySurface.get(row.surface) ?? 0) + 1);
+		if (!row.session_id) callsWithoutSession++;
 		const bucket = daily.get(localDayKey(row.at_ms, timeZone));
 		if (!row.hit) {
 			setAsideCalls++;
@@ -1510,6 +1628,16 @@ function buildRecallUsage(
 	// recall on its first turn therefore rendered "1 of 0 sessions got prior
 	// context" — an EXISTS arm cannot rescue a session that is not in the table
 	// being filtered.
+	//
+	// `session_id IS NOT NULL` on the receipt arm is what keeps that union honest.
+	// A receipt legitimately has no session: `currentAgentSessionId` returns
+	// undefined for a `jolli recall` typed at a shell prompt, and attributing it
+	// to a guessed session would be worse (see its docstring). But SQLite's UNION
+	// dedupes with NULLs comparing EQUAL, so every session-less receipt in the
+	// window collapsed into ONE row per repo and added a phantom session to the
+	// denominator — a session that exists nowhere and, since the numerator skips
+	// a null `session_id`, can never be counted as covered. Measured on this
+	// machine: 104 real sessions, 4 session-less CLI receipts, "of 105".
 	const sessionFilter = scopeFilter(repoId, "s.repo_id");
 	const receiptScope = scopeFilter(repoId, "r.repo_id");
 	const sessionRows = db
@@ -1521,7 +1649,7 @@ function buildRecallUsage(
 			   UNION
 			   SELECT r.repo_id, r.session_id
 			     FROM recall_receipts r
-			    WHERE r.at_ms >= ? AND r.at_ms < ?${receiptScope.sql}
+			    WHERE r.at_ms >= ? AND r.at_ms < ? AND r.session_id IS NOT NULL${receiptScope.sql}
 			 )`,
 		)
 		.get(
@@ -1535,7 +1663,7 @@ function buildRecallUsage(
 
 	// Skill invocations: the `jolli-recall` skill being run, which is NOT a
 	// recall call (see RecallUsage.skillInvocations for why it stays out of the
-	// hit rate). Windowed by the session, the only time a tool row has.
+	// hit rate).
 	const skillFilter = scopeFilter(repoId, "s.repo_id");
 	const skillRow = db
 		.prepare(
@@ -1543,14 +1671,13 @@ function buildRecallUsage(
 			   FROM session_tool_use t
 			   JOIN sessions s ON s.event_id = t.session_event_id
 			  WHERE t.kind = 'skill' AND t.tool_name IN (${placeholders(RECALL_SKILL_NAMES.length)})
-			    AND s.updated_at_ms >= ? AND s.updated_at_ms < ?${skillFilter.sql}`,
+			    AND ${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?${skillFilter.sql}`,
 		)
 		.get(...RECALL_SKILL_NAMES, window.startMs, window.endMs, ...skillFilter.params) as { calls: number };
 
 	// Backfilled recall calls: the MCP tool as the transcripts recorded it, minus
 	// the ones a receipt already accounts for (see RecallUsage.callsWithoutReceipt
 	// for the subtraction's edge case and why references are not a second source).
-	// Windowed by the session, like the skill count above and for the same reason.
 	const toolFilter = scopeFilter(repoId, "s.repo_id");
 	const toolRow = db
 		.prepare(
@@ -1559,7 +1686,7 @@ function buildRecallUsage(
 			   JOIN sessions s ON s.event_id = t.session_event_id
 			  WHERE t.kind = 'mcp'
 			    AND (t.tool_name = ? OR t.tool_name LIKE ? ESCAPE '\\')
-			    AND s.updated_at_ms >= ? AND s.updated_at_ms < ?${toolFilter.sql}`,
+			    AND ${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?${toolFilter.sql}`,
 		)
 		// `\_` escapes SQLite's single-character wildcard, so the underscore in the
 		// suffix is a literal — `isRecallMcpToolName`'s test, expressed in SQL.
@@ -1591,8 +1718,26 @@ function buildRecallUsage(
 	for (const row of refBodies) {
 		for (const at of accumulatedEntryTimes(row.body_md ?? undefined)) {
 			const ms = Date.parse(at);
-			if (Number.isFinite(ms) && ms >= window.startMs && ms < window.endMs) referenceCalls++;
+			if (!Number.isFinite(ms) || ms < window.startMs || ms >= window.endMs) continue;
+			referenceCalls++;
+			// The DAY is banked too, not just the count. This channel is the only
+			// one that knows when a receipt-less call happened — a `session_tool_use`
+			// row carries no time of its own — and the timestamp is already parsed
+			// here for the window test above, so dropping it (as this used to) left
+			// the chart unable to show a single day of the history that
+			// `callsWithoutReceipt` was simultaneously reporting a total for.
+			const bucket = daily.get(localDayKey(ms, timeZone));
+			if (bucket) bucket.estimated++;
 		}
+	}
+	// Receipts win their own day, wholesale. From the day receipts shipped both
+	// channels observe the SAME call — the reference extractor bookmarks exactly
+	// the recalls the serving code also receipted — so a day that has any receipt
+	// must not add the estimate on top of it. Zeroing per DAY rather than globally
+	// is what lets one window hold both halves: the days before receipts existed
+	// keep their estimate, the days after are told by the receipts alone.
+	for (const bucket of daily.values()) {
+		if (bucket.used > 0 || bucket.setAside > 0) bucket.estimated = 0;
 	}
 
 	// Both channels under-report — a tool row cannot see a source that records no
@@ -1602,6 +1747,59 @@ function buildRecallUsage(
 	// lower bound, while a sum would count the common case twice.
 	const callsWithoutReceipt = Math.max(0, Math.max(toolRow.calls, referenceCalls) - (callsBySurface.get("mcp") ?? 0));
 
+	// Skill runs with no other trace — the CLI-fallback recall that used to be
+	// invisible here. See RecallUsage.skillRunsWithoutTrace for why this is its
+	// own figure rather than more of `callsWithoutReceipt`.
+	//
+	// Per session, because the subtraction is only meaningful within one: a
+	// session's MCP rows and the receipts that NAME it account for its skill runs,
+	// and one session's surplus must not be cancelled by another's spare receipt.
+	// Clamped inside the aggregate for the same reason.
+	const skillTraceFilter = scopeFilter(repoId, "s.repo_id");
+	const skillOnlyRow = db
+		.prepare(
+			`SELECT COALESCE(SUM(MAX(0, per.skill_calls - per.mcp_calls - per.receipts)), 0) AS runs
+			   FROM (
+			     SELECT s.event_id,
+			            SUM(CASE WHEN t.kind = 'skill' AND t.tool_name IN (${placeholders(RECALL_SKILL_NAMES.length)})
+			                     THEN t.calls ELSE 0 END) AS skill_calls,
+			            SUM(CASE WHEN t.kind = 'mcp'
+			                       AND (t.tool_name = ? OR t.tool_name LIKE ? ESCAPE '\\')
+			                     THEN t.calls ELSE 0 END) AS mcp_calls,
+			            (SELECT COUNT(*) FROM recall_receipts r
+			              WHERE r.repo_id = s.repo_id AND r.session_id = s.session_id
+			                AND r.at_ms >= ? AND r.at_ms < ?) AS receipts
+			       FROM session_tool_use t
+			       JOIN sessions s ON s.event_id = t.session_event_id
+			      WHERE ${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?${skillTraceFilter.sql}
+			      GROUP BY s.event_id
+			   ) per`,
+		)
+		.get(
+			...RECALL_SKILL_NAMES,
+			RECALL_MCP_TOOL_NAME,
+			`%\\${RECALL_MCP_TOOL_SUFFIX}`,
+			window.startMs,
+			window.endMs,
+			window.startMs,
+			window.endMs,
+			...skillTraceFilter.params,
+		) as { runs: number };
+	// Then the window's session-LESS receipts, globally: those are the CLI recalls
+	// no session can claim, so each one plausibly IS one of the runs just counted.
+	// Subtracting them is what stops a Claude-only machine — where every skill run
+	// does write a receipt — from reporting a gap it does not have.
+	const skillRunsWithoutTrace = Math.max(0, skillOnlyRow.runs - callsWithoutSession);
+
+	// Deliberately UNWINDOWED — the one figure on this card that is not. It says
+	// "recording starts here", which is what tells a reader that a 30-day chart
+	// holding one bar is a young table rather than a broken chart, and a windowed
+	// version could only ever report the window's own start. Its own query
+	// because the `rows` above are windowed by definition.
+	const sinceRow = db
+		.prepare(`SELECT MIN(r.at_ms) AS since FROM recall_receipts r WHERE 1 = 1${filter.sql}`)
+		.get(...filter.params) as { since: number | null };
+
 	return {
 		usedCalls,
 		setAsideCalls,
@@ -1609,13 +1807,25 @@ function buildRecallUsage(
 		distinctMemoriesUsed: memoriesUsed.size,
 		staleMemoriesUsed,
 		sessionsWithContext: sessionsWithContext.size,
+		callsWithoutSession,
 		sessionsInWindow: sessionRows.total,
 		bySurface: [...callsBySurface.entries()]
 			.map(([surface, calls]) => ({ surface: surface as RecallSurface, calls }))
 			.sort((a, b) => b.calls - a.calls),
 		skillInvocations: skillRow.calls,
 		callsWithoutReceipt,
-		daily: [...daily.entries()].map(([date, b]) => ({ date, used: b.used, setAside: b.setAside })),
+		skillRunsWithoutTrace,
+		...(sinceRow.since != null && { receiptsSinceDate: localDayKey(sinceRow.since, timeZone) }),
+		daily: [...daily.entries()].map(([date, b]) => ({
+			date,
+			used: b.used,
+			setAside: b.setAside,
+			// Omitted rather than `0`: the field means "this day has evidence with
+			// no recorded outcome", and every ordinary day has none. Emitting a
+			// zero on all of them would put the key on every point of every series
+			// for the one machine-in-a-thousand that has any.
+			...(b.estimated > 0 && { estimated: b.estimated }),
+		})),
 	};
 }
 
@@ -1704,7 +1914,7 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 					),
 				};
 			case "standup":
-				return { standup: buildStandup(db, options.scope, timeZone, nowMs, tier) };
+				return { standup: buildStandup(db, options.scope, timeZone, nowMs, tier, options.authorIdentity) };
 			case "repositories":
 				return { repositories: options.repositoriesModel ?? NO_REPOSITORIES_MODEL };
 			case "memories":
@@ -1712,7 +1922,15 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 				// not a recall receipt, so it exists as soon as a commit is
 				// summarized — there is nothing here that only makes sense above a
 				// tier.
-				return { memories: buildMemories(db, options.scope, options.hash, options.reachableCommits) };
+				return {
+					memories: buildMemories(
+						db,
+						options.scope,
+						options.hash,
+						options.reachableCommits,
+						options.detailRepoIdentity,
+					),
+				};
 		}
 	};
 

@@ -453,36 +453,60 @@ export interface MemoryConversationRow {
 	readonly messageCount: number;
 }
 
-/** One external reference (Linear/GitHub/…) archived on a memory. */
-export interface MemoryReferenceRow {
-	readonly source: string;
-	readonly nativeId: string;
+/**
+ * The four kinds of context a memory carries, in the order the editor's Context
+ * panel renders them (`buildPlansAndNotesSection` in
+ * `vscode/src/views/SummaryHtmlBuilder.ts`). `skills` is plural because it is the
+ * ONE aggregate row standing for every skill entered this session — the same
+ * choice every other Context surface makes, so a session that entered a dozen
+ * skills does not bury its plans.
+ */
+export type MemoryContextKind = "plan" | "note" | "reference" | "skills";
+
+/** {@link MemoryContextKind} as a value, for `/api/context`'s param check. Render order. */
+export const CONTEXT_DOC_KINDS: ReadonlyArray<MemoryContextKind> = ["plan", "note", "reference", "skills"];
+
+/**
+ * One context item associated with a memory — a plan, a note, an archived
+ * external reference, or the skills aggregate.
+ *
+ * Kept as ONE list rather than a list per kind so the page cannot render them in
+ * a different order than the editor does. The list is already ordered.
+ */
+export interface MemoryContextRow {
+	readonly kind: MemoryContextKind;
+	/**
+	 * Display title, resolved server-side by the same rules the editor uses —
+	 * `referenceDisplayTitle` for a reference (so a tracker row leads with its
+	 * issue key), the archived title otherwise.
+	 */
 	readonly title: string;
+	/**
+	 * `context.context_key` — what `/api/context` needs to fetch the body: the
+	 * plan's slug, the note's id, `<source>/<sanitized-key>` for a reference, and
+	 * the commit hash for the skills row (whose table is rendered from the
+	 * summary, not stored as a document).
+	 *
+	 * Carried on the row rather than re-derived in the client because none of the
+	 * four is recoverable from the title. Absent when the key cannot be derived —
+	 * a reference whose source has since left the registry — which renders the row
+	 * as a plain, unopenable label rather than a button that always 404s.
+	 */
+	readonly contextKey?: string;
+	/** Secondary line under the title: `<nativeId> (Linear)`, `<slug>.md`, the skills totals. */
+	readonly meta?: string;
+	/** Upstream URL, for a reference whose source has a navigable page. */
 	readonly url?: string;
 }
 
-/** One plan or note associated with a memory. */
-export interface MemoryContextRow {
-	readonly kind: "plan" | "note";
-	readonly title: string;
-	/**
-	 * `context.context_key` — the plan's slug or the note's id, i.e. what
-	 * `/api/context` needs to fetch the body. Carried on the row rather than
-	 * re-derived in the client because the archived slug is not the title and
-	 * cannot be recovered from it.
-	 */
-	readonly contextKey: string;
-}
-
 /**
- * A plan/note body, served by `/api/context` for the Context viewer.
+ * One context body, served by `/api/context` for the Context viewer.
  *
- * No `url`: the `context` table CHECK-constrains that column to `reference`
- * rows, so a plan or note can never have one — a field here would be dead by
- * construction.
+ * No `url`: the row the reader clicked already carries it, so repeating it here
+ * would be a second place for the same fact.
  */
 export interface ContextDoc {
-	readonly kind: "plan" | "note";
+	readonly kind: MemoryContextKind;
 	readonly title: string;
 	readonly bodyMd: string;
 }
@@ -552,6 +576,12 @@ export interface MemoryDetail {
 	readonly repoName: string;
 	readonly commitHash: string;
 	readonly shortHash: string;
+	/**
+	 * Always present here, unlike {@link MemoryListItem.memoryRefId}: an unsynced
+	 * memory falls back to `JM-<hash8>`, matching the editor's page title, which
+	 * labels every memory whether or not it has reached a Space.
+	 */
+	readonly memoryRefId: string;
 	readonly title: string;
 	readonly branch?: string;
 	readonly author?: string;
@@ -564,9 +594,18 @@ export interface MemoryDetail {
 	readonly deletions?: number;
 	/** The CONVERSATION's tokens (what was said to produce this commit) — not Jolli's own summarization call. */
 	readonly tokens?: {
+		/**
+		 * The headline figure: `aggregateConversationTokens` over the tree, the
+		 * same number the editor's meter prints. Deliberately NOT the sum of the
+		 * three segments below — a folded session that reports only a scalar count
+		 * with no breakdown lands in this total and in no segment, which is also
+		 * why the bar's widths use the segments' own sum as their denominator.
+		 */
+		readonly total: number;
 		readonly input: number;
 		readonly output: number;
 		readonly cached: number;
+		/** Whole-tree estimate from `estimateSummaryCostUsd` — see {@link MemoryDetail} usage. */
 		readonly costUsd?: number;
 		readonly pricesAsOf?: string;
 	};
@@ -574,7 +613,7 @@ export interface MemoryDetail {
 	readonly summarizedBy?: { readonly model: string; readonly tokens: number };
 	readonly recap?: string;
 	readonly conversations: ReadonlyArray<MemoryConversationRow>;
-	readonly references: ReadonlyArray<MemoryReferenceRow>;
+	/** Plans, notes, references and the skills row — one ordered list, see {@link MemoryContextRow}. */
 	readonly context: ReadonlyArray<MemoryContextRow>;
 	readonly excluded: ReadonlyArray<MemoryExcludedRow>;
 	readonly activity: ReadonlyArray<MemoryActivityRow>;
@@ -928,6 +967,14 @@ export interface StandupModel {
 	readonly todayCommits: ReadonlyArray<StandupCommit>;
 	readonly workspaces: ReadonlyArray<StandupWorkspace>;
 	/**
+	 * The git identity the commit columns and Risks were filtered to (an email,
+	 * or a name when only that is configured). ABSENT means the filter did not
+	 * run and the board is showing every author's work — the page states which
+	 * of the two it is, because an unfiltered standup is a draft the user would
+	 * otherwise post as their own. See `authorFilter` in `DashboardQuery.ts`.
+	 */
+	readonly authoredBy?: string;
+	/**
 	 * Risks/blockers/questions/TODOs mined from the window's commit memories.
 	 * Present (possibly empty) from the memory tier onwards; absent renders the
 	 * locked card.
@@ -1090,6 +1137,28 @@ export interface RecallDayPoint {
 	readonly date: string;
 	readonly used: number;
 	readonly setAside: number;
+	/**
+	 * Calls this day is known to have had from the `jollimemory` context
+	 * REFERENCE alone — a call with no receipt, so its OUTCOME is unknown and it
+	 * can be neither `used` nor `setAside`.
+	 *
+	 * This is the per-day half of {@link RecallUsage.callsWithoutReceipt}, which
+	 * is the same evidence collapsed to one window-wide number. Only the
+	 * reference channel feeds it: `session_tool_use` rows carry no time of their
+	 * own (they are windowed by their session), so they can say how many but
+	 * never on which day.
+	 *
+	 * **A lower bound, and it must be rendered as one.** The reference body
+	 * collapses a repeated query to a single entry and keeps only the newest 20,
+	 * so a busy day reports fewer calls than it had. Drawing it in the same
+	 * style as `used`/`setAside` would state a precision this number does not
+	 * have.
+	 *
+	 * Zero on any day that has a receipt: from the day receipts shipped both
+	 * channels see the same call, and adding them would double it. The receipt
+	 * is the authoritative one, so the estimate only speaks where it is silent.
+	 */
+	readonly estimated?: number;
 }
 
 /**
@@ -1124,6 +1193,20 @@ export interface RecallUsage {
 	 * to no session and is deliberately not invented one here.
 	 */
 	readonly sessionsWithContext: number;
+	/**
+	 * Receipts in the window that carry NO session id — a recall run outside any
+	 * agent session, which counts in {@link usedCalls} / {@link setAsideCalls} but
+	 * can never be counted in {@link sessionsWithContext}.
+	 *
+	 * Its own figure because nothing else on this card implies it. The card used
+	 * to derive the caveat from `sessionsWithContext === 0`, which is a different
+	 * statement — true only when NOT ONE receipt carries a session — so the
+	 * mixed window this caveat exists for (some calls inside a session, some at a
+	 * shell prompt) was the one case that never showed it, and a machine whose
+	 * every recall carries a session id had it printed unconditionally before
+	 * that.
+	 */
+	readonly callsWithoutSession: number;
 	/** Sessions in the window, whether or not they called recall. */
 	readonly sessionsInWindow: number;
 	/**
@@ -1163,8 +1246,9 @@ export interface RecallUsage {
 	 *
 	 *   - `session_tool_use` — `jollimemory.recall` per session, imported from
 	 *     transcripts. Blind to a source that records no tool calls (the gap
-	 *     {@link ToolUsage.uncoveredSources} names), and carries no per-call
-	 *     time, so it is windowed by its session's `updated_at_ms`.
+	 *     {@link ToolUsage.uncoveredSources} names). Windowed by the call's own
+	 *     `last_call_at_ms` where the source's parser could stamp one, and by
+	 *     its session's `updated_at_ms` where it could not.
 	 *   - the `jollimemory` context REFERENCE — one timestamped entry per call,
 	 *     so it windows exactly, and it exists for any source the reference
 	 *     extractor covers. Under-reports differently: a repeated query text
@@ -1182,6 +1266,57 @@ export interface RecallUsage {
 	 * it is clamped at 0.
 	 */
 	readonly callsWithoutReceipt: number;
+	/**
+	 * Recall SKILL runs in the window that left no other trace: no MCP tool row
+	 * in the same session, and no receipt that can be matched to them.
+	 *
+	 * The population this exists for is the `jolli-recall` skill taking its CLI
+	 * fallback — the documented path for a host with no MCP server, and the one
+	 * every non-Claude agent in the wild actually takes. Such a run leaves a
+	 * `kind='skill'` row and nothing else: no `kind='mcp'` row (so
+	 * {@link callsWithoutReceipt}, which only ever looked at MCP rows, could not
+	 * see it), no reference entry (the extractor bookmarks MCP calls), and its
+	 * `cli` receipt is written without a session id on every host but Claude
+	 * (`currentAgentSessionId` reads `CLAUDE_CODE_SESSION_ID` and nothing else).
+	 * So a real recall could be entirely absent from this card while
+	 * {@link skillInvocations} silently counted it.
+	 *
+	 * NOT folded into {@link callsWithoutReceipt}, deliberately: that figure is a
+	 * lower bound on CALLS, and this population is ambiguous by construction — a
+	 * skill run that was invoked and then never recalled anything looks exactly
+	 * the same from here, and is precisely what {@link skillInvocations} exists
+	 * to expose. Merging the two would let "the skill ran and did nothing" inflate
+	 * a count of calls, turning a bound into a guess. Kept separate, each number
+	 * keeps its own meaning and the card can word them differently.
+	 *
+	 * Subtraction happens in two stages, and both are needed. Per session, the
+	 * session's own MCP rows and its attributed receipts come off first — that is
+	 * the ordinary Claude case, where the skill did call the MCP tool and a
+	 * receipt names the session. Then the window's SESSION-LESS receipts come off
+	 * the total, because those are exactly the CLI recalls that cannot be
+	 * attributed to any session; each one plausibly IS one of these runs, and
+	 * counting both would report the same call twice. Clamped at 0 throughout.
+	 */
+	readonly skillRunsWithoutTrace: number;
+	/**
+	 * The day the FIRST receipt in scope was written — `YYYY-MM-DD`, same local
+	 * time zone and same shape as {@link RecallDayPoint.date}.
+	 *
+	 * Absent when no receipt exists at all. Deliberately unwindowed: it answers
+	 * "since when has anything been recorded here", which is the one question a
+	 * windowed figure cannot. Without it a 30-day chart holding one bar is
+	 * indistinguishable from a broken chart — the reader has no way to know that
+	 * the 29 empty days pre-date recording rather than being days nobody
+	 * recalled. The card draws it as the boundary the series begins at.
+	 *
+	 * A day KEY, not the raw epoch-ms it is derived from, because the only
+	 * consumer compares it against `daily[].date`. Those keys are computed in the
+	 * dashboard's resolved time zone, which the browser does not necessarily
+	 * share — formatting the instant client-side would put the boundary on the
+	 * wrong day for anyone whose machine zone differs from the one the series
+	 * was bucketed in.
+	 */
+	readonly receiptsSinceDate?: string;
 	/** Daily series for the bar chart, oldest first. */
 	readonly daily: ReadonlyArray<RecallDayPoint>;
 }

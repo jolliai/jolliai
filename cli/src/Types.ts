@@ -173,6 +173,30 @@ export interface ToolCallCount {
 	/** MCP server the tool belongs to. Present only when `kind` is `"mcp"`. */
 	readonly server?: string;
 	readonly calls: number;
+	/**
+	 * When the LAST call in this bucket was made, from the transcript line that
+	 * recorded it — NOT the session's own clock and NOT any commit's.
+	 *
+	 * A tool call is an event with its own instant, and the two times it used to
+	 * be approximated by are both wrong in a way that shows: a session's
+	 * `updatedAt` moves every time the conversation is touched afterwards (so a
+	 * call made three weeks ago reads as today's), and a commit date has no
+	 * relationship to it at all — an agent turn may precede its commit by hours
+	 * or produce no commit ever. The dashboard windows recall activity by this
+	 * field for exactly that reason.
+	 *
+	 * LAST, not first, and one instant for the whole bucket: a bucket counts N
+	 * calls of the same tool in one session, so a bucket that straddles a window
+	 * boundary is counted wholly inside the window its last call fell in. Splitting
+	 * it would need a row per call, which is a different table; being off by the
+	 * span of one session's repeated calls is a far smaller error than being off
+	 * by however long ago that session was last touched.
+	 *
+	 * Absent when the source's parser has no timestamp to offer (see
+	 * {@link ToolUseTally} for which do) — readers of this field must fall back
+	 * rather than treat absence as "never called".
+	 */
+	readonly lastCallAtMs?: number;
 }
 
 /**

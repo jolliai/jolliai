@@ -191,7 +191,6 @@ function summariesEquivalent(a: string, b: string): boolean {
 	}
 }
 
-/** Order-insensitive JSON equivalence for the synthesized topic index. */
 /**
  * The reason string for a step 2 / step 3 failure, told from the caller's side.
  *

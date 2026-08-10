@@ -211,19 +211,52 @@ export async function recordRecallReceipt(
 }
 
 /**
- * The agent session this process is running inside, when one advertised
- * itself in the environment.
+ * Environment variables that carry the id of the agent session this process is
+ * running inside, most-specific first.
  *
- * Only Claude Code publishes a session id today (`CLAUDE_CODE_SESSION_ID`,
- * the same uuid `sessions.session_id` carries, so a receipt joins straight
- * onto the session row). Every other host, and a plain terminal, yields
- * undefined — which is the honest answer, not a gap to paper over: a recall
- * typed at a shell prompt genuinely belongs to no session, and attributing it
- * to a guessed one would corrupt the coverage figure the Recall card reads.
+ * **One entry, and that is a measured result rather than an unfinished list.**
+ * Claude Code exports `CLAUDE_CODE_SESSION_ID`, and it is the same uuid
+ * `sessions.session_id` carries, so a receipt written from it joins straight
+ * onto the session row (verified against a live session). The other hosts were
+ * checked the only way that settles it — reading `/proc/<pid>/environ` of a
+ * running one — and they publish nothing usable:
+ *
+ *   - **codex**: the whole environment carries no session/conversation/thread
+ *     variable; the only codex-specific entry is
+ *     `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`, which names the front-end, not the
+ *     session. Its session id exists only inside its own rollout files.
+ *
+ * So a recall from those hosts writes no session id, and that is the honest
+ * answer rather than a gap to paper over — see the note below on why the
+ * tempting fallback is worse than the blank.
+ *
+ * Adding a host means measuring it the same way and appending its real variable
+ * name here; nothing else changes.
+ */
+const SESSION_ID_ENV_VARS: ReadonlyArray<string> = ["CLAUDE_CODE_SESSION_ID"];
+
+/**
+ * The agent session this process is running inside, when one advertised itself
+ * in the environment.
+ *
+ * Undefined for a plain terminal and for every host in the note above. That
+ * costs real coverage — a recall from codex or cline can never be counted among
+ * the sessions that got prior context — and it is still the right answer,
+ * because the available fallback is to pick the most recently touched session
+ * for this repo, which is a GUESS that looks exactly like a fact once stored.
+ * The Recall card's coverage figure would then be wrong in the one direction
+ * nobody can audit: attributing a call to a session that never made it.
+ *
+ * A null is visible as a null; an invented id is not. (The coverage denominator
+ * treats a session-less receipt as belonging to no session, deliberately — see
+ * `buildRecallUsage`'s union.)
  */
 function currentAgentSessionId(): string | undefined {
-	const id = process.env.CLAUDE_CODE_SESSION_ID?.trim();
-	return id ? id : undefined;
+	for (const name of SESSION_ID_ENV_VARS) {
+		const id = process.env[name]?.trim();
+		if (id) return id;
+	}
+	return undefined;
 }
 
 /**

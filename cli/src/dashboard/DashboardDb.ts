@@ -35,6 +35,7 @@ import {
 	MEMORY_SOT_DDL,
 	RECALL_RECEIPTS_DDL,
 	SKILL_CONTEXT_KIND_DDL,
+	TOOL_CALL_TIME_DDL,
 } from "./SotSchema.js";
 
 const log = createLogger("DashboardDb");
@@ -65,7 +66,7 @@ const log = createLogger("DashboardDb");
  * user's database (other processes may hold the file open, and the memory half
  * is the only copy there is).
  */
-export const DASHBOARD_SCHEMA_VERSION = 4;
+export const DASHBOARD_SCHEMA_VERSION = 5;
 
 /**
  * Minimum Node that ships `node:sqlite` **without** `--experimental-sqlite`.
@@ -204,7 +205,11 @@ export const BUSY_TIMEOUT_BY_ROLE: Readonly<Record<string, number>> = {
  * steps. Entry 1 adds `recall_receipts` as a real migration: by then dev
  * databases existed at version 1, and only an appended entry reaches those as
  * well as fresh ones. Entry 2 registers the `skill` context kind for the same
- * reason.
+ * reason. Entry 4 gives `session_tool_use` the call's own timestamp — an
+ * additive NULLABLE column precisely because the rows already on disk cannot be
+ * backfilled (the transcripts they were read from may be gone), so they keep
+ * being read under the old session-time fallback rather than dropping out of
+ * every window for want of a value.
  *
  * Exported for tests: they execute entries directly to build a database at a
  * chosen version rather than hand-rolling copies of the DDL, which would drift.
@@ -231,6 +236,7 @@ BEGIN SELECT RAISE(ABORT, 'repos are never deleted: set disabled_at instead'); E
 	RECALL_RECEIPTS_DDL,
 	SKILL_CONTEXT_KIND_DDL,
 	EVENT_FAILED_KIND_DDL,
+	TOOL_CALL_TIME_DDL,
 ];
 
 /** Reads the stored schema version, treating a fresh DB as 0. */

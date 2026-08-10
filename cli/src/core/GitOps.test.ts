@@ -65,6 +65,7 @@ import {
 	listWorktrees,
 	orphanBranchExists,
 	readFileFromBranch,
+	readLocalGitIdentity,
 	readOrigHead,
 	resetStateRootCache,
 	resolveGitHooksDir,
@@ -463,6 +464,26 @@ describe("GitOps", () => {
 			mockSuccess(""); // ls-files --others → none
 			const stats = await getWorkingTreeDiffStats(["a.ts"], "/repo");
 			expect(stats).toEqual({ filesChanged: 1, insertions: 2, deletions: 1 });
+		});
+	});
+
+	describe("readLocalGitIdentity", () => {
+		it("reads user.email and user.name from git config", async () => {
+			mockSuccess("me@example.com\n");
+			mockSuccess("Me\n");
+			expect(await readLocalGitIdentity("/w")).toEqual({ email: "me@example.com", name: "Me" });
+			expect(mockExecFileAsync).toHaveBeenCalledWith(
+				"git",
+				["config", "user.email"],
+				expect.objectContaining({ cwd: "/w" }),
+			);
+		});
+
+		it("reports an unset or unreadable field as null rather than an empty string", async () => {
+			// An unset key exits 1 with no stdout; a whitespace-only value is no value.
+			mockFailure(1, "");
+			mockSuccess("   \n");
+			expect(await readLocalGitIdentity()).toEqual({ email: null, name: null });
 		});
 	});
 

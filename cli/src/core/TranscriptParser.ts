@@ -22,6 +22,29 @@ import {
 } from "./ToolNameClassify.js";
 import { parseTranscriptLine } from "./TranscriptReader.js";
 
+/**
+ * Epoch ms of an ISO timestamp, or undefined when there is none to read or it
+ * does not parse. Undefined rather than `NaN`/0: the field it feeds is optional
+ * and its absence means "this parser had no instant to offer", which a zero
+ * would turn into the claim "called at the epoch".
+ */
+function parseIsoMs(iso: string | undefined): number | undefined {
+	if (iso === undefined) return undefined;
+	const ms = Date.parse(iso);
+	return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
+ * The latest of some instants as a spreadable fragment, absent when none of
+ * them is known. Same reason as `mergeLastCallAt` in `ToolNameClassify`: an
+ * absent time must stay absent rather than be written as `undefined` over a
+ * known one.
+ */
+function latestOf(...times: ReadonlyArray<number | undefined>): { lastCallAtMs?: number } {
+	const known = times.filter((t): t is number => t !== undefined);
+	return known.length > 0 ? { lastCallAtMs: Math.max(...known) } : {};
+}
+
 // Re-exported for the callers that already imported it from here; the shared
 // classifiers now live in ToolNameClassify.ts alongside the other dialects.
 export { classifyToolName } from "./ToolNameClassify.js";
@@ -159,15 +182,19 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 			}
 			const content = (parsed as { message?: { content?: unknown } })?.message?.content;
 			if (!Array.isArray(content)) continue;
+			// The line's own instant, so the bucket can be windowed by when the call
+			// happened rather than by when its session was last touched. Read per
+			// line and not per file: one session's calls span hours.
+			const atMs = parseIsoMs(this.parseTimestamp(line));
 			for (const block of content) {
 				const b = block as { type?: unknown; id?: unknown; name?: unknown; input?: { skill?: unknown } };
 				if (b.type !== "tool_use" || typeof b.name !== "string") continue;
-				tally.addOnce(
-					typeof b.id === "string" ? b.id : undefined,
-					b.name === "Skill" && typeof b.input?.skill === "string"
+				tally.addOnce(typeof b.id === "string" ? b.id : undefined, {
+					...(b.name === "Skill" && typeof b.input?.skill === "string"
 						? skillTool(b.input.skill)
-						: classifyToolName(b.name),
-				);
+						: classifyToolName(b.name)),
+					...(atMs !== undefined && { lastCallAtMs: atMs }),
+				});
 			}
 		}
 		return tally.values();
@@ -296,16 +323,32 @@ export class CodexTranscriptParser implements TranscriptParser {
 				continue;
 			}
 
+			// Stamped on every row, INCLUDING the ones the upgrade rule discards
+			// below: a call's rows (request, then `mcp_tool_call_end`) are written
+			// at different instants, and the identity that wins is not necessarily
+			// the row that happened last. Carrying the later of the two keeps the
+			// bucket's time honest regardless of which row won.
+			// Read off the envelope rather than through a `parseTimestamp` method:
+			// this parser has none, and adding one would also change which lines the
+			// incremental cutoff can see — a separate decision from this one.
+			const rawAt = (parsed as { timestamp?: unknown }).timestamp;
+			const atMs = parseIsoMs(typeof rawAt === "string" ? rawAt : undefined);
+			const timed: ToolCallCount = { ...call, ...(atMs !== undefined && { lastCallAtMs: atMs }) };
+
 			const callId = typeof p.call_id === "string" ? p.call_id : undefined;
 			if (callId === undefined) {
-				anonymous.push(call);
+				anonymous.push(timed);
 				continue;
 			}
 			const known = byCallId.get(callId);
 			// Upgrade-only: a builtin guess yields to a resolved MCP identity, and a
 			// later builtin row (the request written after an event, or a result row
 			// echoing the bare name) never overwrites one.
-			if (known === undefined || (known.kind !== "mcp" && call.kind === "mcp")) byCallId.set(callId, call);
+			const winner = known === undefined || (known.kind !== "mcp" && timed.kind === "mcp") ? timed : known;
+			byCallId.set(callId, {
+				...winner,
+				...(known ? latestOf(known.lastCallAtMs, timed.lastCallAtMs) : latestOf(timed.lastCallAtMs)),
+			});
 		}
 		const tally = new ToolUseTally();
 		for (const call of [...byCallId.values(), ...anonymous]) tally.add(call);
@@ -425,12 +468,15 @@ export class KimiTranscriptParser implements TranscriptParser {
 				| undefined;
 			if (event === null || typeof event !== "object") continue;
 			if (event.type !== "tool.call" || typeof event.name !== "string") continue;
-			tally.addOnce(
-				typeof event.toolCallId === "string" ? event.toolCallId : undefined,
-				event.name === KIMI_SKILL_TOOL_NAME && typeof event.args?.skill === "string"
+			// Every Kimi wire event carries a millisecond-epoch `time`; `parseTimestamp`
+			// is the one place that shape is decoded.
+			const atMs = parseIsoMs(this.parseTimestamp(line));
+			tally.addOnce(typeof event.toolCallId === "string" ? event.toolCallId : undefined, {
+				...(event.name === KIMI_SKILL_TOOL_NAME && typeof event.args?.skill === "string"
 					? skillTool(event.args.skill)
-					: classifyToolName(event.name),
-			);
+					: classifyToolName(event.name)),
+				...(atMs !== undefined && { lastCallAtMs: atMs }),
+			});
 		}
 		return tally.values();
 	}

@@ -286,6 +286,50 @@ describe("collectCommitEvents", () => {
 		}
 	});
 
+	it("excludes Jolli's own storage refs from both log passes and from attribution", async () => {
+		// The orphan branch is a local branch like any other, so every ref-scoped
+		// call here picks it up unless told not to — and it holds one commit PER
+		// MEMORY. Measured on this repo before the exclusion: 1800 of 2468 stored
+		// commits were `Add summary for …`, and `jollimemory/summaries/v3` outranked
+		// `main` in the branch attribution.
+		const calls: string[][] = [];
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			calls.push([...args]);
+			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x.com${SEP}one`);
+			// Sorted by committerdate, so the orphan branch — written on every memory
+			// — is realistically the FIRST entry, not an afterthought at the end.
+			if (args[0] === "for-each-ref") return git("jollimemory/summaries/v3\nmain\n");
+			if (args[0] === "rev-list" && args[1] === "main") return git("aaa\n");
+			return git("");
+		});
+		vi.mocked(getIndex).mockResolvedValue(null);
+		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
+		// Two ways to get this wrong silently, so both are pinned. `--exclude` is
+		// positional — it applies only to the selector that FOLLOWS it — and its
+		// pattern is relative to that selector, so the `refs/heads/`-prefixed form
+		// matches nothing under `--branches` and is ignored without a word.
+		for (const pass of calls.filter((c) => c[0] === "log" || c[0] === "-c")) {
+			expect(pass.indexOf("--exclude=jollimemory/*")).toBe(pass.indexOf("--branches") - 1);
+		}
+		// Never walked, so it can never be attributed either.
+		expect(calls.filter((c) => c[0] === "rev-list").map((c) => c[1])).toEqual(["main"]);
+		expect(events[0]?.branches).toEqual(["main"]);
+	});
+
+	it("keeps a branch merely NAMED like the internal namespace", async () => {
+		// Excluded by namespace (`jollimemory/`), not by prefix match — a user's
+		// own `jollimemory-notes` branch is ordinary work and must stay attributed.
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x.com${SEP}one`);
+			if (args[0] === "for-each-ref") return git("jollimemory-notes\n");
+			if (args[0] === "rev-list" && args[1] === "jollimemory-notes") return git("aaa\n");
+			return git("");
+		});
+		vi.mocked(getIndex).mockResolvedValue(null);
+		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
+		expect(events[0]?.branches).toEqual(["jollimemory-notes"]);
+	});
+
 	it("scans --numstat only for commits the caller has not stored", async () => {
 		// The one expensive step in this collection (6.3 s → 0.44 s on a real 2.5k
 		// commit history), and the reason a moved branch tip no longer costs a
@@ -330,6 +374,44 @@ describe("collectCommitEvents", () => {
 		expect(events[1]).not.toHaveProperty("files");
 	});
 
+	it("never re-asks numstat for a merge commit, which has no file rows to find", async () => {
+		// A merge shows no diff under `git log --numstat`, so it can never acquire
+		// `commit_files` rows — and the caller's "which commits have file rows" set
+		// therefore never contains it. Retrying it on every sweep would be pure
+		// waste, and in a merge-heavy history enough of them to push past
+		// INCREMENTAL_NUMSTAT_LIMIT and drag the whole-history scan back in.
+		const calls: string[][] = [];
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			calls.push([...args]);
+			if (args[0] === "log") {
+				return git(
+					[
+						// %P rides last: two parents = merge, one = ordinary commit.
+						`mmm${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x.com${SEP}merge${SEP}p1 p2`,
+						`aaa${SEP}2026-07-29T08:00:00+08:00${SEP}F${SEP}f@x.com${SEP}new${SEP}p1`,
+					].join("\n"),
+				);
+			}
+			if (args[0] === "for-each-ref") return git("main\n");
+			if (args[0] === "rev-list") return git("mmm\naaa\n");
+			if (args[0] === "-c") return git([`${REC}aaa`, "1\t0\tsrc/a.ts"].join("\n"));
+			throw new Error(`unexpected git ${args.join(" ")}`);
+		});
+		vi.mocked(getIndex).mockResolvedValue(null);
+
+		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w", knownHashes: new Set() });
+
+		const numstat = calls.find((c) => c[0] === "-c");
+		expect(numstat).toContain("aaa");
+		expect(numstat).not.toContain("mmm");
+		// Still emitted, and still ABSENT rather than `[]` — the merge keeps whatever
+		// the projection holds instead of claiming it touches nothing.
+		expect(events.map((e) => e.hash)).toEqual(["mmm", "aaa"]);
+		expect(events[0]).not.toHaveProperty("files");
+		// The subject stays intact with the parent field appended after it.
+		expect(events[0]?.message).toBe("merge");
+	});
+
 	it("falls back to the whole-history scan when too many commits are new", async () => {
 		// The incremental form passes every hash as an argv entry, and Windows caps a
 		// command line at ~32 KB — so past the limit it does not run slower, it fails
@@ -353,7 +435,7 @@ describe("collectCommitEvents", () => {
 		expect(numstat).toContain("--branches");
 	});
 
-	// The `--count` cap is a documented reachability gap, but it must not be
+	// The `MAX_BRANCHES` cap is a documented reachability gap, but it must not be
 	// expressed as the CLAIM `branches: []` — that array is replace-when-present,
 	// so a commit only the branches past the cap reach would have its correct
 	// stored attribution deleted on every pass.
@@ -368,9 +450,10 @@ describe("collectCommitEvents", () => {
 					].join("\n"),
 				);
 			}
-			// One past the cap: this is what makes truncation detectable at all.
+			// Listed in full and capped in JS — asking git for one past the cap would
+			// spend that slot on Jolli's own refs, which are filtered out here.
 			if (args[0] === "for-each-ref") {
-				expect(args).toContain("--count=51");
+				expect(args).not.toContain("--count=51");
 				return git(`${listed.join("\n")}\n`);
 			}
 			if (args[0] === "rev-list" && args[1] === "b0") return git("aaa\n");
@@ -513,6 +596,8 @@ describe("parseNumstatLog", () => {
 });
 
 describe("collectFilesForCommits", () => {
+	const REC = "\u0001";
+
 	it("returns an empty map for no hashes without spawning git", async () => {
 		vi.mocked(execGit).mockClear();
 		expect((await collectFilesForCommits([], "/w")).size).toBe(0);
@@ -522,6 +607,40 @@ describe("collectFilesForCommits", () => {
 	it("returns an empty map when git fails, so the caller omits files rather than clearing them", async () => {
 		vi.mocked(execGit).mockResolvedValue(gitFail("bad object"));
 		expect((await collectFilesForCommits(["aaa"], "/w")).size).toBe(0);
+		// One hash has nothing to bisect: exactly one call, no retry.
+		expect(execGit).toHaveBeenCalledTimes(1);
+	});
+
+	it("bisects a failing batch so one unreadable commit does not blank the rest", async () => {
+		// The failure mode this exists for: a diff past execGit's maxBuffer fails
+		// the whole `--no-walk` call, identically on every retry. Returning empty
+		// for the batch denies file rows to the other commits, and since the next
+		// sweep asks which commits HAVE file rows, the same doomed batch comes back
+		// forever. Here `poison` fails whenever it is in the argv.
+		vi.mocked(execGit).mockClear();
+		vi.mocked(execGit).mockImplementation(async (args) => {
+			const hashes = args.filter((a) => /^[a-z]\d$/.test(a));
+			if (hashes.includes("p1")) return gitFail("stdout maxBuffer length exceeded");
+			return git(hashes.map((h) => `${REC}${h}\n1\t0\tf-${h}.ts`).join("\n"));
+		});
+
+		const files = await collectFilesForCommits(["a1", "b1", "p1", "c1"], "/w");
+
+		expect([...files.keys()].sort()).toEqual(["a1", "b1", "c1"]);
+		expect(files.get("a1")?.[0]?.path).toBe("f-a1.ts");
+	});
+
+	it("stops bisecting a wholly broken repo instead of one call per commit", async () => {
+		// Same failure shape covers "git is broken here", where splitting can only
+		// spend subprocesses. The budget caps the damage at a flat handful rather
+		// than ~2N on every sweep, forever.
+		vi.mocked(execGit).mockClear();
+		vi.mocked(execGit).mockResolvedValue(gitFail("not a git repository"));
+		const hashes = Array.from({ length: 200 }, (_, i) => `h${i}`);
+
+		expect((await collectFilesForCommits(hashes, "/w")).size).toBe(0);
+
+		expect(vi.mocked(execGit).mock.calls.length).toBeLessThan(30);
 	});
 });
 

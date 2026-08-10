@@ -240,6 +240,20 @@ window.JD = window.JD || {};
 		return html + '<span class="schip" style="border-style:dashed">step progress needs plan enumeration</span>';
 	}
 
+	/* Whose commits the board is showing. Stated either way, and never silently:
+	   the columns feed a draft the user posts as their own work, so "filtered to
+	   you" and "could not tell who you are, showing everyone" have to be
+	   distinguishable before the paste, not after. */
+	function authorChip(standup) {
+		if (standup.authoredBy) {
+			return '<span class="schip">yours only · <span class="mono">' + JD.esc(standup.authoredBy) + "</span></span>";
+		}
+		return (
+			'<span class="schip" style="border-style:dashed">every author — no git identity configured, ' +
+			"so this is not filtered to you</span>"
+		);
+	}
+
 	/* ---- the drafted standup ----------------------------------------------- */
 
 	/* The markdown the sheet shows and the clipboard gets. Same routing as the
@@ -372,6 +386,7 @@ window.JD = window.JD || {};
 			'<div class="ctx"><span class="date">' +
 			esc(JD.weekdayDate(model.generatedAtMs, model.timeZone)) +
 			'</span><span class="sprint-chips">' +
+			authorChip(standup) +
 			sprintChips(standup, model) +
 			'</span><div class="spacer"></div>' +
 			'<span class="share-note">posts nowhere — copy it where you like</span>' +
@@ -466,9 +481,14 @@ window.JD = window.JD || {};
 
 		copyButton.onclick = () => {
 			output.value = JD.standupMarkdown(model);
-			document.getElementById("sheetSub").textContent = memory
-				? "From your commit memories. Edit anything before you post it."
-				: "From raw sessions + git log. Enable Jolli Memory for decisions, TODOs and blockers.";
+			/* The unfiltered warning goes FIRST and outranks the tier note: what you
+			   are about to paste containing a teammate's commit matters more than
+			   where the lines came from. */
+			document.getElementById("sheetSub").textContent = !standup.authoredBy
+				? "Every author's commits — no git identity configured, so check the lines are yours before posting."
+				: memory
+					? "From your commit memories. Edit anything before you post it."
+					: "From raw sessions + git log. Enable Jolli Memory for decisions, TODOs and blockers.";
 			overlay.classList.add("open");
 			output.focus();
 			/* Copied on open as well as on the button: the one-click path stays as fast

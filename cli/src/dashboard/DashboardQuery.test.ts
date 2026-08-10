@@ -1138,6 +1138,143 @@ describe("buildDashboardModel — recall usage", () => {
 		const result = await recallUsage();
 		expect(result?.usedCalls).toBe(1);
 		expect(result?.sessionsWithContext).toBe(0);
+		expect(result?.callsWithoutSession).toBe(1);
+	});
+
+	it("counts session-less calls on their own, so a mixed window can say so", async () => {
+		// `callsWithoutSession` is the statement "some receipt names no session",
+		// which `sessionsWithContext === 0` ("no receipt names one") cannot make.
+		// Both halves count: a set-aside call outside a session is just as
+		// unattributable as a used one.
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWith("s1"),
+				recall(hit("a".repeat(40), "2026-07-25"), { sessionId: "s1", atMs: nowMs - 3_600_000 }),
+				recall(hit("b".repeat(40), "2026-07-25"), { surface: "cli", atMs: nowMs - 3_500_000 }),
+				recall(miss, { surface: "cli", atMs: nowMs - 3_400_000 }),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const result = await recallUsage();
+		expect(result?.sessionsWithContext).toBe(1);
+		expect(result?.callsWithoutSession).toBe(2);
+	});
+
+	/**
+	 * Seeds the `jollimemory` recall REFERENCE — the only receipt-less channel
+	 * that timestamps each call, and therefore the only one that can place a
+	 * pre-receipt call on a day. Written directly because it reaches the database
+	 * through the orphan import, not through the event stream.
+	 */
+	const seedRecallReference = async (atIsos: ReadonlyArray<string>): Promise<void> => {
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+					id: number;
+				};
+				// Entry-line form (`ACCUMULATED_ENTRY_RE`), one per call, distinct query
+				// texts so the accumulator does not collapse them into one.
+				const body = atIsos.map((at, i) => `- \`query ${i}\` — ${at}`).join("\n");
+				// `referenced_at` is NOT NULL exactly for a reference (schema CHECK); the
+				// value is the row's own bookmark time, which the per-call entry lines in
+				// `body_md` are what this test actually reads.
+				db.prepare(
+					`INSERT INTO context
+					   (repo_id, kind, context_key, source, native_id, referenced_at, title, body_md, created_at_ms)
+					 VALUES (?, 'reference', 'jollimemory:recall', 'jollimemory', 'recall', ?, 'Recall', ?, 1)`,
+				).run(id, atIsos[0] ?? "2026-07-01T00:00:00.000Z", body);
+			},
+			{ dbPath },
+		);
+	};
+
+	it("buckets receipts by their own day, so a multi-day window shows a bar per day", async () => {
+		// The regression this pins: `daily` is the ONLY per-day series on the card,
+		// and a chart holding one bar is indistinguishable from a broken one — so
+		// "receipts land in their own day" has to be asserted, not assumed.
+		const day = 86_400_000;
+		await applySummaryEvents(
+			[
+				repoEvent,
+				recall(hit("a".repeat(40), "2026-07-25"), { atMs: nowMs - 4 * day }),
+				// Two calls on ONE day, a second apart. Not the same instant: a receipt
+				// is keyed on `statsEventId`, whose only distinguishing part for a call
+				// is when it happened, so two receipts sharing a millisecond converge on
+				// one row by design (`ON CONFLICT(receipt_id) DO UPDATE`).
+				recall(hit("b".repeat(40), "2026-07-25"), { atMs: nowMs - 2 * day }),
+				recall(miss, { atMs: nowMs - 2 * day + 1_000 }),
+				recall(hit("c".repeat(40), "2026-07-25"), { atMs: nowMs }),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const result = await recallUsage();
+		const active = (result?.daily ?? []).filter((d) => d.used > 0 || d.setAside > 0);
+		expect(active).toEqual([
+			{ date: "2026-07-26", used: 1, setAside: 0 },
+			{ date: "2026-07-28", used: 1, setAside: 1 },
+			{ date: "2026-07-30", used: 1, setAside: 0 },
+		]);
+		// Every day of the window is present, zeros included — that is what lets
+		// the chart draw an axis instead of floating three bars in blank space.
+		expect(result?.daily.length).toBeGreaterThan(3);
+	});
+
+	it("reports the first receipt's day unwindowed, as the series' starting boundary", async () => {
+		await applySummaryEvents(
+			[repoEvent, recall(hit("a".repeat(40), "2026-07-25"), { atMs: nowMs - 2 * 86_400_000 })],
+			{ producerKind: "cli", dbPath },
+		);
+		expect((await recallUsage())?.receiptsSinceDate).toBe("2026-07-28");
+	});
+
+	it("leaves the starting boundary absent when nothing has ever been receipted", async () => {
+		await applySummaryEvents([repoEvent], { producerKind: "cli", dbPath });
+		expect((await recallUsage())?.receiptsSinceDate).toBeUndefined();
+	});
+
+	it("places a receipt-less call on its own day from the reference's timestamp", async () => {
+		// Pre-receipt history: the call is known and dated, its OUTCOME is not.
+		await applySummaryEvents([repoEvent], { producerKind: "cli", dbPath });
+		await seedRecallReference(["2026-07-28T04:00:00.000Z", "2026-07-28T05:00:00.000Z"]);
+		const result = await recallUsage();
+		expect(result?.callsWithoutReceipt).toBe(2);
+		expect(result?.daily.find((d) => d.date === "2026-07-28")).toEqual({
+			date: "2026-07-28",
+			used: 0,
+			setAside: 0,
+			estimated: 2,
+		});
+	});
+
+	it("drops the estimate on any day a receipt already covers, so one call is never counted twice", async () => {
+		// From the day receipts shipped, BOTH channels see the same call — the
+		// reference extractor bookmarks exactly the recalls the serving code
+		// receipted. Summing them would double that day.
+		await applySummaryEvents(
+			[repoEvent, recall(hit("a".repeat(40), "2026-07-25"), { atMs: Date.parse("2026-07-28T06:00:00Z") })],
+			{ producerKind: "cli", dbPath },
+		);
+		await seedRecallReference(["2026-07-28T06:00:00.000Z", "2026-07-26T06:00:00.000Z"]);
+		const result = await recallUsage();
+		// The receipted day is told by its receipt alone...
+		expect(result?.daily.find((d) => d.date === "2026-07-28")).toEqual({
+			date: "2026-07-28",
+			used: 1,
+			setAside: 0,
+		});
+		// ...while a day with no receipt keeps its estimate.
+		expect(result?.daily.find((d) => d.date === "2026-07-26")?.estimated).toBe(1);
+	});
+
+	it("omits `estimated` entirely on an ordinary day", async () => {
+		// The field means "evidence with no recorded outcome". Emitting a 0 on
+		// every point would put the key on every series for every machine.
+		await applySummaryEvents([repoEvent, recall(hit("a".repeat(40), "2026-07-25"))], {
+			producerKind: "cli",
+			dbPath,
+		});
+		expect((await recallUsage())?.daily.every((d) => !("estimated" in d))).toBe(true);
 	});
 
 	it("reports skill invocations separately, so they cannot move the hit rate", async () => {
@@ -1205,6 +1342,121 @@ describe("buildDashboardModel — recall usage", () => {
 		// reports the nonsensical "1 of 0 sessions got prior context".
 		expect(result?.sessionsWithContext).toBe(1);
 		expect(result?.sessionsInWindow).toBe(1);
+	});
+
+	/** One session carrying recall tool rows, with an explicit per-call time. */
+	const sessionWithRecallTools = (
+		sessionId: string,
+		tools: ReadonlyArray<{ name: string; kind: "skill" | "mcp"; server?: string; lastCallAtMs?: number }>,
+		updatedAtMs: number = nowMs - 3_600_000,
+		source: "claude" | "codex" = "claude",
+	): StatsEventEnvelope =>
+		({
+			producerKind: "cli",
+			event: {
+				type: "session.upserted",
+				repoIdentity: "repo-1",
+				source,
+				sessionId,
+				updatedAtMs,
+				tools: tools.map((t) => ({ ...t, calls: 1 })),
+			},
+		}) as StatsEventEnvelope;
+
+	it("windows a tool row by the CALL's own time, not by its session's", async () => {
+		// The defect this column exists for: a session updated inside the window
+		// whose recall actually happened months ago was filed under today, and a
+		// call made an hour ago inside a long-running session was filed under
+		// whenever that session last updated.
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWithRecallTools("stale-call", [
+					{ name: "jolli-recall", kind: "skill", lastCallAtMs: Date.parse("2026-05-01T00:00:00Z") },
+				]),
+				sessionWithRecallTools(
+					"fresh-call",
+					[{ name: "jolli-recall", kind: "skill", lastCallAtMs: nowMs - 3_600_000 }],
+					Date.parse("2026-05-01T00:00:00Z"),
+				),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		// One in, one out — and note the two sessions' `updatedAtMs` say the exact
+		// opposite, which is what the old windowing read.
+		expect((await recallUsage())?.skillInvocations).toBe(1);
+	});
+
+	it("falls back to the session's time for a row whose parser stamped none", async () => {
+		// Rows written before the column existed, and sources whose parsers cannot
+		// supply a per-call time, hold NULL — a bare comparison against NULL is
+		// false, so without COALESCE every one of them would silently vanish from
+		// every window rather than keep its old placement.
+		await applySummaryEvents(
+			[repoEvent, sessionWithRecallTools("untimed", [{ name: "jolli-recall", kind: "skill" }])],
+			{ producerKind: "cli", dbPath },
+		);
+		expect((await recallUsage())?.skillInvocations).toBe(1);
+	});
+
+	it("counts a skill run that left no MCP call and no attributable receipt", async () => {
+		// The CLI-fallback recall: a `kind='skill'` row and nothing else. It used
+		// to be invisible — `callsWithoutReceipt` only ever looked at MCP rows.
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWithRecallTools("codex-1", [{ name: "jolli-recall", kind: "skill" }], undefined, "codex"),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const result = await recallUsage();
+		expect(result?.skillRunsWithoutTrace).toBe(1);
+		// Kept OUT of the call bound: a skill run that never recalled looks the same.
+		expect(result?.callsWithoutReceipt).toBe(0);
+		expect(result?.usedCalls).toBe(0);
+	});
+
+	it("does not count a skill run whose session also carries the MCP call", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWithRecallTools("claude-1", [
+					{ name: "jolli:recall", kind: "skill" },
+					{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory" },
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect((await recallUsage())?.skillRunsWithoutTrace).toBe(0);
+	});
+
+	it("does not count a skill run whose session has a receipt of its own", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWithRecallTools("claude-2", [{ name: "jolli-recall", kind: "skill" }]),
+				recall(hit("a".repeat(40), "2026-07-25"), { sessionId: "claude-2", surface: "cli" }),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect((await recallUsage())?.skillRunsWithoutTrace).toBe(0);
+	});
+
+	it("subtracts session-less receipts, so a CLI recall is not counted twice", async () => {
+		// codex/opencode export no session id, so their CLI receipt lands
+		// unattributed — the same call the skill row describes. Counting both
+		// would report one recall as two.
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWithRecallTools("codex-2", [{ name: "jolli-recall", kind: "skill" }], undefined, "codex"),
+				recall(hit("a".repeat(40), "2026-07-25"), { surface: "cli" }),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const result = await recallUsage();
+		expect(result?.callsWithoutSession).toBe(1);
+		expect(result?.skillRunsWithoutTrace).toBe(0);
 	});
 
 	it("is empty, not absent, when nothing made a recall call", async () => {
@@ -2162,5 +2414,185 @@ describe("memory cards — sparse summaries", () => {
 		expect(c.severity).toBe("major");
 		expect(c.insertions).toBeUndefined();
 		expect(c.deletions).toBe(500);
+	});
+});
+
+describe("standup author filter", () => {
+	let dir: string;
+	let dbPath: string;
+	const nowMs = Date.parse("2026-07-30T12:00:00Z");
+	const MINE = { emails: ["Me@Example.com"], names: ["Me"] };
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "jolli-author-"));
+		dbPath = join(dir, "dashboard.db");
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	/**
+	 * A shared branch as it actually looks after a fetch: my commit, a teammate's,
+	 * one of mine recorded under a name but no email (an import, or a rewritten
+	 * noreply address), plus a session and a dirty worktree.
+	 */
+	async function seedSharedBranch(): Promise<void> {
+		const commit = (hash: string, message: string, author: { name?: string; email?: string }) => ({
+			producerKind: "cli" as const,
+			event: {
+				type: "commit.created" as const,
+				repoIdentity: "repo-1",
+				hash,
+				committedAtMs: nowMs - 3_600_000,
+				message,
+				...(author.name ? { authorName: author.name } : {}),
+				...(author.email ? { authorEmail: author.email } : {}),
+			},
+		});
+		await applySummaryEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w",
+						enabledAt: "t",
+					},
+				},
+				// Lower-case on the row, mixed-case in the identity: emails are matched
+				// case-folded, so this pair has to match.
+				commit("mine1", "feat: my work", { name: "Me", email: "me@example.com" }),
+				commit("theirs1", "release: intellij 0.99.11", {
+					name: "Teammate",
+					email: "teammate@example.com",
+				}),
+				commit("mine2", "fix: also mine", { name: "Me" }),
+				{
+					producerKind: "cli",
+					event: {
+						type: "session.upserted",
+						repoIdentity: "repo-1",
+						source: "claude",
+						sessionId: "s1",
+						updatedAtMs: nowMs - 3_600_000,
+						inputTokens: 10,
+						outputTokens: 5,
+						cachedTokens: 0,
+					},
+				},
+				{
+					producerKind: "cli",
+					event: {
+						type: "worktree.status",
+						repoIdentity: "repo-1",
+						branch: "main",
+						filesChanged: 1,
+						insertions: 2,
+						deletions: 3,
+						observedAtMs: nowMs,
+					},
+				},
+				// A memory on the teammate's commit only — its todo is what the Risks
+				// column would otherwise ask the reader to answer for.
+				{
+					producerKind: "bootstrap",
+					event: {
+						type: "commit.summary",
+						repoIdentity: "repo-1",
+						hash: "theirs1",
+						committedAtMs: nowMs - 3_600_000,
+						message: "release: intellij 0.99.11",
+						insights: [{ kind: "todo", text: "someone else's TODO" }],
+						references: [],
+						sessionLinks: [],
+					},
+				},
+				{
+					producerKind: "bootstrap",
+					event: {
+						type: "commit.summary",
+						repoIdentity: "repo-1",
+						hash: "mine1",
+						committedAtMs: nowMs - 3_600_000,
+						message: "feat: my work",
+						insights: [{ kind: "todo", text: "my own TODO" }],
+						references: [],
+						sessionLinks: [],
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+	}
+
+	const standupOf = async (authorIdentity?: QueryOptions["authorIdentity"]) =>
+		(
+			await withDashboardDb(
+				(db) =>
+					buildDashboardModel(db, {
+						view: "standup",
+						scope: { kind: "all" },
+						timeZone: "UTC",
+						nowMs,
+						...(authorIdentity ? { authorIdentity } : {}),
+					}),
+				{ dbPath },
+			)
+		).standup;
+
+	it("keeps only the local identity's commits, matching email case-insensitively or name", async () => {
+		await seedSharedBranch();
+		const standup = await standupOf(MINE);
+		expect(standup?.todayCommits.map((c) => c.hash).sort()).toEqual(["mine1", "mine2"]);
+		expect(standup?.authoredBy).toBe("Me@Example.com");
+	});
+
+	it("drops a teammate's TODO out of the Risks column", async () => {
+		await seedSharedBranch();
+		const insights = (await standupOf(MINE))?.insights ?? [];
+		expect(insights.map((i) => i.text)).toEqual(["my own TODO"]);
+	});
+
+	it("leaves sessions and the dirty worktree unfiltered — they are this machine's own state", async () => {
+		await seedSharedBranch();
+		const standup = await standupOf(MINE);
+		expect(standup?.todaySessions.map((s) => s.sessionId)).toEqual(["s1"]);
+		expect(standup?.workspaces).toHaveLength(1);
+	});
+
+	it("fails open on an identity with nothing usable in it, and says so by omitting authoredBy", async () => {
+		await seedSharedBranch();
+		for (const identity of [undefined, { emails: [], names: [] }, { emails: ["  "], names: [" "] }]) {
+			const standup = await standupOf(identity);
+			expect(standup?.todayCommits.map((c) => c.hash).sort()).toEqual(["mine1", "mine2", "theirs1"]);
+			expect(standup).not.toHaveProperty("authoredBy");
+			expect((standup?.insights ?? []).length).toBe(2);
+		}
+	});
+
+	it("labels a name-only identity with the name", async () => {
+		await seedSharedBranch();
+		const standup = await standupOf({ emails: [], names: ["Me"] });
+		expect(standup?.authoredBy).toBe("Me");
+		expect(standup?.todayCommits.map((c) => c.hash).sort()).toEqual(["mine1", "mine2"]);
+	});
+
+	it("never filters the stats page — repo activity is not a first-person question", async () => {
+		await seedSharedBranch();
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					authorIdentity: MINE,
+				}),
+			{ dbPath },
+		);
+		expect(model.stats?.totalCommits).toBe(3);
 	});
 });

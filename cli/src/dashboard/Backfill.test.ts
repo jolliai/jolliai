@@ -300,6 +300,29 @@ describe("backfillRepo — recovery", () => {
 		expect(collectCommitEvents).toHaveBeenCalled();
 	});
 
+	it("does NOT re-sweep when only Jolli's own storage ref moved", async () => {
+		// The orphan branch gains a commit on every memory write — a commit, a
+		// regenerate, a plan edit, a squash consolidation — and it lives under
+		// refs/heads like any other branch. Hashing its tip meant this cursor could
+		// never converge in a repo that is actually being used, so `jolli dashboard`
+		// re-swept git history on essentially every launch. Its commits are not
+		// collected either, so a tip this ignores cannot change a row.
+		const tips = (orphan: string) => async (args: ReadonlyArray<string>) =>
+			args[0] === "rev-parse" && args[1] === "--verify"
+				? { stdout: `${"ab".repeat(20)}\n`, stderr: "", exitCode: 0 }
+				: {
+						stdout: `refs/heads/main aaa\nrefs/heads/jollimemory/summaries/v3 ${orphan}\n`,
+						stderr: "",
+						exitCode: 0,
+					};
+		vi.mocked(execGit).mockImplementation(tips("mem-1"));
+		await backfillRepo({ repo, dbPath });
+		vi.mocked(collectCommitEvents).mockClear();
+		vi.mocked(execGit).mockImplementation(tips("mem-2"));
+		await backfillRepo({ repo, dbPath });
+		expect(collectCommitEvents).not.toHaveBeenCalled();
+	});
+
 	it("projects only the commits a re-sweep actually changed", async () => {
 		// The daily case: a commit lands on the branch being worked on. The sweep has
 		// to LIST every reachable commit (the prune is computed against that set, and
@@ -341,6 +364,27 @@ describe("backfillRepo — recovery", () => {
 			)
 		).map((r) => r.name);
 		expect(names).toEqual(["feature/x", "main"]);
+	});
+
+	it("re-offers a commit whose file rows were never collected", async () => {
+		// `knownHashes` is what the collector skips its `--numstat` for, and it means
+		// "file rows ARE stored", not "the commit row exists". A numstat that failed
+		// once leaves the commit stored with no `commit_files` rows; keying the skip
+		// off the commit row made that gap permanent, because the only pass that
+		// re-scanned everything was a bootstrap and `bootstrap_state` never returns
+		// to that. Here `aaa` collected its files and `bbb` did not.
+		vi.mocked(collectCommitEvents).mockResolvedValue([
+			{ ...commitEvent("aaa"), files: [{ path: "src/a.ts", insertions: 1, deletions: 0 }] },
+			commitEvent("bbb"),
+		]);
+		await backfillRepo({ repo, dbPath });
+		vi.mocked(collectCommitEvents).mockClear();
+
+		vi.mocked(getHeadHash).mockResolvedValue("head-2");
+		await backfillRepo({ repo, dbPath });
+
+		const known = vi.mocked(collectCommitEvents).mock.calls[0]?.[0].knownHashes;
+		expect([...(known ?? [])]).toEqual(["aaa"]);
 	});
 
 	it("prunes commits that a rewrite made unreachable (set reconciliation)", async () => {
@@ -792,9 +836,12 @@ describe("multiple checkouts of one project (§10.2)", () => {
 		}
 	});
 
-	it("merges a commit whose other checkout reported no branches at all", async () => {
-		// `branches` is optional on the event, so the union has to tolerate it being
-		// absent on either side rather than assuming both sweeps attributed the commit.
+	it("emits no branches at all when one checkout reported none", async () => {
+		// `branches` absent means "that checkout's branch scan was incomplete — keep
+		// what is stored", so a union built from one contributor is a PARTIAL claim,
+		// and the projection replaces the set with it. Writing it would drop the
+		// branches only the unreadable checkout knew; the merged event therefore
+		// stays silent and a later complete sweep fills the attribution in.
 		const a2 = mkdtempSync(join(tmpdir(), "jolli-wt-a-"));
 		const b2 = mkdtempSync(join(tmpdir(), "jolli-wt-b-"));
 		try {
@@ -821,10 +868,61 @@ describe("multiple checkouts of one project (§10.2)", () => {
 					).map((r) => r.branch),
 				{ dbPath },
 			);
-			expect(branches).toEqual(["only-a"]);
+			expect(branches).toEqual([]);
 		} finally {
 			rmSync(a2, { recursive: true, force: true });
 			rmSync(b2, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the stored branch set when NEITHER checkout could attribute the commit", async () => {
+		// The regression: the merge wrote `branches` unconditionally, so two omissions
+		// unioned into `[]` — and `[]` is the meaningful claim "no branch reaches this
+		// commit", which deletes every commit_branches row. A repo with two checkouts
+		// and one failed `for-each-ref` (or a MAX_BRANCHES truncation) lost its whole
+		// branch attribution on the next sweep.
+		const a3 = mkdtempSync(join(tmpdir(), "jolli-wt-a-"));
+		const b3 = mkdtempSync(join(tmpdir(), "jolli-wt-b-"));
+		try {
+			// Pass 1: both checkouts attribute the commit, so the set lands.
+			vi.mocked(collectCommitEvents).mockImplementation(async () => [
+				{
+					type: "commit.created" as const,
+					repoIdentity: repo.repoIdentity,
+					hash: "shared",
+					committedAtMs: 1_700_000_000_000,
+					branches: ["main"],
+				},
+			]);
+			await backfillRepo({ repo: { ...repo, worktrees: [a3, b3] }, dbPath });
+
+			// Pass 2: neither checkout's branch scan completed.
+			vi.mocked(collectCommitEvents).mockImplementation(async () => [
+				{
+					type: "commit.created" as const,
+					repoIdentity: repo.repoIdentity,
+					hash: "shared",
+					committedAtMs: 1_700_000_000_000,
+					message: "touched, so the row is re-projected",
+				},
+			]);
+			await backfillRepo({ repo: { ...repo, worktrees: [a3, b3] }, dbPath });
+
+			const branches = await withDashboardDb(
+				(db) =>
+					(
+						db
+							.prepare(
+								"SELECT b.name AS branch FROM commit_branches cb JOIN branches b ON b.id = cb.branch_id",
+							)
+							.all() as Array<{ branch: string }>
+					).map((r) => r.branch),
+				{ dbPath },
+			);
+			expect(branches).toEqual(["main"]);
+		} finally {
+			rmSync(a3, { recursive: true, force: true });
+			rmSync(b3, { recursive: true, force: true });
 		}
 	});
 

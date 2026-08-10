@@ -4,9 +4,9 @@
  * sidecar-clearing, and re-runnable.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { JolliMemoryConfig } from "../Types.js";
 import { formatUtcStamp, maybeSnapshot } from "./Backup.js";
@@ -284,13 +284,51 @@ describe("restoreFromSnapshot", () => {
 		expect((await restoreFromSnapshot(snap, { dbPath, force: true })).status).toBe("restored");
 		// The dead database's sidecars are gone — nothing to replay over the
 		// restored file — and the result opens as a working database.
-		const { existsSync } = await import("node:fs");
 		expect(existsSync(`${dbPath}-wal`)).toBe(false);
 		const repos = await withDashboardDb(
 			(db) => db.prepare("SELECT repo_name FROM repos").all() as { repo_name: string }[],
 			{ dbPath },
 		);
 		expect(repos).toEqual([{ repo_name: "r" }]);
+	});
+
+	it("sweeps a dead run's restore temp but leaves a live one alone", async () => {
+		// The temp name carries a PID + nonce so two overlapping recoveries cannot
+		// rename each other's half-copied file over the live database. The cost of
+		// that uniqueness is that nothing overwrites the previous run's leftover any
+		// more: a restore killed between the copy and the rename (no throw, so no
+		// catch) used to leave a database-sized file behind forever.
+		const snap = await makeRealSnapshot();
+		const folder = dirname(dbPath);
+		const dead = join(folder, `.${basename(dbPath)}.restore-999999999-deadbeef.tmp`);
+		const live = join(folder, `.${basename(dbPath)}.restore-${process.pid}-cafebabe.tmp`);
+		const unrelated = join(folder, "notes.tmp");
+		for (const p of [dead, live, unrelated]) writeFileSync(p, "leftover");
+
+		expect((await restoreFromSnapshot(snap, { dbPath, force: true })).status).toBe("restored");
+
+		expect(existsSync(dead)).toBe(false);
+		// Another restore in flight — the whole reason the PID is in the name.
+		expect(existsSync(live)).toBe(true);
+		expect(existsSync(unrelated)).toBe(true);
+	});
+
+	it("sweeps an ancient temp even when its PID reads as alive (PID reuse)", async () => {
+		// A leftover only exists because its writer DIED, so its PID is free to be
+		// reused — and once it is, the PID gate says "alive" about an unrelated
+		// process and the file would be skipped forever. Age is the second half of
+		// the pair: this one carries THIS process's pid (maximally alive) and an
+		// mtime two hours back.
+		const snap = await makeRealSnapshot();
+		const folder = dirname(dbPath);
+		const ancient = join(folder, `.${basename(dbPath)}.restore-${process.pid}-0ldbeef0.tmp`);
+		writeFileSync(ancient, "leftover");
+		const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		utimesSync(ancient, twoHoursAgo, twoHoursAgo);
+
+		expect((await restoreFromSnapshot(snap, { dbPath, force: true })).status).toBe("restored");
+
+		expect(existsSync(ancient)).toBe(false);
 	});
 
 	it("never restores from a corrupt snapshot and reports missing files", async () => {

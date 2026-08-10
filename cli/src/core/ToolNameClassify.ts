@@ -120,6 +120,38 @@ export function classifyCodexToolName(name: string, namespace?: string): ToolCal
  *     row). Keying on anything coarser than the call id — a message id, the tool
  *     name — collapses distinct calls made in the same response into one.
  */
+/**
+ * The later of two buckets' `lastCallAtMs`, as a spreadable fragment.
+ *
+ * Spread rather than assigned so an ABSENT time stays absent: merging a call
+ * whose parser offered no timestamp into one that did must not overwrite the
+ * known instant with `undefined`, and `exactOptionalPropertyTypes` would not
+ * catch it — the field is optional, so writing `undefined` type-checks and
+ * silently degrades the bucket to "no time" the first time an untimed call
+ * lands in it.
+ */
+function mergeLastCallAt(a: ToolCallCount, b: ToolCallCount): { lastCallAtMs?: number } {
+	const latest = Math.max(a.lastCallAtMs ?? Number.NEGATIVE_INFINITY, b.lastCallAtMs ?? Number.NEGATIVE_INFINITY);
+	return Number.isFinite(latest) ? { lastCallAtMs: latest } : {};
+}
+
+/**
+ * Sources whose parsers stamp {@link ToolCallCount.lastCallAtMs} today, and
+ * therefore the sources whose tool rows the dashboard can window by the CALL's
+ * own time instead of by the session's.
+ *
+ * Evidence-gated like `TOOL_RECORDING_SOURCES`, and for the same reason: a
+ * source is listed only once its parser is actually passing a timestamp
+ * through. Everything else leaves the field absent, and every consumer must
+ * fall back (the dashboard falls back to `sessions.updated_at_ms`) rather than
+ * read absence as "no calls".
+ *
+ * Exported for documentation and tests, not for branching — a consumer that
+ * switches on the source instead of on the field's presence goes stale the
+ * moment a parser is taught to stamp one.
+ */
+export const TOOL_CALL_TIME_SOURCES: ReadonlyArray<string> = ["claude", "codex", "kimi", "cursor-cli", "antigravity"];
+
 export class ToolUseTally {
 	private readonly byKey = new Map<string, ToolCallCount>();
 	private readonly seen = new Set<string>();
@@ -128,7 +160,11 @@ export class ToolUseTally {
 	add(call: ToolCallCount, calls = 1): void {
 		const key = `${call.kind}:${call.name}`;
 		const prev = this.byKey.get(key);
-		this.byKey.set(key, prev ? { ...prev, calls: prev.calls + calls } : { ...call, calls });
+		if (!prev) {
+			this.byKey.set(key, { ...call, calls });
+			return;
+		}
+		this.byKey.set(key, { ...prev, calls: prev.calls + calls, ...mergeLastCallAt(prev, call) });
 	}
 
 	/**

@@ -15,6 +15,7 @@
 
 import { UNTITLED_SESSION } from "../core/FallbackTitle.js";
 import { execGit, getCurrentBranch } from "../core/GitOps.js";
+import { isJolliInternalRef, JOLLI_REFS_EXCLUDE_GLOB } from "../core/JolliRefs.js";
 import { extractRepoName, getRemoteUrl, resolveKBPath } from "../core/KBPathResolver.js";
 import { estimateModelCostUsd, PRICES_AS_OF } from "../core/Pricing.js";
 import { resolveSessionTitle } from "../core/SessionTitleResolver.js";
@@ -294,9 +295,11 @@ export interface CollectCommitsOptions {
 	/** Storage for the summary-index enrichment read. See {@link CollectSummariesOptions.storage}. */
 	readonly storage?: StorageProvider;
 	/**
-	 * Commit hashes whose file rows are already stored — their `--numstat` is
-	 * skipped. See {@link INCREMENTAL_NUMSTAT_LIMIT} for the whole rationale;
-	 * omit it (bootstrap) to scan every commit.
+	 * Commit hashes whose FILE ROWS are already stored — their `--numstat` is
+	 * skipped. Not "hashes already in `commits`": a commit whose numstat failed is
+	 * stored without file rows, and treating it as known made that gap permanent.
+	 * See {@link INCREMENTAL_NUMSTAT_LIMIT} for the whole rationale; omit it
+	 * (bootstrap) to scan every commit.
 	 */
 	readonly knownHashes?: ReadonlySet<string>;
 }
@@ -385,13 +388,26 @@ export function parseNumstatLog(stdout: string): Map<string, CommitFileChange[]>
 const NUMSTAT_ARGS = ["-c", "core.quotePath=false", "log", "--numstat", "--no-renames", `--format=${REC}%H`] as const;
 
 /**
- * The history this machine owns: every local branch, plus HEAD so a detached
- * checkout (mid-rebase, bisect) is not invisible. Deliberately NOT `--all` —
- * see {@link collectCommitEvents} for why remote-tracking refs and tags are out
- * of scope. Shared by the commit pass and the file-stats pass so the two can
- * never disagree about which commits exist.
+ * The history this machine owns: every local branch EXCEPT Jolli's own storage
+ * refs (see {@link isJolliInternalRef}), plus HEAD so a detached checkout
+ * (mid-rebase, bisect) is not invisible. Deliberately NOT `--all` — see
+ * {@link collectCommitEvents} for why remote-tracking refs and tags are out of
+ * scope. Shared by the commit pass and the file-stats pass so the two can never
+ * disagree about which commits exist.
+ *
+ * The orphan branch is an ordinary local branch holding one commit PER MEMORY,
+ * so without the exclusion `--branches` imported all of them as the user's own
+ * work: measured on this repo, 1800 of the 2468 stored commits were `Add
+ * summary for …` about the other 668, and `jollimemory/summaries/v3` outranked
+ * `main` in the branch attribution — every commit-derived number on the
+ * dashboard reading ~73 % noise.
+ *
+ * `--exclude` is positional: it applies to the `--branches` that FOLLOWS it and
+ * is consumed by it, so the order of these three entries is load-bearing. It
+ * deliberately does not touch the explicit `HEAD`, which cannot be an orphan
+ * ref — that branch is written by plumbing and never checked out.
  */
-const LOCAL_HISTORY_ARGS = ["--branches", "HEAD"] as const;
+const LOCAL_HISTORY_ARGS = [JOLLI_REFS_EXCLUDE_GLOB, "--branches", "HEAD"] as const;
 
 /**
  * Per-commit file lists over the same window {@link collectCommitEvents} logs.
@@ -422,26 +438,90 @@ async function collectCommitFiles(
 	return parseNumstatLog(result.stdout);
 }
 
+/** One `--no-walk` numstat call. `ok: false` means the batch produced nothing. */
+async function numstatBatch(
+	hashes: ReadonlyArray<string>,
+	cwd: string,
+): Promise<{ readonly ok: boolean; readonly files: Map<string, CommitFileChange[]> }> {
+	const result = await execGit([...NUMSTAT_ARGS, "--no-walk", ...hashes], cwd);
+	if (result.exitCode !== 0) {
+		log.debug("numstat batch of %d failed for %s: %s", hashes.length, cwd, result.stderr.trim());
+		return { ok: false, files: new Map() };
+	}
+	return { ok: true, files: parseNumstatLog(result.stdout) };
+}
+
+/**
+ * How many extra numstat calls the bisect below may spend isolating a failing
+ * commit. Bounded because the same failure shape covers both "one commit in this
+ * batch is unreadable" and "git is broken in this repo": breadth-first at this
+ * budget still salvages ~15/16 of a full {@link INCREMENTAL_NUMSTAT_LIMIT}
+ * batch, while a repo that fails every call costs a flat 25 subprocesses instead
+ * of the ~800 an unbounded bisect would spend on every sweep, forever.
+ */
+const NUMSTAT_BISECT_CALL_BUDGET = 24;
+
+/** Splits a chunk in half; only ever called with `length > 1`. */
+function halves(hashes: ReadonlyArray<string>): ReadonlyArray<string>[] {
+	const mid = Math.ceil(hashes.length / 2);
+	return [hashes.slice(0, mid), hashes.slice(mid)];
+}
+
 /**
  * File lists for an explicit set of hashes — the live post-commit path.
  *
  * `--no-walk` makes git report exactly the listed commits instead of their
  * ancestry, so this is one subprocess for the whole drained batch rather than
- * one per commit. Failure returns an empty map, and the caller then omits
- * `files` entirely rather than sending an empty array, so a transient git
- * failure cannot delete rows a previous pass collected.
+ * one per commit. A commit with no result gets no `files` key at all from the
+ * caller (rather than an empty array), so a transient git failure cannot delete
+ * rows a previous pass collected.
+ *
+ * **A failed batch is bisected, because the batch is the blast radius.** One
+ * commit can fail the whole call on its own — a diff larger than `execGit`'s
+ * 10 MB `maxBuffer` is the concrete case, and it is a property of that commit,
+ * so it fails identically on every retry. Returning empty for the batch then
+ * denies file rows to every OTHER commit in it, and since the next sweep asks
+ * which commits have file rows, all of them come back — the same doomed batch,
+ * plus whatever new commits joined it, on every sweep for the life of the
+ * repository. Splitting isolates the poison into ever smaller chunks so the rest
+ * of the batch is stored and stops being re-asked; the unresolvable commits
+ * remain permanently retried, which is the honest cost of not being able to read
+ * their diff, and is now a handful of hashes rather than the batch.
+ *
+ * Logged at WARN, not debug: the commits of a failed batch still land, so this
+ * line is the only trace that their file detail did not.
  */
 export async function collectFilesForCommits(
 	hashes: ReadonlyArray<string>,
 	cwd: string,
 ): Promise<Map<string, CommitFileChange[]>> {
 	if (hashes.length === 0) return new Map();
-	const result = await execGit([...NUMSTAT_ARGS, "--no-walk", ...hashes], cwd);
-	if (result.exitCode !== 0) {
-		log.debug("git log --numstat --no-walk failed for %s: %s", cwd, result.stderr.trim());
-		return new Map();
+	const first = await numstatBatch(hashes, cwd);
+	if (first.ok) return first.files;
+	log.warn("git log --numstat --no-walk failed for %s (%d commits) — bisecting", cwd, hashes.length);
+	if (hashes.length === 1) return new Map();
+
+	const files = new Map<string, CommitFileChange[]>();
+	const queue: ReadonlyArray<string>[] = halves(hashes);
+	let budget = NUMSTAT_BISECT_CALL_BUDGET;
+	// Breadth-first: a shallow pass over the whole batch salvages more per call
+	// than following one branch to a single hash, and it keeps the budget from
+	// being spent entirely on the half that happens to be searched first.
+	while (queue.length > 0 && budget > 0) {
+		const chunk = queue.shift() as ReadonlyArray<string>;
+		budget--;
+		const batch = await numstatBatch(chunk, cwd);
+		if (batch.ok) {
+			for (const [hash, changes] of batch.files) files.set(hash, changes);
+		} else if (chunk.length > 1) {
+			queue.push(...halves(chunk));
+		}
 	}
-	return parseNumstatLog(result.stdout);
+	if (queue.length > 0) {
+		const unresolved = queue.reduce((n, chunk) => n + chunk.length, 0);
+		log.warn("numstat bisect budget spent for %s; %d commits keep no file rows this sweep", cwd, unresolved);
+	}
+	return files;
 }
 
 /**
@@ -484,7 +564,11 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 		// already excluded — collected, then invisible in standup, and counted
 		// under whichever day it was originally written rather than the day the
 		// work actually landed here.
-		["log", ...LOCAL_HISTORY_ARGS, `--pretty=format:%H${SEP}%cI${SEP}%an${SEP}%ae${SEP}%s`, ...sinceArgs],
+		// `%P` (parent hashes) rides LAST, after the subject: a subject cannot
+		// contain SEP (it is a control character), so appending a field keeps every
+		// earlier position stable. It exists only to recognise a merge commit — see
+		// the numstat skip below.
+		["log", ...LOCAL_HISTORY_ARGS, `--pretty=format:%H${SEP}%cI${SEP}%an${SEP}%ae${SEP}%s${SEP}%P`, ...sinceArgs],
 		opts.cwd,
 	);
 	if (logResult.exitCode !== 0) {
@@ -499,16 +583,15 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 
 	// Branch reachability: newest-committed branches first, capped.
 	const refsResult = await execGit(
-		// One past the cap, so truncation is DETECTABLE rather than inferred from a
-		// full page: `--count=${MAX_BRANCHES}` returning exactly that many is
-		// indistinguishable from a repo with exactly that many branches.
-		[
-			"for-each-ref",
-			"refs/heads",
-			"--sort=-committerdate",
-			"--format=%(refname:short)",
-			`--count=${MAX_BRANCHES + 1}`,
-		],
+		// Listed in full and capped below in JS, rather than with git's `--count`.
+		// The cap exists to bound the per-branch `rev-list` fan-out, and Jolli's own
+		// refs are dropped from the list before it is applied — asking git for
+		// `MAX_BRANCHES + 1` and filtering afterwards would spend a slot on a branch
+		// that is never scanned, and the orphan branch is written on every memory so
+		// it sorts FIRST by committerdate essentially always. Listing every local
+		// branch name is one cheap ref walk (`Backfill`'s fingerprint already does
+		// exactly that); it is the rev-list per branch that is expensive.
+		["for-each-ref", "refs/heads", "--sort=-committerdate", "--format=%(refname:short)"],
 		opts.cwd,
 	);
 	// Tracked for the same reason `files` is (see below): `branches` is
@@ -520,7 +603,10 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 	// ordinary concurrent rebase) would silently have stripped just that one.
 	// Incomplete means: emit nothing, keep what is stored.
 	let branchScanComplete = refsResult.exitCode === 0;
-	const listed = refsResult.exitCode === 0 ? refsResult.stdout.split("\n").filter(Boolean) : [];
+	const listed =
+		refsResult.exitCode === 0
+			? refsResult.stdout.split("\n").filter((name) => name && !isJolliInternalRef(name))
+			: [];
 	// A repo past {@link MAX_BRANCHES} is the documented reachability gap, but it
 	// must not be expressed as the CLAIM `branches: []`. The union is
 	// replace-when-present, so emitting an empty array for a commit that only the
@@ -574,13 +660,30 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 	// what is stored" in the projection (the same contract a failed numstat pass
 	// relies on), while an empty array would mean "this commit touches nothing".
 	//
-	// The one thing it gives up: a commit whose file rows were never stored (its
-	// numstat failed once) is never revisited while it stays known. That is a
-	// bounded, self-correcting gap — a bootstrap re-scan restores it — and paying
-	// a full-history numstat on every launch to close it is the cost this exists
-	// to remove.
+	// `knownHashes` is the set of commits whose file rows ARE STORED, not the set
+	// of stored commits (see `commitsWithStoredFiles` in Backfill). A commit whose
+	// numstat failed once therefore comes back on the NEXT sweep instead of never:
+	// keying the skip off row existence made a single transient git failure a
+	// permanent blank, since the only path that re-scanned everything was a
+	// bootstrap and `bootstrap_state` never returns to that.
+	//
+	// Merge commits are excluded from the retry for the same reason they are not
+	// evidence of a failure: `git log --numstat` shows no diff for a merge, so it
+	// has no file rows to find and would otherwise be re-asked on every sweep
+	// forever — and in a merge-heavy history enough of them to push past
+	// INCREMENTAL_NUMSTAT_LIMIT and drag the whole-history scan back in. A
+	// non-merge commit with genuinely zero files (`--allow-empty`) does get
+	// re-asked, which is one hash in an argv list nobody notices.
 	const newHashes = opts.knownHashes
-		? logLines.map((line) => line.split(SEP)[0] ?? "").filter((hash) => hash && !opts.knownHashes?.has(hash))
+		? logLines
+				.map((line) => line.split(SEP))
+				.filter((parts) => {
+					const hash = parts[0];
+					if (!hash || opts.knownHashes?.has(hash)) return false;
+					// `%P` is the last field; more than one parent means a merge.
+					return (parts[5] ?? "").trim().split(" ").filter(Boolean).length <= 1;
+				})
+				.map((parts) => parts[0] ?? "")
 		: null;
 	const filesByHash =
 		newHashes !== null && newHashes.length <= INCREMENTAL_NUMSTAT_LIMIT

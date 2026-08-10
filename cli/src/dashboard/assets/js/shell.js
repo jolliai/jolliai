@@ -74,6 +74,17 @@ window.JD = window.JD || {};
 		return sameName.length === 1 ? mine.repoName : identity;
 	};
 
+	/* Append page-specific params to a `JD.query` result, picking `?` or `&` by
+	   whether that result is already non-empty. One helper because getting the
+	   separator wrong produces a URL that silently loses the page scope. */
+	JD.withParams = (query, params) => {
+		var parts = Object.keys(params)
+			.filter((key) => params[key] !== undefined && params[key] !== null && params[key] !== "")
+			.map((key) => key + "=" + encodeURIComponent(params[key]));
+		if (parts.length === 0) return query;
+		return (query ? query + "&" : "?") + parts.join("&");
+	};
+
 	/* Back-compat alias — some callers only care about the repo scope. */
 	JD.scopeQuery = (scope) =>
 		scope && scope.kind === "repo" && scope.repoIdentity ? "?repo=" + encodeURIComponent(scope.repoIdentity) : "";

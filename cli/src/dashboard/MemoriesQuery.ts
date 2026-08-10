@@ -27,14 +27,22 @@
 import { inflateSync } from "node:zlib";
 
 import { groupArchivedSessions } from "../core/ArchivedConversations.js";
-import { formatMemoryRefId } from "../core/MemoryRefId.js";
+import { formatMemoryRefId, formatMemoryRefIdWithHashFallback } from "../core/MemoryRefId.js";
+import {
+	labelLeadsWithNativeId,
+	referenceDisplayTitle,
+	referenceSourceLabel,
+} from "../core/references/ReferenceDisplay.js";
+import { sanitizeNativeIdForPath } from "../core/references/ReferenceStore.js";
 import { firstUserMessageTitleFromEntries } from "../core/SessionTitleResolver.js";
+import { buildSkillsAggregateMarkdown, buildSkillsSummaryLabel } from "../core/SkillsAggregateMarkdown.js";
 import { assembleMemoryTree } from "../core/SqliteStorage.js";
 import {
 	aggregateConversationTokenBreakdown,
 	aggregateConversationTokens,
 	collectDisplayTopics,
 } from "../core/SummaryTree.js";
+import { estimateSummaryCostUsd } from "../core/TokenCost.js";
 import { TOOL_RECORDING_SOURCES } from "../core/TranscriptParser.js";
 import { createLogger, errMsg } from "../Logger.js";
 import type { CommitSummary, StoredTranscript } from "../Types.js";
@@ -45,13 +53,13 @@ import {
 	MEMORIES_PAGE_SIZE,
 	type MemoriesModel,
 	type MemoryActivityRow,
+	type MemoryContextKind,
 	type MemoryContextRow,
 	type MemoryConversationRow,
 	type MemoryDetail,
 	type MemoryExcludedRow,
 	type MemoryFileRow,
 	type MemoryListItem,
-	type MemoryReferenceRow,
 	type MemoryTopic,
 } from "./DashboardModel.js";
 import {
@@ -68,7 +76,8 @@ interface MemoryListRow {
 	readonly commit_hash: string;
 	readonly branch: string | null;
 	readonly commit_message: string | null;
-	readonly commit_date_ms: number;
+	/** The COALESCEd committer date — see {@link reachableMemoryRows}, not `memories.commit_date_ms`. */
+	readonly committed_at_ms: number;
 	readonly ticket_id: string | null;
 	readonly jolli_doc_id: number | null;
 	readonly repo_identity: string;
@@ -108,11 +117,20 @@ export function isReachable(reachable: ReachableCommits | undefined, repoIdentit
  * on the wire, not rows read.
  *
  * `commit_hash` is the second sort key, and it is load-bearing rather than
- * cosmetic: two memories can share a `commit_date_ms` to the millisecond (a
- * squash, a scripted series of commits), and the page cursor is a position in
- * THIS order. Ordering by the date alone leaves those rows in whatever order
- * SQLite happens to produce, so the same cursor could land on either side of the
- * pair between two requests — dropping one memory or repeating it.
+ * cosmetic: two memories can share a timestamp to the millisecond (a squash, a
+ * scripted series of commits), and the page cursor is a position in THIS order.
+ * Ordering by the date alone leaves those rows in whatever order SQLite happens
+ * to produce, so the same cursor could land on either side of the pair between
+ * two requests — dropping one memory or repeating it.
+ *
+ * The date is the COMMITTER date, falling back to the memory's own
+ * `commit_date_ms` only when no `commits` row exists yet — the same COALESCE
+ * `buildMemoryCards` uses, and for the same reason: `commit_date_ms` comes from
+ * `CommitSummary.commitDate`, which `GitOps.getHeadCommitInfo` reads with `%aI`
+ * (AUTHOR date), while `commits.committed_at_ms` is collected with `%cI`. Two
+ * clocks means a rebased or cherry-picked memory sorts — and renders its
+ * timestamp — differently in the tree than in the Stats feed listing the very
+ * same memory.
  */
 function reachableMemoryRows(
 	db: DashboardDbHandle,
@@ -122,13 +140,15 @@ function reachableMemoryRows(
 	const listFilter = scopeFilter(resolved, "m.repo_id");
 	const allRows = db
 		.prepare(
-			`SELECT m.commit_hash, m.branch, m.commit_message, m.commit_date_ms, m.ticket_id, m.jolli_doc_id,
+			`SELECT m.commit_hash, m.branch, m.commit_message, m.ticket_id, m.jolli_doc_id,
+			        COALESCE(cm.committed_at_ms, m.commit_date_ms) AS committed_at_ms,
 			        r.repo_identity, r.repo_name
 			   FROM memories m
 			   JOIN repos r ON r.id = m.repo_id
+			   LEFT JOIN commits cm ON cm.repo_id = m.repo_id AND cm.hash = m.commit_hash
 			  WHERE m.parent_hash IS NULL
 				${listFilter.sql}
-			  ORDER BY m.commit_date_ms DESC, m.commit_hash DESC`,
+			  ORDER BY COALESCE(cm.committed_at_ms, m.commit_date_ms) DESC, m.commit_hash DESC`,
 		)
 		.all(...listFilter.params) as ReadonlyArray<MemoryListRow>;
 	return allRows.filter((row) => isReachable(reachable, row.repo_identity, row.commit_hash));
@@ -245,7 +265,7 @@ function toListItems(
 			...(memoryRefId ? { memoryRefId } : {}),
 			title: row.commit_message ?? "",
 			...(row.branch ? { branch: row.branch } : {}),
-			committedAtMs: row.commit_date_ms,
+			committedAtMs: row.committed_at_ms,
 			...(row.ticket_id ? { ticketId: row.ticket_id } : {}),
 			...(category ? { category } : {}),
 			synced: row.jolli_doc_id != null,
@@ -428,6 +448,95 @@ function buildActivity(
 	return { activity, uncoveredSources };
 }
 
+/**
+ * `context.context_key` for an archived reference, or undefined when it cannot
+ * be derived.
+ *
+ * Must reproduce `SummaryStore.orphanPathFor` minus the `references/` prefix and
+ * the `.md` suffix, because that path is exactly what `SotImport` files the
+ * document under. Re-derived here rather than exported from there because the
+ * only thing this page needs is the key, and the writer's copy carries a
+ * throw-on-unknown-source guard that is correct for a WRITE and wrong for a read
+ * path: a reference whose source has since left the registry must render as a
+ * plain row, not blow up the whole memory detail. Hence the catch — both
+ * `sanitizeNativeIdForPath`'s traversal guard and an unregistered source land
+ * there and mean the same thing: no document to open.
+ */
+function referenceDocKey(source: string, archivedKey: string | undefined): string | undefined {
+	// An archived reference always carries the key; a hand-written or pre-archive
+	// row may not, and there is no document to open without one.
+	if (!archivedKey) return undefined;
+	const prefix = `${source}:`;
+	const bareKey = archivedKey.startsWith(prefix) ? archivedKey.slice(prefix.length) : archivedKey;
+	try {
+		return `${source}/${sanitizeNativeIdForPath(source, bareKey)}`;
+	} catch (err) {
+		log.debug("no reference doc key for %s: %s", archivedKey, errMsg(err));
+		return undefined;
+	}
+}
+
+/**
+ * The memory's Context list, in the editor's order: plans, notes, references,
+ * then the single skills row.
+ *
+ * The order and the per-kind display rules are the editor's, not this page's —
+ * `referenceDisplayTitle` decides whether a reference leads with its issue key,
+ * and `buildSkillsSummaryLabel` writes the aggregate line. Both are the same CLI
+ * helpers `SummaryHtmlBuilder` calls, so the two surfaces cannot drift into
+ * describing the same memory differently.
+ *
+ * The skills row is ONE row keyed by the commit hash, not one row per skill:
+ * its document is the whole `skills--<hash8>` table, rendered from the summary
+ * on demand (see {@link readContextDoc}).
+ */
+function buildContextRows(summary: CommitSummary): ReadonlyArray<MemoryContextRow> {
+	const skills = summary.skills ?? [];
+	const inferred = skills.some((s) => s.detection === "heuristic") ? " · some inferred" : "";
+	return [
+		// The plan slug is already the archived `slug-hash8` form here, and the
+		// note id already carries its archive suffix — both are the filed key.
+		...(summary.plans ?? []).map((p) => ({
+			kind: "plan" as const,
+			title: p.title,
+			contextKey: p.slug,
+			meta: `${p.slug}.md`,
+		})),
+		...(summary.notes ?? []).map((n) => ({
+			kind: "note" as const,
+			title: n.title,
+			contextKey: n.id,
+			meta: `${n.id}.md`,
+		})),
+		...(summary.references ?? []).map((r) => {
+			const key = referenceDocKey(r.source, r.archivedKey);
+			// Same slot rule as the editor's reference row: the `<nativeId> (Source)`
+			// line is meaningful only for the trackers whose key a reader recognizes;
+			// an accumulating source claims the slot for its newest query instead.
+			const meta = labelLeadsWithNativeId(r.source)
+				? `${r.nativeId} (${referenceSourceLabel(r.source)})`
+				: (r.latestQuery ?? "");
+			return {
+				kind: "reference" as const,
+				title: referenceDisplayTitle(r),
+				...(key ? { contextKey: key } : {}),
+				...(meta ? { meta } : {}),
+				...(r.url ? { url: r.url } : {}),
+			};
+		}),
+		...(skills.length > 0
+			? [
+					{
+						kind: "skills" as const,
+						title: "Skills used",
+						contextKey: summary.commitHash,
+						meta: `${buildSkillsSummaryLabel(skills)}${inferred}`,
+					},
+				]
+			: []),
+	];
+}
+
 /** One memory's full detail, or undefined when `hash` does not resolve within `scope`. */
 export function buildMemoryDetail(
 	db: DashboardDbHandle,
@@ -506,19 +615,7 @@ export function buildMemoryDetail(
 		files: t.filesAffected ?? [],
 	}));
 
-	const references: MemoryReferenceRow[] = (summary.references ?? []).map((r) => ({
-		source: r.source,
-		nativeId: r.nativeId,
-		title: r.title,
-		...(r.url ? { url: r.url } : {}),
-	}));
-	// `contextKey` is what `readContextDoc` looks the body up by, and it must be
-	// the key `SotImport` filed the document under: the plan's slug (already the
-	// archived `slug-hash` form here) and the note's id.
-	const context: MemoryContextRow[] = [
-		...(summary.plans ?? []).map((p) => ({ kind: "plan" as const, title: p.title, contextKey: p.slug })),
-		...(summary.notes ?? []).map((n) => ({ kind: "note" as const, title: n.title, contextKey: n.id })),
-	];
+	const context = buildContextRows(summary);
 	const excluded: MemoryExcludedRow[] = (summary.excludedContext ?? []).map((e) => ({
 		title: e.title,
 		reason: e.reason,
@@ -531,19 +628,35 @@ export function buildMemoryDetail(
 	// conversation tokens on the folded children, so the root's own breakdown
 	// understates the total — here by 5x on a three-commit chain.
 	//
-	// `costUsd` stays the root's own `estimatedCostUsd` rather than a sum: the
-	// field is a per-node estimate at that node's `pricesAsOf`, and adding
-	// figures stamped at different price tables would invent a number no node
-	// agrees with. The editor prices the aggregate from `conversationModels`
-	// instead, which needs the price table this query has no business loading.
+	// `costUsd` is the SAME tree walk the editor's meter runs
+	// (`estimateSummaryCostUsd`), not the root's own `estimatedCostUsd`. Reading
+	// the root alone priced only the tip of a consolidation while the headline
+	// beside it counted every folded node's tokens: measured ≈$2.59 here against
+	// ≈$27.61 in the editor for one commit, with identical 3.1M token figures on
+	// both. The objection that stored per-node costs carry different `pricesAsOf`
+	// stamps is real but does not justify a number nothing agrees with — the
+	// shared helper sums them the same way on every surface, and `pricesAsOf`
+	// stays the root's stamp, which is what the "est. at <date> prices" note has
+	// always meant.
 	const breakdown = aggregateConversationTokenBreakdown(summary);
+	const cost = estimateSummaryCostUsd(summary);
+	// The headline is the editor's `aggregateConversationTokens`, which is NOT
+	// the segment sum: a folded session reporting a scalar count with no
+	// breakdown lands in it and in no segment. The segment-sum fallback covers
+	// the one shape that aggregate cannot describe — a memory carrying a
+	// breakdown but no scalar count, which this page has always rendered
+	// (the editor's meter shows its "not reported" state there instead) and
+	// which would otherwise print a 0 headline above a populated bar.
+	const segmentSum = breakdown.input + breakdown.output + breakdown.cached;
+	const totalTokens = aggregateConversationTokens(summary) || segmentSum;
 	const tokens =
-		aggregateConversationTokens(summary) > 0 || summary.conversationTokenBreakdown
+		totalTokens > 0 || summary.conversationTokenBreakdown
 			? {
+					total: totalTokens,
 					input: breakdown.input,
 					output: breakdown.output,
 					cached: breakdown.cached,
-					...(summary.estimatedCostUsd != null ? { costUsd: summary.estimatedCostUsd } : {}),
+					...(cost.usd > 0 ? { costUsd: cost.usd } : {}),
 					...(summary.pricesAsOf ? { pricesAsOf: summary.pricesAsOf } : {}),
 				}
 			: undefined;
@@ -559,6 +672,14 @@ export function buildMemoryDetail(
 		repoName: row.repo_name,
 		commitHash: row.commit_hash,
 		shortHash: row.commit_hash.slice(0, 7),
+		// Always present, hash-derived until the memory syncs — the editor's page
+		// title carries the same `JM-…` handle on every memory
+		// (`buildPageTitleAndMetaStrip`), so the two surfaces name the same memory
+		// the same way instead of one showing a bare commit message.
+		memoryRefId: formatMemoryRefIdWithHashFallback(
+			row.jolli_doc_id == null ? undefined : Number(row.jolli_doc_id),
+			row.commit_hash,
+		),
 		title: row.commit_message ?? "",
 		...(row.branch ? { branch: row.branch } : {}),
 		...(row.commit_author ? { author: row.commit_author } : {}),
@@ -573,7 +694,6 @@ export function buildMemoryDetail(
 		...(summarizedBy ? { summarizedBy } : {}),
 		...(summary.recap ? { recap: summary.recap } : {}),
 		conversations: buildConversations(db, row.repo_id, hash),
-		references,
 		context,
 		excluded,
 		activity,
@@ -589,21 +709,45 @@ export function buildMemoryDetail(
 	};
 }
 
-/** The full Memories page payload: the list, plus the selected memory's detail when `hash` resolves. */
+/**
+ * The full Memories page payload: the list, plus the selected memory's detail
+ * when `hash` resolves.
+ *
+ * `detailRepoIdentity` disambiguates the DETAIL only and deliberately does not
+ * touch `scope`. Opening a memory used to carry the owning repo in `?repo=`,
+ * which is the page-wide scope param — so clicking any row collapsed the tree to
+ * that one repository, and the reader lost every other repo's memories as the
+ * price of opening one. The two questions are separate: which repo owns the hash
+ * (needed only when two clones share it) and which repos the tree lists.
+ */
 export function buildMemories(
 	db: DashboardDbHandle,
 	scope: DashboardScope,
 	hash: string | undefined,
 	reachable?: ReachableCommits,
+	detailRepoIdentity?: string,
 ): MemoriesModel {
 	const list = buildMemoriesList(db, scope, reachable);
 	if (!hash) return list;
-	const selected = buildMemoryDetail(db, scope, hash);
+	// Through `resolveScope`, because the link carries whatever `JD.repoToken`
+	// picked — usually the repo NAME, since that is the readable token. Handing a
+	// name straight to `buildMemoryDetail` resolves to repo id -1 (matches
+	// nothing), so the tree row navigated to a page whose detail pane stayed
+	// empty: the click looked like it did nothing at all.
+	const detailScope: DashboardScope = detailRepoIdentity
+		? resolveScope(db, { kind: "repo", repoIdentity: detailRepoIdentity })
+		: scope;
+	// A token that resolves to no repo means the link is stale (repo removed, or
+	// renamed since the page was rendered). Fall back to the page scope rather
+	// than to a filter that matches nothing — the hash still identifies the
+	// memory, and showing it is strictly better than showing an empty pane.
+	const detail = scopeToRepoId(db, detailScope).repoId === -1 ? scope : detailScope;
+	const selected = buildMemoryDetail(db, detail, hash);
 	return selected ? { ...list, selected } : list;
 }
 
 /**
- * One plan/note body, for the Context viewer dialog.
+ * One context body, for the Context viewer dialog.
  *
  * Scoped to a repo but NOT to a commit: the same plan backs several memories,
  * and the caller already knows which row was clicked. `repoToken` goes through
@@ -611,17 +755,26 @@ export function buildMemories(
  * does — a full identity or a unique repo name — instead of being the one
  * endpoint that silently 404s on a name.
  *
+ * `skills` is the one kind that is RENDERED rather than read: its per-commit
+ * table is not a stored document at all (the `skills--<hash8>.md` file exists
+ * only in the Memory Bank's visible layer, which orphan-branch-only installs
+ * never write), so it is built from the summary with the same renderer that
+ * wrote that file — exactly what `jollimemory.previewCommittedSkills` does in
+ * the editor. Its `contextKey` is therefore the commit hash, not a `context`
+ * row key.
+ *
  * Returns undefined for an unknown repo/kind/key rather than throwing, so the
  * route can answer 404 without special-casing.
  */
 export function readContextDoc(
 	db: DashboardDbHandle,
 	repoToken: string,
-	kind: "plan" | "note",
+	kind: MemoryContextKind,
 	contextKey: string,
 ): ContextDoc | undefined {
 	const { repoId } = scopeToRepoId(db, resolveScope(db, { kind: "repo", repoIdentity: repoToken }));
 	if (repoId == null) return undefined;
+	if (kind === "skills") return readSkillsDoc(db, repoId, contextKey);
 	const row = db
 		.prepare(
 			`SELECT c.title, c.body_md
@@ -632,4 +785,26 @@ export function readContextDoc(
 		.get(repoId, kind, contextKey) as { title: string | null; body_md: string } | undefined;
 	if (!row) return undefined;
 	return { kind, title: row.title ?? contextKey, bodyMd: row.body_md };
+}
+
+/**
+ * The skills table for one commit, rendered from its summary.
+ *
+ * Reads the TREE, matching {@link buildMemoryDetail}: the row that opened this
+ * dialog was built from the assembled tree, so reading the bare row here could
+ * answer with a different skill set than the row's own count line claims.
+ */
+function readSkillsDoc(db: DashboardDbHandle, repoId: number, commitHash: string): ContextDoc | undefined {
+	const row = db
+		.prepare("SELECT summary_json FROM memories WHERE repo_id = ? AND commit_hash = ? LIMIT 1")
+		.get(repoId, commitHash) as { summary_json: string } | undefined;
+	if (!row) return undefined;
+	const summary = (assembleMemoryTree(db, repoId, commitHash) ?? JSON.parse(row.summary_json)) as CommitSummary;
+	const skills = summary.skills ?? [];
+	if (skills.length === 0) return undefined;
+	return {
+		kind: "skills",
+		title: `Skills used — ${commitHash.substring(0, 8)}`,
+		bodyMd: buildSkillsAggregateMarkdown(summary, skills),
+	};
 }

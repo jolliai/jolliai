@@ -491,6 +491,7 @@ describe("MemoriesQuery", () => {
 			});
 			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
 			expect(detail?.tokens).toEqual({
+				total: 1700,
 				input: 1000,
 				output: 500,
 				cached: 200,
@@ -500,7 +501,7 @@ describe("MemoriesQuery", () => {
 			expect(detail?.summarizedBy).toEqual({ model: "claude-haiku-4-5", tokens: 450 });
 		});
 
-		it("carries references, plans/notes as context, and excludedContext with its reason — and treats absent as empty, not missing", async () => {
+		it("carries plans, notes and references as one ordered context list, and excludedContext with its reason — and treats absent as empty, not missing", async () => {
 			await seedRepo(dbPath, "repo-1", "acme-api");
 			const hash = "a".repeat(40);
 			await seedMemory(dbPath, "repo-1", hash, "feat: x", {
@@ -524,22 +525,33 @@ describe("MemoriesQuery", () => {
 			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
 			expect(detail?.ticketId).toBe("ACME-1");
 			expect(detail?.recap).toBe("Added a token-bucket rate limiter with per-tenant overrides.");
-			expect(detail?.references).toEqual([
-				{ source: "linear", nativeId: "ACME-1", title: "Add rate limiting", url: "https://linear.app/x" },
-				{ source: "github", nativeId: "42", title: "PR #42" },
-			]);
-			// `contextKey` is the plan slug / note id — what the Context dialog
-			// fetches the body by.
+			// ONE ordered list, in the editor's Context-panel order: plans, notes,
+			// references, skills. `contextKey` is what the Context dialog fetches the
+			// body by — the plan slug, the note id, `<source>/<sanitized-key>` for a
+			// reference. A reference with no archivedKey has no document, so it
+			// carries no key and renders inert rather than as a button that 404s.
 			expect(detail?.context).toEqual([
-				{ kind: "plan", title: "Rate limiting plan", contextKey: "rate-limit-plan" },
-				{ kind: "note", title: "A note", contextKey: "n1" },
+				{
+					kind: "plan",
+					title: "Rate limiting plan",
+					contextKey: "rate-limit-plan",
+					meta: "rate-limit-plan.md",
+				},
+				{ kind: "note", title: "A note", contextKey: "n1", meta: "n1.md" },
+				{
+					kind: "reference",
+					// Leads with the nativeId: linear is a tracker whose key a reader recognizes.
+					title: "ACME-1 — Add rate limiting",
+					meta: "ACME-1 (Linear)",
+					url: "https://linear.app/x",
+				},
+				{ kind: "reference", title: "42 — PR #42", meta: "42 (GitHub)" },
 			]);
 			expect(detail?.excluded).toEqual([{ title: "Unrelated ticket", reason: "different feature area" }]);
 
 			const hash2 = "b".repeat(40);
 			await seedMemory(dbPath, "repo-1", hash2, "chore: y");
 			const bare = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash2), { dbPath });
-			expect(bare?.references).toEqual([]);
 			expect(bare?.context).toEqual([]);
 			expect(bare?.excluded).toEqual([]);
 		});
@@ -644,7 +656,7 @@ describe("MemoriesQuery", () => {
 				llm: { model: "claude-haiku-4-5", inputTokens: 300, outputTokens: 100 },
 			});
 			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
-			expect(detail?.tokens).toEqual({ input: 800, output: 400, cached: 0 });
+			expect(detail?.tokens).toEqual({ total: 1200, input: 800, output: 400, cached: 0 });
 			expect(detail?.summarizedBy).toEqual({ model: "claude-haiku-4-5", tokens: 400 });
 		});
 

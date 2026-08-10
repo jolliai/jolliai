@@ -713,6 +713,8 @@ body {
   .mem-title-mark .mem-icon { width: 25px; height: 25px; stroke-width: 2; }
   .mem-short-hash { display: block; margin-bottom: 2px; font-size: 11px; color: var(--muted); }
   .mem-detail .gd-title { font-size: 26px; line-height: 1.2; letter-spacing: -.02em; }
+  /* The `JM-…:` handle reads as a label on the title, not as part of it. */
+  .mem-title-ref { color: var(--muted); font-weight: 500; }
   .mem-meta { padding-bottom: 8px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
   .mem-meta > span { display: inline-flex; align-items: center; gap: 4px; }
   .mem-meta .mem-icon { width: 14px; height: 14px; }
@@ -742,8 +744,26 @@ body {
     width: 100%; align-items: center; min-height: 46px; padding: 9px 12px; border: 1px solid var(--border);
     border-radius: 9px; background: var(--surface); box-shadow: 0 1px 2px rgba(20, 30, 50, .04);
   }
-  /* An openable Context row (plan/note). Reference rows stay inert, so the
-     affordance is on the class, not on `.mem-context .gd-row`. */
+  /* Context row badge — the editor's `kb-tag` letter (P/N/R/S), one hue per
+     kind so the four kinds are separable at a glance in a mixed list. */
+  .mem-ctx-badge {
+    display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; flex: none;
+    border-radius: 5px; font-size: 11px; font-weight: 650; background: var(--lock-bg); color: var(--muted);
+  }
+  .mem-ctx-badge--plan { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
+  .mem-ctx-badge--note { background: color-mix(in srgb, #16a34a 14%, transparent); color: #16a34a; }
+  .mem-ctx-badge--reference { background: color-mix(in srgb, #d97706 16%, transparent); color: #b45309; }
+  .mem-ctx-badge--skills { background: color-mix(in srgb, #7c3aed 14%, transparent); color: #7c3aed; }
+  /* The sub-line shares the row rather than wrapping under the title: these rows
+     are single-height, and the meta is a qualifier (`JOLLI-1901 (Linear)`), not a
+     second title. `min-width: 0` lets it shrink before the title does. */
+  .mem-ctx-sub { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .mem-ctx-link { display: inline-flex; align-items: center; color: var(--muted); }
+  .mem-ctx-link:hover { color: var(--accent); }
+  .mem-ctx-link .mem-icon { width: 14px; height: 14px; }
+  /* An openable Context row (any kind with a resolvable document key). A row
+     without one stays inert, so the affordance is on the class, not on
+     `.mem-context .gd-row`. */
   .gd-row-open { cursor: pointer; }
   .gd-row-open:hover { border-color: var(--accent); }
   .gd-row-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

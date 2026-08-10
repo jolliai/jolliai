@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import type { CommitSummary } from "../Types.js";
 import {
 	estimateConversationCostUsd,
+	estimateSummaryCostUsd,
 	formatExactCostUsd,
 	formatSonnetCostEstimate,
 	formatTokensCompact,
@@ -85,5 +87,65 @@ describe("estimateConversationCostUsd", () => {
 	});
 	it("falls back to the input rate on the total when no breakdown", () => {
 		expect(estimateConversationCostUsd(undefined, 1_000_000)).toBeCloseTo(3, 6);
+	});
+});
+
+describe("estimateSummaryCostUsd", () => {
+	/** Minimal node — the walk reads only the five cost-bearing fields. */
+	const node = (fields: Partial<CommitSummary>): CommitSummary => fields as CommitSummary;
+
+	it("sums stored per-node costs across the whole consolidation tree", () => {
+		// The bug this guards: reading the ROOT's own `estimatedCostUsd` priced only
+		// the tip of a squash while the token headline beside it counted every
+		// folded node — the local web dashboard showed ≈$2.59 against the editor's
+		// ≈$27.61 for one commit.
+		const summary = node({
+			estimatedCostUsd: 1,
+			children: [
+				node({ estimatedCostUsd: 2 }),
+				node({ estimatedCostUsd: 4, children: [node({ estimatedCostUsd: 8 })] }),
+			],
+		});
+		expect(estimateSummaryCostUsd(summary)).toEqual({ usd: 15, mode: "stored" });
+	});
+
+	it("falls back to the flat Sonnet estimate for a node with tokens but no stored cost", () => {
+		const summary = node({
+			conversationTokens: 3_000_000,
+			conversationTokenBreakdown: { input: 1_000_000, output: 1_000_000, cached: 1_000_000 },
+		});
+		const { usd, mode } = estimateSummaryCostUsd(summary);
+		expect(usd).toBeCloseTo(3 + 15 + 3.75, 6);
+		expect(mode).toBe("sonnet");
+	});
+
+	it("reports mixed when a stored node sits beside a fallback node", () => {
+		const summary = node({
+			estimatedCostUsd: 1,
+			children: [node({ conversationTokens: 1_000_000 })],
+		});
+		const { usd, mode } = estimateSummaryCostUsd(summary);
+		expect(usd).toBeCloseTo(1 + 3, 6);
+		expect(mode).toBe("mixed");
+	});
+
+	it("tops up a stored cost with the segments of its UNPRICED model buckets", () => {
+		// A stored cost is a lower bound: write time skips buckets whose model has no
+		// price rather than guessing, so those tokens sit in the headline while
+		// contributing $0. They get the flat rate here, and tip the mode to mixed.
+		const summary = node({
+			estimatedCostUsd: 1,
+			conversationModels: [
+				{ provider: "anthropic", model: "claude-sonnet-5", input: 1000, output: 1000, cached: 1000 },
+				{ provider: "anthropic", model: "some-unlisted-model", input: 1_000_000, output: 0, cached: 0 },
+			],
+		});
+		const { usd, mode } = estimateSummaryCostUsd(summary);
+		expect(usd).toBeCloseTo(1 + 3, 6);
+		expect(mode).toBe("mixed");
+	});
+
+	it("counts a node with neither a cost nor tokens as neither stored nor fallback", () => {
+		expect(estimateSummaryCostUsd(node({ children: [node({})] }))).toEqual({ usd: 0, mode: "sonnet" });
 	});
 });

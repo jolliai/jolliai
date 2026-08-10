@@ -159,12 +159,13 @@ export async function readCursorCliTranscript(
 			// cursor behind so the completed line is re-read next pass (no silent drop).
 			continue;
 		}
-		if (hasCutoff) {
-			const ts = lineTimestampMs(parsed);
-			// This turn (and everything after it) was written after the commit's cutoff:
-			// stop here and leave the cursor before it so the next commit picks it up.
-			if (ts !== undefined && ts > cutoffMs) break;
-		}
+		// Read unconditionally, not just under `hasCutoff`: it is also the instant
+		// stamped on each tool bucket below, and a cutoff-less read (the common
+		// one) would otherwise leave every bucket timeless.
+		const ts = lineTimestampMs(parsed);
+		// This turn (and everything after it) was written after the commit's cutoff:
+		// stop here and leave the cursor before it so the next commit picks it up.
+		if (hasCutoff && ts !== undefined && ts > cutoffMs) break;
 		const role = mapRole(parsed.role);
 		if (role !== undefined) {
 			const text = extractText(parsed);
@@ -177,7 +178,10 @@ export async function readCursorCliTranscript(
 		// `toolu_…` id (dedupe key) and MCP tools are named `mcp__<server>__<tool>`.
 		for (const p of parsed.message?.content ?? []) {
 			if (p.type !== "tool_use" || typeof p.name !== "string" || p.name.length === 0) continue;
-			tally.addOnce(typeof p.id === "string" ? p.id : undefined, classifyToolName(p.name));
+			tally.addOnce(typeof p.id === "string" ? p.id : undefined, {
+				...classifyToolName(p.name),
+				...(ts !== undefined && { lastCallAtMs: ts }),
+			});
 		}
 		lastConsumed = i + 1;
 	}

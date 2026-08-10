@@ -2,6 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import type { ToolCallCount } from "../Types.js";
 import { REAL_TRANSCRIPT_FULL } from "../testUtils/antigravityFixture.js";
 import { readAntigravityTranscript, unwrapUserRequest } from "./AntigravityTranscriptReader.js";
 
@@ -136,10 +137,40 @@ describe("unwrapUserRequest", () => {
 });
 
 describe("readAntigravityTranscript toolUse", () => {
+	/**
+	 * Tool rows with the per-call timestamp dropped. These cases are about WHICH
+	 * bucket a call lands in and how many it counts; the stamping has its own
+	 * case below, and leaving the field in would make every fixture's
+	 * `created_at` an input to assertions that never mention time.
+	 */
+	const untimed = (rows: ReadonlyArray<ToolCallCount> | undefined) =>
+		(rows ?? []).map(({ lastCallAtMs: _dropped, ...rest }) => rest);
+
+	it("stamps each bucket with its last call's own time", async () => {
+		const path = writeTranscript([
+			{
+				step_index: 0,
+				type: "PLANNER_RESPONSE",
+				created_at: "2026-07-19T09:46:50Z",
+				tool_calls: [{ name: "run_command", args: {} }],
+			},
+			{
+				step_index: 1,
+				type: "PLANNER_RESPONSE",
+				created_at: "2026-07-19T09:46:51Z",
+				tool_calls: [{ name: "run_command", args: {} }],
+			},
+		]);
+		const result = await readAntigravityTranscript(path);
+		expect(result.toolUse).toEqual([
+			{ name: "run_command", kind: "builtin", calls: 2, lastCallAtMs: Date.parse("2026-07-19T09:46:51Z") },
+		]);
+	});
+
 	it("counts the PLANNER_RESPONSE tool_calls it also summarizes into the text", async () => {
 		const path = writeTranscript(REAL_TRANSCRIPT_FULL);
 		const result = await readAntigravityTranscript(path);
-		expect(result.toolUse).toEqual([{ name: "run_command", kind: "builtin", calls: 1 }]);
+		expect(untimed(result.toolUse)).toEqual([{ name: "run_command", kind: "builtin", calls: 1 }]);
 	});
 
 	it("sums repeated calls to the same tool across steps", async () => {
@@ -161,7 +192,7 @@ describe("readAntigravityTranscript toolUse", () => {
 			},
 		]);
 		const result = await readAntigravityTranscript(path);
-		expect(result.toolUse).toEqual([
+		expect(untimed(result.toolUse)).toEqual([
 			{ name: "run_command", kind: "builtin", calls: 2 },
 			{ name: "view_file", kind: "builtin", calls: 1 },
 		]);
@@ -191,8 +222,8 @@ describe("readAntigravityTranscript toolUse", () => {
 			},
 		]);
 		const first = await readAntigravityTranscript(path, undefined, "2026-07-19T09:50:00Z");
-		expect(first.toolUse).toEqual([{ name: "run_command", kind: "builtin", calls: 1 }]);
+		expect(untimed(first.toolUse)).toEqual([{ name: "run_command", kind: "builtin", calls: 1 }]);
 		const second = await readAntigravityTranscript(path, first.newCursor);
-		expect(second.toolUse).toEqual([{ name: "view_file", kind: "builtin", calls: 1 }]);
+		expect(untimed(second.toolUse)).toEqual([{ name: "view_file", kind: "builtin", calls: 1 }]);
 	});
 });

@@ -199,7 +199,13 @@ window.JD = window.JD || {};
 			if (!byKey[key]) { byKey[key] = { label: key, cards: [] }; groups.push(byKey[key]); }
 			byKey[key].cards.push(card);
 		});
-		var openHref = (card) => "/memories?repo=" + encodeURIComponent(card.repoIdentity) + "&hash=" + encodeURIComponent(card.commitHash);
+		/* `detailRepo` names the memory's owning repo without scoping the page it
+		   lands on — see wireTree in memories.js. Whatever scope THIS page carries
+		   rides along through JD.query, so a repo-filtered dashboard still opens a
+		   repo-filtered tree. */
+		var openHref = (card) =>
+			"/memories" +
+			JD.withParams(JD.query(model, {}), { hash: card.commitHash, detailRepo: card.repoIdentity });
 		var row = (card) => {
 			var meta = [];
 			if (card.category) meta.push('<span class="mem-activity-category">' + esc(card.category) + "</span>");
@@ -416,8 +422,14 @@ window.JD = window.JD || {};
 		/* Receipts only exist from the day they shipped, and nothing can rebuild
 		   them — but the CALL survives in the transcripts, so a window with only
 		   history says "recall ran N times, outcome not recorded" rather than the
-		   empty panel, which read as "recall was never used". Deliberately without
-		   a hit rate or a chart: neither can be honestly derived from a call count. */
+		   empty panel, which read as "recall was never used".
+		   Still no hit rate — that cannot be derived from a call count — but it
+		   DOES now carry the chart. The original "no chart either" was right while
+		   the daily series knew nothing about receipt-less calls; now that the
+		   `jollimemory` reference's own timestamps reach `daily[].estimated`, the
+		   days those calls fell on are real data, and withholding the chart was
+		   the reason a window of pure history looked like the feature was dead. */
+		var hasEstimatedDays = (usage.daily || []).some((d) => d.estimated > 0);
 		if (totalCalls === 0 && noReceipt > 0) {
 			return (
 				head +
@@ -427,14 +439,30 @@ window.JD = window.JD || {};
 				esc(rangeSub(model.stats)) +
 				"</span></div>" +
 				'<div class="spacer"></div></div>' +
+				(hasEstimatedDays
+					? '<div style="margin-top:8px">' +
+						JD.recallBars(usage.daily, usage.receiptsSinceDate) +
+						'<div class="legend" style="margin-top:6px">' +
+						'<span><i style="background:var(--heat-track)"></i>called, outcome not recorded (at least)</span>' +
+						"</div></div>"
+					: "") +
 				'<div class="locked-panel"><p><b>Recall ran ' +
 				noReceipt +
 				"&times; here, but nothing recorded what it returned.</b></p>" +
 				'<p class="why">These calls come from the agent transcripts. Whether each one ' +
 				"served usable context is only recorded from the call itself, which older " +
 				"runs pre-date — newer calls show their hit rate here." +
+				(hasEstimatedDays
+					? " The chart above places them by date, from the one channel that timestamps each call — " +
+						"a repeated query collapses to a single entry there, so each day is a floor, not a count."
+					: "") +
 				(usage.skillInvocations > 0
 					? " The <code>jolli-recall</code> skill ran <b>" + usage.skillInvocations + "</b>&times; in the same window."
+					: "") +
+				(usage.skillRunsWithoutTrace > 0
+					? " <b>" +
+						usage.skillRunsWithoutTrace +
+						"</b> of those left no other trace — the skill's CLI fallback, which older builds recorded nowhere."
 					: "") +
 				"</p></div></section>"
 			);
@@ -446,10 +474,20 @@ window.JD = window.JD || {};
 				'<div class="locked-panel"><p><b>No recall calls recorded in this window.</b></p>' +
 				'<p class="why">Run <code>jolli recall</code>, or let an agent call the recall tool, ' +
 				"and it shows up here as it happens." +
+				/* "without recalling anything" is only safe to say when nothing
+				   suggests otherwise: a skill run with no trace is just as likely to
+				   have recalled through the CLI fallback and had its receipt land
+				   with no session to attribute it to. */
 				(usage.skillInvocations > 0
-					? " The <code>jolli-recall</code> skill ran <b>" +
-						usage.skillInvocations +
-						"</b>&times; in this window without recalling anything."
+					? usage.skillRunsWithoutTrace > 0
+						? " The <code>jolli-recall</code> skill ran <b>" +
+							usage.skillInvocations +
+							"</b>&times; here, <b>" +
+							usage.skillRunsWithoutTrace +
+							"</b> of them leaving no record of what came back."
+						: " The <code>jolli-recall</code> skill ran <b>" +
+							usage.skillInvocations +
+							"</b>&times; in this window without recalling anything."
 					: "") +
 				"</p></div></section>"
 			);
@@ -467,47 +505,117 @@ window.JD = window.JD || {};
 		html +=
 			'<div style="display:flex;gap:20px;align-items:flex-start;margin-top:8px;flex-wrap:wrap">' +
 			'<div style="flex:1;min-width:220px">' +
-			JD.recallBars(usage.daily) +
+			JD.recallBars(usage.daily, usage.receiptsSinceDate) +
 			'<div class="legend" style="margin-top:6px">' +
 			'<span><i style="background:var(--accent)"></i>the model used it</span>' +
 			'<span><i style="background:var(--muted)"></i>set aside</span>' +
+			/* Only when the window actually holds such a day: this is the rare
+			   channel (pre-receipt history), and a permanent third legend entry
+			   would suggest every chart has one. */
+			(hasEstimatedDays
+				? '<span><i style="background:var(--heat-track)"></i>outcome not recorded</span>'
+				: "") +
 			"</div></div>" +
 			'<div style="min-width:170px">' +
-			statRows([
-				["Used", usage.usedCalls],
-				["Context served", usage.contextServedPct + "%"],
+			statRows(
 				[
-					"Memories",
-					usage.distinctMemoriesUsed + (usage.staleMemoriesUsed > 0 ? " · " + usage.staleMemoriesUsed + " older than 30d" : ""),
-				],
-			]) +
+					["Used", usage.usedCalls],
+					["Context served", usage.contextServedPct + "%"],
+					[
+						"Memories",
+						usage.distinctMemoriesUsed + (usage.staleMemoriesUsed > 0 ? " · " + usage.staleMemoriesUsed + " older than 30d" : ""),
+					],
+				].concat(
+					/* The skill's own row, on the card FACE. It is not a call and must
+					   never move the three figures above — but computing it and then
+					   printing it only inside the ⓘ's `title` attribute was how six
+					   recall rows in the database rendered as "3 used" with nothing
+					   visible to account for the other three. A hover is not a surface.
+					   Suppressed at zero, like every other conditional figure here. */
+					usage.skillInvocations > 0
+						? [
+								[
+									"Skill runs",
+									usage.skillInvocations +
+										(usage.skillRunsWithoutTrace > 0
+											? " · " + usage.skillRunsWithoutTrace + " with no recorded outcome"
+											: ""),
+								],
+							]
+						: [],
+				),
+			) +
 			"</div></div>";
 
+		/* ONE line, which is what the design carries: the coverage ratio and
+		   nothing else. The four `·`-joined clauses this used to print were added
+		   one at a time, each defensible alone, and together they were unreadable
+		   — a reader could not tell which number the caveats even applied to.
+		   They are not deleted, they move to the ⓘ's hover: a caveat that
+		   qualifies a figure belongs next to it, but it does not belong in the
+		   reader's way every time they glance at the card. */
 		var note = "<b>" + usage.sessionsWithContext + "</b> of " + usage.sessionsInWindow + " sessions got prior context";
+
+		/* Plain text, not markup — this becomes a `title` attribute, where tags
+		   would render literally. */
+		var detail = [];
 		if (usage.bySurface.length > 0) {
-			note +=
-				" · " +
+			detail.push(
 				usage.bySurface
-					.map((row) => "<b>" + row.calls + "</b> via " + esc(row.surface === "mcp" ? "the recall tool" : "the CLI"))
-					.join(", ");
+					.map((row) => row.calls + " via " + (row.surface === "mcp" ? "the recall tool" : "the CLI"))
+					.join(", "),
+			);
 		}
 		/* Skill invocations sit OUTSIDE the counts above on purpose: a skill run
 		   that goes on to recall already wrote its own receipt, so folding it in
 		   would count that call twice. What it adds is the gap — invoked, never
-		   recalled — which is why it is only worth printing when there is one. */
+		   recalled — which is why it is only worth mentioning when there is one. */
 		if (usage.skillInvocations > usage.usedCalls + usage.setAsideCalls) {
-			note +=
-				" · the <code>jolli-recall</code> skill ran <b>" +
-				usage.skillInvocations +
-				"</b>&times;, more often than recall was actually called";
+			detail.push("the jolli-recall skill ran " + usage.skillInvocations + "×, more often than recall was called");
 		}
-		/* Mixed window: some calls have receipts, some pre-date them. Said out loud
-		   so the hit rate above is read as covering only the receipted ones. */
+		/* The gap's most likely explanation, stated where the gap is stated. */
+		if (usage.skillRunsWithoutTrace > 0) {
+			detail.push(
+				usage.skillRunsWithoutTrace +
+					" skill " +
+					(usage.skillRunsWithoutTrace === 1 ? "run" : "runs") +
+					" left no MCP call and no attributable receipt — typically the CLI fallback on a host that reports no session id",
+			);
+		}
+		/* Mixed window: some calls have receipts, some pre-date them. Kept so the
+		   percentage above is read as covering only the receipted ones. */
 		if (noReceipt > 0) {
-			note += " · <b>" + noReceipt + "</b> further calls are in the transcripts with no recorded outcome";
+			detail.push(
+				noReceipt +
+					" further " +
+					(noReceipt === 1 ? "call is" : "calls are") +
+					" in the transcripts with no recorded outcome",
+			);
 		}
-		note += " · a recall run outside an agent session counts above but belongs to no session";
-		return html + '<div class="w-foot"><span class="w-measure">ⓘ ' + note + "</span></div></section>";
+		/* Only when there actually IS such a call, counted server-side. Printed
+		   unconditionally, it raised a caveat that did not apply — on a machine
+		   whose every recall carries a session id it described a situation that
+		   cannot occur. The first attempt at a condition tested
+		   `sessionsWithContext === 0`, which reads as "no session claims these
+		   calls" but actually means "not one receipt in the window names a
+		   session" — so the mixed window this caveat is FOR (some calls inside a
+		   session, some at a shell prompt) was precisely the case it stayed
+		   silent for. `callsWithoutSession` is the statement itself. */
+		if (usage.callsWithoutSession > 0) {
+			detail.push(
+				usage.callsWithoutSession +
+					(usage.callsWithoutSession === 1 ? " recall ran" : " recalls ran") +
+					" outside an agent session, counting above but belonging to no session",
+			);
+		}
+		return (
+			html +
+			'<div class="w-foot"><span class="w-measure"' +
+			(detail.length > 0 ? ' title="' + esc(detail.join(" · ")) + '"' : "") +
+			">ⓘ " +
+			note +
+			"</span></div></section>"
+		);
 	}
 
 	/* Ranked rows shared by Skills and MCP servers: label (+ optional kind),

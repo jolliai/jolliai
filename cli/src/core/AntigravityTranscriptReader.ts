@@ -109,8 +109,14 @@ export async function readAntigravityTranscript(
 			// PLANNER_RESPONSE line is not a shape this transcript produces (it is
 			// append-only and each step_index appears once), so counting every
 			// occurrence is correct rather than merely tolerable.
+			const atMs = ts ? Date.parse(ts) : Number.NaN;
 			for (const tc of tcs) {
-				if (typeof tc?.name === "string" && tc.name.length > 0) tally.add(builtinTool(tc.name));
+				if (typeof tc?.name === "string" && tc.name.length > 0) {
+					tally.add({
+						...builtinTool(tc.name),
+						...(Number.isFinite(atMs) && { lastCallAtMs: atMs }),
+					});
+				}
 			}
 			const parts = [content, ...tcs.map(toolCallSummary)].filter((p) => p.length > 0);
 			if (parts.length) entries.push({ role: "assistant", content: parts.join("\n"), timestamp: ts });

@@ -12,6 +12,9 @@ vi.mock("../core/GitOps.js", () => ({
 	// The Memories view asks git which commits are still reachable. Mocked so
 	// that read stays a pure-unit test — the real one shells out to `rev-list`.
 	listReachableCommits: vi.fn(async () => ["reachable-hash"]),
+	// The Standup view asks git who the local user is, to filter the board to
+	// their own commits. Mocked for the same reason: no `git config` subprocess.
+	readLocalGitIdentity: vi.fn(async () => ({ email: "me@example.com", name: "Me" })),
 }));
 vi.mock("../install/Installer.js", () => ({
 	install: vi.fn().mockResolvedValue({ success: true, warnings: [] }),
@@ -1210,6 +1213,40 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect((body.memories?.items ?? []).map((item) => item.commitHash)).toEqual(["reachable-hash"]);
 	});
 
+	// The `/` redirect reads `repos.length` and nothing else. It builds the
+	// `repositories` model to avoid the stats view's LLM call, and that view now
+	// pays a per-repo `git rev-list` for its memory badge — a badge this response
+	// discards, and which the page it redirects to computes again anyway.
+	it("skips the reachability fan-out for the / redirect, but pays it on the page itself", async () => {
+		const dbPath = join(dir, "root-redirect.db");
+		const configDir = join(dir, "config-root");
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+
+		const root = await get(port, "/");
+		expect(root.status).toBe(302);
+		expect(root.headers.get("location")).toBe("/dashboard");
+		expect(gitOps.listReachableCommits).not.toHaveBeenCalled();
+
+		expect((await get(port, "/repositories")).status).toBe(200);
+		expect(gitOps.listReachableCommits).toHaveBeenCalledWith("/w/jolli");
+	});
+
 	// The "Load more" fetch. Filtered by the SAME reachability the page render
 	// uses — that is what makes the cursor a position in the list the client is
 	// actually holding, rather than in a longer one only this route can see.
@@ -1319,8 +1356,11 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 
 		// Unknown document — a 404, not an empty 200 that reads as "no content".
 		expect((await get(port, "/api/context?repo=repo-1&kind=plan&key=nope")).status).toBe(404);
-		// `reference` is a real context kind but not a viewable one here.
-		expect((await get(port, "/api/context?repo=repo-1&kind=reference&key=p1")).status).toBe(400);
+		// Every context kind is viewable now, so `reference` is a 404 (no such
+		// document) rather than a 400 (no such kind) — only an unknown KIND is a
+		// bad request.
+		expect((await get(port, "/api/context?repo=repo-1&kind=reference&key=p1")).status).toBe(404);
+		expect((await get(port, "/api/context?repo=repo-1&kind=nonsense&key=p1")).status).toBe(400);
 		expect((await get(port, "/api/context?kind=plan&key=p1")).status).toBe(400);
 	});
 });
@@ -1455,6 +1495,42 @@ describe("Decisions card gist (Stats view only)", () => {
 
 		expect(res.status).toBe(200);
 		expect(mockGetDecisionGist).not.toHaveBeenCalled();
+	});
+
+	it("filters the standup board to the local git identity, read per enabled repo", async () => {
+		const dbPath = join(dir, "dashboard.db");
+		await seedDecisionCommit(dbPath, "mem4", "picked sqlite");
+		// A placeholder row from a hook that wrote before the registry projected:
+		// `cwd: ''` would silently read whichever repo the server was launched in.
+		await withDashboardDb(
+			(db) => {
+				db.prepare(
+					"INSERT INTO repos (repo_identity, repo_name, worktree_root, enabled_at) VALUES (?, ?, '', 't')",
+				).run("repo-2", "placeholder");
+			},
+			{ dbPath },
+		);
+
+		const port = await listen(
+			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config") }),
+		);
+		const body = (await (await get(port, "/api/model?view=standup")).json()) as DashboardModel;
+
+		expect(vi.mocked(gitOps.readLocalGitIdentity).mock.calls).toEqual([["/w"]]);
+		expect(body.standup?.authoredBy).toBe("me@example.com");
+		// The seeded commit carries no author, so the filter excludes it — the proof
+		// the identity reached the query rather than being resolved and dropped.
+		expect(body.standup?.todayCommits).toEqual([]);
+	});
+
+	it("never reads the git identity for views other than Standup", async () => {
+		const dbPath = join(dir, "dashboard.db");
+		await seedDecisionCommit(dbPath, "mem5", "picked sqlite");
+		const port = await listen(
+			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config") }),
+		);
+		expect((await get(port, "/api/model?view=stats")).status).toBe(200);
+		expect(gitOps.readLocalGitIdentity).not.toHaveBeenCalled();
 	});
 });
 

@@ -603,12 +603,19 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): voi
 	if (event.tools !== undefined) {
 		db.prepare("DELETE FROM session_tool_use WHERE session_event_id = ?").run(eventId);
 		const insertTool = db.prepare(
-			`INSERT INTO session_tool_use (session_event_id, tool_name, kind, server, calls)
-			 VALUES (?, ?, ?, ?, ?)
-			 ON CONFLICT(session_event_id, tool_name, kind) DO UPDATE SET calls = excluded.calls`,
+			`INSERT INTO session_tool_use (session_event_id, tool_name, kind, server, calls, last_call_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(session_event_id, tool_name, kind) DO UPDATE SET calls = excluded.calls,
+			     -- MAX, not the excluded value: a re-read of the same session by a parser
+			     -- that cannot stamp a time (or an older build) would otherwise erase an
+			     -- instant a better read already recorded, and NULL is the one value this
+			     -- column cannot recover from: the transcript slice it came from is
+			     -- behind a cursor by then.
+			     last_call_at_ms = MAX(COALESCE(excluded.last_call_at_ms, 0),
+			                           COALESCE(session_tool_use.last_call_at_ms, 0))`,
 		);
 		for (const tool of event.tools) {
-			insertTool.run(eventId, tool.name, tool.kind, tool.server ?? null, tool.calls);
+			insertTool.run(eventId, tool.name, tool.kind, tool.server ?? null, tool.calls, tool.lastCallAtMs ?? null);
 		}
 	}
 }
@@ -801,9 +808,11 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 		);
 		const deleteTools = db.prepare("DELETE FROM session_tool_use WHERE session_event_id = ?");
 		const insertTool = db.prepare(
-			`INSERT INTO session_tool_use (session_event_id, tool_name, kind, server, calls)
-			 VALUES (?, ?, ?, ?, ?)
-			 ON CONFLICT(session_event_id, tool_name, kind) DO UPDATE SET calls = excluded.calls`,
+			`INSERT INTO session_tool_use (session_event_id, tool_name, kind, server, calls, last_call_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(session_event_id, tool_name, kind) DO UPDATE SET calls = excluded.calls,
+			     last_call_at_ms = MAX(COALESCE(excluded.last_call_at_ms, 0),
+			                           COALESCE(session_tool_use.last_call_at_ms, 0))`,
 		);
 		for (const link of event.sessionLinks) {
 			const sessionEventId = `session:${event.repoIdentity}:${link.source}:${link.sessionId}`;
@@ -862,7 +871,14 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 				if (link.tools !== undefined) {
 					deleteTools.run(sessionEventId);
 					for (const t of link.tools) {
-						insertTool.run(sessionEventId, t.name, t.kind, t.server ?? null, t.calls);
+						insertTool.run(
+							sessionEventId,
+							t.name,
+							t.kind,
+							t.server ?? null,
+							t.calls,
+							t.lastCallAtMs ?? null,
+						);
 					}
 				}
 			}

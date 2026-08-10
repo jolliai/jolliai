@@ -277,6 +277,26 @@ export async function listReachableCommits(cwd?: string): Promise<ReadonlyArray<
 }
 
 /**
+ * The git identity commits made here are attributed to (`user.email` /
+ * `user.name`), each field null when unset or unreadable.
+ *
+ * Read from `git config`, not from HEAD's author: a repo whose last commit came
+ * from a teammate (a fresh clone, a shared branch) would otherwise report the
+ * teammate as the local user. Both fields are returned because the two can
+ * disagree — a machine configured with a work email pushing to a remote that
+ * rewrites it to a noreply address still authored the commit — so callers match
+ * on EITHER, mirroring the backfill author filter.
+ */
+export async function readLocalGitIdentity(cwd?: string): Promise<{ email: string | null; name: string | null }> {
+	const read = async (key: string): Promise<string | null> => {
+		const result = await execGit(["config", key], cwd);
+		const value = result.exitCode === 0 ? result.stdout.trim() : "";
+		return value.length > 0 ? value : null;
+	};
+	return { email: await read("user.email"), name: await read("user.name") };
+}
+
+/**
  * Gets information about a specific commit by hash.
  * Unlike getHeadCommitInfo, this queries a specific hash rather than HEAD.
  */

@@ -450,6 +450,43 @@ ALTER TABLE events_raw ADD COLUMN failed_kind TEXT;
 `;
 
 /**
+ * When the last call in a `session_tool_use` bucket was made.
+ *
+ * A tool call is an event with its own instant, but this table had none — so
+ * every query over it had to borrow a time from elsewhere, and both candidates
+ * are wrong in a way that shows up on the Recall card:
+ *
+ *  - the SESSION's `updated_at_ms` (what the queries used) moves whenever the
+ *    conversation is touched again, so a recall made three weeks ago counts as
+ *    today's, while today's recall inside a long-running session counts as
+ *    whenever that session started;
+ *  - a COMMIT's date has no relationship to a tool call at all — an agent turn
+ *    may precede its commit by hours, follow it, or never produce one. It is
+ *    the right clock for `commits`, and a category error here.
+ *
+ * So: the call's own time, taken from the transcript line that recorded it
+ * (`ToolCallCount.lastCallAtMs`).
+ *
+ * NULLABLE, and permanently so. A bucket is written by whichever parser read the
+ * session, and not every source's transcript offers a per-call timestamp (see
+ * `TOOL_CALL_TIME_SOURCES`); rows written before this column existed are NULL
+ * too, and nothing can backfill them — the transcripts they came from may be
+ * gone. Every consumer therefore reads it as `COALESCE(last_call_at_ms,
+ * sessions.updated_at_ms)`: the old, coarse behaviour survives exactly where the
+ * better answer is unavailable, instead of the row dropping out of a window
+ * because its time is unknown.
+ *
+ * LAST rather than first, one instant per bucket: a bucket counts N calls of one
+ * tool in one session, so a bucket straddling a window edge lands wholly in the
+ * window of its last call. Per-call rows would be a different table; the error
+ * here is bounded by one session's own span rather than by how long ago that
+ * session was last touched.
+ */
+export const TOOL_CALL_TIME_DDL = `
+ALTER TABLE session_tool_use ADD COLUMN last_call_at_ms INTEGER;
+`;
+
+/**
  * The memory tables, `context`, plan progress and the topic KB.
  *
  * Applied as one statement batch inside the caller's transaction. Ordering
