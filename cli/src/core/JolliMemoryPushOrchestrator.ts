@@ -470,9 +470,15 @@ export async function pushSummary(
 		await storeSummary(updatedSummary, ctx.cwd, true, undefined, ctx.storage);
 	} catch (err) {
 		writeBackFailed = true;
+		// `docId` rather than `summaryUrl`: the id is the server's own response
+		// field, so it identifies the stranded article without dragging the
+		// API-key-derived base URL into a log sink (see the `writeBackFailed`
+		// branch in `pushBranchToJolli` for why that matters). It is also what a
+		// caller needs to reconcile by hand — the user-facing message points here.
 		log.warn(
-			"Local write-back after a successful push failed for %s: %s",
+			"Local write-back after a successful push failed for %s (article id %d): %s",
 			summary.commitHash.substring(0, 8),
+			result.docId,
 			err instanceof Error ? err.message : String(err),
 		);
 	}
@@ -735,9 +741,38 @@ export async function pushBranchToJolli(opts: PushBranchOpts): Promise<PushBranc
 				// loud failure this was before `pushSummary` started swallowing the
 				// write-back error, and leave the remaining summaries unsent — they all
 				// need the very write that just failed.
+				//
+				// Deliberately WITHOUT `summaryUrl`. That URL is built from
+				// `ctx.baseUrl`, which `resolveAuth` derives by base64-decoding the
+				// API key's embedded `.u` claim — so CodeQL's `js/clear-text-logging`
+				// taint tracker treats it as secret-derived and flags every console
+				// call this message reaches (four of them, via `emitError` and the
+				// `--format json` branch in `JolliCloudCommands`). Re-adding the URL
+				// here re-opens all four alerts: every reported flow path for them
+				// entered `JolliCloudCommands` through this object's `message` field,
+				// and this template was the only step that put a key-derived value
+				// into it.
+				//
+				// THE ALERTS ARE FALSE POSITIVES, AND THIS IS NOT A SANITIZER.
+				// Nothing secret is disclosed: `.u` is the tenant's public site URL
+				// (the address the user types into a browser), and the key itself
+				// only ever travels in an Authorization header. The URL is dropped
+				// here because it carries nothing the reader needs — the commit hash
+				// identifies the summary, and `pushSummary` logs the stranded
+				// article's id to `debug.log`, which this message points at.
+				//
+				// So this is a value judgement about ONE message, not a rule that
+				// key-derived URLs must not be printed. `jolli push` deliberately
+				// keeps printing the very same URLs on its SUCCESS path — they are
+				// the point of the command — and that asymmetry is intended, not an
+				// oversight left behind by this change. If a future CodeQL release
+				// starts tracking taint through the `urls` array and flags the
+				// success path too, the answer is to dismiss those alerts as
+				// false positives (or model `parseJolliApiKey` as a sanitizer), NOT
+				// to strip the links a user asked for.
 				return {
 					type: "error",
-					message: `Pushed ${s.commitHash.substring(0, 8)} to ${summaryUrl}, but recording its article id locally failed, so a re-push would create a second article for that commit. Remaining summaries were not pushed — see .jolli/jollimemory/debug.log.`,
+					message: `Pushed ${s.commitHash.substring(0, 8)}, but recording its article id locally failed, so a re-push would create a second article for that commit. Remaining summaries were not pushed — see .jolli/jollimemory/debug.log.`,
 				};
 			}
 			urls.push(summaryUrl);

@@ -5,6 +5,8 @@
  * and the VS Code extension (jollimemory-vscode).
  */
 
+import { stripTrailingSlashes } from "./PathUtils.js";
+
 /** Result of parsing a Jolli Space base URL */
 export interface ParsedBaseUrl {
 	/** The origin without any path prefix (e.g. "https://jolli-local.me") */
@@ -185,6 +187,77 @@ export function validateJolliApiKey(key: string): void {
 }
 
 /**
+ * The `jolliUrl` that must be persisted alongside a `jolliApiKey` written
+ * OUTSIDE the sign-in flow — every surface where the user pastes a key
+ * directly. All FOUR of them must call this, or the drift below reappears from
+ * whichever one was missed: `configure --set jolliApiKey=…`, the first-run
+ * paste in `GenerationFix.promptAndSaveJolliKey`, the VS Code Settings panel,
+ * and — for IntelliJ's own Settings dialog, whose only config writer it is —
+ * the `config-save` ide-bridge action.
+ *
+ * The sibling of `resolveSignInJolliUrl` (`auth/AuthConfig.ts`): same rule —
+ * the key's embedded tenant IS the site — but a different entry point. Sign-in
+ * has an origin to fall back to; a pasted key has none, so this returns
+ * undefined and the caller leaves the stored `jolliUrl` untouched rather than
+ * guessing. Lives here rather than next to that sibling so the settings surfaces
+ * can reach it without pulling in `AuthConfig`'s config-file IO for what is a
+ * pure string rule.
+ *
+ * Why the sync is mandatory rather than cosmetic: a new key retargets every
+ * request at its own tenant (`resolveAuth` in `JolliMemoryPushClient.ts` routes
+ * on `parseJolliApiKey(...)?.u` and never consults `jolliUrl`), but `jolliUrl`
+ * is what part of the product reports as the site. The surfaces split in two,
+ * and only the first half drifts:
+ *
+ * - `jolliUrl` ONLY, never decoding the key — `jolli status`
+ *   ({@link ../commands/StatusCommand.ts}), the MCP `status` tool, and the
+ *   guided front door's `✓ signed in · <site>` line. Deliberate: decoding a key
+ *   into something that reaches `console` is what trips CodeQL's
+ *   `js/clear-text-logging` taint tracker. These keep naming the OLD tenant.
+ * - key first, `jolliUrl` only as a fallback — VS Code's `buildJolliSiteLabel`
+ *   / `buildJolliSiteItem` and IntelliJ's three site rows (whose Kotlin config
+ *   DTO has no `jolliUrl` field at all). These self-correct, so a drift is
+ *   invisible in the IDE that caused it and shows up only in the CLI.
+ *
+ * That asymmetry is the reason the mismatch is silent rather than merely untidy:
+ * the user pastes a key in an IDE, sees the new tenant confirmed right there,
+ * and nothing indicates that `jolli status` still names the old one.
+ *
+ * Returns undefined for a legacy / hand-typed key carrying no `meta.u`, and for
+ * an off-allowlist tenant — same guard as the sign-in sibling, so neither helper
+ * can emit an origin {@link assertJolliOriginAllowed} would reject. Every caller
+ * treats undefined as "leave the stored value alone", never as "clear it".
+ *
+ * The trailing-slash strip is the same one `saveAuthCredentials` applies before
+ * persisting a sign-in `jolliUrl`, and it is applied BEFORE the allowlist check
+ * for the same reason it is there. Without it the two writers of one config
+ * field could disagree on the string for a single tenant — the sign-in path
+ * stripped, this one verbatim from a server-controlled claim — and
+ * `apiKeyMatchesTenant`, which compares `(origin, first path segment)`, is
+ * exactly the kind of reader that notices.
+ *
+ * Two things here are deliberately NOT written the obvious way, both because
+ * this function's input is decoded out of a key the user pasted:
+ *   - {@link stripTrailingSlashes} rather than `.replace(/\/+$/, "")`. That
+ *     regex is quadratic on a long run of slashes and is flagged by CodeQL's
+ *     `js/polynomial-redos` the moment its input is library-controlled — see
+ *     that helper's own docstring, which asks callers not to reintroduce it.
+ *   - {@link isJolliOriginAllowed} rather than a try/catch around
+ *     {@link assertJolliOriginAllowed}. The thrown Error embeds the offending
+ *     origin, and CodeQL does not model the `catch` as stopping it: it tracked
+ *     the throw out through every caller to the CLI's top-level
+ *     `console.error("Fatal error:", error)` and reported clear-text logging of
+ *     key-derived data. Testing the predicate never builds that string at all.
+ */
+export function resolveJolliUrlForKey(jolliApiKey: string | undefined): string | undefined {
+	if (!jolliApiKey) return undefined;
+	const meta = parseJolliApiKey(jolliApiKey);
+	if (!meta) return undefined;
+	const tenant = stripTrailingSlashes(meta.u);
+	return tenant && isJolliOriginAllowed(tenant) ? tenant : undefined;
+}
+
+/**
  * Allowlist of host suffixes the Jolli API key / OAuth callback may target.
  * Exported so the VS Code Settings webview can inline this exact list at
  * extension build time (`SettingsScriptBuilder.buildSettingsScript`),
@@ -212,15 +285,46 @@ export function assertJolliOriginAllowed(origin: string): void {
 	} catch {
 		throw new Error(`Rejected Jolli origin (unparseable): ${origin}`);
 	}
-	const host = url.hostname.toLowerCase();
-	const ok =
-		url.protocol === "https:" &&
-		host !== "" &&
-		ALLOWED_JOLLI_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
-	if (ok) {
+	if (isAllowedJolliUrl(url)) {
 		return;
 	}
 	throw new Error(
 		`Rejected Jolli origin "${url.origin}". Only https://*.jolli.ai, https://*.jolli.dev, https://*.jolli.cloud, and https://*.jolli-local.me are permitted.`,
+	);
+}
+
+/**
+ * Non-throwing form of {@link assertJolliOriginAllowed}, for the guard-shaped
+ * callers: `resolveJolliUrlForKey` here and `resolveSignInJolliUrl` in
+ * `auth/AuthConfig.ts`, both of which answer "is this tenant usable?" and have
+ * a fallback rather than a failure when the answer is no.
+ *
+ * Not sugar over a try/catch — building the Error is the thing being avoided.
+ * Its message embeds the rejected origin, so a caller that swallows it still
+ * creates a value derived from the user's API key, and CodeQL's
+ * `js/clear-text-logging` does NOT treat the `catch` as stopping the flow: it
+ * followed such a throw out of `resolveJolliUrlForKey`, up through the guided
+ * front door, and into the CLI's top-level `console.error("Fatal error:", …)`.
+ * Predicate first, Error only where one is actually thrown at someone.
+ */
+export function isJolliOriginAllowed(origin: string): boolean {
+	try {
+		return isAllowedJolliUrl(new URL(origin));
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The allowlist rule itself, in one place so the throwing and predicate forms
+ * above can never disagree about what "allowed" means. Takes a parsed `URL`
+ * because the two differ only in how they report an unparseable input.
+ */
+function isAllowedJolliUrl(url: URL): boolean {
+	const host = url.hostname.toLowerCase();
+	return (
+		url.protocol === "https:" &&
+		host !== "" &&
+		ALLOWED_JOLLI_HOSTS.some((h) => host === h || host.endsWith(`.${h}`))
 	);
 }

@@ -196,6 +196,10 @@ vi.mock("../core/JolliApiUtils.js", () => ({
 	validateJolliApiKey: vi.fn(),
 	assertJolliOriginAllowed: vi.fn(),
 	deriveJolliBackendKey: vi.fn().mockReturnValue("prod"),
+	// The key→tenant rule is covered in JolliApiUtils.test.ts; stubbed here so the
+	// `config-save` cases stay on what this dispatcher owns — whether the derived
+	// URL is merged into the config it forwards.
+	resolveJolliUrlForKey: vi.fn(),
 }));
 
 vi.mock("../core/JolliMemoryPushClient.js", () => {
@@ -2046,6 +2050,54 @@ describe("runIdeBridgeAction — session-state", () => {
 		await expect(
 			runIdeBridgeAction("session-state", "/r", { operation: "config-save", config: "no" }),
 		).rejects.toThrow(/"config"/);
+	});
+
+	// This is the JVM host's only config writer, so it is where `jolliUrl` has to
+	// follow a key pasted into IntelliJ's Settings dialog. The Kotlin config DTO
+	// has no `jolliUrl` field (deliberately — its Gson serializes nulls, so adding
+	// one would blank the value on every unrelated save), which is exactly why the
+	// rule cannot live on that side.
+	describe("config-save — jolliUrl follows the saved key", () => {
+		it("merges the key's tenant URL into the forwarded config", async () => {
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
+			const { resolveJolliUrlForKey } = await import("../core/JolliApiUtils.js");
+			vi.mocked(resolveJolliUrlForKey).mockReturnValue("https://acme.jolli.ai");
+			await runIdeBridgeAction("session-state", "/r", {
+				operation: "config-save",
+				config: { jolliApiKey: "sk-jol-new.key", model: "opus" },
+				dir: "/scoped",
+			});
+			expect(saveConfigScoped).toHaveBeenCalledWith(
+				{ jolliApiKey: "sk-jol-new.key", model: "opus", jolliUrl: "https://acme.jolli.ai" },
+				"/scoped",
+			);
+		});
+
+		it("leaves jolliUrl alone for a legacy key with no tenant claim", async () => {
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
+			const { resolveJolliUrlForKey } = await import("../core/JolliApiUtils.js");
+			vi.mocked(resolveJolliUrlForKey).mockReturnValue(undefined);
+			await runIdeBridgeAction("session-state", "/r", {
+				operation: "config-save",
+				config: { jolliApiKey: "sk-jol-legacy" },
+				dir: "/scoped",
+			});
+			expect(saveConfigScoped).toHaveBeenCalledWith({ jolliApiKey: "sk-jol-legacy" }, "/scoped");
+		});
+
+		// Clearing the key in the dialog arrives as an explicit null. Rewriting the
+		// URL there would name a tenant with no key to prove it.
+		it("leaves jolliUrl alone when the key is being cleared", async () => {
+			const { saveConfigScoped } = await import("../core/SessionTracker.js");
+			const { resolveJolliUrlForKey } = await import("../core/JolliApiUtils.js");
+			await runIdeBridgeAction("session-state", "/r", {
+				operation: "config-save",
+				config: { jolliApiKey: null, authToken: null },
+				dir: "/scoped",
+			});
+			expect(resolveJolliUrlForKey).not.toHaveBeenCalled();
+			expect(saveConfigScoped).toHaveBeenCalledWith({ jolliApiKey: null, authToken: null }, "/scoped");
+		});
 	});
 
 	it("loads plans registry on plans-load", async () => {

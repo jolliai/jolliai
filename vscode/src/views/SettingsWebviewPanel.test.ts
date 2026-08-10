@@ -847,6 +847,75 @@ describe("SettingsWebviewPanel", () => {
 			);
 		});
 
+		it("retargets jolliUrl at the tenant of a newly-pasted jolli API key", async () => {
+			// The key's embedded `.u` is what every request routes to, while the
+			// status surfaces report `jolliUrl`. Saving the key alone left the two
+			// on different tenants with nothing to detect it.
+			const jolliKey =
+				"sk-jol-eyJ0IjoidGVuYW50IiwidSI6Imh0dHBzOi8vdGVuYW50LmpvbGxpLmFpIn0.secret";
+			const dispatch = await setupWithLoadedConfig({ jolliApiKey: jolliKey });
+
+			const maskedJolliKey = `${jolliKey.substring(0, 12)}****${jolliKey.substring(jolliKey.length - 4)}`;
+			// Decodes to { t: "tenant2", u: "https://tenant2.jolli.ai" }
+			const newJolliKey =
+				"sk-jol-eyJ0IjoidGVuYW50MiIsInUiOiJodHRwczovL3RlbmFudDIuam9sbGkuYWkifQ.secret";
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: maskedJolliKey,
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					jolliApiKey: newJolliKey,
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			expect(mockSaveConfigScoped).toHaveBeenCalledWith(
+				expect.objectContaining({ jolliUrl: "https://tenant2.jolli.ai" }),
+				expect.any(String),
+			);
+		});
+
+		it("omits jolliUrl entirely when the jolli API key field is cleared", async () => {
+			// `saveConfigScoped` merges shallowly, so emitting `jolliUrl: undefined`
+			// here would DELETE a site the user still needs. The field must be absent.
+			const jolliKey =
+				"sk-jol-eyJ0IjoidGVuYW50IiwidSI6Imh0dHBzOi8vdGVuYW50LmpvbGxpLmFpIn0.secret";
+			const dispatch = await setupWithLoadedConfig({ jolliApiKey: jolliKey });
+
+			const maskedJolliKey = `${jolliKey.substring(0, 12)}****${jolliKey.substring(jolliKey.length - 4)}`;
+
+			dispatch({
+				command: "applySettings",
+				maskedApiKey: "",
+				maskedJolliApiKey: maskedJolliKey,
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					// Different from masked → resolvedJolliApiKey is "", length 0, so
+					// no tenant can be derived. (Passing "" for BOTH would read back
+					// as "unchanged" and resolve to the cached full key instead.)
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+				},
+			});
+			await flushPromises();
+
+			const update = mockSaveConfigScoped.mock.calls[0]?.[0] as Record<string, unknown>;
+			expect(update).not.toHaveProperty("jolliUrl");
+		});
+
 		it("saves undefined apiKey when user clears the API key field", async () => {
 			const apiKey = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234";
 			const dispatch = await setupWithLoadedConfig({ apiKey });

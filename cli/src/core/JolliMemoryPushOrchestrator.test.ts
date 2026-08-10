@@ -1609,7 +1609,21 @@ describe("pushBranchToJolli", () => {
 
 		expect(result.type).toBe("error");
 		expect(result.type === "error" && result.message).toContain("aaa1111");
-		expect(result.type === "error" && result.message).toContain(`${BASE}/articles?doc=42`);
+		// The article URL is deliberately absent. It is built from the base URL
+		// `resolveAuth` decodes out of the API key, so printing it trips CodeQL's
+		// js/clear-text-logging query at all four console calls this message reaches.
+		// The commit hash identifies the summary and `pushSummary` logs the stranded
+		// article's id to debug.log, so nothing the reader needs is lost.
+		expect(result.type === "error" && result.message).not.toContain(BASE);
+		// …but only because the id took its place. That is the whole trade — the
+		// message tells the reader to open debug.log, so if this warning ever stops
+		// carrying the stranded article's id there is no way left to find it.
+		expect(mockLogWarn).toHaveBeenCalledWith(
+			expect.stringContaining("article id %d"),
+			"aaa1111",
+			42,
+			"orphan branch lock busy",
+		);
 		// The remaining summary is left unsent — it needs the same write that failed.
 		expect(client.push).toHaveBeenCalledTimes(1);
 	});

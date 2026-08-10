@@ -15,7 +15,7 @@
 
 import { getJolliUrl } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
-import { validateJolliApiKey } from "../core/JolliApiUtils.js";
+import { resolveJolliUrlForKey, validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import {
 	isLocalAgentUsable,
@@ -182,7 +182,22 @@ async function promptAndSaveJolliKey(configDir: string): Promise<boolean> {
 		console.error(`\n  Error: ${(err as Error).message}\n`);
 		return false;
 	}
-	await saveConfigScoped({ jolliApiKey: key, aiProvider: "jolli" }, configDir);
+	// `jolliUrl` follows the pasted key, exactly as in `configure --set` and the
+	// VS Code Settings panel — see `resolveJolliUrlForKey`. This is the first-run
+	// paste path, so the drift it prevents is visible in this very command: the
+	// guided front door's own `✓ signed in · <site>` line reads `config.jolliUrl`
+	// a few steps after this returns. Conditional spread, not a plain field: a
+	// legacy key carries no tenant claim and `saveConfigScoped` merges shallowly,
+	// so writing `undefined` would delete a `jolliUrl` the user still needs.
+	const keyTenantUrl = resolveJolliUrlForKey(key);
+	await saveConfigScoped(
+		{
+			jolliApiKey: key,
+			aiProvider: "jolli",
+			...(keyTenantUrl !== undefined ? { jolliUrl: keyTenantUrl } : {}),
+		},
+		configDir,
+	);
 	console.log("\n  ✓ Jolli key saved");
 	return true;
 }

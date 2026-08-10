@@ -78,6 +78,13 @@ export function registerPushCommand(program: Command): void {
 					space: options.space,
 				});
 
+				// `result.urls` holds the same key-derived article URLs that the
+				// write-back-failure message in `pushBranchToJolli` deliberately
+				// omits — see the long note there. Printing them HERE is intended:
+				// a link per pushed memory is what `jolli push` is for, and the
+				// tenant origin they embed is public. Do not "make this consistent"
+				// by deleting them; that note explains why the two paths differ and
+				// what to do if CodeQL ever flags this one.
 				if (options.format === "json") {
 					console.log(JSON.stringify(result));
 					if (result.type === "error") process.exitCode = 1;

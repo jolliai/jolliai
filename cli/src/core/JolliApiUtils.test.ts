@@ -5,9 +5,11 @@ import {
 	deriveJolliBackendKeyFromApiKey,
 	deriveJolliEnvKey,
 	deriveJolliEnvKeyFromApiKey,
+	isJolliOriginAllowed,
 	parseBaseUrl,
 	parseJolliApiKey,
 	resolveArticleUrl,
+	resolveJolliUrlForKey,
 } from "./JolliApiUtils";
 
 describe("JolliApiUtils", () => {
@@ -247,6 +249,101 @@ describe("JolliApiUtils", () => {
 
 		it("falls back to the ?doc=<id> deep-link when the server url is missing", () => {
 			expect(resolveArticleUrl(base, "", 839)).toBe("https://jolli-local.me/7o423e4x/articles?doc=839");
+		});
+	});
+
+	describe("resolveJolliUrlForKey", () => {
+		/** Builds a valid new-format sk-jol key whose embedded meta is the given object. */
+		function buildKey(meta: Record<string, unknown>): string {
+			const encoded = Buffer.from(JSON.stringify(meta)).toString("base64url");
+			return `sk-jol-${encoded}.secret`;
+		}
+
+		it("returns the key's embedded tenant", () => {
+			const key = buildKey({ t: "tenant1", u: "https://tenant1.jolli.ai" });
+			expect(resolveJolliUrlForKey(key)).toBe("https://tenant1.jolli.ai");
+		});
+
+		it("preserves a path-based tenant slug", () => {
+			const key = buildKey({ t: "dev", u: "https://jolli-local.me/dev" });
+			expect(resolveJolliUrlForKey(key)).toBe("https://jolli-local.me/dev");
+		});
+
+		// `saveAuthCredentials` strips before persisting, so a key-derived URL must
+		// too — otherwise the two writers of one config field disagree on the
+		// string for a single tenant, and `apiKeyMatchesTenant` compares
+		// `(origin, first path segment)`.
+		it("strips a trailing slash, matching the sign-in writer", () => {
+			expect(resolveJolliUrlForKey(buildKey({ t: "acme", u: "https://acme.jolli.ai/" }))).toBe(
+				"https://acme.jolli.ai",
+			);
+			expect(resolveJolliUrlForKey(buildKey({ t: "dev", u: "https://jolli-local.me/dev//" }))).toBe(
+				"https://jolli-local.me/dev",
+			);
+		});
+
+		it("returns undefined for a tenant claim that is only slashes", () => {
+			expect(resolveJolliUrlForKey(buildKey({ t: "x", u: "/" }))).toBeUndefined();
+		});
+
+		// The rejection path must not build `assertJolliOriginAllowed`'s Error at
+		// all: its message embeds the offending origin, and CodeQL followed such a
+		// throw out of here (past the `catch` that used to swallow it) all the way
+		// to the CLI's top-level `console.error("Fatal error:", …)`.
+		it("rejects an off-allowlist tenant without throwing anything", () => {
+			const key = buildKey({ t: "evil", u: "https://evil.example.com" });
+			let thrown: unknown;
+			try {
+				expect(resolveJolliUrlForKey(key)).toBeUndefined();
+			} catch (err) {
+				thrown = err;
+			}
+			expect(thrown).toBeUndefined();
+			// The throwing sibling still reports the same tenant as rejected — this
+			// helper is quieter, not more permissive.
+			expect(() => assertJolliOriginAllowed("https://evil.example.com")).toThrow(/Rejected Jolli origin/);
+			expect(isJolliOriginAllowed("https://evil.example.com")).toBe(false);
+		});
+
+		it("agrees with the throwing sibling on every shape", () => {
+			for (const origin of [
+				"https://acme.jolli.ai",
+				"https://jolli-local.me/dev",
+				"http://acme.jolli.ai",
+				"https://evil.example.com",
+				"not a url",
+				"",
+			]) {
+				let asserts = true;
+				try {
+					assertJolliOriginAllowed(origin);
+				} catch {
+					asserts = false;
+				}
+				expect(isJolliOriginAllowed(origin)).toBe(asserts);
+			}
+		});
+
+		it("returns undefined when no key is being written", () => {
+			expect(resolveJolliUrlForKey(undefined)).toBeUndefined();
+		});
+
+		it("returns undefined for a legacy key with no embedded tenant", () => {
+			// Unlike the sign-in sibling there is no origin to fall back to, so the
+			// caller must leave the stored `jolliUrl` untouched rather than guess.
+			expect(resolveJolliUrlForKey("sk-jol-deadbeef")).toBeUndefined();
+		});
+
+		it("returns undefined when the key's tenant is off the allowlist", () => {
+			// Same guard as `resolveSignInJolliUrl`: a tampered `meta.u` must never
+			// reach config, and here there is nothing safe to substitute.
+			const key = buildKey({ t: "evil", u: "https://evil.example.com" });
+			expect(resolveJolliUrlForKey(key)).toBeUndefined();
+		});
+
+		it("returns undefined for an http (non-https) tenant", () => {
+			const key = buildKey({ t: "plain", u: "http://tenant1.jolli.ai" });
+			expect(resolveJolliUrlForKey(key)).toBeUndefined();
 		});
 	});
 });

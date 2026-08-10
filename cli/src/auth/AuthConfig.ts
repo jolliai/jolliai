@@ -7,6 +7,7 @@
 
 import {
 	assertJolliOriginAllowed,
+	isJolliOriginAllowed,
 	parseBaseUrl,
 	parseJolliApiKey,
 	validateJolliApiKey,
@@ -229,7 +230,7 @@ export function shouldRequestFreshApiKey(existingKey: string | undefined, jolliU
  * key. Precedence stays "newly-minted key wins over on-disk key wins over
  * sign-in origin" so a fresh cross-tenant key still overrides a stale one.
  *
- * The adopted `meta.u` is origin-allowlisted here (via {@link isAllowedOrigin})
+ * The adopted `meta.u` is origin-allowlisted here (via {@link isJolliOriginAllowed})
  * so this helper never emits an off-allowlist origin, even to a future caller
  * that doesn't route its result through `saveAuthCredentials`'s validation. An
  * off-allowlist tenant (a buggy/compromised server) falls back to
@@ -243,24 +244,9 @@ export function resolveSignInJolliUrl(
 	for (const candidate of [jolliApiKey, existingKey]) {
 		if (!candidate) continue;
 		const tenant = parseJolliApiKey(candidate)?.u;
-		if (tenant && isAllowedOrigin(tenant)) return tenant;
+		if (tenant && isJolliOriginAllowed(tenant)) return tenant;
 	}
 	return signInOrigin;
-}
-
-/**
- * Non-throwing wrapper over `assertJolliOriginAllowed` — returns false instead
- * of throwing so callers can use it as a guard. Used to keep
- * `resolveSignInJolliUrl` from ever returning an off-allowlist tenant lifted
- * from a key's `meta.u`.
- */
-function isAllowedOrigin(url: string): boolean {
-	try {
-		assertJolliOriginAllowed(url);
-		return true;
-	} catch {
-		return false;
-	}
 }
 
 /** Loads the OAuth auth token. JOLLI_AUTH_TOKEN env var takes priority. */

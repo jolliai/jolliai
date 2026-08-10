@@ -717,7 +717,41 @@ async function runSessionStateAction(cwd: string, request: JsonObject): Promise<
 			const config = request.config as Partial<JolliMemoryConfig> | undefined;
 			if (!config || typeof config !== "object") throw new Error('Request field "config" must be an object.');
 			const dir = optionalString(request, "dir") ?? tracker.getGlobalConfigDir();
-			await tracker.saveConfigScoped(config, dir);
+			// `jolliUrl` follows the key being saved — the same rule the CLI's
+			// `configure --set` and the VS Code Settings panel apply (see
+			// `resolveJolliUrlForKey`). This is the JVM host's ONLY config writer,
+			// so it is where the rule has to live: IntelliJ's Settings dialog has
+			// its own editable "Jolli API Key" field, and a key pasted there used
+			// to leave `jolliUrl` naming the previous tenant while every push went
+			// to the new one.
+			//
+			// It belongs here rather than in Kotlin for a reason that outranks the
+			// usual "product rules live in cli/src": the Kotlin `JolliMemoryConfig`
+			// has no `jolliUrl` field, and its Gson is `serializeNulls()`, so ADDING
+			// one would make every unrelated Kotlin save (`saveDcoSignoff`,
+			// `saveGlobalInstructions`, …) transmit `"jolliUrl": null` and blank the
+			// value on disk. The field's absence is what keeps the shallow merge
+			// preserving it; keep it absent.
+			//
+			// Applies to every save, not just a changed key: each Kotlin caller
+			// round-trips the key already on disk, so an unrelated save also repairs
+			// a `jolliUrl` that drifted before this rule existed — matching the VS
+			// Code panel's re-save-repairs behavior. A cleared key arrives as `null`
+			// and fails the `typeof` check, so signing out never rewrites the URL.
+			//
+			// The derived value deliberately OVERRIDES a `jolliUrl` in the request
+			// rather than deferring to it. No caller can send one today (no Kotlin
+			// field), but if one ever does and the two disagree, honouring the
+			// caller would persist a pair that is known-wrong — the key is what
+			// requests route on. A caller whose key carries no claim still keeps
+			// its own value, since nothing is derived to override it with.
+			const { resolveJolliUrlForKey } = await import("../core/JolliApiUtils.js");
+			const keyTenantUrl =
+				typeof config.jolliApiKey === "string" ? resolveJolliUrlForKey(config.jolliApiKey) : undefined;
+			await tracker.saveConfigScoped(
+				keyTenantUrl !== undefined ? { ...config, jolliUrl: keyTenantUrl } : config,
+				dir,
+			);
 			return { ok: true };
 		}
 		case "plans-load":

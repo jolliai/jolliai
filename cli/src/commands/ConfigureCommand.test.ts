@@ -6,6 +6,8 @@
  *   - localFolder accepted as a string path key (CLI-only setup parity)
  *   - aiProvider accepted as the "anthropic" | "jolli" enum, rejected otherwise
  *   - globalInstructions accepted as the "enabled" | "disabled" enum, rejected otherwise
+ *   - jolliUrl follows a newly-set jolliApiKey, but never survives a --remove of
+ *     that key in the same invocation
  *   - All keys appear in --list-keys output
  */
 
@@ -15,10 +17,11 @@ import type { JolliMemoryConfig } from "../Types.js";
 
 // ─── Hoist mocks ─────────────────────────────────────────────────────────────
 
-const { mockLoadConfig, mockSaveConfig, mockSyncGlobalInstructions } = vi.hoisted(() => ({
+const { mockLoadConfig, mockSaveConfig, mockSyncGlobalInstructions, mockResolveJolliUrlForKey } = vi.hoisted(() => ({
 	mockLoadConfig: vi.fn(),
 	mockSaveConfig: vi.fn(),
 	mockSyncGlobalInstructions: vi.fn(),
+	mockResolveJolliUrlForKey: vi.fn(),
 }));
 
 vi.mock("../core/SessionTracker.js", () => ({
@@ -27,8 +30,12 @@ vi.mock("../core/SessionTracker.js", () => ({
 	saveConfig: mockSaveConfig,
 }));
 
+// The key→tenant rule itself is covered in JolliApiUtils.test.ts; stubbing it
+// here keeps these cases on what this command owns — how the derived URL merges
+// with an explicit --set / --remove of the same field.
 vi.mock("../core/JolliApiUtils.js", () => ({
 	validateJolliApiKey: vi.fn(),
+	resolveJolliUrlForKey: mockResolveJolliUrlForKey,
 }));
 
 // Configure applies a globalInstructions change immediately via syncGlobalInstructions.
@@ -86,6 +93,9 @@ describe("ConfigureCommand — settable keys", () => {
 		vi.clearAllMocks();
 		savedConfig = {};
 		mockLoadConfig.mockResolvedValue({});
+		// Default: a key whose embedded `.u` names the tenant the `jolliUrl` sync
+		// should follow. Individual tests override it.
+		mockResolveJolliUrlForKey.mockReturnValue("https://acme.jolli.ai");
 		// Wire saveConfig to capture what was saved
 		mockSaveConfig.mockImplementation(async (update: Partial<JolliMemoryConfig>) => {
 			savedConfig = { ...savedConfig, ...update };
@@ -571,6 +581,69 @@ describe("ConfigureCommand — settable keys", () => {
 		it("lists mcpPlatformToolsEnabled in --list-keys output", async () => {
 			const help = await runConfigureHelp();
 			expect(help).toContain("mcpPlatformToolsEnabled");
+		});
+	});
+
+	// `jolliUrl` is deliberately NOT in VALID_CONFIG_KEYS, so there is no
+	// "an explicit --set/--remove jolliUrl wins" case to cover here: both
+	// spellings are rejected as an unknown key before any config is written.
+	describe("jolliUrl follows a newly-set jolliApiKey", () => {
+		it("writes the key's embedded tenant URL alongside the key", async () => {
+			await runConfigure(["--set", "jolliApiKey=sk-jol-test.key"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(
+				expect.objectContaining({
+					jolliApiKey: "sk-jol-test.key",
+					jolliUrl: "https://acme.jolli.ai",
+				}),
+			);
+		});
+
+		it("rejects --set jolliUrl as an unknown key (the sync is the only writer)", async () => {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prev = process.exitCode;
+			try {
+				await runConfigure(["--set", "jolliUrl=https://other.jolli.ai"]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/unknown config key: jolliUrl/));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prev;
+			}
+		});
+
+		it("does not touch jolliUrl when no key is being set", async () => {
+			await runConfigure(["--set", "copilotEnabled=true"]);
+			const update = mockSaveConfig.mock.calls[0]?.[0] as Partial<JolliMemoryConfig>;
+			expect(update).not.toHaveProperty("jolliUrl");
+		});
+
+		it("does not touch jolliUrl when the key carries no tenant claim", async () => {
+			mockResolveJolliUrlForKey.mockReturnValue(undefined);
+			await runConfigure(["--set", "jolliApiKey=sk-jol-legacy"]);
+			const update = mockSaveConfig.mock.calls[0]?.[0] as Partial<JolliMemoryConfig>;
+			expect(update).not.toHaveProperty("jolliUrl");
+		});
+
+		// The --remove loop runs AFTER the --set loop, so `keyTenantUrl` is
+		// already captured by the time the key is cleared. Writing the URL anyway
+		// would name a tenant with no key to prove it — the half-state this sync
+		// exists to remove, rebuilt from the other side.
+		it("drops the derived URL when the same invocation also removes the key", async () => {
+			await runConfigure(["--set", "jolliApiKey=sk-jol-test.key", "--remove", "jolliApiKey"]);
+			const update = mockSaveConfig.mock.calls[0]?.[0] as Partial<JolliMemoryConfig>;
+			expect(update.jolliApiKey).toBeUndefined();
+			expect(update).not.toHaveProperty("jolliUrl");
+		});
+
+		it("still writes the derived URL when an unrelated key is removed alongside", async () => {
+			await runConfigure(["--set", "jolliApiKey=sk-jol-test.key", "--remove", "model"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(
+				expect.objectContaining({
+					jolliApiKey: "sk-jol-test.key",
+					jolliUrl: "https://acme.jolli.ai",
+				}),
+			);
 		});
 	});
 });

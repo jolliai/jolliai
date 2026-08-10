@@ -5,6 +5,7 @@ const h = vi.hoisted(() => ({
 	getJolliUrl: vi.fn(),
 	browserLogin: vi.fn(),
 	validateJolliApiKey: vi.fn(),
+	resolveJolliUrlForKey: vi.fn(),
 	loadConfig: vi.fn(),
 	getSummaryCount: vi.fn(),
 	track: vi.fn(),
@@ -30,7 +31,10 @@ const h = vi.hoisted(() => ({
 
 vi.mock("../auth/AuthConfig.js", () => ({ loadAuthToken: h.loadAuthToken, getJolliUrl: h.getJolliUrl }));
 vi.mock("../auth/Login.js", () => ({ browserLogin: h.browserLogin }));
-vi.mock("../core/JolliApiUtils.js", () => ({ validateJolliApiKey: h.validateJolliApiKey }));
+vi.mock("../core/JolliApiUtils.js", () => ({
+	validateJolliApiKey: h.validateJolliApiKey,
+	resolveJolliUrlForKey: h.resolveJolliUrlForKey,
+}));
 vi.mock("../core/SessionTracker.js", () => ({
 	loadConfig: h.loadConfig,
 	saveConfigScoped: h.saveConfigScoped,
@@ -105,6 +109,7 @@ describe("GuidedFrontDoor", () => {
 		h.getJolliUrl.mockReturnValue("https://acme.jolli.ai");
 		h.browserLogin.mockResolvedValue(undefined);
 		h.validateJolliApiKey.mockReturnValue(undefined);
+		h.resolveJolliUrlForKey.mockReturnValue("https://acme.jolli.ai");
 		h.loadAuthToken.mockResolvedValue("oauth-token");
 		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai", jolliApiKey: "sk-jol-default" });
 		h.isGitHookInstalled.mockResolvedValue(true);
@@ -570,8 +575,10 @@ describe("GuidedFrontDoor", () => {
 		h.promptText.mockResolvedValueOnce("2").mockResolvedValueOnce("sk-jol-new");
 		await runGuidedFrontDoor();
 		expect(h.validateJolliApiKey).toHaveBeenCalledWith("sk-jol-new");
+		// `jolliUrl` rides along: requests route on the key's own tenant claim, but
+		// this command's own "✓ signed in · <site>" line reads the stored URL.
 		expect(h.saveConfigScoped).toHaveBeenCalledWith(
-			{ jolliApiKey: "sk-jol-new", aiProvider: "jolli" },
+			{ jolliApiKey: "sk-jol-new", aiProvider: "jolli", jolliUrl: "https://acme.jolli.ai" },
 			"/global/config",
 		);
 		expect(out()).toContain("Jolli key saved");

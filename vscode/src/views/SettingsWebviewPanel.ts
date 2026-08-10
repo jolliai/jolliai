@@ -21,6 +21,7 @@ import {
 } from "../../../cli/src/core/GitOps.js";
 import {
 	parseJolliApiKey,
+	resolveJolliUrlForKey,
 	validateJolliApiKey,
 } from "../../../cli/src/core/JolliApiUtils.js";
 import { resolveMemoryBankState } from "../../../cli/src/core/KBPathResolver.js";
@@ -763,6 +764,12 @@ export class SettingsWebviewPanel {
 				return;
 			}
 		}
+		// Tenant the saved key routes to, for the `jolliUrl` sync in `update` below.
+		// Resolved from the key the save actually persists, so re-saving an unchanged
+		// (masked) key also repairs a `jolliUrl` that drifted before this rule existed.
+		const keyTenantUrl = resolveJolliUrlForKey(
+			resolvedJolliApiKey.length > 0 ? resolvedJolliApiKey : undefined,
+		);
 
 		const excludePatterns = settings.excludePatterns
 			.split(",")
@@ -806,6 +813,12 @@ export class SettingsWebviewPanel {
 			localAgentTool: settings.localAgentTool ?? "claude-code",
 			jolliApiKey:
 				resolvedJolliApiKey.length > 0 ? resolvedJolliApiKey : undefined,
+			// The site the status surfaces report has to follow the key being saved
+			// (see `resolveJolliUrlForKey`). Spread rather than a plain field: a
+			// legacy key carries no tenant claim, and `saveConfigScoped` merges
+			// shallowly, so writing `undefined` there would DELETE a `jolliUrl` the
+			// user still needs instead of leaving it alone.
+			...(keyTenantUrl !== undefined ? { jolliUrl: keyTenantUrl } : {}),
 			claudeEnabled: settings.claudeEnabled,
 			codexEnabled: settings.codexEnabled,
 			geminiEnabled: settings.geminiEnabled,

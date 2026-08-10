@@ -7,7 +7,7 @@
 
 import { join } from "node:path";
 import type { Command } from "commander";
-import { validateJolliApiKey } from "../core/JolliApiUtils.js";
+import { resolveJolliUrlForKey, validateJolliApiKey } from "../core/JolliApiUtils.js";
 import { LOCAL_AGENT_TOOLS } from "../core/localagent/ToolMeta.js";
 import { getGlobalConfigDir, loadConfig, saveConfig } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
@@ -350,6 +350,8 @@ export function registerConfigureCommand(program: Command): void {
 			// Apply --set and --remove mutations
 			if (options.set.length > 0 || options.remove.length > 0) {
 				const update: Record<string, unknown> = {};
+				/** Tenant URL embedded in a newly-set `jolliApiKey`, for the `jolliUrl` sync below. */
+				let keyTenantUrl: string | undefined;
 
 				for (const entry of options.set) {
 					const eq = entry.indexOf("=");
@@ -384,6 +386,7 @@ export function registerConfigureCommand(program: Command): void {
 							process.exitCode = 1;
 							return;
 						}
+						keyTenantUrl = resolveJolliUrlForKey(update[key] as string);
 					}
 					// backupFolder is validated at SAVE time (the cutover gate's
 					// rule); the snapshot engine itself never re-routes a bad value.
@@ -421,6 +424,25 @@ export function registerConfigureCommand(program: Command): void {
 					delete update["slack.workspaceUrl"];
 					const existing = await loadConfig();
 					update.slack = { ...existing.slack, workspaceUrl };
+				}
+
+				// A pasted key retargets every request at its own tenant, so `jolliUrl`
+				// follows it — see `resolveJolliUrlForKey` for why leaving the two out
+				// of step is silent rather than merely untidy.
+				//
+				// No "an explicit --set jolliUrl wins" guard: `jolliUrl` is NOT in
+				// VALID_CONFIG_KEYS, so neither --set nor --remove can put it in
+				// `update` (both spellings are rejected as an unknown key before
+				// reaching here). Add it there and this needs one.
+				//
+				// The `typeof` check IS load-bearing, and must stay AFTER the --remove
+				// loop: `--set jolliApiKey=<B> --remove jolliApiKey` in one invocation
+				// leaves `keyTenantUrl` pointing at B while the remove has already
+				// reset the field to undefined. Writing the URL anyway would name a
+				// tenant the user never signed into, with no key to prove it — the
+				// half-state this sync exists to remove, rebuilt from the other side.
+				if (keyTenantUrl !== undefined && typeof update.jolliApiKey === "string") {
+					update.jolliUrl = keyTenantUrl;
 				}
 
 				await saveConfig(update as Partial<JolliMemoryConfig>);
