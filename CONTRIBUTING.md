@@ -11,7 +11,7 @@ Thank you for your interest in contributing to Jolli Memory! This document expla
 
 ## Development Setup
 
-This is an npm workspaces monorepo. The workspaces are the CLI (`cli/`) and the VS Code extension (`vscode/`); the repo also builds the Claude Code plugin (`claude-plugin/`, non-workspace, built by the root `build` chain) and contains the IntelliJ plugin (`intellij/`, a separate Gradle project that the root build/lint/test chain does not cover; launch its sandbox with `npm run intellij:sandbox`).
+This is an npm workspaces monorepo. The workspaces are the CLI (`cli/`) and the VS Code extension (`vscode/`); the repo also builds two plugins (`claude-plugin/` and `codex-plugin/`, non-workspace, both built by the root `build` chain) and contains the IntelliJ plugin (`intellij/`, a separate Gradle project that the root build/lint/test chain does not cover; launch its sandbox with `npm run intellij:sandbox`).
 
 ```bash
 # Clone your fork
