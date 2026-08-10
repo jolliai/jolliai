@@ -66,6 +66,11 @@ import {
 import type { Manifest, ManifestEntry } from "../../../cli/src/core/KBTypes.js";
 import { MetadataManager } from "../../../cli/src/core/MetadataManager.js";
 import { isManuallyDisabled } from "../../../cli/src/Logger.js";
+import {
+	DEFAULT_PULL_LOCK_WAIT_MS,
+	VaultWriteBusyError,
+	withVaultWriteLock,
+} from "../../../cli/src/sync/VaultWriteLock.js";
 import type { FolderFileKind, FolderNode } from "../views/SidebarMessages.js";
 
 /**
@@ -201,33 +206,53 @@ export class KbFoldersService {
 	 * a mis-classification is undoable. The orphan branch remains the system of
 	 * record regardless.
 	 *
-	 * @returns the list of folder paths that were archived (empty if none).
+	 * SYNCED VAULTS: `<kbParent>` is also the vault git working tree, so the
+	 * `renameSync` is simultaneously an unlocked working-tree mutation and an
+	 * implicit `git rm` of the folder's four git-tracked `.jolli/*.json` stubs.
+	 * Two consequences, both handled here rather than left implicit:
+	 *   1. It must not race a concurrent vault writer (QueueWorker mid-drain, a
+	 *      sync round that already snapshotted `git status`, a compile). So the
+	 *      whole sweep runs under `vault-write.lock` — the SAME lock keyed on the
+	 *      SAME canonical `<kbParent>` those writers take. Best-effort: if the
+	 *      vault is busy we skip and let the next Refresh retry, rather than
+	 *      block the click.
+	 *   2. The staged `git rm` propagates the empty folder's removal to peers.
+	 *      That is correct, not data loss: a synced vault has git-identical
+	 *      content on every peer, so a folder empty here is empty there too, and
+	 *      `resolveKBPath` re-claims (re-writing `config.json`) on the next write
+	 *      on whichever device the repo becomes active — the same self-heal that
+	 *      makes the local move safe. The only unpushed-peer-write edge is bounded
+	 *      by the lock plus `ConflictResolver`'s base-aware merge.
+	 *
+	 * @returns the list of folder paths that were archived (empty if none, or if
+	 * the vault was busy).
 	 */
 	async archiveUnusedFolders(): Promise<string[]> {
 		const ctx = this.getContext();
-		const repos = discoverRepos(
-			ctx.currentRepoName,
-			ctx.currentRemoteUrl,
-			ctx.kbParent,
-		);
-		const archived: string[] = [];
-		for (const repo of repos) {
-			// Two-part current-repo guard. `isCurrentRepo` is remote-first, so it
-			// misses a same-repo folder whose config holds a different transport
-			// or host alias for the current project's remote — exactly the shape
-			// that spawns an extra empty folder in the first place. Matching the
-			// name as well keeps every folder that could be the one this session
-			// is about to write into.
-			if (repo.isCurrentRepo) continue;
-			if (ctx.currentRepoName != null && repo.repoName === ctx.currentRepoName) {
-				continue;
+		const result = await withVaultWriteLock(ctx.kbParent, { wait: DEFAULT_PULL_LOCK_WAIT_MS }, async () => {
+			const repos = discoverRepos(ctx.currentRepoName, ctx.currentRemoteUrl, ctx.kbParent);
+			const archived: string[] = [];
+			for (const repo of repos) {
+				// Two-part current-repo guard. `isCurrentRepo` is remote-first, so it
+				// misses a same-repo folder whose config holds a different transport
+				// or host alias for the current project's remote — exactly the shape
+				// that spawns an extra empty folder in the first place. Matching the
+				// name as well keeps every folder that could be the one this session
+				// is about to write into.
+				if (repo.isCurrentRepo) continue;
+				if (ctx.currentRepoName != null && repo.repoName === ctx.currentRepoName) {
+					continue;
+				}
+				if (!isEmptyKbFolder(repo.kbRoot)) continue;
+				const dest = archiveKBFolder(repo.kbRoot, ctx.kbParent);
+				if (dest) archived.push(repo.kbRoot);
 			}
-			if (!isEmptyKbFolder(repo.kbRoot)) continue;
-			const dest = archiveKBFolder(repo.kbRoot, ctx.kbParent);
-			if (dest) archived.push(repo.kbRoot);
-		}
-		if (archived.length > 0) this.cleanRepos.clear();
-		return archived;
+			if (archived.length > 0) this.cleanRepos.clear();
+			return archived;
+		});
+		// Vault busy (a worker/sync/compile held the lock through the budget): skip
+		// this sweep silently — it is best-effort and the next Refresh retries.
+		return result.ran ? result.value : [];
 	}
 
 	/**
@@ -266,17 +291,29 @@ export class KbFoldersService {
 	 * Executes a plan from {@link planDuplicateConsolidation} — the folder merge
 	 * / rebuild + archive. Drops the "clean repo" memo afterwards so the next
 	 * listing re-reads the survivor. Returns what happened.
+	 *
+	 * Held under `vault-write.lock` for the same reason as the empty sweep: the
+	 * copy-if-absent + metadata union + `archiveKBFolder` all mutate the vault
+	 * working tree, and must serialise against QueueWorker / SyncEngine / compile
+	 * instead of racing their `git status` / staging windows. Throws
+	 * {@link VaultWriteBusyError} when the vault is busy so the caller can tell
+	 * the user "try again shortly" — unlike the best-effort sweep, a user asked
+	 * for this merge, so a silent skip would look like it did nothing.
 	 */
 	async runConsolidation(plan: ConsolidationPlan): Promise<ConsolidationResult> {
 		const ctx = this.getContext();
-		const result = await executeConsolidation(
-			plan,
-			ctx.currentProjectRoot ?? ctx.kbParent,
-			ctx.currentRemoteUrl,
-			ctx.kbParent,
-		);
-		this.cleanRepos.clear();
-		return result;
+		const result = await withVaultWriteLock(ctx.kbParent, { wait: DEFAULT_PULL_LOCK_WAIT_MS }, async () => {
+			const r = await executeConsolidation(
+				plan,
+				ctx.currentProjectRoot ?? ctx.kbParent,
+				ctx.currentRemoteUrl,
+				ctx.kbParent,
+			);
+			this.cleanRepos.clear();
+			return r;
+		});
+		if (!result.ran) throw new VaultWriteBusyError();
+		return result.value;
 	}
 
 	/**

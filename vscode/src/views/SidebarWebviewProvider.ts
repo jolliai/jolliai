@@ -16,6 +16,7 @@ import type {
 	ConsolidationResult,
 } from "../../../cli/src/core/FolderConsolidation.js";
 import type { DetectedAgent } from "../../../cli/src/core/localagent/DetectAgents.js";
+import { VaultWriteBusyError } from "../../../cli/src/sync/VaultWriteLock.js";
 import type { PinEntry, PinKind } from "../../../cli/src/core/PinStore.js";
 import { resolveSessionTitle } from "../../../cli/src/core/SessionTitleResolver.js";
 import { getTranscriptIds } from "../../../cli/src/core/SummaryTree.js";
@@ -2006,6 +2007,28 @@ export class SidebarWebviewProvider
 		}
 		await this.consolidateDuplicateKbFolders();
 		await this.handleExpandFolder("");
+		// The sweep / consolidation may have archived repos, so refresh the
+		// breadcrumb's repo + branch dropdowns too — otherwise they keep offering
+		// an archived repo, and picking it hits `if (!target) return` and silently
+		// does nothing until a window reload. Same re-push refreshKnowledgeBaseFolders
+		// uses for external writes.
+		this.pushBreadcrumbSelection();
+	}
+
+	/**
+	 * Re-pushes the breadcrumb's `selection:repos` and the active repo's
+	 * `selection:branches`. These messages are otherwise only sent at init /
+	 * repo-switch time, so any path that changes the set of repos or branches on
+	 * disk (external write, sync, a folder sweep / consolidation) must call this
+	 * or the dropdowns go stale until a window reload. `listRepos` / `listBranches`
+	 * read fresh from disk on every call.
+	 */
+	private pushBreadcrumbSelection(): void {
+		if (!this.deps.selection) return;
+		this.pushRepos();
+		const repos = this.deps.selection.listRepos();
+		const current = repos.find((r) => r.isCurrent) ?? repos[0];
+		if (current) this.pushBranches(current.repoName);
 	}
 
 	/**
@@ -2052,6 +2075,15 @@ export class SidebarWebviewProvider
 					}
 				});
 		} catch (err) {
+			// The vault was busy (a summary was being written / synced) for the whole
+			// lock budget. The user asked for this merge, so say so and let them retry
+			// — a silent swallow would look like Refresh did nothing.
+			if (err instanceof VaultWriteBusyError) {
+				void vscode.window.showInformationMessage(
+					"Jolli Memory is busy writing a summary right now — click Refresh again shortly to merge the duplicate folders.",
+				);
+				return;
+			}
 			log.warn(
 				"SidebarWebviewProvider",
 				`consolidateDuplicateKbFolders failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -2080,21 +2112,12 @@ export class SidebarWebviewProvider
 		this.deps.kbFolders?.notifyDirty?.();
 		this.postMessage({ type: "kb:foldersReset" });
 		void this.handleExpandFolder("");
-		// Also re-push the breadcrumb's repo list AND the active repo's
-		// branches: those use the `selection:*` messages which are
-		// otherwise only sent at init / repo-switch time. Pre-fix, a sync
-		// round (or any external write that added a new branch directory)
-		// would leave the breadcrumb's branch dropdown frozen on the
-		// pre-sync set until the user manually switched repos. `listRepos`
-		// and `listBranches` both read fresh from disk on every call, so
-		// this re-push immediately reflects whatever the latest
-		// `branches.json` says.
-		if (this.deps.selection) {
-			this.pushRepos();
-			const repos = this.deps.selection.listRepos();
-			const current = repos.find((r) => r.isCurrent) ?? repos[0];
-			if (current) this.pushBranches(current.repoName);
-		}
+		// Re-push the breadcrumb dropdowns: the `selection:*` messages are
+		// otherwise only sent at init / repo-switch time, so a sync round (or any
+		// external write that added a branch directory) would leave the branch
+		// dropdown frozen on the pre-sync set until the user manually switched
+		// repos.
+		this.pushBreadcrumbSelection();
 	}
 
 	/**

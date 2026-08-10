@@ -9,6 +9,7 @@ import type {
 } from "./SidebarMessages";
 import { setManuallyDisabled } from "../../../cli/src/Logger.js";
 import type { ConsolidationPlan } from "../../../cli/src/core/FolderConsolidation.js";
+import { VaultWriteBusyError } from "../../../cli/src/sync/VaultWriteLock";
 import { describeConsolidationPlan, SidebarWebviewProvider } from "./SidebarWebviewProvider";
 
 interface MockWebview {
@@ -2157,6 +2158,47 @@ describe("SidebarWebviewProvider", () => {
 				"rebuilt from it",
 			);
 			expect(describeConsolidationPlan(makePlan({ kind: "union-largest" }))).toContain("will absorb 1 more");
+		});
+
+		it("shows a 'busy — try again' toast when the vault lock is contended", async () => {
+			const { view, runConsolidation } = makeConsolidationProvider(makePlan());
+			runConsolidation.mockRejectedValueOnce(new VaultWriteBusyError());
+			showWarningMessage.mockResolvedValueOnce("Merge");
+			view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+			await new Promise((r) => setTimeout(r, 0));
+			await new Promise((r) => setTimeout(r, 0));
+			expect(runConsolidation).toHaveBeenCalledTimes(1);
+			expect(showInformationMessage).toHaveBeenCalledTimes(1);
+			expect(showInformationMessage.mock.calls[0][0]).toContain("busy writing a summary");
+		});
+
+		it("re-pushes the breadcrumb repo list after a kb refresh (archived repos leave the dropdown)", async () => {
+			const view = makeMockView();
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn().mockResolvedValue(undefined),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "folders",
+					branchName: "main",
+					detached: false,
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				kbFolders: { listChildren: vi.fn().mockResolvedValue([]) },
+				selection: {
+					listRepos: vi.fn(() => [{ repoName: "app", remoteUrl: null, isCurrent: true }]),
+					listBranches: vi.fn(() => ["main"]),
+				},
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+			await new Promise((r) => setTimeout(r, 0));
+			await new Promise((r) => setTimeout(r, 0));
+			const posted = view.webview.postMessage.mock.calls.map((c) => (c[0] as { type: string }).type);
+			expect(posted).toContain("selection:repos");
+			expect(posted).toContain("selection:branches");
 		});
 	});
 

@@ -165,6 +165,14 @@ export async function classifyDuplicateFolders(
 /**
  * Executes a plan produced by {@link classifyDuplicateFolders}. Returns a
  * summary of what happened.
+ *
+ * MUST be called while holding `vault-write.lock` for the vault
+ * (`resolveKbParent(customPath)`): the copy-if-absent, metadata union and
+ * `archiveKBFolder` all mutate the vault working tree, so an unlocked run can
+ * race QueueWorker / SyncEngine / compile (a torn `git status`, or a sync
+ * `git add` on a path this just moved). The only caller today,
+ * `KbFoldersService.runConsolidation`, wraps it in `withVaultWriteLock`; any
+ * new caller must do the same.
  */
 export async function executeConsolidation(
 	plan: ConsolidationPlan,

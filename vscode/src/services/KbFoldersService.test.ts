@@ -15,7 +15,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __setSotResolverForTests } from "../../../cli/src/core/FolderConsolidation";
 import { MetadataManager } from "../../../cli/src/core/MetadataManager";
 import type { StorageProvider } from "../../../cli/src/core/StorageProvider";
+import { VaultWriteBusyError, withVaultWriteLock } from "../../../cli/src/sync/VaultWriteLock";
 import { KbFoldersService, parseMdTitle } from "./KbFoldersService";
+
+// The service now takes vault-write.lock around every vault mutation. Mock it to
+// a pass-through (no real lock file) so the archive / consolidation tests stay
+// hermetic; individual tests override it to simulate a busy vault.
+vi.mock("../../../cli/src/sync/VaultWriteLock.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../../../cli/src/sync/VaultWriteLock.js")>();
+	return {
+		...actual,
+		withVaultWriteLock: vi.fn(async (_root: string, _mode: unknown, body: () => Promise<unknown>) => ({
+			ran: true,
+			value: await body(),
+		})),
+	};
+});
 
 // Windows ignores chmod for unprivileged file accesses, so a `chmod 0o000`
 // based "unreadable file" test ends up reading the file just fine and the
@@ -2195,5 +2210,32 @@ describe("KbFoldersService — duplicate consolidation", () => {
 		expect(result.summariesAfter).toBe(4);
 		expect(existsSync(join(tmpParent, "app-2"))).toBe(false);
 		expect(existsSync(join(tmpParent, "app", ".jolli", "summaries", "z9.json"))).toBe(true);
+	});
+
+	it("runConsolidation throws VaultWriteBusyError when the vault lock is busy", async () => {
+		makeRepo("app", ["a1", "a2", "a3"]);
+		makeRepo("app-2", ["a1", "z9"]);
+		const service = svc("app", "/cwd");
+		const plan = await service.planDuplicateConsolidation();
+		if (!plan) throw new Error("expected a consolidation plan");
+		vi.mocked(withVaultWriteLock).mockResolvedValueOnce({ ran: false });
+
+		await expect(service.runConsolidation(plan)).rejects.toBeInstanceOf(VaultWriteBusyError);
+		// Nothing was moved — the loser folder survives for the next attempt.
+		expect(existsSync(join(tmpParent, "app-2"))).toBe(true);
+	});
+
+	it("archiveUnusedFolders returns [] and archives nothing when the vault lock is busy", async () => {
+		makeRepo("app", ["a1"]); // current repo, never swept
+		// An empty foreign folder that WOULD be swept if the lock were free.
+		mkdirSync(join(tmpParent, "junk", ".jolli"), { recursive: true });
+		writeFileSync(
+			join(tmpParent, "junk", ".jolli", "config.json"),
+			JSON.stringify({ version: 1, sortOrder: "date", remoteUrl: "https://github.com/x/junk.git", repoName: "junk" }),
+		);
+		vi.mocked(withVaultWriteLock).mockResolvedValueOnce({ ran: false });
+
+		expect(await svc("app", "/cwd").archiveUnusedFolders()).toEqual([]);
+		expect(existsSync(join(tmpParent, "junk"))).toBe(true);
 	});
 });
