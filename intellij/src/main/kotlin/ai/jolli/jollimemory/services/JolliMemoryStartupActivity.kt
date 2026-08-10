@@ -68,15 +68,15 @@ class JolliMemoryStartupActivity : ProjectActivity {
                 val details = rejected.joinToString("; ") { r ->
                     "${escapeHtml(r.version)} at ${escapeHtml(r.path)}"
                 }
-                "Node.js is installed but too old (need v18 or newer): $details. " +
-                    "Jolli Memory is blocked."
+                "Node.js is installed but too old (need v${NodeRuntime.MIN_SUPPORTED_DISPLAY} or newer): " +
+                    "$details. Jolli Memory is blocked."
             }
             NotificationGroupManager.getInstance()
                 .getNotificationGroup("JolliMemory")
                 .createNotification(
                     "Jolli Memory requires Node.js",
-                    "$leading Install Node.js 18 or newer (LTS recommended) and click " +
-                        "<b>Retry detection</b> in the Jolli Memory tool window — or point it at " +
+                    "$leading Install Node.js ${NodeRuntime.MIN_SUPPORTED_DISPLAY} or newer (LTS recommended) " +
+                        "and click <b>Retry detection</b> in the Jolli Memory tool window — or point it at " +
                         "an existing binary there with <b>Choose manually</b>.",
                     NotificationType.ERROR,
                 )

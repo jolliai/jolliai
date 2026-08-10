@@ -110,8 +110,13 @@ object CliIntegrations {
         // Null like Ok: the repo is disabled on purpose, so there is nothing to warn
         // about. The caller decides what to do with the state; it is not an error.
         is Result.RefusedManuallyDisabled -> null
+		// The version comes off the detector's own floor, never a literal: this result is
+		// produced by `resolveNode()` -> `NodeRuntime.detect()`, so a hand-typed number
+		// here can name a version the detector already accepts (or already rejects) and
+		// send the user hunting for an install they have.
 		is Result.NodeMissing ->
-			"Node.js 22.5 or newer was not found — CLI-backed memory, MCP, /jolli-recall and /jolli-search are unavailable. " +
+			"Node.js ${NodeRuntime.MIN_SUPPORTED_DISPLAY} or newer was not found — " +
+				"CLI-backed memory, MCP, /jolli-recall and /jolli-search are unavailable. " +
 				"Install Node.js and reopen the project."
         is Result.BundleMissing ->
             "MCP and skills could not be set up — the bundled CLI was not found in the plugin. " +

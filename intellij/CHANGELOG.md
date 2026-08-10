@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.99.11
+
+### New Features
+
+- **Four more AI agents reach the sidebar** — **Kimi Code**, **Devin CLI**, **Cline** (the standalone CLI and the VS Code extension) and **Antigravity** each get a row in the Status panel, a switch under **Settings → AI Agents**, and their own badge in Active Conversations, and their conversations are folded into your memories automatically. Kimi Code (`~/.kimi-code`) is new to Jolli entirely — references and skill usage are extracted from its sessions like any other source; the other three were already supported by the CLI and the VS Code extension and now work here too.
+- **See which skills your agent used** — a **Skills used** row now appears in the CONTEXT list and on every committed memory. Click it to open a rendered table of each captured skill with its invocation count and first/last use. In the Working Memory review the whole row can be left out of the next memory — or added back — in one click.
+- **Redesigned CONTEXT panel** — one **+** button whose dropdown carries **Add Plan**, **Add Markdown Note** and **Add Text Snippet**, replacing the previous two-button toolbar. Every row now has hover actions (pin, edit, remove, and a **leave out of this memory** / **add back** toggle), clicking a row opens a read-only rendered Markdown preview, and ✎ opens the underlying file for editing. Right-click adds **Preview**, **Open in Browser** for references, and **Remove**.
+- **Plans show up mid-session** — a plan written by Claude Code now appears in CONTEXT the moment the file is created, instead of only at the end of the agent's turn.
+- **Turn Jolli off for a repository** — the tool window's status overlay gains **Disable**, which turns Jolli Memory off for the whole repository (every worktree) and replaces the sidebar with a **Get started** card and an **Enable** button. The choice survives IDE restarts and plugin upgrades, and is shared with the CLI and VS Code.
+- **A status overlay in the tool window header** — **Sign In / Sign Out**, **Disable** and **Close** now live in one overlay, with a pulse glyph reporting health at a glance, and the STATUS list itself gains a **Jolli Account** row plus a one-click **Sync Now** that pushes committed memories to your Jolli Space. Together they replace the old Cloud Sync popup.
+- **AI Agent toggles now install and remove hooks** — saving **Settings → AI Agents** installs or removes the Claude Stop and Gemini AfterAgent hooks across every worktree, and a per-worktree failure is reported as a notification naming the integration instead of being invisible. A switched-off agent is no longer scanned at all, and the conversation list refreshes as soon as you save rather than on the next 60 s tick.
+- **Local agent availability is checked before you save** — picking a tool under **Settings → AI Summary** now probes whether it can actually run on this machine, showing **Checking…** and then a clear "*not found on this machine*" line; a confirmed-unavailable pick can't be saved.
+- **Remove a plan from a committed memory** — the memory detail view can now dissociate a plan it had archived, which also deletes that plan's generated Markdown from the Memory Bank folder instead of leaving an orphan file behind. (Associating one was already possible.)
+
+### Changes
+
+- **Node 22.13 or newer is now required** (previously 18). The bundled CLI reads AI conversation databases through Node's built-in SQLite, which throws on older runtimes — so a Node below 22.13 is now reported as unusable instead of being picked and failing later. Upgrade Node, or point the plugin at a newer install from the Status panel.
+- **Preferences → Tools → Jolli Memory is now just an entry point** — it keeps the plugin findable from Search Everywhere and opens the real settings dialog; the duplicate settings form it used to carry is gone. One field was dropped rather than moved: `slack.workspaceUrl` is now set only with `jolli configure --set slack.workspaceUrl=<origin>`, and an already-configured value keeps working and is never overwritten.
+- **Resume in terminal and the eye icon are gone from conversation rows** — Active Conversations and Pinned rows now carry Pin plus the selection toggle only, matching VS Code. Resume only ever worked for Claude sessions.
+- **Squash memories keep your working-area context** — plans, notes and references you activated during a session are now archived onto the memory produced by `git merge --squash` and by `rebase -i` squash/fixup, instead of being left behind in the working area.
+
+### Fixes & Improvements
+
+- **Pinned badges show the right color and letter** — a pinned Notion reference no longer paints note-green and a Slack one no longer paints snippet-amber; GitHub, Confluence, Asana, monday.com, Zoom and context7 no longer all fall through to gray; and pins written by earlier versions (`GH`, `No`, or a raw source name) are re-derived instead of keeping a stale letter.
+- **Every Node.js prompt quotes the version actually needed** — the blocking "Node.js is required" panel, its startup notification and the MCP/skills setup warning each named an older floor (18, or 22.5) than the 22.13 the plugin enforces, so a machine running Node 20 was refused while being told the install it already had was new enough. The Marketplace listing and README said 18 too.
+- **A just-committed memory no longer stays empty** — expanding the new row before its summary finished generating used to leave that memory's CONTEXT (skills, plans, notes) blank for the rest of the session.
+- **Editing a conversation keeps its token record** — saving an edit in the memory detail view no longer strips token usage and tool records from the commit's other, untouched sessions.
+- **A background hiccup no longer inverts your selection** — when the exclude set can't be read, the panels reuse the last set actually read instead of rendering everything as included, and a failed CONTEXT refresh keeps the rows already on screen.
+- **Editing a note's source file reorders CONTEXT on Windows** — a path-separator mismatch meant the list silently stopped reordering.
+- **Toolbar buttons work while the project is indexing** — every panel action is now dumb-aware and toolbars re-evaluate on status change, so buttons no longer stay greyed out on a freshly opened project.
+- **Local agent runs are cheaper and safer** — each local agent CLI now runs isolated from your own MCP servers, plugins and skills (measured at roughly 48x fewer prompt tokens for Claude Code), and a run that produces no answer now fails loudly instead of writing an empty summary over a good one.
+- **Memory data is read through one path** — the plugin no longer reads the Memory Bank's hidden JSON layer itself, so what the panels show always matches what the CLI wrote.
+
+### Performance
+
+- **Fewer round trips when loading memories** — listing memories and reading a commit's conversations now cost one batched read instead of one call per file.
+- **Faster settings saves and enable/disable** — saving settings no longer spawns a cold `node` process unless global instructions actually changed, and enable/disable runs over the long-lived bridge instead of a fresh subprocess.
+
 ## 0.99.10
 
 ### New Features

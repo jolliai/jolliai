@@ -137,6 +137,17 @@ object NodeRuntime {
     internal const val MIN_SUPPORTED_MAJOR = 22
     internal const val MIN_SUPPORTED_MINOR = 13
 
+    /**
+     * The floor as the UI spells it ("22.13").
+     *
+     * Derived rather than typed out again: every "Node.js X or newer" line the user
+     * can read is built from this, so raising the floor cannot leave a dialog quoting
+     * the old number. It shipped exactly that way once — the floor moved 18 -> 22.13
+     * while six strings kept telling the user 18 was enough, which on a machine
+     * running Node 20 reads as the plugin contradicting itself.
+     */
+    internal const val MIN_SUPPORTED_DISPLAY = "$MIN_SUPPORTED_MAJOR.$MIN_SUPPORTED_MINOR"
+
     private const val PATH_MARK_START = "__JOLLI_PATH_START__"
     private const val PATH_MARK_END = "__JOLLI_PATH_END__"
     private const val SHELL_PROBE_TIMEOUT_SECONDS = 5L

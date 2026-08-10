@@ -17,7 +17,7 @@ Then open the **Jolli Memory** tool window from the right sidebar and follow the
 ### Requirements
 
 - **A JetBrains IDE on 2025.1 or newer** (build 251 through 262.\*). Works in any IDE on the platform, not just IDEA: the plugin depends only on the core platform and Git4Idea.
-- **Node.js 18 or newer on your `PATH`.** The plugin drives the bundled Jolli CLI for storage, MCP registration, and the `jolli-recall` / `jolli-search` skills. Without it the tool window still loads, but those features are unavailable and the plugin says so. **Node 22.5+ is recommended**: five sources (OpenCode, Cursor Composer, GitHub Copilot, Devin, and Antigravity) discover sessions through `node:sqlite`, which first ships in 22.5; below that those five are skipped and the rest keep working.
+- **Node.js 22.13 or newer on your `PATH`.** The plugin drives the bundled Jolli CLI for storage, MCP registration, and the `jolli-recall` / `jolli-search` skills. 22.13 is the release where Node's built-in `node:sqlite` loads without an extra startup flag — the CLI reads AI session databases (OpenCode, Cursor Composer, GitHub Copilot, Devin, Antigravity) through it, and the git hooks the plugin installs deliberately pass no flags. Below that floor there is no degraded mode: the tool window shows the versions it found and stays blocked until a newer Node is available.
 - **An Anthropic API key, a Jolli account, or a locally-installed agent CLI** for summary generation. The Local Agent provider drives that CLI on its own subscription login, so it needs no key. With none of the three, hooks still record session metadata but no summary is written.
 - **GitHub CLI (`gh`)** only for **Create & Update PR**.
 

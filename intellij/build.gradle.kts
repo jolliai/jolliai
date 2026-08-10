@@ -17,7 +17,7 @@ plugins {
 }
 
 group = "ai.jolli"
-version = "0.99.10"
+version = "0.99.11"
 
 repositories {
     mavenCentral()
@@ -101,11 +101,12 @@ intellijPlatform {
                 copy you can read, search, or feed to any other tool.
             </p>
             <p>
-                <b>Requires Node.js 18+</b> on your PATH, which the plugin uses to drive its bundled
-                Jolli CLI. Node 22.5+ is recommended: OpenCode, Devin, Antigravity,
-                Cursor's Composer IDE and the Copilot CLI discover sessions through
-                <code>node:sqlite</code>, which first ships in 22.5, and are skipped below it. The
-                cursor-agent CLI, Copilot Chat and Cline read plain files and are unaffected.
+                <b>Requires Node.js 22.13+</b> on your PATH, which the plugin uses to drive its
+                bundled Jolli CLI. That is the release where Node's built-in
+                <code>node:sqlite</code> loads without an extra startup flag &mdash; the CLI reads
+                AI session databases through it, and the git hooks the plugin installs deliberately
+                pass no flags. Below that floor the tool window reports the versions it found and
+                stays blocked until a newer Node is available.
             </p>
 
             <h3>Key Features</h3>

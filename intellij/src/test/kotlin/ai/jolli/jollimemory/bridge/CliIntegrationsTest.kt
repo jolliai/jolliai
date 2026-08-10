@@ -137,6 +137,17 @@ class CliIntegrationsTest {
     }
 
     @Test
+    fun `warningFor NodeMissing quotes the detector's current floor, not a literal`() {
+        // This result is produced by `resolveNode()` -> `NodeRuntime.detect()`, so the
+        // warning has to name the same floor that rejected the runtime. Asserting the
+        // constant (rather than a "Node.js" substring) is what catches a hard-coded
+        // version: the message sat at 22.5 for a whole release after the floor moved to
+        // 22.13, and the three substrings above stayed green the entire time.
+        CliIntegrations.warningFor(CliIntegrations.Result.NodeMissing)!! shouldContain
+            NodeRuntime.MIN_SUPPORTED_DISPLAY
+    }
+
+    @Test
     fun `warningFor BundleMissing is surfaced (not silent)`() {
         val msg = CliIntegrations.warningFor(CliIntegrations.Result.BundleMissing)
         msg shouldNotBe null

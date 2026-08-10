@@ -106,6 +106,9 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
      * completes the startup sequence the gate skipped.
      */
     private fun showNodeMissingContent(project: Project, toolWindow: ToolWindow) {
+        // Every version this panel quotes comes from the detector's own floor — see
+        // NodeRuntime.MIN_SUPPORTED_DISPLAY for why it is never typed out by hand.
+        val minNode = ai.jolli.jollimemory.bridge.NodeRuntime.MIN_SUPPORTED_DISPLAY
         val statusLabel = JBLabel("Checking for Node.js...")
         val retryButton = javax.swing.JButton("Retry detection").apply { isEnabled = false }
         val chooseButton = javax.swing.JButton("Choose manually...").apply { isEnabled = false }
@@ -118,7 +121,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                 "<html>" +
                     "<b>Node.js is required</b><br/><br/>" +
                     "Jolli Memory needs a Node.js runtime and is blocked until one is found.<br/>" +
-                    "Install Node.js 18 or newer (LTS recommended), then click <b>Retry detection</b> — " +
+                    "Install Node.js $minNode or newer (LTS recommended), then click <b>Retry detection</b> — " +
                     "or point Jolli Memory at an existing binary with <b>Choose manually</b>." +
                     "</html>",
             ).apply { alignmentX = Component.LEFT_ALIGNMENT })
@@ -169,12 +172,12 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                 // of a bare "not found" which reads as a bug on a machine that clearly has Node.
                 val rejected = ai.jolli.jollimemory.bridge.NodeRuntime.rejectedFromLastDetection()
                 val msg = if (rejected.isEmpty()) {
-                    "No usable Node.js (18 or newer) was found on this machine."
+                    "No usable Node.js ($minNode or newer) was found on this machine."
                 } else {
                     val items = rejected.joinToString("<br/>") { r ->
                         "• <b>${escapeHtml(r.version)}</b> at ${escapeHtml(r.path)} — too old"
                     }
-                    "<html>Node.js is installed but too old (need v18 or newer):<br/>$items</html>"
+                    "<html>Node.js is installed but too old (need v$minNode or newer):<br/>$items</html>"
                 }
                 SwingUtilities.invokeLater { setIdle(msg) }
             }
@@ -217,7 +220,7 @@ class JolliMemoryToolWindowFactory : ToolWindowFactory, DumbAware {
                     } else {
                         val message = when (result) {
                             is ai.jolli.jollimemory.bridge.NodeRuntime.ManualSelectionResult.TooOld ->
-                                "That Node.js is ${result.version} — version 18 or newer is required."
+                                "That Node.js is ${result.version} — version $minNode or newer is required."
                             is ai.jolli.jollimemory.bridge.NodeRuntime.ManualSelectionResult.NotNode ->
                                 "The selected file did not answer node --version — pick the actual Node.js binary."
                             else ->
