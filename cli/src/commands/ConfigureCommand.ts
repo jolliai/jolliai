@@ -227,18 +227,18 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 	{
 		key: "openCodeEnabled",
 		type: "boolean",
-		description: "Enable OpenCode session discovery (true/false; requires Node 22.5+ at runtime)",
+		description: "Enable OpenCode session discovery (true/false; requires Node 22.13+ at runtime)",
 	},
 	{
 		key: "cursorEnabled",
 		type: "boolean",
 		description:
-			"Enable Cursor session discovery — Composer IDE + cursor-agent CLI (true/false; requires Node 22.5+ at runtime)",
+			"Enable Cursor session discovery — Composer IDE + cursor-agent CLI (true/false; requires Node 22.13+ at runtime)",
 	},
 	{
 		key: "copilotEnabled",
 		type: "boolean",
-		description: "Enable Copilot CLI session discovery (true/false; requires Node 22.5+ at runtime)",
+		description: "Enable Copilot CLI session discovery (true/false; requires Node 22.13+ at runtime)",
 	},
 	{
 		key: "clineEnabled",
@@ -248,12 +248,12 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 	{
 		key: "devinEnabled",
 		type: "boolean",
-		description: "Enable Devin CLI session discovery (true/false; requires Node 22.5+ at runtime)",
+		description: "Enable Devin CLI session discovery (true/false; requires Node 22.13+ at runtime)",
 	},
 	{
 		key: "antigravityEnabled",
 		type: "boolean",
-		description: "Enable Antigravity session discovery (true/false; requires Node 22.5+ at runtime)",
+		description: "Enable Antigravity session discovery (true/false; requires Node 22.13+ at runtime)",
 	},
 	{
 		key: "kimiEnabled",

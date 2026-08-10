@@ -1,6 +1,16 @@
 # Changelog
 
-<!-- Last synced commit: 89a5cb46 | 2026-07-31 -->
+<!-- Last synced commit: f1195846 | 2026-08-09 -->
+
+## 0.99.11
+
+- **Breaking: requires Node 22.13+** — the CLI now requires Node 22.13 or newer (previously Node 22.5+). `node:sqlite` first ships in 22.5, but until 22.13 it only loads with `--experimental-sqlite`, and two surfaces cannot pass a Node flag at all: the VS Code extension host, and the git hooks, which run `node <Hook>.js` deliberately flag-free. Node 22.5–22.12 users should upgrade before running `npm install -g @jolli.ai/cli`; the `engines` field will refuse installation on older runtimes.
+- **Kimi Code conversations become memories** — sessions from **Kimi Code CLI** (Moonshot's `@kimi-code/cli`) are now discovered automatically and folded into your memories, complete with references and skill usage — no hook to install. MCP registration also covers Kimi Code now, making eleven hosts in total.
+- **Skills are shared alongside the memory** — when you push a memory or a branch to a Jolli Space, the skills used by the change go along as separate articles, next to plans, notes, and references.
+- **Squash memories keep the working context** — plans, notes, and references you activated during a session are now archived into squash and merge memories instead of being abandoned in the working area.
+- **A local dashboard in your browser** — `jolli dashboard` starts a private web server on your machine and opens a dashboard with your memories, per-repo stats, and a standup summary — everything served locally and never uploaded. Reopen it any time with the same command and stop it with `jolli dashboard --stop`.
+- **Your memories can move to a local database** — with `jolli cutover` a repository's storage switches from the git branch to a local SQLite database, the new source of truth. This is a one-way switch: it freezes the repo's git branch, and `jolli enable` will not unfreeze it. Run `jolli cutover --status` first to see where the current repo stands, and `jolli cutover --probe` afterwards to check the frozen branch for drift.
+- Bug fixes.
 
 ## 0.99.10
 

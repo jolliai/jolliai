@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 // Partial mock: everything in SqliteHelpers stays real, but `hasNodeSqliteSupport`
-// becomes overridable so the Node-<22.5 arm of `isAntigravityInstalled` can be
-// exercised on this (22.5+) test runtime.
+// becomes overridable so the Node-<22.13 arm of `isAntigravityInstalled` can be
+// exercised on this (22.13+) test runtime.
 vi.mock("./SqliteHelpers.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./SqliteHelpers.js")>();
 	return { ...actual, hasNodeSqliteSupport: vi.fn(actual.hasNodeSqliteSupport) };
@@ -45,7 +45,7 @@ describe("AntigravityDetector", () => {
 		const conv = join(home, ".gemini", "antigravity", "conversations");
 		mkdirSync(conv, { recursive: true });
 		writeFileSync(join(conv, "abc.db"), "");
-		// On the CLI's Node 22.5+ test runtime this is true; guard keeps the test
+		// On the CLI's Node 22.13+ test runtime this is true; guard keeps the test
 		// meaningful if ever run on an older runtime.
 		expect(await isAntigravityInstalled(home)).toBe(hasNodeSqliteSupport());
 	});
@@ -57,7 +57,7 @@ describe("AntigravityDetector", () => {
 		writeFileSync(join(conv, "abc.db"), "");
 		// Presence is a pure filesystem check — used for MCP registration, which
 		// never reads the DB — so it is true even where isAntigravityInstalled
-		// (SQLite-gated) would be false on a Node-18 VS Code host.
+		// (SQLite-gated) would be false on a host below the Node floor.
 		expect(await isAntigravityPresent(home)).toBe(true);
 	});
 
@@ -79,7 +79,7 @@ describe("AntigravityDetector", () => {
 		expect(await isAntigravityInstalled(home)).toBe(false);
 	});
 
-	// A Node-18 VS Code extension host cannot load node:sqlite, so it must report
+	// A host below the Node floor cannot load node:sqlite, so it must report
 	// "not installed" (nothing readable to show in the status tree / discovery)
 	// even with conversation dbs sitting right there on disk.
 	it("isAntigravityInstalled is false on a runtime without node:sqlite, even with a db present", async () => {

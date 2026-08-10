@@ -103,8 +103,8 @@ export function getDevinSessionsDbPath(home?: string): string {
 
 /**
  * Devin is "installed" when its session DB exists AND the runtime can read
- * SQLite. Gated on hasNodeSqliteSupport() so Node 18 VS Code hosts report
- * "not installed" rather than "detected but 0 sessions".
+ * SQLite. Gated on hasNodeSqliteSupport() so a runtime below the Node floor
+ * reports "not installed" rather than "detected but 0 sessions".
  *
  * Deliberately keyed on the DB rather than the looser {@link isDevinPresent}:
  * this drives session discovery and the status tree, where a host with no
@@ -113,7 +113,7 @@ export function getDevinSessionsDbPath(home?: string): string {
 export async function isDevinInstalled(): Promise<boolean> {
 	if (!hasNodeSqliteSupport()) {
 		log.info(
-			"Devin support disabled: this runtime is Node %s, requires 22.5+ for built-in SQLite",
+			"Devin support disabled: this runtime is Node %s, requires 22.13+ for built-in SQLite",
 			process.versions.node,
 		);
 		return false;
@@ -134,9 +134,9 @@ async function hasDevinSessionDb(): Promise<boolean> {
  * Pure filesystem presence check for MCP registration: is Devin on this machine
  * at all, regardless of whether THIS runtime can read its DB? Unlike
  * `isDevinInstalled`, this does NOT gate on `hasNodeSqliteSupport()` — MCP
- * registration only writes a config file, so it must work on Node-18 VS Code
- * hosts where the SQLite gate would otherwise suppress a host the user
- * genuinely has installed.
+ * registration only writes a config file, so it must work on a VS Code host
+ * below the Node floor, where the SQLite gate would otherwise suppress a host
+ * the user genuinely has installed.
  *
  * Accepts the CLI's data DIRECTORY, not just `sessions.db`, because MCP is
  * registered only on an explicit `jolli enable` (the SessionStart / plugin
@@ -171,11 +171,11 @@ export async function scanDevinSessions(projectDir: string): Promise<DevinScanRe
  * at a fixture DB; production callers use `scanDevinSessions`.
  */
 export async function scanDevinSessionsAt(dbPath: string, projectDir: string): Promise<DevinScanResult> {
-	// Node 18 hosts (the VS Code extension bundle) lack `node:sqlite`. Return a
-	// silent empty result — "not supported" is not a scan failure, so callers
-	// must not surface a partial-data / failed-source indicator for it.
+	// A runtime below the Node floor cannot load `node:sqlite`. Return a silent
+	// empty result — "not supported" is not a scan failure, so callers must not
+	// surface a partial-data / failed-source indicator.
 	if (!hasNodeSqliteSupport()) {
-		log.debug("Devin scan skipped: runtime Node %s lacks node:sqlite (requires 22.5+)", process.versions.node);
+		log.debug("Devin scan skipped: runtime Node %s lacks node:sqlite (requires 22.13+)", process.versions.node);
 		return { sessions: [] };
 	}
 

@@ -159,11 +159,12 @@ async function resolveWorktreeRoots(projectDir: string): Promise<ReadonlySet<str
 
 /** Discovers Antigravity conversations relevant to the given project directory. */
 export async function scanAntigravitySessions(projectDir: string, home?: string): Promise<AntigravityScanResult> {
-	// Node < 22.5 lacks node:sqlite. Gate up front (like the detector) so the
-	// aggregator's 60s tick on a Node 18 VS Code host degrades silently instead
-	// of logging a scan failure for every conversation db. The QueueWorker path
-	// already gates via isAntigravityInstalled(); this covers direct-scan callers.
-	/* v8 ignore start -- only reachable on Node < 22.5; the discoverer suite is describe.skip there */
+	// A runtime below the Node floor cannot load node:sqlite. Gate up front (like
+	// the detector) so the aggregator's 60s tick on such a VS Code host degrades
+	// silently instead of logging a scan failure for every conversation db. The
+	// QueueWorker path already gates via isAntigravityInstalled(); this covers
+	// direct-scan callers.
+	/* v8 ignore start -- only reachable below the Node floor; the discoverer suite is describe.skip there */
 	if (!hasNodeSqliteSupport()) return { sessions: [] };
 	/* v8 ignore stop */
 

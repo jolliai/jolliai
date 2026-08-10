@@ -107,7 +107,7 @@ describe("isCursorPresent (decoupled from the SQLite gate)", () => {
 		expect(await isCursorPresent()).toBe(false);
 	});
 
-	it("returns true when the DB exists EVEN ON a runtime without node:sqlite (Node 18 VS Code host)", async () => {
+	it("returns true when the DB exists EVEN ON a runtime without node:sqlite (host below the Node floor)", async () => {
 		const globalDir = join(tmpHome, "Library/Application Support/Cursor/User/globalStorage");
 		await mkdir(globalDir, { recursive: true });
 		await writeFile(join(globalDir, "state.vscdb"), "stub");

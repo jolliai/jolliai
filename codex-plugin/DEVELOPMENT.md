@@ -160,7 +160,7 @@ The build:
 
 - reads the plugin version from `plugins/jolli/.codex-plugin/plugin.json`;
 - reads the embedded core version from `cli/package.json`;
-- bundles `cli/src/**` as CommonJS targeting Node 18;
+- bundles `cli/src/**` as CommonJS with esbuild target `node22` (the runtime floor, matching the CLI's `engines.node`);
 - identifies network requests as `codex-plugin/<plugin-version>`;
 - validates that `hooks.json` contains exactly one SessionStart bootstrap;
 - validates the exact 12-entry output inventory;

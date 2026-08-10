@@ -4241,9 +4241,9 @@ describe("CLI", () => {
 				.mock.calls.map((c) => String(c[0]))
 				.join("\n");
 			expect(output).toContain("openCodeEnabled");
-			// Description should mention the Node version requirement — this is
-			// the only config key that's runtime-gated and users deserve the hint.
-			expect(output).toContain("Node 22.5+");
+			// Description should mention the Node version requirement — these
+			// keys are runtime-gated and users deserve the hint.
+			expect(output).toContain("Node 22.13+");
 		});
 
 		it("should accept cursorEnabled=true/false", async () => {
@@ -4281,7 +4281,7 @@ describe("CLI", () => {
 				.join("\n");
 			expect(output).toContain("cursorEnabled");
 			// Description should mention the Node version requirement.
-			expect(output).toContain("Node 22.5+");
+			expect(output).toContain("Node 22.13+");
 		});
 
 		it("should reject invalid --set format", async () => {

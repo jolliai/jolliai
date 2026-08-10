@@ -73,7 +73,7 @@ describe("CopilotDetector", () => {
 
 	it("isCopilotPresent returns true when the DB exists even on a runtime without node:sqlite", async () => {
 		// Presence is decoupled from the SQLite gate so MCP registration (which only
-		// writes a config file) still runs on Node-18 VS Code hosts.
+		// writes a config file) still runs on hosts below the Node floor.
 		vi.spyOn(process.versions, "node", "get").mockReturnValue("18.0.0");
 		vi.mocked(stat).mockResolvedValue({ isFile: () => true } as Awaited<ReturnType<typeof stat>>);
 		const { isCopilotInstalled, isCopilotPresent } = await import("./CopilotDetector.js");

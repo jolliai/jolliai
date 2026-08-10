@@ -7,10 +7,11 @@
  * whole session — which is exactly when the information is useful.
  *
  * The DB is opened read-only through `withSqliteDb`, which brings the lazy
- * `node:sqlite` import (so a Node-18 bundle tolerates the missing module), the
- * locked-retry backoff, and guaranteed close. `node:sqlite` is a real SQLite, so
- * it reads the WAL — which matters here: this database carries megabytes of
- * uncommitted WAL, and a library that ignored it would silently see stale rows.
+ * `node:sqlite` import (so a bundle below the Node floor tolerates the missing
+ * module), the locked-retry backoff, and guaranteed close. `node:sqlite` is a
+ * real SQLite, so it reads the WAL — which matters here: this database carries
+ * megabytes of uncommitted WAL, and a library that ignored it would silently
+ * see stale rows.
  */
 
 import { stat } from "node:fs/promises";

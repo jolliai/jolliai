@@ -60,7 +60,7 @@ These hooks track which AI sessions are active. Gemini's `AfterAgent` and Claude
 | **Claude Code** | `StopHook` + `SessionStartHook` | `StopHook` runs after each AI response and writes session info to `sessions.json`. `SessionStartHook` records new sessions at start so the cross-machine `/jolli-recall` flow can locate transcripts. |
 | **Gemini** | `GeminiAfterAgentHook` | Same stdin format as Claude's StopHook; additionally outputs `{}` to stdout (Gemini hook spec). |
 | **Codex** | _(no hook)_ | Sessions discovered by scanning `~/.codex/sessions/` at post-commit time. |
-| **OpenCode** | _(no hook)_ | Sessions discovered by reading `~/.local/share/opencode/opencode.db` (SQLite) at post-commit time. Requires Node 22.5+ for `node:sqlite`; the discoverer is lazy-imported and feature-gated, so older hosts (e.g. VS Code's bundled Electron Node) silently skip OpenCode without breaking anything else. |
+| **OpenCode** | _(no hook)_ | Sessions discovered by reading `~/.local/share/opencode/opencode.db` (SQLite) at post-commit time. Requires Node 22.13+ for `node:sqlite`; the discoverer is lazy-imported and feature-gated, so older hosts (e.g. VS Code's bundled Electron Node) silently skip OpenCode without breaking anything else. |
 | **Cursor IDE** (Composer) | _(no hook)_ | Sessions discovered by `CursorDetector` + `CursorSessionDiscoverer` scanning Cursor's workspace storage at post-commit time. |
 | **GitHub Copilot CLI** | _(no hook)_ | Sessions discovered by `CopilotDetector` + `CopilotSessionDiscoverer` scanning the Copilot CLI session log. |
 | **VS Code Copilot Chat** | _(no hook)_ | Sessions discovered by `CopilotChatDetector` + `CopilotChatSessionDiscoverer` reading the Copilot Chat conversation cache. |
@@ -68,8 +68,9 @@ These hooks track which AI sessions are active. Gemini's `AfterAgent` and Claude
 | **Cline** (CLI + VS Code) | _(no hook)_ | Sessions discovered from Cline's local session store — the CLI's `~/.cline/data` plaintext session files and the VS Code extension's task store. Note the CLI's `sessions.db` main database is effectively empty (everything lives in the WAL), which is why discovery reads the plaintext files instead. |
 | **Devin CLI** | _(no hook)_ | Sessions discovered from `~/.local/share/devin/cli/sessions.db` (`%APPDATA%\devin\cli` on Windows), scoped by the `working_directory` column. `message_nodes` is a forest — the canonical conversation is the main chain walked from `sessions.main_chain_id`. |
 | **Antigravity** | _(no hook)_ | The per-conversation SQLite is read only to recover the workspace path (its agent data is encrypted); the conversation content comes from the sibling plaintext `transcript_full.jsonl`. |
+| **Kimi Code** | _(no hook)_ | Sessions discovered from Kimi Code's local session store `~/.kimi-code/sessions/` by `KimiSessionDiscoverer`; the conversation is the sibling `agents/main/wire.jsonl` line. |
 
-Per-integration enable/disable lives in the global config (`claudeEnabled`, `geminiEnabled`, `codexEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `clineEnabled`, `devinEnabled`, `antigravityEnabled`) and is toggled from the **Settings** webview's **AI Agents** tab. The single `copilotEnabled` switch covers both Copilot CLI and Copilot Chat — splitting them was rejected because users almost always want them together; `cursorEnabled` likewise covers the Composer IDE and the `cursor-agent` CLI. Discoverable-but-disabled integrations show up in the sidebar **Status** tab as "detected but disabled". OpenCode and the Copilot family additionally surface a separate **scan-error** row when their backing store is present but unreadable (corrupt, locked, schema-incompatible) — this avoids the past failure mode where a corrupt DB rendered as a healthy-looking integration.
+Per-integration enable/disable lives in the global config (`claudeEnabled`, `geminiEnabled`, `codexEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `clineEnabled`, `devinEnabled`, `antigravityEnabled`, `kimiEnabled`) and is toggled from the **Settings** webview's **AI Agents** tab. The single `copilotEnabled` switch covers both Copilot CLI and Copilot Chat — splitting them was rejected because users almost always want them together; `cursorEnabled` likewise covers the Composer IDE and the `cursor-agent` CLI. Discoverable-but-disabled integrations show up in the sidebar **Status** tab as "detected but disabled". OpenCode and the Copilot family additionally surface a separate **scan-error** row when their backing store is present but unreadable (corrupt, locked, schema-incompatible) — this avoids the past failure mode where a corrupt DB rendered as a healthy-looking integration.
 
 ### Git Hooks — Summary Generation Pipeline
 
@@ -204,7 +205,7 @@ The `services/data/` layer exists so derivation logic can be unit-tested without
 
 ## Bundle Layout
 
-`vscode/esbuild.config.mjs` produces these files in `dist/`, all CJS, all targeting Node 18:
+`vscode/esbuild.config.mjs` produces these files in `dist/`, all CJS, all esbuild target `node22` (the host's Node floor, matching `engines.vscode` ^1.101.0):
 
 | Bundle | Source | Notes |
 |--------|--------|-------|

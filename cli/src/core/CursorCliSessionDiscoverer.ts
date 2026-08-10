@@ -9,7 +9,7 @@
  *       plaintext JSONL — located by uuid (the encoded-cwd dir name is a lossy
  *       `/`↔`-` encoding, so we never decode it; the uuid is globally unique).
  * The co-located store.db is a protobuf Merkle-DAG + WAL — deliberately NOT read.
- * Pure JSON path → no node:sqlite, no WAL trap, no Node-18 feature gate.
+ * Pure JSON path → no node:sqlite, no WAL trap, no Node-floor feature gate.
  *
  * Directory attribution is exact-equality on meta.cwd via normalizePathForCompare,
  * mirroring Devin/OpenCode/Cline CLI: a session started from a repo *subdirectory*

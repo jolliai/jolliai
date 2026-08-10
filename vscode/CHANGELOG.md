@@ -1,15 +1,16 @@
 # Changelog
 
-<!-- Last synced commit: 878524ae | 2026-08-06 -->
+<!-- Last synced commit: f1195846 | 2026-08-09 -->
 
 ## 0.99.11
 
-- **Kimi Code CLI memories** — sessions from Kimi Code CLI (`~/.kimi-code`) are now discovered automatically and folded into your memories, complete with references and skill usage.
-- **Rendered Markdown previews for context snapshots** — clicking a plan, note, skills aggregate, or archived reference opens directly to a rendered Markdown preview with no intermediate raw-text tab, and the preview tab survives a window reload.
-- **Recompute token and cost figures** — memories missing usage data now show a recompute action on the token meter to re-derive tokens and cost from the archived conversations.
-- **Smarter AI agent toggles** — **Settings → AI Agents** only reinstalls Claude Stop / Gemini AfterAgent hooks when the toggles actually change, and clearly tells you when the repo is manually disabled.
-- **Squash memories keep working-area context** — plans, notes, and references you activate during a session are now archived into squash and merge memories, not left behind in the working area.
-- **Skills push to Jolli Space** — when you share a memory or branch, the skills it used are pushed as separate articles alongside plans, notes, and references.
+- **Breaking: requires VS Code 1.101 or newer** — previously 1.80. 1.101 is the first release whose bundled Node loads `node:sqlite` without a flag, which the local dashboard and the SQLite-backed session discoverers (OpenCode, Cursor, Copilot, Devin, Antigravity) need. **On VS Code 1.100 and earlier the Marketplace will no longer offer this update**, and the extension stays on your installed version — upgrade VS Code to keep receiving releases.
+- **Kimi Code conversations become memories** — sessions from **Kimi Code CLI** are now discovered automatically and folded into your memories, complete with references and skill usage.
+- **Clean previews for your context** — clicking a plan, note, skill, or reference opens a tidy rendered preview right away (no raw-text tab in between), and it stays open across a window reload.
+- **Fill in missing cost figures** — if a memory has no token or usage data, a recompute action on the token meter recovers it from the archived conversation.
+- **Simpler AI agent toggles** — **Settings → AI Agents** only makes changes to your hooks when a toggle actually changes, and clearly tells you when you have turned Jolli off for this repo.
+- **Squash memories keep the working context** — plans, notes, and references from your session are now folded into squash and merged memories instead of being left behind.
+- **Skills are shared alongside the memory** — sharing a memory or branch also shares the skills the work used, as separate articles next to plans, notes, and references.
 - Bug fixes.
 
 ## 0.99.10

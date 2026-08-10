@@ -83,8 +83,8 @@ vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
 
 // Mock CursorDetector for status/install checks. isCursorInstalled (SQLite-gated)
 // drives session discovery / auto-enable; isCursorPresent (pure filesystem) drives
-// MCP registration — kept as separate mocks so a test can exercise the Node-18
-// case where a host is present but unreadable.
+// MCP registration — kept as separate mocks so a test can exercise the
+// below-the-Node-floor case where a host is present but unreadable.
 vi.mock("../core/CursorDetector.js", () => ({
 	isCursorInstalled: vi.fn().mockResolvedValue(false),
 	isCursorPresent: vi.fn().mockResolvedValue(false),
@@ -1585,13 +1585,13 @@ describe("Installer", () => {
 			expect(cursorMcp.mcpServers.jollimemory).toBeDefined();
 		});
 
-		it("registers MCP for a host present on disk but unreadable on this runtime (Node-18 VS Code host)", async () => {
-			// Regression guard for the SQLite-gating bug: a VS Code extension host
-			// runs a Node without built-in node:sqlite, so isCursorInstalled (gated)
+		it("registers MCP for a host present on disk but unreadable on this runtime (host below the Node floor)", async () => {
+			// Regression guard for the SQLite-gating bug: a host below the Node floor
+			// runs a Node that cannot load node:sqlite, so isCursorInstalled (gated)
 			// is false there. MCP registration must still run — it only writes a
 			// config file and never reads the DB — so it keys off isCursorPresent.
 			const { isCursorInstalled, isCursorPresent } = await import("../core/CursorDetector.js");
-			vi.mocked(isCursorInstalled).mockResolvedValue(false); // Node 18: gated → "not installed"
+			vi.mocked(isCursorInstalled).mockResolvedValue(false); // gated → "not installed"
 			vi.mocked(isCursorPresent).mockResolvedValue(true); // …but Cursor IS on disk
 
 			const result = await install(tempDir);

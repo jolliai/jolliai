@@ -4,7 +4,7 @@ Follow these steps to get up and running.
 
 ## Prerequisites
 
-- Node.js 22.5 or later
+- Node.js 22.13 or later
 - A content folder with markdown files
 
 ## Installation

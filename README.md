@@ -14,7 +14,7 @@
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, with no extra effort.
 
-When you work with AI agents (Claude Code, Codex, Gemini, OpenCode, Cursor, GitHub Copilot, Cline, Devin, or Antigravity), the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were weighed, what went wrong along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+When you work with AI agents (Claude Code, Codex, Gemini, OpenCode, Cursor, GitHub Copilot, Cline, Devin, Antigravity, or Kimi Code), the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were weighed, what went wrong along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 ![Asking an AI agent "why do we retry with exponential backoff instead of a fixed delay?" and it answers from Jolli Memory, citing the commit where the decision was made](docs/media/ask-your-agent.gif)
 
@@ -27,7 +27,7 @@ When you work with AI agents (Claude Code, Codex, Gemini, OpenCode, Cursor, GitH
 Install the CLI, run `jolli`, and your next commit becomes your first memory.
 
 ```bash
-npm install -g @jolli.ai/cli   # requires Node 22.5+
+npm install -g @jolli.ai/cli   # requires Node 22.13+
 cd your-repo
 jolli                          # guided setup: sign in to Jolli, enable hooks, optional backfill
 ```
@@ -51,7 +51,7 @@ That gives your agent read access to memories you already have. To *record* new 
 Prefer an in-editor panel? The same memories show up in the [VS Code extension](vscode/) and the [JetBrains plugin](intellij/) (preview). Working in Claude Code or Codex? The [Claude Code plugin](claude-plugin/) and the [Codex plugin](codex-plugin/) install the hooks and the MCP server for you, with no npm step. See [Which install is right for me?](#which-install-is-right-for-me) below.
 
 > **Before you start**
-> - **Node 22.5+** and a **git repository** (hooks live in `.git/hooks`).
+> - **Node 22.13+** and a **git repository** (hooks live in `.git/hooks`).
 > - **A free Jolli sign-in** to generate summaries. Bring-your-own Anthropic API key also works if you'd rather (`jolli configure --set apiKey=...`), but signing in is the quickest path and needs no key management. With no credential at all, hooks still record sessions but no summary is written; local `search` / `recall` / `view` work with no account.
 > - **Restart your AI agent session** after enabling, so the hooks take effect.
 > - Installing the CLI globally does nothing on its own: run `jolli` inside a repo to enable it there.
@@ -62,7 +62,7 @@ Prefer an in-editor panel? The same memories show up in the [VS Code extension](
 ## What you get
 
 - **Never lose the _why_.** Every commit gets a structured memory: the trigger behind the change, the decisions and trade-offs, and what was actually built.
-- **Works with 10 AI agents.** Claude Code, Codex, Gemini, OpenCode, Cursor (Composer IDE and the `cursor-agent` CLI), GitHub Copilot CLI, VS Code Copilot Chat, Cline (VS Code extension and CLI), Devin CLI, and Antigravity. Sessions are detected automatically, no per-tool setup. Only Claude Code and Gemini install a hook; the other eight are discovered by scanning their own local session stores.
+- **Works with 11 AI agents.** Claude Code, Codex, Gemini, OpenCode, Cursor (Composer IDE and the `cursor-agent` CLI), GitHub Copilot CLI, VS Code Copilot Chat, Cline (VS Code extension and CLI), Devin CLI, Antigravity, and Kimi Code. Sessions are detected automatically, no per-tool setup. Only Claude Code and Gemini install a hook; the other nine are discovered by scanning their own local session stores.
 - **Ask your agent about past work.** `jolli mcp` exposes your history over the Model Context Protocol (10 tools: search, recall a branch, trace a decision's timeline, list branches, draft a PR description, check installation health, and more), so your agent can answer "how did we handle X?" and draft PRs without leaving the chat. Registered automatically into the AI hosts Jolli detects when you enable, and when you are signed in your Jolli Space's own platform tools are surfaced alongside them.
 - **Catch up on history.** `jolli backfill` writes memories for commits you made before installing Jolli.
 - **Knowledge wiki and graph.** `jolli compile` folds work scattered across many commits into per-topic pages; `jolli graph` renders them as an interactive, shareable map of decisions and how they connect. Both build in the background.
@@ -156,7 +156,7 @@ jolliai/
 
 ### Development quick start
 
-Requires the Node version in `.nvmrc` (currently 24.10.0, which is the development toolchain, distinct from the 22.5+ runtime floor for users):
+Requires the Node version in `.nvmrc` (currently 24.10.0, which is the development toolchain, distinct from the 22.13+ runtime floor for users):
 
 ```bash
 npm install

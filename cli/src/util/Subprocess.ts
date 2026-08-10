@@ -56,7 +56,7 @@ export function execFileAsyncHidden(
  * On Windows the npm launcher is `npm.cmd`, and a bare `npm` cannot be spawned
  * without a shell: `execFile`/`spawn` don't resolve via `PATHEXT` (→ `ENOENT`),
  * and since the Node fix for CVE-2024-27980 (18.20.2 / 20.12.2 / 21.7.2 — all
- * below our `>=22.5` floor) even an explicit `npm.cmd` is rejected without
+ * below our `>=22.13` floor) even an explicit `npm.cmd` is rejected without
  * `shell: true` (→ `EINVAL`). So we opt into a shell on win32 only, where
  * `cmd.exe` resolves `npm.cmd` through `PATHEXT`. Every caller passes static
  * tokens plus allow-listed package names — never user-controlled input — and the

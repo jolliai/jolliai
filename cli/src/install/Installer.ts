@@ -458,10 +458,11 @@ export async function install(
 		// runtime read its transcripts" — the right gate for session discovery and
 		// the auto-enable writes below. But MCP registration only writes a config
 		// file; it never reads the DB, so it must key off raw on-disk PRESENCE
-		// instead. Otherwise a Node-18 VS Code host (no built-in node:sqlite) would
-		// silently skip MCP for a host the user genuinely has installed. Hosts that
-		// are not SQLite-gated (Codex, Gemini, Copilot Chat) already work on Node 18,
-		// so they reuse their *DetectedOnce flag directly.
+		// instead. Otherwise a runtime below the Node floor (no built-in
+		// node:sqlite) would silently skip MCP for a host the user genuinely has
+		// installed. Hosts that are not SQLite-gated (Codex, Gemini, Copilot Chat)
+		// already work on any supported Node, so they reuse their *DetectedOnce flag
+		// directly.
 		//
 		// Cline needs its own present flag for a DIFFERENT reason: it is not
 		// SQLite-gated, but `clineDetectedOnce` above is `extension OR CLI` — and the

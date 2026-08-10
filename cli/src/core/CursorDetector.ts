@@ -27,7 +27,7 @@ export function getCursorWorkspaceStorageDir(home?: string): string {
 /**
  * Checks whether Cursor is installed AND the current runtime can read its DB.
  *
- * Gated on hasNodeSqliteSupport() so VS Code-extension Node 18 hosts report
+ * Gated on hasNodeSqliteSupport() so a runtime below the Node floor reports
  * "not installed" rather than "detected but 0 sessions" — the latter is
  * misleading because a scan would always fail on those runtimes.
  */
@@ -36,7 +36,7 @@ export async function isCursorInstalled(): Promise<boolean> {
 		// "Not applicable on this runtime" rather than a failure — log at info so
 		// operators can correlate "Cursor absent from status" with the runtime version.
 		log.info(
-			"Cursor support disabled: this runtime is Node %s, requires 22.5+ for built-in SQLite",
+			"Cursor support disabled: this runtime is Node %s, requires 22.13+ for built-in SQLite",
 			process.versions.node,
 		);
 		return false;
@@ -48,9 +48,9 @@ export async function isCursorInstalled(): Promise<boolean> {
  * Pure filesystem presence check: is Cursor's DB on disk, regardless of whether
  * THIS runtime can read it? Unlike `isCursorInstalled`, this does NOT gate on
  * `hasNodeSqliteSupport()`. Used for MCP registration, which only writes a
- * config file and never reads the SQLite DB — so it must work on Node-18 VS Code
- * hosts where the transcript-readability gate (correct for session discovery)
- * would otherwise suppress a host that is genuinely installed.
+ * config file and never reads the SQLite DB — so it must work on a VS Code host
+ * below the Node floor, where the transcript-readability gate (correct for
+ * session discovery) would otherwise suppress a host that is genuinely installed.
  */
 export async function isCursorPresent(): Promise<boolean> {
 	const dbPath = getCursorGlobalDbPath();

@@ -12,7 +12,7 @@
  * encrypted `implicit/*.pb` blobs are intentionally NOT read — the readable data
  * lives under `~/.gemini/<variant>/` (see AntigravitySessionDiscoverer).
  *
- * Gated on hasNodeSqliteSupport() so VS Code-extension Node 18 hosts report
+ * Gated on hasNodeSqliteSupport() so a runtime below the Node floor reports
  * "not installed" rather than "detected but 0 sessions".
  */
 
@@ -61,7 +61,7 @@ export function getAntigravityVariants(home: string = homedir()): AntigravityVar
 export async function isAntigravityInstalled(home: string = homedir()): Promise<boolean> {
 	if (!hasNodeSqliteSupport()) {
 		log.info(
-			"Antigravity support disabled: this runtime is Node %s, requires 22.5+ for built-in SQLite",
+			"Antigravity support disabled: this runtime is Node %s, requires 22.13+ for built-in SQLite",
 			process.versions.node,
 		);
 		return false;
@@ -85,9 +85,9 @@ async function hasAntigravityConversationDb(home: string): Promise<boolean> {
  * Pure filesystem presence check for MCP registration: is Antigravity on this
  * machine at all, regardless of whether THIS runtime can read its dbs? Unlike
  * `isAntigravityInstalled`, this does NOT gate on `hasNodeSqliteSupport()` — MCP
- * registration only writes a config file, so it must work on Node-18 VS Code
- * hosts where the SQLite gate would otherwise suppress a host the user genuinely
- * has installed.
+ * registration only writes a config file, so it must work on a VS Code host
+ * below the Node floor, where the SQLite gate would otherwise suppress a host
+ * the user genuinely has installed.
  *
  * Accepts a bare `~/.gemini/<variant>/` directory, not just a conversation db,
  * because MCP is registered only on an explicit `jolli enable` (the SessionStart
