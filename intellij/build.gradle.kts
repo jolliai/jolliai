@@ -81,8 +81,8 @@ intellijPlatform {
             </p>
             <p>
                 When you work with AI agents like <b>Claude Code</b>, <b>Codex</b>, <b>Gemini</b>,
-                <b>Cursor</b>, <b>Copilot</b>, <b>Cline</b>, <b>Devin</b>, <b>OpenCode</b> or
-                <b>Antigravity</b>,
+                <b>Cursor</b>, <b>Copilot</b>, <b>Cline</b>, <b>Devin</b>, <b>OpenCode</b>,
+                <b>Antigravity</b> or <b>Kimi Code</b>,
                 the reasoning behind every decision lives in the conversation &mdash;
                 <em>why this approach was chosen, what alternatives were considered, what problems came up along the way</em>.
                 The moment you commit, that context is gone. Jolli Memory captures it automatically.
@@ -123,7 +123,7 @@ intellijPlatform {
                     import Markdown files, or write quick text snippets. Plans are archived with each commit</li>
                 <li><b>E2E Test Generation</b> &mdash; AI-generated test scenarios with preconditions, steps, and
                     expected results, editable inline in the Summary Viewer</li>
-                <li><b>Session Context Recall</b> &mdash; a lightweight briefing (~300 tokens) is injected at each
+                <li><b>Session Context Recall</b> &mdash; a lightweight briefing (~300&ndash;500 tokens) is injected at each
                     Claude Code session start. The <code>jolli-recall</code> and <code>jolli-search</code> skills
                     are installed for you, so your AI agent can load a branch's full history or search every
                     branch's memories and pick up where you left off</li>
@@ -154,7 +154,7 @@ intellijPlatform {
 
             <h3>Multi-Agent Support</h3>
             <p>
-                Twelve transcript sources are supported. Only two install a hook; the rest are discovered
+                Thirteen transcript sources are supported. Only two install a hook; the rest are discovered
                 automatically by scanning the tool's own local session store, so there is nothing to set up per tool.
             </p>
             <table>
@@ -167,6 +167,7 @@ intellijPlatform {
                 <tr><td><b>Cline</b></td><td>Automatic discovery &mdash; covers both the VS Code extension and the CLI</td></tr>
                 <tr><td><b>Devin CLI</b></td><td>Automatic discovery from its local database, scoped by working directory</td></tr>
                 <tr><td><b>Antigravity</b></td><td>Automatic discovery from its per-conversation store and transcript log</td></tr>
+                <tr><td><b>Kimi Code</b></td><td>Automatic discovery from its local session store, scoped by working directory</td></tr>
             </table>
 
             <h3>Tool Window</h3>
@@ -187,8 +188,8 @@ intellijPlatform {
 
             <h3>Configuration</h3>
             <p>
-                A five-tab dialog in the tool window (gear icon) covers <b>AI Agents</b> (nine toggles, one per source:
-                Claude Code, Codex, Gemini, OpenCode, Cursor IDE, Devin, GitHub Copilot, Cline, Antigravity),
+                A five-tab dialog in the tool window (gear icon) covers <b>AI Agents</b> (ten toggles, one per source:
+                Claude Code, Codex, Gemini, OpenCode, Cursor IDE, Devin, GitHub Copilot, Cline, Antigravity, Kimi Code),
                 <b>AI Summary</b> (provider &mdash; an Anthropic key, Jolli, or a local agent CLI such as
                 Claude Code, Codex, Cursor, OpenCode, or Kimi Code driven by its own login &mdash; plus model and token budget),
                 <b>Sync to Jolli</b>, <b>Memory Bank</b>
