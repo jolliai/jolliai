@@ -25,6 +25,13 @@
  * entities. Bodies are lifted into entry-line form here, at extraction, since the
  * timestamp each entry needs lives on the `Reference` and never in the payload.
  *
+ * The harvested values are not latest-wins: for a source declaring
+ * `titleFallbackPattern`, a winning observation whose title is that source's
+ * SYNTHESIZED fallback keeps the superseded observation's title, url, display fields
+ * and body instead — they all come from the one lookup the fallback title says missed.
+ * Same rule, same implementation, as `writeReferenceMarkdown` applies across scans —
+ * see `restorePriorHarvest`.
+ *
  * Defense-in-depth: every payload walk is wrapped in try/catch so a single
  * pathologically deep payload (attacker-influenceable MCP output) can't abort
  * extraction for the whole transcript. Missing transcript file returns empty.
@@ -35,7 +42,7 @@ import { createLogger } from "../../Logger.js";
 import type { Reference } from "../../Types.js";
 import { loadConfig } from "../SessionTracker.js";
 import { isObject } from "./guards.js";
-import { formatAccumulatedEntry, mergeAccumulatedBody } from "./ReferenceStore.js";
+import { formatAccumulatedEntry, mergeAccumulatedBody, restorePriorHarvest } from "./ReferenceStore.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
 import { getRegistry } from "./SourceDefinitionRegistry.js";
 import * as SourceEngine from "./SourceEngine.js";
@@ -190,14 +197,50 @@ function bodyOf(ref: Reference): string {
 }
 
 /**
+ * The newer of two same-mapKey references, and the one it supersedes.
+ *
+ * Ties go to `incoming` — the later-seen entry — which is what preserves the
+ * transcript's get→list resolution order, and why the parser must emit in
+ * transcript order and this driver must not reorder.
+ */
+function orderByRecency(existing: Reference, incoming: Reference): { newest: Reference; superseded: Reference } {
+	return incoming.referencedAt >= existing.referencedAt
+		? { newest: incoming, superseded: existing }
+		: { newest: existing, superseded: incoming };
+}
+
+/**
+ * Restore the superseded observation's harvested title, url, display fields and body when
+ * the winning one is this source's synthesized fallback — `restorePriorHarvest` is the same
+ * function `writeReferenceMarkdown` applies scan-to-scan, so the two collapse points cannot
+ * restore different sets.
+ *
+ * Needed here because a source declaring `titleFallbackPattern` harvests its title from
+ * OUTSIDE the tool payload, and two calls in one turn can legitimately disagree about
+ * whether that harvest succeeded: sentry reads an issue (prose result → real title) and
+ * then runs Seer on it (root-cause result, no issue prose → `Issue <id>`). Plain
+ * latest-wins hands the collapsed row the degraded label, and on a FIRST capture the
+ * store-level rule cannot recover it — there is no file on disk yet to keep a title from.
+ *
+ * Ordered by recency, not by argument position, so a transcript whose timestamps run
+ * backwards is protected in both directions.
+ */
+function preferHarvest(def: SourceDefinition | undefined, newest: Reference, superseded: Reference): Reference {
+	return def === undefined ? newest : restorePriorHarvest(def, newest, superseded);
+}
+
+/**
  * Collapse two same-mapKey references from an accumulating source into one.
  *
  * Metadata still follows latest-wins (title / url / toolName describe whichever
- * call is newer); only the body accumulates.
+ * call is newer, subject to the harvest rule); only the body accumulates.
  */
-function mergeAccumulatedRefs(existing: Reference, incoming: Reference): Reference {
-	const newest = incoming.referencedAt >= existing.referencedAt ? incoming : existing;
-	return { ...newest, description: mergeAccumulatedBody(bodyOf(existing), bodyOf(incoming)) };
+function mergeAccumulatedRefs(existing: Reference, incoming: Reference, def: SourceDefinition | undefined): Reference {
+	const { newest, superseded } = orderByRecency(existing, incoming);
+	return {
+		...preferHarvest(def, newest, superseded),
+		description: mergeAccumulatedBody(bodyOf(existing), bodyOf(incoming)),
+	};
 }
 
 function dedupeKeepLatest(refs: ReadonlyArray<Reference>): Reference[] {
@@ -208,17 +251,21 @@ function dedupeKeepLatest(refs: ReadonlyArray<Reference>): Reference[] {
 			byMapKey.set(ref.mapKey, ref);
 			continue;
 		}
+		const def = getRegistry().byId(ref.source);
 		// An accumulating source's identity is an ACT, not an entity: two memory queries
 		// sharing a mapKey are two distinct facts, so keeping only the newer would
 		// discard the record. Every other source describes an entity, where a second
 		// fetch of the same entity legitimately supersedes the first.
-		if (getRegistry().byId(ref.source)?.accumulateBody === true) {
-			byMapKey.set(ref.mapKey, mergeAccumulatedRefs(existing, ref));
+		//
+		// The harvest rule applies to BOTH branches and is deliberately not nested inside
+		// either: title recovery has nothing to do with body accumulation, and figma
+		// declares both flags while sentry declares only the harvest one.
+		if (def?.accumulateBody === true) {
+			byMapKey.set(ref.mapKey, mergeAccumulatedRefs(existing, ref, def));
 			continue;
 		}
-		if (ref.referencedAt >= existing.referencedAt) {
-			byMapKey.set(ref.mapKey, ref);
-		}
+		const { newest, superseded } = orderByRecency(existing, ref);
+		byMapKey.set(ref.mapKey, preferHarvest(def, newest, superseded));
 	}
 	return [...byMapKey.values()];
 }

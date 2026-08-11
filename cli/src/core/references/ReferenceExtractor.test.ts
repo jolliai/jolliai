@@ -1641,3 +1641,171 @@ describe("extractReferencesFromTranscript — jollimemory", () => {
 		expect(recall?.toolName).toBe("mcp__jollimemory__recall");
 	});
 });
+
+// ─── Title-fallback rule at the DEDUPE collapse point ────────────────────────
+
+/**
+ * The rule's second collapse point. `writeReferenceMarkdown` compares against the file
+ * already on disk, which covers scan-to-scan; two same-key records in ONE scan are
+ * collapsed here first, and on a FIRST capture there is no file to keep a title from — so
+ * without this the good label is never persisted anywhere at all.
+ *
+ * Driven through sentry because read-then-Seer inside one turn is its ordinary path: the
+ * read returns issue prose (real title), Seer returns root-cause analysis (no issue prose,
+ * so the synthesized `Issue <id>`), and plain latest-wins hands the row the degraded one.
+ */
+describe("extractReferencesFromTranscript — titleFallbackPattern at dedupe", () => {
+	const GET_RESOURCE = "mcp__Sentry__get_sentry_resource";
+	const SEER = "mcp__Sentry__analyze_issue_with_seer";
+	const ISSUE_URL = "https://jolli.sentry.io/issues/7665509682";
+	const HARVESTED = "JAVASCRIPT-NEXTJS-1 · TypeError: Object [object Object] has no method 'updateFrom'";
+
+	const ISSUE_PROSE = [
+		"# Issue JAVASCRIPT-NEXTJS-1 in **jolli**",
+		"",
+		"**Description**: TypeError: Object [object Object] has no method 'updateFrom'",
+		"**Culprit**: ../../sentry/scripts/views.js in poll",
+		"**Project**: javascript-nextjs",
+	].join("\n");
+	// What Seer actually returns: root-cause analysis, carrying none of the issue's fields.
+	const SEER_PROSE = "## Root Cause\n\nThe `updateFrom` call assumes a model instance.\n";
+
+	const call = (id: string, tool: string, ts: string, input: object, prose: string): string[] => [
+		toolUseLine({ toolUseId: id, toolName: tool, timestamp: ts, inputJson: JSON.stringify(input) }),
+		toolResultLine({ toolUseId: id, timestamp: ts, payload: prose }),
+	];
+
+	const read = (id: string, ts: string): string[] => call(id, GET_RESOURCE, ts, { url: ISSUE_URL }, ISSUE_PROSE);
+	const seer = (id: string, ts: string): string[] => call(id, SEER, ts, { issueUrl: ISSUE_URL }, SEER_PROSE);
+
+	it("keeps the harvested title when a LATER Seer call re-derives the fallback", async () => {
+		mockReadFile.mockResolvedValue(
+			makeJsonl(...read("s1", "2026-08-12T10:00:00.000Z"), ...seer("s2", "2026-08-12T10:00:02.000Z")),
+		);
+
+		const refs = (await extractReferencesFromTranscript("/fake.jsonl")).references.filter(
+			(r) => r.source === "sentry",
+		);
+
+		expect(refs).toHaveLength(1);
+		expect(refs[0].title).toBe(HARVESTED);
+		// Metadata still follows latest-wins — only the harvested values are held back.
+		expect(refs[0].toolName).toBe(SEER);
+	});
+
+	it("keeps the display fields and the body, not just the title", async () => {
+		// The title is the detector, not the subject. Restoring only title+url left the row
+		// titled `JAVASCRIPT-NEXTJS-1 · …` with an empty Issue field, no culprit, and a link
+		// line naming the OTHER id spelling — three disagreements visible side by side.
+		mockReadFile.mockResolvedValue(
+			makeJsonl(...read("s1", "2026-08-12T10:00:00.000Z"), ...seer("s2", "2026-08-12T10:00:02.000Z")),
+		);
+
+		const refs = (await extractReferencesFromTranscript("/fake.jsonl")).references.filter(
+			(r) => r.source === "sentry",
+		);
+
+		expect(fieldVal(refs[0], "issue-id")).toBe("JAVASCRIPT-NEXTJS-1");
+		expect(fieldVal(refs[0], "project")).toBe("javascript-nextjs");
+		expect(refs[0].description).toContain("**Culprit:** ../../sentry/scripts/views.js in poll");
+		// The row now agrees with itself: the body names the same id the title does.
+		expect(refs[0].description).toContain("Sentry issue JAVASCRIPT-NEXTJS-1");
+	});
+
+	it("keeps it in the reverse order too — recency, not argument position", async () => {
+		mockReadFile.mockResolvedValue(
+			makeJsonl(...seer("s1", "2026-08-12T10:00:00.000Z"), ...read("s2", "2026-08-12T10:00:02.000Z")),
+		);
+
+		const refs = (await extractReferencesFromTranscript("/fake.jsonl")).references.filter(
+			(r) => r.source === "sentry",
+		);
+
+		expect(refs).toHaveLength(1);
+		expect(refs[0].title).toBe(HARVESTED);
+		expect(refs[0].toolName).toBe(GET_RESOURCE);
+	});
+
+	it("holds the title back even when the fallback record is the newer of a tie", async () => {
+		// A tie resolves to the later-seen record, so this is the shape where latest-wins and
+		// the harvest rule disagree most directly.
+		mockReadFile.mockResolvedValue(
+			makeJsonl(...read("s1", "2026-08-12T10:00:00.000Z"), ...seer("s2", "2026-08-12T10:00:00.000Z")),
+		);
+
+		const refs = (await extractReferencesFromTranscript("/fake.jsonl")).references.filter(
+			(r) => r.source === "sentry",
+		);
+
+		expect(refs[0].title).toBe(HARVESTED);
+	});
+
+	it("lets a genuine re-harvest through — this is not 'pin the first title'", async () => {
+		const renamed = ISSUE_PROSE.replace(
+			"TypeError: Object [object Object] has no method 'updateFrom'",
+			"TypeError: regrouped",
+		);
+		mockReadFile.mockResolvedValue(
+			makeJsonl(
+				...read("s1", "2026-08-12T10:00:00.000Z"),
+				...call("s2", GET_RESOURCE, "2026-08-12T10:00:02.000Z", { url: ISSUE_URL }, renamed),
+			),
+		);
+
+		const refs = (await extractReferencesFromTranscript("/fake.jsonl")).references.filter(
+			(r) => r.source === "sentry",
+		);
+
+		expect(refs[0].title).toBe("JAVASCRIPT-NEXTJS-1 · TypeError: regrouped");
+	});
+
+	it("leaves a fallback→fallback collapse alone", async () => {
+		// Both sides match the pattern, so neither half of the predicate holds and the newest
+		// simply wins — the same reason the store tests both halves.
+		mockReadFile.mockResolvedValue(
+			makeJsonl(...seer("s1", "2026-08-12T10:00:00.000Z"), ...seer("s2", "2026-08-12T10:00:02.000Z")),
+		);
+
+		const refs = (await extractReferencesFromTranscript("/fake.jsonl")).references.filter(
+			(r) => r.source === "sentry",
+		);
+
+		expect(refs).toHaveLength(1);
+		expect(refs[0].title).toBe("Issue 7665509682");
+	});
+
+	it("does not disturb a source with no fallback pattern declared", async () => {
+		// linear's title is payload-derived, so latest-wins must remain exactly latest-wins.
+		mockReadFile.mockResolvedValue(
+			makeJsonl(
+				toolUseLine({
+					toolUseId: "l1",
+					toolName: "mcp__linear__get_issue",
+					timestamp: "2026-08-12T10:00:00.000Z",
+				}),
+				toolResultLine({
+					toolUseId: "l1",
+					timestamp: "2026-08-12T10:00:00.000Z",
+					payload: { ...SAMPLE_ISSUE_PAYLOAD, title: "First title" },
+				}),
+				toolUseLine({
+					toolUseId: "l2",
+					toolName: "mcp__linear__get_issue",
+					timestamp: "2026-08-12T10:00:02.000Z",
+				}),
+				toolResultLine({
+					toolUseId: "l2",
+					timestamp: "2026-08-12T10:00:02.000Z",
+					payload: { ...SAMPLE_ISSUE_PAYLOAD, title: "Second title" },
+				}),
+			),
+		);
+
+		const refs = (await extractReferencesFromTranscript("/fake.jsonl")).references.filter(
+			(r) => r.source === "linear",
+		);
+
+		expect(refs).toHaveLength(1);
+		expect(refs[0].title).toBe("Second title");
+	});
+});

@@ -192,13 +192,21 @@ export async function writeReferenceMarkdown(ref: Reference, cwd: string): Promi
  * `readReferenceMarkdownFromString` strips the auto-note, so the sentinel and its
  * paragraphs can never be accumulated into the merged body.
  *
- * **Harvest (title + url)** — for a source declaring `titleFallbackPattern`, keep BOTH
- * the stored title and the stored url when the incoming title is that source's
- * synthesized fallback and the stored one is not.
+ * **Harvest (title, url, fields, body)** — for a source declaring `titleFallbackPattern`,
+ * keep the stored harvested values when the incoming title is that source's synthesized
+ * fallback and the stored one is not. See {@link restorePriorHarvest} for why the set is
+ * all four rather than the title alone, and why the body is exempt when the source
+ * accumulates.
+ *
+ * Like the body rule, this one has TWO collapse points and neither is sufficient alone.
+ * This store covers scan-to-scan (the file already on disk); `dedupeKeepLatest` covers
+ * within-scan, where there is no file yet — a first capture that reads an issue and then
+ * runs Seer in one turn collapses both observations before this function is ever called,
+ * so only the shared {@link keepsPriorHarvest} guard there can save the good title.
  *
  * The two fields move together because they are two halves of one act. A source needs
  * this flag precisely because its title comes from outside the tool payload, and for
- * figma — the only such source — the url comes from the same place: a pasted link
+ * figma — the first such source — the url comes from the same place: a pasted link
  * supplies the readable slug, lands on the right file type with no redirect hop, and
  * keeps a branch's full `/design/<parent>/branch/<branch>/<slug>` path, while a miss
  * falls back to the legacy universal `/file/<key>` form. Saving the title and letting
@@ -212,6 +220,10 @@ export async function writeReferenceMarkdown(ref: Reference, cwd: string): Promi
  * only the title half. It should declare that difference rather than have this rule
  * loosened: the url is preserved *because* the flag's own precondition — "the title is
  * not in the payload" — is what makes the url not in the payload either, here.
+ *
+ * sentry is the second declarer and needs no loosening: its url is derived from the
+ * nativeId, which is the key this function looks up, so the stored url and the incoming one
+ * are the same string by construction and the url half of this rule cannot change anything.
  *
  * The harvest rule and the body rule are deliberately NOT nested: title/url recovery has
  * nothing to do with body accumulation, and a future source could want either alone.
@@ -228,36 +240,71 @@ function mergeIntoExisting(ref: Reference, existing: string | undefined): Refere
 	if (def.accumulateBody === true && prior.description !== undefined) {
 		out = { ...out, description: mergeAccumulatedBody(prior.description, ref.description ?? "") };
 	}
-	if (keepsPriorHarvest(def, ref.title, prior.title)) {
-		// Conditional spread, never a bare `url: prior.url`: an absent stored url must not
-		// erase one this observation DID resolve. `Reference.url` is optional, and "the
-		// prior write had none" is not evidence against the incoming one.
-		out = { ...out, title: prior.title, ...(prior.url !== undefined ? { url: prior.url } : {}) };
-	}
-	return out;
+	// Applied AFTER the body merge, and it must stay that way: for an accumulating source
+	// the restore deliberately leaves the description alone, so an already-merged body
+	// survives it. Reordering would make that exemption depend on it not having run yet.
+	return restorePriorHarvest(def, out, prior);
 }
 
 /**
  * Is `incoming` this source's synthesized fallback title while `prior` is a real one —
- * i.e. did this observation recover LESS than the stored one did?
+ * i.e. did this observation recover LESS than the one it is superseding?
  *
  * Both halves are required. Testing only `incoming` would pin the very first title
  * forever — including one fallback replacing another — and testing only `prior` would
  * block a genuine rename. See `SourceDefinition.titleFallbackPattern`.
  *
- * The title is the DETECTOR for the whole harvest, not the only thing protected by it:
- * a synthesized title is the observable signal that the out-of-band lookup missed, and
- * every field fed by that lookup is a casualty of the same miss.
- *
  * Compiled per call rather than through `SourceEngine`'s cache: this runs once per
- * reference WRITE (a handful per commit), not once per payload node, and the pattern is
- * validated at registration so it cannot throw here.
+ * reference WRITE and once per same-key dedupe collapse (a handful per commit), not once
+ * per payload node, and the pattern is validated at registration so it cannot throw here.
  */
 function keepsPriorHarvest(def: SourceDefinition, incoming: string, prior: string): boolean {
 	const pattern = def.titleFallbackPattern;
 	if (pattern === undefined) return false;
 	const re = new RegExp(pattern);
 	return re.test(incoming) && !re.test(prior);
+}
+
+/**
+ * Fold the superseded observation's harvested content back into `incoming` when `incoming`
+ * recovered less than it did. Returns `incoming` untouched for a source that declares no
+ * pattern, and for a genuine re-harvest.
+ *
+ * `prior` is whichever observation is being superseded, and it is NOT always a stored file:
+ * this is shared with `dedupeKeepLatest` in ReferenceExtractor, where both sides are
+ * references from the same scan and "prior" is the earlier-timestamped one. Exported for
+ * exactly that caller — the two collapse points must not drift, or the rule would restore
+ * one set of fields on a first commit and a different set on the second.
+ *
+ * **The title is the DETECTOR, not the subject.** A synthesized title is the observable
+ * signal that the out-of-band lookup missed, and EVERY value fed by that lookup is a
+ * casualty of the same miss — so all four move together. Restoring only the title/url pair
+ * was measurably worse than it sounds, because the halves are rendered side by side: a
+ * sentry read followed by a Seer call in one turn produced a row titled
+ * `JAVASCRIPT-NEXTJS-1 · TypeError: …` whose hover card showed no Issue and no Project (the
+ * `issue-id` field exists precisely to be the stable handle, and was empty on the source's
+ * most ordinary path), whose body had lost the culprit — the one line saying WHERE the bug
+ * is — and whose remaining link line said `7665509682`, a different spelling of the id than
+ * its own title. Restoring the set wholesale is also what keeps the row internally
+ * consistent: a per-value merge would reintroduce exactly that disagreement.
+ *
+ * **The body is exempt for an `accumulateBody` source**, and only for one. There a body is
+ * MERGED rather than replaced, so there is nothing to lose — and restoring would discard
+ * the merge instead of protecting it. Both call sites rely on this exemption living here
+ * rather than in either of them.
+ *
+ * Conditional spreads throughout, never a bare `url: prior.url`: an absent value on the
+ * superseded side is not evidence against one this observation DID resolve.
+ */
+export function restorePriorHarvest(def: SourceDefinition, incoming: Reference, prior: Reference): Reference {
+	if (!keepsPriorHarvest(def, incoming.title, prior.title)) return incoming;
+	return {
+		...incoming,
+		title: prior.title,
+		...(prior.url !== undefined ? { url: prior.url } : {}),
+		...(prior.fields !== undefined ? { fields: prior.fields } : {}),
+		...(def.accumulateBody !== true && prior.description !== undefined ? { description: prior.description } : {}),
+	};
 }
 
 /**

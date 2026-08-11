@@ -44,7 +44,7 @@ describe("SourceDefinitionRegistry", () => {
 		expect(r.match("codex", "linear.get_issue")?.id).toBe("linear"); // invocation-tool path (no namespace)
 	});
 
-	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc,asana,monday,context7,jollimemory,vercel,figma", () => {
+	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc,asana,monday,context7,jollimemory,vercel,figma,sentry", () => {
 		expect(
 			getRegistry()
 				.all()
@@ -64,6 +64,7 @@ describe("SourceDefinitionRegistry", () => {
 			"jollimemory",
 			"vercel",
 			"figma",
+			"sentry",
 		]);
 	});
 

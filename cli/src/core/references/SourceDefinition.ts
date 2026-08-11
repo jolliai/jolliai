@@ -130,15 +130,29 @@ export interface SourceDefinition {
 	/**
 	 * Regex (as a string, like every `require`) matching a title this source SYNTHESIZES
 	 * when the real one could not be recovered from the transcript. When the incoming
-	 * title matches it and the title already stored for that key does NOT, the stored
-	 * **title and url** are both kept (`ReferenceStore.mergeIntoExisting`).
+	 * title matches it and the title of the record it supersedes does NOT, that record's
+	 * **title, url, display fields and body** are all kept (`ReferenceStore
+	 * .restorePriorHarvest`, applied at both collapse points — the markdown write and
+	 * extraction-time dedupe).
 	 *
 	 * The title is the DETECTOR, not the whole subject: a synthesized title is the
-	 * observable signal that this source's out-of-band lookup missed, and every field fed
-	 * by that lookup is a casualty of the same miss. Declaring the pattern therefore
-	 * asserts that the source's title AND url both come from that lookup — true for figma,
-	 * the only source that declares it. A future source with a harvested title but a
-	 * payload-derived url must declare that difference rather than have this widened.
+	 * observable signal that this source's out-of-band lookup missed, and every value fed
+	 * by that lookup is a casualty of the same miss — which is why all four move together
+	 * rather than the title alone. Declaring the pattern therefore asserts that the
+	 * source's title AND url both come from that lookup — true for figma, the first source
+	 * to declare it. A future source with a harvested title but a payload-derived url must
+	 * declare that difference rather than have this widened.
+	 *
+	 * The body is exempt for an `accumulateBody` source, and only there: its body is
+	 * MERGED rather than replaced, so nothing is lost and restoring would discard the
+	 * merge.
+	 *
+	 * sentry is that second declarer, and it states the difference rather than widening the
+	 * rule: its title is harvested from a prose result while its url is a pure function of
+	 * the nativeId, which IS the merge key — so the stored and incoming urls are necessarily
+	 * identical and keeping the stored one is a NO-OP, not a regression it has to accept.
+	 * A source whose url is genuinely payload-derived and can differ between two
+	 * observations of one key still may not use this as-is.
 	 *
 	 * Only a source whose title comes from somewhere OTHER than the tool payload needs
 	 * this. figma's name is harvested from role:user text across the whole transcript, so a

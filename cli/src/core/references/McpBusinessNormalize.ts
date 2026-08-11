@@ -32,6 +32,7 @@ import { normalizeContext7 } from "./sources/Context7Normalize.js";
 import { normalizeFigma } from "./sources/FigmaNormalize.js";
 import { normalizeJolliMemory } from "./sources/JolliMemoryNormalize.js";
 import { normalizeMonday, readItemIds } from "./sources/MondayNormalize.js";
+import { normalizeSentry } from "./sources/SentryNormalize.js";
 import { normalizeSlackThread } from "./sources/SlackNormalize.js";
 import { normalizeZoomDoc } from "./sources/ZoomDocNormalize.js";
 import type { ExtractOptions } from "./TranscriptEnvelopeParser.js";
@@ -80,6 +81,19 @@ interface ContextNormalizeEnv {
 	 * the file key alone — only the title falls back to a synthesized label.
 	 */
 	readonly figmaLinks?: ReadonlyMap<string, FigmaLink>;
+	/**
+	 * The RAW result text, supplied only for an `argumentsDerived` source — whose result
+	 * is prose the parser would otherwise discard after `JSON.parse` fails.
+	 *
+	 * OPTIONAL and DISPLAY-ONLY. A producer that has not wired it omits it (the Kimi
+	 * parser does), and every reference is still complete: identity, dedupe and the url
+	 * are built from the ARGUMENTS alone. Only a display field degrades — sentry's title
+	 * falls back from the error description to `Issue <id>`.
+	 *
+	 * Nothing that decides identity may read this. A best-effort parse that succeeds
+	 * sometimes would otherwise split one entity across two nativeIds.
+	 */
+	readonly rawResultText?: string;
 }
 
 /**
@@ -130,6 +144,15 @@ const CONTEXT_NORMALIZERS: Record<
 	// identical to nothing else) plus the harvested pasted-link map, which is
 	// display-only — the url is derivable from the arguments alone.
 	figma: (_payload, toolInput, env) => normalizeFigma(toolInput, env.toolName, env.figmaLinks),
+	// Registered here for the load-bearing reason, not merely because it needs the input:
+	// `CONTEXT_NORMALIZER_IDS` is what makes the Claude parser retain `toolInput` at all.
+	// A definition that sets `argumentsDerived` WITHOUT an entry here gets `{}` as its
+	// payload AND `undefined` as its input — it extracts nothing, forever, with no error
+	// anywhere.
+	//
+	// Reads the tool name (two tools spelling the same fact with different argument keys)
+	// and the raw prose result, which is display-only — see `SentryNormalize`.
+	sentry: (_payload, toolInput, env) => normalizeSentry(toolInput, env.toolName, env.rawResultText),
 };
 
 /**
@@ -150,6 +173,8 @@ export interface McpNormalizeEnv {
 	readonly opts: ExtractOptions;
 	/** See {@link ContextNormalizeEnv.figmaLinks} — optional, display-only. */
 	readonly figmaLinks?: ReadonlyMap<string, FigmaLink>;
+	/** See {@link ContextNormalizeEnv.rawResultText} — optional, display-only. */
+	readonly rawResultText?: string;
 }
 
 /**

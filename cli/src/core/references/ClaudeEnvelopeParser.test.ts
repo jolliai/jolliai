@@ -852,3 +852,100 @@ describe("ClaudeEnvelopeParser vercel", () => {
 		expect(results).toHaveLength(0);
 	});
 });
+
+/**
+ * Sentry end-to-end, on the real 2026-08-11 capture.
+ *
+ * This is the test that proves the two-part wiring works together. `argumentsDerived`
+ * alone would give the normalizer `{}` AND `undefined` input; the `CONTEXT_NORMALIZER_IDS`
+ * membership is what retains `toolInput`; and the `rawResultText` hand-off is what lets
+ * a PROSE result still produce a human title. Any one of the three missing, and the
+ * assertions below fail rather than the source silently extracting nothing.
+ */
+describe("ClaudeEnvelopeParser — sentry (arguments-derived, prose result)", () => {
+	const SENTRY_URL =
+		"https://jolli.sentry.io/issues/7665509682/?project=4511891639762944&query=is%3Aunresolved&referrer=issue-stream";
+
+	// Not JSON. `JSON.parse` fails, which is the entire point.
+	const SENTRY_PROSE = [
+		"# Issue JAVASCRIPT-NEXTJS-1 in **jolli**",
+		"",
+		"**Description**: TypeError: Object [object Object] has no method 'updateFrom'",
+		"**Status**: unresolved",
+		"**Project**: javascript-nextjs",
+	].join("\n");
+
+	function sentryLines(toolName: string, input: unknown, resultText: string): string[] {
+		return [
+			JSON.stringify({
+				message: {
+					role: "assistant",
+					content: [{ type: "tool_use", id: "s1", name: toolName, input }],
+				},
+			}),
+			JSON.stringify({
+				message: {
+					role: "user",
+					content: [{ type: "tool_result", tool_use_id: "s1", content: resultText }],
+				},
+			}),
+		];
+	}
+
+	it("survives a prose result and builds the reference from the arguments", () => {
+		const { results } = claudeEnvelopeParser.parse(
+			sentryLines("mcp__Sentry__get_sentry_resource", { url: SENTRY_URL }, SENTRY_PROSE),
+			{},
+		);
+		expect(results).toHaveLength(1);
+		const ref = extractRef(results[0].def, results[0].payload, results[0].toolName, results[0].referencedAt);
+		// Identity from the INPUT's numeric id, never the prose's short id.
+		expect(ref?.mapKey).toBe("sentry:jolli.sentry.io/7665509682");
+		// Title from the PROSE — the whole reason rawResultText is threaded through.
+		expect(ref?.title).toBe("JAVASCRIPT-NEXTJS-1 · TypeError: Object [object Object] has no method 'updateFrom'");
+		expect(ref?.url).toBe("https://jolli.sentry.io/issues/7665509682");
+	});
+
+	it("still produces a complete reference when the prose carries no Description", () => {
+		const { results } = claudeEnvelopeParser.parse(
+			sentryLines("mcp__Sentry__get_sentry_resource", { url: SENTRY_URL }, "no fields here at all"),
+			{},
+		);
+		const ref = extractRef(results[0].def, results[0].payload, results[0].toolName, results[0].referencedAt);
+		expect(ref?.mapKey).toBe("sentry:jolli.sentry.io/7665509682");
+		expect(ref?.title).toBe("Issue 7665509682");
+	});
+
+	it("collapses a read and a Seer run on one issue onto a single mapKey", () => {
+		const url = "https://jolli.sentry.io/issues/PROJECT-1Z43";
+		const read = claudeEnvelopeParser.parse(
+			sentryLines("mcp__Sentry__get_sentry_resource", { url }, SENTRY_PROSE),
+			{},
+		).results[0];
+		const seer = claudeEnvelopeParser.parse(
+			sentryLines("mcp__Sentry__analyze_issue_with_seer", { issueUrl: url }, SENTRY_PROSE),
+			{},
+		).results[0];
+		const a = extractRef(read.def, read.payload, read.toolName, read.referencedAt);
+		const b = extractRef(seer.def, seer.payload, seer.toolName, seer.referencedAt);
+		expect(b?.mapKey).toBe(a?.mapKey);
+	});
+
+	it("does not capture an enumeration tool on the same server", () => {
+		const { results } = claudeEnvelopeParser.parse(
+			sentryLines("mcp__Sentry__search_issues", { organizationSlug: "jolli" }, SENTRY_PROSE),
+			{},
+		);
+		expect(results).toHaveLength(0);
+	});
+
+	it("does not capture the execute_sentry_tool dispatcher", () => {
+		// Its tool name is constant, so a name-based allow-list cannot tell which
+		// operation it is about to run — including an enumeration.
+		const { results } = claudeEnvelopeParser.parse(
+			sentryLines("mcp__Sentry__execute_sentry_tool", { name: "find_projects", arguments: {} }, SENTRY_PROSE),
+			{},
+		);
+		expect(results).toHaveLength(0);
+	});
+});

@@ -40,6 +40,11 @@ describe("Claude producer binding", () => {
 				// case-sensitive with no normalization anywhere.
 				"mcp__Figma__",
 				"mcp__figma__",
+				// Two spellings: the observed config key `Sentry` and the `claude mcp add
+				// sentry` default. Recognition is a case-SENSITIVE startsWith, so both are
+				// needles rather than one.
+				"mcp__Sentry__",
+				"mcp__sentry__",
 			]);
 		});
 

@@ -70,6 +70,12 @@ export const SOURCE_META: Record<KnownSourceId, SourceMeta> = {
 	// hue. `symbol-color` mirrors `figmaDefinition.icon`
 	// (references/sources/definitions/figma.ts), same visual-lockstep rule as slack.
 	figma: { label: "Figma", letter: "F", icon: "symbol-color", color: "#F24E1E" },
+	// Sentry's brand purple (`#6559C6`, the rgba value its own docs publish). The letter
+	// collides with Slack's 'S', as zoom-meeting/zoom-doc already collide on 'Z' and
+	// jollimemory on 'J'; the badge colors differ, which is what the collisions rely on.
+	// `bug` matches `sentryDefinition.icon` so the CLI and the host stay in visual
+	// lockstep (the slack precedent).
+	sentry: { label: "Sentry", letter: "S", icon: "bug", color: "#6559C6" },
 };
 
 /**

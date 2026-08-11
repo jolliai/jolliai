@@ -374,7 +374,19 @@ function collectToolResults(
 				pendingEntry.toolName,
 				pendingEntry.toolInput,
 				parsedPayload,
-				{ permalinks, figmaLinks, opts },
+				// `rawResultText` ONLY for an arguments-derived source. For every other
+				// source the raw text is just the JSON already in `parsedPayload`, and
+				// handing it over would invite a normalizer to regex what it should be
+				// reading structurally. Gated here so the field means exactly one thing:
+				// the prose an arguments-derived source would otherwise have discarded.
+				//
+				// Display-only by contract — see `McpNormalizeEnv.rawResultText`.
+				{
+					permalinks,
+					figmaLinks,
+					opts,
+					...(pendingEntry.def.argumentsDerived === true ? { rawResultText: payloadText } : {}),
+				},
 			);
 			if (canonical === null) {
 				pending.delete(b.tool_use_id);

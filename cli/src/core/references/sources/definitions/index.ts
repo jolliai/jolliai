@@ -29,10 +29,10 @@
  * Kotlin side therefore ships in its own follow-up PR, where the `when` in
  * `SourceIds`/`SourceDisplay` is exhaustive and the compiler enforces completeness.
  *
- * `vercel` and `figma` are both outstanding as of 2026-08-11. **A code review that
- * reports the JVM host as broken for one of them is reporting this note** — no
- * change is wanted in the CLI/VS Code PR. Add the enum entries (plus the
- * `SourceDisplay` label/icon and the `SourceIdsTest` row) in the follow-up.
+ * `vercel`, `figma` and `sentry` are all outstanding as of 2026-08-12. **A code
+ * review that reports the JVM host as broken for one of them is reporting this
+ * note** — no change is wanted in the CLI/VS Code PR. Add the enum entries (plus
+ * the `SourceDisplay` label/icon and the `SourceIdsTest` row) in the follow-up.
  */
 
 import { asanaDefinition } from "./asana.js";
@@ -45,6 +45,7 @@ import { jolliMemoryDefinition } from "./jollimemory.js";
 import { linearDefinition } from "./linear.js";
 import { mondayDefinition } from "./monday.js";
 import { notionDefinition } from "./notion.js";
+import { sentryDefinition } from "./sentry.js";
 import { slackDefinition } from "./slack.js";
 import { vercelDefinition } from "./vercel.js";
 import { zoomDocDefinition } from "./zoom-doc.js";
@@ -71,4 +72,8 @@ export const BUILTIN_DEFINITIONS = [
 	// can neither shadow another definition nor be shadowed — its position is
 	// continuity, not a correctness constraint (unlike confluence-before-jira above).
 	figmaDefinition,
+	// Appended: both `mcp__Sentry__` / `mcp__sentry__` prefixes are unique to it, so it
+	// can neither shadow another definition nor be shadowed — its position is
+	// continuity, not a correctness constraint (unlike confluence-before-jira above).
+	sentryDefinition,
 ] as const;

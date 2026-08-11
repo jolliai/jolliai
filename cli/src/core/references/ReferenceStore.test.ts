@@ -1117,6 +1117,42 @@ describe("ReferenceStore", () => {
 			expect(back?.url).toBe("https://example.com/KEY1/design-system-v2");
 		});
 
+		// The title is the DETECTOR, not the subject: display fields and the body come from
+		// the same out-of-band lookup, so a fallback title says they are stale too. Restoring
+		// only title+url produced a row whose label named the thing and whose hover card and
+		// body did not — the halves render side by side, so the disagreement is visible.
+		it("keeps the stored display fields and body too, not just the title/url pair", async () => {
+			const harvested = fbRef({
+				title: "Design System v2",
+				url: "https://example.com/KEY1/design-system-v2",
+				description: "**Culprit:** views.js in poll",
+				fields: [{ key: "handle", label: "Handle", value: "DS-2" }],
+			});
+			await writeReferenceMarkdown(harvested, tempDir);
+
+			// A degraded re-observation: synthesized title, no fields, a thinner body.
+			const { sourcePath } = await writeReferenceMarkdown(fbRef({ description: "link only" }), tempDir);
+
+			const back = await readReferenceMarkdown(sourcePath);
+			expect(back?.title).toBe("Design System v2");
+			expect(back?.fields).toEqual([{ key: "handle", label: "Handle", value: "DS-2" }]);
+			expect(back?.description).toBe("**Culprit:** views.js in poll");
+		});
+
+		// The mirror of the url rule: absent on the stored side is not evidence against a
+		// value this observation DID resolve.
+		it("does not erase fields or a body the degraded observation itself resolved", async () => {
+			await writeReferenceMarkdown(fbRef({ title: "Design System v2" }), tempDir);
+			const { sourcePath } = await writeReferenceMarkdown(
+				fbRef({ description: "recovered body", fields: [{ key: "k", label: "K", value: "v" }] }),
+				tempDir,
+			);
+			const back = await readReferenceMarkdown(sourcePath);
+			expect(back?.title).toBe("Design System v2");
+			expect(back?.description).toBe("recovered body");
+			expect(back?.fields).toEqual([{ key: "k", label: "K", value: "v" }]);
+		});
+
 		// The rule must not pin the first harvest forever: a genuine rename still wins, and
 		// it must carry the url with it — a rename yields a new slug, so keeping the old url
 		// beside the new title would make the pair disagree.
