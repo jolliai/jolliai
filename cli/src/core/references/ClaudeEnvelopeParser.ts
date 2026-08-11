@@ -28,6 +28,7 @@ import { isAbsolute } from "node:path";
 import { createLogger } from "../../Logger.js";
 import { CLAUDE_SHELL_TOOL_NAMES, CLAUDE_TOOL_PREFIXES } from "./bindings/claude/index.js";
 import { matchCliCommand } from "./bindings/cli/index.js";
+import { type FigmaLink, scanUserFigmaLinks } from "./FigmaLink.js";
 import { isObject } from "./guards.js";
 import { CONTEXT_NORMALIZER_IDS, normalizeMcpBusiness } from "./McpBusinessNormalize.js";
 import { scanUserPermalinks } from "./SlackPermalink.js";
@@ -102,6 +103,12 @@ class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
 		// every user text line is visited exactly once regardless of how many
 		// Slack tool_results follow it.
 		const permalinks = scanUserPermalinks(lines);
+		// Figma's TITLE needs the file's human name, which no MCP payload carries; a
+		// pasted link is the only place it lives. Scanned once up front for the same
+		// reason permalinks are — every user text line is visited exactly once
+		// regardless of how many Figma tool_results follow it. Unlike Slack's, a miss
+		// here is not fatal: the url is derived from the tool arguments alone.
+		const figmaLinks = scanUserFigmaLinks(lines);
 
 		for (let i = fromLine; i < lines.length; i++) {
 			const line = lines[i];
@@ -138,7 +145,17 @@ class ClaudeEnvelopeParser implements TranscriptEnvelopeParser {
 			} else if (role === "user") {
 				/* v8 ignore stop */
 				const resultsBefore = results.length;
-				collectToolResults(blocks, i + 1, timestamp, opts.beforeTimestamp, pending, results, permalinks, opts);
+				collectToolResults(
+					blocks,
+					i + 1,
+					timestamp,
+					opts.beforeTimestamp,
+					pending,
+					results,
+					permalinks,
+					figmaLinks,
+					opts,
+				);
 				if (results.length > resultsBefore) lastResultLineIndex = i;
 			}
 		}
@@ -274,6 +291,7 @@ function collectToolResults(
 	pending: Map<string, PendingEntry>,
 	results: NormalizedToolResult[],
 	permalinks: Map<string, string>,
+	figmaLinks: ReadonlyMap<string, FigmaLink>,
 	opts: ExtractOptions,
 ): void {
 	if (beforeTimestamp !== undefined && timestamp !== undefined && timestamp > beforeTimestamp) return;
@@ -356,7 +374,7 @@ function collectToolResults(
 				pendingEntry.toolName,
 				pendingEntry.toolInput,
 				parsedPayload,
-				{ permalinks, opts },
+				{ permalinks, figmaLinks, opts },
 			);
 			if (canonical === null) {
 				pending.delete(b.tool_use_id);

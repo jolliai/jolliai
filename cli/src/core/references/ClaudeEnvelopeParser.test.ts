@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { symlinksSupported } from "../../testUtils/symlinkSupport.js";
 import { claudeEnvelopeParser } from "./ClaudeEnvelopeParser.js";
+import { extractRef } from "./SourceEngine.js";
 
 // `symlinkSync` throws EPERM on a non-elevated Windows account, so skip the
 // symlink-guard test there rather than fail the build (see symlinkSupport.ts).
@@ -366,6 +367,146 @@ describe("ClaudeEnvelopeParser context7 (arguments-derived, prose result)", () =
 			"Available Libraries:\n- /vercel/next.js",
 		);
 		expect(claudeEnvelopeParser.parse(lines, {}).results).toHaveLength(0);
+	});
+});
+
+describe("ClaudeEnvelopeParser figma (arguments-derived, non-JSON results)", () => {
+	// Every envelope below is verbatim from the real 2026-08-11 capture in session
+	// f09e9cc7 (7 calls across a design file and a FigJam board). Six of its seven
+	// results fail `JSON.parse`, which is precisely what `argumentsDerived` exists for.
+	const DESIGN = "bJRNYiLoMlBI1UIgMSnOxt";
+	const BOARD = "pb6Hry0yvWpYI0UyyCx3bt";
+
+	function call(id: string, tool: string, input: Record<string, unknown>, content: unknown): string[] {
+		return [
+			JSON.stringify({
+				message: { role: "assistant", content: [{ type: "tool_use", id, name: `mcp__Figma__${tool}`, input }] },
+			}),
+			JSON.stringify({ message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] } }),
+		];
+	}
+
+	function userText(text: string): string {
+		return JSON.stringify({ message: { role: "user", content: [{ type: "text", text }] } });
+	}
+
+	/** `get_screenshot` answers with TWO text blocks — a JSON metadata object and a prose
+	 *  download note. `extractResultPayloadText` JOINS all text blocks, so the
+	 *  concatenation is not valid JSON even though the first block alone is. */
+	const SCREENSHOT_RESULT = [
+		{
+			type: "text",
+			text: '{"image_url":"https://www.figma.com/api/mcp/asset/60607e90-5247-488d-a6db-9f611a83f8cd.png","width":323,"height":700,"format":"png","original_width":393,"original_height":852}',
+		},
+		{
+			type: "text",
+			text: 'The screenshot is hosted at the URL in the first content entry (as JSON). Download the PNG by running:\n\n  curl -L -o screenshot.png "https://www.figma.com/api/mcp/asset/60607e90-5247-488d-a6db-9f611a83f8cd.png"\n\nThe URL returns raw PNG bytes (Content-Type: image/png). The URL is short-lived — treat it like a secret.',
+		},
+	];
+
+	/** `get_metadata` blew Claude Code's tool-output cap, so the transcript holds only a
+	 *  pointer — as a BARE STRING content, not a block array. */
+	const OFFLOAD_POINTER =
+		"Error: result (908,263 characters) exceeds maximum allowed tokens. Output has been saved to /Users/nobody/.claude/projects/p/s/tool-results/mcp-Figma-get_metadata-1786415965131.txt.\nFormat: JSON array with schema: [{type: string, text: string}]";
+
+	it("keeps a get_screenshot call whose two-block result cannot be JSON-parsed", () => {
+		const lines = call(
+			"f1",
+			"get_screenshot",
+			{ fileKey: DESIGN, nodeId: "474:2318", maxDimension: 700 },
+			SCREENSHOT_RESULT,
+		);
+		const { results } = claudeEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("figma");
+		expect(results[0].payload).toMatchObject({
+			fileKey: DESIGN,
+			detail: "Viewed screenshot · node 474:2318",
+			// No pasted link in this transcript, so title and url are both synthesized —
+			// and the url still works, because it is a pure function of the file key.
+			title: "Figma file bJRNYiLo",
+			url: `https://www.figma.com/file/${DESIGN}`,
+		});
+	});
+
+	it("keeps a get_metadata call whose oversized result was offloaded and is now gone", () => {
+		const lines = call("f2", "get_metadata", { fileKey: DESIGN, nodeId: "0:1" }, OFFLOAD_POINTER);
+		const { results } = claudeEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(1);
+		expect(results[0].payload).toMatchObject({ fileKey: DESIGN, detail: "Read structure · node 0:1" });
+	});
+
+	// The capture's fourth call passes fileKey alone; Figma answers in prose with the
+	// document's page list. Requiring nodeId would have dropped it silently.
+	it("keeps a nodeId-less get_metadata call and records it as a whole-file read", () => {
+		const lines = call("f3", "get_metadata", { fileKey: DESIGN }, [
+			{
+				type: "text",
+				text: "No nodeId was provided. Listing the top-level pages of the document.\n\nTop-level pages of the document:\n- 0:1: 小程序\n- 0:2499: 外部组件库",
+			},
+		]);
+		const { results } = claudeEnvelopeParser.parse(lines, {});
+		expect(results[0].payload).toMatchObject({ detail: "Read structure (whole file)" });
+	});
+
+	it("keeps a get_figjam call whose result is XML", () => {
+		const lines = call("f4", "get_figjam", { fileKey: BOARD, nodeId: "0:1", includeImagesOfNodes: false }, [
+			{ type: "text", text: '<canvas id="0:1" name="Page 1" x="0" y="0" width="0" height="0" />' },
+		]);
+		expect(claudeEnvelopeParser.parse(lines, {}).results[0].payload).toMatchObject({
+			fileKey: BOARD,
+			detail: "Read FigJam board · node 0:1",
+		});
+	});
+
+	it("titles the file from a link pasted anywhere in the transcript", () => {
+		const lines = [
+			userText(
+				`https://www.figma.com/design/${DESIGN}/%E5%B0%8F%E7%A8%8B%E5%BA%8F--Copy-?node-id=0-1&p=f&t=2VLISxYAQv0t5i6Y-0\n\n看一下这个设计文稿`,
+			),
+			// A later turn that names no link at all still resolves, because the harvest
+			// scans the whole transcript rather than the current turn.
+			userText("那个登录页的间距再看一下"),
+			...call("f5", "get_variable_defs", { fileKey: DESIGN, nodeId: "474:2318" }, [{ type: "text", text: "{}" }]),
+		];
+		expect(claudeEnvelopeParser.parse(lines, {}).results[0].payload).toMatchObject({
+			title: "小程序--Copy-",
+			url: `https://www.figma.com/design/${DESIGN}/%E5%B0%8F%E7%A8%8B%E5%BA%8F--Copy-`,
+		});
+	});
+
+	it("ignores a write tool in the same namespace", () => {
+		const lines = call("f6", "use_figma", { operation: "create", objectType: "frame" }, [
+			{ type: "text", text: '{"ok":true}' },
+		]);
+		expect(claudeEnvelopeParser.parse(lines, {}).results).toHaveLength(0);
+	});
+
+	// Identity is the FILE, so the capture's seven calls collapse to one row per file.
+	// The parser itself does not dedupe — `mapKey` is what does, downstream.
+	it("collapses the capture's seven calls onto two file-level mapKeys", () => {
+		const lines = [
+			...call("c1", "get_metadata", { fileKey: DESIGN, nodeId: "0:1" }, OFFLOAD_POINTER),
+			...call(
+				"c2",
+				"get_screenshot",
+				{ fileKey: DESIGN, nodeId: "474:2318", maxDimension: 700 },
+				SCREENSHOT_RESULT,
+			),
+			...call("c3", "get_variable_defs", { fileKey: DESIGN, nodeId: "474:2318" }, [{ type: "text", text: "{}" }]),
+			...call("c4", "get_metadata", { fileKey: DESIGN }, [{ type: "text", text: "No nodeId was provided." }]),
+			...call("c5", "get_metadata", { fileKey: DESIGN, nodeId: "0:1" }, OFFLOAD_POINTER),
+			...call("c6", "get_figjam", { fileKey: BOARD, nodeId: "0:1", includeImagesOfNodes: false }, [
+				{ type: "text", text: '<canvas id="0:1" name="Page 1" />' },
+			]),
+			...call("c7", "get_screenshot", { fileKey: BOARD, nodeId: "0:1", maxDimension: 800 }, SCREENSHOT_RESULT),
+		];
+		const { results } = claudeEnvelopeParser.parse(lines, {});
+		expect(results).toHaveLength(7);
+		const mapKeys = new Set(
+			results.map((r) => extractRef(r.def, r.payload, r.toolName, r.referencedAt)?.mapKey).filter(Boolean),
+		);
+		expect([...mapKeys].sort()).toEqual([`figma:${BOARD}`, `figma:${DESIGN}`].sort());
 	});
 });
 

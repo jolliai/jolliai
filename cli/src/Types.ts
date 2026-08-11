@@ -1079,7 +1079,8 @@ export type KnownSourceId =
 	| "monday"
 	| "context7"
 	| "jollimemory"
-	| "vercel";
+	| "vercel"
+	| "figma";
 
 /**
  * ReferenceField — one displayable field produced by a `SourceDefinition`'s `fields` pipes.

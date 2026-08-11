@@ -24,10 +24,12 @@
  * identity one.
  */
 
+import type { FigmaLink } from "./FigmaLink.js";
 import { isObject } from "./guards.js";
 import type { SourceDefinition } from "./SourceDefinition.js";
 import { normalizeConfluence } from "./sources/ConfluenceNormalize.js";
 import { normalizeContext7 } from "./sources/Context7Normalize.js";
+import { normalizeFigma } from "./sources/FigmaNormalize.js";
 import { normalizeJolliMemory } from "./sources/JolliMemoryNormalize.js";
 import { normalizeMonday, readItemIds } from "./sources/MondayNormalize.js";
 import { normalizeSlackThread } from "./sources/SlackNormalize.js";
@@ -71,6 +73,13 @@ interface ContextNormalizeEnv {
 	 * has to be threaded rather than inferred.
 	 */
 	readonly toolName: string;
+	/**
+	 * Figma links the user pasted, keyed by the key the TOOL CALL carries (the branch
+	 * key for a branch link). OPTIONAL and DISPLAY-ONLY: a producer that has not wired
+	 * the scan omits it and every Figma reference still gets a working url built from
+	 * the file key alone — only the title falls back to a synthesized label.
+	 */
+	readonly figmaLinks?: ReadonlyMap<string, FigmaLink>;
 }
 
 /**
@@ -117,6 +126,10 @@ const CONTEXT_NORMALIZERS: Record<
 	// and a bare `recall()` arrives with the same empty input as the tools it must NOT
 	// capture, so the name is the only thing that can distinguish them.
 	jollimemory: (_payload, toolInput, env) => normalizeJolliMemory(toolInput, env.toolName),
+	// Reads the tool name (five tools, and a nodeId-less `get_metadata` is shape-
+	// identical to nothing else) plus the harvested pasted-link map, which is
+	// display-only — the url is derivable from the arguments alone.
+	figma: (_payload, toolInput, env) => normalizeFigma(toolInput, env.toolName, env.figmaLinks),
 };
 
 /**
@@ -135,6 +148,8 @@ export const CONTEXT_NORMALIZER_IDS: ReadonlySet<string> = new Set(Object.keys(C
 export interface McpNormalizeEnv {
 	readonly permalinks: Map<string, string>;
 	readonly opts: ExtractOptions;
+	/** See {@link ContextNormalizeEnv.figmaLinks} — optional, display-only. */
+	readonly figmaLinks?: ReadonlyMap<string, FigmaLink>;
 }
 
 /**

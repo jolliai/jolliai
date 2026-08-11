@@ -127,6 +127,41 @@ export interface SourceDefinition {
 	 * (falsy) for every entity-shaped source.
 	 */
 	readonly accumulateBody?: boolean;
+	/**
+	 * Regex (as a string, like every `require`) matching a title this source SYNTHESIZES
+	 * when the real one could not be recovered from the transcript. When the incoming
+	 * title matches it and the title already stored for that key does NOT, the stored
+	 * **title and url** are both kept (`ReferenceStore.mergeIntoExisting`).
+	 *
+	 * The title is the DETECTOR, not the whole subject: a synthesized title is the
+	 * observable signal that this source's out-of-band lookup missed, and every field fed
+	 * by that lookup is a casualty of the same miss. Declaring the pattern therefore
+	 * asserts that the source's title AND url both come from that lookup — true for figma,
+	 * the only source that declares it. A future source with a harvested title but a
+	 * payload-derived url must declare that difference rather than have this widened.
+	 *
+	 * Only a source whose title comes from somewhere OTHER than the tool payload needs
+	 * this. figma's name is harvested from role:user text across the whole transcript, so a
+	 * later session that pastes a slug-less deep link (`…/design/KEY?node-id=…`, which
+	 * every `figma.com/file/KEY` form also is) — or pastes none at all, which is what a
+	 * resumed session does — re-derives the same reference with the fallback label and the
+	 * fallback link. Because `upsertReferenceEntry` overwrites a row wholesale, measured:
+	 * `小程序--Copy-` + `/design/<key>/<slug>` reverted to `Figma file bJRNYiLo` +
+	 * `/file/<key>` in plans.json, in the per-reference markdown, and in the archived
+	 * `CommitSummary.references` (the archiver re-reads that markdown).
+	 *
+	 * Deliberately a *pattern* rather than a `preferPriorHarvest` boolean: a file that was
+	 * genuinely RENAMED must still update, url included — a rename yields a new slug, so
+	 * the two would otherwise disagree. The narrow cost is that a real name shaped exactly
+	 * like the fallback is read as one — for figma that needs a file literally named
+	 * "Figma file <8 word chars>" AND a hand-written `%20` slug (Figma slugifies spaces to
+	 * `-`, and `decodeSlug` deliberately does not guess them back), and the failure is
+	 * "keeps the older correct title and link".
+	 *
+	 * Absent for every other source: a payload-derived title is not recoverable-or-not,
+	 * it is simply there, and the newest read is the right answer.
+	 */
+	readonly titleFallbackPattern?: string;
 	readonly match: SourceMatch;
 	readonly wrapperKeys: ReadonlyArray<string>;
 	readonly reference: {

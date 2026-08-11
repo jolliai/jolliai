@@ -66,6 +66,10 @@ export const SOURCE_META: Record<KnownSourceId, SourceMeta> = {
 	// `vercelDefinition.icon` (references/sources/definitions/vercel.ts), same
 	// visual-lockstep rule as slack.
 	vercel: { label: "Vercel", letter: "V", icon: "rocket", color: "#4d4d4d" },
+	// Figma's mark is multicolour; `#F24E1E` is its red, the most recognizable single
+	// hue. `symbol-color` mirrors `figmaDefinition.icon`
+	// (references/sources/definitions/figma.ts), same visual-lockstep rule as slack.
+	figma: { label: "Figma", letter: "F", icon: "symbol-color", color: "#F24E1E" },
 };
 
 /**

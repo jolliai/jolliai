@@ -66,6 +66,35 @@ const { ACCUMULATING_DEF } = vi.hoisted(() => ({
 	} as unknown as import("./SourceDefinition.js").SourceDefinition,
 }));
 
+// A source declaring `titleFallbackPattern` and NOTHING else from the accumulation side —
+// the two rules in `mergeIntoExisting` are independent, and only a synthetic definition
+// can prove the title rule does not ride on `accumulateBody` (figma, the one shipped
+// source that declares the pattern, happens to declare both).
+const { FALLBACK_TITLE_DEF } = vi.hoisted(() => ({
+	FALLBACK_TITLE_DEF: {
+		id: "fbtest",
+		label: "Fallback Title Test",
+		icon: "history",
+		titleFallbackPattern: "^Unnamed [0-9a-z]{1,8}$",
+		match: { claude: { prefixes: ["mcp__fbtest__"] } },
+		wrapperKeys: [],
+		reference: {
+			nativeId: { pipe: [{ op: "path", path: "tool" }] },
+			title: { pipe: [{ op: "path", path: "tool" }] },
+			description: { pipe: [{ op: "path", path: "query" }], optional: true },
+		},
+		fields: [],
+		storage: { nativeIdPathSafe: true },
+		render: {
+			wrapperTag: "fb-tests",
+			itemTag: "item",
+			bodyTag: "content",
+			maxCharsPerReference: 2000,
+			maxTotalChars: 6000,
+		},
+	} as unknown as import("./SourceDefinition.js").SourceDefinition,
+}));
+
 vi.mock("./SourceDefinitionRegistry.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./SourceDefinitionRegistry.js")>();
 	let patched: SourceDefinitionRegistry | undefined;
@@ -77,6 +106,7 @@ vi.mock("./SourceDefinitionRegistry.js", async (importOriginal) => {
 				ACCUMULATING_DEF,
 				ARGS_ONLY_DEF,
 				TRACK_ONLY_DEF,
+				FALLBACK_TITLE_DEF,
 			]);
 			return patched;
 		},
@@ -1025,6 +1055,16 @@ describe("ReferenceStore", () => {
 			expect((back as Reference).description).toBe(entry("folder storage", T1));
 		});
 
+		it("leaves the title alone for a source that declares no fallback pattern", async () => {
+			await writeReferenceMarkdown(accRef({ title: "real name", referencedAt: T1 }), tempDir);
+			const { sourcePath, title } = await writeReferenceMarkdown(
+				accRef({ title: "acctest", referencedAt: T2 }),
+				tempDir,
+			);
+			expect(title).toBe("acctest");
+			expect((await readReferenceMarkdown(sourcePath))?.title).toBe("acctest");
+		});
+
 		it("writes the incoming body verbatim when the file on disk has an empty body", async () => {
 			// A prior write with no body parses back with `description: undefined`, so there
 			// is nothing to merge and the incoming entry stands alone.
@@ -1037,6 +1077,143 @@ describe("ReferenceStore", () => {
 			);
 			const back = await readReferenceMarkdown(sourcePath);
 			expect((back as Reference).description).toBe(entry("queue worker lock", T2));
+		});
+	});
+
+	// The figma shape, exercised through a synthetic definition: a title harvested from
+	// role:user text is not re-derivable from a later transcript that pasted a slug-less
+	// link, so the source re-emits its synthesized fallback. Without this rule that
+	// fallback overwrites the stored name in the markdown, in `plans.json` (which takes
+	// `WriteReferenceResult.title`) and in the archived `CommitSummary.references` — the
+	// archiver re-reads this same file.
+	describe("writeReferenceMarkdown — titleFallbackPattern", () => {
+		function fbRef(overrides: Partial<Reference> = {}): Reference {
+			return {
+				mapKey: "fbtest:KEY1",
+				source: "fbtest",
+				nativeId: "KEY1",
+				title: "Unnamed abc12345",
+				url: "https://example.com/KEY1",
+				referencedAt: "2026-08-11T00:00:00Z",
+				toolName: "mcp__fbtest__get_thing",
+				...overrides,
+			};
+		}
+
+		// Title AND url: both are fed by the same out-of-band lookup, so a fallback title is
+		// the signal that the url is a fallback too. Keeping only the title produced a row
+		// labelled with the real name whose link had reverted — measured, and the shape this
+		// pair of assertions exists to prevent.
+		it("keeps the stored real title AND url when the incoming title is the fallback", async () => {
+			await writeReferenceMarkdown(
+				fbRef({ title: "Design System v2", url: "https://example.com/KEY1/design-system-v2" }),
+				tempDir,
+			);
+			const { sourcePath, title, url } = await writeReferenceMarkdown(fbRef(), tempDir);
+			expect(title).toBe("Design System v2");
+			expect(url).toBe("https://example.com/KEY1/design-system-v2");
+			const back = await readReferenceMarkdown(sourcePath);
+			expect(back?.title).toBe("Design System v2");
+			expect(back?.url).toBe("https://example.com/KEY1/design-system-v2");
+		});
+
+		// The rule must not pin the first harvest forever: a genuine rename still wins, and
+		// it must carry the url with it — a rename yields a new slug, so keeping the old url
+		// beside the new title would make the pair disagree.
+		it("takes a new real title and its url over the stored pair", async () => {
+			await writeReferenceMarkdown(
+				fbRef({ title: "Design System v2", url: "https://example.com/KEY1/design-system-v2" }),
+				tempDir,
+			);
+			const { sourcePath, title, url } = await writeReferenceMarkdown(
+				fbRef({ title: "Design System v3", url: "https://example.com/KEY1/design-system-v3" }),
+				tempDir,
+			);
+			expect(title).toBe("Design System v3");
+			expect(url).toBe("https://example.com/KEY1/design-system-v3");
+			const back = await readReferenceMarkdown(sourcePath);
+			expect(back?.title).toBe("Design System v3");
+			expect(back?.url).toBe("https://example.com/KEY1/design-system-v3");
+		});
+
+		// An absent stored url is not evidence against one this observation DID resolve —
+		// a bare `url: prior.url` would erase it.
+		it("does not erase an incoming url when the stored reference had none", async () => {
+			const urlless = fbRef({ title: "Design System v2" });
+			delete (urlless as { url?: string }).url;
+			await writeReferenceMarkdown(urlless, tempDir);
+			const { sourcePath, title, url } = await writeReferenceMarkdown(fbRef(), tempDir);
+			expect(title).toBe("Design System v2");
+			expect(url).toBe("https://example.com/KEY1");
+			expect((await readReferenceMarkdown(sourcePath))?.url).toBe("https://example.com/KEY1");
+		});
+
+		// Both halves of the predicate are required. With only the incoming test, one
+		// fallback replacing another would be blocked for no reason — harmless here, but it
+		// would make the stored title depend on which fallback landed first.
+		it("lets a fallback replace a fallback", async () => {
+			await writeReferenceMarkdown(fbRef({ title: "Unnamed aaa" }), tempDir);
+			const { title } = await writeReferenceMarkdown(fbRef({ title: "Unnamed bbb" }), tempDir);
+			expect(title).toBe("Unnamed bbb");
+		});
+
+		it("uses the incoming title on a first write, with nothing on disk to prefer", async () => {
+			const { sourcePath, title } = await writeReferenceMarkdown(fbRef(), tempDir);
+			expect(title).toBe("Unnamed abc12345");
+			expect((await readReferenceMarkdown(sourcePath))?.title).toBe("Unnamed abc12345");
+		});
+
+		// The unchanged-content short-circuit returns before the write; it must report the
+		// same effective title as the writing branch, or a caller that stores the returned
+		// value gets a different answer depending on whether the bytes happened to change.
+		it("reports the effective title and url on the unchanged-content path too", async () => {
+			await writeReferenceMarkdown(
+				fbRef({ title: "Design System v2", url: "https://example.com/KEY1/design-system-v2" }),
+				tempDir,
+			);
+			const first = await writeReferenceMarkdown(fbRef(), tempDir);
+			const second = await writeReferenceMarkdown(fbRef(), tempDir);
+			expect(second.title).toBe("Design System v2");
+			expect(second.url).toBe("https://example.com/KEY1/design-system-v2");
+			expect(second.contentHash).toBe(first.contentHash);
+		});
+
+		// The production shape, on the real definition, because this is the case with a
+		// consequence beyond a cosmetic label: `figmaFileUrl` documents `/file/<key>` as
+		// UNVERIFIED for a branch key, and a single link-less scan used to overwrite the
+		// verified `/design/<parent>/branch/<branch>/<slug>` path with it.
+		it("keeps a figma branch row's verified link when a later scan harvests no link", async () => {
+			const branchKey = "BRANCHkey0000000000000";
+			const harvested = `https://www.figma.com/design/PARENTkey00000000000000/branch/${branchKey}/Design-System`;
+			const figmaRef = (over: Partial<Reference>): Reference => ({
+				mapKey: `figma:${branchKey}`,
+				source: "figma",
+				nativeId: branchKey,
+				title: "Design-System (branch)",
+				url: harvested,
+				description: "Viewed screenshot · node 474:2318",
+				referencedAt: "2026-08-11T00:00:00Z",
+				toolName: "mcp__Figma__get_screenshot",
+				...over,
+			});
+			await writeReferenceMarkdown(figmaRef({}), tempDir);
+			// A later observation with nothing to harvest: synthesized title, fallback url.
+			const { sourcePath, title, url } = await writeReferenceMarkdown(
+				figmaRef({
+					title: `Figma file ${branchKey.slice(0, 8)}`,
+					url: `https://www.figma.com/file/${branchKey}`,
+					description: "Read structure (whole file)",
+					referencedAt: "2026-08-11T01:00:00Z",
+				}),
+				tempDir,
+			);
+			expect(title).toBe("Design-System (branch)");
+			expect(url).toBe(harvested);
+			const back = await readReferenceMarkdown(sourcePath);
+			expect(back?.url).toBe(harvested);
+			// The body still accumulated — the two rules are independent.
+			expect(back?.description).toContain("Read structure (whole file)");
+			expect(back?.description).toContain("Viewed screenshot · node 474:2318");
 		});
 	});
 });

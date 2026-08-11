@@ -34,6 +34,12 @@ describe("Claude producer binding", () => {
 				// on Kimi, which only resolves generic `mcp__<server>__` prefixes.
 				"mcp__claude_ai_Vercel__",
 				"mcp__vercel__",
+				// figma declares TWO spellings of one namespace, because the segment is
+				// the user's own MCP registration name: the captured install writes
+				// `Figma`, `claude mcp add figma …` writes `figma`, and matching is
+				// case-sensitive with no normalization anywhere.
+				"mcp__Figma__",
+				"mcp__figma__",
 			]);
 		});
 

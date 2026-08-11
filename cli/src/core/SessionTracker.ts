@@ -1701,7 +1701,13 @@ export async function upsertReferenceEntry(ref: Reference, cwd: string): Promise
 	// idempotent per-key set); an accumulating markdown body is folded, so nothing here
 	// covers a lost update on the markdown if the lock is unavailable.
 	await withPlansLock(cwd, async () => {
-		const { sourcePath } = await writeReferenceMarkdown(ref, cwd);
+		// `title`/`url`, not `ref.title`/`ref.url`: for a source declaring
+		// `titleFallbackPattern` the markdown may have kept the pair already stored (a later
+		// transcript that could not re-harvest the real name re-derives the synthesized one
+		// AND the fallback link). Storing the incoming values here would leave this row
+		// disagreeing with the file it points at — and the row is what the sidebar renders
+		// and what the click opens.
+		const { sourcePath, title, url } = await writeReferenceMarkdown(ref, cwd);
 		const beforeRegistry = await loadPlansRegistry(cwd);
 		const beforeReferences = referencesOf(beforeRegistry);
 		const existing = beforeReferences[mapKey];
@@ -1710,8 +1716,8 @@ export async function upsertReferenceEntry(ref: Reference, cwd: string): Promise
 			existing !== undefined
 				? {
 						...existing,
-						title: ref.title,
-						url: ref.url,
+						title,
+						url,
 						sourcePath,
 						sourceToolName: ref.toolName,
 						updatedAt: now,
@@ -1719,8 +1725,8 @@ export async function upsertReferenceEntry(ref: Reference, cwd: string): Promise
 				: {
 						source: ref.source,
 						nativeId: ref.nativeId,
-						title: ref.title,
-						url: ref.url,
+						title,
+						url,
 						sourcePath,
 						addedAt: now,
 						updatedAt: now,

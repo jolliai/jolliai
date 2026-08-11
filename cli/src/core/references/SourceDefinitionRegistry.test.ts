@@ -44,7 +44,7 @@ describe("SourceDefinitionRegistry", () => {
 		expect(r.match("codex", "linear.get_issue")?.id).toBe("linear"); // invocation-tool path (no namespace)
 	});
 
-	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc,asana,monday,context7,jollimemory,vercel", () => {
+	it("all() is stable order linear,confluence,jira,github,notion,slack,zoom-meeting,zoom-doc,asana,monday,context7,jollimemory,vercel,figma", () => {
 		expect(
 			getRegistry()
 				.all()
@@ -63,6 +63,7 @@ describe("SourceDefinitionRegistry", () => {
 			"context7",
 			"jollimemory",
 			"vercel",
+			"figma",
 		]);
 	});
 
@@ -203,6 +204,32 @@ describe("SourceDefinitionRegistry", () => {
 		["render not an object", { ...structuredCloneOfLinear(), render: undefined }],
 	])("rejects definitions missing required structure: %s", (_label, bad) => {
 		expect(validateDefinition(bad).ok).toBe(false);
+	});
+
+	// Validated at registration, unlike a `require`, because this pattern is consulted on
+	// the WRITE path (`ReferenceStore.mergeIntoExisting`) inside the Stop hook's plans
+	// lock — a definition that only failed to compile there would throw while persisting a
+	// reference the extractor had already accepted.
+	describe("titleFallbackPattern", () => {
+		it("accepts a definition that declares none", () => {
+			const base = structuredCloneOfLinear();
+			expect((base as { titleFallbackPattern?: string }).titleFallbackPattern).toBeUndefined();
+			expect(validateDefinition(base).ok).toBe(true);
+		});
+
+		it("accepts a valid pattern", () => {
+			const ok = { ...structuredCloneOfLinear(), titleFallbackPattern: "^Figma file [0-9a-zA-Z]{1,8}$" };
+			expect(validateDefinition(ok).ok).toBe(true);
+		});
+
+		it.each([
+			["empty string", ""],
+			["not a string", 42],
+			["uncompilable regex", "^Figma file ([0-9a-zA-Z$"],
+		])("rejects %s", (_label, pattern) => {
+			const bad = { ...structuredCloneOfLinear(), titleFallbackPattern: pattern };
+			expect(validateDefinition(bad).ok).toBe(false);
+		});
 	});
 
 	it("rejects a reference key (nativeId/title/url) that is not an object", () => {

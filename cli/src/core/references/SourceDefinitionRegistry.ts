@@ -131,6 +131,21 @@ export function validateDefinition(def: unknown): { ok: true; def: SourceDefinit
 	if (typeof def.icon !== "string" || def.icon.length === 0) {
 		return { ok: false, error: "icon must be a non-empty string" };
 	}
+	// Compiled here rather than left to first use: unlike a `require`, this pattern is
+	// consulted on the WRITE path (`ReferenceStore.mergeIntoExisting`), inside the Stop
+	// hook's plans lock. A definition that failed to compile there would throw while
+	// persisting a reference the extractor had already accepted, so it is cheaper to
+	// refuse the definition at registration — which for a built-in means at load.
+	if (def.titleFallbackPattern !== undefined) {
+		if (typeof def.titleFallbackPattern !== "string" || def.titleFallbackPattern.length === 0) {
+			return { ok: false, error: "titleFallbackPattern must be a non-empty string" };
+		}
+		try {
+			new RegExp(def.titleFallbackPattern);
+		} catch (err) {
+			return { ok: false, error: `titleFallbackPattern is not a valid regex: ${(err as Error).message}` };
+		}
+	}
 	if (!isObject(def.match)) return { ok: false, error: "match must be an object" };
 	if (!Array.isArray(def.wrapperKeys)) return { ok: false, error: "wrapperKeys must be an array" };
 	if (!isObject(def.reference)) return { ok: false, error: "reference must be an object" };

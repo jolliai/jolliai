@@ -114,6 +114,20 @@ export function sanitizeNativeIdForPath(source: SourceId, nativeId: string): str
 export interface WriteReferenceResult {
 	readonly sourcePath: string;
 	readonly contentHash: string;
+	/**
+	 * The title actually WRITTEN, which is not always `ref.title` — see
+	 * {@link mergeIntoExisting}'s harvest rule. Returned because `plans.json` carries its
+	 * own copy of the title: a caller that stored `ref.title` while this file kept the
+	 * prior one would leave the registry row and the markdown disagreeing, and the row is
+	 * what the sidebar renders.
+	 */
+	readonly title: string;
+	/**
+	 * The url actually WRITTEN, for the same reason and by the same rule. Absent when the
+	 * effective reference has none (a url-less source, or one whose url could not be
+	 * resolved) — `ReferenceEntry.url` is optional for exactly that case.
+	 */
+	readonly url?: string;
 }
 
 /**
@@ -124,7 +138,7 @@ export interface WriteReferenceResult {
  * `key` defaults to `sanitizeNativeIdForPath(ref.source, ref.nativeId)`.
  *
  * **Callers must hold `withPlansLock`.** For an `accumulateBody` source this is a
- * read-modify-write (see {@link mergeIntoExistingBody}), so two unsynchronized
+ * read-modify-write (see {@link mergeIntoExisting}), so two unsynchronized
  * writers of the same key each merge into the same pre-merge body and the later
  * write drops the earlier one's entries. `upsertReferenceEntry` — the only caller —
  * holds the lock across this call for exactly that reason.
@@ -144,25 +158,31 @@ export async function writeReferenceMarkdown(ref: Reference, cwd: string): Promi
 	// prior file's body into this write, so both the bytes and the hash must describe
 	// the MERGED reference. Hashing the pre-merge `ref` would return a digest of bytes
 	// that never reach disk.
-	const effective = mergeIntoExistingBody(ref, existing);
+	const effective = mergeIntoExisting(ref, existing);
 	const content = renderMarkdown(effective);
 	const contentHash = hashReferenceContent(effective);
+	// Built once, so the unchanged-content short-circuit below cannot report a different
+	// effective title/url from the writing path — a caller that stores what it is handed
+	// must not get a different answer depending on whether the bytes happened to change.
+	const written = { title: effective.title, ...(effective.url !== undefined ? { url: effective.url } : {}) };
 
 	if (existing === content) {
 		log.debug("Reference markdown unchanged, skipping write: %s", sourcePath);
-		return { sourcePath, contentHash };
+		return { sourcePath, contentHash, ...written };
 	}
 
 	await mkdir(dirname(sourcePath), { recursive: true });
 	await writeFile(sourcePath, content, "utf-8");
 	log.debug("Wrote reference markdown: %s (%d chars)", sourcePath, content.length);
-	return { sourcePath, contentHash };
+	return { sourcePath, contentHash, ...written };
 }
 
 /**
- * For an `accumulateBody` source, fold the body already on disk into the incoming
- * reference; for every other source (and for a first write) return `ref` untouched.
+ * Fold what is already on disk for this key into the incoming reference. Two independent
+ * rules, each gated on its own opt-in declaration, so a source declaring neither (and any
+ * first write) gets `ref` back untouched.
  *
+ * **Body** — for an `accumulateBody` source, merge the prior body instead of replacing it.
  * This is one of two collapse points that must accumulate. The other is
  * `dedupeKeepLatest` in ReferenceExtractor, and neither is sufficient alone:
  * dedupe discards same-mapKey duplicates before they ever reach this store, while
@@ -171,13 +191,73 @@ export async function writeReferenceMarkdown(ref: Reference, cwd: string): Promi
  *
  * `readReferenceMarkdownFromString` strips the auto-note, so the sentinel and its
  * paragraphs can never be accumulated into the merged body.
+ *
+ * **Harvest (title + url)** — for a source declaring `titleFallbackPattern`, keep BOTH
+ * the stored title and the stored url when the incoming title is that source's
+ * synthesized fallback and the stored one is not.
+ *
+ * The two fields move together because they are two halves of one act. A source needs
+ * this flag precisely because its title comes from outside the tool payload, and for
+ * figma — the only such source — the url comes from the same place: a pasted link
+ * supplies the readable slug, lands on the right file type with no redirect hop, and
+ * keeps a branch's full `/design/<parent>/branch/<branch>/<slug>` path, while a miss
+ * falls back to the legacy universal `/file/<key>` form. Saving the title and letting
+ * the url revert is measurably worse than either extreme: it produces a row whose label
+ * says `小程序--Copy-` and whose link is `figma.com/file/bJRNYiLo…`, and for a BRANCH row
+ * it replaces a verified link with the one shape `figmaFileUrl` documents as unverified
+ * for branch keys. (The url overwrite predates the title rule — before it, both reverted
+ * together — so this is an asymmetry the title fix exposed rather than created.)
+ *
+ * A future source whose url is payload-derived while its title is harvested would want
+ * only the title half. It should declare that difference rather than have this rule
+ * loosened: the url is preserved *because* the flag's own precondition — "the title is
+ * not in the payload" — is what makes the url not in the payload either, here.
+ *
+ * The harvest rule and the body rule are deliberately NOT nested: title/url recovery has
+ * nothing to do with body accumulation, and a future source could want either alone.
+ * (figma happens to declare both.)
  */
-function mergeIntoExistingBody(ref: Reference, existing: string | undefined): Reference {
+function mergeIntoExisting(ref: Reference, existing: string | undefined): Reference {
 	if (existing === undefined) return ref;
-	if (getRegistry().byId(ref.source)?.accumulateBody !== true) return ref;
-	const prior = readReferenceMarkdownFromString(existing)?.description;
-	if (prior === undefined) return ref;
-	return { ...ref, description: mergeAccumulatedBody(prior, ref.description ?? "") };
+	const def = getRegistry().byId(ref.source);
+	if (def === undefined) return ref;
+	const prior = readReferenceMarkdownFromString(existing);
+	if (prior === null) return ref;
+
+	let out = ref;
+	if (def.accumulateBody === true && prior.description !== undefined) {
+		out = { ...out, description: mergeAccumulatedBody(prior.description, ref.description ?? "") };
+	}
+	if (keepsPriorHarvest(def, ref.title, prior.title)) {
+		// Conditional spread, never a bare `url: prior.url`: an absent stored url must not
+		// erase one this observation DID resolve. `Reference.url` is optional, and "the
+		// prior write had none" is not evidence against the incoming one.
+		out = { ...out, title: prior.title, ...(prior.url !== undefined ? { url: prior.url } : {}) };
+	}
+	return out;
+}
+
+/**
+ * Is `incoming` this source's synthesized fallback title while `prior` is a real one —
+ * i.e. did this observation recover LESS than the stored one did?
+ *
+ * Both halves are required. Testing only `incoming` would pin the very first title
+ * forever — including one fallback replacing another — and testing only `prior` would
+ * block a genuine rename. See `SourceDefinition.titleFallbackPattern`.
+ *
+ * The title is the DETECTOR for the whole harvest, not the only thing protected by it:
+ * a synthesized title is the observable signal that the out-of-band lookup missed, and
+ * every field fed by that lookup is a casualty of the same miss.
+ *
+ * Compiled per call rather than through `SourceEngine`'s cache: this runs once per
+ * reference WRITE (a handful per commit), not once per payload node, and the pattern is
+ * validated at registration so it cannot throw here.
+ */
+function keepsPriorHarvest(def: SourceDefinition, incoming: string, prior: string): boolean {
+	const pattern = def.titleFallbackPattern;
+	if (pattern === undefined) return false;
+	const re = new RegExp(pattern);
+	return re.test(incoming) && !re.test(prior);
 }
 
 /**
