@@ -20,9 +20,9 @@ Run `jolli dev .` in the folder containing this file to start a dev server.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `title` | `string` | Yes | Site title. Displayed in the navbar logo and HTML `<title>`. |
-| `description` | `string` | Yes | HTML meta description. |
-| `nav` | `NavLink[]` | Yes | Legacy flat navbar links. Use `header` for dropdowns. |
+| `title` | `string` | Yes | Site title. Displayed in the navbar logo and HTML `<title>`. The only field [`schemas/site-config.json`](../schemas/site-config.json) actually requires. |
+| `description` | `string` | No | HTML meta description. Recommended — omitting it leaves the site without one. |
+| `nav` | `NavLink[]` | No | Legacy flat navbar links. Use `header` for dropdowns. |
 | `header` | `HeaderConfig` | No | Navbar with dropdown support. Overrides `nav` when set. |
 | `footer` | `FooterConfig` | No | Footer with columns, copyright, and social links. |
 | `navigation` | array | No | Content navigation tree, in one of two modes: *page mode* (an array of named top-level sections) or *simple mode* (a flat array of groups and articles). See `$defs.NavigationPage`, `NavigationGroup` and `NavigationArticle` in [`schemas/site-config.json`](../schemas/site-config.json) for the field-level shape. |
