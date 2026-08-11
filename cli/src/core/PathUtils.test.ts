@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { withPlatform } from "../testUtils/withPlatform.js";
-import { isPathInside, normalizePathForCompare, toForwardSlash } from "./PathUtils.js";
+import { isPathInside, normalizePathForCompare, normalizePathForCompareOn, toForwardSlash } from "./PathUtils.js";
 
 describe("normalizePathForCompare", () => {
 	it("unifies backslashes to forward slashes regardless of platform", () => {
@@ -59,6 +59,38 @@ describe("normalizePathForCompare", () => {
 			// Single root slash gets stripped — fine because all production callers pass absolute file paths
 			expect(normalizePathForCompare("/")).toBe("");
 		});
+	});
+
+	it("stays one-argument so a point-free `.map` cannot pass the index as a platform", () => {
+		// `["/A", "/B"].map(normalizePathForCompare)` is a real call shape in this
+		// repo (TranscriptPlanDiscovery, CommitAttributor). An optional second
+		// parameter here would receive 0, 1, 2 … from `map`, silently turning case
+		// folding off on macOS and Windows with no call site changed.
+		expect(normalizePathForCompare.length).toBe(1);
+		withPlatform("darwin", () => {
+			expect(["/Repo/A", "/Repo/B"].map(normalizePathForCompare)).toEqual(["/repo/a", "/repo/b"]);
+		});
+	});
+});
+
+describe("normalizePathForCompareOn", () => {
+	it("folds case by the NAMED platform, not the host's", () => {
+		// The bug this exists for: `mcpSocketPath(root, { platform: "darwin" })`
+		// derived a socket that differed between a macOS laptop and a Linux runner,
+		// because the flavour came from the argument and the case folding from
+		// `process.platform`.
+		withPlatform("linux", () => {
+			expect(normalizePathForCompareOn("/Repo/WT", "darwin")).toBe("/repo/wt");
+			expect(normalizePathForCompareOn("/Repo/WT", "win32")).toBe("/repo/wt");
+			expect(normalizePathForCompareOn("/Repo/WT", "linux")).toBe("/Repo/WT");
+		});
+		withPlatform("darwin", () => {
+			expect(normalizePathForCompareOn("/Repo/WT", "linux")).toBe("/Repo/WT");
+		});
+	});
+
+	it("applies the separator and trailing-slash rules on every platform", () => {
+		expect(normalizePathForCompareOn("C:\\Repo\\WT\\", "linux")).toBe("C:/Repo/WT");
 	});
 });
 

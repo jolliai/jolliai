@@ -89,21 +89,25 @@ const copyDashboardAssets = {
 
 /**
  * The two lists below define the two test tiers, and they MUST be maintained
- * together. Profiling the suite with `--reporter=json` shows 12 files carrying
- * ~96% of the runtime while the median file takes 14 ms; every one of them
- * drives real `git` subprocesses or real filesystem/lock work.
+ * together. Profiling the suite with `--reporter=json` shows a small set of
+ * files carrying ~96% of the runtime while the median file takes 14 ms; every
+ * one of them drives real `git` subprocesses or real filesystem/lock work.
  *
  * `SLOW_TEST_FILES` is the SINGLE source of truth for the split, and it drives
  * both tiers from opposite directions:
  *
  *   `--mode fast` (npm run test:fast) → EXCLUDES these files. Takes the run
- *       from ~5 min to 25-45 s (324 files, 8.3k tests). It must then also drop
+ *       from ~5 min to ~57 s (425 files, 11.2k tests). It must then also drop
  *       the source they are responsible for from the coverage denominator, or
- *       the 97/96/97/97 thresholds fail on a suite that passed (measured when
- *       this landed, at 319 files: 92.44/90.43/92.25/92.53, all green yet exit
- *       1) — that is `SLOW_ONLY_SOURCES`.
+ *       the 97/96/97/97 thresholds fail on a suite that passed — measured twice
+ *       now, most recently when the dashboard six were added: 425 files all
+ *       green, 94.93% branches, exit 1. That is `SLOW_ONLY_SOURCES`.
  *   `--mode slow` (npm run test:slow) → runs ONLY these files, as `include`
- *       (12 files, 651 tests, ~4 min, no coverage).
+ *       (21 files, 867 tests, no coverage, and its own `maxWorkers` — see below).
+ *
+ * The counts move. Re-derive them with `npx vitest list --filesOnly [--mode …]`
+ * rather than trusting this paragraph; the previous version of it still claimed
+ * 12 / 324 long after the lists had grown to 15 / 431.
  *
  * Deriving both tiers from one list is deliberate: the previous arrangement
  * duplicated the 12 paths into an npm script, where adding a 13th slow file and
@@ -143,6 +147,23 @@ const SLOW_TEST_FILES = [
 	"src/core/RepoProfile.test.ts",
 	"src/core/SpaceBindingCache.test.ts",
 	"src/daemon/DaemonServer.test.ts",
+	// The dashboard/cutover six. Added later than the rest and easy to miss why
+	// they belong: they are not "SQLite tests" — each one seeds a REAL repo and
+	// drives `git` subprocesses through cutover, so they carry the same
+	// whole-machine load profile as sync/ and install/. Profiled together they
+	// are 411 s of the directory's 419 s, with a 15x cliff to the next file
+	// (Backup 23.4 s → SotImport 1.5 s), and `CutoverEngine` at 177 s is now the
+	// single heaviest file in the suite — past `GitClient` (167 s).
+	//
+	// Leaving them in the fast tier is what made `npm run all` red on three
+	// consecutive runs while every one of them passed in isolation
+	// (`Recovery.test.ts`: 9.4 s alone, >60 s timeout under fan-out).
+	"src/dashboard/AutoCutover.test.ts",
+	"src/dashboard/Backup.test.ts",
+	"src/dashboard/CutoverEngine.test.ts",
+	"src/dashboard/CutoverRouter.test.ts",
+	"src/dashboard/ImportState.test.ts",
+	"src/dashboard/Recovery.test.ts",
 	"src/install/DispatchScripts.test.ts",
 	"src/install/GitExclude.test.ts",
 	"src/install/Installer.test.ts",
@@ -160,6 +181,18 @@ const SLOW_ONLY_SOURCES = [
 	"src/core/RepoProfile.ts",
 	"src/core/SpaceBindingCache.ts",
 	"src/daemon/DaemonServer.ts",
+	// The six dashboard/cutover sources, and ONLY those six — re-derived from a
+	// real `--mode fast` run rather than by pairing test files with same-named
+	// modules. The cliff is unambiguous: these land at 1.9-57.1% lines while the
+	// next dashboard source is at 90.1%, because the rest of the directory is
+	// covered by tests that stay in the fast tier. `DashboardDb` / `RepoRegistry`
+	// / `SotWrite` are imported by all six and are deliberately absent here.
+	"src/dashboard/AutoCutover.ts",
+	"src/dashboard/Backup.ts",
+	"src/dashboard/CutoverEngine.ts",
+	"src/dashboard/CutoverRouter.ts",
+	"src/dashboard/ImportState.ts",
+	"src/dashboard/Recovery.ts",
 	"src/install/ClaudeHookInstaller.ts",
 	"src/install/DispatchScripts.ts",
 	"src/install/GeminiHookInstaller.ts",
@@ -253,6 +286,21 @@ export default defineConfig(({ mode }) => {
 			// the cap for `fast` is a measurement question rather than a free win.
 			// Do NOT reach for `--testTimeout` — see the `testTimeout` note below
 			// for why the CLI flag cannot help.
+			//
+			// ONE value for every mode, and `--mode slow` deliberately does NOT get
+			// a tighter one — measured, because the obvious fix does not work.
+			// `CutoverEngine.test.ts` (122.8 s and green when run alone) pushes one
+			// case past the 60 s budget under the slow tier's own fan-out, and
+			// halving the workers neither fixed it nor was cheap: 6 workers took
+			// 448 s and still failed, on a DIFFERENT case in the same file, against
+			// 357 s at 9. 4 workers ran past 20 minutes without finishing.
+			//
+			// The give-away is that total test CPU is unchanged across those runs
+			// (2339 s at 6 workers vs 2328 s at 9). Whatever these files are waiting
+			// on, it is not the CPU the worker count rations — the tier is 21 files
+			// all driving `git`, and git's cost here is fsync. Fewer workers barely
+			// reduces concurrent fsync pressure, so the only thing bought was
+			// wall-clock. Do not re-litigate this without measuring an I/O lever.
 			maxWorkers: "75%",
 			// Neutralize the developer's git configuration for every test file —
 			// see `test/gitEnv.ts` (repo root, shared with the acceptance and

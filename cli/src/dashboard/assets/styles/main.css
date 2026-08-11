@@ -764,7 +764,7 @@ body {
   .mem-ctx-badge--reference { background: color-mix(in srgb, #d97706 16%, transparent); color: #b45309; }
   .mem-ctx-badge--skills { background: color-mix(in srgb, #7c3aed 14%, transparent); color: #7c3aed; }
   /* The sub-line shares the row rather than wrapping under the title: these rows
-     are single-height, and the meta is a qualifier (`JOLLI-1901 (Linear)`), not a
+     are single-height, and the meta is a qualifier (`ENG-1234 (Linear)`), not a
      second title. `min-width: 0` lets it shrink before the title does. */
   .mem-ctx-sub { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .mem-ctx-link { display: inline-flex; align-items: center; color: var(--muted); }

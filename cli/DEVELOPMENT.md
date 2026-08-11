@@ -26,28 +26,33 @@ npm run all
 
 ### Two tiers: inner loop vs gate
 
-`npm run test` is the **gate**: all 340 unit files (~8.9k tests) with `--coverage` and the 97% thresholds, 3.5 min on a quiet box and 9+ min when the machine is busy (measured 213 s and 552 s on the same commit). It is meant to run once before a commit, not once per edit. The 5 acceptance files are a separate runner (`npm run test:acceptance`, 9 tests, ~47 s) — the *root* `npm run test` chains both plus the vscode suite.
+`npm run test` is the **gate**: all 446 unit files (~12.1k tests) with `--coverage` and the 97% thresholds, 3.5 min on a quiet box and 9+ min when the machine is busy (measured 213 s and 573 s on the same commit). It is meant to run once before a commit, not once per edit. The 5 acceptance files are a separate runner (`npm run test:acceptance`, 9 tests, ~47 s) — the *root* `npm run test` chains both plus the vscode suite.
 
-**The cost is not spread evenly.** Profiling the full suite (`--reporter=json`, per-file wall time) shows **12 files account for 96.4% of the runtime** while the median file takes **14 ms**:
+**The cost is not spread evenly.** Profiling the full suite (`--reporter=json`, per-file wall time) shows **21 files account for the overwhelming majority of the runtime** while the median file takes **14 ms**:
 
 | s | file | | s | file |
 |--:|---|---|--:|---|
-| 167 | `sync/GitClient` | | 55 | `install/GitExclude` |
-| 160 | `install/Installer` | | 53 | `core/SpaceBindingCache` |
-| 153 | `sync/BootstrapMerge` | | 47 | `core/KBPathResolver` |
-| 111 | `core/BranchCommitLister` | | 41 | `install/DispatchScripts` |
+| 178 | `dashboard/CutoverEngine` | | 50 | `dashboard/Recovery` |
+| 167 | `sync/GitClient` | | 47 | `core/KBPathResolver` |
+| 160 | `install/Installer` | | 46 | `dashboard/CutoverRouter` |
+| 153 | `sync/BootstrapMerge` | | 41 | `install/DispatchScripts` |
+| 111 | `core/BranchCommitLister` | | 32 | `dashboard/ImportState` |
 | 101 | `core/RepoProfile` | | 30 | `core/Locks` |
-| 57 | `backfill/CommitTargetIndex` | | 30 | `sync/SyncBootstrap` |
+| 82 | `dashboard/AutoCutover` | | 30 | `sync/SyncBootstrap` |
+| 57 | `backfill/CommitTargetIndex` | | 23 | `dashboard/Backup` |
+| 55 | `install/GitExclude` | | | plus `core/FileDiscardService`, |
+| 53 | `core/SpaceBindingCache` | | | `core/GitOps.stateRoot.realgit`, `daemon/DaemonServer` |
 
-Every one of them drives real `git` subprocesses or real filesystem/lock work. The other 328 files sum to well under a minute. So the tiers split along that line:
+Every one of them drives real `git` subprocesses or real filesystem/lock work. The other 425 files sum to well under a minute. So the tiers split along that line:
 
 ```bash
-# 328 light files WITH coverage — 8.3k tests in ~25-45s (load-dependent).
+# 425 light files WITH coverage — 11.2k tests in ~57s (load-dependent).
 # The default inner loop.
 npm run test:fast
 
-# The 12 heavy files above — 651 tests, ~4 min, no coverage.
-# Run when you touch sync/, install/, or git plumbing.
+# The 21 heavy files above — 867 tests, no coverage, and HALF the worker count
+# (see "slow tier gets its own concurrency" below).
+# Run when you touch sync/, install/, git plumbing or dashboard/ cutover.
 npm run test:slow
 
 # Only tests whose import graph reaches your changes
@@ -107,7 +112,9 @@ The `core.excludesFile` neutralization is the non-obvious one: the XDG excludes 
 Rules that follow from this, each learned the hard way:
 
 - **Tune timeouts in the vitest config only** — [`vite.config.ts`](vite.config.ts) for the unit tiers, [`vitest.acceptance.config.ts`](vitest.acceptance.config.ts) for acceptance, `vscode/vitest.config.ts` for the extension (all three sit at 60 s). A per-file `vi.setConfig({ testTimeout })` *replaces* the global rather than widening it, so it can silently shrink the budget for the files that need it most — and a `vitest --testTimeout=…` flag cannot override such a file-local clamp. One such clamp is still live, in exactly the file that can least afford it: `vscode/src/JolliMemoryBridge.integration.test.ts` pins itself to 45 s, so the one vscode file driving a real `git init` / `config` / `commit` runs with 25% less headroom than every pure-unit file in the same suite. The CLI's two heaviest files had this same clamp removed when the globals were raised to 60 s; this one was missed.
-- **Concurrency is `maxWorkers`, not `poolOptions`.** Vitest 4 removed `poolOptions`; a config still using `poolOptions.forks.maxForks` runs at **full fan-out** and only prints a one-line `DEPRECATED` notice, which is easy to miss when you grep a long log for `FAIL`. If you tune concurrency, confirm it took effect rather than assuming — an ignored knob makes every measurement after it meaningless. Note `maxWorkers: "75%"` applies to `--mode fast` too, even though the 12 files that motivated the cap don't run there; whether lifting it for `fast` is a win is unmeasured.
+- **Concurrency is `maxWorkers`, not `poolOptions`.** Vitest 4 removed `poolOptions`; a config still using `poolOptions.forks.maxForks` runs at **full fan-out** and only prints a one-line `DEPRECATED` notice, which is easy to miss when you grep a long log for `FAIL`. If you tune concurrency, confirm it took effect rather than assuming — an ignored knob makes every measurement after it meaningless. Note `maxWorkers: "75%"` applies to `--mode fast` too, even though the heavy files that motivated the cap don't run there; whether lifting it for `fast` is a win is unmeasured.
+
+- **Lowering the worker count does NOT fix the slow tier's timeouts — measured, and the obvious fix is a trap.** After the dashboard six joined the tier, `CutoverEngine.test.ts` began pushing one case past the 60 s budget under fan-out (that file is 122.8 s and *green* when run alone). Halving `maxWorkers` for `--mode slow` looked like the answer and is not: 6 workers took **448 s and still failed**, on a *different* case in the same file, against **357 s** at 9 workers; 4 workers ran past **20 minutes** without finishing. The give-away is that total test CPU barely moved (2339 s at 6 vs 2328 s at 9) — whatever these files wait on is not the CPU the worker count rations. The tier is 21 files all driving `git`, and git's cost here is `fsync`; fewer workers barely reduces concurrent fsync pressure, so the only thing bought was wall-clock. If you want to attack this, measure an **I/O** lever (tmpfs for the scratch repos, `core.fsyncObjectFiles=false` in the test git env) or make `CutoverEngine.test.ts` itself cheaper — its `beforeEach` runs four synchronous `git` subprocesses per test, 24 times. Until then this file is expected to flake under fan-out: triage by shape, re-run it alone, and read green-in-isolation as proof.
 - **`fileParallelism: false` is not immunity from load.** The acceptance suite runs its files serially and still blew a 30 s budget when it started while the slow tier's forks were winding down (the same file passes in 11.8 s alone). Git-subprocess-bound work absorbs pressure from anything on the box, not just from sibling vitest workers.
 - **Don't credit a flag for a green run.** If a serial or low-concurrency round passes, the reduced load did it.
 - **A flaky round is a wasted round.** Vitest emits no coverage report at all when any test fails — not even a `coverage/` directory — so you cannot mine coverage numbers from a failed run. `maxWorkers` is capped below the default fan-out for exactly this reason.
@@ -544,7 +551,7 @@ The `exports` field in `cli/package.json` is what enforces this: `@jolli.ai/cli`
 
 ## Search Index & MCP Server
 
-Starting in JOLLI-1226, the CLI ships a local full-text search index plus an stdio MCP server that exposes JolliMemory's history to AI agents.
+The CLI ships a local full-text search index plus an stdio MCP server that exposes JolliMemory's history to AI agents.
 
 ### Local search index
 
@@ -554,7 +561,11 @@ The index is also refreshed **incrementally at the end of `jolli compile`** (per
 
 ### `jolli mcp`
 
-`jolli mcp` ([McpCommand.ts](src/commands/McpCommand.ts)) starts an stdio MCP server ([McpServer.ts](src/mcp/McpServer.ts)) that AI agents connect to. `jolli mcp --reindex` forces a full rebuild of the local search index from source and exits (no server).
+`jolli mcp` ([McpCommand.ts](src/commands/McpCommand.ts)) is the stdio MCP entry AI agents connect to. `jolli mcp --reindex` forces a full rebuild of the local search index from source and exits (no server).
+
+The command does not *host* the server: it runs a thin proxy ([McpProxy.ts](src/mcp/McpProxy.ts)) that ensures one detached daemon per worktree (`jolli mcp-serve`, hidden — [McpDaemon.ts](src/mcp/McpDaemon.ts)) and forwards raw bytes to it over a unix socket / Windows named pipe. The host still spawns a plain stdio process per session and needs no config change; what changed is that the ~100 MB of storage + manifest init behind `prepareMcpRuntime` is paid **once per worktree** rather than once per session. A proxy measures ~16 MB against an 11 MB bare-Node floor. Set `JOLLI_MCP_NO_DAEMON=1` to force the old in-process server, which is also the automatic fallback whenever a daemon cannot be reached. The design contract — worktree-scoped identity, version handshake, degraded-manifest retry, and the two import graphs that keep the proxy small — is in [AGENTS.md](../AGENTS.md#jolli-mcp-is-a-proxy-the-server-is-one-daemon-per-worktree).
+
+Measuring this yourself: use `vmmap -summary <pid>` (macOS) and read **Physical footprint**, not `ps` RSS. RSS attributes ~22 MB of shared node-binary pages to every process, which made 43 servers look like 1.6 GB when they were really ~4 GB.
 
 The server exposes ten built-in tools, all pure handlers in [McpTools.ts](src/mcp/McpTools.ts):
 

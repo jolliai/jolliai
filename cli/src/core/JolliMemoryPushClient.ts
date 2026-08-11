@@ -623,16 +623,22 @@ export class JolliMemoryPushClient {
 
 	/**
 	 * Fetches the tenant's backend-defined Jolli-platform tool manifest
-	 * (`GET /api/mcp/manifest`). Best-effort by contract: EVERY failure mode —
-	 * a non-2xx status (including 404 when the surface is off and 403 when the
-	 * key lacks permission to invoke it), no api key configured, a network /
-	 * abort / timeout error, a non-JSON body, or a missing / empty tool array —
-	 * resolves to `[]` and NEVER throws, so a disabled or older backend silently
-	 * degrades to "no platform tools" instead of breaking MCP-server startup.
-	 * Malformed individual entries are dropped rather than failing the whole
-	 * manifest. Accepts either a `{ tools: [...] }` envelope or a bare array.
+	 * (`GET /api/mcp/manifest`). Best-effort by contract: it NEVER throws, so a
+	 * disabled or older backend degrades to "no platform tools" instead of
+	 * breaking MCP-server startup. Malformed individual entries are dropped
+	 * rather than failing the whole manifest. Accepts either a `{ tools: [...] }`
+	 * envelope or a bare array.
+	 *
+	 * `undefined` means the fetch FAILED — a non-2xx status (including 404 when
+	 * the surface is off and 403 when the key lacks permission), no api key
+	 * configured, a network / abort / timeout error, or a non-JSON body. `[]`
+	 * means the backend answered and this tenant genuinely has no platform tools.
+	 * Both used to be `[]`, which cost the caller the only signal it had: the
+	 * daemon retries a failed fetch on the next connection, and an empty tenant
+	 * therefore re-fetched the manifest on EVERY connection, forever, with the
+	 * await sitting in front of that client's server construction.
 	 */
-	async fetchManifest(): Promise<PlatformToolManifestEntry[]> {
+	async fetchManifest(): Promise<PlatformToolManifestEntry[] | undefined> {
 		try {
 			const { status, json, parseFailed } = await this.call<unknown>(
 				"GET",
@@ -641,15 +647,15 @@ export class JolliMemoryPushClient {
 				MANIFEST_TIMEOUT_MS,
 			);
 			if (status < 200 || status >= 300 || parseFailed) {
-				return [];
+				return undefined;
 			}
 			return extractManifestTools(json)
 				.map(toPlatformToolEntry)
 				.filter((entry): entry is PlatformToolManifestEntry => entry !== null);
 		} catch {
 			// NotAuthenticatedError (no key / no resolvable URL), a rejected fetch,
-			// or an abort — all collapse to "no platform tools".
-			return [];
+			// or an abort — none of which distinguish "no tools" from "could not ask".
+			return undefined;
 		}
 	}
 

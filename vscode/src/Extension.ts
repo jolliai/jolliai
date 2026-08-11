@@ -540,7 +540,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		extensionPath: context.extensionPath,
 	});
 
-	// ── Telemetry (JOLLI-1785) ────────────────────────────────────────────────
+	// ── Telemetry ─────────────────────────────────────────────────────────────
 	// Bootstrap anonymous, content-free usage telemetry and show the loud
 	// first-run notice once. Honors VS Code's own telemetry setting via
 	// `isTelemetryEnabled`. Fire-and-forget — never blocks activation.
@@ -558,7 +558,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			void reinitExtensionTelemetry(workspaceRoot, !enabled);
 		}),
 	);
-	// JOLLI-1956: UI-decoupled background telemetry flush. The sidebar's 60s tick
+	// UI-decoupled background telemetry flush. The sidebar's 60s tick
 	// only drains the shared buffer while the panel is visible, so a user who keeps
 	// it closed would never upload. Flush once now (drains anything a prior session
 	// left buffered) and then on a fixed interval, regardless of panel state.
@@ -2044,7 +2044,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	runInitializeKB().finally(() => {
 		clearTimeout(kbInitWatchdog);
 		resolveKbInit();
-		// Pre-push sync catch-up (JOLLI-1900): retry any commits left in
+		// Pre-push sync catch-up: retry any commits left in
 		// push-pending.json from a previous session, now that storage is
 		// initialized. Fire-and-forget; fully guarded (never throws, no-ops when
 		// nothing is pending or the user isn't signed in).
@@ -2756,7 +2756,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					} catch (err) {
 						handleError("enable.catchUpDiscovery")(err);
 					}
-					// JOLLI-1904 (funnel): surface enabled. Mirrors IntelliJ
+					// Funnel: surface enabled. Mirrors IntelliJ
 					// surface_enabled { trigger }; surface=vscode auto-injected.
 					track("surface_enabled", { trigger: "command" });
 					log.info("cmd", "enable succeeded — refreshing all panels");
@@ -2839,7 +2839,7 @@ export function activate(context: vscode.ExtensionContext): void {
 					log.error("cmd", "disable failed", { message: result.message });
 					vscode.window.showErrorMessage(`Jolli Memory: ${result.message}`);
 				} else {
-					// JOLLI-1904 (funnel): surface disabled. Mirrors IntelliJ
+					// Funnel: surface disabled. Mirrors IntelliJ
 					// surface_disabled { trigger }; surface=vscode auto-injected.
 					track("surface_disabled", { trigger: "command" });
 					log.info("cmd", "disable succeeded");
@@ -2929,7 +2929,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				);
 				return;
 			}
-			// JOLLI-1904: memory_committed engagement event (mirrors IntelliJ). Gather
+			// The memory_committed engagement event (mirrors IntelliJ). Gather
 			// the counts off the click path so telemetry never delays the commit.
 			void trackMemoryCommitted({
 				getFilesCount: () => filesStore.getSnapshot().files.length,
@@ -4163,7 +4163,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				);
 				return;
 			}
-			// JOLLI-1904: user invoked branch Share (mirrors IntelliJ ActionBarPanel.handleShare).
+			// User invoked branch Share (mirrors IntelliJ ActionBarPanel.handleShare).
 			track("memory_shared");
 			const readStorageResult = await bridge.createReadStorageForCurrentRepo();
 			await SummaryWebviewPanel.showWithShareModal(

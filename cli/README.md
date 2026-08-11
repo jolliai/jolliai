@@ -331,6 +331,8 @@ On top of these ten built-in tools, the server also surfaces **platform tools** 
 
 `jolli enable` registers this server automatically in your project's `.mcp.json`, so Claude Code picks it up on its next start — no manual setup. The search index is a disposable local cache (never written to the orphan branch); `--reindex` forces a fresh rebuild if you ever want to clear it.
 
+**One server per worktree, not per session.** Each AI session still launches `jolli mcp` the same way, but that process is now a thin forwarder onto a single shared background server per git worktree, so opening several sessions on one checkout no longer loads your memories once per session. The shared server shuts itself down a few minutes after its last session disconnects, and a newer Jolli install takes over from an older one automatically. If a session cannot reach it for any reason it silently serves that session on its own, so nothing depends on the daemon being up. Set `JOLLI_MCP_NO_DAEMON=1` to opt a host out entirely.
+
 ### `jolli compile`
 
 Builds your **knowledge wiki**: it ingests the memories that have accumulated across your commits and folds work on the same theme into per-topic pages, so a feature touched by ten commits reads as one evolving page instead of ten disconnected entries. The canonical topic pages are stored alongside your other memories, and a browsable `_wiki/` folder is generated in your Memory Bank. These topic pages also back the MCP server's `search` and `get_decision_timeline` tools.

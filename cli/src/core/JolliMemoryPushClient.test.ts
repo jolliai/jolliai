@@ -706,57 +706,73 @@ const TOOL_B = {
 	inputSchema: { type: "object", properties: {} },
 };
 
+/**
+ * Asserts a SUCCESSFUL fetch and narrows away the failure sentinel.
+ *
+ * The two outcomes are deliberately different values — `undefined` for "could
+ * not ask", `[]` for "asked, no tools" — so a success-path test that silently
+ * accepted `undefined` would be asserting nothing at all.
+ */
+async function fetchManifestOk(c: JolliMemoryPushClient): Promise<PlatformToolManifestEntry[]> {
+	const tools = await c.fetchManifest();
+	expect(tools).toBeDefined();
+	return tools ?? [];
+}
+
 describe("fetchManifest", () => {
 	it("returns the validated tools from a { tools: [...] } envelope", async () => {
 		const c = client(async () => jsonResponse(200, { tools: [TOOL_A, TOOL_B] }));
-		const tools = await c.fetchManifest();
+		const tools = await fetchManifestOk(c);
 		expect(tools.map((t) => t.name)).toEqual(["create_ticket", "list_projects"]);
 	});
 
 	it("accepts a bare top-level array manifest", async () => {
 		const c = client(async () => jsonResponse(200, [TOOL_A]));
-		const tools = await c.fetchManifest();
+		const tools = await fetchManifestOk(c);
 		expect(tools.map((t) => t.name)).toEqual(["create_ticket"]);
 	});
 
+	// `[]`, NOT `undefined`: the backend answered and this tenant has no platform
+	// tools. Collapsing the two is what made the daemon re-fetch the manifest on
+	// every connection for such a tenant — see McpRuntime.platformDegraded.
 	it("returns [] on an empty manifest ({} or { tools: [] })", async () => {
 		expect(await client(async () => jsonResponse(200, {})).fetchManifest()).toEqual([]);
 		expect(await client(async () => jsonResponse(200, { tools: [] })).fetchManifest()).toEqual([]);
 	});
 
-	it("returns [] on 404 (surface disabled) without throwing", async () => {
+	it("returns undefined on 404 (surface disabled) without throwing", async () => {
 		const c = client(async () => jsonResponse(404, { error: "not_found" }));
-		await expect(c.fetchManifest()).resolves.toEqual([]);
+		await expect(c.fetchManifest()).resolves.toBeUndefined();
 	});
 
-	it("returns [] on 403 (key lacks the invoke scope) without throwing", async () => {
+	it("returns undefined on 403 (key lacks the invoke scope) without throwing", async () => {
 		const c = client(async () => jsonResponse(403, { error: "forbidden" }));
-		await expect(c.fetchManifest()).resolves.toEqual([]);
+		await expect(c.fetchManifest()).resolves.toBeUndefined();
 	});
 
-	it("returns [] on a generic non-2xx without throwing", async () => {
+	it("returns undefined on a generic non-2xx without throwing", async () => {
 		const c = client(async () => jsonResponse(500, { error: "boom" }));
-		await expect(c.fetchManifest()).resolves.toEqual([]);
+		await expect(c.fetchManifest()).resolves.toBeUndefined();
 	});
 
-	it("returns [] on a non-JSON 200 body (parse failure)", async () => {
+	it("returns undefined on a non-JSON 200 body (parse failure)", async () => {
 		const c = client(async () => textResponse(200, "<html>200 OK</html>"));
-		await expect(c.fetchManifest()).resolves.toEqual([]);
+		await expect(c.fetchManifest()).resolves.toBeUndefined();
 	});
 
-	it("returns [] when the fetch rejects (network error / abort)", async () => {
+	it("returns undefined when the fetch rejects (network error / abort)", async () => {
 		const c = client(async () => {
 			throw new Error("network down");
 		});
-		await expect(c.fetchManifest()).resolves.toEqual([]);
+		await expect(c.fetchManifest()).resolves.toBeUndefined();
 	});
 
-	it("returns [] (not a throw) when no api key is configured", async () => {
+	it("returns undefined (not a throw) when no api key is configured", async () => {
 		const c = new JolliMemoryPushClient({
 			fetchImpl: async () => jsonResponse(200, { tools: [TOOL_A] }),
 			apiKeyProvider: async () => undefined,
 		});
-		await expect(c.fetchManifest()).resolves.toEqual([]);
+		await expect(c.fetchManifest()).resolves.toBeUndefined();
 	});
 
 	it("drops malformed entries but keeps the valid ones", async () => {
@@ -789,7 +805,7 @@ describe("fetchManifest", () => {
 				],
 			}),
 		);
-		const tools = await c.fetchManifest();
+		const tools = await fetchManifestOk(c);
 		expect(tools.map((t) => t.name)).toEqual(["create_ticket", "list_projects"]);
 	});
 
@@ -801,7 +817,7 @@ describe("fetchManifest", () => {
 				tools: [{ name: "ping", description: "no-arg tool", inputSchema: { type: "object" } }],
 			}),
 		);
-		const [tool] = await c.fetchManifest();
+		const [tool] = await fetchManifestOk(c);
 		expect(tool.name).toBe("ping");
 		expect(tool.inputSchema).toEqual({ type: "object", properties: {} });
 	});
@@ -823,7 +839,7 @@ describe("fetchManifest", () => {
 				],
 			}),
 		);
-		const [tool] = await c.fetchManifest();
+		const [tool] = await fetchManifestOk(c);
 		expect(tool.inputSchema).toMatchObject({
 			type: "object",
 			properties: { x: { type: "string" } },
@@ -840,7 +856,7 @@ describe("fetchManifest", () => {
 			binding: { method: "POST", path: "/api/mcp/tools/list_workflow_definitions" },
 		};
 		const c = client(async () => jsonResponse(200, { tools: [withBinding] }));
-		const [tool] = await c.fetchManifest();
+		const [tool] = await fetchManifestOk(c);
 		expect(tool.binding).toEqual({ method: "POST", path: "/api/mcp/tools/list_workflow_definitions" });
 	});
 
@@ -884,7 +900,7 @@ describe("fetchManifest", () => {
 				],
 			}),
 		);
-		const tools = await c.fetchManifest();
+		const tools = await fetchManifestOk(c);
 		expect(tools.map((t) => t.name)).toEqual([
 			"not_object",
 			"arr_binding",
@@ -903,7 +919,7 @@ describe("fetchManifest", () => {
 			menu: { label: "Create ticket", description: "Open a new ticket", order: 2 },
 		};
 		const c = client(async () => jsonResponse(200, { tools: [withMenu] }));
-		const [tool] = await c.fetchManifest();
+		const [tool] = await fetchManifestOk(c);
 		expect(tool.menu).toEqual({ label: "Create ticket", description: "Open a new ticket", order: 2 });
 	});
 
@@ -920,7 +936,7 @@ describe("fetchManifest", () => {
 				],
 			}),
 		);
-		const [tool] = await c.fetchManifest();
+		const [tool] = await fetchManifestOk(c);
 		expect(tool.menu).toEqual({ label: "Just a label" });
 	});
 
@@ -952,7 +968,7 @@ describe("fetchManifest", () => {
 				],
 			}),
 		);
-		const tools = await c.fetchManifest();
+		const tools = await fetchManifestOk(c);
 		expect(tools.map((t) => t.name)).toEqual(["not_object", "menu_array", "no_label", "blank_label"]);
 		expect(tools.every((t) => t.menu === undefined)).toBe(true);
 	});
@@ -970,7 +986,7 @@ describe("fetchManifest", () => {
 				],
 			}),
 		);
-		const [tool] = await c.fetchManifest();
+		const [tool] = await fetchManifestOk(c);
 		expect(tool.menu).toEqual({ label: "Keep me" });
 	});
 

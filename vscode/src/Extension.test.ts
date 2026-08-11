@@ -649,7 +649,7 @@ vi.mock("../../cli/src/core/SessionTracker.js", () => ({
 	getGlobalConfigDir,
 	saveConfig,
 	saveConfigScoped,
-	// Used by the telemetry bootstrap on activate (JOLLI-1785). Returns a stable
+	// Used by the telemetry bootstrap on activate. Returns a stable
 	// id with created=false so no app_installed event fires during activation tests.
 	getOrCreateInstallId: async () => ({ installId: "00000000-0000-4000-8000-000000000000", created: false }),
 }));
@@ -1076,7 +1076,7 @@ vi.mock("./views/NoteEditorWebviewPanel.js", () => ({
 vi.mock("./TelemetryActivation.js", () => ({
 	activateExtensionTelemetry: vi.fn().mockResolvedValue(undefined),
 	reinitExtensionTelemetry: vi.fn().mockResolvedValue(undefined),
-	// JOLLI-1956: activate() flushes once immediately and on a background interval.
+	// activate() flushes once immediately and on a background interval.
 	flushExtensionTelemetry: vi.fn(),
 }));
 

@@ -1,7 +1,23 @@
 /**
  * McpServer — exposes JolliMemory's search + context tools to AI agents over an
- * stdio MCP transport (JOLLI-1226 P0). Pure glue: tool schemas + a dispatch
- * table over the McpTools handlers. `startMcpServer` is invoked by `jolli mcp`.
+ * MCP transport. Pure glue: tool schemas + a dispatch table over
+ * the McpTools handlers.
+ *
+ * Split into two phases because a worktree now serves N sessions
+ * from ONE process:
+ *
+ *   - {@link prepareMcpRuntime} — the expensive, per-PROCESS half: the two cwd
+ *     refusal guards, the Logger anchor, `setActiveStorage`, and the platform-tool
+ *     manifest fetch. Measured at ~100 MB physical footprint against a real repo,
+ *     versus an 11 MB bare-Node floor, which is the entire reason the daemon
+ *     exists: it is what N sessions must stop paying N times.
+ *   - {@link createMcpServer} — the cheap, per-CONNECTION half. Each MCP client
+ *     runs its own `initialize` handshake and therefore needs its own `Server`
+ *     object, but every one of them reads through the same prepared runtime.
+ *
+ * `startMcpServer` composes the two over stdio and is what a session gets when
+ * the daemon is unavailable; `McpDaemon` composes them over a unix socket /
+ * named pipe.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -16,7 +32,6 @@ import {
 import { VERSION } from "../commands/CliUtils.js";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { JolliMemoryPushClient, type PlatformToolManifestEntry } from "../core/JolliMemoryPushClient.js";
-import { normalizePathForCompare } from "../core/PathUtils.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
@@ -30,6 +45,7 @@ import {
 	JOLLI_PROMPT_NAME,
 	type JolliMenuItem,
 } from "./JolliMenu.js";
+import { isPluginBundleCwd } from "./McpCwdGuard.js";
 import {
 	runBindSpace,
 	runDecisionTimeline,
@@ -207,7 +223,8 @@ export async function dispatchTool(cwd: string, name: string, args: Record<strin
  * interface so tests can inject a fake without constructing a live HTTP client.
  */
 export interface PlatformToolClient {
-	fetchManifest(): Promise<PlatformToolManifestEntry[]>;
+	/** `undefined` when the fetch failed; `[]` when the tenant has no platform tools. */
+	fetchManifest(): Promise<PlatformToolManifestEntry[] | undefined>;
 	invokePlatformTool(tool: PlatformToolManifestEntry, args: Record<string, unknown>): Promise<unknown>;
 }
 
@@ -220,30 +237,66 @@ export interface StartMcpServerDeps {
 }
 
 /**
- * Home-relative roots where AI hosts unpack installed plugin bundles. A server whose
- * cwd sits under one of these was launched from a bundle, not from a repository.
- *
- * Path-matching only, with NO "and it isn't a git repo" refinement on purpose: a
- * marketplace served over git leaves its cache as a real checkout, so the git test
- * would pass there and let exactly the case this guards against through. The
- * inverse mistake — a user keeping a working repository under `~/.codex/plugins/` —
- * is far less likely, and its cost is a refusal that names the directory and says
- * what to do, not a silent wrong answer.
+ * Re-exported from the leaf module [`McpCwdGuard.ts`](McpCwdGuard.ts), where it
+ * lives so the proxy can consult it without importing this module's storage and
+ * search stack. The rule and its rationale are documented there.
  */
-const PLUGIN_BUNDLE_PATH_MARKERS = ["/.codex/plugins/", "/.claude/plugins/"] as const;
+export { isPluginBundleCwd } from "./McpCwdGuard.js";
 
 /**
- * Whether `cwd` is inside an AI host's plugin-bundle cache rather than a repository.
- * Exported for tests; see the call in {@link startMcpServer} for why it matters.
+ * The per-process half of an MCP server: everything that is identical for every
+ * client of one worktree, so a daemon pays for it once instead of N times.
+ *
+ * Holds no per-connection state — see {@link createMcpServer} for that half.
  */
-export function isPluginBundleCwd(cwd: string): boolean {
-	const normalized = normalizePathForCompare(cwd);
-	return PLUGIN_BUNDLE_PATH_MARKERS.some((marker) => normalized.includes(marker));
+export interface McpRuntime {
+	/** The git-worktree root every tool derives its repository from. */
+	readonly cwd: string;
+	/**
+	 * Built-ins plus any backend platform tools, in `tools/list` order.
+	 *
+	 * Handed to `tools/list` by reference, never copied: with no platform tools
+	 * this IS the static `TOOL_DEFINITIONS` array, and a daemon answers this
+	 * request once per client. Nothing mutates it.
+	 */
+	readonly toolDefinitions: ToolDefinition[];
+	/** Present only when the platform-tool gate is open. */
+	readonly platformClient?: PlatformToolClient;
+	/** Full manifest entries (with the internal `binding` / `menu` metadata) by name. */
+	readonly platformByName: Map<string, PlatformToolManifestEntry>;
+	/** Curated `/jolli` menu; empty when the platform-tool gate is closed. */
+	readonly menu: JolliMenuItem[];
+	/**
+	 * True when the gate was OPEN and the manifest fetch FAILED — i.e. this
+	 * runtime is missing tools it should have.
+	 *
+	 * Only a long-lived host acts on it. In a one-shot server the distinction is
+	 * academic: the session simply has no platform tools, exactly as before. In
+	 * the daemon it is the difference between one flaky request and every session
+	 * on the worktree silently losing 22 tools for the daemon's whole lifetime, so
+	 * `McpDaemon` retries the platform half (never the storage half) on the next
+	 * connection.
+	 *
+	 * Two things are deliberately NOT degraded. A closed gate — that is a
+	 * configured choice. And an EMPTY manifest from a healthy fetch: a tenant with
+	 * no platform tools is a normal, permanent state, and reading it as degraded
+	 * (which the first version did, having only the list length to go on) turned
+	 * the bounded retry into a manifest fetch on every single connection, awaited
+	 * in front of that client's server construction, for the daemon's lifetime.
+	 */
+	readonly platformDegraded: boolean;
 }
 
-/** Start the stdio MCP server. Resolves when the transport closes. */
-export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {}): Promise<void> {
-	// Re-entrancy guard (JOLLI-2033): the local-agent backend spawns an agent CLI in
+/**
+ * Runs the once-per-process setup and returns the shared runtime, or
+ * `undefined` when one of the two cwd guards refuses to serve this directory.
+ *
+ * A refusal is NOT an error: the caller's contract is to exit quietly (stdio) or
+ * to never bind a socket (daemon). Returning a sentinel rather than throwing
+ * keeps both callers from having to distinguish "declined" from "broken".
+ */
+export async function prepareMcpRuntime(cwd: string, deps: StartMcpServerDeps = {}): Promise<McpRuntime | undefined> {
+	// Re-entrancy guard: the local-agent backend spawns an agent CLI in
 	// a throwaway temp cwd marked JOLLI_LOCAL_AGENT_CHILD=1. That nested CLI boots
 	// the globally-registered `jolli mcp` here. Without this no-op, the storage init
 	// below roots a FolderStorage at <localFolder>/<tempDirName>/, claiming a
@@ -299,21 +352,55 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 	// users and a per-read WARN in this long-lived process.
 	setActiveStorage(await createStorage(cwd, cwd));
 
-	// Optionally register the backend-defined platform tools alongside the
-	// built-in git-memory tools. Opt-in and off by default: when the gate is
-	// closed we never construct a client or touch the network, so the server
-	// behaves exactly as a git-memory-only server.
+	return buildRuntime(cwd, await loadPlatformTools(deps));
+}
+
+/** The platform-tool half of a runtime — the only part that touches the network. */
+export interface PlatformToolSet {
+	readonly platformClient?: PlatformToolClient;
+	readonly platformTools: PlatformToolManifestEntry[];
+	readonly menu: JolliMenuItem[];
+	/** Whether the config/env gate allowed a manifest fetch at all. */
+	readonly gateOpen: boolean;
+	/**
+	 * Whether the fetch was attempted and failed — as opposed to answering that
+	 * this tenant has no platform tools. Always false when the gate is closed,
+	 * since nothing was attempted.
+	 */
+	readonly fetchFailed: boolean;
+}
+
+/**
+ * Fetches and sanitises the backend-defined platform tools.
+ *
+ * Split out of {@link prepareMcpRuntime} so it can be retried on its own. The
+ * fetch is best-effort and answers an empty list on failure, which used to cost
+ * exactly one session its platform tools. Under a shared daemon that same blip
+ * would otherwise be cached for every session on the worktree until the daemon
+ * reaps — hours, silently, with `tools/list` simply 22 entries short. See
+ * {@link McpRuntime.platformDegraded}.
+ */
+export async function loadPlatformTools(deps: StartMcpServerDeps = {}): Promise<PlatformToolSet> {
+	// Opt-in gate. When it is closed we never construct a client or touch the
+	// network, so the server behaves exactly as a git-memory-only server.
 	const config = await (deps.loadConfig ?? loadConfig)();
+	const gateOpen = isPlatformToolsEnabled(config);
 	let platformClient: PlatformToolClient | undefined;
 	let platformTools: PlatformToolManifestEntry[] = [];
+	let fetchFailed = false;
 	// The curated `/jolli` menu is computed only inside the platform-tools gate, so
 	// with the gate closed it stays empty and no prompt is ever registered.
 	let menu: JolliMenuItem[] = [];
-	if (isPlatformToolsEnabled(config)) {
+	if (gateOpen) {
 		platformClient = (deps.createPlatformClient ?? (() => new JolliMemoryPushClient()))();
 		const builtInNames = new Set(TOOL_DEFINITIONS.map((t) => t.name));
 		const seenNames = new Set<string>();
-		platformTools = (await platformClient.fetchManifest()).filter((tool) => {
+		// `undefined` is the failure signal, and it is NOT the same as `[]`. Reading
+		// an empty list as failure is what made the daemon's bounded retry unbounded
+		// for every tenant that legitimately has no platform tools.
+		const manifest = await platformClient.fetchManifest();
+		fetchFailed = manifest === undefined;
+		platformTools = (manifest ?? []).filter((tool) => {
 			if (builtInNames.has(tool.name)) {
 				// A built-in tool always wins a name collision: drop the backend tool
 				// so the built-in handler stays reachable and its wire contract is
@@ -335,15 +422,22 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 		// (empty for now). Every item is one of the tools advertised below.
 		menu = buildJolliMenu(platformTools, TOOL_DEFINITIONS);
 	}
-	const platformByName = new Map(platformTools.map((t) => [t.name, t] as const));
-	// Allowlist of tool names we may put in telemetry. `req.params.name` is
-	// client-controlled free text (the AI picks it), so an unknown-tool call
-	// would otherwise leak that arbitrary string into `command_invoked{tool}`
-	// via the catch path below — the same "external content in telemetry" leak
-	// JOLLI-1961 forbids for `arguments`. Fold any unrecognized name to
-	// "unknown" so only our own fixed identifiers are ever reported.
-	const knownToolNames = new Set<string>([...TOOL_DEFINITIONS.map((t) => t.name), ...platformByName.keys()]);
-	const telemetryToolName = (name: string): string => (knownToolNames.has(name) ? name : "unknown");
+	return { ...(platformClient ? { platformClient } : {}), platformTools, menu, gateOpen, fetchFailed };
+}
+
+/**
+ * Rebuilds a runtime with a freshly-fetched platform half, reusing everything
+ * else. The storage half is a process-global side effect that is already in
+ * place, so this touches only the network-backed part — see
+ * {@link McpRuntime.platformDegraded} for when a caller should bother.
+ */
+export async function rebuildPlatformHalf(runtime: McpRuntime, deps: StartMcpServerDeps = {}): Promise<McpRuntime> {
+	return buildRuntime(runtime.cwd, await loadPlatformTools(deps));
+}
+
+/** Assembles the advertised tool list and dispatch map from the two halves. */
+function buildRuntime(cwd: string, platform: PlatformToolSet): McpRuntime {
+	const { platformClient, platformTools, menu, gateOpen, fetchFailed } = platform;
 	// Advertise the built-ins plus any platform tools. Build the list locally and
 	// leave the static built-in registry untouched; with no platform tools the
 	// static array is returned directly. Project each platform tool down to the
@@ -356,8 +450,47 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 		description,
 		inputSchema,
 	}));
-	const toolDefinitions: ToolDefinition[] =
-		advertisedPlatformTools.length > 0 ? [...TOOL_DEFINITIONS, ...advertisedPlatformTools] : TOOL_DEFINITIONS;
+	// Logged because the daemon is detached with stdio ignored: this line is the
+	// only way to tell the three states apart — gate closed, fetch failed, or the
+	// tenant simply has no platform tools — and all three are identical to a
+	// client counting entries in `tools/list`.
+	log.info(
+		"MCP runtime ready: %d built-in + %d platform tool(s), gate=%s, manifest=%s",
+		TOOL_DEFINITIONS.length,
+		advertisedPlatformTools.length,
+		gateOpen ? "open" : "closed",
+		gateOpen ? (fetchFailed ? "fetch-failed" : "ok") : "not-fetched",
+	);
+	return {
+		cwd,
+		toolDefinitions:
+			advertisedPlatformTools.length > 0 ? [...TOOL_DEFINITIONS, ...advertisedPlatformTools] : TOOL_DEFINITIONS,
+		...(platformClient ? { platformClient } : {}),
+		platformByName: new Map(platformTools.map((t) => [t.name, t] as const)),
+		menu,
+		platformDegraded: gateOpen && fetchFailed,
+	};
+}
+
+/**
+ * Builds one MCP `Server` for ONE client connection over the shared runtime.
+ *
+ * Per-connection rather than per-process because the MCP lifecycle is
+ * per-connection: each client sends its own `initialize`, and the SDK's `Server`
+ * binds to exactly one transport. Everything expensive already happened in
+ * {@link prepareMcpRuntime}, so this is cheap enough to run per session.
+ */
+export function createMcpServer(runtime: McpRuntime): Server {
+	const { cwd, toolDefinitions, platformClient, platformByName, menu } = runtime;
+
+	// Allowlist of tool names we may put in telemetry. `req.params.name` is
+	// client-controlled free text (the AI picks it), so an unknown-tool call
+	// would otherwise leak that arbitrary string into `command_invoked{tool}`
+	// via the catch path below — the same "external content in telemetry" leak
+	// the telemetry contract forbids for `arguments`. Fold any unrecognized name to
+	// "unknown" so only our own fixed identifiers are ever reported.
+	const knownToolNames = new Set<string>([...TOOL_DEFINITIONS.map((t) => t.name), ...platformByName.keys()]);
+	const telemetryToolName = (name: string): string => (knownToolNames.has(name) ? name : "unknown");
 
 	// Advertise the `prompts` capability only when the menu is non-empty. With an
 	// empty menu (gate off, empty manifest, or no menu-flagged tools) the server is
@@ -389,7 +522,7 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 			// an error, so it stays a normal result.
 			const isError =
 				typeof result === "object" && result !== null && (result as { type?: unknown }).type === "error";
-			// Per-tool-call telemetry (JOLLI-1959). The session-level `command:"mcp"`
+			// Per-tool-call telemetry. The session-level `command:"mcp"`
 			// event (fired once at stdio disconnect) can't tell which tool the AI used;
 			// emit one event per call, tagged with the tool `name`. NEVER include
 			// `arguments` — they may carry user content. `ok` folds in push_memory's
@@ -448,7 +581,23 @@ export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {})
 		});
 	}
 
+	return server;
+}
+
+/**
+ * Start the stdio MCP server. Resolves when the transport closes.
+ *
+ * The single-process path: one client, one server, one repository. It stays the
+ * behaviour a session gets when the per-worktree daemon cannot be reached, so it
+ * must keep working standalone — `McpProxy` falls back to exactly this call.
+ */
+export async function startMcpServer(cwd: string, deps: StartMcpServerDeps = {}): Promise<void> {
+	const runtime = await prepareMcpRuntime(cwd, deps);
+	// A guard declined this cwd and has already said why. Exit quietly — the
+	// host reports a server that would not start, which is the intended signal.
+	if (!runtime) return;
+
 	const transport = new StdioServerTransport();
-	await server.connect(transport);
+	await createMcpServer(runtime).connect(transport);
 	log.info("MCP server connected over stdio (cwd=%s)", cwd);
 }

@@ -198,7 +198,7 @@ export interface SessionLinkItem {
 }
 
 /**
- * Memory-tier enrichment of a commit (JOLLI-2069 phase 2): what the summary
+ * Memory-tier enrichment of a commit: what the summary
  * pipeline learned about it. Idempotent on `(repo, hash)`; the provided
  * `insights` / `references` / `sessionLinks` arrays each REPLACE the stored
  * set (undefined = leave as is).

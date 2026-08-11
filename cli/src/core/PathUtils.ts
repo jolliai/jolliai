@@ -22,10 +22,31 @@
  *
  * NOT resolved: symlinks and `..` segments. `realpath` would require extra I/O
  * and could mask legitimate upgrades if either endpoint is a stale symlink.
+ *
+ * Stays STRICTLY one-argument. Several call sites pass it point-free
+ * (`files.map(normalizePathForCompare)`), and `map` supplies the index as the
+ * second argument — so an optional `platform` parameter here would silently
+ * receive `0`, `1`, `2` and turn case folding off on exactly the platforms that
+ * need it, with no call site changed and nothing to grep for. Callers that must
+ * name a platform use {@link normalizePathForCompareOn}.
  */
 export function normalizePathForCompare(p: string): string {
+	return normalizePathForCompareOn(p, process.platform);
+}
+
+/**
+ * {@link normalizePathForCompare} for an explicitly named platform.
+ *
+ * For the callers that already take a `platform` option and would otherwise be
+ * half-honest about it: `mcpSocketPath(root, { platform: "darwin" })` picked its
+ * socket flavour from the argument while folding case by the host, so one call
+ * answered two ways — case-folded on a macOS laptop, not on a Linux runner.
+ * Production passes `process.platform`; a named platform is a test or a
+ * cross-platform derivation, never a guess about the local filesystem.
+ */
+export function normalizePathForCompareOn(p: string, platform: NodeJS.Platform): string {
 	const unified = stripTrailingSlashes(p.replace(/\\/g, "/"));
-	return process.platform === "win32" || process.platform === "darwin" ? unified.toLowerCase() : unified;
+	return platform === "win32" || platform === "darwin" ? unified.toLowerCase() : unified;
 }
 
 /**

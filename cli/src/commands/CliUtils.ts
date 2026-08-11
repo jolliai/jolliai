@@ -139,29 +139,12 @@ export function parsePositiveInt(value: string): number | undefined {
 }
 
 /**
- * Resolves the project root directory.
- * Auto-detects the git repository root via `git rev-parse --show-toplevel`.
- * Falls back to process.cwd() if not inside a git repo.
- * Result is cached since the git root won't change during a CLI invocation.
+ * Re-exported from the leaf module [`core/ProjectDir.ts`](../core/ProjectDir.ts),
+ * where it now lives so that a caller wanting only the worktree root does not
+ * drag this module's `PluginLoader` / `SummaryStore` imports in with it. Every
+ * existing call site keeps importing it from here, and there is still one cache.
  */
-let _cachedProjectDir: string | undefined;
-
-export function resolveProjectDir(): string {
-	if (_cachedProjectDir !== undefined) return _cachedProjectDir;
-	try {
-		_cachedProjectDir = execFileSyncHidden("git", ["rev-parse", "--show-toplevel"], {
-			encoding: "utf-8",
-			// Capture git's stderr so a non-git cwd doesn't leak
-			// "fatal: not a git repository …" to the user's terminal before
-			// any of jolli's own output. The non-zero exit is already handled
-			// below — we just don't need git's complaint to escape with it.
-			stdio: ["ignore", "pipe", "pipe"],
-		}).trim();
-	} catch {
-		_cachedProjectDir = process.cwd();
-	}
-	return _cachedProjectDir;
-}
+export { resolveProjectDir } from "../core/ProjectDir.js";
 
 /**
  * True when `cwd` is inside a git working tree.

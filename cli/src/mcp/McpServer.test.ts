@@ -16,7 +16,7 @@ vi.mock("./McpTools.js", () => ({
 const { mockStorage } = vi.hoisted(() => ({ mockStorage: { kind: "mock-storage" } }));
 vi.mock("../core/StorageFactory.js", () => ({ createStorage: vi.fn().mockResolvedValue(mockStorage) }));
 vi.mock("../core/SummaryStore.js", () => ({ setActiveStorage: vi.fn() }));
-// JOLLI-1959: the CallTool handler emits per-tool telemetry; spy on track().
+// The CallTool handler emits per-tool telemetry; spy on track().
 vi.mock("../core/Telemetry.js", () => ({ track: vi.fn() }));
 
 // Capture the request handlers the server registers so the test can invoke them directly.
@@ -93,6 +93,8 @@ import {
 	dispatchTool,
 	isPluginBundleCwd,
 	type PlatformToolClient,
+	prepareMcpRuntime,
+	rebuildPlatformHalf,
 	startMcpServer,
 	TOOL_DEFINITIONS,
 } from "./McpServer.js";
@@ -274,7 +276,7 @@ describe("startMcpServer", () => {
 		expect(JSON.parse(result.content[0].text)).toEqual({ type: "error", message: "Not signed in" });
 	});
 
-	it("CallTool emits per-tool telemetry (tool name + ok=true), never the arguments (JOLLI-1959)", async () => {
+	it("CallTool emits per-tool telemetry (tool name + ok=true), never the arguments", async () => {
 		await startMcpServer("/repo");
 		await capturedHandlers[1]({ params: { name: "search", arguments: { query: "acme-secret/repo/path" } } });
 		expect(track).toHaveBeenCalledWith(
@@ -288,7 +290,7 @@ describe("startMcpServer", () => {
 		expect(JSON.stringify(props)).not.toContain("acme-secret");
 	});
 
-	it("CallTool telemetry reports ok=false when the tool throws (JOLLI-1959)", async () => {
+	it("CallTool telemetry reports ok=false when the tool throws", async () => {
 		vi.mocked(runSearch).mockRejectedValueOnce(new Error("boom"));
 		await startMcpServer("/repo");
 		await capturedHandlers[1]({ params: { name: "search", arguments: {} } });
@@ -298,7 +300,7 @@ describe("startMcpServer", () => {
 		);
 	});
 
-	it("CallTool telemetry reports ok=false for a structured {type:'error'} result (JOLLI-1959)", async () => {
+	it("CallTool telemetry reports ok=false for a structured {type:'error'} result", async () => {
 		vi.mocked(runPushMemory).mockResolvedValueOnce({ type: "error", message: "Not signed in" });
 		await startMcpServer("/repo");
 		await capturedHandlers[1]({ params: { name: "push_memory", arguments: {} } });
@@ -308,7 +310,7 @@ describe("startMcpServer", () => {
 		);
 	});
 
-	it("CallTool telemetry folds an unknown (client-controlled) tool name to 'unknown' (JOLLI-1961)", async () => {
+	it("CallTool telemetry folds an unknown (client-controlled) tool name to 'unknown'", async () => {
 		await startMcpServer("/repo");
 		// `name` is free text chosen by the MCP client; an unknown tool throws
 		// `Unknown tool: …` and hits the catch path. The raw name must never reach
@@ -371,7 +373,7 @@ describe("startMcpServer", () => {
 		expect(serverInfo).toMatchObject({ name: "jollimemory", version: VERSION });
 	});
 
-	it("no-ops entirely when running as a local-agent child (JOLLI-2033)", async () => {
+	it("no-ops entirely when running as a local-agent child", async () => {
 		// The local-agent backend spawns `claude` in a throwaway temp cwd marked
 		// JOLLI_LOCAL_AGENT_CHILD=1; a globally-installed jolli plugin then spawns
 		// `jolli mcp` there. Without this guard, createStorage roots a FolderStorage
@@ -655,7 +657,7 @@ describe("startMcpServer — platform tools", () => {
 		expect(list.tools).toHaveLength(11);
 	});
 
-	// --- /jolli menu prompt (JOLLI-1925) ---
+	// --- /jolli menu prompt ---
 
 	const platMenu: PlatformToolManifestEntry = {
 		name: "create_ticket",
@@ -736,5 +738,84 @@ describe("startMcpServer — platform tools", () => {
 		});
 		expect(serverCapabilities).toEqual({ tools: {} });
 		expect(handlerForKind("getPrompt")).toBeUndefined();
+	});
+});
+
+describe("platformDegraded / rebuildPlatformHalf", () => {
+	/** The FAILURE sentinel — the fetch could not be made or could not be read. */
+	const failedClient = (): PlatformToolClient => ({
+		fetchManifest: async () => undefined,
+		invokePlatformTool: vi.fn(),
+	});
+	/** A healthy fetch answering that this tenant has no platform tools. */
+	const emptyClient = (): PlatformToolClient => ({
+		fetchManifest: async () => [],
+		invokePlatformTool: vi.fn(),
+	});
+	const oneToolClient = (): PlatformToolClient => ({
+		fetchManifest: async () =>
+			[
+				{ name: "plat_one", description: "d", inputSchema: { type: "object", properties: {} } },
+			] as PlatformToolManifestEntry[],
+		invokePlatformTool: vi.fn(),
+	});
+
+	it("flags a runtime whose manifest fetch FAILED with the gate OPEN", async () => {
+		// Under a shared daemon this is the difference between one flaky request
+		// and every session on the worktree silently losing its platform tools.
+		const runtime = await prepareMcpRuntime("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: failedClient,
+		});
+		expect(runtime?.platformDegraded).toBe(true);
+	});
+
+	it("does NOT flag a healthy fetch that returned an EMPTY manifest", async () => {
+		// A tenant with no platform tools is a normal, permanent state. Reading it
+		// as degraded — which the first version did, having only the list length to
+		// go on — makes the daemon's bounded retry unbounded: a manifest fetch on
+		// every connection, awaited in front of that client's server construction,
+		// for the daemon's whole lifetime.
+		const runtime = await prepareMcpRuntime("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: emptyClient,
+		});
+		expect(runtime?.platformDegraded).toBe(false);
+	});
+
+	it("does NOT flag a CLOSED gate — that is a configured choice, not a failure", async () => {
+		const runtime = await prepareMcpRuntime("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: false }),
+			createPlatformClient: vi.fn(),
+		});
+		expect(runtime?.platformDegraded).toBe(false);
+	});
+
+	it("does not flag a runtime that got its tools", async () => {
+		const runtime = await prepareMcpRuntime("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: oneToolClient,
+		});
+		expect(runtime?.platformDegraded).toBe(false);
+	});
+
+	it("rebuilds only the platform half, keeping the same cwd and re-advertising the tools", async () => {
+		const degraded = await prepareMcpRuntime("/repo", {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: failedClient,
+		});
+		vi.mocked(createStorage).mockClear();
+
+		const recovered = await rebuildPlatformHalf(degraded as NonNullable<typeof degraded>, {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: oneToolClient,
+		});
+
+		expect(recovered.cwd).toBe("/repo");
+		expect(recovered.platformDegraded).toBe(false);
+		expect(recovered.toolDefinitions.map((t) => t.name)).toContain("plat_one");
+		// The storage half is a process-global side effect that is already correct;
+		// re-running it per connection would undo the sharing the daemon exists for.
+		expect(createStorage).not.toHaveBeenCalled();
 	});
 });
