@@ -95,6 +95,7 @@ import {
 	readReferenceMarkdown,
 	referenceDir,
 	referencePath,
+	referencesRoot,
 	sanitizeNativeIdForPath,
 	writeReferenceMarkdown,
 } from "./ReferenceStore.js";
@@ -194,6 +195,18 @@ describe("ReferenceStore", () => {
 		it("referencePath nests file under the referenceDir with .md suffix", () => {
 			const p = referencePath(tempDir, "jira", "KAN-5");
 			expect(p.endsWith(join("references", "jira", "KAN-5.md"))).toBe(true);
+		});
+
+		it("referencesRoot is a prefix of every source's path", () => {
+			// The property a host's cheap "could this path be a reference?" gate relies
+			// on — it decides whether to spend a `detectReferences` (one plans.json
+			// parse plus a synchronous read per active row) on a saved file.
+			const root = referencesRoot(tempDir);
+			expect(root.endsWith("references")).toBe(true);
+			for (const source of ["linear", "jira", "vercel"] as const) {
+				expect(referenceDir(tempDir, source).startsWith(root)).toBe(true);
+				expect(referencePath(tempDir, source, "KEY-1").startsWith(root)).toBe(true);
+			}
 		});
 	});
 

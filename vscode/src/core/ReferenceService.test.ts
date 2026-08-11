@@ -11,6 +11,7 @@ const {
 	mockShowWarningMessage,
 	mockDeleteReferenceMarkdown,
 	mockExecuteCommand,
+	mockShowArchivedMarkdownPreview,
 } = vi.hoisted(() => ({
 	mockLoadPlansRegistry: vi.fn(),
 	mockLoadPlansRegistryWithStatus: vi.fn(),
@@ -22,6 +23,7 @@ const {
 	mockShowWarningMessage: vi.fn(),
 	mockDeleteReferenceMarkdown: vi.fn(),
 	mockExecuteCommand: vi.fn(),
+	mockShowArchivedMarkdownPreview: vi.fn(),
 }));
 
 // plans.lock passthrough — run the RMW body inline (no real lock file I/O on the
@@ -36,12 +38,23 @@ vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	savePlansRegistry: mockSavePlansRegistry,
 }));
 
-vi.mock("../../../cli/src/core/references/ReferenceStore.js", () => ({
+// Partial: only the delete is stubbed. `readReferenceMarkdownFromString` stays REAL
+// because `renderReferenceForPreview` parses through it, and a stub there would make
+// the header assertions pass against a fake parser rather than the shipped one.
+vi.mock("../../../cli/src/core/references/ReferenceStore.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../../cli/src/core/references/ReferenceStore.js")>()),
 	deleteReferenceMarkdown: mockDeleteReferenceMarkdown,
 }));
 
 vi.mock("./PlanService.js", () => ({
 	getCurrentBranch: mockGetCurrentBranch,
+}));
+
+// The virtual-document scheme is a unit of its own (ArchivedMarkdownPreview.test.ts);
+// here we only assert that the preview path delegates to it with the right ref, and
+// mocking it keeps the vscode stub above from needing a provider registry.
+vi.mock("./ArchivedMarkdownPreview.js", () => ({
+	showArchivedMarkdownPreview: mockShowArchivedMarkdownPreview,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -81,6 +94,7 @@ import {
 	openReferenceInBrowser,
 	openReferenceMarkdown,
 	previewReferenceMarkdown,
+	readActiveReferenceForPreview,
 } from "./ReferenceService.js";
 
 const fieldVal = (r: ReferenceInfo | undefined, key: string): string | undefined =>
@@ -627,29 +641,88 @@ describe("openReferenceMarkdown", () => {
 	});
 });
 
+const REFERENCE_MD = [
+	"---",
+	'source: "jira"',
+	'nativeId: "KAN-5"',
+	'title: "Implement Jira adapter"',
+	'url: "https://example.atlassian.net/browse/KAN-5"',
+	'referencedAt: "2026-05-14T06:06:01.123Z"',
+	'sourceToolName: "mcp__claude_ai_Atlassian__getJiraIssue"',
+	"---",
+	"",
+	"The body.",
+	"",
+].join("\n");
+
+const previewInfo = (): ReferenceInfo => ({
+	kind: "reference",
+	source: "jira",
+	nativeId: "KAN-5",
+	mapKey: "jira:KAN-5",
+	title: "Implement Jira adapter",
+	url: "https://example.atlassian.net/browse/KAN-5",
+	sourcePath: "/repo/.jolli/jollimemory/references/jira/KAN-5.md",
+	addedAt: "x",
+	updatedAt: "x",
+	lastModified: "x",
+	sourceToolName: "y",
+});
+
+describe("readActiveReferenceForPreview", () => {
+	it("lifts the hidden frontmatter into a visible header", () => {
+		mockReadFileSync.mockReturnValue(REFERENCE_MD);
+		const rendered = readActiveReferenceForPreview("/repo/x.md");
+		// The header is what the fix exists for: previewing the file itself renders
+		// through markdown-it-front-matter, whose empty renderer hides all of this.
+		expect(rendered).toContain("# Implement Jira adapter");
+		expect(rendered).toContain("[https://example.atlassian.net/browse/KAN-5]");
+		expect(rendered).toContain("`jira` · captured 2026-05-14T06:06:01.123Z");
+		expect(rendered).toContain("The body.");
+		expect(rendered).not.toContain("---\nsource:");
+	});
+
+	it("returns undefined when the file is gone (archived on commit, or removed)", () => {
+		mockReadFileSync.mockImplementation(() => {
+			throw new Error("ENOENT");
+		});
+		expect(readActiveReferenceForPreview("/repo/missing.md")).toBeUndefined();
+	});
+});
+
 describe("previewReferenceMarkdown", () => {
-	it("opens the rendered markdown preview instead of a text editor", async () => {
+	beforeEach(() => {
+		mockShowArchivedMarkdownPreview.mockClear();
+		mockShowArchivedMarkdownPreview.mockResolvedValue(undefined);
+		mockExecuteCommand.mockClear();
 		mockExecuteCommand.mockResolvedValue(undefined);
 		mockShowTextDocument.mockClear();
-		await previewReferenceMarkdown({
-			kind: "reference",
-			source: "jira",
-			nativeId: "KAN-5",
-			mapKey: "jira:KAN-5",
-			title: "t",
-			url: "https://example.atlassian.net/browse/KAN-5",
-			sourcePath: "/repo/.jolli/jollimemory/references/jira/KAN-5.md",
-			branch: "main",
-			addedAt: "x",
-			updatedAt: "x",
-			lastModified: "x",
-			commitHash: null,
-			ignored: false,
-			sourceToolName: "y",
+	});
+
+	it("renders through the virtual document keyed by mapKey, not the file itself", async () => {
+		mockReadFileSync.mockReturnValue(REFERENCE_MD);
+		await previewReferenceMarkdown(previewInfo());
+		expect(mockShowArchivedMarkdownPreview).toHaveBeenCalledOnce();
+		const [ref, title, body] = mockShowArchivedMarkdownPreview.mock.calls[0];
+		// mapKey, not sourcePath: the ref survives into the URI query and is re-read
+		// after a window reload, so a path there would let a restored URI name any file.
+		expect(ref).toEqual({ ns: "reference-live", mapKey: "jira:KAN-5" });
+		expect(title).toBe("Implement Jira adapter");
+		expect(body).toContain("# Implement Jira adapter");
+		// The file itself is never handed to markdown.showPreview on this path.
+		expect(mockExecuteCommand).not.toHaveBeenCalled();
+		expect(mockShowTextDocument).not.toHaveBeenCalled();
+	});
+
+	it("falls back to previewing the file when it cannot be read", async () => {
+		mockReadFileSync.mockImplementation(() => {
+			throw new Error("EACCES");
 		});
-		// Assert the preview targets the reference's own sourcePath, not just
-		// "some URI" — catches a regression that previews the wrong file. The
-		// mocked vscode.Uri.file stringifies back to the path it was given.
+		await previewReferenceMarkdown(previewInfo());
+		expect(mockShowArchivedMarkdownPreview).not.toHaveBeenCalled();
+		// Assert the fallback targets the reference's own sourcePath, not just "some
+		// URI" — catches a regression that previews the wrong file. The mocked
+		// vscode.Uri.file stringifies back to the path it was given.
 		const previewCall = mockExecuteCommand.mock.calls.find(
 			(c) => c[0] === "markdown.showPreview",
 		);

@@ -11,10 +11,7 @@
  *     (`www.notion.so` / `notion.so` / `app.notion.com` / `*.notion.site`),
  *     HTTPS only, matched case-insensitively (`requireFlags: "i"`) since the
  *     adapter's `isAllowedHost` compared against `new URL().hostname`, which
- *     is always lowercased. Fidelity note: the adapter's `isAllowedHost` parses
- *     the URL structurally (`new URL`), which is marginally stricter against
- *     userinfo tricks (`https://evil@www.notion.so.evil.example/...`) than
- *     this raw regex. No fixture exercises that gap; flagged per the design brief.
+ *     is always lowercased.
  *   - `text` → description: the `<content>…</content>` envelope body
  *     (`CONTENT_BLOCK` regex, first match only — the adapter never scans for
  *     more than one content block), optional.
@@ -25,7 +22,23 @@
 import type { SourceDefinition } from "../../SourceDefinition.js";
 
 const PAGE_ID_PATTERN = "[-/]([0-9a-fA-F]{32})(?=[/?#]|$)";
-const ALLOWED_URL = "^https://(www\\.notion\\.so|notion\\.so|app\\.notion\\.com|[^/]+\\.notion\\.site)/";
+/**
+ * The wildcard arm's character class is a HOSTNAME charset, not "anything but a
+ * slash". The three literal arms are safe on their own — each is anchored on both
+ * sides (`^https://` and the trailing `/`), so the whole authority is pinned. The
+ * `*.notion.site` arm is not: `[^/]` admitted every byte that ENDS the host for the
+ * URL parser, so a value could match `.notion.site/` while resolving somewhere else.
+ * `https://evil.example?x=.notion.site/`, `…#.notion.site/`, `…\.notion.site/`,
+ * `https://user@evil.example?.notion.site/` and `https://evil.example:8443?.notion.site/`
+ * all passed the old class and all navigate to `evil.example` — and this url is
+ * rendered as a clickable link in the sidebar, in the archived markdown, and in memory
+ * pushed to a Space. Only `[A-Za-z0-9.-]` can reach the `.notion.site` suffix now, and
+ * a string of those bytes is read as the host in its entirety, so matching the suffix
+ * and resolving to it are the same thing again. The dot stays in the class so a
+ * multi-label subdomain still passes. Same reasoning, and the same charset, as
+ * `vercelDefinition`'s `url` require.
+ */
+const ALLOWED_URL = "^https://(www\\.notion\\.so|notion\\.so|app\\.notion\\.com|[A-Za-z0-9.-]+\\.notion\\.site)/";
 const CONTENT_BLOCK = "<content\\b[^>]*>([\\s\\S]*?)</content>";
 
 export const notionDefinition: SourceDefinition = {

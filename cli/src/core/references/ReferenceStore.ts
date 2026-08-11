@@ -39,9 +39,24 @@ import { getRegistry } from "./SourceDefinitionRegistry.js";
 
 const log = createLogger("ReferenceStore");
 
+/**
+ * Absolute directory `<jolliMemoryDir>/references` — the parent of every per-source
+ * folder, and therefore a prefix EVERY reference `sourcePath` starts with.
+ *
+ * Exported so a host can cheaply decide "could this path be a reference?" without
+ * asking the bridge: `detectReferences` costs one plans.json parse plus a synchronous
+ * read per active row, which is far too much to spend on a path that structurally
+ * cannot be one. Mirrors `getNotesDir`, which the save-side watcher gate already uses
+ * for the same reason. Keeping the `"references"` segment here rather than letting a
+ * host re-spell it is what stops the two from drifting.
+ */
+export function referencesRoot(cwd: string): string {
+	return join(getJolliMemoryDir(cwd), "references");
+}
+
 /** Absolute directory `<jolliMemoryDir>/references/<source>`. */
 export function referenceDir(cwd: string, source: SourceId): string {
-	return join(getJolliMemoryDir(cwd), "references", source);
+	return join(referencesRoot(cwd), source);
 }
 
 /**

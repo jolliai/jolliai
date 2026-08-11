@@ -577,6 +577,35 @@ Body text from the page.</content>
 		).toBeNull();
 	});
 
+	it("voids a host that ends in .notion.site only because the URL parser stopped earlier", () => {
+		// The `*.notion.site` arm's trailing `/` is not enough on its own: the URL parser
+		// ends the host at the first `?`, `#`, `@`, `:` or `\`, so each of these matches
+		// `.notion.site/` mid-string while navigating to `evil.example`. The reference's
+		// url becomes a clickable link in the sidebar, in the archived markdown, and in
+		// memory pushed to a Space, so the require has to be a hostname charset. The three
+		// literal arms never had this gap — they pin the whole authority.
+		for (const host of [
+			"evil.example?x=.notion.site",
+			"evil.example#.notion.site",
+			"evil.example\\.notion.site",
+			"user@evil.example?.notion.site",
+			"evil.example:8443?.notion.site",
+		]) {
+			const url = `https://${host}/Page-36c4fc101d34805ab1fdfb3e69144580`;
+			expect(extractRef(notionDefinition, { ...REAL_FETCH_PAYLOAD, url }, tool, ts), host).toBeNull();
+			// The spoof is real, not theoretical: this is where a click would land.
+			expect(new URL(url).hostname, host).not.toMatch(/notion\.site$/i);
+		}
+	});
+
+	it("accepts a multi-label notion.site subdomain", () => {
+		// The tightened charset keeps the dot, so a nested subdomain still resolves to a
+		// real `*.notion.site` host and must not void.
+		const url = "https://a.b.notion.site/Page-36c4fc101d34805ab1fdfb3e69144580";
+		expect(new URL(url).hostname).toBe("a.b.notion.site");
+		expect(extractRef(notionDefinition, { ...REAL_FETCH_PAYLOAD, url }, tool, ts)?.url).toBe(url);
+	});
+
 	it("takes the LAST (deepest) 32-hex id from a parent/child URL", () => {
 		const payload = {
 			...REAL_FETCH_PAYLOAD,

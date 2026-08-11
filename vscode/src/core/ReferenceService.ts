@@ -36,6 +36,8 @@ import type {
 } from "../../../cli/src/Types.js";
 import type { ReferenceInfo } from "../Types.js";
 import { log } from "../util/Logger.js";
+import { showArchivedMarkdownPreview } from "./ArchivedMarkdownPreview.js";
+import { renderReferenceForPreview } from "./ReferencePreviewMarkdown.js";
 
 /**
  * Reads plans.json and returns the sorted list of ReferenceInfo for the
@@ -120,14 +122,45 @@ export async function openReferenceMarkdown(info: ReferenceInfo): Promise<void> 
 }
 
 /**
- * Opens the per-reference markdown file in the rendered markdown preview.
- * Sidebar row-click path — mirrors openPlanForPreview / openNoteForPreview so
- * every Plans & Notes row previews on click; editing goes through the
- * context menu's "Edit Markdown" (openReferenceMarkdown).
+ * Reads an active reference's markdown off disk and prepares it for RENDERED display.
+ *
+ * Exported so the preview provider's post-reload resolver runs the identical rewrite:
+ * doing it at only one of the two would make a restored tab lose its header.
+ * Returns undefined when the file is gone (archived on commit, or hard-removed).
+ */
+export function readActiveReferenceForPreview(sourcePath: string): string | undefined {
+	try {
+		return renderReferenceForPreview(readFileSync(sourcePath, "utf-8"));
+	} catch (err) {
+		log.warn("reference", `cannot read reference markdown ${sourcePath}: ${String(err)}`);
+		return undefined;
+	}
+}
+
+/**
+ * Opens the reference in the rendered markdown preview. Sidebar row-click path —
+ * mirrors openPlanForPreview / openNoteForPreview so every Plans & Notes row previews
+ * on click; editing goes through the context menu's "Edit Markdown"
+ * (openReferenceMarkdown), which still opens the real file.
+ *
+ * Renders through a virtual document rather than previewing the file directly,
+ * because VS Code's markdown preview mounts `markdown-it-front-matter` with an empty
+ * renderer: previewing the file itself hides the whole frontmatter block, so the
+ * title, the url, and every display field are invisible and a bookmark-shaped
+ * reference shows a body discussing a link the reader cannot see. Same rewrite the
+ * committed snapshot preview already applies (SummaryWebviewPanel.handlePreviewReference).
+ *
+ * Falls back to previewing the file when it cannot be read or rendered: showing the
+ * body with a hidden header beats not opening anything.
  */
 export async function previewReferenceMarkdown(info: ReferenceInfo): Promise<void> {
-	const uri = vscode.Uri.file(info.sourcePath);
-	await vscode.commands.executeCommand("markdown.showPreview", uri);
+	const rendered = readActiveReferenceForPreview(info.sourcePath);
+	if (rendered === undefined) {
+		const uri = vscode.Uri.file(info.sourcePath);
+		await vscode.commands.executeCommand("markdown.showPreview", uri);
+		return;
+	}
+	await showArchivedMarkdownPreview({ ns: "reference-live", mapKey: info.mapKey }, info.title, rendered);
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────────────

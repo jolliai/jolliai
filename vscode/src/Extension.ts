@@ -71,6 +71,7 @@ import {
 	aggregateEstimatedCost,
 } from "../../cli/src/core/SummaryTree.js";
 import type { StorageProvider } from "../../cli/src/core/StorageProvider.js";
+import { referencesRoot } from "../../cli/src/core/references/ReferenceStore.js";
 import { getDashboardDbPath } from "../../cli/src/dashboard/DashboardDb.js";
 import { isManuallyDisabled, ORPHAN_BRANCH, setManuallyDisabled } from "../../cli/src/Logger.js";
 import type { LocalAgentToolId, SourceId, StatusInfo } from "../../cli/src/Types.js";
@@ -85,11 +86,14 @@ import {
 } from "./commands/SelectAllSelection.js";
 import { SquashCommand } from "./commands/SquashCommand.js";
 import {
+	hasOpenArchivedMarkdownPreviewIn,
+	refreshArchivedMarkdownPreview,
 	registerArchivedMarkdownPreview,
 	showArchivedMarkdownPreview,
 } from "./core/ArchivedMarkdownPreview.js";
 import { decodePreviewRef, encodePreviewRef, sanitizeTitleForUriPath } from "./core/PreviewUri.js";
 import { renderReferenceForPreview } from "./core/ReferencePreviewMarkdown.js";
+import { readActiveReferenceForPreview } from "./core/ReferenceService.js";
 import { getNotesDir } from "./core/NoteService.js";
 import {
 	addPlanToRegistry,
@@ -741,6 +745,18 @@ export function activate(context: vscode.ExtensionContext): void {
 				);
 				if (!summary || (summary.skills?.length ?? 0) === 0) return undefined;
 				return buildSkillsAggregateMarkdown(summary, summary.skills ?? []);
+			}
+			if (ref.ns === "reference-live") {
+				// An ACTIVE reference, re-read from the registry rather than from a path
+				// carried in the URI. `listReferences` returns only active rows, so a
+				// reference archived by a commit since the tab was opened resolves to
+				// undefined and the provider serves its explanatory body — which is the
+				// truthful outcome: that snapshot now lives on the orphan branch under a
+				// different key. Silent on miss (no toast): this runs when VS Code
+				// restores a tab, not in response to a click.
+				const references = await bridge.listReferences();
+				const info = references.find((e) => e.mapKey === ref.mapKey);
+				return info ? readActiveReferenceForPreview(info.sourcePath) : undefined;
 			}
 			return await readReferenceForPreview(
 				ref.source as SourceId,
@@ -2054,6 +2070,35 @@ export function activate(context: vscode.ExtensionContext): void {
 	// disposed via context.subscriptions above, which tears down all three
 	// watchers in one shot.
 	const notesDir = plansStore.getNotesDir();
+	const referencesDir = referencesRoot(workspaceRoot);
+
+	/**
+	 * Pushes a change to the reference markdown at `fileName` into its open preview,
+	 * if this window has one open.
+	 *
+	 * `refreshArchivedMarkdownPreview` keys on the mapKey rather than the path — the
+	 * URI deliberately carries no filesystem location, since the provider reads it
+	 * back after a window reload — so the registry is what turns one into the other.
+	 * A path backing no active row (a stray file, or one a commit already archived)
+	 * resolves to nothing and is left alone.
+	 *
+	 * Shared by the save handler below and the references watcher near the end of
+	 * `activate`, so a hand edit and an out-of-band rewrite reach the tab the same way.
+	 */
+	async function pushReferenceFileAtItsPreview(fileName: string): Promise<void> {
+		try {
+			const references = await bridge.listReferences();
+			const changed = references.find((r) => r.sourcePath === fileName);
+			if (changed) {
+				refreshArchivedMarkdownPreview({
+					ns: "reference-live",
+					mapKey: changed.mapKey,
+				});
+			}
+		} catch {
+			/* ignore — listReferences failure is non-critical here */
+		}
+	}
 
 	// ── External markdown note watcher ──────────────────────────────────────
 	// Markdown notes now reference the user's original file (outside the notes
@@ -2080,6 +2125,39 @@ export function activate(context: vscode.ExtensionContext): void {
 			} catch {
 				/* ignore — listNotes failure is non-critical here */
 			}
+			// An open reference preview does NOT refresh itself the way its two
+			// siblings do. `openPlanForPreview` / `openNoteForPreview` hand a `file:`
+			// URI to the built-in markdown preview, which re-renders on save for free;
+			// a reference renders through our own virtual document instead (the only
+			// way to lift its frontmatter into a visible header), so the body it was
+			// opened with is the body it keeps. "Edit Markdown" opens the real file, so
+			// saving one is a normal thing to do — push the change at the tab here.
+			// An out-of-band rewrite (an agent re-observing the same tool call) produces
+			// no save event at all; the references watcher near the end of `activate`
+			// covers that half.
+			//
+			// TWO gates, both about not paying for the registry read. The first is the
+			// references root, exactly like the notes-dir gate above: `listReferences`
+			// costs a plans.json parse plus a SYNCHRONOUS read per active row, and this
+			// handler runs on every markdown save anywhere in the workspace, so a path
+			// outside that tree — which structurally cannot be a reference — must not
+			// pay for the lookup.
+			//
+			// The second is the same open-preview gate the references watcher below
+			// applies, and it belongs on both paths for one reason: with no preview open,
+			// `pushReferenceFileAtItsPreview`'s only effect —
+			// `refreshArchivedMarkdownPreview` — is a guaranteed no-op (it returns early
+			// for a ref this window never opened), so the registry read behind it buys
+			// nothing at all. Leaving it off here was an inconsistency, not a policy: it
+			// made a save inside the references tree pay the exact cost the watcher path
+			// was built to avoid.
+			if (!doc.fileName.startsWith(referencesDir)) {
+				return;
+			}
+			if (!hasOpenArchivedMarkdownPreviewIn("reference-live")) {
+				return;
+			}
+			await pushReferenceFileAtItsPreview(doc.fileName);
 		}),
 	);
 
@@ -2379,6 +2457,66 @@ export function activate(context: vscode.ExtensionContext): void {
 			if (memoryDbTimer) clearTimeout(memoryDbTimer);
 		},
 	});
+
+	// ── Reference markdown watcher (open-preview refresh only) ──────────────
+	// Appended AFTER `memoryDbWatcher` deliberately, for the reason its own note
+	// gives: `Extension.test.ts` addresses watchers by their
+	// `createFileSystemWatcher` call index, so a new watcher belongs at the end of
+	// this sequence and never mid-sequence. That note's "created last" now means
+	// this watcher rather than that one.
+	//
+	// The other half of the `onDidSaveTextDocument` reference arm above. That one
+	// covers a hand edit; this covers the case that actually happens more often —
+	// an agent re-observing the same tool call, whose upsert rewrites the file out
+	// of band with no save event. A deployment polled again after its build
+	// finishes writes a genuinely different body under the SAME mapKey, so an open
+	// preview otherwise sits on the superseded state indefinitely.
+	//
+	// The two paths DO overlap: an editor save inside this tree fires here as well,
+	// so a hand edit runs both arms and refreshes the tab twice. Both are kept
+	// anyway, and the redundancy is the point rather than an oversight. The `**`
+	// below makes this a RECURSIVE watcher, and `createFileSystemWatcher`'s own API
+	// docs are explicit that "file events from recursive file watchers may be
+	// excluded based on user configuration" via `files.watcherExclude`, while simple
+	// non-recursive patterns are the ones "where the exclude settings are ignored".
+	// So a user who has excluded `.jolli` gets no events here at all, and the save
+	// arm is then the only thing that refreshes a preview they are actively editing.
+	// The dependency does not run the other way — an out-of-band write emits no save
+	// event under any settings — which is what makes this arm the removable one and
+	// the save arm the fallback. Going non-recursive is not the cheaper fix either:
+	// reference files sit one per-source directory deep, so it would mean watching
+	// each `<source>` dir separately and re-watching as new ones appear.
+	// Both arms now share the open-preview gate, so the duplicate costs two no-op
+	// predicate calls in the common case and two cheap refreshes on a real save.
+	//
+	// Not covered by PlansStore's plans.json watcher: that refreshes the ROW list,
+	// and plans.json cannot say which reference body changed. Not covered by the
+	// row list either — the preview is a virtual document whose content this module
+	// owns, which is exactly what buys the visible frontmatter header.
+	//
+	// Fires only on a real content change: `writeReferenceMarkdown` compares the
+	// rendered bytes and skips the write when they match. Delete is deliberately
+	// NOT wired — a commit archives the active file, and replacing a body the user
+	// is reading with "no longer available" is worse than leaving the last-known
+	// content up until the tab is reopened (which re-reads and says so truthfully).
+	//
+	// Gated on an open preview BEFORE the registry lookup, for the same reason the
+	// save handler gates on the references root: `listReferences` costs a plans.json
+	// parse plus a synchronous read per active row, and the overwhelmingly common
+	// case here is that no reference preview is open at all.
+	//
+	// `**` rather than the `*/*.md` the layout would allow (`referencePath` nests one
+	// per-source directory), so a future deeper layout does not silently stop matching.
+	const referencesWatcher = vscode.workspace.createFileSystemWatcher(
+		new vscode.RelativePattern(vscode.Uri.file(referencesDir), "**/*.md"),
+	);
+	const onReferenceFileWritten = (uri: vscode.Uri): void => {
+		if (!hasOpenArchivedMarkdownPreviewIn("reference-live")) return;
+		void pushReferenceFileAtItsPreview(uri.fsPath);
+	};
+	referencesWatcher.onDidCreate(onReferenceFileWritten);
+	referencesWatcher.onDidChange(onReferenceFileWritten);
+	context.subscriptions.push(referencesWatcher);
 
 
 	// COMMITS title updates are handled by the commitsStore.onChange subscription

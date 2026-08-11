@@ -53,6 +53,19 @@ export const SOURCE_META: Record<KnownSourceId, SourceMeta> = {
 	// letter collides with Jira's, as zoom-meeting/zoom-doc already collide on Z; the
 	// badge colors differ, and Jolli is the first-party brand here.
 	jollimemory: { label: "Jolli Memory", letter: "J", icon: "history", color: "#9B5CFF" },
+	// Vercel's brand mark is monochrome black, and `github`'s neutral gray is the
+	// precedent for a colorless brand here. Kept monochrome, but deliberately NOT pure
+	// `#000000`: this value is emitted as a chip `background` (SidebarCssBuilder /
+	// SummaryCssBuilder / NextMemoryCssBuilder all generate one rule per entry), and
+	// VS Code's Dark High Contrast theme paints the panel behind it pure black too —
+	// so `#000000` is the one hue in this table that can render the chip *invisible*,
+	// leaving a bare floating letter. The letter itself is safe at any value (the chip
+	// sets `color: #fff`), so only the silhouette is at stake, and a mid-dark neutral
+	// keeps it on both a white and a black panel. Distinct from `github`'s lighter,
+	// blue-tinted gray so the two do not read as one source. `rocket` mirrors
+	// `vercelDefinition.icon` (references/sources/definitions/vercel.ts), same
+	// visual-lockstep rule as slack.
+	vercel: { label: "Vercel", letter: "V", icon: "rocket", color: "#4d4d4d" },
 };
 
 /**

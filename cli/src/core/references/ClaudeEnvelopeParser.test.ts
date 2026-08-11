@@ -611,3 +611,103 @@ describe("ClaudeEnvelopeParser confluence", () => {
 		expect((results[0].payload as { body?: string }).body).toBe("One pool per provider.");
 	});
 });
+
+// Verbatim from a real Claude Code session (2026-08-10) in the project
+// /Users/zf/.jolli/sites/d98a494d413a: the connector namespace is
+// `mcp__claude_ai_Vercel__`, and `get_deployment`'s `{deployment:{…}}` is the only
+// JSON result the Vercel connector produces. Shapes are captured, never inferred.
+const VERCEL_RESULT = JSON.stringify({
+	deployment: {
+		id: "dpl_21ZZLCbgMKjWucj9sFV6i74BB2nr",
+		name: "forge-docs",
+		url: "forge-docs-b4p8u0cxu-jolli.vercel.app",
+		state: "ERROR",
+		project: { id: "prj_avItWqEtyEdMJlABjdwjiBBpIvNz", name: "forge-docs", framework: "nextjs" },
+		target: "production",
+		readyState: "ERROR",
+		errorCode: "enoent",
+		errorMessage: 'Command "npm run build && npx pagefind --site out" exited with 1',
+		errorStep: "buildStep",
+	},
+});
+
+function vercelLines(toolName: string, resultText: string): string[] {
+	return [
+		JSON.stringify({
+			timestamp: "2026-08-10T10:59:52.000Z",
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "v1",
+						name: toolName,
+						input: { idOrUrl: "dpl_21ZZLCbgMKjWucj9sFV6i74BB2nr", teamId: "team_35lUmEmlUV6VQTk8RSPd5LfI" },
+					},
+				],
+			},
+		}),
+		JSON.stringify({
+			timestamp: "2026-08-10T10:59:53.000Z",
+			message: {
+				role: "user",
+				content: [{ type: "tool_result", tool_use_id: "v1", content: [{ type: "text", text: resultText }] }],
+			},
+		}),
+	];
+}
+
+describe("ClaudeEnvelopeParser vercel", () => {
+	it("routes get_deployment to the vercel definition with an identity payload", () => {
+		const { results } = claudeEnvelopeParser.parse(
+			vercelLines("mcp__claude_ai_Vercel__get_deployment", VERCEL_RESULT),
+			{},
+		);
+		expect(results).toHaveLength(1);
+		expect(results[0].def.id).toBe("vercel");
+		// No context-normalizer: the payload arrives exactly as the connector sent it,
+		// wrapper key included, and `walkPayload` descends it downstream.
+		expect((results[0].payload as { deployment: { id: string } }).deployment.id).toBe(
+			"dpl_21ZZLCbgMKjWucj9sFV6i74BB2nr",
+		);
+		expect(results[0].referencedAt).toBe("2026-08-10T10:59:53.000Z");
+	});
+
+	it("matches the standalone remote MCP prefix too (the Kimi-reachable spelling)", () => {
+		const { results } = claudeEnvelopeParser.parse(vercelLines("mcp__vercel__get_deployment", VERCEL_RESULT), {});
+		expect(results.map((r) => r.def.id)).toEqual(["vercel"]);
+	});
+
+	it("does not match the sibling tools whose results are prose, not JSON", () => {
+		// `endsWith("get_deployment")` is false for `…_build_logs`, so those never resolve
+		// to a definition at all — the prose result is a non-match, not a drop. Capturing
+		// them would need a raw-text capability the envelope layer does not have.
+		for (const tool of [
+			"mcp__claude_ai_Vercel__get_deployment_build_logs",
+			"mcp__claude_ai_Vercel__deploy_to_vercel",
+			"mcp__claude_ai_Vercel__list_projects",
+			"mcp__claude_ai_Vercel__list_teams",
+			"mcp__claude_ai_Vercel__search_vercel_documentation",
+		]) {
+			const { results } = claudeEnvelopeParser.parse(
+				vercelLines(tool, "## Build Logs\n\n10:49:25  Running build in Cleveland, USA (East) – cle1"),
+				{},
+			);
+			expect(results, tool).toHaveLength(0);
+		}
+	});
+
+	it("drops an errored get_deployment whose body is the connector's prose error", () => {
+		// Real capture: `is_error: true` with `API error occurred: Status 404 …`. MCP
+		// entries carry no success gate, so this is the JSON.parse drop doing the work —
+		// vercel is result-derived, so it has no `argumentsDerived` escape hatch.
+		const { results } = claudeEnvelopeParser.parse(
+			vercelLines(
+				"mcp__claude_ai_Vercel__get_deployment",
+				'API error occurred: Status 404 Content-Type "application/json". Body: {"error":{"code":"not_found"}}',
+			),
+			{},
+		);
+		expect(results).toHaveLength(0);
+	});
+});

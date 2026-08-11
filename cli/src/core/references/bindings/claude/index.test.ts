@@ -29,6 +29,11 @@ describe("Claude producer binding", () => {
 				"mcp__claude_ai_monday_com__",
 				"mcp__context7__",
 				"mcp__jollimemory__",
+				// vercel declares TWO prefixes: the claude.ai connector namespace and the
+				// standalone remote MCP. The second is also what makes the source reachable
+				// on Kimi, which only resolves generic `mcp__<server>__` prefixes.
+				"mcp__claude_ai_Vercel__",
+				"mcp__vercel__",
 			]);
 		});
 

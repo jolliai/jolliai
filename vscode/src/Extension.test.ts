@@ -1170,6 +1170,10 @@ vi.mock("node:timers", () => ({
 
 import * as vscode from "vscode";
 import { runCopyBranchRecallPrompt, runRecallInClaudeCode } from "./commands/BranchRecallCommands.js";
+import {
+	ARCHIVED_MARKDOWN_SCHEME,
+	showArchivedMarkdownPreview,
+} from "./core/ArchivedMarkdownPreview.js";
 import { encodePreviewRef } from "./core/PreviewUri.js";
 import { activate, deactivate } from "./Extension.js";
 import { activateExtensionTelemetry, reinitExtensionTelemetry } from "./TelemetryActivation.js";
@@ -2989,6 +2993,61 @@ describe("Extension", () => {
 						"[https://linear.app/acme/issue/PROJ-1](https://linear.app/acme/issue/PROJ-1)",
 					);
 					expect(body).toContain("Body.");
+				});
+
+				it("re-reads an ACTIVE reference from the registry and promotes its frontmatter", async () => {
+					// The uncommitted CONTEXT row previews through this scheme too, because
+					// previewing its real file renders through markdown-it-front-matter and
+					// hides the title, the url and every display field.
+					mockBridge.listReferences.mockResolvedValueOnce([
+						{
+							mapKey: "vercel:dpl_abc123",
+							sourcePath: "/repo/.jolli/jollimemory/references/vercel/dpl_abc123.md",
+						} as never,
+					]);
+					readFileSync.mockReturnValueOnce(
+						[
+							"---",
+							'source: "vercel"',
+							'nativeId: "dpl_abc123"',
+							'title: "forge-docs (ERROR)"',
+							'url: "https://forge-docs-b4p8u0cxu-jolli.vercel.app"',
+							'referencedAt: "2026-08-10T10:59:53.000Z"',
+							'sourceToolName: "mcp__claude_ai_Vercel__get_deployment"',
+							"---",
+							"",
+							'Command "npm run build" exited with 1',
+						].join("\n"),
+					);
+
+					const body = await archivedProvider().provideTextDocumentContent({
+						query: encodePreviewRef({
+							ns: "reference-live",
+							mapKey: "vercel:dpl_abc123",
+						}),
+					});
+
+					expect(body).toContain("# forge-docs (ERROR)");
+					expect(body).toContain(
+						"[https://forge-docs-b4p8u0cxu-jolli.vercel.app](https://forge-docs-b4p8u0cxu-jolli.vercel.app)",
+					);
+					expect(body).toContain('Command "npm run build" exited with 1');
+				});
+
+				it("reports an active reference archived since the tab opened as unavailable", async () => {
+					// `listReferences` returns only ACTIVE rows and a commit deletes the row,
+					// so a miss here is the truthful answer: that snapshot now lives on the
+					// orphan branch under a different key.
+					mockBridge.listReferences.mockResolvedValueOnce([]);
+
+					const body = await archivedProvider().provideTextDocumentContent({
+						query: encodePreviewRef({
+							ns: "reference-live",
+							mapKey: "vercel:dpl_gone",
+						}),
+					});
+
+					expect(body).toContain("no longer available");
 				});
 
 				it("rebuilds a foreign repo's storage from the provenance in the ref", async () => {
@@ -6273,6 +6332,121 @@ describe("Extension", () => {
 			expect(mockBridge.listNotes).not.toHaveBeenCalled();
 		});
 
+		// Mirrors `referencesRoot(workspaceRoot)` — the gate the handler applies before
+		// it will spend a bridge call. Same shape as the notes-dir paths above.
+		const REFERENCES_DIR = "/test/workspace/.jolli/jollimemory/references";
+
+		it("pushes a saved reference file at its open preview", async () => {
+			// A reference preview renders through our own virtual document (the only way
+			// to make its frontmatter visible), so unlike the plan/note previews — which
+			// hand a `file:` URI to the built-in markdown preview — it does not
+			// re-render on save by itself. "Edit Markdown" opens the real file, so
+			// saving one is a normal thing to do.
+			const saveCallback = onDidSaveTextDocument.mock.calls[0]?.[0] as
+				| ((doc: { fileName: string }) => Promise<void>)
+				| undefined;
+			const sourcePath = `${REFERENCES_DIR}/vercel/dpl_abc123.md`;
+			// A preview must actually be open, which is what the name has always claimed:
+			// the arm is gated on one, so without this the handler correctly does nothing.
+			await showArchivedMarkdownPreview(
+				{ ns: "reference-live", mapKey: "vercel:dpl_abc123" },
+				"forge-docs",
+				"# as first opened",
+			);
+			mockBridge.listNotes.mockResolvedValue([]);
+			mockBridge.listReferences
+				.mockReset()
+				.mockResolvedValue([{ mapKey: "vercel:dpl_abc123", sourcePath } as never]);
+
+			await expect(saveCallback?.({ fileName: sourcePath })).resolves.toBeUndefined();
+
+			expect(mockBridge.listReferences).toHaveBeenCalled();
+			mockBridge.listReferences.mockReset().mockResolvedValue([]);
+		});
+
+		it("does not pay for a reference lookup on a save when no preview is open", async () => {
+			// The second gate, and the one that used to be missing on this path: with no
+			// preview open, `refreshArchivedMarkdownPreview` is a guaranteed no-op, so the
+			// registry read behind it — a plans.json parse plus a synchronous read per
+			// active row — buys nothing. The watcher path has always had this gate; this
+			// arm paying the cost anyway was an inconsistency rather than a policy.
+			const saveCallback = onDidSaveTextDocument.mock.calls[0]?.[0] as
+				| ((doc: { fileName: string }) => Promise<void>)
+				| undefined;
+			mockBridge.listNotes.mockResolvedValue([]);
+			mockBridge.listReferences.mockReset().mockResolvedValue([]);
+
+			await expect(
+				saveCallback?.({ fileName: `${REFERENCES_DIR}/vercel/dpl_abc123.md` }),
+			).resolves.toBeUndefined();
+
+			expect(mockBridge.listReferences).not.toHaveBeenCalled();
+		});
+
+		it("does not pay for a reference lookup on a save outside the references dir", async () => {
+			// The gate that keeps this handler cheap: it runs on EVERY markdown save in
+			// the workspace, and listReferences costs a plans.json parse plus a
+			// synchronous read per active row.
+			const saveCallback = onDidSaveTextDocument.mock.calls[0]?.[0] as
+				| ((doc: { fileName: string }) => Promise<void>)
+				| undefined;
+			mockBridge.listNotes.mockResolvedValue([]);
+			mockBridge.listReferences.mockReset().mockResolvedValue([]);
+
+			await saveCallback?.({ fileName: "/user/docs/unrelated.md" });
+
+			expect(mockBridge.listReferences).not.toHaveBeenCalled();
+		});
+
+		it("leaves a file inside the references dir that backs no registry row alone", async () => {
+			const saveCallback = onDidSaveTextDocument.mock.calls[0]?.[0] as
+				| ((doc: { fileName: string }) => Promise<void>)
+				| undefined;
+			await showArchivedMarkdownPreview(
+				{ ns: "reference-live", mapKey: "vercel:dpl_abc123" },
+				"forge-docs",
+				"# body",
+			);
+			mockBridge.listNotes.mockResolvedValue([]);
+			mockBridge.listReferences.mockReset().mockResolvedValue([
+				{
+					mapKey: "vercel:dpl_abc123",
+					sourcePath: `${REFERENCES_DIR}/vercel/dpl_abc123.md`,
+				} as never,
+			]);
+
+			await expect(
+				saveCallback?.({ fileName: `${REFERENCES_DIR}/vercel/dpl_orphaned.md` }),
+			).resolves.toBeUndefined();
+
+			expect(mockBridge.listReferences).toHaveBeenCalled();
+			mockBridge.listReferences.mockReset().mockResolvedValue([]);
+		});
+
+		it("silently catches when listReferences throws during onDidSaveTextDocument", async () => {
+			// Same contract as the listNotes arm above: a save handler must never
+			// surface a bridge failure as an unhandled rejection.
+			const saveCallback = onDidSaveTextDocument.mock.calls[0]?.[0] as
+				| ((doc: { fileName: string }) => Promise<void>)
+				| undefined;
+			// Open a preview so the arm actually reaches the bridge — otherwise the
+			// open-preview gate short-circuits and this would assert nothing.
+			await showArchivedMarkdownPreview(
+				{ ns: "reference-live", mapKey: "jira:KAN-5" },
+				"KAN-5",
+				"# body",
+			);
+			mockBridge.listNotes.mockResolvedValue([]);
+			mockBridge.listReferences.mockReset().mockRejectedValueOnce(new Error("bridge down"));
+
+			await expect(
+				saveCallback?.({ fileName: `${REFERENCES_DIR}/jira/KAN-5.md` }),
+			).resolves.toBeUndefined();
+
+			expect(mockBridge.listReferences).toHaveBeenCalled();
+			mockBridge.listReferences.mockReset().mockResolvedValue([]);
+		});
+
 		it("silently catches when listNotes throws during onDidSaveTextDocument", async () => {
 			const saveCallback = onDidSaveTextDocument.mock.calls[0]?.[0] as
 				| ((doc: { fileName: string }) => Promise<void>)
@@ -6339,6 +6513,157 @@ describe("Extension", () => {
 		// History title now updates via `commitsStore.onChange` in Extension.ts;
 		// the `isMerged` flag lives on the snapshot.  Direct unit coverage for
 		// this wiring has moved to the CommitsStore tests.
+
+		// ── references watcher ────────────────────────────────────────────
+		// The out-of-band half of the reference-preview refresh. The save handler
+		// covers a hand edit; nothing but this covers an agent re-observing the same
+		// tool call, whose upsert rewrites the file with no save event — a deployment
+		// polled again after its build finishes writes a different body under the
+		// SAME mapKey, and plans.json (which PlansStore does watch) cannot say which
+		// body changed.
+		describe("references watcher", () => {
+			const REFERENCES_DIR = "/test/workspace/.jolli/jollimemory/references";
+			const SOURCE_PATH = `${REFERENCES_DIR}/vercel/dpl_abc123.md`;
+			const MAP_KEY = "vercel:dpl_abc123";
+
+			/**
+			 * The watcher `activate` creates LAST — see the note above `memoryDbWatcher`
+			 * in Extension.ts. Addressed from the end rather than by a fixed index so
+			 * this does not have to move every time a watcher is added ahead of it.
+			 */
+			function changeCallback(): ((uri: { fsPath: string }) => void) | undefined {
+				const watcher = createFileSystemWatcher.mock.results.at(-1)?.value;
+				return watcher?.onDidChange.mock.calls[0]?.[0] as
+					| ((uri: { fsPath: string }) => void)
+					| undefined;
+			}
+
+			afterEach(() => {
+				mockBridge.listReferences.mockReset().mockResolvedValue([]);
+			});
+
+			/** The archived scheme's provider, located by scheme rather than by index. */
+			function archivedProvider(): {
+				provideTextDocumentContent: (uri: { query: string }) => Promise<string>;
+			} {
+				const call = registerTextDocumentContentProvider.mock.calls.find(
+					(c) => c[0] === ARCHIVED_MARKDOWN_SCHEME,
+				) as
+					| [string, { provideTextDocumentContent: (uri: { query: string }) => Promise<string> }]
+					| undefined;
+				if (!call) throw new Error("archived provider was never registered");
+				return call[1];
+			}
+
+			const QUERY = encodePreviewRef({ ns: "reference-live", mapKey: MAP_KEY });
+
+			it("pushes an out-of-band rewrite at the open preview", async () => {
+				// `activate` re-registers the preview provider, which clears the open-URI
+				// map, so this is the only preview open.
+				await showArchivedMarkdownPreview(
+					{ ns: "reference-live", mapKey: MAP_KEY },
+					"forge-docs (BUILDING)",
+					"# as first opened",
+				);
+				// Baseline: the body is cached, so the provider answers without re-reading.
+				await expect(
+					archivedProvider().provideTextDocumentContent({ query: QUERY }),
+				).resolves.toBe("# as first opened");
+				mockBridge.listReferences
+					.mockReset()
+					.mockResolvedValue([{ mapKey: MAP_KEY, sourcePath: SOURCE_PATH } as never]);
+
+				const onChange = changeCallback();
+				expect(onChange).toBeDefined();
+				onChange?.({ fsPath: SOURCE_PATH });
+
+				// The registry is what turns the changed PATH into the mapKey the preview
+				// URI is keyed by — the URI deliberately carries no filesystem location.
+				await vi.waitFor(() => {
+					expect(mockBridge.listReferences).toHaveBeenCalled();
+				});
+				// The OUTCOME, not just the lookup: dropping the cached body is the
+				// load-bearing half of the refresh — `provideTextDocumentContent` answers
+				// from the cache first, so a fire without the drop would re-serve the stale
+				// body and the tab would never show the new deployment state.
+				await expect(
+					archivedProvider().provideTextDocumentContent({ query: QUERY }),
+				).resolves.not.toBe("# as first opened");
+			});
+
+			it("does not pay for a registry lookup when no reference preview is open", async () => {
+				// The overwhelmingly common case: references are rewritten on every agent
+				// turn, and `listReferences` costs a plans.json parse plus a synchronous
+				// read per active row. Nothing on screen to refresh means no work at all.
+				mockBridge.listReferences.mockReset().mockResolvedValue([]);
+
+				changeCallback()?.({ fsPath: SOURCE_PATH });
+
+				await Promise.resolve();
+				expect(mockBridge.listReferences).not.toHaveBeenCalled();
+			});
+
+			it("leaves a changed file that backs no registry row alone", async () => {
+				await showArchivedMarkdownPreview(
+					{ ns: "reference-live", mapKey: MAP_KEY },
+					"forge-docs",
+					"# body",
+				);
+				mockBridge.listReferences
+					.mockReset()
+					.mockResolvedValue([{ mapKey: MAP_KEY, sourcePath: SOURCE_PATH } as never]);
+
+				// A stray file, or one a commit already archived out of the registry.
+				changeCallback()?.({ fsPath: `${REFERENCES_DIR}/vercel/dpl_orphaned.md` });
+
+				await vi.waitFor(() => {
+					expect(mockBridge.listReferences).toHaveBeenCalled();
+				});
+				// The OUTCOME: the open preview belongs to a DIFFERENT reference, so its
+				// cached body must survive untouched. Asserting only that the lookup
+				// happened would pass even if the path→mapKey match were inverted and
+				// every unrelated write blew away whatever tab was open.
+				await expect(
+					archivedProvider().provideTextDocumentContent({ query: QUERY }),
+				).resolves.toBe("# body");
+			});
+
+			it("survives a bridge failure without an unhandled rejection", async () => {
+				// Same contract as the save handler's arm: the callback is fire-and-forget,
+				// so a throw here would surface as an unhandled rejection in the host.
+				await showArchivedMarkdownPreview(
+					{ ns: "reference-live", mapKey: MAP_KEY },
+					"forge-docs",
+					"# body",
+				);
+				mockBridge.listReferences.mockReset().mockRejectedValue(new Error("bridge down"));
+
+				expect(() => changeCallback()?.({ fsPath: SOURCE_PATH })).not.toThrow();
+
+				await vi.waitFor(() => {
+					expect(mockBridge.listReferences).toHaveBeenCalled();
+				});
+			});
+
+			it("also fires on create, not only on change", () => {
+				// A first-time reference write is a create event; the preview can already
+				// be open when it lands (the row is clicked, then re-polled).
+				const watcher = createFileSystemWatcher.mock.results.at(-1)?.value;
+				const onCreate = watcher?.onDidCreate.mock.calls[0]?.[0];
+				// Asserted to BE a function first: `toBe` on two absent callbacks would
+				// pass vacuously if this ever addressed the wrong watcher.
+				expect(onCreate).toBeInstanceOf(Function);
+				expect(onCreate).toBe(watcher?.onDidChange.mock.calls[0]?.[0]);
+			});
+
+			it("does not wire delete", () => {
+				// A commit archives the active file. Replacing a body the user is reading
+				// with "no longer available" is worse than leaving the last-known content
+				// up until the tab is reopened, which re-reads and says so truthfully.
+				const watcher = createFileSystemWatcher.mock.results.at(-1)?.value;
+				expect(watcher?.onDidDelete).not.toHaveBeenCalled();
+			});
+		});
 	});
 
 	// Badge-update behaviour is now driven by `filesStore.onChange` →

@@ -23,6 +23,7 @@ import { linearDefinition } from "./linear.js";
 import { mondayDefinition } from "./monday.js";
 import { notionDefinition } from "./notion.js";
 import { slackDefinition } from "./slack.js";
+import { vercelDefinition } from "./vercel.js";
 import { zoomDocDefinition } from "./zoom-doc.js";
 import { zoomMeetingDefinition } from "./zoom-meeting.js";
 
@@ -39,4 +40,8 @@ export const BUILTIN_DEFINITIONS = [
 	mondayDefinition,
 	context7Definition,
 	jolliMemoryDefinition,
+	// Appended: both Claude prefixes are unique to it, so it can neither shadow
+	// another definition nor be shadowed by one — its position is continuity, not a
+	// correctness constraint (unlike confluence-before-jira above).
+	vercelDefinition,
 ] as const;

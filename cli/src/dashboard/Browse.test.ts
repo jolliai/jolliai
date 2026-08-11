@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -18,7 +18,12 @@ describe("browseDirectory", () => {
 	let dir: string;
 
 	beforeEach(() => {
-		dir = mkdtempSync(join(tmpdir(), "jolli-browse-"));
+		// realpath the temp root: `browseDirectory` resolves symlinks, and on macOS
+		// `tmpdir()` is `/var/folders/…`, itself a symlink to `/private/var/folders/…`.
+		// Without this the two path-identity assertions below compare the unresolved
+		// form against the resolved one and fail on every macOS machine. A no-op where
+		// the temp root is already canonical.
+		dir = realpathSync(mkdtempSync(join(tmpdir(), "jolli-browse-")));
 	});
 
 	afterEach(() => {

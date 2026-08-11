@@ -54,7 +54,9 @@ import {
 	ARCHIVED_MARKDOWN_SCHEME,
 	archivedRefToQuery,
 	type ArchivedSnapshotRef,
+	hasOpenArchivedMarkdownPreviewIn,
 	MAX_CACHED_SNAPSHOT_BODIES,
+	refreshArchivedMarkdownPreview,
 	registerArchivedMarkdownPreview,
 	showArchivedMarkdownPreview,
 } from "./ArchivedMarkdownPreview.js";
@@ -286,6 +288,126 @@ describe("ArchivedMarkdownPreview", () => {
 		});
 	});
 
+	describe("refreshArchivedMarkdownPreview", () => {
+		const REF_LIVE: ArchivedSnapshotRef = {
+			ns: "reference-live",
+			mapKey: "vercel:dpl_abc",
+		};
+
+		it("drops the cached body so the tab re-reads, and re-fires for its URI", async () => {
+			// The whole point: this scheme serves a body we own, so unlike a `file:`
+			// preview it does not re-render on save by itself. Deleting the cache is the
+			// load-bearing half — provideTextDocumentContent answers from the cache
+			// first, so firing alone would just re-serve the stale body.
+			const resolver = vi.fn(async () => "# edited on disk");
+			const provider = register(resolver);
+			await showArchivedMarkdownPreview(REF_LIVE, "Deployment", "# as first opened");
+			const { query } = lastUriParts();
+			mockFire.mockClear();
+
+			refreshArchivedMarkdownPreview(REF_LIVE);
+
+			expect(mockFire).toHaveBeenCalledTimes(1);
+			expect(mockFire.mock.calls[0][0]).toMatchObject({
+				scheme: ARCHIVED_MARKDOWN_SCHEME,
+				query,
+			});
+			await expect(provider.provideTextDocumentContent({ query })).resolves.toBe(
+				"# edited on disk",
+			);
+			expect(resolver).toHaveBeenCalledWith(REF_LIVE);
+		});
+
+		it("is a no-op for a ref this window never opened", () => {
+			// A tab restored after a window reload has no URI recorded here, and neither
+			// does a reference the user simply never clicked. There is nothing on screen
+			// to refresh, and the next open re-reads anyway.
+			register();
+
+			refreshArchivedMarkdownPreview(REF_LIVE);
+
+			expect(mockFire).not.toHaveBeenCalled();
+		});
+
+		it("does not resurrect a body evicted from the LRU", async () => {
+			// The URI map is keyed by the same query as the body cache and pruned in the
+			// same place, so the pair cannot drift into a fire with no cache entry.
+			const provider = register(async () => "# re-read");
+			await showArchivedMarkdownPreview(REF_LIVE, "Deployment", "# oldest");
+			const { query } = lastUriParts();
+			for (let n = 0; n < MAX_CACHED_SNAPSHOT_BODIES; n++) {
+				await showArchivedMarkdownPreview(referenceRef(n), `PROJ-${n}`, `# body ${n}`);
+			}
+			mockFire.mockClear();
+
+			refreshArchivedMarkdownPreview(REF_LIVE);
+
+			expect(mockFire).not.toHaveBeenCalled();
+			// And the evicted entry still recovers the normal way, through the resolver.
+			await expect(provider.provideTextDocumentContent({ query })).resolves.toBe(
+				"# re-read",
+			);
+		});
+	});
+
+	describe("hasOpenArchivedMarkdownPreviewIn", () => {
+		const REF_LIVE: ArchivedSnapshotRef = {
+			ns: "reference-live",
+			mapKey: "vercel:dpl_abc",
+		};
+
+		it("is false before anything is opened", () => {
+			register();
+
+			expect(hasOpenArchivedMarkdownPreviewIn("reference-live")).toBe(false);
+		});
+
+		it("is true once a preview in that namespace is open", async () => {
+			register();
+
+			await showArchivedMarkdownPreview(REF_LIVE, "Deployment", "# body");
+
+			expect(hasOpenArchivedMarkdownPreviewIn("reference-live")).toBe(true);
+		});
+
+		it("does not answer for a namespace that only a SIBLING preview is open in", async () => {
+			// The gate exists to keep a caller from paying for a registry lookup, so a
+			// skills tab must not make a reference watcher think it has work to do.
+			register();
+
+			await showArchivedMarkdownPreview(REF_SKILLS_LIVE, "Skills used", "# table");
+
+			expect(hasOpenArchivedMarkdownPreviewIn("skills-live")).toBe(true);
+			expect(hasOpenArchivedMarkdownPreviewIn("reference-live")).toBe(false);
+		});
+
+		it("goes false again once the entry is evicted from the LRU", async () => {
+			// Same pairing as refreshArchivedMarkdownPreview relies on: an evicted URI
+			// has no tab this module can still speak for, so the gate must close with it.
+			register();
+			await showArchivedMarkdownPreview(REF_LIVE, "Deployment", "# oldest");
+			expect(hasOpenArchivedMarkdownPreviewIn("reference-live")).toBe(true);
+
+			for (let n = 0; n < MAX_CACHED_SNAPSHOT_BODIES; n++) {
+				await showArchivedMarkdownPreview(referenceRef(n), `PROJ-${n}`, `# body ${n}`);
+			}
+
+			expect(hasOpenArchivedMarkdownPreviewIn("reference-live")).toBe(false);
+			expect(hasOpenArchivedMarkdownPreviewIn("reference")).toBe(true);
+		});
+
+		it("stays true after a refresh drops the body but keeps the URI", async () => {
+			// `refreshArchivedMarkdownPreview` deliberately deletes only the cached body;
+			// the URI is what it fires with, so the tab is still open and still ours.
+			register();
+			await showArchivedMarkdownPreview(REF_LIVE, "Deployment", "# body");
+
+			refreshArchivedMarkdownPreview(REF_LIVE);
+
+			expect(hasOpenArchivedMarkdownPreviewIn("reference-live")).toBe(true);
+		});
+	});
+
 	describe("provideTextDocumentContent", () => {
 		it("re-reads the snapshot through the resolver on a cache miss", async () => {
 			// The load-bearing case: VS Code restores preview tabs across a window
@@ -333,6 +455,34 @@ describe("ArchivedMarkdownPreview", () => {
 			});
 
 			expect(resolver).toHaveBeenCalledWith(ref);
+		});
+
+		it("carries the mapKey for an active (uncommitted) reference", async () => {
+			// The live shape is keyed by mapKey and NOT by the file path: the ref rides
+			// in the URI query and is re-read after a window reload, so a path there
+			// would let a restored URI name any file on disk.
+			const ref: ArchivedSnapshotRef = { ns: "reference-live", mapKey: "vercel:dpl_abc123" };
+			const resolver = vi.fn(async () => "# live body");
+			const provider = register(resolver);
+
+			const body = await provider.provideTextDocumentContent({
+				query: archivedRefToQuery(ref),
+			});
+
+			expect(resolver).toHaveBeenCalledWith(ref);
+			expect(body).toBe("# live body");
+		});
+
+		it("explains itself for a live reference ref missing its mapKey", async () => {
+			const resolver = vi.fn(async () => "# body");
+			const provider = register(resolver);
+
+			const body = await provider.provideTextDocumentContent({
+				query: encodePreviewRef({ ns: "reference-live" }),
+			});
+
+			expect(body).toContain("no longer available");
+			expect(resolver).not.toHaveBeenCalled();
 		});
 
 		it("carries the commit hash for a committed skills table", async () => {

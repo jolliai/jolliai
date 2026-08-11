@@ -63,7 +63,25 @@ export type ArchivedSnapshotRef =
 			readonly archivedKey: string;
 			readonly repoName?: string;
 			readonly remoteUrl?: string;
-	  };
+	  }
+	/**
+	 * One ACTIVE (uncommitted) reference, still a real file on disk under
+	 * `.jolli/jollimemory/references/`.
+	 *
+	 * It gets a virtual document rather than a preview of the file itself for the same
+	 * reason the archived shape does: `markdown.showPreview` on the real file renders
+	 * through `markdown-it-front-matter`, whose empty renderer makes the whole
+	 * frontmatter block — title, url, and every display field — invisible. A
+	 * bookmark-shaped reference then shows a body talking about a link the reader
+	 * cannot see. `renderReferenceForPreview` lifts those into a visible header, and
+	 * that rewrite needs a document whose content we own.
+	 *
+	 * Keyed by `mapKey`, NOT by the file path: the key survives into the URI query and
+	 * is re-read by the resolver after a window reload, so a path there would mean the
+	 * provider reads an arbitrary filesystem location out of a restored URI. Resolving
+	 * a mapKey through the registry is also what every other reference command does.
+	 */
+	| { readonly ns: "reference-live"; readonly mapKey: string };
 
 /**
  * Re-renders a snapshot whose body is no longer cached. Registered once by
@@ -105,6 +123,24 @@ const UNAVAILABLE_BODY = [
  * the panel that opened it — VS Code will re-ask the provider for content long after.
  */
 const contents = new Map<string, string>();
+
+/**
+ * The URI each cached body was opened under, so {@link refreshArchivedMarkdownPreview}
+ * can re-fire `onDidChange` for a tab it did not build the URI for.
+ *
+ * A separate map rather than a field on the body, because the two have different
+ * lifetimes: the provider caches a body it re-read from a URI VS Code handed it, while
+ * a refresh needs the URI *before* any provider call. {@link cacheBody} keys both on
+ * the query and evicts the pair together, so a URI never outlives its body. The
+ * converse is deliberately allowed: {@link refreshArchivedMarkdownPreview} drops the
+ * body and KEEPS the URI, because that URI is what it fires `onDidChange` with and what
+ * VS Code then re-asks the provider for.
+ *
+ * Only `showArchivedMarkdownPreview` fills it. A tab restored after a window reload
+ * therefore has no entry until it is re-opened, which is correct: nothing in this
+ * window has told the user it is showing a live file.
+ */
+const openUris = new Map<string, vscode.Uri>();
 
 /**
  * The live registration, or `undefined` before `activate` and after dispose.
@@ -149,6 +185,9 @@ function queryToArchivedRef(query: string): ArchivedSnapshotRef | undefined {
 			...(raw.remoteUrl ? { remoteUrl: raw.remoteUrl } : {}),
 		};
 	}
+	if (raw.ns === "reference-live") {
+		return raw.mapKey ? { ns: "reference-live", mapKey: raw.mapKey } : undefined;
+	}
 	return undefined;
 }
 
@@ -163,7 +202,60 @@ function cacheBody(query: string, body: string): void {
 		if (oldest.done) break;
 		/* v8 ignore stop */
 		contents.delete(oldest.value);
+		openUris.delete(oldest.value);
 	}
+}
+
+/**
+ * Drops the cached body for `ref` and asks VS Code to re-render the tab showing it,
+ * so an already-open preview picks up a change to whatever it was rendered from.
+ *
+ * Needed because this scheme serves a body we own rather than a file: the built-in
+ * markdown preview re-renders a `file:` URI on save by itself, which is exactly what
+ * the live-reference preview gave up when it moved here to make the frontmatter
+ * visible. Its two siblings (`openPlanForPreview` / `openNoteForPreview`) still
+ * preview the real file and still refresh for free, so without this a reference is
+ * the one Context row whose preview goes stale after an edit.
+ *
+ * A no-op when this window never opened `ref` — there is no tab to refresh, and the
+ * next open re-reads anyway. Deleting the body before firing is the load-bearing half:
+ * `provideTextDocumentContent` answers from the cache first, so firing alone would
+ * re-serve the stale body.
+ */
+export function refreshArchivedMarkdownPreview(ref: ArchivedSnapshotRef): void {
+	const query = archivedRefToQuery(ref);
+	const uri = openUris.get(query);
+	if (uri === undefined) return;
+	contents.delete(query);
+	state?.emitter.fire(uri);
+}
+
+/**
+ * True when this window has an open preview in namespace `ns` — i.e. when a
+ * {@link refreshArchivedMarkdownPreview} call for one could actually do something.
+ *
+ * Exists so a caller watching for out-of-band writes can decide whether to pay for the
+ * lookup that turns a changed file into a ref. `refreshArchivedMarkdownPreview` is
+ * already a no-op for a ref this window never opened, but *reaching* it means resolving
+ * the ref's identity first, and for the live-reference namespace that costs a registry
+ * read on a path that fires on every write.
+ *
+ * Answered by scanning {@link openUris}, whose size tracks the previews this window
+ * opened — pruned by {@link cacheBody}'s eviction, so it stays on the order of
+ * {@link MAX_CACHED_SNAPSHOT_BODIES} rather than growing with session length. Not a
+ * hard cap (a refresh drops a body while keeping its URI, so the two maps can diverge
+ * until the tab re-reads), which is why this is a scan and not an index.
+ *
+ * Decodes each query rather than matching its prefix: the encoding is base64url of
+ * sorted JSON, so a substring test would depend on the payload's byte layout.
+ */
+export function hasOpenArchivedMarkdownPreviewIn(
+	ns: ArchivedSnapshotRef["ns"],
+): boolean {
+	for (const query of openUris.keys()) {
+		if (queryToArchivedRef(query)?.ns === ns) return true;
+	}
+	return false;
 }
 
 async function provideTextDocumentContent(uri: { query: string }): Promise<string> {
@@ -225,6 +317,7 @@ export function registerArchivedMarkdownPreview(
 			registration.dispose();
 			emitter.dispose();
 			contents.clear();
+			openUris.clear();
 		},
 	};
 	state = { handle, emitter, resolver };
@@ -254,6 +347,9 @@ export async function showArchivedMarkdownPreview(
 		query,
 	});
 	cacheBody(query, content);
+	// After cacheBody, so an eviction triggered by this very insert cannot drop the
+	// entry we are about to add.
+	openUris.set(query, uri);
 	state?.emitter.fire(uri);
 	try {
 		// Load the virtual document (triggers provideTextDocumentContent) without
