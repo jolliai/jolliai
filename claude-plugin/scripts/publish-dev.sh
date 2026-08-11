@@ -2,8 +2,12 @@
 #
 # DEV publish — build the plugin and publish it into the PRIVATE / internal
 # marketplace repo (../claude-plugin-marketplace) so a release can be dry-run
-# before it goes public, then commit + push. Identical flow to publish-prod.sh —
-# the ONLY difference is the default target repo.
+# before it goes public, then commit + push. Same flow as publish-prod.sh; it
+# differs in the default target repo and in passing `dev`, which skips the version
+# guard so a rehearsal can republish one version instead of inflating it (that
+# inflation is what put this repo at 1.0.5 while prod was on 1.0.1). Testers must
+# REMOVE + re-add the plugin — /plugin update compares versions and would report
+# "up to date" for a same-version republish.
 #
 # For the PUBLIC community-marketplace release, use publish-prod.sh. For a no-git
 # local test dir, use publish-local.sh; for a desktop-app zip, use publish-zip.sh.
@@ -20,4 +24,4 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_publish-lib.sh"
 
 DEST="${MARKETPLACE_REPO:-${1:-$MONOREPO/../claude-plugin-marketplace}}"
-publish_git_repo "$DEST" "jolli-plugin-dev/claude-plugin-marketplace"
+publish_git_repo "$DEST" "jolli-plugin-dev/claude-plugin-marketplace" dev

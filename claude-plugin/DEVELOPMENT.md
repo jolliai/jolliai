@@ -17,9 +17,11 @@ manifest is deliberately avoided — see AGENTS.md.
 ```
 claude-plugin/
 ├── .claude-plugin/marketplace.json     # the marketplace (lists the plugin)
+├── LICENSE                             # Apache-2.0, mirrored to the marketplace repo root
 └── plugins/jolli/
     ├── .claude-plugin/plugin.json      # plugin manifest
     ├── .mcp.json                       # jolli MCP server (node dist/Cli.js mcp)
+    ├── LICENSE                         # same text again — this dir is the installed/zipped unit
     ├── hooks/hooks.json                # SessionStart → PluginBootstrapHook (the only manifest hook)
     ├── skills/                         # /jolli:recall  /jolli:search  /jolli:push
     ├── commands/                       # /jolli:init  /jolli:status  /jolli:timeline  /jolli:login  /jolli:logout
@@ -203,7 +205,7 @@ dev rehearsals that preceded it.
 | Script | Produces | Git | Version guard | Reach for it when |
 |--------|----------|-----|---------------|-------------------|
 | `publish-local.sh` | `../claude-plugin-marketplace-local` (plain dir) | no | no | Local end-to-end test **before any push** — `/plugin marketplace add <dir>`. The recommended local-testing path. |
-| `publish-dev.sh` | `../claude-plugin-marketplace` (private repo) | commit + push | yes | **Dry-run** a release into the internal marketplace to rehearse it before it goes public. |
+| `publish-dev.sh` | `../claude-plugin-marketplace` (private repo) | commit + push | **no** | **Dry-run** a release into the internal marketplace to rehearse it before it goes public. Republishes one version freely — testers must remove + re-add. |
 | `publish-prod.sh` | `../jolli-claude-plugin` (public repo) | commit + push | yes | The real **public release** users install with `/plugin marketplace add jolliai/jolli-claude-plugin`. |
 | `publish-zip.sh` | `~/Desktop/jolli-plugin.zip` | no | no | A snapshot **zip for the desktop app's "Upload plugin"** button (see Local testing, Option 4). |
 
@@ -211,28 +213,42 @@ Shared knobs:
 
 - **`NO_PUSH=1`** (git scripts) — commit into the target repo but don't push, so you can
   inspect the diff first.
-- **`JOLLI_PUBLISH_FORCE=1`** — allow a same-version republish (skips the version guard),
-  and bypass the safe-destination check the first time you re-target a directory.
+- **`JOLLI_PUBLISH_FORCE=1`** — allow a same-version or downgrade republish on the **prod**
+  target (skips the version guard; dev already skips it), and bypass the safe-destination check
+  the first time you re-target a directory.
 - **Custom target** — pass a path argument, or set `MARKETPLACE_REPO=/path` (`MARKETPLACE_LOCAL`
   for `publish-local.sh`; `publish-zip.sh` takes the output path as its argument).
 
 **`publish-dev.sh` and `publish-prod.sh` are the same flow** (`publish_git_repo` in
-`_publish-lib.sh`) and differ *only* in the default target repo plus the marketplace slug they
-pass for the README, so a prod release can never behave differently from the dev dry-run that
-rehearsed it. That slug is why [`README.md`](README.md) keeps a neutral `<marketplace-source>`
+`_publish-lib.sh`) and differ in exactly three arguments: the default target repo, the
+marketplace slug they pass for the README, and the `dev`/`prod` target kind that gates the
+version guard (below). Build, inventory assertions, mirror, README resolution,
+staged-completeness check, signed commit and push are shared verbatim, so apart from the version
+check a prod release cannot behave differently from the dev dry-run that rehearsed it. That slug is why [`README.md`](README.md) keeps a neutral `<marketplace-source>`
 placeholder wherever it names the marketplace to add: `publish_readme_source` resolves it on the
 **mirrored copy** (prod repo, dev repo, or the local directory), because a hardcoded slug in the
 source README made the dev mirror tell dry-run readers to install the public release. Publishing
 fails loudly if the placeholder is missing — shipping the literal token is an install command
 that cannot work. `publish-zip.sh` needs no resolution: it packs `plugins/jolli/` and ships no
-README. Both **refuse a same-version
-republish**: Claude Code's `/plugin update` compares `plugin.json` `version`, so re-publishing
+README. **`publish-prod.sh` requires a strictly higher version than the last release in the
+public repo**: Claude Code's `/plugin update` compares `plugin.json` `version`, so re-publishing
 changed bytes under an unchanged version would leave installed users stuck on "up to date" and
-they'd never pull the fix. Bump `version` in
+they'd never pull the fix — and a *lower* one does the same while still reading as a successful
+release. (The guard was equal-only until that second case turned up for real: the monorepo sat at
+`1.0.0` while the prod marketplace had already published `1.0.1`.) Bump `version` in
 [`plugins/jolli/.claude-plugin/plugin.json`](plugins/jolli/.claude-plugin/plugin.json) before a
-dev/prod release (a tripped guard reverts the synced changes back to `HEAD` for you). The two
-local artifacts — `publish-local.sh` and `publish-zip.sh` — have no version guard because they're
-throwaway.
+prod release (a tripped guard reverts the synced changes back to `HEAD` for you).
+
+**`publish-dev.sh` deliberately skips that guard** — it passes `dev` as the third argument to
+`publish_git_repo`, the single behavioural difference between the two. A rehearsal republishes
+the same build repeatedly, and bumping per rehearsal is exactly how the dev marketplace reached
+`1.0.5` while prod was still on `1.0.1`, at which point the guard started refusing legitimate
+releases on the rehearsal target. A version number is a *release* decision; dev is not a release.
+Two consequences, and the script prints the first one every run: a tester who already installed
+from dev must **remove + re-add** the plugin, because `/plugin update` will report "up to date"
+for a same-version republish; and a green dev run no longer proves prod will accept the version,
+since prod has its own history. `publish-local.sh` and `publish-zip.sh` never had a version guard
+— they don't go through `publish_git_repo` at all.
 
 Typical progression: **`publish-local.sh`** (verify on your machine) → **`publish-dev.sh`**
 (rehearse the git release into the private repo) → **`publish-prod.sh`** (ship to the public
@@ -291,8 +307,10 @@ plugin under `plugins/jolli/`, including the built `dist/`) — never hand-edite
 regenerated on every release. Two such repos exist:
 
 - **Public** — `jolliai/jolli-claude-plugin`, the community-marketplace sync
-  source. Users run `/plugin marketplace add jolliai/jolli-claude-plugin`. This
-  repo keeps its own root `LICENSE`, which the publish sync preserves.
+  source. Users run `/plugin marketplace add jolliai/jolli-claude-plugin`. Its
+  root `LICENSE` is mirrored from `claude-plugin/LICENSE` like every other file
+  (it used to be `--exclude`d so the repo's hand-created copy survived, which left
+  the dev mirror and the desktop zip with no license text at all).
 - **Private / internal** — `../claude-plugin-marketplace`, a dry-run target for
   rehearsing a release before it goes public.
 

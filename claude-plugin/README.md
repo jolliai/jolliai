@@ -1,100 +1,139 @@
-# Jolli Memory — Claude Code plugin
+# Jolli Memory for Claude Code
 
-Jolli Memory's Claude Code integration — MCP tools, a bare `/jolli` menu plus
-`/jolli:*` skills and commands, and session hooks — packaged as a single
-installable Claude Code plugin.
+Jolli Memory builds a durable memory of your work from your git commits, and makes
+prior decisions, unfinished work, and branch history recallable — right inside
+Claude Code.
 
-Jolli builds a durable memory of your work from your git commits and lets you
-recall it, search past decisions, and generate memory-rich PR descriptions —
-right inside Claude Code. When enabled, the plugin's `SessionStart` hook also
-installs Jolli's git hooks into the active repository (idempotent); those git
-hooks are what generate the memory that the plugin surfaces let you consume.
+## What the plugin includes
 
-## What you get
-
+- **Commands and skills** — eight `/jolli:*` entry points covering setup, sign-in,
+  status, recall, search, decision timelines, and Space publishing, plus a bare
+  `/jolli` front door (a plugin skill can only ever be invoked as `/jolli:<name>`,
+  so the bare menu is written into `.claude/skills/jolli/` on the first session).
 - **MCP tools** — `recall`, `search`, `get_decision_timeline`, `list_branches`,
-  `get_pr_description`, `queue_status`, `status`, plus the Jolli Space tools.
-- **Commands** — `/jolli:init`, `/jolli:status`, `/jolli:timeline`,
-  `/jolli:login`, `/jolli:logout`.
-- **Skills** — `/jolli:recall`, `/jolli:search`, `/jolli:push`.
-- **Umbrella** — a bare `/jolli` front door: it reads how Jolli is set up in this
-  repo, leads with setup when something is missing, and otherwise shows a status
-  snapshot and routes to your pick (written into `.claude/skills/jolli/` on first
-  session; a plugin can't expose a bare command itself, so this is a
-  project-level skill).
-- **Hooks** — one `SessionStart` bootstrap that installs the git hooks and the
-  canonical agent hooks, which then build memory
-  from your commits, and — until you sign in — remind you to run `/jolli:login`.
+  `get_pr_description`, `queue_status`, `status`, plus the Jolli Space tools. The
+  plugin registers them itself, so they are live as soon as it is installed.
+- **Hooks** — one `SessionStart` bootstrap that installs Jolli's git hooks into the
+  active repository (idempotent) along with the canonical Stop/SessionStart capture
+  hooks, records Claude Code as the local summarization agent when no provider is
+  configured yet, and injects a branch briefing. Those git hooks are what generate
+  the memory everything else surfaces.
+- **A self-contained runtime** — no global `jolli` CLI installation required.
 
-## Installation
+## Install
 
-Install from Jolli's Claude Code marketplace:
-
-```
+```text
 /plugin marketplace add <marketplace-source>
 /plugin install jolli@jolli-marketplace
 ```
 
-`<marketplace-source>` is the marketplace repo (its `marketplace.json`
-names the marketplace `jolli-marketplace`, which is why the install target is
-`jolli@jolli-marketplace`).
+The marketplace's own manifest names it `jolli-marketplace`, which is why the
+install target is `jolli@jolli-marketplace`. In the **desktop app**, use
+**+ → Plugins → Add marketplace** with the same source, then enable **Jolli Memory**
+under **Manage plugins**. After installing, the MCP tools, the `/jolli:*` entry
+points and the hooks are all live.
 
-In the **desktop app**, use **+ → Plugins → Add marketplace** with the same
-source, then enable **Jolli Memory** under **Manage plugins**.
+## First-time setup
 
-After install the MCP tools, `/jolli:*` skills and commands, and the hooks are
-all live.
+Start with **`/jolli`**. It reads how Jolli is set up in this repository and, on a
+fresh repo, leads with setup — routing into `/jolli:init`, which:
 
-Start with **`/jolli`**. It reads how Jolli is set up in this repository, leads
-with setup when something is missing, and otherwise shows a status snapshot and
-routes you to recall, search, a PR description, or a Space. In a brand-new repo
-the bare `/jolli` may not appear until the plugin has written it during its first
-session — **`/jolli:init`** always works directly, and is also what you run to
-re-run setup or change the bound Space.
+1. checks the current repository state;
+2. enables memory capture, records Claude Code as the local summarization agent, and
+   registers the Jolli Memory MCP server;
+3. optionally signs you in to Jolli in the browser;
+4. binds the repository to a Jolli Space for team sharing.
+
+`/jolli` stays the entry point afterwards: once setup is complete it shows a status
+snapshot and routes you to recall, search, a PR description, or a Space. Invoke
+`/jolli:init` directly when you want to re-run setup or change the bound Space. In a
+brand-new repo the bare `/jolli` may not appear until the plugin has written it
+during its first session — `/jolli:init` always works directly.
 
 ## Memory generation works out of the box
 
-**You do not need to sign in, and you do not need an API key.** On its first
-session the plugin writes `local-agent` as the provider into the machine-global
-config (`~/.jolli/jollimemory/config.json`) and drives your already-signed-in
-`claude` CLI to write memories. Commit as usual and the summaries appear. Because
-that config is shared, the choice also becomes the default for the Jolli CLI and
-the VS Code extension on this machine.
+**You do not need to sign in, and you do not need an API key.** On its first session
+the plugin writes `local-agent` as the provider into the machine-global config
+(`~/.jolli/jollimemory/config.json`) and drives your already-signed-in `claude` CLI
+to write the memories. Commit as usual and the summaries appear. Because that config
+is shared, the choice also becomes the default for the Jolli CLI and the other Jolli
+integrations on this machine.
 
-That default is only seeded when you have expressed no provider preference. If
-you ever signed in to Jolli from the CLI or the VS Code extension, or pinned
-`aiProvider` explicitly, that choice is respected here too, so you will need
-whichever credential it implies.
+That default is only seeded when you have expressed no provider preference. If you
+ever signed in to Jolli from the CLI or an IDE integration, or pinned `aiProvider`
+explicitly, that choice is respected here too, so you will need whichever credential
+it implies.
+
+If generation reports an authentication failure, sign the CLI in again:
+
+```text
+claude
+```
+
+Run it once and sign in to your subscription. That login is **separate** from
+Claude Desktop — the desktop app stays signed in on its own, so "authentication
+expired" can be true here while the app looks fine.
+
+> **Prefer your own model API key?** Setting `ANTHROPIC_API_KEY` alone is not enough
+> once `local-agent` has been seeded, because the provider choice is resolved before
+> any key is consulted. Switch deliberately instead:
+> `jolli configure --set aiProvider=anthropic --set apiKey=sk-ant-...`. You need
+> neither this nor a Jolli login for generation to work.
 
 ## Sign in (optional, for sharing to a Jolli Space)
 
 Signing in is about **sharing** memories to a Jolli Space, so teammates and your
 other devices can recall them. It is not required to generate them.
 
-```
+```text
 /jolli:login
 ```
 
-This opens your browser and, on success, saves a Jolli API Key. Run
-`/jolli:logout` to sign out.
+This opens your browser and, on success, saves a Jolli API Key. Run `/jolli:logout`
+to sign out. **`/jolli:init`** does all of it in one pass: it signs you in if
+needed, enables the repository, and binds it to a Space — and `/jolli` routes there
+on its own whenever setup is incomplete.
 
-**`/jolli:init`** does all of it in one pass: it signs you in if needed, enables
-the repo, and binds it to a Space. `/jolli` routes there on its own whenever setup
-is incomplete.
+## What you can invoke
 
-> **Prefer your own Anthropic key?** Setting `ANTHROPIC_API_KEY` on its own is not
-> enough once the plugin has seeded `local-agent`, because the provider choice is
-> resolved before any key is consulted. Switch deliberately instead:
-> `jolli configure --set aiProvider=anthropic --set apiKey=sk-ant-...`. You need
-> neither this nor a Jolli login for generation to work.
+- `/jolli` — state-aware front door.
+- `/jolli:init` — setup and Space binding.
+- `/jolli:login` / `/jolli:logout` — Jolli account credentials.
+- `/jolli:status` — installation and generation health.
+- `/jolli:recall` / `/jolli:search` / `/jolli:timeline` — read memory.
+- `/jolli:push` — publish memories to a Space.
 
 ## Requirements
 
-`node` must be on your PATH — the plugin's MCP server (`node dist/Cli.js mcp`)
-and its hooks all run under it. This is the same requirement the Jolli CLI and
-VS Code extension already have. Claude Code fetches the plugin package itself, so
-`npm` is **not** required on PATH; `node` is.
+- **Node.js 22.13 or newer**, on your `PATH` or recorded by a supported Jolli IDE
+  integration — the MCP server (`node dist/Cli.js mcp`) and every hook run under it.
+  The plugin bundles its own runtime code, but not Node itself. 22.13 is a hard
+  floor rather than a recommendation: the bundled runtime uses `node:sqlite`, which
+  throws on import below it unless Node is started with `--experimental-sqlite`, and
+  the git-hook dispatchers are deliberately flag-free. Claude Code fetches the plugin
+  package itself, so `npm` is **not** required.
+- Claude Code must be installed and signed in for the default `local-agent`
+  provider.
+
+## Telemetry
+
+Jolli Memory collects anonymous, content-free usage data — never your code, your
+paths, or the contents of your memories — and it is **on by default**. Turn it off
+with `jolli telemetry off`, or by setting `DO_NOT_TRACK` to any non-empty value
+other than `0`. Exactly what is collected is listed at
+[jolli.ai/telemetry](https://www.jolli.ai/telemetry) and in
+[TELEMETRY.md](https://github.com/jolliai/jolliai/blob/main/TELEMETRY.md).
+
+## Support and source
+
+- Product: [jolli.ai](https://jolli.ai)
+- Source, issues, and security policy:
+  [github.com/jolliai/jolliai](https://github.com/jolliai/jolliai)
+
+This repository is a generated release artifact — the plugin is built from the Jolli
+monorepo, so file changes here are overwritten by the next release. Report problems
+and send patches to the monorepo instead.
 
 ## License
 
-Apache-2.0. See [LICENSE](https://github.com/jolliai/jolliai/blob/main/LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).

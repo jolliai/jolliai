@@ -60,11 +60,28 @@ PUBLISH_EXPECTED_SKILLS=(
 # cwd, so it would answer for the plugin's own cache directory. MCP reaches Codex
 # through the global `~/.codex/config.toml` entry the bootstrap registers, which Codex
 # launches with the session cwd. See cli/src/install/mcp/HostRegistrars.ts.
+#
+# The bundle redistributes Apache-2.0 code, so the license text has to travel with
+# it — and it is listed TWICE because two different units are distributed:
+#   LICENSE                    the marketplace repo root, which is what a reader of
+#                              the GitHub page (and `marketplace add`) receives
+#   plugins/jolli/LICENSE      the INSTALLED unit — `codex plugin add` copies only
+#                              this directory into ~/.codex/plugins/cache/<version>/,
+#                              so a root-only copy never reaches an installed plugin
+# Both are verbatim copies of the monorepo root LICENSE, mirrored from this tree; the
+# same pair is listed in claude-plugin/scripts/_publish-lib.sh. Neither codex
+# marketplace repo was ever created with a LICENSE of its own, so this tree is the
+# only source there is. Do NOT add an `--exclude 'LICENSE'` to publish_sync: these
+# entries would then fail the staged check (rsync --delete removes the file, `git
+# add -A` stages the deletion), which is the gate working — the fix is to drop the
+# exclude, not to drop these lines.
 PUBLISH_REQUIRED_CONFIG=(
 	plugins/jolli/hooks/hooks.json
 	plugins/jolli/.codex-plugin/plugin.json
 	.agents/plugins/marketplace.json
 	README.md
+	LICENSE
+	plugins/jolli/LICENSE
 )
 
 # The neutral token the SOURCE README carries in its install command. Every publish
@@ -217,6 +234,48 @@ publish_version() {
 	node -e 'process.stdout.write(String(require(process.argv[1]).version))' "$PLUGIN_DIR/.codex-plugin/plugin.json"
 }
 
+# publish_version_gt <candidate> <baseline> — is <candidate> a strictly HIGHER
+# x.y.z than <baseline>? Hand-kept twin of the same helper in
+# claude-plugin/scripts/_publish-lib.sh.
+#
+# Compared component-by-component rather than with `sort -V`, whose availability
+# differs between GNU and BSD userlands, and never as strings: "1.0.10" sorts BELOW
+# "1.0.9" lexically, which would refuse a legitimate release.
+#
+# Anything that is not three plain numbers (a prerelease suffix, an empty string)
+# answers "not greater". That is the safe direction: the publish stops and the
+# operator decides with JOLLI_PUBLISH_FORCE=1, instead of a comparison this function
+# cannot actually make being read as approval.
+publish_version_gt() {
+	local a="$1" b="$2" i av bv
+	# Exactly three numeric components, matched whole — NOT a character-class
+	# check. Rejecting only non-`[0-9.]` characters is what the first version of
+	# this did, and it let five malformed shapes clear the release gate, all
+	# measured: `1.0` and `1.0.` (a missing component read as empty, then padded
+	# to 0), `1..2` and `.1.2` (an empty component padded the same way), and
+	# `1.0.2.1` (a fourth component is never read, so it compares as `1.0.2`).
+	# Each was accepted against a lower baseline, so a typo'd plugin.json version
+	# could commit and push a prod release without JOLLI_PUBLISH_FORCE.
+	#
+	# The `${av:-0}` defaults that padding relied on are gone with it: after this
+	# match every component is guaranteed to be one or more digits, so a default
+	# could only ever mask a shape this function has already refused.
+	#
+	# The pattern is held in a variable because bash treats a QUOTED right-hand
+	# side of `=~` as a literal string; assigning it first is the form that works
+	# the same way from bash 3.2 (macOS /bin/bash) up.
+	local semver='^[0-9]+\.[0-9]+\.[0-9]+$'
+	[[ $a =~ $semver ]] || return 1
+	[[ $b =~ $semver ]] || return 1
+	for i in 1 2 3; do
+		av="$(printf '%s' "$a" | cut -d. -f"$i")"
+		bv="$(printf '%s' "$b" | cut -d. -f"$i")"
+		if [ "$av" -gt "$bv" ]; then return 0; fi
+		if [ "$av" -lt "$bv" ]; then return 1; fi
+	done
+	return 1
+}
+
 # Confirm the marketplace checkout holds a complete plugin. Reads the INDEX
 # (`git ls-files`), which reflects the staged tree before a commit and HEAD's tracked
 # tree after one — so it is equally valid as a pre-commit gate and as a pre-push gate
@@ -275,8 +334,25 @@ publish_push() {
 # the checkout's `origin` on purpose: the README is written before the push, and a
 # mistyped destination path should not silently produce a README that documents
 # whichever repo the wrong checkout happens to point at.
+#
+# <target-kind> is `prod` (default) or `dev`, and it gates ONE thing: the version
+# guard. Everything else is identical, which is what makes a dev run a rehearsal of
+# the prod run. A rehearsal republishes the same build repeatedly, and the guard
+# demands a strictly higher version each time content changes — bumping per rehearsal
+# is how the Claude dev marketplace reached 1.0.5 while prod was still on 1.0.1, at
+# which point the guard began refusing legitimate releases on the rehearsal target.
+# A version number is a RELEASE decision; dev is not a release.
+#
+# The cost is real: an installed tester's plugin update compares versions, so a
+# same-version dev republish looks like "up to date" and they keep running the old
+# bundle — re-add the plugin instead (the reminder below says so, and note this host
+# also caches by version under ~/.codex/plugins/cache/). A green dev run also stops
+# proving prod will accept the version; prod has its own history.
+#
+# Defaults to `prod`: a call site that forgets the argument gets the STRICTER
+# behaviour, not a silently unguarded publish.
 publish_git_repo() {
-	local dest="$1" marketplace_source="$2"
+	local dest="$1" marketplace_source="$2" target_kind="${3:-prod}"
 	if [ ! -d "$dest/.git" ]; then
 		echo "error: '$dest' is not a git checkout." >&2
 		echo "       Clone the target marketplace repository first." >&2
@@ -318,24 +394,41 @@ publish_git_repo() {
 			exit 0
 		fi
 
+		# Strictly greater, not merely different, and prod only: an equal version leaves
+		# installed users on "up to date", and a LOWER one does the same while looking
+		# like a release. The equal-only form this replaced would have waved a downgrade
+		# through — see the twin guard in claude-plugin/scripts/_publish-lib.sh, where
+		# exactly that gap was live (source 1.0.0, prod already on 1.0.1).
 		local version last_msg last_version
 		version="$(publish_version)"
-		last_msg="$(git log -1 --format=%s 2>/dev/null || true)"
-		last_version="${last_msg#release: jolli codex plugin }"
-		if [ "${JOLLI_PUBLISH_FORCE:-0}" != "1" ] &&
-			[ "$last_msg" != "$last_version" ] &&
-			[ "$last_version" = "$version" ]; then
-			echo "error: content changed but plugin version is still ${version}." >&2
-			echo "       Bump codex-plugin/plugins/jolli/.codex-plugin/plugin.json first," >&2
-			echo "       or use JOLLI_PUBLISH_FORCE=1 for a deliberate same-version publish." >&2
-			# The mirror runs BEFORE this guard (the guard needs the staged diff to decide),
-			# so the destination now holds this build even though nothing was committed.
-			# Left in place rather than auto-reverted — it may hold deliberate local edits,
-			# and the safe-dest guard cannot tell those from mirror output. Say so, so the
-			# next run's diff is not mistaken for a real change.
-			echo "note: '${dest}' already holds this build, uncommitted. Discard it with:" >&2
-			echo "        git -C '${dest}' checkout . && git -C '${dest}' clean -fd" >&2
-			exit 1
+		if [ "$target_kind" = "prod" ]; then
+			last_msg="$(git log -1 --format=%s 2>/dev/null || true)"
+			last_version="${last_msg#release: jolli codex plugin }"
+			if [ "${JOLLI_PUBLISH_FORCE:-0}" != "1" ] &&
+				[ "$last_msg" != "$last_version" ] &&
+				! publish_version_gt "$version" "$last_version"; then
+				echo "error: content changed but plugin version ${version} is not higher than" >&2
+				echo "       the last published release (${last_version})." >&2
+				echo "       Both must be exactly three numeric components (e.g. 1.0.2); any other" >&2
+				echo "       shape fails this check rather than being padded or truncated." >&2
+				echo "       Bump codex-plugin/plugins/jolli/.codex-plugin/plugin.json first," >&2
+				echo "       or use JOLLI_PUBLISH_FORCE=1 for a deliberate same-version or" >&2
+				echo "       downgrade publish." >&2
+				# The mirror runs BEFORE this guard (the guard needs the staged diff to decide),
+				# so the destination now holds this build even though nothing was committed.
+				# Left in place rather than auto-reverted — it may hold deliberate local edits,
+				# and the safe-dest guard cannot tell those from mirror output. Say so, so the
+				# next run's diff is not mistaken for a real change.
+				echo "note: '${dest}' already holds this build, uncommitted. Discard it with:" >&2
+				echo "        git -C '${dest}' checkout . && git -C '${dest}' clean -fd" >&2
+				exit 1
+			fi
+		else
+			# Printed, never silent: this is the one behavioural difference between the
+			# rehearsal and the release, so it has to be visible in the rehearsal's output.
+			echo "==> ${target_kind} target — version guard skipped (rehearsals republish one version)."
+			echo "    Testers: REMOVE + re-add the plugin. A same-version republish leaves the"
+			echo "    version-stamped copy under ~/.codex/plugins/cache/ untouched."
 		fi
 
 		publish_assert_staged "$dest"

@@ -16,6 +16,7 @@ separate `jolli` CLI installation.
 codex-plugin/
 ├── .agents/plugins/marketplace.json        # marketplace catalog
 ├── README.md                               # end-user documentation
+├── LICENSE                                 # Apache-2.0, mirrored into every release
 ├── DEVELOPMENT.md                          # this file
 ├── scripts/
 │   ├── _publish-lib.sh                     # shared build, validation, sync, and release logic
@@ -25,6 +26,7 @@ codex-plugin/
 │   └── publish-zip.sh                      # marketplace archive
 └── plugins/jolli/
     ├── .codex-plugin/plugin.json           # plugin manifest and independent version
+    ├── LICENSE                             # same text again — this dir is the installed unit
     ├── hooks/hooks.json                    # single SessionStart bootstrap hook
     │                                       # (no .mcp.json — see "MCP registration")
     ├── skills/                             # bare-named dirs; Codex shows them as $jolli:*
@@ -110,6 +112,9 @@ all of the following even though its manifest registers only the bootstrap:
 - `PostCommitHook.js`, `PostMergeHook.js`, `PostRewriteHook.js`,
   `PrepareMsgHook.js`, and `PrePushHook.js`
 - `QueueWorker.js` and `PrePushWorker.js`
+- `DashboardServerEntry.js` plus its `dashboard-assets/` tree — this dist can win
+  dist-paths arbitration, and `jolli dashboard` spawns that entry by name from its
+  own directory
 
 The build and publish scripts assert this exact inventory. Omitting a git hook or
 worker can turn a user's git operation into `node <missing-file>` and block it.
@@ -163,7 +168,7 @@ The build:
 - bundles `cli/src/**` as CommonJS with esbuild target `node22` (the runtime floor, matching the CLI's `engines.node`);
 - identifies network requests as `codex-plugin/<plugin-version>`;
 - validates that `hooks.json` contains exactly one SessionStart bootstrap;
-- validates the exact 12-entry output inventory;
+- validates the exact 13-entry output inventory;
 - removes the old `dist/` before a non-watch build to prevent stale bundles.
 
 ## Skills
@@ -312,7 +317,7 @@ an artifact.
 | Script | Default output | Git operation | Use case |
 |---|---|---|---|
 | `publish-local.sh` | `../codex-plugin-marketplace-local` | None | Recommended local end-to-end rehearsal |
-| `publish-dev.sh` | `../jolli-chatgpt-plugin-dev` | Commit and push | Dev/rehearsal release |
+| `publish-dev.sh` | `../jolli-chatgpt-plugin-dev` | Commit and push | Dev/rehearsal release; no version guard, so one version can be republished repeatedly |
 | `publish-prod.sh` | `../jolli-chatgpt-plugin` | Commit and push | Marketplace release users install from |
 | `publish-zip.sh` | `~/Desktop/jolli-chatgpt-plugin-marketplace.zip` | None | Review or offline marketplace transfer |
 
@@ -361,12 +366,22 @@ For git-backed releases:
 - The destination must already be a git checkout.
 - The publish script mirrors with `rsync --delete`; its destination safety guard
   accepts only an empty directory or an existing Codex marketplace checkout.
-- `JOLLI_PUBLISH_FORCE=1` overrides the safe-destination and same-version guards;
-  use it only for an intentional operation.
+- `JOLLI_PUBLISH_FORCE=1` overrides the safe-destination and version guards; use it
+  only for an intentional operation.
 - `NO_PUSH=1` creates the signed release commit but leaves it unpushed for review.
 - Release commits use DCO sign-off automatically.
-- If content changed but the last release already used the same plugin version,
-  publishing stops until the version is bumped.
+- **The version guard applies to `publish-prod.sh` only.** If content changed, a prod
+  publish stops unless the plugin version is strictly higher than the last release in
+  that repository — an equal version strands installed users on "up to date", and a
+  lower one does the same while still reading as a release.
+- **`publish-dev.sh` skips it deliberately**, by passing `dev` as the third argument
+  to `publish_git_repo` (the only behavioural difference between the two scripts). A
+  rehearsal republishes the same build repeatedly, and bumping per rehearsal is how
+  the Claude dev marketplace ran to 1.0.5 while prod was on 1.0.1 — after which the
+  guard began refusing legitimate releases on the rehearsal target. The cost: a
+  same-version dev republish leaves the version-stamped copy under
+  `~/.codex/plugins/cache/` untouched, so testers must remove + re-add rather than
+  update; and a green dev run no longer proves prod will accept the version.
 
 Typical release progression:
 
@@ -391,7 +406,10 @@ the embedded core version used by cross-distribution runtime selection.
 
 A CLI change reaches plugin-only users only after the Codex plugin is rebuilt and
 republished. Therefore, bump the plugin version whenever publishing changed plugin
-content or a new embedded CLI snapshot.
+content or a new embedded CLI snapshot **to production** — the guard enforces it
+there. Rehearsals on the dev marketplace do not need a bump and should not get one:
+the version is a release decision, and inflating it per rehearsal is what pushed the
+Claude dev repo past prod and made the guard refuse real releases.
 
 ## Release checklist
 
@@ -403,9 +421,10 @@ content or a new embedded CLI snapshot.
    by the release.
 6. Publish to the private marketplace with `NO_PUSH=1` if an inspectable rehearsal
    is needed.
-7. Inspect the target checkout and confirm all 12 `dist/*.js` files, 11 skills,
-   marketplace manifest, plugin manifest, hook configuration, README, and license
-   are present — and that no `.mcp.json` has reappeared.
+7. Inspect the target checkout and confirm all 13 `dist/*.js` files, the
+   `dist/dashboard-assets/` tree, 11 skills, marketplace manifest, plugin manifest,
+   hook configuration, README, and both `LICENSE` copies (repo root and
+   `plugins/jolli/`) are present — and that no `.mcp.json` has reappeared.
 8. Publish the production marketplace.
 9. Install the released version from the public marketplace in a clean Codex
    environment and repeat a smoke test.
