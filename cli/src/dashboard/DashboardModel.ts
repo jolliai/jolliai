@@ -312,7 +312,7 @@ export type AdoptionTier = "installed" | "memory" | "space";
  * into Memories' per-topic Decisions callout — and `/decisions` now 302s to
  * `/memories`, so this union no longer carries that token.
  */
-export type DashboardView = "stats" | "standup" | "repositories" | "memories";
+export type DashboardView = "stats" | "standup" | "repositories" | "memories" | "settings";
 
 /**
  * The Repositories page payload — also first-run setup once it grows a write
@@ -403,11 +403,95 @@ export interface RepoHookStatus {
 	readonly mcpRegistered: boolean;
 }
 
-/** The Settings page payload. */
+/**
+ * The mockup-era Settings payload (Summarizer / Hooks / Privacy sections). Kept
+ * because `SettingsQuery.buildSettings` / `EnvFacts` / `HookStatus` still build
+ * it, but it is NOT what the shipped Settings page reads — that is
+ * {@link SettingsPageModel}, which mirrors the VS Code settings panel's five
+ * tabs. This one has no route and no consumer today.
+ */
 export interface SettingsModel {
 	readonly summarizer: SettingsSummarizerState;
 	readonly hooks: ReadonlyArray<RepoHookStatus>;
 	readonly privacy: SettingsPrivacyState;
+}
+
+/**
+ * The five agent toggles-plus-one that the AI Agents tab controls, each a
+ * config boolean (default ON — `xEnabled !== false`). `globalInstructions` is
+ * the one tri-state: `"default"` means "never decided" and MUST round-trip as
+ * "leave the field unset" on save, never as `"disabled"` (writing `"disabled"`
+ * would tell `syncGlobalInstructions` to remove a block that was never written).
+ */
+export interface SettingsAgents {
+	readonly claudeEnabled: boolean;
+	readonly codexEnabled: boolean;
+	readonly geminiEnabled: boolean;
+	readonly openCodeEnabled: boolean;
+	readonly cursorEnabled: boolean;
+	readonly devinEnabled: boolean;
+	readonly copilotEnabled: boolean;
+	readonly clineEnabled: boolean;
+	readonly antigravityEnabled: boolean;
+	readonly kimiEnabled: boolean;
+	readonly globalInstructions: "enabled" | "disabled" | "default";
+}
+
+/**
+ * The AI Summary tab. `apiKeyMasked` / `jolliApiKeyMasked` are the ONLY key
+ * material that ever reaches the page — the full key stays server-side and is
+ * re-read from config on save (see `SettingsMutations.applySettings`). An empty
+ * string means no key on file. `hasJolliKey` is given explicitly so the page
+ * need not infer the Jolli card's three states from a mask length.
+ */
+export interface SettingsSummary {
+	readonly aiProvider: "anthropic" | "jolli" | "local-agent";
+	readonly model?: string;
+	readonly maxTokens?: number;
+	readonly apiKeyMasked: string;
+	readonly jolliApiKeyMasked: string;
+	readonly signedIn: boolean;
+	readonly hasJolliKey: boolean;
+	readonly jolliSiteLabel?: string;
+	readonly localAgentTool: LocalAgentToolId;
+	/** Local-agent tools this build knows about, for the picker. */
+	readonly localAgentTools: ReadonlyArray<{ readonly id: LocalAgentToolId; readonly label: string }>;
+}
+
+/** The Memory Bank tab's own fields. `missingSummaries` is fetched lazily (slow). */
+export interface SettingsMemoryBank {
+	readonly localFolder?: string;
+	readonly compileExcludeFolders: string;
+	readonly syncTranscripts: boolean;
+	/** Hidden in the UI today, but round-tripped so an already-configured value is preserved. */
+	readonly autoSyncEnabled?: boolean;
+	readonly syncPollIntervalSec?: number;
+	/**
+	 * Effective folder-layer state for the server's launch repo (see
+	 * `SettingsPageQuery`). `off`/`warn` render a line; `ok` renders nothing, as
+	 * the VS Code panel does. `undefined` when the launch cwd is not a project.
+	 */
+	readonly state?: { readonly severity: "ok" | "warn" | "off"; readonly text: string };
+	/** Name of the repo the state line / missing-count reflect (the server's launch repo). */
+	readonly repoLabel?: string;
+}
+
+/** The Others tab. */
+export interface SettingsOthers {
+	readonly dcoSignoff: boolean;
+	readonly excludePatterns: string;
+}
+
+/**
+ * The shipped Settings page payload — one section per VS Code settings tab. The
+ * per-repo push list and the (slow) missing-summaries count are NOT here: they
+ * load from their own endpoints so the page's first paint is a cheap config read.
+ */
+export interface SettingsPageModel {
+	readonly agents: SettingsAgents;
+	readonly summary: SettingsSummary;
+	readonly memoryBank: SettingsMemoryBank;
+	readonly others: SettingsOthers;
 }
 
 // ── Memories page ───────────────────────────────────────────────────────────
@@ -1426,4 +1510,6 @@ export interface DashboardModel {
 	readonly repositories?: RepositoriesModel;
 	/** Present on the memories view only. */
 	readonly memories?: MemoriesModel;
+	/** Present on the settings view only. */
+	readonly settings?: SettingsPageModel;
 }

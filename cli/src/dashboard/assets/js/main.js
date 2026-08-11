@@ -7,6 +7,8 @@
 		standup: { render: (model) => window.JD.renderStandup(model), grid: false },
 		repositories: { render: (model) => window.JD.renderRepositories(model), grid: false },
 		memories: { render: (model) => window.JD.renderMemories(model), grid: false },
+		// Settings has no page entry — it opens as a modal over the current page
+		// (JD.openSettings, wired to the pinned bottom nav row in shell.js).
 	};
 
 	function render(model) {

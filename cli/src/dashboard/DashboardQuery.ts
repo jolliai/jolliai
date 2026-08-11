@@ -46,6 +46,7 @@ import type {
 	RepoOption,
 	RepositoriesModel,
 	SeriesDimension,
+	SettingsPageModel,
 	StandupCommit,
 	StandupInsight,
 	StandupModel,
@@ -377,6 +378,8 @@ export interface QueryOptions {
 	readonly authorIdentity?: AuthorIdentity;
 	/** Repositories view: the async-read registry + job state. Absent renders an empty list. */
 	readonly repositoriesModel?: RepositoriesModel;
+	/** Settings view: the async-read config/memory-bank snapshot. Absent on every other view. */
+	readonly settingsModel?: SettingsPageModel;
 	readonly timeZone?: string;
 	readonly nowMs?: number;
 }
@@ -1950,7 +1953,7 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 	const window = () => resolveWindow(options.range, options.customFrom, options.customTo, nowMs, timeZone);
 	// Exactly one view payload is built per request — the other two would be
 	// wasted queries, and the page only ever reads its own.
-	const payload = (): Pick<DashboardModel, "stats" | "standup" | "repositories" | "memories"> => {
+	const payload = (): Pick<DashboardModel, "stats" | "standup" | "repositories" | "memories" | "settings"> => {
 		switch (options.view) {
 			case "stats":
 				return {
@@ -1983,6 +1986,11 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 						options.detailRepoIdentity,
 					),
 				};
+			case "settings":
+				// Built entirely off config + a cheap folder-state peek in the model
+				// builder (no DB read), so there is nothing to query here — just pass
+				// the pre-built snapshot through. Absent only if the builder omitted it.
+				return { settings: options.settingsModel };
 		}
 	};
 

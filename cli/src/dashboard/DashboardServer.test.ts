@@ -195,7 +195,7 @@ describe("security layers", () => {
 		expect((await get(port, "/repositories", { Origin: "https://evil.com" })).status).toBe(403);
 	});
 
-	it("serves every read path with no credential — the mutation token gates only POST/browse/probe, never GET pages", async () => {
+	it("serves every read path with no credential — the mutation token gates only POST/probe, never GET pages", async () => {
 		const port = await listen(testServer());
 		expect((await get(port, "/repositories")).status).toBe(200);
 		expect((await get(port, "/api/model")).status).toBe(200);
@@ -1075,9 +1075,8 @@ describe("write surface", () => {
 		}
 	});
 
-	it("403s /api/browse and /api/repo-probe without a valid token, even as GET", async () => {
+	it("403s /api/repo-probe without a valid token, even as GET", async () => {
 		const port = await listen(writeServer());
-		expect((await fetch(`http://127.0.0.1:${port}/api/browse`)).status).toBe(403);
 		expect((await fetch(`http://127.0.0.1:${port}/api/repo-probe?path=/tmp`)).status).toBe(403);
 	});
 
@@ -1096,52 +1095,6 @@ describe("write surface", () => {
 		});
 		expect(res.status).toBe(200);
 		expect((await res.json()) as { isGitRepo: boolean }).toMatchObject({ isGitRepo: false });
-	});
-
-	it("browses a real directory once a valid token is presented", async () => {
-		const port = await listen(writeServer());
-		const scratch = mkdtempSync(join(tmpdir(), "jolli-browse-"));
-		mkdirSync(join(scratch, "sub-repo"));
-		try {
-			const res = await fetch(`http://127.0.0.1:${port}/api/browse?path=${encodeURIComponent(scratch)}`, {
-				headers: { "X-Jolli-Dashboard-Token": TOKEN },
-			});
-			expect(res.status).toBe(200);
-			const body = (await res.json()) as { entries: ReadonlyArray<{ name: string }> };
-			expect(body.entries.map((e) => e.name)).toContain("sub-repo");
-		} finally {
-			rmSync(scratch, { recursive: true, force: true });
-		}
-	});
-
-	it("400s a relative browse path", async () => {
-		const port = await listen(writeServer());
-		const res = await fetch(`http://127.0.0.1:${port}/api/browse?path=relative`, {
-			headers: { "X-Jolli-Dashboard-Token": TOKEN },
-		});
-		expect(res.status).toBe(400);
-	});
-
-	it("browses the default path when none is given", async () => {
-		const port = await listen(writeServer());
-		const res = await fetch(`http://127.0.0.1:${port}/api/browse`, {
-			headers: { "X-Jolli-Dashboard-Token": TOKEN },
-		});
-		expect(res.status).toBe(200);
-	});
-
-	it("500s /api/browse on an unexpected (non-BrowseError) failure", async () => {
-		const browseModule = await import("./Browse.js");
-		const spy = vi.spyOn(browseModule, "browseDirectory").mockRejectedValueOnce(new Error("unexpected"));
-		try {
-			const port = await listen(writeServer());
-			const res = await fetch(`http://127.0.0.1:${port}/api/browse?path=/tmp`, {
-				headers: { "X-Jolli-Dashboard-Token": TOKEN },
-			});
-			expect(res.status).toBe(500);
-		} finally {
-			spy.mockRestore();
-		}
 	});
 });
 

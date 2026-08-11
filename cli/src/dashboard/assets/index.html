@@ -98,6 +98,16 @@
 			</div>
 		</div>
 	</div>
+	<!--
+	  The Settings modal. Opened over any page from the pinned bottom nav row
+	  (JD.openSettings), which fetches /api/model?view=settings and fills the body.
+	  Same layer rules as the sheets above: fixed, inside `.jd` for token scoping.
+	-->
+	<div class="set-modal-overlay" id="settingsModal" role="dialog" aria-modal="true" aria-label="Jolli Memory Settings" hidden>
+		<div class="set-modal">
+			<div class="set-modal-body" id="settingsModalBody"></div>
+		</div>
+	</div>
 </div>
 <!-- scripts:start -->
 <script src="js/format.js"></script>
@@ -107,6 +117,7 @@
 <script src="js/standup.js"></script>
 <script src="js/repositories.js"></script>
 <script src="js/memories.js"></script>
+<script src="js/settings.js"></script>
 <script src="js/main.js"></script>
 <!-- scripts:end -->
 </body>

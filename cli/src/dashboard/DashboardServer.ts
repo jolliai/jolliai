@@ -79,14 +79,18 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
+import { clearAuthCredentials, getJolliUrl } from "../auth/AuthConfig.js";
+import { browserLogin } from "../auth/Login.js";
 import { getProjectRootDir, listReachableCommits, readLocalGitIdentity } from "../core/GitOps.js";
 import { escapeForInlineScript } from "../core/InlineScript.js";
+import { isLocalAgentUsable } from "../core/localagent/DetectAgents.js";
+import { listPushControlRepos, setRepoPushDisabledByIdentity, triggerReenableDrain } from "../core/PushControl.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import { trackAs } from "../core/Telemetry.js";
 import { isTelemetryEventName, type TelemetryEventName } from "../core/TelemetryEvents.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
-import { BrowseError, browseDirectory, defaultBrowsePath } from "./Browse.js";
+import type { LocalAgentToolId } from "../Types.js";
 import {
 	DASHBOARD_SCHEMA_VERSION,
 	ensureDashboardDbExists,
@@ -109,6 +113,14 @@ import { buildMemoriesPage, type ReachableCommits, readContextDoc } from "./Memo
 import { probeRepo } from "./RepoProbe.js";
 import { deregisterRepo, existingWorktrees, readRepoRegistry, registerRepo } from "./RepoRegistry.js";
 import { buildRepositoriesModel } from "./RepositoriesQuery.js";
+import {
+	applySettings,
+	checkLocalFolder,
+	countMissingForCwd,
+	parseSettingsApplyInput,
+	SettingsValidationError,
+} from "./SettingsMutations.js";
+import { buildSettingsPageModel } from "./SettingsPageQuery.js";
 
 const log = createLogger("DashboardServer");
 
@@ -205,6 +217,7 @@ export const DASHBOARD_SCRIPT_FILES = [
 	"standup.js",
 	"repositories.js",
 	"memories.js",
+	"settings.js",
 	"main.js",
 ] as const;
 
@@ -418,6 +431,7 @@ async function defaultModelBuilder(
 	dbPath: string | undefined,
 	identityCache: IdentityCache,
 	now: () => number,
+	launchCwd: string,
 ): Promise<DashboardModel> {
 	// The launcher creates the file before this process starts, so this only
 	// covers the case where it disappears under a running server (a wiped
@@ -427,6 +441,13 @@ async function defaultModelBuilder(
 	// scripts on it, so nothing polls `/api/model` and the browser never comes
 	// back on its own. An empty database renders the normal "no data yet" page.
 	await ensureDashboardDbExists(dbPath ? { dbPath } : {});
+	// Settings is built off config + a cheap folder-state peek, not the DB. Built
+	// here (before the read-only DB open) and threaded through `QueryOptions`. The
+	// launch cwd — `process.cwd()`, set to the git root by `DashboardCommand` when
+	// it spawned this process — drives only the Memory Bank state line; a reused
+	// long-lived server reflects the repo it was FIRST launched in, which is why
+	// that repo's name travels to the user alongside it as `repoLabel`.
+	const settingsModel = request.view === "settings" ? await buildSettingsPageModel(configDir, launchCwd) : undefined;
 	return withReadonlyDashboardDb(
 		async (db) => {
 			// A rebase/reset/squash that rewrites history away leaves the old
@@ -467,6 +488,7 @@ async function defaultModelBuilder(
 			const built = buildDashboardModel(db, {
 				...request,
 				...(repositories ? { repositoriesModel: repositories } : {}),
+				...(settingsModel ? { settingsModel } : {}),
 				...(reachableCommits ? { reachableCommits } : {}),
 				...(authorIdentity ? { authorIdentity } : {}),
 			});
@@ -521,6 +543,14 @@ export interface DashboardServerOptions {
 	readonly configDir?: string;
 	/** Mutation token override (tests). Defaults to a fresh random one per server. */
 	readonly token?: string;
+	/**
+	 * The repo the server was launched in — `process.cwd()` in production (set to
+	 * the git root by `DashboardCommand`). Drives the Settings page's per-repo
+	 * displays and its repo-scoped actions (generate-missing, migrate, sync-now,
+	 * the push list's "this repo" marker). Injectable so tests point it at a
+	 * temp repo instead of the real one.
+	 */
+	readonly serverCwd?: string;
 }
 
 /** Host header allowlist — exact host, optional matching port. */
@@ -653,6 +683,31 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 	return raw ? JSON.parse(raw) : {};
 }
 
+/** How long a Settings sign-in may wait for the browser callback before failing. */
+const SIGNIN_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Rejects with `message` if `promise` has not settled within `ms`. Used to cap
+ * `browserLogin`, which resolves only on the OAuth callback and otherwise waits
+ * forever — a request must not hang on a login the user abandoned.
+ */
+export function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(message)), ms);
+		timer.unref?.();
+		promise.then(
+			(value) => {
+				clearTimeout(timer);
+				resolve(value);
+			},
+			(err) => {
+				clearTimeout(timer);
+				reject(err instanceof Error ? err : new Error(String(err)));
+			},
+		);
+	});
+}
+
 /**
  * The `/api/telemetry` beacon. Forwards ONE content-free, already-bucketed event
  * from the local web view into the shared telemetry buffer, stamped `web-local`.
@@ -756,14 +811,11 @@ function parseWindow(url: URL): Omit<ModelRequest, "view" | "scope"> {
  * (folded into Memories' per-topic Decisions callout) — so it is absent here
  * and handled as its own 302 in `handle()` instead.
  *
- * `/knowledge`, `/graph` and `/settings` are NOT routed: v1 releases none of
- * the three, so they are absent from this table and from `VIEW_TOKENS`, and a
- * direct visit 404s. Their builders (`SettingsQuery.buildSettings`,
- * `EnvFacts.readEnvironmentFacts`, `HookStatus.readRepoHookStatus`) and the
- * `POST /api/hooks/reinstall` handler are retained but currently unreachable;
- * restoring a view means adding its entry here AND to `VIEW_TOKENS`,
- * `DashboardView`, the model payload and `shell.js`'s nav — not a nav row
- * alone.
+ * `settings` has NO page path — it is a MODAL opened over any page from the nav
+ * (`shell.js` → `JD.openSettings`), which fetches its model via
+ * `/api/model?view=settings`. So `settings` is in `VIEW_TOKENS` (for that fetch)
+ * but deliberately absent here; a direct visit to `/settings` 404s. `/knowledge`
+ * and `/graph` are also unrouted (v1 releases neither).
  */
 const VIEW_PATHS: Readonly<Record<string, DashboardView>> = {
 	"/repositories": "repositories",
@@ -780,7 +832,13 @@ const VIEW_PATHS: Readonly<Record<string, DashboardView>> = {
  * moment `stats` moved to `/dashboard` — `?view=standup` stopped resolving and
  * fell back to Stats. The API speaks view tokens; the router speaks paths.
  */
-const VIEW_TOKENS: ReadonlySet<string> = new Set<DashboardView>(["stats", "standup", "repositories", "memories"]);
+const VIEW_TOKENS: ReadonlySet<string> = new Set<DashboardView>([
+	"stats",
+	"standup",
+	"repositories",
+	"memories",
+	"settings",
+]);
 
 /**
  * New destinations that redirect to Repositories when nothing is enabled yet
@@ -799,6 +857,7 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	const now = options.now ?? Date.now;
 	const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
 	const configDir = options.configDir;
+	const serverCwd = options.serverCwd ?? process.cwd();
 	const token = options.token ?? randomBytes(32).toString("hex");
 	let assetsDir: string | undefined;
 	let lastRequestMs = now();
@@ -809,7 +868,8 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	const identityCache: IdentityCache = new Map();
 	const buildModel =
 		options.buildModel ??
-		((request: ModelRequest) => defaultModelBuilder(request, configDir, options.dbPath, identityCache, now));
+		((request: ModelRequest) =>
+			defaultModelBuilder(request, configDir, options.dbPath, identityCache, now, serverCwd));
 
 	const server = createServer(async (req, res) => {
 		lastRequestMs = now();
@@ -866,28 +926,8 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			return;
 		}
 
-		// The two GETs that exist only to feed a mutation — token-gated on the
-		// same terms as the POSTs (see the module header's layer 3).
-		if (url.pathname === "/api/browse") {
-			if (!hasValidToken(req, token)) {
-				sendText(res, 403, "Forbidden");
-				return;
-			}
-			try {
-				const requested = url.searchParams.get("path") || defaultBrowsePath();
-				sendJson(res, 200, await browseDirectory(requested));
-			} catch (err) {
-				// Only our own BrowseError carries a message written for the user.
-				// Anything else is a raw runtime/fs failure whose text can leak
-				// paths and internals, so it is logged and answered generically.
-				if (err instanceof BrowseError) sendJson(res, 400, { error: err.message });
-				else {
-					log.warn("browse failed: %s", errMsg(err));
-					sendJson(res, 500, { error: "could not read that directory" });
-				}
-			}
-			return;
-		}
+		// The GETs that exist only to feed a mutation — token-gated on the same
+		// terms as the POSTs (see the module header's layer 3).
 		if (url.pathname === "/api/repo-probe") {
 			if (!hasValidToken(req, token)) {
 				sendText(res, 403, "Forbidden");
@@ -899,6 +939,17 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 				return;
 			}
 			sendJson(res, 200, await probeRepo(path, configDir));
+			return;
+		}
+		// Settings → Memory Bank: advisory existence/writability check for the typed
+		// Folder Path (blur feedback). Never mutates — creation is a deliberate act
+		// the user does themselves; this only reports a verdict.
+		if (url.pathname === "/api/settings/check-folder") {
+			if (!hasValidToken(req, token)) {
+				sendText(res, 403, "Forbidden");
+				return;
+			}
+			sendJson(res, 200, { status: await checkLocalFolder(url.searchParams.get("path") ?? "") });
 			return;
 		}
 		if (url.pathname === "/health") {
@@ -1060,6 +1111,38 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			return;
 		}
 
+		// Settings → Sync to Jolli: the machine-wide per-repo push list. A read like
+		// every other GET here (no token). `currentCwd` only marks the launch repo's
+		// row and is not what determines the list contents.
+		if (url.pathname === "/api/settings/push-repos") {
+			try {
+				const config = await loadConfigFromDir(configDir ?? getGlobalConfigDir());
+				const repos = await listPushControlRepos({
+					...(config.localFolder ? { localFolder: config.localFolder } : {}),
+					currentCwd: serverCwd,
+				});
+				sendJson(res, 200, { repos });
+			} catch (err) {
+				log.warn("push-repos read failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not list repositories" });
+			}
+			return;
+		}
+
+		// Settings → Memory Bank: the slow missing-summaries count, on its own
+		// endpoint so it never blocks the page's first paint. `null` (not a project)
+		// becomes a 200 with `{ missing: null }` so the page cleanly renders no line.
+		if (url.pathname === "/api/settings/missing-summaries") {
+			try {
+				const count = await countMissingForCwd(serverCwd);
+				sendJson(res, 200, count ?? { missing: null });
+			} catch (err) {
+				log.warn("missing-summaries count failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not count missing summaries" });
+			}
+			return;
+		}
+
 		sendText(res, 404, "Not found");
 	}
 
@@ -1108,8 +1191,194 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			await handleHooksReinstall(res, b);
 			return;
 		}
+		if (url.pathname === "/api/settings/apply") {
+			await handleSettingsApply(res, b);
+			return;
+		}
+		if (url.pathname === "/api/settings/set-push") {
+			await handleSetPush(res, b);
+			return;
+		}
+		if (url.pathname === "/api/settings/signin") {
+			await handleSignIn(res);
+			return;
+		}
+		if (url.pathname === "/api/settings/signout") {
+			await handleSignOut(res);
+			return;
+		}
+		if (url.pathname === "/api/settings/generate-missing") {
+			await handleGenerateMissing(res);
+			return;
+		}
+		if (url.pathname === "/api/settings/probe-local-agent") {
+			await handleProbeLocalAgent(res, b);
+			return;
+		}
+		if (url.pathname === "/api/settings/migrate") {
+			await handleMigrate(res);
+			return;
+		}
+		if (url.pathname === "/api/settings/sync-now") {
+			await handleSyncNow(res);
+			return;
+		}
 		sendText(res, 404, "Not found");
 	}
+
+	/** Settings → Apply Changes: persist config + reconcile hook/global-instructions side effects. */
+	async function handleSettingsApply(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
+		let input: ReturnType<typeof parseSettingsApplyInput>;
+		try {
+			input = parseSettingsApplyInput(body);
+		} catch (err) {
+			if (err instanceof SettingsValidationError) {
+				sendJson(res, 400, { error: err.message });
+				return;
+			}
+			throw err;
+		}
+		try {
+			const result = await applySettings(input, configDir ?? getGlobalConfigDir());
+			sendJson(res, 200, { ok: true, hookFailures: result.hookFailures });
+		} catch (err) {
+			if (err instanceof SettingsValidationError) {
+				sendJson(res, 400, { error: err.message });
+				return;
+			}
+			log.warn("settings apply failed: %s", errMsg(err));
+			sendJson(res, 500, { error: "could not save settings" });
+		}
+	}
+
+	/** Settings → Sync to Jolli: toggle one repo's outbound push. Applies immediately. */
+	async function handleSetPush(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
+		const repoIdentity = typeof body.repoIdentity === "string" ? body.repoIdentity : undefined;
+		if (!repoIdentity) {
+			sendJson(res, 400, { error: "repoIdentity is required" });
+			return;
+		}
+		if (typeof body.disabled !== "boolean") {
+			sendJson(res, 400, { error: "disabled (boolean) is required" });
+			return;
+		}
+		try {
+			const result = await setRepoPushDisabledByIdentity(repoIdentity, body.disabled, "cli");
+			// Re-enabling the repo we're in kicks off its retained-backlog drain now.
+			if (!body.disabled && body.isCurrentRepo === true) triggerReenableDrain(serverCwd);
+			sendJson(res, 200, {
+				ok: true,
+				disabled: result.disabled,
+				// The store had to be rebuilt from empty — other repos' opt-outs were
+				// dropped. The page MUST surface this (see PushControlStore docstring).
+				...(result.recoveredFromCorrupt ? { recoveredFromCorrupt: true } : {}),
+			});
+		} catch (err) {
+			log.warn("set-push failed: %s", errMsg(err));
+			sendJson(res, 500, { error: "could not change push setting" });
+		}
+	}
+
+	/**
+	 * Settings → Sign In. Reuses `browserLogin` verbatim — the same loopback-callback
+	 * OAuth flow `jolli auth login` runs — so there is no new callback route and no
+	 * backend dependency. It opens its own browser tab and resolves when the callback
+	 * lands; capped so a never-completed login does not hang the request forever.
+	 */
+	/* v8 ignore start -- opens a real browser and blocks on the OAuth callback; the
+	   underlying browserLogin is covered by cli/src/auth/Login.test.ts. */
+	async function handleSignIn(res: ServerResponse): Promise<void> {
+		try {
+			await withTimeout(browserLogin(getJolliUrl()), SIGNIN_TIMEOUT_MS, "sign-in timed out — please try again");
+			sendJson(res, 200, { ok: true });
+		} catch (err) {
+			log.warn("sign-in failed: %s", errMsg(err));
+			sendJson(res, 400, { error: errMsg(err) });
+		}
+	}
+	/* v8 ignore stop */
+
+	/* v8 ignore start -- mutates the machine-global auth config; clearAuthCredentials
+	   is covered by cli/src/auth/AuthConfig.test.ts. */
+	/** Settings → Sign Out. Same as `jolli auth logout` (clears authToken + jolliApiKey). */
+	async function handleSignOut(res: ServerResponse): Promise<void> {
+		try {
+			await clearAuthCredentials();
+			sendJson(res, 200, { ok: true });
+		} catch (err) {
+			log.warn("sign-out failed: %s", errMsg(err));
+			sendJson(res, 500, { error: "could not sign out" });
+		}
+	}
+	/* v8 ignore stop */
+
+	/** Settings → Generate Missing Summaries: backfill the launch repo's un-summarized commits. */
+	async function handleGenerateMissing(res: ServerResponse): Promise<void> {
+		let repoRoot: string;
+		try {
+			repoRoot = await getProjectRootDir(serverCwd);
+		} catch {
+			sendJson(res, 400, { error: "the dashboard was not started inside a git repository" });
+			return;
+		}
+		try {
+			const { runBackfill, recentCommitHashes } = await import("../backfill/BackfillEngine.js");
+			const hashes = await recentCommitHashes(repoRoot);
+			const report = await runBackfill({ cwd: repoRoot, hashes });
+			sendJson(res, 200, { ok: true, generated: report.generated, errors: report.errors, total: report.total });
+		} catch (err) {
+			log.warn("generate-missing failed: %s", errMsg(err));
+			sendJson(res, 500, { error: "could not generate summaries" });
+		}
+	}
+
+	/** Settings → AI Summary: probe whether a local-agent CLI is usable (spawns `--version`). */
+	async function handleProbeLocalAgent(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
+		const tool = typeof body.tool === "string" ? (body.tool as LocalAgentToolId) : undefined;
+		if (!tool) {
+			sendJson(res, 400, { error: "tool is required" });
+			return;
+		}
+		try {
+			const usable = await isLocalAgentUsable(tool);
+			sendJson(res, 200, { ok: true, usable });
+		} catch (err) {
+			log.warn("probe-local-agent failed: %s", errMsg(err));
+			sendJson(res, 500, { error: "could not probe the local agent" });
+		}
+	}
+
+	/** Settings → Memory Bank → Migrate: re-migrate the launch repo into a fresh folder. */
+	async function handleMigrate(res: ServerResponse): Promise<void> {
+		try {
+			const { rebuildMemoryBank } = await import("../core/MemoryBankRebuild.js");
+			const result = await rebuildMemoryBank(serverCwd);
+			// On failure the client's JD.post reads `error`, so surface the reason
+			// there (not just `message`) or it renders as "request failed (400)".
+			if (result.ok) sendJson(res, 200, result);
+			else sendJson(res, 400, { error: result.message, ...result });
+		} catch (err) {
+			log.warn("migrate failed: %s", errMsg(err));
+			sendJson(res, 500, { ok: false, message: "could not migrate the Memory Bank" });
+		}
+	}
+
+	/* v8 ignore start -- performs a real network sync to Personal Space via the
+	   shared runSync (covered by cli/src/commands/SyncCommand.test.ts); not safe to
+	   drive against the real account in a unit test. */
+	/** Settings → Memory Bank → Sync Now: one manual push of the Memory Bank to Personal Space. */
+	async function handleSyncNow(res: ServerResponse): Promise<void> {
+		try {
+			const { runSync } = await import("../commands/SyncCommand.js");
+			const code = await runSync({ cwd: serverCwd });
+			if (code === 0) sendJson(res, 200, { ok: true });
+			else sendJson(res, 400, { error: "sync did not complete — check that you are signed in to Jolli" });
+		} catch (err) {
+			log.warn("sync-now failed: %s", errMsg(err));
+			sendJson(res, 500, { error: "could not sync the Memory Bank" });
+		}
+	}
+	/* v8 ignore stop */
 
 	async function handleEnable(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
 		const path = typeof body.path === "string" ? body.path : undefined;

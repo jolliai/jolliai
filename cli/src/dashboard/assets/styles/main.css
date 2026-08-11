@@ -271,8 +271,15 @@ body {
 
   /* The bottom slot is a standing destination, not the tail end of the menu
      list — pin it to the sidebar's bottom edge (flex column + margin-top: auto)
-     and set it off with the same rule used for .footnote elsewhere on the page. */
-  .sb-bottom { margin-top: auto; padding-top: 10px; border-top: 1px solid var(--border); }
+     and set it off with the same rule used for .footnote elsewhere on the page.
+     `position: sticky; bottom: 0` keeps it visible even when the menu list is
+     taller than the viewport (a short window, or DevTools docked at the bottom):
+     without it the auto margin collapses and Settings scrolls below the fold. The
+     opaque surface background lets the scrolling menu pass cleanly behind it. */
+  .sb-bottom {
+    margin-top: auto; position: sticky; bottom: 0; z-index: 1;
+    padding-top: 10px; border-top: 1px solid var(--border); background: var(--surface);
+  }
 
   /* ---------- nav: Dashboard's two children + gated rows ----------
      Six-destination nav (Repositories top slot, Dashboard/Memories/Knowledge/
@@ -570,6 +577,10 @@ body {
   }
   .cta:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
   .cta.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  /* Disabled CTAs (the dirty-gated Apply, an in-flight "Applying…", locked upsell
+     buttons) must READ as disabled — the base .cta had no disabled state, so a
+     set `disabled` attribute still painted a full-colour, pointer-cursor button. */
+  .cta:disabled { opacity: .45; cursor: not-allowed; }
 
   /* ---------- standup view ---------- */
   .ctx { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -1113,3 +1124,226 @@ body {
     .chip, .seg button, .cta, .copybtn { transition: background .12s ease, color .12s ease; }
     .icard { transition: opacity .18s ease, transform .18s ease; }
   }
+
+  /* ── Settings page ─────────────────────────────────────────────────────── */
+  .set-card { grid-column: span 12; }
+  .set-layout { display: flex; gap: 20px; align-items: flex-start; }
+  .set-rail { flex: 0 0 168px; display: flex; flex-direction: column; gap: 2px; }
+  .set-rail-item {
+    appearance: none; text-align: left; font: inherit; font-size: 13px; cursor: pointer;
+    display: flex; align-items: center; gap: 9px;
+    background: transparent; border: 0; border-radius: 7px; padding: 8px 10px; color: var(--ink-2);
+  }
+  .set-rail-item:hover { background: var(--lock-bg); color: var(--ink); }
+  /* Selected item: a neutral light-gray pill (like the Claude settings dialog),
+     not the blue accent tint — the sidebar nav owns the accent, the modal rail
+     stays quiet. The dark text + 600 weight carry the selected state. */
+  .set-rail-item.active { background: var(--lock-bg); color: var(--ink); font-weight: 600; }
+  .set-rail-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .set-rail-icon { width: 16px; height: 16px; display: inline-flex; flex: none; color: var(--muted); }
+  .set-rail-item.active .set-rail-icon { color: var(--ink); }
+  .set-rail-icon svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .set-rail-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .set-content { flex: 1; min-width: 0; }
+  .set-h { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--ink); }
+  .set-h + .set-row, .set-h + .set-group, .set-h + .set-subcard { margin-top: 0; }
+  .set-group { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
+  .set-divider { height: 1px; background: var(--border); margin: 16px 0; }
+  .set-row { display: flex; flex-direction: column; gap: 6px; margin: 14px 0; }
+  .set-row-inline { flex-direction: row; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .set-grow { flex: 1; min-width: 0; }
+  /* Field label stacks its own inline hint onto a second line (it used to render
+     "Folder PathRoot directory…" run together, and the nested hint inherited the
+     label's 600 weight). Hints are always normal-weight muted; a <strong> inside
+     one still emphasises. */
+  .set-label { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; font-size: 13px; font-weight: 600; color: var(--ink); }
+  .set-hint { font-size: 12px; font-weight: 400; color: var(--muted); line-height: 1.5; }
+  /* Inline highlight for a named entity inside a hint (e.g. the current repo in
+     the missing-summaries count) — accent-coloured and a touch heavier so it
+     stands out of the muted sentence around it. */
+  .set-hl { color: var(--accent); font-weight: 600; }
+  .set-note { font-size: 12px; color: var(--muted); padding: 8px 0; }
+  /* Folder Path verdict (blur check) sits to the RIGHT of the input, not below —
+     an empty reserved line under the field read as an ugly blank gap. The input
+     keeps its own width; the status takes the remaining space and wraps under it
+     only when the row is too narrow. */
+  .set-folder-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+  .set-folder-row .set-input { flex: 0 1 420px; }
+  .set-folder-status { flex: 1 1 150px; min-width: 0; font-size: 12px; line-height: 1.4; color: var(--muted); }
+  .set-folder-status:empty { display: none; }
+  .set-folder-status.ok { color: var(--good-text); }
+  .set-folder-status.warn { color: var(--warn); }
+  .set-folder-status.err { color: var(--crit); }
+  .set-input {
+    appearance: none; font: inherit; font-size: 13px; color: var(--ink);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px;
+    max-width: 420px; width: 100%;
+  }
+  .set-input:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .set-input[readonly] { color: var(--ink-2); background: var(--lock-bg); }
+  /* `.set-input` sets appearance:none, which strips the native dropdown arrow, so
+     selects get an explicit chevron (Lucide chevron-down) painted on the right. */
+  select.set-input {
+    max-width: 260px; padding-right: 34px; cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238b93a1' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 11px center; background-size: 15px;
+  }
+  .set-toggle {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 10px; border-radius: 7px; cursor: pointer;
+  }
+  .set-toggle:hover { background: var(--lock-bg); }
+  .set-toggle input { flex: none; width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+  .set-toggle-label { font-size: 13px; color: var(--ink); }
+  .set-toggle .set-hint { flex-basis: 100%; padding-left: 26px; }
+  /* Subtle grouped box for a provider's config form — a faint coordinated tint
+     (matches the rail panel) rather than a heavy solid --lock-bg fill. */
+  .set-subcard { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: color-mix(in srgb, var(--lock-bg) 35%, var(--surface)); }
+  .set-status { font-size: 13px; color: var(--ink-2); }
+  .set-status.ok { color: var(--good-text); font-weight: 600; }
+  .set-status.warn { color: var(--warn, #b26a00); font-weight: 600; }
+  .set-tag {
+    display: inline-block; font-size: 10.5px; font-weight: 600; color: var(--accent);
+    background: var(--accent-soft); border-radius: 5px; padding: 1px 6px; margin-left: 4px;
+  }
+  .set-footer { display: flex; align-items: center; gap: 12px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+  .set-banner { margin-bottom: 14px; }
+  .set-banner.ok { border-color: var(--good); }
+  .callout.err { border-color: var(--crit); color: var(--ink); }
+
+  /* ── Settings modal (opened over any page from the pinned nav row) ───────── */
+  .set-modal-overlay {
+    position: fixed; inset: 0; z-index: 80; display: grid; place-items: center;
+    background: rgba(10, 14, 22, .5); padding: 24px;
+  }
+  .set-modal-overlay[hidden] { display: none; }
+  .set-modal {
+    width: min(920px, 100%); height: min(760px, 92vh); display: flex; flex-direction: column;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: var(--shadow-md); overflow: hidden;
+  }
+  .set-modal-body { flex: 1; min-height: 0; overflow: hidden; display: flex; }
+  .set-modal-body .set-layout { flex: 1; min-height: 0; align-items: stretch; gap: 0; }
+  .set-modal-body .set-rail {
+    flex: 0 0 184px; padding: 16px 12px; border-right: 1px solid var(--border);
+    background: color-mix(in srgb, var(--lock-bg) 40%, var(--surface));
+    overflow-y: auto; gap: 2px;
+  }
+  /* The content column is a flex-col: a fixed close-band on top, the scrolling
+     section body below — so the scrollbar lives under the band and never reaches
+     the ✕ in the corner (the Claude settings-dialog layout). */
+  .set-modal-body .set-content { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+  .set-content-head { flex: none; display: flex; justify-content: flex-end; align-items: center; padding: 12px 14px 6px; }
+  .set-content-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 2px 34px 26px 26px; }
+  /* Persistent action bar pinned to the bottom of the content column (the VS Code
+     `.action-bar` role): one shared Apply button + save/validation feedback, always
+     visible on every section rather than scrolling away inside the body. */
+  .set-content-foot {
+    flex: none; display: flex; align-items: center; gap: 12px;
+    padding: 12px 34px 14px 26px; border-top: 1px solid var(--border); background: var(--surface);
+  }
+  .set-foot-spacer { flex: 1; }
+  .set-foot-msg { font-size: 12.5px; color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .set-foot-msg.ok { color: var(--good-text); font-weight: 600; }
+  .set-foot-msg.err { color: var(--crit); font-weight: 600; }
+  /* No title bar — just the close control, right-aligned inside the band. */
+  .set-modal-close {
+    appearance: none; border: 0; background: transparent; cursor: pointer;
+    color: var(--muted); font-size: 16px; line-height: 1; width: 30px; height: 30px;
+    display: grid; place-items: center; border-radius: 8px;
+  }
+  .set-modal-close:hover { background: var(--lock-bg); color: var(--ink); }
+  .set-modal-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* Thin, subtle scrollbars (like the Claude settings dialog). The default wide
+     bar crowded the close control; a thin overlay-style bar under the band is quiet. */
+  .set-modal-body .set-rail,
+  .set-modal-body .set-content-scroll {
+    scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted) 42%, transparent) transparent;
+  }
+  .set-modal-body .set-rail::-webkit-scrollbar,
+  .set-modal-body .set-content-scroll::-webkit-scrollbar { width: 10px; }
+  .set-modal-body .set-rail::-webkit-scrollbar-track,
+  .set-modal-body .set-content-scroll::-webkit-scrollbar-track { background: transparent; }
+  .set-modal-body .set-rail::-webkit-scrollbar-thumb,
+  .set-modal-body .set-content-scroll::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--muted) 38%, transparent); border-radius: 999px;
+    border: 3px solid transparent; background-clip: padding-box;
+  }
+  .set-modal-body .set-content-scroll:hover::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--muted) 55%, transparent); background-clip: padding-box;
+  }
+
+  /* Toggle row: label + hint on the left, a switch on the right (VS Code layout). */
+  .set-toggle-row {
+    display: flex; align-items: flex-start; gap: 14px; padding: 11px 0; cursor: pointer;
+  }
+  .set-toggle-row + .set-toggle-row { border-top: 1px solid var(--border); }
+  .set-toggle-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .set-toggle-row .set-toggle-label { font-size: 13px; font-weight: 600; color: var(--ink); }
+  .set-switch {
+    flex: none; appearance: none; width: 34px; height: 20px; margin-top: 2px; border-radius: 999px;
+    background: var(--border); position: relative; cursor: pointer; transition: background .15s;
+  }
+  .set-switch::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+    border-radius: 50%; background: #fff; transition: transform .15s;
+  }
+  .set-switch:checked { background: var(--accent); }
+  .set-switch:checked::after { transform: translateX(14px); }
+  .set-switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .section-hint { font-size: 12px; color: var(--muted); margin: 14px 0 6px; }
+  .section-hint:first-child { margin-top: 0; }
+  hr.set-divider { border: 0; height: 1px; background: var(--border); margin: 16px 0; }
+
+  /* Titled block: a panel with multiple areas splits into blocks, each led by a
+     bold heading with generous separation (the Claude settings-dialog grammar). */
+  .set-block { min-width: 0; }
+  .set-block + .set-block { margin-top: 32px; }
+  .set-block-h { margin: 0 0 12px; font-size: 15px; font-weight: 700; color: var(--ink); letter-spacing: -.01em; }
+  .set-block-h + .section-hint, .set-block-h + .set-row { margin-top: 0; }
+  .set-hint code, .warning-banner code, .set-toggle-text code {
+    font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;
+    background: var(--lock-bg); border-radius: 4px; padding: 1px 4px;
+  }
+  /* A caution note reads as a caution — a faint amber wash keyed to --warn, not a
+     neutral --lock-bg fill that looked like an inert grey box. */
+  .warning-banner {
+    font-size: 12px; line-height: 1.5; color: var(--ink-2);
+    background: color-mix(in srgb, var(--warn) 9%, var(--surface));
+    border: 1px solid color-mix(in srgb, var(--warn) 28%, var(--border));
+    border-radius: 8px; padding: 11px 13px;
+  }
+  .set-status.warn { color: var(--warn, #b26a00); font-weight: 600; }
+
+  @media (max-width: 720px) {
+    .set-modal { height: 92vh; }
+    .set-modal-body { flex-direction: column; }
+    .set-modal-body .set-layout { flex-direction: column; }
+    .set-modal-body .set-rail {
+      flex: none; flex-direction: row; overflow-x: auto; border-right: 0;
+      border-bottom: 1px solid var(--border);
+    }
+  }
+
+  /* ── Settings modal loading / error state ───────────────────────────────── */
+  .set-loading {
+    flex: 1; min-height: 220px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px; padding: 48px 24px;
+    text-align: center; color: var(--muted); font-size: 13px;
+  }
+  .set-spinner {
+    width: 30px; height: 30px; border-radius: 50%;
+    border: 3px solid var(--border); border-top-color: var(--accent);
+    animation: jd-spin .8s linear infinite;
+  }
+  @media (prefers-reduced-motion: reduce) { .set-spinner { animation: none; } }
+  .set-loading-error { color: var(--ink-2); }
+  .set-loading-icon {
+    display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%;
+    background: color-mix(in srgb, var(--crit) 14%, transparent); color: var(--crit);
+    font-weight: 700; font-size: 18px; line-height: 1;
+  }
+  .set-loading-title { font-size: 14px; font-weight: 600; color: var(--ink); }
+  .set-loading-sub { max-width: 42ch; line-height: 1.5; }
+  .set-loading-error .cta { margin-top: 6px; }

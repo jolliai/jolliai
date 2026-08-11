@@ -100,6 +100,7 @@ window.JD = window.JD || {};
 		{ view: "standup", label: "Daily Standup", sub: "sprint · local" },
 		{ view: "repositories", label: "Repositories", sub: "enable · pause" },
 		{ view: "memories", label: "Memories", sub: "browse · per-commit" },
+		{ view: "settings", label: "Settings", sub: "agents · summary · memory bank" },
 	];
 
 	/* Canonical URL for a view token. `stats`/`standup` live at /dashboard(/standup)
@@ -111,6 +112,7 @@ window.JD = window.JD || {};
 		standup: "/dashboard/standup",
 		repositories: "/repositories",
 		memories: "/memories",
+		settings: "/settings",
 	};
 	JD.viewPath = (view) => VIEW_PATH[view] || "/" + view;
 
@@ -139,7 +141,10 @@ window.JD = window.JD || {};
 		{ view: "memories", path: "/memories", label: "Memories", gated: true },
 		{ view: "repositories", path: "/repositories", label: "Repositories" },
 	];
-	var NAV_BOTTOM = null;
+	/* Settings is pinned to the sidebar's bottom edge (its reserved slot), not in
+	   the scrollable menu list — a persistent destination rather than the last
+	   nav row. Never gated: agents/summary/privacy are meaningful with zero repos. */
+	var NAV_BOTTOM = { view: "settings", path: "/settings", label: "Settings" };
 
 	/* The sidebar uses the same compact Lucide-style outlines as the mockup.
 	   Keeping the paths here makes the navigation self-contained and avoids a
@@ -152,6 +157,8 @@ window.JD = window.JD || {};
 		database:
 			'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
 		chevron: '<path d="m6 9 6 6 6-6"/>',
+		settings:
+			'<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
 	};
 	var navIcon = (name, extraClass) =>
 		'<span class="sb-icon' +
@@ -159,7 +166,8 @@ window.JD = window.JD || {};
 		'"><svg viewBox="0 0 24 24" aria-hidden="true">' +
 		NAV_ICONS[name] +
 		"</svg></span>";
-	var navIconFor = (view) => ({ repositories: "foldergit", stats: "dashboard", memories: "database" })[view];
+	var navIconFor = (view) =>
+		({ repositories: "foldergit", stats: "dashboard", memories: "database", settings: "settings" })[view];
 
 	/* Tier → the `data-tier` the stylesheet keys its chips and locked previews off. */
 	var TIER_INDEX = { installed: 0, memory: 1, space: 2 };
@@ -226,12 +234,11 @@ window.JD = window.JD || {};
 		});
 		document.getElementById("sbNav").innerHTML = nav;
 		/* The bottom slot is pinned to the sidebar's bottom edge, outside the
-		   scrollable menu list, when it has a row to show — that separate slot
-		   (rather than a trailing nav row) is what makes it read as a persistent
-		   destination instead of the last item in a list. `NAV_BOTTOM` is
-		   currently null (v1 does not release Settings, its intended tenant),
-		   so the slot itself is hidden rather than left rendering its own
-		   border/padding around nothing. */
+		   scrollable menu list — that separate slot (rather than a trailing nav
+		   row) is what makes it read as a persistent destination instead of the
+		   last item in a list. It holds Settings (`NAV_BOTTOM`); if that were ever
+		   nulled the slot hides itself rather than rendering border/padding around
+		   nothing. */
 		var sbBottom = document.getElementById("sbBottom");
 		sbBottom.hidden = !NAV_BOTTOM;
 		sbBottom.innerHTML = NAV_BOTTOM ? navRow(NAV_BOTTOM, model.view === NAV_BOTTOM.view, false) : "";
@@ -377,6 +384,12 @@ window.JD = window.JD || {};
 			var path = button.getAttribute("data-nav-path");
 			var navView = button.getAttribute("data-nav-view");
 			button.onclick = () => {
+				// Settings is a MODAL over the current page, not a navigation — open it
+				// in place rather than routing away (like the Claude settings dialog).
+				if (navView === "settings" && JD.openSettings) {
+					JD.openSettings();
+					return;
+				}
 				if (navView && navView !== model.view) JD.track("dashboard_view_switched", { view: navView });
 				window.location.href = path + JD.query(model, { range: undefined, repo: undefined });
 			};
