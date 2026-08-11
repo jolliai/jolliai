@@ -25,11 +25,14 @@ Run `jolli dev .` in the folder containing this file to start a dev server.
 | `nav` | `NavLink[]` | Yes | Legacy flat navbar links. Use `header` for dropdowns. |
 | `header` | `HeaderConfig` | No | Navbar with dropdown support. Overrides `nav` when set. |
 | `footer` | `FooterConfig` | No | Footer with columns, copyright, and social links. |
+| `navigation` | array | No | Content navigation tree, in one of two modes: *page mode* (an array of named top-level sections) or *simple mode* (a flat array of groups and articles). See `$defs.NavigationPage`, `NavigationGroup` and `NavigationArticle` in [`schemas/site-config.json`](../schemas/site-config.json) for the field-level shape. |
 | `sidebar` | `SidebarOverrides` | No | Custom sidebar labels and ordering per directory. |
+| `anchors` | `AnchorItem[]` | No | Persistent links pinned to the bottom of the sidebar. See [Anchors](#anchors-anchors). |
 | `pathMappings` | `Record<string, string>` | No | Remap source folders to different content paths. |
 | `favicon` | `string` | No | Favicon URL. Deprecated; use `theme.favicon` instead. |
 | `theme` | `ThemeConfig` | No | Visual theme pack and branding options. |
 | `branding` | `BrandingConfig` | No | Deprecated nested-shape alias for `theme`. Coerced at load time; `theme.*` wins on conflict. New site.json files should use `theme` directly. |
+| `renderer` | `string` | No | Reserved for future non-Nextra renderers. Leave unset — Nextra is the only renderer today. |
 
 > **Custom scripts** (analytics, chat widgets, custom CSS) are **not** a `site.json` field — they use a file convention: drop `.js`/`.css` files into a `.jolli/scripts/` folder at your Content_Folder root. See [Custom Scripts](#custom-scripts-jolliscripts) below.
 
@@ -281,6 +284,29 @@ Overrides the auto-generated sidebar labels and ordering per directory.
   }
 }
 ```
+
+---
+
+## Anchors (`anchors`)
+
+Persistent links pinned to the bottom of the sidebar, below the generated page
+tree — the usual home for a Blog, Community, or Changelog link that should stay
+reachable from every page.
+
+```json
+{
+  "anchors": [
+    { "label": "Blog", "href": "https://example.com/blog", "icon": "📘" },
+    { "label": "Community", "href": "https://example.com/community" }
+  ]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `label` | `string` | Yes | Display text. |
+| `href` | `string` | Yes | Destination URL. |
+| `icon` | `string` | No | Optional emoji or text prefix shown before the label. |
 
 ---
 
