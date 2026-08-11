@@ -93,6 +93,7 @@ import {
 } from "../core/references/ReferenceStore.js";
 import { getRegistry } from "../core/references/SourceDefinitionRegistry.js";
 import { renderBlock } from "../core/references/SourceEngine.js";
+import { resolveArchivedTitle } from "../core/SessionTitleResolver.js";
 import {
 	associateNoteWithCommit,
 	associatePlanWithCommit,
@@ -2330,7 +2331,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	// transcript ID for it and stamp it onto the summary in one go. Overlays
 	// are already applied inside loadSessionTranscripts so the summary input,
 	// the empty-transcript guard, and the stored snapshot all see the same view.
-	const storedTranscript = buildStoredTranscript(sessionTranscripts);
+	const storedTranscript = await buildStoredTranscript(sessionTranscripts);
 	const hasTranscriptContent = storedTranscript.sessions.length > 0;
 	const transcriptId = hasTranscriptContent ? generateTranscriptId() : undefined;
 
@@ -3369,7 +3370,7 @@ async function handleAmendPipeline(
 	// Overlays are applied inside loadSessionTranscripts so this just packages
 	// them for storage. Allocate a v5 transcript ID for the delta upfront so
 	// every short-circuit can stamp it onto `summary.transcripts` consistently.
-	const amendStoredTranscript = buildStoredTranscript(sessionTranscripts);
+	const amendStoredTranscript = await buildStoredTranscript(sessionTranscripts);
 	const amendDeltaTranscriptId = amendStoredTranscript.sessions.length > 0 ? generateTranscriptId() : undefined;
 	const transcriptArtifact =
 		amendDeltaTranscriptId !== undefined ? { id: amendDeltaTranscriptId, data: amendStoredTranscript } : undefined;
@@ -4603,12 +4604,21 @@ function appendUsageOnlyCarriers(
  * integrations that happened to share an `sessionId`, silently rewriting
  * the later session's metadata onto the earlier one on serialize.
  */
-function buildStoredTranscript(sessionTranscripts: ReadonlyArray<SessionTranscript>): StoredTranscript {
+async function buildStoredTranscript(sessionTranscripts: ReadonlyArray<SessionTranscript>): Promise<StoredTranscript> {
+	// Titles are resolved HERE rather than attached upstream like `usage` and
+	// `toolUse`, even though that is the established pattern for this array: there
+	// are two call sites (commit and amend) plus the backfill's own writer, and an
+	// attach step is something a fourth writer can forget while still producing a
+	// well-formed archive. Serializing is the one thing no writer can skip. The
+	// cost is that this stops being a pure function — see `resolveArchivedTitle`
+	// for why commit time is the only moment the answer is available at all.
+	const titles = await Promise.all(sessionTranscripts.map((st) => resolveArchivedTitle(st)));
 	return {
-		sessions: sessionTranscripts.map((st) => ({
+		sessions: sessionTranscripts.map((st, i) => ({
 			sessionId: st.sessionId,
 			source: st.source,
 			transcriptPath: st.transcriptPath,
+			...(titles[i] ? { title: titles[i] } : {}),
 			entries: [...st.entries],
 			// Per-session usage is persisted only when non-zero: a stored `usage` of
 			// all zeros is indistinguishable from "this source reports no usage", and

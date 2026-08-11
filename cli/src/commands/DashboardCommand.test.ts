@@ -3,13 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { BackfillProgress } from "../dashboard/Backfill.js";
 import type { DashboardServerState } from "../dashboard/DashboardServer.js";
 import { writeDashboardState } from "../dashboard/DashboardServer.js";
+import type { DbBackfillProgress } from "../dashboard/DbBackfill.js";
 import type { RegisteredRepo } from "../dashboard/RepoRegistry.js";
 
-vi.mock("../dashboard/Backfill.js", () => ({
-	backfillRepos: vi.fn(async () => [{ mode: "bootstrapped", eventsApplied: 3 }]),
+vi.mock("../dashboard/DbBackfill.js", () => ({
+	dbBackfillRepos: vi.fn(async () => [{ mode: "bootstrapped", eventsApplied: 3 }]),
 }));
 // executeDashboard takes the daily backup snapshot (moved here off the
 // read-only server); unmocked it would open the real machine database and
@@ -41,9 +41,9 @@ vi.mock("../dashboard/DashboardDb.js", async (importOriginal) => {
 });
 
 import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
-import { backfillRepos } from "../dashboard/Backfill.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
+import { dbBackfillRepos } from "../dashboard/DbBackfill.js";
 import { listActiveRepos, registerRepo } from "../dashboard/RepoRegistry.js";
 import {
 	acquireSpawnLock,
@@ -102,7 +102,7 @@ beforeEach(() => {
 		worktreeRoot: "/w",
 		enabledAt: "t",
 	});
-	vi.mocked(backfillRepos).mockResolvedValue([{ mode: "bootstrapped", eventsApplied: 3, repoName: "jolli" }]);
+	vi.mocked(dbBackfillRepos).mockResolvedValue([{ mode: "bootstrapped", eventsApplied: 3, repoName: "jolli" }]);
 	vi.mocked(listActiveRepos).mockResolvedValue([]);
 	vi.spyOn(console, "log").mockImplementation(() => {});
 	vi.spyOn(console, "error").mockImplementation(() => {});
@@ -265,7 +265,7 @@ describe("importDashboardHistory", () => {
 		const d = deps();
 		await importDashboardHistory("/w", d);
 		expect(registerRepo).toHaveBeenCalledWith(expect.objectContaining({ cwd: "/w" }));
-		expect(backfillRepos).toHaveBeenCalledTimes(1);
+		expect(dbBackfillRepos).toHaveBeenCalledTimes(1);
 		// The whole point of the split: enable must not bind a port or open a browser.
 		expect(d.spawned).toEqual([]);
 		expect(d.opened).toEqual([]);
@@ -275,18 +275,105 @@ describe("importDashboardHistory", () => {
 		vi.mocked(canUseDashboardDb).mockReturnValueOnce(false);
 		await importDashboardHistory("/w", deps());
 		expect(registerRepo).not.toHaveBeenCalled();
-		expect(backfillRepos).not.toHaveBeenCalled();
+		expect(dbBackfillRepos).not.toHaveBeenCalled();
 	});
 
 	it("imports anyway when the cwd is not a repo", async () => {
 		vi.mocked(registerRepo).mockRejectedValueOnce(new Error("not a git repo"));
 		await importDashboardHistory("/w", deps());
-		expect(backfillRepos).toHaveBeenCalledTimes(1);
+		expect(dbBackfillRepos).toHaveBeenCalledTimes(1);
 	});
 
 	it("never throws when the import fails", async () => {
-		vi.mocked(backfillRepos).mockRejectedValueOnce(new Error("db locked"));
+		vi.mocked(dbBackfillRepos).mockRejectedValueOnce(new Error("db locked"));
 		await expect(importDashboardHistory("/w", deps())).resolves.toBeUndefined();
+	});
+
+	it("says nothing when every registered repo was skipped as dead", async () => {
+		// A repo whose every recorded worktree is gone is dropped before the sweep
+		// and returns no result, so there is nothing this report may claim about it.
+		// Counting the registry instead printed "✓ All 0 memories already migrated."
+		vi.mocked(listActiveRepos).mockResolvedValue([
+			{ repoIdentity: "r", repoName: "jolli", worktreeRoot: "/gone", enabledAt: "t" },
+		]);
+		vi.mocked(dbBackfillRepos).mockResolvedValue([]);
+		await importDashboardHistory("/w", deps());
+		expect(vi.mocked(console.log).mock.calls.flat().join("\n")).not.toMatch(/migrated/i);
+	});
+
+	it("counts the repos that were swept, not the ones that were registered", async () => {
+		vi.mocked(listActiveRepos).mockResolvedValue([
+			{ repoIdentity: "r1", repoName: "a", worktreeRoot: "/a", enabledAt: "t" },
+			{ repoIdentity: "r2", repoName: "b", worktreeRoot: "/b", enabledAt: "t" },
+			{ repoIdentity: "r3", repoName: "gone", worktreeRoot: "/gone", enabledAt: "t" },
+		]);
+		vi.mocked(dbBackfillRepos).mockResolvedValue([
+			{ mode: "updated", eventsApplied: 1, repoName: "a", sotImport: { nodes: 2, updated: 2 } },
+			{ mode: "updated", eventsApplied: 1, repoName: "b", sotImport: { nodes: 1, updated: 1 } },
+		] as unknown as Awaited<ReturnType<typeof dbBackfillRepos>>);
+		await importDashboardHistory("/w", deps());
+		expect(vi.mocked(console.log).mock.calls.flat().join("\n")).toContain("across 2 repo(s)");
+	});
+
+	it("names the repos with no checkout on disk, once, without calling it a failure", async () => {
+		// The only place this reaches the user: the backfill's own log line is at
+		// `debug`, which CLI mode keeps off the terminal, so an unmounted share
+		// silently stopped importing. It is NOT a migration failure — that wording
+		// belongs to `skipped`, and this repo may be back on the next launch.
+		vi.mocked(listActiveRepos).mockResolvedValue([
+			{ repoIdentity: "r1", repoName: "a", worktreeRoot: "/a", enabledAt: "t" },
+			{ repoIdentity: "r2", repoName: "on-a-nas", worktreeRoot: "/mnt/nas/x", enabledAt: "t" },
+		]);
+		vi.mocked(dbBackfillRepos).mockResolvedValue([
+			{ mode: "updated", eventsApplied: 1, repoName: "a", sotImport: { nodes: 2, updated: 0 } },
+			{ mode: "unavailable", eventsApplied: 0, repoName: "on-a-nas" },
+		] as unknown as Awaited<ReturnType<typeof dbBackfillRepos>>);
+		await importDashboardHistory("/w", deps());
+		const out = vi.mocked(console.log).mock.calls.flat().join("\n");
+		expect(out).toContain("Skipped 1 repo(s) with no checkout on disk (on-a-nas)");
+		expect(out).not.toMatch(/migration failed/i);
+		// Counted out of the migration report too — it was never swept, so it is not
+		// one of the repos the "already migrated" line is speaking for.
+		expect(out).not.toContain("across");
+	});
+
+	it("samples distinct names instead of printing the whole dead-entry list", async () => {
+		// Measured on a real registry: 132 unavailable entries, most named `repo`
+		// (test fixtures from before the isolatedHome fix). Printed in full they
+		// buried the result line under them, and "repo, repo, repo" identifies
+		// nothing anyway. Nothing prunes that file, so the count only grows.
+		vi.mocked(listActiveRepos).mockResolvedValue([
+			{ repoIdentity: "r1", repoName: "a", worktreeRoot: "/a", enabledAt: "t" },
+		]);
+		const dead = ["repo", "repo", "repo", "frepo", "bare-fenced", "trepo"].map((repoName, i) => ({
+			mode: "unavailable",
+			eventsApplied: 0,
+			repoName,
+			id: i,
+		}));
+		vi.mocked(dbBackfillRepos).mockResolvedValue([
+			{ mode: "updated", eventsApplied: 1, repoName: "a", sotImport: { nodes: 1, updated: 0 } },
+			...dead,
+		] as unknown as Awaited<ReturnType<typeof dbBackfillRepos>>);
+		await importDashboardHistory("/w", deps());
+		const out = vi.mocked(console.log).mock.calls.flat().join("\n");
+		// The COUNT is every entry; the sample is distinct names, capped at three.
+		expect(out).toContain("Skipped 6 repo(s) with no checkout on disk (repo, frepo, bare-fenced, +1 more)");
+	});
+
+	it("stays silent about migration when every registered repo is unavailable", async () => {
+		// `results` is no longer empty in this case, so the quiet rule has to read
+		// past the unavailable rows or it prints "✓ All 0 memories already migrated."
+		vi.mocked(listActiveRepos).mockResolvedValue([
+			{ repoIdentity: "r1", repoName: "gone", worktreeRoot: "/gone", enabledAt: "t" },
+		]);
+		vi.mocked(dbBackfillRepos).mockResolvedValue([
+			{ mode: "unavailable", eventsApplied: 0, repoName: "gone" },
+		] as unknown as Awaited<ReturnType<typeof dbBackfillRepos>>);
+		await importDashboardHistory("/w", deps());
+		const out = vi.mocked(console.log).mock.calls.flat().join("\n");
+		expect(out).toContain("Skipped 1 repo(s)");
+		expect(out).not.toMatch(/migrated/i);
 	});
 });
 
@@ -308,7 +395,7 @@ describe("executeDashboard", () => {
 		expect(d.opened).toHaveLength(1);
 		// No `?t=` — the URL is hand-openable, which is why the token was dropped.
 		expect(d.opened[0]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/dashboard\/standup$/);
-		expect(backfillRepos).toHaveBeenCalledTimes(1);
+		expect(dbBackfillRepos).toHaveBeenCalledTimes(1);
 	});
 
 	it("attempts a THROTTLED auto-cutover after the import", async () => {
@@ -318,7 +405,7 @@ describe("executeDashboard", () => {
 		const d = deps();
 		await executeDashboard("stats", { cwd: "/w" }, d);
 		expect(maybeAutoCutover).toHaveBeenCalledWith("/w", expect.objectContaining({ throttle: true }));
-		expect(vi.mocked(backfillRepos).mock.invocationCallOrder[0]).toBeLessThan(
+		expect(vi.mocked(dbBackfillRepos).mock.invocationCallOrder[0]).toBeLessThan(
 			vi.mocked(maybeAutoCutover).mock.invocationCallOrder[0] as number,
 		);
 	});
@@ -363,7 +450,7 @@ describe("executeDashboard", () => {
 	});
 
 	it("a backfill failure warns but does not fail the command", async () => {
-		vi.mocked(backfillRepos).mockRejectedValueOnce(new Error("db locked"));
+		vi.mocked(dbBackfillRepos).mockRejectedValueOnce(new Error("db locked"));
 		await expect(executeDashboard("stats", {}, deps())).resolves.toBe(true);
 	});
 
@@ -456,7 +543,7 @@ describe("registerDashboardCommand", () => {
 });
 
 describe("createProgressPrinter", () => {
-	const event = (over: Partial<BackfillProgress>): BackfillProgress => ({
+	const event = (over: Partial<DbBackfillProgress>): DbBackfillProgress => ({
 		repoName: "jolliai",
 		kind: "memories",
 		done: 1,
@@ -467,7 +554,7 @@ describe("createProgressPrinter", () => {
 	});
 
 	/** Drives `done` from 1..total, returning every line the printer emitted. */
-	function drive(total: number, over: Partial<BackfillProgress> = {}, from = 1): string[] {
+	function drive(total: number, over: Partial<DbBackfillProgress> = {}, from = 1): string[] {
 		const lines: string[] = [];
 		const printer = createProgressPrinter({ log: (line) => lines.push(line) });
 		for (let done = from; done <= total; done++) printer.onProgress(event({ done, total, ...over }));

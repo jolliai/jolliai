@@ -28,10 +28,10 @@ import type { Command } from "commander";
 import { getProjectRootDir } from "../core/GitOps.js";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
-import { type BackfillProgress, backfillRepos } from "../dashboard/Backfill.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { canUseDashboardDb, DASHBOARD_SQLITE_MIN_VERSION, ensureDashboardDbExists } from "../dashboard/DashboardDb.js";
 import { clearDashboardState, type DashboardServerState, readDashboardState } from "../dashboard/DashboardServer.js";
+import { type DbBackfillProgress, dbBackfillRepos } from "../dashboard/DbBackfill.js";
 import { listActiveRepos, registerRepo } from "../dashboard/RepoRegistry.js";
 import { createLogger, errMsg } from "../Logger.js";
 import { spawnHidden } from "../util/Subprocess.js";
@@ -369,7 +369,7 @@ async function stopServer(deps: DashboardDeps): Promise<void> {
  *
  * Split out of {@link executeDashboard} because the import is the only part of
  * the launcher `jolli enable` and the guided front door actually need.
- * `backfillRepos` is the sole production caller of the SOT import, so memories
+ * `dbBackfillRepos` is the sole production caller of the SOT import, so memories
  * just written would otherwise sit outside the database until someone ran
  * `jolli dashboard` by hand — but wanting that import is no reason to bind a
  * port, spawn a detached server and take over the user's browser at enable
@@ -393,12 +393,12 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 		const repos = await listActiveRepos(deps.configDir);
 		// Zero registered repos stays completely silent, header included: there is
 		// no work, and announcing none is worse than saying nothing. The call still
-		// happens — `backfillRepos([])` is a no-op, and skipping it would make this
+		// happens — `dbBackfillRepos([])` is a no-op, and skipping it would make this
 		// function's contract depend on the registry, which callers rely on not
 		// doing.
 		const quiet = repos.length === 0;
 		// Held, not printed: on a steady-state pass the whole block is noise. The
-		// import itself is cursor-gated (see Backfill's `sot-import`), so a converged
+		// import itself is cursor-gated (see DbBackfill's `sot-import`), so a converged
 		// run does no memory work at all — but the phase markers still fire for the
 		// tiers that DO run every time (sessions), and a header announcing a
 		// migration that will not happen is exactly what made this look like it
@@ -407,7 +407,7 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 		// honest report and prints either way.
 		const out = createDeferredWriter();
 		const printer = createProgressPrinter({ log: out.write });
-		const results = await backfillRepos(repos, {
+		const results = await dbBackfillRepos(repos, {
 			...(deps.dbPath ? { dbPath: deps.dbPath } : {}),
 			...(deps.now ? { now: deps.now } : {}),
 			// THE reveal rule: only the two tiers that are cursor-gated may put this
@@ -433,12 +433,50 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 				printer.onProgress(progress);
 			},
 		});
-		if (quiet) return;
+		// A repo whose every registered worktree is gone is not counted with the
+		// ones that were imported: it was never swept, so `results` — never
+		// `repos` — is what this report may count, minus the entries that only say
+		// "not here". Unfiltered it printed "✓ All 0 memories already migrated."
+		const worked = results.filter((r) => r.mode !== "unavailable");
+		const missing = results.filter((r) => r.mode === "unavailable");
+		// ONE line for the whole run, naming the repos. The three warnings per repo
+		// per pass this replaced were the reason it went silent, but silence is not
+		// the fix: "no checkout on disk" is also what a network share or an
+		// external drive looks like while it is unmounted, and in that case the
+		// user is still expecting these memories to arrive. The wording says what
+		// was observed and what follows from it — not "failed", which is what a
+		// `skipped` row below means.
+		//
+		// Printed directly rather than through the deferred writer, and WITHOUT
+		// revealing a header: nothing was migrated for these repos, so putting
+		// "Migrating your memories…" on screen because one of them is unmounted
+		// would re-introduce, in the block that exists to avoid it, exactly the
+		// claim the reveal rule is there to prevent.
+		if (missing.length > 0) {
+			// A SAMPLE of distinct names, never the whole list. Measured on a real
+			// registry: 132 dead entries, most of them named `repo` — test fixtures
+			// that predate the `isolatedHome` fix in this same change — printed as
+			// one 132-item line that buried the ✓ result under it. Nothing prunes
+			// this file, so the count only grows. Distinct because a list reading
+			// "repo, repo, repo" identifies nothing; the count carries the scale and
+			// the sample carries "which kind of thing is this".
+			const distinct = [...new Set(missing.map((r) => r.repoName))];
+			const sample = distinct.slice(0, 3).join(", ");
+			const rest = distinct.length > 3 ? `, +${distinct.length - 3} more` : "";
+			console.log(
+				`\n  ⚠ Skipped ${missing.length} repo(s) with no checkout on disk (${sample}${rest})` +
+					" — deleted, or on a drive that is not mounted. Still registered; they resume on their own.",
+			);
+		}
+		// With every entry dead that leaves nothing more to say, and the
+		// zero-registered-repos rule applies for the same reason: announcing work
+		// on repos that were not touched is worse than silence.
+		if (quiet || worked.length === 0) return;
 		// A failure has to be shown in context — which repo, under which header.
-		if (results.some((r) => r.mode === "skipped")) out.reveal(MIGRATION_HEADER);
+		if (worked.some((r) => r.mode === "skipped")) out.reveal(MIGRATION_HEADER);
 		// A repo that threw used to reach `log.error` and nothing else, so on
 		// screen it was indistinguishable from a repo with nothing to do.
-		for (const failed of results.filter((r) => r.mode === "skipped")) {
+		for (const failed of worked.filter((r) => r.mode === "skipped")) {
 			console.log(`  ⚠ ${failed.repoName} — migration failed: ${failed.error ?? "unknown error"}`);
 		}
 		// Report what actually happened, not what was re-projected. A steady-state
@@ -449,10 +487,10 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 		//
 		// The counts are MEMORIES, not events: events are the activity tier, and
 		// this whole line is about the thing the user was told was migrating.
-		const migrated = results.reduce((sum, r) => sum + (r.sotImport?.nodes ?? 0), 0);
-		const bootstrapped = results.filter((r) => r.mode === "bootstrapped").length;
-		const newMemories = results.reduce((sum, r) => sum + (r.sotImport?.updated ?? 0), 0);
-		const across = repos.length > 1 ? ` across ${bootstrapped || repos.length} repo(s)` : "";
+		const migrated = worked.reduce((sum, r) => sum + (r.sotImport?.nodes ?? 0), 0);
+		const bootstrapped = worked.filter((r) => r.mode === "bootstrapped").length;
+		const newMemories = worked.reduce((sum, r) => sum + (r.sotImport?.updated ?? 0), 0);
+		const across = worked.length > 1 ? ` across ${bootstrapped || worked.length} repo(s)` : "";
 		if (bootstrapped > 0 || newMemories > 0) {
 			// Something landed, so the progress that produced it belongs on screen —
 			// including the runs too fast to have tripped the elapsed-time reveal.
@@ -529,7 +567,7 @@ export function createDeferredWriter(): {
  * rewritten line is invisible in a piped log.
  */
 export function createProgressPrinter(deps: { readonly log?: (line: string) => void } = {}): {
-	onProgress: (progress: BackfillProgress) => void;
+	onProgress: (progress: DbBackfillProgress) => void;
 } {
 	const write = deps.log ?? ((line: string) => console.log(line));
 	let lastQuarter = 0;

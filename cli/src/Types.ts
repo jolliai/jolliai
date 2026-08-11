@@ -258,6 +258,22 @@ export interface StoredSession {
 	readonly source?: TranscriptSource;
 	/** Original JSONL file path, preserved for re-summarize (future) */
 	readonly transcriptPath?: string;
+	/**
+	 * The session's display title as of this commit, resolved by
+	 * `resolveArchivedTitle` when the memory was written.
+	 *
+	 * The answer, deliberately, rather than leaving every reader to re-derive it
+	 * from {@link transcriptPath}. That path is machine-local and the file behind
+	 * it is pruned on the agent's own schedule, so re-derivation fails exactly
+	 * where it matters most: an old memory, and every memory on a machine that
+	 * did not write it. This archive is the only artifact that travels.
+	 *
+	 * Forward-only, like {@link usage} and {@link toolUse}: absent on memories
+	 * written before this field existed, and absent when no title could be
+	 * resolved at all. Readers must treat absence as "not recorded" and fall back
+	 * to whatever they used before, never as "this session has no title".
+	 */
+	readonly title?: string;
 	readonly entries: ReadonlyArray<TranscriptEntry>;
 	/**
 	 * This session's own share of the commit's conversation tokens — the
@@ -1490,6 +1506,13 @@ export interface CommitInfo {
 	readonly message: string;
 	readonly author: string;
 	readonly date: string;
+	/**
+	 * Author email (`%ae`), absent when git reported none. Optional because
+	 * `getHeadCommitInfo` does not ask for it — only the dashboard's live
+	 * producer needs it, to match the author filter's email clause against
+	 * commits made since the last backfill sweep.
+	 */
+	readonly authorEmail?: string;
 }
 
 /** Result of a git command execution */

@@ -2735,7 +2735,7 @@ describe("QueueWorker", () => {
 			// Regression: the previous Map<sessionId,…> lookup would collapse these
 			// two into a single entry because UUID collisions across integrations
 			// can't be ruled out and the transcriptPath on collision differs per source.
-			const stored = __test__.buildStoredTranscript([
+			const stored = await __test__.buildStoredTranscript([
 				{
 					sessionId: "shared-uuid",
 					transcriptPath: "/claude/sessions/shared-uuid.jsonl",
@@ -2759,8 +2759,37 @@ describe("QueueWorker", () => {
 			expect(opencodeSession.transcriptPath).toBe("/tmp/opencode.db#shared-uuid");
 		});
 
+		it("archives the session's title, so no reader has to re-derive it from a path", async () => {
+			// The archive is the only artifact that travels: the live .jsonl is pruned on
+			// the agent's own schedule and the `sessions` row with `sessions.json`, so a
+			// reader on another machine has neither. It used to carry only
+			// `transcriptPath` — an absolute path under THIS machine's home.
+			const stored = await __test__.buildStoredTranscript([
+				{
+					sessionId: "s1",
+					transcriptPath: "/gone/s1.jsonl",
+					source: "claude",
+					entries: [{ role: "human", content: "restart the web backend", timestamp: "2026-04-22T10:00:00Z" }],
+				},
+			]);
+
+			// The live file is absent, so the ladder lands on its step 3 — and takes it
+			// from the ARCHIVED entries, which is the slice this memory owns.
+			expect(stored.sessions[0].title).toBe("restart the web backend");
+		});
+
+		it("omits title rather than storing a sentinel when no title can be resolved", async () => {
+			// Absence is what lets a reader fall back; a stored "(untitled session)"
+			// would be indistinguishable from a real title and pin the wrong answer.
+			const stored = await __test__.buildStoredTranscript([
+				{ sessionId: "s1", transcriptPath: "/gone/s1.jsonl", source: "claude", entries: [] },
+			]);
+
+			expect(stored.sessions[0]).not.toHaveProperty("title");
+		});
+
 		it("preserves sessionTranscripts that arrive without a source (legacy claude rows)", async () => {
-			const stored = __test__.buildStoredTranscript([
+			const stored = await __test__.buildStoredTranscript([
 				{
 					sessionId: "legacy-session",
 					transcriptPath: "/claude/legacy.jsonl",
@@ -2778,7 +2807,7 @@ describe("QueueWorker", () => {
 			// The worker computes this split in memory while reading slices; before it was
 			// persisted, only the merged total reached disk and detaching one conversation
 			// from a committed memory had no subtrahend to correct the token bar with.
-			const stored = __test__.buildStoredTranscript([
+			const stored = await __test__.buildStoredTranscript([
 				{
 					sessionId: "s1",
 					transcriptPath: "/claude/s1.jsonl",
@@ -2801,7 +2830,7 @@ describe("QueueWorker", () => {
 			// A stored zero would read as "this session used nothing", which detach would
 			// treat as a valid no-op subtraction; absent means "cannot attribute" and
 			// leaves the memory's totals alone. Sources with no usage must land on absent.
-			const stored = __test__.buildStoredTranscript([
+			const stored = await __test__.buildStoredTranscript([
 				{
 					sessionId: "s1",
 					transcriptPath: "/gemini/s1.json",
@@ -2816,8 +2845,8 @@ describe("QueueWorker", () => {
 			expect(stored.sessions[0]).not.toHaveProperty("usageByModel");
 		});
 
-		it("persists tool calls so the dashboard can read them after the transcript is gone", () => {
-			const stored = __test__.buildStoredTranscript([
+		it("persists tool calls so the dashboard can read them after the transcript is gone", async () => {
+			const stored = await __test__.buildStoredTranscript([
 				{
 					sessionId: "s1",
 					transcriptPath: "/claude/s1.jsonl",
@@ -2838,19 +2867,19 @@ describe("QueueWorker", () => {
 			]);
 		});
 
-		it("keeps an empty toolUse, which claims 'called no tools' — unlike absent", () => {
+		it("keeps an empty toolUse, which claims 'called no tools' — unlike absent", async () => {
 			// The two are different facts and the dashboard branches on which it got:
 			// `[]` replaces stored rows, absent leaves them alone. Length-gating this
 			// the way `usageByModel` is gated would collapse them.
-			const stored = __test__.buildStoredTranscript([
+			const stored = await __test__.buildStoredTranscript([
 				{ sessionId: "s1", transcriptPath: "/claude/s1.jsonl", source: "claude", entries: [], toolUse: [] },
 			]);
 
 			expect(stored.sessions[0].toolUse).toEqual([]);
 		});
 
-		it("omits toolUse for a source whose parser cannot report tool calls", () => {
-			const stored = __test__.buildStoredTranscript([
+		it("omits toolUse for a source whose parser cannot report tool calls", async () => {
+			const stored = await __test__.buildStoredTranscript([
 				{ sessionId: "s1", transcriptPath: "/gemini/s1.json", source: "gemini", entries: [] },
 			]);
 
@@ -5306,7 +5335,7 @@ describe("QueueWorker", () => {
 				// …and the stored transcript now carries the matching per-session record,
 				// so `subtractDetachedUsage` has an exact subtrahend and the leaf/amend
 				// writers allocate a transcript id for it.
-				const stored = __test__.buildStoredTranscript(result.sessionTranscripts);
+				const stored = await __test__.buildStoredTranscript(result.sessionTranscripts);
 				expect(stored.sessions).toHaveLength(1);
 				expect(stored.sessions[0].sessionId).toBe("claude-usage-only");
 				expect(stored.sessions[0].entries).toHaveLength(0);

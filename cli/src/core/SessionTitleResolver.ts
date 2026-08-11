@@ -109,6 +109,61 @@ export function firstUserMessageTitleFromEntries(entries: ReadonlyArray<Transcri
 	return UNTITLED_SESSION;
 }
 
+/**
+ * The title to ARCHIVE with a session, resolved at the moment the memory is
+ * written — the answer, not a pointer to where the answer could be recomputed.
+ *
+ * Every reader used to re-derive this, and each derived it differently: the
+ * editor ran the full ladder against the live file, the dashboard joined its
+ * `sessions` table and then re-read the file again, and the collector wrote a
+ * third answer into that table. Those agree only as long as someone keeps them
+ * agreeing. Archiving the string makes them agree by construction.
+ *
+ * Commit time is the only moment where this is both cheap and correct: the live
+ * transcript was just read (its entries are the argument below), so step 2 has
+ * the file it needs and step 3 needs no second pass. Every later moment is worse
+ * — the file is pruned on the agent's own schedule, the `sessions` row is pruned
+ * with `sessions.json`, and on a teammate's machine neither ever existed. The
+ * archive is the only artifact that travels, and it carried a machine-local
+ * absolute path where it should have carried this.
+ *
+ * `mergedEntries` is the ARCHIVED slice on purpose: step 3 then describes the
+ * turns this memory actually owns, rather than the live file's first turn, which
+ * for an amend chain belongs to a different commit.
+ *
+ * Structural parameter rather than `SessionTranscript` so this module does not
+ * import the transcript reader (both archive writers pass one).
+ *
+ * Returns undefined for {@link UNTITLED_SESSION} so the field stays absent
+ * rather than storing a sentinel: "no title" is a fact each surface renders its
+ * own way, and an absent field is what lets an older archive fall back.
+ */
+export async function resolveArchivedTitle(session: {
+	readonly sessionId: string;
+	readonly source?: TranscriptSource;
+	readonly transcriptPath?: string;
+	readonly entries: ReadonlyArray<TranscriptEntry>;
+}): Promise<string | undefined> {
+	try {
+		const title = await resolveSessionTitle(
+			{
+				sessionId: session.sessionId,
+				transcriptPath: session.transcriptPath ?? "",
+				updatedAt: "",
+				...(session.source ? { source: session.source } : {}),
+			},
+			session.entries,
+		);
+		return title && title !== UNTITLED_SESSION ? title : undefined;
+	} catch (err) {
+		// A title is never worth failing an archive write for — the memory itself
+		// is what must land. Readers fall back exactly as they do for an archive
+		// written before this field existed.
+		log.debug("resolveArchivedTitle failed for %s: %s", session.sessionId, errMsg(err));
+		return undefined;
+	}
+}
+
 // --- per-source line parsers ---
 
 function parseClaudeUserLine(line: string): string | undefined {

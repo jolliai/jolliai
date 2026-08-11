@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { readClaudeAiTitle } from "./ClaudeAiTitleReader.js";
+import { readClaudeAiTitle, TAIL_SCAN_BYTES } from "./ClaudeAiTitleReader.js";
 
 describe("readClaudeAiTitle", () => {
 	let dir: string;
@@ -126,6 +126,33 @@ describe("readClaudeAiTitle", () => {
 		);
 		const result = await readClaudeAiTitle(file);
 		expect(result).toBe("OK");
+	});
+
+	it("scans only the tail of a transcript larger than the budget, dropping the partial first line", async () => {
+		// The read is on the dashboard's request path against a file that is being
+		// appended to, so a growing multi-MB transcript is re-scanned on every 30 s
+		// poll. The tail is where the answer is: only the LAST ai-title is wanted.
+		const file = join(dir, "huge.jsonl");
+		const filler = `${JSON.stringify({ type: "user", content: "x".repeat(4096) })}\n`;
+		const early = `${JSON.stringify({ type: "ai-title", sessionId: "s", aiTitle: "before the cut" })}\n`;
+		const late = `${JSON.stringify({ type: "ai-title", sessionId: "s", aiTitle: "after the cut" })}\n`;
+		writeFileSync(file, early + filler.repeat(Math.ceil(TAIL_SCAN_BYTES / filler.length) + 8) + late);
+
+		expect(await readClaudeAiTitle(file)).toBe("after the cut");
+	});
+
+	it("gives up a title that sits entirely before the cut, rather than reporting a wrong one", async () => {
+		// The documented trade-off, pinned so it is a decision and not a surprise: a
+		// transcript that grew past the budget with every `ai-title` behind the cut
+		// reports none, and the caller falls back to its own title source. Claude
+		// re-emits the title as the conversation continues, so this is the shape a
+		// real transcript does not have.
+		const file = join(dir, "title-before-cut.jsonl");
+		const filler = `${JSON.stringify({ type: "user", content: "x".repeat(4096) })}\n`;
+		const early = `${JSON.stringify({ type: "ai-title", sessionId: "s", aiTitle: "before the cut" })}\n`;
+		writeFileSync(file, early + filler.repeat(Math.ceil(TAIL_SCAN_BYTES / filler.length) + 8));
+
+		expect(await readClaudeAiTitle(file)).toBeUndefined();
 	});
 
 	it("returns undefined and does not throw when readlines is given a path it cannot open as a regular file", async () => {

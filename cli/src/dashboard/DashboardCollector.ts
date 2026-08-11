@@ -589,7 +589,7 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 		// `MAX_BRANCHES + 1` and filtering afterwards would spend a slot on a branch
 		// that is never scanned, and the orphan branch is written on every memory so
 		// it sorts FIRST by committerdate essentially always. Listing every local
-		// branch name is one cheap ref walk (`Backfill`'s fingerprint already does
+		// branch name is one cheap ref walk (`DbBackfill`'s fingerprint already does
 		// exactly that); it is the rev-list per branch that is expensive.
 		["for-each-ref", "refs/heads", "--sort=-committerdate", "--format=%(refname:short)"],
 		opts.cwd,
@@ -661,7 +661,7 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 	// relies on), while an empty array would mean "this commit touches nothing".
 	//
 	// `knownHashes` is the set of commits whose file rows ARE STORED, not the set
-	// of stored commits (see `commitsWithStoredFiles` in Backfill). A commit whose
+	// of stored commits (see `commitsWithStoredFiles` in DbBackfill). A commit whose
 	// numstat failed once therefore comes back on the NEXT sweep instead of never:
 	// keying the skip off row existence made a single transient git failure a
 	// permanent blank, since the only path that re-scanned everything was a

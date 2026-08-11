@@ -273,7 +273,7 @@ export async function runGuidedFrontDoor(): Promise<void> {
  * browser on it — one `executeDashboard` call, which is exactly what `jolli
  * dashboard` runs.
  *
- * Placed AFTER the back-fill step on purpose. `backfillRepos` (which the import
+ * Placed AFTER the back-fill step on purpose. `dbBackfillRepos` (which the import
  * half wraps) is the ONLY production caller of the source-of-truth import:
  * memories the back-fill just wrote would otherwise sit outside the dashboard
  * database until the user happened to run `jolli dashboard` by hand.

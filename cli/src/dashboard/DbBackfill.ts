@@ -1,10 +1,17 @@
 /**
- * Backfill — one-time bootstrap and post-restart gap recovery for the
+ * DbBackfill — one-time bootstrap and post-restart gap recovery for the
  * dashboard database.
  *
  * Both run in a command process (`jolli dashboard`, `jolli enable`) — never in
  * the read-only HTTP service — and both feed the same `StatsWriter`, so an
  * imported fact and a live-written fact are indistinguishable in the DB.
+ *
+ * The `db` prefix on every export is load-bearing, not decoration: `src/backfill/`
+ * is an unrelated feature with the same name — the `jolli backfill` command, which
+ * spends LLM budget generating summaries for historical commits. Nothing here
+ * calls a model. The two used to collide outright (both declared a
+ * `BackfillOptions`), and the ambiguity reached users: `jolli cutover` and
+ * `jolli dashboard` print progress from THIS module, which reads as the LLM one.
  *
  * ## Correctness model (why cursors are not the mechanism)
  *
@@ -40,7 +47,7 @@ import {
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import { inTransaction, withDashboardDb } from "./DashboardDb.js";
 import type { CommitCreatedEvent, ProducerKind, StatsEvent, StatsEventEnvelope } from "./DashboardModel.js";
-import { existingWorktrees, type RegisteredRepo, readRepoCutoverFence } from "./RepoRegistry.js";
+import { existingWorktrees, hasLiveWorktree, type RegisteredRepo, readRepoCutoverFence } from "./RepoRegistry.js";
 import {
 	countMemoriesAbsentFromListing,
 	EMPTY_IMPORT_RESULT,
@@ -51,7 +58,7 @@ import {
 } from "./SotImport.js";
 import { applyToDb, pruneProjectedEvents } from "./StatsWriter.js"; // recordRepoGraph parked — see SotSchema
 
-const log = createLogger("Backfill");
+const log = createLogger("DbBackfill");
 
 /**
  * Events per write transaction. Small on purpose: every batch takes SQLite's
@@ -132,7 +139,7 @@ async function checkoutFingerprint(path: string): Promise<string | null> {
 	return `${head}+${createHash("sha256").update(tips).digest("hex")}`;
 }
 
-export interface BackfillOptions {
+export interface DbBackfillOptions {
 	readonly repo: RegisteredRepo;
 	/** Test seam: path override for the dashboard DB. */
 	readonly dbPath?: string;
@@ -152,7 +159,7 @@ export interface BackfillOptions {
 }
 
 /**
- * What a backfill is working through right now, for one repo.
+ * What a DB backfill is working through right now, for one repo.
  *
  * `done: 0` is a **phase-start marker**, emitted BEFORE the work begins. That
  * is the only kind of event the slow phases can offer: measured on a two-repo
@@ -185,15 +192,24 @@ export interface RepoProgress {
 }
 
 /** {@link RepoProgress} plus the repo's place in a multi-repo run. */
-export interface BackfillProgress extends RepoProgress {
+export interface DbBackfillProgress extends RepoProgress {
 	/** 1-based. */
 	readonly repoIndex: number;
 	readonly repoTotal: number;
 }
 
-export interface BackfillResult {
-	/** 'bootstrapped' = full import ran; 'recovered' = incremental pass; 'skipped' = the repo errored out. */
-	readonly mode: "bootstrapped" | "recovered" | "skipped";
+export interface DbBackfillResult {
+	/**
+	 * 'bootstrapped' = full import ran; 'recovered' = incremental pass;
+	 * 'skipped' = the repo errored out; 'unavailable' = no registered checkout
+	 * exists on disk, so nothing was attempted (see {@link dbBackfillRepos}).
+	 *
+	 * The last two are deliberately different words for different facts: a
+	 * 'skipped' repo is a failure to report against the repo, an 'unavailable'
+	 * one is a repo that is not here right now. A caller that prints them the
+	 * same way turns an unmounted network share into "migration failed".
+	 */
+	readonly mode: "bootstrapped" | "recovered" | "skipped" | "unavailable";
 	readonly eventsApplied: number;
 	/** Row counts from the v7 SOT import; absent when the repo was skipped. */
 	readonly sotImport?: SotImportResult;
@@ -439,12 +455,12 @@ function repoEnabledEvent(repo: RegisteredRepo): StatsEvent {
  * exist has no memories, no KPIs and no page (every gated route redirects), and
  * a disabled repo whose `disabled_at` is still NULL keeps counting in every KPI
  * and picker. `jolli enable` gets the projection for free from the full
- * backfill it runs; a long-lived server mutating the registry over HTTP does
+ * DB backfill it runs; a long-lived server mutating the registry over HTTP does
  * not, and that is exactly the caller this exists for.
  *
  * Cheap by construction — two rows, no git, no import — so it is safe to await
  * inside a request handler before answering. The heavier memory import stays
- * `backfillRepo`'s job.
+ * `dbBackfillRepo`'s job.
  */
 export function projectRepoRegistryState(
 	db: DashboardDbHandle,
@@ -463,7 +479,7 @@ export function projectRepoRegistryState(
  * — a crash mid-import leaves `bootstrap_state = 'in-progress'`, and the next
  * run simply collects and applies again (UPSERTs make the redo harmless).
  */
-export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResult> {
+export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfillResult> {
 	const now = opts.now ?? Date.now;
 	const producerKind = opts.producerKind ?? "bootstrap";
 	const repo = opts.repo;
@@ -901,43 +917,76 @@ export async function backfillRepo(opts: BackfillOptions): Promise<BackfillResul
 
 			const mode = isBootstrap ? "bootstrapped" : "recovered";
 			log.info("%s %s: %d events applied", mode, repo.repoName, applied);
-			return { mode, eventsApplied: applied, sotImport, repoName: repo.repoName } as BackfillResult;
+			return { mode, eventsApplied: applied, sotImport, repoName: repo.repoName } as DbBackfillResult;
 		},
 		{ dbPath: opts.dbPath },
 	);
 }
 
 /**
- * Backfills every repo in the list, independently — one broken repo (deleted
+ * Backfills every repo into the dashboard database, independently — one broken repo (deleted
  * worktree, git failure) must not stop the others from importing.
  */
-export async function backfillRepos(
+export async function dbBackfillRepos(
 	repos: ReadonlyArray<RegisteredRepo>,
-	opts: Omit<BackfillOptions, "repo" | "onProgress"> & {
+	opts: Omit<DbBackfillOptions, "repo" | "onProgress"> & {
 		/** Same events as the per-repo callback, plus where this repo sits in the run. */
-		readonly onProgress?: (progress: BackfillProgress) => void;
+		readonly onProgress?: (progress: DbBackfillProgress) => void;
 	},
-): Promise<ReadonlyArray<BackfillResult>> {
+): Promise<ReadonlyArray<DbBackfillResult>> {
 	// Pulled out of the spread: the two callbacks have different shapes, and
-	// letting the wide one ride along on `...rest` would hand `backfillRepo` a
+	// letting the wide one ride along on `...rest` would hand `dbBackfillRepo` a
 	// function expecting fields it never supplies.
 	const { onProgress: forward, ...rest } = opts;
-	const results: BackfillResult[] = [];
-	for (const [i, repo] of repos.entries()) {
-		// The index is injected here rather than passed down, so `backfillRepo`
+	// A repo whose every recorded checkout is gone is dropped BEFORE the sweep,
+	// not swept and warned about. `existingWorktrees` deliberately falls back to
+	// the recorded path rather than returning nothing, so sweeping such an entry
+	// runs `git` against a directory that does not exist: three warnings per repo
+	// per pass (HEAD unreadable → collection failed → prune skipped), on every
+	// `jolli dashboard` launch, forever — nothing prunes the registry, and
+	// `deregisterRepo` cannot reach a deleted directory. It is also not a failure
+	// worth a `mode: "skipped"` result, which the caller prints as "migration
+	// failed": there is no repo left to migrate.
+	//
+	// Deliberately NOT deregistration: the same predicate answers "temporarily
+	// unmounted" (network share, external drive, a worktree being recreated), and
+	// forgetting a repo on that evidence would throw away its registration for a
+	// directory that comes back. Skipping costs one converged pass; the entry is
+	// picked up again the moment a path exists.
+	//
+	// It IS reported, as `mode: "unavailable"`, and that is the half the log line
+	// alone cannot do. `log.debug` (and `log.info`) are suppressed from the
+	// terminal in CLI mode by design, so a repo that quietly stopped being
+	// imported — the unmounted-share case, where the user still expects their
+	// memories to keep arriving — had no signal anywhere the user looks. A result
+	// row lets the caller say it once per run, in the terminal it owns, without
+	// resurrecting the three warnings per repo per pass this replaced.
+	const unavailable: DbBackfillResult[] = [];
+	const live = repos.filter((repo) => {
+		if (hasLiveWorktree(repo)) return true;
+		log.debug("skipping %s -- no registered worktree exists on disk (%s)", repo.repoName, repo.worktreeRoot);
+		unavailable.push({ mode: "unavailable", eventsApplied: 0, repoName: repo.repoName });
+		return false;
+	});
+	const results: DbBackfillResult[] = [];
+	for (const [i, repo] of live.entries()) {
+		// The index is injected here rather than passed down, so `dbBackfillRepo`
 		// stays ignorant of the list it happens to be in.
 		const perRepo = forward
-			? { onProgress: (p: RepoProgress) => forward({ ...p, repoIndex: i + 1, repoTotal: repos.length }) }
+			? { onProgress: (p: RepoProgress) => forward({ ...p, repoIndex: i + 1, repoTotal: live.length }) }
 			: {};
 		try {
-			results.push(await backfillRepo({ ...rest, ...perRepo, repo }));
+			results.push(await dbBackfillRepo({ ...rest, ...perRepo, repo }));
 		} catch (err) {
-			log.error("backfill failed for %s: %s", repo.repoName, errMsg(err));
+			log.error("db backfill failed for %s: %s", repo.repoName, errMsg(err));
 			// Carried on the result, not just logged: the caller is the only thing
 			// with a terminal, and a repo that failed to import must not look
 			// identical to one that had nothing to do.
 			results.push({ mode: "skipped", eventsApplied: 0, repoName: repo.repoName, error: errMsg(err) });
 		}
 	}
-	return results;
+	// Appended, not prepended: a caller reading the list in order should see the
+	// repos that were worked on first, and these carry no per-repo detail to
+	// interleave with them.
+	return [...results, ...unavailable];
 }

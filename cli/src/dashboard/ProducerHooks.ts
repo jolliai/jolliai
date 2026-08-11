@@ -299,6 +299,13 @@ export async function recordCommitsFromWorker(
 						committedAtMs,
 						message: info.message.split("\n")[0],
 						authorName: info.author,
+						// Both identity fields, not just the name: the standup board's
+						// "mine only" filter matches on EITHER, and a machine with
+						// `user.name` unset (git still commits under the OS ident) would
+						// otherwise have every commit made since the last backfill sweep
+						// silently dropped from the board — with the chip still claiming
+						// the rows are filtered to the user.
+						...(info.authorEmail ? { authorEmail: info.authorEmail } : {}),
 						...(onBranch ? { branch: onBranch, branches: [onBranch] } : {}),
 						// Absent (not empty) when the numstat pass failed, so a
 						// transient git error cannot delete rows an earlier pass

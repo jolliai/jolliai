@@ -446,11 +446,37 @@ export interface MemoryListItem {
 	readonly synced: boolean;
 }
 
-/** One conversation that fed a memory — {@link MemoryDetail.conversations}. */
+/**
+ * One conversation that fed a memory — {@link MemoryDetail.conversations}.
+ *
+ * Exactly the four fields the page renders, and no server-side ones. The whole
+ * model is `JSON.stringify`d into the served HTML, so a field here is a field in
+ * the payload; the rule is that nothing lands in this type which the client does
+ * not use. `transcriptPath` and a `nativeTitle` flag were briefly on it to drive
+ * a server-side `ai-title` read, defended by a strip on the way out — a
+ * convention the type system could not enforce, shipping an absolute path under
+ * the user's home for nothing. The title is now resolved once at archive time
+ * (`StoredSession.title`), so there is no private data to carry and nothing to
+ * strip.
+ */
 export interface MemoryConversationRow {
 	readonly title: string;
 	readonly source: string;
 	readonly messageCount: number;
+	/**
+	 * Rendered as the row's tooltip (`conversationsSection` in `memories.js`) —
+	 * which is the only reason it is allowed here, by the rule above. It earns
+	 * that: the other three fields do not distinguish two conversations from the
+	 * same source, and a title that fell back to the first user message can make
+	 * two rows near-identical, so a memory fed by three Claude sessions was
+	 * unreadable and could not be matched against `sessions.json` or a log line.
+	 *
+	 * Safe to serve for the reason `transcriptPath` was not: it is an opaque id
+	 * the agent chose, not a fact about this machine's filesystem. It is also the
+	 * editor's own row identity — `SummaryScriptBuilder` keys its conversation
+	 * rows on `(source, sessionId)` — so the two surfaces name a row the same way.
+	 */
+	readonly sessionId: string;
 }
 
 /**

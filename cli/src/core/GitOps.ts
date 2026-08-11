@@ -299,9 +299,13 @@ export async function readLocalGitIdentity(cwd?: string): Promise<{ email: strin
 /**
  * Gets information about a specific commit by hash.
  * Unlike getHeadCommitInfo, this queries a specific hash rather than HEAD.
+ *
+ * `%ae` is appended LAST so the four historical field positions are untouched:
+ * a caller (or a test) that still sees a 4-field line keeps working and simply
+ * reports no email.
  */
 export async function getCommitInfo(hash: string, cwd?: string): Promise<CommitInfo> {
-	const logResult = await execGit(["log", "-1", "--pretty=format:%H%x00%s%x00%an%x00%aI", hash], cwd);
+	const logResult = await execGit(["log", "-1", "--pretty=format:%H%x00%s%x00%an%x00%aI%x00%ae", hash], cwd);
 	if (logResult.exitCode !== 0) {
 		throw new Error(`Failed to get commit info for ${hash}: ${logResult.stderr}`);
 	}
@@ -311,11 +315,13 @@ export async function getCommitInfo(hash: string, cwd?: string): Promise<CommitI
 		throw new Error(`Unexpected git log format for ${hash}: ${logResult.stdout}`);
 	}
 
+	const authorEmail = parts[4]?.trim();
 	const info: CommitInfo = {
 		hash: parts[0],
 		message: parts[1],
 		author: parts[2],
 		date: parts[3],
+		...(authorEmail ? { authorEmail } : {}),
 	};
 	log.info("Commit %s: %s", info.hash.substring(0, 8), info.message.substring(0, 60));
 	return info;

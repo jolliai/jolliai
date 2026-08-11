@@ -25,6 +25,7 @@ import {
 	ensureWorktreeListed,
 	existingWorktrees,
 	getRepoRegistryPath,
+	hasLiveWorktree,
 	listActiveRepos,
 	readRegistryInstanceId,
 	readRepoRegistry,
@@ -190,6 +191,37 @@ describe("multiple checkouts of one project (§10.2)", () => {
 				enabledAt: "t",
 			};
 			expect(existingWorktrees(repo)).toEqual([real]);
+		} finally {
+			rmSync(real, { recursive: true, force: true });
+		}
+	});
+
+	it("hasLiveWorktree separates a gone repo from one the fallback makes look alive", () => {
+		const real = mkdtempSync(join(tmpdir(), "jolli-wt-"));
+		try {
+			const alive = {
+				repoIdentity: "id",
+				repoName: "r",
+				worktreeRoot: "/gone",
+				worktrees: ["/gone", real],
+				enabledAt: "t",
+			};
+			const gone = {
+				repoIdentity: "id",
+				repoName: "r",
+				worktreeRoot: "/gone",
+				worktrees: ["/gone", "/also-gone"],
+				enabledAt: "t",
+			};
+			expect(hasLiveWorktree(alive)).toBe(true);
+			expect(hasLiveWorktree(gone)).toBe(false);
+			// The distinction `existingWorktrees` cannot make: its non-empty fallback
+			// answers the same shape for both.
+			expect(existingWorktrees(gone)).toEqual(["/gone"]);
+			// Legacy entry with no `worktrees` list falls back to the root, here too.
+			expect(hasLiveWorktree({ repoIdentity: "id", repoName: "r", worktreeRoot: real, enabledAt: "t" })).toBe(
+				true,
+			);
 		} finally {
 			rmSync(real, { recursive: true, force: true });
 		}

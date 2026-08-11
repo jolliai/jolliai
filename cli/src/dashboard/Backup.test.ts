@@ -29,6 +29,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { JolliMemoryConfig } from "../Types.js";
+import { setIsolatedHome } from "../testUtils/isolatedHome.js";
 import {
 	backupHealthCheck,
 	defaultBackupFolder,
@@ -184,14 +185,13 @@ describe("folder rules", () => {
 		// default-folder arm runs without touching the real home.
 		const fakeHome = join(dir, "home");
 		mkdirSync(fakeHome, { recursive: true });
-		const realHome = process.env.HOME;
-		process.env.HOME = fakeHome;
+		const restoreHome = setIsolatedHome(fakeHome);
 		try {
 			const result = await snapshot({ config: {} as JolliMemoryConfig });
 			expect(result.status).toBe("created");
 			expect((result as { path: string }).path.startsWith(join(fakeHome, "jolli_back"))).toBe(true);
 		} finally {
-			process.env.HOME = realHome;
+			restoreHome();
 		}
 	});
 
@@ -204,14 +204,13 @@ describe("folder rules", () => {
 		const fakeHome = join(dir, "dotfiles-home");
 		mkdirSync(fakeHome, { recursive: true });
 		await execFileAsync("git", ["init"], { cwd: fakeHome });
-		const realHome = process.env.HOME;
-		process.env.HOME = fakeHome;
+		const restoreHome = setIsolatedHome(fakeHome);
 		try {
 			const result = await snapshot({ config: {} as JolliMemoryConfig });
 			expect(result).toMatchObject({ status: "failed", reason: expect.stringContaining("git clean -xdf") });
 			expect(existsSync(join(fakeHome, "jolli_back"))).toBe(false);
 		} finally {
-			process.env.HOME = realHome;
+			restoreHome();
 		}
 	});
 
@@ -269,8 +268,7 @@ describe("mirror witness", () => {
 		// A real mirror carries its identity; without it peekKBPath treats the
 		// folder as foreign and resolves to a fresh slot.
 		writeFileSync(join(kb, "app", ".jolli", "config.json"), JSON.stringify({ repoName: "app" }));
-		const realHome = process.env.HOME;
-		process.env.HOME = home;
+		const restoreHome = setIsolatedHome(home);
 		try {
 			const { stampRegistryInstanceId } = await import("./RepoRegistry.js");
 			await stampRegistryInstanceId("unused-here");
@@ -294,7 +292,7 @@ describe("mirror witness", () => {
 			// The mirror-less repo gained nothing: no folder was created.
 			expect(existsSync(join(kb, "ghost"))).toBe(false);
 		} finally {
-			process.env.HOME = realHome;
+			restoreHome();
 		}
 	});
 });
@@ -339,12 +337,11 @@ describe("save-time validation", () => {
 		// No dbPath: the machine default fills in (fake HOME keeps it in the fixture).
 		const fakeHome = join(dir, "vhome");
 		mkdirSync(fakeHome, { recursive: true });
-		const realHome = process.env.HOME;
-		process.env.HOME = fakeHome;
+		const restoreHome = setIsolatedHome(fakeHome);
 		try {
 			expect(await validateBackupFolder(join(dir, "ok-target"), {})).toBeNull();
 		} finally {
-			process.env.HOME = realHome;
+			restoreHome();
 		}
 	});
 
@@ -389,8 +386,7 @@ describe("opportunisticSnapshot", () => {
 		// in the fixture instead of the real ~/jolli_back.
 		const fakeHome = join(dir, "op-home");
 		mkdirSync(fakeHome, { recursive: true });
-		const realHome = process.env.HOME;
-		process.env.HOME = fakeHome;
+		const restoreHome = setIsolatedHome(fakeHome);
 		try {
 			const result = await opportunisticSnapshot(dbPath);
 			expect(result.status).toBe("created");
@@ -405,7 +401,7 @@ describe("opportunisticSnapshot", () => {
 			const bad = await opportunisticSnapshot(join(dir, "not-a-dir", "x.db"));
 			expect(bad.status).toBe("failed");
 		} finally {
-			process.env.HOME = realHome;
+			restoreHome();
 		}
 	});
 });

@@ -24,7 +24,7 @@
  *
  * Failure semantics: this runs in the bootstrap path (`jolli dashboard` →
  * backfill), NOT in a hook — errors propagate to the per-repo handler in
- * `backfillRepos`. Individually malformed artifacts are skipped and counted,
+ * `dbBackfillRepos`. Individually malformed artifacts are skipped and counted,
  * never silently dropped.
  */
 
@@ -150,7 +150,7 @@ export const EMPTY_IMPORT_RESULT: SotImportResult = {
  * Losing the fence re-legalizes `seed`, whose reconciliation would then delete
  * every fence-era SQLite-only memory permanently — the branch it reconciles
  * against is frozen and will never list them again. Both callers that can pick
- * `seed` (the cutover CAS's pre-fence import and `Backfill`'s per-repo sweep)
+ * `seed` (the cutover CAS's pre-fence import and `DbBackfill`'s per-repo sweep)
  * must consult this; the sweep runs on every `jolli dashboard`, so it is the
  * one that matters most.
  *
@@ -634,7 +634,7 @@ const keyOf = (...parts: ReadonlyArray<string>): string => parts.join(KEY_SEP);
  * Deletes every row of `table` for this repo whose business key is absent from
  * `live`, returning how many rows it removed directly (FK cascades ride along
  * uncounted). This is the delete half of set reconciliation — the same model
- * `Backfill.pruneUnreachableCommits` applies to the derived commit tier.
+ * `DbBackfill.pruneUnreachableCommits` applies to the derived commit tier.
  *
  * `live` must be built from what the branch *lists*, never from what parsed
  * successfully: a present-but-malformed artifact is skipped by the import, and
@@ -727,7 +727,7 @@ export async function importRepoMemory(db: DashboardDbHandle, opts: SotImportOpt
 	try {
 		return await runRepoImport(db, opts);
 	} catch (err) {
-		// Recorded HERE and not in `backfillRepos`' per-repo catch: by the time the
+		// Recorded HERE and not in `dbBackfillRepos`' per-repo catch: by the time the
 		// error reaches that handler `withDashboardDb` has closed the connection,
 		// so the only place a failure can still be written down is inside the
 		// import. Rethrown unchanged — this marks, it does not swallow.
@@ -876,7 +876,7 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 	 * fence time and every import stamp from ONE `nowMs`, so a retry found every
 	 * attempt-0 row at exactly `protect`, `>=` held, catch-up updated nothing,
 	 * and the containment compare that the retry exists to satisfy could never
-	 * pass — the repo stayed `legacy-fenced` forever. Backfill and recovery hit
+	 * pass — the repo stayed `legacy-fenced` forever. DbBackfill and recovery hit
 	 * the same wall one pass later, with the wall clock landing past a fence
 	 * parsed off disk.
 	 *

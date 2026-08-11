@@ -412,7 +412,7 @@ describe("schema creation", () => {
 	it("supports the repos DML shapes the writers use — UPSERT, UPDATE, child FK", async () => {
 		await withDashboardDb(
 			(db) => {
-				// The three shapes StatsWriter/Backfill actually use, replayed verbatim
+				// The three shapes StatsWriter/DbBackfill actually use, replayed verbatim
 				// against the surrogate-key repos table.
 				db.prepare(
 					`INSERT INTO repos (repo_identity, repo_name, worktree_root, remote_url, enabled_at, disabled_at)

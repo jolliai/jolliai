@@ -1369,12 +1369,16 @@ function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: Re
 	const filter = scopeFilter(scopeToRepoId(db, scope), "s.repo_id");
 	const rows = db
 		.prepare(
+			// Windowed by the CALL, like the Recall card — see TOOL_CALL_TIME_SQL. The
+			// two panels report the same rows from the same table, so a `jolli-recall`
+			// bucket landing on one day here and another day there is a contradiction
+			// the reader has no way to resolve.
 			`SELECT t.tool_name, t.kind, t.server,
 			        COUNT(DISTINCT t.session_event_id) AS session_count,
 			        COALESCE(SUM(t.calls), 0) AS call_count
 			   FROM session_tool_use t
 			   JOIN sessions s ON s.event_id = t.session_event_id
-			  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql}
+			  WHERE ${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?${filter.sql}
 			  GROUP BY t.kind, t.tool_name, t.server`,
 		)
 		.all(window.startMs, window.endMs, ...filter.params) as ReadonlyArray<{
@@ -1442,7 +1446,7 @@ function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: Re
 			        COUNT(DISTINCT t.tool_name) AS tool_count
 			   FROM session_tool_use t
 			   JOIN sessions s ON s.event_id = t.session_event_id
-			  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql}
+			  WHERE ${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?${filter.sql}
 			    AND t.kind = 'mcp' AND t.server IS NOT NULL
 			  GROUP BY t.server`,
 		)
@@ -1456,18 +1460,53 @@ function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: Re
 	const byAdoption = <T extends { sessions: number; calls: number }>(a: T, b: T) =>
 		b.sessions - a.sessions || b.calls - a.calls;
 
-	// Coverage from the FULL session population, never from the join above.
+	// Coverage from the FULL session population, never from the join above — and
+	// windowed by the SESSION's own time OR by any call it made, which is the
+	// union of the two clocks and not either one alone. Both halves are needed
+	// and for opposite reasons. Session time alone drops nothing that the caveat
+	// is about but cannot see a session whose calls landed in this window while
+	// its own `updated_at_ms` did not — and since the two queries above moved to
+	// call time, that session's tool row is IN the ranking, so the page printed
+	// "1 session" directly above "from 0 of 0 sessions in this window". Call time
+	// alone is the failure the old comment named: a session that made no tool
+	// call has no call to be windowed by and would vanish from the denominator
+	// the caveat is built on. The union admits a session if EITHER clock puts it
+	// here, so every ranked row is backed by a session it counts.
+	//
+	// The NUMERATOR carries the same window as the rankings, and for the reason
+	// the denominator carries the union: unwindowed, a session admitted by its own
+	// `updated_at_ms` counted as "with tools" on the strength of calls made weeks
+	// earlier — calls that are in no ranked row on the page, because both queries
+	// above window by call time. That is the same contradiction in the other
+	// direction: "3 of 4 sessions" above a table whose rows account for one of
+	// them. Windowed, the fraction says what the caveat claims it says — sessions
+	// whose tool use is what the page is showing.
 	const sessionFilter = scopeFilter(scopeToRepoId(db, scope), "s.repo_id");
 	const sessionRows = db
 		.prepare(
 			`SELECT s.source,
 			        COUNT(*) AS total,
-			        COALESCE(SUM(EXISTS (SELECT 1 FROM session_tool_use t WHERE t.session_event_id = s.event_id)), 0) AS with_tools
+			        COALESCE(SUM(EXISTS (SELECT 1 FROM session_tool_use t
+			                              WHERE t.session_event_id = s.event_id
+			                                AND ${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?)), 0) AS with_tools
 			   FROM sessions s
-			  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${sessionFilter.sql}
+			  WHERE ((s.updated_at_ms >= ? AND s.updated_at_ms < ?)
+			         OR EXISTS (SELECT 1 FROM session_tool_use t
+			                     WHERE t.session_event_id = s.event_id
+			                       AND ${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?))${sessionFilter.sql}
 			  GROUP BY s.source`,
 		)
-		.all(window.startMs, window.endMs, ...sessionFilter.params) as ReadonlyArray<{
+		// Six bounds, not four: the SELECT list's `?`s bind ahead of the WHERE's,
+		// and all three range tests are the same window.
+		.all(
+			window.startMs,
+			window.endMs,
+			window.startMs,
+			window.endMs,
+			window.startMs,
+			window.endMs,
+			...sessionFilter.params,
+		) as ReadonlyArray<{
 		source: string;
 		total: number;
 		with_tools: number;
@@ -1524,8 +1563,21 @@ const RECALL_STALE_MS = 30 * 86_400_000;
  *
  * Written as a fragment used in BOTH bounds of each range test, so a row cannot
  * be admitted by one clock and excluded by the other.
+ *
+ * The `NULLIF` is what makes the fallback total. 0 is the one stored value that
+ * defeats a bare COALESCE — 0 is not NULL, so the row resolves to epoch 0 and
+ * leaves every window instead of keeping its session's placement — and it is
+ * indistinguishable from "no time known", which is precisely the case the
+ * fallback exists for. Both writers already refuse to store one (their
+ * `MAX(COALESCE(…,0), COALESCE(…,0))` is wrapped in `NULLIF` too), so this is
+ * the belt to those braces; it lives HERE, and not in a migration, because a
+ * migration runs once and a third writer added later would store its first 0
+ * long after every database had passed that step. Neutralising it at the read
+ * costs nothing, covers rows that already exist and rows not yet written, and
+ * needs no schema version — which is a cross-surface event, since every surface
+ * refuses a database stamped ahead of its own build.
  */
-const TOOL_CALL_TIME_SQL = "COALESCE(t.last_call_at_ms, s.updated_at_ms)";
+const TOOL_CALL_TIME_SQL = "COALESCE(NULLIF(t.last_call_at_ms, 0), s.updated_at_ms)";
 
 /**
  * The Recall card: how often recall actually served usable commit context.

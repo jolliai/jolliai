@@ -337,9 +337,9 @@ CREATE TABLE ingest_cursors (
 
 -- ── Code graph ──────────────────────────────────────────────────────────────
 -- PARKED, not deleted. The graph page was removed (no view token, no route, no
--- reader), which left this table written by Backfill and read by nothing — a few
+-- reader), which left this table written by DbBackfill and read by nothing — a few
 -- hundred KB of JSON per repo per import, for no query. The writer is commented
--- out in lockstep (StatsWriter.recordRepoGraph, Backfill's call site); uncomment
+-- out in lockstep (StatsWriter.recordRepoGraph, DbBackfill's call site); uncomment
 -- all three together if the page returns. Kept as commented DDL rather than
 -- dropped from history because this is the exact shape it would come back to.
 --
@@ -485,6 +485,34 @@ ALTER TABLE events_raw ADD COLUMN failed_kind TEXT;
 export const TOOL_CALL_TIME_DDL = `
 ALTER TABLE session_tool_use ADD COLUMN last_call_at_ms INTEGER;
 `;
+
+/*
+ * A stored `0` in this column is handled at the READ site, and deliberately not
+ * by a migration — do not add one back.
+ *
+ * 0 is the one value that breaks the fallback above: 0 is not NULL, so such a
+ * row resolves to epoch 0 and silently drops out of every window instead of
+ * keeping its session's placement. Both writers already wrap their
+ * `MAX(COALESCE(…,0), COALESCE(…,0))` in `NULLIF`, so nothing produces one; the
+ * remaining question is only what to do about a row that already holds one.
+ *
+ * A sweep entry was written for that and then removed, for two reasons that are
+ * worth keeping written down:
+ *
+ *  - **It cannot do the job it was added for.** Its stated purpose was that "a
+ *    third writer added later will not come with this reasoning attached" — but
+ *    a migration entry runs ONCE, on the step that crosses its version, so it is
+ *    long finished by the time that writer stores its first 0. Only the read can
+ *    be permanent, which is why `TOOL_CALL_TIME_SQL` wraps the column in
+ *    `NULLIF` rather than trusting what is on disk.
+ *  - **It cost a cross-surface version bump for a provably empty set.** Every
+ *    surface refuses a database stamped ahead of its own build, so a bump locks
+ *    older CLI / VS Code / IntelliJ builds out of the machine-global file. What
+ *    the sweep would have cleaned is 0 rows, and not merely by measurement:
+ *    both write paths DELETE the session's rows before inserting, so `ON
+ *    CONFLICT` can only fire on a duplicate `(tool_name, kind)` within one
+ *    event, which `ToolUseTally` cannot emit — that pair is its bucket key.
+ */
 
 /**
  * The memory tables, `context`, plan progress and the topic KB.

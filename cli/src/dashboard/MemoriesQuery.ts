@@ -41,6 +41,7 @@ import {
 	aggregateConversationTokenBreakdown,
 	aggregateConversationTokens,
 	collectDisplayTopics,
+	getTranscriptIds,
 } from "../core/SummaryTree.js";
 import { estimateSummaryCostUsd } from "../core/TokenCost.js";
 import { TOOL_RECORDING_SOURCES } from "../core/TranscriptParser.js";
@@ -278,6 +279,7 @@ interface MemoryDetailRow {
 	readonly branch: string | null;
 	readonly commit_message: string | null;
 	readonly commit_author: string | null;
+	/** The COALESCEd committer date — see {@link buildMemoryDetail}, not the raw `memories.commit_date_ms`. */
 	readonly commit_date_ms: number;
 	readonly ticket_id: string | null;
 	readonly summary_json: string;
@@ -344,16 +346,40 @@ function linkedSessionCoverage(
  *     keeps growing after the commit. The count a memory should show is the
  *     number of turns archived INTO it.
  *
- * The live `sessions` row is still consulted, but only as the title of first
- * resort — it carries the discoverer's native title (opencode/cursor/copilot),
- * which is `resolveSessionTitle`'s own step 1. Its steps 2-3 need either the
- * live transcript file or the merged entries; only the latter is reachable from
- * a database transaction, and for an archived session it is what the editor
- * ends up using anyway (the stored session carries no `title`, and its
- * `transcriptPath` is usually gone), so `firstUserMessageTitleFromEntries` is
- * the same answer rather than an approximation of it.
+ * Titles come from the ARCHIVE first (`StoredSession.title`, resolved by
+ * `resolveArchivedTitle` when the memory was written), then from the live
+ * `sessions` row, then from the archived first user message. That order is the
+ * point: the archived string is the full ladder's answer as of this commit,
+ * taken while the transcript was still readable, and it is the only one of the
+ * three that survives session pruning or arriving on another machine.
+ *
+ * This whole function is synchronous, and that is now a property rather than a
+ * limitation. It used to hand each row a `transcriptPath` so a later async pass
+ * could re-read the live file for Claude's `ai-title` — which put an absolute
+ * path under the user's home into a payload nothing rendered, and (measured)
+ * could only fire where it was least likely to succeed: a row with a stored
+ * title skipped the read, and a row without one had no readable file to read.
+ *
+ * **The row ORDER comes from `summary.transcripts`, not from the link table.**
+ * `groupArchivedSessions` emits conversations in first-seen order over the
+ * transcripts it is handed, so the order this function feeds it IS the displayed
+ * order — and `memory_transcripts` cannot supply it. That table is a SET (its PK
+ * stores no array index, by the comment on it in `SotSchema.ts`), and the query
+ * below is served by the PK's covering index, so rows arrive sorted by
+ * `transcript_id` — a UUID, i.e. arbitrary (measured: `aaa`, `mmm`, `zzz` for
+ * insertions in the reverse order). The editor reads the summary's own
+ * `transcripts` array via `getTranscriptIds`, so the same memory listed its
+ * conversations in a different order on the two surfaces. Ordering by the array
+ * here is what makes them agree; a linked id the array does not name keeps its
+ * query position after the named ones rather than being dropped, since a row the
+ * link table has is still a real conversation.
  */
-function buildConversations(db: DashboardDbHandle, repoId: number, hash: string): ReadonlyArray<MemoryConversationRow> {
+function buildConversations(
+	db: DashboardDbHandle,
+	repoId: number,
+	hash: string,
+	summary: CommitSummary,
+): ReadonlyArray<MemoryConversationRow> {
 	const blobs = db
 		.prepare(
 			`SELECT mt.transcript_id, t.sessions_blob
@@ -363,8 +389,22 @@ function buildConversations(db: DashboardDbHandle, repoId: number, hash: string)
 		)
 		.all(repoId, hash) as ReadonlyArray<{ transcript_id: string; sessions_blob: Uint8Array }>;
 
+	// First occurrence wins: `transcripts[]` carries no uniqueness guarantee (a
+	// squash that concatenated two arrays repeats the shared ids), and the editor
+	// reaches such an id at its first position too.
+	const rank = new Map<string, number>();
+	for (const [i, id] of getTranscriptIds(summary).entries()) {
+		if (!rank.has(id)) rank.set(id, i);
+	}
+	// Unnamed ids all score `rank.size`, so the sort's stability keeps them in
+	// query order behind the named ones instead of shuffling them.
+	const unnamed = rank.size;
+	const ordered = [...blobs].sort(
+		(a, b) => (rank.get(a.transcript_id) ?? unnamed) - (rank.get(b.transcript_id) ?? unnamed),
+	);
+
 	const transcripts: Array<readonly [string, StoredTranscript]> = [];
-	for (const b of blobs) {
+	for (const b of ordered) {
 		try {
 			transcripts.push([b.transcript_id, JSON.parse(inflateSync(Buffer.from(b.sessions_blob)).toString("utf8"))]);
 		} catch (err) {
@@ -397,10 +437,16 @@ function buildConversations(db: DashboardDbHandle, repoId: number, hash: string)
 	const { order, grouped } = groupArchivedSessions(transcripts);
 	return order.map((key) => {
 		const g = grouped.get(key) as NonNullable<ReturnType<typeof grouped.get>>;
+		const source = g.session.source ?? "claude";
 		return {
-			source: g.session.source ?? "claude",
-			title: nativeTitles.get(key) ?? firstUserMessageTitleFromEntries(g.entries),
+			source,
+			// Archive first: see the note above for why it outranks a live row that
+			// may not exist. `?? ` and not `||` would be wrong the other way round —
+			// an archived empty string is not a title, and the writer stores the
+			// field only when it resolved one, so absence is the only empty case.
+			title: g.session.title ?? nativeTitles.get(key) ?? firstUserMessageTitleFromEntries(g.entries),
 			messageCount: g.entries.length,
+			sessionId: g.session.sessionId,
 		};
 	});
 }
@@ -547,11 +593,16 @@ export function buildMemoryDetail(
 	const filter = scopeFilter(resolved, "m.repo_id");
 	const row = db
 		.prepare(
-			`SELECT m.commit_hash, m.branch, m.commit_message, m.commit_author, m.commit_date_ms, m.ticket_id,
+			`SELECT m.commit_hash, m.branch, m.commit_message, m.commit_author, m.ticket_id,
+			        -- Same COALESCE as reachableMemoryRows and buildMemoryCards, for the
+			        -- same reason: raw m.commit_date_ms is the AUTHOR date, so a rebased
+			        -- memory would render one instant in the tree row and another here.
+			        COALESCE(cm.committed_at_ms, m.commit_date_ms) AS commit_date_ms,
 			        m.summary_json, m.files_changed, m.insertions, m.deletions, m.jolli_doc_id,
 			        m.repo_id, r.repo_identity, r.repo_name
 			   FROM memories m
 			   JOIN repos r ON r.id = m.repo_id
+			   LEFT JOIN commits cm ON cm.repo_id = m.repo_id AND cm.hash = m.commit_hash
 			  WHERE m.commit_hash = ?${filter.sql}
 			  -- Deterministic pick. Without a scope filter (the all-repos view) one
 			  -- hash can match rows in two repos — two clones of a project, or the
@@ -693,7 +744,7 @@ export function buildMemoryDetail(
 		...(tokens ? { tokens } : {}),
 		...(summarizedBy ? { summarizedBy } : {}),
 		...(summary.recap ? { recap: summary.recap } : {}),
-		conversations: buildConversations(db, row.repo_id, hash),
+		conversations: buildConversations(db, row.repo_id, hash, summary),
 		context,
 		excluded,
 		activity,

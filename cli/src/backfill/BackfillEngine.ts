@@ -17,6 +17,7 @@
 import { execGit, getCommitInfo, getDiffContent, getDiffStats } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { hasLlmCredentials } from "../core/LlmCredentials.js";
+import { resolveArchivedTitle } from "../core/SessionTitleResolver.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
@@ -149,13 +150,24 @@ async function worktreeRoots(cwd: string): Promise<string[]> {
 // hasLlmCredentials is imported from ../core/LlmCredentials.js (single source of
 // truth shared with SessionStartHook, the summarizer, and compile).
 
-/** Converts an attributed commit's sessions into the orphan-branch transcript artifact. */
-function toStoredTranscript(attr: AttributedCommit): StoredTranscript {
+/**
+ * Converts an attributed commit's sessions into the orphan-branch transcript artifact.
+ *
+ * Titles are resolved here for the same reason the live writer resolves them
+ * (see `resolveArchivedTitle`), with one difference worth knowing: backfill runs
+ * long after the commit, so a transcript pruned in the meantime yields no
+ * `ai-title` and the archived first user message stands instead. That is the
+ * honest answer — and still strictly better than archiving nothing, which leaves
+ * every future reader deriving it from a path that is already gone.
+ */
+async function toStoredTranscript(attr: AttributedCommit): Promise<StoredTranscript> {
+	const titles = await Promise.all(attr.sessions.map((s) => resolveArchivedTitle(s)));
 	return {
-		sessions: attr.sessions.map((s) => ({
+		sessions: attr.sessions.map((s, i) => ({
 			sessionId: s.sessionId,
 			source: s.source,
 			transcriptPath: s.transcriptPath,
+			...(titles[i] ? { title: titles[i] } : {}),
 			entries: [...s.entries],
 		})),
 	};
@@ -223,7 +235,7 @@ async function generateAndStore(
 
 	// Only attach a transcript artifact when a conversation was attributed.
 	const artifacts =
-		attr && transcriptId ? { transcript: { id: transcriptId, data: toStoredTranscript(attr) } } : undefined;
+		attr && transcriptId ? { transcript: { id: transcriptId, data: await toStoredTranscript(attr) } } : undefined;
 	await storeSummary(summary, cwd, false, artifacts, storage);
 	return result.topics.length;
 }

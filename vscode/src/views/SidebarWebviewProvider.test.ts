@@ -4492,6 +4492,60 @@ describe("SidebarWebviewProvider", () => {
 			]);
 		});
 
+		it("shows the title the ARCHIVE recorded, without re-deriving it from the live transcript", async () => {
+			// `StoredSession.title` is resolved once, at commit time, and travels with
+			// the memory — so this panel and the dashboard show one string instead of
+			// two independently re-derived ones. It is fed in as the resolver's own
+			// step 1, which is why no branch here has to know about it. The path below
+			// does not exist: an archived title must not depend on the live file, which
+			// is exactly the case that used to fall back to "(untitled session)".
+			const view = makeMockView();
+			const getSummaryByHash = vi.fn().mockResolvedValue({
+				version: 5,
+				commitHash: "abc1234",
+				commitMessage: "feat: add widget",
+				commitAuthor: "Dev",
+				commitDate: "2024-01-01T00:00:00Z",
+				branch: "main",
+				generatedAt: "2024-01-01T00:01:00Z",
+				transcripts: ["tid-1"],
+			});
+			const readTranscriptById = vi.fn().mockResolvedValue({
+				sessions: [
+					{
+						sessionId: "sess-abc",
+						source: "claude" as const,
+						transcriptPath: "/gone/claude.jsonl",
+						title: "Add the rate limiter",
+						entries: [{ role: "human", content: "restart the web backend" }],
+					},
+				],
+			});
+			const provider = new SidebarWebviewProvider({
+				executeCommand: vi.fn(),
+				getInitialState: () => ({
+					enabled: true,
+					authenticated: false,
+					activeTab: "kb",
+					kbMode: "memories",
+					branchName: "main",
+					detached: false,
+					currentRepoName: "myrepo",
+				}),
+				extensionUri: mockExtensionUri as unknown as never,
+				getSummaryByHash,
+				readTranscriptById,
+			});
+			provider.resolveWebviewView(view as unknown as never);
+			view.webview.postMessage.mockClear();
+			view.webview.triggerMessage({ type: "kb:expandMemory", commitHash: "abc1234" });
+			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
+			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
+			// Not the archived first human turn, which is what the ladder would have
+			// produced on its own for a session whose live file is gone.
+			expect(evidenceMsg.evidence.conversations[0].title).toBe("Add the rate limiter");
+		});
+
 		it("posts kb:memoryEvidence with projected conversations/context/files from the summary", async () => {
 			const view = makeMockView();
 			const fakeSummary = {

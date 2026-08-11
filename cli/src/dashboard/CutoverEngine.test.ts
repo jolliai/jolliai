@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resolveCommittish } from "../core/GitRefStorage.js";
 import { readCutoverFence, writeCutoverFence } from "../core/RepoProfile.js";
 import { ORPHAN_BRANCH } from "../Logger.js";
+import { type RestoreHome, setIsolatedHome } from "../testUtils/isolatedHome.js";
 import { probeCutoverDrift, runCutover } from "./CutoverEngine.js";
 import { resolveCutoverRoute } from "./CutoverRouter.js";
 import { withDashboardDb } from "./DashboardDb.js";
@@ -22,7 +23,8 @@ import { readRepoRegistry, registerRepo } from "./RepoRegistry.js";
 let dir: string;
 let cwd: string;
 let dbPath: string;
-let realHome: string | undefined;
+let home: string;
+let restoreHome: RestoreHome;
 
 const HASH = "a".repeat(40);
 
@@ -80,11 +82,12 @@ async function writeOrphanSummary(hash: string, message: string): Promise<void> 
 
 beforeEach(async () => {
 	dir = mkdtempSync(join(tmpdir(), "jolli-cutover-"));
-	// Isolated HOME: the registry and profile paths are machine-global.
-	const home = join(dir, "home");
+	// Isolated HOME: the registry and profile paths are machine-global. Must go
+	// through the helper — setting `HOME` alone leaves the real home in place on
+	// Windows, where `os.homedir()` reads `USERPROFILE`.
+	home = join(dir, "home");
 	mkdirSync(home, { recursive: true });
-	realHome = process.env.HOME;
-	process.env.HOME = home;
+	restoreHome = setIsolatedHome(home);
 	cwd = join(dir, "repo");
 	mkdirSync(cwd, { recursive: true });
 	execSync("git init -q", { cwd });
@@ -97,7 +100,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-	process.env.HOME = realHome;
+	restoreHome();
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -652,7 +655,7 @@ describe("runCutover", () => {
 		await writeOrphanSummary(HASH, "seed");
 		// dist-paths records what is INSTALLED here; an old surface would keep
 		// writing the frozen branch, so the cutover must not begin.
-		const distDir = join(process.env.HOME as string, ".jolli", "jollimemory", "dist-paths");
+		const distDir = join(home, ".jolli", "jollimemory", "dist-paths");
 		mkdirSync(distDir, { recursive: true });
 		const { writeFileSync } = await import("node:fs");
 		// The dist dir must EXIST: admission only counts entries whose directory

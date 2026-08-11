@@ -74,6 +74,7 @@ vi.mock("./CliUtils.js", async (importOriginal) => {
 	return { ...actual, resolveProjectDir: h.resolveProjectDir };
 });
 
+import { setIsolatedHome } from "../testUtils/isolatedHome.js";
 import { registerDoctorCommand } from "./DoctorCommand.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -277,8 +278,7 @@ describe("doctor --recover", () => {
 		const { join } = await import("node:path");
 		const { runRecover } = await import("./DoctorCommand.js");
 		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-recover-"));
-		const realHome = process.env.HOME;
-		process.env.HOME = home;
+		const restoreHome = setIsolatedHome(home);
 		// This file mocks SessionTracker wholesale; point the two functions the
 		// recovery path uses at the fake HOME.
 		const st = await import("../core/SessionTracker.js");
@@ -331,7 +331,7 @@ describe("doctor --recover", () => {
 			process.exitCode = 0;
 			logSpy.mockRestore();
 			errSpy.mockRestore();
-			process.env.HOME = realHome;
+			restoreHome();
 			rmSync(home, { recursive: true, force: true });
 		}
 	});

@@ -282,7 +282,7 @@ export function drainPending(
 		}
 	}
 	// Counted from the table, never accumulated. `pending` is what
-	// `Backfill.applyBatches` consults before advancing the summaries cursor, so
+	// `DbBackfill.applyBatches` consults before advancing the summaries cursor, so
 	// it has to mean "events still unprojected" — the tally it replaces counted
 	// only future-schema rows plus this pass's own failures, and said 0 while
 	// everything the `LIMIT` did not reach was still waiting. One first tick on a
@@ -611,8 +611,13 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): voi
 			     -- instant a better read already recorded, and NULL is the one value this
 			     -- column cannot recover from: the transcript slice it came from is
 			     -- behind a cursor by then.
-			     last_call_at_ms = MAX(COALESCE(excluded.last_call_at_ms, 0),
-			                           COALESCE(session_tool_use.last_call_at_ms, 0))`,
+			     --
+			     -- NULLIF around the MAX keeps "neither side has a time" as NULL: the
+			     -- COALESCEs turn both-NULL into 0, and a stored 0 reads back as a real
+			     -- epoch-0 instant, so the display's fallback to the session's own
+			     -- timestamp would never fire.
+			     last_call_at_ms = NULLIF(MAX(COALESCE(excluded.last_call_at_ms, 0),
+			                                  COALESCE(session_tool_use.last_call_at_ms, 0)), 0)`,
 		);
 		for (const tool of event.tools) {
 			insertTool.run(eventId, tool.name, tool.kind, tool.server ?? null, tool.calls, tool.lastCallAtMs ?? null);
@@ -653,7 +658,7 @@ function projectRecallObserved(db: DashboardDbHandle, event: RecallObservedEvent
 
 // PARKED with the `repo_graphs` table (see SotSchema): the graph page was
 // removed, so nothing reads the artifact. Uncomment this, the table DDL and
-// Backfill's call site together if the page returns.
+// DbBackfill's call site together if the page returns.
 // /**
 //  * Records a repo's knowledge-graph artifact.
 //  *
@@ -811,8 +816,10 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 			`INSERT INTO session_tool_use (session_event_id, tool_name, kind, server, calls, last_call_at_ms)
 			 VALUES (?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(session_event_id, tool_name, kind) DO UPDATE SET calls = excluded.calls,
-			     last_call_at_ms = MAX(COALESCE(excluded.last_call_at_ms, 0),
-			                           COALESCE(session_tool_use.last_call_at_ms, 0))`,
+			     -- NULLIF for the same reason as the live path above: both-NULL must stay
+			     -- NULL, or the row claims epoch 0 as a real last-call instant.
+			     last_call_at_ms = NULLIF(MAX(COALESCE(excluded.last_call_at_ms, 0),
+			                                  COALESCE(session_tool_use.last_call_at_ms, 0)), 0)`,
 		);
 		for (const link of event.sessionLinks) {
 			const sessionEventId = `session:${event.repoIdentity}:${link.source}:${link.sessionId}`;

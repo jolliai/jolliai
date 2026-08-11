@@ -47,7 +47,6 @@ vi.mock("./SotImport.js", async (importOriginal) => ({
 import { execGit, getHeadHash, listFilesInBranch } from "../core/GitOps.js";
 import { readCutoverFence } from "../core/RepoProfile.js";
 import { getIndex } from "../core/SummaryStore.js";
-import { backfillRepo, backfillRepos, pruneUnreachableCommits } from "./Backfill.js";
 import {
 	collectCommitEvents,
 	collectRepoGraph,
@@ -55,6 +54,7 @@ import {
 	collectSummaryEvents,
 	collectWorktreeEvent,
 } from "./DashboardCollector.js";
+import { dbBackfillRepo, dbBackfillRepos, pruneUnreachableCommits } from "./DbBackfill.js";
 import { importRepoMemory } from "./SotImport.js";
 
 let dir: string;
@@ -63,7 +63,11 @@ let dbPath: string;
 const repo: RegisteredRepo = {
 	repoIdentity: "https://github.com/jolliai/jolliai",
 	repoName: "jolliai",
-	worktreeRoot: "/home/dev/jolli",
+	// Must be a directory that EXISTS: `dbBackfillRepos` drops a repo whose every
+	// recorded checkout is gone (see its own describe block), so a fixture on a
+	// made-up path would silently be skipped instead of swept. Nothing is read
+	// from it — the collectors are mocked.
+	worktreeRoot: tmpdir(),
 	remoteUrl: "https://github.com/jolliai/jolliai",
 	enabledAt: "2026-01-01T00:00:00.000Z",
 };
@@ -145,9 +149,9 @@ async function query<T>(sql: string, ...params: unknown[]): Promise<T[]> {
 	return withDashboardDb((db) => db.prepare(sql).all(...params) as T[], { dbPath });
 }
 
-describe("backfillRepo — bootstrap", () => {
+describe("dbBackfillRepo — bootstrap", () => {
 	it("imports commits, sessions and worktree state, then marks the repo done", async () => {
-		const result = await backfillRepo({ repo, dbPath });
+		const result = await dbBackfillRepo({ repo, dbPath });
 		expect(result.mode).toBe("bootstrapped");
 		expect(result.eventsApplied).toBe(5); // repo.enabled + 2 commits + session + worktree
 
@@ -161,7 +165,7 @@ describe("backfillRepo — bootstrap", () => {
 	});
 
 	it("records cursors: HEAD for commits, max updatedAt for sessions", async () => {
-		await backfillRepo({ repo, dbPath, now: () => 42 });
+		await dbBackfillRepo({ repo, dbPath, now: () => 42 });
 		const cursors = await query<{ source: string; cursor: string }>(
 			"SELECT source, cursor FROM ingest_cursors ORDER BY source",
 		);
@@ -170,12 +174,15 @@ describe("backfillRepo — bootstrap", () => {
 			// sorted) so a commit landing in a second clone — or a branch moving
 			// without HEAD moving — cannot read as "nothing changed". Matched by shape
 			// rather than a pinned digest of the fixture's empty ref output.
-			{ source: "git-commits", cursor: expect.stringMatching(/^\/home\/dev\/jolli@head-1\+[0-9a-f]{64}$/) },
+			// The path prefix is the fixture's own root (an existing directory — see
+			// the fixture), asserted below rather than inlined into the pattern.
+			{ source: "git-commits", cursor: expect.stringMatching(/@head-1\+[0-9a-f]{64}$/) },
 			{ source: "sessions", cursor: String(sessionEvent.updatedAtMs) },
 			// The memory import's own signal: the orphan tip (a hash of everything it
 			// reads) plus the mode, since seed and catch-up do not write the same rows.
 			{ source: "sot-import", cursor: `${"ab".repeat(20)}#seed` },
 		]);
+		expect(cursors[0].cursor.startsWith(`${repo.worktreeRoot}@`)).toBe(true);
 	});
 
 	// PARKED with `repo_graphs` and Backfill's call site (see SotSchema): the
@@ -197,7 +204,7 @@ describe("backfillRepo — bootstrap", () => {
 	// edges: [{ from: "u1", to: "u2" }],
 	// coChangeTopicEdges: [],
 	// } as unknown as KnowledgeGraph);
-	// await backfillRepo({ repo, dbPath });
+	// await dbBackfillRepo({ repo, dbPath });
 	// const row = await withDashboardDb(
 	// (db) =>
 	// db
@@ -218,9 +225,9 @@ describe("backfillRepo — bootstrap", () => {
 	// });
 
 	it("is idempotent — running twice does not duplicate rows", async () => {
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		vi.mocked(getHeadHash).mockResolvedValue("head-2"); // force a re-collect
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect((await query("SELECT hash FROM commits")).length).toBe(2);
 	});
 
@@ -243,7 +250,7 @@ describe("backfillRepo — bootstrap", () => {
 		);
 		expect((await query("SELECT event_id FROM events_raw WHERE event_id = 'stale'")).length).toBe(1);
 
-		await backfillRepo({ repo, dbPath, now: () => Date.parse("2026-08-09T00:00:00Z") });
+		await dbBackfillRepo({ repo, dbPath, now: () => Date.parse("2026-08-09T00:00:00Z") });
 
 		expect((await query("SELECT event_id FROM events_raw WHERE event_id = 'stale'")).length).toBe(0);
 	});
@@ -265,7 +272,7 @@ describe("backfillRepo — bootstrap", () => {
 			{ dbPath },
 		);
 
-		await backfillRepo({ repo, dbPath, now: () => Date.parse("2026-08-09T00:00:00Z") });
+		await dbBackfillRepo({ repo, dbPath, now: () => Date.parse("2026-08-09T00:00:00Z") });
 
 		const kept = await query<{ event_id: string }>(
 			"SELECT event_id FROM events_raw WHERE event_id IN ('pending','failed') ORDER BY event_id",
@@ -274,11 +281,11 @@ describe("backfillRepo — bootstrap", () => {
 	});
 });
 
-describe("backfillRepo — recovery", () => {
+describe("dbBackfillRepo — recovery", () => {
 	it("skips the git sweep when HEAD matches the cursor", async () => {
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		vi.mocked(collectCommitEvents).mockClear();
-		const result = await backfillRepo({ repo, dbPath });
+		const result = await dbBackfillRepo({ repo, dbPath });
 		expect(collectCommitEvents).not.toHaveBeenCalled();
 		// Sessions and worktree are still re-projected (idempotent, cheap).
 		expect(collectSessionEvents).toHaveBeenCalledTimes(2);
@@ -286,7 +293,7 @@ describe("backfillRepo — recovery", () => {
 	});
 
 	it("re-sweeps when a branch tip moves without HEAD moving", async () => {
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		vi.mocked(collectCommitEvents).mockClear();
 		// Same HEAD, different branch tips — a branch that is not the checked-out one
 		// was deleted, rebased or gained a commit. A HEAD-only cursor read this as
@@ -296,7 +303,7 @@ describe("backfillRepo — recovery", () => {
 			stderr: "",
 			exitCode: 0,
 		});
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(collectCommitEvents).toHaveBeenCalled();
 	});
 
@@ -316,10 +323,10 @@ describe("backfillRepo — recovery", () => {
 						exitCode: 0,
 					};
 		vi.mocked(execGit).mockImplementation(tips("mem-1"));
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		vi.mocked(collectCommitEvents).mockClear();
 		vi.mocked(execGit).mockImplementation(tips("mem-2"));
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(collectCommitEvents).not.toHaveBeenCalled();
 	});
 
@@ -330,13 +337,13 @@ describe("backfillRepo — recovery", () => {
 		// projecting the unchanged ones re-ran an UPSERT + DELETE + re-INSERT per
 		// commit to arrive at the bytes already there. Measured on a real 2.5k-commit
 		// repo: one new commit went from 2457 projections to 1.
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		// A pass with nothing to do still re-projects the always-on tiers, so THAT is
 		// the baseline to compare against rather than a hard-coded count.
-		const idle = await backfillRepo({ repo, dbPath });
+		const idle = await dbBackfillRepo({ repo, dbPath });
 		vi.mocked(getHeadHash).mockResolvedValue("head-2");
 		vi.mocked(collectCommitEvents).mockResolvedValue([commitEvent("aaa"), commitEvent("bbb"), commitEvent("ccc")]);
-		const result = await backfillRepo({ repo, dbPath });
+		const result = await dbBackfillRepo({ repo, dbPath });
 		// Exactly one more: `ccc`. `aaa` and `bbb` are listed by the sweep and used
 		// for the prune, but neither reaches the projection.
 		expect(result.eventsApplied).toBe(idle.eventsApplied + 1);
@@ -348,13 +355,13 @@ describe("backfillRepo — recovery", () => {
 		// `branches` is replace-when-present, so a stale set is a wrong answer to
 		// "group by branch" — this is the one field that legitimately changes for an
 		// OLD commit, and skipping it is what a naive "already stored" test would do.
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		vi.mocked(getHeadHash).mockResolvedValue("head-2");
 		vi.mocked(collectCommitEvents).mockResolvedValue([
 			{ ...commitEvent("aaa"), branches: ["main", "feature/x"] },
 			commitEvent("bbb"),
 		]);
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		const names = (
 			await query<{ name: string }>(
 				`SELECT b.name FROM commit_branches cb
@@ -377,22 +384,22 @@ describe("backfillRepo — recovery", () => {
 			{ ...commitEvent("aaa"), files: [{ path: "src/a.ts", insertions: 1, deletions: 0 }] },
 			commitEvent("bbb"),
 		]);
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		vi.mocked(collectCommitEvents).mockClear();
 
 		vi.mocked(getHeadHash).mockResolvedValue("head-2");
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 
 		const known = vi.mocked(collectCommitEvents).mock.calls[0]?.[0].knownHashes;
 		expect([...(known ?? [])]).toEqual(["aaa"]);
 	});
 
 	it("prunes commits that a rewrite made unreachable (set reconciliation)", async () => {
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		// Rebase: bbb rewritten to ccc, HEAD moved.
 		vi.mocked(getHeadHash).mockResolvedValue("head-2");
 		vi.mocked(collectCommitEvents).mockResolvedValue([commitEvent("aaa"), commitEvent("ccc")]);
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		const hashes = (await query<{ hash: string }>("SELECT hash FROM commits ORDER BY hash")).map((r) => r.hash);
 		expect(hashes).toEqual(["aaa", "ccc"]);
 	});
@@ -403,13 +410,13 @@ describe("backfillRepo — recovery", () => {
 		// commits", so the prune wiped the commit layer (with its CASCADEs) — and then
 		// advanced the cursor, so the next pass skipped collection entirely and the
 		// blank persisted until some unrelated ref moved.
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		const before = await query<{ hash: string }>("SELECT hash FROM commits ORDER BY hash");
 		const cursorBefore = await query<{ cursor: string }>("SELECT cursor FROM ingest_cursors WHERE source = 'git'");
 
 		vi.mocked(getHeadHash).mockResolvedValue("head-2");
 		vi.mocked(collectCommitEvents).mockRejectedValue(new Error("git log failed: stdout limit exceeded"));
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 
 		expect(await query<{ hash: string }>("SELECT hash FROM commits ORDER BY hash")).toEqual(before);
 		// Cursor unmoved, so the next pass re-collects instead of trusting the gap.
@@ -420,7 +427,7 @@ describe("backfillRepo — recovery", () => {
 
 	it("still recovers sessions when HEAD is unreadable (worktree gone mid-run)", async () => {
 		vi.mocked(getHeadHash).mockRejectedValue(new Error("not a repo"));
-		const result = await backfillRepo({ repo, dbPath });
+		const result = await dbBackfillRepo({ repo, dbPath });
 		expect(result.mode).toBe("bootstrapped");
 		expect((await query("SELECT event_id FROM sessions")).length).toBe(1);
 		// No commit cursor written without a HEAD to anchor it. The memory import's
@@ -432,14 +439,14 @@ describe("backfillRepo — recovery", () => {
 
 	it("skips the worktree event when the collector returns null", async () => {
 		vi.mocked(collectWorktreeEvent).mockResolvedValue(null);
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(await query("SELECT branch FROM worktree_status")).toEqual([]);
 	});
 });
 
 describe("pruneUnreachableCommits", () => {
 	it("returns 0 and writes nothing when everything is reachable", async () => {
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		const pruned = await withDashboardDb(
 			(db) => pruneUnreachableCommits(db, repo.repoIdentity, new Set(["aaa", "bbb"])),
 			{ dbPath },
@@ -448,7 +455,7 @@ describe("pruneUnreachableCommits", () => {
 	});
 
 	it("cascades: pruning a commit removes its branch links", async () => {
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		const pruned = await withDashboardDb((db) => pruneUnreachableCommits(db, repo.repoIdentity, new Set(["aaa"])), {
 			dbPath,
 		});
@@ -460,19 +467,20 @@ describe("pruneUnreachableCommits", () => {
 	});
 });
 
-describe("backfillRepos", () => {
+describe("dbBackfillRepos", () => {
 	it("continues past a repo whose backfill throws", async () => {
+		// Live path on purpose: this is the "the sweep threw" case, distinct from
+		// the "the checkout is gone" case below, which never reaches the sweep.
 		const broken: RegisteredRepo = {
 			...repo,
 			repoIdentity: "local:broken",
 			repoName: "broken",
-			worktreeRoot: "/gone",
 		};
 		vi.mocked(collectSessionEvents).mockImplementation(async (opts) => {
 			if (opts.repoIdentity === "local:broken") throw new Error("worktree deleted");
 			return [sessionEvent];
 		});
-		const results = await backfillRepos([broken, repo], { dbPath });
+		const results = await dbBackfillRepos([broken, repo], { dbPath });
 		expect(results).toHaveLength(2);
 		// `repoName` and `error` ride on every result now: a repo that failed to
 		// import used to reach the log and nothing else, so the caller had no way to
@@ -485,9 +493,45 @@ describe("backfillRepos", () => {
 		});
 		expect(results[1].mode).toBe("bootstrapped");
 	});
+
+	it("reports a repo whose every recorded checkout is gone, without sweeping it", async () => {
+		// The registry is append-only in practice, so a repo whose directory was
+		// deleted stays in it forever. Sweeping it runs git against a path that does
+		// not exist — three warnings per pass, on every `jolli dashboard` launch —
+		// and it is not a failure the caller should print as "migration failed".
+		//
+		// Reported all the same, under its own mode: the identical evidence describes
+		// an unmounted share, where the user is still expecting these memories, and
+		// the log line the sweep-suppression left behind is at `debug` — which CLI
+		// mode keeps off the terminal entirely. `unavailable` is what lets the caller
+		// say it once without calling it a failure.
+		const gone: RegisteredRepo = {
+			...repo,
+			repoIdentity: "local:gone",
+			repoName: "gone",
+			worktreeRoot: join(dir, "deleted"),
+			worktrees: [join(dir, "deleted"), join(dir, "also-deleted")],
+		};
+		const results = await dbBackfillRepos([gone, repo], { dbPath });
+		// Worked-on repos first; the untouched entries are appended.
+		expect(results.map((r) => r.repoName)).toEqual(["jolliai", "gone"]);
+		expect(results[1]).toEqual({ mode: "unavailable", eventsApplied: 0, repoName: "gone" });
+		// Not swept at all: no collector ever saw it.
+		expect(vi.mocked(collectSessionEvents).mock.calls.every((c) => c[0].repoIdentity !== "local:gone")).toBe(true);
+	});
+
+	it("counts only the surviving repos when stamping each one's place in the run", async () => {
+		// `repoTotal` follows the list that is actually swept, so a dead entry does
+		// not make the progress line count to a total it will never reach.
+		const gone: RegisteredRepo = { ...repo, repoIdentity: "local:gone2", worktreeRoot: join(dir, "deleted") };
+		const seen: number[] = [];
+		await dbBackfillRepos([gone, repo], { dbPath, onProgress: (p) => seen.push(p.repoTotal) });
+		expect(seen.length).toBeGreaterThan(0);
+		expect(seen.every((total) => total === 1)).toBe(true);
+	});
 });
 
-describe("backfillRepo — SOT import wiring (v7)", () => {
+describe("dbBackfillRepo — SOT import wiring (v7)", () => {
 	it("runs the importer for the repo and reports its row counts", async () => {
 		vi.mocked(importRepoMemory).mockResolvedValue({
 			nodes: 3,
@@ -503,7 +547,7 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 			pruned: 2,
 		});
 
-		const result = await backfillRepo({ repo, dbPath, now: () => 4242 });
+		const result = await dbBackfillRepo({ repo, dbPath, now: () => 4242 });
 
 		expect(result.sotImport).toMatchObject({ nodes: 3, docs: 4, planProgress: 1, pruned: 2 });
 		expect(importRepoMemory).toHaveBeenCalledWith(
@@ -517,12 +561,12 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 		// before it picks a mode, so a provider stub without it never reaches the
 		// importer at all.
 		const storage = { kind: "orphan-branch" as const, listFiles: async () => [] } as never;
-		await backfillRepo({ repo, dbPath, storage });
+		await dbBackfillRepo({ repo, dbPath, storage });
 		expect(importRepoMemory).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ storage }));
 	});
 
 	it("imports in seed mode while the repo has never been fenced for cutover", async () => {
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(importRepoMemory).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ mode: "seed" }));
 	});
 
@@ -536,7 +580,7 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 		const a = mkdtempSync(join(tmpdir(), "jolli-wt-a-"));
 		const b = mkdtempSync(join(tmpdir(), "jolli-wt-b-"));
 		try {
-			await backfillRepo({ repo: { ...repo, worktrees: [a, b] }, dbPath });
+			await dbBackfillRepo({ repo: { ...repo, worktrees: [a, b] }, dbPath });
 			expect(importRepoMemory).toHaveBeenCalledWith(
 				expect.anything(),
 				expect.objectContaining({ mode: "catch-up" }),
@@ -552,7 +596,7 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 		// reconciliation reading the now-frozen orphan branch would treat every
 		// one of them as "removed from the branch" and prune them right back out.
 		vi.mocked(readCutoverFence).mockResolvedValue({ reason: "cutover", at: "2026-08-06T00:00:00.000Z" });
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(importRepoMemory).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ mode: "catch-up" }));
 	});
 
@@ -562,10 +606,10 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 		// seconds of every `jolli dashboard`, on a source that has not changed a
 		// byte. The tip is a hash of that whole source, so "unchanged tip" is an
 		// exact answer, not a heuristic.
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		vi.mocked(importRepoMemory).mockClear();
 
-		const result = await backfillRepo({ repo, dbPath });
+		const result = await dbBackfillRepo({ repo, dbPath });
 
 		expect(importRepoMemory).not.toHaveBeenCalled();
 		// The count still has to be right: the caller prints it, and a zero here
@@ -574,7 +618,7 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 	});
 
 	it("re-imports once the orphan tip moves", async () => {
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		vi.mocked(importRepoMemory).mockClear();
 		vi.mocked(execGit).mockImplementation(async (args) =>
 			args[0] === "rev-parse" && args[1] === "--verify"
@@ -582,7 +626,7 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 				: { stdout: "", stderr: "", exitCode: 0 },
 		);
 
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 
 		expect(importRepoMemory).toHaveBeenCalledTimes(1);
 	});
@@ -592,11 +636,11 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 		// without the branch moving, and the two modes do not write the same rows —
 		// seed reconciles, catch-up never deletes. A tip-only cursor would skip the
 		// one pass where the difference matters.
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		vi.mocked(importRepoMemory).mockClear();
 		vi.mocked(readCutoverFence).mockResolvedValue({ reason: "cutover", at: "2026-08-06T00:00:00.000Z" });
 
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 
 		expect(importRepoMemory).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ mode: "catch-up" }));
 	});
@@ -606,7 +650,7 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 		// or half-built; a repo still marked pending has not proven its rows are
 		// there, and a wrong skip costs the repo's memories while a wrong import
 		// costs one pass.
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		await withDashboardDb(
 			(db) => {
 				db.prepare("UPDATE repos SET bootstrap_state = 'pending'").run();
@@ -615,7 +659,7 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 		);
 		vi.mocked(importRepoMemory).mockClear();
 
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 
 		expect(importRepoMemory).toHaveBeenCalledTimes(1);
 	});
@@ -639,7 +683,7 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 			};
 		});
 
-		const results = await backfillRepos([repo, other], { dbPath });
+		const results = await dbBackfillRepos([repo, other], { dbPath });
 
 		expect(results[0]).toEqual({
 			mode: "skipped",
@@ -652,7 +696,7 @@ describe("backfillRepo — SOT import wiring (v7)", () => {
 	});
 });
 
-describe("backfillRepo — summaries sweep (memory tier)", () => {
+describe("dbBackfillRepo — summaries sweep (memory tier)", () => {
 	const summaryEvent = {
 		type: "commit.summary" as const,
 		repoIdentity: repo.repoIdentity,
@@ -671,7 +715,7 @@ describe("backfillRepo — summaries sweep (memory tier)", () => {
 		vi.mocked(getIndex).mockResolvedValue({ version: 3, entries: [] });
 		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [summaryEvent], complete: true });
 
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 
 		// The enrichment copies are gone (A3b): the sweep's job is the commits
 		// row; turns/ticket/insights live on the memory tables, which the
@@ -684,11 +728,11 @@ describe("backfillRepo — summaries sweep (memory tier)", () => {
 		vi.mocked(getIndex).mockResolvedValue({ version: 3, entries: [] });
 		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [summaryEvent], complete: true });
 
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(collectSummaryEvents).toHaveBeenCalledTimes(1);
 
 		// Same index content → recovery skips the expensive summary read.
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(collectSummaryEvents).toHaveBeenCalledTimes(1);
 
 		// Index changed (new summary stored) → sweep again.
@@ -705,12 +749,12 @@ describe("backfillRepo — summaries sweep (memory tier)", () => {
 				},
 			],
 		});
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(collectSummaryEvents).toHaveBeenCalledTimes(2);
 	});
 
 	it("skips the sweep entirely when there is no summary index", async () => {
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(collectSummaryEvents).not.toHaveBeenCalled();
 	});
 
@@ -721,19 +765,19 @@ describe("backfillRepo — summaries sweep (memory tier)", () => {
 		vi.mocked(getIndex).mockResolvedValue({ version: 3, entries: [] });
 		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [summaryEvent], complete: false });
 
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(collectSummaryEvents).toHaveBeenCalledTimes(1);
 
 		// Same index content, but the cursor never moved — so the next pass
 		// re-reads instead of trusting an incomplete result.
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(collectSummaryEvents).toHaveBeenCalledTimes(2);
 
 		// A clean sweep finally parks it.
 		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [summaryEvent], complete: true });
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(collectSummaryEvents).toHaveBeenCalledTimes(3);
-		await backfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
 		expect(collectSummaryEvents).toHaveBeenCalledTimes(3);
 	});
 
@@ -745,7 +789,7 @@ describe("backfillRepo — summaries sweep (memory tier)", () => {
 		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [summaryEvent], complete: true });
 		const kinds = async (): Promise<string[]> => {
 			const seen: string[] = [];
-			await backfillRepo({
+			await dbBackfillRepo({
 				repo,
 				dbPath,
 				onProgress: (p) => {
@@ -778,7 +822,7 @@ describe("multiple checkouts of one project (§10.2)", () => {
 				},
 			]);
 
-			await backfillRepo({ repo: { ...repo, worktrees: [a, b] }, dbPath });
+			await dbBackfillRepo({ repo: { ...repo, worktrees: [a, b] }, dbPath });
 
 			const hashes = await withDashboardDb(
 				(db) =>
@@ -814,7 +858,7 @@ describe("multiple checkouts of one project (§10.2)", () => {
 				},
 			]);
 
-			await backfillRepo({ repo: { ...repo, worktrees: [a, b] }, dbPath });
+			await dbBackfillRepo({ repo: { ...repo, worktrees: [a, b] }, dbPath });
 
 			const branches = await withDashboardDb(
 				(db) =>
@@ -855,7 +899,7 @@ describe("multiple checkouts of one project (§10.2)", () => {
 				},
 			]);
 
-			await backfillRepo({ repo: { ...repo, worktrees: [a2, b2] }, dbPath });
+			await dbBackfillRepo({ repo: { ...repo, worktrees: [a2, b2] }, dbPath });
 
 			const branches = await withDashboardDb(
 				(db) =>
@@ -894,7 +938,7 @@ describe("multiple checkouts of one project (§10.2)", () => {
 					branches: ["main"],
 				},
 			]);
-			await backfillRepo({ repo: { ...repo, worktrees: [a3, b3] }, dbPath });
+			await dbBackfillRepo({ repo: { ...repo, worktrees: [a3, b3] }, dbPath });
 
 			// Pass 2: neither checkout's branch scan completed.
 			vi.mocked(collectCommitEvents).mockImplementation(async () => [
@@ -906,7 +950,7 @@ describe("multiple checkouts of one project (§10.2)", () => {
 					message: "touched, so the row is re-projected",
 				},
 			]);
-			await backfillRepo({ repo: { ...repo, worktrees: [a3, b3] }, dbPath });
+			await dbBackfillRepo({ repo: { ...repo, worktrees: [a3, b3] }, dbPath });
 
 			const branches = await withDashboardDb(
 				(db) =>
@@ -935,7 +979,7 @@ describe("multiple checkouts of one project (§10.2)", () => {
 			// keeps this assertion about the per-checkout composition, not hashing.
 			vi.mocked(execGit).mockResolvedValue({ stdout: "", stderr: "", exitCode: 1 });
 
-			await backfillRepo({ repo: { ...repo, worktrees: [a, b] }, dbPath });
+			await dbBackfillRepo({ repo: { ...repo, worktrees: [a, b] }, dbPath });
 
 			const cursor = await withDashboardDb(
 				(db) =>
@@ -962,7 +1006,7 @@ describe("multiple checkouts of one project (§10.2)", () => {
  * before it runs, because a phase that reports only on completion cannot break
  * the silence during it.
  */
-describe("backfillRepo — progress", () => {
+describe("dbBackfillRepo — progress", () => {
 	it("announces every phase before it runs, and forwards the importer's counter", async () => {
 		vi.mocked(importRepoMemory).mockImplementation(async (_db, opts) => {
 			opts.onProgress?.({ done: 1, total: 2 });
@@ -982,7 +1026,7 @@ describe("backfillRepo — progress", () => {
 			};
 		});
 		const seen: Array<{ kind: string; done: number; total?: number; detail?: string }> = [];
-		await backfillRepo({
+		await dbBackfillRepo({
 			repo,
 			dbPath,
 			onProgress: (p) =>
@@ -1017,7 +1061,7 @@ describe("backfillRepo — progress", () => {
 		const b = mkdtempSync(join(tmpdir(), "jolli-wt-b-"));
 		try {
 			const seen: string[] = [];
-			await backfillRepo({
+			await dbBackfillRepo({
 				repo: { ...repo, worktrees: [a, b] },
 				dbPath,
 				onProgress: (p) => {
@@ -1033,7 +1077,7 @@ describe("backfillRepo — progress", () => {
 
 	it("omits the checkout qualifier when there is only one", async () => {
 		const seen: Array<string | undefined> = [];
-		await backfillRepo({
+		await dbBackfillRepo({
 			repo,
 			dbPath,
 			onProgress: (p) => {
@@ -1043,10 +1087,10 @@ describe("backfillRepo — progress", () => {
 		expect(seen).toEqual([undefined]);
 	});
 
-	it("backfillRepos stamps each repo's place in the run", async () => {
+	it("dbBackfillRepos stamps each repo's place in the run", async () => {
 		const other: RegisteredRepo = { ...repo, repoIdentity: "https://example.com/other.git", repoName: "other" };
 		const seen: Array<{ repoName: string; repoIndex: number; repoTotal: number }> = [];
-		await backfillRepos([repo, other], {
+		await dbBackfillRepos([repo, other], {
 			dbPath,
 			onProgress: (p) => seen.push({ repoName: p.repoName, repoIndex: p.repoIndex, repoTotal: p.repoTotal }),
 		});
@@ -1055,7 +1099,7 @@ describe("backfillRepo — progress", () => {
 	});
 
 	it("runs unchanged when no callback is supplied", async () => {
-		const result = await backfillRepo({ repo, dbPath });
+		const result = await dbBackfillRepo({ repo, dbPath });
 		expect(result.mode).toBe("bootstrapped");
 	});
 });

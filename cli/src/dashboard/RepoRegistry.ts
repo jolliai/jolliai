@@ -81,6 +81,24 @@ export function existingWorktrees(repo: RegisteredRepo): ReadonlyArray<string> {
 }
 
 /**
+ * Whether ANY checkout of this repo still exists on disk.
+ *
+ * The companion to {@link existingWorktrees}' deliberate non-empty fallback: a
+ * caller that only wants to know "is this entry still backed by anything?"
+ * cannot read that off the returned list, because the fallback makes a repo
+ * whose every path is gone look identical to one with a single live checkout.
+ *
+ * The registry is append-only in practice — nothing prunes it, and
+ * `deregisterRepo` has to run from inside the repo it removes, which a deleted
+ * directory makes impossible — so dead entries accumulate and every sweep pays
+ * for them again. Asking this first is how a sweep tells "gone" from "broken".
+ */
+export function hasLiveWorktree(repo: RegisteredRepo): boolean {
+	const known = repo.worktrees && repo.worktrees.length > 0 ? repo.worktrees : [repo.worktreeRoot];
+	return known.some((path) => existsSync(path));
+}
+
+/**
  * The repo's cutover fence, found by asking EVERY surviving checkout — plus the
  * root it was found in, which is the only one whose orphan branch is the frozen
  * one.

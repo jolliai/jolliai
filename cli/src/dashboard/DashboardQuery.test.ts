@@ -968,6 +968,83 @@ describe("buildDashboardModel — tool usage", () => {
 		expect(result?.sessionsInWindow).toBe(2);
 	});
 
+	it("counts a session whose CALL is in the window but whose own time is not", async () => {
+		// The ranked rows are windowed by call time; the coverage denominator is
+		// windowed by the session's own. A long-running session that last updated
+		// weeks ago but called a tool an hour ago is in one and not the other, so
+		// the page printed "1 session" for the tool directly above "from 0 of 0
+		// sessions in this window".
+		await applySummaryEvents(
+			[
+				repoEvent,
+				{
+					producerKind: "cli",
+					event: {
+						type: "session.upserted",
+						repoIdentity: "repo-1",
+						source: "claude",
+						sessionId: "long-running",
+						updatedAtMs: nowMs - 90 * 86_400_000,
+						tools: [{ name: "code-review", kind: "skill", calls: 4, lastCallAtMs: nowMs - 3_600_000 }],
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const result = await usage();
+		expect(result?.skills).toEqual([{ name: "code-review", kind: "skill", sessions: 1, calls: 4 }]);
+		expect(result?.sessionsInWindow).toBe(1);
+		expect(result?.sessionsWithTools).toBe(1);
+	});
+
+	it("does not count a session whose own time is in the window but whose calls are not", async () => {
+		// The mirror of the case above, and the other way the caveat can contradict
+		// the table it sits under. A session touched an hour ago whose only tool call
+		// was four months back is in the denominator (its own clock puts it here) but
+		// its call is in no ranked row — both rankings window by call time. Counting
+		// it as "with tools" printed "1 of 1 sessions" above an empty table.
+		await applySummaryEvents(
+			[
+				repoEvent,
+				{
+					producerKind: "cli",
+					event: {
+						type: "session.upserted",
+						repoIdentity: "repo-1",
+						source: "claude",
+						sessionId: "touched-today",
+						updatedAtMs: nowMs - 3_600_000,
+						tools: [{ name: "old-skill", kind: "skill", calls: 2, lastCallAtMs: nowMs - 120 * 86_400_000 }],
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const result = await usage();
+		expect(result?.skills).toEqual([]);
+		expect(result?.sessionsInWindow).toBe(1);
+		expect(result?.sessionsWithTools).toBe(0);
+	});
+
+	it("treats a stored 0 as no time at all, falling back to the session's own", async () => {
+		// 0 is the one value a bare COALESCE cannot survive: it is not NULL, so the
+		// row resolves to epoch 0 and leaves every window — while meaning exactly
+		// what NULL means, "this parser could not stamp a time". Neither writer can
+		// store one (both wrap their MAX in NULLIF), so the row below is written by
+		// hand: the point of handling it at the READ is that it also covers a writer
+		// that does not yet exist, which the migration this replaced could not.
+		await applySummaryEvents([repoEvent, sessionWith("zeroed", [{ name: "Bash", kind: "builtin", calls: 3 }])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		await withDashboardDb((db) => db.exec("UPDATE session_tool_use SET last_call_at_ms = 0"), { dbPath });
+
+		const result = await usage();
+		// Windowed by the session's `updated_at_ms` (an hour ago), not by epoch 0.
+		expect(result?.sessionsInWindow).toBe(1);
+		expect(result?.sessionsWithTools).toBe(1);
+	});
+
 	it("is empty, not absent, when nothing recorded a tool call", async () => {
 		await applySummaryEvents([repoEvent, sessionWith("s1", undefined, "codex")], { producerKind: "cli", dbPath });
 		expect(await usage()).toMatchObject({
@@ -1362,6 +1439,29 @@ describe("buildDashboardModel — recall usage", () => {
 				tools: tools.map((t) => ({ ...t, calls: 1 })),
 			},
 		}) as StatsEventEnvelope;
+
+	it("ranks the Skills panel by the call's own time too, matching the Recall card", async () => {
+		// Same rows, same table, two panels: a bucket that lands in the window for
+		// one and outside it for the other is a contradiction with no resolution
+		// available to the reader.
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWithRecallTools(
+					"fresh-call",
+					[{ name: "jolli-recall", kind: "skill", lastCallAtMs: nowMs - 3_600_000 }],
+					Date.parse("2026-05-01T00:00:00Z"),
+				),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		expect(model.stats?.toolUsage.skills).toEqual([{ name: "jolli-recall", kind: "skill", sessions: 1, calls: 1 }]);
+		expect(model.stats?.recallUsage.skillInvocations).toBe(1);
+	});
 
 	it("windows a tool row by the CALL's own time, not by its session's", async () => {
 		// The defect this column exists for: a session updated inside the window

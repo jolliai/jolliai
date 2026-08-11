@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readRepoProfile, updateRepoProfile } from "../core/RepoProfile.js";
 import { ORPHAN_BRANCH } from "../Logger.js";
+import { type RestoreHome, setIsolatedHome } from "../testUtils/isolatedHome.js";
 import { AUTO_CUTOVER_RETRY_MS, maybeAutoCutover } from "./AutoCutover.js";
 import { resolveCutoverRoute } from "./CutoverRouter.js";
 import { registerRepo } from "./RepoRegistry.js";
@@ -19,7 +20,7 @@ import { registerRepo } from "./RepoRegistry.js";
 let dir: string;
 let cwd: string;
 let dbPath: string;
-let realHome: string | undefined;
+let restoreHome: RestoreHome;
 
 const HASH = "a".repeat(40);
 
@@ -54,10 +55,11 @@ async function writeOrphanSummary(hash: string): Promise<void> {
 
 beforeEach(async () => {
 	dir = mkdtempSync(join(tmpdir(), "jolli-autocut-"));
+	// Isolated HOME: `registerRepo` below writes the machine-global registry.
+	// The helper also covers Windows, where `os.homedir()` ignores `HOME`.
 	const home = join(dir, "home");
 	mkdirSync(home, { recursive: true });
-	realHome = process.env.HOME;
-	process.env.HOME = home;
+	restoreHome = setIsolatedHome(home);
 	cwd = join(dir, "repo");
 	mkdirSync(cwd, { recursive: true });
 	execSync("git init -q", { cwd });
@@ -68,7 +70,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-	process.env.HOME = realHome;
+	restoreHome();
 	rmSync(dir, { recursive: true, force: true });
 });
 

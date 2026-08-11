@@ -346,7 +346,7 @@ describe("write-ahead log", () => {
 	});
 
 	it("reports the rows the claim LIMIT never reached as pending", async () => {
-		// `Backfill.applyBatches` refuses to advance the summaries cursor while
+		// `DbBackfill.applyBatches` refuses to advance the summaries cursor while
 		// anything is unprojected, so `pending` has to mean exactly that. The
 		// tally it replaces counted only future-schema rows plus this pass's own
 		// failures — so a first tick with more sessions than one batch reported a
@@ -373,7 +373,7 @@ describe("write-ahead log", () => {
 
 	it("scopes pending to the repos the caller is reporting on", async () => {
 		// `events_raw` is machine-global but the caller's gate is per-repo:
-		// `Backfill` asks "may I advance repo-1's summaries cursor?". Counting
+		// `DbBackfill` asks "may I advance repo-1's summaries cursor?". Counting
 		// another repo's in-flight rows answers a question nobody asked and holds
 		// repo-1 back for a reason repo-1 cannot act on. Unlike the future-schema
 		// case this one is self-healing, so it is scoped rather than an error.
@@ -589,7 +589,7 @@ describe("write-ahead log", () => {
 		const result = await withDashboardDb((db) => drainPending(db), { dbPath });
 		expect(result.projected).toBe(1);
 		// Reported as a CLEAR backlog even though 600 rows are still pending in the
-		// table. `pending` gates `Backfill`'s summaries cursor, and a future-schema
+		// table. `pending` gates `DbBackfill`'s summaries cursor, and a future-schema
 		// row can never be claimed by this build — `attempts` stays 0, so it never
 		// ages out either. Counting it stalls that cursor permanently, for every
 		// repo, and each pass then re-collects the whole index. The rows staying

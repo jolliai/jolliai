@@ -1630,8 +1630,8 @@ describe("PostCommitHook helpers", () => {
 	});
 
 	describe("buildStoredTranscript", () => {
-		it("falls back to the session transcript path when the session metadata is missing", () => {
-			const stored = __test__.buildStoredTranscript([
+		it("falls back to the session transcript path when the session metadata is missing", async () => {
+			const stored = await __test__.buildStoredTranscript([
 				{
 					sessionId: "sess-1",
 					transcriptPath: "/tmp/from-transcript.jsonl",

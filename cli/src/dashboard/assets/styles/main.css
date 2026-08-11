@@ -241,8 +241,6 @@ body {
 
   .machines-chip { display: none; font-size: 12px; color: var(--ink-2); border: 1px dashed var(--border); border-radius: 999px; padding: 4px 10px; }
   .jd[data-tier="2"] .machines-chip { display: inline-block; }
-  .local-chip { font-size: 12px; color: var(--ink-2); border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; }
-  .jd[data-tier="2"] .local-chip { display: none; }
 
   /* ---------- sidebar ---------- */
   .sidebar {

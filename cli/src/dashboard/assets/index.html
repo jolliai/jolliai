@@ -13,8 +13,8 @@
   repo pill and time-range control, and one `.wrap` per view.
 
   `data-tier` on `.jd` is load-bearing, not decorative — the stylesheet keys the
-  local/synced chips and the locked-preview treatments off it, so the shell
-  reflects the adoption tier without any JS branching in the page modules.
+  synced chip and the locked-preview treatments off it, so the shell reflects the
+  adoption tier without any JS branching in the page modules.
 -->
 <div class="jd" data-tier="0" id="jdRoot">
 	<aside class="sidebar" aria-label="Jolli local web server">
@@ -47,7 +47,6 @@
 					<div><button type="button" class="cta ghost sm" id="rangeCancel">Cancel</button><button type="submit" class="cta sm">Apply</button></div>
 				</div>
 			</form>
-			<span class="local-chip" id="localChip">Runs locally. Nothing leaves this machine.</span>
 			<span class="machines-chip" id="machinesChip">⟳ synced</span>
 			<div class="spacer"></div>
 		</header>

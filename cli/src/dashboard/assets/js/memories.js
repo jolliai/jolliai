@@ -370,7 +370,19 @@ window.JD = window.JD || {};
 		var body = rows(
 			detail.conversations,
 			(c) =>
-				'<div class="gd-row"><span class="mem-row-icon">' +
+				/* The session id is this row's tooltip, and that is what it is in the
+				   payload FOR — see MemoryConversationRow. Two conversations from the
+				   same source render identically otherwise (same glyph, same `claude`
+				   meta, and titles that a first-user-message fallback can make near
+				   duplicates), so a memory fed by three Claude sessions gave the user no
+				   way to tell which row is which, nor to match one against
+				   `sessions.json` or a log line. The whole attribute is omitted rather
+				   than filled with a placeholder when the archive carries no id: an
+				   absent tooltip says nothing, where `Session unknown` says something
+				   false about the session. */
+				'<div class="gd-row"' +
+				(c.sessionId ? ' title="Session ' + esc(c.sessionId) + '"' : "") +
+				'><span class="mem-row-icon">' +
 				memoryIcon("message") +
 				'</span><span class="mem-row-title">' +
 				esc(c.title || "(untitled)") +
@@ -425,6 +437,11 @@ window.JD = window.JD || {};
 		var rows = detail.context.map((c) => {
 			var meta = contextKindMeta(c.kind);
 			var openable = !!c.contextKey;
+			/* Scheme-checked, not just escaped: the url is a third party's string
+			   carried in from an archived MCP reference, and an unnavigable one
+			   renders as no link at all rather than as a dead glyph. Already
+			   escaped for an attribute — interpolated raw below, never via `esc`. */
+			var href = JD.safeHrefAttr(c.url);
 			return (
 				'<div class="gd-row' +
 				(openable ? " gd-row-open" : "") +
@@ -444,9 +461,9 @@ window.JD = window.JD || {};
 				esc(c.title) +
 				"</span>" +
 				(c.meta ? '<span class="mem-row-meta mem-ctx-sub">' + esc(c.meta) + "</span>" : "") +
-				(c.url
+				(href
 					? '<a class="mem-ctx-link" href="' +
-						esc(c.url) +
+						href +
 						'" target="_blank" rel="noreferrer noopener" title="Open upstream">' +
 						memoryIcon("link") +
 						"</a>"
@@ -721,14 +738,24 @@ window.JD = window.JD || {};
 		document.querySelectorAll("[data-context-key]").forEach((row) => {
 			var open = () =>
 				openContextDialog(detail, row.getAttribute("data-context-kind"), row.getAttribute("data-context-key"));
+			/* The upstream-link glyph is a real navigation nested inside a row that
+			   is itself a button; without this, activating it would ALSO open the
+			   archived snapshot behind the new tab. Both handlers need the exemption,
+			   but the keyboard one only for ENTER: that is an <a>'s own activation
+			   key, and this row's `preventDefault()` would cancel the navigation and
+			   show the dialog instead — the keyboard path is the one that has no
+			   other way in.
+			   SPACE is deliberately NOT exempted. It does not activate a link at all
+			   (the browser scrolls the page), so exempting it traded a working
+			   affordance for nothing: with the glyph focused, Space opened the dialog
+			   before and would do neither afterwards. */
+			var fromLink = (e) => !!(e && e.target && e.target.closest && e.target.closest(".mem-ctx-link"));
 			row.onclick = (e) => {
-				/* The upstream-link glyph is a real navigation nested inside a row that
-				   is itself a button; without this, clicking it would ALSO open the
-				   archived snapshot behind the new tab. */
-				if (e && e.target && e.target.closest && e.target.closest(".mem-ctx-link")) return;
+				if (fromLink(e)) return;
 				open();
 			};
 			row.onkeydown = (e) => {
+				if (fromLink(e) && e.key === "Enter") return;
 				if (e.key === "Enter" || e.key === " ") {
 					e.preventDefault();
 					open();

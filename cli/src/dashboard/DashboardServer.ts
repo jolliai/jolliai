@@ -25,7 +25,7 @@
  * Both halves of the no-daemon backup schedule now live in processes that
  * already write: `executeDashboard` and the post-commit `QueueWorker`.
  *
- * Backfill is deliberately NOT part of that write surface. Generating memories
+ * DbBackfill is deliberately NOT part of that write surface. Generating memories
  * for existing commits is an explicit CLI action (`jolli backfill`), and the
  * import sweep that fills the database from summaries already written is
  * `jolli dashboard`'s own startup step, run in the command process. A second
@@ -86,7 +86,6 @@ import { trackAs } from "../core/Telemetry.js";
 import { isTelemetryEventName, type TelemetryEventName } from "../core/TelemetryEvents.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
-import { projectRepoRegistryState } from "./Backfill.js";
 import { BrowseError, browseDirectory, defaultBrowsePath } from "./Browse.js";
 import {
 	DASHBOARD_SCHEMA_VERSION,
@@ -104,6 +103,7 @@ import {
 	type SeriesDimension,
 } from "./DashboardModel.js";
 import { buildDashboardModel, type QueryOptions } from "./DashboardQuery.js";
+import { projectRepoRegistryState } from "./DbBackfill.js";
 import { getDecisionGist } from "./DecisionGist.js";
 import { buildMemoriesPage, type ReachableCommits, readContextDoc } from "./MemoriesQuery.js";
 import { probeRepo } from "./RepoProbe.js";
@@ -315,6 +315,21 @@ export type ModelBuilder = (request: ModelRequest) => Promise<DashboardModel>;
 const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>(["stats", "memories", "repositories"]);
 
 /**
+ * How long one worktree's git identity is trusted. Minutes, not hours: the value
+ * only changes when the user reconfigures git, and a stale identity shows the
+ * wrong person's commits as their own.
+ */
+const IDENTITY_CACHE_TTL_MS = 5 * 60_000;
+
+/**
+ * Per-worktree git identity, remembered for the life of ONE server (created in
+ * `createDashboardServer`, never module-global). Process-scoped state is what a
+ * cache of a machine-local git config should be, and it also keeps a test's
+ * observations of the git calls from depending on what an earlier test cached.
+ */
+type IdentityCache = Map<string, { identity: { email: string | null; name: string | null }; atMs: number }>;
+
+/**
  * Every `user.email` / `user.name` this machine commits under, unioned across
  * the registered repos — the standup board's "mine only" filter.
  *
@@ -326,18 +341,36 @@ const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>(["
  * costs a correlated filter to separate identities that belong to one person
  * anyway.
  *
- * Concurrent, two `git config` reads per repo, and only for the standup view.
+ * Concurrent, two `git config` reads per repo, and only for the standup view —
+ * and each worktree's answer is then cached for {@link IDENTITY_CACHE_TTL_MS}.
+ * The page re-polls `/api/model` every 30 s for as long as it is open, so an
+ * uncached read means two subprocesses per repo forever, to re-learn a value
+ * that changes when the user edits `.git/config` by hand. The TTL, rather than a
+ * permanent memo, is what lets such an edit take effect without a restart.
+ *
  * An unreadable or unconfigured repo contributes nothing rather than failing the
- * request: `authorFilter` then fails open on an empty identity.
+ * request: `authorFilter` then fails open on an empty identity. Those are cached
+ * too — a repo with no `user.email` would otherwise pay the subprocesses on
+ * every poll precisely because it has nothing to remember.
  */
 async function readLocalAuthorIdentity(
 	repos: ReadonlyArray<{ worktree_root: string }>,
+	cache: IdentityCache,
+	now: () => number,
 ): Promise<{ emails: string[]; names: string[] }> {
+	const nowMs = now();
 	const identities = await Promise.all(
 		// An empty `worktree_root` is a placeholder row (see readReachableCommitsByRepo):
 		// `cwd: ''` silently runs in the PARENT process's directory, which would read
 		// whichever repo the server happens to be launched from.
-		repos.map(async (repo) => (repo.worktree_root ? readLocalGitIdentity(repo.worktree_root) : null)),
+		repos.map(async (repo) => {
+			if (!repo.worktree_root) return null;
+			const hit = cache.get(repo.worktree_root);
+			if (hit && nowMs - hit.atMs < IDENTITY_CACHE_TTL_MS) return hit.identity;
+			const identity = await readLocalGitIdentity(repo.worktree_root);
+			cache.set(repo.worktree_root, { identity, atMs: nowMs });
+			return identity;
+		}),
 	);
 	const emails = new Set<string>();
 	const names = new Set<string>();
@@ -383,6 +416,8 @@ async function defaultModelBuilder(
 	request: ModelRequest,
 	configDir: string | undefined,
 	dbPath: string | undefined,
+	identityCache: IdentityCache,
+	now: () => number,
 ): Promise<DashboardModel> {
 	// The launcher creates the file before this process starts, so this only
 	// covers the case where it disappears under a running server (a wiped
@@ -425,15 +460,17 @@ async function defaultModelBuilder(
 							db
 								.prepare("SELECT worktree_root FROM repos WHERE disabled_at IS NULL")
 								.all() as ReadonlyArray<{ worktree_root: string }>,
+							identityCache,
+							now,
 						)
 					: undefined;
-			const model = buildDashboardModel(db, {
+			const built = buildDashboardModel(db, {
 				...request,
 				...(repositories ? { repositoriesModel: repositories } : {}),
 				...(reachableCommits ? { reachableCommits } : {}),
 				...(authorIdentity ? { authorIdentity } : {}),
 			});
-			return attachDecisionGist(model, request, configDir);
+			return attachDecisionGist(built, request, configDir);
 		},
 		{ dbPath },
 	);
@@ -768,8 +805,11 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	/** The idle poll, armed on `listening` and cleared on `close`. See `armIdlePoll`. */
 	let idlePoll: ReturnType<typeof setInterval> | undefined;
 	let boundPort = options.port;
+	/** Lives as long as this server; see {@link IdentityCache}. */
+	const identityCache: IdentityCache = new Map();
 	const buildModel =
-		options.buildModel ?? ((request: ModelRequest) => defaultModelBuilder(request, configDir, options.dbPath));
+		options.buildModel ??
+		((request: ModelRequest) => defaultModelBuilder(request, configDir, options.dbPath, identityCache, now));
 
 	const server = createServer(async (req, res) => {
 		lastRequestMs = now();

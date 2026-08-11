@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { JolliMemoryConfig } from "../Types.js";
+import { setIsolatedHome } from "../testUtils/isolatedHome.js";
 import { formatUtcStamp, maybeSnapshot } from "./Backup.js";
 import { withDashboardDb } from "./DashboardDb.js";
 import { fillMemoriesFromMirrors, restoreFromSnapshot, surveyRecovery } from "./Recovery.js";
@@ -76,8 +77,7 @@ describe("surveyRecovery", () => {
 		// not whatever the real machine has stamped.
 		const fakeHome = join(dir, "home");
 		mkdirSync(fakeHome, { recursive: true });
-		const realHome = process.env.HOME;
-		process.env.HOME = fakeHome;
+		const restoreHome = setIsolatedHome(fakeHome);
 		let survey: Awaited<ReturnType<typeof surveyRecovery>>;
 		try {
 			// No configured backupFolder first: the default under HOME is scanned.
@@ -85,7 +85,7 @@ describe("surveyRecovery", () => {
 			expect(bare.candidates).toEqual([]);
 			survey = await surveyRecovery({ dbPath, config: cfg() });
 		} finally {
-			process.env.HOME = realHome;
+			restoreHome();
 		}
 		expect(survey.fileState).toBe("absent");
 		// No registry/mirror stamps in this fixture: a fresh install.
@@ -120,8 +120,7 @@ describe("fillMemoriesFromMirrors", () => {
 				"\t",
 			),
 		);
-		const realHome = process.env.HOME;
-		process.env.HOME = home;
+		const restoreHome = setIsolatedHome(home);
 		try {
 			const { mkdir, writeFile } = await import("node:fs/promises");
 			await mkdir(join(home, ".jolli", "jollimemory"), { recursive: true });
@@ -161,7 +160,7 @@ describe("fillMemoriesFromMirrors", () => {
 			);
 			expect(repos).toBe(2);
 		} finally {
-			process.env.HOME = realHome;
+			restoreHome();
 		}
 	});
 });
@@ -202,8 +201,7 @@ describe("fillMemoriesFromFrozenOrphans", () => {
 			],
 			"add",
 		);
-		const realHome = process.env.HOME;
-		process.env.HOME = home;
+		const restoreHome = setIsolatedHome(home);
 		try {
 			const { registerRepo } = await import("./RepoRegistry.js");
 			await registerRepo({ cwd: repoDir, now: () => new Date(0) });
@@ -228,7 +226,7 @@ describe("fillMemoriesFromFrozenOrphans", () => {
 			);
 			expect(rows).toEqual([{ commit_message: "frozen memory" }]);
 		} finally {
-			process.env.HOME = realHome;
+			restoreHome();
 		}
 	});
 
@@ -246,8 +244,7 @@ describe("fillMemoriesFromFrozenOrphans", () => {
 		execSync("git commit -q --allow-empty -m init", { cwd: repoDir });
 		const { OrphanBranchStorage } = await import("../core/OrphanBranchStorage.js");
 		await new OrphanBranchStorage(repoDir).ensure();
-		const realHome = process.env.HOME;
-		process.env.HOME = home;
+		const restoreHome = setIsolatedHome(home);
 		try {
 			const { registerRepo } = await import("./RepoRegistry.js");
 			await registerRepo({ cwd: repoDir, now: () => new Date(0) });
@@ -264,7 +261,7 @@ describe("fillMemoriesFromFrozenOrphans", () => {
 		} finally {
 			vi.doUnmock("./SotImport.js");
 			vi.resetModules();
-			process.env.HOME = realHome;
+			restoreHome();
 		}
 	});
 });

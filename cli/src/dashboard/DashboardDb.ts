@@ -48,10 +48,26 @@ const log = createLogger("DashboardDb");
  * able to `SELECT` the columns it knows about after a newer build has migrated
  * up.
  *
- * It is 4. Entry 0 is the whole schema as it first landed; entry 1 adds
- * `recall_receipts`; entry 2 registers `skill` as the fourth `context` kind;
- * entry 3 adds `events_raw.failed_kind` so an event parked by an older build
- * that did not know its type can be un-parked by one that does.
+ * It is 5, one per entry in {@link MIGRATIONS}. Entry 0 is the whole schema as
+ * it first landed; entry 1 adds `recall_receipts`; entry 2 registers `skill` as
+ * the fourth `context` kind; entry 3 adds `events_raw.failed_kind` so an event
+ * parked by an older build that did not know its type can be un-parked by one
+ * that does; entry 4 adds `session_tool_use.last_call_at_ms`.
+ *
+ * Bumping this is a CROSS-SURFACE event, not a local edit — that is the reason
+ * the number is worth stating here rather than left to be read off the array.
+ * Every surface that opens this database refuses one stamped ahead of its own
+ * build ({@link DashboardSchemaAheadError}, `CutoverRouter`'s `unavailable`, the
+ * server's skipped registry projection), so the first surface to migrate locks
+ * every older one out of the machine-global file until it is upgraded too. The
+ * cost is paid per bump, not per entry: an entry that rides an already-planned
+ * bump is free, and one that forces its own has to be worth a forced upgrade on
+ * its own. A sixth entry — one `UPDATE` normalising a value the writers can no
+ * longer produce — was added and then taken back out for exactly that test; see
+ * the note where it used to live in `SotSchema.ts`, and prefer a defensive READ
+ * over a migration whenever the choice exists (a read is permanent, a migration
+ * runs once).
+ *
  * Nothing has shipped yet, so entry 0 could in principle
  * have absorbed the new table — it deliberately does not, because dev
  * databases (including the one every developer on this repo is using) are
@@ -210,6 +226,12 @@ export const BUSY_TIMEOUT_BY_ROLE: Readonly<Record<string, number>> = {
  * backfilled (the transcripts they were read from may be gone), so they keep
  * being read under the old session-time fallback rather than dropping out of
  * every window for want of a value.
+ *
+ * There is no entry normalising a stored `0` in that column, and that absence is
+ * a decision: the writers cannot produce one, and the reader treats one as
+ * absent (`TOOL_CALL_TIME_SQL`'s `NULLIF`), which is both permanent and free
+ * where a sixth entry would have been neither. See the note in `SotSchema.ts`
+ * where that entry used to be.
  *
  * Exported for tests: they execute entries directly to build a database at a
  * chosen version rather than hand-rolling copies of the DDL, which would drift.
@@ -423,8 +445,8 @@ async function openDb(readOnly: boolean, opts: OpenDashboardDbOptions): Promise<
  *
  * Keep `fn` short. It holds a connection that may take SQLite's single writer
  * lock, and every other producer on the machine — hooks, the extension host,
- * `jolli enable` — is contending for it. Backfill opens one handle per repo
- * and runs many short transactions inside it (see `Backfill.applyBatches`) —
+ * `jolli enable` — is contending for it. DbBackfill opens one handle per repo
+ * and runs many short transactions inside it (see `DbBackfill.applyBatches`) —
  * the lock is held per-transaction, not for the whole callback.
  */
 export async function withDashboardDb<T>(
@@ -452,7 +474,7 @@ export async function withDashboardDb<T>(
  *
  * Exists because "no writer has run yet" is a REACHABLE first-run state, not a
  * theoretical one: a `jolli dashboard` in a directory with nothing registered
- * never opens a writable handle anywhere (`backfillRepos([])` returns without
+ * never opens a writable handle anywhere (`dbBackfillRepos([])` returns without
  * touching the file), so every read-only open below fails and the whole
  * dashboard answers 500. A reader cannot fix that for itself — `readOnly:
  * true` is exactly the mode that must not create a schema — so the one caller

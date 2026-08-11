@@ -79,7 +79,7 @@ const BRANCH_NAME_ALLOWLIST: ReadonlyMap<string, string> = new Map([
 	["cli/src/dashboard/CutoverEngine.ts", "the cutover machinery: tips, fence, CAS"],
 	["cli/src/dashboard/SotImport.ts", "the orphan → SQLite importer"],
 	["cli/src/dashboard/Recovery.ts", "reads the fenced root's tip"],
-	["cli/src/dashboard/Backfill.ts", "reads the orphan tip"],
+	["cli/src/dashboard/DbBackfill.ts", "reads the orphan tip"],
 	["cli/src/backfill/CommitTargetIndex.ts", "`--not` excludes the summaries branch's own commits; unrelated to SoT"],
 	["cli/src/core/SchemaV5Migration.ts", "captures the rollback SHA only while the branch IS the system of record"],
 	["cli/src/core/SummaryMigration.ts", "the v1-era raw branch writes, refused by route on any non-uncutover repo"],

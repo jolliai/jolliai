@@ -498,6 +498,20 @@ describe("GitOps", () => {
 			expect(info.date).toBe("2026-02-19T10:00:00+08:00");
 		});
 
+		it("should parse the author email when git reports one", async () => {
+			mockSuccess("abc123\x00Fix\x00John Doe\x002026-02-19T10:00:00+08:00\x00john@example.com");
+
+			expect((await getCommitInfo("abc123")).authorEmail).toBe("john@example.com");
+		});
+
+		// The field is appended last precisely so a 4-field line stays valid — the
+		// dashboard's author filter then falls back to matching on the name.
+		it("should omit the author email when the line carries none", async () => {
+			mockSuccess("abc123\x00Fix\x00John Doe\x002026-02-19T10:00:00+08:00");
+
+			expect((await getCommitInfo("abc123")).authorEmail).toBeUndefined();
+		});
+
 		it("should pass the given hash as an argument to git log", async () => {
 			mockSuccess("abc123def456\x00Fix bug\x00John\x002026-02-19T10:00:00+08:00");
 

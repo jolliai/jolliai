@@ -1685,6 +1685,15 @@ export class SidebarWebviewProvider
 							transcriptPath: session.transcriptPath ?? "",
 							updatedAt: "",
 							source: session.source,
+							// The title the archive recorded at commit time, fed in as the
+							// resolver's own step 1 rather than as a new branch here. When
+							// present it wins, which is what makes this panel and the
+							// dashboard show one string instead of two independently
+							// re-derived ones — and it is the only answer that survives the
+							// live transcript being pruned, or this memory arriving on a
+							// machine that never had the session. Absent on memories written
+							// before the field existed, where the ladder runs exactly as before.
+							...(session.title ? { title: session.title } : {}),
 						},
 						// readArchivedSessions always returns sessions with `entries` set
 						// to an array (`{ ...base, entries: sorted.flat() }`), so the `?? []`

@@ -173,6 +173,25 @@ vi.mock("node:fs", async (importOriginal) => {
 	};
 });
 
+// The archive writer resolves each session's title, which streams the live
+// transcript. This whole describe runs on `vi.useFakeTimers()`, and a readline
+// stream's callbacks never fire under a fake clock — the test hangs to its
+// timeout rather than failing. Only the title path is faked; what these tests
+// are about is what gets persisted, and `resolveArchivedTitle`'s own behaviour
+// is covered against a real filesystem in QueueWorker.test.ts.
+vi.mock("../core/SessionTitleResolver.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/SessionTitleResolver.js")>();
+	return {
+		...actual,
+		// Mirrors the real answer for an absent transcript: the archived slice's
+		// first human turn, or undefined when it has none.
+		resolveArchivedTitle: vi.fn(async (session: { entries: ReadonlyArray<{ role: string; content: string }> }) => {
+			const first = session.entries.find((e) => e.role === "human" && e.content.trim().length > 0);
+			return first?.content;
+		}),
+	};
+});
+
 vi.mock("../core/CodexSessionDiscoverer.js", () => ({
 	discoverCodexSessions: vi.fn().mockResolvedValue([]),
 	isCodexInstalled: vi.fn().mockResolvedValue(true),

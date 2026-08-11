@@ -68,6 +68,8 @@ interface SeedMemoryOptions {
 		steps: ReadonlyArray<string>;
 		expectedResults: ReadonlyArray<string>;
 	}>;
+	/** v5 `summary.transcripts` — the id ORDER the conversation list is built in. */
+	readonly transcripts?: ReadonlyArray<string>;
 }
 
 /** Seeds one `memories` row (+ its `memory_topics`) with a hand-built summary payload. */
@@ -103,6 +105,7 @@ async function seedMemory(
 				...(opts.excludedContext ? { excludedContext: opts.excludedContext } : {}),
 				...(opts.e2eTestGuide ? { e2eTestGuide: opts.e2eTestGuide } : {}),
 				...(opts.jolliDocId != null ? { jolliDocId: opts.jolliDocId } : {}),
+				...(opts.transcripts ? { transcripts: opts.transcripts } : {}),
 				diffStats: { filesChanged: 2, insertions: 10, deletions: 3 },
 			};
 			db.prepare(
@@ -163,6 +166,8 @@ async function seedLinkedSession(
 		readonly source: string;
 		readonly sessionId: string;
 		readonly title: string;
+		/** `StoredSession.title` — the title the ARCHIVE recorded, absent on older memories. */
+		readonly archivedTitle?: string;
 		readonly messageCount: number;
 		readonly tools?: ReadonlyArray<{
 			toolName: string;
@@ -214,6 +219,7 @@ async function seedLinkedSession(
 								{
 									sessionId: opts.sessionId,
 									source: opts.source,
+									...(opts.archivedTitle ? { title: opts.archivedTitle } : {}),
 									entries: sliceHash === hash ? entries : [],
 								},
 							],
@@ -572,8 +578,16 @@ describe("MemoriesQuery", () => {
 			});
 
 			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			// Exactly four fields: this row is serialized into the page, so anything
+			// server-side on it would be in the payload. `toEqual` (not
+			// `objectContaining`) is what pins that.
 			expect(detail?.conversations).toEqual([
-				{ source: "claude", title: "Building the rate limiter", messageCount: 12 },
+				{
+					source: "claude",
+					title: "Building the rate limiter",
+					messageCount: 12,
+					sessionId: "s1",
+				},
 			]);
 			expect(detail?.activity).toEqual(
 				expect.arrayContaining([
@@ -582,6 +596,100 @@ describe("MemoriesQuery", () => {
 				]),
 			);
 			expect(detail?.activityUncoveredSources).toEqual([]);
+		});
+
+		it("orders conversations by the summary's transcripts[], not by query order", async () => {
+			// The editor builds its list from `summary.transcripts`, so the two surfaces
+			// disagreed on ORDER whenever SQLite handed the blobs back differently.
+			// Seeded s1 first, then s2, and named in the opposite order.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x", {
+				transcripts: [`${hash}-s2`, `${hash}-s1`],
+			});
+			await seedLinkedSession(dbPath, "repo-1", hash, {
+				source: "claude",
+				sessionId: "s1",
+				title: "first seeded",
+				messageCount: 1,
+			});
+			await seedLinkedSession(dbPath, "repo-1", hash, {
+				source: "claude",
+				sessionId: "s2",
+				title: "second seeded",
+				messageCount: 1,
+			});
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(detail?.conversations.map((c) => c.sessionId)).toEqual(["s2", "s1"]);
+		});
+
+		it("keeps an unnamed transcript behind the named ones, in query order", async () => {
+			// An id the summary does not name scores `rank.size`, and the sort is stable
+			// — so it lands after everything named without disturbing its neighbours.
+			// This is the pre-v5 / partially-listed case, not a corrupt one.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "b".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: y", { transcripts: [`${hash}-s3`] });
+			for (const id of ["s1", "s2", "s3"]) {
+				await seedLinkedSession(dbPath, "repo-1", hash, {
+					source: "claude",
+					sessionId: id,
+					title: id,
+					messageCount: 1,
+				});
+			}
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(detail?.conversations.map((c) => c.sessionId)).toEqual(["s3", "s1", "s2"]);
+		});
+
+		it("prefers the title the ARCHIVE recorded over the live sessions row", async () => {
+			// The archived string is the full title ladder's answer as of this commit,
+			// resolved while the transcript was still readable. The `sessions` row is a
+			// different moment (whenever that session was last collected) and, for an
+			// old memory or one that arrived on another machine, does not exist at all.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x");
+			await seedLinkedSession(dbPath, "repo-1", hash, {
+				source: "claude",
+				sessionId: "s1",
+				title: "collected later, after the session moved on",
+				archivedTitle: "Add the rate limiter",
+				messageCount: 3,
+			});
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(detail?.conversations[0]?.title).toBe("Add the rate limiter");
+		});
+
+		it("falls back to the live row, then the archived first message, for a memory with no archived title", async () => {
+			// Forward-only: every memory written before the field existed lands here,
+			// and must read exactly as it did before.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const withRow = "a".repeat(40);
+			const withoutRow = "b".repeat(40);
+			await seedMemory(dbPath, "repo-1", withRow, "feat: x");
+			await seedMemory(dbPath, "repo-1", withoutRow, "feat: y");
+			await seedLinkedSession(dbPath, "repo-1", withRow, {
+				source: "claude",
+				sessionId: "s1",
+				title: "from the sessions row",
+				messageCount: 2,
+			});
+			await seedLinkedSession(dbPath, "repo-1", withoutRow, {
+				source: "claude",
+				sessionId: "s2",
+				title: "",
+				messageCount: 1,
+				entries: [{ role: "human", content: "restart the web backend" }],
+			});
+
+			const a = await withDashboardDb((db) => buildMemoryDetail(db, ALL, withRow), { dbPath });
+			const b = await withDashboardDb((db) => buildMemoryDetail(db, ALL, withoutRow), { dbPath });
+			expect(a?.conversations[0]?.title).toBe("from the sessions row");
+			expect(b?.conversations[0]?.title).toBe("restart the web backend");
 		});
 
 		it("reports an uncovered source honestly instead of a fabricated zero-activity claim", async () => {
@@ -709,7 +817,7 @@ describe("MemoriesQuery", () => {
 			// `resolveSessionTitle`'s step 3, which is what the editor lands on for an
 			// archived session (no stored title, no live transcript to read).
 			expect(detail?.conversations).toEqual([
-				{ source: "claude", title: "why is the proxy 504ing", messageCount: 2 },
+				{ source: "claude", title: "why is the proxy 504ing", messageCount: 2, sessionId: "s1" },
 			]);
 		});
 
@@ -728,7 +836,9 @@ describe("MemoriesQuery", () => {
 			});
 
 			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
-			expect(detail?.conversations).toEqual([{ source: "claude", title: "One conversation", messageCount: 3 }]);
+			expect(detail?.conversations).toEqual([
+				{ source: "claude", title: "One conversation", messageCount: 3, sessionId: "s1" },
+			]);
 		});
 
 		it("drops a usage-only carrier session, the way the editor's conversation list does", async () => {
@@ -769,7 +879,9 @@ describe("MemoriesQuery", () => {
 			);
 
 			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
-			expect(detail?.conversations).toEqual([{ source: "claude", title: "(untitled session)", messageCount: 0 }]);
+			expect(detail?.conversations).toEqual([
+				{ source: "claude", title: "(untitled session)", messageCount: 0, sessionId: "legacy" },
+			]);
 		});
 	});
 
