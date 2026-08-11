@@ -53,7 +53,7 @@ Jolli Memory runs in the background using two kinds of hooks. You don't need to 
 
 ### AI agent sources: knowing which sessions are active
 
-Twelve transcript sources are supported. Only two of them install a hook; the rest are discovered by scanning the tool's own local session store, so there is nothing to configure per tool.
+Thirteen transcript sources are supported. Only two of them install a hook; the rest are discovered by scanning the tool's own local session store, so there is nothing to configure per tool.
 
 | Agent | How sessions are tracked |
 | -- | -- |
@@ -69,7 +69,7 @@ Twelve transcript sources are supported. Only two of them install a hook; the re
 
 Gemini's hook records only a session ID and file path. Claude's hook also scans the transcript as you work, to pick up plan files and issue references. The scan-based sources read transcript content too, at commit time to build the summary and on the sidebar's refresh to title recent conversations. All of that is local; see [Privacy](#privacy) for what is sent when a memory is generated.
 
-The plugin's **Settings > AI Agents** tab exposes nine toggles, one per source: Claude Code, Codex, Gemini, OpenCode, Cursor IDE, Devin, GitHub Copilot, Cline, and Antigravity. Three of them cover a pair of sources each: Cursor covers the Composer IDE and the `cursor-agent` CLI, Copilot covers the CLI and VS Code Chat, and Cline covers the CLI and the VS Code extension.
+The plugin's **Settings > AI Agents** tab exposes ten toggles, one per source: Claude Code, Codex, Gemini, OpenCode, Cursor IDE, Devin, GitHub Copilot, Cline, Antigravity, and Kimi Code. Three of them cover a pair of sources each: Cursor covers the Composer IDE and the `cursor-agent` CLI, Copilot covers the CLI and VS Code Chat, and Cline covers the CLI and the VS Code extension.
 
 ### Git hooks: generating summaries on commit
 

@@ -6,9 +6,9 @@ Codex.
 
 ## What the plugin includes
 
-- **Skills** — eleven `$jolli:*` entry points covering setup, sign-in, status,
-  recall, search, decision timelines, Space publishing, and local/remote workflow
-  runs, plus a bare `$jolli` front door that ships in the bundle.
+- **Skills** — eleven in all: a bare `$jolli` front door that ships in the bundle,
+  plus ten `$jolli:*` entry points covering setup, sign-in, status, recall, search,
+  decision timelines, Space publishing, and local/remote workflow runs.
 - **MCP tools** — `recall`, `search`, `get_decision_timeline`, `list_branches`,
   `get_pr_description`, `queue_status`, `status`, plus the Jolli Space tools. The
   bootstrap registers them with Codex, so they load from your **second** session
