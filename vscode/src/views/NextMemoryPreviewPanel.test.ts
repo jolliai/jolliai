@@ -61,6 +61,18 @@ vi.mock("../../../cli/src/core/CommitSelectionStore.js", () => ({
 	}),
 	writeAiSelection: writeAiMock,
 }));
+// Keep the REAL partitionForeignPlans + reason string, but drive classification off
+// the plan's sourcePath prefix so the unit test never spawns git. `/foreign/…` →
+// foreign; any other defined path → local; undefined → unknown (the shipped default),
+// so every existing fixture — which omits sourcePath — is classified exactly as before.
+vi.mock("../../../cli/src/core/plans/PlanContainment.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../../../cli/src/core/plans/PlanContainment.js")>();
+	return {
+		...actual,
+		createPlanSourceClassifier: () => async (sourcePath?: string) =>
+			sourcePath === undefined ? "unknown" : sourcePath.startsWith("/foreign/") ? "foreign" : "local",
+	};
+});
 
 import { NextMemoryPreviewPanel } from "./NextMemoryPreviewPanel.js";
 
@@ -470,6 +482,47 @@ describe("NextMemoryPreviewPanel — context relevance overlay", () => {
 		expect(sidebar.pushContextRelevanceToSidebar).toHaveBeenCalledWith([
 			expect.objectContaining({ id: "p1", autoExclude: true }),
 		]);
+	});
+
+	it("splits foreign-repo plans out of the ranker input and strikes them through", async () => {
+		postMessage.mockClear();
+		assessMock.mockClear();
+		detectPlansMock.mockResolvedValue([
+			{ slug: "localPlan", title: "Local", sourcePath: "/repo/plan.md" },
+			{ slug: "foreignPlan", title: "Foreign", sourcePath: "/foreign/other/plan.md" },
+		]);
+		assessMock.mockResolvedValue({
+			plans: [{ slug: "localPlan", title: "Local", sourcePath: "/repo/plan.md" }],
+			notes: [],
+			references: [],
+			excludedContext: [],
+			results: [
+				{ id: "localPlan", kind: "plan", relevant: true, score: 0.9, tier: "high", reason: "related", rank: 1, autoExclude: false },
+			],
+		});
+		const sidebar = makeSidebarProvider({
+			getFilesSnapshot: vi.fn().mockReturnValue([{ id: "f1", description: "src/a.ts", isSelected: true }]),
+		});
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() => expect(assessMock).toHaveBeenCalled());
+		// The foreign plan is NOT in the ranker input — its file content never reaches
+		// readEntryContent / the LLM, which is the leak this split closes. Only the
+		// local plan is ranked.
+		expect(assessMock.mock.calls.at(-1)?.[0].plans).toEqual([expect.objectContaining({ slug: "localPlan" })]);
+		// ...yet the foreign plan still surfaces in the overlay as a deterministic
+		// exclude (tier "low"), so the Review panel strikes it through rather than
+		// showing it as an includable candidate — matching the worker.
+		await vi.waitFor(() =>
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					type: "context:relevance",
+					items: expect.arrayContaining([
+						expect.objectContaining({ id: "localPlan", autoExclude: false }),
+						expect.objectContaining({ id: "foreignPlan", tier: "low", autoExclude: true }),
+					]),
+				}),
+			),
+		);
 	});
 
 	it("folds the working-tree diff into the ranker signal on a cache miss", async () => {

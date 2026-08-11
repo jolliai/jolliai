@@ -5,6 +5,7 @@ import { sumConversationTokens } from "../../../cli/src/core/ConversationTokenTo
 import { assessContextRelevance, capDiffForRelevance, computeChangeFingerprint } from "../../../cli/src/core/ContextRelevance.js";
 import { type AiRelevanceEntry, readExclusions, writeAiSelection } from "../../../cli/src/core/CommitSelectionStore.js";
 import { getWorkingTreeDiffStats } from "../../../cli/src/core/GitOps.js";
+import { createPlanSourceClassifier, partitionForeignPlans } from "../../../cli/src/core/plans/PlanContainment.js";
 import {
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
@@ -429,8 +430,23 @@ export class NextMemoryPreviewPanel {
 			]);
 			// Same user-hard-exclude filter the worker applies, so the candidate set
 			// (and thus the reused decision) matches.
+			const userKeptPlans = plans.filter((p) => !exclusions.plans.has(p.slug));
+			// Split off foreign-repo plans BEFORE ranking, exactly as the QueueWorker
+			// does (runPipeline → partitionForeignPlans): their file content must never
+			// be read from disk and fed to the relevance LLM — that is the very leak this
+			// PR closes on the commit path — and they must surface as struck-through in
+			// the Review panel rather than as includable candidates. Without this, the
+			// panel disagrees with both the worker AND IntelliJ's active-for-commit view.
+			// The classifier is git-backed, so this is an async hop — but a newer
+			// refresh that starts during it is still caught by the cache-hit `!isStale()`
+			// gate and the pre-LLM `isStale()` gate below, so no extra guard is needed
+			// here (and adding one only leaves an untriggerable branch).
+			const { localPlans, foreignExcludedContext } = await partitionForeignPlans(
+				userKeptPlans,
+				createPlanSourceClassifier(workspaceRoot),
+			);
 			const raw = {
-				plans: plans.filter((p) => !exclusions.plans.has(p.slug)),
+				plans: localPlans,
 				notes: notes.filter((n) => !exclusions.notes.has(n.id)),
 				references: refs.filter((e) => !exclusions.references.has(`${e.source}:${e.nativeId}`)),
 			};
@@ -451,6 +467,11 @@ export class NextMemoryPreviewPanel {
 				fingerprint,
 				...[
 					...raw.plans.map((p) => `p:${p.slug}`),
+					// Foreign plans are excluded from `raw` (never ranked), but they still
+					// paint a strikethrough in the overlay — so a change in the foreign set
+					// must move the cache key, or a cache hit would replay an overlay that
+					// no longer matches which plans are foreign.
+					...foreignExcludedContext.map((e) => `fp:${e.key}`),
 					...raw.notes.map((n) => `n:${n.id}`),
 					...raw.references.map((e) => `r:${e.source}:${e.nativeId}`),
 				].sort(),
@@ -510,12 +531,26 @@ export class NextMemoryPreviewPanel {
 			// in the panel + persisted as a `dismissed` flag via dismissAiExclusion),
 			// so the item falls back to showing its original tier + note.
 			const excludedKeys = new Set(decision.excludedContext.map((e) => `${e.kind}:${e.key}`));
-			const items: ContextRelevancePreviewItem[] = decision.results.map((r) => ({
-				id: r.id,
-				tier: r.tier,
-				reason: r.reason,
-				autoExclude: excludedKeys.has(`${r.kind}:${r.id}`),
-			}));
+			const items: ContextRelevancePreviewItem[] = [
+				...decision.results.map((r) => ({
+					id: r.id,
+					tier: r.tier,
+					reason: r.reason,
+					autoExclude: excludedKeys.has(`${r.kind}:${r.id}`),
+				})),
+				// Foreign plans never entered the ranker, so they carry no `results` entry.
+				// Surface them here as deterministic excludes (tier "low" + the containment
+				// reason) so the panel strikes them through — matching the worker, which
+				// records the same items on the summary's `excludedContext`.
+				// partitionForeignPlans always stamps FOREIGN_PLAN_EXCLUSION_REASON, so
+				// `e.reason` is the containment reason verbatim — no fallback needed.
+				...foreignExcludedContext.map((e) => ({
+					id: e.key,
+					tier: "low" as const,
+					reason: e.reason,
+					autoExclude: true,
+				})),
+			];
 			// writeAiSelection above is an async yield point, so re-check we're still the
 			// latest refresh before caching / posting — otherwise a slower earlier call
 			// could clobber a newer one's cache + overlay here (the pre-/post-LLM isStale
