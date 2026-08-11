@@ -19,6 +19,7 @@ import { withPlansLock } from "../Locks.js";
 import { normalizePathForCompare } from "../PathUtils.js";
 import { getClaudePlansDir } from "../PlanPaths.js";
 import { loadPlansRegistry, savePlansRegistry } from "../SessionTracker.js";
+import { createPlanSourceClassifier } from "./PlanContainment.js";
 import { getPlanScanner } from "./PlanTranscriptScanner.js";
 
 const log = createLogger("PlanDiscovery");
@@ -202,7 +203,32 @@ export async function scanPlansFrom(
 	// read — byte-equivalent to the pre-refactor Claude behaviour.
 	const filteredExternal = new Set([...externalPlans].filter((p) => isExternalPlanCandidate(p, cwd)));
 
-	if (slugs.size === 0 && filteredExternal.size === 0) {
+	// Discovery-time containment gate: an external `.md` that belongs to ANOTHER
+	// git repository (a sibling checkout the agent incidentally read/wrote) never
+	// enters plans.json in the first place — the same deterministic, no-LLM rule
+	// the archive path enforces (see PlanContainment), moved up to discovery so a
+	// foreign-repo file is never registered rather than being filtered out later.
+	// Only external paths can be foreign: the `slugs` set is always canonical
+	// ~/.claude/plans (whitelisted `local`), so it is not classified. `unknown`
+	// (a loose file in no git repo) is KEPT — "don't drop on uncertainty" matches
+	// the archive gate and leaves temp residue to the separate pruning concern.
+	// The classifier strips the hook-injected git location env vars before asking
+	// git, so this resolves by cwd even inside the detached post-commit worker.
+	let localExternal = filteredExternal;
+	if (filteredExternal.size > 0) {
+		const classify = createPlanSourceClassifier(cwd);
+		const kept = new Set<string>();
+		for (const absPath of filteredExternal) {
+			if ((await classify(absPath)) === "foreign") {
+				log.info("Plan discovery: %s belongs to another repository — not registering", absPath);
+				continue;
+			}
+			kept.add(absPath);
+		}
+		localExternal = kept;
+	}
+
+	if (slugs.size === 0 && localExternal.size === 0) {
 		return totalLines;
 	}
 
@@ -304,7 +330,7 @@ export async function scanPlansFrom(
 	//        editing even though that particular edit didn't land — accepted as a
 	//        benign true-ish positive, and identical to the long-standing Claude
 	//        behaviour (a failed Edit to an existing .md registers the same way).
-	for (const absPath of filteredExternal) {
+	for (const absPath of localExternal) {
 		if (!existsSync(absPath)) continue;
 		if (noteSourcePaths.has(normalizePathForCompare(absPath))) {
 			log.info("Plan discovery: %s already a note — skipping plan registration", absPath);
@@ -382,7 +408,7 @@ export async function scanPlansFrom(
 		log.info(
 			"Plan discovery: upserted %d slug(s) + %d external path(s) into plans.json",
 			slugs.size,
-			filteredExternal.size,
+			localExternal.size,
 		);
 	}
 

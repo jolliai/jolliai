@@ -49,6 +49,12 @@ vi.mock("../core/TelemetryStartup.js", () => ({
 vi.mock("../core/GitOps.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../core/GitOps.js")>()),
 	resolveStateRoot: vi.fn((cwd: string) => cwd),
+	// The discovery-time foreign-repo gate (PlanContainment) resolves each
+	// out-of-worktree external plan's owning repo via this. These unit tests use
+	// synthetic paths (`/repo/docs/*.md` under a `/my/project` cwd) that no real
+	// git repo owns, so stub it to null → the plan classifies as `unknown` and is
+	// KEPT, preserving the pre-gate behaviour without spawning real git per test.
+	resolveContainingRepoCommonDir: vi.fn().mockResolvedValue(null),
 }));
 
 // Mock Locks — these unit tests run with synthetic cwds (e.g. "/project"), so
