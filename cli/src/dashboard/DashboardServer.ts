@@ -25,12 +25,17 @@
  * Both halves of the no-daemon backup schedule now live in processes that
  * already write: `executeDashboard` and the post-commit `QueueWorker`.
  *
- * DbBackfill is deliberately NOT part of that write surface. Generating memories
- * for existing commits is an explicit CLI action (`jolli backfill`), and the
- * import sweep that fills the database from summaries already written is
- * `jolli dashboard`'s own startup step, run in the command process. A second
- * entry point here would mean two ways to start the same LLM-spending work,
- * one of them from a browser tab whose lifetime has nothing to do with it.
+ * DbBackfill is deliberately NOT part of that write surface: the import sweep
+ * that fills the database from summaries already written is `jolli dashboard`'s
+ * own startup step, run in the command process, never from a request here.
+ * Generating the memories themselves (a real per-commit model call) stays a CLI
+ * action (`jolli backfill`) too — with ONE deliberate browser-reachable
+ * exception, Settings → Generate Missing Summaries
+ * (`/api/settings/generate-missing`), added for parity with the VS Code panel.
+ * That is the one place a request here spends model budget on a backfill, so it
+ * is serialised by `generateMissingInFlight`: a refresh or a second tab drops
+ * the page-side busy flag, and without the guard a re-click would start a second
+ * backfill over the same commits and pay for every summary twice.
  *
  * ## Security model
  *
@@ -44,10 +49,13 @@
  *      request carrying a cross-origin `Origin` is rejected outright, so a
  *      hostile page cannot read the responses even if it can issue requests.
  *   3. A per-server random token, checked ONLY on mutating routes (every
- *      POST, plus the two GETs that exist solely to feed a mutation:
- *      `/api/browse`, `/api/repo-probe`). GET pages and `/api/model` stay
- *      exactly as open as before — `http://localhost:<port>/dashboard` still
- *      just works by hand, which was the original product call and is
+ *      POST) and on the three GETs that expose more than a public read: the
+ *      two that feed a mutation or probe the filesystem (`/api/repo-probe`,
+ *      `/api/settings/check-folder`) and the one that carries key-derived
+ *      material (`/api/model?view=settings` — masked keys, sign-in state, the
+ *      Memory Bank folder path). Every other GET page and `/api/model` view
+ *      stays exactly as open as before — `http://localhost:<port>/dashboard`
+ *      still just works by hand, which was the original product call and is
  *      unaffected by this. The token is minted at server start, held only in
  *      process memory, and inlined into the page as
  *      `window.__JOLLI_DASHBOARD_TOKEN__` (never in a URL, to keep it out of
@@ -57,8 +65,10 @@
  *      `hasForeignOrigin` already rejects it), and another local user cannot
  *      read this process's memory over loopback the way they could read a
  *      file. GET-only readers (session counts, tokens, cost, commit subjects,
- *      mined insights) still need no credential — nothing there is a
- *      secret, and the API key is never part of any model this serves.
+ *      mined insights) still need no credential — nothing there is a secret.
+ *      The lone exception is the settings view, whose masked keys, sign-in
+ *      state and folder path are gated by the same token above; every other
+ *      model this serves is still free of key-derived material.
  *   4. `Sec-Fetch-Site` gates the one thing a GET can do that is NOT free:
  *      building the Stats payload can fire a DecisionGist LLM call. Layers
  *      1+2 do not stop a hostile tab from ISSUING a GET (a `no-cors` request
@@ -120,7 +130,7 @@ import {
 	parseSettingsApplyInput,
 	SettingsValidationError,
 } from "./SettingsMutations.js";
-import { buildSettingsPageModel } from "./SettingsPageQuery.js";
+import { buildSettingsPageModel, clearLaunchRepoStateCache } from "./SettingsPageQuery.js";
 
 const log = createLogger("DashboardServer");
 
@@ -866,6 +876,13 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	let boundPort = options.port;
 	/** Lives as long as this server; see {@link IdentityCache}. */
 	const identityCache: IdentityCache = new Map();
+	// Serialises the one browser-reachable LLM-spending action (Settings →
+	// Generate Missing Summaries). Its only progress signal is page-side
+	// `state.busy`, which a refresh or a second tab drops — so without this a
+	// re-click would run a SECOND backfill over the same commits concurrently,
+	// paying for every summary twice. Process-scoped: it guards this server, not
+	// a separate CLI `jolli backfill` (those still serialise on the orphan lock).
+	let generateMissingInFlight = false;
 	const buildModel =
 		options.buildModel ??
 		((request: ModelRequest) =>
@@ -1022,9 +1039,19 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		if (url.pathname === "/api/model") {
 			const requested = url.searchParams.get("view") ?? "";
 			const view: DashboardView = VIEW_TOKENS.has(requested) ? (requested as DashboardView) : "stats";
-			// Deliberately NOT a 403 without the token: this route stays open, as
-			// the module header's layer 3 promises. The token only decides whether
-			// the answer may cost money — see `ModelRequest.allowModelSpend`.
+			const trusted = hasValidToken(req, token) && !isCrossSiteRequest(req);
+			// The settings view is the one payload here that carries key-derived
+			// material (masked API keys, sign-in state, the Memory Bank folder path),
+			// so unlike every other view it is NOT a free public read: serve it only
+			// to our own token-bearing, same-site page (JD.getJson always sends the
+			// token). A token-free or cross-site caller gets 403 rather than the
+			// masked keys — see the module header's layer 3.
+			if (view === "settings" && !trusted) {
+				sendText(res, 403, "Forbidden");
+				return;
+			}
+			// Otherwise the route stays open as layer 3 promises; the token only
+			// decides whether the answer may cost money — see `ModelRequest.allowModelSpend`.
 			sendJson(
 				res,
 				200,
@@ -1032,7 +1059,7 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 					view,
 					scope: parseScope(url),
 					...parseWindow(url),
-					allowModelSpend: hasValidToken(req, token) && !isCrossSiteRequest(req),
+					allowModelSpend: trusted,
 				}),
 			);
 			return;
@@ -1321,6 +1348,19 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			sendJson(res, 400, { error: "the dashboard was not started inside a git repository" });
 			return;
 		}
+		// One backfill at a time per server — a second concurrent run (a refresh or a
+		// second tab drops the page-side busy flag) would re-summarize the same
+		// commits and pay for every summary twice. See `generateMissingInFlight`.
+		/* v8 ignore start -- concurrency guard: a second in-flight backfill is not
+		   deterministically reproducible in a unit test (the empty-repo backfill the
+		   endpoint test uses returns before a second request could observe the flag).
+		   Exercised in production by a refresh / second-tab re-click. */
+		if (generateMissingInFlight) {
+			sendJson(res, 409, { error: "a summary generation is already running — wait for it to finish" });
+			return;
+		}
+		/* v8 ignore stop */
+		generateMissingInFlight = true;
 		try {
 			const { runBackfill, recentCommitHashes } = await import("../backfill/BackfillEngine.js");
 			const hashes = await recentCommitHashes(repoRoot);
@@ -1329,6 +1369,8 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		} catch (err) {
 			log.warn("generate-missing failed: %s", errMsg(err));
 			sendJson(res, 500, { error: "could not generate summaries" });
+		} finally {
+			generateMissingInFlight = false;
 		}
 	}
 
@@ -1353,6 +1395,13 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		try {
 			const { rebuildMemoryBank } = await import("../core/MemoryBankRebuild.js");
 			const result = await rebuildMemoryBank(serverCwd);
+			// A successful OR partial migrate archived the old folder and re-migrated
+			// into the freed base slot WITHOUT changing `localFolder`, so the memoised
+			// launch-repo state (keyed on (launchCwd, localFolder)) is now stale. Drop
+			// it unconditionally — cache invalidation is the host's job by
+			// MemoryBankRebuild's contract, and it is harmless on the "no memories"
+			// early-out (which changed nothing).
+			clearLaunchRepoStateCache();
 			// On failure the client's JD.post reads `error`, so surface the reason
 			// there (not just `message`) or it renders as "request failed (400)".
 			if (result.ok) sendJson(res, 200, result);

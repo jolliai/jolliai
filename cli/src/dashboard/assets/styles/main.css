@@ -1148,6 +1148,11 @@ body {
   .set-h { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--ink); }
   .set-h + .set-row, .set-h + .set-group, .set-h + .set-subcard { margin-top: 0; }
   .set-group { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
+  /* Per-repo push toggle result, centered under its row (VS Code panel parity):
+     prominent by placement + weight, so an immediate-apply toggle reads as done. */
+  .set-push-status { text-align: center; font-size: 13px; font-weight: 600; line-height: 1.4; padding: 8px 6px 4px; color: var(--ink-2); }
+  .set-push-status.warn { color: var(--warn, #b26a00); }
+  .set-push-status.err { color: var(--crit); }
   .set-divider { height: 1px; background: var(--border); margin: 16px 0; }
   .set-row { display: flex; flex-direction: column; gap: 6px; margin: 14px 0; }
   .set-row-inline { flex-direction: row; align-items: center; gap: 10px; flex-wrap: wrap; }

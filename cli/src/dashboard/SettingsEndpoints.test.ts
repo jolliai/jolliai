@@ -315,6 +315,20 @@ describe("real model builder for /settings", () => {
 		expect(settings.summary.aiProvider).toBe("anthropic");
 		expect(settings.others).toBeTruthy();
 	});
+
+	it("403s on /api/model?view=settings without the token — the payload carries masked keys", async () => {
+		const port = await startRealServer();
+		// No X-Jolli-Dashboard-Token header (unlike the `get` helper), so this is a
+		// token-free reader — it must NOT receive the settings payload.
+		const res = await fetch(`http://127.0.0.1:${port}/api/model?view=settings`);
+		expect(res.status).toBe(403);
+	});
+
+	it("still serves a non-settings /api/model view without the token", async () => {
+		const port = await startRealServer();
+		const res = await fetch(`http://127.0.0.1:${port}/api/model?view=stats`);
+		expect(res.status).toBe(200);
+	});
 });
 
 describe("withTimeout", () => {

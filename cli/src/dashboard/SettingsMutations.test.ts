@@ -116,6 +116,16 @@ describe("parseSettingsApplyInput", () => {
 		);
 	});
 
+	it("rejects an unknown localAgentTool", () => {
+		expect(() => parseSettingsApplyInput(rawBody({ localAgentTool: "not-a-real-tool" }))).toThrow(
+			SettingsValidationError,
+		);
+	});
+
+	it("defaults an empty localAgentTool to claude-code", () => {
+		expect(parseSettingsApplyInput(rawBody({ localAgentTool: "" })).localAgentTool).toBe("claude-code");
+	});
+
 	it("rejects a submission with every agent disabled", () => {
 		const allOff = Object.fromEntries(
 			[

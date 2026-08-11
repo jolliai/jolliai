@@ -24,6 +24,7 @@ import { isAbsolute } from "node:path";
 import { getProjectRootDir, listWorktrees } from "../core/GitOps.js";
 import { assertJolliOriginAllowed, parseJolliApiKey, resolveJolliUrlForKey } from "../core/JolliApiUtils.js";
 import { extractRepoName } from "../core/KBPathResolver.js";
+import { LOCAL_AGENT_TOOLS } from "../core/localagent/ToolMeta.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { getGlobalConfigDir, updateConfigTransactionalScoped } from "../core/SessionTracker.js";
 import {
@@ -124,6 +125,16 @@ export function parseSettingsApplyInput(body: Record<string, unknown>): Settings
 	if (gi !== "enabled" && gi !== "disabled" && gi !== "default") {
 		throw new SettingsValidationError("globalInstructions must be enabled, disabled or default");
 	}
+	// Validate against the known tool ids like aiProvider/globalInstructions above —
+	// an unchecked cast let a bad value through to config, only to explode later
+	// inside summarization. `Object.keys().includes` (not `in`) so a prototype key
+	// like "constructor" can't pass.
+	const localAgentTool = asString(body.localAgentTool) || "claude-code";
+	if (!Object.keys(LOCAL_AGENT_TOOLS).includes(localAgentTool)) {
+		throw new SettingsValidationError(
+			`localAgentTool must be one of: ${Object.keys(LOCAL_AGENT_TOOLS).join(", ")}`,
+		);
+	}
 	const agents = Object.fromEntries(AGENT_FIELDS.map((f) => [f, asBool(body[f])])) as Record<
 		(typeof AGENT_FIELDS)[number],
 		boolean
@@ -144,7 +155,7 @@ export function parseSettingsApplyInput(body: Record<string, unknown>): Settings
 		...(maxTokens !== undefined ? { maxTokens } : {}),
 		apiKey: asString(body.apiKey),
 		jolliApiKey: asString(body.jolliApiKey),
-		localAgentTool: (asString(body.localAgentTool) || "claude-code") as LocalAgentToolId,
+		localAgentTool: localAgentTool as LocalAgentToolId,
 		localFolder: asString(body.localFolder),
 		compileExcludeFolders: asString(body.compileExcludeFolders),
 		syncTranscripts: asBool(body.syncTranscripts),

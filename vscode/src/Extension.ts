@@ -2605,125 +2605,33 @@ export function activate(context: vscode.ExtensionContext): void {
 					};
 				}
 				try {
-					const {
-						extractRepoName,
-						getRemoteUrl,
-						initializeKBFolder,
-						findRepoFolders,
-						peekKBPath,
-						archiveKBFolder,
-					} = await import("../../cli/src/core/KBPathResolver.js");
-					const { MetadataManager } = await import(
-						"../../cli/src/core/MetadataManager.js"
+					// The migrate sequence itself is shared core (archive every folder for
+					// the repo, then re-migrate from the orphan branch into the freed base
+					// slot) — cli/src/core/MemoryBankRebuild.ts, the one routine the dashboard
+					// server drives too. Only the host-side refresh stays here (per that
+					// file's contract that cache/sidebar invalidation is the host's job).
+					const { rebuildMemoryBank } = await import(
+						"../../cli/src/core/MemoryBankRebuild.js"
 					);
-					const { resolveSotStorage } = await import(
-						"../../cli/src/core/SotStorageResolver.js"
-					);
-					const { detectStoredMemories } = await import(
-						"../../cli/src/core/StoredMemories.js"
-					);
-					const { FolderStorage } = await import(
-						"../../cli/src/core/FolderStorage.js"
-					);
-					const { MigrationEngine } = await import(
-						"../../cli/src/core/MigrationEngine.js"
-					);
-
-					const repoName = extractRepoName(workspaceRoot);
-					const remoteUrl = getRemoteUrl(workspaceRoot);
-					const cfg = await loadConfig();
-					const customKBPath = (cfg as Record<string, unknown>).localFolder as
-						| string
-						| undefined;
-
-					const sot = await resolveSotStorage(workspaceRoot);
-					// NOT `exists()`: this branch archives every existing Memory
-					// Bank folder for the repo before re-migrating, and past a
-					// cutover `exists()` is true for any enabled repo — memories
-					// or not. `unknown` (a read failure) takes the same exit as
-					// `none`, because the destructive path must never run on a
-					// guess. See cli/src/core/StoredMemories.ts.
-					const presence = await detectStoredMemories(sot);
-					if (presence !== "some") {
-						return {
-							ok: false,
-							message:
-								presence === "none"
-									? "No stored memories found — nothing to rebuild."
-									: "Could not read stored memories — leaving the Memory Bank untouched.",
-						};
+					const result = await rebuildMemoryBank(workspaceRoot);
+					// `folder` is set only when a migration actually ran (not on the "no
+					// stored memories" / "could not read" early-outs) — exactly when the
+					// previous inline code refreshed. The rebuilt folder keeps the SAME path,
+					// so refreshSidebarKbRoot would report moved=false; refresh +
+					// cache-invalidate unconditionally so the tree picks up the rebuilt
+					// contents and the multi-repo Memories aggregate drops entries discovered
+					// against the now-archived identities.
+					if (result.folder !== undefined) {
+						await refreshSidebarKbRoot();
+						sidebarProvider.refreshKnowledgeBaseFolders();
+						bridge.invalidateEntriesCache();
+						if (memoriesStore.hasFirstLoaded()) {
+							memoriesStore
+								.refresh()
+								.catch(handleError("rebuildKnowledgeBase.memories"));
+						}
 					}
-
-					// Enumerate EVERY folder that currently holds this repo, then
-					// archive the whole pile FIRST — the canonical base `<repo>` slot
-					// included. Earlier buggy runs (archive gate defeated by a numbering
-					// hole) could leave a pile of duplicates — `<repo>`, `-3`, `-4`, … all
-					// sharing one identity. Archiving up front frees the base slot so the
-					// migration below lands back on the canonical base name instead of
-					// climbing to an ever-higher `<repo>-N` (the user-visible "I keep
-					// getting jolliai-2, -3 …" symptom). Safe to archive before migrating:
-					// the migration SOURCE is the orphan branch (the system of record),
-					// not these folders, so a crash mid-migrate self-heals on the next
-					// activation, which re-migrates from the orphan branch into the now
-					// free base slot.
-					//
-					// `archiveKBFolder` MOVES each folder into the hidden, per-Memory-Bank
-					// `.jolli/archive/` dir rather than rewriting its identity in place.
-					// The old identity-rewrite left folders visible in both IDE folder
-					// views and still tracked by the vault git (so they kept syncing);
-					// the archive dir is hidden (leading-dot) and unowned by the sync
-					// classifier. Folding the whole pile to a single live folder also lets
-					// the sync layer self-heal `repos.json`: with one folder per identity,
-					// `resolveOrAssignFolder` repoints any stale row to the live folder on
-					// the next round (multi-folder identities are skipped by
-					// `reconcileMappingAdditive` precisely to avoid a mapping↔disk split,
-					// so we must NOT write `repos.json` from here).
-					const staleFolders = findRepoFolders(repoName, remoteUrl, customKBPath);
-					for (const stale of staleFolders) {
-						archiveKBFolder(stale, customKBPath);
-					}
-
-					// With the pile archived, the base slot is free again; `peekKBPath`
-					// resolves to it (falling back to a fresh `-N` only if some folder
-					// for this repo survived archiving). Claim it and migrate into it.
-					const newKbRoot = peekKBPath(repoName, remoteUrl, customKBPath);
-					initializeKBFolder(newKbRoot, repoName, remoteUrl);
-
-					const newMm = new MetadataManager(join(newKbRoot, ".jolli"));
-					const folder = new FolderStorage(newKbRoot, newMm);
-					await folder.ensure();
-					const engine = new MigrationEngine(sot, folder, newMm);
-					const result = await engine.runMigration();
-
-					// Rebuild's new folder lives under the SAME Memory Bank parent
-					// as the previous one (the canonical <localFolder>/<repo>/ slot,
-					// re-created after the prior pile was archived), so
-					// refreshSidebarKbRoot would return moved=false and the KB tree
-					// would still point at the archived directory until a window
-					// reload. The folder's contents were replaced even though its
-					// path did not change — refresh + cache-invalidate unconditionally
-					// after a successful rebuild so the tree picks up the rebuilt
-					// folder and the multi-repo Memories aggregate drops entries
-					// discovered against the now-archived identities.
-					await refreshSidebarKbRoot();
-					sidebarProvider.refreshKnowledgeBaseFolders();
-					bridge.invalidateEntriesCache();
-					if (memoriesStore.hasFirstLoaded()) {
-						memoriesStore
-							.refresh()
-							.catch(handleError("rebuildKnowledgeBase.memories"));
-					}
-
-					if (result.status === "completed") {
-						return {
-							ok: true,
-							message: `${result.migratedEntries} memories migrated to ${newKbRoot}`,
-						};
-					}
-					return {
-						ok: false,
-						message: `Rebuild ${result.status}: ${result.migratedEntries}/${result.totalEntries} entries (${newKbRoot})`,
-					};
+					return { ok: result.ok, message: result.message };
 				} catch (err) {
 					return {
 						ok: false,

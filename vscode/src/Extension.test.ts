@@ -9664,7 +9664,12 @@ describe("Extension", () => {
 		});
 
 		it("returns not-ok when the system of record holds nothing", async () => {
-			mockSotInstance.exists.mockResolvedValueOnce(false);
+			// Stable (not `…Once`): the rebuild path now runs through the shared
+			// `rebuildMemoryBank`, which reads the disable flag + config before probing
+			// storage, so the handler's `exists()` is no longer guaranteed to be the
+			// first call — activate()'s background migration can consume a one-shot
+			// mock first. A persistent false models "holds nothing" order-independently.
+			mockSotInstance.exists.mockResolvedValue(false);
 			activate(makeContext());
 			const handler = getRegisteredCommand("jollimemory.rebuildKnowledgeBase");
 			const result = (await handler()) as { ok: boolean; message: string };

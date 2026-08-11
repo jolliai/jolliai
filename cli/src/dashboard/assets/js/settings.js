@@ -94,6 +94,7 @@ window.JD = window.JD || {};
 		folderStatus: null,
 		pushRepos: null,
 		pushError: null,
+		pushStatus: null, // { repoIdentity, text, kind } — last per-repo toggle result
 		missing: undefined,
 		notice: null,
 		error: null,
@@ -386,6 +387,11 @@ window.JD = window.JD || {};
 
 	function anthropicCard(f) {
 		var model = f.model || "sonnet";
+		// A configured full model id (e.g. "claude-opus-4-8") matches none of the three
+		// preset aliases, so the browser would silently show the first option ("Haiku")
+		// as if the config had changed. Surface the real value as its own selected
+		// option instead; leaving the field untouched still submits it verbatim.
+		var customModelOpt = model && ["haiku", "sonnet", "opus"].indexOf(model) === -1 ? opt(model, model, model) : "";
 		var warn =
 			f.apiKey === ""
 				? '<div class="set-status warn"><span>⚠</span> API key is empty. AI summaries won\'t work without it.</div>'
@@ -400,6 +406,7 @@ window.JD = window.JD || {};
 			'" placeholder="sk-ant-..."/></div>' +
 			'<div class="set-row"><label class="set-label" for="model">Model</label>' +
 			'<select class="set-input" id="model" data-field="model">' +
+			customModelOpt +
 			opt("haiku", "Haiku — fastest", model) +
 			opt("sonnet", "Sonnet — balanced (default)", model) +
 			opt("opus", "Opus — most capable", model) +
@@ -478,13 +485,21 @@ window.JD = window.JD || {};
 		var list;
 		if (state.pushError) list = '<div class="callout err">' + esc(state.pushError) + "</div>";
 		else if (state.pushRepos === null) list = '<div class="set-hint">Loading…</div>';
-		else if (state.pushRepos.length === 0) list = '<div class="set-hint">Loading…</div>';
+		else if (state.pushRepos.length === 0)
+			list = '<div class="set-hint">No repositories with a git remote are tracked on this machine yet.</div>';
 		else
 			list =
 				'<div class="set-group">' +
 				state.pushRepos
-					.map(
-						(r) =>
+					.map((r) => {
+						// Per-repo result of the last immediate toggle, shown right under
+						// its row (prominent, next to the switch) — matches the VS Code
+						// panel, which renders the status here rather than in a far footer.
+						var st =
+							state.pushStatus && state.pushStatus.repoIdentity === r.repoIdentity
+								? '<div class="set-push-status ' + state.pushStatus.kind + '">' + esc(state.pushStatus.text) + "</div>"
+								: "";
+						return (
 							'<label class="set-toggle-row"><span class="set-toggle-text"><span class="set-toggle-label">' +
 							esc(r.repoName) +
 							(r.isCurrentRepo ? ' <span class="set-tag">this repo</span>' : "") +
@@ -495,8 +510,10 @@ window.JD = window.JD || {};
 							'"' +
 							(r.pushDisabled ? "" : " checked") +
 							(r.isCurrentRepo ? ' data-current="1"' : "") +
-							"/></label>",
-					)
+							"/></label>" +
+							st
+						);
+					})
 					.join("") +
 				"</div>";
 
@@ -560,6 +577,11 @@ window.JD = window.JD || {};
 	}
 
 	function bankSection(mb, f) {
+		// Migrate / Generate act on the LAUNCH repo (serverCwd), not whichever repo
+		// the dashboard is currently scoped to — so name it (same label as the
+		// section's state tag) rather than a bare "this repo", falling back to the
+		// generic phrase when the launch repo isn't resolvable.
+		var launchName = mb.repoLabel ? '<span class="set-hl">' + esc(mb.repoLabel) + "</span>" : "";
 		// Effective Memory Bank verdict for the launch repo — a ✓/⚠/○ line per
 		// severity (matches the VS Code panel). "ok" names the resolved per-repo
 		// folder (where memories land); the repo tag names which repo it's for.
@@ -616,12 +638,16 @@ window.JD = window.JD || {};
 					">" +
 					(state.busy === "migrate" ? "Migrating…" : "Migrate to Memory Bank") +
 					"</button></div>" +
-					'<div class="set-hint">Re-migrate this repo from the orphan branch into a fresh Memory Bank folder. The existing folder is preserved (a new <code>-2</code>-suffixed folder is created and the repo registry is repointed).</div>' +
+					'<div class="set-hint">Re-migrate ' +
+					(launchName || "this repo") +
+					' from the orphan branch into a fresh Memory Bank folder. The existing folder is preserved (a new <code>-2</code>-suffixed folder is created and the repo registry is repointed).</div>' +
 					'<div class="set-row set-row-inline"><button type="button" class="cta ghost sm" data-action="syncNow"' +
 					(state.busy === "syncNow" ? " disabled" : "") +
 					">" +
 					(state.busy === "syncNow" ? "Syncing…" : "Sync to Personal Space Now") +
-					'</button><span class="set-hint">Push this Memory Bank to your <strong>private</strong> Personal Space. Requires Jolli sign-in.</span></div>' +
+					"</button><span class=\"set-hint\">Push " +
+					(launchName ? launchName + "’s" : "this") +
+					" Memory Bank to your <strong>private</strong> Personal Space. Requires Jolli sign-in.</span></div>" +
 					toggleRow(
 						"syncTranscripts",
 						"Include transcripts (raw AI conversation logs)",
@@ -639,7 +665,9 @@ window.JD = window.JD || {};
 					"</button></div>" +
 					'<div class="set-hint"><span>' +
 					missing +
-					"</span> Generates summaries for your own past commits in this repository that don't have one yet — using the Claude Code conversation behind each commit when it can be found, otherwise summarizing the code change alone. Runs one AI call per commit, so it may take a while.</div>",
+					"</span> Generates summaries for your own past commits in " +
+					(launchName || "this repository") +
+					" that don't have one yet — using the Claude Code conversation behind each commit when it can be found, otherwise summarizing the code change alone. Runs one AI call per commit, so it may take a while.</div>",
 			)
 		);
 	}
@@ -711,6 +739,11 @@ window.JD = window.JD || {};
 				state.section = btn.getAttribute("data-section");
 				state.notice = null;
 				state.error = null;
+				// Clear a prior push-list load failure so re-entering Sync retries it
+				// (the wire() guard skips the fetch while pushError is set), and drop a
+				// stale per-row toggle status.
+				state.pushError = null;
+				state.pushStatus = null;
 				render(model);
 			};
 		});
@@ -749,7 +782,11 @@ window.JD = window.JD || {};
 				togglePush(model, box.getAttribute("data-push"), !box.checked, box.getAttribute("data-current") === "1");
 		});
 
-		if (state.section === "sync" && state.pushRepos === null) loadPushRepos(model);
+		// `!state.pushError` is load-bearing: on a failed load `pushRepos` stays null,
+		// and render() → wire() would otherwise re-fire loadPushRepos on every render,
+		// hammering a 500ing endpoint forever. The error render sets pushError, which
+		// closes the guard until the user retries (a rail switch clears it).
+		if (state.section === "sync" && state.pushRepos === null && !state.pushError) loadPushRepos(model);
 		if (state.section === "bank" && state.missing === undefined) loadMissing(model);
 	}
 
@@ -884,12 +921,30 @@ window.JD = window.JD || {};
 			});
 	}
 
+	// Per-repo push status wording, matched verbatim to the VS Code panel
+	// (SettingsWebviewPanel.handleSetPushDisabled) so the two surfaces read
+	// identically. `recovered` = the store was corrupt and was rebuilt from empty
+	// (the dashboard endpoint reports no `preservedAt`, so that clause is omitted).
+	function pushStatusText(disabled, isCurrent, recovered) {
+		if (recovered) {
+			return "Enabled ✓ — but the setting file was unreadable and was rebuilt, so every other repository's opt-out was reset to ON.";
+		}
+		if (disabled) return "Disabled — this repo's memory stays local ✓";
+		return isCurrent
+			? "Enabled — syncing retained memory now ✓"
+			: "Enabled ✓ — backlog will sync on this repo's next activity";
+	}
+
 	function togglePush(model, repoIdentity, disabled, isCurrent) {
 		JD.post("/api/settings/set-push", { repoIdentity: repoIdentity, disabled: disabled, isCurrentRepo: isCurrent })
 			.then((data) => {
-				if (data.recoveredFromCorrupt) {
-					state.notice = "Push store was rebuilt — other repos' opt-outs may have been reset. Please re-check.";
-				}
+				// Immediate-apply (no "Apply Changes") — report the result on a status
+				// line under the toggled row, wording matched to the VS Code panel.
+				state.pushStatus = {
+					repoIdentity: repoIdentity,
+					text: pushStatusText(data.disabled === true, isCurrent, data.recoveredFromCorrupt === true),
+					kind: data.recoveredFromCorrupt ? "warn" : "ok",
+				};
 				if (state.pushRepos) {
 					state.pushRepos = state.pushRepos.map((r) =>
 						r.repoIdentity === repoIdentity ? Object.assign({}, r, { pushDisabled: data.disabled }) : r,
@@ -897,8 +952,14 @@ window.JD = window.JD || {};
 				}
 				render(model);
 			})
-			.catch((err) => {
-				state.error = err.message || "Could not change push setting.";
+			.catch(() => {
+				// Same as the VS Code panel: show the failure under the row and reload the
+				// persisted list so the checkbox snaps back to what was actually stored.
+				state.pushStatus = {
+					repoIdentity: repoIdentity,
+					text: "Couldn't update outbound push — see logs. No change was made.",
+					kind: "err",
+				};
 				loadPushRepos(model);
 			});
 	}
