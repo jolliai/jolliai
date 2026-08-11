@@ -37,6 +37,7 @@ import {
 	RECALL_RECEIPTS_DDL,
 	REPOS_DELETE_ALLOWED_DDL,
 	SCHEMA_MIGRATIONS_DDL,
+	SESSION_ACTIVITY_DDL,
 	SESSION_USAGE_EVENTS_DDL,
 	SKILL_CONTEXT_KIND_DDL,
 	STATS_DAILY_DAY_INDEX_DDL,
@@ -71,11 +72,12 @@ const log = createLogger("DashboardDb");
  * cumulative total under a single timestamp cannot be split across the days the
  * conversation actually spanned), the `stats_daily` rollup cache plus the
  * `commits.written_at_ms` that detects a stale day, the stamp and keyset indexes
- * those two need, and the backfill that gives every stamp a number.
+ * those two need, and the backfill that gives every stamp a number; entry 8 adds
+ * `session_activity`.
  *
- * ONE entry because the intermediate versions those steps produced (8 through 13)
- * exist on no database anybody will ever ship or receive — they were this
- * branch's own development history, and a version the release cannot reach is
+ * Entry 7 is ONE entry because the intermediate versions its steps produced
+ * (8 through 13 of that branch's own development) exist on no database anybody
+ * will ever ship or receive, and a version the release cannot reach is
  * bookkeeping nobody can act on. That merge is only legal because the feature has
  * not shipped; once it has, the append-only rule below takes over and the next
  * feature's steps must each be their own entry. The cost of getting this wrong is
@@ -84,6 +86,21 @@ const log = createLogger("DashboardDb");
  * seven steps — three index entries, an ALTER and a backfill, none of which can
  * introduce a table an older build cannot see — would each have disabled that
  * cache on every older build for nothing.
+ *
+ * Entry 8 (`session_activity`) is what the collision below produced: it and the
+ * session-statistics sync were two unreleased branches that each appended an
+ * "entry 7", and the merge kept BOTH — the sync as 7, session_activity as 8 —
+ * exactly because the log is keyed by NAME, not by position.
+ *
+ * **The number no longer decides anything, and that is what makes appending
+ * safe.** It was once the whole key — the loop ran `MIGRATIONS.slice(from)` — so
+ * two unreleased branches appending DIFFERENT entries under the same one
+ * collided on the machine-global database: whichever ran first stamped it, and
+ * the second build then saw `stored >= claimed`, ran nothing, and failed at
+ * query time with `no such table`, which reads like a code bug. That is why the
+ * log below is keyed by NAME. A branch that appends an entry the file has never
+ * seen now gets it applied whatever the stamp says, so the only remaining job of
+ * this number is migration bookkeeping.
  *
  * Bumping it is NOT a cross-surface event any more, and that is the one thing
  * worth knowing about it: nothing refuses a database over this number (see the
@@ -109,7 +126,7 @@ const log = createLogger("DashboardDb");
  * user's database (other processes may hold the file open, and the memory half
  * is the only copy there is).
  */
-export const DASHBOARD_SCHEMA_VERSION = 8;
+export const DASHBOARD_SCHEMA_VERSION = 9;
 
 /**
  * NOTE ON COMPATIBILITY, because its absence here is a decision.
@@ -317,11 +334,27 @@ export interface Migration {
  * being read under the old session-time fallback rather than dropping out of
  * every window for want of a value.
  *
- * There is no entry normalising a stored `0` in that column, and that absence is
- * a decision: the writers cannot produce one, and the reader treats one as
- * absent (`TOOL_CALL_TIME_SQL`'s `NULLIF`), which is both permanent and free
- * where a sixth entry would have been neither. See the note in `SotSchema.ts`
- * where that entry used to be.
+ * Entry 8 adds `session_activity`, with `recorded_at_ms` NOT NULL from the
+ * start. Carrying the column in the CREATE rather than appending it later is the
+ * whole reason it can be NOT NULL: SQLite's `ADD COLUMN` takes only a CONSTANT
+ * default, and the value is a wall-clock instant. That is entry 4's
+ * `last_call_at_ms` shape, whose permanent `NULLIF` handling at every read site
+ * is the price of having had no choice — here there was one, so it was taken.
+ *
+ * A dev machine that ran an EARLIER draft of this entry has the table under the
+ * same name, so the name key reads it as applied and does not replay it. If the
+ * draft's shape differed, that is drift rather than a missing table:
+ * {@link findDriftedMigrations} reports it and `jolli doctor --schema-log` lists
+ * it, and the repair is the operator's — `DROP TABLE session_activity`, then
+ * `jolli doctor --mark-migration` or a stamp the entry can replay under. Nothing
+ * here self-heals a column, and nothing should: replaying DDL over a table whose
+ * contents this build cannot vouch for is how a half-migrated file is made.
+ *
+ * There is no entry normalising a stored `0` in `last_call_at_ms`, and that
+ * absence is a decision: the writers cannot produce one, and the reader treats
+ * one as absent (`TOOL_CALL_TIME_SQL`'s `NULLIF`), which is permanent where a
+ * migration entry runs once. See the note in `SotSchema.ts` where that entry
+ * used to be.
  *
  * Exported for tests: they execute entries directly to build a database at a
  * chosen version rather than hand-rolling copies of the DDL, which would drift.
@@ -386,6 +419,7 @@ BEGIN SELECT RAISE(ABORT, 'repos are never deleted: set disabled_at instead'); E
 			SYNC_KEYSET_INDEX_DDL +
 			SYNC_STAMP_NULL_BACKFILL_DDL,
 	},
+	{ name: "SESSION_ACTIVITY_DDL", ddl: SESSION_ACTIVITY_DDL },
 ];
 
 /** Reads the stored schema version, treating a fresh DB as 0. */

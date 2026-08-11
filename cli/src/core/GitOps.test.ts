@@ -72,6 +72,7 @@ import {
 	resolveGitHooksDir,
 	resolveStateRoot,
 	resolveWorktreeRootOrNull,
+	resolveWorktreeRoots,
 	writeFileToBranch,
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
@@ -1753,6 +1754,52 @@ describe("GitOps", () => {
 		it("should throw on failure", async () => {
 			mockFailure(128, "fatal: not a git repository");
 			await expect(listWorktrees("/not/a/repo")).rejects.toThrow("Failed to list worktrees");
+		});
+	});
+
+	describe("resolveWorktreeRoots", () => {
+		it("returns the queried directory first, then its siblings", async () => {
+			mockSuccess(
+				"worktree /main/repo\nHEAD abc123\nbranch refs/heads/main\n\n" +
+					"worktree /main/worktrees/feature-a\nHEAD def456\nbranch refs/heads/feature/feature-a\n",
+			);
+			await expect(resolveWorktreeRoots("/main/repo")).resolves.toEqual([
+				"/main/repo",
+				"/main/worktrees/feature-a",
+			]);
+		});
+
+		it("does not repeat a directory git also lists", async () => {
+			// The queried directory seeds the set, so a linked worktree asking about
+			// ITSELF must not appear twice — callers feed this straight into per-root
+			// scans, and a duplicate root is a duplicate pass over every store.
+			mockSuccess(
+				"worktree /main/repo\nHEAD abc123\nbranch refs/heads/main\n\n" +
+					"worktree /main/worktrees/feature-a\nHEAD def456\nbranch refs/heads/feature/feature-a\n",
+			);
+			await expect(resolveWorktreeRoots("/main/worktrees/feature-a")).resolves.toEqual([
+				"/main/worktrees/feature-a",
+				"/main/repo",
+			]);
+		});
+
+		it("degrades to the directory itself when git cannot answer", async () => {
+			// The property every caller depends on: this runs on a sweep's critical path,
+			// so a missing git or a non-checkout must cost the widened scope, never the
+			// pass. Same answer the code had before roots existed.
+			mockFailure(128, "fatal: not a git repository");
+			await expect(resolveWorktreeRoots("/not/a/repo")).resolves.toEqual(["/not/a/repo"]);
+		});
+
+		it("dedupes a checkout git spells with different separators, keeping the caller's", async () => {
+			// `listWorktrees` returns git's own spelling (forward slashes, even on
+			// Windows) while `dir` arrives in the caller's (often backslashes). A
+			// raw-string Set kept BOTH — and the sole direct consumer that does not
+			// re-dedupe (Antigravity's per-repo narrowing) then pays a streamed title
+			// read per duplicate. The compare key folds `\` -> `/` on every platform, so
+			// this holds on the Linux runner too; the surviving string is the caller's.
+			mockSuccess("worktree /srv/repo\nHEAD abc123\nbranch refs/heads/main\n");
+			await expect(resolveWorktreeRoots("\\srv\\repo")).resolves.toEqual(["\\srv\\repo"]);
 		});
 	});
 

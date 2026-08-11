@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,6 +31,11 @@ vi.mock("../core/GitOps.js", () => ({
 	// reaches this export; unmocked it would spawn git against a worktree these
 	// tests never create.
 	listFilesInBranch: vi.fn(),
+	// The session tier scopes itself to every linked worktree. The real helper
+	// shells `git worktree list`; here the fixture repo IS the only checkout, so
+	// the default answer is the identity — the same thing the real one degrades to
+	// when git cannot answer.
+	resolveWorktreeRoots: vi.fn(async (dir: string) => [dir]),
 }));
 vi.mock("../core/SummaryStore.js", () => ({
 	getIndex: vi.fn(),
@@ -114,7 +119,7 @@ import { scanCopilotSessionsOnDisk } from "../core/CopilotSessionDiscoverer.js";
 import { scanCursorCliSessionsOnDisk } from "../core/CursorCliSessionDiscoverer.js";
 import { scanCursorComposersOnDisk } from "../core/CursorSessionDiscoverer.js";
 import { scanDevinSessionsOnDisk } from "../core/DevinSessionDiscoverer.js";
-import { execGit, getHeadHash, listFilesInBranch } from "../core/GitOps.js";
+import { execGit, getHeadHash, listFilesInBranch, resolveWorktreeRoots } from "../core/GitOps.js";
 import { scanKimiSessionsOnDisk } from "../core/KimiSessionDiscoverer.js";
 import { scanOpenCodeSessionsOnDisk } from "../core/OpenCodeSessionDiscoverer.js";
 import { readCutoverFence, readManualDisableFlagSync } from "../core/RepoProfile.js";
@@ -295,7 +300,7 @@ describe("dbBackfillRepo — bootstrap", () => {
 			// full transcript read produced the stored session rows, and it is the only
 			// thing that makes the per-session skip safe to trust. See
 			// `SESSION_READ_GENERATION`.
-			{ source: "sessions-read-generation", cursor: "4" },
+			{ source: "sessions-read-generation", cursor: "5" },
 			// The memory import's own signal: the orphan tip (a hash of everything it
 			// reads) plus the mode, since seed and catch-up do not write the same rows.
 			{ source: "sot-import", cursor: `${"ab".repeat(20)}#seed` },
@@ -744,6 +749,26 @@ describe("dbBackfillRepos", () => {
 		expect(scanCursorComposersOnDisk).not.toHaveBeenCalled();
 	});
 
+	it("hands the session tier its checkouts and its worktrees as SEPARATE lists", async () => {
+		// Two granularities, and conflating them loses sessions. `worktreeRoots` is the
+		// union of every linked worktree of every registered checkout, because a
+		// conversation is keyed by the directory it ran in. `checkoutRoots` names the
+		// checkouts themselves, because that is what a worktree-spanning source is asked
+		// at — such a source resolves the worktrees of the repository it is HANDED, so
+		// one call answers for one clone and reaches no other clone's `.git`.
+		const cloneB = join(dir, "clone-b");
+		mkdirSync(cloneB, { recursive: true });
+		vi.mocked(resolveWorktreeRoots).mockImplementation(async (root: string) => [root, join(root, "wt")]);
+
+		await dbBackfillRepos([{ ...repo, worktrees: [repo.worktreeRoot, cloneB] }], { dbPath });
+
+		const opts = vi.mocked(collectSessionEvents).mock.calls[0][0];
+		expect([...(opts.checkoutRoots ?? [])].sort()).toEqual([repo.worktreeRoot, cloneB].sort());
+		// The linked worktrees reach the per-root half and only that half.
+		expect(opts.worktreeRoots).toContain(join(cloneB, "wt"));
+		expect(opts.checkoutRoots).not.toContain(join(cloneB, "wt"));
+	});
+
 	it("keeps a custom session loader isolated from real machine-global stores", async () => {
 		const loadSessions = vi.fn(async () => []);
 
@@ -1090,7 +1115,7 @@ describe("dbBackfillRepo — per-session skip", () => {
 		const cursors = await query<{ source: string; cursor: string }>(
 			"SELECT source, cursor FROM ingest_cursors WHERE source = 'sessions-read-generation'",
 		);
-		expect(cursors).toEqual([{ source: "sessions-read-generation", cursor: "4" }]);
+		expect(cursors).toEqual([{ source: "sessions-read-generation", cursor: "5" }]);
 		// And the second sweep is the one that gets a predicate.
 		await dbBackfillRepo({ repo, dbPath });
 		expect(vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0].isAlreadyCurrent).toBeDefined();
@@ -1125,7 +1150,7 @@ describe("dbBackfillRepo — per-session skip", () => {
 		const cursors = await query<{ cursor: string }>(
 			"SELECT cursor FROM ingest_cursors WHERE source = 'sessions-read-generation'",
 		);
-		expect(cursors).toEqual([{ cursor: "4" }]);
+		expect(cursors).toEqual([{ cursor: "5" }]);
 	});
 });
 
@@ -1802,6 +1827,54 @@ describe("dbBackfillRepo — sessions sweep", () => {
 		expect(await loggedSessions("s1")).toBe(2);
 		const row = await query<{ title: string }>("SELECT title FROM sessions WHERE session_id = 's1'");
 		expect(row).toEqual([{ title: "a conversation" }]);
+	});
+
+	it("still projects a session whose activity buckets arrived later", async () => {
+		// The regression this comparison exists to stop repeating: `session_activity`
+		// shipped as a new table, so every already-stored session was byte-identical on
+		// every OTHER column and the event was dropped before the projection could
+		// insert a single bucket. Re-reading the transcript does not help — it rebuilds
+		// the event, and this is the gate the event dies at.
+		vi.mocked(collectSessionEvents).mockResolvedValue([richSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...richSession, activityBuckets: [1_700_000_000_000, 1_700_000_900_000] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const rows = await query<{ bucket_ms: number }>(
+			`SELECT a.bucket_ms FROM session_activity a
+			   JOIN sessions s ON s.event_id = a.session_event_id
+			  WHERE s.session_id = 's1' ORDER BY a.bucket_ms`,
+		);
+		expect(rows).toEqual([{ bucket_ms: 1_700_000_000_000 }, { bucket_ms: 1_700_000_900_000 }]);
+	});
+
+	it("does not re-enqueue a session whose buckets are all stored, including a shrinking re-read", async () => {
+		// CONTAINMENT, not set equality. A re-read that yields FEWER buckets is routine
+		// (a host truncated its store, Devin's regenerated main chain walks a different
+		// branch), and the insert-only projection would keep the missing ones anyway —
+		// so calling that a change would re-project the session on every pass forever to
+		// write nothing at all.
+		const withBuckets = { ...richSession, activityBuckets: [1_700_000_000_000, 1_700_000_900_000] };
+		vi.mocked(collectSessionEvents).mockResolvedValue([withBuckets]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([withBuckets]);
+		await dbBackfillRepo({ repo, dbPath });
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...richSession, activityBuckets: [1_700_000_000_000] }]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+		const rows = await query<{ c: number }>(
+			`SELECT COUNT(*) c FROM session_activity a
+			   JOIN sessions s ON s.event_id = a.session_event_id
+			  WHERE s.session_id = 's1'`,
+		);
+		expect(rows).toEqual([{ c: 2 }]);
 	});
 
 	it("still projects a session whose model split arrived later", async () => {
@@ -2620,6 +2693,33 @@ describe("dbRescanSessions", () => {
 		await dbRescanSessions({ repos: [repo], dbPath, windowMs: 12_345, emitted: new Map() });
 
 		expect(scanCodexSessionsOnDisk).toHaveBeenCalledWith(12_345);
+	});
+
+	it("passes every sibling checkout and worktree to the collector, matching the back-fill", async () => {
+		// Regression: the tick used to hand `collectSessionEvents` only `cwd`, so it
+		// narrowed `preScanned` against one checkout and a sibling's sessions failed
+		// every source's path-containment rule by construction — invisible until the
+		// next full back-fill. It must pass the SAME roots `dbBackfillRepo` does.
+		const a = mkdtempSync(join(tmpdir(), "jolli-rescan-a-"));
+		const b = mkdtempSync(join(tmpdir(), "jolli-rescan-b-"));
+		try {
+			vi.mocked(resolveWorktreeRoots).mockImplementation(async (root: string) => [root, join(root, "wt")]);
+			const multi = { ...repo, worktrees: [a, b] };
+			await dbBackfillRepo({ repo: multi, dbPath });
+			vi.mocked(collectSessionEvents).mockClear();
+
+			await dbRescanSessions({ repos: [multi], dbPath, emitted: new Map() });
+
+			// Order is `existingWorktrees`' (newest checkout first), not asserted here —
+			// what matters for the regression is that BOTH checkouts and BOTH their
+			// linked worktrees reach the collector.
+			const call = vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0];
+			expect([...(call?.checkoutRoots ?? [])].sort()).toEqual([a, b].sort());
+			expect([...(call?.worktreeRoots ?? [])].sort()).toEqual([a, join(a, "wt"), b, join(b, "wt")].sort());
+		} finally {
+			rmSync(a, { recursive: true, force: true });
+			rmSync(b, { recursive: true, force: true });
+		}
 	});
 
 	it("accepts a baseline recorded at an OLDER read generation", async () => {

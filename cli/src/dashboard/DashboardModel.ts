@@ -88,6 +88,19 @@ export interface SessionUpsertedEvent {
 	 * without tool parsing from erasing what a full read collected.
 	 */
 	readonly tools?: ReadonlyArray<ToolCallCount>;
+	/**
+	 * Quarter-hour buckets in which this session produced a message. REPLACES
+	 * the stored set when present; `undefined` means "this producer could not
+	 * see per-message timestamps" and leaves the rows alone — which is what
+	 * keeps a re-upsert from a source without timestamps from erasing what a
+	 * full read collected.
+	 *
+	 * Producers must send `undefined`, never `[]`, when nothing was timestamped:
+	 * a source whose reader emits no timestamps computes an empty array on every
+	 * read, and emitting it would assert "measured, no activity" about a source
+	 * that was never measurable.
+	 */
+	readonly activityBuckets?: ReadonlyArray<number>;
 }
 
 /**
@@ -1101,6 +1114,55 @@ export interface HourBucket {
 	readonly sessions: number;
 }
 
+/** One quarter-hour and how many distinct agent sessions were active in it. */
+export interface ConcurrencyBucket {
+	readonly bucketMs: number;
+	readonly sessions: number;
+}
+
+/**
+ * How many agents ran at the same time — machine-global and self-only.
+ *
+ * Deliberately NOT filtered by the page's repo scope: concurrency means "how
+ * many things was this person doing at once", which is a property of the person
+ * and not of a repository. A per-repo figure truncates the number into
+ * something with no actionable meaning.
+ */
+export interface ConcurrencyModel {
+	/** Only buckets with at least one session; ascending. */
+	readonly buckets: ReadonlyArray<ConcurrencyBucket>;
+	/** Bucket width, carried on the wire so a renderer never hardcodes it. */
+	readonly bucketMinutes: number;
+	/**
+	 * Highest session count in any one bucket — an UPPER BOUND on instantaneous
+	 * concurrency, not the thing itself: two sessions active in the same quarter
+	 * hour need not overlap at any instant. Any label must say "agents active
+	 * within the same 15 minutes", never "running simultaneously".
+	 */
+	readonly peak: number;
+	/**
+	 * Mean session count over ACTIVE buckets. The denominator is deliberately
+	 * the buckets with activity, not the buckets in the window: a 7-day window
+	 * holds 672 buckets and dividing by all of them yields ~0.2, a figure with
+	 * no meaning. Any label must state the denominator.
+	 */
+	readonly meanActive: number;
+	/** Sources that contributed at least one bucket in the window. */
+	readonly measuredSources: ReadonlyArray<string>;
+	/**
+	 * Sources whose in-window sessions produced NO activity bucket at all —
+	 * uncovered, not idle.
+	 *
+	 * Deliberately not the complement of {@link measuredSources}: that one is
+	 * scoped to buckets inside the window and answers "did this source draw a
+	 * bar", which a session admitted by `updatedAt` while all its turns predate
+	 * the window fails despite being perfectly measurable. This asks whether the
+	 * source's own sessions ever produced a bucket at all. The two lists can
+	 * therefore overlap, and the overlap is honest.
+	 */
+	readonly uncoveredSources: ReadonlyArray<string>;
+}
+
 export interface FunStats {
 	readonly legendarySessionMinutes: number;
 	readonly legendarySessionTitle?: string;
@@ -1355,6 +1417,10 @@ export interface StatsModel {
 	readonly decisions?: DecisionsCard;
 	/** Skills, MCP servers and the tool mix — Claude-only coverage, stated. */
 	readonly toolUsage: ToolUsage;
+	/** Absent when no bucket falls in the window — a consumer shows "no data",
+	 *  never a zero. Under forward-only collection this is the normal state for
+	 *  the first days after deployment. */
+	readonly concurrency?: ConcurrencyModel;
 }
 
 /** A commit row on the Standup page. */

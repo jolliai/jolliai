@@ -54,6 +54,7 @@ import {
 	pushTopicsSection,
 } from "./SummaryMarkdownBuilder.js";
 import { getActiveStorage, getIndexEntryMap, getSummary, storeSummary } from "./SummaryStore.js";
+import { collectTranscriptSessionMeta, type TranscriptSessionMeta } from "./TranscriptSessionMeta.js";
 
 /**
  * Re-exported so every existing importer (the ide-bridge, `PushExecutor`, the
@@ -76,6 +77,19 @@ const log = createLogger("JolliMemoryPushOrchestrator");
 const MAX_SUMMARY_JSON_BYTES = 1_572_864;
 
 /**
+ * A summary as the PUSH path sees it: the stored record plus the push-time
+ * session enrichment.
+ *
+ * The extra field lives here, not on `CommitSummary`, on purpose — the storage
+ * path cannot name it, so it cannot persist it. That is what keeps this change
+ * clear of the stored-schema lockstep contracts (FolderStorage's hidden layer
+ * and the IntelliJ readers over it).
+ */
+export type EnrichedPushSummary = CommitSummary & {
+	readonly transcriptSessions?: ReadonlyArray<TranscriptSessionMeta>;
+};
+
+/**
  * Serializes a summary for the `summaryJson` push field: the enriched
  * `summaryForMarkdown` copy (plan/note URLs woven in) minus the client push-state
  * fields — `jolliDocId`/`jolliDocUrl` and their skill-article siblings
@@ -86,8 +100,13 @@ const MAX_SUMMARY_JSON_BYTES = 1_572_864;
  * unchanged content, so the server upsert can no-op — per-plan/note `jolliPlan*`/
  * `jolliNote*` ids nested inside `plans[]`/`notes[]` are untouched and can still
  * churn). Returns undefined above {@link MAX_SUMMARY_JSON_BYTES}.
+ *
+ * If the payload is over the cap and carries the `transcriptSessions` push-time
+ * enrichment, retries once without it before giving up on the whole sidecar —
+ * the enrichment is a small optional extra, so shedding it alone is strictly
+ * better than losing the entire JSON to it.
  */
-export function serializeSummaryJson(summary: CommitSummary): string | undefined {
+export function serializeSummaryJson(summary: EnrichedPushSummary): string | undefined {
 	const {
 		jolliDocId: _docId,
 		jolliDocUrl: _docUrl,
@@ -103,13 +122,24 @@ export function serializeSummaryJson(summary: CommitSummary): string | undefined
 		...content
 	} = summary;
 	const json = JSON.stringify(content);
-	if (Buffer.byteLength(json, "utf-8") > MAX_SUMMARY_JSON_BYTES) {
-		log.warn(
-			`Summary JSON for ${summary.commitHash.substring(0, 8)} exceeds ${MAX_SUMMARY_JSON_BYTES} bytes — pushing markdown only`,
-		);
-		return;
+	if (Buffer.byteLength(json, "utf-8") <= MAX_SUMMARY_JSON_BYTES) return json;
+	// The session enrichment is a push-time extra, so shedding it is strictly
+	// better than shedding the whole sidecar — which is what the cap otherwise
+	// does. Worst case becomes the pre-enrichment behavior, never worse.
+	if (content.transcriptSessions !== undefined) {
+		const { transcriptSessions: _sessions, ...withoutSessions } = content;
+		const retry = JSON.stringify(withoutSessions);
+		if (Buffer.byteLength(retry, "utf-8") <= MAX_SUMMARY_JSON_BYTES) {
+			log.warn(
+				`Summary JSON for ${summary.commitHash.substring(0, 8)} exceeds ${MAX_SUMMARY_JSON_BYTES} bytes — pushing without session metadata`,
+			);
+			return retry;
+		}
 	}
-	return json;
+	log.warn(
+		`Summary JSON for ${summary.commitHash.substring(0, 8)} exceeds ${MAX_SUMMARY_JSON_BYTES} bytes — pushing markdown only`,
+	);
+	return;
 }
 
 /**
@@ -403,11 +433,18 @@ export async function pushSummary(
 
 	const published = await pushContextAttachments(summary, ctx, envKey, selection);
 
+	// Push-time session enrichment. Read from the artifacts this tree references,
+	// stamped on the root only (the server merges duplicate rows keep-first), and
+	// omitted entirely when empty so absence never reads as a measured zero.
+	const transcriptSessions = await collectTranscriptSessionMeta(summary, ctx.cwd, ctx.storage);
 	// Weave the published URLs into the copy the markdown is rendered from, so the
 	// article's Context list links to the published docs. `reduceOwnItems` first:
 	// only the reduced set was uploaded (same-named plan snapshots collapse), so the
 	// rendered body must list the same set.
-	const summaryForMarkdown = applyPublishedUrls(reduceOwnItems(summary), published);
+	const summaryForMarkdown: EnrichedPushSummary = {
+		...applyPublishedUrls(reduceOwnItems(summary), published),
+		...(transcriptSessions.length > 0 && { transcriptSessions }),
+	};
 	const markdown = buildPushMarkdown(summaryForMarkdown);
 	// The structured twin of the markdown article, from the same enriched copy —
 	// the share page renders it directly instead of regex-parsing the markdown.

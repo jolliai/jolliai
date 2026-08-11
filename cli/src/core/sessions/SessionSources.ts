@@ -219,6 +219,9 @@ const cursorCliSource = defineSessionSource<DiskSession>({
 const antigravitySource = defineSessionSource<DiskSession>({
 	source: "antigravity",
 	usesAlreadyRecorded: true,
+	// The only entry that declares it: `antigravitySessionsForRepo` runs its own
+	// `resolveWorktreeRoots`, so asking it once already covers every checkout.
+	forRepoSpansWorktrees: true,
 	scan: async ({ windowMs, alreadyRecorded }) => {
 		const mod = await import("../AntigravitySessionDiscoverer.js");
 		const result = alreadyRecorded

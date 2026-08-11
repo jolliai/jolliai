@@ -478,11 +478,13 @@ function isUnknownTypeError(err: unknown): boolean {
 /**
  * Dispatches one event to its projection. Must run inside a transaction.
  *
- * `nowMs` is the wall clock for the per-row sync stamps (see `SYNC_STAMP_DDL`).
- * It is threaded rather than read inside each projection so tests can pin it,
- * and so it is visibly NOT one of the event's own business timestamps — writing
- * `event.updatedAtMs` into a stamp would quietly turn it into a second business
- * clock and defeat the column's only purpose.
+ * `nowMs` is the wall clock for the per-row sync stamps (see `SYNC_STAMP_DDL`)
+ * and for the one projection that stamps a row with wall-clock
+ * (`session_activity.recorded_at_ms`). It is read once per drained row and
+ * threaded rather than read from `Date.now` inside each projection, so tests can
+ * pin it, and so it is visibly NOT one of the event's own business timestamps —
+ * writing `event.updatedAtMs` into a stamp would quietly turn it into a second
+ * business clock and defeat the column's only purpose.
  */
 function projectEvent(db: DashboardDbHandle, event: StatsEvent, nowMs: number): void {
 	switch (event.type) {
@@ -1031,6 +1033,31 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 			);
 		}
 	}
+
+	// NOT the replace-when-observed contract the two blocks above use, and the
+	// asymmetry is the point: a bucket is a monotone historical fact, not a
+	// restatement of a current total, so no read may remove one. See
+	// SESSION_ACTIVITY_DDL for why (a truncating host and Devin's regenerated
+	// main chain both make a re-read return a non-superset, and deleting there
+	// destroys presence the transcript can no longer prove).
+	//
+	// The `!== undefined` guard therefore no longer decides whether to DELETE —
+	// it now only skips the loop for a source that measures no timestamps. It
+	// stays because `[]` and absent still MEAN different things everywhere else,
+	// and collapsing them here would invite collapsing them upstream.
+	//
+	// `OR IGNORE` keeps a re-observed bucket's ORIGINAL `recorded_at_ms`, which
+	// is what stops a 60 s tick re-presenting a whole session as new to a sync
+	// cursor reading that column.
+	if (event.activityBuckets !== undefined) {
+		const recordedAtMs = nowMs;
+		const insertBucket = db.prepare(
+			"INSERT OR IGNORE INTO session_activity (session_event_id, bucket_ms, recorded_at_ms) VALUES (?, ?, ?)",
+		);
+		for (const bucket of event.activityBuckets) {
+			insertBucket.run(eventId, bucket, recordedAtMs);
+		}
+	}
 }
 
 /**
@@ -1535,5 +1562,60 @@ export function pruneProjectedEvents(db: DashboardDbHandle, now: () => number = 
 		// Housekeeping must never fail a write that already succeeded.
 		log.debug("%sevent pruning skipped: %s", tag, errMsg(err));
 		return 0;
+	}
+}
+
+/**
+ * Returns every STUCK event to the queue with a fresh attempt budget, and reports
+ * how many were revived.
+ *
+ * "Stuck" is exactly {@link countStuckEvents}' set — both statements share
+ * {@link REVIVABLE_PREDICATE} so the number doctor COUNTS and the number `--fix`
+ * can REACH cannot disagree. That excludes the `unknown-type` rows a drain revives
+ * on its own (touching them would reset an attempt budget the build still cannot
+ * spend) and INCLUDES the rows nothing revives automatically: `failed_kind =
+ * 'error'`, the pre-migration `NULL` rows, and an `unknown-type` whose event type
+ * this build still does not recognise. An earlier revision narrowed this to
+ * `failed_kind = 'error'` alone, which left both NULL and unrecognised-type rows
+ * counted-but-unfixable — reported to the user with no way to act on them.
+ *
+ * **Deliberately manual.** The automatic revivals are each keyed to evidence the
+ * blocker is gone — a lock contention never spends the budget, `unknown-type` is
+ * scoped to types this build now understands. A stuck row carries no such
+ * evidence, so the only honest trigger is an operator who has just fixed something
+ * (upgraded the CLI, restored a migration). Calling this on every drain would
+ * spend attempts forever on a genuinely defective event.
+ *
+ * The caller supplies the writable handle: this runs inside whatever transaction
+ * or lock the caller already holds, and the caller is the one that knows whether
+ * a drain should follow.
+ *
+ * Degrades on a pre-migration schema exactly as {@link countStuckEvents} does —
+ * there is no `failed_kind` column to null out or to narrow by, and every `failed`
+ * row is stuck there, so the whole set is un-parked.
+ */
+export function unparkStuckEvents(db: DashboardDbHandle): number {
+	const revivable = KNOWN_EVENT_TYPES.map(() => "?").join(", ");
+	try {
+		const result = db
+			.prepare(
+				`UPDATE events_raw SET projection_status = 'pending', attempts = 0, failed_kind = NULL
+				  WHERE projection_status = 'failed'
+				    AND NOT (${REVIVABLE_PREDICATE} AND type IN (${revivable}))`,
+			)
+			.run(...KNOWN_EVENT_TYPES) as { changes?: number | bigint };
+		const revived = Number(result?.changes ?? 0);
+		if (revived > 0) log.info("un-parked %d stuck event(s) for reprojection", revived);
+		return revived;
+	} catch (err) {
+		if (!/no such column: failed_kind/i.test(errMsg(err))) throw err;
+		const result = db
+			.prepare(
+				"UPDATE events_raw SET projection_status = 'pending', attempts = 0 WHERE projection_status = 'failed'",
+			)
+			.run() as { changes?: number | bigint };
+		const revived = Number(result?.changes ?? 0);
+		if (revived > 0) log.info("un-parked %d stuck event(s) for reprojection (pre-migration schema)", revived);
+		return revived;
 	}
 }

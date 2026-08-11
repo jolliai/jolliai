@@ -28,6 +28,7 @@
  * (per-kind reduced) are pushed — the standalone button's existing behavior.
  */
 
+import { errMsg } from "../../../cli/src/Logger.js";
 import type { CommitSummary, NoteReference, PlanReference, ReferenceCommitRef } from "../../../cli/src/Types.js";
 import { deriveJolliEnvKey, resolveArticleUrl } from "../../../cli/src/core/JolliApiUtils.js";
 import { DocTypeNotAllowedError } from "../../../cli/src/core/JolliMemoryPushClient.js";
@@ -49,6 +50,7 @@ import {
 import { canReuseDocId } from "../../../cli/src/core/push/DocIdReuse.js";
 import { adoptLegacySkillDocIds } from "../../../cli/src/core/push/LegacySkillDocIds.js";
 import { track } from "../../../cli/src/core/Telemetry.js";
+import { collectTranscriptSessionMeta, type TranscriptSessionMeta } from "../../../cli/src/core/TranscriptSessionMeta.js";
 import { log } from "../util/Logger.js";
 import { buildBranchRelativePath, buildPushTitle } from "../views/SummaryUtils.js";
 import { buildMarkdown } from "../views/SummaryMarkdownBuilder.js";
@@ -98,6 +100,18 @@ export class ShareBindingError extends Error {
 const MAX_SUMMARY_JSON_BYTES = 1_572_864;
 
 /**
+ * A summary as the PUSH path sees it: the stored record plus the push-time
+ * session enrichment.
+ *
+ * The extra field lives here, not on `CommitSummary`, on purpose — the storage
+ * path cannot name it, so it cannot persist it. Mirrors
+ * `EnrichedPushSummary` in the CLI's `JolliMemoryPushOrchestrator.ts`.
+ */
+export type EnrichedPushSummary = CommitSummary & {
+	readonly transcriptSessions?: ReadonlyArray<TranscriptSessionMeta>;
+};
+
+/**
  * Serializes a summary for the `summaryJson` push field: the enriched
  * `summaryForMarkdown` copy (plan/note URLs woven in) minus the client push-state
  * fields — `jolliDocId`/`jolliDocUrl` and their skill-article siblings
@@ -108,8 +122,13 @@ const MAX_SUMMARY_JSON_BYTES = 1_572_864;
  * in the same run, so `applyPublishedUrls` has already woven its id/URL onto the
  * summary by the time we serialize. Returns undefined (with a warning) above
  * {@link MAX_SUMMARY_JSON_BYTES}.
+ *
+ * If the payload is over the cap and carries the `transcriptSessions` push-time
+ * enrichment, retries once without it before giving up on the whole sidecar —
+ * the enrichment is a small optional extra, so shedding it alone is strictly
+ * better than losing the entire JSON to it.
  */
-export function serializeSummaryJson(summary: CommitSummary): string | undefined {
+export function serializeSummaryJson(summary: EnrichedPushSummary): string | undefined {
 	const {
 		jolliDocId: _docId,
 		jolliDocUrl: _docUrl,
@@ -119,14 +138,26 @@ export function serializeSummaryJson(summary: CommitSummary): string | undefined
 		...content
 	} = summary;
 	const json = JSON.stringify(content);
-	if (Buffer.byteLength(json, "utf-8") > MAX_SUMMARY_JSON_BYTES) {
-		log.warn(
-			"PushOrchestrator",
-			`Summary JSON for ${summary.commitHash.substring(0, 8)} exceeds ${MAX_SUMMARY_JSON_BYTES} bytes — pushing markdown only`,
-		);
-		return;
+	if (Buffer.byteLength(json, "utf-8") <= MAX_SUMMARY_JSON_BYTES) return json;
+	// The session enrichment is a push-time extra, so shedding it is strictly
+	// better than shedding the whole sidecar — which is what the cap otherwise
+	// does. Worst case becomes the pre-enrichment behavior, never worse.
+	if (content.transcriptSessions !== undefined) {
+		const { transcriptSessions: _sessions, ...withoutSessions } = content;
+		const retry = JSON.stringify(withoutSessions);
+		if (Buffer.byteLength(retry, "utf-8") <= MAX_SUMMARY_JSON_BYTES) {
+			log.warn(
+				"PushOrchestrator",
+				`Summary JSON for ${summary.commitHash.substring(0, 8)} exceeds ${MAX_SUMMARY_JSON_BYTES} bytes — pushing without session metadata`,
+			);
+			return retry;
+		}
 	}
-	return json;
+	log.warn(
+		"PushOrchestrator",
+		`Summary JSON for ${summary.commitHash.substring(0, 8)} exceeds ${MAX_SUMMARY_JSON_BYTES} bytes — pushing markdown only`,
+	);
+	return;
 }
 
 /** Everything the orchestrator needs that isn't on the summary itself. */
@@ -299,7 +330,31 @@ export async function pushSummaryWithAttachments(
 		// article's Context list links to the published docs). `reduceOwnItems`
 		// first — only the reduced set was uploaded (same-named plan snapshots
 		// collapse), so the rendered body must list the same set.
-		const summaryForMarkdown = applyPublishedUrls(reduceOwnItems(summary), published);
+		//
+		// Push-time session enrichment rides along. Read from the artifacts this tree
+		// references, stamped on the root only (the server merges duplicate rows
+		// keep-first), and omitted entirely when empty so absence never reads as a
+		// measured zero. No storage is threaded — this is a read, so the fallback to
+		// the orphan branch (the system of record) inside `resolveStorage` is the
+		// correct source.
+		//
+		// `collectTranscriptSessionMeta` already swallows its own failures and
+		// resolves to `[]`, but this is belt-and-suspenders: the enrichment is an
+		// optional extra, so a defensive catch here too means this call site can
+		// never abort the push, even if that internal guarantee ever regresses.
+		let transcriptSessions: ReadonlyArray<TranscriptSessionMeta> = [];
+		try {
+			transcriptSessions = await collectTranscriptSessionMeta(summary, ctx.workspaceRoot);
+		} catch (err) {
+			log.warn(
+				"PushOrchestrator",
+				`Transcript session enrichment failed for ${summary.commitHash.substring(0, 8)} (non-fatal, pushing without it): ${errMsg(err)}`,
+			);
+		}
+		const summaryForMarkdown: EnrichedPushSummary = {
+			...applyPublishedUrls(reduceOwnItems(summary), published),
+			...(transcriptSessions.length > 0 && { transcriptSessions }),
+		};
 		const markdown = buildMarkdown(summaryForMarkdown);
 		// The structured twin of the markdown article, from the same enriched copy —
 		// the share page renders it directly instead of regex-parsing the markdown.

@@ -544,13 +544,20 @@ ALTER TABLE session_tool_use ADD COLUMN last_call_at_ms INTEGER;
  *    long finished by the time that writer stores its first 0. Only the read can
  *    be permanent, which is why `TOOL_CALL_TIME_SQL` wraps the column in
  *    `NULLIF` rather than trusting what is on disk.
- *  - **It cost a cross-surface version bump for a provably empty set.** Every
- *    surface refuses a database stamped ahead of its own build, so a bump locks
- *    older CLI / VS Code / IntelliJ builds out of the machine-global file. What
- *    the sweep would have cleaned is 0 rows, and not merely by measurement:
- *    both write paths DELETE the session's rows before inserting, so `ON
- *    CONFLICT` can only fire on a duplicate `(tool_name, kind)` within one
- *    event, which `ToolUseTally` cannot emit — that pair is its bucket key.
+ *  - **It would have cleaned a provably empty set**, and not merely by
+ *    measurement: both write paths DELETE the session's rows before inserting,
+ *    so `ON CONFLICT` can only fire on a duplicate `(tool_name, kind)` within
+ *    one event, which `ToolUseTally` cannot emit — that pair is its bucket key.
+ *    An entry that does nothing is not a cheap precaution: a shipped entry's
+ *    name is permanent and its DDL is frozen, so it stays in `MIGRATIONS`, in
+ *    the fingerprint test and in every database's log forever.
+ *
+ * The argument originally written here was the cross-surface cost of the
+ * version bump — every surface refusing a file stamped ahead of its own build.
+ * That premise is gone: the compatibility gate was removed, and a newer file is
+ * now opened and written normally with one warn-once line (see
+ * `DASHBOARD_SCHEMA_VERSION`). The conclusion is unchanged on the two reasons
+ * above, which never depended on it.
  */
 
 /**
@@ -776,6 +783,90 @@ CREATE INDEX ix_schema_migrations_name ON schema_migrations(name, seq);
  */
 export const REPOS_DELETE_ALLOWED_DDL = `
 DROP TRIGGER IF EXISTS repos_no_delete;
+`;
+
+/**
+ * One row per (session, 15-minute bucket) in which that session produced a
+ * message — the input to the concurrency figure.
+ *
+ * `bucket_ms` holds an ABSOLUTE epoch-ms bucket start, not a localised day or
+ * hour key: time zone is a render-time concern that `localDayKey` / `localHour`
+ * already handle in the query layer, and a stored localised copy would be a
+ * second answer to a question that already has one.
+ *
+ * Buckets rather than a stored `(start, end)` interval because a resumed
+ * session is common and its span is not its presence — measured, the longest
+ * session on the author's machine spans 18 hours across 28 messages. A bucket
+ * list occupies only the quarter-hours the session actually spoke in, with no
+ * gap-threshold parameter to tune.
+ *
+ * `INTEGER` under STRICT is load-bearing twice: `node:sqlite` returns these as
+ * JS numbers (epoch ms sits ~5000x below `Number.MAX_SAFE_INTEGER`), and STRICT
+ * REJECTS a REAL here, so a missing `Math.floor` upstream fails at insert
+ * instead of storing a fractional bucket that defeats the primary key.
+ *
+ * ## This table is INSERT-ONLY, unlike its two siblings
+ *
+ * `projectSession` replaces `session_model_usage` and `session_tool_use`
+ * wholesale on every observed read, and this table deliberately does NOT follow
+ * that contract. Those two restate a CURRENT TOTAL — a re-read that attributes
+ * tokens to fewer models supersedes the old split, and leaving a stale row would
+ * stop the split summing to the scalar columns. A bucket is not a total; it is a
+ * MONOTONE HISTORICAL FACT. "This session produced a message in this
+ * quarter-hour" cannot become false, so there is no read whose result should
+ * remove one.
+ *
+ * The reads that would have removed one are all cases where the EVIDENCE went
+ * away, not the fact:
+ *
+ *  - A host that rotates or truncates its own store (the SQLite-backed sources
+ *    own their retention; nothing here does).
+ *  - Devin, whose `message_nodes` is a forest: a regeneration moves
+ *    `sessions.main_chain_id`, so a re-read walks a DIFFERENT chain, not a
+ *    superset of the old one. The developer was still present in those buckets.
+ *
+ * Under the old wholesale replace, both of those deleted true presence and the
+ * transcript could no longer prove it — an unrecoverable loss. The cost of
+ * insert-only is the mirror image and is recoverable: a bucket computed from a
+ * BAD read (a parser reading Devin's epoch SECONDS as ms, a local-time string
+ * parsed as UTC) now persists instead of being corrected by the next re-read.
+ * That is a deliberate trade — a wrong row can be repaired by an explicit
+ * rebuild, a deleted row cannot be repaired at all — and it is why no repair
+ * path ships with this: the failure it guards against needs a parser bug first.
+ *
+ * `ON DELETE CASCADE` stays, and is not a hole in the above: nothing deletes
+ * from `sessions` today, and if something ever does, these rows reference a
+ * parent that no longer exists. Insert-only is a rule about RE-OBSERVATION, not
+ * about referential cleanup.
+ *
+ * ## `recorded_at_ms` is a sync cursor, not a business time
+ *
+ * The instant the row was first INSERTed locally — deliberately NOT anything
+ * about the conversation. `bucket_ms` cannot serve as a cursor: a backfill over
+ * old transcripts inserts old buckets today, and a `bucket_ms > lastSync` reader
+ * would skip every one of them. This column answers only "what is new SINCE my
+ * last upload", which is the one question a downstream sync has to ask without
+ * knowing anything about what a bucket means.
+ *
+ * `INSERT OR IGNORE` is what makes it stable: a re-observed bucket keeps the
+ * timestamp of its FIRST insert rather than being bumped, so re-reading a
+ * session every 60 s does not re-present its whole history as new work.
+ *
+ * Two properties a consumer must not assume. The clock is `Date.now()`, so it is
+ * not monotonic across an NTP correction — pair the cursor with an idempotent
+ * upstream upsert and resume at `>= lastSync` rather than `>`, which also
+ * absorbs the same-millisecond boundary. And it is a LOCAL time: two machines
+ * belonging to one developer stamp independently.
+ */
+export const SESSION_ACTIVITY_DDL = `
+CREATE TABLE session_activity (
+  session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE,
+  bucket_ms        INTEGER NOT NULL,
+  recorded_at_ms   INTEGER NOT NULL,
+  PRIMARY KEY (session_event_id, bucket_ms)
+) STRICT;
+CREATE INDEX ix_activity_bucket ON session_activity(bucket_ms);
+CREATE INDEX ix_activity_recorded ON session_activity(recorded_at_ms);
 `;
 
 /**

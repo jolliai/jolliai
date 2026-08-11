@@ -51,7 +51,6 @@ import {
 } from "../dashboard/Recovery.js";
 import { backupRepoRegistry, forgetRepos, type RegistrySurvey, surveyRepoRegistry } from "../dashboard/RepoForget.js";
 import { getRepoRegistryPath, type RegistryRepair, repairRegistryEntries } from "../dashboard/RepoRegistry.js";
-import { countStuckEvents } from "../dashboard/StatsWriter.js";
 import { traverseDistPaths } from "../install/DistPathResolver.js";
 import { getStatus, install } from "../install/Installer.js";
 import { createLogger, errMsg, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
@@ -59,48 +58,6 @@ import { inspectPlugins } from "../PluginLoader.js";
 import { resolveProjectDir, VERSION } from "./CliUtils.js";
 
 const log = createLogger("doctor");
-
-/** What {@link probeParkedEvents} could establish about the event log. */
-type ParkedProbe =
-	/** Counted. `stuck` excludes the rows a later build revives by itself. */
-	| { readonly kind: "counted"; readonly stuck: number }
-	/** No database to ask — below the `node:sqlite` floor, or never opened. */
-	| { readonly kind: "absent" }
-	/** A database that is there and cannot be read. */
-	| { readonly kind: "unreadable"; readonly reason: string };
-
-/**
- * Asks the event log how many parked events need a human, distinguishing the three
- * answers a diagnostic must not conflate.
- *
- * The bare `catch { return null }` this replaced folded "no database" together with
- * "corrupt database" — and got the second one exactly backwards for the one command whose
- * job is to tell them apart. A zero-byte or truncated `jollimemory.db` opens read-only
- * WITHOUT error and throws on the first statement, so it landed in the same silent branch
- * as a machine that has simply never opened the dashboard, and `jolli doctor` printed no row
- * at all for the state that permanently disables the daemon's re-scan
- * (`idleReason: "database-unusable"`).
- *
- * Absence is decided BEFORE the open, by `existsSync`, and not from the error — measured:
- * a read-only open of a missing file throws `ERR_SQLITE_ERROR: unable to open database
- * file`, carrying no `ENOENT` code, so an error-shape test cannot tell "never created" from
- * "there and broken" at all. Same order, and the same reason, as `dbRescanSessions`'
- * `no-database` / `database-unusable` split.
- *
- * Read-only on purpose, in both directions: `withReadonlyDashboardDb` throws where the
- * writable handle would CREATE the file, and a diagnostic must not drain the log either —
- * counting through a writable handle would run `drainPending` and change the answer it is
- * reporting.
- */
-async function probeParkedEvents(): Promise<ParkedProbe> {
-	if (!canUseDashboardDb()) return { kind: "absent" };
-	if (!existsSync(getDashboardDbPath())) return { kind: "absent" };
-	try {
-		return { kind: "counted", stuck: await withReadonlyDashboardDb((db) => countStuckEvents(db)) };
-	} catch (err: unknown) {
-		return { kind: "unreadable", reason: errMsg(err) };
-	}
-}
 
 /** Individual check result returned by each diagnostic probe. */
 export interface DoctorCheck {
@@ -311,6 +268,96 @@ export function formatRepoRegistryReadFailure(reason: string, path: string): Doc
 			"      · no repo can register until this is resolved; move the file aside and re-run `jolli enable`\n" +
 			"        in each repo to rebuild it (every registration in it is lost)",
 	};
+}
+
+/** What {@link probeParkedEvents} could establish about the event log. */
+type ParkedProbe =
+	/** Counted. `stuck` excludes the rows a later build revives by itself. */
+	| { readonly kind: "counted"; readonly stuck: number }
+	/** No database to ask — below the `node:sqlite` floor, or never opened. */
+	| { readonly kind: "absent" }
+	/** A database that is there and cannot be read. */
+	| { readonly kind: "unreadable"; readonly reason: string };
+
+/**
+ * Asks the event log how many parked events need a human, distinguishing the
+ * three answers a diagnostic must not conflate.
+ *
+ * Folding "no database" together with "corrupt database" gets the second one
+ * backwards for the one command whose job is to tell them apart. A zero-byte or
+ * truncated `jollimemory.db` opens read-only WITHOUT error and throws on the first
+ * statement, so it lands in the same silent branch as a machine that has never
+ * opened the dashboard — and `jolli doctor` then prints no row at all for the
+ * state that permanently disables the daemon's re-scan (`database-unusable`).
+ *
+ * Absence is decided BEFORE the open, by `existsSync`, not from the error — a
+ * read-only open of a missing file throws `ERR_SQLITE_ERROR: unable to open
+ * database file` carrying no `ENOENT`, so an error-shape test cannot tell "never
+ * created" from "there and broken".
+ *
+ * Read-only on purpose: `withReadonlyDashboardDb` throws where a writable handle
+ * would CREATE the file, and a diagnostic must not drain the log — counting
+ * through a writable handle would run `drainPending` and change the answer it is
+ * reporting. {@link countStuckEvents} is the count deliberately: it matches the
+ * daemon's own `failedEvents` metric (whose log line points here) and the set
+ * {@link unparkStuckEvents} `--fix` can actually reach.
+ */
+async function probeParkedEvents(): Promise<ParkedProbe> {
+	if (!canUseDashboardDb()) return { kind: "absent" };
+	if (!existsSync(getDashboardDbPath())) return { kind: "absent" };
+	try {
+		const { countStuckEvents } = await import("../dashboard/StatsWriter.js");
+		return { kind: "counted", stuck: await withReadonlyDashboardDb((db) => countStuckEvents(db)) };
+	} catch (err) {
+		return { kind: "unreadable", reason: errMsg(err) };
+	}
+}
+
+/**
+ * `doctor --fix` for parked events: returns them to the queue AND drains, so the
+ * numbers are correct when the command exits.
+ *
+ * Draining here rather than leaving it to the next natural drain is the point.
+ * Un-parking alone is honest but useless as a fix: the next drain is whatever
+ * comes first — a commit's QueueWorker or the editor's 60 s tick — so a user who
+ * is not committing right now would read `10 event(s) returned to the queue`,
+ * see the dashboard unchanged, and reasonably conclude `--fix` did nothing. The
+ * cost is that doctor now does projection work while holding the writable
+ * handle, contending with hooks for SQLite's single writer; one bounded batch
+ * (`DRAIN_BATCH_SIZE`) covers any realistic parked set, and doctor is an
+ * interactive command, not a hot path.
+ *
+ * The projected count is reported alongside the revived one because they can
+ * differ, and the difference is the whole answer: an event that fails again is
+ * NOT re-parked by this call. Measured: one drain spends exactly ONE attempt, so
+ * a still-defective row comes back `pending` with `attempts = 1` and only re-parks
+ * after five failed drains. Reporting "1 revived" alone would read as a completed
+ * repair when nothing was actually recovered.
+ *
+ * What is left over is taken from `drainPending`'s own `pending` — a COUNT off
+ * the table — never from `revived - projected`. That subtraction was wrong in
+ * both directions: the drain is capped at `DRAIN_BATCH_SIZE`, so a large parked
+ * set leaves rows this pass never claimed and the difference understates them;
+ * and `projected` also counts pending rows that were already queued before the
+ * un-park, so it can exceed `revived` and make the difference negative. The
+ * table knows the answer, and it is asked.
+ *
+ * Fixer contract (see the "Git hooks" fixer): THROW on failure so the doctor
+ * loop records it; return a string describing what was done on success.
+ */
+async function repairParkedDashboardEvents(): Promise<string> {
+	const { withDashboardDb } = await import("../dashboard/DashboardDb.js");
+	const { drainPending, unparkStuckEvents } = await import("../dashboard/StatsWriter.js");
+	return await withDashboardDb((db) => {
+		const revived = unparkStuckEvents(db);
+		// Reachable despite the fixer being attached only when the count is
+		// non-zero: the diagnosis read a different, read-only handle, and another
+		// doctor may have won the race in between.
+		if (revived === 0) return "nothing parked";
+		const { projected, pending } = drainPending(db);
+		if (pending === 0) return `${revived} revived, ${projected} projected`;
+		return `${revived} revived, ${projected} projected, ${pending} still queued (will retry)`;
+	});
 }
 
 /**
@@ -668,38 +715,42 @@ async function runDoctor(cwd: string, fix: boolean, dryRun = false, forgetDead =
 		checks.push(formatRepoRegistryReadFailure(errMsg(err), getRepoRegistryPath()));
 	}
 
-	// 12. Parked events. A `session.upserted` that never projected is a conversation
-	// the dashboard will never show, and until this row nothing reported one: no
-	// projected row to notice missing, no reader that queries `events_raw`, and a
-	// prune that only ever deletes `projected` rows so a failure does not even age
-	// out. WARN rather than fail, and with no fixer — deciding what to do with a
-	// parked event needs its reason, so this row's whole job is to make the number
-	// visible before anyone designs that.
+	// 12. Parked dashboard events — the ONE fault in this list that is otherwise
+	// invisible. An event that never projects is a conversation the dashboard will
+	// never show, and nothing else reports one: no projected row to notice missing,
+	// no reader that queries `events_raw`, and a prune that only deletes `projected`
+	// rows so a failure never even ages out. `warn` rather than `fail`: the memories
+	// themselves are safe in the system of record, so this must not make an
+	// otherwise-healthy install exit non-zero.
 	//
-	// Two rows, because the probe has two failure answers and they need opposite
-	// wording. `countStuckEvents` already excludes the `unknown-type` rows a later
-	// build un-parks by itself, so a non-zero count here really does need a human —
-	// the count it replaced included them, and asserted "some conversations may be
-	// missing" for rows the next commit silently revives, with no fixer to offer.
-	// An unreadable database is the state that permanently disables the daemon's
-	// re-scan, and the whole point of this row is that `jolli doctor` used to print
-	// nothing at all for it.
-	//
-	// The name is 16 characters in both, because the printer below pads to 16 and does
-	// not truncate — a longer name pushes the message out of the aligned column.
+	// The probe has three answers and they need different wording. `counted` uses
+	// `countStuckEvents`, which excludes the `unknown-type` rows a later build revives
+	// by itself — so a non-zero count really does need a human — and matches BOTH the
+	// daemon's `failedEvents` metric (whose log line sends the user here) and the set
+	// `--fix` (`unparkStuckEvents`) can actually return to the queue. `unreadable` is
+	// its own row because an unreadable database is precisely the state that
+	// permanently disables the daemon's re-scan, and doctor used to print nothing at
+	// all for it; no fixer, because re-queuing cannot repair a database that will not
+	// open.
 	const parked = await probeParkedEvents();
-	if (parked.kind === "counted" && parked.stuck > 0) {
-		checks.push({
-			name: "Dashboard events",
-			status: "warn",
-			message: `${parked.stuck} event(s) parked unprojected — some conversations may be missing from the dashboard`,
-		});
-	}
 	if (parked.kind === "unreadable") {
 		checks.push({
 			name: "Dashboard events",
 			status: "warn",
 			message: `dashboard database present but unreadable (${parked.reason}) — the background re-scan is stopped`,
+		});
+	} else {
+		const stuck = parked.kind === "counted" ? parked.stuck : 0;
+		checks.push({
+			name: "Dashboard events",
+			status: stuck > 0 ? "warn" : "ok",
+			message:
+				stuck > 0
+					? `${stuck} event(s) parked after repeated projection failures — dashboard figures are incomplete`
+					: "none parked",
+			// Attached only when there is something to do, so `--fix` on a healthy
+			// machine does not print a line about work it did not need to perform.
+			...(stuck > 0 ? { fixer: repairParkedDashboardEvents } : {}),
 		});
 	}
 

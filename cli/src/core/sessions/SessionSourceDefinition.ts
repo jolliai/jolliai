@@ -116,6 +116,31 @@ export interface SessionSourceSpec<T> {
 		windowMs?: number,
 	) => ReadonlyArray<SessionInfo> | Promise<ReadonlyArray<SessionInfo>>;
 	/**
+	 * True when {@link forRepo} resolves the repo's OWN worktree set from the
+	 * directory it is handed, so one call already answers for every checkout.
+	 *
+	 * Declared because the collector asks each root separately (a conversation is
+	 * keyed by the directory it ran in, and every other source matches against the
+	 * one `cwd` it is given). For a source that spans worktrees by itself, that
+	 * loop is not a wider search — it is the SAME search run N times, and the
+	 * dedupe throws all but one result away. Antigravity is the entry that
+	 * declares it, and its narrowing reads a title per claimed session, so the
+	 * discarded passes are the expensive kind: N × one streamed transcript read
+	 * per session, on a repo with six worktrees.
+	 *
+	 * A source that declares this is asked once per REGISTERED CHECKOUT; the rest
+	 * are asked per root. Per checkout rather than once overall, because what such
+	 * a source resolves is the worktree set of the repository it is HANDED — one
+	 * call covers one clone's linked checkouts and reaches no other clone's `.git`,
+	 * while a repo identity is a remote and can have several clones. Both routes
+	 * into the source obey it: the narrowing of a supplied scan AND the per-repo
+	 * `scanForRepo` fallback, which is the more expensive of the two.
+	 *
+	 * Getting it wrong in the other direction LOSES sessions rather than costing
+	 * time, so it stays opt-in and false by default.
+	 */
+	readonly forRepoSpansWorktrees?: boolean;
+	/**
 	 * The per-repo fallback: discover this source's sessions for ONE repo,
 	 * without a machine-wide scan behind it.
 	 *
@@ -151,6 +176,7 @@ export interface SessionSourceDefinition {
 		cwd: string,
 		windowMs?: number,
 	) => ReadonlyArray<SessionInfo> | Promise<ReadonlyArray<SessionInfo>>;
+	readonly forRepoSpansWorktrees: boolean;
 	readonly scanForRepo?: (cwd: string, windowMs?: number) => Promise<ReadonlyArray<SessionInfo>>;
 }
 
@@ -172,6 +198,7 @@ export function defineSessionSource<T>(spec: SessionSourceSpec<T>): SessionSourc
 		daemonRescan: spec.daemonRescan ?? false,
 		scan: spec.scan,
 		forRepo: (scanned, cwd, windowMs) => spec.forRepo(scanned as ReadonlyArray<T>, cwd, windowMs),
+		forRepoSpansWorktrees: spec.forRepoSpansWorktrees ?? false,
 		...(spec.scanForRepo ? { scanForRepo: spec.scanForRepo } : {}),
 	};
 }

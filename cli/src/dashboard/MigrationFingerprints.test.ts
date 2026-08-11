@@ -54,6 +54,7 @@ const EXPECTED: ReadonlyArray<readonly [name: string, fingerprint: string]> = [
 	// the documented repair, and it is the reason no further merge may happen after
 	// the first release.
 	["SESSION_STATS_SYNC_DDL", "e0c166639049"],
+	["SESSION_ACTIVITY_DDL", "67be18551dae"],
 ];
 
 describe("migration fingerprints", () => {

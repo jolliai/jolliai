@@ -23,10 +23,12 @@ import { TOOL_RECORDING_SOURCES } from "../core/TranscriptParser.js";
 import type { TranscriptRepairState } from "../core/TranscriptRepair.js";
 import { createLogger, errMsg } from "../Logger.js";
 import type { CommitSummary } from "../Types.js";
+import { ACTIVITY_BUCKET_MS } from "./ActivityBuckets.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import type {
 	AdoptionTier,
 	CommitInsightKind,
+	ConcurrencyModel,
 	CoverageNote,
 	DashboardMenus,
 	DashboardModel,
@@ -966,6 +968,7 @@ function buildStats(
 	// has no summarized commits, so this comes back empty and the renderer shows
 	// the session list instead.
 	const memoryFeed = buildMemoryCards(db, scope, window, reachable);
+	const concurrency = buildConcurrency(db, window);
 
 	return {
 		...seriesResult,
@@ -986,6 +989,7 @@ function buildStats(
 		rangeFrom: window.from,
 		rangeTo: window.to,
 		toolUsage: buildToolUsage(db, scope, window),
+		...(concurrency !== undefined ? { concurrency } : {}),
 		...(pricesAsOf ? { pricesAsOf } : {}),
 		...(memoriesCreated !== undefined ? { memoriesCreated } : {}),
 		...(decisions !== undefined ? { decisionsCaptured: decisions.keptCount, decisions } : {}),
@@ -1423,6 +1427,93 @@ function decisionCountsFor(
 function withModel(summary: CommitSummary): { model?: string } {
 	const model = dominantWorkingModel(summary);
 	return model ? { model } : {};
+}
+
+// ── Concurrency ──────────────────────────────────────────────────────────────
+
+/**
+ * The concurrency figure. Takes a window but NOT a scope: it is machine-global
+ * by design (see {@link ConcurrencyModel}).
+ */
+function buildConcurrency(db: DashboardDbHandle, window: ResolvedWindow): ConcurrencyModel | undefined {
+	const rows = db
+		.prepare(
+			// COUNT(DISTINCT session_event_id) would be WRONG: `sessions` is unique
+			// on (repo_id, source, session_id), so one agent session that touched
+			// two repos is two rows with two event ids and would count as two
+			// agents. Machine-global aggregation makes that certain, not latent.
+			`SELECT a.bucket_ms AS bucket_ms,
+			        COUNT(DISTINCT s.source || ':' || s.session_id) AS n
+			   FROM session_activity a
+			   JOIN sessions s ON s.event_id = a.session_event_id
+			  WHERE a.bucket_ms >= ? AND a.bucket_ms < ?
+			  GROUP BY a.bucket_ms
+			  ORDER BY a.bucket_ms`,
+		)
+		.all(window.startMs, window.endMs) as ReadonlyArray<{ bucket_ms: number; n: number }>;
+	if (rows.length === 0) return undefined;
+
+	const buckets = rows.map((r) => ({ bucketMs: r.bucket_ms, sessions: r.n }));
+	const peak = buckets.reduce((max, b) => (b.sessions > max ? b.sessions : max), 0);
+	const total = buckets.reduce((sum, b) => sum + b.sessions, 0);
+
+	// Derived per query, never a declared list: the declarative alternative is
+	// the shape of `PARSER_BACKED_SOURCES`, which omits `kimi` even though
+	// `getParserForSource` accepts it.
+	const measured = new Set(
+		(
+			db
+				.prepare(
+					`SELECT DISTINCT s.source AS source
+					   FROM session_activity a
+					   JOIN sessions s ON s.event_id = a.session_event_id
+					  WHERE a.bucket_ms >= ? AND a.bucket_ms < ?`,
+				)
+				.all(window.startMs, window.endMs) as ReadonlyArray<{ source: string }>
+		).map((r) => r.source),
+	);
+	// "Uncovered" is asked of the SESSIONS, not of the chart, and the two are
+	// different questions — which is why this is its own query rather than
+	// `seen − measured`.
+	//
+	// `measured` above is window-scoped on `bucket_ms`, so it answers "did this
+	// source draw a bar". A session is admitted to the window by `updated_at_ms`
+	// instead, and the two need not agree: a conversation resumed just after
+	// midnight, or one from a source whose `updatedAt` is its store row's own
+	// timestamp rather than its last turn, is in-window while every one of its
+	// buckets predates the window. Subtracting `measured` reported that agent as
+	// carrying no per-turn timestamps at all, when the truth is only that its
+	// timestamps are older than the range being looked at.
+	//
+	// NOT a boundary-rounding problem, which is the tempting reading and is
+	// wrong: `resolveWindow` puts both bounds through `addLocalDays`, which snaps
+	// to a local midnight, and every IANA offset is a multiple of 15 minutes — so
+	// a window bound is always bucket-aligned, and a bucket holding an in-window
+	// turn is always in-window itself.
+	//
+	// `EXISTS` over the session's own activity rows, unwindowed, is the honest
+	// test: a session that produced ANY bucket proves its source can be measured.
+	// What is left is what the label means — transcripts with no turn timestamps.
+	const uncovered = (
+		db
+			.prepare(
+				`SELECT s.source AS source
+				   FROM sessions s
+				  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?
+				  GROUP BY s.source
+				 HAVING SUM(EXISTS (SELECT 1 FROM session_activity a WHERE a.session_event_id = s.event_id)) = 0`,
+			)
+			.all(window.startMs, window.endMs) as ReadonlyArray<{ source: string }>
+	).map((r) => r.source);
+
+	return {
+		buckets,
+		bucketMinutes: ACTIVITY_BUCKET_MS / 60_000,
+		peak,
+		meanActive: total / buckets.length,
+		measuredSources: [...measured].sort(),
+		uncoveredSources: uncovered.sort(),
+	};
 }
 
 // ── Tool / skill / MCP usage ────────────────────────────────────────────────

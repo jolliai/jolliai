@@ -16,7 +16,7 @@
  *   - Cached aliases (`commitAliases`) so repeated lookups skip git calls
  */
 
-import { createLogger, isManuallyDisabled } from "../Logger.js";
+import { createLogger, errMsg, isManuallyDisabled } from "../Logger.js";
 import type {
 	CatalogEntry,
 	CatalogTopic,
@@ -40,6 +40,7 @@ import type {
 	TopicSummary,
 } from "../Types.js";
 import { CURRENT_SCHEMA_VERSION } from "../Types.js";
+import { mapWithConcurrency } from "./Concurrency.js";
 import { getDiffStats, getTreeHash } from "./GitOps.js";
 import { acquireOrphanWriteLock, OrphanWriteBusyError, releaseOrphanWriteLock } from "./Locks.js";
 import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
@@ -1748,6 +1749,93 @@ export async function readTranscriptsForCommits(
 			result.set(hash, transcript);
 		}
 	}
+	return result;
+}
+
+/**
+ * Reads many transcripts in ONE logical operation, keyed by id. The batch twin
+ * of {@link readTranscript} — same path shape (`transcripts/{id}.json`), same
+ * per-entry contract (`null` for missing or unparseable), but a single round
+ * trip instead of N.
+ *
+ * Uses `storage.batchReadFiles` when the backend implements it (one `git
+ * cat-file --batch` subprocess instead of N spawns — see the method's
+ * docstring on `StorageProvider`); falls back to a per-path `readFile` loop
+ * when it's absent (FolderStorage, where a local read is already cheap). Both
+ * branches are live in production: `DualWriteStorage` always has the method
+ * (delegating to its orphan-branch primary), `FolderStorage` never does.
+ *
+ * A missing artifact and a malformed JSON body both map to `null` — the
+ * caller (`collectTranscriptSessionMeta`) treats either as "no sessions from
+ * this id", never as fatal.
+ *
+ * Resolves through {@link resolveReadStorage}, not {@link resolveStorage}: this
+ * is a pure read, and the write-side resolver warns on its fallback. `vscode/src`
+ * never calls `setActiveStorage` and the push path threads no storage, so every
+ * VS Code push would otherwise log "The Memory Bank side will miss this write"
+ * about a write that was never attempted — the healthy-behaviour warning
+ * `resolveReadStorage` exists to stop.
+ */
+export async function readTranscriptsBatch(
+	ids: ReadonlyArray<string>,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<Map<string, StoredTranscript | null>> {
+	const result = new Map<string, StoredTranscript | null>();
+	if (ids.length === 0) return result;
+	const store = await resolveReadStorage(storage, cwd);
+	const pathFor = (id: string): string => `transcripts/${id}.json`;
+	const paths = ids.map(pathFor);
+	const rawByPath = store.batchReadFiles ? await store.batchReadFiles(paths) : await readFilesLooped(store, paths);
+	for (const id of ids) {
+		const raw = rawByPath.get(pathFor(id));
+		if (!raw) {
+			result.set(id, null);
+			continue;
+		}
+		try {
+			result.set(id, JSON.parse(raw) as StoredTranscript);
+		} catch {
+			log.warn("Failed to parse transcript for %s", id.substring(0, 8));
+			result.set(id, null);
+		}
+	}
+	return result;
+}
+
+/**
+ * Bound on concurrent `readFile`s in {@link readFilesLooped}. A v3 squash root can
+ * reference ~100 artifacts and this is the path a `batchReadFiles`-less backend
+ * takes, so a strictly serial loop paid ~100 disk round-trips in series; a small
+ * fixed width overlaps them without unbounded fan-out.
+ */
+const READ_FILES_CONCURRENCY = 8;
+
+/**
+ * Per-path `readFile` — the fallback `readTranscriptsBatch` uses when the backend
+ * has no `batchReadFiles` (FolderStorage). Reads run with bounded concurrency
+ * ({@link READ_FILES_CONCURRENCY}) rather than strictly serially, because the batch
+ * path exists precisely for the ~100-artifact squash root and awaiting each read in
+ * turn serialized every one of those disk round-trips. A single path throwing
+ * (rather than resolving to `null`) must not fail the whole batch — mirrors
+ * `batchReadFiles`' own contract, where one missing/unreadable entry never aborts
+ * the request for the rest, so `onError` records `null` and the others proceed.
+ */
+async function readFilesLooped(
+	store: StorageProvider,
+	paths: ReadonlyArray<string>,
+): Promise<Map<string, string | null>> {
+	const values = await mapWithConcurrency<string, string | null>(
+		paths,
+		READ_FILES_CONCURRENCY,
+		(path) => store.readFile(path),
+		(path, err) => {
+			log.warn("readFile failed for %s: %s", path, errMsg(err));
+			return null;
+		},
+	);
+	const result = new Map<string, string | null>();
+	for (let i = 0; i < paths.length; i++) result.set(paths[i] as string, values[i] ?? null);
 	return result;
 }
 

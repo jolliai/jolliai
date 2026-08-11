@@ -17,6 +17,7 @@ import { UNTITLED_SESSION } from "../core/FallbackTitle.js";
 import { execGit, getCurrentBranch } from "../core/GitOps.js";
 import { JOLLI_REFS_EXCLUDE_GLOB } from "../core/JolliRefs.js";
 import { extractRepoName, getRemoteUrl, resolveKBPath } from "../core/KBPathResolver.js";
+import { normalizePathForCompare } from "../core/PathUtils.js";
 import { estimateModelCostUsd, PRICES_AS_OF } from "../core/Pricing.js";
 import { resolveSessionTitle } from "../core/SessionTitleResolver.js";
 import { loadConfig } from "../core/SessionTracker.js";
@@ -25,6 +26,7 @@ import { getIndex, getSummary, readTranscriptsForCommits } from "../core/Summary
 import { collectDisplayTopics, getTranscriptIds } from "../core/SummaryTree.js";
 import type { SessionContent } from "../core/sessions/SessionSignalExtractor.js";
 import { extractSessionSignals } from "../core/sessions/SessionSignals.js";
+import type { SessionSourceDefinition } from "../core/sessions/SessionSourceDefinition.js";
 import { SESSION_SOURCES } from "../core/sessions/SessionSources.js";
 import { isMissingTranscriptError, readTranscript } from "../core/TranscriptReader.js";
 import { readTranscriptForSource, readTranscriptLinesForSource } from "../core/TranscriptSourceReader.js";
@@ -41,6 +43,7 @@ import type {
 	TranscriptSource,
 } from "../Types.js";
 import { mapWithConcurrency, withIoBudget } from "../util/Concurrency.js";
+import { bucketsFrom } from "./ActivityBuckets.js";
 import type {
 	CommitCreatedEvent,
 	CommitFileChange,
@@ -149,7 +152,54 @@ export type SessionLoader = (
 	cwd: string,
 	windowMs?: number,
 	preScanned?: PreScannedSessions,
+	defs?: ReadonlyArray<SessionSourceDefinition>,
 ) => Promise<ReadonlyArray<SessionInfo>>;
+
+/**
+ * The per-repo fallbacks this call is responsible for, as unstarted thunks.
+ *
+ * Shared by {@link loadAllSessions} and by {@link collectSessionEvents}'s
+ * worktree-spanning half, so that BOTH routes into a source — the narrowing of a
+ * supplied scan and the fallback when there is none — obey the same granularity.
+ * They used to disagree: the spanning split was applied to `preScannedForRepo`
+ * alone, so a source whose machine-wide scan failed had its full sweep re-run
+ * once per worktree root, concurrently. That is the exact N× cost the flag
+ * exists to prevent, reached by the path that is already the degraded one.
+ */
+function scanForRepoThunks(
+	defs: ReadonlyArray<SessionSourceDefinition>,
+	pre: PreScannedSessions,
+	cwd: string,
+	windowMs: number | undefined,
+): Array<() => Promise<ReadonlyArray<SessionInfo>>> {
+	const thunks: Array<() => Promise<ReadonlyArray<SessionInfo>>> = [];
+	// EVERY registered source is skippable, because every one of them reads a store
+	// keyed by something other than the repo — so a caller that already scanned it
+	// machine-wide must not have it read a second time, once per repo.
+	//
+	// The check is `!== undefined`, never truthiness: `[]` is the positive claim "the
+	// scan ran and found nothing", and re-running the per-repo loader on that would
+	// undo the hoist for exactly the sources that are cheapest to get wrong about.
+	for (const def of defs) {
+		const perRepo = def.scanForRepo;
+		if (!perRepo || pre[def.source] !== undefined) continue;
+		thunks.push(() => perRepo(cwd, windowMs));
+	}
+	return thunks;
+}
+
+/** Runs discovery thunks concurrently, logging and skipping the ones that throw. */
+async function settleLoaders(
+	loaders: ReadonlyArray<() => Promise<ReadonlyArray<SessionInfo>>>,
+): Promise<ReadonlyArray<SessionInfo>> {
+	const settled = await Promise.allSettled(loaders.map((load) => load()));
+	const sessions: SessionInfo[] = [];
+	for (const result of settled) {
+		if (result.status === "fulfilled") sessions.push(...result.value);
+		else log.warn("session discoverer failed during dashboard collection: %s", errMsg(result.reason));
+	}
+	return sessions;
+}
 
 /**
  * Default loader: every per-source discoverer, failures logged and skipped.
@@ -159,11 +209,19 @@ export type SessionLoader = (
  * history back-fill is the only caller that does — see
  * {@link BACKFILL_SESSION_WINDOW_MS} for why widening the constants instead would
  * have reached the post-commit summary and corrupted what it stores.
+ *
+ * `defs` is the slice of {@link SESSION_SOURCES} this call answers for; the whole
+ * registry is the default and is what every single-root caller wants. The one
+ * caller that narrows it is {@link collectSessionEvents}, which drives the
+ * worktree-spanning sources on their own granularity — see
+ * {@link SessionSourceDefinition.forRepoSpansWorktrees}. The hook registry read is
+ * NOT part of that slice: it is per-project, so it belongs to every root.
  */
 export async function loadAllSessions(
 	cwd: string,
 	windowMs?: number,
 	preScanned: PreScannedSessions = {},
+	defs: ReadonlyArray<SessionSourceDefinition> = SESSION_SOURCES,
 ): Promise<ReadonlyArray<SessionInfo>> {
 	// Lazy imports throughout, same rationale as ActiveSessionAggregator: several
 	// discoverers reach for node:sqlite, and loading them eagerly would emit the
@@ -191,26 +249,9 @@ export async function loadAllSessions(
 		// `saveSession`, so widening a window cannot bring them back — only a Gemini
 		// disk scanner could, and that is deliberately its own change.
 		async () => (await import("../core/SessionTracker.js")).loadAllSessions(cwd, windowMs),
+		...scanForRepoThunks(defs, preScanned, cwd, windowMs),
 	];
-	// EVERY registered source is skippable, because every one of them reads a store
-	// keyed by something other than the repo — so a caller that already scanned it
-	// machine-wide must not have it read a second time, once per repo.
-	//
-	// The check is `!== undefined`, never truthiness: `[]` is the positive claim "the
-	// scan ran and found nothing", and re-running the per-repo loader on that would
-	// undo the hoist for exactly the sources that are cheapest to get wrong about.
-	for (const def of SESSION_SOURCES) {
-		const perRepo = def.scanForRepo;
-		if (!perRepo || preScanned[def.source] !== undefined) continue;
-		loaders.push(() => perRepo(cwd, windowMs));
-	}
-	const settled = await Promise.allSettled(loaders.map((load) => load()));
-	const sessions: SessionInfo[] = [];
-	for (const result of settled) {
-		if (result.status === "fulfilled") sessions.push(...result.value);
-		else log.warn("session discoverer failed during dashboard collection: %s", errMsg(result.reason));
-	}
-	return sessions;
+	return settleLoaders(loaders);
 }
 
 /**
@@ -270,11 +311,53 @@ export interface SessionPassCounts {
 export interface CollectSessionsOptions {
 	readonly repoIdentity: string;
 	readonly cwd: string;
+	/**
+	 * Every checkout whose sessions belong to this repo — `cwd` plus its linked
+	 * worktrees. Defaults to `[cwd]`, and `cwd` is unioned in regardless, so a
+	 * list that omits it (or spells it differently) can only ADD roots, never
+	 * take this checkout's own registry away.
+	 *
+	 * A conversation is keyed by the directory it RAN IN, and a developer running
+	 * agents across `git worktree` checkouts produces sessions under each of them.
+	 * One root therefore does not scope a repo, it scopes a checkout: measured on a
+	 * repo with six live worktrees, 65 of 94 in-window Claude sessions belonged to a
+	 * sibling and were invisible — and they are precisely the parallel work the
+	 * agent-concurrency figure exists to show.
+	 *
+	 * The rules are unchanged and stay where they are: every root is asked the same
+	 * per-source question, and {@link sessionDirBelongsToRepo}'s nested-`.git` walk
+	 * still excludes a checkout nested INSIDE another (that one answers for itself,
+	 * as its own root in this list). Widening the predicate instead would have
+	 * re-opened the cross-context bleed it exists to prevent.
+	 *
+	 * Cost is one narrowing pass per root over scans that were already read once for
+	 * the whole run; the dedupe on `(source, sessionId)` below is what makes asking
+	 * N roots safe — a session two roots both claim is collected once.
+	 */
+	readonly worktreeRoots?: ReadonlyArray<string>;
+	/**
+	 * One entry per REGISTERED checkout of this repo — a second clone of the same
+	 * remote is a second entry, its own linked worktrees are not. Defaults to
+	 * `[cwd]`, and `cwd` is unioned in regardless, for the same reason
+	 * {@link worktreeRoots} is.
+	 *
+	 * This is the granularity a {@link SessionSourceDefinition.forRepoSpansWorktrees}
+	 * source is asked at, and the distinction from `worktreeRoots` is exactly what
+	 * that flag claims: such a source resolves the worktrees of the repository it is
+	 * HANDED, so one call covers every linked checkout of one clone and no call
+	 * covers a different clone's `.git`. Asking only at `cwd` therefore dropped the
+	 * second clone's sessions outright — silently, and for that source alone, since
+	 * every other source is matched against each root in `worktreeRoots`.
+	 *
+	 * The cost of one redundant entry is one repeated narrowing that the dedupe on
+	 * `(source, sessionId)` reconciles; the cost of a missing one is lost sessions.
+	 */
+	readonly checkoutRoots?: ReadonlyArray<string>;
 	/** Injected for tests. Defaults to {@link loadAllSessions}. */
 	readonly loadSessions?: SessionLoader;
 	/**
-	 * Reads a transcript's usage. Injected for tests; the default reads real
-	 * Claude JSONL via `readTranscript`.
+	 * Reads a transcript's usage. Injected for tests; the default dispatches
+	 * to the reader each source requires via `readTranscriptForSource`.
 	 */
 	readonly readUsage?: typeof readTranscript;
 	/**
@@ -400,10 +483,13 @@ async function resolveTitle(s: SessionInfo): Promise<string | undefined> {
  * session recorded live and the same session re-collected later land on the
  * identical row with identical semantics.
  *
- * Token figures come from the transcript itself and only Claude transcripts
- * carry per-turn usage — every other source is honestly labelled
- * `sessions-only`, which the UI renders as a session count instead of a token
- * figure (the mockups' G-3 coverage split).
+ * Every source's transcript is now read, via the same per-source dispatch
+ * the active-conversations sidebar uses (`readTranscriptForSource`) — not
+ * only Claude's. That is what lets `activityBuckets` be derived for every
+ * source. Token figures still come from per-turn usage, which today only
+ * Claude transcripts carry: every other source gets `activityBuckets` and
+ * `messageCount` but no `models`/`tokenCoverage`, which `StatsWriter`
+ * defaults to `sessions-only` when absent (the mockups' G-3 coverage split).
  *
  * Returns null when the discoverer's timestamp is unparseable — an event
  * without a valid `updatedAtMs` cannot be bucketed anywhere.
@@ -475,7 +561,12 @@ export async function sessionEventFromInfo(
 	// read per session.
 	const sessionContent = sessionContentFor(source, s.transcriptPath, readUsage);
 	try {
+		// Cursor-less, so this is the WHOLE session rather than a slice. Two things
+		// downstream depend on that and would fail quietly against a partial read:
+		// `projectSession`'s wholesale replace of the model/tool rows, and the
+		// activity buckets below.
 		const read = await sessionContent.read();
+		const buckets = bucketsFrom(read.entries);
 		const models: StatsModelUsage[] = toStatsModelUsage(read.usageByModel ?? []);
 		// Priced here, beside the aggregate, from the SAME model→provider mapping the
 		// aggregate was priced with — the two read the same transcript lines, so a
@@ -516,12 +607,16 @@ export async function sessionEventFromInfo(
 			...(Number.isFinite(startedAtMs) && Number.isFinite(endedAtMs) && endedAtMs > startedAtMs
 				? { durationMs: endedAtMs - startedAtMs }
 				: {}),
-			// `sessions-only` is now reached by a source having no per-turn usage to
-			// report rather than by it not being Claude. Same outcome for the sources
-			// that carry none, and an honest `full` for any that does.
-			...(models.length > 0
-				? { models, tokenCoverage: "full" as const, pricesAsOf: PRICES_AS_OF }
-				: { tokenCoverage: "sessions-only" as const }),
+			// Only the `full` case sets `tokenCoverage`. A source with no per-turn usage
+			// leaves it ABSENT rather than writing `sessions-only`, because the merge in
+			// `StatsWriter` reads absence as "preserve": `event.tokenCoverage ??
+			// existing?.token_coverage ?? "sessions-only"`. On first write the default
+			// still lands `sessions-only`; on a RE-read that lost its usage (a Claude
+			// transcript whose retention window dropped the per-turn data) an explicit
+			// `sessions-only` would DOWNGRADE a row that had measured `full` — and the
+			// token COUNTS on the same row already fall back to the existing values, so
+			// clearing only the coverage flag would leave the row self-contradictory.
+			...(models.length > 0 ? { models, tokenCoverage: "full" as const, pricesAsOf: PRICES_AS_OF } : {}),
 			// Forwarded whenever the reader says this source is usage-capable,
 			// including an EMPTY set: a re-read that can see usage but nothing
 			// datable must clear the rows an earlier, better read left behind —
@@ -531,6 +626,10 @@ export async function sessionEventFromInfo(
 			// "called no tools" and is worth storing; absence means "this source cannot
 			// report them", and the two must not collapse.
 			...(signals.tools ? { tools: signals.tools } : {}),
+			// ABSENT, never `[]`: a source whose reader emits no timestamps computes an
+			// empty array on every read, and emitting it would assert "measured, no
+			// activity" about a source that was never measurable.
+			...(buckets.length > 0 ? { activityBuckets: buckets } : {}),
 		};
 	} catch (err) {
 		// A moved or deleted transcript still counts as a session — record it
@@ -624,7 +723,33 @@ function sessionContentFor(
 }
 
 /**
+ * Distinct checkout roots, first spelling wins, order preserved.
+ *
+ * Folded with `normalizePathForCompare` for the COMPARISON only — the surviving
+ * string is the caller's own, because every consumer downstream feeds it either
+ * to `sessionDirBelongsToRepo` (whose nested-`.git` walk needs a real on-disk
+ * path) or to a `sessions.json` read, and a lower-cased path is neither on a
+ * case-sensitive filesystem. Same trade `resolveWorktreeRoots` documents.
+ */
+function dedupeRoots(roots: ReadonlyArray<string>): string[] {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const root of roots) {
+		const key = normalizePathForCompare(root);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push(root);
+	}
+	return out;
+}
+
+/**
  * Narrows every supplied machine-wide scan to one repo.
+ *
+ * `defs` is the slice of {@link SESSION_SOURCES} this call is responsible for —
+ * the caller splits the registry on {@link SessionSourceDefinition.forRepoSpansWorktrees}
+ * and drives the two halves differently. Passing the whole registry is the
+ * single-root case and is what every non-worktree-aware caller wants.
  *
  * Each source's own `…SessionsForRepo` does its own matching — this only decides
  * WHICH ones to ask, and asks exactly those the caller supplied. Two are async and
@@ -640,10 +765,11 @@ function sessionContentFor(
 async function preScannedForRepo(
 	pre: PreScannedSessions,
 	cwd: string,
-	windowMs?: number,
+	windowMs: number | undefined,
+	defs: ReadonlyArray<SessionSourceDefinition>,
 ): Promise<ReadonlyArray<SessionInfo>> {
 	const out: SessionInfo[] = [];
-	for (const def of SESSION_SOURCES) {
+	for (const def of defs) {
 		const scanned = pre[def.source];
 		// `!== undefined` rather than truthiness: `[]` means the scan ran and found
 		// nothing, which must still be narrowed (to nothing) rather than treated as
@@ -673,8 +799,53 @@ export async function collectSessionEvents(opts: CollectSessionsOptions): Promis
 	// A source supplied as a pre-scan is NOT loaded again by the fan-out — otherwise
 	// its store would be read twice per repo, which is the opposite of the point. One
 	// object drives both halves, so the two cannot disagree.
-	const discovered = await load(opts.cwd, opts.windowMs, preScanned);
-	const sessions = [...discovered, ...(await preScannedForRepo(preScanned, opts.cwd, opts.windowMs))];
+	// Every checkout, not just `cwd` — see `CollectSessionsOptions.worktreeRoots`. The
+	// two halves are asked per root for the same reason: `loadAllSessions` reads the
+	// PER-PROJECT hook registry (each worktree has its own `sessions.json`, so a single
+	// root reads one of six files), and `preScannedForRepo` runs each source's own
+	// path-containment rule, which a sibling checkout fails by construction.
+	//
+	// `cwd` is UNIONED in rather than replaced by the supplied list, and the direction
+	// matters: the roots come from a `git worktree list` that degrades to its input on
+	// failure, and a caller that resolved them at a sibling — or against a realpath
+	// that folds differently from the one it passes as `cwd` — would otherwise drop
+	// this checkout's own `sessions.json` with nothing logged. A redundant root costs
+	// one registry read and is reconciled by the dedupe below; a missing one is silent
+	// data loss. Deduped on the compare-folded spelling so two spellings of one
+	// checkout do not read the same file twice.
+	const roots = dedupeRoots([opts.cwd, ...(opts.worktreeRoots ?? [])]);
+	// The registry is split because the two halves answer at different granularity.
+	// A source that resolves the repo's worktrees itself (`forRepoSpansWorktrees`) is
+	// asked once per CHECKOUT — running it per worktree root re-runs an identical
+	// search whose results the dedupe discards, and for Antigravity each discarded
+	// pass costs a streamed title read per claimed session. Everything else matches
+	// against the single directory it is handed and must be asked per root.
+	//
+	// Per checkout, and not simply once at `cwd`: what such a source resolves is the
+	// worktree set of the repository it is HANDED, so one call covers one clone's
+	// linked checkouts and reaches no other clone's `.git` — while `worktreeRoots` is
+	// deliberately a union ACROSS clones (two checkouts of one remote share an
+	// identity). See `CollectSessionsOptions.checkoutRoots`.
+	const spanning = SESSION_SOURCES.filter((def) => def.forRepoSpansWorktrees);
+	const perRootDefs = SESSION_SOURCES.filter((def) => !def.forRepoSpansWorktrees);
+	const checkouts = dedupeRoots([opts.cwd, ...(opts.checkoutRoots ?? [])]);
+	const perRoot = await Promise.all(
+		roots.map(async (root) => [
+			...(await load(root, opts.windowMs, preScanned, perRootDefs)),
+			...(await preScannedForRepo(preScanned, root, opts.windowMs, perRootDefs)),
+		]),
+	);
+	// Both routes into a spanning source — narrowing a supplied scan, and the
+	// per-repo fallback when there is none — run here, on the same granularity. The
+	// fallback used to ride inside `load` above, which put it back on the per-root
+	// loop that the split exists to keep it off.
+	const perCheckout = await Promise.all(
+		checkouts.map(async (root) => [
+			...(await settleLoaders(scanForRepoThunks(spanning, preScanned, root, opts.windowMs))),
+			...(await preScannedForRepo(preScanned, root, opts.windowMs, spanning)),
+		]),
+	);
+	const sessions = [...perRoot.flat(), ...perCheckout.flat()];
 
 	// Dedupe on (source, id), newest wins — two discoverers can surface the same
 	// session (e.g. a registry entry and a rescan of the same store).

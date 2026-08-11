@@ -5,6 +5,11 @@ import type { GitCommandResult, SessionInfo, TranscriptReadResult, TranscriptSou
 vi.mock("../core/GitOps.js", () => ({
 	execGit: vi.fn(),
 	getCurrentBranch: vi.fn(),
+	// Antigravity's narrowing asks the repo for its checkouts. These fixtures have
+	// exactly one, which is also what the real helper degrades to when git cannot
+	// answer — so returning the identity keeps the attribution assertions about
+	// attribution rather than about worktree enumeration.
+	resolveWorktreeRoots: vi.fn(async (dir: string) => [dir]),
 }));
 vi.mock("../core/SummaryStore.js", () => ({
 	getIndex: vi.fn(),
@@ -20,6 +25,16 @@ vi.mock("../core/SummaryStore.js", () => ({
 vi.mock("../core/TranscriptReader.js", async (importOriginal) => {
 	const original = await importOriginal<typeof import("../core/TranscriptReader.js")>();
 	return { ...original, readTranscript: vi.fn() };
+});
+// PARTIAL, for the same reason as above: the default stays the REAL per-source
+// dispatcher, so a Claude session still lands on the mocked `readTranscript`
+// and `readTranscriptLinesForSource` keeps feeding the line-oriented extractors
+// that `sessionContentFor` shares. The per-source tests override the dispatch
+// with `mockResolvedValueOnce`, which is what lets them assert a codex or
+// cursor session without a real SQLite/JSONL fixture.
+vi.mock("../core/TranscriptSourceReader.js", async (importOriginal) => {
+	const original = await importOriginal<typeof import("../core/TranscriptSourceReader.js")>();
+	return { ...original, readTranscriptForSource: vi.fn(original.readTranscriptForSource) };
 });
 // The default session loader fans out to every discoverer; mock the registry
 // loader so `loadAllSessions` has one deterministic success and the rest of
@@ -40,10 +55,11 @@ import type { ClaudeDiskSession } from "../core/ClaudeSessionDiscoverer.js";
 import type { CodexDiskSession } from "../core/CodexSessionDiscoverer.js";
 import { discoverCodexSessions } from "../core/CodexSessionDiscoverer.js";
 import type { DiskSession } from "../core/DiskSessionScan.js";
-import { execGit, getCurrentBranch } from "../core/GitOps.js";
+import { execGit, getCurrentBranch, resolveWorktreeRoots } from "../core/GitOps.js";
 import { loadAllSessions as loadRegistrySessions } from "../core/SessionTracker.js";
 import { getIndex, getSummary, readTranscriptsForCommits } from "../core/SummaryStore.js";
 import { readTranscript } from "../core/TranscriptReader.js";
+import { readTranscriptForSource } from "../core/TranscriptSourceReader.js";
 import {
 	collectCommitEvents,
 	collectFilesForCommits,
@@ -52,6 +68,7 @@ import {
 	collectWorktreeEvent,
 	loadAllSessions,
 	parseNumstatLog,
+	sessionEventFromInfo,
 	sessionPassKey,
 	sourceOfSessionPassKey,
 	summaryEventFromCommitSummary,
@@ -154,14 +171,202 @@ describe("collectSessionEvents", () => {
 		expect(events[0].models?.[0].estCostUsd).toBeGreaterThan(0);
 	});
 
-	it("labels a Claude session with no usage as sessions-only", async () => {
+	it("asks every worktree root, not just cwd", async () => {
+		// The gap this closes: a conversation is keyed by the directory it RAN IN, so a
+		// linked worktree's sessions live under its own path and under its own
+		// `sessions.json`. Scoping to the registered checkout alone made them invisible
+		// to the sweep while their rows already existed — written live by the StopHook
+		// running inside that worktree.
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const asked: string[] = [];
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w/main",
+			worktreeRoots: ["/w/main", "/w/feature"],
+			loadSessions: async (root) => {
+				asked.push(root);
+				return root === "/w/feature" ? [claudeSession({ sessionId: "in-sibling" })] : [];
+			},
+		});
+		expect(asked).toEqual(["/w/main", "/w/feature"]);
+		expect(events.map((e) => e.sessionId)).toEqual(["in-sibling"]);
+	});
+
+	it("collects a session two roots both claim exactly once", async () => {
+		// What makes asking N roots safe. Roots overlap in practice — a source that
+		// cannot scope its store answers the same session for every root it is asked
+		// about — and the dedupe on `(source, sessionId)` is the only thing standing
+		// between that and one conversation counted once per checkout.
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w/main",
+			worktreeRoots: ["/w/main", "/w/feature"],
+			loadSessions: async () => [claudeSession({ sessionId: "shared" })],
+		});
+		expect(events.map((e) => e.sessionId)).toEqual(["shared"]);
+	});
+
+	it("falls back to cwd when no roots are supplied", async () => {
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const asked: string[] = [];
+		await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w",
+			worktreeRoots: [],
+			loadSessions: async (root) => {
+				asked.push(root);
+				return [];
+			},
+		});
+		expect(asked).toEqual(["/w"]);
+	});
+
+	it("still asks cwd when the supplied roots leave it out", async () => {
+		// The roots come from a `git worktree list` that degrades to its input on
+		// failure, so a caller can hand over a list that does not name this checkout.
+		// Replacing `cwd` with it would drop THIS worktree's own `sessions.json` — the
+		// hook registry is per-project, so that is the one file nothing else reads —
+		// and the loss is silent: the sweep reports a clean run over a checkout it
+		// never opened. Union, never substitute.
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const asked: string[] = [];
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w/main",
+			worktreeRoots: ["/w/feature"],
+			loadSessions: async (root) => {
+				asked.push(root);
+				return root === "/w/main" ? [claudeSession({ sessionId: "in-cwd" })] : [];
+			},
+		});
+		expect(asked).toEqual(["/w/main", "/w/feature"]);
+		expect(events.map((e) => e.sessionId)).toEqual(["in-cwd"]);
+	});
+
+	it("reads one checkout once when cwd is also named in the roots", async () => {
+		// The common case — a caller that already unioned `cwd` in. The dedupe is on
+		// the compare-folded spelling, so `/w/Main` and `/w/main` are one checkout on
+		// a case-insensitive filesystem; the SURVIVING string is the caller's own,
+		// because `sessionDirBelongsToRepo` walks it as a real on-disk path.
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const asked: string[] = [];
+		await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w/main",
+			worktreeRoots: ["/w/main", "/w/feature"],
+			loadSessions: async (root) => {
+				asked.push(root);
+				return [];
+			},
+		});
+		expect(asked).toEqual(["/w/main", "/w/feature"]);
+	});
+
+	it("asks a worktree-spanning source once, not once per root", async () => {
+		// Antigravity is the one definition that declares `forRepoSpansWorktrees`: its
+		// narrowing runs its OWN `resolveWorktreeRoots`, so one call already covers
+		// every checkout. Asking it per root is the identical search N times, and the
+		// dedupe throws all but one result away — while each discarded pass still pays
+		// a streamed title read per claimed session. The mocked resolver is the probe:
+		// one call means one narrowing.
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			worktreeRoots: [WORKTREE, "/w/feature", "/w/third"],
+			loadSessions: async () => [],
+			preScanned: { antigravity: [diskEntry("antigravity", "ag-1")] },
+		});
+		expect(vi.mocked(resolveWorktreeRoots)).toHaveBeenCalledTimes(1);
+		expect(events.map((e) => e.sessionId)).toEqual(["ag-1"]);
+	});
+
+	it("asks a worktree-spanning source once per CHECKOUT, so a second clone is not lost", async () => {
+		// `worktreeRoots` is a union across clones — two checkouts of one remote share
+		// a repo identity — while a spanning source resolves the worktrees of the
+		// repository it is HANDED. So one call covers one clone's `.git` and reaches no
+		// other's: asking only at `cwd` dropped the second clone's sessions for this
+		// source alone, while every other source picked them up from the root list.
+		vi.mocked(resolveWorktreeRoots).mockImplementation(async (dir: string) =>
+			dir === "/w/clone-b" ? ["/w/clone-b", "/w/clone-b-feature"] : [dir, "/w/feature"],
+		);
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			worktreeRoots: [WORKTREE, "/w/feature", "/w/clone-b", "/w/clone-b-feature"],
+			checkoutRoots: [WORKTREE, "/w/clone-b"],
+			loadSessions: async () => [],
+			preScanned: {
+				antigravity: [
+					diskEntry("antigravity", "ag-1"),
+					diskEntry("antigravity", "ag-2", ["/w/clone-b-feature"]),
+				],
+			},
+		});
+		// Once per checkout — not once per worktree root (four), not once overall.
+		expect(vi.mocked(resolveWorktreeRoots)).toHaveBeenCalledTimes(2);
+		expect(events.map((e) => e.sessionId).sort()).toEqual(["ag-1", "ag-2"]);
+	});
+
+	it("runs a spanning source's per-repo FALLBACK once per checkout, not once per root", async () => {
+		// The degraded path: the machine-wide scan failed, so the source arrives as
+		// `undefined` and its own `scanForRepo` runs instead. That route used to ride
+		// inside `loadAllSessions`, which is driven per worktree root — so the full
+		// sweep this flag exists to run once ran N times concurrently, on exactly the
+		// path that was already the expensive one.
+		await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			worktreeRoots: [WORKTREE, "/w/feature", "/w/third"],
+			checkoutRoots: [WORKTREE, "/w/clone-b"],
+			// The real `loadAllSessions`, so the fallback is reached the way production
+			// reaches it; `antigravity` is absent from `preScanned`, which is how a
+			// failed machine-wide scan arrives.
+		});
+		// The probe is the same one the narrowing test uses: Antigravity's per-repo scan
+		// ends in `antigravitySessionsForRepo`, which resolves the worktrees of the
+		// directory it was handed. Two directories, not the three worktree roots.
+		expect(
+			vi
+				.mocked(resolveWorktreeRoots)
+				.mock.calls.map((c) => c[0])
+				.sort(),
+		).toEqual(["/w/clone-b", WORKTREE]);
+	});
+
+	it("keeps a spanning source out of the slice the per-root loader is handed", async () => {
+		// The other half of the same rule, asserted at the seam: `loadAllSessions` runs
+		// per worktree root, so anything left in its `defs` is asked N times.
+		const handed: Array<ReadonlyArray<string>> = [];
+		await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			worktreeRoots: [WORKTREE, "/w/feature"],
+			loadSessions: async (_cwd, _windowMs, _pre, defs) => {
+				handed.push((defs ?? []).map((d) => d.source));
+				return [];
+			},
+		});
+		expect(handed).toHaveLength(2);
+		for (const sources of handed) {
+			expect(sources).not.toContain("antigravity");
+			// The slice is a narrowing, not an emptying — every other source is still there.
+			expect(sources).toContain("codex");
+		}
+	});
+
+	it("leaves tokenCoverage absent for a Claude session with no usage", async () => {
+		// Absent, not an explicit `sessions-only`: `StatsWriter` defaults absence to
+		// `sessions-only` on first write but PRESERVES an existing `full` on re-read, so
+		// a transcript whose retention window dropped its usage cannot downgrade a row
+		// that once measured full usage.
 		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
 		const events = await collectSessionEvents({
 			repoIdentity: "r",
 			cwd: "/w",
 			loadSessions: async () => [claudeSession()],
 		});
-		expect(events[0].tokenCoverage).toBe("sessions-only");
+		expect(events[0]).not.toHaveProperty("tokenCoverage");
 		expect(events[0].models).toBeUndefined();
 	});
 
@@ -259,6 +464,53 @@ describe("collectSessionEvents", () => {
 			}),
 		]);
 		expect(readTranscript).not.toHaveBeenCalled();
+	});
+
+	it("buckets a session's activity, but attributes tokens only where per-turn usage exists", async () => {
+		vi.mocked(readTranscriptForSource).mockResolvedValueOnce({
+			entries: [
+				{ role: "human", content: "hi", timestamp: "2026-08-11T10:07:00.000Z" },
+				{ role: "assistant", content: "yo", timestamp: "2026-08-11T10:41:00.000Z" },
+			],
+			newCursor: { lineNumber: 2 },
+			totalLinesRead: 2,
+		} as unknown as TranscriptReadResult);
+
+		const event = await sessionEventFromInfo("repo-1", {
+			sessionId: "s1",
+			source: "codex",
+			transcriptPath: "/tmp/s1.jsonl",
+			updatedAt: "2026-08-11T10:41:00.000Z",
+		} as SessionInfo);
+
+		expect(event?.messageCount).toBe(2);
+		expect(event?.activityBuckets).toEqual([
+			Date.parse("2026-08-11T10:00:00.000Z"),
+			Date.parse("2026-08-11T10:30:00.000Z"),
+		]);
+		// Codex carries no per-turn usage, so nothing is attributed — the event leaves
+		// `tokenCoverage` ABSENT and `StatsWriter` defaults it to `sessions-only` on
+		// first write (while preserving an existing `full` on re-read).
+		expect(event).not.toHaveProperty("tokenCoverage");
+		expect(event?.models).toBeUndefined();
+	});
+
+	it("omits activityBuckets entirely when no entry is timestamped", async () => {
+		vi.mocked(readTranscriptForSource).mockResolvedValueOnce({
+			entries: [{ role: "human", content: "hi" }],
+			newCursor: { lineNumber: 1 },
+			totalLinesRead: 1,
+		} as unknown as TranscriptReadResult);
+
+		const event = await sessionEventFromInfo("repo-1", {
+			sessionId: "s2",
+			source: "cursor",
+			transcriptPath: "/tmp/s2.db#c1",
+			updatedAt: "2026-08-11T10:41:00.000Z",
+		} as SessionInfo);
+
+		// ABSENT, not `[]` — "uncovered", not "used no agents".
+		expect(event).not.toHaveProperty("activityBuckets");
 	});
 
 	it("dedupes (source, sessionId), keeping the newest, and drops unparseable timestamps", async () => {

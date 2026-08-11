@@ -25,16 +25,29 @@ vi.mock("../Logger.js", async (importOriginal) => {
 vi.mock("./GitOps.js", () => ({ getDefaultBranch: vi.fn() }));
 vi.mock("./PrDescription.js", () => ({ loadBranchSummaries: vi.fn() }));
 vi.mock("./PushPendingStore.js", () => ({ loadPushPending: vi.fn() }));
-vi.mock("./SummaryStore.js", () => ({
-	getActiveStorage: vi.fn(),
-	getIndexEntryMap: vi.fn(async () => new Map()),
-	getSummary: vi.fn(),
-	readNoteFromBranch: vi.fn(),
-	readPlanFromBranch: vi.fn(),
-	readReferenceFromBranch: vi.fn(),
-	readSkillFromBranch: vi.fn(),
-	storeSummary: vi.fn(),
-}));
+vi.mock("./SummaryStore.js", () => {
+	// Enrichment path (TranscriptSessionMeta) reads through `readTranscriptsBatch`
+	// now, not `readTranscript` — but every existing test drives it via the
+	// latter's single-value `mockResolvedValue`, so the batch mock fans that same
+	// value out to every id it's asked for rather than duplicating each test.
+	const readTranscript = vi.fn(async () => null);
+	return {
+		getActiveStorage: vi.fn(),
+		getIndexEntryMap: vi.fn(async () => new Map()),
+		getSummary: vi.fn(),
+		readNoteFromBranch: vi.fn(),
+		readPlanFromBranch: vi.fn(),
+		readTranscript,
+		readTranscriptsBatch: vi.fn(async (ids: ReadonlyArray<string>) => {
+			const result = new Map<string, unknown>();
+			for (const id of ids) result.set(id, await readTranscript());
+			return result;
+		}),
+		readReferenceFromBranch: vi.fn(),
+		readSkillFromBranch: vi.fn(),
+		storeSummary: vi.fn(),
+	};
+});
 vi.mock("./GitRemoteUtils.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./GitRemoteUtils.js")>();
 	return { ...actual, getCanonicalRepoUrl: vi.fn() };
@@ -98,6 +111,7 @@ import {
 	readPlanFromBranch,
 	readReferenceFromBranch,
 	readSkillFromBranch,
+	readTranscript,
 	storeSummary,
 } from "./SummaryStore.js";
 
@@ -223,6 +237,75 @@ describe("serializeSummaryJson", () => {
 		const huge = "x".repeat(2_000_000);
 		const s = { commitHash: "a", commitMessage: huge } as unknown as CommitSummary;
 		expect(serializeSummaryJson(s)).toBeUndefined();
+	});
+});
+
+describe("serializeSummaryJson session enrichment", () => {
+	/** A summary whose `recap` alone lands just under the 1.5 MB cap. */
+	function summaryOfRecapSize(chars: number): CommitSummary {
+		return {
+			version: 5,
+			commitHash: "b".repeat(40),
+			commitMessage: "feat: big",
+			commitAuthor: "Dev",
+			commitDate: "2026-08-01T10:00:00.000Z",
+			branch: "feature/x",
+			generatedAt: "2026-08-01T10:05:00.000Z",
+			recap: "x".repeat(chars),
+		} as CommitSummary;
+	}
+
+	it("carries transcriptSessions through when the payload fits", () => {
+		const json = serializeSummaryJson({
+			...summaryOfRecapSize(10),
+			transcriptSessions: [
+				{
+					sessionId: "s1",
+					source: "claude",
+					messageCount: 3,
+					startedAt: "2026-08-01T09:00:00.000Z",
+					endedAt: "2026-08-01T10:10:00.000Z",
+				},
+			],
+		});
+
+		expect(json).toBeDefined();
+		expect(JSON.parse(json as string).transcriptSessions).toEqual([
+			{
+				sessionId: "s1",
+				source: "claude",
+				messageCount: 3,
+				startedAt: "2026-08-01T09:00:00.000Z",
+				endedAt: "2026-08-01T10:10:00.000Z",
+			},
+		]);
+	});
+
+	it("drops only the enrichment when it is what pushes the payload over the cap", () => {
+		// 1.5 MB is 1_572_864 bytes; leave under 400 bytes of headroom so a handful
+		// of session rows is the difference between fitting and not.
+		const base = summaryOfRecapSize(1_572_500);
+		const withoutEnrichment = serializeSummaryJson(base);
+		expect(withoutEnrichment).toBeDefined();
+
+		const json = serializeSummaryJson({
+			...base,
+			transcriptSessions: Array.from({ length: 20 }, (_, i) => ({
+				sessionId: `session-${i}`,
+				source: "claude",
+				messageCount: 10,
+				startedAt: "2026-08-01T09:00:00.000Z",
+				endedAt: "2026-08-01T10:10:00.000Z",
+			})),
+		});
+
+		// The sidecar survives; only the enrichment is gone.
+		expect(json).toBe(withoutEnrichment);
+		expect(JSON.parse(json as string)).not.toHaveProperty("transcriptSessions");
+	});
+
+	it("still returns undefined when the payload is oversized without any enrichment", () => {
+		expect(serializeSummaryJson(summaryOfRecapSize(2_000_000))).toBeUndefined();
 	});
 });
 
@@ -2197,5 +2280,109 @@ describe("skill attachments", () => {
 		const owned = assignOwnedContext([older, newer]).get("skill");
 		expect(owned?.owned.get("1111111111111")).toBeUndefined();
 		expect(owned?.owned.get("2222222222222")).toHaveLength(1);
+	});
+});
+
+describe("session enrichment on the push path", () => {
+	beforeEach(() => {
+		vi.mocked(storeSummary).mockReset().mockResolvedValue(undefined);
+		vi.mocked(readPlanFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(readNoteFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(loadPushPending).mockReset().mockResolvedValue({ version: 1, entries: {} });
+		vi.mocked(getIndexEntryMap).mockReset().mockResolvedValue(new Map());
+		vi.mocked(readReferenceFromBranch).mockReset().mockResolvedValue(null);
+		vi.mocked(saveSpaceBindingCache).mockReset().mockResolvedValue(undefined);
+		vi.mocked(clearSpaceBindingCache).mockReset().mockResolvedValue(undefined);
+		vi.mocked(readTranscript).mockReset().mockResolvedValue(null);
+	});
+
+	const ONE_SESSION = {
+		sessions: [
+			{
+				sessionId: "s1",
+				source: "claude" as const,
+				entries: [
+					{ role: "human" as const, content: "a", timestamp: "2026-08-01T09:00:00.000Z" },
+					{ role: "assistant" as const, content: "b", timestamp: "2026-08-01T10:10:00.000Z" },
+				],
+			},
+		],
+	};
+
+	/** A v5 root that lists one artifact, plus a child that lists none. */
+	function summaryWithChild(): CommitSummary {
+		return {
+			version: 5,
+			commitHash: "c".repeat(40),
+			commitMessage: "feat: x",
+			commitAuthor: "Dev",
+			commitDate: "2026-08-01T10:00:00.000Z",
+			branch: "feature/x",
+			generatedAt: "2026-08-01T10:05:00.000Z",
+			transcripts: ["t1"],
+			children: [
+				{
+					version: 5,
+					commitHash: "d".repeat(40),
+					commitMessage: "wip",
+					commitAuthor: "Dev",
+					commitDate: "2026-08-01T09:30:00.000Z",
+					branch: "feature/x",
+					generatedAt: "2026-08-01T09:35:00.000Z",
+					transcripts: [],
+				},
+			],
+		} as CommitSummary;
+	}
+
+	/** The `summaryJson` sidecar of the last summary article this client pushed. */
+	function lastPushedSummaryJson(client: ReturnType<typeof fakeClient>): Record<string, unknown> {
+		const payload = vi
+			.mocked(client.push)
+			.mock.calls.map((c) => c[0] as PushPayload)
+			.filter((p) => p.docType === "summary")
+			.at(-1);
+		return JSON.parse(payload?.summaryJson as string);
+	}
+
+	it("stamps the rows on the root only, never on a child", async () => {
+		vi.mocked(readTranscript).mockResolvedValue(ONE_SESSION);
+		const client = fakeClient();
+
+		await pushSummary(summaryWithChild(), baseCtx(client));
+		const pushed = lastPushedSummaryJson(client);
+
+		expect(pushed.transcriptSessions).toEqual([
+			{
+				sessionId: "s1",
+				source: "claude",
+				messageCount: 2,
+				startedAt: "2026-08-01T09:00:00.000Z",
+				endedAt: "2026-08-01T10:10:00.000Z",
+			},
+		]);
+		// A child copy would activate the server's keep-first merge and truncate.
+		expect((pushed.children as Array<Record<string, unknown>>)[0]).not.toHaveProperty("transcriptSessions");
+	});
+
+	it("omits the key entirely when no session is derivable", async () => {
+		vi.mocked(readTranscript).mockResolvedValue(null);
+		const client = fakeClient();
+
+		await pushSummary(summaryWithChild(), baseCtx(client));
+
+		// An empty array would read as "measured: zero conversations" and would also
+		// disable the server's bare-transcript-id fallback.
+		expect(lastPushedSummaryJson(client)).not.toHaveProperty("transcriptSessions");
+	});
+
+	it("never persists the enrichment to the stored summary", async () => {
+		vi.mocked(readTranscript).mockResolvedValue(ONE_SESSION);
+		const ctx = baseCtx(fakeClient());
+
+		await pushSummary(summaryWithChild(), ctx);
+
+		const stored = vi.mocked(storeSummary).mock.calls.at(-1)?.[0] as CommitSummary;
+		expect(stored).not.toHaveProperty("transcriptSessions");
 	});
 });

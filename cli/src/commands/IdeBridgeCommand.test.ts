@@ -254,6 +254,13 @@ vi.mock("../core/JolliMemoryPushOrchestrator.js", () => ({
 	latestPlanPerName: vi.fn((plans: unknown[]) => plans),
 }));
 
+// The push-time session enrichment the `serialize-summary` op now derives (there is
+// no Kotlin equivalent). Defaults to "no sessions" so the existing serialize cases
+// behave exactly as before; the enrichment case overrides it per-test.
+vi.mock("../core/TranscriptSessionMeta.js", () => ({
+	collectTranscriptSessionMeta: vi.fn().mockResolvedValue([]),
+}));
+
 vi.mock("../core/GitRemoteUtils.js", () => ({
 	getCanonicalRepoUrl: vi.fn().mockResolvedValue("git@github.com:acme/repo.git"),
 	deriveRepoNameFromUrl: vi.fn().mockReturnValue("repo"),
@@ -3111,6 +3118,47 @@ describe("runIdeBridgeAction — jolli-api", () => {
 		vi.mocked(serializeSummaryJson).mockReturnValue(undefined);
 		const result = await runIdeBridgeAction("jolli-api", "/r", { operation: "serialize-summary", summary: {} });
 		expect(result).toEqual({ json: null });
+	});
+
+	it("enriches the summary with derived transcript sessions before serializing", async () => {
+		// Parity with the CLI push path: the JVM host has no way to compute the
+		// push-time session enrichment, so the bridge must derive it and weave it in
+		// before serializing — otherwise every IntelliJ-initiated share ships the
+		// pre-enrichment sidecar silently.
+		const { serializeSummaryJson } = await import("../core/JolliMemoryPushOrchestrator.js");
+		const { collectTranscriptSessionMeta } = await import("../core/TranscriptSessionMeta.js");
+		const sessions = [{ sessionId: "s1", messageCount: 3 }];
+		vi.mocked(collectTranscriptSessionMeta).mockResolvedValueOnce(sessions as never);
+		vi.mocked(serializeSummaryJson).mockReturnValue('{"enriched":true}');
+
+		const result = await runIdeBridgeAction("jolli-api", "/r", {
+			operation: "serialize-summary",
+			summary: { commitHash: "abc" },
+		});
+
+		expect(result).toEqual({ json: '{"enriched":true}' });
+		expect(vi.mocked(serializeSummaryJson)).toHaveBeenCalledWith(
+			expect.objectContaining({ commitHash: "abc", transcriptSessions: sessions }),
+		);
+	});
+
+	it("leaves an already-enriched summary untouched", async () => {
+		// A host that learns to compute the enrichment itself wins: the bridge must not
+		// recompute (or clobber) a `transcriptSessions` the caller already supplied.
+		const { serializeSummaryJson } = await import("../core/JolliMemoryPushOrchestrator.js");
+		const { collectTranscriptSessionMeta } = await import("../core/TranscriptSessionMeta.js");
+		vi.mocked(serializeSummaryJson).mockReturnValue('{"kept":true}');
+
+		const supplied = [{ sessionId: "host", messageCount: 1 }];
+		await runIdeBridgeAction("jolli-api", "/r", {
+			operation: "serialize-summary",
+			summary: { commitHash: "abc", transcriptSessions: supplied },
+		});
+
+		expect(vi.mocked(collectTranscriptSessionMeta)).not.toHaveBeenCalled();
+		expect(vi.mocked(serializeSummaryJson)).toHaveBeenCalledWith(
+			expect.objectContaining({ transcriptSessions: supplied }),
+		);
 	});
 
 	it("pushes a payload via JolliMemoryPushClient", async () => {

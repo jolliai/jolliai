@@ -1108,7 +1108,22 @@ async function runJolliApiAction(cwd: string, request: JsonObject): Promise<unkn
 	}
 	if (operation === "serialize-summary") {
 		const { serializeSummaryJson } = await import("../core/JolliMemoryPushOrchestrator.js");
-		return { json: serializeSummaryJson(request.summary as Parameters<typeof serializeSummaryJson>[0]) ?? null };
+		const { collectTranscriptSessionMeta } = await import("../core/TranscriptSessionMeta.js");
+		const summary = request.summary as Parameters<typeof serializeSummaryJson>[0];
+		// Parity with the CLI push path (`pushSummary`): the enrichment is derived, not
+		// carried by the caller, and there is no Kotlin equivalent — so a JVM-initiated
+		// share reached here with `transcriptSessions` absent and shipped the pre-
+		// enrichment sidecar silently. Derive it from the artifacts this tree references
+		// (`storage` resolves from `cwd`), skip when the caller already supplied it (a
+		// host that learns to compute it wins), and omit when empty so absence never
+		// reads as a measured zero. `collectTranscriptSessionMeta` degrades to `[]` on
+		// any read fault, so this never blocks the serialize.
+		let enriched = summary;
+		if (summary.transcriptSessions === undefined) {
+			const transcriptSessions = await collectTranscriptSessionMeta(summary, cwd);
+			if (transcriptSessions.length > 0) enriched = { ...summary, transcriptSessions };
+		}
+		return { json: serializeSummaryJson(enriched) ?? null };
 	}
 	// spec 306: the memory-mutating operations must consult the per-repo
 	// outbound-push opt-out — the SAME gate the CLI drains, the manual/MCP push, and

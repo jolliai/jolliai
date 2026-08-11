@@ -5,12 +5,15 @@ const { mockPushToJolli, mockDeleteFromJolli } = vi.hoisted(() => ({
 	mockPushToJolli: vi.fn(),
 	mockDeleteFromJolli: vi.fn(),
 }));
-const { mockReadPlan, mockReadNote, mockReadReference, mockReadSkill } = vi.hoisted(() => ({
-	mockReadPlan: vi.fn(),
-	mockReadNote: vi.fn(),
-	mockReadReference: vi.fn(),
-	mockReadSkill: vi.fn(),
-}));
+const { mockReadPlan, mockReadNote, mockReadReference, mockReadSkill, mockReadTranscriptsBatch } = vi.hoisted(
+	() => ({
+		mockReadPlan: vi.fn(),
+		mockReadNote: vi.fn(),
+		mockReadReference: vi.fn(),
+		mockReadSkill: vi.fn(),
+		mockReadTranscriptsBatch: vi.fn(),
+	}),
+);
 // spec 306: the outbound-push gate. Default allowed; the fail-fast test flips it.
 const { mockIsOutboundPushAllowed } = vi.hoisted(() => ({
 	mockIsOutboundPushAllowed: vi.fn(async () => true),
@@ -29,7 +32,20 @@ vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	readNoteFromBranch: mockReadNote,
 	readReferenceFromBranch: mockReadReference,
 	readSkillFromBranch: mockReadSkill,
+	readTranscriptsBatch: mockReadTranscriptsBatch,
 }));
+// Spy-wraps the real `collectTranscriptSessionMeta` (like the panel test wraps
+// `pushSummaryWithAttachments`): every existing test keeps exercising the genuine
+// enrichment, while one test can `mockRejectedValueOnce` to pin that a call-site
+// failure here — not just a `readTranscriptsBatch` failure — still can't abort a push.
+const { mockCollectTranscriptSessionMeta } = vi.hoisted(() => ({
+	mockCollectTranscriptSessionMeta: vi.fn(),
+}));
+vi.mock("../../../cli/src/core/TranscriptSessionMeta.js", async (importActual) => {
+	const actual = await importActual<typeof import("../../../cli/src/core/TranscriptSessionMeta.js")>();
+	mockCollectTranscriptSessionMeta.mockImplementation(actual.collectTranscriptSessionMeta);
+	return { ...actual, collectTranscriptSessionMeta: mockCollectTranscriptSessionMeta };
+});
 vi.mock("../views/SummaryMarkdownBuilder.js", () => ({ buildMarkdown: () => "# markdown" }));
 vi.mock("../../../cli/src/core/Telemetry.js", () => ({ track: vi.fn() }));
 vi.mock("../util/Logger.js", () => ({
@@ -63,6 +79,13 @@ function makeSummary(overrides: Partial<CommitSummary> = {}): CommitSummary {
 	} as unknown as CommitSummary;
 }
 
+/** Makes `readTranscriptsBatch` resolve every requested id to the same value. */
+function mockTranscriptsBatch(value: unknown): void {
+	mockReadTranscriptsBatch.mockImplementation(
+		async (ids: readonly string[]) => new Map(ids.map((id) => [id, value])),
+	);
+}
+
 function makeContext(overrides: Partial<PushContext> = {}): PushContext {
 	return {
 		baseUrl: "https://acme.jolli.ai/",
@@ -81,6 +104,7 @@ beforeEach(() => {
 	mockReadNote.mockResolvedValue("note body");
 	mockReadReference.mockResolvedValue(null);
 	mockReadSkill.mockResolvedValue(null);
+	mockTranscriptsBatch(null);
 	mockIsOutboundPushAllowed.mockResolvedValue(true);
 });
 
@@ -668,6 +692,90 @@ describe("pushSummaryWithAttachments", () => {
 	});
 });
 
+describe("session enrichment on pushSummaryWithAttachments", () => {
+	const ONE_SESSION = {
+		sessions: [
+			{
+				sessionId: "s1",
+				source: "claude" as const,
+				entries: [
+					{ role: "human" as const, content: "a", timestamp: "2026-08-01T09:00:00.000Z" },
+					{ role: "assistant" as const, content: "b", timestamp: "2026-08-01T10:10:00.000Z" },
+				],
+			},
+		],
+	};
+
+	function summaryText(): { calls: unknown[][] } {
+		return { calls: mockPushToJolli.mock.calls };
+	}
+
+	function summaryPayload(): { summaryJson?: string } {
+		const call = summaryText().calls.find((c) => (c[2] as { docType: string }).docType === "summary");
+		return call?.[2] as { summaryJson?: string };
+	}
+
+	it("weaves transcriptSessions into the pushed summaryJson when a transcript is readable", async () => {
+		mockTranscriptsBatch(ONE_SESSION);
+		mockPushToJolli.mockResolvedValue({ docId: 100 });
+		const summary = makeSummary({ transcripts: ["t1"] });
+
+		await pushSummaryWithAttachments(summary, makeContext());
+
+		const parsed = JSON.parse(summaryPayload().summaryJson ?? "{}");
+		expect(parsed.transcriptSessions).toEqual([
+			{
+				sessionId: "s1",
+				source: "claude",
+				messageCount: 2,
+				startedAt: "2026-08-01T09:00:00.000Z",
+				endedAt: "2026-08-01T10:10:00.000Z",
+			},
+		]);
+	});
+
+	it("still pushes without transcriptSessions when the enrichment itself rejects (call-site defense)", async () => {
+		// Regression: `collectTranscriptSessionMeta` used to be awaited unguarded here.
+		// Any throw inside it (not just a `readTranscriptsBatch` failure — e.g. id
+		// resolution over a malformed summary tree) aborted the whole push before
+		// `pushToJolli` was ever reached. The enrichment is an optional extra, so a
+		// rejection here must degrade to "no sessions", never abort the push.
+		mockCollectTranscriptSessionMeta.mockRejectedValueOnce(new Error("enrichment boom"));
+		mockPushToJolli.mockResolvedValue({ docId: 100 });
+		const summary = makeSummary({ transcripts: ["t1"] });
+
+		const result = await pushSummaryWithAttachments(summary, makeContext());
+
+		expect(result.pushedDoc.summaryDocId).toBe(100);
+		expect(mockPushToJolli).toHaveBeenCalled();
+		const parsed = JSON.parse(summaryPayload().summaryJson ?? "{}");
+		expect(parsed).not.toHaveProperty("transcriptSessions");
+	});
+
+	it("omits transcriptSessions entirely when no session is derivable", async () => {
+		mockTranscriptsBatch(null);
+		mockPushToJolli.mockResolvedValue({ docId: 100 });
+		const summary = makeSummary({ transcripts: ["t1"] });
+
+		await pushSummaryWithAttachments(summary, makeContext());
+
+		const parsed = JSON.parse(summaryPayload().summaryJson ?? "{}");
+		expect(parsed).not.toHaveProperty("transcriptSessions");
+	});
+
+	it("never persists the enrichment on the stored summary", async () => {
+		mockTranscriptsBatch(ONE_SESSION);
+		mockPushToJolli.mockResolvedValue({ docId: 100 });
+		const summary = makeSummary({ transcripts: ["t1"] });
+		const ctx = makeContext();
+
+		await pushSummaryWithAttachments(summary, ctx);
+
+		const stored = (ctx.storeSummary as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as CommitSummary;
+		expect(stored).not.toHaveProperty("transcriptSessions");
+	});
+});
+
 describe("serializeSummaryJson", () => {
 	it("strips jolliDocId/jolliDocUrl/orphanedDocIds and keeps content fields", () => {
 		const json = serializeSummaryJson(
@@ -717,5 +825,60 @@ describe("serializeSummaryJson", () => {
 
 	it("returns undefined for a summary that serializes over the byte cap", () => {
 		expect(serializeSummaryJson(makeSummary({ recap: "x".repeat(1_600_000) }))).toBeUndefined();
+	});
+});
+
+describe("serializeSummaryJson session enrichment", () => {
+	it("carries transcriptSessions through when the payload fits", () => {
+		const json = serializeSummaryJson({
+			...makeSummary({ recap: "x".repeat(10) }),
+			transcriptSessions: [
+				{
+					sessionId: "s1",
+					source: "claude",
+					messageCount: 3,
+					startedAt: "2026-08-01T09:00:00.000Z",
+					endedAt: "2026-08-01T10:10:00.000Z",
+				},
+			],
+		});
+
+		expect(json).toBeDefined();
+		expect(JSON.parse(json as string).transcriptSessions).toEqual([
+			{
+				sessionId: "s1",
+				source: "claude",
+				messageCount: 3,
+				startedAt: "2026-08-01T09:00:00.000Z",
+				endedAt: "2026-08-01T10:10:00.000Z",
+			},
+		]);
+	});
+
+	it("drops only the enrichment when it is what pushes the payload over the cap", () => {
+		// 1.5 MB is 1_572_864 bytes; leave under 400 bytes of headroom so a handful
+		// of session rows is the difference between fitting and not.
+		const base = makeSummary({ recap: "x".repeat(1_572_500) });
+		const withoutEnrichment = serializeSummaryJson(base);
+		expect(withoutEnrichment).toBeDefined();
+
+		const json = serializeSummaryJson({
+			...base,
+			transcriptSessions: Array.from({ length: 20 }, (_, i) => ({
+				sessionId: `session-${i}`,
+				source: "claude",
+				messageCount: 10,
+				startedAt: "2026-08-01T09:00:00.000Z",
+				endedAt: "2026-08-01T10:10:00.000Z",
+			})),
+		});
+
+		// The sidecar survives; only the enrichment is gone.
+		expect(json).toBe(withoutEnrichment);
+		expect(JSON.parse(json as string)).not.toHaveProperty("transcriptSessions");
+	});
+
+	it("still returns undefined when the payload is oversized without any enrichment", () => {
+		expect(serializeSummaryJson(makeSummary({ recap: "x".repeat(2_000_000) }))).toBeUndefined();
 	});
 });

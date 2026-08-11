@@ -88,6 +88,7 @@ import {
 	readReferenceFromBranch,
 	readSkillFromBranch,
 	readTranscript,
+	readTranscriptsBatch,
 	readTranscriptsForCommits,
 	removeFromIndex,
 	resolveReadStorage,
@@ -2580,6 +2581,85 @@ describe("SummaryStore", () => {
 			expect(fakeStorage?.readFile).toHaveBeenNthCalledWith(1, "transcripts/h1.json");
 			expect(fakeStorage?.readFile).toHaveBeenNthCalledWith(2, "transcripts/h2.json");
 			expect(result.size).toBe(2);
+		});
+
+		describe("readTranscriptsBatch", () => {
+			it("returns an empty map without touching storage when ids is empty", async () => {
+				const fakeStorage = {
+					readFile: vi.fn(),
+					batchReadFiles: vi.fn(),
+				} as unknown as Parameters<typeof readTranscriptsBatch>[2];
+
+				const result = await readTranscriptsBatch([], undefined, fakeStorage);
+
+				expect(result.size).toBe(0);
+				expect(fakeStorage?.readFile).not.toHaveBeenCalled();
+				expect(fakeStorage?.batchReadFiles).not.toHaveBeenCalled();
+			});
+
+			it("uses batchReadFiles in a single call when the backend implements it", async () => {
+				const batchReadFiles = vi.fn().mockResolvedValue(
+					new Map([
+						["transcripts/h1.json", JSON.stringify({ sessions: [{ sessionId: "a", entries: [] }] })],
+						["transcripts/h2.json", null],
+					]),
+				);
+				const fakeStorage = {
+					readFile: vi.fn(),
+					batchReadFiles,
+				} as unknown as Parameters<typeof readTranscriptsBatch>[2];
+
+				const result = await readTranscriptsBatch(["h1", "h2"], undefined, fakeStorage);
+
+				expect(batchReadFiles).toHaveBeenCalledTimes(1);
+				expect(batchReadFiles).toHaveBeenCalledWith(["transcripts/h1.json", "transcripts/h2.json"]);
+				expect(fakeStorage?.readFile).not.toHaveBeenCalled();
+				expect(result.get("h1")?.sessions[0]?.sessionId).toBe("a");
+				expect(result.get("h2")).toBeNull();
+			});
+
+			it("falls back to a per-path readFile loop when batchReadFiles is absent (FolderStorage)", async () => {
+				const fakeStorage = {
+					readFile: vi
+						.fn()
+						.mockResolvedValueOnce(JSON.stringify({ sessions: [{ sessionId: "a", entries: [] }] }))
+						.mockResolvedValueOnce(null),
+				} as unknown as Parameters<typeof readTranscriptsBatch>[2];
+
+				const result = await readTranscriptsBatch(["h1", "h2"], undefined, fakeStorage);
+
+				expect(fakeStorage?.readFile).toHaveBeenCalledTimes(2);
+				expect(fakeStorage?.readFile).toHaveBeenNthCalledWith(1, "transcripts/h1.json");
+				expect(fakeStorage?.readFile).toHaveBeenNthCalledWith(2, "transcripts/h2.json");
+				expect(result.get("h1")?.sessions[0]?.sessionId).toBe("a");
+				expect(result.get("h2")).toBeNull();
+			});
+
+			it("maps a malformed JSON body to null rather than throwing", async () => {
+				const batchReadFiles = vi.fn().mockResolvedValue(new Map([["transcripts/h1.json", "not json"]]));
+				const fakeStorage = {
+					readFile: vi.fn(),
+					batchReadFiles,
+				} as unknown as Parameters<typeof readTranscriptsBatch>[2];
+
+				const result = await readTranscriptsBatch(["h1"], undefined, fakeStorage);
+
+				expect(result.get("h1")).toBeNull();
+			});
+
+			it("maps one throwing readFile to null in the fallback loop without failing the other ids", async () => {
+				const fakeStorage = {
+					readFile: vi.fn().mockImplementation(async (path: string) => {
+						if (path === "transcripts/bad.json") throw new Error("simulated read failure");
+						return JSON.stringify({ sessions: [{ sessionId: "good", entries: [] }] });
+					}),
+				} as unknown as Parameters<typeof readTranscriptsBatch>[2];
+
+				const result = await readTranscriptsBatch(["bad", "good"], undefined, fakeStorage);
+
+				expect(result.get("bad")).toBeNull();
+				expect(result.get("good")?.sessions[0]?.sessionId).toBe("good");
+			});
 		});
 
 		it("should write and delete transcript files in a single batch", async () => {

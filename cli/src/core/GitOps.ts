@@ -11,11 +11,11 @@
 import { once } from "node:events";
 import { readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { createLogger } from "../Logger.js";
+import { createLogger, errMsg } from "../Logger.js";
 import type { CommitInfo, DiffStats, FileWrite, GitCommandResult } from "../Types.js";
 import { execFileAsyncHidden, execFileSyncHidden, spawnHidden } from "../util/Subprocess.js";
 import { resolveGitFsLayout } from "./GitFsLayout.js";
-import { toForwardSlash } from "./PathUtils.js";
+import { normalizePathForCompare, toForwardSlash } from "./PathUtils.js";
 
 const MAX_GIT_BUFFER_BYTES = 10 * 1024 * 1024; // 10MB
 /** NUL byte — used as entry separator in `git ls-tree -z` output. */
@@ -1199,6 +1199,52 @@ export async function listWorktrees(cwd: string): Promise<ReadonlyArray<string>>
 		.filter((line) => line.startsWith("worktree "))
 		.map((line) => line.slice("worktree ".length).trim());
 	return paths;
+}
+
+/**
+ * {@link listWorktrees} that never throws — `dir` plus every sibling checkout of
+ * the same repository, deduped, `dir` first.
+ *
+ * The "one repo, many checkouts" question comes up wherever an artifact records
+ * the directory it was produced in and a caller has to decide which repository
+ * that is. An agent session is the case that matters most: transcripts are keyed
+ * by the cwd the conversation ran in, so a linked worktree's sessions live under
+ * ITS path, and a scope built from one checkout alone silently answers for a
+ * fraction of the repo's work. Measured while this was still per-checkout: of 94
+ * in-window Claude sessions on a repo with six live worktrees, 65 belonged to a
+ * sibling and were invisible to the back-fill — and they are exactly the parallel
+ * work the agent-concurrency figure exists to show.
+ *
+ * Returned paths are kept RAW (the caller's / git's own spelling): callers feed
+ * them to {@link sessionDirBelongsToRepo}, whose nested-repo `.git` walk needs a
+ * real on-disk path, and which folds separators and case itself. The DEDUPE key,
+ * however, is `normalizePathForCompare`d — same trade as `dedupeRoots`. Without it
+ * the Set keyed on raw strings: `listWorktrees` returns git's own output
+ * (forward-slash paths on Windows) while `dir` arrives in the caller's spelling
+ * (often backslash), so one checkout would survive as BOTH spellings, and the sole
+ * direct consumer that does not re-dedupe (Antigravity's per-repo narrowing, the
+ * reason `forRepoSpansWorktrees` exists) pays a streamed title read per duplicate.
+ *
+ * Falling back to `[dir]` rather than propagating is what makes this usable on a
+ * caller's critical path: git being absent, or `dir` not being a checkout at all,
+ * degrades to the previous single-root behaviour instead of failing a sweep.
+ */
+export async function resolveWorktreeRoots(dir: string): Promise<ReadonlyArray<string>> {
+	const seen = new Set<string>();
+	const roots: string[] = [];
+	const add = (root: string): void => {
+		const key = normalizePathForCompare(root);
+		if (seen.has(key)) return;
+		seen.add(key);
+		roots.push(root);
+	};
+	add(dir);
+	try {
+		for (const worktree of await listWorktrees(dir)) add(worktree);
+	} catch (err) {
+		log.debug("listWorktrees failed for %s -- using it as the only root: %s", dir, errMsg(err));
+	}
+	return roots;
 }
 
 /**

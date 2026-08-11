@@ -37,7 +37,7 @@ import { mapWithConcurrency, withIoBudget } from "../util/Concurrency.js";
 import { getAntigravityVariants } from "./AntigravityDetector.js";
 import { unwrapUserRequest } from "./AntigravityTranscriptReader.js";
 import { type AlreadyCurrent, type DiskSession, sessionsForRepo } from "./DiskSessionScan.js";
-import { listWorktrees } from "./GitOps.js";
+import { resolveWorktreeRoots } from "./GitOps.js";
 import { sessionDirBelongsToRepo } from "./SessionDirMatch.js";
 import { classifyScanError, hasNodeSqliteSupport, type SqliteScanError, withSqliteDb } from "./SqliteHelpers.js";
 
@@ -147,29 +147,6 @@ async function readTitle(transcriptPath: string): Promise<string | undefined> {
 		log.debug("readTitle stream failed for %s: %s", transcriptPath, errMsg(err));
 	}
 	return undefined;
-}
-
-/**
- * Resolves the set of worktree roots (raw, unnormalized paths) for the repo
- * containing `projectDir`. Antigravity records the checkout the IDE was opened
- * in, which is frequently a *different* worktree than the one committing (e.g.
- * the IDE sits on the main checkout while commits happen from a linked feature
- * worktree), so matching against every worktree root attributes the conversation
- * to the same repo regardless of which worktree runs the hook. Falls back to
- * just `projectDir` when git is unavailable or the dir is not inside a repo.
- *
- * Paths are kept raw (not `normalizePathForCompare`d) because the caller feeds
- * them to `sessionDirBelongsToRepo`, whose nested-repo `.git` walk needs the
- * real on-disk path; that helper does the separator/case folding itself.
- */
-async function resolveWorktreeRoots(projectDir: string): Promise<ReadonlySet<string>> {
-	const roots = new Set<string>([projectDir]);
-	try {
-		for (const wt of await listWorktrees(projectDir)) roots.add(wt);
-	} catch (err) {
-		log.debug("listWorktrees failed for %s (falling back to exact match): %s", projectDir, errMsg(err));
-	}
-	return roots;
 }
 
 /**
@@ -489,7 +466,7 @@ export async function antigravitySessionsForRepo(
 	scanned: ReadonlyArray<DiskSession>,
 	projectDir: string,
 ): Promise<ReadonlyArray<SessionInfo>> {
-	const worktreeRoots = [...(await resolveWorktreeRoots(projectDir))];
+	const worktreeRoots = await resolveWorktreeRoots(projectDir);
 	const mine = sessionsForRepo(scanned, (dir) => worktreeRoots.some((root) => sessionDirBelongsToRepo(dir, root)));
 	return mapWithConcurrency(mine, async (session) => {
 		// Streams with an early exit on the first user turn, so it claims a slot and

@@ -1023,6 +1023,130 @@ describe("buildDashboardModel", () => {
 			expect(old.heatmap.every((cell) => cell.sessions === 0)).toBe(true);
 		});
 	});
+
+	describe("concurrency", () => {
+		// Two adjacent quarter-hours inside the default window.
+		const B0 = Math.floor((nowMs - 3_600_000) / 900_000) * 900_000;
+		const B1 = B0 + 900_000;
+
+		const model = async () =>
+			withDashboardDb(
+				(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+				{ dbPath },
+			);
+
+		it("counts one agent session once even when it touched two repos", async () => {
+			// `sessions` is unique on (repo_id, source, session_id), so the SAME
+			// agent session in two repos is two rows with two event ids. Counting
+			// event ids would report one agent as two — and this figure is
+			// machine-global, which makes that certain rather than latent.
+			await applyStatsEvents(
+				[
+					session({ repoIdentity: "repo-1", source: "cursor", sessionId: "s1", activityBuckets: [B0] }),
+					session({ repoIdentity: "repo-2", source: "cursor", sessionId: "s1", activityBuckets: [B0] }),
+				],
+				{ producerKind: "cli", dbPath },
+			);
+			expect((await model()).stats?.concurrency?.peak).toBe(1);
+		});
+
+		it("reports the peak and the mean over ACTIVE buckets only", async () => {
+			await applyStatsEvents(
+				[
+					session({ source: "claude", sessionId: "s1", activityBuckets: [B0, B1] }),
+					session({ source: "codex", sessionId: "s2", activityBuckets: [B0] }),
+				],
+				{ producerKind: "cli", dbPath },
+			);
+			const stats = (await model()).stats;
+			// B0 holds 2 sessions, B1 holds 1. The mean over the two ACTIVE buckets
+			// is 1.5 — not 3/672, which is what dividing by the window would give.
+			expect(stats?.concurrency?.peak).toBe(2);
+			expect(stats?.concurrency?.meanActive).toBeCloseTo(1.5);
+			expect(stats?.concurrency?.buckets).toHaveLength(2);
+			expect(stats?.concurrency?.bucketMinutes).toBe(15);
+		});
+
+		it("names sources that contributed sessions but no buckets as uncovered", async () => {
+			await applyStatsEvents(
+				[
+					session({ source: "claude", sessionId: "s1", activityBuckets: [B0] }),
+					session({ source: "opencode", sessionId: "s2" }),
+				],
+				{ producerKind: "cli", dbPath },
+			);
+			const stats = (await model()).stats;
+			expect(stats?.concurrency?.measuredSources).toEqual(["claude"]);
+			// Uncovered, NOT "ran zero agents".
+			expect(stats?.concurrency?.uncoveredSources).toEqual(["opencode"]);
+		});
+
+		it("does not call a source uncovered when its buckets merely predate the window", async () => {
+			// A session enters the window by `updated_at_ms`, but its buckets are keyed
+			// by its TURNS — and the two come apart in practice. A conversation resumed
+			// just after midnight, or one from a source whose `updatedAt` is its store
+			// row's timestamp rather than its last turn, is in-window with every bucket
+			// older than the window.
+			//
+			// `measuredSources` correctly says it drew no bar. Deriving "uncovered" by
+			// subtracting that set turned the same fact into a claim about the AGENT —
+			// "this one carries no per-turn timestamps" — which is exactly what the
+			// label is read as, and which is false here.
+			const oldTurnMs = nowMs - 45 * 86_400_000;
+			await applyStatsEvents(
+				[
+					session({ source: "claude", sessionId: "s1", activityBuckets: [B0] }),
+					session({
+						source: "opencode",
+						sessionId: "resumed",
+						// In-window by its update instant …
+						updatedAtMs: nowMs,
+						// … while its only turn is well before the 30-day window starts.
+						activityBuckets: [Math.floor(oldTurnMs / 900_000) * 900_000],
+					}),
+				],
+				{ producerKind: "cli", dbPath },
+			);
+			const stats = (await model()).stats;
+			// It drew no bar in the window — that half is honest and unchanged.
+			expect(stats?.concurrency?.measuredSources).not.toContain("opencode");
+			// But it is measurable, so it must not be named as uncovered.
+			expect(stats?.concurrency?.uncoveredSources).toEqual([]);
+		});
+
+		it("ignores the repo scope — concurrency is a property of the person", async () => {
+			await applyStatsEvents(
+				[
+					session({ repoIdentity: "repo-1", source: "claude", sessionId: "s1", activityBuckets: [B0] }),
+					session({ repoIdentity: "repo-2", source: "codex", sessionId: "s2", activityBuckets: [B0] }),
+				],
+				{ producerKind: "cli", dbPath },
+			);
+			const scoped = await withDashboardDb(
+				(db) =>
+					buildDashboardModel(db, {
+						view: "stats",
+						scope: { kind: "repo", repoIdentities: ["repo-1"] },
+						timeZone: "UTC",
+						nowMs,
+					}),
+				{ dbPath },
+			);
+			// Both agents still count: filtering here would truncate the number
+			// into something with no actionable meaning.
+			expect(scoped.stats?.concurrency?.peak).toBe(2);
+		});
+
+		it("omits the field entirely when no bucket falls in the window", async () => {
+			await applyStatsEvents([session({ source: "claude", sessionId: "s1" })], {
+				producerKind: "cli",
+				dbPath,
+			});
+			// Absent, not a zero: under forward-only collection this is the normal
+			// state for the first days after deployment.
+			expect((await model()).stats?.concurrency).toBeUndefined();
+		});
+	});
 });
 
 describe("buildDashboardModel — tool usage", () => {

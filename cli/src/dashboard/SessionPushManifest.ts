@@ -99,6 +99,16 @@ export const NEVER_SYNCED_TABLES = [
 	// of the no-timezone rule in this module's header: instants go up, days are
 	// cut by whoever is asking.
 	"stats_daily",
+	// The per-quarter-hour agent-activity buckets behind the LOCAL agent-concurrency
+	// figure. Collected on this branch, uploaded by nothing: cloud upload was an
+	// explicit deferral of the concurrency work (there is no front-end that reads it
+	// yet either). Its `recorded_at_ms` column was built as a sync cursor in advance
+	// (see `SESSION_ACTIVITY_DDL`), so wiring it up later is this line plus its
+	// `SYNCED_COLUMNS`, `SYNC_STAMP_COLUMNS`, `KEYSET_COLUMNS`, `WINDOW_SOURCES` and
+	// `BATCH_LIMITS` entries — but that is a privacy decision (activity timestamps
+	// leaving the machine) to make when the manager view actually consumes them, not
+	// a default to reach for on sight.
+	"session_activity",
 	// The memory half. It travels on the commit-push channel, which has its own
 	// binding rules, and `commit_aliases` answers a rebase-matching question that
 	// does not exist on a server where commits and memories arrive together.

@@ -32,7 +32,7 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { AlreadyCurrent } from "../core/DiskSessionScan.js";
-import { execGit, getHeadHash } from "../core/GitOps.js";
+import { execGit, getHeadHash, resolveWorktreeRoots } from "../core/GitOps.js";
 import { GitRefStorage, resolveCommittish } from "../core/GitRefStorage.js";
 import { isJolliInternalRef } from "../core/JolliRefs.js";
 import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
@@ -164,8 +164,29 @@ const CURSOR_SOT = "sot-import";
  * cannot be invalidated — an already-scanned Codex Desktop session therefore reads as
  * three skills here and zero in the SKILLS panel. That asymmetry is understood and
  * accepted; `scanSkillsWithCursor` carries the decision and is where to argue with it.
+ *
+ * `5` — a full read now yields `activityBuckets`, the quarter-hour presence rows behind
+ * `session_activity`. That table arrived as its own schema entry, so an existing database
+ * HAS it and simply holds nothing for any session read under `4`; measured on a real
+ * machine, 1826 stored sessions produced 6 rows across 3 conversations — only the ones
+ * that happened to speak after the new build landed. Nothing else can reach the rest:
+ * the table is insert-only and deliberately ships no repair path (see
+ * `SESSION_ACTIVITY_DDL`), and the live producers only touch a session whose instant
+ * moved, which a finished conversation's never does.
+ *
+ * What this bump does NOT recover is accepted rather than deferred. Discovery is a
+ * 7-day window (`BACKFILL_SESSION_WINDOW_MS`), so anything older is never re-opened and
+ * stays without buckets for good — a permanent edge on the concurrency figure, which
+ * reads recent rhythm and does not claim to answer for last month.
+ *
+ * `5` also covers the SCOPE change made in the same release: the session tier now asks
+ * every linked worktree, not just the registered checkout (`sessionWorktreeRoots`). A
+ * sibling worktree's sessions already had rows — the StopHook runs inside them and
+ * resolves the identity from the remote — so they carry a read receipt and would be
+ * skipped by `isAlreadyCurrent` forever, having never once been reached by a sweep.
+ * One un-skipped pass is what lets the widened scope see them.
  */
-const SESSION_READ_GENERATION = "4";
+const SESSION_READ_GENERATION = "5";
 
 /**
  * Content fingerprint of the summary index — the summaries cursor value.
@@ -975,17 +996,21 @@ interface StoredToolRow {
 }
 
 /**
- * One session as it is currently stored: its own row plus BOTH child tables.
+ * One session as it is currently stored: its own row plus ALL THREE child tables.
  *
  * The child maps are keyed the way their table is keyed — `session_model_usage`
  * by `model`, `session_tool_use` by `(tool_name, kind)` — so a comparison that
  * walks them cannot accidentally merge two rows the schema keeps apart (a skill
  * and a builtin may share a name; see that table's DDL).
+ *
+ * `buckets` is a bare set because `session_activity` has no payload beyond its own
+ * key: a `(session, bucket)` pair either exists or does not.
  */
 interface StoredSession {
 	readonly row: Record<string, unknown>;
 	readonly models: ReadonlyMap<string, StoredModelRow>;
 	readonly tools: ReadonlyMap<string, StoredToolRow>;
+	readonly buckets: ReadonlySet<number>;
 }
 
 /** `(tool_name, kind)` — the `session_tool_use` primary key, minus the session. */
@@ -1005,7 +1030,10 @@ function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<str
 		)
 		.all(repoIdentity) as ReadonlyArray<Record<string, unknown> & { source: string; session_id: string }>;
 	const sessions = new Map<string, StoredSession>(
-		rows.map((r) => [`${r.source}\0${r.session_id}`, { row: r, models: new Map(), tools: new Map() }]),
+		rows.map((r) => [
+			`${r.source}\0${r.session_id}`,
+			{ row: r, models: new Map(), tools: new Map(), buckets: new Set<number>() },
+		]),
 	);
 
 	// Joined back through `sessions` rather than read by `session_event_id`: the
@@ -1062,6 +1090,20 @@ function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<str
 			calls: r.calls,
 			lastCallAtMs: r.last_call_at_ms,
 		});
+	}
+
+	const bucketRows = db
+		.prepare(
+			`SELECT s.source, s.session_id, a.bucket_ms
+			   FROM session_activity a
+			   JOIN sessions s ON s.event_id = a.session_event_id
+			   JOIN repos r    ON r.id = s.repo_id
+			  WHERE r.repo_identity = ?`,
+		)
+		.all(repoIdentity) as ReadonlyArray<{ source: string; session_id: string; bucket_ms: number }>;
+	for (const r of bucketRows) {
+		const target = sessions.get(`${r.source}\0${r.session_id}`);
+		(target?.buckets as Set<number>)?.add(r.bucket_ms);
 	}
 	return sessions;
 }
@@ -1225,6 +1267,14 @@ function sameToolSet(tools: ReadonlyArray<ToolCallCount>, stored: ReadonlyMap<st
  *    comparison has to happen ahead of the carry-forward return.
  *  - Both child tables are replace-when-observed, under the same predicate
  *    `projectSession` uses to decide it wrote at all.
+ *  - `session_activity` is the THIRD child and the one exception to that shape: it
+ *    is insert-only, so it is compared by containment rather than equality. Adding
+ *    a derived output to `projectSession` without adding it here is silent — the
+ *    event is judged unchanged and dropped before the projection ever runs, so the
+ *    new table simply stays empty for every session that was already stored. That
+ *    is exactly how the buckets went missing (52 rows against 1826 sessions), and
+ *    bumping {@link SESSION_READ_GENERATION} did not fix it: re-reading a
+ *    transcript only rebuilds the EVENT, and this is the gate the event dies at.
  */
 function unchangedSessionEvent(event: SessionUpsertedEvent, stored: StoredSession | undefined): boolean {
 	if (!stored) return false;
@@ -1247,6 +1297,18 @@ function unchangedSessionEvent(event: SessionUpsertedEvent, stored: StoredSessio
 	// "unobserved", and the projection leaves the stored split alone.
 	if (hasUsage && event.models !== undefined && !sameModelSplit(models, stored.models)) return false;
 	if (event.tools !== undefined && !sameToolSet(event.tools, stored.tools)) return false;
+	// CONTAINMENT, not set equality — the one comparison here that does not mirror a
+	// replace. `session_activity` is insert-only (see `SESSION_ACTIVITY_DDL`), so the
+	// question is only "would the INSERT OR IGNORE add a row", and a stored bucket the
+	// event no longer produces is a fact the projection would keep anyway. Set equality
+	// would call such a session changed on every pass forever, re-projecting it to write
+	// nothing — which is the churn this whole comparator exists to remove.
+	//
+	// Compared BEFORE the carry-forward return below, for the same reason `est_cost_usd`
+	// is: buckets do not ride on `hasUsage`. A source with no per-turn usage — every
+	// agent but Claude — reaches that return, so gating this behind it would mean their
+	// presence never reached the table.
+	if (event.activityBuckets?.some((bucket) => !stored.buckets.has(bucket))) return false;
 
 	const sum = (read: (m: StatsModelUsage) => number): number => models.reduce((total, m) => total + read(m), 0);
 	// `COALESCE`d, so only a non-null derived value can move it — but compared
@@ -1395,9 +1457,22 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 	const worktrees = existingWorktrees(repo);
 	// The newest checkout is "the" repo for anything that must pick one: HEAD-based
 	// cursors, the summary index (dual-written per repo, so identical in each
-	// clone), sessions (recorded per project, not per checkout) and the knowledge
-	// graph.
+	// clone) and the knowledge graph.
+	//
+	// Sessions are NOT one of those, and used to be listed here as "recorded per
+	// project, not per checkout". They are recorded per DIRECTORY: an agent writes its
+	// transcript under the cwd the conversation ran in, and the hook registry is a file
+	// inside that worktree. So the session tier below scopes itself to every linked
+	// worktree of every registered checkout instead — see `sessionWorktreeRoots`.
 	const cwd = worktrees[0];
+	// Resolved once per repo, ahead of the sweep: one `git worktree list` per
+	// REGISTERED checkout (two clones of one remote each enumerate their own linked
+	// worktrees), deduped because two entries can enumerate the same set. Failure
+	// degrades to the checkout itself, so a repo whose git is unavailable keeps the
+	// behaviour it had before this existed rather than losing its session tier.
+	const sessionWorktreeRoots = [
+		...new Set((await Promise.all(worktrees.map((root) => resolveWorktreeRoots(root)))).flat()),
+	];
 
 	// Filled by the session tier inside the callback below and read by the same
 	// callback's `return`. It sits out here so the tier that PRODUCES it and the result
@@ -1727,6 +1802,12 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 				},
 				repoIdentity: repo.repoIdentity,
 				cwd,
+				worktreeRoots: sessionWorktreeRoots,
+				// The registered checkouts themselves, NOT their linked worktrees: this is
+				// the granularity a worktree-spanning source is asked at, and one call
+				// answers for one clone's `.git` only. Handing over just `cwd` would drop a
+				// second clone's sessions for that source alone.
+				checkoutRoots: worktrees,
 				// The one caller that widens the horizon past every source's 48 h default.
 				windowMs: BACKFILL_SESSION_WINDOW_MS,
 				...(opts.preScanned ? { preScanned: opts.preScanned } : {}),
@@ -2869,15 +2950,28 @@ export async function dbRescanSessions(opts: SessionRescanOptions): Promise<Sess
 	// stores.
 	for (const repo of ready) {
 		const known = baselines.get(repo.repoIdentity) ?? new Map<string, number>();
-		// The newest surviving checkout, exactly as `dbBackfillRepo` picks it: sessions
-		// are recorded per project, not per checkout.
+		// The registered checkouts of this repo, and its `cwd` the newest of them —
+		// exactly as `dbBackfillRepo` picks it.
 		//
 		// Not null-checked, and that is not an oversight: `existingWorktrees` is documented
 		// to never return empty while the repo is registered (it falls back to the recorded
 		// path), and `live` has already been filtered by `hasLiveWorktree`, so this repo has
 		// a checkout on disk. A guard here would be an unreachable branch spending the
 		// suite's branch-coverage floor and reading to the next maintainer as a real case.
-		const cwd = existingWorktrees(repo)[0] as string;
+		const worktrees = existingWorktrees(repo);
+		const cwd = worktrees[0] as string;
+		// The SAME sibling coverage `dbBackfillRepo` passes, and for the same reason:
+		// `collectSessionEvents` narrows `preScanned` by running each source's own
+		// path-containment rule against these roots, and a session that ran in a sibling
+		// checkout fails that rule against `cwd` alone "by construction" (see
+		// `collectSessionEvents`). Omitting them made the 30 s tick blind to every
+		// sibling-worktree session until the next full back-fill — measured at 65 of 94
+		// in-window sessions on a repo with six live worktrees. `worktreeRoots` is every
+		// linked worktree of every registered checkout; `checkoutRoots` is the checkouts
+		// themselves (the granularity a worktree-spanning source is asked at).
+		const sessionWorktreeRoots = [
+			...new Set((await Promise.all(worktrees.map((root) => resolveWorktreeRoots(root)))).flat()),
+		];
 		// Two questions, ORed. The shared predicate answers "the database already holds
 		// this version"; the emission gate answers "I already emitted for this version",
 		// which is the state the shared one structurally cannot see (see `emitted`).
@@ -2899,6 +2993,8 @@ export async function dbRescanSessions(opts: SessionRescanOptions): Promise<Sess
 			const events = await collectSessionEvents({
 				repoIdentity: repo.repoIdentity,
 				cwd,
+				worktreeRoots: sessionWorktreeRoots,
+				checkoutRoots: worktrees,
 				windowMs,
 				preScanned,
 				// Every session in this pass comes from `preScanned`, which the collector

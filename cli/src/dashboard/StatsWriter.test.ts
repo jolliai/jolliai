@@ -19,6 +19,7 @@ import {
 	drainPending,
 	observeWorktree,
 	pruneProjectedEvents,
+	unparkStuckEvents,
 } from "./StatsWriter.js";
 
 vi.mock("../core/GitOps.js", () => ({
@@ -782,6 +783,107 @@ describe("session_tool_use projection", () => {
 		});
 		await applyStatsEvents([sessionEvent({ tools: [] })], { producerKind: "cli", dbPath });
 		expect(await tools()).toEqual([]);
+	});
+});
+
+describe("session_activity projection", () => {
+	const readBuckets = (db: DashboardDbHandle) =>
+		(
+			db.prepare("SELECT bucket_ms FROM session_activity ORDER BY bucket_ms").all() as ReadonlyArray<{
+				bucket_ms: number;
+			}>
+		).map((r) => r.bucket_ms);
+
+	const readRows = (db: DashboardDbHandle) =>
+		db.prepare("SELECT bucket_ms, recorded_at_ms FROM session_activity ORDER BY bucket_ms").all() as ReadonlyArray<{
+			bucket_ms: number;
+			recorded_at_ms: number;
+		}>;
+
+	it("stores one row per bucket and KEEPS ones a later read no longer sees", async () => {
+		await applyStatsEvents([envelope(session({ activityBuckets: [1_700_000_000_000, 1_700_000_900_000] }))], {
+			producerKind: "cli",
+			dbPath,
+		});
+		await withDashboardDb(
+			(db) => {
+				expect(readBuckets(db)).toEqual([1_700_000_000_000, 1_700_000_900_000]);
+			},
+			{ dbPath },
+		);
+
+		// A truncating host, or Devin regenerating onto a different main chain,
+		// makes a full re-read return a NON-superset. The developer was still
+		// present in the dropped bucket and the transcript can no longer prove
+		// it, so this table must not take the re-read's word for its absence.
+		await applyStatsEvents([envelope(session({ activityBuckets: [1_700_000_000_000] }))], {
+			producerKind: "cli",
+			dbPath,
+		});
+		await withDashboardDb(
+			(db) => {
+				expect(readBuckets(db)).toEqual([1_700_000_000_000, 1_700_000_900_000]);
+			},
+			{ dbPath },
+		);
+	});
+
+	it("stamps recorded_at_ms at insert and does not bump it on re-observation", async () => {
+		await applyStatsEvents([envelope(session({ activityBuckets: [1_700_000_000_000] }))], {
+			producerKind: "cli",
+			dbPath,
+			now: () => 5_000,
+		});
+		// The 60 s tick re-reads the same session and finds one further bucket.
+		// Only the NEW row may carry the new instant — bumping the old one would
+		// re-present already-synced history to a cursor reading this column.
+		await applyStatsEvents([envelope(session({ activityBuckets: [1_700_000_000_000, 1_700_000_900_000] }))], {
+			producerKind: "cli",
+			dbPath,
+			now: () => 9_000,
+		});
+		await withDashboardDb(
+			(db) => {
+				expect(readRows(db)).toEqual([
+					{ bucket_ms: 1_700_000_000_000, recorded_at_ms: 5_000 },
+					{ bucket_ms: 1_700_000_900_000, recorded_at_ms: 9_000 },
+				]);
+			},
+			{ dbPath },
+		);
+	});
+
+	it("leaves stored buckets alone when the field is ABSENT", async () => {
+		await applyStatsEvents([envelope(session({ activityBuckets: [1_700_000_000_000] }))], {
+			producerKind: "cli",
+			dbPath,
+		});
+		// A producer that cannot see timestamps re-upserts the same session.
+		await applyStatsEvents([envelope(session())], { producerKind: "cli", dbPath });
+		await withDashboardDb(
+			(db) => {
+				expect(readBuckets(db)).toEqual([1_700_000_000_000]);
+			},
+			{ dbPath },
+		);
+	});
+
+	// The inverse of what this asserted before insert-only. `[]` still MEANS
+	// "observed, measured none" and stays distinct from absent everywhere else —
+	// it just no longer authorises a delete, because "I saw none this time" is
+	// not evidence that a bucket recorded earlier never happened.
+	it("adds nothing and removes nothing when an observed read found none", async () => {
+		await applyStatsEvents([envelope(session({ activityBuckets: [1_700_000_000_000] }))], {
+			producerKind: "cli",
+			dbPath,
+		});
+		await applyStatsEvents([envelope(session({ activityBuckets: [] }))], { producerKind: "cli", dbPath });
+		await withDashboardDb(
+			(db) => {
+				expect(readBuckets(db)).toEqual([1_700_000_000_000]);
+			},
+			{ dbPath },
+		);
 	});
 });
 
@@ -1778,6 +1880,34 @@ describe("sync stamps", () => {
 		expect(s?.written_at_ms).toBe(2_000);
 	});
 
+	it("preserves an existing full row when a re-read reports no usage", async () => {
+		// The downgrade F3 guards against: a Claude transcript whose retention window
+		// dropped its per-turn usage re-reads with no models, so the collector leaves
+		// `tokenCoverage` absent. The merge must PRESERVE the `full` the row already
+		// carries — the token counts on the same row already fall back to their existing
+		// values, so clearing the coverage flag alone would make the row contradict itself.
+		await applyStatsEvents([envelope(session())], { producerKind: "cli", dbPath });
+		const [before] = await query<{ token_coverage: string; input_tokens: number }>("SELECT * FROM sessions");
+		expect(before?.token_coverage).toBe("full");
+
+		await applyStatsEvents([envelope(session({ models: undefined, tokenCoverage: undefined }))], {
+			producerKind: "cli",
+			dbPath,
+		});
+		const [after] = await query<{ token_coverage: string; input_tokens: number }>("SELECT * FROM sessions");
+		expect(after?.token_coverage).toBe("full");
+		expect(after?.input_tokens).toBe(before?.input_tokens);
+	});
+
+	it("defaults an absent tokenCoverage to sessions-only on first write", async () => {
+		await applyStatsEvents([envelope(session({ models: undefined, tokenCoverage: undefined }))], {
+			producerKind: "cli",
+			dbPath,
+		});
+		const [row] = await query<{ token_coverage: string }>("SELECT * FROM sessions");
+		expect(row?.token_coverage).toBe("sessions-only");
+	});
+
 	// THE regression this column exists for. `projectCommitSummary` upgrades a
 	// `sessions-only` row to `full` without touching `updated_at_ms` — correctly,
 	// since the only clock it holds is the commit's. A sync keyed on that column
@@ -1878,5 +2008,145 @@ describe("sync stamps", () => {
 		const [r] = await query<{ at_ms: number; updated_at_ms: number }>("SELECT * FROM recall_receipts");
 		expect(r?.at_ms).toBe(1_700_000_300_000);
 		expect(r?.updated_at_ms).toBe(7_000);
+	});
+});
+
+describe("unparkStuckEvents", () => {
+	/**
+	 * Parks one genuinely-defective event (`error`) and one whose type this build
+	 * does not recognise (`unknown-type`, type not in `KNOWN_EVENT_TYPES`). BOTH are
+	 * stuck for this build: `drainPending` only auto-revives `unknown-type` rows
+	 * whose type IS known, so nothing returns either of these to the queue on its
+	 * own — which is why `unparkStuckEvents` (sharing `REVIVABLE_PREDICATE` with the
+	 * count `probeParkedEvents` reports) must reach both.
+	 */
+	async function parkTwo(): Promise<void> {
+		await withDashboardDb(
+			(db) => {
+				db.prepare(
+					`INSERT INTO events_raw (event_id, type, schema_version, received_at, data_json)
+				 VALUES ('bad', 'session.upserted', ?, 't', 'not json')`,
+				).run(STATS_EVENT_SCHEMA_VERSION);
+				db.prepare(
+					`INSERT INTO events_raw (event_id, type, schema_version, received_at, data_json)
+				 VALUES ('future', 'commit.vibes', ?, 't', '{"type":"commit.vibes"}')`,
+				).run(STATS_EVENT_SCHEMA_VERSION);
+			},
+			{ dbPath },
+		);
+		for (let i = 0; i < 5; i++) await applyStatsEvents([], { producerKind: "cli", dbPath });
+	}
+
+	it("reports zero — and stays silent — when there is nothing to revive", async () => {
+		await applyStatsEvents([envelope(session())], { producerKind: "cli", dbPath });
+		expect(await withDashboardDb((db) => unparkStuckEvents(db), { dbPath })).toBe(0);
+	});
+
+	it("returns EVERY stuck row to the queue with its attempt budget reset", async () => {
+		await parkTwo();
+		// Two, not one: an `unknown-type` whose type this build still cannot project is
+		// as stuck as an `error` row — `drainPending` never revives it — so `--fix`
+		// must reach it too, matching the count `probeParkedEvents`/`countStuckEvents`
+		// reports. An earlier revision un-parked only `error`, leaving this row counted
+		// but unreachable.
+		expect(await withDashboardDb((db) => unparkStuckEvents(db), { dbPath })).toBe(2);
+		const rows = await withDashboardDb(
+			(db) =>
+				db
+					.prepare(
+						"SELECT event_id, projection_status, attempts, failed_kind FROM events_raw ORDER BY event_id",
+					)
+					.all(),
+			{ dbPath },
+		);
+		expect(rows).toEqual([
+			{ event_id: "bad", projection_status: "pending", attempts: 0, failed_kind: null },
+			{ event_id: "future", projection_status: "pending", attempts: 0, failed_kind: null },
+		]);
+	});
+
+	it("leaves an auto-revivable unknown-type row for drainPending to own", async () => {
+		// The exclusion `REVIVABLE_PREDICATE` encodes: a row parked `unknown-type`
+		// whose type this build DOES know heals on the next drain, so touching it here
+		// would reset a budget `drainPending` already owns. It is not in the stuck set,
+		// so `unparkStuckEvents` must leave it exactly as it found it.
+		await withDashboardDb(
+			(db) =>
+				db
+					.prepare(
+						`INSERT INTO events_raw (event_id, type, schema_version, received_at, data_json,
+						                         projection_status, attempts, failed_kind)
+						 VALUES ('revivable', 'session.upserted', ?, 't', '{}', 'failed', 5, 'unknown-type')`,
+					)
+					.run(STATS_EVENT_SCHEMA_VERSION),
+			{ dbPath },
+		);
+		expect(await withDashboardDb((db) => unparkStuckEvents(db), { dbPath })).toBe(0);
+		const row = await withDashboardDb(
+			(db) =>
+				db
+					.prepare(
+						"SELECT projection_status, attempts, failed_kind FROM events_raw WHERE event_id = 'revivable'",
+					)
+					.get(),
+			{ dbPath },
+		);
+		expect(row).toEqual({ projection_status: "failed", attempts: 5, failed_kind: "unknown-type" });
+	});
+
+	it("actually recovers the data once the blocker is gone", async () => {
+		// The real case this exists for: the event failed against a table a skipped
+		// migration never created. With the table present, the same row projects.
+		await parkTwo();
+		await withDashboardDb(
+			(db) =>
+				db.prepare("UPDATE events_raw SET data_json = ? WHERE event_id = 'bad'").run(JSON.stringify(session())),
+			{ dbPath },
+		);
+		await withDashboardDb((db) => unparkStuckEvents(db), { dbPath });
+		// Only 'bad' projects — 'future' is still an unknown type to this build, so it
+		// re-parks. The point is that the fixed row genuinely recovered.
+		expect((await applyStatsEvents([], { producerKind: "cli", dbPath })).projected).toBe(1);
+	});
+
+	it("re-parks a row that is still defective instead of retrying it forever", async () => {
+		// The cost of the exit being manual: reviving a genuinely poison event spends
+		// one drain cycle and lands back on 'failed'. That is why nothing calls this
+		// automatically. Both stuck rows come back parked (neither is projectable here).
+		await parkTwo();
+		await withDashboardDb((db) => unparkStuckEvents(db), { dbPath });
+		for (let i = 0; i < 5; i++) await applyStatsEvents([], { producerKind: "cli", dbPath });
+		expect(await withDashboardDb((db) => countStuckEvents(db), { dbPath })).toBe(2);
+	});
+
+	it("un-parks every failed row on a pre-migration schema (no failed_kind column)", () => {
+		// The fallback that mirrors `countStuckEvents`: before the `failed_kind`
+		// migration there is no column to null out or narrow by, so every `failed` row
+		// is stuck and the whole set is un-parked with an UPDATE that never names it.
+		let statements = 0;
+		const handle = {
+			prepare: () => {
+				statements += 1;
+				if (statements === 1)
+					return {
+						run: () => {
+							throw new Error("no such column: failed_kind");
+						},
+					};
+				return { run: () => ({ changes: 4 }) };
+			},
+		} as unknown as DashboardDbHandle;
+		expect(unparkStuckEvents(handle)).toBe(4);
+	});
+
+	it("rethrows a genuine fault rather than un-parking around it", () => {
+		const handle = {
+			prepare: () => ({
+				run: () => {
+					throw new Error("database disk image is malformed");
+				},
+			}),
+		} as unknown as DashboardDbHandle;
+		expect(() => unparkStuckEvents(handle)).toThrow(/malformed/);
 	});
 });

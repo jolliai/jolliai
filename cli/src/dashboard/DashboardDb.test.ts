@@ -328,6 +328,62 @@ describe("withDashboardDb", () => {
 		);
 		expect(count).toBe(0);
 	});
+
+	it("creates session_activity, keyed per (session, bucket) and rejecting a REAL bucket", async () => {
+		const rows = await withDashboardDb(
+			(db) =>
+				db
+					.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_activity'")
+					.all() as ReadonlyArray<{ name: string }>,
+			{ dbPath },
+		);
+		expect(rows).toHaveLength(1);
+
+		// STRICT is what turns a forgotten Math.floor into a loud failure instead
+		// of a fractional bucket that silently defeats the primary key.
+		await withDashboardDb(
+			(db) => {
+				// `enabled_at` is NOT NULL with no default — omitting it fails the insert.
+				db.prepare(
+					"INSERT INTO repos (repo_identity, repo_name, worktree_root, enabled_at) VALUES (?, ?, ?, ?)",
+				).run("repo-1", "repo-1", "/tmp/repo-1", "2026-08-11T00:00:00.000Z");
+				db.prepare(
+					`INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms)
+				 VALUES ('s-evt', 1, 'claude', 's1', 1786425300000)`,
+				).run();
+				db.prepare(
+					"INSERT INTO session_activity (session_event_id, bucket_ms, recorded_at_ms) VALUES (?, ?, ?)",
+				).run("s-evt", 1786425300000, 1786425400000);
+				expect(() =>
+					db
+						.prepare(
+							"INSERT INTO session_activity (session_event_id, bucket_ms, recorded_at_ms) VALUES (?, ?, ?)",
+						)
+						.run("s-evt", 1786425300000.5, 1786425400000),
+				).toThrow(/REAL/);
+
+				// `recorded_at_ms` is NOT NULL with no default — the in-place edit to
+				// migration entry 5 is what bought that (an appended ALTER TABLE could
+				// only have added it nullable), so pin it rather than let a future
+				// "just append a migration" quietly relax it.
+				expect(() =>
+					db
+						.prepare("INSERT INTO session_activity (session_event_id, bucket_ms) VALUES (?, ?)")
+						.run("s-evt", 1),
+				).toThrow(/NOT NULL/);
+			},
+			{ dbPath },
+		);
+	});
+
+	it("ends at the version this build declares", async () => {
+		// Against the CONSTANT, never a literal: a literal here is a second place to
+		// remember on every append, and `MigrationFingerprints.test.ts` already pins
+		// the constant to `MIGRATIONS.length`. What this adds is that a real database
+		// actually arrives there — the fingerprint test never opens one.
+		const version = await withDashboardDb((db) => readSchemaVersion(db), { dbPath });
+		expect(version).toBe(DASHBOARD_SCHEMA_VERSION);
+	});
 });
 
 describe("withReadonlyDashboardDb", () => {

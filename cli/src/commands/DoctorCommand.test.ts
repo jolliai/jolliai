@@ -1,11 +1,17 @@
 /**
- * DoctorCommand tests — focused on the local-agent tool-selection diagnostic.
+ * DoctorCommand tests.
  *
  * Covers:
  *   - `getBackend` is probed with the configured `localAgentTool` (defaulting
  *     to "claude-code" when unset)
  *   - a failed probe's message includes that tool's login hint (LOCAL_AGENT_TOOLS)
  *     so a not-signed-in user gets actionable guidance
+ *   - `doctor --recover`'s survey / restore arms, against a real database
+ *   - the parked-event diagnostic and its `--fix`, also against a real database
+ *
+ * Note for anyone adding a case here: `withDashboardDb` must NOT be mocked in
+ * this file. Two describes build a real database through it, so a module-level
+ * replacement would silently rewire them into passing for the wrong reason.
  */
 
 import { mkdtemp, writeFile } from "node:fs/promises";
@@ -41,6 +47,8 @@ const h = vi.hoisted(() => ({
 	// one candidate fail without touching any other test's real repair behavior.
 	throwHash: "f".repeat(40),
 	findStrandedRoots: vi.fn(),
+	unparkStuckEvents: vi.fn(),
+	withReadonlyDashboardDb: vi.fn(),
 }));
 
 vi.mock("../dashboard/SessionSyncRunner.js", () => ({ runSessionSync: h.runSessionSync }));
@@ -124,6 +132,24 @@ vi.mock("../core/repair/StrandedTrees.js", () => ({ findStrandedRoots: h.findStr
 vi.mock("../install/DistPathResolver.js", () => ({ traverseDistPaths: h.traverseDistPaths }));
 vi.mock("../install/Installer.js", () => ({ getStatus: h.getStatus, install: h.install }));
 vi.mock("../PluginLoader.js", () => ({ inspectPlugins: h.inspectPlugins }));
+// Spread the originals and override ONLY the parked-event surface: `Backup.ts`
+// and `Recovery.ts` both import `withDashboardDb` from this module, so replacing
+// it wholesale would silently rewire the `doctor --recover` tests below.
+//
+// `withReadonlyDashboardDb` is NOT exclusive to the parked-event check, though it
+// once was: `runSchemaLog` reads the migration log through the same helper, so the
+// `doctor --schema-log` describe hands this seam back to the real implementation in
+// its own `beforeEach`. Under the default (a rejected open) that command reports an
+// unavailable database and prints no listing — a green-looking mock that answers the
+// wrong question.
+vi.mock("../dashboard/DashboardDb.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../dashboard/DashboardDb.js")>()),
+	withReadonlyDashboardDb: h.withReadonlyDashboardDb,
+}));
+vi.mock("../dashboard/StatsWriter.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../dashboard/StatsWriter.js")>()),
+	unparkStuckEvents: h.unparkStuckEvents,
+}));
 vi.mock("../Logger.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../Logger.js")>();
 	return {
@@ -165,25 +191,42 @@ async function runDoctor(args: string[] = []): Promise<string[]> {
 
 const BASE_CONFIG: Partial<JolliMemoryConfig> = {};
 
-describe("DoctorCommand — local-agent tool diagnostic", () => {
-	beforeEach(() => {
-		vi.clearAllMocks();
-		process.exitCode = undefined;
-		h.resolveProjectDir.mockReturnValue("/repo");
-		h.readManualDisableFlag.mockResolvedValue(false);
-		h.getStatus.mockResolvedValue({ gitHookInstalled: true, claudeHookInstalled: true, geminiHookInstalled: true });
-		h.orphanBranchExists.mockResolvedValue(true);
-		h.resolveSotBackend.mockResolvedValue({ ok: true, state: "uncutover", storage: {} });
-		h.isWorkerLockStale.mockResolvedValue(false);
-		h.loadAllSessions.mockResolvedValue([]);
-		h.countActiveQueueEntries.mockResolvedValue(0);
-		h.loadConfig.mockResolvedValue(BASE_CONFIG);
-		h.resolveLlmCredentialSource.mockReturnValue("local-agent");
-		h.getGlobalConfigDir.mockReturnValue("/global");
-		h.traverseDistPaths.mockReturnValue([]);
-		h.inspectPlugins.mockResolvedValue([]);
-		h.findStrandedRoots.mockResolvedValue([]);
+/**
+ * Puts every probe on its healthy answer. Shared by the describes below so a
+ * new diagnostic's setup does not have to restate fifteen unrelated mocks —
+ * each test then overrides only the probe it is about.
+ */
+function healthyDefaults(): void {
+	vi.clearAllMocks();
+	process.exitCode = undefined;
+	h.resolveProjectDir.mockReturnValue("/repo");
+	h.readManualDisableFlag.mockResolvedValue(false);
+	h.getStatus.mockResolvedValue({ gitHookInstalled: true, claudeHookInstalled: true, geminiHookInstalled: true });
+	h.orphanBranchExists.mockResolvedValue(true);
+	h.resolveSotBackend.mockResolvedValue({ ok: true, state: "uncutover", storage: {} });
+	h.isWorkerLockStale.mockResolvedValue(false);
+	h.loadAllSessions.mockResolvedValue([]);
+	h.countActiveQueueEntries.mockResolvedValue(0);
+	h.loadConfig.mockResolvedValue(BASE_CONFIG);
+	h.resolveLlmCredentialSource.mockReturnValue("local-agent");
+	h.findStrandedRoots.mockResolvedValue([]);
+	// A discoverable agent CLI: without it the local-agent probe fails and pushes
+	// `exitCode` to 1, which then confounds any OTHER check's exit-code assertion.
+	h.getBackend.mockReturnValue({
+		discoverExecutable: vi.fn().mockResolvedValue({ file: "/usr/bin/claude", version: "2.0.0" }),
 	});
+	h.getGlobalConfigDir.mockReturnValue("/global");
+	h.traverseDistPaths.mockReturnValue([]);
+	h.inspectPlugins.mockResolvedValue([]);
+	// Default: no database to consult — the shape of a machine where no writer has
+	// ever run, and the state every other describe in this file already assumes.
+	// `getDashboardDbPath()` resolves under the mocked `/global` config dir, which
+	// does not exist, so `probeParkedEvents` returns `absent` before any open.
+	h.withReadonlyDashboardDb.mockRejectedValue(new Error("unable to open database file"));
+}
+
+describe("DoctorCommand — local-agent tool diagnostic", () => {
+	beforeEach(healthyDefaults);
 
 	afterEach(() => {
 		vi.clearAllMocks();
@@ -866,6 +909,16 @@ describe("doctor --recover", () => {
 });
 
 describe("doctor --schema-log", () => {
+	// The file-wide mock of `withReadonlyDashboardDb` exists for the parked-event
+	// check and defaults to a rejected open. `runSchemaLog` reads the log through
+	// the same helper, so without this every assertion below would be measuring the
+	// mock's failure rather than the command.
+	beforeEach(async () => {
+		const realDb =
+			await vi.importActual<typeof import("../dashboard/DashboardDb.js")>("../dashboard/DashboardDb.js");
+		h.withReadonlyDashboardDb.mockImplementation(realDb.withReadonlyDashboardDb);
+	});
+
 	it("prints the log, names a drift, and records a migration whose row went missing", async () => {
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
@@ -1107,106 +1160,182 @@ describe("doctor --schema-log", () => {
 	});
 });
 
-describe("doctor — parked events", () => {
-	it("reports parked events, and says nothing when there are none", async () => {
-		// Until this row a parked event was invisible in every direction: the projection
-		// wrote no `sessions` row to notice missing, nothing queries `events_raw`, and
-		// the prune deletes only `projected` rows so a failure does not even age out.
+describe("DoctorCommand — parked dashboard events", () => {
+	beforeEach(healthyDefaults);
+
+	afterEach(() => {
+		vi.clearAllMocks();
+		process.exitCode = undefined;
+	});
+
+	/** The one printed row this describe is about. */
+	const eventRow = (lines: ReadonlyArray<string>): string => lines.find((l) => l.includes("Dashboard events")) ?? "";
+
+	/**
+	 * Point `getDashboardDbPath()` at an isolated home and create the db FILE, so
+	 * `probeParkedEvents` passes its `existsSync` guard and reaches the (mocked)
+	 * open. The file's contents never matter — `withReadonlyDashboardDb` is the seam
+	 * that decides `counted` vs `unreadable`. Returns a teardown that removes it.
+	 */
+	async function withPresentDb(): Promise<() => void> {
+		const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-parked-present-"));
+		const restoreHome = setIsolatedHome(home);
+		const configDir = join(home, ".jolli", "jollimemory");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(join(configDir, "jollimemory.db"), "present");
+		h.getGlobalConfigDir.mockReturnValue(configDir);
+		return () => {
+			restoreHome();
+			rmSync(home, { recursive: true, force: true });
+		};
+	}
+
+	// Asserted on the ROW ICON rather than on `process.exitCode`: the exit code is
+	// the whole check list's verdict, so any unrelated probe (dist-paths is `✗`
+	// under these mocks) would make the assertion pass or fail for the wrong
+	// reason. The icon is this check's own status.
+
+	it("reports none parked when the database cannot be consulted at all", async () => {
+		// The default `getDashboardDbPath()` (under `/global`) does not exist, so the
+		// probe returns `absent` before any open — the honest shape of a machine where
+		// no writer has ever run. Doctor must still complete and still print the row:
+		// it is the command a user runs when things are broken.
+		const row = eventRow(await runDoctor());
+		expect(row).toMatch(/✓/);
+		expect(row).toMatch(/none parked/);
+	});
+
+	it("reports the database as present but unreadable when the open throws", async () => {
+		// The state that permanently disables the daemon's re-scan, and the one doctor
+		// used to print NOTHING for: the file exists (so `absent` is wrong) and the
+		// open throws (so a count is impossible). Its own row, no fixer — re-queuing
+		// cannot repair a database that will not open.
+		const teardown = await withPresentDb();
+		try {
+			h.withReadonlyDashboardDb.mockRejectedValue(new Error("database disk image is malformed"));
+			const row = eventRow(await runDoctor());
+			expect(row).toMatch(/⚠/);
+			expect(row).toMatch(/present but unreadable/);
+			expect(row).toMatch(/malformed/);
+			expect(row).toMatch(/re-scan is stopped/);
+		} finally {
+			teardown();
+		}
+	});
+
+	it("warns with the count rather than failing the run", async () => {
+		const teardown = await withPresentDb();
+		try {
+			// `probeParkedEvents` counts via `withReadonlyDashboardDb(countStuckEvents)`;
+			// the seam resolves the count directly.
+			h.withReadonlyDashboardDb.mockResolvedValue(10);
+			const row = eventRow(await runDoctor());
+			// ⚠ not ✗: the memories are safe in the system of record, so an otherwise
+			// healthy install must not start exiting non-zero over dashboard gaps.
+			expect(row).toMatch(/⚠/);
+			expect(row).not.toMatch(/✗/);
+			expect(row).toMatch(/10 event\(s\) parked/);
+		} finally {
+			teardown();
+		}
+	});
+
+	it("offers no fixer when nothing is parked", async () => {
+		const teardown = await withPresentDb();
+		try {
+			h.withReadonlyDashboardDb.mockResolvedValue(0);
+			await runDoctor(["--fix"]);
+			expect(h.unparkStuckEvents).not.toHaveBeenCalled();
+		} finally {
+			teardown();
+		}
+	});
+
+	it("--fix revives and drains against a real database, reporting both numbers", async () => {
+		// Against a REAL database rather than a stub: `withDashboardDb` cannot be
+		// mocked in this file (the `doctor --recover` test above builds a real
+		// database through it), and the fixer's whole claim is that the numbers are
+		// correct when the command exits — which only a real drain can show.
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
 		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-parked-"));
 		const restoreHome = setIsolatedHome(home);
-		const st = await import("../core/SessionTracker.js");
-		vi.mocked(st.getGlobalConfigDir).mockReturnValue(join(home, ".jolli", "jollimemory"));
-		try {
-			const { withDashboardDb } = await import("../dashboard/DashboardDb.js");
-
-			// No database at all — a normal state, not a fault, so the row is absent
-			// rather than reading a confident "0".
-			expect((await runDoctor()).join("\n")).not.toContain("Dashboard events");
-
-			// An empty database says nothing either.
-			await withDashboardDb(() => undefined);
-			expect((await runDoctor()).join("\n")).not.toContain("Dashboard events");
-
-			await withDashboardDb((db) =>
-				db
-					.prepare(
-						`INSERT INTO events_raw
-						   (event_id, repo_identity, type, schema_version, received_at, data_json,
-						    projection_status, failed_kind, attempts)
-						 VALUES ('session:r:codex:s', 'r', 'session.upserted', 1, '2026-08-01T00:00:00.000Z',
-						         '{}', 'failed', 'error', 5)`,
-					)
-					.run(),
-			);
-
-			const out = (await runDoctor()).join("\n");
-			expect(out).toContain("Dashboard events");
-			expect(out).toContain("1 event(s) parked unprojected");
-		} finally {
-			restoreHome();
-			rmSync(home, { recursive: true, force: true });
-		}
-	});
-
-	it("does not count a row the next writable open revives by itself", async () => {
-		// `drainPending` un-parks `unknown-type` rows whose type this build now understands
-		// on every writable open — a version-skew artefact (an older CLI parked an event a
-		// newer VS Code build wrote) whose repair is the upgrade that already happened.
-		// Counting them made this row assert "some conversations may be missing from the
-		// dashboard", with no fixer to offer, for rows the next commit silently revives.
-		const { mkdtempSync, rmSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-revivable-"));
-		const restoreHome = setIsolatedHome(home);
-		const st = await import("../core/SessionTracker.js");
-		vi.mocked(st.getGlobalConfigDir).mockReturnValue(join(home, ".jolli", "jollimemory"));
-		try {
-			const { withDashboardDb } = await import("../dashboard/DashboardDb.js");
-			await withDashboardDb((db) =>
-				db
-					.prepare(
-						`INSERT INTO events_raw
-						   (event_id, repo_identity, type, schema_version, received_at, data_json,
-						    projection_status, failed_kind, attempts)
-						 VALUES ('session:r:codex:revivable', 'r', 'session.upserted', 1,
-						         '2026-08-01T00:00:00.000Z', '{}', 'failed', 'unknown-type', 5)`,
-					)
-					.run(),
-			);
-
-			expect((await runDoctor()).join("\n")).not.toContain("Dashboard events");
-		} finally {
-			restoreHome();
-			rmSync(home, { recursive: true, force: true });
-		}
-	});
-
-	it("says a database that is present and unreadable, instead of nothing at all", async () => {
-		// The state the bare `catch { return null }` folded in with "no database": a zero-byte
-		// or truncated `jollimemory.db` opens READ-ONLY without error and throws on the first
-		// statement. It is also the state that permanently stops the daemon's re-scan, and the
-		// one command whose job is to tell these apart printed no row for it.
-		const { mkdirSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-unreadable-"));
-		const restoreHome = setIsolatedHome(home);
-		const st = await import("../core/SessionTracker.js");
 		const configDir = join(home, ".jolli", "jollimemory");
-		vi.mocked(st.getGlobalConfigDir).mockReturnValue(configDir);
+		h.getGlobalConfigDir.mockReturnValue(configDir);
+		// Delegate the mocked seam back to the real implementations for this test.
+		const real = await vi.importActual<typeof import("../dashboard/StatsWriter.js")>("../dashboard/StatsWriter.js");
+		const realDb =
+			await vi.importActual<typeof import("../dashboard/DashboardDb.js")>("../dashboard/DashboardDb.js");
+		// `probeParkedEvents` counts via `withReadonlyDashboardDb(countStuckEvents)` —
+		// countStuckEvents stays REAL (spread), so only the read-only handle and the
+		// fixer's un-park need delegating back to their real implementations.
+		h.unparkStuckEvents.mockImplementation(real.unparkStuckEvents);
+		h.withReadonlyDashboardDb.mockImplementation(realDb.withReadonlyDashboardDb);
 		try {
-			const { getDashboardDbPath } = await import("../dashboard/DashboardDb.js");
-			const dbPath = getDashboardDbPath();
-			mkdirSync(join(dbPath, ".."), { recursive: true });
-			writeFileSync(dbPath, "");
+			const { STATS_EVENT_SCHEMA_VERSION } = await import("../dashboard/DashboardModel.js");
+			const dbPath = join(configDir, "jollimemory.db");
+			// One event that cannot be projected, driven to `failed` the only way a
+			// real one gets there: by spending its whole attempt budget.
+			await realDb.withDashboardDb(
+				(db) =>
+					db
+						.prepare(
+							`INSERT INTO events_raw (event_id, type, schema_version, received_at, data_json)
+							 VALUES ('bad', 'session.upserted', ?, 't', 'not json')`,
+						)
+						.run(STATS_EVENT_SCHEMA_VERSION),
+				{ dbPath },
+			);
+			for (let i = 0; i < 5; i++) await real.applyStatsEvents([], { producerKind: "cli", dbPath });
+			expect(await realDb.withReadonlyDashboardDb((db) => real.countStuckEvents(db), { dbPath })).toBe(1);
 
-			const out = (await runDoctor()).join("\n");
-			expect(out).toContain("Dashboard events");
-			expect(out).toContain("present but unreadable");
+			const lines = (await runDoctor(["--fix"])).join("\n");
+
+			// Nothing was actually recovered: one drain spends ONE attempt, so the row
+			// is back to `pending` rather than projected or re-parked. The message has
+			// to say that — "1 revived" alone would read as a completed repair. The
+			// leftover is COUNTED off the table (`drainPending`'s `pending`), not
+			// derived as `revived - projected` — that subtraction ignored the
+			// `DRAIN_BATCH_SIZE` cap and could go negative when rows were already
+			// queued before the un-park.
+			expect(lines).toMatch(/Dashboard events: 1 revived, 0 projected, 1 still queued \(will retry\)/);
+
+			// Park it again — the fix above left it `pending`, and the point of the
+			// next assertion is that the FIXER is what recovers it.
+			for (let i = 0; i < 5; i++) await real.applyStatsEvents([], { producerKind: "cli", dbPath });
+			expect(await realDb.withReadonlyDashboardDb((db) => real.countStuckEvents(db), { dbPath })).toBe(1);
+
+			// Now the blocker is gone — the real case: an event that failed against a
+			// table a skipped migration never created, replayed after the repair.
+			await realDb.withDashboardDb(
+				(db) =>
+					db.prepare("UPDATE events_raw SET data_json = ? WHERE event_id = 'bad'").run(
+						JSON.stringify({
+							type: "session.upserted",
+							repoIdentity: "repo-1",
+							source: "claude",
+							sessionId: "s1",
+							updatedAtMs: 1_700_000_000_000,
+							messageCount: 1,
+							models: [],
+							tokenCoverage: "none",
+						}),
+					),
+				{ dbPath },
+			);
+			expect((await runDoctor(["--fix"])).join("\n")).toMatch(/Dashboard events: 1 revived, 1 projected/);
+
+			// The race the fixer guards against: the diagnosis saw a parked row on its
+			// own read-only handle, but by the time the fixer took the write lock
+			// another doctor had already revived it. Forced here by making the probe's
+			// read-only count report one while the real database (which the fixer's
+			// writable handle sees) is clean.
+			h.withReadonlyDashboardDb.mockResolvedValue(1);
+			expect((await runDoctor(["--fix"])).join("\n")).toMatch(/Dashboard events: nothing parked/);
 		} finally {
 			restoreHome();
 			rmSync(home, { recursive: true, force: true });
