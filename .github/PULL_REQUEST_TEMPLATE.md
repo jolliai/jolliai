@@ -15,10 +15,16 @@
 ## Testing
 
 <!-- How did you verify this works? -->
+
 - [ ] Added/updated unit tests
+- [ ] Ran `npm run all` locally (clean → build → typecheck → lint → test)
+- [ ] Tested on: (e.g. macOS + Node 22.13)
+
+If you touched `intellij/` (its Gradle project is not covered by `npm run all`):
+
 - [ ] Ran `./gradlew test` locally
 - [ ] Tested in sandbox IDE via `./gradlew runIde`
-- [ ] Tested on: (e.g. macOS + IntelliJ 2025.1)
+- [ ] No new warnings from Plugin Verifier
 
 ## Screenshots / Recordings
 
@@ -26,6 +32,6 @@
 
 ## Checklist
 
+- [ ] Every commit is signed off (`git commit -s`) — CI rejects PRs without a `Signed-off-by:` trailer
 - [ ] Code follows the existing style
 - [ ] Documentation updated (README / CHANGELOG) if user-facing
-- [ ] No new warnings from Plugin Verifier

@@ -19,6 +19,9 @@ Claude Code.
   configured yet, and injects a branch briefing. Those git hooks are what generate
   the memory everything else surfaces.
 - **A self-contained runtime** — no global `jolli` CLI installation required.
+  Jolli's CLI is still reachable at `~/.jolli/jollimemory/run-cli`, which takes the
+  same arguments as `jolli` itself, for the few things below that are not a
+  `/jolli:*` entry point.
 
 ## Install
 
@@ -77,7 +80,8 @@ expired" can be true here while the app looks fine.
 > **Prefer your own model API key?** Setting `ANTHROPIC_API_KEY` alone is not enough
 > once `local-agent` has been seeded, because the provider choice is resolved before
 > any key is consulted. Switch deliberately instead:
-> `jolli configure --set aiProvider=anthropic --set apiKey=sk-ant-...`. You need
+> `~/.jolli/jollimemory/run-cli configure --set aiProvider=anthropic --set apiKey=sk-ant-...`
+> (plain `jolli configure …` if you also have the CLI installed globally). You need
 > neither this nor a Jolli login for generation to work.
 
 ## Sign in (optional, for sharing to a Jolli Space)
@@ -119,8 +123,11 @@ on its own whenever setup is incomplete.
 
 Jolli Memory collects anonymous, content-free usage data — never your code, your
 paths, or the contents of your memories — and it is **on by default**. Turn it off
-with `jolli telemetry off`, or by setting `DO_NOT_TRACK` to any non-empty value
-other than `0`. Exactly what is collected is listed at
+by setting `DO_NOT_TRACK` to any non-empty value other than `0`, or by running
+`~/.jolli/jollimemory/run-cli telemetry off` (plain `jolli telemetry off` if you
+also have the CLI installed globally). The `telemetry off` form is written to the
+machine-global config, so it applies to every Jolli integration on this machine.
+Exactly what is collected is listed at
 [jolli.ai/telemetry](https://www.jolli.ai/telemetry) and in
 [TELEMETRY.md](https://github.com/jolliai/jolliai/blob/main/TELEMETRY.md).
 

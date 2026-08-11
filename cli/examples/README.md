@@ -4,6 +4,15 @@ Each folder is a self-contained Content_Folder you can run with `jolli dev`.
 
 ## Running an Example
 
+`dev` is a Jolli Site command. This package ships only a stub for it, so install
+the site plugin first:
+
+```bash
+npm install -g @jolli.ai/site-cli
+```
+
+Then:
+
 ```bash
 jolli dev cli/examples/<folder-name>
 ```
