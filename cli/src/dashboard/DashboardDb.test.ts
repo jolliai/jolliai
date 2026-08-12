@@ -12,6 +12,7 @@ import {
 	DEFAULT_BUSY_TIMEOUT_MS,
 	getDashboardDbPath,
 	inTransaction,
+	MIGRATIONS,
 	migrateDashboardDb,
 	readSchemaVersion,
 	withDashboardDb,
@@ -447,6 +448,85 @@ describe("schema creation", () => {
 			{ dbPath },
 		);
 		expect(row).toEqual({ id: 1, repo_name: "new", worktree_root: "/w2", bootstrap_state: "done" });
+	});
+});
+
+describe("sync-stamp backfill", () => {
+	// The stamps arrived as a migration over databases that already had rows, and
+	// the whole promise is that the FIRST sync selects what business time would
+	// have selected. A fresh database proves none of that — its tables are empty
+	// when the entry runs — so this stops at the version before the stamps, seeds
+	// the rows a real machine would have, and then migrates the rest of the way.
+	async function migrateFromV5(seed: (db: DashboardDbHandle) => void): Promise<DashboardDbHandle> {
+		const { DatabaseSync } = await import("node:sqlite");
+		const raw = new DatabaseSync(dbPath) as unknown as DashboardDbHandle;
+		// Entries 0..4 are everything up to (not including) SYNC_STAMP_DDL.
+		for (const entry of MIGRATIONS.slice(0, 5)) raw.exec(entry);
+		raw.exec("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT)");
+		raw.exec("INSERT OR REPLACE INTO schema_meta VALUES ('schema_version', '5')");
+		seed(raw);
+		migrateDashboardDb(raw);
+		return raw;
+	}
+
+	it("dates pre-existing rows from their business clock, not from 'now'", async () => {
+		const raw = await migrateFromV5((db) => {
+			db.exec(
+				"INSERT INTO repos (repo_identity, repo_name, worktree_root, enabled_at) VALUES ('r', 'jolli', '/w', 1)",
+			);
+			db.exec(
+				`INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms)
+				 VALUES ('s1', 1, 'claude', 'sess-1', 1000)`,
+			);
+			db.exec(
+				`INSERT INTO session_model_usage (session_event_id, model, input_tokens, output_tokens, cached_tokens)
+				 VALUES ('s1', 'claude-opus-4-8', 1, 2, 3)`,
+			);
+			db.exec(
+				`INSERT INTO session_tool_use (session_event_id, tool_name, kind, calls)
+				 VALUES ('s1', 'Read', 'builtin', 4)`,
+			);
+			db.exec(
+				`INSERT INTO recall_receipts (receipt_id, repo_id, at_ms, surface, hit, commit_count)
+				 VALUES ('rc1', 1, 2000, 'cli', 1, 0)`,
+			);
+		});
+		try {
+			const one = (sql: string) => (raw.prepare(sql).get() as { v: number }).v;
+			// The session's own clock, and the parent's for its two child tables —
+			// so a cursor placed by business time sees exactly these rows.
+			expect(one("SELECT written_at_ms AS v FROM sessions")).toBe(1000);
+			expect(one("SELECT updated_at_ms AS v FROM session_model_usage")).toBe(1000);
+			expect(one("SELECT updated_at_ms AS v FROM session_tool_use")).toBe(1000);
+			expect(one("SELECT updated_at_ms AS v FROM recall_receipts")).toBe(2000);
+			// Commits are stamped 0 on purpose: "written before we tracked this",
+			// which is exactly right for a row that has not changed since and never
+			// makes a settled rollup day look stale.
+			expect(readSchemaVersion(raw)).toBe(DASHBOARD_SCHEMA_VERSION);
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("survives a child row whose parent session is gone", async () => {
+		// The column is NOT NULL, so the backfill's subquery returning NULL would
+		// abort the migration — and an aborted migration is a database nobody can
+		// open. COALESCE is what keeps an orphan cheap: it lands on 0.
+		const raw = await migrateFromV5((db) => {
+			db.exec("PRAGMA foreign_keys = OFF");
+			db.exec(
+				`INSERT INTO session_model_usage (session_event_id, model, input_tokens, output_tokens, cached_tokens)
+				 VALUES ('missing', 'claude-opus-4-8', 1, 2, 3)`,
+			);
+		});
+		try {
+			expect((raw.prepare("SELECT updated_at_ms AS v FROM session_model_usage").get() as { v: number }).v).toBe(
+				0,
+			);
+			expect(readSchemaVersion(raw)).toBe(DASHBOARD_SCHEMA_VERSION);
+		} finally {
+			raw.close();
+		}
 	});
 });
 

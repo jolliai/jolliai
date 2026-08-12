@@ -1238,3 +1238,264 @@ describe("events_raw retention (§11 defect 2)", () => {
 		expect(old).toBe(0);
 	});
 });
+
+describe("session_usage_events — spend lands on the day it happened", () => {
+	const at = (ms: number) => () => ms;
+	const DAY1 = Date.parse("2026-03-01T10:00:00Z");
+	const DAY3 = Date.parse("2026-03-03T09:00:00Z");
+
+	// THE assertion this whole table exists for. Before it, a conversation's
+	// entire spend was filed under `sessions.updated_at_ms` — one timestamp for
+	// the lot — so a session opened on the 1st and continued on the 3rd reported
+	// $0 on the 1st and everything on the 3rd.
+	it("splits one session across the days it actually spanned", async () => {
+		await applyStatsEvents(
+			[
+				envelope(
+					session({
+						updatedAtMs: DAY3,
+						usageEvents: [
+							{
+								respondedAtMs: DAY1,
+								model: "claude-opus-5",
+								input: 100,
+								output: 10,
+								cached: 0,
+								dedupKey: "a",
+							},
+							{
+								respondedAtMs: DAY3,
+								model: "claude-opus-5",
+								input: 200,
+								output: 20,
+								cached: 0,
+								dedupKey: "b",
+							},
+						],
+					}),
+				),
+			],
+			{ producerKind: "cli", dbPath, now: at(9_000) },
+		);
+
+		const rows = await query<{ responded_at_ms: number; input_tokens: number }>(
+			"SELECT * FROM session_usage_events ORDER BY responded_at_ms",
+		);
+		expect(rows.map((r) => [r.responded_at_ms, r.input_tokens])).toEqual([
+			[DAY1, 100],
+			[DAY3, 200],
+		]);
+		// The session row still says "last active on the 3rd" — that is what it
+		// means, and it is no longer what the daily numbers are built from.
+		const [s] = await query<{ updated_at_ms: number }>("SELECT * FROM sessions");
+		expect(s?.updated_at_ms).toBe(DAY3);
+	});
+
+	it("converges on re-read instead of doubling", async () => {
+		const events = [
+			{ respondedAtMs: DAY1, model: "claude-opus-5", input: 100, output: 10, cached: 0, dedupKey: "a" },
+		];
+		for (const now of [1_000, 2_000]) {
+			await applyStatsEvents([envelope(session({ usageEvents: events }))], {
+				producerKind: "cli",
+				dbPath,
+				now: at(now),
+			});
+		}
+		const rows = await query<{ updated_at_ms: number }>("SELECT * FROM session_usage_events");
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.updated_at_ms).toBe(2_000);
+	});
+
+	// `undefined` means "this source cannot report per-response usage" — every
+	// source but Claude today. It must not erase what a capable read collected.
+	it("leaves existing rows alone when the producer cannot see per-response usage", async () => {
+		const events = [
+			{ respondedAtMs: DAY1, model: "claude-opus-5", input: 100, output: 10, cached: 0, dedupKey: "a" },
+		];
+		await applyStatsEvents([envelope(session({ usageEvents: events }))], {
+			producerKind: "cli",
+			dbPath,
+			now: at(1_000),
+		});
+		await applyStatsEvents([envelope(session({ usageEvents: undefined, messageCount: 9 }))], {
+			producerKind: "cli",
+			dbPath,
+			now: at(2_000),
+		});
+
+		expect(await query("SELECT * FROM session_usage_events")).toHaveLength(1);
+	});
+
+	it("clears stored events when a re-read sees usage but nothing datable", async () => {
+		const events = [
+			{ respondedAtMs: DAY1, model: "claude-opus-5", input: 100, output: 10, cached: 0, dedupKey: "a" },
+		];
+		await applyStatsEvents([envelope(session({ usageEvents: events }))], {
+			producerKind: "cli",
+			dbPath,
+			now: at(1_000),
+		});
+		await applyStatsEvents([envelope(session({ usageEvents: [], messageCount: 9 }))], {
+			producerKind: "cli",
+			dbPath,
+			now: at(2_000),
+		});
+
+		expect(await query("SELECT * FROM session_usage_events")).toHaveLength(0);
+	});
+
+	it("falls back to the line position when the source cannot name the response", async () => {
+		await applyStatsEvents(
+			[
+				envelope(
+					session({
+						usageEvents: [
+							{ respondedAtMs: DAY1, model: "", input: 1, output: 1, cached: 0 },
+							{ respondedAtMs: DAY3, model: "", input: 2, output: 2, cached: 0 },
+						],
+					}),
+				),
+			],
+			{ producerKind: "cli", dbPath, now: at(1_000) },
+		);
+		const rows = await query<{ dedup_key: string }>("SELECT * FROM session_usage_events ORDER BY dedup_key");
+		expect(rows.map((r) => r.dedup_key)).toEqual(["line:0", "line:1"]);
+	});
+});
+
+describe("sync stamps", () => {
+	const at = (ms: number) => () => ms;
+
+	it("stamps the session and both child tables on the live path", async () => {
+		await applyStatsEvents([envelope(session({ tools: [{ name: "Edit", kind: "builtin", calls: 3 }] }))], {
+			producerKind: "cli",
+			dbPath,
+			now: at(9_000),
+		});
+
+		const [s] = await query<{ written_at_ms: number; updated_at_ms: number }>("SELECT * FROM sessions");
+		expect(s?.written_at_ms).toBe(9_000);
+		// The business clock still says what the event said, not when we wrote it.
+		expect(s?.updated_at_ms).toBe(1_700_000_000_000);
+
+		const [m] = await query<{ updated_at_ms: number }>("SELECT * FROM session_model_usage");
+		expect(m?.updated_at_ms).toBe(9_000);
+		const [t] = await query<{ updated_at_ms: number }>("SELECT * FROM session_tool_use");
+		expect(t?.updated_at_ms).toBe(9_000);
+	});
+
+	it("moves the stamp when a token-less re-read rewrites the row", async () => {
+		await applyStatsEvents([envelope(session())], { producerKind: "cli", dbPath, now: at(1_000) });
+		await applyStatsEvents([envelope(session({ messageCount: 9 }))], {
+			producerKind: "cli",
+			dbPath,
+			now: at(2_000),
+		});
+
+		const [s] = await query<{ written_at_ms: number }>("SELECT * FROM sessions");
+		expect(s?.written_at_ms).toBe(2_000);
+	});
+
+	// THE regression this column exists for. `projectCommitSummary` upgrades a
+	// `sessions-only` row to `full` without touching `updated_at_ms` — correctly,
+	// since the only clock it holds is the commit's. A sync keyed on that column
+	// would never learn the token split improved; the stamp is what makes it visible.
+	it("moves the stamp on a sessions-only -> full upgrade, leaving the business clock alone", async () => {
+		await applyStatsEvents([envelope(session({ models: undefined, tokenCoverage: "sessions-only" }))], {
+			producerKind: "cli",
+			dbPath,
+			now: at(1_000),
+		});
+		const [before] = await query<{ updated_at_ms: number; written_at_ms: number; token_coverage: string }>(
+			"SELECT * FROM sessions",
+		);
+		expect(before?.token_coverage).toBe("sessions-only");
+
+		await applyStatsEvents(
+			[
+				{
+					event: {
+						type: "commit.summary",
+						repoIdentity: "repo-1",
+						hash: "abc123",
+						committedAtMs: 1_700_000_500_000,
+						sessionLinks: [
+							{
+								source: "claude",
+								sessionId: "s1",
+								confidence: "exact",
+								models: [
+									{
+										model: "claude-opus-5",
+										provider: "anthropic",
+										inputTokens: 10,
+										outputTokens: 5,
+										cachedTokens: 0,
+										estCostUsd: 0.1,
+									},
+								],
+							},
+						],
+					},
+					producerKind: "cli",
+				} as unknown as StatsEventEnvelope,
+			],
+			{ producerKind: "cli", dbPath, now: at(5_000) },
+		);
+
+		const [after] = await query<{ updated_at_ms: number; written_at_ms: number; token_coverage: string }>(
+			"SELECT * FROM sessions",
+		);
+		expect(after?.token_coverage).toBe("full");
+		// Business clock untouched — the commit's time is not the session's.
+		expect(after?.updated_at_ms).toBe(before?.updated_at_ms);
+		// …but the row changed, so the stamp moved and a sync will pick it up.
+		expect(after?.written_at_ms).toBe(5_000);
+	});
+
+	it("moves the stamp on the tool-use conflict branch", async () => {
+		// Two buckets with the same (name, kind) inside one event take the
+		// ON CONFLICT path, which is a write like any other.
+		await applyStatsEvents(
+			[
+				envelope(
+					session({
+						tools: [
+							{ name: "Edit", kind: "builtin", calls: 1 },
+							{ name: "Edit", kind: "builtin", calls: 7 },
+						],
+					}),
+				),
+			],
+			{ producerKind: "cli", dbPath, now: at(4_000) },
+		);
+
+		const rows = await query<{ calls: number; updated_at_ms: number }>("SELECT * FROM session_tool_use");
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.calls).toBe(7);
+		expect(rows[0]?.updated_at_ms).toBe(4_000);
+	});
+
+	it("stamps recall receipts", async () => {
+		await applyStatsEvents(
+			[
+				{
+					event: {
+						type: "recall.observed",
+						repoIdentity: "repo-1",
+						atMs: 1_700_000_300_000,
+						surface: "mcp",
+						outcome: { hit: true, commitCount: 1, commits: [{ hash: "abc123", date: "2026-08-01" }] },
+					},
+					producerKind: "cli",
+				} as unknown as StatsEventEnvelope,
+			],
+			{ producerKind: "cli", dbPath, now: at(7_000) },
+		);
+
+		const [r] = await query<{ at_ms: number; updated_at_ms: number }>("SELECT * FROM recall_receipts");
+		expect(r?.at_ms).toBe(1_700_000_300_000);
+		expect(r?.updated_at_ms).toBe(7_000);
+	});
+});

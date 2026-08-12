@@ -1075,9 +1075,6 @@ window.JD = window.JD || {};
 		html += decisionsCard(model);
 		html += recallCard(model);
 
-		/* The session-activity card (heatmap, hour histogram, records, share card)
-		   was removed — `stats.heatmap` / `stats.hours` / `stats.fun` stay in the
-		   payload, so restoring it is a render change only. */
 		html += feedCard(model);
 
 		document.getElementById("app").innerHTML = html;
@@ -1091,15 +1088,8 @@ window.JD = window.JD || {};
 			};
 		});
 
-		/* Card tabs and the table toggle are pure view state over the SAME model,
-		   so they re-render locally instead of re-querying. */
-		var tableToggle = document.getElementById("tableToggle");
-		if (tableToggle) {
-			tableToggle.onclick = () => {
-				JD.m1Table = !JD.m1Table;
-				JD.renderPage(model);
-			};
-		}
+		/* Card tabs are pure view state over the SAME model, so they re-render
+		   locally instead of re-querying. */
 		document.querySelectorAll("[data-memory-activity-view]").forEach((button) => {
 			button.onclick = () => {
 				JD.memoryActivityView = button.getAttribute("data-memory-activity-view");

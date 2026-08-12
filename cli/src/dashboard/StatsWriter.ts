@@ -62,6 +62,7 @@ import {
 	statsEventId,
 	type WorktreeStatusEvent,
 } from "./DashboardModel.js";
+import { buildRollupQuietly, forgetRollupDays } from "./StatsRollup.js";
 
 const log = createLogger("StatsWriter");
 
@@ -140,6 +141,16 @@ export function applyToDb(
 		(id): id is string => typeof id === "string" && id.length > 0,
 	);
 	const drained = drainPending(db, { now, pendingScope });
+
+	// Tx3+ — settle whatever days the projections just invalidated. After the
+	// drain, not before: the rows this call wrote are exactly what makes a day
+	// stale, and building first would cache the state we are about to leave.
+	// Quietly, and on a budget: this is derived data on the writer's lock, and
+	// the callers holding it (an editor's periodic scan among them) wait
+	// milliseconds for it. Falling behind costs a slower page; holding the lock
+	// costs someone else's write.
+	buildRollupQuietly(db, { now });
+
 	return { accepted: envelopes.length, projected: drained.projected, pending: drained.pending };
 }
 
@@ -237,7 +248,7 @@ export function drainPending(
 					now(),
 					row.seq,
 				);
-				projectEvent(db, event);
+				projectEvent(db, event, now());
 				db.prepare("UPDATE events_raw SET projection_status = 'projected' WHERE seq = ?").run(row.seq);
 			});
 			projected++;
@@ -372,8 +383,16 @@ function isUnknownTypeError(err: unknown): boolean {
 	return err instanceof Error && err.message.startsWith(UNKNOWN_TYPE_MARKER);
 }
 
-/** Dispatches one event to its projection. Must run inside a transaction. */
-function projectEvent(db: DashboardDbHandle, event: StatsEvent): void {
+/**
+ * Dispatches one event to its projection. Must run inside a transaction.
+ *
+ * `nowMs` is the wall clock for the per-row sync stamps (see `SYNC_STAMP_DDL`).
+ * It is threaded rather than read inside each projection so tests can pin it,
+ * and so it is visibly NOT one of the event's own business timestamps — writing
+ * `event.updatedAtMs` into a stamp would quietly turn it into a second business
+ * clock and defeat the column's only purpose.
+ */
+function projectEvent(db: DashboardDbHandle, event: StatsEvent, nowMs: number): void {
 	switch (event.type) {
 		case "repo.enabled":
 			projectRepoEnabled(db, event);
@@ -382,19 +401,19 @@ function projectEvent(db: DashboardDbHandle, event: StatsEvent): void {
 			projectRepoDisabled(db, event);
 			return;
 		case "session.upserted":
-			projectSession(db, event);
+			projectSession(db, event, nowMs);
 			return;
 		case "commit.created":
-			projectCommit(db, event);
+			projectCommit(db, event, nowMs);
 			return;
 		case "commit.summary":
-			projectCommitSummary(db, event);
+			projectCommitSummary(db, event, nowMs);
 			return;
 		case "worktree.status":
 			projectWorktree(db, event);
 			return;
 		case "recall.observed":
-			projectRecallObserved(db, event);
+			projectRecallObserved(db, event, nowMs);
 			return;
 		default: {
 			// Two guarantees, both needed.
@@ -491,7 +510,7 @@ function resolveRepoId(db: DashboardDbHandle, repoIdentity: string): number | nu
 	return row?.id ?? null;
 }
 
-function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): void {
+function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowMs: number): void {
 	const repoId = ensureRepoRow(db, event.repoIdentity);
 	const eventId = statsEventId(event);
 	const models = event.models ?? [];
@@ -538,9 +557,13 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): voi
 		`INSERT INTO sessions
 		   (event_id, repo_id, source, session_id, title, started_at_ms,
 		    updated_at_ms, message_count, duration_ms, model,
-		    input_tokens, output_tokens, cached_tokens, est_cost_usd, token_coverage, prices_as_of)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		    input_tokens, output_tokens, cached_tokens, est_cost_usd, token_coverage, prices_as_of,
+		    written_at_ms)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(event_id) DO UPDATE SET
+		   -- Unconditional, and NOT a COALESCE: the stamp means "we wrote this row",
+		   -- so anything that preserves an older value defeats it.
+		   written_at_ms  = excluded.written_at_ms,
 		   title          = COALESCE(excluded.title, sessions.title),
 		   started_at_ms  = COALESCE(excluded.started_at_ms, sessions.started_at_ms),
 		   updated_at_ms  = excluded.updated_at_ms,
@@ -570,7 +593,65 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): voi
 		cost,
 		event.tokenCoverage ?? existing?.token_coverage ?? "sessions-only",
 		event.pricesAsOf ?? null,
+		nowMs,
 	);
+
+	// Per-response rows, replaced wholesale on the same terms as the model split
+	// below. The producer re-reads the WHOLE transcript, so what arrives is the
+	// complete set — and a complete set can shrink: agents compact and rewrite
+	// their transcripts, so responses recorded earlier can stop existing. Upsert
+	// alone would keep those forever, with nothing to notice them.
+	//
+	// Only when the producer actually SAW per-response usage —
+	// `undefined` means "this source cannot report it" (today, everything but
+	// Claude) and must leave what a capable read collected alone.
+	//
+	// This is the only table that can place a conversation's spend on the days it
+	// actually spanned; `sessions` and `session_model_usage` are totals derived
+	// from the same numbers, kept because a KPI should not pay for a GROUP BY.
+	if (event.usageEvents !== undefined) {
+		// A response that stops existing takes its day's cached total with it, and
+		// leaves no write stamp for the rollup to notice — the replacement rows
+		// only expire the days that still have responses. Read the old days before
+		// emptying the set, and forget them; a day that kept its rows is rebuilt
+		// anyway, so over-forgetting here costs one recomputation and never a
+		// wrong number.
+		const previousDays = db
+			.prepare("SELECT DISTINCT responded_at_ms FROM session_usage_events WHERE session_event_id = ?")
+			.all(eventId) as ReadonlyArray<{ responded_at_ms: number }>;
+		forgetRollupDays(
+			db,
+			previousDays.map((row) => row.responded_at_ms),
+		);
+		db.prepare("DELETE FROM session_usage_events WHERE session_event_id = ?").run(eventId);
+		// Plain INSERT, no ON CONFLICT: the DELETE above just emptied this session's
+		// rows, and the producer cannot hand us the same key twice — the reader
+		// dedupes on the response id, and the fallback key below is an index. A
+		// conflict here would mean one of those two invariants broke, and throwing
+		// says so instead of quietly merging.
+		const insertUsage = db.prepare(
+			`INSERT INTO session_usage_events
+			   (session_event_id, dedup_key, responded_at_ms, model, input_tokens, output_tokens, cached_tokens,
+			    est_cost_usd, updated_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		);
+		for (const [i, usage] of event.usageEvents.entries()) {
+			insertUsage.run(
+				eventId,
+				// A source that cannot name the response is keyed by its position
+				// among the counted responses — unique within the batch, which is all
+				// the key has to be once the set is replaced wholesale.
+				usage.dedupKey ?? `line:${i}`,
+				usage.respondedAtMs,
+				usage.model,
+				usage.input,
+				usage.output,
+				usage.cached,
+				usage.estCostUsd ?? null,
+				nowMs,
+			);
+		}
+	}
 
 	// Replace the model split wholesale — a partial update would leave a stale
 	// row behind whenever a re-read attributes tokens to fewer models than
@@ -589,11 +670,20 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): voi
 		db.prepare("DELETE FROM session_model_usage WHERE session_event_id = ?").run(eventId);
 		const insertModel = db.prepare(
 			`INSERT INTO session_model_usage
-			   (session_event_id, model, input_tokens, output_tokens, cached_tokens, est_cost_usd)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
+			   (session_event_id, model, input_tokens, output_tokens, cached_tokens, est_cost_usd,
+			    updated_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		);
 		for (const m of models) {
-			insertModel.run(eventId, m.model, m.inputTokens, m.outputTokens, m.cachedTokens, m.estCostUsd ?? null);
+			insertModel.run(
+				eventId,
+				m.model,
+				m.inputTokens,
+				m.outputTokens,
+				m.cachedTokens,
+				m.estCostUsd ?? null,
+				nowMs,
+			);
 		}
 	}
 
@@ -603,9 +693,14 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): voi
 	if (event.tools !== undefined) {
 		db.prepare("DELETE FROM session_tool_use WHERE session_event_id = ?").run(eventId);
 		const insertTool = db.prepare(
-			`INSERT INTO session_tool_use (session_event_id, tool_name, kind, server, calls, last_call_at_ms)
-			 VALUES (?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(session_event_id, tool_name, kind) DO UPDATE SET calls = excluded.calls,
+			`INSERT INTO session_tool_use
+			   (session_event_id, tool_name, kind, server, calls, last_call_at_ms, updated_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(session_event_id, tool_name, kind) DO UPDATE SET
+			     calls = excluded.calls,
+			     -- The stamp must be in THIS branch too: a conflict is still a write,
+			     -- and a sync keyed on it would otherwise never see a recount.
+			     updated_at_ms = excluded.updated_at_ms,
 			     -- MAX, not the excluded value: a re-read of the same session by a parser
 			     -- that cannot stamp a time (or an older build) would otherwise erase an
 			     -- instant a better read already recorded, and NULL is the one value this
@@ -620,7 +715,15 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): voi
 			                                  COALESCE(session_tool_use.last_call_at_ms, 0)), 0)`,
 		);
 		for (const tool of event.tools) {
-			insertTool.run(eventId, tool.name, tool.kind, tool.server ?? null, tool.calls, tool.lastCallAtMs ?? null);
+			insertTool.run(
+				eventId,
+				tool.name,
+				tool.kind,
+				tool.server ?? null,
+				tool.calls,
+				tool.lastCallAtMs ?? null,
+				nowMs,
+			);
 		}
 	}
 }
@@ -633,14 +736,16 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): voi
  * every other projection here has, expressed as an UPSERT because there is no
  * natural business key for "a call" beyond when it happened.
  */
-function projectRecallObserved(db: DashboardDbHandle, event: RecallObservedEvent): void {
+function projectRecallObserved(db: DashboardDbHandle, event: RecallObservedEvent, nowMs: number): void {
 	const repoId = ensureRepoRow(db, event.repoIdentity);
 	const outcome = event.outcome;
 	db.prepare(
 		`INSERT INTO recall_receipts
-		   (receipt_id, repo_id, at_ms, surface, session_id, hit, commit_count, commits_json)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		   (receipt_id, repo_id, at_ms, surface, session_id, hit, commit_count, commits_json,
+		    updated_at_ms)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(receipt_id) DO UPDATE SET
+		   updated_at_ms = excluded.updated_at_ms,
 		   hit          = excluded.hit,
 		   commit_count = excluded.commit_count,
 		   commits_json = excluded.commits_json`,
@@ -653,6 +758,7 @@ function projectRecallObserved(db: DashboardDbHandle, event: RecallObservedEvent
 		outcome.hit ? 1 : 0,
 		outcome.commitCount,
 		outcome.commits.length > 0 ? JSON.stringify(outcome.commits) : null,
+		nowMs,
 	);
 }
 
@@ -702,14 +808,14 @@ function projectRecallObserved(db: DashboardDbHandle, event: RecallObservedEvent
 // 	return true;
 // }
 
-function projectCommit(db: DashboardDbHandle, event: CommitCreatedEvent): void {
+function projectCommit(db: DashboardDbHandle, event: CommitCreatedEvent, nowMs: number): void {
 	const repoId = ensureRepoRow(db, event.repoIdentity);
 	const eventId = statsEventId(event);
 	db.prepare(
 		`INSERT INTO commits
 		   (event_id, repo_id, hash, branch, message, author_name, author_email,
-		    committed_at_ms, files_changed, insertions, deletions)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		    committed_at_ms, files_changed, insertions, deletions, written_at_ms)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(event_id) DO UPDATE SET
 		   branch        = COALESCE(excluded.branch, commits.branch),
 		   message       = COALESCE(excluded.message, commits.message),
@@ -718,7 +824,11 @@ function projectCommit(db: DashboardDbHandle, event: CommitCreatedEvent): void {
 		   committed_at_ms = excluded.committed_at_ms,
 		   files_changed = COALESCE(excluded.files_changed, commits.files_changed),
 		   insertions    = COALESCE(excluded.insertions, commits.insertions),
-		   deletions     = COALESCE(excluded.deletions, commits.deletions)`,
+		   deletions     = COALESCE(excluded.deletions, commits.deletions),
+		   -- Unconditional, like every other sync/build stamp: this row just
+		   -- changed, and the rollup decides a cached day is stale by comparing
+		   -- against this. A COALESCE here would hide the change from it.
+		   written_at_ms = excluded.written_at_ms`,
 	).run(
 		eventId,
 		repoId,
@@ -731,6 +841,7 @@ function projectCommit(db: DashboardDbHandle, event: CommitCreatedEvent): void {
 		event.filesChanged ?? null,
 		event.insertions ?? null,
 		event.deletions ?? null,
+		nowMs,
 	);
 
 	// `branches` is authoritative when present — replacing the set is what prunes
@@ -776,46 +887,59 @@ function projectCommit(db: DashboardDbHandle, event: CommitCreatedEvent): void {
  * session older than the agents' retention exists nowhere but in the memory
  * pipeline's links, and the sessions table is activity data, not memory data.
  */
-function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent): void {
+function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent, nowMs: number): void {
 	const repoId = ensureRepoRow(db, event.repoIdentity);
 	// Same event_id namespace as commit.created — the enrichment lands on the
 	// SAME commits row, only the events_raw provenance ids differ.
 	const commitEventId = `commit:${event.repoIdentity}:${event.hash}`;
 	db.prepare(
 		`INSERT INTO commits
-		   (event_id, repo_id, hash, branch, message, committed_at_ms)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		   (event_id, repo_id, hash, branch, message, committed_at_ms, written_at_ms)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(event_id) DO UPDATE SET
 		   branch        = COALESCE(excluded.branch, commits.branch),
-		   message       = COALESCE(excluded.message, commits.message)`,
-	).run(commitEventId, repoId, event.hash, event.branch ?? null, event.message ?? null, event.committedAtMs);
+		   message       = COALESCE(excluded.message, commits.message),
+		   written_at_ms = excluded.written_at_ms`,
+	).run(commitEventId, repoId, event.hash, event.branch ?? null, event.message ?? null, event.committedAtMs, nowMs);
 
 	if (event.sessionLinks) {
 		const seedSession = db.prepare(
 			`INSERT INTO sessions
 			   (event_id, repo_id, source, session_id, updated_at_ms, message_count,
-			    input_tokens, output_tokens, cached_tokens, est_cost_usd, token_coverage, prices_as_of)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			    input_tokens, output_tokens, cached_tokens, est_cost_usd, token_coverage, prices_as_of,
+			    written_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(event_id) DO UPDATE SET
 			   input_tokens   = excluded.input_tokens,
 			   output_tokens  = excluded.output_tokens,
 			   cached_tokens  = excluded.cached_tokens,
 			   est_cost_usd   = excluded.est_cost_usd,
 			   token_coverage = excluded.token_coverage,
-			   prices_as_of   = excluded.prices_as_of
+			   prices_as_of   = excluded.prices_as_of,
+			   -- The whole reason this column exists. This UPDATE deliberately leaves
+			   -- updated_at_ms alone (the commit's clock is not the session's), so a
+			   -- sync keyed on that column would never learn the token split just
+			   -- improved here. The stamp is what makes the enrichment visible.
+			   written_at_ms  = excluded.written_at_ms
 			 WHERE sessions.token_coverage = 'sessions-only' AND excluded.token_coverage = 'full'`,
 		);
 		const deleteModels = db.prepare("DELETE FROM session_model_usage WHERE session_event_id = ?");
 		const insertModel = db.prepare(
 			`INSERT INTO session_model_usage
-			   (session_event_id, model, input_tokens, output_tokens, cached_tokens, est_cost_usd)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
+			   (session_event_id, model, input_tokens, output_tokens, cached_tokens, est_cost_usd,
+			    updated_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		);
 		const deleteTools = db.prepare("DELETE FROM session_tool_use WHERE session_event_id = ?");
 		const insertTool = db.prepare(
-			`INSERT INTO session_tool_use (session_event_id, tool_name, kind, server, calls, last_call_at_ms)
-			 VALUES (?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(session_event_id, tool_name, kind) DO UPDATE SET calls = excluded.calls,
+			`INSERT INTO session_tool_use
+			   (session_event_id, tool_name, kind, server, calls, last_call_at_ms, updated_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(session_event_id, tool_name, kind) DO UPDATE SET
+			     calls = excluded.calls,
+			     -- The stamp must be in THIS branch too: a conflict is still a write,
+			     -- and a sync keyed on it would otherwise never see a recount.
+			     updated_at_ms = excluded.updated_at_ms,
 			     -- NULLIF for the same reason as the live path above: both-NULL must stay
 			     -- NULL, or the row claims epoch 0 as a real last-call instant.
 			     last_call_at_ms = NULLIF(MAX(COALESCE(excluded.last_call_at_ms, 0),
@@ -846,6 +970,7 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 				cost,
 				models.length > 0 ? "full" : "sessions-only",
 				models.length > 0 ? PRICES_AS_OF : null,
+				nowMs,
 			) as { changes?: number | bigint };
 			if (Number(result?.changes ?? 0) > 0) {
 				deleteModels.run(sessionEventId);
@@ -857,6 +982,7 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 						m.outputTokens,
 						m.cachedTokens,
 						m.estCostUsd ?? null,
+						nowMs,
 					);
 				}
 				// Tool calls ride the SAME gate as the model split, which is what keeps
@@ -885,6 +1011,7 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 							t.server ?? null,
 							t.calls,
 							t.lastCallAtMs ?? null,
+							nowMs,
 						);
 					}
 				}

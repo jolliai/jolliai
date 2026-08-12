@@ -4,8 +4,8 @@
  *
  * ## The single time-zone engine
  *
- * Every local-time decision in the dashboard — "today"'s boundaries, heatmap
- * day buckets, the hour histogram, streaks — goes through the JS/IANA helpers
+ * Every local-time decision in the dashboard — "today"'s boundaries, day
+ * buckets for the spend series, streaks — goes through the JS/IANA helpers
  * in this file, driven by one `timeZone` string. SQLite's `localtime` is never
  * used: it answers with the process's zone at query time, drifts on Windows,
  * and cannot agree with the boundaries computed here. The database itself
@@ -34,9 +34,6 @@ import type {
 	DaySeriesPoint,
 	DecisionRecord,
 	DecisionsCard,
-	FunStats,
-	HeatmapCell,
-	HourBucket,
 	KpiCard,
 	McpServerRow,
 	MemoryCard,
@@ -64,7 +61,10 @@ import {
 	scopeToRepoId,
 	splitDecisionBullets,
 } from "./DashboardScopeUtil.js";
+import { addLocalDays, dayKeyToMidnight, localDayKey, machineTimeZone, startOfLocalDay } from "./LocalDays.js";
 import { buildMemories, isReachable, type ReachableCommits } from "./MemoriesQuery.js";
+import { type DayPlan, planDays, readRollupSeries, TOKENS_KIND } from "./StatsRollup.js";
+import { readAxisRows, readDatedUsage } from "./StatsSeries.js";
 import { WORKTREE_STATUS_MAX_AGE_MS } from "./StatsWriter.js";
 
 const log = createLogger("DashboardQuery");
@@ -82,11 +82,11 @@ import {
 } from "./DashboardModel.js";
 
 /**
- * The heatmap's own span, deliberately NOT range-scoped: it is the long view by
- * definition, and the mockup labels it "12 weeks · all agents" regardless of the
- * selected range.
+ * The page's long-view sweep, deliberately NOT range-scoped: the streak and the
+ * previous-window cost comparison both reach back past whatever range is
+ * selected, so one scan over this span serves them and the range filter alike.
  */
-const HEATMAP_DAYS = 84; // 12 weeks
+const SWEEP_DAYS = 84; // 12 weeks
 
 /** The fixed-width ranges. `custom` is excluded — it carries its own bounds. */
 type PresetRange = Exclude<DashboardRange, "custom">;
@@ -117,131 +117,12 @@ const DEFAULT_RANGE: PresetRange = "month";
  */
 const MAX_CUSTOM_DAYS = 366;
 
-/** Shape of a local calendar day key, `YYYY-MM-DD`. */
-const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+// Re-exported so this module stays the one place the dashboard's public surface
+// is named, even though the implementations moved out to break an import cycle.
+export { addLocalDays, localDayKey, localHour, machineTimeZone, startOfLocalDay } from "./LocalDays.js";
+
 /** A session updated within this window renders as "live". */
 const LIVE_WINDOW_MS = 10 * 60 * 1000;
-/** Local hour at or after which a session counts as night-owl work. */
-const NIGHT_OWL_HOUR = 21;
-
-// ── Time-zone engine ────────────────────────────────────────────────────────
-
-/** The machine's IANA zone — the default for every query. */
-export function machineTimeZone(): string {
-	return Intl.DateTimeFormat().resolvedOptions().timeZone;
-}
-
-interface ZonedParts {
-	readonly year: number;
-	readonly month: number;
-	readonly day: number;
-	readonly hour: number;
-	readonly minute: number;
-}
-
-const partsFormatterCache = new Map<string, Intl.DateTimeFormat>();
-
-function partsFormatter(timeZone: string): Intl.DateTimeFormat {
-	let formatter = partsFormatterCache.get(timeZone);
-	if (!formatter) {
-		formatter = new Intl.DateTimeFormat("en-CA", {
-			timeZone,
-			year: "numeric",
-			month: "2-digit",
-			day: "2-digit",
-			hour: "2-digit",
-			minute: "2-digit",
-			hourCycle: "h23",
-		});
-		partsFormatterCache.set(timeZone, formatter);
-	}
-	return formatter;
-}
-
-/** Wall-clock components of `ms` in `timeZone`. */
-function zonedParts(ms: number, timeZone: string): ZonedParts {
-	const parts = partsFormatter(timeZone).formatToParts(ms);
-	const get = (type: string) => Number.parseInt(parts.find((p) => p.type === type)?.value ?? "0", 10);
-	return { year: get("year"), month: get("month"), day: get("day"), hour: get("hour"), minute: get("minute") };
-}
-
-/** Local calendar day of `ms` as `YYYY-MM-DD`. */
-export function localDayKey(ms: number, timeZone: string): string {
-	const p = zonedParts(ms, timeZone);
-	return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
-}
-
-/** Local hour (0–23) of `ms`. */
-export function localHour(ms: number, timeZone: string): number {
-	return zonedParts(ms, timeZone).hour;
-}
-
-/**
- * Epoch-ms of local midnight at the start of the day containing `ms`.
- *
- * `Intl` can only map epoch → wall clock; this inverts it by guessing the UTC
- * value of the wall-clock midnight and correcting by the observed error. Two
- * iterations settle every real zone including DST transitions: the first
- * correction lands within the zone's offset step, the second removes any
- * residue from a transition between guess and target. (On a "spring forward"
- * day where 00:00 does not exist, this lands on the earliest existing instant
- * of the day — exactly what a day boundary should be.)
- */
-function localMidnight(year: number, month: number, day: number, timeZone: string): number {
-	let guess = Date.UTC(year, month - 1, day);
-	for (let i = 0; i < 3; i++) {
-		const seen = zonedParts(guess, timeZone);
-		const error =
-			Date.UTC(seen.year, seen.month - 1, seen.day, seen.hour, seen.minute) - Date.UTC(year, month - 1, day);
-		if (error === 0) break;
-		guess -= error;
-	}
-	return guess;
-}
-
-export function startOfLocalDay(ms: number, timeZone: string): number {
-	const target = zonedParts(ms, timeZone);
-	return localMidnight(target.year, target.month, target.day, timeZone);
-}
-
-/**
- * Epoch-ms of local midnight starting the day `key` (`YYYY-MM-DD`) names, or
- * `undefined` when `key` is not a real local day.
- *
- * The round-trip check is the validation: `Date.UTC` happily normalises
- * 2026-02-31 into March 3rd, so a request for a day that does not exist would
- * otherwise silently return data for a different one. Comparing the resolved
- * instant's own day key against the input rejects exactly that case — and
- * costs nothing on the overwhelmingly common valid input.
- */
-function dayKeyToMidnight(key: string, timeZone: string): number | undefined {
-	if (!DAY_KEY_RE.test(key)) return undefined;
-	const ms = localMidnight(
-		Number.parseInt(key.slice(0, 4), 10),
-		Number.parseInt(key.slice(5, 7), 10),
-		Number.parseInt(key.slice(8, 10), 10),
-		timeZone,
-	);
-	return localDayKey(ms, timeZone) === key ? ms : undefined;
-}
-
-/**
- * Start of the local day `n` days after the day containing `ms`. Steps through
- * midday rather than adding exact 24 h multiples, so 23- and 25-hour DST days
- * cannot skip or repeat a day.
- */
-export function addLocalDays(ms: number, days: number, timeZone: string): number {
-	let cursor = startOfLocalDay(ms, timeZone);
-	const step = days >= 0 ? 1 : -1;
-	for (let i = 0; i !== days; i += step) {
-		// ±24 h from midnight, then +12 h INTO the target day: lands mid-day in
-		// the neighbouring day whether it is 23, 24 or 25 hours long, and
-		// startOfLocalDay snaps back to its midnight. (A ±36 h jump would
-		// overshoot a whole day when stepping backwards.)
-		cursor = startOfLocalDay(cursor + step * 86_400_000 + 43_200_000, timeZone);
-	}
-	return cursor;
-}
 
 // ── Range resolution ────────────────────────────────────────────────────────
 
@@ -545,8 +426,6 @@ const TOPIC_INSIGHTS_CTE = `WITH topic_insights AS (
 	 WHERE TRIM(COALESCE(json_extract(t.value, '$.todo'), '')) <> ''
 )`;
 
-const totalTokens = (row: SessionRow): number => row.input_tokens + row.output_tokens + row.cached_tokens;
-
 // ── Stats page ──────────────────────────────────────────────────────────────
 
 function formatTokens(n: number): string {
@@ -592,124 +471,38 @@ function buildSeries(
 	fromMs: number,
 	toMs: number,
 	timeZone: string,
+	plan: DayPlan,
 ): SeriesResult {
 	// Memory-only axes fall back to `model` below the memory tier, so a stale URL
 	// renders real data instead of an empty chart pretending to be one.
 	const memoryOnly = dimension === "branch" || dimension === "ticket" || dimension === "category";
 	const effective: SeriesDimension = memoryOnly && tier === "installed" ? "model" : dimension;
 
-	interface UsageRow {
-		readonly at_ms: number;
-		readonly key: string;
-		readonly tokens: number;
-		readonly cost: number;
-	}
-	let rows: ReadonlyArray<UsageRow>;
-	if (effective === "model") {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "s.repo_id");
-		rows = db
-			.prepare(
-				`SELECT s.updated_at_ms AS at_ms, u.model AS key,
-				        u.input_tokens + u.output_tokens + u.cached_tokens AS tokens,
-				        COALESCE(u.est_cost_usd, 0) AS cost
-				   FROM session_model_usage u JOIN sessions s ON s.event_id = u.session_event_id
-				  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	} else if (effective === "agent") {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "repo_id");
-		rows = db
-			.prepare(
-				`SELECT updated_at_ms AS at_ms, source AS key,
-				        input_tokens + output_tokens + cached_tokens AS tokens,
-				        COALESCE(est_cost_usd, 0) AS cost
-				   FROM sessions WHERE updated_at_ms >= ? AND updated_at_ms < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	} else if (effective === "project") {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "s.repo_id");
-		rows = db
-			.prepare(
-				`SELECT s.updated_at_ms AS at_ms, r.repo_name AS key,
-				        s.input_tokens + s.output_tokens + s.cached_tokens AS tokens,
-				        COALESCE(s.est_cost_usd, 0) AS cost
-				   FROM sessions s JOIN repos r ON r.id = s.repo_id
-				  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	} else if (effective === "category") {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "m.repo_id");
-		// One row per TOPIC, with the commit's tokens shared across its topics —
-		// category belongs to a topic, and the old per-commit mode erased every
-		// category that never won a commit's vote (security and docs vanished
-		// entirely on this repo's data). Sharing keeps the axis summing to the
-		// real total, the property the mode existed to protect; the cost
-		// figures are apportioned by design, not exact per-topic spend.
-		// The LEFT JOIN keeps memories with no topics on the axis: their window
-		// COUNT(*) is 1 and their whole spend lands in '(uncategorised)'.
-		rows = db
-			.prepare(
-				`SELECT COALESCE(cm.committed_at_ms, m.commit_date_ms) AS at_ms,
-				        COALESCE(t.category, '(uncategorised)') AS key,
-				        COALESCE(m.tokens, 0) * 1.0
-				          / COUNT(*) OVER (PARTITION BY m.repo_id, m.commit_hash) AS tokens,
-				        COALESCE(m.est_cost_usd, 0) * 1.0
-				          / COUNT(*) OVER (PARTITION BY m.repo_id, m.commit_hash) AS cost
-				   FROM memories m
-				   LEFT JOIN memory_topics t ON t.repo_id = m.repo_id AND t.commit_hash = m.commit_hash
-				   LEFT JOIN commits cm ON cm.repo_id = m.repo_id AND cm.hash = m.commit_hash
-				  WHERE m.tokens IS NOT NULL
-				    AND COALESCE(cm.committed_at_ms, m.commit_date_ms) >= ?
-				    AND COALESCE(cm.committed_at_ms, m.commit_date_ms) < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	} else if (effective === "branch") {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
-		// A commit reachable from several branches contributes to each — the axis
-		// answers "where did the spend land", not "sum to the exact total". That
-		// licenses duplication ACROSS SERIES, never in the day totals, which is
-		// why the spend is apportioned exactly as the category axis apportions
-		// across topics. `commit_branches` is a per-branch `git rev-list` union,
-		// so every commit on `main` is also listed under every feature branch
-		// based off it: unapportioned, one 10k-token commit on a repo with five
-		// such branches added 60k tokens (and 6x the cost) to the day.
-		rows = db
-			.prepare(
-				`SELECT c.committed_at_ms AS at_ms, br.name AS key,
-				        COALESCE(m.tokens, 0) * 1.0
-				          / COUNT(*) OVER (PARTITION BY c.repo_id, c.hash) AS tokens,
-				        COALESCE(m.est_cost_usd, 0) * 1.0
-				          / COUNT(*) OVER (PARTITION BY c.repo_id, c.hash) AS cost
-				   FROM commits c JOIN commit_branches b ON b.commit_id = c.id
-			                        JOIN branches br ON br.id = b.branch_id
-			                        JOIN memories m ON m.repo_id = c.repo_id AND m.commit_hash = c.hash
-				  WHERE m.tokens IS NOT NULL AND c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	} else {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
-		rows = db
-			.prepare(
-				`SELECT c.committed_at_ms AS at_ms, COALESCE(m.ticket_id, '(no ticket)') AS key,
-				        COALESCE(m.tokens, 0) AS tokens, COALESCE(m.est_cost_usd, 0) AS cost
-				   FROM commits c JOIN memories m ON m.repo_id = c.repo_id AND m.commit_hash = c.hash
-				  WHERE m.tokens IS NOT NULL AND c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	}
-
 	const seriesByDay = new Map<string, { tokens: number; cost: number; bySeries: Map<string, number> }>();
 	for (let dayStart = fromMs; dayStart < toMs; dayStart = addLocalDays(dayStart, 1, timeZone)) {
 		seriesByDay.set(localDayKey(dayStart, timeZone), { tokens: 0, cost: 0, bySeries: new Map() });
 	}
 	const seriesKeys = new Set<string>();
-	for (const row of rows) {
-		const bucket = seriesByDay.get(localDayKey(row.at_ms, timeZone));
-		if (!bucket) continue;
-		bucket.tokens += row.tokens;
-		bucket.cost += row.cost;
-		bucket.bySeries.set(row.key, (bucket.bySeries.get(row.key) ?? 0) + row.tokens);
-		seriesKeys.add(row.key);
+	const add = (day: string, key: string, tokens: number, cost: number) => {
+		const bucket = seriesByDay.get(day);
+		if (!bucket) return;
+		bucket.tokens += tokens;
+		bucket.cost += cost;
+		bucket.bySeries.set(key, (bucket.bySeries.get(key) ?? 0) + tokens);
+		seriesKeys.add(key);
+	};
+
+	// Settled days come out of the cache; the rest are computed. The two sets are
+	// disjoint by construction, and the live pass filters on membership rather
+	// than on the range — see DayPlan for why the range alone is not enough.
+	for (const row of readRollupSeries(db, timeZone, effective, plan.cached, scope)) {
+		add(row.day, row.series_key, row.value, row.cost_usd);
+	}
+	if (plan.live.size > 0) {
+		for (const row of readAxisRows(db, scope, effective, plan.liveFromMs, plan.liveToMs)) {
+			const day = localDayKey(row.bucket_at_ms, timeZone);
+			if (plan.live.has(day)) add(day, row.key, row.tokens, row.cost);
+		}
 	}
 	return {
 		series: [...seriesByDay.entries()].map(([date, b]) => ({
@@ -719,12 +512,112 @@ function buildSeries(
 			// integers to every consumer; rounding here (not per row) keeps the
 			// day's error under half a token.
 			tokens: Math.round(b.tokens),
+			// NOT quantised, and the reason is worth recording because rounding is
+			// the obvious move here and it backfires. A cached day sums its repos'
+			// pre-aggregated subtotals while a live day sums the raw rows, and
+			// float addition is not associative, so the two land ~1e-13 apart
+			// ($21.26483375 vs $21.264833749999998 — measured). Rounding to six
+			// decimals hides that on most days and then makes it WORSE on the ones
+			// where the true value sits near a boundary: the category axis divides
+			// each commit's cost across its topics, and $171.7868375 rounded from
+			// either side differs by a whole 1e-6. A tolerance is the honest tool
+			// for comparing two float sums; quantising only moves the disagreement
+			// somewhere rarer and larger.
 			estCostUsd: b.cost,
-			bySeries: Object.fromEntries([...b.bySeries.entries()].map(([k, v]) => [k, Math.round(v)])),
+			// Sorted, so the two paths cannot differ merely by insertion order: the
+			// live pass inserts as rows arrive, the cached one in GROUP BY order.
+			// Same numbers either way, but a serialised model would not compare
+			// equal, and this object is handed out as JSON.
+			bySeries: Object.fromEntries(
+				[...b.bySeries.entries()]
+					.sort(([a], [c]) => (a < c ? -1 : a > c ? 1 : 0))
+					.map(([k, v]) => [k, Math.round(v)]),
+			),
 		})),
 		seriesKeys: [...seriesKeys].sort(),
 		seriesDimension: effective,
 	};
+}
+
+/** One window's token split and spend, plus the per-day split behind them. */
+interface SpendTotals {
+	readonly input: number;
+	readonly output: number;
+	readonly cached: number;
+	readonly costUsd: number;
+	/** Day key → segments, seeded with every day in the window so quiet days render. */
+	readonly perDay: ReadonlyMap<string, { input: number; output: number; cached: number }>;
+}
+
+/**
+ * The window's spend on the SAME per-response clock the charts use.
+ *
+ * ⚠ This is not an optimisation of the old `rangeSessions.reduce(...)` — it is a
+ * different answer, and the KPI row and the token card must both use it or the
+ * page contradicts itself. A `sessions` row carries a conversation's cumulative
+ * totals under ONE timestamp, so a session that crossed midnight lands entirely
+ * on whichever day it was last active; the charts have placed each response on
+ * its own day since `session_usage_events` landed. Mixing the two put the token
+ * card's legend and its bars on different clocks: on a range that ended before
+ * such a session's last activity the legend read zero — and the renderer's
+ * `total === 0` branch then replaced a day of real bars with "No token data
+ * yet".
+ *
+ * The three segments and the cost come from the two readers the charts use, so
+ * the KPI equals the token card exactly, and equals the `model` series' day
+ * totals exactly. Cost rides the `model` axis rather than a fourth query
+ * because that axis IS the session-side spend — same rows, same fallback for
+ * sources that report no per-response usage.
+ *
+ * One consequence worth stating: a usage line the parser cannot date is counted
+ * in the session's totals but dropped from the events (see `readTranscript`), so
+ * these figures can sit a hair BELOW the session-level ones. That is the right
+ * side to err on for a per-day card — an undatable token has no day to be shown
+ * on — and it is why the two must not be mixed in one card rather than merely
+ * reconciled.
+ */
+function readSpendTotals(db: DashboardDbHandle, scope: DashboardScope, timeZone: string, plan: DayPlan): SpendTotals {
+	const perDay = new Map<string, { input: number; output: number; cached: number }>();
+	for (const day of plan.dayKeys) perDay.set(day, { input: 0, output: 0, cached: 0 });
+
+	// Settled days are read; the rest are computed, filtered on day membership
+	// rather than on the enclosing range (see DayPlan).
+	for (const row of readRollupSeries(db, timeZone, TOKENS_KIND, plan.cached, scope)) {
+		const cell = perDay.get(row.day);
+		if (!cell) continue;
+		if (row.series_key === "input") cell.input += row.value;
+		else if (row.series_key === "output") cell.output += row.value;
+		else if (row.series_key === "cached") cell.cached += row.value;
+	}
+	let costUsd = 0;
+	for (const row of readRollupSeries(db, timeZone, "model", plan.cached, scope)) costUsd += row.cost_usd;
+	if (plan.live.size > 0) {
+		for (const row of readDatedUsage(db, scope, plan.liveFromMs, plan.liveToMs)) {
+			const day = localDayKey(row.bucket_at_ms, timeZone);
+			if (!plan.live.has(day)) continue;
+			const cell = perDay.get(day);
+			if (!cell) continue;
+			cell.input += row.input;
+			cell.output += row.output;
+			cell.cached += row.cached;
+		}
+		for (const row of readAxisRows(db, scope, "model", plan.liveFromMs, plan.liveToMs)) {
+			if (plan.live.has(localDayKey(row.bucket_at_ms, timeZone))) costUsd += row.cost;
+		}
+	}
+
+	let input = 0;
+	let output = 0;
+	let cached = 0;
+	for (const cell of perDay.values()) {
+		input += cell.input;
+		output += cell.output;
+		cached += cell.cached;
+	}
+	// Rounded exactly where the series rounds — at emission, not per row — so the
+	// scalar and the bars it sits above cannot differ by an accumulated fraction.
+	// Cost stays unrounded, for the reason `buildSeries` records at `estCostUsd`.
+	return { input: Math.round(input), output: Math.round(output), cached: Math.round(cached), costUsd, perDay };
 }
 
 /** Price-table date behind the cost figures, from the newest priced session. */
@@ -810,61 +703,60 @@ function buildStats(
 	reachable?: ReachableCommits,
 ): StatsModel {
 	const tomorrowStart = addLocalDays(nowMs, 1, timeZone);
-	const heatmapStart = addLocalDays(nowMs, -(HEATMAP_DAYS - 1), timeZone);
+	const sweepStart = addLocalDays(nowMs, -(SWEEP_DAYS - 1), timeZone);
 	// The KPI row, the series and the session feed share ONE window — the
 	// selected range — so every figure on the page answers the same question.
-	// The heatmap and the records row keep their own 12-week span (HEATMAP_DAYS).
-	// One sweep over the heatmap window feeds the heatmap, the hour histogram and
-	// the records row. A PRESET range is always inside that sweep, so its rows
-	// are a filter over what is already in memory; a custom range can start
-	// before it or end before today, which needs its own scan.
-	const windowSessions = sessionsInRange(db, scope, heatmapStart, tomorrowStart);
-	const windowCommits = commitsInRange(db, scope, heatmapStart, tomorrowStart);
-	const insideSweep = window.startMs >= heatmapStart && window.endMs <= tomorrowStart;
+	// One sweep over the 12-week span (SWEEP_DAYS) feeds the streak, which looks
+	// past the range by definition. A PRESET range is always inside that sweep, so
+	// its rows are a filter over what is already in memory; a custom range can
+	// start before it or end before today, which needs its own scan.
+	const windowSessions = sessionsInRange(db, scope, sweepStart, tomorrowStart);
+	const windowCommits = commitsInRange(db, scope, sweepStart, tomorrowStart);
+	const insideSweep = window.startMs >= sweepStart && window.endMs <= tomorrowStart;
 	const inWindow = (ms: number) => ms >= window.startMs && ms < window.endMs;
 	const rangeSessions = insideSweep
 		? windowSessions.filter((s) => inWindow(s.updated_at_ms))
 		: sessionsInRange(db, scope, window.startMs, window.endMs);
 
+	// One cache scan for the whole page. Shared by the KPI row, the token split
+	// and the spend series so they cannot disagree about which days are settled —
+	// half a page reading a cached day while the other half recomputes it would be
+	// a discrepancy with no visible cause.
+	const plan = planDays(db, timeZone, window.startMs, window.endMs, nowMs);
+
+	// Every token and dollar on this page comes from here, on the per-response
+	// clock (see readSpendTotals for why the session-level totals are a DIFFERENT
+	// answer rather than a cheaper one). `rangeSessions` still answers everything
+	// that is genuinely about sessions — how many there were, which to feed, when
+	// the machine was last active — and nothing about how much they spent.
+	const spend = readSpendTotals(db, scope, timeZone, plan);
+
 	// KPI row, scoped to the range. Labels carry the window so "6 sessions" can
 	// never be misread as today's when the user is looking at a month.
-	const rangeTokens = rangeSessions.reduce((sum, s) => sum + totalTokens(s), 0);
-	const rangeCost = rangeSessions.reduce((sum, s) => sum + (s.est_cost_usd ?? 0), 0);
-	const rangeCached = rangeSessions.reduce((sum, s) => sum + s.cached_tokens, 0);
-	const rangeInput = rangeSessions.reduce((sum, s) => sum + s.input_tokens + s.cached_tokens, 0);
+	const rangeTokens = spend.input + spend.output + spend.cached;
+	const rangeInput = spend.input + spend.cached;
 
-	// "Where your tokens went" — input/output/cache over the range, day-bucketed
-	// for the card's chart. Reuses `rangeSessions`, already swept above for the
-	// KPI row, rather than a second query.
-	const perDayTokens = new Map<string, { input: number; output: number; cached: number }>();
-	for (let dayStart = window.startMs; dayStart < window.endMs; dayStart = addLocalDays(dayStart, 1, timeZone)) {
-		perDayTokens.set(localDayKey(dayStart, timeZone), { input: 0, output: 0, cached: 0 });
-	}
-	for (const s of rangeSessions) {
-		const cell = perDayTokens.get(localDayKey(s.updated_at_ms, timeZone));
-		if (cell) {
-			cell.input += s.input_tokens;
-			cell.output += s.output_tokens;
-			cell.cached += s.cached_tokens;
-		}
-	}
+	// "Where your tokens went" — the same numbers the KPI row just used, with the
+	// per-day split the card's chart draws. One source, so the legend above the
+	// bars is the bars' own total by construction.
 	const tokenBreakdown: TokenBreakdown = {
-		input: rangeSessions.reduce((sum, s) => sum + s.input_tokens, 0),
-		output: rangeSessions.reduce((sum, s) => sum + s.output_tokens, 0),
-		cached: rangeCached,
-		perDay: [...perDayTokens.entries()].map(([date, v]) => ({ date, ...v })),
+		input: spend.input,
+		output: spend.output,
+		cached: spend.cached,
+		perDay: [...spend.perDay.entries()].map(([date, v]) => ({ date, ...v })),
 	};
 
 	// Cost vs the immediately preceding window of equal length — the Spend
-	// card's own self-trend.
+	// card's own self-trend. Its own plan, and therefore its own pair of queries
+	// rather than a filter over `windowSessions`: comparing a response-dated
+	// window against a session-dated one would put the drift between the two
+	// clocks straight into the percentage, where it is indistinguishable from a
+	// real change in spend.
 	const priorRangeFrom = window.startMs - (window.endMs - window.startMs);
-	const priorRangeCost = (
-		priorRangeFrom >= heatmapStart
-			? windowSessions.filter((s) => s.updated_at_ms >= priorRangeFrom && s.updated_at_ms < window.startMs)
-			: sessionsInRange(db, scope, priorRangeFrom, window.startMs)
-	).reduce((sum, s) => sum + (s.est_cost_usd ?? 0), 0);
+	const priorPlan = planDays(db, timeZone, priorRangeFrom, window.startMs, nowMs);
+	const priorRangeCost = readSpendTotals(db, scope, timeZone, priorPlan).costUsd;
 	const costTrendPct =
-		priorRangeCost > 0 ? Math.round(((rangeCost - priorRangeCost) / priorRangeCost) * 100) : undefined;
+		priorRangeCost > 0 ? Math.round(((spend.costUsd - priorRangeCost) / priorRangeCost) * 100) : undefined;
 
 	const streakDays = computeStreak(
 		[...windowSessions.map((s) => s.updated_at_ms), ...windowCommits.map((c) => c.committed_at_ms)],
@@ -875,11 +767,11 @@ function buildStats(
 	const kpis: KpiCard[] = [
 		{ key: "sessions", label: `sessions ${suffix}`, value: String(rangeSessions.length) },
 		{ key: "tokens", label: `tokens ${suffix}`, value: formatTokens(rangeTokens) },
-		{ key: "cost", label: `est. cost ${suffix}`, value: `$${rangeCost.toFixed(2)}` },
+		{ key: "cost", label: `est. cost ${suffix}`, value: `$${spend.costUsd.toFixed(2)}` },
 		{
 			key: "cached",
 			label: "% cached",
-			value: rangeInput > 0 ? `${Math.round((rangeCached / rangeInput) * 100)}%` : "—",
+			value: rangeInput > 0 ? `${Math.round((spend.cached / rangeInput) * 100)}%` : "—",
 		},
 		{ key: "streak", label: "streak", value: `${streakDays}d 🔥` },
 	];
@@ -893,9 +785,9 @@ function buildStats(
 	// those null (see CommitRow), which would undercount "captured" and inflate
 	// the Memory Activity gap count against commits that were never actually gaps.
 	//
-	// Reachability filters the CAPTURED side only, never `totalCommits` or the
-	// heatmap: those answer "what did I do", where a commit that has since been
-	// squashed away still happened. "Captured" sits directly above the memory
+	// Reachability filters the CAPTURED side only, never `totalCommits`: that
+	// answers "what did I do", where a commit that has since been squashed away
+	// still happened. "Captured" sits directly above the memory
 	// card list and has to count the same rows that list renders — otherwise a
 	// branch of forty squashed predecessors reads as "41 captured" over two
 	// cards.
@@ -909,56 +801,7 @@ function buildStats(
 	const pricesAsOf = readPricesAsOf(db, scope);
 
 	// Cost/token series along the requested dimension, over the same window.
-	const seriesResult = buildSeries(db, scope, dimension, tier, window.startMs, window.endMs, timeZone);
-
-	// Heatmap + hour histogram from the same window sweep. Commits count as
-	// their own dimension: sessions older than the live-log window survive only
-	// as stored summaries, so commit dates carry the long tail of history and a
-	// commit-only day must not render as inactive.
-	const heatmapByDay = new Map<string, { sessions: number; commits: number; tokens: number }>();
-	for (let dayStart = heatmapStart; dayStart < tomorrowStart; dayStart = addLocalDays(dayStart, 1, timeZone)) {
-		heatmapByDay.set(localDayKey(dayStart, timeZone), { sessions: 0, commits: 0, tokens: 0 });
-	}
-	const hourCounts = new Array<number>(24).fill(0);
-	let nightOwl = 0;
-	for (const s of windowSessions) {
-		const cell = heatmapByDay.get(localDayKey(s.updated_at_ms, timeZone));
-		if (cell) {
-			cell.sessions += 1;
-			cell.tokens += totalTokens(s);
-		}
-		const hour = localHour(s.updated_at_ms, timeZone);
-		hourCounts[hour] += 1;
-		if (hour >= NIGHT_OWL_HOUR) nightOwl += 1;
-	}
-	for (const c of windowCommits) {
-		const cell = heatmapByDay.get(localDayKey(c.committed_at_ms, timeZone));
-		if (cell) cell.commits += 1;
-	}
-	const heatmap: HeatmapCell[] = [...heatmapByDay.entries()].map(([date, cell]) => ({ date, ...cell }));
-	const hours: HourBucket[] = hourCounts.map((sessions, hour) => ({ hour, sessions }));
-
-	// Fun stats.
-	const longest = windowSessions.reduce<SessionRow | null>(
-		(best, s) => ((s.duration_ms ?? 0) > (best?.duration_ms ?? 0) ? s : best),
-		null,
-	);
-	let biggestDayDate: string | undefined;
-	let biggestDayTokens = 0;
-	for (const [date, cell] of heatmapByDay) {
-		if (cell.tokens > biggestDayTokens) {
-			biggestDayTokens = cell.tokens;
-			biggestDayDate = date;
-		}
-	}
-	const fun: FunStats = {
-		legendarySessionMinutes: Math.round((longest?.duration_ms ?? 0) / 60_000),
-		...(longest?.title ? { legendarySessionTitle: longest.title } : {}),
-		...(longest && longest.message_count != null ? { legendarySessionTurns: longest.message_count } : {}),
-		...(biggestDayDate ? { biggestDayDate } : {}),
-		biggestDayTokens,
-		nightOwlSharePct: windowSessions.length > 0 ? Math.round((nightOwl / windowSessions.length) * 100) : 0,
-	};
+	const seriesResult = buildSeries(db, scope, dimension, tier, window.startMs, window.endMs, timeZone, plan);
 
 	// The feed follows the range, not the 12-week sweep: on a custom window that
 	// predates the sweep, showing this month's sessions under a January heading
@@ -972,11 +815,8 @@ function buildStats(
 	return {
 		kpis,
 		...seriesResult,
-		heatmap,
-		hours,
 		tokenBreakdown,
 		...(costTrendPct !== undefined ? { costTrendPct } : {}),
-		fun,
 		recentSessions,
 		memoryCards,
 		totalCommits: rangeCommits.length,

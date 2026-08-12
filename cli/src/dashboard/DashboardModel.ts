@@ -15,7 +15,14 @@
  */
 
 import type { KnowledgeGraph } from "../graph/GraphSchema.js";
-import type { LocalAgentToolId, RecallOutcome, ToolCallCount, ToolCallKind, TranscriptSource } from "../Types.js";
+import type {
+	LocalAgentToolId,
+	RecallOutcome,
+	SessionUsageEvent,
+	ToolCallCount,
+	ToolCallKind,
+	TranscriptSource,
+} from "../Types.js";
 
 /**
  * Version stamped on every event written to `events_raw`. Bump when an event's
@@ -58,6 +65,21 @@ export interface SessionUpsertedEvent {
 	readonly tokenCoverage?: TokenCoverage;
 	readonly pricesAsOf?: string;
 	readonly models?: ReadonlyArray<StatsModelUsage>;
+	/**
+	 * One entry per counted model response, each carrying its own instant.
+	 *
+	 * REPLACES the stored set when present, on the same terms as {@link models}:
+	 * a re-read attributing usage to fewer responses must not leave the extras
+	 * behind. `undefined` means this producer could not see per-response usage
+	 * (only the Claude parser can today) and leaves existing rows alone; an
+	 * empty array means it saw usage but nothing datable, which REPLACES the
+	 * stored set with nothing so a transcript rewrite cannot leave stale rows.
+	 *
+	 * {@link models} is the same numbers with the time thrown away. Both are
+	 * carried because the summary stores the aggregate, but only this one can be
+	 * placed on a calendar — see `SESSION_USAGE_EVENTS_DDL`.
+	 */
+	readonly usageEvents?: ReadonlyArray<SessionUsageEvent>;
 	/**
 	 * Tool calls observed in the session's transcript. REPLACES the stored set
 	 * when present; `undefined` means "this producer could not see tools" and
@@ -358,63 +380,6 @@ export interface KnowledgeModel {
 }
 
 // ── Settings page ───────────────────────────────────────────────────────────
-
-/**
- * The Settings/Repositories provider choice, reshaped from `aiProvider` by
- * `EnvFacts.ts`'s `readEnvironmentFacts`. `"none"` covers both an unset
- * config and a value this reader does not recognise — both mean "nothing
- * chosen yet" to the page.
- */
-export type SummarizerProvider = "local" | "apikey" | "account" | "none";
-
-export interface SettingsSummarizerState {
-	readonly provider: SummarizerProvider;
-	readonly localAgentTool?: LocalAgentToolId;
-	/** Local agent tools present on this machine, in display order. */
-	readonly agentsPresent: ReadonlyArray<{ readonly id: LocalAgentToolId; readonly label: string }>;
-	/** Whether an Anthropic API key is on file — never the key itself. */
-	readonly keyConfigured: boolean;
-	/** Whether a Jolli Space account is on file — never the key itself. */
-	readonly signedIn: boolean;
-	/** No provider is configured yet — the page must ask rather than assume one. */
-	readonly mustAsk: boolean;
-}
-
-export interface SettingsPrivacyState {
-	/** The server's actual bound port — never a literal, so Settings cannot drift from what is really listening. */
-	readonly port: number;
-	readonly transcriptsLocal: true;
-	/** Whether the configured summarizer sends commit context to a remote API. */
-	readonly summarizerLeaves: boolean;
-}
-
-/**
- * One repo's real installed-hook status — a filesystem/JSON-file probe, not
- * `Installer.getStatus()`'s much heavier machine-wide sweep. No orphan-branch
- * check: that needs a git subprocess, which this cheap-by-design probe does
- * not spend.
- */
-export interface RepoHookStatus {
-	readonly repoIdentity: string;
-	readonly repoName: string;
-	readonly gitHookInstalled: boolean;
-	readonly claudeHookInstalled: boolean;
-	readonly geminiHookInstalled: boolean;
-	readonly mcpRegistered: boolean;
-}
-
-/**
- * The mockup-era Settings payload (Summarizer / Hooks / Privacy sections). Kept
- * because `SettingsQuery.buildSettings` / `EnvFacts` / `HookStatus` still build
- * it, but it is NOT what the shipped Settings page reads — that is
- * {@link SettingsPageModel}, which mirrors the VS Code settings panel's five
- * tabs. This one has no route and no consumer today.
- */
-export interface SettingsModel {
-	readonly summarizer: SettingsSummarizerState;
-	readonly hooks: ReadonlyArray<RepoHookStatus>;
-	readonly privacy: SettingsPrivacyState;
-}
 
 /**
  * The five agent toggles-plus-one that the AI Agents tab controls, each a
@@ -766,8 +731,8 @@ export interface RepoOption {
 /**
  * Time window the page is scoped to. Drives the KPI row, the series and the
  * session feed together, so every number on the page answers the same
- * question. The heatmap and the records row stay at their own 12-week span by
- * design (they ARE the long view), which is why `range` does not collapse them.
+ * question. The streak and the previous-window cost trend reach past it by
+ * design, which is why `range` does not collapse the 12-week sweep behind them.
  *
  * `custom` carries its bounds out-of-band (`QueryOptions.customFrom` / `To`);
  * every other member is a fixed number of days ending today. Whichever was
@@ -792,30 +757,6 @@ export interface DaySeriesPoint {
 	readonly estCostUsd: number;
 	/** Split along the currently requested dimension (model, agent, …). */
 	readonly bySeries: Readonly<Record<string, number>>;
-}
-
-/** One cell of the 12-week heatmap. */
-export interface HeatmapCell {
-	readonly date: string;
-	readonly sessions: number;
-	/** Commits carry the long tail — history older than the live-log window. */
-	readonly commits: number;
-	readonly tokens: number;
-}
-
-export interface HourBucket {
-	readonly hour: number;
-	readonly sessions: number;
-}
-
-export interface FunStats {
-	readonly legendarySessionMinutes: number;
-	readonly legendarySessionTitle?: string;
-	/** Conversation turns of the longest session (memory tier); absent below it. */
-	readonly legendarySessionTurns?: number;
-	readonly biggestDayDate?: string;
-	readonly biggestDayTokens: number;
-	readonly nightOwlSharePct: number;
 }
 
 /** A row in "What my agents did". */
@@ -952,8 +893,6 @@ export interface StatsModel {
 	readonly seriesKeys: ReadonlyArray<string>;
 	/** The dimension `series`/`seriesKeys` were built along. */
 	readonly seriesDimension: SeriesDimension;
-	readonly heatmap: ReadonlyArray<HeatmapCell>;
-	readonly hours: ReadonlyArray<HourBucket>;
 	/** Token volume by type, over the range — available at every tier, like `kpis`. */
 	readonly tokenBreakdown: TokenBreakdown;
 	/**
@@ -962,7 +901,6 @@ export interface StatsModel {
 	 * sessions to compare against.
 	 */
 	readonly costTrendPct?: number;
-	readonly fun: FunStats;
 	/**
 	 * The tier-0 feed: raw sessions from local agent logs. The renderer shows
 	 * these only when memory is off — with memory on, {@link memoryCards} is the
@@ -1485,7 +1423,7 @@ export interface GraphVersion {
 /**
  * Data honesty flags surfaced in the UI footer. Session-level activity older
  * than the live-log window comes only from stored summaries, so an empty
- * stretch of heatmap can mean "not recorded" rather than "not working" — the
+ * stretch of the page can mean "not recorded" rather than "not working" — the
  * page says so instead of letting the reader assume.
  */
 export interface CoverageNote {

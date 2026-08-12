@@ -326,7 +326,7 @@ export type ModelBuilder = (request: ModelRequest) => Promise<DashboardModel>;
 /**
  * Views whose payload counts or renders per-MEMORY rows, and therefore pay for
  * one `git rev-list --branches` per repo. Deliberately not `standup`: its
- * commit lists — like the stats heatmap and KPI row — report activity, and a
+ * commit lists — like the stats KPI row — report activity, and a
  * commit that has since been squashed away still happened. Only the
  * memory-facing rows are filtered, because a rewritten commit's `memories` row
  * is a DUPLICATE of the surviving one, not a record of separate work.

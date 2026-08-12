@@ -56,6 +56,7 @@ import {
 	resolveProtectNewerThanMs,
 	type SotImportResult,
 } from "./SotImport.js";
+import { forgetRollupDays } from "./StatsRollup.js";
 import { applyToDb, pruneProjectedEvents } from "./StatsWriter.js"; // recordRepoGraph parked — see SotSchema
 
 const log = createLogger("DbBackfill");
@@ -306,11 +307,42 @@ export function pruneUnreachableCommits(
 		.filter((hash) => !reachable.has(hash))
 		.map((hash) => ({ hash }));
 	if (stale.length === 0) return 0;
+	// Read before deleting: the cached day a commit contributed to is derived
+	// from its own timestamp, and once the row is gone there is nothing left to
+	// ask. Staleness is otherwise detected from write stamps, which a deletion
+	// leaves none of — so this is the one direction the cache has to be told
+	// about rather than being able to work out.
+	const staleDays = db
+		.prepare(
+			`SELECT committed_at_ms FROM commits
+			  WHERE repo_id = (SELECT id FROM repos WHERE repo_identity = ?)
+			    AND hash IN (${stale.map(() => "?").join(", ")})`,
+		)
+		.all(repoIdentity, ...stale.map((row) => row.hash)) as ReadonlyArray<{ committed_at_ms: number }>;
+	// The commit rows are gone, but their memories survive (a rewritten commit's
+	// row is a DUPLICATE of the surviving one, kept by design), and the memory
+	// axes bucket those by `COALESCE(committed_at_ms, commit_date_ms)`. With the
+	// commit deleted the bucket falls back to `commit_date_ms` — which can land
+	// on a DIFFERENT day than the pruned commit's — so that day's cache must be
+	// forgotten too, or the memory's contribution silently vanishes from it
+	// until some unrelated write rebuilds it.
+	const orphanedMemoryDays = db
+		.prepare(
+			`SELECT m.commit_date_ms AS at_ms FROM memories m
+			  WHERE m.repo_id = (SELECT id FROM repos WHERE repo_identity = ?)
+			    AND m.commit_hash IN (${stale.map(() => "?").join(", ")})
+			    AND m.commit_date_ms IS NOT NULL`,
+		)
+		.all(repoIdentity, ...stale.map((row) => row.hash)) as ReadonlyArray<{ at_ms: number }>;
 	const remove = db.prepare(
 		"DELETE FROM commits WHERE repo_id = (SELECT id FROM repos WHERE repo_identity = ?) AND hash = ?",
 	);
 	inTransaction(db, () => {
 		for (const row of stale) remove.run(repoIdentity, row.hash);
+		forgetRollupDays(db, [
+			...staleDays.map((row) => row.committed_at_ms),
+			...orphanedMemoryDays.map((row) => row.at_ms),
+		]);
 	});
 	log.info("pruned %d unreachable commits for %s", stale.length, repoIdentity);
 	return stale.length;

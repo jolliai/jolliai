@@ -55,6 +55,7 @@ import type { CommitSummary, FileWrite, StoredTranscript, SummaryIndex } from ".
 import { type DashboardDbHandle, inTransaction } from "./DashboardDb.js";
 import { commitDateMs, markdownTitle, remountRepo, reportOffTypeNumerics, tryParse } from "./SotImport.js";
 import { REORDER_OFFSET } from "./SotSchema.js";
+import { forgetRollupDays } from "./StatsRollup.js";
 
 const log = createLogger("SotWrite");
 
@@ -252,11 +253,26 @@ function branchFromMemories(db: DashboardDbHandle, repoId: number, key: string):
 
 /** Lands node deletes, upserts, repositioning, re-grounding and remount. */
 function landSummaries(db: DashboardDbHandle, repoId: number, c: Classified, nowMs: number): void {
+	// Collected before the deletes, because a deleted row cannot tell anyone
+	// which cached day it used to contribute to, and a deletion leaves no write
+	// stamp for the rollup's staleness check to find. This is the one direction
+	// the cache must be told about; everything else it works out for itself.
+	const deletedDays: number[] = [];
 	for (const hash of c.summaryDeletes) {
+		const row = db
+			.prepare(
+				`SELECT COALESCE(c.committed_at_ms, m.commit_date_ms) AS at_ms
+				   FROM memories m
+				   LEFT JOIN commits c ON c.repo_id = m.repo_id AND c.hash = m.commit_hash
+				  WHERE m.repo_id = ? AND m.commit_hash = ?`,
+			)
+			.get(repoId, hash) as { at_ms: number | null } | undefined;
+		if (row?.at_ms != null) deletedDays.push(row.at_ms);
 		// The self-FK cascades: deleting a node takes its stored subtree with it,
 		// which is the plan's "pruning is a whole-tree decision".
 		db.prepare("DELETE FROM memories WHERE repo_id = ? AND commit_hash = ?").run(repoId, hash);
 	}
+	forgetRollupDays(db, deletedDays);
 	if (c.summaryTrees.length === 0) return;
 
 	// Phase 1 of the sibling reorder: every parent whose child SET this batch

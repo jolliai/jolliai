@@ -271,6 +271,279 @@ describe("buildDashboardModel", () => {
 		);
 	}
 
+	// The fix this whole change exists for. Before per-response rows, one
+	// conversation carried a single timestamp, so a session opened yesterday and
+	// continued today reported ZERO yesterday and everything today.
+	it("splits a cross-day session across the days its responses happened on", async () => {
+		const dayAgo = nowMs - 26 * 3_600_000;
+		await applySummaryEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w",
+						enabledAt: "t",
+					},
+				},
+				session({
+					sessionId: "spanning",
+					updatedAtMs: nowMs,
+					models: [
+						{
+							model: "claude-opus-4-8",
+							provider: "anthropic",
+							inputTokens: 300,
+							outputTokens: 0,
+							cachedTokens: 0,
+							estCostUsd: 3,
+						},
+					],
+					usageEvents: [
+						{
+							respondedAtMs: dayAgo,
+							model: "claude-opus-4-8",
+							input: 100,
+							output: 0,
+							cached: 0,
+							estCostUsd: 1,
+							dedupKey: "a",
+						},
+						{
+							respondedAtMs: nowMs,
+							model: "claude-opus-4-8",
+							input: 200,
+							output: 0,
+							cached: 0,
+							estCostUsd: 2,
+							dedupKey: "b",
+						},
+					],
+				}),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					dimension: "model",
+					range: "month",
+				}),
+			{ dbPath },
+		);
+
+		const withTokens = (model.stats?.series ?? []).filter((p) => (p.tokens ?? 0) > 0);
+		// Two days, not one — and each carries only what happened on it.
+		expect(withTokens.map((p) => p.tokens)).toEqual([100, 200]);
+	});
+
+	// Same defect, same fix, different card: "Where your tokens went" is a
+	// per-day figure too, and it was reading the session's single timestamp.
+	it("splits the daily token breakdown across the days the responses happened on", async () => {
+		const dayAgo = nowMs - 26 * 3_600_000;
+		await applySummaryEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w",
+						enabledAt: "t",
+					},
+				},
+				session({
+					sessionId: "spanning-2",
+					updatedAtMs: nowMs,
+					models: [
+						{
+							model: "claude-opus-4-8",
+							provider: "anthropic",
+							inputTokens: 300,
+							outputTokens: 0,
+							cachedTokens: 0,
+							estCostUsd: 3,
+						},
+					],
+					usageEvents: [
+						{
+							respondedAtMs: dayAgo,
+							model: "claude-opus-4-8",
+							input: 100,
+							output: 0,
+							cached: 0,
+							dedupKey: "a",
+						},
+						{
+							respondedAtMs: nowMs,
+							model: "claude-opus-4-8",
+							input: 200,
+							output: 0,
+							cached: 0,
+							dedupKey: "b",
+						},
+					],
+				}),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					dimension: "model",
+					range: "month",
+				}),
+			{ dbPath },
+		);
+
+		const days = (model.stats?.tokenBreakdown.perDay ?? []).filter((d) => d.input > 0);
+		expect(days.map((d) => d.input)).toEqual([100, 200]);
+	});
+
+	// The half of that fix the charts alone could not carry: the KPI row and the
+	// token card's own legend were still summing `sessions` rows, which place a
+	// whole conversation on its last-active day. A window that ends BEFORE that
+	// day is where the two clocks separate visibly — and the renderer turns a
+	// zero legend into "No token data yet", so a day of real bars disappeared
+	// behind an empty-state that blames the agent for not reporting tokens.
+	it("keeps the KPI row and the token legend on the same clock as the bars", async () => {
+		const dayAgo = nowMs - 26 * 3_600_000; // Jul 29, one day before `updatedAtMs`
+		await applySummaryEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w",
+						enabledAt: "t",
+					},
+				},
+				session({
+					sessionId: "spanning-3",
+					// Last active on Jul 30, so this row is invisible to a Jul 29 window.
+					updatedAtMs: nowMs,
+					models: [
+						{
+							model: "claude-opus-4-8",
+							provider: "anthropic",
+							inputTokens: 300,
+							outputTokens: 0,
+							cachedTokens: 0,
+							estCostUsd: 3,
+						},
+					],
+					usageEvents: [
+						{
+							respondedAtMs: dayAgo,
+							model: "claude-opus-4-8",
+							input: 100,
+							output: 0,
+							cached: 0,
+							estCostUsd: 1,
+							dedupKey: "a",
+						},
+						{
+							respondedAtMs: nowMs,
+							model: "claude-opus-4-8",
+							input: 200,
+							output: 0,
+							cached: 0,
+							estCostUsd: 2,
+							dedupKey: "b",
+						},
+					],
+				}),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					dimension: "model",
+					range: "custom",
+					customFrom: "2026-07-29",
+					customTo: "2026-07-29",
+				}),
+			{ dbPath },
+		);
+		const stats = model.stats;
+		if (!stats) throw new Error("stats missing");
+
+		// Only the Jul 29 response counts — not the whole session, and not zero.
+		expect(stats.tokenBreakdown).toMatchObject({ input: 100, output: 0, cached: 0 });
+		expect(stats.kpis.find((k) => k.key === "tokens")?.value).toBe("100");
+		expect(stats.kpis.find((k) => k.key === "cost")?.value).toBe("$1.00");
+		// The invariant behind all of the above, stated on its own so a future
+		// change that re-splits the two sources fails here rather than in a
+		// screenshot: the legend IS the bars' total.
+		const perDay = stats.tokenBreakdown.perDay;
+		expect(perDay.reduce((sum, d) => sum + d.input + d.output + d.cached, 0)).toBe(
+			stats.tokenBreakdown.input + stats.tokenBreakdown.output + stats.tokenBreakdown.cached,
+		);
+		// The session itself is still a session on its own clock — this window
+		// contains none, which is a different question from what was spent in it.
+		expect(stats.kpis.find((k) => k.key === "sessions")?.value).toBe("0");
+	});
+
+	// Everything but Claude reports no per-response usage, so those sessions keep
+	// being placed by their session-level timestamp. The two paths must not
+	// double-count: a session contributes its events OR its total, never both.
+	it("still places a session with no per-response rows on its last-active day", async () => {
+		await applySummaryEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w",
+						enabledAt: "t",
+					},
+				},
+				session({ sessionId: "no-events", updatedAtMs: nowMs, source: "cursor" }),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					dimension: "model",
+					range: "month",
+				}),
+			{ dbPath },
+		);
+
+		const withTokens = (model.stats?.series ?? []).filter((p) => (p.tokens ?? 0) > 0);
+		expect(withTokens).toHaveLength(1);
+		expect(withTokens[0]?.tokens).toBe(1600);
+	});
+
 	it("serves every group-by axis, and falls back to model for memory-only axes at tier 0", async () => {
 		await seed();
 		const axis = async (dimension: "model" | "agent" | "project" | "branch" | "ticket" | "category") =>
@@ -335,13 +608,9 @@ describe("buildDashboardModel", () => {
 		const month = await forRange("month");
 		expect(month.stats?.kpis.find((k) => k.key === "sessions")?.value).toBe("3");
 		expect(month.stats?.series).toHaveLength(30);
-
-		// The heatmap is deliberately NOT range-scoped — it is the 12-week long view.
-		expect(today.stats?.heatmap).toHaveLength(84);
-		expect(month.stats?.heatmap).toHaveLength(84);
 	});
 
-	it("assembles the stats view with KPIs, heatmap, hours and recent sessions", async () => {
+	it("assembles the stats view with KPIs, series and recent sessions", async () => {
 		await seed();
 		const model = await withDashboardDb(
 			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
@@ -392,20 +661,6 @@ describe("buildDashboardModel", () => {
 		expect(stats.seriesKeys).toEqual(["claude-opus-4-8"]);
 		const today = stats.series[stats.series.length - 1];
 		expect(today.bySeries["claude-opus-4-8"]).toBe(1600);
-
-		// Heatmap: 84 days; the commit-only day counts commits, not sessions.
-		expect(stats.heatmap).toHaveLength(84);
-		const commitDay = stats.heatmap.find((c) => c.date === "2026-07-29");
-		expect(commitDay).toMatchObject({ sessions: 1, commits: 1 }); // yesterday-1 session + commit
-
-		// Hours histogram covers 0..23 and counts window sessions.
-		expect(stats.hours).toHaveLength(24);
-		expect(stats.hours.reduce((sum, h) => sum + h.sessions, 0)).toBe(3);
-
-		// Fun stats: the 90-minute session is legendary.
-		expect(stats.fun.legendarySessionMinutes).toBe(90);
-		expect(stats.fun.legendarySessionTitle).toBe("Fix bug");
-		expect(stats.fun.biggestDayTokens).toBeGreaterThan(0);
 
 		// Recent sessions, newest first, with live flag from recency.
 		expect(stats.recentSessions[0]).toMatchObject({ sessionId: "today-1", repoName: "jolli", isLive: false });
@@ -534,7 +789,7 @@ describe("buildDashboardModel", () => {
 		expect(scoped.repos).toHaveLength(2); // the selector still lists every repo
 	});
 
-	it("renders sensibly from an empty database — zero KPIs, empty fun stats, no series keys", async () => {
+	it("renders sensibly from an empty database — zero KPIs, no series keys", async () => {
 		await applySummaryEvents([], { producerKind: "cli", dbPath }); // create schema only
 		const model = await withDashboardDb(
 			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
@@ -545,9 +800,6 @@ describe("buildDashboardModel", () => {
 		expect(stats.kpis.find((k) => k.key === "sessions")?.value).toBe("0");
 		expect(stats.kpis.find((k) => k.key === "cached")?.value).toBe("—");
 		expect(stats.seriesKeys).toEqual([]);
-		expect(stats.fun).toMatchObject({ legendarySessionMinutes: 0, biggestDayTokens: 0, nightOwlSharePct: 0 });
-		expect(stats.fun.legendarySessionTitle).toBeUndefined();
-		expect(stats.fun.biggestDayDate).toBeUndefined();
 	});
 
 	it("fills row-level fallbacks: untitled sessions, commits without stats, detached worktrees", async () => {
@@ -756,9 +1008,6 @@ describe("buildDashboardModel", () => {
 			// The feed follows the range, so it shows the window's session — not
 			// whatever happens to be most recent overall.
 			expect(old.recentSessions.map((s) => s.title)).toEqual(["Old work"]);
-			// The heatmap keeps its own span regardless, and stays empty here.
-			expect(old.heatmap).toHaveLength(84);
-			expect(old.heatmap.every((cell) => cell.sessions === 0)).toBe(true);
 		});
 	});
 });

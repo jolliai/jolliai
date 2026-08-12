@@ -938,6 +938,85 @@ describe("TranscriptReader", () => {
 		});
 	});
 
+	describe("usageEvents — one record per response, with its own instant", () => {
+		// The whole point of the per-call record: a conversation that spans days
+		// must contribute to each of those days, not to whichever one it was last
+		// touched on. Everything downstream is a GROUP BY over these.
+		it("dates each response by its own line, not by the session", async () => {
+			const filePath = join(tempDir, "claude-spanning.jsonl");
+			const lines = [
+				JSON.stringify({
+					message: { role: "assistant", id: "msg_a", model: "claude-opus-5", content: [] },
+					usage: { input_tokens: 100, output_tokens: 10 },
+					timestamp: "2026-03-01T10:00:00Z",
+				}),
+				JSON.stringify({
+					message: { role: "assistant", id: "msg_b", model: "claude-opus-5", content: [] },
+					usage: { input_tokens: 200, output_tokens: 20 },
+					timestamp: "2026-03-03T09:00:00Z",
+				}),
+			];
+			await writeFile(filePath, lines.join("\n"), "utf-8");
+
+			const result = await readTranscript(filePath);
+			expect(result.usageEvents).toHaveLength(2);
+			expect(result.usageEvents?.[0]).toEqual({
+				respondedAtMs: Date.parse("2026-03-01T10:00:00Z"),
+				model: "claude-opus-5",
+				input: 100,
+				output: 10,
+				cached: 0,
+				dedupKey: "msg_a",
+			});
+			expect(result.usageEvents?.[1]?.respondedAtMs).toBe(Date.parse("2026-03-03T09:00:00Z"));
+			// The session-level totals still cover both, unchanged.
+			expect(result.usageTokens).toBe(330);
+		});
+
+		it("counts one response once even when it spans several block lines", async () => {
+			const filePath = join(tempDir, "claude-blocks.jsonl");
+			const block = (text: string) =>
+				JSON.stringify({
+					message: {
+						role: "assistant",
+						id: "msg_same",
+						model: "claude-opus-5",
+						content: [{ type: "text", text }],
+					},
+					usage: { input_tokens: 50, output_tokens: 5 },
+					timestamp: "2026-03-01T10:00:00Z",
+				});
+			await writeFile(filePath, [block("a"), block("b"), block("c")].join("\n"), "utf-8");
+
+			const result = await readTranscript(filePath);
+			// One response, not three — the same dedup identity the totals use.
+			expect(result.usageEvents).toHaveLength(1);
+			expect(result.usageTokens).toBe(55);
+		});
+
+		// A wrong day is worse than a missing one: these rows are what a per-day
+		// figure is built from. The totals still count it, so the two disagree by
+		// exactly what could not be dated.
+		it("drops an undatable response from the events while still counting its tokens", async () => {
+			const filePath = join(tempDir, "claude-undated.jsonl");
+			await writeFile(
+				filePath,
+				JSON.stringify({
+					message: { role: "assistant", id: "msg_x", model: "claude-opus-5", content: [] },
+					usage: { input_tokens: 9, output_tokens: 1 },
+				}),
+				"utf-8",
+			);
+
+			const result = await readTranscript(filePath);
+			// Present-but-empty: this source can report usage, so a downstream
+			// consumer may CLEAR rows an earlier read left behind — `undefined`
+			// is reserved for sources that cannot report usage at all.
+			expect(result.usageEvents).toEqual([]);
+			expect(result.usageTokens).toBe(10);
+		});
+	});
+
 	describe("usageTokens accumulation", () => {
 		it("accumulates per-turn token usage from Claude transcript", async () => {
 			const filePath = join(tempDir, "claude-usage.jsonl");

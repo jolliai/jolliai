@@ -24,6 +24,7 @@ import { createLogger } from "../Logger.js";
 import type {
 	ConversationTokenBreakdown,
 	ModelTokenUsage,
+	SessionUsageEvent,
 	ToolCallCount,
 	TranscriptCursor,
 	TranscriptEntry,
@@ -129,23 +130,40 @@ export async function readTranscript(
 	// commit boundary — closing it fully means persisting the last counted id in
 	// the cursor, which is not worth the schema change at that magnitude.
 	const countedUsageKeys = new Set<string>();
+	// One entry per counted response, each with its own instant. Built in the same
+	// pass as the totals above rather than by a second scan: a separate pass would
+	// be a second place that decides what "a counted response" means, and it would
+	// have to re-resolve the same timestamps.
+	const usageEvents: SessionUsageEvent[] = [];
+
+	// The entry's own timestamp, else the parser's raw-line one.
+	//
+	// ⚠ Called only where the answer is actually used, never once per line up
+	// front. `ClaudeTranscriptParser.parseTimestamp` is a whole-line `JSON.parse`,
+	// this loop runs over every line of every transcript, and the collector re-reads
+	// each transcript WHOLE on every tick — so the fallback is charged only to the
+	// lines the cutoff or a usage event asks about, not to the entry-less lines
+	// (tool-only turns, meta records) that neither will look at. Hoisted rather
+	// than closed over `i` so resolving costs a call and not an allocation per line.
+	const timestampOf = (entry: TranscriptEntry | null, index: number): string | undefined =>
+		entry?.timestamp ?? activeParser.parseTimestamp?.(newLines[index], startLine + index);
 
 	for (let i = 0; i < newLines.length; i++) {
 		const lineNum = startLine + i;
 		const entry = parseFn(newLines[i], lineNum);
+		// Resolved here only when there IS a cutoff; reused below so a line that
+		// needs it for both purposes still pays once.
+		const cutoffTimestamp = cutoffTime ? timestampOf(entry, i) : undefined;
+
 		// Apply the time cutoff per LINE, not only per produced entry. A tool-only
 		// assistant turn yields no entry (extractContent keeps only text) yet carries
 		// a real timestamp and usage; gating only on entry-bearing lines let such a
 		// turn past the cutoff still have its tokens summed here and the cursor
 		// advanced over it, so the commit that owns it could never read those tokens.
-		// Falls back to the entry timestamp, then the parser's raw-line timestamp.
 		// Lines with no resolvable timestamp are conservatively included (they were
 		// written before the next timestamped line, so they belong to this window).
-		if (cutoffTime) {
-			const lineTimestamp = entry?.timestamp ?? activeParser.parseTimestamp?.(newLines[i], lineNum);
-			if (lineTimestamp && new Date(lineTimestamp).getTime() > cutoffTime) {
-				break; // Remaining lines (this one included) belong to a later commit
-			}
+		if (cutoffTime && cutoffTimestamp && new Date(cutoffTimestamp).getTime() > cutoffTime) {
+			break; // Remaining lines (this one included) belong to a later commit
 		}
 		if (entry) {
 			rawEntries.push(entry);
@@ -159,6 +177,24 @@ export async function readTranscript(
 			usageInput += usage.input;
 			usageOutput += usage.output;
 			usageCached += usage.cached;
+			// Same response, now with its instant. A line the parser cannot date is
+			// DROPPED from the events rather than dated by guesswork: these rows are
+			// what a per-day figure is built from, and a wrong day is worse than a
+			// missing one. It still counts toward the totals above, so the session's
+			// own numbers stay whole — the two disagree only by what could not be
+			// dated, which is what `token_coverage` is for.
+			const lineTimestamp = cutoffTime ? cutoffTimestamp : timestampOf(entry, i);
+			const respondedAtMs = lineTimestamp ? new Date(lineTimestamp).getTime() : Number.NaN;
+			if (Number.isFinite(respondedAtMs)) {
+				usageEvents.push({
+					respondedAtMs,
+					model: usage.model ?? "",
+					input: usage.input,
+					output: usage.output,
+					cached: usage.cached,
+					...(usage.dedupKey && { dedupKey: usage.dedupKey }),
+				});
+			}
 		}
 		// Only advance cursor for lines we actually processed (not past the break point)
 		lastConsumedLineIndex = startLine + i + 1;
@@ -192,6 +228,13 @@ export async function readTranscript(
 		usageTokens: usageInput + usageOutput + usageCached,
 		usageBreakdown: { input: usageInput, output: usageOutput, cached: usageCached },
 		...(usageByModel && usageByModel.length > 0 && { usageByModel }),
+		// Present-but-empty when this source's parser can report usage at all: a
+		// re-read that sees no datable responses must be able to CLEAR rows a
+		// better read left behind (agents compact and rewrite their transcripts),
+		// and `undefined` — the one thing a consumer can distinguish from an
+		// empty set — is what "this source records none" means. Only the Claude
+		// parser defines `parseUsageTokens` today.
+		...(activeParser.parseUsageTokens ? { usageEvents } : {}),
 		// Kept even when empty: an empty array is the positive fact "this slice
 		// called no tools", which absence cannot express.
 		...(toolUse && { toolUse }),

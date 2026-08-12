@@ -1,0 +1,135 @@
+/**
+ * Local-calendar arithmetic, DST-safe.
+ *
+ * Its own module because the day-bucketing rules now have two callers that must
+ * not import each other: the read path in {@link ./DashboardQuery.ts} and the
+ * rollup builder in {@link ./StatsRollup.ts}, which runs on the WRITE side and
+ * is reached from `StatsWriter` — while `DashboardQuery` already imports
+ * `StatsWriter`. Leaving these here rather than in either of them is what keeps
+ * that from becoming a cycle.
+ *
+ * A cached day and a live day must agree on where a boundary falls to the
+ * millisecond, so both sides deriving their days from THIS code is not tidiness
+ * — a second implementation would disagree exactly on the DST days these
+ * functions exist to get right, and disagree silently.
+ */
+
+/** Shape of a local calendar day key, `YYYY-MM-DD`. */
+const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** The machine's IANA zone — the default for every query. */
+export function machineTimeZone(): string {
+	return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
+interface ZonedParts {
+	readonly year: number;
+	readonly month: number;
+	readonly day: number;
+	readonly hour: number;
+	readonly minute: number;
+}
+
+const partsFormatterCache = new Map<string, Intl.DateTimeFormat>();
+
+function partsFormatter(timeZone: string): Intl.DateTimeFormat {
+	let formatter = partsFormatterCache.get(timeZone);
+	if (!formatter) {
+		formatter = new Intl.DateTimeFormat("en-CA", {
+			timeZone,
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit",
+			hour: "2-digit",
+			minute: "2-digit",
+			hourCycle: "h23",
+		});
+		partsFormatterCache.set(timeZone, formatter);
+	}
+	return formatter;
+}
+
+/** Wall-clock components of `ms` in `timeZone`. */
+function zonedParts(ms: number, timeZone: string): ZonedParts {
+	const parts = partsFormatter(timeZone).formatToParts(ms);
+	const get = (type: string) => Number.parseInt(parts.find((p) => p.type === type)?.value ?? "0", 10);
+	return { year: get("year"), month: get("month"), day: get("day"), hour: get("hour"), minute: get("minute") };
+}
+
+/** Local calendar day of `ms` as `YYYY-MM-DD`. */
+export function localDayKey(ms: number, timeZone: string): string {
+	const p = zonedParts(ms, timeZone);
+	return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
+}
+
+/** Local hour (0–23) of `ms`. */
+export function localHour(ms: number, timeZone: string): number {
+	return zonedParts(ms, timeZone).hour;
+}
+
+/**
+ * Epoch-ms of local midnight at the start of the day containing `ms`.
+ *
+ * `Intl` can only map epoch → wall clock; this inverts it by guessing the UTC
+ * value of the wall-clock midnight and correcting by the observed error. Two
+ * iterations settle every real zone including DST transitions: the first
+ * correction lands within the zone's offset step, the second removes any
+ * residue from a transition between guess and target. (On a "spring forward"
+ * day where 00:00 does not exist, this lands on the earliest existing instant
+ * of the day — exactly what a day boundary should be.)
+ */
+function localMidnight(year: number, month: number, day: number, timeZone: string): number {
+	let guess = Date.UTC(year, month - 1, day);
+	for (let i = 0; i < 3; i++) {
+		const seen = zonedParts(guess, timeZone);
+		const error =
+			Date.UTC(seen.year, seen.month - 1, seen.day, seen.hour, seen.minute) - Date.UTC(year, month - 1, day);
+		if (error === 0) break;
+		guess -= error;
+	}
+	return guess;
+}
+
+export function startOfLocalDay(ms: number, timeZone: string): number {
+	const target = zonedParts(ms, timeZone);
+	return localMidnight(target.year, target.month, target.day, timeZone);
+}
+
+/**
+ * Epoch-ms of local midnight starting the day `key` (`YYYY-MM-DD`) names, or
+ * `undefined` when `key` is not a real local day.
+ *
+ * The round-trip check is the validation: `Date.UTC` happily normalises
+ * 2026-02-31 into March 3rd, so a request for a day that does not exist would
+ * otherwise silently return data for a different one. Comparing the resolved
+ * instant's own day key against the input rejects exactly that case — and
+ * costs nothing on the overwhelmingly common valid input.
+ */
+export function dayKeyToMidnight(key: string, timeZone: string): number | undefined {
+	if (!DAY_KEY_RE.test(key)) return undefined;
+	const ms = localMidnight(
+		Number.parseInt(key.slice(0, 4), 10),
+		Number.parseInt(key.slice(5, 7), 10),
+		Number.parseInt(key.slice(8, 10), 10),
+		timeZone,
+	);
+	return localDayKey(ms, timeZone) === key ? ms : undefined;
+}
+
+/**
+ * Start of the local day `n` days after the day containing `ms`. Steps through
+ * midday rather than adding exact 24 h multiples, so 23- and 25-hour DST days
+ * cannot skip or repeat a day.
+ */
+export function addLocalDays(ms: number, days: number, timeZone: string): number {
+	let cursor = startOfLocalDay(ms, timeZone);
+	const step = days >= 0 ? 1 : -1;
+	for (let i = 0; i !== days; i += step) {
+		// ±24 h from midnight, then +12 h INTO the target day: lands mid-day in
+		// the neighbouring day whether it is 23, 24 or 25 hours long, and
+		// startOfLocalDay snaps back to its midnight. (A ±36 h jump would
+		// overshoot a whole day when stepping backwards.)
+		cursor = startOfLocalDay(cursor + step * 86_400_000 + 43_200_000, timeZone);
+	}
+	return cursor;
+}

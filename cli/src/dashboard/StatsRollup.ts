@@ -1,0 +1,449 @@
+/**
+ * The per-day cache in front of the spend axes and the token split.
+ *
+ * Two halves that must agree: {@link buildRollup} runs on the WRITE side and
+ * settles days into `stats_daily`; {@link readAvailableDays} and
+ * {@link readRollupSeries} run on the read side and use a settled day instead
+ * of recomputing it. Both derive their numbers from {@link ./StatsSeries.ts}
+ * and their day boundaries from {@link ./LocalDays.ts}, which is what makes a
+ * cached day and a live day the same number rather than two numbers that
+ * happen to match.
+ *
+ * ⚠ The cache is never authoritative. Every function here may answer "not
+ * available" and the caller must be able to compute the day itself; deleting
+ * every row changes only how long a page takes. That property is the whole
+ * safety argument, and it is easy to lose by storing something here that the
+ * sources can no longer produce.
+ *
+ * # How a day expires
+ *
+ * By asking the sources, not by being told. Each day carries the instant it was
+ * built, and every table an axis reads carries the instant its rows were last
+ * written; a day is stale when any source row belonging to it was written after
+ * that. The alternative — writers recording "this day changed" as they go —
+ * fails the way a ledger fails: one write path that forgets to record leaves a
+ * permanently wrong number that nothing detects. A new write path here is
+ * visible the moment it lands, because the rows it writes carry stamps.
+ *
+ * The one thing the sources cannot report is a DELETE — a removed row leaves no
+ * stamp behind. That gap is closed from the other side, by deleting the day's
+ * cached rows whenever source rows are deleted: a day with no rows is a day
+ * that was never computed, which already falls back to computing it. Over-
+ * rebuilding is the failure mode there, and it is self-correcting.
+ */
+
+import { createLogger, errMsg } from "../Logger.js";
+import type { DashboardDbHandle } from "./DashboardDb.js";
+import { inTransaction } from "./DashboardDb.js";
+import type { DashboardScope } from "./DashboardModel.js";
+import { scopeFilter, scopeToRepoId } from "./DashboardScopeUtil.js";
+import { addLocalDays, dayKeyToMidnight, localDayKey, machineTimeZone, startOfLocalDay } from "./LocalDays.js";
+import { type AxisRow, readAxisRows, readDatedUsage } from "./StatsSeries.js";
+
+const log = createLogger("StatsRollup");
+
+/** The spend axes, every one of them cacheable. */
+export const ROLLUP_AXES = ["model", "agent", "project", "branch", "ticket", "category"] as const;
+
+/** `kind` of the row that records a day was computed. See the DDL. */
+export const BUILT_KIND = "built";
+
+/** `kind` of the "Where your tokens went" split. */
+export const TOKENS_KIND = "tokens";
+
+/** `series_key`s under {@link TOKENS_KIND}. */
+export const TOKEN_SERIES = ["input", "output", "cached"] as const;
+
+export type TokenSeries = (typeof TOKEN_SERIES)[number];
+
+/**
+ * Every `kind` this table stores.
+ *
+ * The axis names come from the dimension union and the other two are invented
+ * here, so they share one namespace and must not collide — `ROLLUP_KINDS` is
+ * pinned by a test against `SeriesDimension` for exactly that reason. A new
+ * dimension called `tokens` would otherwise read a day's token split as if it
+ * were an axis, silently.
+ */
+export const ROLLUP_KINDS = [...ROLLUP_AXES, TOKENS_KIND, BUILT_KIND] as const;
+
+/**
+ * How far back a day is worth caching.
+ *
+ * Not a correctness bound — an older day simply computes live, exactly as every
+ * day does today. It bounds the work the staleness scan and the build loop can
+ * ever do, so that a machine with years of history does not pay for a range
+ * nobody opens. The stock ranges (7 / 14 / 30 days) sit well inside it.
+ */
+export const ROLLUP_HORIZON_DAYS = 90;
+
+/**
+ * Days one call may settle.
+ *
+ * ⚠ This runs inside the writer's lock, on a path an editor's periodic scan
+ * reaches, and that caller waits a few hundred milliseconds for the lock at
+ * most. Falling behind costs a slower page; holding the lock costs a dropped
+ * write. So the budget is deliberately small and the backlog drains across
+ * calls — there is always another call.
+ */
+export const ROLLUP_MAX_DAYS_PER_BUILD = 14;
+
+/** Sentinel `repo_id`: the day, rather than any one repo. Real ids start at 1. */
+const SENTINEL_REPO_ID = 0;
+
+interface StaleSourceRow {
+	readonly repo_id: number;
+	readonly at_ms: number;
+	readonly w: number;
+}
+
+/**
+ * Every source row written after `sinceMs`, with the instant that decides which
+ * day it belongs to.
+ *
+ * One query per side rather than one per axis: the four session-backed axes and
+ * the token split all read the same two tables, and the three memory-backed
+ * ones all read the same two. Both are filtered on the write stamp, so a caught-
+ * up machine reads nothing.
+ */
+function readSourcesWrittenSince(db: DashboardDbHandle, sinceMs: number): ReadonlyArray<StaleSourceRow> {
+	const sessionSide = db
+		.prepare(
+			`SELECT s.repo_id, e.responded_at_ms AS at_ms, e.updated_at_ms AS w
+			   FROM session_usage_events e JOIN sessions s ON s.event_id = e.session_event_id
+			  WHERE e.updated_at_ms > ?
+			 UNION ALL
+			SELECT s.repo_id, s.updated_at_ms AS at_ms, s.written_at_ms AS w
+			   FROM sessions s WHERE s.written_at_ms > ?`,
+		)
+		.all(sinceMs, sinceMs) as StaleSourceRow[];
+	// The memory side dates a row exactly as the `category` axis does, through
+	// the commit when there is one. Dating it by `commit_date_ms` alone would
+	// mark the wrong day stale whenever the two disagree — leaving the day that
+	// really changed serving its old numbers.
+	const memorySide = db
+		.prepare(
+			`SELECT m.repo_id, COALESCE(c.committed_at_ms, m.commit_date_ms) AS at_ms, m.written_at_ms AS w
+			   FROM memories m
+			   LEFT JOIN commits c ON c.repo_id = m.repo_id AND c.hash = m.commit_hash
+			  WHERE m.written_at_ms > ?
+			 UNION ALL
+			SELECT c.repo_id, c.committed_at_ms AS at_ms, c.written_at_ms AS w
+			   FROM commits c WHERE c.written_at_ms > ?`,
+		)
+		.all(sinceMs, sinceMs) as StaleSourceRow[];
+	return [...sessionSide, ...memorySide];
+}
+
+/** `day -> built_at_ms` for every settled day in `[fromDay, toDay]`. */
+function readSentinels(db: DashboardDbHandle, timeZone: string, fromDay: string, toDay: string): Map<string, number> {
+	const rows = db
+		.prepare(
+			`SELECT day, built_at_ms FROM stats_daily
+			  WHERE tz = ? AND kind = ? AND repo_id = ? AND day >= ? AND day <= ?`,
+		)
+		.all(timeZone, BUILT_KIND, SENTINEL_REPO_ID, fromDay, toDay) as ReadonlyArray<{
+		day: string;
+		built_at_ms: number;
+	}>;
+	return new Map(rows.map((r) => [r.day, r.built_at_ms]));
+}
+
+/**
+ * Of `days`, the ones whose cached rows may be used as they stand.
+ *
+ * A day qualifies when it has been built and no source row belonging to it has
+ * been written since. `today` never qualifies, whatever the table holds: it is
+ * still accumulating, so a cached copy of it is stale by construction rather
+ * than by accident.
+ *
+ * Days outside the caller's window are ignored, so this is safe to call with a
+ * year of day keys — it just answers "none of them" for the ones past the
+ * horizon, and the caller computes those live.
+ */
+export function readAvailableDays(
+	db: DashboardDbHandle,
+	timeZone: string,
+	days: ReadonlyArray<string>,
+	nowMs: number,
+): ReadonlySet<string> {
+	if (days.length === 0) return new Set();
+	const today = localDayKey(nowMs, timeZone);
+	const candidates = days.filter((d) => d < today).sort();
+	const first = candidates[0];
+	const last = candidates[candidates.length - 1];
+	if (first === undefined || last === undefined) return new Set();
+
+	const sentinels = readSentinels(db, timeZone, first, last);
+	if (sentinels.size === 0) return new Set();
+
+	// Bounded by the OLDEST day in play: a row written before every candidate was
+	// built cannot have invalidated any of them, so it need not be read at all.
+	const oldestBuild = Math.min(...sentinels.values());
+	const available = new Set(sentinels.keys());
+	for (const row of readSourcesWrittenSince(db, oldestBuild)) {
+		const day = localDayKey(row.at_ms, timeZone);
+		const builtAt = sentinels.get(day);
+		if (builtAt !== undefined && row.w > builtAt) available.delete(day);
+	}
+	return available;
+}
+
+/**
+ * How one window splits between cached days and days that must be computed.
+ *
+ * ⚠ `live` is what the caller must FILTER on, not merely a hint about the span:
+ * `liveFromMs`..`liveToMs` is the enclosing range, so a cached day sitting
+ * between two live ones is inside it. A row from such a day would be added on
+ * top of the cached copy already counted — the one way this cache can produce a
+ * number larger than the truth rather than merely staler.
+ */
+export interface DayPlan {
+	/** Every local day the window covers, in order. */
+	readonly dayKeys: ReadonlyArray<string>;
+	readonly cached: ReadonlyArray<string>;
+	readonly live: ReadonlySet<string>;
+	/** Range enclosing every live day; both 0 when none are. */
+	readonly liveFromMs: number;
+	readonly liveToMs: number;
+}
+
+/**
+ * Splits `[fromMs, toMs)` into the days that can be read and the ones that must
+ * be recomputed.
+ *
+ * One scan of the cache per request, shared by every card, so the fallback
+ * decision cannot come out differently for two figures on the same page.
+ */
+export function planDays(
+	db: DashboardDbHandle,
+	timeZone: string,
+	fromMs: number,
+	toMs: number,
+	nowMs: number,
+): DayPlan {
+	const dayKeys: string[] = [];
+	const startByDay = new Map<string, number>();
+	for (let cursor = fromMs; cursor < toMs; cursor = addLocalDays(cursor, 1, timeZone)) {
+		const key = localDayKey(cursor, timeZone);
+		dayKeys.push(key);
+		startByDay.set(key, startOfLocalDay(cursor, timeZone));
+	}
+	const available = readAvailableDays(db, timeZone, dayKeys, nowMs);
+	const live = new Set(dayKeys.filter((d) => !available.has(d)));
+	let liveFromMs = 0;
+	let liveToMs = 0;
+	if (live.size > 0) {
+		const starts = [...live].map((d) => startByDay.get(d) ?? 0);
+		liveFromMs = Math.min(...starts);
+		liveToMs = addLocalDays(Math.max(...starts), 1, timeZone);
+	}
+	return { dayKeys, cached: dayKeys.filter((d) => available.has(d)), live, liveFromMs, liveToMs };
+}
+
+interface RollupRow {
+	readonly day: string;
+	readonly series_key: string;
+	readonly value: number;
+	readonly cost_usd: number;
+}
+
+/**
+ * Cached rows for one kind over `days`, summed across the repos in `scope`.
+ *
+ * Callers must pass only days {@link readAvailableDays} returned; nothing here
+ * re-checks that, because the check needs the whole window at once and doing it
+ * per read would make the fallback decision inconsistent within one page.
+ */
+export function readRollupSeries(
+	db: DashboardDbHandle,
+	timeZone: string,
+	kind: string,
+	days: ReadonlyArray<string>,
+	scope: DashboardScope,
+): ReadonlyArray<RollupRow> {
+	if (days.length === 0) return [];
+	const filter = scopeFilter(scopeToRepoId(db, scope), "repo_id");
+	const placeholders = days.map(() => "?").join(", ");
+	return db
+		.prepare(
+			`SELECT day, series_key, SUM(value) AS value, SUM(cost_usd) AS cost_usd
+			   FROM stats_daily
+			  WHERE tz = ? AND kind = ? AND day IN (${placeholders})${filter.sql}
+			  GROUP BY day, series_key`,
+		)
+		.all(timeZone, kind, ...days, ...filter.params) as RollupRow[];
+}
+
+/** Accumulator key — a repo's contribution to one series on one day. */
+function cellKey(repoId: number, seriesKey: string): string {
+	return `${repoId}\u0000${seriesKey}`;
+}
+
+interface Cell {
+	repoId: number;
+	seriesKey: string;
+	value: number;
+	cost: number;
+}
+
+function accumulate(rows: ReadonlyArray<AxisRow>): Map<string, Cell> {
+	const cells = new Map<string, Cell>();
+	for (const row of rows) {
+		const key = cellKey(row.repo_id, row.key);
+		const cell = cells.get(key);
+		if (cell) {
+			cell.value += row.tokens;
+			cell.cost += row.cost;
+		} else {
+			cells.set(key, { repoId: row.repo_id, seriesKey: row.key, value: row.tokens, cost: row.cost });
+		}
+	}
+	return cells;
+}
+
+/**
+ * Recomputes one day from scratch and replaces its cached rows.
+ *
+ * Whole-day replacement, not an incremental adjustment. Two axes apportion a
+ * commit's spend across its topics or its branches, so an incremental update
+ * would have to compute a difference against a divisor that itself changed —
+ * and an arithmetic slip there accumulates forever with nothing to detect it. A
+ * rebuild is self-correcting: whatever was wrong yesterday is right today.
+ *
+ * The DELETE and the INSERTs share one transaction so a day is never half
+ * updated — one axis refreshed beside another still holding last week's values
+ * would be worse than an uncached day, because it looks computed.
+ */
+function buildDay(db: DashboardDbHandle, timeZone: string, day: string, nowMs: number): void {
+	const startMs = dayKeyToMidnight(day, timeZone);
+	if (startMs === undefined) return;
+	const endMs = addLocalDays(startMs, 1, timeZone);
+	const allRepos: DashboardScope = { kind: "all" };
+
+	const perKind = new Map<string, Map<string, Cell>>();
+	for (const axis of ROLLUP_AXES) {
+		perKind.set(axis, accumulate(readAxisRows(db, allRepos, axis, startMs, endMs)));
+	}
+	const tokenCells = new Map<string, Cell>();
+	for (const row of readDatedUsage(db, allRepos, startMs, endMs)) {
+		const segments: ReadonlyArray<readonly [TokenSeries, number]> = [
+			["input", row.input],
+			["output", row.output],
+			["cached", row.cached],
+		];
+		for (const [seriesKey, amount] of segments) {
+			const key = cellKey(row.repo_id, seriesKey);
+			const cell = tokenCells.get(key);
+			if (cell) cell.value += amount;
+			else tokenCells.set(key, { repoId: row.repo_id, seriesKey, value: amount, cost: 0 });
+		}
+	}
+	perKind.set(TOKENS_KIND, tokenCells);
+
+	inTransaction(db, () => {
+		db.prepare("DELETE FROM stats_daily WHERE tz = ? AND day = ?").run(timeZone, day);
+		const insert = db.prepare(
+			`INSERT INTO stats_daily (repo_id, tz, day, kind, series_key, value, cost_usd, built_at_ms, updated_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		);
+		for (const [kind, cells] of perKind) {
+			for (const cell of cells.values()) {
+				insert.run(cell.repoId, timeZone, day, kind, cell.seriesKey, cell.value, cell.cost, nowMs, nowMs);
+			}
+		}
+		// Last, and inside the same transaction: its presence is what marks the
+		// day usable, so it must not exist without the rows it speaks for.
+		insert.run(SENTINEL_REPO_ID, timeZone, day, BUILT_KIND, "", 0, 0, nowMs, nowMs);
+	});
+}
+
+export interface BuildRollupOptions {
+	readonly now?: () => number;
+	readonly timeZone?: string;
+	readonly maxDays?: number;
+}
+
+/**
+ * Settles up to {@link ROLLUP_MAX_DAYS_PER_BUILD} days, newest first.
+ *
+ * Newest first because that is what a reader opens: the stock ranges all end
+ * today, so the most recent unsettled day is the one a page is about to ask
+ * for. A backlog therefore shortens from the end that matters, and an old gap
+ * that nobody looks at can wait indefinitely without costing anyone a slow
+ * page.
+ *
+ * Returns the number of days settled — for logging and tests; no caller should
+ * branch on it, since zero is the normal steady state.
+ */
+export function buildRollup(db: DashboardDbHandle, opts: BuildRollupOptions = {}): number {
+	const nowMs = (opts.now ?? Date.now)();
+	const timeZone = opts.timeZone ?? machineTimeZone();
+	const budget = opts.maxDays ?? ROLLUP_MAX_DAYS_PER_BUILD;
+	if (budget <= 0) return 0;
+
+	// Yesterday backwards: today is still accumulating and is never cached.
+	const days: string[] = [];
+	let cursor = addLocalDays(startOfLocalDay(nowMs, timeZone), -1, timeZone);
+	for (let i = 0; i < ROLLUP_HORIZON_DAYS; i++) {
+		days.push(localDayKey(cursor, timeZone));
+		cursor = addLocalDays(cursor, -1, timeZone);
+	}
+
+	const available = readAvailableDays(db, timeZone, days, nowMs);
+	const pending = days.filter((d) => !available.has(d)).slice(0, budget);
+	let built = 0;
+	for (const day of pending) {
+		buildDay(db, timeZone, day, nowMs);
+		built++;
+	}
+	if (built > 0) log.debug("settled %d day(s) of stats, %s..%s", built, pending[built - 1], pending[0]);
+	return built;
+}
+
+/**
+ * Forgets the cached days covering `atMs` instants, in every zone.
+ *
+ * The counterpart to staleness-by-write-stamp: a deleted row leaves nothing
+ * behind to notice, so whoever deletes says so here. Every zone, because a
+ * single instant falls on different calendar days in different ones and this
+ * process does not know which zones have cached rows — the table is small and
+ * a day dropped needlessly only costs one recomputation.
+ */
+export function forgetRollupDays(db: DashboardDbHandle, atMs: ReadonlyArray<number>): void {
+	if (atMs.length === 0) return;
+	const zones = db.prepare("SELECT DISTINCT tz FROM stats_daily").all() as ReadonlyArray<{ tz: string }>;
+	if (zones.length === 0) return;
+	const del = db.prepare("DELETE FROM stats_daily WHERE tz = ? AND day = ?");
+	for (const { tz } of zones) {
+		for (const day of new Set(atMs.map((ms) => localDayKey(ms, tz)))) del.run(tz, day);
+	}
+}
+
+/**
+ * Runs {@link buildRollup} as a side effect of a write, swallowing failures.
+ *
+ * The rollup is derived, so a build that throws must not fail the write that
+ * triggered it: the caller's events are already durable and the only cost of
+ * skipping is a slower page.
+ *
+ * ⚠ At `info`, NOT `debug`. The default file threshold is `info`, so a `debug`
+ * line here is written nowhere — which made this the exact failure the note
+ * below warns about, silent in the one place someone would look. `info` reaches
+ * `debug.log` while staying off the terminal in CLI mode (see `createLogger`),
+ * which is what a derived-data miss deserves: recorded, not shown.
+ *
+ * The failure worth catching this way is a STANDING one, and the likeliest is
+ * structural rather than transient: {@link ./DashboardDb.ts}'s `inTransaction`
+ * issues `BEGIN IMMEDIATE`, which SQLite refuses inside an open transaction, so
+ * a caller that ever wraps `applyToDb` in one turns every build here into a
+ * throw. Nothing would break — the page just recomputes every day forever, and
+ * without a line in the log there is nothing to connect that to a cause.
+ */
+export function buildRollupQuietly(db: DashboardDbHandle, opts: BuildRollupOptions = {}): void {
+	try {
+		buildRollup(db, opts);
+	} catch (err) {
+		log.info("stats rollup skipped: %s", errMsg(err));
+	}
+}

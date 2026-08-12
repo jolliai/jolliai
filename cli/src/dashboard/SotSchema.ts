@@ -486,6 +486,128 @@ export const TOOL_CALL_TIME_DDL = `
 ALTER TABLE session_tool_use ADD COLUMN last_call_at_ms INTEGER;
 `;
 
+/**
+ * A per-row "when did WE last write this" stamp on the four activity tables, so
+ * an outbound sync can select exactly the rows that changed since its cursor.
+ *
+ * It exists because **no business time column can answer that question**, and
+ * the counter-example is not hypothetical: `projectCommitSummary`'s `sessions`
+ * upsert updates the token columns, `token_coverage` and `prices_as_of` but
+ * deliberately NOT `updated_at_ms` — enriching a `sessions-only` row into a
+ * `full` one changes what the row says while leaving that column untouched. A
+ * cursor over `updated_at_ms` never sees the enrichment, so the better token
+ * split it just wrote would never leave this machine, and nothing would report
+ * it. That omission is CORRECT on its own terms (`updated_at_ms` means "when
+ * the session was last active", and the only clock that path has is the
+ * commit's, which would also move the session's whole spend into another day) —
+ * which is exactly why the two questions need two columns.
+ *
+ * So: business columns keep their meaning and are never bumped for bookkeeping;
+ * these columns are bumped unconditionally on every write and mean nothing else.
+ *
+ * ⚠ THE NAME IS NOT UNIFORM, and that is a trap worth stating rather than
+ * tidying: `sessions.updated_at_ms` is already taken by the business meaning, so
+ * that table's stamp is `written_at_ms` (matching `memories.written_at_ms`,
+ * which is the same concept) while the other three use `updated_at_ms`. A sync
+ * that assumes one name and writes `WHERE updated_at_ms >= ?` against all four
+ * compiles, runs, and silently reads the WRONG column on `sessions` — back to
+ * the bug above. Readers must go through the per-table map in `SyncColumns.ts`.
+ *
+ * Backfilled from each table's best available approximation (its own business
+ * time, or the parent session's for the two child tables). That is an
+ * approximation, not the real write instant, which is unknowable for rows
+ * already on disk — but it is the right one: it makes the first sync select the
+ * same rows it would have selected by business time.
+ *
+ * ⚠ `NOT NULL DEFAULT 0`, never a bare nullable column, and the reason is the
+ * same failure this whole mechanism exists to prevent. A cursor is spelled
+ * `WHERE <stamp> >= ?`, and SQL's answer for NULL there is NULL — not true — so
+ * a single NULL stamp makes its row invisible to EVERY sync, permanently and
+ * with nothing to notice it. Nullable is not the safe default here: it is the
+ * bug, one level down. 0 says "written before we tracked this", which no cursor
+ * past 0 needs to revisit and which the backfill above then improves wherever a
+ * business time exists. `commits.written_at_ms` is declared the same way for the
+ * same reason.
+ */
+/**
+ * One counted model response: what it cost and WHEN it happened.
+ *
+ * The record every usage and billing system keeps, and the reason it exists here
+ * is that `sessions` cannot answer the question it looks like it answers. That
+ * row holds a whole conversation's cumulative tokens under a single timestamp,
+ * so a conversation spanning three days contributes its ENTIRE spend to whichever
+ * day it was last active — the earlier days read as zero. No care in the query
+ * layer fixes that: the time was discarded before the write.
+ *
+ * With one row per response, "how much did I spend on the 1st" is a plain GROUP
+ * BY, and a session becomes what it always was — a grouping, not a quantity.
+ * `sessions` and `session_model_usage` keep their totals as DERIVED caches so the
+ * KPI stays a scalar scan; both are written from these rows in the same
+ * transaction, so they cannot disagree with the detail.
+ *
+ * Keyed on the response's own identity (`message.id` for Claude), falling back to
+ * `line:<n>` for a source that cannot name one — the transcript is append-only,
+ * so a line number is stable across re-reads and a re-read of the same slice
+ * converges on the same rows instead of doubling them.
+ *
+ * ⚠ NOT every source can fill this. `parseUsageTokens` is optional on
+ * `TranscriptParser` and only the Claude parser implements it today, so sessions
+ * from other sources have no rows here and keep being placed by their
+ * session-level timestamp. `token_coverage` is what tells the two apart; the
+ * dashboard must not present them as the same precision.
+ *
+ * ⚠ Instants, never local days. Bucketing is a READ-time decision because the
+ * timezone is a property of whoever is asking — storing a day would repeat the
+ * mistake this table exists to fix, one level up.
+ */
+export const SESSION_USAGE_EVENTS_DDL = `
+CREATE TABLE session_usage_events (
+  session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE,
+  -- The response's identity, or 'line:<n>' when the source cannot name one.
+  dedup_key        TEXT NOT NULL,
+  -- THIS response's instant. The column the whole table exists for; named for
+  -- what it IS rather than what reads do with it, because those bucket it by a
+  -- timezone the table deliberately does not store.
+  responded_at_ms  INTEGER NOT NULL,
+  -- Empty string when the transcript recorded usage without naming a model,
+  -- matching how the whole-slice aggregate buckets those.
+  model            TEXT NOT NULL,
+  input_tokens     INTEGER NOT NULL DEFAULT 0,
+  output_tokens    INTEGER NOT NULL DEFAULT 0,
+  cached_tokens    INTEGER NOT NULL DEFAULT 0,
+  est_cost_usd     REAL,
+  -- Sync stamp, same rule as SYNC_STAMP_DDL's columns: bumped on every write,
+  -- never a business time. See that constant for why the two cannot be one.
+  updated_at_ms    INTEGER NOT NULL,
+  PRIMARY KEY (session_event_id, dedup_key)
+) STRICT, WITHOUT ROWID;
+-- Every read is "this window", and the window is on the RESPONSE's own time
+-- rather than its session's — which is the point of the table.
+CREATE INDEX ix_sue_at ON session_usage_events(responded_at_ms);
+CREATE INDEX ix_sue_sync ON session_usage_events(updated_at_ms);
+`;
+
+export const SYNC_STAMP_DDL = `
+ALTER TABLE sessions            ADD COLUMN written_at_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE session_model_usage ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE session_tool_use    ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE recall_receipts     ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0;
+
+UPDATE sessions        SET written_at_ms = updated_at_ms WHERE written_at_ms = 0;
+UPDATE recall_receipts SET updated_at_ms = at_ms         WHERE updated_at_ms = 0;
+-- COALESCE is load-bearing twice over: the column is NOT NULL, so a child row
+-- whose parent session is missing would abort the migration outright — and 0 is
+-- the right value for it anyway, matching a row that predates the column.
+UPDATE session_model_usage
+   SET updated_at_ms = COALESCE((SELECT s.updated_at_ms FROM sessions s
+                                  WHERE s.event_id = session_model_usage.session_event_id), 0)
+ WHERE updated_at_ms = 0;
+UPDATE session_tool_use
+   SET updated_at_ms = COALESCE((SELECT s.updated_at_ms FROM sessions s
+                                  WHERE s.event_id = session_tool_use.session_event_id), 0)
+ WHERE updated_at_ms = 0;
+`;
+
 /*
  * A stored `0` in this column is handled at the READ site, and deliberately not
  * by a migration — do not add one back.
@@ -915,3 +1037,98 @@ export const SOT_INSPECTION_QUERIES = {
 		                     WHERE EXISTS (SELECT 1 FROM transcripts t
 		                                    WHERE t.repo_id = m.repo_id AND t.transcript_id = j.value)), '')`,
 } as const;
+
+/**
+ * Pre-computed per-day spend, plus the one write stamp that makes a stale day
+ * detectable.
+ *
+ * ⚠ DERIVED DATA. Every row here can be recomputed from the tables it
+ * summarises, and the read path falls back to computing a day live whenever a
+ * row is missing or out of date. `DELETE FROM stats_daily` is therefore always
+ * safe: the dashboard shows the same numbers, more slowly. Nothing may treat
+ * this table as a source of truth, and nothing may write a figure here that
+ * cannot be re-derived — the moment one exists, deleting the table loses data
+ * and the fallback silently starts lying.
+ *
+ * ⚠ `commits.written_at_ms` is NOT part of the cache; it is what the cache
+ * needs from the commit side. Staleness is decided by asking "did any source
+ * row change after this day was built", and three of the six axes read the
+ * commit graph. `memories.written_at_ms` already answers for the memory rows,
+ * and `memory_topics` is rewritten inside the same statement pair, so it is
+ * covered too — but two things it cannot see: a commit row arriving late (the
+ * `category` axis dates a memory by `commits.committed_at_ms` when it has one,
+ * so a late arrival can move a memory to a different day) and a change of
+ * branch membership. The second is why the stamp is here rather than on
+ * `commit_branches`: that set is only ever rewritten per-commit, in the same
+ * projection that upserts the commit row, so the commit's stamp already marks
+ * every membership change — and `commit_branches` is fifty times the larger
+ * table, deliberately shrunk once already (see its DDL).
+ *
+ * One thing NOTHING here can see, listed so the set above stays honest: a
+ * `repos.repo_name` rename. The `project` axis stores that name as its
+ * `series_key`, and `repos` carries no write stamp, so a settled day keeps
+ * labelling its rows with the old name until some unrelated write to that day
+ * rebuilds it. Deliberately left alone rather than given a fourth stamp — it is
+ * a label on the right number, it is self-correcting, and a repo's display name
+ * changes about as often as the repo is created.
+ *
+ * Backfilled to 0 rather than to `committed_at_ms`: 0 reads as "written before
+ * we tracked this", which is exactly right for a row that has not changed
+ * since, and never makes a settled day look stale. A business time here would
+ * be the same category error the sync stamps exist to avoid.
+ */
+/**
+ * The rollup's day-scoped DELETE paths (`buildDay`'s whole-day replacement and
+ * `forgetRollupDays`) filter on `tz` + `day`, neither of which is a PK prefix —
+ * the PK leads with `repo_id`, so both currently scan. Small today, but the
+ * table is never pruned, so the scan grows with history. Its own migration entry
+ * (8) because rows already on disk at schema 8 predate it; a fresh database gets
+ * it inline from {@link STATS_DAILY_DDL} below.
+ */
+export const STATS_DAILY_DAY_INDEX_DDL = `
+CREATE INDEX IF NOT EXISTS ix_stats_daily_day ON stats_daily(tz, day);
+`;
+
+export const STATS_DAILY_DDL = `
+ALTER TABLE commits ADD COLUMN written_at_ms INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE stats_daily (
+  -- 0 on the 'built' sentinel, which speaks for the whole day rather than for
+  -- one repo; a real repos.id on every data row. No foreign key, for that
+  -- reason and because nothing here should cascade: this table is rebuilt, not
+  -- maintained, and its delete path is explicit.
+  repo_id       INTEGER NOT NULL,
+  -- IANA zone the day was cut in. In the key because a day boundary is a
+  -- property of the asker: a reader in another zone misses and builds its own
+  -- rows rather than reading someone else's days as if they were its own.
+  tz            TEXT NOT NULL,
+  day           TEXT NOT NULL,           -- local calendar day, YYYY-MM-DD
+  -- One of the spend axes, or 'tokens', or the 'built' sentinel.
+  --
+  -- The sentinel is what separates "this day was computed and had no activity"
+  -- from "this day was never computed". Without it every quiet day misses
+  -- forever and is recomputed on every request — the days most likely to be
+  -- quiet being exactly the ones a wide range is full of. It is stored ONCE per
+  -- day rather than once per repo so that a repo added later cannot leave old
+  -- days permanently unavailable: a repo that did not exist contributed
+  -- nothing, and when it does contribute, its own write stamp marks the day
+  -- stale and the day is rebuilt.
+  kind          TEXT NOT NULL,
+  -- The series within the kind: a model/branch/ticket name for an axis,
+  -- input|output|cached for 'tokens', '' for the sentinel.
+  series_key    TEXT NOT NULL,
+  -- REAL, not INTEGER: the category and branch axes apportion a commit's tokens
+  -- across its topics or branches, so a day's contribution is fractional. The
+  -- read path rounds at emission exactly as the live path does.
+  value         REAL NOT NULL,
+  cost_usd      REAL NOT NULL DEFAULT 0,
+  -- When this day was computed. Staleness is "a source row was written after
+  -- this", so it is compared against the sources' own write stamps and must
+  -- never hold a business time.
+  built_at_ms   INTEGER NOT NULL,
+  -- Sync stamp, same rule as SYNC_STAMP_DDL's columns.
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (repo_id, tz, day, kind, series_key)
+) STRICT, WITHOUT ROWID;
+${STATS_DAILY_DAY_INDEX_DDL}
+`;

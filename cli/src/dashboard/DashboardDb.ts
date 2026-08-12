@@ -34,7 +34,11 @@ import {
 	EVENT_FAILED_KIND_DDL,
 	MEMORY_SOT_DDL,
 	RECALL_RECEIPTS_DDL,
+	SESSION_USAGE_EVENTS_DDL,
 	SKILL_CONTEXT_KIND_DDL,
+	STATS_DAILY_DAY_INDEX_DDL,
+	STATS_DAILY_DDL,
+	SYNC_STAMP_DDL,
 	TOOL_CALL_TIME_DDL,
 } from "./SotSchema.js";
 
@@ -48,11 +52,19 @@ const log = createLogger("DashboardDb");
  * able to `SELECT` the columns it knows about after a newer build has migrated
  * up.
  *
- * It is 5, one per entry in {@link MIGRATIONS}. Entry 0 is the whole schema as
+ * It is 9, one per entry in {@link MIGRATIONS}. Entry 0 is the whole schema as
  * it first landed; entry 1 adds `recall_receipts`; entry 2 registers `skill` as
  * the fourth `context` kind; entry 3 adds `events_raw.failed_kind` so an event
  * parked by an older build that did not know its type can be un-parked by one
- * that does; entry 4 adds `session_tool_use.last_call_at_ms`.
+ * that does; entry 4 adds `session_tool_use.last_call_at_ms`; entry 5 adds the
+ * per-row sync stamps (`SYNC_STAMP_DDL`) that let an outbound sync select the
+ * rows that changed — see that constant for why no business column can serve;
+ * entry 6 adds `session_usage_events`, one row per model response, because a
+ * session's cumulative total under a single timestamp cannot be split across the
+ * days the conversation actually spanned; entry 7 adds `stats_daily`, the cache
+ * a finished local day is settled into so the page reads it back instead of
+ * re-aggregating every render; entry 8 gives `stats_daily` its `(tz, day)`
+ * index, which fresh databases already got inline with entry 7.
  *
  * Bumping this is a CROSS-SURFACE event, not a local edit — that is the reason
  * the number is worth stating here rather than left to be read off the array.
@@ -82,7 +94,7 @@ const log = createLogger("DashboardDb");
  * user's database (other processes may hold the file open, and the memory half
  * is the only copy there is).
  */
-export const DASHBOARD_SCHEMA_VERSION = 5;
+export const DASHBOARD_SCHEMA_VERSION = 9;
 
 /**
  * Minimum Node that ships `node:sqlite` **without** `--experimental-sqlite`.
@@ -259,6 +271,10 @@ BEGIN SELECT RAISE(ABORT, 'repos are never deleted: set disabled_at instead'); E
 	SKILL_CONTEXT_KIND_DDL,
 	EVENT_FAILED_KIND_DDL,
 	TOOL_CALL_TIME_DDL,
+	SYNC_STAMP_DDL,
+	SESSION_USAGE_EVENTS_DDL,
+	STATS_DAILY_DDL,
+	STATS_DAILY_DAY_INDEX_DDL,
 ];
 
 /** Reads the stored schema version, treating a fresh DB as 0. */

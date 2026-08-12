@@ -402,27 +402,7 @@ body {
      content rather than as the absence of it. */
   .empty-note { font-size: 12.5px; color: var(--muted); margin-top: 12px; line-height: 1.55; }
 
-  /* ---------- ranked bars ---------- */
-  .ranked { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
-  .rrow { display: grid; grid-template-columns: 190px 1fr 92px; gap: 10px; align-items: center; }
-  .rrow .lbl { font-size: 12.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .rrow .bar { height: 18px; border-radius: 0 4px 4px 0; background: var(--s1); min-width: 2px; position: relative; }
-  .rrow .track { background: transparent; border-left: 2px solid var(--baseline); padding-left: 0; height: 18px; display:flex; align-items:center; }
-  .rrow .val { font-size: 12.5px; text-align: right; color: var(--ink); }
-  .rrow .meta { font-size: 11px; color: var(--muted); display: block; }
-
-  /* ---------- table view ---------- */
-  .ttable { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 12.5px; }
-  .ttable th { text-align: left; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
-  .ttable td { padding: 7px 8px; border-bottom: 1px solid var(--grid); color: var(--ink-2); }
-  .ttable td.r, .ttable th.r { text-align: right; }
-  .ttable td:first-child { color: var(--ink); }
-
-  /* ---------- heatmap & records ---------- */
-  .heat-legend { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); flex-wrap: wrap; }
-  .heat-legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
-  .dist { display: flex; gap: 2px; height: 10px; border-radius: 5px; overflow: hidden; max-width: 420px; }
-  .dist i { display: block; }
+  /* ---------- records ---------- */
   .dist-labels { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 6px; font-size: 11px; color: var(--muted); }
   .dist-labels span { display: inline-flex; align-items: center; }
   .dist-labels i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; margin-right: 5px; }
@@ -1116,8 +1096,6 @@ body {
   .mg-move { border-top: 1px dashed var(--grid); margin-top: 9px; padding-top: 9px; font-size: 12px; color: var(--ink-2); line-height: 1.5; }
   .mg-move b { color: var(--ink); }
   .mate .trend { font-size: 10.5px; color: var(--muted); font-weight: 400; }
-  .ttable .ok { color: var(--good-text); font-weight: 600; }
-  .ttable .no { color: var(--muted); }
 
   .footer-note { max-width: 1200px; margin: 18px auto 0; padding: 0 24px; font-size: 11.5px; color: var(--muted); }
   @media (prefers-reduced-motion: no-preference) {

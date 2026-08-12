@@ -2,7 +2,7 @@
  * SettingsPageQuery — assembles the Settings page payload
  * ({@link SettingsPageModel}) that the shipped Settings page reads. Mirrors the
  * VS Code settings panel's five tabs (AI Agents / AI Summary / Sync to Jolli /
- * Memory Bank / Others), NOT the mockup-era `SettingsQuery.buildSettings`.
+ * Memory Bank / Others).
  *
  * Two hard rules, both about the API key:
  *   - Only the MASKED key ever reaches this payload. The full key stays in

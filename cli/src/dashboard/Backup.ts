@@ -118,7 +118,12 @@ export interface SnapshotOptions {
 	readonly config: JolliMemoryConfig;
 	/** Marks the snapshot retention-exempt (pre-migration). */
 	readonly premigration?: boolean;
-	/** Skips the daily gate (explicit `jolli backup now` / pre-migration). */
+	/**
+	 * Skips the daily gate. Reserved for a snapshot whose reason is not "a day
+	 * passed" — a pre-migration one above all, which must land even when today's
+	 * ordinary snapshot already did (only THAT one is retention-exempt, so the
+	 * two never substitute for each other). No shipped caller sets it today.
+	 */
 	readonly force?: boolean;
 }
 
@@ -311,10 +316,11 @@ async function snapshotInner(db: DashboardDbHandle, opts: SnapshotOptions): Prom
 	// identical temp path. Both then `rmSync`'d it (before and after their own
 	// VACUUM), so each deleted the file the other was writing and neither snapshot
 	// landed: the day's backup silently did not happen. The pid separates
-	// processes; the nonce separates two calls inside ONE process, which the
-	// post-commit worker and a `jolli backup now` can genuinely overlap on. The
-	// FINAL path stays free of both — a same-second collision there is two
-	// snapshots of the same database, where last-writer-wins is correct.
+	// processes; the nonce separates two calls inside ONE process, which nothing
+	// does today — it costs one uuid and it is what keeps this fix from depending
+	// on that staying true. The FINAL path stays free of both — a same-second
+	// collision there is two snapshots of the same database, where
+	// last-writer-wins is correct.
 	const tempPath = join(folder, `.${name}.${process.pid}-${randomUUID().slice(0, 8)}.tmp`);
 
 	rmSync(tempPath, { force: true });
