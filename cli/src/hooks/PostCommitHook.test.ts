@@ -6,6 +6,16 @@ vi.mock("node:child_process", () => ({
 	execSync: vi.fn(),
 }));
 
+// `runPostCommitHook` now unconditionally triggers the detached global-daemon
+// ensure helper after every `postCommitEntry` invocation. Without this mock,
+// the real helper would register a detached-child spawn against the SAME
+// mocked `node:child_process` layer above and break assertions that are really
+// about the QueueWorker's spawn, not the daemon helper's.
+vi.mock("../daemon/EnsureGlobalDaemon.js", () => ({
+	triggerEnsureGlobalDaemon: vi.fn(() => true),
+	retireGlobalDaemon: vi.fn(async () => true),
+}));
+
 vi.mock("../core/StorageFactory.js", () => ({
 	createStorage: vi.fn().mockResolvedValue({
 		readFile: vi.fn().mockResolvedValue(null),

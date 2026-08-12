@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
 	// Defaults to "no layout" so every existing case keeps exercising the `git`
 	// fallback it was written against.
 	resolveGitFsLayout: vi.fn<() => { worktreeRoot: string } | null>(() => null),
+	triggerEnsureGlobalDaemon: vi.fn().mockReturnValue(true),
 }));
 
 vi.mock("../core/GitFsLayout.js", () => ({ resolveGitFsLayout: mocks.resolveGitFsLayout }));
@@ -53,6 +54,10 @@ vi.mock("./SessionStartHook.js", () => ({
 	ensurePluginDefaultProvider: mocks.ensurePluginDefaultProvider,
 }));
 vi.mock("./HookUtils.js", () => ({ readStdin: mocks.readStdin }));
+vi.mock("../daemon/EnsureGlobalDaemon.js", () => ({
+	triggerEnsureGlobalDaemon: mocks.triggerEnsureGlobalDaemon,
+	retireGlobalDaemon: vi.fn().mockResolvedValue(true),
+}));
 vi.mock("../Logger.js", () => ({
 	createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 	setLogDir: vi.fn(),

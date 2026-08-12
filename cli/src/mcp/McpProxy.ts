@@ -26,6 +26,7 @@ import { unlink } from "node:fs/promises";
 import { connect, type Socket } from "node:net";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { createLogger } from "../Logger.js";
+import { resolveCliEntry } from "../util/CliEntry.js";
 import { spawnHidden } from "../util/Subprocess.js";
 import { isPluginBundleCwd } from "./McpCwdGuard.js";
 import {
@@ -173,7 +174,16 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<McpProxy
 	// what each of them got before the daemon existed, and it keeps the shared-daemon
 	// invariant true for the sessions that can actually benefit from it.
 	const notAWorktree = options.isWorktreeRoot === false;
-	if (notAWorktree) {
+	// Evaluated BEFORE the message below, not just before the fallback, because
+	// these two overlap with `notAWorktree` rather than being alternatives to it:
+	// a local-agent child runs in a scratch directory by construction and a
+	// plugin-bundle cwd is a cache directory, so both arrive with
+	// `isWorktreeRoot: false` too. Their refusal text (and the decision to print
+	// any) belongs to `startMcpServer`, which the fallback runs — and telling them
+	// to "point this MCP server at a workspace directory" would describe a host
+	// misconfiguration that does not exist, on a path meant to be a silent no-op.
+	const refusedSilently = isLocalAgentChild(env, cwd) || isPluginBundleCwd(cwd);
+	if (notAWorktree && !refusedSilently) {
 		// stderr, NEVER stdout: stdout is this session's JSON-RPC stream and a
 		// stray byte desynchronises the host's framing for the whole session —
 		// strictly worse than the empty answers this line exists to explain.
@@ -190,10 +200,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<McpProxy
 				`or launch it from inside a repository.\n`,
 		);
 	}
-	// The other two guards stay silent HERE: their refusal text, and the decision
-	// to print it, belong to `startMcpServer`, which the fallback runs. A second
-	// copy would double-print for the cases that were already handled.
-	if (isLocalAgentChild(env, cwd) || isPluginBundleCwd(cwd) || notAWorktree) {
+	if (refusedSilently || notAWorktree) {
 		await fallback(cwd);
 		return "refused";
 	}
@@ -548,21 +555,21 @@ async function removeStaleSocket(socketPath: string): Promise<void> {
 /**
  * Spawns the daemon, detached, from the SAME bundle this proxy is running from.
  *
- * `process.argv[1]` rather than `import.meta.url`: under the CLI's multi-entry
- * Vite build this module is a shared chunk, so `import.meta.url` would name the
- * chunk instead of an executable entry — the mirror image of the bug
- * `launchWorker` documents, where the bundled copy resolved to its caller. argv[1]
- * is the script Node was actually launched with, which is the dist entry the host
- * (or `run-cli`) chose, so proxy and daemon are guaranteed to be the same build
- * and the version in the handshake means what it says.
+ * The entry is the `Cli.js` beside this module, NEVER `process.argv[1]` — see
+ * {@link resolveCliEntry}. argv[1] is the CLI here only because `runMcpProxy` is
+ * reached solely from `Cli.ts`'s fast path, which is an invariant nothing
+ * enforces; the identical assumption in the global daemon's trigger, which IS
+ * called from hook entries, made it spawn those hooks in a loop. A sibling
+ * lookup is correct whichever entry this code is inlined into, and it keeps the
+ * property argv[1] was chosen for: proxy and daemon are the same dist, so the
+ * version in the handshake means what it says.
  */
 function spawnDetachedDaemon(args: RunMcpProxyOptions, cwd: string, socketPath: string): void {
 	if (args.spawnDaemon) {
 		args.spawnDaemon(cwd, socketPath);
 		return;
 	}
-	/* v8 ignore start -- spawns a real detached process; exercised by the acceptance run, not unit tests */
-	const entry = process.argv[1];
+	const entry = resolveCliEntry(import.meta.url);
 	if (!entry) {
 		log.warn("Cannot locate the CLI entry to spawn a daemon — serving in-process");
 		return;
@@ -581,7 +588,6 @@ function spawnDetachedDaemon(args: RunMcpProxyOptions, cwd: string, socketPath: 
 	});
 	child.unref();
 	log.info("Spawned MCP daemon (pid %d) for %s", child.pid ?? -1, cwd);
-	/* v8 ignore stop */
 }
 
 /**

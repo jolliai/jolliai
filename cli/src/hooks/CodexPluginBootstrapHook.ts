@@ -189,6 +189,8 @@ export async function main(): Promise<void> {
 		const parsed = input.trim() ? (JSON.parse(input) as { cwd?: string }) : {};
 		const output = await runCodexPluginBootstrap(parsed.cwd ?? process.cwd());
 		if (output) process.stdout.write(JSON.stringify(output));
+		const { triggerEnsureGlobalDaemon } = await import("../daemon/EnsureGlobalDaemon.js");
+		triggerEnsureGlobalDaemon();
 	} catch (error: unknown) {
 		log.info("Codex plugin bootstrap failed: %s", (error as Error).message);
 	}

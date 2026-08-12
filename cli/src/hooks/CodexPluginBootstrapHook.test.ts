@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
 	buildSessionStartContext: vi.fn().mockResolvedValue("codex briefing"),
 	ensurePluginDefaultProvider: vi.fn().mockResolvedValue(true),
 	readStdin: vi.fn().mockResolvedValue(JSON.stringify({ cwd: "/repo/subdir" })),
+	triggerEnsureGlobalDaemon: vi.fn().mockReturnValue(true),
 }));
 
 vi.mock("../core/AgentReentry.js", () => ({ isLocalAgentChild: mocks.isLocalAgentChild }));
@@ -31,6 +32,14 @@ vi.mock("./HookUtils.js", () => ({ readStdin: mocks.readStdin }));
 vi.mock("../Logger.js", () => ({
 	createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 	setLogDir: vi.fn(),
+}));
+// `main()` now triggers the detached global-daemon ensure helper after writing
+// its stdout envelope. Without this mock the real helper would spawn a
+// detached child on every test that reaches `main()`'s success path — real
+// process work this unit suite should not depend on.
+vi.mock("../daemon/EnsureGlobalDaemon.js", () => ({
+	triggerEnsureGlobalDaemon: mocks.triggerEnsureGlobalDaemon,
+	retireGlobalDaemon: vi.fn().mockResolvedValue(true),
 }));
 
 const { buildCodexBootstrapOutput, main, runCodexPluginBootstrap } = await import("./CodexPluginBootstrapHook.js");

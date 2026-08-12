@@ -271,6 +271,31 @@ describe("DoctorCommand — local-agent tool diagnostic", () => {
 	});
 });
 
+describe("global daemon check", () => {
+	it("reports the daemon as running with its pid, version and uptime", async () => {
+		const { formatGlobalDaemonCheck } = await import("./DoctorCommand.js");
+		const check = formatGlobalDaemonCheck(
+			{ t: "hello", protocol: 1, version: "0.99.3", pid: 4242, startedAt: 1_000_000 },
+			1_000_000 + 3 * 60 * 60 * 1000,
+		);
+
+		expect(check.status).toBe("ok");
+		expect(check.message).toContain("4242");
+		expect(check.message).toContain("0.99.3");
+		expect(check.message).toContain("3h");
+	});
+
+	it("reports 'not running' as a warning, never a failure", async () => {
+		const { formatGlobalDaemonCheck } = await import("./DoctorCommand.js");
+		const check = formatGlobalDaemonCheck(undefined, Date.now());
+
+		// Not a failure: backups still land from the opportunistic callers, and
+		// the row that reports whether they ACTUALLY landed is "Database backup".
+		expect(check.status).toBe("warn");
+		expect(check.message).toContain("not running");
+	});
+});
+
 describe("doctor --recover", () => {
 	it("lists candidates under a fake HOME and reports a failed restore", async () => {
 		const { mkdtempSync, rmSync } = await import("node:fs");

@@ -376,8 +376,13 @@ export async function verifySnapshotFile(path: string): Promise<boolean> {
  * The opportunistic entry point — what the dashboard server calls on start
  * and the QueueWorker calls after its post-drain COMMIT. Self-contained:
  * opens its own short-lived handle, loads config itself, obeys the daily
- * gate, degrades below the Node floor, and never throws. There is no
- * daemon; these two call sites ARE the schedule.
+ * gate, degrades below the Node floor, and never throws.
+ *
+ * These two are the OPPORTUNISTIC schedule, and they cover only the user who
+ * commits (or opens the dashboard) regularly. The machine-global daemon is
+ * what covers the user who does not — it asks this function hourly and lets
+ * the daily gate below decide, which is why the gate lives here rather than
+ * in any caller. See `daemon/GlobalDaemon.ts` (`defaultTasks`).
  */
 export async function opportunisticSnapshot(dbPath?: string): Promise<SnapshotResult> {
 	try {

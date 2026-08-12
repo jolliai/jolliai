@@ -91,6 +91,15 @@ vi.mock("../Logger.js", () => ({
 	ORPHAN_BRANCH: "jollimemory/summaries/v3",
 }));
 
+// `main()` now triggers the detached global-daemon ensure helper after writing
+// its briefing. Without this mock the real helper would spawn a detached child
+// on every test that reaches `main()`'s success path — real process work this
+// unit suite should not depend on.
+vi.mock("../daemon/EnsureGlobalDaemon.js", () => ({
+	triggerEnsureGlobalDaemon: vi.fn().mockReturnValue(true),
+	retireGlobalDaemon: vi.fn().mockResolvedValue(true),
+}));
+
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { resolveStateRoot } from "../core/GitOps.js";

@@ -184,6 +184,7 @@ async function runUninstall(cwd: string, scope: Scope, dryRun: boolean, skipProm
 	let removedExtension = false;
 	let removedGlobalConfig = false;
 	let removedCliGlobal = false;
+	let removedMachineGlobal = false;
 	const failures: string[] = [];
 	for (const item of targets) {
 		const error = await removeItem(item);
@@ -192,6 +193,7 @@ async function runUninstall(cwd: string, scope: Scope, dryRun: boolean, skipProm
 			if (item.surface === "vscode-extension") removedExtension = true;
 			if (item.surface === "global-config") removedGlobalConfig = true;
 			if (item.surface === "cli-global") removedCliGlobal = true;
+			if (SURFACE_META.find((m) => m.surface === item.surface)?.scope === "global") removedMachineGlobal = true;
 			console.log(`  ✓ ${item.label}`);
 		} else {
 			failures.push(`${item.label}: ${error}`);
@@ -203,6 +205,27 @@ async function runUninstall(cwd: string, scope: Scope, dryRun: boolean, skipProm
 	// where every item failed (or nothing was selected) is not a disable.
 	if (removed > 0) {
 		track("surface_disabled", { reason: "uninstall" });
+	}
+
+	// Ask the resident daemon to stand down — but ONLY when this run actually
+	// removed something machine-global. `uninstall` is on the trigger's exclusion
+	// list, so nothing in this process brings it back.
+	//
+	// The condition is the whole point, and it is the opposite of what "the daemon
+	// is machine-global, not owned by this repo" argues for: precisely BECAUSE it
+	// is machine-global, a repo-scoped uninstall has no standing to stop it. Its
+	// one task is the daily `jollimemory.db` snapshot, which is not this repo's
+	// work, and after a retire nothing restarts it until an unrelated trigger
+	// happens to fire somewhere else on the machine. A run where every removal
+	// failed is the same case: nothing was taken away, so the dist the daemon runs
+	// from is still there and still the right one.
+	//
+	// Removing a machine-global surface is different — the global CLI, the global
+	// config dir holding the hook entry scripts, or an editor integration may be
+	// the very dist this daemon is running out of, so it has to go.
+	if (removedMachineGlobal) {
+		const { retireGlobalDaemon } = await import("../daemon/EnsureGlobalDaemon.js");
+		await retireGlobalDaemon();
 	}
 
 	console.log(`\n  Removed ${removed} item${removed === 1 ? "" : "s"}.`);

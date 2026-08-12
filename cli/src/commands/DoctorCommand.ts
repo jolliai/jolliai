@@ -21,6 +21,8 @@ import { localAgentToolLabel, localAgentToolLoginHint } from "../core/localagent
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfig } from "../core/SessionTracker.js";
 import { resolveSotBackend } from "../core/SotStorageResolver.js";
+import { probeGlobalDaemon } from "../daemon/EnsureGlobalDaemon.js";
+import type { GlobalDaemonHello } from "../daemon/GlobalDaemonProtocol.js";
 import { backupHealthCheck } from "../dashboard/Backup.js";
 import {
 	canUseDashboardDb,
@@ -50,12 +52,39 @@ import { resolveProjectDir, VERSION } from "./CliUtils.js";
 const log = createLogger("doctor");
 
 /** Individual check result returned by each diagnostic probe. */
-interface DoctorCheck {
+export interface DoctorCheck {
 	readonly name: string;
 	readonly status: "ok" | "warn" | "fail";
 	readonly message: string;
 	/** Optional fixer that applies a remedy and returns a new message describing what was done. */
 	readonly fixer?: () => Promise<string>;
+}
+
+/**
+ * The daemon's row. Exported for tests, and pure so the formatting can be
+ * asserted without a live socket.
+ *
+ * "Not running" is a WARNING, never a failure, and the ordering with the
+ * "Database backup" row is the reason: that row reports whether snapshots are
+ * actually landing, which is the question that matters. A daemon that is up but
+ * has never produced a snapshot is a worse state than no daemon with the
+ * opportunistic callers keeping up — so the process must never be presented as
+ * evidence that the work is getting done.
+ */
+export function formatGlobalDaemonCheck(hello: GlobalDaemonHello | undefined, nowMs: number): DoctorCheck {
+	if (!hello) {
+		return {
+			name: "Global daemon",
+			status: "warn",
+			message: "not running — scheduled work falls back to commit-time triggers",
+		};
+	}
+	const upHours = Math.floor((nowMs - hello.startedAt) / (60 * 60 * 1000));
+	return {
+		name: "Global daemon",
+		status: "ok",
+		message: `running (pid ${hello.pid}, v${hello.version}, up ${upHours}h)`,
+	};
 }
 
 /**
@@ -321,7 +350,11 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 		}
 	}
 
-	// 9. Database backup health — the cutover gate's reporting row. An illegal
+	// 9. Global daemon — context for the backup row below, never a substitute
+	// for it.
+	checks.push(formatGlobalDaemonCheck(await probeGlobalDaemon(), Date.now()));
+
+	// 10. Database backup health — the cutover gate's reporting row. An illegal
 	// stored folder or week-stale snapshots are failures; "drive unplugged" is
 	// a warning that escalates after seven days.
 	const backup = await backupHealthCheck(Date.now());

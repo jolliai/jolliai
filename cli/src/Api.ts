@@ -21,6 +21,7 @@ import { registerDoctorCommand } from "./commands/DoctorCommand.js";
 import { registerDisableCommand, registerEnableCommand } from "./commands/EnableCommand.js";
 import { registerExportCommand, registerExportPromptCommand } from "./commands/ExportCommand.js";
 import { registerGenerateCommand } from "./commands/GenerateCommand.js";
+import { registerGlobalDaemonCommand } from "./commands/GlobalDaemonCommand.js";
 import { registerGraphCommand } from "./commands/GraphCommand.js";
 import { runGuidedFrontDoor } from "./commands/GuidedFrontDoor.js";
 import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
@@ -402,6 +403,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerAuthCommands(program);
 	registerSyncCommand(program);
 	registerMcpCommand(program);
+	registerGlobalDaemonCommand(program);
 	registerTelemetryCommand(program);
 	registerGenerateCommand(program);
 	registerDaemonCommand(program);

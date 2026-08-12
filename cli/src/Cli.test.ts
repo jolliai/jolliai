@@ -2,6 +2,8 @@ import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { isBareMcpInvocation, isDetachedDaemonInvocation } from "./Cli.js";
 import { MCP_DAEMON_COMMAND, MCP_NO_DAEMON_ENV } from "./commands/McpCommand.js";
+import { GLOBAL_DAEMON_ENSURE_COMMAND } from "./daemon/EnsureGlobalDaemon.js";
+import { GLOBAL_DAEMON_COMMAND } from "./daemon/GlobalDaemon.js";
 
 describe("isBareMcpInvocation", () => {
 	it("routes the bare `jolli mcp` a host spawns per session", () => {
@@ -32,18 +34,31 @@ describe("isBareMcpInvocation", () => {
 });
 
 describe("isDetachedDaemonInvocation", () => {
-	it("recognises the daemon the proxy spawns", () => {
+	it("recognises the MCP daemon the proxy spawns", () => {
 		expect(isDetachedDaemonInvocation(["mcp-serve", "--cwd", "/repo", "--socket", "/tmp/x.sock"])).toBe(true);
+	});
+
+	it("recognises the machine-global daemon EnsureGlobalDaemon spawns", () => {
+		// Missing this case burns the one-time telemetry disclosure for good: the
+		// global daemon's stderr is `/dev/null`, so showing the notice there marks
+		// it shown without ever displaying it, on installs that never ran `jolli` in
+		// a terminal first (e.g. bootstrapped from the VS Code extension).
+		expect(isDetachedDaemonInvocation(["global-daemon", "--socket", "/tmp/g.sock"])).toBe(true);
+	});
+
+	it("recognises the detached global-daemon ensure helper too", () => {
+		expect(isDetachedDaemonInvocation(["global-daemon-ensure", "--socket", "/tmp/g.sock"])).toBe(true);
 	});
 
 	it.each([[["mcp"]], [["status"]], [[]], [["mcp", "--reindex"]]])("leaves %s alone", (argv) => {
 		expect(isDetachedDaemonInvocation(argv)).toBe(false);
 	});
 
-	it("does not match a command that merely starts with the daemon's name", () => {
+	it("does not match a command that merely starts with a daemon's name", () => {
 		// argv[0] is a whole command word, not a prefix; a future `mcp-serve-status`
-		// must not inherit the daemon's stderr policy.
+		// or `global-daemon-status` must not inherit either daemon's stderr policy.
 		expect(isDetachedDaemonInvocation(["mcp-serve-status"])).toBe(false);
+		expect(isDetachedDaemonInvocation(["global-daemon-status"])).toBe(false);
 	});
 });
 
@@ -62,6 +77,21 @@ describe("Cli entry — cold-start import graph", () => {
 		// marking it shown and denying it to the user forever, with nothing failing.
 		const source = await readFile(new URL("./Cli.ts", import.meta.url), "utf-8");
 		expect(source).toContain(`const MCP_DAEMON_COMMAND = "${MCP_DAEMON_COMMAND}";`);
+	});
+
+	it("keeps the global-daemon subcommand in lockstep with GlobalDaemon's canonical constant", async () => {
+		// Same reasoning as the MCP restatement above, and the same silent,
+		// one-sided failure mode: a divergence here would make the global daemon
+		// print (and burn) the one-time telemetry disclosure into its own
+		// `/dev/null` stderr instead of leaving it owed for the next real terminal
+		// invocation, with nothing failing to say so.
+		const source = await readFile(new URL("./Cli.ts", import.meta.url), "utf-8");
+		expect(source).toContain(`const GLOBAL_DAEMON_COMMAND = "${GLOBAL_DAEMON_COMMAND}";`);
+	});
+
+	it("keeps the detached ensure subcommand in lockstep with EnsureGlobalDaemon's canonical constant", async () => {
+		const source = await readFile(new URL("./Cli.ts", import.meta.url), "utf-8");
+		expect(source).toContain(`const GLOBAL_DAEMON_ENSURE_COMMAND = "${GLOBAL_DAEMON_ENSURE_COMMAND}";`);
 	});
 
 	it("loads Api.js and the telemetry stack by dynamic import only", async () => {

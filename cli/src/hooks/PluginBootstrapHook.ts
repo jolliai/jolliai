@@ -198,6 +198,8 @@ export async function main(): Promise<void> {
 			transcriptPath: parsed.transcript_path,
 		});
 		if (output) process.stdout.write(JSON.stringify(output));
+		const { triggerEnsureGlobalDaemon } = await import("../daemon/EnsureGlobalDaemon.js");
+		triggerEnsureGlobalDaemon();
 	} catch (error: unknown) {
 		log.info("Plugin bootstrap failed: %s", (error as Error).message);
 	}

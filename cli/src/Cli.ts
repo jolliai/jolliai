@@ -28,6 +28,16 @@ const MCP_NO_DAEMON_ENV = "JOLLI_MCP_NO_DAEMON";
 const MCP_DAEMON_COMMAND = "mcp-serve";
 
 /**
+ * The hidden machine-global daemon subcommand, restated for the same reason:
+ * `GlobalDaemon.ts` owns the canonical constant, but it also pulls in the
+ * daemon's full dependency graph (storage, the scheduler, the backup task),
+ * which is exactly what this file's static import list must stay leaf-only to
+ * avoid — see `isBareMcpInvocation`. A test pins both spellings.
+ */
+const GLOBAL_DAEMON_COMMAND = "global-daemon";
+const GLOBAL_DAEMON_ENSURE_COMMAND = "global-daemon-ensure";
+
+/**
  * Whether this invocation is the bare `jolli mcp` a host spawns per session, and
  * therefore eligible for the proxy fast path below.
  *
@@ -44,18 +54,24 @@ export function isBareMcpInvocation(argv: ReadonlyArray<string>, env: NodeJS.Pro
 }
 
 /**
- * Whether this invocation is the detached per-worktree MCP daemon.
+ * Whether this invocation is a detached daemon — the per-worktree MCP daemon
+ * OR the machine-global daemon `EnsureGlobalDaemon` spawns.
  *
  * Used for ONE decision — suppressing the one-time telemetry disclosure — and
- * that decision is about this process's stderr, not about what it does. The
- * proxy spawns it with `stdio: "ignore"`, so the notice would be written to
- * `/dev/null` while `telemetryNoticeShown: true` still lands in the config: the
- * disclosure is consumed without ever having been shown, and never offered
- * again on this machine. Skipping it here keeps the notice OWED, so the next
- * ordinary `jolli` invocation (which has a real stderr) presents it.
+ * that decision is about this process's stderr, not about what it does. Both
+ * daemons are spawned with `stdio: "ignore"`, so the notice would be written
+ * to `/dev/null` while `telemetryNoticeShown: true` still lands in the
+ * machine-global config: the disclosure is consumed without ever having been
+ * shown, and never offered again on this machine — for the global daemon this
+ * is the very first process to reach the notice on an install that never ran
+ * `jolli` in a terminal (e.g. bootstrapped from the VS Code extension or a
+ * plugin), so missing this case burns the disclosure for good. Skipping it
+ * here keeps the notice OWED, so the next ordinary `jolli` invocation (which
+ * has a real stderr) presents it.
  *
- * Not extended to suppress telemetry itself: the daemon runs the tools, so it
- * is exactly the process that must keep emitting per-tool events.
+ * Not extended to suppress telemetry itself: both daemons run tools (MCP tool
+ * calls, the global daemon's backup task), so they are exactly the processes
+ * that must keep emitting per-tool events.
  *
  * The name is matched on argv rather than asked of the process, because a
  * process cannot tell that its own fd 2 is a black hole — with `stdio:
@@ -64,7 +80,9 @@ export function isBareMcpInvocation(argv: ReadonlyArray<string>, env: NodeJS.Pro
  * `main()` parses anything.
  */
 export function isDetachedDaemonInvocation(argv: ReadonlyArray<string>): boolean {
-	return argv[0] === MCP_DAEMON_COMMAND;
+	return (
+		argv[0] === MCP_DAEMON_COMMAND || argv[0] === GLOBAL_DAEMON_COMMAND || argv[0] === GLOBAL_DAEMON_ENSURE_COMMAND
+	);
 }
 
 /**
@@ -188,6 +206,13 @@ if (!process.env.VITEST) {
 				if (!shouldSkipExitFlush()) {
 					await flushTelemetryNow(resolveProjectDir(), { timeoutMs: 2_000 });
 				}
+				// Ask the detached ensure helper to make sure the machine-global
+				// daemon exists. Last, so it can never delay the command's own
+				// output, and fire-and-forget: the helper process owns the bounded
+				// connect/hello wait and any follow-on spawn.
+				const { triggerEnsureGlobalDaemon } = await import("./daemon/EnsureGlobalDaemon.js");
+				const { getInvokedRootCommand } = await import("./core/TelemetryCommandHook.js");
+				triggerEnsureGlobalDaemon({ command: getInvokedRootCommand() });
 				if (failed) process.exit(1);
 			})(),
 		);

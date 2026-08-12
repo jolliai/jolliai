@@ -23,6 +23,7 @@ const {
 	mockTrack,
 	mockCreateStorage,
 	mockSetActiveStorage,
+	mockRetireGlobalDaemon,
 } = vi.hoisted(() => ({
 	mockScan: vi.fn(),
 	mockPrune: vi.fn(),
@@ -33,6 +34,7 @@ const {
 	mockTrack: vi.fn(),
 	mockCreateStorage: vi.fn(),
 	mockSetActiveStorage: vi.fn(),
+	mockRetireGlobalDaemon: vi.fn(),
 }));
 
 vi.mock("node:fs/promises", () => ({ rm: mockRm }));
@@ -49,6 +51,12 @@ vi.mock("../install/UninstallScan.js", () => ({
 vi.mock("../install/Installer.js", () => ({ uninstall: mockUninstall }));
 
 vi.mock("../core/Telemetry.js", () => ({ track: mockTrack }));
+
+// Mocked for correctness as well as isolation: the real `retireGlobalDaemon()`
+// takes no arguments here, so it derives THIS machine's live global socket path
+// and would send `retire` to the developer's own running daemon on every test
+// that reaches it.
+vi.mock("../daemon/EnsureGlobalDaemon.js", () => ({ retireGlobalDaemon: mockRetireGlobalDaemon }));
 
 vi.mock("./CliUtils.js", () => ({
 	isInteractive: mockIsInteractive,
@@ -268,6 +276,48 @@ describe("uninstall — --yes", () => {
 		} finally {
 			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
 		}
+	});
+
+	it("retires the machine-global daemon when a machine-global surface is removed", async () => {
+		mockScan.mockResolvedValue(
+			inventory([item({ surface: "cli-global", label: "CLI", path: "/cli", kind: "dir" })]),
+		);
+
+		// The daemon runs out of a dist this removal is taking away, so it has to
+		// stand down. `uninstall` is on the trigger's exclusion list, so nothing in
+		// this process brings it back.
+		await run(["--yes"]);
+		expect(mockRetireGlobalDaemon).toHaveBeenCalled();
+	});
+
+	it("leaves the machine-global daemon alone for a project-scoped uninstall", async () => {
+		mockScan.mockResolvedValue(
+			inventory([
+				item({ surface: "repo-hooks", label: "Hooks", path: "/repo", kind: "hooks" }),
+				item({ surface: "project-config", label: "State", path: "/repo/.jolli", kind: "dir" }),
+			]),
+		);
+
+		// The daemon is machine-global and its one task — the daily
+		// `jollimemory.db` snapshot — is not this repo's. Retiring it here stops
+		// that backup for EVERY other repo on the machine, and nothing restarts it
+		// until an unrelated trigger fires somewhere else.
+		await run(["--scope", "project", "--yes"]);
+		expect(mockRm).toHaveBeenCalledWith("/repo/.jolli", { recursive: true, force: true });
+		expect(mockRetireGlobalDaemon).not.toHaveBeenCalled();
+	});
+
+	it("leaves the machine-global daemon alone when every global removal failed", async () => {
+		mockScan.mockResolvedValue(
+			inventory([item({ surface: "cli-global", label: "CLI", path: "/cli", kind: "dir" })]),
+		);
+		mockRm.mockRejectedValue(new Error("EBUSY"));
+
+		// Nothing was taken away, so the daemon's dist is still there and still the
+		// right one to be running. This is the case the old unconditional call got
+		// exactly backwards.
+		await run(["--yes"]);
+		expect(mockRetireGlobalDaemon).not.toHaveBeenCalled();
 	});
 
 	it("reconciles the VS Code manifest after deleting an extension folder", async () => {

@@ -79,6 +79,22 @@ export function shouldSkipExitFlush(): boolean {
 	return forcedSkipExitFlush || invokedRootCommand === "telemetry";
 }
 
+/**
+ * The root-level name of the command commander resolved this run, or `null`
+ * when no action ran.
+ *
+ * Exposed because more than one policy keys off it. The value is set by the
+ * `preAction` hook, so it reflects the parsed command TREE rather than an argv
+ * position — the positional check broke silently the moment a global option
+ * preceded the subcommand, and any new consumer would inherit that bug.
+ *
+ * This module owns the FACT; the policy that reads it (e.g.
+ * `shouldSkipGlobalDaemon`) lives with the feature it governs.
+ */
+export function getInvokedRootCommand(): string | null {
+	return invokedRootCommand;
+}
+
 /** Register the `command_invoked` auto-emit hooks on the root program. */
 export function installCommandTelemetryHooks(program: Command): void {
 	program.hook("preAction", (_thisCommand, actionCommand) => {

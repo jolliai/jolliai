@@ -159,7 +159,13 @@ export async function runPostCommitHook(cwd: string): Promise<{ commitHash: stri
 		log.info("Repository is manually disabled — skipping post-commit enqueue");
 		return null;
 	}
-	return postCommitEntry(cwd);
+	const result = postCommitEntry(cwd);
+	// The commit path is already a fire-and-forget region. Hand the actual
+	// ensure work to the detached helper so the hook's own latency stays off the
+	// daemon's bounded connect/hello path.
+	const { triggerEnsureGlobalDaemon } = await import("../daemon/EnsureGlobalDaemon.js");
+	triggerEnsureGlobalDaemon();
+	return result;
 }
 
 // Re-export QueueWorker's __test__ helpers alongside our own so that existing

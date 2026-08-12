@@ -377,6 +377,8 @@ export async function main(): Promise<void> {
 		} else {
 			log.info("No briefing or reminder generated (skipped or timed out)");
 		}
+		const { triggerEnsureGlobalDaemon } = await import("../daemon/EnsureGlobalDaemon.js");
+		triggerEnsureGlobalDaemon();
 	} catch (error: unknown) {
 		/* v8 ignore next 2 - defensive: main() catches unexpected errors to never block session startup */
 		log.info("SessionStartHook failed: %s", (error as Error).message);

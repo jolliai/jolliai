@@ -28,6 +28,17 @@ vi.mock("./McpDaemonProtocol.js", async (importOriginal) => ({
 	isManagedSocketDirSafe: () => isManagedSocketDirSafe(),
 }));
 
+// Only the OS-level spawn is stubbed, so the argv the proxy builds for its
+// daemon is asserted for real. Every other test in this file injects
+// `spawnDaemon` and never reaches this.
+const spawnHidden = vi.fn(() => ({ pid: 4242, unref: vi.fn() }));
+vi.mock("../util/Subprocess.js", () => ({ spawnHidden: (...args: unknown[]) => spawnHidden(...(args as [])) }));
+
+// The real resolver answers `undefined` under `vitest`, which runs from the
+// source tree where no `Cli.js` sits beside the proxy. The resolution rule
+// itself is covered by `util/CliEntry.test.ts`.
+vi.mock("../util/CliEntry.js", () => ({ resolveCliEntry: () => "/opt/jolli/dist/Cli.js" }));
+
 const { runMcpProxy } = await import("./McpProxy.js");
 const {
 	cliCoreVersion,
@@ -175,6 +186,32 @@ describeUnixSocket("runMcpProxy — cwd guards", () => {
 			});
 			expect(stderr).toHaveBeenCalledTimes(1);
 			expect(String(stderr.mock.calls[0]?.[0])).toContain("not a git repository");
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it.each([
+		["a local-agent child", () => isLocalAgentChild.mockReturnValue(true)],
+		["a plugin-bundle cwd", () => isPluginBundleCwd.mockReturnValue(true)],
+	])("stays silent for %s, whose cwd is not a repo either", async (_label, arrange) => {
+		// A local-agent child runs in a scratch cwd by construction, and a
+		// plugin-bundle cwd is a cache directory — neither is a repository, so both
+		// arrive here with `isWorktreeRoot: false`. Their refusal is deliberately
+		// silent (the guards' own text belongs to `startMcpServer`), and telling
+		// them to "point this MCP server at a workspace directory" describes a
+		// misconfiguration that does not exist.
+		arrange();
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		try {
+			await runMcpProxy({
+				cwd: "/tmp/scratch",
+				socketPath,
+				spawnDaemon: vi.fn(),
+				fallback: vi.fn().mockResolvedValue(undefined),
+				isWorktreeRoot: false,
+			});
+			expect(stderr).not.toHaveBeenCalled();
 		} finally {
 			stderr.mockRestore();
 		}
@@ -744,6 +781,30 @@ describeUnixSocket("runMcpProxy — bounded retries", () => {
 	});
 });
 
+describeUnixSocket("runMcpProxy — the daemon it spawns", () => {
+	it("spawns the CLI entry beside this bundle, never the script that launched it", async () => {
+		// `process.argv[1]` is the CLI only while `runMcpProxy` is reached solely
+		// from `Cli.js` — an invariant nothing enforces, and the same assumption
+		// that made the global daemon's trigger spawn hook entries in a loop. A
+		// sibling lookup is correct whichever entry this code is inlined into.
+		const fallback = vi.fn().mockResolvedValue(undefined);
+
+		// `readyTimeoutMs: 0` — one connect attempt after the spawn, so nothing
+		// waits out the real 15 s budget for a daemon this test never starts.
+		await expect(runMcpProxy({ cwd: CWD, socketPath, fallback, readyTimeoutMs: 0 })).resolves.toBe(
+			"fallback-inprocess",
+		);
+
+		expect(spawnHidden).toHaveBeenCalledWith(
+			process.execPath,
+			["/opt/jolli/dist/Cli.js", "mcp-serve", "--cwd", CWD, "--socket", socketPath],
+			expect.objectContaining({ detached: true, stdio: "ignore", cwd: CWD }),
+		);
+		const [, argv] = spawnHidden.mock.calls[0] as unknown as [string, string[], unknown];
+		expect(argv[0]).not.toBe(process.argv[1]);
+	});
+});
+
 // A source-shape assertion, following `DaemonServer.test.ts`'s cold-start suite,
 // because nothing else can see this regress: a new static import here type-checks,
 // lints clean and leaves every test green — the only thing that changes is the
@@ -761,6 +822,7 @@ describe("cold-start import graph", () => {
 		const ALLOWED_LEAF_MODULES = new Set([
 			"../core/AgentReentry.js",
 			"../Logger.js",
+			"../util/CliEntry.js",
 			"../util/Subprocess.js",
 			"./McpCwdGuard.js",
 			"./McpDaemonProtocol.js",
