@@ -13,6 +13,9 @@ const mocks = vi.hoisted(() => ({
 	ensurePluginDefaultProvider: vi.fn().mockResolvedValue(true),
 	readStdin: vi.fn().mockResolvedValue(JSON.stringify({ cwd: "/repo/subdir" })),
 	triggerEnsureGlobalDaemon: vi.fn().mockReturnValue(true),
+	bootstrapTelemetry: vi.fn().mockResolvedValue(undefined),
+	flushTelemetryNow: vi.fn().mockResolvedValue(undefined),
+	maybeEmitOnboardingProgress: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../core/AgentReentry.js", () => ({ isLocalAgentChild: mocks.isLocalAgentChild }));
@@ -23,6 +26,11 @@ vi.mock("../core/GitOps.js", () => ({
 vi.mock("../core/Locks.js", () => ({ withRepoHooksLock: mocks.withRepoHooksLock }));
 vi.mock("../core/RepoProfile.js", () => ({ readManualDisableFlag: mocks.readManualDisableFlag }));
 vi.mock("../core/SessionTracker.js", () => ({ loadConfig: mocks.loadConfig }));
+vi.mock("../core/TelemetryStartup.js", () => ({
+	bootstrapTelemetry: mocks.bootstrapTelemetry,
+	flushTelemetryNow: mocks.flushTelemetryNow,
+}));
+vi.mock("../core/OnboardingFunnel.js", () => ({ maybeEmitOnboardingProgress: mocks.maybeEmitOnboardingProgress }));
 vi.mock("../install/Installer.js", () => ({ install: mocks.install, uninstall: mocks.uninstall }));
 vi.mock("./SessionStartHook.js", () => ({
 	buildSessionStartContext: mocks.buildSessionStartContext,
@@ -103,6 +111,19 @@ describe("CodexPluginBootstrapHook", () => {
 			expect(mocks.ensurePluginDefaultProvider).toHaveBeenCalledWith("codex-plugin", {});
 		});
 
+		it("primes telemetry and emits the onboarding-funnel snapshot after repo-hook reconciliation", async () => {
+			await runCodexPluginBootstrap("/repo/subdir");
+
+			expect(mocks.bootstrapTelemetry).toHaveBeenCalledWith({ cwd: "/repo" });
+			expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledWith({ cwd: "/repo", config: {} });
+			expect(mocks.flushTelemetryNow).toHaveBeenCalledWith("/repo", { timeoutMs: 2_000 });
+			const bootstrapOrder = mocks.bootstrapTelemetry.mock.invocationCallOrder[0];
+			const emitOrder = mocks.maybeEmitOnboardingProgress.mock.invocationCallOrder[0];
+			const flushOrder = mocks.flushTelemetryNow.mock.invocationCallOrder[0];
+			expect(bootstrapOrder).toBeLessThan(emitOrder);
+			expect(emitOrder).toBeLessThan(flushOrder);
+		});
+
 		// The bare `$jolli` skill ships in the plugin bundle because Codex plugin skill
 		// names are flat, so nothing is written into the work tree — no menu install and
 		// therefore no git-exclude entry either. Pinned by the module mocks: importing
@@ -123,6 +144,7 @@ describe("CodexPluginBootstrapHook", () => {
 
 			expect(mocks.uninstall).toHaveBeenCalled();
 			expect(mocks.install).not.toHaveBeenCalled();
+			expect(mocks.bootstrapTelemetry).not.toHaveBeenCalled();
 			expect(output).toBeNull();
 		});
 
@@ -168,6 +190,8 @@ describe("CodexPluginBootstrapHook", () => {
 
 			expect(await runCodexPluginBootstrap("/repo/subdir")).toBeNull();
 			expect(mocks.buildSessionStartContext).not.toHaveBeenCalled();
+			// Fires on BOTH the success and failure branch, mirroring the Claude path.
+			expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledWith({ cwd: "/repo", config: {} });
 		});
 	});
 
@@ -177,6 +201,7 @@ describe("CodexPluginBootstrapHook", () => {
 
 			expect(await runCodexPluginBootstrap("/tmp/not-a-repo")).toBeNull();
 			expect(mocks.install).not.toHaveBeenCalled();
+			expect(mocks.bootstrapTelemetry).not.toHaveBeenCalled();
 		});
 
 		it("does nothing when rev-parse cannot resolve a toplevel", async () => {

@@ -47,8 +47,10 @@ import { fileURLToPath } from "node:url";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { execGit, isInsideGitRepo } from "../core/GitOps.js";
 import { withRepoHooksLock } from "../core/Locks.js";
+import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig } from "../core/SessionTracker.js";
+import { bootstrapTelemetry, flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import { readStdin } from "./HookUtils.js";
@@ -138,6 +140,15 @@ export async function runCodexPluginBootstrap(projectDir: string): Promise<Codex
 		respectManualDisable: true,
 		automatic: true,
 	});
+	// Onboarding-funnel snapshot, on BOTH the success and failure branch — mirrors
+	// PluginBootstrapHook's Claude-side fix. This SessionStart hook is the only
+	// trigger for a codex-plugin install, so without it the surface never emits
+	// onboarding_progressed at all. bootstrapTelemetry primes the in-process context
+	// (this hook never does so otherwise), and flushTelemetryNow sends it before the
+	// process exits, since a one-shot hook gets no later flush tick.
+	await bootstrapTelemetry({ cwd: worktreeRoot });
+	await maybeEmitOnboardingProgress({ cwd: worktreeRoot, config: await loadConfig() });
+	await flushTelemetryNow(worktreeRoot, { timeoutMs: 2_000 });
 	if (!result.success) {
 		log.warn("Codex plugin repo-hook reconciliation failed: %s", result.message);
 		return null;

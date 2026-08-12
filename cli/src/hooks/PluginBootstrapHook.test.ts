@@ -22,6 +22,9 @@ const mocks = vi.hoisted(() => ({
 	// fallback it was written against.
 	resolveGitFsLayout: vi.fn<() => { worktreeRoot: string } | null>(() => null),
 	triggerEnsureGlobalDaemon: vi.fn().mockReturnValue(true),
+	bootstrapTelemetry: vi.fn().mockResolvedValue(undefined),
+	flushTelemetryNow: vi.fn().mockResolvedValue(undefined),
+	maybeEmitOnboardingProgress: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../core/GitFsLayout.js", () => ({ resolveGitFsLayout: mocks.resolveGitFsLayout }));
@@ -38,6 +41,11 @@ vi.mock("../core/RepoProfile.js", () => ({
 	readManualDisableFlag: mocks.readManualDisableFlag,
 }));
 vi.mock("../core/SessionTracker.js", () => ({ loadConfig: mocks.loadConfig, saveSession: mocks.saveSession }));
+vi.mock("../core/TelemetryStartup.js", () => ({
+	bootstrapTelemetry: mocks.bootstrapTelemetry,
+	flushTelemetryNow: mocks.flushTelemetryNow,
+}));
+vi.mock("../core/OnboardingFunnel.js", () => ({ maybeEmitOnboardingProgress: mocks.maybeEmitOnboardingProgress }));
 vi.mock("../install/GitExclude.js", () => ({ addGitExcludePaths: mocks.addGitExcludePaths }));
 vi.mock("../install/ClaudeHookInstaller.js", () => ({
 	getClaudeAgentHookHealth: mocks.getClaudeAgentHookHealth,
@@ -119,6 +127,21 @@ describe("PluginBootstrapHook", () => {
 		});
 	});
 
+	it("primes telemetry and emits the onboarding-funnel snapshot after repo-hook reconciliation", async () => {
+		await runPluginBootstrap("/repo/subdir");
+		expect(mocks.bootstrapTelemetry).toHaveBeenCalledWith({ cwd: "/repo" });
+		expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledWith({ cwd: "/repo", config: {} });
+		expect(mocks.flushTelemetryNow).toHaveBeenCalledWith("/repo", { timeoutMs: 2_000 });
+		// bootstrapTelemetry (priming the in-process context) must run before the
+		// funnel snapshot tries to track() through it, which must run before the
+		// one-shot hook flushes and exits.
+		const bootstrapOrder = mocks.bootstrapTelemetry.mock.invocationCallOrder[0];
+		const emitOrder = mocks.maybeEmitOnboardingProgress.mock.invocationCallOrder[0];
+		const flushOrder = mocks.flushTelemetryNow.mock.invocationCallOrder[0];
+		expect(bootstrapOrder).toBeLessThan(emitOrder);
+		expect(emitOrder).toBeLessThan(flushOrder);
+	});
+
 	it("records the first session without depending on Stop-hook hot reload", async () => {
 		await runPluginBootstrap("/repo", { sessionId: "s1", transcriptPath: "/tmp/transcript.jsonl" });
 		expect(mocks.saveSession).toHaveBeenCalledWith(
@@ -152,6 +175,11 @@ describe("PluginBootstrapHook", () => {
 		expect(mocks.install).not.toHaveBeenCalled();
 		expect(mocks.ensurePluginDefaultProvider).not.toHaveBeenCalled();
 		expect(output).toBeNull();
+		// Never reaches repo-hook reconciliation, so the funnel snapshot must not fire —
+		// maybeEmitOnboardingProgress has its own manual-disable gate, but this path
+		// should not even pay for loadConfig()/bootstrapTelemetry() to reach it.
+		expect(mocks.bootstrapTelemetry).not.toHaveBeenCalled();
+		expect(mocks.maybeEmitOnboardingProgress).not.toHaveBeenCalled();
 	});
 
 	it("lock contention never writes unlocked and rechecks whether a peer created the menu", async () => {
@@ -198,6 +226,7 @@ describe("PluginBootstrapHook", () => {
 		expect(await runPluginBootstrap("/tmp")).toBeNull();
 		mocks.execGit.mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "no repo" });
 		expect(await runPluginBootstrap("/tmp")).toBeNull();
+		expect(mocks.bootstrapTelemetry).not.toHaveBeenCalled();
 	});
 
 	it("takes the worktree root off the filesystem, without asking git twice", async () => {
@@ -222,6 +251,11 @@ describe("PluginBootstrapHook", () => {
 			"/repo",
 		);
 		expect(mocks.buildSessionStartContext).not.toHaveBeenCalled();
+		// The onboarding-funnel snapshot fires on BOTH the success and failure branch of
+		// repo-hook reconciliation, mirroring EnableCommand's report tail — a failed
+		// install is exactly the "installed but never got into a working state" drop-off
+		// this snapshot exists to make visible.
+		expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledWith({ cwd: "/repo", config: {} });
 	});
 
 	it("does not seed or emit context when Claude integration is disabled", async () => {

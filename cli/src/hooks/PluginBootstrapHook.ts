@@ -15,9 +15,11 @@ import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { resolveGitFsLayout } from "../core/GitFsLayout.js";
 import { execGit, isInsideGitRepo } from "../core/GitOps.js";
 import { withRepoHooksLock } from "../core/Locks.js";
+import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
 import { toForwardSlash } from "../core/PathUtils.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig, saveSession } from "../core/SessionTracker.js";
+import { bootstrapTelemetry, flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { getClaudeAgentHookHealth } from "../install/ClaudeHookInstaller.js";
 import { addGitExcludePaths } from "../install/GitExclude.js";
 import { install, uninstall } from "../install/Installer.js";
@@ -155,6 +157,15 @@ export async function runPluginBootstrap(
 		respectManualDisable: true,
 		automatic: true,
 	});
+	// Onboarding-funnel snapshot, on BOTH the success and failure branch (mirrors
+	// EnableCommand's report tail) — this SessionStart hook is the only trigger for a
+	// claude-plugin install, so without it the surface never emits onboarding_progressed
+	// at all. bootstrapTelemetry primes the in-process context (this hook never does so
+	// otherwise: it only flushes what Cli.js already buffered), and flushTelemetryNow
+	// sends it before the process exits, since a one-shot hook gets no later flush tick.
+	await bootstrapTelemetry({ cwd: worktreeRoot });
+	await maybeEmitOnboardingProgress({ cwd: worktreeRoot, config: await loadConfig() });
+	await flushTelemetryNow(worktreeRoot, { timeoutMs: 2_000 });
 	if (!result.success) {
 		log.warn("Plugin repo-hook reconciliation failed: %s", result.message);
 		return buildPluginBootstrapOutput(reloadSkills, null);
