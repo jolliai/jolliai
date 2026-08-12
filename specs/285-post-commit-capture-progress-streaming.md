@@ -27,7 +27,7 @@ Give an interactive caller (a terminal user, or an AI-agent session) a live, mil
 - The post-commit hook's enqueue and worker-spawn behavior (owned by the post-commit-hook-enqueue spec).
 - The pre-push hand-off protocol whose request, result and lock files share this directory (owned by spec 335); this spec covers only the fact that they are here and therefore have to be swept.
 - How a generation failure is classified into a stored error marker, and every other consumer of that marker (owned by the queue-worker / summary-error specs); this spec consumes only what the stored milestone carries.
-- The database-availability routing decision the pre-watch check consults (owned by the cutover-routing spec); this spec owns only what the hook does with a blocked answer.
+- The database-availability routing decision the pre-watch check consults (owned by spec 344); this spec owns only what the hook does with a blocked answer.
 
 ## Data Contracts
 
@@ -214,4 +214,4 @@ At the start of processing each commit-typed entry the worker opportunistically 
 - The shared login-expiry remediation copy surfaced on an auth-expired `stored` milestone, and the parallel session-start reminder surface, are defined by the local-agent login-expiry remediation spec. That spec owns one of the three stored renderings; the choice between all three, and the generic failure line, are owned here.
 - The pre-push hand-off files and per-push lock that share this directory are defined by spec 335; only their presence in the sweep is owned here.
 - The classification that turns a generation failure into a stored error kind — and the local-agent backend that produces it — are owned by the queue-worker / summary-error specs and by spec 280.
-- The storage-route decision the pre-watch check consults is owned by the cutover-routing spec.
+- The storage-route decision the pre-watch check consults — including which conditions produce the blocked answer this spec branches on — is owned by spec 344.

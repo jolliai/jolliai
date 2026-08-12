@@ -30,6 +30,8 @@ Errors from fixers are reported in the fixes section, not via stderr.
 
 The command never prompts the user for confirmation before applying a repair. `--fix` is the explicit consent — there is no second `[y/N]` gate.
 
+**One flag changes what `--fix` means entirely.** When the recovery flag is also passed, the command takes a completely different path: no probe runs, no repair loop runs, and `--fix` degrades to a single boolean — "overwrite a healthy database". See "Recovery mode" below.
+
 ### Per-probe repair
 
 Repairs are attempted in the same order the probes ran. A probe contributes to the fix loop only if it has a fixer attached; probes that are purely informational or whose fault has no automated remedy are skipped.
@@ -48,6 +50,41 @@ Repairs are attempted in the same order the probes ran. A probe contributes to t
 | Config | `warn` "no credentials" | No fixer. Credentials require explicit user action (`jolli auth login` or `jolli configure --set apiKey=…`). |
 | dist-paths/`<source>` | `warn` "(MISSING)" | Removes the stale per-source registry entry. Reports `removed stale entry`. |
 | dist-paths registry empty | `fail` "no sources registered" | No fixer. The user must run `jolli enable`. |
+| System of record | `fail` "unavailable" | No fixer. A repository whose truth has nowhere to live needs recovery mode below, not an unattended repair. |
+| Database backup | `fail` staleness **only** (spec 59) | Takes one snapshot through the ordinary opportunistic path (spec 349). Reports `snapshot written to <path>` on success, or `snapshot not taken: <reason>` otherwise — **without throwing in either case**. |
+| Database backup | `fail` invalid folder, or unreachable folder | No fixer. Both need a human; a snapshot attempt would fail the same way. |
+
+### Recovery mode (`--recover`)
+
+A separate mode of the same command, selected before any probe runs and returning without running one. It answers "the memory database is missing or damaged — what can I restore from?" and, when told which file to use, performs the restore.
+
+**Invocation forms:**
+
+- `jolli doctor --recover` — survey and list only; never writes.
+- `jolli doctor --recover --from <snapshot path>` — survey, then restore from that file.
+- `jolli doctor --recover --from <snapshot path> --fix` — the same, with `--fix` carrying the **only** meaning it has in this mode: consent to overwrite a healthy database.
+
+**The survey, printed first in every form:**
+
+1. The database's path, and its file state — which of the healthy combinations it is in, or that it is absent, or the alarming state where its write-ahead sidecars survive without it (spec 348).
+2. **Only when the database is absent**: the identity verdict (fresh install / deleted / ambiguous residue) and both raw identity witnesses, each printed as `(none)` when unrecorded.
+3. Every snapshot candidate, newest first, one line each: its timestamp (or a marker when the filename's stamp cannot be parsed), the identity fragment from its filename, a pre-migration marker where applicable, and its path. When there are none, the list is replaced by a line naming every folder that was scanned.
+
+The folders scanned are the configured-or-default snapshot folder, the directory of the `--from` file when one was given, and the folder recorded inside the database as last used — the last of which is reachable only while the database still opens, which is exactly what may be gone.
+
+With no `--from`, the command ends by printing how to invoke the restore, and returns.
+
+**With `--from`, the fixed three-step recovery order runs** (spec 349 owns the ordering rationale; the two fill steps' mechanics are owned elsewhere):
+
+| Step | What runs | Output |
+| --- | --- | --- |
+| ① Restore | The snapshot becomes the database — refused over a healthy one without `--fix`, integrity-checked before and after copying | `Restored from <path>.` |
+| ② Mirror fill | Every registered repository's memory mirror fills memory gaps only; additive, never deleting, never touching activity data | one line with nodes, repositories and skipped counts |
+| ③ Frozen-branch fill | Only repositories carrying a freeze marker; recovers what existed before the freeze | one line, **printed only when at least one repository was touched**, telling the user to finish each one's cutover |
+
+The run ends by telling the user to re-run the diagnostics. Steps ② and ③ run **only after a successful restore** — a refusal or a failure prints the reason to stderr and stops there.
+
+**A refusal is not a failure of the restore, but it is reported like one:** both a refusal (a healthy database, no `--fix`) and an outright failure print `Restore <status>: <reason>` to stderr and set a non-zero exit.
 
 ### Behavior on read-only repos
 
@@ -66,6 +103,13 @@ The exit code is decided independently of the original diagnostic verdicts:
 | `0`  | Every fixer that ran succeeded **and** every remaining `fail` verdict has an attached fixer (i.e. every fault was repaired). Warnings do not affect the exit code. |
 | `1`  | Either at least one fixer threw, **or** at least one probe with a `fail` verdict has no fixer (an unfixable failure). |
 
+In recovery mode the probes never run, so neither rule applies:
+
+| Code | Condition |
+|------|-----------|
+| `0`  | The survey was printed (with or without candidates), or the restore succeeded. |
+| `1`  | The restore was refused or failed. |
+
 The invariant is: a `0` exit from `--fix` means a subsequent `jolli doctor` would also return `0`. CI relies on this.
 
 ## Notable Behavior
@@ -80,8 +124,17 @@ The invariant is: a `0` exit from `--fix` means a subsequent `jolli doctor` woul
 - **Neither of the two credential-shaped faults has a fixer, and that boundary is intentional.** Missing credentials and an unusable local agent CLI both require choosing a provider, typing a key, or clearing a setting — which an unattended repair pass must not do on the user's behalf. The interactive repair ladder (spec 291) is the counterpart surface that repairs exactly these two faults, and it is never invoked from `doctor`.
 - **A richer remedy message did not move the no-fixer boundary.** The local-agent diagnostic line now names up to two concrete user actions (sign in; clear the explicit-path setting), and `--fix` still performs neither. Removing a value the user explicitly configured is exactly the class of decision `--fix` is not allowed to make, so the growth in *advice* is deliberately not matched by growth in *automation*. The consequence recorded above still holds unchanged: an unusable local agent CLI is a `fail` with no fixer, so it forces exit `1` and cannot be cleared by re-running `--fix`.
 
+- **The backup fixer reports success even when it took no snapshot.** It returns a message either way — "written to …" or "not taken: `<reason>`" — and returns rather than throwing, so the fixes section prints a tick and the exit-code rule counts the fault as repaired. A user whose snapshot folder became unreachable between the probe and the repair sees a green line and exit `0` with the same fault still present on the next run. (Surprising; the same "a fixer that returns is assumed to have worked" rule as above, with a message that quietly says otherwise.)
+- **The one fault this command can genuinely create is also the only one it repairs.** Backup staleness appears because snapshots ride two event-driven call sites and nothing schedules them, so a week of not committing is enough to fail the report — and the repair is simply to run the pass by hand. (Notable.)
+- **`--fix` means something entirely different in recovery mode.** There it is not "apply every repair" but a single consent to overwrite a healthy database — and because the recovery flag short-circuits before the probes, `jolli doctor --recover --fix` repairs *nothing else*: no hooks are reinstalled, no lock is released, no stale registry entry is removed. (Surprising.)
+- **A refusal exits non-zero.** Restoring over a healthy database without consent is the safe, expected outcome of re-running recovery, and it still reports as a failure on stderr with a non-zero exit. (Notable.)
+- **The two gap-fill steps run unconditionally after a successful restore, and one of them prints nothing when it does nothing.** The mirror line is always printed, including as all-zeros; the frozen-branch line appears only when at least one fenced repository was touched. (Notable.)
+- **The most useful folder in the survey is the one most likely to be unavailable.** The previously-configured snapshot folder is recorded inside the database, so after a re-target it stays a candidate source — but only while the database still opens, which is precisely the situation recovery exists for. (Surprising.)
+
 ## Shared Behavior
 
 - The `--cwd <dir>` flag is shared with most other `jolli` sub-commands. When omitted, the project directory is auto-resolved to the enclosing git repository root.
 - The probes, their order, the verdict labels, and the diagnostic-line format are all identical to the diagnostic-only mode (spec 59).
-- The `--fix` flag does not affect which probes run; it only controls whether the fix loop runs after them.
+- The `--fix` flag does not affect which probes run; it only controls whether the fix loop runs after them — except in recovery mode, where no probe runs at all.
+- The snapshot engine the backup fixer invokes, the restore it performs, the verification and sidecar-removal ordering inside that restore, and the rationale for the three-step recovery order are all owned by spec 349. The file-state and identity verdicts the survey prints are owned by spec 348, and the database they describe by spec 347.
+- The backup health verdict that decides whether the fixer is attached at all — including that staleness is its only repairable outcome — is owned by spec 59.

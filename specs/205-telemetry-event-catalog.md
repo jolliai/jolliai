@@ -33,7 +33,7 @@ Every event is recorded as one envelope with this fixed shape; event-specific da
 | -- | -- | -- |
 | Schema version | integer | A constant (currently `1`); bumped only on a breaking envelope-shape change. |
 | Event name | string | One of the registered names (see catalog). |
-| Surface | string | The client kind, carried through from the build-time identity rather than validated against a fixed set. `cli`, `vscode` and `intellij` are the kinds the catalog's own descriptions assume; the two AI-host plugin bundles each carry their own kind and reach the backend under it, undescribed here (see the derivation note). |
+| Surface | string | Normally the client kind, carried through from the build-time identity rather than validated against a fixed set — but a second recording entry point stamps a caller-supplied string instead, bypassing that derivation entirely. `cli`, `vscode` and `intellij` are the kinds the catalog's own descriptions assume; the two AI-host plugin bundles each carry their own kind, and `web-local` arrives only through the override (see the derivation note). |
 | Surface version | string | The client's version, or `unknown` when unparseable. |
 | Install identifier | string (UUID) | The stable per-machine anonymous id. Must be a UUID; the backend's column is UUID-typed and silently drops a non-UUID value. |
 | Session identifier | string, optional | The current AI/editor session id when one exists; omitted otherwise. |
@@ -49,7 +49,37 @@ Every event is recorded as one envelope with this fixed shape; event-specific da
 
 The surface and its version are split from a client-identification string of the form `kind/version` (e.g. `cli/1.2.0`, `vscode-plugin/0.99.4`): the part before the first slash is the kind, the part after is the version. A missing slash makes the whole string the kind with version `unknown`; an empty version becomes `unknown`. The kind `vscode-plugin` is normalized to the dashboard surface `vscode`. The JVM IDE fixes its surface to `intellij` and uses the plugin version directly.
 
-**The split is pass-through, not an allowlist**, and that is the surprising part: exactly one kind (`vscode-plugin`) is rewritten, and every other kind reaches the envelope as the build stamped it. Each AI-host plugin bundle stamps its own distinct kind, so those bundles emit under kinds this document does not describe and no client-side check rejects. Whether such a kind is meaningful is decided at ingest, not here. (Notable: a reader who takes the envelope's surface description as a closed set will under-count the surfaces actually reporting.)
+**The split is pass-through, not an allowlist** — and that is still true of the ordinary path, but it is no longer the only path a surface value can arrive by. Two entry points feed the surface field:
+
+1. **The ordinary recording entry point** derives it from the build-time identity as above. Exactly one kind (`vscode-plugin`) is rewritten; every other kind reaches the envelope as the build stamped it. Each AI-host plugin bundle stamps its own distinct kind, so those bundles emit under kinds this document does not describe.
+2. **An explicit-surface recording entry point** takes a surface **string as an argument** and stamps it verbatim. The build-time identity is not consulted, the one rewrite does not apply, and the string is subject to **no client-side check whatsoever** — it is not matched against any list, and the envelope's surface field is an unconstrained string all the way through the buffer and onto the wire.
+
+Whether a surface value is meaningful is therefore decided **entirely at ingest**, against the backend's own closed allowlist — after the client has buffered it, uploaded it, and had the batch acknowledged. An off-list value is dropped there, silently and successfully.
+
+The rest of the envelope is **not** overridable: the override argument reaches the surface field and nothing else, so every other field on such an envelope still describes the process that recorded it.
+
+(Notable: a reader who takes the envelope's surface description as a closed set will under-count the surfaces actually reporting — and a reader who assumes the surface is always the build's own kind will mis-attribute every envelope that came through the override.)
+
+### The `web-local` surface — a surface no build stamps
+
+`web-local` is a surface value that **no build produces**. There is no client kind for it; it exists only as a constant the override path passes. It is stamped by the long-lived local server process on events forwarded to it from the browser page it serves (see **Telemetry Startup and Command Instrumentation** for that process's own bootstrap and flush, and the trap below for what such an envelope actually describes).
+
+**The envelope is the SERVER's, not the browser's.** The browser contributes exactly two things: the event name and the properties bag. Every other field is stamped by the recording process:
+
+| Field on a `web-local` envelope | Who it describes |
+| -- | -- |
+| Operating system, architecture | The **server process's** host, from the process itself — never the browser's platform. |
+| Runtime version | The **server process's** runtime tag — never a browser version or user-agent. |
+| Surface version | The **server build's** version — the local page has no version of its own on the wire. |
+| Session identifier | The server process's, which is **absent** — its bootstrap supplies none, so the field is omitted from every event it records. |
+| Install identifier, environment, timestamp, schema version, per-event identity, always-null account | All the recording process's, as for any other event. Notably the timestamp is the **server's** clock, not the browser's. |
+| Event name, properties | The browser's — the only browser-originated content. |
+
+Do not read a `web-local` envelope as a browser-originated record: it says nothing about which browser, which platform the browser ran on, or what time the browser thought it was.
+
+Two independent gates screen what the browser may claim: the event name must be registered **and** must be one of a fixed four-name set (below); the properties bag is not gated by name at all, only run through the ordinary scrubber. Restricting the names is what stops a caller reaching that endpoint from forging an unrelated registered event under this surface — the forwarding endpoint deliberately carries **no** mutation-token requirement, because the token is inlined only into the write-surface pages and a token-gated beacon would silently drop every event fired from the read-only ones.
+
+Delivery is **fire-and-forget by contract**: every bad input — an unreadable or oversized body, a non-object payload, an unregistered or off-list name — is dropped and answered with a success-with-no-content status, so the browser's beacon can never learn to retry. The browser side likewise never throws and prefers a beacon over a request precisely because a nav or range click triggers a full-page navigation the event has to survive.
 
 ### The event catalog (registry)
 
@@ -114,6 +144,22 @@ The registry is the single source of truth, ordered, append-only. Each entry is 
 | `memory_shared` | User invoked Share for a branch's memories (read-only share link). | none. |
 | `key_rejected` | The server rejected the API key (401/403). | `retried` (boolean), `where` (discriminator). |
 | `reauth_completed` | Re-authentication after a rejected key finished. | `outcome` (discriminator: success / failed). |
+
+**Local web dashboard UI (the `web-local` surface only):**
+
+These four are the complete set the forwarding endpoint accepts, and the only registered names that ever carry the `web-local` surface.
+
+| Name | Description | Properties |
+| -- | -- | -- |
+| `dashboard_opened` | The local web dashboard was opened in a browser — fired **once per browser session**, because navigating the dashboard is a full page reload and a naive call would re-fire on every page. | `first_run` (boolean — first-ever open in **this browser profile**; the marker is per-origin browser storage, so it re-reports across ports, across browsers, and after a storage clear). Both markers live in browser storage, so a profile that blocks storage (a private window) records **no** open event at all rather than reporting every load as a first run. |
+| `dashboard_view_switched` | The local web dashboard's left-nav view was switched. Emitted only on a real change — clicking the already-active view is silent. | `view` (discriminator: `stats` / `standup` / `repositories` / `memories`). |
+| `range_changed` | The dashboard time-range control was changed. Emitted only on a real change; the custom-range branch reports on the date picker's confirm. | `range` (discriminator: `7d` / `30d` / `90d` / `custom`). |
+| `chart_split_changed` | A dashboard card's split-by control was changed. Emitted only on a real change of the active split. | `card` (discriminator: `tokens` / `mcp`), `split` (discriminator — the selected split, whose vocabulary is per card: `type` / `model` / `repo` for the tokens card, `server` / `tool` for the MCP card). |
+
+Two of these carry sharp edges worth stating outright:
+
+- **`dashboard_view_switched` is a distinct event from `view_switched`, not a spelling of it.** `view_switched` is the IDE tool-window event, with its own view vocabulary (`current` / `bank` / `knowledge`); this one is the web dashboard's left nav, with a disjoint vocabulary. The two names overlap by suffix only and must never be merged or read as one metric. The settings entry in that nav opens a modal rather than switching the view, so it never appears as a `view` value.
+- **`range_changed` reports mapped display labels, not the internal tokens.** The range control's internal values are a different vocabulary from the `7d` / `30d` / `90d` documented above; the emit site translates each one into the label the button shows, so the discriminator matches this catalog and the user-visible control. The translation is a lookup with a **pass-through fallback**: an internal range value with no mapping entry would emit its raw internal token, outside the documented set. Two such values are accepted elsewhere in the product and simply have no button today. `custom` is emitted verbatim from the date-picker's confirm, not through the lookup.
 
 ### Naming convention and append-only contract
 
@@ -192,7 +238,10 @@ A bump of the schema-version constant is the signal for a breaking envelope-shap
 - **Keys are scrubbed, not just values.** A content-derived dynamic map key (a path, email, or repo name used as a key) is run through the same string redaction as values, so it cannot leak verbatim; static keys pass through unchanged. (Surprising; intentional.)
 - **Token-shape redaction is word-boundary-anchored, not start-anchored.** A secret embedded mid-message is still redacted, while an unrelated word that merely contains the prefix letters is not tripped. (Notable.)
 - **The scrubber is a second line of defense, not the only one.** The backend re-scrubs; the client scrubber bounds depth and string length and drops non-serializable values primarily so that a buggy call site cannot leak content even before it leaves the machine. (Notable.)
-- **The transparency document cannot drift from the code.** The events table is generated from the registry and a build test fails if the committed copy is stale. (Notable.)
+- **The transparency document cannot drift from the code — but only its table can't.** The events table is generated from the registry and a build test fails if the committed copy is stale. The surrounding prose is human-authored and has drifted: it tells the reader the surface is one of `cli`, `vscode`, or `intellij`, while three further values (`web-local` and the two AI-host plugin kinds) are actually emitted. The generation guard has nothing to say about that sentence. (Surprising; the guarantee is narrower than it reads.)
+- **A caller can stamp an arbitrary surface, and only the backend objects.** The explicit-surface entry point performs no local validation of the string at all; an off-list value is buffered, uploaded, acknowledged, and then dropped at ingest. Nothing on the client reports that the events went nowhere. (Surprising; intentional sharp edge.)
+- **A `web-local` envelope describes the local server process, not the browser.** Its operating system, architecture, runtime version, surface version, session (absent), and timestamp all come from the recording process; the browser supplies only the event name and the properties. Treating it as a browser record misattributes every one of those fields. (Surprising; the most likely misreading of this surface.)
+- **The `web-local` name gate is a fixed four-name set, narrower than the registry.** Registration alone is not enough to reach that surface: the forwarding endpoint sits ahead of the local server's mutation-token gate, so anything that clears that server's own host and origin checks can post to it untokened — and without the name set, such a caller could forge an unrelated registered event under this surface. The properties bag has no such per-name gate and is only scrubbed. (Notable, defensive.)
 - **The salted-hash separator is a NUL byte for cross-surface stability.** All surfaces use the same separator so the same (value, salt) yields the same hash regardless of which surface produced it. (Notable.)
 - **`object_action` naming and the property bag keep additions migration-free.** Event-specific fields live in `properties` (schema-on-read server-side), so adding a field never requires a backend migration; the name never encodes the field. (Notable.)
 - **`command_invoked` covers success, failure, and every MCP tool call from one name.** The command hook emits ok:true on the success path and ok:false from the top-level catch when an action threw. MCP is the exception: the session-level command:"mcp" event is suppressed in the command hook, and the MCP server instead emits one command_invoked{command:"mcp", tool} per tool call; the tool value is folded to "unknown" for any name not in the advertised tool set.

@@ -4,6 +4,8 @@
 
 Perform the one-shot import of a user's personal-space content from the backend's legacy database storage into the user's newly minted git-backed Memory Bank vault, push it as the first commit, then notify the backend to flip the space's backing from database to git.
 
+This migration runs **database → git-backed store**, and is a different, opposite migration from the local memory database's own import (cross-ref 351), which runs **git-backed store → local database**; the two share no state, no trigger and no direction.
+
 ## Scope
 
 **In scope:**

@@ -167,6 +167,22 @@ Re-deriving the set from the code means counting only the **outermost** labels: 
 
 The set of accepted transcript sources for the two transcript actions and for the conversation-overlay action is derived from the surface's own canonical source list rather than being an inlined copy, so a source added there becomes acceptable here automatically. That derivation is not cosmetic: the inlined list it replaced had drifted to roughly half the canonical set, and the surface was rejecting sources its own aggregator was already emitting. The names match the IDE host's own enumeration, so a round trip by name works.
 
+### `config-save` derives and overrides the Jolli site
+
+The session-state action's config save is the JVM host's **only** configuration writer, and its Settings dialog has an editable Jolli API key field — so this action, not the host, owns the rule that the stored Jolli **site** follows the key.
+
+Before delegating to the scoped save, the action inspects the incoming configuration object's key field:
+
+- **Key present as a string** → derive the tenant from the key's own embedded claim (trailing slashes stripped, screened against the origin allowlist) and, when a value comes back, write it as the site.
+- **Key absent, or present but not a string** — which is how a *cleared* key arrives, as a null — → derive nothing and pass the caller's object through **verbatim**, with no site key at all. Because the scoped save merges shallowly, the absence is what preserves the stored site, so signing out never rewrites it.
+
+Two properties of this are deliberate and load-bearing:
+
+- **It applies to EVERY save, not only to one that changed the key.** Each caller on that host round-trips the key already on disk, so an entirely unrelated save — a sign-off toggle, a global-instructions edit, the telemetry switch — also repairs a site that had drifted before this rule existed.
+- **The derived value OVERRIDES any site the caller sent, rather than deferring to it.** No caller can send one today (the host's configuration document has no such field), but if one ever did and the two disagreed, honouring the caller would persist a pair that is known-wrong: requests route on the key, not on the stored site. A caller whose key yields no claim keeps whatever it sent, since there is nothing to override it with.
+
+**Why the rule lives here rather than being ported to the host.** Adding a site field to the host's own configuration document would look tidier and is the wrong shape: that host's serializer emits nulls, so every unrelated save from it would then transmit an explicit null for the site and blank the value on disk. The field's *absence* is exactly what makes the shallow merge preserve it. (Note this is the harsher failure of the two: an explicitly-undefined value is dropped by serialization and merely deletes the key, while a transmitted null survives and persists as a literal null.)
+
 ### Selection state: the always-present empty array
 
 Three operations return the user's commit-exclusion set — the shared-store action's selection read, and both of the working-context action's listing operations — and **all three materialise the skills group as an empty array rather than omitting it** when nothing is excluded. The field is optional on disk, because it postdates the file. Omitting it costs twice: a caller that saw it vanish could not tell "nothing excluded" from "the serving build is too old to know about skills", and the JVM host's mirror of this shape turns an absent key into a null collection that throws on first use. So "nothing excluded" has to arrive as an empty array, not as no key.

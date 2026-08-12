@@ -11,11 +11,15 @@ Persist summary files on a long-lived parallel git ref using only object-databas
 - How one or more files are written or deleted in a single atomic ref update.
 - How the path of the underlying ref directory is resolved when the host repository uses an alternate working-tree pointer (a worktree-style indirection).
 - The contract this storage implements (read one path, write a batch with a message, list paths under a prefix, check existence, ensure initialization).
+- The **three refusal gates the write batch carries ahead of the plumbing**, in order: the durable manual-disable opt-out, a freeze check read from disk, and a second per-identity check for a recorded switch away from this ref.
+- The states in which this ref is still **read** even though it is never written.
 
 **Out of scope (boundaries):**
 - The schema or interpretation of files written under this storage (covered by "Summary Tree Structure" and downstream consumers).
 - The folder-mirror copy of the same files (covered by "Folder-Based Summary Storage").
 - The conditional combination of this storage with other backends (covered by "Dual-Write Summary Storage").
+- **What the freeze marker means, what else its presence changes, who writes it, and the protocol that records the switch** — covered by "Orphan Branch Cutover Fence and Compare-and-Swap" (345). Only the two gates' position inside this storage's write batch, and their failure policies, are stated here.
+- Which backend a caller is given for a repository in each routing state (covered by "Cutover Routing State Table", 344).
 - Locking and concurrency at higher levels (queues, hooks). This storage performs no in-process or filesystem locking of its own; it relies entirely on the atomicity of a single ref-update at the underlying VCS layer.
 - The durable repo-wide manual-disable opt-out — how it is set, cleared, and stored, and the full inventory of writes it suppresses (covered by "Manually-Disabled Zero-Write Contract"). Only its position inside this storage's write batch is stated here.
 
@@ -88,6 +92,12 @@ This classification is a property of the **single-path** read only. The multi-pa
 
 ### Write batch (`writeFiles(files, message)`)
 0. If the project is **manually disabled**, return immediately. The refusal sits **before** the initialization routine in step 1, so a disabled project never has the ref created for it: on a repository whose ref does not yet exist, a batch write leaves the repository with no parallel ref at all rather than an empty initialized one. This is the only entry point on this storage that carries the gate — read, list, existence, and the standalone initialization routine are unaffected. The opt-out itself is defined by **Manually-Disabled Zero-Write Contract**.
+0a. **Freeze check.** Re-read the repository's freeze marker **from disk**, for this instance's working directory (or the process working directory when it has none). If a marker is present, **throw**, with a message stating that the ref is frozen, that this process is holding a pre-freeze storage object, and that it must be restarted so writes route to the database. Any failure reading the marker is treated as "no marker".
+
+   Reading from disk here, immediately before the plumbing, is the only thing that can close the window for a long-lived process — an editor host, a long-lived server, a worker started before the freeze — which holds *this object* for its lifetime and can never be reached by any cache invalidation. A write racing the freeze therefore either lands before the swap's tip re-check (which then retries and imports it) or fails loudly here; it never lands silently on a frozen ref after the swap is recorded.
+0b. **Recorded-switch check.** Ask whether a switch has been recorded for this working directory's repository identity, and **throw** if so, with a message stating that the ref is retired for this repository and that writes route to the database. This second gate exists because the freeze marker is **per clone**: a checkout of the same remote that the swap never enumerated, or a clone made afterwards, carries no marker at all, yet a write here would land on a ref nothing will read again.
+
+   This check **fails open**: any failure — a missing database, one this build cannot open, any thrown error — answers "not recorded" and the write proceeds. An unfrozen repository must never be blocked by a broken database, and the caller has already consulted the marker in step 0a. The consequence is real and deliberate: a marker-less clone of a repository that *has* switched can still write this retired ref whenever the database cannot answer. A separate drift probe exists to catch that (see 345).
 1. Call the initialization routine first; this is a no-op if the ref already exists.
 2. Resolve the current commit at the ref's tip; if resolution fails, throw with the underlying stderr.
 3. Resolve the tree object at that commit; if resolution fails, throw.
@@ -107,6 +117,11 @@ All plumbing failures during steps 4–6 throw with the underlying stderr.
 
 ### Existence (`exists`)
 - Verify the qualified ref `refs/heads/<name>` resolves; success means the ref exists.
+
+### Reading a ref that is never written
+The two gates above sit on the **write batch alone**. Reading one path, reading many paths, listing, checking existence and the standalone initialization routine are all ungated, so an instance of this storage reads (and can still create) the ref regardless of any freeze or recorded switch.
+
+That is not merely theoretical. Once a repository has been frozen, routing stops constructing this backend as its system of record — but one path still hands it out: the store layer's untargeted fallback degrades the unroutable state to this backend and reads through it, with a warning. That is the single place in the product where the unroutable state does not fail loudly (see 346). Before a freeze, this backend is the system of record and is read through normally, even though higher-level read resolution may prefer the folder mirror instead.
 
 ### Tree-update primitives (internal)
 - "Replace or add an entry in a tree": list the current tree's entries (NUL-delimited), drop any entry whose name matches the target, append a new entry line of the form `<mode> <type> <hash>\t<name>`, write the resulting block as a new tree. Order of entries in the input is irrelevant to the resulting tree's identity.
@@ -151,10 +166,16 @@ There is no Present → Absent transition implemented by this storage.
 - **Maximum capture buffer** for VCS-command stdout is fixed at 10 mebibytes; larger outputs cause the underlying process invocation to fail and surface as a generic error. (Notable.)
 - **Backend identity is carried as declared data, not derived from runtime type.** The contract's identity value exists because both shipped bundles are minified without identifier preservation, so an instance's runtime type name reaches production mangled — and mangled *differently* in each bundle — making it useless in a diagnostic. The value selects no behavior and is never persisted; its only production consumer is a single debug line. Because it is optional on the contract, consumers render an unset value as `unknown`. (Notable; the whole point is that it survives the build.)
 - **Initial-index version mismatch.** The initial-tree content sets `version: 1`, while the ref name itself encodes schema version 3. The storage layer makes no attempt to reconcile these; downstream consumers maintain and upgrade the index document. (Surprising; intentional.)
-- **There is one implementation of this storage.** The former JVM-based port is gone. The JVM-hosted surface still **reads** the orphan branch natively — it lists and shows branch files with its own direct VCS invocations, bypassing the storage abstraction entirely — but it performs **no writes**: every write on that surface goes through this implementation over a bridge action. So the write protocol described above has exactly one implementation, while the read path has two (this one, and the JVM surface's native display-time reads). (Notable.)
+- **There is one implementation of this storage, and one implementation of every operation on it.** The former JVM-based port is gone: that host's storage adapter forwards every read, batch read, listing, existence probe, initialization and write to this implementation over a bridge action. Its own version-control helper still carries a "list files in a branch" and a "read a file from a branch" primitive, but **nothing in its production sources calls either** — its only remaining direct invocations of that shape target ordinary commits, not this ref. (Notable; both branch-read helpers on that host are unreached.)
+- **The write batch carries three refusals, and only the first is about the user.** After the manual-disable opt-out come a freeze check read from disk and a recorded-switch check keyed by repository identity, both of which throw. The disk read is deliberate: routing keeps *newly constructed* storage off a frozen ref, but a long-lived process holds this object for its lifetime, and nothing can invalidate that. (Notable; the last line of the freeze protocol.)
+- **The two freeze gates have opposite failure policies.** The marker check treats any read failure as "no marker" and proceeds; the recorded-switch check treats any database failure as "not recorded" and proceeds. Both fail open, in the same direction: writing is preferred to blocking, because an unfrozen repository must never be stopped by state it never had. The cost is that a clone carrying no marker, of a repository that has switched, can still write this ref whenever the database cannot answer — which is exactly what the switch protocol's drift probe watches for. (Surprising; intentional, with a compensating control in 345.)
+- **Reads and initialization are not gated at all.** A frozen repository can still be read through this backend, and a standalone initialization call can still create the ref for one — only the batch write refuses. (Notable.)
 
 ## Shared Behavior
 - The durable repo-wide manual-disable opt-out that suppresses this storage's write batch is defined by **Manually-Disabled Zero-Write Contract**.
+- The freeze marker that step 0a reads, the recorded switch that step 0b probes, everything else their presence changes, the protocol that writes them, and the drift probe that catches a write this backend let through are defined by **Orphan Branch Cutover Fence and Compare-and-Swap** (345).
+- Which backend a repository is given in each routing state — and therefore when this one stops being constructed at all — is defined by **Cutover Routing State Table** (344).
+- The untargeted fallback that hands this backend out for reads in the unroutable state, and the distinction between resolving the system of record and resolving read storage, are defined by **System-of-Record versus Read Storage Resolution** (346).
 - The schema and interpretation of stored summary documents are defined by **Summary Tree Structure**.
 - A folder-on-disk mirror of the same files, layered on top of this storage, is defined by **Folder-Based Summary Storage**.
 - Conditional dual-write semantics that combine this storage with the folder mirror are defined by **Dual-Write Summary Storage**.

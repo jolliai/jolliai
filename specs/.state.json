@@ -1,9 +1,9 @@
 {
   "branches": {
     "main": {
-      "revision": "f184549fc5229e4e562591ea00b2c5494e105ec9",
-      "subject": "Fix Kimi review round 2: context7, cursor scoping, sessionKey, ENAMETOOLONG",
-      "reviewedAt": "2026-08-12T03:10:19Z",
+      "revision": "3d45b46b005d1f5873be2d9469be48a407f62268",
+      "subject": "Fix PR review findings for the local SQLite dashboard",
+      "reviewedAt": "2026-08-12T17:25:14Z",
       "actor": "doug.schroeder",
       "skill": "specs-update"
     }

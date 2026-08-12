@@ -55,7 +55,11 @@ Each substitution is performed against an expected template marker; a **missing 
 
 ### Embedded-data escaping
 
-Before inlining, three sequences in the graph JSON are neutralized so they cannot break out of the inline-script context: the closing-script-tag sequence (case-insensitive) and the two raw line-separator characters JSON leaves unescaped. Substitutions are applied as literal replacements (never patterns that would reinterpret special replacement tokens), because the inlined assets and JSON contain such tokens.
+Before inlining, three substitutions neutralize the graph JSON so it cannot break out of the inline-script context: **every `<` character** becomes its JSON unicode-escape form `\u003c`, and the two raw line-separator characters JSON leaves unescaped (U+2028, U+2029) become `\u2028` / `\u2029`. `>` and `&` are deliberately left alone — neither can move the tokenizer out of script-data state.
+
+The `<` rule is character-wide rather than a match on the closing-script-tag sequence: a script block has three tokenizer exits (`</script`, `<!--`, and a nested `<script` inside the escaped state the second one opens), all beginning with `<`, and `\u003c` is the same string to a JSON parser. Neutralizing only the first left a commit body carrying `<!--<script>` able to swallow every script inlined after the data assignment. The substitution is correct only because the input is an already-serialized JSON document, where every `<` sits inside a string literal. This command runs the same shared rule as the other surfaces that inline graph data into a page, not a private copy.
+
+The template substitutions are applied as computed replacements rather than replacement patterns (which would reinterpret special replacement tokens), because the inlined assets and JSON contain such tokens.
 
 ### Asset resolution
 

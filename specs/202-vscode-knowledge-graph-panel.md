@@ -62,7 +62,13 @@ The packaged viewer template is rewritten with three marker-based substitutions 
 
 ### Embedded-data escaping
 
-Before inlining, three sequences in the graph JSON are neutralized so they cannot break out of the inline-script context: the closing-script-tag sequence (case-insensitive) and the two raw line-separator characters JSON leaves unescaped. (Inert on modern engines; defense in depth.) The data assignment is the **only** inline script and is the only one carrying the script nonce.
+Before inlining, three substitutions neutralize the graph JSON so it cannot break out of the inline-script context: **every `<` character** becomes its JSON unicode-escape form `\u003c`, and the two raw line-separator characters JSON leaves unescaped (U+2028, U+2029) become `\u2028` / `\u2029`. `>` and `&` are deliberately left alone — neither can move the tokenizer out of script-data state.
+
+The `<` rule is character-wide, not the closing-script-tag sequence: a script block has three tokenizer exits (`</script`, `<!--`, and a nested `<script` inside the escaped state the second one opens), all beginning with `<`. Neutralizing only the first left a topic body carrying `<!--<script>` able to swallow every script inlined after the data assignment. Only the two line-separator escapes are "inert on modern engines, defense in depth"; the `\u003c` escape is load-bearing. The substitution is correct only because the input is already a serialized JSON document, where every `<` sits inside a string literal.
+
+The panel runs this from the **same shared implementation** the command-line export uses — deliberately not a per-surface copy, because the three copies that preceded it each neutralized the closing-script-tag sequence and each missed `<!--`.
+
+The data assignment is the **only** inline script and is the only one carrying the script nonce.
 
 ### Asset-serving strategy
 

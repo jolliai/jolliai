@@ -12,6 +12,7 @@ Refuse to save any Jolli URL whose host is not on a fixed allowlist of approved 
 - The HTTPS-only requirement and how it composes with the host check.
 - The suffix-boundary host check that prevents `<allowed>.<attacker>` style bypasses.
 - The set of call sites that gate a trust boundary on this check: persistence, environment-variable resolution, and composition of a URL that is handed to a browser.
+- The two forms the check is exposed in — a throwing assertion and a non-throwing predicate — the single shared rule behind them, and which kind of caller uses which.
 - The save-time-only doctrine: where this check runs and where it deliberately does not.
 - The failure mode (refuse to save, surface a fixed user-facing error) and what it preserves about the trusted state.
 - Two implementations (canonical port and JVM IDE port) and their parity gap.
@@ -63,6 +64,19 @@ The forbidden patterns include:
 - `jolli.ai.attacker.com` (allowlist entry as a non-suffix substring)
 - `evil-jolli.ai` (allowlist entry as a suffix without the boundary dot)
 - `JOLLI.AI` only without lowercasing — the implementation lowercases first, so the user-facing behavior is case-insensitive.
+
+### Two forms: a throwing assertion and a non-throwing predicate
+
+The acceptance predicate above is stated **once** and exposed in two forms, so the two can never disagree about what "allowed" means:
+
+| Form | Input | Answer | Used by |
+| --- | --- | --- | --- |
+| Throwing assertion | A URL string | Returns nothing when accepted; throws one of the two fixed messages below otherwise. | Every trust-boundary call site in the list further down — the save sites, the environment-variable resolver, and the browser-facing URL composition — where a rejection must stop the caller. |
+| Non-throwing predicate | A URL string | `true` / `false`. An unparseable input answers `false` (it never throws). | The two *guard-shaped* callers that ask "is this tenant usable?" and have a fallback rather than a failure when the answer is no: the resolver that picks which tenant URL a sign-in persists, and the resolver that derives the tenant URL to persist alongside a hand-pasted product API key. |
+
+The two forms differ **only** in how they report the outcome — the parse, the HTTPS test, the non-empty-host test, and the suffix-boundary test are the same shared rule. The throwing form's two messages are unchanged and remain the user-facing contract.
+
+**Building the error object is what the predicate form exists to avoid — not the cost of a `try`/`catch`.** The rejection message embeds the offending origin, so a caller that constructs and then swallows that error has still created a string derived from the user's product API key. The repository's static-analysis gate does not model a `catch` as stopping such a value: it follows the throw out of the pasted-key tenant resolver, up through the guided front door, and into the command-line surface's top-level fatal-error print, and reports it as clear-text logging of key-derived data. Testing the predicate never builds the string at all. A guard-shaped caller must therefore use the predicate form rather than wrapping the assertion.
 
 ### Failure mode
 
@@ -133,6 +147,7 @@ There is no Trusted → Tainted transition. The allowlist throw runs *before* th
 - **The error message contains the parsed `origin`, not the raw input.** Using `origin` (scheme + host + port) means a user who pasted a full URL with a path and query string sees a sanitized form of what was rejected, and an attacker cannot inject misleading path or query content into the rendered error message. (Notable, defensive.)
 - **Hostname is lowercased before comparison.** This is purely a usability concession (so a user pasting `https://APP.JOLLI.AI` is not refused for casing) — the underlying URL parser already handles case-insensitive host matching at most layers, but the explicit lowercase removes any ambiguity. (Notable.)
 - **Save-time validation, not request-time validation.** Re-checking the allowlist on every outbound request would be "defense against a scenario that can't happen" once save is the only entry point. The single exception is the code-exchange call, which re-checks because it accepts a `jolliUrl` argument and a long-lived process could be holding a stale value. (Surprising; intentional.)
+- **The non-throwing form exists to avoid CONSTRUCTING the error, not to avoid catching it.** A guard that wraps the throwing form in a `try`/`catch` still builds a message embedding the origin decoded out of the user's API key, and the repository's clear-text-logging analysis does not treat the `catch` as stopping that value — it follows the throw all the way to the command-line surface's top-level fatal-error print. Testing a predicate never builds the string. Rewriting a guard-shaped caller back into a wrapped assertion would look equivalent and would re-open the finding. (Surprising; intentional.)
 - **The allowlist is the entry point's only argument, not a parameter.** The function takes a URL and consults the module-local allowlist constant directly. It cannot be called against a different list. The trust boundary is a code change, not a configuration change. (Notable.)
 - **A failed save does not taint the trusted state.** The throw runs before any persistence call, so the in-memory pending state can be cleared by the caller (the browser-login flow does exactly this) and the on-disk trusted value is unaffected. (Notable.)
 - **`configure --set jolliApiKey` runs the API-key validator, which calls this check on the decoded `u`.** A key whose payload claims an off-allowlist URL is refused with this layer's message, even though the user only supplied the key. (Notable.)

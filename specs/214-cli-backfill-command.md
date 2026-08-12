@@ -4,6 +4,8 @@
 
 The command-line surface for historical back-fill: resolve a candidate list of the local user's own recent commits (or an explicit override subset), run the back-fill engine, and render the outcome — as one-shot text/JSON, as an NDJSON progress stream, or (for `list-candidates`) as a single cold-start-signals JSON line with no engine call at all. Exists so out-of-process hosts (the IntelliJ plugin, which shells out to this command rather than calling the engine in-process like VS Code does) get the same cold-start and progress UX as an in-process caller.
 
+**Not to be confused with the database repository back-fill** (cross-ref 350), an unrelated feature of the same name that reconciles already-existing facts into the local memory database and never calls a model. This command is the one that generates memories for historical commits and therefore spends model budget.
+
 ## Scope
 
 **In scope:**

@@ -11,8 +11,8 @@ Refuse to claim a per-repository subdirectory under the Memory Bank parent folde
 - The two deliberate non-refusals (a project checked out beneath the system temp root; a project checked out beneath the Memory Bank parent).
 - The three consumers that consult the boundary — write-side storage construction, read-side storage resolution, and the user-knowledge scanner's root resolution — and how each degrades.
 - One further consumer that resolves a per-repository subdirectory in order to *read* the mirror and does **not** consult the boundary, and what its claiming resolution therefore creates.
-- Which storage configurations skip the boundary evaluation entirely.
-- The read-only derivation of the effective Memory Bank state from exactly two configuration values, and its three arms.
+- Which routing states and which storage configurations skip the boundary evaluation entirely.
+- The read-only derivation of the effective Memory Bank state from exactly two configuration values, its three arms, and the **divergence between what it reports and what the write side now does**.
 - The single shared wording table that turns that state into user-facing text, its three severity levels, and every text string verbatim.
 - The three surfaces that report the state: the human-readable command-line status row, the machine-readable status snapshot field, and the read-only state line in the desktop-editor settings panel's Memory Bank tab.
 - The guarantee that the boundary changes no naming rule and relocates no previously-resolved subdirectory.
@@ -21,8 +21,8 @@ Refuse to claim a per-repository subdirectory under the Memory Bank parent folde
 **Out of scope (boundaries):**
 - The per-repository subdirectory naming rule, the collision / adoption policy, the `-N` suffix ladder, and the claiming resolver's atomicity contract (covered by **Memory Bank Folder Layout**).
 - The three-layer on-disk shape of a per-repository subdirectory (hidden machine-readable, visible per-branch, generated topic-wiki) — covered by **Memory Bank Folder Layout** and **Folder-Based Summary Storage**.
-- Which backend serves reads in each storage configuration, the composite's write fan-out, and the shadow dirty-flag protocol (covered by **Storage-Mode Selection**).
-- The remaining probes the read-side resolution performs *after* the boundary allows (folder-readiness probe, dirty-flag probe) — covered by **Storage-Mode Selection**; only the boundary's position ahead of them is defined here.
+- Which backend serves reads and holds the truth in each routing state (covered by **Cutover Routing State Table**, 344), and the dual-write composite's write fan-out and shadow dirty-flag protocol (covered by **Dual-Write Summary Storage**).
+- The remaining probes the read-side resolution performs *after* the boundary allows (folder-readiness probe, dirty-flag probe) — covered by **Cutover Routing State Table** (344); only the boundary's position ahead of them is defined here.
 - The classification rules the user-knowledge scanner applies once it has a root (covered by **Memory Bank Folder Layout**).
 - Every other row of the command-line status report and every other field of the status snapshot (covered by the status-command spec).
 - Every other control in the settings panel's Memory Bank tab — folder picker, migrate action, compile-exclude input, sync controls (covered by the settings-webview spec).
@@ -102,18 +102,23 @@ Given a project path and the configured parent, in order:
 
 ### Consumer 1 — write-side storage construction
 1. Load the configuration; a load failure degrades to an empty configuration with a warning.
-2. Read the storage mode, defaulting to dual-write when absent, and the configured parent.
-3. **If the mode is not the explicit version-controlled-ref-only value, evaluate the boundary.** On refusal: log a warning naming the project path and the mode that was skipped, and return version-controlled-ref-only storage.
-4. Otherwise construct the configured storage: the dual-write composite, the folder-only backend, or (for the ref-only value and every unrecognized value) the version-controlled-ref backend.
+2. Read the configured parent. **The storage mode is read only to log that it is being ignored** — it no longer selects anything on this path.
+3. Resolve the repository's routing state (spec 344). In the unroutable state, **throw**; nothing is constructed and the boundary is never evaluated.
+4. **Evaluate the boundary — unconditionally, in every writable routing state.** On a refusal, return the state's system-of-record backend alone, with no folder mirror:
+   - In the two frozen states, the database-backed backend, **silently** (this branch logs nothing).
+   - In the un-cutover state, the version-controlled-ref backend, logging a warning naming the project path.
+5. Otherwise construct the dual-write composite pairing that state's system-of-record backend with the folder mirror.
 
-Because step 3's guard excludes only the explicit ref-only value, an **unrecognized** mode value still pays for a boundary evaluation even though step 4 reaches the ref-only backend either way; the only observable difference is which log line is written.
+The mode-shaped guard that used to sit at step 4 is gone with the mode dispatch: every writable state can reach the folder layer, so every writable state pays for a boundary evaluation.
 
 ### Consumer 2 — read-side storage resolution
-Identical guard, in the same position — ahead of every mode dispatch. On refusal: log a warning naming the working directory and the mode, and return version-controlled-ref-only storage.
+The boundary sits inside the **un-cutover** branch only. Read resolution resolves the routing state first: the unroutable state throws, and the two frozen states return the database-backed backend without ever constructing a folder mirror — so they need no boundary consultation at all. In the un-cutover state the mode-gated guard survives unchanged: for every mode value other than the explicit ref-only one, evaluate the boundary, and on refusal log a warning naming the working directory and the mode and return version-controlled-ref-only storage.
+
+Because that guard excludes only the explicit ref-only value, an **unrecognized** mode value still pays for a boundary evaluation even though the dispatch reaches the ref-only backend either way; the only observable difference is which log line is written.
 
 The read side is gated for a reason specific to it: the folder backend it would build is rooted through the **claiming** resolver, so an ungated *read* created the very subdirectory it was only trying to read. Degrading costs nothing at this seam — in dual-write mode the freshly created subdirectory would have failed the folder-readiness probe and fallen back to the version-controlled-ref layer anyway, just after leaving the subdirectory behind.
 
-When the boundary allows, resolution proceeds to the mode dispatch and (in dual-write mode) the readiness and dirty-flag probes defined by **Storage-Mode Selection**.
+When the boundary allows, resolution proceeds to the mode dispatch and (on the default value) the readiness and dirty-marker probes defined by **Cutover Routing State Table** (344).
 
 ### Consumer 3 — user-knowledge root resolution
 1. Load the configuration and read the configured parent. **The storage mode is not consulted at all** — the boundary is evaluated unconditionally.
@@ -129,7 +134,7 @@ A further consumer resolves the per-repository subdirectory in order to **read**
 - Merely attaching that read path materializes the per-repository subdirectory that the boundary would have refused. Attachment happens at host activation and again whenever the user saves settings (the re-attach exists so the reader stops pointing at a previous parent folder), so both moments claim.
 - The attempt is silent either way. Whether the read path attached or not is recorded only in an internal activation log that no surface displays, and **no effective-state text reports that a read path is active** — the wording table describes where *writes* will land. A user on this host therefore has no indication that a subdirectory was claimed for reading, nor that reads are being served from it.
 
-The read path's own fallback behavior (what it reads, when it declines, and how it diverges from the canonical read-side resolution) belongs to **Storage-Mode Selection** and to the direct hidden-layer reader spec (307); what belongs here is only that the boundary is not on its path.
+The read path's own fallback behavior (what it reads, when it declines, and how it diverges from the canonical read-side resolution) belongs to **Cutover Routing State Table** (344) and to the direct hidden-layer reader spec (307); what belongs here is only that the boundary is not on its path.
 
 ### Deriving the effective state
 1. Read the storage mode, defaulting to dual-write when absent.
@@ -137,7 +142,11 @@ The read path's own fallback behavior (what it reads, when it declines, and how 
 3. Evaluate the boundary against the project path and the configured parent. On refusal, return the `degraded` arm carrying the refusal reason, plus the resolved parent when it can be resolved (omitted when it cannot).
 4. Otherwise return the `active` arm carrying the mode and a **read-only peek** of the per-repository subdirectory: the path the claiming resolver would return, computed by the same selection rules (including the suffix ladder) but with every filesystem mutation omitted. *Displaying* the state therefore cannot create the subdirectory it describes.
 
-The derivation reads exactly two configuration values and is not gated on the durable repo-wide manual-disable opt-out.
+The derivation reads exactly two configuration values and is not gated on the durable repo-wide manual-disable opt-out. It also never consults the routing state.
+
+**Step 2 is a bug, and it is documented in place as mirroring something that no longer exists.** Its justification is that both storage factories fall through their dispatch to the version-controlled-ref backend on the ref-only value and on any unrecognized one, so the report merely mirrors what actually happens. Only the **read** factory still does that, and only while the repository is un-cutover. The **write** factory has no such branch at all: it ignores the storage mode entirely and constructs the dual-write composite in every writable routing state (spec 344).
+
+The observable consequence: a repository configured with the ref-only value — or with a typo — **reports "Off — memories are stored on the orphan branch only" while its every write is fanned out to the Memory Bank folder**. The status row, the machine-readable snapshot and the settings-panel line all say no folder layer exists; the folder is being written on every commit. The report is also strictly cheaper than the truth here, since step 2 short-circuits ahead of the boundary evaluation and the version-control interrogation, so a working directory that the boundary would refuse still reports "off" rather than a blocker.
 
 ### Rendering to text
 A single switch over the state's arm produces the display record per the wording table. The degraded arms fall through a secondary switch over the refusal reason, whose default arm supplies the unresolvable-parent wording — so a future reason without its own entry renders as the unresolvable-parent text rather than crashing or printing nothing.
@@ -189,13 +198,15 @@ Consumer-side observation points:
 ## Notable Behavior
 
 - **Refusal is silent apart from a log.** A refused consumer returns version-controlled-ref-only storage (or an empty scan result) and reports success. Nothing throws, nothing is created, and the resulting behavior is **indistinguishable at the API surface** from a user who deliberately chose the ref-only configuration. That indistinguishability is precisely why the effective state is reported separately — before it existed, a Memory Bank that stopped updating (or never appeared) was unattributable from the outside and its only symptom was staleness. (Notable; intentional.)
-- **An unrecognized storage-mode value renders as "Off", not as a warning.** Both storage factories fall through their dispatch to the version-controlled-ref backend on an unrecognized value, so the report mirrors what actually happens rather than claiming a folder layer is live. A configuration typo therefore presents as a deliberate opt-out. (Surprising; intentional mirroring.)
+- **The report claims to mirror the write side and no longer does — a repository configured for ref-only storage reports "Off" while it dual-writes the folder.** The derivation returns its ref-only arm for the explicit ref-only value and for any unrecognized one, justified in place by both factories falling through to the version-controlled-ref backend. That is true of the read factory only, and only before a cutover; the write factory ignores the mode outright and always builds the dual-write composite. So the one report that exists specifically because a silent folder-layer degradation was unattributable now itself misreports the folder layer as absent while it is being written on every commit. (Notable; a real defect, documented as reality.)
+- **An unrecognized storage-mode value renders as "Off", not as a warning.** A configuration typo presents as a deliberate opt-out — and, per the point above, as an opt-out that is not actually in force on the write side. (Surprising.)
 - **"Off" is its own severity, deliberately not a warning.** Ref-only storage is a valid configuration, so its line takes a neutral glyph and the muted colour rather than the warning colour. Only a *refused* folder configuration warns. (Notable.)
 - **The active arm reports the resolved per-repository subdirectory, not the configured parent.** The suffix ladder means the two routinely differ, and the subdirectory actually being written is the answer to "where did my memories go". (Notable.)
 - **The parent is omitted for the unresolvable-parent reason, so no invented path is ever printed.** The degraded arm carries the parent on every other reason (including `not-a-project`, whose wording happens not to use it); only the arm whose blocker *is* the parent's unresolvability drops the field, and its wording points the user at the home-directory environment instead. (Notable; intentional.)
 - **Reporting is read-only by construction.** The active arm resolves through the peek path, never the claiming path, so asking where the Memory Bank is can never be what brings it into existence — the same reason the re-target flow peeks. (Notable.)
 - **The state is not gated on the manual-disable opt-out.** A repository whose owner has explicitly disabled the product still reports `active` with a subdirectory path. The report answers "which storage configuration and which boundary verdict apply here", not "is the product currently running". (Surprising.)
-- **The boundary is skipped entirely for the explicit ref-only configuration, but not for an unrecognized one.** In ref-only mode no folder is touched, so the boundary's version-control interrogation would be pure overhead — and the reporting derivation short-circuits ahead of it too, which is why a non-project path under a ref-only configuration reports "off" rather than `not-a-project`. An unrecognized value still runs the boundary, which changes nothing except the log line. (Notable.)
+- **The mode-shaped skip survives on the read side only.** Read resolution still skips the boundary for the explicit ref-only value — no folder is touched there, so the version-control interrogation would be pure overhead — but not for an unrecognized one, which pays for an evaluation that changes nothing except the log line. Write-side construction skips it for nothing: every writable routing state can reach the folder layer. The reporting derivation short-circuits ahead of the boundary for both values, which is why a non-project path under a ref-only configuration reports "off" rather than `not-a-project`. (Notable.)
+- **The two frozen routing states never consult the boundary on the read side, and always consult it on the write side.** They read from the database-backed backend and construct no folder mirror, so there is nothing to gate; but they still dual-write the folder, so their construction is gated exactly like the un-cutover one — except that a refusal there is silent, where the un-cutover refusal logs a warning. (Notable; asymmetric logging.)
 - **A project beneath the Memory Bank parent is fine; a Memory Bank parent beneath the project is not.** The containment test runs in exactly one direction. An earlier parent-as-prefix test read as equivalent but rejected every checkout beneath a parent that also held source trees (a documents root, a cloud-drive root), degrading the whole folder layer to ref-only with nothing but a debug line to explain why the Memory Bank had stopped updating. The current test additionally catches the case the prefix test missed: a parent pointed *into* a source tree. (Notable; intentional regression-closer.)
 - **The observed `folder-inside-repo` case is a Memory Bank parent that is itself a working tree.** Such a parent passes the first condition, resolves to itself as the main working-tree root, and would otherwise claim a subdirectory named after itself nested one level inside itself. Any working directory *inside* that parent — including one of its own per-repository subdirectories — resolves to the same working-tree root and is caught by the same test. (Notable.)
 - **The system temp root is deliberately not gated.** Every junk-folder case observed in practice is already covered by the not-a-working-tree condition, while a temp-root rule would reject legitimately temp-rooted checkouts. (Notable; intentional.)
@@ -217,9 +228,10 @@ Consumer-side observation points:
 ## Shared Behavior
 - The per-repository subdirectory naming rule (remote-origin basename → main-working-tree-root basename → path basename → literal fallback), the collision / reuse / adoption policy, the `-N` suffix ladder with its timestamp fallback, the claiming resolver's atomicity contract, and the read-only peek path whose selection this spec's active arm reports are defined by **Memory Bank Folder Layout**.
 - The validation-and-fallback policy for the configured Memory Bank parent — absolute, no traversal segment, otherwise fall back to the default parent with a warning — and its strict throwing variant are defined by **Memory Bank Folder Layout**.
-- The three storage configurations, which backend serves reads in each, the dual-write composite's write fan-out and shadow dirty-flag protocol, and the folder-readiness and dirty-flag probes that the read-side resolution performs after this boundary allows are defined by **Storage-Mode Selection**.
+- The routing state table that decides which backend pairing is constructed, the retired configuration key's one surviving read-side consumer, and the folder-readiness and dirty-marker probes that the read-side resolution performs after this boundary allows are defined by **Cutover Routing State Table** (344). The composite's write fan-out and shadow dirty-marker protocol are defined by **Dual-Write Summary Storage**.
 - The three-layer on-disk shape of each per-repository subdirectory, and the classification rules the user-knowledge scanner applies once it has a root, are defined by **Memory Bank Folder Layout** and **Folder-Based Summary Storage**.
 - Every other row of the human-readable status report, and every other field of the machine-readable snapshot, are defined by the status-command spec.
 - Every other control on the settings panel's Memory Bank tab — the folder picker, the migrate action, the compile-exclude input, and the sync controls — is defined by the settings-webview spec.
 - The durable repo-wide manual-disable opt-out, which this derivation deliberately ignores, is defined by the manual-disable spec.
-- The direct hidden-layer read path whose resolution is ungated by this boundary — what it reads, when it declines, and how its own gates work — is defined by the direct hidden-layer reader spec (307), and its divergences from the canonical read-side resolution by **Storage-Mode Selection**.
+- The direct hidden-layer read path whose resolution is ungated by this boundary — what it reads, when it declines, and how its own gates work — is defined by the direct hidden-layer reader spec (307), and its divergences from the canonical read-side resolution by **Cutover Routing State Table** (344).
+- The distinction between resolving the system of record and resolving read storage, which is what makes the read-side dispatch this boundary gates only one of two questions, is defined by **System-of-Record versus Read Storage Resolution** (346).

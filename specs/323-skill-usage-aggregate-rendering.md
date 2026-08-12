@@ -46,7 +46,7 @@ Four fields, and nothing else. `SkillCommitRef` (the archived snapshot behind `s
 | `buildSkillsTable(rows)` | none — returns `string[]` so callers splice it under their own heading | both documents below, and `SummaryMarkdownBuilder`'s per-commit skills section |
 | `buildSkillsAggregateMarkdown(summary, refs)` | frontmatter + `# Skills used — <hash8>` + italicised commit message | `FolderStorage.generateSkillsAggregate` writes it to `<branchFolder>/skills--<hash8>.md`; the VS Code `previewCommittedSkills` command and the local dashboard's memory page both render it on demand; the JVM host receives it over the bridge |
 | `buildLiveSkillsMarkdown(rows)` | `# Skills used — uncommitted` + a one-line explanation | the VS Code `openSkillsAggregate` command; the JVM host over the bridge |
-| `buildSkillsSummaryLabel(rows)` | none — one line of text | `SummaryMarkdownBuilder` (the exported memory Markdown's `- Skills used — …` row), `SummaryHtmlBuilder` (the VS Code memory-detail panel's aggregate row), the dashboard's Context list, and the JVM host over the bridge |
+| `buildSkillsSummaryLabel(rows)` | none — one line of text | `SummaryMarkdownBuilder` (the exported memory Markdown's `- Skills used — …` row), `SummaryHtmlBuilder` (the VS Code memory-detail panel's aggregate row), the local dashboard's memory-detail Context list (as the skills row's secondary line, with ` · some inferred` appended when any row is heuristic — the row's body is fetched separately, keyed by the commit hash), and the JVM host over the bridge |
 | `skillsAggregateKey(hash8)` | — | `skillsAggregateFileName` below, and the `skill` push kind's per-commit article `entryKey` |
 | `skillsAggregateFileName(hash8)` | — | `FolderStorage` (write, heal, delete) |
 

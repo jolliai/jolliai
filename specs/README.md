@@ -30,7 +30,7 @@ gate a change.
 
 - [01 — Orphan Branch Summary Storage](01-orphan-branch-summary-storage.md) — persist summaries on a long-lived parallel git ref using object-database plumbing only, never checking out a tree.
 - [02 — Folder-Based Summary Storage](02-folder-based-summary-storage.md) — store summaries as plain files in a user-chosen folder with a metadata sidecar tracking AI-generated files and branch mappings.
-- [03 — Storage-Mode Selection](03-dual-write-summary-storage.md) — pick ref-only, folder-only, or the dual-write composite from a single config value, with primary-wins conflict semantics.
+- [03 — Dual-Write Summary Storage](03-dual-write-summary-storage.md) — the composite every writable routing state constructs, its primary-wins conflict semantics, and the retirement of the single config value that used to select between backends.
 - [04 — Summary Tree Structure](04-summary-tree-structure.md) — the in-memory commit-summary tree, its per-node fields, aggregation rules, and the schema-version discriminator between two layouts.
 - [05 — Summary Index Format](05-summary-index-format.md) — a flat record set enabling lookup, listing, pagination, and cross-branch matching without loading summary payloads.
 - [06 — Summary Schema Migration](06-summary-schema-migration.md) — the two-phase idempotent upgrade from the legacy flat-records format to the unified hoist tree, with a 48-hour safety window.
@@ -43,6 +43,22 @@ gate a change.
 - [215 — Memory Bank Migration Engine](215-memory-bank-migration-engine.md) — copy the whole orphan-branch store into the Memory Bank folder resumably and idempotently, then keep the visible layer reconciled.
 - [232 — Canonical Repo URL and Name Derivation](232-canonical-repo-url-and-name-derivation.md) — normalize a git remote into one stable key across transports and casing, plus the derived repo name and branch slug.
 - [311 — Project State-Root Resolution](311-project-state-root-resolution.md) — anchor an implicitly-supplied working directory to its enclosing worktree root so a subdirectory can never fork a second per-project state store.
+- [344 — Cutover Routing State Table](344-cutover-routing-state-table.md) — the four-state route resolved from a per-clone freeze marker plus a database witness, and the backend each state yields on write and on read.
+- [345 — Orphan Branch Cutover Fence and Compare-and-Swap](345-orphan-branch-cutover-fence-and-cas.md) — what freezing a repository's parallel ref means, every refusal it introduces, and the locked swap that makes the database the system of record.
+- [346 — System-of-Record versus Read Storage Resolution](346-system-of-record-vs-read-storage-resolution.md) — why resolving where truth lives is a different question from resolving where a read is served, and the states in which the two disagree.
+
+## Local dashboard and the memory database
+
+- [347 — Machine-Level Memory Database: Store, Schema and Migration Ladder](347-dashboard-sqlite-store-and-schema-migration.md) — the machine-global database file, its two-half schema, owner-only permissions, and an append-only migration ladder that refuses a file newer than the running build.
+- [348 — Memory Database Deletion Detection](348-dashboard-db-deletion-detection.md) — distinguishing a fresh install from a deleted database from ambiguous residue, by file-combination state and a stored instance identity.
+- [349 — Memory Database Snapshot and Restore](349-dashboard-db-snapshot-and-restore.md) — a daily-gated verified copy with retention floors, and a restore that guarantees the copy's integrity but never its recency.
+- [350 — Dashboard Database Repository Backfill](350-dashboard-db-repo-backfill.md) — set reconciliation of commits, summaries, sessions and worktree state into the database, spending no model budget — not to be confused with the historical attribution back-fill.
+- [351 — Orphan Import Lifecycle and Resume Cursor](351-orphan-import-lifecycle-and-resume-cursor.md) — the stored import record, its ordering fingerprint and mode-pinned cursor, and the three liveness states it reports.
+- [352 — Local Dashboard HTTP Server](352-local-dashboard-http-server.md) — the loopback service behind the dashboard command: how it binds, its route surface, its browser-security layers, and the small set of endpoints that demand a token while the rest do not.
+- [353 — Dashboard Read Model Query Layer](353-dashboard-read-model-query-layer.md) — how each view's payload is derived from a read-only handle, and the scope, window and dimension axes every view shares.
+- [354 — Dashboard Database Write Protocol](354-dashboard-database-write-protocol.md) — the pending-then-project write path and the producer wrappers that cannot fail their caller, so no capture depends on the service being up.
+- [355 — Dashboard Repo Registry and Probe](355-dashboard-repo-registry-and-probe.md) — how a repository becomes known: a machine-global registry file the database's own table projects from, plus the pre-registration folder probe.
+- [356 — Local Dashboard Browser Application](356-local-dashboard-browser-ui.md) — the no-build browser app inlined into every page, its views and modal, its refresh loop, and its zero external network requests.
 
 ## Summary generation and the LLM path
 
@@ -95,6 +111,7 @@ gate a change.
 - [278 — Antigravity Conversation Discovery and Transcript Reading](278-antigravity-session-and-transcript-reading.md) — recover the workspace path from a per-conversation encrypted database, then read the plaintext transcript beside it.
 - [279 — Cursor CLI (cursor-agent) Session and Transcript Reading](279-cursor-cli-session-and-transcript-reading.md) — read the terminal `cursor-agent` product's own plain JSON/JSONL layout, unrelated to the Cursor IDE source.
 - [339 — Kimi Code CLI Session Discovery and Transcript Reading](339-kimi-code-cli-session-and-transcript-reading.md) — find this host's sessions with no lifecycle hook, recover each one's working directory from a per-session state document, and normalize its wire-event stream into canonical turns.
+- [357 — Transcript Tool-Call Tally and MCP Classification](357-transcript-tool-call-tally-and-mcp-classification.md) — the shared rule classifying each host's tool names as server-backed or built-in and tallying them per slice, where an unrecognized host is filed built-in rather than name-tested.
 - [305 — Re-Enable Transcript Discovery Catch-Up](305-re-enable-transcript-discovery-catch-up.md) — re-scan recorded sessions from their frozen watermark when a repository is re-enabled, recovering the window during which discovery was suspended; editor-only, uncapped, and paid inside the enable gesture.
 
 ## Working-memory state: overlays, selection, pins
@@ -416,7 +433,7 @@ gate a change.
 - [249 — MCP & Skills Integration](249-intellij-mcp-and-skills-integration.md) — extract the bundled CLI to a machine-global directory and shell out to its integrations-only enable; there is no native MCP registry writer.
 - ~~[250 — Transcript Plan Discovery](250-intellij-transcript-plan-discovery.md)~~ **(REMOVED)** — the IDE-side scanner and its hook are gone; plans enter the registry only through the CLI's discovery, and this surface only reads.
 - [251 — Create-PR View](251-intellij-create-pr-view.md) — a branch-level tab aggregating every committed memory on the branch into one draft and sharing them in the same submit action, opened in two stages so a cheap draft paints before the expensive one replaces it.
-- [307 — Direct Memory-Mirror Read Path](307-intellij-direct-memory-mirror-read.md) — a second, filesystem-direct read source for four single-item memory shapes, attached after migration and gated per read on the out-of-sync marker, whose degradations are invisible and can be outlived by the cache in front of it.
+- ~~[307 — Direct Memory-Mirror Read Path](307-intellij-direct-memory-mirror-read.md)~~ **(REMOVED)** — the second, filesystem-direct read source is deleted along with its per-read out-of-sync gate and its attach lifecycle; every data read on this surface now goes through the bridge. The sibling metadata reader (314) is a different accessor and survives.
 - [309 — PR-Status Cache](309-intellij-pr-status-cache.md) — a project-scoped in-memory cache over the three forge probes, with two freshness windows, join-one-in-flight-probe deduplication, and a retention policy that keeps a genuine negative but discards a failed answer.
 - [252 — Share-to-Jolli Core](252-intellij-share-to-jolli.md) — the UI-free core sharing one memory and its plans, persisting returned ids, and cleaning up orphans behind both share entry points.
 - ~~[254 — Post-Commit Summarization Pipeline](254-intellij-post-commit-summarization-pipeline.md)~~ **(REMOVED)** — the IDE-native per-commit summarization pipeline no longer exists on this surface; summarization is owned entirely by the CLI queue worker.

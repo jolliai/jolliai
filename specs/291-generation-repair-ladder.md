@@ -12,7 +12,7 @@ When a credential or a provider is already configured but memory generation cann
 - The eligibility gate that decides whether the ladder runs at all.
 - The three rungs: the key/provider crossover rung, the no-crossover rung, and the local-agent rung — with their exact headlines, menu text, default answers, and the rule for unmatched input, including how the local-agent rung is parameterized by the configured agent tool.
 - The single one-shot re-probe offered by the local-agent rung, and why it can succeed.
-- The two key-entry branches and their asymmetric validation.
+- The two key-entry branches and their asymmetric validation, and the tenant site the Jolli branch persists alongside the key.
 - Where every persisted change lands.
 - The invariant that the configured provider is only ever changed by an explicit choice.
 - The contract between the ladder and its two callers: the verdict it reports is advisory and is discarded.
@@ -142,9 +142,19 @@ The single retry is meaningful rather than cosmetic because probe **failures are
 ### Key entry (asymmetric by provider)
 
 - **Anthropic key** — prompts `Anthropic API Key (press Enter to skip):`. Empty input prints `Skipped. Set a key in settings or run `jolli configure` later.` and changes nothing. A supplied key is saved **with no validation whatsoever**, the provider is pinned to Anthropic, and `✓ Anthropic key saved` is printed.
-- **Jolli key** — prompts `Jolli API Key (press Enter to skip):`. Empty input prints the same skip line. A supplied key is **validated against the Jolli origin allowlist before anything is written**: on rejection it prints `Error: <message>` to standard error and **saves nothing** (the provider is left untouched); on acceptance it saves the key, pins the provider to Jolli, and prints `✓ Jolli key saved`.
+- **Jolli key** — prompts `Jolli API Key (press Enter to skip):`. Empty input prints the same skip line. A supplied key is **validated against the Jolli origin allowlist before anything is written**: on rejection it prints `Error: <message>` to standard error and **saves nothing** (the provider is left untouched); on acceptance it saves the key **together with the Jolli site derived from that key** (see below), pins the provider to Jolli, and prints `✓ Jolli key saved`.
 
 The asymmetry is deliberate — a Jolli key encodes the tenant origin it will talk to and is therefore checkable up front, whereas an Anthropic key is opaque and can only be validated by using it.
+
+#### The Jolli rung also writes the site
+
+The accepted key's own embedded tenant claim (trailing slashes stripped, re-screened against the same allowlist) is written to the machine-global configuration **in the same save** as the key. The user is never asked for it and there is no prompt for it.
+
+That the site follows the key matters visibly in this very command: the guided front door prints a `✓ signed in · <site>` line a few steps after this rung returns, and that line reads the **stored site**, never the key. Writing the key alone would leave the confirmation naming whichever tenant the previous key belonged to.
+
+**The field is added conditionally, never assigned.** The machine-global save merges shallowly, so a present-but-undefined value would **delete** a stored site rather than leave it alone — and it would do so precisely for a legacy key that carries no claim to replace it with. Because this rung has already run the full key validation, a key that reaches the save is in practice always decodable and on the allowlist, so the conditional is belt-and-braces here; it is a required shape for the rule regardless, since the same derivation is shared with surfaces that do not pre-validate.
+
+This pairing is for display and for outbound targets only. Requests are routed from the key's own claim and never from the stored site, so the two being out of step mislabels rather than misroutes.
 
 ### Termination
 
@@ -182,7 +192,7 @@ The two callers differ only in how the ladder interacts with first-time setup (e
 | Local agent, CLI not usable | `3` | Anthropic key entry outcome | key entry outcome |
 | Local agent, CLI not usable | `4` (skip) | none | cannot generate |
 | Any, Anthropic key entry, key supplied | — | key saved, provider → Anthropic | can generate |
-| Any, Jolli key entry, key accepted | — | key saved, provider → Jolli | can generate |
+| Any, Jolli key entry, key accepted | — | key + derived site saved, provider → Jolli | can generate |
 | Any, Jolli key entry, key rejected | — | **none** | cannot generate |
 | Any, key entry, empty input | — | none | cannot generate |
 

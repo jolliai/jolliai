@@ -37,7 +37,23 @@ The viewer resolves its graph model through three delivery paths, tried in order
 
 The standalone package and the editor panel use the embedded global; paths (2) and (3) are fallbacks.
 
-When the host inlines the model, three sequences in the JSON are neutralized so they cannot break out of the inline-script context: the closing-script-tag sequence (case-insensitive) and the two raw line-separator characters that JSON leaves unescaped. (The latter two are inert on modern engines; the escaping is defense in depth.)
+When the host inlines the model, three substitutions neutralize it so it cannot break out of the inline-script context:
+
+| Neutralized | Becomes |
+| --- | --- |
+| **Every `<` character**, wherever it appears | its JSON unicode-escape form `\u003c` |
+| A raw U+2028 line separator | `\u2028` |
+| A raw U+2029 paragraph separator | `\u2029` |
+
+**The `<` rule is character-wide on purpose, and neutralizing only the closing-script-tag sequence is a known hole.** The HTML tokenizer has three exits from a script block, not one: `</script` closes the element, `<!--` switches it into an escaped state after which the block's own `</script>` no longer closes it, and a nested `<script` inside that escaped state escalates one level further. Escaping only the first left the other two open — a topic body carrying `<!--<script>` swallowed every script inlined after the data assignment (blank page), and with a matching close it was an injection primitive. All three exits begin with `<`, and `\u003c` is the same string to a JSON parser, so one character-level substitution covers the whole class.
+
+`>` and `&` are deliberately **not** escaped: neither can move the tokenizer out of script-data state, so escaping them would only inflate the payload.
+
+The substitution is safe **only because the input is already a JSON document** — every `<` in one is inside a string literal. Applied to arbitrary code it would corrupt an ordinary less-than comparison.
+
+The two line-separator escapes are inert on modern engines and are defense in depth; the `<` escape is not — it is load-bearing.
+
+All three host surfaces run the identical rule from one shared implementation. It previously existed as three private per-surface copies, which is how two of them were left unfixed: every copy neutralized the closing-script-tag sequence and every copy missed `<!--`.
 
 ### Graph model (as consumed)
 

@@ -4,6 +4,8 @@
 
 Run the end-to-end historical back-fill for a list of candidate commits: drop the ones that already have a memory, build the offline transcript and commit indexes, attribute conversation slices to commits, then for each still-missing commit either generate and store a memory (reusing the live summary-generation and storage paths) or, in dry-run, preview the attribution. After a real batch that produced at least one memory, trigger a single repo-wide knowledge ingest. Every per-commit failure is isolated so a batch always finishes.
 
+**Not to be confused with the database repository back-fill** (cross-ref 350), an unrelated feature of the same name that reconciles already-existing facts into the local memory database and never calls a model. This engine is the one that generates memories for historical commits and therefore spends model budget.
+
 ## Scope
 
 **In scope:**

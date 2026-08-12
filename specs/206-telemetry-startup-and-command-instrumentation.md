@@ -9,7 +9,7 @@ Bootstrap the telemetry context once per process by resolving the anonymous iden
 **In scope:**
 
 - The one-call startup bootstrap: what it resolves (config, install identifier, reporting origin/environment), the once-per-machine install event, and its never-throw guarantee.
-- The per-surface startup wiring (command-line, editor, JVM IDE) and the periodic/lifecycle flush hooks they install.
+- The per-surface startup wiring (command-line, editor, JVM IDE, and the long-lived local dashboard server) and the periodic/lifecycle flush hooks they install.
 - Minting and sharing of the per-machine anonymous install identifier, including the race-free first-run arbitration.
 - The reporting-origin resolution precedence and its mapping to the environment label, plus the sandbox self-tag that precedes and overrides that mapping.
 - The automatic per-command instrumentation: what fires it, what it records, and why a failing command does not fire it.
@@ -135,6 +135,23 @@ The bootstrap is wrapped so a telemetry error never blocks startup; the auto-emi
 
 The long-lived post-commit worker bootstraps telemetry first (so ingest-path events emit in the worker process), then drains its work, then flushes the buffer once on completion — the natural send point for events that short-lived hook invocations only buffered. The whole chain is best-effort and never blocks exit on a telemetry error.
 
+### Long-lived local dashboard server: startup and flush
+
+The local dashboard server is a **detached, long-lived process** and therefore the one surface whose telemetry lifecycle is a boot / interval / shutdown triple rather than a per-invocation one.
+
+1. **Bootstrap at boot.** Before it begins serving, it primes the telemetry context for its working directory. Failure is caught and logged as a warning — telemetry must never keep the server from serving.
+2. **Periodic flush, every 60 seconds.** A repeating timer flushes the buffer. Each flush is capped at a **2-second** network budget — deliberately well under the transport's ordinary 10-second default — and the timer is explicitly detached from the event loop so it can never, by itself, keep the process (or a test runner) alive.
+3. **Flush on shutdown.** A stop step clears the timer and performs one final best-effort flush, and is idempotent. It runs on the interrupt and terminate signals and on the **idle-shutdown** path, and it runs **before** the process releases its own on-disk state and exits — so a clean shutdown ships whatever the last interval did not. There is no hangup-signal or exit-hook equivalent, so an abrupt kill or a crash loses the un-flushed tail (bounded by the buffer's own caps).
+
+Two things this surface deliberately does **not** do:
+
+- **It emits no startup event of its own.** Nothing on the boot path records an event; the only event the boot can produce is the once-per-machine install event, and only in the case where this process happens to be the one that mints the install identifier — which is stamped with the command-line surface, not with the web surface.
+- **It never records under its own surface for browser activity.** Events forwarded to it from the page it serves are recorded through the explicit-surface override under `web-local`; the process's own surface stays the command-line one. See **Telemetry Event Catalog** for what those envelopes actually describe.
+
+The 2-second per-flush cap is a shutdown-latency decision, not a tuning knob: the final flush sits on the exit path, and a slow network must not hold the process — and the on-disk state it owns — open for the full default. A dropped batch is best-effort and recovered on the next run.
+
+**Buffer address: the resolved repository root, decided by the launcher.** The server addresses its buffer with the working directory it was started in, and its bootstrap and its flushes are pinned to the same value by construction (one resolution, used for both). What makes that value the *repository root* is the launching command, which resolves the root **before spawning** the detached child and starts it there. That resolution validates the raw directory is real (falling back to the process's own working directory if not), then takes the git top level, keeping the validated base on any git failure or outside a repository. Launched from a subdirectory, the raw directory would address a buffer no other surface drains — see **Telemetry Event Buffering and Flush** for why the working directory *is* the buffer's identity.
+
 ### Editor startup and flush
 
 On activation the editor bootstraps telemetry with the host opt-out signal, shows the first-run notice once (see **Telemetry Consent and Opt-Out**), and subscribes to the host telemetry-setting change so a mid-session toggle re-bootstraps with the new signal. A flush runs on activation and on a 60-second extension-level interval regardless of panel visibility, threading the live host opt-out signal each time; the visibility-gated sidebar-tick flush remains as an additional path.
@@ -196,6 +213,9 @@ One property of this event is a deliberate departure from the model used everywh
 - **The environment label is stamped once per bootstrap, not per event.** A single self-tag (or origin) resolution at process start covers the whole session; both the full re-bootstrap and the JVM IDE's lighter environment-only refresh re-apply the self-tag check, so a mid-session sign-in or host-setting toggle does not silently drop the tag. (Notable.)
 - **The sync failure path emits the same completion event with a failure outcome.** Without it the sync-health view would see only successes. (Notable.)
 - **The disclosure is printed before the install event is buffered.** Ordering ensures a single-command user sees the disclosure before any event is recorded. (Notable.)
+- **The long-lived local server flushes on a shorter network budget than any other surface's interval flush.** Its final flush is on the exit path, so a slow network would otherwise hold the process and its on-disk state open for the transport's full default. (Notable.)
+- **That server's buffer is anchored by its launcher, not by itself.** It simply uses the directory it was started in for both bootstrap and flush; the repository-root resolution happens in the command that spawns it. A future caller that spawned it in a raw subdirectory would silently strand its events in a buffer nothing drains. (Surprising; the invariant lives one process away from the code that depends on it.)
+- **That server emits no event to announce itself.** There is no "server started" name; the process is visible in telemetry only through the events it forwards from the page it serves, which carry a different surface. (Notable.)
 
 ## Shared Behavior
 

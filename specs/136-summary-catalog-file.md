@@ -158,7 +158,7 @@ Topics in each catalog entry are produced by a shared display-topic collector th
 
 ## Shared Behavior
 
-- **Storage backend** — atomic multi-file writes, payload paths, the orphan-branch read/write plumbing, and the cross-process lock primitive.
+- **Storage backend** — atomic multi-file writes, payload paths, the read/write plumbing of whichever backend is this repository's system of record, and the cross-process lock primitive. **The catalog is submitted in the same batch as the summary and index writes, so in every writable routing state it lands in the Memory Bank folder's hidden layer as well as in the system of record, rather than under one configured storage mode** (that routing is owned by spec 344).
 - **Summary index format** — how roots are identified, the structure of the index entry-map, and the index's own atomic update protocol that the catalog write-along participates in.
 - **Summary tree structure** — the payload structure that catalog projection reads to extract recap, ticket identifier, and topics.
 - **Cross-process lock** — the shared lock acquired by the lazy build and held during all write operations on the summary store.

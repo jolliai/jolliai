@@ -2,13 +2,13 @@
 
 ## Topic Statement
 
-The IDE plugin locates and verifies a usable Node.js runtime before any plugin logic runs, and blocks the entire plugin behind that check. Because a GUI-launched IDE (Dock, Launchpad, desktop shortcut) inherits a minimal environment whose PATH omits Node installed by version managers and package managers, a naive "spawn `node` and see" would report "missing" on machines that clearly have Node. Detection is therefore two-phase — gather candidate binaries from every plausible channel, then prove each candidate by actually executing it and reading its reported version — with a minimum major-version floor, a persisted winner for fast subsequent checks, an interactive retry, and a manual file-chooser fallback. When no usable runtime is found the plugin surfaces a blocking "Node.js required" panel and does nothing else.
+The IDE plugin locates and verifies a usable Node.js runtime before any plugin logic runs, and blocks the entire plugin behind that check. Because a GUI-launched IDE (Dock, Launchpad, desktop shortcut) inherits a minimal environment whose PATH omits Node installed by version managers and package managers, a naive "spawn `node` and see" would report "missing" on machines that clearly have Node. Detection is therefore two-phase — gather candidate binaries from every plausible channel, then prove each candidate by actually executing it and reading its reported version — with a minimum major.minor version floor, a persisted winner for fast subsequent checks, an interactive retry, and a manual file-chooser fallback. When no usable runtime is found the plugin surfaces a blocking "Node.js required" panel and does nothing else.
 
 ## Scope
 
 **In scope:**
 - The two-phase detect flow: candidate discovery channels and their order, verify-by-execution, the minimum-version floor, first-match-wins.
-- The verified-runtime record (path + reported version) and the rejected-candidate record (ran but too old), and how each is surfaced.
+- The verified-runtime record (path + reported version) and the rejected-candidate record (ran but too old), and how each is surfaced — including the rule that every version number a message quotes is derived from the floor rather than typed out.
 - The persisted detection result, the plain-text sibling record it is kept in lockstep with, the in-process cache (including negative caching), the fast re-verify path, and forced re-probe.
 - The manual file-chooser fallback and its identical proof.
 - The hard gate: which plugin entry points require a runtime, what happens when none is found, and the retry/manual paths that unblock.
@@ -23,15 +23,27 @@ The IDE plugin locates and verifies a usable Node.js runtime before any plugin l
 
 ### Verified runtime
 
-A verified runtime is the absolute path to a Node binary plus the version string that binary reported when executed (e.g. a `v`-prefixed major.minor.patch). A binary is "verified" only after it actually ran and answered with a parseable version at or above the minimum supported major.
+A verified runtime is the absolute path to a Node binary plus the version string that binary reported when executed (a `v`-prefixed major.minor.patch). A binary is "verified" only after it actually ran and answered with a parseable version at or above the floor.
 
-### Minimum supported major
+### Minimum supported version — `22.13`, compared as major **and** minor
 
-Detection enforces a minimum Node major version (the oldest major the bundled tool can run on). A binary that runs but reports an older major is **not** a successful detection — it is recorded as a rejected candidate, and a newer install found through a later channel can still win.
+Detection enforces a floor of Node **22.13** (the oldest release the bundled tool can run on, because that is the first one whose built-in SQLite module loads without an experimental command-line flag — and the hook dispatchers that run under it are deliberately flag-free).
+
+The comparison is **major-then-minor, not major alone**: a higher major passes outright, a lower major fails outright, and an equal major falls through to a minor comparison against the floor's minor. So `22.13.0`, `22.22.1` and `24.0.0` are usable while `22.12.9`, `22.5.0` and `20.19.0` are not. The first two of those failures are the ones that matter: a major-only check would have admitted both, and they sit in exactly the range where the built-in SQLite module exists but throws on import.
+
+Both version components are parsed from a **`v`-prefixed** shape. A reported version without that leading `v` does not parse, and an unparseable version is treated as **not supported** rather than as "assume new enough" — so a candidate that answers `22.13.0` with no `v` is skipped. (Notable sharp edge.)
+
+A binary that runs but reports a version below the floor is **not** a successful detection — it is recorded as a rejected candidate, and a newer install found through a later channel can still win.
 
 ### Rejected candidate
 
-A candidate that ran and reported a version but fell below the minimum is captured as a path + version pair and exposed to the UI, so a machine that has an old Node gets a specific, actionable message ("v14 at /path — too old, install 18+") instead of a bare "no Node found," which reads as a bug on a machine that clearly has Node. The rejected list is reset at the start of each probe, is empty when detection has never run / succeeded on the fast path / succeeded on the first candidate / no candidate answered at all, and is cleared when a manual pick is adopted.
+A candidate that ran and reported a version but fell below the floor is captured as a path + version pair and exposed to the UI, so a machine that has an old Node gets a specific, actionable message (the concrete version and path, plus the floor it is below) instead of a bare "no Node found," which reads as a bug on a machine that clearly has Node. The rejected list is reset at the start of each probe, is empty when detection has never run / succeeded on the fast path / succeeded on the first candidate / no candidate answered at all, and is cleared when a manual pick is adopted.
+
+### Version numbers in user-facing text are derived, not typed
+
+Every runtime message that quotes a version — the blocking panel's install instruction, its "no usable Node.js (`<floor>` or newer) was found" line, its too-old list header, its file-chooser rejection ("that Node.js is `<version>` — version `<floor>` or newer is required"), the project-open notification's too-old and install-instruction branches, and the integrations-unavailable warning — renders the floor from the same constant detection compares against. Raising the floor therefore moves every one of those strings in one edit.
+
+Two things sit outside that guarantee. The **marketplace listing description** is hand-written and hard-codes `Requires Node.js 22.13+` — the one shipping user-facing surface that can drift from the constant. And several "Node.js not found" messages name **no version at all**: the AI-generation and bridge-connection failures, the status row and its tooltip, the historical-backfill notice, and the blocking panel's own generic no-candidate line. A user who reaches one of those learns that Node is missing but not which version to install.
 
 ### Persisted detection record
 
@@ -106,6 +118,8 @@ too old only       → still blocked, specific msg  (candidates ran but below th
 - **GAP — a missing sibling is not recreated by a fast-path success.** The fast path rewrites the records only when the re-verified version differs from the recorded one. So if the sibling is deleted or corrupted out from under the plugin (a cleanup script, a partial restore) while the structured record stays valid, every subsequent start takes the fast path, agrees on the version, and writes nothing — the sibling stays missing. It is recreated only by a version drift on the fast path, a forced re-probe, or a manual pick. In that window the plugin itself works normally (it uses the in-process value) while the shell dispatchers silently lose their fallback tier.
 - **Detection is two-phase precisely because a GUI-launched IDE's PATH is not the user's shell PATH.** Merely finding an executable file is not proof it runs, and a naive spawn misses version-manager installs; the design gathers candidates broadly and proves them by execution.
 - **The minimum-version floor is applied during verification, not after.** A too-old binary never counts as a detection, so a newer install elsewhere can still win — and the too-old finding is surfaced for an actionable message.
+- **The floor is a major *and* minor pair, and a version that does not parse is refused rather than assumed good.** Comparing only the major would admit every `22.x` below `22.13`, which is the whole range where the built-in SQLite module exists but throws on import; and an unparseable version string (one missing the leading `v`) is treated as unsupported, so a candidate that reports a perfectly new version in an unexpected shape is skipped rather than adopted. (Surprising; intentional.)
+- **Every version number the plugin's own messages quote is rendered from the detector's constant, so raising the floor moves them together.** The hand-written marketplace listing description is the one shipping user-facing surface outside that guarantee — and separately, the "not found" messages quote no version at all, so they cannot drift but also cannot tell the user what to install. (Notable.)
 - **Both positive and negative outcomes are cached for the process lifetime**, so the many gate checks stay cheap; only a forced refresh re-probes.
 - **The persisted "manual" source tag survives version drift**: a re-verify that rewrites a manually chosen record does not silently reclassify it as auto-detected.
 - **Node is now a hard prerequisite for the whole plugin on this surface**, reversing the earlier "Java hooks work without Node" posture. The contrast is stronger than "installs no hooks": the hooks themselves *execute* under Node, so a machine without a usable runtime has **no memory generation at all** — not merely a skipped install. And because every data read the plugin performs beyond native git plumbing is a bridge call spawned under the same runtime, the gate is the precondition for the plugin's **reads** as much as for its writes (cross-reference the MCP-and-skills integration, delegated-hook-installation, bridge-connection, and lifecycle specs).

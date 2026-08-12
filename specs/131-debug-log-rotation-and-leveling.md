@@ -18,6 +18,7 @@ A persistent debug log under the per-user state directory that every Jolli Memor
 - The `console.error` / `console.warn` mirror behavior that depends on the level and the silent-console flag.
 - The fail-silent guarantee: missing directory, permission errors, disk-full, etc. never throw and never crash the calling process.
 - The "do not auto-create the state directory" rule: log writes are skipped when the state directory is absent.
+- One content constraint the file imposes on its callers: this log is treated as a sink for the repository's clear-text-logging analysis, so a value derived from the product API key does not go into a record.
 
 **Out of scope:**
 - The state directory's own creation policy (owned by the install / enable spec).
@@ -102,6 +103,16 @@ Any one of the three alone is sufficient. The two environment signals are checke
 All three suppress **the enqueue itself**, not just the append. Because the size check, the archive rename, and the archive pruning all live *inside* the queued work, none of them run either: a suppressed record produces no stat, no rotation, and no prune. The level filter and the standard-error mirror sit **earlier** in the per-record flow and are unaffected by all three.
 
 The in-memory gate is process-local and is set only by the editor host; it is inert in command-line invocations, hook scripts and background workers, which is why those processes still write their own log lines. Its lifecycle, and the durable on-disk opt-out it mirrors, are owned by spec 145; the write suppression it drives across other subsystems by `specs/304-manually-disabled-zero-write-contract.md`.
+
+### This file is a sink: key-derived values stay out of a record
+
+This log is one of the destinations the repository's clear-text-logging analysis tracks, so a value the product API key was decoded to produce is deliberately kept out of the message a caller formats.
+
+The live instance is the `warn` record written when a push reached the server but the **local write-back of the resulting article id failed**. That record names the stranded article by the **server's own numeric article identifier**, alongside the short commit hash and the underlying error text — and specifically **not** by the article's URL, which is composed from a base address derived by decoding the key's embedded tenant claim.
+
+Nothing secret is actually disclosed by that URL (the tenant claim is the site address a user types into a browser, and the key itself only ever travels in a request header), and the identifier is not a redaction of it — it is a *replacement* that carries what a reader actually needs: the id is what a caller uses to reconcile the stranded article by hand.
+
+The same substitution runs one step out: the user-facing error raised on that path — the one that tells the reader to consult this file — likewise no longer carries the article URL. The success path of the same command still prints those URLs, because a link per pushed memory is what that command is for; the asymmetry is deliberate and is a judgement about that one message, not a rule that key-derived URLs may never be printed anywhere.
 
 ### Silent-console flag
 
@@ -262,6 +273,7 @@ A fourth setter sets the global working directory the log file path resolves aga
 - **The format-string placeholders are intentionally limited to three.** `%s`, `%d`, `%j` cover stringification, numeric coercion, and JSON serialization. There is no `%o`, no width specifier, no precision specifier. An unsubstituted placeholder is left as-is.
 - **Calling a logger method on a freshly imported module is safe.** Defaults (`info`, no overrides, silent console, fallback cwd) make every method usable before any setter has been called.
 - **A manually disabled repository produces no log growth and no rotation — but the editor session stays fully diagnosable.** The gate suppresses the enqueue, so the live file never grows, never reaches the size ceiling, and never spawns an archive or a prune. Meanwhile the editor surface writes every line to its own output panel *before* handing it to the file logger, so the user (and support) can still read the complete session log in the editor — just not on disk. Diagnosability moves, it does not disappear. (Surprising; intentional.)
+- **The write-back-failure record names the stranded article by identifier, not by URL — and that is a replacement, not a redaction.** The identifier is the server's own response field, so the record still tells a reader exactly which article to reconcile, while the URL it displaced carried nothing the reader needed and was derived from the API key. The paired user-facing error, which points at this file, dropped the URL in the same change. (Notable.)
 - **The in-memory gate can flip mid-process; the two environment signals cannot.** A session can begin writing, be silenced by a disable gesture, and resume on a later enable, all without restarting. This is why the gate is checked on every record rather than sampled once. (Notable.)
 
 ## Shared Behavior

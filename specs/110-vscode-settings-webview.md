@@ -246,17 +246,32 @@ The skill-preference toggle is stored as a tri-state and propagated **only on a 
 
 1. Resolve each masked sentinel: if the form's value still equals the sentinel the host last sent, replace it with the cached full key; otherwise treat the form's value as the new key.
 2. If the resolved Jolli key is non-empty, run validation. On failure, send `settingsError` with the validator's message and abort.
-3. Parse the comma-separated exclude patterns into an array, trimming and dropping empties.
-4. Build the partial-config payload: every form field maps to either its value or `undefined` (so defaults elide).
-5. Read the stored configuration — needed for the tri-state mapping and for both transition gates below.
-6. Resolve the repository root and run the hook sync, **only when an agent-toggle transition occurred** and only when the repository is not manually disabled (see "Hook-sync side effect on save").
-7. Save the partial config to the per-user file.
-8. Record a provider-selection event, but **only when the provider actually changed** relative to the stored one.
-9. Propagate the skill preference, **only on a transition** (see above).
-10. Update the cached full keys to the resolved values.
-11. Recompute the Memory Bank effective state and send `settingsSaved` carrying the freshly rendered verdict. The recomputation pairs the folder value **just persisted** with the storage mode read from the configuration loaded at the top of the save — the mode has no editing surface in this panel, so there is nothing newer to read it from. Invoke the post-save callback if one is registered.
+3. Derive the Jolli **site** from the *resolved* key (see "Site derived from the saved key" below).
+4. Parse the comma-separated exclude patterns into an array, trimming and dropping empties.
+5. Build the partial-config payload: every form field maps to either its value or `undefined` (so defaults elide) — **except** the derived site, which is added only when a value was derived.
+6. Read the stored configuration — needed for the tri-state mapping and for both transition gates below.
+7. Resolve the repository root and run the hook sync, **only when an agent-toggle transition occurred** and only when the repository is not manually disabled (see "Hook-sync side effect on save").
+8. Save the partial config to the per-user file.
+9. Record a provider-selection event, but **only when the provider actually changed** relative to the stored one.
+10. Propagate the skill preference, **only on a transition** (see above).
+11. Update the cached full keys to the resolved values.
+12. Recompute the Memory Bank effective state and send `settingsSaved` carrying the freshly rendered verdict. The recomputation pairs the folder value **just persisted** with the storage mode read from the configuration loaded at the top of the save — the mode has no editing surface in this panel, so there is nothing newer to read it from. Invoke the post-save callback if one is registered.
 
 Note the ordering: the hook sync runs **before** the configuration write, so a hook-sync failure leaves nothing persisted at all.
+
+### Site derived from the saved key
+
+Along with the Jolli API key, the save writes the **Jolli site** the key belongs to — never asked of the user, always derived from the key's own embedded tenant claim (trailing slashes stripped, then screened against the same host allowlist the key validation uses). There is no site field on this form.
+
+Three rules make this behave the way it does:
+
+- **It is derived from the key the save actually persists, not from what the user typed.** The masked sentinel is resolved first (step 1), so an *unchanged* key still yields its tenant. The consequence is that **any** Apply repairs a drifted site — including one that only changed an exclude pattern or a toggle, on a tab with nothing to do with authentication. Re-saving is the repair gesture.
+- **The field is added conditionally, never assigned.** When nothing can be derived — an empty key field, or a legacy key carrying no tenant claim, or a claim off the allowlist — the field is **omitted from the partial**. This is required, not tidy: the save merges shallowly onto the stored configuration, so a present-but-undefined value is a **delete**, and it would delete a site precisely in the case where the key cannot supply a replacement.
+- **Clearing the key does not clear the site.** An emptied key field removes the key and derives nothing, so the stored site is left untouched.
+
+The site this writes is a **display and outbound-target** value. Requests are routed by the key's own claim and never by the stored site, so a drifted value mislabels rather than misroutes — and this panel's own site label reads the key first and falls back to the stored value, so the drift was invisible *here* while the command-line surfaces (which read the stored value and deliberately never decode a key) kept naming the previous tenant. See **Auth Credential Storage** for the full contract.
+
+One asymmetry worth stating, because it gates the whole repair: the key validation in step 2 runs on the **resolved** key, so it re-validates an untouched stored key too. A stored key that predates the allowlist — or that cannot be decoded at all — therefore makes **every** save on **every** tab fail with the validator's message and persist nothing, until the user replaces the key. The open-time validation described under "Initial load" is the only warning of that state.
 
 ### What a completed save triggers outside this panel
 

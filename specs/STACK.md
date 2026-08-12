@@ -59,13 +59,28 @@ both and currently happens to be level with them at `0.99.10`. Each AI-host plug
 **Node** — `.nvmrc` pins `24.10.0`. Use it (`nvm use`). CI resolves Node from `node-version-file:
 .nvmrc`. Two lower floors also exist and are enforced at different points:
 
-- `cli/package.json` → `"engines": { "node": ">=22.5.0" }` (the published-package floor; `node:sqlite`
-  in the OpenCode reader is why).
+- `cli/package.json` → `"engines": { "node": ">=22.13.0" }` (the published-package floor). The reason
+  is **flag-free `node:sqlite`**, not any one reader: the module exists from 22.5 but throws on import
+  until 22.13 unless given an experimental flag, and two surfaces can never supply that flag — the
+  VS Code extension host (Electron launches it) and the git-hook dispatchers (deliberately flag-free,
+  so an old runtime cannot die on an unknown option before running any code).
 - `vscode/scripts/run-vitest.mjs` → `MIN_NODE_MAJOR = 22`; if the invoking `node` is older it hunts
   `~/.nvm/versions/node` for a `>= 22` binary and re-execs vitest under it, erroring out if none.
+- `cli/src/core/SqliteHelpers.ts` → `NODE_SQLITE_MIN_VERSION = { major: 22, minor: 13 }`, compared
+  **major then minor** — a major-only check would admit 22.5 and throw at import.
+- `intellij/.../bridge/NodeRuntime.kt` → `MIN_SUPPORTED_MAJOR = 22`, `MIN_SUPPORTED_MINOR = 13`
+  (major *and* minor, for the same reason).
+- esbuild `target: "node22"` in the VS Code config and both plugin build scripts.
 
-**VS Code host** — `vscode/package.json` → `"engines": { "vscode": "^1.80.0" }`, `@types/vscode`
-`^1.80.0`. The extension host is CJS; jollimemory core is pure ESM — esbuild bridges this.
+That floor is a multi-place lockstep: the published-package engines range, the shared runtime
+constant, the JVM host's own minimum, the editor host's engines range, and every esbuild target must
+agree, or a hook write throws on whichever surface lags. Read the values off those files rather than
+trusting a restatement here — a single test pins them together.
+
+**VS Code host** — `vscode/package.json` → `"engines": { "vscode": "^1.101.0" }`, `@types/vscode`
+`^1.101.0`. That is the first release whose bundled Node crossed the floor above (1.100.0 was still
+on Node 20.19), which is why the two move together. The extension host is CJS; jollimemory core is
+pure ESM — esbuild bridges this.
 
 **JVM / Gradle (IntelliJ only)**
 

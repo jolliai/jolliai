@@ -16,7 +16,7 @@ Before the IntelliJ Memory Bank tree reads a repository's manifest, it runs a **
 
 **Out of scope:**
 - The heal algorithm itself — what counts as missing, how a summary JSON is re-rendered into Markdown, and the `dropOrphanedManifestEntries` semantics at the storage seam (owned by specs 02 and 03).
-- The `jolli heal-folder` command surface and its storage-mode precondition (owned by spec 03).
+- The `jolli heal-folder` command surface (owned by spec 190) and the cutover routing state its manifest-drop precondition is decided from (owned by spec 344).
 - The IDE-bridge transport, daemon lifecycle, and one-shot spawn fallback (owned by specs 287 and 288).
 - The manifest and index reads that follow the heal in the same loop (owned by spec 314).
 - The tree's node model, badges, expansion, search, and timeline grouping (owned by spec 193).
@@ -48,7 +48,7 @@ The `projectDir` argument on the bridge call is `CliIntegrations.resolveDefaultC
 
 ### What the bridge does with it
 
-`folder-heal-visible-markdown` (`cli/src/commands/IdeBridgeCommand.ts:1064-1083`) constructs a `MetadataManager` over `<kbRoot>/.jolli` and a **`FolderStorage`** over `kbRoot` — the folder backend directly, not the dual-write composite — then returns `storage.healMissingVisibleMarkdown({ dropOrphanedManifestEntries: dropOrphans })`.
+`folder-heal-visible-markdown` (`cli/src/commands/IdeBridgeCommand.ts:1962-1981`) constructs a `MetadataManager` over `<kbRoot>/.jolli` and a **`FolderStorage`** over `kbRoot` — the folder backend directly, not the dual-write composite — then returns `storage.healMissingVisibleMarkdown({ dropOrphanedManifestEntries: dropOrphans })`.
 
 ### Gating state
 
@@ -113,7 +113,7 @@ Per repository, keyed by absolute `kbRoot`:
 - **A repository that heals successfully but never reaches clean re-heals on every single rebuild.** `cleanRepos` admits only `isClean()`, so a repository with one permanently un-regenerable file (`failed > 0`, `error == null`) clears its error stamp on every pass and is never cached — one bridge round-trip plus a full disk scan per tree rebuild, forever, with no log line after the first. The cooldown does not apply because the cooldown keys on `error`, and a per-file failure is not a bridge error. (Surprising; the throttle has a hole exactly where throttling would matter most.)
 - **The clean cache has no expiry.** Once a repository is cached clean, the only ways back are a VFS event under the Memory Bank parent or a migration reset. A `.md` deleted by a process the VFS does not observe (a change outside the IDE's watched roots, or a refresh that never lands) stays missing from the tree for the life of the panel.
 - **Only the TREE view heals.** `buildTimeline` (`:1275`) reads `KBDataCache` and never calls `FolderHealer`, and the Timeline's rows come from manifest entries rather than from the visible layer. A user who stays in Timeline view therefore never triggers a heal, and never observes one being needed — the missing-`.md` symptom is specific to the tree walk.
-- **The sidebar must leave `dropOrphanedManifestEntries` false, and two independent things keep it false.** The flag drops manifest rows whose hidden JSON is also gone, which on a folder-only repository is data loss — the manifest is the last record there. The adapter's default is `false`, and the bridge handler additionally constructs `FolderStorage` **directly** rather than the dual-write composite, so the composite's seam default of `true` (spec 03) is never reached from this path. The `jolli heal-folder` CLI remains the only surface that opts in.
+- **The sidebar must leave `dropOrphanedManifestEntries` false, and two independent things keep it false.** The flag drops manifest rows whose hidden JSON is also gone, which on a folder-only repository is data loss — the manifest is the last record there. The adapter's default is `false`, and the bridge handler additionally constructs `FolderStorage` **directly** rather than the dual-write composite, so the composite's seam default of `true` (spec 03) is never reached from this path. The `jolli heal-folder` CLI remains the only surface that opts in at all — and even it opts in **conditionally**, on the repository's cutover routing state rather than on any configuration value: only the pre-cutover state permits a drop, while a fenced or cut-over repository (and any repository whose routing state cannot be resolved) keeps every manifest row. See spec 344 for that state; the retired storage-mode configuration key decides nothing here.
 - **A failed heal is invisible to the user.** `error` is logged at WARN and stamped; nothing reaches a notification, the status panel, or the tree. From the user's side, a Memory Bank whose daemon is dead and one whose visible layer is intact look identical — the tree simply keeps missing rows it cannot recover.
 - **The cooldown protects a rebuild, not a session.** Thirty seconds is sized against the N-repositories-per-rebuild multiplication, not against a long outage: a Memory Bank with a dozen repositories and a dead daemon costs a dozen bridge timeouts, then goes quiet for 30 s, then costs a dozen more.
 - **The adapter has no decisions of its own.** `FolderHealer` builds a request, calls the bridge, decodes the reply, and converts a throw into `Result(error = e.message ?: e.javaClass.simpleName)`. Every policy — when to call, whether to retry, what to cache — lives in the panel, which is why this spec's gating section is longer than its data contract.
@@ -122,7 +122,9 @@ Per repository, keyed by absolute `kbRoot`:
 ## Shared Behavior
 
 - **Folder-Based Summary Storage (02)** — owns `healMissingVisibleMarkdown` itself: what it considers missing, how it re-renders Markdown from summary JSON, and what it counts.
-- **Dual-Write Summary Storage (03)** — owns the heal delegation at the composite seam (including its `dropOrphanedManifestEntries` default of true, which this path does not reach), the dirty-marking on a thrown delegation, and the `jolli heal-folder` command's storage-mode precondition.
+- **Dual-Write Summary Storage (03)** — owns the heal delegation at the composite seam (including its `dropOrphanedManifestEntries` default of true, which this path does not reach) and the dirty-marking on a thrown delegation.
+- **CLI Heal-Folder Command (190)** — owns the terminal-invoked heal surface: the only caller that can opt into dropping manifest rows, and its operator-facing report.
+- **Cutover Routing State Table (344)** — owns the routing state that CLI opt-in is decided from, and records that the former storage-mode configuration key is retired on the write side (read only to log that it is ignored).
 - **CLI IDE-Bridge Command Surface (287)** — owns the `folder-heal-visible-markdown` action's registration and request validation.
 - **IntelliJ CLI Daemon Connection (288)** — owns the transport, the daemon-versus-one-shot-spawn decision, and the latency this gating exists to ration.
 - **IntelliJ Native Memory Bank Metadata Read (314)** — owns the manifest and index reads that immediately follow the heal in the same loop.
