@@ -1352,3 +1352,102 @@ body {
   .set-loading-title { font-size: 14px; font-weight: 600; color: var(--ink); }
   .set-loading-sub { max-width: 42ch; line-height: 1.5; }
   .set-loading-error .cta { margin-top: 6px; }
+
+  /* ---------- Knowledge page ----------
+     Two-pane like Memories (searchable per-repo `_wiki` list + a reading pane),
+     but the reading pane is a sandboxed `/wiki-viewer` iframe, so it needs an
+     explicit height rather than flowing content. */
+  /* These two pages own the viewport: the list and the iframe(s) scroll
+     internally, so the OUTER page must not scroll. Cap `.jd` (default is
+     min-height:100vh, which grows past the viewport under `.main`'s 48px
+     padding-bottom + the footer note) and drop both for these views. */
+  .jd:has(.knowledge-page), .jd:has(.graph-page) { height: 100vh; overflow: hidden; }
+  .main:has(.knowledge-page), .main:has(.graph-page) { padding-bottom: 0; }
+  .main:has(.knowledge-page) .footer-note, .main:has(.graph-page) .footer-note { display: none; }
+  /* Graph carries its own header (repo name + search) inside the framed viz, so
+     the dashboard topbar ("Graph · knowledge graph · per-repo") is redundant — hide
+     it and let the graph fill the full viewport; the repo picker below is the only
+     dashboard chrome the page needs. Knowledge keeps its topbar. */
+  .main:has(.graph-page) .topbar { display: none; }
+  .wrap:has(.knowledge-page) { max-width: none; padding: 0 56px 0 0; }
+  .wrap:has(.graph-page) { max-width: none; padding: 0; }
+  .grid:has(.knowledge-page), .grid:has(.graph-page) { display: block; }
+  .knowledge-page {
+    display: grid; grid-template-columns: 344px minmax(0, 1fr);
+    gap: 6px; height: calc(100vh - 58px);
+  }
+  .kn-side {
+    min-width: 0; height: calc(100vh - 58px); align-self: start; overflow: hidden;
+    border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+    box-shadow: 0 2px 5px rgba(20, 30, 50, .05); display: flex; flex-direction: column;
+  }
+  .kn-search {
+    margin: 16px 16px 10px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 9px;
+    background: var(--page); color: var(--ink); font: inherit; font-size: 13px; min-width: 0;
+  }
+  .kn-list { min-height: 0; flex: 1; overflow-y: auto; padding: 6px 8px 12px; border-top: 1px solid var(--grid); }
+  .kn-group { margin-bottom: 10px; }
+  .kn-group-head {
+    display: flex; align-items: center; gap: 8px; padding: 6px 6px 4px; min-width: 0;
+    font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em;
+    cursor: pointer; user-select: none; border-radius: 6px;
+  }
+  .kn-group-head:hover { background: var(--lock-bg); }
+  .kn-group-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .kn-group-head .chev { width: 14px; height: 14px; display: inline-grid; place-items: center; flex: none; }
+  .kn-group-head .chev svg {
+    width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 2;
+    stroke-linecap: round; stroke-linejoin: round; transition: transform .18s ease;
+  }
+  .kn-group-head[aria-expanded="false"] .chev svg { transform: rotate(-90deg); }
+  .kn-repo { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .kn-graph-link {
+    margin-left: auto; flex: none; display: inline-flex; align-items: center; line-height: 0;
+    color: var(--muted); text-decoration: none;
+  }
+  .kn-graph-link:hover { color: var(--accent); }
+  .kn-graph-link.disabled { color: color-mix(in srgb, var(--muted) 40%, transparent); cursor: not-allowed; }
+  /* Tree children: indented under the group head, past the chevron (aligns with
+     the repo name = head padding 6 + chevron 14 + gap 8 ≈ 28px). */
+  .kn-row {
+    display: block; width: 100%; text-align: left; border: 0; border-radius: 6px; cursor: pointer;
+    padding: 6px 8px 6px 28px; font: inherit; font-size: 12.5px; color: var(--ink); background: transparent;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .kn-row:hover { background: var(--lock-bg); }
+  .kn-row.active { background: var(--accent-soft); }
+  .kn-group .kn-empty { padding-left: 28px; }
+  .kn-empty { padding: 12px; font-size: 12.5px; color: var(--muted); }
+  .kn-detail {
+    min-width: 0; height: calc(100vh - 58px); overflow: hidden; display: flex;
+    border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+  }
+  .kn-placeholder { margin: auto; padding: 24px; font-size: 13px; color: var(--muted); text-align: center; }
+  .kn-frame { flex: 1; width: 100%; height: 100%; border: 0; border-radius: 12px; }
+
+  /* ---------- Graph page ----------
+     The whole page IS the framed `/graph-viewer` viz (its own header carries the
+     repo switcher + search). Dashboard topbar hidden (above); iframe fills the
+     viewport. It needs an explicit height — an iframe with none collapses to ~150px. */
+  .graph-page { display: flex; flex-direction: column; height: 100vh; padding: 0; }
+  .graph-frame { flex: 1; min-height: 0; width: 100%; border: 0; background: var(--surface); }
+  .graph-page .empty { margin: 24px; }
+
+  @media (max-width: 1100px) {
+    .wrap:has(.knowledge-page) { padding: 0 24px 0 0; }
+    .knowledge-page { grid-template-columns: 320px minmax(0, 1fr); }
+  }
+  @media (max-width: 760px) {
+    /* Stacked layout is taller than the viewport, so let the OUTER page scroll
+       again (undo the viewport cap) rather than clipping the reading pane. */
+    .jd:has(.knowledge-page), .jd:has(.graph-page) { height: auto; overflow: visible; }
+    .main:has(.knowledge-page), .main:has(.graph-page) { padding-bottom: 48px; }
+    .wrap:has(.knowledge-page) { padding: 0 16px; }
+    .wrap:has(.graph-page) { padding: 0 16px; }
+    .knowledge-page { grid-template-columns: 1fr; gap: 0; height: auto; }
+    .kn-side { height: auto; }
+    .kn-list { height: min(42vh, 360px); }
+    .kn-detail { height: min(60vh, 520px); }
+    .graph-page { height: auto; }
+    .graph-frame { height: min(70vh, 560px); }
+  }

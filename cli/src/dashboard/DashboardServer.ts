@@ -98,6 +98,7 @@ import { listPushControlRepos, setRepoPushDisabledByIdentity, triggerReenableDra
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import { trackAs } from "../core/Telemetry.js";
 import { isTelemetryEventName, type TelemetryEventName } from "../core/TelemetryEvents.js";
+import { resolveAssetsDir as resolveGraphAssetsDir } from "../graph/GraphExport.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
 import type { LocalAgentToolId } from "../Types.js";
@@ -119,6 +120,15 @@ import {
 import { buildDashboardModel, type QueryOptions } from "./DashboardQuery.js";
 import { projectRepoRegistryState } from "./DbBackfill.js";
 import { getDecisionGist } from "./DecisionGist.js";
+import { buildGraphViewerDocument } from "./GraphViewerDocument.js";
+import {
+	buildGraphModel,
+	buildKnowledgeModel,
+	readGraphJson,
+	readWikiBody,
+	resolveKbRoot,
+	WIKI_FILE_PATTERN,
+} from "./KnowledgeQuery.js";
 import { buildMemoriesPage, type ReachableCommits, readContextDoc } from "./MemoriesQuery.js";
 import { probeRepo } from "./RepoProbe.js";
 import { deregisterRepo, existingWorktrees, readRepoRegistry, registerRepo } from "./RepoRegistry.js";
@@ -227,6 +237,8 @@ export const DASHBOARD_SCRIPT_FILES = [
 	"standup.js",
 	"repositories.js",
 	"memories.js",
+	"knowledge.js",
+	"graph.js",
 	"settings.js",
 	"main.js",
 ] as const;
@@ -278,6 +290,63 @@ export function assembleDashboardHtml(assetsDir: string, modelJson: string, toke
 	const marker = /<!-- scripts:start -->[\s\S]*?<!-- scripts:end -->/;
 	if (!marker.test(html)) throw new Error("dashboard template missing scripts block");
 	return html.replace(marker, () => scripts);
+}
+
+// ── Framed viewer documents (Knowledge / Graph iframes) ─────────────────────
+
+/**
+ * Minimal readable styling for the `/wiki-viewer` document. It renders in a
+ * sandboxed iframe with its own (opaque) origin, so it inherits none of the
+ * dashboard theme — hence a self-contained neutral stylesheet.
+ */
+const WIKI_VIEWER_CSS = `
+:root { color-scheme: light dark; }
+body { margin: 0; padding: 24px 40px; font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #1a1d21; background: #fff; }
+@media (prefers-color-scheme: dark) { body { color: #d6dae0; background: #16181c; } }
+/* Fill the reading pane's width (left-aligned) — a narrow centred column left
+   large blank margins in the wide detail pane. Cap only on very wide viewports. */
+.md { max-width: 1200px; margin: 0; }
+.md h1, .md h2, .md h3 { line-height: 1.25; margin: 1.4em 0 .5em; }
+.md h1 { font-size: 1.6em; } .md h2 { font-size: 1.3em; } .md h3 { font-size: 1.1em; }
+.md a { color: #2563eb; } @media (prefers-color-scheme: dark) { .md a { color: #6ea8ff; } }
+.md pre { overflow-x: auto; padding: 12px 14px; border-radius: 8px; background: #f3f4f6; }
+@media (prefers-color-scheme: dark) { .md pre { background: #23262b; } }
+.md code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; }
+.md table { border-collapse: collapse; } .md th, .md td { border: 1px solid #d0d5dd; padding: 6px 10px; }
+.md img { max-width: 100%; }
+.viewer-msg { max-width: 640px; margin: 48px auto; color: #6b7280; text-align: center; }
+`;
+
+/**
+ * A self-contained `/wiki-viewer` document: the vendored `marked` engine inlined,
+ * plus one script that renders `bodyMd` into `#md`. Served ONLY into a
+ * `sandbox="allow-scripts"` iframe (no `allow-same-origin`), which is what
+ * actually isolates any HTML the wiki markdown produces from the token-bearing
+ * parent page — the CSP `frame-ancestors 'self'` only controls who may embed it.
+ * `bodyMd` is inlined as `escapeForInlineScript(JSON.stringify(bodyMd))`: it must
+ * become a JS string literal first (marked.parse takes a string), then have
+ * `</script>` / ` ` neutralised.
+ */
+function buildWikiViewerHtml(graphAssetsDir: string, bodyMd: string): string {
+	const marked = readFileSync(join(graphAssetsDir, "vendor", "marked.min.js"), "utf8");
+	const safe = escapeForInlineScript(JSON.stringify(bodyMd));
+	return (
+		`<!doctype html><html lang="en"><head><meta charset="utf-8" />` +
+		`<meta name="viewport" content="width=device-width, initial-scale=1" />` +
+		`<style>${WIKI_VIEWER_CSS}</style></head><body><article id="md" class="md"></article>` +
+		`<script>\n${marked}\n</script>` +
+		`<script>document.getElementById("md").innerHTML = window.marked.parse(${safe});</script>` +
+		`</body></html>`
+	);
+}
+
+/** A friendly framed message (no scripts) for a viewer that has nothing to show. */
+function viewerMessageHtml(message: string): string {
+	// `message` is one of a few fixed strings, never user input — safe to inline.
+	return (
+		`<!doctype html><html lang="en"><head><meta charset="utf-8" />` +
+		`<style>${WIKI_VIEWER_CSS}</style></head><body><p class="viewer-msg">${message}</p></body></html>`
+	);
 }
 
 // ── Request handling ────────────────────────────────────────────────────────
@@ -458,6 +527,9 @@ async function defaultModelBuilder(
 	// long-lived server reflects the repo it was FIRST launched in, which is why
 	// that repo's name travels to the user alongside it as `repoLabel`.
 	const settingsModel = request.view === "settings" ? await buildSettingsPageModel(configDir, launchCwd) : undefined;
+	// Knowledge/Graph read the Memory Bank folder (not the DB), like Settings above.
+	const knowledgeModel = request.view === "knowledge" ? await buildKnowledgeModel(configDir) : undefined;
+	const graphModel = request.view === "graph" ? await buildGraphModel(configDir) : undefined;
 	return withReadonlyDashboardDb(
 		async (db) => {
 			// A rebase/reset/squash that rewrites history away leaves the old
@@ -499,6 +571,8 @@ async function defaultModelBuilder(
 				...request,
 				...(repositories ? { repositoriesModel: repositories } : {}),
 				...(settingsModel ? { settingsModel } : {}),
+				...(knowledgeModel ? { knowledgeModel } : {}),
+				...(graphModel ? { graphModel } : {}),
 				...(reachableCommits ? { reachableCommits } : {}),
 				...(authorIdentity ? { authorIdentity } : {}),
 			});
@@ -604,6 +678,34 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 function sendText(res: ServerResponse, status: number, text: string): void {
 	res.writeHead(status, { "Content-Type": "text/plain" });
 	res.end(text);
+}
+
+/**
+ * Sends a framed viewer document (`/wiki-viewer`, `/graph-viewer`).
+ *
+ * Two isolation layers, both load-bearing:
+ *   - The `sandbox allow-scripts` CSP directive forces this document into an
+ *     OPAQUE origin whatever loads it — the framing iframe OR a top-level
+ *     navigation. That is what actually stops any HTML the wiki/graph markdown
+ *     produces from reaching this same-origin server's `__JOLLI_DASHBOARD_TOKEN__`
+ *     and forging a mutation. The front end's `sandbox="allow-scripts"` iframe
+ *     attribute does the same for the frame case, but a document loaded top-level
+ *     (a hostile page's `window.open('…/wiki-viewer?…')`) has no such attribute —
+ *     so the header is the backend-enforced backstop the attribute cannot be.
+ *     `allow-scripts` (no `allow-same-origin`) keeps `marked` running while the
+ *     opaque origin denies token access; the viz uses no `localStorage`/`cookie`.
+ *   - `frame-ancestors 'self'` (overriding the global `'none'`) lets the dashboard
+ *     frame it; it is evaluated on the response URL's origin, not the sandboxed
+ *     one, so same-origin framing still works. `X-Frame-Options: SAMEORIGIN`
+ *     covers pre-CSP clients (it has no sandbox equivalent, hence the CSP above).
+ *
+ * `no-store` keeps it in step with the dashboard's private-data caching policy.
+ */
+function sendViewerHtml(res: ServerResponse, status: number, html: string): void {
+	res.setHeader("Content-Security-Policy", "sandbox allow-scripts; frame-ancestors 'self'");
+	res.setHeader("X-Frame-Options", "SAMEORIGIN");
+	res.writeHead(status, { "Content-Type": "text/html", "Cache-Control": "no-store" });
+	res.end(html);
 }
 
 /** Header carrying the mutation token — never a query param (URLs end up in logs/history/referrers). */
@@ -824,14 +926,20 @@ function parseWindow(url: URL): Omit<ModelRequest, "view" | "scope"> {
  * `settings` has NO page path — it is a MODAL opened over any page from the nav
  * (`shell.js` → `JD.openSettings`), which fetches its model via
  * `/api/model?view=settings`. So `settings` is in `VIEW_TOKENS` (for that fetch)
- * but deliberately absent here; a direct visit to `/settings` 404s. `/knowledge`
- * and `/graph` are also unrouted (v1 releases neither).
+ * but deliberately absent here; a direct visit to `/settings` 404s.
+ *
+ * `/knowledge` and `/graph` ARE routed (Memory Bank `_wiki` browser + per-repo
+ * knowledge graph). Each also has a companion iframe route — `/wiki-viewer` and
+ * `/graph-viewer` — that serves a sandboxed self-contained document (see below);
+ * those are NOT view paths and are handled directly in `handle()`.
  */
 const VIEW_PATHS: Readonly<Record<string, DashboardView>> = {
 	"/repositories": "repositories",
 	"/dashboard": "stats",
 	"/dashboard/standup": "standup",
 	"/memories": "memories",
+	"/knowledge": "knowledge",
+	"/graph": "graph",
 };
 
 /**
@@ -847,6 +955,8 @@ const VIEW_TOKENS: ReadonlySet<string> = new Set<DashboardView>([
 	"standup",
 	"repositories",
 	"memories",
+	"knowledge",
+	"graph",
 	"settings",
 ]);
 
@@ -870,6 +980,8 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	const serverCwd = options.serverCwd ?? process.cwd();
 	const token = options.token ?? randomBytes(32).toString("hex");
 	let assetsDir: string | undefined;
+	/** Lazily-resolved knowledge-graph viz assets (`<dist>/graph-assets/`) — reused by both iframe routes. */
+	let graphAssetsDir: string | undefined;
 	let lastRequestMs = now();
 	/** The idle poll, armed on `listening` and cleared on `close`. See `armIdlePoll`. */
 	let idlePoll: ReturnType<typeof setInterval> | undefined;
@@ -1030,6 +1142,76 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			const html = assembleDashboardHtml(assetsDir, JSON.stringify(model), token);
 			res.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
 			res.end(html);
+			return;
+		}
+
+		// The Knowledge page's per-file iframe: one wiki markdown rendered by the
+		// vendored `marked` into a SANDBOXED self-contained document. A public GET
+		// like the pages (no token); the `sandbox="allow-scripts"` attribute on the
+		// iframe (front end) is what isolates it — see `buildWikiViewerHtml`.
+		if (url.pathname === "/wiki-viewer") {
+			const kb = url.searchParams.get("kb");
+			const file = url.searchParams.get("file");
+			if (!kb || !file) {
+				sendText(res, 400, "kb and file are required");
+				return;
+			}
+			if (!WIKI_FILE_PATTERN.test(file)) {
+				// Path-traversal guard: only `_index.md` / `topic--<slug>.md` are servable.
+				sendText(res, 400, "invalid wiki file");
+				return;
+			}
+			const kbRoot = await resolveKbRoot(configDir, kb);
+			const body = kbRoot ? readWikiBody(kbRoot, file) : undefined;
+			if (body === undefined) {
+				sendViewerHtml(res, 404, viewerMessageHtml("This wiki page could not be found."));
+				return;
+			}
+			// A partially-shipped viz asset tree would throw here; the outer request
+			// catch turns that into a 500 (never a crash), same as any page route.
+			graphAssetsDir ??= resolveGraphAssetsDir();
+			sendViewerHtml(res, 200, buildWikiViewerHtml(graphAssetsDir, body));
+			return;
+		}
+
+		// The Graph page's iframe: the repo's knowledge graph inlined into the
+		// self-contained viz (reusing `GraphExport.buildStandaloneHtml`), served
+		// into a `sandbox="allow-scripts"` iframe. Same public-GET + isolation model.
+		if (url.pathname === "/graph-viewer") {
+			const kb = url.searchParams.get("kb");
+			if (!kb) {
+				sendText(res, 400, "kb is required");
+				return;
+			}
+			const kbRoot = await resolveKbRoot(configDir, kb);
+			if (!kbRoot) {
+				sendViewerHtml(res, 404, viewerMessageHtml("This repository could not be found."));
+				return;
+			}
+			const graphJson = readGraphJson(kbRoot);
+			if (graphJson === undefined) {
+				// A friendly 200 so the iframe shows guidance rather than a browser error.
+				sendViewerHtml(
+					res,
+					200,
+					viewerMessageHtml('No knowledge graph yet — run "jolli compile" in this repo.'),
+				);
+				return;
+			}
+			graphAssetsDir ??= resolveGraphAssetsDir();
+			// The Graph page is just this iframe: build the viz with an in-header repo
+			// switcher (self-navigating) and, for light, the injected `--vscode-*`
+			// palette the viz needs (dark-only otherwise). See GraphViewerDocument.
+			const graphRepos = (await buildGraphModel(configDir)).repos.filter((r) => r.graphAvailable);
+			sendViewerHtml(
+				res,
+				200,
+				buildGraphViewerDocument(graphAssetsDir, graphJson, {
+					kb,
+					repos: graphRepos,
+					light: url.searchParams.get("theme") === "light",
+				}),
+			);
 			return;
 		}
 

@@ -95,12 +95,46 @@ function writeTestAssets(base: string): string {
 		"graph.js",
 		"repositories.js",
 		"memories.js",
+		"knowledge.js",
 		"settings.js",
 		"main.js",
 	]) {
 		writeFileSync(join(assets, "js", f), `/* ${f} */`);
 	}
 	return assets;
+}
+
+/**
+ * Writes a Memory Bank parent folder under `base/mb` plus a config dir at
+ * `base/cfg` pointing `localFolder` at it, and returns the config dir — the seam
+ * the Knowledge/Graph server reads through. Each repo gets `.jolli/config.json`,
+ * optional `_wiki/*.md`, optional `.jolli/graph/graph.json`.
+ */
+function writeMemoryBank(
+	base: string,
+	repos: ReadonlyArray<{ dir: string; wiki?: Record<string, string>; graph?: string }>,
+): string {
+	const mb = join(base, "mb");
+	for (const r of repos) {
+		const kbRoot = join(mb, r.dir);
+		mkdirSync(join(kbRoot, ".jolli"), { recursive: true });
+		writeFileSync(
+			join(kbRoot, ".jolli", "config.json"),
+			JSON.stringify({ version: 1, sortOrder: "date", repoName: r.dir }),
+		);
+		if (r.wiki) {
+			mkdirSync(join(kbRoot, "_wiki"), { recursive: true });
+			for (const [file, body] of Object.entries(r.wiki)) writeFileSync(join(kbRoot, "_wiki", file), body);
+		}
+		if (r.graph !== undefined) {
+			mkdirSync(join(kbRoot, ".jolli", "graph"), { recursive: true });
+			writeFileSync(join(kbRoot, ".jolli", "graph", "graph.json"), r.graph);
+		}
+	}
+	const configDir = join(base, "cfg");
+	mkdirSync(configDir, { recursive: true });
+	writeFileSync(join(configDir, "config.json"), JSON.stringify({ localFolder: mb }));
+	return configDir;
 }
 
 const model = (view: DashboardView): DashboardModel => ({
@@ -402,7 +436,7 @@ describe("routes", () => {
 		expect(page.status).toBe(200);
 		expect(page.headers.get("content-type")).toBe("text/html");
 		// The API speaks view TOKENS, which are no longer the paths.
-		for (const view of ["stats", "standup", "repositories", "memories"] as const) {
+		for (const view of ["stats", "standup", "repositories", "memories", "knowledge", "graph"] as const) {
 			const api = await get(port, `/api/model?view=${view}`);
 			expect(((await api.json()) as DashboardModel).view).toBe(view);
 		}
@@ -427,6 +461,8 @@ describe("routes", () => {
 			["/dashboard", "stats"],
 			["/dashboard/standup", "standup"],
 			["/memories", "memories"],
+			["/knowledge", "knowledge"],
+			["/graph", "graph"],
 		];
 		for (const [path, view] of cases) {
 			const page = await get(port, path);
@@ -440,6 +476,95 @@ describe("routes", () => {
 		const port = await listen(testServer());
 		const res = await get(port, "/api/graph-version?repo=r1");
 		expect(res.status).toBe(404);
+	});
+
+	describe("wiki-viewer & graph-viewer iframes", () => {
+		it("renders a wiki page via marked, sandbox-isolated (frame-ancestors self, no-store)", async () => {
+			const configDir = writeMemoryBank(dir, [{ dir: "repoA", wiki: { "topic--a.md": "# Hello\n\nbody" } }]);
+			const port = await listen(testServer({ configDir }));
+			const res = await get(port, "/wiki-viewer?kb=repoA&file=topic--a.md");
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-type")).toBe("text/html");
+			expect(res.headers.get("content-security-policy")).toBe("sandbox allow-scripts; frame-ancestors 'self'");
+			expect(res.headers.get("x-frame-options")).toBe("SAMEORIGIN");
+			expect(res.headers.get("cache-control")).toBe("no-store");
+			const body = await res.text();
+			// The vendored marked engine is inlined, and the page body is rendered by it.
+			expect(body).toContain('id="md"');
+			expect(body).toContain("window.marked.parse(");
+			// The document must NOT carry the dashboard mutation token.
+			expect(body).not.toContain("__JOLLI_DASHBOARD_TOKEN__");
+		});
+
+		it("neutralizes a </script> breakout payload in the wiki body", async () => {
+			const payload = "# Title\n\n</script><script>window.parent.__JOLLI_DASHBOARD_TOKEN__</script>";
+			const configDir = writeMemoryBank(dir, [{ dir: "repoA", wiki: { "topic--evil.md": payload } }]);
+			const port = await listen(testServer({ configDir }));
+			const body = await (await get(port, "/wiki-viewer?kb=repoA&file=topic--evil.md")).text();
+			// The raw closing tag must NOT survive verbatim — escapeForInlineScript
+			// rewrote every `<` to `<`, so the inline <script> cannot be closed.
+			expect(body).not.toContain("</script><script>window.parent");
+			expect(body).toContain("\\u003c/script>\\u003cscript>window.parent");
+		});
+
+		it("400s a missing param and a bad file name (path-traversal guard)", async () => {
+			const configDir = writeMemoryBank(dir, [{ dir: "repoA", wiki: { "topic--a.md": "# x\n" } }]);
+			const port = await listen(testServer({ configDir }));
+			expect((await get(port, "/wiki-viewer?kb=repoA")).status).toBe(400);
+			expect((await get(port, "/wiki-viewer?file=topic--a.md")).status).toBe(400);
+			expect((await get(port, "/wiki-viewer?kb=repoA&file=../../secret.md")).status).toBe(400);
+		});
+
+		it("404s an unknown repo and a missing wiki file with a framed message", async () => {
+			const configDir = writeMemoryBank(dir, [{ dir: "repoA", wiki: { "topic--a.md": "# x\n" } }]);
+			const port = await listen(testServer({ configDir }));
+			const unknownRepo = await get(port, "/wiki-viewer?kb=nope&file=topic--a.md");
+			expect(unknownRepo.status).toBe(404);
+			expect(await unknownRepo.text()).toContain("could not be found");
+			const missingFile = await get(port, "/wiki-viewer?kb=repoA&file=topic--missing.md");
+			expect(missingFile.status).toBe(404);
+		});
+
+		it("frames a repo's graph (inlined __EMBEDDED_GRAPH__) with an in-header repo switcher", async () => {
+			const configDir = writeMemoryBank(dir, [
+				{ dir: "repoA", graph: '{"schemaVersion":4,"nodes":[]}' },
+				{ dir: "repoB", graph: "{}" },
+			]);
+			const port = await listen(testServer({ configDir }));
+			const res = await get(port, "/graph-viewer?kb=repoA");
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-security-policy")).toBe("sandbox allow-scripts; frame-ancestors 'self'");
+			expect(res.headers.get("cache-control")).toBe("no-store");
+			const body = await res.text();
+			expect(body).toContain("__EMBEDDED_GRAPH__");
+			expect(body).not.toContain("__JOLLI_DASHBOARD_TOKEN__");
+			// The repo switcher lists every graph-bearing repo, current one selected.
+			expect(body).toContain('id="jolli-repo-switcher"');
+			expect(body).toContain('<option value="repoA" selected>repoA</option>');
+			expect(body).toContain('<option value="repoB">repoB</option>');
+		});
+
+		it("classes the REAL <body> for light theme (not the CSS comment's literal <body>)", async () => {
+			const configDir = writeMemoryBank(dir, [{ dir: "repoA", graph: '{"schemaVersion":4,"nodes":[]}' }]);
+			const port = await listen(testServer({ configDir }));
+			// Assert on the body tag that follows </head> — the graph CSS contains a
+			// literal "<body>" in a comment, so a lax `toContain` would pass on the
+			// wrong match (the bug this guards against).
+			const dark = await (await get(port, "/graph-viewer?kb=repoA")).text();
+			expect(dark).toMatch(/<\/head>\s*<body>/);
+			const light = await (await get(port, "/graph-viewer?kb=repoA&theme=light")).text();
+			expect(light).toMatch(/<\/head>\s*<body class="vscode-light">/);
+		});
+
+		it("400s a missing kb, 404s an unknown repo, and shows guidance when a repo has no graph", async () => {
+			const configDir = writeMemoryBank(dir, [{ dir: "repoA" }]);
+			const port = await listen(testServer({ configDir }));
+			expect((await get(port, "/graph-viewer")).status).toBe(400);
+			expect((await get(port, "/graph-viewer?kb=nope")).status).toBe(404);
+			const noGraph = await get(port, "/graph-viewer?kb=repoA");
+			expect(noGraph.status).toBe(200);
+			expect(await noGraph.text()).toContain("No knowledge graph yet");
+		});
 	});
 
 	it("passes a valid dimension through to the model builder and drops an invalid one", async () => {
@@ -1116,6 +1241,24 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		const repositories = await get(port, "/api/model?view=repositories");
 		expect(repositories.status).toBe(200);
 		expect(((await repositories.json()) as DashboardModel).view).toBe("repositories");
+	});
+
+	it("reads knowledge and graph models off the Memory Bank folder", async () => {
+		const dbPath = join(dir, "kg.db");
+		const configDir = writeMemoryBank(dir, [
+			{ dir: "repoA", wiki: { "_index.md": "# repoA Wiki\n" }, graph: '{"nodes":[]}' },
+		]);
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+
+		const knowledge = (await (await get(port, "/api/model?view=knowledge")).json()) as DashboardModel;
+		expect(knowledge.view).toBe("knowledge");
+		expect(knowledge.knowledge?.repos[0]?.repoName).toBe("repoA");
+		expect(knowledge.knowledge?.repos[0]?.graphAvailable).toBe(true);
+
+		const graph = (await (await get(port, "/api/model?view=graph")).json()) as DashboardModel;
+		expect(graph.view).toBe("graph");
+		expect(graph.graph?.repos[0]?.graphAvailable).toBe(true);
 	});
 
 	// Memories is the one view that reads git before querying: a rebase leaves

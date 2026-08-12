@@ -84,6 +84,18 @@ describe("assembleGraphHtml", () => {
 		expect(html).not.toContain("</script>bad");
 	});
 
+	it("applies bodyClass to the real <body>, not a literal <body> in the inlined CSS", () => {
+		// The CSS mentions "<body>" in a comment; the class must land on the tag,
+		// not that comment (a post-inline String.replace would hit the comment first).
+		const html = assembleGraphHtml({ ...PARTS, css: "/* the <body> carries the theme */ .b{}" }, "vscode-light");
+		expect(html).toMatch(/<\/head><body class="vscode-light">/);
+		expect(html).toContain("the <body> carries the theme");
+	});
+
+	it("leaves <body> unclassed when no bodyClass is given", () => {
+		expect(assembleGraphHtml(PARTS)).toContain("</head><body>");
+	});
+
 	it("throws when the template is missing a marker (no silent drop)", () => {
 		expect(() => assembleGraphHtml({ ...PARTS, template: "<html><head></head><body></body></html>" })).toThrow(
 			/missing expected marker: stylesheet link/,

@@ -35,8 +35,10 @@ import type {
 	DecisionRecord,
 	DecisionsCard,
 	FunStats,
+	GraphModel,
 	HeatmapCell,
 	HourBucket,
+	KnowledgeModel,
 	KpiCard,
 	McpServerRow,
 	MemoryCard,
@@ -378,6 +380,10 @@ export interface QueryOptions {
 	readonly authorIdentity?: AuthorIdentity;
 	/** Repositories view: the async-read registry + job state. Absent renders an empty list. */
 	readonly repositoriesModel?: RepositoriesModel;
+	/** Knowledge view: the async-read Memory Bank `_wiki` file lists. Absent renders an empty list. */
+	readonly knowledgeModel?: KnowledgeModel;
+	/** Graph view: the async-read Memory Bank repo list. Absent renders an empty list. */
+	readonly graphModel?: GraphModel;
 	/** Settings view: the async-read config/memory-bank snapshot. Absent on every other view. */
 	readonly settingsModel?: SettingsPageModel;
 	readonly timeZone?: string;
@@ -1886,6 +1892,8 @@ function buildRecallUsage(
 
 /** Fallback for a `buildDashboardModel` call that never read the repo registry. */
 const NO_REPOSITORIES_MODEL: RepositoriesModel = { repos: [], hooksManifest: [] };
+const NO_KNOWLEDGE_MODEL: KnowledgeModel = { repos: [] };
+const NO_GRAPH_MODEL: GraphModel = { repos: [] };
 
 // ── Model assembly ──────────────────────────────────────────────────────────
 
@@ -1953,7 +1961,10 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 	const window = () => resolveWindow(options.range, options.customFrom, options.customTo, nowMs, timeZone);
 	// Exactly one view payload is built per request — the other two would be
 	// wasted queries, and the page only ever reads its own.
-	const payload = (): Pick<DashboardModel, "stats" | "standup" | "repositories" | "memories" | "settings"> => {
+	const payload = (): Pick<
+		DashboardModel,
+		"stats" | "standup" | "repositories" | "memories" | "knowledge" | "graph" | "settings"
+	> => {
 		switch (options.view) {
 			case "stats":
 				return {
@@ -1972,6 +1983,12 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 				return { standup: buildStandup(db, options.scope, timeZone, nowMs, tier, options.authorIdentity) };
 			case "repositories":
 				return { repositories: options.repositoriesModel ?? NO_REPOSITORIES_MODEL };
+			case "knowledge":
+				// Read off disk (Memory Bank `_wiki`), pre-built in the model builder like
+				// repositories/settings — there is no DB query for it here.
+				return { knowledge: options.knowledgeModel ?? NO_KNOWLEDGE_MODEL };
+			case "graph":
+				return { graph: options.graphModel ?? NO_GRAPH_MODEL };
 			case "memories":
 				// No tier gate, unlike Decisions: a memory is a per-commit capture,
 				// not a recall receipt, so it exists as soon as a commit is

@@ -2696,3 +2696,59 @@ describe("standup author filter", () => {
 		expect(model.stats?.totalCommits).toBe(3);
 	});
 });
+
+describe("knowledge & graph payloads", () => {
+	let dir: string;
+	let dbPath: string;
+
+	beforeEach(async () => {
+		dir = mkdtempSync(join(tmpdir(), "jolli-dq-kg-"));
+		dbPath = join(dir, "kg.db");
+		await withDashboardDb(() => {}, { dbPath });
+	});
+	afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+	it("passes the pre-built knowledge model through, and falls back to an empty one", async () => {
+		const provided = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "knowledge",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs: 0,
+					knowledgeModel: { repos: [{ kb: "r", repoName: "r", graphAvailable: true, files: [] }] },
+				}),
+			{ dbPath },
+		);
+		expect(provided.view).toBe("knowledge");
+		expect(provided.knowledge?.repos).toHaveLength(1);
+
+		const fallback = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "knowledge", scope: { kind: "all" }, timeZone: "UTC", nowMs: 0 }),
+			{ dbPath },
+		);
+		expect(fallback.knowledge).toEqual({ repos: [] });
+	});
+
+	it("passes the pre-built graph model through, and falls back to an empty one", async () => {
+		const provided = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "graph",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs: 0,
+					graphModel: { repos: [{ kb: "r", repoName: "r", graphAvailable: false }] },
+				}),
+			{ dbPath },
+		);
+		expect(provided.view).toBe("graph");
+		expect(provided.graph?.repos).toHaveLength(1);
+
+		const fallback = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "graph", scope: { kind: "all" }, timeZone: "UTC", nowMs: 0 }),
+			{ dbPath },
+		);
+		expect(fallback.graph).toEqual({ repos: [] });
+	});
+});

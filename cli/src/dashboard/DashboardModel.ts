@@ -312,7 +312,7 @@ export type AdoptionTier = "installed" | "memory" | "space";
  * into Memories' per-topic Decisions callout — and `/decisions` now 302s to
  * `/memories`, so this union no longer carries that token.
  */
-export type DashboardView = "stats" | "standup" | "repositories" | "memories" | "settings";
+export type DashboardView = "stats" | "standup" | "repositories" | "memories" | "knowledge" | "graph" | "settings";
 
 /**
  * The Repositories page payload — also first-run setup once it grows a write
@@ -344,17 +344,55 @@ export interface RepositoriesModel {
 	readonly hooksManifest: ReadonlyArray<{ readonly title: string; readonly detail: string }>;
 }
 
+/** One browsable `_wiki` markdown file (a topic page or the `_index.md`). */
+export interface KnowledgeFile {
+	/** File name under `<kbRoot>/_wiki/` — `_index.md` or `topic--<slug>.md`. Also the `/wiki-viewer?file=` key. */
+	readonly file: string;
+	/** Display title — manifest `title`, else the file's first H1, else the file name. */
+	readonly title: string;
+}
+
+/** One Memory Bank repo's `_wiki` contents, for the Knowledge page. */
+export interface KnowledgeRepo {
+	/**
+	 * The Memory Bank folder's directory basename (`DiscoveredRepo.dirName`) — the
+	 * stable key the `/wiki-viewer` and `/graph-viewer` routes resolve back to a
+	 * `kbRoot` via `discoverRepos`. Deliberately NOT the dashboard registry's
+	 * `repoIdentity` (a different identity space); see the Knowledge/Graph docstrings.
+	 */
+	readonly kb: string;
+	readonly repoName: string;
+	/** Whether `<kbRoot>/.jolli/graph/graph.json` exists — gates the row's Graph link. */
+	readonly graphAvailable: boolean;
+	readonly files: ReadonlyArray<KnowledgeFile>;
+}
+
 /**
- * The Knowledge nav destination's honest placeholder counts.
- *
- * The CLI already compiles a knowledge wiki (`jolli compile`) into
- * `topic_pages`/`topic_source_refs`, but no endpoint serves it to this app
- * yet — the page states that rather than rendering a finished view. The count
- * is real (a plain `topic_pages` tally) so the placeholder says how much is
- * waiting rather than just that something is.
+ * The Knowledge page payload — the `_wiki` markdown files of every Memory Bank
+ * repo, read straight off disk (NOT the dashboard SQLite). The bodies are not
+ * carried here: each is fetched on click through the `/wiki-viewer` iframe, so
+ * the model stays a small per-repo file list.
  */
 export interface KnowledgeModel {
-	readonly topicPages: number;
+	readonly repos: ReadonlyArray<KnowledgeRepo>;
+}
+
+/** One Memory Bank repo, for the Graph page's repo picker. */
+export interface GraphRepo {
+	/** Same `DiscoveredRepo.dirName` key as {@link KnowledgeRepo.kb}. */
+	readonly kb: string;
+	readonly repoName: string;
+	/** Whether the repo has a compiled `graph.json` — a repo without one is not selectable. */
+	readonly graphAvailable: boolean;
+}
+
+/**
+ * The Graph page payload — the Memory Bank repos and whether each has a compiled
+ * graph. The graph itself is not carried: the page frames `/graph-viewer?kb=…`,
+ * which reuses `GraphExport.buildStandaloneHtml` to inline that repo's graph.json.
+ */
+export interface GraphModel {
+	readonly repos: ReadonlyArray<GraphRepo>;
 }
 
 // ── Settings page ───────────────────────────────────────────────────────────
@@ -1510,6 +1548,10 @@ export interface DashboardModel {
 	readonly repositories?: RepositoriesModel;
 	/** Present on the memories view only. */
 	readonly memories?: MemoriesModel;
+	/** Present on the knowledge view only. */
+	readonly knowledge?: KnowledgeModel;
+	/** Present on the graph view only. */
+	readonly graph?: GraphModel;
 	/** Present on the settings view only. */
 	readonly settings?: SettingsPageModel;
 }

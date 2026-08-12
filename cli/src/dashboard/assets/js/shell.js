@@ -100,6 +100,8 @@ window.JD = window.JD || {};
 		{ view: "standup", label: "Daily Standup", sub: "sprint · local" },
 		{ view: "repositories", label: "Repositories", sub: "enable · pause" },
 		{ view: "memories", label: "Memories", sub: "browse · per-commit" },
+		{ view: "knowledge", label: "Knowledge", sub: "wiki · per-repo" },
+		{ view: "graph", label: "Graph", sub: "knowledge graph · per-repo" },
 		{ view: "settings", label: "Settings", sub: "agents · summary · memory bank" },
 	];
 
@@ -112,6 +114,8 @@ window.JD = window.JD || {};
 		standup: "/dashboard/standup",
 		repositories: "/repositories",
 		memories: "/memories",
+		knowledge: "/knowledge",
+		graph: "/graph",
 		settings: "/settings",
 	};
 	JD.viewPath = (view) => VIEW_PATH[view] || "/" + view;
@@ -125,10 +129,13 @@ window.JD = window.JD || {};
 	   behind an expand/collapse toggle — that interaction is a later polish
 	   pass, not a routing concern.
 
-	   Knowledge, Graph and Settings have no nav row AND no route: v1 releases
-	   none of the three, so DashboardServer's VIEW_PATHS omits them and a
-	   direct visit 404s. Restoring one needs the server-side route, view token
-	   and model payload back as well — a nav row on its own is not enough. */
+	   Knowledge and Graph ARE routed (VIEW_PATHS has /knowledge, /graph) and
+	   appear below Repositories; unlike Dashboard/Memories they are NOT gated
+	   (see the note on their entries). Settings alone has no scrollable nav row
+	   and no page path — it is a modal pinned to the bottom slot (NAV_BOTTOM),
+	   opened via JD.openSettings, so a direct visit to /settings 404s. Adding a
+	   new page needs its server route, view token and model payload too — a nav
+	   row on its own is not enough. */
 	var NAV_MIDDLE = [
 		{
 			label: "Dashboard",
@@ -140,6 +147,11 @@ window.JD = window.JD || {};
 		},
 		{ view: "memories", path: "/memories", label: "Memories", gated: true },
 		{ view: "repositories", path: "/repositories", label: "Repositories" },
+		/* Knowledge / Graph browse the Memory Bank FOLDER, whose repo set differs
+		   from the enabled dashboard repos GATED_PATHS keys off — so they are NOT
+		   gated (their pages carry their own empty state). */
+		{ view: "knowledge", path: "/knowledge", label: "Knowledge" },
+		{ view: "graph", path: "/graph", label: "Graph" },
 	];
 	/* Settings is pinned to the sidebar's bottom edge (its reserved slot), not in
 	   the scrollable menu list — a persistent destination rather than the last
@@ -157,6 +169,9 @@ window.JD = window.JD || {};
 		database:
 			'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
 		chevron: '<path d="m6 9 6 6 6-6"/>',
+		book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+		network:
+			'<rect x="9" y="2" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="16" y="16" width="6" height="6" rx="1"/><path d="M12 8v4"/><path d="M5 16v-2h14v2"/>',
 		settings:
 			'<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
 	};
@@ -167,7 +182,14 @@ window.JD = window.JD || {};
 		NAV_ICONS[name] +
 		"</svg></span>";
 	var navIconFor = (view) =>
-		({ repositories: "foldergit", stats: "dashboard", memories: "database", settings: "settings" })[view];
+		({
+			repositories: "foldergit",
+			stats: "dashboard",
+			memories: "database",
+			knowledge: "book",
+			graph: "network",
+			settings: "settings",
+		})[view];
 
 	/* Tier → the `data-tier` the stylesheet keys its chips and locked previews off. */
 	var TIER_INDEX = { installed: 0, memory: 1, space: 2 };

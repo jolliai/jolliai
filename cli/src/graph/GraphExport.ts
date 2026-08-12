@@ -60,8 +60,14 @@ function replaceMarker(html: string, marker: RegExp, replacement: () => string, 
  * Pure assembly: inline the stylesheet and all scripts into the template, with
  * the graph data behind `window.__EMBEDDED_GRAPH__`. No fs access — fully
  * testable. Throws if the template is missing an expected marker.
+ *
+ * `bodyClass` (e.g. `"vscode-light"`) is written onto the real `<body>` tag so a
+ * host can force the viz's light palette. It is applied to the RAW template,
+ * BEFORE the stylesheet is inlined — the CSS carries a literal `<body>` in a
+ * comment, and a post-inline `String.replace("<body>", …)` would class that
+ * comment instead (it replaces only the first match). Omit for the default dark.
  */
-export function assembleGraphHtml(parts: GraphHtmlParts): string {
+export function assembleGraphHtml(parts: GraphHtmlParts, bodyClass?: string): string {
 	const safeGraph = escapeForInlineScript(parts.graphJson);
 	const scriptTag = (js: string) => `<script>\n${js}\n</script>`;
 	// Vendor first, then the embedded data (data.js reads it), then app scripts.
@@ -70,8 +76,10 @@ export function assembleGraphHtml(parts: GraphHtmlParts): string {
 		`<script>window.__EMBEDDED_GRAPH__ = ${safeGraph};</script>\n` +
 		parts.appJs.map(scriptTag).join("\n");
 
-	let html = replaceMarker(
-		parts.template,
+	// Real `<body>` first (CSS with its comment `<body>` is not inlined yet).
+	let html = bodyClass ? parts.template.replace("<body>", `<body class="${bodyClass}">`) : parts.template;
+	html = replaceMarker(
+		html,
 		/<link rel="stylesheet" href="styles\/main\.css" \/>/,
 		() => `<style>\n${parts.css}\n</style>`,
 		"stylesheet link",
@@ -96,15 +104,18 @@ export function resolveAssetsDir(baseDir: string = HERE): string {
 }
 
 /** Read the viz assets from `assetsDir` and assemble the standalone HTML. */
-export function buildStandaloneHtml(assetsDir: string, graphJson: string): string {
+export function buildStandaloneHtml(assetsDir: string, graphJson: string, bodyClass?: string): string {
 	const read = (...p: string[]) => readFileSync(join(assetsDir, ...p), "utf8");
-	return assembleGraphHtml({
-		template: read("index.html"),
-		css: read("styles", "main.css"),
-		vendorJs: VENDOR_FILES.map((f) => read("vendor", f)),
-		appJs: SCRIPT_FILES.map((f) => read("js", f)),
-		graphJson,
-	});
+	return assembleGraphHtml(
+		{
+			template: read("index.html"),
+			css: read("styles", "main.css"),
+			vendorJs: VENDOR_FILES.map((f) => read("vendor", f)),
+			appJs: SCRIPT_FILES.map((f) => read("js", f)),
+			graphJson,
+		},
+		bodyClass,
+	);
 }
 
 export interface ExportGraphOptions {
