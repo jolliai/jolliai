@@ -3,10 +3,10 @@
 # Covers `cli/` and `vscode/` together because they share a root package.json
 # (npm workspaces) — touching one can break the other's install or build.
 #
-# `claude-plugin/` and `codex-plugin/` are in the glob list for the same reason
-# even though they are not workspaces: root `npm run build` chains their esbuild
-# targets, and both bundle `cli/src/**` into their own `dist/`. This job runs
-# `npm run all`, so it is the ONLY gate that builds them — without those globs a
+# `claude-plugin/`, `codex-plugin/` and `cursor-plugin/` are in the glob list for the
+# same reason even though they are not workspaces: root `npm run build` chains their
+# esbuild targets, and all three bundle `cli/src/**` into their own `dist/`. This job
+# runs `npm run all`, so it is the ONLY gate that builds them — without those globs a
 # plugin-only PR reports SUCCESS having compiled nothing.
 
 # Required by branch ruleset (contexts: build-vscode). The status check
@@ -45,6 +45,7 @@ jobs:
                         vscode/*
                         claude-plugin/*
                         codex-plugin/*
+                        cursor-plugin/*
                         package.json
                         package-lock.json
                         .nvmrc

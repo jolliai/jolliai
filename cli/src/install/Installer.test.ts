@@ -1,3 +1,4 @@
+import { lstatSync, readlinkSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -169,12 +170,33 @@ vi.mock("../core/SchemaV5Migration.js", () => ({
 	readSchemaV5State: vi.fn().mockResolvedValue(null),
 }));
 
+// The Cursor mirror's reconcile asks whether the Cursor plugin is still installed by
+// looking at `dist-paths/`. Unmocked that reads the DEVELOPER's real
+// `~/.jolli/jollimemory/`, so whether the mirror gets written would depend on whether
+// that machine happens to have the plugin. Default to "installed"; the removal case
+// flips it. Added to BOTH mocks of this module below so the behaviour does not depend
+// on which registration vitest keeps.
+const { traverseDistPathsMock } = vi.hoisted(() => ({
+	traverseDistPathsMock: vi.fn(() => [
+		{ source: "cursor-plugin", version: "0.0.0", distDir: "/fake/dist", available: true },
+	]),
+}));
+
+/**
+ * A stand-in plugin bundle for the Cursor mirror, which is planted as a SYMLINK into
+ * `<bundle>/mirror/`. The target has to exist: a link into a path that is not there is
+ * a dangling link, which reads through `exists()` exactly like "never written".
+ * Created per test and pointed at by the mock above.
+ */
+let fakeBundleDir: string;
+
 // Partially mock DistPathResolver so resolveDistPath doesn't depend on global npm state.
 // By default, resolveDistPath returns the caller's own dist dir with "cli" source.
 vi.mock("./DistPathResolver.js", async (importOriginal) => {
 	const original = await importOriginal<typeof import("./DistPathResolver.js")>();
 	return {
 		...original,
+		traverseDistPaths: traverseDistPathsMock,
 		resolveDistPath: vi.fn().mockImplementation(async (_cwd, callerDistDir, callerSource) => ({
 			distDir: callerDistDir,
 			version: typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev",
@@ -220,6 +242,7 @@ vi.mock("./DistPathResolver.js", async (importOriginal) => {
 	const original = await importOriginal<typeof import("./DistPathResolver.js")>();
 	return {
 		...original,
+		traverseDistPaths: traverseDistPathsMock,
 		resolveDistPath: vi
 			.fn()
 			.mockImplementation(async (_cwd: string, callerDistDir: string, callerSource: string) => ({
@@ -293,6 +316,26 @@ describe("Installer", () => {
 		originalCwd = process.cwd();
 		// Create .git/hooks directory to simulate a git repo
 		await mkdir(join(tempDir, ".git", "hooks"), { recursive: true });
+		// A real symlink target for the Cursor mirror — see fakeBundleDir's note.
+		fakeBundleDir = await mkdtemp(join(tmpdir(), "jollimemory-bundle-"));
+		for (const name of ["jolli", "jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
+			await mkdir(join(fakeBundleDir, "mirror", name), { recursive: true });
+			await writeFile(
+				join(fakeBundleDir, "mirror", name, "SKILL.md"),
+				`---\nname: ${name}\n---\nbody\n`,
+				"utf-8",
+			);
+		}
+		// Where the Cursor mirror's symlink targets are found. Recorded by the plugin's
+		// own bootstrap in production — `dist-paths` cannot answer it, because that slot
+		// is keyed by source tag alone and a `run-cli` dispatch records whichever runtime
+		// actually executed (the CLI, at a version tie).
+		await mkdir(join(fakeHomeDir, ".jolli", "jollimemory"), { recursive: true });
+		await writeFile(
+			join(fakeHomeDir, ".jolli", "jollimemory", "cursor-plugin-root"),
+			`${fakeBundleDir}\n`,
+			"utf-8",
+		);
 		// No Cline flavors by default; the MCP tests below point this at a temp dir.
 		clineControl.storageDirs = [];
 		// Reset integration detector mocks to defaults so state doesn't leak between tests
@@ -1318,8 +1361,9 @@ describe("Installer", () => {
 
 	// `/jolli:init` runs `enable --repo-hooks-only --source-tag <plugin>` with no
 	// --automatic; the plugin's SessionStart bootstrap runs the same install() WITH
-	// automatic: true. Only the former may claim the local-agent tool.
-	describe("plugin init claims the local-agent tool", () => {
+	// automatic: true. Only the former may seed the local-agent tool, and only into a
+	// config that holds none.
+	describe("plugin init seeds the local-agent tool", () => {
 		it("records the initiating host's tool on an explicit (non-automatic) plugin install", async () => {
 			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
 
@@ -1329,9 +1373,9 @@ describe("Installer", () => {
 			expect(globalConfig.localAgentTool).toBe("codex");
 		});
 
-		// The overwrite is deliberate, but it must not be silent: the only other trace
-		// is a log.info that lands in debug.log, where the user never sees it.
-		it("overwrites a tool the other host had seeded, and reports the replacement", async () => {
+		// Setting a repository up inside one host is not a decision about which agent
+		// generates memories machine-wide. Changing that stays `jolli configure --set`.
+		it("leaves a tool that is already configured alone, and says nothing about it", async () => {
 			await writeFile(
 				join(emptyGlobalDir, "config.json"),
 				JSON.stringify({ aiProvider: "local-agent", localAgentTool: "claude-code" }),
@@ -1341,14 +1385,13 @@ describe("Installer", () => {
 			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
 
 			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
-			expect(globalConfig.localAgentTool).toBe("codex");
-			const notice = result.warnings.find((warning) => warning.includes("local agent"));
-			expect(notice).toContain("Codex");
-			expect(notice).toContain("was: Claude Code");
-			expect(notice).toContain("localAgentTool=claude-code");
+			expect(globalConfig.localAgentTool).toBe("claude-code");
+			// Nothing changed, so there is nothing to warn about — the front door's own
+			// "summaries via <tool>" line is what tells the user which CLI runs.
+			expect(result.warnings.filter((warning) => warning.includes("local agent"))).toEqual([]);
 		});
 
-		// Filling in a blank is not a change the user needs told about.
+		// Filling in a blank is not a change the user needs told about either.
 		it("stays quiet when it only fills in an unset tool", async () => {
 			const result = await install(tempDir, { repoHooksOnly: true, sourceTag: "codex-plugin" });
 
@@ -1363,6 +1406,22 @@ describe("Installer", () => {
 			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
 			expect(globalConfig.aiProvider).toBe("jolli");
 			expect(globalConfig.localAgentTool).toBe("claude-code");
+		});
+
+		// The mirror image: turning generation on for a user who already picked a tool
+		// points the provider at THAT tool, never at the initiating host's.
+		it("seeds the provider onto the configured tool rather than its own", async () => {
+			await writeFile(
+				join(emptyGlobalDir, "config.json"),
+				JSON.stringify({ localAgentTool: "opencode" }),
+				"utf-8",
+			);
+
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
+
+			const globalConfig = JSON.parse(await readFile(join(emptyGlobalDir, "config.json"), "utf-8"));
+			expect(globalConfig.aiProvider).toBe("local-agent");
+			expect(globalConfig.localAgentTool).toBe("opencode");
 		});
 
 		// The no-tug-of-war guarantee: the automatic bootstrap must not touch the tool,
@@ -1537,6 +1596,152 @@ describe("Installer", () => {
 
 			expect(await exists(join(fakeHomeDir, ".codex", "config.toml"))).toBe(false);
 		});
+
+		/*
+		 * Cursor's counterpart, and the reason it needs no exception to the global-host
+		 * skip: its MCP config is REPO-scoped, so the ordinary repo registrar is already
+		 * the right writer and the entry lands in the worktree the user is working in.
+		 * The Cursor plugin therefore ships no `mcp.json` of its own for the same reason
+		 * the Codex one does — a plugin-declared entry would resolve its relative cwd
+		 * against the plugin root and answer for the bundle's cache directory.
+		 */
+		it("registers the repo-scoped Cursor MCP entry for a cursor-plugin bootstrap", async () => {
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
+
+			const raw = await readFile(join(tempDir, ".cursor", "mcp.json"), "utf-8");
+			expect(JSON.parse(raw).mcpServers).toHaveProperty("jollimemory");
+		});
+
+		// ONLY cursor. A Cursor plugin install must not go writing MCP config for Claude
+		// or for any global host — no detector is consulted on this path, so the flags
+		// are hardcoded and a widened set would be silent.
+		it("registers no other host for a cursor-plugin bootstrap", async () => {
+			const { registerGlobalMcpHosts, registerRepoMcpHosts } = await import("./mcp/HostRegistrars.js");
+
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
+
+			const repoDetected = vi.mocked(registerRepoMcpHosts).mock.calls[0][1];
+			const { cursor, ...otherRepoHosts } = repoDetected;
+			expect(cursor).toBe(true);
+			expect(Object.values(otherRepoHosts).every((value) => value === false)).toBe(true);
+
+			const globalDetected = vi.mocked(registerGlobalMcpHosts).mock.calls[0][0];
+			expect(Object.values(globalDetected).every((value) => value === false)).toBe(true);
+			expect(await exists(join(fakeHomeDir, ".codex", "config.toml"))).toBe(false);
+		});
+
+		// Host isolation, the whole point of keying the branch on the source tag: a
+		// Cursor session must not rewrite, upgrade or clean Claude's assets.
+		it("writes none of Claude's own assets for a cursor-plugin bootstrap", async () => {
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
+
+			expect(await exists(join(tempDir, ".claude", "skills", "jolli", "SKILL.md"))).toBe(false);
+			expect(await exists(join(tempDir, ".claude", "settings.local.json"))).toBe(false);
+		});
+
+		// `.agents/skills/` stays untouched: it is the cross-platform copy a full
+		// `jolli enable` owns, and it is the ONLY copy Codex, Gemini, OpenCode, Windsurf
+		// and Copilot have. A bootstrap write here would flap against that install.
+		it("never writes .agents/skills/ for a cursor-plugin bootstrap", async () => {
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
+
+			expect(await exists(join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md"))).toBe(false);
+		});
+
+		/*
+		 * What it DOES own is the Cursor-only mirror. Cursor reads `.agents/skills/` and
+		 * the plugin bundle into one flat pool and collapses neither, so the four
+		 * host-neutral skills are not bundled — they are placed per repo here, and only
+		 * when `.agents/` has not already supplied them. `.cursor/skills/` is read by no
+		 * other host, which is what makes writing and removing it safe.
+		 */
+		it("mirrors the host-neutral skills into .cursor/skills/ when .agents/ has none", async () => {
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
+
+			for (const name of ["jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
+				expect(await exists(join(tempDir, ".cursor", "skills", name, "SKILL.md"))).toBe(true);
+			}
+			// Planted as SYMLINKS into the bundle, which is what makes them vanish when the
+			// plugin is uninstalled. What the target CONTAINS is the bundle's business and
+			// is asserted in SkillInstaller.test.ts against the real builders.
+			const recall = join(tempDir, ".cursor", "skills", "jolli-recall");
+			expect(lstatSync(recall).isSymbolicLink()).toBe(true);
+			expect(readlinkSync(recall)).toBe(join(fakeBundleDir, "mirror", "jolli-recall"));
+			// The `/jolli` umbrella is NOT among them: it is machine-global, because the
+			// chat-first window that most needs a front door never names a workspace.
+			expect(await exists(join(tempDir, ".cursor", "skills", "jolli", "SKILL.md"))).toBe(false);
+		});
+
+		/*
+		 * The convergence that makes removal-through-the-UI survivable. Once the Cursor
+		 * plugin is uninstalled its own bootstrap never runs again, so if the reconcile
+		 * lived only in the cursor branch nothing could ever clean up the mirror. Every
+		 * other host's bootstrap keeps running — and Cursor itself executes the imported
+		 * Claude plugin's hooks — so the reconcile runs from all of them.
+		 */
+		it("cleans up the Cursor mirror from ANOTHER host's bootstrap", async () => {
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
+			expect(await exists(join(tempDir, ".cursor", "skills", "jolli-recall", "SKILL.md"))).toBe(true);
+
+			// The plugin is gone, exactly as Cursor's plugin manager leaves it: the bundle
+			// directory itself no longer exists, so every planted symlink now dangles. The
+			// recorded root under `~/.jolli/` survives — an uninstall never touches it —
+			// so only verifying that `mirror/` still exists can notice.
+			await rm(fakeBundleDir, { recursive: true, force: true });
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "claude-plugin" });
+
+			for (const name of ["jolli", "jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
+				expect(await exists(join(tempDir, ".cursor", "skills", name, "SKILL.md"))).toBe(false);
+			}
+
+			// No restore needed: beforeEach rebuilds the bundle and re-points the mock.
+		});
+
+		/*
+		 * The same convergence in the WRITE direction, which is the half that was
+		 * untested — and the half that made the git-exclude registration wrong.
+		 *
+		 * The reconcile is host-neutral, so with the Cursor plugin present on the machine
+		 * it plants `.cursor/skills/` symlinks during a CLAUDE or CODEX bootstrap too:
+		 * repo-hooks-only writes no `.agents/skills/`, so nothing else supplies these
+		 * names. While the exclude paths were registered inside the `pluginHost ===
+		 * "cursor"` branch, exactly that combination got the symlinks with no exclude
+		 * lines and left `?? .cursor/` in `git status`. Registration now sits beside this
+		 * call instead, outside the host branch.
+		 */
+		it("mirrors into .cursor/skills/ from ANOTHER host's bootstrap too", async () => {
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "claude-plugin" });
+
+			for (const name of ["jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
+				expect(await exists(join(tempDir, ".cursor", "skills", name, "SKILL.md"))).toBe(true);
+			}
+		});
+
+		it("mirrors nothing when .agents/skills/ already provides the skill", async () => {
+			await mkdir(join(tempDir, ".agents", "skills", "jolli-recall"), { recursive: true });
+			await writeFile(
+				join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md"),
+				'---\nname: jolli-recall\nmetadata:\n  vendor: "jolli.ai"\n---\nbody\n',
+				"utf-8",
+			);
+
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
+
+			expect(await exists(join(tempDir, ".cursor", "skills", "jolli-recall", "SKILL.md"))).toBe(false);
+			// The others still get mirrored — the decision is per skill, not per repo.
+			expect(await exists(join(tempDir, ".cursor", "skills", "jolli-search", "SKILL.md"))).toBe(true);
+		});
+
+		// The exclude paths themselves are asserted in SkillInstaller.test.ts
+		// (`CURSOR_REPO_SKILL_GIT_EXCLUDE_PATHS`); this fixture's temp dir is not a real
+		// git checkout, so `addGitExcludePaths` no-ops here and there is nothing to read
+		// back. Verifying the one-line hand-off would mean standing up a real repo in
+		// the fast tier, which is not worth it.
+		//
+		// What IS covered functionally is the precondition that made the registration's
+		// placement matter — that the mirror is planted from a non-Cursor bootstrap (see
+		// the test above). The registration is now unconditional and adjacent to that
+		// call, so the two cannot drift apart the way a branch-gated one did.
 	});
 
 	describe("multi-host MCP registration", () => {

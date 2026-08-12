@@ -1,0 +1,16 @@
+{
+	"name": "jolli-cursor-marketplace",
+	"owner": { "name": "jolli.ai", "email": "hello@jolli.ai" },
+	"metadata": {
+		"description": "Jolli Memory tools for Cursor — recall prior context, search decisions, author memory-rich PRs."
+	},
+	"plugins": [
+		{
+			"name": "jolli",
+			"source": "./plugins/jolli",
+			"description": "Recall prior dev context for a branch, search past decisions, and build memory-rich PR descriptions. Bundles the jolli CLI and a sessionStart bootstrap that installs the repository's git hooks and registers the Jolli Memory MCP server.",
+			"category": "developer-tools",
+			"keywords": ["memory", "recall", "pr", "git", "context"]
+		}
+	]
+}

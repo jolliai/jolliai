@@ -2216,6 +2216,17 @@ describe("ensurePluginDefaultProvider", () => {
 		expect(writes).toEqual([{ aiProvider: "local-agent", localAgentTool: "claude-code" }]);
 	});
 
+	// The regression this whole gate-splitting exists for. `jolli configure --set
+	// localAgentTool=codex` writes ONLY that key, so a user who picked a tool without
+	// ever picking a provider used to have it replaced by whichever plugin host opened
+	// the next session — silently, and before any `/jolli-init` could get there. The
+	// provider is still seeded (nothing had claimed it); it just points at THEIR tool.
+	it("seeds only the provider when a tool is already configured, leaving the tool alone", async () => {
+		const { writes } = fakeConfigLock({ localAgentTool: "codex" });
+		expect(await ensurePluginDefaultProvider("cursor-plugin", {})).toBe(true);
+		expect(writes).toEqual([{ aiProvider: "local-agent" }]);
+	});
+
 	// Seeding Claude's CLI for a Codex user would point generation at a binary they
 	// may not have installed — the tool has to follow the host that is seeding.
 	it("seeds the initiating host's own agent tool, not a hardcoded claude-code", async () => {
@@ -2283,6 +2294,15 @@ describe("computeLoginReminder", () => {
 		expect(text).not.toContain("/jolli:init");
 	});
 
+	// Cursor applies no namespace to a plugin's skills, so the bundle carries the
+	// prefix in its directory name. This surface returned NULL — no reminder at all —
+	// for as long as the lookup was a two-arm ladder over claude/codex.
+	it("uses the unnamespaced setup skill on the cursor-plugin surface", () => {
+		const text = computeLoginReminder("cursor-plugin", false, false);
+		expect(text).toContain("/jolli-init");
+		expect(text).not.toContain("jolli:init");
+	});
+
 	it("returns null for non-plugin surfaces (cli / vscode) even without a credential", () => {
 		expect(computeLoginReminder("cli", false, false)).toBeNull();
 		expect(computeLoginReminder("vscode-plugin", false, false)).toBeNull();
@@ -2320,6 +2340,18 @@ describe("formatRecallSuggestion", () => {
 			"Warning: 9 days since last commit. Run $jolli:recall for full context.",
 		);
 		expect(formatRecallSuggestion(2, "codex-plugin")).not.toContain("jolli-recall");
+	});
+
+	// The mirror image of the Codex case: Cursor namespaces nothing, so the prefix
+	// lives in the directory name and `jolli:recall` would name nothing. This surface
+	// fell through to the bare CLI form while the lookup was a two-arm ladder.
+	it("uses the unnamespaced /jolli-recall skill on the Cursor plugin surface", () => {
+		expect(formatRecallSuggestion(2, "cursor-plugin")).toBe("Tip: run /jolli-recall for full context");
+		expect(formatRecallSuggestion(9, "cursor-plugin")).toBe(
+			"Warning: 9 days since last commit. Run /jolli-recall for full context.",
+		);
+		expect(formatRecallSuggestion(2, "cursor-plugin")).not.toContain("jolli:recall");
+		expect(formatRecallSuggestion(2, "cursor-plugin")).not.toContain("`jolli recall`");
 	});
 
 	// "shared" is what the settings-installed repo hook passes: it cannot know which

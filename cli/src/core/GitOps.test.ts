@@ -64,6 +64,7 @@ import {
 	listFilesInBranch,
 	listWorktrees,
 	orphanBranchExists,
+	probeWorktree,
 	readFileFromBranch,
 	readLocalGitIdentity,
 	readOrigHead,
@@ -1693,6 +1694,41 @@ describe("GitOps", () => {
 			} finally {
 				await rm(dir, { recursive: true, force: true });
 			}
+		});
+	});
+
+	/*
+	 * The stricter sibling. `isInsideGitRepo` answers "any git context" — correct for
+	 * its own callers, and too loose for anything that gates on being in a WORKING TREE.
+	 * Measured on git 2.x: a bare repo and the `.git` directory itself both exit 0 from
+	 * `rev-parse --git-dir` while `--is-inside-work-tree` prints `false`, so an
+	 * exit-code check calls them work trees. These pin the STDOUT reading, plus the
+	 * third state that is not about `cwd` at all.
+	 */
+	describe("probeWorktree", () => {
+		it("answers inside for a real work tree", async () => {
+			mockSuccess("true\n");
+			expect(await probeWorktree("/main/repo")).toBe("inside");
+		});
+
+		// The case an exit-code check gets wrong: git answers successfully, and the
+		// answer is "no".
+		it("answers outside for a bare repo, which still exits 0", async () => {
+			mockSuccess("false\n");
+			expect(await probeWorktree("/some/bare.git")).toBe("outside");
+		});
+
+		it("answers outside when git reports no repository at all", async () => {
+			mockFailure(128, "fatal: not a git repository (or any of the parent directories): .git");
+			expect(await probeWorktree("/not/a/repo")).toBe("outside");
+		});
+
+		// `execGit` maps ENOENT to 127, and a daemon spawned by a GUI-launched IDE
+		// genuinely inherits a PATH without git. Reporting that as "not a repo" points
+		// the user at the one thing that is not wrong.
+		it("distinguishes an unusable git from a directory that is not a work tree", async () => {
+			mockFailure("ENOENT", "spawn git ENOENT");
+			expect(await probeWorktree("/main/repo")).toBe("git-unavailable");
 		});
 	});
 

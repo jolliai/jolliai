@@ -13,6 +13,27 @@ get a sign-in reminder; a healthy repo gets a short snapshot and a routed action
 It **never** re-implements another skill's workflow — it only reads state and
 invokes an existing skill or an existing Jolli Memory tool.
 
+### Shell prerequisite
+
+This block requires a POSIX bash shell. On Linux/macOS the system bash works.
+**On Windows, use Git Bash** (the bash bundled with Git for Windows). Other
+Windows "bash" options — `C:\Windows\System32\bash.exe`, the WindowsApps
+alias, or any WSL bash — see a separate Linux home directory and will not
+find the Jolli entry script that lives under `%USERPROFILE%`.
+
+If Git Bash is not available on Windows, STOP and tell the user:
+"Jolli skill needs Git Bash on Windows. Install Git for Windows from
+https://git-scm.com/download/win and retry."
+
+Do NOT fall back to `npm run`, `npx`, `node` directly, PowerShell-native
+commands, WSL bash, or any workspace-local script — those bypass the
+security recipe and the dist resolver and will not produce valid output.
+
+Getting this wrong is worse here than in the other skills: Step 0 reads a failed
+`test -f` as "the dispatcher is not installed" and sends the user off to re-trust
+a SessionStart hook that was working all along. Run the check in the wrong shell
+and that verdict is simply false.
+
 ## Step 0 — confirm this menu can route
 
 The plugin's SessionStart hook is what installs the CLI dispatcher AND what
@@ -74,9 +95,11 @@ Derive three things, mirroring the CLI's guided front door:
 
 - **can generate memories** — provider-AWARE, NOT a blind OR of every credential:
   - `local-agent` → **yes**; summaries generate by driving the local agent CLI
-    named by `account.localAgentTool` (the user's own Codex/ChatGPT login), with
-    no API key and no Jolli sign-in. This is the plugin's default, so a freshly
-    installed repo can already generate.
+    named by `account.localAgentTool` — the user's own login for whatever agent
+    that field names, Codex/ChatGPT on a fresh setup — with no API key and no Jolli
+    sign-in. This is the plugin's default, so a freshly installed repo can already
+    generate. Report the field, never assume Codex: an agent tool the user had
+    already configured is kept as-is.
   - `jolli` → yes if `account.signedIn` OR `account.jolliApiKeyConfigured`.
   - `anthropic` → yes only if `account.anthropicKeyConfigured`; a Jolli sign-in
     alone does NOT count.

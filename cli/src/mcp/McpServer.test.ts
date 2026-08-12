@@ -13,6 +13,14 @@ vi.mock("./McpTools.js", () => ({
 	runBindSpace: vi.fn().mockResolvedValue({ type: "bound", bindingId: 1, jmSpaceId: 1, repoName: "acme" }),
 }));
 
+// `startMcpServer` withholds every `requiresRepo` tool when the cwd is not inside a git
+// worktree, so any test that expects the full tool set needs this to answer true.
+// Mocked rather than given a real temp repo: these tests pass synthetic paths like
+// "/repo", and spawning git per case would put this file in the slow tier for no added
+// coverage.
+const { probeWorktreeMock } = vi.hoisted(() => ({ probeWorktreeMock: vi.fn().mockResolvedValue("inside") }));
+vi.mock("../core/GitOps.js", () => ({ probeWorktree: probeWorktreeMock }));
+
 const { mockStorage } = vi.hoisted(() => ({ mockStorage: { kind: "mock-storage" } }));
 vi.mock("../core/StorageFactory.js", () => ({ createStorage: vi.fn().mockResolvedValue(mockStorage) }));
 vi.mock("../core/SummaryStore.js", () => ({ setActiveStorage: vi.fn() }));
@@ -204,6 +212,7 @@ describe("startMcpServer", () => {
 		capturedSchemas.length = 0;
 		serverCapabilities = undefined;
 		connectMock.mockClear();
+		probeWorktreeMock.mockReset().mockResolvedValue("inside");
 		// Platform tools are on by default, so pin these built-in-only tests to the
 		// dormant (git-memory-only) path with an explicit opt-out; otherwise the
 		// default-on gate would open and hit the unstubbed manifest fetch.
@@ -230,11 +239,58 @@ describe("startMcpServer", () => {
 		expect(serverCapabilities).toEqual({ tools: {} });
 	});
 
+	/*
+	 * The classification itself, pinned as an exact partition.
+	 *
+	 * `requiresRepo` is a required field, so TypeScript already stops a new tool from
+	 * omitting it — but not from declaring it WRONG, and wrong in the `false` direction
+	 * is silent: the tool stays advertised outside a repository and answers from
+	 * `StorageFactory`'s orphan-only fallback, empty-but-successful, which is exactly
+	 * the reading the withholding exists to prevent. Spelling both sides out makes
+	 * flipping one a deliberate edit to this list rather than a one-character change
+	 * nothing observes.
+	 *
+	 * `list_spaces` is the only built-in on the repo-independent side: it asks the
+	 * backend what Spaces the TENANT has, taking nothing from cwd. `bind_space` and
+	 * `push_memory` also talk to the backend but are repo-scoped — they bind *this*
+	 * repository and push *this* branch.
+	 */
+	it("classifies every built-in tool as repo-scoped or not", () => {
+		const partition = (requiresRepo: boolean) =>
+			TOOL_DEFINITIONS.filter((t) => t.requiresRepo === requiresRepo)
+				.map((t) => t.name)
+				.sort();
+		expect(partition(false)).toEqual(["list_spaces"]);
+		expect(partition(true)).toEqual([
+			"bind_space",
+			"get_decision_timeline",
+			"get_pr_description",
+			"list_branches",
+			"push_memory",
+			"queue_status",
+			"recall",
+			"search",
+			"status",
+		]);
+	});
+
 	it("ListTools handler returns the tool definitions", async () => {
 		await startMcpServer("/repo");
 		const listHandler = capturedHandlers[0];
-		const result = (await listHandler({ params: { name: "" } })) as { tools: unknown[] };
-		expect(result.tools).toBe(TOOL_DEFINITIONS);
+		const result = (await listHandler({ params: { name: "" } })) as { tools: { name: string }[] };
+		expect(result.tools.map((t) => t.name)).toEqual(TOOL_DEFINITIONS.map((t) => t.name));
+	});
+
+	// `requiresRepo` decides what is advertised; it is not part of the advertisement.
+	// The platform-tool path already projected its entries down to these three keys to
+	// keep `binding` / `menu` off the wire, and the built-ins are now held to the same
+	// rule — a client has no use for it and the MCP tool schema has no field for it.
+	it("ListTools never leaks the internal requiresRepo flag onto the wire", async () => {
+		await startMcpServer("/repo");
+		const result = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: object[] };
+		for (const tool of result.tools) {
+			expect(Object.keys(tool).sort()).toEqual(["description", "inputSchema", "name"]);
+		}
 	});
 
 	it("CallTool handler dispatches a successful tool call to a text response", async () => {
@@ -432,14 +488,185 @@ describe("startMcpServer", () => {
 		expect(written).toContain("refusing to start");
 		expect(written).toContain(".codex/plugins/cache");
 	});
+
+	/*
+	 * The general form of the guard above, and a REAL production failure rather than a
+	 * hypothetical one.
+	 *
+	 * Cursor imports Claude plugins wholesale under its `enable_cc_plugin_import` gate,
+	 * `.mcp.json` included — and it spawns MCP servers from a shared process before any
+	 * workspace folder is known, so the child inherits the host's own cwd. On a real
+	 * install that was the user's HOME directory: the Claude plugin's server came up
+	 * rooted at `/Users/<me>`, logged "Successfully connected", and answered every tool
+	 * from `StorageFactory`'s orphan-only fallback — empty results indistinguishable
+	 * from real ones. The bundle guard cannot catch it (HOME is not a bundle path), and
+	 * nothing in that launch can recover the workspace.
+	 *
+	 * Unlike the two guards above this one FILTERS rather than refuses, and the
+	 * difference is not cosmetic. A bundle cache and an agent temp dir are wrong about
+	 * everything a tool could answer; "not a git repo" is wrong only about the
+	 * repo-scoped tools. `list_spaces` and every platform tool are pure backend calls
+	 * (`invokePlatformTool` takes nothing from cwd), and nine of the eleven MCP hosts
+	 * register machine-globally — so refusing wholesale took the entire Space and
+	 * workflow surface offline in any non-repo directory, to protect nine tools that
+	 * withholding protects better.
+	 */
+	it("starts without the repo-scoped tools when the cwd is not inside a git worktree", async () => {
+		probeWorktreeMock.mockResolvedValue("outside");
+		vi.mocked(createStorage).mockClear();
+		vi.mocked(setActiveStorage).mockClear();
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		let written: string;
+		try {
+			await startMcpServer("/Users/dev");
+			written = stderr.mock.calls.map((call) => String(call[0])).join("");
+		} finally {
+			stderr.mockRestore();
+		}
+		// The server DOES come up now — that is the whole change.
+		expect(connectMock).toHaveBeenCalledTimes(1);
+		const listed = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
+		const names = listed.tools.map((t) => t.name);
+		expect(names).toEqual(["list_spaces"]);
+		for (const withheld of TOOL_DEFINITIONS.filter((t) => t.requiresRepo)) {
+			expect(names, `${withheld.name} must not be advertised`).not.toContain(withheld.name);
+		}
+
+		// Still skipped, and for reasons the filtering did not change: the log dir is
+		// `<cwd>/.jolli/`, so a non-repo cwd would litter whatever directory the host
+		// launched from (HOME, in the measured case), and nothing that reads through
+		// storage is reachable when every storage-backed tool is withheld.
+		expect(createStorage).not.toHaveBeenCalled();
+		expect(setActiveStorage).not.toHaveBeenCalled();
+		expect(getLogDir()).toBeUndefined();
+
+		// The reason still has to reach the developer — stderr is the only channel a
+		// stdio server may use, since stdout is the JSON-RPC stream.
+		expect(written).toContain("not inside a git worktree");
+		expect(written).toContain("WITHOUT its repository tools");
+		expect(written).toContain("/Users/dev");
+		expect(written).toContain("before it knew which workspace was open");
+	});
+
+	/*
+	 * The third probe state, and the reason it is not folded into "outside".
+	 *
+	 * `execGit` reports a missing binary as exit 127 rather than throwing, and a daemon
+	 * spawned by a GUI-launched IDE really does inherit a PATH with no `git` on it. The
+	 * withholding is right either way — without git, storage cannot resolve a repository
+	 * either — but reporting it as "this directory is not a repo" sends the user to
+	 * check the one thing that is not wrong.
+	 */
+	it("names a missing git as the reason instead of blaming the directory", async () => {
+		probeWorktreeMock.mockResolvedValue("git-unavailable");
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		let written: string;
+		try {
+			await startMcpServer("/repo");
+			written = stderr.mock.calls.map((call) => String(call[0])).join("");
+		} finally {
+			stderr.mockRestore();
+		}
+		// Same protection…
+		const listed = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
+		expect(listed.tools.map((t) => t.name)).toEqual(["list_spaces"]);
+		// …different explanation.
+		expect(written).toContain("`git` could not be executed");
+		expect(written).toContain("stripped PATH");
+		expect(written).not.toContain("is not inside a git worktree");
+	});
+
+	/*
+	 * The predicate is `--is-inside-work-tree`'s STDOUT, not `rev-parse --git-dir`'s exit
+	 * code. Measured: in a bare repo and inside `.git/` itself the exit code is 0 while
+	 * the answer is `false`, and both then fail `StorageFactory`'s stricter
+	 * claimable-project check — so an exit-code gate would advertise the repo tools into
+	 * exactly the empty-but-successful hole this guard closes. `probeWorktree` owns that
+	 * distinction; this asserts the server acts on it rather than on "any git context".
+	 */
+	it("withholds in a git context that is not a working tree", async () => {
+		probeWorktreeMock.mockResolvedValue("outside");
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		try {
+			await startMcpServer("/repo/.git");
+		} finally {
+			stderr.mockRestore();
+		}
+		const listed = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
+		expect(listed.tools.map((t) => t.name)).toEqual(["list_spaces"]);
+	});
+
+	// Backstop for a client working from a cached tools/list. Without it the call
+	// reaches dispatchTool against a non-repo cwd and comes back empty-but-successful,
+	// which is the exact reading the withholding exists to prevent.
+	it("refuses a repo-scoped tool CALL outside a worktree instead of answering empty", async () => {
+		probeWorktreeMock.mockResolvedValue("outside");
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		try {
+			await startMcpServer("/Users/dev");
+		} finally {
+			stderr.mockRestore();
+		}
+		const result = (await capturedHandlers[1]({ params: { name: "recall", arguments: {} } })) as {
+			content: { text: string }[];
+			isError?: boolean;
+		};
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain("needs a git repository");
+		expect(runRecall).not.toHaveBeenCalled();
+	});
+
+	// An unrecognised name must still be reported as unknown, not as a repo problem —
+	// the backstop checks the real registry rather than assuming any unlisted name is
+	// something it withheld.
+	it("still reports an unknown tool as unknown outside a worktree", async () => {
+		probeWorktreeMock.mockResolvedValue("outside");
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		try {
+			await startMcpServer("/Users/dev");
+		} finally {
+			stderr.mockRestore();
+		}
+		const result = (await capturedHandlers[1]({ params: { name: "no_such_tool", arguments: {} } })) as {
+			content: { text: string }[];
+			isError?: boolean;
+		};
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain("Unknown tool");
+	});
+
+	// The order matters: the bundle check is a pure string test and must not be masked
+	// by a git spawn, and a bundle cache that IS a real checkout (a marketplace served
+	// over git) would otherwise pass the worktree test and be served.
+	it("reports the bundle reason, not the worktree reason, for a plugin cache that is a real checkout", async () => {
+		probeWorktreeMock.mockResolvedValue("inside");
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		let written: string;
+		try {
+			await startMcpServer("/Users/dev/.claude/plugins/cache/jolli-marketplace/jolli/1.0.2");
+			written = stderr.mock.calls.map((call) => String(call[0])).join("");
+		} finally {
+			stderr.mockRestore();
+		}
+		expect(connectMock).not.toHaveBeenCalled();
+		expect(written).toContain("plugin bundle");
+		expect(written).not.toContain("WITHOUT its repository tools");
+		// Refused before the git probe — the string test is cheaper and more specific.
+		expect(probeWorktreeMock).not.toHaveBeenCalled();
+	});
 });
 
 describe("isPluginBundleCwd", () => {
 	it.each([
 		["/Users/dev/.codex/plugins/cache/jolli-marketplace/jolli/1.0.0", true],
 		["/Users/dev/.claude/plugins/cache/jolli/jolli/2.3.4", true],
+		// Cursor's local plugin directory is the one a developer actually points at by
+		// hand (`~/.cursor/plugins/local/<name>`), so it is the likeliest way to launch
+		// a server from a bundle rather than a repository.
+		["/Users/dev/.cursor/plugins/local/jolli", true],
 		// Windows separators reach us verbatim from the host's spawn.
 		["C:\\Users\\dev\\.codex\\plugins\\cache\\mp\\jolli\\1.0.0", true],
+		["C:\\Users\\dev\\.cursor\\plugins\\local\\jolli", true],
 		["/Users/dev/work/jolliai", false],
 		// Near-misses: a repo that merely mentions plugins, and a host's config root
 		// that is not its plugin cache.
@@ -471,6 +698,7 @@ describe("startMcpServer — platform tools", () => {
 		capturedSchemas.length = 0;
 		serverCapabilities = undefined;
 		connectMock.mockClear();
+		probeWorktreeMock.mockReset().mockResolvedValue("inside");
 		loadConfigMock.mockReset().mockResolvedValue({});
 		fetchManifestMock.mockReset();
 		invokePlatformToolMock.mockReset();
@@ -483,8 +711,8 @@ describe("startMcpServer — platform tools", () => {
 			loadConfig: async () => ({ mcpPlatformToolsEnabled: false }),
 			createPlatformClient,
 		});
-		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: unknown[] };
-		expect(list.tools).toBe(TOOL_DEFINITIONS);
+		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
+		expect(list.tools.map((t) => t.name)).toEqual(TOOL_DEFINITIONS.map((t) => t.name));
 		expect(list.tools).toHaveLength(10);
 		expect(createPlatformClient).not.toHaveBeenCalled();
 		// A built-in still dispatches through the local table.
@@ -599,8 +827,8 @@ describe("startMcpServer — platform tools", () => {
 			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
 			createPlatformClient: () => stubClient([]),
 		});
-		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: unknown[] };
-		expect(list.tools).toBe(TOOL_DEFINITIONS);
+		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
+		expect(list.tools.map((t) => t.name)).toEqual(TOOL_DEFINITIONS.map((t) => t.name));
 		expect(list.tools).toHaveLength(10);
 		expect(connectMock).toHaveBeenCalledTimes(1);
 	});
@@ -817,5 +1045,43 @@ describe("platformDegraded / rebuildPlatformHalf", () => {
 		// The storage half is a process-global side effect that is already correct;
 		// re-running it per connection would undo the sharing the daemon exists for.
 		expect(createStorage).not.toHaveBeenCalled();
+	});
+
+	/*
+	 * The trap in rebuilding: `buildRuntime` decides the built-in half too, so a
+	 * refresh that does not carry `insideRepo` forward silently re-advertises the nine
+	 * repo-scoped tools this runtime was created to withhold — and a daemon refreshes
+	 * on a later connection, long after the cwd was probed. The next client would then
+	 * get exactly the empty-but-successful answers the withholding exists to prevent,
+	 * with nothing in the logs to say the set had changed.
+	 */
+	it("keeps the repo-scoped tools withheld across a platform-half rebuild", async () => {
+		probeWorktreeMock.mockResolvedValue("outside");
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		let degraded: Awaited<ReturnType<typeof prepareMcpRuntime>>;
+		try {
+			degraded = await prepareMcpRuntime("/not/a/repo", {
+				loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+				createPlatformClient: failedClient,
+			});
+		} finally {
+			stderr.mockRestore();
+		}
+		expect(degraded?.insideRepo).toBe(false);
+		expect(degraded?.toolDefinitions.map((t) => t.name)).toEqual(["list_spaces"]);
+
+		const recovered = await rebuildPlatformHalf(degraded as NonNullable<typeof degraded>, {
+			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
+			createPlatformClient: oneToolClient,
+		});
+
+		// The platform half recovered…
+		expect(recovered.toolDefinitions.map((t) => t.name)).toContain("plat_one");
+		// …and the built-in half is still filtered. `probeWorktree` is NOT re-run: the
+		// answer rides on the runtime, so a rebuild costs no extra git subprocess.
+		expect(recovered.insideRepo).toBe(false);
+		for (const withheld of TOOL_DEFINITIONS.filter((t) => t.requiresRepo)) {
+			expect(recovered.toolDefinitions.map((t) => t.name)).not.toContain(withheld.name);
+		}
 	});
 });

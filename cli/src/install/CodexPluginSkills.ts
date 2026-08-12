@@ -15,12 +15,18 @@
 
 import { LOCAL_AGENT_TOOLS, localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import type { LocalAgentToolId } from "../Types.js";
+import { SHELL_PREREQUISITE_BLOCK, setFrontmatterName, stripMetadataBlock } from "./PluginSkillText.js";
 import {
 	buildLocalRunSkillTemplate,
 	buildRecallSkillTemplate,
 	buildRemoteRunSkillTemplate,
 	buildSearchSkillTemplate,
 } from "./SkillInstaller.js";
+
+// Re-exported: this module was the original home of both helpers and its drift test
+// imports `stripMetadataBlock` from here. They moved to PluginSkillText when the
+// Cursor bundle needed the same two transforms.
+export { stripMetadataBlock } from "./PluginSkillText.js";
 
 const RUN_CLI = '"$HOME/.jolli/jollimemory/run-cli"';
 
@@ -60,6 +66,13 @@ get a sign-in reminder; a healthy repo gets a short snapshot and a routed action
 
 It **never** re-implements another skill's workflow — it only reads state and
 invokes an existing skill or an existing Jolli Memory tool.
+
+${SHELL_PREREQUISITE_BLOCK}
+
+Getting this wrong is worse here than in the other skills: Step 0 reads a failed
+\`test -f\` as "the dispatcher is not installed" and sends the user off to re-trust
+a SessionStart hook that was working all along. Run the check in the wrong shell
+and that verdict is simply false.
 
 ## Step 0 — confirm this menu can route
 
@@ -122,9 +135,11 @@ Derive three things, mirroring the CLI's guided front door:
 
 - **can generate memories** — provider-AWARE, NOT a blind OR of every credential:
   - \`local-agent\` → **yes**; summaries generate by driving the local agent CLI
-    named by \`account.localAgentTool\` (the user's own Codex/ChatGPT login), with
-    no API key and no Jolli sign-in. This is the plugin's default, so a freshly
-    installed repo can already generate.
+    named by \`account.localAgentTool\` — the user's own login for whatever agent
+    that field names, Codex/ChatGPT on a fresh setup — with no API key and no Jolli
+    sign-in. This is the plugin's default, so a freshly installed repo can already
+    generate. Report the field, never assume Codex: an agent tool the user had
+    already configured is kept as-is.
   - \`jolli\` → yes if \`account.signedIn\` OR \`account.jolliApiKeyConfigured\`.
   - \`anthropic\` → yes only if \`account.anthropicKeyConfigured\`; a Jolli sign-in
     alone does NOT count.
@@ -252,6 +267,8 @@ description: "Set up Jolli Memory for the current repository in Codex: verify th
 
 Complete the steps in order. Stop when a required step fails.
 
+${SHELL_PREREQUISITE_BLOCK}
+
 ## 1. Inspect state
 
 Call the Jolli Memory \`status\` tool. If unavailable, run \`${RUN_CLI} status\`.
@@ -266,8 +283,9 @@ Run:
 ${RUN_CLI} enable --repo-hooks-only --source-tag codex-plugin
 \`\`\`
 
-This explicit setup records \`codex\` as the local-agent tool while preserving an
-existing paid provider choice. It also registers the Jolli Memory MCP server for
+This explicit setup records \`codex\` as the local-agent tool only when none is
+configured yet — an agent tool and a paid provider already on disk are both left
+exactly as they are. It also registers the Jolli Memory MCP server for
 Codex, which Codex picks up at the START of a session — so if the MCP tools were
 missing in this session, they appear in the next one. If the command reports that
 the repository is manually disabled, explain that an explicit full \`jolli enable\`
@@ -306,7 +324,9 @@ Call \`status\` again (or \`${RUN_CLI} status\` when the tool is not registered 
 Report:
 
 - memory generation enabled or the exact remaining problem;
-- summaries run through Codex when provider is \`local-agent\`;
+- which agent generates summaries when provider is \`local-agent\` — name
+  \`localAgentTool\` from \`status\` rather than assuming Codex, since a tool that
+  was already configured is left alone;
 - Jolli sign-in and bound Space when sharing was configured;
 - a normal commit captures memory and \`git push\` publishes to the bound Space;
 - when the MCP tools were unavailable this session, that they load on the next one.
@@ -320,6 +340,8 @@ description: Sign in to Jolli from Codex so the repository can bind to a Jolli S
 ---
 
 # Jolli Login
+
+${SHELL_PREREQUISITE_BLOCK}
 
 Run and wait for the interactive browser flow:
 
@@ -346,6 +368,8 @@ description: Sign out of Jolli from Codex by clearing the stored Jolli auth toke
 ---
 
 # Jolli Logout
+
+${SHELL_PREREQUISITE_BLOCK}
 
 Run:
 
@@ -391,6 +415,8 @@ description: Diagnose Jolli Memory installation, provider, account, hooks, queue
 
 If \`status\` is unavailable, run \`${RUN_CLI} status\` and summarize it. Do not
 list branch memories; route those requests to \`jolli:recall\` or \`jolli:search\`.
+
+${SHELL_PREREQUISITE_BLOCK}
 `;
 }
 
@@ -494,42 +520,6 @@ export const CODEX_PLUGIN_SKILLS: ReadonlyArray<CodexPluginSkill> = [
 export const CODEX_PLUGIN_SKILL_NAMES: ReadonlyArray<string> = CODEX_PLUGIN_SKILLS.map((skill) => skill.name);
 
 /**
- * Strips the `metadata:` block from a canonical template's frontmatter, leaving
- * `name` and `description` — the two fields Codex documents as required.
- *
- * The block exists for SkillInstaller's on-disk upsert, which compares revisions
- * before overwriting a user's file. Plugin-bundled skills are never upserted, so it
- * is inert here — and its `version` is a build-time define, so committing it would
- * either bake in a stale string or churn these files on every release. Codex
- * tolerates extra frontmatter keys (two of its own system skills carry `metadata`),
- * so this is about not shipping meaningless content, not compatibility.
- *
- * Line-based rather than a YAML round-trip: the templates have a fixed generated
- * shape, and re-serializing risks reflowing the long `description` values in ways
- * that fail the drift test for purely cosmetic reasons.
- */
-export function stripMetadataBlock(template: string): string {
-	const lines = template.split("\n");
-	if (lines[0] !== "---") return template;
-	const end = lines.indexOf("---", 1);
-	if (end === -1) return template;
-
-	const frontmatter: string[] = [];
-	let skipping = false;
-	for (const line of lines.slice(1, end)) {
-		if (line === "metadata:") {
-			skipping = true;
-			continue;
-		}
-		// Entries under `metadata:` are indented; the next unindented key ends the block.
-		if (skipping && /^\s+\S/u.test(line)) continue;
-		skipping = false;
-		frontmatter.push(line);
-	}
-	return ["---", ...frontmatter, "---", ...lines.slice(end + 1)].join("\n");
-}
-
-/**
  * Canonical CLI skill name → this plugin's model-visible invocation name.
  *
  * Only the four shared builders need an entry: they are authored for
@@ -543,24 +533,6 @@ const SHARED_SKILL_INVOCATION_NAMES: Readonly<Record<string, string>> = {
 	"jolli-local-run": "jolli:local-run",
 	"jolli-remote-run": "jolli:remote-run",
 };
-
-/**
- * Re-heads a canonical template with the plugin's bare directory name.
- *
- * Frontmatter `name` and the bundle directory are kept equal on purpose: Codex is
- * documented to require `name`, and which of the two seeds the `jolli:` namespace is
- * not specified anywhere we can rely on, so a mismatch would be a guess.
- */
-function setFrontmatterName(template: string, name: string): string {
-	const lines = template.split("\n");
-	if (lines[0] !== "---") return template;
-	const end = lines.indexOf("---", 1);
-	if (end === -1) return template;
-	const index = lines.findIndex((line, i) => i > 0 && i < end && line.startsWith("name: "));
-	if (index === -1) return template;
-	lines[index] = `name: ${name}`;
-	return lines.join("\n");
-}
 
 /**
  * The exact bytes the plugin's `skills/<name>/SKILL.md` must contain.

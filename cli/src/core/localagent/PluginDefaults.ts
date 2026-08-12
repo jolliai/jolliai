@@ -2,13 +2,31 @@ import type { JolliMemoryConfig, LocalAgentToolId } from "../../Types.js";
 import { updateConfigTransactional } from "../SessionTracker.js";
 
 /** The AI host a plugin bootstrap is acting for. */
-export type PluginBootstrapHost = "claude" | "codex";
+export type PluginBootstrapHost = "claude" | "codex" | "cursor";
 
 interface PluginHostProfile {
 	/** Which host's own assets (`.claude/**` etc.) this bootstrap owns. */
 	readonly host: PluginBootstrapHost;
 	/** The local-agent CLI this host drives when it generates memories. */
 	readonly localAgentTool: LocalAgentToolId;
+	/**
+	 * How the MODEL must be told to invoke one of this host's bundled skills, as a
+	 * format string with `<name>` standing in for the bare skill name.
+	 *
+	 * Three hosts, three different forms, none of them derivable from the others:
+	 * Claude and Codex namespace a plugin's skills as `jolli:<name>` and differ only
+	 * in their invocation sigil, while Cursor namespaces nothing and the bundle
+	 * carries the `jolli-` prefix in the directory name instead (see
+	 * {@link file://../../install/CursorPluginSkills.ts}).
+	 *
+	 * Declared here rather than at each call site because the alternative is a
+	 * hardcoded `clientKind === … ? … : clientKind === … ? … : null` ladder, and that
+	 * pattern has already gone stale twice: `loginReminderText` and
+	 * `formatRecallSuggestion` both kept two-arm ladders when a third host was added,
+	 * so a Cursor user silently got NO login reminder and a recall hint naming the
+	 * bare CLI. A table row cannot be half-added.
+	 */
+	readonly skillInvocation: `${string}<name>${string}`;
 }
 
 /**
@@ -25,9 +43,32 @@ interface PluginHostProfile {
  * paths. Read the host off the tag.
  */
 const PLUGIN_HOSTS: Readonly<Record<string, PluginHostProfile>> = {
-	"claude-plugin": { host: "claude", localAgentTool: "claude-code" },
-	"codex-plugin": { host: "codex", localAgentTool: "codex" },
+	"claude-plugin": { host: "claude", localAgentTool: "claude-code", skillInvocation: "/jolli:<name>" },
+	"codex-plugin": { host: "codex", localAgentTool: "codex", skillInvocation: "$jolli:<name>" },
+	// The Cursor plugin runs inside the Cursor IDE, but the CLI it can DRIVE to
+	// generate a summary is `cursor-agent` — the IDE itself is not a headless
+	// backend. Same relationship as the other two hosts: seed the tool that shares
+	// this host's login, not the surface the user is typing into.
+	//
+	// `/jolli-<name>` and not `/jolli:<name>`: Cursor applies no namespace to a
+	// plugin's skills, so this bundle carries the prefix in the directory name.
+	"cursor-plugin": { host: "cursor", localAgentTool: "cursor-agent", skillInvocation: "/jolli-<name>" },
 };
+
+/**
+ * Every tag {@link PLUGIN_HOSTS} answers for.
+ *
+ * Exists so one invariant can be pinned by a test instead of holding only in a
+ * comment: for a plugin BUNDLE, the compile-time client kind and the install source
+ * tag are the same string. That is what lets `SessionStartHook` look a client kind up
+ * in this table (`pluginSkillInvocation(clientKind, …)`) even though the header above
+ * describes it as source-tag-keyed. The invariant is one-directional and only holds
+ * for bundles — the `/jolli:init` path still reports a `cli` kind under a plugin tag,
+ * which is exactly why the table is keyed by tag — so a fourth host that ships a kind
+ * without a matching tag would silently lose its reminder and its recall hint, the
+ * failure this table replaced. `ClientHeader.test.ts` asserts the two lists agree.
+ */
+export const PLUGIN_HOST_SOURCE_TAGS: ReadonlyArray<string> = Object.keys(PLUGIN_HOSTS);
 
 /**
  * The tool a plugin host drives, or undefined when `sourceTag` is not a plugin tag.
@@ -38,6 +79,19 @@ const PLUGIN_HOSTS: Readonly<Record<string, PluginHostProfile>> = {
  */
 export function pluginDefaultLocalAgentTool(sourceTag: string | undefined): LocalAgentToolId | undefined {
 	return sourceTag === undefined ? undefined : PLUGIN_HOSTS[sourceTag]?.localAgentTool;
+}
+
+/**
+ * How to tell the model to invoke `skillName` on this plugin host, or undefined when
+ * `sourceTag` is not a plugin tag.
+ *
+ * Undefined is the meaningful answer for `cli` / `vscode` / `intellij`: those surfaces
+ * ship no bundled skills, so a caller must fall back to naming the CLI command rather
+ * than inventing a slash form that would not resolve.
+ */
+export function pluginSkillInvocation(sourceTag: string | undefined, skillName: string): string | undefined {
+	const template = sourceTag === undefined ? undefined : PLUGIN_HOSTS[sourceTag]?.skillInvocation;
+	return template?.replace("<name>", skillName);
 }
 
 /**
@@ -60,56 +114,67 @@ export function pluginBootstrapHost(sourceTag: string | undefined): PluginBootst
 
 /** Outcome of {@link applyPluginInitLocalAgentTool}, for the caller's report line. */
 export interface PluginInitToolResult {
+	/** The tool this host would drive — written only when nothing was configured. */
 	readonly tool: LocalAgentToolId;
-	/** `localAgentTool` was moved to `tool` (false when it already matched). */
-	readonly changedTool: boolean;
+	/** `localAgentTool` held nothing and is now `tool`. */
+	readonly seededTool: boolean;
 	/**
-	 * The value `localAgentTool` held before the move, or undefined when it held
-	 * nothing. Present so the caller can tell "filled in a blank" from "replaced a
-	 * choice the user made" — only the latter is worth telling the user about.
+	 * The tool `localAgentTool` already held and that this init LEFT ALONE, present
+	 * only when it differs from {@link tool}. Undefined covers both "was unset" and
+	 * "already matched" — neither is worth a word to anyone. The one case that is
+	 * worth recording is a host initializing over another tool's configured value,
+	 * because from then on this host's memories are generated by a CLI that is not
+	 * its own, and nothing else in the install output explains why.
 	 */
-	readonly previousTool?: LocalAgentToolId;
+	readonly keptTool?: LocalAgentToolId;
 	/** `aiProvider` was unset and is now `local-agent`. */
 	readonly seededProvider: boolean;
 }
 
+/** The configured tool this init is declining to replace, if any. */
+function keptToolOf(existing: LocalAgentToolId | undefined, tool: LocalAgentToolId): LocalAgentToolId | undefined {
+	return existing === undefined || existing === tool ? undefined : existing;
+}
+
 /**
  * Provider write for an EXPLICIT plugin setup — `/jolli:init`, which runs
- * `enable` WITHOUT `--automatic`. This is the authoritative "this is my agent"
- * moment; contrast `ensurePluginDefaultProvider` in SessionStartHook, the
- * automatic first-wins seed that never overwrites anything.
+ * `enable` WITHOUT `--automatic`. Contrast `ensurePluginDefaultProvider` in
+ * SessionStartHook, the automatic seed that runs on every session start.
  *
- * Two fields, two deliberately different policies:
+ * Both fields are FIRST-WINS: each is seeded only when it holds nothing, and a
+ * value already on disk is never replaced.
  *
- *   - `localAgentTool` always moves to the initiating host's tool, even when it
- *     already holds another one. Running init inside an agent IS the user picking
- *     that agent, and this is the friendlier form of
- *     `jolli configure --set localAgentTool=…`. Only *automatic* paths must never
- *     overwrite — two hosts each re-seeding on every session start is exactly the
- *     tug-of-war this split exists to prevent.
- *   - `aiProvider` keeps first-wins and is seeded only when unset, because it
- *     decides whose account pays. A user already on `jolli` or `anthropic` must
- *     not be dragged onto `local-agent` just by initializing inside an agent.
- *     While the provider is not `local-agent` the tool write is inert — but it is
- *     the right value to have waiting if they switch later.
+ *   - `localAgentTool` was an unconditional overwrite until it was measured in
+ *     practice: a Cursor user whose configured tool was `codex` ran `/jolli` on a
+ *     new repo and had it silently moved to `cursor-agent`, because running init
+ *     inside a host was read as the user picking that host's CLI. It is not. The
+ *     host a repository is set up from says nothing about which agent should
+ *     generate its memories — the value on disk is a choice someone made once
+ *     (often the only CLI they are signed into), and re-deciding it per repository
+ *     makes the last host to see a repo the winner. Changing it stays an explicit
+ *     `jolli configure --set localAgentTool=…`, which is what a user who wants
+ *     this host's CLI runs. Reported through {@link PluginInitToolResult.keptTool}
+ *     rather than acted on.
+ *   - `aiProvider` was already first-wins, because it decides whose account pays.
+ *     A user on `jolli` or `anthropic` must not be dragged onto `local-agent` just
+ *     by initializing inside an agent.
  *
- * Because the tool write is an overwrite, it reports {@link
- * PluginInitToolResult.previousTool} so the caller can say so out loud. A silent
- * overwrite would leave a user who deliberately configured another agent with no
- * user-visible trace of the change at all (the log line lands in `debug.log`).
+ * A consequence worth stating, because the overwrite used to hide it: seeding
+ * `aiProvider` no longer drags the tool along with it. A config whose provider is
+ * unset but whose tool is set now gets `aiProvider: local-agent` pointed at THAT
+ * tool rather than at this host's — the right way round, since the tool is the
+ * field the user expressed an opinion about.
  *
  * Both decisions are made INSIDE `config.lock` and reported from the state the
  * write actually landed on, not from the `config` snapshot the caller loaded. The
- * snapshot cannot be trusted for `aiProvider`, whose policy is first-wins: reading
- * "unset" before the lock and writing `local-agent` after it would drag a user onto
- * the plugin's provider when a concurrent writer — the other host's session-start
- * seed, or a `jolli configure --set` — had just chosen `jolli` or `anthropic`. It
- * also matters for the report: `previousTool` is what the caller tells the user it
- * replaced, so a stale snapshot would name the wrong tool.
+ * snapshot cannot be trusted for either gate: reading "unset" before the lock and
+ * writing after it would overwrite whatever a concurrent writer — the other host's
+ * session-start seed, or a `jolli configure --set` — had just chosen.
  *
- * The `config` argument is kept as a fast path only: when it already shows both the
- * matching tool AND a set provider there is nothing this function could write, so it
- * returns without taking the lock.
+ * The `config` argument is kept as a fast path only: when both fields already hold
+ * a value there is nothing first-wins could write, so it returns without taking the
+ * lock. Answering `keptTool` from that snapshot is safe precisely because no write
+ * follows it — it feeds a log line, never a decision.
  *
  * Returns null when `sourceTag` is not a plugin tag, having written nothing.
  * Throws on a config-write failure: unlike the session-start seed (which must
@@ -122,19 +187,25 @@ export async function applyPluginInitLocalAgentTool(
 ): Promise<PluginInitToolResult | null> {
 	const tool = pluginDefaultLocalAgentTool(sourceTag);
 	if (tool === undefined) return null;
-	if (config.localAgentTool === tool && config.aiProvider !== undefined) {
-		return { tool, changedTool: false, seededProvider: false };
+	if (config.localAgentTool !== undefined && config.aiProvider !== undefined) {
+		return { tool, seededTool: false, keptTool: keptToolOf(config.localAgentTool, tool), seededProvider: false };
 	}
 	return updateConfigTransactional<PluginInitToolResult>((current) => {
-		const previousTool = current.localAgentTool;
-		const changedTool = previousTool !== tool;
+		const seededTool = current.localAgentTool === undefined;
 		const seededProvider = current.aiProvider === undefined;
-		if (!changedTool && !seededProvider) {
-			return { update: null, result: { tool, changedTool: false, seededProvider: false } };
-		}
+		const result: PluginInitToolResult = {
+			tool,
+			seededTool,
+			keptTool: keptToolOf(current.localAgentTool, tool),
+			seededProvider,
+		};
+		if (!seededTool && !seededProvider) return { update: null, result };
 		return {
-			update: seededProvider ? { aiProvider: "local-agent", localAgentTool: tool } : { localAgentTool: tool },
-			result: { tool, changedTool, previousTool, seededProvider },
+			update: {
+				...(seededProvider ? { aiProvider: "local-agent" as const } : {}),
+				...(seededTool ? { localAgentTool: tool } : {}),
+			},
+			result,
 		};
 	});
 }

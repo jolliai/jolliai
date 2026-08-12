@@ -68,15 +68,16 @@ describe("Node ≥ 22.13 floor is in lockstep across every place that declares i
 
 	it("every esbuild target names the same Node major", () => {
 		// The bundles are emitted for this target; a lower one would advertise
-		// support the dist cannot deliver. All THREE bundles ship the same
-		// QueueWorker/StopHook that write the dashboard DB, so codex-plugin
-		// belongs here too — leaving it out is what let it sit on node18 while
-		// this test claimed the floor was pinned.
+		// support the dist cannot deliver. All FOUR bundles ship the same
+		// QueueWorker/StopHook that write the dashboard DB, so every plugin
+		// belongs here too — leaving codex-plugin out is what let it sit on
+		// node18 while this test claimed the floor was pinned.
 		const expected = `node${major}`;
 		for (const rel of [
 			"vscode/esbuild.config.mjs",
 			"claude-plugin/plugins/jolli/scripts/build.mjs",
 			"codex-plugin/plugins/jolli/scripts/build.mjs",
+			"cursor-plugin/plugins/jolli/scripts/build.mjs",
 		]) {
 			const m = /target:\s*"([^"]+)"/.exec(read(rel));
 			expect(m?.[1], `${rel} esbuild target`).toBe(expected);

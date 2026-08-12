@@ -45,7 +45,6 @@ import { resolveMemoryBankState } from "../core/KBPathResolver.js";
 import { discoverKimiSessions, isKimiInstalled } from "../core/KimiSessionDiscoverer.js";
 import { acquireRepoHooksLock, type StrictLockHandle, withRuntimeRegistryLock } from "../core/Locks.js";
 import { applyPluginInitLocalAgentTool, pluginBootstrapHost } from "../core/localagent/PluginDefaults.js";
-import { localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import {
 	isOpenCodeInstalled,
 	isOpenCodePresent,
@@ -112,10 +111,13 @@ import {
 	removeRepoMcpHosts,
 } from "./mcp/HostRegistrars.js";
 import {
+	CURSOR_REPO_SKILL_GIT_EXCLUDE_PATHS,
 	installPluginJolliMenu,
 	JOLLI_MENU_GIT_EXCLUDE_PATHS,
 	PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS,
+	reconcileCursorRepoSkills,
 	removeClaudeLegacySkills,
+	removeCursorRepoSkills,
 	removePluginJolliMenu,
 	removeRetiredSkills,
 	SKILL_GIT_EXCLUDE_PATHS,
@@ -179,6 +181,69 @@ export async function syncGlobalInstructions(detected?: {
 	} else if (decision.remove) {
 		await removeGlobalInstructions();
 	}
+}
+
+// ─── Runtime registry ───────────────────────────────────────────────────────
+
+/**
+ * Reconcile the MACHINE-GLOBAL runtime registry: the three dispatch scripts plus
+ * this bundle's `dist-paths/<sourceTag>` entry.
+ *
+ * Extracted from {@link install} because it is the half of an install that is not
+ * about a repository at all. Nothing it writes lives under a worktree — it is all
+ * `~/.jolli/jollimemory/` — and nothing it writes is specific to one repo: the
+ * scripts are byte-identical across every surface, and the dist entry says "a
+ * runtime of this version lives here", which is true the moment the bundle exists.
+ *
+ * Kept as ONE function rather than two calls at each site because the four steps
+ * are ordered and interdependent: the scripts are useless without a registered
+ * dist (`resolve-dist-path` enumerates `dist-paths/` and exits non-zero when it
+ * finds no complete runtime, so `run-cli` exits 1 before running anything), and the
+ * migration/prune steps only make sense around the write. Two callers duplicating
+ * that order is exactly the drift this removes.
+ *
+ * The second caller is the Cursor bootstrap, which must reconcile even for a
+ * repository that has not opted in — see the call site for why that is not a hole
+ * in its consent gate.
+ *
+ * @param sourceTag - Already validated by the caller; `installDistPath` re-validates
+ *   at the write boundary as defense-in-depth.
+ * @param distDir - The dist to register. Undefined (every in-process caller) means
+ *   "the directory this module was bundled into".
+ * @param lockOpts - Short budget for automatic callers, so a session hook defers
+ *   instead of blocking; undefined takes the default budget.
+ * @returns false when the registry could not be reconciled — the caller must not
+ *   install anything that depends on it.
+ */
+export async function reconcileRuntimeRegistry(
+	sourceTag: string,
+	distDir?: string,
+	lockOpts?: { readonly timeoutMs: number; readonly pollMs: number },
+): Promise<boolean> {
+	const reconcile = async () => {
+		if (!(await installHookScripts())) return false;
+		try {
+			await migrateLegacyDistPath();
+			/* v8 ignore start -- defensive: migrateLegacyDistPath handles its own errors internally */
+		} catch (error: unknown) {
+			log.warn("Legacy dist-path migration failed (non-fatal): %s", (error as Error).message);
+		}
+		/* v8 ignore stop */
+		if (!(await installDistPath(sourceTag, distDir))) return false;
+		try {
+			const pruned = await pruneStaleDistPaths();
+			if (pruned.length > 0) log.info("Pruned stale dist-paths entries: %s", pruned.join(", "));
+			/* v8 ignore start -- defensive: pruneStaleDistPaths swallows its own per-entry errors */
+		} catch (error: unknown) {
+			log.warn("Pruning stale dist-paths failed (non-fatal): %s", (error as Error).message);
+		}
+		/* v8 ignore stop */
+		return true;
+	};
+	const result = lockOpts
+		? await withRuntimeRegistryLock(reconcile, lockOpts)
+		: await withRuntimeRegistryLock(reconcile);
+	return result.acquired && result.value === true;
 }
 
 // ─── Install ────────────────────────────────────────────────────────────────
@@ -321,33 +386,10 @@ export async function install(
 		// lifecycle writes every enabled host's assets by design.
 		const pluginHost = pluginBootstrapHost(sourceTag);
 
-		const reconcileRuntime = async () => {
-			if (!(await installHookScripts())) return false;
-			try {
-				await migrateLegacyDistPath();
-				/* v8 ignore start -- defensive: migrateLegacyDistPath handles its own errors internally */
-			} catch (error: unknown) {
-				log.warn("Legacy dist-path migration failed (non-fatal): %s", (error as Error).message);
-			}
-			/* v8 ignore stop */
-			// `options?.distDir` (undefined for every in-process caller) keeps the
-			// historical "register my own directory" default while letting a daemon-hosted
-			// caller name the dist it is installing on behalf of. See the option's docs.
-			if (!(await installDistPath(sourceTag, options?.distDir))) return false;
-			try {
-				const pruned = await pruneStaleDistPaths();
-				if (pruned.length > 0) log.info("Pruned stale dist-paths entries: %s", pruned.join(", "));
-				/* v8 ignore start -- defensive: pruneStaleDistPaths swallows its own per-entry errors */
-			} catch (error: unknown) {
-				log.warn("Pruning stale dist-paths failed (non-fatal): %s", (error as Error).message);
-			}
-			/* v8 ignore stop */
-			return true;
-		};
-		const runtimeResult = lifecycleLockOpts
-			? await withRuntimeRegistryLock(reconcileRuntime, lifecycleLockOpts)
-			: await withRuntimeRegistryLock(reconcileRuntime);
-		if (!runtimeResult.acquired || runtimeResult.value !== true) {
+		// `options?.distDir` (undefined for every in-process caller) keeps the
+		// historical "register my own directory" default while letting a daemon-hosted
+		// caller name the dist it is installing on behalf of. See the option's docs.
+		if (!(await reconcileRuntimeRegistry(sourceTag, options?.distDir, lifecycleLockOpts))) {
 			return {
 				success: false,
 				message: "Failed to reconcile the shared runtime registry — cannot install hooks that depend on it",
@@ -381,10 +423,11 @@ export async function install(
 			}
 
 			// EXPLICIT plugin setup: `/jolli:init` runs this command WITHOUT --automatic,
-			// so the host the user initialized from becomes the local-agent tool. Sits
-			// after the manual-disable early return so a disabled repo stays a true
-			// zero-write. Non-plugin source tags return null and write nothing, which is
-			// every ordinary `jolli enable`.
+			// so the host the user initialized from seeds the local-agent tool — but only
+			// when nothing is configured, never over a tool already on disk (see
+			// applyPluginInitLocalAgentTool). Sits after the manual-disable early return so
+			// a disabled repo stays a true zero-write. Non-plugin source tags return null
+			// and write nothing, which is every ordinary `jolli enable`.
 			//
 			// LOCK ORDER — this nests: `saveConfig` takes the machine-global `config.lock`
 			// while this flow still holds the repository's `repo-hooks.lock`. That order
@@ -399,30 +442,38 @@ export async function install(
 			//
 			// The `!automatic` gate is load-bearing, not a fast path: the plugin's
 			// SessionStart bootstrap reaches this same install() with a plugin sourceTag
-			// and automatic: true. Letting it through would overwrite localAgentTool on
-			// every session, which is precisely the two-host tug-of-war that the
-			// first-wins seed in ensurePluginDefaultProvider exists to avoid.
+			// and automatic: true. It survives the tool write becoming first-wins, because
+			// the two gates are not the same gate: `ensurePluginDefaultProvider` writes
+			// only while `aiProvider` is unset, whereas this one also seeds a missing
+			// `localAgentTool` under an already-chosen paid provider. Letting the bootstrap
+			// through would put that machine-global write on every session of every
+			// repository a window happens to open, and take `config.lock` there too.
 			if (!options?.automatic) {
 				try {
 					const applied = await applyPluginInitLocalAgentTool(sourceTag, config);
-					if (applied !== null && (applied.changedTool || applied.seededProvider)) {
+					if (applied !== null && (applied.seededTool || applied.seededProvider)) {
 						log.info(
-							"Plugin init recorded localAgentTool=%s (source %s, previous %s, seededProvider=%s)",
+							"Plugin init seeded localAgentTool=%s (source %s, seededTool=%s, seededProvider=%s)",
 							applied.tool,
 							sourceTag,
-							applied.previousTool ?? "unset",
+							applied.seededTool,
 							applied.seededProvider,
 						);
-						// Replacing a tool the user had explicitly configured is a real config
-						// change, so say it out loud — the log line above only reaches
-						// `debug.log`. Filling in an unset value needs no notice.
-						if (applied.changedTool && applied.previousTool !== undefined) {
-							warnings.push(
-								`Recorded ${localAgentToolLabel(applied.tool)} as the local agent for memory generation ` +
-									`(was: ${localAgentToolLabel(applied.previousTool)}). Change it back with ` +
-									`jolli configure --set localAgentTool=${applied.previousTool}`,
-							);
-						}
+					}
+					// Neither outcome warrants a warning, because neither is a change the user
+					// did not ask for: filling in a blank is invisible by design, and keeping a
+					// tool they configured is now the whole point. What the kept case still
+					// needs is a trace — from here on this host's memories are generated by
+					// another host's CLI — and the user-facing half of that is already the
+					// status line every front door prints ("summaries via <tool>"), which reads
+					// this same field.
+					if (applied?.keptTool !== undefined) {
+						log.info(
+							"Plugin init kept localAgentTool=%s (source %s drives %s; left alone)",
+							applied.keptTool,
+							sourceTag,
+							applied.tool,
+						);
 					}
 				} catch (error: unknown) {
 					warnings.push(`Could not record the local agent tool for this host: ${(error as Error).message}`);
@@ -538,9 +589,94 @@ export async function install(
 						const result = await reconcileClaudeAgentHooks(wt);
 						if (wt === projectDir || claudeResult.path === undefined) claudeResult = result;
 					}
+				} else if (pluginHost === "cursor") {
+					// The ONE thing a Cursor plugin bootstrap must do beyond the shared repo
+					// hooks: write this worktree's `.cursor/mcp.json`. It is the only way the
+					// plugin gets a WORKING MCP server — the plugin ships no `mcp.json` of its
+					// own, because a plugin-shipped entry resolves its relative `cwd` against
+					// the PLUGIN root, and every memory tool derives the repository it serves
+					// from its cwd (the measurements are on the Codex side; the failure mode is
+					// identical here, and `startMcpServer` refuses a plugin-cache cwd as the
+					// backstop). Cursor's own MCP config is repo-scoped, so unlike Codex this
+					// needs no exception to the global-host skip — the normal repo registrar is
+					// already the right writer.
+					//
+					// No detector is consulted: this code is running inside a Cursor session, so
+					// Cursor is present by construction, and repo-hooks-only deliberately skips
+					// the filesystem probes to stay fast. ONLY cursor — a Cursor plugin install
+					// must not go writing MCP config for Claude or any global host.
+					//
+					// Deliberately NOT gated on `!automatic`: the sessionStart bootstrap is
+					// exactly the path that must keep the registration alive, and a user who
+					// removed the entry (or upgraded from a bundle that never wrote it) has no
+					// other way to get it back. `upsertJsonMcpServer` short-circuits when the
+					// entry already matches, so the repeat cost on every session is a read.
+					const cursorOnly: DetectedHosts = {
+						claude: false,
+						codex: false,
+						cursor: true,
+						gemini: false,
+						opencode: false,
+						copilot: false,
+						copilotChat: false,
+						cline: false,
+						devin: false,
+						antigravity: false,
+						kimi: false,
+					};
+					await registerRepoMcpHosts(wt, cursorOnly);
+					// UNION (not replace), same reasoning as the Claude branch above: this hook
+					// re-runs on every session start and only knows its own entry, so replacing
+					// the block would shrink a set a prior full `jolli enable` populated.
+					await addGitExcludePaths(
+						wt,
+						buildRegistrars(cursorOnly).flatMap((r) => r.gitExcludePaths()),
+					);
 				}
-				// No `else`: the Codex bootstrap deliberately owns NO skill assets. Codex loads
-				// its skills from the plugin bundle (namespaced `jolli:<name>`) and,
+
+				/*
+				 * Converge the Cursor mirror on EVERY plugin bootstrap, not just Cursor's.
+				 *
+				 * The case this exists for is the one no code can react to as it happens: the
+				 * user removes the Cursor plugin through Cursor's own UI. From that moment the
+				 * Cursor bootstrap never runs again, so a reconcile that only lived there could
+				 * never clean up after itself — the mirrored skills would stay in the slash menu
+				 * of a repo whose plugin is gone.
+				 *
+				 * Every other host's bootstrap, however, keeps running, and Cursor executes the
+				 * imported Claude plugin's hooks itself. Those fire per SESSION, which is far
+				 * sooner than the next commit — the only other automatic signal available, and
+				 * one that may never arrive in a repo the user has stopped committing to.
+				 *
+				 * Cheap and idempotent: a handful of stats, and on a machine that never had
+				 * the Cursor plugin the bundle lookup comes back empty and this resolves to a
+				 * no-op against a repo that has nothing to remove.
+				 */
+				await reconcileCursorRepoSkills(wt);
+				/*
+				 * The mirror's git-excludes belong HERE, beside the reconcile — not in the
+				 * `pluginHost === "cursor"` branch above, where they used to live.
+				 *
+				 * The reconcile is deliberately host-neutral (see the block above), so it
+				 * plants `.cursor/skills/` symlinks on a CLAUDE or CODEX bootstrap too, as
+				 * long as this machine has the Cursor plugin. With the registration gated on
+				 * the Cursor branch, exactly that combination — both plugins installed, the
+				 * repository opted in from the other host — got the symlinks with no exclude
+				 * lines, leaving `?? .cursor/` in `git status`: the pollution these paths
+				 * exist to prevent, in the one case the gate could not see.
+				 *
+				 * Unconditional rather than conditioned on "did it plant anything", for the
+				 * reason the constant's own docstring gives: the set is union-merged and an
+				 * exclude line for an absent path is inert, so covering both states keeps
+				 * this idempotent instead of making the block flap. A return value the
+				 * caller must remember to honour would also be the same shape of bug as the
+				 * one being fixed.
+				 */
+				await addGitExcludePaths(wt, [...CURSOR_REPO_SKILL_GIT_EXCLUDE_PATHS]);
+				// Neither non-Claude bootstrap owns any SKILL assets — the Cursor branch above
+				// writes MCP config and nothing else. Both hosts load their skills from the
+				// plugin bundle (Codex namespaces them `jolli:<name>`; the Cursor bundle keeps
+				// the canonical `jolli-` prefix instead — see CursorPluginSkills) and,
 				// independently, from the repository's `.agents/skills/` — so a repo that also
 				// ran a full `jolli enable` shows both. That is ACCEPTED duplication, not a bug
 				// to clean up. The names do not collide and neither shadows the other (verified
@@ -1075,6 +1211,23 @@ export async function uninstall(
 			// removePluginJolliMenu). This is the ONE skill uninstall actively removes;
 			// the `jolli-*` siblings stay per the conservative policy noted below.
 			if (!options?.preserveMenu) await removePluginJolliMenu(wt);
+
+			// The Cursor mirror, for the same reason and with one extra twist. These FOUR
+			// host-neutral skills live in this repo's `.cursor/skills/` because Cursor pools
+			// every skill root into one flat menu, so bundling them would double each entry
+			// — see reconcileCursorRepoSkills. Being repo-level is what makes them survive a
+			// plugin-manager uninstall, and a code-driven uninstall is the only thing that
+			// can reach them. (The `/jolli` umbrella is NOT among them: it is machine-global,
+			// shared by every repo, so only a plugin-level teardown may remove it — see
+			// removeCursorGlobalMenu.)
+			//
+			// NOT gated on `preserveMenu`: that flag exists so one host's teardown cannot
+			// delete ANOTHER host's assets, and `.cursor/skills/` is written by nothing
+			// else. A Cursor session tearing down a disabled repo should still take its own
+			// mirror with it, exactly as it would its own MCP entry.
+			//
+			// Ownership-guarded, so a user's own `.cursor/skills/jolli-recall` survives.
+			await removeCursorRepoSkills(wt);
 		}
 
 		// Git hooks are shared — remove once from the common hooks directory

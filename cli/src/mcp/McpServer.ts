@@ -31,6 +31,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { VERSION } from "../commands/CliUtils.js";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
+import { probeWorktree } from "../core/GitOps.js";
 import { JolliMemoryPushClient, type PlatformToolManifestEntry } from "../core/JolliMemoryPushClient.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
@@ -62,15 +63,46 @@ import { isPlatformToolsEnabled } from "./PlatformTools.js";
 
 const log = createLogger("McpServer");
 
-export interface ToolDefinition {
+/**
+ * Exactly what a client may see in `tools/list`.
+ *
+ * Split from {@link ToolDefinition} so the internal fields below cannot reach the
+ * wire by being added to one type. The platform-tool path already projected its
+ * manifest entries down to these three keys for that reason (`binding` and `menu`
+ * are backend routing / curation metadata); making the shape explicit means the
+ * built-ins are held to the same rule instead of relying on their type happening to
+ * carry nothing extra.
+ */
+export interface PublicToolDefinition {
 	name: string;
 	description: string;
 	inputSchema: { type: "object"; properties: Record<string, unknown>; required?: string[] };
 }
 
+export interface ToolDefinition extends PublicToolDefinition {
+	/**
+	 * Whether this tool derives the repository it answers for from the server's cwd.
+	 *
+	 * REQUIRED, not optional, and that is the whole safety property. Outside a git
+	 * worktree a repo-scoped tool does not fail — `StorageFactory` falls back to
+	 * orphan-only storage and every read answers EMPTY BUT SUCCESSFUL, which reads to
+	 * a model as "this branch has no memories" rather than "this server does not know
+	 * which repository it serves". A tool that forgot to declare itself would inherit
+	 * exactly that failure, silently. With no default, adding one is a compile error.
+	 *
+	 * `false` means "cwd contributes nothing": `list_spaces` asks the backend about the
+	 * tenant, and every platform tool is a pure HTTP passthrough
+	 * (`invokePlatformTool` — endpoint from the manifest, auth from the API key, args
+	 * from the model). Those stay available outside a repository, which is the point of
+	 * declaring this per tool rather than refusing to start the whole server.
+	 */
+	requiresRepo: boolean;
+}
+
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	{
 		name: "bind_space",
+		requiresRepo: true,
 		description:
 			'Bind this repo to a Jolli Space so `push_memory` can push to it. Idempotent — binding an already-bound repo returns `{type:"already_bound"}` rather than erroring.',
 		inputSchema: {
@@ -86,12 +118,14 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "list_spaces",
+		requiresRepo: false,
 		description:
 			"List the Jolli Spaces this tenant can bind a repo to, plus the tenant's configured default space.",
 		inputSchema: { type: "object", properties: {} },
 	},
 	{
 		name: "push_memory",
+		requiresRepo: true,
 		description:
 			'Push this branch\'s JolliMemory commit summaries to the bound Jolli Space as articles. If the repo isn\'t bound yet, returns {"type":"binding_required"} with the available spaces — call again with `space` set (or use `bind_space` first) to bind and push. If the user has turned outbound push off for this repo, returns {"type":"push_disabled"} — memory is still recorded locally; this is a deliberate setting, so do not retry, and tell the user to re-enable it instead.',
 		inputSchema: {
@@ -112,6 +146,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "search",
+		requiresRepo: true,
 		description:
 			"Full-text search over this repo's historical decisions and implementations (topics + commits). Use to check how a topic was handled before.",
 		inputSchema: {
@@ -127,6 +162,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "recall",
+		requiresRepo: true,
 		description:
 			"Recall the development context for a branch from raw commit summaries (decisions, plans, notes, commits) — the same data the recall skill surfaces, NOT the topic KB. Omit `branch` to recall the current branch.",
 		inputSchema: {
@@ -136,6 +172,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "get_decision_timeline",
+		requiresRepo: true,
 		description: "Chronological evolution of a topic — its source events ordered oldest-first.",
 		inputSchema: {
 			type: "object",
@@ -145,11 +182,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "list_branches",
+		requiresRepo: true,
 		description: "List all branches that have JolliMemory records, with their topic titles.",
 		inputSchema: { type: "object", properties: {} },
 	},
 	{
 		name: "get_pr_description",
+		requiresRepo: true,
 		description:
 			"Build a GitHub PR title + description from the CURRENT branch's JolliMemory commit summaries — the same memory-rich body the VS Code extension writes. Use before `gh pr create` so the PR embeds the curated memory instead of a diff-derived summary. Always describes the current branch (the commit range is base..HEAD).",
 		inputSchema: {
@@ -169,6 +208,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "queue_status",
+		requiresRepo: true,
 		description:
 			'Report whether this repo\'s memory-summary generation is still in progress. Call before building a PR (get_pr_description) so freshly-committed summaries are included. Wiki/graph rendering is excluded from the verdict. Pass {"wait": true} to block until drained (default 120s, override with timeoutMs).',
 		inputSchema: {
@@ -181,6 +221,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "status",
+		requiresRepo: true,
 		description:
 			"Report Jolli Memory's installation & configuration health for this repo: which hooks are installed, the active hook runtime, data-migration state, account / API-key configuration, detected AI integrations with their session counts, the stored-memory count, and the orphan branch. This is the environment health check — pair it with queue_status (generation progress), not list_branches (recorded memory).",
 		inputSchema: { type: "object", properties: {} },
@@ -239,7 +280,10 @@ export interface StartMcpServerDeps {
 /**
  * Re-exported from the leaf module [`McpCwdGuard.ts`](McpCwdGuard.ts), where it
  * lives so the proxy can consult it without importing this module's storage and
- * search stack. The rule and its rationale are documented there.
+ * search stack. That module is itself a one-line alias for
+ * [`core/PluginBundlePaths`](../core/PluginBundlePaths.ts), which is where the
+ * markers actually live — the Cursor plugin bootstrap needs the same predicate and
+ * must not reach into `mcp/` for it.
  */
 export { isPluginBundleCwd } from "./McpCwdGuard.js";
 
@@ -253,13 +297,27 @@ export interface McpRuntime {
 	/** The git-worktree root every tool derives its repository from. */
 	readonly cwd: string;
 	/**
-	 * Built-ins plus any backend platform tools, in `tools/list` order.
+	 * Whether {@link cwd} is inside a git working tree, and therefore whether the
+	 * `requiresRepo` built-ins may be served at all.
 	 *
-	 * Handed to `tools/list` by reference, never copied: with no platform tools
-	 * this IS the static `TOOL_DEFINITIONS` array, and a daemon answers this
-	 * request once per client. Nothing mutates it.
+	 * Carried ON THE RUNTIME rather than computed once in {@link prepareMcpRuntime},
+	 * because {@link rebuildPlatformHalf} re-enters {@link buildRuntime} with the same
+	 * cwd: without it, a daemon refreshing its platform half would quietly re-advertise
+	 * the nine repo-scoped tools it had withheld, and the next client would get the
+	 * empty-but-successful answers the withholding exists to prevent.
 	 */
-	readonly toolDefinitions: ToolDefinition[];
+	readonly insideRepo: boolean;
+	/**
+	 * The advertised tool list, in `tools/list` order: the built-ins this cwd can
+	 * answer for, plus any backend platform tools.
+	 *
+	 * `PublicToolDefinition`, not `ToolDefinition` — every entry is projected down to
+	 * name/description/inputSchema so no internal field (a built-in's `requiresRepo`, a
+	 * manifest entry's `binding` / `menu`) can reach a client. That projection is also
+	 * why this is always a fresh array rather than the static `TOOL_DEFINITIONS` handed
+	 * over by reference. Nothing mutates it.
+	 */
+	readonly toolDefinitions: PublicToolDefinition[];
 	/** Present only when the platform-tool gate is open. */
 	readonly platformClient?: PlatformToolClient;
 	/** Full manifest entries (with the internal `binding` / `menu` metadata) by name. */
@@ -340,19 +398,102 @@ export async function prepareMcpRuntime(cwd: string, deps: StartMcpServerDeps = 
 		return;
 	}
 
-	// Anchor the Logger's global dir to this (already git-root-resolved) cwd so the
-	// long-lived server's debug.log — written on every tool call — lands in the
-	// repo's `.jolli/`, not a stray store under the subdirectory it was launched
-	// from. `cwd` is resolved by the `jolli mcp` command via resolveProjectDir.
-	setLogDir(cwd);
+	// Third cwd sentinel — same failure it guards against, but NOT the same remedy.
+	//
+	// Outside a git worktree a repo-scoped tool does not fail: `StorageFactory` logs
+	// "Not a claimable project (no git worktree …) — using orphan-only storage" and
+	// every read answers EMPTY BUT SUCCESSFUL, which the cutover rule in AGENTS.md
+	// names as worse than no data at all. A model cannot tell that apart from "this
+	// branch genuinely has no memories".
+	//
+	// Measured, not hypothetical. Cursor imports Claude plugins wholesale — including
+	// their `.mcp.json` — under its `enable_cc_plugin_import` gate, and it spawns MCP
+	// servers from a SHARED process before any workspace folder is known
+	// ("WARN No workspace folders found, using current path for . expansion" in
+	// mcpprocess.log). The child therefore inherits the host's own cwd: on a real
+	// install that was the user's HOME directory, so `~/.claude/plugins/.../Cli.js mcp`
+	// came up rooted at `/Users/<me>` and served an empty repository while reporting
+	// "Successfully connected". The bundle guard above cannot see it, because the cwd
+	// is not a bundle path. Nothing recovers the workspace from inside that launch —
+	// Cursor passes MCP servers no workspace env (`CURSOR_WORKSPACE_LABEL` goes to the
+	// extension host only) and the spawn predates workspace resolution.
+	//
+	// WHY THIS ONE FILTERS INSTEAD OF REFUSING, unlike the two guards above. Those two
+	// describe a server that is wrong about EVERYTHING it could answer — a bundle cache
+	// or a throwaway agent temp dir is not a repository and has no backend identity
+	// either. "Not a git repo" is narrower: the nine repo-scoped built-ins are unusable,
+	// but `list_spaces` and every platform tool are not, because a platform tool is a
+	// pure HTTP passthrough (`invokePlatformTool` — endpoint from the manifest, auth
+	// from the API key, args from the model) with no input from cwd at all. Refusing
+	// wholesale took ~23 of 32 tools offline to protect the other 9, on nine hosts whose
+	// MCP registration is machine-global and therefore reached from ANY directory the
+	// user opens a session in. Dropping the repo-scoped tools from `tools/list` protects
+	// those 9 more thoroughly than a refusal does — the model never sees a tool it could
+	// misread an empty answer from — while leaving the rest working.
+	//
+	// The residual ambiguity is accepted rather than guessed at: if a user's HOME *is* a
+	// git repository (a dotfiles checkout), it passes and is served. That is right when
+	// they really opened it and indistinguishable from a stray launch when they did not,
+	// so HOME is not special-cased — that would refuse a legitimate project on a hunch.
+	// `probeWorktree`, not `isInsideGitRepo`: the latter answers "any git context",
+	// which calls a bare repo and the `.git` directory itself a working tree. Both
+	// then fail `StorageFactory`'s stricter claimable-project check and land right
+	// back in the empty-but-successful hole this guard exists to close. The probe
+	// tests `--is-inside-work-tree`'s STDOUT instead.
+	const probe = await probeWorktree(cwd);
+	const insideRepo = probe === "inside";
+	if (!insideRepo) {
+		// Two different problems, and conflating them sends the user to check the wrong
+		// thing. A missing `git` is not a statement about cwd at all — `execGit` reports
+		// it as exit 127, and a daemon spawned by a GUI-launched IDE genuinely does get a
+		// PATH without git on it.
+		const reason =
+			probe === "git-unavailable"
+				? "`git` could not be executed from this process (a GUI-launched host often passes a " +
+					"stripped PATH), so this server cannot tell which repository it serves"
+				: `${cwd} is not inside a git worktree`;
+		process.stderr.write(
+			`jolli mcp: ${reason}, so this server is starting WITHOUT its repository tools ` +
+				"(recall, search, status, …) — they would answer for no project at all, and empty results " +
+				"look like real ones. Space and workflow tools still work. When the cause is the launch " +
+				"directory, it usually means the AI host started the server before it knew which workspace " +
+				"was open; register it with `jolli enable` in the repository you want served.\n",
+		);
+		log.warn("worktree probe returned %s for cwd %s — repo-scoped tools withheld", probe, cwd);
+	}
 
-	// Establish the configured storage backend up front. The tool handlers read
-	// through the store APIs without threading `storage`, so without this they'd
-	// fall through resolveStorage to the orphan branch — wrong for folder-mode
-	// users and a per-read WARN in this long-lived process.
-	setActiveStorage(await createStorage(cwd, cwd));
+	// BOTH of these are gated on `insideRepo`, and each for its own reason — the
+	// filtering above changed which tools are served, not what a non-repo cwd is
+	// allowed to be treated as.
+	//
+	//   setLogDir  — NOT a litter guard, and it is worth being precise about that:
+	//     Logger never creates its directory. `enqueueLogWrite` stats
+	//     `<dir>/.jolli/jollimemory/` and silently drops the line when it is absent, so
+	//     anchoring a non-repo cwd could not have produced a stray `.jolli/` in the
+	//     user's HOME to begin with. The gate is about what this server may CLAIM as
+	//     its state root: outside a worktree there is no repository to anchor to, so it
+	//     anchors to nothing. Skipping is a no-op in the measured case — `getJolliMemoryDir`
+	//     falls back to `process.cwd()`, which is what `resolveProjectDir` already
+	//     returned for a non-git cwd — and that coincidence is exactly why the
+	//     invariant is stated here rather than left to the fallback happening to agree.
+	//   createStorage — nothing that reads through it is reachable now: every
+	//     storage-backed tool declares `requiresRepo`. Skipping it also avoids the
+	//     per-read "Not a claimable project" WARN in a process that never exits.
+	if (insideRepo) {
+		// Anchor the Logger's global dir to this (already git-root-resolved) cwd so the
+		// debug.log lands in the repo's `.jolli/`, not a stray store under the
+		// subdirectory it was launched from. `cwd` is resolved by the `jolli mcp`
+		// command via resolveProjectDir.
+		setLogDir(cwd);
 
-	return buildRuntime(cwd, await loadPlatformTools(deps));
+		// Establish the configured storage backend up front. The tool handlers read
+		// through the store APIs without threading `storage`, so without this they'd
+		// fall through resolveStorage to the orphan branch — wrong for folder-mode
+		// users and a per-read WARN in this long-lived process.
+		setActiveStorage(await createStorage(cwd, cwd));
+	}
+
+	return buildRuntime(cwd, await loadPlatformTools(deps, insideRepo), insideRepo);
 }
 
 /** The platform-tool half of a runtime — the only part that touches the network. */
@@ -380,11 +521,16 @@ export interface PlatformToolSet {
  * reaps — hours, silently, with `tools/list` simply 22 entries short. See
  * {@link McpRuntime.platformDegraded}.
  */
-export async function loadPlatformTools(deps: StartMcpServerDeps = {}): Promise<PlatformToolSet> {
+export async function loadPlatformTools(deps: StartMcpServerDeps = {}, insideRepo = true): Promise<PlatformToolSet> {
 	// Opt-in gate. When it is closed we never construct a client or touch the
 	// network, so the server behaves exactly as a git-memory-only server.
 	const config = await (deps.loadConfig ?? loadConfig)();
 	const gateOpen = isPlatformToolsEnabled(config);
+	// The built-ins this cwd can actually answer for — the menu must be built from the
+	// same list `tools/list` will advertise, or it would offer a route to a tool that
+	// was withheld. Defaults to the full set so the `rebuildPlatformHalf` path and any
+	// caller that does not care about the repo dimension keep today's behaviour.
+	const availableBuiltIns = insideRepo ? TOOL_DEFINITIONS : TOOL_DEFINITIONS.filter((t) => !t.requiresRepo);
 	let platformClient: PlatformToolClient | undefined;
 	let platformTools: PlatformToolManifestEntry[] = [];
 	let fetchFailed = false;
@@ -419,8 +565,10 @@ export async function loadPlatformTools(deps: StartMcpServerDeps = {}): Promise<
 			return true;
 		});
 		// Menu = menu-flagged platform tools ∪ the local-tools inclusion list
-		// (empty for now). Every item is one of the tools advertised below.
-		menu = buildJolliMenu(platformTools, TOOL_DEFINITIONS);
+		// (empty for now). Every item is one of the tools advertised below — so it is
+		// fed the same repo-filtered list, or the menu could offer a route to a tool
+		// `tools/list` withheld.
+		menu = buildJolliMenu(platformTools, availableBuiltIns);
 	}
 	return { ...(platformClient ? { platformClient } : {}), platformTools, menu, gateOpen, fetchFailed };
 }
@@ -432,39 +580,47 @@ export async function loadPlatformTools(deps: StartMcpServerDeps = {}): Promise<
  * {@link McpRuntime.platformDegraded} for when a caller should bother.
  */
 export async function rebuildPlatformHalf(runtime: McpRuntime, deps: StartMcpServerDeps = {}): Promise<McpRuntime> {
-	return buildRuntime(runtime.cwd, await loadPlatformTools(deps));
+	// `runtime.insideRepo` threaded through both calls: a refresh must not
+	// re-advertise the repo-scoped tools this runtime was built to withhold.
+	return buildRuntime(runtime.cwd, await loadPlatformTools(deps, runtime.insideRepo), runtime.insideRepo);
 }
 
 /** Assembles the advertised tool list and dispatch map from the two halves. */
-function buildRuntime(cwd: string, platform: PlatformToolSet): McpRuntime {
+function buildRuntime(cwd: string, platform: PlatformToolSet, insideRepo: boolean): McpRuntime {
 	const { platformClient, platformTools, menu, gateOpen, fetchFailed } = platform;
-	// Advertise the built-ins plus any platform tools. Build the list locally and
-	// leave the static built-in registry untouched; with no platform tools the
-	// static array is returned directly. Project each platform tool down to the
-	// public tool schema (name / description / inputSchema): a manifest entry also
-	// carries `binding` (backend routing) and `menu` (curation) metadata that are
-	// internal-only and must never reach a client's `tools/list`. Dispatch still
-	// uses the full entries via `platformByName`, so routing is unaffected.
-	const advertisedPlatformTools: ToolDefinition[] = platformTools.map(({ name, description, inputSchema }) => ({
+	// The built-ins this cwd can answer for. Outside a worktree the `requiresRepo`
+	// ones are withheld rather than left to fail at call time: a tool the model cannot
+	// see is a tool it cannot read an empty-but-successful answer from. The call-time
+	// check in `createMcpServer` is the backstop for a client working from a cached
+	// list, not the primary defence.
+	const availableBuiltIns = insideRepo ? TOOL_DEFINITIONS : TOOL_DEFINITIONS.filter((t) => !t.requiresRepo);
+	// Every advertised entry is projected down to the public schema
+	// (name / description / inputSchema). Both sides carry fields that must never reach
+	// a client's `tools/list`: a manifest entry has `binding` (backend routing) and
+	// `menu` (curation), a built-in has `requiresRepo`. Dispatch still uses the full
+	// entries via `platformByName`, so routing is unaffected.
+	const advertise = ({ name, description, inputSchema }: PublicToolDefinition): PublicToolDefinition => ({
 		name,
 		description,
 		inputSchema,
-	}));
+	});
 	// Logged because the daemon is detached with stdio ignored: this line is the
-	// only way to tell the three states apart — gate closed, fetch failed, or the
-	// tenant simply has no platform tools — and all three are identical to a
-	// client counting entries in `tools/list`.
+	// only way to tell the states apart — gate closed, fetch failed, the tenant
+	// simply has no platform tools, or the repo-scoped built-ins were withheld —
+	// and they are all identical to a client counting entries in `tools/list`.
 	log.info(
-		"MCP runtime ready: %d built-in + %d platform tool(s), gate=%s, manifest=%s",
+		"MCP runtime ready: %d/%d built-in (insideRepo=%s) + %d platform tool(s), gate=%s, manifest=%s",
+		availableBuiltIns.length,
 		TOOL_DEFINITIONS.length,
-		advertisedPlatformTools.length,
+		insideRepo,
+		platformTools.length,
 		gateOpen ? "open" : "closed",
 		gateOpen ? (fetchFailed ? "fetch-failed" : "ok") : "not-fetched",
 	);
 	return {
 		cwd,
-		toolDefinitions:
-			advertisedPlatformTools.length > 0 ? [...TOOL_DEFINITIONS, ...advertisedPlatformTools] : TOOL_DEFINITIONS,
+		insideRepo,
+		toolDefinitions: [...availableBuiltIns.map(advertise), ...platformTools.map(advertise)],
 		...(platformClient ? { platformClient } : {}),
 		platformByName: new Map(platformTools.map((t) => [t.name, t] as const)),
 		menu,
@@ -481,7 +637,7 @@ function buildRuntime(cwd: string, platform: PlatformToolSet): McpRuntime {
  * {@link prepareMcpRuntime}, so this is cheap enough to run per session.
  */
 export function createMcpServer(runtime: McpRuntime): Server {
-	const { cwd, toolDefinitions, platformClient, platformByName, menu } = runtime;
+	const { cwd, insideRepo, toolDefinitions, platformClient, platformByName, menu } = runtime;
 
 	// Allowlist of tool names we may put in telemetry. `req.params.name` is
 	// client-controlled free text (the AI picks it), so an unknown-tool call
@@ -489,6 +645,10 @@ export function createMcpServer(runtime: McpRuntime): Server {
 	// via the catch path below — the same "external content in telemetry" leak
 	// the telemetry contract forbids for `arguments`. Fold any unrecognized name to
 	// "unknown" so only our own fixed identifiers are ever reported.
+	//
+	// Deliberately the FULL built-in list, not the repo-filtered one: a withheld tool
+	// is still one of our own fixed identifiers, and folding it to "unknown" would hide
+	// exactly the calls worth knowing about (a client working from a cached list).
 	const knownToolNames = new Set<string>([...TOOL_DEFINITIONS.map((t) => t.name), ...platformByName.keys()]);
 	const telemetryToolName = (name: string): string => (knownToolNames.has(name) ? name : "unknown");
 
@@ -507,6 +667,19 @@ export function createMcpServer(runtime: McpRuntime): Server {
 		const { name, arguments: args } = req.params;
 		const start = Date.now();
 		try {
+			// Backstop for a client working from a cached `tools/list` (or one that
+			// ignores it). Throwing names the reason; the alternative is `dispatchTool`
+			// running against a non-repo cwd and returning the plausible-looking empty
+			// result this whole path exists to prevent. Checked against the FULL
+			// registry, so an unknown name still falls through to the dispatch table's
+			// own "Unknown tool" error rather than being reported as a repo problem.
+			if (!insideRepo && TOOL_DEFINITIONS.some((t) => t.name === name && t.requiresRepo)) {
+				throw new Error(
+					`${name} needs a git repository, and this server was started in ${cwd}, which is not ` +
+						"inside one. Start the AI host from the repository you want served, or run " +
+						"`jolli enable` there.",
+				);
+			}
 			// Route backend-defined tools through the generic executor; everything
 			// else is a built-in handled by the local dispatch table.
 			const platformTool = platformByName.get(name);

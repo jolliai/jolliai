@@ -1127,6 +1127,42 @@ export async function isInsideGitRepo(cwd: string): Promise<boolean> {
 }
 
 /**
+ * Where a directory sits relative to a git WORKING TREE, distinguishing the two
+ * reasons a caller can get "no".
+ *
+ * Deliberately not {@link isInsideGitRepo}, whose "any git context" answer is
+ * correct for its own callers and too loose here. Measured on git 2.x:
+ *
+ * | cwd            | `rev-parse --git-dir` | `--is-inside-work-tree` |
+ * |----------------|-----------------------|-------------------------|
+ * | bare repo      | exit 0                | `false`                 |
+ * | a worktree     | exit 0                | `true`                  |
+ * | inside `.git/` | exit 0                | `false`                 |
+ *
+ * So an exit-code check calls a bare repo and the `.git` directory itself a
+ * working tree. That matters wherever the answer gates something that will later
+ * be re-decided by a stricter predicate — `StorageFactory`'s claimable-project
+ * check, for one — because the looser gate lets a caller through into a path that
+ * then degrades silently. Tests STDOUT, like `CliUtils.isInsideWorkTree` does.
+ *
+ * `git-unavailable` is split out because it is not a statement about `cwd` at all:
+ * `execGit` turns a missing binary into `exitCode: 127` rather than throwing, and a
+ * daemon spawned by a GUI-launched IDE really does get a PATH with no `git` on it.
+ * Collapsing that into "not a repo" produces a diagnostic that sends the user to
+ * check the wrong thing. Callers that only need a boolean can treat both non-`inside`
+ * answers alike; callers that report a reason must not.
+ */
+export type WorktreeProbe = "inside" | "outside" | "git-unavailable";
+
+/** Probe whether `cwd` is inside a git working tree. Never throws. */
+export async function probeWorktree(cwd: string): Promise<WorktreeProbe> {
+	const result = await execGit(["rev-parse", "--is-inside-work-tree"], cwd);
+	if (result.exitCode === 127) return "git-unavailable";
+	if (result.exitCode !== 0) return "outside";
+	return result.stdout.trim() === "true" ? "inside" : "outside";
+}
+
+/**
  * Returns the absolute paths of all git worktrees for the repository.
  * Parses the output of `git worktree list --porcelain` and extracts lines
  * starting with "worktree " to collect each worktree path.

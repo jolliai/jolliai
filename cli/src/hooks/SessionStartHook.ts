@@ -31,7 +31,7 @@ import { resolveClientKind } from "../core/ClientHeader.js";
 import { type GitFsLayout, readBranchFromFs, readHeadHashFromFs, resolveGitFsLayout } from "../core/GitFsLayout.js";
 import { resolveStateRoot } from "../core/GitOps.js";
 import { hasLlmCredentials } from "../core/LlmCredentials.js";
-import { pluginDefaultLocalAgentTool } from "../core/localagent/PluginDefaults.js";
+import { pluginDefaultLocalAgentTool, pluginSkillInvocation } from "../core/localagent/PluginDefaults.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig, normalizePlansRegistry, updateConfigTransactional } from "../core/SessionTracker.js";
 import { resolveSotStorage } from "../core/SotStorageResolver.js";
@@ -40,7 +40,14 @@ import { getDisplayDate } from "../core/SummaryFormat.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
 import { createLogger, setLogDir } from "../Logger.js";
-import type { CommitSummary, DiffStats, JolliMemoryConfig, PlansRegistry, SummaryIndexEntry } from "../Types.js";
+import type {
+	CommitSummary,
+	DiffStats,
+	JolliMemoryConfig,
+	LocalAgentToolId,
+	PlansRegistry,
+	SummaryIndexEntry,
+} from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import { buildAuthFailureReminderText } from "./AuthRemediation.js";
 import { readStdin } from "./HookUtils.js";
@@ -110,15 +117,16 @@ const LOGIN_REMINDER_DISMISS_MARKER = "login-reminder-dismissed";
 
 /**
  * Shown at session start when a plugin has no way to generate memories yet.
+ *
+ * Plugin hosts only — a non-plugin surface returns null, because the reminder's whole
+ * content is "invoke this host's setup skill" and there is none. Reads the invocation
+ * form from `PLUGIN_HOSTS` rather than a per-kind ladder: the ladder here named two
+ * hosts after a third existed, so a Cursor user got no reminder at all.
  */
 function loginReminderText(clientKind: string): string | null {
-	const action =
-		clientKind === "claude-plugin"
-			? "Run /jolli:init to finish setup."
-			: clientKind === "codex-plugin"
-				? "Run $jolli:init to finish setup."
-				: null;
-	if (action === null) return null;
+	const init = pluginSkillInvocation(clientKind, "init");
+	if (init === undefined) return null;
+	const action = `Run ${init} to finish setup.`;
 	return [
 		"[Jolli Memory] Memory generation is not configured for this repository.",
 		`→ ${action}`,
@@ -153,19 +161,35 @@ export function computeLoginReminder(clientKind: string, hasCredential: boolean,
  * user has expressed no provider preference at all, and an explicit "anthropic" /
  * "jolli" / "local-agent" pick is never overwritten. That gate is also what keeps
  * two installed plugin hosts from flipping the value on each other every session —
- * the second host to start finds a value and does nothing. The authoritative
- * override lives on the explicit `/jolli:init` path instead — see
- * `applyPluginInitLocalAgentTool` in core/localagent/PluginDefaults.ts for why the
- * two config fields get different overwrite policies.
+ * the second host to start finds a value and does nothing.
  *
- * The gate is evaluated INSIDE `config.lock` (via `updateConfigTransactional`), not
- * against the `config` argument. Two plugin hosts opening their first session
+ * **`localAgentTool` is seeded on its own gate, not on the provider's.** The two
+ * fields are separate opinions and the earlier version conflated them: it wrote both
+ * whenever `aiProvider` was unset, so a user who had run
+ * `jolli configure --set localAgentTool=codex` without ever picking a provider had
+ * that choice silently replaced on their first Cursor session. This is the same bug
+ * `applyPluginInitLocalAgentTool` was fixed for, and this path is the one that
+ * matters more: the bootstrap runs before any `/jolli-init`, on every session of
+ * every repository, so it gets there first. Seeding the provider while LEAVING a
+ * configured tool alone is the right pairing — the tool is the field the user
+ * expressed an opinion about, so `local-agent` should point at THAT tool, not at
+ * this host's.
+ *
+ * The explicit `/jolli:init` path (`applyPluginInitLocalAgentTool` in
+ * core/localagent/PluginDefaults.ts) is first-wins on both fields as well, so no
+ * path overwrites a configured tool; it differs only in ALSO seeding a missing
+ * `localAgentTool` when the provider is already set, which this seed — running
+ * unattended rather than on request — deliberately does not do.
+ *
+ * Both gates are evaluated INSIDE `config.lock` (via `updateConfigTransactional`),
+ * not against the `config` argument. Two plugin hosts opening their first session
  * together would otherwise both read "unset" from their own pre-lock snapshot, both
  * pass a first-wins gate that is supposed to admit one of them, and settle
  * `localAgentTool` on whichever wrote last. The `config` argument is now only a
  * fast path: `aiProvider` is never cleared once set, so a snapshot showing it set
  * lets us skip taking the lock at all — the common case on every session after the
- * first.
+ * first. It deliberately carries only `aiProvider`: the tool gate has to be read
+ * under the lock, and a second snapshot field would invite deciding it from there.
  *
  * Called BEFORE {@link getLoginReminder} in `main()` so a brand-new plugin user is
  * immediately "credentialed" (`hasLlmCredentials` counts local-agent) and never
@@ -185,16 +209,26 @@ export async function ensurePluginDefaultProvider(
 	if (tool === undefined) return false;
 	if (config.aiProvider !== undefined) return false;
 	try {
-		const seeded = await updateConfigTransactional((current) =>
+		// `T` is the tool that ends up in effect, or undefined for "wrote nothing" —
+		// spelled out rather than inferred, since the two branches carry different types.
+		const seeded = await updateConfigTransactional<LocalAgentToolId | undefined>((current) =>
 			current.aiProvider === undefined
-				? { update: { aiProvider: "local-agent", localAgentTool: tool }, result: true }
-				: { update: null, result: false },
+				? {
+						update: {
+							aiProvider: "local-agent" as const,
+							// Only when nothing is configured. A tool already on disk is the
+							// user's pick and stays, even though the provider beside it is ours.
+							...(current.localAgentTool === undefined ? { localAgentTool: tool } : {}),
+						},
+						result: current.localAgentTool ?? tool,
+					}
+				: { update: null, result: undefined },
 		);
-		if (!seeded) {
+		if (seeded === undefined) {
 			log.info("Skipped seeding the %s default — another writer set aiProvider first", sourceTag);
 			return false;
 		}
-		log.info("Seeded default aiProvider=local-agent tool=%s for the %s surface", tool, sourceTag);
+		log.info("Seeded default aiProvider=local-agent tool=%s for the %s surface", seeded, sourceTag);
 		return true;
 	} catch (error) {
 		log.info("Failed to seed default local-agent provider: %s", (error as Error).message);
@@ -711,12 +745,11 @@ function buildBriefingText(
  */
 export function formatRecallSuggestion(daysSinceLastCommit: number, clientKind: string): string | null {
 	if (daysSinceLastCommit <= 0) return null;
-	const recallHint =
-		clientKind === "claude-plugin"
-			? "/jolli:recall"
-			: clientKind === "codex-plugin"
-				? "$jolli:recall"
-				: "`jolli recall`";
+	// Plugin hosts name their bundled skill; every other surface names the CLI command,
+	// which is the only thing that exists there. Table-driven for the same reason as
+	// loginReminderText — this ladder also stopped at two hosts, so a Cursor user was
+	// told to run the bare `jolli recall`.
+	const recallHint = pluginSkillInvocation(clientKind, "recall") ?? "`jolli recall`";
 	return daysSinceLastCommit > 3
 		? `Warning: ${daysSinceLastCommit} days since last commit. Run ${recallHint} for full context.`
 		: `Tip: run ${recallHint} for full context`;

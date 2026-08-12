@@ -16,10 +16,44 @@
  *   deletes pre-plugin unnamespaced `jolli-*` copies.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	readlinkSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { dirname, join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// `reconcileCursorRepoSkills` asks Cursor whether it will load the other hosts' skill
+// roots. Left unmocked that reads the DEVELOPER's live Cursor database, so the same
+// test would pass here, fail on a machine with the toggle off, and take a third path
+// on CI where Cursor is not installed at all. Default to enabled (Cursor's own
+// default) and let the cases that care override it.
+const { thirdPartyEnabledMock } = vi.hoisted(() => ({ thirdPartyEnabledMock: vi.fn().mockResolvedValue(true) }));
+vi.mock("./CursorSettings.js", () => ({ isThirdPartyExtensibilityEnabled: thirdPartyEnabledMock }));
+
+// Same reasoning for the plugin-presence probe: unmocked it reads the DEVELOPER's real
+// `~/.jolli/jollimemory/dist-paths/`, so whether the mirror is written would depend on
+// whether that machine happens to have the Cursor plugin installed. Default to
+// "installed"; the teardown cases flip it.
+// The Cursor mirror is located through `~/.jolli/jollimemory/cursor-plugin-root`, a
+// record only the plugin's own bootstrap can write truthfully — so these suites point
+// HOME at a scratch dir and plant the record there. (`dist-paths` cannot answer the
+// question: its slot is keyed by source tag alone, so a `run-cli` dispatch that lands
+// in the CLI records the CLI's dist under the `cursor-plugin` tag.)
+const { homedirMock } = vi.hoisted(() => ({ homedirMock: vi.fn(() => "/nonexistent-home") }));
+vi.mock("node:os", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:os")>();
+	return { ...actual, homedir: homedirMock };
+});
+
 import {
 	buildJolliMenuSkillTemplate,
 	buildLocalRunSkillTemplate,
@@ -27,10 +61,16 @@ import {
 	buildRecallSkillTemplate,
 	buildRemoteRunSkillTemplate,
 	buildSearchSkillTemplate,
+	CURSOR_MIRROR_SKILLS,
+	CURSOR_REPO_SKILL_GIT_EXCLUDE_PATHS,
+	ensureCursorGlobalMenu,
 	installPluginJolliMenu,
 	JOLLI_MENU_GIT_EXCLUDE_PATHS,
 	PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS,
+	reconcileCursorRepoSkills,
 	removeClaudeLegacySkills,
+	removeCursorGlobalMenu,
+	removeCursorRepoSkills,
 	removePluginJolliMenu,
 	SKILL_GIT_EXCLUDE_PATHS,
 	updateSkillIfNeeded,
@@ -46,10 +86,16 @@ let tempDir: string;
 
 beforeEach(() => {
 	tempDir = mkdtempSync(join(tmpdir(), "jolli-skill-installer-"));
+	fakePluginDir = mkdtempSync(join(tmpdir(), "jolli-fake-bundle-"));
+	fakeHome = mkdtempSync(join(tmpdir(), "jolli-fake-home-"));
+	homedirMock.mockReturnValue(fakeHome);
+	plantFakeBundle();
 });
 
 afterEach(() => {
 	rmSync(tempDir, { recursive: true, force: true });
+	rmSync(fakePluginDir, { recursive: true, force: true });
+	rmSync(fakeHome, { recursive: true, force: true });
 });
 
 // ─── Convenience readers ────────────────────────────────────────────────────
@@ -1423,7 +1469,7 @@ describe("skill revision is kept in lockstep with the body", () => {
 		search: { build: buildSearchSkillTemplate, revision: 2, fingerprint: "2fa504d6745f" },
 		localRun: { build: buildLocalRunSkillTemplate, revision: 5, fingerprint: "81db78096bb6" },
 		remoteRun: { build: buildRemoteRunSkillTemplate, revision: 4, fingerprint: "9fd34e36c20e" },
-		menu: { build: buildJolliMenuSkillTemplate, revision: 6, fingerprint: "81cc5c34d91e" },
+		menu: { build: buildJolliMenuSkillTemplate, revision: 7, fingerprint: "d49640721415" },
 		pluginMenu: { build: buildPluginJolliMenuSkillTemplate, revision: 8, fingerprint: "cf37465fecac" },
 	} as const;
 
@@ -1442,5 +1488,541 @@ describe("skill revision is kept in lockstep with the body", () => {
 		// Bumping the standalone menu without bumping this one silently breaks that.
 		const revOf = (t: string) => Number(t.match(/revision:\s*(\d+)/)?.[1]);
 		expect(revOf(buildPluginJolliMenuSkillTemplate())).toBeGreaterThan(revOf(buildJolliMenuSkillTemplate()));
+	});
+});
+
+// ─── Cursor per-repo skill mirror ───────────────────────────────────────────
+//
+// The rule these pin: Cursor reads `.agents/skills/` and a plugin bundle's own
+// `skills/` into ONE flat, un-namespaced pool and collapses neither, so the bundle
+// ships only Cursor-specific skills and the four host-neutral ones are mirrored per
+// repo — but only when `.agents/` has not already supplied them.
+
+// `jolli` is NOT here. The umbrella is the front door and has to be reachable from
+// Cursor's chat-first window, which starts conversations without naming a workspace —
+// so it is written machine-global by `ensureCursorGlobalMenu` instead of mirrored per
+// repo. See its own suite below.
+const CURSOR_MIRRORED = ["jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"];
+
+/**
+ * A stand-in plugin bundle. The mirror is a SYMLINK into this directory, so the tests
+ * need a real target — pointing at a path that does not exist would produce a broken
+ * link, which is indistinguishable from "not written" through `existsSync`. Torn down
+ * per test, and `plantFakeBundle`/`removeFakeBundle` model install and uninstall.
+ */
+let fakePluginDir: string;
+let fakeHome: string;
+
+function plantFakeBundle(): void {
+	for (const skill of CURSOR_MIRROR_SKILLS) {
+		const dir = join(fakePluginDir, "mirror", skill.name);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "SKILL.md"), skill.build(), "utf-8");
+	}
+	writeCursorPluginRootRecord(fakePluginDir);
+}
+
+/**
+ * Uninstall, as Cursor's own plugin manager performs it: the bundle simply vanishes.
+ *
+ * The RECORD is deliberately left behind — it lives under `~/.jolli/`, which an
+ * uninstall never touches, so this is what a real teardown looks like. Noticing the
+ * uninstall therefore depends on the resolver checking that `mirror/` still exists
+ * rather than trusting the recorded path.
+ */
+function removeFakeBundle(): void {
+	rmSync(fakePluginDir, { recursive: true, force: true });
+}
+
+function writeCursorPluginRootRecord(root: string): void {
+	const dir = join(fakeHome, ".jolli", "jollimemory");
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "cursor-plugin-root"), `${root}\n`, "utf-8");
+}
+
+/** No plugin has ever bootstrapped on this machine — nothing recorded the bundle. */
+function clearCursorPluginRootRecord(): void {
+	rmSync(join(fakeHome, ".jolli", "jollimemory", "cursor-plugin-root"), { force: true });
+}
+
+const cursorSkill = (name: string) => join(tempDir, ".cursor/skills", name, "SKILL.md");
+const agentsSkill = (name: string) => join(tempDir, ".agents/skills", name, "SKILL.md");
+
+function plantAgentsSkill(name: string, content = '---\nname: x\nmetadata:\n  vendor: "jolli.ai"\n---\nbody\n'): void {
+	mkdirSync(join(tempDir, ".agents/skills", name), { recursive: true });
+	writeFileSync(agentsSkill(name), content, "utf-8");
+}
+
+describe("reconcileCursorRepoSkills", () => {
+	it("writes the four host-neutral skills when .agents/skills/ has none of them", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		for (const name of CURSOR_MIRRORED) expect(existsSync(cursorSkill(name))).toBe(true);
+	});
+
+	it("never plants the umbrella per repo — that one is machine-global", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(cursorSkill("jolli"))).toBe(false);
+	});
+
+	it("writes nothing when .agents/skills/ already provides the skill", async () => {
+		for (const name of CURSOR_MIRRORED) plantAgentsSkill(name);
+		await reconcileCursorRepoSkills(tempDir);
+		for (const name of CURSOR_MIRRORED) expect(existsSync(cursorSkill(name))).toBe(false);
+	});
+
+	// The transition that makes this a reconcile rather than a one-shot install: a
+	// plugin-only repo later runs a full `jolli enable`, and the copy written earlier
+	// becomes the duplicate. Removing `.cursor/` is safe precisely because no other
+	// host reads it — the reverse (deleting from `.agents/`) would take the only copy
+	// Codex, Gemini, OpenCode, Windsurf and Copilot have.
+	it("removes its own copy once .agents/skills/ starts providing the skill", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(cursorSkill("jolli-recall"))).toBe(true);
+		plantAgentsSkill("jolli-recall");
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(cursorSkill("jolli-recall"))).toBe(false);
+	});
+
+	it("leaves a user-authored .cursor/skills entry alone in both directions", async () => {
+		const mine = "---\nname: jolli-recall\ndescription: mine\n---\nhand written\n";
+		mkdirSync(join(tempDir, ".cursor/skills/jolli-recall"), { recursive: true });
+		writeFileSync(cursorSkill("jolli-recall"), mine, "utf-8");
+
+		// Write direction: no vendor marker means it is not ours to overwrite.
+		await reconcileCursorRepoSkills(tempDir);
+		expect(readFileSync(cursorSkill("jolli-recall"), "utf-8")).toBe(mine);
+
+		// Remove direction: still not ours to delete once `.agents/` provides one.
+		plantAgentsSkill("jolli-recall");
+		await reconcileCursorRepoSkills(tempDir);
+		expect(readFileSync(cursorSkill("jolli-recall"), "utf-8")).toBe(mine);
+	});
+
+	it("is idempotent — a second run leaves the same content", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		const first = readFileSync(cursorSkill("jolli-search"), "utf-8");
+		await reconcileCursorRepoSkills(tempDir);
+		expect(readFileSync(cursorSkill("jolli-search"), "utf-8")).toBe(first);
+	});
+
+	/*
+	 * The WINDOWS FALLBACK's copy, which is a real directory rather than a symlink.
+	 *
+	 * Symlinks there need Developer Mode, so `linkMirroredSkill` writes a plain copy —
+	 * and an ownership test that accepted only symlinks made that copy permanently
+	 * invisible to this reconcile. Two consequences, one per direction, and both are
+	 * asserted below: an upgrade never refreshed the text, and the copy was never
+	 * removed once `.agents/skills/` began supplying the same name, leaving a duplicate
+	 * in Cursor's flat menu that only an explicit uninstall could clear.
+	 *
+	 * Reproduced by planting the directory directly rather than by faking a symlink
+	 * failure: what makes it ours is the vendor marker in the SKILL.md, which the
+	 * bundle's `mirror/` copies carry (unlike the bundle's own `skills/`, whose
+	 * `metadata:` block the generator strips), so the fallback reproduces it verbatim.
+	 */
+	function plantWindowsFallbackCopy(name: string, body = "stale\n"): void {
+		mkdirSync(join(tempDir, ".cursor/skills", name), { recursive: true });
+		writeFileSync(cursorSkill(name), `---\nname: ${name}\nmetadata:\n  vendor: "jolli.ai"\n---\n${body}`, "utf-8");
+	}
+
+	it("refreshes the Windows fallback's copy instead of skipping it forever", async () => {
+		plantWindowsFallbackCopy("jolli-recall");
+		await reconcileCursorRepoSkills(tempDir);
+		expect(readFileSync(cursorSkill("jolli-recall"), "utf-8")).not.toContain("stale");
+	});
+
+	/*
+	 * Steady state, and the reason `linkMirroredSkill` looks before it writes.
+	 *
+	 * This reconcile runs per session, per worktree, times four, from EVERY host's
+	 * bootstrap — and it used to `rm` and recreate all four links each time. `rm` +
+	 * `symlink` is not atomic, and Cursor's own skill provider scans these very
+	 * directories at that same moment, so a scan landing in the gap sees no skill at
+	 * all. Same class of churn `upsertJsonMcpServer` stopped emitting into
+	 * `.cursor/mcp.json`.
+	 *
+	 * Asserted by inode, because a rebuilt link is indistinguishable by content: that is
+	 * exactly what kept the churn invisible.
+	 */
+	it("does not rebuild a link that already points at the current bundle", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		const inodes = () => CURSOR_MIRRORED.map((n) => lstatSync(join(tempDir, ".cursor/skills", n)).ino);
+		const before = inodes();
+		await reconcileCursorRepoSkills(tempDir);
+		expect(inodes()).toEqual(before);
+	});
+
+	/*
+	 * The property the unconditional rebuild was there to guarantee, and it survives the
+	 * check: the bundle directory is version-stamped, so an upgrade leaves a link that is
+	 * ours, intact, and pointing at a version that is gone. Compared by the link's
+	 * RECORDED target rather than by following it — following a link into a deleted
+	 * bundle throws, while `readlink` answers fine, and "broken" and "stale" have to
+	 * reach the same rebuild.
+	 */
+	it("rebuilds a link left pointing at a previous bundle", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		const link = join(tempDir, ".cursor/skills", "jolli-recall");
+		rmSync(link, { recursive: true, force: true });
+		symlinkSync(join(fakePluginDir, "1.0.0", "mirror", "jolli-recall"), link, "dir");
+
+		await reconcileCursorRepoSkills(tempDir);
+
+		expect(readlinkSync(link)).toBe(join(fakePluginDir, "mirror", "jolli-recall"));
+	});
+
+	/*
+	 * The Windows fallback's copy is a real directory, so it is compared by CONTENT — it
+	 * has the same non-atomic rewrite to avoid, on the one platform where it is the only
+	 * placement available. Planted directly (as the suite above explains) rather than by
+	 * faking a symlink failure.
+	 */
+	it("does not rewrite the Windows fallback's copy when it is already current", async () => {
+		const current = readFileSync(join(fakePluginDir, "mirror", "jolli-recall", "SKILL.md"), "utf-8");
+		plantWindowsFallbackCopy("jolli-recall");
+		writeFileSync(cursorSkill("jolli-recall"), current, "utf-8");
+		const before = lstatSync(cursorSkill("jolli-recall")).mtimeMs;
+		// A coarse clock could tie two genuinely separate writes.
+		await new Promise((r) => setTimeout(r, 25));
+
+		await reconcileCursorRepoSkills(tempDir);
+
+		expect(lstatSync(cursorSkill("jolli-recall")).mtimeMs).toBe(before);
+		// And it stays a copy: converting it back to a symlink would only fail again on
+		// the machine that produced it.
+		expect(lstatSync(join(tempDir, ".cursor/skills", "jolli-recall")).isDirectory()).toBe(true);
+	});
+
+	it("removes the Windows fallback's copy once .agents/skills/ provides the skill", async () => {
+		plantWindowsFallbackCopy("jolli-recall");
+		plantAgentsSkill("jolli-recall");
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(cursorSkill("jolli-recall"))).toBe(false);
+	});
+
+	// A real directory with no marker is a user's own skill even on Windows, where ours
+	// is also a real directory — the marker is the only thing separating the two.
+	it("still leaves an unmarked real directory alone", async () => {
+		mkdirSync(join(tempDir, ".cursor/skills/jolli-recall"), { recursive: true });
+		writeFileSync(cursorSkill("jolli-recall"), "---\nname: jolli-recall\n---\nmine\n", "utf-8");
+		await reconcileCursorRepoSkills(tempDir);
+		expect(readFileSync(cursorSkill("jolli-recall"), "utf-8")).toContain("mine");
+	});
+
+	// Neither of the three states this module produces, so neither is ours: a directory
+	// with no SKILL.md has no marker to read, and a plain FILE at a skill's path is not
+	// something any placement of ours could have created.
+	it("leaves a marker-less directory and a plain file at the skill path alone", async () => {
+		mkdirSync(join(tempDir, ".cursor/skills/jolli-recall"), { recursive: true });
+		mkdirSync(join(tempDir, ".cursor/skills"), { recursive: true });
+		writeFileSync(join(tempDir, ".cursor/skills", "jolli-search"), "not a directory\n", "utf-8");
+
+		await reconcileCursorRepoSkills(tempDir);
+
+		expect(existsSync(join(tempDir, ".cursor/skills/jolli-recall"))).toBe(true);
+		expect(existsSync(cursorSkill("jolli-recall"))).toBe(false); // still empty — untouched
+		expect(readFileSync(join(tempDir, ".cursor/skills", "jolli-search"), "utf-8")).toBe("not a directory\n");
+	});
+
+	/*
+	 * With no bundle there is nothing to link against, so the question the roots answer
+	 * ("does some other root already provide this?") does not arise — and answering it
+	 * anyway costs a read of Cursor's private `state.vscdb`. This reconcile is
+	 * host-neutral, so that read landed on EVERY Claude and Codex session start, to
+	 * produce a value the no-bundle path discards.
+	 */
+	it("does not read Cursor's settings database when no bundle is present", async () => {
+		clearCursorPluginRootRecord();
+		thirdPartyEnabledMock.mockClear();
+		await reconcileCursorRepoSkills(tempDir);
+		expect(thirdPartyEnabledMock).not.toHaveBeenCalled();
+	});
+
+	// Registered unconditionally, so the exclude block does not flap as `.agents/`
+	// appears and disappears; an exclude line for an absent path is inert.
+	/*
+	 * The containing directory carries its own line, and the per-skill ones do NOT make
+	 * it redundant: git reports an untracked DIRECTORY as one `?? .cursor/` entry rather
+	 * than descending into it, so excluding only the four leaves left the whole thing
+	 * visible in `git status` after a real `/jolli-init`.
+	 *
+	 * `.cursor/skills/` and not `.cursor/` — the parent is the user's own configuration
+	 * directory (rules, settings, mcp.json), and hiding all of it would hide their work
+	 * along with ours.
+	 */
+	it("declares an exclude path for every mirrored skill, plus the directory holding them", () => {
+		expect([...CURSOR_REPO_SKILL_GIT_EXCLUDE_PATHS].sort()).toEqual(
+			["/.cursor/skills/", ...CURSOR_MIRRORED.map((name) => `/.cursor/skills/${name}/`)].sort(),
+		);
+		expect(CURSOR_REPO_SKILL_GIT_EXCLUDE_PATHS).not.toContain("/.cursor/");
+	});
+});
+
+// ─── Cursor mirror: every source Cursor would load from ─────────────────────
+//
+// Cursor takes a skill's invocation name from the parent directory of its SKILL.md
+// and pools six roots flat, matching by `includes` so the `~` variants count too. A
+// copy in ANY of them occupies the name, so writing ours beside it is the duplicate
+// this mechanism exists to remove — checking only `.agents/skills/` left the rest.
+
+describe("reconcileCursorRepoSkills — source coverage", () => {
+	function plantAt(root: string, name: string): void {
+		mkdirSync(join(root, name), { recursive: true });
+		writeFileSync(join(root, name, "SKILL.md"), "---\nname: x\n---\nbody\n", "utf-8");
+	}
+
+	it("skips a skill provided by the repo's .claude/skills (a pre-upgrade enable's leftovers)", async () => {
+		// Cleaned up only by `removeClaudeLegacySkills`, which runs from the CLAUDE
+		// plugin bootstrap — a Cursor-only user never reaches it, so this really does
+		// sit there.
+		plantAt(join(tempDir, ".claude/skills"), "jolli-recall");
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(cursorSkill("jolli-recall"))).toBe(false);
+		// The others are unaffected — the decision is per skill, not per repo.
+		expect(existsSync(cursorSkill("jolli-search"))).toBe(true);
+	});
+
+	it("skips a skill provided by the repo's .codex/skills", async () => {
+		plantAt(join(tempDir, ".codex/skills"), "jolli-search");
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(cursorSkill("jolli-search"))).toBe(false);
+	});
+
+	/*
+	 * The toggle. With third-party extensibility OFF, Cursor's provider does not load
+	 * the `.claude` / `.codex` groups at all — so a copy there is invisible, and
+	 * treating it as "already provided" would leave the user with no recall whatsoever.
+	 * Failing toward a duplicate is acceptable here; failing toward nothing is not.
+	 */
+	it("still writes when the only other copy sits in a root Cursor is not loading", async () => {
+		thirdPartyEnabledMock.mockResolvedValue(false);
+		plantAt(join(tempDir, ".claude/skills"), "jolli-recall");
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(cursorSkill("jolli-recall"))).toBe(true);
+		thirdPartyEnabledMock.mockResolvedValue(true);
+	});
+
+	// `.agents/skills/` is in the always-on group, so the toggle must not reach it.
+	it("skips an .agents copy regardless of the toggle", async () => {
+		thirdPartyEnabledMock.mockResolvedValue(false);
+		plantAgentsSkill("jolli-local-run");
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(cursorSkill("jolli-local-run"))).toBe(false);
+		thirdPartyEnabledMock.mockResolvedValue(true);
+	});
+
+	// Ownership is deliberately not consulted: a user's own same-named skill occupies
+	// the menu entry just as completely, and theirs is the one they chose.
+	it("skips a user-authored copy that carries no Jolli marker", async () => {
+		mkdirSync(join(tempDir, ".agents/skills/jolli-remote-run"), { recursive: true });
+		writeFileSync(
+			join(tempDir, ".agents/skills/jolli-remote-run/SKILL.md"),
+			"---\nname: jolli-remote-run\n---\nhand written\n",
+			"utf-8",
+		);
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(cursorSkill("jolli-remote-run"))).toBe(false);
+	});
+});
+
+// ─── Cursor mirror teardown ─────────────────────────────────────────────────
+
+describe("removeCursorRepoSkills", () => {
+	it("removes every mirrored skill it wrote", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		for (const name of CURSOR_MIRRORED) expect(existsSync(cursorSkill(name))).toBe(true);
+
+		await removeCursorRepoSkills(tempDir);
+		for (const name of CURSOR_MIRRORED) expect(existsSync(cursorSkill(name))).toBe(false);
+	});
+
+	// Same guard as the write direction. Uninstall is exactly when a user is least
+	// likely to expect their own file to disappear.
+	it("leaves a user-authored copy in place", async () => {
+		const mine = "---\nname: jolli-recall\ndescription: mine\n---\nhand written\n";
+		mkdirSync(join(tempDir, ".cursor/skills/jolli-recall"), { recursive: true });
+		writeFileSync(cursorSkill("jolli-recall"), mine, "utf-8");
+
+		await removeCursorRepoSkills(tempDir);
+
+		expect(readFileSync(cursorSkill("jolli-recall"), "utf-8")).toBe(mine);
+	});
+
+	it("is a no-op on a repo that never received the mirror", async () => {
+		await expect(removeCursorRepoSkills(tempDir)).resolves.toBeUndefined();
+		expect(existsSync(join(tempDir, ".cursor/skills"))).toBe(false);
+	});
+});
+
+/*
+ * The case no code can react to at the moment it happens: the user removes the plugin
+ * through Cursor's own UI. Nothing of ours runs then, so the mirror would sit in the
+ * slash menu of a repo whose plugin is gone. The reconcile is therefore convergent —
+ * it leads with "does the plugin still exist" and cleans up when it does not, on
+ * whichever install path runs next.
+ */
+/*
+ * The machine-global umbrella. It is not a variant of the per-repo mirror — it exists
+ * because Cursor's chat-first window starts conversations with `workspace_roots: []`,
+ * so the surface that most needs a front door is the one surface a per-repo copy can
+ * never reach.
+ */
+describe("ensureCursorGlobalMenu", () => {
+	const globalSkill = (home: string) => join(home, ".cursor", "skills", "jolli", "SKILL.md");
+
+	it("writes the state-aware Cursor variant, not the host-neutral menu", async () => {
+		await ensureCursorGlobalMenu(tempDir);
+		const written = readFileSync(globalSkill(tempDir), "utf-8");
+		expect(written).toMatch(/^name: jolli$/mu);
+		// Cursor-only plumbing the host-neutral menu does not carry.
+		expect(written).toContain("Customize");
+		expect(written).toContain("can generate memories");
+	});
+
+	it("needs no repository — the whole point of it being global", async () => {
+		// No worktree, no `.agents/`, nothing planted. It still lands.
+		await ensureCursorGlobalMenu(tempDir);
+		expect(existsSync(globalSkill(tempDir))).toBe(true);
+	});
+
+	it("is idempotent across sessions", async () => {
+		await ensureCursorGlobalMenu(tempDir);
+		const first = readFileSync(globalSkill(tempDir), "utf-8");
+		await ensureCursorGlobalMenu(tempDir);
+		expect(readFileSync(globalSkill(tempDir), "utf-8")).toBe(first);
+	});
+
+	it("never overwrites a skill the user wrote themselves", async () => {
+		const path = globalSkill(tempDir);
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, "---\nname: jolli\n---\n\nmine, hands off\n");
+
+		await ensureCursorGlobalMenu(tempDir);
+
+		expect(readFileSync(path, "utf-8")).toContain("mine, hands off");
+	});
+
+	it("removeCursorGlobalMenu reclaims ours and spares theirs", async () => {
+		await ensureCursorGlobalMenu(tempDir);
+		await removeCursorGlobalMenu(tempDir);
+		expect(existsSync(globalSkill(tempDir))).toBe(false);
+
+		const path = globalSkill(tempDir);
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, "---\nname: jolli\n---\n\nmine\n");
+		await removeCursorGlobalMenu(tempDir);
+		expect(existsSync(path)).toBe(true);
+	});
+});
+
+describe("reconcileCursorRepoSkills — plugin removed outside our control", () => {
+	it("removes the mirror when the recorded bundle has disappeared", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		for (const name of CURSOR_MIRRORED) expect(existsSync(cursorSkill(name))).toBe(true);
+
+		// The record SURVIVES the uninstall — it lives under `~/.jolli/`. Only the check
+		// that `mirror/` still exists can notice, which is why the resolver verifies
+		// instead of trusting the recorded path.
+		removeFakeBundle();
+		await reconcileCursorRepoSkills(tempDir);
+
+		for (const name of CURSOR_MIRRORED) expect(existsSync(cursorSkill(name))).toBe(false);
+	});
+
+	// A machine where no plugin ever bootstrapped reads the same as a stale record, and
+	// is equally safe: a repo that never received the mirror has nothing to remove.
+	it("is a no-op when the plugin was never installed", async () => {
+		clearCursorPluginRootRecord();
+		await expect(reconcileCursorRepoSkills(tempDir)).resolves.toBeUndefined();
+		expect(existsSync(join(tempDir, ".cursor/skills"))).toBe(false);
+	});
+
+	// The convergence point that matters in practice: `jolli enable` still runs after
+	// the plugin is gone, and it is what a user who keeps using the CLI will run.
+	it("cleans up from a full enable, not just from the Cursor bootstrap", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(cursorSkill("jolli-recall"))).toBe(true);
+
+		removeFakeBundle();
+		await updateSkillsIfNeeded(tempDir);
+
+		expect(existsSync(cursorSkill("jolli-recall"))).toBe(false);
+		// …and the cross-platform copies it just wrote are of course untouched.
+		expect(existsSync(join(tempDir, ".agents/skills/jolli-recall/SKILL.md"))).toBe(true);
+	});
+
+	/*
+	 * The case that produced dangling links in production, kept as a regression: the
+	 * mirror used to be derived from `dist-paths/cursor-plugin`, whose slot is keyed by
+	 * SOURCE TAG ALONE. `/jolli-init` runs `run-cli enable --source-tag cursor-plugin`,
+	 * `run-cli` resolves to the highest-version dist — the CLI at a tie — and the CLI
+	 * recorded its own dist under that tag. Every planted link then pointed at
+	 * `<cli>/mirror`, which does not exist, and Cursor silently dropped all four skills.
+	 */
+	it("never plants against a recorded root whose mirror is absent", async () => {
+		writeCursorPluginRootRecord(join(tmpdir(), "jolli-not-a-bundle"));
+
+		await reconcileCursorRepoSkills(tempDir);
+
+		for (const name of CURSOR_MIRRORED) expect(existsSync(join(tempDir, ".cursor/skills", name))).toBe(false);
+	});
+});
+
+/*
+ * The property the whole design rests on, and it is a property of the FILESYSTEM
+ * rather than of any code path: the mirror is a symlink into the bundle, so removing
+ * the plugin makes the skill unreadable at that instant — with nothing of ours running.
+ *
+ * Measured on Cursor 3.15.6 before this was built: with `.cursor/skills/jolli-recall`
+ * symlinked into the bundle and the other four written as real directories, deleting
+ * the bundle removed exactly the symlinked entry from the slash menu and left the four
+ * real ones behind. That experiment is what these assert in code.
+ */
+describe("the Cursor mirror disappears with the plugin", () => {
+	it("plants symlinks, not copies", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		for (const name of CURSOR_MIRRORED) {
+			const link = join(tempDir, ".cursor/skills", name);
+			expect(lstatSync(link).isSymbolicLink(), `${name} must be a symlink`).toBe(true);
+			// …and it resolves to the bundle's copy while the bundle is there.
+			expect(readFileSync(join(link, "SKILL.md"), "utf-8")).toContain("name: ");
+		}
+	});
+
+	// The point. No reconcile, no uninstall, no hook — the bundle simply goes away.
+	it("becomes unreadable the moment the bundle is deleted, with no code running", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(cursorSkill("jolli-recall"))).toBe(true);
+
+		removeFakeBundle();
+
+		// The link is still listed in the directory, but nothing can be read through
+		// it — which is exactly why Cursor drops the skill from its menu.
+		expect(existsSync(cursorSkill("jolli-recall"))).toBe(false);
+		expect(() => readFileSync(cursorSkill("jolli-recall"), "utf-8")).toThrow();
+	});
+
+	// An upgrade moves a marketplace bundle to a version-stamped path, stranding every
+	// existing link. Rebuilding unconditionally is what makes that self-heal on the
+	// next session rather than needing its own migration.
+	it("re-points the links after the bundle moves", async () => {
+		await reconcileCursorRepoSkills(tempDir);
+		const before = readlinkSync(join(tempDir, ".cursor/skills/jolli-recall"));
+
+		rmSync(fakePluginDir, { recursive: true, force: true });
+		fakePluginDir = mkdtempSync(join(tmpdir(), "jolli-fake-bundle-v2-"));
+		plantFakeBundle();
+		await reconcileCursorRepoSkills(tempDir);
+
+		const after = readlinkSync(join(tempDir, ".cursor/skills/jolli-recall"));
+		expect(after).not.toBe(before);
+		expect(existsSync(cursorSkill("jolli-recall"))).toBe(true);
+	});
+
+	// Nothing to point at: leave nothing behind rather than a link into the void.
+	it("plants nothing when no bundle is registered", async () => {
+		removeFakeBundle();
+		await reconcileCursorRepoSkills(tempDir);
+		expect(existsSync(join(tempDir, ".cursor/skills/jolli-recall"))).toBe(false);
 	});
 });

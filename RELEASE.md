@@ -20,6 +20,21 @@ Each artifact has its own workflow but they share the branch model, signing requ
 > test, confirmation that the backend accepts the `codex-plugin` client kind, and
 > the product assets required by the public Plugins Directory.
 
+> **Cursor plugin release.** Structurally identical to the Codex plugin above — its own
+> version in
+> [`cursor-plugin/plugins/jolli/.cursor-plugin/plugin.json`](cursor-plugin/plugins/jolli/.cursor-plugin/plugin.json),
+> the same `publish-local.sh` → `publish-dev.sh` → `publish-prod.sh` progression through
+> the scripts in `cursor-plugin/scripts/`, no tag-triggered workflow. Two differences
+> worth knowing before releasing it: `publish-local.sh` targets a **single-plugin**
+> directory (`~/.cursor/plugins/local/jolli/`) rather than a marketplace, and Cursor's
+> **official** marketplace requires a manual submission at `cursor.com/marketplace/publish`
+> with a manual review of every update — so `publish-prod.sh` makes the repository ready
+> for review rather than shipping to users, while a Cursor **team** marketplace points
+> straight at the repository and updates as soon as the push lands. A public release also
+> requires a clean Cursor install smoke test, confirmation that the backend accepts the
+> `cursor-plugin` client kind, and a committed logo. See
+> [`cursor-plugin/DEVELOPMENT.md`](cursor-plugin/DEVELOPMENT.md) for the open items.
+
 > **Site generation lives in a separate package.** The seven `new` / `build` / `dev` / `start` / `convert` / `reverse` / `theme` commands are provided by the `@jolli.ai/site-cli` plugin, which the host CLI discovers at runtime via [`PluginLoader`](cli/src/PluginLoader.ts) and [`KnownPlugins`](cli/src/KnownPlugins.ts). That plugin is built and released from a separate repository on its own cadence — releasing the host CLI does not require coordinating with it. When the plugin isn't installed, the host CLI registers stub commands ([`SiteCommandStubs.ts`](cli/src/commands/SiteCommandStubs.ts)) so `jolli --help` still lists the site commands and tells the user how to install the plugin.
 
 > **Out of scope: IntelliJ plugin.** The `intellij/` deliverable currently uses its own legacy [`publish-intellij.yaml`](.github/workflows/publish-intellij.yaml) workflow (Gradle-based JetBrains Marketplace publish, no maintenance branches, no sigstore tag signing, no `Production` environment gate, and no already-published pre-check — it takes no tag input and publishes whatever `version` sits in `build.gradle.kts` on the selected branch). It is **not** covered by this document. Migrating it to the same model is a separate piece of work.

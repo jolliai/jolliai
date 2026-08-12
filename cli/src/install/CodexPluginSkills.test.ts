@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 import { LOCAL_AGENT_TOOLS, localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import type { LocalAgentToolId } from "../Types.js";
 import {
+	buildCodexInitSkillTemplate,
 	buildCodexJolliSkillTemplate,
 	buildCodexLogoutSkillTemplate,
 	CODEX_PLUGIN_SKILL_NAMES,
@@ -23,6 +24,7 @@ import {
 	renderCodexPluginSkill,
 	stripMetadataBlock,
 } from "./CodexPluginSkills.js";
+import { SHELL_PREREQUISITE_BLOCK } from "./PluginSkillText.js";
 import { buildPluginJolliMenuSkillTemplate } from "./SkillInstaller.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -37,6 +39,36 @@ describe("Codex plugin skills stay in lockstep with the canonical builders", () 
 			);
 		});
 	}
+});
+
+/*
+ * Same rule the Cursor bundle carries, derived from each body rather than from a
+ * hand-kept list of skill names — a skill that grows a `run-cli` call later is
+ * exactly what a list would miss.
+ *
+ * `run-cli` is an extensionless bash script under `%USERPROFILE%`, and only Git
+ * Bash's `$HOME` points there. PowerShell defines `$HOME` too, so the path expands
+ * to something real and the command fails as "not recognized" — and in the umbrella
+ * that failure is read as a missing dispatcher, sending the user to re-trust a
+ * SessionStart hook that was fine.
+ */
+describe("every Codex skill that shells run-cli carries the Windows shell prerequisite", () => {
+	for (const skill of CODEX_PLUGIN_SKILLS) {
+		const body = skill.build();
+		const shellsRunCli = body.includes(".jolli/jollimemory/run-cli");
+		it(`${skill.name}: ${shellsRunCli ? "shells run-cli, so it pins Git Bash" : "is MCP-only, so it stays lean"}`, () => {
+			expect(body.includes(SHELL_PREREQUISITE_BLOCK)).toBe(shellsRunCli);
+		});
+	}
+
+	// The block survives `renderCodexPluginSkill`'s substring rewrite untouched. That
+	// rewrite is a plain `split().join()` over `jolli-recall` → `jolli:recall` and
+	// friends, so any path-shaped `jolli-<name>` in shared text would be corrupted —
+	// this is the assertion that keeps one from being added to it later.
+	it("survives the sibling-reference rewrite unchanged", () => {
+		const rendered = renderCodexPluginSkill({ name: "init", build: buildCodexInitSkillTemplate });
+		expect(rendered).toContain(SHELL_PREREQUISITE_BLOCK);
+	});
 });
 
 // The bare front door exists three times — CLI `runGuidedFrontDoor`, the Claude

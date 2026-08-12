@@ -111,3 +111,10 @@ notes.md
 # the session cwd — see cli/src/install/mcp/HostRegistrars.ts).
 !/codex-plugin/.agents/
 !/codex-plugin/plugins/**/SKILL.md
+
+# cursor-plugin, same reason as claude-plugin. It needs NO directory re-include: its
+# manifest and marketplace live under `.cursor-plugin/`, which the `.cursor/` rule
+# above does not match (that pattern is an exact directory name), and it ships no
+# `mcp.json` — MCP is registered into the workspace's own `.cursor/mcp.json` by the
+# bootstrap, which is per-developer state and stays ignored.
+!/cursor-plugin/plugins/**/SKILL.md

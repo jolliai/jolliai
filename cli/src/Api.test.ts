@@ -1014,18 +1014,21 @@ describe("CLI", () => {
 		});
 
 		// `/jolli:init` is this mode WITHOUT --automatic, and the installer warns here
-		// about things the user needs to know: a localAgentTool it replaced, or a config
-		// save that failed. Dropping them reported a silent config change as success.
-		// stderr, not stdout — the Codex plugin's SessionStart rejects any non-JSON byte
-		// on stdout, and the mode's documented stdout silence stays intact.
+		// about things the user needs to know — a config save that failed being the one
+		// that most looks like success from outside. Dropping them reported a setup that
+		// recorded nothing as complete. stderr, not stdout — the Codex plugin's
+		// SessionStart rejects any non-JSON byte on stdout, and the mode's documented
+		// stdout silence stays intact.
 		it("prints installer warnings on stderr for an explicit --repo-hooks-only run", async () => {
 			vi.mocked(install).mockResolvedValueOnce({
 				success: true,
 				message: "ok",
-				warnings: ["Recorded Codex as the local agent for memory generation (was: Claude Code)."],
+				warnings: ["Could not record the local agent tool for this host: disk full"],
 			});
 			await main(["enable", "--repo-hooks-only", "--cwd", "/tmp/test-project"]);
-			expect(console.error).toHaveBeenCalledWith(expect.stringContaining("Recorded Codex as the local agent"));
+			expect(console.error).toHaveBeenCalledWith(
+				expect.stringContaining("Could not record the local agent tool"),
+			);
 			expect(console.log).not.toHaveBeenCalled();
 		});
 

@@ -54,10 +54,14 @@
  * `intellij/src/main/kotlin/ai/jolli/jollimemory/bridge/SkillInstaller.kt`.
  */
 
-import { mkdir, readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, mkdir, readFile, readlink, rm, symlink } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { atomicWriteFile } from "../core/AtomicWrite.js";
 import { createLogger } from "../Logger.js";
+import { buildCursorJolliSkillTemplate } from "./CursorPluginSkills.js";
+import { isThirdPartyExtensibilityEnabled } from "./CursorSettings.js";
+import { SHELL_PREREQUISITE_BLOCK } from "./PluginSkillText.js";
 
 const log = createLogger("SkillInstaller");
 
@@ -235,6 +239,15 @@ export async function updateSkillsIfNeeded(
 			await upsertSkill(targetDir, skill.name, skill.build());
 		}
 	}
+
+	// Converge the Cursor mirror from here too, not only from the Cursor bootstrap.
+	//
+	// This is the path that still runs after the plugin has been removed through
+	// Cursor's UI — which is the one moment no Jolli code can react to. It is also the
+	// path that has just written `.agents/skills/`, making every mirrored copy
+	// redundant. Both cases resolve to the same call, and both directions are
+	// ownership-guarded, so a repo that never had the mirror is untouched.
+	await reconcileCursorRepoSkills(projectDir);
 }
 
 /**
@@ -338,6 +351,543 @@ export async function installPluginJolliMenu(projectDir: string): Promise<void> 
 	}
 
 	await upsertSkill(skillsDir, "jolli", buildPluginJolliMenuSkillTemplate());
+}
+
+/**
+ * Cursor's own repo-level skill root. A first-class entry in Cursor's flat skill
+ * pool, and — unlike `.agents/skills/` — read by NOTHING else, which is the whole
+ * reason it can be written and deleted freely here.
+ */
+export const CURSOR_SKILLS_DIR: ReadonlyArray<string> = [".cursor", "skills"];
+
+/**
+ * The FOUR host-neutral skills mirrored per-repo for Cursor: the ones the bundle no
+ * longer ships, because a root Cursor already reads supplies them under the identical
+ * name whenever a full `jolli enable` has run.
+ *
+ * **The `jolli` umbrella is deliberately NOT in this list**, and the filter is what
+ * keeps it out. It is not shipped in the bundle either — but it is placed
+ * MACHINE-GLOBAL, by {@link ensureCursorGlobalMenu}, because the surface that needs a
+ * front door most cannot name a repository at all (see
+ * {@link CURSOR_GLOBAL_SKILLS_DIR}). So it is out of the per-repo mirror not because
+ * it is unwanted but because its scope is different.
+ *
+ * The document it receives there is also a DIFFERENT builder from the one
+ * {@link SKILLS} registers. Both are called `jolli` and both are front doors, yet they
+ * are not the same document: the standalone menu is host-neutral, while
+ * `buildCursorJolliSkillTemplate` is state-aware (it reads `status` and leads a
+ * half-configured repo into setup) and carries the Cursor-only plumbing notes about
+ * enabling the MCP server in Customize. A plugin-only user — nobody has run
+ * `jolli enable` for them — is exactly who needs the state-aware one, so mirroring the
+ * generic template would hand the wrong document to the only person who receives it.
+ * When `.agents/skills/jolli` DOES exist it stays and the generic menu serves too,
+ * which is why it had to learn to route to whatever skills the session actually has —
+ * and why one duplicate `/jolli` in the flat menu is accepted rather than pruned.
+ */
+export const CURSOR_MIRROR_SKILLS: ReadonlyArray<SkillRegistration> = SKILLS.filter((skill) => skill.name !== "jolli");
+
+/**
+ * Cursor's MACHINE-GLOBAL skill root, and the home of the `/jolli` umbrella.
+ *
+ * Measured on Cursor 3.15.19, because the obvious reading of the provider is not
+ * enough to bet the front door on. A doubled-star glob for `.cursor/skills` is in the
+ * skill-scan list (that prefix matches any parent, `$HOME` included) and `~/.cursor`
+ * is in the external-watcher list; the NEGATED entries for the same path, which look
+ * like they contradict this, belong to the WORKSPACE FILE INDEX exclusions alongside
+ * the one for `.cursor/worktrees` — a different list for a different purpose.
+ * Confirmed end to end by writing a throwaway skill here and seeing it in the menu of
+ * a window
+ * with no folder open.
+ *
+ * That last part is the whole reason this exists. Cursor's chat-first "Agents Window"
+ * delivers `sessionStart` with `workspace_roots: []` and `CURSOR_PROJECT_DIR: ""` no
+ * matter which repository row the conversation was started from, and nothing in the
+ * payload recovers it (`transcript_path` is null, and the
+ * `~/.cursor/projects/<repo>/agent-transcripts/<conversation_id>` mapping is not
+ * created until the conversation does work). A per-repo front door therefore cannot be
+ * planted from that surface at all — while a machine-global one needs no repository.
+ */
+export const CURSOR_GLOBAL_SKILLS_DIR: ReadonlyArray<string> = [".cursor", "skills"];
+
+/**
+ * Git-exclude paths for the on-demand copies. Registered unconditionally, whether or
+ * not this repo currently needs the copies written: the set is a UNION merged into
+ * `.git/info/exclude`, and an exclude line for a path that does not exist is inert,
+ * so covering both states keeps the reconcile idempotent instead of making the
+ * exclude block flap as `.agents/skills/` appears and disappears.
+ *
+ * **The containing directory needs its own line, and the per-skill ones do not cover
+ * it.** git reports an untracked DIRECTORY as a single `?? .cursor/` entry rather than
+ * walking into it, so excluding `.cursor/skills/jolli-recall/` and its three siblings
+ * left the parent — and therefore the whole thing — showing up in `git status`
+ * (measured on a fresh repo after `/jolli-init`). Excluding `/.cursor/skills/` rather
+ * than `/.cursor/` is deliberate: `.cursor/` is the user's own configuration directory
+ * and hiding all of it would hide their rules and settings too, while
+ * `.cursor/skills/` is a directory this reconcile owns outright.
+ */
+export const CURSOR_REPO_SKILL_GIT_EXCLUDE_PATHS: ReadonlyArray<string> = [
+	`/${CURSOR_SKILLS_DIR.join("/")}/`,
+	...CURSOR_MIRROR_SKILLS.map((skill) => `/${CURSOR_SKILLS_DIR.join("/")}/${skill.name}/`),
+];
+
+/**
+ * Give this worktree exactly ONE copy of each host-neutral skill, for Cursor.
+ *
+ * Cursor reads `.agents/skills/` and a plugin bundle's `skills/` into the SAME flat,
+ * un-namespaced pool, and its slash-menu de-duplicator only collapses entries from
+ * the same plugin — so a repo that ran a full `jolli enable` used to show
+ * `/jolli-recall` twice, identical but for a brand icon. The bundle therefore ships
+ * only what is Cursor-specific, and the shared four are placed here on demand:
+ *
+ *   - `.agents/skills/<name>` present → this repo already has the canonical copy.
+ *     Remove ours if a previous run wrote one. Never touch `.agents/` itself: it is
+ *     the ONLY copy Codex, Gemini, OpenCode, Windsurf and Copilot have, which is why
+ *     de-duplicating in that direction was rejected.
+ *   - absent → write ours, so a plugin-only user (who never ran `jolli enable`, and
+ *     whose bootstrap therefore never writes `.agents/`) still has recall and search.
+ *
+ * **Why `.cursor/skills/` and not the bundle.** Deleting from the bundle instead was
+ * the obvious alternative and is wrong: the bundle is machine-global while
+ * `.agents/skills/` is per-repo, so one repo's reconcile would strip a skill from
+ * every other repo, and two windows on differently-configured repos would fight.
+ * `.cursor/skills/` sits at the same per-repo granularity as the thing it mirrors.
+ *
+ * Both directions are ownership-guarded, so a user's own `.cursor/skills/jolli-recall`
+ * is neither overwritten nor deleted.
+ *
+ * **This runs from the bootstrap, which is not guaranteed to run.** Cursor drops every
+ * plugin hook, silently, whenever its plugins provider times out (measured; see
+ * `cursor-plugin/DEVELOPMENT.md`). That is why the bundle keeps the `jolli` umbrella
+ * and `jolli-init`: when this never executes, the user still has a front door and a
+ * manual route to it. Do not move those two here.
+ */
+export async function reconcileCursorRepoSkills(projectDir: string): Promise<void> {
+	// Step one is not "what does this repo have" but "does the plugin still exist".
+	//
+	// Removing the plugin through Cursor's own UI runs no Jolli code, so nothing can
+	// clean up at that moment — the mirror would otherwise sit in the slash menu of a
+	// repo whose plugin the user believes they removed. The signal is the recorded
+	// bundle root plus a live `mirror/` beneath it: `~/.jolli/` outlives an uninstall,
+	// so the record can be stale, and it is precisely that staleness — a recorded root
+	// whose `mirror/` no longer exists — that {@link cursorPluginMirrorDir} reports as
+	// "gone". (NOT `dist-paths/cursor-plugin`, which answers a different question and
+	// gave dangling links; see {@link CURSOR_PLUGIN_ROOT_RECORD}.)
+	//
+	// This makes the reconcile CONVERGENT rather than install-only: it now belongs on
+	// every install path, not just the Cursor bootstrap, because those are the paths
+	// that still run after the plugin is gone. An absent record (the user never had the
+	// plugin) reads the same as a stale one and is equally safe — a repo that never
+	// received the mirror has nothing to remove.
+	const cursorSkillsDir = join(projectDir, ...CURSOR_SKILLS_DIR);
+	const mirrorDir = await cursorPluginMirrorDir();
+	// Deferred behind the bundle check, not computed alongside it. `cursorSkillRoots`
+	// opens Cursor's private `state.vscdb` to read the extensibility toggle, and the
+	// roots only decide whether some OTHER root already provides a skill — a question
+	// that arises only when there is a bundle to link against. Computing it eagerly
+	// made every Claude and Codex session start read another app's SQLite (this
+	// reconcile is host-neutral) to produce a value the no-bundle path discards.
+	// `[]` is the honest stand-in there: `existsInAny([])` is false, and the branch
+	// below removes our copies on `mirrorDir === undefined` regardless.
+	const roots = mirrorDir === undefined ? [] : await cursorSkillRoots(projectDir);
+
+	// The machine-global umbrella goes when the bundle does, and this is the only place
+	// that can notice. Cursor's plugin manager runs none of our code on uninstall, so
+	// the signal has to come from whatever OTHER Jolli runtime reconciles next — the
+	// CLI, VS Code, another plugin — and `mirrorDir === undefined` is exactly that
+	// signal: the registered dist is gone.
+	//
+	// Removing a MACHINE-GLOBAL asset from a PER-REPO reconcile is normally the fight
+	// this module refuses to start, but not here: the trigger is "the plugin no longer
+	// exists on this machine", which every repo would answer identically, so there is
+	// no state for two windows to disagree about. And if the entry is merely missing
+	// transiently (mid-upgrade), the next Cursor session rewrites it — `main()` ensures
+	// it before anything else.
+	//
+	// KNOWN RESIDUAL, and it is narrow rather than absent. "The plugin is gone" and "the
+	// record is stale" are the same observation, so an upgrade that has moved the
+	// version-stamped bundle before Cursor has run a session against the new one leaves
+	// this branch removing a menu whose plugin is very much installed. Within Cursor that
+	// is invisible — `CursorPluginBootstrapHook.main()` calls `ensureCursorGlobalMenu()`
+	// and then `recordCursorPluginRoot()` BEFORE it reaches any repository, so the record
+	// this reads is always fresh and the umbrella is rewritten regardless. The window
+	// belongs to the OTHER runtimes, which reconcile host-neutrally: a `jolli enable`, a
+	// VS Code activate, a Claude or Codex bootstrap landing inside it removes the menu,
+	// and the next Cursor session puts it back.
+	//
+	// Where that stops self-healing is the one case worth naming: a plugin whose hooks
+	// are being dropped — `thirdPartyExtensibilityEnabled` off, or the server-side
+	// `enable_cc_plugin_import` gate off — never runs `main()` again, so nothing rewrites
+	// it. And that is exactly the state where it matters most, because `~/.cursor/skills/`
+	// is in Cursor's always-loaded `workspace` group while `.cursor/plugins/` is in the
+	// gated one: the umbrella is then the user's ONLY remaining Jolli entry, and this
+	// would take it. Left as-is deliberately — the alternative is a second presence
+	// signal (probing for any jolli bundle under the plugin roots) that would have to be
+	// as reliable as the record to be worth the ambiguity it adds. Do not widen this
+	// branch's trigger without closing that gap first.
+	if (mirrorDir === undefined) await removeCursorGlobalMenu();
+
+	for (const skill of CURSOR_MIRROR_SKILLS) {
+		const linkPath = join(cursorSkillsDir, skill.name);
+		// Ours to manage only if it is absent or is a link we planted. A user's own
+		// directory at this path is never touched, in either direction.
+		if (!(await isOursToManage(linkPath))) continue;
+
+		const providedElsewhere = await existsInAny(roots, skill.name);
+		if (providedElsewhere || mirrorDir === undefined) {
+			// Either a root Cursor reads already provides this skill, or there is no
+			// bundle to point at. Both mean: leave nothing of ours behind.
+			await rm(linkPath, { recursive: true, force: true });
+			continue;
+		}
+		await linkMirroredSkill(linkPath, join(mirrorDir, skill.name));
+	}
+}
+
+/**
+ * The one-line record of where the Cursor plugin bundle lives, written by the only
+ * process that can know it.
+ *
+ * **`dist-paths/cursor-plugin` cannot answer this question, and using it was a bug.**
+ * That registry slot is keyed by SOURCE TAG ALONE, never by directory — a deliberate
+ * property, so that a same-version reinstall at a new path (switching worktrees) still
+ * claims the slot instead of leaving hooks dispatching from a stale directory. What it
+ * records is therefore "the dist of whichever runtime most recently installed while
+ * claiming this tag", which is not the same as "where that host's bundle is". Measured:
+ * `/jolli-init` runs `run-cli enable --source-tag cursor-plugin`, `run-cli` resolves to
+ * the highest-version dist (the CLI wins a version tie), and the CLI dutifully recorded
+ * its OWN dist under the `cursor-plugin` key — so `dirname(distDir)/mirror` came out as
+ * `<repo>/cli/mirror`, which does not exist, and every planted link dangled silently.
+ *
+ * Plain text, one absolute path, mirroring the `node-path` sibling.
+ */
+const CURSOR_PLUGIN_ROOT_RECORD = "cursor-plugin-root";
+
+/**
+ * Record where this bundle lives, so a later non-plugin runtime can find its `mirror/`.
+ *
+ * Called by the Cursor bootstrap, which is the ONLY process that knows the answer
+ * authoritatively — it is running from inside the bundle. Rewritten every session, so
+ * a marketplace upgrade (which moves the version-stamped directory) self-heals without
+ * a migration.
+ *
+ * The reader is `/jolli-init`, which dispatches through `run-cli` and can therefore be
+ * executing the CLI's bundle rather than the plugin's. Without this record it has no
+ * authoritative way to locate the plugin at all, and the four mirrored skills would not
+ * appear until the next session's bootstrap.
+ */
+export async function recordCursorPluginRoot(bundleRoot: string): Promise<void> {
+	try {
+		const dir = join(homedir(), ".jolli", "jollimemory");
+		await mkdir(dir, { recursive: true });
+		await atomicWriteFile(join(dir, CURSOR_PLUGIN_ROOT_RECORD), `${bundleRoot}\n`);
+	} catch (error: unknown) {
+		// Best-effort: a missing record costs a delayed mirror, never a broken session.
+		log.info("Could not record the Cursor plugin root: %s", (error as Error).message);
+	}
+}
+
+/**
+ * Where the plugin keeps the symlink targets, or undefined when there is no usable
+ * bundle — which the caller reads as "the plugin is gone" and cleans up after.
+ *
+ * Existence of `mirror/` is checked rather than assumed. The record can outlive the
+ * bundle (it lives in `~/.jolli/`, which an uninstall never touches), and that stale
+ * case is exactly how an uninstall is noticed: the target vanishes, this returns
+ * undefined, and the reconcile removes the links. Planting against an unverified path
+ * is what produced dangling links before.
+ */
+async function cursorPluginMirrorDir(): Promise<string | undefined> {
+	try {
+		const recorded = await readFile(join(homedir(), ".jolli", "jollimemory", CURSOR_PLUGIN_ROOT_RECORD), "utf-8");
+		const root = recorded.split("\n")[0]?.trim();
+		if (!root) return undefined;
+		const mirrorDir = join(root, "mirror");
+		await lstat(mirrorDir);
+		return mirrorDir;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Whether we may create, replace or delete whatever sits at `linkPath`.
+ *
+ * Three states are ours, matching the three this module produces:
+ *
+ *   - **absent** — nothing to protect.
+ *   - **a symlink** — the normal placement; nothing else creates one here.
+ *   - **a real directory whose `SKILL.md` carries our vendor marker** — the WINDOWS
+ *     FALLBACK's copy ({@link linkMirroredSkill} writes one when symlinks need
+ *     Developer Mode). Including it is not a nicety: a symlink-only test made that
+ *     copy permanently untouchable by the reconcile, so on Windows a plugin upgrade
+ *     never refreshed the text and — worse — the copy was never removed once
+ *     `.agents/skills/` began supplying the same name, leaving a duplicate entry in
+ *     Cursor's flat menu with no way back except an explicit uninstall.
+ *
+ * The marker is what keeps this safe, and it is genuinely there to read: the
+ * bundle's `mirror/` copies keep their `metadata:` block (unlike the bundle's own
+ * `skills/`, whose block the generator strips), so the fallback copies it verbatim.
+ * A user's own hand-authored directory has no marker and is left alone in both
+ * directions — which is the same rule {@link removeCursorRepoSkills} applies on the
+ * teardown side, now applied on the write side too.
+ */
+async function isOursToManage(linkPath: string): Promise<boolean> {
+	let info: Awaited<ReturnType<typeof lstat>>;
+	try {
+		info = await lstat(linkPath);
+	} catch {
+		return true; // absent
+	}
+	if (info.isSymbolicLink()) return true;
+	if (!info.isDirectory()) return false;
+	try {
+		return isJolliOwnedSkill(await readFile(join(linkPath, "SKILL.md"), "utf-8"));
+	} catch {
+		// No readable SKILL.md — not something we wrote, so not ours to remove.
+		return false;
+	}
+}
+
+/**
+ * Whether what sits at `linkPath` is ALREADY what {@link linkMirroredSkill} would put
+ * there for `target` — the check that makes the reconcile a no-op in steady state.
+ *
+ * Both placements this module produces are recognised, because both are written per
+ * session and both would otherwise churn:
+ *
+ *   - a **symlink**, compared by its recorded target rather than by resolving it. The
+ *     stored string is what an upgrade invalidates (the bundle directory is version
+ *     stamped), and comparing the string is also what keeps a link pointing at a
+ *     DELETED bundle from reading as current — `readlink` answers fine on a broken
+ *     link, where anything that followed the link would throw.
+ *   - a **real directory**, i.e. the Windows fallback's copy, compared by content. That
+ *     placement has the same non-atomic rewrite to avoid, on the one platform where it
+ *     is the ONLY placement available — so it is checked rather than left to churn.
+ *
+ * Accepting a current copy means a real directory is never upgraded into a symlink,
+ * which is a deliberate trade and a narrow one: a copy exists precisely because
+ * `symlink` failed on that machine, so converting it would fail again there. The
+ * symlink's own advantage — the entry disappears with the bundle, no code of ours
+ * running — is already unavailable to any install in that state, which is why
+ * {@link removeCursorRepoSkills} exists to clean up after it.
+ *
+ * Anything else — absent, a regular file, an unreadable directory — makes one of these
+ * calls throw and answers `false`, which is the rebuild path. That is the honest answer
+ * for every one of them: none is a placement this function could have produced.
+ */
+async function placementIsCurrent(linkPath: string, target: string): Promise<boolean> {
+	try {
+		const info = await lstat(linkPath);
+		if (info.isSymbolicLink()) return (await readlink(linkPath)) === target;
+		const [here, there] = await Promise.all([
+			readFile(join(linkPath, "SKILL.md"), "utf-8"),
+			readFile(join(target, "SKILL.md"), "utf-8"),
+		]);
+		return here === there;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Point `linkPath` at the bundle's copy — the whole mechanism, in one call.
+ *
+ * A symlink is what makes this repo-level file disappear when the plugin does: Cursor
+ * follows it while the target exists (measured) and drops the skill from its menu the
+ * moment the target is gone, with no code of ours running at that moment. Every other
+ * placement leaves a file that only an explicit uninstall could ever remove.
+ *
+ * Windows is the exception and the reason for the fallback: creating a symlink there
+ * needs Developer Mode or elevation, so a plain copy is written instead. That copy is
+ * a real file and cannot vanish with the plugin, which is precisely why
+ * {@link removeCursorRepoSkills} and its callers still exist — they are the Windows
+ * path's cleanup, not dead code.
+ */
+async function linkMirroredSkill(linkPath: string, target: string): Promise<void> {
+	// Return before touching anything when the placement is already the one we would
+	// produce — the steady state on every session after the first.
+	//
+	// This used to rebuild unconditionally, on the reasoning that an upgrade moves the
+	// bundle and an existing link may point at a version that is gone. That reasoning is
+	// right and is preserved: {@link placementIsCurrent} compares against the CURRENT
+	// target, so a link left over from the old bundle still fails the check and is
+	// rebuilt. What it does not do is churn the other 99% of the time — and this runs
+	// per session, per worktree, times four, from EVERY host's bootstrap (see
+	// {@link reconcileCursorRepoSkills}), while Cursor's own skill provider is scanning
+	// these very directories at that same moment. `rm` + `symlink` is not atomic, so a
+	// scan landing between them sees no skill at all. Same reason `upsertJsonMcpServer`
+	// skips a no-op write rather than re-emitting identical bytes every session.
+	if (await placementIsCurrent(linkPath, target)) return;
+	await rm(linkPath, { recursive: true, force: true });
+	await mkdir(dirname(linkPath), { recursive: true });
+	try {
+		await symlink(target, linkPath, "dir");
+		return;
+	} catch (error: unknown) {
+		// A concurrent reconcile — two Cursor windows, or a plugin bootstrap racing a
+		// `jolli enable` — can plant the same link between the `rm` above and this call,
+		// and `EEXIST` is then success wearing an error's clothes. Take it rather than
+		// falling through, because the copy fallback below would go straight THROUGH the
+		// fresh link: `mkdir` with `recursive` succeeds on a symlink-to-directory, and
+		// the write would land in the BUNDLE's own `mirror/` instead of the repo
+		// (measured). Harmless as bytes — it rewrites the file it just read — but it is
+		// the plugin bundle, and nothing should be writing there.
+		/* v8 ignore start -- a symlink race between two reconciles; not deterministically reproducible in-process */
+		if (await placementIsCurrent(linkPath, target)) return;
+		/* v8 ignore stop */
+		log.info("Symlink unavailable for %s (%s) — copying instead", linkPath, (error as Error).message);
+	}
+	try {
+		const content = await readFile(join(target, "SKILL.md"), "utf-8");
+		await mkdir(linkPath, { recursive: true });
+		await atomicWriteFile(join(linkPath, "SKILL.md"), content);
+	} catch (error: unknown) {
+		/* v8 ignore start -- defensive: the target was just verified to exist */
+		log.warn("Could not place %s: %s", linkPath, (error as Error).message);
+		/* v8 ignore stop */
+	}
+}
+
+/**
+ * Every directory Cursor would load a same-named skill from, for this repo.
+ *
+ * Read out of Cursor 3.15.6's provider (`extensions/cursor-agent-exec/dist/main.js`),
+ * which classifies each discovered `SKILL.md` by path into four groups and scans a
+ * fixed glob list. The groups matter because they are not all always active:
+ *
+ *   - **workspace** (`.agents/skills/`, `.cursor/skills/`) — always loaded.
+ *   - **claude** (`.claude/skills/`) and **plugin** (`.claude/plugins/`,
+ *     `.cursor/plugins/`) — loaded only while `thirdPartyExtensibilityEnabled` is on;
+ *     the provider re-scans on `onDidChangeThirdPartyExtensibilityEnabled`.
+ *   - **builtin** (`.cursor/skills-cursor/`) — Cursor's own, never ours.
+ *
+ * Matching is `includes`, not `startsWith`, so the `~` variants count too: a
+ * `~/.agents/skills/jolli-recall` is as visible in the menu as a repo-level one.
+ *
+ * `.claude/plugins/` and `.cursor/plugins/` are deliberately NOT probed. Cursor takes
+ * a plugin skill's invocation name from the parent directory of its `SKILL.md`, and
+ * the Claude plugin's directories are BARE (`recall`, `search`, `push`) — so they
+ * never collide with `jolli-recall` and are not duplicates of it. `.cursor/plugins/`
+ * is our own bundle, which no longer ships these four at all.
+ */
+async function cursorSkillRoots(projectDir: string): Promise<ReadonlyArray<string>> {
+	const home = homedir();
+	// Always-on roots. `.cursor/skills/` is where we write, so it is not probed here —
+	// finding our own copy would make the reconcile a no-op forever.
+	const roots = [join(projectDir, ".agents", "skills"), join(home, ".agents", "skills")];
+	// Gated roots. When the toggle is OFF these are invisible to Cursor, so treating a
+	// copy there as "already provided" would leave the user with nothing — which is
+	// exactly the direction this whole mechanism refuses to fail in.
+	if (await isThirdPartyExtensibilityEnabled()) {
+		roots.push(
+			join(projectDir, ".claude", "skills"),
+			join(home, ".claude", "skills"),
+			join(projectDir, ".codex", "skills"),
+			join(home, ".codex", "skills"),
+		);
+	}
+	return roots;
+}
+
+/**
+ * Write the `/jolli` umbrella into `~/.cursor/skills/`, the one thing the Cursor
+ * bootstrap does for EVERY session — with or without a repository.
+ *
+ * This is the front door, and it is deliberately the ONLY unconditional write this
+ * host performs. Everything else (git hooks, `.cursor/mcp.json`, the four mirrored
+ * skills) waits for the user to opt a repository in through `/jolli-init`, because
+ * installing into whatever repository a window happens to have open is a change to
+ * someone's `.git/hooks` that they never asked for. "Not installed yet" is the
+ * correct state for a repository nobody has opted in, not a fault to be repaired.
+ *
+ * Machine-global rather than per-repo because the surface that needs it most cannot
+ * name a repository at all — see {@link CURSOR_GLOBAL_SKILLS_DIR}. The cost is one
+ * duplicate `/jolli` in the flat menu for a repo that ALSO ran a full `jolli enable`
+ * (its `.agents/skills/jolli` stays, as it must — that copy is the only one Codex,
+ * Gemini, OpenCode and Copilot have). That trade was made deliberately: a duplicated
+ * entry is two working front doors, while the alternative degrades to no front door
+ * and nothing on screen to explain why.
+ *
+ * Ownership-guarded through {@link upsertSkill}, so a user's own
+ * `~/.cursor/skills/jolli/` is never overwritten.
+ */
+export async function ensureCursorGlobalMenu(home: string = homedir()): Promise<void> {
+	await upsertSkill(join(home, ...CURSOR_GLOBAL_SKILLS_DIR), "jolli", buildCursorJolliSkillTemplate());
+}
+
+/**
+ * Remove the machine-global `/jolli` umbrella.
+ *
+ * Scope is the reason this is separate from {@link removeCursorRepoSkills}: the file
+ * is shared by every repository on the machine, so disabling ONE repo must not delete
+ * it. Only a plugin-level teardown may — which is also why nothing calls this from the
+ * per-repo uninstall path.
+ */
+export async function removeCursorGlobalMenu(home: string = homedir()): Promise<void> {
+	await removeJolliOwnedSkillDir(join(home, ...CURSOR_GLOBAL_SKILLS_DIR, "jolli"), "cursor global menu");
+}
+
+/**
+ * Remove the Cursor mirror this repo received, if it is ours.
+ *
+ * The teardown counterpart of {@link reconcileCursorRepoSkills}, and it exists for the
+ * same reason `removePluginJolliMenu` does: these files live in the REPOSITORY, so
+ * uninstalling the plugin through Cursor's own plugin manager cannot reach them. Only a
+ * code-driven uninstall can, and if it does not, the entries stay in the slash menu of a
+ * repo the user believes they have disabled.
+ *
+ * Ownership-guarded per entry, so a `.cursor/skills/jolli-recall` the user wrote
+ * themselves is left alone — the same rule that governs writing them.
+ *
+ * Note what this deliberately does NOT try to solve: a user who removes the plugin
+ * through Cursor's UI runs no Jolli code at all, so nothing here executes. That is
+ * survivable because the mirrored skills keep WORKING in that state — they invoke
+ * `~/.jolli/jollimemory/run-cli`, which is machine-global and resolves to whichever
+ * other dist is registered (CLI, VS Code, another plugin). They only become dead
+ * entries if that was the last Jolli runtime on the machine, which is the one case
+ * worth telling the user about rather than guessing at.
+ */
+export async function removeCursorRepoSkills(projectDir: string): Promise<void> {
+	const cursorSkillsDir = join(projectDir, ...CURSOR_SKILLS_DIR);
+	for (const skill of CURSOR_MIRROR_SKILLS) {
+		const path = join(cursorSkillsDir, skill.name);
+		// A symlink is unambiguously ours — nothing else creates one here, and reading
+		// through a broken one to look for a vendor marker would fail and wrongly spare
+		// it. Unlink it directly; `rm` removes the link, never the target.
+		let isLink = false;
+		try {
+			isLink = (await lstat(path)).isSymbolicLink();
+		} catch {
+			continue; // absent
+		}
+		if (isLink) {
+			await rm(path, { recursive: true, force: true });
+			log.info("Removed cursor mirror symlink at %s", path);
+			continue;
+		}
+		// A real directory: the Windows fallback's copy, which does carry the marker.
+		await removeJolliOwnedSkillDir(path, "cursor mirror");
+	}
+}
+
+/**
+ * Whether any of `roots` already holds `<name>/SKILL.md`.
+ *
+ * Ownership is deliberately NOT considered. The goal is one entry per name in a flat
+ * menu, and a user's own `~/.claude/skills/jolli-recall` occupies that name just as
+ * completely as ours would — writing a second copy beside it is the duplicate this
+ * exists to prevent, and their version is the one they chose.
+ */
+async function existsInAny(roots: ReadonlyArray<string>, name: string): Promise<boolean> {
+	for (const root of roots) {
+		try {
+			await readFile(join(root, name, "SKILL.md"), "utf-8");
+			return true;
+		} catch {
+			// Not here — keep looking.
+		}
+	}
+	return false;
 }
 
 export async function isPluginJolliMenuCanonical(projectDir: string): Promise<boolean> {
@@ -531,32 +1081,6 @@ async function upsertSkill(skillsDir: string, name: string, content: string): Pr
 }
 
 // ─── Skill Templates ────────────────────────────────────────────────────────
-
-/**
- * The Windows shell-prerequisite block shared by every shell-backed skill. It
- * pins Git Bash on Windows because the `run-cli` entry script is written via
- * Windows Node's `os.homedir()` to `%USERPROFILE%\\.jolli\\jollimemory\\run-cli`,
- * and only Git Bash's `$HOME` aligns with `%USERPROFILE%` — PowerShell / WSL bash
- * see a different home and won't find the script. Reused verbatim by both the
- * arg-carrying here-doc skills ({@link heredocInvocation}) and the local-run
- * recipe (fixed `run-cli` subcommands, no here-doc), so the guidance lives in one
- * place instead of drifting per skill.
- */
-const SHELL_PREREQUISITE_BLOCK = `### Shell prerequisite
-
-This block requires a POSIX bash shell. On Linux/macOS the system bash works.
-**On Windows, use Git Bash** (the bash bundled with Git for Windows). Other
-Windows "bash" options — \`C:\\Windows\\System32\\bash.exe\`, the WindowsApps
-alias, or any WSL bash — see a separate Linux home directory and will not
-find the Jolli entry script that lives under \`%USERPROFILE%\`.
-
-If Git Bash is not available on Windows, STOP and tell the user:
-"Jolli skill needs Git Bash on Windows. Install Git for Windows from
-https://git-scm.com/download/win and retry."
-
-Do NOT fall back to \`npm run\`, \`npx\`, \`node\` directly, PowerShell-native
-commands, WSL bash, or any workspace-local script — those bypass the
-security recipe and the dist resolver and will not produce valid output.`;
 
 /**
  * Shared Step-1 preamble — instructs the LLM to invoke the CLI via a here-doc
@@ -1397,10 +1921,10 @@ to report the cancelled outcome (who/when + workflow URL).
 export function buildJolliMenuSkillTemplate(): string {
 	return `---
 name: jolli
-description: The Jolli action menu — a single front door that lists the Jolli skills (recall, search, run a workflow local or remote, workflow history) plus the Jolli MCP tools registered in this session, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
+description: The Jolli action menu — a single front door that lists the Jolli skills available in this session (recall, search, run a workflow local or remote, workflow history, plus any setup and account skills a Jolli plugin adds) and the Jolli MCP tools, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 6
+  revision: 7
   vendor: "jolli.ai"
 ---
 
@@ -1423,7 +1947,18 @@ ${SHELL_PREREQUISITE_BLOCK}
 
 Assemble ONE combined list of actions from two sources.
 
-### Local Jolli skills (always present)
+### Local Jolli skills
+
+Offer the \`jolli-*\` skills that are ACTUALLY AVAILABLE in this session, not a
+fixed list — exactly as with the MCP tools below. The four described here ship
+everywhere, so they are documented in full; a host that also has a Jolli plugin
+installed (Cursor, Codex, Claude Code) additionally exposes setup and account
+skills such as \`jolli-init\`, \`jolli-login\`, \`jolli-logout\`, \`jolli-status\`,
+\`jolli-timeline\` and \`jolli-push\`. Include whichever of those exist, named as
+this host invokes them, and route by invoking the skill rather than restating its
+steps. If the user asks for something one of them owns — setting Jolli up, signing
+in, checking installation health, publishing this branch's memories — route there
+instead of answering that the menu has no such action.
 
 - **jolli-recall** — Recall prior development context for the current branch.
   Route by invoking the \`jolli-recall\` skill.

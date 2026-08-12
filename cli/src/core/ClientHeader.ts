@@ -47,6 +47,23 @@ export function isClaudePluginBuild(): boolean {
 }
 
 /**
+ * Every client kind that denotes an AI-host plugin's embedded CLI.
+ *
+ * A set rather than an `||` chain so adding a host is one entry — the chain form had
+ * already gone stale by the time a third plugin shipped, and the failure is silent:
+ * the bundle just inherits standalone-CLI behavior. Deliberately NOT derived from
+ * `PLUGIN_HOSTS` in `core/localagent/PluginDefaults`, even though the literals
+ * coincide: that table is keyed by install SOURCE TAG and pulls in the config stack,
+ * while this module is a leaf the push client depends on.
+ *
+ * That the literals coincide is nonetheless load-bearing — `SessionStartHook` resolves
+ * a skill invocation by looking a CLIENT KIND up in that source-tag table — so this is
+ * exported for `ClientHeader.test.ts` to assert against `PLUGIN_HOST_SOURCE_TAGS`.
+ * Duplicating the list is the deliberate choice; letting the two copies drift is not.
+ */
+export const PLUGIN_BUNDLE_KINDS: ReadonlySet<string> = new Set(["claude-plugin", "codex-plugin", "cursor-plugin"]);
+
+/**
  * Whether a client kind denotes an AI-host plugin's embedded CLI rather than a
  * standalone install.
  *
@@ -56,7 +73,7 @@ export function isClaudePluginBuild(): boolean {
  * decision in a pure function over the kind lets every arm be pinned.
  */
 export function isPluginBundleKind(kind: typeof __JOLLI_CLIENT_KIND__): boolean {
-	return kind === "claude-plugin" || kind === "codex-plugin";
+	return PLUGIN_BUNDLE_KINDS.has(kind);
 }
 
 /**
