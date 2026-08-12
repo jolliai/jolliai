@@ -1,21 +1,28 @@
 import { chmodSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	BUSY_TIMEOUT_BY_ROLE,
 	canUseDashboardDb,
 	DASHBOARD_SCHEMA_VERSION,
 	type DashboardDbHandle,
 	DashboardRuntimeError,
-	DashboardSchemaAheadError,
 	DEFAULT_BUSY_TIMEOUT_MS,
+	findDriftedMigrations,
 	getDashboardDbPath,
 	inTransaction,
+	MIGRATIONS,
+	type MigrationLogRow,
 	migrateDashboardDb,
+	readMigrationLog,
+	readMigrationLogState,
 	readSchemaVersion,
+	recordMigrationAsApplied,
+	verifyMigrationLog,
 	withDashboardDb,
 	withReadonlyDashboardDb,
+	withRepairDashboardDb,
 } from "./DashboardDb.js";
 
 let dir: string;
@@ -29,6 +36,51 @@ beforeEach(() => {
 afterEach(() => {
 	rmSync(dir, { recursive: true, force: true });
 });
+
+/** Raw handle — deliberately bypasses every gate the module applies on open. */
+async function rawDb(path: string): Promise<DashboardDbHandle> {
+	const { DatabaseSync } = await import("node:sqlite");
+	return new DatabaseSync(path) as unknown as DashboardDbHandle;
+}
+
+/** Stamps `schema_version` directly — the way a newer build would leave it. */
+async function stampSchema(path: string, version: number): Promise<void> {
+	const raw = await rawDb(path);
+	try {
+		raw.prepare(
+			`INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		).run(String(version));
+	} finally {
+		raw.close();
+	}
+}
+
+/**
+ * A database as an OLDER build left it: the first `upTo` entries applied, the
+ * version stamped, and no migration log — the state every existing install is in
+ * when it first meets the log. Executes the exported entries rather than copying
+ * their DDL, which would drift.
+ */
+async function buildLegacyDb(path: string, upTo: number): Promise<void> {
+	const raw = await rawDb(path);
+	try {
+		for (let slot = 0; slot < upTo; slot++) raw.exec(MIGRATIONS[slot].ddl);
+		raw.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)").run(String(upTo));
+	} finally {
+		raw.close();
+	}
+}
+
+/** The log, read raw. Returns undefined when the table does not exist. */
+async function readLog(path: string): Promise<ReadonlyArray<MigrationLogRow> | undefined> {
+	const raw = await rawDb(path);
+	try {
+		return readMigrationLog(raw);
+	} finally {
+		raw.close();
+	}
+}
 
 describe("canUseDashboardDb", () => {
 	it("accepts the flag-free floor and above", () => {
@@ -496,17 +548,67 @@ describe("transactional migration runner", () => {
 		}
 	});
 
-	it("refuses a database written by a newer build instead of guessing", async () => {
+	it("NEVER refuses a database, however far ahead its format is", async () => {
+		// The assertion the whole change exists for. Measured before it: five MCP
+		// servers, the dashboard server and the VS Code extension host all died on
+		// the same error for a schema bump that added two tables and five nullable
+		// columns. There is no gate left — not a version one, not a floor one.
 		await withDashboardDb(() => undefined, { dbPath });
-		const { DatabaseSync } = await import("node:sqlite");
-		const raw = new DatabaseSync(dbPath) as unknown as DashboardDbHandle;
+		await stampSchema(dbPath, DASHBOARD_SCHEMA_VERSION + 3);
+		await expect(withDashboardDb((db) => readSchemaVersion(db), { dbPath })).resolves.toBe(
+			DASHBOARD_SCHEMA_VERSION + 3,
+		);
+		// And it can still WRITE — the half that was actually broken, since reads were
+		// never version-gated in the first place.
+		await expect(
+			withDashboardDb(
+				(db) => {
+					db.prepare("INSERT INTO schema_meta (key, value) VALUES ('probe', 'written') ").run();
+					return (db.prepare("SELECT value FROM schema_meta WHERE key = 'probe'").get() as { value: string })
+						.value;
+				},
+				{ dbPath },
+			),
+		).resolves.toBe("written");
+	});
+
+	it("writes no compatibility floor key at all", async () => {
+		// Two keys were tried and removed (`min_compatible_version`, then
+		// `min_compatible_release`). Their absence is pinned so neither comes back by
+		// accident: a floor a build cannot see is worse than no floor, and this
+		// database is not where cross-surface compatibility is decided.
+		await withDashboardDb(() => undefined, { dbPath });
+		const keys = await withReadonlyDashboardDb(
+			(db) => (db.prepare("SELECT key FROM schema_meta").all() as Array<{ key: string }>).map((r) => r.key),
+			{ dbPath },
+		);
+		expect(keys).toContain("schema_version");
+		expect(keys.filter((k) => k.includes("compatible"))).toEqual([]);
+	});
+
+	it("warns ONCE per process about a format it cannot fully read", async () => {
+		// This path is on the git hook, so a warn per open would flood the log. The
+		// counter is module-scoped and keyed by the version, so the second open of the
+		// same file is silent.
+		await withDashboardDb(() => undefined, { dbPath });
+		await stampSchema(dbPath, DASHBOARD_SCHEMA_VERSION + 1);
+		const lines: string[] = [];
+		const spy = vi
+			.spyOn(console, "warn")
+			.mockImplementation((...a: unknown[]) => void lines.push(a.map(String).join(" ")));
 		try {
-			raw.exec(`UPDATE schema_meta SET value = '${DASHBOARD_SCHEMA_VERSION + 1}' WHERE key = 'schema_version'`);
+			await withDashboardDb(() => undefined, { dbPath });
+			await withDashboardDb(() => undefined, { dbPath });
 		} finally {
-			raw.close();
+			spy.mockRestore();
 		}
-		await expect(withDashboardDb(() => undefined, { dbPath })).rejects.toThrow(DashboardSchemaAheadError);
-		await expect(withDashboardDb(() => undefined, { dbPath })).rejects.toThrow(/delete that file/);
+		// EXACTLY one, not "at most one": the point is that the second open is silent,
+		// and an assertion that passes on zero would not notice the line disappearing.
+		const ahead = lines.filter((l) => l.includes("not visible here"));
+		expect(ahead).toHaveLength(1);
+		// Names the surface: six kinds of process share one debug.log, so a line that
+		// says only "this build" cannot answer which of them could not see the data.
+		expect(ahead[0]).toMatch(/\(([a-z-]+\/\S+)\)/);
 	});
 });
 
@@ -589,5 +691,391 @@ describe("write-lock waiting (§10.1)", () => {
 		// a detached worker has nobody waiting on it and should not drop data.
 		expect(BUSY_TIMEOUT_BY_ROLE.vscode).toBeLessThan(BUSY_TIMEOUT_BY_ROLE["queue-worker"]);
 		expect(BUSY_TIMEOUT_BY_ROLE.vscode).toBeLessThan(DEFAULT_BUSY_TIMEOUT_MS);
+	});
+});
+
+describe("the migration log — identity is the name, not the slot", () => {
+	it("logs every entry it applies, with a real client identity and a duration", async () => {
+		await withDashboardDb(() => undefined, { dbPath });
+		const rows = await readLog(dbPath);
+		expect(rows?.map((r) => r.name)).toEqual(MIGRATIONS.map((m) => m.name));
+		expect(rows?.every((r) => r.outcome === "applied")).toBe(true);
+		// The identity is JOLLI_CLIENT_HEADER — '<kind>/<version>' — and never a
+		// literal: the point of the column is naming the surface a user would go
+		// and upgrade.
+		expect(rows?.every((r) => /^[a-z-]+\/\S+$/.test(r.applied_by))).toBe(true);
+		expect(rows?.every((r) => r.duration_ms >= 0)).toBe(true);
+		// Slot is recorded but decides nothing.
+		expect(rows?.map((r) => r.slot)).toEqual(MIGRATIONS.map((_m, i) => i));
+	});
+
+	it("stores the DDL verbatim, so the log answers 'what actually ran' offline", async () => {
+		await withDashboardDb(() => undefined, { dbPath });
+		const rows = await readLog(dbPath);
+		for (const row of rows ?? []) {
+			expect(row.ddl).toBe(MIGRATIONS[row.slot].ddl);
+		}
+	});
+
+	it("seeds a pre-log database as 'baseline', not as 'applied'", async () => {
+		await buildLegacyDb(dbPath, 5);
+		await withDashboardDb(() => undefined, { dbPath });
+		const rows = await readLog(dbPath);
+		const seeded = rows?.filter((r) => r.outcome === "baseline");
+		// One per entry the version stamp claims, named from THIS build's list —
+		// which is a guess, and says so in the outcome rather than posing as an
+		// observation.
+		expect(seeded?.map((r) => r.name)).toEqual(MIGRATIONS.slice(0, 5).map((m) => m.name));
+		// The entry that created the table is the only observed one, and its row
+		// comes after the seeds so `seq` order still reads as history.
+		const observed = rows?.filter((r) => r.outcome === "applied");
+		expect(observed?.map((r) => r.name)).toEqual(["SCHEMA_MIGRATIONS_DDL"]);
+		expect(observed?.[0]?.seq).toBeGreaterThan(seeded?.[4]?.seq ?? 0);
+	});
+
+	it("re-applies a MISSING name on a database that is already past it — the self-heal", async () => {
+		// The whole reason identity moved off the slot. Two branches each appended an
+		// entry; after the merge the file's log is missing one of them while its
+		// version says "finished". Name-keyed, the missing one is simply applied.
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			raw.prepare("DELETE FROM schema_migrations WHERE name = ?").run("EVENT_FAILED_KIND_DDL");
+			raw.exec("ALTER TABLE events_raw DROP COLUMN failed_kind");
+		} finally {
+			raw.close();
+		}
+		await withDashboardDb(() => undefined, { dbPath });
+		const rows = await readLog(dbPath);
+		expect(rows?.filter((r) => r.name === "EVENT_FAILED_KIND_DDL" && r.outcome === "applied")).toHaveLength(1);
+		// And the version stamp was not dragged backwards to the re-applied slot.
+		await expect(withReadonlyDashboardDb(readSchemaVersion, { dbPath })).resolves.toBe(DASHBOARD_SCHEMA_VERSION);
+	});
+
+	it("records a 'skipped' row when another writer got there first", async () => {
+		// The concurrency path, which is the only one a single-threaded test has to
+		// stage: the pass decides to apply an entry, then finds it already applied
+		// once it holds the write lock (a rival writer committed in between). That
+		// used to be a bare `continue` leaving no trace anywhere — and a skipped
+		// entry that nobody comes back to is precisely the bug this table exists for.
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			// Hide one name from the FIRST log read only. The second read happens
+			// inside BEGIN IMMEDIATE and sees the real rows — exactly what a rival's
+			// commit looks like from in here.
+			let reads = 0;
+			const hidden = "RECALL_RECEIPTS_DDL";
+			const patched: DashboardDbHandle = {
+				exec: (sql) => raw.exec(sql),
+				close: () => raw.close(),
+				prepare: (sql) => {
+					const stmt = raw.prepare(sql);
+					if (!sql.includes("FROM schema_migrations")) return stmt;
+					return {
+						...stmt,
+						all: (...params) => {
+							const rows = stmt.all(...params) as MigrationLogRow[];
+							reads += 1;
+							return reads === 1 ? rows.filter((r) => r.name !== hidden) : rows;
+						},
+						get: (...params) => stmt.get(...params),
+						run: (...params) => stmt.run(...params),
+					};
+				},
+			};
+			migrateDashboardDb(patched, { appliedBy: "test/1.0" });
+			const rows = readMigrationLog(raw);
+			expect(rows?.filter((r) => r.outcome === "skipped").map((r) => r.name)).toEqual([hidden]);
+			// And nothing was re-executed: the entry's original applied row still
+			// stands alone.
+			expect(rows?.filter((r) => r.name === hidden && r.outcome === "applied")).toHaveLength(1);
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("keeps a 'failed' row even though the transaction rolled back", async () => {
+		// Written after the ROLLBACK, outside the transaction, or it would vanish
+		// with the change it describes — and most callers of withDashboardDb swallow
+		// the exception, so this row can be the only evidence a user ever has.
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			raw.prepare("DELETE FROM schema_migrations WHERE name = ?").run("TOOL_CALL_TIME_DDL");
+			// The column is still there, so re-applying the entry dies on duplicate.
+			expect(() => migrateDashboardDb(raw, { appliedBy: "test/1.0" })).toThrow();
+			const rows = readMigrationLog(raw);
+			const failed = rows?.filter((r) => r.outcome === "failed");
+			expect(failed?.map((r) => r.name)).toEqual(["TOOL_CALL_TIME_DDL"]);
+			expect(failed?.[0]?.applied_by).toBe("test/1.0");
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("WARNS about drifted DDL and keeps working — never refuses the database", async () => {
+		// It used to throw. Two measurements killed that: the comparison is byte-exact
+		// while 64% of the baseline entry is SQL comments (22,967 of 35,673 chars), so
+		// re-wrapping a comment would have made every existing database refuse writes;
+		// and `MigrationFingerprints.test.ts` already fails on such an edit in CI, on
+		// the author's machine, before it can ship.
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			raw.prepare("UPDATE schema_migrations SET ddl = ? WHERE name = ?").run(
+				"-- something another branch shipped",
+				"RECALL_RECEIPTS_DDL",
+			);
+		} finally {
+			raw.close();
+		}
+		const lines: string[] = [];
+		const spy = vi
+			.spyOn(console, "warn")
+			.mockImplementation((...a: unknown[]) => void lines.push(a.map(String).join(" ")));
+		try {
+			await expect(withDashboardDb(() => "ok", { dbPath })).resolves.toBe("ok");
+		} finally {
+			spy.mockRestore();
+		}
+		const drift = lines.filter((l) => l.includes("DIFFERENT DDL"));
+		// Named, attributed, and pointed at the report — once per name per process.
+		expect(drift).toHaveLength(1);
+		expect(drift[0]).toContain("RECALL_RECEIPTS_DDL");
+		expect(drift[0]).toContain("jolli doctor --schema-log");
+		expect(drift[0]).toMatch(/\(([a-z-]+\/\S+)\)/);
+	});
+
+	it("still REPORTS drift for the doctor listing", async () => {
+		// The warn is per-process; the report has to work on any handle at any time.
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			raw.prepare("UPDATE schema_migrations SET ddl = 'drifted' WHERE name = ?").run("SKILL_CONTEXT_KIND_DDL");
+			expect(() => verifyMigrationLog(raw)).not.toThrow();
+			expect(findDriftedMigrations(raw).map((r) => r.name)).toEqual(["SKILL_CONTEXT_KIND_DDL"]);
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("keeps reporting drift when a LATER non-applied row exists under the same name", async () => {
+		// The whole reason the drift key is "newest APPLIED row", not "newest row". A
+		// reachable sequence: an older build really applies drifted DDL, then a later
+		// writer stale-reads the name as missing (or steps over it for any other reason)
+		// and appends `skipped` carrying this build's DDL. Keyed off the newest row of any
+		// outcome, that row buries the applied one and BOTH the runtime warning and
+		// `doctor --schema-log` go quiet about a schema that still differs.
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			raw.prepare("UPDATE schema_migrations SET ddl = 'what the older build ran' WHERE name = ?").run(
+				"SKILL_CONTEXT_KIND_DDL",
+			);
+			raw.prepare(
+				`INSERT INTO schema_migrations (slot, name, outcome, applied_by, applied_at_ms, duration_ms, ddl)
+				 VALUES (0, 'SKILL_CONTEXT_KIND_DDL', 'skipped', 'test/1.0', 0, 0, 'this build''s DDL')`,
+			).run();
+			const drifted = findDriftedMigrations(raw);
+			expect(drifted.map((r) => r.name)).toEqual(["SKILL_CONTEXT_KIND_DDL"]);
+			// And it is the APPLIED row that is reported — the one that says what the
+			// schema was actually built from.
+			expect(drifted[0]?.outcome).toBe("applied");
+			expect(drifted[0]?.ddl).toBe("what the older build ran");
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("tolerates a database with no log table — the entry that creates it is in the list", async () => {
+		const raw = await rawDb(dbPath);
+		try {
+			expect(readMigrationLog(raw)).toBeUndefined();
+			expect(() => verifyMigrationLog(raw)).not.toThrow();
+		} finally {
+			raw.close();
+		}
+		// The full pass, from empty, has to survive checking for a table it is about
+		// to create.
+		await expect(withDashboardDb(() => "ok", { dbPath })).resolves.toBe("ok");
+	});
+
+	it("passes a name with no row, and a seeded row, rather than guessing about them", async () => {
+		await buildLegacyDb(dbPath, 5);
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			// Seeded rows are inference, so comparing DDL against them would report
+			// drift nobody observed. Rows deleted outright are simply unknown.
+			raw.prepare(
+				"UPDATE schema_migrations SET ddl = 'whatever the old build ran' WHERE outcome = 'baseline'",
+			).run();
+			expect(() => verifyMigrationLog(raw)).not.toThrow();
+			raw.prepare("DELETE FROM schema_migrations WHERE name = ?").run("SCHEMA_MIGRATIONS_DDL");
+			expect(() => verifyMigrationLog(raw)).not.toThrow();
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("warns — never throws — about a migration this build has never heard of", async () => {
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			raw.prepare("UPDATE schema_migrations SET name = ? WHERE name = ?").run(
+				"SOME_UNMERGED_BRANCH_DDL",
+				"SKILL_CONTEXT_KIND_DDL",
+			);
+			// A file legitimately shared by two builds in rotation must stay usable;
+			// the foreign name is a clue, not a fault.
+			expect(() => verifyMigrationLog(raw)).not.toThrow();
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("records a migration as applied by APPENDING a row — the missing-row repair", async () => {
+		// The one state a name key cannot fix by itself: the log lost a row while the
+		// column that entry created is still in the schema, so the next open would
+		// re-run it and die on `duplicate column`. `doctor --mark-migration` writes the
+		// row back. An append, never an UPDATE — the log stays a log.
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			raw.prepare("DELETE FROM schema_migrations WHERE name = ?").run("TOOL_CALL_TIME_DDL");
+			expect(recordMigrationAsApplied(raw, "TOOL_CALL_TIME_DDL", { appliedBy: "test/1.0" })).toBe(true);
+			const rows = readMigrationLog(raw)?.filter((r) => r.name === "TOOL_CALL_TIME_DDL");
+			expect(rows).toHaveLength(1);
+			expect(rows?.[0]?.applied_by).toBe("test/1.0");
+			// A name this build does not carry has no DDL to record.
+			expect(recordMigrationAsApplied(raw, "NOT_A_MIGRATION")).toBe(false);
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("reports a log table it cannot READ as unreadable, never as absent", async () => {
+		// The state the whole table exists to diagnose. Answering `none` here sends the
+		// reader looking for a database that predates the log — and makes the migration
+		// pass believe the version stamp is trustworthy evidence.
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			raw.exec("ALTER TABLE schema_migrations RENAME COLUMN ddl TO ddl_moved_by_another_build");
+			const state = readMigrationLogState(raw);
+			expect(state.kind).toBe("unreadable");
+			if (state.kind === "unreadable") expect(state.reason).toContain("ddl");
+			// The convenience wrapper still collapses both to undefined — callers that act
+			// on the difference are the ones that must ask for the state.
+			expect(readMigrationLog(raw)).toBeUndefined();
+			// Nothing may throw over it, and nothing may be written into it.
+			expect(() => verifyMigrationLog(raw)).not.toThrow();
+			expect(recordMigrationAsApplied(raw, "TOOL_CALL_TIME_DDL")).toBe(false);
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("reports a database that cannot answer AT ALL as unreadable, never as pre-log", async () => {
+		// A garbage or truncated file opens fine — SQLite reads no page until the first
+		// statement — so the failure lands on the table-existence probe. Answering
+		// "absent" for a probe that itself failed reported a corrupt database as "no
+		// migration log yet", i.e. the pre-log message, to the one reader who cannot act
+		// on it. `tableConfirmed` is what keeps the two apart.
+		const { writeFileSync } = await import("node:fs");
+		writeFileSync(dbPath, "this is not a database");
+		const raw = await rawDb(dbPath);
+		try {
+			const state = readMigrationLogState(raw);
+			expect(state.kind).toBe("unreadable");
+			if (state.kind === "unreadable") expect(state.tableConfirmed).toBe(false);
+			expect(() => verifyMigrationLog(raw)).not.toThrow();
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("migrates from the version stamp over a damaged log, warns, and seeds NOTHING", async () => {
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		const lines: string[] = [];
+		const spy = vi
+			.spyOn(console, "warn")
+			.mockImplementation((...a: unknown[]) => void lines.push(a.map(String).join(" ")));
+		const countRows = () => (raw.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get() as { n: number }).n;
+		try {
+			const before = countRows();
+			raw.exec("ALTER TABLE schema_migrations RENAME COLUMN name TO name_moved_by_another_build");
+			expect(() => migrateDashboardDb(raw, { appliedBy: "test/1.0" })).not.toThrow();
+			// Writing inference into a table whose shape this build cannot read is how a
+			// half-written log gets manufactured; the row count is untouched.
+			expect(countRows()).toBe(before);
+		} finally {
+			spy.mockRestore();
+			raw.close();
+		}
+		expect(lines.filter((l) => l.includes("could not be read"))).toHaveLength(1);
+	});
+});
+
+describe("withRepairDashboardDb", () => {
+	it("refuses nothing — its whole job is skipping the migration pass", async () => {
+		// Not a bypass around a gate any more (there is none). The pass is the thing it
+		// must skip: `--mark-migration` repairs a database whose log lost a row, and a
+		// pass would re-run that entry into `duplicate column` before the repair ran.
+		await withDashboardDb(() => undefined, { dbPath });
+		await stampSchema(dbPath, 999);
+		await expect(withRepairDashboardDb(() => "ok", { dbPath })).resolves.toBe("ok");
+	});
+
+	it("does not migrate, so it cannot repair by moving the thing under repair", async () => {
+		await buildLegacyDb(dbPath, 5);
+		await withRepairDashboardDb(() => undefined, { dbPath });
+		await expect(withReadonlyDashboardDb(readSchemaVersion, { dbPath })).resolves.toBe(5);
+	});
+});
+
+describe("edges of the version reader", () => {
+	it("reads a database with no schema_meta at all as version 0", async () => {
+		const raw = await rawDb(dbPath);
+		try {
+			expect(readSchemaVersion(raw)).toBe(0);
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("skips silently when a rival bumps the version of a PRE-LOG database", async () => {
+		// The one skip that cannot be recorded: there is no log table yet, so the
+		// version stamp is both the fence and the only evidence. Staged by making the
+		// in-lock version read (the second one) answer higher, which is exactly what a
+		// rival writer's commit looks like from inside BEGIN IMMEDIATE.
+		await buildLegacyDb(dbPath, 5);
+		const raw = await rawDb(dbPath);
+		try {
+			let versionReads = 0;
+			const patched: DashboardDbHandle = {
+				exec: (sql) => raw.exec(sql),
+				close: () => raw.close(),
+				prepare: (sql) => {
+					const stmt = raw.prepare(sql);
+					if (!sql.includes("'schema_version'")) return stmt;
+					return {
+						all: (...p) => stmt.all(...p),
+						run: (...p) => stmt.run(...p),
+						get: (...p) => {
+							versionReads += 1;
+							return versionReads === 1 ? stmt.get(...p) : { value: "99" };
+						},
+					};
+				},
+			};
+			migrateDashboardDb(patched, { appliedBy: "test/1.0" });
+			// Nothing ran, and nothing claims to have: the log table still does not exist.
+			expect(readMigrationLog(raw)).toBeUndefined();
+		} finally {
+			raw.close();
+		}
 	});
 });

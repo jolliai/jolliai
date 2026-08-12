@@ -1758,10 +1758,16 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			const entry = registry.repos.find((r) => r.repoIdentity === repoIdentity);
 			if (!entry) return undefined;
 			const dbOpts = options.dbPath ? { dbPath: options.dbPath } : {};
+			// ONE reason to stand down, and it is not about compatibility: a writable
+			// open MIGRATES, and this long-lived process is the wrong one to do that
+			// (see the module header). A file AHEAD of this build is written to
+			// normally — the database refuses nobody, see the compatibility note in
+			// `DashboardDb`. The exact-equality test this replaces also degraded the
+			// list whenever the file was merely newer.
 			const found = await withReadonlyDashboardDb(readSchemaVersion, dbOpts);
-			if (found !== DASHBOARD_SCHEMA_VERSION) {
+			if (found < DASHBOARD_SCHEMA_VERSION) {
 				log.info(
-					"skipping registry projection: database schema v%d != this build's v%d",
+					"skipping registry projection: database schema v%d predates this build's v%d",
 					found,
 					DASHBOARD_SCHEMA_VERSION,
 				);

@@ -52,7 +52,7 @@ import { SqliteStorage } from "../core/SqliteStorage.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
 import type { CutoverRecord } from "./CutoverRouter.js";
-import { DashboardSchemaAheadError, inTransaction, withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
+import { inTransaction, withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
 import { existingWorktrees, type RegisteredRepo, readRepoRegistry, resolveRepoIdentityForCwd } from "./RepoRegistry.js";
 import { countMemoriesAbsentFromListing, importRepoMemory } from "./SotImport.js";
 
@@ -199,7 +199,7 @@ function summariesEquivalent(a: string, b: string): boolean {
  * only thing the user needs is that re-running finishes the CAS.
  */
 function importOrCompareFailure(err: unknown, fenced: boolean): string {
-	const detail = err instanceof DashboardSchemaAheadError ? errMsg(err) : `import/compare failed: ${errMsg(err)}`;
+	const detail = `import/compare failed: ${errMsg(err)}`;
 	return fenced ? `${detail} — this repo is legacy-fenced; re-run \`jolli cutover\` to finish` : detail;
 }
 
@@ -444,29 +444,21 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 	if (!repo) return { status: "not-ready", reason: "repo is not registered — run jolli enable first" };
 
 	const dbOpts = opts.dbPath ? { dbPath: opts.dbPath } : {};
-	// A database written by a NEWER build cannot be migrated down, so every
-	// writable open throws — including the CAS this cutover would end with.
-	// That is a readiness fact, not a crash: `resolveCutoverRoute` already
-	// reports it as a warning on the read side, and letting the raw error escape
-	// here made `jolli cutover` print a stack trace and do nothing, which reads
-	// as "the command has no effect". Caught around the FIRST open only: if this
-	// one succeeds, no later open in this run can hit the condition.
-	let alreadyCommitted: boolean;
-	try {
-		alreadyCommitted = await withDashboardDb((db) => {
-			const row = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as
-				| { id: number }
-				| undefined;
-			if (!row) return false;
-			return (
-				db.prepare("SELECT 1 AS ok FROM repo_state WHERE repo_id = ? AND key = 'cutover'").get(row.id) !==
-				undefined
-			);
-		}, dbOpts);
-	} catch (err) {
-		if (err instanceof DashboardSchemaAheadError) return { status: "not-ready", reason: errMsg(err) };
-		throw err;
-	}
+	// No try/catch here, and its absence is the point: this open used to be wrapped
+	// because a database written by a newer build made EVERY writable open throw,
+	// which turned `jolli cutover` into a stack trace that changed nothing. The
+	// database no longer refuses a build over its version (see the compatibility
+	// note in `DashboardDb`), so the only errors left are real I/O faults, and those
+	// should propagate.
+	const alreadyCommitted = await withDashboardDb((db) => {
+		const row = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as
+			| { id: number }
+			| undefined;
+		if (!row) return false;
+		return (
+			db.prepare("SELECT 1 AS ok FROM repo_state WHERE repo_id = ? AND key = 'cutover'").get(row.id) !== undefined
+		);
+	}, dbOpts);
 	if (alreadyCommitted) return { status: "already-cutover" };
 
 	const roots = await collectSources(repo);
@@ -566,7 +558,7 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 		// costs the regenerated memory with nothing to recover it from.
 		// Steps 2 and 3 answer `not-ready` rather than throwing. On a RETRY they
 		// run with the fence already up, and both can fail for reasons that have
-		// nothing to do with this repo's readiness — `DashboardSchemaAheadError`, a
+		// nothing to do with this repo's readiness — a
 		// concurrent QueueWorker holding the writer past `busy_timeout`, a git read
 		// failure. Letting that escape lands in `CutoverCommand`'s uncaught
 		// commander action: a stack trace, and no word to the user that the repo is
@@ -689,7 +681,9 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 				// The transaction itself can throw — `BEGIN IMMEDIATE` raises
 				// "database is locked" whenever another writer (a hook, `jolli
 				// enable`) holds SQLite's writer lock past `busy_timeout`, and a
-				// schema-ahead handle throws outright. This was the ONE post-fence
+				// migration entry can fail on a damaged file. (A schema-ahead file is
+				// NOT one of these: there is no version gate, so a newer format opens
+				// and writes normally — see `DASHBOARD_SCHEMA_VERSION`.) This was the ONE post-fence
 				// step with no error handling, which defeats the policy the lock
 				// timeout and the null-row check below both spell out: after the
 				// fence is up, every exit must be a CutoverOutcome carrying the

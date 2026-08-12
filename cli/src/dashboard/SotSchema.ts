@@ -515,6 +515,74 @@ ALTER TABLE session_tool_use ADD COLUMN last_call_at_ms INTEGER;
  */
 
 /**
+ * The migration log — "who ran what, when, and how did it go".
+ *
+ * A LOG, not a set of booleans, which is what fixes the table shape: the primary
+ * key is an autoincrementing sequence because one migration can be touched more
+ * than once (skipped by a loser writer, later applied; re-applied after a
+ * snapshot restore), and every touch is worth keeping. `schema_meta` is the
+ * wrong home for exactly that reason — it is a whole-database singleton (one key,
+ * one value) and both its columns are TEXT, so `seq`/`applied_at_ms` would
+ * degrade to strings and `ORDER BY seq` to lexicographic order.
+ *
+ * NOT `WITHOUT ROWID`, unlike its neighbours: `AUTOINCREMENT` requires a rowid,
+ * and the table would simply fail to create.
+ *
+ * The columns each stop a different failure, and none is decorative:
+ *
+ *  - `name` is the IDENTITY of a migration — the exported DDL constant's name,
+ *    not its position in the array. Position as identity is what let two
+ *    unmerged branches both claim index 5, so that the one merged second was
+ *    silently never executed while the file was stamped as fully migrated. Under
+ *    a name key that conflict does not exist: whichever entries are missing get
+ *    applied. The cost is that a name is a PERMANENT identifier — renaming one
+ *    reads as "never ran" and re-runs it into `duplicate column`.
+ *  - `outcome = 'skipped'` records the concurrency skip that used to leave no
+ *    trace at all. That is the row the bug above would have been diagnosed from.
+ *  - `outcome = 'failed'` is written OUTSIDE the migration's transaction, after
+ *    the rollback — inside it the row would roll back with the change it
+ *    describes, which is precisely when a trace is most needed (most callers of
+ *    `withDashboardDb` swallow the exception, so the user may see no log at all).
+ *  - `outcome = 'baseline'` marks a SEEDED row: a database that predates this
+ *    table has no log, so its first upgrade writes one row per already-applied
+ *    entry. Those rows are a guess about which DDL actually ran (Flyway calls
+ *    this taking over an existing database, and uses the same word), so they say
+ *    so rather than claiming to be observations.
+ *  - `ddl` stores the statement text VERBATIM, which no server-side migration
+ *    tool does — they record a script name because the script is in the version
+ *    control the operator is standing in. Here the DDL that ran may have come
+ *    from a branch that was never merged, or has since been deleted, and the
+ *    user's machine has no repository to consult. It doubles as the drift check:
+ *    a byte compare against the current constant needs no checksum column (the
+ *    DDL constants interpolate nothing at runtime, so the comparison is exact),
+ *    and reading all of it measured 0.033 ms against 0.014 ms without.
+ *  - `duration_ms` is operational: the baseline entry alone is ~37 KB and ~130
+ *    objects, and a future entry that rebuilds a large table can take tens of
+ *    seconds on a large database — which the user experiences as "startup hung".
+ *
+ * It is evidence, NOT a recovery source: it records what DID run, which cannot
+ * be inverted into what SHOULD have. Do not build a "replay the log to repair"
+ * tool on it.
+ */
+export const SCHEMA_MIGRATIONS_DDL = `
+CREATE TABLE schema_migrations (
+  seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+  -- Which array position it ran at. DIAGNOSTIC ONLY — nothing decides anything
+  -- from it. Kept because "slot 5" is what a bug report says out loud.
+  slot          INTEGER NOT NULL,
+  name          TEXT    NOT NULL,
+  outcome       TEXT    NOT NULL CHECK (outcome IN ('applied','failed','skipped','baseline')),
+  -- \`JOLLI_CLIENT_HEADER\` — '<kind>/<version>', e.g. 'cli/0.99.11' or
+  -- 'vscode-plugin/0.99.11'. The surface identity the user would go and upgrade.
+  applied_by    TEXT    NOT NULL,
+  applied_at_ms INTEGER NOT NULL,
+  duration_ms   INTEGER NOT NULL,
+  ddl           TEXT    NOT NULL
+) STRICT;
+CREATE INDEX ix_schema_migrations_name ON schema_migrations(name, seq);
+`;
+
+/**
  * The memory tables, `context`, plan progress and the topic KB.
  *
  * Applied as one statement batch inside the caller's transaction. Ordering

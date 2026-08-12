@@ -32,12 +32,7 @@ import { createHash } from "node:crypto";
 
 import { isPidAlive } from "../core/LockPrimitives.js";
 import { createLogger, errMsg } from "../Logger.js";
-import {
-	canUseDashboardDb,
-	DASHBOARD_SCHEMA_VERSION,
-	type DashboardDbHandle,
-	getDashboardDbPath,
-} from "./DashboardDb.js";
+import { canUseDashboardDb, type DashboardDbHandle, getDashboardDbPath } from "./DashboardDb.js";
 import { classifyDbFiles } from "./DbDetection.js";
 import { resolveRepoIdentityForCwd } from "./RepoRegistry.js";
 
@@ -193,15 +188,10 @@ export async function readImportState(
 		const { DatabaseSync } = await import("node:sqlite");
 		const db = new DatabaseSync(dbPath, { readOnly: true });
 		try {
-			const version = db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as
-				| { value: string }
-				| undefined;
-			if (version && Number(version.value) > DASHBOARD_SCHEMA_VERSION) {
-				return {
-					kind: "unavailable",
-					reason: `database schema v${version.value} is newer than this build's v${DASHBOARD_SCHEMA_VERSION} — upgrade this surface`,
-				};
-			}
+			// NO version or compatibility check, deliberately: this row is plain JSON
+			// in `repo_state` and a newer format does not make it unreadable. Reporting
+			// `unavailable` over a version number hid a migration verdict the user can
+			// act on. See the compatibility note above `DASHBOARD_SCHEMA_VERSION`.
 			const { identity } = await resolveRepoIdentityForCwd(cwd);
 			const repo = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as
 				| { id: number }

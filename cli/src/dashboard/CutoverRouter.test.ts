@@ -145,15 +145,16 @@ describe("resolveCutoverRoute", () => {
 		expect((route as { reason: string }).reason).toContain("doctor --recover");
 	});
 
-	it("a schema from the future is unavailable: blocked when fenced", async () => {
+	it("a format from the future is still answered — no version gate left", async () => {
+		// This used to report `unavailable`, which for a FENCED repo means `blocked`:
+		// writes had nowhere to go because one surface was a version behind. The row
+		// is plain JSON in `repo_state` and reads fine, so the answer is the real one.
 		await withDashboardDb(
 			(db) => db.prepare("UPDATE schema_meta SET value = '99' WHERE key = 'schema_version'").run(),
 			{ dbPath },
 		);
 		await writeCutoverFence(cwd, FENCE);
-		const route = await resolveCutoverRoute(cwd, { dbPath });
-		expect(route.state).toBe("blocked");
-		expect((route as { reason: string }).reason).toContain("upgrade this surface");
+		expect((await resolveCutoverRoute(cwd, { dbPath })).state).toBe("legacy-fenced");
 	});
 });
 

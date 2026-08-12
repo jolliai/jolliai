@@ -23,7 +23,7 @@
 
 import { readCutoverFence } from "../core/RepoProfile.js";
 import { createLogger, errMsg } from "../Logger.js";
-import { canUseDashboardDb, DASHBOARD_SCHEMA_VERSION, getDashboardDbPath } from "./DashboardDb.js";
+import { canUseDashboardDb, getDashboardDbPath } from "./DashboardDb.js";
 import { classifyDbFiles } from "./DbDetection.js";
 import { resolveRepoIdentityForCwd } from "./RepoRegistry.js";
 
@@ -97,15 +97,13 @@ async function readCutoverRow(cwd: string, dbPath: string): Promise<DbAnswer> {
 		const { DatabaseSync } = await import("node:sqlite");
 		const db = new DatabaseSync(dbPath, { readOnly: true });
 		try {
-			const version = db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as
-				| { value: string }
-				| undefined;
-			if (version && Number(version.value) > DASHBOARD_SCHEMA_VERSION) {
-				return {
-					kind: "unavailable",
-					reason: `database schema v${version.value} is newer than this build's v${DASHBOARD_SCHEMA_VERSION} — upgrade this surface`,
-				};
-			}
+			// NO version or compatibility check here, and its absence is the decision:
+			// a file whose format is ahead of this build still answers this question
+			// correctly (the `cutover` row is plain JSON in `repo_state`), and
+			// answering "cannot ask" instead used to route a cut-over repo's writes
+			// back onto its frozen orphan branch — the exact loss the protocol exists
+			// to prevent. Compatibility is a release-line concern; see the note above
+			// `DASHBOARD_SCHEMA_VERSION`.
 			const identity = await cachedIdentity(cwd);
 			const repo = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as
 				| { id: number }

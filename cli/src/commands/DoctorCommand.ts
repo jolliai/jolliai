@@ -23,6 +23,19 @@ import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfi
 import { resolveSotBackend } from "../core/SotStorageResolver.js";
 import { backupHealthCheck } from "../dashboard/Backup.js";
 import {
+	canUseDashboardDb,
+	findDriftedMigrations,
+	getDashboardDbPath,
+	inTransaction,
+	type MigrationLogRow,
+	type MigrationLogState,
+	readMigrationLogState,
+	recordMigrationAsApplied,
+	withReadonlyDashboardDb,
+	withRepairDashboardDb,
+} from "../dashboard/DashboardDb.js";
+import { classifyDbFiles } from "../dashboard/DbDetection.js";
+import {
 	fillMemoriesFromFrozenOrphans,
 	fillMemoriesFromMirrors,
 	restoreFromSnapshot,
@@ -446,6 +459,210 @@ export async function runRecover(fromPath?: string, force?: boolean): Promise<vo
 	}
 }
 
+/**
+ * `doctor --schema-log` — the "who ran what, when, and how did it go" report, plus
+ * the one repair that is still reachable.
+ *
+ * The listing prints `skipped` / `failed` rows alongside the successful ones, which
+ * is the whole reason those outcomes are recorded: a migration that was stepped
+ * over, or that threw inside a transaction that then rolled its own trace away, is
+ * otherwise invisible to everyone including us. Drifted names are called out at the
+ * end — a warning at runtime (see `verifyMigrationLog`), reported here.
+ *
+ * There is deliberately no `--accept-schema-ddl` any more. It existed to unblock a
+ * drift error, and drift no longer blocks anything, so an "accept" would write a
+ * row that changes nothing. `--mark-migration` survives because it fixes a
+ * different state, and the only one a name key cannot fix by itself: the log lost a
+ * row while the column or table that entry created is still in the schema, so the
+ * next open would re-run it and die on `duplicate column`. Flyway's `repair` covers
+ * the same case.
+ */
+/**
+ * What `--schema-log` found, with a FOURTH answer the storage layer cannot give:
+ * the database itself could not be opened or read.
+ *
+ * That answer has to exist here, because collapsing it into `none` is the same
+ * mistake `MigrationLogState` was split to avoid, one level further out. A corrupt
+ * file, a permission problem, a sidecars-only recovery state and a locked database
+ * all arrive as a thrown open — and reporting those as "this database predates the
+ * log — run any Jolli command that writes first" points the reader at the one
+ * explanation that is definitely wrong, from the command whose whole job is to
+ * diagnose a damaged log.
+ *
+ * A database that does not exist yet stays `none`, not `open-failed`: that is a
+ * normal, non-faulty state, and a readonly open of a missing file throws like any
+ * other failure — so the file check is the only thing that tells the two apart.
+ *
+ * The drifted list rides along on `rows` so the whole report comes out of ONE open.
+ * Two opens could disagree (the second one failing left the drift section silently
+ * absent, which reads as "no drift").
+ */
+type SchemaLogRead =
+	| (Extract<MigrationLogState, { kind: "rows" }> & { readonly drifted: ReadonlyArray<MigrationLogRow> })
+	| Exclude<MigrationLogState, { kind: "rows" }>
+	| { readonly kind: "open-failed"; readonly reason: string }
+	| { readonly kind: "sidecars-only" };
+
+/** Reads the log, mapping an open/read failure to `open-failed` rather than `none`. */
+async function readSchemaLogState(): Promise<SchemaLogRead> {
+	try {
+		return await withReadonlyDashboardDb((db): SchemaLogRead => {
+			const state = readMigrationLogState(db);
+			return state.kind === "rows" ? { ...state, drifted: findDriftedMigrations(db) } : state;
+		});
+	} catch (err) {
+		// A failed open has THREE shapes, and only the file combination tells them
+		// apart — `existsSync` on the `.db` alone cannot (see DbDetection): an
+		// `absent` triplet is the normal pre-log / not-created-yet case (`none`);
+		// sidecars without the `.db` is the one recovery alarm and must NOT collapse
+		// into `none`; anything else (the file is present but corrupt, locked or
+		// permission-denied) is a genuine open fault.
+		const files = classifyDbFiles(getDashboardDbPath());
+		if (files === "absent") return { kind: "none" };
+		if (files === "alarm-sidecars-only") return { kind: "sidecars-only" };
+		return { kind: "open-failed", reason: err instanceof Error ? err.message : String(err) };
+	}
+}
+
+/**
+ * Why `--mark-migration <name>` recorded nothing. Four answers, and the user can act
+ * on the difference between all four — which is the only reason `readSchemaLogState`
+ * is re-read after the repair returns false.
+ */
+function whyNothingWasRecorded(name: string, state: SchemaLogRead): string {
+	if (state.kind === "rows") return `\nUnknown migration: ${name} — this build carries no DDL under that name.`;
+	if (state.kind === "none")
+		return "\nThis database has no migration log yet — run any Jolli command that writes first.";
+	if (state.kind === "sidecars-only")
+		return (
+			"\nThe database file is gone but its -wal/-shm sidecars remain — it was deleted\n" +
+			"    out from under a live database. Nothing was recorded; run `jolli doctor --recover`."
+		);
+	if (state.kind === "unreadable" && state.tableConfirmed) {
+		return (
+			`\nThe migration log exists but could not be read: ${state.reason}\n` +
+			"    This build cannot record into it; the schema_migrations table is damaged."
+		);
+	}
+	return (
+		`\nThe database could not be read: ${state.reason}\n` +
+		"    Nothing was recorded. This is not a missing log — the file itself is unreadable."
+	);
+}
+
+export async function runSchemaLog(action: { mark?: string }): Promise<void> {
+	if (!canUseDashboardDb()) {
+		// The diagnostic could not run at all — a fault from a script's point of view,
+		// so exit non-zero like every other "could not read" path. This is NOT the
+		// benign `none` case (an empty log the command DID inspect), which stays exit 0.
+		console.error(`\nDatabase schema: this runtime (Node ${process.versions.node}) cannot open the database.`);
+		process.exitCode = 1;
+		return;
+	}
+	if (action.mark) {
+		// Classify by the file COMBINATION first, and never open to create. The repair's
+		// open is writable, and a writable `node:sqlite` open CREATES the file — so on a
+		// machine that has never run Jolli this command used to manufacture an empty
+		// database and then report that there was no log in it. A diagnostic must not
+		// create the artifact it is diagnosing. `existsSync` on the `.db` alone cannot
+		// tell "nothing has run yet" from the sidecars-only recovery alarm, so use the
+		// same file-combination table the report below relies on (see DbDetection).
+		const files = classifyDbFiles(getDashboardDbPath());
+		if (files === "absent") {
+			console.error("\nThis database does not exist yet — run any Jolli command that writes first.");
+			process.exitCode = 1;
+			return;
+		}
+		if (files === "alarm-sidecars-only") {
+			console.error(whyNothingWasRecorded(action.mark, { kind: "sidecars-only" }));
+			process.exitCode = 1;
+			return;
+		}
+		// A writable open that does NOT migrate — running the pass first is exactly
+		// what this repair is here to avoid. See `withRepairDashboardDb`. The open
+		// itself can still fail (corrupt, locked, permission-denied) on a `.db` that
+		// exists: catch it and fall through to the shared diagnosis below, so the
+		// reader gets the "database could not be read" guidance instead of a raw throw.
+		let marked = false;
+		try {
+			marked = await withRepairDashboardDb((db) =>
+				inTransaction(db, () => recordMigrationAsApplied(db, action.mark as string)),
+			);
+		} catch {
+			marked = false;
+		}
+		if (!marked) {
+			// Four ways to land here, and the user can act on the difference: a name this
+			// build has never carried, a database with no log table to write into, a log
+			// table that exists but cannot be read, or a database that cannot be read at all.
+			const state = await readSchemaLogState();
+			console.error(whyNothingWasRecorded(action.mark, state));
+			process.exitCode = 1;
+			return;
+		}
+		console.log(`\nRecorded ${action.mark} as applied.`);
+	}
+	const state = await readSchemaLogState();
+	// The database itself could not be opened, or could not answer at all. Reported as
+	// a fault, not as an empty log: corruption, a permission problem, a locked file and
+	// a sidecars-only recovery state all land here, and every one of them is something
+	// the reader can act on — while "this database predates the log" is the one
+	// explanation that is certainly wrong.
+	if (state.kind === "open-failed" || (state.kind === "unreadable" && !state.tableConfirmed)) {
+		console.error(
+			`\nMigration log: UNAVAILABLE — the database could not be read.\n` +
+				`  ${state.reason}\n` +
+				"  This is NOT a database that predates the log; the file exists and this build\n" +
+				"  cannot read it. Try `jolli doctor --recover` to survey what can be rebuilt.",
+		);
+		process.exitCode = 1;
+		return;
+	}
+	if (state.kind === "sidecars-only") {
+		// The one recovery alarm: the `.db` was deleted out from under a live database
+		// while its -wal/-shm remain. Reporting it as `none` ("predates the log") is the
+		// exact opposite of the recovery path this state should send the reader to.
+		console.error(
+			"\nMigration log: UNAVAILABLE — the database file is gone but its -wal/-shm\n" +
+				"  sidecars remain, so it was deleted out from under a live database.\n" +
+				"  Try `jolli doctor --recover` to survey what can be rebuilt.",
+		);
+		process.exitCode = 1;
+		return;
+	}
+	if (state.kind === "unreadable") {
+		// The state this report exists for. Saying "none" here would send the reader
+		// looking for a database that predates the log, which this one does not.
+		console.error(
+			`\nMigration log: PRESENT BUT UNREADABLE — ${state.reason}\n` +
+				"  The schema_migrations table is in the schema and this build cannot query it.\n" +
+				"  Writes still work: the migration pass falls back to the schema_version stamp\n" +
+				"  and records nothing, so drift verification is skipped until the table is fixed.",
+		);
+		process.exitCode = 1;
+		return;
+	}
+	if (state.kind === "none") {
+		console.log("\nMigration log: none — this database predates the log (or does not exist yet).");
+		return;
+	}
+	console.log("\nMigration log (oldest first):");
+	for (const row of state.rows) {
+		const when = new Date(row.applied_at_ms).toISOString().replace("T", " ").slice(0, 19);
+		console.log(
+			`  ${String(row.seq).padStart(3)}  slot ${row.slot}  ${row.outcome.padEnd(8)}  ${when}  ` +
+				`${row.applied_by}  ${row.name}  (${row.duration_ms} ms)`,
+		);
+	}
+	const drifted = state.drifted;
+	if (drifted.length > 0) {
+		console.log(
+			`\n  ⚠ Applied by a different build than this one: ${drifted.map((r) => r.name).join(", ")}\n` +
+				"    The database keeps working; this is a diagnostic, not a fault.",
+		);
+	}
+}
+
 /** Registers the `doctor` sub-command on the given Commander program. */
 export function registerDoctorCommand(program: Command): void {
 	program
@@ -454,14 +671,32 @@ export function registerDoctorCommand(program: Command): void {
 		.option("--fix", "Auto-fix detected issues (release stale lock, clear stuck queue, reinstall missing hooks)")
 		.option("--recover", "List database recovery candidates (snapshots with identity and age)")
 		.option("--from <path>", "With --recover: restore the database from this snapshot file")
+		.option("--schema-log", "Print the database's migration log (who ran what, when, and how it went)")
+		.option("--mark-migration <name>", "Record one migration as applied by other means (see --schema-log)")
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
-		.action(async (options: { cwd: string; fix?: boolean; recover?: boolean; from?: string }) => {
-			setLogDir(options.cwd);
-			log.info("Running 'doctor' command");
-			if (options.recover === true) {
-				await runRecover(options.from, options.fix === true);
-				return;
-			}
-			await runDoctor(options.cwd, options.fix === true);
-		});
+		.action(
+			async (options: {
+				cwd: string;
+				fix?: boolean;
+				recover?: boolean;
+				from?: string;
+				schemaLog?: boolean;
+				markMigration?: string;
+			}) => {
+				setLogDir(options.cwd);
+				log.info("Running 'doctor' command");
+				if (options.recover === true) {
+					await runRecover(options.from, options.fix === true);
+					return;
+				}
+				// The repair implies the report, so `--mark-migration` reaches it on its
+				// own — a user who typed it and got silence because they omitted
+				// `--schema-log` would reasonably conclude it did nothing.
+				if (options.schemaLog === true || options.markMigration) {
+					await runSchemaLog({ mark: options.markMigration });
+					return;
+				}
+				await runDoctor(options.cwd, options.fix === true);
+			},
+		);
 }

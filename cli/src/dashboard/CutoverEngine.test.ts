@@ -116,28 +116,25 @@ describe("runCutover", () => {
 		expect(result).toMatchObject({ status: "not-ready", reason: expect.stringContaining("no orphan branch") });
 	});
 
-	it("a database written by a newer build is not-ready, not a crash", async () => {
+	it("a database written by a newer build cuts over normally — no version gate left", async () => {
 		await writeOrphanSummary(HASH, "the memory");
-		// Stamp the schema ahead of this build, the way a dev machine that ran a
-		// later build (or a mid-rollout surface) leaves it. Every writable open
-		// then throws, so the CAS could never land — reporting the reason beats
-		// letting the raw error escape as a stack trace and no state change.
+		// Stamp the format ahead of this build, the way a dev machine that ran a later
+		// build leaves it. This used to make every writable open throw, so the CAS
+		// could never land and the whole repo reported not-ready. The database no
+		// longer refuses anyone, so the cutover simply proceeds.
 		await withDashboardDb(
-			(db) => {
-				db.exec(
-					`INSERT INTO schema_meta (key, value) VALUES ('schema_version', '999')
-				 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-				);
-			},
+			(db) =>
+				db
+					.prepare(
+						`INSERT INTO schema_meta (key, value) VALUES ('schema_version', '999')
+						 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+					)
+					.run(),
 			{ dbPath },
 		);
 
-		const result = await runCutover(cwd, { dbPath });
-
-		expect(result).toMatchObject({ status: "not-ready", reason: expect.stringContaining("newer than this build") });
-		// Nothing moved: no fence, still uncutover.
-		expect(await readCutoverFence(cwd)).toBeNull();
-		expect((await resolveCutoverRoute(cwd, { dbPath })).state).toBe("uncutover");
+		expect((await runCutover(cwd, { dbPath })).status).toBe("committed");
+		expect(await readCutoverFence(cwd)).not.toBeNull();
 	});
 
 	it("imports, compares, fences every source, and commits the CAS", async () => {

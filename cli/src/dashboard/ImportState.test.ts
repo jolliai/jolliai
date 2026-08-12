@@ -102,14 +102,15 @@ describe("readImportState", () => {
 		expect(answer.kind).toBe("unavailable");
 	});
 
-	it("reports unavailable when the schema is newer than this build", async () => {
+	it("still answers when the format is ahead of this build — no version gate left", async () => {
+		// This used to report `unavailable`, which reads as "cannot tell whether this
+		// repo migrated" for a repo that plainly did. The row is JSON in `repo_state`;
+		// a newer format does not make it unreadable.
 		await withDashboardDb(
 			(db) => db.prepare("UPDATE schema_meta SET value = '999' WHERE key = 'schema_version'").run(),
 			{ dbPath },
 		);
-		const answer = await readImportState(cwd, { dbPath });
-		expect(answer.kind).toBe("unavailable");
-		expect((answer as { reason: string }).reason).toContain("999");
+		expect((await readImportState(cwd, { dbPath })).kind).not.toBe("unavailable");
 	});
 
 	it("reports unavailable when the WAL survived but the database did not", async () => {

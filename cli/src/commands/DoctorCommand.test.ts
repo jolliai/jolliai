@@ -336,3 +336,245 @@ describe("doctor --recover", () => {
 		}
 	});
 });
+
+describe("doctor --schema-log", () => {
+	it("prints the log, names a drift, and records a migration whose row went missing", async () => {
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { runSchemaLog } = await import("./DoctorCommand.js");
+		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-schemalog-"));
+		const restoreHome = setIsolatedHome(home);
+		const st = await import("../core/SessionTracker.js");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(join(home, ".jolli", "jollimemory"));
+		const logs: string[] = [];
+		const errs: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation((m) => void logs.push(String(m)));
+		const errSpy = vi.spyOn(console, "error").mockImplementation((m) => void errs.push(String(m)));
+		try {
+			const { withDashboardDb, withRepairDashboardDb } = await import("../dashboard/DashboardDb.js");
+			// No database yet: the report says so instead of failing.
+			await runSchemaLog({});
+			expect(logs.join("\n")).toContain("Migration log: none");
+
+			await withDashboardDb(() => undefined);
+			logs.length = 0;
+			await runSchemaLog({});
+			const listing = logs.join("\n");
+			// The one-SQL answer to "who ran what, when" — the whole diagnostic payoff.
+			expect(listing).toContain("Migration log (oldest first)");
+			expect(listing).toContain("BASELINE_DDL");
+			expect(listing).toContain("applied");
+
+			// Drift is REPORTED, not repaired: it no longer blocks anything, so there is
+			// nothing to unblock and no `--accept-schema-ddl`.
+			await withRepairDashboardDb((db) => {
+				db.prepare("UPDATE schema_migrations SET ddl = 'from an unmerged branch' WHERE name = ?").run(
+					"RECALL_RECEIPTS_DDL",
+				);
+			});
+			logs.length = 0;
+			await runSchemaLog({});
+			expect(logs.join("\n")).toContain("Applied by a different build than this one: RECALL_RECEIPTS_DDL");
+			expect(logs.join("\n")).toContain("not a fault");
+
+			// The one repair left: record a name whose log row went missing, and refuse
+			// a name this build does not carry.
+			await withRepairDashboardDb((db) =>
+				db.prepare("DELETE FROM schema_migrations WHERE name = ?").run("TOOL_CALL_TIME_DDL"),
+			);
+			logs.length = 0;
+			await runSchemaLog({ mark: "TOOL_CALL_TIME_DDL" });
+			expect(logs.join("\n")).toContain("Recorded TOOL_CALL_TIME_DDL as applied.");
+			await runSchemaLog({ mark: "NOT_A_MIGRATION" });
+			expect(errs.join("\n")).toContain("Unknown migration: NOT_A_MIGRATION");
+			expect(process.exitCode).toBe(1);
+			process.exitCode = 0;
+
+			// A log table that EXISTS but cannot be read is the state this report is for.
+			// Reporting it as "none" would send the reader looking for a database that
+			// predates the log — the one thing this file is not.
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+			try {
+				await withRepairDashboardDb((db) =>
+					db.exec("ALTER TABLE schema_migrations RENAME COLUMN ddl TO ddl_moved_by_another_build"),
+				);
+				logs.length = 0;
+				errs.length = 0;
+				await runSchemaLog({});
+				expect(logs.join("\n")).not.toContain("Migration log: none");
+				expect(errs.join("\n")).toContain("PRESENT BUT UNREADABLE");
+				expect(process.exitCode).toBe(1);
+				process.exitCode = 0;
+				// And the repair says which of its two "cannot record" reasons applies.
+				errs.length = 0;
+				await runSchemaLog({ mark: "TOOL_CALL_TIME_DDL" });
+				expect(errs.join("\n")).toContain("The migration log exists but could not be read");
+				expect(process.exitCode).toBe(1);
+				process.exitCode = 0;
+			} finally {
+				warnSpy.mockRestore();
+			}
+		} finally {
+			process.exitCode = 0;
+			logSpy.mockRestore();
+			errSpy.mockRestore();
+			restoreHome();
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it("does not CREATE a database when --mark-migration is run without one", async () => {
+		// A writable `node:sqlite` open creates the file, so the repair used to manufacture
+		// an empty database and then report that it had no log — a diagnostic producing the
+		// artifact it is diagnosing. The existence check has to be read-only and first.
+		const { mkdtempSync, mkdirSync, rmSync, existsSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { runSchemaLog } = await import("./DoctorCommand.js");
+		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-schemalog-nodb-"));
+		const restoreHome = setIsolatedHome(home);
+		const st = await import("../core/SessionTracker.js");
+		const configDir = join(home, ".jolli", "jollimemory");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(configDir);
+		const errs: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+		const errSpy = vi.spyOn(console, "error").mockImplementation((m) => void errs.push(String(m)));
+		try {
+			mkdirSync(configDir, { recursive: true });
+			await runSchemaLog({ mark: "BASELINE_DDL" });
+			expect(errs.join("\n")).toContain("does not exist yet");
+			expect(existsSync(join(configDir, "jollimemory.db"))).toBe(false);
+			expect(process.exitCode).toBe(1);
+		} finally {
+			process.exitCode = 0;
+			logSpy.mockRestore();
+			errSpy.mockRestore();
+			restoreHome();
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it("reports a database it cannot OPEN as unavailable, never as a missing log", async () => {
+		// The opposite of what a diagnostic command should do: corruption, a permission
+		// problem or a sidecars-only recovery state all arrive as a thrown open, and
+		// mapping those onto "this database predates the log — run any Jolli command that
+		// writes first" points the reader at the one explanation that is certainly wrong.
+		const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { runSchemaLog } = await import("./DoctorCommand.js");
+		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-schemalog-broken-"));
+		const restoreHome = setIsolatedHome(home);
+		const st = await import("../core/SessionTracker.js");
+		const configDir = join(home, ".jolli", "jollimemory");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(configDir);
+		const logs: string[] = [];
+		const errs: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation((m) => void logs.push(String(m)));
+		const errSpy = vi.spyOn(console, "error").mockImplementation((m) => void errs.push(String(m)));
+		try {
+			mkdirSync(configDir, { recursive: true });
+			writeFileSync(join(configDir, "jollimemory.db"), "this is not a database");
+			await runSchemaLog({});
+			expect(logs.join("\n")).not.toContain("Migration log: none");
+			expect(errs.join("\n")).toContain("Migration log: UNAVAILABLE");
+			expect(errs.join("\n")).toContain("NOT a database that predates the log");
+			expect(process.exitCode).toBe(1);
+		} finally {
+			process.exitCode = 0;
+			logSpy.mockRestore();
+			errSpy.mockRestore();
+			restoreHome();
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it("--mark-migration DIAGNOSES a database it cannot open instead of throwing", async () => {
+		// The repair's open is writable and unguarded: an existing-but-corrupt (or locked,
+		// or permission-denied) `.db` used to throw straight out of runSchemaLog, so the
+		// "database could not be read" guidance the command was written to print was never
+		// reached. It must degrade to that diagnosis and exit 1, never propagate the throw.
+		const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { runSchemaLog } = await import("./DoctorCommand.js");
+		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-schemalog-markbroken-"));
+		const restoreHome = setIsolatedHome(home);
+		const st = await import("../core/SessionTracker.js");
+		const configDir = join(home, ".jolli", "jollimemory");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(configDir);
+		const errs: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+		const errSpy = vi.spyOn(console, "error").mockImplementation((m) => void errs.push(String(m)));
+		try {
+			mkdirSync(configDir, { recursive: true });
+			writeFileSync(join(configDir, "jollimemory.db"), "this is not a database");
+			// The whole point: the call resolves, it does not reject.
+			await expect(runSchemaLog({ mark: "TOOL_CALL_TIME_DDL" })).resolves.toBeUndefined();
+			expect(errs.join("\n")).toContain("could not be read");
+			expect(errs.join("\n")).not.toContain("does not exist yet");
+			expect(process.exitCode).toBe(1);
+		} finally {
+			process.exitCode = 0;
+			logSpy.mockRestore();
+			errSpy.mockRestore();
+			restoreHome();
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it("routes the sidecars-only recovery state to --recover, never to 'no log yet'", async () => {
+		// `.db` deleted out from under a live database while its -wal/-shm remain is the ONE
+		// recovery alarm (DbDetection). Discriminating on `.db` existence alone collapsed it
+		// into `none` / "does not exist yet" — the opposite of the recovery path — on both
+		// the report and the mark path.
+		const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { runSchemaLog } = await import("./DoctorCommand.js");
+		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-schemalog-sidecars-"));
+		const restoreHome = setIsolatedHome(home);
+		const st = await import("../core/SessionTracker.js");
+		const configDir = join(home, ".jolli", "jollimemory");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(configDir);
+		const logs: string[] = [];
+		const errs: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation((m) => void logs.push(String(m)));
+		const errSpy = vi.spyOn(console, "error").mockImplementation((m) => void errs.push(String(m)));
+		try {
+			mkdirSync(configDir, { recursive: true });
+			// Sidecars present, `.db` absent.
+			writeFileSync(join(configDir, "jollimemory.db-wal"), "wal");
+			writeFileSync(join(configDir, "jollimemory.db-shm"), "shm");
+
+			await runSchemaLog({});
+			expect(logs.join("\n")).not.toContain("Migration log: none");
+			expect(errs.join("\n")).toContain("recover");
+			expect(process.exitCode).toBe(1);
+			process.exitCode = 0;
+
+			errs.length = 0;
+			await runSchemaLog({ mark: "TOOL_CALL_TIME_DDL" });
+			expect(errs.join("\n")).not.toContain("does not exist yet");
+			expect(errs.join("\n")).toContain("recover");
+			expect(process.exitCode).toBe(1);
+		} finally {
+			process.exitCode = 0;
+			logSpy.mockRestore();
+			errSpy.mockRestore();
+			restoreHome();
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it("is reachable from --mark-migration without --schema-log", async () => {
+		// A user who typed it and got silence would reasonably conclude it did nothing.
+		// Asserted as "it did NOT run the ordinary doctor report", because the schema-log
+		// path returns before that — and under this file's mocked HOME it may legitimately
+		// report the missing log on stderr rather than printing a listing.
+		const lines = await runDoctor(["--mark-migration", "BASELINE_DDL"]);
+		expect(lines.join("\n")).not.toContain("Jolli Memory Doctor");
+		process.exitCode = 0;
+	});
+});

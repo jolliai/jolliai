@@ -426,7 +426,7 @@ export async function fillMemoriesFromFrozenOrphans(
 		// unprotected — see `resolveProtectNewerThanMs`.
 		// Per-repo, exactly as in fillMemoriesFromMirrors: this is the LAST
 		// resort in the recovery order, so one repo whose frozen branch cannot
-		// be read (a pruned object, a permission error, a schema-ahead database)
+		// be read (a pruned object, a permission error, a corrupt database)
 		// must not abandon recovery for every repo that still has a good one.
 		try {
 			const result = await withDashboardDb(
