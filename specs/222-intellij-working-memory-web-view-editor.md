@@ -15,7 +15,8 @@ A read-only embedded-browser editor tab that renders "the full memory the next c
 - The embedded-browser body and its graceful fallback when the embedded browser is unavailable.
 - The one-way data gathered for the view: branch, change stats (insertions/deletions/files vs `HEAD`), a detected ticket id, a token-status label, the active-conversation list, the linked-context list, and the changed-file list.
 - The rendered page structure and its fixed copy (title, intro, proposed-title block, token meter, three lists with empty-state rows, privacy note, commit-note, local-first note, and the Commit Memory button).
-- The JS↔host bridge: the page calls a single host function with a JSON command; the host recognizes the `commitMemory` command and runs the AI commit on the UI thread.
+- The JS↔host bridge: the page calls a single host function with a JSON command; the host recognizes `commitMemory` (run the AI commit on the UI thread) and `toggleExclude` (leave a context row in or out of the next memory, off the UI thread).
+- The leave-out toggle on a context row, and the special case the aggregate skills row forces on it.
 - The reload-on-status-change behavior: the page is rebuilt off the UI thread and reloaded whenever project status changes.
 - External-link handling: http/https navigations open in the system browser instead of inside the panel.
 - The theming inputs and their disagreement: the pre-load shell colour taken from the IDE's live editor background, the light/dark palette taken from the widget theme's brightness flag, and the page's own background left at the borrowed stylesheet's dark default.
@@ -31,6 +32,9 @@ A read-only embedded-browser editor tab that renders "the full memory the next c
 - The shared summary CSS theme tokens reused by the page — owned by the summary-view styling; this view only layers extra rules on top.
 - The per-producer logo SVG assets inlined into the page — owned by the icon resource set.
 - The "Review" button that triggers the open — owned by the working-memory section container spec.
+- The file-discard command the same bridge also carries, and the confirmation, git work and editor refresh behind it — owned by the discard spec.
+- Which skills count as still-uncommitted, how the aggregate row's label is composed, and the bridge adapter that answers both — owned by specs 319, 323 and 336.
+- The exclusion store the toggle writes into — owned by spec 188.
 
 ## Data Contracts
 
@@ -75,16 +79,23 @@ The tab is opened by handing a Working Memory virtual file to the IDE's open-fil
 | detected ticket | The first `[A-Z]+-\d+` match found in a context item tagged `L` (Linear) or `J` (Jira), else the first such match in the branch name, else none. |
 | token label | A fixed `N/A tokens` — live sessions carry no token usage in this surface; usage is captured only when the memory is generated at commit time. |
 | conversations | The active-session aggregator's current conversations, each mapped to `(producer, title-or-fallback, message-count)`; on any failure, an empty list. |
-| context | Uncommitted plans and notes on the current branch plus all references (see below). |
+| context | The shared "what the next memory would claim" answer — plans, notes, references and the current leave-out set in one round trip — plus the aggregate skills row from a second (see below). |
 | files | The changed-files query, each split into file name, directory, and a one-letter status (default `M`). |
 
 ### Context-list rules
 
-For each entry in the plans/notes/references registry:
+Each context row carries a tag glyph, a title, the **exclusion kind** it belongs to, the **key** the leave-out toggle writes, and whether it is currently left out. Rows that are left out stay listed, struck through, with an add-back affordance — the view never drops a row because the user unchecked it.
 
-- **Plans**: skipped if ignored, already committed (has a commit hash), on a different non-blank branch, or whose source file no longer exists; otherwise added with tag `P`.
-- **Notes**: skipped if ignored, already committed, or on a different non-blank branch; otherwise added with tag `N`.
-- **References**: always added, with a tag taken from the shared source-presentation table rather than a local mapping — the panel calls that table's `of(source).tag` and uses whatever letter it returns. Every tag is a single letter (Linear `L`, Jira `J`, GitHub `G`, Notion `N`, and so on across all twelve sources), with a neutral `R` for a source this surface's enum does not yet cover. The table and its twelve rows are owned by spec 313.
+The plan / note / reference rows come from the shared "what the next memory would claim" answer, which arrives together with the current leave-out set in one round trip. That answer is deliberately narrower than the browsable Context panel's list, and it already drops plans and notes whose source file is gone; this view applies **no filter of its own**, and in particular no branch filter — uncommitted working-area items follow the user across a checkout and bind to a branch only at commit.
+
+- **Plans**: tag `P`, key = the plan's slug.
+- **Notes**: tag `N`, key = the note's id.
+- **References**: tag from the shared source-presentation table rather than a local mapping — whatever letter that table returns. Every tag is a single letter (Linear `L`, Jira `J`, GitHub `G`, Notion `N`, and so on), with a neutral `R` for a source this surface's enum does not yet cover. The table is owned by spec 313. Key = the reference's map key. The title comes with the payload rather than being looked up here, so the row is not labelled by a second, host-side rule.
+- **Skills**: at most **one** aggregate row for every skill captured this session, tag `S`, appended last and shown only when the set is non-empty. Its figures come from a **second** round trip, deliberately not from the raw skill registry: a skill row survives archival (guarded, not deleted, so a later re-entry is still detectable), so the raw map would list every skill ever used as if it were pending. Its title is the label the shared implementation composes.
+
+**The skills row's key is the empty string**, and that is a contract, not a placeholder: one row stands for every captured skill, so there is no single key to carry. It reads as left-out only when **every** captured skill's key is in the leave-out set, so a partially-excluded set renders as included and the next click excludes the remainder rather than re-including what was already out.
+
+**The letter `S` is overloaded, and on this surface nothing disambiguates it.** Across the product `S` is a snippet note, this skills aggregate, and the Slack reference source; `J` is both Jira and the product's own memory-lookup source; `Z` is both Zoom kinds. The sibling panels tell them apart by the badge's colour — but every tag glyph here renders in one uniform outlined chip with no per-kind hue at all, so a reader of this list has only the letter. (Surprising; observed.)
 
 ### Rendered page (fixed structure and copy)
 
@@ -96,7 +107,7 @@ In order:
 4. Proposed-title block: label `Proposed title` with an `AI` pill, the text "An AI-written commit message is generated when you commit.", and a grid line `Target commit next on <branch>` plus an optional `Detected ticket <id>`.
 5. Token meter: the token label followed by `· captured by this memory`.
 6. Conversations list (count badge), each row = inlined producer logo SVG (dark variant when available) + title + optional `<n> msg(s)`; empty row text `No active conversations in the last 2 days.`
-7. Context list (count badge), each row = tag glyph + title; empty row text `No linked plans, notes, or references.`
+7. Context list (count badge — the number of rendered rows, so the aggregate skills row counts as one), each row = tag glyph + title + the leave-out toggle; empty row text `No linked plans, notes, references, or skills.`
 8. Files list (count badge), each row = file name (monospace) + optional directory subline + a status glyph colored by status; empty row text `No changed files.`
 9. Privacy note about transcripts staying in the repo.
 10. Commit-note explaining the commit covers files only; conversations/context stay local.
@@ -106,8 +117,10 @@ In order:
 ### Bridge protocol
 
 - The host injects a single global function the page can call with a string message.
-- The page's Commit Memory button calls that function with `{"command":"commitMemory"}`.
-- The host parses the message; on command `commitMemory` it runs the AI commit on the UI thread. Any parse failure is logged and ignored. The host always returns an `ok` response.
+- The page's Commit Memory button calls that function with `{"command":"commitMemory"}`; a context row's leave-out toggle calls it with `{"command":"toggleExclude", kind, key, excluded}`. (A file row's discard button uses the same channel; that command is out of scope here.)
+- The host parses the message and dispatches on the command. `commitMemory` runs the AI commit **on the UI thread**, because the first thing it does is open dialogs. `toggleExclude` runs **off** the UI thread, because writing the leave-out set is a cross-process round trip that can take a cold start to answer; it touches no UI itself and hops back for the refresh it triggers.
+- **The `toggleExclude` dispatch guards on the key being present, not on it being non-empty**, which is precisely what lets the aggregate skills row's empty key through. A blank-key guard here would make that row's toggle a silent no-op.
+- Any parse failure is logged and ignored. The host always returns an `ok` response.
 
 ## Behavior
 
@@ -138,6 +151,17 @@ On each status-change fire: rebuild the HTML off the UI thread, then reload it i
 2. The host marshals to the UI thread and resolves the AI-commit action; if absent, nothing happens.
 3. The host builds an action event with an explicit project data context (so the project resolves the same way it would from the tool window) and performs the action.
 
+### Leaving a context row out of the next memory
+
+Off the UI thread:
+
+1. **The aggregate skills row is special-cased on its empty key.** It resolves the current set of captured skills and writes **every** one of their keys in a single bulk operation. Leaving any behind would strand that skill in a state the reader has no affordance to see or change, because the row is the only surface for all of them.
+2. Every other kind writes its single key.
+3. On failure the write is logged and the refresh is skipped, so the row stays showing what the store still holds.
+4. On success the view announces the selection change (so other open reviews reload) and directly refreshes the sidebar panel that mirrors the same state — plans, notes, references and skills all live in one such panel, conversations in another. Those panels listen on a different channel than this announcement, so without the direct refresh a leave-out here would not move their checkboxes, and both must agree because the commit reads the same store all of them write.
+
+**An empty skill-key set is treated as "do nothing", not as "exclude nothing".** The row is only drawn when skills were captured, so an empty resolution means either that the read failed (it degrades to empty rather than reporting failure, so the surrounding failure handling cannot see it) or that a commit in another window archived them between render and click. Writing an empty bulk operation would rewrite the store unchanged and report success — the click would vanish with nothing to explain it. The write is skipped and logged, and the refresh still runs, so the checkbox resyncs or the stale row disappears.
+
 ### Disposal
 
 Remove the status listener, dispose the bridge query handler, and dispose the embedded browser.
@@ -162,13 +186,25 @@ Remove the status listener, dispose the bridge query handler, and dispose the em
   branch ← gitOps.currentBranch ?? "unknown"
   (files, ins, del) ← parse(diff HEAD --shortstat); files ← files>0 ? files : changedFiles.size
   conversations ← aggregator.list().map{...}  (catch → [])
-  context ← uncommitted plans + uncommitted notes (this branch) + all references
+  context ← shared claim-set answer (plans + notes + references + leave-out set)
+            then, when non-empty, one aggregate skills row (second round trip, empty key)
   detectedTicket ← ticket regex over L/J context title, else over branch, else null
   tokenLabel ← "N/A tokens"
   files ← changedFiles().map{name, dir, status}
 
 [status change]
   off-UI: html ← buildHtml(...) ; on-UI: browser.loadHTML(html)
+
+[page → bridge "toggleExclude" {kind, key, excluded}]
+  (key present, possibly empty — an empty key is the skills row)
+  off-UI:
+    [kind == skills] → resolve every captured skill's key
+                        [none resolved] → log; skip the write
+                        [else]          → one bulk write of them all
+    [else]           → write the single key
+    [write failed]   → log; no refresh
+    [ok]             → announce selection change; refresh the mirroring sidebar panel;
+                       reload this review
 
 [page → bridge "commitMemory"]
   on-UI: action ← lookup AI-commit ; if null → no-op
@@ -182,12 +218,14 @@ Remove the status listener, dispose the bridge query handler, and dispose the em
 ## Notable Behavior
 
 - **There is exactly one Working Memory tab per project.** The virtual file's identity is a single constant, so every open collapses to the same tab.
-- **The view is presentational and one-way.** It renders a snapshot; the only write path is the Commit Memory button, which runs the AI-commit action — the page itself edits nothing.
+- **The view is presentational, but no longer strictly one-way.** It renders a snapshot and edits no artifact, yet two of its controls write: the Commit Memory button runs the AI-commit action, and a context row's toggle writes the next memory's leave-out set (a file row's discard is a third, owned elsewhere).
 - **The token label is always `N/A tokens` here.** Live sessions in this surface carry no token usage; the real token count is captured only when the memory is generated at commit time.
 - **Change stats are diff-vs-`HEAD`, staged + unstaged.** The shortstat is parsed textually; when it reports zero files (e.g. only untracked files exist) the file count falls back to the changed-files query, but insertions/deletions remain whatever the shortstat reported (zero in that case).
 - **The detected-ticket heuristic prefers a Linear/Jira context item over the branch name.** It scans the first `L`/`J`-tagged context title first, then the branch. The literal `"L"`/`"J"` comparison is unchanged, but the tags it now compares against come from the shared source table (spec 313), where `J` is deliberately shared by Jira **and** the product's own memory-lookup source — so a Jolli Memory reference can be selected as the "detected ticket" when it sorts first. (Surprising; observed, not intended.)
-- **Context excludes committed and cross-branch plans/notes, but never filters references.** A reference is always listed regardless of branch or commit state.
-- **Plans are also dropped if their source file is gone; notes are not file-existence-checked.** The two kinds have slightly different visibility rules in the context gather.
+- **The context list applies no visibility rule of its own.** Which plans, notes and references the next memory would claim is decided by the shared implementation and arrives as one answer, with the leave-out set riding along; this view renders it. A file-existence check that used to live here was a shared rule restated locally, and it would have gone stale the moment the commit path's own skip condition changed. There is no branch filter either — working-area items follow the reader across a checkout.
+- **One row stands for every captured skill, and it is the only row with no key.** The collapse is deliberate (a session routinely enters a dozen skills and this list cannot absorb a dozen affordance-free rows), and every consequence follows from it: the toggle is all-or-nothing, the row reads as left-out only when every member is, and the bridge's presence-not-emptiness guard is what keeps the empty key from being dropped in transit. (Central design point.)
+- **A partially-excluded skill set renders as included.** The next click then excludes the remainder rather than re-including what was already out, which is the only behaviour that cannot lose a reader's earlier decision through a row that shows one aggregate state for many items.
+- **The skills row costs an extra round trip that the rest of the list does not.** Plans, notes, references and the leave-out set arrive together; skills are fetched separately, and deliberately not read off the raw registry, because a skill row survives archival and the raw map would present every skill ever used as pending.
 - **External links escape the panel.** http/https navigation opens in the system browser; the embedded page never navigates away.
 - **The Commit Memory bridge supplies an explicit project context.** Invoking the action from the embedded panel's own component context could resolve a null project; the host therefore builds the event with the project data context directly.
 - **The page reuses the shared summary theme tokens** and layers working-memory-specific rules on top, so it visually matches the memory-summary and PR web views.
@@ -202,7 +240,9 @@ Remove the status listener, dispose the bridge query handler, and dispose the em
 
 - **AI-commit action** — run by the Commit Memory button; its own spec.
 - **Active-session aggregator** — supplies the conversation list.
-- **Plans/notes/references registry** — supplies the context list.
+- **Shared working-context answer** — supplies the plan / note / reference rows and the leave-out set in one round trip, and owns every rule about which of them the next memory would claim.
+- **Skills projection and its aggregate label** (specs 319, 323) reached through the bridge adapter (spec 336) — supplies the single skills row and its title.
+- **Exclusion selection store** (spec 188) — the destination of the leave-out toggle; the live CONTEXT panel (spec 132) writes the same keys and is refreshed directly by this view.
 - **Git wrapper** — supplies the branch and the shortstat diff parsed for change stats.
 - **Project service** — supplies the changed-files query, the working directory, and the status listener that drives reloads.
 - **Shared summary CSS theme** — the base styling the page layers onto.

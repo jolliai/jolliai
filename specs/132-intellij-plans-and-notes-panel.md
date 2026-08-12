@@ -1,267 +1,256 @@
-# IntelliJ PLANS & NOTES Panel
+# 132. IntelliJ CONTEXT Panel
 
 ## Topic Statement
 
-The PLANS & NOTES section of the JolliMemory tool window — a single newest-first list that merges Claude Code plans (auto-recorded by the Stop hook) with user-created notes (markdown files or inline snippets), tags each row with an icon that distinguishes plan from markdown-note from snippet-note and from "committed" (locked), prefixes committed rows with their short commit hash, opens the underlying file in an IDE editor on double-click, and exposes a single per-row trash affordance plus right-click and keyboard delete paths that ask for confirmation before removing.
+The CONTEXT section of the JolliMemory tool window — a single newest-first list that merges plans, notes, external references and **one aggregate row standing for every skill captured this session**, rendering each as a coloured letter badge plus a wrapping title, revealing a per-row action cluster on hover, opening a read-only rendered preview on click, and writing the next memory's leave-out set from the row's toggle — where every question about *what the data means* (which rows are visible, what removing one destroys, which skills are still uncommitted, how the skills row is labelled) is answered by a cross-process round trip to the shared implementation rather than by any rule restated in this panel.
 
 ## Scope
 
 **In scope:**
-- The two source registries the panel reads from on every refresh (the plans registry and the notes registry).
-- The merge order: newest `lastModified` first.
-- The icon set per row (plan-uncommitted, plan-committed, markdown-note-uncommitted, snippet-note-uncommitted, note-committed) and the per-icon meaning.
-- The title rendering: plain title when uncommitted; `<8-char short hash> · <title>` when committed.
-- The right-side meta label (edit count for plans; format word for notes) and the tooltip text per row.
-- The trash icon on the right edge of every row, its 30-pixel click zone, and the hand cursor on hover.
-- The double-click action to open the underlying file (plan: home-directory plans folder or project-state-directory plans folder; note: project-state-directory notes folder).
-- The right-click context menu with a single `Remove` item.
-- The Delete and Backspace key bindings on the focused list, both routed to the same remove flow.
-- The remove-confirmation dialog (`Remove plan "X"?` / `Remove note "X"?`).
-- The remove semantics that differ between plans (soft delete via `ignored = true`) and notes (full registry removal plus optional source-file deletion for uncommitted snippet notes).
-- The visibility filter that hides plans/notes whose source file no longer exists, whose archive guard says the file is unchanged from its committed snapshot, or whose entry is the committed-snapshot copy that exists only for storage.
-- The empty / disabled / initializing placeholder states.
-- The post-action refresh that runs on the project's status listener so the panel re-renders whenever a hook fires or a commit is made.
+
+- The two round trips a repaint makes: one that returns plans, notes, references and the leave-out set together, and a second for the active-skills projection.
+- The merge order (newest-modified first) and the row cap with its "Show N more" expander.
+- The four row kinds, their badge letters and accent colours, and the letter collisions across the corpus.
+- Title rendering per kind, including the committed short-hash prefix on plan and note rows and the CLI-supplied label on the skills row.
+- The per-row hover action cluster (pin, edit, remove, leave-out toggle) and the skills row's reduced cluster.
+- The leave-out toggle: which key each kind writes, why the skills row writes every key at once, the struck-through rendering, and the failure dialogs.
+- Row click → rendered preview; the edit action → the file's source; the right-click menu per kind.
+- The delayed hover card per kind, including the skills card's ordering, cap, overflow line, em-dash rule and footnote.
+- The remove flow: confirmation, the CLI-side removal, the failure dialog, and the working-context refresh that follows.
+- The placeholder states and the refresh sources that drive them, including what a failed refresh renders.
+- The paths that exist but cannot be reached: pin / edit / remove on the skills row, and this panel's select-all.
 
 **Out of scope:**
-- The Stop hook that writes the plans registry — separate spec.
-- The note-creation form / editor — separate spec.
-- The summary viewer that opens for a row's commit hash — this panel does not open it; only the file itself opens.
-- The plan-archival logic that promotes a live plan into a committed snapshot — separate spec.
-- The content-hashing / archive-guard logic that the visibility filter consults — owned by core; this panel only calls the filter.
-- The actual on-disk format of plan or note files.
+
+- The visibility rules themselves (which plan or note rows are browsable at all) and the delete semantics (whether removing a row also unlinks its backing file) — both are decided by the shared implementation this panel calls.
+- Which skills count as uncommitted, how their counters accumulate, and what an archive snapshot means.
+- The aggregate skills table's own rendering — columns, ordering, dashes, markers — and the summary label's format.
+- The exclusion file's format, locking and versioning.
+- The bridge adapter that serves this panel its skills data (its degrade-vs-throw split and its serialization obligations).
+- The section toolbar's "Add" action and the plan/note creation form.
+- The letter tags, brand colours and display-title rule for reference sources.
+- The commits panel's committed CONTEXT group, which renders its own aggregate skills row.
 
 ## Data Contracts
 
-### Two source registries, one merged list
+### Row kinds
 
-The panel always renders a single flat list whose items are drawn from two registries living in the project state directory:
+| Kind | Payload | Sort timestamp |
+| --- | --- | --- |
+| Plan | The shared display projection of one plan row (slug, filename, file path, title, timestamps, commit hash). | The projection's last-modified value. |
+| Note | The shared display projection of one note row (id, title, format, timestamps, commit hash, optional file path). | The projection's last-modified value. |
+| Reference | One registry row plus its `<source>:<nativeId>` key. | The row's updated-at value. |
+| Skills (aggregate) | The whole active-skills answer: the projected rows, the CLI-supplied summary label, and derived "is empty" / "any inferred" / "exclusion keys" views over them. | The **newest** member's last-modified value, or the empty string when the set is empty. |
 
-| Source       | Registry                                       | Item type   |
-| ------------ | ---------------------------------------------- | ----------- |
-| Plans        | The plans-registry file in the state directory | Plan entry  |
-| Notes        | The notes-registry file in the state directory | Note entry  |
+There is at most one skills row however many skills were captured. The other three kinds carry exactly one artifact each.
 
-Each item is wrapped into a unified row carrying its title and a `lastModified` timestamp. The panel sorts the merged list by `lastModified` descending (newest first). When two rows have identical `lastModified`, plans render before notes.
+### Badges
 
-### Per-row data
+| Kind | Letter | Colour |
+| --- | --- | --- |
+| Plan | `P` | blue |
+| Markdown note | `N` | green |
+| Snippet note | `S` | amber |
+| Reference | from the shared source-presentation table | from that table |
+| Skills aggregate | `S` | purple |
 
-| Field          | Plan                                                            | Note                                                         |
-| -------------- | --------------------------------------------------------------- | ------------------------------------------------------------ |
-| Title          | Plan's title (or its slug if title is blank).                   | Note's title.                                                |
-| Last modified  | Plan's `updatedAt`.                                             | Note's `updatedAt`.                                          |
-| Commit hash    | Plan's `commitHash` (null when uncommitted).                    | Note's `commitHash` (null when uncommitted).                 |
-| Format / count | Edit count from the plan registry (e.g. `3 edits`, `1 edit`).   | Format word: `markdown` or `snippet`.                        |
-| Icon           | "lock" when committed; otherwise "file-text" (plan icon).       | "lock" when committed; "comment" for snippet; "note" otherwise. |
-| Source path    | Plan's source path (used for open-on-double-click).             | Note's source path (used for open-on-double-click).          |
-| Branch         | Plan's branch, when the row carries one (used in tooltip).       | Note's branch, when the row carries one (used in tooltip).    |
+**One letter means three different things and is disambiguated by colour alone.** `S` is a snippet note (amber), the skills aggregate (purple), and the Slack reference source (Slack purple). The same table also gives `J` to both Jira and the product's own memory-lookup source, and `Z` to both Zoom kinds. A reader who keys on the letter without the hue cannot tell them apart.
 
-This surface is the only one that still declares a branch on a working-area plan or note row, and the only one whose detail view has a branch line. See "Parity gap: a branch is still written here, and can never be read back" under Notable Behavior — the value never reaches the rendered row.
+### Titles
 
-### Title rendering
+| Kind | Rendered title |
+| --- | --- |
+| Plan | `<first 8 chars of commit hash> · <title>` when the row carries a commit hash; otherwise the plain title (falling back to the slug when the title is blank). |
+| Note | `<first 8 chars of commit hash> · <title>` when committed; otherwise the plain title. |
+| Reference | The shared display-title rule for that source. |
+| Skills aggregate | The **CLI-supplied** summary label, with ` · some inferred` appended when any member was inferred rather than observed. Falls back to the literal `Skills used` when the label arrives blank. |
 
-| Condition  | Rendered title                       |
-| ---------- | ------------------------------------ |
-| Committed  | `<first 8 chars of commitHash> · <title>` |
-| Uncommitted | Plain title                          |
+The middle dot is the Unicode middle dot. The skills row is the only one whose text is composed elsewhere: the same label must read identically here, in the sibling desktop editor, and in the committed aggregate document, so this panel appends a suffix and otherwise passes it through.
 
-The middle dot (`·`) is the Unicode middle-dot. It is part of the contract (downstream styling keys off it).
+### Leave-out keys
 
-### Tooltip text
+| Kind | Kind name written | Key written |
+| --- | --- | --- |
+| Plan | plans | the plan's slug |
+| Note | notes | the note's id |
+| Reference | references | the `<source>:<nativeId>` key |
+| Skills aggregate | skills | **every** captured skill's `<source>:<skill>` key, in one bulk write |
 
-Per-row HTML / multi-line tooltip:
+The skills row resolves to **no single key at all**. Every code path that maps a row to one key returns nothing for it, and each such path either refuses the row up front or is unreachable for it.
 
-| Row type | Tooltip lines |
-| -------- | ------------- |
-| Plan     | `<slug>.md` / `Branch: <branch>` (only when the row carries a branch) / `Updated: <updatedAt>` |
-| Note     | `<id>` / `Format: <markdown\|snippet>` / `Branch: <branch>` (only when the row carries a branch) / `Updated: <updatedAt>` |
+### Placeholders
 
-Both branch lines are conditional on the row actually carrying a branch, and no row handed to this panel does — see "Parity gap: a branch is still written here, and can never be read back" under Notable Behavior.
+| Condition | Body |
+| --- | --- |
+| No status snapshot yet | "Initializing Jolli Memory..." |
+| Status present but the repository is not enabled | "Jolli Memory is not enabled for this repository." then, on a second line, "Open the Status panel to install hooks and enable it." |
+| Enabled, and the merged list is empty | "No plans or notes yet." then "Plans appear when Claude Code creates plan files." then "Notes can be added with the + button." |
 
-### Trash icon zone
-
-Every row carries a trash icon glued to the right edge of the cell. The clickable zone is 30 pixels wide (icon width 16 + a 6-pixel left inset + the cell's 8-pixel right padding). The cursor switches to a hand pointer the moment the mouse enters this zone and reverts the moment it leaves.
-
-### Empty / placeholder states
-
-| Condition                         | Body                                                                                        |
-| --------------------------------- | ------------------------------------------------------------------------------------------- |
-| Project status not yet loaded     | "Initializing Jolli Memory..."                                                              |
-| Status loaded but the repository is not enabled | "Jolli Memory is not enabled for this repository." then, on a second line, "Open the Status panel to install hooks and enable it." |
-| Both registries yield zero rows   | "No plans or notes yet. / Plans appear when Claude Code creates plan files. / Notes can be added with the + button." |
-
-The not-yet-loaded and not-enabled states are **distinct**, and the not-enabled copy replaced a bare "Jolli Memory is disabled." It names the situation and points at the Status panel, so a repository that will never initialize because nothing is installed does not look like a slow load.
-
-The empty and not-enabled bodies are centered HTML; the initializing body is plain centered text.
-
-### Visibility filter contract
-
-A row is included only when **all** of the following are true:
-
-1. `ignored` is not `true`.
-2. The entry is not a "committed-snapshot copy" of an already-committed item (committed-snapshot copies are filtered out — they exist only for storage and are not surfaced in the panel).
-3. If the entry has an "archive guard" hash recording the file's contents at commit time, the source file still differs from that recorded hash (otherwise the file is "unchanged from committed snapshot" and is hidden).
-4. If the entry is uncommitted, the source file still exists on disk.
-
-The same four rules apply to plans and notes (each with its own source-path field and its own archive-guard mechanism).
-
-None of the four is branch-sensitive. The filter performs no branch comparison and no commit-reachability test: a working-area plan or note is worktree-scoped and stays listed regardless of which branch is checked out, and a committed row is hidden or shown purely by its archive guard. The panel does read the current branch before filtering, but nothing in the filter consumes it.
+The not-yet-loaded and not-enabled bodies are distinct: a repository that will never initialize because nothing is installed must not look like a slow load. All three are centred HTML.
 
 ## Behavior
 
-### Initial render
+### Construction
 
-On panel construction:
-
-1. The panel registers a project-status listener that triggers a refresh on every status change.
-2. It schedules a background refresh that reads both registries and applies the visibility filter.
-3. It shows the "Initializing Jolli Memory..." placeholder until the first refresh completes.
+1. Subscribe to the project status channel **and** to the working-context channel. Both are needed and neither is redundant: the refresh gates on the status snapshot's enabled flag, while a plan / note / reference moving does not go through a status recompute. The two are fired by different service methods, so one event never arrives twice.
+2. Schedule the first refresh on a pooled thread.
 
 ### Refresh
 
-Each refresh runs on a background thread:
+Runs off the UI thread, on every fire of either channel.
 
-1. Read the project status. If status is null → show the initializing placeholder; if not enabled → show the not-enabled placeholder.
-2. Read the plans registry — a cross-process round-trip to the shared registry loader, not a local file read.
-3. Read the notes registry. The notes **directory** is likewise resolved over a round-trip rather than computed locally.
-4. Apply the visibility filter to each set.
-5. Wrap surviving entries into row models and merge them.
-6. Sort by `lastModified` descending; on ties, plans before notes.
-7. Hand off to the UI thread, which clears and rebuilds the list model. If the merged list is empty, the empty-state body is shown instead.
+1. Read the status snapshot. No snapshot → the initializing placeholder. Not enabled → the not-enabled placeholder.
+2. **One round trip** returns the visible plans, the visible notes, the reference rows keyed by their map key, and all five leave-out sets at once. The panel applies no filter of its own: archive guards, committed-snapshot copies and orphaned rows are already dropped, and no branch comparison is performed anywhere — working-area context belongs to the worktree and binds to a branch only when a commit claims it. Reference rows carry no committed state at all (a commit deletes the row), so every returned reference is active.
+3. **A second round trip** returns the active skills — the rows no commit has claimed — together with their summary label. This is deliberately not a read of the raw skill registry: a skill row survives archival, so the raw map would list every skill ever used as if it were fresh working state. This call **degrades to an empty answer** rather than failing, so a skills hiccup costs one row instead of the whole repaint.
+4. Wrap each item, merge all four kinds into one list, and sort by the row's timestamp descending.
+5. Hand the list to the UI thread and re-render.
 
-### Per-row rendering
+**A failure of the first round trip re-renders the rows already held, not an empty list.** The stored leave-out sets are only reassigned on success, so the surviving rows stay consistent with the strike-through state they were drawn with. Because the re-render works from the held list — empty until the first success — a failure on the very first refresh still lands on the real empty-state body instead of leaving the panel stuck on "Initializing". That ordering is not hypothetical: the first enabled refresh is exactly when the cross-process channel is least likely to be ready.
 
-The cell renderer composes each row as:
+### Rendering
 
-| Position | Element                       |
-| -------- | ----------------------------- |
-| Far left | Icon (per the icon table above) |
-| Middle   | Title label (per the title-rendering table above) |
-| Right of title | Meta label (edit count for plans; format word for notes), in gray |
-| Far right | Trash icon, hand cursor, "Remove" tooltip |
+At most six rows are shown; when more exist and the section has not been expanded, a "Show N more" row is appended that expands the list permanently for the session. Each row is a wrapping panel: badge on the left, a word-wrapping title in the middle that grows the row taller as the window narrows, and a right-hand action strip that **reserves width only while hovered**, so short titles stay on one line at rest.
 
-Selection is single-row only.
+A row whose item is currently left out renders its title struck through and greyed.
 
-### Click semantics
+### Hover
 
-Three mouse handlers are attached to the list:
+Entering a row tints it, reveals its action icons, and starts a one-second timer that opens the hover card below the row. Leaving it clears the tint and starts a 200 ms dismissal grace period; a mouse-exit whose source is no longer on screen clears unconditionally rather than testing whether the cursor is still inside the row. Entering the card itself cancels the dismissal.
 
-| Click                                              | Action                                                                |
-| -------------------------------------------------- | --------------------------------------------------------------------- |
-| Single click anywhere in the trash zone of a row   | Select that row and run the remove flow.                              |
-| Double click anywhere outside the trash zone        | Open the underlying file in the IDE editor.                           |
-| Right click (popup trigger) on a row                | Select that row and show a single-item context menu: `Remove`.        |
+### Action cluster
 
-The trash-zone click runs even before any selection — it implicitly selects the clicked row first.
+| Icon | Tooltip | Effect |
+| --- | --- | --- |
+| Pin | `Pin` | Records the row in the pinned section with the same badge letter the row shows. |
+| Edit | `Edit Plan` / `Edit Note` / `Edit Markdown` | Opens the backing file's **source**, editable. |
+| Remove | `Remove` | Enters the remove flow. |
+| Leave-out toggle | `Leave out of this memory` / `Add back to this memory` | Flips the row's exclusion. |
 
-### Keyboard semantics
+**The skills row's cluster is the leave-out toggle alone.** It has no single document to pin, edit or remove, and pinning addresses one artifact by key.
 
-The list registers two when-focused key bindings, both routed to the remove flow:
+### The leave-out toggle
 
-- `DELETE`
-- `BACK_SPACE`
+1. Compute the target state as the negation of the row's current one. The skills row reads as excluded **only when its key set is non-empty and every one of those keys is excluded** — so a partially-excluded set renders as included, and the next click excludes the remainder rather than re-including what was already out.
+2. Off the UI thread, write: one key for a plan / note / reference, or **every captured skill's key in a single bulk write** for the aggregate row. Leaving any skill key untouched would strand it in a state the user has no affordance to see or change.
+3. A write failure logs and opens an error dialog ("Could not update whether this item is left out of the next memory"). This is a cross-process round trip, so a stopped daemon, a missing runtime or a cold-start timeout all land here; without the dialog the click would be indistinguishable from a dead control, because the row keeps its old state.
+4. On success, notify the selection-changed channel, then re-read all five sets and re-render. **The re-read is best-effort**: the write has already landed, so a failure here costs a stale checkbox until the next refresh, not a lost change.
 
-### Remove flow
+### Opening and editing
 
-The remove flow runs on every entry path (trash click, right-click `Remove`, Delete key, Backspace key):
+- **Row click** opens a read-only rendered preview, never the editor. A plan and a note open their resolved file; a reference opens a synthesised copy whose YAML frontmatter has been turned into a leading Markdown table; the skills row opens the rendered aggregate table.
+- **Edit** opens the file's raw source instead, so a reference's frontmatter stays visible.
+- **Right-click** offers, for a plan / note / reference: Preview, the per-kind edit entry, "Open in Browser" for a reference carrying an http(s) URL, a separator, and Remove. **For the skills row it offers Preview alone** — the row is a record of what ran, so entries that silently did nothing would be worse than their absence.
 
-1. Read the selected row. If none, return.
-2. Compute `<itemType>` (`plan` / `note`) and `<itemName>` (the title).
-3. Show a yes/no confirmation dialog: "Remove `<itemType>` \"`<itemName>`\" from the list?". Title: `Remove <Plan|Note>`.
-4. On `No`, return.
-5. On `Yes`, run the type-specific delete on a background thread, then ask the project's status listener to refresh.
+Only http and https URLs are opened externally; anything else is refused with a dialog.
 
-### Plan delete
+### Opening the uncommitted skills table
 
-Soft delete: load the plans registry; locate the entry by slug; clone it with `ignored = true`; save the registry. The plan file on disk is **not** touched.
+There is no file to open: on disk each skill is its own working-area document, and the aggregate becomes a real file only once the work is committed. So the table is **rendered** through the CLI and shown as a read-only in-memory document titled `Skills used — uncommitted.md` — the same name the sibling desktop editor gives it and the same wording as the table's own heading, so the before-commit and after-commit tabs read as one pair.
 
-### Note delete
+Two outcomes are kept apart on purpose:
 
-Hard delete: load the notes registry; locate the entry by id; remove it from the registry; save the registry.
+- **The render call fails** → "Could not render the skills table: …". An unreachable back end is not evidence about what was captured, and saying otherwise would point the user at the wrong problem.
+- **The render call answers "nothing"** → "These skills are now archived on your latest memory — nothing new has been captured for the current working session." This is the normal state right after a commit; it is worded as where the skills *went* rather than as their absence, because the row was on screen a moment ago and "none captured" would read as a loss.
 
-Side effect: when the note was uncommitted **and** is a snippet **and** has a `sourcePath`, that source file is also deleted from disk (best-effort — IO errors are silently swallowed). Markdown notes' source files are never deleted, even on hard delete, because they may reference user content the user wants to keep. Committed notes' source files are never deleted because the note is preserved in storage by hash.
+### The hover card
 
-### Open-on-double-click
+| Kind | Card content |
+| --- | --- |
+| Plan | Bold title, then the plan's filename. |
+| Note | Bold title, then `Format: markdown` or `Format: snippet`. |
+| Reference | Bold plain title, then `Source:`, `Tool:` and (when non-blank) `Updated:`; then, when the backing file is readable and the source declares fields, a separator and the field list; then an "Open in <source>" link when the row carries a URL. |
+| Skills aggregate | Bold summary label, then one line per skill, then an overflow line, then the footnote. |
 
-| Row type | Candidate paths, in order of preference                                                       |
-| -------- | --------------------------------------------------------------------------------------------- |
-| Plan     | The plan's stored source path; `~/.claude/plans/<slug>.md`; `<state-dir>/plans/<slug>.md`.   |
-| Note     | The note's stored source path; `<state-dir>/notes/<id>.md`.                                   |
+The skills card names the skills the row can only count. Members are ordered **heaviest total first, then by skill id**, matching the aggregate table's own ordering so the card and the document one click away cannot disagree about what dominated the work; the comparison is deliberately not locale-aware. At most **eight** members are listed; when more exist, a final line reads `+N more — click to open the table`. Each line reads `<skill>[ †] — <N>× · <tokens>`, where the token figure is compact (`93.8k`, `~12.3k` for an estimate) and an **em dash when the member attributed nothing** — never a zero, because a rendered zero reads as a measurement rather than as its absence. A member whose confidence is anything other than the attributed value carries the estimate marker. When any member was inferred, a trailing line explains the dagger: "† inferred from a file read, not an observed call".
 
-The first candidate that exists on disk is opened in the IDE editor as a normal text file. If none exists, an information dialog announces "Plan file not found: `<slug>.md`" or "Note file not found: `<id>`".
+The compact number is formatted with a fixed decimal separator rather than the ambient one, so a comma-decimal IDE cannot render `93,8k` here while the table one click away says `93.8k`.
 
-### Status-listener-driven refresh
+**No card carries a branch line.** An uncommitted plan or note belongs to the worktree, follows the user across a checkout, and gains a branch only when a commit claims it; labelling it with whichever branch happened to be current would state something the model does not guarantee.
 
-The panel registers a status listener at construction. Every time the project status changes (hook fires, install completes, commit lands, sign-in changes), the panel re-runs the refresh. This is what causes a brand-new plan to appear in the list within milliseconds of the Stop hook writing it.
+### Remove
+
+1. The skills row **returns before the dialog** — it is a record of what ran, not a document the user curates; leaving it out of the next memory is the toggle's job.
+2. Confirm: `Remove <plan|note|reference> "<title>" from the list?`, titled `Remove <Plan|Note|Reference>`.
+3. On confirmation, off the UI thread, hand the removal to the shared implementation. **All three kinds are hard removals** — the registry row is deleted, leaving no tombstone, so re-adding the same plan or note, or re-referencing the same entity, revives it. Whether the backing file is also unlinked is decided there, not here: this panel touches no file on any removal path.
+4. A failure logs and opens "Could not remove <kind>: …".
+5. On success, fire the **working-context** refresh rather than a full status recompute: removing a row moves working-area state only, and this panel is on both channels so it repaints either way.
+
+### Disposal
+
+Dismiss any open hover card and unsubscribe from both channels.
 
 ## State Transitions
 
 ```
 [panel constructed]
-  add status listener
-  background: refreshFromDisk()
+  subscribe status channel + working-context channel
+  pooled: refresh
 
-[status changes]
-  background: refreshFromDisk()
+[either channel fires]
+  pooled: refresh
 
-[refreshFromDisk()]
-  status = service.getStatus()
-  if status == null → initializing placeholder
-  else if !status.enabled → not-enabled placeholder
+[refresh]
+  status == null            → "Initializing Jolli Memory..."
+  status not enabled        → "not enabled for this repository"
   else:
-    plans = registry.plans filtered by visibility filter
-    notes = registry.notes filtered by visibility filter
-    items = merge(plans, notes), sort by lastModified desc, plans-before-notes on ties
-    UI thread: updateList(items)
+    round trip 1 → plans, notes, references, all five leave-out sets
+    round trip 2 → active skills + their summary label (empty on failure)
+    merge all four kinds, sort by timestamp descending
+    UI thread: render (cap 6, "Show N more" beyond)
+  [round trip 1 threw] → re-render the rows already held, leave-out sets untouched
 
-[user double-clicks a row outside trash zone]
-  if PlanItem → open plan file from candidate paths
-  if NoteItem → open note file from candidate paths
+[cursor enters a row]      tint, reveal actions, start 1 s card timer
+[cursor leaves a row]      clear tint, start 200 ms dismissal
+[card entered]             cancel dismissal
 
-[user clicks trash zone, or right-click Remove, or Delete, or Backspace]
-  selected = list.selected
-  if none → return
-  confirm = dialog("Remove <plan|note> \"<title>\"?")
-  if confirm == YES:
-    if plan → mark ignored=true in plans registry
-    if note → remove from notes registry
-              if uncommitted snippet w/ sourcePath → delete source file (best-effort)
-    refresh status listener (triggers refreshFromDisk)
+[row clicked]              rendered read-only preview for that kind
+[edit icon]                the file's raw source, editable
+[right-click]              per-kind menu; skills row → Preview only
 
-[panel disposed]
-  remove status listener
+[leave-out toggle]
+  target = NOT current
+  pooled: plan/note/reference → write one key
+          skills              → write EVERY captured key in one bulk write
+    [write threw]  → dialog, stop
+  notify selection changed
+  re-read all five sets  [threw → stop; checkbox stays stale until next refresh]
+  UI thread: re-render
+
+[remove]
+  skills row → return before the dialog
+  confirm → pooled: CLI removal
+    [threw] → dialog
+    [ok]    → working-context refresh
+
+[disposed]  dismiss card; unsubscribe both channels
 ```
 
 ## Notable Behavior
 
-- **The list is one merged stream, not two tabs.** The user sees plans and notes intermixed in time order — there is no plans-only or notes-only filter.
-- **Newest first; plans win ties.** When a plan and a note share the exact same `lastModified` timestamp (rare, but possible when both are written by the same hook tick), the plan renders above the note.
-- **Trash click zone is the right 30 pixels of the row, regardless of icon position.** The hit-test is geometric, not by hovering the icon component itself, which is what makes the trash icon clickable on rows where the title is long enough to crowd it.
-- **Plan delete is soft; note delete is hard.** A "removed" plan can be unmarked by editing the registry; a "removed" note is gone from the registry. This asymmetry is intentional — plans are auto-generated by the hook and can be regenerated; notes are user-authored and removing them must be definitive.
-- **Snippet note delete also removes the file from disk.** Only when the note is (a) uncommitted, (b) a snippet, and (c) has a `sourcePath`. This is the only path in this panel that touches the filesystem outside of the registry files.
-- **Markdown note source files are never deleted on remove.** Even when hard-deleting the registry entry — markdown notes can be user-authored documents whose loss would be data loss.
-- **Committed entries hide automatically when their file equals the archived snapshot.** The archive-guard hash is what prevents a committed plan or note from re-appearing in the panel after its content is committed; the moment the user edits it again, the hash diverges and it reappears.
-- **The committed-snapshot copies are deliberately invisible.** They exist in the registry only because storage needs them. Surfacing them would show a duplicate row for every committed plan.
-- **Nothing here is filtered by branch.** There is no branch comparison and no commit-reachability test in the visibility filter. A plan or note committed on one branch is hidden or shown by its archive guard alone, identically on every branch; a still-pending plan or note is worktree-scoped and survives branch switches, exactly like uncommitted code. The refresh does read the current branch before filtering, but no rule consumes it.
-- **Parity gap: a branch is still written here, and can never be read back.** This is the only plugin that still declares a branch on a working-area plan or note record, the only one whose detail view has a branch line, and the only one where anything still stamps a branch onto a row — the section toolbar's add-plan and add-note actions do (those actions are out of scope here; only the field they write is relevant). The other two surfaces removed the field from their record contracts and stamp nothing. But the shared registry loader — the very loader that serves this panel its rows — **strips** any branch value it finds on read and marks the registry as changed, so the next write-back from any surface persists the cleaned shape. The net effect: a branch written here reaches disk, is discarded on the very next read, and never reaches the row the panel renders. The declaration and the render code survive; the branch line is dead for every record. (Surprising; a leftover.)
-- **No plan ever enters the registry from this surface.** Plan discovery is not performed here at all: rows appear only because another surface's transcript discovery wrote them. This panel reads, filters, renders, soft-deletes and hard-deletes; it never registers a plan. (The retired IDE-side plan discovery is recorded in its own spec.)
-- **The registry read is a cross-process round-trip, but the archived bodies are not.** Enumeration goes through the shared registry loader while the archived plan/note text is read directly off the memory ref in process. So which rows exist and what a row's committed body says come from two different mechanisms and can, in principle, disagree.
-- **The registry record declares a field this surface never renders, purely so a write cannot erase it.** The plans registry now also carries a per-skill usage map, and the commit-memory record carries a per-commit skill list. **Nothing in this IDE displays either.** They are declared for a *write* reason: the decoder this surface uses drops every member the record type does not declare, and both records travel through a decode → `copy()` → encode → save round-trip in normal operation. The plans registry's round-trip is this panel's own soft-delete and hard-delete (load the whole registry, copy it with one map replaced, hand the whole record back to the bridge). The bridge's registry-save action writes what it is handed **verbatim, with no field-wise merge against what is already on disk**, so an undeclared field is not merely unread — it is deleted on the next delete of any plan or note. The commit-memory record's equivalent round-trip is the memory viewer's edit-one-topic action, which re-encodes the whole memory tree. Both were live erasure paths before the fields were declared; the fields exist to close them and for no other reason.
-- **Registry writes serialize against other surfaces' writers, best-effort.** This panel's soft-delete and hard-delete take the registry's cross-process lock through the bridge before their load-modify-save. A failed acquire does not abort the write — it proceeds unlocked — so a delete racing a concurrent discovery write can lose one side's change.
-- **The double-click open path searches three candidates for plans and two for notes.** This is what makes the panel resilient to the plan file having moved between the live `~/.claude/plans` and the project's archived `<state-dir>/plans/` after a commit.
-- **Right-click and Delete/Backspace are equivalent paths to the trash icon.** All four converge on the same confirmation dialog and the same per-type delete branch.
-- **The empty body is informative, not minimal.** It tells the user where plans come from (Claude Code) and how to add notes (the `+` button on the section toolbar).
+- **The skills row's pin, edit and remove paths are unreachable by construction, not dead code.** The row is never given a pin or edit icon, and its remove path returns before the confirmation dialog. The branches inside each of those functions still exist and must: narrowing on the row's absent key does not narrow its type, so the compiler requires every kind to be accounted for. (Unreachable-by-construction.)
+- **This panel's select-all has no caller.** It flips every **reference** row (and only references: plans, notes and the skills row are ignored), reading "if any is excluded, include them all; otherwise exclude them all", and writes the whole set in one bulk call. Nothing in the plugin invokes it — the toolbar's select-all action targets the commits panel. (Declared-but-unreachable.)
+- **Nothing here is filtered by branch, and nothing here stamps a branch.** No card carries a branch line, no row is hidden by a branch comparison, and the panel does not read the current branch at all. Working-area context is worktree-scoped and binds to a branch only at commit.
+- **Removal is hard, and the panel does not decide what else it destroys.** All three removable kinds delete the registry row outright; whether the backing file is unlinked is answered by the shared implementation. This panel deletes no file on any path. (The earlier behaviour that marked a plan row with a hide flag instead of removing it is gone; nothing on this surface writes such a field.)
+- **A row's title is the only thing it shows.** There is no right-hand meta label — no edit count for a plan, no format word for a note. Format survives only inside the note's hover card.
+- **The skills row's label is fetched, not composed.** The count and token figure come from the CLI; this panel appends only ` · some inferred`, because the aggregate table spells the same caveat as a dagger footnote instead. A blank label degrades to the words `Skills used`.
+- **A per-skill token figure is formatted here, and that is a second copy of a shared format.** The round trip returns the aggregate label, not per-row text, so the card re-derives the compact form for each member. It is pinned to a fixed decimal separator for exactly that reason; the two roundings must not disagree across one click.
+- **An absent confidence marks the figure as an estimate.** The card marks anything that is not the attributed value, so a member arriving without a confidence renders with the estimate marker rather than as a measurement.
+- **A partially-excluded skill set reads as included.** The aggregate reads as excluded only when every member is, so one click after a partial exclusion excludes the remainder instead of re-including what was already out. An empty key set can never read as excluded.
+- **Both the write and the re-read after a toggle can fail, and only one of them is loud.** The write opens a dialog because a silent failure leaves a control that looks dead. The re-read only logs, because the change has already landed and the cost is a stale checkbox.
+- **The panel subscribes to two refresh channels deliberately.** The status channel because the refresh gates on the enabled flag; the working-context channel because a plan, note or reference moving never triggers a status recompute. They are fired separately, so an event is never delivered twice.
+- **A failed repaint keeps the previous rows on screen.** What used to be a local file read is now a cross-process round trip, and the working-context channel repaints this panel whenever a plan file is saved anywhere on the machine — so one hiccup must not read as "the user has no context".
+- **The skills read degrades where the context read does not.** An unavailable skills answer costs exactly the aggregate row; an unavailable context answer keeps the whole previous list.
+- **Plan file resolution restates the shared layout and is knowingly left that way.** The authoritative path the CLI just supplied is tried first, and only when that file is already gone do two hard-coded fallbacks run; the whole thing returns nothing rather than guessing, so a layout change degrades to "file not found" instead of opening the wrong document. The note path asks for its directory over the bridge instead, which is the shape this one would converge on.
+- **Reference previews are synthesised, not opened.** The desktop sibling's Markdown preview renders YAML frontmatter as a table automatically while this IDE's hides it, so the panel builds that table itself and opens a decorated in-memory copy; a failure to parse falls back to opening the real file unchanged. The parser handles only the flat key-value and field-list subset the writer emits.
 
 ## Shared Behavior
 
-- **Plans registry** — the source of plan rows; written by the agent stop hook's plan discovery and the plan-archival flow, both of which live outside this surface. This panel reaches the registry over a bridge round-trip and, for its own load-modify-save operations, takes the registry's cross-process lock through the same bridge so it serializes against those writers. **A failed lock acquisition is treated as "write without the lock"**, so a contended soft-delete can still clobber a concurrent writer.
-- **Notes registry** — the source of note rows; written by the note creation/edit flow and the note-archival flow. Reached over a bridge round-trip; the notes directory path is resolved the same way.
-- **Archived plan and note bodies** — read natively in process off the memory ref (a direct show-at-revision), not through the shared storage layer. Reference markdown is likewise read natively, off the reference's own recorded absolute path, by the JVM port of the reference-markdown parser (spec 179) — which is that port's one live caller.
-- **Reference hover popup and reference open** — two consumers of that native read, both reshaped for parity with the sibling VS Code surface:
-  - The **hover popup** no longer repeats the row's `<native identifier> — <title>` label as its own heading. It leads with the plain title and follows it with a dim metadata block — `Source: <human source label>`, `Tool: <originating tool name>`, and `Updated: <timestamp>` when the timestamp is non-blank — before the separator and the adapter field list. The duplication it removed was visible (a row reading `recall — Recall` produced a popup headed `recall — Recall` above the same words again). The field list is still skipped entirely when the backing file is missing or the source declares no fields.
-  - **Opening a reference** no longer hands the on-disk file straight to the editor. The panel reads the file, synthesises a leading Markdown **table** from its YAML frontmatter (the scalar keys plus each adapter field's label/value pair, with JSON-encoded values decoded to their plain form and pipes/newlines escaped so the table stays well-formed), and opens the decorated text as a **read-only in-memory file** named after the original. The reason is a concrete divergence: VS Code's Markdown preview renders frontmatter as a table automatically, while this IDE's preview treats it as metadata and hides it — so this surface's reader used to lose the "when, and by what tool" context entirely. If the read or the synthesis throws, the panel falls back to opening the real file on disk unchanged. The synthesiser parses only the flat key-value and field-list subset the writer emits; it is not a general YAML parser, and it returns the input untouched when no closed frontmatter block is present.
-- **Project status listener** — drives every refresh; flips between `enabled` placeholders and the actual list.
-- **Visibility filter** — shared with the VS Code Plans/Notes provider; this panel re-implements the same four rules so both surfaces show identical sets. Neither surface filters by branch.
-- **IDE editor** — the destination for double-click opens; the panel uses the standard "open file" entry point.
-- **Section toolbar** — owns the `+` action that opens the note-creation form (separate spec).
-- **Plan-archival flow** — the writer of the archive-guard hash that hides unchanged committed plans.
-- **Skill usage tracking** (specs 319 / 322) — owns the skill records themselves: what is measured, when a row is written, how invocations and per-session usage accumulate, and what an archive snapshot means. This surface participates only as a **pass-through**: it declares the record shapes so its decode/re-encode round-trips preserve them, and it renders none of it.
+- **Working-area context services** — own which plans and notes are browsable, what removing any row destroys, and the reference registry; this panel calls them and re-implements none of them.
+- **Active-skills projection** — owns which skills are still uncommitted and which figures a row reports; reached here through the plugin's bridge adapter.
+- **Aggregate skills rendering** — owns the summary label this panel displays and the table its preview opens (spec 323).
+- **Skill capture and archival** (specs 319, 322) — own the records behind the aggregate row: what is measured, when a row is written, and what a commit freezes.
+- **Exclusion selection store** (spec 188) — owns the file this panel's toggle writes, including the skills set's optional shape on disk.
+- **Source presentation table** (spec 313) — owns every reference row's letter, colour and display title; this panel holds no letter table for references.
+- **Pinned section** — the destination of the pin action, which addresses one artifact by key and therefore cannot serve the aggregate row.
+- **Project status and working-context channels** — the two refresh sources.
+- **Section toolbar** — owns the single "Add" action that opens the creation form.

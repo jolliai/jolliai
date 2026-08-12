@@ -15,14 +15,15 @@ on screen.
 
 - The problem this exists to solve: a memory stores only the post-merge aggregate, so removing one conversation from it has no subtrahend unless that conversation's own share was persisted at write time.
 - The composite conversation identity used to decide which stored conversation records are being removed.
-- Per-node ownership resolution over the consolidation tree, and why the node's own transcript-id list is not itself the ownership record.
-- The three unattributable outcomes (no claimant, several claimants, a removed conversation with no recorded share) and the partial-subtraction case that both corrects and reports.
+- Per-node ownership resolution over the consolidation tree — both of its evidence tiers — and why the node's own transcript-id list is not itself the ownership record.
+- The three unattributable outcomes (no resolvable claimant, several claimants, a removed conversation with no recorded share) and the partial-subtraction case that both corrects and reports.
 - The subtraction itself: per-segment flooring, the scalar-only degrade, stripping the field group when nothing remains, and re-derivation (never scaling) of the cost.
 - The second, parallel correction applied to each skill row's per-session usage split — its unconditional per-node application, its re-derivation of the row's total and confidence from what survives, and its forward-only guard.
 - The condition under which the tree is walked at all, given that either correction can be the only one with work to do.
 - The write ordering — stored conversation records first, then one summary write carrying both the id removal and the figure correction — and what each failure leaves behind.
-- What the user is told when the summary write fails, why that outcome is permanent, and the notification's gate on there having been an attributable correction (so one of the two failure branches is silent).
-- The in-place meter replacement the panel performs on success, and the deliberate omission of it when nothing was attributable.
+- The self-heal that runs when that summary write fails: a derivation from the surviving transcripts that also drops the dangling ids, and what each of its two outcomes means for the user.
+- What the user is told when the self-heal also fails, and the notification's gate on there having been an attributable correction (so one of the two failure branches is silent).
+- The in-place meter replacement the panel performs on success, the deliberate omission of it when nothing was attributable, and the refresh control the replacement markup always carries.
 
 **Out of scope (boundaries)**
 
@@ -31,7 +32,9 @@ on screen.
 - The price table, the cost formula, and the verification stamp (see [257 — Multi-Provider Pricing and Cost Estimation]).
 - The summary node's usage/cost field group and the tree-aggregation helpers that read it (see [04 — Summary Tree Structure]).
 - The panel that hosts the detach control, its read-only gates, and the conversations list it renders (see [109 — VS Code Summary Webview Panel]).
-- The meaning and lifecycle of a node's transcript-id list (see [185 — V5 UUID Identity and Migration]).
+- The meaning and lifecycle of a node's transcript-id list, and the tree-wide id removal the self-heal writes through (see [185 — V5 UUID Identity and Migration]).
+- The derivation the self-heal runs — its evidence contract, its forward-only gate, its idempotence, and its other two consumers (see [333 — Conversation Usage Recomputation from Transcripts]).
+- What a regeneration replaces and preserves (see [334 — Summary Regeneration Field Contract]).
 - Rewriting the stored conversation records themselves — the detach's file-level effect, which this correction only observes.
 
 ## Data Contracts
@@ -105,10 +108,46 @@ which is why ownership is computed rather than read off the field:
   every file — while the root's own usage figures cover its **delta** only
   (amend, pick) or nothing at all (squash).
 
-A node therefore **owns** an id only when it lists that id and **no descendant**
-lists it. Resolution is a post-order walk, so a node can only become an owner once
-its whole subtree has had the chance to claim the id, and the walk is restricted to
-the ids actually being detached so an unrelated tree-wide index costs nothing.
+Each id resolves to **at most one** owner, because the root and its folded children
+each carry their own figures and the tree aggregation display surfaces use walks
+both — an id counted at two nodes is counted twice everywhere.
+
+Two independent kinds of evidence are consulted, in this order. (This rule is shared
+with the derivation in [333 — Conversation Usage Recomputation from Transcripts] and
+is stated in full in both places.)
+
+1. **A claim.** A post-order walk restricted to the ids actually being detached, so
+   an unrelated tree-wide index costs nothing. A node claims an id the moment it
+   lists that id and no descendant already claimed it; claims propagate upward so a
+   parent can tell whether its own listing is a claim or just an index entry. This is
+   what stops a consolidated root's index from outranking the leaf whose figures
+   actually cover the id.
+2. **The commit identifier.** A stored conversation record is written under the
+   commit identifier of the commit whose conversations it holds, so a node whose own
+   commit identifier equals the id is the node those conversations were counted at.
+
+Resolution per id:
+
+- **Two or more claimants** → unresolved (see the outcomes below).
+- **No claimant** → look tree-wide for nodes whose commit identifier equals the id.
+  Exactly one match owns it; zero or several leave it unresolved.
+- **Exactly one claimant** → look for a commit-identifier match **inside that
+  claimant's own subtree**, the claimant itself included. Exactly one match owns it;
+  zero or several leave the claimant as the owner.
+
+The identifier match may only move ownership **down**, within the claimant's subtree.
+A match elsewhere in the tree is ignored on purpose: a stale id that happens to equal
+an unrelated node's commit identifier would otherwise be handed someone else's
+conversations, and the claim is the stronger evidence there.
+
+**The second tier is what makes a memory in the post-upgrade shape correctable at
+all.** The one-shot identity upgrade puts every descendant's commit identifier on the
+root's list and leaves the children with no list of their own, so the root is the sole
+claimant of ids a child's figures cover — and the identifier tier pushes ownership
+back down to that child. A tree in that shape used to resolve to the root or not at
+all, so the correction either corrupted the wrong node or refused; it now lands on the
+child. The same tier is the only evidence available on a pre-upgrade tree, where no
+node lists anything.
 
 Ownership is resolved over the whole tree **before** anything is subtracted, then
 each owner's subtrahends are applied in a second walk.
@@ -125,11 +164,14 @@ question; the third corrects whatever it can — see "Partial attribution" below
 where a record holding several removed conversations of which only some carry a
 share is reported **and** has the shares that do exist subtracted.
 
-1. **No claimant.** The memory and the stored records disagree about what belongs
-   to this memory.
+1. **No claimant, and no unique commit-identifier match.** The memory and the stored
+   records disagree about what belongs to this memory, and nothing in the tree was
+   written under that identifier either. Note that "no claimant" alone is no longer
+   an unattributable outcome: a single identifier match resolves it.
 2. **Two or more claimants.** Sibling nodes can both list an id without either
    being the other's descendant, so there is no deepest one. Subtracting at both
-   would double-subtract; picking one arbitrarily would corrupt the other.
+   would double-subtract; picking one arbitrarily would corrupt the other. The
+   identifier tier is not consulted here — the ambiguity is in the stronger evidence.
 3. **A removed conversation with no recorded segment breakdown.** Written before
    the share was persisted, produced by a source that reports no usage, or — the
    non-obvious one — a record that persisted a **per-model split but no segment
@@ -239,15 +281,20 @@ it:
   conversations are still readable and the memory still claims their ids. The
   failure is surfaced as a visible error.
 - **Summary write fails** → a dangling id (file gone, id still listed) plus stale
-  figures. The dangling id is harmless in the display and self-heals there: the
-  panel intersects the memory's ids with the transcript files that actually exist
-  before rendering anything from them.
-- **Ids first (the rejected order)** would be unrecoverable: the id strip is
-  durable while the record batch can still fail, so the user's retry would
-  recompute the correction against a memory in which **no node claims the detached
-  id** — the no-claimant outcome — which refuses to guess. The detach would then
-  "succeed" on the second attempt with the figures permanently stale, and the
-  orphaned records referenced by nothing.
+  figures. Both are then attacked by the self-heal below, which re-derives the
+  figures from the surviving conversations and drops the dangling ids from **every**
+  node in the same write. The panel's rendering is unaffected either way — it
+  intersects the memory's ids with the conversation records that actually exist
+  before rendering anything from them — but the dangling id is a real durable defect,
+  not a display artefact, and removing it is part of the repair rather than a
+  cosmetic tidy-up.
+- **Ids first (the rejected order)** was rejected because the id strip is durable
+  while the record batch can still fail, so the user's retry would recompute the
+  correction against a memory in which **no node lists the detached id**. Ownership
+  would then rest entirely on the commit-identifier tier, which resolves only for an
+  id that happens to equal exactly one node's commit identifier — never for an
+  opaquely-minted one. The detach would "succeed" on the second attempt with the
+  figures stale and the orphaned records referenced by nothing.
 
 The correction is deliberately **not** published to the in-memory memory before the
 writes succeed. An already-subtracted in-memory value surviving a failed write
@@ -255,34 +302,66 @@ would let the user's retry apply the same subtraction a second time — and the
 zero-floor would then collapse the meter to "not reported", indistinguishable from
 a memory that never reported usage. Only what is durable is published.
 
-### When the summary write fails — told only if there was a correction to lose
+### When the summary write fails — re-derive first, warn only if that fails too
 
-A failed summary write is **not** retried and is **not** recoverable:
+The write is **not** retried, and the subtrahend this run held in memory is gone
+with it: it was read from the removed conversations' own persisted shares, which
+are only readable while those conversations are still in the records, and a second
+detach attempt finds nothing to remove and completes as a plain acknowledgement.
 
-- The conversations are already gone from the stored records, so a second attempt
-  finds nothing to remove and completes as a plain acknowledgement.
-- The subtrahend this run held in memory is unrecoverable, because it is read from
-  the removed conversations' own persisted shares, which are only readable while
-  they are still in the records.
-- Regenerating the memory does not help: regeneration carries the token figures
-  over verbatim rather than recomputing them from conversations.
+The correction is nonetheless recoverable **from the other side**. Deriving the
+figures from the conversations that are *left* needs no subtrahend at all, so the
+failure handler runs exactly one such derivation (see
+[333 — Conversation Usage Recomputation from Transcripts]) before deciding what to
+tell the user. Three properties of the moment it runs in are what make it work:
 
-So the figures stay permanently high by the detached conversation's share. A log
-line the user never opens is not an honest way to report that — but the
-notification that says so is **gated on there having been an attributable
-correction to lose**, which splits the failure into two outcomes:
+- It reads the memory the panel still holds in memory — the **pre-correction** one,
+  since nothing was published — so every id the detach was about to strip is still
+  listed and every node's figures are still the stored ones.
+- The records themselves have already changed, so the derivation sees exactly the
+  conversations that survive.
+- The ids whose records the detach deleted now have no backing record, so the same
+  run identifies them as dangling and drops them **from every node** in the one write
+  it performs. Healing the figures without them would leave the memory referencing
+  conversations that no longer exist.
 
-- **Something was attributable.** A **warning notification** is shown stating that
-  the conversation was detached but the memory's token and cost figures could not
-  be updated and still include it.
-- **Nothing was attributable.** The write that would have run carries only the
-  transcript-id removal, and its failure produces **no notification at all** — a
-  single log line and nothing on screen. The memory keeps a dangling id and figures
-  that were already stale before this detach began. This is the less honest of the
-  two outcomes: the user is told nothing, and the same "stale figure with no trace"
-  this behavior exists to avoid is exactly what they are left with. It is a gap in
-  the reporting, not a designed exemption — the figures being *already* wrong is
-  not a reason to stay silent about a write that failed.
+The derivation never throws out of the handler; a failure inside it is swallowed and
+answered as "nothing derived", because the handler's next step is a warning and a
+second error toast in its place would be a worse report.
+
+Two outcomes follow, and only one of them is visible:
+
+- **Something was derived.** The figures are replaced, the dangling ids are gone,
+  **no notification of any kind is raised**, and the acknowledgement carries a
+  rebuilt meter exactly as on the success path. Nothing was lost, so nothing is
+  said.
+- **Nothing was derived** (every owning node's evidence was incomplete, or the
+  heal's own write failed). Only now is the user warned, and the warning is further
+  **gated on there having been an attributable correction to lose**:
+  - **Something was attributable.** A **warning notification** states that the
+    conversation was detached but the memory's token and cost figures could not be
+    updated and still include it.
+  - **Nothing was attributable.** The write that would have run carried only the
+    transcript-id removal, and its failure produces **no notification at all** — a
+    log line and nothing on screen. The memory keeps a dangling id and figures that
+    were already stale before this detach began. This is the less honest of the two
+    outcomes: the user is told nothing, and the same "stale figure with no trace"
+    this behavior exists to avoid is exactly what they are left with. It is a gap in
+    the reporting, not a designed exemption — the figures being *already* wrong is
+    not a reason to stay silent about a write that failed.
+
+Two limits on the heal are worth stating here, because they decide whether the
+detach's own damage actually gets repaired:
+
+- **It is forward-only in the same way the subtraction is.** A node one of whose
+  surviving conversations records no usage share keeps its stored figures, so a
+  memory old enough to lack per-conversation shares derives nothing and lands in the
+  warning branch.
+- **The dangling-id cleanup only engages when the memory's root carries an id list
+  at all.** A memory whose root has no list — every pre-upgrade memory, and any
+  memory whose root list was lost while its children still list ids — yields an empty
+  dangling set, so the heal can re-derive figures there but drops no stale id. See
+  [333] for the rule.
 
 Either way the row is still acknowledged to the panel — the records really did
 change, and leaving the row on screen would only invite the no-op retry.
@@ -290,12 +369,24 @@ change, and leaving the row on screen would only invite the no-op retry.
 ### Success path: in-place meter replacement
 
 On success the panel is told the conversation was detached, and — **only when the
-figures actually changed** — is handed a freshly-built token meter to swap in
-place. The row is removed and the meter replaced without a full re-render, so a
-single-row change does not collapse scroll position and expanded sections. When
-nothing was attributable the meter is deliberately omitted and keeps its current
-value, which is the honest reading of "we cannot know" (see [109 — VS Code Summary
-Webview Panel]).
+figures actually changed** — is handed a freshly-built token meter to swap in place.
+The row is removed and the meter replaced without a full re-render, so a single-row
+change does not collapse scroll position and expanded sections. When nothing was
+attributable the meter is deliberately omitted and keeps its current value, which is
+the honest reading of "we cannot know" (see [109 — VS Code Summary Webview Panel]).
+
+"The figures actually changed" is satisfied by **either** the subtraction or the
+heal, so the failure path can also carry a meter.
+
+The replacement markup is always built **with the meter's own refresh control
+present**, unconditionally — the flag that would suppress it is hard-coded on, so
+the swap can never drop a control the first render emitted. The first render instead
+decides that control's presence from whether the panel is read-only, and the two
+agree only because two *other* gates keep this handler off a read-only panel: a
+panel showing another repository's memory is refused by the message dispatcher
+before the handler runs, and a panel showing a superseded commit is refused by the
+stale-commit guard at the top of it. Neither of those is the read-only flag; the
+markup itself makes no check (see [109 — VS Code Summary Webview Panel]).
 
 ## State Transitions
 
@@ -305,8 +396,14 @@ owner and re-derive its cost → write stored records → write the summary once
 (ids + figures) → refresh the panel's id set → acknowledge the row, with a rebuilt
 meter only if the figures changed.
 
-Nothing is retried at any step. Every step before the record write is pure
-computation over the input tree; the tree itself is never mutated in place.
+On a failed summary write the tail becomes: re-derive the figures from the surviving
+conversations and drop the dangling ids in one write → if that produced a change,
+finish exactly as on the success path and say nothing → otherwise warn, but only when
+the subtraction had attributed something → acknowledge the row regardless.
+
+Nothing is retried at any step, and the derivation runs at most once. Every step
+before the record write is pure computation over the input tree; the tree itself is
+never mutated in place.
 
 ## Notable Behavior
 
@@ -317,8 +414,17 @@ computation over the input tree; the tree itself is never mutated in place.
   [245].)
 - **A node listing an id does not mean it owns it.** On a consolidated root the id
   list is a tree-wide index while the node's figures cover only its delta (or
-  nothing). Ownership must be computed post-order — deepest claimant wins. (Surprising;
-  intentional.)
+  nothing). Ownership must be computed post-order — deepest claimant wins.
+  (Surprising; intentional.)
+- **Ownership has a second evidence tier, and it rescues the shapes that used to be
+  uncorrectable.** A node whose own commit identifier equals the id is evidence in
+  its own right: used alone when nothing claims the id (which is every pre-upgrade
+  memory, where no node lists anything), and used to move ownership **down** inside a
+  sole claimant's subtree (which is every post-upgrade memory, where the root claims
+  ids its children's figures cover). A match outside the claimant's subtree is
+  ignored, because a stale id that coincides with an unrelated node's commit
+  identifier would otherwise be handed someone else's conversations. (Surprising;
+  load-bearing — shared verbatim with [333].)
 - **The per-skill correction deliberately ignores ownership, and the aggregate one
   deliberately cannot.** The skill correction runs on every node because an amend
   genuinely records one conversation's skill contribution at both the root and the
@@ -377,22 +483,57 @@ computation over the input tree; the tree itself is never mutated in place.
   until both writes succeed, because a retry against an already-subtracted
   in-memory value would subtract twice and the floor would then hide the memory's
   usage entirely. (Surprising; intentional.)
-- **Records are written before the summary, and the reverse order was rejected as
-  unrecoverable.** Writing ids first turns a later failure into a retry that can no
-  longer attribute anything (no node claims the id), leaving the figures
-  permanently stale and the records orphaned. (Surprising; intentional.)
-- **A failed summary write is permanent, and the user is told so only when a
-  correction was lost with it.** Not retried, not recoverable by retrying, and not
-  fixable by regenerating (regeneration carries the token figures over verbatim).
-  When something was attributable the figures stay high by the detached
-  conversation's share and a warning says so. When nothing was attributable the
-  failing write carried only the id removal, and the user sees nothing — a log line
-  is the whole report. (Surprising; the silent branch is a reporting gap, and the
-  less honest of the two outcomes.)
-- **The meter is swapped in place, and omitted when nothing changed.** No full
-  re-render for a single-row change, and no meter update at all when nothing was
-  attributable — the old value stands rather than being replaced by a guess.
-  (Notable.)
+- **Records are written before the summary, and the reverse order was rejected.**
+  Writing ids first makes the id strip durable while the record batch can still
+  fail, so a retry computes the correction against a memory in which no node lists
+  the id — leaving ownership to rest on a commit-identifier coincidence that an
+  opaquely-minted id can never satisfy — and the records orphaned. (Surprising;
+  intentional.)
+- **A failed summary write is no longer the end of it — the handler re-derives the
+  figures from the conversations that survive.** The lost subtrahend does not have
+  to be recovered, because a derivation needs none; it runs against the memory the
+  panel still holds (which nothing published a correction into), so every id is
+  still listed and every figure still stored. (Surprising; this replaced an outcome
+  that really was permanent.)
+- **A successful heal is completely silent.** No notification of any kind, on the
+  grounds that nothing was lost — the user sees only the meter change under the
+  detached row, exactly as on the success path. (Notable.)
+- **The failure path can end up MORE correct than the success path.** The heal is
+  reachable only from the write's failure handler, so a detach whose share was
+  unattributable but whose write *succeeded* keeps its stale figures untouched,
+  while the same detach with a *failed* write gets them re-derived. Nothing on the
+  success path re-derives anything. (Surprising; a real asymmetry.)
+- **The warning now means "the repair failed too", not "the write failed".** It is
+  raised only when the heal derived nothing *and* the subtraction had attributed
+  something. Both other combinations are silent, and the nothing-attributable one is
+  still the reporting gap it always was — the user is told nothing about a write
+  that failed against figures that were already wrong. (Surprising; the silent
+  branch is a gap, not a designed exemption.)
+- **The heal drops dangling ids from every node, and that is a durable repair rather
+  than a cosmetic one.** The panel's own rendering already tolerates a dangling id
+  by intersecting the memory's ids with the records that exist, so the removal buys
+  nothing on screen — it exists because the memory would otherwise reference
+  conversations that are gone. (Notable.)
+- **The dangling-id half of the heal does nothing on a memory whose root carries no
+  id list**, which includes every pre-upgrade memory — exactly the shape whose id
+  list the failed write was going to create. The figures can still be re-derived
+  there; only the cleanup is skipped. (Surprising; see [333].)
+- **The meter is swapped in place, and omitted only when neither the subtraction nor
+  the heal changed anything.** No full re-render for a single-row change, and no
+  meter update at all when nothing could be attributed or derived — the old value
+  stands rather than being replaced by a guess. (Notable.)
+- **The swapped-in meter always carries the refresh control, unconditionally.** Both
+  places that build a replacement meter hard-code it as present rather than deriving
+  it from the panel's read-only state, so the swap cannot silently drop a control the
+  first render emitted. What keeps that from painting a write affordance into a
+  read-only panel is not the markup but two unrelated gates: the dispatcher refuses
+  the detach on a foreign-repository panel, and the stale-commit guard refuses it on
+  a superseded one. (Surprising; correct only by coincidence of the gates.)
+- **The handler's own foreign-repository check can never run.** The message
+  dispatcher default-denies every command absent from its read-only allow-list, and
+  the detach is not on it, so a foreign panel is refused before the handler is
+  entered. The check inside the handler is dead code. (Unreachable path; not a live
+  protection — the dispatcher is.)
 
 ## Shared Behavior
 
@@ -414,8 +555,17 @@ computation over the input tree; the tree itself is never mutated in place.
 - The per-skill usage split this correction deletes from — how it is captured, keyed
   and attributed at write time — is owned by spec 321, and the row it sits on by
   spec 319.
-- The transcript-id list whose per-node meaning drives ownership resolution is
-  defined in [185 — V5 UUID Identity and Migration].
+- The derivation the failure handler runs — its evidence contract, its
+  all-or-nothing per-node gate, its idempotence, the panel-side evidence read it
+  shares with the user-pressable control, and its two other consumers — is
+  [333 — Conversation Usage Recomputation from Transcripts]. The ownership rule
+  stated above is shared verbatim with it.
+- The transcript-id list whose per-node meaning drives ownership resolution, the
+  shape the one-shot identity upgrade leaves behind, and the tree-wide id removal the
+  heal writes through are defined in [185 — V5 UUID Identity and Migration].
+- What a regeneration replaces and preserves — including that it re-derives these
+  same figures but never drops a dangling id — is
+  [334 — Summary Regeneration Field Contract].
 - The panel that offers the detach control, gates it in read-only modes, hides
   turn-less carrier records from its conversations list, and performs the in-place
   meter swap is [109 — VS Code Summary Webview Panel].

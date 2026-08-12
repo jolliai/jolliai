@@ -45,6 +45,7 @@ Exactly the following keys are accepted by `--set` / `--remove` / `--list-keys`.
 | `clineEnabled` | boolean | Enable Cline session discovery — VS Code extension and CLI (one shared toggle). |
 | `devinEnabled` | boolean | Enable Devin CLI session discovery. |
 | `antigravityEnabled` | boolean | Enable Antigravity session discovery. |
+| `kimiEnabled` | boolean | Enable Kimi Code CLI session discovery. |
 | `mcpPlatformToolsEnabled` | boolean | Register backend-defined Jolli-platform tools in the MCP server. On by default (like the other `*Enabled` keys); set `false` to opt out. |
 | `globalInstructions` | enum | Machine-global skill-preference block switch. One of `enabled`, `disabled`. Setting it has an immediate side effect beyond `config.json` (see "Immediate side effect: `globalInstructions`" below). |
 | `logLevel` | enum | One of `debug`, `info`, `warn`, `error`. |
@@ -56,7 +57,13 @@ Exactly the following keys are accepted by `--set` / `--remove` / `--list-keys`.
 | `syncTranscripts` | boolean | Include raw AI conversation transcripts in cloud sync. |
 | `syncPollIntervalSec` | number | Sync poll interval in seconds. Must be a positive integer clamped to the range `5400`–`86400` (90 min floor, 24h ceiling). |
 | `syncOnPush` | boolean | Auto-sync pushed commits' memory to Jolli Space on every git push. |
+| `backupFolder` | string | Absolute path of the directory snapshots are written to. Heavily validated at save time, and the only key whose validation has a filesystem side effect (see below). **Undocumented by `--list-keys`.** |
+| `backupRetentionDays` | number | How many days of snapshots to keep. Must be an integer of at least one — zero is refused outright, because it reads as "no backups" rather than as a retention policy. **Undocumented by `--list-keys`.** |
 | `slack.workspaceUrl` | string | A dotted pseudo-key, not a top-level configuration field (see "Dotted pseudo-keys" below). Fallback base address used to reconstruct a Slack thread's shareable link when none was pasted into the conversation. |
+
+**`--list-keys` documents a strict subset of what `--set` accepts.** The two backup keys above are accepted, coerced and validated exactly like any other key, and appear in neither the listing nor its usage lines — so the only way to discover them is to already know their names. The listing also orders its entries differently from the accept-list, so the two are not a reordering of each other. (The listing is a static help table; the accept-list is what actually gates a write.)
+
+Several fields the configuration carries are deliberately **not** in the accept-list and are rejected as unknown keys, including the tenant site (written only as a side effect of setting a Jolli API key — see below), the compile-exclusion list, the storage mode, the commit sign-off flag, the auto-sync flag, the install identifier, and every telemetry field. Three of those — the compile-exclusion list, the sign-off flag and the auto-sync flag — are editable from the desktop-editor settings surface, so the two surfaces are not subsets of one another in either direction.
 
 ### Dotted pseudo-keys
 
@@ -74,7 +81,8 @@ The `value` portion of `--set key=value` is a single string from the command lin
 
 - **`maxTokens`** — parsed as a finite integer greater than zero. Strict parsing rejects non-numeric suffixes (e.g. `8192abc` is rejected, not silently truncated to `8192`). Failure: `maxTokens must be a positive integer (got: <raw>)`.
 - **`syncPollIntervalSec`** — parsed as a finite integer greater than zero, then clamped to the range `5400`–`86400`. A value below `5400` fails with `syncPollIntervalSec must be at least 5400 (90 min) to avoid excessive sync push frequency (got: <raw>)`; a value above `86400` fails with `syncPollIntervalSec must be at most 86400 (24h) (got: <raw>)`; a non-integer fails with `syncPollIntervalSec must be a positive integer (got: <raw>)`.
-- **Boolean keys** (`codexEnabled`, `geminiEnabled`, `claudeEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `clineEnabled`, `devinEnabled`, `antigravityEnabled`, `mcpPlatformToolsEnabled`, `syncTranscripts`, `syncOnPush`) — case-insensitive. `true`, `1`, `yes` → `true`; `false`, `0`, `no` → `false`. Anything else is rejected: `<key> must be true/false (got: <raw>)`.
+- **`backupRetentionDays`** — parsed the same strict way, then required to be an integer of at least one. Failure: `backupRetentionDays must be an integer >= 1 (0 is refused — it reads as 'no backups') (got: <raw>)`.
+- **Boolean keys** (`codexEnabled`, `geminiEnabled`, `claudeEnabled`, `openCodeEnabled`, `cursorEnabled`, `copilotEnabled`, `clineEnabled`, `devinEnabled`, `antigravityEnabled`, `kimiEnabled`, `mcpPlatformToolsEnabled`, `syncTranscripts`, `syncOnPush`) — case-insensitive. `true`, `1`, `yes` → `true`; `false`, `0`, `no` → `false`. Anything else is rejected: `<key> must be true/false (got: <raw>)`.
 - **`logLevel`** — must be exactly one of `debug`, `info`, `warn`, `error`. Failure: `logLevel must be one of: debug, info, warn, error (got: <raw>)`.
 - **`aiProvider`** — must be exactly one of `anthropic`, `jolli`, `local-agent`. Failure: `aiProvider must be one of: anthropic, jolli, local-agent (got: <raw>)`.
 - **`localAgentTool`** — must be exactly one of `claude-code`, `codex`, `cursor-agent`, `opencode`, `kimi`. Failure: `localAgentTool must be one of: claude-code, codex, cursor-agent, opencode, kimi (got: <raw>)`. The accepted set and the order it is listed in are **derived from the single agent-tool registry** that also supplies each tool's display name and sign-in hint, so this key's accepted values cannot drift from the tools the setup picker offers (spec 57) or the ones the runtime can actually drive (spec 280). Adding a tool to that registry widens this key with no edit here.
@@ -87,7 +95,8 @@ The `value` portion of `--set key=value` is a single string from the command lin
 
 Validation runs **after** coercion and **before** writing to disk, with one exception noted below. A failed validation prevents the entire `--set` / `--remove` batch from being persisted (the update is atomic) and exits with code `1`.
 
-- **`jolliApiKey`** — the value (after coercion) is parsed and rejected if the embedded tenant URL is outside the Jolli origin allowlist or if the shape is unrecognized. The same validation runs at save time everywhere a Jolli API key can be stored, so `configure --set jolliApiKey=…` and the OAuth callback share one rejection rule.
+- **`jolliApiKey`** — the value (after coercion) is parsed and rejected if the embedded tenant URL is outside the Jolli origin allowlist or if the shape is unrecognized. The same validation runs at save time everywhere a Jolli API key can be stored, so `configure --set jolliApiKey=…` and the OAuth callback share one rejection rule. This key also has a **second write** — see "Setting a Jolli API key also writes the tenant site" below.
+- **`backupFolder`** — the most heavily validated key, and the only one whose validation *touches the filesystem*. The value is rejected when it is not absolute, when it contains a parent-directory segment, when it falls under the product's own machine-global directory or the live database's directory, when it lies **inside the Memory Bank folder**, when it lies **inside any git worktree** (a working-tree clean would delete the snapshots), and finally when the directory is not writable. That last check is a real write probe, and it is placed **last on purpose** so a value rejected by any earlier rule leaves nothing behind on disk. Each failure carries its own message; the worktree one names the reason explicitly.
 - **`slack.workspaceUrl`** — this key's validation is folded into its coercion step rather than running as a separate pass, but the effect is the same "reject before persisting" guarantee:
   1. The raw value must parse as a URL at all; a value that fails to parse is rejected.
   2. The parsed URL's scheme must be exactly `https:`.
@@ -127,6 +136,18 @@ Setting or removing `globalInstructions` is the one config key whose update has 
 
 This is the CLI-side opt-in surface for the block, mirroring the VS Code Settings toggle. The block is written only because the user explicitly set this key here — it is never written by a bare `jolli enable`, which only *applies* an already-persisted decision. The block content, target files, and host gating are spec 241; the tri-state switch semantics are spec 242.
 
+### Setting a Jolli API key also writes the tenant site
+
+`jolliApiKey` is the one key whose successful `--set` writes **two** fields. The key's own payload encodes the tenant address it belongs to; that address is decoded, checked against the same origin allowlist, stripped of any trailing separator, and persisted alongside the key as the tenant site.
+
+This is required rather than a convenience: requests route on the address carried *inside* the key, while several read-only surfaces — including this command's own display, the status report and the guided front door — deliberately never decode a key, and report the separately-stored site instead. A surface that persisted one without the other would split the product in half silently, with the drift invisible on exactly the surfaces that would have shown it.
+
+Three details are load-bearing:
+
+- The site is written **only when the same invocation actually persists a key**. `--set jolliApiKey=<new> --remove jolliApiKey` in one invocation removes the key and, correctly, does **not** leave the removed key's tenant site behind.
+- A key that cannot be decoded, or that decodes to an address outside the allowlist, contributes **no** site — the previously stored one is left alone rather than being cleared.
+- The tenant site is **not itself a settable key**, so there is no "an explicit set wins over the derived value" rule to get wrong. Making it settable would require adding one.
+
 ### Coupling between `localAgentTool` and `localAgentPath`
 
 These two keys are not independent at save time, and this command is one of several writers subject to the rule rather than its owner (spec 308 owns it). The shared write path applies one invariant on every configuration write, whoever performs it:
@@ -147,7 +168,11 @@ The configuration is global to the user, not per-project. There is no `--cwd` fl
 | Code | Condition |
 |------|-----------|
 | `0`  | Configuration was displayed, listed, set, or removed successfully. |
-| `1`  | A `--set` argument lacked `=`, **or** an unknown key was passed to `--set`/`--remove`, **or** a value failed coercion (e.g. non-positive integer for `maxTokens`), **or** the `jolliApiKey` value failed origin-allowlist validation, **or** the `slack.workspaceUrl` value failed URL-shape/host validation. |
+| `1`  | A `--set` argument lacked `=`, **or** an unknown key was passed to `--set`/`--remove`, **or** a value failed coercion (e.g. non-positive integer for `maxTokens`), **or** the `jolliApiKey` value failed origin-allowlist validation, **or** the `backupFolder` value failed any of its location or writability rules, **or** the `slack.workspaceUrl` value failed URL-shape/host validation. |
+
+Every failure path sets the exit code and returns rather than throwing, so no stack trace is ever printed and the generic fatal-error handler is not involved. Failures print only to standard error; nothing is written to standard output.
+
+`--list-keys` short-circuits ahead of everything else, so it wins even when `--set` or `--remove` were passed in the same invocation — those are silently not applied.
 
 ## Notable Behavior
 
@@ -157,12 +182,17 @@ The configuration is global to the user, not per-project. There is no `--cwd` fl
 - **Removing a key writes the absence to disk.** Subsequent display omits the key entirely; subsequent `--remove` of the same key is a no-op.
 - **The default boolean for *Enabled keys is "enabled".** A key that is absent from the config is treated as `true` by the rest of the system; setting it to `false` is the only way to opt out of an integration.
 - **Display masking is recognizability-preserving.** The first 6 and last 4 characters are kept so a user can confirm at a glance which key is stored without exposing the full secret in screenshots or logs.
-- **`globalInstructions` is the only key with a filesystem side effect.** Every other key only mutates `config.json`; setting `globalInstructions` also writes to or removes from the AI hosts' global instruction files as part of the same command, synchronously, before the success line prints.
+- **`globalInstructions` is the only key whose *successful set* has a filesystem side effect.** Every other key's set only mutates the configuration file; setting this one also writes to or removes from the AI hosts' global instruction files as part of the same command, synchronously, before the success line prints.
+- **But `backupFolder` has a filesystem side effect during *validation*, and it is not transactional.** Its writability check creates the directory. Validation runs per `--set` entry, inside the loop, while the persist happens once at the end — so a `--set backupFolder=…` that passes, followed by a later `--set` that fails, leaves the created directory on disk with **nothing persisted**. That is the one residue the otherwise all-or-nothing batch can leave. (Surprising.)
+- **Setting any key at all silently migrates one legacy field.** The read that precedes every write folds a retired sync flag onto its replacement and deletes the retired name from the in-memory object — and that same object is what gets written back. So an unrelated `--set` rewrites the file with the old name gone. (Notable.)
+- **There is no way to read one key.** There is no `--get`; the bare form dumps the entire stored configuration, including keys `--set` cannot write.
+- **Two stored shapes display unreadably.** The bare form stringifies any non-array value, so the nested container behind the dotted pseudo-key and the per-logger level overrides both render as an opaque object marker. `slack.workspaceUrl` is therefore settable but not readably displayable. (Surprising.)
 - **Setting `localAgentTool` alone silently clears `localAgentPath`.** It is the one key whose update can remove a *different* key's value, and the removal is not reported in this command's one-line success output. Batching both keys in the same invocation is the way to keep the path — see the coupling section. This command is also the only surface that can *set* an explicit path at all; every other writer of the tool key either omits the path or clears it.
 
 ## Shared Behavior
 
-- The Jolli-API-key validation rule (origin allowlist + recognized shape + HTTPS-only with suffix-boundary host check) is the same rule used everywhere a Jolli API key can be stored in the CLI, the VS Code extension, and the IntelliJ plugin.
+- The Jolli-API-key validation rule (origin allowlist + recognized shape + HTTPS-only with suffix-boundary host check) is the same rule used everywhere a Jolli API key can be stored in the CLI, the VS Code extension, and the IntelliJ plugin. The paired tenant-site write is likewise required of every surface that persists a pasted key.
+- `slack.workspaceUrl` is the one setting that was **dropped** from both IDE surfaces rather than moved: neither the desktop-editor settings panel nor the IntelliJ dialog carries a field for it, and both leave an already-stored value untouched when they save. This command is the only way to set it.
 - The `slack.workspaceUrl` validation rule (HTTPS-only + suffix-boundary host check) mirrors the shape of the Jolli-API-key validation rule above, applied to the `slack.com` host family instead of the Jolli origin allowlist.
 - The `localAgentTool` accepted set is the single agent-tool registry shared with the interactive provider setup picker (spec 57), the diagnostic command's credential label and sign-in hints (spec 59), and the runtime backend that actually drives the chosen tool (spec 280).
 - The tool/path clearing invariant applied to this command's writes is owned by spec 308, which also lists the other writers subject to it; how a stored path is attributed to a tool at read time is spec 280. The diagnostic command's failure message names `--remove localAgentPath` as its remedy (spec 59).

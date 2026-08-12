@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-A two-phase, idempotent migration that upgrades stored summaries from the legacy "flat records list" format to the current "unified hoist tree" format and upgrades the lookup index from its legacy shape to the current flat-with-parent-links shape, retaining the legacy data store for a 48-hour safety window before reclamation.
+A two-phase, idempotent migration that upgrades stored summaries from the legacy "flat records list" format to the current "unified hoist tree" format and upgrades the lookup index from its legacy shape to the current flat-with-parent-links shape, retaining the legacy data store for a 48-hour safety window before reclamation — plus the separate, purely in-memory normalization that raises a single already-parsed legacy payload to the unified-hoist shape for any caller that needs one, whether or not the staged migration above has ever run.
 
 ## Scope
 
@@ -14,12 +14,14 @@ A two-phase, idempotent migration that upgrades stored summaries from the legacy
 - Idempotency on re-run, including resumption after interruption.
 - Reader detection of format version and how readers handle a mixed corpus.
 - What is preserved versus dropped during conversion.
+- The separate, purely in-memory legacy-to-unified normalization: its version gate, what it hoists onto the root it produces, what it drains into the cleanup queue, and what it does not collect at all.
 
 **Out of scope:**
 - The structure of the index itself (covered by the summary-index topic).
 - The structure of the unified-hoist tree itself (covered by the summary-tree topic).
 - The pipelines that write new summaries (covered by the pipeline topic).
 - A separate, parallel migration from the durable store to a folder-based mirror (covered by the local-folder-mirror topic).
+- The callers that invoke the in-memory normalization and decide whether to persist its result (covered by the regeneration and identity-migration topics).
 
 ## Data Contracts
 
@@ -156,6 +158,23 @@ Readers must tolerate both legacy-version and current-version payloads coexistin
 
 These rules guarantee no information loss when the writer for a downstream operation encounters legacy-format input.
 
+### In-memory legacy-to-unified normalization
+
+Distinct from the two phases above and reachable without them: a pure, no-I/O helper that takes one already-parsed payload and returns it in the unified-hoist shape. It performs no reads and no writes — a caller that wants the upgrade to stick persists the result itself.
+
+**Version gate.** A payload at or above the unified-hoist version is returned unchanged, by identity. The test is "at or above", not "equal to", so a payload from a *later* format is a no-op too rather than being downgraded.
+
+**Otherwise, a new root is produced from the old one:**
+
+- Topics and recap are resolved with the legacy-aware rules stated above, so a legacy container whose narrative lives only on its children surrenders it to the root.
+- The legacy diff-statistics field is removed from the result unconditionally; it is converted to the current field first, but only when the current one is absent and the legacy one present. The value stamped is the **aggregate** the old read path would have displayed, not the node's own raw figure — a container's own figure is only its delta, and once the current field is present readers return it directly instead of re-aggregating, so stamping the raw delta would silently shrink the displayed totals.
+- Plans, notes, external references and end-to-end scenarios are hoisted from the whole tree, the root's own included.
+- Skill references are collected through the shared accumulating fold, and the identifiers that fold banked as superseded are stripped off every row before it is written — a banked marker left on a persisted row is a live-looking field naming a document already queued for deletion.
+- The **memory** article's identifier and URL are hoisted by the newest-by-activity rule, the root's own pair competing on equal terms with its descendants'. Losers join the cleanup queue.
+- The cleanup queue is a **set union** of: the memory-article hoist's losers, the root's own already-pending queue, every descendant's already-pending queue, and the identifiers the skill fold banked. The unresolved-orphan-hash list is likewise a set union of the root's own and its descendants'.
+- Every descendant is passed through the same hoist-strip the live pipelines use, so the root is the sole carrier of the hoist family.
+- Each hoisted list other than topics is written only when non-empty; topics is always present on the root, possibly empty, and recap only when one was resolved.
+
 ### Per-entry resilience
 
 Phase 1 and Phase 2 both proceed entry-by-entry: a single bad payload causes that one entry to be skipped, never aborts the run. The final batch contains every entry that succeeded.
@@ -193,6 +212,20 @@ When promoting a single-record legacy payload to a leaf node, the resulting node
 
 When promoting a multi-record payload, the resulting root has no own topics, no own diff stats, no own LLM-call metadata. Those fields exist only on the children. The tree's container node thus mirrors the structure produced by the current pipeline's squash-style merge.
 
+### The normalization's cleanup queue deduplicates; the consolidation path's does not
+
+The queue this helper writes is built as a set, so an identifier named by more than one of its contributing sources — a descendant's already-pending entry that the skill fold also banked, say — is listed once. The N-to-1 consolidation performs the same drain from the same kinds of source by plain concatenation, so the queue it writes can name one identifier twice. Both are "identifiers pending cleanup", and the difference is invisible in the shape of the field, which is a plain list either way.
+
+### The normalization hoists one published document, where the consolidation hoists two — and the second is dropped, not queued
+
+This is the real asymmetry against the consolidation path, and it loses data rather than merely differing.
+
+The consolidation treats the commit-level **skill** article as a second document under the identical rule it applies to the memory article: newest-by-activity child wins and is adopted onto the merged root, every other candidate's identifier joins the cleanup queue, and the pair is stripped off the retained children so a later fold cannot re-report an article that is gone.
+
+The normalization applies that rule to the memory article **only**. It never collects the skill-article pair at all. The root's own pair survives, because the new root is built by copying the old one — but the hoist-strip removes that pair from every descendant, and since nothing collected it first, a descendant-held skill-article identifier is neither adopted onto the new root nor added to the cleanup queue. The article is simply gone from the memory: nothing points at it, and nothing is scheduled to delete it.
+
+**Reachability: latent, not observed.** The commit-level skill article postdates the tree format this helper accepts as input — only a payload *below* the unified-hoist version enters the conversion at all, every writer able to attach such an article stamps the current format version, and the push step that mints one requires the payload to already carry skill records, which those same writers are the only producers of. So no stored payload that reaches this helper can carry the field today. The helper nonetheless performs the skill fold and its banked-identifier drain on the same unreachable input. (Notable: a data-loss shape held out of reach only by the version gate, in a helper that is otherwise careful with exactly this class of identifier.)
+
 ### Safety net is a feature, not a bug
 
 The 48-hour retention is intentional. Operators who notice a bad migration outcome have the legacy ledger intact for inspection and manual recovery. Reclamation happens passively through the cleanup probe, never as part of the migration command itself.
@@ -204,7 +237,8 @@ The Phase 1 short-circuit checks for the completion marker on the current branch
 ## Shared Behavior
 
 - **Summary index format** — the legacy and current shapes of the index, the version marker, the entry shape produced by Phase 2's flatten, and how readers branch on the index version.
-- **Summary tree format** — the unified-hoist root contract, hoist-managed fields, and the per-version branching readers apply when extracting topics or per-source groups during downstream operations.
+- **Summary tree format** — the unified-hoist root contract, hoist-managed fields, the hoist-strip applied to descendants, the accumulating skill fold and the banked-superseded marker it mints, and the per-version branching readers apply when extracting topics or per-source groups during downstream operations.
+- **Squash consolidation** — the N-to-1 path that hoists *both* published documents under one rule and drains the fold's banked identifiers by concatenation, which is what the in-memory normalization diverges from above.
 - **Storage backend** — atomic batch write semantics, branch-creation behavior, and the pure-plumbing read/write helpers used to manipulate the durable store without checkout.
 - **Cross-process lock** — the shared lock that index writes (Phase 2) require their callers to hold.
 - **Pipeline operations** — the live writers (commit, amend, squash, rebase pick) whose readers must tolerate the mixed corpus described above.

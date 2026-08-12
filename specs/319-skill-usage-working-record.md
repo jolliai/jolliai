@@ -13,13 +13,14 @@ Every captured entry into an agent Skill is persisted as **one accumulating mark
 - The markdown render/parse round-trip (frontmatter and invocation detail rows), including how each degrades on corrupt input.
 - `upsertSkillEntry`: what it copies from the fold, what it must never resurrect, and the near-write reload.
 - The rule that every field-by-field rebuild of a `PlansRegistry` must carry the `skills` map, and the repo-wide test that enforces it.
+- `projectActiveSkills` / `ActiveSkill` — the CLI-owned display projection over this registry, shared by both IDE hosts, and its counters-from-the-delta / timestamps-from-the-row rule.
 
 **Out of scope:**
 - Producing a `SkillUse` from a Claude transcript (spec 320), an OpenCode store (spec 325), or a Codex transcript (spec 326).
 - Computing `SkillUsage` figures for a session (spec 321) — this spec only folds a number it is handed.
 - Freezing a row onto a commit, `archivedTotals` as an archival baseline, and the orphan-branch copy (spec 322).
 - Rendering skills into a commit summary, the PR-wide aggregate, and the Memory Bank visible layer (spec 323).
-- The VS Code Context list row and its exclusion checkbox (spec 324).
+- The VS Code Context list row and its exclusion checkbox (spec 324), the IntelliJ CONTEXT row (spec 132), and the bridge adapter that serves the projection to the JVM host (spec 336) — this spec owns the projection itself, not any surface's rendering of it.
 - The `plans.json` file itself, its lock (`withPlansLock`), and the plan / note / reference maps that share it (specs 29, 42, 43, 179).
 
 ## Data Contracts
@@ -31,7 +32,7 @@ Two places, both per-project and both gitignored:
 - `<projectDir>/.jolli/jollimemory/skills/<source>/<stem>.md` — the accumulating markdown, one file per skill per host. `skillDir` / `skillPath` build it off `getJolliMemoryDir(cwd)`, so it is worktree-local like `sessions.json` and `plans.json`.
 - `plans.json.skills` — `Readonly<Record<string, SkillEntry>>`, keyed `<source>:<skill>` (the **mapKey**). The map is **optional** on `PlansRegistry`, which is the source of the erasure hazard recorded under Notable Behavior.
 
-`SkillSource` is `"claude" | "opencode" | "codex" | "cursor"`. Gemini, Antigravity, Cline and Devin are absent because they have no skill concept on disk at all — nothing to capture, as opposed to something not yet done.
+`SkillSource` is `"claude" | "opencode" | "codex" | "cursor" | "kimi"`. Gemini, Antigravity, Cline and Devin are absent because they have no skill concept on disk at all — nothing to capture, as opposed to something not yet done. Each member also has a human host label (`skillSourceLabel`, with a capitalize-the-raw-value fallback so an unlabelled member degrades rather than rendering an empty segment); the surfaces that consume that label are outside this spec.
 
 ### The filesystem stem
 
@@ -142,6 +143,16 @@ Everything runs inside `withPlansLock(cwd)`:
 
 A `withPlansLock` timeout does not abort the write — it logs a warning and proceeds best-effort, relying on the per-key merge above to mitigate.
 
+### The shared display projection
+
+`projectActiveSkills(cwd)` ([`cli/src/core/skills/SkillProjection.ts`](../cli/src/core/skills/SkillProjection.ts)) is the one read path that turns this registry into rows an IDE Context surface can show, and it lives in the CLI rather than inside one editor because **both** hosts consume it: the VS Code extension imports it (spec 324), and the IntelliJ plugin reaches the same function over a bridge operation (spec 336). Neither host re-derives it.
+
+It loads the registry, computes `uncommittedDelta(entry)` for every row, **skips a row whose delta is `undefined`**, and sorts the survivors newest-first by `lastModified`. The filter is what separates skills from references: a reference row is deleted when its commit lands, so every row in that registry is uncommitted by definition, while a skill row is guarded and left in place — returning all of them would put every skill ever used back on a panel as fresh working state.
+
+The projected `ActiveSkill` carries `kind: "skill"`, the `mapKey`, `source`, `skill`, optional `plugin`, `entryPaths`, `invocationCount`, `firstUsedAt`, `lastUsedAt`, optional `usage`, `sourcePath`, optional `detection`, and `lastModified` (mirroring `lastUsedAt` so a skill sorts against plans / notes / references in one list). It is structurally assignable to spec 323's `SkillTableRow`, which is what lets a live view and a committed file share one renderer.
+
+**Its one novel rule is where each field is read from: the COUNTERS come from the delta, the TIMESTAMPS from the row.** `invocationCount` and `usage` are the delta's — the row's running total would overstate a re-used skill by everything already frozen onto earlier commits, and these rows preview what the *next* commit will carry. `firstUsedAt` / `lastUsedAt` / `lastModified` are the row's, because `SkillArchivedTotals` carries no time fields and archival stamps its ref from the row's bounds too (spec 322) — so reading them from the row is what keeps the preview in parity with the committed record rather than a leak of the same kind. An absent `usage` stays absent through the projection; it is never rendered as a zero.
+
 ### Normalization must pass `skills` through untouched
 
 `normalizePlansRegistry` strips legacy fields from `plans` / `notes` and **drops guarded rows** from `references` (a committed reference row always carries `commitHash`, and reference rows are deleted rather than guarded). Skills take neither treatment: they are a post-legacy artifact type with no dead fields and no `ignored` rows, and they follow the plan/note lifecycle where **guarded rows MUST survive**. Copying the reference branch here would delete every archive guard on load.
@@ -168,7 +179,7 @@ Per skill file / registry row:
 - **`invocationCount` carries a known bounded imprecision.** It advances by the number of incoming invocations not present in the *retained* detail list, and invocations already trimmed past the cap are no longer available to dedupe against — so a cursor rewind that re-reads them counts them a second time. The alternative, deriving the total from the retained list, would under-report by the whole trimmed tail on every capped skill, which is the worse error. Rewinds are rare (version skew, catch-up) and the drift is bounded by what was trimmed.
 - **The working file is load-bearing, not a convenience cache.** Three ways: `contentHashAtCommit` hashes THIS file, so with no file the archive guard is inert; archival is a byte-for-byte COPY of it rather than a re-render from the row, which keeps the display format in one place; and it exists from the moment of capture, so working state is inspectable on disk without an IDE.
 - **The file is never cleared or zeroed at archive time**, even though that is the obvious way to answer "what is uncommitted". It is the only dedup ledger: main transcripts ride a monotonic mark, but subagent files are re-scanned in full on every pass by design (spec 320), so invocations are re-emitted and deduped by `at` against what is already on disk. Clearing it would make a re-scan of an already-archived transcript read as fresh usage. Spec 322 subtracts a stored baseline instead.
-- **A skill entered again after being committed keeps ACCUMULATING in the same row.** This is the property that separates skills from plans and notes throughout the subsystem — it is why the guard alone cannot answer "what is uncommitted", why `detectActiveSkillsForBranch` and the VS Code panel use `uncommittedDelta` instead of the guard predicate, and why `archivedTotals` exists.
+- **A skill entered again after being committed keeps ACCUMULATING in the same row.** This is the property that separates skills from plans and notes throughout the subsystem — it is why the guard alone cannot answer "what is uncommitted", why the shared display projection above filters on `uncommittedDelta` instead of the guard predicate, and why `archivedTotals` exists.
 - **The stem's hash suffix is unconditional, not a fallback.** It reads worse than a plain substitution and is the only thing making the mapping injective; the readable prefix is free to collide.
 - **The invocation row's `args` is JSON-encoded specifically so the row can be parsed, and the parser must lift it out before splitting.** This is the one ordering constraint in the format: an `args` value containing ` · ` is legitimate host-supplied text, and a naive split-then-scan reads its contents as sibling `body:` / `failed` fields.
 - **A corrupt file and a missing file are the same outcome by construction.** `parseSkillMarkdownFromString` returning `null` collapses to `undefined` at the call site, so the pass folds against "no prior history" and rewrites the file — losing the unreadable history but never throwing into a hook and never leaving the skill uncapturable.
@@ -179,6 +190,6 @@ Per skill file / registry row:
 - The `SkillUsage` figures folded here are computed by spec 321, and corrected after a conversation detach by spec 306.
 - `commitHash`, `contentHashAtCommit`, `archivedTotals` and `uncommittedDelta` are owned by spec 322; this spec only preserves them.
 - Rendering skills onto a commit summary, the PR-wide aggregate, and the Memory Bank `skills--<hash8>.md` visible file are owned by spec 323.
-- The VS Code Context list projection (`detectSkills` / `SkillInfo`) and the per-skill exclusion checkbox are owned by spec 324.
+- The projection above is consumed by spec 324 (the VS Code Context row, whose own `SkillInfo` is an alias of `ActiveSkill` and whose `detectSkills` is a one-line delegate), by spec 336 (the JVM bridge adapter) and, through it, by specs 132 and 222.
 - `plans.json`, `withPlansLock`, `loadPlansRegistry` / `savePlansRegistry` and the sibling plan / note / reference maps are owned by specs 29, 42, 43 and 179; the reference markdown store (spec 179) is the format precedent this file follows.
 - The exclusion selection store that supplies `exclusions.skills` is owned by spec 188.

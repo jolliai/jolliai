@@ -66,6 +66,9 @@ gate a change.
 - [286 — Local-Agent Login-Expiry Remediation Guidance](286-local-agent-login-expiry-remediation.md) — persist an auth-expired placeholder summary and surface one shared remediation message inline and at next session start.
 - [291 — Generation Repair Ladder](291-generation-repair-ladder.md) — the shared interactive ladder that diagnoses which of three provider/credential mismatches applies and offers the smallest fix in one prompt.
 - [294 — Commit-Subject Merge Algorithm](294-commit-subject-merge-algorithm.md) — fold ordered commit subjects into one line deterministically via structural prefix, then ticket dedupe, then plain join.
+- [331 — Local-Agent Optional-Flag Degradation](331-local-agent-optional-flag-degradation.md) — learn after a failed run which isolation flag the installed agent CLI rejects, drop it, retry in the same call, and remember the answer per tool-and-version.
+- [333 — Conversation Usage Recomputation from Transcripts](333-conversation-usage-recomputation-from-transcripts.md) — re-derive a memory's token and cost figures per node from the sessions its owned transcripts still hold, replacing the stored figures outright rather than adjusting by a delta.
+- [334 — Summary Regeneration Field Contract](334-summary-regeneration-field-contract.md) — which fields an end-to-end regeneration rebuilds from a fresh model call, which it derives afresh, and which it carries over from the stored memory untouched.
 
 ## Transcript and session sources
 
@@ -91,6 +94,7 @@ gate a change.
 - [277 — Devin CLI Session and Main-Chain Transcript Reading](277-devin-cli-session-and-transcript-reading.md) — reconstruct the canonical linear conversation from a message forest in one machine-global embedded store.
 - [278 — Antigravity Conversation Discovery and Transcript Reading](278-antigravity-session-and-transcript-reading.md) — recover the workspace path from a per-conversation encrypted database, then read the plaintext transcript beside it.
 - [279 — Cursor CLI (cursor-agent) Session and Transcript Reading](279-cursor-cli-session-and-transcript-reading.md) — read the terminal `cursor-agent` product's own plain JSON/JSONL layout, unrelated to the Cursor IDE source.
+- [339 — Kimi Code CLI Session Discovery and Transcript Reading](339-kimi-code-cli-session-and-transcript-reading.md) — find this host's sessions with no lifecycle hook, recover each one's working directory from a per-session state document, and normalize its wire-event stream into canonical turns.
 - [305 — Re-Enable Transcript Discovery Catch-Up](305-re-enable-transcript-discovery-catch-up.md) — re-scan recorded sessions from their frozen watermark when a repository is re-enabled, recovering the window during which discovery was suspended; editor-only, uncapped, and paid inside the enable gesture.
 
 ## Working-memory state: overlays, selection, pins
@@ -100,6 +104,7 @@ gate a change.
 - [188 — Commit Exclusion Selection Store](188-commit-exclusion-selection-store.md) — a sticky per-project file holding the user's manual EXCLUDE set plus the AI-relevance ranking layer for the next pipeline run.
 - [189 — Hidden Conversations Store](189-hidden-conversations-store.md) — remember conversations the user removed from the active list, with snapshot-scoped semantics so new activity brings the row back.
 - [246 — Pin Store](246-pin-store.md) — per-project, per-repo-and-branch records of artifacts pinned to the top of the Current Branch view, carrying only reopen identity.
+- [337 — CLI-Owned Working-Area Context Service](337-cli-working-context-service.md) — the one command-line-owned set of operations over a worktree's uncommitted plans, notes and references, including two deliberately non-interchangeable visibility rules and a load-time normalization that hard-deletes legacy shapes.
 
 ## Git hooks and the operation queue
 
@@ -189,6 +194,8 @@ gate a change.
 - [180 — Codex Reference Extraction via Polling](180-codex-reference-extraction-via-polling.md) — extract references from recent Codex transcripts on the host UI's refresh timer, since Codex offers no lifecycle hook.
 - [255 — Source-definition DSL and evaluation engine](255-source-definition-dsl-and-engine.md) — a pure engine over declarative extraction pipes, where a definition may only name allow-listed transforms — the security boundary.
 - [256 — Slack thread reference capture](256-slack-thread-reference-capture.md) — resolve a thread's shareable link from whatever the transcript offers and void the whole capture when no link can be established.
+- [340 — Kimi Artifact Discovery and Reference Extraction](340-kimi-artifact-discovery-and-reference-extraction.md) — the hook-free pass that scans this host's recent sessions from two independent triggers under a per-workspace single-flight with dirty-rerun.
+- [342 — MCP Business-Payload Normalization](342-mcp-business-payload-normalization.md) — one shared closed registry coercing an already-parsed tool-result payload into the single-entity shape its source definition expects, defaulting to identity.
 
 ## Skill usage capture and reporting
 
@@ -200,6 +207,8 @@ gate a change.
 - [324 — VS Code Skills Context Row](324-vscode-skills-context-row.md) — one collapsed "Skills used" row carrying a sentinel id, filtered by the uncommitted delta, with every per-kind decision resolved from one injected table.
 - [325 — OpenCode Skill Invocation Capture](325-opencode-skill-invocation-capture.md) — read the host's embedded store for first-class skill-tool rows on a polling tick, with spend that can only ever be an estimate.
 - [326 — Codex Skill Inference From File Reads](326-codex-skill-inference-from-file-reads.md) — infer an entry from a shell command that reads a `SKILL.md`, matching the path shape rather than the verb and marking every record heuristic.
+- [336 — IntelliJ Skills Bridge Projection](336-intellij-skills-bridge-projection.md) — the JVM host computes and renders nothing about skills itself; one adapter turns every skills question three panels can ask into a single cross-process request.
+- [341 — Kimi Skill Invocation Capture](341-kimi-skill-invocation-capture.md) — a first-class skill tool makes this host's records observed rather than heuristic, correlated with their results to learn whether each invocation succeeded.
 
 ## Topic knowledge base (wiki)
 
@@ -258,6 +267,8 @@ gate a change.
 - [301 — Memory Reference Identifier and Copy Chip](301-memory-reference-id-chip.md) — a memory's human-facing identifier, minted only once the backend has one, and the click-to-copy chip that surfaces it — always on detail panels, synced-only in lists, so a chip in a list is itself the "already pushed" signal.
 - [310 — Per-Repo Outbound-Push Control](310-per-repo-outbound-push-control.md) — a machine-global, identity-keyed `pushDisabled` store and one `isOutboundPushAllowed` predicate gating every CLI/VS Code/IntelliJ push path, plus a current-repo toggle on each surface.
 - [327 — Repo-Wide Push-Refusal Classification](327-repo-wide-push-refusal-classification.md) — one shared error-name set tells a whole-repository refusal from a per-document failure, so every push loop stops instead of firing N doomed requests.
+- [335 — Pre-Push Worker Result Handoff](335-pre-push-worker-result-handoff.md) — the file-based request / result / liveness protocol by which the pre-push hook hands one push's commits to a detached worker and then watches it publish a partial outcome after every settled commit.
+- [343 — Legacy Skill-Article Migration](343-legacy-skill-article-migration.md) — adopt one previously-shipped per-skill article identifier as the commit's aggregate article and queue every other for deletion, so no published article is left with nothing pointing at it.
 
 ## PR authoring
 
@@ -294,7 +305,9 @@ gate a change.
 - [289 — IDE-Bridge Refresh Notification Channel](289-ide-bridge-refresh-notification-channel.md) — push coarse queue and orphan-ref change notices to the IDE host, multiplexed onto the response stream and distinguished by having no correlation id.
 - [290 — Claude Plugin Session Bootstrap](290-claude-plugin-session-bootstrap-hook.md) — the plugin's single manifest action: a per-session reconciler that restores canonical installation under short-budget locks and never overrides a deliberate disable.
 - [303 — Claude Plugin Front-Door Menu Content](303-claude-plugin-front-door-menu-content.md) — the body of the plugin companion's action menu: its revision-ordering invariant over the standalone menu, the status fields it reads, and its provider-aware "can generate memories" derivation.
-- [328 — Codex Plugin Package](328-codex-plugin-package.md) — the Claude plugin's structural sibling and the five places the two hosts diverge: manifest paths, a strict one-JSON-object hook envelope, no plugin MCP manifest, committed static skills, and tag-driven host isolation.
+- [328 — Codex Plugin Package](328-codex-plugin-package.md) — the Claude plugin's structural sibling and the places the two hosts diverge: manifest paths, a strict one-JSON-object hook envelope, no plugin MCP manifest, committed static skills, and tag-driven host isolation.
+- [330 — Codex Plugin Front-Door Menu Content](330-codex-plugin-front-door-menu-content.md) — the third front-door body: no frontmatter metadata block, a hook-trust precondition when no routing target answers yet, and memory tools looked up by bare name inside the host's namespace.
+- [338 — Refresh Escalation Rule](338-refresh-escalation-rule.md) — one shared sticky flag that a heavy refresh signal can set and a light one can never clear, so a light signal landing on a pending heavy one escalates rather than demotes.
 
 ## Workflows
 
@@ -368,6 +381,7 @@ gate a change.
 - [247 — Working-Memory Review Panel](247-vscode-next-memory-review-panel.md) — a singleton editor webview mirroring the sidebar's next-commit draft through the same host handler, so the two can never drift.
 - [295 — Sidebar Status Tree](295-vscode-status-tree-panel.md) — the STATUS tab's three degenerate render states plus the enabled row set, where each dual-variant integration shows its merged row and an additional standalone warn row.
 - [304 — Zero-Write Contract for a Manually-Disabled Repository](304-manually-disabled-zero-write-contract.md) — the in-process suppression flag seeded before the first log line, the full inventory of writes it stops, and the carve-outs that still reach disk.
+- [329 — Context Snapshot Markdown Preview](329-vscode-context-snapshot-markdown-preview.md) — a read-only virtual-document scheme serving rendered markdown for snapshots composed in memory, keyed by a self-describing reference in the URI so a tab still renders after the host that built it is gone.
 
 ## The IntelliJ surface
 
@@ -422,3 +436,4 @@ gate a change.
 - [316 — IntelliJ Memory Bank Repo-Scope Filter](316-intellij-memory-bank-repo-scope-filter.md) — a synthetic "All repos" breadcrumb entry on its own callback, broadening the explorer through one volatile, never-persisted filter field.
 - [317 — IntelliJ Archived Reference Body Read](317-intellij-archived-reference-body-read.md) — derive the command-line surface's archived-reference file stem before either read leg, since the GitHub and context7 sources carry native ids that are not path-safe.
 - [318 — IntelliJ Memory Bank Folder Setting Key Migration](318-intellij-memory-bank-folder-setting-key-migration.md) — one field with a legacy-key alias recovers a pre-1.1 folder path on load and rewrites it under the canonical key on the next save.
+- [332 — IntelliJ Enable / Disable Surface](332-intellij-enable-disable-surface.md) — the two gestures that turn capture on and off for one repository, the cached verdict and protection window that let the enable repaint before the work finishes, and the one-way projection folding a legacy machine-wide pause onto this repository's own opt-out.

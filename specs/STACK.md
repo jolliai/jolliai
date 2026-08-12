@@ -377,11 +377,19 @@ cd intellij
 ./gradlew buildPlugin test verifyPlugin -x buildSearchableOptions
 ```
 
-`test` `dependsOn` **two** `Exec` tasks — `checkGlobalState` (`bash scripts/check-global-state.sh`,
-§6.4) and `checkNoDirectLlmHttp` (`bash scripts/check-no-direct-llm-http.sh`, §6.5) — so both gates
-run on every local `./gradlew test` too, with no separate pipeline step. Both are
-`onlyIf { !os.name.contains("win") }` (the gates are bash; CI is Linux) and both sit in Gradle's
-`verification` group.
+`test` `dependsOn` a set of `Exec` tasks, so every one of them runs on a local `./gradlew test` too,
+with no separate pipeline step:
+
+- `checkGlobalState` — `bash scripts/check-global-state.sh`, §6.4.
+- `checkNoDirectLlmHttp` — `bash scripts/check-no-direct-llm-http.sh`, §6.5.
+- `checkActionsDumbAware` — `bash scripts/check-actions-dumbaware.sh`. Every action class under
+  `actions/` must declare `DumbAware`; a new action without the marker fails `./gradlew test` with a
+  hard error and no compiler warning anywhere. It greps comment-stripped text, and it also fails when
+  it finds **zero** files — a sweep that silently matched nothing would pass forever.
+
+They are all `onlyIf { !os.name.contains("win") }` (the gates are bash; CI is Linux) and all sit in
+Gradle's `verification` group. Read the list off `dependsOn` rather than trusting a count here: this
+set has grown twice, and the tasks are registered next to each other in the build script.
 
 ### 5.5 Coverage floors and exclusions — quoted
 

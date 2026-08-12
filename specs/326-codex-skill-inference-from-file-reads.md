@@ -116,7 +116,7 @@ The `skills` mark is deliberately **independent** of the shared `lineNumber` cur
 
 ### Dispatch and drivers
 
-[`SkillTranscriptScanner.ts`](../cli/src/core/skills/SkillTranscriptScanner.ts) holds the per-source table for the line-oriented path. It has exactly **two** entries: `claude` and `codex`. A source absent from it has no skill extraction, and the reasons differ:
+[`SkillTranscriptScanner.ts`](../cli/src/core/skills/SkillTranscriptScanner.ts) holds the per-source table for the line-oriented path. Codex has an entry in it, alongside every other source whose transcript is JSONL lines and whose skill invocation is readable — Codex is the only one of them whose entry is inferred rather than observed. A source absent from the table has no skill extraction, and the reasons differ:
 
 | Source | Why absent |
 |---|---|
@@ -126,7 +126,7 @@ The `skills` mark is deliberately **independent** of the shared `lineNumber` cur
 
 No matcher may be written for Cursor or Copilot CLI until a real invocation is captured from a live run. This repository has already shipped a parser whose fixtures and code were both imagined, agreeing with each other and with nothing real.
 
-The Codex path is driven from `CodexDiscovery.discoverCodexConversations`, which calls `scanSkillsWithCursor(session.transcriptPath, cwd, "codex")` per in-scope session. `DiscoveryCatchUp` — the re-enable catch-up sweep (spec 305) — **explicitly skips Codex sessions** so it does not duplicate that work or mis-order the references-first scan there.
+The Codex path is driven from `CodexDiscovery.discoverCodexConversations`, which calls `scanSkillsWithCursor(session.transcriptPath, cwd, "codex")` per in-scope session. That entry point is reached from the sidebar's periodic Active Conversations refresh and from the post-commit queue drain, where it runs concurrently with the other hookless source against one shared deadline and is **abandoned rather than cancelled** if the deadline wins — its writes still land, and this commit may simply miss an artifact the pass extracted moments later. `DiscoveryCatchUp` — the re-enable catch-up sweep (spec 305) — **explicitly skips Codex sessions** so it does not duplicate that work or mis-order the references-first scan there.
 
 ## State Transitions
 
@@ -147,8 +147,8 @@ The Codex path is driven from `CodexDiscovery.discoverCodexConversations`, which
 - **The glob rejection was found by corpus run, not by fixtures.** `for f in .../skills/*/SKILL.md` matches the path shape structurally and would have shipped a skill named `*`. Recorded because the same class of false positive is what any future loosening of `SKILL_PATH` will reintroduce.
 - **`lastLine` advances before filtering, on purpose.** The cursor records how far the scan *looked*, not how far it *matched*; anything else would re-read the same non-matching lines forever.
 - **The session key would be wrong for Codex, and is never written.** Codex transcripts are `rollout-<timestamp>-<uuid>`, so the file stem is not the session id — a latent hazard that only stays latent while Codex reports no usage.
-- **`"cursor"` is a declared but currently unreachable member of `SkillSource`.** The union in [`cli/src/Types.ts`](../cli/src/Types.ts) lists `claude | opencode | codex | cursor`, but there is no `CursorSkillScanner`, no `cursor` entry in the dispatch table, and no other producer of a `source: "cursor"` skill row anywhere in the repository. Nothing constructs one today. (Surprising; the union is the set of hosts whose skills are *conceptually* readable, and Cursor is the one member for which no invocation record has yet been found on disk.)
-- **Codex skill capture, like OpenCode's, runs only on the VS Code polling tick.** `discoverCodexConversations` has one caller — the sidebar's 60 s Active Conversations refresh — and the re-enable catch-up sweep skips Codex by design. There is no post-commit Codex skill scan.
+- **`"cursor"` is a declared but currently unreachable member of `SkillSource`.** The union in [`cli/src/Types.ts`](../cli/src/Types.ts) declares it beside the sources that do produce rows, but there is no `CursorSkillScanner`, no `cursor` entry in the dispatch table, and no other producer of a `source: "cursor"` skill row anywhere in the repository. Nothing constructs one today. (Surprising; the union is the set of hosts whose skills are *conceptually* readable, and Cursor is the one member for which no invocation record has yet been found on disk.)
+- **Codex skill capture now rides both the polling tick and the post-commit drain.** `discoverCodexConversations` used to have the sidebar's 60 s Active Conversations refresh as its only caller; the queue drain now calls it too, so a Codex skill read can be captured without the sidebar ever running. The re-enable catch-up sweep still skips Codex by design. The drain's call is deadline-bounded and shares that deadline with the other hookless source, so a slow scan there is dropped from *this* commit rather than delaying it — the extractor's own high-water mark makes the next pass resume from where it stopped.
 
 ## Shared Behavior
 

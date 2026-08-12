@@ -14,7 +14,8 @@ Detect references to plan-class markdown files inside an AI agent's append-only 
 - The triggers that drive scanner invocations and their position relative to other passes — one trigger per producer, fired from a different host event but funnelled into the **same** shared driver.
 - The on-disk cursor that records how far each transcript has been consumed. The cursor is per-transcript and producer-neutral; the host that drives the scan owns persistence.
 - The shared external-plan exclusion policy (path segments, basenames, basename-suffix patterns, and scratch-temp roots) that the driver applies uniformly to every producer's external-plans set. The policy is a function of both the candidate path **and** the current workspace root — a temp-root exclusion is waived for files inside the workspace.
-- The shape of a single plan-registry record.
+- The **discovery-time repository-containment gate** that drops an external candidate belonging to another repository before it can ever enter the registry.
+- The shape of a single plan-registry record, and the fields the registry loader destroys before the driver ever sees a record.
 - The upsert semantics — new entry, updated-at refresh, archive guard, and content-change override — exercised identically for every producer.
 - The interaction between this scan and a separate writer (the source-control commit pipeline) that may stamp registry records with a commit hash.
 - The cross-mutation safety against the sibling notes registry (a note source path suppresses plan auto-registration for the same file).
@@ -24,6 +25,7 @@ Detect references to plan-class markdown files inside an AI agent's append-only 
 - The hosts that fire the trigger:
   - The Claude-agent host (a per-stop hook, fired by the agent each time it completes a response turn) is covered by spec 26.
   - The Codex host (a periodic polling tick that walks transcript rollouts and schedules a scan-with-cap) is covered by the Codex polling-tick spec; its session-discovery layer is covered by spec 18.
+- The **other** mid-session writer of the same records: a registration operation, driven by a watch on the agent's machine-global plan directory, that registers a plan file the moment it appears rather than waiting for the end of a turn (spec 113). This scan is no longer the only path that creates a plan record mid-session, and the two are independent — neither observes the other.
 - The session-recording writes that may run alongside each scan invocation are owned by the trigger spec, not this one.
 - Any model call — this scan does no LLM work.
 - The transcript file's own format beyond the line-level signals each producer scanner is contracted to recognise. The per-producer signal grammars are listed below at the level the driver depends on; the full envelope contracts live in spec 153 (for the reference pipeline that uses the same envelope parsing) and in spec 181 (for the Codex apply-patch envelope).
@@ -101,9 +103,13 @@ One record per plan slug. Fields:
 - **commit hash** (string or null): null while the plan is still pending; populated by the commit pipeline once the plan has been associated with a commit.
 - **content hash at commit** (optional, string): a hash of the plan source file's content captured at the moment the commit pipeline associated it with a commit. Used as the archive guard.
 
+Those are all the fields a live record has. Three others appear only in legacy data and are destroyed by the registry loader before the driver ever sees a record — a **hide flag** (whose presence set to true causes the whole record to be **dropped**, not hidden), a **branch**, and an **edit count** (the last two stripped from survivors). The driver therefore never has to reason about them, never writes one, and cannot resurrect one: a record it hands back carries only the fields above.
+
 ### Plans-registry envelope
 
-A versioned container holding the plan records keyed by slug, plus an optional sibling map of note records that this scan does not touch. The reader normalizes a missing or partial envelope into a canonical empty shape so callers can always assume the keyed map is present.
+A versioned container holding the plan records keyed by slug, plus three optional sibling maps this scan never mutates — note records, external-reference records, and skill-usage records.
+
+The reader normalizes a missing or partial envelope into a canonical empty shape, so callers can always assume the plan map is present. That same normalization is what performs the field/record destruction described above, and it applies a **different** rule to each map: plan and note records lose the hide flag, the branch and the edit count (and a hide-flagged one is dropped); reference records are additionally dropped whenever they carry commit-claim fields at all; skill records are passed through untouched. The normalization rebuilds the container field by field, so an absent map stays absent and a present one is rebuilt — which is why every writer of this file, this driver included, must carry all four maps through.
 
 ### Per-producer source signals
 
@@ -133,6 +139,25 @@ Applied by the driver, uniformly, to every producer's external-plans set **befor
 
 The policy is owned here so that every producer inherits the same exclusions.
 
+### Discovery-time repository-containment gate
+
+Applied by the driver to the **survivors of the exclusion policy** — that is, to external paths only — and skipped entirely when that set is empty. Each surviving path is classified against the current repository as belonging to it, to a **foreign** one, or to neither; a foreign path is logged and dropped, and never enters the registry at all.
+
+Canonical agent-plan-directory slugs are **not** classified. They are whitelisted by the classifier anyway, so classifying them would cost a decision with a foregone answer; only an external path can be foreign.
+
+The discriminator is **git repository identity, not directory containment**, because plan-mode plans legitimately live outside the worktree:
+
+1. No path at all → **neither**.
+2. Inside the current worktree → **this repository**, resolved with no repository query.
+3. Inside a canonical machine-global agent plan directory → **this repository**, by whitelist, independently of any repository that happens to enclose the user's home directory.
+4. Otherwise compare the enclosing repository's shared directory with the current one's: equal → this repository (which is what makes a sibling worktree of the same repository classify correctly), different → **foreign**, unresolvable on either side → **neither**.
+
+**"Neither" is kept, not dropped.** A loose file in no repository at all is uncertainty, and the rule is never to drop on uncertainty; stale scratch residue is a separate pruning concern.
+
+The comparison resolves symbolic links on both spellings first: the shared directory comes back relative for a main worktree and absolute-and-already-resolved for a linked one, so under a symlinked prefix the two diverge and a sibling worktree of the *same* repository would otherwise read as foreign. The repository lookup also strips the location environment variables a source-control hook exports before asking — without that, every lookup (foreign path or workspace alike) would resolve to the hook's own repository and a sibling repository's plan would read as local and never be excluded. Resolution is memoized per directory as an in-flight value, so a burst of candidates sharing a directory costs one query rather than one each, and the classifier is scoped to a single invocation.
+
+This gate is **new relative to the archive-time gate it duplicates**: the same classifier already runs at commit time, where a foreign plan is turned into a visible "left out because it is outside the current repository" entry rather than being silently dropped. Moving the same decision up to discovery means a foreign-repository file is never registered in the first place, so it never appears in a panel and never has to be filtered out later.
+
 ### On-disk existence gate
 
 For every survivor of the exclusion policy and for every canonical slug whose source file is checked at the canonical user-home location, the driver requires the file to exist on disk **at scan time**. Survivors whose file is absent are silently dropped. This is the **only** success gate, and it is deliberate: scanners read the **write request** (the producer's tool-use entry or patch-application entry), never the tool result, so they cannot tell whether a given edit actually applied. The existence check is the deliberate stand-in for "the write landed". A failed or undone add leaves no file and is dropped; a failed or undone update against a pre-existing markdown file leaves the file in place and is therefore upserted. The latter is an accepted benign true-ish positive, shared across all producers so they have one and the same success contract.
@@ -160,40 +185,44 @@ Existing entries are never renamed; the rule is backward-compatible across upgra
 1. Resolve the scanner by producer tag.
 2. Invoke the scanner with the transcript path, lower bound, working directory, and upper-bound cap. The scanner streams the transcript line-by-line, counts lines from `1`, skips lines at or before the lower bound, stops reading after the first line beyond the upper bound (or reaches end-of-file when the cap is unbounded), and returns its three outputs: the slug set, the unfiltered external-plans set, and the total-lines count. Scanner-internal stream errors resolve the scanner result with whatever was accumulated; the driver never sees a thrown error from the scanner itself.
 3. Apply the shared external-plan exclusion policy to each path in the scanner's external-plans set, passing the current workspace root as the second input (needed for the scratch-temp-root exclusion's workspace caveat), **before** the early-exit check. Survivors form the filtered external-plans set. (Filtering before the early-exit preserves the long-standing behaviour that scanning a window containing only excluded files skips the registry read entirely.)
-4. If both the slug set and the filtered external-plans set are empty, return the total-lines value to the trigger. No registry read, no registry write.
-5. Otherwise, read the plans registry (an initial read used to compute the upsert).
-6. Build the suppression set from the registry's sibling notes map: every note's normalised source path.
-7. **Canonical slug branch (slug-signal producers only).** For each slug in the scanner's slug set:
+4. If that filtered set is non-empty, build a fresh repository classifier bound to the workspace root and run the containment gate over it, dropping every **foreign** path with a log line. An empty filtered set skips this step, so a window with no external candidates issues no repository query at all. The survivors form the local external-plans set. This also runs **before** the early-exit, so a window whose only external candidates belonged to another repository still skips the registry read entirely.
+5. If both the slug set and the local external-plans set are empty, return the total-lines value to the trigger. No registry read, no registry write.
+6. Otherwise, read the plans registry (an initial read used to compute the upsert). The read normalizes, so this snapshot already has every legacy hide-flagged record dropped and every dead field stripped.
+7. Build the suppression set from the registry's sibling notes map: every note's normalised source path.
+8. **Canonical slug branch (slug-signal producers only).** For each slug in the scanner's slug set:
    - Construct the canonical user-home plan path for the slug.
    - If the file does not exist on disk, skip the slug.
    - If the path matches any note's source path, skip the slug.
    - Resolve a unique slug via the source-path reverse lookup / base-slug-free / hash-suffix rule (see "Slug-collision resolution"). This prevents a canonical-plan upsert from silently overwriting a previously-registered external entry that already owns the base slug.
    - Upsert under the resolved slug (see "Per-slug upsert" below).
-8. **External-plan branch (all producers).** For each absolute path in the filtered external-plans set:
+9. **External-plan branch (all producers).** For each absolute path in the local external-plans set:
    - If the file does not exist on disk, skip the path.
    - If the path matches any note's source path, skip the path.
    - Derive the base slug from the file's basename minus its case-insensitive `.md` suffix (using a separator-agnostic split so a Windows-style path parsed on a POSIX host yields a clean filename).
    - Resolve a unique slug via the same rule.
    - Upsert under the resolved slug (see "Per-slug upsert" below).
-9. **Per-slug upsert** (used by both branches):
+10. **Per-slug upsert** (used by both branches):
    - If a record exists for the resolved slug:
      - **Archive guard active** (the record carries a content-hash-at-commit): hash the current source file's content. If it differs from the recorded content-hash-at-commit, replace the record with a fresh, uncommitted record (commit hash reset to null, added-at and updated-at refreshed). If it matches, leave the record alone.
      - **No archive guard, commit hash is null**: refresh the record's updated-at timestamp.
      - **No archive guard, commit hash is non-null**: leave the record alone.
    - If no record exists: build a fresh record (commit hash null, added-at and updated-at set to now, source path set to the candidate's absolute path, title extracted from the file's first markdown heading or its basename as a fallback).
    - In every "changed" arm above, mark the slug as touched.
-10. If no slug was touched, return the total-lines value. No registry write.
-11. Otherwise, acquire the plans-registry write lock and **re-read** the registry inside the lock. Build the merged map by starting from the freshly-read registry and overlaying only the touched slugs as follows:
+11. If no slug was touched, return the total-lines value. No registry write.
+12. Otherwise, acquire the plans-registry write lock and **re-read** the registry inside the lock. Build the merged map by starting from the freshly-read registry and overlaying only the touched slugs as follows:
     - If the fresh-read entry exists and has a commit hash that the original-read entry did not have, **take the fresh entry wholesale** — a sibling writer (typically the commit pipeline) transitioned this slug from uncommitted to archived between this scan's load and save, and it wrote both the commit hash AND the content-hash-at-commit as a pair; preserving them as a pair is what keeps the archive guard functional on the next scan.
     - Else, if the fresh-read entry exists or the slug did not exist at the original read, write the touched local entry. (A touched slug whose original-read state was "present" but whose fresh-read state is "absent" was concurrently hard-deleted by a sibling writer; the touched entry is **not** restored, so the explicit delete wins over this scan's auto-registration.)
-12. Save the merged registry under the lock, preserving the version field and the sibling notes / references maps from the fresh read. Release the lock.
-13. Return the total-lines value to the trigger.
+13. Save the merged registry under the lock. The write starts from the whole fresh in-lock snapshot and replaces only the plan map, so the version field and **every** sibling map — notes, references and skill usage — are carried through from that snapshot. Release the lock.
+14. Return the total-lines value to the trigger.
 
 ### Branches
 
 (Trigger-level branches — transcript missing, cursor not yet present, etc. — are owned by the trigger, not by the driver. The driver's branches all start from "scanner returned its three outputs".)
 
-- **Scanner returned empty slug set and empty filtered external set** → the driver returns the total-lines value with no registry read and no registry write.
+- **Scanner returned empty slug set and empty filtered external set** → the driver returns the total-lines value with no repository query, no registry read and no registry write.
+- **Scanner returned only external candidates, and every one of them belongs to another repository** → all are dropped at the containment gate, and the driver returns the total-lines value with no registry read and no registry write.
+- **An external candidate is in no repository at all** → classified as neither, and **kept**. Uncertainty never drops a candidate.
+- **An external candidate lives in a sibling worktree of the same repository** → classified as this repository, and kept.
 - **Scanner returned candidates, but every candidate file is missing on disk** → no upsert occurs; the driver still completes the read (notes are consulted, slug resolution is attempted) and returns the total-lines value with no registry write.
 - **Scanner returned candidates, all surviving paths are claimed by notes** → no upsert; return.
 - **Signal for an archived (commit-stamped) plan, file unchanged** → record is left alone (the archive guard remains active).
@@ -211,8 +240,8 @@ Existing entries are never renamed; the rule is backward-compatible across upgra
 - One acquisition of the plans-registry write lock and one in-lock re-read when at least one slug was touched.
 - One write of the plans registry under the lock when at least one slug was touched.
 - Best-effort hash and read of one or more plan source files on disk (the title extraction reads the first markdown heading; the archive-guard arm hashes the file content).
+- **One source-control identity query per distinct directory involved in the containment gate**, memoized within the invocation, and none at all when no external candidate survived the exclusion policy. This is the one part of the driver that shells out.
 - No cursor reads or writes from the driver itself — the trigger owns the cursor.
-- No source-control queries from the driver itself.
 - No model call. No transcript writes. No remote requests.
 
 ### Errors classified
@@ -247,7 +276,13 @@ The cursor key, per transcript path, has the following states (managed by the tr
 
 - **Two-layer split is load-bearing.** The driver does not parse a single transcript line. Every "is this a plan signal?" decision lives in the per-producer scanner; every "what does it mean for the registry?" decision lives in the driver. Adding a new producer is exactly one new scanner.
 - **Single driver entry point.** Both triggers — the Claude-side per-stop hook and the Codex-side polling tick — call the same driver function with the same five inputs. The driver's branching on producer tag is one switch: scanner selection. Everything after that (exclusion policy, existence gate, note suppression, slug resolution, archive guard, lock-and-merge upsert) is identical across producers. This was not true before the split.
-- **Scanner is the only file the driver does not own.** The shared external-plan exclusion policy is applied **in the driver**, not in the scanner. This was a deliberate change: hoisting the exclusion list to the driver is what gives every producer the same README / project-guidance / CHANGELOG filter without duplicating the list per scanner.
+- **Scanner is the only file the driver does not own.** The shared external-plan exclusion policy is applied **in the driver**, not in the scanner. This was a deliberate change: hoisting the exclusion list to the driver is what gives every producer the same README / project-guidance / CHANGELOG filter without duplicating the list per scanner. The repository-containment gate sits in the same place, for the same reason.
+- **A foreign-repository plan is now refused at discovery, not filtered at archive.** A session working in one repository that incidentally touches a markdown file in a sibling checkout used to register that file as a plan of the current repository — where it then attached to the next commit and polluted both the generated memory and the pull-request context. The same deterministic classifier that already excluded it at commit time now runs at discovery, so the record is never written. There is no model in the loop. (Notable.)
+- **Containment is decided by repository IDENTITY, not by directory containment.** Plan-mode plans legitimately live outside the worktree, so "outside the worktree means foreign" would drop the most important plans. A sibling worktree of the *same* repository shares the identity and is kept; the canonical agent plan directory is whitelisted outright, independently of any repository that happens to enclose the user's home directory. (Notable.)
+- **The containment gate never drops on uncertainty.** A file in no repository at all — loose scratch, a deleted directory — is classified as neither and is kept. Stale residue is a separate pruning concern; a wrongly dropped plan is unrecoverable. (Notable.)
+- **The containment gate strips the source-control location environment variables before asking.** A commit hook exports them, and without stripping, every lookup — the foreign path's and the workspace's alike — would resolve to the hook's own repository, so a sibling repository's plan would read as local and never be excluded. (Surprising; reality.)
+- **The gate runs before the early exit, so a window of only foreign candidates still skips the registry entirely** — but it also means such a window pays for the repository queries. The queries are memoized per directory within one invocation, and skipped altogether when no external candidate survived the exclusion policy. (Notable.)
+- **The driver never sees a legacy field, because the loader destroyed it first.** A hide flag on a record drops the whole record; a branch and an edit count are stripped from survivors. That normalization is what makes "a plan record has no branch" true for this driver by construction rather than by discipline. (Notable.)
 - **Incremental scan via a per-transcript cursor owned by the trigger.** Every invocation reads only the transcript suffix beyond the trigger's persisted line watermark. A growing transcript across many trigger fires is consumed in O(new lines), not O(all lines). The driver itself is stateless across calls; the watermark is supplied by the trigger.
 - **Upper-bound cap exists for the polling-tick trigger only.** The per-stop trigger passes no cap, so the scanner reads to end-of-file. The polling-tick trigger passes the reference-safe line as the cap so plan candidates beyond the reference window are deferred to a later tick — no transcript line is ever interpreted twice across triggers within a single producer.
 - **Existence gate is the sole success contract, shared across producers.** Scanners read the **write request** (a tool-use entry, a patch-application entry), never the tool result, so they cannot tell whether the write actually landed. The existence check is the deliberate stand-in for "the write landed". This admits a benign true-ish positive when an `Update`/`Edit` to a pre-existing markdown file fails — the file remains, so the plan is registered. Accepted because it is uniform across producers and conservative (it never registers a plan whose file is absent).
@@ -257,9 +292,9 @@ The cursor key, per transcript path, has the following states (managed by the tr
 - **Archive guard is overridden by file-content change.** If the source file is rewritten with new content, the next scan that observes a signal for that slug replaces the record with a fresh uncommitted entry (commit hash reset to null). Edits to a *changed* file surface as a fresh plan; edits to an *unchanged* archived file stay archived.
 - **Slug-collision resolution is deterministic and reversible.** A slug whose base name is already taken by a different absolute path is suffixed with `-<first 8 hex chars of sha256(normalised absolute path)>`. The suffix is a function of the path alone, so the same file always resolves to the same slug across runs and across upgrades. Existing entries are never renamed.
 - **Source-path reverse lookup is idempotent.** If a registry entry already has the candidate's absolute path as its source path, that entry's slug is reused even if the base slug now points at a different file. This keeps repeat scans of the same file aimed at the same record across schema upgrades.
-- **Concurrent commit-stamp is taken wholesale.** The in-lock re-read may discover that a sibling writer (typically the commit pipeline) has just transitioned a slug from uncommitted to archived. In that case, the fresh entry is **taken as a single unit** — both the commit hash and the content-hash-at-commit move together. Picking the commit hash off the fresh entry and copying it onto the touched local entry would drop the content-hash-at-commit (which the sibling writer wrote as a pair), break the archive guard's next scan, and trip downstream snapshot filters that check for `contentHashAtCommit` presence.
+- **Concurrent commit-stamp is taken wholesale.** The in-lock re-read may discover that a sibling writer (typically the commit pipeline) has just transitioned a slug from uncommitted to archived. In that case, the fresh entry is **taken as a single unit** — both the commit hash and the content-hash-at-commit move together. Picking the commit hash off the fresh entry and copying it onto the touched local entry would drop the content-hash-at-commit (which the sibling writer wrote as a pair), break the archive guard's next scan, and trip the downstream visibility gate that hides any record carrying a commit hash without a content hash.
 - **Concurrent hard delete wins.** If a slug present at the original read is gone at the in-lock re-read, the touched local entry is NOT restored. This preserves explicit "remove this plan" actions from the editor extension against a parallel scan that happened to register the same file.
-- **Lock-and-merge upsert is per-slug, not whole-map.** The merge starts from the freshest registry snapshot and layers ONLY the touched slugs onto it. Concurrent writes to other slugs — including the sibling notes and references maps in the same envelope — are preserved.
+- **Lock-and-merge upsert is per-slug, not whole-map.** The merge starts from the freshest registry snapshot and layers ONLY the touched slugs onto it. Concurrent writes to other slugs — and every sibling map in the same envelope: notes, references and skill usage — are preserved, because the write replaces only the plan map on that snapshot. Every map is optional, so a writer that rebuilt the envelope field by field and forgot one would erase it with nothing failing to compile.
 - **Cursor advance is independent of registry write.** The driver always returns the scanner's total-lines value, even when no slug was touched. The trigger uses that value to advance the cursor whenever the transcript grew, preventing repeated re-scans of a tail that contains no signals. The trigger may choose to **hold** the cursor on errors (e.g. when a sibling scan in the same discovery pass failed), but that policy lives in the trigger, not in the driver.
 - **Per-producer scanner is stateless across calls.** No scanner accumulates state between invocations. The slug set and external-plans set are produced per call from the windowed input.
 - **Failures are non-fatal at every layer.** Scanner stream errors resolve with partial results; per-iteration upsert errors do not abort the batch; the driver's outer-most error is caught and logged by the trigger.
@@ -271,6 +306,8 @@ The cursor key, per transcript path, has the following states (managed by the tr
   - The Codex polling-tick trigger (and the reference-safe upper-bound cap it passes) is defined by the Codex polling-tick spec; session discovery for that trigger is defined by spec 18.
 - The per-producer apply-patch scanner — its envelope contract, header-prefix grammar, column-zero requirement, markdown filter, path-resolution rule, and error semantics — is defined by spec 181. The driver consumes its output identically to the slug-and-tool-use scanner's.
 - The reference-extraction scan that runs alongside plan discovery in each trigger — same two-layer-split philosophy, different per-producer envelope parsers, different registry — is defined by spec 153.
+- The repository classifier used by the containment gate is shared with the commit-time archive chokepoint, which applies the identical rule and turns a foreign plan into a visible "outside the current repository" exclusion entry. Sharing it is what makes discovery and commit agree about which plans are foreign; the same classifier also backs the pre-commit preview's foreign fold (spec 337).
+- The mid-session registration operation driven by a watch on the agent's plan directory (spec 113) writes the same records into the same map, under the same lock, and is the other reason a plan can appear before the end of a turn. Neither writer observes the other; both are safe because each is a load-modify-save under that one lock.
 - The session and cursor registries (their on-disk layout, atomic-write rules, and stale-entry pruning) are defined by the **session-tracking** spec.
 - The plans-registry envelope, including its sibling notes and references maps, version field, and the canonical normalization a reader applies to malformed content, is defined by the **plans-registry** spec.
 - The commit-stamping that turns an active record into an archived one (writing the commit hash and content-hash-at-commit) is defined by the **source-control commit pipeline** specs.

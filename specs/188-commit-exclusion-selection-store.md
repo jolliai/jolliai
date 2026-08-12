@@ -17,6 +17,7 @@ In scope:
 - The transparent migration from the older schema to the current one.
 - The read API for the user layer: returning four sets, the missing-file branch, the malformed-file branch, the unknown-version branch, the per-field defensive coercion, and the warning surface for non-missing read failures.
 - The read API for the AI layer: returning the per-item ranking list plus the optional fingerprint, and its defensive coercion (including dropping a legacy per-entry score and other legacy keys).
+- What happens to the optional skill kind when the user layer is served across the process boundary to the JVM host: the field is materialized unconditionally, so "absent" and "empty" become one value on that side.
 - The user-layer write APIs: single-key and bulk-key, each parameterized by kind and by an add-or-remove direction.
 - The AI-layer write APIs: write the whole per-item ranking (list + fingerprint), veto one AI exclusion (the "dismiss" mechanism, which sets a flag — it does not remove the entry), and clear the AI layer.
 - The atomic write protocol: write to a uniquely named temp sibling, rename into place, clean up the temp sibling if the rename fails.
@@ -38,6 +39,7 @@ Out of scope (boundaries — referenced, not duplicated):
 - The "by transcript cutoff" attribution rule for summaries, which must account for this exclusion pass when deciding what is in scope (see [36 — Summary Attribution by Transcript Cutoff]).
 - The per-turn token breakdown whose per-session totals the worker drops for excluded conversations to keep the branch token bar honest (see [243 — Token Usage Extraction and Cost Estimation]).
 - The UI surface (sidebar checkbox, section Select-All / Deselect-All button, row rendering) that emits the add/remove calls — only the contract at the API boundary is in scope here.
+- The cross-process transport that carries this store to the JVM host, and that host's adapter over it — this spec covers only what the responses do to the optional skill kind.
 - The plans-and-notes registry whose entries the exclusion keys refer to.
 
 ## Data Contracts
@@ -146,6 +148,8 @@ The read API returns a structure with four always-present read-only sets plus on
 - **Optional** — the set of excluded skill keys. Present only when the file carried the field at all; an absent field yields an absent set rather than an empty one, and every consumer reads that as "nothing excluded" (the squash path, for example, substitutes an empty set).
 
 When the file is missing or unreadable, the four required sets are empty and the skill set is absent.
+
+**That optionality does not survive the JVM boundary — see "The absent-stays-absent rule stops at the bridge" below.** Inside this runtime, absent and empty are distinguishable and the distinction is load-bearing; every response that carries this shape to the JVM host materializes the skill set unconditionally, so on that side of the wire the two are the same value.
 
 ### AI-layer returned shape
 
@@ -274,6 +278,25 @@ The cross-process lock: each chained operation additionally runs under a worktre
 
 This helper is exposed for tests and manual operator use. It is not invoked by the pipeline. Deleting the file is equivalent to "un-exclude everything, across every kind" — including the optional skills set, which a reader counting only the required kinds would miss.
 
+### The absent-stays-absent rule stops at the bridge
+
+The JVM host does not read this file. It asks this runtime for the exclusion set over a cross-process call, and every response that carries the set — the direct read, and the two working-context answers that bundle it with the items it applies to — **rewrites the optional skill field as a materialized array**: present always, empty when the file carried no such field.
+
+So the invariant holds where it is decided and is gone where it is consumed:
+
+| Reader | "file written before skills existed" | "user excluded no skill" |
+| --- | --- | --- |
+| This runtime | absent set | absent set (the two are genuinely the same case) |
+| This runtime, file carries an empty array | — | empty set |
+| JVM host | empty set | empty set |
+
+Two reasons the wire spells it out, and both are about the receiving side being unable to represent the third state safely:
+
+- **An omitted key deserializes to null in a field declared as a non-null set**, which then throws the first time a panel reads it. The mirroring type on that side supplies a default for every field precisely so an omission degrades to empty instead — but that defaulting only applies at all because *every* field there has one; a single field added without one removes the constructor the defaults hang off and silently takes the defaulting for all the others with it. Materializing the field on the wire is the half of that guarantee this runtime controls.
+- **A caller that saw the key vanish could not tell "nothing excluded" from "the runtime serving me is too old to know about skills."** Both would arrive as an absent key, and the two call for opposite behaviour.
+
+The consequence to be clear about: the distinction this store maintains internally — the one that keeps a pre-skills file byte-identical and lets a consumer substitute its own default at the use site — is **not observable by the JVM host at all**. Nothing there can behave differently for a file written before skills existed. Since every consumer of an absent set substitutes an empty one anyway, no behaviour differs today; what is lost is the ability to ever make one differ without changing the wire.
+
 ### Consumption by the queue worker
 
 When the queue worker runs a pipeline for a plain commit (the same path also serves cherry-pick and revert), an amend, or a squash (either squash route), it reads the **user EXCLUDE set** read-only and uses the returned sets to shape the run. The 1:1 rebase-pick migration reads nothing from this file at all — it carries an existing memory forward to a new hash and has no selection to honour. The user layer is invariant across the entire pipeline execution, regardless of op type or outcome; the worker never mutates it. (The worker *does* write, at commit time, to a *different* store — the plans/notes/references registry and the orphan branch — but only to *associate the CHECKED items*; it never deletes an excluded row. That is not a write to the exclusion file.)
@@ -349,6 +372,7 @@ The AI layer has a different, non-sticky lifecycle:
 - **The branch-scoping removal that shipped alongside these changes is IntelliJ-only.** No CLI/VS Code behavior changed for that half; the CLI exclusion store's per-project (not per-branch) scope is unchanged.
 - **The skills kind is DECLARED but no live writer ever emits it into the AI layer.** `skills` is a full member of the exclusion-kind enumeration and is accepted by the AI-ranking coercion, so a ranking entry carrying it would round-trip cleanly. Nothing produces one: the only writer of the AI layer maps the ranker's verdicts to `plans` / `notes` / `references` and has no fourth arm, and the ranker itself only ever builds items of those three kinds. Skills are never fed to the ranker at all — they are track-only metadata about *how* the work happened, with no relevance verdict to have. Treat the enumeration member as declared-but-unreachable on the AI layer; the **user** layer's skills array, by contrast, is written and read for real. (Notable; the asymmetry between the two layers is the point.)
 - **Skill exclusion is optional in a way the other four are not.** The other four arrays are always materialized on write and always yield a set on read. The skills array is written only when non-empty and read back as *absent* when the file lacks it — so a file written before skills existed is indistinguishable from one whose user has excluded nothing, and both are correct. Consumers substitute an empty set at the use site. This is what keeps the on-disk file byte-identical for users who never touch the feature, matching the AI layer's rule. (Notable; intentional.)
+- **…and that "absent stays absent, never an empty set" rule is ERASED at the JVM boundary.** Every response that ships this shape across the bridge materializes the skill field unconditionally — always present, empty when the file had none — and the mirroring type on the receiving side defaults it to an empty set as well. The invariant is therefore **true inside this runtime and false by the time the JVM host sees it**, with no failure and no warning anywhere: the two states simply arrive as one. It is deliberate, and for a reason that has nothing to do with exclusions: an omitted key deserializes to null in a field declared non-null and throws on first read, and an absent key would also be indistinguishable from a runtime too old to know about skills. The cost is that this store's most carefully-preserved distinction is unobservable on one of its two consuming surfaces — invisible today only because every consumer substitutes an empty set anyway. (Notable; a real split between where a rule is decided and where it is read.)
 - **Defensive coercion is per-field.** A file with one corrupted field (non-array, or array of non-strings) still surfaces the valid keys in the other three fields. This is a deliberate weakening of "all-or-nothing" parsing so a partially-damaged file is recoverable on the next write.
 - **Loud-but-safe on unknown version.** An unknown version stamp emits a warning and returns empty rather than throwing. This protects the user from being unable to make further selections after a downgrade, at the cost of silently masking the on-disk content until the next write overwrites it.
 - **Locking is now cross-process (reversed).** The earlier design serialized writes in-process only and accepted a possible cross-process lost update, on the theory that only one surface mutates selections at a time. That is no longer true: the pre-commit panel and the post-commit worker are separate processes that both write this file (the panel persists the AI ranking; the worker clears it after consume). Every write therefore now runs under a worktree-scoped, PID-tagged cross-process file lock in addition to the in-process chain. The lock is best-effort (a slow holder never permanently blocks a selection change) and the atomic temp+rename keeps the file from ever being observed half-written even when the lock is skipped.

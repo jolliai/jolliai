@@ -2,229 +2,202 @@
 
 ## Topic Statement
 
-The PINNED section of the tool window — a single newest-first list of items the user has explicitly pinned (drawn from a per-project pin store), where each row mirrors the badge and title of the row it was pinned from, exposes hover actions to open the underlying content, resume a Claude session, or unpin, and shows a placeholder when nothing is pinned.
+The PINNED section of the tool window — a newest-first list of items the user explicitly pinned, read on every refresh from the shared cross-surface pin store, where each row shows a lead badge and a title, opens its underlying content when the row body is clicked, and offers exactly one hover-revealed action: unpin.
 
 ## Scope
 
 **In scope:**
 
-- The single source the panel reads on every refresh: the **shared cross-surface pin store**, reached over the IDE bridge, returning a flat list of pinned entries for the current repository-and-branch group.
-- The adapter layer between that store's persisted shape and this panel's row model: plural↔singular kind names, `id`↔`key`, the badge fallback, and the client-side newest-first sort.
-- The per-row anatomy: a lead badge (a real producer logo for conversation pins, otherwise a colored rounded pill carrying a short tag), the title text, and a right-edge cluster of hover-revealed icon actions.
-- The hover-action set per row: an "open" action always present; a "resume in terminal" action present only for Claude conversation pins; an "unpin" action always present.
-- The click semantics: clicking the row body opens the pinned content; the per-icon clicks are consumed so they do not also fire the row-body open.
-- The open dispatch keyed by the entry's kind: conversation, plan, note, reference, or memory — each resolving to a different viewer.
-- The unpin flow: remove the entry from the store on a background thread, then refresh.
-- The resume flow: extract the session identifier from the entry key and hand it to the terminal-resume utility with a tab title derived from the pin title.
-- The empty-state placeholder.
-- The live row-count notification the panel emits so the hosting section header can show a count.
-- The fit-to-content sizing model (the panel reports its natural height; it owns no scroll bar).
-- The badge color maps for conversation pins (by producer) and context pins (by tag letter), with a neutral fallback.
-- The refresh triggers: an explicit refresh call (invoked after another panel records a pin, and after this panel unpins).
+- The single read the panel performs on every refresh, and the fact that the group it reads is resolved on the far side of the round trip from the working directory it supplies.
+- The adapter between the store's persisted shape and this panel's row model: the singular↔plural kind names, the identifier rename, the badge fallback chain, and the client-side newest-first sort.
+- The per-row anatomy: a lead badge, a word-wrapping title, and a right-edge action revealed on hover.
+- The **badge derivation**, which is not uniform across kinds: a reference's letter *and* colour are both re-derived from the shared source-presentation table via the pin's own identifier, while every other kind keeps the letter it was stamped with.
+- The open dispatch keyed by the pin's kind, and what each kind resolves to.
+- The unpin flow.
+- The empty-state placeholder and the row-count signal the panel publishes.
+- The fit-to-content sizing model.
+- The refresh triggers — and the deliberate decision that this panel subscribes to **no** change-notification list at all.
 
 **Out of scope (boundaries):**
 
-- The pin store's on-disk format, versioning, group-key construction, atomic-write, defensive read coercion, and de-dup-on-re-pin rules — owned by the pin store spec (246). This panel only reads the list and calls add/remove through the bridge.
-- The act of *creating* a pin — performed by the source panels (the conversations sub-panel pins a conversation, the context sub-panel pins a plan/note/reference, the committed-memories panel pins a memory). This panel never writes a new pin; it only reads, opens, and removes.
-- The conversation transcript editor tab opened for a conversation pin — its own spec; this panel only constructs the conversation virtual file and hands it to the IDE open-file mechanism.
-- The summary/memory editor tab opened for a memory pin — its own spec; this panel only looks up the memory and hands it to the shared single-memory-tab opener. That opener's one-tab-per-project rule and its in-place content swap belong to that spec too.
-- The rendered-markdown preview opened for plan/note/reference pins — owned by the markdown-preview utility; this panel only resolves the source path and calls it.
-- The terminal-resume utility — its own spec; this panel only supplies the session id, working directory, and tab title.
-- The active-session aggregator used to re-resolve a conversation pin to a live conversation item — its own spec.
-- The plans/notes/references registry used to resolve a context pin's source path — owned by the registry/plans spec.
-- The section frame that hosts this panel (header, collapse state, count suffix, gear-menu visibility toggle, shared scroll bar) — owned by the tool-window layout spec.
-- The composite-key construction (`producer` + `session id`, plan slug, note id, reference key, commit hash) — defined by the commit-selection store / source panels; this panel treats the key as opaque except when splitting out a session id for resume.
+- The pin store's on-disk format, its versioning, its group-key construction, its atomic write, its defensive read coercion and its de-duplication on re-pin — owned by the pin store spec. This panel reads the list and asks for a removal.
+- Pin *creation*, which happens on the surfaces the pinned item came from — the live conversations list, the working-context list and the committed-memories list. This panel never writes a new pin.
+- The conversation editor tab, the rendered-markdown preview, and the shared single-memory-tab opener — each its own surface. This panel only resolves what to hand each one.
+- The active-session aggregation used to re-resolve a conversation pin to a live conversation.
+- The working-area registry used to resolve a context pin's file path.
+- The shared source-presentation table itself — its rows, its label-composition policy and its neutral fallback (spec 313). This panel consumes it.
+- The section frame that hosts this panel — header, count suffix, collapse state, visibility toggle, and the shared scroll bar.
+- The terminal session-resume affordance. It is **no longer present on this panel** (spec 212).
 
 ## Data Contracts
 
-### The store this panel is backed by
+### The store behind the panel
 
-This panel is **not** an independent implementation. It reads and writes the same shared pin store, in the same format, in the same file, as the other host surface — reached over the IDE bridge with three operations (read the current group, add, remove). Consequences that are part of this panel's observable contract:
+This panel is not an independent implementation. It reads and removes through the same shared store, in the same format and the same file, as the desktop editor's equivalent surface, over a round trip with three operations — read the current group, add, remove. Two consequences are part of this panel's observable contract:
 
-- **The list is branch-scoped, not project-global.** Pins live in a group keyed by repository-and-branch, and the group is resolved on the far side of the bridge from the working directory the panel supplies. The panel never constructs the group key. **Switching branches changes the visible pin list**; switching back restores it.
-- **Content written by the retired panel-local store is unreadable.** The old implementation was project-global, stamped its timestamp as an ISO string, and stored plural kind names. That shape does not match the shared format and is coerced away on read, so pins made before the migration simply do not appear.
+- **The list is branch-scoped, not project-global.** Pins live in a group keyed by repository and branch, resolved on the far side of the round trip from the directory the panel supplies. Switching branches changes the visible list; switching back restores it. Nothing in the panel says so.
+- **Content written by the retired panel-local store is unreadable.** That shape — project-global grouping, a text timestamp, plural kind names — does not survive the shared format's read filter, so pins made before the migration simply do not appear, and are erased from disk by the next write.
 
-### Pinned entry (consumed)
-
-Each entry the panel renders carries:
+### The row model
 
 | Field | Meaning / use |
 | --- | --- |
-| kind | One of `conversations`, `plans`, `notes`, `references`, `memories`. Selects the badge style, the open dispatch, and whether resume is offered. **Stored singular; the adapter pluralizes it on read and the bridge re-singularizes it on write.** An unrecognized kind is passed through unchanged by the adapter and rejected with an error by the bridge. |
-| key | The opaque identity of the pinned item (composite conversation key, plan slug, note id, reference key, or commit hash). **Named `id` in the store.** Passed to unpin; for conversation pins the substring after the first `:` is the session id used by resume and used to re-match the live conversation. |
-| title | Rendered verbatim as the row's title; also used to build the resume tab title (`Claude – <title>`). |
-| badge | A short tag mirroring the source row's badge — a producer name for conversation pins, or a letter tag for context pins. Drives the lead badge (logo lookup or pill color). **Derived as the store's `badge` field, falling back to its `source` field when `badge` is absent, and to the empty string when neither is present.** |
-| pinned-at | The newest-first sort key (descending). Not rendered. **An epoch-millisecond number**, stamped on the far side of the bridge at add time — the panel never supplies it. |
+| Kind | One of the five pinnable kinds — conversation, plan, note, reference, memory. Selects the badge style, the open dispatch and the colour source. **Stored singular; the adapter pluralizes it on read, and the far side re-singularizes it on write, rejecting anything it does not recognise.** An unrecognised kind is passed through unchanged by the adapter. |
+| Key | The pinned item's opaque identity — the composite conversation key, a plan slug, a note id, a reference registry key, or a commit hash. **Named differently in the store**; renamed by the adapter. Passed back on unpin, and — for references only — parsed for its source prefix. |
+| Title | Rendered verbatim. |
+| Badge | A short tag mirroring the source row's badge. **Derived as the store's badge field, falling back to its provider field, and to the empty string when neither is present.** Consumed for conversation and plan/note kinds; ignored for references. |
+| Pinned-at | An epoch-millisecond number, stamped on the far side at write time. The newest-first sort key. Never rendered. |
 
-The list does **not** arrive sorted: the adapter sorts it newest-first by the epoch timestamp, client-side, on every read.
+The list does not arrive sorted; the adapter sorts it descending by that timestamp on every read, and applies no de-duplication — that happens on the far side at **write** time, where re-pinning an already-pinned artifact replaces the record and re-stamps its timestamp, so it floats back to the top. Two pins sharing a key but differing in kind are two distinct rows, correctly, since removal is keyed on both.
 
-### Lead badge rule
+### Lead badge
 
-- **Conversation pins**: if the producer (the badge value, lowercased) has a registered logo, a plain logo icon is shown with the producer name as tooltip; otherwise a colored pill with the producer name.
-- **All other kinds**: a colored pill carrying the letter tag.
+- **Conversation pins** whose producer has a registered logo render that logo, with the raw badge value as the tooltip.
+- **Everything else** renders a rounded pill: bold white text on a solid colour, with a minimum width and a fixed small height.
 
-Pill color is chosen by:
+### Badge letter, by kind
 
-| Pin kind | Color source |
+| Kind | Letter |
 | --- | --- |
-| conversations | Producer color map (claude=amber, gemini=emerald, codex=violet, opencode=cobalt, cursor=crimson), neutral gray otherwise. |
-| plans / notes / references / memories | Tag color map keyed by the letter tag (P=blue, N=green, S=amber, L=violet, GH=gray, J=blue, No=gray), neutral gray otherwise. **Two of those keys are now unreachable** — see "Two dead keys in the tag color map" under Notable Behavior. |
+| Reference | **Re-derived** from the shared source-presentation table, resolved from the source prefix of the pin's own key. |
+| Plan, note, memory, conversation | The stored badge, verbatim. |
 
-The pill is a rounded rectangle with bold white text, a minimum width, and a fixed small height.
+### Badge colour, by kind
 
-### Hover-action set
+| Kind | Colour |
+| --- | --- |
+| Conversation | A producer colour map covering the five earliest producers, keyed on the lower-cased badge; neutral grey for anything else. |
+| Reference | **Re-derived** from the shared source-presentation table, resolved from the same source prefix. |
+| Plan, note, memory | This panel's own tag map, which holds exactly three letters — plan, note and snippet — with neutral grey for anything else. |
 
-| Action | Present when | Effect |
-| --- | --- | --- |
-| Open (eye icon) | Always | Opens the pinned content (see open dispatch). |
-| Resume (play/execute icon) | Only when kind is `conversations` and the producer is Claude | Resumes the Claude session in a terminal. |
-| Unpin (close icon) | Always | Removes the entry and refreshes. |
+A memory pin's stamped letter is not one of those three, so **every memory pin renders neutral grey**.
 
-Icons are hidden by default and revealed on hover; each carries a tooltip. The icon order is Open, then Resume (if present), then Unpin.
+**Both halves of a reference badge are derived rather than read, and that is the whole point.** A letter is not a unique key: two sources share one letter in two separate cases in the shared table, so a letter-keyed colour lookup cannot be right for both members of such a pair. Worse, two of those letters collide with the note and snippet letters this panel owns outright — so a letter-keyed lookup painted one source's pins in the colour reserved for notes and another's in the colour reserved for snippets. And the *letter itself* cannot be trusted either: it is whatever alphabet the plugin version that created the pin was using, and that alphabet has changed — pins predating the single-letter scheme carry two-character tags, and a pin written before the badge field existed at all falls back to the raw source name. Deriving only the colour would render those forever as a stale letter over a correct hue.
 
-### Empty-state contract
+Because a reference pin's key *is* the registry key, and that key leads with the source's wire name, the source is recoverable with no change to the stored shape. An unparseable wire name lands on the shared table's **neutral unknown** — its placeholder letter together with its neutral grey — which is exactly how the reference rows themselves render an unrecognised source, and is deliberately *not* the plain grey the conversation branch falls back to.
 
-When the list is empty, a single left-aligned gray label reading **`Nothing pinned.`** is shown with uniform padding.
+### Empty state
 
-### Row-count contract
+A single left-aligned dim label reading **`Nothing pinned.`** with uniform padding.
 
-After each render the panel records the row count and invokes its registered count-changed callback with the new value, so the hosting section header can display `PINNED (N)`. The empty-state render reports nothing was explicitly counted via the callback; the count is updated only inside the data render path (zero entries report `0`).
+### Row-count signal
 
-### Sizing contract
+The populated render path records the list size and invokes the registered count callback, so the hosting header can show a count — including for a zero-length list. The standalone placeholder render used at construction does not fire it.
 
-The panel reports its maximum height as its preferred height (fit-to-content) and is placed so it never stretches; it has no internal scroll bar. The hosting section provides the shared scroll bar.
+### Sizing
+
+The panel reports its maximum height as its preferred height and owns no scroll bar; the hosting section provides the shared one.
 
 ## Behavior
 
 ### Construction
 
-1. Build the rows container with a vertical layout and a small border.
-2. Build (but reuse) the empty-state label.
-3. Render the empty state immediately (before any data load).
+Build the row container and the placeholder, render the placeholder immediately, and stop. **The panel does not load on construction** — the first populated render happens only when something triggers a refresh.
 
-The panel does not auto-load on construction; the first populated render happens when an external refresh is triggered.
+### Refresh
 
-### Refresh (one cycle)
-
-1. Resolve the working directory: prefer the service's main repo root, else the project base path; if both are null, abort silently.
-2. On a background thread, read the current group's pin list over the bridge and sort it newest-first.
-3. Marshal to the UI thread and render the list.
+1. Resolve the working directory: the shared repository root first, the project's base path as fallback. If neither resolves, abandon silently.
+2. On a background thread, read the current group's pins and sort them newest-first.
+3. Marshal to the UI thread and render.
 
 ### Render
 
-1. Set the row count to the list size and fire the count-changed callback.
-2. Clear the rows container.
-3. If the list is empty, attach the empty-state label.
-4. Otherwise build one row per entry and attach them in order.
-5. Revalidate and repaint the whole panel so the hosting section re-lays out to the new content height.
+Publish the count, clear the container, attach either the placeholder or one row per pin in order, then revalidate and repaint the **whole panel** so the hosting section re-measures to the new content height.
 
 ### Row composition
 
-1. **Lead**: producer logo (conversation pins with a registered logo) or colored pill.
-2. **Title**: the entry title.
-3. **Right cluster**: the hover-action icons in order (Open, optional Resume, Unpin), all initially hidden.
-4. A shared hover adapter and a shared body-click adapter are installed on the row, the lead container, and the title; the body-click adapter opens the pinned content. Each action icon has its own click adapter that consumes the event so the body-click does not also fire.
+- **Lead**: logo or pill, held in a cell that keeps it naturally sized and vertically centred as the row grows.
+- **Centre**: the title, in a word-wrapping text area styled as a label.
+- **Right**: the unpin action, hidden at rest. Its width is measured while visible and then **reserved**, so the title's wrap width — and the row's height — do not change when the action appears.
 
-### Hover model
+The row's height is computed from the wrapped title at the row's actual width and re-computed whenever the row's width changes, so resizing the tool window reflows the list. The row's maximum height is clamped to its preferred height. The hover tint is *painted* rather than set as an opaque background, so the ancestor is always repainted underneath.
 
-- On mouse-enter (from the row, lead, or title): all action icons become visible.
-- On mouse-exit: if the exited component is no longer showing, or the row is no longer showing, hide the icons; otherwise compute the cursor's screen-space position and hide the icons only if it falls outside the row's screen-space bounds (so crossing an internal child boundary keeps the row "hot").
+### Hover
 
-### Open dispatch (row body click or Open icon)
+One shared handler is installed on the row, the lead cell, the lead, the title and the action. Entering tints the row and reveals the action; leaving tests the cursor's **screen-space** position against the row's screen-space bounds and reverts only when it is genuinely outside, so moving onto the action does not flicker it away. The handler short-circuits when the state is unchanged.
 
-Resolve the working directory; if null, do nothing. Then by kind:
+### Click routing
 
-| Kind | Open behavior |
+The body-click handler is installed on the row, the lead cell, the lead and the title — and **not** on the action, which consumes its own click. The right-hand cell is likewise not a click target, so the strip of empty space the reserved action width creates is inert.
+
+### Open dispatch (row body)
+
+Resolve the working directory; abandon if it does not resolve. Then, by kind:
+
+| Kind | Behavior |
 | --- | --- |
-| conversations | On a background thread, re-resolve the entry to a live conversation by matching its composite key against the active-session aggregator's current list; if found, open the conversation virtual file as an editor tab on the UI thread. If not found, nothing opens. |
-| plans | Look up the plan in the plans registry by key, resolve its source path, and open it as rendered markdown. |
-| notes | Look up the note in the notes map by key, resolve its source path, open as rendered markdown. |
-| references | Look up the reference in the references map by key, resolve its source path, open as rendered markdown. |
-| memories | On a background thread, fetch the memory by commit hash; if found, hand it on the UI thread to the **shared single-memory-tab opener** (the full memory UI, identical to the committed-memories view). That opener allows at most one memory tab per project, so if one is already open it swaps that tab's content to this memory and re-activates it rather than opening a second tab — **whatever memory the tab was showing is replaced**. This panel never constructs the memory's virtual file itself. |
+| Conversation | On a background thread, list the currently-active conversations and find the one whose composite key equals the pin's. If found, open it as an editor tab on the UI thread. If not found, nothing opens. A failure of that listing is caught and logged as a transport problem rather than silently treated as "not found". |
+| Plan | Look the slug up in the working-area registry, take its recorded file path, and open it as **rendered markdown**. |
+| Note | Same, against the notes map. |
+| Reference | Same, against the references map. |
+| Memory | On a background thread, fetch the memory by commit hash; if found, hand it on the UI thread to the shared single-memory-tab opener — the full memory surface, identical to the committed-memories view. |
 
-For plan/note/reference, a null or blank source path is a no-op; the path is resolved to a virtual file and, if that resolution fails, nothing opens.
+For plan, note and reference a null or blank path is a no-op, and a path that cannot be resolved to a file opens nothing. The dispatch has no catch-all arm, so a kind outside the five — which the adapter passes through unchanged rather than rejecting — silently does nothing.
+
+The click is not restricted to the primary mouse button, so any button over the row body opens the pin.
 
 ### Unpin
 
-1. The unpin icon's click is consumed (no body open).
-2. Resolve the working directory; if null, no-op.
-3. On a background thread, remove the entry by `(kind, key)` from the store, then trigger a refresh.
+The action consumes its click, the working directory is resolved, an unpin event tagged with the kind is recorded, and on a background thread the entry is removed by kind-and-key, followed by a refresh.
 
-### Resume (Claude conversation pins only)
+### Refresh triggers
 
-1. The resume icon's click is consumed.
-2. Resolve the working directory; if null, no-op.
-3. Extract the session id as the substring of the key after the first `:`.
-4. If that session id is non-blank, call the terminal-resume utility with the project, session id, working directory, and a tab title of the form `Claude – <title>`.
+There are exactly two ways this panel reloads, and both are explicit calls:
+
+1. The tool window's own initial background load when its content is built.
+2. Whoever writes a pin, immediately after the write — the live conversations list, the working-context list, the committed-memories list, and this panel's own unpin.
+
+**The panel subscribes to no change-notification list.** That is a decision, not an omission: every value a row paints — its title and its badge — was snapshotted at pin time, and the only other file the panel touches is read once, inside a click, purely to resolve a target. So no context-change event can alter what this panel paints, and subscribing to one bought a round trip plus a full row rebuild (which also discards hover state) on every mid-session working-area edit in every open project on the machine. If pinned titles are ever made to resolve live out of the registry, that is when this changes.
 
 ### Disposal
 
-The panel holds no timers or external listeners and releases nothing special on disposal.
+Nothing to release — the panel holds no timer and no external registration.
 
 ## State Transitions
 
-```
-[constructed]
-  build rows container + empty label
-  render empty state
-  (no auto-load)
-
-[refresh invoked]
-  cwd ← mainRepoRoot ?? basePath ; if null → abort
-  on background: pins ← bridge pins-read(cwd)   // group resolved remotely from cwd
-                 pins ← pins.sortedByDescending(pinnedAt)
-  on UI: render(pins)
-
-[render(pins)]
-  rowCount ← pins.size ; fire count callback
-  clear rows
-  if empty → add empty label
-  else → add one row per pin (in store order, newest-first)
-  revalidate + repaint
-
-[hover enters row/lead/title]
-  show all action icons
-
-[hover leaves]
-  if cursor screen-pos ∉ row screen bounds (or row not showing) → hide icons
-  else → keep shown
-
-[row body / Open clicked]
-  dispatch by kind → open conversation tab / markdown preview / memory tab
-
-[Unpin clicked]  (event consumed)
-  on background: store.unpin(cwd, kind, key) ; refresh()
-
-[Resume clicked]  (event consumed, Claude conversation pins only)
-  sessionId ← key after first ':' ; if non-blank → terminal.resume(...)
-```
+| From | Trigger | To |
+| --- | --- | --- |
+| Constructed | — | Placeholder shown, no count published, no data read |
+| Any | Explicit refresh with a resolvable directory | Background read, then a populated or empty render with a published count |
+| Any | Explicit refresh with no resolvable directory | Unchanged, silently |
+| Rendered | Cursor enters a row | Row tinted, unpin revealed |
+| Rendered | Cursor leaves the row's screen-space bounds | Reverted |
+| Rendered | Row body clicked | Dispatch by kind |
+| Rendered | Unpin clicked | Event recorded; entry removed; refresh |
+| Rendered | Branch changed underneath | Unchanged until something triggers a refresh, then a different group's list |
 
 ## Notable Behavior
 
-- **The pin store is shared, not panel-local.** This panel is one of three consumers of one store and one file. A pin made here is visible to the other host surface and vice versa; there is no per-IDE pin format any more.
-- **The list is branch-scoped, so switching branches changes what is pinned.** A user who pins several conversations on a feature branch, checks out the trunk, and opens the tool window sees an empty PINNED section — the pins are not gone, they are in the other branch's group. Nothing in the panel explains this.
-- **Pins written before the migration are silently invisible.** The retired panel-local store's shape (project-global grouping, ISO-string timestamp, plural kinds) does not survive the shared format's read filter. Those entries are dropped on read and erased from disk by the next add or remove.
-- **The panel never creates a pin.** Pins are written by the source panels; this panel only reads, opens, removes. It is the read/act surface of the pin store.
-- **The display badge falls back to the transcript-provider field.** When a stored entry carries no explicit badge, the panel uses the store's `source` value as the badge — which is why conversation pins keep their producer pill even though the badge and the provider are two separate persisted fields. An entry with neither yields an empty badge string, which renders as an empty pill (not a missing lead).
-- **Conversation pins re-resolve to live conversations at open time.** Because a pin stores only a key and a title snapshot, opening a conversation pin requires matching the key against the *current* active-session list. If the conversation is no longer active (outside the recency window, hidden, etc.), the Open action silently does nothing — the row stays, but cannot open.
-- **Resume is offered only for Claude conversation pins.** The eligibility test is kind `conversations` AND producer (badge, lowercased) `claude`. A pinned conversation from any other producer shows only Open and Unpin.
-- **The session id for resume is parsed from the composite key.** It is the substring after the first `:`; a malformed key with no `:` or an empty session id makes resume a no-op.
-- **Plan/note/reference pins open as rendered markdown, not raw text** — consistent with the design intent that these are human-readable documents.
-- **Memory pins open the full memory editor**, the same surface as the committed-memories list (with its own actions such as Create PR), not a read-only snippet.
-- **Opening a memory pin replaces whatever memory was already showing.** Memory opening goes through the shared single-memory-tab opener, which allows at most one memory tab per project. Clicking through several memory pins in a row therefore reuses one tab rather than accumulating tabs, and there is no way to keep two pinned memories open side by side. (Notable; the list's "several pinned memories" framing does not suggest it.)
-- **The panel fits to content and owns no scroll bar.** It participates in the section's single shared scroll bar; every render revalidates the whole panel so the section re-measures.
-- **The lead is logo-first for conversation pins only.** Context-kind pins always render a colored letter pill, never a logo.
-- **Two dead keys in the tag color map, and one wrong colour, because the producer side moved and this map did not.** The map itself is unchanged, but the badges written into the store changed underneath it. The context panel that creates reference pins used to stamp its own letters; it now stamps the letter from the shared source-presentation table (spec 313), which is single-letter across all twelve sources. A GitHub reference is therefore pinned as `"G"` and a Notion reference as `"N"`. The map's `GH` and `No` entries can no longer be produced by any writer — they are dead keys — and the two affected pins resolve elsewhere: `G` misses the map entirely and falls through to the neutral gray fallback (which happens to be close to the intended GitHub gray), while `N` **hits the notes entry and paints a Notion reference pin green**, the colour reserved for notes. Nothing distinguishes the two on screen. This is observed behavior, not intent: the drift was introduced by the producer-side change and the consumer map was never updated. (Surprising.)
-- **The empty-state render path does not fire the count callback.** The count callback is fired from the data render path (which reports `0` for an empty list); the standalone empty-state render used at construction simply shows the label.
+- **The hover cluster is one action.** Unpin only. A dedicated open action was redundant with the row-body click, and the terminal session-resume action was dropped for parity with the desktop editor, which has neither. (Notable — an earlier shape of this row carried three.)
+- **A reference pin's letter and colour are BOTH re-derived, and neither is read from what was stored.** This closes a drift that shipped in both directions at once: a letter-keyed colour map cannot serve two sources that share a letter, it collided with the note and snippet letters this panel owns, and the stored letter itself belongs to whatever alphabet the writing plugin version used. Deriving only the colour would have left a stale two-character tag sitting over the correct hue forever. The key already carries the source, so nothing about the stored shape had to change. (Notable; a closed defect, documented as the current rule.)
+- **An unrecognised reference source lands on the shared table's neutral unknown, not on the panel's own grey.** The two are different fallbacks that happen to look similar; taking the shared one is what makes a pinned row and a live reference row render an unknown source identically. (Notable.)
+- **The pin store is shared, not panel-local.** A pin made here is visible on the desktop editor's surface and the reverse; there is no per-host pin format. (Notable.)
+- **The list is branch-scoped, so switching branches changes what is pinned.** Pinning several conversations on a feature branch and then checking out the trunk shows an empty section. The pins are not gone — they are in the other branch's group — and nothing on screen explains that. (Surprising.)
+- **Pins written before the migration are silently invisible.** The retired panel-local shape does not survive the shared format's read filter; those entries are dropped on read and erased by the next write. (Notable.)
+- **The panel never creates a pin.** It is the read-and-act surface of a store four other surfaces write into. (Notable.)
+- **The badge falls back to the provider field when no badge was stored**, which is why a conversation pin keeps its producer identity even though badge and provider are two separate persisted fields. An entry with neither yields an empty pill rather than a missing lead — and for a reference that fallback is irrelevant, since the letter is derived anyway. (Notable.)
+- **A conversation pin re-resolves to a live conversation at open time.** Because a pin stores only a key and a snapshotted title, opening one requires matching that key against the *current* active list. A conversation that has aged out of the recency window, or been dismissed, cannot be opened — the row stays, and the click does nothing. A failure of the listing itself is logged, so a user report can be traced to a transport failure rather than a missing session; the click is silent either way. (Notable.)
+- **Opening a memory pin replaces whatever memory was already showing.** Memory opening goes through the shared single-memory-tab opener, which allows at most one memory tab per project. Clicking through several memory pins reuses one tab, and two pinned memories cannot be open side by side — which the phrase "several pinned memories" does not suggest. (Surprising.)
+- **The panel is on neither change-notification list, deliberately.** Every painted value was snapshotted at pin time, so no context event can change the render; subscribing cost a round trip and a full rebuild on every unrelated working-area edit machine-wide. (Notable.)
+- **The panel does not load on construction.** Until something calls refresh, the section shows the placeholder even when pins exist. (Notable.)
+- **The working directory here prefers the shared repository root and falls back to the checkout path** — the opposite order to the live conversations list, which prefers the checkout precisely because its inputs are per-checkout. The pin file is per project directory, so in a linked checkout the two surfaces can be reading and writing different files. (Surprising; the two surfaces do not agree.)
+- **The placeholder render at construction publishes no count, but the populated path publishes zero for an empty list.** The header can therefore be uninitialised until the first real render. (Notable.)
+- **The reserved action width creates an inert right-hand strip.** The right cell is neither a click target nor an open target, so clicking the empty space where the action will appear does nothing. (Notable.)
+- **The panel fits to content and owns no scroll bar**, and every render revalidates the whole panel so the hosting section re-measures. (Notable.)
+- **Only conversation pins can render a logo.** Every other kind always renders a coloured letter pill. (Notable.)
+- **The aggregate skill row cannot be pinned.** The working-context surface gives it no pin affordance, because a pin addresses one artifact by key and that row stands for every captured skill at once. (Notable.)
+- **Memory pins are always neutral grey.** The letter stamped for a memory has no entry in this panel's tag map, so every memory pin takes the fallback hue while its plan, note and reference neighbours are coloured. (Surprising; an unfixed gap.)
+- **A source the panel's own source enumeration does not carry paints as an unrecognised reference.** That enumeration lags the reference-source catalogue, and at least one shipping source is currently absent from it — so a pin of that source renders with the placeholder letter and the neutral hue here, while the desktop editor renders its real brand letter and colour from identical stored data. (Surprising; see spec 313 for where the drift sits.)
+- **The section header carries no toolbar.** Its action group is registered with no actions, so there is no header-level refresh or clear affordance; every reload is an explicit call from elsewhere. (Notable.)
+- **The click target excludes the right-hand cell but the hover target includes the action.** Both are deliberate: the action must keep the row "hot" while the cursor is over it, and must not double as an open. (Notable.)
+- **The panel exposes an "is this pinned?" query that nothing calls.** (Unreachable.)
 
 ## Shared Behavior
 
-- **Pin store (spec 246)** — the single shared store behind all three surfaces. It owns the persisted list, the versioned format, the repository-and-branch group key, the atomic write, the defensive read coercion, and the upsert-on-re-pin semantics. This panel reads and unpins through the bridge, and applies the newest-first sort itself.
-- **Active-session aggregator** — re-resolves a conversation pin's key to a live conversation item at open time.
-- **Plans/notes/references registry** — resolves a context pin's source path by key.
-- **Conversation transcript editor tab / conversation virtual file** — the surface a conversation pin opens; this panel only constructs the virtual file.
-- **Memory editor tab / memory virtual file** — the surface a memory pin opens; this panel only looks up the memory and hands it to the shared single-memory-tab opener, which decides between swapping the one existing memory tab and opening a new one.
-- **Markdown preview utility** — renders plan/note/reference markdown.
-- **Terminal-resume utility** — resumes a Claude session; this panel only supplies session metadata.
-- **Tool-window section frame** — owns the PINNED header, count suffix, collapse, gear-menu visibility, and the shared scroll bar.
-- **Source panels (conversations / context / committed memories)** — own pin creation; this panel is the consumer surface. The letter a reference pin carries is decided there, from the shared source-presentation table (spec 313); this panel only looks that letter up in its own colour map.
+- **Pin store** — the single shared store behind every surface. It owns the persisted list, the versioned format, the repository-and-branch group key, the atomic write, the defensive read coercion and the upsert-on-re-pin semantics. This panel reads and removes through it, and applies the newest-first sort itself.
+- **Source presentation table (spec 313)** — owns the per-source letter, colour and label, plus the neutral unknown this panel's reference rows fall back to. This panel consumes it for both halves of a reference badge.
+- **Active session aggregation (spec 155)** — re-resolves a conversation pin's key to a live conversation at open time.
+- **Working-area context registry** — resolves a plan, note or reference pin's file path by key.
+- **Conversation editor tab, rendered-markdown preview, and the shared single-memory-tab opener** — the three surfaces the open dispatch hands off to.
+- **The hosting section frame** — owns the header, the count suffix, collapse state, the visibility toggle and the shared scroll bar.
+- **The pin-creating surfaces** — the live conversations list (spec 192), the working-context list, and the committed-memories list. Each decides the badge it stamps and calls this panel's refresh after writing.

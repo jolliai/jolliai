@@ -44,7 +44,7 @@ A merged entry carries a role (one of "human" or "assistant") and a content stri
 
 ### Producer enumeration
 
-The resolver pins a closed enumeration of twelve producers. The producers are named, in this spec, by their shorthand identifiers: **claude**, **codex**, **gemini**, **opencode**, **cursor**, **cursor-cli**, **copilot**, **copilot-chat**, **cline**, **cline-cli**, **devin**, **antigravity**. When the session record's producer field is absent, the resolver substitutes **claude**.
+The resolver pins a closed enumeration of producers, and its per-producer parser table is total over it. The producers are named, in this spec, by their shorthand identifiers: **claude**, **codex**, **gemini**, **opencode**, **cursor**, **cursor-cli**, **copilot**, **copilot-chat**, **cline**, **cline-cli**, **devin**, **antigravity**, **kimi**. When the session record's producer field is absent, the resolver substitutes **claude**.
 
 ### Output
 
@@ -142,6 +142,7 @@ The parsers, by producer:
 | **cline-cli**    | Always returns undefined.                                                                                                | The source carries a native title from the discoverer; this parser exists for completeness only (stub).                                                       |
 | **devin**        | Always returns undefined.                                                                                                | The source carries a native title from the discoverer; this parser exists for completeness only (stub).                                                       |
 | **antigravity**  | Always returns undefined.                                                                                                | The source carries a native title from the discoverer; this parser exists for completeness only (stub).                                                       |
+| **kimi**         | Object's `type` field equals the prompt-turn marker. (Notably **not** `role` and **not** `type: "user"` — this producer's wire stream types a human turn as a prompt-turn event.) | Top-level `input`. Apply the stringification contract.                                                                                                        |
 
 **Copilot-chat parser** handles two shapes within one parser:
 
@@ -197,6 +198,8 @@ The Claude native reader and the streaming first-user-message fallback both open
 - **Copilot-chat parser handles two shapes inside one parser.** Real Copilot Chat transcripts come in two on-disk shapes: a per-session JSONL patch document and an events.jsonl envelope. An earlier implementation handled only shape A, with the effect that events.jsonl-backed sessions rendered correctly in the detail panel (the loader supports both shapes) but always showed the placeholder in the sidebar title. The parser handles both shapes precisely to remove that "details work, title is wrong" split.
 
 - **Opencode, cursor, copilot, cursor-cli, cline, cline-cli, devin, antigravity parsers are no-op stubs.** These producers' discoverers always populate the native title field, so step 1 wins for every real session. The stub parsers exist so the per-producer parser table is total over the producer enum. If a session of one of these producers ever reaches step 3 (because the native title was unexpectedly empty), the parser unconditionally returns undefined and the placeholder is emitted.
+
+- **The kimi parser is a real parser, not one of those stubs, and it is genuinely reached.** That producer's discoverer populates the native title only when the session's own metadata document carried a non-empty one, and it omits the field entirely otherwise — so a session whose metadata is silent about the title falls through step 1 into step 3, where this parser recognises the transcript's prompt-turn event and returns its stringified body. The parsers that actually inspect a line are claude, codex, gemini, copilot-chat and kimi; every other entry in the table is a stub.
 
 - **Pre-filter substring check in the Claude reader is sound.** The reader explicitly does not re-check the `type` field after JSON parsing. The literal substring `"type":"ai-title"` (with the trailing closing quote) is exact: any line that passes this check has, after parsing, a `type` that is exactly `"ai-title"`. A line whose `type` is a longer string that starts with the same value (e.g. `"ai-title-other"`) does not pass the pre-filter because the closing quote position would be different.
 

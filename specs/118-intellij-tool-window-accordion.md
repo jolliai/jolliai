@@ -1,251 +1,255 @@
-# IntelliJ Tool Window Layout
+# 118. IntelliJ Tool Window Layout
 
 ## Topic Statement
 
-A single tool window in the IDE that, once a Git repository and credentials are present, presents a three-segment view switch (Current Branch / Memory Bank / Knowledge), a repo/branch breadcrumb, a vertical stack of three named collapsible sections — PINNED, WORKING MEMORY, COMMITTED MEMORIES — sharing one scroll bar, and a fixed bottom action bar; carries its window-level controls (agent access, settings, status toggle, cloud sync) in the title bar and per-section show/hide toggles in the gear menu; swaps a full-pane STATUS card in whenever the project is disabled; and falls back to a no-git placeholder or an onboarding card when prerequisites are missing.
+A single tool window in the IDE whose content is chosen by a stack of nested card switches — two hard pre-gates, then a three-way route between an onboarding card, a dedicated **disabled** card and the main card, then a two-way route between the normal sidebar and a full-pane **status overlay**, then a three-way route between the accordion, the Memory Bank explorer and a Knowledge placeholder — where the accordion itself is a view switch, a breadcrumb, a vertical stack of three named collapsible sections sharing one scroll bar, and a fixed bottom action bar, with a **two-icon** title-bar strip and per-section show/hide toggles in the gear menu.
 
 ## Scope
 
 **In scope:**
-- The top-to-bottom order of the Current-Branch view: view switch, breadcrumb, the three collapsible sections in a single shared scroll, and the bottom action bar.
-- The fixed order of the three sections (PINNED, WORKING MEMORY, COMMITTED MEMORIES) and the single-scrollbar stacking model that replaced the per-section resize bars.
-- The header anatomy (collapse arrow, section title with optional live row-count suffix, action toolbar) and the click-to-toggle gesture.
-- The "click anywhere on the header" expand/collapse rule.
-- The vertical-space model: each section sizes to its own content height; one outer scroll bar spans the whole stack; trailing glue absorbs slack when the content is short. The PINNED section additionally fits-to-content.
-- Per-section persistence of two independent flags: the user's expand/collapse choice and the user's show/hide choice (the latter exposed through the tool window's gear menu).
-- The full-pane STATUS card and its continuous auto-show rule, which tracks the project's enabled flag rather than firing once.
-- The title-bar action group (agent access, settings, status toggle, cloud sync).
-- The view-switch behavior surface (Current Branch / Memory Bank / Knowledge) and the breadcrumb-mode changes it drives.
-- The behavior surface when no git repository is detected and when a repository disappears mid-session.
-- The behavior surface when the user has neither signed in, saved an API key, set a Jolli API key, set the Anthropic env key, nor paused — the whole main view is replaced by an onboarding card at this layer.
-- The foreign-memory mode the breadcrumb can enter, which hides the WORKING MEMORY section and switches the COMMITTED MEMORIES section to read-only.
+
+- The two hard pre-gates ahead of every card: the absent-repository placeholder and the absent-runtime blocking panel.
+- The three-way root route (onboarding / disabled / main), its exact predicate, and the state that predicate does not cover.
+- The status **overlay**: that it is a card above the entire normal layout rather than a section, what toggles it, and the continuous synchronisation rule that shows, hides and collapses it.
+- The two-icon title-bar strip, and the health-coloured toggle icon.
+- The view switch (Current Branch / Memory Bank / Knowledge), which segment is reachable, and the breadcrumb modes it drives.
+- The accordion's fixed contents and order, the single-scrollbar stacking model, header anatomy, and the click-to-toggle gesture.
+- Per-section persistence of two independent flags, and the gear menu that exposes one of them.
+- The cold-start card that renders above the stack without being one of the sections.
+- The behaviour surface when the repository disappears mid-session.
+- The foreign-memory mode the breadcrumb can enter.
+- Which registered action groups are wired to a header, which are registered but reach nothing, and which action classes are registered nowhere and therefore unreachable.
 
 **Out of scope:**
-- The contents of the three sections (PINNED, WORKING MEMORY, COMMITTED MEMORIES) — each owns its own spec; COMMITTED MEMORIES is the commits panel (separate spec).
-- The Memory Bank and Knowledge view bodies — the Knowledge view is a "coming soon" placeholder at this layer; Memory Bank's explorer is its own concern.
-- The onboarding card's internal layout — its own spec.
-- The Settings dialog the gear/settings action opens — its own spec.
-- The summary / conversation viewers that open when a row is clicked — their own specs.
-- The cloud-sync action's sign-in / sign-out flow — specified as part of the broader auth surface.
+
+- The contents of the three sections — each owns its own spec.
+- The status overlay's header actions and row list — spec 133.
+- What the disable and enable gestures actually do, the cached verdict they flip, and the roll-backs — spec 332.
+- The onboarding card's internal layout, the disabled card's internal layout (it is a stateless label-and-button panel; all sequencing lives in the frame), and the Settings dialog.
+- The Memory Bank explorer body and the runtime-detection subsystem behind the absent-runtime panel — spec 284.
+- The summary and conversation viewers opened by a row click.
+- The sign-in flow, which is no longer reachable from this frame at all.
 
 ## Data Contracts
 
-### The three top-level sections
+### The card stack
 
-The Current-Branch view always contains exactly these three sections, in this order:
+Four nested switches, evaluated outermost first:
 
-| Position | Section title       | Sizing                       | Initial expanded |
-| -------- | ------------------- | ---------------------------- | ---------------- |
-| 1        | PINNED              | Fits to content height       | Expanded         |
-| 2        | WORKING MEMORY      | Sizes to content height      | Expanded         |
-| 3        | COMMITTED MEMORIES  | Sizes to content height      | Expanded         |
+| Level | Choices | Selected by |
+| --- | --- | --- |
+| Pre-gate 1 | Absent-repository placeholder, or continue | Whether a repository marker exists under the project base path |
+| Pre-gate 2 | Absent-runtime blocking panel, or continue | Whether a verified external runtime is already cached (a non-blocking check, safe on the interface thread) |
+| Root | Onboarding / **Disabled** / Main | The predicate below |
+| Main | Normal sidebar / **Status overlay** | The title-bar toggle and the synchronisation rule below |
+| Content | Accordion / Memory Bank explorer / Knowledge placeholder | The view switch |
 
-The three are stacked vertically in a width-tracking panel inside a single scroll pane (vertical-as-needed, horizontal never), with trailing vertical glue. There are no resize bars between sections, and no proportional weight redistribution — each section keeps its natural height. Section titles render uppercase exactly as listed.
+### The root predicate
 
-The PINNED and COMMITTED MEMORIES headers carry a live `(N)` row-count suffix; the count updates as the underlying panel's row count changes.
+```
+disabled AND configured   → the disabled card
+configured                → the main card
+otherwise                 → the onboarding card
+```
 
-### Per-section persisted state
+*Configured* means any one of: the local-agent provider is selected, an assistant API key is saved, that key's environment variable is set, or a product API key is saved.
 
-Two independent boolean flags per section title, persisted across IDE restarts:
+Two consequences are load-bearing:
 
-| Flag        | Trigger                                                                 | Default |
-| ----------- | ----------------------------------------------------------------------- | ------- |
-| `expanded`  | The user clicked the section header to collapse or expand.             | `true`  |
-| `visible`   | The user toggled the section in the tool window's gear menu.            | `true`  |
+- **The disable verdict wins over being configured, but not over being unconfigured.** A repository the user turned off *and* whose credentials were then all removed renders the **onboarding** card, with nothing anywhere stating that it is opted out.
+- A legacy machine-wide "paused" preference is **no longer** one of the configured conditions. It participates only in the startup projection owned by spec 332.
 
-Both flags are keyed by the section title string.
+The verdict is seeded once when the content is built and re-read on every status fire; the view is re-routed only when it changed. It is also flipped optimistically by the disabled card's enable button and rolled back on failure — spec 332 owns that lifecycle.
 
-### Header layout contract
+### Title-bar actions — exactly two
 
-Each section header shows, left to right:
+| Position | Action | Icon |
+| --- | --- | --- |
+| 1 | **Settings** — opens the Settings dialog | A static gear |
+| 2 | **Status** — a toggle that shows and hides the full-pane status overlay | **Not static**: a health-coloured circle, re-resolved on every action update, computed on the background update thread |
 
-1. A collapse/expand triangle (right-pointing when collapsed, down-pointing when expanded).
-2. An optional title icon (only the PINNED section carries one — a pin glyph shown before its title).
-3. The bold uppercase section title, optionally followed by a live `(N)` row-count.
-4. The right-aligned action toolbar populated from a per-section action group identifier.
+Both are constructed inline; neither is a registered action class.
 
-The header strip is opaque and fully clickable to toggle.
-
-### Section-specific action group identifiers
-
-| Section title       | Action group identifier              |
-| ------------------- | ------------------------------------ |
-| PINNED              | `JolliMemory.PinnedActions`          |
-| WORKING MEMORY      | `JolliMemory.CurrentMemoryActions`   |
-| COMMITTED MEMORIES  | `JolliMemory.CommitsActions`         |
-
-These names are part of the contract because external action contributions key off them. (Action groups `JolliMemory.StatusActions`, `JolliMemory.PlansActions`, `JolliMemory.ChangesActions`, and `JolliMemory.ConversationsActions` remain registered; the latter three are consumed by sub-sections folded inside WORKING MEMORY, and the STATUS group is registered but no longer wired into any header.)
-
-### View switch
-
-A persistent three-segment switch above the breadcrumb:
-
-| Segment         | Effect                                                                                  |
-| --------------- | --------------------------------------------------------------------------------------- |
-| Current Branch  | Shows the accordion card; breadcrumb in branch mode; the bottom action bar is visible.  |
-| Memory Bank     | Shows the Memory Bank explorer card; breadcrumb in repo-filter mode; action bar hidden. |
-| Knowledge       | Shows the Knowledge "coming soon" placeholder card; breadcrumb in repo-filter mode; action bar hidden. |
-
-The active segment is bold with an accent underline; inactive segments are muted and highlight on hover. Selecting a segment also clears the full-pane status card if it was showing.
-
-### Title-bar actions
-
-The tool window title bar carries the following actions, in order:
-
-1. **Agent Access** — opens an informational "coming soon" message. **Gated behind the unfinished-feature flag**: the action object is still defined, but it is added to the title bar only when that master flag is on, which it is not in shipped builds. So the shipped title bar does **not** carry it (re-enabling is a one-line flag flip).
-2. **Settings** — opens the Settings dialog.
-3. **Status** — a toggle action that shows / hides the full-pane STATUS card over the current content. **Its icon is not a static glyph**: it reflects overall health as a green / yellow / red status circle (see Health status glyph below), recomputed on the background update thread.
-4. **Cloud sync** — opens the sign-in / sign-out popup; its icon reflects the current auth state.
-
-So the shipped title bar carries three actions (Settings, Status, Cloud sync); Agent Access appears only when the unfinished-feature flag is enabled.
+**The cloud-sync action is gone.** The title bar previously carried a third action whose popup held sign-in, sign-out and manual sync; those three moved into the status overlay (its header carries sign-in/out, and its row list carries manual sync — spec 133), leaving a two-icon strip. **The "agent access" placeholder is gone too**; the unfinished-feature master flag that used to gate it still exists but no longer gates any title-bar action.
 
 ### Health status glyph
 
-The title-bar Status toggle's icon is a colored circle chosen by a single shared health function (also used by the separate hover status-indicator, so the two always agree):
+The status toggle's icon is chosen by a single shared health function, also used by the separate hover indicator so the two always agree:
 
-| Color  | Condition |
-| ------ | --------- |
-| Red    | No status snapshot, or the project is not enabled. |
-| Yellow | Enabled but degraded — any of: no LLM credential for the selected provider; a recorded last-error; git hooks not fully installed; a detected Claude/Gemini host whose hook is not installed; an OpenCode or Cursor scan error; **Node missing, or present but the bundled-tool MCP/skills integrations not set up**. |
-| Green  | Enabled with none of the above. |
+| Colour | Condition |
+| --- | --- |
+| Red | No status snapshot, or the repository is not enabled |
+| Yellow | Enabled but degraded — any of: no credential for the *selected* provider; a recorded last error; git hooks not fully installed; a detected assistant host whose hook is not installed; a reported scan failure from either of the two embedded-store integrations the function checks; the runtime missing, or present with the integrations not set up |
+| Green | Enabled with none of the above |
 
-The integration clause mirrors the STATUS panel's "MCP & Skills" row (spec 133) and degrades the glyph to yellow rather than red. Note the historical rationale for choosing yellow — "memory generation still runs on native hooks" — no longer holds: the installed hooks execute under the resolved external runtime too, so a missing runtime is not in fact non-blocking. The colour rule is unchanged; only its justification is stale.
+The credential clause is provider-aware: the assistant provider requires its own key or environment variable, the hosted provider requires the product key, and every other provider setting requires *some* credential.
 
-### Hover status popup — hooks line
+The integrations clause mirrors the corresponding overlay row and degrades to yellow rather than red. The historical justification for that choice — "memory generation still runs on native in-IDE hooks" — no longer holds, since the installed hooks execute under the external runtime; the colour rule is unchanged, only its justification is stale.
 
-The hover status indicator renders a small HTML summary whose hooks line is a `+`-joined list of the installed hook families, in the same form the STATUS panel's Hooks row uses: `5 Git + 2 Claude + 1 Gemini` when all three families are present, `5 Git` when only the git hooks are, and `none installed` when none are. The bullet beside it is green when the git-hook flag is set and red otherwise. The count in `5 Git` is part of the literal string, not a computed number, and the git-hook flag it keys off is computed from every installed git hook except the push-time one (see spec 133) — so a repository missing the push-time hook still shows a green bullet and `5 Git`.
+**The scan-failure clause is narrower than the overlay's row set.** The health function checks two integrations' scan failures; the overlay renders failure rows for considerably more. A failure from any integration the health function does not check leaves the glyph green while the overlay shows a warning row. (Notable.)
 
-### Gear menu
+### The three accordion sections
 
-The tool window's additional-gear menu carries one show/hide toggle action per top-level section (PINNED, WORKING MEMORY, COMMITTED MEMORIES), in stack order. Each toggle flips that section's persisted `visible` flag and re-lays out the stack.
+| Position | Title | Sizing | Initially |
+| --- | --- | --- | --- |
+| 1 | PINNED | Fits to content height | Expanded |
+| 2 | WORKING MEMORY | Sizes to content height | Expanded |
+| 3 | COMMITTED MEMORIES | Sizes to content height | Expanded |
 
-### Cold-start back-fill card
+Stacked vertically in a width-tracking panel inside a single scroll pane (vertical as needed, horizontal never), with trailing glue. There are no resize bars and no proportional weight redistribution. Titles render uppercase exactly as listed. The first and third headers carry a live row-count suffix that tracks the underlying panel.
 
-A bare bordered card can render **above** the PINNED section, at the very top of the accordion stack. It is deliberately **not** one of the three top-level sections: it carries no header triangle, no persisted `expanded`/`visible` flags, and no entry in the gear menu's show/hide list above. Its visibility is driven entirely by the project service's cold-start signal (and a repo-wide dismiss marker), not by any user-persisted toggle. Full internals — the signal, the card's own state machine, the dismiss marker, and the shared background runner — are owned by **IntelliJ Cold-start Back-fill Card** (spec 260).
+### Per-section persisted state
 
-### Full-pane STATUS card
+Two independent booleans per section title, persisted across restarts, both defaulting to true: whether the user expanded it (toggled by clicking the header) and whether the user made it visible (toggled from the gear menu). Both are keyed by the section **title string**, so renaming a title orphans its state.
 
-The STATUS panel is registered as its own content card (not as a collapsible section). The Status title-bar toggle swaps it over the accordion; an auto-show rule swaps it in whenever the project is disabled.
+### Header layout
 
-### Foreign-memory mode
+Left to right: a collapse/expand triangle; an optional title icon (only the first section carries one); the bold uppercase title with its optional row-count suffix; and a right-aligned toolbar populated from a per-section action group identifier. The whole strip is opaque and clickable to toggle.
 
-When the breadcrumb selects a foreign repo + branch, the WORKING MEMORY section is hidden, the bottom action bar enters foreign mode, and the COMMITTED MEMORIES section switches to a read-only view of the foreign memories. Clearing the selection restores the WORKING MEMORY section's persisted visibility, clears the action bar's foreign mode, and returns COMMITTED MEMORIES to workspace mode.
+### Action group identifiers
+
+The three section headers, the three sub-section headers folded inside the second section, and two standalone actions are all resolved by registered identifier, which is why the identifiers are part of the contract.
+
+**One registered group reaches nothing.** The status action group and the refresh action inside it are still declared, but the status surface is a hand-rolled overlay with no toolbar, so no header consumes them.
+
+**Five named action classes are reachable from nowhere at all**, alongside an unused sign-in bar component. They appear in neither the plugin manifest nor any programmatic construction, and nothing in the source names them, so no gesture anywhere can invoke them — they are unreachable code, not behaviour. One of the five is a **standalone settings action**: a complete second implementation of the same gesture the title bar's inline gear performs, opening the same dialog by the same route. Nothing distinguishes the two at runtime, because only the inline one exists at runtime. (Re-derived at HEAD: the manifest registers seven action classes by name, one more is constructed directly by the gear menu's per-section toggles, and the remaining five are named nowhere.)
+
+### View switch
+
+A persistent segmented switch above the breadcrumb:
+
+| Segment | Effect |
+| --- | --- |
+| Current Branch | Accordion card; breadcrumb in branch mode; bottom action bar visible |
+| Memory Bank | Explorer card; breadcrumb in repository-filter mode; action bar hidden |
+| Knowledge | Placeholder card; breadcrumb in repository-filter mode; action bar hidden |
+
+**The Knowledge segment is not reachable.** Its tab is added only when the unfinished-feature master flag is on, which it is not in shipped builds; the segment and its handler remain so that re-enabling is a flag flip. Its content card is therefore dead in shipped builds.
+
+The active segment is bold with an accent underline; inactive segments are muted and highlight on hover.
+
+### Cold-start card
+
+A bare bordered card can render **above** the first section, at the very top of the stack. It is deliberately not one of the three sections: no header triangle, no persisted flags, no gear-menu entry. Its visibility is driven by the project service's cold-start signal and a repository-wide dismiss marker. It is constructed defensively — a construction failure omits it entirely rather than failing the content. Full internals are owned by spec 260.
 
 ## Behavior
 
 ### Initial render
 
-On tool window open the host first checks for a `.git` directory inside the project's base path. If absent, a single placeholder body is shown with a static message instructing the user to run `git init` or enable VCS integration; the host subscribes to a project-level VCS-configuration-change channel and rebuilds the full content the moment a `.git` directory appears.
+The frame checks for a repository marker under the project base path. If absent, a single placeholder body is shown instructing the user to initialise a repository or enable version-control integration, and the frame subscribes to the project's version-control-configuration channel so the content is rebuilt the moment the marker appears.
 
-When `.git` is present, the host resets the service if it is recovering from a prior `.git` removal, initializes the service if needed, then builds the full content. The full content is wrapped in an onboarding-vs-main card: the main card is shown only when the user is "configured" — signed in, OR a saved Anthropic API key, OR the `ANTHROPIC_API_KEY` environment variable, OR a saved Jolli API key, OR a `paused` config flag. Otherwise the onboarding card is shown. The split is re-evaluated on every status change and on every auth change.
+Otherwise the runtime gate runs: a cached verified runtime lets the full content build; otherwise a blocking panel is shown instead. That panel re-probes in the background without forcing (so a probe already running in the startup activity is shared) and swaps itself out for the full content once a runtime is found; its retry control forces a fresh probe and completes the startup sequence the gate skipped. Nothing else of the frame is reachable behind it, and the project service's own initialisation is gated on the same check.
+
+Full content then builds the sections, the view switch, the breadcrumb, the action bar, the title-bar actions and the gear menu, subscribes for repository-removal detection, seeds the disable verdict, routes the root card, and runs the status synchronisation once.
 
 ### Click-to-toggle
 
-A single click anywhere on a section header flips the section's `expanded` flag. The triangle icon updates immediately. The contained body is added to or removed from the section, and both the section and its parent stack are revalidated so the single scroll re-measures. A collapsed section shrinks to header height.
-
-The flag is persisted per section title at the moment of toggle.
+A single click anywhere on a section header flips that section's expanded flag and persists it. The triangle updates, the body is added or removed, and both the section and the stack are revalidated so the single scroll re-measures. A collapsed section shrinks to header height.
 
 ### Single-scroll stacking
 
-The three sections live in a width-tracking content panel inside one scroll pane. The content panel tracks the viewport width (so long rows never trigger a horizontal scrollbar). When the combined content is shorter than the viewport it fills the height (trailing glue absorbs slack, no scrollbar); when taller it keeps its natural height and the single vertical scrollbar covers the whole stack. The COMMITTED MEMORIES section's own token-meter + list render at natural height with no inner scrollbar, so they participate in this single outer scroll.
+The sections live in a width-tracking panel inside one scroll pane, which tracks the viewport width so long rows never produce a horizontal scrollbar. Shorter-than-viewport content is absorbed by trailing glue with no scrollbar; taller content keeps its natural height and one vertical scrollbar covers the whole stack. The third section's own meter and list render at natural height with no inner scrollbar, so they participate in the outer scroll.
 
-### Status full-pane toggle and auto-show
+### The status overlay
 
-The Status title-bar toggle calls the show-status function, which swaps between the STATUS card and the accordion card.
+It is a card **above the entire normal sidebar layout**, so showing it hides the view switch, the breadcrumb, the accordion and the action bar together. It is not a section and it is not the disabled card.
 
-A continuous auto-show rule runs on construction and on every status-listener fire: if the project is **not** enabled, the STATUS card is forced shown; if the project **is** enabled and the status card is currently shown, it is dismissed back to the accordion. (When enabled, the dismissal only fires if the status card was the one showing — it does not disturb the Memory Bank / Knowledge views.) This means the STATUS card appears the moment the project becomes disabled and disappears the moment it is re-enabled.
+Because it is constructed before the switch that drives it exists, the toggle is wired to a forward-declared placeholder and the real implementation is pushed through once, so the toggle's own state cannot desynchronise from the card actually shown.
 
-### View switching
+**The synchronisation rule**, run on construction and on every status fire:
 
-Selecting a view-switch segment swaps the content card, sets the breadcrumb mode, toggles the bottom action bar's visibility, and (for Memory Bank) kicks off a background load of the explorer. Switching any view first clears the full-pane status state.
+```
+if the disable verdict is set:
+      collapse the overlay if it is showing, and RETURN
+if the repository is not enabled:
+      force the overlay shown
+else if the overlay is showing:
+      dismiss it back to the normal layout
+```
 
-### Branch / breadcrumb updates
+The first branch is deliberately **not** a plain early return. The card holding the overlay survives underneath the disabled card, so an overlay left open would still be open when the user clicks Enable — and the click would land back on the status page instead of the sidebar. This branch is what covers every route into the disabled state the frame did not itself initiate: a disable typed in a terminal, one performed in another window, or the Settings dialog auto-disabling after the last credential is removed. The frame's own disable gesture collapses the overlay inline, without waiting for the asynchronous refresh (spec 332).
 
-The breadcrumb's current branch is updated from three detection paths: the IDE git-repository-change event, the VCS-configuration-change channel (catching terminal branch operations), and the service's status listener.
+Selecting any view-switch segment also collapses the overlay first — through the same setter the toggle uses, rather than by flipping a raw flag, so the toggle button cannot desynchronise.
 
-### Loss of `.git` mid-session
+### Branch and breadcrumb updates
 
-The host subscribes both to the VCS-configuration channel and to the service's own status listener. If either fires while a `.git` directory has been removed from disk (detected by absence on disk, or by the service flagging git as removed), the entire content is torn down and the no-git placeholder is shown. Re-creating `.git` rebuilds the content via the same path as the initial render. The git-removal switch is guarded so it fires at most once per content lifetime.
+The breadcrumb's current branch is refreshed from three detection paths: the IDE's repository-change event, the version-control-configuration channel (which catches branch operations performed in a terminal), and the service's status listener.
 
-### Onboarding ↔ main
+### Loss of the repository mid-session
 
-When the user is not configured, the onboarding card is shown. Saving an API key (or any of the configured-credential conditions becoming true) flips to the main card. On sign-out, if no other credentials remain, the service is uninstalled and status refreshed on a background pool; the view re-syncs to onboarding.
+The frame subscribes both to the version-control-configuration channel and to the service's status listener. If either fires while the repository marker has been removed from disk — detected by absence, or by the service flagging removal — the whole content is torn down and the placeholder is shown. Re-creating the marker rebuilds the content by the same path as the initial render. The teardown is guarded so it fires at most once per content lifetime.
+
+### Foreign-memory mode
+
+When the breadcrumb selects a foreign repository and branch, the second section is hidden, the bottom action bar enters foreign mode, and the third section switches to a read-only view of the foreign memories. Clearing the selection restores the second section's persisted visibility, clears the action bar's foreign mode, and returns the third section to workspace mode.
 
 ## State Transitions
 
 ```
-[tool window opened, no .git]
-  show no-git placeholder
-  subscribe(VCS_CONFIGURATION_CHANGED)
-  on .git appears → tear down placeholder, run [tool window opened, .git present]
+[tool window opened, no repository marker]
+  show placeholder; subscribe to the VCS-configuration channel
+  marker appears → tear down, run the branch below
 
-[tool window opened, .git present]
-  reset service if recovering from .git removal; initialize if needed
-  build sections, view switch, breadcrumb, action bar, title-bar actions, gear menu
-  subscribe(VCS_CONFIGURATION_CHANGED) + service status listener for .git removal
-  if not configured → show onboarding card; else → show main card
-  syncStatusCard()  // auto-show STATUS when disabled
+[tool window opened, marker present, no cached runtime]
+  show the blocking runtime panel; probe in the background
+  runtime found → swap in the full content
 
-[user clicks header on section S]
-  S.expanded ← !S.expanded; persist
-  revalidate section + stack
+[tool window opened, marker present, runtime cached]
+  build sections, view switch, breadcrumb, action bar, title actions, gear menu
+  subscribe for repository removal; seed the disable verdict
+  route the root card; run the status synchronisation
 
-[user toggles section S in gear menu]
-  S.visible ← !S.visible; persist
-  re-layout stack
-
-[user clicks Status title-bar toggle]
-  swap STATUS card ↔ accordion card
+[user clicks a section header]      → flip + persist expanded; revalidate
+[user toggles a section in the gear menu] → flip + persist visible; re-lay out
+[user clicks the Status toggle]     → swap overlay ↔ normal layout
 
 [status listener fires]
-  syncStatusCard(): if !enabled → show STATUS; else if status shown → show accordion
-  re-evaluate onboarding-vs-main
-  update breadcrumb branch
+  re-read the disable verdict; re-route the root card only if it changed
+  run the status synchronisation (collapse-and-return when disabled)
+  update the breadcrumb branch
 
 [user selects a view-switch segment]
-  clear status-shown
-  swap content card; set breadcrumb mode; toggle action bar; (Memory Bank → load explorer)
+  collapse the overlay; swap the content card; set breadcrumb mode;
+  toggle the action bar; (Memory Bank → load the explorer in the background)
 
-[breadcrumb selects a foreign repo/branch]
-  hide WORKING MEMORY; action bar → foreign; COMMITTED MEMORIES → read-only foreign
-
-[breadcrumb clears foreign selection]
+[breadcrumb selects a foreign repository/branch]
+  hide WORKING MEMORY; action bar → foreign; COMMITTED MEMORIES → read-only
+[breadcrumb clears the selection]
   restore WORKING MEMORY visibility; action bar → workspace; COMMITTED MEMORIES → workspace
 
-[user signs in or becomes configured]
-  flip onboarding card → main card
-
-[user signs out, no credentials remain]
-  uninstall + refresh status (background); flip main card → onboarding card
-
-[.git is removed]
-  tear down content → show no-git placeholder
+[user becomes configured]           → onboarding card → main card
+[user signs out with no credentials left] → uninstall + refresh on a pool; → onboarding card
+[repository marker removed]         → tear down → placeholder
 ```
 
 ## Notable Behavior
 
-- **The section order is fixed.** Users cannot reorder; the gear menu only hides/shows.
-- **There are no resize bars and no weight redistribution.** The earlier five-section drag-to-resize accordion was replaced by a single shared scroll bar; each section keeps its natural content height and the outer scroll covers the whole stack.
-- **The STATUS section is no longer one of the stacked sections.** It is a full-pane card swapped in by the title-bar Status toggle and by the continuous auto-show-when-disabled rule.
-- **The auto-show-when-disabled rule is continuous, not one-shot.** Shown when disabled; dismissed when enabled (only if it was the visible card). It re-fires on every status change.
-- **Section headers carry a live row count.** PINNED and COMMITTED MEMORIES show `(N)`; the suffix tracks the underlying panel's row count.
-- **The configured-vs-onboarding split is at this layer.** When the user lacks every credential path (sign-in / Anthropic key / Anthropic env / Jolli key / paused), the whole main view is hidden behind the onboarding card.
-- **The no-git placeholder is reactive.** Running `git init` from any tool brings the content to life without restarting the IDE, because the placeholder subscribes to the IDE's VCS-configuration channel.
-- **Persistence keys are keyed by section title.** Renaming a section title would orphan its persisted expand / visible state — section titles are part of the contract.
-- **Foreign-memory mode collapses the live-work sections.** Browsing another repo/branch's memories hides WORKING MEMORY and makes COMMITTED MEMORIES read-only, so the destructive bottom-action-bar operations don't apply to memories the user can't act on.
-- **The five-section accordion frame from the prior design is gone.** The legacy STATUS/MEMORIES/PLANS & NOTES/CHANGES/COMMITTS accordion, its resize-bar drag model, its STATUS auto-visibility flag, and the MEMORIES-header status-indicator dot are no longer wired into the tool window.
-- **The title-bar Status glyph is health-colored, not static.** It renders a green/yellow/red circle from a shared health function (also driving the hover status indicator), recomputed on the background update thread, factoring credentials, last-error, git/Claude/Gemini hook states, OpenCode/Cursor scan errors, and the bundled-tool integration availability/active state. See the Health status glyph contract.
-- **Agent Access is gated off in shipped builds.** It lives behind the master unfinished-feature flag; the action object stays defined but is not added to the shipped title bar, so re-enabling is a single flag flip.
-- **The tool-window content disposable is hoisted so message-bus connections don't leak.** The content-level disposable is created up front and used both as the content's disposer and as the parent of the branch-update message-bus connection. A message-bus connection created with no parent disposable would keep its plugin-class handler subscribed after a dynamic unload and pin the plugin classloader; parenting it to the real content disposable ensures it is torn down with the content.
-- **Dynamic-unload cleanup groundwork exists but is INERT in production (prepared, not live).** An app-level unload listener is registered that, just before a dynamic plugin unload, would release the plugin's static-singleton background resources (auth service, telemetry, log writer) so they don't pin the classloader. However, the plugin manifest declares **require-restart**, so enabling / disabling / uninstalling the plugin always triggers a full IDE restart rather than a hot dynamic unload — and the unload listener therefore never runs in production. It is documented here as prepared-but-not-live groundwork (kept because a future coroutine/lifecycle refactor could make hot-unload clean), explicitly **not** an active code path today. The restart requirement itself is the current, live behavior: enable/disable/uninstall = one clean full reload.
+- **A disabled repository routes to a dedicated card, not to the status surface.** The status surface is a user-toggled overlay that is additionally force-shown while the repository is configured but *not installed*. Conflating the two is easy and wrong: they are different cards at different levels of the stack, chosen by different predicates. (Notable; this reverses the previous arrangement, in which a disabled project swapped the status panel in as full content.)
+- **The disabled card requires being configured as well as disabled.** Remove every credential from a disabled repository and the frame shows onboarding instead, with no statement anywhere that the repository is opted out. (Surprising; observable gap.)
+- **The title bar is a two-icon strip.** The cloud-sync popup that used to carry sign-in, sign-out and manual sync was deleted and its three gestures moved into the status overlay, and the agent-access placeholder was deleted with it. The unfinished-feature flag survives but no longer gates anything in the title bar.
+- **The status toggle's icon is health-coloured, not a static glyph**, and its scan-failure clause covers fewer integrations than the overlay's row set does — so a scan failure from an integration outside that clause shows a warning row while the glyph stays green.
+- **The overlay's disabled branch collapses rather than returning early, and that is the whole point of it.** The card beneath survives the route to the disabled card, so an overlay left showing would be what the user lands on after clicking Enable.
+- **The overlay is collapsed through its setter, never by flipping a flag.** The toggle button's own state is derived from the same setter, so a raw flip would leave the button claiming the overlay is shown while the normal layout is on screen.
+- **One registered action group reaches nothing.** The status group and its refresh action are still declared, but the status surface is a hand-rolled overlay with no toolbar.
+- **Five named action classes and one panel component are unreachable code.** None is declared in the manifest, none is constructed anywhere, and nothing names them, so no gesture can reach them; they are not behaviour and nothing on this surface changes if they are read as such. **The one worth calling out is a standalone settings action** — a whole second implementation of the title bar's settings gesture, opening the same dialog, that cannot be invoked because nothing registers or constructs it. A reader auditing "how many ways can settings be opened from this frame?" will find two and must count one. (Notable; unreachable.)
+- **The Knowledge segment is dead in shipped builds.** Its tab is added only behind the unfinished-feature flag; its content card and handler remain so re-enabling is a one-line change.
+- **The section order is fixed.** Users cannot reorder; the gear menu only hides and shows.
+- **There are no resize bars and no weight redistribution.** Each section keeps its natural content height and one outer scroll bar covers the whole stack.
+- **Persistence keys are the section titles.** Renaming a title orphans its persisted expand and visibility state, so titles are part of the contract.
+- **The absent-repository placeholder is reactive.** Initialising a repository from any tool brings the content to life without restarting the IDE, because the placeholder subscribes to the IDE's version-control-configuration channel.
+- **The runtime gate is a hard gate, not a warning.** Behind it nothing of the frame is reachable and the project service does not initialise. It self-heals: a tool window opened before the first probe finished swaps itself into the full content when the probe lands.
+- **Foreign-memory mode collapses the live-work sections**, so the destructive bottom-action-bar operations cannot apply to memories the user cannot act on.
+- **The cold-start card is constructed defensively** and omitted entirely if its construction fails, rather than taking the whole content down with it.
+- **The content disposable is hoisted so message-bus connections do not leak.** It is created up front and used both as the content's disposer and as the parent of the branch-update connection; an unparented connection would keep its handler subscribed after a dynamic unload and pin the plugin's classloader.
+- **Dynamic-unload cleanup groundwork exists but is inert.** An application-level unload listener would release the plugin's static background resources just before a hot unload, but the manifest declares a restart requirement, so enable / disable / uninstall of the plugin always triggers a full IDE restart and the listener never runs in production. The restart requirement itself is the live behaviour.
 
 ## Shared Behavior
 
-- **PINNED, WORKING MEMORY, COMMITTED MEMORIES sections** — each owns its own body and toolbar action group; this topic owns only their stacking frame, headers, and toggles.
-- **STATUS panel** — owns the full-pane card body; this topic owns when it is shown / hidden.
-- **Onboarding card** — sibling at this layer, shown when the user is not configured.
-- **No-git placeholder** — sibling at this layer, shown when no `.git` directory is present.
-- **Memory Bank / Knowledge cards** — sibling content cards selected by the view switch.
-- **Project status listener** — drives the status-card auto-show, the onboarding re-sync, and the breadcrumb branch update.
-- **Tool window gear menu / title-bar actions** — anchored here; carry the per-section visibility toggles and the agent-access / settings / status / cloud-sync actions.
-- **Bottom action bar / breadcrumb** — anchored here; the breadcrumb's foreign-mode selection drives the section visibility and read-only switches.
+- **The three sections** — each owns its own body and toolbar action group; this topic owns only the stacking frame, headers and toggles.
+- **The status overlay (133)** — owns the overlay's header actions and its row list; this topic owns where the overlay sits and when it is shown, hidden or collapsed.
+- **The enable/disable surface (332)** — owns the disable verdict this topic routes on, the optimistic flips and roll-backs that move it, and what the overlay's disable action does.
+- **The onboarding card, the disabled card, the Memory Bank explorer and the Knowledge placeholder** — sibling content cards at their respective levels.
+- **The runtime detection subsystem (284)** — owns the probe behind the second pre-gate.
+- **The cold-start card (260)** — owns the signal, state machine and dismiss marker behind the card that renders above the stack.
+- **The project status listener** — drives the status synchronisation, the root re-route, and the breadcrumb branch update.
+- **The bottom action bar and breadcrumb** — anchored here; the breadcrumb's foreign selection drives the section visibility and read-only switches.

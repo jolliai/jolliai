@@ -1,164 +1,192 @@
-# VS Code Plan and Note Archive Guards
+# 114. Plan and Note Archive Guards
 
 ## Topic Statement
 
-The content-hash guard the plans-and-notes registry uses to hide a plan or note from the sidebar after it's been associated with a commit, while keeping it visible the moment its source content changes again, so users see "this is now archived; if you edit it, it's a new artifact" without losing the ability to keep iterating on the same file.
+The content-hash guard that hides a plan or note from the editor extension's context list once a commit has claimed it, and brings the row straight back the moment its source content changes again — together with the three other gates that decide the same row's visibility, and the load-time normalization that silently destroys any row carrying the legacy hide flag.
 
 ## Scope
 
 **In scope:**
-- The shape of a registry entry, including the fields that drive guard behavior: `slug` / `id`, `sourcePath`, `commitHash`, `editCount`, `addedAt`, `updatedAt`, `contentHashAtCommit`, `ignored`, plus the `format` discriminant for notes (snippet vs markdown).
-- What "archive" does to the entry: writes `commitHash`, writes `contentHashAtCommit` (SHA-256 of current source content), clears `ignored`, and creates a sibling `<slug>-<shortHash>` snapshot entry the orphan branch / Summary WebView consume.
-- The sidebar visibility rule: an entry whose `contentHashAtCommit` is set is hidden when the live source content still hashes to the guard value, and shown again when it differs.
-- The user-hide rule (`ignored = true`): hides from the sidebar regardless of any other field.
-- The interaction between the two: an explicit user-hide trumps content-hash logic; clearing `ignored` (via the panel's "Add" / Associate flow) restores the content-hash decision.
-- The "snapshot copy" rule: entries with `commitHash` set AND no `contentHashAtCommit` are hidden from the sidebar (they exist for orphan-branch storage / Summary WebView only).
-- The orphan-source-file rule: an uncommitted entry whose source file no longer exists is hidden; for plans only, the next sidebar load also evicts that entry from the registry as a one-shot cleanup.
 
-**Out of scope:**
-- The orphan-branch storage that holds the snapshot (where the bytes go on the special branch).
-- The Summary WebView's UI for picking a plan/note to associate with a commit.
-- The post-commit hook pipeline that writes the archive entries from the CLI side. This spec covers the registry's *visibility* model, agnostic of which code path called the archive.
-- Cross-project plan attribution (covered in its own spec); guards apply once the entry is in the registry.
-- Slug / ID generation rules (a slug is a filename minus `.md` for plans; for notes it's a kebab-cased title plus a 4-char random suffix). The format is opaque to this spec.
+- The row fields that drive guard behaviour for both kinds, and the fields that no longer exist on a live row.
+- What claiming a row for a commit actually writes, and what it deliberately does **not** write.
+- The four visibility gates, in the order they are evaluated, for plans and for notes.
+- The load-time normalization that drops hide-flagged rows outright and strips dead fields from survivors, and the one-shot write-back it triggers.
+- The plans-only orphan eviction that runs as a side effect of listing.
+- What the extension's "Remove" action does to a guarded row (it is not a hide).
+- The explicit re-add path that discards a guard.
+- Why no gate compares a branch.
+
+**Out of scope (boundaries):**
+
+- The full command-line-owned working-area service these gates live in — its whole operation set, its locking discipline, and the archive-selection visibility rule that answers a *different* question (spec 337). This spec covers only the browsable-list side and the guard that shapes it.
+- Where the archived bytes go: the summary-storage backend, its system-of-record branch, and its user-browsable layer.
+- The commit-time pipeline that claims rows in bulk, and the memory-detail panel's own associate / dissociate affordances.
+- Discovery of plans from agent transcripts (spec 29) and cross-project attribution of a newly-appeared plan file (spec 113) — those insert rows; this spec covers what happens to a row once it exists.
+- Reference rows, which have no guarded state at all (spec 187), and skill-usage rows.
+- Note creation flows (spec 111).
+- Row layout, icons, hover cards, menus.
 
 ## Data Contracts
 
-### Plan registry entry
+### The one registry
 
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `slug` | string | Stable identifier; matches the markdown filename's stem in the global plans directory. |
-| `title` | string | First `#` heading of the source file, falling back to the filename. |
-| `sourcePath` | absolute path | Where the plan markdown lives on disk (under the global plans directory for fresh entries; archive snapshots reference the same path). |
-| `addedAt` | ISO 8601 | First time the plan was registered. |
-| `updatedAt` | ISO 8601 | Last registry mutation. |
-| `commitHash` | string \| null | Null while uncommitted; the commit's full hash once associated. |
-| `editCount` | number | Times the source file has been edited (maintained by the agent stop-hook, not the guard logic). |
-| `contentHashAtCommit` | string \| undefined | SHA-256 of the source content captured at archive time. Presence of this field flips the entry into "archive guard" mode. |
-| `ignored` | boolean \| undefined | When true, the entry is force-hidden from the sidebar regardless of any other field. |
+Plans and notes live side by side in a single per-project registry file, under sibling maps keyed by each kind's identifier. Every read normalizes the parsed content before any caller sees it; every write re-serializes the whole object, so a legacy field never disappears on its own — normalization is the only thing that removes one.
 
-### Note registry entry
+### Plan row
 
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `id` | string | Stable identifier (kebab-cased title + 4-char random suffix). |
-| `title` | string | Display title (first `#` heading for markdown, or the user-given title). |
-| `format` | `"snippet"` \| `"markdown"` | Snippet notes are stored as a file inside the per-repo notes directory; markdown notes reference an arbitrary user file. |
-| `sourcePath` | absolute path \| undefined | The file on disk that holds the content. |
-| `addedAt` / `updatedAt` | ISO 8601 | Same as plans. |
-| `commitHash` | string \| null | Same role as plans. |
-| `contentHashAtCommit` | string \| undefined | Same role as plans — SHA-256 of the current content captured at archive time. |
-| `ignored` | boolean \| undefined | Same force-hide semantics. |
-
-The plan registry and the note registry live side-by-side in a single per-repo file: `<workspaceRoot>/.jolli/jollimemory/plans.json` (notes are stored under a `notes` map alongside the `plans` map).
-
-### Archive operation
-
-When a plan or note is associated with a commit (from the Summary WebView's "+ Associate" affordance, or the post-commit hook):
-
-1. Compute `contentHashAtCommit = SHA-256(current source bytes)`.
-2. Update the original entry in place: set `commitHash` to the new commit's full hash, set `contentHashAtCommit` to the value above, clear `ignored`, set `updatedAt` to now.
-3. Create a sibling registry entry whose key is `<slug>-<shortHash8>` (or `<id>-<shortHash8>` for notes); this snapshot copy carries `commitHash` but has no `contentHashAtCommit`.
-4. Write the source content into the orphan branch under the snapshot key.
-
-After step 4, two entries exist in the registry for the same source artifact:
-
-- The original key, with `contentHashAtCommit` set — the **archive guard**.
-- The `-<shortHash8>` key, without `contentHashAtCommit` — the **snapshot copy**.
-
-Each plays a distinct visibility role.
-
-### Sidebar visibility rule
-
-The sidebar (PLANS panel for plans; the merged Plans-and-Notes view) renders only entries where every gate below passes. Entries are evaluated independently — there is no global "hide all archived" flag.
-
-| Gate | Pass condition |
+| Field | Meaning |
 | --- | --- |
-| Ignored guard | `ignored !== true`. |
-| Archive guard | If `contentHashAtCommit` is set: source file must exist AND its current SHA-256 must differ from `contentHashAtCommit`. If `contentHashAtCommit` is unset: pass. |
-| Snapshot-copy guard | If `commitHash !== null` AND `contentHashAtCommit` is unset: hide (it's a snapshot copy intended for orphan-branch / Summary WebView). |
-| Source-file-deleted guard | If `commitHash === null` AND source file does not exist: hide (uncommitted artifact whose file the user removed). |
+| slug | Primary key. |
+| title | Display name. |
+| source path | Absolute path of the markdown on disk. Usually **outside** the worktree — the agent's machine-global plan directory, an in-repo document, or an arbitrary file the agent wrote. |
+| added-at / updated-at | ISO timestamps. |
+| commit hash | Null while unclaimed; the claiming commit's full hash once archived. |
+| content hash at commit | Present only on an archived row whose source file existed at archive time. Its presence is what puts the row into **archive-guard** mode. |
 
-For notes, the archive guard has one extra wrinkle: the source content read can be either the snippet file (for snippet notes) or the user's referenced file (for markdown notes). The hash compared is over whichever current bytes are present. If the source file cannot be read at all, the entry is hidden.
+### Note row
 
-### Orphan cleanup (plans only)
+| Field | Meaning |
+| --- | --- |
+| id | Primary key. |
+| title | Display name. |
+| format | Snippet (body file owned by the product, inside the per-project state directory) or markdown (a file the user picked, referenced in place). |
+| source path | Optional. Absolute path of the file holding the body. |
+| added-at / updated-at | ISO timestamps. |
+| commit hash | Same role as a plan's. |
+| content hash at commit | Same role as a plan's. |
 
-On every panel-load pass, plan entries that are uncommitted (`commitHash === null`), have no archive guard (`contentHashAtCommit` is unset), are not user-hidden (`ignored !== true`), AND whose source file does not exist are evicted from the registry. The pass is one-shot convergent: a subsequent load with no orphans performs no writes.
+### Fields that are NOT on a live row
 
-The note registry has no analogous cleanup pass — notes whose source file is missing are simply hidden by the source-file-deleted guard.
+Three fields appear in legacy data and are purged on every load. None of them is written by anything in the product today.
+
+| Field | What happens to it |
+| --- | --- |
+| Hide flag | A row carrying it set to true is **dropped from the registry** during normalization. Survivors have the field stripped. |
+| Branch | Stripped from every survivor. |
+| Edit count (plans only) | Stripped from every survivor. |
+
+- **The hide flag is a HARD DELETE, not a soft hide and not a reversible force-hide.** It reads like "hide this row"; its actual effect is that the row does not survive the next load, and no surviving row can carry it. Writing it destroys the row and everything on it, with no way back short of re-discovery.
+- **The edit count is a dead field.** Nothing writes it and it is stripped on load, so any surface still rendering one renders a permanent absence.
+- **A branch never persists past a load-then-save.** See "Worktree scoping" below.
+
+### Load-time normalization
+
+Pure and idempotent — clean input reports "nothing changed". For these two kinds it drops any hide-flagged row and strips the dead fields above; the commit hash and the content hash at commit are **kept**, because they are the guard. The "did anything change" signal it returns is what drives the one-shot write-back described under Behavior.
+
+The normalization rebuilds the registry container field by field, so an absent kind's map stays absent and a present one is rebuilt. (Two sibling maps in the same file — external references and skill usage — are normalized by different rules; see spec 337.)
+
+### Claiming a row for a commit
+
+When a plan or note is archived onto a commit:
+
+1. The current source content is read and hashed.
+2. The **original** key is written back as the guard row: every field it already had, plus the commit hash, a refreshed updated-at, and the content hash.
+3. The content is stored into summary storage under a key formed from the original key plus the commit's short hash.
+4. A reference record naming that suffixed key is returned for the caller to attach to the commit's stored memory.
+
+**No sibling registry row is created.** The suffixed key exists only inside summary storage and on the commit's stored memory — never as a second row in the registry.
+
+For a note, one extra step runs after storage: a **snippet's** body file is unlinked, because its content now lives in summary storage. A markdown note's user-owned file is left alone.
+
+Two asymmetries between the kinds at claim time:
+
+- A plan whose source file is **missing** is still claimed — the commit hash is written, the content hash is not (there is nothing to hash), and no content is stored. The resulting row is a commit-hash-without-content-hash row, which the second visibility gate hides forever.
+- A note whose content cannot be read is **not** claimed at all: the operation returns nothing and the registry is untouched.
+
+### Visibility gates
+
+A row is shown only if it passes every gate. Gates are evaluated in this order, per row, independently — there is no global "hide everything archived" switch.
+
+| Order | Gate | A plan fails it when… | A note fails it when… |
+| --- | --- | --- | --- |
+| 1 | **Archive guard** | It carries a content hash at commit **and** its source file is missing, or the file's current content hashes to that stored value. | It carries a content hash at commit **and** its content is unreadable, or the current content hashes to that stored value. |
+| 2 | **Claimed-without-guard** | It carries a commit hash and no content hash at commit. | Same. |
+| 3 | **Missing source** | It carries no commit hash and its source file is missing. | It carries no commit hash, records a source path, and that file is missing. |
+| 4 | *(none)* | — | — |
+
+Gate 2 is what makes a claim-with-a-missing-file permanent for plans: the row can never satisfy gate 1 (it has no stored hash to diverge from) and never satisfy gate 2 (it has a commit hash and no stored hash), so it is invisible until something rewrites it. For notes this shape is unreachable through the claim path and can only arrive as legacy data.
+
+A note with no source path at all skips gate 3 entirely — nothing is checked, so it is visible.
+
+### Projection of a survivor
+
+**Plans.** The on-disk source path is kept even for a revived guard — the row is visible precisely because that local file changed, so opening it must open that file. The title is re-extracted from the file's first heading whenever the file exists. The last-modified is the file's modification time when it can be read, else the row's updated-at. The list is sorted newest-modified first.
+
+**Notes.** Same last-modified rule and same sort. The title is re-extracted from the file only for a **markdown-format, unclaimed** row whose file exists; a snippet's title and a claimed row's title come from the registry.
+
+### Worktree scoping
+
+Working-area context belongs to the worktree, not to a branch. It follows the user across a checkout exactly like an uncommitted code change, and binds to a branch only when a commit claims it — the branch is then recorded on that commit's stored memory, never on the working-area row. This is why the branch field is on the strip list, why no gate compares a branch, and why switching branches neither hides nor reveals a row.
 
 ## Behavior
 
-### Associating a plan or note with a commit
+### Listing browsable plans
 
-1. Read the source bytes; compute `contentHashAtCommit`.
-2. Update the original registry entry: set `commitHash`, `contentHashAtCommit`, `updatedAt`; clear `ignored`.
-3. Create the snapshot-copy entry under `<slug>-<shortHash8>` / `<id>-<shortHash8>` with `commitHash` set and no `contentHashAtCommit`.
-4. Write the source content to the orphan branch under the snapshot key.
+1. Load and normalize the registry, keeping the "did normalization change anything" signal.
+2. Over a copy of the plans map, evict every row that has a null commit hash, no content hash at commit, and a missing source file — the **orphan eviction**. (Note that this is strictly narrower than gate 3: a row failing gate 3 is hidden, and only an *unguarded* one is also deleted.)
+3. If anything was evicted **or** normalization changed something, and the in-process disabled mirror is not set: take the registry lock, load and normalize again inside it, re-run the eviction against that fresh snapshot, and save if either the fresh normalization or the fresh eviction produced a change.
+4. Build the display list from the **pre-lock** snapshot, through the gates above, and sort.
 
-After this completes:
-- The original entry is hidden from the sidebar (archive guard fires because the live content still hashes to `contentHashAtCommit`).
-- The snapshot-copy entry is hidden from the sidebar (snapshot-copy guard fires).
-- Both entries are visible to the Summary WebView and orphan-branch consumers.
+The write-back is a convergence step, not the answer: a later call over a clean registry writes nothing.
 
-### Editing the source after archiving
+### Listing browsable notes
 
-1. The user opens the plan / note source file and edits it.
-2. The next sidebar refresh re-evaluates each entry.
-3. The original entry's archive guard now compares a different live hash to `contentHashAtCommit`; the entry passes the archive guard and re-appears in the sidebar.
-4. The original entry's `commitHash` remains set (it's still associated with the commit), but the user can iterate on it as a fresh uncommitted-feeling artifact and re-associate it with a later commit if desired.
+Load and normalize; if normalization changed something and the in-process disabled mirror is not set, take the lock, re-load, and save if the fresh load also reports a change. Then project every row through the gates and sort.
 
-### User explicitly hiding a plan or note
+There is **no** orphan-eviction pass for notes — a note whose file vanished is hidden by gate 3, and stays in the registry.
 
-1. The user invokes the panel's "Remove from list" action on an entry.
-2. The entry's `ignored` field is set to `true` (no other fields change).
-3. All subsequent sidebar evaluations hide the entry by the ignored guard, ahead of any other gate.
+### Editing the source after a claim
 
-For notes, "Remove" on an uncommitted snippet is destructive — it deletes the snippet file *and* removes the registry entry entirely (not just sets `ignored`). For uncommitted markdown notes (which reference a user file), "Remove" only removes the registry entry; the user file is not touched.
+The next refresh re-evaluates the row. Its stored hash no longer matches the file's content, so gate 1 passes and the row re-appears — with its commit hash still set. No explicit un-archive step exists, and none is needed: touching the file is the whole gesture.
 
-### Restoring a previously-hidden plan
+### Removing a row from the list
 
-1. The user invokes the panel's "Add Plan" action and picks the slug from the list.
-2. The registry entry is rewritten as a fresh uncommitted entry: `commitHash` is null, `contentHashAtCommit` is undefined, `ignored` is undefined, `editCount` is preserved if previously set.
-3. The entry now passes every guard and shows in the sidebar.
+The extension's "Remove" is a **hard delete**, not a hide, and it runs with no confirmation prompt: the registry row is deleted outright, and the backing file is unlinked **only when it lives inside the per-project state directory**. Because plan source files are almost always external, in practice a plan's file survives and only the row goes; a snippet note's body file is deleted and a markdown note's user-owned file is not.
 
-This deliberately drops a previous archive guard's `contentHashAtCommit` even when the source file is unchanged — the user's explicit "Add" intent supersedes the archive's "we already snapshotted this" memory.
+No tombstone is written, so a later re-discovery or re-registration of the same file revives the row.
+
+### Re-adding a plan explicitly
+
+Picking a plan from the machine-global plan directory rebuilds a **fresh unclaimed row**: commit hash null, no content hash at commit, title re-extracted, added-at preserved from any prior row, updated-at set to now. This deliberately discards an existing archive guard even when the source file is unchanged — the user's explicit add supersedes the archive's "we already snapshotted this" memory.
 
 ## State Transitions
 
-For a plan/note registry entry, the visibility-relevant transitions are:
+For one plan or note row:
 
 | From | Trigger | To |
 | --- | --- | --- |
-| Uncommitted (no `commitHash`, no `contentHashAtCommit`, not ignored) | Source file edited | Uncommitted (still visible) |
-| Uncommitted | Source file deleted | Uncommitted-orphan (hidden; for plans, evicted on next load) |
-| Uncommitted | User clicks "Remove" | Ignored (hidden) — for note snippets, file deleted and entry erased |
-| Uncommitted | Associate with commit | Archive-guarded (hidden); sibling snapshot-copy entry created (also hidden in sidebar) |
-| Archive-guarded | Source file unchanged | Hidden (live hash equals `contentHashAtCommit`) |
-| Archive-guarded | Source file edited | Visible again (live hash differs from `contentHashAtCommit`) |
-| Archive-guarded | User clicks "Remove" | Ignored (hidden) |
-| Ignored | User clicks "Add" / "Associate" | Fresh uncommitted (visible) |
-| Snapshot-copy (`commitHash` set, no `contentHashAtCommit`) | Anything | Hidden (snapshot-copy guard) |
-
-No transition is branch-sensitive. The entry shape has no branch field, the loader that feeds the sidebar strips any branch value it finds on a row, and none of the gates compares one — a pending plan or note belongs to the worktree, so switching branches neither hides nor reveals anything. A branch is attached to the artifact only once a commit archives it, and it is that commit's branch, recorded on the commit's stored summary.
+| Absent | Discovery, registration, or an explicit add | Unclaimed — visible |
+| Unclaimed | Source file edited | Unclaimed — visible |
+| Unclaimed | Source file deleted | Hidden (gate 3); for plans, evicted from the registry on the next listing |
+| Unclaimed | Claimed by a commit, source readable | **Guard row** on the same key — hidden while the content matches |
+| Unclaimed | Claimed by a commit, plan source file missing | Claimed-without-guard row — hidden permanently (gate 2) |
+| Guard row | Source content still matches | Hidden (gate 1) |
+| Guard row | Source content diverges | **Revived** — visible again, commit hash retained |
+| Guard row | Source file deleted | Hidden (gate 1's missing-file arm); not evicted, because it carries a guard |
+| Guard row | Explicit re-add (plans) | Fresh unclaimed row; guard discarded, added-at preserved |
+| Any | "Remove" | Gone from the registry — no tombstone, so re-discovery revives it |
+| Any | Carried the hide flag on disk | **Gone on the next load** |
 
 ## Notable Behavior
 
-- **Two entries per archived artifact.** After associating a plan with a commit, the registry contains both the original-slug entry (acting as the visibility guard) and a `<slug>-<shortHash8>` snapshot-copy entry (referenced by the Summary WebView and orphan-branch storage). The sidebar hides both, but for different reasons: the original by the content hash matching, the snapshot-copy by the snapshot-copy guard. (Surprising; intentional.)
-- **Editing an archived plan reincarnates it in the sidebar.** The archive guard does not require the user to do anything explicit to "un-archive" — touching the source file is sufficient. This is intentional: it means iterating on a plan after the first commit is frictionless. (Surprising; intentional.)
-- **The user-hide flag wins against all other rules.** A user who clicks "Remove" gets their wish even if the source content later changes back; only an explicit "Add" / "Associate" can reverse it. The system never decides on its own that an ignored entry should reappear. (Notable.)
-- **"Remove" on a note has different physical effects depending on format.** For snippet notes, removing also deletes the local snippet file (the orphan branch holds the archive copy if any). For markdown notes referencing a user file, removing only erases the registry entry — the user's file is untouched. The plan equivalent ("Remove from list") merely sets `ignored`; the plan markdown file is never deleted. (Surprising; intentional.)
-- **There is no branch gate.** The sidebar never compares a branch. A pending plan or note is worktree-scoped and stays listed across branch switches, exactly like uncommitted code; the artifact acquires a branch only when a commit archives it, and it is the commit's branch, not anything the registry held. (Notable.)
-- **Plan source files live outside the workspace.** Plans live under a per-user global directory (the agent's plans directory). When the source file is deleted, the orphan-cleanup pass evicts the registry entry; this is the only place in the visibility logic that mutates the registry as a side-effect of rendering. (Notable.)
-- **Note source files live in two different places.** Snippet notes are written by the panel itself into a per-repo notes directory; markdown notes can reference any path the user picks. The visibility rule treats both uniformly — it just hashes whatever bytes the `sourcePath` points to. (Notable.)
-- **The snapshot-copy guard is an opaque rule, not a UI flag.** The reason `<slug>-<shortHash8>` entries don't show up is that they have `commitHash` set without `contentHashAtCommit` — which the visibility rule reads as "this is the orphan-branch shadow, not a sidebar artifact". A future field added to mark these explicitly would not change behavior. (Notable.)
-- **`addedAt` is preserved across archive / re-add cycles.** When a previously-archived plan is re-added to the registry as fresh uncommitted, the original `addedAt` is kept; only `updatedAt` advances. The sidebar's sort order (by `lastModified` derived from `updatedAt` or the source file's mtime) therefore behaves as the user expects — re-adding bumps a plan to the top, but its "discovered on" timestamp is unchanged. (Notable.)
-- **Orphan cleanup writes the registry only when something changed.** The plan-load pass collects deletions in memory and only writes plans.json if at least one entry was evicted. A clean pass is a strict no-op on disk. (Notable.)
+- **The hide flag destroys data.** It is named like a soft hide and behaves like a hard delete: any row carrying it is dropped during normalization and the field is stripped from every survivor. Nothing in the product writes it, so this only ever fires against legacy data or a hand-edited registry — silently, and with no record that a row was ever there. (Surprising; reality.)
+- **The edit count is dead.** It is written by nothing and stripped on load, so a surface that renders one renders a value that can only be absent. (Notable.)
+- **Claiming a row writes no sibling row.** The claimed key stays the *original* key and becomes the guard; the short-hash-suffixed key exists only in summary storage and on the commit's stored memory. A registry that shows two rows per archived artifact is legacy data, not something this path produces. (Notable.)
+- **Editing an archived plan reincarnates it.** No explicit un-archive exists; touching the source file is sufficient, and the row returns still carrying its commit hash. This is what makes iterating on a plan after the first commit frictionless — and it is also why the *other* visibility rule (the one answering "what will the next commit claim?", spec 337) still excludes the same row. Both are correct answers to different questions. (Surprising; intentional.)
+- **A plan claimed while its source file was missing is hidden forever.** It ends up with a commit hash and no content hash, which fails gate 2 unconditionally. Nothing re-writes such a row, so it sits in the registry invisible. The note path cannot reach this shape — it refuses to claim an unreadable note at all. (Surprising; reality.)
+- **"Remove" is destructive and unconfirmed.** It deletes the row rather than hiding it, and for a row whose file lives in the per-project state directory it deletes the file too. There is no undo and no tombstone. (Notable.)
+- **Backing-file deletion is decided by LOCATION, never by state.** Both removals unlink the source file only when it sits inside the per-project state directory — not by "is this a snippet", not by "is this unclaimed". A markdown note the user pointed at a file inside that directory would therefore have that file deleted on remove. (Notable.)
+- **The orphan eviction is the only place rendering mutates the registry**, and it is plans-only. Notes are hidden but never evicted, so the two kinds diverge in what a deleted source file leaves behind. (Notable.)
+- **The eviction and the write-back are skipped while the project is disabled in-process, but nothing checks the durable on-disk disable state here.** In a long-lived server process — which never goes through the activation that sets the in-process mirror — the write-back still runs against a durably disabled project. (Notable.)
+- **No gate compares a branch, and none can.** The row shape carries no branch, the loader strips any it finds, and a pending plan or note stays listed across a checkout exactly like uncommitted code. A branch attaches only when a commit claims the row, and it is that commit's branch, recorded on the commit's stored memory. (Notable.)
+- **Added-at survives an archive-and-re-add cycle.** Only updated-at advances, so re-adding bumps a row to the top of the list while its "discovered on" timestamp is unchanged. (Notable.)
+- **The archive path can silently lose the stored copy.** The storage handle is threaded in by the caller and the resolver fails *safe* rather than loud: with nothing supplied it falls back to a system-of-record-only backend, so a user configured for the dual-write layout loses the user-visible archived artifact with only a log line. Reads still come from the system of record, so the list looks correct and the gap surfaces later as a phantom missing file. (Surprising; reality.)
 
 ## Shared Behavior
 
-- **One registry file holds plans and notes.** A single `plans.json` per repo with sibling `plans` and `notes` maps; readers and writers (sidebar, post-commit hook, Summary WebView) all consume the same file with atomic writes.
-- **SHA-256 over UTF-8 source bytes.** The same hashing primitive is used everywhere a content guard is evaluated — both at archive-time and at sidebar-render time — so guard checks always agree across surfaces.
-- **First-`#`-heading title extraction.** The same rule that drives plan attribution (cross-project guard) and the panel's display titles is used here for both plans and notes.
-- **Atomic write via tmpfile + rename.** All registry writes use the shared tmpfile-then-rename primitive used by every per-repo state file (`sessions.json`, `cursors.json`, `plans.json`, …), with the same Windows EPERM fallback.
+- The registry file's location, its atomic-write primitive, and the lock that serializes read-modify-write cycles over it are shared with every other writer of that file — the discovery scans, the commit-time pipeline, and both IDE hosts.
+- The content guard is a hash over the source file's bytes, computed identically at claim time and at visibility-evaluation time, so the two can never disagree.
+- The first-heading-else-filename title extraction is the same rule used by plan discovery, note saving, and every surface that needs a markdown file's display title.
+- Every gate, every mutation and the normalization itself are owned by the command-line working-area service (spec 337) and reached identically by both IDE hosts — one imports them in process, the other calls them over a bridge. A host-side restatement of any of them is the drift that service exists to remove.
+- The second, non-interchangeable visibility rule — "what will the next commit claim?" — lives in the same service and deliberately answers differently for a revived guard (spec 337).

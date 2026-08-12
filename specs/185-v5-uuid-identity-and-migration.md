@@ -12,6 +12,8 @@ The v5 transcript identity scheme assigns opaque random UUIDs to newly captured 
 - The way legacy (pre-v5) commit-hash transcript filenames become v5 IDs without any rename.
 - The opaque-ID contract that downstream readers, write paths, and display surfaces uphold.
 - Persisting an explicit "transcripts referenced by this summary" array on every v5 summary root.
+- The per-node shape the migration leaves behind — everything on the root, nothing on the descendants — and the fact that this shape is now load-bearing input to the per-node usage attribution other topics resolve over it.
+- The tree-wide removal of a set of identifiers from an already-stored summary: which nodes it rewrites, which marker it does and does not stamp, and how the caller learns whether a write is owed at all.
 - The on-startup, one-shot, idempotent migration that normalizes legacy summaries to v5 (including the v3 → v4 → v5 collapse).
 - The two-step write ordering (content first, completion marker second) and the gate on the completion marker.
 - The recovery path when a prior attempt left the primary storage at v5 but the shadow storage stale.
@@ -28,6 +30,8 @@ The v5 transcript identity scheme assigns opaque random UUIDs to newly captured 
 - The index format and per-node entries (covered by spec 05).
 - The write-time path used by the live commit/amend/squash pipeline to allocate fresh IDs in normal operation (covered by the queue worker and pipeline specs).
 - The display surfaces that resolve transcript IDs to rendered conversations.
+- The attribution rule itself — how a single owning node is chosen for an identifier, and what happens when none can be — which reads the shape described here but is defined in [333 — Conversation Usage Recomputation from Transcripts] and restated in [306 — Conversation Detach Usage Correction].
+- What causes an identifier to go stale in the first place, and the outcome reporting around the removal (see [306] and [333]).
 
 ## Data Contracts
 
@@ -145,6 +149,31 @@ The transcripts directory itself is never rewritten by the migration. Files that
 This is deliberate: physically renaming hundreds or thousands of transcript files plus updating every referencing summary in lockstep would compound the migration's failure modes. Keeping the names and treating the existing strings as opaque IDs is a no-rename, in-place upgrade that costs only a per-summary content rewrite.
 
 Mixing UUID-form and commit-hash-form IDs in the same array (and in the same on-disk directory) is fully supported by the contract. Both forms route through the same parser, the same storage primitives, and the same display code.
+
+### The shape the upgrade leaves behind, and why it is now an input rather than just an output
+
+The recompute branch collects every commit hash reachable through the children tree and writes the filtered result onto the **root**. The descendants themselves are not touched at all: no identifier array is added to them, and their version markers are left at whatever they were written under. So a migrated consolidated memory has every identifier in one place, at the top, and nothing anywhere below it.
+
+That was chosen for blast radius — one rewrite per summary rather than a coordinated rewrite of a whole tree — but it has become load-bearing for a second reason. Any caller that corrects a memory's per-node figures must decide which **single** node's figures cover a given identifier, and on this shape the root is the sole node listing identifiers whose figures actually sit on a child. The only remaining evidence that points back at the right child is that the identifier **is** that child's commit hash — which is true precisely because the migration reuses the legacy filename verbatim instead of renaming it. Had the files been renamed to fresh opaque identifiers, every memory this migration produced would be permanently unattributable per node.
+
+Two shapes therefore behave differently under that rule, and both are normal:
+
+- **Pre-upgrade**: no node carries an identifier array at all, so the commit-hash correspondence is the *only* evidence available.
+- **Post-upgrade**: the root carries all of them, so the correspondence is what moves attribution back down into the subtree the root claimed on behalf of.
+
+A memory written natively at v5 by the live pipeline is the third shape, and the one this concern does not apply to: its identifiers are opaque values with no correspondence to any commit hash, and the nodes that list them are the nodes whose figures cover them.
+
+### Removing identifiers from a stored summary
+
+A caller that needs a set of identifiers gone from an already-stored summary (a conversation archive that was emptied, or a reference left dangling by a lost write) hands the summary and the set to one removal routine. It rewrites **every node**, not only the root:
+
+- **The root's list** is filtered. On a record that already carries one, that is a plain filter. On a **pre-upgrade** record — which has no list — the effective list is instead taken from the caller's *file-backed* set: the tree's identifiers already intersected with the archive files that exist. That mirrors the migration's own file-existence filter exactly, so the removal cannot bake a dangling identifier into a list that is supposed to be authoritative and file-backed.
+- **Every descendant's own list** is filtered too. This is not defensive breadth: the shape the routine is called on is precisely the one where the root's list is short or empty while a child still lists the identifier, so filtering the root alone would report success, leave the dead identifier on disk, and — because the figures beside it were corrected in the same write — make every later attempt conclude that everything already matches while the stale reference survives indefinitely.
+- **A descendant carrying no list is left untouched**, not given an empty one. The field's absence is what marks a node as pre-upgrade-nested, and manufacturing an empty array would erase that distinction.
+- **A descendant's version marker is deliberately not stamped.** The migration never stamps descendants, so a child's marker records the schema it was written under and nothing routes a read off it; bumping it here would claim a migration that did not happen.
+- **The root's version marker and identifier field are always stamped** on any write this routine performs. That is the lazy upgrade: a pre-upgrade record that reaches this path is written back as a full post-upgrade record rather than as a hybrid carrying an identifier list under an older marker, which a version-routing reader would misclassify.
+
+The routine answers with the **same summary reference** when nothing needed changing, and callers use that identity — not the size of the set they asked to remove — to decide whether a write actually happened. There is one asymmetry inside that rule: a **pre-upgrade** record with a non-empty file-backed set counts as changed even when the filter removed nothing, because writing it *is* the upgrade. A pre-upgrade record whose file-backed set is empty has neither a list to upgrade nor anything to remove, and is returned unchanged.
 
 ### Decision: normal write versus recovery re-push
 
@@ -274,9 +303,21 @@ Every successful migration logs the primary backend's pre-migration head identif
 
 The fast-path "already v5" check requires both the version marker *and* the transcripts field. A record with version 5 and no transcripts field is treated as anomalous (a bug or hand-edit) and falls through to the recompute branch, repairing it. Without this guard, such a record would force every read of its transcripts list down the legacy children-walk fallback forever — defeating the v5 schema's purpose.
 
+### The no-rename decision turned out to be what keeps migrated memories attributable
+
+Keeping the legacy filenames was justified on blast radius alone: renaming thousands of files in lockstep with every referencing summary compounds the failure modes for no functional gain. What that decision also preserved, unintentionally, is a correspondence between an identifier and a commit hash — and that correspondence is now the only evidence that can attribute a migrated memory's conversations to the individual node whose figures cover them, because the upgrade hoists every identifier to the root and leaves the descendants bare. A rename to opaque values would have been schema-clean and would have made every pre-existing consolidated memory permanently unattributable per node. (Surprising; the cheap choice was also the correct one, for a reason that did not exist yet.)
+
+### The removal routine rewrites descendants but refuses to stamp them
+
+Filtering an identifier out walks the whole tree, because the shape it is called on is the one where the root's list is short and a child still lists the identifier. But it stamps only the root's version marker and identifier field. Bumping a child's marker would assert that a migration touched it, which no migration ever does — descendants are left at whatever schema they were written under, and nothing routes a read off that value. A child with no identifier field is likewise left without one rather than given an empty array, since the absence is the marker for "pre-upgrade, nested". (Surprising; the asymmetry between root and descendant is deliberate in both directions.)
+
+### Reference identity, not set size, is how a caller learns a write happened
+
+The removal answers with the input reference when it changed nothing, and callers key off that rather than off how many identifiers they asked to remove. The one case where "the filter removed nothing" still counts as a change is a pre-upgrade record with a non-empty file-backed identifier set — writing it *is* the upgrade, so it must not report itself as a no-op. A pre-upgrade record with an empty file-backed set has nothing to upgrade and nothing to remove, and correctly reports no change. (Notable.)
+
 ### Live writers and the migration must agree on the file-existence filter
 
-The same "intersect children-tree hashes with existing transcript files" rule that the migration uses to build the v5 transcripts list is also used by every live write path (amend, squash, rebase pick, one-to-one migrate, many-to-one merge) when materializing an authoritative v5 transcripts array from a possibly-legacy input. Without alignment, a squash or rebase of legacy data would bake "dangling" commit-hash IDs (commits that never had an AI session) into the new v5 record's authoritative array, violating the contract that every ID in the array has a backing file at the time the array was written.
+The same "intersect children-tree hashes with existing transcript files" rule that the migration uses to build the v5 transcripts list is also used by every live write path (amend, squash, rebase pick, one-to-one migrate, many-to-one merge) — and by the removal routine's pre-upgrade branch — when materializing an authoritative v5 transcripts array from a possibly-legacy input. Without alignment, a squash or rebase of legacy data would bake "dangling" commit-hash IDs (commits that never had an AI session) into the new v5 record's authoritative array, violating the contract that every ID in the array has a backing file at the time the array was written.
 
 ### Lock contention is documented, not engineered around
 
@@ -296,3 +337,5 @@ The state record itself carries a "schema version of the state record" field set
 - **Summary schema migration (spec 06)** — the prior-version chain (legacy flat-records → unified hoist, legacy index version flip) that runs before the v5 step in the operator-issued migrate command; spec 06's "v3 → v4" collapse is invoked as a sub-step of the per-record upgrade here.
 - **Shared write lock** — the coarse-grained orphan-write lock that serializes the migration against the live commit pipeline and other migration attempts.
 - **Live commit / amend / squash / rebase pick pipelines** — the writers that allocate fresh UUIDs for new transcripts at write time and apply the same file-existence filter the migration uses when constructing authoritative v5 transcripts arrays.
+- **Per-node usage attribution ([333 — Conversation Usage Recomputation from Transcripts], restated in [306 — Conversation Detach Usage Correction])** — the rule that reads the shape this migration leaves behind: which single node's figures cover an identifier, why a root listing one does not mean it owns it, and why a node whose commit hash equals the identifier is evidence in its own right. Those specs also own the two callers of the removal routine described here, and the outcomes they report around it.
+- **The memory panel ([109 — VS Code Summary Webview Panel])** — the surface that supplies the file-backed identifier set the removal's pre-upgrade branch uses, and the only host that invokes the removal today.

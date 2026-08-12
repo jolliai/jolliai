@@ -1,249 +1,219 @@
-# IntelliJ STATUS Panel
+# 133. IntelliJ Status Overlay
 
 ## Topic Statement
 
-The STATUS panel of the JolliMemory tool window — a single panel that, once a status snapshot exists, renders a row-list of one row per status field (hooks installed, active session count, stored memory count, optional Jolli site host, and one row per detected AI agent integration), each row carrying an icon (OK / WARN / ERROR / pulse / book / globe), a label, a gray description, and a multi-line tooltip; before a snapshot exists it shows a single "Initializing..." label; and it rebuilds itself from scratch on every project-status change.
+The status surface of the JVM IDE tool window — an overlay whose header carries three actions (sign in / sign out, disable, close) and whose body is a row list rebuilt from scratch on every status or authentication change: one row per health fact, one read-only account row, one clickable manual-sync row that appears only while signed in, and one row per detected assistant integration, with row activation on a single primary-button click.
 
 ## Scope
 
 **In scope:**
-- The two render states the panel rebuilds itself between: no-snapshot (single "Initializing..." label) and snapshot-present (status-row list).
-- The enabled-mode rows: hooks, MCP & Skills, sessions, stored memories, optional Jolli site, and one optional row per detected agent (Claude, Codex, Gemini, OpenCode, Cursor, Copilot).
-- The "MCP & Skills" row: a fixed row (always shown when a snapshot exists) inserted between the Hooks row and the Sessions row, with three states (OK "active", WARN "Node.js not found", WARN "setup incomplete") computed from the snapshot's Node-available and integrations-active booleans.
-- The description-color-by-severity rule in the row renderer: WARN descriptions render amber, ERROR descriptions render red, everything else renders the normal gray; the clickable-link blue is applied only when the row carries no severity color.
-- The four-state integration row rule (per detected agent: enabled-with-hook-OK, enabled-no-hook-needed-OK, enabled-with-hook-missing-WARN, disabled-WARN).
-- The separate "scan unavailable" WARN rows the panel emits for OpenCode, Cursor, and Copilot when a scan error is reported.
-- The hooks row's compact summary (`5 Git + 2 Claude + 1 Gemini` style) and the multi-line tooltip detailing each hook family.
-- The "stored memories" row's `<branch-count> / <total-count>` rendering, where the branch count is computed by walking the current branch's not-in-main commits and intersecting with the summary index (commit aliases included).
-- The Jolli site row that appears only when a Jolli API key is saved and parses successfully — showing the host stripped of `https://` / `http://`, with a tenant-mention tooltip.
-- The icon set (`OK`, `ERROR`, `WARN`, `PULSE`, `BOOK`, `GLOBE`) and the white-tint behavior when a row is selected.
-- Refresh triggers: the project's status listener fires after every install / uninstall / hook event; the panel re-renders on every fire.
-- The double-click and hand-cursor affordances for rows that carry an `onClick` callback (the data model supports it; the implemented row set has no rows that supply one — but the affordance plumbing is part of the contract).
+
+- The two render states the body rebuilds itself between: no snapshot (a single initialising label) and snapshot present (the row list).
+- The overlay's three header actions, what each one does, and the mouse-button gap they carry.
+- The full row set in fixed order, including the read-only account row and the sign-in-gated manual-sync row.
+- The always-present integrations row and its three states.
+- The four-state per-integration row rule, and the separate scan-failure rows.
+- The hooks row's compact summary and its multi-line tooltip.
+- The stored-memories row's per-branch count, computed on every render rather than read from the snapshot.
+- The optional site row driven by a saved product key.
+- The description-colour-by-severity rule and its precedence over the clickable-link colour.
+- Row activation: single click, gated on the primary mouse button and on a click count of one, and the reason for both gates.
+- Refresh triggers: the project status listener **and** an authentication listener.
+- The one detected source the underlying report carries for which this surface has no row at all.
 
 **Out of scope:**
-- The disabled-vs-enabled presentation of the *tool window* — when the project is disabled the tool window swaps the whole STATUS panel in as a full-content card, and the enable call-to-action lives in the onboarding view and the Settings dialog, not in this panel (separate specs). This panel renders no "Enable Jolli Memory" button and no marketing copy.
-- The full Settings dialog (separate spec), which owns the API-key / model / install toggle controls.
-- The tool-window frame's view switch, breadcrumb, title-bar actions, and the full-pane Status toggle that shows / hides this panel (separate spec).
-- The OAuth / sign-in flow (separate spec) — the STATUS panel surfaces no sign-in button or sign-in row.
-- The plumbing that produces the status snapshot (which hooks are installed, session count, summary count, branch summaries, per-agent detection / scan-error fields) — owned by the install/status core.
+
+- Where the overlay sits in the tool window's card stack, what shows and hides it, and the health-coloured toggle icon in the title bar — spec 118.
+- What the disable and sign-in/out header actions actually *do* once clicked: the enable/disable lifecycle, its optimistic flips and roll-backs, and the projection that can disable a repository at startup — spec 332.
+- The disabled card a disabled repository routes to. **This panel is not that card**, and it renders no enable call-to-action of its own.
+- The settings dialog, which owns credential entry and the per-integration toggles this panel only reads.
+- The sign-in flow itself and the manual sync round this panel only requests.
+- The plumbing that produces the status snapshot — every detection flag, every scan-failure record, and the fields this panel has no row for.
 
 ## Data Contracts
 
 ### Two render states
 
-| State          | Trigger              | Body                                                  |
-| -------------- | -------------------- | ----------------------------------------------------- |
-| No snapshot    | `status == null`     | A single "Initializing..." label.                     |
-| Snapshot       | `status != null`     | Scrollable row-list (see Row set below).              |
+| State | Trigger | Body |
+| --- | --- | --- |
+| No snapshot | The service reports no status yet | A single "initialising" label |
+| Snapshot | A status snapshot exists | The scrollable row list below |
 
-The panel does **not** branch on `status.enabled`. Whenever a snapshot exists it builds the full row list; rows whose underlying state is "not installed" / `0` simply render in their not-installed / zero form.
+The body does **not** branch on whether the repository is enabled. Whenever a snapshot exists it builds the full list; rows whose underlying state is "not installed" or zero simply render in that form.
 
-### Enabled-mode row set
+### The overlay header — three actions
 
-Every render with a snapshot rebuilds the list model from scratch in this fixed order:
+Left to right, all rendered as bare labels rather than buttons:
 
-| # | Label                | Icon   | Description                                                          | Tooltip lines |
-| - | -------------------- | ------ | -------------------------------------------------------------------- | ------------- |
-| 1 | `Hooks`              | OK if git hook installed; ERROR otherwise | `5 Git + 2 Claude + 1 Gemini` (only the parts whose hooks are installed are joined; if none, `none installed`) | Three lines: Git hooks status (post-commit, post-rewrite, prepare-commit-msg, post-merge, pre-push), Claude Code hooks (Stop, SessionStart), Gemini hook (AfterAgent). |
-| 2 | `MCP & Skills`       | OK / WARN (see MCP row rule) | `active` / `Node.js not found` / `setup incomplete` | Explains what the MCP tools + `/jolli-recall` / `/jolli-search` skills are, or why they are unavailable (Node missing vs setup incomplete), always noting memory generation is unaffected. |
-| 3 | `Sessions`           | PULSE  | `<active-session-count>` (numeric)                                   | `<n> active Claude/Gemini session(s)`. |
-| 4 | `Stored Memories`    | BOOK   | `<branch-count> / <total-count>`                                     | `<branch-count> on current branch, <total-count> total across all branches`. |
-| 5 | `Jolli Site` (optional) | GLOBE | Host extracted from the saved Jolli API key (with `https://` / `http://` prefix stripped) | `Resolved from Jolli API Key (tenant: <tenant>)`. Row is omitted when no API key is saved or when it fails to parse. |
-| 6 | `Claude Integration` (optional) | per the four-state table | per the four-state table | per the four-state table |
-| 7 | `Codex Integration` (optional)  | per the four-state table | per the four-state table | per the four-state table |
-| 8 | `Gemini Integration` (optional) | per the four-state table | per the four-state table | per the four-state table |
-| 9 | `OpenCode Integration` (optional) | per the four-state table, or WARN when a scan error is reported | per the four-state table, or `unavailable — <kind>` | per the four-state table, or scan-error detail |
-| 10 | `Cursor Integration` (optional) | per the four-state table, or WARN when a scan error is reported | per the four-state table, or `unavailable — <kind>` | per the four-state table, or scan-error detail |
-| 11 | `Copilot Integration` (optional) | per the four-state table | per the four-state table, with a CLI/Chat detection mark in the tooltip | per the four-state table |
+| Action | Icon reflects | Effect |
+| --- | --- | --- |
+| **Sign in / sign out** | Whether a session exists | Signs out immediately when signed in; otherwise opens the sign-in flow forcing a fresh product key, and on success retries any pending outbound pushes off the interface thread |
+| **Disable** | Static | Runs the full teardown for this repository (spec 332). Its tooltip — naming that hooks are removed and a card will appear to turn it back on — is the only warning; there is no confirmation |
+| **Close** | Static | Collapses the overlay |
 
-### MCP & Skills row rule
+**None of the three is gated on the mouse button.** The toolkit dispatches a click event for the secondary and middle buttons as well, so a right-click on the disable glyph runs the entire uninstall transaction and a right-click on the sign-out glyph signs the user out. The row list directly beneath them *is* gated, for exactly this reason (below).
 
-The row is **always present** when a snapshot exists (it is not gated on any detection flag). Its state comes from two snapshot booleans — Node-available and integrations-active:
+### Row set, in fixed order
 
-| Node available | Integrations active | Icon | Description | Tooltip theme |
-| -------------- | ------------------- | ---- | ----------- | ------------- |
-| true | true | OK | `active` | MCP tools + the `/jolli-recall` and `/jolli-search` skills are active. |
-| false | — | WARN | `Node.js not found` | Lists what is unavailable (MCP tools, `/jolli-recall`, `/jolli-search`); claims memory generation is unaffected "(native Java hooks)"; install Node and reopen. |
-| true | false | WARN | `setup incomplete` | Node present but the bundled tool failed to enable or was not found; points at the install-debug log and to reopen the project. |
+Every render with a snapshot clears and refills the model in this order:
 
-Detection of each integration is **snapshot-only**. Every per-agent detection flag is read straight from the status snapshot, and a **null flag renders nothing** — it is treated as "not detected", so the row is omitted entirely. There is no installer probe, no filesystem fallback, and no agent for which the panel does its own detection:
+| Label | Icon | Description | Condition |
+| --- | --- | --- | --- |
+| Hooks | OK when the git-hook flag is set, ERROR otherwise | A `+`-joined list of the installed hook families, or "none installed" | Always |
+| MCP & Skills | OK / WARN | "active" / "Node.js not found" / "setup incomplete" | Always |
+| Sessions | Pulse | The active-session count | Always |
+| Stored Memories | Book | `<branch count> / <total count>` | Always |
+| Jolli Account | OK when signed in, WARN otherwise | "connected" / "not connected" | Always — **read-only** |
+| Sync Now | Pulse | "click to push memories to your Jolli Space" | **Only while signed in**; carries the panel's only activation callback |
+| Jolli Site | Globe | The host from the saved product key, scheme stripped | Only when that key is saved and parses |
+| Claude Integration | four-state | four-state | Only when the snapshot's Claude flag is true |
+| Codex Integration | four-state | four-state | Only when detected |
+| Gemini Integration | four-state | four-state | Only when detected |
+| OpenCode Integration | four-state, or WARN on a scan failure | four-state, or "unavailable — *kind*" | Only when detected |
+| Cursor Integration | four-state, or WARN on a scan failure | four-state, or "unavailable — *kind*" | Only when the **editor** flag is detected |
+| Devin Integration | four-state, or WARN on a scan failure | four-state, or "unavailable — *kind*" | Only when detected |
+| Copilot Integration (WARN) | WARN | "unavailable — *kind*" | Only when a Copilot command-line scan failure is reported |
+| Copilot Chat (WARN) | WARN | "unavailable — *kind*" | Only when a Copilot chat scan failure is reported |
+| Copilot Integration | four-state | four-state, with a per-surface mark in the tooltip | When either Copilot surface is detected |
+| Cline (VS Code) (WARN) | WARN | "unavailable — *kind*" | Only when that scan failure is reported |
+| Cline CLI (WARN) | WARN | "unavailable — *kind*" | Only when that scan failure is reported |
+| Cline Integration | four-state | four-state, with a per-surface mark in the tooltip | When either Cline surface is detected |
+| Antigravity Integration | four-state, or WARN on a scan failure | four-state, or "unavailable — *kind*" | Only when detected |
+| Kimi Code Integration | four-state | four-state | Only when detected — **no scan-failure channel exists for it** |
 
-- **Claude** — the snapshot's Claude-detected flag. No longer "the exception": every agent now behaves this way.
-- **Codex** — the snapshot's Codex-detected flag.
-- **Gemini** — the snapshot's Gemini-detected flag.
-- **OpenCode** — the snapshot's OpenCode-detected flag.
-- **Cursor** — the snapshot's Cursor-detected flag. Note this is the Cursor **IDE** (Composer) flag only; the panel has no field for the Cursor command-line agent, so a Cursor-CLI-only user gets no row.
-- **Copilot** — covers both the Copilot CLI and VS Code Copilot Chat under a single row and a single config toggle. Either surface's snapshot flag is enough to render the row. The tooltip carries a per-surface `CLI: ✓/✗, Chat: ✓/✗` mark.
+### The account row is deliberately read-only
 
-The practical consequence: until the first status snapshot has populated these fields, **no integration rows render at all**. Previously the panel could fill that gap with its own probes; now the row list simply lacks integration rows until the snapshot arrives.
+It reports connection state and nothing else; its tooltips point the user at the header icon. The reason is stated in the code: the sign-in and sign-out affordance is meant to exist in exactly one place, so a user hunting for it has one target rather than two.
 
-### Scan-error WARN rows
+### Integrations row rule
 
-OpenCode, Cursor, and Copilot each have a separate "scan unavailable" path. For **OpenCode and Cursor**, the panel emits a WARN row **only when that agent's saved enabled flag is on** and the snapshot reports a scan error; the WARN row (description `unavailable — <kind>`, tooltip `<agent> DB scan failed (<kind>): <message>`) replaces the agent's normal four-state row for that render. For **Copilot**, the CLI and Chat scan errors each emit their own standalone WARN row (`Copilot Integration` / `Copilot Chat`) in addition to the combined integration row — and these two Copilot rows are **not** gated on the Copilot enabled flag: a reported Copilot / Chat scan error surfaces a WARN row even when Copilot integration is disabled in config. (Surprising; asymmetric with the OpenCode/Cursor gating.)
+Always present when a snapshot exists — it is not gated on any detection flag — and driven by two snapshot booleans:
+
+| Runtime available | Integrations active | Icon | Description |
+| --- | --- | --- | --- |
+| true | true | OK | "active" |
+| false | — | WARN | "Node.js not found" |
+| true | false | WARN | "setup incomplete" |
 
 ### Four-state integration row
 
-For each detected integration whose enabled flag is on and which has no scan error:
+For each detected integration with no reported scan failure:
 
-| Saved enabled flag | Hook status        | Icon | Description                  | Tooltip                                                |
-| ------------------ | ------------------ | ---- | ---------------------------- | ------------------------------------------------------ |
-| `false`            | n/a                | WARN | `detected but disabled`      | `<agent> detected but … is disabled in config`         |
-| `true`             | hook not required (Codex / OpenCode / Cursor / Copilot) | OK | `detected & enabled` | `<agent> … found — … is enabled` |
-| `true`             | hook required, not installed | WARN | `hook not installed`     | `<agent> detected but hook is not installed`           |
-| `true`             | hook required, installed   | OK | `hook installed`             | `<agent> hooks installed (...) — session tracking is enabled` |
+| Saved toggle | Hook status | Icon | Description |
+| --- | --- | --- | --- |
+| Explicitly off | n/a | WARN | "detected but disabled" |
+| On | Hook not required | OK | "detected & enabled" |
+| On | Hook required, not installed | WARN | "hook not installed" |
+| On | Hook required, installed | OK | "hook installed" |
 
-The "hook not required" branch applies to Codex, OpenCode, Cursor, and Copilot; Claude and Gemini always require their hooks.
+Only the two assistant hosts that carry their own agent hooks take the hook-required branches; every other integration takes the hook-not-required branch.
 
-### Stored-memories branch count rule
+### Scan-failure rows
 
-The branch count is **not** taken from the status snapshot. The panel computes it on every render:
+An integration whose session store could not be read gets a WARN row reading "unavailable — *kind*", with the failure detail in the tooltip. For the single-surface integrations that row **replaces** the four-state row for that render. The two dual-surface integrations behave differently: each of their surfaces emits its **own standalone** WARN row *in addition to* the combined four-state row, and those standalone rows are not gated on the integration's saved toggle — so a reported scan failure surfaces even when the integration is switched off in configuration. (Asymmetric with the single-surface gating.)
 
-1. Read the list of commit hashes that are on the current branch and not in `main` (worktree-aware; native in-process git invocation).
-2. Pass the list through the summary store's have-a-memory filter, which checks each hash against the index map (including commit aliases — same tree-hash matches across rebases / cherry-picks). **This filter is a delegated round-trip to the command-line surface**, so it is recomputed across a process boundary on every single render.
-3. The count of survivors is the branch-count.
+### Detection is snapshot-only
 
-The total-count comes verbatim from the status snapshot.
+Every per-integration flag is read straight from the status snapshot, and a null flag **renders nothing** — the row is omitted entirely. There is no probe, no filesystem fallback, and no integration for which this panel does its own detection. The practical consequence is that until the first snapshot populates these fields, the list has no integration rows at all.
 
-### Icon palette
+### Stored-memories branch count
 
-Six logical icons, each backed by a fixed asset:
-
-| Logical | Use                                                     |
-| ------- | ------------------------------------------------------- |
-| `OK`    | Green check.                                            |
-| `ERROR` | Red X.                                                  |
-| `WARN`  | Yellow warning.                                         |
-| `PULSE` | Pulse / heartbeat (used for sessions).                  |
-| `BOOK`  | Book (used for stored memories).                        |
-| `GLOBE` | Globe (used for the Jolli site host).                   |
-
-When a row is selected the icon is rendered with all non-transparent pixels replaced by white (cached per-icon). This is what makes the icon legible against the IDE's selection background.
+Not taken from the snapshot. On every render the panel reads the commits on the current branch that are not in the base branch, passes them through the memory store's have-a-memory filter (which honours commit aliases across rebases and cherry-picks), and counts the survivors. That filter is a delegated round trip across a process boundary, paid on **every single render**. The total count comes verbatim from the snapshot.
 
 ### Per-row layout
 
-The row renderer composes:
-
-| Position | Element                                                                 |
-| -------- | ----------------------------------------------------------------------- |
-| Far left | Logical icon (white-tinted when selected).                              |
-| Inset    | 8 pixels.                                                               |
-| Middle   | Label (default foreground; selection foreground when selected).         |
-| Right of label | Description prefixed with two spaces; selection foreground when selected. When not selected, the color is chosen by severity: a WARN row's description is amber, an ERROR row's is red, and any other row's is the normal gray. A row that carries an `onClick` callback paints the description link blue (`0x4A90D9`) **only when it has no severity color** (severity wins over the clickability affordance). |
-| Tooltip  | Multi-line; lines join with `\n`.                                       |
-
-### Click and cursor affordances
-
-The list registers two mouse handlers:
-
-- A double-click handler that, when the click lands on a row whose data carries a non-null `onClick`, invokes the callback.
-- A motion handler that switches the cursor to a hand pointer over rows whose data carries a non-null `onClick`, and back to the default cursor everywhere else.
-
-In the implemented row set, no row supplies an `onClick` — but the data model and handler plumbing are part of the contract because they make per-row link affordances cheap to add.
+An icon (all non-transparent pixels replaced with white, cached per icon, when the row is selected), an inset, the label, then the description. Selection foreground wins when selected. Otherwise the description colour is chosen by severity — amber for WARN, red for ERROR, the ordinary muted colour otherwise — and a row carrying an activation callback paints its description link-blue **only when it has no severity colour**. Severity beats the clickability affordance. Tooltips are multi-line.
 
 ## Behavior
 
 ### Construction
 
-On panel construction:
+The panel registers a mouse listener for activation, a motion listener that switches the cursor to a hand over rows carrying a callback, a project status listener, and an **authentication listener** — the last because signing in or out changes the account row and toggles both the manual-sync row and the site row, and no status change need accompany it. It then renders once, synchronously.
 
-1. The panel registers two mouse listeners on the list (the double-click `onClick` dispatcher and the cursor-motion handler).
-2. It registers the project-status listener to call `refreshUI()` on every fire.
-3. It runs `refreshUI()` once synchronously.
+### Render
 
-### `refreshUI`
+On the interface thread: remove every component; read the snapshot; if there is none, add the initialising label and return. Otherwise resolve the repository's main root (so linked worktrees share the main repository's configuration), load the layered configuration for the per-integration toggles and the saved product key, compute the branch count, clear and rebuild the model in the order above, add the scrollable list, revalidate and repaint.
 
-The full render runs on the UI thread:
+### Row activation
 
-1. Remove all components.
-2. Read the project status snapshot.
-3. If the snapshot is null, add a single "Initializing..." label and return.
-4. Otherwise:
-   - Resolve the project's main repo root (so worktrees share config with the main repo).
-   - Load the global config for the per-agent enabled flags and the saved Jolli API key.
-   - Compute the branch-count of summaries.
-   - Clear and rebuild the list model in the order of the row set.
-   - Add the scrollable list to the panel.
-5. Revalidate and repaint.
+A click activates a row's callback **only when it is the primary button and the click count is exactly one.**
 
-### Status-listener-driven refresh
+Both gates are load-bearing and both were added at once, replacing an ungated double-click:
 
-Every project-status change (install completed, hook fired, sign-in changed, etc.) fires the listener; the panel re-renders via `refreshUI()`.
+- **The button gate** exists because the manual-sync row is the only row in this panel with an external side effect — a real outbound push to a Space — and the toolkit dispatches a click event for the secondary and middle buttons too. Before the gate, a right-click anywhere on that row performed the push.
+- **The click-count gate** stops a double-click from firing the action twice.
+
+The panel's other rows carry no callback, so they are inert under any click.
+
+### Manual sync
+
+Runs off the interface thread. If the sync orchestrator has not yet been built — which is the case when a sign-in is immediately followed by a sync, before the reconciliation step has run — it is built first, and only then is the manual round requested. Without that, the sync would silently not run.
 
 ### Disposal
 
-On disposal the panel removes its status listener.
+The status listener is removed and the authentication listener's registration is disposed.
 
 ## State Transitions
 
 ```
 [panel constructed]
-  add list mouse listeners
-  add status listener
-  refreshUI()
+  register activation + cursor listeners
+  register status listener; register auth listener
+  render()
 
-[refreshUI]
+[render]
   removeAll()
-  status = service.getStatus()
-  if status == null:
-    add "Initializing..." label
-    return
-  config = loadGlobalConfig()
-  branchCount = countBranchSummaries()
-  listModel.clear()
-  add row: Hooks          // "5 Git + 2 Claude + 1 Gemini"
-  add row: MCP & Skills   // (nodeAvailable, integrationsActive) → OK/WARN
-  add row: Sessions
-  add row: Stored Memories
-  if config.jolliApiKey parses → add row: Jolli Site
-  if snapshot.claudeDetected == true → add Claude integration row (4-state)
-  if snapshot.codexDetected == true → add Codex integration row (4-state)
-  if snapshot.geminiDetected == true → add Gemini integration row (4-state)
-  if snapshot.openCodeDetected == true → add OpenCode row (4-state, or scan-error WARN)
-  if snapshot.cursorDetected == true → add Cursor row (4-state, or scan-error WARN)
-  if copilot CLI or Chat scan error → add standalone WARN row(s)
-  if snapshot.copilotCli == true || snapshot.copilotChat == true → add combined Copilot row (4-state)
-  // a null detection flag adds nothing — there is no probe fallback
-  add scrollable list to panel
-  revalidate; repaint
+  snapshot = service status
+  if none: add "initialising" label; return
+  config = layered config at the main repository root
+  branchCount = walk branch commits, filter by stored memory
+  clear model
+  add Hooks, MCP & Skills, Sessions, Stored Memories
+  add Jolli Account  (+ Sync Now only when signed in)
+  add Jolli Site      only when the product key is saved and parses
+  add one four-state row per DETECTED integration, in the fixed order above
+  add a scan-failure WARN row wherever one is reported
+  add the list; revalidate; repaint
 
-[status listener fires (any reason)]
-  UI: refreshUI()
-
-[user double-clicks a row]
-  if row.onClick != null → row.onClick.invoke()
-
-[panel disposed]
-  remove status listener
+[status listener fires]        → render()
+[auth listener fires]          → render()
+[primary single click on a row carrying a callback] → invoke it
+[any other click]              → ignored
+[panel disposed]               → remove status listener; dispose auth registration
 ```
 
 ## Notable Behavior
 
-- **The panel rebuilds itself top-down on every refresh.** There is no in-place row mutation. The list model is cleared and refilled and the panel `removeAll()`s its components before re-adding the list.
-- **The panel has no disabled mode and no inline enable button.** It renders the status row list whenever a snapshot exists, regardless of the enabled flag. When the project is disabled, the tool-window frame surfaces this panel as a full-content card; the enable call-to-action lives in the onboarding view and the Settings dialog (separate specs). Spec-130-era marketing copy and the `Enable Jolli Memory` / `Enabling...` / `Disabling...` toggle button are gone.
-- **The hooks row's icon hinges on the git-hook flag alone.** If git hooks are installed but Claude or Gemini hooks are not, the icon is still OK — the description and tooltip carry the missing-hook detail. The integration rows are where missing-hook surfaces as WARN.
-- **The hooks row's description is a "+"-joined list of installed hook families.** When all three families are installed it reads `5 Git + 2 Claude + 1 Gemini`; when only Git is installed it reads `5 Git`; when none it reads `none installed`. The numbers are part of the literal string, not a count.
-- **The Hooks health icon ignores the push-time hook, so a repository missing it still renders healthy.** The git-hook flag the snapshot supplies is computed from every installed git hook *except* the push-time one, which is deliberately excluded from it. The row's description and tooltip both say "5", but the OK/ERROR decision does not consider that hook. A repository with every git hook installed and a repository missing only the push-time hook therefore render identically: OK, `5 Git`.
-- **The branch-count for stored memories is computed by walking commits, not from the status snapshot.** This is what lets the row reflect the count for the currently checked-out branch even when the snapshot is stale.
-- **Commit aliases are honored.** A commit's tree hash matching a previous commit's stored memory (after rebase, cherry-pick, or amend that ports the same patch) counts toward the branch-count. The aliasing logic is owned by the summary store; the panel only sees the count.
-- **The Jolli site row reads from the global config, not from the runtime auth service.** A signed-out user with a manually-saved API key still sees the row. Conversely, a signed-in user whose account-managed API key has not yet been written to the config sees no row.
-- **Codex / OpenCode / Cursor / Copilot are the hookless integrations.** Their detection happens on the command-line side and arrives in the snapshot; the four-state rule's "hook not required" branch is the only path that produces an OK row without a hook. Copilot's CLI and Chat surfaces share one row and one config toggle, with a per-surface mark in the tooltip.
-- **Per-agent detection is snapshot-only; a null flag renders nothing.** The panel performs no detection of its own — no installer probe, no filesystem check, no fallback. Every agent, Claude included, is read straight from the snapshot, and a null flag is treated as "not detected" so the row is omitted. Claude is no longer "the exception"; every agent behaves the same. The practical effect is that before the first snapshot populates these fields, the row list has no integration rows at all.
-- **The panel has no row for several integrations the command-line surface actually reports.** The status snapshot as this panel consumes it carries no fields for Cline, the Cline command-line variant, Devin, Antigravity, or the Cursor command-line agent — even though the command-line surface detects and reports all of them. Those integrations therefore **never** get a Status row here, at any state, and no scan-error row either. Cline visibility is entirely absent from this surface.
-- **This surface's Cursor coverage is narrower than the others'.** The single `Cursor Integration` row reflects only the Cursor IDE (Composer) detection. A user running the Cursor command-line agent sees no Cursor row unless the IDE is also detected — a narrowing that does not exist on the command-line or VS Code surfaces, or in the MCP status tool.
-- **This panel has no AI-provider row and no vendor-key row at all.** It reports hooks, MCP & Skills, sessions, stored memories, the optional site host, and the per-agent rows — and nothing about which provider will generate the next summary or whether that provider's credential resolves. So the parity fix that made the provider report name the *selected* provider (and that stopped the vendor-key warning from appearing under a provider that never consumes a vendor key) landed on the command-line status report, on the other editor's status tree, and in the structured AI-host status response — but not here, because there was no row on this surface to correct. A user driving the local-agent provider from this IDE sees no confirmation of it anywhere in this panel. (Notable; observable gap.)
-- **The "Node.js not found" tooltip still claims memory generation survives because of "native Java hooks".** That parenthetical is stale: the installed hooks execute under the resolved Node runtime, so a machine with no Node has no memory generation at all — not merely no MCP tools. The tooltip text is the observable contract and it currently overstates what still works.
-- **Scan errors surface as their own WARN rows.** OpenCode, Cursor, and Copilot emit a separate `unavailable — <kind>` row when their session-DB scan fails, distinct from the four-state row.
-- **Selected rows white-tint their icons via a cached image transform.** The transform replaces every non-transparent pixel with white while preserving alpha; the result is cached per logical icon. This is what makes the icons legible against the IDE selection background.
-- **The MCP & Skills row is always shown, unlike the agent rows.** It is not gated on a detection flag — it renders on every snapshot so a missing or unenabled Node runtime is a durable, hover-explained status rather than only a transient balloon. Its two WARN states are distinguished by whether Node is missing entirely versus present-but-not-set-up.
-- **Description color now encodes severity, not just clickability.** A non-healthy status reads by color (amber WARN / red ERROR), and severity color takes precedence over the clickable-link blue. The colors are theme-aware (darker on a light theme, brighter on a dark theme).
+- **The panel rebuilds itself top-down on every refresh.** There is no in-place row mutation; the model is cleared and refilled and the panel removes every component before re-adding the list.
+- **The header's three actions carry no mouse-button gate, while the rows beneath them do.** The fix that stopped a right-click from firing a real outbound push on the sync row was never applied one level up — so a right-click on the disable glyph still runs a full uninstall, and a right-click on the sign-out glyph still signs the user out. (Surprising; reality.)
+- **Row activation is a single primary-button click, not a double-click.** The earlier contract was an ungated double-click, which meant a right-**double**-click on the manual-sync row performed a real push to a Space.
+- **The account row is informational on purpose.** Sign-in and sign-out live only in the header, so the gesture has exactly one home; the row's tooltips exist to point there.
+- **The manual-sync row exists only while signed in**, and it is the only row in the whole panel that does anything when clicked.
+- **The panel now refreshes on authentication changes as well as status changes.** Signing in or out changes three rows and need not be accompanied by any status change.
+- **The hooks row's icon hinges on the git-hook flag alone.** With git hooks installed but an assistant hook missing, the icon is still OK; the description and tooltip carry the detail, and the per-integration rows are where a missing hook surfaces as a warning.
+- **The hooks row's description is a joined list of installed families**, and the numbers in it are part of the literal strings rather than computed counts.
+- **The hooks health icon ignores the push-time hook.** The flag the snapshot supplies is computed from every git hook *except* that one. The row's description and tooltip both count it, but the OK-versus-ERROR decision does not — so a repository with every git hook and one missing only the push-time hook render identically. (Surprising; reality.)
+- **The branch count is recomputed on every render, across a process boundary.** This is what lets it reflect the currently checked-out branch even when the snapshot is stale, and it is paid on every status fire and every authentication fire.
+- **Commit aliases are honoured** in that count: a commit whose tree matches a previously-summarised one after a rebase, cherry-pick or amend still counts.
+- **The site row reads the saved configuration, not the live session.** A signed-out user with a manually-saved product key still sees it; a signed-in user whose account-managed key has not yet been written to configuration does not.
+- **Detection is snapshot-only and a null flag renders nothing.** The panel performs no detection of its own, so before the first snapshot arrives the list carries no integration rows at all.
+- **Exactly one source the underlying report detects has no row here at any state: the command-line Cursor agent.** This surface's snapshot model carries no field for it or for its scan failures, so a machine running only that agent — with no Cursor editor present — gets no Cursor row, and a scan failure from it is invisible. The other surfaces render it, folding a per-surface mark into their Cursor row alongside a dedicated failure row. (Notable; observable gap. This is the last remnant of a wider gap: rows for the two Cline surfaces, the Devin agent, the Antigravity assistant and the Kimi agent all exist now.)
+- **The Kimi row has no failure channel.** Every other embedded-store integration can report a scan failure and surface a warning row; that source's row can only ever render one of the four ordinary states. (Notable.)
+- **The dual-surface integrations' failure rows ignore their own toggle.** A reported failure from either Copilot surface, or either Cline surface, produces a standalone warning row even when that integration is switched off — asymmetric with every single-surface integration, whose failure row is gated on its toggle being on. (Surprising.)
+- **The integrations row is always shown, unlike every integration row.** It is not gated on a detection flag, so a missing or unconfigured runtime is a durable, hover-explained status rather than only a transient balloon.
+- **The "runtime not found" tooltip still claims memory generation survives on native in-IDE hooks.** That is stale: the installed hooks execute under the external runtime, so a machine without it has no memory generation at all — not merely no tools and skills. The tooltip text is the observable contract and it overstates what still works. (Surprising; reality.)
+- **This panel has no provider row and no vendor-key row.** It reports hooks, integrations, sessions, stored memories, the account, the optional site host, and the per-integration rows — and nothing about which provider will generate the next memory or whether its credential resolves. So the parity fix that made the provider report name the *selected* provider landed on every other surface and not here, because there was no row to correct. (Notable; observable gap.)
+- **This panel is not the disabled card.** A disabled repository routes to a dedicated card elsewhere; this overlay is user-toggled and is additionally force-shown while the repository is configured but not installed. The panel renders no enable call-to-action and no marketing copy.
+- **Description colour encodes severity, and severity beats clickability.** A non-healthy row reads by colour, and a clickable row loses its link-blue whenever it also carries a severity.
+- **Selected rows white-tint their icons** through a cached transform that replaces every non-transparent pixel while preserving alpha, which is what keeps them legible against the selection background.
 
 ## Shared Behavior
 
-- **Project status snapshot** — drives the whole panel; every refresh re-reads it.
-- **Project status listener** — the panel registers and removes one listener; every fire triggers `refreshUI()`.
-- **Saved global config** — read on every snapshot-present refresh for the per-agent enabled flags and the saved Jolli API key.
-- **Summary store's have-a-memory filter** — used to compute the branch-count for stored memories; a delegated round-trip on every render.
-- **Jolli API key parser** — used to extract the host and tenant for the Jolli site row.
-- **Installation-status core** — owns every per-agent detection flag and every scan-error record this panel renders, including the fields this panel has no row for. The panel is a pure renderer of that snapshot; it contributes no detection of its own.
-- **Tool-window frame** — owns the view switch, breadcrumb, title-bar actions, the full-pane Status toggle that shows / hides this panel, and the auto-show-when-disabled rule (separate spec).
-- **Onboarding view / Settings dialog** — own the enable call-to-action and credential entry that this panel deliberately does not render (separate specs).
+- **The status snapshot** — drives the whole body; every render re-reads it. The installation-status core owns every detection flag and scan-failure record rendered here, including the field this panel has no row for.
+- **The project status listener and the authentication listener** — both trigger a full re-render; both are released on disposal.
+- **The layered configuration** — read on every snapshot-present render for the per-integration toggles and the saved product key.
+- **The memory store's have-a-memory filter** — supplies the branch count, as a delegated round trip on every render.
+- **The product key parser** — extracts the host and tenant for the site row.
+- **The tool window frame (118)** — owns where this overlay sits, what shows and hides it, and the health-coloured toggle in the title bar.
+- **The enable/disable surface (332)** — owns what the header's disable action does, what the sign-in/out action does beyond flipping this panel's rows, and the roll-backs behind both.
+- **The settings dialog and the onboarding card** — own the credential entry and per-integration toggles this panel only reads, and the enable call-to-action it deliberately does not render.

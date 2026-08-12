@@ -2,170 +2,223 @@
 
 ## Topic Statement
 
-A machine-global store records which repositories have **outbound push to a Jolli Space** turned off. Unlike `manuallyDisabled` (spec 145, which stops *all* capture), this opt-out blocks only outbound sync — memory is still captured and stored locally. The store lives at `~/.jolli/jollimemory/push-control.json` and is keyed by each repo's **canonical identity** (`getCanonicalRepoUrl`), NOT by a working-tree path — so the machine-wide control view (whose rows come from the Memory Bank, which knows repos by identity) and the per-repo gate (which resolves its own canonical URL) share one key, and a repo checked out in several worktrees shares one decision. A single predicate, `isOutboundPushAllowed(cwd)`, composes the durable `manuallyDisabled` flag with this store and is the one gate every outbound push path on every surface consults: the two CLI drains, the CLI manual/MCP push, the VS Code HTTP push client, and (via the IDE bridge) the IntelliJ push sites. The VS Code Settings **Sync to Jolli** tab lists every repo the Memory Bank knows about (plus the current repo) with a per-repo toggle; the CLI and IntelliJ expose a current-repo toggle. New repositories are push-*allowed* by default — a restriction is always an explicit opt-in.
+A machine-global store records which repositories have **outbound push to a Jolli Space** turned off. Unlike the repo-wide manual disable flag, which stops *all* capture, this opt-out blocks only outbound sync — memory is still captured and stored locally. The store is keyed by each repository's **canonical identity**, not by a working-tree path, so the machine-wide control view (whose rows come from the Memory Bank, which knows repositories by identity) and the per-repo gate (which resolves its own canonical URL) share one key, and a repository checked out in several worktrees shares one decision. A single predicate composes the manual-disable flag with this store, and it is the one gate every outbound path on every surface consults. New repositories are push-*allowed* by default — a restriction is always an explicit opt-in.
 
 ## Scope
 
 **In scope:**
-- The `pushDisabled` opt-out, its storage (a machine-global, identity-keyed `push-control.json` — deliberately NOT shared with `manuallyDisabled`), and its semantics versus `manuallyDisabled`.
-- The `isOutboundPushAllowed` predicate: what it composes, why it goes through the migrating readers, and the correctness hole that choice closes.
-- The store's schema-version guard, its corrupt-store recovery (and the four surfaces that must report it), and the machine-global `push-control.lock`.
-- Every outbound-push gate point across CLI, VS Code, and IntelliJ, and what each one does on the blocked path.
-- The three current-repo control surfaces (CLI command, VS Code Settings toggle, IntelliJ bridge-backed toggle) and the shared engine behind them.
-- Re-enable catch-up: what a toggle-on triggers.
-- The telemetry events emitted on toggle.
 
-**Out of scope:**
-- `manuallyDisabled`'s own storage, migration, and capture gate (owned by spec 145).
-- The push payload, endpoints, and error taxonomy (owned by specs 94 / 95 / 236 and the client error-mapping specs).
-- The personal Memory-Bank **vault sync** (mb-sync) outbound channel (specs 150 / 170 / 174) — a different outbound path, deliberately NOT covered by this flag.
-- Server-side repo allowlisting (`repo_not_allowlisted`) — a backend concern; this spec covers only how clients gate their own outbound sends.
+- The opt-out's storage — machine-global, identity-keyed, deliberately not the repository's own profile file — and its semantics versus the manual-disable flag.
+- The store's entry shape, its on-disk ordering rule, the refusal to store an empty identity, and what a read does with each class of damaged file.
+- The schema-version guard and why it is not folded into "corrupt".
+- Corrupt-store recovery on the enable path, the preserved copy it leaves behind, and the surfaces that must report it.
+- The store's own machine-global lock and the one best-effort fallback layered on it.
+- The composed outbound predicate, why it goes through the migrating manual-disable reader, and its fail-closed rule.
+- The reporting read that carries the *reason* alongside the flag, and the absence of a boolean-only shorthand.
+- What is memoized between gate reads and — precisely — what is not.
+- The machine-wide repository list: its source, its key, the always-present current row, and the one failure it is allowed to propagate.
+- Every outbound-push gate point across the command line, the desktop editor, and the JVM host, and what each does on the blocked path.
+- The mid-run holds inside a running drain and the claim-release rule that makes a held entry immediately re-drainable.
+- The current-repo control surfaces (command line, desktop-editor settings, JVM settings) and the shared engine behind them.
+- Re-enable catch-up: what a toggle-on triggers, and when it cannot.
+- The telemetry emitted on toggle.
+
+**Boundaries (consumed here, owned elsewhere):**
+
+- The repo-wide manual disable flag's own storage, anchoring, and legacy-marker migration are defined by **Repo-Wide Manual Disable Flag** (145).
+- Canonical repository identity, its normalization, and its remote-less fallback are defined by **Canonical Repo URL and Name Derivation** (232).
+- The push payload, endpoints and error taxonomy are defined by **Summary Push to Jolli Space** (94), **Binding Required Flow** (95) and **Jolli Space Push Article Assembly** (231).
+- The drains and the pre-push hook this gate is added to are defined by **Git Pre-Push Hook and Detached Sync Worker** (268), **Push-Pending Queue and Claim-Based Drain Engine** (269) and **Push-Pending Compensation Retry** (270); this topic owns only the per-repo gate they consult.
+- The shared classifier that makes the push-disabled refusal abort a whole attachment loop rather than be collected per item is defined by **Repo-Wide Push-Refusal Classification** (327); this topic owns only the flag that raises it.
+- The lock-primitive catalogue this store's lock joins is defined by **Lock Primitive Registry** (297).
+- The bridge operations that carry the gate and the toggle to the JVM host are defined by **CLI IDE-Bridge Command Surface** (287); the command's own option surface and rendering by **CLI Space Push / Spaces / Bind Commands** (230).
+- The telemetry catalogue is defined by **Telemetry Event Catalog** (205).
+- The personal Memory-Bank vault sync is a different outbound channel, deliberately **not** covered by this flag; it is defined by **Sync Engine Reconciliation Cycle** (150), **Sync Backend Client** (170) and **IDE Sync Round Orchestrator** (174).
+- Server-side repository allowlisting is a backend concern; this topic covers only how clients gate their own outbound sends.
 
 ## Data Contracts
 
-### The push-control store (`PushControlStore`)
+### The store
 
-A machine-global JSON file at `~/.jolli/jollimemory/push-control.json` holding only the DISABLED repos, each as a self-describing entry:
+A JSON file in the machine-global configuration directory holding a schema version (currently `1`) and only the DISABLED repositories, each as a self-describing entry:
 
-```jsonc
-{
-  "version": 1,
-  "disabled": [
-    { "repo": "jolli", "identity": "https://github.com/jolliai/jolli", "disabledAt": "<ISO-8601>", "trigger": "cli" }
-  ]
-}
-```
+| Field | Role |
+| --- | --- |
+| `identity` | The canonical repository identity — the store key and the toggle target. The only load-bearing field. |
+| `repo` | Human-readable name derived from the identity. Display only. |
+| `disabledAt` | Timestamp of the last disable. Display only. |
+| `trigger` | Which surface flipped it. Display only. |
 
-- **Keyed by canonical repo identity** (`getCanonicalRepoUrl` — see spec 232), not a working-tree path. Absent from the list = push allowed. The `identity` field is the only load-bearing one; `repo` (derived from the identity via `deriveRepoNameFromUrl`), `disabledAt`, and `trigger` are **display-only** so a hand-inspection of the file explains itself — `loadDisabledRepos` reads back the identities and nothing else.
-- An **empty** `repoIdentity` is refused at the write with a thrown error, not stored. Persisting one would be worse than refusing: the read path skips entries with an empty identity, so the write would land on disk, report success, and read back as "not disabled" — a toggle that silently does nothing. Failing loudly surfaces a caller that passed a blank identity (an unparseable remote, a row from a degraded list) at the write instead of at the next gate read.
-- Writes go through `withPushControlLock` (a machine-global lock, distinct from the runtime-registry lock) as a serialized read-modify-write, so a CLI toggle and a VS Code toggle of different repos can't lose-update each other; a lock timeout falls back to a best-effort unlocked write rather than dropping the toggle. The `disabled` array is written in **code-point** order of `identity` — deliberately not `localeCompare`, which would make the on-disk bytes depend on the ambient ICU locale (contrast the *display* sort in `listPushControlRepos`, which pins `"en"`).
-- Reads (`loadDisabledRepos` / `isRepoPushDisabled`) treat a **missing** file as the empty set (push allowed — the first-run default), but a present-but-**corrupt/unreadable** file **propagates** so the gate fails CLOSED (see the predicate below) rather than silently allowing every push-disabled repo. A parseable-but-odd shape (non-array `disabled`, or malformed elements with no string `identity`) is tolerated as empty — it is readable, just carries nothing actionable. Enabling a repo (`setRepoPushDisabled(…, false)`) is the one exception: it rebuilds from an empty set on a corrupt file so `jolli push-control --enable` recovers from an *unparseable* store; disabling stays strict. That recovery is deliberately **not** universal — a store written by a newer schema is excluded from it (see below).
+Absent from the list = push allowed. The three display fields exist so a hand-inspection of the file explains itself; the gate reads back the identities and nothing else. A malformed entry that still carries a non-empty string identity is repaired on read — the name is re-derived from the identity and the two other fields default to empty.
 
-The opt-out deliberately does **not** live in the repo's working-tree `profile.json` (contrast `manuallyDisabled`, spec 145) precisely so the identity-keyed list and gate can share one key.
+**An empty identity is refused at the write with a thrown error**, never stored. Persisting one would be worse than refusing: the read path skips entries whose identity is empty, so the write would land on disk, report success, and read back as "not disabled" — a toggle that silently does nothing. Failing loudly surfaces a caller that passed a blank identity (an unparseable remote, a row from a degraded list) at the write instead of at the next gate read.
 
-### Schema-version guard (`PushControlStoreTooNewError`)
+The `disabled` array is written in **code-point** order of `identity`. This is the on-disk byte order, so it must not depend on the ambient locale — deliberately unlike the *display* sort of the machine-wide list, which pins a fixed locale. Identities are also case-sensitive keys, so a base-sensitivity collator would call two distinct identities equal and leave their order unstable. The comparator's equal-identity branch is **unreachable today** (the working set is a map keyed by identity, so two entries cannot share one) and is kept only so the comparator stays self-consistent if duplicates ever become possible.
 
-`loadEntries` throws `PushControlStoreTooNewError` when `parsed.version > PUSH_CONTROL_VERSION` (`PushControlStore.ts:147-149`; the class at `:88-98` carries the store path and the found version, and its message names the upgrade as the fix). It is a **distinct** condition from "corrupt", because the correct recovery differs:
+The opt-out deliberately does **not** live in the repository's working-tree profile file (contrast the manual-disable flag) precisely so the identity-keyed list and the gate can share one key.
+
+### What a read does with a damaged store
+
+| On disk | Read result |
+| --- | --- |
+| Missing | Empty set — push allowed. The first-run default. |
+| Present but unreadable (permissions, I/O) | **Propagates** an error naming the store's absolute path and the underlying reason. |
+| Present but unparseable | **Propagates** an error naming the absolute path and stating the file is corrupt. |
+| Parseable, schema version newer than this build | **Propagates** the distinct too-new error (below). |
+| Parseable but odd — non-array `disabled`, or elements that are not objects or carry no string identity | Tolerated as empty. It is readable, it just carries nothing actionable. |
+
+Propagation is what lets the composed gate fail **closed** on an unreadable store, rather than silently treating every push-disabled repository as allowed and leaking memory outbound.
+
+### The schema-version guard
+
+A store whose recorded version is a number greater than this build's is a **distinct** condition from "corrupt", carrying the store path and the found version and naming an upgrade as the fix. The recoveries differ:
 
 - An unparseable file is garbage, so the enable path may rebuild it.
-- A newer-version file is *valid data this build cannot interpret*. Rebuilding it would destroy real opt-outs, and reading it with v1 rules could silently drop the entries whose shape changed — a fail-OPEN leak in the one module that is fail-closed everywhere else.
+- A newer-version file is *valid data this build cannot interpret*. Rebuilding it would destroy real opt-outs, and reading it with current rules could silently drop the entries whose shape changed — a fail-OPEN leak in the one module that is fail-closed everywhere else.
 
-So the enable-path rebuild explicitly **rethrows** it (`:226-227`) instead of recovering: `if (error instanceof PushControlStoreTooNewError) throw error;` sits ahead of the rebuild, so `--enable` refuses rather than resetting the machine. An older or absent `version` is fine — v1 is the only shipped format and a missing field simply predates the check.
+The enable-path rebuild therefore **rethrows** this error ahead of its recovery, so re-enabling refuses rather than resetting the machine. An older or absent version is fine — the current format is the only one shipped, and a missing field simply predates the check.
 
-### Corrupt-store recovery reporting (`SetRepoPushDisabledResult`)
+### The write result, and the corrupt-store recovery it reports
 
-Every write returns `{ disabled, recoveredFromCorrupt, preservedAt? }` (`PushControlStore.ts:67-72`). `recoveredFromCorrupt` is true **only** on the enable path when the store could not be parsed, so the write rebuilt it from an empty set and **every other repo's opt-out was dropped**. Because that path is one GUI checkbox click away, the unreadable file is not overwritten: it is renamed aside to `<path>.corrupt-<epoch>` (`CORRUPT_SUFFIX`, `:75`; the rename at `:233-246`) and the resulting absolute path is returned as `preservedAt`. A rename failure is best-effort — the rebuild still proceeds, because the user asked to enable — and only the evidence is lost, with a warning logged.
+Every write answers with the flag it wrote, a `recoveredFromCorrupt` marker, and — when one was made — the absolute path of a preserved copy.
 
-**This must never be silent.** A bare "Enabled ✓" printed over a machine-wide settings reset is the one outcome this store must not produce, so all **four** surfaces surface it:
+`recoveredFromCorrupt` is true **only** on the enable path when the store could not be parsed, so the write rebuilt it from an empty set and **every other repository's opt-out was dropped**. Enabling must succeed even on a corrupt store, because it is the documented recovery; disabling stays strict and fails rather than blowing away other repositories' opt-outs while ADDING a restriction.
 
-| Surface | Where |
-|---|---|
-| CLI | `cli/src/commands/PushControlCommand.ts:77-86` — appends a "the setting file was unreadable and has been rebuilt … every other repository's opt-out was reset to ON" note plus the `preservedAt` path. |
-| VS Code | `vscode/src/views/SettingsWebviewPanel.ts:580-586` — replaces the success status string with the same warning, including the preserved path. |
-| IDE bridge | `cli/src/commands/IdeBridgeCommand.ts:1129-1135` — `push-control-set` propagates `recoveredFromCorrupt` / `preservedAt` in its reply (omitted when false). |
-| IntelliJ | `intellij/src/main/kotlin/ai/jolli/jollimemory/toolwindow/SettingsDialog.kt:1041-1070` — reads those bridge fields and raises a WARNING-level `Notifications.Bus` balloon ("Outbound push setting file was rebuilt"). |
+Because that rebuild is one checkbox click away, the unreadable file is not overwritten: it is renamed aside next to the store with a suffix carrying the current epoch, and that absolute path is returned. A rename failure is best-effort — the rebuild still proceeds, since the user asked to enable — and only the evidence is lost, with a warning logged.
 
-### The store lock (`push-control.lock`)
+**This must never be silent.** A bare "Enabled ✓" printed over a machine-wide settings reset is the one outcome this store must not produce, so it is reported on the command line (an appended note plus the preserved path), in the desktop editor's settings status line (the success string is replaced by the same warning), across the bridge (the two fields ride along in the reply, omitted when false), and in the JVM host (a warning-level notification balloon raised from those fields).
 
-Writes are serialized by `withPushControlLock` (`cli/src/core/Locks.ts:643-666`), a **machine-global** lock at `~/.jolli/jollimemory/push-control.lock` — deliberately its own file rather than reusing `runtime-registry.lock`, so the two never contend. Budget: **5 s**, polled at **25 ms**. The primitive itself is **strict** (it returns a `StrictLockResult` and runs nothing when the budget expires), but the single call site adds a best-effort fallback: `PushControlStore.ts:276-277` re-runs the same read-modify-write unlocked when `acquired` is false, because silently dropping a toggle the user just clicked would be worse than the residual lost-update window (the guarded section is a sub-millisecond read-modify-write ending in an atomic write). See spec 297.
+### The store's lock
 
-### The outbound-push predicate
+Writes are serialized by a **machine-global** lock beside the store — deliberately its own file rather than reusing the runtime-registry lock, so the two never contend. Budget **5 s**, polled at **25 ms**. The primitive is **strict** (it runs nothing when the budget expires), but the single call site adds a best-effort fallback: it re-runs the same read-modify-write unlocked when the lock was not acquired, because silently dropping a toggle the user just clicked would be worse than the residual lost-update window (the guarded section is a sub-millisecond read-modify-write ending in an atomic write).
 
-`isOutboundPushAllowed(cwd)` returns `true` only when the repository is neither fully disabled nor push-disabled:
+### The outbound predicate
 
-- `readManualDisableFlag(cwd)` — migration-aware (honors the legacy `disabled-by-user` per-worktree marker; see spec 145).
-- `isRepoPushDisabled(getCanonicalRepoUrl(cwd))` — the store lookup.
+The single "may this repository push memory outbound?" answer is true only when the repository is neither fully disabled nor push-disabled:
 
-Going through the migrating `readManualDisableFlag` (not a raw `readRepoProfile`) closes the hole where a repo disabled solely via the legacy marker would read as push-*allowed*.
+- the **manual disable flag**, read through the migration-aware reader (which honours the legacy per-worktree marker), and
+- the store lookup on the repository's canonical identity.
 
-### The machine-wide list (`listPushControlRepos`)
+Going through the migrating reader closes the hole where a repository disabled solely via the legacy marker would read as push-*allowed*.
 
-Sourced from the Memory Bank: `KBRepoDiscoverer.discoverRepos` yields every mirrored repo with the `remoteUrl` stored in its `<kbRoot>/.jolli/config.json`. Each `remoteUrl` is run through the **same** `normalizeRemoteUrl` the gate uses, so the list key equals the store key — a Memory Bank row recorded as `git@github.com:AcMe/Widgets.git` and a working tree whose `remote.origin.url` is `https://github.com/acme/widgets` collapse onto one row, one key, one decision. Each row carries its live disabled state (from the store), its display name, and an `isCurrentRepo` flag.
+**It fails CLOSED.** A *missing* store means "nothing disabled" (allowed), but any error reading the state — an unreadable store, a failed identity read, a failed flag read — blocks. A silent fail-open would let the automatic drains leak memory the moment the store went bad.
 
-The **current** repo is always listed, even when it is not mirrored into the Memory Bank yet and even when it is local-only (no git remote, so its identity is the `file://<worktree>` fallback) — the user must always be able to toggle the repo they are standing in. **Local-only repos are omitted only from the *Memory Bank–sourced* rows**, since the Memory Bank records no `remoteUrl` to key them by; any other machine's local-only repo therefore stays controllable in-repo via `jolli push-control` / that surface's own current-repo toggle rather than from this list.
+### The reporting read
 
-Enumeration is deliberately defensive — `discoverRepos` swallows its own IO errors and the current-repo identity read is guarded — so the **only** failure that propagates out of `listPushControlRepos` is an unreadable push-control store, i.e. exactly the condition on which the gate fails CLOSED. Callers rely on that narrowness to tell "pushing really is blocked machine-wide" apart from "the list is merely incomplete".
+Reporting surfaces read a two-part state: the flag, plus an `error` set **only** when the flag is a fail-closed fallback rather than the user's recorded choice. The error carries the store's absolute path, so a surface can explain an otherwise inexplicable "OFF" — without it, every repository on the machine reports OFF with no way to learn that one file is corrupt.
+
+There is deliberately **no boolean-only shorthand** for the opt-out. One existed and was removed: gates never wanted it (they read the composed predicate, which also folds in the manual-disable flag), and its only caller was the JVM settings toggle's bridge read — a reporting surface, which is precisely where dropping the reason produces the "you turned this repository off" misattribution.
+
+### What is memoized
+
+Only the resolved canonical **identity** is memoized, per working directory, for **5 s**. A summary push asks the gate once up front and then once inside each attachment's send, and each ask would otherwise spawn a git subprocess to re-derive one value that cannot change during the push. Changing the identity means editing git configuration, where a few seconds of staleness costs nothing.
+
+The memo is swept of expired entries once it reaches a size cap (64), and the sweep runs **before** the new entry is inserted so the fresh entry is never its own sweep candidate. Without a sweep the memo only ever *replaces* an entry on re-access of the same directory, so a long-lived host that sees many roots would grow it without bound.
+
+Neither state that can say *no* is memoized, and both exclusions are load-bearing:
+
+- The manual-disable flag is the highest-priority stop-ALL opt-out and its writers live in **other** processes, so an in-process memo could not be invalidated airtight and any lifetime would be a window in which a repository the user just disabled keeps pushing — a privacy leak, not a latency trade-off.
+- The store is excluded because the opt-out must be read LIVE so a mid-push toggle takes effect immediately (and it is a plain file read with no subprocess to save anyway).
+
+**This halves the burst; it does not remove it.** The manual-disable read resolves the main-worktree root through its own git subprocess and is deliberately not memoized, so a ten-attachment push still pays roughly one git spawn per gate read rather than two.
+
+### The machine-wide repository list
+
+Sourced from the Memory Bank: every mirrored repository that records a remote URL. Each remote URL is run through the **same** normalization the gate uses, so the list key equals the store key — a Memory Bank row recorded in one remote spelling and a working tree whose remote is written in another collapse onto one row, one key, one decision. Each row carries its live disabled state, its display name, its identity, and a current-repository flag. Rows are sorted current-first, then by name using a **pinned** locale so the display order is stable across machines.
+
+The **current** repository is always listed, even when it is not mirrored into the Memory Bank yet and even when it is remote-less (so its identity is the working-tree fallback) — the user must always be able to toggle the repository they are standing in. **Remote-less repositories are omitted only from the Memory-Bank-sourced rows**, since the Memory Bank records no remote URL to key them by; any other machine's remote-less repository therefore stays controllable in-repo rather than from this list.
+
+Enumeration is deliberately defensive — the Memory Bank walk swallows its own I/O errors and the current-repository identity read is guarded — so the **only** failure that propagates out of the list is an unreadable store, i.e. exactly the condition on which the gate fails closed. Callers rely on that narrowness to tell "pushing really is blocked machine-wide" apart from "the list is merely incomplete".
 
 ## Behavior
 
-### The outbound-push gate
+### The outbound gate, per surface
 
-`isOutboundPushAllowed(cwd)` is consulted at every point that would send memory off the machine. On the blocked path each keeps local state intact and emits nothing:
+The composed predicate is consulted at every point that would send memory off the machine. On the blocked path each keeps local state intact and emits nothing.
 
 | Surface | Gate point | Blocked-path behavior |
-|---|---|---|
-| CLI — post-queue / activation drain | `processPushPending`, beside the existing `syncOnPush` skip | Returns the empty result with a `"push disabled for this repo"` note; **pending entries are kept** so a later re-enable catches up. |
-| CLI — pre-push inline drain | `processPrePushInline`, beside its own `syncOnPush` skip | Same note; entries (recorded write-first by the hook) stay pending. The pre-push hook additionally prints a one-line stderr notice so `git push` is not silent — and it reads `readPushDisabledState`, not the boolean, so the two reasons get different advice (see "The unreadable-store notice" below). |
-| CLI — manual / MCP push | `pushBranchToJolli`, before any network call | Returns a new `{ type: "push_disabled" }` result; `jolli push` prints it and exits 0 (a deliberate opt-out, not an error), MCP `push_memory` passes the tagged result through. |
-| VS Code — every memory-content send | `pushToJolli` / `deleteFromJolli` (the choke for memory content), gated by a `cwd` threaded from the push orchestrator | Rejects with a typed `PushDisabledError` before opening the socket; the orchestrator's callers (Share, Create-PR, Push) surface it. |
-| IntelliJ — native manual push sites | the `outbound-push-allowed` IDE-bridge call, which returns `isOutboundPushAllowed` for the project | The push site aborts with a "re-enable to push" message. A bridge reply that is not a definitive `{ allowed: boolean }` — a non-object body, a missing/non-boolean field, or a JSON-RPC `error` — also blocks (fail-closed), but raises `PushGateUnavailableError` ("couldn't verify the setting") instead of the opt-out message. Only a bridge that could not run at all (Node missing, spawn failure, timeout) fails OPEN. |
-| VS Code + IntelliJ — live-share **reconcile** | the ordinary push gate, reached through the shared push funnel | **Swallowed, not surfaced.** Both reconcile paths catch `PushDisabledError` and `return` quietly, leaving the cached share record intact (`vscode/src/services/LiveShareController.ts:550-559`; `intellij/…/services/LiveShareController.kt:331-336`). Reconcile is a best-effort background pass the share modal runs on every view, so a push-disabled repo just means "nothing to sync outbound" — letting the refusal escape would render the user's own opt-out as the modal's red "Couldn't refresh the shared content" toast. The **mint** path through the same funnel (`LiveShareController.kt:120-121`) does *not* swallow it: there the user asked for a link, so the refusal must be reported. |
+| --- | --- | --- |
+| Command line — every drain (post-queue, activation, pre-push worker) | the shared drain engine's entry gate, beside the existing sync-on-push skip | Returns the empty result with a "push disabled for this repo" note; **pending entries are kept** so a later re-enable catches up. There is one drain function and one entry gate — the pre-push path differs only in the options it passes, so it inherits this gate rather than carrying its own. |
+| Command line — pre-push hook | its own read of the push-disabled **state**, after the queue write and before the worker spawn | Nothing is spawned; entries (recorded write-first) stay pending, and the hook prints a one-line notice to standard error so the push is not silent. It reads the state form, not the boolean, so the two reasons get different advice (below). The notice exists because the worker's drain gates on the same flag and its empty result would print nothing. |
+| Command line — manual and MCP push | before any network call | Returns a tagged push-disabled result; the command prints it and exits **0** (a deliberate opt-out, not an error), and the MCP tool passes the tagged result through with a documented instruction not to retry. |
+| Desktop editor — every memory-content send | the push and delete calls (the choke for memory content), gated on a working directory threaded from the push orchestrator | Rejects with the typed push-disabled refusal before opening the socket; the orchestrator's callers surface it. The orchestrator additionally fails fast at its own entry gate before any attachment is attempted. |
+| JVM host — native manual push sites | a bridge call answering the composed predicate | The push site aborts with a "re-enable to push" message. A bridge reply that is not a definitive boolean answer — a non-object body, a missing or non-boolean field, or a JSON-RPC error — also blocks (fail-closed), but raises the distinct gate-unavailable verdict ("couldn't verify the setting") instead of the opt-out message. Only a bridge that could not run at all (no runtime, spawn failure, timeout) fails OPEN. |
+| Desktop editor + JVM host — live-share **reconcile** | the ordinary push gate, reached through the shared push funnel | **Swallowed, not surfaced.** Both reconcile paths catch the refusal and return quietly, leaving the cached share record intact. Reconcile is a best-effort background pass the share modal runs on every view, so a push-disabled repository just means "nothing to sync outbound"; letting the refusal escape would render the user's own opt-out as the modal's "couldn't refresh the shared content" error. The **mint** path through the same funnel does *not* swallow it: there the user asked for a link, so the refusal must be reported. |
 
-The CLI drains are the load-bearing gate for **automatic** leaks on *every* surface: git hooks are source-neutral and always run the CLI drains, so a push-disabled repository never auto-syncs regardless of which editor is installed. The VS Code and IntelliJ native gates cover their respective **manual** push actions, which do not go through the CLI drains.
+The command-line drains are the load-bearing gate for **automatic** leaks on *every* surface: git hooks are source-neutral and always run those drains, so a push-disabled repository never auto-syncs regardless of which editor is installed. The editor and JVM gates cover their respective **manual** push actions, which do not go through the drains.
+
+### Mid-run holds inside a drain
+
+The drain's entry gate runs once, before its loop. The opt-out can still trip after it, and both places that can trip produce a **hold** — an outcome that is neither pushed nor failed:
+
+- the **per-commit re-read** at the top of each commit's push, so a user who disables push mid-drain stops the REMAINING commits; and
+- the **push-disabled refusal raised between one commit's own sends**, by the live re-check the push orchestrator performs before every attachment and again before the summary send, which the drain catches and converts rather than routing through its retry classifier.
+
+A hold deliberately records **no attempt** — no error text, no retry burned — but it must still **release the entry's claim** by writing an empty patch. Otherwise the re-enable drain defeats itself: it is a single detached pass, a claim is honoured for its full staleness window, and the entries the user just re-enabled would be skipped as "claimed by another process" until an unrelated later trigger. "Leave the entry exactly as claimed" is the wrong instinct — the correct invariant is "indistinguishable from an entry this drain never reached", which includes being re-claimable.
+
+The manual and MCP push path has the same shape one level up: its entry gate returns the tagged push-disabled result before any network call, and a refusal raised mid-run — after that gate passed — is converted to the **same** tagged result rather than a generic error, so a deliberate user setting is never reported as a failure. Summaries already pushed in that run stay pushed.
 
 ### The control surfaces
 
-All three drive one shared engine (`PushControl`): `isPushDisabled(cwd)` resolves the repo's canonical identity (`getCanonicalRepoUrl`) and reads the opt-out from the **machine-global, identity-keyed push-control store** (see Data Contracts), and `applyPushDisabled(cwd, disabled, trigger)` resolves the same identity, writes the store entry, emits telemetry, and — when re-enabling — triggers the compensation drain. The single source of truth is that one store, **not** the repo's `profile.json` (contrast `manuallyDisabled`, spec 145). The CLI and IntelliJ surfaces toggle the **current repo** — the one they were opened in — while the VS Code Settings tab additionally lists every repo the Memory Bank knows about.
+All three drive one shared engine. Reading resolves the repository's canonical identity and consults the machine-global store; writing resolves the same identity, writes the entry, emits telemetry, and — when re-enabling for the current repository — triggers the compensation drain. The single source of truth is that one store, **not** the repository's profile file. The command line and the JVM host toggle the **current** repository; the desktop editor's settings additionally lists every repository the Memory Bank knows about.
 
-- **CLI** — `jolli push-control` shows the current repo's state; `--disable` / `--enable` toggle the current repo (`--cwd`). `--format json` mirrors the other read commands. **`--enable` and `--disable` are mutually exclusive**: passing both errors out with `--enable and --disable are mutually exclusive.` and does nothing (`cli/src/commands/PushControlCommand.ts:105-108`) — checked before either branch, so an ambiguous invocation can never fall through to the destructive enable path.
-- **VS Code** — a per-repo Push toggle in the Settings webview's **Sync to Jolli** tab, listing every repo the Memory Bank knows about (via `listPushControlRepos`) plus the current workspace repo. **Every row, including the current repo, is written by identity** via `setRepoPushDisabledByIdentity` — the key of the row the user actually clicked. The `isCurrent` flag decides only whether the re-enable drain can run afterwards (that needs a working tree, so it goes through `triggerReenableDrain(workspaceRoot)`); it deliberately does **not** also re-derive the target via `applyPushDisabled(workspaceRoot, …)`, which would give "which repo did they mean" two sources of truth that disagree once the workspace's remote changes after the list was rendered. All three helpers are imported directly from the bundled CLI, and each toggle applies immediately (no "Apply Changes"), with the persisted list re-posted afterwards so a failed write snaps the checkbox back.
-- **IntelliJ** — reads the toggle's initial state through the `push-control-get` IDE-bridge method (the pure per-repo flag) and writes through `push-control-set` (which acts on the project's `cwd`); its push sites gate on `outbound-push-allowed` (the composed predicate). All the flag logic lives in the shared `PushControl` core — there is no Kotlin re-implementation, and the machine-global store stays the single source of truth. `push-control-set` **validates rather than coerces** its request field: `typeof request.disabled !== "boolean"` throws `Request field "disabled" must be a boolean.` (`cli/src/commands/IdeBridgeCommand.ts:1124-1127`). A truthiness test (`request.disabled === true`) would make a missing or mistyped field silently mean ENABLE — and enabling is the one direction that rebuilds an unreadable store from empty, dropping every other repo's opt-out. A malformed request must never take that path.
+- **Command line** — one command shows the current repository's state and toggles it, with a machine-readable output mode that mirrors the other read commands. **The enable and disable options are mutually exclusive**: passing both errors out and does nothing, checked *before* either branch so an ambiguous invocation can never fall through to the destructive enable path.
+- **Desktop editor** — a per-repository toggle in the settings view's sync tab, listing every repository the Memory Bank knows about plus the current workspace's. **Every row, including the current one, is written by identity** — the key of the row the user actually clicked. The current-repository flag decides only whether the re-enable drain can run afterwards (that needs a working tree); it deliberately does *not* also re-derive the target from the workspace path, which would give "which repository did they mean" two sources of truth that disagree once the workspace's remote changes after the list was rendered. Each toggle applies immediately, with the persisted list re-posted afterwards so a failed write snaps the checkbox back to reality. The Memory Bank root is read **separately** from the store and degrades to "none" on failure, so a configuration read error is never reported as an unreadable store — a machine-wide "pushing is blocked" alarm for a condition that blocks nothing.
+- **JVM host** — reads the toggle's initial state through a bridge operation returning the pure per-repo **state** (not the composed predicate) and writes through a second one that acts on the project's working directory. All the flag logic lives in the shared engine; there is no host-side re-implementation. The write operation **validates rather than coerces** its request field: a non-boolean is rejected outright. A truthiness test would make a missing or mistyped field silently mean ENABLE — and enabling is the one direction that rebuilds an unreadable store from empty. A malformed request must never take that path.
 
 ### Re-enable catch-up
 
-Toggling a repo back **on** writes `pushDisabled: false` *and* triggers the same detached compensation drain (spec 270) that activation and sign-in use, so memory retained while the repo was disabled syncs without waiting for the next `git push`. Toggling **off** only writes the flag; pending entries are left in place.
+Toggling a repository back **on** writes the flag *and*, when the surface has a working tree for it, triggers the same detached compensation drain that activation and sign-in use, so memory retained while the repository was disabled syncs without waiting for the next push. Toggling **off** only writes the flag; pending entries are left in place.
+
+Re-enabling a **different** repository by identity (a non-current row in the machine-wide list) only writes the flag — there is no working tree to drain — so that repository's backlog syncs on its own next activation or push.
 
 ### Telemetry
 
-`applyPushDisabled` emits `push_disabled` / `push_enabled` (append-only catalog, spec 205) carrying a `trigger` of `cli` | `vscode` | `intellij`.
+A toggle emits a disable or enable event carrying the surface that triggered it.
 
 ## State Transitions
 
 | From | Event | To | Notes |
-|---|---|---|---|
-| Absent / `false` | Toggle off (any surface) | `true` | Only the flag is written; pending entries left pending. |
-| `true` | Toggle on (any surface) | `false` | Flag written, then a compensation drain is triggered. |
-| `true` | Any gated outbound path fires | Unchanged | The gate is read-only; the repo keeps capturing locally and keeps refusing to send. |
+| --- | --- | --- | --- |
+| Absent / allowed | Toggle off (any surface) | Disabled | Only the flag is written; pending entries left pending. |
+| Disabled | Toggle on, current repository | Allowed | Flag written, then a compensation drain is triggered. |
+| Disabled | Toggle on, a row that is not the current repository | Allowed | Flag written only; that repository drains on its own next activation or push. |
+| Disabled | Any gated outbound path fires | Unchanged | The gate is read-only; the repository keeps capturing locally and keeps refusing to send. |
+| Store unparseable | Toggle on | Rebuilt from empty | Every other repository's opt-out is dropped; the old file is preserved beside the store and the fact is reported on every surface. |
+| Store unparseable | Toggle off | Unchanged | The write refuses rather than destroying other repositories' opt-outs while adding a restriction. |
+| Store version newer than this build | Toggle either way | Unchanged | Refused with the upgrade-required error; the enable path's rebuild explicitly does not apply. |
 
 ## Notable Behavior
 
-- **`pushDisabled` and `manuallyDisabled` are independent.** A repo may be push-disabled while fully enabled for capture, and vice versa. They live in **different** stores under **different** locks: `pushDisabled` in the machine-global, identity-keyed `~/.jolli/jollimemory/push-control.json` (this spec), `manuallyDisabled` in the repo-wide working-tree `profile.json` (spec 145). The predicate composes them; nothing shares one file.
-- **The predicate goes through the migrating readers on purpose.** Reading a raw profile would miss a legacy-marker-only disable and wrongly allow a manual/MCP push. (Surprising; the reason the predicate is not a two-field struct read.)
-- **Automatic leaks are gated CLI-side for every surface; native gates only add the manual paths.** Because git hooks are source-neutral CLI code, gating the two CLI drains already stops auto-sync for VS Code- and IntelliJ-only installs. (Central design point.)
-- **The toggle is always read live, keyed by identity.** Each surface reads and writes the flag from the one machine-global, identity-keyed push-control store; a repo checked out in several worktrees therefore shares one decision. There is no per-worktree or cached copy to drift. Live-read is a requirement, not an accident, and **all three surfaces implement it**:
-  - **VS Code** — the orchestrator's fail-fast entry check plus the per-call check inside `pushToJolli` / `deleteFromJolli` are *both* live, so a push of N attachments performs 1 + N reads rather than caching one decision.
-  - **CLI** — `assertOutboundStillAllowed(cwd)` (`cli/src/core/JolliMemoryPushOrchestrator.ts:913-916`) re-reads the composed predicate and throws `PushDisabledError`, and is called before **every** attachment send — plans (`:1061`), notes (`:1105`), references (`:1158`) — *and* before the summary send itself (`:963`), which is the last outbound call of the group and can be many seconds after the attachment loops began. Without it the native CLI would be the one surface that keeps leaking after the toggle. It is cheap by construction because the repo identity is memoized per-cwd (next bullet), so each extra read is a file read, not a `git config` spawn.
-  - **IntelliJ** — the `jolli-api` bridge re-checks inside each outbound call, and `JolliApiClient.kt:721` remaps the CLI's mid-call `PushDisabledError` back into the Kotlin type so it lands on the panels' quiet "re-enable to push" handling rather than the generic failure path.
-
-  A mid-push opt-out therefore takes effect immediately on every surface.
-- **Only the repo IDENTITY is memoized; neither "don't push" state ever is.** The gate would otherwise spawn `git config --get remote.origin.url` on all 1 + N reads of a single push, so the resolved canonical identity is memoized per-cwd for a few seconds — changing it means editing `git config`, where staleness is harmless. The two states that can say *no* are deliberately excluded: `manuallyDisabled` (spec 145) is the highest-priority stop-ALL opt-out whose writers live in **other** processes (`jolli disable` in a terminal, the VS Code / IntelliJ Disable commands), so an in-process memo could not be invalidated airtight and any TTL would be a window in which a repo the user just disabled keeps pushing — a privacy leak, not a latency trade-off; and the push-control store is excluded by the live-read rule above (a plain file read with no subprocess to save anyway). The identity memo is swept of expired entries once it passes a size cap, so a long-lived host that sees many roots cannot grow it without bound. (Surprising; the reason the gate is not "cache the whole decision".)
-- **A local-only repo does NOT share one decision across worktrees.** The shared-decision property comes from the identity: worktrees of the same repo share `.git/config`, so they resolve the same `remote.origin.url`. With no remote, `getCanonicalRepoUrl` falls back to `file://<worktree>` (spec 232) — so each worktree of a remote-less repo is a **separate key** with its own opt-out, and so is any explicitly-passed `--cwd` below the root. Such repos are already absent from the machine-wide list for the same reason; this is the one place the "one decision per repo" rule does not hold. (Surprising; follows from the identity fallback.)
-- **An unreadable store reports OFF for every repo, so every surface that reports OFF must say which OFF it means.** `readPushDisabledState(cwd)` returns the fail-closed flag *plus* the error (which names the store's absolute path). Every reporting surface consumes the state form, not the boolean, because attributing a fail-closed read to the user is wrong twice over — they chose nothing, and the condition is machine-wide rather than per-repo:
-  - `jolli push-control` show prints the reason and the repair hint; `--format json` adds an `error` field.
-  - `getStatus` carries **both** halves (`pushDisabled` + `pushDisabledError`), so `jolli status` prints an `Outbound push:` row only when push is off, and branches on the error: `Blocked — setting unreadable (<status.pushDisabledError>)` instead of `Disabled for this repo` (`cli/src/commands/StatusCommand.ts:551-556`). The parenthesis interpolates the **whole** error string, not just a path — and that string is already `Push-control store at <path> could not be read: <errno msg>` (`PushControlStore.ts:128`; the parse-failure twin at `:136` reads `… is corrupt and could not be parsed: …`). So the rendered row names the file *and* the reason, at the cost of nesting one sentence inside another.
-  - The MCP `status` tool is the one reporting surface that carries **neither** half. It does not inherit them from `getStatus`: `buildStatusSummary` projects `StatusInfo` into a curated `StatusResult` (`cli/src/mcp/McpTools.ts`), so a field that is not named there is dropped — and neither `pushDisabled` nor `pushDisabledError` is named, in the interface or in the projection. So an AI host whose `push_memory` is refused has no channel at all for learning why: it can see the account, the hooks, the bound Space and the stored-memory count, but not that this repo's outbound push is off (still less that the store is unreadable machine-wide). This is the gap the rest of this bullet's rule exists to prevent, left open on exactly the surface that cannot ask a human. (Real gap; every other surface below closes it.)
-  - The pre-push hook branches on it too — see below.
-  - The VS Code Settings list posts `unreadable` alongside the (stale) rows so the checkboxes are explicitly marked untrustworthy.
-  - The IntelliJ Settings checkbox renders the fail-closed case as its existing **unknown** state (disabled box, tooltip naming the store path, and — per the next bullet — pointing at `jolli push-control`, never `--enable`). The `push-control-get` bridge therefore returns the state form; leaving the toggle unwritable is load-bearing rather than merely cautious, since writing "enable" is exactly the recovery that rebuilds the store from empty.
-
-  There is deliberately **no boolean-only shorthand** for the opt-out. One existed (`isPushDisabled`) and was deleted: gates never wanted it (they read `isOutboundPushAllowed`, which also composes in `manuallyDisabled`), and its only caller was the `push-control-get` bridge — a reporting surface, which is precisely where dropping the reason produces the "you turned this repo off" misattribution this bullet exists to forbid.
-
-- **The unreadable-store notice must not recommend `--enable`.** `--enable` is the documented recovery, but on a corrupt store it rebuilds from an empty set and **drops every repo's opt-out**. So the one notice a user cannot miss — the pre-push stderr line, printed on every `git push` — deliberately does *not* offer it when `error` is set; it points at `jolli push-control` (which explains the trade-off in full) instead. Only the genuine user opt-out gets the `--enable` hint. (Surprising: the same condition yields two different notices on purpose, and the destructive-recovery path is reachable only from a surface that first explains what it destroys.)
-- **New repos push by default.** Gating treats an absent flag as allowed, so a restriction is always an explicit action.
-- **Re-enabling syncs the backlog.** Toggle-on for the CURRENT repo (CLI `--enable` / the current-repo toggle) kicks the compensation drain immediately so retained memory flushes without another push. Re-enabling a DIFFERENT repo by identity (the VS Code list rows) only writes the flag — there is no working tree to drain there — so that repo's backlog syncs on its next activation or `git push`.
-- **The opt-out never burns retry budget.** `classifyError` gives `PushDisabledError` its own non-incrementing `"push-disabled"` category (`cli/src/core/PushExecutor.ts:135`), alongside not-authenticated / permission-denied / binding-required / client-outdated. Retrying cannot succeed until the user changes the setting, so counting it against the ceiling of 3 would quietly retire entries the re-enable drain is supposed to flush. (Notable; see spec 269 for the classification contract.)
-- **A mid-run hold must RELEASE the pending entry's claim, not just skip the send.** All four gates that trip *during* a drain — the per-batch and per-commit re-reads in `processPushPending`, the `PushDisabledError` the orchestrator's own per-attachment re-check raises between attachments, and the inline pre-HTTP re-read in `processPrePushInline` (spec 269) — deliberately record no attempt — no `lastError`, no retry burned — but it must still clear `claimedAt` via an empty patch. Otherwise the re-enable drain above defeats itself: it is a single detached pass, `claimForPush` honours a claim for `CLAIM_STALE_MS` (5 min), and so the entries the user just re-enabled are skipped as "claimed by another process" and wait for an unrelated later trigger. "Leave the entry exactly as claimed" is the wrong instinct here and was the original bug — the correct invariant is "indistinguishable from an entry this drain never reached", which includes being re-claimable. (Surprising: the hold path writes to the pending store precisely in order to look untouched.)
-- **The vault sync is a separate channel.** `pushDisabled` governs only per-repo Space push; the personal Memory-Bank vault sync is out of scope and unaffected.
-- **The gated choke covers memory content, not every outbound byte.** `pushToJolli` / `deleteFromJolli` are the choke for VS Code pushes of memory *content*, but they are not the extension's only outbound HTTP path: `vscode/src/services/JolliShareService.ts` issues its own `node:http`/`node:https` requests for `createLiveShare` / `updateLiveShare`, and those are deliberately ungated. They carry share metadata (visibility, recipients, a `ref` pointing at already-pushed Space docs) rather than memory content, and every path that reaches them runs a gated push first — so a push-disabled repo aborts before any of them fire. Recorded explicitly because "the single HTTP choke" would invite a future author to add a content-carrying send there and assume the gate covers it, which is the exact omission this feature was built to close. Same shape on the Kotlin side, where the `*-share` bridge operations are excluded from the `jolli-api` gate for the same reason. (Surprising; intentional.)
+- **The push opt-out and the manual disable flag are independent.** A repository may be push-disabled while fully enabled for capture, and vice versa. They live in **different** stores under **different** locks — this one machine-global and identity-keyed, the other repo-wide inside the working tree. The predicate composes them; nothing shares one file.
+- **The predicate goes through the migrating reader on purpose.** Reading a raw profile would miss a legacy-marker-only disable and wrongly allow a manual push. (Surprising; the reason the predicate is not a two-field struct read.)
+- **Automatic leaks are gated on the command-line side for every surface; the native gates only add the manual paths.** Because git hooks are source-neutral command-line code, gating the drains already stops auto-sync for editor-only and JVM-only installs. (Central design point.)
+- **The toggle is always read live, keyed by identity, on every surface.** There is no per-worktree or cached copy to drift. The desktop editor's orchestrator entry check and the per-call check inside its send/delete choke are *both* live, so a push of N attachments performs one plus N reads rather than caching one decision; the command-line loop re-reads before **every** attachment send from inside its one kind-generic loop — so every registered context kind, present and future, inherits it without a per-kind call site — *and* before the summary send, which is the last outbound call of the group and can be many seconds after the loop began; and the JVM bridge's outbound calls re-check, with the command line's mid-call refusal remapped back into the host's own type so it lands on the panels' quiet "re-enable to push" handling rather than the generic failure path. A mid-push opt-out therefore takes effect immediately everywhere.
+- **Only the repository IDENTITY is memoized; neither state that can say "don't push" ever is** — and the memo halves the per-read subprocess cost rather than removing it, because the manual-disable read resolves its own root through a git subprocess every time. (Surprising; the reason the gate is not "cache the whole decision".)
+- **A remote-less repository does NOT share one decision across worktrees.** The shared-decision property comes from the identity: worktrees of the same repository share one git configuration and so resolve the same remote. With no remote, the identity falls back to the worktree path — so each worktree of a remote-less repository is a **separate key** with its own opt-out, and so is any explicitly-passed working directory below the root. Such repositories are already absent from the machine-wide list for the same reason; this is the one place the "one decision per repository" rule does not hold. (Surprising; follows from the identity fallback.)
+- **An unreadable store reports OFF for every repository, so every surface that reports OFF must say which OFF it means.** Attributing a fail-closed read to the user is wrong twice over — they chose nothing, and the condition is machine-wide rather than per-repository — so every reporting surface consumes the state form, not the boolean:
+  - The command-line show prints the reason and a repair hint; its machine-readable mode adds an error field.
+  - The installation-health report carries **both** halves, so the health output prints an outbound-push row only when push is off and branches on the error: a "blocked — setting unreadable" line naming the whole error string instead of "disabled for this repo". Because that string already reads "the store at `<path>` could not be read / is corrupt and could not be parsed: `<reason>`", the rendered row names the file *and* the reason, at the cost of nesting one sentence inside another.
+  - The MCP health tool carries **both** halves, and carries them **conditionally**. Its projection is curated — a field not named there is dropped — so both are named explicitly: the flag is emitted only when true, and the error only when the flag is true *and* an error was recorded. Absent therefore means "this repository pushes", which is the honest encoding given the gate treats an absent flag as allowed, and no host can mistake a fail-closed machine-wide read failure for a per-repository decision the user made. This is the surface that cannot ask a human why its push was refused.
+  - The pre-push notice branches on it too (below).
+  - The desktop editor's settings list posts an unreadable marker alongside the last-known (stale) rows, so the checkboxes are explicitly marked untrustworthy rather than silently showing every repository as pushing while every push is in fact blocked.
+  - The JVM settings checkbox renders the fail-closed case as its **unknown** state — box disabled, state not marked loaded (so the dialog's write is skipped), tooltip naming the store path. Leaving the toggle unwritable is load-bearing rather than merely cautious, since writing "enable" is exactly the recovery that rebuilds the store from empty. That host treats a failed read, a malformed reply, and a reply carrying the error as the same unknown, and never defaults to "push is on".
+- **The unreadable-store notice must not recommend enabling.** Re-enabling is the documented recovery, but on a corrupt store it rebuilds from an empty set and **drops every repository's opt-out**. So the one notice a user cannot miss — the pre-push line, printed on every push — deliberately does *not* offer it when an error is set; it points at the plain command, which explains the trade-off in full. Only the genuine user opt-out gets the re-enable hint. The JVM tooltip follows the same rule. (Surprising: the same condition yields two different notices on purpose, and the destructive recovery is reachable only from a surface that first explains what it destroys.)
+- **New repositories push by default.** The gate treats an absent flag as allowed, so a restriction is always an explicit action.
+- **The opt-out never burns retry budget, and it is protected twice.** The hold branch above intercepts the refusal and records no attempt at all. The drain's retry classifier *also* gives the refusal its own non-incrementing category, alongside not-signed-in, permission-denied, binding-required and client-outdated — but that entry is **unreachable from the only production caller**, because the hold branch is tested first and returns. It is a redundant second line of defence, not the mechanism. Retrying cannot succeed until the user changes the setting, so counting it against the ceiling would quietly retire entries the re-enable drain is supposed to flush. (Notable; one of the two guards never runs.)
+- **A mid-run hold writes to the pending store precisely in order to look untouched.** It records no attempt but must clear the claim, or the re-enable drain skips the very entries it was launched to flush. (Surprising; the original bug was to leave the entry exactly as claimed.)
+- **The gated choke covers memory content, not every outbound byte.** The desktop editor's push and delete calls are the choke for memory *content*, but they are not the extension's only outbound HTTP path: its share service issues its own requests to create and update a live share, and those are deliberately ungated. They carry share metadata (visibility, recipients, a reference pointing at already-pushed documents) rather than memory content, and every path that reaches them runs a gated push first — so a push-disabled repository aborts before any of them fire. Recorded explicitly because "the single HTTP choke" would invite a future author to add a content-carrying send there and assume the gate covers it, which is the exact omission this feature was built to close. Same shape on the JVM side, where the share bridge operations are excluded from the gated wrapper for the same reason. (Surprising; intentional.)
+- **The vault sync is a separate channel.** This flag governs only per-repository Space push; the personal Memory-Bank vault sync is unaffected.
 
 ## Shared Behavior
 
-- The repo-wide profile file, its anchoring, atomic-write, lock, and the `manuallyDisabled` field and its legacy-marker migration are owned by spec 145.
-- The push payload / endpoints / binding flow are owned by specs 94, 95, 231, 236, 263.
-- The two CLI drains and the pre-push hook are owned by specs 268, 269, 270; this spec owns only the per-repo gate added to them.
-- The compensation drain that re-enable triggers is owned by spec 270.
-- The telemetry catalog is owned by spec 205.
-- The IDE-bridge command surface that carries `outbound-push-allowed` / `push-control-set` is owned by spec 287.
-- The lock-primitive catalogue that `push-control.lock` joins (budgets, strict-vs-best-effort discipline) is owned by spec 297.
-- The shared classifier that makes `PushDisabledError` abort a whole attachment/summary loop instead of being collected per item is owned by spec 327; this spec owns only the flag that raises it.
-- The `jolli push-control` command's own option surface and rendering is owned by spec 230, alongside the other CLI Space commands.
+- The repo-wide profile file, its anchoring, atomic write, lock, and the manual-disable field with its legacy-marker migration are defined by **Repo-Wide Manual Disable Flag** (145).
+- Canonical repository identity, its normalization and its remote-less fallback are defined by **Canonical Repo URL and Name Derivation** (232).
+- The push payload, endpoints and binding flow are defined by **Summary Push to Jolli Space** (94), **Binding Required Flow** (95), **Jolli Space Push Article Assembly** (231) and **IntelliJ Push Orchestration** (263).
+- The drains and the pre-push hook are defined by **Git Pre-Push Hook and Detached Sync Worker** (268), **Push-Pending Queue and Claim-Based Drain Engine** (269) and **Push-Pending Compensation Retry** (270), which also owns the compensation drain that re-enabling triggers and the retry classification the push-disabled category joins.
+- The telemetry catalogue is defined by **Telemetry Event Catalog** (205).
+- The bridge operations carrying the gate and the toggle are defined by **CLI IDE-Bridge Command Surface** (287).
+- The lock-primitive catalogue this store's lock joins (budgets, strict-versus-best-effort discipline) is defined by **Lock Primitive Registry** (297).
+- The shared classifier that makes the push-disabled refusal abort a whole attachment or summary loop instead of being collected per item is defined by **Repo-Wide Push-Refusal Classification** (327).
+- The command's own option surface and rendering is defined by **CLI Space Push / Spaces / Bind Commands** (230).
+- The installation-health report and the MCP health tool that carry the state are defined by **CLI status command** (58) and **MCP server — tool surface** (148).

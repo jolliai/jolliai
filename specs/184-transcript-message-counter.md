@@ -58,13 +58,13 @@ Three output shapes, one per entry point pair:
 
 ### Producer enum
 
-Same closed twelve-value enumeration used throughout the product: `claude`, `codex`, `gemini`, `opencode`, `cursor`, `cursor-cli`, `copilot`, `copilot-chat`, `cline`, `cline-cli`, `devin`, `antigravity` — display strings **Claude Code, Codex, OpenCode, Gemini, Cursor, Cursor CLI, Copilot CLI, Copilot Chat, Cline (VS Code), Cline CLI, Devin, Antigravity**. The counter dispatches on this enum and falls back to Claude Code when the field is absent on a locator.
+The same closed enumeration used throughout the product: `claude`, `codex`, `gemini`, `opencode`, `cursor`, `cursor-cli`, `copilot`, `copilot-chat`, `cline`, `cline-cli`, `devin`, `antigravity`, `kimi`. The counter dispatches on this enum and falls back to Claude Code when the field is absent on a locator.
 
 ### Per-source dispatch contracts
 
 The counter's per-source dispatch differs between **full-transcript mode** and **unread-slice mode**, because the two upstream readers expose different surfaces.
 
-**Full-transcript mode** (used by the count operation and the full-merged operation): the per-source dispatch hands the locator's transcript handle to a per-source loader, which returns the full parsed-entry array. Nine producers own dedicated single-artifact readers (Gemini JSON document; OpenCode / Cursor / Copilot CLI / Devin SQLite databases; Cline (VS Code) and Cline CLI plain-JSON files; Cursor CLI plaintext JSONL; Antigravity whole-file transcript). The remaining three (Claude Code, Codex, Copilot Chat) share a line-streamed JSONL loader that selects the per-producer parser by enum value.
+**Full-transcript mode** (used by the count operation and the full-merged operation): the per-source dispatch hands the locator's transcript handle to a per-source loader, which returns the full parsed-entry array. These producers own dedicated single-artifact readers, dispatched before the line-streamed table is consulted: Gemini (JSON document); OpenCode, Cursor, Copilot CLI and Devin (SQLite databases); Cline (VS Code) and Cline CLI (plain-JSON files); Cursor CLI (plaintext JSONL); Antigravity (whole-file transcript). The remaining producers — Claude Code, Codex, Copilot Chat and Kimi Code CLI — share a line-streamed JSONL loader that selects the per-producer parser by enum value.
 
 **Unread-slice mode** (used by the unread-merged operation and the raw-unread operation): the per-source dispatch is a per-source switch that calls each producer's dedicated reader with the saved cursor. Specifically:
 
@@ -76,6 +76,7 @@ The counter's per-source dispatch differs between **full-transcript mode** and *
 | Copilot CLI    | SQLite reader called with the cursor.                                                                            |
 | Copilot Chat   | JSONL reader called with **`cursor ?? undefined`**, normalizing a missing cursor to the undefined sentinel.      |
 | Codex          | Generic JSONL reader called with the Codex line-parser strategy.                                                 |
+| Kimi Code CLI  | Generic JSONL reader called with the Kimi line-parser strategy — an explicit arm, unlike Claude Code, which is served by the default arm below. |
 | Devin          | SQLite reader called with the cursor.                                                                            |
 | Cursor CLI     | Plaintext-JSONL reader called with the cursor.                                                                   |
 | Cline (VS Code) | Plain-JSON reader called with the cursor.                                                                       |
@@ -146,7 +147,7 @@ The raw-unread operation deliberately swallows reader errors. This is the only e
 Each full-mode loader takes `(transcript handle)` and returns a parsed-entry array. Per-source behavior the counter relies on:
 
 - **Gemini / OpenCode / Cursor / Copilot CLI** — wrapped in a try/catch inside the loader; ENOENT is silent, every other error warn-logs and returns `[]`. The loader **never throws**.
-- **Claude Code / Codex / Copilot Chat** — line-streamed JSONL; per-line parse failures are silently skipped (with a single end-of-stream debug log carrying the skipped count); stream-level failures are caught with ENOENT silent and others warn-logged, then `[]` is returned. Again, the loader **never throws**.
+- **Claude Code / Codex / Copilot Chat / Kimi Code CLI** — line-streamed JSONL; per-line parse failures are silently skipped (with a single end-of-stream debug log carrying the skipped count); stream-level failures are caught with ENOENT silent and others warn-logged, then `[]` is returned. Again, the loader **never throws**.
 
 The counter never wraps the full-mode loader in its own try/catch because the loader's own failure-isolation contract makes it impossible for the loader to throw. (See Notable Behavior for the consequence if that contract is ever violated.)
 
@@ -212,7 +213,7 @@ No call to the counter ever writes to disk, ever invokes an LLM, or ever takes a
 
 ## Shared Behavior
 
-- The per-producer parser rules — including Claude Code's compaction-summary skip, tool-use-block discard, IDE-tag stripping, and skill-injection prefix filter, plus Codex's `event_msg` filtering, plus the Gemini / OpenCode / Cursor / Copilot CLI / Copilot Chat producer-specific decoding — are owned by the per-producer discovery / reader specs and the canonical parser strategy. This counter consumes the resulting "visible entries" array as a black box.
+- The per-producer parser rules — including Claude Code's compaction-summary skip, tool-use-block discard, IDE-tag stripping, and skill-injection prefix filter, plus Codex's `event_msg` filtering, plus Kimi Code CLI's wire-event decoding (prompt-turn events become human entries, text content parts become assistant entries, reasoning parts and every other event family produce nothing), plus the Gemini / OpenCode / Cursor / Copilot CLI / Copilot Chat producer-specific decoding — are owned by the per-producer discovery / reader specs and the canonical parser strategy. This counter consumes the resulting "visible entries" array as a black box.
 - The conversation overlay store, including the identity-matching rules `(role, content, timestamp?)`, the delete-wins-over-edit precedence, the dedupe-on-save rules, the prune-on-consume sweep, and the on-disk format, is defined by the conversation overlay spec (cross-ref 183). This counter consumes the load and apply operations only.
 - The cursor file / cursor registry is owned by the cursor / summary pipeline specs; the counter consumes only the "load cursor for this transcript handle" lookup.
 - The active-session aggregator (cross-ref 155) consumes both the merged-unread and merged-full operations to populate row fields (message-count, title-cascade fallback). The aggregator's empty-row drop, its overlay-edited flag, and its sort are all owned by that spec; this spec covers only what the aggregator receives.

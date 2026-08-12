@@ -16,7 +16,8 @@ The per-user state directory at `~/.jolli/jollimemory/` keeps a small registry o
 - The optional required-entry-file argument that gates candidate eligibility in the dispatch resolver.
 - The soft source-preference environment override the dispatch resolver consults ahead of the fixed preference order.
 - The write-time "keep the existing entry" gate, its ten-file completeness definition, and the fact that it turns on completeness alone — never on a version comparison.
-- The machine-global lock every registry writer is required to hold.
+- The **optional explicit distribution directory** a writer may be handed instead of inferring its own location, why it exists, and where it is validated.
+- The machine-global lock every registry writer is required to hold, **and the one documented writer that does not hold it**.
 - The missing-distribution filter: entries whose recorded directory no longer exists are skipped at selection time, and are additionally pruned (deleted from the registry) by any source's install/enable run.
 - The legacy single-file format at `~/.jolli/jollimemory/dist-path` and the one-time migration that converts it to the per-source layout, including the source-tag recovery rule when the legacy file does not name a recognizable source.
 - What happens when the registry yields no winner (a non-zero exit and a stderr diagnostic from the resolver script; consumers that expect a zero-status path receive nothing).
@@ -185,7 +186,7 @@ The motivation is not dispatch selection, which already tolerates ghosts. A ghos
 A source registering itself does **not** unconditionally overwrite its own entry. The write applies a third, stricter notion of completeness and can deliberately decline to record what the caller asked for:
 
 1. The source tag is validated first (lowercase alphanumerics and hyphens, starting with an alphanumeric). An invalid tag is refused outright and nothing is written.
-2. The candidate content is assembled: the caller's version (defaulting to the placeholder `dev` when the build carries no version) on the first line, the caller's distribution directory on the second.
+2. The candidate content is assembled: the caller's version (defaulting to the placeholder `dev` when the build carries no version) on the first line, and the distribution directory on the second — **either the one the caller supplied explicitly, or, when none was supplied, the directory of the bundle that is executing the write** (see below).
 3. If no entry exists for that source tag yet, the candidate is written.
 4. Otherwise the existing entry is read and classified as **complete** or not. An entry is complete when it has both lines *and* its recorded directory holds the full runtime entry set (see below).
 5. **Keep gate.** If the existing entry is complete AND the candidate's own directory is *not* complete, the existing entry is left untouched and the write reports success. Completeness is the gate's only input: the two recorded versions are never compared, so a candidate that is itself complete always wins the slot regardless of whether it is newer, older, or identical in version.
@@ -203,6 +204,18 @@ A filesystem failure at the write step is a warning and a failure return, not a 
 - Because the gate ignores versions, an entry's recorded version is **descriptive, not a claim to the slot**. It still decides cross-source selection at dispatch time; it has no bearing on which distribution a source records for itself.
 - Because a same-content write is skipped entirely, a repeated install is not merely idempotent in outcome — it performs no filesystem write at all.
 
+### The recorded directory: inferred by default, injectable by request
+
+By default the writer records **the directory of the bundle that is executing it**. That is correct exactly when the process running the install *is* the distribution being registered — true for the standalone command-line invocation and for the editor extension's in-process call.
+
+It is **not** true for a long-lived server installing on another distribution's behalf. The JVM IDE surface's server is launched preferentially from its own installation tree inside the IDE, which is version-scoped: it disappears on a plugin uninstall and moves on an IDE major upgrade. The distribution that surface actually wants registered is the stable per-user copy it extracts. Getting this wrong is invisible — the shared hook dispatcher exits silently by design so it never blocks source control, so the symptom is capture quietly stopping rather than an error.
+
+The writer therefore accepts an explicit distribution directory, and the surface that needs it sets it centrally so neither of its call sites can forget. Two other pieces of the same call accept an explicit override for related reasons: the recorded version, and the registry root itself (used by the package-manager refresh and by scoped operations).
+
+The receiving end of the cross-process request **validates the injected directory rather than passing it through**: it must be absolute and it must exist, both rejected loudly. A relative path would resolve against whatever working directory a hook happened to run in, and a non-existent one would register a dead entry that fails silently on the blocking source-control path. This is the same reasoning that re-validates the source tag at its own write boundary.
+
+The legacy single-file migration also supplies both an explicit directory and an explicit version — the ones recovered from the legacy file — rather than inferring either.
+
 ### The machine-global registry lock
 
 Every writer of this registry — the install/enable path on any surface, and the package-manager post-install refresh — is required to perform its registry work while holding a single machine-global lock kept alongside the registry in the per-user state directory. The lock covers the whole cluster of work that must be consistent together: rewriting the dispatch scripts, running the legacy migration, writing the caller's own entry, and pruning missing entries.
@@ -212,6 +225,24 @@ The lock is **strict**: a caller that cannot acquire it within its wait budget d
 The read-modify-write inside the entry writer itself carries no internal lock — it relies entirely on its callers holding the machine-global lock. A future writer that skips the lock would reintroduce a lost-update window between reading the existing entry and writing the replacement.
 
 Individual entry writes are atomic: content is written to a sibling temporary file and renamed into place, with a direct-overwrite fallback on platforms where the rename is refused. A crash mid-write therefore cannot leave a torn half-entry that readers would reject.
+
+### The one writer that holds no lock and applies no keep-existing gate
+
+A second writer exists and it is **not** the writer described above. The repository's own IDE-sandbox launcher — a developer-facing script run by hand to rebuild the product and start a sandboxed IDE — writes registry entries directly, with its own two-line writer.
+
+What it does, on **every** launch:
+
+- Writes **two** entries: the standalone-command-line tag pointed at this checkout's freshly built distribution, and the JVM-IDE tag pointed at the per-user copy it has just synchronised. Both carry the version read from the checkout's own package metadata.
+- **Takes no machine-global lock.** The reasoning recorded in place is that this is a developer-only, interactively-invoked entry point that never fires from hooks, continuous integration, package-manager post-install, or any autonomous flow — and that its write is a **pure overwrite** rather than a read-modify-write, so the only surviving race is last-writer-wins between two developer-initiated writes.
+- **Bypasses the keep-existing gate entirely.** It reads no existing entry and makes no keep-or-overwrite decision: the stated contract is that the current checkout's build is the source of truth for this launch, always.
+- **Does not snapshot or restore anything on exit**, and registers no exit handler at all.
+- Still writes each entry atomically, temporary-file-then-rename, with a dot-prefixed temporary name so a crash between write and rename leaves a hidden file the shell resolver's expansion skips. It falls back to a direct overwrite on the permission errors that platform can raise.
+
+It does apply a completeness check, but not *this* registry's: it carries a **hand-mirrored copy** of the ten-entry runtime set and asserts both candidate directories against it, aborting the whole launch when either is short. The copy is documented in place as manually kept in step, so a growth of the canonical list that is not mirrored lets this script certify a distribution the sanctioned writer would refuse.
+
+**The scope of the effect is machine-global and permanent, and that is deliberate rather than an oversight.** The registry is one shared per-user directory that every hook fire, every dispatched invocation, and every server launch on the machine resolves through. After one sandbox launch, an existing standalone-command-line registration is destroyed in place and **every repository on the machine dispatches through this checkout's build** — because the two would otherwise tie at equal versions and the fixed preference order hands the tie to the standalone tag. The only mitigation is a log line naming what the entry pointed at before the overwrite. Recovery is manual: re-install the standalone package from its own checkout, or let some other writer register a higher version.
+
+The reasoning is recorded in place, including the instruction not to restore, not to lock, and not to narrow the write to the IDE tag alone — and the acknowledgement that a future non-interactive caller would invalidate the whole analysis.
 
 ### One-time migration from legacy single-file format
 
@@ -265,6 +296,18 @@ The legacy single-file format transitions through:
 
 ## Notable Behavior
 
+### "Every writer holds the lock" is no longer universal
+
+The requirement that every registry writer hold the machine-global lock, and that every write pass the keep-existing completeness gate, holds for the sanctioned writer and every path that reaches it. It does **not** hold for the repository's IDE-sandbox launcher, which writes two entries directly on every launch with no lock, no keep-existing gate, and no restore.
+
+Three things about that exception are worth stating plainly, because the reasoning recorded beside it is framed in terms of the sandbox:
+
+- **The write is machine-global, not sandbox-scoped.** There is one registry per user; there is no sandboxed copy of it. The launcher's effect is on every repository on the machine, not on the sandboxed IDE.
+- **It is permanent.** Nothing reverts it when the sandbox exits, by explicit design, so the machine keeps dispatching through a developer checkout indefinitely.
+- **Overwriting the standalone-command-line slot is the point, not a side effect.** The launcher writes that slot precisely because it would otherwise lose the equal-version tie-break to an installed standalone package.
+
+The lock's absence is defended on the grounds that the write makes no decision, so the residual race is only "which value lands last" between two developer-initiated writes; the keep-existing gate's absence is defended on the grounds that the current build must always win. Both defences are about *this* writer's own correctness, and neither weakens the requirement on any other writer.
+
 ### Per-source independence
 
 Each source is responsible for its own entry and only its own entry. There is no central index, no atomic multi-source update, and no coordination protocol between sources. A new source is added simply by writing its file. A source upgrade just rewrites that one file. The registry's correctness rests on the per-dispatch enumeration, not on cross-source bookkeeping.
@@ -305,6 +348,10 @@ Each entry is two lines of plain text. A user investigating dispatch issues can 
 
 The same version-comparison rule used to pick the winning registry entry is also reused outside the dispatch path: the plugin update-check layer compares the running CLI version (and each installed plugin's installed version) against the npm-registry `latest` using the same comparison, so that placeholder versions (`dev`, `unknown`, empty), plain numeric versions, and prerelease/build-metadata versions are ordered consistently across both surfaces. See **Plugin Update Check** for that consumer. Because that consumer, like every other, only tests the comparison against zero, the raw-difference result described above is never observable there either.
 
+### The recorded directory is no longer necessarily the writer's own location
+
+The default — record the directory of the bundle performing the write — is an inference, and it is right only while the process running the install *is* the distribution being registered. A long-lived server installing on another distribution's behalf breaks that, so the directory is injectable, and the surface that needs it injects it at a single choke point rather than at each call site. The failure the injection prevents is invisible by construction: the shared hook dispatcher exits silently so it never blocks source control, so a registry entry pointing at a directory the IDE has since discarded presents as capture quietly stopping, not as an error. The injected value is validated for absoluteness and existence at the process boundary rather than trusted.
+
 ### Tie-break preference among sources at the same version
 
 When two or more available entries are tied at the highest version, a fixed source-preference order decides: the standalone CLI (`cli`) wins first, then the canonical VS Code source (`vscode`), then `cursor`. The bundled product core is byte-for-byte identical at equal versions, so the tie-break only makes the winner deterministic; it does not change which behaviors are available. The standalone-CLI tag (`cli`) is the preferred winner whenever it is present and tied at the top, which gives the canonical CLI build precedence over any IDE-embedded copy of the same version.
@@ -327,6 +374,7 @@ Sources absent from the order are not second-class in general — they still win
 - **Npm postinstall dist-path refresh** — one of the triggers that writes a per-source entry (specifically the `cli` entry); covered by its own topic.
 - **First-time enable flow** — another trigger that initializes the registry and writes the dispatch scripts.
 - **IDE extension activation** — for each IDE source, the activation path writes that source's per-source entry on every activation, refreshing both the version and the recorded distribution directory.
-- **Lock primitive registry** — the machine-global lock that every registry writer must hold is one of the product's declared locks; its location, wait budget, and strict-failure semantics are catalogued there.
+- **Lock primitive registry** — the machine-global lock that every registry writer must hold is one of the product's declared locks; its location, wait budget, and strict-failure semantics are catalogued there, along with the record that this registry has one sanctioned unlocked writer.
+- **The repository's IDE-sandbox launcher** — a developer-facing script, not a shipped surface, and the only writer of this registry that holds no lock, applies no keep-existing gate, and restores nothing. Its effect is machine-global and permanent; its full behaviour is described above rather than in a topic of its own, because nothing else consumes it.
 - **Doctor and uninstall commands** — operations that may inspect, repair, or remove registry entries.
 - **Plugin Update Check** — independently reuses this spec's version-comparison helper to decide whether the running CLI or an installed plugin trails the npm registry's `latest`.

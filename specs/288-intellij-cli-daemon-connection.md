@@ -65,7 +65,7 @@ Two, on different paths, and only one of them is inert:
 - **`JOLLI_IDE_BRIDGE_SERVE=1`, on the long-lived server spawn only.** Set purely so the process is identifiable in a process listing. **Nothing reads it** — *this one* is a diagnostic marker, not a behavioral switch.
 - **A correlation identifier, on the one-shot spawn only** (and only when the host is inside an operation scope, so the value is non-blank). Unlike the marker, **this one is read by the child**: the command-line entry point adopts it at startup, which is how a one-shot call gets the same cross-log correlation the long-lived path gets from the request line's `traceId` field. The long-lived server spawn does not receive it — it could not usefully, since one server serves many operations and the identifier is per call.
 
-The other two one-shot spawns this component makes (AI generation and Memory Bank migration) receive neither.
+The other one-shot spawn this component makes — AI generation — receives neither. Memory Bank migration is no longer a spawn of its own: it is an ordinary bridge action and therefore takes whichever transport the routing below picks.
 
 ### Version stamp dependency
 
@@ -87,7 +87,7 @@ For every bridge call, in order:
 
 Spawn the command-line entry in its one-shot bridge form with the action name and the working directory, redirecting output to a temporary file and discarding the error stream. Write the request body to the child's input and close it. Wait for the budget, force-terminating on expiry. Parse the **last non-blank line** of the captured output; map an `error` object to the business-error exception; treat a non-zero exit with no error envelope as a generic failure; otherwise return the result (or a JSON null when the response carried none).
 
-**The capture file is created owner-read/write-only on POSIX hosts**, not with the platform default. It has to be: a whole-callback authentication response travels through this file and carries a bearer token and a platform key, and the default creation path leaves the file world-readable for the life of the call on hosts with a shared temporary directory. On a non-POSIX filesystem, where the permission request is unsupported, it falls back to the default creation path — the per-user temporary directory there already restricts access at the access-control-list layer. The same helper is used for the AI-generation and Memory Bank migration capture files, which carry no credentials but can carry private summary and transcript content.
+**The capture file is created owner-read/write-only on POSIX hosts**, not with the platform default. It has to be: a whole-callback authentication response travels through this file and carries a bearer token and a platform key, and the default creation path leaves the file world-readable for the life of the call on hosts with a shared temporary directory. On a non-POSIX filesystem, where the permission request is unsupported, it falls back to the default creation path — the per-user temporary directory there already restricts access at the access-control-list layer. The same helper is used for the AI-generation capture file, which carries no credentials but can carry private summary and transcript content.
 
 ### Project matching
 
@@ -100,7 +100,7 @@ A candidate matches on canonical equality **or on prefix containment in either d
 
 ### Global-scope calls
 
-Some actions have no project of their own: Memory Bank path and identity resolution, repository discovery, Memory Bank metadata operations, and summary-tree analysis. These send **the first non-disposed open project's canonical base path**, falling back to the process working directory when no project is open. So an arbitrary open project's server serves them, and the real target travels in the request body rather than in the working directory. Metadata calls do this deliberately, precisely so the connection fast path can match.
+Some actions have no project of their own, and the set is broader than it looks: Memory Bank path and identity resolution, Memory Bank metadata operations, repository discovery, mirror-folder repair, summary-tree analysis, **every configuration and session-state read**, and **authentication and platform-API calls**. These send **the first non-disposed open project's canonical base path**, falling back to the process working directory when no project is open. So an arbitrary open project's server serves them, and the real target travels in the request body rather than in the working directory. That default is chosen deliberately, precisely so the connection fast path can match instead of falling through to a spawn.
 
 ### Spawn and handshake gate
 
@@ -126,7 +126,7 @@ On process death: log it, snapshot and clear only that connection's map, fail ea
 The connection's reader thread reads one line at a time, skipping blanks, and routes:
 
 - **No `id`, or an `id` of JSON null → treated as a notification** and routed by `method`: the handshake completes the handshake gate if it is not already done; a refresh is handed to the refresh channel (spec 289); anything else is logged as an unaddressed line and dropped.
-- **`id` present but not numeric → logged and dropped.** The server accepts string ids on the wire; this client cannot consume them. In practice it only ever sends integers, so this path is defensive.
+- **`id` present but not readable as a number → logged and dropped.** The server accepts string ids on the wire; this client can only consume ones that parse numerically (a numeric string does parse, so it is the *shape* rather than the JSON type that decides). In practice it only ever sends integers, so this path is defensive.
 - **`id` numeric →** the matching outstanding call is completed. An id with no outstanding call is logged at info — late responses are tolerated, not treated as an error.
 
 The error stream is drained on its own thread, each line truncated to 500 characters and logged at info.
@@ -134,7 +134,7 @@ The error stream is drained on its own thread, each line truncated to 500 charac
 ### Two grounded dead-letter cases
 
 1. **The server's malformed-line error envelope never reaches any caller.** That envelope carries `id: null` and no `method` (spec 287), so it lands in the notification branch, matches no method, and is logged-and-dropped as unaddressed. **The caller that sent the malformed line then blocks for the full per-call budget** — up to five minutes — before failing with a timeout, even though the server answered immediately. And because a timeout is one of the two non-fallback exception classes, that call is never retried as a spawn either.
-2. **A string-id response is dropped the same way.** The two ends disagree about the id type the wire permits; the disagreement is invisible today only because the client never emits a string id.
+2. **A response whose id cannot be read as a number is dropped the same way.** The two ends disagree about the id type the wire permits; the disagreement is invisible today only because the client never emits anything but an integer.
 
 ### Shutdown
 
@@ -192,7 +192,7 @@ resolve connection
 - **In-flight scoping is per connection, deliberately.** Without it, a predecessor whose process dies after a successor is already serving would fail the successor's calls. With it, a dying connection's blast radius is exactly its own outstanding work.
 - **Shutdown closes input and waits rather than killing.** This is what lets a server flush computed responses; it also means disposal costs up to two seconds per connection.
 - **A malformed request line costs the caller the full budget for nothing.** The server answers immediately, the answer is unroutable, and the caller waits out five minutes and then cannot retry. This is the sharpest edge of the id-null notification rule.
-- **The direct memory-mirror read path adds calls here; it removes none.** Locating that mirror costs four calls — repository name, remote URL, configuration record, and the claiming root resolution — each dispatched against an arbitrary open project's canonical base path with the real target carried in the request body, once per project session and again on every settings save that re-points it (specs 124, 135, 307). The single-memory, plan-body, and note-body reads it then answers locally never crossed this connection in the first place — their fallback is a blob read from the canonical ref through the plugin's own git subprocess wrapper (spec 126), not a bridge round-trip. So a reader should not expect the mirror to reduce traffic on this connection.
+- **Locating the memory-mirror folder costs four global-scope calls per project session** — repository name, remote location, configuration record, and the claiming root resolution — each dispatched against an arbitrary open project's canonical base path with the real target in the request body (spec 124). Nothing offsets them: **no read source is mounted against that folder**, so every memory, plan and note read crosses this connection too. (Corrected: this spec previously described those four calls as the setup cost of a local read path that answered later reads without a round trip. That read path was deleted; only its setup cost remains.)
 - **The handshake check is a hard string equality with no negotiation.** A protocol change on either side is a clean, immediate, loud failure rather than a subtly degraded session — at the cost of every call falling back to one-shot spawns until the two sides match again.
 
 ## Shared Behavior

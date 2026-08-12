@@ -144,7 +144,7 @@ The product is built on a hook pipeline that runs in the user's project, not in 
 
 2. **Git hooks** drive a unified queue under `.jolli/jollimemory/git-op-queue/`. `post-commit` enqueues + spawns a detached `QueueWorker` in <5 ms; when the commit comes from an interactive context (a TTY or an AI-agent session — `CLAUDECODE`/`AI_AGENT`/`CURSOR_TRACE_ID`/`GEMINI_CLI`/`OPENCODE`), it then tails the worker's `capture-progress/<hash>.ndjson` stream and prints milestones inline, blocking until the worker emits a terminal event, the watch times out (15 s agent ceiling / 90 s TTY), or the worker is detected dead via its per-hash PID lock (`capture-progress/<sha256>.lock`, written by `acquireCaptureLock` in the worker, probed by `isCaptureWorkerDead` in the watcher). GUI git clients set none of these markers and keep the original fast, silent, non-blocking behavior. The worker holds a 5-min file lock, drains entries in timestamp order, runs the LLM where needed, and chain-spawns a successor if new entries appear after it finishes. Squash entries (and rebase-squash) now go through the LLM-driven `generateSquashConsolidation` pipeline (`cli/src/hooks/QueueWorker.ts runSquashPipeline`) — the old "skip LLM, mechanical merge only" behavior is now the **fallback** when the consolidation call fails. Rebase-pick entries skip the LLM and just migrate hashes 1:1. `prepare-commit-msg` writes `squash-pending.json` so the worker recognizes squash before picking a consolidation strategy. See [`cli/DEVELOPMENT.md`](cli/DEVELOPMENT.md) for the queue rationale (each op gets its own file precisely because the previous single-slot pending files lost summaries during rapid amend/rebase sequences).
 
-### Push channel: one watch list, two hosts, five kinds
+### Push channel: one watch list, two hosts, a growing set of kinds
 
 JVM hosts have no in-process way to notice a write, so the CLI pushes `refresh`
 notifications at them. [`computeWatchTargets`](cli/src/daemon/DaemonServer.ts) is
@@ -156,9 +156,12 @@ as the plugin-wide listener registry, fed by `injectRefresh`). Both build their
 payload with `buildRefreshParams`, so a host receives the identical line
 whichever is running. Add a target in one place; never inline a second list.
 
-Three things about the five kinds are easy to get wrong:
+Read the kinds off `RefreshKind` rather than off a count here — the set has grown
+(`memory-db` is the most recent), and one declared kind (`memory-bank`) still has
+no watch target and is never emitted, so "declared" and "produced" are different
+lists. Three things about them are easy to get wrong:
 
-- **`queue` / `orphan-ref` / `memory-bank` are commit-time; `working-context` /
+- **`queue` / `orphan-ref` / `memory-db` / `memory-bank` are commit-time; `working-context` /
   `claude-plans` are mid-session.** Only the first group can change installation
   state, and only that group should reach IntelliJ's `refreshStatus()` — a
   `@Synchronized` method wrapping a whole `ide-bridge status` round-trip that

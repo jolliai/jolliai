@@ -1,9 +1,9 @@
 {
   "branches": {
     "main": {
-      "revision": "542c8804aed8acb9dafbab292d2ceaa6306ed965",
-      "subject": "telemetry: thread injected env into env resolution and mirror sandbox tag to Kotlin",
-      "reviewedAt": "2026-08-04T07:17:29Z",
+      "revision": "f184549fc5229e4e562591ea00b2c5494e105ec9",
+      "subject": "Fix Kimi review round 2: context7, cursor scoping, sessionKey, ENAMETOOLONG",
+      "reviewedAt": "2026-08-12T03:10:19Z",
       "actor": "doug.schroeder",
       "skill": "specs-update"
     }

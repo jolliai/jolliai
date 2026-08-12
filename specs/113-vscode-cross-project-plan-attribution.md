@@ -1,132 +1,164 @@
-# VS Code Cross-Project Plan Attribution
+# 113. Cross-Project Attribution of a Newly-Appeared Plan File
 
 ## Topic Statement
 
-The watcher-driven gate that decides whether a newly-appearing plan markdown file in the global Claude Code plans directory belongs to the current workspace, by checking that the plan file's absolute path appears as a JSON-escaped substring in at least one of the workspace's recent agent transcripts before the plan is registered into this workspace's plan registry.
+The transcript-affinity predicate that decides whether a plan markdown file appearing in the machine-global agent plan directory belongs to *this* project, so that a plan an agent wrote for one project is not registered into every other project open on the machine — together with the two host routes that feed it and the guards each route runs before it.
 
 ## Scope
 
 **In scope:**
-- The trigger: the OS-level file-create event for any `*.md` file appearing in the global Claude Code plans directory (`~/.claude/plans/`), delivered to every editor window with a workspace open.
-- The attribution check: search the current workspace's recent agent transcripts for the plan path, in the JSON-escaped form Claude Code records under `"file_path"` in tool-use entries.
-- The two-way outcome: register-into-this-workspace or silently ignore (sibling-window's plan).
-- Why it matters: the plans directory is global across all editor windows; without the check, every plan would appear in every workspace.
-- Post-registration change tracking: once a plan is registered, subsequent change events on the same file only refresh the per-workspace registry view; the registration step is a no-op for already-registered plans.
-- Serialization: file-create bursts must not interleave registry reads/writes, so the registration calls are queued behind one another per editor window.
-- The auxiliary path: a plan can also be registered from outside the watcher (e.g. by the agent's stop-hook scanning transcripts at turn end) — the watcher path is only one of two routes and must agree with that path's attribution semantics.
 
-**Out of scope:**
-- The plan markdown's own format / content. This spec is purely about which workspace claims a plan, not what is inside it.
-- The agent stop-hook's incremental transcript scan that writes the registry from the CLI side. This spec only covers the watcher-driven registration that runs in the editor.
-- Archive guards (the snapshot-on-commit hash that hides committed plans whose source file is unchanged). Covered in the plan-and-note archive guards spec.
-- The sidebar's render rules that decide which registered plans actually display (archive guards, missing source files). Covered in the plan-and-note archive guards spec.
-- Note attribution. Notes are not discovered from the global plans directory.
-- The note editor flow that creates new note files inside the workspace.
+- Why the question exists: the agent's plan directory is one machine-global directory, and every open project observes every write to it.
+- The affinity predicate itself: its inputs, its escaping rule, its short-circuit, and its failure tolerance.
+- The two host routes that reach it — one host calling it in process, the other reaching the whole decide-and-register chain through a single command-line operation — and the one behavioural asymmetry between them.
+- The filters that run **before** the predicate on the command-line route, in order, and why their order is load-bearing.
+- The two-part disable gate on registration, and the specific reader it must use.
+- What registration writes, and what it deliberately refuses to overwrite.
+- Serialization of a burst on both routes.
+- The change-notification payload that carries filenames rather than identifiers, and why.
+
+**Out of scope (boundaries):**
+
+- The full command-line-owned working-area service and its whole operation set (spec 337). This spec covers the attribution decision and the registration it gates.
+- Discovery of plans by scanning an agent transcript at the end of a turn (spec 29) — the other, independent writer of the same rows.
+- The visibility gates that decide whether a registered plan is listed, and the archive guard (spec 114).
+- The change-notification channel's own framing, debouncing and escalation rules.
+- The session registry whose entries name the transcripts this predicate reads.
+- Note attribution — notes are never discovered from the agent plan directory.
 
 ## Data Contracts
 
-### Trigger
+### Why attribution is needed at all
 
-A file-system watcher subscribed to `~/.claude/plans/*.md` fires its create callback for each `*.md` file that appears under that directory after the watcher was started. The OS delivers this event to every subscriber — meaning every editor window with the watcher attached — exactly once per file.
+The agent writes its plan-mode markdown into **one directory under the user's home**, shared by every project on the machine. Any mechanism that watches that directory therefore observes plans belonging to every project, including ones whose repositories the observer has never seen. Without a per-project decision, one agent's plan would land in every open project's working-area registry at once.
 
-The watcher does NOT receive create events for files that were already in the directory when it started. Historical plans are therefore invisible to this code path; they only enter a registry through the agent stop-hook's transcript scan.
-
-### Attribution check input
+### The affinity predicate
 
 | Input | Source |
 | --- | --- |
-| Plan absolute path | The created file's full path (under the global plans directory). |
-| Current workspace's recent transcripts | The list of agent sessions known to belong to this workspace, looked up from this workspace's per-repo session registry. |
+| The plan file's absolute path | The name the operating system reported, joined onto the agent plan directory. |
+| This project's known agent sessions | This project's own session registry. |
 
-### Attribution rule
+The plan is attributed to this project **if and only if** its absolute path appears as a substring of at least one of this project's session transcripts, in the form the agent writes such paths into its transcripts.
 
-The plan is attributed to this workspace if and only if the plan's absolute path appears as a JSON-escaped substring in at least one of the workspace's recent transcript files.
+Escaping rule: the needle is the absolute path with every backslash doubled. Forward-slash paths are therefore searched verbatim; Windows paths are searched in the doubled form the agent's JSON-escaped transcript records. No other normalization is applied — no drive-letter casing fold, no universal-naming-convention handling.
 
-JSON escaping rules used for the substring search:
+Failure and edge behaviour:
 
-- POSIX paths (forward-slash `/`) are searched verbatim — JSON does not require slashes to be escaped.
-- Windows paths (backslash `\`) are searched with each backslash doubled (`\` → `\\`). This matches how the agent records `"file_path":"<absPath>"` entries in its JSON-Lines transcripts.
-
-The substring search is plain text — no parsing of the JSON-Lines lines, no key-aware lookup. A substring match anywhere in the file (even inside an unrelated value) counts. This is intentional: the agent's transcript writer is the single source of truth that emits these absolute paths; false positives would require user-typed prose that happens to contain the absolute plan path verbatim.
-
-### Two-way outcome
-
-| Outcome | Side effect |
+| Case | Outcome |
 | --- | --- |
-| Match found in any transcript | Register the plan into this workspace's plan registry as a fresh uncommitted entry (if not already present). |
-| No match in any transcript | No-op. The plan belongs to a sibling editor window's workspace. |
-| Workspace has no recent transcripts at all | Treat as no match → ignore. |
-| Any individual transcript is unreadable (rotated, permission denied) | Skip that transcript and continue. The check still succeeds if any other transcript matches. |
+| The project has no known sessions | Not attributed. The predicate returns before reading anything. |
+| A transcript is missing or unreadable | That transcript is skipped; the scan continues. |
+| Any transcript matches | Attributed; the scan short-circuits. |
+| No transcript matches | Not attributed. |
 
-### Registration outcome (when match is found)
+The search is plain text over the raw transcript bytes — the transcript's own line structure is never parsed, and a match anywhere in the file counts, including inside an unrelated value. This is deliberate: the agent's own transcript writer is the only thing that emits these absolute paths, and a false positive would need user-typed prose containing the absolute plan path verbatim.
 
-The registration step writes a registry entry keyed by the plan's slug (its filename without `.md`). The entry shape (relevant fields):
+### The registration a positive answer gates
 
-| Field | Value at registration time |
-| --- | --- |
-| slug | filename without `.md` |
-| title | extracted from the plan markdown's first `#` heading, falling back to the filename |
-| sourcePath | absolute path to the plan file in the global plans directory |
-| addedAt | now (ISO 8601), or preserved from any previous entry |
-| updatedAt | now |
-| commitHash | null (uncommitted) |
+Registration inserts a **fresh unclaimed row** keyed by the plan's slug — the file's name with its markdown extension removed — carrying the title extracted from the file's first heading (falling back to the file name), the absolute source path, added-at and updated-at set to now, and a null commit hash.
 
-If the slug is already in the workspace's registry, registration is a strict no-op — even if the previous entry was marked ignored. This preserves the user's explicit "I don't want to see this plan" state across re-creates of the same filename.
+It inserts **only if the slug is not already present**. An existing row is left exactly as it is, so a claimed row keeps its commit hash and its archive guard rather than being reset to unclaimed.
 
-### Change tracking after registration
+### The disable gate on registration
 
-The watcher also subscribes to file-change and file-delete events for `*.md` in the global plans directory. Those events trigger a debounced refresh of the panel from the registry; they do not register-or-attribute. Neither this path nor any other writer on this surface keeps a per-plan edit tally — the watcher is purely a "did the registry need re-read" trigger for the panel, and any edit-count value found on a row is purged when the registry is read.
+Registration returns immediately, before touching anything, if **either** of two conditions holds:
+
+1. The in-process disabled mirror is set.
+2. The durable on-disk disable state for this project says disabled.
+
+**Both halves are required.** The in-process mirror is inert inside a long-lived server process, which never goes through the activation that sets it; the durable state is the only signal that survives a process boundary.
+
+The durable check must use the **read-only** probe of that state. The other reader of the same state migrates a profile written before the disable flags were split apart and *persists* the migrated value — performing exactly the write into a disabled project that this gate exists to prevent.
+
+### The notification payload
+
+The change-notification channel carries, for this one event kind, the raw **directory entry names** the operating system reported. Names, not slugs: deriving a slug, skipping non-markdown entries and deciding project affinity are rules, and a host-side restatement of them is the drift the command-line service exists to remove. The host contributes only the one thing it has and the service does not — what the operating system said changed.
+
+The watcher on that directory is gated to markdown entry names. An event the platform reports **with no filename** is dropped rather than forwarded blind, because the gate cannot be honoured for it. The directory is never auto-created: it is not the product's, and it appears the first time the agent writes a plan.
 
 ## Behavior
 
-### Plan file appears in the global plans directory
+### Route one — the host that calls the predicate in process
 
-1. The OS emits a create event to every editor window watching the directory.
-2. Each window enqueues a registration task behind any in-flight registration (so back-to-back creates from a single agent turn cannot interleave registry reads and writes).
-3. When the task runs, it loads the workspace's known agent sessions.
-4. If there are no sessions, the task ends — no registration.
-5. Otherwise it builds the JSON-escaped form of the plan's absolute path.
-6. It reads each transcript file in turn. The first file containing the substring causes the loop to short-circuit with "matched"; unreadable files are skipped silently.
-7. If no file matched, the task ends — no registration.
-8. If matched, the task delegates to the registry-add path: load the registry, look up the slug, and either return immediately (slug already present, including ignored) or write a fresh uncommitted entry for the slug.
+A watcher is subscribed to markdown files in the agent plan directory.
 
-### Plan file changes (not creates) in the global plans directory
+1. On a **create** event: schedule the panel's debounced refresh, and enqueue a registration task.
+2. The task is chained onto a per-window queue, so a burst from one agent turn cannot interleave read-modify-write cycles over the registry.
+3. When the task runs, it drops the name unless it ends in the markdown extension, derives the slug, asks the affinity predicate, and — only on a positive answer — calls registration.
+4. A failure is logged and swallowed; the queue continues.
 
-1. The OS emits a change event.
-2. The watcher debounces this with the same panel-refresh debounce that batches all `~/.claude/plans/`, `<workspace>/.jolli/jollimemory/plans.json`, and `<workspace>/.jolli/jollimemory/notes/*.md` events.
-3. After the debounce, the panel re-reads from the registry. No attribution check runs on change events; only creates are gated.
+On a **change** or **delete** event: only the debounced refresh runs. No attribution, no registration.
 
-### Plan file is deleted from the global plans directory
+The watcher receives no events for files already present when it started, so historical plans never reach this route.
 
-1. The OS emits a delete event.
-2. Same debounced refresh as for change events. The panel re-reads from the registry; whether the entry stays visible depends on the registry's archive-guard logic, not on the deletion event itself.
+### Route two — the host that reaches the chain over the command line
+
+The host forwards the burst of raw entry names it was notified about. The service runs the same three steps in the same order, and the host contributes no rule of its own.
+
+1. **Short-circuit on an empty burst**, before any input/output at all.
+2. Read the registry once, purely as a fast path: collect the set of slugs this project already tracks.
+3. For each name in the burst, in order:
+   - Drop it unless it is a bare directory entry name — no path component — ending in the markdown extension, and unless the remaining stem is non-empty. Anything else is a caller bug or an attempt to escape the directory.
+   - **Drop it if the stem is already tracked.** This check sits deliberately *before* the affinity scan: the scan reads every active transcript in full, transcripts routinely run to tens of megabytes, and the underlying event source cannot distinguish a create from a content edit — so a user iterating on one plan would otherwise re-scan every transcript on every save, in every open project, because the directory is machine-global. Registration would no-op on a tracked slug anyway, so attribution has nothing left to decide.
+   - Drop it if the file does not exist. A delete arrives indistinguishably from a create.
+   - Drop it if the affinity predicate says the plan belongs to another project.
+   - Register it, then add the stem to the in-burst tracked set so a duplicated event name costs no second lock acquisition.
+4. Return the list of names that passed every filter and were handed to registration.
+
+The return value is **accepted, not registered**: registration re-reads under the lock and may find the slug already present, so claiming a write happened would be a guess. The caller re-reads the registry either way.
+
+Registration is serial across the burst rather than concurrent, because each call is a load-modify-save under one lock and concurrent calls would queue on it anyway.
+
+The host refreshes its working-area panels whether or not anything was accepted — a name it correctly ignored does not rule out a concurrent write landing in the same window from the end-of-turn transcript scan.
+
+### The asymmetry between the two routes
+
+One host wires this to **create events only**; the other is fed by a watcher that **cannot tell a create from a content edit**, so an edit to an existing plan file reaches its registration path and does not reach the first host's.
+
+This is invisible for a tracked slug (the fast path drops it) and for a foreign one (attribution says no). It is visible in exactly one case: **a plan the user explicitly removed.** Removal leaves no tombstone, so the slug is untracked again — and the agent's next write to that file passes the tracked check, passes the existence check, passes attribution, and re-registers the plan. The user's removal is undone by an edit they may not have made themselves.
+
+The other host reaches the same end state through the end-of-turn transcript scan, which also re-registers the file; the difference is only *when*. The revival is a consequence of the working-area contract's deliberate absence of tombstones, not of this route.
 
 ## State Transitions
 
-| Registry state for slug | Trigger | New state |
+| Registry state for a slug | Trigger | New state |
 | --- | --- | --- |
-| Not present | Create event + matched transcript | Fresh uncommitted entry (commitHash=null) |
-| Not present | Create event + no transcript match | Not present (no-op) |
-| Present (any state, including ignored) | Create event + matched transcript | Unchanged — registration is a strict no-op |
-| Present (any state) | Create event + no transcript match | Unchanged — no-op |
-| Present (any state) | Change/delete event | Unchanged by attribution; panel re-reads registry |
+| Absent | Event + file exists + attributed | Fresh unclaimed row |
+| Absent | Event + not attributed | Absent |
+| Absent | Event + file already gone | Absent |
+| Absent | Event while the project is disabled (either half of the gate) | Absent |
+| Present, any state | Event + attributed | **Unchanged** — registration refuses to overwrite |
+| Present, any state | Event + not attributed | Unchanged |
+| Present, any state | Change or delete event on the first route | Unchanged; the panel re-reads |
+| Removed by the user, then edited | Event on the second route | Fresh unclaimed row — the plan is revived |
 
 ## Notable Behavior
 
-- **The plans directory is global across all editor windows.** A single physical directory under the user's home is watched by every editor window with the extension enabled. Without the attribution check, every plan an agent writes anywhere on the user's machine would land in every open workspace's panel. (Surprising; reality.)
-- **Substring match, not JSON parsing.** The check reads the transcript file as raw text and uses `String.includes`. The agent transcripts are JSON-Lines, but we never parse them — parsing would be slower and more brittle, and the absolute path is unique enough as a needle that a substring hit is good evidence. (Notable.)
-- **Backslash doubling is the only Windows accommodation.** No drive-letter casing normalization, no UNC handling. The transcript and the watcher both report the same absolute path string the agent's tool-use entry records, so byte-for-byte equality (after backslash doubling) is enough. (Notable.)
-- **Already-present slugs are never re-registered.** Even if the user has explicitly hidden a plan via the panel and the agent re-emits the same filename, the watcher path will not unhide it. The user's intent persists across file re-creates. The only way to bring back an ignored plan is the explicit Add Plan flow inside the panel, which deliberately clears the ignored flag. (Surprising; intentional.)
-- **Two registration routes, one attribution rule.** The agent stop-hook also discovers plans, but it does so by scanning the workspace's transcripts directly — it never sees plans that were not produced by sessions in this workspace. The watcher path emulates that affinity by checking transcripts after the OS event. (Notable.)
-- **Registrations are serialized per editor window.** A single agent turn can produce multiple plan files in close succession; these arrive as multiple create events. To keep registry writes correct, the registration calls are chained on a per-window queue, so each one sees the previous one's changes. (Notable.)
-- **Empty session list silently ignores all events.** A new editor window opened on a repo where no agent has ever run sees zero recent sessions and therefore attributes nothing — including its own future agent runs, until the agent stop-hook writes the first session record. The watcher path catches up after that. (Notable.)
-- **The substring is the absolute path; relative paths in transcripts do not match.** Because the agent records the absolute `file_path` value in tool-use entries, the watcher's needle is the absolute path of the plan file. A transcript that only mentions the plan by relative path (e.g. as part of a user's prompt text) does not count as attribution. (Notable.)
-- **Unreadable transcripts are not errors.** A rotated, deleted, or permission-restricted transcript is skipped during the loop. The check still succeeds if any other transcript matches. (Notable.)
-- **No per-workspace user override exists.** There is no setting to "always claim every plan that appears" or "never claim any plan from the watcher". The attribution rule is the only rule, and it is always on. (Notable.)
+- **The agent's plan directory is machine-global, and every open project sees every write to it.** Without attribution, a plan written for one project would be registered into every project open on the machine. (Surprising; reality.)
+- **The attribution decision is a rule, so it lives in the command-line service and not in either host.** One host imports it in process; the other reaches the entire decide-and-register chain through a single operation and supplies only the filenames the operating system reported. A host-side restatement of "which plans are mine" is exactly the drift the service exists to prevent. (Notable.)
+- **A create and an edit are indistinguishable on the second route, and that revives a removed plan.** The underlying watcher fires on content edits too. Because removal leaves no tombstone, the slug is untracked, and an edit therefore re-registers a plan the user deliberately removed. Verified against the live path: the tracked-slug fast path misses, the file exists, attribution succeeds, and a fresh unclaimed row is written. (Surprising; reality.)
+- **The already-tracked check must stay ahead of the affinity scan.** The scan reads every active transcript in full, and the event source fires on every save. Reordering these two would make each keystroke-driven save re-read tens of megabytes per open project. (Notable.)
+- **The fast path has a known, deliberately unclosed limit.** It only covers slugs *this* project has registered, so every edit to a plan owned by another project does reach the full scan. It is bounded rather than unbounded: the session list prunes stale entries, so a project with no live session returns nothing and the predicate exits before reading anything. (Notable.)
+- **The disable gate is two checks, and the durable one must be the read-only probe.** The in-process mirror is inert inside a long-lived server process, so it alone cannot protect a disabled project. The other reader of the durable state migrates a legacy profile and *persists* the result — using it inside a gate whose whole purpose is "write nothing here" would perform the write it exists to prevent. (Notable.)
+- **The wire carries filenames, never slugs.** Deriving a slug, skipping non-markdown, and deciding affinity are all rules; the host contributes only what it alone has. (Notable.)
+- **A nameless watch event is dropped, not forwarded.** Some platforms omit the filename; the directory gate cannot be honoured without it, so the channel stays silent rather than firing blind. (Notable.)
+- **A path that is not a bare entry name is refused, not joined.** Anything carrying a path component is treated as a caller bug or an escape attempt. (Notable.)
+- **The substring search never parses the transcript.** A match anywhere in the file counts, including inside an unrelated value. The absolute path is the needle precisely because only the agent's own writer emits it. (Notable.)
+- **Backslash doubling is the only platform accommodation.** No drive-letter casing fold, no universal-naming-convention handling — byte equality after doubling is the whole rule. (Notable.)
+- **A relative mention never attributes.** The needle is the absolute path, so a transcript that names the plan only relatively — for instance inside user prose — does not count. (Notable.)
+- **An unreadable transcript is not an error.** A rotated, deleted or permission-restricted transcript is skipped and the scan continues. (Notable.)
+- **A project with no recorded sessions attributes nothing**, including its own future agent runs, until something records the first session. (Notable.)
+- **Registration never overwrites.** An already-present slug is left untouched, so a claimed row keeps its commit hash and archive guard rather than being reset to unclaimed. (Notable.)
+- **The answer is "accepted", not "registered".** Registration re-reads under the lock and may find the slug already there, so the operation reports what it handed on rather than what it wrote. (Notable.)
+- **There is no user override.** No setting says "claim every plan" or "claim none"; the affinity rule is the only rule and it is always on. (Notable.)
 
 ## Shared Behavior
 
-- **Per-repo plan registry.** The watcher writes into the same registry the agent stop-hook writes into and the panel reads from; the file format is shared across CLI, IntelliJ, and VS Code surfaces.
-- **Per-repo session registry.** The list of "recent transcripts for this workspace" is the same list the rest of the product consumes for development-context recall and session-status reporting.
-- **Title extraction.** The first-`#`-heading-or-filename rule used here is the same rule the note service uses for note titles and the panel uses everywhere a markdown file's display title is needed.
-- **Slug = filename minus extension.** The slug used as the registry key is the same slug used for orphan-branch storage paths and the agent's per-plan file naming.
+- The registry this writes into, its atomic-write primitive, and the lock that serializes read-modify-write cycles over it are shared with the end-of-turn transcript scan, the commit-time pipeline and both IDE hosts.
+- The session registry naming this project's transcripts is the same list the rest of the product consumes for development-context recall and session-status reporting.
+- The first-heading-else-filename title extraction is the same rule used everywhere a markdown file needs a display title.
+- The slug is the file name minus its markdown extension, the same slug used for the archived key in summary storage.
+- The end-of-turn transcript scan (spec 29) registers the same rows by a different mechanism and is the fallback whenever this path declines or fails; it is no longer the only mid-session writer, precisely because this registration operation exists.
+- The change-notification channel that delivers the burst, and the debounce and escalation rules its clients apply, are owned elsewhere.
+- The two-part disable gate and the read-only-probe requirement are stated identically in spec 337, which owns the operation.

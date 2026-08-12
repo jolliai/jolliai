@@ -8,7 +8,8 @@ A single read-side request returns the ordered list of currently-active AI codin
 
 **In scope:**
 
-- The fan-out across all supported producers (Claude Code, Codex, OpenCode, Gemini, Cursor, Copilot CLI, Copilot Chat, Cursor CLI, Cline (VS Code), Cline CLI, Devin, Antigravity), the per-producer failure isolation rules, and the partial-result reporting envelope.
+- The fan-out across all supported producers (Claude Code, Codex, OpenCode, Gemini, Cursor, Cursor CLI, Copilot CLI, Copilot Chat, Cline (VS Code), Cline CLI, Devin, Antigravity, Kimi Code), the per-producer failure isolation rules, and the partial-result reporting envelope.
+- The per-producer **enabled gate**: the configuration is read once before the fan-out, and every producer's loader short-circuits on its own toggle before touching disk.
 - The recency-window filter that drops sessions older than a caller-supplied cutoff.
 - The composite identity rule that dedupes intra-producer duplicates while keeping cross-producer rows with the same opaque session identifier distinct.
 - The cross-cutting "user-hidden" filter and the rule that hiding is a per-snapshot dismiss, not a permanent block.
@@ -50,7 +51,7 @@ Each row in the aggregator's output carries exactly these fields:
 | Field             | Type                       | Meaning                                                                                                                                                        |
 | ----------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | session id        | string                     | The opaque, producer-supplied identifier for the session. Unique within a producer; not unique across producers.                                                |
-| producer          | producer enum              | One of the supported producers. Display strings: Claude, Codex, OpenCode, Gemini, Cursor, Cursor CLI, Copilot, Copilot Chat, Cline (VS Code), Cline CLI, Devin, Antigravity. |
+| producer          | producer enum              | One of the supported producers (see "Producer enum" below). |
 | title             | string                     | The resolved display title (see title-cascade below). Never empty; falls back to a constant placeholder when nothing else can be derived.                       |
 | message count     | number                     | The number of merged transcript entries in the **unread slice** for this session. Always positive on returned rows; rows whose unread slice is empty are dropped. |
 | last activity     | string                     | The session's recorded last-update timestamp, in ISO-8601 form. Drives ordering and the recency filter.                                                         |
@@ -71,16 +72,45 @@ The plain variant is exactly the items half of the envelope; both entry points s
 
 ### Producer enum
 
-The aggregator pins a closed enumeration of producers: `claude`, `codex`, `gemini`, `opencode`, `cursor`, `cursor-cli`, `copilot`, `copilot-chat`, `cline`, `cline-cli`, `devin`, `antigravity`. The user-facing display strings are: **Claude Code**, **Codex**, **OpenCode**, **Gemini**, **Cursor**, **Cursor CLI**, **Copilot CLI**, **Copilot Chat**, **Cline (VS Code)**, **Cline CLI**, **Devin**, **Antigravity**. Removing or renaming an entry must happen consistently across the runtime allowlist and every consumer; this spec treats the set as fixed. Some producers are two on-disk forms of one product that share a single user-facing enable toggle (Cursor IDE + Cursor CLI; Copilot CLI + Copilot Chat; Cline VS Code + Cline CLI) but remain distinct enum values with distinct discoverers and rows.
+The aggregator pins a closed enumeration of producers. In declaration order — which is also the order the runtime allowlist and every mirrored consumer enumeration must use:
 
-A session whose producer field is missing from the producer enum (i.e. the discoverer omitted the field) is treated as **Claude Code** throughout the pipeline — for hidden-check, for selection-check, for title resolution, and for the output row's producer field.
+| Producer key | User-facing display string | Enable toggle it reads |
+| --- | --- | --- |
+| `claude` | Claude | Claude |
+| `codex` | Codex | Codex |
+| `gemini` | Gemini | Gemini |
+| `opencode` | OpenCode | OpenCode |
+| `cursor` | Cursor | Cursor *(shared)* |
+| `cursor-cli` | Cursor CLI | Cursor *(shared)* |
+| `copilot` | Copilot | Copilot *(shared)* |
+| `copilot-chat` | Copilot Chat | Copilot *(shared)* |
+| `cline` | Cline (VS Code) | Cline *(shared)* |
+| `cline-cli` | Cline CLI | Cline *(shared)* |
+| `devin` | Devin | Devin |
+| `antigravity` | Antigravity | Antigravity |
+| `kimi` | Kimi Code | Kimi Code |
+
+Removing or renaming an entry must happen consistently across the runtime allowlist and every consumer; this spec treats the set as fixed. Three pairs are two on-disk forms of one product sharing a single user-facing enable toggle (Cursor IDE + Cursor CLI; Copilot CLI + Copilot Chat; Cline VS Code + Cline CLI) but remain distinct enum values with distinct discoverers and rows.
+
+A session whose producer field is missing from the producer enum (i.e. the discoverer omitted the field) is treated as **Claude Code** throughout the pipeline — for the enabled gate, for hidden-check, for selection-check, for title resolution, and for the output row's producer field.
+
+### The enabled gate
+
+One predicate maps a producer (or a missing producer, which falls back to Claude Code) plus the loaded configuration to a boolean. Each toggle is **on unless explicitly set to false** — absent means enabled — and the three shared pairs above resolve to their product's single toggle. A producer outside the enumeration answers "enabled".
+
+This predicate is consulted in two places on purpose, and the redundancy is deliberate rather than accidental:
+
+1. **Inside the aggregator**, once per producer, before the loader touches disk.
+2. **Again in each consumer**, over both the returned rows and the returned failed-producer list, after the aggregator has answered.
+
+The second pass exists because the consumer loads the configuration itself, concurrently with the call: a save landing between the two reads would otherwise let a just-disabled producer's rows render, or spike the consumer's "sources unavailable" hint for a producer the user has just switched off. In the steady state it is a no-op.
 
 ### Title-cascade contract
 
 The title resolver works the same way for every producer. Inputs are: a session info record (with optional native title), the session's producer, the transcript handle, and optionally a pre-loaded merged-entry array (see the cost-saving rule below). The cascade is:
 
 1. **Native title from the session info** — if the discoverer supplied a non-empty native title, use it. Trim to a maximum code-point count.
-2. **Producer-specific native reader** — currently only Claude Code has one; it streams the transcript and returns the most-recent producer-emitted "ai title" row's payload. Other producers have no native reader at this layer.
+2. **Producer-specific native reader** — currently only Claude Code has one; it streams the transcript and returns the most-recent producer-emitted "ai title" row's payload. Other producers have no native reader at this layer. This step is additionally skipped when the session carries an **empty transcript handle** (an archived session whose live transcript is gone): opening a read stream on an empty path is a real filesystem round-trip that always fails, so the cascade falls straight through instead.
 3. **First-user-message fallback** — find the body of the first non-empty human turn in the transcript, normalize whitespace, and trim to the maximum code-point count.
 4. **Constant placeholder** — when nothing above produces a non-empty string, emit a fixed sentinel string (the placeholder is part of the contract; the exact wording is "(untitled session)").
 
@@ -106,6 +136,7 @@ The first-user-message fallback consults a per-producer line parser. Each parser
 | Cline CLI      | Same as OpenCode.                                                                                                       | Same as OpenCode.                                                                                                                                        |
 | Devin          | Same as OpenCode.                                                                                                       | Same as OpenCode.                                                                                                                                        |
 | Antigravity    | Same as OpenCode.                                                                                                       | Same as OpenCode.                                                                                                                                        |
+| Kimi Code      | Line is a parsed JSON object whose `type` marks a turn's prompt event.                                                  | The event's `input`: a bare string as-is, or an array of content blocks joined by the shared array rule below. **This is a real parser, not a stub** — Kimi Code sessions carry a native title only when the session's own state record supplied one, so the fallback genuinely runs. |
 
 A line that fails JSON parsing is skipped silently; the scan continues. A line whose parser throws is caught and the scan continues. The first line that yields a non-empty body wins.
 
@@ -130,21 +161,26 @@ The "is edited" flag is computed by loading the per-session overlay record and a
 The aggregator runs the following pipeline on every call. There is **no cache**, **no LLM invocation**, and **no background task** retained between calls; each call is a fresh computation.
 
 1. **Resolve the recency cutoff.** Compute `cutoff = now − window`. The window defaults to 48 hours when the caller passes nullish.
-2. **Fan out concurrently** to one loader per producer, except that Claude Code and Gemini share a single loader: (a) the combined Claude-Code + Gemini loader, (b) the Cursor discoverer, (c) the Codex discoverer, (d) the OpenCode discoverer, (e) the Copilot CLI discoverer, (f) the Copilot Chat discoverer, (g) the Cline (VS Code) discoverer, (h) the Cline CLI discoverer, (i) the Devin discoverer, (j) the Cursor CLI discoverer, (k) the Antigravity discoverer. Concurrently, also load (l) the hidden-conversations state for this project and (m) the commit-exclusion state for this project. Every loader runs in parallel; the slowest determines the wall-clock floor.
-3. **Combine producer batches** into one flat session list. Each loader returns a "result envelope" of (sessions, failed-producers); the aggregator concatenates the sessions across every envelope and concatenates the failed-producer lists into one set.
-4. **Apply the recency filter.** Parse each session's last-activity into milliseconds; drop sessions whose value is below the cutoff.
-5. **Dedupe by composite identity.** Build a map keyed by `(producer, session-id)`. For each surviving session, if the key is new, insert it; if the key already exists, keep the entry whose last-activity timestamp is newer. The first-seen entry wins on ties (a strictly-greater comparison).
-6. **Apply the hidden filter.** Drop any session whose `(producer, session-id, last-activity)` triple satisfies the "is still hidden" predicate. The producer falls back to Claude Code when missing.
-7. **Per-row enrichment** (concurrent across rows; sequential within a row only where needed):
+2. **Load the configuration once**, before anything else, and hand the same snapshot to every loader. One read serves the whole fan-out; no loader re-reads it.
+3. **Fan out concurrently** to one loader per producer, except that Claude Code and Gemini share a single loader (both write their session metadata into the same per-project registry). The loaders are: the combined Claude-Code + Gemini loader, then the Cursor, Codex, OpenCode, Copilot CLI, Copilot Chat, Cline (VS Code), Cline CLI, Devin, Cursor CLI, Antigravity, and Kimi Code discoverers. Concurrently, also load the hidden-conversations state for this project and the commit-exclusion state for this project. Every loader runs in parallel; the slowest determines the wall-clock floor.
+
+   **Every loader's first act is the enabled gate.** A producer whose toggle is off returns an empty session list and an empty failed list *without opening a file, opening a database, or walking a transcript* — and, critically, without being flagged as failed, because the user switched it off rather than the scan breaking. The combined Claude/Gemini loader handles its two toggles specially: both off skips the shared registry read entirely; exactly one off performs the read and then drops that half's rows.
+
+   The discoverers' own heavier machinery (embedded-database readers and the like) is loaded lazily inside each loader body, so a disabled producer also never pays that load cost.
+4. **Combine producer batches** into one flat session list. Each loader returns a "result envelope" of (sessions, failed-producers); the aggregator concatenates the sessions across every envelope and concatenates the failed-producer lists into one set.
+5. **Apply the recency filter.** Parse each session's last-activity into milliseconds; drop sessions whose value is below the cutoff.
+6. **Dedupe by composite identity.** Build a map keyed by `(producer, session-id)`. For each surviving session, if the key is new, insert it; if the key already exists, keep the entry whose last-activity timestamp is newer. The first-seen entry wins on ties (a strictly-greater comparison).
+7. **Apply the hidden filter.** Drop any session whose `(producer, session-id, last-activity)` triple satisfies the "is still hidden" predicate. The producer falls back to Claude Code when missing.
+8. **Per-row enrichment** (concurrent across rows; sequential within a row only where needed):
    - Load the **unread slice** of the merged transcript for this session, applying the persisted overlay. On any read failure, treat the slice as empty (and log a diagnostic).
    - Compute the **is-edited** flag by loading the per-session overlay record and checking for saved edits or deletions. On any read failure, treat as false (and log a diagnostic).
    - Compute the **title** via the title-cascade:
      - If the unread slice is non-empty, also load the **full** merged transcript so the title-cascade can fall back against the complete in-memory entry array (preserving title quality for producers without a native reader). On any read failure here, treat the full transcript as empty (and log a diagnostic) — the row still survives because the unread slice was already non-empty; the title degrades to the placeholder.
      - If the unread slice is empty, pass the empty slice into the title-cascade (the row will be dropped by the next step anyway; this avoids a redundant disk pass).
    - Build the output row with the computed fields, the session's producer (defaulting to Claude Code), the session's transcript handle, the session's last-activity timestamp, and the **is-selected** flag (derived from the commit-exclusion store via the composite key).
-8. **Drop empty rows.** Any row whose message-count is zero is dropped before sorting. This catches both "session has been fully consumed into a prior summary" and "transcript read failed and degraded to empty".
-9. **Sort.** Order rows by last-activity descending. Ties broken by session-id ascending. Use lexicographic comparison on the ISO-8601 timestamp strings (which is order-preserving for well-formed ISO-8601).
-10. **Return.** The diagnostic variant returns `{ items, failedSources }`; the plain variant returns just `items`. The two share one implementation.
+9. **Drop empty rows.** Any row whose message-count is zero is dropped before sorting. This catches both "session has been fully consumed into a prior summary" and "transcript read failed and degraded to empty".
+10. **Sort.** Order rows by last-activity descending. Ties broken by session-id ascending. Use lexicographic comparison on the ISO-8601 timestamp strings (which is order-preserving for well-formed ISO-8601).
+11. **Return.** The diagnostic variant returns `{ items, failedSources }`; the plain variant returns just `items`. The two share one implementation.
 
 ### Per-loader failure isolation
 
@@ -171,6 +207,8 @@ No row failure ever causes the whole aggregator to fail. The row is degraded or 
 The thin consumer wrapper that adapts the aggregator output for the webview surface adds one more failure layer:
 
 - If the aggregator itself throws (i.e. something outside any per-loader catch crashed — typically an import-time failure or an out-of-memory event), the wrapper catches and returns `{ items: [], failedSources: [<every producer in the closed enum>] }`. The full failed-set is reported because reporting an empty failed-set would be indistinguishable from a healthy-but-empty list, suppressing the partial-result banner on the consumer side.
+- On the **success** path the wrapper loads the configuration itself, concurrently with the aggregator call, and re-applies the enabled gate to both the returned rows and the returned failed-producer list (see "The enabled gate"). This is the second of the two gates and is a no-op unless the configuration changed between the two loads.
+- On the success path the wrapper also fires a **fire-and-forget** projection of the surfaced sessions into the local statistics store, riding this refresh rather than owning a timer. It never awaits it and never lets it affect the returned value; the projection does its own capability gating, its own change-filtering, and swallows its own failures.
 - The wrapper de-duplicates repeated identical aggregator-throw warning logs: a failure with the same message as the immediately-previous failure is **not** re-logged. A successful refresh in between resets the de-duplicator, so the same failure can be logged again after recovery.
 - The wrapper short-circuits when no project root is known (no open workspace): it returns `{ items: [], failedSources: [] }` without invoking the aggregator. This is **not** a failure case; the empty failed-set is correct because the system is healthy, it just has nothing to aggregate.
 
@@ -179,7 +217,7 @@ The thin consumer wrapper that adapts the aggregator output for the webview surf
 Within the title resolver:
 
 1. If the session info carries a non-empty native title, return it (trimmed to the code-point cap).
-2. Otherwise, if the producer is Claude Code, run the producer-specific native reader (streams the transcript looking for the most-recent producer-emitted "ai-title" payload). If it returns a non-empty string, return it (trimmed to the cap). If it throws — which is expected to be impossible because the reader itself catches all I/O errors and returns undefined — log at debug and fall through.
+2. Otherwise, if the producer is Claude Code **and the transcript handle is non-empty**, run the producer-specific native reader (streams the transcript looking for the most-recent producer-emitted "ai-title" payload). If it returns a non-empty string, return it (trimmed to the cap). If it throws — which is expected to be impossible because the reader itself catches all I/O errors and returns undefined — log at debug and fall through.
 3. Otherwise, if the caller pre-loaded the merged transcript, derive the title from the in-memory array: iterate entries, find the first human-role entry whose content trims to non-empty, return its content (trimmed to the cap). If no such entry exists, return the placeholder.
 4. Otherwise, stream the transcript line-by-line, calling the per-producer parser on each line, returning the first non-empty body (trimmed to the cap). If the stream itself throws (non-ENOENT — ENOENT is silent), log at debug and return the placeholder. If the loop exhausts without finding a user message, return the placeholder.
 
@@ -215,8 +253,8 @@ The aggregator does not poll. It is called by its consumer on demand. Refresh ca
 
 There is **one** implementation, with two consumers:
 
-- **The webview sidebar** calls it in-process through the thin consumer wrapper described above (which owns the no-workspace short-circuit, the wholesale-throw-to-every-producer-failed substitution, and the log de-duplication).
-- **The IntelliJ tool window** calls **this same implementation** out-of-process, over a bridge action, passing the working directory and an **explicit recency window**. There is no second aggregator on that surface. The window the IntelliJ consumer supplies is 48 hours, and the bridge action itself falls back to 48 hours when no window is present in the request — so both paths agree on the default. That consumer performs its own wholesale-failure substitution on its side (spec 192), and because its call crosses a process boundary, a transport failure is indistinguishable from an aggregator crash there.
+- **The webview sidebar** calls it in-process through the thin consumer wrapper described above (which owns the no-workspace short-circuit, the wholesale-throw-to-every-producer-failed substitution, the log de-duplication, the second enabled gate, and the statistics projection).
+- **The IntelliJ tool window** calls **this same implementation** out-of-process, over a bridge action, passing the working directory and an **explicit recency window**. There is no second aggregator on that surface. The window the IntelliJ consumer supplies is 48 hours, and the bridge action itself falls back to 48 hours when no window is present in the request — so both paths agree on the default. That consumer's adapter also carries its own hand-written mirror of the enabled predicate and re-filters both rows and failed producers with it, exactly as the webview wrapper does. The panel above it performs the wholesale-failure substitution (spec 192), and because the call crosses a process boundary, a transport failure is indistinguishable from an aggregator crash there.
 
 ## Notable Behavior
 
@@ -229,7 +267,7 @@ There is **one** implementation, with two consumers:
 - **Equal timestamps remain hidden.** A session whose last-activity is exactly the hide timestamp is treated as the same snapshot the user just dismissed, not new activity. (Notable; boundary case.)
 - **Corrupt hidden-store timestamps default to "remain hidden".** An unparseable hide timestamp or session timestamp keeps the user's hide intent intact rather than silently unhiding. (Notable; defensive.)
 - **The title-cascade's Claude-Code native-reader path is independent of the merged-entries shortcut.** The shortcut covers the first-user-message fallback only; the Claude-Code native reader always runs its own stream because the merged-transcript layer strips its source rows. So Claude Code sessions cost one extra stream pass per refresh even when the caller supplied merged entries. (Notable.)
-- **OpenCode / Cursor / Copilot CLI / Cursor CLI / Cline / Cline CLI / Devin / Antigravity parsers in the first-user-message fallback always return undefined.** Those producers always carry a discoverer-supplied native title that short-circuits the cascade at step 1. The parsers exist for shape-completeness; reaching them in production means a discoverer regression. The cascade falls through to the placeholder in that case. (Notable.)
+- **Several first-user-message parsers are always-undefined stubs, and one recently-added producer's is not.** OpenCode, Cursor, Copilot CLI, Cursor CLI, Cline, Cline CLI, Devin and Antigravity all carry a discoverer-supplied native title that short-circuits the cascade at step 1, so their parsers exist for shape-completeness and reaching them in production means a discoverer regression (the cascade falls through to the placeholder). Kimi Code is the exception: its discoverer supplies a title only when the session's own state record had one, so its parser is a real one that reads the turn's prompt event. Do not assume "new producer ⇒ stub". (Notable.)
 - **The Gemini parser keys on `type === "user"`, not `role === "user"`.** Early versions used `role` and silently produced "(untitled session)" for every Gemini session even when the transcript clearly had user turns. The current parser also accepts a top-level `text` string as a final fallback for forward-compat. (Notable; bug-fix preserved as contract.)
 - **The Copilot Chat parser accepts two distinct on-disk shapes.** Both must be supported because the transcript-loader layer supports both; if the parser only handled one, sessions on the other shape would show "(untitled session)" in the sidebar even though the detail panel rendered them correctly — a "details work, title is wrong" split that the design explicitly rules out. (Notable; bug-fix preserved as contract.)
 - **The Claude Code native title reader returns the LAST `ai-title` row in the file**, not the first. Claude Code re-evaluates the title continuously and appends a new row each time; the most recent row reflects the current title. (Notable.)
@@ -239,7 +277,10 @@ There is **one** implementation, with two consumers:
 - **The wholesale-throw path in the consumer wrapper reports every producer as failed**, not an empty failed-set. An empty failed-set would be indistinguishable from a healthy-but-empty list and would suppress the consumer's partial-data banner, hiding a broken aggregator from the user. (Notable; intentional.)
 - **The consumer wrapper de-duplicates repeated identical aggregator-throw warning logs.** A failure with the same message as the immediately-previous failure is not re-logged; a successful refresh resets the de-duplicator. This prevents log spam on a stuck failure. (Notable.)
 - **The consumer wrapper's "no workspace" short-circuit returns an empty failed-set**, distinguishing it from a wholesale-throw. The webview can rely on this to suppress the partial-data banner when there is simply no project to aggregate. (Notable.)
-- **The aggregator never invokes an LLM and never writes to disk.** The pipeline is pure-read; the only writes happen out-of-band via the hidden-conversations / commit-exclusion / overlay stores when the user takes UI actions, all owned by their respective specs. (Notable; load-bearing.)
+- **A disabled producer costs nothing and is not reported as broken.** Its loader returns before opening anything, and it is deliberately absent from the failed-producer list — otherwise turning a producer off would light up the consumer's "some sources failed to load" banner, telling the user their own choice was a malfunction. (Notable; the empty-failed-list half is the easy part to get wrong.)
+- **The enabled gate is applied twice on purpose, and the second application is not redundancy.** The aggregator gates before reading disk; each consumer re-filters both the rows and the failed-producer list afterwards. The consumer loads the configuration concurrently with the call, so the two can disagree only in the window where a save lands mid-call — which is exactly the window where a just-disabled producer would otherwise render rows, or spike the unavailable-sources hint. (Notable; belt-and-braces against configuration drift, not duplication.)
+- **Three producers do not have a toggle of their own.** Cursor CLI rides the Cursor toggle, Copilot Chat rides the Copilot toggle, and Cline CLI rides the Cline toggle. Switching one of those products off silently removes two producers' rows. (Notable.)
+- **The aggregator never invokes an LLM and never writes to disk.** The pipeline is pure-read; the only writes happen out-of-band via the hidden-conversations / commit-exclusion / overlay stores when the user takes UI actions, all owned by their respective specs. The statistics projection that rides the webview consumer's refresh is the consumer's, not the aggregator's. (Notable; load-bearing.)
 - **The aggregator holds no cache between calls.** Every call re-reads every input. This trades CPU for freshness; a consumer that calls on a tick interval (e.g. ~60s for the sidebar) re-pays the cost each tick. (Notable.)
 - **Title truncation is by Unicode code point, preserving surrogate pairs.** A title made entirely of astral-plane emoji is truncated by character count, not UTF-16 code unit, so no row produces a half-truncated surrogate. Internal whitespace is collapsed to single spaces before truncation. (Notable.)
 - **A line whose JSON parses but whose body extractor returns undefined does not abort the first-user-message scan.** The scan continues, so a follow-up valid line still produces a title. The same is true of array-content lines whose elements contain no extractable text. (Notable.)

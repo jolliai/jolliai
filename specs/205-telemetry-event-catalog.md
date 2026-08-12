@@ -33,7 +33,7 @@ Every event is recorded as one envelope with this fixed shape; event-specific da
 | -- | -- | -- |
 | Schema version | integer | A constant (currently `1`); bumped only on a breaking envelope-shape change. |
 | Event name | string | One of the registered names (see catalog). |
-| Surface | string | The client kind: `cli`, `vscode`, or `intellij`. Derived per surface (the editor's bundler kind `vscode-plugin` is normalized to `vscode`). |
+| Surface | string | The client kind, carried through from the build-time identity rather than validated against a fixed set. `cli`, `vscode` and `intellij` are the kinds the catalog's own descriptions assume; the two AI-host plugin bundles each carry their own kind and reach the backend under it, undescribed here (see the derivation note). |
 | Surface version | string | The client's version, or `unknown` when unparseable. |
 | Install identifier | string (UUID) | The stable per-machine anonymous id. Must be a UUID; the backend's column is UUID-typed and silently drops a non-UUID value. |
 | Session identifier | string, optional | The current AI/editor session id when one exists; omitted otherwise. |
@@ -48,6 +48,8 @@ Every event is recorded as one envelope with this fixed shape; event-specific da
 ### Surface kind/version derivation
 
 The surface and its version are split from a client-identification string of the form `kind/version` (e.g. `cli/1.2.0`, `vscode-plugin/0.99.4`): the part before the first slash is the kind, the part after is the version. A missing slash makes the whole string the kind with version `unknown`; an empty version becomes `unknown`. The kind `vscode-plugin` is normalized to the dashboard surface `vscode`. The JVM IDE fixes its surface to `intellij` and uses the plugin version directly.
+
+**The split is pass-through, not an allowlist**, and that is the surprising part: exactly one kind (`vscode-plugin`) is rewritten, and every other kind reaches the envelope as the build stamped it. Each AI-host plugin bundle stamps its own distinct kind, so those bundles emit under kinds this document does not describe and no client-side check rejects. Whether such a kind is meaningful is decided at ingest, not here. (Notable: a reader who takes the envelope's surface description as a closed set will under-count the surfaces actually reporting.)
 
 ### The event catalog (registry)
 

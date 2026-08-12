@@ -15,6 +15,8 @@ The Share popover's state machine: for a share subject (a whole branch, or a sin
 - The invite flow's ordering — grant access, then email — and that a mail failure never revokes access.
 - What "live" means: the link references current Space docs (a covered doc-id allowlist), never a frozen blob.
 - Reconcile-on-open for an unexpired branch link, gated by a content fingerprint.
+- What that fingerprint covers — and the kind of context it does **not** cover, which therefore never triggers a reconcile.
+- Which published documents can and cannot appear in a share's covered allowlist.
 - Rollback of a link minted (or a tier flipped) purely to carry an invite when the invite then fails.
 - The access-change race guard (trust the requested tier, not the server echo).
 - Origin-allowlist enforcement on every rendered/copied URL.
@@ -74,6 +76,20 @@ Where it can be compared, it agrees with this contract: same five endpoints, sam
 
 The description is a one-line blurb (head commit's recap, else its subject line, whitespace-collapsed, capped ~200 chars) shown on the share page and in the invite email; omitted when the head summary yields no text.
 
+### Content fingerprint (the reconcile gate)
+
+A short hash over a projection of the subject's summaries, recomputed on every open and compared against the value cached on the share record. It exists to answer one question — *has anything a push would send changed without git HEAD moving?* — so it deliberately covers only content, never push-assigned document ids (those would move the hash on every push and make every open reconcile).
+
+The projection carries, per commit: the commit hash, the effective decisions, the effective recap (as an explicit null when absent, because a decision-less memory renders its recap as the share card and a recap-only edit must still count), each plan's slug + revision stamp, each note's id + revision stamp, and each external reference's per-commit archive key + reference stamp.
+
+**It does NOT cover the commit's recorded skill usage.** No skill field enters the projection — not the refs, not their counts, not their stamps — so a change confined to skills leaves the hash where it was and the reconcile short-circuits: the existing share keeps whatever skill content the last reconcile happened to publish, indefinitely, until something else on the same commit changes. This is a negative fact about the current projection, stated because the same push path *does* publish a skill article. (Surprising; see Notable Behavior.)
+
+### What the covered allowlist can contain
+
+The live reference records, per commit, the summary's document id plus a flat set of attachment document ids. That set is built by the push pipeline (236) by looking up each of the commit's stored context items, under its kind's cross-commit identity, in a branch-wide map of published articles.
+
+**An article published for a kind that collapses a commit's items into ONE aggregate can never be found by that lookup.** The map is keyed by the identity of the *published article*, which for an aggregate is a commit-level identity minted at push time; the lookup is keyed by the identities the memory's *stored items* carry, which are the individual per-item ones. The two are different strings by construction and cannot collide, so the aggregate's document id never enters the covered set for any commit. Today exactly one kind is an aggregate: the per-commit skill-usage article. It is pushed, it is stored on the memory, and it is outside every share's document set. (Surprising; see Notable Behavior.)
+
 ## Behavior
 
 ### Open
@@ -128,7 +144,7 @@ When a mint (link creation via the push pipeline) fails, the specific reason is 
 Both paths run through the same push funnel, which raises `PushDisabledError` at the orchestrator's entry gate when the repo's outbound push is off (spec 310). They treat it differently on purpose:
 
 - **Mint** (Copy / tier flip / invite) propagates it. The user just asked for a link and nothing was published, so the refusal must be reported.
-- **Reconcile** catches it and `return`s, leaving the cached record untouched (`vscode/src/services/LiveShareController.ts:550-559`). Reconcile is a best-effort background pass the modal runs on **every** view, so a push-disabled repo simply means "nothing to sync outbound". Letting it escape would render the user's own setting as the modal's red "Couldn't refresh the shared content" toast on every open. Mirrors IntelliJ's reconcile branch (262).
+- **Reconcile** catches it and returns, leaving the cached record untouched. Reconcile is a best-effort background pass the modal runs on **every** view, so a push-disabled repo simply means "nothing to sync outbound". Letting it escape would render the user's own setting as the modal's red "Couldn't refresh the shared content" toast on every open. Mirrors the JVM host's reconcile branch (262).
 
 The **whole-branch** share loop has its own repo-wide stop test on top of this — see 236.
 
@@ -158,7 +174,9 @@ For one subject:
 - **A `people` link with nobody invited cannot exist.** It would be openable only by its owner, so it is never minted (or is stopped when it becomes empty). (Surprising; intentional.)
 - **Invite grants access, then emails — and a mail failure keeps the grant.** Access is a server-side allowlist merge; the email is a notification. Losing the email does not lose access. (Notable.)
 - **The access flip trusts the request, not the echo.** After a successful PATCH the tier is taken from what was asked for; a stale or omitted server echo previously reverted the tier silently (e.g. a flip to public rendered back as org). Echo and existing value are only fallbacks. (Surprising; intentional.)
-- **Reconcile-on-open is gated twice.** Only a live, unexpired **branch** link reconciles, and even then only when a content fingerprint shows the shared memory changed — so ordinary re-opens don't re-push. The fingerprint hashes each summary's topics, recap, plan/note revisions, **and its references** (each reference's stamp bumps on a new/changed reference), so adding or updating a shared reference triggers a reconcile even when git HEAD hasn't moved. Commit links never reconcile. (Notable.)
+- **Reconcile-on-open is gated twice.** Only a live, unexpired **branch** link reconciles, and even then only when a content fingerprint shows the shared memory changed — so ordinary re-opens don't re-push. The fingerprint hashes each summary's decisions, recap, plan/note revisions, **and its external references** (each reference's stamp bumps on a new/changed reference), so adding or updating a shared reference triggers a reconcile even when git HEAD hasn't moved. Commit links never reconcile. (Notable.)
+- **The fingerprint OMITS recorded skill usage, so a skills-only change never reconciles.** Every other kind of context the push path publishes is in the projection; skills are in none of it. A commit whose only change is its skill record — a skill entered again, its counts or spend corrected, a detach re-deriving its usage — leaves the hash identical, the reconcile short-circuits before pushing anything, and the shared page keeps serving the previously published skill content for as long as nothing else on that commit moves. (Surprising; a real gap, recorded as reality.)
+- **The share's document allowlist can never contain the skill article.** The covered set resolves each commit's attachment document ids by looking its stored items up under their per-item identities, while the skill article is published under a commit-level aggregate identity minted at push time — so the lookup misses every time and that document id is never added, for any commit, on either the create or the reconcile path. The article is still pushed and its id is still stored on the memory; it simply falls outside the set the share references. Nothing degrades loudly: the push reports success and the share renders without it. (Surprising; a real gap, confirmed against the resolution path and recorded as reality.)
 - **A push-disabled repo makes reconcile a silent no-op, but still blocks a mint loudly.** The same refusal from the same funnel is reported on the path the user initiated and swallowed on the path the modal initiates for them. Surfacing a user's own opt-out as a red "couldn't refresh" toast on every popover open would be noise about a setting they chose. (Surprising; intentional asymmetry — spec 310.)
 - **Rollback undoes a mint/flip done only to carry an invite.** If the invite fails, a link that existed solely to invite is revoked, or a tier bump is reverted, so a failed invite doesn't leave a stray or over-open link. (Notable.)
 - **Every URL is origin-checked before it's shown or copied.** A record whose URL fails the Jolli allowlist renders as absent, and copy asserts the origin before touching the clipboard — a defense against a tampered cache. (Notable.)

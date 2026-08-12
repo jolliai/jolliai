@@ -25,7 +25,7 @@ The COMMITS section of the JolliMemory tool window — a row-per-commit list tha
 - The hover action icons (revealed on row hover): Pin, Copy recall prompt, View memory — visible only for memory-bearing rows, with their horizontal space reserved while hidden.
 - The SHIPPED group: three fixed entries (PR, E2E guide, Synced to Jolli), each showing done/not-done state with distinct icon and chip.
 - The CONVERSATIONS group: per-session rows with source badge, title, message count; on hover swaps to Open and optional Resume actions; resume is gated on the session file existing locally and the source being Claude.
-- The CONTEXT group: plans (P), notes (N), and external references (single-letter tags from the shared source-presentation table, spec 313), with clickable URL when available and an archived-Markdown source view when not.
+- The CONTEXT group: plans (P), notes (N), external references (single-letter tags from the shared source-presentation table, spec 313) with clickable URL when available and an archived-Markdown source view when not, the **silent omission** of a reference whose source this surface cannot decode, and — when the memory archived any skill usage — **one aggregate skills row** carrying a label the shared implementation composes.
 - The FILES group: per-file rows; single click opens the parent↔commit diff.
 - The "Hide memory details" link at the bottom of expanded content and the "Show memory details" link that rides the collapsed row's affordance row.
 - The click-to-open-summary behavior: clicking anywhere on the row body (not arrow, checkbox, overflow chip, or hover icons) shows the memory in the project's single shared memory tab.
@@ -103,7 +103,7 @@ Each row's input fields:
 | `isSyncedToJolli` | `true` when a Jolli Space doc ID or URL is stored on the memory.                                    |
 | `jolliDocUrl`     | Direct URL to the Jolli Space article, when synced.                                                  |
 | `conversationTurns`| Count of human turns across contributing conversations, from the stored summary.                   |
-| `contextCount`    | Count of linked context items (plans + notes + references).                                          |
+| `contextCount`    | Count of linked context items: plans + notes + references only. **It does not count the aggregate skills row**, so it can disagree by one with the count the expanded CONTEXT header shows (which counts rendered rows). Nothing in this panel currently renders this field. |
 
 The per-commit change statistics (`filesChanged` / `insertions` / `deletions`) come from the **same single listing invocation** that produces the metadata, rather than one additional child process per listed commit. A commit for which the listing emits no statistics line at all — a commit whose diff is empty — keeps zeros for all three. One incidental consequence: a repository's very first commit now reports its real statistics, where the previous per-commit comparison against a non-existent parent always failed and left zeros.
 
@@ -167,10 +167,20 @@ The expanded container holds four groups, always in order:
 
 1. **SHIPPED** — exactly three entries: PR status, E2E guide status, Synced-to-Jolli status. Done entries have full-color icon + click action; not-yet-done entries are dim with a descriptor chip and either no action or a link to the memory editor.
 2. **CONVERSATIONS** — one row per committed conversation (source logo, title, message count). Empty state: `"<N turns> conversation turns (details not stored)"` or `"No conversations"`.
-3. **CONTEXT** — one row per plan, note, or external reference. Plans and notes carry the outlined dim chips `P` and `N`. Reference rows do **not** use a local tag table: the tag letter and its colour both come from the shared source-presentation table (spec 313), which is single-letter across all twelve sources — `L` Linear, `J` Jira, `G` GitHub, `N` Notion, `S` Slack, `J` Jolli Memory, `7` Context7, `C` Confluence, `A` Asana, `M` monday.com, `Z` Zoom Doc, `Z` Zoom Meeting — with a neutral `R` for a source this surface's enum does not yet cover. Empty state: `"No linked context"`.
+3. **CONTEXT** — one row per plan, note, or external reference, plus at most one aggregate skills row (below). Plans and notes carry the outlined dim chips `P` and `N`. Reference rows do **not** use a local tag table: the tag letter and its colour both come from the shared source-presentation table (spec 313), which is single-letter across all twelve sources — `L` Linear, `J` Jira, `G` GitHub, `N` Notion, `S` Slack, `J` Jolli Memory, `7` Context7, `C` Confluence, `A` Asana, `M` monday.com, `Z` Zoom Doc, `Z` Zoom Meeting. Empty state: `"No linked context"`.
+
+   **A reference whose source this surface cannot decode does not get a row at all.** The stored memory names each reference's source as a free-form string, while this host pins the sources it knows as a closed enumeration; a name outside that enumeration decodes to nothing, and the row is skipped before any presentation lookup happens. So the shared table's neutral placeholder — the letter-and-hue an unknown source falls back to on the working-area list and on a pinned row — is **unreachable from this group**: the only lookup here that could produce it lives in a second letter helper that nothing calls. The reference simply vanishes from the expanded memory, and the group's header count drops with it; nothing marks the omission. (Corrected: this spec previously stated such a reference renders with the neutral `R`.) The catalogue the extractor writes from currently carries at least one shipping source this enumeration does not, so the omission is live rather than theoretical.
 
    The reference chip is also a **different widget**: plans and notes render the outlined dim chip, while a reference row passes the source's brand colour through and gets a **filled, rounded, brand-coloured badge** with bold white text instead — the same visual weight the sibling VS Code surface paints. The distinction is made by whether a colour is supplied: supplying one selects the filled badge, omitting one selects the outlined chip. (Corrected: this spec previously listed a single outlined chip set including the two-letter tags `GH` and `No`; neither the two-letter form nor the uniform outlined chip survives.)
 4. **FILES** — one row per changed file (file-type icon, filename, relative path, status badge). Empty state: `"No files"`.
+
+**The aggregate skills row.** When the memory carries archived skill usage, the CONTEXT group ends with exactly **one** more row standing for all of it — a commit routinely archives a dozen skills, and no Context surface can absorb a dozen rows whose only action is the same click. It uses the same filled brand-style badge widget the reference rows use, painted with the shared skill accent, and its letter is `S`.
+
+That letter is **overloaded three ways across this product and disambiguated by colour alone**: `S` is a snippet note, this skills aggregate, and the Slack reference source. (The shared source table has the same problem elsewhere — `J` for both Jira and the product's own memory-lookup source, `Z` for both Zoom kinds.) A reader keying on the letter without the hue cannot tell them apart. The accent is deliberately kept in one place shared with the live CONTEXT list (spec 132) rather than per-panel, and relabelling the row in one IDE only was judged the worse trade.
+
+Its title is **not composed here**: it is the summary label the shared implementation writes, so the count and token figure are formatted once for every surface that shows them. This row passes it through unmodified — unlike the live CONTEXT list (spec 132), which appends its own "some inferred" caveat, so a committed memory whose skills were inferred from file reads carries no such caveat on this row at all. When the label is unavailable the row falls back to the literal `Skills used` and still renders: the row exists because the memory has skills, a fact already read off disk, so an unresolved label must not remove it.
+
+The row counts toward the group's header count, because that count is the number of rendered rows.
 
 Each group is preceded by a bold dim header `"<TITLE> (<count>)"`. There are **no separator lines between groups any more** — the groups are separated by spacing alone (each header after the first gets a little more room above it than the first one does), and the header font is a touch smaller than before. The effect is a calm block rather than a bordered card. The total "Hide memory details" link is appended after the last group.
 
@@ -307,6 +317,7 @@ Two problems live in this meter as written:
 | Click on a conversation's "Resume" hover icon (Claude only, file present) | Open a new terminal tab and resume the session. |
 | Click on a CONTEXT reference row that has an upstream URL | Open the URL in the system browser.        |
 | Click on a CONTEXT reference row that has **no** upstream URL | Read the reference's archived Markdown body from storage and open it in the host editor in **source view**. |
+| Click on the CONTEXT aggregate skills row | Render this memory's archived skills table off the UI thread and open it as a read-only in-memory Markdown **preview** (see below). |
 
 Note: there is no double-click-to-open-memory behavior. A single click on the row body opens the memory.
 
@@ -322,13 +333,29 @@ Toggling expand:
 4. Toggles the visibility of the "Show memory details" link (hidden while expanded; the "Hide memory details" link at the bottom of the expanded content takes over).
 5. If newly expanding and the detail has not been loaded yet, kicks off a background bundle load.
 
-The first expand of a commit fetches a bundle containing: the full `CommitSummary`, the committed conversations (with squash-transcript fallback), and the changed files. Concurrent expands of the same commit share a single `CompletableFuture` (keyed by commit hash, populated atomically on first request). On failure, the cache entry is removed so a future expand can retry.
+The first expand of a commit fetches a bundle containing: the full `CommitSummary`, the committed conversations (with squash-transcript fallback), the changed files, and — **only when that summary carries archived skills** — the aggregate skills row's label. Concurrent expands of the same commit share a single `CompletableFuture` (keyed by commit hash, populated atomically on first request). On failure, the cache entry is removed so a future expand can retry.
+
+The skills label is resolved **inside this bundle rather than at render time, and that placement is load-bearing**: composing it is a cross-process round trip, while the group rendering runs on the UI thread, so asking for it there would freeze the UI for as long as the back end took to answer — up to a cold start. The cost is that expanding a memory with skills makes **one additional round trip per detail load**, on top of everything the bundle already fetches. The label request carries the memory's own archived skill records across the boundary, because the working registry no longer holds them once they are committed. A failure resolves to no label (the row then shows its fallback wording), not to a failed bundle.
 
 While the bundle is in flight, the container shows `"Loading..."`. On completion, `renderExpandedGroups` builds the four group sections. On failure, `"(failed to load)"` is shown.
 
 ### Squash-transcript fallback
 
 When gathering conversations for the CONVERSATIONS group: if the commit has no transcript of its own and its `CommitSummary.children` is non-empty, the conversations from the child commits are aggregated instead. Aggregation dedupes by `"<source>|<sessionId>"` key, summing message counts for duplicates. Nested squashes are recursed.
+
+### Opening a committed memory's skills table
+
+Clicking the aggregate skills row records a memory-item-opened event tagged `skill` (singular, the same vocabulary the group's other open paths and the sibling desktop surface use, because the metric joins on it), then works off the UI thread:
+
+1. Ask the shared implementation to render this memory's skills table, handing it the whole memory. It renders from the memory rather than reading the Memory Bank's `skills--<hash8>.md` file, because that file exists only in the visible layer — absent in orphan-branch-only storage, and absent for a foreign repo whose folder this machine has never synced. Rendering works in every mode and is the same renderer that wrote the file.
+2. Back on the UI thread, dispatch on **three** outcomes, which are deliberately not collapsed into two:
+   - the call **failed** → a dialog reading `Could not render this memory's skills: <reason>`;
+   - the call answered **nothing** → a dialog reading `This memory has no archived skill usage.`;
+   - text → open it read-only in a Markdown preview titled `Skills used — <hash8>`.
+
+Keeping the first two apart is the point. This row was drawn from the memory's own archived records — data already read off disk — so reporting an unreachable back end as "this memory has no archived skill usage" would have the panel contradict what it had just rendered and send the reader looking for a missing memory instead of a stopped service. The "nothing" answer is close to unreachable for this caller for the same reason, and is reachable only when the memory was squashed or amended away between the render and the click.
+
+The tab is named after what the reader clicked and after the table's own heading, not after the generated file's slug — every other preview this panel opens is named for the clicked artifact, and the file-slug form was the one that leaked storage naming into a tab title.
 
 ### File-row click → diff
 
@@ -485,7 +512,9 @@ Clearing foreign mode restores normal operation and triggers a standard refresh.
 [user clicks arrow or "Show/Hide memory details"]
   toggle expand/collapse
   toggle the WHOLE affordance row's visibility (cloud chip + overflow chip + link)
-  if expanding for the first time: kick off lazy bundle load (summary + conversations + files)
+  if expanding for the first time: kick off lazy bundle load
+    (summary + conversations + files [+ the skills label, one extra round trip,
+     only when the summary carries archived skills])
 
 [user clicks row body (hasSummary), or the View-memory hover action]
   fetch memory async → hand to the shared single-memory-tab opener
@@ -494,6 +523,13 @@ Clearing foreign mode restores normal operation and triggers a standard refresh.
 [user clicks a row's overflow chip]
   reveal that row's hidden status chips in place; remove the overflow chip
   (not remembered — the next rebuild collapses them again)
+
+[user clicks the CONTEXT aggregate skills row]
+  track memory-item-opened (skill)
+  off-UI: render this memory's archived skills table
+    [failed]  → dialog "Could not render this memory's skills: …"
+    [nothing] → dialog "This memory has no archived skill usage."
+    [text]    → read-only preview titled "Skills used — <hash8>"
 
 [user clicks a file row inside an expanded commit]
   open diff: parent ↔ commit for that file
@@ -601,8 +637,13 @@ Clearing foreign mode restores normal operation and triggers a standard refresh.
 - **The selection clears the moment the hash sequence changes, but selection mode does not.** A rebase or amend invalidates whatever was selected before; the panel does not try to map old-hash selection onto new-hash rows. The checkboxes stay on screen, emptied.
 - **Detail bundle loads lazily and concurrently safely.** Two near-simultaneous expands of the same commit share one query. The cache survives until the hash sequence changes. A failed load removes the cache entry so the next expand retries.
 - **All four expanded groups always render.** An empty CONVERSATIONS, CONTEXT, or FILES group shows a plain-text placeholder row rather than being absent. This ensures the expanded panel has consistent structure across commits.
+- **A reference this surface cannot decode is dropped from the CONTEXT group without a trace.** The memory records each reference's source as free text; this host pins the sources it knows as a closed set, and a name outside it decodes to nothing and is skipped ahead of every presentation lookup. There is no placeholder row, no dimmed entry and no log line the reader can see — the reference is simply absent from the expanded memory and the group's header count is one lower. This is a real drop today, not a hypothetical one: the catalogue the extractor writes from carries at least one shipping source this host's set does not. The neutral unknown badge that the working-area list and the pinned list both render for exactly this case cannot be reached from here; the sole lookup that would produce it survives in a letter helper no caller invokes, so it is unreachable code rather than a fallback. (Notable; a silent visibility rule.)
 - **A reference row with no upstream URL now opens the reference itself, not the commit.** Track-only sources (the product's own memory lookups, documentation lookups, and any other reference the extractor captured without a link) have no URL to browse. Such a row used to be a link-styled dead end that fell back to the whole commit memory; it now reads that reference's **archived Markdown body** from storage on a pooled thread and opens it in the host editor. The commit-memory fallback survives only as a second-order fallback: it fires when the archived body cannot be read *and* the commit actually has a memory. When neither holds, the click does nothing. The archived read itself is spec 317's; this panel owns only the dispatch and the two fallbacks.
-- **That body opens in source view, not rendered preview, and that is deliberate.** The archived file's YAML frontmatter (source, native identifier, title, referenced-at timestamp, originating tool name) and its HTML-comment markers are the point of opening it — a rendered preview hides both. The editor is therefore explicitly switched to the editor-only layout after opening, matching the sibling VS Code surface, which opens the same content as an untitled Markdown document rather than a preview. (Notable; the sole place this panel deliberately declines to render Markdown.)
+- **That body opens in source view, not rendered preview, and the two hosts have since diverged on it.** The archived file's YAML frontmatter (source, native identifier, title, referenced-at timestamp, originating tool name) and its HTML-comment markers are the point of opening it — a rendered preview hides both — so this panel explicitly switches the editor to the editor-only layout after opening. **The claim that the sibling desktop surface opens the same content as an untitled Markdown document is no longer true**: that surface now renders archived reference bodies as a *rendered* preview, having solved the same problem the other way round — it rewrites the frontmatter into a visible leading block first, so nothing is hidden by rendering it. The result is genuine cross-surface divergence in how one archived reference reads, not a shared decision. (Notable; source view is still the sole place this panel deliberately declines to render Markdown — the skills table below it renders.)
+- **The CONTEXT group collapses a memory's skills into one row, and its own count is not the one the memory carries.** However many skills a commit archived, the group shows a single aggregate row; the header count counts rendered rows, while the memory brief's own context count sums plans, notes and references only — so the two disagree by one on any memory with skills. Nothing renders the brief's count today, so the disagreement is latent rather than visible. (Notable.)
+- **The skills row's label is fetched, not composed, and it costs one round trip per expanded memory.** The label is resolved inside the detail bundle rather than while rendering, because rendering happens on the UI thread and this is a cross-process call that can take a cold start to answer. So every expand of a memory with skills pays one more round trip than the same expand of a memory without. A failure degrades to fixed wording rather than dropping the row — the row's existence is established by data already read off disk. (Notable.)
+- **A committed skills row drops the "inferred" caveat that the live one carries.** The shared label deliberately omits the inferred marker so each surface can spell it its own way; the live CONTEXT list appends words, and this row appends nothing. A memory whose skills were inferred from file reads therefore looks measured here until the reader opens the table, which does carry the marker and its footnote. (Surprising; observed.)
+- **A failed render and an empty answer are answered differently, on purpose.** "Could not render" names a back-end failure; "no archived skill usage" is a claim about the reader's memory. Collapsing them would make an unreachable service contradict a row this panel drew from the memory it had already read, and send the reader looking for the wrong problem. (Notable.)
 - **The "Show memory details" / "Hide memory details" links are the primary expand toggle for most users.** The arrow also works; both run the same toggle.
 - **Expanding now hides the whole affordance row, cloud chip included.** Previously only the expand link itself hid, so the chips stayed visible above the expanded body. The "Hide memory details" link at the bottom of the expanded content is the only remaining toggle while a row is open. (Notable.)
 - **The delayed hover detail card is gone.** Hovering a row used to bring up, after a short dwell, a small card carrying the commit subject, a relative date, an optional type badge, the file/insertion/deletion change statistics, the short hash, and a link into the memory — with its own show delay and exit grace period, and its own teardown on panel disposal. All of that has been removed; hovering a row now only tints it and reveals its action icons. Everything the card showed is still reachable somewhere on the row or by expanding it — subject and short hash on the row's own two lines, relative age on the sub-line, type badge appended to the title, and the memory itself via the row click or the View-memory action — **except the change statistics**, which have no at-rest surface any more and are only implied once the row is expanded (the FILES group's own count gives the file count; the inserted/deleted line counts are no longer displayed by this panel at all). The removal was a casualty of the selection-mode restructure rather than a design decision, and the code records re-adding the card as a follow-up. (Notable; a real loss.)
@@ -653,5 +694,7 @@ Clearing foreign mode restores normal operation and triggers a standard refresh.
 - **Branch-level Create-PR view** — the destination of the action bar's Create-PR button, opened via this panel's open-Create-PR-view action (Create-PR-view spec).
 - **Post-commit summarization pipeline** — the write-time source of the token breakdown, per-model usage, and estimated cost every row and the branch meter here read and tree-aggregate (post-commit-pipeline spec).
 - **Memory reference identifier and copy chip** (spec 301) — owns the identifier's format, the strict presence rule that decides whether a row shows a chip at all, and everything the chip does when clicked. This panel owns only where the chip sits in the row and how the wrapping title measures around it.
-- **Source presentation table** (spec 313) — owns the twelve sources' letter tags, brand colours, human labels, the neutral unknown placeholder, and the rule deciding whether a reference's display title leads with its native identifier. This panel reads that table for the CONTEXT reference rows' badge letter, badge colour, and title, and holds no letter table of its own.
+- **Skills bridge adapter** (spec 336) — owns the two requests this panel makes about skills (the archived label, the archived table), their degrade-versus-throw split, and what each null means. The label's format and the table's columns are owned by spec 323; what counts as archived skill usage in the first place by specs 319 and 322. The live CONTEXT list's own aggregate row is spec 132's.
+- **Badge widget and the skill accent** — the filled brand-style badge is shared with the live CONTEXT list, and the skill colour lives with the badge rather than in either panel so the two cannot drift.
+- **Source presentation table** (spec 313) — owns the twelve sources' letter tags, brand colours, human labels, the neutral unknown placeholder, and the rule deciding whether a reference's display title leads with its native identifier. This panel reads that table for the CONTEXT reference rows' badge letter, badge colour, and title, and holds no letter table of its own. It is the one consumer that never reaches the neutral unknown placeholder: a source it cannot decode is dropped ahead of the lookup, so the placeholder's whole purpose — keeping an unrecognised source visible — is defeated on this surface.
 - **Archived-reference body read** (spec 317) — owns the read that backs the no-URL reference click: the source-plus-archived-key lookup, the stem derivation, and the silent decline this panel treats as "fall back to the commit memory".

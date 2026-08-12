@@ -1,103 +1,198 @@
-# IntelliJ Orphan-Branch Ref Monitoring
+# 125. IntelliJ Orphan-Branch Ref Monitoring
 
 ## Topic Statement
 
-The IntelliJ project service watches four specific files — the orphan branch's loose ref, the queue worker's two lock files, and the plan registry — for external changes, using the IDE platform's own virtual-file-system change bus rather than an operating-system watcher API, and debounces rapid event bursts before instructing UI panels to reload.
+The JVM IDE's project service watches a small set of externally-written files through the IDE platform's own change bus rather than an operating-system watcher, classifies **every** path in each delivered batch into one of three outcomes rather than stopping at the first match, and routes the result onto two independent debounce timers — one of which picks between a heavy and a light refresh under a sticky, one-way escalation.
 
 ## Scope
 
-- Registering two directories as non-recursive watch roots with the IDE platform's virtual file system: the parent directory of the orphan branch's loose ref file (under the main repo root's git directory) and the main repo root's per-project Jolli state directory.
-- Seeding the platform's virtual file system with each root before registering it, so events for paths the platform has never visited are still delivered.
-- Filtering every delivered change event by **exact canonical full-path equality** against four target files, and the path canonicalisation (including symlink resolution) required for that comparison to succeed.
-- Debouncing the noisy event stream produced when the queue worker writes a chain of git objects (blob, tree, commit, ref update) in quick succession.
-- Triggering a status refresh on the project service when a relevant event is observed.
-- Worktree-aware path resolution: both roots are resolved under the main repo root, not the worktree's own git pointer.
-- Lifecycle: start during service initialization, tear down with the service.
+**In scope:**
+- The three directories registered as non-recursive watch roots, how each is resolved, and what happens when one does not exist at startup.
+- Seeding the platform's virtual file system with each root before registering it.
+- The path canonicalisation that makes exact-equality matching work at all.
+- The batch classifier: its three outcomes, the exact-path set behind each of the first two, the extension rule behind the third, and why every path in a batch is examined.
+- The commit-time debounce timer, its window, and the escalation rule that decides which refresh it runs — stated here in full.
+- The note-source debounce timer, its accumulating path set, its enablement gate, and the membership question it asks.
+- Lifecycle: start inside service initialization, tear down with the service, including handing the watch roots back.
 
-Out of scope: the packed-refs file (only the loose ref form is observed, since the queue worker writes loose refs); UI rendering of the refreshed memory list; the queue worker itself; the command-line surface's *own* watchers, which push refresh notifications over the bridge and are owned by spec 289.
+**Out of scope (boundaries):**
+- What either refresh recomputes, and the two disjoint listener lists they wake — spec 124.
+- The command-line surface's **own** watchers, which push notifications over the connection and reach the same two refreshes independently — spec 289.
+- The canonical statement of the escalation rule — spec 338 (inlined below, as every dependent spec must).
+- The packed form of the memory reference: only the loose form is observed, because the writer writes loose references.
+- Which files back a working-area note — a decision the command-line side owns; this component only asks.
+- The writer whose sequence of object writes is what the debounce window exists to collapse — spec 34.
 
 ## Data Contracts
 
-The watcher exposes no data shape of its own; its only output is a side effect on the project service: the cached status and the orphan-branch summary index are reloaded, and subscribed panels are notified.
+The watcher exposes no data shape of its own. Its only outputs are side effects on the project service: one of two refreshes, and — separately — a working-context refresh when a saved markdown file turns out to back a note.
 
-### Watch roots (two)
+### Watch roots (three)
 
-| Root | Location | Registered recursively? |
+All three are registered **non-recursively**, and the platform de-duplicates them, which matters because two of them are frequently the same directory.
+
+| Root | Location | Present when? |
 | --- | --- | --- |
-| Orphan ref parent | The main repo root's git directory, under `refs/heads/` along the orphan branch's path | No |
-| Jolli state directory | `<main-repo-root>/.jolli/jollimemory` | No |
+| Memory-reference parent | The **leaf parent** of the memory reference file, under the project root's repository directory | Only once a memory has been written; and only when the project root's repository entry is a **directory** |
+| Per-project state directory | The product's state directory under the project root | Created by ordinary product use |
+| Profile directory | The product's state directory under the **main** checkout, resolved through the repository's shared directory | Once a profile has been written; equals the row above on the main checkout |
 
-The user-global agent plans directory is **no longer watched**. Nothing outside the repository is observed.
+The first two are resolved against the **resolved repository root** the service computed during initialization — which is the top level for the project directory, i.e. the current checkout's own root, not its parent's. Only the profile directory is deliberately anchored to the main checkout, so a disable performed from any checkout of the repository is observed from every other one.
 
-### Target files (four, matched by exact path)
+Nothing outside the repository is watched. The machine-global agent-plans directory is **not** a root here.
 
-Change events are not scoped per root or per event kind. The platform delivers every virtual-file-system change in a batch, and the listener keeps only events whose full path exactly equals one of:
+### Target paths (four exact, plus one extension rule)
 
-- the orphan ref's leaf file under the orphan ref parent (the final segment of the hierarchical orphan branch name);
-- `worker.lock` in the Jolli state directory — the queue worker's liveness lock, whose observation is also what keeps the service's cached "worker busy" state fresh for action-enablement checks that must not touch disk;
-- `lock` in the Jolli state directory — the queue drain's exclusion lock;
-- `plans.json` in the Jolli state directory — the plan registry.
+Change events are not scoped per root or per event kind — the platform delivers every change in the process as a batch, and the listener filters. Four full paths are matched by **exact string equality**, each built by joining a filename onto the canonical form of its root:
 
-There are no per-directory event-kind registrations (create / modify / delete), no filename-suffix matching, and no `.md` extension rule. Any event kind on a matching path counts as relevant; every event on any other path is ignored.
+| Path | Outcome | Why it is watched |
+| --- | --- | --- |
+| The memory reference's leaf file under the reference parent | commit-time | The background worker updates it after writing a memory |
+| The worker's liveness lock in the state directory | commit-time | Also what keeps the cached worker-busy flag fresh for action-enablement checks that must not touch disk |
+| The queue drain's exclusion lock in the state directory | commit-time | Worker lifecycle |
+| The repository profile file in the profile directory | commit-time | Carries the repository-wide manual opt-out, which **only** the heavy refresh reads |
+| The working-context registry in the state directory | working-area | A plan, note or reference moved |
+
+Any other path whose name ends in the markdown extension — matched **case-insensitively, anywhere on the filesystem** — is collected for the note-source check. Everything else is ignored.
+
+A target path is only live when its root existed at startup; when a root was skipped, the paths built from it are absent and their events fall through to the extension rule (and then to being ignored).
+
+**The profile file is grouped with the commit-time paths on purpose, not by accident of location.** It sits in the same directory as the working-context registry, but the opt-out it carries is read only by the heavy refresh, so routing it to the cheap repaint would leave a disable typed in a terminal — or performed in a sibling editor window — invisible in this IDE.
 
 ### Path canonicalisation
 
-Each of the four target paths is canonicalised once at startup — resolving symbolic links along the whole path and normalising backslashes to forward slashes — so it matches the form the platform reports in its events. Without symlink resolution, a platform whose temporary or system directories are symlinked (a `/var` → `/private/var` link, for example) would report a path that never string-equals the naively joined one, and no event would ever match.
+Each root's canonical form is taken from the platform's own answer when it accepted the path, and otherwise computed by resolving symbolic links along the whole path and normalising backslashes to forward slashes. The target paths are then built from that form.
+
+Without symlink resolution the comparison silently matches nothing: on hosts that route temporary and system directories through links, the platform reports a path that never string-equals a naively joined one. The presentation of that bug is a watcher that arms cleanly and then never fires.
 
 ## Behavior
 
-### Watcher startup
+### Startup
 
-During service initialization, after the bridge collaborators are built, watcher startup runs against the resolved main repo root. For each of the two roots it resolves the directory, asks the platform's local file system to refresh-and-find that path (seeding the virtual file system so subsequent events for it are delivered), and registers the root as a non-recursive watch root. It then subscribes to the platform's bulk file-change bus with a listener that runs after each change batch.
+Inside service initialization, after the bridge collaborators are built, startup runs against the resolved repository root. For each of the three roots, in order:
 
-A root that does not exist at startup is skipped, and **is not retried later** — the watcher performs no rescan, so a directory created after startup is never observed for the remainder of the session.
+1. Test whether the directory exists; if not, log and skip it — permanently for the session.
+2. Ask the platform's local file system to refresh-and-find the path, seeding its virtual file system so events for it are delivered at all (the repository's internal directories are outside project scope by default). A refusal is logged as a warning but does not stop the root being registered.
+3. Add the path to the set of roots to register.
 
-There is no watcher thread. The platform owns event delivery; the subscription is tied to the service's disposable, so the platform tears it down when the service is disposed. If the whole startup call throws, the failure is logged and no watching occurs for the rest of the session — the service then relies solely on the IDE's own repository-change events (which fire on working-tree changes but never on orphan-branch ref updates) and on refresh notifications pushed from the command-line side (spec 289). There is no periodic-poll fallback timer.
+The whole set is then registered non-recursively in one call, and the returned registration tokens are kept so they can be handed back on disposal. Finally the listener subscribes to the platform's bulk change bus.
 
-### Event filtering
+**The subscription is on the application-wide bus, not the project's.** Batches therefore include changes belonging to every other open project, which is why the extension rule can and does see markdown saves from outside this repository — deliberately, since a note references the user's own file wherever it lives, frequently outside the workspace.
 
-On each delivered change batch, the listener walks the batch's events and compares each event's reported path against the four canonicalised targets. It returns on the **first** matching path in the batch — the remaining events in that batch are not examined, because one match is all that is needed to schedule a refresh. There is no watch-key reset step and no per-root disambiguation, since matching is on the full path.
+A root that did not exist at startup **is not retried**; there is no rescan, so a directory created later is never observed for the rest of the session. If the whole startup call throws, it is logged and no watching occurs at all — the service then relies solely on the IDE's own repository-change events (which fire for working-tree changes but never for a memory reference update) and on the pushed notifications from the command-line side (spec 289). There is no periodic-poll fallback.
 
-### Debounced refresh
+### Batch classification
 
-Refresh scheduling uses a 500-millisecond, non-repeating timer. Each new relevant event stops the prior timer (if running) and starts a fresh one. The scheduling call early-returns when the service is already disposed. When the timer elapses it submits a status refresh to the project service on a background pool and completes. Because the queue worker performs its writes in a tight sequence, the burst of platform events collapses into a single refresh.
+On each delivered batch the listener returns immediately if the service is already disposed. Otherwise it walks **every** path in the batch and, per path, takes the first branch that matches:
 
-### Notification path
+1. Equal to the working-context registry → set the **working-area** flag.
+2. Present in the commit-time path set → set the **commit-time** flag.
+3. Ends with the markdown extension (case-insensitive) → append to the collected saved-markdown list.
 
-When the timer's task runs, it calls the project service's status refresh on a pooled background thread. That refresh recomputes the cached status and then fans out to all registered panel listeners (spec 124). Memory and commit panels reload their displayed entries.
+**Every path is examined; there is no early return.** The batches the platform delivers are merged, and an agent that commits at the end of its turn writes the working-context registry and the memory reference close enough together to land in one batch. Stopping at whichever appeared first would *drop* the other signal outright rather than demote it — and the escalation below can only merge calls that actually happen. Nothing polls to recover a heavy refresh that was never scheduled. A markdown save sitting behind a matched control file was lost the same way.
 
-### Worktree-aware path resolution
+The classifier is a pure function of the batch's paths and the resolved target paths, deliberately, because the listener it serves is an anonymous object inside a project-level service that no test can otherwise reach.
 
-Both roots are resolved against the main repo root, not the worktree directory. The orphan branch ref lives in the main repo's git directory, and the queue locks and plan registry live in the main repo's Jolli state directory; a worktree shares all of them with its parent. The service has already resolved the main worktree root before starting the watcher and passes that resolved value in.
+### Dispatch
+
+- If **either** flag is set, the commit-time debounce is scheduled **once**, carrying the commit-time flag as its argument. One call, not one per signal: a second call would only restart the timer.
+- If the saved-markdown list is non-empty, the note-source check is scheduled with it.
+
+**A batch that set both flags produces one call carrying the commit-time flag** — the working-area repaint is skipped entirely for that batch. That is the intended escalation, and it is also why a subscriber that sits only on the working-area list would be silently skipped by exactly the batch a committing agent produces (spec 124).
+
+### The commit-time debounce, and the escalation rule
+
+Scheduling returns immediately when the service is disposed. Otherwise it records the signal, stops any pending timer, and starts a fresh **500-millisecond non-repeating** interface-thread timer. When the timer elapses it re-checks disposal, **drains** the recorded signal, and only then hops to a background pool, where it runs the heavy refresh when the drain returned true and the light one otherwise.
+
+Because the writer performs its object writes in a tight sequence, the burst of platform events collapses into a single refresh.
+
+The pick between the two refreshes is governed by a shared, sticky, one-way escalation flag with exactly these semantics (canonical treatment: spec 338 — inlined here in full, as that spec requires of its dependents):
+
+- **Recording a commit-time signal sets the flag; recording a working-area signal does nothing at all.** That asymmetry *is* the rule — a light signal is never a demotion.
+- **Recording is a bare write of true, never a read-modify-write.** The tidier "flag becomes flag-or-signal" spelling is not atomic, and two concurrent commit-time signals can interleave their read and write phases and lose one of the trues — defeating the escalation in precisely the concurrent case it exists for. A lone write of true cannot be lost, and only draining or teardown ever writes false.
+- **Draining is a single indivisible read-and-clear**, not a read followed by an assignment. The pair leaves a window of its own: a commit-time signal landing between the read and the write is overwritten by that write, and the newly-opened window starts without the flag — the same loss, merely relocated. With one indivisible step a concurrent signal either lands inside the window being drained or survives into the next one, never in neither.
+- **The drain happens before the hop off the timer thread.** Draining after the hop would leave the flag set across the hop, so a signal arriving mid-dispatch would be consumed by the refresh already in flight instead of opening a fresh window. The drained boolean is carried across the hop as a plain value.
+- **Teardown clears the flag rather than draining it**, so that discarding the value reads as intent rather than as a dropped result.
+- The flag is safe for concurrent access, which this caller needs: it records from the platform's listener thread and drains on the interface thread.
+
+**Why demoting would be a bug rather than a tuning choice:** an agent that commits at the end of its turn produces a memory-reference update when the summary lands and a working-context registry rewrite moments later. Under last-writer-wins the second demotes the pending heavy refresh, and **nothing polls to recover it** — the memory the user just watched being created simply never appears in the sidebar until some unrelated event arrives. Escalation is one-way by design; being heavier than necessary is the safe way to be wrong.
+
+The identical rule, through the identical shared component, governs the pushed-notification channel's own debounce (spec 289).
+
+### The note-source check
+
+A **separate** 500-millisecond non-repeating timer, deliberately not shared with the one above: a markdown save and a working-context registry write are independent events, and one timer would let a burst of markdown saves keep cancelling a pending status refresh, or the reverse.
+
+Scheduling returns immediately when the service is disposed, when the cached status does not report the product as enabled, or when no repository root is resolved — the enablement check happens **before** the paths are recorded, so nothing accumulates while the product is off.
+
+Otherwise the batch's markdown paths are **added to** a pending set — accumulated, never replaced, because each batch is its own call and replacing would drop a note save that a later unrelated markdown write pushed out of the window. The timer is then restarted.
+
+When it elapses, on a background pool: drain the pending set wholesale, return if it is empty, ask the command-line side for the current note list and test whether any note's backing file is among the drained paths; on a thrown failure log and treat the answer as no. When the answer is yes, run the **working-context** refresh.
+
+**Both sides of the membership test are normalised before comparison**, because they come from producers that only agree on one platform family. The platform reports its paths forward-slashed on every operating system; a note's stored backing path is whatever separator the host that created it used. Case is folded **only where the filesystem is case-insensitive** — the same condition under which two spellings denote one file, so folding cannot match two genuinely distinct notes. A false positive costs one extra repaint and writes nothing, which is the cheap direction to be wrong in.
+
+**This is the one working-area signal that has no second path.** Editing a note's backing file reorders the working-area list through that file's modification time alone, with no write to the working-context registry and no pushed notification anywhere — so when this comparison misses, nothing recovers it and the list simply stops reordering.
 
 ### Shutdown
 
-On service disposal the debounce timer is stopped, cancelling any pending refresh that has not yet fired. There is no watcher handle to close and no thread to interrupt: the change-bus subscription unhooks itself through the service's disposable.
+On service disposal, the disposed marker is set first so a batch already in flight refuses to schedule anything. Then: both debounce timers are stopped (cancelling any pending refresh), the escalation flag is cleared, the pending markdown set is emptied, and the registration tokens are handed back to the platform's local file system inside a swallowing catch. The change-bus subscription unhooks itself through the service's own disposal handle; there is no watcher thread to interrupt.
 
 ## State Transitions
 
-The watcher has three operational states within a project session:
+### The watcher, within one project session
 
-- **Active** — both roots registered, the change-bus subscription live, debounce timer idle.
-- **Partially active** — the subscription is live but one of the two roots did not exist at startup; that root will not become observed if it is created later (no rescan).
-- **Inactive** — the whole watcher-startup call threw and was logged; no events are observed for the rest of the session.
+```
+[inactive]  ── startup call threw ───────────> stays inactive for the session
+                                                (no events observed at all)
 
-There is no transition back from inactive to active without a service restart.
+[active]        ── all three roots existed at startup
+[partly active] ── one or more roots missing at startup
+                   (their target paths are absent; no rescan ever restores them)
+
+[any] ── service disposal ──> timers stopped, flag cleared, pending set emptied,
+                              watch roots handed back
+```
+
+There is no transition from inactive back to active without re-initializing the service.
+
+### One delivered batch
+
+```
+[batch of paths]
+   → per path, first match wins:
+        working-context registry → record WORKING-AREA
+        a commit-time path       → record COMMIT-TIME
+        ends with .md            → collect for the note-source check
+      (every path examined; no early return)
+   → if either flag: ONE debounce call carrying the commit-time flag
+   → 500 ms interface-thread timer (restarted by each call)
+   → drain (indivisible) → hop to pool → heavy refresh if true, else light
+   → if markdown collected: accumulate into the pending set,
+        500 ms timer → pool → drain set → ask for the note list
+        → match ⇒ light refresh
+```
 
 ## Notable Behavior
 
-- **This watcher now runs *in addition to* the command-line surface's own watchers.** The long-lived bridge server watches the queue directory and the orphan ref directory itself and pushes `refresh` notifications to the plugin, which debounces them a second time before calling the same status refresh (spec 289). The two paths are independent and unsynchronised, and each has its own debounce window. **A single queue-worker run can therefore drive two status refreshes** — one from this watcher's 500-millisecond timer and one from the notification path's own — with no coalescing between them.
-- **The migration away from an operating-system watcher was made because that mechanism was unreliable, not merely to prefer a platform API.** The previous implementation silently degraded to ~10-second polling on one platform and regularly missed git's atomic-rename events entirely, so an orphan-ref update could go unobserved until some unrelated change forced a refresh.
-- **Matching is by exact full path, so a target file is observed wherever its directory is registered — and nothing else is.** A sibling file in either watched directory (a queue entry, a progress stream, a cursor file) produces no refresh at all, even though it lives inside a registered root.
-- **Symlink resolution is load-bearing, not cosmetic.** Comparing an unresolved path against the platform's reported path silently matches nothing, which presents as a watcher that arms cleanly and then never fires.
-- Only loose-form orphan refs are observed. If the user packs refs, subsequent updates to the loose ref still occur on the next worker write, so observation recovers automatically.
-- **Skipping a missing root is permanent for the session.** The very first time hooks are installed and the worker runs, the orphan ref directory may not have existed at startup, so this watcher misses the initial creation; the IDE's own repository-change event on the underlying commit, and the command-line side's notification channel, still force a refresh that picks up the new index.
-- Events are delivered off the IDE's UI thread; the refresh is dispatched onto a background pool, and panels marshal their UI updates back onto the UI thread when their listener callback fires.
-- There is no fallback poll timer that re-reads the ref hash on a fixed interval; invalidation relies on this watcher, the IDE's own repository-change events, or the command-line side's notifications.
+- **Matching is exact full-path equality, so a sibling file in a watched directory produces nothing at all.** A queue entry, a progress stream or a cursor file living inside a registered root is ignored — which is the whole point, since one of those directories also carries a log written many times a second.
+- **The markdown rule is the exception to that, and it is unbounded.** It matches by extension anywhere on the filesystem, on an application-wide bus, so every markdown save in every open project reaches this listener. The narrowing is done afterwards, by asking the command-line side which files back a note — because that decision lives in a registry this side does not own, and a note's backing file is frequently outside the workspace anyway.
+- **Skipping a missing root is permanent for the session.** The very first time hooks are installed and the worker runs, the memory-reference directory may not have existed at startup, so this watcher misses its creation entirely. The IDE's own repository-change event on the underlying commit, and the pushed notification channel, still force a refresh that picks up the new index.
+- **On a linked checkout the memory-reference root can never exist**, because the repository entry there is a file rather than a directory, so the joined path is not a directory and the root is skipped every time. Such a checkout observes memory writes only through the other two roots and through the pushed channel. (Notable.)
+- **Two of the three roots are usually the same directory**, and the third differs only on a linked checkout. Registration de-duplicates them, so this costs nothing; what it buys is that a disable performed from any checkout is observed from all of them.
+- **A batch that mixes the two control signals runs the heavy refresh only.** The working-area repaint is skipped for that batch, by design — and that is exactly the batch a committing agent produces. Nothing lands twice; the light refresh's own subscribers simply do not fire (spec 124).
+- **Symlink resolution is load-bearing, not cosmetic.** Comparing an unresolved path against the platform's reported path silently matches nothing, presenting as a watcher that arms cleanly and never fires.
+- **The move away from an operating-system watcher was made because that mechanism was unreliable, not merely to prefer a platform API.** The previous implementation silently degraded to roughly ten-second polling on one platform and regularly missed the brief atomic-rename events a repository update produces, so a memory reference update could go unobserved until some unrelated change forced a refresh.
+- **Only the loose form of the memory reference is observed.** If the user packs references, the next worker write recreates the loose form, so observation recovers automatically.
+- **This watcher runs *in addition to* the command-line surface's own watchers.** Those watch overlapping directories and push notifications that the plugin debounces a second time before calling the same two refreshes (spec 289). The two paths are independent, unsynchronised, and do not share an escalation flag instance — so **a single worker run can drive two refreshes**, each itself a round trip.
+- **Events are delivered off the interface thread**; the timers live on it, and each refresh is dispatched onto a background pool, with panels marshalling their own updates back when their callback fires.
+- **The note-source check accumulates rather than replaces**, and it drains wholesale. A save that arrives while a check is already scheduled is not lost, but a save that arrives *while the drained check is running* opens a fresh window rather than joining the one in flight.
+- **There is no fallback poll that re-reads the reference on a fixed interval.** Invalidation relies entirely on this watcher, the IDE's own repository-change events, or the pushed channel.
 
 ## Shared Behavior
 
-- The notification of panels uses the project-service status-listener bus described in spec 124; the watcher maintains no subscriber list of its own.
-- The resolved main worktree root is computed by the git wrapper (spec 126) and consumed here.
-- Reading the actual orphan-branch contents after a refresh goes through the summary store / summary reader (separate specs), not through this watcher.
-- **IDE-Bridge Refresh Notification Channel (289)** owns the second, command-line-side path into the same status refresh — including its watch targets, its own debounce, and the client-side debounce that follows it. That spec and this one describe two independent mechanisms with the same effect.
+- **Refresh Escalation Rule (338)** — the sticky, one-way, atomically-drained flag stated inline above in full; that spec is its canonical treatment and is also inlined by spec 289.
+- **IntelliJ Project Service Lifecycle (124)** — owns both refreshes, the two disjoint listener lists they wake, the disposed marker this listener checks, and the watcher's start and stop.
+- **IDE-Bridge Refresh Notification Channel (289)** — the second, independent path into the same two refreshes, with its own watch targets, filename gates and debounce; that spec and this one describe two mechanisms with one effect.
+- **IntelliJ Native Repository Wrapper (126)** — computes the resolved repository root consumed here.
+- **CLI Working-Context Service (337)** — owns the note list this component's membership test asks for, and the rule for which backing files a visible note has.
+- **Git Operation Queue Worker (34)** — the writer whose object sequence is what the 500-millisecond window exists to collapse.

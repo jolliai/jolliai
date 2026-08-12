@@ -12,7 +12,7 @@ Every mutually-exclusive critical section in the product is guarded by an adviso
 - The three location scopes a lock can have (per-worktree, shared across every worktree of one repository, machine-global for one user) and what each therefore serialises.
 - A complete catalogue of the product's locks: file name, location scope, default wait budget, and failure discipline.
 - The **strict** versus **best-effort** failure discipline, which locks have which, and why the distinction is load-bearing rather than stylistic.
-- Per-lock constraints that cannot be expressed by the primitive itself: the pair that must never be held simultaneously, the non-re-entrancy rule, and the one lock whose best-effort form now has no callers.
+- Per-lock constraints that cannot be expressed by the primitive itself: the pair that must never be held simultaneously, the non-re-entrancy rule, the one lock whose best-effort form now has no callers, and the one **documented writer that bypasses its lock entirely**.
 
 **Out of scope (boundaries):**
 
@@ -111,6 +111,21 @@ The consequence of that migration is visible to users: a profile write that cann
 - **No lock is re-entrant.** A flow that already holds a lock and takes it again polls until its budget expires. On a best-effort lock that degrades into running the inner section unlocked; on a strict lock it fails outright. The rule is therefore to wrap the leaf read-modify-write, never a caller that already holds the lock — and, for the strict pair, to pass an explicit "already held" signal down to a nested operation rather than letting it try to acquire again.
 - **The staleness ceiling is a contract with long holders, not just a cleanup value.** Any new long-running holder must refresh its modification time on an interval well under half the ceiling, or it will be reclaimed while still working.
 
+### One writer of a guarded document deliberately takes no lock
+
+The machine-global runtime-registry lock is strict, and every writer of the runtime registry is required to hold it — with one exception that is deliberate, documented in place, and worth stating here because "every writer takes it" is otherwise the rule this whole topic rests on.
+
+The repository's own IDE-sandbox launcher — a developer-facing script started by hand — writes two runtime-registry entries on every launch **without acquiring this lock**. Its defence, recorded beside the write, has two parts:
+
+1. **It is a development-only, interactively-invoked entry point.** It never fires from a hook, from continuous integration, from a package-manager post-install step, or from any autonomous flow, so the concurrent-writer workload the lock defends against is not one this script participates in.
+2. **Its write makes no decision.** The sanctioned writer reads the existing entry to decide keep-or-overwrite, which is exactly the check-then-act the lock closes; this script overwrites unconditionally. The only surviving race is therefore "which of two developer-initiated writes lands last", which is either indistinguishable (same content) or resolved by last-writer-wins.
+
+Its individual writes are still atomic (temporary file then rename), so a concurrent reader never sees a torn entry.
+
+**The exception's blast radius is not scoped to the sandbox.** There is one registry per user, and the script writes into it, so a concurrent enable or post-install refresh on the same machine can lose an update against it — and the entries it lands persist after the sandbox exits, by explicit design. The note beside the write states that if a future caller ever invokes this from a non-interactive path, the analysis no longer holds and the lock must be added.
+
+This is a **coverage** exception, not a discipline change: the lock is still strict for every other writer, and nothing about the primitive was softened to accommodate it.
+
 ### Residual races that are accepted, not fixed
 
 - **Stale-reclaim versus heartbeat.** Between a contender observing that a lock is older than the ceiling and its removal of that file, the holder can refresh the modification time once. The contender then deletes a now-fresh lock and both parties believe they hold it. Closing this needs an atomic "remove only if the modification time is unchanged" operation, which the primitive does not have. The window requires the refresh to land in the sub-millisecond gap at the one boundary tick inside a full heartbeat cycle.
@@ -133,7 +148,7 @@ For any single lock file:
 ## Notable Behavior
 
 - **The location choice, not the lock, is what makes serialisation correct.** A repository-wide state document guarded by a per-worktree lock is serialised against nothing when two working trees contend. This is why the repository profile and the repository hook lifecycle both live in the shared-across-worktrees directory even though most state locks are per-worktree: their writers are a command-line process in one working tree and an editor extension host in another.
-- **A lock only works if every writer takes it.** Partial coverage serialises nothing. Adding a new writer to any guarded document without routing it through the same lock silently reopens the window the lock exists to close.
+- **A lock only works if every writer takes it — and one guarded document already has a writer that does not.** Partial coverage serialises nothing, so adding a new writer to any guarded document without routing it through the same lock silently reopens the window the lock exists to close. The runtime registry carries exactly one sanctioned breach of that rule (the IDE-sandbox launcher), justified by being interactive-only and decision-free rather than by anything the primitive provides. Reading its justification as a general licence would be wrong: what makes it tolerable is precisely that it performs no read-modify-write, which is not true of any other writer of any guarded document here. (Surprising; the rule is stated absolutely elsewhere and has one live exception.)
 - **Best-effort was the original discipline; strict is the newer one.** The older state-document locks were all written to degrade rather than block, because their worst case was a small lost update. The locks added for durable lifecycle decisions inverted that on purpose, and the repository profile was migrated across the line. The two disciplines coexisting is deliberate, not an inconsistency to be normalised.
 - **The shortened automatic budget is a deferral mechanism, not an optimisation.** A background caller that would otherwise stall a user's session asks for a fraction of the normal budget precisely so that contention resolves as "try again next time" within milliseconds. This only works because the lock is strict: a short budget on a best-effort lock would make unlocked execution the common case rather than the rare one.
 - **An unused best-effort entry point is a hazard, not dead weight.** The retained best-effort wrapper over the repository profile lock still compiles and still degrades to unlocked execution; a future caller reaching for it by name would reintroduce exactly the race its callers were migrated away from.
@@ -142,7 +157,7 @@ For any single lock file:
 
 - **Per-worktree state directory**, **repository-shared state directory rooted at the common git directory**, and **the per-user machine-global state directory** are the three location conventions used throughout the product; the locks simply live in them alongside the state they guard.
 - **Hook installation orchestration** is the consumer of the two strict locks that must never be held simultaneously, and owns the user-facing message emitted for each acquisition failure.
-- **Per-source dist-path version selection** requires every registry writer to hold the machine-global runtime-registry lock, and deliberately leaves its own read-modify-write internally unlocked in reliance on that.
+- **Per-source dist-path version selection** requires every registry writer to hold the machine-global runtime-registry lock, and deliberately leaves its own read-modify-write internally unlocked in reliance on that. It also owns the full account of the one unlocked writer noted above — what it writes, what else it skips, and the machine-wide consequence of it.
 - **Npm postinstall dist-path refresh** turns a failure to acquire the machine-global lock into a complete silent skip.
 - **The repository-profile / manual-disable topic** owns the state guarded by the strict profile lock, including the abort-without-teardown behaviour on a lock timeout.
 - **Queue draining, orphan-branch writes, Memory Bank sync rounds, the plan/note registry, the commit-selection record, the pending-push ledger, session/cursor registries, and machine-global configuration** each own their guarded critical section; this topic owns only the lock characteristics.

@@ -1,305 +1,295 @@
-# VS Code External References Panel
+# 187. External Reference Rows in the Context List
 
 ## Topic Statement
 
-The sidebar rows that surface every active external reference (issue-tracker tickets, code-host issues, knowledge-base pages, messaging-thread mentions) within the merged Context list (formerly labelled "Plans & Notes") of the sidebar's Branch tab.
+The rows that surface every active external reference — issue-tracker tickets, code-host issues, knowledge-base pages, messaging threads, meeting artifacts, documentation lookups, deployment records — inside the editor extension's merged context list, covering how each registry row is projected into a row, what each affordance on it does, and why no visibility filter runs on this side at all.
 
 ## Scope
 
 **In scope:**
-- Reading the active reference set from the per-project plans registry and projecting one panel row per registry entry.
-- Optional per-source filtering at read time (one provider only); the filter itself is a plain string match against a source id, not bounded to the shared display table's known ids (see "One shared per-source table governs the entire surface" in Notable Behavior).
-- The migration-writeback path that re-saves the registry once on first read when load-time normalization purged legacy rows or fields.
-- Sort order of the projected rows: newest "last updated" first.
-- The per-row icon mapping keyed by source.
-- The per-row label, secondary description, and structured hover-card data.
-- The trash inline-action that hard-deletes both the registry row and the on-disk per-reference markdown file in that order.
-- The checkbox inline-action that toggles the row's per-row commit-exclusion state in the project's commit-selection store, keyed by the same `<source>:<native-id>` mapKey.
-- The two distinct row-activation paths: plain row click opens the local markdown file in an editor; the inline "open in browser" affordance and the hover-card "Open in <source>" link both open the upstream URL in the system browser.
-- The defense-in-depth URL-scheme re-validation at the open-in-browser sink (http or https only).
-- The stale-mapKey resolver run by every reference webview command before it acts.
-- The right-click context menu for a reference row.
-- The webview-to-host message protocol carrying the mapKey for open-in-browser, open-markdown, hard-delete, and checkbox-toggle.
-- The pre-archive vs post-archive mapKey shape and how the resolver tolerates both.
 
-**Boundaries:**
-- This spec does NOT cover how references are extracted from agent transcripts (see the transcript-reference-extraction spec).
-- This spec does NOT cover the on-disk persistence format of the per-reference markdown file or its frontmatter shape (see the reference-store markdown-persistence spec).
-- This spec does NOT cover the commit-exclusion store layout, lock semantics, or how commit-time consumers read the exclusion sets (see the commit-exclusion-store spec).
-- This spec does NOT cover the registry-load normalization that decides whether `changed` is true (see the plans-registry spec).
-- This spec does NOT cover how a reference is archived into a commit summary or how the registry row is removed at commit time. The panel assumes "every active registry row is shown."
-- This spec does NOT cover how plans and notes render in the same merged list; references appear alongside them as a third row type.
-- This spec does NOT cover the sidebar's other Branch-tab sections (Changes, Commits, Conversations).
-- This spec does NOT cover hover-card timer / positioning behaviour shared with non-reference rows.
+- Reading the active reference set from the per-project working-area registry and projecting one row per entry, with no filtering.
+- The load-time normalization that **drops** any row carrying commit-claim fields or the legacy hide flag, and the one-shot write-back it triggers.
+- The optional read-time per-source narrowing, and how it differs from the closed set used as a security boundary.
+- The shared per-source display table — label, badge letter, row icon, badge colour — and the neutral projection for a source outside it.
+- The per-row label policy, the sub-text, the structured hover card, and the plain-text tooltip the activity-bar surface uses instead.
+- The best-effort read of the per-reference markdown that supplies the field bag and the body preview.
+- Every affordance on a row: the include/exclude state, the pin, the edit, the removal, the preview, and the open-in-browser path — including which of them are suppressed for a link-less source.
+- The host-side stale-identifier resolver every reference command runs before acting.
+- The scheme re-validation at the open-in-browser sink.
+- Keeping an already-open preview current when the underlying file changes.
+
+**Out of scope (boundaries):**
+
+- The rendered-preview surface itself — its virtual-document scheme, its restore-after-reload resolution, its tab identity (spec 329). This spec says only which row action opens one and what keeps it fresh.
+- How references are extracted from agent transcripts and inserted into the registry (spec 153).
+- The on-disk format of a per-reference markdown file, its file-name key, and its frontmatter shape.
+- The commit-exclusion store's persistence, locking, and how commit-time consumers read its sets.
+- How a reference is archived onto a commit and removed from the registry at commit time; the committed-memory surface that renders archived references.
+- How plans, notes and the skill-usage row render in the same merged list (spec 114, spec 111).
+- The other sections of the same sidebar tab.
+- The hover card's timer, positioning and dismissal, shared with the other row types.
 
 ## Data Contracts
 
-### Source identifier enumeration
+### Reference row in the registry
 
-A single shared table drives every per-source display decision on this surface (icon, badge letter, badge color, and display label all come from the same table entry) — a new source is a single table row rather than a hunt across several independent switches. The table's built-in enumeration carries one row per known source id, each with its own badge letter, row icon, badge background color, and display label:
+| Field | Meaning |
+| --- | --- |
+| source | The upstream system's identifier. |
+| native id | The source-native key. |
+| title | Display name. |
+| url | Optional — a source may record a purely local lookup with no navigable page. |
+| source path | Absolute path of the per-reference markdown, always inside the per-project state directory. |
+| added-at / updated-at | ISO timestamps. |
+| source tool name | The tool call that surfaced it. |
 
-| Source id | Badge letter | Row icon | Badge color |
+**A reference row carries no commit-claim fields.** A commit deletes the row outright rather than guarding it, so every row present is by construction active and uncommitted — which is why nothing on this surface filters.
+
+### Load-time normalization
+
+Every read of the registry normalizes it first, and for this kind the normalization is destructive:
+
+| Rows dropped outright | Fields stripped from survivors |
+| --- | --- |
+| Any row carrying the legacy hide flag set to true, **or** a non-null commit hash, **or** a content-hash-at-commit field at all. | The hide flag, a branch, the commit hash, the content hash at commit. |
+
+Two consequences:
+
+- **The hide flag is a hard delete, not a soft hide.** A row carrying it does not survive the next load, and no surviving row can carry it. Nothing writes it, so it only ever fires against legacy data.
+- **A legacy row that was ever claimed by a commit is destroyed on load.** This is the migration from a world where a reference had a guarded, committed state to one where it does not.
+
+The drop is decided by the **presence of the commit-claim fields, deliberately not by a key that looks archived** — a live upstream identifier can legitimately end in eight digits, and digits are hexadecimal, so a key-shape test would silently delete active rows. A row whose key happens to end that way is therefore an ordinary active row and is projected verbatim.
+
+The normalization also returns a "did anything change" signal, which drives the migration write-back below. It rebuilds the registry container field by field, so the sibling plan, note and skill maps are carried through.
+
+### Row projection
+
+Reading the registry yields the active entries plus the change signal. For each entry the panel projects a row carrying:
+
+- The source id.
+- The native id.
+- The row identifier, which is exactly the registry key: the source and native id joined by a colon.
+- Title, url, source path, added-at, updated-at, a last-modified initialized from updated-at, and an optional source tool name.
+- An optional list of opaque `{key, label, value, icon?}` records read from the markdown's frontmatter.
+- An optional body preview cut to the first 200 characters, taken **after** the auto-generated note block has been removed at its sentinel — so explanatory boilerplate never reaches a tooltip or hover card.
+
+`url` is optional one layer upstream and an absent one is coerced to an empty string here, so every consumer can treat it as always present, with emptiness meaning "this source has no navigable page".
+
+Rows are sorted by last-modified, newest first. There is no tie-break beyond the registry map's own key iteration order.
+
+### The shared per-source display table
+
+One table drives every per-source display decision on this surface — icon, badge letter, badge colour and display label are all one lookup — so a new source is one table row rather than a hunt across independent switches.
+
+| Source | Badge letter | Row icon | Badge colour |
 | --- | --- | --- | --- |
-| An issue-tracker source | `L` | `issues` | `#5e6ad2` |
-| A wiki / knowledge-page source | `C` | `book` | `#1868DB` |
-| A second issue-tracker source | `J` | `issues` | `#0052cc` |
-| A code-host source | `G` | `issues` | `#6e7681` |
-| A knowledge-base / page source | `N` | `file-text` | `#787774` |
-| A messaging-thread source | `S` | `comment-discussion` | `#4a154b` |
-| A video-meeting source | `Z` | `device-camera-video` | `#2D8CFF` |
-| A meeting-document source | `Z` | `file` | `#2D8CFF` |
-| A task / project source | `A` | `checklist` | `#f06a6a` |
-| A work-management board source | `M` | `table` | `#ff3d57` |
-| A library-documentation source | `7` | `book` | `#0b7285` |
-| The first-party memory source | `J` | `history` | `#9B5CFF` |
+| First issue-tracker source | `L` | `issues` | `#5e6ad2` |
+| Wiki / knowledge-page source | `C` | `book` | `#1868DB` |
+| Second issue-tracker source | `J` | `issues` | `#0052cc` |
+| Code-host source | `G` | `issues` | `#6e7681` |
+| Knowledge-base page source | `N` | `file-text` | `#787774` |
+| Messaging-thread source | `S` | `comment-discussion` | `#4a154b` |
+| Video-meeting source | `Z` | `device-camera-video` | `#2D8CFF` |
+| Meeting-document source | `Z` | `file` | `#2D8CFF` |
+| Task / project source | `A` | `checklist` | `#f06a6a` |
+| Work-management board source | `M` | `table` | `#ff3d57` |
+| Library-documentation source | `7` | `book` | `#0b7285` |
+| First-party memory source | `J` | `history` | `#9B5CFF` |
+| Deployment source | `V` | `rocket` | `#4d4d4d` |
 
-Per-source display labels are used in the hover-card "Open in <source>" action and any user-facing source-name surface.
+Collisions are tolerated throughout, because the source id is the unique key and letter and icon are display-only: the two meeting sources share both letter and colour and differ only by icon; the wiki and library-documentation sources share the `book` icon; the second issue-tracker source and the first-party memory source share the letter `J` on different colours. The library-documentation source's badge glyph is a **digit** rather than a letter.
 
-**The two meeting sources share the same badge letter `Z`** (and the same badge color); they are distinguished only by their row/hover icons — the video-meeting source renders a camera glyph, the meeting-document source renders a plain file glyph. A source id is otherwise the unique key; the letter is display-only and need not be unique.
+Two colour choices are deliberate rather than incidental. The code-host source and the deployment source are both monochrome brands, and the deployment source's hue is explicitly **not** pure black: the value is emitted as a chip background, and a high-contrast theme paints the panel behind it black too, which would render the chip invisible and leave a bare floating letter. It is also kept distinct from the code-host source's lighter, blue-tinted grey so the two do not read as one source.
 
-**Two further collisions exist in the table.** The library-documentation source's badge letter `7` is the table's **first non-alphabetic glyph** — it is a digit taken from the source's own name rather than an initial, because its initial would collide with the code-host source's `C`-adjacent set. And the `book` row icon is now shared by two entries: the wiki source and the library-documentation source, distinguished only by badge letter and badge color. Both collisions are tolerated for the same reason as the meeting pair: the source id is the unique key, and letter/icon are display-only.
+A source id outside the table falls back to a **neutral projection**: the label is the raw id, the badge letter is the id's first character upper-cased, the row icon is a generic link glyph, and the badge colour is a neutral grey — the same hue the code-host source happens to carry. That lookup is an own-property check rather than a truthiness test, so an id colliding with an inherited object member still resolves to the neutral projection instead of a bogus entry.
 
-**A third letter collision arrived with the first-party memory source**, whose `J` is also the second issue-tracker source's letter. Tolerated on the same grounds, plus one more: the badge colors differ, and this is the only first-party brand in the table.
+The neutral colour must be the same value in three places — this fallback and the kind-marker rule in each of the two webviews that render context rows — because a webview routes an unknown source to the kind marker's class (its per-source siblings are generated from the table, so an unknown id matches none), making that rule the actually-rendered fallback.
 
-The table's own enumeration is not the outer bound of what this surface can display: a source id outside the table falls back to a **neutral projection** rather than an error — a synthesized label equal to the raw id, a badge letter equal to the id's first character uppercased, a generic linking icon (`link`), and a neutral (non-branded) badge color (`#6e7681`, the same hue as the code-host source's color). This fallback is what makes the read-time per-source filter (below) tolerant of a source id the table doesn't yet know about, and is also mirrored independently by the webview-side badge renderer so the two stay visually consistent without a round trip to the host.
-
-The table is also the security boundary for inbound webview messages: the closed set of ids it enumerates is exactly the allow-list an inbound "open this evidence reference" message's source field is checked against before it is trusted. Adding a table row therefore also makes that source's rows openable through that path — the two are the same edit.
-
-The neutral fallback uses an own-property lookup into the table (not a truthy check), so an id colliding with an inherited object member (e.g. `toString`, `constructor`) still resolves to the neutral projection rather than a bogus table entry.
-
-### Registry projection
-
-Reading the project's reference registry yields a list of zero or more entries plus a `changed` flag indicating whether load-time normalization mutated the in-memory snapshot.
-
-For each entry, the panel projects a "reference info" row carrying:
-
-- `source` — one of the table's known source ids, or (in principle) an id outside that set, handled by the neutral fallback described above.
-- `nativeId` — the source-native identifier (e.g. ticket key, `<owner>/<repo>#<number>`, page id, or a channel-plus-timestamp identifier for the messaging-thread source).
-- `mapKey` — exactly `<source>:<native-id>` for pre-archive rows; the bareId portion of an archived row may carry a content-hash suffix appended by an upstream layer, so the same `<source>:<bareId-with-suffix>` form must still survive the projection unchanged.
-- `title`, `url`, `sourcePath` (the absolute path of the per-reference markdown), `addedAt`, `updatedAt`, `lastModified` (initialized to `updatedAt`), and an optional `sourceToolName`. `url` is modeled as optional one layer upstream (a reference can in principle carry no link), but this projection always yields a string: an absent upstream `url` is coerced to the empty string here, so every consumer of this row can treat `url` as always present.
-- An optional `fields` list of opaque `{key, label, value, icon?}` records read from the markdown's frontmatter.
-- An optional `description` preview cut to the first 200 characters of the markdown body **after** the auto-generated note block has been cut off at its sentinel (see "Frontmatter parsing" step 5), so the explanatory note text never appears in a row tooltip or hover card.
+The per-source class token used by those generated rules is derived from the source id with every byte outside the legal identifier set folded to a dash, because a source id is an open string read from disk: a raw one could otherwise end the token early and inject a second class or break the selector. The generated rules **must** be emitted after the kind marker's rule — the two selectors have equal specificity, so source order decides.
 
 ### Display fields per row
 
-| Field          | Source                                                                                                         |
-| -------------- | -------------------------------------------------------------------------------------------------------------- |
-| Label          | For the three **native-id-leading tracker sources** (the two issue-tracker sources plus the code-host source): `<native-id> — <title>`. For every other source (the two knowledge-page sources, the messaging-thread source, the two meeting sources, the task/project source, the work-management board source, the library-documentation source, and any source outside the known set): `<title>` only. The tracker set is exactly the three whose nativeId is a human-recognizable key; a new source is title-only by default and opts in only if its nativeId is user-facing. The library-documentation source is title-only, so its row reads as the bare library name rather than repeating the slash-prefixed identifier alongside it. |
-| Description    | A short relative-time string derived from `lastModified`.                                                      |
-| Row icon       | Per-source, from the shared table (see the enumeration above): `issues` for the three tracker sources; `file-text` for the page source; a comment/discussion glyph for the messaging-thread source; `book` for the wiki source **and** for the library-documentation source; `device-camera-video` for the video-meeting source; `file` for the meeting-document source; `checklist` for the task/project source; `table` for the work-management board source; a generic linking glyph (`link`) for any source outside the known set.              |
-| Selection      | A checkbox keyed by `mapKey`; checked iff the per-row commit-exclusion store does NOT carry this mapKey.       |
-| Inline actions | One "open in browser" affordance and one "remove" (trash) affordance, both keyed by `mapKey`.                  |
-| contextValue   | The literal `"reference"` (uniform across every source).                                                   |
+| Field | Value |
+| --- | --- |
+| Label | For the three **native-id-leading tracker sources** (the two issue trackers plus the code host): the native id, an em dash, then the title. For every other source, including one outside the table: the title alone. |
+| Sub-text | A short relative-time string derived from last-modified — except for an accumulating source, see below. |
+| Row icon | Per-source, from the shared table; the generic link glyph for a source outside it. |
+| Inclusion state | Keyed by the row identifier; included exactly when the per-row commit-exclusion set does **not** carry that identifier. |
+| Inline actions | Pin, edit, remove, and the include/exclude toggle. |
+| Row kind marker | The literal reference marker, uniform across every source. |
 
-### Hover-card payload
+The label policy is defined once in a shared display module reused by this surface, the committed-memory view and the command line's own markdown renderers, so the three cannot drift.
 
-A structured hover-card record:
+### Hover card
 
-- `title`: same string as the row label.
-- `source`: the source id.
-- `fields`: omitted when the registry+frontmatter projection produced an empty field list; otherwise the same opaque `{key, label, value, icon?}` list, rendered as one row each with the field's chosen icon and value text.
-- `url`: the upstream URL (already coerced to the empty string when absent, per the registry-projection note above).
+A structured record carrying the same string as the row label, the source id, the field list when non-empty, and the url. The card's title row is prefixed with the same coloured square-letter badge used elsewhere on this surface, from the same table, with the same neutral fallback. Its action row offers "Open in *source*", falling back to a generic "Open in Browser" label when the source id has no registered display label; activating it dispatches through the same scheme-guarded sink the other open paths use.
 
-The hover-card's title row is prefixed with the same colored square-letter badge used elsewhere on this surface (see "Badge color" below): the letter and background color both come from the shared per-source table (`L` / `C` / `J` / `G` / `N` / `S` / `Z` / `Z` / `A` / `M` / `7`); a source id outside the table falls back to a badge letter equal to the id's first character uppercased, on the neutral background color. The card's "Open in <source>" action falls back to the literal label "Open in Browser" when the source id has no registered display label (the same table lookup miss that drives the badge-letter fallback).
+**The card's separator rule is conditional on something following it.** The tail — an exclusion-reason block, then the action row — is assembled before the rule is emitted, and the rule is emitted only if that tail is non-empty; otherwise a link-less source with no exclusion reason would show a bare line with nothing beneath it. The reason block's own trailing rule, which assumes an action row follows, is likewise dropped when none does.
 
-Clicking the "Open in <source>" (or "Open in browser") action dispatches the open-in-browser command through the same scheme-guarded sink that the inline "open in browser" affordance uses.
+### Plain-text tooltip
 
-### Plain-text tooltip (activity-bar fallback)
+The native tree surface reads a plain-text tooltip instead: the label line, then a blank line and one `label: value` line per field when fields are present, then a blank line and the url, then a blank line and a 200-character body preview with a trailing ellipsis when the body is longer. Inside the webview the row's native tooltip attribute is suppressed so this does not double up with the structured card.
 
-The native tree-view surface reads a plain-text tooltip composed of:
+### Message protocol
 
-- The label line (`<native-id> — <title>` for one of the three tracker sources, or `<title>` only for a title-only source — the two knowledge-page sources, the messaging-thread source, the two meeting sources, the task/project source, the work-management board source, the library-documentation source, or a source outside the known set).
-- A blank line then one `<label>: <value>` line per field, when fields are present.
-- A blank line then the URL.
-- A blank line then a 200-character body preview with a trailing ellipsis when the body exceeds 200 characters.
+Outbound, from the webview:
 
-Inside the webview, the row's native `title=` attribute is suppressed so this plain-text tooltip does not double-up with the structured hover-card.
+- **Open in browser**, carrying the row identifier — the hover card's action and the context menu's entry.
+- **Open the markdown in an editor**, carrying the row identifier — the inline edit button and the context menu's edit entry.
+- **Open the rendered preview**, carrying the row identifier — a plain row click and the context menu's preview entry.
+- **Remove**, carrying the row identifier — the inline trash and the context menu's remove entry.
+- **Toggle inclusion**, carrying the row identifier and the new state.
 
-### Webview message protocol
+Inbound: the panel re-renders from a refreshed projection whenever the working-area store fires its change event, which both the removal and the inclusion toggle trigger after they persist.
 
-Outbound (webview → host):
+### Commit-exclusion key contract
 
-- `branch:openReference { mapKey }` — inline affordance, hover-card action, and context-menu "Open in browser".
-- `branch:openReferenceMarkdown { mapKey }` — context-menu "Open Markdown" and plain row click.
-- `branch:ignoreReference { mapKey }` — inline trash, context-menu "Remove".
-- `branch:toggleReferenceSelection { mapKey, selected }` — checkbox change event.
-
-Inbound (host → webview): the panel re-renders from a refreshed projection when the plans store fires its change event, which the reference-delete and the checkbox-toggle paths both trigger after they persist.
-
-### Commit-exclusion store key contract
-
-The mapKey passed in `branch:toggleReferenceSelection` is forwarded verbatim into the commit-exclusion store under a fixed top-level key ("references"). The same `<source>:<native-id>` string keys the exclusion set across the panel's checkbox state and the commit-time consumer.
+The row identifier is forwarded verbatim into the commit-exclusion store under its references key. The same string keys the exclusion set across the row's inclusion state and the commit-time consumer.
 
 ## Behavior
 
 ### Producing the row list
 
-1. Load the project's plans registry. The loader returns the parsed registry and a `changed` flag.
-2. If `changed` is true, take the plans lock and re-read inside the lock; if the in-lock re-read also reports `changed`, persist the normalized registry. If a concurrent writer already normalized it (the in-lock re-read reports `changed=false`), skip the save. The display list below is built from the pre-lock snapshot; the writeback is purely a one-shot migration.
-3. Iterate the entries in the registry's `references` map. For each entry whose source matches the optional source filter (or every entry when no filter is set):
-   - Read the per-reference markdown file at the entry's `sourcePath` and parse its frontmatter. Tolerate any I/O or parse failure by returning an empty parsed result.
-   - Build the reference-info row from the registry fields plus the parsed `fields` and `description` (when each is non-empty).
-4. Sort the resulting list by `lastModified` descending.
+1. Load the working-area registry. The loader returns the normalized registry and the change signal.
+2. If the signal is set **and** the in-process disabled mirror is not, take the registry lock and re-read inside it; persist only if the in-lock re-read also reports a change. If a concurrent writer already normalized it, the save is skipped. The display list is built from the **pre-lock** snapshot; the write-back is purely a one-shot migration.
+3. Iterate the registry's reference entries. For each entry whose source matches the optional per-source narrowing (or every entry when none is set):
+   - Read the per-reference markdown at the entry's source path and parse its frontmatter, tolerating any read or parse failure by returning an empty result.
+   - Build the row from the registry fields plus the parsed field list and body preview, each included only when non-empty.
+4. Sort by last-modified, descending.
 
-The list returned is the input to the renderer; every entry currently in the registry is by contract an "active, uncommitted" reference because commit-time consumers delete the entry as part of archival. No archive-guard filter runs on this side.
+No archive-guard filter runs on this side, because there is no guarded state to filter.
 
-### Frontmatter parsing for the fields bag and description preview
+### Frontmatter parsing
 
-Reading the per-reference markdown is best-effort and tolerant:
+Best-effort and tolerant:
 
-1. If the file cannot be read, return empty.
-2. If the first non-blank line is not the fenced opening `---`, return empty.
-3. Scan forward for a closing `---` line; if missing, return empty.
-4. Between the fences, look for a single line whose trimmed text is exactly `fields:`. From that line forward, treat every line matching the pattern `<whitespace>- <text>` as a list item; parse `<text>` as JSON.
-   - Skip an item whose JSON parse fails.
-   - Skip an item that parses but does not match the `{key: string, label: string, value: string, icon?: string}` shape (including: not an object, missing any required string, icon present and not a string).
-   - The first line inside the fields block that is not a list item resets the parser out of "in fields" mode but does not terminate frontmatter scanning; later non-list scalar lines are silently ignored.
-5. After the closing fence, read the body, **truncate it at the first occurrence of the auto-generated-note sentinel** (an HTML comment; everything from it onward is discarded), then strip leading and trailing blank lines, and emit the first 200 bytes as the description preview when the result is non-empty. The truncation runs before the blank-line strip and applies regardless of which source the file names. This reader carries its own copy of the sentinel string rather than importing the writer's, so it must stay in lockstep with the persistence layer's own strip (see the reference-store markdown-persistence spec).
-6. Return the collected fields (when non-empty) and the description preview (when non-empty).
+1. An unreadable file yields nothing.
+2. If the first non-blank line is not the opening fence, yield nothing.
+3. Scan forward for a closing fence; if missing, yield nothing.
+4. Between the fences, find a line whose trimmed text is exactly the field-list key. From there, treat every line matching "whitespace, dash, space, text" as a list item and parse the text as structured data. Skip an item that fails to parse, and skip one that parses but does not match the `{key, label, value, icon?}` shape — including a non-object, a missing required string, or a non-string icon. Already-collected items are kept. The first line inside the block that is not a list item takes the parser out of list mode but does not stop scanning; later non-list lines are ignored.
+5. After the closing fence, read the body, **truncate it at the first occurrence of the auto-generated-note sentinel**, strip leading and trailing blank lines, and emit the first 200 characters as the preview when the result is non-empty. The truncation runs before the blank-line strip and applies regardless of source. This reader carries its own copy of the sentinel rather than importing the writer's, so the two must be kept in lockstep.
 
-### Render path (per row)
+### Row rendering
 
-For each reference info:
+1. Choose the row icon from the shared table, or the generic link glyph for an unknown source. The leading badge additionally carries the table's per-source background colour, or the neutral fallback.
+2. Render the inclusion state. The checkbox element remains in the document as the state holder for the change handler, but the visible affordance is a strikethrough include/exclude toggle in the hover action cluster, which flips the checkbox and redispatches its change event — so the wire protocol is unchanged. The toggle's glyph reads **both** strike axes: any struck row (user-excluded or soft-excluded by the summarizer) offers "add back"; only a fully normal row offers "leave out".
+3. Render the label and the sub-text.
+4. Render the inline action cluster: pin, edit, remove, then the include/exclude toggle, each carrying the row identifier.
+5. Set the row's kind marker and clear the native tooltip attribute so it does not compete with the hover card.
 
-1. Choose the row icon from the shared per-source table (see "Source identifier enumeration"): the page source renders `file-text`, the messaging-thread source renders its own comment/discussion glyph, every tracker source renders `issues`, the wiki source and the library-documentation source both render `book`, the video-meeting source renders `device-camera-video`, the meeting-document source renders `file`, the task/project source renders `checklist`, the work-management board source renders `table`, and a source outside the table renders a generic linking glyph (`link`). The row's leading badge (used in the merged-list context rows and the hover card) additionally carries the table's per-source background color, or the neutral fallback color for an unrecognized source — a deliberate reversal of an earlier "no brand tints" design; see "Badge color" in Notable Behavior.
-2. Render the leading checkbox; its `checked` state mirrors the row's `isSelected` projection (computed by the upstream serializer against the project's commit-exclusion "references" set, with "not excluded" meaning "checked").
-3. Render the label and the short-relative-date description.
-4. Render the inline action group: an "open in browser" iconbutton, then a trash iconbutton, both carrying the row's `mapKey` as `data-id`.
-5. Set the row's `contextValue` data attribute to `"reference"`; clear the native `title=` so it does not compete with the hover-card.
-
-### Sort behaviour
-
-Single sort: `lastModified` descending. There is no tie-break ordering among references with identical timestamps beyond Object-key iteration order of the underlying registry map.
-
-### Hover-card behaviour
-
-The hover-card opens after the shared mouseover delay (~1s), positions relative to the cursor, and stays open during a short grace period after mouseout to allow the cursor to land on the card itself. Inline-action buttons inside the row dismiss the hover-card immediately so a button tooltip does not stack on top of the card. The card's "Open in <source>" link posts the same open-in-browser command path used by the inline affordance and the context-menu entry.
+Pin is suppressed while viewing another repository's memories read-only.
 
 ### Click dispatch
 
-When a click lands on a row with `contextValue="reference"`:
+When a click lands on a reference row:
 
-1. If the click landed on the checkbox, route through the checkbox handler (see below) and short-circuit.
-2. If the click landed on the trash inline button, post `branch:ignoreReference` with the row's mapKey.
-3. If the click landed on the open-in-browser inline button, post `branch:openReference` with the row's mapKey.
-4. Otherwise (plain row click), post `branch:openReferenceMarkdown` with the row's mapKey.
-
-### Checkbox change
-
-The checkbox's change event posts `branch:toggleReferenceSelection { mapKey, selected }`. The host:
-
-1. Calls into the commit-exclusion store, setting `(references, mapKey)` excluded when `selected` is false, and clearing the exclusion when `selected` is true.
-2. Re-queries the plans store's exclusions so the projected `isSelected` for every row stays current.
-3. Re-renders the panel.
+1. A click on the inclusion checkbox routes to the inclusion handler and short-circuits, so selecting never also opens anything.
+2. A click on an inline button routes by that button's action — pin, edit (open the markdown in an editor), or remove.
+3. **Any other click on the row opens the rendered preview.** This is the change from the earlier behaviour, where a plain row click opened the raw markdown file: every context row now previews on click, and reaching the real file is an explicit action.
 
 ### Context menu
 
-On right-click of a reference row, the panel shows a three-item menu with a separator:
+Right-clicking a reference row shows: **Preview**, then **Edit Markdown**, then **Open in Browser** — included only when the row's url resolved and is non-empty — then a separator, then **Remove**. The native browser menu is always suppressed inside the panel.
 
-1. "Open in browser" → posts `branch:openReference` verbatim.
-2. "Open Markdown" → posts `branch:openReferenceMarkdown` verbatim.
-3. (separator)
-4. "Remove" → posts `branch:ignoreReference` verbatim.
+### Inclusion toggle
 
-The native browser context menu is always suppressed inside the panel.
+The toggle posts the row identifier and the new state. The host sets the identifier excluded when the new state is "not included" and clears the exclusion otherwise, re-queries the exclusion sets so every row's projected state stays current, and re-renders.
 
-### Host-side stale-mapKey resolution
+### Stale-identifier resolution
 
-Every reference command on the host (open in browser, open markdown, ignore) first calls a shared resolver:
+Every reference command on the host first runs a shared resolver: re-read the active reference list, find the entry whose identifier equals the posted one, and — if it is absent — log a warning, surface a toast saying the reference is no longer in the active panel (likely archived or removed) with an instruction to refresh, and return without acting. Only a resolved row is handed to the action.
 
-1. Read the active reference list again.
-2. Find the entry whose `mapKey` equals the posted mapKey.
-3. If not found, log a warning and surface a user-facing toast saying the reference is no longer in the active panel (likely archived or removed) and instructing a refresh. Return without acting.
-4. If found, hand the resolved row to the bridge method for that command.
+This guards a click on a row the webview rendered before the host finished refreshing after a commit or a concurrent removal. Without it the removal path would silently return and the open paths would silently do nothing.
 
-This guards against a click on a row that the webview rendered before the host store finished a refresh from a commit or a concurrent removal.
+### Removal
 
-### Hard-delete
+Removal is a **rule owned by the command line and shared by both IDE hosts**, not a per-host implementation.
 
-The "ignore" command:
+1. Take the registry lock.
+2. Re-read the registry inside it.
+3. If the identifier is absent, release and return.
+4. Delete the entry and write the registry back, rebuilt field by field so the plan map, the note map **and the skill map** are carried through — removing one reference must not erase the skill registry.
+5. Release the lock.
+6. After the lock is released, best-effort delete the per-reference markdown. A missing file is tolerated and any error is swallowed, because the row is already gone.
+7. Refresh the working-area store so the panel re-renders without the row.
 
-1. Acquires the plans lock.
-2. Re-reads the registry inside the lock.
-3. If the mapKey is not present, releases the lock and returns (no-op).
-4. Removes the entry from the registry's `references` map.
-5. Writes the registry back, preserving the registry version, the `plans` section, and the `notes` section verbatim.
-6. Releases the lock.
-7. After the lock is released, best-effort deletes the per-reference markdown at the removed entry's `sourcePath`. A delete error is swallowed; the registry row is already gone.
-8. Triggers a plans-store refresh so the panel re-renders without the row.
+Reference markdown always lives inside the per-project state directory, so — unlike plan and note removal — no internal-versus-external location test is needed. No tombstone is written: a later re-mention of the same entity re-discovers the row and re-creates the file.
 
-There is no tombstone: a future re-reference of the same logical entity re-inserts the row and re-creates the file.
+### Open in browser
 
-### Open-in-browser with scheme re-validation
+1. Parse the row's url through the platform's parser.
+2. If the scheme is not exactly one of the two web schemes, log a warning naming the source, native id and scheme, surface a warning toast, and return without invoking the browser.
+3. Otherwise ask the platform to open it externally and return the platform's result.
 
-The open-in-browser handler:
+This is defence in depth: each upstream adapter already gates incoming urls, but the url flows through a user-editable registry on disk, so the sink re-validates rather than trusting the saved value.
 
-1. Parses the row's `url` through the platform's URI parser.
-2. If the parsed scheme is not exactly `http` or `https`, logs a warning identifying the source/nativeId/scheme, surfaces a user-facing warning toast, and returns `false`. The browser is NOT invoked.
-3. Otherwise asks the platform to open the URL externally; returns the platform's success boolean.
+### Opening the markdown
 
-The rationale is defense-in-depth: each upstream adapter already gates incoming URLs through `^https?://`, but the URL flows through the registry on disk (a user-editable file), so the sink revalidates rather than trusting the saved value.
+The resolved row's markdown file is opened at its absolute path in a text editor, editable.
 
-### Open-markdown
+### Keeping an open preview current
 
-The open-markdown handler resolves the row, then opens the per-reference markdown file at its absolute `sourcePath` in an editor.
+A reference preview is a rendered virtual document, so unlike the plan and note previews — which hand a real file to the built-in preview and get re-rendering for free — the body it was opened with is the body it keeps. Two paths push a change at it, both ending in the same lookup: re-read the active reference list, find the row whose source path is the changed file, and refresh that preview.
+
+1. **A document save.** Every markdown save in the workspace reaches this handler. It returns early unless the saved path is under the references tree, and again unless a reference preview is actually open.
+2. **A watcher over the references tree**, on create and change, matching all descendants rather than only the current one-directory-deep layout so a future deeper layout does not silently stop matching. It applies the same open-preview gate before the lookup.
+
+Both gates exist for the same reason: listing active references costs a registry parse plus one synchronous file read per active row, and with no preview open the refresh is a guaranteed no-op — so the lookup behind it would buy nothing. An out-of-band rewrite (an agent re-observing the same tool call) produces no save event at all, which is the half the watcher covers.
+
+### The activity-bar surface
+
+The native tree row is a separate surface with the same per-source icon and the plain-text tooltip above, and its **click still opens the raw markdown file** rather than the preview. It has no inline actions and no hover card.
 
 ## State Transitions
 
-### Panel-level row lifecycle
-
-| From                | Trigger                                            | To                                                              |
-| ------------------- | -------------------------------------------------- | --------------------------------------------------------------- |
-| (absent)            | Upstream extractor inserts a new registry entry    | Row appears at the top of the merged list on next refresh.      |
-| Visible             | User toggles checkbox off                          | Row stays visible; commit-exclusion set carries the mapKey.     |
-| Visible             | User toggles checkbox on (when previously off)     | Row stays visible; commit-exclusion set drops the mapKey.       |
-| Visible             | User clicks trash / Remove                         | Registry row deleted, markdown file deleted, panel re-renders without the row.   |
-| Visible             | Upstream consumer deletes the entry at commit time | Row disappears on next refresh; commit-exclusion entry for the mapKey may persist orphaned until garbage-collected by the exclusion store (out of scope here). |
-
-### Stale-mapKey on click
-
-| From               | Trigger                                                                  | To                                                              |
-| ------------------ | ------------------------------------------------------------------------ | --------------------------------------------------------------- |
-| User clicks a row  | Webview-cached mapKey is no longer in the registry by the time the host receives the message | Host shows a warning toast and refuses; no side-effect on registry or files. |
-
-### Registry migration writeback
-
-| From                              | Trigger                                                                | To                                                                                          |
-| --------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| Registry on disk has legacy fields | First panel refresh after upgrade; initial load reports `changed=true` | Plans lock taken; in-lock re-read still reports `changed=true` → normalized registry persisted once. |
-| Registry on disk has legacy fields | First panel refresh after upgrade, but a concurrent process already normalized | Plans lock taken; in-lock re-read reports `changed=false` → save skipped (idempotency guard). |
+| From | Trigger | To |
+| --- | --- | --- |
+| Absent | Upstream extraction inserts a registry row | Row appears in the merged list on the next refresh |
+| Present, on disk with commit-claim fields | Any load | **Gone** — the row is dropped during normalization and the cleaned registry is written back once |
+| Present, carrying the hide flag on disk | Any load | **Gone** — dropped during normalization |
+| Visible, included | Toggle off | Still visible, struck through; the exclusion set carries the identifier |
+| Visible, excluded | Toggle on | Still visible, unstruck; the exclusion set drops the identifier |
+| Visible | Remove | Registry row deleted, markdown file deleted, panel re-renders without it |
+| Visible | A commit claims it | Row disappears on the next refresh; a stale exclusion entry may outlive it |
+| Rendered in the webview, gone from the registry | Any command clicked on it | Warning toast; no change to the registry or to any file |
 
 ## Notable Behavior
 
-- **Active-by-construction.** The panel never filters references; every entry currently in the registry is shown. The "active" semantics are upheld upstream by removing the registry entry at commit-archive time.
-- **Hard delete, not tombstone.** Removing a reference leaves no trace in the registry or on disk, which intentionally allows a later re-mention of the same entity to re-discover and re-insert it cleanly.
-- **Markdown delete happens after lock release.** The registry write is the critical step; the markdown delete is best-effort and swallowed on error so a permission/lock issue can never strand the panel with an orphaned row. The inverse order (file first, then registry) would risk leaving a row pointing at a missing file on failure.
-- **The webview row dispatches by `contextValue` only.** Every source collapses to the same `"reference"` contextValue; the only places that branch on the per-source table are the row label (tracker-style vs title-only), the row icon, the badge letter, the badge color, and the hover-card action label.
-- **Badge color.** An earlier design rejected per-source brand tints outright (monochrome badge, default-color row icon). That rejection has been reversed: the row badge and the hover-card title badge now render with a per-source background color pulled from the same shared table that supplies the icon and letter — matching the pinned-context rows, so those surfaces read identically. A source outside the table's known set still renders, but on a neutral (non-branded) background rather than one of the table's per-source colors.
-- **The committed-memory reference rows reached that agreement late, and via a wrong default.** Their badge previously hardcoded a single hue — the *first* issue-tracker source's brand color, a leftover from when it was the only reference source — so every other source rendered in that source's colors with only the letter differing. They now generate per-source rules from the same shared table, with the kind marker carrying only the unknown-source neutral fallback. The generated per-source rules must be emitted **after** the kind marker's rule: the two selectors have equal specificity, so source order is what decides. The class token is derived from the source id with every byte outside the CSS-identifier set folded to `-`, because a source id is an open string read from disk and a raw one could otherwise end the class token early.
-- **Description preview not in row, except for an accumulating source.** The description appears only in the activity-bar tooltip and (when implemented) the hover-card; the row description column is the short relative date, never the body text. Status / labels / priority drift after capture (the host does not poll), so the row stays date-only and the tooltip / hover-card carries the captured snapshot. The exception is the accumulating case described above, where the body is not a drifting snapshot but a bounded list of immutable queries, and the row would otherwise carry no distinguishing information at all.
-- **`fields` is opaque end-to-end.** The renderer iterates the fields list generically (icon + value), never names a source-specific field. Adding a new field to a source requires no panel change.
-- **mapKey survives post-archive suffix.** The mapKey is `<source>:<native-id>`; when the upstream registry has appended a short content-hash suffix to disambiguate post-archive variants of the same entity, the panel forwards the suffixed form verbatim. The commit-exclusion store, the registry, and the panel checkbox state all key on the identical mapKey form.
-- **Scheme guard refuses non-http(s).** A hand-edited registry URL using `javascript:`, `data:`, `file:`, or any other scheme triggers a warning toast and a refusal at the open sink, even though the extractor adapters already gate their inputs. This is a "URL came from a local user-editable file → re-validate at the sink" pattern.
-- **Stale-mapKey produces a toast, not silence.** Without the resolver, the underlying hard-delete would silently return when the mapKey is absent, and the open commands would no-op on a missing entry. The resolver surfaces the staleness as a refresh hint instead.
-- **Single hover-card surface for plan, note, and reference rows.** The dispatcher reads a per-row `referenceHover` (or `planHover` / `noteHover`) projection off the serialized item and routes to the right renderer; the timer dance and positioning are shared across all three row types.
-- **Inline-actions group differs from plans/notes.** Plan and note rows expose edit + remove; reference rows expose open-in-browser + remove (the row click already opens the markdown for editing) — except that the open-in-browser affordance is **omitted entirely** for a source with no link, see below.
-- **An open-in-browser affordance is offered only when the row actually has a link.** A source may have no external destination at all (the first-party memory source records a local lookup, not a navigable artifact — spec 153). Every surface that offers the action keys off the projected `url` being non-empty: the row's inline button, the hover card's action row, and the row context menu's entry are each suppressed when it is empty. Suppression is the *only* correct handling — the sink's scheme validation would reject an empty url and raise a warning worded for a tampered link, which would read as a defect rather than as an intentionally link-less source. The sink keeps that validation regardless; this is a UI-level omission, not a replacement for it.
-- **Suppression requires a RESOLVED empty url, not merely an unresolved projection.** The context menu reads the url off the serialized hover projection, looked up by row id. That lookup can come back empty for a row it cannot find — which is ignorance, not an absent link, and treating the two alike would hide the action for every source including ones with perfectly good links. So the action is withheld only when a reference projection resolved *and* carried an empty url; an unresolvable lookup keeps the action and leaves the final word to the sink's own validation. (This is the opposite default from the extraction-side server check in spec 153, and deliberately so: there, mis-attributing is worse than missing; here, hiding a working action is worse than offering one that a guard will reject.)
-- **The hover card's separator rule is conditional on something following it.** The card's tail — an AI-exclusion reason block, then the action row — is assembled before the rule is emitted, and the rule is emitted only if that tail is non-empty. With no action row (a link-less source) and no exclusion reason, an unconditional rule would leave a bare line dangling under the fields with nothing beneath it. The reason block's own trailing rule, which assumes an action row follows, is likewise dropped when none does.
-- **Reference rows carry a relative-date chip, in the same slot as plan rows.** The chip reads as "when this was last consulted"; for an accumulating source that is the most recent lookup rather than a creation date. The projected timestamp is required on the archived row shape, so there is no absent case.
-- **An accumulating source's row sub-text carries its newest query, not just the date.** For every entity-shaped source the sub-text is the relative date alone, because captured status drifts and stale status is worse than none. An accumulating source inverts the calculation: its title is the *tool* label, identical on every row and every commit, so the date alone leaves the row carrying nothing about what happened — while the query, being a record of what was asked, cannot drift. The newest query is read back out of the body through the same entry format the persistence layer writes (spec 179), never by re-deriving that format at the display site. The gate ("does this source accumulate at all?") is part of that shared helper too, so no display site decides it independently.
-- **The committed view shows the same query, from a snapshot rather than a derivation.** The uncommitted row derives the newest query from the body it can still read on disk. After commit that body lives only on the orphan branch, and the per-commit row shape is a *value snapshot* that does not carry it — so the newest query is frozen onto that snapshot at archive time, using the same shared helper, and the committed row renders it. Without this the two views contradict each other: the same reference reads as `<query> · <date>` before the commit and as a bare, commit-indistinguishable date after it. Only the newest query is snapshotted, not the body — the full list stays on the orphan branch, reachable from the row's preview action. The row's own date chip is unaffected; the query claims the sub-line slot, which is unused for a non-tracker source. The query is user-typed text and is HTML-escaped like every other untrusted string on the row.
-- **One shared per-source table governs the entire surface, with an open-ended read filter.** The icon mapping, the badge-letter mapping, the badge-color mapping, and the display-label mapping are all one lookup into the same table (falling back to the neutral projection for an unrecognized id). The read-time source filter, by contrast, is a plain string-equality comparison against whatever source id a caller passes — it is not itself bounded by the table's known ids, so a future source can be filtered on before it ever earns a table entry. A closed check against the table's known id set is used only where a security boundary is needed (validating an inbound webview message's source field before trusting it), not for filtering or display.
-- **The table lagged the upstream catalog, and one row is still a distinct kind of glyph.** Two entries were absent from this table while their sources already existed upstream — the work-management board source and, more recently, the library-documentation source. A missing row is not an error (the neutral projection renders it), but it renders unbranded and, until added, is also excluded from the inbound-message allow-list. The library-documentation row is also the first whose badge glyph is a digit rather than a letter, and the first to reuse an icon (`book`) already claimed by another source.
-- **The description preview never contains the auto-generated note.** The persistence layer appends an explanatory note block to references from sources declaring the track-only or arguments-derived flags; this panel's frontmatter reader cuts the body at that note's sentinel before taking its 200-character preview, so neither the row tooltip nor the hover card ever shows the note text. The sentinel string is duplicated here rather than imported, so it must be kept in lockstep with the persistence layer.
-- **The GitHub badge letter was previously inconsistent, now unified.** One surface on this panel used to render a two-letter badge for the code-host source while every other surface rendered one letter; the shared table now standardizes on the single-letter form everywhere on this panel (and everywhere else that reads the same table).
+- **Active by construction; nothing here filters.** Every row in the registry is shown. The "active" semantics are upheld upstream by deleting the row at commit time, and reinforced at load time by dropping any row that still carries commit-claim fields. (Notable.)
+- **The hide flag is a hard delete, not a soft hide.** A row carrying it is destroyed at the next load rather than being hidden and recoverable. Nothing writes it. (Surprising; reality.)
+- **A legacy claimed row is destroyed on load, silently.** The migration has no report and no undo; the row's archived copy in summary storage is what survives. (Surprising; reality.)
+- **The drop predicate is field-based, never key-shaped.** A live upstream identifier can end in eight digits, and digits are hexadecimal, so a "looks archived" key test would delete active rows. Consequently a row whose identifier ends that way is an ordinary active row here. (Notable.)
+- **Removal is one command-line rule, run by both hosts.** It hard-deletes the row and its markdown with no tombstone, which is what lets a later re-mention re-discover the entity cleanly. (Notable.)
+- **The markdown is deleted after the lock is released.** The registry write is the critical step; the file delete is best-effort and swallowed, so a permission or lock problem can never strand the panel with a row it cannot remove. The reverse order would risk a row pointing at a missing file. (Notable.)
+- **The registry rebuild carries every sibling map.** Removing one reference must not erase the plan, note or skill maps — each is optional, so a rebuild that forgets one erases it with nothing failing to compile. (Notable.)
+- **A plain row click previews; reaching the real file is explicit.** This inverts the earlier behaviour, and it is what makes every context row — plan, note, reference — behave the same way on click. The raw file is reachable from the inline edit button and the context menu's edit entry. (Notable.)
+- **The activity-bar row did not follow.** Its click still opens the raw markdown, so the same reference behaves differently depending on which of the two surfaces it is clicked in. (Surprising; reality.)
+- **An open preview does not refresh itself, so two mechanisms push at it.** A rendered virtual document keeps the body it was opened with; a save handler and a tree watcher each re-resolve the row and refresh it. Both are gated on a preview actually being open, because the lookup is expensive and otherwise buys nothing. (Notable.)
+- **There is no inline open-in-browser affordance any more.** The inline cluster is pin, edit, remove and the include/exclude toggle; the browser lives in the hover card's action row and the context menu. (Notable.)
+- **The open-in-browser entry is offered only when the row actually has a link.** A source may record a purely local lookup with no navigable page. Suppression is the correct handling: the sink's scheme validation would reject an empty url and raise a warning worded for a tampered link, which reads as a defect rather than as an intentionally link-less source. The sink keeps that validation regardless — this is a presentation-level omission, not a replacement for it. (Notable.)
+- **Suppression requires a RESOLVED empty url, not merely an unresolved projection.** The menu reads the url off the serialized hover projection by row identifier, and that lookup comes back empty for a row it cannot find — which is ignorance, not absence. Treating the two alike would hide the action for every source. So the action is withheld only when a projection resolved *and* carried an empty url; an unresolvable lookup keeps the action and leaves the last word to the sink. (Deliberately the opposite default from the extraction-side check in spec 153: there, mis-attributing is worse than missing; here, hiding a working action is worse than offering one a guard will reject.) (Notable.)
+- **The scheme guard refuses anything but the two web schemes.** A hand-edited registry url using a script, data or file scheme produces a warning toast and a refusal at the sink, even though the extractors already gate their inputs — the url passed through a user-editable file on the way. (Notable.)
+- **A stale identifier produces a toast, not silence.** Without the resolver the removal would silently return and the open commands would silently no-op. (Notable.)
+- **The visible inclusion affordance is a strikethrough toggle, but the checkbox is still the state holder.** The toggle flips the hidden checkbox and redispatches its change event, so the host round trip is unchanged. Its glyph reads both the user's own exclusion and the summarizer's soft exclusion. (Notable.)
+- **The read-time per-source narrowing is an open string comparison; the closed set is used only as a security boundary.** Display always falls back to the neutral projection, so a source can be narrowed on before it ever earns a table row — while an inbound "open this evidence reference" message's source field is checked against the table's enumerated ids before being trusted. Adding a table row therefore also makes that source openable through that path. (Notable.)
+- **The table lags the upstream catalogue by design tolerance, not by contract.** Sources have existed upstream while absent here; a missing row is not an error, but it renders unbranded and is excluded from the inbound-message allow list until added. (Notable.)
+- **The deployment source's badge hue is deliberately not black.** It is emitted as a chip background and a high-contrast theme paints the panel black behind it, which would leave a bare floating letter with no chip silhouette. (Surprising; intentional.)
+- **The generated per-source colour rules must follow the kind marker's rule.** Equal specificity means source order decides which wins. (Notable.)
+- **The field list is opaque end to end.** The renderer iterates it generically and never names a source-specific field, so adding a field to a source needs no change here. (Notable.)
+- **The body preview never contains the auto-generated note.** The persistence layer appends an explanatory block to references from sources declaring the track-only or arguments-derived flags; this reader cuts the body at that block's sentinel before taking the preview. The sentinel is duplicated here rather than imported, so it must be kept in lockstep. (Notable.)
+- **An accumulating source's sub-text carries its newest query, not just a date.** For an entity-shaped source the sub-text is the relative date alone, because captured status drifts and stale status is worse than none. An accumulating source inverts that: its title is the *tool* label, identical on every row and every commit, so a date alone leaves the row saying nothing about what happened — while the query, being a record of what was asked, cannot drift. The newest query is read back out of the body through the same entry format the persistence layer writes, never by re-deriving that format here, and the "does this source accumulate at all?" gate is part of that same shared helper. (Notable.)
+- **The committed view shows the same query from a snapshot rather than a derivation.** After a commit the body lives only in summary storage and the per-commit row shape does not carry it, so the newest query is frozen onto that shape at archive time using the same helper. Without this the same reference would read as query-plus-date before the commit and as a bare date after it. Only the newest query is snapshotted; the full list stays in storage, reachable from the preview action. The query is user-typed text and is escaped like every other untrusted string on the row. (Notable.)
+- **The migration write-back is skipped only on the in-process disabled mirror.** Nothing here consults the durable on-disk disable state, so inside a long-lived server process the write-back still runs against a durably disabled project. (Notable.)
 
 ## Shared Behavior
 
-- The per-reference markdown's on-disk format, the sanitized filename key, and the frontmatter shape are owned by the reference-store markdown-persistence spec; this panel only reads / deletes those files.
-- The plans registry and the lock that serializes its read-modify-write are shared with the plans and notes panel surfaces; this panel uses the same lock for the migration-writeback path and the hard-delete path.
-- The commit-exclusion store (separate spec) owns the persistence and read semantics for the "references" exclusion set; this panel only writes one entry on each checkbox toggle and reads the set to project the row's `isSelected`.
-- The transcript-reference-extraction pipeline (separate spec) is the upstream producer that inserts registry entries; this panel does not invoke it. The messaging-thread source's own capture and link-resolution behavior — including the rule that a thread with no resolvable link is never turned into a stored reference at all — is owned entirely upstream by spec 256; by the time a messaging-thread reference reaches this surface it is an ordinary registry entry, indistinguishable in shape from any other source's row. This panel's own `url`-to-empty-string coercion (see "Registry projection" above) is a general defensive default for the shared optional-`url` model, not something this messaging-thread source specifically relies on.
-- The label-leads-with-native-id policy (which sources show `<native-id> — <title>` vs `<title>` alone) is defined once in a shared display-policy module reused by this panel, the committed-memory HTML view, and the CLI's own PR/commit markdown renderer, so the three surfaces cannot drift from each other.
-- The merged Context section ordering with plans, notes, and references in the same list is owned by the merge-ordering helper (separate concern); this spec describes the reference row's contribution to that merge: one row per active reference, sorted with the others by `lastModified` descending, tied-break-rank "reference" last.
-- The hover-card timer / positioning / dismiss logic is shared with other Branch-tab row types; this spec describes only the reference-specific renderer that fills the card body.
+- The working-area registry, its atomic-write primitive, and the lock that serializes read-modify-write cycles over it are shared with plans, notes, skill usage, the discovery scans, the commit-time pipeline and both IDE hosts.
+- The removal rule, and the load-time normalization that drops claimed rows, are owned by the command-line working-area service (spec 337) and reached identically by both hosts.
+- The per-reference markdown's on-disk format, its sanitized file-name key and its frontmatter shape are owned elsewhere; this surface only reads and deletes those files.
+- The commit-exclusion store owns the persistence and read semantics of the references exclusion set; this surface writes one entry per toggle and reads the set to project each row's inclusion state.
+- The transcript-reference extraction pipeline (spec 153) is the upstream producer. The messaging-thread source's own capture and link-resolution behaviour — including the rule that a thread with no resolvable link never becomes a stored reference at all — is owned there; by the time such a reference reaches this surface it is an ordinary row. This surface's own empty-url coercion is a general defensive default for the shared optional-url model, not something that source relies on.
+- The label policy (which sources lead with a native id) is defined once in a shared display module reused by this surface, the committed-memory view and the command line's own markdown renderers.
+- The rendered-preview surface, its virtual-document identity and its restore-after-reload resolution are owned by spec 329; this surface only opens one and pushes refreshes at it.
+- The merged ordering of plan, note, reference and skill rows in one list is owned by the merge helper; this spec describes only the reference row's contribution — one row per active reference, sorted with the others by last-modified descending, and — on an exact timestamp tie — ranked after plan and note rows and ahead of the single aggregate skill row.
+- The hover card's timer, positioning and dismissal are shared with the other row types; this spec describes only the renderer that fills the card body.

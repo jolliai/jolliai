@@ -9,7 +9,8 @@ The pipeline that, when a commit is rewritten in place to produce a new commit h
 **In scope:**
 - Inputs identifying the prior commit hash and the new commit hash.
 - The three-tier dispatch by which the pipeline either skips both the language-model calls, runs only the delta call, or runs both the delta and the consolidation call.
-- Which fields are preserved verbatim from the prior summary.
+- Which fields are preserved verbatim from the prior summary, including both published-document identities.
+- How published document identity survives the skill union, which mints no banked-superseded marker for a later drain.
 - Which fields are regenerated against the rewritten commit.
 - The construction of a new root with the prior summary attached as a stripped child.
 - The fall-back when no prior summary exists.
@@ -45,8 +46,8 @@ Two distinct diff scopes are computed:
 
 Regardless of which dispatch tier runs, these fields on the new root are copied directly from the prior summary when present:
 
-- Article-style metadata (a server-side article identifier and its public URL).
-- The accumulated list of orphaned article identifiers awaiting cleanup.
+- Article-style metadata for **two** published documents, each a straight copy of the prior summary's: the memory article's identifier and URL, and the commit-level skill article's identifier and URL — the one document a commit's whole skill set publishes as. The second travels for exactly the reason the first does: an in-place rewrite is the same commit under a new hash, so neither article's content has changed and the next push must update both in place rather than mint siblings and strand the originals under a hash the branch no longer has.
+- The accumulated list of orphaned article identifiers awaiting cleanup, **extended** with any identifier the skill reconciliation below displaced (see "Published identity across the skill union"). The extension must be spread after the copy of the prior summary's own fields, or that copy wins and the displaced identifiers are silently dropped.
 - Plan references, note references, external-entity references, and skill references.
 - End-to-end test guidance scenarios.
 
@@ -66,6 +67,22 @@ The key each kind merges on differs, and one of them differs deliberately:
 Skills are the exception because they do not carry the archive hash in the identifier they are keyed on. A plan or note ref embeds it (`<slug>-<hash8>`), so the suffix has to be stripped to recover a base key; a skill ref keeps its hash in its separate archive key and leaves the skill id raw. Stripping anyway would silently truncate any skill id that happens to end in eight hex characters, folding two distinct skills into one row here while the exclusion audit below and the tree accumulation both kept them apart — three derivations of one key that have to agree.
 
 All four keys therefore name the logical **item**, never the archived file the item was last snapshotted into. That is what lets an artifact re-archived under the rewrite's new hash list once instead of twice, and it is sound here only because the union has exactly **one** prior summary to draw its old side from. The consolidation that folds *many* prior summaries into a single commit performs the same union with the same new-wins rule over its plan, note and external-reference fields, but keys it on the **archived file** (archive-hash suffix retained): two of its sources can legitimately hold the same logical item snapshotted at different commits, nothing in that pipeline renames or deletes a source's snapshot, so both archived files outlive the fold and both need a summary referring to them. This topic's keys used there would keep whichever source was walked last and leave the other archived file stranded on the parallel ref with nothing referring to it — the failure class the two key families exist to keep apart. They are not interchangeable in either direction; the consolidated variant's key rule is stated by the summary-tree topic and the pipeline that supplies its caller-side refs by the squash-consolidation topic.
+
+### Published identity across the skill union
+
+Skills are the one kind whose old and new sides can both already be published, and this pipeline **unions** them rather than folding them. That matters because the fold is where published identity is normally protected: folding two records of one skill leaves a single row that can point at only one document, so the fold banks the displaced identifier on the surviving row for a later drain. A union mints no such marker, and nothing downstream drains one — so identity has to be reconciled here, by hand, and it is:
+
+1. Before the union runs, the prior summary's skill references are indexed by the same `<source>:<skill>` key the union merges on, recording the published identifier and URL of each one that has them.
+2. Every row that survives the union is then checked against that index:
+   - **no prior entry** — the row is left exactly as it is;
+   - **prior entry, and the surviving row carries no identifier of its own** — it adopts the prior identifier and URL, so the next push rewrites that same article (retitling it to the new hash) instead of creating a sibling beside it;
+   - **both sides published, and to different articles** — the surviving row keeps its own identifier, because overwriting it would push this content at the older article, and the prior identifier is appended to the new root's orphaned-identifier queue rather than dropped.
+
+A row that came through the union unopposed is its own prior entry, so it matches on identifier and nothing is queued.
+
+So the union **preserves** the published identity the fold is careful about: every identifier either survives on the row that replaced it, or is queued for cleanup. What the union deliberately does not carry over is the losing row's *counting* payload — a skill reference is one commit's increment, and folding the old increment into the new row would have it counted a second time when a later consolidation walks the tree and meets the same reference from both ends. That is sound only because the losing reference survives verbatim on the retained child, which is where the tree walk finds it.
+
+These per-item identifiers are the residue of an earlier model in which every skill on a commit published its own article; the commit-level article that replaced them travels separately, as a straight copy of the prior summary's own field (see Preserved fields). Both are handled because a stored summary can still carry either.
 
 ### Regenerated or recomposed fields
 
@@ -159,6 +176,10 @@ Logical-item keying is chosen for the shape of the *pipeline* — one prior summ
 ### Skill refs merge on the raw registry key, not through the archive-hash strip
 
 Plans and notes carry the archive short hash inside the identifier they are keyed on, so their merge key is that identifier with the suffix stripped. A skill ref does not: its hash lives in a separate archive key and its skill id stays raw. Applying the same strip to it would truncate any id ending in eight hex characters and silently fold two distinct skills into one row at this one site — while the exclusion audit and the tree-level accumulation, which both derive the same key without stripping, kept them apart. The deliberate asymmetry is what keeps those three derivations in agreement.
+
+### The union mints no banked marker, and loses no published identity
+
+This is the one pipeline that merges skill references without the shared accumulation, so it is also the one that produces no banked-superseded marker for anyone to drain. That is not a gap: the two things the fold's marker exists to protect are handled directly here. The commit-level skill article is copied off the prior summary onto the new root, unconditionally, exactly like the memory article — an in-place rewrite publishes the same content under a new hash, so the next push must update those two articles rather than mint siblings. And the legacy per-item identifiers are reconciled through an index built from the prior summary before the union runs: an unpublished winner adopts the prior identifier, a winner with an identifier of its own keeps it and sends the prior one to the commit's cleanup queue, and a row with no prior counterpart is untouched. Nothing is dropped along either arm. (Notable; a deliberate divergence from the consolidation path, reached by a different mechanism to the same guarantee.)
 
 ### Skills are hoisted onto the new root and left on the child
 
