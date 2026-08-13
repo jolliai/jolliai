@@ -49,6 +49,26 @@ const NATIVE_ID = "^[A-Za-z0-9.-]{1,253}/[A-Za-z0-9_-]{1,128}$";
 const SYNTHESIZED_TITLE = "^Issue [A-Za-z0-9_-]{1,128}$";
 
 /**
+ * The POOREST member of {@link SYNTHESIZED_TITLE}'s family: `Issue <machine id>`, the
+ * shape synthesized when NO prose was recovered at all.
+ *
+ * The two synthesized arms are not interchangeable, and the two-sided keep-the-prior test
+ * could not tell them apart. `Issue JAVASCRIPT-NEXTJS-1` means the prose heading WAS
+ * harvested — the short id is Sentry's canonical, stable handle and the `issue-id` field
+ * exists to carry it — while `Issue 7665509682` means nothing was. Both matched
+ * `SYNTHESIZED_TITLE`, so `!re.test(prior)` was false and the second overwrote the first,
+ * dropping the short id, project and culprit along with the label (the harvested set moves
+ * wholesale, by design). Ranking them makes a no-prose re-observation yield.
+ *
+ * All-digits rather than "not a short id": a Sentry issue URL's id and the `issueId` /
+ * `resourceId` arguments are the numeric machine id, while a harvested short id always
+ * carries its project prefix and a `-`. Note the reverse does NOT hold — a model may pass
+ * a SHORT id as `issueId`, so a poorest-arm title can look like the richer one; that is
+ * why this ranks within the family instead of replacing `SYNTHESIZED_TITLE` with it.
+ */
+const SYNTHESIZED_TITLE_NO_PROSE = "^Issue [0-9]{1,128}$";
+
+/**
  * sentry — track-only Sentry issue references. Records WHICH production issue was
  * consulted while a commit was being written. Track-only because an error report is the
  * INPUT to the work, not a statement about the code: feeding a stacktrace into the
@@ -86,6 +106,7 @@ export const sentryDefinition: SourceDefinition = {
 	// Overwrite is right only while the re-observation recovered as much as the stored one
 	// did. It often has not — see {@link SYNTHESIZED_TITLE}.
 	titleFallbackPattern: SYNTHESIZED_TITLE,
+	titleFallbackPoorestPattern: SYNTHESIZED_TITLE_NO_PROSE,
 	match: {
 		claude: {
 			prefixes: [...SENTRY_TOOL_PREFIXES],

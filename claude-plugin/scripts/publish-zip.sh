@@ -40,9 +40,10 @@ node "$PLUGIN_DIR/scripts/build.mjs"
 # SOURCED from _publish-lib.sh rather than restated. This file used to carry its
 # own copy, and the copy drifted the moment the dashboard arrived: it checked
 # `dashboard-assets/index.html` alone while the server's own door check
-# (resolveDashboardAssetsDir) requires the stylesheet and all eight scripts — so
-# the zip path could still ship the exact partial asset tree the shared list was
-# expanded file-by-file to prevent.
+# (resolveDashboardAssetsDir) requires the stylesheet and EVERY script in
+# DASHBOARD_SCRIPT_FILES — so the zip path could still ship the exact partial asset
+# tree the shared list was expanded file-by-file to prevent. (Don't restate the
+# count here either: it has already grown twice.)
 # shellcheck source=./_publish-lib.sh
 . "$SCRIPT_DIR/_publish-lib.sh"
 
@@ -59,15 +60,12 @@ if [ "$(cd "$PLUGIN_DIR" && pwd)" != "$(cd "$SCRIPT_DIR/../plugins/jolli" && pwd
 	exit 1
 fi
 
-missing=""
-for f in "${PUBLISH_REQUIRED_DIST[@]}"; do
-	[ -s "$PLUGIN_DIR/dist/$f" ] || missing="$missing $f"
-done
-if [ -n "$missing" ]; then
-	echo "error: build produced an incomplete dist/ — missing:$missing" >&2
-	echo "       A plugin missing any git-hook/worker script blocks user commits." >&2
-	exit 1
-fi
+# The lib's own assertions, not a third copy of the loop: the inline version this
+# replaced is exactly the kind of copy the comment above is about. The config check
+# matters here too — the zip packs `plugins/jolli/` alone, so `plugins/jolli/LICENSE`
+# is the only license text an uploaded plugin ever carries.
+publish_assert_dist_built
+publish_assert_config_present
 
 echo "==> Packing $PLUGIN_DIR"
 echo "    -> $OUT"

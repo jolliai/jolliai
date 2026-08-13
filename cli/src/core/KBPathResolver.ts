@@ -555,10 +555,10 @@ function isSameRepo(config: KBConfig, remoteUrl: string | null, repoName: string
  * Deliberately module-private: "are these two folders the same repo?" is a
  * question only the folder-claiming path should answer, and it must answer it
  * through `isSameRepo`. A previous iteration exported this so the VS Code
- * sidebar's Refresh could collapse duplicate folders on its own; that feature
- * was withdrawn because Refresh must never move a folder holding memories —
- * consolidating duplicates is Migrate's job (it can rebuild the survivor from
- * the orphan branch, which a plain archive-the-loser move cannot).
+ * sidebar could collapse duplicate folders with its own identity comparison; that
+ * was withdrawn, and the replacement is `findRepoFolders` + `FolderConsolidation`
+ * — one identity rule in this module, and a merge (or a rebuild from the system of
+ * record) rather than the archive-the-loser move the host would have done.
  */
 function normalizeRemoteUrl(url: string): string {
 	return foldGitTransportToHttps(url)

@@ -48,7 +48,7 @@
  */
 
 import type { Dirent } from "node:fs";
-import { existsSync, promises as fs, readdirSync, readFileSync } from "node:fs";
+import { existsSync, promises as fs, readdirSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, normalize } from "node:path";
 import type { SummaryIndex } from "../../../cli/src/Types.js";
 import {
@@ -56,6 +56,7 @@ import {
 	type ConsolidationPlan,
 	type ConsolidationResult,
 	executeConsolidation,
+	revalidateConsolidationPlan,
 } from "../../../cli/src/core/FolderConsolidation.js";
 import { FolderStorage } from "../../../cli/src/core/FolderStorage.js";
 import { archiveKBFolder } from "../../../cli/src/core/KBPathResolver.js";
@@ -72,6 +73,25 @@ import {
 	withVaultWriteLock,
 } from "../../../cli/src/sync/VaultWriteLock.js";
 import type { FolderFileKind, FolderNode } from "../views/SidebarMessages.js";
+
+/**
+ * The pending-worker wakeup every vault-lock holder must supply — a QueueWorker
+ * that timed out waiting for this lock recorded itself in the per-vault registry,
+ * and nothing else drains it (`withVaultWriteLock`'s docstring: "Production
+ * holders MUST pass this"). Without it a commit's summary stays stranded until
+ * that repo's NEXT commit.
+ *
+ * `launchWorker` is imported lazily INSIDE the callback, not at module scope:
+ * `QueueWorker` pulls the whole transcript-reader / detector graph, and the sweep
+ * runs on every sidebar Refresh. `wakePendingWorkers` fires this only when a
+ * worker is actually waiting, so on the ordinary path the import never happens.
+ * Fire-and-forget matches the `(cwd: string) => void` contract.
+ */
+const PENDING_WORKER_RELEASE_HOOK = {
+	launch: (cwd: string): void => {
+		void import("../../../cli/src/hooks/QueueWorker.js").then(({ launchWorker }) => launchWorker(cwd));
+	},
+};
 
 /**
  * The data the service needs to enumerate repos and identify the user's
@@ -144,21 +164,24 @@ export class KbFoldersService {
 	/**
 	 * Archives Memory Bank folders that were claimed for something that never
 	 * turned out to be a useful repo, so the Folders tab stops listing rows the
-	 * user has no reason to browse. This is the ONLY mutation the sidebar's
-	 * Refresh performs.
+	 * user has no reason to browse.
 	 *
-	 * REFRESH'S CONTRACT — Refresh clears folders that a past bug created and
-	 * that never held anything; it NEVER moves a folder holding memories. That is
-	 * the whole reason this sweep is keyed on emptiness and nothing else, and why
-	 * DUPLICATE folders are deliberately out of scope here even though they are
-	 * the more visible annoyance: collapsing duplicates means picking one of
-	 * several populated folders and burying the rest, since an archive is a plain
-	 * move that cannot merge them. The only correct survivor is one rebuilt from
-	 * the orphan branch (the system of record), which is Migrate's job — so
-	 * duplicates belong to Migrate, and a Refresh stays a safe, lossless action
-	 * the user can click without thinking. An earlier revision did wire a
-	 * duplicate-collapsing pass into Refresh; it was withdrawn for exactly this
-	 * reason. Do not re-add one here.
+	 * THIS SWEEP'S CONTRACT — it clears folders that a past bug created and that
+	 * never held anything; it NEVER moves a folder holding memories. That is the
+	 * whole reason it is keyed on emptiness and nothing else, and it is what makes
+	 * it safe to run unprompted on every Refresh.
+	 *
+	 * DUPLICATE folders are out of scope FOR THIS METHOD, and were once out of
+	 * scope for Refresh entirely: collapsing duplicates means picking one of
+	 * several populated folders, and an archive is a plain move that cannot merge
+	 * them. That objection was answered rather than overruled —
+	 * {@link planDuplicateConsolidation} / {@link runConsolidation} do a real merge
+	 * (copy-if-absent across every layer, or a rebuild from the system of record),
+	 * and the caller gates them behind an explicit modal confirmation. So Refresh
+	 * now performs TWO mutations: this unprompted, emptiness-only sweep, and that
+	 * confirmed merge. What must not come back is a duplicate pass keyed on
+	 * anything weaker than those two — an unprompted archive-the-loser move here
+	 * would still be the lossy thing the original objection was about.
 	 *
 	 * WHY these folders exist: `resolveKBPath` CLAIMS the folder it returns
 	 * (writes `.jolli/config.json`) and takes its `repoName` from whatever cwd the
@@ -244,12 +267,16 @@ export class KbFoldersService {
 					continue;
 				}
 				if (!isEmptyKbFolder(repo.kbRoot)) continue;
+				// Third part of the guard: a folder claimed in the last hour belongs to
+				// a window that is probably using it right now — see
+				// RECENT_CLAIM_GRACE_MS. The next Refresh sweeps it if it stayed empty.
+				if (wasClaimedRecently(repo.kbRoot)) continue;
 				const dest = archiveKBFolder(repo.kbRoot, ctx.kbParent);
 				if (dest) archived.push(repo.kbRoot);
 			}
 			if (archived.length > 0) this.cleanRepos.clear();
 			return archived;
-		});
+		}, PENDING_WORKER_RELEASE_HOOK);
 		// Vault busy (a worker/sync/compile held the lock through the budget): skip
 		// this sweep silently — it is best-effort and the next Refresh retries.
 		return result.ran ? result.value : [];
@@ -299,19 +326,27 @@ export class KbFoldersService {
 	 * {@link VaultWriteBusyError} when the vault is busy so the caller can tell
 	 * the user "try again shortly" — unlike the best-effort sweep, a user asked
 	 * for this merge, so a silent skip would look like it did nothing.
+	 *
+	 * The plan is re-validated INSIDE the lock (`revalidateConsolidationPlan`) and
+	 * the freshly-computed one is what executes: detection ran before the modal
+	 * opened, that modal can sit open indefinitely, and the folder set can change
+	 * under it. A mismatch throws `ConsolidationStalePlanError` so the caller can
+	 * ask for a re-confirm rather than acting on a description the user never saw.
 	 */
 	async runConsolidation(plan: ConsolidationPlan): Promise<ConsolidationResult> {
 		const ctx = this.getContext();
-		const result = await withVaultWriteLock(ctx.kbParent, { wait: DEFAULT_PULL_LOCK_WAIT_MS }, async () => {
-			const r = await executeConsolidation(
-				plan,
-				ctx.currentProjectRoot ?? ctx.kbParent,
-				ctx.currentRemoteUrl,
-				ctx.kbParent,
-			);
-			this.cleanRepos.clear();
-			return r;
-		});
+		const cwd = ctx.currentProjectRoot ?? ctx.kbParent;
+		const result = await withVaultWriteLock(
+			ctx.kbParent,
+			{ wait: DEFAULT_PULL_LOCK_WAIT_MS },
+			async () => {
+				const current = await revalidateConsolidationPlan(plan, cwd, ctx.currentRemoteUrl, ctx.kbParent);
+				const r = await executeConsolidation(current, cwd, ctx.currentRemoteUrl, ctx.kbParent);
+				this.cleanRepos.clear();
+				return r;
+			},
+			PENDING_WORKER_RELEASE_HOOK,
+		);
 		if (!result.ran) throw new VaultWriteBusyError();
 		return result.value;
 	}
@@ -835,6 +870,39 @@ const OS_NOISE_FILES: ReadonlySet<string> = new Set([".ds_store", "thumbs.db"]);
 
 function isOsNoise(name: string): boolean {
 	return OS_NOISE_FILES.has(name.toLowerCase());
+}
+
+/**
+ * How recently a folder must have been CLAIMED to be spared by the sweep.
+ *
+ * `resolveKBPath` writes `.jolli/config.json` when it claims a slot, so that
+ * file's mtime is the claim time. The sweep's current-project guard only knows
+ * about THIS window, and a second window (or a second IDE) legitimately holds an
+ * empty folder for the project it just opened — a fresh install's folder is empty
+ * until its first commit lands. Archiving it is a move that window did not ask
+ * for, and it drops the row from its tree.
+ *
+ * Deliberately narrow: this protects the just-claimed window, NOT every folder
+ * another window happens to have open. A project opened days ago whose folder is
+ * still empty has an old claim time and is still swept — which is safe for the
+ * reason the sweep is safe at all (nothing to move, and `resolveKBPath` re-claims
+ * the same path on the next write).
+ */
+const RECENT_CLAIM_GRACE_MS = 60 * 60 * 1000;
+
+/**
+ * True when `kbRoot` was claimed within {@link RECENT_CLAIM_GRACE_MS}. An
+ * unreadable/absent config resolves to `false`: this is a spare-it check layered
+ * on top of the emptiness test, and a folder with no readable claim time is
+ * decided by that test alone (as it was before this existed).
+ */
+function wasClaimedRecently(kbRoot: string, nowMs: number = Date.now()): boolean {
+	try {
+		const claimedMs = statSync(join(kbRoot, ".jolli", "config.json")).mtimeMs;
+		return nowMs - claimedMs < RECENT_CLAIM_GRACE_MS;
+	} catch {
+		return false;
+	}
 }
 
 /**

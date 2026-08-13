@@ -16,6 +16,29 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", ".
 const readme = () => readFileSync(join(repoRoot, "claude-plugin", "README.md"), "utf-8");
 const script = (name: string) => readFileSync(join(repoRoot, "claude-plugin", "scripts", name), "utf-8");
 
+describe("Claude publish gates the config inventory on every path", () => {
+	// `publish_assert_dist_staged` checks PUBLISH_REQUIRED_CONFIG in the
+	// DESTINATION's index, so only the git-repo publish ever consulted it. The
+	// archive and local-install paths never stage anything — they pack / mirror
+	// straight from disk — so a missing `LICENSE` (both copies are in that list)
+	// shipped silently. The source-side check has to hang off `publish_build`,
+	// which is the one step all three paths share.
+	it("asserts the required config files from publish_build", () => {
+		const lib = script("_publish-lib.sh");
+		const buildBody = lib.split("publish_build() {")[1]?.split("\n}")[0] ?? "";
+		expect(buildBody).toContain("publish_assert_config_present");
+		expect(lib).toContain("publish_assert_config_present() {");
+	});
+
+	it("checks it on the archive and local-install paths too", () => {
+		// The zip path builds inline (it needs its own PLUGIN_DIR agreement check
+		// first), so it calls the two assertions directly; local-install goes through
+		// publish_build, which now carries them.
+		expect(script("publish-zip.sh")).toContain("publish_assert_config_present");
+		expect(script("publish-local.sh")).toContain("publish_build");
+	});
+});
+
 describe("Claude publish resolves the README marketplace source", () => {
 	// The README used to hardcode the PROD slug, so the dev mirror told dry-run
 	// readers to install the public release instead of the rehearsal copy. The

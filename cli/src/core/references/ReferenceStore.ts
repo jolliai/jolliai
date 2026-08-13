@@ -247,22 +247,39 @@ function mergeIntoExisting(ref: Reference, existing: string | undefined): Refere
 }
 
 /**
- * Is `incoming` this source's synthesized fallback title while `prior` is a real one —
- * i.e. did this observation recover LESS than the one it is superseding?
+ * Did this observation recover LESS than the one it is superseding?
  *
- * Both halves are required. Testing only `incoming` would pin the very first title
- * forever — including one fallback replacing another — and testing only `prior` would
- * block a genuine rename. See `SourceDefinition.titleFallbackPattern`.
+ * The base rule needs both halves: testing only `incoming` would pin the very first
+ * title forever, and testing only `prior` would block a genuine rename. See
+ * `SourceDefinition.titleFallbackPattern`.
+ *
+ * `titleFallbackPoorestPattern` adds the case both halves miss — two fallbacks that
+ * are not equally poor. sentry synthesizes `Issue <shortId>` when the prose heading
+ * was harvested and `Issue <machineId>` when nothing was; both match the fallback
+ * pattern, so `!re.test(prior)` was false and the machine-id form overwrote the
+ * short-id row, dropping its issue-id, project and culprit with it (the whole set
+ * moves together — see {@link restorePriorHarvest}). A source that can tell its own
+ * fallbacks apart declares the poorest form, and a poorest-form observation then
+ * yields to a richer stored fallback. The reverse still supersedes: a later
+ * observation that recovered more must win, which is exactly what testing
+ * `incoming` alone would have prevented.
  *
  * Compiled per call rather than through `SourceEngine`'s cache: this runs once per
  * reference WRITE and once per same-key dedupe collapse (a handful per commit), not once
- * per payload node, and the pattern is validated at registration so it cannot throw here.
+ * per payload node, and the patterns are validated at registration so they cannot throw
+ * here.
  */
 function keepsPriorHarvest(def: SourceDefinition, incoming: string, prior: string): boolean {
 	const pattern = def.titleFallbackPattern;
 	if (pattern === undefined) return false;
 	const re = new RegExp(pattern);
-	return re.test(incoming) && !re.test(prior);
+	if (!re.test(incoming)) return false;
+	if (!re.test(prior)) return true;
+	// Both are fallbacks: keep the prior only when this one is strictly poorer.
+	const poorest = def.titleFallbackPoorestPattern;
+	if (poorest === undefined) return false;
+	const poor = new RegExp(poorest);
+	return poor.test(incoming) && !poor.test(prior);
 }
 
 /**

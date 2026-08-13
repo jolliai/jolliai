@@ -196,10 +196,17 @@ object FileDiscarder {
      * Read-only: no index, worktree or ref is written, so this runs BEFORE the
      * user has confirmed anything.
      *
-     * On an unreadable or short response every path is reported as NOT deleted.
-     * That is the milder verb, and it is the right way to fail here: the caller
-     * falls back to [GitStatusCodes.discardDeletesFile], which is the wording
-     * this host used before the query existed.
+     * On an unreadable or short response every path is reported as NOT deleted —
+     * an EMPTY set, returned normally. That is the milder verb, and it is the right
+     * way to fail here: nothing has been deleted, so promising less than happens is
+     * the safe direction, and the discard itself then reports the real reason.
+     *
+     * Note what this does NOT do: it does not raise, so the caller's
+     * [GitStatusCodes.discardDeletesFile] fallback does NOT run for these cases.
+     * That fallback is reachable only when the query itself throws (transport /
+     * parse failure, a host process that is down, a missing runtime) — see the
+     * caller. The letter heuristic is lossy for conflicted rows, so keeping it off
+     * the merely-unusable-answer path is deliberate.
      *
      * [cwd] and [relativePaths] follow the same rules as [discard] — see
      * [WorktreeRoot]. Blocking I/O; call OFF the EDT.

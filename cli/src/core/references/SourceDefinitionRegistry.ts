@@ -146,6 +146,25 @@ export function validateDefinition(def: unknown): { ok: true; def: SourceDefinit
 			return { ok: false, error: `titleFallbackPattern is not a valid regex: ${(err as Error).message}` };
 		}
 	}
+	if (def.titleFallbackPoorestPattern !== undefined) {
+		if (typeof def.titleFallbackPoorestPattern !== "string" || def.titleFallbackPoorestPattern.length === 0) {
+			return { ok: false, error: "titleFallbackPoorestPattern must be a non-empty string" };
+		}
+		try {
+			new RegExp(def.titleFallbackPoorestPattern);
+		} catch (err) {
+			return {
+				ok: false,
+				error: `titleFallbackPoorestPattern is not a valid regex: ${(err as Error).message}`,
+			};
+		}
+		// Ranking fallbacks is meaningless without the family they belong to: with no
+		// `titleFallbackPattern` nothing is ever detected as a fallback, so this would be
+		// a silently dead declaration.
+		if (def.titleFallbackPattern === undefined) {
+			return { ok: false, error: "titleFallbackPoorestPattern requires titleFallbackPattern" };
+		}
+	}
 	if (!isObject(def.match)) return { ok: false, error: "match must be an object" };
 	if (!Array.isArray(def.wrapperKeys)) return { ok: false, error: "wrapperKeys must be an array" };
 	if (!isObject(def.reference)) return { ok: false, error: "reference must be an object" };

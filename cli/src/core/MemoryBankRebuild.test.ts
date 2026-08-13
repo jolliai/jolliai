@@ -1,8 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { acquireVaultWriteLock } from "../sync/VaultWriteLock.js";
+import { extractRepoName, getRemoteUrl, resolveKBPath, resolveKbParent } from "./KBPathResolver.js";
 import { rebuildMemoryBank } from "./MemoryBankRebuild.js";
 import { writeManualDisableFlag } from "./RepoProfile.js";
 import { resolveSotStorage } from "./SotStorageResolver.js";
@@ -123,5 +125,40 @@ describe("rebuildMemoryBank", () => {
 		// still returns ok + "0 memories migrated", matching /migrated/) is caught.
 		expect(result.message).toMatch(/\b1 memories migrated/);
 		expect(result.folder).toBeTruthy();
+	});
+
+	it("reports busy — and archives nothing — while another vault writer holds the lock", async () => {
+		const repo = initRepo();
+		writeFileSync(join(repo, "f.txt"), "hi");
+		execFileSync("git", ["add", "-A"], { cwd: repo });
+		execFileSync("git", ["commit", "-qm", "init"], { cwd: repo });
+		const sot = await resolveSotStorage(repo);
+		const hash = "abc123def456";
+		await sot.writeFiles(
+			[
+				{ path: "index.json", content: makeIndex(hash) },
+				{ path: `summaries/${hash}.json`, content: makeSummary(hash) },
+			],
+			"seed summary",
+		);
+		// Claim the folder so there IS something the archive-then-migrate sequence
+		// would move. Cheaper than a full first rebuild, which is what this test is
+		// asserting never starts.
+		const kbRoot = resolveKBPath(extractRepoName(repo), getRemoteUrl(repo), undefined);
+
+		// A concurrent vault writer (QueueWorker mid-drain / sync round / compile).
+		const vaultRoot = resolveKbParent(undefined);
+		const held = await acquireVaultWriteLock(vaultRoot, "fail-fast");
+		expect(held).not.toBeNull();
+		try {
+			const result = await rebuildMemoryBank(repo, { lockWaitMs: 30 });
+			expect(result.ok).toBe(false);
+			expect(result.message).toMatch(/busy/i);
+			// Nothing was archived: the claimed folder is still live and in place.
+			expect(existsSync(kbRoot)).toBe(true);
+			expect(existsSync(join(vaultRoot, ".jolli", "archive"))).toBe(false);
+		} finally {
+			await held?.release();
+		}
 	});
 });

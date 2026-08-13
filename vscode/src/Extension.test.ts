@@ -717,6 +717,24 @@ const { mockArchiveKBFolder, mockFindRepoFolders } = vi.hoisted(() => ({
 	mockFindRepoFolders: vi.fn(() => ["/test/kb"]),
 }));
 
+// `rebuildMemoryBank` now runs its archive-then-migrate sequence under
+// `vault-write.lock`. Mocked to a pass-through here for the same reason
+// KbFoldersService.test.ts does it: these tests are about the command's wiring, and
+// the real lock would try to create its directory under this file's MOCKED global
+// config dir (`/home/user/...`), which macOS cannot make — so every rebuild test
+// failed with a raw ENOENT. The real lock is exercised against a real, isolated HOME
+// in cli/src/core/MemoryBankRebuild.test.ts.
+vi.mock("../../cli/src/sync/VaultWriteLock.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../../cli/src/sync/VaultWriteLock.js")>();
+	return {
+		...actual,
+		withVaultWriteLock: vi.fn(async (_root: string, _mode: unknown, body: () => Promise<unknown>) => ({
+			ran: true,
+			value: await body(),
+		})),
+	};
+});
+
 vi.mock("../../cli/src/core/KBPathResolver.js", () => ({
 	extractRepoName: vi.fn(() => "test-repo"),
 	getRemoteUrl: vi.fn(() => null),

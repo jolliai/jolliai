@@ -110,6 +110,27 @@ describe("sentryDefinition", () => {
 		}
 	});
 
+	// The two synthesized shapes are not equally poor, and treating them as
+	// interchangeable is what let a Seer run overwrite a short-id row with a bare
+	// machine id — dropping the issue-id, project and culprit with it, since the
+	// harvested set moves wholesale.
+	it("ranks the no-prose title as its poorest fallback, below the harvested short id", () => {
+		const poorest = sentryDefinition.titleFallbackPoorestPattern;
+		expect(poorest).toBeDefined();
+		const re = new RegExp(poorest as string);
+		// Arm 4: no prose at all → the machine id from the arguments.
+		const noProse = normalizeSentry({ url: SENTRY_URL }, GET_RESOURCE) as { title: string };
+		expect(re.test(noProse.title), noProse.title).toBe(true);
+		// Arm 3: the heading WAS harvested → a stable per-issue handle. Still a
+		// fallback, but not the poorest one.
+		const headingOnly = normalizeSentry({ url: SENTRY_URL }, GET_RESOURCE, "# Issue JS-NEXT-1 in **j**") as {
+			title: string;
+		};
+		expect(re.test(headingOnly.title), headingOnly.title).toBe(false);
+		// Every poorest title is a member of the fallback family, or the rank is dead.
+		expect(new RegExp(sentryDefinition.titleFallbackPattern as string).test(noProse.title)).toBe(true);
+	});
+
 	it("declares no status field — the one fact that can go stale", () => {
 		const keys = sentryDefinition.fields.map((f) => f.key);
 		expect(keys).toEqual(["issue-id", "project"]);

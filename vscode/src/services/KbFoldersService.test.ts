@@ -7,12 +7,13 @@ import {
 	readdirSync,
 	renameSync,
 	rmSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { __setSotResolverForTests } from "../../../cli/src/core/FolderConsolidation";
+import { __setSotResolverForTests, ConsolidationStalePlanError } from "../../../cli/src/core/FolderConsolidation";
 import { MetadataManager } from "../../../cli/src/core/MetadataManager";
 import type { StorageProvider } from "../../../cli/src/core/StorageProvider";
 import { VaultWriteBusyError, withVaultWriteLock } from "../../../cli/src/sync/VaultWriteLock";
@@ -32,6 +33,11 @@ vi.mock("../../../cli/src/sync/VaultWriteLock.js", async (importOriginal) => {
 	};
 });
 
+// The vault-lock release hook lazy-imports QueueWorker to wake a stranded
+// worker. Stubbed so the wake path can be asserted without pulling that module's
+// transcript-reader / detector graph into this suite.
+vi.mock("../../../cli/src/hooks/QueueWorker.js", () => ({ launchWorker: vi.fn() }));
+
 // Windows ignores chmod for unprivileged file accesses, so a `chmod 0o000`
 // based "unreadable file" test ends up reading the file just fine and the
 // "expect title to be undefined" assertion fails. ESM namespace exports
@@ -44,6 +50,11 @@ const skipIfWin32 = process.platform === "win32" ? it.skip : it;
  * Seed a fake KB repo under `parent`. Mirrors what `initializeKBFolder` does
  * (writes `.jolli/config.json`) but inline so tests stay readable and don't
  * pull in the full CLI helper graph.
+ *
+ * The config's mtime is backdated a day, because `archiveUnusedFolders` reads it
+ * as the claim time and spares a folder claimed within the last hour (another IDE
+ * window may have just opened that project). A test that wants the fresh-claim
+ * behaviour calls {@link touchClaim}.
  */
 function seedRepo(
 	parent: string,
@@ -52,8 +63,9 @@ function seedRepo(
 ): string {
 	const repoDir = join(parent, dirName);
 	mkdirSync(join(repoDir, ".jolli"), { recursive: true });
+	const configPath = join(repoDir, ".jolli", "config.json");
 	writeFileSync(
-		join(repoDir, ".jolli", "config.json"),
+		configPath,
 		JSON.stringify({
 			version: 1,
 			sortOrder: "date",
@@ -62,7 +74,15 @@ function seedRepo(
 		}),
 		"utf-8",
 	);
+	const aDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+	utimesSync(configPath, aDayAgo, aDayAgo);
 	return repoDir;
+}
+
+/** Marks a seeded folder as claimed just now (the mtime `seedRepo` backdates). */
+function touchClaim(repoDir: string): void {
+	const now = new Date();
+	utimesSync(join(repoDir, ".jolli", "config.json"), now, now);
 }
 
 describe("KbFoldersService — single repo (under multi-repo parent)", () => {
@@ -1861,6 +1881,17 @@ describe("KbFoldersService.archiveUnusedFolders", () => {
 		expect(isArchived("system32")).toBe(true);
 	});
 
+	it("keeps an empty folder claimed moments ago — another window may have just opened that project", async () => {
+		// `resolveKBPath` claims (writes config.json) the first time a window resolves
+		// a repo's folder, and a fresh install's folder is legitimately empty until the
+		// first commit lands. Archiving it out from under that window is a move it did
+		// not ask for; the sweep's whole point is folders nothing has touched in ages.
+		const fresh = seedRepo(tmpParent, "just-opened", { remoteUrl: "https://github.com/x/just-opened.git" });
+		touchClaim(fresh);
+		expect(await makeSvc().archiveUnusedFolders()).toEqual([]);
+		expect(existsSync(fresh)).toBe(true);
+	});
+
 	it("archives an empty folder that carries a real remote (checkout opened once, never committed to)", async () => {
 		// Identifying a real repo is not the same as being useful: the row is
 		// pure noise until a memory lands, and the folder returns the moment
@@ -2212,6 +2243,40 @@ describe("KbFoldersService — duplicate consolidation", () => {
 		expect(existsSync(join(tmpParent, "app", ".jolli", "summaries", "z9.json"))).toBe(true);
 	});
 
+	it("re-validates the plan under the lock and refuses a stale one", async () => {
+		makeRepo("app", ["a1", "a2", "a3"]);
+		makeRepo("app-2", ["a1", "z9"]);
+		const service = svc("app", "/cwd");
+		const plan = await service.planDuplicateConsolidation();
+		if (!plan) throw new Error("expected a consolidation plan");
+
+		// Detection runs OUTSIDE the lock and the confirmation modal can sit open
+		// indefinitely, so the folder set can change before the user clicks Merge.
+		rmSync(join(tmpParent, "app-2"), { recursive: true, force: true });
+
+		await expect(service.runConsolidation(plan)).rejects.toBeInstanceOf(ConsolidationStalePlanError);
+		// The surviving folder is untouched — no half-merge against a stale plan.
+		expect(existsSync(join(tmpParent, "app", ".jolli", "summaries", "z9.json"))).toBe(false);
+	});
+
+	it("passes the pending-worker release hook so a worker waiting on the vault is woken", async () => {
+		makeRepo("app", ["a1", "a2", "a3"]);
+		makeRepo("app-2", ["a1", "z9"]);
+		const service = svc("app", "/cwd");
+		const plan = await service.planDuplicateConsolidation();
+		if (!plan) throw new Error("expected a consolidation plan");
+		await service.runConsolidation(plan);
+
+		const releaseHook = vi.mocked(withVaultWriteLock).mock.calls.at(-1)?.[3];
+		expect(typeof releaseHook?.launch).toBe("function");
+
+		// And the hook actually reaches the worker launcher — the wake is the whole
+		// point, so asserting only that a function was passed proves nothing.
+		const { launchWorker } = await import("../../../cli/src/hooks/QueueWorker.js");
+		releaseHook?.launch("/some/repo");
+		await vi.waitFor(() => expect(launchWorker).toHaveBeenCalledWith("/some/repo"));
+	});
+
 	it("runConsolidation throws VaultWriteBusyError when the vault lock is busy", async () => {
 		makeRepo("app", ["a1", "a2", "a3"]);
 		makeRepo("app-2", ["a1", "z9"]);
@@ -2237,5 +2302,12 @@ describe("KbFoldersService — duplicate consolidation", () => {
 
 		expect(await svc("app", "/cwd").archiveUnusedFolders()).toEqual([]);
 		expect(existsSync(join(tmpParent, "junk"))).toBe(true);
+	});
+
+	it("archiveUnusedFolders passes the pending-worker release hook", async () => {
+		makeRepo("app", ["a1"]);
+		await svc("app", "/cwd").archiveUnusedFolders();
+		const releaseHook = vi.mocked(withVaultWriteLock).mock.calls.at(-1)?.[3];
+		expect(typeof releaseHook?.launch).toBe("function");
 	});
 });

@@ -385,6 +385,12 @@ publish_git_repo() {
 		git -c core.excludesFile=/dev/null add -A
 		if git -c core.excludesFile=/dev/null diff --cached --quiet; then
 			echo "==> Nothing changed — target already up to date."
+			# Unconditionally, BEFORE the unpushed branch below: a destination
+			# .gitignore matching a required file keeps it out of the index, so
+			# `add -A` stages nothing and this branch is reached with the published
+			# tree incomplete. Gating the assertion on "has an unpushed commit" left
+			# exactly that case green.
+			publish_assert_staged "$dest"
 			# ... but "nothing to COMMIT" is not "nothing to PUBLISH". A previous
 			# NO_PUSH=1 rehearsal or a failed push leaves the release commit local-only,
 			# and every later run also finds nothing to commit — so without this the
@@ -392,12 +398,9 @@ publish_git_repo() {
 			# reach users.
 			if publish_has_unpushed; then
 				echo "==> Local release commit is not on the remote yet."
-				# Same completeness gate as the commit path below. This branch pushes a commit
-				# THIS run did not create, so without the check an incomplete commit — one an
-				# older script version or a hand-run `git commit` landed here — would go out to
-				# users unexamined. `git ls-files` reads the index, which after a commit still
-				# reflects the tracked tree, so the assertion is meaningful here too.
-				publish_assert_staged "$dest"
+				# The completeness gate for this branch already ran above — it pushes a
+				# commit THIS run did not create, so an incomplete one (an older script
+				# version, a hand-run `git commit`) must not go out unexamined.
 				publish_push
 			fi
 			exit 0
@@ -408,13 +411,22 @@ publish_git_repo() {
 		# like a release. The equal-only form this replaced would have waved a downgrade
 		# through — see the twin guard in claude-plugin/scripts/_publish-lib.sh, where
 		# exactly that gap was live (source 1.0.0, prod already on 1.0.1).
-		local version last_msg last_version
+		local version last_msg last_version release_subject
 		version="$(publish_version)"
+		release_subject="release: jolli codex plugin "
 		if [ "$target_kind" = "prod" ]; then
-			last_msg="$(git log -1 --format=%s 2>/dev/null || true)"
-			last_version="${last_msg#release: jolli codex plugin }"
-			if [ "${JOLLI_PUBLISH_FORCE:-0}" != "1" ] &&
-				[ "$last_msg" != "$last_version" ] &&
+			# The baseline is the last RELEASE commit, looked up in history — not the
+			# tip. Reading the tip and stripping the prefix made the guard vanish
+			# whenever the destination's last commit was anything else (a README fix, a
+			# merge): the strip was a no-op, the `last_msg != last_version` sanity test
+			# went false, and the `&&` chain short-circuited into a green downgrade.
+			last_msg="$(git log -1 --format=%s --grep="^${release_subject}" 2>/dev/null || true)"
+			last_version="${last_msg#"$release_subject"}"
+			if [ -z "$last_msg" ]; then
+				# No release commit on the target: a first publish has no baseline to be
+				# higher than. Said out loud, because "guard skipped" must never be silent.
+				echo "==> No previous release commit on the target — version guard has no baseline."
+			elif [ "${JOLLI_PUBLISH_FORCE:-0}" != "1" ] &&
 				! publish_version_gt "$version" "$last_version"; then
 				echo "error: content changed but plugin version ${version} is not higher than" >&2
 				echo "       the last published release (${last_version})." >&2
@@ -441,7 +453,9 @@ publish_git_repo() {
 		fi
 
 		publish_assert_staged "$dest"
-		git commit -s -m "release: jolli codex plugin ${version}"
+		# Same `release_subject` the guard greps for — a literal here could drift from
+		# the pattern and leave every future run without a baseline.
+		git commit -s -m "${release_subject}${version}"
 
 		publish_push
 

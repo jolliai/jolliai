@@ -33,10 +33,10 @@
 
 import { copyFileSync, type Dirent, existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
-import { createLogger } from "../Logger.js";
+import { createLogger, isManuallyDisabled } from "../Logger.js";
 import type { SummaryIndex } from "../Types.js";
 import { FolderStorage } from "./FolderStorage.js";
-import { archiveKBFolder, findRepoFolders, initializeKBFolder, resolveKbParent } from "./KBPathResolver.js";
+import { archiveKBFolder, findRepoFolders, initializeKBFolder, peekKBPath, resolveKbParent } from "./KBPathResolver.js";
 import type { BranchesJson, Manifest } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
 import { MigrationEngine } from "./MigrationEngine.js";
@@ -58,16 +58,50 @@ export function __setSotResolverForTests(fn: ((cwd: string) => Promise<StoragePr
 
 export type ConsolidationKind = "identical" | "orphan-superset" | "union-largest";
 
+/**
+ * Thrown by {@link executeConsolidation} when the project is manually disabled.
+ *
+ * A distinct type so a host can tell "you disabled this project" apart from a
+ * real failure — the user clicked Merge, so a silent swallow would look like the
+ * click did nothing.
+ */
+export class ConsolidationDisabledError extends Error {
+	constructor(message = "Jolli Memory is disabled for this project — enable it first.") {
+		super(message);
+		this.name = "ConsolidationDisabledError";
+	}
+}
+
+/**
+ * Thrown by a caller that re-classified under the vault lock and found the plan
+ * the user confirmed no longer describes what is on disk. Separate from
+ * {@link ConsolidationDisabledError} because the remedy is different: click
+ * Refresh again and confirm the new plan.
+ */
+export class ConsolidationStalePlanError extends Error {
+	constructor(message = "the Memory Bank folders changed since this merge was described") {
+		super(message);
+		this.name = "ConsolidationStalePlanError";
+	}
+}
+
 export interface ConsolidationPlan {
 	readonly kind: ConsolidationKind;
 	readonly repoName: string;
 	/** Absolute paths of every folder that currently holds this repo (≥ 2). */
 	readonly folders: readonly string[];
 	/**
-	 * The folder that will remain live. For `orphan-superset` this is the
-	 * canonical `<parent>/<repo>` base slot the rebuild lands on (which may
-	 * itself be archived-then-recreated); for the other kinds it is an existing
-	 * folder in {@link folders}.
+	 * The folder that will remain live. For the two merge kinds this is an
+	 * existing folder in {@link folders} and is authoritative.
+	 *
+	 * For `orphan-superset` it is only a PREDICTION — the canonical
+	 * `<parent>/<repo>` base slot, which the rebuild lands on in the ordinary case
+	 * (the base is one of {@link folders} and is archived-then-recreated). The
+	 * executor re-resolves the slot for real after archiving, because the base may
+	 * belong to a DIFFERENT repo that shares the basename — the very reason this
+	 * repo ended up on suffixed slots — and that folder is not in {@link folders},
+	 * so it is never archived and must never be claimed. Read the actual folder
+	 * off {@link ConsolidationResult.survivor}, never off the plan.
 	 */
 	readonly survivor: string;
 	/** Folders that will be archived. For `orphan-superset` this is ALL folders. */
@@ -102,7 +136,9 @@ const MERGED_OR_OWNED_META: ReadonlySet<string> = new Set([
 
 /**
  * Classifies the duplicate folders for the given repo, or returns `null` when
- * there is nothing to consolidate (fewer than two folders).
+ * there is nothing to consolidate (fewer than two folders, or the project is
+ * manually disabled — see {@link executeConsolidation} for why disabled must
+ * offer nothing rather than offer a merge that cannot complete).
  */
 export async function classifyDuplicateFolders(
 	cwd: string,
@@ -110,6 +146,7 @@ export async function classifyDuplicateFolders(
 	remoteUrl: string | null,
 	customPath?: string,
 ): Promise<ConsolidationPlan | null> {
+	if (isManuallyDisabled()) return null;
 	const folders = findRepoFolders(repoName, remoteUrl, customPath);
 	if (folders.length < 2) return null;
 
@@ -163,6 +200,44 @@ export async function classifyDuplicateFolders(
 }
 
 /**
+ * Re-classifies and returns the CURRENT plan, throwing
+ * {@link ConsolidationStalePlanError} when it no longer matches the one the user
+ * confirmed.
+ *
+ * Detection necessarily runs outside the vault lock (the host shows a modal
+ * between plan and execute, and holding the lock across a dialog would block
+ * every summary write for as long as it stays open), so the folder set can change
+ * under an open confirmation — another window's sweep, a sync round, a second
+ * clone's first write. Callers must therefore invoke this INSIDE the lock and
+ * execute the returned plan: the user agreed to a specific description, so a
+ * changed one is a re-confirm, not something to silently act on.
+ *
+ * `kind`, the folder set and the survivor are compared; the counts are not (they
+ * are display detail, and the returned plan carries the fresh ones).
+ *
+ * Disabled is reported as {@link ConsolidationDisabledError}, not as a stale plan:
+ * `classifyDuplicateFolders` declines outright while disabled, so a null answer
+ * there is ambiguous, and telling a user their folders changed when what actually
+ * happened is that the project is off sends them to re-click Refresh forever.
+ */
+export async function revalidateConsolidationPlan(
+	plan: ConsolidationPlan,
+	cwd: string,
+	remoteUrl: string | null,
+	customPath?: string,
+): Promise<ConsolidationPlan> {
+	if (isManuallyDisabled()) throw new ConsolidationDisabledError();
+	const fresh = await classifyDuplicateFolders(cwd, plan.repoName, remoteUrl, customPath);
+	if (fresh === null) throw new ConsolidationStalePlanError();
+	const sameFolders =
+		fresh.folders.length === plan.folders.length && fresh.folders.every((f, i) => f === plan.folders[i]);
+	if (fresh.kind !== plan.kind || fresh.survivor !== plan.survivor || !sameFolders) {
+		throw new ConsolidationStalePlanError();
+	}
+	return fresh;
+}
+
+/**
  * Executes a plan produced by {@link classifyDuplicateFolders}. Returns a
  * summary of what happened.
  *
@@ -173,6 +248,17 @@ export async function classifyDuplicateFolders(
  * `git add` on a path this just moved). The only caller today,
  * `KbFoldersService.runConsolidation`, wraps it in `withVaultWriteLock`; any
  * new caller must do the same.
+ *
+ * Throws {@link ConsolidationDisabledError} while the project is manually
+ * disabled, and the gate is on the SAME in-memory flag that makes the rebuild's
+ * own steps no-op (`FolderStorage.ensure`, `MigrationEngine.runMigration` both
+ * check `isManuallyDisabled`). That is what makes the two consistent by
+ * construction: in any process where the destructive half would be skipped, the
+ * archive half is refused too. Measured before the gate: every folder archived,
+ * initialization and migration skipped, and the host reported success with
+ * "(0 memories)" — every memory in the archive with nothing rebuilt.
+ * `classifyDuplicateFolders` also declines while disabled, so this throw only
+ * covers a project disabled between the plan and the user's confirmation.
  */
 export async function executeConsolidation(
 	plan: ConsolidationPlan,
@@ -180,6 +266,7 @@ export async function executeConsolidation(
 	remoteUrl: string | null,
 	customPath?: string,
 ): Promise<ConsolidationResult> {
+	if (isManuallyDisabled()) throw new ConsolidationDisabledError();
 	if (plan.kind === "orphan-superset") {
 		return rebuildFromOrphan(plan, cwd, remoteUrl, customPath);
 	}
@@ -247,7 +334,16 @@ async function rebuildFromOrphan(
 		archiveKBFolder(folder, customPath);
 	}
 
-	const base = plan.survivor;
+	// Re-resolve AFTER archiving rather than trusting `plan.survivor`, exactly as
+	// `rebuildMemoryBank` does. `plan.survivor` is the base slot as PREDICTED at
+	// classification time, and the prediction is wrong in the one case that
+	// matters: when `<parent>/<repo>` belongs to a different repo sharing the
+	// basename, it is not in `plan.folders`, so the loop above did not archive it —
+	// and claiming it would rewrite ANOTHER repo's `config.json` identity and
+	// migrate this repo's memories into its folder. `peekKBPath` answers with the
+	// freed base when the base is ours-or-absent and with the lowest free suffix
+	// otherwise; it is the pure-read sibling, so it claims nothing on its own.
+	const base = peekKBPath(plan.repoName, remoteUrl, customPath);
 	initializeKBFolder(base, plan.repoName, remoteUrl);
 	const mm = new MetadataManager(join(base, ".jolli"));
 	const folder = new FolderStorage(base, mm);

@@ -2,12 +2,16 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setManuallyDisabled } from "../Logger.js";
 import type { FileWrite, SummaryIndex } from "../Types.js";
 import {
 	__setSotResolverForTests,
+	ConsolidationDisabledError,
 	type ConsolidationPlan,
+	ConsolidationStalePlanError,
 	classifyDuplicateFolders,
 	executeConsolidation,
+	revalidateConsolidationPlan,
 } from "./FolderConsolidation.js";
 import { __setSshRunnerForTests } from "./SshAliasResolver.js";
 import type { StorageProvider } from "./StorageProvider.js";
@@ -130,6 +134,7 @@ describe("FolderConsolidation", () => {
 	afterEach(() => {
 		__setSotResolverForTests(null);
 		__setSshRunnerForTests(null);
+		setManuallyDisabled(false);
 		try {
 			rmSync(parent, { recursive: true, force: true });
 		} catch {
@@ -393,6 +398,117 @@ describe("FolderConsolidation", () => {
 			expect(plan?.kind).toBe("union-largest");
 			expect(plan?.counts.perFolder[join(parent, "app-2")]).toBe(0);
 			expect(plan?.survivor).toBe(join(parent, "app"));
+		});
+
+		it("orphan-superset: never lands on a base slot another repo owns", async () => {
+			// The base `<parent>/app` belongs to a DIFFERENT repo that happens to share
+			// the basename — which is the very reason this repo ended up on suffixed
+			// slots. `findRepoFolders` correctly leaves it out of the pile, so it is
+			// never archived; claiming it anyway rewrote its identity and migrated this
+			// repo's memories into another repo's folder.
+			const foreignRemote = "git@github.com:other/app.git";
+			const foreign = makeKbFolder(parent, "app", {
+				remoteUrl: foreignRemote,
+				repoName: "app",
+				hashes: ["f1"],
+			});
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1"] });
+			makeKbFolder(parent, "app-3", { remoteUrl: REMOTE, repoName: "app", hashes: ["a2"] });
+			const sot = new InMemoryStorage(true);
+			await sot.writeFiles(
+				[
+					{ path: "index.json", content: indexJson(["a1", "a2"]) },
+					{ path: "summaries/a1.json", content: summaryJson("a1") },
+					{ path: "summaries/a2.json", content: summaryJson("a2") },
+				],
+				"seed",
+			);
+			__setSotResolverForTests(async () => sot);
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			assertPlan(plan);
+			expect(plan.kind).toBe("orphan-superset");
+
+			const result = await executeConsolidation(plan, "/cwd", REMOTE, parent);
+
+			expect(result.survivor).not.toBe(foreign);
+			// The other repo's folder is untouched: same identity, same contents.
+			const config = JSON.parse(readFileSync(join(foreign, ".jolli", "config.json"), "utf-8")) as {
+				remoteUrl: string;
+			};
+			expect(config.remoteUrl).toBe(foreignRemote);
+			expect(summaryHashesOnDisk(foreign)).toEqual(["f1"]);
+			// This repo's memories still landed somewhere, rebuilt from the orphan branch.
+			expect(summaryHashesOnDisk(result.survivor)).toEqual(["a1", "a2"]);
+		});
+
+		it("re-validation reports DISABLED rather than a stale plan", async () => {
+			// `classifyDuplicateFolders` declines while disabled, so a null answer from it
+			// is ambiguous — reporting "the folders changed" would send the user back to
+			// Refresh forever instead of telling them the project is off.
+			makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "z9"] });
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			assertPlan(plan);
+
+			setManuallyDisabled(true);
+			await expect(revalidateConsolidationPlan(plan, "/cwd", REMOTE, parent)).rejects.toBeInstanceOf(
+				ConsolidationDisabledError,
+			);
+		});
+
+		it("re-validation refuses a plan whose folder set moved on", async () => {
+			makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "z9"] });
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			assertPlan(plan);
+
+			// A third folder appears (another clone's first write) — the survivor choice
+			// and the merge description are both different now.
+			makeKbFolder(parent, "app-3", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2", "a4", "a5"] });
+			await expect(revalidateConsolidationPlan(plan, "/cwd", REMOTE, parent)).rejects.toBeInstanceOf(
+				ConsolidationStalePlanError,
+			);
+		});
+
+		it("re-validation returns the freshly-computed plan when nothing moved", async () => {
+			makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "z9"] });
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			assertPlan(plan);
+			const fresh = await revalidateConsolidationPlan(plan, "/cwd", REMOTE, parent);
+			expect(fresh.kind).toBe(plan.kind);
+			expect(fresh.survivor).toBe(plan.survivor);
+			expect(fresh.folders).toEqual(plan.folders);
+		});
+
+		it("refuses to run while the project is manually disabled", async () => {
+			// Every write the rebuild depends on (`FolderStorage.ensure`,
+			// `MigrationEngine.runMigration`) no-ops while disabled, so archiving the
+			// pile first would leave every memory in the archive with nothing rebuilt —
+			// and report success with "(0 memories)".
+			makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a3"] });
+			const sot = new InMemoryStorage(true);
+			await sot.writeFiles(
+				[
+					{ path: "index.json", content: indexJson(["a1", "a2", "a3"]) },
+					{ path: "summaries/a1.json", content: summaryJson("a1") },
+					{ path: "summaries/a2.json", content: summaryJson("a2") },
+					{ path: "summaries/a3.json", content: summaryJson("a3") },
+				],
+				"seed",
+			);
+			__setSotResolverForTests(async () => sot);
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			assertPlan(plan);
+
+			setManuallyDisabled(true);
+			await expect(executeConsolidation(plan, "/cwd", REMOTE, parent)).rejects.toBeInstanceOf(
+				ConsolidationDisabledError,
+			);
+			// Nothing archived, nothing moved.
+			expect(existsSync(join(parent, ".jolli", "archive"))).toBe(false);
+			expect(summaryHashesOnDisk(join(parent, "app"))).toEqual(["a1", "a2"]);
 		});
 
 		it("merges commitAliases across folders", async () => {

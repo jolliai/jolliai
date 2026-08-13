@@ -33,7 +33,8 @@ PLUGIN_DIR="$SRC/plugins/jolli"
 # directions matter: a script listed here that the build no longer emits makes
 # `publish_assert_dist_built` refuse EVERY publish (local/dev/prod/zip alike), and a
 # script the server loads but this list omits is exactly the silent-dropout case
-# above.
+# above — this list had already drifted three files behind that way (knowledge.js,
+# graph.js, settings.js) while the comment claimed each was asserted.
 PUBLISH_REQUIRED_DIST=(
 	Cli.js PluginBootstrapHook.js StopHook.js SessionStartHook.js
 	PostCommitHook.js PostMergeHook.js PostRewriteHook.js PrepareMsgHook.js PrePushHook.js
@@ -144,10 +145,32 @@ publish_assert_dist_staged() {
 	fi
 }
 
+# publish_assert_config_present — every PUBLISH_REQUIRED_CONFIG file exists and is
+# non-empty in the SOURCE tree.
+#
+# The dest-side twin (`publish_assert_dist_staged`) only runs on the git-repo
+# publish, because only that path stages anything. The archive and local-install
+# paths pack / mirror straight from disk and so were gated on dist completeness
+# alone — a tree missing either LICENSE copy produced a zip and a local
+# marketplace with no license text and printed nothing. Checked against the source
+# so the error names a path the developer can fix.
+publish_assert_config_present() {
+	local missing=() f
+	for f in "${PUBLISH_REQUIRED_CONFIG[@]}"; do
+		[ -s "$SRC/$f" ] || missing+=("$f")
+	done
+	if [ "${#missing[@]}" -gt 0 ]; then
+		echo "error: required plugin file(s) missing or empty: ${missing[*]}" >&2
+		echo "       The plugin MUST ship its manifest, hooks, MCP registration and LICENSE." >&2
+		return 1
+	fi
+}
+
 publish_build() {
 	echo "==> Building dist/ (bundles current cli/src) ..."
 	node "$PLUGIN_DIR/scripts/build.mjs"
 	publish_assert_dist_built
+	publish_assert_config_present
 }
 
 # publish_assert_safe_dest <dest-dir> — refuse to `rsync --delete` into a
@@ -355,10 +378,18 @@ publish_git_repo() {
 	git -c core.excludesFile=/dev/null add -A
 	if git -c core.excludesFile=/dev/null diff --cached --quiet; then
 		echo "==> Nothing changed — target already up to date."
+		# "Nothing to COMMIT" is not proof the release is complete. A destination
+		# .gitignore matching a required file keeps it out of the index, so `add -A`
+		# stages nothing and the diff is empty — which reads as "already up to date"
+		# while the published tree is missing that file. The assertion reads the index,
+		# which after a commit still reflects the tracked tree, so it is meaningful
+		# here; running it BEFORE the exit is the whole point.
+		publish_assert_dist_staged "$dest"
 		return 0
 	fi
 
-	local version last_msg last_version
+	local version last_msg last_version release_subject
+	release_subject="release: jolli plugin "
 	version="$(publish_version)"
 
 	# Version-bump guard, prod only: we're past the `diff --cached --quiet` check, so
@@ -373,13 +404,19 @@ publish_git_repo() {
 	# to a newer version than the one being released. Strictly-greater is the actual
 	# invariant `/plugin update` needs.
 	#
-	# (First publish / non-release last commit falls through: the prefix doesn't
-	# strip, so last_msg == last_version and the guard is skipped.) Override a
-	# deliberate same-version or downgrade republish with JOLLI_PUBLISH_FORCE=1.
+	# The baseline is the last RELEASE commit, found with --grep rather than read off
+	# the tip. The tip-and-strip form this replaced disabled the guard entirely
+	# whenever the destination's last commit was not a release commit (a README fix,
+	# a merge): the prefix didn't strip, the `last_msg != last_version` sanity test
+	# went false, and the whole `&&` chain short-circuited into a green downgrade.
+	# A first publish has no baseline and says so. Override a deliberate same-version
+	# or downgrade republish with JOLLI_PUBLISH_FORCE=1.
 	if [ "$target_kind" = "prod" ]; then
-		last_msg="$(git log -1 --format=%s 2>/dev/null || true)"
-		last_version="${last_msg#release: jolli plugin }"
-		if [ "${JOLLI_PUBLISH_FORCE:-0}" != "1" ] && [ "$last_msg" != "$last_version" ] &&
+		last_msg="$(git log -1 --format=%s --grep="^${release_subject}" 2>/dev/null || true)"
+		last_version="${last_msg#"$release_subject"}"
+		if [ -z "$last_msg" ]; then
+			echo "==> No previous release commit on the target — version guard has no baseline."
+		elif [ "${JOLLI_PUBLISH_FORCE:-0}" != "1" ] &&
 			! publish_version_gt "$version" "$last_version"; then
 			# `publish_sync` already ran `rsync --delete` + `git add -A`, so the checkout is
 			# dirty. Forgetting the version bump is the common trip (production publish
@@ -413,7 +450,9 @@ publish_git_repo() {
 	# every installing user's commits. Runs only once we're certain we'll commit.
 	publish_assert_dist_staged "$dest"
 
-	git commit -s -m "release: jolli plugin ${version}"
+	# Same `release_subject` the guard greps for — a literal here could drift from the
+	# pattern and leave every future run without a baseline.
+	git commit -s -m "${release_subject}${version}"
 
 	if [ "${NO_PUSH:-0}" = "1" ]; then
 		echo "==> NO_PUSH set — committed but not pushed."

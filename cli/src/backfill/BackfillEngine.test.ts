@@ -245,6 +245,42 @@ describe("runBackfill", () => {
 		expect(vi.mocked(attributeCommits)).not.toHaveBeenCalled();
 	});
 
+	it("re-checks each commit at the money boundary so a concurrent run is not paid for twice", async () => {
+		// The missing set is computed ONCE at run start, so anything that lands a
+		// summary while this run is mid-loop (the dashboard's Generate Missing button
+		// and `jolli backfill` are separate processes; the in-flight guard is
+		// process-scoped) was re-summarized and billed a second time.
+		vi.mocked(getIndexEntryMap)
+			.mockResolvedValueOnce(new Map()) // step 1: neither commit has a summary
+			.mockResolvedValueOnce(new Map()) // re-check before c1 → still missing
+			.mockResolvedValue(new Map([["c2", {} as never]])); // c2 landed meanwhile
+		vi.mocked(attributeCommits).mockReturnValue({
+			attributed: new Map([
+				["c1", attrFor("c1")],
+				["c2", attrFor("c2")],
+			]),
+			skipped: [],
+		});
+
+		const report = await runBackfill({ cwd: CWD, hashes: ["c1", "c2"] });
+
+		expect(vi.mocked(generateSummary)).toHaveBeenCalledTimes(1);
+		expect(report.generated).toBe(1);
+		expect(report.outcomes.find((o) => o.commitHash === "c2")?.status).toBe("skipped-has-summary");
+	});
+
+	it("still generates when the pre-generation re-check itself fails", async () => {
+		vi.mocked(getIndexEntryMap)
+			.mockResolvedValueOnce(new Map()) // step 1
+			.mockRejectedValue(new Error("orphan branch unreadable")); // the re-check
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+
+		const report = await runBackfill({ cwd: CWD, hashes: ["c1"] });
+
+		// A transient read failure must not silently skip the commit.
+		expect(report.generated).toBe(1);
+	});
+
 	it("generates a diff-only summary when no conversation is attributed (mirrors live no-session path)", async () => {
 		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map(), skipped: ["c1"] });
 		const report = await runBackfill({ cwd: CWD, hashes: ["c1"] });

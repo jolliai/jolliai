@@ -97,6 +97,43 @@ export function isDetachedDaemonInvocation(argv: ReadonlyArray<string>): boolean
  * loader — including the one invocation whose entire job is to forward bytes
  * between a socket and stdio, multiplied by every open AI session on the machine.
  */
+/**
+ * Serves the MCP session IN THIS PROCESS, with telemetry primed first — the
+ * fallback every proxy terminal that cannot reach a daemon ends in.
+ *
+ * The fast path below skips `main()`, which is where `bootstrapTelemetry` runs.
+ * That is correct for the proxy itself, which runs no tool and so has no per-tool
+ * event to emit — but it is NOT correct for the fallback, which is a full
+ * in-process server running in this same process. Without this, an
+ * unsafe-socket-dir / spawn-failure / all-generations-deferred session emitted
+ * zero telemetry for its entire life, silently.
+ *
+ * The one-time telemetry NOTICE is deliberately not shown here, for the same
+ * reason `isDetachedDaemonInvocation` suppresses it: this process's stderr belongs
+ * to the host's MCP transport, so the disclosure would be consumed by a log nobody
+ * reads while marking itself shown forever. It stays owed to the next ordinary
+ * `jolli` invocation.
+ *
+ * Priming is best-effort: telemetry must never cost a session its MCP server.
+ */
+export async function serveMcpInProcess(dir: string): Promise<void> {
+	const { bootstrapTelemetry, flushTelemetryNow } = await import("./core/TelemetryStartup.js");
+	try {
+		await bootstrapTelemetry({ cwd: dir });
+	} catch (error: unknown) {
+		// stderr, never stdout — stdout is this session's JSON-RPC stream.
+		console.error("telemetry unavailable for this MCP session:", error);
+	}
+	const { startMcpServer } = await import("./mcp/McpServer.js");
+	try {
+		await startMcpServer(dir);
+	} finally {
+		// The session is over, so this is the only chance to upload what it buffered.
+		// Bounded and best-effort, like the command path's exit flush.
+		await flushTelemetryNow(dir, { timeoutMs: 2_000 });
+	}
+}
+
 async function runMcpProxyFastPath(): Promise<void> {
 	const { runMcpProxy } = await import("./mcp/McpProxy.js");
 	// `resolveProjectDirInfo`, not `resolveProjectDir`: a cwd that came from the
@@ -105,7 +142,9 @@ async function runMcpProxyFastPath(): Promise<void> {
 	// path declines — so the claim has to be made in BOTH places or the guard has
 	// a hole exactly where it matters.
 	const { dir, fromGit } = resolveProjectDirInfo();
-	await runMcpProxy({ cwd: dir, isWorktreeRoot: fromGit });
+	// `serveMcpInProcess` rather than the proxy's default `startMcpServer`: the
+	// fallback needs telemetry primed, which only this entry point can do.
+	await runMcpProxy({ cwd: dir, isWorktreeRoot: fromGit, fallback: serveMcpInProcess });
 }
 
 // Auto-execute when run as a script (skip in test environment).

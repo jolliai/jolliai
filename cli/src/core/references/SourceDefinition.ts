@@ -176,6 +176,27 @@ export interface SourceDefinition {
 	 * it is simply there, and the newest read is the right answer.
 	 */
 	readonly titleFallbackPattern?: string;
+	/**
+	 * The POOREST title in {@link titleFallbackPattern}'s family — the shape this source
+	 * synthesizes when the out-of-band lookup recovered nothing at all.
+	 *
+	 * Only meaningful alongside that pattern, and only for a source whose fallbacks are
+	 * not all equally poor. sentry's are not: `Issue <shortId>` means the prose heading
+	 * WAS harvested (a stable, per-issue handle) while `Issue <machineId>` means nothing
+	 * was. Both match the fallback pattern, so the two-sided keep-the-prior test saw them
+	 * as interchangeable and let the machine-id form supersede the short-id row — taking
+	 * its `issue-id`, project and culprit with it, since the harvested set moves
+	 * wholesale. Declaring the poorest form makes a poorest-form observation yield to a
+	 * richer stored fallback while a richer one still supersedes a poorer stored one.
+	 *
+	 * Deliberately NOT a fix by narrowing `titleFallbackPattern` to the poorest form
+	 * instead: an `issueId` argument is not always the machine id (a model routinely
+	 * passes a short id), so the poorest shape is reachable with a short-id-looking value
+	 * and must still read as a fallback against a genuinely harvested title.
+	 *
+	 * Absent for figma: its one fallback shape is the only one it can synthesize.
+	 */
+	readonly titleFallbackPoorestPattern?: string;
 	readonly match: SourceMatch;
 	readonly wrapperKeys: ReadonlyArray<string>;
 	readonly reference: {

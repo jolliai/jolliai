@@ -26,12 +26,34 @@ export interface MemoryBankRebuildResult {
 	readonly folder?: string;
 }
 
+export interface MemoryBankRebuildOptions {
+	/**
+	 * Vault-lock wait budget. Defaults to `DEFAULT_PULL_LOCK_WAIT_MS` (10 s) —
+	 * long enough to sit out a summary write, short enough that a user who clicked
+	 * Migrate gets an answer. A test seam only; no production caller sets it.
+	 */
+	readonly lockWaitMs?: number;
+}
+
 /**
  * Re-migrates the repo at `cwd` from the orphan branch into a fresh Memory Bank
  * folder (the previous folders are archived, not deleted). Refuses when the repo
- * is manually disabled, or when there are no stored memories to rebuild.
+ * is manually disabled, when there are no stored memories to rebuild, or when
+ * another vault writer holds `vault-write.lock`.
+ *
+ * The lock is not optional. This archives EVERY folder for the repo and then
+ * re-migrates into the freed slot — a multi-second, many-file rewrite of the same
+ * working tree a QueueWorker drain, a sync round or a compile may be mid-write in.
+ * Unlocked, it tore across their `git status` snapshots exactly the way
+ * `KbFoldersService`'s two sweeps are locked to prevent. Being a plain file lock
+ * that refuses even its own PID, it doubles as the in-flight guard: a second
+ * concurrent call in THIS process (a double-clicked button, two hosts driving one
+ * CLI) is reported busy rather than archiving what the first just created.
  */
-export async function rebuildMemoryBank(cwd: string): Promise<MemoryBankRebuildResult> {
+export async function rebuildMemoryBank(
+	cwd: string,
+	opts: MemoryBankRebuildOptions = {},
+): Promise<MemoryBankRebuildResult> {
 	// While manually disabled, `folder.ensure()` and the repoint would run even
 	// though the identity write is gated — one call would de-identify the old
 	// folder while migrating nothing. Refuse outright, as the VS Code command does.
@@ -39,6 +61,36 @@ export async function rebuildMemoryBank(cwd: string): Promise<MemoryBankRebuildR
 		return { ok: false, message: "Jolli Memory is disabled for this project — enable it first." };
 	}
 
+	const { resolveKbParent } = await import("./KBPathResolver.js");
+	const { loadConfig: loadConfigForVault } = await import("./SessionTracker.js");
+	const { DEFAULT_PULL_LOCK_WAIT_MS, withVaultWriteLock } = await import("../sync/VaultWriteLock.js");
+	const vaultRoot = resolveKbParent((await loadConfigForVault()).localFolder);
+	const outcome = await withVaultWriteLock(
+		vaultRoot,
+		{ wait: opts.lockWaitMs ?? DEFAULT_PULL_LOCK_WAIT_MS },
+		() => rebuildLocked(cwd),
+		{
+			// Same contract as every other holder: wake a QueueWorker that timed out
+			// waiting on this lock. Imported inside the lambda so the ordinary path
+			// never pulls QueueWorker's reader/detector graph into a migrate.
+			/* v8 ignore start -- fires only when a worker is actually queued behind this lock */
+			launch: (workerCwd: string): void => {
+				void import("../hooks/QueueWorker.js").then(({ launchWorker }) => launchWorker(workerCwd));
+			},
+			/* v8 ignore stop */
+		},
+	);
+	if (!outcome.ran) {
+		return {
+			ok: false,
+			message: "Jolli Memory is busy writing to the Memory Bank right now — try again shortly.",
+		};
+	}
+	return outcome.value;
+}
+
+/** The archive-then-migrate sequence, always run while holding `vault-write.lock`. */
+async function rebuildLocked(cwd: string): Promise<MemoryBankRebuildResult> {
 	const { extractRepoName, getRemoteUrl, initializeKBFolder, findRepoFolders, peekKBPath, archiveKBFolder } =
 		await import("./KBPathResolver.js");
 	const { MetadataManager } = await import("./MetadataManager.js");

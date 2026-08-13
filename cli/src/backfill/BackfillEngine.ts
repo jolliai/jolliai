@@ -174,6 +174,29 @@ async function toStoredTranscript(attr: AttributedCommit): Promise<StoredTranscr
 }
 
 /**
+ * Does `hash` have a summary RIGHT NOW? Re-read immediately before the LLM call.
+ *
+ * The run's `missing` set is a snapshot from before the first generation, and a
+ * backfill is minutes long: the dashboard's Generate Missing button and
+ * `jolli backfill` are separate processes (the server's in-flight guard is
+ * process-scoped), and the live post-commit worker writes into the same store. Any
+ * of them landing a summary mid-run had this run generate and bill a second one.
+ *
+ * Costs one index read per commit — negligible next to the model call it guards,
+ * and skipped entirely on the dry-run / no-credentials paths, which spend nothing.
+ * A read failure answers "no summary" so a transient store problem degrades to the
+ * old behaviour (generate) rather than silently skipping the commit.
+ */
+async function hasSummaryNow(hash: string, cwd: string, storage: StorageProvider): Promise<boolean> {
+	try {
+		return (await getIndexEntryMap(cwd, storage)).has(hash);
+	} catch (err) {
+		log.warn("Back-fill re-check failed for %s: %s", hash.substring(0, 8), (err as Error).message);
+		return false;
+	}
+}
+
+/**
  * Generates and stores one back-filled summary. Throws on LLM/storage failure.
  *
  * `attr === null` is the **diff-only** path: no conversation was confidently
@@ -344,6 +367,13 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 			};
 		} else if (!credsOk) {
 			outcome = { commitHash: hash, status: "error", message: "no LLM credentials configured" };
+		} else if (await hasSummaryNow(hash, cwd, storage)) {
+			// Someone else summarized it since step 1 computed `missing` — another
+			// backfill process, or the live post-commit worker draining a queue entry.
+			// This is the last point before money is spent, so it is the only place the
+			// check is worth anything.
+			log.info("Back-fill skipping %s — a summary landed while this run was in flight", hash.substring(0, 8));
+			outcome = { commitHash: hash, status: "skipped-has-summary" };
 		} else {
 			try {
 				const topics = await generateAndStore(hash, attr, cwd, llmConfig, storage);

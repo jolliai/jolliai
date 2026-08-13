@@ -1603,8 +1603,12 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			return;
 		}
 		// One backfill at a time per server — a second concurrent run (a refresh or a
-		// second tab drops the page-side busy flag) would re-summarize the same
-		// commits and pay for every summary twice. See `generateMissingInFlight`.
+		// second tab drops the page-side busy flag) would otherwise start a second
+		// pass over the same commits. This flag is PROCESS-scoped and cannot see a
+		// concurrent `jolli backfill`, so it is not what stops double billing:
+		// `runBackfill` re-checks each commit for a summary immediately before the
+		// model call (`hasSummaryNow`). This guard just keeps one server from racing
+		// itself, and answers 409 so the page can say so.
 		/* v8 ignore start -- concurrency guard: a second in-flight backfill is not
 		   deterministically reproducible in a unit test (the empty-repo backfill the
 		   endpoint test uses returns before a second request could observe the flag).

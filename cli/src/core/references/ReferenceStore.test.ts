@@ -76,6 +76,9 @@ const { FALLBACK_TITLE_DEF } = vi.hoisted(() => ({
 		label: "Fallback Title Test",
 		icon: "history",
 		titleFallbackPattern: "^Unnamed [0-9a-z]{1,8}$",
+		// The all-digits form is this source's POOREST fallback — the shape it
+		// synthesizes when nothing at all was recovered.
+		titleFallbackPoorestPattern: "^Unnamed [0-9]{1,8}$",
 		match: { claude: { prefixes: ["mcp__fbtest__"] } },
 		wrapperKeys: [],
 		reference: {
@@ -1137,6 +1140,31 @@ describe("ReferenceStore", () => {
 			expect(back?.title).toBe("Design System v2");
 			expect(back?.fields).toEqual([{ key: "handle", label: "Handle", value: "DS-2" }]);
 			expect(back?.description).toBe("**Culprit:** views.js in poll");
+		});
+
+		// Two fallbacks are not equally poor, and the two-sided test cannot see it.
+		// sentry synthesizes `Issue <shortId>` when the prose heading was harvested and
+		// `Issue <machineId>` when nothing was: BOTH match the fallback pattern, so
+		// `!re.test(prior)` was false and the machine-id form overwrote the short-id row
+		// — taking its issue-id, project and culprit with it. A source that can rank its
+		// own fallbacks declares the poorest form.
+		it("keeps a richer stored fallback when the incoming one is the source's poorest form", async () => {
+			await writeReferenceMarkdown(
+				fbRef({ title: "Unnamed abc12345", fields: [{ key: "handle", label: "Handle", value: "DS-2" }] }),
+				tempDir,
+			);
+			const { sourcePath, title } = await writeReferenceMarkdown(fbRef({ title: "Unnamed 87654321" }), tempDir);
+			expect(title).toBe("Unnamed abc12345");
+			const back = await readReferenceMarkdown(sourcePath);
+			expect(back?.fields).toEqual([{ key: "handle", label: "Handle", value: "DS-2" }]);
+		});
+
+		// The other direction still has to work, which is why testing `incoming` alone was
+		// never an option: a later observation that recovered MORE must win.
+		it("still lets a richer fallback replace the poorest stored one", async () => {
+			await writeReferenceMarkdown(fbRef({ title: "Unnamed 87654321" }), tempDir);
+			const { title } = await writeReferenceMarkdown(fbRef({ title: "Unnamed abc12345" }), tempDir);
+			expect(title).toBe("Unnamed abc12345");
 		});
 
 		// The mirror of the url rule: absent on the stored side is not evidence against a

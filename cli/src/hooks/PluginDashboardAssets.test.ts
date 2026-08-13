@@ -31,11 +31,15 @@ import { DASHBOARD_SCRIPT_FILES } from "../dashboard/DashboardServer.js";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const assetsDir = join(repoRoot, "cli", "src", "dashboard", "assets");
 
-/** The entries of a plugin lib's `PUBLISH_REQUIRED_DIST=( … )`, in declared order. */
+/**
+ * The entries of a plugin lib's `PUBLISH_REQUIRED_DIST=( … )`, in declared order.
+ * `#`-prefixed tokens are dropped so annotating an entry inside the array does not
+ * read back as a required file that no build emits.
+ */
 function requiredDist(plugin: string): string[] {
 	const text = readFileSync(join(repoRoot, plugin, "scripts", "_publish-lib.sh"), "utf-8");
 	const block = text.split("PUBLISH_REQUIRED_DIST=(")[1]?.split(")")[0] ?? "";
-	return block.split(/\s+/u).filter((entry) => entry.length > 0);
+	return block.split(/\s+/u).filter((entry) => entry.length > 0 && !entry.startsWith("#"));
 }
 
 const PLUGINS = ["claude-plugin", "codex-plugin"] as const;

@@ -10,10 +10,12 @@
 import { randomBytes } from "node:crypto";
 import { basename } from "node:path";
 import * as vscode from "vscode";
-import type {
-	ConsolidationKind,
-	ConsolidationPlan,
-	ConsolidationResult,
+import {
+	ConsolidationDisabledError,
+	type ConsolidationKind,
+	type ConsolidationPlan,
+	type ConsolidationResult,
+	ConsolidationStalePlanError,
 } from "../../../cli/src/core/FolderConsolidation.js";
 import type { DetectedAgent } from "../../../cli/src/core/localagent/DetectAgents.js";
 import { VaultWriteBusyError } from "../../../cli/src/sync/VaultWriteLock.js";
@@ -217,9 +219,10 @@ export interface SidebarWebviewDeps {
 		 * committed to. Optional so existing tests keep compiling. Resolves to
 		 * the list of folder paths that were archived.
 		 *
-		 * Duplicate folders are NOT in scope — see the service method's contract:
-		 * a Refresh never moves a folder holding memories, so consolidating
-		 * duplicates is Migrate's job.
+		 * Duplicate folders are not in scope for THIS callback — this sweep is
+		 * unprompted and only ever moves provably-empty folders. They are handled by
+		 * `planDuplicateConsolidation` / `runConsolidation` below, which merge rather
+		 * than archive-the-loser and run only after an explicit confirmation.
 		 */
 		archiveUnusedFolders?: () => Promise<string[]>;
 		/**
@@ -2094,6 +2097,25 @@ export class SidebarWebviewProvider
 			if (err instanceof VaultWriteBusyError) {
 				void vscode.window.showInformationMessage(
 					"Jolli Memory is busy writing a summary right now — click Refresh again shortly to merge the duplicate folders.",
+				);
+				return;
+			}
+			// The plan is re-validated under the vault lock, and this modal can sit
+			// open for as long as the user likes — so the folder set may have moved
+			// on. Ask for a re-confirm rather than swallowing: the user clicked Merge
+			// and is entitled to know it did not happen.
+			if (err instanceof ConsolidationStalePlanError) {
+				void vscode.window.showInformationMessage(
+					"The Memory Bank folders changed while that prompt was open — click Refresh again to review the merge.",
+				);
+				return;
+			}
+			// Disabled between the prompt and the click. Every write the merge needs
+			// is gated on the same flag, so it refuses rather than archiving folders
+			// it cannot rebuild.
+			if (err instanceof ConsolidationDisabledError) {
+				void vscode.window.showInformationMessage(
+					"Jolli Memory is disabled for this project — enable it before merging the duplicate folders.",
 				);
 				return;
 			}

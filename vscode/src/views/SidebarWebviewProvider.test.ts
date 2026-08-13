@@ -8,7 +8,11 @@ import type {
 	SidebarState,
 } from "./SidebarMessages";
 import { setManuallyDisabled } from "../../../cli/src/Logger.js";
-import type { ConsolidationPlan } from "../../../cli/src/core/FolderConsolidation.js";
+import {
+	ConsolidationDisabledError,
+	type ConsolidationPlan,
+	ConsolidationStalePlanError,
+} from "../../../cli/src/core/FolderConsolidation.js";
 import { VaultWriteBusyError } from "../../../cli/src/sync/VaultWriteLock";
 import { describeConsolidationPlan, SidebarWebviewProvider } from "./SidebarWebviewProvider";
 
@@ -2170,6 +2174,28 @@ describe("SidebarWebviewProvider", () => {
 			expect(runConsolidation).toHaveBeenCalledTimes(1);
 			expect(showInformationMessage).toHaveBeenCalledTimes(1);
 			expect(showInformationMessage.mock.calls[0][0]).toContain("busy writing a summary");
+		});
+
+		it("asks for a re-confirm when the folders changed under the open modal", async () => {
+			const { view, runConsolidation } = makeConsolidationProvider(makePlan());
+			runConsolidation.mockRejectedValueOnce(new ConsolidationStalePlanError());
+			showWarningMessage.mockResolvedValueOnce("Merge");
+			view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+			await new Promise((r) => setTimeout(r, 0));
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showInformationMessage).toHaveBeenCalledTimes(1);
+			expect(showInformationMessage.mock.calls[0][0]).toContain("changed");
+		});
+
+		it("says so when the project was disabled before the merge ran", async () => {
+			const { view, runConsolidation } = makeConsolidationProvider(makePlan());
+			runConsolidation.mockRejectedValueOnce(new ConsolidationDisabledError());
+			showWarningMessage.mockResolvedValueOnce("Merge");
+			view.webview.triggerMessage({ type: "refresh", scope: "kb" });
+			await new Promise((r) => setTimeout(r, 0));
+			await new Promise((r) => setTimeout(r, 0));
+			expect(showInformationMessage).toHaveBeenCalledTimes(1);
+			expect(showInformationMessage.mock.calls[0][0]).toContain("disabled");
 		});
 
 		it("re-pushes the breadcrumb repo list after a kb refresh (archived repos leave the dropdown)", async () => {

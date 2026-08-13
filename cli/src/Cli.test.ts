@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { isBareMcpInvocation, isDetachedDaemonInvocation } from "./Cli.js";
 import { MCP_DAEMON_COMMAND, MCP_NO_DAEMON_ENV } from "./commands/McpCommand.js";
 import { GLOBAL_DAEMON_ENSURE_COMMAND } from "./daemon/EnsureGlobalDaemon.js";
@@ -59,6 +59,53 @@ describe("isDetachedDaemonInvocation", () => {
 		// or `global-daemon-status` must not inherit either daemon's stderr policy.
 		expect(isDetachedDaemonInvocation(["mcp-serve-status"])).toBe(false);
 		expect(isDetachedDaemonInvocation(["global-daemon-status"])).toBe(false);
+	});
+});
+
+describe("serveMcpInProcess (the fast path's fallback)", () => {
+	it("primes telemetry before serving, so a fallback session still reports per-tool events", async () => {
+		// The fast path skips `main()`, which is where telemetry is bootstrapped. Every
+		// proxy terminal that cannot reach a daemon serves in-process IN THIS PROCESS —
+		// and that server does run tools, so the "the proxy runs no tool, so it emits
+		// no telemetry" reasoning does not cover it.
+		const order: string[] = [];
+		vi.doMock("./core/TelemetryStartup.js", () => ({
+			bootstrapTelemetry: vi.fn(async () => void order.push("bootstrap")),
+			flushTelemetryNow: vi.fn(async () => {}),
+			maybeShowCliTelemetryNotice: vi.fn(async () => {}),
+		}));
+		vi.doMock("./mcp/McpServer.js", () => ({
+			startMcpServer: vi.fn(async () => void order.push("serve")),
+		}));
+		const { serveMcpInProcess } = await import("./Cli.js");
+
+		await serveMcpInProcess("/repo");
+
+		expect(order).toEqual(["bootstrap", "serve"]);
+		vi.doUnmock("./core/TelemetryStartup.js");
+		vi.doUnmock("./mcp/McpServer.js");
+		vi.resetModules();
+	});
+
+	it("serves even when priming telemetry fails", async () => {
+		// Telemetry is never allowed to cost a session its MCP server.
+		vi.doMock("./core/TelemetryStartup.js", () => ({
+			bootstrapTelemetry: vi.fn(async () => {
+				throw new Error("no install id");
+			}),
+			flushTelemetryNow: vi.fn(async () => {}),
+			maybeShowCliTelemetryNotice: vi.fn(async () => {}),
+		}));
+		const startMcpServer = vi.fn(async () => {});
+		vi.doMock("./mcp/McpServer.js", () => ({ startMcpServer }));
+		const { serveMcpInProcess } = await import("./Cli.js");
+
+		await serveMcpInProcess("/repo");
+
+		expect(startMcpServer).toHaveBeenCalledWith("/repo");
+		vi.doUnmock("./core/TelemetryStartup.js");
+		vi.doUnmock("./mcp/McpServer.js");
+		vi.resetModules();
 	});
 });
 

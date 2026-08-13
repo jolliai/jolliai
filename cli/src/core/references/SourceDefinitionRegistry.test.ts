@@ -233,6 +233,31 @@ describe("SourceDefinitionRegistry", () => {
 		});
 	});
 
+	describe("titleFallbackPoorestPattern", () => {
+		const withFamily = (poorest: unknown) => ({
+			...structuredCloneOfLinear(),
+			titleFallbackPattern: "^Issue [A-Za-z0-9_-]{1,128}$",
+			titleFallbackPoorestPattern: poorest,
+		});
+
+		it("accepts a valid pattern alongside the family it ranks within", () => {
+			expect(validateDefinition(withFamily("^Issue [0-9]{1,128}$")).ok).toBe(true);
+		});
+
+		it.each([
+			["empty string", ""],
+			["not a string", 42],
+			["uncompilable regex", "^Issue ([0-9$"],
+		])("rejects %s", (_label, pattern) => {
+			expect(validateDefinition(withFamily(pattern)).ok).toBe(false);
+		});
+
+		it("rejects a rank with no family — nothing would ever be detected as a fallback", () => {
+			const orphaned = { ...structuredCloneOfLinear(), titleFallbackPoorestPattern: "^Issue [0-9]{1,128}$" };
+			expect(validateDefinition(orphaned).ok).toBe(false);
+		});
+	});
+
 	it("rejects a reference key (nativeId/title/url) that is not an object", () => {
 		const base = structuredCloneOfLinear();
 		const bad = { ...base, reference: { ...base.reference, nativeId: undefined } };
