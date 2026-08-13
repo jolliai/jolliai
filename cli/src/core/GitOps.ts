@@ -14,6 +14,8 @@ import { dirname, join, resolve } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { CommitInfo, DiffStats, FileWrite, GitCommandResult } from "../Types.js";
 import { execFileAsyncHidden, execFileSyncHidden, spawnHidden } from "../util/Subprocess.js";
+import { resolveGitFsLayout } from "./GitFsLayout.js";
+import { toForwardSlash } from "./PathUtils.js";
 
 const MAX_GIT_BUFFER_BYTES = 10 * 1024 * 1024; // 10MB
 /** NUL byte — used as entry separator in `git ls-tree -z` output. */
@@ -55,6 +57,22 @@ export function resetStateRootCache(): void {
 export function resolveStateRoot(cwd: string): string {
 	const cached = _stateRootCache.get(cwd);
 	if (cached !== undefined) return cached;
+	// Filesystem first: this is the SessionStart hook's very first call, where a
+	// `rev-parse` is ~10 ms of pure process creation before any work begins.
+	//
+	// Two conversions are what make the fast path answer the SAME string as
+	// `--show-toplevel`, and this value anchors `.jolli/`, so the two spellings
+	// must never disagree or a repo grows a second state directory: `realpath:
+	// true` resolves symlinks (git reports the real path), and `toForwardSlash`
+	// matches git's separator — `/` on every platform, where a filesystem walk
+	// yields `\` on Windows. `node:fs` accepts either spelling, so the second one
+	// would be invisible at runtime and show up only as a split state directory.
+	const fromFs = resolveGitFsLayout(cwd, { realpath: true })?.worktreeRoot;
+	if (fromFs) {
+		const fsRoot = toForwardSlash(fromFs);
+		_stateRootCache.set(cwd, fsRoot);
+		return fsRoot;
+	}
 	let root = cwd;
 	try {
 		const out = execFileSyncHidden("git", ["rev-parse", "--show-toplevel"], {
@@ -1084,6 +1102,26 @@ export async function getProjectRootDir(cwd: string): Promise<string> {
  * blocks genuinely-non-git directories and never a valid `git worktree` setup.
  */
 export async function isInsideGitRepo(cwd: string): Promise<boolean> {
+	// A resolved filesystem layout is proof on its own because `resolveGitFsLayout`
+	// applies git's own repository test (HEAD + `objects/` + `refs/`) rather than
+	// just finding a `.git` — a bare `.git` directory, which an interrupted clone
+	// leaves behind, is answered null there precisely so this guard cannot report
+	// "inside a repo" for a directory `--git-dir` exits 128 on.
+	//
+	// The converse does NOT hold, which is why only `true` short-circuits: a bare
+	// repo resolves to null while git says yes. Two more asymmetries are worth
+	// stating because they are easy to assume away. A cwd INSIDE `.git/` is a hit,
+	// not a null — the walk finds the enclosing `.git` from `.git/hooks` just as it
+	// would from a source subdirectory (measured) — so it agrees with `--git-dir`
+	// here and disagrees with `--show-toplevel`, which refuses. And a misconfigured
+	// `core.worktree` is a hit while `--git-dir` fails. Neither is a problem for
+	// THIS guard, whose answer is the same as git's in both cases; they matter to a
+	// caller that reads a layout as "a worktree `--show-toplevel` would accept".
+	//
+	// Worth the three lines because the callers are latency-critical and already
+	// know the answer: the Claude plugin bootstrap resolves the worktree root off
+	// the filesystem and then hands it to `install`, which asked git again.
+	if (resolveGitFsLayout(cwd) !== null) return true;
 	const result = await execGit(["rev-parse", "--git-dir"], cwd);
 	return result.exitCode === 0;
 }

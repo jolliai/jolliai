@@ -208,6 +208,124 @@ describe("installHookScripts", () => {
 			expect(r.status).toBe(0);
 			expect(r.stdout).toBe(vscodeDist);
 		});
+
+		// The resolver is fork-free (builtins only — see the template's header), so
+		// the version ordering it used to delegate to `sort -V` is now its own code.
+		// These execute it rather than reading it, because the whole risk of that
+		// rewrite is a comparison that reads right and ranks wrong.
+		describe("version ordering", () => {
+			/** Re-registers the two sources at the given versions and resolves. */
+			async function resolveAt(
+				script: string,
+				pluginVersion: string,
+				vscodeVersion: string,
+				pluginDist: string,
+				vscodeDist: string,
+			): Promise<string> {
+				await writeFile(join(distPathsDir(), "claude-plugin"), `${pluginVersion}\n${pluginDist}`, "utf-8");
+				await writeFile(join(distPathsDir(), "vscode"), `${vscodeVersion}\n${vscodeDist}`, "utf-8");
+				return runResolver(script, {}, "PostCommitHook.js").stdout;
+			}
+
+			it("compares numerically, not lexically", async () => {
+				const { script, pluginDist, vscodeDist } = await setupTiedSources();
+
+				// The case a string comparison gets wrong: "0.99.10" < "0.99.9" lexically.
+				expect(await resolveAt(script, "0.99.10", "0.99.9", pluginDist, vscodeDist)).toBe(pluginDist);
+				expect(await resolveAt(script, "0.9.0", "0.10.0", pluginDist, vscodeDist)).toBe(vscodeDist);
+				expect(await resolveAt(script, "2.0.0", "10.0.0", pluginDist, vscodeDist)).toBe(vscodeDist);
+			});
+
+			it("ranks a prerelease below its own release, agreeing with compareSemver", async () => {
+				const { script, pluginDist, vscodeDist } = await setupTiedSources();
+
+				// This is a deliberate CHANGE from the `sort -V` the script used to
+				// shell out to, which ranks 1.0.0-rc.1 ABOVE 1.0.0. DistPathResolver's
+				// in-process compareSemver has always ranked it below; the two agree now.
+				expect(await resolveAt(script, "1.0.0", "1.0.0-rc.1", pluginDist, vscodeDist)).toBe(pluginDist);
+				expect(await resolveAt(script, "1.0.0-rc.1", "1.0.0", pluginDist, vscodeDist)).toBe(vscodeDist);
+			});
+
+			it("orders two prereleases of the same release, agreeing with compareSemver", async () => {
+				const { script, pluginDist, vscodeDist } = await setupTiedSources();
+
+				// The half of semver's prerelease rule that survives stripping everything
+				// after the `-`: both sides collapse to 1.0.0, compare EQUAL in both
+				// directions, and the winner falls out of readdir order instead of the
+				// version. Asserted in both directions because that is what distinguishes
+				// a real comparison from an alphabetical accident.
+				expect(await resolveAt(script, "1.0.0-rc.2", "1.0.0-rc.1", pluginDist, vscodeDist)).toBe(pluginDist);
+				expect(await resolveAt(script, "1.0.0-rc.1", "1.0.0-rc.2", pluginDist, vscodeDist)).toBe(vscodeDist);
+			});
+
+			it("compares prerelease identifiers numerically, not lexically", async () => {
+				const { script, pluginDist, vscodeDist } = await setupTiedSources();
+
+				// `rc.10` vs `rc.9` is the prerelease spelling of the `0.99.10` case above.
+				expect(await resolveAt(script, "1.0.0-rc.10", "1.0.0-rc.9", pluginDist, vscodeDist)).toBe(pluginDist);
+				expect(await resolveAt(script, "1.0.0-rc.9", "1.0.0-rc.10", pluginDist, vscodeDist)).toBe(vscodeDist);
+			});
+
+			it("ranks alpha below beta below rc, and a longer identifier list above its own prefix", async () => {
+				const { script, pluginDist, vscodeDist } = await setupTiedSources();
+
+				expect(await resolveAt(script, "1.0.0-beta.1", "1.0.0-alpha.9", pluginDist, vscodeDist)).toBe(
+					pluginDist,
+				);
+				expect(await resolveAt(script, "1.0.0-rc.1", "1.0.0-beta.9", pluginDist, vscodeDist)).toBe(pluginDist);
+				// semver: a larger set of identifiers wins when every shared one is equal.
+				expect(await resolveAt(script, "1.0.0-rc.1", "1.0.0-rc", pluginDist, vscodeDist)).toBe(pluginDist);
+				expect(await resolveAt(script, "1.0.0-rc", "1.0.0-rc.1", pluginDist, vscodeDist)).toBe(vscodeDist);
+			});
+
+			it("ignores build metadata in precedence, as semver requires", async () => {
+				const { script, pluginDist, vscodeDist } = await setupTiedSources();
+
+				// The trap the numeric scrub sets: the third field of `1.0.0+b1` is
+				// `0+b1`, and scrubbing non-digits out of it yields `01` — so the version
+				// used to rank as `1.0.1`, ABOVE its own release and level with a
+				// genuinely higher one.
+				//
+				// The metadata is on VSCODE in every case here, deliberately. Pass 1
+				// enumerates alphabetically and only a STRICTLY greater version displaces
+				// the incumbent, so `claude-plugin` wins every tie; and Pass 2's
+				// preference override compares versions as raw strings, which two
+				// different spellings of one version never satisfy. Putting the metadata
+				// on the incumbent therefore produces the same winner either way and
+				// would assert nothing.
+				expect(await resolveAt(script, "1.0.0", "1.0.0+b1", pluginDist, vscodeDist)).toBe(pluginDist);
+				expect(await resolveAt(script, "1.0.1", "1.0.0+b9", pluginDist, vscodeDist)).toBe(pluginDist);
+				// Build metadata sits AFTER the prerelease tail and must not join it.
+				expect(await resolveAt(script, "1.0.0-rc.1", "1.0.0-rc.1+b1", pluginDist, vscodeDist)).toBe(pluginDist);
+				// …while a real prerelease difference still decides, metadata or not.
+				expect(await resolveAt(script, "1.0.0-rc.1", "1.0.0-rc.2+b1", pluginDist, vscodeDist)).toBe(vscodeDist);
+			});
+
+			it("ranks dev and unknown below every real version", async () => {
+				const { script, pluginDist, vscodeDist } = await setupTiedSources();
+
+				expect(await resolveAt(script, "dev", "0.0.1", pluginDist, vscodeDist)).toBe(vscodeDist);
+				expect(await resolveAt(script, "unknown", "0.0.1", pluginDist, vscodeDist)).toBe(vscodeDist);
+			});
+
+			it("reads a registration whose last line has no trailing newline", async () => {
+				const { script, pluginDist } = await setupTiedSources();
+				await rm(join(distPathsDir(), "vscode"));
+				// How the registrations are actually written — `read` reports failure on
+				// the unterminated line while still populating the variable.
+				await writeFile(join(distPathsDir(), "claude-plugin"), `1.2.3\n${pluginDist}`, "utf-8");
+
+				expect(runResolver(script, {}, "PostCommitHook.js").stdout).toBe(pluginDist);
+			});
+
+			it("tolerates CRLF line endings from a Windows-side sync", async () => {
+				const { script, pluginDist } = await setupTiedSources();
+				await rm(join(distPathsDir(), "vscode"));
+				await writeFile(join(distPathsDir(), "claude-plugin"), `1.2.3\r\n${pluginDist}\r\n`, "utf-8");
+
+				expect(runResolver(script, {}, "PostCommitHook.js").stdout).toBe(pluginDist);
+			});
+		});
 	});
 
 	// Behavioral: node resolution is PATH-first with a fallback to the runtime

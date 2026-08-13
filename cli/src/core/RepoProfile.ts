@@ -24,6 +24,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { getJolliMemoryDir } from "../Logger.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import { writeFileAtomic } from "./AtomicJsonFile.js";
+import { resolveGitFsLayout } from "./GitFsLayout.js";
 import { execGit, listWorktrees } from "./GitOps.js";
 import { withStrictProfileLock } from "./Locks.js";
 
@@ -106,18 +107,39 @@ interface ProfilePaths {
 }
 
 /**
+ * The absolute git-common-dir for `cwd`, or null when `cwd` is not in a repo.
+ *
+ * Tries the filesystem first ({@link resolveGitFsLayout}) and only spawns `git`
+ * when that declines. The read is on the SessionStart hook's critical path, where
+ * a `rev-parse` costs ~10 ms of pure process creation and this was one of three
+ * identical calls in a single run — see the GitFsLayout module docstring.
+ *
+ * `realpath: false` is load-bearing, not a default taken by accident: this path
+ * anchors `profile.json`, which holds the user's `userDisabled` opt-out. The
+ * subprocess form below resolves git's output against `cwd` WITHOUT resolving
+ * symlinks, so normalizing here would relocate the profile of any repo reached
+ * through a symlinked path — reading as "never disabled" on the next hook run.
+ */
+async function resolveCommonDir(cwd: string): Promise<string | null> {
+	const fromFs = resolveGitFsLayout(cwd)?.commonDir;
+	if (fromFs) return fromFs;
+	const res = await execGit(["rev-parse", "--git-common-dir"], cwd);
+	const raw = res.exitCode === 0 ? res.stdout.trim() : "";
+	if (!raw) return null;
+	return isAbsolute(raw) ? raw : join(cwd, raw);
+}
+
+/**
  * Resolves the profile path, anchored to the MAIN worktree root so the file is
  * shared across all worktrees of the repo. Falls back to the current-dir
  * `.jolli/jollimemory/` only when `cwd` is not a git repo — the front door never
  * offers back-fill there, so the fallback is inert.
  */
 async function resolvePaths(cwd: string): Promise<ProfilePaths> {
-	const res = await execGit(["rev-parse", "--git-common-dir"], cwd);
-	const raw = res.exitCode === 0 ? res.stdout.trim() : "";
-	if (!raw) {
+	const commonDir = await resolveCommonDir(cwd);
+	if (commonDir === null) {
 		return { profilePath: join(getJolliMemoryDir(cwd), PROFILE_FILE), legacyMarkerPath: null };
 	}
-	const commonDir = isAbsolute(raw) ? raw : join(cwd, raw);
 	// The main worktree root is the parent of the common `.git` dir. Linked
 	// worktrees still report the main repo's common dir, so they resolve here too
 	// — this shared common dir is exactly why we use it rather than
@@ -383,6 +405,14 @@ export function resetRepoProfileRootCache(): void {
 function resolveMainRootSync(cwd: string): string {
 	const cached = _mainRootCache.get(cwd);
 	if (cached !== undefined) return cached;
+	// Filesystem first, for the reason spelled out on the async `resolveCommonDir`
+	// above — including why the answer must NOT be realpath-normalized.
+	const fromFs = resolveGitFsLayout(cwd)?.commonDir;
+	if (fromFs) {
+		const root = dirname(fromFs);
+		_mainRootCache.set(cwd, root);
+		return root;
+	}
 	let commonDir = "";
 	try {
 		const raw = execFileSyncHidden("git", ["rev-parse", "--git-common-dir"], {

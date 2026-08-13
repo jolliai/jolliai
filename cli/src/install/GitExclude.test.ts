@@ -17,6 +17,7 @@ import {
 	addGitExcludePaths,
 	normalizeGitPathOutput,
 	removeGitExcludePaths,
+	resetGitExcludePathCache,
 	resolveGitExcludePath,
 	updateGitExclude,
 } from "./GitExclude.js";
@@ -86,6 +87,36 @@ describe("resolveGitExcludePath", () => {
 	it("returns null when given a path that doesn't exist", async () => {
 		const resolved = await resolveGitExcludePath(join(tempDir, "nonexistent-subdir"));
 		expect(resolved).toBeNull();
+	});
+
+	// The memo exists because the Claude plugin bootstrap resolved this twice per
+	// session start — once for the /jolli menu's exclusions, once inside install.
+	describe("per-process memo", () => {
+		afterEach(() => {
+			resetGitExcludePathCache();
+		});
+
+		it("does not re-spawn git for a repo it has already resolved", async () => {
+			await gitInit(tempDir);
+			const first = await resolveGitExcludePath(tempDir);
+
+			// Rename the gitdir out from under it: a second `rev-parse` could not
+			// succeed, so an unchanged answer proves no subprocess ran.
+			rmSync(join(tempDir, ".git"), { recursive: true, force: true });
+
+			expect(await resolveGitExcludePath(tempDir)).toBe(first);
+		});
+
+		it("does not memoize the not-a-repo answer", async () => {
+			expect(await resolveGitExcludePath(tempDir)).toBeNull();
+
+			// A directory can become a repo moments later — `jolli enable` against a
+			// path the user is about to `git init` is the real case. Caching the null
+			// would make it permanently un-excludable for the life of the process.
+			await gitInit(tempDir);
+
+			expect(await resolveGitExcludePath(tempDir)).not.toBeNull();
+		});
 	});
 });
 

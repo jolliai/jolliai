@@ -74,6 +74,15 @@ const RESOLVE_DIST_PATH_CONTENT = `#!/bin/bash
 # Stable public API: run-hook, run-cli, legacy hooks still on disk, and
 # third-party tools all rely on this script's "output a path, exit 0/1"
 # contract.
+#
+# EVERY command below is a bash builtin — no sed, no sort, no grep. This script
+# runs on the front of every hook dispatch, including the SessionStart hook a user
+# waits on before Claude Code gives them a prompt. The previous form spent two
+# 'sed' processes per registered source plus a four-process 'printf | sort -V |
+# tail | grep' pipeline per version comparison: ~40 processes and ~60 ms of pure
+# fork/exec to read a dozen two-line files. It is now ~5 ms. Keep it fork-free —
+# a single innocuous-looking pipeline here is paid by every git hook and every
+# session start.
 
 DIR="$HOME/.jolli/jollimemory"
 REQUIRED="$1"
@@ -89,17 +98,107 @@ has_required() {
   [ -f "$1/$REQUIRED" ]
 }
 
-# Pass 1 — highest core version wins. Selection uses 'sort -V', which agrees with
-# the in-process compareSemver (cli/src/install/DistPathResolver.ts) on every
-# non-prerelease comparison. The comparison is STRICT greater-than: an equal
-# version does NOT overwrite, so enumeration (alphabetical) order never decides a
-# tie. (Known sort -V divergence: it ranks 1.0.0-rc.1 ABOVE 1.0.0; compareSemver
-# follows semver and ranks it below. Too rare to hand-roll in POSIX sh.)
+# read_entry <file> — sets ENTRY_VER / ENTRY_PATH from a two-line registration.
+# 'read' is a builtin, so this replaces two 'sed' processes per source. A final
+# line with no trailing newline (which is how these files are actually written)
+# still populates the variable even though 'read' reports failure, hence the
+# unconditional 'return 0'. The CR strip mirrors run-hook's node-path reader: a
+# file round-tripped through a Windows-side sync would otherwise fail the -d test
+# with no diagnostic anywhere.
+read_entry() {
+  ENTRY_VER=""
+  ENTRY_PATH=""
+  [ -f "$1" ] || return 1
+  { IFS= read -r ENTRY_VER; IFS= read -r ENTRY_PATH; } < "$1"
+  ENTRY_VER="\${ENTRY_VER%$'\\r'}"
+  ENTRY_PATH="\${ENTRY_PATH%$'\\r'}"
+  return 0
+}
+
+# ver_gt <a> <b> — true when version <a> sorts strictly ABOVE <b>.
+#
+# Replaces 'sort -V' with dotted-numeric comparison over the first three fields,
+# which is the shape every version here has (dev/unknown are normalised to 0.0.0
+# by the caller). It also CLOSES a documented divergence rather than adding one:
+# 'sort -V' ranks 1.0.0-rc.1 above 1.0.0, while semver — and the in-process
+# compareSemver in cli/src/install/DistPathResolver.ts this script must agree
+# with — rank a prerelease below its own release.
+#
+# The prerelease tail is compared too, not stripped. Dropping it would make
+# 1.0.0-rc.1 and 1.0.0-rc.2 compare EQUAL in both directions, and since an equal
+# version never displaces the incumbent, the winner would fall out of readdir
+# order — hooks silently routed to the older of two prereleases. Rules are
+# semver's: identifier by identifier, numerically when both are numeric, and a
+# longer identifier list wins when every shared one is equal.
+#
+# Build metadata is stripped FIRST, which is both what semver requires (it takes
+# no part in precedence) and the only way the numeric scrub below stays honest:
+# the third field of 1.0.0+b1 is '0+b1', and scrubbing non-digits out of that
+# yields '01' — so without this the version compared EQUAL to 1.0.1 and ABOVE a
+# plain 1.0.0, where compareSemver says below and equal. That is exactly the
+# equal-compare shape described above, with readdir order deciding the winner.
+ver_gt() {
+  # LC_ALL is local so the string comparison below is byte order everywhere. It is
+  # an assignment, not a subprocess: bash re-inits its collation on it and restores
+  # the caller's on return.
+  local av="\${1%%+*}" bv="\${2%%+*}" a b apre="" bpre="" i x y ap bp ai bi LC_ALL=C
+  a="\${av%%-*}"
+  b="\${bv%%-*}"
+  [ "$a" != "$av" ] && apre=1
+  [ "$b" != "$bv" ] && bpre=1
+  for i in 1 2 3; do
+    x="\${a%%.*}"
+    y="\${b%%.*}"
+    # Backstop for anything else non-numeric that reaches a field (a hand-edited
+    # registration, a tag we do not know); build metadata is already gone by here.
+    x="\${x//[!0-9]/}"
+    y="\${y//[!0-9]/}"
+    [ -z "$x" ] && x=0
+    [ -z "$y" ] && y=0
+    [ "$x" -gt "$y" ] && return 0
+    [ "$x" -lt "$y" ] && return 1
+    case "$a" in *.*) a="\${a#*.}" ;; *) a=0 ;; esac
+    case "$b" in *.*) b="\${b#*.}" ;; *) b=0 ;; esac
+  done
+  # Numerically equal. A release outranks its own prerelease; two releases are
+  # equal; two prereleases fall through to their identifiers.
+  [ -z "$apre" ] && [ -n "$bpre" ] && return 0
+  [ -n "$apre" ] && [ -z "$bpre" ] && return 1
+  [ -z "$apre" ] && return 1
+  ap="\${av#*-}"
+  bp="\${bv#*-}"
+  while [ -n "$ap" ] || [ -n "$bp" ]; do
+    ai="\${ap%%.*}"
+    bi="\${bp%%.*}"
+    # Ran out of identifiers: the shorter list is the lower version (rc < rc.1).
+    [ -z "$ai" ] && return 1
+    [ -z "$bi" ] && return 0
+    case "$ai$bi" in
+      # Either side non-numeric: byte order, which puts digits below letters and
+      # so agrees with semver's "numeric identifiers rank below alphanumeric".
+      *[!0-9]*)
+        [[ "$ai" > "$bi" ]] && return 0
+        [[ "$ai" < "$bi" ]] && return 1
+        ;;
+      *)
+        [ "$ai" -gt "$bi" ] && return 0
+        [ "$ai" -lt "$bi" ] && return 1
+        ;;
+    esac
+    case "$ap" in *.*) ap="\${ap#*.}" ;; *) ap="" ;; esac
+    case "$bp" in *.*) bp="\${bp#*.}" ;; *) bp="" ;; esac
+  done
+  return 1
+}
+
+# Pass 1 — highest core version wins. The comparison is STRICT greater-than: an
+# equal version does NOT overwrite, so enumeration (alphabetical) order never
+# decides a tie.
 if [ -d "$DIR/dist-paths" ]; then
   for f in "$DIR/dist-paths"/*; do
-    [ -f "$f" ] || continue
-    VER=$(sed -n '1p' "$f")
-    CANDIDATE=$(sed -n '2p' "$f")
+    read_entry "$f" || continue
+    VER="$ENTRY_VER"
+    CANDIDATE="$ENTRY_PATH"
     [ -z "$VER" ] && continue
     [ -d "$CANDIDATE" ] || continue
     has_required "$CANDIDATE" || continue
@@ -110,8 +209,7 @@ if [ -d "$DIR/dist-paths" ]; then
     if [ -z "$BEST_PATH" ]; then
       BEST_PATH="$CANDIDATE"
       BEST_VER="$VER_CMP"
-    elif [ "$VER_CMP" != "$BEST_VER" ] && \\
-         printf '%s\\n%s' "$BEST_VER" "$VER_CMP" | sort -V | tail -1 | grep -qxF "$VER_CMP"; then
+    elif ver_gt "$VER_CMP" "$BEST_VER"; then
       BEST_PATH="$CANDIDATE"
       BEST_VER="$VER_CMP"
     fi
@@ -126,10 +224,9 @@ fi
 # a missing / incomplete / older prefer falls through to Pass 2. This is the soft
 # replacement for the former hard pin — every source still competes on version.
 if [ -n "$BEST_PATH" ] && [ -n "$PREFER" ]; then
-  pf="$DIR/dist-paths/$PREFER"
-  if [ -f "$pf" ]; then
-    PVER=$(sed -n '1p' "$pf")
-    PPATH=$(sed -n '2p' "$pf")
+  if read_entry "$DIR/dist-paths/$PREFER"; then
+    PVER="$ENTRY_VER"
+    PPATH="$ENTRY_PATH"
     case "$PVER" in dev|unknown) PVER="0.0.0" ;; esac
     if [ -d "$PPATH" ] && has_required "$PPATH" && [ "$PVER" = "$BEST_VER" ]; then
       echo "$PPATH"
@@ -145,10 +242,9 @@ fi
 # complete pass-1 winner.
 if [ -n "$BEST_PATH" ]; then
   for pref in ${SOURCE_PREFERENCE_ORDER.join(" ")}; do
-    pf="$DIR/dist-paths/$pref"
-    [ -f "$pf" ] || continue
-    PVER=$(sed -n '1p' "$pf")
-    PPATH=$(sed -n '2p' "$pf")
+    read_entry "$DIR/dist-paths/$pref" || continue
+    PVER="$ENTRY_VER"
+    PPATH="$ENTRY_PATH"
     [ -d "$PPATH" ] || continue
     has_required "$PPATH" || continue
     case "$PVER" in dev|unknown) PVER="0.0.0" ;; esac

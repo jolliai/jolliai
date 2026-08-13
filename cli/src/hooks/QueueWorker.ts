@@ -208,6 +208,7 @@ import {
 	pruneStaleCaptureProgress,
 	releaseCaptureLock,
 } from "./CaptureProgress.js";
+import { warmBriefingCache } from "./SessionStartHook.js";
 
 const log = createLogger("QueueWorker");
 
@@ -960,6 +961,16 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		// survive un-deleted, and the next worker redoes it. Cutting over after the
 		// ingest costs one drain's delay on a 6 h-throttled, opportunistic step and
 		// keeps every write in this run on the provider that matches the repo's state.
+		// A landed summary is the ONLY thing that invalidates the session-start
+		// briefing cache (its key is HEAD), and this is the one process that knows it
+		// just happened. Recomputing here moves the miss out of the next session
+		// start — where a human is waiting on the hook before Claude Code gives them
+		// a prompt — into a detached worker nobody is watching. Never throws.
+		//
+		// Before `maybeAutoCutover`, deliberately: this reads through the `storage`
+		// resolved at the top of the run, and the cutover swaps the system of record
+		// underneath it.
+		if (summariesLandedThisRun) await warmBriefingCache(cwd);
 		if (summariesLandedThisRun) await maybeAutoCutover(cwd, { throttle: true });
 	} finally {
 		// Backstops (idempotent): cover the early-return and mid-run-throw paths

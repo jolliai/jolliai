@@ -14,6 +14,7 @@ vi.mock("node:fs", () => ({
 	existsSync: vi.fn().mockReturnValue(false),
 	readFileSync: vi.fn().mockReturnValue("{}"),
 	writeFileSync: vi.fn(),
+	renameSync: vi.fn(),
 	mkdirSync: vi.fn(),
 	rmSync: vi.fn(),
 }));
@@ -34,6 +35,19 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 
 vi.mock("../core/SummaryStore.js", () => ({
 	getIndex: vi.fn(),
+}));
+
+// The zero-spawn fast path. Defaults to "no layout" so every pre-existing case
+// keeps exercising the `git` fallback it was written against (and keeps asserting
+// on the mocked `execFileSync`); the cases that care opt in by returning a layout.
+const mockResolveGitFsLayout = vi.hoisted(() => vi.fn<() => { readonly marker: string } | null>(() => null));
+const mockReadBranchFromFs = vi.hoisted(() => vi.fn<() => string | null>(() => null));
+const mockReadHeadHashFromFs = vi.hoisted(() => vi.fn<() => string | null>(() => null));
+
+vi.mock("../core/GitFsLayout.js", () => ({
+	resolveGitFsLayout: mockResolveGitFsLayout,
+	readBranchFromFs: mockReadBranchFromFs,
+	readHeadHashFromFs: mockReadHeadHashFromFs,
 }));
 
 vi.mock("../core/GitOps.js", () => ({
@@ -78,7 +92,7 @@ vi.mock("../Logger.js", () => ({
 }));
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { resolveStateRoot } from "../core/GitOps.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig, updateConfigTransactional } from "../core/SessionTracker.js";
@@ -94,6 +108,8 @@ const mockCollectAllTopics = vi.mocked(collectAllTopics);
 const mockExistsSync = vi.mocked(existsSync);
 const mockReadFileSync = vi.mocked(readFileSync);
 const mockRmSync = vi.mocked(rmSync);
+const mockWriteFileSync = vi.mocked(writeFileSync);
+const mockRenameSync = vi.mocked(renameSync);
 const mockLoadConfig = vi.mocked(loadConfig);
 const mockUpdateConfig = vi.mocked(updateConfigTransactional);
 
@@ -119,6 +135,8 @@ function makeSummary(overrides: Partial<CommitSummary> = {}): CommitSummary {
 // Import after mocks
 const {
 	main,
+	armSessionStartDeadline,
+	warmBriefingCache,
 	buildSessionStartContext,
 	computeLoginReminder,
 	formatRecallSuggestion,
@@ -126,6 +144,166 @@ const {
 	ensurePluginDefaultProvider,
 	getAuthFailureReminder,
 } = await import("./SessionStartHook.js");
+
+// ─── Zero-spawn fast path ────────────────────────────────────────────────────
+
+describe("filesystem fast path", () => {
+	const LAYOUT = { marker: "layout" };
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockResolveGitFsLayout.mockReturnValue(LAYOUT);
+		mockReadBranchFromFs.mockReturnValue("feature/test-branch");
+		mockReadHeadHashFromFs.mockReturnValue("headhash");
+		mockReadSummaryFile.mockResolvedValue(null);
+		mockExistsSync.mockReturnValue(false);
+		mockGetIndex.mockResolvedValue(null);
+	});
+
+	afterEach(() => {
+		mockResolveGitFsLayout.mockReturnValue(null);
+		mockReadBranchFromFs.mockReturnValue(null);
+		mockReadHeadHashFromFs.mockReturnValue(null);
+	});
+
+	it("reads the branch without spawning git", async () => {
+		await buildSessionStartContext("/repo", "shared", { includePluginReminders: false });
+
+		expect(mockReadBranchFromFs).toHaveBeenCalled();
+		expect(mockExecFileSync).not.toHaveBeenCalled();
+	});
+
+	it("validates the briefing cache without spawning git", async () => {
+		mockExistsSync.mockReturnValue(true);
+		mockReadFileSync.mockReturnValue(
+			JSON.stringify({
+				branch: "feature/test-branch",
+				lastCommitHash: "headhash",
+				clientKind: "shared",
+				briefingText: "cached briefing",
+				generatedAt: "2026-08-13T00:00:00.000Z",
+			}) as never,
+		);
+
+		const context = await buildSessionStartContext("/repo", "shared", { includePluginReminders: false });
+
+		expect(context).toBe("cached briefing");
+		expect(mockExecFileSync).not.toHaveBeenCalled();
+		// The whole point of the cache hit: the index is never even opened.
+		expect(mockGetIndex).not.toHaveBeenCalled();
+	});
+
+	it("falls back to git when the worktree layout cannot be read", async () => {
+		mockResolveGitFsLayout.mockReturnValue(null);
+		mockExecFileSync.mockReturnValue("feature/test-branch\n" as never);
+
+		await buildSessionStartContext("/repo", "shared", { includePluginReminders: false });
+
+		expect(mockExecFileSync).toHaveBeenCalledWith("git", ["branch", "--show-current"], expect.anything());
+	});
+
+	it("treats a detached HEAD as no branch instead of re-asking git", async () => {
+		mockReadBranchFromFs.mockReturnValue(null);
+
+		const context = await buildSessionStartContext("/repo", "shared", { includePluginReminders: false });
+
+		expect(context).toBeNull();
+		expect(mockExecFileSync).not.toHaveBeenCalled();
+	});
+});
+
+describe("warmBriefingCache", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockResolveGitFsLayout.mockReturnValue({ marker: "layout" });
+		mockReadBranchFromFs.mockReturnValue("feature/test-branch");
+		mockReadHeadHashFromFs.mockReturnValue("headhash");
+		mockExistsSync.mockReturnValue(false);
+		mockReadSummaryFile.mockResolvedValue(null);
+	});
+
+	afterEach(() => {
+		mockResolveGitFsLayout.mockReturnValue(null);
+		mockReadBranchFromFs.mockReturnValue(null);
+		mockReadHeadHashFromFs.mockReturnValue(null);
+	});
+
+	it("writes the cache the next session start will read", async () => {
+		mockGetIndex.mockResolvedValue(
+			makeIndex([
+				{
+					commitHash: "aaa",
+					commitMessage: "older",
+					branch: "feature/test-branch",
+					date: "2026-08-01T00:00:00Z",
+				},
+				{
+					commitHash: "bbb",
+					commitMessage: "newer",
+					branch: "feature/test-branch",
+					date: "2026-08-10T00:00:00Z",
+				},
+			] as unknown as SummaryIndex["entries"]),
+		);
+
+		await expect(warmBriefingCache("/repo")).resolves.toBe(true);
+
+		// Atomic: written to a sibling temp file, then renamed into place — two
+		// processes write this file now (the hook and the worker).
+		const [tempPath, contents] = mockWriteFileSync.mock.calls[0] as [string, string];
+		expect(tempPath).toMatch(/briefing-cache\.json\.\d+\.tmp$/);
+		expect(mockRenameSync).toHaveBeenCalledWith(tempPath, expect.stringMatching(/briefing-cache\.json$/));
+		// Keyed for the settings-installed hook, which is the one that runs every session.
+		expect(JSON.parse(contents)).toMatchObject({ branch: "feature/test-branch", clientKind: "shared" });
+	});
+
+	it("reports false without writing when the branch has nothing to brief on", async () => {
+		mockGetIndex.mockResolvedValue(null);
+
+		await expect(warmBriefingCache("/repo")).resolves.toBe(false);
+		expect(mockWriteFileSync).not.toHaveBeenCalled();
+	});
+
+	it("swallows a failure rather than disturbing the commit that triggered it", async () => {
+		mockGetIndex.mockRejectedValue(new Error("index unreadable"));
+
+		await expect(warmBriefingCache("/repo")).resolves.toBe(false);
+	});
+});
+
+describe("armSessionStartDeadline", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("schedules a process exit that does not itself keep the process alive", () => {
+		vi.useFakeTimers();
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+		const timer = armSessionStartDeadline(10);
+
+		// unref'd: a clean run still exits the moment its own work drains, so the
+		// deadline can only ever cut a run that is still busy.
+		expect(timer.hasRef()).toBe(false);
+		expect(exit).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(10);
+		expect(exit).toHaveBeenCalledWith(0);
+		exit.mockRestore();
+	});
+
+	it("defaults to the briefing deadline plus a flush grace", () => {
+		vi.useFakeTimers();
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+		armSessionStartDeadline();
+
+		vi.advanceTimersByTime(749);
+		expect(exit).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1);
+		expect(exit).toHaveBeenCalledWith(0);
+		exit.mockRestore();
+	});
+});
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 

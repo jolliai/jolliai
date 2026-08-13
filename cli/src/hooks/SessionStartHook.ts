@@ -23,11 +23,12 @@
  *   - .jolli/jollimemory/plans.json → associated plan names
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { resolveClientKind } from "../core/ClientHeader.js";
+import { type GitFsLayout, readBranchFromFs, readHeadHashFromFs, resolveGitFsLayout } from "../core/GitFsLayout.js";
 import { resolveStateRoot } from "../core/GitOps.js";
 import { hasLlmCredentials } from "../core/LlmCredentials.js";
 import { pluginDefaultLocalAgentTool } from "../core/localagent/PluginDefaults.js";
@@ -50,6 +51,39 @@ const log = createLogger("SessionStartHook");
 const SKIP_BRANCHES = new Set(["main", "master", "develop", "development", "staging", "production"]);
 
 const HARD_TIMEOUT_MS = 500;
+
+/**
+ * Grace between the briefing deadline and tearing the process down.
+ *
+ * Covers the writes that legitimately trail the last `await`: stdout to a pipe is
+ * asynchronous on POSIX, and the logger's `appendFile` is too. Without it, a
+ * forced exit would truncate the briefing the hook exists to emit, or drop the
+ * one debug line explaining why it emitted nothing.
+ */
+const EXIT_GRACE_MS = 250;
+
+/**
+ * Makes {@link HARD_TIMEOUT_MS} a deadline on the PROCESS, which is what Claude
+ * Code actually waits on.
+ *
+ * The `Promise.race` in {@link buildSessionStartContext} only decides when the
+ * TEXT is settled. It cancels nothing: the losing branch keeps its `git` reads and
+ * storage handles alive, so the event loop stays busy and the session start blocks
+ * for as long as that work takes — with no ceiling anywhere. A repository whose
+ * summary index is slow to read, or a `git` call stuck behind an index lock, is
+ * exactly the case where the hook is most in the way and least able to say so.
+ *
+ * The timer is `unref`'d so it is not itself a reason to stay alive: a clean run
+ * still exits the moment its work drains (the normal path, unchanged), and only a
+ * run that is still busy at the deadline gets cut off. Exit code 0 always — a
+ * non-zero SessionStart hook is a user-visible error, and "we ran out of time" is
+ * not one.
+ */
+export function armSessionStartDeadline(totalMs: number = HARD_TIMEOUT_MS + EXIT_GRACE_MS): NodeJS.Timeout {
+	const timer = setTimeout(() => process.exit(0), totalMs);
+	timer.unref();
+	return timer;
+}
 
 interface BriefingCache {
 	readonly branch: string;
@@ -379,6 +413,40 @@ export async function buildSessionStartContext(
 }
 
 /**
+ * Pre-computes and stores the briefing so the NEXT session start is a cache hit.
+ *
+ * Called by the queue worker once a drain has landed summaries — the only moment
+ * the cache can go stale, since its key is HEAD. Without it, the first session
+ * after every commit pays the full miss (read the index, read the newest
+ * summary, read plans) inside the window where a human is waiting for a prompt;
+ * with it, that work moves into a process that is already detached and that the
+ * user is not watching, and the hook is left with two file reads.
+ *
+ * `"shared"` is the client kind the settings-installed hook passes, so this warms
+ * the entry that hook will look for. A plugin bootstrap asks for its own kind and
+ * simply misses — correct, since the cached text embeds a host-specific recall
+ * hint (see {@link checkBriefingCache}), and a miss costs what today's every-run
+ * behaviour already costs.
+ *
+ * Never throws and reports only through the log: this is an optimisation running
+ * behind a completed commit, and there is nothing a failure here should disturb.
+ */
+export async function warmBriefingCache(projectDir: string, clientKind = "shared"): Promise<boolean> {
+	try {
+		const briefing = await generateBriefing(projectDir, clientKind);
+		if (briefing === null) {
+			log.info("Briefing cache not warmed — nothing to brief on this branch");
+			return false;
+		}
+		log.info("Briefing cache warmed for the next session start");
+		return true;
+	} catch (error: unknown) {
+		log.info("Briefing cache warm-up failed (non-fatal): %s", (error as Error).message);
+		return false;
+	}
+}
+
+/**
  * Generates a briefing for the current branch, or returns null to skip.
  *
  * `clientKind` is the caller's source tag, threaded through rather than read from
@@ -394,14 +462,19 @@ export async function buildSessionStartContext(
  * commit alone hands the second host the first host's syntax.
  */
 async function generateBriefing(projectDir: string, clientKind: string): Promise<string | null> {
+	// Resolved once and threaded through: the two git facts below and the cache
+	// validation all come off the same worktree, and re-resolving would repeat the
+	// (cheap, but not free) directory walk three times per run.
+	const layout = gitFsLayoutFor(projectDir);
+
 	// Step 1: Get current branch
-	const branch = getCurrentBranch(projectDir);
+	const branch = getCurrentBranch(projectDir, layout);
 	if (!branch || SKIP_BRANCHES.has(branch)) {
 		return null;
 	}
 
 	// Step 2: Check briefing cache
-	const cacheResult = checkBriefingCache(projectDir, branch, clientKind);
+	const cacheResult = checkBriefingCache(projectDir, branch, clientKind, layout);
 	if (cacheResult) {
 		return cacheResult;
 	}
@@ -461,7 +534,7 @@ async function generateBriefing(projectDir: string, clientKind: string): Promise
 
 	// Step 8: Cache the result (use HEAD hash as cache key, not index commit hash,
 	// because HEAD may be ahead of the last summarized commit during active development)
-	const headHash = getCurrentHeadHash(projectDir);
+	const headHash = getCurrentHeadHash(projectDir, layout);
 	saveBriefingCache(projectDir, branch, headHash ?? lastEntry.commitHash, briefing, clientKind);
 
 	return briefing;
@@ -695,7 +768,12 @@ function getBriefingCachePath(projectDir: string): string {
  * matches no live tag and so reads as a miss — one regenerated briefing per repo,
  * no migration.
  */
-function checkBriefingCache(projectDir: string, branch: string, clientKind: string): string | null {
+function checkBriefingCache(
+	projectDir: string,
+	branch: string,
+	clientKind: string,
+	layout: GitFsLayout | null = gitFsLayoutFor(projectDir),
+): string | null {
 	const cachePath = getBriefingCachePath(projectDir);
 	if (!existsSync(cachePath)) return null;
 
@@ -705,7 +783,7 @@ function checkBriefingCache(projectDir: string, branch: string, clientKind: stri
 		if (cache.clientKind !== clientKind) return null;
 
 		// Validate that HEAD hasn't moved since we cached the briefing
-		const currentHead = getCurrentHeadHash(projectDir);
+		const currentHead = getCurrentHeadHash(projectDir, layout);
 		if (!currentHead || cache.lastCommitHash !== currentHead) return null;
 
 		return cache.briefingText;
@@ -719,6 +797,13 @@ function checkBriefingCache(projectDir: string, branch: string, clientKind: stri
  * take turns evicting each other rather than each keeping their own entry — the
  * `clientKind` check in {@link checkBriefingCache} makes that a miss-and-regenerate
  * (correct, slower) instead of a hit on the wrong syntax.
+ *
+ * Written through a temp file and `rename` because there are now TWO writers: the
+ * hook itself and the queue worker's {@link warmBriefingCache}, which runs
+ * detached and can therefore land mid-read of a session that started at the same
+ * moment. A torn read degrades safely (the parse throws and the caller treats it
+ * as a miss), but "safely" here means silently doing the slow thing on exactly the
+ * commit that just warmed the cache — the case this is all for.
  */
 function saveBriefingCache(
 	projectDir: string,
@@ -741,7 +826,10 @@ function saveBriefingCache(
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });
 		}
-		writeFileSync(cachePath, JSON.stringify(cache, null, "\t"), "utf-8");
+		// Same directory, so the rename is atomic on every platform we ship to.
+		const tempPath = `${cachePath}.${process.pid}.tmp`;
+		writeFileSync(tempPath, JSON.stringify(cache, null, "\t"), "utf-8");
+		renameSync(tempPath, cachePath);
 	} catch {
 		// Non-critical — cache write failure is fine
 	}
@@ -749,7 +837,27 @@ function saveBriefingCache(
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
-function getCurrentHeadHash(projectDir: string): string | null {
+/**
+ * Both git facts this hook needs come off the filesystem first.
+ *
+ * This is the hook the user waits on before Claude Code gives them a prompt, and
+ * ~90% of its in-process time used to be `git` subprocesses — each ~10-15 ms of
+ * process creation, on a path whose entire useful work is reading two files and a
+ * cached JSON blob. `resolveGitFsLayout` answers both questions without spawning;
+ * the `git` calls below stay as the fallback for every layout it declines
+ * (see the GitFsLayout module docstring for what those are).
+ *
+ * `realpath: false` is correct here even though `projectDir` came from
+ * `resolveStateRoot` (which normalizes): the layout is used only to READ HEAD and
+ * the branch ref, never to derive a path anyone stores.
+ */
+function gitFsLayoutFor(projectDir: string): GitFsLayout | null {
+	return resolveGitFsLayout(projectDir);
+}
+
+function getCurrentHeadHash(projectDir: string, layout = gitFsLayoutFor(projectDir)): string | null {
+	const fromFs = layout ? readHeadHashFromFs(layout) : null;
+	if (fromFs) return fromFs;
 	try {
 		return (
 			execFileSyncHidden("git", ["rev-parse", "HEAD"], {
@@ -762,7 +870,14 @@ function getCurrentHeadHash(projectDir: string): string | null {
 	}
 }
 
-function getCurrentBranch(projectDir: string): string | null {
+function getCurrentBranch(projectDir: string, layout = gitFsLayoutFor(projectDir)): string | null {
+	const fromFs = layout ? readBranchFromFs(layout) : null;
+	if (fromFs) return fromFs;
+	// A detached HEAD reads as null from the filesystem AND prints empty from
+	// `branch --show-current`, so the fallback below agrees rather than papering
+	// over it — but it only runs when the layout itself was unavailable, since a
+	// resolved layout has already given the authoritative answer.
+	if (layout) return null;
 	try {
 		return (
 			execFileSyncHidden("git", ["branch", "--show-current"], {
@@ -832,6 +947,7 @@ function isMainScript(): boolean {
 }
 
 if (isMainScript()) {
+	armSessionStartDeadline();
 	main();
 }
 /* v8 ignore stop */

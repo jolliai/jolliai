@@ -164,10 +164,12 @@ describe("DistPathResolver", () => {
 		// prerelease sorts below its own release, but a newer prerelease still
 		// beats an older stable.
 		//
-		// NOTE on the shell: `resolve-dist-path` uses `sort -V`, which ranks
-		// `1.0.0-rc.1` ABOVE `1.0.0` — the opposite of semver. compareSemver is
-		// the in-process authority; the divergence only affects the rare case of a
-		// stable and its own prerelease both being registered. See the JSDoc.
+		// NOTE on the shell: `resolve-dist-path` no longer shells out to `sort -V`
+		// (which ranked `1.0.0-rc.1` ABOVE `1.0.0`, the opposite of semver) and now
+		// compares prereleases itself — release above its own prerelease, then
+		// identifier by identifier. The cases below are mirrored in
+		// `DispatchScripts.test.ts` → "version ordering" against the real script, so
+		// the two implementations are pinned to the same answers.
 		describe("prerelease ordering (semver semantics)", () => {
 			it("ranks a prerelease below its own release", () => {
 				expect(compareSemver("1.0.0-rc.1", "1.0.0")).toBeLessThan(0);

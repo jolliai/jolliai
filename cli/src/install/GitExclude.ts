@@ -70,7 +70,39 @@ export function normalizeGitPathOutput(relOrAbs: string, projectDir: string): st
 	return absolute ? relOrAbs : join(projectDir, relOrAbs);
 }
 
+/**
+ * Per-process memo of resolved exclude paths, keyed by `projectDir`.
+ *
+ * A repository's `info/exclude` location does not move while the repository
+ * exists, and this used to be re-resolved by every caller: the Claude plugin
+ * bootstrap alone spawned it twice per session start (once for the `/jolli`
+ * menu's exclusions, once inside `install`), on a hook a user waits on before
+ * getting a prompt.
+ *
+ * Only successes are memoized. A null means "no git here yet", which a test — or
+ * a `jolli enable` run against a directory the user is about to `git init` — can
+ * legitimately turn into a real answer moments later; caching that would be the
+ * one way this memo could ever be wrong.
+ *
+ * Sizing and staleness are bounded by the callers, not by an eviction policy the
+ * map does not have. The hook processes this exists for live milliseconds. The one
+ * long-lived process, `ide-bridge-serve`, holds a handful of project directories
+ * for a session and can outlast a `git worktree remove`, leaving an entry for a
+ * path nothing asks about again — a few strings, and never a WRONG answer, since
+ * a removed worktree has no caller left to serve. If either bound stops holding
+ * (an entry per repository on a shared daemon, say), this wants a real cache
+ * rather than a wider claim in this docstring.
+ */
+const excludePathCache = new Map<string, string>();
+
+/** Test-only: drops memoized exclude paths so cases don't leak into each other. */
+export function resetGitExcludePathCache(): void {
+	excludePathCache.clear();
+}
+
 export async function resolveGitExcludePath(projectDir: string): Promise<string | null> {
+	const cached = excludePathCache.get(projectDir);
+	if (cached !== undefined) return cached;
 	try {
 		const { stdout } = await execFileAsyncHidden("git", ["rev-parse", "--git-path", "info/exclude"], {
 			cwd: projectDir,
@@ -79,7 +111,9 @@ export async function resolveGitExcludePath(projectDir: string): Promise<string 
 		/* v8 ignore start -- defensive: git rev-parse always emits a non-empty path on success */
 		if (relOrAbs.length === 0) return null;
 		/* v8 ignore stop */
-		return normalizeGitPathOutput(relOrAbs, projectDir);
+		const resolved = normalizeGitPathOutput(relOrAbs, projectDir);
+		excludePathCache.set(projectDir, resolved);
+		return resolved;
 	} catch {
 		return null;
 	}

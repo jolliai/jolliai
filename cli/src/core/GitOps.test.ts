@@ -1649,6 +1649,51 @@ describe("GitOps", () => {
 			mockFailure(128, "fatal: not a git repository (or any of the parent directories): .git");
 			expect(await isInsideGitRepo("/not/a/repo")).toBe(false);
 		});
+
+		it("answers from the filesystem without spawning git when a worktree is visible", async () => {
+			const dir = await mkdtemp(join(tmpdir(), "gitops-inside-"));
+			try {
+				await mkdir(join(dir, ".git", "refs"), { recursive: true });
+				await mkdir(join(dir, ".git", "objects"), { recursive: true });
+				await writeFile(join(dir, ".git", "HEAD"), "ref: refs/heads/main\n");
+
+				expect(await isInsideGitRepo(dir)).toBe(true);
+				expect(mockExecFileAsync).not.toHaveBeenCalled();
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("asks git about a bare `.git` directory rather than calling it a repo", async () => {
+			// The shape an interrupted clone or a half-synced tree leaves behind. `git
+			// rev-parse --git-dir` exits 128 for it, so the filesystem answer must not
+			// be allowed to stand in — otherwise this guard reports "inside a repo" for
+			// a directory every git command below it will fail on.
+			const dir = await mkdtemp(join(tmpdir(), "gitops-skeleton-"));
+			try {
+				await mkdir(join(dir, ".git"), { recursive: true });
+				mockFailure(128, "fatal: not a git repository (or any of the parent directories): .git");
+
+				expect(await isInsideGitRepo(dir)).toBe(false);
+				expect(mockExecFileAsync).toHaveBeenCalled();
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("still asks git for a layout the filesystem cannot recognise", async () => {
+			// A bare repo has no `.git` to find, and git answers yes — which is why
+			// only a positive filesystem answer is allowed to short-circuit.
+			const dir = await mkdtemp(join(tmpdir(), "gitops-bare-"));
+			try {
+				mockSuccess(`${dir}\n`);
+
+				expect(await isInsideGitRepo(dir)).toBe(true);
+				expect(mockExecFileAsync).toHaveBeenCalled();
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		});
 	});
 
 	describe("listWorktrees", () => {

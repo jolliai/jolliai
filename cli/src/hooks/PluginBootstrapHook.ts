@@ -12,8 +12,10 @@
 import { resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
+import { resolveGitFsLayout } from "../core/GitFsLayout.js";
 import { execGit, isInsideGitRepo } from "../core/GitOps.js";
 import { withRepoHooksLock } from "../core/Locks.js";
+import { toForwardSlash } from "../core/PathUtils.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig, saveSession } from "../core/SessionTracker.js";
 import { getClaudeAgentHookHealth } from "../install/ClaudeHookInstaller.js";
@@ -55,14 +57,53 @@ export function buildPluginBootstrapOutput(
 	};
 }
 
+/**
+ * The worktree root, or null when `projectDir` is not in a repository.
+ *
+ * One filesystem walk replaces the `--git-dir` + `--show-toplevel` pair this used
+ * to open with: both answer the same question, and each cost ~10 ms of process
+ * creation on the front of a hook that blocks a session start.
+ *
+ * Two conversions make the fast answer byte-identical to `--show-toplevel`'s,
+ * which matters because this value becomes the log dir and the anchor for every
+ * path below it: `realpath: true` resolves symlinks (git reports the real path),
+ * and {@link toForwardSlash} matches git's separator, which is `/` on EVERY
+ * platform while a filesystem walk yields `\` on Windows. Dropping the second one
+ * does not break at runtime — `node:fs` treats the two spellings alike — which is
+ * exactly why it has to be deliberate rather than incidental.
+ *
+ * The fast path is not a strict subset of what the `git` pair accepted, and the
+ * three differences are behaviour changes rather than subtleties of the same
+ * behaviour. All measured against real repositories:
+ *
+ * - A cwd inside `.git/`, and a repo declared `core.bare = true`, both make
+ *   `--show-toplevel` exit non-zero ("this operation must be run in a work tree"),
+ *   so the whole bootstrap used to be a silent no-op. The walk answers the
+ *   enclosing worktree root instead, and installs into it.
+ * - A `core.worktree` pointing somewhere that does not exist is the one case where
+ *   git does NOT refuse: it prints the configured path, so the bootstrap used to
+ *   install against a directory nobody has. The walk answers the real one.
+ *
+ * Every case resolves toward the directory a session would actually be started
+ * in, so the direction is safe; none of them is reachable from a normal session
+ * cwd. Stated here because the answer differs from `--show-toplevel`'s, and the
+ * fallback below silently stops being consulted once the walk succeeds.
+ */
+async function resolveWorktreeRoot(projectDir: string): Promise<string | null> {
+	const fromFs = resolveGitFsLayout(projectDir, { realpath: true })?.worktreeRoot;
+	if (fromFs) return toForwardSlash(fromFs);
+	if (!(await isInsideGitRepo(projectDir))) return null;
+	const topLevel = await execGit(["rev-parse", "--show-toplevel"], projectDir);
+	if (topLevel.exitCode !== 0 || !topLevel.stdout.trim()) return null;
+	return topLevel.stdout.trim();
+}
+
 export async function runPluginBootstrap(
 	projectDir: string,
 	session?: { readonly sessionId?: string; readonly transcriptPath?: string },
 ): Promise<PluginBootstrapOutput | null> {
-	if (!(await isInsideGitRepo(projectDir))) return null;
-	const topLevel = await execGit(["rev-parse", "--show-toplevel"], projectDir);
-	if (topLevel.exitCode !== 0 || !topLevel.stdout.trim()) return null;
-	const worktreeRoot = topLevel.stdout.trim();
+	const worktreeRoot = await resolveWorktreeRoot(projectDir);
+	if (worktreeRoot === null) return null;
 	setLogDir(worktreeRoot);
 
 	const menuWasCanonicalAtEntry = await isPluginJolliMenuCanonical(worktreeRoot);

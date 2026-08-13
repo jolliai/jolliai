@@ -18,7 +18,12 @@ const mocks = vi.hoisted(() => ({
 	buildSessionStartContext: vi.fn().mockResolvedValue("first context"),
 	ensurePluginDefaultProvider: vi.fn().mockResolvedValue(true),
 	readStdin: vi.fn().mockResolvedValue(JSON.stringify({ cwd: "/repo/subdir" })),
+	// Defaults to "no layout" so every existing case keeps exercising the `git`
+	// fallback it was written against.
+	resolveGitFsLayout: vi.fn<() => { worktreeRoot: string } | null>(() => null),
 }));
+
+vi.mock("../core/GitFsLayout.js", () => ({ resolveGitFsLayout: mocks.resolveGitFsLayout }));
 
 vi.mock("../core/AgentReentry.js", () => ({ isLocalAgentChild: mocks.isLocalAgentChild }));
 vi.mock("../core/GitOps.js", () => ({
@@ -188,6 +193,18 @@ describe("PluginBootstrapHook", () => {
 		expect(await runPluginBootstrap("/tmp")).toBeNull();
 		mocks.execGit.mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "no repo" });
 		expect(await runPluginBootstrap("/tmp")).toBeNull();
+	});
+
+	it("takes the worktree root off the filesystem, without asking git twice", async () => {
+		mocks.resolveGitFsLayout.mockReturnValueOnce({ worktreeRoot: "/linked-wt" });
+
+		await runPluginBootstrap("/linked-wt/src");
+
+		expect(mocks.installPluginJolliMenu).toHaveBeenCalledWith("/linked-wt");
+		// Both the `--git-dir` probe and the `--show-toplevel` that followed it are
+		// answered by the one filesystem walk.
+		expect(mocks.isInsideGitRepo).not.toHaveBeenCalled();
+		expect(mocks.execGit).not.toHaveBeenCalled();
 	});
 
 	it("fails soft when repo reconciliation fails", async () => {
