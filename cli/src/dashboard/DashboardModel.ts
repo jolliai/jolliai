@@ -362,6 +362,17 @@ export interface KnowledgeRepo {
 	 */
 	readonly kb: string;
 	readonly repoName: string;
+	/**
+	 * The scope token a source-commit wiki jump sends as `/memories?detailRepo=`,
+	 * chosen like `JD.repoToken`: the readable display name when it is unique (so the
+	 * URL reads `?detailRepo=jolliai`, like every other dashboard link), and only the
+	 * dashboard `repoIdentity` (derived from the remote URL) when two repos share a
+	 * name and the ambiguous name must be disambiguated. Falls back to the name (then
+	 * page scope) when no usable identity exists. NOT shown in the UI — `repoName` is
+	 * the visible label; this is only the memory-jump scope token. See
+	 * `detailRepoToken` in `KnowledgeQuery.ts`.
+	 */
+	readonly detailRepo: string;
 	/** Whether `<kbRoot>/.jolli/graph/graph.json` exists — gates the row's Graph link. */
 	readonly graphAvailable: boolean;
 	readonly files: ReadonlyArray<KnowledgeFile>;

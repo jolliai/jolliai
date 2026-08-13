@@ -48,18 +48,19 @@ function anchor(href: string, text: string): StubAnchor {
 }
 
 /** Runs the rewrite script over `anchors`; returns the messages posted to the parent. */
-function run(anchors: StubAnchor[], search = "?kb=jolliai&file=topic--x.md"): Array<{ type: string; hash: string }> {
+function run(anchors: StubAnchor[], detailRepo = "Jolli AI"): Array<{ type: string; hash: string }> {
 	const posted: Array<{ type: string; hash: string }> = [];
 	const md = { querySelectorAll: (sel: string) => (sel === "a[href]" ? anchors : []) };
 	const doc = {
 		getElementById: (id: string) => (id === "md" ? md : null),
 		createElement: () => ({ textContent: "" }),
 	};
-	// The frame reads its own ?kb= to build the real /memories href (status-bar preview).
+	// buildWikiViewerHtml injects the owning repo's display name as this global; the
+	// script reads it to build the real /memories href (status-bar preview).
 	const win = {
 		parent: { postMessage: (msg: { type: string; hash: string }) => posted.push(msg) },
 		document: doc,
-		location: { search },
+		__JOLLI_WIKI_DETAIL_REPO__: detailRepo,
 	};
 	new Function("window", "document", WIKI_LINK_REWRITE_SCRIPT)(win, doc);
 	return posted;
@@ -73,18 +74,18 @@ describe("WIKI_LINK_REWRITE_SCRIPT", () => {
 			"a2bc7940",
 		);
 		const posted = run([a]);
-		// href becomes the REAL destination (kb from the frame's own URL) so the
-		// browser status bar previews where the click goes.
-		expect(a.hrefSet).toBe("/memories?hash=a2bc7940&detailRepo=jolliai");
+		// href becomes the REAL destination, using the injected repo DISPLAY NAME as
+		// detailRepo (URL-encoded), so the browser status bar previews the click.
+		expect(a.hrefSet).toBe("/memories?hash=a2bc7940&detailRepo=Jolli%20AI");
 		expect(a.replacedWithText).toBeNull();
 		expect(posted).toEqual([]); // nothing posts until the click fires
 		a.clickHandler?.({ preventDefault: () => undefined });
 		expect(posted).toEqual([{ type: "jolli-wiki-nav", hash: "a2bc7940" }]);
 	});
 
-	it("omits detailRepo from the href when the frame's URL carries no kb", () => {
+	it("omits detailRepo from the href when no owning repo is injected", () => {
 		const a = anchor("../main/add-thing-a2bc7940.md", "a2bc7940");
-		run([a], "?file=topic--x.md");
+		run([a], "");
 		expect(a.hrefSet).toBe("/memories?hash=a2bc7940");
 	});
 

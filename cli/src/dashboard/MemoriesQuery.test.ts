@@ -480,19 +480,21 @@ describe("MemoriesQuery", () => {
 			expect(short?.conversations.length).toBe(full?.conversations.length);
 		});
 
-		it("resolves a short-hash prefix collision within ONE repo deterministically", async () => {
+		it("resolves a short-hash prefix collision within ONE repo by a deterministic RULE (lexicographic hash)", async () => {
 			await seedRepo(dbPath, "repo-1", "acme-api");
-			const h1 = `abcd1234${"1".repeat(32)}`;
+			// Seed the lexicographically-LARGER hash first, so a passing test proves the
+			// ORDER BY commit_hash rule — not merely insertion/rowid order (which is what
+			// `ORDER BY repo_id` alone left to the engine when repo_id ties within a repo).
+			const h1 = `abcd1234${"1".repeat(32)}`; // lexicographically first
 			const h2 = `abcd1234${"2".repeat(32)}`;
-			await seedMemory(dbPath, "repo-1", h1, "first", { commitDateMs: 1 });
 			await seedMemory(dbPath, "repo-1", h2, "second", { commitDateMs: 2 });
+			await seedMemory(dbPath, "repo-1", h1, "first", { commitDateMs: 1 });
 
-			// Both share prefix "abcd1234" in the SAME repo, so detailRepo cannot
-			// disambiguate; the pick must be stable across calls (not throw, not vary).
-			const a = await withDashboardDb((db) => buildMemoryDetail(db, ALL, "abcd1234"), { dbPath });
-			const b = await withDashboardDb((db) => buildMemoryDetail(db, ALL, "abcd1234"), { dbPath });
-			expect(a?.commitHash).toBe(b?.commitHash);
-			expect([h1, h2]).toContain(a?.commitHash);
+			// Both share prefix "abcd1234" in the SAME repo (same repo_id), so repo_id is
+			// a tie; the full-hash tie-breaker must pick h1 — the lexicographically first —
+			// regardless of insert order.
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, "abcd1234"), { dbPath });
+			expect(detail?.commitHash).toBe(h1);
 		});
 
 		it("splits a topic's decisions prose into bullets, and falls back to one bullet for a plain sentence", async () => {

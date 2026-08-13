@@ -621,10 +621,19 @@ export function buildMemoryDetail(
 			  -- Deterministic pick. Without a scope filter (the all-repos view) one
 			  -- hash can match rows in two repos — two clones of a project, or the
 			  -- same commit cherry-picked into another — and an unordered LIMIT 1 let
-			  -- the engine hand back a different repo's memory between renders. A short
-			  -- hash can also prefix-collide within one repo; the same ORDER makes that
-			  -- pick deterministic, and detailRepo narrows the scope first.
-			  ORDER BY m.repo_id
+			  -- the engine hand back a different repo's memory between renders.
+			  -- m.commit_hash is the SECOND key, not decoration: a short hash can
+			  -- prefix-collide WITHIN one repo (same repo_id), where repo_id alone is a
+			  -- tie and LIMIT 1 would again be engine-defined. Ordering by the full
+			  -- hash breaks that tie by a stable rule (lexicographic first), so the pick
+			  -- is reproducible rather than whichever row the engine emits. It is a
+			  -- deterministic choice among ambiguous matches, not a claim about which
+			  -- commit the user meant — an 8-char prefix cannot say. detailRepo narrows
+			  -- the scope first; within one scope a FULL hash matches exactly one row.
+			  -- (In the all-repos view a full hash can still match two rows — the same
+			  -- commit cherry-picked into two repos — but there the repo_id key breaks
+			  -- the tie and the equal commit_hash makes the second key inert.)
+			  ORDER BY m.repo_id, m.commit_hash
 			  LIMIT 1`,
 		)
 		.get(hash, hash, ...filter.params) as MemoryDetailRow | undefined;

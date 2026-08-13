@@ -27,6 +27,7 @@ afterEach(() => {
 interface RepoSpec {
 	readonly dir: string;
 	readonly repoName?: string;
+	readonly remoteUrl?: string; // written into config.json; drives detailRepo (identity)
 	readonly wiki?: Record<string, string>; // file name -> body
 	readonly manifestTitles?: Record<string, string>; // wiki path -> title
 	readonly graph?: string; // graph.json contents; omit for no graph
@@ -40,7 +41,12 @@ function scaffold(repos: RepoSpec[]): { configDir: string } {
 		mkdirSync(join(kbRoot, ".jolli"), { recursive: true });
 		writeFileSync(
 			join(kbRoot, ".jolli", "config.json"),
-			JSON.stringify({ version: 1, sortOrder: "date", ...(spec.repoName ? { repoName: spec.repoName } : {}) }),
+			JSON.stringify({
+				version: 1,
+				sortOrder: "date",
+				...(spec.repoName ? { repoName: spec.repoName } : {}),
+				...(spec.remoteUrl ? { remoteUrl: spec.remoteUrl } : {}),
+			}),
 		);
 		if (spec.wiki) {
 			mkdirSync(join(kbRoot, "_wiki"), { recursive: true });
@@ -79,6 +85,31 @@ describe("WIKI_FILE_PATTERN", () => {
 });
 
 describe("buildKnowledgeModel", () => {
+	it("uses the display name when unique, the repoIdentity to disambiguate a shared name", async () => {
+		const { configDir } = scaffold([
+			// UNIQUE name → the readable name itself (even though it has a remote), so the
+			// URL stays short and matches the rest of the dashboard.
+			{ dir: "solo", repoName: "Solo", remoteUrl: "git@github.com:acme/solo.git" },
+			// Two repos SHARE the name "Dup" → each gets its identity to disambiguate.
+			{ dir: "dupA", repoName: "Dup", remoteUrl: "git@github.com:teamA/dup.git" },
+			{ dir: "dupB", repoName: "Dup", remoteUrl: "git@github.com:teamB/dup.git" },
+			// SHARED name but no usable (non-file:) identity → the ambiguous name
+			// (best-effort; the jump then degrades to the page scope, never a file:// token).
+			{ dir: "localA", repoName: "LocalDup", remoteUrl: "/home/user/a.git" },
+			{ dir: "localB", repoName: "LocalDup" },
+		]);
+		const model = await buildKnowledgeModel(configDir);
+		const byKb = new Map(model.repos.map((r) => [r.kb, r]));
+		// Unique name → the name (short, dashboard-consistent), NOT its identity.
+		expect(byKb.get("solo")?.detailRepo).toBe("Solo");
+		// Shared name → the identity (github path lower-cased by normalizeRemoteUrl).
+		expect(byKb.get("dupA")?.detailRepo).toBe("https://github.com/teama/dup");
+		expect(byKb.get("dupB")?.detailRepo).toBe("https://github.com/teamb/dup");
+		// Shared name, no usable identity → the ambiguous name, never a file:// token.
+		expect(byKb.get("localA")?.detailRepo).toBe("LocalDup");
+		expect(byKb.get("localB")?.detailRepo).toBe("LocalDup");
+	});
+
 	it("lists a repo's wiki TOPICS by title, excluding the _index and non-wiki files", async () => {
 		const { configDir } = scaffold([
 			{

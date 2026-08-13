@@ -126,6 +126,7 @@ import {
 	buildKnowledgeModel,
 	readGraphJson,
 	readWikiBody,
+	resolveKbRepo,
 	resolveKbRoot,
 	WIKI_FILE_PATTERN,
 } from "./KnowledgeQuery.js";
@@ -334,16 +335,22 @@ body { margin: 0; padding: 24px 40px; font: 14px/1.6 -apple-system, BlinkMacSyst
  *   - **Source-commit** links — `../<branch>/<slug>-<hash8>.md` (NO `summary--`
  *     prefix: the visible file `FolderStorage` writes is `<slug>-<hash8>.md`, and
  *     the link's visible label is that 8-char hash) — get their `href` REWRITTEN
- *     to the real target `/memories?hash=…&detailRepo=<kb>` (so the browser status
- *     bar previews where a click goes) but still `preventDefault` + `postMessage`
- *     the hash up to the Knowledge page, which performs the actual navigation.
- *     This frame is sandboxed (opaque origin) — a bare `<a>` click would navigate
- *     the FRAME, not the top page — so the anchor cannot be left to do the jump.
- *     `kb` for the href is read from this frame's own `?kb=` (its URL already
- *     names the repo); the parent navigates to the SAME `detailRepo=<kb>`, so the
- *     previewed URL and the real one match exactly. Classified as a relative `.md`
- *     whose trailing `-<hex>.md` (or link text) is a commit hash; the hash is
- *     read from that trailing group, falling back to the link text.
+ *     to the real target `/memories?hash=…&detailRepo=<token>` (so the browser
+ *     status bar previews where a click goes) but still `preventDefault` +
+ *     `postMessage` the hash up to the Knowledge page, which performs the actual
+ *     navigation. This frame is sandboxed (opaque origin) — a bare `<a>` click
+ *     would navigate the FRAME, not the top page — so the anchor cannot be left to
+ *     do the jump. `detailRepo` is the repo's SCOPE TOKEN (see `detailRepoToken`:
+ *     the dashboard repoIdentity from the remote URL when one exists, else the
+ *     display name — NOT the frame's own `?kb=`, a Memory Bank DIRECTORY name that
+ *     `resolveScope` cannot scope by), injected by `buildWikiViewerHtml` as
+ *     `window.__JOLLI_WIKI_DETAIL_REPO__`. The parent navigates to the SAME
+ *     `detailRepo` — both values come from `discoverRepos` for the same `dirName`,
+ *     so they normally match exactly (the injected one is read at request time, the
+ *     parent's from the page's model, so a mid-session folder rename could
+ *     momentarily diverge them — a status-bar-preview cosmetic, not a wrong jump).
+ *     Classified as a relative `.md` whose trailing `-<hex>.md` (or link text) is a
+ *     commit hash; the hash is read from that trailing group, falling back to text.
  *   - **Related-branch** links — `../<folder>/` — plus the index page's bare
  *     `topic--<slug>.md` links and any other leftover relative link keep their
  *     text but drop the anchor (local dashboard has no branch page, and every
@@ -354,7 +361,10 @@ body { margin: 0; padding: 24px 40px; font: 14px/1.6 -apple-system, BlinkMacSyst
  */
 export const WIKI_LINK_REWRITE_SCRIPT =
 	'(function(){var md=document.getElementById("md");if(!md)return;' +
-	'var kb=(new URLSearchParams(window.location.search)).get("kb")||"";' +
+	// The owning repo's scope token (repoIdentity, or display name when it has no
+	// remote), injected by buildWikiViewerHtml — for /memories?detailRepo=. A Memory
+	// Bank dir name would not resolve.
+	'var repo=window.__JOLLI_WIKI_DETAIL_REPO__||"";' +
 	'Array.prototype.forEach.call(md.querySelectorAll("a[href]"),function(a){' +
 	'var href=a.getAttribute("href")||"";' +
 	"var rel=/^\\.{1,2}\\//.test(href);" +
@@ -363,10 +373,10 @@ export const WIKI_LINK_REWRITE_SCRIPT =
 	// Source-commit link: a relative .md whose trailing -<hex>.md (or visible label)
 	// is a commit hash. There is NO "summary--" prefix — the file is <slug>-<hash8>.md.
 	"if(rel&&/\\.md$/i.test(href)&&/^[0-9a-f]{7,40}$/i.test(hash)){" +
-	// Show the real destination in the status bar (kb from this frame's own URL);
-	// the click still goes through the parent, since a sandboxed <a> would only
-	// navigate the frame. The parent navigates to this SAME detailRepo=<kb>.
-	'a.setAttribute("href","/memories?hash="+encodeURIComponent(hash)+(kb?"&detailRepo="+encodeURIComponent(kb):""));' +
+	// Show the real destination in the status bar; the click still goes through the
+	// parent, since a sandboxed <a> would only navigate the frame. The parent
+	// navigates to this SAME detailRepo=<token>.
+	'a.setAttribute("href","/memories?hash="+encodeURIComponent(hash)+(repo?"&detailRepo="+encodeURIComponent(repo):""));' +
 	'a.addEventListener("click",function(e){e.preventDefault();' +
 	'window.parent.postMessage({type:"jolli-wiki-nav",hash:hash},"*");});' +
 	"return;}" +
@@ -376,14 +386,18 @@ export const WIKI_LINK_REWRITE_SCRIPT =
 	"s.textContent=a.textContent;if(a.parentNode)a.parentNode.replaceChild(s,a);}" +
 	"});})();";
 
-function buildWikiViewerHtml(graphAssetsDir: string, bodyMd: string): string {
+function buildWikiViewerHtml(graphAssetsDir: string, bodyMd: string, detailRepo: string): string {
 	const marked = readFileSync(join(graphAssetsDir, "vendor", "marked.min.js"), "utf8");
 	const safe = escapeForInlineScript(JSON.stringify(bodyMd));
+	// The scope token the rewrite script writes into each source-commit link's
+	// `detailRepo`. Escaped like `bodyMd` (not developer-controlled — a repo URL).
+	const safeRepo = escapeForInlineScript(JSON.stringify(detailRepo));
 	return (
 		`<!doctype html><html lang="en"><head><meta charset="utf-8" />` +
 		`<meta name="viewport" content="width=device-width, initial-scale=1" />` +
 		`<style>${WIKI_VIEWER_CSS}</style></head><body><article id="md" class="md"></article>` +
 		`<script>\n${marked}\n</script>` +
+		`<script>window.__JOLLI_WIKI_DETAIL_REPO__ = ${safeRepo};</script>` +
 		`<script>document.getElementById("md").innerHTML = window.marked.parse(${safe});</script>` +
 		`<script>${WIKI_LINK_REWRITE_SCRIPT}</script>` +
 		`</body></html>`
@@ -1220,16 +1234,20 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 				sendText(res, 400, "invalid wiki file");
 				return;
 			}
-			const kbRoot = await resolveKbRoot(configDir, kb);
-			const body = kbRoot ? readWikiBody(kbRoot, file) : undefined;
-			if (body === undefined) {
+			const repo = await resolveKbRepo(configDir, kb);
+			const body = repo ? readWikiBody(repo.kbRoot, file) : undefined;
+			if (!repo || body === undefined) {
 				sendViewerHtml(res, 404, viewerMessageHtml("This wiki page could not be found."));
 				return;
 			}
 			// A partially-shipped viz asset tree would throw here; the outer request
 			// catch turns that into a 500 (never a crash), same as any page route.
 			graphAssetsDir ??= resolveGraphAssetsDir();
-			sendViewerHtml(res, 200, buildWikiViewerHtml(graphAssetsDir, body));
+			// The rewritten source-commit links carry `repo.detailRepo` (the dashboard
+			// repoIdentity when a remote exists, else the display name — NOT the `kb`
+			// dir name) so the memory jump scopes to the owning repo even when two
+			// repos share a display name. See the script's docstring and `resolveKbRepo`.
+			sendViewerHtml(res, 200, buildWikiViewerHtml(graphAssetsDir, body, repo.detailRepo));
 			return;
 		}
 

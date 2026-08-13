@@ -293,10 +293,25 @@ window.JD = window.JD || {};
 	   Only reached from renderMemories, never from refreshTree (collapse toggles /
 	   load-more must not reposition the tree). No-op when the row isn't loaded. */
 	function scrollSelectedIntoView(model) {
-		var sel = model.memories && model.memories.selected ? model.memories.selected.commitHash : null;
-		if (!sel || sel === JD.memLastScrolledHash) return;
-		JD.memLastScrolledHash = sel;
-		var row = document.querySelector('#memTree [aria-current="true"]');
+		var detail = model.memories && model.memories.selected;
+		var hash = detail ? detail.commitHash : null;
+		if (!hash || hash === JD.memLastScrolledHash) return;
+		JD.memLastScrolledHash = hash;
+		// The tree marks selection by commit hash ALONE, so when the same hash exists
+		// in two repos (a cherry-pick) BOTH rows carry aria-current. Center the row
+		// whose repo actually OWNS this detail (matched on repoIdentity), not just the
+		// first — otherwise the scroll can land on the other repo's row while the
+		// detail pane shows this one. Match by data-repo (each row carries it); fall
+		// back to the first selected row if none matches (should not happen).
+		var selected = document.querySelectorAll('#memTree [aria-current="true"]');
+		var row = null;
+		for (var i = 0; i < selected.length; i++) {
+			if (selected[i].getAttribute("data-repo") === detail.repoIdentity) {
+				row = selected[i];
+				break;
+			}
+		}
+		if (!row) row = selected[0];
 		if (row && row.scrollIntoView) row.scrollIntoView({ block: "center" });
 	}
 

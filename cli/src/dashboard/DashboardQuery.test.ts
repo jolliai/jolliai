@@ -2716,7 +2716,9 @@ describe("knowledge & graph payloads", () => {
 					scope: { kind: "all" },
 					timeZone: "UTC",
 					nowMs: 0,
-					knowledgeModel: { repos: [{ kb: "r", repoName: "r", graphAvailable: true, files: [] }] },
+					knowledgeModel: {
+						repos: [{ kb: "r", repoName: "r", detailRepo: "r", graphAvailable: true, files: [] }],
+					},
 				}),
 			{ dbPath },
 		);

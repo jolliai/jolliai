@@ -12,10 +12,11 @@
  *
  *   - **`kb` is `DiscoveredRepo.dirName`, not a dashboard `repoIdentity`.** The
  *     Knowledge/Graph pages browse the Memory Bank *folder*, a different identity
- *     space from `dashboard-repos.json`. The `/wiki-viewer` and `/graph-viewer`
- *     routes resolve a `kb` back to a `kbRoot` through {@link resolveKbRoot} —
- *     which matches against `discoverRepos` output and NEVER joins caller input
- *     into a path, so a `../` `kb` cannot escape the Memory Bank root.
+ *     space from `dashboard-repos.json`. Both viewer routes resolve a `kb` back to
+ *     a `kbRoot` — `/graph-viewer` through {@link resolveKbRoot}, `/wiki-viewer`
+ *     through {@link resolveKbRepo} (which also returns `repoName` for the memory
+ *     jump's scope token) — matching against `discoverRepos` output and NEVER
+ *     joining caller input into a path, so a `../` `kb` cannot escape the root.
  *
  *   - **Every disk read is independently guarded.** `_wiki` is wiped and
  *     rewritten wholesale on each `jolli compile` (see `FolderStorage`), so an
@@ -25,7 +26,8 @@
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { discoverRepos } from "../core/KBRepoDiscoverer.js";
+import { normalizeRemoteUrl } from "../core/GitRemoteUtils.js";
+import { type DiscoveredRepo, discoverRepos } from "../core/KBRepoDiscoverer.js";
 import type { Manifest } from "../core/KBTypes.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import type { GraphModel, GraphRepo, KnowledgeFile, KnowledgeModel, KnowledgeRepo } from "./DashboardModel.js";
@@ -110,13 +112,49 @@ function listWikiFiles(kbRoot: string): KnowledgeFile[] {
 	return files;
 }
 
+/**
+ * The `/memories?detailRepo=` scope token for a source-commit wiki jump, chosen the
+ * same way `JD.repoToken` chooses one for the memories tree, so the URL reads the
+ * same across the dashboard:
+ *
+ *   - **Unique display name → the display name.** When no other repo shares it,
+ *     `resolveScope` resolves the name to exactly one repo, so the readable
+ *     `?detailRepo=jolliai` is enough — and matches every other dashboard link.
+ *   - **Shared display name → the `repoIdentity`.** Only when two repos share a
+ *     name does `resolveScope` refuse the ambiguous name; then we need the identity,
+ *     which `normalizeRemoteUrl` derives from the remote URL by the SAME transform
+ *     the collector runs, so it equals `repos.repo_identity` and is unique.
+ *
+ * The identity is used only when it is a usable, non-`file:` one — mirroring the
+ * collector's classification ({@link resolveRepoIdentity}): a `file:` result (a
+ * local-path / unparseable remote) is stored there as `local:<hash of the WORKTREE
+ * root>`, which this side (rooted at `kbRoot`) cannot reconstruct. So a shared name
+ * with no usable identity falls back to the (ambiguous) name — best-effort, and the
+ * jump then degrades to the page scope + hash rather than sending an unmatchable
+ * `file://<kbRoot>`.
+ *
+ * Uniqueness is judged over the Memory Bank folders (`repos`), which normally equals
+ * the dashboard's repo set; a rare divergence (a repo enabled but not yet compiled)
+ * only costs a page-scope fallback, never a wrong jump.
+ */
+function detailRepoToken(repo: DiscoveredRepo, repos: ReadonlyArray<DiscoveredRepo>): string {
+	if (repos.filter((r) => r.repoName === repo.repoName).length === 1) return repo.repoName;
+	if (repo.remoteUrl) {
+		const identity = normalizeRemoteUrl(repo.remoteUrl, repo.kbRoot);
+		if (!identity.startsWith("file:")) return identity;
+	}
+	return repo.repoName;
+}
+
 /** Knowledge page: every Memory Bank repo's `_wiki` file list. */
 export async function buildKnowledgeModel(configDir?: string): Promise<KnowledgeModel> {
 	const localFolder = await readLocalFolder(configDir);
-	const repos = discoverRepos(null, null, localFolder).map(
+	const discovered = discoverRepos(null, null, localFolder);
+	const repos = discovered.map(
 		(r): KnowledgeRepo => ({
 			kb: r.dirName,
 			repoName: r.repoName,
+			detailRepo: detailRepoToken(r, discovered),
 			graphAvailable: hasGraph(r.kbRoot),
 			files: listWikiFiles(r.kbRoot),
 		}),
@@ -141,6 +179,24 @@ export async function buildGraphModel(configDir?: string): Promise<GraphModel> {
 export async function resolveKbRoot(configDir: string | undefined, kb: string): Promise<string | undefined> {
 	const localFolder = await readLocalFolder(configDir);
 	return discoverRepos(null, null, localFolder).find((r) => r.dirName === kb)?.kbRoot;
+}
+
+/**
+ * Like {@link resolveKbRoot}, but also returns the memory-jump SCOPE TOKEN — see
+ * {@link detailRepoToken}: the readable display name when it is unique, else the
+ * `repoIdentity` to disambiguate a shared name (else a page-scope fallback). This
+ * MUST use the same derivation over the same repo set that `buildKnowledgeModel`
+ * gives the client — hence it discovers ALL repos, not just the one — so the
+ * iframe-injected href and the parent's navigation carry the identical `detailRepo`.
+ */
+export async function resolveKbRepo(
+	configDir: string | undefined,
+	kb: string,
+): Promise<{ kbRoot: string; detailRepo: string } | undefined> {
+	const localFolder = await readLocalFolder(configDir);
+	const discovered = discoverRepos(null, null, localFolder);
+	const repo = discovered.find((r) => r.dirName === kb);
+	return repo ? { kbRoot: repo.kbRoot, detailRepo: detailRepoToken(repo, discovered) } : undefined;
 }
 
 /**

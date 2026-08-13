@@ -112,15 +112,29 @@ function writeTestAssets(base: string): string {
  */
 function writeMemoryBank(
 	base: string,
-	repos: ReadonlyArray<{ dir: string; wiki?: Record<string, string>; graph?: string }>,
+	repos: ReadonlyArray<{
+		dir: string;
+		repoName?: string;
+		remoteUrl?: string;
+		wiki?: Record<string, string>;
+		graph?: string;
+	}>,
 ): string {
 	const mb = join(base, "mb");
 	for (const r of repos) {
 		const kbRoot = join(mb, r.dir);
 		mkdirSync(join(kbRoot, ".jolli"), { recursive: true });
+		// `repoName` defaults to the dir name; `remoteUrl` is optional. A test sets them
+		// so it can prove which token a route serves (dir name vs display name vs the
+		// repoIdentity derived from the remote).
 		writeFileSync(
 			join(kbRoot, ".jolli", "config.json"),
-			JSON.stringify({ version: 1, sortOrder: "date", repoName: r.dir }),
+			JSON.stringify({
+				version: 1,
+				sortOrder: "date",
+				repoName: r.repoName ?? r.dir,
+				...(r.remoteUrl ? { remoteUrl: r.remoteUrl } : {}),
+			}),
 		);
 		if (r.wiki) {
 			mkdirSync(join(kbRoot, "_wiki"), { recursive: true });
@@ -480,7 +494,19 @@ describe("routes", () => {
 
 	describe("wiki-viewer & graph-viewer iframes", () => {
 		it("renders a wiki page via marked, sandbox-isolated (frame-ancestors self, no-store)", async () => {
-			const configDir = writeMemoryBank(dir, [{ dir: "repoA", wiki: { "topic--a.md": "# Hello\n\nbody" } }]);
+			// TWO repos SHARE the display name ("Repo Alpha"), so the served repo's token
+			// must be its repoIdentity (to disambiguate) — differing from BOTH the kb dir
+			// name ("repoA") and the shared display name. This proves the route injects
+			// the derived identity via detailRepoToken, not either name.
+			const configDir = writeMemoryBank(dir, [
+				{
+					dir: "repoA",
+					repoName: "Repo Alpha",
+					remoteUrl: "git@github.com:acme/repo-alpha.git",
+					wiki: { "topic--a.md": "# Hello\n\nbody" },
+				},
+				{ dir: "repoB", repoName: "Repo Alpha", remoteUrl: "git@github.com:other/repo-alpha.git" },
+			]);
 			const port = await listen(testServer({ configDir }));
 			const res = await get(port, "/wiki-viewer?kb=repoA&file=topic--a.md");
 			expect(res.status).toBe(200);
@@ -500,6 +526,14 @@ describe("routes", () => {
 			// WikiViewerScript.test.ts against real href shapes.)
 			expect(body).toContain('window.parent.postMessage({type:"jolli-wiki-nav",hash:hash}');
 			expect(body).toContain("a.parentNode.replaceChild(s,a)");
+			// The owning repo's repoIdentity (derived from its remote URL) is injected as
+			// the detailRepo scope token — NOT the kb dir name ("repoA") nor the display
+			// name ("Repo Alpha"). End-to-end proof that resolveKbRepo → buildWikiViewerHtml
+			// serves the identity (what resolveScope matches, unique across same-named
+			// repos), not either name; all three values differ so it can't pass by accident.
+			expect(body).toContain('window.__JOLLI_WIKI_DETAIL_REPO__ = "https://github.com/acme/repo-alpha";');
+			expect(body).not.toContain('window.__JOLLI_WIKI_DETAIL_REPO__ = "repoA"');
+			expect(body).not.toContain('window.__JOLLI_WIKI_DETAIL_REPO__ = "Repo Alpha"');
 		});
 
 		it("neutralizes a </script> breakout payload in the wiki body", async () => {

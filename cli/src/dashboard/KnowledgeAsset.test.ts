@@ -74,6 +74,9 @@ function setup() {
 				{
 					kb: "jolliai",
 					repoName: "Jolli AI",
+					// The scope token — distinct from BOTH kb and repoName so the assertion
+					// proves the nav uses detailRepo (the repoIdentity), not either name.
+					detailRepo: "https://github.com/acme/jolliai",
 					graphAvailable: true,
 					files: [{ file: "topic--x.md", title: "X" }],
 				},
@@ -90,13 +93,14 @@ function setup() {
 }
 
 describe("knowledge.js — wiki source-commit navigation", () => {
-	it("navigates to /memories with the hash and the open page's kb as detailRepo", () => {
+	it("navigates to /memories with the hash and the owning repo's detailRepo scope token", () => {
 		const h = setup();
 		h.openWikiRow(); // sets state.selected → kb "jolliai"
 		h.fireMessage({ type: "jolli-wiki-nav", hash: "a742fa47" });
-		// detailRepo is the kb — the SAME value the iframe wrote into the link's
-		// visible href, so the status-bar preview and the real destination match.
-		expect(h.href()).toBe("/memories?hash=a742fa47&detailRepo=jolliai");
+		// detailRepo is the repo's scope token (its repoIdentity here), URL-encoded —
+		// NOT the kb dir name and NOT the display name. resolveScope matches identity
+		// exactly and it disambiguates repos that share a display name.
+		expect(h.href()).toBe("/memories?hash=a742fa47&detailRepo=https%3A%2F%2Fgithub.com%2Facme%2Fjolliai");
 	});
 
 	it("ignores a message whose hash is not a valid hex commit id", () => {

@@ -172,25 +172,34 @@ window.JD = window.JD || {};
 			redrawList(model);
 		};
 		wireList(model);
-		wireWikiNav();
+		wireWikiNav(model);
 	}
 
 	// A source-commit link clicked inside the wiki iframe posts up its commit hash
 	// (the frame is sandboxed / opaque-origin, so it can't navigate us). We validate
 	// the hash shape — the frame is untrusted — and navigate to that memory, scoped
-	// by the currently-open page's `kb`. This is the SAME `detailRepo=<kb>` the frame
-	// wrote into the link's visible href, so the status-bar preview and the real
-	// destination match. Re-registered per render, previous handler removed first so
-	// repeated renders don't stack listeners (mirrors graph.js's syncUrlWithFrame).
-	function wireWikiNav() {
+	// by the owning repo's SCOPE TOKEN (`detailRepo`: the dashboard repoIdentity when
+	// the repo has a remote, else its display name). This is the SAME `detailRepo`
+	// the frame wrote into the link's visible href, so the status-bar preview and the
+	// real destination match. Re-registered per render, previous handler removed
+	// first so repeated renders don't stack listeners (mirrors graph.js).
+	function wireWikiNav(model) {
 		if (JD._wikiNavHandler) window.removeEventListener("message", JD._wikiNavHandler);
 		JD._wikiNavHandler = function (ev) {
 			var d = ev && ev.data;
 			if (!d || d.type !== "jolli-wiki-nav" || typeof d.hash !== "string") return;
 			if (!/^[0-9a-f]{7,40}$/i.test(d.hash)) return;
-			var kb = (state.selected && state.selected.kb) || "";
+			// detailRepo is the owning repo's scope token — repoIdentity (unique, and
+			// what resolveScope matches even when two repos share a display name) when a
+			// remote exists, else the name. `kb` (the Memory Bank dir name) is NOT a
+			// scope token, so a short hash could open the wrong repo's memory.
+			var kb = state.selected && state.selected.kb;
+			var repo = allRepos(model).filter((r) => r.kb === kb)[0];
+			var detailRepo = repo ? repo.detailRepo : "";
 			window.location.href =
-				"/memories?hash=" + encodeURIComponent(d.hash) + (kb ? "&detailRepo=" + encodeURIComponent(kb) : "");
+				"/memories?hash=" +
+				encodeURIComponent(d.hash) +
+				(detailRepo ? "&detailRepo=" + encodeURIComponent(detailRepo) : "");
 		};
 		window.addEventListener("message", JD._wikiNavHandler);
 	}
