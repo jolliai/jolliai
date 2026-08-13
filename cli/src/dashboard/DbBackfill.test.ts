@@ -28,6 +28,10 @@ vi.mock("../core/GitOps.js", () => ({
 }));
 vi.mock("../core/SummaryStore.js", () => ({
 	getIndex: vi.fn(),
+	// The commit tier's branch-attribution read is threaded from here now. Left
+	// unmocked it is `undefined` and every test in this file dies on the call, so
+	// the identity default doubles as the assertion target for the seam below.
+	resolveReadStorage: vi.fn(),
 }));
 vi.mock("../core/RepoProfile.js", () => ({
 	readCutoverFence: vi.fn(),
@@ -46,7 +50,7 @@ vi.mock("./SotImport.js", async (importOriginal) => ({
 
 import { execGit, getHeadHash, listFilesInBranch } from "../core/GitOps.js";
 import { readCutoverFence } from "../core/RepoProfile.js";
-import { getIndex } from "../core/SummaryStore.js";
+import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
 import {
 	collectCommitEvents,
 	collectRepoGraph,
@@ -137,6 +141,10 @@ beforeEach(() => {
 	});
 	// No summary store by default — the summaries sweep is opt-in per test.
 	vi.mocked(getIndex).mockResolvedValue(null);
+	// Identity: the real one answers `opts.storage` when given one, and the
+	// ambient system of record otherwise. `null` stands in for "no override" —
+	// what the collector then does with it is `collectCommitEvents`' own suite.
+	vi.mocked(resolveReadStorage).mockImplementation(async (storage) => storage as never);
 	// Not fenced for cutover by default — the orphan branch is still authoritative.
 	vi.mocked(readCutoverFence).mockResolvedValue(null);
 });
@@ -147,6 +155,18 @@ afterEach(() => {
 
 async function query<T>(sql: string, ...params: unknown[]): Promise<T[]> {
 	return withDashboardDb((db) => db.prepare(sql).all(...params) as T[], { dbPath });
+}
+
+/** The branch axis's own view of one commit: `commit_branches`, resolved to names. */
+async function branchesOf(hash: string): Promise<string[]> {
+	const rows = await query<{ name: string }>(
+		`SELECT b.name FROM commit_branches cb
+		   JOIN branches b ON b.id = cb.branch_id
+		   JOIN commits c  ON c.id = cb.commit_id
+		  WHERE c.hash = ? ORDER BY b.name`,
+		hash,
+	);
+	return rows.map((r) => r.name);
 }
 
 describe("dbBackfillRepo — bootstrap", () => {
@@ -351,10 +371,13 @@ describe("dbBackfillRepo — recovery", () => {
 		expect(hashes).toEqual(["aaa", "bbb", "ccc"]);
 	});
 
-	it("re-projects a commit whose branch reachability changed", async () => {
+	it("re-projects a commit whose branch attribution changed", async () => {
 		// `branches` is replace-when-present, so a stale set is a wrong answer to
 		// "group by branch" — this is the one field that legitimately changes for an
 		// OLD commit, and skipping it is what a naive "already stored" test would do.
+		// (It used to change because a reachability window reshuffled, which never
+		// converged; it now changes only when the recorded branch really does — a
+		// late-arriving memory or an amend. See `unchangedCommitEvent`.)
 		await dbBackfillRepo({ repo, dbPath });
 		vi.mocked(getHeadHash).mockResolvedValue("head-2");
 		vi.mocked(collectCommitEvents).mockResolvedValue([
@@ -371,6 +394,48 @@ describe("dbBackfillRepo — recovery", () => {
 			)
 		).map((r) => r.name);
 		expect(names).toEqual(["feature/x", "main"]);
+	});
+
+	it("fills branch attribution for a commit whose memory arrived after it", async () => {
+		// The gap the churn was accidentally papering over. A commit lands before its
+		// memory exists, so the first sweep records no branch for it; the summary
+		// arrives moments later. While the reachability window thrashed, EVERY pass
+		// re-emitted every commit and re-read the recorded branch, so this filled
+		// itself as a side effect of the bug. Now that a commit converges after one
+		// projection, the late fill is a distinct transition that has to work on its
+		// own — and three UI cards render `commits.branch`.
+		//
+		// `[]`, not absent: the commit genuinely has no recorded branch yet, and that
+		// answer must CLEAR rows rather than preserve them.
+		vi.mocked(collectCommitEvents).mockResolvedValue([{ ...commitEvent("aaa"), branch: undefined, branches: [] }]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await query<{ branch: string | null }>("SELECT branch FROM commits WHERE hash = 'aaa'")).toEqual([
+			{ branch: null },
+		]);
+		expect(await query("SELECT 1 FROM commit_branches")).toEqual([]);
+
+		// The memory lands. One more emission, and it is a real change.
+		const beforeFill = await dbBackfillRepo({ repo, dbPath });
+		vi.mocked(getHeadHash).mockResolvedValue("head-2");
+		vi.mocked(collectCommitEvents).mockResolvedValue([
+			{ ...commitEvent("aaa"), branch: "feature/x", branches: ["feature/x"] },
+		]);
+		const filled = await dbBackfillRepo({ repo, dbPath });
+		expect(filled.eventsApplied).toBe(beforeFill.eventsApplied + 1);
+		expect(await query<{ branch: string | null }>("SELECT branch FROM commits WHERE hash = 'aaa'")).toEqual([
+			{ branch: "feature/x" },
+		]);
+		// Exactly one row — the whole point of the new shape.
+		expect(
+			await query<{ name: string }>(
+				`SELECT b.name FROM commit_branches cb JOIN branches b ON b.id = cb.branch_id`,
+			),
+		).toEqual([{ name: "feature/x" }]);
+
+		// And it converges: a further identical pass emits nothing new.
+		vi.mocked(getHeadHash).mockResolvedValue("head-3");
+		const settled = await dbBackfillRepo({ repo, dbPath });
+		expect(settled.eventsApplied).toBe(beforeFill.eventsApplied);
 	});
 
 	it("re-offers a commit whose file rows were never collected", async () => {
@@ -563,6 +628,30 @@ describe("dbBackfillRepo — SOT import wiring (v7)", () => {
 		const storage = { kind: "orphan-branch" as const, listFiles: async () => [] } as never;
 		await dbBackfillRepo({ repo, dbPath, storage });
 		expect(importRepoMemory).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ storage }));
+	});
+
+	it("gives the same injected provider to the COMMIT sweep, not just the importer", async () => {
+		// The commit tier reads `index.json` too — that is where branch attribution
+		// comes from — and it used to take whatever `getIndex`'s ambient fallback
+		// resolved instead. So the seam covered half the pass: a test could feed the
+		// importer one index while the attribution came from the real machine.
+		const storage = { kind: "orphan-branch" as const, listFiles: async () => [] } as never;
+		await dbBackfillRepo({ repo, dbPath, storage });
+		expect(vi.mocked(resolveReadStorage).mock.calls[0]?.[0]).toBe(storage);
+		expect(vi.mocked(collectCommitEvents).mock.calls[0]?.[0].storage).toBe(storage);
+	});
+
+	it("threads ONE routed provider into the commit sweep, resolved outside the db handle", async () => {
+		// Not `orphanStorage`: that one is pinned to the orphan tip, which a fenced
+		// repo has frozen — attribution for every post-fence commit would come back
+		// empty and DELETE its rows. The routed system of record is right in both
+		// states, so what the sweep must receive is this resolver's answer.
+		const routed = { kind: "sqlite" as const } as never;
+		vi.mocked(resolveReadStorage).mockResolvedValue(routed);
+		await dbBackfillRepo({ repo, dbPath });
+		// One resolution for the pass, not one per checkout.
+		expect(resolveReadStorage).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(collectCommitEvents).mock.calls[0]?.[0].storage).toBe(routed);
 	});
 
 	it("imports in seed mode while the repo has never been fenced for cutover", async () => {
@@ -781,6 +870,46 @@ describe("dbBackfillRepo — summaries sweep (memory tier)", () => {
 		expect(collectSummaryEvents).toHaveBeenCalledTimes(3);
 	});
 
+	it("lands branch attribution from a summary that arrived after the sweep", async () => {
+		// THE ordinary race, and the one the commit tier structurally cannot close:
+		// its cursor hashes HEAD plus `refs/heads` minus Jolli's own refs, so the
+		// orphan branch gaining the memory moves nothing it watches. Pass 2 skips
+		// `collectCommitEvents` entirely — if `commit.summary` only wrote the
+		// `commits.branch` column, the branch axis (which joins `commit_branches`)
+		// would keep reading nothing until an unrelated ref happened to move.
+		vi.mocked(collectCommitEvents).mockResolvedValue([{ ...commitEvent("aaa"), branches: [] }]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await branchesOf("aaa")).toEqual([]);
+
+		vi.mocked(collectCommitEvents).mockClear();
+		vi.mocked(getIndex).mockResolvedValue({ version: 3, entries: [] });
+		vi.mocked(collectSummaryEvents).mockResolvedValue({
+			events: [{ ...summaryEvent, branch: "feature/x" }],
+			complete: true,
+		});
+
+		// Nothing in git moved — only the orphan branch did.
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(collectCommitEvents).not.toHaveBeenCalled();
+		expect(await branchesOf("aaa")).toEqual(["feature/x"]);
+	});
+
+	it("leaves stored attribution alone for a summary that records no branch", async () => {
+		// The absent half of the same replace-when-present contract. Only
+		// `commit.created` may claim "no branch", because only it can tell an
+		// unreadable index from one that does not list the hash; a summary without
+		// a branch knows nothing and must not clear what the sweep established.
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await branchesOf("aaa")).toEqual(["main"]);
+
+		vi.mocked(getIndex).mockResolvedValue({ version: 3, entries: [] });
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [summaryEvent], complete: true });
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await branchesOf("aaa")).toEqual(["main"]);
+	});
+
 	it("announces the sweep only when it is going to run", async () => {
 		// The marker is the caller's evidence that something is worth narrating, so
 		// a skipped sweep has to be silent — announcing "Indexing stored memories…"
@@ -923,8 +1052,8 @@ describe("multiple checkouts of one project (§10.2)", () => {
 		// The regression: the merge wrote `branches` unconditionally, so two omissions
 		// unioned into `[]` — and `[]` is the meaningful claim "no branch reaches this
 		// commit", which deletes every commit_branches row. A repo with two checkouts
-		// and one failed `for-each-ref` (or a MAX_BRANCHES truncation) lost its whole
-		// branch attribution on the next sweep.
+		// where neither could load a summary index lost its whole branch attribution
+		// on the next sweep.
 		const a3 = mkdtempSync(join(tmpdir(), "jolli-wt-a-"));
 		const b3 = mkdtempSync(join(tmpdir(), "jolli-wt-b-"));
 		try {

@@ -34,7 +34,7 @@ import { execGit, getHeadHash } from "../core/GitOps.js";
 import { GitRefStorage, resolveCommittish } from "../core/GitRefStorage.js";
 import { isJolliInternalRef } from "../core/JolliRefs.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
-import { getIndex } from "../core/SummaryStore.js";
+import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
 import {
 	collectCommitEvents,
@@ -372,10 +372,25 @@ function storedCommitRows(
  *  - `committed_at_ms` is written unconditionally, so it is compared even when
  *    every other field matches.
  *  - `branches` is replace-when-present, so a present set must match exactly;
- *    absent (a failed branch scan) means "leave the rows alone".
+ *    absent (no summary index was loaded, whether unreadable or not yet written)
+ *    means "leave the rows alone".
  *  - `files` present is never skipped. It is replace-when-present too, and the
  *    stored file rows are not read here — a commit whose files this pass actually
  *    scanned is by construction a new one, so this costs nothing in practice.
+ *
+ * **Why this function converges, and why it did not used to.** Nothing here was
+ * changed to fix the churn — the fix was making its INPUT stable. Every field
+ * compared above is immutable for a given hash, and `branches` now carries only
+ * the commit's recorded branch, which is a historical fact and equally immutable.
+ * So a commit is projected once and then judged unchanged forever. Previously
+ * `branches` was a reachability union over the 50 newest-committed branches, and
+ * that window reshuffled whenever ANY branch gained a commit: exact set equality
+ * then failed on every pass, re-enqueueing every commit the window reached
+ * (measured: 11,953 per shift on a 350-branch repo). The lesson generalises — if
+ * a `slice(0, N)` result feeds an idempotency comparison, ask whether the window
+ * is stable. `files` was always the right shape here for the same reason: its skip
+ * is keyed on whether `commit_files` rows EXIST (monotonic state), not on
+ * comparing content.
  */
 function unchangedCommitEvent(
 	event: CommitCreatedEvent,
@@ -512,6 +527,35 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 	const orphanTip = opts.storage ? null : await resolveCommittish(ORPHAN_BRANCH, cwd);
 	const orphanStorage = opts.storage ?? (orphanTip ? new GitRefStorage(orphanTip, cwd) : null);
 
+	// The commit tier's read side, threaded explicitly into `collectCommitEvents`
+	// — which reads `index.json` for branch attribution and, given nothing, falls
+	// back to the ambient system of record inside `getIndex`. That fallback
+	// re-resolved the backend once per CHECKOUT and silently ignored the
+	// `--storage` seam, so a test could feed the importer an index the commit tier
+	// never saw.
+	//
+	// One provider for every checkout, resolved at `cwd`, because the index is
+	// per-REPO: it is dual-written identically into each clone, which is the same
+	// reason the summaries cursor and `orphanStorage` are taken from `cwd` alone.
+	// That makes the `branches` union in the merge loop below degenerate — every
+	// checkout now reports the same recorded branch for a hash — without making it
+	// removable; see the ABSENT note there.
+	//
+	// **NOT `orphanStorage`, and that is why it is a second provider.** The pinned
+	// one is the ORPHAN TIP, which a fenced repo has frozen: every commit made
+	// after the fence is absent from that index, and an index that loads without
+	// the entry is the "no recorded branch" answer — `[]`, which the projection
+	// honours by DELETING the commit's rows. Pinning here would wipe attribution
+	// for exactly the commits a cut-over repo still creates. The routed system of
+	// record is right in both states: the orphan branch before cutover,
+	// `SqliteStorage` after (its `synthIndex` rebuilds `index.json` from the
+	// `memories` rows, `branch` included).
+	//
+	// Resolved out here for the same reason `readRepoCutoverFence` is: after
+	// cutover this opens the database, and that must not sit inside the writable
+	// handle's lifetime.
+	const indexStorage = await resolveReadStorage(opts.storage, cwd);
+
 	// Once this repo is fenced for cutover, new memories land in SQLite only —
 	// the orphan branch stops moving. Read before opening the DB, so the async
 	// call cannot sit inside the handle's lifetime.
@@ -598,6 +642,9 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 							// the step this sweep's wall clock is made of. A bootstrap has an
 							// empty set and so still scans everything.
 							knownHashes,
+							// The branch-attribution read. Explicit, and not this checkout's
+							// own ambient fallback — see `indexStorage`.
+							storage: indexStorage,
 						});
 					} catch (err) {
 						// Not fatal for the repo: sessions and memories still import, and the
@@ -613,13 +660,24 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 							merged.set(event.hash, event);
 							continue;
 						}
-						// Union the reachability; keep the first checkout's metadata, which
+						// Union the attribution; keep the first checkout's metadata, which
 						// is identical for a given hash apart from `branches`.
 						//
-						// ABSENT ON EITHER SIDE POISONS THE UNION. A checkout omits
-						// `branches` when its own branch scan was incomplete (a failed
-						// `for-each-ref`/`rev-list`, or a commit only branches past
-						// MAX_BRANCHES reach), and absent means "keep what is stored".
+						// The union is FULLY degenerate now and kept for its ABSENT
+						// handling alone: every checkout reads its attribution from the one
+						// `indexStorage` this pass resolved, so each contributes the same
+						// single recorded branch for a hash. (It used to be argued as
+						// earning its place across two CLONES holding different indexes;
+						// that stopped being true when the provider stopped being
+						// per-checkout, and the index was already treated as per-repo by
+						// the summaries cursor either way.)
+						//
+						// ABSENT ON EITHER SIDE POISONS THE UNION, and that half is NOT
+						// degenerate — one shared provider means the index either loads for
+						// every checkout or for none, but the "for none" case still has to
+						// come out absent. `branches` is omitted when the index could not
+						// be loaded at all (unreadable, or none written yet), and absent
+						// means "keep what is stored".
 						// Coercing that to `[]` and unioning turns two omissions into the
 						// CLAIM "no branch reaches this commit" — which the projection
 						// honours by deleting every `commit_branches` row for the commit —

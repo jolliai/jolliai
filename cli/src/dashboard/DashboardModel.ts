@@ -113,9 +113,26 @@ export interface CommitCreatedEvent {
 	readonly hash: string;
 	readonly branch?: string;
 	/**
-	 * Every branch this commit is currently reachable from. Replaces the whole
-	 * `commit_branches` set for the commit — an empty array is meaningful (the
-	 * commit is unreachable from any tracked ref) and prunes the old rows.
+	 * The branch this commit was COMMITTED ON, as a one-element list — the same
+	 * fact as `branch`, in the shape `commit_branches` stores.
+	 *
+	 * **Not a reachability set.** It was one (the union of a per-ref `git rev-list`
+	 * over the newest branches) and that was the churn bug: the window reshuffled on
+	 * every commit while `unchangedCommitEvent` compares this field for exact set
+	 * equality, so nothing ever converged. See `collectCommitEvents` and the
+	 * `commit_branches` note in `SotSchema` for the measurements and for why the two
+	 * tables are kept.
+	 *
+	 * Still REPLACES the whole stored set, so the absent/empty distinction is
+	 * load-bearing in both directions:
+	 * - `[]` — the summary index was read and records no branch for this commit;
+	 *   PRUNES its rows. The common case (a commit with no memory), and `[]` is
+	 *   truthy, which is what makes the projection's `if (event.branches)` run its
+	 *   DELETE.
+	 * - `undefined` — could not tell, because no summary index was loaded at all;
+	 *   LEAVES the stored rows alone. A read failure and a repo that has no index
+	 *   yet arrive as the same `null` from `getIndex` and are deliberately treated
+	 *   alike — see the collector for why that asymmetry is the safe one.
 	 */
 	readonly branches?: ReadonlyArray<string>;
 	readonly message?: string;

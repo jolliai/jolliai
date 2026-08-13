@@ -11,10 +11,12 @@ window.JD = window.JD || {};
 		var ranged = JD.ranged(model);
 		var range = "range" in o ? o.range : ranged ? ranged.range : undefined;
 		/* Falls back to the dimension the SERVER says it used, not to undefined.
-		   `JD.dimension` is only ever set by a chip click, so before the first click
-		   a deep-linked `?dimension=branch` was absent from every rebuilt URL and
-		   the 30 s poll silently re-asked for the default — the chart axis changed
-		   under the reader. */
+		   `JD.dimension` is only set by the Tokens card's split tabs, so for every
+		   other axis it is undefined — and a deep-linked `?dimension=branch` was
+		   then absent from every rebuilt URL while the 30 s poll silently re-asked
+		   for the default, changing the chart axis under the reader. Deep links are
+		   the ONLY way to reach the branch/ticket/category axes: the server accepts
+		   them (see `parseDimension`) but nothing renders a control for them. */
 		var served = model.stats && model.stats.seriesDimension;
 		var dimension = "dimension" in o ? o.dimension : JD.dimension || served;
 		/* Bounds ride along ONLY with range=custom, so switching to a preset drops

@@ -15,7 +15,7 @@
 
 import { UNTITLED_SESSION } from "../core/FallbackTitle.js";
 import { execGit, getCurrentBranch } from "../core/GitOps.js";
-import { isJolliInternalRef, JOLLI_REFS_EXCLUDE_GLOB } from "../core/JolliRefs.js";
+import { JOLLI_REFS_EXCLUDE_GLOB } from "../core/JolliRefs.js";
 import { extractRepoName, getRemoteUrl, resolveKBPath } from "../core/KBPathResolver.js";
 import { estimateModelCostUsd, PRICES_AS_OF } from "../core/Pricing.js";
 import { resolveSessionTitle } from "../core/SessionTitleResolver.js";
@@ -81,14 +81,6 @@ function toStatsModelUsage(models: ReadonlyArray<ModelTokenUsage>): StatsModelUs
 			};
 		});
 }
-
-/**
- * Ceiling on per-ref `rev-list` fan-out. Reachability refresh unions rev-list
- * output per branch; a repo with hundreds of stale branches would turn that
- * into hundreds of subprocesses for data nobody scopes a dashboard to. The most
- * recently committed branches win.
- */
-const MAX_BRANCHES = 50;
 
 /**
  * Loads raw `SessionInfo`s from every source, without the sidebar's filters.
@@ -389,7 +381,7 @@ const NUMSTAT_ARGS = ["-c", "core.quotePath=false", "log", "--numstat", "--no-re
 
 /**
  * The history this machine owns: every local branch EXCEPT Jolli's own storage
- * refs (see {@link isJolliInternalRef}), plus HEAD so a detached checkout
+ * refs (see `isJolliInternalRef` in `core/JolliRefs`), plus HEAD so a detached checkout
  * (mid-rebase, bisect) is not invisible. Deliberately NOT `--all` — see
  * {@link collectCommitEvents} for why remote-tracking refs and tags are out of
  * scope. Shared by the commit pass and the file-stats pass so the two can never
@@ -525,23 +517,36 @@ export async function collectFilesForCommits(
 }
 
 /**
- * Collects one `commit.created` per commit reachable from any local branch,
- * with the branch-reachability set attached.
+ * Collects one `commit.created` per commit reachable from any local branch, with
+ * the branch it was COMMITTED ON attached.
  *
- * Reachability is computed by unioning per-ref `git rev-list` (bounded by
- * {@link MAX_BRANCHES}) — never `git branch --contains` per commit, which is
- * O(commits × branches) subprocess calls.
+ * **Attribution is a single recorded value, not a reachability set, and that is a
+ * deliberate reversal.** This used to union a per-ref `git rev-list` over the 50
+ * newest-committed branches. Two things were wrong with it. The window
+ * (`--sort=-committerdate` + a cap) reshuffles whenever any branch gains a
+ * commit, and `unchangedCommitEvent` compares `branches` for exact set equality —
+ * so on a repo past the cap every commit the window reached was re-projected on
+ * every pass and never converged (measured on a 350-branch repo: 11,953 commits
+ * re-enqueued per shift, 24.6 MB of duplicate `events_raw` rows). And because the
+ * field is replace-when-present, a branch falling out of the window DELETED its
+ * rows, making stored attribution a moving target — under the one query that
+ * reads it, per-branch token/cost. The recorded branch is a historical fact about
+ * one commit, so it cannot reshuffle, and it is also the better answer for that
+ * query: reachability counted every commit on `main` under every feature branch
+ * based off it, which is why the reader needed an apportioning division at all.
  *
- * Both passes are scoped to {@link LOCAL_HISTORY_ARGS}, the same ref set the
- * attribution loop below walks. `--all` was wrong on both ends of that: it adds
- * remote-tracking refs and tags, so a commit living only on a colleague's fetched
- * branch or an old tag was counted as this machine's work AND displayed with no
- * branch at all, because `refs/heads` could never explain where it came from.
- * Aligning them means "in the dashboard" and "attributable to a local branch"
- * are one statement. The one gap left is {@link MAX_BRANCHES}: a commit reachable
- * only from a branch past the cap is collected but unattributed — left absent, not
- * emitted as `branches: []`, so the replace-when-present projection keeps whatever
- * a fuller earlier pass stored instead of erasing it.
+ * The cost is that "which branches can see this commit NOW" is no longer
+ * answerable. That was checked against the question the dashboard actually asks
+ * (cost per PR, cost per commit) and is not needed for either. `commit_branches`
+ * and `branches` are retained, still written (one row per commit) and still read
+ * by released clients — see the note on those tables in `SotSchema`.
+ *
+ * Both `git log` passes are scoped to {@link LOCAL_HISTORY_ARGS}. `--all` was
+ * wrong here: it adds remote-tracking refs and tags, so a commit living only on a
+ * colleague's fetched branch or an old tag was counted as this machine's work AND
+ * displayed with no branch at all, because `refs/heads` could never explain where
+ * it came from. Scoping to local branches keeps "in the dashboard" and
+ * "attributable to a local branch" one statement.
  *
  * Summary-index metadata (recorded branch, diff stats) enriches commits the
  * memory pipeline saw; plain `git log` fields cover the rest.
@@ -557,9 +562,11 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 	const sinceArgs = opts.sinceMs ? [`--since=${new Date(opts.sinceMs).toISOString()}`] : [];
 	const logResult = await execGit(
 		// `%cI`, not `%aI`. The field this feeds is `committedAtMs`, and every
-		// window this collector works in is a COMMITTER-date window: `--since`
-		// here and on the per-branch `rev-list` below both filter committer date,
-		// and the cursor is derived from the same. Reading the author date instead
+		// window this collector works in is a COMMITTER-date window: `--since` here
+		// filters committer date, and the cursor is derived from the same. (It also
+		// used to hold for the per-branch `rev-list` that computed reachability;
+		// that pass is gone, but the rule is unchanged for the two that remain.)
+		// Reading the author date instead
 		// put every rebased or cherry-picked commit in a day bucket the filter had
 		// already excluded — collected, then invisible in standup, and counted
 		// under whichever day it was originally written rather than the day the
@@ -581,67 +588,32 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 		throw new CommitCollectionFailedError(opts.cwd, logResult.stderr.trim());
 	}
 
-	// Branch reachability: newest-committed branches first, capped.
-	const refsResult = await execGit(
-		// Listed in full and capped below in JS, rather than with git's `--count`.
-		// The cap exists to bound the per-branch `rev-list` fan-out, and Jolli's own
-		// refs are dropped from the list before it is applied — asking git for
-		// `MAX_BRANCHES + 1` and filtering afterwards would spend a slot on a branch
-		// that is never scanned, and the orphan branch is written on every memory so
-		// it sorts FIRST by committerdate essentially always. Listing every local
-		// branch name is one cheap ref walk (`DbBackfill`'s fingerprint already does
-		// exactly that); it is the rev-list per branch that is expensive.
-		["for-each-ref", "refs/heads", "--sort=-committerdate", "--format=%(refname:short)"],
-		opts.cwd,
-	);
-	// Tracked for the same reason `files` is (see below): `branches` is
-	// REPLACE-when-present in the projection, so emitting a partial union is a
-	// claim that the missing branches no longer reach the commit. A failed
-	// `for-each-ref` would have emitted `[]` for every commit and wiped the
-	// repo's whole branch attribution in one pass; a single branch that was
-	// deleted or repacked between the ref list and its own `rev-list` (an
-	// ordinary concurrent rebase) would silently have stripped just that one.
-	// Incomplete means: emit nothing, keep what is stored.
-	let branchScanComplete = refsResult.exitCode === 0;
-	const listed =
-		refsResult.exitCode === 0
-			? refsResult.stdout.split("\n").filter((name) => name && !isJolliInternalRef(name))
-			: [];
-	// A repo past {@link MAX_BRANCHES} is the documented reachability gap, but it
-	// must not be expressed as the CLAIM `branches: []`. The union is
-	// replace-when-present, so emitting an empty array for a commit that only the
-	// branches past the cap reach would delete a correct stored attribution on
-	// every pass. Truncated therefore behaves like a partially failed scan for the
-	// commits nothing listed reaches — see the emit below — while the commits the
-	// listed branches DO reach keep getting their (capped) attribution refreshed.
-	const branchesTruncated = listed.length > MAX_BRANCHES;
-	const branches = branchesTruncated ? listed.slice(0, MAX_BRANCHES) : listed;
-	const branchesByHash = new Map<string, string[]>();
-	for (const branch of branches) {
-		const revs = await execGit(["rev-list", branch, ...sinceArgs], opts.cwd);
-		if (revs.exitCode !== 0) {
-			branchScanComplete = false;
-			continue;
-		}
-		for (const hash of revs.stdout.split("\n")) {
-			if (!hash) continue;
-			const list = branchesByHash.get(hash);
-			if (list) list.push(branch);
-			else branchesByHash.set(hash, [branch]);
-		}
-	}
-
-	if (!branchScanComplete) {
-		log.warn("branch scan incomplete for %s -- leaving stored branch attribution untouched", opts.cwd);
-	} else if (branchesTruncated) {
-		log.warn(
-			"branch list truncated at %d for %s -- commits reached only by older branches keep their stored attribution",
-			MAX_BRANCHES,
-			opts.cwd,
-		);
-	}
-
-	// Summary-index enrichment, keyed by commit hash.
+	// Summary-index enrichment, keyed by commit hash. Also the source of branch
+	// attribution — see the emit below.
+	//
+	// The emit below keys ABSENT-vs-EMPTY on whether this LOADED — `index !== null`
+	// — and not on whether the call threw. A throw is the rare shape: `getIndex`
+	// resolves `null` for every genuine read failure it meets (`FolderStorage`
+	// classifies EACCES/EIO to a warn + `null`, `readFileFromBranch` does the same
+	// for a non-absence `git show` failure, and a malformed `index.json` is caught
+	// at the `JSON.parse`), which is why its own contract says callers must read
+	// null as "nothing to read", NOT as "nothing went wrong". Treating only the
+	// throw as "could not tell" therefore left the failures it names on the
+	// clear-the-rows path: one unreadable index emitted `branches: []` for every
+	// commit and DELETED the repo's whole attribution in a single pass — and
+	// because that pass is otherwise complete, the cursor advances and the next
+	// sweep skips collection, so the blank outlives the failure.
+	//
+	// Folding "absent index" in with "unreadable index" is the safe direction, and
+	// the reason is that the two cases the old comment separated are not
+	// symmetrical. A repo with no index yet keeps whatever an older client's
+	// reachability pass stored, which sounds like the stale-rows bug this change
+	// exists to escape — but the ONE query that reads `commit_branches` inner-joins
+	// `memories` (see `buildSeries`'s branch axis), so rows belonging to a repo with
+	// no summaries are invisible, and they are replaced the moment an index appears:
+	// a commit the index does not mention still gets `[]` below. Wiping live
+	// attribution is visible immediately; keeping unreadable rows is not visible at
+	// all.
 	const index = await getIndex(opts.cwd, opts.storage).catch(() => null);
 	const summaryByHash = new Map(index?.entries.map((e) => [e.commitHash, e]) ?? []);
 
@@ -651,10 +623,13 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 	// `git log --numstat` over the whole history is where this collection's wall
 	// clock goes (6-12 s per checkout, measured), and it is pure waste for a commit
 	// whose file rows are already stored: a commit's diff is immutable, so a hash
-	// already in the database can never need a re-scan. Everything ELSE here stays
-	// whole-history on purpose — the commit list is what the prune is computed
-	// against, and branch reachability changes for OLD commits every time a branch
-	// moves, so neither can be narrowed to the new arrivals.
+	// already in the database can never need a re-scan. The commit LIST stays
+	// whole-history on purpose, and now for exactly one reason: it is what the prune
+	// is computed against, so narrowing it to the new arrivals would read as "every
+	// older commit is gone". (It used to have a second reason — branch reachability
+	// changed for OLD commits whenever any branch moved. Attribution is the
+	// summary's recorded branch now, which never changes for a given hash, so that
+	// half is void; the prune keeps the requirement alive by itself.)
 	//
 	// Omitting `files` for a known commit is not a downgrade: absent means "keep
 	// what is stored" in the projection (the same contract a failed numstat pass
@@ -708,15 +683,29 @@ export async function collectCommitEvents(opts: CollectCommitsOptions): Promise<
 			// The summary's recorded branch is where the commit was actually made;
 			// reachability can only say where it is visible NOW.
 			...(summary?.branch ? { branch: summary.branch } : {}),
-			// Absent (not empty) when the scan above was incomplete — an empty
-			// array here is the meaningful claim "no branch reaches this commit",
-			// and it is only true when every local branch was actually walked. Under
-			// truncation the same reasoning applies per commit: a hit is still a hit,
-			// but "nothing reached it" may just mean the branch that does sits past
-			// the cap, so that case falls back to leaving the stored value alone.
-			...(branchScanComplete && (!branchesTruncated || branchesByHash.has(hash))
-				? { branches: branchesByHash.get(hash) ?? [] }
-				: {}),
+			// `branches` carries the SAME single fact, as a one-element list — not a
+			// reachability union. It used to be the union of a per-branch `rev-list`
+			// over the 50 newest-committed branches, and that window was the bug: it
+			// reshuffles whenever any branch gains a commit, while
+			// `unchangedCommitEvent` compares this field for exact set equality, so
+			// every commit the window reached was re-projected on every pass, forever.
+			// Measured on a 350-branch repo: 11,953 commits re-enqueued per shift and
+			// 24.6 MB of duplicate `events_raw` rows, plus branch attribution that was
+			// a moving target because the field is replace-when-present. The recorded
+			// branch cannot reshuffle — it is a historical fact about one commit — so
+			// the comparison converges after one projection.
+			//
+			// ABSENT vs EMPTY is load-bearing, and `[]` is the common case:
+			//   - no index loaded   → absent → projection keeps whatever is stored
+			//     (the "could not tell" answer — unreadable and not-present alike;
+			//     see the `getIndex` call above for why those cannot be told apart)
+			//   - index loaded, no recorded branch → `[]` → CLEARS the stored rows
+			// Writing absent for the second would leave every such commit carrying its
+			// old N-row reachability set forever, permanently mixed in with the 1-row
+			// commits. Note `[]` is truthy, which is what makes `projectCommit`'s
+			// `if (event.branches)` run its DELETE — do not "simplify" that to a
+			// `.length` test, in either place.
+			...(index ? { branches: summary?.branch ? [summary.branch] : [] } : {}),
 			// Absent (not empty) when the numstat pass failed, so a transient git
 			// failure leaves previously collected file rows in place.
 			...(filesByHash.has(hash) ? { files: filesByHash.get(hash) } : {}),

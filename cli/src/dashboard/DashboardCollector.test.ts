@@ -192,7 +192,7 @@ describe("collectCommitEvents", () => {
 	const SEP = "\u001f";
 	const REC = "\u0001";
 
-	it("combines git log, branch reachability and summary-index enrichment", async () => {
+	it("combines git log with summary-index enrichment, attributing the recorded branch", async () => {
 		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
 			if (args[0] === "log") {
 				return git(
@@ -202,9 +202,6 @@ describe("collectCommitEvents", () => {
 					].join("\n"),
 				);
 			}
-			if (args[0] === "for-each-ref") return git("main\nfeature/x\n");
-			if (args[0] === "rev-list" && args[1] === "main") return git("aaa\nbbb\n");
-			if (args[0] === "rev-list" && args[1] === "feature/x") return git("aaa\n");
 			// The numstat pass is a separate `git log`, prefixed with -c.
 			if (args[0] === "-c") {
 				return git(
@@ -235,7 +232,9 @@ describe("collectCommitEvents", () => {
 			message: "feat: one",
 			authorName: "Foster",
 			branch: "feature/x", // recorded branch from the summary index
-			branches: ["main", "feature/x"],
+			// The SAME fact as `branch`, as a one-element list — not a reachability
+			// union. No `rev-list` is run at all any more.
+			branches: ["feature/x"],
 			filesChanged: 3,
 			insertions: 10,
 			deletions: 2,
@@ -245,9 +244,57 @@ describe("collectCommitEvents", () => {
 			// Binary: git prints "-", so neither count is recorded rather than 0.
 			{ path: "docs/logo.png" },
 		]);
-		expect(events[1]).toMatchObject({ hash: "bbb", branches: ["main"] });
+		// `bbb` has no summary entry, so nothing records a branch for it: `[]`, which
+		// CLEARS any stored attribution rather than leaving a stale one behind.
+		expect(events[1]).toMatchObject({ hash: "bbb", branches: [] });
 		expect(events[1]?.files).toEqual([{ path: "src/a.ts", insertions: 1, deletions: 0 }]);
 		expect(events[1]).not.toHaveProperty("filesChanged");
+	});
+
+	// The churn regression. `for-each-ref --sort=-committerdate` + `slice(0, 50)`
+	// was an UNSTABLE window on a repo past the cap: a commit on ANY branch
+	// reorders it. `unchangedCommitEvent` compares `branches` for exact set
+	// equality, so a window that swaps one member re-projected every commit the
+	// window reached — forever, never converging. Measured on a 350-branch repo:
+	// 11,953 commits re-enqueued per shift and 24.6 MB of duplicate `events_raw`
+	// rows, plus branch attribution that was a moving target because `branches` is
+	// replace-when-present. The fix makes the value depend only on the summary's
+	// recorded branch, which is a historical fact and cannot reshuffle.
+	const collectWithBranchWindow = async (branchList: ReadonlyArray<string>, recordedBranch = "feature/x") => {
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x${SEP}one`);
+			if (args[0] === "for-each-ref") return git(`${branchList.join("\n")}\n`);
+			// Every branch reaches the commit, which is the normal shape: old feature
+			// branches all contain main's history.
+			if (args[0] === "rev-list") return git("aaa\n");
+			return git("");
+		});
+		vi.mocked(getIndex).mockResolvedValue({
+			version: 3,
+			entries: [
+				{
+					commitHash: "aaa",
+					parentCommitHash: null,
+					commitMessage: "one",
+					commitDate: "2026-07-30",
+					branch: recordedBranch,
+					generatedAt: "t",
+				},
+			],
+		});
+		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
+		return events[0]?.branches;
+	};
+
+	it("emits a stable branches value when the branch window reshuffles", async () => {
+		const many = Array.from({ length: 60 }, (_, i) => `b${i}`);
+		const first = await collectWithBranchWindow(many);
+		// One branch enters the window and one falls out — exactly what a single
+		// commit on any branch does to a `-committerdate` sort.
+		const second = await collectWithBranchWindow(["newcomer", ...many.slice(0, 59)]);
+		expect(second).toEqual(first);
+		// And the value is the commit's recorded branch, not a reachability union.
+		expect(first).toEqual(["feature/x"]);
 	});
 
 	it("passes --since through to log and rev-list when given", async () => {
@@ -286,48 +333,49 @@ describe("collectCommitEvents", () => {
 		}
 	});
 
-	it("excludes Jolli's own storage refs from both log passes and from attribution", async () => {
+	it("excludes Jolli's own storage refs from both log passes", async () => {
 		// The orphan branch is a local branch like any other, so every ref-scoped
 		// call here picks it up unless told not to — and it holds one commit PER
 		// MEMORY. Measured on this repo before the exclusion: 1800 of 2468 stored
-		// commits were `Add summary for …`, and `jollimemory/summaries/v3` outranked
-		// `main` in the branch attribution.
+		// commits were `Add summary for …`.
+		//
+		// The attribution half of this test is gone with the reachability scan; the
+		// namespace-vs-prefix rule it also covered now has direct tests in
+		// `core/JolliRefs.test.ts`, next to the function that owns it.
 		const calls: string[][] = [];
 		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
 			calls.push([...args]);
 			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x.com${SEP}one`);
-			// Sorted by committerdate, so the orphan branch — written on every memory
-			// — is realistically the FIRST entry, not an afterthought at the end.
-			if (args[0] === "for-each-ref") return git("jollimemory/summaries/v3\nmain\n");
-			if (args[0] === "rev-list" && args[1] === "main") return git("aaa\n");
 			return git("");
 		});
 		vi.mocked(getIndex).mockResolvedValue(null);
-		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
+		await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
 		// Two ways to get this wrong silently, so both are pinned. `--exclude` is
 		// positional — it applies only to the selector that FOLLOWS it — and its
 		// pattern is relative to that selector, so the `refs/heads/`-prefixed form
 		// matches nothing under `--branches` and is ignored without a word.
-		for (const pass of calls.filter((c) => c[0] === "log" || c[0] === "-c")) {
+		const logPasses = calls.filter((c) => c[0] === "log" || c[0] === "-c");
+		expect(logPasses.length).toBeGreaterThan(0);
+		for (const pass of logPasses) {
 			expect(pass.indexOf("--exclude=jollimemory/*")).toBe(pass.indexOf("--branches") - 1);
 		}
-		// Never walked, so it can never be attributed either.
-		expect(calls.filter((c) => c[0] === "rev-list").map((c) => c[1])).toEqual(["main"]);
-		expect(events[0]?.branches).toEqual(["main"]);
 	});
 
-	it("keeps a branch merely NAMED like the internal namespace", async () => {
-		// Excluded by namespace (`jollimemory/`), not by prefix match — a user's
-		// own `jollimemory-notes` branch is ordinary work and must stay attributed.
+	it("runs no per-branch rev-list at all", async () => {
+		// The 350 subprocesses this replaced were both the cost and the churn: the
+		// window they were driven from reshuffled on every commit. Pinned as a call
+		// shape because a reintroduced `rev-list` would still produce correct-looking
+		// output — it is the instability, not the values, that was wrong.
+		const calls: string[][] = [];
 		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			calls.push([...args]);
 			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x.com${SEP}one`);
-			if (args[0] === "for-each-ref") return git("jollimemory-notes\n");
-			if (args[0] === "rev-list" && args[1] === "jollimemory-notes") return git("aaa\n");
 			return git("");
 		});
 		vi.mocked(getIndex).mockResolvedValue(null);
-		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
-		expect(events[0]?.branches).toEqual(["jollimemory-notes"]);
+		await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
+		expect(calls.filter((c) => c[0] === "rev-list")).toEqual([]);
+		expect(calls.filter((c) => c[0] === "for-each-ref")).toEqual([]);
 	});
 
 	it("scans --numstat only for commits the caller has not stored", async () => {
@@ -435,54 +483,6 @@ describe("collectCommitEvents", () => {
 		expect(numstat).toContain("--branches");
 	});
 
-	// The `MAX_BRANCHES` cap is a documented reachability gap, but it must not be
-	// expressed as the CLAIM `branches: []` — that array is replace-when-present,
-	// so a commit only the branches past the cap reach would have its correct
-	// stored attribution deleted on every pass.
-	it("omits branches for a commit no listed branch reaches when the ref list was truncated", async () => {
-		const listed = Array.from({ length: 51 }, (_, i) => `b${i}`);
-		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
-			if (args[0] === "log") {
-				return git(
-					[
-						`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x${SEP}one`,
-						`bbb${SEP}2026-07-29T08:00:00+08:00${SEP}F${SEP}f@x${SEP}two`,
-					].join("\n"),
-				);
-			}
-			// Listed in full and capped in JS — asking git for one past the cap would
-			// spend that slot on Jolli's own refs, which are filtered out here.
-			if (args[0] === "for-each-ref") {
-				expect(args).not.toContain("--count=51");
-				return git(`${listed.join("\n")}\n`);
-			}
-			if (args[0] === "rev-list" && args[1] === "b0") return git("aaa\n");
-			return git("");
-		});
-		vi.mocked(getIndex).mockResolvedValue(null);
-		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
-		// Reached by a listed branch → its (capped) attribution still refreshes.
-		expect(events[0]).toMatchObject({ hash: "aaa", branches: ["b0"] });
-		// Reached by nothing listed → could be on a branch past the cap, so the
-		// stored value is left alone rather than claimed empty.
-		expect(events[1]).not.toHaveProperty("branches");
-		// Only the branches WITHIN the cap are walked.
-		expect(vi.mocked(execGit).mock.calls.filter((c) => c[0][0] === "rev-list")).toHaveLength(50);
-	});
-
-	it("still emits an empty branches array when the ref list exactly fills the cap", async () => {
-		// 50 listed is not truncation — asking for 51 and getting 50 proves it.
-		const listed = Array.from({ length: 50 }, (_, i) => `b${i}`);
-		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
-			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x${SEP}one`);
-			if (args[0] === "for-each-ref") return git(`${listed.join("\n")}\n`);
-			return git("");
-		});
-		vi.mocked(getIndex).mockResolvedValue(null);
-		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
-		expect(events[0]?.branches).toEqual([]);
-	});
-
 	it("still emits commits when only the numstat pass fails, without a files field", async () => {
 		// The numstat pass is deliberately separate so its failure costs file
 		// detail and nothing else — this is the test that pins that down.
@@ -508,50 +508,78 @@ describe("collectCommitEvents", () => {
 		await expect(collectCommitEvents({ repoIdentity: "r", cwd: "/w" })).rejects.toThrow(/git log failed/);
 	});
 
-	// `branches` is REPLACE-when-present in the projection, so the distinction
-	// this asserts is the whole guard: `[]` claims no branch reaches the commit
-	// (and deletes its rows), `undefined` says "not observed" and leaves them.
-	it("omits branches entirely when a per-branch rev-list failed", async () => {
+	// `branches` is REPLACE-when-present in the projection, so ABSENT vs EMPTY is
+	// the whole guard, and the three next tests are the set that pins it:
+	//   `[]`        → "the index records no branch for this commit" → CLEARS its rows
+	//   `undefined` → "no index loaded, so could not tell"          → LEAVES them
+	// Collapsing them either way is a silent bug in one direction or the other.
+	const logOneCommit = () => {
 		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
 			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x${SEP}feat: one`);
-			if (args[0] === "for-each-ref") return git("main\n");
-			// The per-branch reachability pass fails; the commit survives, but its
-			// stored attribution must not be replaced by a partial union.
-			return gitFail("rev-list exploded");
+			return git("");
 		});
-		vi.mocked(getIndex).mockResolvedValue(null);
+	};
+
+	it("omits branches entirely when the summary index throws", async () => {
+		// "Could not tell", so the stored attribution has to survive it — one
+		// unreadable index must not wipe the repo's branch rows in a single pass.
+		logOneCommit();
+		vi.mocked(getIndex).mockRejectedValue(new Error("index unreadable"));
 		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
 		expect(events).toHaveLength(1);
 		expect(events[0]).not.toHaveProperty("branches");
 	});
 
-	// The worse half of the same bug: one failed ref listing used to emit `[]`
-	// for EVERY commit, wiping the repo's whole branch attribution in one pass.
-	it("omits branches entirely when the ref listing itself failed", async () => {
-		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
-			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x${SEP}feat: one`);
-			if (args[0] === "for-each-ref") return gitFail("boom");
-			return git("");
-		});
+	it("omits branches entirely when the summary index resolves null", async () => {
+		// THE REGRESSION THIS PINS. A resolved `null` used to be read as "readable,
+		// records nothing" and emitted `[]`, which CLEARS every commit_branches row.
+		// But `getIndex` resolves null for every genuine read failure too —
+		// `FolderStorage` classifies EACCES/EIO to a warn + null, `readFileFromBranch`
+		// does the same for a failed `git show`, and a malformed `index.json` is
+		// swallowed at the `JSON.parse` — so a throw is the rare shape and that guard
+		// protected almost nothing. One EACCES wiped the repo's whole attribution, and
+		// since the pass is otherwise complete the cursor advances and the next sweep
+		// skips collection, so the blank outlived the failure.
+		//
+		// Absent is the safe reading of BOTH cases: a repo that has no index yet keeps
+		// rows an older client stored, and those are invisible until an index exists
+		// (the only query reading them inner-joins `memories`), at which point a commit
+		// the index does not mention gets `[]` and clears them anyway.
+		logOneCommit();
 		vi.mocked(getIndex).mockResolvedValue(null);
 		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
-		expect(events).toHaveLength(1);
 		expect(events[0]).not.toHaveProperty("branches");
 	});
 
-	// And the case that must keep emitting `[]`: a clean scan where no branch
-	// reaches the commit is a real answer, and the only thing that can prune a
-	// branch the commit has genuinely left.
-	it("emits an empty branches array when the scan succeeded and found none", async () => {
-		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
-			if (args[0] === "log") return git(`aaa${SEP}2026-07-30T08:00:00+08:00${SEP}F${SEP}f@x${SEP}feat: one`);
-			if (args[0] === "for-each-ref") return git("main\n");
-			if (args[0] === "rev-list") return git("zzz\n"); // reaches some other commit
-			return git("");
+	it("emits an empty branches array for an index entry carrying no branch name", async () => {
+		// The EMPTY half of the pair, and the one that keeps a mid-transition database
+		// converging: an index that loaded is a real answer, so a commit it records
+		// nothing for must clear its old reachability rows rather than keep them.
+		// (The other shape of this — a loaded index that has no entry for the commit
+		// at all — is `bbb` in the first test of this describe.)
+		//
+		// `SummaryIndexEntry.branch` is a required
+		// `string`, so the empty value is the type-legal shape of "recorded nothing";
+		// a legacy on-disk entry written before the field existed reaches the same
+		// falsy path (the type already documents that legacy entries omit fields —
+		// see `parentCommitHash`'s `undefined` case). Both must clear, not preserve.
+		logOneCommit();
+		vi.mocked(getIndex).mockResolvedValue({
+			version: 3,
+			entries: [
+				{
+					commitHash: "aaa",
+					parentCommitHash: null,
+					commitMessage: "feat: one",
+					commitDate: "2026-07-30",
+					branch: "",
+					generatedAt: "t",
+				},
+			],
 		});
-		vi.mocked(getIndex).mockResolvedValue(null);
 		const events = await collectCommitEvents({ repoIdentity: "r", cwd: "/w" });
-		expect(events[0].branches).toEqual([]);
+		expect(events[0]?.branches).toEqual([]);
+		expect(events[0]).not.toHaveProperty("branch");
 	});
 
 	it("skips malformed log lines and survives a missing summary index", async () => {

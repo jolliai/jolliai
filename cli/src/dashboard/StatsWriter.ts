@@ -733,9 +733,16 @@ function projectCommit(db: DashboardDbHandle, event: CommitCreatedEvent): void {
 		event.deletions ?? null,
 	);
 
-	// `branches` is authoritative when present — replacing the set is what prunes
-	// a branch the commit is no longer reachable from. `undefined` means "not
-	// observed this time" and leaves the existing rows alone.
+	// `branches` is authoritative when present — replacing the set is what drops an
+	// attribution the commit no longer carries. `undefined` means "could not tell"
+	// (the collector loaded no summary index) and leaves the existing rows alone.
+	//
+	// The guard MUST stay a plain truthiness test on the array itself: `[]` is
+	// truthy, and that is exactly what lets an empty list reach the DELETE and clear
+	// the rows. Rewriting it as `event.branches?.length` or `.length > 0` looks
+	// equivalent and silently inverts the meaning of `[]` into `undefined`'s —
+	// which, on a database still holding the old N-row reachability sets, leaves
+	// those commits carrying stale attribution forever. See `CommitCreatedEvent.branches`.
 	const commitId = resolveCommitId(db, eventId);
 	if (event.branches) {
 		db.prepare("DELETE FROM commit_branches WHERE commit_id = ?").run(commitId);
@@ -789,6 +796,42 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 		   branch        = COALESCE(excluded.branch, commits.branch),
 		   message       = COALESCE(excluded.message, commits.message)`,
 	).run(commitEventId, repoId, event.hash, event.branch ?? null, event.message ?? null, event.committedAtMs);
+
+	// `commit_branches` too, and NOT just the `commits.branch` column above.
+	//
+	// Attribution is the branch the commit was COMMITTED ON, and its source is
+	// this very summary — so this event carries the whole fact and must project it
+	// into the table the branch axis actually reads (`buildSeries` joins
+	// `commit_branches`; nothing reads `commits.branch` for that axis).
+	//
+	// Writing only the column left a gap no later pass closes on its own. The
+	// commit tier is gated on `checkoutFingerprint`, which hashes HEAD plus
+	// `refs/heads` MINUS Jolli's own refs — so the orphan branch moving under a
+	// late-arriving memory does not move that cursor, `collectCommitEvents` is
+	// skipped, and the commit keeps whatever attribution it had when it was last
+	// swept: `[]` for one whose summary did not exist yet, since an index that
+	// loads WITHOUT the entry is the "no recorded branch" answer. The rows then
+	// stay wrong until some unrelated ref happens to move.
+	// `recordCommitsFromWorker` hides this for the ordinary local commit — it
+	// writes the current branch at drain time — which is exactly why the hole only
+	// shows for the paths that skip it: a live write that failed (and was
+	// swallowed, by contract), a regeneration outside the queue, and a database
+	// whose sweep ran between the commit and its summary.
+	//
+	// Same replace-when-present contract as `commit.created`'s `branches`, and the
+	// absent side is load-bearing in the same way: `branch` is present-gated by
+	// `summaryEventFromCommitSummary`, so a summary recording none leaves the
+	// stored rows ALONE rather than clearing them. Only `commit.created` may say
+	// "no branch reaches this commit", because only it can tell an unreadable
+	// index from one that simply does not list the hash.
+	if (event.branch) {
+		const commitId = resolveCommitId(db, commitEventId);
+		db.prepare("DELETE FROM commit_branches WHERE commit_id = ?").run(commitId);
+		db.prepare(
+			`INSERT INTO commit_branches (commit_id, branch_id) VALUES (?, ?)
+			 ON CONFLICT(commit_id, branch_id) DO NOTHING`,
+		).run(commitId, resolveBranchId(db, repoId, event.branch));
+	}
 
 	if (event.sessionLinks) {
 		const seedSession = db.prepare(

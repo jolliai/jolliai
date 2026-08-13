@@ -10,27 +10,6 @@ window.JD = window.JD || {};
 		return RANGE_SUB[stats.range] || stats.rangeFrom + " → " + stats.rangeTo;
 	}
 
-	/* The mockup's group-by axes. `lockTier: 1` reads the memory-enriched commit
-	   columns; `project` is unlocked here because repo grouping needs no memory. */
-	var GROUPS = [
-		{ key: "model", label: "Model", memoryOnly: false },
-		{ key: "agent", label: "Agent", memoryOnly: false },
-		{ key: "project", label: "Project", memoryOnly: false },
-		{ key: "branch", label: "Branch", memoryOnly: true },
-		{ key: "ticket", label: "Ticket", memoryOnly: true },
-		{ key: "category", label: "Work category", memoryOnly: true },
-	];
-
-	/* Per-axis footnote, quoting the mockup's own wording where it applies. */
-	var AXIS_NOTE = {
-		model: "Token coverage: <b>Claude ✓</b> · Codex, Cursor, Copilot report sessions only until usage parsing lands.",
-		agent: "Sessions and tokens per agent. Cost shown where the transcript reports usage.",
-		project: "Tokens per repository, across every agent.",
-		branch: "A commit reachable from several branches counts on each — the axis answers where spend landed.",
-		ticket: "Commits with no ticket are grouped as <span class=\"mono\">(no ticket)</span>.",
-		category: "Work category is the dominant topic category of each commit's memory.",
-	};
-
 	/* Totals per series key, for the ranked-bar axes. */
 	function rankRows(stats) {
 		/* Prototype-less, same reason as memoryActivityCard's grouping: series keys
@@ -1108,8 +1087,9 @@ window.JD = window.JD || {};
 	var TOK_VIEW_LABEL = { model: "Model", project: "Project" };
 
 	/* Split-by tabs, inside the card and nowhere else. Picking "By model"/"By
-	   repo" re-fetches exactly the way Cost & tokens' own group-by chips do,
-	   because both read `JD.dimension`. */
+	   repo" writes `JD.dimension` and re-fetches, because the axis is a
+	   server-side query. These are the only controls that set it — the generic
+	   group-by chips they used to be described as matching were never rendered. */
 	function tokensViewChips(view) {
 		return (
 			'<div class="chips" role="group" aria-label="Split by" style="margin-top:10px">' +
@@ -1373,15 +1353,6 @@ window.JD = window.JD || {};
 		html += feedCard(model);
 
 		document.getElementById("app").innerHTML = html;
-
-		/* Group-by chips: re-fetch the model along the picked axis (the axis is a
-		   server-side query, so it needs a round trip). */
-		document.querySelectorAll(".chips .chip[data-dim]").forEach((chip) => {
-			chip.onclick = () => {
-				JD.dimension = chip.getAttribute("data-dim");
-				JD.refreshNow(JD.renderPage);
-			};
-		});
 
 		/* Card tabs and the table toggle are pure view state over the SAME model,
 		   so they re-render locally instead of re-querying. */

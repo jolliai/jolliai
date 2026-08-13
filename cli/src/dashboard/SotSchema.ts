@@ -58,6 +58,44 @@ export const REORDER_OFFSET = 1_000_000;
  * Every repo association is `repo_id`, and every composite key and index leads
  * with it. The one exception is `commit_branches`, which carries no repo column
  * at all — see the note on `branches`.
+ *
+ * ## `commit_branches` no longer stores reachability — read this before touching it
+ *
+ * Its in-DDL comment still describes the per-ref `git rev-list` union it was
+ * built for, and that comment is FROZEN: this constant is `MIGRATIONS[0]`, whose
+ * bytes every existing database has recorded and now byte-compares on every
+ * writable open (see `DashboardDb`'s drift check and `MigrationFingerprints`).
+ * Editing a character in there makes every database in the wild refuse to open.
+ * So the current behaviour is documented here, outside the frozen text.
+ *
+ * **What it holds now: exactly ONE row per commit — the branch the commit was
+ * committed on** (`CommitCreatedEvent.branches` as a one-element list, sourced
+ * from the summary's recorded branch in `DashboardCollector`).
+ *
+ * **Why the union was removed.** It came from `for-each-ref --sort=-committerdate`
+ * capped at 50, and that window reshuffles whenever any branch gains a commit —
+ * while `DbBackfill`'s `unchangedCommitEvent` compares `branches` for exact set
+ * equality. On a repo past the cap every commit the window reached was re-projected
+ * on every pass and never converged: measured on a 350-branch repo, 11,953 commits
+ * re-enqueued per shift and 24.6 MB of duplicate `events_raw` rows. Worse, the
+ * field is replace-when-present, so a branch dropping out of the window DELETED its
+ * rows — stored attribution was a moving target under the one query that reads it.
+ * A recorded branch is a historical fact about one commit and cannot reshuffle.
+ *
+ * It is also the better answer for that query (per-PR cost): under reachability
+ * every commit on `main` counted under every feature branch based off it, which is
+ * the only reason the reader needed an apportioning division at all. What is lost
+ * is "which branches can see this commit NOW", checked against what the dashboard
+ * asks (cost per PR, cost per commit) and needed by neither.
+ *
+ * **Why both tables survive with a degenerate use — do NOT drop them.** Released
+ * clients still JOIN them for the per-branch series, and the rule here is to keep
+ * compatibility with shipped clients rather than delete tables or columns. An older
+ * client reading a database this build wrote gets one row per commit, so its
+ * `COUNT(*) OVER (PARTITION BY hash)` divisor becomes 1 and it stops apportioning —
+ * fixed by this change, not degraded. Dropping them (or removing the CREATE, which
+ * is the same thing for every database created afterwards) would make that client
+ * fail with `no such table` instead.
  */
 export const ACTIVITY_DDL = `
 -- ── Metadata ────────────────────────────────────────────────────────────────

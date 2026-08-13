@@ -675,14 +675,20 @@ function buildSeries(
 			.all(fromMs, toMs, ...filter.params) as UsageRow[];
 	} else if (effective === "branch") {
 		const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
-		// A commit reachable from several branches contributes to each — the axis
-		// answers "where did the spend land", not "sum to the exact total". That
-		// licenses duplication ACROSS SERIES, never in the day totals, which is
-		// why the spend is apportioned exactly as the category axis apportions
-		// across topics. `commit_branches` is a per-branch `git rev-list` union,
-		// so every commit on `main` is also listed under every feature branch
-		// based off it: unapportioned, one 10k-token commit on a repo with five
-		// such branches added 60k tokens (and 6x the cost) to the day.
+		// `commit_branches` now holds ONE row per commit — the branch it was
+		// committed on — so this axis answers "what did the work on this branch
+		// cost", which is the per-PR question, and a commit counts once.
+		//
+		// **The apportioning division is kept deliberately even though the divisor
+		// is 1 for anything this build wrote.** It is the transition safeguard: a
+		// database written by an older client still holds that client's per-branch
+		// `git rev-list` UNION (every commit on `main` also listed under every
+		// feature branch based off it) until the first sweep re-projects each commit.
+		// Unapportioned against those rows, one 10k-token commit on a repo with five
+		// such branches would add 60k tokens — and 6x the cost — to the day. Dividing
+		// keeps the reading sane until the rows converge, then costs nothing.
+		// Removing it would make THIS build the one that reads a mid-transition
+		// database wrong while an older client read it correctly.
 		rows = db
 			.prepare(
 				`SELECT c.committed_at_ms AS at_ms, br.name AS key,
