@@ -1,6 +1,15 @@
 # Changelog
 
-<!-- Last synced commit: f1195846 | 2026-08-09 -->
+<!-- Last synced commit: 09554198 | 2026-08-13 -->
+
+## 0.99.12
+
+- **Three more places your references come from** — **Vercel** deployments, **Figma** design files, and **Sentry** issues now appear on your memories, with their own labels and previews.
+- **Conversation titles stay put** — the title is saved with the memory, so the sidebar, the memory details, and the dashboard all show the same one.
+- **Lighter with several AI sessions open** — the MCP server is now shared per checkout instead of started once per session.
+- **AI sessions start faster** — the hook that runs when a session opens no longer waits on `git`.
+- **Daily backups run on their own schedule** — instead of only when something else happened to wake Jolli up.
+- Bug fixes.
 
 ## 0.99.11
 

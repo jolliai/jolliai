@@ -1,6 +1,17 @@
 # Changelog
 
-<!-- Last synced commit: f1195846 | 2026-08-09 -->
+<!-- Last synced commit: 09554198 | 2026-08-13 -->
+
+## 0.99.12
+
+- **Lighter with several AI sessions open** — sessions now share one MCP server per checkout instead of each starting its own.
+- **More in the dashboard** — `jolli dashboard` gains a **Settings** screen, a browsable **Knowledge** view of your wiki, and the knowledge **Graph** in-page. Tool usage now breaks down by agent.
+- **Three more places your references come from** — **Vercel** deployments, **Figma** design files, and **Sentry** issues now show up on your memories. Fifteen sources in total.
+- **Daily backups run on their own schedule** — instead of only when a commit or the dashboard happened to wake Jolli up.
+- **`jolli doctor --schema-log` / `--mark-migration`** — inspect your memory database's schema history, or repair it when a migration record went missing.
+- **AI sessions start faster** — the hook that runs when a session opens no longer waits on `git`.
+- **Per-branch token and cost figures stay put** — each memory now records the branch it was made on, so the numbers stop shifting.
+- Bug fixes.
 
 ## 0.99.11
 

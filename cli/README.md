@@ -25,7 +25,7 @@ Turns your AI coding sessions into structured development documentation attached
 - **MCP server for AI agents** — `jolli mcp` exposes your history to Claude Code (and any MCP-aware agent) so it can search memories, recall a branch, and trace a decision's history without leaving the chat. Registered automatically on `jolli enable`.
 - **Knowledge wiki** — `jolli compile` folds the work scattered across many commits into per-topic pages and a browsable `_wiki/` folder in your Memory Bank, updated automatically after each commit.
 - **Knowledge graph** — `jolli graph` exports the wiki's topics as an interactive, self-contained HTML map of categories, knowledge units, and the typed links between them. Built incrementally alongside the wiki on every commit.
-- **Issue, page & conversation references** — Linear, Jira, GitHub, Notion, Slack, Zoom, Confluence, Asana, and monday.com items mentioned in your AI conversations are captured and attached to the relevant memory, along with context7 library-documentation lookups and Jolli's own memory lookups (`recall` / `search` / `get_decision_timeline` — the question asked is recorded, never the memory that came back). **Claude Code, Codex, and Kimi Code only:** every other supported agent's transcript format discards the tool calls this reads, so references are simply never captured there. Kimi Code covers a subset today — **Linear, GitHub, context7, and Jolli's own lookups**; the remaining sources are recognised by the tool names Claude's first-party connectors use, which a Kimi install does not produce.
+- **Issue, page & conversation references** — Linear, Jira, GitHub, Notion, Slack, Zoom, Confluence, Asana, and monday.com items mentioned in your AI conversations are captured and attached to the relevant memory, along with context7 library-documentation lookups, Vercel deployments, Figma design files, Sentry issues, and Jolli's own memory lookups (`recall` / `search` / `get_decision_timeline` — the question asked is recorded, never the memory that came back). Fifteen sources in all. Vercel, Figma, and Sentry are **track-only** — archived, displayed, and shared like any other reference but never fed to the model that writes the memory, because a failed build or a stacktrace is the *input* to the work and would read as a reason for the change. **Claude Code, Codex, and Kimi Code only:** every other supported agent's transcript format discards the tool calls this reads, so references are simply never captured there. Kimi Code covers a subset today — **Linear, GitHub, context7, Vercel, Figma, Sentry, and Jolli's own lookups**; the remaining sources are recognised by the tool names Claude's first-party connectors use, which a Kimi install does not produce.
 - **Skill usage** — the agent skills entered while doing the work are captured alongside plans, notes, and references, with their token cost and the commit they belong to. **Claude Code, OpenCode, and Kimi Code** expose a real skill tool, so *which* skills ran is observed rather than guessed on all three — but the token figure only comes with it on **Claude Code** and **OpenCode**; Kimi's transcript carries no usage data, so its rows show no token cost. **Codex** has no skill tool at all (its only signal is a shell command reading a `SKILL.md`), so its rows are flagged as heuristic and likewise carry no token figure. Every other supported agent reports nothing, for one of two reasons: Gemini, Antigravity, Cline, and Devin CLI have no skill concept on disk at all, while Cursor and GitHub Copilot CLI do ship skills but leave no record of *entering* one in anything they write to disk.
 - **Per-repo push control** — `jolli push-control` decides whether *this* repo's memories are pushed to a Jolli Space. Capture keeps running locally either way, and memory retained while pushing was off is synced when you turn it back on.
 - **Privacy-first** — transcripts and diff go straight to Anthropic (with your `apiKey`) or via the Jolli LLM proxy (in-memory, never persisted). Raw transcripts are never included when you share a memory to a team Jolli Space; mirroring them into your own personal space is a separate opt-in (`syncTranscripts`), off by default.
@@ -99,7 +99,7 @@ When you use an AI coding agent, Jolli Memory keeps track of your active session
 | **VS Code Copilot Chat** | No hook needed — sessions are discovered automatically by reading the Copilot Chat conversation cache |
 | **Cline** (CLI + VS Code) | No hook needed — sessions are discovered automatically from Cline's local session store (the CLI's `~/.cline/data` plaintext session files and the VS Code extension's task store) |
 | **Devin CLI** | No hook needed — sessions are discovered automatically from Devin's local SQLite database (`~/.local/share/devin/cli/sessions.db`; `%APPDATA%\devin\cli` on Windows), scoped by working directory |
-| **Kimi Code** | No hook needed — sessions are discovered automatically from Kimi Code's local session store (`~/.kimi-code/sessions/`), with references (Linear, GitHub, context7, and Jolli's own lookups) and skill usage extracted from its `wire.jsonl` transcript |
+| **Kimi Code** | No hook needed — sessions are discovered automatically from Kimi Code's local session store (`~/.kimi-code/sessions/`), with references (Linear, GitHub, context7, Vercel, Figma, Sentry, and Jolli's own lookups) and skill usage extracted from its `wire.jsonl` transcript |
 
 ### Git Hooks — generating summaries on commit
 
@@ -416,7 +416,19 @@ jolli doctor
 
 # Auto-fix failures (release stuck lock, reinstall missing hooks)
 jolli doctor --fix
+
+# List the database snapshots you can restore from, then restore one
+jolli doctor --recover
+jolli doctor --recover --from ~/jolli_back/memory-20260813T020000Z-1a2b3c4d.db
+
+# Print the memory database's migration log — what ran, when, and how it went
+jolli doctor --schema-log
+
+# Record one migration as already applied by other means (see --schema-log)
+jolli doctor --mark-migration <name>
 ```
+
+`--schema-log` also flags any migration whose recorded text disagrees with the build you are running. That is a warning, never a refusal: a newer or older database is still opened and written normally. `--mark-migration` exists for the one state that cannot be repaired by re-running — the log lost a row while the change it describes is already in place, so a normal open would try to apply it again and fail. Deleting the database is never the answer; memories rebuild from git, but session usage and recall history have no second copy.
 
 Doctor is deliberately narrow — it only flags conditions that *break* Jolli Memory. Stale-but-harmless data (old sessions, orphan files from amend/squash) is handled by `clean`.
 
@@ -478,6 +490,8 @@ Claude transcripts for now. Requires an API key (same as summary generation). Th
 ### `jolli dashboard`
 
 Starts a private web server on your machine and opens a dashboard with your memories, per-repo stats, and a standup summary. Everything is served locally from your own data — nothing is uploaded.
+
+Alongside the overview it carries a **Memories** list, a **Decisions** view, a **Repositories** view, a **Knowledge** view that browses your knowledge wiki page by page, and a **Graph** view that renders the knowledge map in place (no `jolli graph --export` step needed). Tool-usage rows break down per agent, so you can see which agent made which calls. A **Settings** modal mirrors the editor extensions' five sections — AI Agents, AI Summary, Sync to Jolli, Memory Bank, Others — saved through a single **Apply**; API keys are held server-side and only masked values ever reach the page.
 
 ```bash
 # Start the dashboard and open it in your browser
@@ -550,6 +564,8 @@ Settings are stored globally in `~/.jolli/jollimemory/config.json`. The recommen
 | `antigravityEnabled` | boolean | auto-detect | Enable Antigravity session discovery |
 | `kimiEnabled` | boolean | auto-detect | Enable Kimi Code session discovery |
 | `localFolder` | string | — | Memory Bank root on disk — every memory is dual-written here as Markdown alongside the orphan-branch copy. Set via the editor extensions' Memory Bank Settings tab. |
+| `backupFolder` | string | `~/jolli_back` | Where snapshots of the local memory database go. Deliberately outside `~/.jolli` (a backup must not share fate with the disaster) and independent of `localFolder`. Validated when you set it; if the folder later becomes unreachable — an unplugged drive, say — Jolli warns rather than quietly writing snapshots somewhere else. |
+| `backupRetentionDays` | integer | `20` | How long snapshots are kept. A few of the most recent are always kept regardless of age, and old ones are only removed after a new one has been written and verified. |
 | `excludePatterns` | string[] | — | Glob patterns for file exclusion (set via `jolli configure --set excludePatterns=glob1,glob2`) |
 | `syncTranscripts` | boolean | `false` | When the editor plugin's sync is enabled, also mirror raw conversation transcripts (not just summaries) into the personal vault. Off by default so transcripts stay local unless you opt in. |
 
