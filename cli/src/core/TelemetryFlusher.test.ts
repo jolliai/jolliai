@@ -133,6 +133,51 @@ describe("flushTelemetry", () => {
 		expect(fetchImpl).toHaveBeenCalledTimes(3); // 2 + 2 + 1
 	});
 
+	it("stops issuing POSTs once deadlineMs is exhausted, leaving the rest buffered", async () => {
+		// Three install_id groups so the budget check is exercised at BOTH levels:
+		// group b's inner-loop check flips the exhausted flag, group c is skipped
+		// by the outer-loop check without even slicing a batch.
+		seed(1, "install-a");
+		seed(1, "install-b");
+		seed(1, "install-c");
+		// Each POST outlasts the whole budget. The budget is generous relative to
+		// the gap before the first check so a CPU-starved full run can't burn it
+		// before any POST is attempted, and the POST delay comfortably exceeds it.
+		const fetchImpl = vi.fn<typeof fetch>(
+			() => new Promise((resolve) => setTimeout(() => resolve({ ok: true } as Response), 300)),
+		);
+		const result = await flushTelemetry({ cwd, origin: "https://jolli.ai", fetchImpl, deadlineMs: 200 });
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+		expect(result.sent).toBe(1);
+		expect(result.remaining).toBe(2);
+		// The unsent events stay buffered for the next flush — same contract as a
+		// failed batch, never a drop.
+		expect((await readTelemetryEvents(cwd)).map((e) => e.installId)).toEqual(["install-b", "install-c"]);
+	});
+
+	it("clamps each POST's timeout to the remaining budget", async () => {
+		seed(1);
+		// The fetch resolves only via its abort signal, so the flush can finish in
+		// ~deadline time despite a 10s per-POST timeout — proof the per-POST abort
+		// fired at min(timeoutMs, remaining) rather than at timeoutMs.
+		const fetchImpl = vi.fn<typeof fetch>(
+			(_url, init) =>
+				new Promise((_resolve, reject) => {
+					(init?.signal as AbortSignal | undefined)?.addEventListener("abort", () =>
+						reject(new Error("aborted")),
+					);
+				}),
+		);
+		const result = await flushTelemetry({
+			cwd,
+			origin: "https://jolli.ai",
+			fetchImpl,
+			timeoutMs: 10_000,
+			deadlineMs: 30,
+		});
+		expect(result).toEqual({ sent: 0, remaining: 1 });
+	});
+
 	it("stops on the first failing batch and keeps the un-acked remainder", async () => {
 		seed(5);
 		const fetchImpl = vi

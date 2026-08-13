@@ -114,14 +114,51 @@ describe("CodexPluginBootstrapHook", () => {
 		it("primes telemetry and emits the onboarding-funnel snapshot after repo-hook reconciliation", async () => {
 			await runCodexPluginBootstrap("/repo/subdir");
 
-			expect(mocks.bootstrapTelemetry).toHaveBeenCalledWith({ cwd: "/repo" });
+			expect(mocks.bootstrapTelemetry).toHaveBeenCalledWith(
+				expect.objectContaining({ cwd: "/repo", sessionId: undefined }),
+			);
 			expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledWith({ cwd: "/repo", config: {} });
-			expect(mocks.flushTelemetryNow).toHaveBeenCalledWith("/repo", { timeoutMs: 2_000 });
-			const bootstrapOrder = mocks.bootstrapTelemetry.mock.invocationCallOrder[0];
-			const emitOrder = mocks.maybeEmitOnboardingProgress.mock.invocationCallOrder[0];
-			const flushOrder = mocks.flushTelemetryNow.mock.invocationCallOrder[0];
-			expect(bootstrapOrder).toBeLessThan(emitOrder);
-			expect(emitOrder).toBeLessThan(flushOrder);
+			// Both caps: timeoutMs bounds each POST, deadlineMs bounds the whole
+			// flush — this hook blocks the Codex session start, and a hook the
+			// host kills for overrunning loses its stdout envelope entirely.
+			expect(mocks.flushTelemetryNow).toHaveBeenCalledWith(
+				"/repo",
+				expect.objectContaining({ timeoutMs: 2_000, deadlineMs: 2_000 }),
+			);
+		});
+
+		it("orders telemetry by COMPLETION and holds the return until the overlapped flush resolves", async () => {
+			// invocationCallOrder only records when each call STARTED — a
+			// Promise.all rewrite would pass such an assertion while breaking the
+			// real contract: bootstrap must COMPLETE before the emit can track()
+			// through its context, the emit must COMPLETE before the flush reads
+			// the buffer, and the hook must not return before the flush (started
+			// early, awaited late) resolves.
+			const timeline: Array<string> = [];
+			const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 2));
+			mocks.bootstrapTelemetry.mockImplementation(async () => {
+				await tick();
+				timeline.push("bootstrap:done");
+			});
+			mocks.maybeEmitOnboardingProgress.mockImplementation(async () => {
+				timeline.push("emit:start");
+				await tick();
+				timeline.push("emit:done");
+			});
+			mocks.flushTelemetryNow.mockImplementation(async () => {
+				timeline.push("flush:start");
+				await tick();
+				timeline.push("flush:done");
+			});
+			await runCodexPluginBootstrap("/repo");
+			expect(timeline).toContain("bootstrap:done");
+			expect(timeline).toContain("flush:done");
+			expect(timeline.indexOf("bootstrap:done")).toBeLessThan(timeline.indexOf("emit:start"));
+			expect(timeline.indexOf("emit:done")).toBeLessThan(timeline.indexOf("flush:start"));
+			// The flush is STARTED before the briefing build so the two overlap.
+			expect(mocks.flushTelemetryNow.mock.invocationCallOrder[0]).toBeLessThan(
+				mocks.buildSessionStartContext.mock.invocationCallOrder[0],
+			);
 		});
 
 		// The bare `$jolli` skill ships in the plugin bundle because Codex plugin skill

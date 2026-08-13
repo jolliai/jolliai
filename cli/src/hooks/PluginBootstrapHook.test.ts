@@ -129,17 +129,50 @@ describe("PluginBootstrapHook", () => {
 
 	it("primes telemetry and emits the onboarding-funnel snapshot after repo-hook reconciliation", async () => {
 		await runPluginBootstrap("/repo/subdir");
-		expect(mocks.bootstrapTelemetry).toHaveBeenCalledWith({ cwd: "/repo" });
+		expect(mocks.bootstrapTelemetry).toHaveBeenCalledWith(
+			expect.objectContaining({ cwd: "/repo", sessionId: undefined }),
+		);
 		expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledWith({ cwd: "/repo", config: {} });
-		expect(mocks.flushTelemetryNow).toHaveBeenCalledWith("/repo", { timeoutMs: 2_000 });
-		// bootstrapTelemetry (priming the in-process context) must run before the
-		// funnel snapshot tries to track() through it, which must run before the
-		// one-shot hook flushes and exits.
-		const bootstrapOrder = mocks.bootstrapTelemetry.mock.invocationCallOrder[0];
-		const emitOrder = mocks.maybeEmitOnboardingProgress.mock.invocationCallOrder[0];
-		const flushOrder = mocks.flushTelemetryNow.mock.invocationCallOrder[0];
-		expect(bootstrapOrder).toBeLessThan(emitOrder);
-		expect(emitOrder).toBeLessThan(flushOrder);
+		// Both caps: timeoutMs bounds each POST, deadlineMs bounds the whole
+		// flush — a full buffer is several sequential POSTs, and this hook blocks
+		// the host's session start.
+		expect(mocks.flushTelemetryNow).toHaveBeenCalledWith(
+			"/repo",
+			expect.objectContaining({ timeoutMs: 2_000, deadlineMs: 2_000 }),
+		);
+	});
+
+	it("orders telemetry by COMPLETION and holds the return until the overlapped flush resolves", async () => {
+		// invocationCallOrder only records when each call STARTED — a Promise.all
+		// rewrite would pass such an assertion while breaking the real contract:
+		// bootstrap must COMPLETE before the emit can track() through its context,
+		// the emit must COMPLETE before the flush reads the buffer, and the hook
+		// must not return before the flush (started early, awaited late) resolves.
+		const timeline: Array<string> = [];
+		const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 2));
+		mocks.bootstrapTelemetry.mockImplementation(async () => {
+			await tick();
+			timeline.push("bootstrap:done");
+		});
+		mocks.maybeEmitOnboardingProgress.mockImplementation(async () => {
+			timeline.push("emit:start");
+			await tick();
+			timeline.push("emit:done");
+		});
+		mocks.flushTelemetryNow.mockImplementation(async () => {
+			timeline.push("flush:start");
+			await tick();
+			timeline.push("flush:done");
+		});
+		await runPluginBootstrap("/repo");
+		expect(timeline).toContain("bootstrap:done");
+		expect(timeline).toContain("flush:done");
+		expect(timeline.indexOf("bootstrap:done")).toBeLessThan(timeline.indexOf("emit:start"));
+		expect(timeline.indexOf("emit:done")).toBeLessThan(timeline.indexOf("flush:start"));
+		// The flush is STARTED before the briefing build so the two overlap.
+		expect(mocks.flushTelemetryNow.mock.invocationCallOrder[0]).toBeLessThan(
+			mocks.buildSessionStartContext.mock.invocationCallOrder[0],
+		);
 	});
 
 	it("records the first session without depending on Stop-hook hot reload", async () => {
@@ -151,6 +184,11 @@ describe("PluginBootstrapHook", () => {
 				source: "claude",
 			}),
 			"/repo",
+		);
+		// The hook is the one bootstrapTelemetry caller that actually holds a
+		// session id — forward it so the funnel events carry the session dimension.
+		expect(mocks.bootstrapTelemetry).toHaveBeenCalledWith(
+			expect.objectContaining({ cwd: "/repo", sessionId: "s1" }),
 		);
 	});
 

@@ -47,13 +47,12 @@ import { fileURLToPath } from "node:url";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { execGit, isInsideGitRepo } from "../core/GitOps.js";
 import { withRepoHooksLock } from "../core/Locks.js";
-import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig } from "../core/SessionTracker.js";
-import { bootstrapTelemetry, flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import { readStdin } from "./HookUtils.js";
+import { capturePluginOnboardingSnapshot } from "./PluginBootstrapTelemetry.js";
 import { buildSessionStartContext, ensurePluginDefaultProvider } from "./SessionStartHook.js";
 
 const log = createLogger("CodexPluginBootstrapHook");
@@ -140,17 +139,17 @@ export async function runCodexPluginBootstrap(projectDir: string): Promise<Codex
 		respectManualDisable: true,
 		automatic: true,
 	});
-	// Onboarding-funnel snapshot, on BOTH the success and failure branch — mirrors
-	// PluginBootstrapHook's Claude-side fix. This SessionStart hook is the only
-	// trigger for a codex-plugin install, so without it the surface never emits
-	// onboarding_progressed at all. bootstrapTelemetry primes the in-process context
-	// (this hook never does so otherwise), and flushTelemetryNow sends it before the
-	// process exits, since a one-shot hook gets no later flush tick.
-	await bootstrapTelemetry({ cwd: worktreeRoot });
-	await maybeEmitOnboardingProgress({ cwd: worktreeRoot, config: await loadConfig() });
-	await flushTelemetryNow(worktreeRoot, { timeoutMs: 2_000 });
+	// Onboarding-funnel snapshot, on BOTH the success and failure branch — this
+	// SessionStart hook is the only per-session trigger for the codex-plugin
+	// surface (and it is trust-gated, so /jolli:init's --repo-hooks-only emit can
+	// be the surface's only other one). The bounded flush is started here but
+	// awaited only at each return, so its network wait overlaps the briefing
+	// build. See PluginBootstrapTelemetry for the full rationale (shared with
+	// the Claude hook — the Codex hook input carries no session id).
+	const funnel = await capturePluginOnboardingSnapshot(worktreeRoot);
 	if (!result.success) {
 		log.warn("Codex plugin repo-hook reconciliation failed: %s", result.message);
+		await funnel.flushed;
 		return null;
 	}
 
@@ -182,6 +181,7 @@ export async function runCodexPluginBootstrap(projectDir: string): Promise<Codex
 		log.info("Codex plugin context deferred — repo hook lifecycle lock is busy");
 	}
 
+	await funnel.flushed;
 	return buildCodexBootstrapOutput(context);
 }
 

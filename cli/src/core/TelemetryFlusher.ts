@@ -44,6 +44,19 @@ export interface FlushOptions {
 	readonly fetchImpl?: typeof fetch;
 	readonly timeoutMs?: number;
 	readonly maxBatch?: number;
+	/**
+	 * Total budget for the WHOLE flush, across every batch. `timeoutMs` alone
+	 * bounds only a single POST: against a full buffer (`MAX_EVENTS` = 500,
+	 * `maxBatch` = 100) a caller passing `timeoutMs: 2000` can still wait
+	 * ~5 × 2 s of sequential posts — and more with several install_id groups,
+	 * since a failed group only stops its own remaining batches. Callers on a
+	 * blocking path (the plugin SessionStart bootstraps, JOLLI-1955-style exit
+	 * caps) pass this so the worst case is bounded; once the budget is spent no
+	 * further POST is issued and each in-budget POST's timeout is clamped to the
+	 * time left. Unsent events just stay buffered for the next flush — the same
+	 * contract as a failed batch. Omit for the unbounded legacy behavior.
+	 */
+	readonly deadlineMs?: number;
 }
 
 export interface FlushResult {
@@ -108,13 +121,25 @@ export async function flushTelemetry(opts: FlushOptions): Promise<FlushResult> {
 		else groups.set(e.installId, [e]);
 	}
 
+	const deadlineAt = opts.deadlineMs === undefined ? undefined : Date.now() + opts.deadlineMs;
+	let budgetExhausted = false;
 	const acked: TelemetryEnvelope[] = [];
 	for (const group of groups.values()) {
+		if (budgetExhausted) break;
 		for (let i = 0; i < group.length; i += maxBatch) {
 			const batch = group.slice(i, i + maxBatch);
+			let batchTimeout = timeoutMs;
+			if (deadlineAt !== undefined) {
+				const remaining = deadlineAt - Date.now();
+				if (remaining <= 0) {
+					budgetExhausted = true;
+					break;
+				}
+				batchTimeout = Math.min(timeoutMs, remaining);
+			}
 			// A failed batch stops THIS install_id's remaining batches (the next
 			// would fail the same way) but not the other groups' — continue the loop.
-			if (!(await postBatch(url, batch, authKey, fetchImpl, timeoutMs))) break;
+			if (!(await postBatch(url, batch, authKey, fetchImpl, batchTimeout))) break;
 			acked.push(...batch);
 		}
 	}

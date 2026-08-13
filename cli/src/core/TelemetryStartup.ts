@@ -139,6 +139,13 @@ export interface FlushNowDeps {
 	 * network can't stall the process; omit to use the flusher's default (10s).
 	 */
 	readonly timeoutMs?: number;
+	/**
+	 * Total flush budget, forwarded to `flushTelemetry`. `timeoutMs` bounds each
+	 * POST; a full buffer still flushes as several sequential POSTs, so a caller
+	 * that is blocking something user-visible (the plugin SessionStart
+	 * bootstraps) passes this to bound the whole call. See `FlushOptions`.
+	 */
+	readonly deadlineMs?: number;
 }
 
 /**
@@ -168,6 +175,7 @@ export async function flushTelemetryNow(cwd: string, deps?: FlushNowDeps): Promi
 			jolliApiKey: config.jolliApiKey,
 			fetchImpl: deps?.fetchImpl,
 			timeoutMs: deps?.timeoutMs,
+			deadlineMs: deps?.deadlineMs,
 		});
 	} catch {
 		// Flush is best-effort — never propagate into the worker / exit path.

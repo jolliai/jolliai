@@ -22,6 +22,7 @@ import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
 import { getGlobalConfigDir, loadConfig, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
 import { markSkipExitFlush } from "../core/TelemetryCommandHook.js";
+import { flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
 import { deregisterRepo, registerRepo } from "../dashboard/RepoRegistry.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
@@ -441,6 +442,19 @@ export function registerEnableCommand(program: Command): void {
 						process.exitCode = 1;
 					}
 					reportRepoHooksOnlyWarnings(result.warnings, options.automatic === true);
+					// Onboarding-funnel snapshot, on BOTH the success and failure branch.
+					// This early return never reaches reportEnableResult's tail emit, and
+					// both plugins' /jolli:init run exactly this mode — so without an emit
+					// here the plugins' primary install gesture is a funnel blind spot
+					// (the Codex plugin's SessionStart hook is trust-gated, so this can be
+					// the only trigger that ever fires for that surface). The flush must
+					// be explicit and bounded: markSkipExitFlush() above disarmed the exit
+					// flush for this mode, and neither call writes to stdout, which the
+					// automatic (SessionStart bootstrap) callers need kept byte-clean.
+					// deadlineMs bounds the WHOLE flush — timeoutMs alone is per-POST,
+					// and a full buffer flushes as several sequential POSTs.
+					await maybeEmitOnboardingProgress({ cwd: options.cwd, config: await loadConfig() });
+					await flushTelemetryNow(options.cwd, { timeoutMs: 2_000, deadlineMs: 2_000 });
 					return;
 				}
 

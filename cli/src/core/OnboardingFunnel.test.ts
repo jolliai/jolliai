@@ -5,7 +5,17 @@ import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vite
 
 vi.mock("./GitOps.js", () => ({ isInsideGitRepo: vi.fn() }));
 vi.mock("./LlmClient.js", () => ({ resolveLlmCredentialSource: vi.fn() }));
+// Kept ONLY to prove the heavy probe is never called — the lazy status fallback
+// is the lightweight GitHookInstaller/SummaryStore pair below, not getStatus().
 vi.mock("../install/Installer.js", () => ({ getStatus: vi.fn() }));
+vi.mock("../install/GitHookInstaller.js", () => ({
+	isGitHookInstalled: vi.fn(),
+	isHookSectionInstalled: vi.fn(),
+	POST_REWRITE_MARKER_START: "# >>> JolliMemory post-rewrite hook >>>",
+	PREPARE_MSG_MARKER_START: "# >>> JolliMemory prepare-commit-msg hook >>>",
+	POST_MERGE_MARKER_START: "# >>> JolliMemory post-merge hook >>>",
+}));
+vi.mock("./SummaryStore.js", () => ({ getSummaryCount: vi.fn() }));
 vi.mock("../Logger.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../Logger.js")>();
 	return { ...actual, getJolliMemoryDir: vi.fn() };
@@ -22,17 +32,22 @@ vi.mock("./RepoProfile.js", async (importOriginal) => {
 	return { ...actual, readManualDisableFlagSync: vi.fn() };
 });
 
+import { isGitHookInstalled, isHookSectionInstalled } from "../install/GitHookInstaller.js";
 import { getStatus } from "../install/Installer.js";
 import { getJolliMemoryDir, setManuallyDisabled } from "../Logger.js";
 import { isInsideGitRepo } from "./GitOps.js";
 import { resolveLlmCredentialSource } from "./LlmClient.js";
 import { captureMethodOf, maybeEmitOnboardingProgress, resolveOnboardingFunnel } from "./OnboardingFunnel.js";
 import { readManualDisableFlagSync } from "./RepoProfile.js";
+import { getSummaryCount } from "./SummaryStore.js";
 import { getTelemetryContext, track } from "./Telemetry.js";
 
 const isGit = isInsideGitRepo as Mock;
 const resolveSrc = resolveLlmCredentialSource as Mock;
 const getStatusMock = getStatus as Mock;
+const gitHookMock = isGitHookInstalled as Mock;
+const hookSectionMock = isHookSectionInstalled as Mock;
+const summaryCountMock = getSummaryCount as Mock;
 const jolliDir = getJolliMemoryDir as Mock;
 const trackMock = track as Mock;
 const ctxMock = getTelemetryContext as Mock;
@@ -74,7 +89,7 @@ describe("captureMethodOf", () => {
 });
 
 describe("resolveOnboardingFunnel", () => {
-	it("short-circuits outside a git repo without touching getStatus()", async () => {
+	it("short-circuits outside a git repo without touching any status probe", async () => {
 		isGit.mockResolvedValue(false);
 		resolveSrc.mockReturnValue("anthropic-config");
 		const state = await resolveOnboardingFunnel({ cwd: tmp, config: {} });
@@ -87,9 +102,11 @@ describe("resolveOnboardingFunnel", () => {
 			memoriesBucket: "0",
 		});
 		expect(getStatusMock).not.toHaveBeenCalled();
+		expect(gitHookMock).not.toHaveBeenCalled();
+		expect(summaryCountMock).not.toHaveBeenCalled();
 	});
 
-	it("uses a precomputed status without calling getStatus()", async () => {
+	it("uses a precomputed status without running any probe", async () => {
 		resolveSrc.mockReturnValue("local-agent");
 		const state = await resolveOnboardingFunnel({
 			cwd: tmp,
@@ -105,6 +122,8 @@ describe("resolveOnboardingFunnel", () => {
 			memoriesBucket: "1-5",
 		});
 		expect(getStatusMock).not.toHaveBeenCalled();
+		expect(gitHookMock).not.toHaveBeenCalled();
+		expect(summaryCountMock).not.toHaveBeenCalled();
 	});
 
 	it("reports not-enabled and zero memories for a bare git repo", async () => {
@@ -120,18 +139,36 @@ describe("resolveOnboardingFunnel", () => {
 		expect(state.memoriesBucket).toBe("0");
 	});
 
-	it("lazily computes status via getStatus() when none is provided", async () => {
+	it("lazily computes status via the lightweight probe when none is provided — never getStatus()", async () => {
 		resolveSrc.mockReturnValue("jolli-proxy");
-		getStatusMock.mockResolvedValue({ enabled: true, summaryCount: 50 });
+		gitHookMock.mockResolvedValue(true);
+		hookSectionMock.mockResolvedValue(true);
+		summaryCountMock.mockResolvedValue(50);
 		const state = await resolveOnboardingFunnel({ cwd: tmp, config: {} });
-		expect(getStatusMock).toHaveBeenCalledWith(tmp);
+		expect(gitHookMock).toHaveBeenCalledWith(tmp);
+		expect(summaryCountMock).toHaveBeenCalledWith(tmp);
+		// The heavy probe (host detection, session-store scans, worktree
+		// enumeration) must stay out of the lazy path — some no-status triggers
+		// sit on blocking per-session paths (plugin SessionStart bootstraps).
+		expect(getStatusMock).not.toHaveBeenCalled();
+		expect(state.repoEnabled).toBe(true);
 		expect(state.captureMethod).toBe("jolli");
 		expect(state.memoriesGenerated).toBe(true);
 		expect(state.memoriesBucket).toBe("21-100");
 	});
 
+	it("replicates getStatus()'s enabled derivation: a missing sibling hook section reads as not enabled", async () => {
+		gitHookMock.mockResolvedValue(true);
+		hookSectionMock.mockResolvedValueOnce(true).mockResolvedValue(false);
+		summaryCountMock.mockResolvedValue(0);
+		const state = await resolveOnboardingFunnel({ cwd: tmp, config: {} });
+		expect(state.repoEnabled).toBe(false);
+	});
+
 	it("treats a missing summaryCount as zero", async () => {
-		getStatusMock.mockResolvedValue({ enabled: true });
+		gitHookMock.mockResolvedValue(true);
+		hookSectionMock.mockResolvedValue(true);
+		summaryCountMock.mockResolvedValue(undefined);
 		const state = await resolveOnboardingFunnel({ cwd: tmp, config: {} });
 		expect(state.memoriesGenerated).toBe(false);
 		expect(state.memoriesBucket).toBe("0");

@@ -15,11 +15,9 @@ import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { resolveGitFsLayout } from "../core/GitFsLayout.js";
 import { execGit, isInsideGitRepo } from "../core/GitOps.js";
 import { withRepoHooksLock } from "../core/Locks.js";
-import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
 import { toForwardSlash } from "../core/PathUtils.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig, saveSession } from "../core/SessionTracker.js";
-import { bootstrapTelemetry, flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { getClaudeAgentHookHealth } from "../install/ClaudeHookInstaller.js";
 import { addGitExcludePaths } from "../install/GitExclude.js";
 import { install, uninstall } from "../install/Installer.js";
@@ -31,6 +29,7 @@ import {
 } from "../install/SkillInstaller.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import { readStdin } from "./HookUtils.js";
+import { capturePluginOnboardingSnapshot } from "./PluginBootstrapTelemetry.js";
 import { buildSessionStartContext, ensurePluginDefaultProvider } from "./SessionStartHook.js";
 
 const log = createLogger("PluginBootstrapHook");
@@ -157,17 +156,15 @@ export async function runPluginBootstrap(
 		respectManualDisable: true,
 		automatic: true,
 	});
-	// Onboarding-funnel snapshot, on BOTH the success and failure branch (mirrors
-	// EnableCommand's report tail) — this SessionStart hook is the only trigger for a
-	// claude-plugin install, so without it the surface never emits onboarding_progressed
-	// at all. bootstrapTelemetry primes the in-process context (this hook never does so
-	// otherwise: it only flushes what Cli.js already buffered), and flushTelemetryNow
-	// sends it before the process exits, since a one-shot hook gets no later flush tick.
-	await bootstrapTelemetry({ cwd: worktreeRoot });
-	await maybeEmitOnboardingProgress({ cwd: worktreeRoot, config: await loadConfig() });
-	await flushTelemetryNow(worktreeRoot, { timeoutMs: 2_000 });
+	// Onboarding-funnel snapshot, on BOTH the success and failure branch — this
+	// SessionStart hook is the only per-session trigger for the claude-plugin
+	// surface. The bounded flush is started here but awaited only at each return,
+	// so its network wait overlaps the briefing build instead of delaying it.
+	// See PluginBootstrapTelemetry for the full rationale (shared with Codex).
+	const funnel = await capturePluginOnboardingSnapshot(worktreeRoot, session?.sessionId);
 	if (!result.success) {
 		log.warn("Plugin repo-hook reconciliation failed: %s", result.message);
+		await funnel.flushed;
 		return buildPluginBootstrapOutput(reloadSkills, null);
 	}
 
@@ -191,6 +188,7 @@ export async function runPluginBootstrap(
 		log.info("Plugin context deferred — repo hook lifecycle lock is busy");
 	}
 
+	await funnel.flushed;
 	return buildPluginBootstrapOutput(reloadSkills, context);
 }
 

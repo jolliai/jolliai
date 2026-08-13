@@ -43,6 +43,8 @@ const h = vi.hoisted(() => ({
 	loadConfigFromDir: vi.fn(),
 	saveConfigScoped: vi.fn(),
 	track: vi.fn(),
+	maybeEmitOnboardingProgress: vi.fn(),
+	flushTelemetryNow: vi.fn(),
 	triggerPendingPushRetry: vi.fn(),
 	isValidSourceTag: vi.fn(),
 	install: vi.fn(),
@@ -72,6 +74,8 @@ vi.mock("../core/SessionTracker.js", () => ({
 }));
 vi.mock("../core/Telemetry.js", () => ({ track: h.track }));
 vi.mock("../core/TelemetryCommandHook.js", () => ({ markSkipExitFlush: vi.fn() }));
+vi.mock("../core/OnboardingFunnel.js", () => ({ maybeEmitOnboardingProgress: h.maybeEmitOnboardingProgress }));
+vi.mock("../core/TelemetryStartup.js", () => ({ flushTelemetryNow: h.flushTelemetryNow }));
 vi.mock("../hooks/PushCompensation.js", () => ({ triggerPendingPushRetry: h.triggerPendingPushRetry }));
 vi.mock("../install/DistPathResolver.js", () => ({ isValidSourceTag: h.isValidSourceTag }));
 vi.mock("../install/Installer.js", () => ({ install: h.install, uninstall: h.uninstall }));
@@ -592,5 +596,59 @@ describe("EnableCommand — dashboard registration and history import", () => {
 
 		expect(process.exitCode ?? 0).toBe(0);
 		expect(h.uninstall).toHaveBeenCalled();
+	});
+});
+
+// ─── Onboarding funnel on the repo-hooks-only early return ─────────────────
+//
+// This branch returns before reportEnableResult's tail emit, and both plugins'
+// /jolli:init run exactly this mode — so it must carry its own snapshot, or the
+// plugins' primary install gesture is a funnel blind spot (the Codex plugin's
+// SessionStart hook is trust-gated, so this can be that surface's only trigger).
+
+describe("EnableCommand — repo-hooks-only onboarding funnel", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		h.resolveProjectDir.mockReturnValue("/repo");
+		h.isLocalAgentChild.mockReturnValue(false);
+		h.loadConfig.mockResolvedValue({});
+		h.install.mockResolvedValue({ success: true, message: "ok", warnings: [] });
+	});
+
+	afterEach(() => {
+		process.exitCode = undefined;
+		vi.restoreAllMocks();
+	});
+
+	async function runRepoHooksOnly(): Promise<void> {
+		const program = new Command();
+		registerEnableCommand(program);
+		await program.parseAsync(["node", "jolli", "enable", "--cwd", "/repo", "--repo-hooks-only"]);
+	}
+
+	it("emits the funnel snapshot and then explicitly flushes on success", async () => {
+		await runRepoHooksOnly();
+
+		expect(h.maybeEmitOnboardingProgress).toHaveBeenCalledTimes(1);
+		expect(h.maybeEmitOnboardingProgress).toHaveBeenCalledWith({ cwd: "/repo", config: {} });
+		// markSkipExitFlush() disarms the CLI's exit flush for this mode, so the
+		// emit must be followed by its own bounded flush or the event just sits
+		// in the on-disk buffer until some unrelated command happens to run.
+		expect(h.flushTelemetryNow).toHaveBeenCalledWith("/repo", { timeoutMs: 2_000, deadlineMs: 2_000 });
+		const emitOrder = h.maybeEmitOnboardingProgress.mock.invocationCallOrder[0];
+		const flushOrder = h.flushTelemetryNow.mock.invocationCallOrder[0];
+		expect(emitOrder).toBeLessThan(flushOrder);
+	});
+
+	it("emits on the failure branch too — a reconciliation that fails is exactly the drop-off the funnel observes", async () => {
+		h.install.mockResolvedValue({ success: false, message: "boom", warnings: [] });
+
+		await runRepoHooksOnly();
+
+		expect(process.exitCode).toBe(1);
+		expect(h.maybeEmitOnboardingProgress).toHaveBeenCalledWith({ cwd: "/repo", config: {} });
+		expect(h.flushTelemetryNow).toHaveBeenCalledWith("/repo", { timeoutMs: 2_000, deadlineMs: 2_000 });
 	});
 });

@@ -99,6 +99,31 @@ export function captureMethodOf(config: CaptureConfig): CaptureMethod {
 /** The status fields the funnel reads. Accepted precomputed so trigger sites that already ran `getStatus()` don't pay for it twice. */
 type FunnelStatus = Pick<StatusInfo, "enabled" | "summaryCount">;
 
+/**
+ * The lazy fallback for trigger sites that hold no precomputed status: reads
+ * ONLY the two fields the snapshot uses. This used to be a full `getStatus()`,
+ * which probes every AI host, scans session stores and enumerates worktrees —
+ * several times the cost of these two reads — and some no-status triggers sit
+ * on blocking per-session paths (the plugin SessionStart bootstraps), where
+ * `install(..., { repoHooksOnly })` deliberately skips exactly those host
+ * probes to stay fast. `enabled` replicates `getStatus()`'s own derivation
+ * (the post-commit hook plus its three sibling sections), so swapping the
+ * fallback cannot shift the dedup-ledger signature and trigger a spurious
+ * re-emit. Lazy imports break the static Installer ⇆ OnboardingFunnel cycle.
+ */
+async function resolveFunnelStatusLight(cwd: string): Promise<FunnelStatus> {
+	const [gitHooks, { getSummaryCount }] = await Promise.all([
+		import("../install/GitHookInstaller.js"),
+		import("./SummaryStore.js"),
+	]);
+	const enabled =
+		(await gitHooks.isGitHookInstalled(cwd)) &&
+		(await gitHooks.isHookSectionInstalled(cwd, "post-rewrite", gitHooks.POST_REWRITE_MARKER_START)) &&
+		(await gitHooks.isHookSectionInstalled(cwd, "prepare-commit-msg", gitHooks.PREPARE_MSG_MARKER_START)) &&
+		(await gitHooks.isHookSectionInstalled(cwd, "post-merge", gitHooks.POST_MERGE_MARKER_START));
+	return { enabled, summaryCount: await getSummaryCount(cwd) };
+}
+
 export interface ResolveFunnelOptions {
 	/** Repo context to snapshot. */
 	readonly cwd: string;
@@ -110,10 +135,10 @@ export interface ResolveFunnelOptions {
 
 /**
  * Compute the onboarding snapshot for a repo context. **Rejects** if the
- * underlying `isInsideGitRepo` / `getStatus` calls fail — the caller
+ * underlying `isInsideGitRepo` / status calls fail — the caller
  * (`maybeEmitOnboardingProgress`) is where the swallow-and-continue guard lives,
  * so telemetry never breaks the command. When the cwd is not a git repo we
- * short-circuit — no hooks, no summaries — and never touch `getStatus()`.
+ * short-circuit — no hooks, no summaries — and never touch the status probe.
  */
 export async function resolveOnboardingFunnel(opts: ResolveFunnelOptions): Promise<OnboardingFunnelState> {
 	const captureMethod = captureMethodOf(opts.config);
@@ -129,12 +154,7 @@ export async function resolveOnboardingFunnel(opts: ResolveFunnelOptions): Promi
 			memoriesBucket: "0",
 		};
 	}
-	let status = opts.status;
-	if (!status) {
-		// Lazy import breaks the static Installer ⇆ OnboardingFunnel cycle.
-		const { getStatus } = await import("../install/Installer.js");
-		status = await getStatus(opts.cwd);
-	}
+	const status = opts.status ?? (await resolveFunnelStatusLight(opts.cwd));
 	const summaryCount = status.summaryCount ?? 0;
 	return {
 		inGitRepo: true,

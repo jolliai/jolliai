@@ -11,7 +11,7 @@ collected — generated from the event registry the code actually uses.
 ## What we collect
 
 - A random per-machine identifier (`installId`) and the surface (`cli`,
-  `vscode`, or `intellij`) + version.
+  `vscode`, `intellij`, `claude-plugin`, or `codex-plugin`) + version.
 - Coarse environment facts: OS, architecture, runtime version, and which Jolli
   environment your client is pointed at (`local` / `dev` / `preview` / `prod`).
 - The events listed below, each with a small bag of **bucketed or boolean**
