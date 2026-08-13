@@ -14,11 +14,13 @@ The CHANGES section of the JolliMemory tool window — a per-row list of working
 - The in-memory selection that is the input to AI commit (the panel's checkboxes own this state; nothing else does).
 - The auto-refresh sources: working-tree changes outside `.git/`, and IDE-side git repository changes (commit, branch switch, index update).
 - The single-click opens-diff behavior, with three branches by status: side-by-side `HEAD` vs working tree, working-tree-only open, and `HEAD`-content read-only view.
-- The hover-only discard action and its three-branch destructive semantics.
+- The hover-only discard action: the unsaved-editor flush it performs first, the read-only query that words its confirmation, the failure dialog, and the virtual-filesystem refresh it drives afterwards. The dispatch itself — which of the unmerged / renamed / added / untracked / staged-and-worktree / worktree-only operations a path needs — is **not** decided here; the panel sends paths and nothing else.
+- The removal of the panel's multi-file discard: the header action group is now empty.
 - The "no changes" empty state and the disabled-project / initializing placeholders.
 - Refresh debouncing and stale-result discard via a monotonic version counter.
 
 **Out of scope:**
+- The discard rule set itself — the one status read every requested path is resolved against, the classification order, the per-path operations, the eight outcome actions and their success/failure pairing, and the read-only preview that answers whether a discard deletes the file. Owned by the working-tree-file-discard topic; the panel is a caller.
 - The AI-commit flow itself (how selected files are staged and a commit message generated) — separate spec.
 - The exclusion-pattern filter that some surfaces use to hide files — not enforced in this panel; every porcelain row is shown.
 - The Branch / Plans / Memories / Commits sections of the tool window.
@@ -149,20 +151,21 @@ The checkbox is excluded from this click handler (clicking the checkbox toggles 
 
 ### Discard
 
-Hovering a row reveals a discard glyph at the right end of the row. Clicking it opens a confirm dialog whose verb depends on the status:
+Hovering a row reveals a discard glyph at the right end of the row (a right-click menu item does the same thing). **The panel no longer decides what a discard does.** It sends the row's worktree-root-relative path — and nothing else, no status letter, no porcelain columns — to the shared discard rule set, which resolves that path against its own status read and reports one outcome back. The panel's own responsibilities are the four steps below.
 
-| Status      | Confirmation verb                          |
-| ----------- | ------------------------------------------ |
-| `??`        | "Are you sure you want to delete `<path>`?" |
-| Others      | "Are you sure you want to discard changes to `<path>`?" |
+**1. Word the confirmation from a read-only query, off the UI thread.** The click does not open a dialog directly. It first hops to a background thread, resolves the worktree root, and asks the shared **read-only preview** whether discarding this path *deletes* the file, then hops back to the UI thread to open the dialog. The verb is "delete" when it does and "discard changes to" when it does not; the dialog is a yes/no warning naming the path and stating the action cannot be undone.
 
-On confirm, the discard branches by status:
+The collapsed one-letter heuristic the panel still carries — untracked, index-added, renamed **or copied** deletes; everything else restores — survives **only as the fallback for a query that throws**. That is four things: a genuine transport or parse failure, an **unreadable** response, the host process being down, and no runtime available. It is **not** the fallback for "any failure": a failed status read, a blank path, a path with nothing pending, and a response that parsed but carried no answer list or the wrong number of entries all resolve to "does not delete" — the milder verb — **without raising**, and so does a project with no resolvable worktree root, which never reaches the query at all. So the heuristic fires less often than the code's own comment implies, but an unreadable answer is on the throwing side of that line, not the quiet side: a body that cannot be parsed is rejected before the adapter that would have shrugged it off ever sees it.
 
-- `??` (untracked): **this arm is now unreachable.** The discard code still contains a `??`→delete branch, but the changed-files source now hands the panel a single-character `?` status for untracked files (never the two-character `??`), so this branch never matches. An untracked file instead falls through to the *all others* branch below and is run through `git checkout HEAD -- <path>`, which is a **no-op** for a file that was never committed — so the untracked file is **not** deleted. (Bug: untracked discard silently does nothing.)
-- `A` (staged-new): unstage with `git reset HEAD -- <path>`, then delete from disk.
-- All others (`M`, `D`, `R`, `C`, `U`, and the single-character `?` an untracked file actually arrives as): restore via `git checkout HEAD -- <path>`.
+**Notable:** the heuristic is wrong only for a conflicted row, and unavoidably so — this panel's rows come from the IDE's change tracker, whose change types have no conflicted case at all, so the raw porcelain columns are not recoverable here under any spelling. A staged deletion (which discard *restores*) and the conflicts whose file it *removes* all arrive as the same letter.
 
-A refresh is triggered after the discard completes.
+**2. Flush this path's unsaved editor buffer, on the UI thread, after confirmation and before any git call.** The row list is built from the IDE's change tracker, which deliberately reports a file as changed while its edits live only in the editor's document; the rule set resolves every path against a status read, which cannot see those. Without the flush the discard comes back "already in the requested state" **with success** — the user confirms an irreversible action, nothing happens, and nothing is shown anywhere. Only the requested path is flushed: a save-everything call would write every other unsaved editor in the project to disk as a side effect of discarding one file.
+
+**3. Report a failure.** The panel branches on the outcome's success **flag**, never on whether its error text is non-empty (the text is nullable, so an empty-string test would drop any failure arriving without one), substitutes a generic reason when it is absent, and shows a modal error dialog naming the path and the reason. Previously nothing was reported at all. A project with no resolvable worktree root is itself reported this way, and that path returns before step 4.
+
+**4. Refresh the virtual filesystem for every touched path, then re-read.** Synchronously and recursively, over the requested path **plus** every additional path the outcome reported back (distinct) — a reverted rename also restores its **original** path, which the panel cannot derive. This happens **whether or not the discard failed**: a partial failure still changed something. Only then does the panel re-read the working tree. Without the refresh the row survives its own successful discard, because the change tracker is built from the virtual filesystem and the rule set changed the files behind the IDE's back — and the periodic poll does not rescue it, because that poll short-circuits on an unchanged signature computed from the same stale tracker.
+
+**The panel has no multi-file discard.** Its discard-selected-files action was removed, and its file-header action group is present but **empty** — deliberately, to match the editor host's file header, where discard is likewise a per-row hover action only.
 
 ### Hover detection
 
@@ -205,8 +208,17 @@ The toggle does not refresh the underlying list; it only flips checkbox states. 
   open diff per status branch
 
 [user clicks discard glyph]
-  confirm dialog (verb depends on status)
-  on confirm: discard per status branch; refresh()
+  background: resolve worktree root; ask the read-only preview "does this delete?"
+              no root → "does not delete" (the query is never asked)
+              on throw (transport / parse failure, unreadable body, host down,
+                        no runtime) → fall back to the collapsed-letter heuristic
+              parsed but unusable body → "does not delete", no raise
+  UI thread: confirm dialog ("delete" vs "discard changes to")
+  on confirm, UI thread: flush THIS path's unsaved editor buffer to disk
+  background: send the path (only the path) to the shared discard rule set
+              first failing outcome → modal error dialog (branch on the flag, not the text)
+              refresh the virtual filesystem for every touched path (requested +
+              additional, distinct) — on failure too — then re-read the working tree
 
 [user toggles checkbox]
   panel-local checkbox state flips
@@ -238,8 +250,12 @@ The toggle does not refresh the underlying list; it only flips checkbox states. 
 - **The disabled placeholder is the same copy the sibling memory panels use.** Its two-line text points the user at the Status panel; it is distinct from the initializing copy so a not-enabled repository does not look like a slow load.
 - **Single-click on a row opens a diff; the row has no double-click meaning.** Diffs open immediately on the first click. Clicks on the checkbox or discard glyph are excluded from this handler.
 - **Diff content for the working-tree side is sourced from VFS, not from the file on disk.** This is what lets the diff reflect unsaved edits in the IDE's document model and use the right encoding / line separators.
-- **The discard dialog wording is destructive for `??` and `A` and corrective for the others.** This is intentional — for untracked / staged-new files there is no `HEAD` version to fall back to, so the right verb is "delete"; for the others the verb is "discard".
-- **The hover discard glyph is the panel's only inline destructive action.** The status badge is non-interactive (tooltip-only); the filename is non-interactive (clicking it opens the diff, like the row).
+- **The discard wording comes from a query, not from a status letter, and destructive wording covers more cases than untracked and staged-new.** A **rename** revert deletes the new path (the content returns under the original name), a **copy** revert deletes the copy, and a **conflicted** row's file is deleted whenever the committed tree has no version of it. Both this panel and the editor host had previously shipped the letter rule wrong in opposite directions — this one omitted both renamed and copied — telling the user the file would stay while the button removed it. The letter rule survives only as the fallback for a preview query that *throws*.
+- **The panel decides nothing about what a discard does.** It sends a path. The classification (unmerged first, then renamed, added/copied, untracked, staged-and-worktree, worktree-only) and the operations belong to the shared rule set, precisely because a host-side restatement of them fails silently — nothing on the wire between the two disagrees when they do.
+- **The old per-status dispatch is gone, and with it the untracked bug.** The panel used to unstage-then-delete an index-added file and run everything else through a restore-from-the-committed-tree, which for an untracked file is a no-op — so untracked discard silently did nothing. **The wording was broken by the same mismatch**: both the dispatch's untracked arm and the confirmation table's untracked row matched the *two-character* untracked code, while the row source has always handed the panel a single character, so an untracked file also got the corrective "discard changes to" wording instead of the destructive one. Neither the arm nor that row exists any more, the untracked-deletes rule now covers both spellings in the fallback heuristic, and the git wrapper carries no discard helper at all.
+- **The unsaved-editor flush is what makes discard work here at all**, and is scoped to the clicked path. The row list reports a file as changed while its edits live only in the editor; the rule set resolves paths against a status read that cannot see those, and answers "already in the requested state" **with success** — the exact shape of a confirmed irreversible action that does nothing.
+- **The post-discard refresh runs on failure too, and covers paths the user never clicked.** A reverted rename restores its original path, which the panel cannot derive; the outcome reports it, and it is reported even when the revert failed, because the revert's first git call may have landed.
+- **The hover discard glyph is the panel's only inline destructive action, and the panel's only discard at all.** The status badge is non-interactive (tooltip-only); the filename is non-interactive (clicking it opens the diff, like the row); the file-header action group is empty.
 - **Toggle-select-all uses an asymmetric rule.** It checks all when any are unchecked; it does not require "all checked" to switch to "all unchecked". This mirrors a checkbox tri-state where the "off" state requires unanimous unchecked.
 
 ## Shared Behavior
@@ -247,7 +263,10 @@ The toggle does not refresh the underlying list; it only flips checkbox states. 
 - **Project status surface** — feeds the `enabled` flag the panel keys its placeholders on.
 - **IDE change-list manager** — the panel's primary data source, and the reason unsaved edits are visible; also the source of the change-set notifications that let the fixed poll act as a backstop rather than the main trigger.
 - **Project service "list changed files" call** — the panel's fallback data source, still a native in-process porcelain read.
-- **Git operations bridge** — runs `git checkout`, `git reset`, and `git show <ref>:<path>` for the discard and diff branches.
+- **Git operations bridge** — runs `git show <ref>:<path>` for the diff branches. **Discard does not go through it at all**: it carries no checkout, reset or clean helper, and the discard path reaches the shared rule set instead.
+- **Working-tree file discard rule set** — the owner of the status read, the classification order, the per-path operations, the outcome actions and the read-only wording query. This panel supplies paths and consumes outcomes.
+- **Worktree-root resolution** — the root every path sent from here is relative to, and the base of every join behind the virtual-filesystem refresh. Resolved once at project initialisation by a git query and cached; the per-call lookup reads that cache and falls back to the project directory.
+- **Unsaved-editor flush** — the UI-thread write-out of the clicked path's editor buffer, performed after confirmation and before any git call.
 - **IDE diff viewer** — the destination for click-on-row in `M` / `R` / `D` cases.
 - **IDE file editor** — the destination for click-on-row in `A` / `??` cases.
 - **AI-commit flow** — the consumer of the panel's selection (selected files become the staged set).

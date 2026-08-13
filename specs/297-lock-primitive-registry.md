@@ -9,14 +9,17 @@ Every mutually-exclusive critical section in the product is guarded by an adviso
 **In scope:**
 
 - The shared on-disk convention every lock uses: the ownership record, the freshness signal, the staleness ceiling, early reclamation of a dead owner's lock, and ownership-checked release.
-- The three location scopes a lock can have (per-worktree, shared across every worktree of one repository, machine-global for one user) and what each therefore serialises.
+- The location scopes a lock can have (per-worktree, shared across every worktree of one repository, machine-global for one user, and per-configured-vault filed in the machine-global directory) and what each therefore serialises.
 - A complete catalogue of the product's locks: file name, location scope, default wait budget, and failure discipline.
+- The one lock that has **two callers with opposite busy disciplines against the same budget**, which is the axis this topic owns.
+- The one lock that does not use the shared convention at all, and what it drops by re-implementing it.
 - The **strict** versus **best-effort** failure discipline, which locks have which, and why the distinction is load-bearing rather than stylistic.
 - Per-lock constraints that cannot be expressed by the primitive itself: the pair that must never be held simultaneously, the non-re-entrancy rule and the **one lock that is now re-entrant** (together with the call-chain registry that makes it so, and what breaks in both directions when a caller takes that lock without registering), the one lock whose best-effort form now has no callers, and the one **documented writer that bypasses its lock entirely**.
 
 **Out of scope (boundaries):**
 
-- What each guarded critical section actually does — those belong to their own topics (queue draining, orphan-branch writes, Memory Bank sync rounds, the plan/note registry, the pending-push ledger, the repository profile, hook installation, the runtime registry).
+- What each guarded critical section actually does — those belong to their own topics (queue draining, orphan-branch writes, Memory Bank sync rounds, the folder-tree tidy-up, the plan/note registry, the pending-push ledger, the repository profile, hook installation, the runtime registry, the machine-global repository registry, the dashboard launcher).
+- The per-vault write lock's path canonicalisation, acquired-handle interface, heartbeat cadence, hold windows, cross-repository waiter registry and diagnostic probe. Only its catalogue row and its two-discipline anomaly are described here.
 - Coordination artifacts that are **not** mutual-exclusion locks even though they sit beside these files and share the ownership-record convention: the display-only ingest phase marker and the per-commit capture-progress ownership file that a progress watcher probes to detect a dead producer. They are described where their consumers are.
 - In-process synchronisation of any kind. Every lock here is a filesystem artifact, so it serialises separate processes as well as separate asynchronous flows inside one process.
 
@@ -49,11 +52,12 @@ A contender that did not acquire the lock never releases it, even on the best-ef
 
 ### Location scopes
 
-Where the file lives is what decides what is actually serialised. Three scopes exist:
+Where the file lives is what decides what is actually serialised. Four scopes exist:
 
 - **Per-worktree** — inside the per-project state directory of the specific working tree. Two working trees of the same repository never contend. Correct when the guarded state is itself per-worktree.
 - **Shared across worktrees** — inside a state directory rooted at the repository's common git directory, so every working tree of the same repository, and every surface operating in any of them, resolves to the same file. Correct when the guarded state is repository-wide rather than worktree-wide. When the location cannot be resolved (not inside a repository, or git unavailable), it falls back to the per-worktree directory — single-worktree behaviour is then unchanged, and multi-worktree serialisation is simply unavailable.
 - **Machine-global** — inside the per-user state directory. One file for the whole machine, across every repository and every install surface.
+- **Per-configured-vault, filed machine-globally** — the file lives in a fixed subdirectory of the per-user state directory, but its *name* is derived from a hash of the canonicalised path of a user-configured directory, so one file exists per such directory rather than one per machine. This scope exists for exactly one lock, and the reason it is not simply "inside the directory it guards" is that its earliest holder must acquire **before** any code that touches that directory's own state runs; a lock inside it would not exist in that window. The canonicalisation is the whole correctness story — two parties that spell the same directory differently (a relative path, a symlink, a case variation on a case-insensitive filesystem) must hash to one file, and two parties that spell different directories must not. That canonicalisation belongs to the lock's own topic and is not restated here.
 
 ## Behavior
 
@@ -84,8 +88,13 @@ Callers must therefore handle the two disciplines differently. A best-effort cal
 | `repo-hooks.lock` | Shared across worktrees | 5 seconds, polled; automatic (machine-initiated) callers use a much shorter budget of a fraction of a second | **Strict** |
 | `runtime-registry.lock` | Machine-global | 5 seconds, polled; automatic callers use the same shortened budget | **Strict** |
 | `push-control.lock` | Machine-global | 5 seconds, polled at 25 ms | **Strict primitive, best-effort at its one call site** — see below |
+| `repo-registry.lock` | Machine-global | 5 seconds, polled at 25 ms | **Best-effort** |
+| `vault-<hash>.lock` | Per-configured-vault, filed machine-globally | Two named budgets plus a fail-fast mode: 60 seconds for a holder with queued on-disk work, 10 seconds for a holder that would rather yield; all polled at 100 ms | Acquisition result returned to the caller — and, uniquely, **two callers over one budget answer a miss oppositely**; see below |
+| `dashboard-spawn.lock` | Machine-global | Fail-fast, with one reclaim-and-retry attempt; no polling | Acquisition result returned to the caller, which falls back to waiting for the winning launcher. **Does not use the shared convention** — see below |
 
-The three oldest entries (`worker.lock`, `ingest.lock`, `orphan-write.lock`) and the sync lock are neither strict nor best-effort in the sense above: they hand the acquisition result back and let each caller decide, and every caller declines the work on failure. The strict/best-effort distinction applies to the wrappers that run a callback on the caller's behalf.
+The three oldest entries (`worker.lock`, `ingest.lock`, `orphan-write.lock`), the sync lock and the per-vault write lock are neither strict nor best-effort in the sense above: they hand the acquisition result back and let each caller decide. Every caller of the first four declines the work on failure; the per-vault lock is the one place where two callers make different choices. The strict/best-effort distinction applies to the wrappers that run a callback on the caller's behalf.
+
+The parent directory of a lock file may not exist on a fresh install; every acquire path creates it on demand.
 
 ### The push-control lock is strict by shape and best-effort by use
 
@@ -94,6 +103,32 @@ The three oldest entries (`worker.lock`, `ingest.lock`, `orphan-write.lock`) and
 Its wrapper returns the strict acquisition result — on timeout it runs nothing and reports "not acquired". But its **single** caller, the store's read-modify-write, then re-runs the same guarded function unlocked rather than propagating the failure. The net user-visible discipline is therefore best-effort, for the best-effort rationale above: the critical section is a sub-millisecond read-modify-write that re-reads inside the lock and ends in an atomic write, so contention narrows to a small residual lost-update window — whereas dropping the write would silently discard a toggle the user just clicked, which on the *disable* direction means the repo keeps pushing after the user turned it off.
 
 This is worth stating explicitly because the shape and the behavior disagree: reading only the wrapper would classify this lock as strict, and a future second caller that forgets the fallback would silently start dropping toggles.
+
+### The per-vault write lock is the first with two callers whose disciplines are opposites
+
+Every other result-returning lock in the catalogue has one answer to a miss: the caller declines the work. The per-vault write lock is the first where that is not true, and the disagreement is not between budgets — it is between two callers that take **the same budget, milliseconds apart, on one user gesture**.
+
+A user-initiated Refresh of the editor's Memory Bank tree runs two operations in sequence, each holding this lock for its whole body with the shorter yield budget:
+
+- The **archival sweep** of the folders that hold nothing answers a full-budget miss by reporting that it archived nothing, **silently**. Its result is a list of folders it moved, so the miss is indistinguishable from a sweep that found nothing to move, and its caller suppresses the notification on an empty list. Under sustained contention the sweep therefore never runs and never says so.
+- The **duplicate-folder consolidation** answers the same miss by raising a typed busy signal that reaches the user as "busy writing a summary right now — click Refresh again shortly".
+
+The axis is not the budget, the location, or the guarded state — all three are identical. It is **whether the user asked for that specific operation**: the Refresh implies the re-listing, so a tidy-up may defer without comment; a merge the user confirmed through a modal may not, because a silent swallow would look like the confirmation did nothing. This is the sharpest available illustration of why discipline is the catalogue's third column rather than a property of the lock, and it is also the case that breaks the shortcut of inferring a discipline from a budget: a future reader who does that will infer the wrong one for one of the two.
+
+Two further properties of these particular holders are worth recording here because they are lock-level, not operation-level. Both reach the lock through the body-style wrapper that acquires, heartbeats, runs and releases — and both **omit its optional release hook**, so neither drains the cross-repository waiter registry on release. A queue worker that timed out on this lock and recorded itself there survives both releases untouched. Nothing type-checks, tests, or logs the omission, because the wrapper is perfectly correct without the hook — just less useful to everybody else.
+
+The contrast is **not** "every other holder passes the hook": the hook is passed by the queue worker's ingest write guard and the two compile write guards, while the worker's own summary drain calls the same drain by hand right after releasing, and the Memory Bank sync round's drain is **round-scoped rather than release-scoped** — a round-complete callback that fires after the whole round, not when this lock frees mid-round. The two editor-host spans are therefore the only holders that leave a recorded waiter untouched, but they are not the only ones without the hook.
+
+### The dashboard spawn lock re-implements the convention rather than using it
+
+`dashboard-spawn.lock` is the one entry in the catalogue that does not go through the shared primitive. It keeps the shape — a single regular file whose existence means "held", containing the owning process's numeric identifier, taken by exclusive create — and drops two of the three guarantees around it:
+
+- **No staleness ceiling and no freshness signal.** Reclamation is by dead owner only: an unreadable lock, or one holding a non-numeric identifier, also counts as reclaimable so a launcher killed mid-write cannot wedge the dashboard permanently. There is no modification-time test anywhere, and therefore no heartbeat obligation on the holder.
+- **Release is not ownership-checked.** It removes the file unconditionally.
+
+Its reclaim path is nonetheless careful about the thing that matters for it: the retry after removing a dead owner's file goes through the **same exclusive create**, then reads the file back to confirm the recorded identifier is its own. An earlier blind overwrite let two launchers that both observed the same dead identifier both believe they had won, which is exactly the double spawn the lock exists to prevent; now the loser's create fails and it falls into the wait-for-the-other-launcher branch.
+
+One residual race is accepted in place: remove-then-create is two syscalls, so a second reclaimer whose removal lands after the first has already created and read back its own lock still takes it. The consequence is bounded on the other side rather than in the lock — the launcher probes the recorded server's own health endpoint and reuses a live server before it ever tries to spawn — so the worst case is one short-lived extra process, not a permanently orphaned server.
 
 ### The repository profile lock has two disciplines
 
@@ -175,6 +210,8 @@ For any single lock file:
 
 ## Notable Behavior
 
+- **Discipline is a property of the caller, and one lock now proves it by having two callers who disagree.** The per-vault write lock's two editor-host holders take the same budget on the same click and answer a miss oppositely — one silently, one visibly — on the sole basis of whether the user asked for that specific operation. Any reading of the catalogue that treats discipline as derivable from the budget or the guarded state is wrong for that pair. (Surprising; the catalogue's three columns are independent and this is the case that demonstrates it.)
+- **A silent miss can be indistinguishable from a successful no-op, and one caller is built that way on purpose.** The archival sweep's result is the list of folders it moved, so "the vault was busy for ten seconds" and "there was nothing to move" are the same answer, and the notification is suppressed on both. That is what "never block the user's click" costs: the operation has no observability at all under contention. (Notable.)
 - **The location choice, not the lock, is what makes serialisation correct.** A repository-wide state document guarded by a per-worktree lock is serialised against nothing when two working trees contend. This is why the repository profile and the repository hook lifecycle both live in the shared-across-worktrees directory even though most state locks are per-worktree: their writers are a command-line process in one working tree and an editor extension host in another.
 - **A lock only works if every writer takes it — and one guarded document already has a writer that does not.** Partial coverage serialises nothing, so adding a new writer to any guarded document without routing it through the same lock silently reopens the window the lock exists to close. The runtime registry carries exactly one sanctioned breach of that rule (the IDE-sandbox launcher), justified by being interactive-only and decision-free rather than by anything the primitive provides. Reading its justification as a general licence would be wrong: what makes it tolerable is precisely that it performs no read-modify-write, which is not true of any other writer of any guarded document here. (Surprising; the rule is stated absolutely elsewhere and has one live exception.)
 - **Best-effort was the original discipline; strict is the newer one.** The older state-document locks were all written to degrade rather than block, because their worst case was a small lost update. The locks added for durable lifecycle decisions inverted that on purpose, and the repository profile was migrated across the line. The two disciplines coexisting is deliberate, not an inconsistency to be normalised.
@@ -191,4 +228,7 @@ For any single lock file:
 - **Npm postinstall dist-path refresh** turns a failure to acquire the machine-global lock into a complete silent skip.
 - **The repository-profile / manual-disable topic** owns the state guarded by the strict profile lock, including the abort-without-teardown behaviour on a lock timeout.
 - **The cutover compare-and-swap** is the one sanctioned bare acquisition of the summary-ref write lock, and owns why it holds several clones' locks at once, in what order, and what it does inside them — defined by **Orphan Branch Cutover Fence and Compare-and-Swap** (345).
+- **The per-vault write lock's own topic** owns its path canonicalisation, its acquired-handle interface, its heartbeat cadence, its hold windows, the cross-repository waiter registry drained on release, and its diagnostic probe. This topic owns only its place in the catalogue and the fact that it is the one lock with two callers whose disciplines are opposites. The two editor-host holders that produce that split, and their omission of the release hook, are owned by the Memory Bank unused-folder archival spec and the Memory Bank duplicate-folder consolidation spec.
+- **The dashboard launcher** owns why the spawn lock exists, the health probe that bounds its residual race, and the recorded-server record it protects; this topic owns only the fact that the lock re-implements the shared convention and what it drops.
+- **The machine-global repository registry** — the durable record from which the dashboard database is rebuilt — owns its own read-modify-write; its lock is best-effort for the same reason as the other state-document locks, and running that section unlocked narrows to a small lost-registration window rather than dropping the registration outright.
 - **Queue draining, orphan-branch writes, Memory Bank sync rounds, the plan/note registry, the commit-selection record, the pending-push ledger, session/cursor registries, and machine-global configuration** each own their guarded critical section; this topic owns only the lock characteristics.

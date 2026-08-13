@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-How a repository becomes known to this machine: the durable, machine-global list of enabled repositories, the identity derived for each, the four paths that create or extend an entry, and the read-only probe that reports on a candidate folder before it is added.
+How a repository becomes known to this machine: the durable, machine-global list of enabled repositories, the identity derived for each, the paths that create or extend an entry, and the read-only probe that answers what picking a candidate folder would mean — a question no shipped surface asks any more, since the folder-browser add flow it was written for was deleted.
 
 ## Scope
 
@@ -16,7 +16,7 @@ How a repository becomes known to this machine: the durable, machine-global list
 - The two checkout-list readers and how their answers differ for a repository whose every checkout is gone.
 - The database identity stamp carried in the same file.
 - The callers that make a repository known, including the hook-side gap fill and its retry rule.
-- The pre-registration folder probe: what it checks, what it reports, and what it deliberately does not answer.
+- The pre-registration folder probe: what it checks, what it reports, what it deliberately does not answer, and the fact that nothing in the browser reaches it.
 - The direction of the relationship between this file and the database's repository table, and the one case where the table gets ahead of the file.
 - The configuration-derived and hook-installation reads that exist for a settings surface but are **unreachable** at HEAD.
 
@@ -154,7 +154,7 @@ Five, plus one caller that re-registers something already known:
 1. **The launcher command.** Before doing anything else it registers the current directory, ignoring the failure when the directory is not a repository — outside a repository the dashboard still opens with whatever is already registered. **The guided first-run setup arrives here**, not at the import path below.
 2. **The enable command**, directly, on the directory being enabled.
 3. **The import-only entry point**, which registers the given directory (again tolerating a non-repository) and then runs the history import. Its one caller is the enable command, and only on an interactive run that did not opt out — so an interactive enable registers twice, harmlessly, since registration is idempotent apart from re-stamping the checkout list.
-4. **The HTTP enable route**, which resolves the submitted path to a repository root, installs, then registers.
+4. **The HTTP enable route**, which resolves the submitted path to a repository root, installs, then registers. It is routed and token-gated but has **no caller in the shipped page** — the folder-browser add flow that posted to it was deleted — so in practice this path is reachable only by a token-bearing local caller.
 5. **The producer write path** (the hooks and the editor tick), which registers as a *side effect* of resolving an identity. This is what makes the dashboard see repositories that were enabled before the registry existed; without it the list would only ever grow on a fresh enable, leaving every already-enabled repository invisible while its hooks were actively writing to the same database.
 
 The **HTTP resume route** also calls full registration, but it cannot introduce a repository: it refuses an identity the registry does not already hold. It is there purely for the side effect described above — rebuilding the entry is what clears the disable stamp.
@@ -174,6 +174,8 @@ Registry state reaches the table two ways: the full import reads the active list
 ### The pre-registration folder probe
 
 Answers "what would picking this folder mean" without committing to anything — no registration, no hook installation, no model call.
+
+**Nothing reaches it from the browser.** It was written for a folder-browser add flow on the dashboard's Repositories page; that flow was deleted along with the directory-listing endpoint it walked (which now answers not-found) when the settings folder control became a validated text field. The probe's own route survives, still token-gated, and so does the enable action it fed — but the shipped page asks neither, and there is no user interface anywhere behind which "before it is added" happens. Read every rule below as the behaviour a token-bearing local caller gets, not as something a reader can trigger.
 
 1. If **`<path>/.git` does not exist**, answer `{ isGitRepo: false, alreadyAdded: false }` and stop. (This is an existence check, so a linked worktree — where that entry is a file — passes.)
 2. Derive the identity from the **path as given**, and read the active repository list; `alreadyAdded` is whether any active entry shares that identity.
@@ -208,7 +210,7 @@ These are described here only because they read registry-adjacent state; **no be
 
 | From | Event | To |
 | --- | --- | --- |
-| absent | registration from any of the four paths | present, `enabledAt` = now, checkout list = `[this root]`, no `disabledAt` |
+| absent | registration from any of the paths enumerated above | present, `enabledAt` = now, checkout list = `[this root]`, no `disabledAt` |
 | present, enabled | registration from another checkout of the same identity | same entry, `worktreeRoot` = this root, checkout list unioned (this root last), `enabledAt` preserved |
 | present, enabled | disable | `disabledAt` stamped; row and data kept |
 | present, disabled | registration (explicit enable / resume) | `disabledAt` **cleared** — the entry is rebuilt |
@@ -233,7 +235,8 @@ These are described here only because they read registry-adjacent state; **no be
 - **A registration clears a disable, because the entry is rebuilt rather than merged.** That is right for an explicit enable and wrong for a hook, which is exactly why the hook path never calls it for a known identity. (Notable.)
 - **The producer path memoises the identity only after registration settles**, so a transient write failure is retried on the next call instead of being locked in for the life of a long-running host. (Surprising; the obvious ordering is the broken one.)
 - **The `file:`-scheme canonical remote is detected and rejected as an identity.** Accepting it would make the user's absolute path — home directory included — a primary key echoed into every table, and a display value in the probe. (Notable.)
-- **The probe hashes the path it was handed, while registration hashes the resolved main-worktree root.** For a repository with **no usable remote**, probing a linked worktree therefore produces a different identity than the one registration wrote, so `alreadyAdded` reads **false** for a repository that is in fact registered. Remote-backed repositories are unaffected, since their identity does not depend on the path. (Surprising; a real divergence at HEAD.)
+- **The probe hashes the path it was handed, while registration hashes the resolved main-worktree root.** For a repository with **no usable remote**, probing a linked worktree therefore produces a different identity than the one registration wrote, so `alreadyAdded` reads **false** for a repository that is in fact registered. Remote-backed repositories are unaffected, since their identity does not depend on the path. (Surprising; a real divergence at HEAD — though no user can currently see it, since nothing reaches the probe from the browser.)
+- **The probe and the HTTP enable route have no caller in the shipped page.** Both existed for one folder-browser add flow, deleted with the directory-listing endpoint it walked. Both still route and still act for a token-bearing local caller; the "before it is added" framing describes an interface that no longer exists, and re-adding one means building a front end against endpoints that are already there. (Unreachable from the shipped page; live over the wire.)
 - **The live-checkout reader never returns an empty list**, so "every checkout is gone" and "one checkout, alive" are indistinguishable through it — which is precisely why the second, plain-existence reader exists. Picking the wrong one makes a sweep act on a path that is not there. (Notable.)
 - **Nothing ever prunes this file.** Disabling cannot run for a deleted directory, so dead entries accumulate indefinitely and every sweep re-pays for them. (Notable.)
 - **The lock is best-effort: on a 5-second timeout the read-modify-write proceeds unlocked**, trading a lost-update window for never dropping a registration outright. (Notable.)

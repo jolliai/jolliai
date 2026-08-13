@@ -17,7 +17,8 @@ This spec defines how the terminal-based `cursor-agent` product's conversation s
 - The bucket-resolution strategy for locating a session's transcript file, including its in-scan caching optimization.
 - The two-tier error-classification policy (whole-scan failures vs. isolated per-item skips).
 - Transcript line shapes, role mapping, text-part extraction, and the user-turn tag-unwrapping scheme.
-- The embedded free-text timestamp format used solely to gate an optional commit-boundary cutoff.
+- The embedded free-text timestamp format, its two consumers (the optional commit-boundary cutoff, and the instant stamped on each tool-call tally bucket), and the fact that it is read on every line regardless of whether a cutoff was supplied.
+- The per-session tool-call tally this reader produces: which line parts feed it, how repeats are de-duplicated, and how it is reported even when empty.
 - Cursor-keyed resumption (line-based), including the append-only trailing-newline handling and the malformed/partial-line retry behavior.
 
 **Out of scope**
@@ -67,8 +68,8 @@ A session is skipped (not discovered) if `cwd` is not a string, if neither times
 
 | Shape | Fields | Meaning |
 | --- | --- | --- |
-| Turn line | `role` (`"user"` \| `"assistant"`), `message.content` (array of parts, each optionally `{ type, text }`) | A conversational turn. Only parts with `type: "text"` and a string `text` contribute; other part types (e.g. tool-call parts) are dropped. |
-| Control line | any shape without a recognized `role` | Skipped: produces no entry, but the line still counts as consumed. |
+| Turn line | `role` (`"user"` \| `"assistant"`), `message.content` (array of parts, each optionally `{ type, text }`) | A conversational turn. Only parts with `type: "text"` and a string `text` contribute to the entry's content; tool-call parts are dropped from the content but **counted** into the tool tally (see below). |
+| Control line | any shape without a recognized `role` | Skipped: produces no entry, but the line still counts as consumed. Its tool-call parts, if any, are still tallied — the tally walk is not gated on the role mapping. |
 
 ### Normalized entry (output of read)
 
@@ -76,7 +77,13 @@ A session is skipped (not discovered) if `cwd` is not a string, if neither times
 | --- | --- | --- |
 | `role` | `"human"` \| `"assistant"` | `"user"` → `"human"`, `"assistant"` → `"assistant"`; any other/missing role yields no entry. |
 | `content` | string | Extracted, trimmed text (user turns additionally unwrapped — see below). |
-| `timestamp` | absent | This reader never populates the entry-level timestamp field, even though it parses an embedded timestamp from user turns — that parsed value is used only to decide cutoff gating and is discarded afterward. |
+| `timestamp` | absent | This reader never populates the entry-level timestamp field, even though it parses an embedded timestamp from user turns. That parsed value goes to the cutoff decision and to the tool-call tally's per-bucket instant instead of onto the entry. |
+
+### Per-session tool-call tally (output of read)
+
+Reported alongside the entries and the cursor, and **always present even when empty** — an empty tally is the recorded fact "this session called no tools", which a consumer must be able to tell apart from a source that records nothing at all. Each bucket carries a display name, a classification, a call count, and optionally the instant of its most recent observed call.
+
+Classification follows the shared naming convention this product's tool tallies use: a name carrying the machine-to-machine tool prefix is split into a server and a tool and recorded as an external-server call (with the server kept as its own field and also folded into the display name, so two servers exposing a same-named tool stay distinguishable); a prefix with no tool segment is malformed and stays attributed to the server rather than being dropped; everything else is a built-in call.
 
 ### Cursor (the persistence one, not the IDE)
 
@@ -127,20 +134,25 @@ The queue-worker-facing entry point runs the scan against the default (real) dir
 4. If a cutoff instant was supplied and parses as a valid date, cutoff gating is active; otherwise every line is eligible.
 5. Walk the remaining lines in order:
    - A line that fails to parse as JSON is skipped without advancing the consumed-count. Because a later successfully-parsed line unconditionally advances the consumed-count to just past itself, a mid-file parse failure is effectively passed over for good once any later line succeeds; only a parse failure with **no successful line after it in this read** (a transcript file caught mid-write) leaves the consumed-count sitting before it, so it is retried on the next read.
-   - When cutoff gating is active, compute the line's embedded timestamp (only user-role lines carry one, inside a tagged region of their text). If a timestamp is found and it is strictly after the cutoff, stop the whole walk immediately — this line and every line after it in the file are left unconsumed, to be picked up by a future read once the cutoff advances past them.
+   - Compute the line's embedded timestamp (only user-role lines carry one, inside a tagged region of their text). This happens **unconditionally, on every line, whether or not cutoff gating is active** — the value has a second consumer, the tool-tally bucket stamp below, and computing it only under a cutoff left every bucket timeless on the common (cutoff-free) read.
+   - **Then**, only when cutoff gating is active: if a timestamp was found and it is strictly after the cutoff, stop the whole walk immediately — this line and every line after it in the file are left unconsumed, to be picked up by a future read once the cutoff advances past them.
    - Map the line's role; a line without a recognized role produces no entry, but still counts as consumed (its position still advances the cursor).
    - For a role-bearing line, extract text from all `type: "text"` content parts, joined and trimmed. For a user-role line, further unwrap it: strip every timestamp-tagged span from the text first, then take the inner text of a user-query-tagged span if one is present, otherwise use the (timestamp-stripped) remaining text; trim the result. Assistant-role text is used as extracted, with no further unwrapping.
-   - If the final content is non-empty, append a normalized entry (with no timestamp field). Either way, the consumed-count advances past this line.
+   - If the final content is non-empty, append a normalized entry (with no timestamp field).
+   - **Tally this line's tool-call parts**, regardless of whether it produced an entry — a pure tool-call turn yields no entry but is real agent activity, and this is the only place those parts are recorded at all. Each part whose type marks it a tool call and whose name is a non-empty string is counted once, classified by name, and — when this line's embedded timestamp parsed — stamped with that instant as the bucket's most-recent-call time. Repeats are de-duplicated on the part's own call identity when it carries one, and counted unconditionally when it does not: an absent identity means the transcript gave no identity to compare, so dropping the call would lose a real one while counting a repeat only inflates one bucket. When several calls land in the same bucket, the bucket keeps the later of the instants.
+   - Either way, the consumed-count advances past this line.
 6. Merge consecutive entries of the same role (their text joined with a blank-line separator) — the same merging every other source's reader applies.
-7. Return the merged entries, a new cursor whose line count is the final consumed-count, and the count of lines advanced over in this call.
+7. Return the merged entries, a new cursor whose line count is the final consumed-count, the count of lines advanced over in this call, and the tool-call tally.
 
-### Embedded timestamp parsing (cutoff gating only)
+### Embedded timestamp parsing
+
+Read on every line, and consumed by two things: the cutoff decision, and the per-bucket instant on the tool-call tally.
 
 - Only present on user-role lines, inside a tagged span of their text; the tag's content is matched anywhere within the span (leading free text such as a weekday name is ignored).
 - Expected shape: a three-letter month name, day, four-digit year, 12-hour time to the minute, an AM/PM marker, and a parenthesized UTC offset (a signed one-or-two-digit hour, optionally followed by a colon-optional two-digit minute).
 - The month name is matched case-insensitively against a fixed set of three-letter English abbreviations; an unrecognized month, or text that doesn't match the expected shape at all, makes the timestamp unparseable for that line.
 - An unparseable or absent timestamp is **not** treated as "after cutoff" — such a line (and, transitively, any run of non-user lines immediately following it, since only user lines are checked) is conservatively kept rather than deferred. Only a line with a timestamp that both parses *and* falls after the cutoff triggers deferral.
-- A parsed timestamp is converted to a UTC instant using the stated offset; it is never surfaced on the resulting entry — it exists solely to decide whether this line (and the rest of the file) should be deferred.
+- A parsed timestamp is converted to a UTC instant using the stated offset. It is never surfaced on the resulting **entry**, but it is not discarded: it is stamped as the most-recent-call instant on every tool bucket this line contributes to. An unparseable or absent one simply leaves those buckets' instant absent for this line.
 
 ## State Transitions
 
@@ -155,7 +167,9 @@ Both discovery and reading are read-only with respect to the on-disk stores. The
 - **No runtime feature gate**: unlike sibling sources backed by an embedded database, this source's plain-JSON/JSONL storage means detection never depends on optional runtime module support.
 - **The bucket-preference cache changes performance, not results**: a cache "miss" (a session whose transcript lives in a different bucket than the one just resolved) transparently falls back to a full per-bucket scan; it never causes a resolvable session to be missed.
 - **The transcript-side bucket encoding is deliberately never decoded**: matching happens by testing for the presence of a same-named session file inside each candidate bucket, not by computing which bucket a given working directory maps to.
-- **Entry-level timestamps are dropped even though a timestamp is parsed**: the embedded per-turn timestamp exists in this source's data purely to support cutoff gating; it does not propagate into the normalized entry the way it does for sources whose store carries a structured per-message timestamp field.
+- **Entry-level timestamps are dropped even though a timestamp is parsed**: the embedded per-turn timestamp does not propagate into the normalized entry the way it does for sources whose store carries a structured per-message timestamp field. It is not, however, discarded — it reaches the tool-call tally.
+- **The embedded timestamp is parsed on every line, including on reads with no cutoff at all.** Doing it only under an active cutoff is the obvious shape and was the wrong one: the value is also the instant stamped on each tool bucket, and the cutoff-free read is the common case, so gating the parse left every bucket in every ordinary read with no recorded call time. The cutoff break itself is unchanged — it still fires only when gating is active and only on a timestamp that both parses and falls after the cutoff. (Surprising; the two consumers have different activation conditions.)
+- **The tool-call tally is not gated on the role mapping.** A line whose role this reader does not recognise produces no entry and still has its tool-call parts counted, because a pure tool-call turn is real agent activity that the content extraction deliberately throws away. This tally is the only record of those parts anywhere. (Notable; and it was undocumented in this spec entirely until the per-bucket instant made it load-bearing.)
 - **Mid-stream vs. trailing malformed lines are handled differently by construction, not by explicit special-casing**: a malformed line is only ever retried on a later call when it is the last thing in the current read window with nothing valid consumed after it.
 - **Title always arrives pre-populated from discovery**: the metadata's own title field is the only title source for this product; there is no per-transcript-line title-parsing fallback for this source (the generic downstream fallback chain's per-source parser for this source is a permanent no-op).
 
@@ -165,6 +179,7 @@ Both discovery and reading are read-only with respect to the on-disk stores. The
 - **Canonical session-info shape** (`{ sessionId, transcriptPath, updatedAt, source, title? }`) matches every other discovery-based source.
 - **Path normalization for directory-equality attribution** (separator unification, trailing-slash trim, case-folding on case-insensitive platforms) is the same normalization used across the product for path comparisons.
 - **Canonical normalized-entry shape** (`{ role: "human"|"assistant", content }`) matches every other source reader, aside from this source never populating the optional timestamp field.
+- **The per-session tool-call tally, its de-duplication on call identity, its name classification into built-in / external-server buckets, and the always-present-even-when-empty contract** are the shared tally behaviour every tool-recording source reader applies; only the source of the per-bucket instant differs (here, the user turn's embedded free-text timestamp).
 - **Cursor-keyed resumption** by `(transcriptPath, lineNumber)` matches every other line-oriented source reader.
 - **Same-role coalescing** is applied with the same semantics as every other source reader.
 - **Time-cutoff filter** matches the general contract used by every other source reader: a cutoff stops consumption, the cursor advances only past what was actually consumed, and records with no determinable timestamp are conservatively included rather than deferred.

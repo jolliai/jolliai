@@ -2,14 +2,16 @@
 
 ## Topic Statement
 
-A single call resolves the display title for one AI coding session by consulting an ordered chain of sources, returning a constant placeholder when no source yields a non-empty string.
+A single call resolves the display title for one AI coding session by consulting an ordered chain of sources, returning a constant placeholder when no source yields a non-empty string — plus a second entry point that runs the same chain against an already-archived slice of conversation and answers "absent" instead of the placeholder.
 
 ## Scope
 
 **In scope:**
 
 - The four-step cascade applied to every call: caller-supplied native title, producer-specific native reader, first-user-message fallback, constant placeholder.
+- The second public entry point: the same cascade applied to an archived conversation slice at memory-write time, its swallow-everything failure contract, and its absent-instead-of-placeholder result.
 - The branch that runs the producer-specific native reader only for sessions whose producer is the one producer that has a native reader.
+- The producer-specific native reader's size budget: whole-file scan below it, tail scan above it, and the discarded first line of a tail read.
 - The branch that, when the caller passes a pre-loaded merged-entry array, derives the fallback from that array instead of streaming the transcript again from disk.
 - The per-producer line parsers that the first-user-message fallback consults, including the rule that some producers always return "no match" because their sessions always carry a native title.
 - The two stringification shapes the parsers accept for a user-message body (bare string, array of mixed string/object blocks) and what they reject.
@@ -23,7 +25,8 @@ A single call resolves the display title for one AI coding session by consulting
 - How the active-session aggregator decides to call the resolver, how it parallelizes the calls across sessions, what surface renders the resolved title, and the cost-saving rule by which the aggregator passes in a pre-loaded merged-entry array — owned by the active session aggregator spec.
 - How each producer's transcript is discovered, located on disk, and loaded into the merged-entry shape consumed elsewhere — owned by the per-producer transcript reading specs.
 - The persistence and emission rules for any "native title" field on a discoverer's session record — owned by each producer's discovery spec; the resolver only consumes the field if present.
-- The placement of any cache or memoization across multiple calls; the resolver itself is stateless and recomputes on every call. Any caching that exists lives in the caller.
+- Where the archived title the second entry point produces is *stored* on a memory's transcript artifact, which writers call it, and the order in which later readers prefer it over other sources — owned by the memory-storage and read-model topics. This spec defines only how that value is computed and the fact that it can legitimately be absent.
+- The placement of any cache or memoization across multiple calls; the resolver itself is stateless and recomputes on every call. Any caching that exists lives in the caller — and the one caller that had a cache no longer exists: the local dashboard's memory-detail read used to hand each conversation row a live transcript path so a later asynchronous pass could re-derive the native title, keyed by that file's modification time and size. That read and its cache are gone, and the read model it belonged to is now synchronous, so nothing on a request path calls this resolver.
 - The mechanism that triggers refresh of a title in any user-facing surface; the resolver runs once per call and does not subscribe to any event.
 
 ## Data Contracts
@@ -93,6 +96,18 @@ When the step applies, the resolver invokes the Claude native reader (see "Claud
 ### Claude native reader
 
 The reader streams the session transcript line by line and remembers the most recent line that matches a "native title" record shape. At end of stream, the reader returns the remembered payload, or undefined if no line matched.
+
+**The scan does not always start at the beginning of the file.** The reader stats the transcript first and compares its size against a **four-mebibyte** budget:
+
+- At or below the budget, the whole file is read, exactly as described above.
+- Above it, the scan starts that many bytes from the **end** of the file. Everything before that offset is never read.
+- A failed stat falls through to a whole-file scan. The size is an optimisation input, not a precondition, and the stream reports the real error a moment later anyway.
+
+The tail is sound because of what this record *is*: the producer re-emits it as the conversation continues and only the **last** one is wanted, so the answer lives at the end of the file and every line before it is read only to be thrown away.
+
+**The first line of a tail read is discarded.** A byte offset lands mid-line (and possibly mid-code-point) in the general case, so that line is a fragment. It cannot be parsed — and, the load-bearing half, a fragment of a **non-title** line can carry a title record's shape and pass the substring filter below. Dropping it costs one line and is the only way to keep every line the loop sees a whole one. The drop applies only when the scan started past byte zero.
+
+**What the budget gives up, and it is undocumented anywhere the user can see:** a transcript that grew past the budget with *every* title record behind the cut yields no candidate at all. The reader returns "no title", the cascade falls through to the next step, and the session is titled from its first user message instead. That is a silent downgrade rather than a wrong title, which is the trade — but nothing reports it, and no log line distinguishes it from a transcript that genuinely never carried a title record.
 
 - Each line is first filtered by a fast literal-substring check: the line must contain the exact substring `"type":"ai-title"` (including the closing double-quote after the value). Lines that fail this filter are skipped without parsing.
 - Lines that pass the filter are parsed as JSON. Lines whose parse fails are counted (the count is logged once at end of stream at a debug level) and skipped; the scan continues so a later valid line still wins.
@@ -166,12 +181,25 @@ This sub-path does not consult disk and does not invoke the per-producer line pa
 
 The Claude native reader still runs in step 2 even when pre-loaded entries are supplied — provided the session carries a non-empty transcript handle — because the merged-entry array does not contain the native-title rows (those rows are stripped during transcript loading). When the transcript handle is empty, step 2 is skipped regardless of whether entries were supplied, and the cascade falls through to step 3.
 
+### The archived-slice entry point
+
+A second public entry point resolves the title to **store with a session** at the moment a memory is written, rather than the title to display right now. It takes a slice of an archived conversation — a session identifier, an optional producer, an optional transcript handle, and the array of entries that slice owns — and runs the identical cascade over it. Three things about it differ:
+
+- **The entries it passes are the archived slice, not the live file.** So step 3 describes the turns this memory actually owns; for an amend or squash chain the live file's first turn belongs to a different commit, and using it would title every slice of the chain identically.
+- **It never propagates a failure.** Every error is caught, recorded as a diagnostic, and answered as "absent". The display cascade already never propagates one, so this is a second net rather than the first — a title is never worth failing an archive write for, and the archive itself is what must land.
+- **It answers absent in place of the placeholder.** When the cascade returns the constant placeholder, the entry point returns nothing at all, so the stored field stays absent rather than carrying the placeholder string. "No title" is a fact each later reader renders its own way, and an absent field is also what lets a reader fall back the same way it does for an archive written before the field existed.
+
+An absent transcript handle is substituted with the empty string, which by the step-2 empty-handle rule skips the producer-specific native reader. So a slice archived with no live file behind it resolves from its own entries or not at all. When the handle *is* present, step 2 still runs against the live file for the one producer that has a native reader — the same reason it runs in the display path, since the archived entries never contain the native-title records.
+
+Every reader of a stored title used to re-derive it independently, and each derived it differently. Resolving it once at write time is what makes them agree by construction — and commit time is the only moment where it is both cheap and correct, because the live transcript was just read and is the argument to this call.
+
 ### Diagnostic recording
 
 The resolver logs diagnostics at a debug level in two cases:
 
 - The Claude native reader (step 2) threw an exception. The diagnostic includes the transcript handle and an error message.
 - The streaming first-user-message fallback (step 3, streaming sub-path) threw an exception that its own catch did not handle. The diagnostic includes the producer, the transcript handle, and an error message.
+- The archived-slice entry point caught anything at all. The diagnostic includes the session identifier and an error message, and the entry point answers "absent".
 
 The two underlying readers also emit their own debug-level diagnostics for non-ENOENT stream failures and (for the Claude reader) for the count of malformed lines that passed the substring filter.
 
@@ -181,7 +209,7 @@ No diagnostic surfaces in the returned value; on any of these conditions, the re
 
 The resolver is stateless. It mutates nothing on disk, retains nothing across calls, and starts no background work. Each call is a fresh end-to-end traversal of the cascade above.
 
-The Claude native reader and the streaming first-user-message fallback both open the transcript on each call, stream it to completion, and close it. They do not memoize across calls.
+Both underlying readers open the transcript on each call and close it, and neither memoizes across calls. They differ in how much of it they read: the streaming first-user-message fallback always opens at byte zero and streams to completion (it stops early only on a hit); the Claude native reader streams to completion but starts four mebibytes from the end for any transcript larger than that, so above the budget it never reads the file's opening bytes at all.
 
 ## Notable Behavior
 
@@ -202,6 +230,12 @@ The Claude native reader and the streaming first-user-message fallback both open
 - **The kimi parser is a real parser, not one of those stubs, and it is genuinely reached.** That producer's discoverer populates the native title only when the session's own metadata document carried a non-empty one, and it omits the field entirely otherwise — so a session whose metadata is silent about the title falls through step 1 into step 3, where this parser recognises the transcript's prompt-turn event and returns its stringified body. The parsers that actually inspect a line are claude, codex, gemini, copilot-chat and kimi; every other entry in the table is a stub.
 
 - **Pre-filter substring check in the Claude reader is sound.** The reader explicitly does not re-check the `type` field after JSON parsing. The literal substring `"type":"ai-title"` (with the trailing closing quote) is exact: any line that passes this check has, after parsing, a `type` that is exactly `"ai-title"`. A line whose `type` is a longer string that starts with the same value (e.g. `"ai-title-other"`) does not pass the pre-filter because the closing quote position would be different.
+
+- **A large transcript's native title can be lost silently, and no surface says so.** Above the four-mebibyte budget the reader sees only the tail, so a transcript whose every title record sits before the cut yields no candidate and the session is titled from its first user message instead. Nothing distinguishes that outcome from a transcript that never carried a title record: the reader logs neither case, and the cascade's own contract is to fall through. The design accepts it because a fall-through is a downgrade while reading a stale mid-file record would be a wrong answer — but the failure mode is real and unreported. (Surprising; deliberate, undocumented to the user.)
+
+- **The tail read throws away its own first line, and the reason is not truncation but forgery.** A byte offset lands mid-line, so that line is a fragment — and a fragment of a line that is *not* a title record can still contain the exact substring the pre-filter tests for. Keeping it would let an arbitrary line's tail be parsed as a title record. Dropping it is what makes the pre-filter's soundness argument hold for a tail read at all. (Surprising.)
+
+- **The archived-slice entry point returns absent where the display cascade returns the placeholder**, and that difference is the whole point of it: the stored field must be able to be missing, because a reader that finds it missing falls back, while a reader that finds the placeholder string renders it. The same entry point also swallows every error rather than propagating one, so an archive write can never fail over a title. (Notable.)
 
 - **Lines that pass the Claude pre-filter but fail JSON.parse are counted, not aborted on.** The reader continues scanning so that a later valid line still wins. The count is logged once at end of stream at a debug level rather than per line, because title resolution is cosmetic and per-line warnings would be noise.
 

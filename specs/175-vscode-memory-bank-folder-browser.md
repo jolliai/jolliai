@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-Surface the Memory Bank parent folder as a lazily-expanded tree that interleaves discovered repository entries with user-dropped sibling entries, enriching each tracked file with manifest-derived classification, title, branch, and divergence metadata.
+Surface the Memory Bank parent folder as a lazily-expanded tree that interleaves discovered repository entries with user-dropped sibling entries, enriching each tracked file with manifest-derived classification, title, branch, and divergence metadata — and, on a user-initiated Refresh of that tree, tidy the parent folder itself by archiving the repository folders that hold nothing and folding the several folders that hold one repository into one.
 
 ## Scope
 
@@ -23,6 +23,9 @@ Surface the Memory Bank parent folder as a lazily-expanded tree that interleaves
 - Error semantics: repository-segment misses, non-directory expansion requests, and inner stat failures.
 - The healed-callback contract that fires after a heal pass regenerated at least one tracked file.
 - The "drop the clean memo" interface used by external refresh triggers to re-arm the reconcile + heal pre-pass.
+- The fact that a user-initiated Refresh of this tree **mutates the parent folder**, and the two operations it runs before re-listing: an archival sweep of the repository folders that provably hold nothing, and a modal-confirmed consolidation of the several folders that hold the current repository. Both are held under the per-vault write lock, both move folders into the same hidden archive directory, and both invalidate this service's clean-repository memo. Only the vocabulary of what they do to this surface is defined here; their own rules are boundaries below.
+- The two interfaces this service exposes for them: the sweep (which reports the folders it archived and can point at the archive directory) and the consolidation's split detect-then-execute pair, whose split exists so a case-specific confirmation can sit between the two halves.
+- The consolidation's precondition that the host supply the current project's working-tree root, and the silent disabling of the whole operation when it does not.
 
 **Out of scope (boundaries):**
 - Repository discovery itself — which on-disk subdirectories qualify, how they are identified, how the current-repository flag is assigned, and how they are ordered relative to each other (covered by the memory-bank-folder-layout spec and the repo-identity-and-folder-naming spec).
@@ -34,7 +37,9 @@ Surface the Memory Bank parent folder as a lazily-expanded tree that interleaves
 - The visual rendering of any node (icons, badges, suffix text, divergence marker, current-repository highlight) — the service emits structured flags only.
 - The Memory Bank parent-folder validation and default-resolution policy (covered by the memory-bank-folder-layout spec).
 - The decoration provider that mirrors the divergence flag onto the host editor's native file tree.
-- Any write operation; this surface is read-only.
+- The archival sweep's own rules: the emptiness predicate it evaluates, its allowlist of inert hidden-layer documents, its two-name exemption for operating-system noise, its two-part current-repository guard, and its silent skip when the vault lock is busy (covered by the Memory Bank unused-folder archival spec).
+- The consolidation's own rules: how the duplicate set is assembled, the three classifications and their survivor selection, the copy-if-absent merge and metadata union, the rebuild from the system of record, the base-slot hijack that rebuild admits, and its visible failure when the vault lock is busy (covered by the Memory Bank duplicate-folder consolidation spec).
+- The archive directory those two operations move folders into — its location, its timestamped naming, and why archiving is a move rather than a deletion (covered by the Memory Bank migration-engine spec).
 
 ## Data Contracts
 
@@ -313,6 +318,8 @@ ABSENT ──(listing inside the repository observes a heal pass with healed=0 a
 PRESENT ──(another listing inside the repository requests the heal pre-pass)──> PRESENT (no-op; pre-pass skipped)
 PRESENT ──(external refresh trigger calls the whole-set clear)──> ABSENT
 PRESENT ──(external refresh trigger calls the single-repo clear with this root)──> ABSENT
+PRESENT ──(a Refresh's archival sweep archived at least one folder)──> ABSENT (whole-set clear; a sweep that archived nothing leaves the memo intact)
+PRESENT ──(a Refresh's duplicate consolidation completed)──> ABSENT (whole-set clear; the survivor's contents changed even when its path did not)
 ABSENT ──(listing inside the repository observes a heal pass that healed at least one file)──> ABSENT (pass through; memo not added)
 ABSENT ──(listing inside the repository observes a heal pass that failed at least one file)──> ABSENT (pass through; memo not added)
 ABSENT ──(reconcile or heal throws)──> ABSENT (memo not added; warning logged; listing continues)
@@ -323,6 +330,9 @@ The folder-node payload returned from any single listing has no state of its own
 
 ## Notable Behavior
 
+- **This surface is no longer read-only, and the Refresh button is where it stopped being read-only.** Every listing path described above still only reads and (through the pre-pass) regenerates files from their own hidden sources — but a user-initiated Refresh of the tree now archives repository folders and folds several folders into one before re-listing. Both operations move directories. Anyone reasoning about this surface as a viewer, or about Refresh as a safe re-read, is reasoning about a previous behavior. (Notable; the single largest change to the surface's contract.)
+- **The two Refresh mutations have opposite busy disciplines against the same lock.** Both take the per-vault write lock with the same short budget. The sweep skips silently and reports nothing archived, which is indistinguishable from a clean sweep. The consolidation surfaces the busy vault to the user and asks them to click Refresh again shortly, because they confirmed that merge through a modal. (Notable.)
+- **The clean-repository memo is cleared by both mutations, but only conditionally by the sweep.** The consolidation always clears the whole set after a successful merge; the sweep clears it only when it actually archived something. A sweep that archived nothing leaves a previously-clean repository memoised, so the following listing still short-circuits past the reconcile + heal pre-pass. (Notable.)
 - **The first-segment namespace lookup is two-tier and ordered.** A first segment matching both a discovered repository and a user-created entry of the same name resolves as the repository — the exclusion-set step at root listing also prevents the user entry from appearing twice. Two repositories of the same configured name disambiguate via their on-disk basenames (the recorded name plus parenthesised basename composition). The user-entry second-tier exists so the parent folder doubles as an Obsidian-style notes dump without those notes being mistakenly classified as repositories.
 - **Repository-discovery is re-invoked on every listing.** The service stores no repository list; every listing fetches the latest snapshot from the boundary discovery surface using the latest-supplied workspace identity and Memory Bank parent folder. A repository created or removed since the previous listing is reflected immediately on the next call. (Notable.)
 - **Reconcile + heal is awaited inline, not fire-and-forget.** The regenerated visible files must be on disk by the time the inner listing enumerates the folder; a fire-and-forget heal would return a tree omitting the recovered files and require the consumer to refresh again. (Notable.)
@@ -373,4 +383,7 @@ The folder-node payload returned from any single listing has no state of its own
 - **The content-fingerprint algorithm** is defined by the folder-based-summary-storage spec. This spec computes the same algorithm at every divergence check.
 - **The consumer-side message protocol that drives this service** (the expand-folder request, the folders-data response, the folders-reset signal, the error fallback that returns an empty-children tree to end the consumer's loading state) is defined by the VS Code sidebar webview message-protocol spec. This spec defines only the in-process interface.
 - **The per-commit skill-usage aggregate file behind the `skill` kind** — its path within a branch folder, its content, and when it is written — is defined by spec 323 (and the Memory Bank folder layout, spec 151). The sidebar row's rendering, tag and context menu are owned by spec 324; this spec's own note on them records only what follows from the classification.
+- **The archival sweep a Refresh runs before re-listing** — its emptiness predicate, its inert-document allowlist, its two-name operating-system-noise exemption, its two-part current-repository guard, its notification, and its silent skip on a busy vault — is defined by the Memory Bank unused-folder archival spec. This spec defines only that the sweep exists on this surface's Refresh, the interfaces it reaches through here, and its effect on the clean-repository memo.
+- **The duplicate-folder consolidation a Refresh runs after the sweep** — the duplicate set, the three classifications and their survivors, the copy-if-absent merge and metadata union, the rebuild from the system of record, its two degradations, and its visible failure on a busy vault — is defined by the Memory Bank duplicate-folder consolidation spec. This spec defines only the split detect-then-confirm-then-execute shape it needs from this service and the current-project-root precondition.
+- **The per-vault write lock** both Refresh mutations hold, its short wait budget, and the cross-repository pending-worker registry that neither of them drains on release are defined by the vault write-lock spec.
 - **The on-disk file-system semantics** (the readdir-with-types primitive, the stat primitive, the line-ending and byte-order-mark conventions) are platform conventions and not duplicated here.

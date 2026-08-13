@@ -6,10 +6,10 @@ A hand-maintained, per-model USD list-price table keyed by the exact model
 identifier that appears in a transcript, plus the uniform cost formula that
 prices a model's normalised token usage against it — the write-time cost
 estimate stamped on a commit summary and preferred by every token meter in the
-product (the editor extension's branch bar and per-memory detail meter, and the
-JVM/IDE surface's own detail meter and memories-list figure), each with its own
-preference granularity and its own fallback to the flat-rate estimator for what
-the stamped figure does not cover.
+product (the editor extension's branch bar and per-memory detail meter, the local
+dashboard's memory detail, and the JVM/IDE surface's own detail meter and
+memories-list figure), each with its own preference granularity and its own
+fallback to the flat-rate estimator for what the stamped figure does not cover.
 
 ## Scope
 
@@ -33,6 +33,9 @@ the stamped figure does not cover.
   granularity, its own fallback to the unrelated Sonnet-only estimator (see
   [243 — Token Usage Extraction and Cost Estimation]), and its own set of states
   when neither source yields a figure.
+- The one shared routine that serves the per-node, per-model-bucket granularity for
+  both the editor extension's detail meter and the local dashboard's memory detail,
+  and the half of its result the dashboard discards.
 - The JVM/IDE surface's divergences: a tree-wide, all-or-nothing stored-versus-flat
   preference, a single static tooltip, an article line priced by its own port of the
   flat-rate estimator, and a branch banner that sums already-resolved row costs
@@ -239,9 +242,27 @@ that preference, and in what they render when neither path yields a figure:
   scalar total has nothing for it to price and could not produce a figure even if
   the suppression were lifted. So the branch bar has three cost states, not two:
   stored, segment-derived fallback, and **suppressed**.
-- **The per-memory detail meter** resolves the preference **per node of the
-  consolidation tree, and within a node per model bucket**. It walks every node
-  and, for each:
+- **The per-node, per-bucket rule now serves TWO surfaces from one routine.** The
+  editor extension's per-memory detail meter and the local dashboard's memory
+  detail both call the same shared walk, which lives in the shared core rather
+  than on either surface — precisely because a memory's cost must read the same on
+  both, and it did not: the dashboard read the tree's ROOT node's own stored cost
+  while the editor summed the whole tree, so a consolidated memory was priced at a
+  fraction of the work folded beneath it on one surface and in full on the other,
+  with identical token headlines on both. The dashboard's memory detail now runs
+  the whole-tree walk; the editor's output is unchanged, since it was already the
+  caller the rule was written for. (The spec's earlier enumeration of which
+  surface prices how did not mention the dashboard at all.) The dashboard keeps
+  the ROOT's price-table verification stamp for its "estimated at these prices"
+  note, which is what that note has always meant, even though the nodes summed
+  beneath it may carry different stamps. It also uses only half of what the shared
+  routine returns: it takes the dollar figure and **discards the source mode**, so
+  it has no counterpart to the three source-naming tooltip wordings below, and it
+  attaches no cost field at all when the walk totals zero — an absent figure,
+  never a rendered `$0.00`.
+
+  The routine resolves the preference **per node of the consolidation tree, and
+  within a node per model bucket**. It walks every node and, for each:
   - a node with a strictly-positive stored cost contributes that cost — plus a
     flat-rate estimate for exactly those of its per-model buckets whose model has
     no table entry, since a stored cost is a lower bound and not proof of full
@@ -298,8 +319,10 @@ that preference, and in what they render when neither path yields a figure:
 
 Because that meter's figure can be fed by either source or both, it reports which
 one it actually used rather than overclaiming. The wording is selected by how many
-nodes contributed from each source. (The JVM/IDE detail meter has one static
-wording instead — see above.)
+nodes contributed from each source — the source mode the shared per-node routine
+returns alongside the figure. (The JVM/IDE detail meter has one static wording
+instead, and the local dashboard's memory detail has none at all: it drops that
+mode — see above.)
 
 1. **Stored only** (at least one node priced from the table, none fell back) —
    described as priced per model at list rates, with the standard "no
@@ -316,7 +339,9 @@ priced at zero.
 This means the same commit's cost can legitimately read differently on several
 surfaces at once: the editor extension's branch bar prefers a branch-wide stored
 sum, falls back only from the segments, and suppresses the figure entirely when no
-memory reports segments; its detail meter mixes per node and per model bucket; the
+memory reports segments; its detail meter and the local dashboard's memory detail
+share one routine that mixes per node and per model bucket, and therefore agree by
+construction (differing only in that the dashboard shows no source wording); the
 JVM/IDE meters prefer tree-wide and all-or-nothing; and every article line is always
 flat-rate — from one of three separate copies of that estimator's usage block, one
 of which is a re-implementation on the JVM.
@@ -404,6 +429,13 @@ of which is a re-implementation on the JVM.
   remains on the older Sonnet-only estimator with no migration in flight — and the
   meters keep that estimator as their fallback, so the older path is not merely
   legacy, it is load-bearing. (Notable.)
+- **The per-node, per-bucket rule is shared code, and the surface that adopted it
+  most recently is the one it fixed.** The local dashboard's memory detail used to
+  read the tree's root node's own stored cost while the editor summed the whole tree,
+  so a consolidated memory's cost differed by orders of magnitude between the two
+  surfaces while both showed the same token headline. Moving to the shared walk
+  changed the dashboard's number and left the editor's untouched. (Notable; the fix
+  was to route a second caller through the existing rule, not to change the rule.)
 - **Several meters, two preference granularities, and different "no figure"
   behaviours.** The editor extension's branch bar suppresses the cost outright when no
   memory on the branch reports segments; its detail meter states the absence in words
@@ -442,6 +474,15 @@ of which is a re-implementation on the JVM.
   tree-aggregation helpers that merge per-model usage across a tree and sum
   an already-priced cost across a tree, are defined in [04 — Summary Tree
   Structure].
+- **The per-node, per-model-bucket walk is one routine with two callers**, and it
+  lives in the shared core rather than on either surface for exactly that reason:
+  the editor extension's per-memory detail meter and the local dashboard's memory
+  detail must show the same figure for the same memory, and they did not while the
+  dashboard priced the tree's root alone. It returns the dollar total and the source
+  mode; the editor uses both, the dashboard uses only the total. Its membership test
+  for "unpriced" is the same per-model lookup the write-time estimate uses — probed
+  through that lookup's own null answer rather than by re-reading the table — so the
+  two can never disagree about what unpriced means.
 - **The price table and its formula exist twice, and must move together.** The
   JVM/IDE surface carries an independent port of the same table — the same rows
   (three dozen on each side today), the same rates, the same verification stamp, the

@@ -25,7 +25,7 @@ The loopback-only HTTP service that renders the local dashboard's pages and answ
 - The browser-side page modules that consume the inlined model and call these routes.
 - The repository registry, the identity derivation, and the folder probe — the Repository Registry and Probe topic.
 - Telemetry buffering, consent, and the event registry that decides whether a forwarded event is recorded at all.
-- The settings mutation semantics (masked-key reuse, the cross-repo hook sweep, folder validation wording) and the install/uninstall functions the repository routes drive.
+- The settings mutation semantics (masked-key reuse, the cross-repo hook sweep, folder validation wording) and the install/uninstall functions the repository routes drive. **The split with that topic is deliberate and one-directional: the access boundary is enumerated here and nowhere else** — it is a property of the route surface, not of any one payload — and that topic states only which of the settings routes are exceptions to the rule stated here, plus what those exceptions expose.
 - Sign-in's browser OAuth flow, the memory-bank migration, the manual sync, and the backfill engine.
 
 ## Data Contracts
@@ -122,7 +122,8 @@ Any exception thrown while handling a request is logged and answered **500** `In
 Stated plainly, because it is the security-relevant default:
 
 - **Almost every read is unauthenticated.** Session counts, token totals, cost, commit subjects, mined insights, memory bodies, plan and note documents, the per-repo push list, and the missing-summary count are all served to **any** caller that satisfies the host and origin checks — which a local process making a plain request does trivially (no `Origin` header, a loopback `Host`). So any other process, or any other user, on this machine can read them for as long as the server is up.
-- **Exactly three reads require the token**: the repository folder probe, the memory-bank folder check, and `/api/model` **when and only when** `view=settings` is requested (that payload carries masked keys, sign-in state and the memory-bank folder path).
+- **Exactly three reads require the token**: the repository folder probe, the memory-bank folder check, and `/api/model` **when and only when** `view=settings` is requested (that payload carries masked keys, sign-in state and the memory-bank folder path). The first two are gated because they probe the filesystem or feed a mutation — but the mutation the repository probe fed no longer has a caller in the shipped page, so of the three only the folder check and the settings view are reached by anything the browser loads.
+- **The settings view is the one place two conditions are demanded rather than one**: the token **and** a same-site indication, refused with the plain-text 403. **That second condition cannot be tripped from the shipped page** — the token is inlined on every page render and a same-origin fetch is never cross-site — so its entire effect is on other local processes and hostile tabs, which could otherwise read masked keys, sign-in state and the folder path. In a browser a trip is indistinguishable from any other failed load. (Unreachable from the product's own surface; reachable by everything else.)
 - **Every mutation requires the token**, except the telemetry beacon, which is deliberately ungated.
 - The token is inlined into **every** page this server renders, so any tab showing a dashboard page holds it. A cross-origin page cannot read it back (no CORS headers, and a cross-origin `Origin` is rejected), and a framing attack is blocked by the framing headers.
 
@@ -130,7 +131,7 @@ Stated plainly, because it is the security-relevant default:
 
 | Path | Token | Inputs | Response |
 | --- | --- | --- | --- |
-| `/api/repo-probe` | **required** | `path` (query) | 403 plain `Forbidden` on a bad/absent token; **400** `{"error":"path is required"}` when `path` is empty; else **200** with the folder probe result |
+| `/api/repo-probe` | **required** | `path` (query) | 403 plain `Forbidden` on a bad/absent token; **400** `{"error":"path is required"}` when `path` is empty; else **200** with the folder probe result. **No shipped caller** — see the note below |
 | `/api/settings/check-folder` | **required** | `path` (query, defaults to `""`) | 403 as above; **200** `{"status":"empty"\|"ok"\|"relative"\|"missing"\|"not-a-dir"\|"not-writable"}` |
 | `/health` | no | — | **200** `{"ok":true,"pid":<number>,"port":<number>,"schemaVersion":<number>}` |
 | `/` | no | window params (ignored except scope) | **302** to `/repositories` when no enabled repository exists, else to `/dashboard` |
@@ -150,6 +151,7 @@ Notes on the table:
 - **The gated pages build a full model before deciding to redirect.** `/dashboard`, `/dashboard/standup` and `/memories` redirect to `/repositories` when no enabled repository exists — but only after their model has been built. `/repositories` is deliberately not gated: it is the page that opens the gate.
 - **Window parameters** accepted by every model-building route: `repo` (selects a repo-scoped view; absent means all), `range` (one of `today`, `week`, `2w`, `month`, `3m`, `custom` — anything else is dropped), `from` / `to` (forwarded verbatim), `dimension` (one of `model`, `agent`, `project`, `branch`, `ticket`, `category` — anything else is dropped), `hash` (which memory's detail to build) and `detailRepo` (which repository owns that hash, kept separate from `repo` so opening one memory does not narrow the page).
 - **Assets are never served as files.** There is no static-file route: a request for a stylesheet or a script path is an unmatched path and 404s. Everything the page needs is inlined into the page itself.
+- **The repository probe has no caller in the shipped page.** It exists to report on a candidate folder before it is added, and the only surface that ever asked — a folder-browser add flow on the Repositories page — was removed along with its own browse endpoint (which now 404s) when the settings folder control became a validated text field. The probe is still routed, still token-gated and still answers; nothing the browser loads reaches it. The same is true of two POSTs, `/api/repos/enable` and `/api/hooks/reinstall` (below). (Unreachable from the shipped page; live over the wire — a token-bearing local client still gets all three.)
 
 ### POST routes
 
@@ -165,10 +167,10 @@ For every other POST, in order:
 
 | Path | Inputs | Response |
 | --- | --- | --- |
-| `/api/repos/enable` | `path` | **400** `{"error":"path is required"}`; **400** `{"error":"path is not a git repository"}`; **500** `{"error":<install failure message>}`; **200** `{"ok":true,"repoIdentity":…,"warning"?:…}` |
+| `/api/repos/enable` | `path` | **400** `{"error":"path is required"}`; **400** `{"error":"path is not a git repository"}`; **500** `{"error":<install failure message>}`; **200** `{"ok":true,"repoIdentity":…,"warning"?:…}`. **No shipped caller** |
 | `/api/repos/disable` | `repoIdentity` | **400** `{"error":"repoIdentity is required"}`; **404** `{"error":"no repository with that identity is registered"}`; **500** `{"error":<uninstall failure message>}`; **200** `{"ok":true,"warning"?:…}` |
 | `/api/repos/resume` | `repoIdentity` | same errors as disable; **200** `{"ok":true,"warning"?:…}` |
-| `/api/hooks/reinstall` | `repoIdentity` | same errors; **200** `{"ok":true}` — no warning field, because this route makes no database write |
+| `/api/hooks/reinstall` | `repoIdentity` | same errors; **200** `{"ok":true}` — no warning field, because this route makes no database write. **No shipped caller** |
 | `/api/settings/apply` | the full settings object | **400** `{"error":<validation message>}`; **500** `{"error":"could not save settings"}`; **200** `{"ok":true,"hookFailures":[{"integration":"Claude"\|"Gemini","worktree":…,"cause":…}]}` |
 | `/api/settings/set-push` | `repoIdentity`, `disabled` (boolean), `isCurrentRepo` (optional) | **400** `{"error":"repoIdentity is required"}`; **400** `{"error":"disabled (boolean) is required"}`; **500** `{"error":"could not change push setting"}`; **200** `{"ok":true,"disabled":<boolean>,"recoveredFromCorrupt"?:true}` |
 | `/api/settings/signin` | — | **200** `{"ok":true}`; **400** `{"error":<reason>}`, including the timeout message after **5 minutes** waiting for the browser callback |
@@ -218,6 +220,8 @@ Two, and only two:
   "Cross-site" is read from **`Sec-Fetch-Site`**: any value other than `same-origin` or `none` counts as cross-site. **An absent header is trusted** (treated as not cross-site) — that is a non-browser client on the user's own machine.
 
 - **Generate-missing summaries.** The one mutation that spends model budget: it resolves the launch directory's repository root, then backfills that repository's un-summarized commits. Serialised process-wide by an in-flight flag, so a second click (from a refresh or a second tab, either of which loses the page's own busy state) is answered **409** instead of paying for every summary twice. The flag is cleared however the run ends.
+
+  **The serialisation is process-scoped only, and that is narrower than it sounds.** No run-level lock is taken, so a concurrent command-line backfill still duplicates the spend; the storage write lock serialises individual writes, not runs. What the flag stops is two clicks against **this** server, which is the case that made every memory get paid for twice — the missing set is computed once at run start, so both runs walked the same candidate set.
 
 ### The database writes this process makes
 
@@ -279,6 +283,8 @@ A third route reaches a write indirectly: generate-missing stores the summaries 
 - **The telemetry beacon answers 204 for everything.** A malformed body, an oversized body, an unregistered event name and a forwarded event are indistinguishable to the caller. It is also the one POST that is not token-gated. (Notable; deliberate.)
 - **An unrecognized `?view=` silently becomes `stats`** rather than 404ing, so a typo returns a plausible payload for the wrong view. (Surprising.)
 - **`/settings` is a 404.** Settings is a modal, and its payload is the one `/api/model` view that is token-gated. The accepted view-token set is strictly larger than the served page set. (Notable.)
+- **The same-site condition on that view cannot be tripped by the shipped page.** The token is on every page and a same-origin fetch is never cross-site, so the check exists entirely for other local processes and hostile tabs — the only callers that can fail it. (Unreachable from the product's own surface, reachable by everything else.)
+- **The generate-missing guard is process-scoped only.** It stops two clicks in two tabs against this server; it does not stop a concurrent command-line backfill from paying for the same memories again, since the storage write lock serialises individual writes rather than runs. (Notable; the obvious reading of "serialised" is wrong here.)
 - **A gated page pays for its whole model before redirecting away from it.** The redirect decision is made from the built model's repository list. (Notable.)
 - **`/decisions` redirects unconditionally and forever**, including when the target page would itself be gated away. (Notable.)
 - **A partially-shipped asset tree is skipped, not used.** The door check requires the template, the stylesheet and every script; a candidate that has only the template falls through, and a total failure produces a scriptless plain-text 500 that nothing polls its way out of. (Notable; this is why the asset list is restated in the publish inventories — where it is currently one file short.)
@@ -289,6 +295,7 @@ A third route reaches a write indirectly: generate-missing stores the summaries 
 - **The per-worktree git identity cache has a 5-minute TTL, and caches the empty answer too.** A repository with no configured identity would otherwise pay two subprocesses on every poll precisely because it has nothing to remember. (Notable.)
 - **An array body passes the object-shape check** and then fails on the per-route required-field checks. (Surprising; benign.)
 - **Pause, resume and reinstall fan out over every surviving checkout of that identity and stop at the first failure**, so a partial application is possible: earlier checkouts have been changed, later ones have not, and the response is a 500. Enable does not fan out — it acts on the one path it was handed. (Notable; the asymmetry is easy to misread as an oversight.)
+- **Three routed, token-gated routes have no caller in the shipped page**: the repository probe, `/api/repos/enable` and `/api/hooks/reinstall`. All three served a folder-browser add flow on the Repositories page that was deleted, together with its own browse endpoint — which now answers 404, so a token-bearing local client can no longer walk the home tree. The three survivors still route, still gate on the token, and still act; only nothing in the browser asks them. Re-adding an "add from here" surface means building a front end against endpoints that are already there. (Unreachable from the shipped page, not unreachable over the wire — a distinction the route table alone cannot show.)
 - **The bind-phase error listener is detached the moment the listener starts serving.** Leaving it attached would swallow every later error — rejecting an already-settled promise is a no-op, yet the listener's presence stops the runtime from surfacing the error at all. (Notable.)
 
 ## Shared Behavior
@@ -298,5 +305,5 @@ A third route reaches a write indirectly: generate-missing stores the summaries 
 - The dashboard database, its schema version, its read-only/writable open modes, and the runtime floor that decides whether it can be used at all.
 - Every model-building query behind `/api/model`, the memories page cursor semantics behind `/api/memories`, and the context-document lookup behind `/api/context`.
 - Telemetry buffering, consent handling, the registered event names, and the periodic flush this process arms.
-- The settings mutation semantics behind `/api/settings/apply` (masked-key reuse, tri-state global instructions, the cross-repository hook sweep) and the folder-status verdicts shared with `/api/settings/check-folder`.
+- The settings mutation semantics behind `/api/settings/apply` (masked-key reuse, tri-state global instructions, the cross-repository hook sweep), the folder-status verdicts shared with `/api/settings/check-folder`, what the two open settings reads expose, and what the deleted folder-browser took with it — spec 363. **The access boundary is not shared with that topic**: it is enumerated here, and that topic names only the settings routes that are exceptions to it. Same for the generate-missing guard, which is stated here in full and referenced there.
 - The inline-script escaping applied to both page globals, which is shared with the other surfaces that inline model JSON into a page.

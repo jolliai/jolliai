@@ -7,7 +7,7 @@ The behavior, run as part of the per-commit summarization pipeline, that takes u
 ## Scope
 
 **In scope:**
-- The selection rule that determines which registry entries are eligible for archival on a given commit.
+- The selection rule that determines which registry entries are eligible for archival on a given commit, including the deterministic refusal of a plan whose source file belongs to a different repository.
 - The filename convention under which a snapshot is stored.
 - The single-entry rewrite of the local registry: the original slug's row becomes a guard entry. No second row is created under the slug-with-hash key.
 - The plan-reference structure attached to the new commit summary.
@@ -54,9 +54,14 @@ The archived plan content is stored on the orphan branch at a conventional path 
 ### Selection of eligible entries
 
 1. Load the plan registry.
-2. Collect every entry whose commit-hash field is null and whose content-hash-at-commit field is absent.
+2. Build a single per-run classifier that answers, for one source path, whether it belongs to **this** repository, to a **foreign** one, or to **neither** (see "Foreign-repository plans are refused inside the selection").
+3. Admit an entry in either of two states — and in both, refuse it outright when the classifier calls its source path foreign:
+   - **Fresh** — commit-hash field null and content-hash-at-commit field absent. This is "genuinely uncommitted and not yet archived".
+   - **Revived guard** — commit-hash field non-null, content-hash-at-commit field set, a source path present, and the file's current SHA-256 no longer matching the stored content hash. The classification is checked **before the file is hashed**, so a foreign file is never read at all.
 
-These two conditions express "this entry is genuinely uncommitted and not yet archived". Entries that already carry a content hash are guard records from a prior archival; entries with a non-null commit hash are either committed snapshots or stale records superseded elsewhere. There is no per-row hidden flag consulted here: user hard-exclude is handled entirely by the separate commit-exclusion store (see [188]), and any row the registry reader finds carrying a legacy `ignored === true` marker is deleted outright on read rather than kept as a hidden variant.
+Every other shape is skipped. A guard whose file still hashes to the stored value — or whose file cannot be read at all — is an intact guard with nothing new to archive. An entry carrying a commit hash but no content hash, or no source path, matches neither state and is a committed snapshot or a record superseded elsewhere.
+
+There is no per-row hidden flag consulted here: user hard-exclude is handled entirely by the separate commit-exclusion store (see [188]), and any row the registry reader finds carrying a legacy `ignored === true` marker is deleted outright on read rather than kept as a hidden variant.
 
 Selection is branch-independent, because a registry entry carries no branch to select on. Every genuinely-uncommitted entry in the worktree's registry is eligible for the commit being processed, whichever branch that commit is on. The commit's own branch is the only branch attribution an archived plan ever acquires.
 
@@ -123,27 +128,47 @@ If the original slug were deleted on archival, the system would lose its only ha
 
 Multiple commits over the lifetime of a plan produce multiple archived snapshots under distinct slug-and-hash keys. These snapshots coexist only on the orphan-branch storage, where each is individually retrievable, and each is pointed to by a plan reference on its commit summary. They are **not** registry rows — the registry holds only the single guard row under the original slug, and the panel hides that guard while its content hash matches. The summary tree is the canonical pointer from a commit to its plan references.
 
-### Skipping happens in three places
+### Where an entry is skipped
 
-- An entry's registry record is missing — skipped silently with a debug log.
-- An entry's source file is missing on disk — skipped.
-- An entry's commit-hash field is already non-null or its content-hash-at-commit field is set — already-archived guard or already-associated, skipped before reading the file.
+- Its source path is classified as belonging to a foreign repository — refused inside the selection, on the fresh branch and on the revived-guard branch alike, and on the revived-guard branch before the file is even hashed.
+- It carries a commit hash and a content hash, and the file's current hash still matches the stored one (or the file cannot be read at all) — an intact guard, nothing new to archive.
+- It carries a commit hash but no content hash, or carries no source path at all — matching neither admitted state.
+- Its registry record is missing when the archival loop looks it up — skipped silently with a debug log.
+- Its source file is missing on disk at archival time — skipped.
 
-In all three cases the archival batch simply does not include the skipped entry.
+In every case the archival batch simply does not include the skipped entry.
 
 ### Idempotency rests on the guard
 
-A second archival of the same plan against the same commit hash short-circuits at the selection rule: the entry's content-hash-at-commit field is already set, so it is no longer eligible. There is no separate idempotency check at the storage layer.
+A second archival of the same plan against the same commit hash short-circuits at the selection rule: archival just wrote the content-hash-at-commit field from the file's current bytes, so the file's live hash matches the stored one and the entry is neither fresh nor a revived guard. There is no separate idempotency check at the storage layer.
+
+### Foreign-repository plans are refused inside the selection
+
+Plans are discovered by scanning an agent transcript for the markdown files it read or wrote, so a session working in this repository that incidentally touches a markdown file in an unrelated checkout registers that other repository's file as one of *this* repository's plans. The selection rule refuses such an entry outright, with no model in the loop.
+
+The decision is by git-repository **identity**, not by directory containment: a legitimate agent plan lives in a machine-global plan directory outside the worktree, so "outside the worktree, therefore foreign" would drop exactly the plans that matter most. A source path inside the current worktree is this repository's, decided without any git call; so is a path inside a whitelisted canonical agent plan directory; otherwise the enclosing repository's identity is compared against the current worktree's. A sibling checkout of the *same* repository is likewise this repository's, since linked worktrees of one repository share one identity.
+
+**Uncertainty never excludes.** An entry with no source path, a file that lies in no repository at all, and a current worktree whose own identity cannot be resolved all classify as **neither**, and *neither* is always kept. The refusal fires only where foreignness was actually proved.
+
+Consequences that do not follow the pattern the other exclusions set:
+
+- **The refusal lives inside the selection, not in the caller.** The user's hard-exclude set and the relevance ranker's soft-exclude set are both applied by the caller, which subtracts their slugs from the candidate set this path returned. The foreign refusal happens while the candidates are being collected, so it is in force on every route that reaches this path at all, and no caller can hand a refused slug back in. Those routes are the plain commit, the squash-consolidation route and every amend shape — but not the 1:1 rebase reapply, which never reaches this path at all and therefore never applies the refusal either; it only re-points a prior summary's existing plan references, so it has no candidate set to classify.
+- **A refused plan is refused on every future commit, forever.** Every other unarchived plan stays eligible for the next commit; a foreign one is re-classified identically each time and refused again for as long as its source path stays where it is. It is never archived — and equally never deleted: its uncommitted registry row and its backing file are left completely intact.
+- **On some routes the refusal is silent.** The routes that build a fresh summarization prompt run their own upstream copy of the same classification and record one excluded-context entry per foreign plan on the stored summary, carrying a fixed reason, so a panel can show why the plan was left out. The squash-consolidation route, and the amend routes that carry the previous memory's topics forward instead of generating new ones, hand this path an **empty** excluded-context set — so on those, the plan is dropped from the archive with no audit row anywhere explaining the omission.
+
+**Notable asymmetry: containment beats identity, in one direction only.** The in-worktree check short-circuits before any git call, so a plan file inside a submodule or an unrelated nested clone that happens to sit *under* the current worktree is classified as this repository's and archived into this repository's memory — no repository walk is performed. The very same submodule checked out *outside* the worktree is classified foreign and refused. Which answer a submodule gets therefore depends on where it is checked out, not on what it is.
 
 ### Interaction with exclusions (skipped from archival, never discarded)
 
-Before invoking this path, the pipeline removes two kinds of slugs from the set of candidates it hands to archival: the user's **hard-excluded** plans (the "leave out of this memory" set), and the plans the AI relevance ranker **soft-excluded** for this commit (see [258]). Both are now treated **identically**:
+Before invoking this path, the pipeline removes the user's **hard-excluded** plans (the "leave out of this memory" set) and the plans the AI relevance ranker **soft-excluded** for this commit (see [258]) from the set of candidates it hands to archival. A third exclusion also reaches archival — the deterministic foreign-repository refusal above — but it is not one of the caller's subtractions: it is applied *inside* the selection rule and cannot be handed back in. The two the caller subtracts are treated **identically**:
 
 - A hard-excluded or soft-excluded plan is **skipped from association only**. No commit hash is assigned to it, no content-hash guard is written, and its uncommitted registry row and backing file are left completely intact. The plan is **neither archived nor deleted** — it stays in the working area (commit-hash still null, no content hash) and the panel surfaces it again on the next refresh, eligible for archival or a fresh relevance judgement on the next commit.
 
+The foreign refusal shares the "neither archived nor deleted" half of that and **not** the "eligible on the next commit" half: a foreign plan's row and file are equally untouched, but the classification is deterministic and re-derived per commit, so the next commit refuses it again on exactly the same grounds. Only moving the file makes it eligible.
+
 There is **no discard pass** for plans. An earlier design permanently deleted a user hard-excluded plan's registry row and product-owned backing file on the excluding commit; that behavior has been **removed entirely**. "Leave out of this memory" is a one-commit skip, not a delete — the user's hard-exclude and the AI's soft-exclude now converge on the same sticky leave-out.
 
-**A route that runs no relevance judgement has no soft-exclude set.** The soft-exclude set exists only where a relevance judgement was made for the commit being processed; where none was, the set handed to archival is empty and the user's full working-area selection is archived, minus only their hard excludes. The squash-consolidation route is one such route: it consolidates the topic structures the squashed-away commits already carry rather than re-deriving anything from the diff and transcript, so there is nothing for a relevance judgement to rank and none is made.
+**A route that runs no relevance judgement has no soft-exclude set — but it still refuses foreign plans.** The soft-exclude set exists only where a relevance judgement was made for the commit being processed; where none was, the set handed to archival is empty and the user's full working-area selection is archived, minus their hard excludes *and* minus any plan the selection rule classifies as foreign. The squash-consolidation route is one such route: it consolidates the topic structures the squashed-away commits already carry rather than re-deriving anything from the diff and transcript, so there is nothing for a relevance judgement to rank and none is made — yet a foreign plan is still dropped there, and dropped **silently**, because the empty excluded-context set that route passes means no audit row is written to say so.
 
 **Contrast with conversations (the discard exception):** excluded *conversations* are the one item kind that is still a one-time discard — an excluded conversation is read only to advance its cursor to the commit boundary and is then dropped from the summary, so it never reappears. That discard is owned by the transcript-loading path, not this one; plans (like notes and references) are the sticky, skip-only kind.
 
@@ -169,3 +194,4 @@ The registry entries that this path reads are populated by an entirely separate 
 - **Re-association on rewrite** — the amend, squash, and rebase pipelines that walk a prior summary's plan-reference list and update each entry's commit-hash field in the registry. On the amend and squash routes that step runs alongside the archival documented here, and after it, so a guard revived and re-archived under the new hash is not migrated a second time.
 - **Note archival on commit** — the parallel path for note entries; this topic only covers plans.
 - **AI context-relevance filtering (spec 258)** and **commit-exclusion store (spec 188)** — a soft-excluded plan and a user hard-excluded plan are treated identically: both are removed from the candidate set fed here and neither is discarded (each stays uncommitted, row and file intact, for re-evaluation on the next commit). Only excluded conversations are a one-time discard, and that is owned elsewhere.
+- **Plan source-path classification** — the repository-identity rules the selection above consults (what counts as this repository, what counts as foreign, and the "uncertainty is kept" default) are owned by their own topic; this spec owns only how the answer gates archival. The pre-commit surfaces that fold the same classification into what they present as claimable, and the excluded-context row the fresh-prompt routes write for a refused plan, are owned by those surfaces' topics.

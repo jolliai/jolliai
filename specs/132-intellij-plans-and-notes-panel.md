@@ -14,6 +14,7 @@ The CONTEXT section of the JolliMemory tool window — a single newest-first lis
 - Title rendering per kind, including the committed short-hash prefix on plan and note rows and the CLI-supplied label on the skills row.
 - The per-row hover action cluster (pin, edit, remove, leave-out toggle) and the skills row's reduced cluster.
 - The leave-out toggle: which key each kind writes, why the skills row writes every key at once, the struck-through rendering, and the failure dialogs.
+- What the leave-out sets this panel reads do **not** contain, and the plan the next memory refuses without saying so.
 - Row click → rendered preview; the edit action → the file's source; the right-click menu per kind.
 - The delayed hover card per kind, including the skills card's ordering, cap, overflow line, em-dash rule and footnote.
 - The remove flow: confirmation, the CLI-side removal, the failure dialog, and the working-context refresh that follows.
@@ -101,6 +102,8 @@ Runs off the UI thread, on every fire of either channel.
 
 1. Read the status snapshot. No snapshot → the initializing placeholder. Not enabled → the not-enabled placeholder.
 2. **One round trip** returns the visible plans, the visible notes, the reference rows keyed by their map key, and all five leave-out sets at once. The panel applies no filter of its own: archive guards, committed-snapshot copies and orphaned rows are already dropped, and no branch comparison is performed anywhere — working-area context belongs to the worktree and binds to a branch only when a commit claims it. Reference rows carry no committed state at all (a commit deletes the row), so every returned reference is active.
+
+   **All five leave-out sets arrive exactly as stored.** This round trip applies no classification of any kind on the way out — no containment check on a plan's source file, no derivation of any sort — and the panel adds none. So a row is struck through only because the user's own stored set holds its key, never because anything decided the next memory would refuse it. The sibling round trip a host uses to ask "what would the next memory claim?" does apply such a classification and marks a plan whose file belongs to another repository excluded in the set *it* answers with; that is a different operation, deliberately kept separate, and this panel does not call it. See the Notable section for what that costs here.
 3. **A second round trip** returns the active skills — the rows no commit has claimed — together with their summary label. This is deliberately not a read of the raw skill registry: a skill row survives archival, so the raw map would list every skill ever used as if it were fresh working state. This call **degrades to an empty answer** rather than failing, so a skills hiccup costs one row instead of the whole repaint.
 4. Wrap each item, merge all four kinds into one list, and sort by the row's timestamp descending.
 5. Hand the list to the UI thread and re-render.
@@ -134,6 +137,8 @@ Entering a row tints it, reveals its action icons, and starts a one-second timer
 2. Off the UI thread, write: one key for a plan / note / reference, or **every captured skill's key in a single bulk write** for the aggregate row. Leaving any skill key untouched would strand it in a state the user has no affordance to see or change.
 3. A write failure logs and opens an error dialog ("Could not update whether this item is left out of the next memory"). This is a cross-process round trip, so a stopped daemon, a missing runtime or a cold-start timeout all land here; without the dialog the click would be indistinguishable from a dead control, because the row keeps its old state.
 4. On success, notify the selection-changed channel, then re-read all five sets and re-render. **The re-read is best-effort**: the write has already landed, so a failure here costs a stale checkbox until the next refresh, not a lost change.
+
+**The toggle is a plain flip for every row kind, including a plan the next memory will refuse.** The write lands, and the re-read in step 4 returns the stored sets verbatim — the read path behind it classifies nothing either — so both directions stick and both directions look the same on every kind of row. Nothing on this surface can mark a row that the commit path will drop on its own.
 
 ### Opening and editing
 
@@ -194,6 +199,8 @@ Dismiss any open hover card and unsubscribe from both channels.
   status not enabled        → "not enabled for this repository"
   else:
     round trip 1 → plans, notes, references, all five leave-out sets
+                   (every set exactly as stored — nothing on this path
+                    classifies a row or derives an exclusion)
     round trip 2 → active skills + their summary label (empty on failure)
     merge all four kinds, sort by timestamp descending
     UI thread: render (cap 6, "Show N more" beyond)
@@ -214,6 +221,7 @@ Dismiss any open hover card and unsubscribe from both channels.
     [write threw]  → dialog, stop
   notify selection changed
   re-read all five sets  [threw → stop; checkbox stays stale until next refresh]
+                         (stored sets verbatim — the flip sticks on every kind)
   UI thread: re-render
 
 [remove]
@@ -236,6 +244,8 @@ Dismiss any open hover card and unsubscribe from both channels.
 - **A per-skill token figure is formatted here, and that is a second copy of a shared format.** The round trip returns the aggregate label, not per-row text, so the card re-derives the compact form for each member. It is pinned to a fixed decimal separator for exactly that reason; the two roundings must not disagree across one click.
 - **An absent confidence marks the figure as an estimate.** The card marks anything that is not the attributed value, so a member arriving without a confidence renders with the estimate marker rather than as a measurement.
 - **A partially-excluded skill set reads as included.** The aggregate reads as excluded only when every member is, so one click after a partial exclusion excludes the remainder instead of re-including what was already out. An empty key set can never read as excluded.
+- **A plan whose source file lives in a different repository is shown as an ordinary, included row, and the next memory refuses it with no indication anywhere.** Neither read behind this panel classifies anything: the context round trip returns the stored leave-out sets verbatim, and so does the toggle's re-read. So such a plan is drawn un-struck, its toggle reads "leave out of this memory", and every affordance says it will be claimed. The commit-time archive step classifies the same file, drops it, and records that only in the debug log — so after a commit the row is still there, still uncommitted, with nothing on screen having changed and no warning at any point. The panel cannot notice: it never asks the question, and the answer is not in anything it receives. (Surprising.)
+- **The one surface that does mark such a plan is a different round trip, which this panel does not call.** The archive-selection read folds every foreign plan's slug into the leave-out set it answers with, so a host asking "what would the next memory claim?" sees the row marked excluded while this panel, asking "what is browsable?", sees it included. The two operations are deliberately separate and answer different questions; the cost is that the same plan reads two ways depending on which one a surface asked.
 - **Both the write and the re-read after a toggle can fail, and only one of them is loud.** The write opens a dialog because a silent failure leaves a control that looks dead. The re-read only logs, because the change has already landed and the cost is a stale checkbox.
 - **The panel subscribes to two refresh channels deliberately.** The status channel because the refresh gates on the enabled flag; the working-context channel because a plan, note or reference moving never triggers a status recompute. They are fired separately, so an event is never delivered twice.
 - **A failed repaint keeps the previous rows on screen.** What used to be a local file read is now a cross-process round trip, and the working-context channel repaints this panel whenever a plan file is saved anywhere on the machine — so one hiccup must not read as "the user has no context".
@@ -245,7 +255,7 @@ Dismiss any open hover card and unsubscribe from both channels.
 
 ## Shared Behavior
 
-- **Working-area context services** — own which plans and notes are browsable, what removing any row destroys, and the reference registry; this panel calls them and re-implements none of them.
+- **Working-area context services** — own which plans and notes are browsable, what removing any row destroys, and the reference registry; this panel calls them and re-implements none of them. They also own the plan source-file classification that decides which plans a commit will claim — applied at the commit-time archive step and on the archive-selection read, neither of which is on this panel's path.
 - **Active-skills projection** — owns which skills are still uncommitted and which figures a row reports; reached here through the plugin's bridge adapter.
 - **Aggregate skills rendering** — owns the summary label this panel displays and the table its preview opens (spec 323).
 - **Skill capture and archival** (specs 319, 322) — own the records behind the aggregate row: what is measured, when a row is written, and what a commit freezes.

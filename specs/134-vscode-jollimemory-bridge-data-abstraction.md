@@ -11,7 +11,7 @@ A central object the VS Code extension constructs once per workspace that funnel
 - The full surface of operations exposed by the bridge, grouped into the categories below. Methods marked **read** use a separate read-side storage handle so that a dual-write deployment can read from the folder shadow while writes go to the orphan branch primary; methods marked **write** use the primary write-side handle.
   - **Install / status / staleness** — enable, disable, auto-install-for-worktree, status-snapshot, hook-staleness check.
   - **Storage lifecycle** — two reload hooks (`reload-everything` and `reload-read-only`), each with its own invalidation scope.
-  - **Working tree** — list-files, list-files-by-commit, stage-files, unstage-files, discard-files, list-staged-paths, save-index-tree (with implicit unmerged-staging), restore-index-tree, reset-index.
+  - **Working tree** — list-files, list-files-by-commit, stage-files, unstage-files, discard-files, discard-preview (read-only), list-staged-paths, save-index-tree (with implicit unmerged-staging), restore-index-tree, reset-index.
   - **Commit message generation** — AI commit-message generator, no-LLM string-merge squash-message, LLM squash-message with string-merge fallback.
   - **Commit / amend / squash** — commit, amend-with-message, amend-no-edit, squash (with the summary-merge handoff below), squash-and-push.
   - **Branch history** — branch-commits walker with main-merge / fork-point detection, current-branch getter, HEAD-message getter, HEAD-hash getter, current-user-name getter, HEAD-pushed check.
@@ -80,12 +80,14 @@ Every method below is on the bridge surface. Errors that escape are documented i
 #### File ops
 - The working-tree listing capability — runs `git status -z --porcelain=v1 -uall` and returns a status row per file. Empty list on git failure.
 - The commit-files listing capability — runs `git diff-tree -m --first-parent -M -r --name-status --root <hash>` and returns a per-file info row for the given commit. Empty list on git failure.
-- The stage capability — `git add` for present paths; with the allow-missing option, partitions paths by on-disk existence and `git rm --cached --ignore-unmatch`s the missing ones. Errors propagate.
-- The unstage capability — `git restore --staged --` in a single invocation. Errors propagate.
-- The discard capability — groups by status and runs the matching restore / rm flow per group. Errors propagate.
+- The stage capability — `git add` for present paths; with the allow-missing option, partitions paths by on-disk existence and `git rm --cached --ignore-unmatch`s the missing ones. **Every path is wrapped as a literal, non-glob pathspec** in both branches. Errors propagate.
+- The unstage capability — `git restore --staged --` in a single invocation, **with every path wrapped as a literal pathspec**. Errors propagate.
+- The discard capability — **does not group by status and does not decide anything.** It reads only each row's repository-relative path (the collapsed status letter and both raw porcelain columns on the row are ignored) and forwards those paths to the shared discard rule set, which resolves each one against its own status read. It then filters the returned outcomes to the failures — branching on each outcome's success **flag**, never on whether its error text is non-empty — and, if any, raises **one** error naming every failing path with its reason, substituting a generic reason for a failure that arrives without one. Success is a silent resolve.
+- The discard-preview capability — the **read-only** companion to the discard capability, and the only thing that decides the wording of a discard confirmation. It forwards the same paths and reduces the answer to the set of paths whose discard would **delete** the file rather than restore it. It writes no index, worktree or ref, which is what lets it run before the user has confirmed anything. An empty request short-circuits to an empty set.
 
 #### Commit message generation
 - The commit-message generator — gathers the staged diff, branch name, staged file list, and global config; calls the Anthropic-or-Jolli routing layer; returns the proposed message. Errors propagate.
+- The selection-scoped commit-message generator and the diff-for-the-selection capability behind it — the same routing call, but scoped to an explicit path list rather than to the index. The diff capability runs a working-tree diff against the committed tree for those paths, then adds each untracked member back by diffing it against an empty file, so a selection of only new files still yields content to title from. **Both git calls that take the whole path list pass it bare** — this is the only capability in the module that hands git a caller-supplied path list without the literal-pathspec wrapper the staging capabilities use, on paths that came out of the same status rows. An empty selection short-circuits to an empty diff.
 
 #### Commit / amend
 - The commit capability — writes a plugin-source marker, runs `git commit -m`, returns the new HEAD hash.
@@ -142,7 +144,7 @@ Every method below is on the bridge surface. Errors that escape are documented i
 - The reference open-markdown — opens the per-reference markdown file in a VS Code editor tab.
 
 #### Index snapshot
-- The index-tree save — stages any unmerged files (assumes the worktree version is the resolution), runs `git write-tree`, returns the tree SHA.
+- The index-tree save — stages any unmerged files (assumes the worktree version is the resolution; **their paths too are wrapped as literal pathspecs**), runs `git write-tree`, returns the tree SHA.
 - The index-tree restore — runs `git read-tree <treeSha>`.
 - The index reset — mixed reset (no flags) to clear the index back to HEAD.
 
@@ -189,7 +191,8 @@ The bridge funnels three classes of errors:
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | Status-snapshot exceptions                | Caught; replaced with a fully-zeroed default snapshot.                                                  |
 | Tolerant git-subprocess non-zero exits    | Caught; empty string returned. Methods built on the tolerant runner (history, branch lookups, working-tree listing, commit-files listing, current-branch getter, HEAD-pushed check, etc.) treat the empty string as a no-data sentinel and return empty arrays / sensible defaults. |
-| Strict git-subprocess non-zero exits      | Propagated as a thrown error with the original git stderr. Methods built on the strict runner (stage / unstage / discard / commit / amend / squash / push / read-tree / write-tree / reset) propagate. |
+| Strict git-subprocess non-zero exits      | Propagated as a thrown error with the original git stderr. Methods built on the strict runner (stage / unstage / commit / amend / squash / push / read-tree / write-tree / reset) propagate. |
+| Per-path discard outcomes                 | **Not** a git-runner class at all — discard drives no git subprocess of its own. The shared rule set returns a success flag per path; the bridge raises one error naming every failing path and its reason (generic when the reason is absent). A discard where nothing failed resolves silently, and the read-only preview never raises for a per-path reason. |
 
 Local-folder push throws an error with the message `No summary found for commit <hash>` when the requested hash has no stored summary.
 
@@ -301,6 +304,9 @@ On deactivation there is no explicit dispose; the bridge is GC'd with the extens
 ## Notable Behavior
 
 - **The bridge is the single git boundary.** No command, provider, or message handler spawns a subprocess that runs `git` itself. The strict and tolerant git-subprocess runners are private to the bridge module.
+- **Discard is the one working-tree capability the bridge does not implement.** It is a pass-through to a shared, host-agnostic rule set that takes **paths only** — no status letters, no porcelain columns — and the bridge's whole contribution is aggregating the per-path outcomes into a single raised error. The bridge is therefore also the surface that decides *how* a partial failure is reported: one error naming every failing path, rather than a per-path result the caller would have to walk.
+- **Discard is also the one capability with a read-only twin whose only purpose is wording.** The preview shares its classification with the discard so the sentence the user reads and the operation that runs cannot drift; it is a separate capability precisely because it must be safe to call before the confirmation modal opens.
+- **The mutating path-list capabilities wrap their paths as literal pathspecs; the read-only diff ones do not.** Staging, allow-missing unstaging-of-the-absent, unstaging, and the unmerged-staging inside the index-tree save all wrap, because git matches a bare path as a glob and would act on a *different* file while exiting zero. The diff-for-the-selection capability, taking its path list from the very same file rows, passes them **bare** to both of its git calls — the tracked diff against the committed tree and the untracked-file scan — and so does the shared path-scoped working-tree diff-stat helper the next-memory preview calls. Neither writes anything, so a wrong glob there misstates what a preview shows rather than destroying an edit, but they are the case the rule most directly claims to cover: a path that came straight out of a status read. Wrapping is deliberately not applied to a caller-authored pattern.
 - **The bridge does not persist a worker-side global storage instance.** The bridge holds the storage backend on its own field; the in-process global the queue worker uses is irrelevant to the extension host because they live in different processes. This is what lets the user change storage mode in settings without affecting in-flight queue worker runs.
 - **The tolerant and strict git runners differ only in error handling.** Both invoke `git` as a child process from the workspace directory. The tolerant runner swallows non-zero exits and returns the empty string; the strict runner rethrows. Methods pick one based on whether their failure mode is "no data" vs. "operation failed".
 - **The plugin-source marker is written by every commit-creating path.** Without it, the post-commit-hook queue worker tags the queue entry with `commitSource: "external"` and may pick a different summary-generation strategy.
@@ -322,6 +328,8 @@ On deactivation there is no explicit dispose; the bridge is GC'd with the extens
 - **Session tracker (the plugin-source marker writer, the squash-pending writer)** — the writers of the plugin-source marker and the squash-pending record.
 - **Summarizer routing** — called by the commit-message generator and the LLM squash-message capability; the bridge supplies the input bundle.
 - **Local pusher** — called by the local-folder push after the bridge prepares the satellite list.
+- **Working-tree file discard rule set** — the shared, host-agnostic owner of the status read, the classification, the per-path operations, the outcome actions and the read-only wording query. The bridge's two discard capabilities are pass-throughs to it; the same rule set is reached by the JVM host over its own transport, which is what makes a bridge-side restatement of any of it a defect rather than a duplication.
+- **Literal-pathspec helper** — shared with that rule set; applied by the bridge's mutating path-list capabilities (staging, allow-missing staging, unstaging, unmerged staging) and **not** by its diff-for-the-selection capability, which hands git the same kind of path list bare.
 - **Plan and note services** — the bridge re-exports their list / save / remove / archive / cleanup methods.
 - **Reference service** — the bridge re-exports the reference detector, the registry-and-markdown remover, and the open-in-browser / open-markdown helpers.
 - **Repo discoverer and Memory Bank path resolver** — used by the cross-repo helpers to enumerate the foreign repos under the configured Memory Bank parent and resolve the per-repo Memory Bank root.

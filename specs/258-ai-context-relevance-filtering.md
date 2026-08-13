@@ -8,7 +8,7 @@ Before a commit summary is generated, a pure-LLM relevance ranker assesses each 
 
 **In scope:**
 
-- The candidate set the ranker is offered: the user-kept plans/notes/references **minus** every reference from a track-only source, and the consequences of that carve-out for tiers, reasons, and the soft-excluded set.
+- The candidate set the ranker is offered: the user-kept plans/notes/references **minus** every reference from a track-only source and **minus** every plan classified as belonging to a different repository, and the consequences of those two carve-outs for tiers, reasons, and the soft-excluded set.
 - The candidate representation: small items sent verbatim under per-kind character caps; larger items reduced to a mechanical, fence-aware skeleton under a skeleton cap.
 - The **change-affinity pre-ordering** applied before the budget is spent, its needle derivation, its scoring rule, its deliberately-ascending direction, and why that direction is the correct one for a fail-open-keep layer.
 - The total prompt character budget over all rendered items, how it is spent walking the affinity order, and tail-drop of the overflow.
@@ -31,6 +31,7 @@ Before a commit summary is generated, a pure-LLM relevance ranker assesses each 
 - The pre-commit review-panel overlay that displays tiers/reasons and calls the first orchestrator (owned by [247 — VS Code Working-Memory Review Panel]).
 - How the summary generator consumes the ranked context blocks, and how the soft-excluded set and the kept-item relevance projection are recorded as two fields on the stored summary (owned by [12 — Multi-Topic Commit Summary Generation]).
 - How the surrounding pipeline drops soft-excluded plans/notes from archival without discarding them (owned by [42 — Plan Archival on Commit] and [43 — Note Archival on Commit]).
+- The rules by which a plan's source file is classified as this repository's, a different repository's, or neither, and the independent second application of that classification inside archival's own selection (owned by their own topics; this spec owns only the shape of the resulting hole in the candidate set).
 - LLM transport, proxy routing, and credential/origin resolution (specs 08, 09, 10).
 
 ## Data Contracts
@@ -39,8 +40,14 @@ Before a commit summary is generated, a pure-LLM relevance ranker assesses each 
 
 The ranker's input is **not** simply "every active CONTEXT item". The caller partitions the user-kept set first and offers this layer only part of it:
 
-- The input set is the user-kept plans, notes, and references **minus every reference whose source declares itself track-only** (the flag is owned by the source-definition spec; which source declares it is the built-in-source catalog's concern).
-- The withheld track-only references are spliced back into the caller's kept set **unconditionally** after this layer returns, on both the normal-commit path and the amend path.
+The caller applies **two** carve-outs before this layer is offered anything, and they behave oppositely on the far side:
+
+- **Track-only references are withheld and returned.** Every reference whose source declares itself track-only is lifted out (the flag is owned by the source-definition spec; which source declares it is the built-in-source catalog's concern) and spliced back into the caller's kept set **unconditionally** after this layer returns, on both the normal-commit path and the amend path.
+- **Foreign plans are removed and not returned.** Every plan whose source file is deterministically classified as belonging to a **different git repository** is dropped from the input outright. Unlike a withheld track-only reference, it is not spliced back: it is neither offered to the ranker nor restored to the kept set. Classification is by repository identity rather than directory containment, and it keeps anything it cannot prove foreign — a plan with no source path, one in no repository at all, or one whose comparison cannot be resolved is treated as this repository's and stays in the input.
+
+So the input set is the user-kept plans, notes and references, minus the track-only references and minus the foreign plans.
+
+**The two carve-outs also differ in what they leave on the artifact.** A withheld track-only reference leaves no trace of the withholding anywhere. A removed foreign plan, by contrast, **does** land on the stored summary's excluded-context field — one entry per foreign plan, carrying a fixed reason phrase and the lowest tier. That entry is manufactured by the caller, not produced here: this layer never saw the plan, never tiered it and never wrote a reason for it, yet the field it lands in is the same field this layer's own soft-excluded set feeds. Downstream, a foreign-plan entry is therefore indistinguishable from a model verdict except by the wording of its reason, which no consumer inspects.
 
 Consequences for this layer's own contracts, all directly observable:
 
@@ -194,6 +201,8 @@ The model's tier is authoritative and is not re-binned by rank position — ther
 
 Any error anywhere in this layer (call failure, timeout, parse failure, a failed spawn of a local agent CLI) yields a **keep-all** result: every item marked relevant, tier `mid`, score `0.6`, empty reason, ranked in insertion order, `autoExclude` false. The `mid` default is a neutral data-layer choice (nothing over-claimed), but it is effectively **inert**: the fail-open reason is empty, and every display surface gates its tier chip on a non-empty reason, so a fail-open row shows no tier at all. An **empty** candidate list short-circuits to an empty result with no call at all — that is now the **only** input that skips the call.
 
+**Keep-all is this layer's own return value, not the caller's outcome.** The caller seeds its excluded-context field with the foreign-plan entries described above and only unions this layer's soft-excluded set into it on success, so a failure here still leaves those entries standing on the stored summary. "The layer failed open" therefore no longer implies "nothing was excluded".
+
 ### Building the change signal
 
 - The **commit message** is supplied by the caller (the pre-commit panel has none yet; the post-commit worker does).
@@ -215,7 +224,7 @@ Folding the diff into the key is **deliberately not done**: the pre-commit diff 
 
 ### Orchestrator 1 — assess relevance (reads content, ranks)
 
-Given registry entries already filtered of user hard-excludes **and already stripped of track-only references** (see "The candidate set"), a change signal, and an LLM config:
+Given registry entries already filtered of user hard-excludes, **already stripped of track-only references and of plans classified as belonging to a different repository** (see "The candidate set"), a change signal, and an LLM config:
 
 1. Build candidates from the entries, reading each entry's canonical content from its source path on disk, falling back to the title when the file is missing or empty (best-effort, never throws — plan source paths can point outside the worktree).
 2. If there are no candidates, return the registry entries unchanged with an empty soft-exclude set.
@@ -251,6 +260,7 @@ The layer is stateless and pure per invocation. Orchestrator 1 performs disk rea
 ## Notable Behavior
 
 - **Track-only references are carved out before this layer runs, not filtered inside it.** They are removed from the candidate set upstream and spliced back into the kept set unconditionally afterwards, so this layer can never assign them a tier, a reason, or an auto-exclude verdict. Framing it as an input carve-out rather than an internal rule is deliberate: it makes "a relevance verdict cannot drop a track-only reference" structurally true rather than dependent on a conditional inside the ranker.
+- **Foreign plans are the other input carve-out, and it is the mirror image of the first.** A plan whose source file belongs to a different repository is removed from the candidate set upstream and is **not** spliced back — the model never sees it and never keeps it. Yet it is the carve-out that shows up on the artifact: the caller writes one excluded-context entry for it, with a fixed reason phrase and the lowest tier, into the very field this layer's own soft-excluded set feeds. So the excluded-context field carries two kinds of entry with one shape — a model verdict this layer produced, and a deterministic classification it never touched. Nothing downstream tells them apart. (Surprising.)
 - **No config gate.** Wherever the layer is invoked it is attempted. Whether it does anything then depends only on the presence of credentials and on the fail-open path; there is no user-facing on/off switch for relevance filtering. What *does* decide whether the layer runs at all is the commit kind — see "Which commit kinds issue the call".
 - **A consolidating or migrating commit has no relevance layer, and that is a design choice rather than a degradation.** A squash (both routes) and a rebase-pick issue no call, and an amend whose delta is trivial returns before reaching the layer. Those memories look exactly like a fail-open keep-all from the outside — full user selection, no tiers, no soft-excluded set — but arrive there without a call, because there is no newly-derived change for the layer to judge against. Reading "the layer is always attempted" as "every commit is ranked" is the mistake to avoid. (Surprising; intentional.)
 - **The model emits the tier directly; the tier is authoritative.** The model returns a categorical `high`/`mid`/`low` per item. There is no numeric score in the response and no rank-position binning — the score and rank on the result are both **derived** (score from the tier, rank from tier-then-insertion order) and exist only for display/audit. A previous design had the model return a `relevant` flag + a `[0,1]` score that the caller binned into thirds by rank; that is gone.

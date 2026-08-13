@@ -15,6 +15,7 @@ This spec defines how conversations from Antigravity (Google's Gemini-powered ag
 - The discovery-time optimizations: cheap file-stat staleness gate before opening the database, skip-reopen when a newer variant of the same conversation was already accepted, and streaming early-exit title extraction.
 - Cross-variant de-duplication of a conversation that exists under more than one interface variant.
 - Plaintext transcript line-type-to-role mapping, including the request-envelope unwrapping and tool-call summarization.
+- The per-session tool-call tally built from the same tool-call array the summaries are rendered from, and the per-bucket instant taken from the line's own creation time.
 - The cursor structure for incremental resumption and the optional time-cutoff filter.
 - Title resolution for a discovered session.
 
@@ -130,6 +131,17 @@ User input arrives wrapped as a user-request envelope (plus optional sibling met
 
 Each tool call renders as `↪ <name>` optionally followed by `: <detail>`, where `<detail>` is the tool call's command-line argument if it is a string, else its tool-summary argument if that is a string, else empty (in which case the summary is just `↪ <name>` with no trailing colon/detail). The name falls back to the literal `tool` if absent.
 
+### Per-session tool-call tally (output of read)
+
+The same tool-call array the summaries above are rendered from also feeds a per-session tally, reported alongside the entries and the cursor and **always present even when empty** — an empty tally is the recorded fact "this session called no tools", which a consumer must be able to tell apart from a source that records nothing at all. Each bucket carries a display name, a classification, a call count, and optionally the instant of its most recent observed call.
+
+Two properties are forced by what this transcript records:
+
+- **Every call is classified as a built-in one, and none can be de-duplicated.** A tool-call entry carries a name and its arguments — no call identity, no naming prefix, no server field — so there is nothing to split into an external-server bucket and nothing to compare two occurrences on.
+- **Every occurrence is counted, not de-duplicated by name.** That is correct rather than merely tolerable: the transcript is append-only and each step appears once, so a repeated planner-response line is not a shape this source produces.
+
+The per-bucket instant is the line's own creation time, parsed to an epoch instant. A line with no creation time, or one that does not parse, contributes a bucket with no instant.
+
 ## Behavior
 
 ### Feature gate
@@ -191,9 +203,10 @@ For each conversation that survives scoping and de-duplication, the transcript i
    - Parse each line as JSON; a parse failure skips that line and continues (does not abort the read).
    - If the line has a `created_at` and its parsed instant is at or after the cutoff, stop the loop without consuming this line — it will be re-read on the next call. (A line without `created_at` is always consumed, since — by the transcript's append-only, chronological ordering — it necessarily precedes the stopping point.)
    - Otherwise, if `created_at` is present, remember it as the running "last timestamp".
-   - Apply the line-type mapping to conditionally append a normalized entry.
+   - Apply the line-type mapping to conditionally append a normalized entry. For a planner-response line, walk its tool-call array **before** rendering the summaries and count each named call into the tally, stamping the line's own creation time (parsed to an epoch instant) as that bucket's most-recent-call time when it parses.
 6. After the loop, coalesce consecutive same-role entries (shared merge behavior with every other source reader).
 7. Compute the new cursor: line number is the index of the first unconsumed line (either past the end, or the stopping line under a cutoff); the timestamp is the last consumed line's timestamp, or the incoming cursor's timestamp (or current wall-clock time) if no line carried a timestamp.
+8. Return the coalesced entries, the new cursor, the count of lines consumed this pass, and the tool-call tally.
 
 ### Cursor advancement
 
@@ -219,6 +232,8 @@ Discovery and reading are read-only with respect to both the database and the tr
 - **The transcript reader never throws.** Every failure mode (missing file, malformed JSON, unreadable path) degrades to an empty result with the cursor held at its input position, unlike other embedded-store readers that raise on genuine failure.
 - **Unparseable individual JSON lines are skipped, not fatal** to the rest of the read.
 - **A line without `created_at` is always consumed even under a time cutoff**, on the assumption (append-only, chronological file) that it necessarily precedes any later timestamped stopping point.
+- **The tool calls this spec previously treated only as text to summarise are also counted.** The same array that renders the `↪ <name>` lines feeds a per-session tally, and each bucket carries the planner-response line's own creation time as its most-recent-call instant. Nothing about the summaries changed; the tally is a second consumer of an array that was already parsed. (Notable; the tally was undocumented here until the per-bucket instant made it load-bearing.)
+- **This source's tally can neither classify an external-server call nor de-duplicate one.** A tool-call entry carries a name and arguments only — no call identity, no naming prefix, no server field — so every call is a built-in and every occurrence counts. Counting every occurrence is correct here rather than merely tolerable, because the transcript is append-only and each step appears exactly once. (Notable.)
 - **This source's own title path truncates to 120 code points**, but the shared title resolver re-truncates a native title to the shared 60-code-point limit, so the effective displayed title length is 60.
 
 ## Shared Behavior
@@ -227,6 +242,7 @@ Discovery and reading are read-only with respect to both the database and the tr
 - **Canonical session-info shape** (`{ sessionId, transcriptPath, updatedAt, source, title? }`) matches every other discovery-based source.
 - **Source tag `"antigravity"`** is the literal value shared with downstream session persistence, title-resolution dispatch, and human-readable labeling ("Antigravity").
 - **Canonical normalized entry shape** (`{ role: "human"|"assistant", content, timestamp? }`) matches every other source reader.
+- **The per-session tool-call tally and its always-present-even-when-empty contract** are the shared tally behaviour every tool-recording source reader applies; this source contributes only built-in, un-de-duplicable buckets, and takes each bucket's instant from the line's own creation time.
 - **Cursor-keyed resumption** by `(transcriptPath, lineNumber)` matches every other line-oriented source reader.
 - **Same-role coalescing** is applied with the same semantics as every other source reader.
 - **Time-cutoff filter** matches every other source reader: cutoff stops consumption before the stopping line, the cursor advances only past consumed lines, and untimed lines are conservatively consumed.

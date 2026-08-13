@@ -1,9 +1,9 @@
 {
   "branches": {
     "main": {
-      "revision": "3d45b46b005d1f5873be2d9469be48a407f62268",
-      "subject": "Fix PR review findings for the local SQLite dashboard",
-      "reviewedAt": "2026-08-12T17:25:14Z",
+      "revision": "e94d5cbc01ab67daae68f3fe4fec949f7500611b",
+      "subject": "Update specs for the f184549f..3d45b46b delta",
+      "reviewedAt": "2026-08-13T04:24:58Z",
       "actor": "doug.schroeder",
       "skill": "specs-update"
     }

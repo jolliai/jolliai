@@ -18,9 +18,12 @@ attribution (who cancelled, when). **No URL is ever constructed** — every URL 
 every manifest entry is read straight off the payload, and exactly what the
 payload carried is what gets opened.
 
-The `jolli mcp` server is **stateless** — one dispatch per call, no cross-call
+The `jolli mcp` surface is **stateless** — one dispatch per call, no cross-call
 session state, no server-initiated push, no way to pop an interactive prompt
-(standard input/output is the JSON-RPC transport, spec 148). Therefore "report
+(spec 148). Standard input/output is the JSON-RPC transport of the
+**host-to-process hop only**: the process a host spawns is a per-session proxy
+forwarding bytes to a shared per-worktree server over a socket or named pipe
+(spec 364). Every stateless property above survives that unchanged. Therefore "report
 the result and offer to open links" means the **calling client's agent loop**
 drives an ordered sequence of MCP tool calls plus `jolli` (`Bash`) helper calls,
 guided by an installed **recipe skill**; the "offer to open" is the agent using

@@ -3,7 +3,8 @@
 Operational reference for an agent about to change this repo: what the deliverables are, how to
 iterate on each, and the exact gate a change must pass. Every value here was read out of a manifest
 in this tree — not inferred. Recorded at `93933725`; sandbox launcher pipeline (§4.5) refreshed at
-`be2f67ab`.
+`be2f67ab`; deliverable versions (§1), the dashboard surface (§3, §4.3) and the test tiers (§5.5-§5.7)
+refreshed at `e94d5cbc`.
 
 This is **not** a behavioral spec. Command names, file paths, and version numbers are the point.
 
@@ -13,13 +14,13 @@ This is **not** a behavioral spec. Command names, file paths, and version number
 
 Five deliverables, two of which are npm workspaces. One product model, one shared on-disk state.
 
-| Deliverable | Directory | Build system | Coordinated by root? | Version at `93933725` |
+| Deliverable | Directory | Build system | Coordinated by root? | Version at `e94d5cbc` |
 |---|---|---|---|---|
-| `@jolli.ai/cli` | `cli/` | Vite multi-entry lib build + `tsc` declarations | **Yes** — npm workspace | `0.99.10` |
-| `jollimemory-vscode` | `vscode/` | esbuild → CJS bundles | **Yes** — npm workspace | `0.99.10` |
-| Claude Code plugin | `claude-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.0` (`.claude-plugin/plugin.json`) |
-| Codex plugin | `codex-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.0` (`.codex-plugin/plugin.json`) |
-| Jolli Memory IntelliJ plugin | `intellij/` | Gradle / Kotlin (`ai.jolli.jollimemory`) | **No** — independent build | `0.99.10` |
+| `@jolli.ai/cli` | `cli/` | Vite multi-entry lib build + `tsc` declarations | **Yes** — npm workspace | `0.99.11` |
+| `jollimemory-vscode` | `vscode/` | esbuild → CJS bundles | **Yes** — npm workspace | `0.99.11` |
+| Claude Code plugin | `claude-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.2` (`.claude-plugin/plugin.json`) |
+| Codex plugin | `codex-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.1` (`.codex-plugin/plugin.json`) |
+| Jolli Memory IntelliJ plugin | `intellij/` | Gradle / Kotlin (`ai.jolli.jollimemory`) | **No** — independent build | `0.99.11` |
 
 Root `package.json` (`"name": "jollimemory"`, `"version": "0.99.0"`, `"private": true`) declares
 exactly two workspaces:
@@ -49,8 +50,9 @@ plugin `.mcp.json`, its committed static skills, and its host-isolation rule) �
 
 Root version (`0.99.0`) tracks the workspace coordinator, not any shipped artifact. CLI and
 VS Code versions move together in practice but are independent by policy; IntelliJ is independent of
-both and currently happens to be level with them at `0.99.10`. Each AI-host plugin versions on its own
-`1.0.0` line entirely, independently of the other.
+both and currently happens to be level with them. Each AI-host plugin versions on its own `1.0.x` line
+entirely, independently of the other — and they have already drifted apart, which is the policy
+working rather than a mistake.
 
 ---
 
@@ -120,15 +122,29 @@ devDependency and both schema URLs together.
 
 ---
 
-## 3. There are no ports and there is no dev server
+## 3. One loopback surface, and no dev server
 
-**Nothing to start.** This repo ships a CLI, an editor extension, and an IDE plugin. There is no HTTP
-server, no frontend dev server, no database, no `docker-compose.yml`, no `Dockerfile`. No
-`package.json` in the tree defines a `dev`, `start`, or `serve` script (verified across root, `cli/`,
-`vscode/`). Do not look for a port, and do not add a "start the app" step to any workflow that
-targets this repo.
+**Almost nothing to start.** There is no frontend dev server, no `docker-compose.yml`, no
+`Dockerfile`, and no `package.json` in the tree defines a `dev`, `start`, or `serve` script (verified
+across root, `cli/`, `vscode/`). Do not add a "start the app" step to a workflow that targets this
+repo on the strength of a framework convention.
 
-Two things are sometimes mistaken for a dev server:
+The one exception is real and browser-reachable: **`jolli dashboard`**. The command is a launcher, not
+the server — it registers the current repo, ensures the dashboard SQLite database exists, probes
+`/health` and spawns a detached loopback HTTP server (`dist/DashboardServerEntry.js`) if none is
+running, opens a browser at it, and only *then* runs the import sweep that fills the database, so the
+page appears immediately and history arrives behind it. It binds `127.0.0.1` on `1818`, falling back to `18118`;
+`--port` overrides, `--no-open` prints the URL instead of opening it, `--stop` kills the recorded
+server, `--cwd` picks the repo to register. So a change to a dashboard page, an `/api/*` endpoint, or
+the **Settings** modal (opened over any page, fed by `/api/model?view=settings`, mutating through the
+same `install` / `registerRepo` functions the CLI commands use) is exercised in a browser against a
+real repo: build the CLI (§4.3), then run the command.
+
+That is a local operator surface, not a service this repo deploys. The server opens the database
+read-only per render, so whether it is running has no effect on data capture, and nothing in CI
+starts it.
+
+Two other things are sometimes mistaken for a dev server:
 
 - `vscode/package.json` → `build:watch` (`node esbuild.config.mjs --watch`) — an incremental
   bundler, not a server.
@@ -139,7 +155,7 @@ plugin package, not here; in this repo they exist only as help-text stubs
 (`cli/src/commands/SiteCommandStubs.ts`).
 
 The way you "run" this product is: build it, install it, and exercise it against a real git repo
-(§4).
+(§4) — with the dashboard above as the one place that means a browser.
 
 ---
 
@@ -176,12 +192,14 @@ npm install -g .
 plain `npm run build` (in `cli/`) is enough — the global `jolli` picks it up immediately with no
 re-install. `postbuild` chmods `dist/Cli.js` to `0o755`.
 
-`cli` build = `vite build && tsc --project tsconfig.build.json` — the Vite step emits 13 ES entries
-(`Cli`, `Api`, `PostInstall`, and the hook/worker entries `StopHook`, `PostCommitHook`,
+`cli` build = `vite build && tsc --project tsconfig.build.json` — the Vite step emits 14 ES entries
+(`Cli`, `Api`, `PostInstall`, the hook/worker entries `StopHook`, `PostCommitHook`,
 `PostRewriteHook`, `PrepareMsgHook`, `GeminiAfterAgentHook`, `SessionStartHook`, `PostMergeHook`,
-`PrePushHook`, `PrePushWorker`, `QueueWorker`) plus `dist/graph-assets/` (the knowledge-graph viz
-runtime, minified here and copied verbatim by every downstream consumer); the `tsc` step emits
-declarations. Externals: `@anthropic-ai/sdk`, `commander`, `open`, `semver`, `node:*`.
+`PrePushHook`, `PrePushWorker`, `QueueWorker`, and `DashboardServerEntry` — the detached dashboard
+server of §3, a build contract in the same way `QueueWorker` is) plus two asset trees,
+`dist/graph-assets/` (the knowledge-graph viz runtime) and `dist/dashboard-assets/` (the dashboard's
+HTML/CSS/JS), both minified here and copied verbatim by every downstream consumer; the `tsc` step
+emits declarations. Externals: `@anthropic-ai/sdk`, `commander`, `open`, `semver`, `node:*`.
 
 ### 4.4 VS Code extension — deploy and reload
 
@@ -313,7 +331,7 @@ CI runs the identical command: `.github/workflows/build-vscode.yaml` ("CI - CLI 
 >
 > - **`test` has three sub-stages, not two** — the CLI unit suite, then a separate CLI **acceptance**
 >   suite (`test:acceptance -w @jolli.ai/cli`, config `cli/vitest.acceptance.config.ts`), then the
->   VS Code suite. `AGENTS.md` names the acceptance files elsewhere ("356 unit + 5 acceptance") but
+>   VS Code suite. `AGENTS.md` names the acceptance files elsewhere (its "unit + acceptance" split) but
 >   its one-line expansion of the gate still folds all three into a single `test`.
 >
 > Consequence for anyone verifying a change — unchanged, and this is the part that actually bites:
@@ -416,6 +434,7 @@ exclude: [
     "vite.config.ts",
     "test/**",
     "src/graph/assets/**",
+    "src/dashboard/assets/**",
     // Only in `--mode fast`; never in the gate. See SLOW_ONLY_SOURCES.
     ...(fast ? SLOW_ONLY_SOURCES : []),
 ],
@@ -428,7 +447,7 @@ thresholds: {
 ```
 
 The thresholds are **identical in every mode** — `--mode fast` does not lower the floor, it removes the
-16 source files whose only meaningful cover was skipped (§5.6). That conditional spread must stay
+source files whose only meaningful cover was skipped (§5.6). That conditional spread must stay
 inside the `fast` branch: in the default (gate) mode it would silently stop the floor from protecting
 `sync/` and `install/` at all.
 
@@ -507,45 +526,49 @@ the IntelliJ plugin in `build.gradle.kts`.
 
 ### 5.6 The two CLI test tiers — one list, two directions
 
-`npm run test` is the gate: the whole CLI unit suite with `--coverage`, **measured at 3.5 min on a
-quiet box and 9+ min on a busy one (213 s and 552 s on the same commit) — a dated figure, taken when
-the list held 12 files and the suite was smaller; nothing since has re-measured it, and the suite has
-grown.** The shape of the cost is what matters and that has not changed: profiling showed a handful of
-files carrying ~96% of the runtime against a **~14 ms median file**, and every one of them drives real
-`git` subprocesses or real filesystem/lock work. `SLOW_TEST_FILES` now holds **13**. The tiers split on
-exactly that line:
+`npm run test` is the gate: the whole CLI unit suite with `--coverage`, and it costs minutes rather
+than seconds — a quiet box and a busy one differ by more than 2x on the same commit, so treat any
+figure you are quoted as a measurement with a date on it. The shape of the cost is what matters and
+that has not changed: profiling showed a handful of files carrying ~96% of the runtime against a
+**~14 ms median file**, and every one of them drives real `git` subprocesses or real filesystem/lock
+work. The slow tier is exactly that set — read its current membership off `SLOW_TEST_FILES`, which has
+grown repeatedly since the split landed, most recently by the six `dashboard/` cutover files (they are not
+"SQLite tests": each seeds a real repo and drives `git` through cutover, and `CutoverEngine.test.ts` is
+now the single heaviest file in the suite). The tiers split on exactly that line:
 
 | Script | Vitest invocation | Files | Coverage |
 |---|---|---|---|
 | `npm run test` (gate) | `vitest run --coverage` | all of them | yes, 97/96/97/97 |
-| `npm run test:fast` | `vitest run --mode fast --coverage --reporter=dot` | all **but** the 13 | yes, **same** thresholds |
-| `npm run test:slow` | `vitest run --mode slow --reporter=dot` | **only** the 13 | no |
+| `npm run test:fast` | `vitest run --mode fast --coverage --reporter=dot` | everything **except** `SLOW_TEST_FILES` | yes, **same** thresholds |
+| `npm run test:slow` | `vitest run --mode slow --reporter=dot` | **only** `SLOW_TEST_FILES` | no |
 
 **One list drives both.** `SLOW_TEST_FILES` in `cli/vite.config.ts` is the single source of truth:
-`--mode fast` appends it to `test.exclude`, `--mode slow` uses it as `test.include`. Adding a 14th slow
-file is one edit. (It used to be two — the same paths were also spelled out in the `test:slow` npm
+`--mode fast` appends it to `test.exclude`, `--mode slow` uses it as `test.include`. Adding a slow file
+is one edit. (It used to be two — the same paths were also spelled out in the `test:slow` npm
 script, where a one-sided edit silently left a file in both tiers or in neither.) Entries are **exact
 repo-relative paths**, not brace globs, so a future same-named file elsewhere cannot be captured by
 accident. The switch is vite's own `--mode`, not an env var, because an `FOO=1 vitest` prefix in an npm
 script does not work under Windows `cmd`.
 
 **How `test:fast` keeps coverage honest.** Dropping test files without narrowing the denominator turns
-a passing suite into a failing run — measured at 92.44/90.43/92.25/92.53 with **exit 1 and zero test
-failures**, because `sync/`, `install/` and friends are still counted while nothing exercises them. A
-permanently-red inner loop trains you to ignore its exit code, so the config drops **both halves
-together**: the 13 test files and the 16 source files they are responsible for (`SLOW_ONLY_SOURCES`).
-The mapping is deliberately **not** one-to-one, and it now runs in **both** directions — which is why
-13 test files map to 16 sources:
+a passing suite into a failing run — measured twice now, most recently at 94.93% branches with **exit 1
+and zero test failures**, because `sync/`, `install/` and friends are still counted while nothing
+exercises them. A permanently-red inner loop trains you to ignore its exit code, so the config drops
+**both halves together**: the slow test files and the source files they are responsible for
+(`SLOW_ONLY_SOURCES`). The mapping is deliberately **not** one-to-one, and it runs in **both**
+directions — which is why the two lists are different lengths:
 
 - **One → many.** One installer test file is the only meaningful cover for four separate
   hook-installer modules, so `install/Installer.test.ts` pulls `ClaudeHookInstaller.ts`,
   `GeminiHookInstaller.ts`, `GitHookInstaller.ts` and `HookSettingsHelper.ts` into the exclusion list
   alongside `Installer.ts`.
-- **One → none.** The 13th entry, `src/core/GitOps.stateRoot.realgit.test.ts`, contributes **no**
+- **One → none.** `src/core/GitOps.stateRoot.realgit.test.ts` contributes **no**
   `SLOW_ONLY_SOURCES` entry: `src/core/GitOps.ts` is deliberately absent, because a mocked sibling
-  (`src/core/GitOps.test.ts`) still covers the module in fast mode. That is correct, not an oversight
-  — but it breaks the tempting "every slow test file contributes its source" reading, and it means
-  fast-mode headroom absorbed a new uncovered branch set rather than excluding it.
+  (`src/core/GitOps.test.ts`) still covers the module in fast mode. The same holds for the modules the
+  dashboard six all import (`DashboardDb`, `RepoRegistry`, `SotWrite`) — covered by tests that stay in
+  the fast tier, so excluded from the exclusion list. That is correct, not an oversight — but it breaks
+  the tempting "every slow test file contributes its source" reading, and it means fast-mode headroom
+  absorbed a new uncovered branch set rather than excluding it.
 
 Two rules about that pair: **maintain them together, re-deriving from measurement rather than
 inspection** (`cli/vite.config.ts`'s header documents the regenerating commands), and **the coverage
@@ -553,32 +576,31 @@ exclusion must never leave the `fast` branch** (§5.5). Headroom is thin on purp
 against a 96% floor — so if `test:fast` goes red on coverage alone, the read is "the lists need
 re-deriving", not "lower the threshold".
 
-> **⚠ The file counts in the repo's own prose are stale, and the two documents now disagree with each
-> other as well as with the tree.** `AGENTS.md` says "361 files … (356 unit + 5 acceptance)", "the 343
-> light CLI files", "the 13 slow test files", "(343 + 13 = 356)". `cli/DEVELOPMENT.md` was not updated
-> alongside it and still says "all 340 unit files", "the other 328 files", "328 + 12 = 340 at
-> `64f8bc6b`", "12 files account for 96.4%" and "measured at all 340 files". Measured at `93933725`:
-> **357** CLI unit test files, **344** in the fast tier, **13** in the slow tier, plus **5** acceptance
-> files — so `AGENTS.md` is one short on every unit figure and `cli/DEVELOPMENT.md` is a whole tier
-> revision behind. Re-derive rather than trusting either:
+> **⚠ Absolute file counts rot here, and no document in the tree has stayed level with them.** The
+> lists have grown repeatedly; `cli/vite.config.ts`'s own header notes that its previous paragraph
+> claimed one pair of numbers "long after the lists had grown", and `cli/DEVELOPMENT.md` is currently
+> half-refreshed — some of its figures match the config and others are a tier revision behind, in the
+> same document. `AGENTS.md` was brought level with the config most recently. **Do not trust a count in
+> any of them, including in this section.** Re-derive:
 >
 > ```bash
 > cd cli
-> npx vitest list --filesOnly | grep -c 'test\.ts'               # 357 — unit suite
-> npx vitest list --filesOnly --mode fast | grep -c 'test\.ts'   # 344 — fast tier
-> npx vitest list --filesOnly --mode slow | grep -c 'test\.ts'   # 13  — slow tier
-> find src -name '*.test.ts' | wc -l                             # 357 — cross-check
+> npx vitest list --filesOnly | grep -c 'test\.ts'               # unit suite
+> npx vitest list --filesOnly --mode fast | grep -c 'test\.ts'   # fast tier
+> npx vitest list --filesOnly --mode slow | grep -c 'test\.ts'   # slow tier
+> find src -name '*.test.ts' | wc -l                             # cross-check
 > ```
 >
-> The partition itself is still exact by construction — "everything except the 13" versus "the 13" —
-> so treat **any** absolute count in that prose (or in this box) as a measurement with a date on it,
-> and the 13-entry `SLOW_TEST_FILES` list as the real definition.
+> What does *not* rot is the partition: the two tiers are "everything except `SLOW_TEST_FILES`" versus
+> "`SLOW_TEST_FILES`", exact by construction because both read the one list. That list, plus the
+> `cli/test/sync-acceptance/**` glob for the separate acceptance runner, is the real definition.
 
 ### 5.7 Real-`git` test isolation lives in one file, monorepo-wide
 
-About a dozen CLI test files spawn real `git` subprocesses on purpose (`sync/GitClient`,
-`sync/BootstrapMerge`, `install/GitExclude`, `core/{Locks,KBPathResolver,RepoProfile,BranchCommitLister,PushControl}`,
-…), the acceptance suite builds real bare repos and clones, and the vscode suite's bridge integration
+A couple of dozen CLI test files spawn real `git` subprocesses on purpose (`sync/GitClient`,
+`sync/BootstrapMerge`, `install/GitExclude`,
+`core/{Locks,KBPathResolver,RepoProfile,BranchCommitLister,PushControl,FileDiscardService}`, the
+`dashboard/` cutover files, …), the acceptance suite builds real bare repos and clones, and the vscode suite's bridge integration
 test runs a real `git commit`. **`test/gitEnv.ts` at the repo root** neutralizes the developer's git
 configuration for all of them, wired in as `setupFiles` by all three gating configs
 (`cli/vite.config.ts`, `cli/vitest.acceptance.config.ts`, `vscode/vitest.config.ts`). It sets exactly
@@ -615,7 +637,8 @@ Two rules when touching it:
   excludes-file neutralization.
 
 **Timeouts are a load signal, not a regression signal.** Triage by failure *shape*: a
-`Test timed out in NNNNms` in `sync/*`, `install/*` or `core/{Locks,KBPathResolver,BranchCommitLister,PushControl}`
+`Test timed out in NNNNms` in `sync/*`, `install/*`, `dashboard/*` or
+`core/{Locks,KBPathResolver,BranchCommitLister,PushControl}`
 is almost always CPU contention starving a real `git` subprocess — confirm by running that file alone
 with the stock timeout, where green is the proof. An assertion or thrown error is worth investigating.
 An unhandled rejection naming a `coverage/.tmp/coverage-N.json` path is infrastructure, not a result.
@@ -627,18 +650,27 @@ probe) has now blown three successive budgets — 30 s → 45 s → 60 s — mos
 clock was 552 s, while the same case takes 7.1 s alone and the whole gate then re-ran green in 213 s. A
 starved `git rebase` degrades with load and no ceiling outruns that. Don't reach for 90 s.
 
+**Nor is lowering `maxWorkers`, and that one is measured.** `dashboard/CutoverEngine.test.ts` still
+flakes past the 60 s budget under the slow tier's own fan-out while running green alone, and giving
+`--mode slow` a tighter worker cap made it *worse*: fewer workers took longer and still failed, on a
+different case in the same file, and total test CPU barely moved between the two runs. Whatever these
+files wait on is not the CPU a worker count rations — the tier is all `git`, and git's cost here is
+`fsync`. `cli/vite.config.ts` records the numbers; read them there before re-litigating this, and
+attack an I/O lever or the file's own `beforeEach` rather than the worker count.
+
 **Tune timeouts in the configs only** — the three named above. A per-file
 `vi.setConfig({ testTimeout })` **replaces** the global rather than widening it, and a
 `vitest --testTimeout=…` flag cannot override such a file-local clamp.
 
-> **⚠ Third discrepancy with the repo's own prose.** `AGENTS.md` and `cli/DEVELOPMENT.md` both state
-> that all three configs "sit at 60 s". The configs do — but
-> `vscode/src/JolliMemoryBridge.integration.test.ts` still calls
-> `vi.setConfig({ testTimeout: 45_000, hookTimeout: 45_000 })` at module scope, so the one vscode file
-> that actually drives real `git init` / `config` / `commit` runs with **45 s**, i.e. 25% less headroom
-> than every pure-unit file in the same suite. The CLI's two heaviest files had exactly this clamp
-> removed when the globals were raised; this one was left behind. Note also that `vscode/vite.config.ts`
-> wires in neither the isolation nor the budgets at all.
+> **⚠ Third discrepancy with the repo's own prose — now in the other direction.** All three configs sit
+> at 60 s and **nothing clamps below them any more**: the last file-local clamp,
+> `vi.setConfig({ testTimeout: 45_000, hookTimeout: 45_000 })` in
+> `vscode/src/JolliMemoryBridge.integration.test.ts`, has been removed, and that file now carries a
+> comment explaining its own absence (it timed out at 45 s inside a suite the config had already given
+> 60 s, and only in a full run — green in isolation, which reads exactly like a flake).
+> `cli/DEVELOPMENT.md` has not caught up and still describes that clamp as live "in exactly the file
+> that can least afford it"; do not go looking for it. Note also that `vscode/vite.config.ts` wires in
+> neither the isolation nor the budgets at all.
 
 ---
 

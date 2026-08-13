@@ -9,12 +9,13 @@ The no-build browser application the local dashboard serves: a page-per-view app
 **In scope:**
 
 - What the served document contains and what it does **not** request — the zero-external-request property and why the scripts are inlined rather than fetched.
+- The one link a reader may click out of: its scheme allowlist, the normalised probe the allowlist is tested against, and what happens to a URL that clears neither.
 - The two page globals (the model and the mutation token) and the boot sequence over them.
 - The render dispatch: shell first, then exactly one view renderer.
 - The shell: the navigation list and its gating, the range control and its calendar popover, the scope chip, the coverage footer, and the tier attribute.
 - Link construction — which parameters survive a click and which are deliberately dropped.
 - The four page views' behavior, and which of their controls re-render locally versus re-fetch.
-- The **Settings modal**: how it opens, what it fetches, its controlled form and dirty gate, its per-section lazy loads, and its immediate-apply toggles.
+- The **Settings modal**: how it opens, what it fetches, its controlled form and dirty gate, its per-section lazy loads, its immediate-apply toggles, its non-gating availability probe, and the client state that survives a close.
 - The periodic refresh loop: which view it runs on, what it does on a schema mismatch, and what it does on failure.
 - How the mutation token is obtained and which requests carry it.
 - The content-free telemetry beacon and the events it emits.
@@ -24,7 +25,7 @@ The no-build browser application the local dashboard serves: a page-per-view app
 - Every route this application calls, the security checks each is subject to, and how the document is assembled — spec 352. This spec covers only what the browser does with what it is given.
 - The payloads it renders and every figure in them — spec 353. Field meanings are not restated here.
 - The write protocol behind those payloads (spec 354) and the registry the Repositories view lists (spec 355).
-- The mutation semantics behind the Settings actions: masked-key reuse on save, the cross-repository hook sweep, folder validation rules, sign-in's browser flow, the memory-bank migration, the manual sync, and the backfill engine.
+- The mutation semantics behind the Settings actions — masked-key reuse on save, the cross-repository hook sweep, folder validation rules — spec 363; the access boundary those endpoints sit behind and the backfill's concurrency guard — spec 352; the push toggles' machine-global store and per-row wording — spec 310. Sign-in's browser flow, the memory-bank migration, the manual sync and the backfill engine itself have their own topics.
 - Visual design: colors, spacing, iconography, and the individual element structure of any card.
 
 ## Data Contracts
@@ -37,7 +38,18 @@ One self-contained document per page render: the stylesheet, the two page global
 
 **The page issues zero external network requests.** Every icon is inline SVG written into the markup; there are no font, image, frame or stylesheet references; the only URL-shaped value in the stylesheet is a single inline `data:` SVG (whose XML namespace declaration is an identifier, not a fetch). Every request the application issues is a same-origin relative path, and nothing uses a long-lived transport. This is what makes the service's refusal to emit any cross-origin header cost the page nothing.
 
-The one thing that reaches outside is not a request the page makes: an archived reference row renders the upstream URL as an ordinary link the **reader** may click, restricted to the two safe schemes and opened in a new context with no referrer.
+The one thing that reaches outside is not a request the page makes: an archived reference row renders the upstream URL as an ordinary link the **reader** may click, scheme-allowlisted and opened in a new context with no referrer.
+
+### The link allowlist
+
+The allowlist admits **three literal schemes** — the two web schemes and the mail scheme — and it is an allowlist rather than a filter because the URL comes from an archived third-party reference and this page holds the mutation token, so a script-scheme URL reaching an anchor would run authenticated against the mutating routes. Escaping cannot help: a script scheme survives every HTML escape intact.
+
+**The test runs on a NORMALISED PROBE while the ESCAPED ORIGINAL is what gets rendered**, and both halves are load-bearing. A browser does not read a scheme byte-for-byte: it removes tab, line-feed and carriage-return from **anywhere** in a URL and trims leading control characters and spaces before it looks. The probe reproduces exactly those two rules, then lower-cases — so an obfuscated script scheme with a newline inside it is recognised and refused, while the value handed to the attribute is still the original the browser will actually parse.
+
+Two consequences follow:
+
+- A URL whose scheme the browser cannot read at all is a **relative** URL, so it resolves against this origin and renders as a **dead same-origin link** rather than escalating into another scheme. That is why a probe stricter than the browser is safe here and a probe looser than it is not.
+- The allowlist is narrower than the web but **not narrower than the data**: every builtin reference source stores a web URL, including the ones whose desktop apps also register a private scheme — so nothing is being swallowed today. Admitting an app scheme later is a decision about what this page hands to the operating system, and the row must still render (unlinked) when the answer is no.
 
 ### The two page globals
 
@@ -81,7 +93,7 @@ The shell renders first, then a per-view renderer. The application container is 
 Rendered on every render, including every refresh tick.
 
 - **Page title and subtitle** per view; the document title is set to match.
-- **A tier attribute** on the root element, which the stylesheet keys chip and locked-preview treatments off, so the shell reflects the adoption tier with no branching in the view modules.
+- **A tier attribute** on the root element, which the stylesheet keys the synced chip and the locked-preview treatments off, so the shell reflects the adoption tier with no branching in the view modules. **The synced chip is the only chip left on that attribute**: a second topbar chip stating that the server runs locally and nothing leaves the machine has been removed from both the markup and the stylesheet, so the page no longer asserts that property anywhere in its own interface — it merely holds.
 - **The navigation list**: a Dashboard group rendered flat under a non-interactive group label with two children (the activity dashboard and the daily standup), then Memories, then Repositories. **Settings is pinned to the sidebar's bottom edge in its own slot**, a sibling of the scrolling list rather than its last row — a persistent destination.
 - **Gating**: the Dashboard group's two children and Memories are marked disabled when no repository is enabled, mirroring the service's own redirect. Repositories is never gated — it is the row that opens the gate, so it must stay reachable with zero repositories. The disable exists only so a click does not visibly bounce through a redirect; the redirect is the enforcement.
 - **Every navigation is a full page load, not a client-side swap**, so every view is deep-linkable and reload-safe. The rows are **buttons that assign a location**, not anchors — so the destinations are real URLs but the sidebar itself supports no middle-click, no open-in-new-tab, and no hover target. (In the memories tree the same is true of a row click; the one genuine anchor in the application is the upstream reference link.)
@@ -157,6 +169,7 @@ A tree beside a detail pane.
 **The detail pane** renders the memory's header, token meter, counts, recap, then conversations, context, topics, files and verification scenarios. Two behaviors matter:
 
 - **The token meter's headline and bar use different denominators**, matching the editor: the headline is the reported total, while the three segment widths divide by the segments' own sum, because a folded session can report a scalar count with no breakdown and dividing the widths by the total would underfill the bar.
+- **Each conversation row carries the session identifier as its tooltip**, and that is the only thing the identifier is in the payload for. The three visible fields cannot tell two conversations from the same source apart — same glyph, same source label, and titles that a first-user-message fallback can make near-duplicates — so a memory fed by three sessions of one agent was unreadable and could not be matched against the recorded sessions or a log line. **When the archive carries no identifier the whole attribute is omitted**, never filled with a placeholder: an absent tooltip says nothing, where a rendered "unknown" would say something false about the session.
 - **Copy Recall Prompt** assembles a short prompt — an instruction line, then the memory's title, recap, branch and hash, each omitted when absent — and writes it to the clipboard, reporting success (briefly, on the button itself) or unavailability there.
 
 **The context viewer** is one shared dialog. The body is fetched on click rather than shipped with the detail, because a memory can carry several full documents the reader usually never opens, and it is rendered as **preformatted text, not markup**: this application has no markdown renderer, and injecting a document an agent wrote into the document tree is not a corner worth cutting. A failure never leaves the dialog on its loading text — the message includes the status and suggests restarting a long-running server, because a server started before this endpoint existed answers the same "not found" as a genuinely missing document and the fix differs.
@@ -183,9 +196,16 @@ The close control is re-created by every write into the modal body (loading, err
 - **Apply validates client-side that at least one agent remains enabled** before sending, and after a successful save it **re-fetches** the payload and reseeds the form — the server is authoritative. A partial success (some repositories' hooks failed to sync) is reported in the banner.
 - The global-instructions toggle is tri-state under the hood: turning it off returns it to "never decided" when that is what it started as, rather than asserting an explicit disable.
 - **The Folder Path field is checked on blur** against the server, purely advisorily (the save gate re-checks), and the verdict line is updated by a targeted write rather than a re-render so the field keeps focus. A fresh edit invalidates the previous verdict. The reply is discarded if the field's value changed while it was in flight.
-- **Two sections lazy-load on first entry**: the per-repository push list, and the missing-summaries count. A failed push-list load sets an error that also **closes the guard** which would otherwise re-fire the request on every render, hammering a failing endpoint forever; switching sections clears it and retries.
-- **The per-repository push toggles apply immediately** — no Apply — and report their result on a status line under the toggled row. A failure states that nothing changed and **reloads the persisted list** so the switch snaps back to what is actually stored.
+- **Two sections lazy-load on first entry**: the per-repository push list, and the missing-summaries count. A failed push-list load sets an error that also **closes the guard** which would otherwise re-fire the request on every render, hammering a failing endpoint forever; switching sections clears it and retries. A **failed count** load is likewise never retried — the failure is held as a real "no count" rather than as "not yet asked" — while a successful backfill drops the cached count so the line reloads on the next entry.
+- **The per-repository push toggles bypass Apply and apply immediately**, each reporting its own outcome beside the row it belongs to rather than in the shared banner — the one place in this modal where a control writes without the form. The store behind them, the per-row wording, and the reload that snaps a failed switch back to what is stored are spec 310's.
 - The remaining actions (sign in, sign out, probe the local agent, migrate, sync now, generate missing summaries) each set a busy state, render, and report into the same banner; sign-in and sign-out reseed the form from a fresh fetch afterwards.
+- **The local-agent availability probe is a manual button and its result gates nothing.** It renders beside the button and does not touch Apply — unlike the desktop editor's equivalent, where a confirmed-unavailable verdict disables saving on every tab at once and an in-flight one holds the click.
+
+**Closing the modal only hides the overlay, so most of its state outlives it.** The selected section, the loaded push list, the missing count and the probe result all survive a close and are still there on the next open. Three things follow:
+
+- The two lazy loads are **once per page LOAD**, not once per open — reopening the modal does not re-ask either endpoint.
+- The modal **reopens on the last-used section**, not on the first one.
+- Only the form is reseeded on each open, from a fresh payload fetch, because the server is authoritative for the values.
 
 ### The refresh loop
 
@@ -194,6 +214,7 @@ The close control is re-created by every write into the modal body (loading, err
 - **The refetch carries the token even though the route answers without one.** The token is what tells the service this is the page's own request rather than a cross-site read, and a tokenless answer omits the one field that costs money to produce — so without it the poll would silently drop the compressed decision line the page was rendered with.
 - **A schema-version mismatch triggers a full page reload**, not a re-render. A tab left open across an upgrade is talking to a service whose payload shapes may have moved on, and reloading refetches the current document rather than patching an old one in place.
 - **A failed refresh re-renders the last known model anyway.** Callers clear local UI state before handing over the repaint (a row's busy flag, for instance), so swallowing the failure silently left that row stuck in its working state with no controls until a manual reload. Re-rendering the same model is idempotent.
+- **A tick repaints the page underneath an open Settings modal without disturbing it.** The repaint writes the shell and the one view renderer; the modal is a separate fixed layer with its own body, which nothing on that path touches. So a form mid-edit, a mid-flight lazy load and a busy action all survive every tick, and the page behind the overlay stays live.
 
 ### The request helpers and the token
 
@@ -223,7 +244,9 @@ A fire-and-forget beacon, preferring the browser's beacon transport so the event
 | Settings modal, loading | Fetch fails | Error state with a retry that re-runs the open |
 | Settings modal, clean | Any edit | Dirty — Apply enabled, stale banner cleared |
 | Settings modal, dirty | Apply succeeds | Busy → banner → payload re-fetched → form reseeded clean |
-| Settings modal, any state | Close control, or backdrop click | Hidden; nothing persisted |
+| Settings modal, any state | Close control, or backdrop click | Hidden; nothing persisted to disk, but the section, push list, missing count and probe result are all **retained** |
+| Settings modal, hidden with state | Pinned row clicked again | Reopens on the **last-used section**; neither lazy load re-fires |
+| Activity dashboard, Settings modal open | 30 s tick | Page underneath repainted; the modal is untouched |
 | Activity dashboard | 30 s tick, same schema | Model replaced, page re-rendered |
 | Activity dashboard | 30 s tick, schema differs | **Full page reload** |
 | Activity dashboard | 30 s tick fails | Last model re-rendered unchanged |
@@ -263,6 +286,12 @@ A fire-and-forget beacon, preferring the browser's beacon transport so the event
 - **Paging state lives on the payload's list object, not on a module-level flag**, so a refresh that swaps the payload cannot strand the new list at its first page or append its rows onto the old one's. (Notable.)
 - **The memories toolbar is deliberately excluded from a re-render into an existing page**, so a reader mid-filter keeps focus and caret through every tick. (Notable.)
 - **A failed push-list load closes the guard that would re-fetch it**, because a render-driven retry against a failing endpoint loops forever. (Notable.)
+- **Closing the Settings modal only hides it, so its state outlives the close.** The section, the push list, the missing count and the probe result are all still there on the next open — which makes the two "lazy-load on first entry" fetches once per page **load** rather than once per open, and makes the modal reopen where the reader left it rather than on the first section. (Surprising; "first entry" reads as per-open.)
+- **The 30-second tick repaints the page underneath an open modal and cannot disturb it.** The repaint writes the shell and one view renderer; the modal body is a separate fixed layer nothing on that path touches. (Notable.)
+- **The local-agent availability probe is manual and gates nothing here.** The desktop editor's equivalent disables Apply on a confirmed negative — for the whole panel — and holds a click made mid-check; this modal's button only prints a line. (Surprising; the same check, two entirely different consequences.)
+- **The link allowlist tests a normalised probe and renders the escaped original.** Three literal schemes are admitted (the two web schemes and the mail scheme); the probe strips tab, line-feed and carriage-return from anywhere, trims leading control characters and spaces, and lower-cases — mirroring exactly what a browser does before it reads a scheme, which is what refuses an obfuscated script scheme. Because the probe never becomes the attribute, a URL the browser cannot read a scheme out of is a relative one, so the worst case is a dead same-origin link rather than an escalation. (Security-relevant; the escaping alone would not have stopped it.)
+- **A conversation row's tooltip is the session identifier, and it is omitted rather than placeheld.** It is the only field distinguishing two conversations from one source; when the archive has no identifier the attribute is dropped, because "unknown" would be a claim about the session and no tooltip is not. (Notable.)
+- **The topbar's local-only chip is gone from the markup and the stylesheet.** Only the synced chip is still keyed off the tier attribute, so the page no longer states anywhere in its own interface that it runs locally and sends nothing — the property holds, but it is unasserted. (Notable; the tier attribute now drives one chip, not two.)
 - **Grouping maps are prototype-less wherever the keys are user-controlled strings** — a branch named after an inherited member either dropped its series silently or blanked the page. (Surprising; measured.)
 - **The standup's Escape handler is assigned rather than added**, precisely so the 30-second re-render replaces it instead of stacking copies; the calendar's, which must be added, is explicitly removed before re-binding for the same reason. (Notable.)
 - **The standup draft is editable and is copied on open as well as on the button**, so the one-click path stays fast while the sheet is what makes the draft correctable before it is posted. (Notable.)
@@ -272,5 +301,5 @@ A fire-and-forget beacon, preferring the browser's beacon transport so the event
 - Every route called here, the checks each is subject to, page assembly, and the token's minting and inlining are owned by spec 352.
 - Every payload rendered here, and the meaning of every figure in it, is owned by spec 353 — including the two facts this application renders around: the tier that never reaches its third value, and the insight kinds that are never produced.
 - The registry the Repositories view lists and acts on is owned by spec 355.
-- The settings mutation semantics behind Apply and the per-repository toggles — masked-key reuse, the cross-repository hook sweep, folder validation, sign-in, migration, sync and backfill — are owned by their own topics.
+- The settings mutation semantics behind Apply — masked-key reuse, the cross-repository hook sweep, folder validation, and what the modal's own migrate hint gets wrong — are owned by spec 363; the access boundary its endpoints sit behind and the backfill's concurrency guard by spec 352; the per-repository push toggles' store, row contents and per-row wording by spec 310; and sign-in's browser flow, the migrate routine, the sync round and the backfill engine by their own topics. This spec owns only the modal as client behaviour: its open sequence, its controlled form and dirty gate, its lazy loads and their guard, the probe that gates nothing, and the state that survives a close.
 - Telemetry buffering, consent, and whether a forwarded event is recorded at all are owned by the telemetry topic; this spec covers only what the page emits and when.

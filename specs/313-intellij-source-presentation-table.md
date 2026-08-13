@@ -13,7 +13,7 @@ One table is the single place every IntelliJ surface looks before painting an ex
 - The label-composition policy: which sources lead their row with a native identifier and which do not.
 - Every surface that reads the table, and which of the three values each one takes.
 - The two deliberate letter collisions.
-- The cross-language obligation this table creates against the desktop editor's equivalent, exactly where the mirror stops, and the one source currently missing from this side.
+- The cross-language obligation this table creates against the desktop editor's equivalent, exactly where the mirror stops, and the shipping sources currently missing from this side.
 - The two different neutral fallbacks that exist on this host and why they are not interchangeable.
 
 **Out of scope (boundaries):**
@@ -47,6 +47,8 @@ Three display values: a badge letter, a colour, and a human label. Nothing here 
 | Zoom Meeting | `Z` | `#2D8CFF` | Zoom Meeting |
 
 Every colour is declared with **identical light and dark values** — the table commits to the source's brand hue in both IDE themes rather than adapting.
+
+The rows cover every source this host's own enumeration carries, and that enumeration is **narrower than the shared reference-source catalogue** — see the missing-sources note below for which sources it omits and what a row from one of them looks like here.
 
 ### The neutral placeholder
 
@@ -87,8 +89,8 @@ This host carries two distinct neutral fallbacks that happen to look similar: th
 
 ## Notable Behavior
 
-- **Two letter collisions are deliberate.** `J` is shared by Jira and Jolli Memory, whose colours differ and where the first-party brand takes precedence — the same call the desktop editor made. `Z` is shared by Zoom Doc and Zoom Meeting, which additionally share one hue and are therefore **visually indistinguishable at badge size**. Only the first collision is acknowledged in place. (Intentional; the second is undocumented.)
-- **One shipping source is missing from this host's table, and its absence is invisible until a user has one.** The reference-source catalogue and the desktop editor's table both carry a deployment-platform source that this host's enumeration does not. A reference from it deserializes to an absence and therefore renders as the neutral placeholder — placeholder letter, neutral hue, the label "Reference" — in the working-context list, the working-memory review and the pinned list, while its row is **dropped outright** from the committed-memories context group, and the desktop editor renders its real letter, hue and label from byte-identical stored data. (Surprising; live drift.)
+- **Two letter collisions are deliberate.** `J` is shared by Jira and Jolli Memory, whose colours differ and where the first-party brand takes precedence — the same call the desktop editor made. `Z` is shared by Zoom Doc and Zoom Meeting, which additionally share one hue and are therefore **visually indistinguishable at badge size**. Only the first collision is acknowledged in place. A third collision exists in the shared catalogue and in the desktop editor's table — the issue-tracking / error-monitoring source reuses Slack's `S` on a different hue — but cannot arise here, because that source is one of the ones this host's enumeration omits. (Intentional; the second is undocumented.)
+- **Several shipping sources are missing from this host's table, and their absence is invisible until a user has one.** The reference-source catalogue and the desktop editor's table both carry a deployment-platform source, a design-file source and an issue-tracking / error-monitoring source that this host's enumeration does not. This is an **accepted gap, recorded as such where the catalogue is declared** — the enumeration and this table are meant to be extended in a follow-up change of their own, so a reviewer finding one of them missing here is finding a known decision rather than an oversight. The observable consequence is exact: a reference from any of them deserializes to an absence, so it renders as the neutral placeholder — placeholder letter, neutral hue, the label "Reference" — in the working-context list, the working-memory review and the pinned list, while its row is **dropped entirely** from the committed-memories context group, and the desktop editor renders its real letter, hue and label from byte-identical stored data. (Surprising; live drift, deliberately accepted.)
 - **Nothing enforces the cross-language mirror.** The obligation rests entirely on the two files' own comments. A sibling contract in the same area *is* pinned by a test, which is exactly why its drift never happened and this one did. (Notable.)
 - **The fallback is where the mirror deliberately stops, and only the colour agrees.** The desktop editor derives its fallback *from the source's own identifier* — the identifier as the label, its first character upper-cased as the letter, a generic icon — while this table's is a fixed constant. A future source named, say, `hubspot` therefore reads as `H` / "hubspot" on one host and as the placeholder letter / "Reference" on the other, from identical on-disk data. The claim that the neutral colour is "the other host's fallback colour for the same purpose" is true of the colour and easy to misread as a claim about the whole fallback. (Surprising.)
 - **The desktop editor's table carries two fields this one has no counterpart for** — an icon identifier and a per-source style-token derivation — and it enumerates its own keys in a load-bearing order for one dialog. Neither has an analogue here, so those are not drift. (Notable.)

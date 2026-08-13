@@ -12,10 +12,15 @@ request on the client's own machine. A workflow is offered as locally-runnable
 machine; before the run starts the developer is told whether the resulting PR
 will auto-merge (destination auto-apply on) or open for team review (off).
 
-The `jolli mcp` server is a **stateless** request/response surface — one
+The `jolli mcp` surface is a **stateless** request/response surface — one
 dispatch per call, no cross-call session state, no server-initiated push, and no
-way to pop an interactive prompt (standard input/output is the JSON-RPC
-transport). Therefore "the host drives the flow" means the **calling client's
+way to pop an interactive prompt. Standard input/output is the JSON-RPC transport
+of the **host-to-process hop only**: the process a host spawns is a per-session
+proxy that forwards bytes to a shared per-worktree server over a socket or named
+pipe (spec 364), so the transport further down is not stdio. None of that changes
+the properties this spec relies on — still one dispatch per call, still no
+cross-call session state, still no server-initiated push, still no interactive
+prompt. Therefore "the host drives the flow" means the **calling client's
 agent loop** drives an ordered sequence of MCP tool calls plus command-line
 (`Bash`) calls, guided by an installed Jolli **recipe skill**. The human sitting
 in that client is the review gate; the agent re-calling the progress tool while

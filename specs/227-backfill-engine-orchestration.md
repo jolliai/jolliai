@@ -11,7 +11,7 @@ Run the end-to-end historical back-fill for a list of candidate commits: drop th
 **In scope:**
 - The ordered run pipeline (drop-existing → index → attribute → generate/store or preview).
 - The cursor-candidate gathering that feeds the attributor a superset of the emit set.
-- The generate-and-store step, including the diff-only path, the fields stamped on a back-filled memory, and when a transcript artifact is attached.
+- The generate-and-store step, including the diff-only path, the fields stamped on a back-filled memory, when a transcript artifact is attached, and the per-session display title resolved into that artifact at write time.
 - The own-author commit filter (email OR name, literal matching) shared by every entry point.
 - The single post-batch ingest trigger.
 - Error isolation and the no-credentials outcome.
@@ -80,6 +80,8 @@ For one commit (with an attribution or `null`):
 4. Generate the summary via the **same** generation path the live pipeline uses, passing conversation, diff, commit info, diff stats, and the attributed entry/turn counts (zero when diff-only).
 5. Build the stored memory: schema version, commit metadata, branch = attributed branch or the `backfilled` sentinel, generated-at, generation results (entry/turn counts, model info, stats, topics, optional ticket id and recap), the **back-filled flag set true**, method = attribution method or `diff-only`, confidence **only when attributed**, tree hash when available, and a transcript id **only when a conversation was attributed**.
 6. Attach a transcript artifact **only when a conversation was attributed**; store the memory through the active storage.
+   - Building that artifact is an **asynchronous** step, because each archived session in it also carries a **display title resolved once, here, at write time** — every session in the attribution is resolved in parallel and a resolved title is stamped onto the archived session; a session that resolves to nothing carries no title field at all, so a later reader falls back exactly as it does for an artifact written before the field existed. The artifact otherwise carries each session's identifier, producer, transcript path and archived turns.
+   - **Documented caveat:** the title resolution runs long after the commit, so a transcript pruned in the meantime yields no producer-native title and the archived first user message stands instead. That is the honest answer for a file that is gone, and still strictly better than archiving nothing — which left every future reader deriving the title from a path that had already stopped existing.
 7. Return the topic count.
 
 **Diff-only path (`null` attribution):** mirrors the live pipeline's no-active-session behaviour — a diff-derived memory is *always* produced; the "never guess" rule governs only whether a *conversation* is attached, not whether a memory exists. No transcript id, no transcript artifact, no confidence field.
@@ -107,6 +109,7 @@ Every commit-listing query the engine runs (cursor candidates; the recent-hashes
 - **The back-filled flag and method distinguish back-filled memories** from live ones; confidence is present only when a conversation was attributed. (Notable.)
 - **A single repo-wide ingest fires once per batch**, never per memory, and only when something was generated — with force so a deliberate back-fill always refreshes the knowledge wiki/graph regardless of the ingest cooldown. (Notable.)
 - **Tree hash is computed even for diff-only memories** so cross-branch dedup parity with the live pipeline holds. (Notable.)
+- **The archived transcript carries a resolved title per session, and back-fill is the entry point where that resolution is most likely to be degraded.** The same write-time resolution the live pipeline performs runs here, but long after the commit — so a transcript the agent has since pruned yields no producer-native title and the archived first user message stands in for it. Recorded as a known caveat rather than a defect: the alternative is storing no title and leaving every reader to re-derive one from a path that no longer resolves. (Notable.)
 - **Author filter is fixed-string, not regex** — a deliberate choice to avoid silently matching zero commits for perfectly ordinary emails/names. (Surprising; intentional.)
 - **The candidate/emit split is intentional:** neighbours that are already summarized or out of the requested range are still passed in so they truncate attribution windows, but they never receive a new outcome. (Notable.)
 - **A cooperative cancellation signal lets a caller stop between commits without corrupting state** — checked only at the commit boundary; an in-flight commit's generation is never interrupted. The guided front door's cold-start offer uses this for its Ctrl-C handling. (Notable.)

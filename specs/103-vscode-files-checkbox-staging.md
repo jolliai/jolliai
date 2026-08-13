@@ -10,7 +10,7 @@ A UI-only set of repository-relative paths that records which files the user has
 - The data shape that backs the per-file selection (a set keyed by repository-relative path).
 - How the selection interacts with the live file list returned by the underlying repository status query.
 - The single direction of authority: the in-memory selection set is the truth; the IDE TreeItem checkbox state is derived.
-- The mapping of git porcelain status codes to the row's left-glyph (M/A/D/R/U/C/I/?), and how each code influences row click behavior and discard semantics.
+- The mapping of git porcelain status codes to the row's left-glyph (M/A/D/R/U/C/I/?), and how each code influences row click behavior. The code does **not** influence discard — see the note under the mapping table.
 - The folder-grouping the Changes tab presents and the per-folder expand/collapse persistence within the webview's lifetime.
 - The "N selected" count surfaced to the toolbar and status bar.
 - The debounced refresh path that keeps the file list current across rapid file-system or index events without losing selection.
@@ -18,7 +18,7 @@ A UI-only set of repository-relative paths that records which files the user has
 **Out of scope:**
 - The AI Commit flow itself — staging at commit time, message generation, hook orchestration. This topic owns the **selection input**; the commit flow owns what to do with it.
 - The exclude filter implementation. Its existence is honored here (selected paths that become excluded are pruned), but the pattern set is owned elsewhere.
-- The discard action's destructive semantics. This topic notes that selection prunes after discard but does not own the discard implementation.
+- The discard action's destructive semantics — the path-only request shape, the single status read every path is resolved against, the classification and per-path operations, the outcome actions, and the read-only query that words the confirmation prompt. Owned by the working-tree-file-discard topic. This topic notes only that selection prunes after discard.
 - The Branch tab's plans/notes/commits surfaces.
 
 ## Data Contracts
@@ -64,18 +64,20 @@ The order is reset only on:
 
 Each row carries a single status code character extracted from the underlying repository status query. The protocol surfaces it as the `gitStatus` field on the serialized row. Codes used and their behavior:
 
-| Code | Meaning            | Click action                                                                          | Discard action                                                       |
-| ---- | ------------------ | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `M`  | Modified           | Open a side-by-side diff: `HEAD` vs working tree.                                     | "Discard changes to this file. Cannot be undone."                    |
-| `A`  | Added (staged-new) | Open the working-tree file directly (no `HEAD` version exists).                       | "Permanently delete this file from disk. Cannot be undone."          |
-| `D`  | Deleted            | Open the `HEAD` version read-only.                                                    | "Discard changes to this file. Cannot be undone."                    |
-| `R`  | Renamed            | Side-by-side diff: previous path at `HEAD` vs current path in working tree.           | "Permanently delete this file from disk. Cannot be undone."          |
-| `?`  | Untracked          | Open the working-tree file directly.                                                  | "Permanently delete this file from disk. Cannot be undone."          |
-| `U`  | Unmerged           | (Standard diff or open path; consumers gate on the code.)                             | (Standard discard.)                                                  |
-| `C`  | Copied             | Standard diff path.                                                                    | Standard discard.                                                    |
-| `I`  | Ignored            | Standard open.                                                                         | Standard discard.                                                    |
+| Code | Meaning            | Click action                                                                          |
+| ---- | ------------------ | ------------------------------------------------------------------------------------- |
+| `M`  | Modified           | Open a side-by-side diff: `HEAD` vs working tree.                                     |
+| `A`  | Added (staged-new) | Open the working-tree file directly (no `HEAD` version exists).                       |
+| `D`  | Deleted            | Open the `HEAD` version read-only.                                                    |
+| `R`  | Renamed            | Side-by-side diff: previous path at `HEAD` vs current path in working tree.           |
+| `?`  | Untracked          | Open the working-tree file directly.                                                  |
+| `U`  | Unmerged           | (Standard diff or open path; consumers gate on the code.)                             |
+| `C`  | Copied             | Standard diff path.                                                                    |
+| `I`  | Ignored            | Standard open.                                                                         |
 
-The "permanent delete" wording on the discard prompt fires for codes that imply the file did not exist at `HEAD` (`?`, `A`, `R`).
+**The status code no longer influences discard at all.** The row's discard sends the row's repository-relative path and nothing else; the wording of its confirmation prompt comes from a separate read-only query, and the operation performed comes from a status read the discard rule set takes itself. Two consequences for this table: it has no discard column, and the code is not what decides between "discard all changes to this file" and "permanently delete this file from disk".
+
+The delete-wording set is also wider than a `?` / `A` / `R` rule would give: a **copy** revert deletes the copy, and a **conflicted** row's file is deleted whenever the committed tree has no version of it — while a *staged deletion*, which also arrives as `D` here, is **restored**. A collapsed one-letter code cannot express that split, which is exactly why the wording is queried rather than derived. The one-letter rule survives on this surface only as the fallback for a query that *throws*, and it covers `?`, `A`, `R` **and** `C`.
 
 ### Folder grouping
 
@@ -206,7 +208,7 @@ selection = ∅, rawFiles = [], orderMap = {}, isEnabled = true
 ## Shared Behavior
 
 - **AI Commit flow** — the consumer of `selectedFiles`. Stages exactly that subset and runs the LLM message-generation step.
-- **Discard action** — the destructive operation that prunes the selection after success.
+- **Discard action** — the destructive operation that prunes the selection after success. It takes paths only; neither the row's status code nor its raw porcelain columns reach it, and the wording of its prompt is a separate read-only query rather than a function of the code this topic maps.
 - **Exclude filter** — the pattern set whose changes prune the selection and shrink `visibleFiles`.
 - **Repository status query** — the producer of the raw file list and the porcelain status codes.
 - **Sidebar message protocol** — the route the toggle messages flow through.
