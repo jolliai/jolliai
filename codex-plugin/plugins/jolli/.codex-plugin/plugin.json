@@ -1,6 +1,6 @@
 {
 	"name": "jolli",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"description": "Automatically captures and generates project memory from your development work — team-shareable and synced across devices, so you can recall and search past decisions and context across sessions and agents. Backed by the jolli CLI bundled with this plugin.",
 	"author": { "name": "jolli.ai", "url": "https://jolli.ai" },
 	"homepage": "https://jolli.ai",
