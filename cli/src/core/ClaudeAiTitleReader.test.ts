@@ -2,7 +2,27 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { readClaudeAiTitle, TAIL_SCAN_BYTES } from "./ClaudeAiTitleReader.js";
+import { aiTitleFromRecord, readClaudeAiTitle, TAIL_SCAN_BYTES } from "./ClaudeAiTitleReader.js";
+
+describe("aiTitleFromRecord", () => {
+	it("returns the title of an ai-title row", () => {
+		expect(aiTitleFromRecord({ type: "ai-title", aiTitle: "a title" })).toBe("a title");
+	});
+
+	it("declines a row of any other type", () => {
+		// Unreachable from the streaming reader, whose substring pre-filter has already
+		// established the type — but this function's other caller (the Claude disk scan)
+		// folds it over EVERY parsed record, so the check is what makes it safe there.
+		expect(aiTitleFromRecord({ type: "user", aiTitle: "not a title row" })).toBeUndefined();
+		expect(aiTitleFromRecord({})).toBeUndefined();
+	});
+
+	it("declines an ai-title row whose title is empty or not a string", () => {
+		expect(aiTitleFromRecord({ type: "ai-title", aiTitle: "" })).toBeUndefined();
+		expect(aiTitleFromRecord({ type: "ai-title", aiTitle: 42 })).toBeUndefined();
+		expect(aiTitleFromRecord({ type: "ai-title" })).toBeUndefined();
+	});
+});
 
 describe("readClaudeAiTitle", () => {
 	let dir: string;

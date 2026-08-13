@@ -29,6 +29,7 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
+import { mapWithConcurrency, withIoBudget } from "../util/Concurrency.js";
 import { sessionDirBelongsToRepo } from "./SessionDirMatch.js";
 
 const log = createLogger("CodexDiscoverer");
@@ -43,28 +44,97 @@ const CODEX_DIR_NAME = ".codex";
  * Discovers Codex sessions relevant to the given project directory.
  * Scans ~/.codex/sessions/ for JSONL files whose session_meta.cwd matches
  * the project directory. Only returns sessions updated within the staleness
- * window (48 hours).
+ * window (48 hours by default).
  *
  * @param projectDir - The git repository root to match sessions against
+ * @param windowMs - Staleness window; defaults to {@link SESSION_STALE_MS}.
+ *   The dashboard's history back-fill passes a wider one (7 days). Every caller
+ *   that must keep the 48 h horizon simply omits it — the sidebar's Active
+ *   Conversations, `jolli status`, and (the one that matters) `QueueWorker`'s
+ *   post-commit summary, which decides which conversations belong to the commit
+ *   being summarised. Widening THAT would write week-old unrelated conversations
+ *   into a commit's stored memory, persistently and with no error anywhere, which
+ *   is why the constant above stays a default and never becomes the knob.
  * @returns Array of matching sessions with source="codex"
  */
-export async function discoverCodexSessions(projectDir: string): Promise<ReadonlyArray<SessionInfo>> {
+export async function discoverCodexSessions(
+	projectDir: string,
+	windowMs?: number,
+): Promise<ReadonlyArray<SessionInfo>> {
+	return codexSessionsForRepo(await scanCodexSessionsOnDisk(windowMs), projectDir);
+}
+
+/** One Codex rollout, as the machine-wide scan understands it. */
+export interface CodexDiskSession {
+	readonly sessionId: string;
+	readonly transcriptPath: string;
+	readonly updatedAt: string;
+	/**
+	 * The working directory `session_meta` recorded. An array for symmetry with the
+	 * other disk scans (Claude collects several per transcript, Devin has a primary
+	 * plus an attached list); Codex records exactly one, so it always holds one entry.
+	 */
+	readonly dirs: ReadonlyArray<string>;
+}
+
+/**
+ * Scans every Codex rollout on this machine and returns those inside the window,
+ * each carrying the working directory it recorded.
+ *
+ * MACHINE-WIDE and repo-agnostic on purpose. `~/.codex/sessions/` is one global tree
+ * keyed by DATE, not by project, so a repo-scoped scan re-reads the first line of
+ * every rollout once per registered repo — measured on this machine, 68 ms per repo
+ * and 201 ms across three, all of it pure repetition. Callers scan once and narrow
+ * with {@link codexSessionsForRepo}.
+ */
+export async function scanCodexSessionsOnDisk(windowMs?: number): Promise<ReadonlyArray<CodexDiskSession>> {
 	const codexBase = join(homedir(), CODEX_DIR_NAME);
-	const resolvedProject = resolve(projectDir);
-	const sessions: SessionInfo[] = [];
+	const staleMs = windowMs ?? SESSION_STALE_MS;
+	const sessions: CodexDiskSession[] = [];
 
 	// Scan active sessions in date-organized directories
 	const sessionsDir = join(codexBase, "sessions");
-	const activeSessions = await scanSessionsDirectory(sessionsDir, resolvedProject);
-	sessions.push(...activeSessions);
+	sessions.push(...(await scanSessionsDirectory(sessionsDir, staleMs)));
 
-	// Scan archived sessions (flat directory)
+	// Scan archived sessions (flat directory). Unlike the active half this is not
+	// date-partitioned, so it needs no directory-range change — only the staleness
+	// window reaches it.
 	const archivedDir = join(codexBase, "archived_sessions");
-	const archivedSessions = await scanFlatDirectory(archivedDir, resolvedProject);
-	sessions.push(...archivedSessions);
+	sessions.push(...(await scanFlatDirectory(archivedDir, staleMs)));
 
-	log.debug("Discovered %d Codex session(s)", sessions.length);
+	log.debug("Codex disk scan: %d rollout(s) inside the window", sessions.length);
 	return sessions;
+}
+
+/**
+ * Narrows a machine-wide Codex scan to one repo.
+ *
+ * Attribution is `sessionDirBelongsToRepo`, unchanged from when it ran inside the
+ * scan: prefix/containment with case folding plus the nested-repo exclusion, so a
+ * rollout started in a SUBDIRECTORY still counts (the exact-equality match this
+ * replaced silently dropped every one of those — JOLLI-2015).
+ *
+ * FILTERS rather than partitions: nested-repo exclusion aside, the same rollout may
+ * legitimately be claimed by two registered repos that are two checkouts of one
+ * project.
+ */
+export function codexSessionsForRepo(
+	scanned: ReadonlyArray<CodexDiskSession>,
+	projectDir: string,
+): ReadonlyArray<SessionInfo> {
+	const resolvedProject = resolve(projectDir);
+	const mine: SessionInfo[] = [];
+	for (const session of scanned) {
+		if (!session.dirs.some((dir) => sessionDirBelongsToRepo(resolve(dir), resolvedProject))) continue;
+		mine.push({
+			sessionId: session.sessionId,
+			transcriptPath: session.transcriptPath,
+			updatedAt: session.updatedAt,
+			source: "codex",
+		});
+	}
+	log.debug("Discovered %d Codex session(s) for %s", mine.length, projectDir);
+	return mine;
 }
 
 /**
@@ -85,9 +155,9 @@ export async function isCodexInstalled(): Promise<boolean> {
  * Scans the date-organized ~/.codex/sessions/YYYY/MM/DD/ directory structure.
  * Only traverses date directories within the 48h staleness window.
  */
-async function scanSessionsDirectory(sessionsDir: string, resolvedProject: string): Promise<SessionInfo[]> {
-	const results: SessionInfo[] = [];
-	const recentDates = getRecentDateDirs();
+async function scanSessionsDirectory(sessionsDir: string, staleMs: number): Promise<CodexDiskSession[]> {
+	const results: CodexDiskSession[] = [];
+	const recentDates = getRecentDateDirs(staleMs);
 
 	let yearDirs: string[];
 	try {
@@ -132,7 +202,7 @@ async function scanSessionsDirectory(sessionsDir: string, resolvedProject: strin
 				}
 
 				const dayPath = join(monthPath, day);
-				const daySessions = await scanFlatDirectory(dayPath, resolvedProject);
+				const daySessions = await scanFlatDirectory(dayPath, staleMs);
 				results.push(...daySessions);
 			}
 		}
@@ -145,37 +215,35 @@ async function scanSessionsDirectory(sessionsDir: string, resolvedProject: strin
  * Scans a flat directory for .jsonl files and checks each for cwd match.
  * Used for both day directories (active sessions) and archived_sessions.
  */
-async function scanFlatDirectory(dirPath: string, resolvedProject: string): Promise<SessionInfo[]> {
-	const results: SessionInfo[] = [];
-
+async function scanFlatDirectory(dirPath: string, staleMs: number): Promise<CodexDiskSession[]> {
 	let files: string[];
 	try {
 		files = await readdir(dirPath);
 	} catch {
-		return results;
+		return [];
 	}
 
-	for (const file of files) {
-		if (!file.endsWith(".jsonl")) {
-			continue;
-		}
-
-		const filePath = join(dirPath, file);
-		const session = await tryParseSessionMeta(filePath, resolvedProject);
-		if (session) {
-			results.push(session);
-		}
-	}
-
-	return results;
+	// One rollout per file, so the cost of this scan is the number of rollouts a user
+	// has — which on a heavy Codex machine is thousands. Fanned out rather than looped
+	// because each file is an independent first-line read. Each one takes a slot from
+	// the shared budget (see `withIoBudget` inside `tryParseSessionMeta`), so this
+	// running alongside eleven other scans still cannot exceed the process-wide total.
+	const scanned = await mapWithConcurrency(
+		files.filter((file) => file.endsWith(".jsonl")),
+		(file) => tryParseSessionMeta(join(dirPath, file), staleMs),
+	);
+	return scanned.filter((session): session is CodexDiskSession => session !== null);
 }
 
 /**
  * Reads only the first line of a Codex JSONL file to extract session_meta.
- * Returns a SessionInfo if the session's cwd matches the project directory
- * and the session is within the staleness window.
+ * Returns the rollout's facts when it is within the staleness window, or null.
+ *
+ * Repo attribution is deliberately NOT done here: it belongs to
+ * {@link codexSessionsForRepo}, so one scan of this global tree can serve every
+ * registered repo instead of being re-run per repo.
  */
-async function tryParseSessionMeta(filePath: string, resolvedProject: string): Promise<SessionInfo | null> {
+async function tryParseSessionMeta(filePath: string, staleMs: number): Promise<CodexDiskSession | null> {
 	let firstLine: string;
 	try {
 		firstLine = await readFirstLine(filePath);
@@ -209,34 +277,34 @@ async function tryParseSessionMeta(filePath: string, resolvedProject: string): P
 			return null;
 		}
 
-		// Match cwd against the project directory via `sessionDirBelongsToRepo`
-		// (shared with Devin/OpenCode/Copilot): prefix/containment with separator +
-		// case folding (handling the Windows "e:\foo" vs "E:\foo" drive-letter drift)
-		// plus the nested-repo exclusion. It replaced the exact `resolvedCwd ===
-		// resolvedProject` match, which silently dropped every session run from a
-		// subdirectory of the repo (JOLLI-2015).
-		if (!sessionDirBelongsToRepo(resolve(cwd), resolvedProject)) {
-			return null;
-		}
-
 		// Determine session freshness from timestamp or file mtime
 		const updatedAt = timestamp ?? (await getFileMtime(filePath));
 		if (!updatedAt) {
 			return null;
 		}
 
-		// Check staleness
-		const age = Date.now() - new Date(updatedAt).getTime();
-		if (age > SESSION_STALE_MS) {
+		// Check parseability before staleness. `NaN > staleMs` is false, so an invalid
+		// timestamp otherwise looks fresh and escapes the scan with an undateable
+		// `SessionInfo`; downstream then counts it as discovered but cannot project it.
+		const updatedAtMs = Date.parse(updatedAt);
+		if (!Number.isFinite(updatedAtMs)) return null;
+		const age = Date.now() - updatedAtMs;
+		if (age > staleMs) {
 			log.debug("Stale Codex session %s (age: %dh)", id, Math.round(age / 3600000));
 			return null;
 		}
 
+		// The cwd is carried, not matched. `codexSessionsForRepo` does the matching
+		// through `sessionDirBelongsToRepo` (shared with Devin/OpenCode/Copilot):
+		// prefix/containment with separator + case folding (handling the Windows
+		// "e:\foo" vs "E:\foo" drive-letter drift) plus the nested-repo exclusion. That
+		// replaced an exact `resolvedCwd === resolvedProject` match, which silently
+		// dropped every session run from a subdirectory of the repo (JOLLI-2015).
 		return {
 			sessionId: id,
 			transcriptPath: filePath,
 			updatedAt,
-			source: "codex",
+			dirs: [cwd],
 		};
 	} catch (error: unknown) {
 		log.debug("Failed to parse session_meta from %s: %s", filePath, (error as Error).message);
@@ -249,6 +317,12 @@ async function tryParseSessionMeta(filePath: string, resolvedProject: string): P
  * Closes the stream immediately after reading one line.
  */
 function readFirstLine(filePath: string): Promise<string> {
+	// Zero bytes claimed: this reads one line, not the file, so it needs a slot (to
+	// bound how many rollouts are open at once) and none of the byte allowance.
+	return withIoBudget(0, () => readFirstLineUnbudgeted(filePath));
+}
+
+function readFirstLineUnbudgeted(filePath: string): Promise<string> {
 	return new Promise((resolve, reject) => {
 		const stream = createReadStream(filePath, { encoding: "utf-8" });
 		const rl = createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
@@ -290,16 +364,45 @@ async function getFileMtime(filePath: string): Promise<string | null> {
 	}
 }
 
+/** One calendar day in ms — the step between Codex's `YYYY/MM/DD` directories. */
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
 /**
- * Returns date directory paths (YYYY/MM/DD format) for the last 3 days.
- * The 48h window may span up to 3 calendar days (today, yesterday, day before).
+ * How many `YYYY/MM/DD` directories a staleness window can reach into.
+ *
+ * `+1` because a window almost never ends at midnight: 48 h measured from noon
+ * today reaches back to noon two days ago, which is the THIRD calendar day
+ * (today, yesterday, the day before). Dropping the `+1` silently truncates the
+ * oldest day of every window.
+ *
+ * This is the second half of widening the window, and the half that is easy to
+ * miss: the staleness check alone is not enough, because a session four days old
+ * lives in a directory this traversal would never enter. Passing a 7-day window
+ * without widening the range here leaves the parameter purely decorative — with no
+ * error, no warning, and a plausible-looking empty result.
  */
-function getRecentDateDirs(): string[] {
+function calendarDaySpan(staleMs: number): number {
+	return Math.ceil(Math.max(0, staleMs) / ONE_DAY_MS) + 1;
+}
+
+/**
+ * Returns date directory paths (YYYY/MM/DD format) covering `staleMs`.
+ *
+ * The parts come from the LOCAL date, which matches how Codex names these
+ * directories: a real capture has `~/.codex/sessions/2026/08/11/` holding
+ * `rollout-2026-08-11T10-52-15-…jsonl` whose `session_meta.timestamp` is
+ * `2026-08-11T02:53:24.548Z` — 02:53 UTC is 10:53 in the machine's UTC+8, so the
+ * name is stamped in local time. (Inferred from the filename rather than proven
+ * directly: the machine that capture came from had no session spanning a date
+ * boundary, so UTC and local dates agreed for every sample.)
+ */
+function getRecentDateDirs(staleMs: number): string[] {
 	const dates: string[] = [];
 	const now = new Date();
+	const days = calendarDaySpan(staleMs);
 
-	for (let i = 0; i < 3; i++) {
-		const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+	for (let i = 0; i < days; i++) {
+		const d = new Date(now.getTime() - i * ONE_DAY_MS);
 		const year = String(d.getFullYear());
 		const month = String(d.getMonth() + 1).padStart(2, "0");
 		const day = String(d.getDate()).padStart(2, "0");

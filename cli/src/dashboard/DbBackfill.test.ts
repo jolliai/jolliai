@@ -13,6 +13,12 @@ vi.mock("./DashboardCollector.js", () => ({
 	collectSessionEvents: vi.fn(),
 	collectSummaryEvents: vi.fn(),
 	collectWorktreeEvent: vi.fn(),
+	// A pure key builder, not a seam: the backfill maps every session event through
+	// it to report which sessions a pass processed. A `vi.fn()` here returns
+	// undefined and the map throws, which this whole-module factory turns into
+	// `mode: "skipped"` on every repo rather than into a readable failure. Its real
+	// behaviour is pinned by DashboardCollector.test.ts.
+	sessionPassKey: (source: string, sessionId: string) => `${source}:${sessionId}`,
 }));
 vi.mock("../core/GitOps.js", () => ({
 	getHeadHash: vi.fn(),
@@ -33,6 +39,52 @@ vi.mock("../core/SummaryStore.js", () => ({
 	// the identity default doubles as the assertion target for the seam below.
 	resolveReadStorage: vi.fn(),
 }));
+// `dbBackfillRepos` scans `~/.claude/projects` and `~/.codex/sessions` once per run.
+// Both are mocked because the real scans read the DEVELOPER's home directory:
+// unmocked, every case in this file would walk whatever transcripts happen to be on
+// the machine — slow, and its results would vary per machine. Their own behaviour is
+// covered by each discoverer's suite against a temp tree.
+// EVERY machine-global scan is mocked, not just the two that are asserted on. These
+// read the developer's real home directory (~/.claude, ~/.cursor, ~/.codex, the
+// OpenCode and Devin databases, …), so an unmocked one makes this suite depend on
+// which AI tools the machine running it happens to have installed — the exact kind of
+// environment coupling that made the original per-repo profile misleading.
+vi.mock("../core/ClaudeSessionDiscoverer.js", () => ({
+	scanClaudeSessionsOnDisk: vi.fn(),
+}));
+vi.mock("../core/CodexSessionDiscoverer.js", () => ({
+	scanCodexSessionsOnDisk: vi.fn(),
+}));
+vi.mock("../core/CursorSessionDiscoverer.js", () => ({
+	scanCursorComposersOnDisk: vi.fn(async () => ({ composers: [] })),
+}));
+vi.mock("../core/KimiSessionDiscoverer.js", () => ({
+	scanKimiSessionsOnDisk: vi.fn(async () => []),
+}));
+vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
+	scanOpenCodeSessionsOnDisk: vi.fn(async () => ({ sessions: [] })),
+}));
+vi.mock("../core/CopilotSessionDiscoverer.js", () => ({
+	scanCopilotSessionsOnDisk: vi.fn(async () => ({ sessions: [] })),
+}));
+vi.mock("../core/CopilotChatSessionDiscoverer.js", () => ({
+	scanCopilotChatSessionsOnDisk: vi.fn(async () => ({ sessions: [] })),
+}));
+vi.mock("../core/ClineSessionDiscoverer.js", () => ({
+	scanClineSessionsOnDisk: vi.fn(async () => ({ sessions: [] })),
+}));
+vi.mock("../core/ClineCliSessionDiscoverer.js", () => ({
+	scanClineCliSessionsOnDisk: vi.fn(async () => ({ sessions: [] })),
+}));
+vi.mock("../core/DevinSessionDiscoverer.js", () => ({
+	scanDevinSessionsOnDisk: vi.fn(async () => ({ sessions: [] })),
+}));
+vi.mock("../core/CursorCliSessionDiscoverer.js", () => ({
+	scanCursorCliSessionsOnDisk: vi.fn(async () => ({ sessions: [] })),
+}));
+vi.mock("../core/AntigravitySessionDiscoverer.js", () => ({
+	scanAntigravitySessionsOnDisk: vi.fn(async () => ({ sessions: [] })),
+}));
 vi.mock("../core/RepoProfile.js", () => ({
 	readCutoverFence: vi.fn(),
 }));
@@ -48,8 +100,21 @@ vi.mock("./SotImport.js", async (importOriginal) => ({
 	importRepoMemory: vi.fn(),
 }));
 
+import { scanAntigravitySessionsOnDisk } from "../core/AntigravitySessionDiscoverer.js";
+import { scanClaudeSessionsOnDisk } from "../core/ClaudeSessionDiscoverer.js";
+import { scanClineCliSessionsOnDisk } from "../core/ClineCliSessionDiscoverer.js";
+import { scanClineSessionsOnDisk } from "../core/ClineSessionDiscoverer.js";
+import { scanCodexSessionsOnDisk } from "../core/CodexSessionDiscoverer.js";
+import { scanCopilotChatSessionsOnDisk } from "../core/CopilotChatSessionDiscoverer.js";
+import { scanCopilotSessionsOnDisk } from "../core/CopilotSessionDiscoverer.js";
+import { scanCursorCliSessionsOnDisk } from "../core/CursorCliSessionDiscoverer.js";
+import { scanCursorComposersOnDisk } from "../core/CursorSessionDiscoverer.js";
+import { scanDevinSessionsOnDisk } from "../core/DevinSessionDiscoverer.js";
 import { execGit, getHeadHash, listFilesInBranch } from "../core/GitOps.js";
+import { scanKimiSessionsOnDisk } from "../core/KimiSessionDiscoverer.js";
+import { scanOpenCodeSessionsOnDisk } from "../core/OpenCodeSessionDiscoverer.js";
 import { readCutoverFence } from "../core/RepoProfile.js";
+import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
 import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
 import {
 	collectCommitEvents,
@@ -90,6 +155,11 @@ const sessionEvent: SessionUpsertedEvent = {
 	repoIdentity: repo.repoIdentity,
 	source: "claude",
 	sessionId: "s1",
+	// Carried because it is what makes the stored row a READ receipt: `started_at_ms`
+	// comes from the transcript's first entry, so only a full read can produce it, and
+	// `readKnownSessions` counts a row as evidence on exactly that basis. An event
+	// without it projects a row indistinguishable from one a commit summary seeded.
+	startedAtMs: 1_700_000_000_000,
 	updatedAtMs: 1_700_000_050_000,
 };
 
@@ -120,6 +190,11 @@ beforeEach(() => {
 	// memories nothing is "absent from the tip", so the mode stays `seed` unless a
 	// test says otherwise.
 	vi.mocked(listFilesInBranch).mockResolvedValue([]);
+	// An empty disk scan by default. It must RESOLVE rather than return undefined:
+	// `dbBackfillRepos` attaches a `.catch` to the call, so a bare `vi.fn()` with no
+	// return value throws a TypeError before any repo is swept.
+	vi.mocked(scanClaudeSessionsOnDisk).mockResolvedValue([]);
+	vi.mocked(scanCodexSessionsOnDisk).mockResolvedValue([]);
 	vi.mocked(collectCommitEvents).mockResolvedValue([commitEvent("aaa"), commitEvent("bbb")]);
 	vi.mocked(collectSessionEvents).mockResolvedValue([sessionEvent]);
 	vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [], complete: true });
@@ -198,6 +273,11 @@ describe("dbBackfillRepo — bootstrap", () => {
 			// the fixture), asserted below rather than inlined into the pattern.
 			{ source: "git-commits", cursor: expect.stringMatching(/@head-1\+[0-9a-f]{64}$/) },
 			{ source: "sessions", cursor: String(sessionEvent.updatedAtMs) },
+			// NOT a high-water mark like the others — a receipt. It records which build's
+			// full transcript read produced the stored session rows, and it is the only
+			// thing that makes the per-session skip safe to trust. See
+			// `SESSION_READ_GENERATION`.
+			{ source: "sessions-read-generation", cursor: "3" },
 			// The memory import's own signal: the orphan tip (a hash of everything it
 			// reads) plus the mode, since seed and catch-up do not write the same rows.
 			{ source: "sot-import", cursor: `${"ab".repeat(20)}#seed` },
@@ -499,7 +579,11 @@ describe("dbBackfillRepo — recovery", () => {
 		// cursor is unaffected — it is anchored on the orphan tip, which resolves
 		// whether or not HEAD does.
 		const cursors = await query<{ source: string }>("SELECT source FROM ingest_cursors ORDER BY source");
-		expect(cursors).toEqual([{ source: "sessions" }, { source: "sot-import" }]);
+		expect(cursors).toEqual([
+			{ source: "sessions" },
+			{ source: "sessions-read-generation" },
+			{ source: "sot-import" },
+		]);
 	});
 
 	it("skips the worktree event when the collector returns null", async () => {
@@ -585,6 +669,32 @@ describe("dbBackfillRepos", () => {
 		expect(vi.mocked(collectSessionEvents).mock.calls.every((c) => c[0].repoIdentity !== "local:gone")).toBe(true);
 	});
 
+	it("does not scan machine-global stores when no repo has a live checkout", async () => {
+		const gone: RegisteredRepo = {
+			...repo,
+			repoIdentity: "local:only-gone",
+			worktreeRoot: join(dir, "deleted"),
+		};
+
+		await dbBackfillRepos([gone], { dbPath });
+
+		expect(scanClaudeSessionsOnDisk).not.toHaveBeenCalled();
+		expect(scanCodexSessionsOnDisk).not.toHaveBeenCalled();
+		expect(scanCursorComposersOnDisk).not.toHaveBeenCalled();
+	});
+
+	it("keeps a custom session loader isolated from real machine-global stores", async () => {
+		const loadSessions = vi.fn(async () => []);
+
+		await dbBackfillRepos([repo], { dbPath, loadSessions });
+
+		expect(scanClaudeSessionsOnDisk).not.toHaveBeenCalled();
+		expect(scanCodexSessionsOnDisk).not.toHaveBeenCalled();
+		expect(scanCursorComposersOnDisk).not.toHaveBeenCalled();
+		expect(vi.mocked(collectSessionEvents).mock.calls[0][0].loadSessions).toBe(loadSessions);
+		expect(vi.mocked(collectSessionEvents).mock.calls[0][0].preScanned).toEqual({});
+	});
+
 	it("counts only the surviving repos when stamping each one's place in the run", async () => {
 		// `repoTotal` follows the list that is actually swept, so a dead entry does
 		// not make the progress line count to a total it will never reach.
@@ -593,6 +703,368 @@ describe("dbBackfillRepos", () => {
 		await dbBackfillRepos([gone, repo], { dbPath, onProgress: (p) => seen.push(p.repoTotal) });
 		expect(seen.length).toBeGreaterThan(0);
 		expect(seen.every((total) => total === 1)).toBe(true);
+	});
+
+	it("scans the Claude transcript tree ONCE for the whole run, not once per repo", async () => {
+		// The point of hoisting it out of the loop: that tree is machine-global, so a
+		// per-repo scan re-reads every transcript once per registered repo.
+		const second: RegisteredRepo = { ...repo, repoIdentity: "local:second", repoName: "second" };
+		const third: RegisteredRepo = { ...repo, repoIdentity: "local:third", repoName: "third" };
+
+		await dbBackfillRepos([repo, second, third], { dbPath });
+
+		expect(scanClaudeSessionsOnDisk).toHaveBeenCalledTimes(1);
+		// …and every repo still received it.
+		const seen = vi.mocked(collectSessionEvents).mock.calls.map((c) => c[0].preScanned?.claude);
+		expect(seen).toHaveLength(3);
+		expect(seen.every((d) => d !== undefined)).toBe(true);
+	});
+
+	it("uses a caller-supplied scan instead of running its own", async () => {
+		const supplied = [
+			{
+				sessionId: "d1",
+				transcriptPath: "/t/d1.jsonl",
+				updatedAt: "2026-07-30T08:00:00.000Z",
+				dirs: ["/w"],
+				complete: true,
+			},
+		];
+
+		await dbBackfillRepos([repo], { dbPath, preScanned: { claude: supplied } });
+
+		expect(scanClaudeSessionsOnDisk).not.toHaveBeenCalled();
+		expect(vi.mocked(collectSessionEvents).mock.calls[0][0].preScanned?.claude).toEqual(supplied);
+	});
+
+	it("does not let the scans skip anything on a first pass", async () => {
+		// No repo has completed a session pass yet, so nothing in the database can be
+		// trusted as a receipt — see `readRecordedSessions`. The scan must read
+		// everything properly exactly once.
+		await dbBackfillRepos([repo], { dbPath });
+
+		expect(vi.mocked(scanClaudeSessionsOnDisk).mock.calls[0][0]?.alreadyRecorded).toBeUndefined();
+	});
+
+	it("lets the scans skip once every repo has completed a session pass", async () => {
+		await dbBackfillRepos([repo], { dbPath });
+		vi.mocked(scanClaudeSessionsOnDisk).mockClear();
+
+		await dbBackfillRepos([repo], { dbPath });
+
+		expect(vi.mocked(scanClaudeSessionsOnDisk).mock.calls[0][0]?.alreadyRecorded).toBeDefined();
+	});
+
+	it("turns skipping off for the whole run when one repo is newly registered", async () => {
+		// The reason the gate is over EVERY repo rather than per repo: a fresh repo has
+		// no rows, and skipping on another repo's evidence would leave it permanently
+		// without them.
+		await dbBackfillRepos([repo], { dbPath });
+		const fresh: RegisteredRepo = { ...repo, repoIdentity: "local:fresh", repoName: "fresh" };
+		vi.mocked(scanClaudeSessionsOnDisk).mockClear();
+
+		await dbBackfillRepos([repo, fresh], { dbPath });
+
+		expect(vi.mocked(scanClaudeSessionsOnDisk).mock.calls[0][0]?.alreadyRecorded).toBeUndefined();
+	});
+
+	it("keeps sweeping when the disk scan fails", async () => {
+		// Not fatal by design: every other source scans its own store, and the
+		// `sessions.json` half of the collector still carries Claude — so a failed scan
+		// costs Claude its pre-48 h reach, never the run.
+		vi.mocked(scanClaudeSessionsOnDisk).mockRejectedValue(new Error("home directory unreadable"));
+
+		const results = await dbBackfillRepos([repo], { dbPath });
+
+		expect(results[0].mode).toBe("bootstrapped");
+		expect(vi.mocked(collectSessionEvents).mock.calls[0][0].preScanned?.claude).toBeUndefined();
+	});
+
+	it("scans the Codex rollout tree ONCE for the whole run too", async () => {
+		// `~/.codex/sessions/` is keyed by DATE, so it has the same per-repo repetition
+		// as the Claude tree — measured 68 ms per repo, 201 ms across three.
+		const second: RegisteredRepo = { ...repo, repoIdentity: "local:second", repoName: "second" };
+
+		await dbBackfillRepos([repo, second], { dbPath });
+
+		expect(scanCodexSessionsOnDisk).toHaveBeenCalledTimes(1);
+		expect(scanCodexSessionsOnDisk).toHaveBeenCalledWith(BACKFILL_SESSION_WINDOW_MS);
+		expect(vi.mocked(collectSessionEvents).mock.calls.every((c) => c[0].preScanned?.codex !== undefined)).toBe(
+			true,
+		);
+	});
+
+	it("falls back to per-repo Codex scans — not to an empty set — when its scan fails", async () => {
+		// `undefined`, not `[]`. An empty array is the positive claim "the scan ran and
+		// found nothing", which makes the collector skip its own codex loader and lose the
+		// source outright. Absence sends it back to scanning per repo.
+		vi.mocked(scanCodexSessionsOnDisk).mockRejectedValue(new Error("codex home unreadable"));
+
+		const results = await dbBackfillRepos([repo], { dbPath });
+
+		expect(results[0].mode).toBe("bootstrapped");
+		expect(vi.mocked(collectSessionEvents).mock.calls[0][0].preScanned?.codex).toBeUndefined();
+	});
+
+	// Every other machine-global store, held to the same two guarantees: scanned once
+	// per RUN, and handed to every repo. Table-driven because the failure they guard
+	// against is per-source and silent — a source left out of the hoist just goes back
+	// to costing a full store read per repo, with an identical result set.
+	const HOISTED_SCANS = [
+		{ key: "cursor", spy: () => scanCursorComposersOnDisk },
+		{ key: "kimi", spy: () => scanKimiSessionsOnDisk },
+		{ key: "opencode", spy: () => scanOpenCodeSessionsOnDisk },
+		{ key: "copilot", spy: () => scanCopilotSessionsOnDisk },
+		// Keyed by the source TAG now, not by a camel-cased field name — the two
+		// spellings used to be hand-mapped, and the map is gone.
+		{ key: "copilot-chat", spy: () => scanCopilotChatSessionsOnDisk },
+		{ key: "cline", spy: () => scanClineSessionsOnDisk },
+		{ key: "cline-cli", spy: () => scanClineCliSessionsOnDisk },
+		{ key: "devin", spy: () => scanDevinSessionsOnDisk },
+		{ key: "cursor-cli", spy: () => scanCursorCliSessionsOnDisk },
+		{ key: "antigravity", spy: () => scanAntigravitySessionsOnDisk },
+	] as const;
+
+	for (const { key, spy } of HOISTED_SCANS) {
+		it(`scans the ${key} store ONCE for the whole run and gives it to every repo`, async () => {
+			const second: RegisteredRepo = { ...repo, repoIdentity: "local:second", repoName: "second" };
+			const third: RegisteredRepo = { ...repo, repoIdentity: "local:third", repoName: "third" };
+
+			await dbBackfillRepos([repo, second, third], { dbPath });
+
+			expect(spy()).toHaveBeenCalledTimes(1);
+			const seen = vi.mocked(collectSessionEvents).mock.calls.map((c) => c[0].preScanned?.[key]);
+			expect(seen).toHaveLength(3);
+			expect(seen.every((d) => d !== undefined)).toBe(true);
+		});
+
+		it(`falls back to per-repo ${key} scans when its scan fails`, async () => {
+			// Same rule as Codex: absence, never `[]`. Per source, so one broken store
+			// costs that source its run-wide scan and nothing else.
+			vi.mocked(spy()).mockRejectedValue(new Error(`${key} store unreadable`));
+
+			const results = await dbBackfillRepos([repo], { dbPath });
+
+			expect(results[0].mode).toBe("bootstrapped");
+			expect(vi.mocked(collectSessionEvents).mock.calls[0][0].preScanned?.[key]).toBeUndefined();
+		});
+	}
+
+	it("treats a scan that reported failure on its ERROR CHANNEL as absence too", async () => {
+		// Most of these discoverers never throw — they answer `{ sessions, error }` and let
+		// the caller decide. Reading `.sessions` alone spelled a failed scan as `[]`, which
+		// is the positive claim "the store was read and holds nothing": the per-repo
+		// fallback was skipped for the whole run, and the pass reported that nothing as a
+		// fact about the agent.
+		vi.mocked(scanOpenCodeSessionsOnDisk).mockResolvedValue({
+			sessions: [],
+			error: { kind: "locked", message: "database is locked" },
+		});
+
+		const results = await dbBackfillRepos([repo], { dbPath });
+
+		expect(results[0].mode).toBe("bootstrapped");
+		expect(vi.mocked(collectSessionEvents).mock.calls[0][0].preScanned?.opencode).toBeUndefined();
+	});
+
+	it("keeps a PARTIAL scan's sessions instead of discarding them", async () => {
+		// Cline scans each editor flavour independently and Copilot Chat each workspace, so
+		// an error beside sessions means "some of it was unreadable", not "this failed".
+		// Only empty-AND-errored is a total failure.
+		vi.mocked(scanOpenCodeSessionsOnDisk).mockResolvedValue({
+			sessions: [
+				{
+					session: {
+						sessionId: "oc1",
+						transcriptPath: "/tmp/oc.db#oc1",
+						updatedAt: "2026-08-01T00:00:00.000Z",
+						source: "opencode",
+					},
+					dirs: [repo.worktreeRoot],
+				},
+			],
+			error: { kind: "permission", message: "one store unreadable" },
+		});
+
+		await dbBackfillRepos([repo], { dbPath });
+
+		expect(vi.mocked(collectSessionEvents).mock.calls[0][0].preScanned?.opencode).toHaveLength(1);
+	});
+
+	it("gives every source the back-fill's wider window, not each source's 48 h default", async () => {
+		// The reason the back-fill has its own scan path at all. A source left on the
+		// default silently contributes only two days of history to a seven-day import.
+		await dbBackfillRepos([repo], { dbPath });
+
+		expect(scanCodexSessionsOnDisk).toHaveBeenCalledWith(BACKFILL_SESSION_WINDOW_MS);
+		expect(scanKimiSessionsOnDisk).toHaveBeenCalledWith(BACKFILL_SESSION_WINDOW_MS);
+		expect(scanOpenCodeSessionsOnDisk).toHaveBeenCalledWith(BACKFILL_SESSION_WINDOW_MS);
+		expect(scanCopilotSessionsOnDisk).toHaveBeenCalledWith(BACKFILL_SESSION_WINDOW_MS);
+		expect(scanCopilotChatSessionsOnDisk).toHaveBeenCalledWith(BACKFILL_SESSION_WINDOW_MS);
+		expect(scanDevinSessionsOnDisk).toHaveBeenCalledWith(BACKFILL_SESSION_WINDOW_MS);
+		// These three take the window behind their own directory-override seams.
+		expect(scanClineSessionsOnDisk).toHaveBeenCalledWith(undefined, BACKFILL_SESSION_WINDOW_MS);
+		expect(scanClineCliSessionsOnDisk).toHaveBeenCalledWith(undefined, BACKFILL_SESSION_WINDOW_MS);
+		expect(scanCursorCliSessionsOnDisk).toHaveBeenCalledWith(undefined, undefined, BACKFILL_SESSION_WINDOW_MS);
+		expect(scanAntigravitySessionsOnDisk).toHaveBeenCalledWith(undefined, BACKFILL_SESSION_WINDOW_MS);
+		// Cursor Composer is the exception and must NOT take one: its anchors bypass the
+		// window, so filtering at scan time would drop anchored composers. The window is
+		// applied per repo instead, in `cursorSessionsForRepo`.
+		expect(scanCursorComposersOnDisk).toHaveBeenCalledWith();
+	});
+});
+
+describe("dbBackfillRepo — per-session skip", () => {
+	/** Runs one sweep and returns the predicate the collector was handed. */
+	async function capturePredicate(): Promise<
+		(source: "claude" | "codex" | "cursor", sessionId: string, updatedAtMs: number) => boolean
+	> {
+		await dbBackfillRepo({ repo, dbPath });
+		const opts = vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0];
+		const predicate = opts?.isAlreadyCurrent;
+		if (!predicate) throw new Error("collector received no isAlreadyCurrent predicate");
+		return predicate;
+	}
+
+	it("skips a session the database already holds at its instant", async () => {
+		// First sweep stores `sessionEvent` (source claude, id s1, at 1_700_000_050_000).
+		await dbBackfillRepo({ repo, dbPath });
+		const predicate = await capturePredicate();
+
+		expect(predicate("claude", "s1", 1_700_000_050_000)).toBe(true);
+	});
+
+	it("skips a session the database holds at a LATER instant", async () => {
+		await dbBackfillRepo({ repo, dbPath });
+		const predicate = await capturePredicate();
+
+		expect(predicate("claude", "s1", 1_700_000_040_000)).toBe(true);
+	});
+
+	it("does NOT skip a session that has moved on since it was stored", async () => {
+		// The case a repo-wide high-water mark gets wrong: resuming an old conversation.
+		await dbBackfillRepo({ repo, dbPath });
+		const predicate = await capturePredicate();
+
+		expect(predicate("claude", "s1", 1_700_000_060_000)).toBe(false);
+	});
+
+	it("does NOT skip a session the database has never seen", async () => {
+		await dbBackfillRepo({ repo, dbPath });
+		const predicate = await capturePredicate();
+
+		expect(predicate("claude", "never-stored", 1)).toBe(false);
+	});
+
+	it("keys the skip on source as well as id", async () => {
+		await dbBackfillRepo({ repo, dbPath });
+		const predicate = await capturePredicate();
+
+		// Same session id, different agent — a different conversation entirely.
+		expect(predicate("codex", "s1", 1_700_000_050_000)).toBe(false);
+	});
+
+	it("does NOT skip a session whose only row was seeded by a commit summary", async () => {
+		// The permanent-skip trap. A summary's session links seed a row stamped with the
+		// COMMIT's time, which is necessarily later than the conversation's last turn — so
+		// taken as a receipt it skips that transcript on every pass forever, and the seed's
+		// ON CONFLICT never rewrites the instant that would walk it back. A seed can arrive
+		// at any moment (the QueueWorker writes one from post-commit), which is why the
+		// generation gate cannot cover it and the row itself has to be disqualified.
+		await dbBackfillRepo({ repo, dbPath });
+		await withDashboardDb(
+			(db) => {
+				db.prepare(
+					`INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms, message_count)
+					 VALUES ('session:seeded', (SELECT id FROM repos WHERE repo_identity = ?), 'codex', 'seeded-1', ?, 4)`,
+				).run(repo.repoIdentity, 1_700_000_900_000);
+			},
+			{ dbPath },
+		);
+
+		const predicate = await capturePredicate();
+
+		expect(predicate("codex", "seeded-1", 1_700_000_050_000)).toBe(false);
+	});
+
+	it("does NOT skip a session whose row carries only a title", async () => {
+		// The other way a row looks like a receipt without being one. `sessionEventFromInfo`
+		// resolves the title BEFORE it opens the transcript and keeps it when that read
+		// throws, and every source with a native title column (opencode, cursor, devin,
+		// cline, copilot, antigravity) answers from the discoverer without reading anything.
+		// So a store that was momentarily locked writes a title and nothing else — and
+		// counting that as a receipt strands the session there: no message count, no
+		// duration, no tokens, no tools, no skills, never re-read until it gains a turn.
+		await dbBackfillRepo({ repo, dbPath });
+		await withDashboardDb(
+			(db) => {
+				db.prepare(
+					`INSERT INTO sessions (event_id, repo_id, source, session_id, title, updated_at_ms)
+					 VALUES ('session:titled', (SELECT id FROM repos WHERE repo_identity = ?), 'cursor', 'locked-1', 'Fix the parser', ?)`,
+				).run(repo.repoIdentity, 1_700_000_050_000);
+			},
+			{ dbPath },
+		);
+
+		const predicate = await capturePredicate();
+
+		expect(predicate("cursor", "locked-1", 1_700_000_050_000)).toBe(false);
+	});
+
+	it("hands the collector NO predicate on the first sweep of a repo", async () => {
+		// The receipt gate. A `sessions` row proves when a session last spoke, never that
+		// this build read its transcript — and the summaries tier, which runs first, seeds
+		// rows stamped with the COMMIT's time, necessarily later than the last turn. So a
+		// repo with no recorded read-generation gets one pass with no skipping at all,
+		// which is what stops a first back-fill from skipping the very sessions it exists
+		// to read.
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0].isAlreadyCurrent).toBeUndefined();
+	});
+
+	it("records the read generation, so the next sweep may skip", async () => {
+		await dbBackfillRepo({ repo, dbPath });
+
+		const cursors = await query<{ source: string; cursor: string }>(
+			"SELECT source, cursor FROM ingest_cursors WHERE source = 'sessions-read-generation'",
+		);
+		expect(cursors).toEqual([{ source: "sessions-read-generation", cursor: "3" }]);
+		// And the second sweep is the one that gets a predicate.
+		await dbBackfillRepo({ repo, dbPath });
+		expect(vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0].isAlreadyCurrent).toBeDefined();
+	});
+
+	it("re-opens every transcript when the recorded generation is stale", async () => {
+		// What a parser improvement relies on: a session that has not spoken since keeps
+		// whatever the old read stored, because its instant has not moved. Bumping the
+		// generation is the only thing that reaches it.
+		await dbBackfillRepo({ repo, dbPath });
+		await withDashboardDb(
+			(db) => {
+				db.prepare(
+					"UPDATE ingest_cursors SET cursor = 'stale' WHERE source = 'sessions-read-generation'",
+				).run();
+			},
+			{ dbPath },
+		);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0].isAlreadyCurrent).toBeUndefined();
+	});
+
+	it("records the generation even after a sweep that discovered nothing", async () => {
+		// A partial pass cannot mislead the next one: a session that was never discovered
+		// has no row, so the skip has nothing to match it against.
+		vi.mocked(collectSessionEvents).mockResolvedValue([]);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		const cursors = await query<{ cursor: string }>(
+			"SELECT cursor FROM ingest_cursors WHERE source = 'sessions-read-generation'",
+		);
+		expect(cursors).toEqual([{ cursor: "3" }]);
 	});
 });
 

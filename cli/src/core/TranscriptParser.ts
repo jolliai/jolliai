@@ -45,6 +45,21 @@ function latestOf(...times: ReadonlyArray<number | undefined>): { lastCallAtMs?:
 	return known.length > 0 ? { lastCallAtMs: Math.max(...known) } : {};
 }
 
+/**
+ * How many `tool_result` blocks one record's content carries.
+ *
+ * Only the count matters, and only to decide whether the record's single
+ * `toolUseResult.commandName` can be attributed to a specific block — see
+ * `ClaudeTranscriptParser.parseToolUse`.
+ */
+function countToolResults(content: ReadonlyArray<unknown>): number {
+	let n = 0;
+	// Plain member access, matching how the tally loop reads the same blocks: a `?.`
+	// here would add a null branch no transcript can produce and no test can reach.
+	for (const block of content) if ((block as { type?: unknown }).type === "tool_result") n++;
+	return n;
+}
+
 // Re-exported for the callers that already imported it from here; the shared
 // classifiers now live in ToolNameClassify.ts alongside the other dialects.
 export { classifyToolName } from "./ToolNameClassify.js";
@@ -167,12 +182,34 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 	 * would otherwise count each call several times. The block id is unique per
 	 * call and stable across those repeats — exactly the identity needed.
 	 *
-	 * A `Skill` call is re-attributed to the skill it ran (`input.skill`), since
-	 * "which skills does this person use" is the question being asked; counting
-	 * every skill invocation as one builtin named `Skill` would answer nothing.
+	 * A `Skill` call is re-attributed to the skill it ran, since "which skills does
+	 * this person use" is the question being asked; counting every skill invocation
+	 * as one builtin named `Skill` would answer nothing.
+	 *
+	 * ## The skill's name comes from the RESULT record, not from the request
+	 *
+	 * `input.skill` is what the model asked for; `toolUseResult.commandName`, on the
+	 * following `tool_result` record, is what the host actually launched — and for a
+	 * plugin-provided skill the two differ by the plugin prefix (`brainstorming`
+	 * against `superpowers:brainstorming`). `ClaudeSkillScanner` has always preferred
+	 * the resolved name, so reporting the requested one here made the two halves of
+	 * one skill's usage disagree: `mergeToolCalls` folds on `(kind, name)`, so a
+	 * single invocation surfaced as TWO `session_tool_use` rows — one of them under a
+	 * name the user never typed, with the call count split between them.
+	 *
+	 * That is why skill blocks are held back rather than tallied where they are seen:
+	 * the result record arrives after the request, so the resolved name is not known
+	 * yet. Everything else is tallied inline, and the held-back skills are folded in
+	 * at the end (which is why they sort last). A call whose result never arrived —
+	 * an incremental slice that split the pair, a session still mid-turn — falls back
+	 * to the requested name, exactly as before.
 	 */
 	parseToolUse(lines: ReadonlyArray<string>): ToolCallCount[] {
 		const tally = new ToolUseTally();
+		/** Skill requests, awaiting whatever name their result record resolves to. */
+		const pendingSkills: Array<{ readonly id?: string; readonly requested: string; readonly atMs?: number }> = [];
+		/** `tool_use_id` → the skill id the host reported launching for it. */
+		const resolved = new Map<string, string>();
 		for (const line of lines) {
 			let parsed: unknown;
 			try {
@@ -180,22 +217,73 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 			} catch {
 				continue;
 			}
-			const content = (parsed as { message?: { content?: unknown } })?.message?.content;
+			const record = parsed as { message?: { content?: unknown }; toolUseResult?: { commandName?: unknown } };
+			const content = record?.message?.content;
 			if (!Array.isArray(content)) continue;
+			// Read once per line: the resolved name lives on the RECORD, beside the
+			// content, while the id it belongs to lives in the `tool_result` block below.
+			//
+			// An EMPTY string is treated as no answer rather than as the name. It would
+			// otherwise win the `??` fallback below and file the invocation under a
+			// nameless skill — a row the user cannot recognise and cannot merge with the
+			// scanner's own, since `mergeToolCalls` folds on the name.
+			//
+			const rawCommandName = record.toolUseResult?.commandName;
+			const commandName =
+				typeof rawCommandName === "string" && rawCommandName.length > 0 ? rawCommandName : undefined;
+			// `toolUseResult` is ONE object, so it can only describe one result — and
+			// Claude Code writes each tool result as its own record, which is why every
+			// real record here carries exactly one `tool_result` block. A record with
+			// several would leave no way to tell which one the name belongs to, and
+			// handing it to all of them would rename an unrelated skill: two parallel
+			// skill calls answered in one record would both take the first one's name.
+			//
+			// So a multi-result record resolves NOTHING and every skill in it falls back
+			// to what the model requested. That is the same outcome as a result record
+			// that never arrived, which the fold below already handles. Defensive rather
+			// than observed: no capture shows this shape, and the check costs one pass
+			// over a handful of blocks.
+			const namesOneResult = countToolResults(content) === 1;
 			// The line's own instant, so the bucket can be windowed by when the call
 			// happened rather than by when its session was last touched. Read per
 			// line and not per file: one session's calls span hours.
 			const atMs = parseIsoMs(this.parseTimestamp(line));
 			for (const block of content) {
-				const b = block as { type?: unknown; id?: unknown; name?: unknown; input?: { skill?: unknown } };
+				const b = block as {
+					type?: unknown;
+					id?: unknown;
+					tool_use_id?: unknown;
+					name?: unknown;
+					input?: { skill?: unknown };
+				};
+				if (b.type === "tool_result") {
+					if (commandName !== undefined && namesOneResult && typeof b.tool_use_id === "string")
+						resolved.set(b.tool_use_id, commandName);
+					continue;
+				}
 				if (b.type !== "tool_use" || typeof b.name !== "string") continue;
-				tally.addOnce(typeof b.id === "string" ? b.id : undefined, {
-					...(b.name === "Skill" && typeof b.input?.skill === "string"
-						? skillTool(b.input.skill)
-						: classifyToolName(b.name)),
+				const id = typeof b.id === "string" ? b.id : undefined;
+				if (b.name === "Skill" && typeof b.input?.skill === "string") {
+					pendingSkills.push({
+						...(id !== undefined ? { id } : {}),
+						requested: b.input.skill,
+						...(atMs !== undefined ? { atMs } : {}),
+					});
+					continue;
+				}
+				tally.addOnce(id, {
+					...classifyToolName(b.name),
 					...(atMs !== undefined && { lastCallAtMs: atMs }),
 				});
 			}
+		}
+		for (const pending of pendingSkills) {
+			// De-duplication still rides on the block id, so a response repeated across
+			// lines contributes one call however many times it was held back.
+			tally.addOnce(pending.id, {
+				...skillTool((pending.id !== undefined ? resolved.get(pending.id) : undefined) ?? pending.requested),
+				...(pending.atMs !== undefined && { lastCallAtMs: pending.atMs }),
+			});
 		}
 		return tally.values();
 	}

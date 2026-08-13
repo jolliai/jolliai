@@ -30,20 +30,28 @@
  */
 
 import { createHash } from "node:crypto";
+import type { AlreadyCurrent } from "../core/DiskSessionScan.js";
 import { execGit, getHeadHash } from "../core/GitOps.js";
 import { GitRefStorage, resolveCommittish } from "../core/GitRefStorage.js";
 import { isJolliInternalRef } from "../core/JolliRefs.js";
+import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
+import { SESSION_SOURCES } from "../core/sessions/SessionSources.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
-import type { ToolCallCount } from "../Types.js";
+import type { ToolCallCount, TranscriptSource } from "../Types.js";
 import {
 	collectCommitEvents,
 	// collectRepoGraph,  // parked with `repo_graphs` — see SotSchema
 	collectSessionEvents,
 	collectSummaryEvents,
 	collectWorktreeEvent,
+	type PreScannedSessions,
 	type SessionLoader,
+	type SessionPassCounts,
+	type SessionPassKey,
+	type SessionSourceCounts,
+	sessionPassKey,
 } from "./DashboardCollector.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import { inTransaction, withDashboardDb } from "./DashboardDb.js";
@@ -79,8 +87,57 @@ const BATCH_SIZE = 200;
 /** `ingest_cursors.source` keys. */
 const CURSOR_GIT = "git-commits";
 const CURSOR_SESSIONS = "sessions";
+const CURSOR_SESSIONS_GENERATION = "sessions-read-generation";
 const CURSOR_SUMMARIES = "summaries";
 const CURSOR_SOT = "sot-import";
+
+/**
+ * What a full transcript read currently produces, as an opaque generation tag.
+ *
+ * This is HALF the receipt the per-session skip needs, and it is the half about builds:
+ * a row's instant proves when a session last spoke, never that THIS build's reader
+ * produced what the row holds. When transcript parsing learns something new — a tool
+ * shape, a skill call, a token field — every session that has not spoken since keeps
+ * whatever the old parser stored, forever, because its instant has not moved.
+ *
+ * So the skip is gated on this tag: a repo whose recorded tag differs from this value
+ * gets ONE pass with no skipping at all, which re-reads every in-window transcript and
+ * overwrites what the older reader stored (`projectSessionUpserted` assigns
+ * `updated_at_ms` unconditionally, while the summary seed never updates it — so once a
+ * real read lands it cannot be walked back). From the next pass on, the skip is
+ * comparing values a full read produced, which is the only thing it was ever safe to
+ * compare.
+ *
+ * The OTHER half is per row and is not this tag's job, because a per-repo tag cannot
+ * express it: a commit summary seeds a session row stamped with the COMMIT's time,
+ * which is necessarily later than the conversation's last turn, and a seed can land at
+ * any moment — the summaries tier runs before the sessions tier in the same pass, and
+ * the QueueWorker seeds straight from post-commit, long before any back-fill sees the
+ * session. Such a row would read as "already current" forever. That case is answered
+ * where it belongs, by {@link readKnownSessions} refusing to treat a commit-seeded row
+ * as a receipt at all.
+ *
+ * BUMP THIS whenever a change alters what a full read yields. It costs one un-skipped
+ * pass per repo and is the only way an existing database picks the improvement up.
+ * Kept in `ingest_cursors`, which takes a free-form `source` key, precisely so this
+ * needs no column and therefore no schema version bump — see DashboardDb's header for
+ * why that matters across the three surfaces sharing this file.
+ *
+ * `2` — a full read now runs every registered extractor rather than only Claude's
+ * tool tally (see `SessionSignals`). Two things it yields that `1` did not: skill
+ * invocations entered by slash command, which no tool-call reader can see at any
+ * source, and tool/MCP calls from the eight non-Claude sources that were returning
+ * before their transcript was ever opened. Every session already in a database was
+ * stored by the narrower read, and none of their instants will move on their own.
+ *
+ * `3` — Claude's tool reader now names a skill the way the skill scanner already did
+ * (`toolUseResult.commandName`, the id the host launched) instead of the model's
+ * requested `input.skill`. Under `2` a plugin-provided skill therefore landed as TWO
+ * `session_tool_use` rows with the calls split between them, one of them named
+ * something the user never typed. Re-reading is what removes the stale row: the
+ * upsert deletes a session's tool rows before rewriting them, so nothing else can.
+ */
+const SESSION_READ_GENERATION = "3";
 
 /**
  * Content fingerprint of the summary index — the summaries cursor value.
@@ -156,6 +213,16 @@ export interface DbBackfillOptions {
 	readonly now?: () => number;
 	/** Test seams, forwarded to the collector. */
 	readonly loadSessions?: SessionLoader;
+	/**
+	 * The RUN-wide machine-global scans, forwarded to the collector.
+	 *
+	 * Threaded down rather than scanned here because every one of these stores is
+	 * machine-global: scanning them per repo re-reads the same records once per
+	 * registered repo, which is the shape {@link dbBackfillRepos} exists to collapse.
+	 * A source being absent here is a valid state — the collector then falls back to
+	 * scanning that one per repo, exactly as before.
+	 */
+	readonly preScanned?: PreScannedSessions;
 	/** Test seam: read source for the SOT import; defaults to the orphan branch. */
 	readonly storage?: StorageProvider;
 	/**
@@ -189,6 +256,16 @@ export interface RepoProgress {
 	 */
 	readonly detail?: string;
 	/**
+	 * Set on the `sessions` phase-END marker, and only there: what each agent
+	 * contributed to THIS repo.
+	 *
+	 * A phase-end marker exists for this tier alone because it is the only one whose
+	 * interesting output is a breakdown rather than a count. Consumers that only render
+	 * counts ignore the field; the one that renders it keys off its presence rather
+	 * than off `done`, since a repo can legitimately end the tier having processed 0.
+	 */
+	readonly sessionBreakdown?: Readonly<Record<string, SessionSourceTotals>>;
+	/**
 	 * Set on a `commits` phase-start marker when this repo has never completed a
 	 * bootstrap — i.e. when the sweep really will read the whole history.
 	 *
@@ -207,6 +284,64 @@ export interface DbBackfillProgress extends RepoProgress {
 	readonly repoTotal: number;
 }
 
+/**
+ * One repo's session-tier outcome.
+ *
+ * `processed` and `skipped` do not have to add up to `discovered`, and the report
+ * must not assume they do: a session with an unparseable instant is neither — it is
+ * never skipped (being undateable is a reason to look at it) but it also produces no
+ * event. So all three are carried rather than two plus arithmetic.
+ */
+export interface SessionTierSummary {
+	/** Sessions the window turned up, after dedupe and before any skipping. */
+	readonly discovered: number;
+	/** Sessions actually read and projected this pass. */
+	readonly processed: number;
+	/** Sessions the database already held at or past their instant. */
+	readonly skipped: number;
+	/**
+	 * All three totals split by agent, so the report can say which tool each number
+	 * came from rather than only naming the tools that happened to be read.
+	 *
+	 * It carries the same three fields as the totals, and for the same reason they are
+	 * carried rather than derived: an agent's `processed + skipped` need not equal its
+	 * `discovered`. The split is keyed by every source the window turned up, including
+	 * one whose sessions were all skipped — reporting "codex 51 found, 0 read" is the
+	 * point of the breakdown, and dropping the key would spell it as "codex absent".
+	 */
+	readonly bySource: Readonly<Record<string, SessionSourceTotals>>;
+	/**
+	 * The same three populations IDENTIFIED rather than tallied, so a reader merging
+	 * several repos can count conversations instead of counting claims.
+	 *
+	 * The counts above are per-repo facts and stay correct as such: this repo really
+	 * did discover, read and skip that many. They are simply NOT ADDABLE across repos.
+	 * One conversation is routinely claimed by more than one — Cursor's attribution is
+	 * coarse by construction (its global store records no workspace for a composer, so
+	 * every in-window composer belongs to every repo Cursor has a workspace for), and
+	 * two clones of one project claim an identical set — so summing N repos' counts
+	 * reports one conversation N times, and the inflation grows with how many repos are
+	 * registered. Only the machine's owner sees it, which is what kept it invisible.
+	 *
+	 * Keys are {@link SessionPassKey}s, stable across repos, so a cross-repo reader
+	 * unions them into a set first — see `printSessionSummary`.
+	 */
+	readonly keys: SessionTierKeys;
+}
+
+/** {@link SessionTierSummary}'s three populations, by {@link SessionPassKey}. */
+export interface SessionTierKeys {
+	readonly discovered: ReadonlyArray<SessionPassKey>;
+	readonly processed: ReadonlyArray<SessionPassKey>;
+	readonly skipped: ReadonlyArray<SessionPassKey>;
+}
+
+/** One agent's row in {@link SessionTierSummary.bySource}. */
+export interface SessionSourceTotals extends SessionSourceCounts {
+	/** Of this agent's discovered sessions, the ones read and projected this pass. */
+	readonly processed: number;
+}
+
 export interface DbBackfillResult {
 	/**
 	 * 'bootstrapped' = full import ran; 'recovered' = incremental pass;
@@ -220,6 +355,19 @@ export interface DbBackfillResult {
 	 */
 	readonly mode: "bootstrapped" | "recovered" | "skipped" | "unavailable";
 	readonly eventsApplied: number;
+	/**
+	 * What the session tier saw and did, for the caller's one-line report. Absent on
+	 * a repo that never reached that tier.
+	 *
+	 * It exists because this tier had no user-visible output at all: the progress
+	 * block's reveal rule deliberately excludes `sessions` (that tier used to
+	 * re-project everything on every pass, so its progress lines said nothing), which
+	 * left the whole 7-day back-fill invisible — a run that pulled in 18 previously
+	 * unreachable conversations printed exactly what a run that did nothing printed.
+	 * Reported here rather than through `onProgress` because it is a summary, known
+	 * only once the tier is done.
+	 */
+	readonly sessions?: SessionTierSummary;
 	/** Row counts from the v7 SOT import; absent when the repo was skipped. */
 	readonly sotImport?: SotImportResult;
 	/** Present on every result, so a caller can name the repo in its output. */
@@ -256,6 +404,77 @@ function writeCursor(db: DashboardDbHandle, repoIdentity: string, source: string
 		 VALUES ((SELECT id FROM repos WHERE repo_identity = ?), ?, ?, ?)
 		 ON CONFLICT(repo_id, source) DO UPDATE SET cursor = excluded.cursor, updated_at_ms = excluded.updated_at_ms`,
 	).run(repoIdentity, source, cursor, nowMs);
+}
+
+/**
+ * Every session this repo has a row for **that a transcript read produced**, keyed
+ * `<source>:<sessionId>` and valued with the stored `updated_at_ms`.
+ *
+ * This is the whole mechanism behind the collector's `isAlreadyCurrent`, and it needs
+ * no schema of its own: a `sessions` row written by a full read IS the receipt that
+ * the session was processed, and it already records how far the processing got. The
+ * three tables that look like better answers are not: `events_raw` deliberately has no
+ * unique constraint and no index on `event_id` and is pruned once projected, so an
+ * absent row does not mean "never processed"; `ingest_cursors` holds one high-water
+ * value per repo, which an out-of-order update slips past; and `token_coverage` /
+ * `message_count` are written with overlapping value ranges by both the live read and
+ * the commit-seeded path, so neither can tell them apart. A column of its own would
+ * work — appending a migration is legal and no build is refused over a version it does
+ * not know (see DashboardDb's header) — but it would be a permanent, frozen schema
+ * entry restating something the existing columns already answer exactly.
+ *
+ * ## The seeded-row exclusion, which is load-bearing rather than defensive
+ *
+ * Not every `sessions` row came from reading a transcript. `projectSummary` SEEDS one
+ * from a commit summary's session links (the retention case: the agent's own store has
+ * aged the conversation out and the memory pipeline is the only record left), stamped
+ * with the COMMIT's time — necessarily later than the conversation's last turn. Taken
+ * as a receipt, such a row skips the session's transcript on every pass from then on,
+ * and PERMANENTLY: the seed's `ON CONFLICT` never rewrites `updated_at_ms`, so nothing
+ * walks the claim back and the session keeps a row with no title, no start, no
+ * duration, no tools and no skills while the sweep reports it as up to date.
+ * {@link SESSION_READ_GENERATION} cannot cover this — a seed lands at any moment (the
+ * QueueWorker writes one straight from post-commit, and the summaries tier writes one
+ * earlier in this very pass), so there is no point at which one un-skipped pass makes
+ * the remaining rows trustworthy.
+ *
+ * What separates the two writers is which COLUMNS they can fill. A commit summary
+ * knows a session's identity, an instant and its token totals; `started_at_ms` and
+ * `duration_ms` are derived from the transcript's own first and last entry, and the
+ * seed writes neither on insert or on conflict. So either of them being present is
+ * proof a read happened — which is why {@link projectSummary}'s seed must never start
+ * writing one. The converse is a deliberate false negative: a read that yielded
+ * neither (an empty or unreadable transcript) is re-read every pass, which costs one
+ * open of a file with nothing in it and keeps the safe answer safe.
+ *
+ * ## `title` is NOT on that list, and must not be added to it
+ *
+ * It looks like a third receipt — the seed never writes one either — but it is the one
+ * transcript-shaped column that survives a FAILED read.
+ * `sessionEventFromInfo` resolves the title BEFORE it opens the transcript and, when
+ * the read then throws, still returns that base event; `resolveSessionTitle` answers
+ * from `SessionInfo.title` alone for every source whose discoverer carries a native
+ * one (opencode, cursor, devin, cline, copilot, antigravity). So a store that was
+ * momentarily locked (`SQLITE_BUSY` while the user's agent is running) writes a row
+ * with a title and nothing else — and counting that as a receipt would strand the
+ * session at exactly that half-built state: no message count, no duration, no tokens,
+ * no tools, no skills, never re-read until the conversation gains a new turn.
+ *
+ * One indexed read: `repos.repo_identity` is UNIQUE and `ix_sessions_repo_time` leads
+ * with `repo_id`.
+ */
+function readKnownSessions(db: DashboardDbHandle, repoIdentity: string): Map<string, number> {
+	const rows = db
+		.prepare(
+			`SELECT s.source, s.session_id, s.updated_at_ms FROM sessions s
+			   JOIN repos r ON r.id = s.repo_id
+			  WHERE r.repo_identity = ?
+			    AND (s.started_at_ms IS NOT NULL OR s.duration_ms IS NOT NULL)`,
+		)
+		.all(repoIdentity) as ReadonlyArray<{ source: string; session_id: string; updated_at_ms: number }>;
+	const known = new Map<string, number>();
+	for (const row of rows) known.set(`${row.source}:${row.session_id}`, row.updated_at_ms);
+	return known;
 }
 
 /**
@@ -896,6 +1115,12 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 	// graph.
 	const cwd = worktrees[0];
 
+	// Filled by the session tier inside the callback below and read by the same
+	// callback's `return`. It sits out here so the tier that PRODUCES it and the result
+	// assembly that consumes it do not have to be adjacent — the callback runs a tier
+	// per phase between them, and several of those can return early.
+	let sessionSummary: SessionTierSummary | undefined;
+
 	// Read before opening the DB: `withDashboardDb` closes its handle in a
 	// `finally`, which for an async callback runs before the awaits inside it
 	// resolve — so an async read placed inside the callback would come back to an
@@ -1183,14 +1408,54 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 			}
 
 			// Sessions: always re-COLLECT the currently discoverable set. A global
-			// max-updatedAt cursor would miss an old session updated out of order,
-			// so the cursor only records progress for observability — it is never
-			// used to skip. The projection is narrowed per event instead, exactly as
-			// in the two tiers above; see `unchangedSessionEvent`.
+			// max-updatedAt cursor would miss an old session updated out of order, so
+			// `CURSOR_SESSIONS` below only records progress for observability — it is
+			// never used to skip.
+			//
+			// Skipping happens at two narrower layers instead, neither of them repo-wide.
+			// On the READ side it is per-session and exact: `readKnownSessions` answers
+			// "how far did I get with THIS session", so resuming a three-day-old
+			// conversation still re-reads it (its stored instant is older than the turn
+			// just added) — the failure mode a repo-wide high-water mark has and this
+			// does not. On the PROJECTION side it is per event, exactly as in the two
+			// tiers above; see `unchangedSessionEvent`.
 			opts.onProgress?.({ repoName: repo.repoName, kind: "sessions", done: 0 });
+			// The receipt check, and it has two halves. Only a repo whose recorded
+			// generation matches what a full read produces TODAY may have transcripts
+			// skipped — anything else, including a database predating this gate, gets one
+			// un-skipped pass ({@link SESSION_READ_GENERATION}) — and only rows a real read
+			// wrote count as evidence, which is what stops the summaries tier just above
+			// from seeding a commit-time instant this comparison would trust
+			// ({@link readKnownSessions}).
+			const readGeneration = readCursor(db, repo.repoIdentity, CURSOR_SESSIONS_GENERATION);
+			const maySkip = readGeneration === SESSION_READ_GENERATION;
+			const known = maySkip ? readKnownSessions(db, repo.repoIdentity) : new Map<string, number>();
+			let counts: SessionPassCounts = {
+				discovered: 0,
+				skipped: 0,
+				bySource: {},
+				discoveredKeys: [],
+				skippedKeys: [],
+			};
 			const sessionEvents = await collectSessionEvents({
+				onCounts: (seen) => {
+					counts = seen;
+				},
 				repoIdentity: repo.repoIdentity,
 				cwd,
+				// The one caller that widens the horizon past every source's 48 h default.
+				windowMs: BACKFILL_SESSION_WINDOW_MS,
+				...(opts.preScanned ? { preScanned: opts.preScanned } : {}),
+				...(maySkip
+					? {
+							isAlreadyCurrent: (source: TranscriptSource, sessionId: string, updatedAtMs: number) => {
+								const stored = known.get(`${source}:${sessionId}`);
+								// `>=`, not `>`: an equal instant means a re-read would write back
+								// the row already there, which is not worth the transcript parse.
+								return stored !== undefined && stored >= updatedAtMs;
+							},
+						}
+					: {}),
 				...(opts.loadSessions ? { loadSessions: opts.loadSessions } : {}),
 			});
 			const storedSessions = storedSessionRows(db, repo.repoIdentity);
@@ -1210,6 +1475,53 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 			).applied;
 			const maxUpdated = sessionEvents.reduce((max, e) => Math.max(max, e.updatedAtMs), 0);
 			if (maxUpdated > 0) writeCursor(db, repo.repoIdentity, CURSOR_SESSIONS, String(maxUpdated), now());
+			// Recorded unconditionally, including after a pass where a discoverer failed.
+			// A partial pass cannot mislead the next one: a session that was never
+			// discovered has no row a read wrote, so the skip has nothing to match it
+			// against and it is read in full whenever it does turn up. A commit summary may
+			// have seeded a row for it in the meantime, which is exactly why
+			// `readKnownSessions` does not count one.
+			writeCursor(db, repo.repoIdentity, CURSOR_SESSIONS_GENERATION, SESSION_READ_GENERATION, now());
+			// Merged from two sides, and it has to be: the collector knows what it SAW
+			// (discovered / skipped, including for a source it read nothing from), the
+			// event list knows what SURVIVED. Seeding from the collector's keys rather
+			// than from the events is what keeps a fully-skipped agent in the report.
+			const processedBySource: Record<string, number> = {};
+			for (const event of sessionEvents)
+				processedBySource[event.source] = (processedBySource[event.source] ?? 0) + 1;
+			const bySource: Record<string, SessionSourceTotals> = {};
+			for (const [source, seen] of Object.entries(counts.bySource)) {
+				bySource[source] = { ...seen, processed: processedBySource[source] ?? 0 };
+			}
+			// The processed population is spelled from the EVENTS, matching how
+			// `processed` itself is counted — a discovered session that produced no event
+			// belongs to neither the processed nor the skipped set, and the keys have to
+			// keep that gap open the same way the three numbers do.
+			const processedKeys: SessionPassKey[] = sessionEvents.map((event) =>
+				sessionPassKey(event.source, event.sessionId),
+			);
+			sessionSummary = {
+				discovered: counts.discovered,
+				skipped: counts.skipped,
+				processed: sessionEvents.length,
+				bySource,
+				keys: {
+					discovered: counts.discoveredKeys,
+					processed: processedKeys,
+					skipped: counts.skippedKeys,
+				},
+			};
+			// The per-repo breakdown, emitted as its own phase-END marker. The tier's
+			// phase-START marker above cannot carry it — the numbers do not exist until
+			// the reads are done — and the run-wide summary at the very end cannot
+			// either, because it is merged across repos by design. `done` is the
+			// processed count purely so the event is not mistaken for a start marker.
+			opts.onProgress?.({
+				repoName: repo.repoName,
+				kind: "sessions",
+				done: sessionEvents.length,
+				sessionBreakdown: bySource,
+			});
 
 			// Worktree: transient, recomputed every pass — from the PRIMARY checkout
 			// only. `worktree_status` is keyed `(repo_id, branch_key)`, so two
@@ -1400,10 +1712,144 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 
 			const mode = isBootstrap ? "bootstrapped" : "recovered";
 			log.info("%s %s: %d events applied", mode, repo.repoName, applied);
-			return { mode, eventsApplied: applied, sotImport, repoName: repo.repoName } as DbBackfillResult;
+			return {
+				mode,
+				eventsApplied: applied,
+				sotImport,
+				repoName: repo.repoName,
+				...(sessionSummary ? { sessions: sessionSummary } : {}),
+			} as DbBackfillResult;
 		},
 		{ dbPath: opts.dbPath },
 	);
+}
+
+/**
+ * Reads every machine-global session store once, for the whole run.
+ *
+ * Dynamic imports throughout, matching `loadAllSessions`: several of these reach for
+ * `node:sqlite`, and importing them eagerly would emit the ExperimentalWarning in
+ * every process that loads this module without ever backfilling.
+ *
+ * Each scan is independent and all of them run concurrently — they touch different
+ * stores, and one source failing must not delay or fail another. Every source is
+ * given the back-fill's wider window, which is the whole reason the back-fill has its
+ * own scan path rather than reusing the 48 h defaults.
+ *
+ * A partial result is kept rather than discarded: a scan that returns sessions AND an
+ * error (Cline, whose flavours are scanned independently; Copilot Chat, whose
+ * workspaces are) has genuinely found those sessions. Dropping them because a sibling
+ * directory was unreadable would lose data the old per-repo path also kept — its
+ * callers read `.sessions` and ignored `.error` for exactly this reason.
+ */
+async function scanAllStores(alreadyRecorded?: AlreadyCurrent): Promise<PreScannedSessions> {
+	const scanned = new Map<TranscriptSource, ReadonlyArray<unknown>>();
+	// Concurrent, and the results are collected by source tag rather than positionally:
+	// a positional destructure is a second ordering to keep in step with the registry,
+	// and getting it wrong would file one agent's sessions under another's name.
+	await Promise.all(
+		SESSION_SOURCES.map(async (def) => {
+			// `alreadyRecorded` reaches only the definitions that declare they use it —
+			// the two whose per-session read is expensive enough to be worth skipping.
+			// Passing it to the rest would be harmless but misleading: it would read as a
+			// promise that every scanner honours it.
+			const opts = {
+				windowMs: BACKFILL_SESSION_WINDOW_MS,
+				...(alreadyRecorded && def.usesAlreadyRecorded ? { alreadyRecorded } : {}),
+			};
+			try {
+				const result = await def.scan(opts);
+				// A source is recorded ONLY on success. Absence is what tells the collector
+				// to fall back to that source's per-repo scan; recording `[]` for a failed
+				// scan would claim the store was read and found empty, and the fallback that
+				// exists precisely for this case would never run.
+				scanned.set(def.source, result as ReadonlyArray<unknown>);
+			} catch (err) {
+				log.warn(
+					"%s scan failed -- back-fill falls back to per-repo scans for it: %s",
+					def.source,
+					errMsg(err),
+				);
+			}
+		}),
+	);
+	return Object.fromEntries(scanned) as PreScannedSessions;
+}
+
+/**
+ * One machine-wide answer to "is this session already recorded, everywhere it
+ * matters?", for the SCANNERS to consult before they pay for an expensive read.
+ *
+ * ## Why this exists at all, given the per-repo skip already does
+ *
+ * The per-repo `isAlreadyCurrent` runs after the scan, so it saves the second read
+ * of a transcript and not the first. Claude's scan already reads and parses every
+ * in-window transcript in full (to collect the working directories a `cd` scattered
+ * through the file), and Antigravity's already opens one SQLite per conversation. On
+ * a converged re-run — nothing to update, which is the normal case — all of that was
+ * still paid, so a repeat `jolli dashboard` cost roughly half of a first one for no
+ * result. This moves the decision to where the scanner can act on it.
+ *
+ * ## The rule, and the two ways of getting it wrong
+ *
+ * A session is "already recorded" when EVERY repo holding a row for it is at or past
+ * `updatedAtMs`. Two tempting variants are both wrong:
+ *
+ *  - **"every registered repo has a current row"** — a Claude session belongs to one
+ *    repo, so on a machine with three registered repos the other two never have a
+ *    row and the condition never holds. The optimisation would silently do nothing
+ *    the moment a second repo was registered.
+ *  - **"some repo has a current row"** — right for the steady state, wrong the first
+ *    time a NEW repo is registered: that repo's rows do not exist yet, and skipping
+ *    on another repo's evidence would leave it permanently without them.
+ *
+ * The MINIMUM over the repos that do have a row answers the first, and the
+ * generation gate below answers the second: a repo that has never completed a
+ * session pass turns scan-level skipping OFF for the whole run, so it gets one full
+ * scan and every later run gets the fast path.
+ *
+ * Returns `undefined` when nothing may be skipped — no repo, a repo still on an
+ * older read generation, or a database that could not be read. Absence is the safe
+ * answer: it costs one full scan.
+ */
+async function readRecordedSessions(
+	live: ReadonlyArray<RegisteredRepo>,
+	dbPath?: string,
+): Promise<AlreadyCurrent | undefined> {
+	if (live.length === 0) return undefined;
+	try {
+		return await withDashboardDb(
+			(db) => {
+				// Every live repo must be past the gate. One that is not gets a pass with no
+				// skipping at all — see this function's header for the new-repo case.
+				for (const repo of live) {
+					if (readCursor(db, repo.repoIdentity, CURSOR_SESSIONS_GENERATION) !== SESSION_READ_GENERATION) {
+						return undefined;
+					}
+				}
+				// The minimum stored instant per session, across the repos that hold a row.
+				const floor = new Map<string, number>();
+				for (const repo of live) {
+					for (const [key, instant] of readKnownSessions(db, repo.repoIdentity)) {
+						const seen = floor.get(key);
+						if (seen === undefined || instant < seen) floor.set(key, instant);
+					}
+				}
+				if (floor.size === 0) return undefined;
+				return (source: TranscriptSource, sessionId: string, updatedAtMs: number) => {
+					const stored = floor.get(`${source}:${sessionId}`);
+					return stored !== undefined && stored >= updatedAtMs;
+				};
+			},
+			dbPath ? { dbPath } : {},
+		);
+	} catch (err) {
+		// A database that cannot be read is not a failure worth reporting here: the
+		// per-repo passes will hit the same problem and report it properly. All that is
+		// lost is the fast path.
+		log.debug("cannot pre-read recorded sessions -- scans will not skip: %s", errMsg(err));
+		return undefined;
+	}
 }
 
 /**
@@ -1451,6 +1897,68 @@ export async function dbBackfillRepos(
 		unavailable.push({ mode: "unavailable", eventsApplied: 0, repoName: repo.repoName });
 		return false;
 	});
+	// ONE read of each machine-global store for the whole run, hoisted out of the loop
+	// below. Not one of these stores is keyed by repo — Claude by a lossily encoded
+	// path, Codex by DATE, OpenCode / Copilot CLI / Devin / Cursor by nothing at all
+	// (one database for every project), Cline by editor flavour, Copilot Chat and
+	// Cursor by a VS Code workspace hash — so "which sessions are this repo's" can only
+	// be answered after opening the records. Scanning per repo therefore re-opens the
+	// same records once per registered repo. Measured on a three-repo machine: Claude
+	// 64 transcripts (36 ms of head/tail reads, 464 ms of full parse), Codex 68 ms per
+	// repo against 201 ms across three, all of it repetition.
+	//
+	// The nine below were previously left per-repo on the strength of that same
+	// profile, where they cost under a millisecond between them. That was the wrong
+	// conclusion from a correct measurement: those sources were not INSTALLED on the
+	// profiling machine, so each returned on its first `readdir`. On a machine that
+	// actually runs Cursor, Copilot and Cline, each per-repo pass is a real SQLite open
+	// plus a full-table scan, or a JSON parse of the user's entire task history.
+	//
+	// They all run concurrently because they touch different stores and no one's
+	// failure should delay another's.
+	//
+	// A caller may supply its own scans (tests, and any embedder that already has
+	// them); a supplied value wins and no scan happens here for that source.
+	//
+	// Failure is NOT fatal and must not be: every source scans its own store
+	// independently, so one failed scan costs that source its pre-48 h reach and
+	// nothing else. Claude degrades furthest but not to zero — the `sessions.json` half
+	// of the collector still carries it.
+	//
+	// Read BEFORE the scans and not inside them: the answer is one query per repo
+	// against a database the scanners know nothing about, and asking per transcript
+	// would put a database round trip inside the fan-out it is meant to shorten.
+	// There is no consumer for a run-wide scan when every registered checkout is
+	// unavailable. Apart from wasting startup time, scanning here used to open the
+	// user's real agent stores even though the loop below had no repo to attribute a
+	// single result to.
+	//
+	// A custom loader is an ownership boundary too: callers inject it specifically to
+	// define the session set (tests are one caller, embedders are another). Adding real
+	// home-directory scans on top makes that seam non-deterministic and can project
+	// sessions the injected loader never returned. An explicitly supplied `preScanned`
+	// value still wins, so callers that own both halves can opt into the combination.
+	//
+	// COST: this binding is RESIDENT for the whole multi-repo run — it cannot be freed per
+	// repo, because which repo claims a session is only known after `forRepo` runs and any
+	// of them may claim any of it. What it holds is now bounded per session: identity, an
+	// instant, and the directories the session recorded.
+	//
+	// It used to hold each Claude session's whole parse as well (the entries plus the
+	// transcript's own lines), so a 7-day window kept every transcript in memory at once —
+	// over 100 MB on this repo's own 64-file corpus, growing linearly with the window and
+	// with nothing capping the total. `withIoBudget` does not help: that budget caps bytes
+	// IN FLIGHT, released the moment a read returns, and says nothing about what a caller
+	// then keeps. So the parse is no longer carried, and the collector reads each
+	// transcript itself (see `acceptFacts` for what that costs instead).
+	//
+	// Do not reintroduce a carried parse here without a byte cap on the total.
+	const preScanned =
+		rest.preScanned ??
+		(live.length === 0 || rest.loadSessions
+			? {}
+			: await scanAllStores(await readRecordedSessions(live, rest.dbPath)));
+
 	const results: DbBackfillResult[] = [];
 	for (const [i, repo] of live.entries()) {
 		// The index is injected here rather than passed down, so `dbBackfillRepo`
@@ -1459,7 +1967,14 @@ export async function dbBackfillRepos(
 			? { onProgress: (p: RepoProgress) => forward({ ...p, repoIndex: i + 1, repoTotal: live.length }) }
 			: {};
 		try {
-			results.push(await dbBackfillRepo({ ...rest, ...perRepo, repo }));
+			results.push(
+				await dbBackfillRepo({
+					...rest,
+					...perRepo,
+					preScanned,
+					repo,
+				}),
+			);
 		} catch (err) {
 			log.error("db backfill failed for %s: %s", repo.repoName, errMsg(err));
 			// Carried on the result, not just logged: the caller is the only thing

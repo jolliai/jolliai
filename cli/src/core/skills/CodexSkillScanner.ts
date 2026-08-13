@@ -1,9 +1,28 @@
 /**
  * CodexSkillScanner — infers skill usage from Codex shell calls.
  *
- * Codex has NO skill tool. Its only signal is an `exec_command` whose shell string
+ * Codex has NO skill tool. Its only signal is a shell call whose command string
  * happens to read a `SKILL.md`, so unlike the Claude and OpenCode scanners this one
  * is heuristic and every entry it produces says so via `detection: "heuristic"`.
+ *
+ * ## Codex spells a shell call two ways, and they disagree on the field name
+ *
+ * `function_call` (`name: "exec_command"`) carries its parameters as a JSON string
+ * in `arguments`. `custom_tool_call` (`name: "exec"`) carries a JavaScript snippet
+ * in `input` instead — `const r = await tools.exec_command({ cmd: "…" })`. Both are
+ * a shell command the model ran, so both are the same signal here.
+ *
+ * The second form is now the overwhelming majority: re-measured across 41 real
+ * session files, 619 `custom_tool_call` against 110 `function_call`. Reading only
+ * `arguments` therefore dropped 85% of the shell calls this scanner exists to see —
+ * on one machine's 7-day window, 2 of 17 (session, skill) pairs survived, and one
+ * skill was never recorded at all. `TranscriptParser` had already measured the same
+ * split (804 vs 415) without that reaching this file.
+ *
+ * That gap outlived a test named for covering it, because the test built its
+ * `custom_tool_call` by string-replacing the TYPE of a `function_call` fixture and
+ * left the `arguments` field in place — a shape Codex never emits. Both forms are
+ * verbatim captures now, which is the only version of this test that can fail.
  *
  * Measured over 1,503 real session files before any of this was written: 976 calls
  * touch a `SKILL.md`, across 594 distinct (session, skill) pairs. Three properties
@@ -91,7 +110,7 @@ export function scanCodexSkillLines(lines: ReadonlyArray<string>, fromLine: numb
 		const payload = isRecord(record.payload) ? record.payload : record;
 		if (payload.type !== "function_call" && payload.type !== "custom_tool_call") continue;
 
-		const args = typeof payload.arguments === "string" ? payload.arguments : "";
+		const args = commandStringOf(payload);
 		if (!args.includes(NEEDLE)) continue;
 
 		const at = timestampOf(record, payload);
@@ -129,6 +148,25 @@ export function scanCodexSkillLines(lines: ReadonlyArray<string>, fromLine: numb
 	}
 	if (uses.length > 0) log.debug("Inferred %d Codex skill(s) from shell reads", uses.length);
 	return { uses, lastLine };
+}
+
+/**
+ * The command string a shell call carries, whichever of its two field names holds it.
+ *
+ * `arguments` is preferred only because it is the older, JSON-shaped form; the two
+ * never appear together on one record, so the order is not a precedence rule. A value
+ * that is present but not a string yields `""` — the path only counts when it is in
+ * the text the model actually ran, and a structured object still puts "SKILL.md" in
+ * the raw line, so the needle pre-filter lets it through and this is what rejects it.
+ *
+ * Nothing here parses the JavaScript wrapper `custom_tool_call` uses. The path regex
+ * runs over the whole string either way, and a real parse would buy nothing: the
+ * signal is a substring, and a snippet this scanner cannot parse is a snippet whose
+ * skill read it would rather still find.
+ */
+function commandStringOf(payload: Record<string, unknown>): string {
+	if (typeof payload.arguments === "string") return payload.arguments;
+	return typeof payload.input === "string" ? payload.input : "";
 }
 
 /** Codex timestamps live on the envelope, not the payload. */

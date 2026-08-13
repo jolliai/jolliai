@@ -9,8 +9,14 @@
  * Public symbols:
  *   - getVscodeUserDataDir(flavor, home?)
  *   - getVscodeWorkspaceStorageDir(flavor, home?)
- *   - findVscodeWorkspaceHash(flavor, projectDir)
+ *   - findVscodeWorkspaceHash(flavor, projectDir)   — one repo → its workspace hash
+ *   - listVscodeWorkspaceFolders(flavor)            — every workspace → its folder
  *   - normalizePathForMatch(p)
+ *
+ * The last two are the two directions of the same lookup, and which one a caller
+ * wants follows from how many repos it serves: a per-repo question takes the find,
+ * a machine-wide scan serving every registered repo takes the list. Calling the
+ * find in a loop re-reads every `workspace.json` on the machine once per repo.
  */
 
 import { readdir, readFile } from "node:fs/promises";
@@ -76,12 +82,92 @@ export function normalizePathForMatch(p: string): string {
 }
 
 /**
+ * Reads one `workspaceStorage/<entry>/workspace.json` and returns the local path its
+ * `folder` URI points at, or undefined when there is none to read.
+ *
+ * Single-folder workspaces only — an entry with a `workspace` field instead of
+ * `folder` (a multi-root `.code-workspace` file) yields undefined and is skipped by
+ * every caller.
+ */
+async function readWorkspaceFolderPath(
+	flavor: VscodeFlavor,
+	wsStorageDir: string,
+	entry: string,
+): Promise<string | undefined> {
+	const wsJsonPath = join(wsStorageDir, entry, "workspace.json");
+	let folderUri: string | undefined;
+	try {
+		const raw = await readFile(wsJsonPath, "utf8");
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		folderUri = typeof parsed.folder === "string" ? parsed.folder : undefined;
+	} catch {
+		return undefined;
+	}
+
+	if (!folderUri || !folderUri.startsWith("file://")) {
+		return undefined;
+	}
+
+	try {
+		return fileURLToPath(folderUri);
+	} catch {
+		log.warn("%s workspace %s has unparseable folder URI: %s", flavor, entry, folderUri);
+		return undefined;
+	}
+}
+
+/** One VS Code-family workspace: its storage directory name and the folder it opens. */
+export interface VscodeWorkspaceFolder {
+	/** The `workspaceStorage/<hash>` entry name. */
+	readonly hash: string;
+	/** The local path its `folder` URI resolves to. Raw — not normalised for matching. */
+	readonly folderPath: string;
+}
+
+/**
+ * Every single-folder workspace this flavour has storage for.
+ *
+ * The forward direction of {@link findVscodeWorkspaceHash}, and the one a machine-wide
+ * scan needs. Resolving a hash FROM a repo path can only answer for the repo you
+ * already have, so a scan built on it re-reads every `workspace.json` on the machine
+ * once per registered repo. Listing them once gives every repo its answer from one
+ * pass.
+ *
+ * Returns an empty list when the storage directory is unreadable — the same silent
+ * degradation `findVscodeWorkspaceHash` applies, and for the same reason: a machine
+ * without this editor installed is not a failure to report.
+ */
+export async function listVscodeWorkspaceFolders(flavor: VscodeFlavor): Promise<ReadonlyArray<VscodeWorkspaceFolder>> {
+	const wsStorageDir = getVscodeWorkspaceStorageDir(flavor);
+
+	let entries: string[];
+	try {
+		entries = await readdir(wsStorageDir);
+	} catch {
+		log.debug("%s workspaceStorage not readable at %s", flavor, wsStorageDir);
+		return [];
+	}
+
+	const out: VscodeWorkspaceFolder[] = [];
+	for (const entry of entries) {
+		const folderPath = await readWorkspaceFolderPath(flavor, wsStorageDir, entry);
+		if (folderPath !== undefined) out.push({ hash: entry, folderPath });
+	}
+	return out;
+}
+
+/**
  * Scans the workspaceStorage directory for an entry whose `workspace.json` has
  * a `folder` URI that resolves to projectDir. Returns the entry name (workspace
  * hash) on match, or null when no match is found.
  *
  * Single-folder workspaces only — entries with a `workspace` field instead of
  * `folder` (multi-root .code-workspace files) are skipped silently.
+ *
+ * Deliberately NOT written as a filter over {@link listVscodeWorkspaceFolders}: this
+ * stops at the first match, and its callers ask about one repo at a time. A caller
+ * that needs every workspace should use the list directly rather than calling this in
+ * a loop.
  */
 export async function findVscodeWorkspaceHash(flavor: VscodeFlavor, projectDir: string): Promise<string | null> {
 	const wsStorageDir = getVscodeWorkspaceStorageDir(flavor);
@@ -97,29 +183,8 @@ export async function findVscodeWorkspaceHash(flavor: VscodeFlavor, projectDir: 
 	const target = normalizePathForMatch(projectDir);
 
 	for (const entry of entries) {
-		const wsJsonPath = join(wsStorageDir, entry, "workspace.json");
-		let folderUri: string | undefined;
-		try {
-			const raw = await readFile(wsJsonPath, "utf8");
-			const parsed = JSON.parse(raw) as Record<string, unknown>;
-			folderUri = typeof parsed.folder === "string" ? parsed.folder : undefined;
-		} catch {
-			continue;
-		}
-
-		if (!folderUri || !folderUri.startsWith("file://")) {
-			continue;
-		}
-
-		let folderPath: string;
-		try {
-			folderPath = fileURLToPath(folderUri);
-		} catch {
-			log.warn("%s workspace %s has unparseable folder URI: %s", flavor, entry, folderUri);
-			continue;
-		}
-
-		if (normalizePathForMatch(folderPath) === target) {
+		const folderPath = await readWorkspaceFolderPath(flavor, wsStorageDir, entry);
+		if (folderPath !== undefined && normalizePathForMatch(folderPath) === target) {
 			return entry;
 		}
 	}

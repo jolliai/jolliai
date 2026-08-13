@@ -36,7 +36,13 @@ vi.mock("node:os", async (importOriginal) => {
 });
 
 import { symlinksSupported } from "../testUtils/symlinkSupport.js";
-import { discoverCursorSessions, scanCursorSessions } from "./CursorSessionDiscoverer.js";
+import {
+	type CursorDiskComposer,
+	cursorSessionsForRepo,
+	discoverCursorSessions,
+	scanCursorComposersOnDisk,
+	scanCursorSessions,
+} from "./CursorSessionDiscoverer.js";
 
 // The non-ENOENT-stat case is driven by a self-referential symlink (ELOOP).
 // symlink() throws EPERM on a non-elevated Windows account, so skip it there.
@@ -205,6 +211,24 @@ describe("discoverCursorSessions", () => {
 
 		const sessions = await discoverCursorSessions(toNativePath("/Users/flyer/work/proj-a"));
 		expect(sessions).toEqual([]);
+	});
+
+	// The dashboard's history back-fill passes a wider window than the 48h default.
+	// `pointers: null` keeps the composer out of the anchor set, so the window is the
+	// only thing that can admit it: the default call rejects it, the explicit one keeps it.
+	it("admits a composer outside the 48h window when an explicit wider window is passed", async () => {
+		const stale = Date.now() - 72 * 60 * 60 * 1000;
+		await setupCursorHome(tmpHome, {
+			globalComposers: [{ composerId: "stale-1", createdAtMs: stale, lastUpdatedAtMs: stale }],
+			workspaces: [{ folder: toFileUri("/Users/flyer/work/proj-a"), pointers: null }],
+		});
+		const projectDir = toNativePath("/Users/flyer/work/proj-a");
+
+		const withDefaultWindow = await scanCursorSessions(projectDir);
+		expect(withDefaultWindow.sessions).toEqual([]);
+
+		const withWiderWindow = await scanCursorSessions(projectDir, 7 * 24 * 60 * 60 * 1000);
+		expect(withWiderWindow.sessions.map((s) => s.sessionId)).toEqual(["stale-1"]);
 	});
 
 	it("skips composerData rows with malformed JSON without crashing", async () => {
@@ -781,5 +805,75 @@ describe("discoverCursorSessions", () => {
 		expect(result.sessions).toEqual([]);
 		expect(result.error).toBeDefined();
 		expect(["corrupt", "permission", "unknown"]).toContain(result.error?.kind);
+	});
+});
+
+/**
+ * The scan/narrow split the multi-repo back-fill uses: one machine-wide scan, narrowed
+ * per repo. Exercised directly because that is the only caller — `scanCursorSessions`
+ * settles the workspace lookup itself, precisely so a repo Cursor has no workspace for
+ * never pays for the scan.
+ */
+describe("cursorSessionsForRepo", () => {
+	let tmpHome: string;
+
+	beforeEach(async () => {
+		tmpHome = await mkdtemp(join(tmpdir(), "cursor-narrow-"));
+		mockHomedir.mockReturnValue(tmpHome);
+		mockPlatform.mockReturnValue("darwin");
+	});
+
+	afterEach(async () => {
+		await rm(tmpHome, { recursive: true, force: true });
+	});
+
+	it("claims nothing for a repo Cursor has no workspace for", async () => {
+		// The composer is inside the window, so only the missing workspace can exclude it.
+		// This is the coarse-attribution rule's one limit: with no workspace, a repo is not
+		// a Cursor project at all and claims none of the store.
+		await setupCursorHome(tmpHome, {
+			globalComposers: [{ composerId: "fresh-1", createdAtMs: Date.now(), lastUpdatedAtMs: Date.now() }],
+			workspaces: [{ folder: toFileUri("/Users/flyer/work/proj-a"), pointers: null }],
+		});
+		const { composers } = await scanCursorComposersOnDisk();
+		expect(composers.map((c) => c.session.sessionId)).toEqual(["fresh-1"]);
+
+		const mine = await cursorSessionsForRepo(composers, toNativePath("/Users/flyer/work/proj-b"));
+		expect(mine).toEqual([]);
+	});
+
+	it("narrows one machine-wide scan to the repo whose workspace anchors it", async () => {
+		// Anchored well outside the window, so only the anchor can admit it — the property
+		// that stops the scan from pre-filtering by time.
+		const ancient = Date.now() - 365 * 24 * 60 * 60 * 1000;
+		await setupCursorHome(tmpHome, {
+			globalComposers: [{ composerId: "anchor-1", createdAtMs: ancient, lastUpdatedAtMs: ancient }],
+			workspaces: [
+				{
+					folder: toFileUri("/Users/flyer/work/proj-a"),
+					pointers: { lastFocusedComposerIds: ["anchor-1"] },
+				},
+			],
+		});
+		const { composers } = await scanCursorComposersOnDisk();
+
+		const mine = await cursorSessionsForRepo(composers, toNativePath("/Users/flyer/work/proj-a"));
+		expect(mine.map((s) => s.sessionId)).toEqual(["anchor-1"]);
+	});
+
+	it("applies the caller's window rather than the 48h default", async () => {
+		// The back-fill's 7-day window is passed per repo, at narrow time, because the scan
+		// cannot apply it without dropping anchored composers.
+		const stale = Date.now() - 72 * 60 * 60 * 1000;
+		await setupCursorHome(tmpHome, {
+			globalComposers: [{ composerId: "stale-1", createdAtMs: stale, lastUpdatedAtMs: stale }],
+			workspaces: [{ folder: toFileUri("/Users/flyer/work/proj-a"), pointers: null }],
+		});
+		const { composers }: { composers: ReadonlyArray<CursorDiskComposer> } = await scanCursorComposersOnDisk();
+		const projectDir = toNativePath("/Users/flyer/work/proj-a");
+
+		expect(await cursorSessionsForRepo(composers, projectDir)).toEqual([]);
+		const wider = await cursorSessionsForRepo(composers, projectDir, 7 * 24 * 60 * 60 * 1000);
+		expect(wider.map((s) => s.sessionId)).toEqual(["stale-1"]);
 	});
 });

@@ -430,9 +430,19 @@ async function refreshMemoryRows(cwd: string, hashes: ReadonlyArray<string>, dbP
  *
  * The caller (VS Code's 60 s sidebar tick) hands over whatever the aggregator
  * saw; this function writes only the sessions whose `updatedAt` moved since
- * the last tick write — reading a transcript for token usage is the expensive
- * part, and an idle session's row is already correct. Worktree state is
- * refreshed on every effective write (it is one cheap git call).
+ * the last tick write — reading a transcript is the expensive part, and an idle
+ * session's row is already correct. Worktree state is refreshed on every
+ * effective write (it is one cheap git call).
+ *
+ * That gate is what keeps the tick affordable now that `sessionEventFromInfo` reads a
+ * transcript for EVERY source rather than only Claude (it used to return early for the
+ * other twelve, so this loop was near-free for them). Two things follow, and both are
+ * accepted rather than pending — see that function's header for the full note:
+ * the aggregator has already parsed the same files this tick to count messages, so the
+ * read here is a second parse rather than a first; and `lastTickWrite` lives in this
+ * process, so the first tick after a window reload has a watermark of 0 and pays for
+ * every in-window session once. Do not "fix" either by reintroducing a source check —
+ * the tool and skill signals for the non-Claude agents are exactly what that check hid.
  *
  * The watermark advances only **after** `safeApply` reports the write landed.
  * Moving it while building the batch would make a swallowed failure (the DB

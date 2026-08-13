@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StartedDashboardServer } from "../dashboard/DashboardServer.js";
-import type { DbBackfillProgress } from "../dashboard/DbBackfill.js";
+import type { DbBackfillProgress, DbBackfillResult } from "../dashboard/DbBackfill.js";
 import type { RegisteredRepo } from "../dashboard/RepoRegistry.js";
 
 vi.mock("../dashboard/DbBackfill.js", () => ({
@@ -53,7 +53,7 @@ import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
 import { DASHBOARD_HEALTH_SERVICE } from "../dashboard/DashboardServer.js";
-import { dbBackfillRepos } from "../dashboard/DbBackfill.js";
+import { dbBackfillRepos, type SessionTierSummary } from "../dashboard/DbBackfill.js";
 import { listActiveRepos, registerRepo } from "../dashboard/RepoRegistry.js";
 import {
 	createDeferredWriter,
@@ -62,6 +62,7 @@ import {
 	executeDashboard,
 	identifyDashboardHealth,
 	importDashboardHistory,
+	printSessionSummary,
 	registerDashboardCommand,
 	resolveServerCwd,
 	startForegroundDashboard,
@@ -944,6 +945,204 @@ describe("createProgressPrinter", () => {
 			"  Reading AI sessions…",
 		]);
 		expect(lines.filter((l) => l.includes("can take a few minutes"))).toHaveLength(1);
+	});
+
+	it("keeps two same-named repos apart, because the name is not unique", () => {
+		// `deriveRepoName` is the last path/URL segment, so two clones of one project
+		// (or two unrelated `app` directories) collide. A name-keyed reset never fires
+		// on the collision: the second repo printed no heading, no phase labels, and
+		// its whole run appeared under the FIRST repo's heading.
+		const lines: string[] = [];
+		const printer = createProgressPrinter({ log: (line) => lines.push(line) });
+		for (const repoIndex of [1, 2] as const) {
+			printer.onProgress(event({ repoName: "app", repoIndex, repoTotal: 2, kind: "sessions", done: 0 }));
+		}
+		expect(lines).toEqual(["  app (1/2)", "  Reading AI sessions…", "  app (2/2)", "  Reading AI sessions…"]);
+	});
+
+	it("prints the per-agent breakdown when the session tier ends", () => {
+		const lines: string[] = [];
+		const printer = createProgressPrinter({ log: (line) => lines.push(line) });
+		printer.onProgress(event({ kind: "sessions", done: 0, total: undefined }));
+		printer.onProgress(
+			event({
+				kind: "sessions",
+				// Nonzero, which is exactly why the breakdown branch must run before the
+				// commit-only counter rule that would otherwise drop this event.
+				done: 18,
+				total: undefined,
+				sessionBreakdown: {
+					claude: { discovered: 18, processed: 14, skipped: 4 },
+					codex: { discovered: 6, processed: 4, skipped: 2 },
+				},
+			}),
+		);
+		expect(lines).toEqual([
+			"  Reading AI sessions…",
+			"      claude  18 found, 14 processed, 4 skipped",
+			"      codex    6 found,  4 processed, 2 skipped",
+		]);
+	});
+
+	it("adds no breakdown lines for a repo whose window turned up nothing", () => {
+		const lines: string[] = [];
+		const printer = createProgressPrinter({ log: (line) => lines.push(line) });
+		printer.onProgress(event({ kind: "sessions", done: 0, total: undefined }));
+		printer.onProgress(event({ kind: "sessions", done: 0, total: undefined, sessionBreakdown: {} }));
+		expect(lines).toEqual(["  Reading AI sessions…"]);
+	});
+});
+
+describe("printSessionSummary", () => {
+	const result = (sessions?: SessionTierSummary): DbBackfillResult => ({
+		mode: "recovered",
+		eventsApplied: 0,
+		repoName: "jolliai",
+		...(sessions ? { sessions } : {}),
+	});
+
+	/** Shorthand for one agent's row: found / processed / skipped. */
+	const agent = (discovered: number, processed: number, skipped: number) => ({ discovered, processed, skipped });
+
+	/**
+	 * Builds one repo's tier summary from per-agent counts.
+	 *
+	 * The summary carries conversation IDENTITIES alongside the counts, because the
+	 * report merges by conversation rather than by adding the repos' numbers — so a
+	 * fixture has to name its conversations. Ids are synthesised per agent as
+	 * `<source><tag>-<n>` from 1, with the processed set taken off the front and the
+	 * skipped set immediately after it; any remainder is discovered-but-neither, which
+	 * is the undateable session the totals must not derive by subtraction.
+	 *
+	 * `tag` is what decides whether two repos claim the SAME conversations (same tag —
+	 * the coarse-attribution case the merge has to collapse) or different ones.
+	 */
+	function tier(bySource: Record<string, ReturnType<typeof agent>>, tag = ""): SessionTierSummary {
+		const keys = { discovered: [] as string[], processed: [] as string[], skipped: [] as string[] };
+		let discovered = 0;
+		let processed = 0;
+		let skipped = 0;
+		for (const [source, counts] of Object.entries(bySource)) {
+			const ids = Array.from({ length: counts.discovered }, (_, i) => `${source}:${source}${tag}-${i + 1}`);
+			keys.discovered.push(...ids);
+			keys.processed.push(...ids.slice(0, counts.processed));
+			keys.skipped.push(...ids.slice(counts.processed, counts.processed + counts.skipped));
+			discovered += counts.discovered;
+			processed += counts.processed;
+			skipped += counts.skipped;
+		}
+		return { discovered, processed, skipped, bySource, keys };
+	}
+
+	/** Returns every line the summary printed. */
+	function render(results: ReadonlyArray<DbBackfillResult>): string[] {
+		const lines: string[] = [];
+		const log = vi.spyOn(console, "log").mockImplementation((line?: unknown) => {
+			lines.push(String(line ?? ""));
+		});
+		try {
+			printSessionSummary(results);
+		} finally {
+			log.mockRestore();
+		}
+		return lines;
+	}
+
+	it("states both counts outright, then all three per agent", () => {
+		const lines = render([result(tier({ claude: agent(18, 14, 4), codex: agent(6, 4, 2) }))]);
+		// Numbers right-padded into columns: the reader is comparing agents against each
+		// other, which ragged numbers turn into a per-line parse.
+		expect(lines).toEqual([
+			"  ✓ 24 AI conversations in the last 7 days: 18 processed, 6 skipped",
+			"      claude  18 found, 14 processed, 4 skipped",
+			"      codex    6 found,  4 processed, 2 skipped",
+		]);
+	});
+
+	it("uses the same sentence on a converged run, with a zero in it", () => {
+		// A silent branch makes a converged re-run look identical to a run that never
+		// happened; a DIFFERENT sentence would read as a different kind of event.
+		// The agent still appears: "24 found, 0 processed" is what says the tier looked
+		// and found nothing new, which an omitted row would spell as "codex absent".
+		const lines = render([result(tier({ codex: agent(24, 0, 24) }))]);
+		expect(lines).toEqual([
+			"  ✓ 24 AI conversations in the last 7 days: 0 processed, 24 skipped",
+			"      codex  24 found, 0 processed, 24 skipped",
+		]);
+	});
+
+	it("does not derive the skip count by subtraction", () => {
+		// A session with an unparseable instant is neither processed nor skipped, so
+		// `discovered - processed` would overstate the skips. Reporting the real count.
+		const lines = render([result(tier({ claude: agent(10, 4, 3) }))]);
+		expect(lines[0]).toContain("4 processed, 3 skipped");
+		expect(lines[1]).toContain("10 found, 4 processed, 3 skipped");
+	});
+
+	it("uses the singular for one conversation", () => {
+		const lines = render([result(tier({ claude: agent(1, 1, 0) }))]);
+		expect(lines[0]).toContain("1 AI conversation in the last 7 days");
+	});
+
+	it("adds up repos that turned up different conversations, busiest agent first", () => {
+		// Alphabetical order would bury the agent the user actually works in. All three
+		// numbers merge, not just the processed one — otherwise a reader cannot tell a
+		// converged agent from one whose transcripts could not be read.
+		const lines = render([
+			result(tier({ codex: agent(3, 2, 1), claude: agent(7, 4, 3) }, "-a")),
+			result(tier({ claude: agent(11, 7, 4), kimi: agent(3, 2, 1) }, "-b")),
+		]);
+		expect(lines).toEqual([
+			"  ✓ 24 AI conversations in the last 7 days: 15 processed, 9 skipped",
+			"      claude  18 found, 11 processed, 7 skipped",
+			"      codex    3 found,  2 processed, 1 skipped",
+			"      kimi     3 found,  2 processed, 1 skipped",
+		]);
+	});
+
+	it("counts a conversation once when several repos claim it", () => {
+		// Cursor's global store records no workspace for a composer, so every in-window
+		// composer is claimed by every repo Cursor has a workspace for — and two clones of
+		// one project claim an identical set outright. Adding the repos' counts reported
+		// one conversation once per registered repo, so the headline grew with how many
+		// repos the user had registered and was only ever wrong on their own machine.
+		const claimed = () => result(tier({ cursor: agent(5, 5, 0) }));
+		const lines = render([claimed(), claimed(), claimed()]);
+		expect(lines).toEqual([
+			"  ✓ 5 AI conversations in the last 7 days: 5 processed, 0 skipped",
+			"      cursor  5 found, 5 processed, 0 skipped",
+		]);
+	});
+
+	it("reports a shared conversation as processed when any repo read it", () => {
+		// The same conversation read here and already-current there is a conversation this
+		// run read. Taking the last repo's answer instead would make the headline depend
+		// on registry order.
+		const lines = render([result(tier({ claude: agent(1, 1, 0) })), result(tier({ claude: agent(1, 0, 1) }))]);
+		expect(lines).toEqual([
+			"  ✓ 1 AI conversation in the last 7 days: 1 processed, 0 skipped",
+			"      claude  1 found, 1 processed, 0 skipped",
+		]);
+	});
+
+	it("breaks an agent tie alphabetically, so the block is stable across runs", () => {
+		const lines = render([result(tier({ kimi: agent(2, 2, 0), claude: agent(2, 2, 0) }))]);
+		expect(lines.slice(1)).toEqual([
+			"      claude  2 found, 2 processed, 0 skipped",
+			"      kimi    2 found, 2 processed, 0 skipped",
+		]);
+	});
+
+	it("prints the headline alone when the window turned up nothing", () => {
+		// An empty split is not a reason to withhold the headline: the run still
+		// happened, and a list of zeroes for absent tools says less than no list.
+		const lines = render([result(tier({}))]);
+		expect(lines).toEqual(["  ✓ 0 AI conversations in the last 7 days: 0 processed, 0 skipped"]);
+	});
+
+	it("says nothing when no repo reached the session tier", () => {
+		expect(render([result(undefined)])).toEqual([]);
+		expect(render([])).toEqual([]);
 	});
 });
 

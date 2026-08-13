@@ -39,7 +39,12 @@ function setPlatform(os: NodeJS.Platform): void {
 	Object.defineProperty(process, "platform", { value: os, configurable: true });
 }
 
-import { discoverCodexSessions, isCodexInstalled } from "./CodexSessionDiscoverer.js";
+import {
+	codexSessionsForRepo,
+	discoverCodexSessions,
+	isCodexInstalled,
+	scanCodexSessionsOnDisk,
+} from "./CodexSessionDiscoverer.js";
 
 let tempDir: string;
 
@@ -272,6 +277,18 @@ describe("discoverCodexSessions", () => {
 		expect(sessions).toHaveLength(0);
 	});
 
+	it("skips a session_meta row with an unparseable timestamp", async () => {
+		const now = new Date();
+		const year = String(now.getFullYear());
+		const month = String(now.getMonth() + 1).padStart(2, "0");
+		const day = String(now.getDate()).padStart(2, "0");
+		const dayDir = join(tempDir, ".codex", "sessions", year, month, day);
+
+		await createCodexSession(dayDir, "rollout-bad-time.jsonl", "/my/project", "sess-bad-time", "not-a-date");
+
+		await expect(discoverCodexSessions("/my/project")).resolves.toEqual([]);
+	});
+
 	it("falls back to file mtime when session_meta has no timestamp", async () => {
 		const now = new Date();
 		const year = String(now.getFullYear());
@@ -426,6 +443,173 @@ describe("Windows path case-insensitive matching", () => {
 
 		const sessions = await discoverCodexSessions("/MY/PROJECT");
 		expect(sessions).toHaveLength(0);
+	});
+});
+
+describe("discoverCodexSessions — staleness window", () => {
+	const DAY_MS = 24 * 60 * 60 * 1000;
+	const SEVEN_DAYS_MS = 7 * DAY_MS;
+
+	/**
+	 * The `YYYY/MM/DD` directory Codex would have written a session `daysAgo` days
+	 * back, built from LOCAL date parts — which is what the discoverer's own
+	 * traversal uses, and what Codex itself stamps into these names (a real capture
+	 * has `sessions/2026/08/11/rollout-2026-08-11T10-52-15-….jsonl` whose
+	 * `session_meta.timestamp` is `2026-08-11T02:53:24Z`, i.e. 10:53 local at UTC+8).
+	 */
+	function dayDirFor(daysAgo: number): string {
+		const d = new Date(Date.now() - daysAgo * DAY_MS);
+		return join(
+			tempDir,
+			".codex",
+			"sessions",
+			String(d.getFullYear()),
+			String(d.getMonth() + 1).padStart(2, "0"),
+			String(d.getDate()).padStart(2, "0"),
+		);
+	}
+
+	const isoDaysAgo = (daysAgo: number): string => new Date(Date.now() - daysAgo * DAY_MS).toISOString();
+
+	it("finds a four-day-old session when given a seven-day window", async () => {
+		// THIS is the test that pins the calendar-day traversal, not just the staleness
+		// check. A session four days back lives in a `YYYY/MM/DD` directory that the
+		// old hard-coded three-day range never entered, so it was unreachable no matter
+		// what window was asked for — the parameter would have been purely decorative,
+		// with no error and a plausible-looking empty result.
+		await createCodexSession(dayDirFor(4), "rollout-old.jsonl", "/my/project", "sess-4d", isoDaysAgo(4));
+
+		const sessions = await discoverCodexSessions("/my/project", SEVEN_DAYS_MS);
+
+		expect(sessions.map((s) => s.sessionId)).toEqual(["sess-4d"]);
+	});
+
+	it("does not find that session under the default 48-hour window", async () => {
+		await createCodexSession(dayDirFor(4), "rollout-old.jsonl", "/my/project", "sess-4d", isoDaysAgo(4));
+
+		await expect(discoverCodexSessions("/my/project")).resolves.toEqual([]);
+	});
+
+	it("reaches the oldest calendar day a seven-day window can touch", async () => {
+		// `ceil(7d / 1d) + 1 = 8` directories: a window that ends mid-day reaches into
+		// the eighth calendar day back. Six days is comfortably inside that.
+		await createCodexSession(dayDirFor(6), "rollout-six.jsonl", "/my/project", "sess-6d", isoDaysAgo(6));
+
+		const sessions = await discoverCodexSessions("/my/project", SEVEN_DAYS_MS);
+
+		expect(sessions.map((s) => s.sessionId)).toEqual(["sess-6d"]);
+	});
+
+	it("still rejects a session older than the widened window", async () => {
+		// Nine days back: outside the window AND outside the directory range.
+		await createCodexSession(dayDirFor(9), "rollout-ancient.jsonl", "/my/project", "sess-9d", isoDaysAgo(9));
+
+		await expect(discoverCodexSessions("/my/project", SEVEN_DAYS_MS)).resolves.toEqual([]);
+	});
+
+	it("applies the window to archived sessions, which are not date-partitioned", async () => {
+		// The archived half is a flat directory, so it needs no traversal change — only
+		// the staleness value reaches it. Worth pinning so a later edit does not assume
+		// the two halves work the same way.
+		const archived = join(tempDir, ".codex", "archived_sessions");
+		await createCodexSession(archived, "rollout-arch.jsonl", "/my/project", "sess-arch", isoDaysAgo(4));
+
+		await expect(discoverCodexSessions("/my/project")).resolves.toEqual([]);
+		const wide = await discoverCodexSessions("/my/project", SEVEN_DAYS_MS);
+		expect(wide.map((s) => s.sessionId)).toEqual(["sess-arch"]);
+	});
+});
+
+describe("scanCodexSessionsOnDisk / codexSessionsForRepo", () => {
+	/** Today's date directory, where a fresh rollout would land. */
+	function todayDir(): string {
+		const d = new Date();
+		return join(
+			tempDir,
+			".codex",
+			"sessions",
+			String(d.getFullYear()),
+			String(d.getMonth() + 1).padStart(2, "0"),
+			String(d.getDate()).padStart(2, "0"),
+		);
+	}
+
+	it("scans machine-wide and carries each rollout's working directory", async () => {
+		// Repo-agnostic on purpose: one scan serves every registered repo, instead of
+		// re-reading the first line of every rollout once per repo.
+		await createCodexSession(todayDir(), "a.jsonl", "/w/one", "sess-a");
+		await createCodexSession(todayDir(), "b.jsonl", "/w/two", "sess-b");
+
+		const scanned = await scanCodexSessionsOnDisk();
+
+		expect(scanned.map((s) => s.sessionId).sort()).toEqual(["sess-a", "sess-b"]);
+		expect(scanned.find((s) => s.sessionId === "sess-a")?.dirs).toEqual(["/w/one"]);
+	});
+
+	it("narrows a scan to one repo, including a rollout started in a subdirectory", async () => {
+		const repoRoot = await mkdtemp(join(realTmpdir(), "codex-repo-"));
+		try {
+			const scanned = [
+				{
+					sessionId: "root",
+					transcriptPath: "/t/root.jsonl",
+					updatedAt: "2026-08-13T00:00:00.000Z",
+					dirs: [repoRoot],
+				},
+				{
+					sessionId: "sub",
+					transcriptPath: "/t/sub.jsonl",
+					updatedAt: "2026-08-13T00:00:00.000Z",
+					dirs: [join(repoRoot, "cli", "src")],
+				},
+				{
+					sessionId: "elsewhere",
+					transcriptPath: "/t/elsewhere.jsonl",
+					updatedAt: "2026-08-13T00:00:00.000Z",
+					dirs: ["/somewhere/else"],
+				},
+				{
+					// A sibling sharing the repo's name prefix — a naive `startsWith` claims it.
+					sessionId: "sibling",
+					transcriptPath: "/t/sibling.jsonl",
+					updatedAt: "2026-08-13T00:00:00.000Z",
+					dirs: [`${repoRoot}-other`],
+				},
+			];
+
+			const mine = codexSessionsForRepo(scanned, repoRoot);
+
+			expect(mine.map((s) => s.sessionId).sort()).toEqual(["root", "sub"]);
+			expect(mine[0].source).toBe("codex");
+		} finally {
+			await rm(repoRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("excludes a rollout that belongs to a nested repo inside this one", async () => {
+		const repoRoot = await mkdtemp(join(realTmpdir(), "codex-repo-"));
+		try {
+			const nested = join(repoRoot, "vendor", "inner");
+			await mkdir(join(nested, ".git"), { recursive: true });
+			const scanned = [
+				{ sessionId: "n", transcriptPath: "/t/n.jsonl", updatedAt: "2026-08-13T00:00:00.000Z", dirs: [nested] },
+			];
+
+			expect(codexSessionsForRepo(scanned, repoRoot)).toEqual([]);
+		} finally {
+			await rm(repoRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("gives the same answer as the wrapper that replaced it", async () => {
+		// `discoverCodexSessions` is now scan-then-filter; the split must not have moved
+		// any behaviour.
+		await createCodexSession(todayDir(), "c.jsonl", "/my/project", "sess-c");
+
+		const direct = await discoverCodexSessions("/my/project");
+		const split = codexSessionsForRepo(await scanCodexSessionsOnDisk(), "/my/project");
+
+		expect(split).toEqual(direct);
 	});
 });
 

@@ -179,6 +179,22 @@ describe("scanCopilotSessions", () => {
 		expect(sessions.map((s) => s.sessionId)).toEqual(["fresh"]);
 	});
 
+	// The dashboard's history back-fill passes a wider window than the 48h default.
+	// Same fixture, two calls: the default rejects the row, the explicit window admits
+	// it — which is the whole point of the parameter being opt-in.
+	it("admits a session outside the 48h window when an explicit wider window is passed", async () => {
+		const SEVENTY_TWO_HOURS_MS = 72 * 60 * 60 * 1000;
+		const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+		await withFixture([{ id: "old", cwd: platformPath("/p"), updated_at: isoFromNow(SEVENTY_TWO_HOURS_MS) }]);
+		const { scanCopilotSessions } = await import("./CopilotSessionDiscoverer.js");
+
+		const withDefaultWindow = await scanCopilotSessions(platformPath("/p"));
+		expect(withDefaultWindow.sessions).toEqual([]);
+
+		const withWiderWindow = await scanCopilotSessions(platformPath("/p"), SEVEN_DAYS_MS);
+		expect(withWiderWindow.sessions.map((s) => s.sessionId)).toEqual(["old"]);
+	});
+
 	it("returns empty silently when the DB file is missing", async () => {
 		const detector = await import("./CopilotDetector.js");
 		vi.spyOn(detector, "getCopilotDbPath").mockReturnValue(join(tmpdir(), "copilot-disc-missing", "x.db"));

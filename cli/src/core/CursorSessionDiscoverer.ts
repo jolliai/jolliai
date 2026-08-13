@@ -62,19 +62,105 @@ export interface CursorScanResult {
  * composers updated within the last 48 h (time window), deduped.
  *
  * @param projectDir - The git repository root to filter sessions by
+ * @param windowMs - Optional staleness window in milliseconds. Defaults to
+ *   {@link SESSION_STALE_MS} (48 h). The dashboard's history back-fill passes a wider
+ *   window (7 d) to recover conversations the database never recorded. Callers that
+ *   must NOT widen it omit the argument entirely: the "Active Conversations" sidebar,
+ *   `jolli status`, and — the one that matters — the post-commit summary in
+ *   `QueueWorker`, which uses this window to decide which conversations belong to the
+ *   commit being summarised. That summary is written to the git orphan branch and
+ *   kept, so a wider window there quietly attaches week-old unrelated conversations
+ *   to a commit's stored memory with no error anywhere. Workspace anchors are
+ *   unaffected — they bypass the window by design.
  * @returns { sessions, error? } — sessions is always an array; if `error` is
  *   present, callers should surface it to the user rather than silently reporting
  *   "0 sessions" (which is indistinguishable from a genuinely-empty scan).
  */
-export async function scanCursorSessions(projectDir: string): Promise<CursorScanResult> {
-	const globalDbPath = getCursorGlobalDbPath();
-
-	// Step 1: Workspace lookup — find which workspace hash corresponds to projectDir.
+export async function scanCursorSessions(projectDir: string, windowMs?: number): Promise<CursorScanResult> {
+	// Step 1 runs BEFORE the disk scan, and that order is this caller's whole cost
+	// model. A repo Cursor has no workspace for claims nothing at all (see
+	// {@link cursorSessionsForRepo}), and settling that costs a few `workspace.json`
+	// reads — while the scan below is `LIKE 'composerData:%'` plus a `JSON.parse` of
+	// every matching blob, i.e. a full pass over the user's entire Cursor history.
+	// Scanning first and narrowing afterwards would put that full pass on the 60 s
+	// sidebar tick, on every post-commit and on every `jolli status` of a repo Cursor
+	// was never opened in, where the answer is provably empty before any blob is read.
+	//
+	// The multi-repo back-fill hoists the scan on purpose (see
+	// {@link scanCursorComposersOnDisk}) — that caller pays the full pass once for N
+	// repos, which is the opposite trade. This one has exactly one repo to answer for.
 	const wsHash = await findCursorWorkspaceHash(projectDir);
 	if (wsHash === null) {
 		log.debug("No Cursor workspace found matching %s", projectDir);
 		return { sessions: [] };
 	}
+	const { composers, error } = await scanCursorComposersOnDisk();
+	const mine = await narrowToCursorWorkspace(composers, projectDir, wsHash, windowMs);
+	return error ? { sessions: mine, error } : { sessions: mine };
+}
+
+/** One Cursor composer from the global store, with the timestamp the window judges. */
+export interface CursorDiskComposer {
+	readonly session: SessionInfo;
+	/** `lastUpdatedAt` in epoch ms — already validated finite by the scan. */
+	readonly lastUpdatedAt: number;
+}
+
+/** A machine-wide Cursor composer scan: every composer in the global store. */
+export interface CursorDiskScanResult {
+	readonly composers: ReadonlyArray<CursorDiskComposer>;
+	readonly error?: SqliteScanError;
+}
+
+/**
+ * Reads every composer out of Cursor's GLOBAL store, once.
+ *
+ * MACHINE-WIDE and repo-agnostic on purpose — and this is the source where that
+ * split is least obvious, so it is worth stating what does and does not move here.
+ *
+ * There is no "this composer belongs to this workspace" pointer in the global store
+ * (see this file's header), so a composer carries no directory and this scan cannot
+ * narrow anything. What it CAN do is stop repeating the expensive half: the query is
+ * `LIKE 'composerData:%'` over `cursorDiskKV` followed by a `JSON.parse` of every
+ * matching blob — a full scan of the user's entire Cursor history, which the
+ * repo-scoped shape ran once per registered repo.
+ *
+ * The cheap, genuinely per-repo half stays in {@link cursorSessionsForRepo}: the
+ * workspace-hash lookup and the single-row anchor read. That is the right cut. The
+ * anchor read is one `SELECT … LIMIT 1` against a per-workspace database, so hoisting
+ * it would mean opening EVERY workspace's `state.vscdb` on the machine — more work
+ * than it saves as soon as a user has more Cursor workspaces than registered repos,
+ * which is the normal case.
+ *
+ * The staleness window is deliberately NOT applied here either: anchors bypass it by
+ * design, so a composer outside the window can still be claimed by the workspace that
+ * points at it. Filtering here would silently drop those.
+ *
+ * ## KNOWN, DEFERRED: this returns the user's ENTIRE Cursor history
+ *
+ * Not a defect to report again. The repo-scoped shape this replaced ran the same query
+ * and the same `JSON.parse` per blob, but decided anchor-or-window INSIDE the loop, so
+ * it only ever kept the composers one repo could claim. This keeps every composer in
+ * the global store, because the decision moved to {@link cursorSessionsForRepo} — and
+ * for a multi-repo run that is the point, since each repo answers it differently.
+ *
+ * What that costs is one small record per composer (id, synthetic path, instant, title)
+ * held for the length of the run — single-digit megabytes for a heavy user, not a
+ * transcript each. It is bounded by how much Cursor history exists, which does not grow
+ * with the number of registered repos.
+ *
+ * It cannot be filtered here without breaking attribution, and the reason is worth
+ * knowing before someone tries: a composer is claimed by anchor OR by window, and the
+ * anchor set lives in the per-workspace `state.vscdb`, one database per workspace. To
+ * know the anchors at scan time this would have to open EVERY workspace database on the
+ * machine — measured above as more work than it saves once a user has more Cursor
+ * workspaces than registered repos, which is the normal case. Applying the window alone
+ * is not a safe subset either: that is exactly what silently drops an anchored composer
+ * the user is actively working in. If this ever has to shrink, the shape to reach for is
+ * a lazy handle (id plus enough to re-read the blob on demand), not a filter.
+ */
+export async function scanCursorComposersOnDisk(): Promise<CursorDiskScanResult> {
+	const globalDbPath = getCursorGlobalDbPath();
 
 	// Pre-flight: distinguish "global DB missing" (silent) from "DB unreadable" (genuine failure)
 	// before calling DatabaseSync, which surfaces both as the same error message.
@@ -87,24 +173,17 @@ export async function scanCursorSessions(projectDir: string): Promise<CursorScan
 			const scanError = classifyScanError(error);
 			if (scanError) {
 				log.error("Cursor global DB stat failed (%s): %s", scanError.kind, scanError.message);
-				return { sessions: [], error: scanError };
+				return { composers: [], error: scanError };
 			}
-			return { sessions: [] };
+			return { composers: [] };
 		}
 		/* v8 ignore stop */
 		log.debug("Cursor global DB not present at %s — treating as not installed", globalDbPath);
-		return { sessions: [] };
+		return { composers: [] };
 	}
 
-	// Step 2: Anchor extraction — read the per-workspace composer pointer IDs.
-	const anchorIds = await readCursorAnchorComposerIds(wsHash);
-	const anchorSet = new Set(anchorIds);
-
-	// Step 3: Time-window scan — compute cutoff and open the global DB.
-	const cutoffMs = Date.now() - SESSION_STALE_MS;
-
 	try {
-		const out: SessionInfo[] = [];
+		const out: CursorDiskComposer[] = [];
 		const seenIds = new Set<string>();
 
 		await withSqliteDb(globalDbPath, (db) => {
@@ -155,15 +234,9 @@ export async function scanCursorSessions(projectDir: string): Promise<CursorScan
 					continue;
 				}
 
-				const inAnchor = anchorSet.has(composerId);
-				const inWindow = lastUpdatedAt >= cutoffMs;
-
-				// Step 4: Union — include if in anchor set OR within time window.
-				if (!inAnchor && !inWindow) {
-					continue;
-				}
-
-				// Dedupe: each composerId appears at most once.
+				// Dedupe: each composerId appears at most once. The anchor / window
+				// decision is NOT made here — it is per-repo, and lives in
+				// `cursorSessionsForRepo`.
 				if (seenIds.has(composerId)) {
 					continue;
 				}
@@ -173,38 +246,106 @@ export async function scanCursorSessions(projectDir: string): Promise<CursorScan
 				const title = nameRaw.length > 0 ? nameRaw : undefined;
 
 				out.push({
-					sessionId: composerId,
-					// Synthetic path: global DB path + composer discriminator (matches OpenCode pattern)
-					transcriptPath: `${globalDbPath}#${composerId}`,
-					updatedAt: new Date(lastUpdatedAt).toISOString(),
-					source: "cursor",
-					title,
+					session: {
+						sessionId: composerId,
+						// Synthetic path: global DB path + composer discriminator (matches OpenCode pattern)
+						transcriptPath: `${globalDbPath}#${composerId}`,
+						updatedAt: new Date(lastUpdatedAt).toISOString(),
+						source: "cursor",
+						title,
+					},
+					lastUpdatedAt,
 				});
 			}
 		});
 
-		log.debug("Discovered %d Cursor session(s) for %s", out.length, projectDir);
-		return { sessions: out };
+		log.debug("Cursor disk scan: %d composer(s) in the global store", out.length);
+		return { composers: out };
 	} catch (error: unknown) {
 		const scanError = classifyScanError(error);
 		/* v8 ignore start -- TOCTOU race: the DB passed stat() but vanished or became unreadable before DatabaseSync opened it. Requires a filesystem-level mock; classifier behavior is covered by classifyScanError unit tests. */
 		if (scanError === null) {
 			log.debug("Cursor global DB disappeared between detection and scan: %s", (error as Error).message);
-			return { sessions: [] };
+			return { composers: [] };
 		}
 		/* v8 ignore stop */
 		log.error("Cursor scan failed (%s): %s", scanError.kind, scanError.message);
-		return { sessions: [], error: scanError };
+		return { composers: [], error: scanError };
 	}
+}
+
+/**
+ * Narrows a machine-wide Cursor composer scan to one repo — the β′ algorithm's
+ * per-repo half.
+ *
+ * ASYNC and NOT built on `DiskSession`, because Cursor's attribution is not a
+ * directory comparison at all. The global store records no workspace for a composer,
+ * so a repo claims one of two ways:
+ *
+ *  1. **Anchor** — the repo's own workspace database points at it
+ *     (`lastFocusedComposerIds` / `selectedComposerIds`). Anchors bypass the staleness
+ *     window by design, which is why the scan must not pre-filter by time.
+ *  2. **Time window** — the composer was updated recently.
+ *
+ * The second is deliberately coarse: with no workspace pointer in the global store,
+ * every recent composer is claimed by every repo Cursor has a workspace for. That is
+ * pre-existing behaviour, unchanged here — a repo with NO Cursor workspace still
+ * claims nothing, which is what the early return preserves.
+ */
+export async function cursorSessionsForRepo(
+	composers: ReadonlyArray<CursorDiskComposer>,
+	projectDir: string,
+	windowMs?: number,
+): Promise<ReadonlyArray<SessionInfo>> {
+	// Step 1: Workspace lookup — find which workspace hash corresponds to projectDir.
+	const wsHash = await findCursorWorkspaceHash(projectDir);
+	if (wsHash === null) {
+		log.debug("No Cursor workspace found matching %s", projectDir);
+		return [];
+	}
+	return narrowToCursorWorkspace(composers, projectDir, wsHash, windowMs);
+}
+
+/**
+ * Steps 2-4 of the β′ algorithm, given a workspace hash step 1 already resolved.
+ *
+ * Split out so the single-repo entry point can settle step 1 BEFORE paying for the
+ * disk scan without resolving the same hash twice — see {@link scanCursorSessions}.
+ * Not exported: a caller with no hash belongs in {@link cursorSessionsForRepo},
+ * which is the function that knows a missing hash means "claims nothing".
+ */
+async function narrowToCursorWorkspace(
+	composers: ReadonlyArray<CursorDiskComposer>,
+	projectDir: string,
+	wsHash: string,
+	windowMs?: number,
+): Promise<ReadonlyArray<SessionInfo>> {
+	// Step 2: Anchor extraction — read the per-workspace composer pointer IDs.
+	const anchorSet = new Set(await readCursorAnchorComposerIds(wsHash));
+
+	// Step 3/4: window cutoff, then union with the anchors.
+	const cutoffMs = Date.now() - (windowMs ?? SESSION_STALE_MS);
+	const out = composers
+		.filter(({ session, lastUpdatedAt }) => anchorSet.has(session.sessionId) || lastUpdatedAt >= cutoffMs)
+		.map(({ session }) => session);
+
+	log.debug("Discovered %d Cursor session(s) for %s", out.length, projectDir);
+	return out;
 }
 
 /**
  * Backwards-compatible wrapper around `scanCursorSessions` that only returns
  * the session array. Callers that need to surface scan failures to the user
  * should call `scanCursorSessions` directly.
+ *
+ * @param windowMs - Forwarded to {@link scanCursorSessions}; see that function for why
+ *   the post-commit caller leaves it unset.
  */
-export async function discoverCursorSessions(projectDir: string): Promise<ReadonlyArray<SessionInfo>> {
-	const { sessions } = await scanCursorSessions(projectDir);
+export async function discoverCursorSessions(
+	projectDir: string,
+	windowMs?: number,
+): Promise<ReadonlyArray<SessionInfo>> {
+	const { sessions } = await scanCursorSessions(projectDir, windowMs);
 	return sessions;
 }
 

@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import type { GitCommandResult, SessionInfo, TranscriptReadResult } from "../Types.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { GitCommandResult, SessionInfo, TranscriptReadResult, TranscriptSource } from "../Types.js";
 
 vi.mock("../core/GitOps.js", () => ({
 	execGit: vi.fn(),
@@ -10,12 +10,16 @@ vi.mock("../core/SummaryStore.js", () => ({
 	getSummary: vi.fn(),
 	readTranscriptsForCommits: vi.fn(),
 }));
-// Only the read is faked — `isMissingTranscriptError` classifies the rejection
-// the collector catches, so the real predicate has to stay in place.
-vi.mock("../core/TranscriptReader.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../core/TranscriptReader.js")>()),
-	readTranscript: vi.fn(),
-}));
+// Only the read is faked; everything else in the module stays REAL, for two
+// separate reasons. `isMissingTranscriptError` classifies the rejection the
+// collector catches, so the real predicate has to stay in place. And
+// `splitTranscriptLines` is a pure string split that the line-oriented
+// extractors depend on — a mocked-away `undefined` would surface as a TypeError
+// deep inside a lazily-imported reader rather than as a failed expectation.
+vi.mock("../core/TranscriptReader.js", async (importOriginal) => {
+	const original = await importOriginal<typeof import("../core/TranscriptReader.js")>();
+	return { ...original, readTranscript: vi.fn() };
+});
 // The default session loader fans out to every discoverer; mock the registry
 // loader so `loadAllSessions` has one deterministic success and the rest of
 // the discoverers run for real against a directory that has none of their stores.
@@ -23,7 +27,18 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 	const original = await importOriginal<typeof import("../core/SessionTracker.js")>();
 	return { ...original, loadAllSessions: vi.fn() };
 });
+// PARTIAL: only the per-repo scan is replaced, so `codexSessionsForRepo` keeps doing
+// real attribution. The spy is how the "a pre-scanned source is not scanned again"
+// guarantee is asserted — without it that double read would be invisible.
+vi.mock("../core/CodexSessionDiscoverer.js", async (importOriginal) => {
+	const original = await importOriginal<typeof import("../core/CodexSessionDiscoverer.js")>();
+	return { ...original, discoverCodexSessions: vi.fn(async () => []) };
+});
 
+import type { ClaudeDiskSession } from "../core/ClaudeSessionDiscoverer.js";
+import type { CodexDiskSession } from "../core/CodexSessionDiscoverer.js";
+import { discoverCodexSessions } from "../core/CodexSessionDiscoverer.js";
+import type { DiskSession } from "../core/DiskSessionScan.js";
 import { execGit, getCurrentBranch } from "../core/GitOps.js";
 import { loadAllSessions as loadRegistrySessions } from "../core/SessionTracker.js";
 import { getIndex, getSummary, readTranscriptsForCommits } from "../core/SummaryStore.js";
@@ -36,8 +51,18 @@ import {
 	collectWorktreeEvent,
 	loadAllSessions,
 	parseNumstatLog,
+	sessionPassKey,
+	sourceOfSessionPassKey,
 	summaryEventFromCommitSummary,
 } from "./DashboardCollector.js";
+
+beforeEach(() => {
+	// The partial SessionTracker mock keeps the real module except for this read.
+	// Give the seam its valid default explicitly: a bare `vi.fn()` resolves to
+	// undefined, which violates the loader contract and makes the fan-out fail while
+	// spreading a fulfilled result that is not an array.
+	vi.mocked(loadRegistrySessions).mockResolvedValue([]);
+});
 
 const git = (stdout: string): GitCommandResult => ({ stdout, stderr: "", exitCode: 0 });
 const gitFail = (stderr: string): GitCommandResult => ({ stdout: "", stderr, exitCode: 128 });
@@ -48,6 +73,39 @@ const claudeSession = (over: Partial<SessionInfo> = {}): SessionInfo => ({
 	updatedAt: "2026-07-30T08:00:00.000Z",
 	source: "claude",
 	...over,
+});
+
+/** A repo root the disk-scan fixtures below attribute themselves to. */
+const WORKTREE = "/w/repo";
+
+const diskSession = (over: Partial<ClaudeDiskSession> = {}): ClaudeDiskSession => ({
+	sessionId: "d1",
+	transcriptPath: "/t/d1.jsonl",
+	updatedAt: "2026-07-30T08:00:00.000Z",
+	dirs: [WORKTREE],
+	// The whole-file read every non-skipped transcript gets; the scan only reports
+	// `false` when the database already held the session.
+	complete: true,
+	...over,
+});
+
+const codexDiskSession = (over: Partial<CodexDiskSession> = {}): CodexDiskSession => ({
+	sessionId: "x1",
+	transcriptPath: "/t/x1.jsonl",
+	updatedAt: "2026-07-30T08:00:00.000Z",
+	dirs: [WORKTREE],
+	...over,
+});
+
+/** A machine-wide scan entry for any of the sources that use the shared shape. */
+const diskEntry = (source: TranscriptSource, id: string, dirs: string[] = [WORKTREE]): DiskSession => ({
+	session: {
+		sessionId: id,
+		transcriptPath: `/t/${id}.jsonl`,
+		updatedAt: "2026-07-30T08:00:00.000Z",
+		source,
+	},
+	dirs,
 });
 
 const transcript = (over: Partial<TranscriptReadResult> = {}): TranscriptReadResult => ({
@@ -97,6 +155,47 @@ describe("collectSessionEvents", () => {
 		expect(events[0].models).toBeUndefined();
 	});
 
+	it("omits the duration for a conversation with a single turn", async () => {
+		// First and last entry are the same record, so there is no elapsed time to
+		// report. Writing 0 would claim a measurement; absence says there is none —
+		// and the guard is `>`, not `>=`, for exactly this case.
+		vi.mocked(readTranscript).mockResolvedValue(
+			transcript({
+				entries: [{ role: "human", content: "one turn", timestamp: "2026-07-30T07:00:00.000Z" }],
+				usageByModel: [],
+			}),
+		);
+
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w",
+			loadSessions: async () => [claudeSession()],
+		});
+
+		expect(events[0].messageCount).toBe(1);
+		expect(events[0].durationMs).toBeUndefined();
+	});
+
+	it("keeps the NEWER of two views of one session, whichever order they arrive in", async () => {
+		// Two discoverers can surface the same conversation — the hook registry and a
+		// rescan of the same store — and the dedupe has to be an explicit comparison
+		// rather than last-write-wins, or which timestamp survives depends on the order
+		// the loaders happened to finish in.
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w",
+			loadSessions: async () => [
+				claudeSession({ updatedAt: "2026-07-30T09:00:00.000Z" }),
+				claudeSession({ updatedAt: "2026-07-30T08:00:00.000Z" }),
+			],
+		});
+
+		expect(events).toHaveLength(1);
+		expect(events[0].updatedAtMs).toBe(Date.parse("2026-07-30T09:00:00.000Z"));
+	});
+
 	it("keeps a session whose transcript is unreadable, with what the discoverer knew", async () => {
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 		vi.mocked(readTranscript).mockRejectedValue(new Error("moved"));
@@ -129,12 +228,19 @@ describe("collectSessionEvents", () => {
 		warn.mockRestore();
 	});
 
-	it("does not read transcripts for non-Claude sources — no per-turn usage exists there", async () => {
+	it("never sends a non-Claude transcript to Claude's reader", async () => {
+		// Non-Claude sources DO get read now — that is what gave the other twelve agents
+		// their tool and MCP calls. What must not happen is them being read by the
+		// Claude-shaped `readTranscript`: a Cursor `transcriptPath` is a synthetic
+		// `<dbPath>#<sessionId>` handle, and a JSONL reader handed one does not fail
+		// loudly, it parses zero lines and reports an empty conversation.
 		const events = await collectSessionEvents({
 			repoIdentity: "r",
 			cwd: "/w",
 			loadSessions: async () => [claudeSession({ source: "cursor", sessionId: "c1" })],
 		});
+		// The row survives whatever its own reader did — an unreadable transcript still
+		// counts as a session, recorded from what the discoverer knew.
 		expect(events).toEqual([
 			expect.objectContaining({
 				source: "cursor",
@@ -194,6 +300,310 @@ describe("collectSessionEvents", () => {
 			},
 		});
 		expect(events[0].source).toBe("claude");
+	});
+
+	it("adds pre-scanned Claude transcripts whose working directory matches the repo", async () => {
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			loadSessions: async () => [],
+			preScanned: { claude: [diskSession()] },
+		});
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({ source: "claude", sessionId: "d1" });
+	});
+
+	it("reads a pre-scanned transcript itself rather than taking the scan's word", async () => {
+		// The scan parsed this file to collect its working directories and deliberately
+		// kept none of it — carrying the parse made a run's resident set grow with the
+		// window (see `acceptFacts`). So the read is paid here, per session, and it is a
+		// re-read rather than a first read.
+		vi.mocked(readTranscript).mockResolvedValue(
+			transcript({ entries: [{ role: "human", content: "only turn" }], usageByModel: [] }),
+		);
+
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			loadSessions: async () => [],
+			preScanned: { claude: [diskSession()] },
+		});
+
+		expect(readTranscript).toHaveBeenCalledTimes(1);
+		expect(events[0].messageCount).toBe(1);
+	});
+
+	it("reads a cheap-path scan the same way — `complete` no longer changes anything here", async () => {
+		// `complete: false` says the scan only read a tail, so its `dirs` may be short.
+		// That is an attribution caveat and not a content one: neither path carries
+		// content, so both cost exactly one read here.
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+
+		await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			loadSessions: async () => [],
+			preScanned: { claude: [diskSession({ complete: false })] },
+		});
+
+		expect(readTranscript).toHaveBeenCalledTimes(1);
+	});
+
+	it("drops a pre-scanned transcript belonging to another repo", async () => {
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			loadSessions: async () => [],
+			preScanned: { claude: [diskSession({ dirs: ["/somewhere/else"] })] },
+		});
+		expect(events).toEqual([]);
+		expect(readTranscript).not.toHaveBeenCalled();
+	});
+
+	it("merges the disk scan with the registry instead of replacing it", async () => {
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			// Only reachable through `sessions.json` — e.g. Gemini, which has no disk scanner.
+			loadSessions: async () => [claudeSession({ source: "gemini", sessionId: "g1" })],
+			preScanned: { claude: [diskSession()] },
+		});
+		expect(events.map((e) => e.sessionId).sort()).toEqual(["d1", "g1"]);
+	});
+
+	it("keeps the registry copy when both routes surface one session (its instant is later)", async () => {
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			// The Stop hook stamps the hook's own instant, a few seconds after the last turn.
+			loadSessions: async () => [claudeSession({ sessionId: "d1", updatedAt: "2026-07-30T08:00:03.000Z" })],
+			preScanned: { claude: [diskSession({ updatedAt: "2026-07-30T08:00:00.000Z" })] },
+		});
+		expect(events).toHaveLength(1);
+		expect(events[0].updatedAtMs).toBe(Date.parse("2026-07-30T08:00:03.000Z"));
+	});
+
+	it("skips a session the database already holds at or past its instant, without reading it", async () => {
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w",
+			loadSessions: async () => [claudeSession()],
+			isAlreadyCurrent: () => true,
+		});
+		expect(events).toEqual([]);
+		// The whole point of the skip: the expensive transcript parse never happens.
+		expect(readTranscript).not.toHaveBeenCalled();
+	});
+
+	it("passes source, id and instant to the skip predicate", async () => {
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const seen: Array<[string, string, number]> = [];
+		await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w",
+			loadSessions: async () => [claudeSession(), claudeSession({ source: "cursor", sessionId: "c1" })],
+			isAlreadyCurrent: (source, sessionId, updatedAtMs) => {
+				seen.push([source, sessionId, updatedAtMs]);
+				return source === "cursor";
+			},
+		});
+		expect(seen).toContainEqual(["claude", "s1", Date.parse("2026-07-30T08:00:00.000Z")]);
+		expect(seen).toContainEqual(["cursor", "c1", Date.parse("2026-07-30T08:00:00.000Z")]);
+	});
+
+	it("re-reads a session whose stored instant is older than the disk one", async () => {
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const stored = Date.parse("2026-07-27T00:00:00.000Z");
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w",
+			// A three-day-old conversation the user has just resumed. A repo-wide
+			// high-water mark would skip this; a per-session compare must not.
+			loadSessions: async () => [claudeSession({ updatedAt: "2026-07-30T00:00:00.000Z" })],
+			isAlreadyCurrent: (_source, _sessionId, updatedAtMs) => stored >= updatedAtMs,
+		});
+		expect(events).toHaveLength(1);
+	});
+
+	it("adds pre-scanned Codex rollouts whose working directory matches the repo", async () => {
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			loadSessions: async () => [],
+			preScanned: { codex: [codexDiskSession()] },
+		});
+		expect(events).toEqual([expect.objectContaining({ source: "codex", sessionId: "x1" })]);
+		// Codex writes JSONL, so it shares the one reader Claude uses — with its own
+		// parser, which is the part that must be right. The tier used to open Claude's
+		// transcript alone and hand every other agent a bare session row.
+		const [path, , parser] = vi.mocked(readTranscript).mock.calls[0];
+		expect(path).toBe("/t/x1.jsonl");
+		expect(parser?.constructor.name).toBe("CodexTranscriptParser");
+	});
+
+	it("drops a pre-scanned Codex rollout belonging to another repo", async () => {
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			loadSessions: async () => [],
+			preScanned: { codex: [codexDiskSession({ dirs: ["/somewhere/else"] })] },
+		});
+		expect(events).toEqual([]);
+	});
+
+	it("does not scan Codex again when a pre-scan was supplied", async () => {
+		// The whole point of hoisting it: a per-repo scan on top of the run-wide one
+		// would read `~/.codex/sessions/` twice per repo instead of once per run.
+		await loadAllSessions("/w", undefined, { codex: [codexDiskSession()] });
+
+		expect(discoverCodexSessions).not.toHaveBeenCalled();
+	});
+
+	it("treats an EMPTY pre-scan as already scanned, not as no scan", async () => {
+		// The distinction the whole `PreScannedSessions` shape rests on: `[]` is the
+		// positive claim "the scan ran and found nothing", so the per-repo loader must
+		// still be skipped. Reading `[]` as "nothing supplied" would re-scan the store
+		// for every repo — silently, since both spellings produce zero sessions.
+		await loadAllSessions("/w", undefined, { codex: [] });
+
+		expect(discoverCodexSessions).not.toHaveBeenCalled();
+	});
+
+	it("does scan Codex when no pre-scan was supplied", async () => {
+		// Every caller outside the back-fill relies on this — the sidebar, `jolli status`
+		// and the post-commit summary all pass nothing and must still get the source.
+		await loadAllSessions("/w");
+
+		expect(discoverCodexSessions).toHaveBeenCalledWith("/w", undefined);
+	});
+
+	// Every hookless source reads a machine-global store, so every one of them can be
+	// pre-scanned once for a whole multi-repo run and narrowed here. The two halves are
+	// asserted together on purpose: a source that narrows correctly but is not skipped
+	// by the fan-out reads its store twice per repo, and a source that is skipped but
+	// does not narrow disappears from the run — both are silent, and both produce a
+	// plausible-looking result.
+	// `PreScannedSessions` is keyed by `TranscriptSource` itself, so the key IS the
+	// source — spelled once here rather than as a parallel camelCase column, which is
+	// what let three of these sit unmatched: an unknown key narrows to nothing, and
+	// the "belongs to another repo" half of each pair expects nothing anyway, so only
+	// one of the two assertions could ever notice.
+	//
+	// `lineOriented` marks the sources whose transcript is a JSONL file. Those share
+	// the one `readTranscript` entry point (with their own parser) — see
+	// LINE_ORIENTED_SOURCES in TranscriptSourceReader; the rest own a reader over a
+	// JSON file or a SQLite store and never reach it.
+	const HOISTED = [
+		{ source: "kimi", lineOriented: true },
+		{ source: "opencode", lineOriented: false },
+		{ source: "copilot", lineOriented: false },
+		{ source: "copilot-chat", lineOriented: false },
+		{ source: "cline", lineOriented: false },
+		{ source: "cline-cli", lineOriented: false },
+		{ source: "devin", lineOriented: false },
+		{ source: "cursor-cli", lineOriented: false },
+		{ source: "antigravity", lineOriented: false },
+	] as const;
+
+	for (const { source, lineOriented } of HOISTED) {
+		const key = source;
+		it(`adds pre-scanned ${source} sessions whose directory matches the repo`, async () => {
+			const events = await collectSessionEvents({
+				repoIdentity: "r",
+				cwd: WORKTREE,
+				loadSessions: async () => [],
+				preScanned: { [key]: [diskEntry(source, `${source}-1`)] },
+			});
+			expect(events).toEqual([expect.objectContaining({ source, sessionId: `${source}-1` })]);
+			// A JSONL source is read through the shared entry point; a store-backed one
+			// is read by its own module and must never reach it — handing a SQLite file
+			// to a line parser does not fail, it reports an empty conversation.
+			if (lineOriented) expect(readTranscript).toHaveBeenCalled();
+			else expect(readTranscript).not.toHaveBeenCalled();
+		});
+
+		it(`drops a pre-scanned ${source} session belonging to another repo`, async () => {
+			const events = await collectSessionEvents({
+				repoIdentity: "r",
+				cwd: WORKTREE,
+				loadSessions: async () => [],
+				preScanned: { [key]: [diskEntry(source, `${source}-1`, ["/somewhere/else"])] },
+			});
+			expect(events).toEqual([]);
+		});
+	}
+
+	it("drops a pre-scanned session that recorded no directory at all", async () => {
+		// An empty `dirs` must match NOTHING. The tempting reading — no directories,
+		// therefore no objection, therefore keep it — would attach the session to every
+		// repo on the machine.
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			loadSessions: async () => [],
+			preScanned: { kimi: [diskEntry("kimi", "k1", [])] },
+		});
+		expect(events).toEqual([]);
+	});
+
+	it("does not skip a session whose instant cannot be parsed", async () => {
+		const predicate = vi.fn(() => true);
+		await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w",
+			loadSessions: async () => [claudeSession({ updatedAt: "not-a-date" })],
+			isAlreadyCurrent: predicate,
+		});
+		// Being unable to date a session is a reason to look at it, not to assume
+		// it is current — so the predicate is never consulted for it.
+		expect(predicate).not.toHaveBeenCalled();
+	});
+
+	it("keeps the other sources' sessions when one source's NARROWING throws", async () => {
+		// Narrowing is real I/O for two sources (Antigravity enumerates the repo's
+		// worktrees, Cursor resolves a workspace hash), so a failure here is a live
+		// mode rather than a defensive catch — and it must cost that source alone.
+		// A payload of the wrong shape is the cheapest way to make one throw: every
+		// narrowing starts by iterating the scan it was handed.
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			loadSessions: async () => [],
+			preScanned: {
+				kimi: "not an array" as unknown as ReadonlyArray<unknown>,
+				opencode: [diskEntry("opencode", "oc1")],
+			},
+		});
+
+		expect(events.map((e) => e.sessionId)).toEqual(["oc1"]);
+		warn.mockRestore();
+	});
+});
+
+describe("sessionPassKey", () => {
+	it("joins the source and the session id", () => {
+		expect(sessionPassKey("claude", "s1")).toBe("claude:s1");
+	});
+
+	it("reads the source back off a key", () => {
+		expect(sourceOfSessionPassKey("copilot-chat:abc")).toBe("copilot-chat");
+	});
+
+	it("keeps only the FIRST segment, so an id containing a colon cannot shift the source", () => {
+		expect(sourceOfSessionPassKey("cursor:a:b:c")).toBe("cursor");
+	});
+
+	it("answers the whole string for a key with no separator at all", () => {
+		// Nothing produces such a key today — every one comes from `sessionPassKey`. The
+		// fallback exists so a malformed key degrades to a wrong-looking agent NAME in a
+		// report rather than to an empty label that reads as a missing agent.
+		expect(sourceOfSessionPassKey("nocolon")).toBe("nocolon");
 	});
 });
 

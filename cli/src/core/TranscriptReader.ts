@@ -152,10 +152,6 @@ export async function readTranscript(
 	parser?: TranscriptParser,
 	beforeTimestamp?: string,
 ): Promise<TranscriptReadResult> {
-	const startLine = cursor?.lineNumber ?? 0;
-	const activeParser = parser ?? new ClaudeTranscriptParser();
-	const parseFn = (line: string, num: number) => activeParser.parseLine(line, num);
-
 	let content: string;
 	try {
 		content = await readFile(transcriptPath, "utf-8");
@@ -171,8 +167,55 @@ export async function readTranscript(
 		// the next reader's trap, not a live bug.
 		throwTranscriptReadError(log, `Cannot read transcript: ${transcriptPath}`, error);
 	}
+	return parseTranscriptContent(transcriptPath, content, cursor, parser, beforeTimestamp);
+}
 
-	const lines = content.split("\n").filter((line) => line.trim().length > 0);
+/**
+ * A JSONL transcript's non-blank lines, as every reader here counts them.
+ *
+ * Exported because line NUMBERS cross module boundaries: a scanner handed these
+ * lines reports a cursor position against them, and the incremental cursors in
+ * `discovery-cursors.json` are monotonic — a mark advanced past a line is never
+ * re-read. So a second filter that disagreed by even one blank line would not
+ * fail loudly; it would silently strand records on one side of the boundary.
+ * One function, one definition of "line N".
+ */
+export function splitTranscriptLines(content: string): string[] {
+	return content.split("\n").filter((line) => line.trim().length > 0);
+}
+
+/**
+ * Everything {@link readTranscript} does once the file is in hand — same result,
+ * same rules, no disk access.
+ *
+ * Split out for a caller that has ALREADY read the file, so one read can serve both
+ * it and this parse — by extraction rather than by a second implementation, which is
+ * what keeps "what counts as a turn, a token, a tool call" in exactly one place.
+ *
+ * **No such caller exists today**, and the reason is worth knowing before adding one.
+ * The Claude disk scan was it: it reads each transcript whole for the working
+ * directories a `cd` scattered through the file, and handing that text over here
+ * removed a second read (measured 464 ms across 64 transcripts, paid twice). It was
+ * reverted because the parse then had to be CARRIED for the whole run, which made a
+ * back-fill's resident set grow with its window — see `acceptFacts` in
+ * `ClaudeSessionDiscoverer`. So the seam is kept, and a future caller may use it, but
+ * only one that consumes the result immediately rather than holding it.
+ *
+ * `transcriptPath` is still required: it is not read, but it is what the returned
+ * cursor names.
+ */
+export function parseTranscriptContent(
+	transcriptPath: string,
+	content: string,
+	cursor?: TranscriptCursor | null,
+	parser?: TranscriptParser,
+	beforeTimestamp?: string,
+): TranscriptReadResult {
+	const startLine = cursor?.lineNumber ?? 0;
+	const activeParser = parser ?? new ClaudeTranscriptParser();
+	const parseFn = (line: string, num: number) => activeParser.parseLine(line, num);
+
+	const lines = splitTranscriptLines(content);
 
 	// Process only new lines since cursor
 	const newLines = lines.slice(startLine);

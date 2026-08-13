@@ -256,6 +256,66 @@ describe("scanCopilotChatSessions", () => {
 		const result = await scanCopilotChatSessions(projectDir);
 		expect(result.sessions).toHaveLength(2);
 	});
+
+	// ─── Staleness window override (windowMs) ──────────────────────────────────
+	it("windowMs: an explicit wider window admits 72h-old sessions from BOTH scans", async () => {
+		// One session per scan, each 72h old — outside the 48h default, inside the
+		// 7-day window the dashboard back-fill passes.
+		makeSessionStateEntry({ sid: "old-a", folderPath: projectDir, ageHours: 72 });
+		const ws = makeWorkspace("ws1", nativePathToFileUri(projectDir));
+		makeChatSessionsFile(ws, "old-b.jsonl", 72);
+		const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+		const { scanCopilotChatSessions } = await import("./CopilotChatSessionDiscoverer.js");
+
+		// Default (omitted) window: both are stale, as QueueWorker requires.
+		expect((await scanCopilotChatSessions(projectDir)).sessions).toEqual([]);
+
+		// Widened: Scan A and Scan B each compute their OWN cutoff, so asserting the
+		// full pair is what catches a regression where only one of the two sites
+		// reads windowMs — a half-widened scan returns exactly one id and no error,
+		// which every other assertion here would happily accept.
+		const widened = await scanCopilotChatSessions(projectDir, sevenDaysMs);
+		expect(widened.error).toBeUndefined();
+		expect(widened.sessions.map((s) => s.sessionId).sort()).toEqual(["old-a", "old-b"]);
+	});
+
+	// ─── The machine-wide entry point ──────────────────────────────────────────
+	it("scans EVERY workspace when no repo directs it, unlike the repo-scoped call", async () => {
+		// The two entry points share one loop and differ only in whether Scan B is
+		// directed at one folder. This is the undirected half, which the multi-repo
+		// back-fill uses: a workspace this repo does not own still has to come back,
+		// because some OTHER registered repo may claim it.
+		const mine = makeWorkspace("ws-mine", nativePathToFileUri(projectDir));
+		const theirs = makeWorkspace("ws-theirs", nativePathToFileUri(join(tmpRoot, "someone-else")));
+		makeChatSessionsFile(mine, "s-mine.jsonl", 1);
+		makeChatSessionsFile(theirs, "s-theirs.jsonl", 1);
+
+		const { scanCopilotChatSessions, scanCopilotChatSessionsOnDisk } = await import(
+			"./CopilotChatSessionDiscoverer.js"
+		);
+		const everything = await scanCopilotChatSessionsOnDisk();
+		const directed = await scanCopilotChatSessions(projectDir);
+
+		// The machine-wide half yields `DiskSession`s — each carrying the workspace folder
+		// that decides ownership — while the repo-scoped one has already narrowed to
+		// `SessionInfo`. That shape difference IS the split.
+		expect(everything.sessions.map((s) => s.session.sessionId).sort()).toEqual(["s-mine", "s-theirs"]);
+		expect(directed.sessions.map((s) => s.sessionId)).toEqual(["s-mine"]);
+	});
+
+	it("forwards a widened window to the machine-wide scan", async () => {
+		// The back-fill's 7-day horizon has to reach both halves; on the 48 h default this
+		// session is stale and must not come back.
+		const ws = makeWorkspace("ws-old", nativePathToFileUri(projectDir));
+		makeChatSessionsFile(ws, "s-old.jsonl", 72);
+
+		const { scanCopilotChatSessionsOnDisk } = await import("./CopilotChatSessionDiscoverer.js");
+
+		expect((await scanCopilotChatSessionsOnDisk()).sessions).toEqual([]);
+		expect(
+			(await scanCopilotChatSessionsOnDisk(7 * 24 * 3600 * 1000)).sessions.map((s) => s.session.sessionId),
+		).toEqual(["s-old"]);
+	});
 });
 
 describe("scanCopilotChatSessions error precedence", () => {
@@ -313,7 +373,8 @@ describe("scanCopilotChatSessions error precedence", () => {
 		);
 		writeFileSync(join(sessionDir, "events.jsonl"), JSON.stringify({ type: "session.start", data: {} }));
 
-		// Build a workspaceStorage entry so findVscodeWorkspaceHash matches; mock readdir to fail on chatSessions.
+		// Build a workspaceStorage entry so Scan B's workspace listing finds it and
+		// attributes it to projectDir; mock readdir to fail on chatSessions.
 		const ws = join(tmpRoot, "Library", "Application Support", "Code", "User", "workspaceStorage", "ws-b-error");
 		mkdirSync(join(ws, "chatSessions"), { recursive: true });
 		writeFileSync(join(ws, "workspace.json"), JSON.stringify({ folder: nativePathToFileUri(projectDir) }));

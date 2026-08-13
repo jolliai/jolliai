@@ -92,11 +92,23 @@ export async function saveSession(sessionInfo: SessionInfo, cwd?: string): Promi
 /**
  * Loads all active (non-stale) sessions from the registry.
  * Returns an empty array if no sessions exist.
+ *
+ * `windowMs` widens the read-side filter and defaults to {@link SESSION_STALE_MS},
+ * so every existing caller is unaffected. It exists for interface symmetry with the
+ * per-source discoverers, which the dashboard's back-fill calls with a 7-day window.
+ *
+ * **Widening it recovers almost nothing, and for Gemini nothing at all.** The prune
+ * here only filters what it returns, but `saveSession` writes back the pruned
+ * registry — a PHYSICAL delete — and every Claude or Gemini turn triggers one. So
+ * rows past the window are normally gone from the file before any reader could have
+ * asked for them. Claude has a second route (`ClaudeSessionDiscoverer` reads the
+ * transcripts themselves, which survive indefinitely); Gemini has none, so its
+ * history older than 48 h is unrecoverable until a Gemini disk scanner exists.
  */
-export async function loadAllSessions(cwd?: string): Promise<ReadonlyArray<SessionInfo>> {
+export async function loadAllSessions(cwd?: string, windowMs?: number): Promise<ReadonlyArray<SessionInfo>> {
 	const dir = getJolliMemoryDir(cwd);
 	const registry = await loadSessionsRegistry(dir);
-	const { activeSessions } = pruneStale(registry.sessions);
+	const { activeSessions } = pruneStale(registry.sessions, windowMs);
 	const sessions = Object.values(activeSessions);
 	return sessions;
 }
@@ -1253,10 +1265,19 @@ async function loadCursorsRegistry(dir: string, filename: string = CURSORS_FILE)
 }
 
 /**
- * Filters out sessions older than SESSION_STALE_MS.
+ * Filters out sessions older than `staleMs` (default {@link SESSION_STALE_MS}).
  * Returns the active sessions and the transcript paths of pruned sessions.
+ *
+ * The window is a parameter only for the read path ({@link loadAllSessions}). The
+ * WRITE callers — `saveSession` and `pruneStaleSessions` — deliberately keep the
+ * default, because what they do with the result is delete rows from disk: a caller
+ * that widened the window there would not be reading more, it would be changing how
+ * long the registry retains anything.
  */
-function pruneStale(sessions: Readonly<Record<string, SessionInfo>>): {
+function pruneStale(
+	sessions: Readonly<Record<string, SessionInfo>>,
+	staleMs: number = SESSION_STALE_MS,
+): {
 	activeSessions: Record<string, SessionInfo>;
 	stalePaths: string[];
 } {
@@ -1266,7 +1287,7 @@ function pruneStale(sessions: Readonly<Record<string, SessionInfo>>): {
 
 	for (const [id, session] of Object.entries(sessions)) {
 		const age = now - new Date(session.updatedAt).getTime();
-		if (age > SESSION_STALE_MS) {
+		if (age > staleMs) {
 			log.info("Pruning stale session %s (age: %dh)", id, Math.round(age / 3600000));
 			stalePaths.push(session.transcriptPath);
 		} else {

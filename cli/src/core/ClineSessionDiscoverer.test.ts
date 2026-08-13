@@ -73,6 +73,36 @@ describe("scanClineSessions", () => {
 		expect(r.sessions.map((s) => s.sessionId)).toEqual(["t2"]);
 	});
 
+	it("skips an out-of-range numeric timestamp without losing healthy tasks", async () => {
+		await writeHistory(sd, [
+			{ id: "bad", ts: 1e100, task: "bad date", cwdOnTaskInitialization: "/tmp/other" },
+			{ id: "ok", ts: Date.now(), task: "keeper", cwdOnTaskInitialization: project },
+		]);
+
+		const r = await scanClineSessions(project, [sd]);
+
+		expect(r.error).toBeUndefined();
+		expect(r.sessions.map((s) => s.sessionId)).toEqual(["ok"]);
+	});
+
+	// The dashboard's history back-fill widens the window explicitly; the sidebar,
+	// `jolli status` and the post-commit summary generation keep the 48h default by
+	// omitting the parameter.
+	it("admits a session outside the 48h default when an explicit wider window is passed", async () => {
+		const sevenDays = 7 * 24 * 60 * 60 * 1000;
+		const threeDaysAgo = Date.now() - 72 * 60 * 60 * 1000;
+		await writeHistory(sd, [{ id: "tOld", ts: threeDaysAgo, task: "backfill", cwdOnTaskInitialization: project }]);
+
+		// The default 48h window excludes it…
+		expect((await scanClineSessions(project, [sd])).sessions).toEqual([]);
+		// …a 7-day window admits it, and the QueueWorker wrapper forwards the value.
+		const wide = await scanClineSessions(project, [sd], sevenDays);
+		expect(wide.sessions.map((s) => s.sessionId)).toEqual(["tOld"]);
+		detector.dirs = [sd];
+		const viaWrapper = await discoverClineSessions(project, sevenDays);
+		expect(viaWrapper.map((s) => s.sessionId)).toEqual(["tOld"]);
+	});
+
 	// Valid JSON that is not an array — Cline rewrites taskHistory.json wholesale,
 	// so a half-migrated or hand-edited file can legitimately hold an object.
 	// Treat it as "no history" rather than letting `for…of` throw.

@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
+import { type DiskSession, sessionsForRepo } from "./DiskSessionScan.js";
 import { normalizePathForCompare } from "./PathUtils.js";
 
 const log = createLogger("CursorCliDiscoverer");
@@ -100,11 +101,65 @@ async function resolveTranscriptPath(
 	return undefined;
 }
 
+/**
+ * Scans ~/.cursor/chats for cursor-agent sessions attributed to `projectDir`.
+ *
+ * @param windowMs Optional staleness window, in milliseconds. Defaults to
+ * `SESSION_STALE_MS` (48h), the window shared by every discovery-based source.
+ * The dashboard's history back-fill passes a wider one (7 days) so it can reach
+ * further into the past. Callers that must NOT widen simply omit it: the VS Code
+ * / IntelliJ "Active Conversations" sidebar, `jolli status`, and above all the
+ * post-commit summary generation in `hooks/QueueWorker.ts`, which uses this
+ * session set to decide which conversations belong to the commit being
+ * summarised. Widening it there folds week-old unrelated conversations into that
+ * commit's stored memory, which is written to the git orphan branch and is
+ * persistent — and it fails invisibly, with no error, just wrong content.
+ */
 export async function scanCursorCliSessions(
 	projectDir: string,
 	chatsDir: string = getCursorCliChatsDir(),
 	projectsDir: string = getCursorCliProjectsDir(),
+	windowMs?: number,
 ): Promise<CursorCliScanResult> {
+	const { sessions, error } = await scanCursorCliSessionsOnDisk(chatsDir, projectsDir, windowMs);
+	const mine = cursorCliSessionsForRepo(sessions, projectDir);
+	return error ? { sessions: mine, error } : { sessions: mine };
+}
+
+/** A machine-wide cursor-agent scan: every in-window session, plus a genuine failure. */
+export interface CursorCliDiskScanResult {
+	readonly sessions: ReadonlyArray<DiskSession>;
+	readonly error?: CursorCliScanError;
+}
+
+/**
+ * Scans `~/.cursor/chats` once and returns every in-window cursor-agent session, each
+ * carrying the `cwd` its `meta.json` recorded.
+ *
+ * MACHINE-WIDE and repo-agnostic on purpose. The `chats/<md5(cwd)>/` buckets cannot
+ * be derived from a repo path (the hash input is not part of cursor-agent's
+ * contract), so every bucket has to be opened and every `meta.json` parsed — once per
+ * registered repo, under the old repo-scoped shape. Callers scan once and narrow with
+ * {@link cursorCliSessionsForRepo}.
+ *
+ * ## One cost moved rather than removed
+ *
+ * The repo-scoped version resolved a session's transcript path only AFTER the cwd
+ * matched, so a machine-wide scan does that lookup for sessions no repo will claim.
+ * It is bounded — `resolveTranscriptPath` tries the remembered bucket first, and
+ * every session under one `chats/<hash>` shares a cwd and therefore a bucket, so the
+ * lookup stays O(1) after the first hit in each bucket — and it is paid ONCE for the
+ * run instead of once per repo. With two or more registered repos this is strictly
+ * cheaper; with exactly one it does more `stat` calls than before. That trade is
+ * deliberate: the back-fill is the multi-repo caller, and the single-repo path
+ * (`discoverCursorCliSessions`, the post-commit hook) still goes through the wrapper
+ * above, which scans and narrows in one call just as it always did.
+ */
+export async function scanCursorCliSessionsOnDisk(
+	chatsDir: string = getCursorCliChatsDir(),
+	projectsDir: string = getCursorCliProjectsDir(),
+	windowMs?: number,
+): Promise<CursorCliDiskScanResult> {
 	let hashes: string[];
 	try {
 		hashes = await readdir(chatsDir);
@@ -114,9 +169,9 @@ export async function scanCursorCliSessions(
 		return { sessions: [], error: { kind: "fs", message: (error as Error).message } };
 	}
 
-	const cutoffMs = Date.now() - SESSION_STALE_MS;
-	const target = normalizePathForCompare(projectDir);
-	const sessions: SessionInfo[] = [];
+	const staleMs = windowMs ?? SESSION_STALE_MS;
+	const cutoffMs = Date.now() - staleMs;
+	const sessions: DiskSession[] = [];
 
 	// Read the projects/ listing once — resolveTranscriptPath reuses it for every
 	// matching session. A MISSING projects/ dir (ENOENT) is benign: chats can exist
@@ -137,8 +192,9 @@ export async function scanCursorCliSessions(
 		}
 		projectBuckets = [];
 	}
-	// The target repo's sessions all share one bucket; remember it once resolved and
-	// try it first for the rest (see resolveTranscriptPath).
+	// Every session under one chats/<hash> shares a cwd and therefore one projects/
+	// bucket, so remembering the last resolved bucket keeps the lookup O(1) within a
+	// hash. Carried across hashes too — a miss just falls through to the full sweep.
 	let preferredBucket: string | undefined;
 
 	for (const hash of hashes) {
@@ -156,7 +212,9 @@ export async function scanCursorCliSessions(
 				log.debug("Skipping %s: meta.json read/parse failed (%s)", uuid, (error as Error).message);
 				continue;
 			}
-			if (typeof meta.cwd !== "string" || normalizePathForCompare(meta.cwd) !== target) continue;
+			// The cwd is CARRIED, not matched — `cursorCliSessionsForRepo` does that. A
+			// session without one can never be attributed, so it is still dropped here.
+			if (typeof meta.cwd !== "string") continue;
 			const updatedAtMs = meta.updatedAtMs ?? meta.createdAtMs;
 			if (typeof updatedAtMs !== "number" || !Number.isFinite(updatedAtMs)) {
 				log.warn("Skipping Cursor CLI session %s: non-finite updatedAtMs", uuid);
@@ -171,20 +229,51 @@ export async function scanCursorCliSessions(
 			preferredBucket = resolved.bucket;
 			const title = meta.title?.trim();
 			sessions.push({
-				sessionId: uuid,
-				transcriptPath: resolved.path,
-				updatedAt: new Date(updatedAtMs).toISOString(),
-				source: "cursor-cli",
-				...(title ? { title } : {}),
+				session: {
+					sessionId: uuid,
+					transcriptPath: resolved.path,
+					updatedAt: new Date(updatedAtMs).toISOString(),
+					source: "cursor-cli",
+					...(title ? { title } : {}),
+				},
+				dirs: [meta.cwd],
 			});
 		}
 	}
 	return { sessions };
 }
 
-/** QueueWorker wrapper — strips the error channel. */
-export async function discoverCursorCliSessions(projectDir: string): Promise<ReadonlyArray<SessionInfo>> {
-	const { sessions, error } = await scanCursorCliSessions(projectDir);
+/**
+ * Narrows a machine-wide cursor-agent scan to one repo.
+ *
+ * Attribution is EXACT equality on `meta.cwd`, verbatim from when it ran inside the
+ * scan — mirroring Devin/OpenCode/Cline CLI's spelling but NOT the prefix/containment
+ * rule: a session started from a repo *subdirectory* is not attributed to the root.
+ * That is the known, intentional hookless limitation — see the "subdirectory"
+ * contract test.
+ */
+export function cursorCliSessionsForRepo(
+	scanned: ReadonlyArray<DiskSession>,
+	projectDir: string,
+): ReadonlyArray<SessionInfo> {
+	const target = normalizePathForCompare(projectDir);
+	return sessionsForRepo(scanned, (dir) => normalizePathForCompare(dir) === target);
+}
+
+/**
+ * QueueWorker wrapper — strips the error channel.
+ *
+ * `windowMs` is forwarded verbatim. QueueWorker itself must keep omitting it —
+ * see `scanCursorCliSessions` for why widening the post-commit window corrupts
+ * stored memory.
+ */
+export async function discoverCursorCliSessions(
+	projectDir: string,
+	windowMs?: number,
+): Promise<ReadonlyArray<SessionInfo>> {
+	// The two `undefined`s keep the ~/.cursor chats/projects defaults; only the
+	// trailing staleness window is being overridden here.
+	const { sessions, error } = await scanCursorCliSessions(projectDir, undefined, undefined, windowMs);
 	if (error) log.warn("Cursor CLI scan error (%s): %s", error.kind, error.message);
 	return sessions;
 }

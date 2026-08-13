@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
 	CODEX_CAT_SKILL,
 	CODEX_COMPOUND_SKILL,
+	CODEX_EXEC_TOOL_COMPOUND_SKILL,
+	CODEX_EXEC_TOOL_SKILL,
 	CODEX_GLOB_LOOP_OVER_SKILLS,
 	CODEX_RG_SEARCH_FOR_SKILLS,
 	CODEX_SED_SKILL,
@@ -162,11 +164,45 @@ describe("scanCodexSkillLines", () => {
 		expect(uses[0].invocations[0].at).toBe(T1);
 	});
 
-	it("accepts the custom_tool_call shape as well as function_call", () => {
-		// Codex emits both for shell work. Matching only `function_call` would silently
-		// halve the signal for whichever sessions used the other form.
-		const inner = CODEX_CAT_SKILL.replace('"type":"function_call"', '"type":"custom_tool_call"');
-		expect(scanCodexSkillLines([codexRecord(inner, T1)], 0).uses).toHaveLength(1);
+	it("reads a real custom_tool_call, whose command lives in `input` and not `arguments`", () => {
+		// The majority form — 619 of 729 shell calls across 41 real session files — and
+		// the one this scanner could not see for a year. The predecessor of this test
+		// built its record by string-replacing the TYPE of a `function_call` fixture and
+		// left `arguments` in place, so it passed while every real `custom_tool_call`
+		// was dropped at the field read: 2 of 17 (session, skill) pairs survived on one
+		// machine's 7-day window. The fixture is a capture now, which is what makes the
+		// assertion mean anything.
+		const { uses } = scanCodexSkillLines([codexRecord(CODEX_EXEC_TOOL_SKILL, T1)], 0);
+		expect(uses).toHaveLength(1);
+		expect(uses[0].skill).toBe("comprehensive-review-full-review");
+		expect(uses[0].detection).toBe("heuristic");
+	});
+
+	it("reads the custom_tool_call form when the command chains other work after the read", () => {
+		// How it usually arrives: the capture chained the read with printf, pwd and git
+		// status in one `cmd`. The path is no longer at the end of the string, so this
+		// exercises the regex against trailing shell text rather than a clean terminator.
+		const { uses } = scanCodexSkillLines([codexRecord(CODEX_EXEC_TOOL_COMPOUND_SKILL, T1)], 0);
+		expect(uses.map((u) => u.skill)).toEqual(["comprehensive-review-full-review"]);
+	});
+
+	it("folds both record shapes into one entry for the same skill", () => {
+		// A session mixes the two forms freely. Keying on the skill name rather than on
+		// the record shape is what stops one skill being reported as two.
+		const { uses } = scanCodexSkillLines(
+			[codexRecord(CODEX_SED_SKILL, T2), codexRecord(CODEX_EXEC_TOOL_SKILL, T1)],
+			0,
+		);
+		expect(uses).toHaveLength(1);
+		expect(uses[0].invocations[0].at).toBe(T1);
+	});
+
+	it("ignores a custom_tool_call whose `input` is not a string", () => {
+		// Same rule as the `arguments` case below: the path only counts when it is in the
+		// text the model ran. A structured object still carries the needle into the raw
+		// line, so the pre-filter admits it and the type check is what rejects it.
+		const inner = '{"type":"custom_tool_call","name":"exec","input":{"cmd":"cat /x/skills/git-commit/SKILL.md"}}';
+		expect(scanCodexSkillLines([codexRecord(inner, T1)], 0).uses).toEqual([]);
 	});
 
 	it("ignores a non-call record even when it quotes a skill path", () => {

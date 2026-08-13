@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
+import { type DiskSession, sessionsForRepo } from "./DiskSessionScan.js";
 import { sessionDirBelongsToRepo } from "./SessionDirMatch.js";
 import {
 	classifyScanError as classifySqliteScanError,
@@ -130,14 +131,48 @@ export interface OpenCodeScanResult {
  * sessions (within 48h) matching the given project directory.
  *
  * @param projectDir - The git repository root to filter sessions by
+ * @param windowMs - Optional staleness window in milliseconds. Defaults to
+ *   {@link SESSION_STALE_MS} (48 h). The dashboard's history back-fill passes a wider
+ *   window (7 d) to recover conversations the database never recorded. Callers that
+ *   must NOT widen it omit the argument entirely: the "Active Conversations" sidebar,
+ *   `jolli status`, and — the one that matters — the post-commit summary in
+ *   `QueueWorker`, which uses this window to decide which conversations belong to the
+ *   commit being summarised. That summary is written to the git orphan branch and
+ *   kept, so a wider window there quietly attaches week-old unrelated conversations
+ *   to a commit's stored memory with no error anywhere.
  * @returns { sessions, error? } — sessions is always an array; if `error` is
  *   present and its kind is not "missing", callers should surface it to the user
  *   rather than silently reporting "0 sessions" (which is indistinguishable
  *   from a genuinely-empty scan).
  */
-export async function scanOpenCodeSessions(projectDir: string): Promise<OpenCodeScanResult> {
+export async function scanOpenCodeSessions(projectDir: string, windowMs?: number): Promise<OpenCodeScanResult> {
+	const { sessions, error } = await scanOpenCodeSessionsOnDisk(windowMs);
+	const mine = openCodeSessionsForRepo(sessions, projectDir);
+	return error ? { sessions: mine, error } : { sessions: mine };
+}
+
+/** A machine-wide OpenCode scan: every in-window session, plus a genuine failure. */
+export interface OpenCodeDiskScanResult {
+	readonly sessions: ReadonlyArray<DiskSession>;
+	readonly error?: OpenCodeScanError;
+}
+
+/**
+ * Scans OpenCode's global database once and returns every session inside the window,
+ * each carrying the `directory` its row recorded.
+ *
+ * MACHINE-WIDE and repo-agnostic on purpose. `~/.local/share/opencode/opencode.db` is
+ * ONE database holding every project's sessions, so a repo-scoped scan opens the same
+ * file, runs the same query and re-parses the same rows once per registered repo.
+ * Callers scan once and narrow with {@link openCodeSessionsForRepo}.
+ *
+ * The time cutoff stays in SQL — it is the filter that keeps the row set small, and
+ * it is repo-independent, so hoisting the scan does not weaken it.
+ */
+export async function scanOpenCodeSessionsOnDisk(windowMs?: number): Promise<OpenCodeDiskScanResult> {
 	const dbPath = getOpenCodeDbPath();
-	const cutoffMs = Date.now() - SESSION_STALE_MS;
+	const staleMs = windowMs ?? SESSION_STALE_MS;
+	const cutoffMs = Date.now() - staleMs;
 
 	// Pre-flight: distinguish "DB missing" (silent) from "DB exists but unreadable"
 	// (genuine failure) before calling DatabaseSync, which surfaces both as the same
@@ -167,13 +202,14 @@ export async function scanOpenCodeSessions(projectDir: string): Promise<OpenCode
 			// Auto-compact creates child sessions (parent_id != NULL) that carry on the conversation,
 			// so filtering to parent_id IS NULL would miss active sessions after compaction.
 			//
-			// The directory match runs in JS via `sessionDirBelongsToRepo` (shared with
-			// Devin/Copilot): prefix/containment with separator + case folding (handling
-			// the "E:\\proj" vs "e:\\proj" Windows drive-letter drift and case-sensitive
-			// Linux) plus the nested-repo exclusion. It replaced the SQL `directory =
-			// :projectDir` (and the win32/darwin LOWER() variant), which silently dropped
-			// every session run from a subdirectory of the repo (JOLLI-2015). Rows are
-			// still narrowed by the time cutoff in SQL; the directory filter is JS-side.
+			// The directory is CARRIED, not matched. `openCodeSessionsForRepo` does the
+			// matching through `sessionDirBelongsToRepo` (shared with Devin/Copilot):
+			// prefix/containment with separator + case folding (handling the "E:\\proj" vs
+			// "e:\\proj" Windows drive-letter drift and case-sensitive Linux) plus the
+			// nested-repo exclusion. That replaced the SQL `directory = :projectDir` (and
+			// the win32/darwin LOWER() variant), which silently dropped every session run
+			// from a subdirectory of the repo (JOLLI-2015). Rows are still narrowed by the
+			// time cutoff in SQL, which is repo-independent and so stays here.
 			const rows = db
 				.prepare(
 					// No ORDER BY: every row passing the SQL cutoff and the JS directory filter is
@@ -190,10 +226,7 @@ export async function scanOpenCodeSessions(projectDir: string): Promise<OpenCode
 				directory: string;
 			}>;
 
-			return rows.flatMap((row): SessionInfo[] => {
-				if (!sessionDirBelongsToRepo(row.directory, projectDir)) {
-					return [];
-				}
+			return rows.flatMap((row): DiskSession[] => {
 				// Guard against schema drift: SQL's `time_updated > :cutoff` already
 				// filters NULL, but a non-numeric value would make new Date().toISOString()
 				// throw RangeError and bubble up as a spurious "unknown" scan error.
@@ -203,18 +236,21 @@ export async function scanOpenCodeSessions(projectDir: string): Promise<OpenCode
 				}
 				return [
 					{
-						sessionId: String(row.id),
-						// Synthetic path: DB path + session discriminator for unique cursor keying
-						transcriptPath: `${dbPath}#${row.id}`,
-						updatedAt: new Date(row.time_updated).toISOString(),
-						source: "opencode",
-						title: typeof row.title === "string" && row.title.trim().length > 0 ? row.title : undefined,
+						session: {
+							sessionId: String(row.id),
+							// Synthetic path: DB path + session discriminator for unique cursor keying
+							transcriptPath: `${dbPath}#${row.id}`,
+							updatedAt: new Date(row.time_updated).toISOString(),
+							source: "opencode",
+							title: typeof row.title === "string" && row.title.trim().length > 0 ? row.title : undefined,
+						},
+						dirs: [row.directory],
 					},
 				];
 			});
 		});
 
-		log.debug("Discovered %d OpenCode session(s) for %s", sessions.length, projectDir);
+		log.debug("OpenCode disk scan: %d session(s) inside the window", sessions.length);
 		return { sessions };
 	} catch (error: unknown) {
 		const scanError = classifyScanError(error);
@@ -234,11 +270,35 @@ export async function scanOpenCodeSessions(projectDir: string): Promise<OpenCode
 }
 
 /**
+ * Narrows a machine-wide OpenCode scan to one repo.
+ *
+ * Attribution is `sessionDirBelongsToRepo`, verbatim from when it ran inside the
+ * scan's `flatMap`: prefix/containment with separator and case folding plus the
+ * nested-repo exclusion, so a session run from a SUBDIRECTORY still counts
+ * (JOLLI-2015). The helper's own null guard is what keeps a row whose `directory`
+ * column is NULL from throwing here — such a session simply matches no repo.
+ */
+export function openCodeSessionsForRepo(
+	scanned: ReadonlyArray<DiskSession>,
+	projectDir: string,
+): ReadonlyArray<SessionInfo> {
+	const mine = sessionsForRepo(scanned, (dir) => sessionDirBelongsToRepo(dir, projectDir));
+	log.debug("Discovered %d OpenCode session(s) for %s", mine.length, projectDir);
+	return mine;
+}
+
+/**
  * Backwards-compatible wrapper around `scanOpenCodeSessions` that only returns
  * the session array. Callers that need to surface scan failures to the user
  * should call `scanOpenCodeSessions` directly.
+ *
+ * @param windowMs - Forwarded to {@link scanOpenCodeSessions}; see that function for why
+ *   the post-commit caller leaves it unset.
  */
-export async function discoverOpenCodeSessions(projectDir: string): Promise<ReadonlyArray<SessionInfo>> {
-	const { sessions } = await scanOpenCodeSessions(projectDir);
+export async function discoverOpenCodeSessions(
+	projectDir: string,
+	windowMs?: number,
+): Promise<ReadonlyArray<SessionInfo>> {
+	const { sessions } = await scanOpenCodeSessions(projectDir, windowMs);
 	return sessions;
 }

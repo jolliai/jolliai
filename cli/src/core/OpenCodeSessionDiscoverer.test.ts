@@ -322,6 +322,20 @@ describe("OpenCodeSessionDiscoverer", () => {
 			expect(sessions[0].sessionId).toBe("fresh");
 		});
 
+		// The dashboard's history back-fill passes a wider window than the 48h default.
+		// Same fixture, two calls: the default rejects the row, the explicit window admits
+		// it — which is the whole point of the parameter being opt-in.
+		it("admits a session outside the 48h window when an explicit wider window is passed", async () => {
+			const old = Date.now() - 72 * 60 * 60 * 1000;
+			const dbDir = join(fakeHome, ".local", "share", "opencode");
+			await createOpenCodeDb(dbDir, [{ id: "old", directory: projectDir, time_created: old, time_updated: old }]);
+
+			expect(await discoverOpenCodeSessions(projectDir)).toHaveLength(0);
+
+			const widened = await discoverOpenCodeSessions(projectDir, 7 * 24 * 60 * 60 * 1000);
+			expect(widened.map((s) => s.sessionId)).toEqual(["old"]);
+		});
+
 		it("includes child sessions from auto-compaction (non-null parent_id)", async () => {
 			const now = Date.now();
 			const dbDir = join(fakeHome, ".local", "share", "opencode");

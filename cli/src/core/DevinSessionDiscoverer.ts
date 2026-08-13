@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
+import { type DiskSession, sessionsForRepo } from "./DiskSessionScan.js";
 import { sessionDirBelongsToRepo } from "./SessionDirMatch.js";
 import { classifyScanError, hasNodeSqliteSupport, type SqliteScanError, withSqliteDb } from "./SqliteHelpers.js";
 
@@ -50,28 +51,23 @@ function parseWorkspaceDirs(raw: string | null): string[] {
 }
 
 /**
- * A Devin session belongs to `repoRoot` when its primary `working_directory` OR
- * any of its additional `workspace_dirs` is inside the repo worktree. Sessions
- * started from an attached workspace/worktree surface only through
- * `workspace_dirs`, so matching on `working_directory` alone silently drops them.
+ * Every directory a Devin session recorded: its primary `working_directory` first,
+ * then each of its additional `workspace_dirs`.
  *
- * Matching is prefix/containment via {@link sessionDirBelongsToRepo}, shared with
- * the other hookless directory-scoped sources (OpenCode, Copilot): a session
- * started from a *subdirectory* of the repo — common in a monorepo, e.g.
- * `cd packages/foo && devin …` — IS attributed to the repo (JOLLI-2015).
- * Sessions living in a nested git repo / submodule inside the worktree are
- * excluded so they aren't double-captured by both repos — the helper's docstring
- * has the full rationale.
+ * Both halves matter. A session started from an attached workspace/worktree surfaces
+ * ONLY through `workspace_dirs`, so a caller that looked at `working_directory` alone
+ * would silently drop it. Collecting them into one list is what lets the ordinary
+ * "does any recorded directory belong to this repo" rule cover both — see
+ * {@link devinSessionsForRepo} for the match itself.
+ *
+ * A null `working_directory` contributes nothing rather than a null entry: the
+ * column is nullable (a session started outside any project), and every consumer
+ * downstream expects real strings.
  */
-function sessionMatchesDir(
-	workingDirectory: string | null,
-	workspaceDirsRaw: string | null,
-	repoRoot: string,
-): boolean {
-	if (typeof workingDirectory === "string" && sessionDirBelongsToRepo(workingDirectory, repoRoot)) {
-		return true;
-	}
-	return parseWorkspaceDirs(workspaceDirsRaw).some((dir) => sessionDirBelongsToRepo(dir, repoRoot));
+function sessionDirs(workingDirectory: string | null, workspaceDirsRaw: string | null): string[] {
+	const dirs = typeof workingDirectory === "string" ? [workingDirectory] : [];
+	dirs.push(...parseWorkspaceDirs(workspaceDirsRaw));
+	return dirs;
 }
 
 function getDevinCliDir(home?: string): string {
@@ -161,16 +157,65 @@ export interface DevinScanResult {
 	readonly error?: SqliteScanError;
 }
 
-/** Discover Devin sessions for the given project directory (production entrypoint). */
-export async function scanDevinSessions(projectDir: string): Promise<DevinScanResult> {
-	return scanDevinSessionsAt(getDevinSessionsDbPath(), projectDir);
+/**
+ * Discover Devin sessions for the given project directory (production entrypoint).
+ *
+ * @param windowMs Optional session-staleness window in milliseconds, defaulting to
+ * the 48-hour {@link SESSION_STALE_MS}. Only the dashboard's history back-fill passes
+ * a wider one (7 days); every caller that must NOT widen simply omits it — the
+ * "Active Conversations" sidebar, `jolli status`, and above all the post-commit
+ * summary generation in `hooks/QueueWorker.ts`, which uses this window to decide
+ * which conversations belong to the commit being summarised. A wider window there
+ * would pull unrelated week-old conversations into that commit's stored memory,
+ * which is persisted to the git orphan branch and fails silently — no error, just
+ * wrong content.
+ */
+export async function scanDevinSessions(projectDir: string, windowMs?: number): Promise<DevinScanResult> {
+	return scanDevinSessionsAt(getDevinSessionsDbPath(), projectDir, windowMs);
 }
 
 /**
  * Discover Devin sessions from an explicit DB path. Split out so tests can point
  * at a fixture DB; production callers use `scanDevinSessions`.
+ *
+ * @param windowMs Optional staleness window in milliseconds; see
+ * {@link scanDevinSessions} for the default and for who may widen it.
  */
-export async function scanDevinSessionsAt(dbPath: string, projectDir: string): Promise<DevinScanResult> {
+export async function scanDevinSessionsAt(
+	dbPath: string,
+	projectDir: string,
+	windowMs?: number,
+): Promise<DevinScanResult> {
+	const { sessions, error } = await scanDevinSessionsOnDiskAt(dbPath, windowMs);
+	const mine = devinSessionsForRepo(sessions, projectDir);
+	return error ? { sessions: mine, error } : { sessions: mine };
+}
+
+/** A machine-wide Devin scan: every in-window session, plus a genuine failure. */
+export interface DevinDiskScanResult {
+	readonly sessions: ReadonlyArray<DiskSession>;
+	readonly error?: SqliteScanError;
+}
+
+/**
+ * Scans Devin's global session database once and returns every in-window session,
+ * each carrying the directories its row recorded.
+ *
+ * MACHINE-WIDE and repo-agnostic on purpose. `sessions.db` is ONE database for every
+ * project — the `working_directory` column is what scopes a row, not the file's
+ * location — so a repo-scoped scan opens it, queries it and re-parses every
+ * `workspace_dirs` JSON blob once per registered repo. Callers scan once and narrow
+ * with {@link devinSessionsForRepo}.
+ */
+export async function scanDevinSessionsOnDisk(windowMs?: number): Promise<DevinDiskScanResult> {
+	return scanDevinSessionsOnDiskAt(getDevinSessionsDbPath(), windowMs);
+}
+
+/**
+ * {@link scanDevinSessionsOnDisk} against an explicit DB path, so tests can point at
+ * a fixture database.
+ */
+export async function scanDevinSessionsOnDiskAt(dbPath: string, windowMs?: number): Promise<DevinDiskScanResult> {
 	// A runtime below the Node floor cannot load `node:sqlite`. Return a silent
 	// empty result — "not supported" is not a scan failure, so callers must not
 	// surface a partial-data / failed-source indicator.
@@ -179,7 +224,8 @@ export async function scanDevinSessionsAt(dbPath: string, projectDir: string): P
 		return { sessions: [] };
 	}
 
-	const cutoffMs = Date.now() - SESSION_STALE_MS;
+	const staleMs = windowMs ?? SESSION_STALE_MS;
+	const cutoffMs = Date.now() - staleMs;
 
 	// Pre-flight: "DB missing" (silent) vs "DB unreadable" (genuine failure).
 	try {
@@ -205,11 +251,11 @@ export async function scanDevinSessionsAt(dbPath: string, projectDir: string): P
 			// last_activity_at is epoch SECONDS → compare against cutoff in seconds.
 			const cutoffSec = Math.floor(cutoffMs / 1000);
 
-			// The directory match runs in JS (not SQL) via `sessionDirBelongsToRepo`,
-			// which does prefix/containment matching with separator/case folding plus
-			// the nested-repo exclusion. The old exact `working_directory = :projectDir`
-			// both missed subdirectory sessions and mishandled trailing-slash / backslash
-			// paths.
+			// The directories are CARRIED, not matched — `devinSessionsForRepo` does that
+			// via `sessionDirBelongsToRepo`, which does prefix/containment matching with
+			// separator/case folding plus the nested-repo exclusion. The old exact
+			// `working_directory = :projectDir` both missed subdirectory sessions and
+			// mishandled trailing-slash / backslash paths.
 			const rows = db
 				.prepare(
 					// No ORDER BY: every row passing the SQL filters and the JS directory match is
@@ -227,27 +273,27 @@ export async function scanDevinSessionsAt(dbPath: string, projectDir: string): P
 				workspace_dirs: string | null;
 			}>;
 
-			return rows.flatMap((row): SessionInfo[] => {
-				if (!sessionMatchesDir(row.working_directory, row.workspace_dirs, projectDir)) {
-					return [];
-				}
+			return rows.flatMap((row): DiskSession[] => {
 				if (!Number.isFinite(row.last_activity_at)) {
 					log.warn("Skipping Devin session %s: non-finite last_activity_at", row.id);
 					return [];
 				}
 				return [
 					{
-						sessionId: String(row.id),
-						transcriptPath: `${dbPath}#${row.id}`,
-						updatedAt: new Date(row.last_activity_at * 1000).toISOString(),
-						source: "devin",
-						title: typeof row.title === "string" && row.title.trim().length > 0 ? row.title : undefined,
+						session: {
+							sessionId: String(row.id),
+							transcriptPath: `${dbPath}#${row.id}`,
+							updatedAt: new Date(row.last_activity_at * 1000).toISOString(),
+							source: "devin",
+							title: typeof row.title === "string" && row.title.trim().length > 0 ? row.title : undefined,
+						},
+						dirs: sessionDirs(row.working_directory, row.workspace_dirs),
 					},
 				];
 			});
 		});
 
-		log.debug("Discovered %d Devin session(s) for %s", sessions.length, projectDir);
+		log.debug("Devin disk scan: %d session(s) inside the window", sessions.length);
 		return { sessions };
 	} catch (error: unknown) {
 		const scanError = classifyScanError(error);
@@ -262,8 +308,40 @@ export async function scanDevinSessionsAt(dbPath: string, projectDir: string): P
 	}
 }
 
-/** Backwards-compatible wrapper returning only the session array. */
-export async function discoverDevinSessions(projectDir: string): Promise<ReadonlyArray<SessionInfo>> {
-	const { sessions } = await scanDevinSessions(projectDir);
+/**
+ * Narrows a machine-wide Devin scan to one repo.
+ *
+ * A session belongs to `projectDir` when its primary `working_directory` OR any of
+ * its attached `workspace_dirs` is inside the worktree — the same disjunction that
+ * ran inside the scan, now expressed as "any recorded directory matches" because
+ * {@link sessionDirs} collected both into one list.
+ *
+ * Matching is prefix/containment via {@link sessionDirBelongsToRepo}, shared with the
+ * other hookless directory-scoped sources (OpenCode, Copilot): a session started from
+ * a *subdirectory* of the repo — common in a monorepo, e.g. `cd packages/foo && devin
+ * …` — IS attributed to the repo (JOLLI-2015). Sessions living in a nested git repo /
+ * submodule inside the worktree are excluded so they aren't double-captured by both
+ * repos; the helper's docstring has the full rationale.
+ */
+export function devinSessionsForRepo(
+	scanned: ReadonlyArray<DiskSession>,
+	projectDir: string,
+): ReadonlyArray<SessionInfo> {
+	const mine = sessionsForRepo(scanned, (dir) => sessionDirBelongsToRepo(dir, projectDir));
+	log.debug("Discovered %d Devin session(s) for %s", mine.length, projectDir);
+	return mine;
+}
+
+/**
+ * Backwards-compatible wrapper returning only the session array.
+ *
+ * @param windowMs Optional staleness window in milliseconds, forwarded verbatim; see
+ * {@link scanDevinSessions} for the default and for who may widen it.
+ */
+export async function discoverDevinSessions(
+	projectDir: string,
+	windowMs?: number,
+): Promise<ReadonlyArray<SessionInfo>> {
+	const { sessions } = await scanDevinSessions(projectDir, windowMs);
 	return sessions;
 }

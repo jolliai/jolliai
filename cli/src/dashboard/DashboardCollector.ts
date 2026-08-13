@@ -23,7 +23,11 @@ import { loadConfig } from "../core/SessionTracker.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { getIndex, getSummary, readTranscriptsForCommits } from "../core/SummaryStore.js";
 import { collectDisplayTopics, getTranscriptIds } from "../core/SummaryTree.js";
+import type { SessionContent } from "../core/sessions/SessionSignalExtractor.js";
+import { extractSessionSignals } from "../core/sessions/SessionSignals.js";
+import { SESSION_SOURCES } from "../core/sessions/SessionSources.js";
 import { isMissingTranscriptError, readTranscript } from "../core/TranscriptReader.js";
+import { readTranscriptForSource, readTranscriptLinesForSource } from "../core/TranscriptSourceReader.js";
 import { readGraph } from "../graph/GraphArtifactStore.js";
 import type { KnowledgeGraph } from "../graph/GraphSchema.js";
 import { createLogger, errMsg } from "../Logger.js";
@@ -33,8 +37,10 @@ import type {
 	SessionInfo,
 	SkillCommitRef,
 	ToolCallCount,
+	TranscriptReadResult,
 	TranscriptSource,
 } from "../Types.js";
+import { mapWithConcurrency, withIoBudget } from "../util/Concurrency.js";
 import type {
 	CommitCreatedEvent,
 	CommitFileChange,
@@ -90,37 +96,114 @@ function toStatsModelUsage(models: ReadonlyArray<ModelTokenUsage>): StatsModelUs
  * discoverers themselves are shape-neutral, it is only the aggregator above
  * them that applies sidebar policy.
  */
-export type SessionLoader = (cwd: string) => Promise<ReadonlyArray<SessionInfo>>;
+/**
+ * Machine-wide scans a caller has already run, keyed by source.
+ *
+ * A key's PRESENCE means "already scanned": {@link loadAllSessions} skips that
+ * source's per-repo loader, and {@link collectSessionEvents} narrows these records to
+ * the repo instead. Absent means "load it here", which is what every caller outside
+ * the back-fill wants.
+ *
+ * ## Why presence, and not a separate "did I scan this" flag
+ *
+ * The two facts — *was it pre-scanned* and *what did the scan find* — must never
+ * disagree, and this shape is what makes disagreeing impossible. They used to be two
+ * fields (`codexDisk` plus a `{ codex: boolean }`), kept in step by hand at the call
+ * site; getting that wrong in either direction is silent. Say the source is scanned
+ * twice and every one of its sessions is discovered twice, or say it is skipped by the
+ * fan-out with nothing supplied in its place and the source vanishes from the run
+ * entirely — with no error either way, because "this source found nothing" and "this
+ * source was never asked" produce the identical empty result.
+ *
+ * The distinction that DOES survive is empty-versus-absent. An empty array is the
+ * positive claim "the scan ran and found nothing", so the fan-out still skips that
+ * source. `undefined` means no scan happened and the per-repo loader runs. A caller
+ * whose scan FAILED must therefore pass `undefined`, never `[]` — see the failure
+ * handling in `dbBackfillRepos`.
+ *
+ * ## Claude is the one source that is added to, not substituted for
+ *
+ * Every other key replaces its loader. Claude's does not, because the `sessions.json`
+ * half of the fan-out carries Claude too (as this scan's fallback) and Gemini (which
+ * has no other route at all). So the registry loader always runs and the pre-scanned
+ * Claude sessions are concatenated onto it; the dedupe below merges the two views of
+ * one session.
+ *
+ * ## Keyed by source TAG, and payload-typed as `unknown`
+ *
+ * This used to be twelve named fields, which cost two things worth naming. It was
+ * a thirteenth list to keep in step with {@link SESSION_SOURCES} — and the one no
+ * compiler could check, since a missing field simply meant that source was never
+ * pre-scanned. And its field names were camel-cased (`copilotChat`, `cursorCli`)
+ * while the tags they stood for are hyphenated (`copilot-chat`, `cursor-cli`), so
+ * every producer and consumer hand-mapped between the two spellings.
+ *
+ * The payload is `unknown` because each source's scan yields its own private
+ * record shape, and only the definition that produced a value ever consumes it —
+ * see {@link defineSessionSource} for why that pairing is what makes the erasure
+ * sound.
+ */
+export type PreScannedSessions = Readonly<Partial<Record<TranscriptSource, ReadonlyArray<unknown>>>>;
 
-/** Default loader: every per-source discoverer, failures logged and skipped. */
-export async function loadAllSessions(cwd: string): Promise<ReadonlyArray<SessionInfo>> {
-	// Lazy imports, same rationale as ActiveSessionAggregator: several
-	// discoverers reach for node:sqlite, and loading them eagerly would emit
-	// the ExperimentalWarning in processes that never scan sessions.
-	const loaders: ReadonlyArray<() => Promise<ReadonlyArray<SessionInfo>>> = [
-		async () => (await import("../core/SessionTracker.js")).loadAllSessions(cwd),
-		async () =>
-			(await import("../core/CursorSessionDiscoverer.js")).scanCursorSessions(cwd).then((r) => r.sessions),
-		async () => (await import("../core/CodexSessionDiscoverer.js")).discoverCodexSessions(cwd),
-		async () =>
-			(await import("../core/OpenCodeSessionDiscoverer.js")).scanOpenCodeSessions(cwd).then((r) => r.sessions),
-		async () =>
-			(await import("../core/CopilotSessionDiscoverer.js")).scanCopilotSessions(cwd).then((r) => r.sessions),
-		async () =>
-			(await import("../core/CopilotChatSessionDiscoverer.js"))
-				.scanCopilotChatSessions(cwd)
-				.then((r) => r.sessions),
-		async () => (await import("../core/ClineSessionDiscoverer.js")).scanClineSessions(cwd).then((r) => r.sessions),
-		async () =>
-			(await import("../core/ClineCliSessionDiscoverer.js")).scanClineCliSessions(cwd).then((r) => r.sessions),
-		async () => (await import("../core/DevinSessionDiscoverer.js")).scanDevinSessions(cwd).then((r) => r.sessions),
-		async () =>
-			(await import("../core/CursorCliSessionDiscoverer.js")).scanCursorCliSessions(cwd).then((r) => r.sessions),
-		async () =>
-			(await import("../core/AntigravitySessionDiscoverer.js"))
-				.scanAntigravitySessions(cwd)
-				.then((r) => r.sessions),
+export type SessionLoader = (
+	cwd: string,
+	windowMs?: number,
+	preScanned?: PreScannedSessions,
+) => Promise<ReadonlyArray<SessionInfo>>;
+
+/**
+ * Default loader: every per-source discoverer, failures logged and skipped.
+ *
+ * `windowMs` is forwarded to all of them and omitted by default, so every source
+ * keeps its own 48 h `SESSION_STALE_MS` unless a caller asks for more. The
+ * history back-fill is the only caller that does — see
+ * {@link BACKFILL_SESSION_WINDOW_MS} for why widening the constants instead would
+ * have reached the post-commit summary and corrupted what it stores.
+ */
+export async function loadAllSessions(
+	cwd: string,
+	windowMs?: number,
+	preScanned: PreScannedSessions = {},
+): Promise<ReadonlyArray<SessionInfo>> {
+	// Lazy imports throughout, same rationale as ActiveSessionAggregator: several
+	// discoverers reach for node:sqlite, and loading them eagerly would emit the
+	// ExperimentalWarning in processes that never scan sessions. The registry keeps
+	// that property — see the header of `SessionSources`.
+	const loaders: Array<() => Promise<ReadonlyArray<SessionInfo>>> = [
+		// The hook registry (`sessions.json`), which holds Claude and Gemini.
+		//
+		// The one source that is NOT machine-global: it is a per-project file, so reading
+		// it once per repo is reading a different file each time — there is nothing to
+		// hoist. It also stays unconditional even when Claude was pre-scanned, for two
+		// reasons: it is the only route Claude has when that scan fails, and it is the
+		// only route Gemini has at all (there is no Gemini disk discoverer — only
+		// `GeminiSessionDetector`, which answers "is it installed" — and no Gemini
+		// producer hook). Keeping both costs nothing, because the dedupe below merges
+		// the two views of one session.
+		//
+		// It is deliberately NOT a `SESSION_SOURCES` entry: the registry describes
+		// machine-global stores, and this is the one route that is per-project. That is
+		// also why `claude` is the single definition without a `scanForRepo` — this line
+		// IS its per-repo route.
+		//
+		// KNOWN CONSEQUENCE for Gemini: history older than 48 h is permanently
+		// unrecoverable. `pruneStale` deletes those rows from the file on every
+		// `saveSession`, so widening a window cannot bring them back — only a Gemini
+		// disk scanner could, and that is deliberately its own change.
+		async () => (await import("../core/SessionTracker.js")).loadAllSessions(cwd, windowMs),
 	];
+	// EVERY registered source is skippable, because every one of them reads a store
+	// keyed by something other than the repo — so a caller that already scanned it
+	// machine-wide must not have it read a second time, once per repo.
+	//
+	// The check is `!== undefined`, never truthiness: `[]` is the positive claim "the
+	// scan ran and found nothing", and re-running the per-repo loader on that would
+	// undo the hoist for exactly the sources that are cheapest to get wrong about.
+	for (const def of SESSION_SOURCES) {
+		const perRepo = def.scanForRepo;
+		if (!perRepo || preScanned[def.source] !== undefined) continue;
+		loaders.push(() => perRepo(cwd, windowMs));
+	}
 	const settled = await Promise.allSettled(loaders.map((load) => load()));
 	const sessions: SessionInfo[] = [];
 	for (const result of settled) {
@@ -128,6 +211,60 @@ export async function loadAllSessions(cwd: string): Promise<ReadonlyArray<Sessio
 		else log.warn("session discoverer failed during dashboard collection: %s", errMsg(result.reason));
 	}
 	return sessions;
+}
+
+/**
+ * One agent's share of a session pass.
+ *
+ * Kept separate from the processed count, which only the caller can know: this module
+ * reports what it SAW and what it declined to re-read, while "processed" is how many
+ * of the reads survived {@link sessionEventFromInfo} — a source can be discovered,
+ * not skipped, and still produce no event.
+ */
+export interface SessionSourceCounts {
+	/** Sessions this agent contributed to the deduped set. */
+	readonly discovered: number;
+	/** Of those, the ones the database already held at or past their instant. */
+	readonly skipped: number;
+}
+
+/**
+ * The dedupe key one session was counted under: `<source>:<sessionId>`.
+ *
+ * Spelled by {@link sessionPassKey} and stable across repos, which is the whole
+ * reason the keys are reported alongside the counts. One conversation can be
+ * claimed by SEVERAL repos — Cursor's attribution is coarse by construction (with
+ * no workspace pointer in its global store, every in-window composer belongs to
+ * every repo Cursor has a workspace for), and two clones of one project claim the
+ * same set outright. A caller that adds up N repos' counts therefore reports one
+ * conversation N times, and no count can undo that afterwards. A key can.
+ */
+export type SessionPassKey = string;
+
+/** The dedupe key a session pass counts a session under. */
+export function sessionPassKey(source: TranscriptSource | string, sessionId: string): SessionPassKey {
+	return `${source}:${sessionId}`;
+}
+
+/** The source half of a {@link SessionPassKey}. */
+export function sourceOfSessionPassKey(key: SessionPassKey): string {
+	const sep = key.indexOf(":");
+	return sep === -1 ? key : key.slice(0, sep);
+}
+
+/** {@link CollectSessionsOptions.onCounts}'s payload: run totals plus the per-agent split. */
+export interface SessionPassCounts {
+	readonly discovered: number;
+	readonly skipped: number;
+	readonly bySource: Readonly<Record<string, SessionSourceCounts>>;
+	/**
+	 * Every session the pass discovered, by {@link SessionPassKey}. Same population as
+	 * `discovered`, identified rather than tallied — see {@link SessionPassKey} for why
+	 * a cross-repo reader needs the identity and not the number.
+	 */
+	readonly discoveredKeys: ReadonlyArray<SessionPassKey>;
+	/** The subset of {@link discoveredKeys} the skip removed. */
+	readonly skippedKeys: ReadonlyArray<SessionPassKey>;
 }
 
 export interface CollectSessionsOptions {
@@ -140,6 +277,92 @@ export interface CollectSessionsOptions {
 	 * Claude JSONL via `readTranscript`.
 	 */
 	readonly readUsage?: typeof readTranscript;
+	/**
+	 * Machine-wide scans the caller already ran, narrowed here to this repo.
+	 *
+	 * Passed in rather than scanned per call so a multi-repo run reads each global
+	 * store ONCE for the whole run instead of once per registered repo. Every hookless
+	 * source is eligible, because not one of them keys its store by repo: Claude
+	 * encodes a path lossily, Codex partitions by date, OpenCode / Copilot CLI / Devin
+	 * / Cursor keep one database for every project, Cline keeps one task history per
+	 * editor flavour, and the VS Code-family sources key on a workspace hash. In every
+	 * case "which sessions are this repo's" is only answerable after opening the
+	 * records — so a repo-scoped scan re-opens the same records N times.
+	 *
+	 * Measured on a three-repo machine: Claude one walk is 36 ms of head/tail reads
+	 * with a 464 ms full parse behind it, and Codex is 68 ms per repo / 201 ms across
+	 * three. Those were the only two sources installed there, which is exactly why the
+	 * profile is not the argument: on that machine the other nine returned on their
+	 * first `readdir` and cost under a millisecond between them, so the numbers say
+	 * nothing about a developer who actually runs Cursor, Copilot and Cline and pays a
+	 * SQLite open, a full-table scan and a whole-history JSON parse per repo per pass.
+	 * All of them are hoisted on that reasoning rather than on a profile of a machine
+	 * that did not have them installed.
+	 *
+	 * What did NOT move is any attribution rule: each source's `…SessionsForRepo`
+	 * still owns its own, in its own file. This changed when a rule runs, never what
+	 * it says — restating those rules as shared data is where this module's bugs have
+	 * historically come from.
+	 *
+	 * Absent (for a given source) means "no scan was supplied", which is not the same
+	 * as "the scan found nothing" — see {@link PreScannedSessions}.
+	 */
+	readonly preScanned?: PreScannedSessions;
+	/**
+	 * Discovery window forwarded to every source, in ms. Omitted leaves each source
+	 * on its own 48 h default; the back-fill passes
+	 * {@link BACKFILL_SESSION_WINDOW_MS}.
+	 */
+	readonly windowMs?: number;
+	/**
+	 * True when the database already holds this session at or past `updatedAtMs` —
+	 * i.e. when re-reading its transcript would write back the row that is already
+	 * there.
+	 *
+	 * This is NOT the high-water cursor this module's header rules out, and the
+	 * difference is the whole reason it is safe. That rule is about ONE number
+	 * standing in for a whole repo, which an out-of-order update slips past: resume a
+	 * three-day-old conversation and its timestamp still sits below the repo's
+	 * high-water mark, so it is skipped forever. This compares each session against
+	 * its OWN stored instant, so that conversation's stored time is older than the
+	 * turn just added and it is re-read.
+	 */
+	readonly isAlreadyCurrent?: (source: TranscriptSource, sessionId: string, updatedAtMs: number) => boolean;
+	/**
+	 * What the pass saw, for the caller's one-line report: how many distinct sessions
+	 * the window turned up, how many of those {@link isAlreadyCurrent} removed, and the
+	 * same split per agent.
+	 *
+	 * Both totals are reported rather than one derived from the other, because the
+	 * difference is not the skip count. A session can also drop out with an unparseable
+	 * instant, so `discovered - events.length` overstates what was skipped — and
+	 * "skipped" is the number a reader would act on.
+	 *
+	 * `bySource` is built HERE rather than by the caller counting the returned events,
+	 * because the events are what survived: a skipped session produces none, so an
+	 * event-side count can only ever report the processed third of the picture. Every
+	 * source that reached the dedupe gets an entry, including one whose sessions were
+	 * all skipped — "codex 51 found, 0 read" and "codex absent" are different facts and
+	 * an omitted key spells them the same way.
+	 *
+	 * Reported through a callback rather than on the return value because the caller
+	 * needs these only to print, and widening the return type would rewrite every
+	 * existing call site for numbers none of them read. Fires once, after the loop.
+	 */
+	readonly onCounts?: (counts: SessionPassCounts) => void;
+	/**
+	 * How many sessions may be read at once; defaults to
+	 * {@link mapWithConcurrency}'s own width.
+	 *
+	 * A knob rather than a constant because the right width depends on what the
+	 * caller is doing while this runs, and only the caller knows: the back-fill owns
+	 * the whole process and wants the default, while a surface reading sessions
+	 * alongside other work may want it narrower. Lowering it to 1 also restores the
+	 * strictly sequential read order, which is occasionally what a test wants to
+	 * assert — though it is not needed for determinism, since the fan-out preserves
+	 * input order at any width.
+	 */
+	readonly concurrency?: number;
 }
 
 /**
@@ -184,6 +407,50 @@ async function resolveTitle(s: SessionInfo): Promise<string | undefined> {
  *
  * Returns null when the discoverer's timestamp is unparseable — an event
  * without a valid `updatedAtMs` cannot be bucketed anywhere.
+ *
+ * ## Every source now costs a transcript read here, deliberately
+ *
+ * This function used to `return base` for anything that was not Claude, so for the
+ * other twelve agents it was pure CPU: no file opened, no database queried. It is not
+ * any more — `sessionContent.read()` plus the extractors run for every source — and
+ * that is the whole point of the change (see the note beside `extractSessionSignals`
+ * below), not an oversight to be walked back. Two consequences are worth having in
+ * mind before "optimising" this, because both look like regressions in isolation:
+ *
+ *  - **The VS Code 60 s tick pays it too**, through `recordSessionsFromTick`. That
+ *    path is bounded rather than free-running (it only builds events for sessions whose
+ *    `updatedAt` moved since its last write), and the read is not new to the tick —
+ *    `ActiveSessionAggregator` already loads every listed conversation to count its
+ *    messages. What IS new is that the same file is parsed a SECOND time in the same
+ *    tick, because the aggregator's parsed form cannot be handed over. It is the reason
+ *    a first tick after a window reload is the expensive one (the tick watermark is per
+ *    process, so it starts at 0).
+ *
+ *    **KNOWN, DEFERRED — do not re-report this as a review finding.** The follow-up is
+ *    understood and scoped. The aggregator reads each file to count unread turns and,
+ *    when there are any, reads it whole again to resolve a title; at that moment it is
+ *    holding exactly what this function then goes and re-reads. It throws the raw text
+ *    away because the two want different things from it: the aggregator wants the
+ *    INCREMENTAL slice with the user's overlay edits applied, while this wants the
+ *    WHOLE file unedited, plus token usage, tool calls and raw lines the aggregator
+ *    never looks at. The bridge between them (`ActiveConversationItem`) is deliberately
+ *    five fields wide because it is `postMessage`d into the webview, so widening it to
+ *    carry a transcript is not an option — the follow-up needs a separate
+ *    host-process-only channel, and it has to draw the overlay boundary explicitly:
+ *    whoever gets the pre-overlay text must be the dashboard side, or a user's manual
+ *    edits start showing up in token totals with nothing to signal it.
+ *  - **The back-fill pays it as a RE-read.** The Claude disk scan has already read every
+ *    in-window transcript in full, to collect the directories a `cd` scattered through
+ *    it. It used to hand that parse over so this function opened nothing; it no longer
+ *    keeps it, because keeping it made a whole run's memory grow with the window and with
+ *    nothing to cap it (see `acceptFacts`). So a Claude session costs the scan's read,
+ *    this read, the `lines()` read behind the skill extractor and one tail read for the
+ *    `ai-title` row — four passes over the same file, traded for a bounded resident set.
+ *    Two of those four are collapsible on their own; see `sessionContentFor`.
+ *  - **A source with no per-turn usage still opens its store.** `sessions-only` is now
+ *    reached by "this reader reports no usage", not by "this is not Claude", so the read
+ *    happens even when the token columns end up empty. It is what yields the message
+ *    count, the duration and the tool/skill signals, none of which the discoverer knows.
  */
 export async function sessionEventFromInfo(
 	repoIdentity: string,
@@ -202,14 +469,29 @@ export async function sessionEventFromInfo(
 		...(title ? { title } : {}),
 		updatedAtMs,
 	};
-	if (source !== "claude") return base;
+	// One memoised view of this conversation, shared by the token/duration read below
+	// and by every extractor. Without the memo, each extractor that wanted the
+	// transcript would open it again — so adding one would silently add a whole-file
+	// read per session.
+	const sessionContent = sessionContentFor(source, s.transcriptPath, readUsage);
 	try {
-		const read = await readUsage(s.transcriptPath);
+		const read = await sessionContent.read();
 		const models: StatsModelUsage[] = toStatsModelUsage(read.usageByModel ?? []);
 		const first = read.entries[0]?.timestamp;
 		const last = read.entries[read.entries.length - 1]?.timestamp;
 		const startedAtMs = first ? Date.parse(first) : Number.NaN;
 		const endedAtMs = last ? Date.parse(last) : Number.NaN;
+		// Every source that can answer, asked by capability rather than by name. This
+		// replaces `if (source !== "claude") return base`, which gave twelve agents a
+		// bare session row — no tool calls, no MCP calls, no skills — while nine of them
+		// had a reader that reports tool calls and three had a skill scanner. None of it
+		// was missing; it was unreachable.
+		const signals = await extractSessionSignals({
+			source,
+			sessionId: s.sessionId,
+			transcriptPath: s.transcriptPath,
+			content: sessionContent,
+		});
 		return {
 			...base,
 			messageCount: read.entries.length,
@@ -217,13 +499,16 @@ export async function sessionEventFromInfo(
 			...(Number.isFinite(startedAtMs) && Number.isFinite(endedAtMs) && endedAtMs > startedAtMs
 				? { durationMs: endedAtMs - startedAtMs }
 				: {}),
+			// `sessions-only` is now reached by a source having no per-turn usage to
+			// report rather than by it not being Claude. Same outcome for the sources
+			// that carry none, and an honest `full` for any that does.
 			...(models.length > 0
 				? { models, tokenCoverage: "full" as const, pricesAsOf: PRICES_AS_OF }
 				: { tokenCoverage: "sessions-only" as const }),
-			// Forwarded only when the reader actually produced it. An empty array
-			// means "called no tools" and is worth storing; absence means "this
-			// source records none", and the two must not collapse.
-			...(read.toolUse ? { tools: read.toolUse } : {}),
+			// Forwarded only when an extractor actually answered. An empty array means
+			// "called no tools" and is worth storing; absence means "this source cannot
+			// report them", and the two must not collapse.
+			...(signals.tools ? { tools: signals.tools } : {}),
 		};
 	} catch (err) {
 		// A moved or deleted transcript still counts as a session — record it
@@ -237,26 +522,238 @@ export async function sessionEventFromInfo(
 	}
 }
 
+/**
+ * One session's content, read at most once no matter how many callers ask.
+ *
+ * `readUsage` is consulted for Claude only, because that is what its signature
+ * describes: a JSONL reader taking a path. Every other source needs its own reader
+ * (a JSON file, a SQLite database, a synthetic `<dbPath>#<sessionId>` handle), and
+ * handing one of those to a Claude-shaped reader would not fail cleanly — it would
+ * parse zero lines and report an empty conversation.
+ *
+ * ## Both reads claim a slot in the shared I/O budget
+ *
+ * These are the largest reads in a session pass, and they used to be the only leaf
+ * reads that took no slot at all — so the fan-out's width was the only thing bounding
+ * them, and a scanner fanning out at the same time could push the process past its
+ * descriptor limit, where reads fail with `EMFILE` and take the whole batch down with
+ * them (see {@link withIoBudget}).
+ *
+ * They claim a slot and ZERO bytes, which is honest rather than ideal: the byte
+ * dimension needs the size up front, and neither reader knows it (one streams a file,
+ * the others query a database). So the budget bounds how MANY of these run at once and
+ * not how much they materialise — closing that needs a `stat` before the read, which is
+ * its own change. Claiming a guessed byte figure would be worse than claiming none,
+ * because an over-claim holds allowance a genuinely large read needs.
+ *
+ * The claim wraps the read and nothing above it, which is what keeps it un-nested: no
+ * caller of `sessionEventFromInfo` holds a budget slot, and none of these readers takes
+ * one internally. Both halves matter — see {@link IoBudget.run} on nesting.
+ *
+ * ## KNOWN, DEFERRED: the two reads below open a line-oriented file TWICE
+ *
+ * Not a defect to report again — it is measured, understood, and scheduled. For the
+ * three JSONL sources (claude / codex / kimi) `read()` opens the file and parses it,
+ * and then `lines()` opens the SAME file again to split its raw text. The memos stop
+ * each accessor repeating itself; they do not make the two share one read, because
+ * `read()`'s result carries no raw text and `lines()`' text carries no parse.
+ *
+ * That makes one Claude session in a session pass cost FOUR passes over its file: the
+ * disk scan's own read (for the working directories a `cd` scattered through it), the
+ * `read()` here, the `lines()` here, and `resolveSessionTitle`'s tail stream for the
+ * `ai-title` row. An earlier docstring in this module said three — it did not count
+ * `lines()`, which only exists since the skill extractor was wired in.
+ *
+ * The fix is mechanical and the pieces already exist: read the text once, then feed
+ * `parseTranscriptContent` and `splitTranscriptLines` from that one string.
+ * `readTranscript(path)` is by definition `readFile` followed by
+ * `parseTranscriptContent`, so the RESULT is identical — this is purely one fewer
+ * open.
+ *
+ * It is NOT in this change because of where the test seam sits. `readUsage` is an
+ * injected whole-file reader, and `DashboardCollector.test.ts` mocks exactly
+ * `readTranscript` while deliberately keeping `parseTranscriptContent` and
+ * `splitTranscriptLines` real. Feeding a parse from text therefore stops the injected
+ * reader being called at all, so ~20 cases that hand this module a ready-made
+ * `TranscriptReadResult` would have to hand it a real JSONL string instead. That is a
+ * seam change (the injection point moves from "read the file" to "here is the text"),
+ * not an optimisation, and it belongs with the tick work below — both are the same
+ * question of who owns reading versus parsing.
+ */
+function sessionContentFor(
+	source: TranscriptSource,
+	transcriptPath: string,
+	readUsage: typeof readTranscript,
+): SessionContent {
+	let readOnce: Promise<TranscriptReadResult> | undefined;
+	let linesOnce: Promise<ReadonlyArray<string> | undefined> | undefined;
+	return {
+		read: () => {
+			readOnce ??= withIoBudget(0, () =>
+				source === "claude" ? readUsage(transcriptPath) : readTranscriptForSource(source, transcriptPath),
+			);
+			return readOnce;
+		},
+		lines: () => {
+			linesOnce ??= withIoBudget(0, () => readTranscriptLinesForSource(source, transcriptPath));
+			return linesOnce;
+		},
+	};
+}
+
+/**
+ * Narrows every supplied machine-wide scan to one repo.
+ *
+ * Each source's own `…SessionsForRepo` does its own matching — this only decides
+ * WHICH ones to ask, and asks exactly those the caller supplied. Two are async and
+ * that is inherent, not an inconsistency: Antigravity has to enumerate the repo's
+ * worktrees (`git worktree list`), and Cursor has to resolve the repo's workspace
+ * hash and read that workspace's anchor pointers. Both are per-repo questions no
+ * machine-wide scan could have answered in advance.
+ *
+ * The result is CONCATENATED with the fan-out's, never substituted for it — the
+ * caller's dedupe on `(source, sessionId)` is what reconciles a session that both
+ * halves saw, which is the normal case for Claude.
+ */
+async function preScannedForRepo(
+	pre: PreScannedSessions,
+	cwd: string,
+	windowMs?: number,
+): Promise<ReadonlyArray<SessionInfo>> {
+	const out: SessionInfo[] = [];
+	for (const def of SESSION_SOURCES) {
+		const scanned = pre[def.source];
+		// `!== undefined` rather than truthiness: `[]` means the scan ran and found
+		// nothing, which must still be narrowed (to nothing) rather than treated as
+		// "no scan happened".
+		if (scanned === undefined) continue;
+		try {
+			// The window is forwarded to every definition and used by one: Cursor needs
+			// it HERE rather than at scan time, because anchored composers bypass it and
+			// a scan that applied it would have dropped them before this step could keep
+			// them. The rest ignore the argument.
+			out.push(...(await def.forRepo(scanned, cwd, windowMs)));
+		} catch (err) {
+			// One source's narrowing failure must not lose the other eleven's sessions.
+			// Narrowing is I/O for two of them (worktree enumeration, workspace-hash
+			// resolution), so this is a real failure mode rather than a defensive catch.
+			log.warn("narrowing %s sessions to %s failed: %s", def.source, cwd, errMsg(err));
+		}
+	}
+	return out;
+}
+
 /** Collects one `session.upserted` per discoverable session (see {@link sessionEventFromInfo}). */
 export async function collectSessionEvents(opts: CollectSessionsOptions): Promise<ReadonlyArray<SessionUpsertedEvent>> {
 	const load = opts.loadSessions ?? loadAllSessions;
 	const readUsage = opts.readUsage ?? readTranscript;
-	const sessions = await load(opts.cwd);
+	const preScanned = opts.preScanned ?? {};
+	// A source supplied as a pre-scan is NOT loaded again by the fan-out — otherwise
+	// its store would be read twice per repo, which is the opposite of the point. One
+	// object drives both halves, so the two cannot disagree.
+	const discovered = await load(opts.cwd, opts.windowMs, preScanned);
+	const sessions = [...discovered, ...(await preScannedForRepo(preScanned, opts.cwd, opts.windowMs))];
 
 	// Dedupe on (source, id), newest wins — two discoverers can surface the same
 	// session (e.g. a registry entry and a rescan of the same store).
-	const bySourceAndId = new Map<string, SessionInfo>();
+	//
+	// A Claude session present in BOTH `sessions.json` and the disk scan resolves to
+	// the registry copy, because the Stop hook's instant is the last turn plus the
+	// few seconds the hook took to fire. Nothing is lost by that: such a session is
+	// exactly the one `isAlreadyCurrent` is about to skip, so which of the two
+	// timestamps won never reaches a row.
+	const bySourceAndId = new Map<SessionPassKey, SessionInfo>();
 	for (const s of sessions) {
-		const key = `${s.source ?? "claude"}:${s.sessionId}`;
+		const key = sessionPassKey(s.source ?? "claude", s.sessionId);
 		const existing = bySourceAndId.get(key);
 		if (!existing || Date.parse(s.updatedAt) > Date.parse(existing.updatedAt)) bySourceAndId.set(key, s);
 	}
 
-	const events: SessionUpsertedEvent[] = [];
-	for (const s of bySourceAndId.values()) {
-		const event = await sessionEventFromInfo(opts.repoIdentity, s, readUsage);
-		if (event) events.push(event);
+	// The skip runs as its own pass, BEFORE the fan-out below, for two reasons. It
+	// has to come before `sessionEventFromInfo`, which is where the cost is: for
+	// Claude that call reads the whole transcript and resolves the title (measured
+	// 464 ms across 64 files), so skipping after it would save nothing. What the
+	// skip cannot reclaim is the scan itself — the instant being compared had to be
+	// read to exist — so the saving is the parse, not the open. And because the
+	// decision is one synchronous map lookup, settling it here means the whole
+	// concurrency budget below goes to sessions that genuinely need a read.
+	//
+	// A session whose reported instant is unparseable is NOT skipped: being unable
+	// to date a session is a reason to look at it, never a reason to assume it is
+	// current.
+	const toRead: SessionInfo[] = [];
+	let skipped = 0;
+	// Mutable accumulators, frozen into the readonly payload at the end. Every source
+	// that reached the dedupe is registered on sight, before the skip decision, so a
+	// source whose sessions were ALL skipped still reports `discovered: n, skipped: n`
+	// rather than vanishing from the split — absence has to keep meaning "this agent
+	// contributed nothing to the window".
+	const perSource = new Map<string, { discovered: number; skipped: number }>();
+	const skippedKeys: SessionPassKey[] = [];
+	for (const [key, s] of bySourceAndId) {
+		const source = s.source ?? "claude";
+		const counts = perSource.get(source) ?? { discovered: 0, skipped: 0 };
+		counts.discovered++;
+		perSource.set(source, counts);
+		const updatedAtMs = Date.parse(s.updatedAt);
+		if (
+			opts.isAlreadyCurrent &&
+			Number.isFinite(updatedAtMs) &&
+			opts.isAlreadyCurrent(source, s.sessionId, updatedAtMs)
+		) {
+			skipped++;
+			counts.skipped++;
+			skippedKeys.push(key);
+			continue;
+		}
+		toRead.push(s);
 	}
+
+	// Bounded fan-out rather than a sequential loop: this is the expensive half of
+	// the whole back-fill and every unit of it is independent I/O. Each Claude
+	// session costs a full transcript read plus parse plus a tail read for the
+	// `ai-title` stream, and running them one at a time leaves the disk idle
+	// between parses — on a machine with a week of history that is tens of
+	// sequential 464 ms-class reads.
+	//
+	// Safe to overlap because nothing here is shared: every source's reader builds its
+	// own parser and opens its own handle per call, `resolveSessionTitle` only reads
+	// files, and none of them touches the dashboard database — that write is
+	// `applyBatches`, after this returns.
+	//
+	// EVERY source now costs a read here, not just Claude. The `if (source !== "claude")
+	// return base` that used to make this comment's "for a non-Claude source nothing is
+	// opened at all" true is gone: a SQLite-backed source opens its store, which is why
+	// the fan-out is bounded rather than the width being a Claude-only concern. Callers
+	// on a hot path are the ones that must keep the read set small — the tick producer
+	// does it with its own watermark, the back-fill with `isAlreadyCurrent` above.
+	//
+	// BOUNDED, not `Promise.all`: each unit holds one whole transcript in memory
+	// while it parses, which is the same exposure the disk scan's phase 2 already
+	// accepts at the same width — and an unbounded fan-out over a machine-global
+	// store is the `EMFILE` shape {@link mapWithConcurrency} exists to prevent.
+	//
+	// Order is preserved by `mapWithConcurrency`, so the event array is identical
+	// to what the sequential loop produced. That is load-bearing for the caller:
+	// `applyBatches` slices this array into fixed-size batches, and a
+	// completion-ordered result would reshuffle which sessions share a batch from
+	// run to run.
+	const read = await mapWithConcurrency(
+		toRead,
+		(s) => sessionEventFromInfo(opts.repoIdentity, s, readUsage),
+		opts.concurrency,
+	);
+	const events = read.filter((event): event is SessionUpsertedEvent => event !== null);
+	// Logged because "nothing was imported" and "nothing needed importing" look
+	// identical from the outside, and this is the only place that can tell them apart.
+	if (skipped > 0) log.debug("skipped %d session(s) already current in the database", skipped);
+	opts.onCounts?.({
+		discovered: bySourceAndId.size,
+		skipped,
+		bySource: Object.fromEntries(perSource),
+		discoveredKeys: [...bySourceAndId.keys()],
+		skippedKeys,
+	});
 	return events;
 }
 

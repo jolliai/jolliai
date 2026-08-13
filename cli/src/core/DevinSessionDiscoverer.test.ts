@@ -25,6 +25,7 @@ import {
 	isDevinPresent,
 	scanDevinSessions,
 	scanDevinSessionsAt,
+	scanDevinSessionsOnDisk,
 } from "./DevinSessionDiscoverer.js";
 
 describe("DevinSessionDiscoverer", () => {
@@ -176,6 +177,26 @@ describe("DevinSessionDiscoverer", () => {
 		});
 	});
 
+	describe("scanDevinSessionsOnDisk", () => {
+		it("resolves its own DB path and carries every session's directory, unfiltered", async () => {
+			// The machine-wide half, and the one the multi-repo back-fill calls: it resolves
+			// `getDevinSessionsDbPath()` itself rather than taking a path, and it does NOT
+			// narrow — a session belonging to some other repo still comes back, because
+			// which repo claims it is `devinSessionsForRepo`'s question.
+			const nowSec = Math.floor(Date.now() / 1000);
+			await createDevinDb(join(fakeDataHome, "devin", "cli"), [
+				{ id: "mine", workingDirectory: projectDir, lastActivityAt: nowSec - 10 },
+				{ id: "theirs", workingDirectory: "/tmp/other-project", lastActivityAt: nowSec - 20 },
+			]);
+
+			const result = await scanDevinSessionsOnDisk();
+
+			expect(result.error).toBeUndefined();
+			expect(result.sessions.map((s) => s.session.sessionId).sort()).toEqual(["mine", "theirs"]);
+			expect(result.sessions.find((s) => s.session.sessionId === "mine")?.dirs).toContain(projectDir);
+		});
+	});
+
 	describe("scanDevinSessions / discoverDevinSessions", () => {
 		it("discovers the session matching its working_directory", async () => {
 			const dbDir = join(fakeDataHome, "devin", "cli");
@@ -225,6 +246,27 @@ describe("DevinSessionDiscoverer", () => {
 			const sessions = await discoverDevinSessions(projectDir);
 
 			expect(sessions.map((s) => s.sessionId)).toEqual(["fresh"]);
+		});
+
+		// The dashboard's history back-fill widens the window explicitly; the sidebar,
+		// `jolli status` and the post-commit summary generation keep the 48h default
+		// by omitting the parameter.
+		it("admits a stale session when an explicit wider window is passed", async () => {
+			const dbDir = join(fakeDataHome, "devin", "cli");
+			const nowSec = Math.floor(Date.now() / 1000);
+			const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+			const dbPath = await createDevinDb(dbDir, [
+				{ id: "backfill", workingDirectory: projectDir, lastActivityAt: nowSec - 72 * 60 * 60 },
+			]);
+
+			// The default 48h window excludes it…
+			expect(await discoverDevinSessions(projectDir)).toEqual([]);
+			// …a 7-day window admits it, through the wrapper and through the
+			// explicit-DB-path variant alike.
+			const viaWrapper = await discoverDevinSessions(projectDir, sevenDaysMs);
+			expect(viaWrapper.map((s) => s.sessionId)).toEqual(["backfill"]);
+			const at = await scanDevinSessionsAt(dbPath, projectDir, sevenDaysMs);
+			expect(at.sessions.map((s) => s.sessionId)).toEqual(["backfill"]);
 		});
 
 		it("filters out hidden sessions", async () => {

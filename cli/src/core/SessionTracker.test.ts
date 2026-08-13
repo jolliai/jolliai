@@ -241,6 +241,33 @@ describe("SessionTracker", () => {
 			expect(sessions).toEqual([]);
 		});
 
+		it("should widen the read filter when given an explicit window", async () => {
+			// Written straight to the registry rather than through `saveSession`, which
+			// would prune this row before it ever reached disk — which is also why
+			// widening the window recovers so little in practice: the write path deletes
+			// what the read path would otherwise be allowed to see.
+			const dir = await ensureJolliMemoryDir(tempDir);
+			await writeFile(
+				join(dir, "sessions.json"),
+				JSON.stringify({
+					version: 1,
+					sessions: {
+						old: {
+							sessionId: "old",
+							transcriptPath: "/path/old.jsonl",
+							updatedAt: new Date(Date.now() - 72 * 3600_000).toISOString(),
+							source: "claude",
+						},
+					},
+				}),
+				"utf-8",
+			);
+
+			expect(await loadAllSessions(tempDir)).toEqual([]);
+			const wide = await loadAllSessions(tempDir, 7 * 24 * 3600_000);
+			expect(wide.map((s) => s.sessionId)).toEqual(["old"]);
+		});
+
 		it("should handle corrupted sessions.json gracefully", async () => {
 			const dir = await ensureJolliMemoryDir(tempDir);
 			await writeFile(join(dir, "sessions.json"), "not valid json", "utf-8");

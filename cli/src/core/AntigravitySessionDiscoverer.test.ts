@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 
 // Two of the discoverer's guards protect against a TOCTOU race — the file or db
-// disappearing between the existsSync/statSync probe and the read. The
+// disappearing between the discoverer's `stat` probe and the read. The
 // filesystem cannot be made to lose that race on demand, so the two holders
 // below inject the exact error the race would produce. Both default to
 // `undefined`, i.e. fully real behaviour.
@@ -37,10 +37,12 @@ vi.mock("./SqliteHelpers.js", async (importOriginal) => {
 
 import { buildMetadataBlob, createAntigravityConvo, REAL_TRANSCRIPT_FULL } from "../testUtils/antigravityFixture.js";
 import { symlinksSupported } from "../testUtils/symlinkSupport.js";
+import { getAntigravityVariants } from "./AntigravityDetector.js";
 import {
 	discoverAntigravitySessions,
 	extractWorkspacePath,
 	scanAntigravitySessions,
+	scanAntigravitySessionsOnDisk,
 } from "./AntigravitySessionDiscoverer.js";
 import { hasNodeSqliteSupport } from "./SqliteHelpers.js";
 
@@ -241,8 +243,9 @@ sqliteOnly("AntigravitySessionDiscoverer", () => {
 				transcriptLines: REAL_TRANSCRIPT_FULL,
 			});
 		// Relative to now so the conversations stay inside the 48h window whenever
-		// the suite runs. antigravity-ide is newest → kept; -cli is oldest → the
-		// `>=` guard skips its SQLite open; antigravity is replaced when -ide wins.
+		// the suite runs. antigravity-ide is newest → kept; the other two lose. The
+		// winner is picked from the complete stat set BEFORE any database is opened,
+		// so the answer cannot depend on which stat finished first.
 		const now = Date.now();
 		const at = (hoursAgo: number) => {
 			const d = new Date(now - hoursAgo * 3600_000);
@@ -255,6 +258,67 @@ sqliteOnly("AntigravitySessionDiscoverer", () => {
 		const sessions = await discoverAntigravitySessions(ws, home);
 		expect(sessions).toHaveLength(1);
 		expect(sessions[0].transcriptPath).toContain("antigravity-ide");
+	});
+
+	it("falls back to an older variant's copy when the newest one yields nothing", async () => {
+		// Newest-wins decides the ORDER, not the outcome. A copy can still fail to produce
+		// a session — here the newest variant has no transcript written yet — and dropping
+		// the conversation on that evidence loses a conversation an older copy can answer
+		// for in full.
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		const older = createAntigravityConvo(home, {
+			convId: "fallback",
+			variant: "antigravity",
+			workspacePath: ws,
+			transcriptLines: REAL_TRANSCRIPT_FULL,
+		});
+		const newest = createAntigravityConvo(home, {
+			convId: "fallback",
+			variant: "antigravity-ide",
+			workspacePath: ws,
+			transcriptLines: [],
+			writeTranscript: false,
+		});
+		const now = Date.now();
+		const at = (hoursAgo: number) => {
+			const d = new Date(now - hoursAgo * 3600_000);
+			return [d, d] as const;
+		};
+		utimesSync(older.dbPath, ...at(2));
+		utimesSync(newest.dbPath, ...at(1));
+
+		const sessions = await discoverAntigravitySessions(ws, home);
+
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0].transcriptPath).toBe(older.transcriptPath);
+	});
+
+	it("breaks an mtime tie by variant order, not by whichever stat landed first", async () => {
+		// Equal mtimes are reachable (two copies written in the same millisecond, or a
+		// filesystem with coarse timestamps). The winner must be the first variant in
+		// `getAntigravityVariants` order — a deterministic answer, which is precisely
+		// what the sequential "consult the map while filling it" version stopped being
+		// able to promise once the scan fanned out.
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		const mk = (variant: string) =>
+			createAntigravityConvo(home, {
+				convId: "tie",
+				variant,
+				workspacePath: ws,
+				transcriptLines: REAL_TRANSCRIPT_FULL,
+			});
+		const same = new Date(Date.now() - 3600_000);
+		utimesSync(mk("antigravity").dbPath, same, same);
+		utimesSync(mk("antigravity-ide").dbPath, same, same);
+		utimesSync(mk("antigravity-cli").dbPath, same, same);
+
+		const sessions = await discoverAntigravitySessions(ws, home);
+
+		expect(sessions).toHaveLength(1);
+		const [first] = getAntigravityVariants(home);
+		expect(sessions[0].transcriptPath.startsWith(first.brainDir)).toBe(true);
 	});
 
 	it("skips a conversation whose db was last touched more than 48h ago", async () => {
@@ -270,10 +334,30 @@ sqliteOnly("AntigravitySessionDiscoverer", () => {
 		expect(await discoverAntigravitySessions(ws, home)).toHaveLength(0);
 	});
 
+	it("admits a conversation older than 48h when an explicit wider window is passed", async () => {
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		const { dbPath } = createAntigravityConvo(home, {
+			convId: "old-but-in-window",
+			workspacePath: ws,
+			transcriptLines: REAL_TRANSCRIPT_FULL,
+		});
+		// 72h ago — outside the 48h default, inside the 7-day window the dashboard
+		// back-fill passes.
+		const old = new Date(Date.now() - 72 * 3600_000);
+		utimesSync(dbPath, old, old);
+
+		// Omitted window: stale, as QueueWorker requires.
+		expect(await discoverAntigravitySessions(ws, home)).toHaveLength(0);
+
+		const widened = await discoverAntigravitySessions(ws, home, 7 * 24 * 3600_000);
+		expect(widened.map((s) => s.sessionId)).toEqual(["old-but-in-window"]);
+	});
+
 	it("skips a variant whose conversations path is not a directory", async () => {
-		// existsSync() is happy with a FILE at conversations/, so the variant is
-		// listed; readdirSync then fails with ENOTDIR and the variant is skipped
-		// rather than aborting the whole scan.
+		// The detector's existsSync() is happy with a FILE at conversations/, so the
+		// variant is listed; the scanner's readdir then fails with ENOTDIR and the
+		// variant is skipped rather than aborting the whole scan.
 		const home = freshDir("agy-home-");
 		const ws = freshDir("repo-");
 		mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
@@ -297,8 +381,8 @@ sqliteOnly("AntigravitySessionDiscoverer", () => {
 			workspacePath: ws,
 			transcriptLines: REAL_TRANSCRIPT_FULL,
 		});
-		// Self-referential symlink — readdirSync lists it, statSync chases the link
-		// into itself and throws ELOOP. Models the real race where a conversation
+		// Self-referential symlink — readdir lists it, the staleness stat chases the
+		// link into itself and throws ELOOP. Models the real race where a conversation
 		// is deleted between the listing and the stat.
 		const loop = join(dbPath, "..", "loop.db");
 		symlinkSync(loop, loop, "file");
@@ -321,7 +405,7 @@ sqliteOnly("AntigravitySessionDiscoverer", () => {
 		expect(error).toBeDefined();
 	});
 
-	// The db passed statSync but was gone by the time SQLite opened it (the user
+	// The db passed the staleness stat but was gone by the time SQLite opened it (the user
 	// deleted the conversation mid-scan). classifyScanError returns null for
 	// ENOENT, so this is benign: skip the conversation, surface NO error.
 	it("silently skips a conversation whose db vanished between the stat and the open", async () => {
@@ -406,7 +490,7 @@ sqliteOnly("AntigravitySessionDiscoverer titles", () => {
 		expect(sessions[0].title).toBeUndefined();
 	});
 
-	// The transcript passed existsSync but was gone by the time the stream opened.
+	// The transcript passed the existence stat but was gone by the time the stream opened.
 	// ENOENT is the expected shape of that race, so readTitle stays silent (no
 	// debug log) and the session still surfaces — just without a title.
 	it("leaves the title undefined, without logging, when the transcript vanished mid-scan", async () => {
@@ -424,7 +508,7 @@ sqliteOnly("AntigravitySessionDiscoverer titles", () => {
 	});
 
 	it("leaves the title undefined when the transcript path is unreadable", async () => {
-		// A DIRECTORY named transcript_full.jsonl: existsSync() passes the
+		// A DIRECTORY named transcript_full.jsonl: the existence stat passes the
 		// materialization gate, then the read stream fails with EISDIR — a
 		// non-ENOENT error, so readTitle logs and degrades to no title.
 		const { ws, home, transcriptPath } = convoWithRawTranscript("");
@@ -433,5 +517,86 @@ sqliteOnly("AntigravitySessionDiscoverer titles", () => {
 		const sessions = await discoverAntigravitySessions(ws, home);
 		expect(sessions).toHaveLength(1);
 		expect(sessions[0].title).toBeUndefined();
+	});
+});
+
+sqliteOnly("scanAntigravitySessionsOnDisk — the already-recorded skip", () => {
+	function oneConvo(convId = "1bbaa61e"): { home: string; ws: string; dbPath: string } {
+		const home = freshDir("agy-home-");
+		const ws = freshDir("repo-");
+		const { dbPath } = createAntigravityConvo(home, {
+			convId,
+			workspacePath: ws,
+			transcriptLines: REAL_TRANSCRIPT_FULL,
+		});
+		return { home, ws, dbPath };
+	}
+
+	it("scans normally when nothing is recorded", async () => {
+		const { home } = oneConvo();
+
+		const { sessions } = await scanAntigravitySessionsOnDisk(home, undefined, { alreadyRecorded: () => false });
+
+		expect(sessions).toHaveLength(1);
+		expect(sessions[0].session.sessionId).toBe("1bbaa61e");
+		// The machine-wide scan carries no title: reading one streams a transcript, and
+		// doing it here meant doing it for every conversation on the machine. It is read
+		// after the match instead — see `antigravitySessionsForRepo`, and the title suite
+		// above, which asserts through the repo-scoped entry point.
+		expect(sessions[0].session.title).toBeUndefined();
+	});
+
+	it("drops a recorded conversation rather than opening its database", async () => {
+		// Unlike Claude, there is no cheap way to learn the workspace here — it lives in
+		// the protobuf blob inside the database — so a skipped conversation cannot be
+		// attributed and is left out. Safe because the skip only fires when every repo
+		// holding a row for it is already current.
+		const { home } = oneConvo();
+		race.sqliteError = new Error("the db must not be opened for a recorded conversation");
+		try {
+			const { sessions, error } = await scanAntigravitySessionsOnDisk(home, undefined, {
+				alreadyRecorded: () => true,
+			});
+			expect(sessions).toEqual([]);
+			expect(error).toBeUndefined();
+		} finally {
+			race.sqliteError = undefined;
+		}
+	});
+
+	it("asks with the conversation id from the filename and the instant from its mtime", async () => {
+		const { home } = oneConvo("abc123");
+		const asked: Array<[string, string, number]> = [];
+
+		await scanAntigravitySessionsOnDisk(home, undefined, {
+			alreadyRecorded: (source, sessionId, updatedAtMs) => {
+				asked.push([source, sessionId, updatedAtMs]);
+				return false;
+			},
+		});
+
+		expect(asked).toHaveLength(1);
+		expect(asked[0][0]).toBe("antigravity");
+		expect(asked[0][1]).toBe("abc123");
+		expect(Number.isFinite(asked[0][2])).toBe(true);
+	});
+
+	it("does not ask about a conversation outside the window", async () => {
+		// The staleness stat runs first, so a stale conversation is dropped either way
+		// and must not be reported as one this run discovered.
+		const { home, dbPath } = oneConvo();
+		const old = new Date(Date.now() - 60_000);
+		utimesSync(dbPath, old, old);
+		let asked = 0;
+
+		const { sessions } = await scanAntigravitySessionsOnDisk(home, 1_000, {
+			alreadyRecorded: () => {
+				asked++;
+				return true;
+			},
+		});
+
+		expect(asked).toBe(0);
+		expect(sessions).toEqual([]);
 	});
 });

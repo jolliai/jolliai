@@ -395,6 +395,176 @@ describe("ClaudeTranscriptParser", () => {
 			).toEqual([{ name: "code-review", kind: "skill", calls: 1 }]);
 		});
 
+		it("names a Skill call after what the host launched, not what the model asked for", () => {
+			// `input.skill` is the request; `toolUseResult.commandName` is the resolved id,
+			// and a plugin-provided skill differs by its prefix. `ClaudeSkillScanner` has
+			// always preferred the resolved one, so reporting the request here put ONE
+			// invocation in two `session_tool_use` rows with the calls split between them.
+			const result = parser.parseToolUse([
+				line([{ type: "tool_use", id: "t1", name: "Skill", input: { skill: "brainstorming" } }]),
+				JSON.stringify({
+					type: "user",
+					toolUseResult: { success: true, commandName: "superpowers:brainstorming" },
+					message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1" }] },
+				}),
+			]);
+			expect(result).toEqual([{ name: "superpowers:brainstorming", kind: "skill", calls: 1 }]);
+		});
+
+		it("counts a held-back skill call once when its response repeats across lines", () => {
+			// Skill blocks are tallied after the stream rather than where they are seen, so
+			// the repeat-dedupe has to survive the detour — it still rides on the block id.
+			const dup = line([{ type: "tool_use", id: "toolu_s", name: "Skill", input: { skill: "code-review" } }]);
+			expect(parser.parseToolUse([dup, dup])).toEqual([{ name: "code-review", kind: "skill", calls: 1 }]);
+		});
+
+		it("ignores a resolved name that belongs to a different call", () => {
+			// The pairing is by `tool_use_id`. A result whose id matches nothing must not
+			// rename an unrelated skill.
+			const result = parser.parseToolUse([
+				line([{ type: "tool_use", id: "t1", name: "Skill", input: { skill: "code-review" } }]),
+				JSON.stringify({
+					toolUseResult: { commandName: "other:skill" },
+					message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t2" }] },
+				}),
+			]);
+			expect(result).toEqual([{ name: "code-review", kind: "skill", calls: 1 }]);
+		});
+
+		it("stamps a tool call with the instant of the LINE that recorded it", () => {
+			// Read per line rather than per file: one session's calls span hours, and the
+			// dashboard windows recall activity by this field — a session-level clock would
+			// date a three-week-old call as today's.
+			const at = "2026-08-01T10:00:00.000Z";
+			const result = parser.parseToolUse([
+				JSON.stringify({
+					type: "assistant",
+					timestamp: at,
+					message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash" }] },
+				}),
+			]);
+			expect(result).toEqual([{ name: "Bash", kind: "builtin", calls: 1, lastCallAtMs: Date.parse(at) }]);
+		});
+
+		it("stamps a HELD-BACK skill call from its own line too", () => {
+			// Skills are tallied after the whole stream, so their instant has to survive
+			// that detour — it is captured with the request, not when the fold runs.
+			const at = "2026-08-01T11:00:00.000Z";
+			const result = parser.parseToolUse([
+				JSON.stringify({
+					type: "assistant",
+					timestamp: at,
+					message: {
+						role: "assistant",
+						content: [{ type: "tool_use", id: "s1", name: "Skill", input: { skill: "code-review" } }],
+					},
+				}),
+			]);
+			expect(result).toEqual([{ name: "code-review", kind: "skill", calls: 1, lastCallAtMs: Date.parse(at) }]);
+		});
+
+		it("still counts a tool_use block that carries no id", () => {
+			// The repeat-dedupe keys on the block id; without one there is nothing to
+			// dedupe against, so the call is counted rather than dropped.
+			expect(parser.parseToolUse([line([{ type: "tool_use", name: "Bash" }])])).toEqual([
+				{ name: "Bash", kind: "builtin", calls: 1 },
+			]);
+		});
+
+		it("skips a line that is not JSON, and one whose content is not an array", () => {
+			// Both are routine in a live transcript: a partially-written last line, and
+			// the many record shapes whose `content` is a plain string.
+			expect(parser.parseToolUse(["{not json", JSON.stringify({ message: { content: "plain text" } })])).toEqual(
+				[],
+			);
+		});
+
+		it("resolves nothing from a tool_result block with no tool_use_id", () => {
+			// The name is paired to a call BY id, so a result that identifies no call
+			// cannot rename anything — the skill keeps what the model requested.
+			const result = parser.parseToolUse([
+				line([{ type: "tool_use", id: "t1", name: "Skill", input: { skill: "code-review" } }]),
+				JSON.stringify({
+					toolUseResult: { commandName: "superpowers:brainstorming" },
+					message: { role: "user", content: [{ type: "tool_result" }] },
+				}),
+			]);
+			expect(result).toEqual([{ name: "code-review", kind: "skill", calls: 1 }]);
+		});
+
+		it("keeps a Skill call that carries no id, without consulting the resolved names", () => {
+			// No id means nothing to pair a result against, so the fold must not try — and
+			// the call still has to be counted, under the name the model asked for.
+			const result = parser.parseToolUse([
+				line([{ type: "tool_use", name: "Skill", input: { skill: "code-review" } }]),
+				JSON.stringify({
+					toolUseResult: { commandName: "superpowers:brainstorming" },
+					message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t-other" }] },
+				}),
+			]);
+			expect(result).toEqual([{ name: "code-review", kind: "skill", calls: 1 }]);
+		});
+
+		it("ignores a block that is neither a tool_use nor a tool_result", () => {
+			// Assistant content is mostly text; only the tool-shaped blocks are tallied.
+			expect(parser.parseToolUse([line([{ type: "text", text: "thinking" }])])).toEqual([]);
+		});
+
+		it("ignores a tool_use whose name is not a string", () => {
+			expect(parser.parseToolUse([line([{ type: "tool_use", id: "t1", name: 42 }])])).toEqual([]);
+		});
+
+		it("ignores a Skill block whose requested skill is not a string", () => {
+			// It falls through to the builtin path rather than being held back, so it is
+			// counted as one call of the `Skill` tool itself — the honest answer when the
+			// skill it ran cannot be read.
+			expect(
+				parser.parseToolUse([line([{ type: "tool_use", id: "t1", name: "Skill", input: { skill: 7 } }])]),
+			).toEqual([{ name: "Skill", kind: "builtin", calls: 1 }]);
+		});
+
+		it("resolves nothing when one record carries SEVERAL tool results", () => {
+			// `toolUseResult` is one object, so a record with two results leaves no way to
+			// tell which one its name describes. Attributing it to both would rename the
+			// other skill after the first. Both fall back to what the model requested,
+			// which is what a missing result record already does.
+			const result = parser.parseToolUse([
+				line([
+					{ type: "tool_use", id: "t1", name: "Skill", input: { skill: "code-review" } },
+					{ type: "tool_use", id: "t2", name: "Skill", input: { skill: "brainstorming" } },
+				]),
+				JSON.stringify({
+					toolUseResult: { commandName: "superpowers:brainstorming" },
+					message: {
+						role: "user",
+						content: [
+							{ type: "tool_result", tool_use_id: "t1" },
+							{ type: "tool_result", tool_use_id: "t2" },
+						],
+					},
+				}),
+			]);
+			expect(result).toEqual([
+				{ name: "code-review", kind: "skill", calls: 1 },
+				{ name: "brainstorming", kind: "skill", calls: 1 },
+			]);
+		});
+
+		it("keeps the requested name when the result resolves to an EMPTY one", () => {
+			// An empty `commandName` is not an answer. Taken as one it would win the
+			// fallback and file the invocation under a nameless skill — a row nobody can
+			// recognise, and one `mergeToolCalls` cannot fold with the skill scanner's,
+			// since that fold is on the name.
+			const result = parser.parseToolUse([
+				line([{ type: "tool_use", id: "t1", name: "Skill", input: { skill: "code-review" } }]),
+				JSON.stringify({
+					toolUseResult: { commandName: "" },
+					message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1" }] },
+				}),
+			]);
+			expect(result).toEqual([{ name: "code-review", kind: "skill", calls: 1 }]);
+		});
+
 		it("falls back to the builtin name when a Skill call carries no skill id", () => {
 			expect(parser.parseToolUse([line([{ type: "tool_use", id: "t1", name: "Skill", input: {} }])])).toEqual([
 				{ name: "Skill", kind: "builtin", calls: 1 },

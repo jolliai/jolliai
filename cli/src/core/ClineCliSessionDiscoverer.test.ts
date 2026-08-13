@@ -69,6 +69,19 @@ describe("scanClineCliSessions", () => {
 		expect(r.sessions.map((s) => s.sessionId)).toEqual(["s3"]);
 	});
 
+	it("drops a VALID sidecar that carries neither spelling of a workspace root", async () => {
+		// Distinct from the corrupt case above: this parses fine, it just cannot be
+		// attributed to any repo. Carrying it with an empty directory list would make it
+		// match nothing downstream anyway — dropping it here is what keeps the scan's own
+		// count honest rather than reporting a session no repo will ever claim.
+		await writeSession(sessionsDir, "sNoRoot", { session_id: "sNoRoot", metadata: { title: "orphan" } });
+		await writeSession(sessionsDir, "sOk", { session_id: "sOk", workspace_root: project });
+
+		const r = await scanClineCliSessions(project, sessionsDir);
+
+		expect(r.sessions.map((s) => s.sessionId)).toEqual(["sOk"]);
+	});
+
 	it("discoverClineCliSessions strips error channel", async () => {
 		const sessions = await discoverClineCliSessions(project);
 		expect(Array.isArray(sessions)).toBe(true);
@@ -91,6 +104,26 @@ describe("scanClineCliSessions", () => {
 		expect(r.sessions.map((s) => s.sessionId)).not.toContain("sOld");
 		// s5 should be skipped (no messages file)
 		expect(r.sessions.map((s) => s.sessionId)).not.toContain("s5");
+	});
+
+	// The dashboard's history back-fill widens the window explicitly; the sidebar,
+	// `jolli status` and the post-commit summary generation keep the 48h default by
+	// omitting the parameter.
+	it("admits a session outside the 48h default when an explicit wider window is passed", async () => {
+		const sevenDays = 7 * 24 * 60 * 60 * 1000;
+		await writeSession(sessionsDir, "sBackfill", { workspace_root: project });
+		const threeDaysAgo = new Date(Date.now() - 72 * 60 * 60 * 1000);
+		const messagesPath = join(sessionsDir, "sBackfill", "sBackfill.messages.json");
+		await utimes(messagesPath, threeDaysAgo, threeDaysAgo);
+
+		// The default 48h window excludes it…
+		expect((await scanClineCliSessions(project, sessionsDir)).sessions).toEqual([]);
+		// …a 7-day window admits it, and the QueueWorker wrapper forwards the value.
+		const wide = await scanClineCliSessions(project, sessionsDir, sevenDays);
+		expect(wide.sessions.map((s) => s.sessionId)).toEqual(["sBackfill"]);
+		detector.sessionsDir = sessionsDir;
+		const viaWrapper = await discoverClineCliSessions(project, sevenDays);
+		expect(viaWrapper.map((s) => s.sessionId)).toEqual(["sBackfill"]);
 	});
 
 	it("skips sessions from different workspace_root/cwd", async () => {

@@ -34,6 +34,8 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
+import { mapWithConcurrency, withIoBudget } from "../util/Concurrency.js";
+import { type DiskSession, sessionsForRepo } from "./DiskSessionScan.js";
 import { sessionDirBelongsToRepo } from "./SessionDirMatch.js";
 
 const log = createLogger("KimiDiscoverer");
@@ -67,21 +69,48 @@ const CWD_STATE_FIELDS = ["workDir", "cwd", "workingDirectory", "workspaceRoot",
  * staleness window (48 hours).
  *
  * @param projectDir - The git repository root to match sessions against
+ * @param windowMs - Staleness window; defaults to {@link SESSION_STALE_MS}. The
+ *   dashboard's history back-fill passes a wider one (7 days); every caller that
+ *   must keep the 48 h horizon omits it — the sidebar's Active Conversations,
+ *   `jolli status`, and `QueueWorker`'s post-commit summary, which decides which
+ *   conversations belong to the commit being summarised. Widening that last one
+ *   would write week-old unrelated conversations into a commit's stored memory,
+ *   persistently and silently, which is why the constant stays a default.
  * @returns Array of matching sessions with source="kimi"
  */
-export async function discoverKimiSessions(projectDir: string): Promise<ReadonlyArray<SessionInfo>> {
+export async function discoverKimiSessions(projectDir: string, windowMs?: number): Promise<ReadonlyArray<SessionInfo>> {
+	return kimiSessionsForRepo(await scanKimiSessionsOnDisk(windowMs), projectDir);
+}
+
+/**
+ * Scans every Kimi session tree on this machine and returns those inside the window,
+ * each carrying the working directory its `state.json` recorded.
+ *
+ * MACHINE-WIDE and repo-agnostic on purpose. `~/.kimi-code/sessions/` is one global
+ * tree whose `<workDirKey>` buckets are `wd_<slug>_<hash>` names Kimi does not
+ * document, so they cannot be derived from a repo path and every bucket has to be
+ * opened. A repo-scoped scan therefore re-reads every `state.json` on the machine
+ * once per registered repo. Callers scan once and narrow with
+ * {@link kimiSessionsForRepo}.
+ */
+export async function scanKimiSessionsOnDisk(windowMs?: number): Promise<ReadonlyArray<DiskSession>> {
 	const sessionsDir = join(kimiCodeHome(), "sessions");
-	const resolvedProject = resolve(projectDir);
-	const sessions: SessionInfo[] = [];
+	const staleMs = windowMs ?? SESSION_STALE_MS;
+	const scanned: DiskSession[] = [];
 
 	let workDirKeys: string[];
 	try {
 		workDirKeys = await readdir(sessionsDir);
 	} catch {
 		log.debug("Kimi sessions directory not found: %s", sessionsDir);
-		return sessions;
+		return scanned;
 	}
 
+	// Every session directory on the machine, flattened first so the fan-out below is
+	// over sessions rather than over buckets. Bucket counts are lopsided — one project
+	// the user lives in can hold most of their sessions — so fanning out per bucket
+	// would leave the widest one running alone.
+	const sessionDirs: Array<{ readonly sessionId: string; readonly sessionDir: string }> = [];
 	for (const workDirKey of workDirKeys) {
 		const workDirPath = join(sessionsDir, workDirKey);
 		let sessionIds: string[];
@@ -90,18 +119,40 @@ export async function discoverKimiSessions(projectDir: string): Promise<Readonly
 		} catch {
 			continue;
 		}
-
 		for (const sessionId of sessionIds) {
-			const sessionDir = join(workDirPath, sessionId);
-			const session = await tryParseSession(sessionDir, sessionId, resolvedProject);
-			if (session) {
-				sessions.push(session);
-			}
+			sessionDirs.push({ sessionId, sessionDir: join(workDirPath, sessionId) });
 		}
 	}
 
-	log.debug("Discovered %d Kimi session(s)", sessions.length);
-	return sessions;
+	// One `stat` plus one small `state.json` read per session, each independent — and
+	// each taking a slot from the shared budget inside `tryParseSession`, so this
+	// running alongside the other scans cannot push the process past its total.
+	const parsed = await mapWithConcurrency(sessionDirs, ({ sessionId, sessionDir }) =>
+		tryParseSession(sessionDir, sessionId, staleMs),
+	);
+	scanned.push(...parsed.filter((session): session is DiskSession => session !== null));
+
+	log.debug("Kimi disk scan: %d session(s) inside the window", scanned.length);
+	return scanned;
+}
+
+/**
+ * Narrows a machine-wide Kimi scan to one repo.
+ *
+ * Attribution is prefix/containment, unchanged from when it ran inside the scan: a
+ * session started in a SUBDIRECTORY of the repo still counts, while one living in a
+ * nested git repo does not.
+ */
+export function kimiSessionsForRepo(
+	scanned: ReadonlyArray<DiskSession>,
+	projectDir: string,
+): ReadonlyArray<SessionInfo> {
+	// The predicate is verbatim what ran inside the scan, `resolve` on both sides
+	// included — this change moved when it runs, not what it says.
+	const resolvedProject = resolve(projectDir);
+	const mine = sessionsForRepo(scanned, (dir) => sessionDirBelongsToRepo(resolve(dir), resolvedProject));
+	log.debug("Discovered %d Kimi session(s) for %s", mine.length, projectDir);
+	return mine;
 }
 
 /**
@@ -119,46 +170,50 @@ export async function isKimiInstalled(): Promise<boolean> {
 }
 
 /**
- * Builds a SessionInfo for one `<workDirKey>/<sessionId>/` tree, or null when it
- * has no readable transcript, is stale, or cannot be attributed to the project.
+ * Builds a scanned session for one `<workDirKey>/<sessionId>/` tree, or null when it
+ * has no readable transcript, is stale, or records no working directory at all.
+ *
+ * Repo attribution is deliberately NOT done here: it belongs to
+ * {@link kimiSessionsForRepo}, so one scan of this global tree can serve every
+ * registered repo instead of being re-run per repo. A session with no working
+ * directory is still dropped here — with no directory it can never be attributed, so
+ * carrying it forward would only make every filter re-decide the same thing.
  */
-async function tryParseSession(
-	sessionDir: string,
-	sessionId: string,
-	resolvedProject: string,
-): Promise<SessionInfo | null> {
+async function tryParseSession(sessionDir: string, sessionId: string, staleMs: number): Promise<DiskSession | null> {
 	const transcriptPath = join(sessionDir, "agents", "main", "wire.jsonl");
 
 	// Staleness gate BEFORE reading state.json — an absent/old transcript is
-	// skipped with a single stat.
+	// skipped with a single stat. Zero bytes claimed from the budget: a `stat` and a
+	// small `state.json` need a slot, not part of the byte allowance a whole
+	// transcript would take.
 	let mtimeIso: string;
 	try {
-		const fileStat = await stat(transcriptPath);
+		const fileStat = await withIoBudget(0, () => stat(transcriptPath));
 		mtimeIso = fileStat.mtime.toISOString();
 	} catch {
 		return null;
 	}
-	if (Date.now() - new Date(mtimeIso).getTime() > SESSION_STALE_MS) {
+	if (Date.now() - new Date(mtimeIso).getTime() > staleMs) {
 		return null;
 	}
 
-	const state = await readState(sessionDir);
+	const state = await withIoBudget(0, () => readState(sessionDir));
 	const cwd = cwdFromState(state);
 	if (!cwd) {
 		log.debug("No working directory in state.json for Kimi session %s", sessionId);
 		return null;
 	}
-	if (!sessionDirBelongsToRepo(resolve(cwd), resolvedProject)) {
-		return null;
-	}
 
 	const title = titleFromState(state);
 	return {
-		sessionId,
-		transcriptPath,
-		updatedAt: mtimeIso,
-		source: "kimi",
-		...(title ? { title } : {}),
+		session: {
+			sessionId,
+			transcriptPath,
+			updatedAt: mtimeIso,
+			source: "kimi",
+			...(title ? { title } : {}),
+		},
+		dirs: [cwd],
 	};
 }
 

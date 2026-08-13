@@ -148,6 +148,37 @@ describe("resolveSessionTitle", () => {
 		expect(result).toBe("the first human turn");
 		expect(readFirstUserMessageTitle).not.toHaveBeenCalled();
 	});
+
+	describe("a supplied aiTitle", () => {
+		const claude = { sessionId: "s", transcriptPath: "/t/s.jsonl", updatedAt: "x", source: "claude" as const };
+
+		it("is used without streaming the transcript", async () => {
+			expect(await resolveSessionTitle(claude, undefined, "handed over")).toBe("handed over");
+			expect(readClaudeAiTitle).not.toHaveBeenCalled();
+		});
+
+		it("null means 'looked, found none' and still skips the stream", async () => {
+			// The state the three-way parameter exists for: a short conversation with no
+			// ai-title row is common, and treating its absence as "unknown" would leave
+			// the up-to-4 MB stream on for most sessions.
+			vi.mocked(readFirstUserMessageTitle).mockResolvedValue("from the entries");
+
+			const result = await resolveSessionTitle(claude, [{ role: "human", content: "from the entries" }], null);
+
+			expect(result).toBe("from the entries");
+			expect(readClaudeAiTitle).not.toHaveBeenCalled();
+		});
+
+		it("undefined means 'did not look', so the stream still runs", async () => {
+			vi.mocked(readClaudeAiTitle).mockResolvedValue("streamed");
+			expect(await resolveSessionTitle(claude, undefined, undefined)).toBe("streamed");
+			expect(readClaudeAiTitle).toHaveBeenCalledTimes(1);
+		});
+
+		it("loses to a native SessionInfo.title, which is still checked first", async () => {
+			expect(await resolveSessionTitle({ ...claude, title: "native" }, undefined, "handed over")).toBe("native");
+		});
+	});
 });
 
 // Every source has an entry in PARSE_LINE, but the ones whose discoverer always

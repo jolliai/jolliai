@@ -34,8 +34,10 @@ import type { Command } from "commander";
 import { getProjectRootDir } from "../core/GitOps.js";
 import { readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
+import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
 import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
+import { sourceOfSessionPassKey } from "../dashboard/DashboardCollector.js";
 import { canUseDashboardDb, DASHBOARD_SQLITE_MIN_VERSION, ensureDashboardDbExists } from "../dashboard/DashboardDb.js";
 import {
 	DASHBOARD_HEALTH_SERVICE,
@@ -43,7 +45,12 @@ import {
 	type StartedDashboardServer,
 	startDashboardServer,
 } from "../dashboard/DashboardServer.js";
-import { type DbBackfillProgress, dbBackfillRepos } from "../dashboard/DbBackfill.js";
+import {
+	type DbBackfillProgress,
+	type DbBackfillResult,
+	dbBackfillRepos,
+	type SessionSourceTotals,
+} from "../dashboard/DbBackfill.js";
 import { listActiveRepos, registerRepo } from "../dashboard/RepoRegistry.js";
 import { type ServerTelemetryHandle, startServerTelemetry } from "../dashboard/ServerTelemetry.js";
 import { createLogger, errMsg } from "../Logger.js";
@@ -790,6 +797,15 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 		//
 		// The counts are MEMORIES, not events: events are the activity tier, and
 		// this whole line is about the thing the user was told was migrating.
+		// The session tier's own line, printed ahead of the memory one and on the same
+		// terms: directly, not through the deferred writer. It has to be its own line
+		// because the progress block's reveal rule deliberately excludes `sessions`, so
+		// on a converged re-run — where git and memories are both cursor-gated into
+		// silence — the tier that DID the 7-day back-fill was the one tier with no
+		// output at all. A run that pulled in eighteen previously unreachable
+		// conversations printed exactly what a run that did nothing printed.
+		printSessionSummary(worked);
+
 		const migrated = worked.reduce((sum, r) => sum + (r.sotImport?.nodes ?? 0), 0);
 		const bootstrapped = worked.filter((r) => r.mode === "bootstrapped").length;
 		const newMemories = worked.reduce((sum, r) => sum + (r.sotImport?.updated ?? 0), 0);
@@ -808,6 +824,95 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 	} catch (err) {
 		output.error(`  Warning: memory migration failed: ${errMsg(err)}\n`);
 	}
+}
+
+/**
+ * One line for the AI-conversation tier: how far back it looked, how many it read,
+ * how many it skipped, and which agents the read ones came from.
+ *
+ * Both counts are stated outright rather than as "18 of 24", which asks the reader to
+ * subtract — and would give them the wrong answer if they did. `processed` and
+ * `skipped` need not add up to `discovered`: a session with an unparseable instant is
+ * neither (see {@link SessionTierSummary}). So the two numbers a reader would act on
+ * are the two that are printed, and `discovered` is stated as the window's reach — the
+ * figure that shows a 7-day scan doing something a 48-hour one could not.
+ *
+ * ONE format for both outcomes, including the converged run where `processed` is 0.
+ * A separate "nothing to do" sentence would read as a different kind of event; the
+ * same sentence with a zero in it reads as the same event with nothing in it.
+ *
+ * It prints at all — rather than staying silent when nothing changed — for the reason
+ * the memory line does: silence makes a converged re-run indistinguishable from a run
+ * that never happened, which is the complaint that produced all of this.
+ *
+ * Silent only when no repo reached the tier — there is nothing to report then, not
+ * even a zero.
+ *
+ * ## Merged by CONVERSATION, never by adding the repos' counts
+ *
+ * Every number here is a count of distinct {@link SessionTierSummary.keys} entries,
+ * because one conversation is routinely claimed by several repos and adding the
+ * per-repo counts therefore reports it several times. Cursor is the clearest case —
+ * its global store records no workspace for a composer, so every in-window composer
+ * belongs to every repo Cursor has a workspace for — and two clones of one project do
+ * it outright. Summing inflated the headline by roughly the number of registered
+ * repos, and only on a machine with several of them, which is why it read as
+ * plausible. The per-repo counts stay correct as per-repo facts; they are simply not
+ * addable, and this is the reader that has to know it.
+ */
+export function printSessionSummary(worked: ReadonlyArray<DbBackfillResult>): void {
+	const tiers = worked.map((r) => r.sessions).filter((s): s is NonNullable<typeof s> => s !== undefined);
+	if (tiers.length === 0) return;
+
+	// One entry per conversation, holding the strongest outcome any repo reported for
+	// it. Processed outranks skipped, and skipped outranks "discovered but neither" —
+	// a conversation this run actually read is a read conversation, however many other
+	// repos already held it. Without that ranking the merge would be arrival-ordered,
+	// and the headline would then depend on which repo the registry happened to list
+	// first.
+	const outcome = new Map<string, 0 | 1 | 2>();
+	const mark = (keys: ReadonlyArray<string>, rank: 0 | 1 | 2): void => {
+		for (const key of keys) {
+			const seen = outcome.get(key);
+			if (seen === undefined || rank > seen) outcome.set(key, rank);
+		}
+	};
+	for (const tier of tiers) {
+		mark(tier.keys.discovered, 0);
+		mark(tier.keys.skipped, 1);
+		mark(tier.keys.processed, 2);
+	}
+
+	// Both totals and the per-agent split come from the SAME deduped map, so the two
+	// can never disagree — the agent lines add up to the headline by construction
+	// rather than by two loops agreeing. The agent is read off the key, which is where
+	// the collector put it.
+	const bySource = new Map<string, { discovered: number; processed: number; skipped: number }>();
+	let discovered = 0;
+	let processed = 0;
+	let skipped = 0;
+	for (const [key, rank] of outcome) {
+		const source = sourceOfSessionPassKey(key);
+		const total = bySource.get(source) ?? { discovered: 0, processed: 0, skipped: 0 };
+		discovered++;
+		total.discovered++;
+		if (rank === 2) {
+			processed++;
+			total.processed++;
+		} else if (rank === 1) {
+			skipped++;
+			total.skipped++;
+		}
+		bySource.set(source, total);
+	}
+
+	const days = Math.round(BACKFILL_SESSION_WINDOW_MS / 86_400_000);
+	const noun = discovered === 1 ? "conversation" : "conversations";
+	// The headline keeps the run-wide totals and drops the agent names it used to
+	// carry inline: the per-agent lines below say the same thing with the two numbers
+	// the inline form had no room for.
+	console.log(`  ✓ ${discovered} AI ${noun} in the last ${days} days: ${processed} processed, ${skipped} skipped`);
+	for (const line of formatSessionBreakdown(Object.fromEntries(bySource))) console.log(line);
 }
 
 /**
@@ -878,18 +983,33 @@ export function createProgressPrinter(deps: { readonly log?: (line: string) => v
 	let lastCommitQuarter = 0;
 	let warnedSlow = false;
 	let announcedResume = false;
-	let currentRepo: string | null = null;
+	let currentRepo: number | null = null;
 	const labelled = new Set<string>();
 	return {
 		onProgress: (progress) => {
-			if (progress.repoName !== currentRepo) {
-				currentRepo = progress.repoName;
+			// Keyed on the INDEX, not the name. `deriveRepoName` is the last path or URL
+			// segment and is not unique — two clones of one project, two worktrees of it,
+			// or two unrelated repos whose directory is called `app` all collide. On a
+			// collision a name test never fires, so the second repo printed no header, no
+			// phase labels (`labelled` was never cleared) and quarter marks continued from
+			// the previous repo's high-water: its whole run appeared UNDER the first
+			// repo's header, attributed to the wrong repo. `repoIndex` is 1-based and
+			// assigned per position, so it cannot collide.
+			if (progress.repoIndex !== currentRepo) {
+				currentRepo = progress.repoIndex;
 				lastQuarter = 0;
 				lastCommitQuarter = 0;
 				announcedResume = false;
 				labelled.clear();
 				if (progress.repoTotal > 1)
 					write(`  ${progress.repoName} (${progress.repoIndex}/${progress.repoTotal})`);
+			}
+			// Before the phase-start branch below: this marker carries a nonzero `done`
+			// on any repo that read something, so it would otherwise fall through to the
+			// commit-only counter rule and be dropped.
+			if (progress.sessionBreakdown) {
+				for (const line of formatSessionBreakdown(progress.sessionBreakdown)) write(line);
+				return;
 			}
 			// The scans before the migration. These are where the wall clock
 			// actually goes — measured 64 s of scanning against 3 s of migrating —
@@ -986,6 +1106,44 @@ const PHASE_LABELS: Record<"commits" | "summaries" | "sessions", string> = {
 	summaries: "Indexing stored memories…",
 	sessions: "Reading AI sessions…",
 };
+
+/**
+ * One indented line per agent: what the window turned up for it, how much was read,
+ * how much was already current.
+ *
+ * Sorted busiest-first and name-ordered on a tie, matching the run-wide summary — with
+ * up to a dozen possible agents, alphabetical order buries the one the user works in,
+ * and an unstable order makes two runs over the same data look different.
+ *
+ * Names are left-padded and each number right-padded to its own column, so the block
+ * reads as a table — which is the whole point of splitting it up: the reader is
+ * comparing agents against each other, and ragged numbers make that a per-line parse.
+ * Every width is computed per call rather than fixed at the widest possible value
+ * (`copilot-chat`, five-digit counts), because a machine running two agents should not
+ * be indented for ten it does not have.
+ *
+ * Returns EMPTY for a repo whose window turned up nothing — the phase label above it
+ * has already said the tier ran, and a list of zeroes for absent tools says less than
+ * no list at all. Sources are kept even when everything was skipped: "51 found, 0
+ * processed" is the case this breakdown exists to show.
+ */
+export function formatSessionBreakdown(bySource: Readonly<Record<string, SessionSourceTotals>>): string[] {
+	const rows = Object.entries(bySource).filter(([, counts]) => counts.discovered > 0);
+	if (rows.length === 0) return [];
+	rows.sort((a, b) => b[1].discovered - a[1].discovered || a[0].localeCompare(b[0]));
+	const nameWidth = Math.max(...rows.map(([source]) => source.length));
+	const widthOf = (pick: (c: SessionSourceTotals) => number): number =>
+		Math.max(...rows.map(([, counts]) => String(pick(counts)).length));
+	const foundWidth = widthOf((c) => c.discovered);
+	const processedWidth = widthOf((c) => c.processed);
+	const skippedWidth = widthOf((c) => c.skipped);
+	return rows.map(
+		([source, c]) =>
+			`      ${source.padEnd(nameWidth)}  ${String(c.discovered).padStart(foundWidth)} found` +
+			`, ${String(c.processed).padStart(processedWidth)} processed` +
+			`, ${String(c.skipped).padStart(skippedWidth)} skipped`,
+	);
+}
 
 /**
  * Registers this repo and runs {@link runHistoryImport} — the server-free

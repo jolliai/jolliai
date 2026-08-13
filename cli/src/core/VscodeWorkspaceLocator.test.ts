@@ -219,6 +219,77 @@ describe("findVscodeWorkspaceHash", () => {
 		expect(await findVscodeWorkspaceHash("Code", toNativePath("/Users/test/myproject"))).toBeNull();
 		expect(await findVscodeWorkspaceHash("Cursor", toNativePath("/Users/test/myproject"))).toBe("cursor1");
 	});
+
+	// ─── The forward direction, used by the machine-wide scans ──────────────────
+	describe("listVscodeWorkspaceFolders", () => {
+		it("returns every single-folder workspace with the path it opens", async () => {
+			// The direction a machine-wide scan needs: resolving a hash FROM a repo can
+			// only answer for the repo you already hold, so a scan built on the find
+			// re-reads every workspace.json once per registered repo.
+			makeWorkspaceEntry("Code", "ws-a", { folder: toFileUri("/Users/test/a") });
+			makeWorkspaceEntry("Code", "ws-b", { folder: toFileUri("/Users/test/b") });
+
+			const { listVscodeWorkspaceFolders } = await import("./VscodeWorkspaceLocator.js");
+			const found = await listVscodeWorkspaceFolders("Code");
+
+			expect(found.map((w) => w.hash).sort()).toEqual(["ws-a", "ws-b"]);
+			expect(found.find((w) => w.hash === "ws-a")?.folderPath).toBe(toNativePath("/Users/test/a"));
+		});
+
+		it("keeps BOTH entries when one folder is open under two workspaces", async () => {
+			// Routine — VS Code mints a new workspace per window identity. This is why the
+			// machine-wide scan cannot be `findVscodeWorkspaceHash` in a loop: that stops
+			// at the first match and would lose the second entry's sessions.
+			makeWorkspaceEntry("Code", "ws-1", { folder: toFileUri("/Users/test/same") });
+			makeWorkspaceEntry("Code", "ws-2", { folder: toFileUri("/Users/test/same") });
+
+			const { listVscodeWorkspaceFolders } = await import("./VscodeWorkspaceLocator.js");
+
+			expect((await listVscodeWorkspaceFolders("Code")).map((w) => w.hash).sort()).toEqual(["ws-1", "ws-2"]);
+		});
+
+		it("skips an entry with no workspace.json, a malformed one, and a multi-root one", async () => {
+			// A `workspace` field instead of `folder` is a multi-root `.code-workspace`
+			// file, which has no single folder to attribute sessions to.
+			makeWorkspaceEntry("Code", "ws-none", null);
+			makeWorkspaceEntry("Code", "ws-ok", { folder: toFileUri("/Users/test/ok") });
+			const bad = join(tmpRoot, "Library", "Application Support", "Code", "User", "workspaceStorage", "ws-bad");
+			mkdirSync(bad, { recursive: true });
+			writeFileSync(join(bad, "workspace.json"), "{ not json");
+			makeWorkspaceEntry("Code", "ws-multi", { workspace: "/Users/test/team.code-workspace" });
+
+			const { listVscodeWorkspaceFolders } = await import("./VscodeWorkspaceLocator.js");
+
+			expect((await listVscodeWorkspaceFolders("Code")).map((w) => w.hash)).toEqual(["ws-ok"]);
+		});
+
+		it("skips a folder URI that is not a file:// one", async () => {
+			// Remote workspaces (`vscode-remote://`, `ssh://`) have no local path, so there
+			// is nothing to match a repo against.
+			makeWorkspaceEntry("Code", "ws-remote", { folder: "vscode-remote://ssh-remote+box/home/u/p" });
+			makeWorkspaceEntry("Code", "ws-local", { folder: toFileUri("/Users/test/local") });
+
+			const { listVscodeWorkspaceFolders } = await import("./VscodeWorkspaceLocator.js");
+
+			expect((await listVscodeWorkspaceFolders("Code")).map((w) => w.hash)).toEqual(["ws-local"]);
+		});
+
+		it("returns an empty list when the storage directory is unreadable", async () => {
+			// Same silent degradation as the find, and for the same reason: a machine
+			// without this editor installed is not a failure to report.
+			const { listVscodeWorkspaceFolders } = await import("./VscodeWorkspaceLocator.js");
+			expect(await listVscodeWorkspaceFolders("VSCodium")).toEqual([]);
+		});
+
+		it("isolates flavors the same way the find does", async () => {
+			makeWorkspaceEntry("Cursor", "cursor-only", { folder: toFileUri("/Users/test/p") });
+
+			const { listVscodeWorkspaceFolders } = await import("./VscodeWorkspaceLocator.js");
+
+			expect(await listVscodeWorkspaceFolders("Code")).toEqual([]);
+			expect((await listVscodeWorkspaceFolders("Cursor")).map((w) => w.hash)).toEqual(["cursor-only"]);
+		});
+	});
 });
 
 describe("ALL_VSCODE_FLAVORS", () => {

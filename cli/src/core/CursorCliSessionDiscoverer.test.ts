@@ -56,6 +56,30 @@ describe("scanCursorCliSessions", () => {
 		expect(r).toEqual({ sessions: [] });
 	});
 
+	it("drops a chat whose meta.json records no cwd", async () => {
+		// The cwd is what the narrowing matches on, so a chat without one can never be
+		// attributed to any repo. It is dropped at scan time rather than carried with an
+		// empty directory list, which keeps the scan's own count honest.
+		//
+		// Only the surviving chat gets a transcript, and that is deliberate rather than
+		// lazy: the cwd test runs BEFORE the transcript lookup, so `uNo` is dropped for
+		// the reason this case is about, while a chat with no JSONL would be dropped
+		// later for an unrelated one — which would make the case pass without ever
+		// reaching the branch it names.
+		await writeChat(chatsDir, "hNo", "uNo", { updatedAtMs: now, title: "no cwd" });
+		await writeChat(chatsDir, "hOk", "uOk", { cwd: project, updatedAtMs: now });
+		await writeTranscript(
+			projectsDir,
+			"Users-x-proj-a",
+			"uOk",
+			'{"role":"user","message":{"content":[{"type":"text","text":"hi"}]}}\n',
+		);
+
+		const r = await scanCursorCliSessions(project, chatsDir, projectsDir);
+
+		expect(r.sessions.map((s) => s.sessionId)).toEqual(["uOk"]);
+	});
+
 	it("attributes by meta.cwd, sets source/title/updatedAt, resolves JSONL by uuid", async () => {
 		await writeChat(chatsDir, "h1", "u1", { cwd: project, updatedAtMs: now, title: "Hello There" });
 		const jsonl1 = '{"role":"user","message":{"content":[{"type":"text","text":"hi"}]}}\n';
@@ -111,6 +135,20 @@ describe("scanCursorCliSessions", () => {
 		await writeTranscript(projectsDir, "e", "u3", "{}\n");
 		const r = await scanCursorCliSessions(project, chatsDir, projectsDir);
 		expect(r.sessions).toHaveLength(0);
+	});
+
+	it("admits a session older than 48h when an explicit wider window is passed", async () => {
+		// 72h ago — outside the 48h default, inside the 7-day window the dashboard
+		// back-fill passes.
+		await writeChat(chatsDir, "hw", "uw", { cwd: project, updatedAtMs: now - 72 * 60 * 60 * 1000 });
+		await writeTranscript(projectsDir, "Users-x-proj-a", "uw", "{}\n");
+
+		// Omitted window: stale, as QueueWorker requires.
+		const dflt = await scanCursorCliSessions(project, chatsDir, projectsDir);
+		expect(dflt.sessions).toHaveLength(0);
+
+		const widened = await scanCursorCliSessions(project, chatsDir, projectsDir, 7 * 24 * 60 * 60 * 1000);
+		expect(widened.sessions.map((s) => s.sessionId)).toEqual(["uw"]);
 	});
 
 	it("falls back to createdAtMs when updatedAtMs missing; skips non-finite timestamp", async () => {

@@ -834,6 +834,15 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 	}
 
 	if (event.sessionLinks) {
+		// This statement's COLUMN LIST is load-bearing, and not only for what it writes.
+		// `title`, `started_at_ms` and `duration_ms` are absent because a commit summary
+		// cannot know them — and the back-fill's per-session skip reads that absence as
+		// "no transcript was ever read for this row" (`readKnownSessions` in DbBackfill).
+		// Its instant is the COMMIT's time, later than the conversation's last turn, so a
+		// row this seed created must never look like a read receipt: adding one of those
+		// three columns here would make the sweep skip that session's transcript on every
+		// pass from then on, permanently and silently. Token columns are safe — the
+		// summary genuinely observed those.
 		const seedSession = db.prepare(
 			`INSERT INTO sessions
 			   (event_id, repo_id, source, session_id, updated_at_ms, message_count,

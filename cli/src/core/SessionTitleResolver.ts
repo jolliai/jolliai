@@ -46,10 +46,26 @@ const PARSE_LINE: Record<TranscriptSource, (line: string) => string | undefined>
  * message-count), pass them in and the resolver skips its own redundant
  * `readFirstUserMessageTitle` stream — extracting the first human turn
  * directly from the array. Saves one full transcript scan per session.
+ *
+ * `aiTitle` is the same bargain for step 2, and it needs THREE states rather than
+ * two. `undefined` means "I did not look" and the resolver streams the file itself.
+ * A string is the title it found. **`null` means "I looked and there is none"**, which
+ * is the state that actually matters: without it a caller who had already read the
+ * whole transcript still paid a second streaming pass of up to
+ * `ClaudeAiTitleReader.TAIL_SCAN_BYTES` — 4 MB — to be told the same nothing. A short
+ * conversation with no `ai-title` row is a common case, not an edge one, so treating
+ * absence as "unknown" would have left the expensive path on for most sessions.
+ *
+ * **No production caller passes `aiTitle` today.** The dashboard back-fill did, out of
+ * the Claude disk scan's own parse, until that handoff was reverted for the resident-set
+ * reason in `acceptFacts` (`ClaudeSessionDiscoverer`). The parameter stays because the
+ * three-state contract is the part that was hard to get right, and any caller that
+ * regains the answer cheaply needs it — not because something is currently using it.
  */
 export async function resolveSessionTitle(
 	session: SessionInfo,
 	mergedEntries?: ReadonlyArray<TranscriptEntry>,
+	aiTitle?: string | null,
 ): Promise<string> {
 	// 1. Pre-populated native title (cheap path for opencode/cursor/copilot).
 	if (typeof session.title === "string" && session.title.trim().length > 0) {
@@ -65,7 +81,12 @@ export async function resolveSessionTitle(
 	// whose live transcript is gone): opening a read stream on "" is a real
 	// fs round-trip that always ENOENTs — pure waste, and it made callers'
 	// evidence pipelines timing-sensitive for nothing.
-	if (source === "claude" && session.transcriptPath) {
+	// A caller that already knows the answer short-circuits the stream — including
+	// when the answer is "there is none" (`null`), which is the whole point of the
+	// three-state parameter.
+	if (aiTitle !== undefined) {
+		if (aiTitle) return truncateToCodePoints(aiTitle, TITLE_MAX_CODE_POINTS);
+	} else if (source === "claude" && session.transcriptPath) {
 		try {
 			const ai = await readClaudeAiTitle(session.transcriptPath);
 			if (ai && ai.length > 0) {

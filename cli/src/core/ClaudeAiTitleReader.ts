@@ -43,6 +43,27 @@ const AI_TITLE_FRAGMENT = '"type":"ai-title"';
  */
 export const TAIL_SCAN_BYTES = 4 * 1024 * 1024;
 
+/**
+ * The title carried by one already-parsed transcript record, if it carries one.
+ *
+ * The whole rule, in one place, so a caller that has already parsed the line does not
+ * have to restate it, and so {@link readClaudeAiTitle} below has exactly one
+ * definition of what a title row IS.
+ *
+ * The Claude disk scan used to be the other caller — it parses every line anyway, so
+ * folding this over those records saved it a second streaming pass of up to
+ * {@link TAIL_SCAN_BYTES}. That was reverted with the rest of the content handoff (see
+ * `acceptFacts` in `ClaudeSessionDiscoverer`), so the streaming reader is the only
+ * caller today. Kept exported because it is the rule, not a helper of that one loop.
+ *
+ * "Last one wins" is the caller's job, not this function's — it answers about one
+ * record. That is the same order the streaming loop below relies on.
+ */
+export function aiTitleFromRecord(raw: { readonly type?: unknown; readonly aiTitle?: unknown }): string | undefined {
+	if (raw.type !== "ai-title") return undefined;
+	return typeof raw.aiTitle === "string" && raw.aiTitle.length > 0 ? raw.aiTitle : undefined;
+}
+
 export async function readClaudeAiTitle(transcriptPath: string): Promise<string | undefined> {
 	let latest: string | undefined;
 	let parseSkipped = 0;
@@ -69,18 +90,18 @@ export async function readClaudeAiTitle(transcriptPath: string): Promise<string 
 					dropPartial = false;
 					continue;
 				}
-				// Pre-filter: skip lines that can't possibly be ai-title rows.
-				// The literal substring `"type":"ai-title"` (including the
-				// trailing closing quote) is exactly what Claude Code writes,
-				// and any line that passes this check also satisfies
-				// `obj.type === "ai-title"` once parsed — so an explicit
-				// `obj.type !== "ai-title"` check post-parse is redundant.
+				// Pre-filter: skip lines that can't possibly be ai-title rows, so the
+				// common line never reaches JSON.parse. The literal substring
+				// `"type":"ai-title"` (including the trailing closing quote) is exactly
+				// what Claude Code writes, so a line that passes this also satisfies the
+				// `type` test inside `aiTitleFromRecord` — the two agree by construction
+				// and the second one is what makes that function safe for a caller
+				// (the disk scan) that has no fragment pre-filter to lean on.
 				if (!line.includes(AI_TITLE_FRAGMENT)) continue;
 				try {
-					const obj = JSON.parse(line) as { aiTitle?: unknown };
-					if (typeof obj.aiTitle === "string" && obj.aiTitle.length > 0) {
-						latest = obj.aiTitle;
-					}
+					// `aiTitleFromRecord` owns what a title row IS; this loop owns only
+					// "the last one wins" and the tail-slice mechanics above.
+					latest = aiTitleFromRecord(JSON.parse(line) as Record<string, unknown>) ?? latest;
 				} catch {
 					// Skip malformed ai-title row but keep scanning so a
 					// later valid row still produces a title. Aggregate count

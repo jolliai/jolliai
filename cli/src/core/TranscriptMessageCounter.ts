@@ -24,21 +24,11 @@
 
 import { createLogger, errMsg } from "../Logger.js";
 import type { SessionInfo, TranscriptEntry, TranscriptReadResult, TranscriptSource } from "../Types.js";
-import { readAntigravityTranscript } from "./AntigravityTranscriptReader.js";
-import { readClineCliTranscript } from "./ClineCliTranscriptReader.js";
-import { readClineTranscript } from "./ClineTranscriptReader.js";
 import { applyOverlay, loadOverlay } from "./ConversationOverlayStore.js";
-import { readCopilotChatTranscript } from "./CopilotChatTranscriptReader.js";
-import { readCopilotTranscript } from "./CopilotTranscriptReader.js";
-import { readCursorCliTranscript } from "./CursorCliTranscriptReader.js";
-import { readCursorTranscript } from "./CursorTranscriptReader.js";
-import { readDevinTranscript } from "./DevinTranscriptReader.js";
-import { readGeminiTranscript } from "./GeminiTranscriptReader.js";
-import { readOpenCodeTranscript } from "./OpenCodeTranscriptReader.js";
 import { loadCursorForTranscript } from "./SessionTracker.js";
 import { loadTranscript } from "./TranscriptLoader.js";
-import { getParserForSource } from "./TranscriptParser.js";
-import { isMissingTranscriptError, readTranscript } from "./TranscriptReader.js";
+import { isMissingTranscriptError } from "./TranscriptReader.js";
+import { readTranscriptForSource } from "./TranscriptSourceReader.js";
 
 const log = createLogger("TranscriptMessageCounter");
 
@@ -127,35 +117,8 @@ async function readUnreadTranscript(
 	transcriptPath: string,
 	cursor: Awaited<ReturnType<typeof loadCursorForTranscript>>,
 ): Promise<TranscriptReadResult> {
-	switch (source) {
-		case "gemini":
-			return readGeminiTranscript(transcriptPath, cursor);
-		case "opencode":
-			return readOpenCodeTranscript(transcriptPath, cursor);
-		case "cursor":
-			return readCursorTranscript(transcriptPath, cursor);
-		case "copilot":
-			return readCopilotTranscript(transcriptPath, cursor);
-		case "devin":
-			return readDevinTranscript(transcriptPath, cursor);
-		case "cursor-cli":
-			return readCursorCliTranscript(transcriptPath, cursor);
-		case "copilot-chat":
-			return readCopilotChatTranscript(transcriptPath, cursor ?? undefined);
-		case "cline":
-			return readClineTranscript(transcriptPath, cursor);
-		case "cline-cli":
-			return readClineCliTranscript(transcriptPath, cursor);
-		case "antigravity":
-			return readAntigravityTranscript(transcriptPath, cursor ?? undefined);
-		case "codex":
-			return readTranscript(transcriptPath, cursor, getParserForSource("codex"));
-		case "kimi":
-			return readTranscript(transcriptPath, cursor, getParserForSource("kimi"));
-		default:
-			// Claude is the fallback parser; SessionInfo.source defaults to
-			// "claude" for back-compat, so unknown values flow through here
-			// too rather than throwing.
-			return readTranscript(transcriptPath, cursor, getParserForSource("claude"));
-	}
+	// The dispatch itself lives in `TranscriptSourceReader`, shared with the dashboard
+	// back-fill. It used to be inline here, where nothing else could reach it — which
+	// is how the back-fill ended up unable to read anything but Claude.
+	return readTranscriptForSource(source, transcriptPath, cursor);
 }

@@ -144,6 +144,23 @@ describe("discoverKimiSessions", () => {
 		await rm(repo, { recursive: true, force: true });
 	});
 
+	it("admits that session when an explicit wider window is passed", async () => {
+		// The staleness gate sits in a per-session helper, so this also pins that the
+		// parameter reaches it rather than stopping at the exported function.
+		const repo = await mkdtemp(join(realTmpdir(), "kimi-repo-"));
+		await writeKimiSession({ workDir: repo, ageMs: 49 * 60 * 60 * 1000 });
+		const sessions = await discoverKimiSessions(repo, 7 * 24 * 60 * 60 * 1000);
+		expect(sessions).toHaveLength(1);
+		await rm(repo, { recursive: true, force: true });
+	});
+
+	it("still rejects a session older than the widened window", async () => {
+		const repo = await mkdtemp(join(realTmpdir(), "kimi-repo-"));
+		await writeKimiSession({ workDir: repo, ageMs: 8 * 24 * 60 * 60 * 1000 });
+		expect(await discoverKimiSessions(repo, 7 * 24 * 60 * 60 * 1000)).toEqual([]);
+		await rm(repo, { recursive: true, force: true });
+	});
+
 	it("ignores a non-directory entry in the sessions tree", async () => {
 		const repo = await mkdtemp(join(realTmpdir(), "kimi-repo-"));
 		await writeKimiSession({ workDir: repo });
@@ -157,6 +174,16 @@ describe("discoverKimiSessions", () => {
 	it("skips a session with malformed state.json (no recoverable cwd)", async () => {
 		const repo = await mkdtemp(join(realTmpdir(), "kimi-repo-"));
 		await writeKimiSession({ rawState: "{ not json" });
+		expect(await discoverKimiSessions(repo)).toEqual([]);
+		await rm(repo, { recursive: true, force: true });
+	});
+
+	it("skips a state.json that is valid JSON but not an OBJECT", async () => {
+		// A different failure from the one above, and it does not throw: `JSON.parse`
+		// succeeds and hands back `null`, so the parse-error path never runs. Without the
+		// shape test the reader would go on to index a non-object for `workDir`.
+		const repo = await mkdtemp(join(realTmpdir(), "kimi-repo-"));
+		await writeKimiSession({ rawState: "null" });
 		expect(await discoverKimiSessions(repo)).toEqual([]);
 		await rm(repo, { recursive: true, force: true });
 	});
