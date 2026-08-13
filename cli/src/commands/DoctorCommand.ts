@@ -617,19 +617,34 @@ export async function runSchemaLog(action: { mark?: string }): Promise<void> {
 		// exists: catch it and fall through to the shared diagnosis below, so the
 		// reader gets the "database could not be read" guidance instead of a raw throw.
 		let marked = false;
+		let openError: unknown;
 		try {
 			marked = await withRepairDashboardDb((db) =>
 				inTransaction(db, () => recordMigrationAsApplied(db, action.mark as string)),
 			);
-		} catch {
-			marked = false;
+		} catch (err) {
+			openError = err;
 		}
 		if (!marked) {
-			// Four ways to land here, and the user can act on the difference: a name this
-			// build has never carried, a database with no log table to write into, a log
-			// table that exists but cannot be read, or a database that cannot be read at all.
+			// Five ways to land here. Four are states `readSchemaLogState` reports (a name
+			// this build never carried, no log table to write into, a log table that
+			// cannot be read, a database that cannot be read at all). The fifth is a
+			// WRITABLE open — or its transaction — that threw: a lock a busy retry could
+			// not clear, or a read-only mount. It has to be told apart, because the
+			// read-only re-read below can still SUCCEED past a write lock (WAL) or on a
+			// read-only file, so `whyNothingWasRecorded` would find a readable log and
+			// blame an "Unknown migration" for a name this build plainly carries.
 			const state = await readSchemaLogState();
-			console.error(whyNothingWasRecorded(action.mark, state));
+			if (openError !== undefined && state.kind === "rows") {
+				const reason = openError instanceof Error ? openError.message : String(openError);
+				console.error(
+					`\nThe database could not be opened for writing: ${reason}\n` +
+						"    Nothing was recorded — another Jolli process may be writing (retry), or the\n" +
+						"    database is on a read-only mount. This is not an unknown migration.",
+				);
+			} else {
+				console.error(whyNothingWasRecorded(action.mark, state));
+			}
 			process.exitCode = 1;
 			return;
 		}

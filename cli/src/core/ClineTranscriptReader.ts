@@ -7,6 +7,7 @@ import {
 	mapClineRole,
 	type NormalizedMessage,
 } from "./ClineTranscriptShared.js";
+import { logTranscriptReadFailure } from "./TranscriptReader.js";
 
 const log = createLogger("ClineReader");
 
@@ -75,7 +76,7 @@ export async function readClineTranscript(
 		const parsed = JSON.parse(await readFile(transcriptPath, "utf8")) as unknown;
 		raw = Array.isArray(parsed) ? (parsed as ExtMessage[]) : [];
 	} catch (error: unknown) {
-		log.error("Failed to read Cline transcript %s: %s", transcriptPath, (error as Error).message);
+		logTranscriptReadFailure(log, `Cannot read Cline transcript: ${transcriptPath}`, error);
 		return emptyClineReadResult(transcriptPath, cursor);
 	}
 	const messages: NormalizedMessage[] = raw.map((msg) => {

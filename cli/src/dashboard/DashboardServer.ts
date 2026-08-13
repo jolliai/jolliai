@@ -99,13 +99,13 @@ import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js
 import { trackAs } from "../core/Telemetry.js";
 import { isTelemetryEventName, type TelemetryEventName } from "../core/TelemetryEvents.js";
 import { resolveAssetsDir as resolveGraphAssetsDir } from "../graph/GraphExport.js";
-import { install, uninstall } from "../install/Installer.js";
+import { install } from "../install/Installer.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
 import type { LocalAgentToolId } from "../Types.js";
 import {
 	DASHBOARD_SCHEMA_VERSION,
 	ensureDashboardDbExists,
-	readSchemaVersion,
+	isSchemaCurrent,
 	withDashboardDb,
 	withReadonlyDashboardDb,
 } from "./DashboardDb.js";
@@ -133,8 +133,7 @@ import {
 } from "./KnowledgeQuery.js";
 import { buildMemoriesPage, type ReachableCommits, readContextDoc } from "./MemoriesQuery.js";
 import { probeRepo } from "./RepoProbe.js";
-import { deregisterRepo, existingWorktrees, readRepoRegistry, registerRepo } from "./RepoRegistry.js";
-import { buildRepositoriesModel } from "./RepositoriesQuery.js";
+import { existingWorktrees, readRepoRegistry, registerRepo } from "./RepoRegistry.js";
 import {
 	applySettings,
 	checkLocalFolder,
@@ -237,7 +236,6 @@ export const DASHBOARD_SCRIPT_FILES = [
 	"shell.js",
 	"stats.js",
 	"standup.js",
-	"repositories.js",
 	"memories.js",
 	"knowledge.js",
 	"graph.js",
@@ -272,7 +270,7 @@ export function resolveDashboardAssetsDir(baseDir: string = HERE): string {
  * the strict no-CORS policy costs the page nothing.
  *
  * `token` (when given) is inlined as `window.__JOLLI_DASHBOARD_TOKEN__` —
- * the mutation-only credential `repositories.js` attaches to its own POSTs
+ * the mutation-only credential `JD.post` attaches to every POST it makes
  * (see the module header for why GET stays token-free). Optional so the
  * many existing tests that call this with two arguments are unaffected.
  */
@@ -434,24 +432,17 @@ export type ModelRequest = Omit<QueryOptions, "timeZone" | "nowMs"> & {
 	 * fires) and `Host: 127.0.0.1:<port>` passes layer 1, so a background tab
 	 * could loop `?view=stats` with varied window params — each miss on
 	 * DecisionGist's 256-entry cache being a real LLM call the user never sees.
-	 * The `/` redirect below already avoids this one view for the same reason;
-	 * this closes the route that redirect cannot cover.
+	 * The `/` redirect builds no model at all, so this is the only route that
+	 * needs the gate.
+	 *
+	 * A `skipReachability` twin sat here, for a caller that read only
+	 * `repos.length` and must not pay the per-repo `git rev-list --branches`
+	 * fan-out. Its one producer was the `/` redirect, back when the destination
+	 * depended on whether any repo was enabled; that redirect is unconditional
+	 * now, so the option had a reader and no writer — an axis whose only effect
+	 * was to make the reachability condition look conditional.
 	 */
 	readonly allowModelSpend?: boolean;
-	/**
-	 * Set when the caller reads only the parts of the model every view carries —
-	 * today just `repos.length`, for the `/` redirect — and must not pay for the
-	 * per-repo `git rev-list --branches` fan-out {@link REACHABILITY_VIEWS} would
-	 * otherwise trigger.
-	 *
-	 * The redirect builds the `repositories` model to stay clear of the stats
-	 * view's LLM call, and that became the expensive choice the moment
-	 * `repositories` joined the reachability set: one git subprocess per enabled
-	 * repo plus every root memory hash materialized in JS, to decide a 302 whose
-	 * destination then does the same work again. `isReachable` fails open, so the
-	 * counts this skips revert to their raw values — which the redirect discards.
-	 */
-	readonly skipReachability?: boolean;
 };
 
 /** Builds the model for one request. Injectable so tests skip the real DB. */
@@ -465,11 +456,10 @@ export type ModelBuilder = (request: ModelRequest) => Promise<DashboardModel>;
  * memory-facing rows are filtered, because a rewritten commit's `memories` row
  * is a DUPLICATE of the surviving one, not a record of separate work.
  *
- * `repositories` is here for its per-repo memory badge alone: that number must
- * answer the same question the Memories tree does, or the two pages contradict
- * each other for any repo whose history was rewritten away.
+ * `repositories` used to be here too, for its per-repo memory badge; it went
+ * with that page.
  */
-const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>(["stats", "memories", "repositories"]);
+const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>(["stats", "memories"]);
 
 /**
  * How long one worktree's git identity is trusted. Minutes, not hours: the value
@@ -601,24 +591,15 @@ async function defaultModelBuilder(
 			// commits' rows in `commits` and `memories` forever, since nothing
 			// else notices they dropped off every branch — see `ReachableCommits`.
 			// Every view that renders per-commit rows pays for the check: the
-			// memories tree, the stats page's Memory Activity feed and captured
-			// counts, and the Repositories page's per-repo memory badge.
-			//
-			// Computed BEFORE the repositories model, which consumes it. Skipped
-			// for a caller that never looks at the filtered rows — see
-			// `ModelRequest.skipReachability`.
-			const reachableCommits =
-				REACHABILITY_VIEWS.has(request.view) && !request.skipReachability
-					? await readReachableCommitsByRepo(
-							db
-								.prepare("SELECT repo_identity, worktree_root FROM repos WHERE disabled_at IS NULL")
-								.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
-						)
-					: undefined;
-			const repositories =
-				request.view === "repositories"
-					? await buildRepositoriesModel(db, configDir, reachableCommits)
-					: undefined;
+			// memories tree, and the stats page's Memory Activity feed and captured
+			// counts. Every other view skips it outright.
+			const reachableCommits = REACHABILITY_VIEWS.has(request.view)
+				? await readReachableCommitsByRepo(
+						db
+							.prepare("SELECT repo_identity, worktree_root FROM repos WHERE disabled_at IS NULL")
+							.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
+					)
+				: undefined;
 			// Standup is a FIRST-PERSON report, unlike every other view: its columns
 			// feed a Copy-as-standup draft the user posts as their own work, so a
 			// shared branch's teammate commits are a false claim rather than noise.
@@ -634,7 +615,6 @@ async function defaultModelBuilder(
 					: undefined;
 			const built = buildDashboardModel(db, {
 				...request,
-				...(repositories ? { repositoriesModel: repositories } : {}),
 				...(settingsModel ? { settingsModel } : {}),
 				...(knowledgeModel ? { knowledgeModel } : {}),
 				...(graphModel ? { graphModel } : {}),
@@ -650,7 +630,7 @@ async function defaultModelBuilder(
 /**
  * Stats view only: compresses the Decisions card's "Latest" text into one
  * sentence for display. Runs after `buildDashboardModel` (rather than as a
- * pre-fetch alongside envFacts/hooks/repositories above) because the text to
+ * pre-fetch alongside the settings/reachability reads above) because the text to
  * compress isn't known until that call returns the `latest` decision. Fails
  * open — a missing API key, LLM error, or timeout just leaves `latest.text`
  * as-is; see DecisionGist.ts.
@@ -924,9 +904,23 @@ async function handleTelemetry(req: IncomingMessage, res: ServerResponse): Promi
 	res.writeHead(204).end();
 }
 
+/**
+ * The page's repo scope, from zero or more `repo=` params.
+ *
+ * REPEATED params, never one comma-joined value: a repo identity is a remote URL
+ * for anything with a remote, so any delimiter we picked would be a character an
+ * identity may legitimately contain — and splitting on it would silently answer
+ * for two repos that do not exist instead of the one that does.
+ *
+ * A single `?repo=x` therefore keeps parsing exactly as it always did, which is
+ * what makes every existing bookmark and the Repositories row button survive the
+ * move to a multi-select picker. Blank values are dropped so a `?repo=` the
+ * browser emitted with nothing behind it reads as "all repos" rather than as an
+ * identity no repo can match.
+ */
 function parseScope(url: URL): DashboardScope {
-	const repo = url.searchParams.get("repo");
-	return repo ? { kind: "repo", repoIdentity: repo } : { kind: "all" };
+	const repos = url.searchParams.getAll("repo").filter((value) => value.length > 0);
+	return repos.length > 0 ? { kind: "repo", repoIdentities: repos } : { kind: "all" };
 }
 
 /** Series-axis request param; anything unrecognized falls back to the default. */
@@ -991,11 +985,19 @@ function parseWindow(url: URL): Omit<ModelRequest, "view" | "scope"> {
  * change. Each view has exactly ONE path: the legacy `/stats` and `/standup`
  * aliases were removed, so a bookmark on either now 404s. That was a
  * deliberate call — two URLs for one page is what made `shell.js`'s nav, the
- * range control and the repo filter able to disagree about where a view lives.
+ * range control and the repo picker able to disagree about where a view lives.
  *
  * `/decisions` is retired — its view token, model payload and page are gone
  * (folded into Memories' per-topic Decisions callout) — so it is absent here
- * and handled as its own 302 in `handle()` instead.
+ * and handled as its own 302 in `handle()` instead. `/repositories` is retired
+ * too and gets no such redirect: it had no content to fold anywhere, so it 404s.
+ *
+ * NOTHING IS GATED. A `GATED_PATHS` set used to redirect the three paths above to
+ * `/repositories` while no repo was enabled, with Repositories as the row that
+ * opened the gate. With that page gone the gate has nowhere to send anyone — a
+ * redirect to a 404, or a loop back to the same path — so the zero-repo case is
+ * a state the stats view renders (the enable instruction that page used to
+ * carry) rather than a place to be sent.
  *
  * `settings` has NO page path — it is a MODAL opened over any page from the nav
  * (`shell.js` → `JD.openSettings`), which fetches its model via
@@ -1008,7 +1010,6 @@ function parseWindow(url: URL): Omit<ModelRequest, "view" | "scope"> {
  * those are NOT view paths and are handled directly in `handle()`.
  */
 const VIEW_PATHS: Readonly<Record<string, DashboardView>> = {
-	"/repositories": "repositories",
 	"/dashboard": "stats",
 	"/dashboard/standup": "standup",
 	"/memories": "memories",
@@ -1027,7 +1028,6 @@ const VIEW_PATHS: Readonly<Record<string, DashboardView>> = {
 const VIEW_TOKENS: ReadonlySet<string> = new Set<DashboardView>([
 	"stats",
 	"standup",
-	"repositories",
 	"memories",
 	"knowledge",
 	"graph",
@@ -1043,14 +1043,6 @@ const VIEW_TOKENS: ReadonlySet<string> = new Set<DashboardView>([
  * appended by the client to the one it asked about.
  */
 const TOOL_USAGE_LISTS: ReadonlyArray<ToolUsageList> = ["skill", "server", "tool"];
-
-/**
- * New destinations that redirect to Repositories when nothing is enabled yet
- * — mirrors the mockup's nav gating ("nothing for any of them to read" before
- * a repo is set up). `/repositories` is deliberately absent — it is the row
- * that opens the gate, so it must stay reachable with zero repos.
- */
-const GATED_PATHS = new Set(["/dashboard", "/dashboard/standup", "/memories"]);
 
 /**
  * Creates (but does not start) the server. Exported separately from
@@ -1112,7 +1104,7 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		// clickjack: a cross-site page that FRAMES this server issues same-origin
 		// requests from inside the frame, Origin and all, and the port is one of two
 		// hard-coded candidates so it is guessable. One tricked click on an overlaid
-		// frame was enough to POST /api/repos/disable with the page's own mutation
+		// frame was enough to POST /api/settings/apply with the page's own mutation
 		// token. `frame-ancestors` is the modern rule; X-Frame-Options covers the
 		// clients that predate it. Set on EVERY response, not just the HTML — an
 		// api response rendered in a frame is equally usable as a probe.
@@ -1176,23 +1168,14 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		}
 
 		if (url.pathname === "/") {
-			// Repositories is the landing page until something is enabled; once it
-			// is, land on the Dashboard. Built as `repositories`, NOT `stats`:
-			// `repos` is on every model, while the stats view additionally runs
-			// the whole stats query set and can fire a DecisionGist LLM call — so
-			// merely opening the base URL by hand used to spend model budget on a
-			// redirect. Same gate as the destination pages below, one model each.
-			// `skipReachability` because only `repos.length` is read here: the
-			// per-repo git fan-out the `repositories` view otherwise pays for would
-			// buy a memory badge this response throws away, and the page it
-			// redirects to computes it again anyway.
-			const model = await buildModel({
-				view: "repositories",
-				scope: parseScope(url),
-				...parseWindow(url),
-				skipReachability: true,
-			});
-			res.writeHead(302, { Location: model.repos.length === 0 ? "/repositories" : "/dashboard" });
+			// Unconditional now. This used to build a whole `repositories` model
+			// just to choose between two destinations — the LANDING page depended
+			// on whether anything was enabled yet, so the redirect had to know.
+			// With Repositories gone there is one destination, and the "nothing
+			// enabled" case is a state the Dashboard renders rather than a place
+			// to be sent. That deletes a full model build (and the DecisionGist
+			// avoidance dance it was shaped around) from the base URL.
+			res.writeHead(302, { Location: "/dashboard" });
 			res.end();
 			return;
 		}
@@ -1217,11 +1200,6 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 				...parseWindow(url),
 				allowModelSpend: !isCrossSiteRequest(req),
 			});
-			if (GATED_PATHS.has(url.pathname) && model.repos.length === 0) {
-				res.writeHead(302, { Location: "/repositories" });
-				res.end();
-				return;
-			}
 			assetsDir ??= options.assetsDir ?? resolveDashboardAssetsDir();
 			const html = assembleDashboardHtml(assetsDir, JSON.stringify(model), token);
 			res.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
@@ -1532,14 +1510,10 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			await handleEnable(res, b);
 			return;
 		}
-		if (url.pathname === "/api/repos/disable") {
-			await handleDisable(res, b);
-			return;
-		}
-		if (url.pathname === "/api/repos/resume") {
-			await handleResume(res, b);
-			return;
-		}
+		// `/api/repos/disable` and `/api/repos/resume` were the Repositories page's
+		// per-row Pause / Resume. Both went with that page. Pausing a repository
+		// is still a thing — `jolli disable` writes `disabled_at` and every query
+		// here still honours it — it just has no dashboard control any more.
 		if (url.pathname === "/api/hooks/reinstall") {
 			await handleHooksReinstall(res, b);
 			return;
@@ -1795,11 +1769,12 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	 * Projects a registry mutation into the `repos` table — the step `jolli enable`
 	 * gets for free from the backfill it runs and a long-lived server does not.
 	 *
-	 * Every read surface filters on `repos.disabled_at IS NULL`, and this server
+	 * The reachability reads filter on `repos.disabled_at IS NULL`, and this server
 	 * never re-backfills (its only timer is the idle-shutdown poll), so an
 	 * unprojected write stays invisible until the next `jolli dashboard`: a repo
-	 * added from this page has no row, so every gated route 302s and the button
-	 * appears to do nothing, while a paused one keeps counting in every KPI.
+	 * added from this page has no row, so it is missing everywhere, while a paused
+	 * one keeps counting in every KPI (the repo picker now lists it, marked paused,
+	 * rather than dropping it).
 	 *
 	 * Re-reads the registry rather than taking the caller's entry: `registerRepo` /
 	 * `deregisterRepo` are the writers, and what has to be projected is the state
@@ -1831,13 +1806,15 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			// normally — the database refuses nobody, see the compatibility note in
 			// `DashboardDb`. The exact-equality test this replaces also degraded the
 			// list whenever the file was merely newer.
-			const found = await withReadonlyDashboardDb(readSchemaVersion, dbOpts);
-			if (found < DASHBOARD_SCHEMA_VERSION) {
-				log.info(
-					"skipping registry projection: database schema v%d predates this build's v%d",
-					found,
-					DASHBOARD_SCHEMA_VERSION,
-				);
+			//
+			// The predicate is `isSchemaCurrent`, NOT `found < DASHBOARD_SCHEMA_VERSION`:
+			// under the name key a file can be at the current stamp with a named migration
+			// still pending, and `withDashboardDb` below would then MIGRATE it from this
+			// long-lived process — exactly what the guard exists to prevent. Standing down
+			// leaves the apply to the startup `ensureDashboardDbExists` or a hook.
+			const current = await withReadonlyDashboardDb(isSchemaCurrent, dbOpts);
+			if (!current) {
+				log.info("skipping registry projection: a schema migration is pending for this build");
 				return staleList;
 			}
 			await withDashboardDb((db) => projectRepoRegistryState(db, entry), dbOpts);
@@ -1872,47 +1849,6 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		return { repoIdentity, worktreeRoot: entry.worktreeRoot, roots: existingWorktrees(entry) };
 	}
 
-	async function handleDisable(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
-		const target = await resolveRegisteredRepo(res, body);
-		if (!target) return;
-		for (const root of target.roots) {
-			const result = await uninstall(root, { preserveMenu: true, persistManualDisable: true });
-			if (!result.success) {
-				sendJson(res, 500, { error: result.message });
-				return;
-			}
-		}
-		await deregisterRepo({ cwd: target.worktreeRoot, configDir });
-		const warning = await projectRegistryEntry(target.repoIdentity);
-		sendJson(res, 200, { ok: true, ...(warning ? { warning } : {}) });
-	}
-
-	async function handleResume(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
-		const target = await resolveRegisteredRepo(res, body);
-		if (!target) return;
-		// clearManualDisableOnSuccess is what makes resume actually resume: pausing
-		// from this page goes through `uninstall(persistManualDisable: true)`, which
-		// writes `userDisabled: true`, and that flag alone stops capture even with
-		// every hook back in place. Reinstalling without clearing it returns ok and
-		// changes nothing observable.
-		//
-		// Per checkout, mirroring the pause: the flag it clears is per-clone, so a
-		// resume that visited only one root would leave the other one flagged and
-		// silent.
-		for (const root of target.roots) {
-			const result = await install(root, { source: "cli", clearManualDisableOnSuccess: true });
-			if (!result.success) {
-				sendJson(res, 500, { error: result.message });
-				return;
-			}
-		}
-		// registerRepo clears disabledAt on an existing entry — the same
-		// "re-registering is re-enabling" behaviour `jolli enable` relies on.
-		await registerRepo({ cwd: target.worktreeRoot, configDir });
-		const warning = await projectRegistryEntry(target.repoIdentity);
-		sendJson(res, 200, { ok: true, ...(warning ? { warning } : {}) });
-	}
-
 	async function handleHooksReinstall(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
 		const target = await resolveRegisteredRepo(res, body);
 		if (!target) return;
@@ -1927,8 +1863,9 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		// `.claude/skills/jolli-*`, which skill-revision gating then stops
 		// `jolli enable` from restoring.
 		//
-		// Every checkout, like pause/resume: hooks live in each clone's own
-		// `.git/hooks`, and this row's button speaks for the whole identity.
+		// Every checkout: hooks live in each clone's own `.git/hooks`, while the
+		// registry row this resolves from is keyed by repo IDENTITY and therefore
+		// speaks for every clone of it.
 		for (const root of target.roots) {
 			const result = await install(root, { source: "cli" });
 			if (!result.success) {

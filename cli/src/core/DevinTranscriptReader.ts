@@ -26,7 +26,7 @@ import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
 import { withSqliteDb } from "./SqliteHelpers.js";
 import { builtinTool, ToolUseTally } from "./ToolNameClassify.js";
-import { mergeConsecutiveEntries } from "./TranscriptReader.js";
+import { mergeConsecutiveEntries, throwTranscriptReadError } from "./TranscriptReader.js";
 
 const log = createLogger("DevinReader");
 
@@ -276,14 +276,6 @@ export async function readDevinTranscript(
 		// Always present, even when empty — see TOOL_RECORDING_SOURCES.
 		return { entries, newCursor, totalLinesRead, toolUse: tally.values() };
 	} catch (error: unknown) {
-		log.error("Failed to read Devin session %s: %s", sessionId, (error as Error).message);
-		// Preserve an ENOENT code so callers (e.g. TranscriptLoader) can treat a
-		// vanished DB as a silent "not present" rather than a real read failure.
-		const wrapped = new Error(`Cannot read Devin session: ${sessionId}`) as NodeJS.ErrnoException;
-		const code = (error as NodeJS.ErrnoException | undefined)?.code;
-		if (code !== undefined) {
-			wrapped.code = code;
-		}
-		throw wrapped;
+		throwTranscriptReadError(log, `Cannot read Devin session: ${sessionId}`, error);
 	}
 }

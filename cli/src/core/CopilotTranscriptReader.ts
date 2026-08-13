@@ -14,7 +14,7 @@
 import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
 import { withSqliteDb } from "./SqliteHelpers.js";
-import { mergeConsecutiveEntries } from "./TranscriptReader.js";
+import { mergeConsecutiveEntries, throwTranscriptReadError } from "./TranscriptReader.js";
 
 const log = createLogger("CopilotTranscriptReader");
 
@@ -80,8 +80,7 @@ export async function readCopilotTranscript(
 		);
 		return { entries, newCursor, totalLinesRead };
 	} catch (error: unknown) {
-		log.error("Failed to read Copilot session %s: %s", sessionId.substring(0, 8), (error as Error).message);
-		throw new Error(`Cannot read Copilot session: ${sessionId}`);
+		throwTranscriptReadError(log, `Cannot read Copilot session: ${sessionId}`, error);
 	}
 }
 

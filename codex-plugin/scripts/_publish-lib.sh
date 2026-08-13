@@ -24,7 +24,14 @@ PLUGIN_DIR="$SRC/plugins/jolli"
 # Codex bootstrap never installs Claude's agent hooks — dist completeness is a
 # machine-global contract (DistPathWriter.REQUIRED_RUNTIME_FILES), and a dist that
 # wins the version race must be able to serve another host's repo hooks too.
-# Kept in lockstep with plugins/jolli/scripts/build.mjs entryPoints.
+# Kept in lockstep with plugins/jolli/scripts/build.mjs entryPoints, and — for the
+# dashboard scripts, same order — with DASHBOARD_SCRIPT_FILES in
+# cli/src/dashboard/DashboardServer.ts; a drift either way fails
+# PluginDashboardAssets.test.ts rather than waiting for release time. Both directions
+# matter: a script listed here that the build no longer emits makes
+# `publish_assert_dist_built` refuse EVERY publish (local/dev/prod/zip alike), and a
+# script the server loads but this list omits can be dropped by a marketplace-repo
+# .gitignore and 500 the first `jolli dashboard`.
 PUBLISH_REQUIRED_DIST=(
 	Cli.js CodexPluginBootstrapHook.js McpLauncher.js StopHook.js SessionStartHook.js
 	PostCommitHook.js PostMergeHook.js PostRewriteHook.js PrepareMsgHook.js PrePushHook.js
@@ -36,8 +43,10 @@ PUBLISH_REQUIRED_DIST=(
 	dashboard-assets/js/shell.js
 	dashboard-assets/js/stats.js
 	dashboard-assets/js/standup.js
-	dashboard-assets/js/repositories.js
 	dashboard-assets/js/memories.js
+	dashboard-assets/js/knowledge.js
+	dashboard-assets/js/graph.js
+	dashboard-assets/js/settings.js
 	dashboard-assets/js/main.js
 )
 

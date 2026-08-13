@@ -93,7 +93,6 @@ function writeTestAssets(base: string): string {
 		"stats.js",
 		"standup.js",
 		"graph.js",
-		"repositories.js",
 		"memories.js",
 		"knowledge.js",
 		"settings.js",
@@ -190,10 +189,26 @@ afterEach(async () => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
+/* `dbPath` and `configDir` are defaulted to the per-test temp dir because
+   omitting them is not "unused" — `createDashboardServer` falls back to the
+   MACHINE's real `~/.jolli/jollimemory/jollimemory.db` and real repo registry,
+   and one write route follows that fallback all the way to an INSERT:
+   `projectRegistryEntry` (DashboardServer.ts) projects the registry into
+   `repos`. So a write-surface test running with a mocked `readRepoRegistry`
+   wrote its own fixture into the developer's live database — a repo named
+   `acme-api` at `/tmp/acme-api`, `enabled_at: "t"`, `disabled_at` NULL, which
+   every read surface then showed as a real repo in the picker. It is also not
+   removable by the obvious means: `repos_no_delete` (DashboardDb.ts) aborts any
+   DELETE on `repos`, by design, so the only cleanup is stamping `disabled_at`.
+   Nothing failed — the enable tests assert an exact `{ok, repoIdentity}` body,
+   which is what a SUCCESSFUL projection returns — so this was silent both ways.
+   `over` still spreads last: a test wanting a specific path passes one. */
 function testServer(over: Partial<Parameters<typeof createDashboardServer>[0]> = {}): Server {
 	return createDashboardServer({
 		port: 0,
 		assetsDir,
+		dbPath: join(dir, "testserver-default.db"),
+		configDir: join(dir, "testserver-default-config"),
 		buildModel: async (req) => model(req.view),
 		...over,
 	});
@@ -225,7 +240,7 @@ describe("security layers", () => {
 		const port = await listen(testServer());
 		const status = await new Promise<number>((resolve, reject) => {
 			const req = request(
-				{ host: "127.0.0.1", port, path: "/repositories", headers: { Host: "evil.com" } },
+				{ host: "127.0.0.1", port, path: "/memories", headers: { Host: "evil.com" } },
 				(res) => {
 					res.resume();
 					resolve(res.statusCode ?? 0);
@@ -240,12 +255,12 @@ describe("security layers", () => {
 	it("403s a cross-origin request on every route, including the JSON endpoint", async () => {
 		const port = await listen(testServer());
 		expect((await get(port, "/api/model", { Origin: "https://evil.com" })).status).toBe(403);
-		expect((await get(port, "/repositories", { Origin: "https://evil.com" })).status).toBe(403);
+		expect((await get(port, "/memories", { Origin: "https://evil.com" })).status).toBe(403);
 	});
 
 	it("serves every read path with no credential — the mutation token gates only POST/probe, never GET pages", async () => {
 		const port = await listen(testServer());
-		expect((await get(port, "/repositories")).status).toBe(200);
+		expect((await get(port, "/memories")).status).toBe(200);
 		expect((await get(port, "/api/model")).status).toBe(200);
 		const health = await get(port, "/health");
 		expect(health.status).toBe(200);
@@ -254,7 +269,7 @@ describe("security layers", () => {
 
 	it("never emits Access-Control-Allow-Origin", async () => {
 		const port = await listen(testServer());
-		const res = await get(port, "/repositories");
+		const res = await get(port, "/memories");
 		expect(res.headers.get("access-control-allow-origin")).toBeNull();
 	});
 
@@ -269,9 +284,9 @@ describe("security layers", () => {
 });
 
 describe("navigation", () => {
-	it("serves the page directly at /repositories — no handshake, no cookie", async () => {
+	it("serves the page directly at /memories — no handshake, no cookie", async () => {
 		const port = await listen(testServer());
-		const res = await get(port, "/repositories");
+		const res = await get(port, "/memories");
 		expect(res.status).toBe(200);
 		const html = await res.text();
 		expect(html).toContain("window.__JOLLI_DASHBOARD__");
@@ -280,39 +295,46 @@ describe("navigation", () => {
 		expect(res.headers.get("set-cookie")).toBeNull();
 	});
 
-	it("redirects / to /repositories when nothing is enabled yet", async () => {
-		const port = await listen(testServer());
-		const root = await get(port, "/");
-		expect(root.status).toBe(302);
-		expect(root.headers.get("location")).toBe("/repositories");
-	});
-
-	it("redirects / to /dashboard once a repo is enabled", async () => {
+	it("redirects / to /dashboard, and builds no model to decide it", async () => {
+		// The destination used to depend on whether anything was enabled, so this
+		// route built a whole `repositories` model just to pick between two
+		// targets. There is one target now, and "nothing enabled yet" is a state
+		// the Dashboard renders rather than a place to be sent.
+		const views: string[] = [];
 		const port = await listen(
 			testServer({
-				buildModel: async (req) => ({
-					...model(req.view),
-					repos: [{ repoIdentity: "r1", repoName: "r1", worktreeRoot: "/r1", sessionsThisWeek: 0 }],
-				}),
+				buildModel: async (req) => {
+					views.push(req.view);
+					return model(req.view);
+				},
 			}),
 		);
 		const root = await get(port, "/");
 		expect(root.status).toBe(302);
 		expect(root.headers.get("location")).toBe("/dashboard");
+		expect(views).toEqual([]);
 	});
 
-	it("gates the new destinations behind /repositories when no repo is enabled", async () => {
+	it("gates nothing — every destination renders with zero repos", async () => {
+		// The gate redirected these three to /repositories. That page is gone, so
+		// a gate could only redirect to a 404 or to itself.
 		const port = await listen(testServer());
 		for (const path of ["/dashboard", "/dashboard/standup", "/memories"]) {
-			const res = await get(port, path);
-			expect(res.status, path).toBe(302);
-			expect(res.headers.get("location"), path).toBe("/repositories");
+			expect((await get(port, path)).status, path).toBe(200);
 		}
 	});
 
-	it("keeps Repositories reachable with zero repos — it is the page that opens the gate", async () => {
-		const port = await listen(testServer());
-		expect((await get(port, "/repositories")).status).toBe(200);
+	it("404s the retired /repositories page and its Pause/Resume endpoints", async () => {
+		const port = await listen(testServer({ token: "t" }));
+		expect((await get(port, "/repositories")).status).toBe(404);
+		for (const path of ["/api/repos/disable", "/api/repos/resume"]) {
+			const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+				method: "POST",
+				headers: { "content-type": "application/json", "X-Jolli-Dashboard-Token": "t" },
+				body: JSON.stringify({ repoIdentity: "r1" }),
+			});
+			expect(res.status, path).toBe(404);
+		}
 	});
 
 	// One page, one URL: the legacy aliases were removed rather than kept as
@@ -361,7 +383,37 @@ describe("routes", () => {
 		const res = await get(port, "/api/model?view=standup&repo=r1");
 		expect(res.status).toBe(200);
 		expect(((await res.json()) as DashboardModel).view).toBe("standup");
-		expect(scopes).toEqual([{ kind: "repo", repoIdentity: "r1" }]);
+		expect(scopes).toEqual([{ kind: "repo", repoIdentities: ["r1"] }]);
+	});
+
+	it("reads a multi-repo scope from REPEATED repo params", async () => {
+		// Repeated rather than comma-joined: an identity is a remote URL, so any
+		// delimiter is a character one may legitimately contain.
+		const scopes: DashboardScope[] = [];
+		const port = await listen(
+			testServer({
+				buildModel: async (req) => {
+					scopes.push(req.scope);
+					return model(req.view);
+				},
+			}),
+		);
+		await get(port, "/api/model?view=stats&repo=r1&repo=https%3A%2F%2Fgithub.com%2Fa%2Fb");
+		expect(scopes).toEqual([{ kind: "repo", repoIdentities: ["r1", "https://github.com/a/b"] }]);
+	});
+
+	it("reads a blank repo param as all repos, not as an identity nothing matches", async () => {
+		const scopes: DashboardScope[] = [];
+		const port = await listen(
+			testServer({
+				buildModel: async (req) => {
+					scopes.push(req.scope);
+					return model(req.view);
+				},
+			}),
+		);
+		await get(port, "/api/model?view=stats&repo=");
+		expect(scopes).toEqual([{ kind: "all" }]);
 	});
 
 	it("defaults /api/model to the stats view and the all scope", async () => {
@@ -407,11 +459,9 @@ describe("routes", () => {
 			expect(spendFlags).toEqual([true]);
 		});
 
-		// `/repositories` rather than a GATED_PATH: the shared `model()` helper
-		// has no repos, so /dashboard would 302 before rendering.
 		it("allows spend for a page render — the by-hand URL keeps its full payload", async () => {
 			const port = await listen(spyServer());
-			expect((await get(port, "/repositories")).status).toBe(200);
+			expect((await get(port, "/dashboard")).status).toBe(200);
 			expect(spendFlags).toEqual([true]);
 		});
 
@@ -420,7 +470,7 @@ describe("routes", () => {
 		// and a real LLM call.
 		it("withholds spend from a cross-site page load", async () => {
 			const port = await listen(spyServer());
-			const res = await get(port, "/repositories", { "Sec-Fetch-Site": "cross-site" });
+			const res = await get(port, "/dashboard", { "Sec-Fetch-Site": "cross-site" });
 			expect(res.status).toBe(200);
 			expect(spendFlags).toEqual([false]);
 		});
@@ -446,11 +496,11 @@ describe("routes", () => {
 
 	it("serves every view as a page and over the API, and rejects an unknown one", async () => {
 		const port = await listen(testServer());
-		const page = await get(port, "/repositories");
+		const page = await get(port, "/memories");
 		expect(page.status).toBe(200);
 		expect(page.headers.get("content-type")).toBe("text/html");
 		// The API speaks view TOKENS, which are no longer the paths.
-		for (const view of ["stats", "standup", "repositories", "memories", "knowledge", "graph"] as const) {
+		for (const view of ["stats", "standup", "memories", "knowledge", "graph"] as const) {
 			const api = await get(port, `/api/model?view=${view}`);
 			expect(((await api.json()) as DashboardModel).view).toBe(view);
 		}
@@ -471,7 +521,6 @@ describe("routes", () => {
 		});
 		const port = await listen(withRepo);
 		const cases: ReadonlyArray<[string, DashboardModel["view"]]> = [
-			["/repositories", "repositories"],
 			["/dashboard", "stats"],
 			["/dashboard/standup", "standup"],
 			["/memories", "memories"],
@@ -619,7 +668,7 @@ describe("routes", () => {
 		);
 		await get(port, "/api/model?dimension=branch");
 		await get(port, "/api/model?dimension=; DROP TABLE");
-		await get(port, "/repositories?dimension=ticket");
+		await get(port, "/memories?dimension=ticket");
 		expect(dimensions).toEqual(["branch", undefined, "ticket"]);
 	});
 
@@ -648,8 +697,8 @@ describe("routes", () => {
 				},
 			}),
 		);
-		await get(port, "/repositories?range=month");
-		await get(port, "/repositories?range=custom&from=2026-07-01&to=2026-07-15");
+		await get(port, "/memories?range=month");
+		await get(port, "/memories?range=custom&from=2026-07-01&to=2026-07-15");
 		await get(port, "/api/model?range=fortnight");
 		// Bounds are forwarded verbatim — validation lives in resolveWindow, so the
 		// server has exactly one job here and cannot drift out of step with it.
@@ -833,7 +882,7 @@ describe("resolveDashboardAssetsDir", () => {
 	it("is resolved and used lazily by the server when no assetsDir is injected", async () => {
 		const server = createDashboardServer({ port: 0, buildModel: async (req) => model(req.view) });
 		const port = await listen(server);
-		const res = await get(port, "/repositories");
+		const res = await get(port, "/memories");
 		expect(res.status).toBe(200);
 		expect(await res.text()).toContain("window.__JOLLI_DASHBOARD__");
 	});
@@ -952,9 +1001,9 @@ describe("write surface", () => {
 		// The Origin check cannot see a clickjack: a page that FRAMES this server
 		// issues same-origin requests from inside the frame, Origin and all, and the
 		// port is one of two hard-coded candidates. One tricked click on an overlaid
-		// frame was enough to POST /api/repos/disable with the page's own token.
+		// frame was enough to POST /api/settings/apply with the page's own token.
 		const port = await listen(writeServer());
-		for (const path of ["/repositories", "/api/model"]) {
+		for (const path of ["/memories", "/api/model"]) {
 			const res = await fetch(`http://127.0.0.1:${port}${path}`);
 			expect(res.headers.get("x-frame-options")).toBe("DENY");
 			expect(res.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
@@ -1077,88 +1126,6 @@ describe("write surface", () => {
 		expect((await res.json()) as { error: string }).toMatchObject({ error: "disk full" });
 	});
 
-	it("disables a registered repo: uninstalls with persistManualDisable, then deregisters", async () => {
-		vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValueOnce({
-			version: 1,
-			repos: [
-				{
-					repoIdentity: "r1",
-					repoName: "acme-api",
-					worktreeRoot: "/tmp/acme-api",
-					enabledAt: "2026-01-01T00:00:00Z",
-				},
-			],
-		});
-		const port = await listen(writeServer());
-		const res = await fetch(`http://127.0.0.1:${port}/api/repos/disable`, {
-			method: "POST",
-			headers: HEADERS,
-			body: JSON.stringify({ repoIdentity: "r1" }),
-		});
-		expect(res.status).toBe(200);
-		expect(installer.uninstall).toHaveBeenCalledWith(
-			"/tmp/acme-api",
-			expect.objectContaining({ preserveMenu: true, persistManualDisable: true }),
-		);
-		expect(repoRegistry.deregisterRepo).toHaveBeenCalled();
-	});
-
-	it("500s disable when uninstall fails, surfacing its message", async () => {
-		vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValue({
-			version: 1,
-			repos: [{ repoIdentity: "r1", repoName: "acme-api", worktreeRoot: "/tmp/acme-api", enabledAt: "t" }],
-		});
-		vi.mocked(installer.uninstall).mockResolvedValueOnce({ success: false, message: "in use", warnings: [] });
-		const port = await listen(writeServer());
-		const res = await fetch(`http://127.0.0.1:${port}/api/repos/disable`, {
-			method: "POST",
-			headers: HEADERS,
-			body: JSON.stringify({ repoIdentity: "r1" }),
-		});
-		expect(res.status).toBe(500);
-		expect((await res.json()) as { error: string }).toMatchObject({ error: "in use" });
-	});
-
-	// The whole point of resume. Pausing writes `userDisabled: true` (uninstall's
-	// persistManualDisable), and that flag stops capture on its own — so a resume
-	// that reinstalls the hooks but leaves it set returns 200 and silently keeps the
-	// repo dead. Only `clearManualDisableOnSuccess` clears it, so assert on the
-	// option, not just on the reinstall having happened.
-	it("resumes a registered repo: reinstalls (clearing the pause) and re-registers", async () => {
-		vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValueOnce({
-			version: 1,
-			repos: [{ repoIdentity: "r1", repoName: "acme-api", worktreeRoot: "/tmp/acme-api", enabledAt: "t" }],
-		});
-		const port = await listen(writeServer());
-		const res = await fetch(`http://127.0.0.1:${port}/api/repos/resume`, {
-			method: "POST",
-			headers: HEADERS,
-			body: JSON.stringify({ repoIdentity: "r1" }),
-		});
-		expect(res.status).toBe(200);
-		expect(installer.install).toHaveBeenCalledWith("/tmp/acme-api", {
-			source: "cli",
-			clearManualDisableOnSuccess: true,
-		});
-		expect(repoRegistry.registerRepo).toHaveBeenCalledWith(expect.objectContaining({ cwd: "/tmp/acme-api" }));
-	});
-
-	it("500s resume when install fails, surfacing its message", async () => {
-		vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValue({
-			version: 1,
-			repos: [{ repoIdentity: "r1", repoName: "acme-api", worktreeRoot: "/tmp/acme-api", enabledAt: "t" }],
-		});
-		vi.mocked(installer.install).mockResolvedValueOnce({ success: false, message: "no credential", warnings: [] });
-		const port = await listen(writeServer());
-		const res = await fetch(`http://127.0.0.1:${port}/api/repos/resume`, {
-			method: "POST",
-			headers: HEADERS,
-			body: JSON.stringify({ repoIdentity: "r1" }),
-		});
-		expect(res.status).toBe(500);
-		expect((await res.json()) as { error: string }).toMatchObject({ error: "no credential" });
-	});
-
 	// The retired routes. A 404 (not a 403) because the token check runs first
 	// for every POST — these are gone from the route table entirely.
 	it("404s the retired backfill and job routes", async () => {
@@ -1215,9 +1182,9 @@ describe("write surface", () => {
 		expect((await res.json()) as { error: string }).toMatchObject({ error: "locked" });
 	});
 
-	it("400s disable/resume/hooks-reinstall when repoIdentity is missing", async () => {
+	it("400s hooks-reinstall when repoIdentity is missing", async () => {
 		const port = await listen(writeServer());
-		for (const path of ["/api/repos/disable", "/api/repos/resume", "/api/hooks/reinstall"]) {
+		for (const path of ["/api/hooks/reinstall"]) {
 			const res = await fetch(`http://127.0.0.1:${port}${path}`, {
 				method: "POST",
 				headers: HEADERS,
@@ -1227,10 +1194,10 @@ describe("write surface", () => {
 		}
 	});
 
-	it("404s disable/resume/hooks-reinstall for an unregistered repoIdentity", async () => {
+	it("404s hooks-reinstall for an unregistered repoIdentity", async () => {
 		vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValue({ version: 1, repos: [] });
 		const port = await listen(writeServer());
-		for (const path of ["/api/repos/disable", "/api/repos/resume", "/api/hooks/reinstall"]) {
+		for (const path of ["/api/hooks/reinstall"]) {
 			const res = await fetch(`http://127.0.0.1:${port}${path}`, {
 				method: "POST",
 				headers: HEADERS,
@@ -1264,23 +1231,26 @@ describe("write surface", () => {
 });
 
 describe("defaultModelBuilder (no injected buildModel)", () => {
-	// Exercises the real per-view async reads (Repositories only) against an actual
-	// migrated SQLite dashboard db — every other test in this file injects
-	// `buildModel` and never touches this code path at all.
-	it("reads repositories for the Repositories view", async () => {
+	// Exercises the real query path against an actual migrated SQLite dashboard
+	// db — every other test in this file injects `buildModel` and never touches
+	// this code path at all.
+	it("builds each view from a real database, and refuses the retired one", async () => {
 		const dbPath = join(dir, "dashboard.db");
 		const configDir = join(dir, "config");
 		await withDashboardDb(() => {}, { dbPath });
 
 		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
 
-		const stats = await get(port, "/api/model?view=stats");
-		expect(stats.status).toBe(200);
-		expect(((await stats.json()) as DashboardModel).view).toBe("stats");
-
-		const repositories = await get(port, "/api/model?view=repositories");
-		expect(repositories.status).toBe(200);
-		expect(((await repositories.json()) as DashboardModel).view).toBe("repositories");
+		for (const view of ["stats", "standup", "memories"] as const) {
+			const res = await get(port, `/api/model?view=${view}`);
+			expect(res.status, view).toBe(200);
+			expect(((await res.json()) as DashboardModel).view, view).toBe(view);
+		}
+		// `repositories` is no longer a view token, and an unknown one falls back
+		// to stats rather than erroring — so a stale link renders a real page.
+		const retired = await get(port, "/api/model?view=repositories");
+		expect(retired.status).toBe(200);
+		expect(((await retired.json()) as DashboardModel).view).toBe("stats");
 	});
 
 	it("reads knowledge and graph models off the Memory Bank folder", async () => {
@@ -1349,11 +1319,10 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect((body.memories?.items ?? []).map((item) => item.commitHash)).toEqual(["reachable-hash"]);
 	});
 
-	// The `/` redirect reads `repos.length` and nothing else. It builds the
-	// `repositories` model to avoid the stats view's LLM call, and that view now
-	// pays a per-repo `git rev-list` for its memory badge — a badge this response
-	// discards, and which the page it redirects to computes again anyway.
-	it("skips the reachability fan-out for the / redirect, but pays it on the page itself", async () => {
+	// The `/` redirect builds no model at all now — it has one destination, so
+	// there is nothing to read `repos.length` for. The page it lands on still
+	// pays the per-repo `git rev-list` its memory rows are filtered by.
+	it("does no git work for the / redirect, but pays it on the page itself", async () => {
 		const dbPath = join(dir, "root-redirect.db");
 		const configDir = join(dir, "config-root");
 		await applyStatsEvents(
@@ -1379,7 +1348,7 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect(root.headers.get("location")).toBe("/dashboard");
 		expect(gitOps.listReachableCommits).not.toHaveBeenCalled();
 
-		expect((await get(port, "/repositories")).status).toBe(200);
+		expect((await get(port, "/memories")).status).toBe(200);
 		expect(gitOps.listReachableCommits).toHaveBeenCalledWith("/w/jolli");
 	});
 

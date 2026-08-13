@@ -795,6 +795,70 @@ describe("the migration log — identity is the name, not the slot", () => {
 		}
 	});
 
+	it("flushes rows applied before the log table existed even when it then SKIPS the creating entry", async () => {
+		// The Critical race, reproduced deterministically. This pass applies the pre-log
+		// entries (their DDL runs, the rows held in memory because there is nowhere yet to
+		// record them); a RIVAL that started from version 0 then creates the log table and
+		// records ONLY the entries from the log slot on; and this pass SKIPS every one of
+		// them. The skip used to `continue` without flushing the held rows, so those slots
+		// were absent from the log, re-ran on the next open, and died on a duplicate object
+		// — permanently. The flush is now unconditional at the skip.
+		const raw = await rawDb(dbPath);
+		try {
+			const logSlot = MIGRATIONS.findIndex((m) => m.name === "SCHEMA_MIGRATIONS_DDL");
+			let rivalRan = false;
+			const logTableExists = (): boolean => {
+				try {
+					(raw.prepare("SELECT 1 FROM schema_migrations LIMIT 1") as { get: () => unknown }).get();
+					return true;
+				} catch {
+					return false;
+				}
+			};
+			// A monotone clock that, the instant this pass has applied every pre-log entry
+			// (the version stamp has reached the log slot) but not yet created the log table,
+			// stands in for the rival: it creates the table and records slots logSlot..end,
+			// leaving the earlier slots unrecorded so this pass's held rows are their only
+			// evidence. `startedAt = now()` runs before this pass's BEGIN IMMEDIATE, so the
+			// file is unlocked here and the rival's writes commit cleanly.
+			let t = 1;
+			const now = (): number => {
+				if (!rivalRan && !logTableExists() && readSchemaVersion(raw) >= logSlot) {
+					rivalRan = true;
+					for (let s = logSlot; s < MIGRATIONS.length; s++) raw.exec(MIGRATIONS[s].ddl);
+					for (let s = logSlot; s < MIGRATIONS.length; s++) {
+						raw.prepare(
+							"INSERT INTO schema_migrations (slot, name, outcome, applied_by, applied_at_ms, duration_ms, ddl) VALUES (?, ?, 'applied', 'rival/1.0', 0, 0, ?)",
+						).run(s, MIGRATIONS[s].name, MIGRATIONS[s].ddl);
+					}
+				}
+				return t++;
+			};
+			migrateDashboardDb(raw, { appliedBy: "test/1.0", now });
+			expect(rivalRan).toBe(true);
+			const recorded = new Set(
+				readMigrationLog(raw)
+					?.filter((r) => r.outcome === "applied" || r.outcome === "baseline")
+					.map((r) => r.name),
+			);
+			// EVERY migration name is recorded — the held pre-log rows survived the skip.
+			for (const m of MIGRATIONS) expect(recorded.has(m.name)).toBe(true);
+			// And the proof it matters: a second pass has nothing to re-run, so it does not
+			// throw on a duplicate object — the permanent-corruption symptom.
+			expect(() => migrateDashboardDb(raw, { appliedBy: "test/1.0" })).not.toThrow();
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("pins DASHBOARD_SCHEMA_VERSION to MIGRATIONS.length", () => {
+		// A hand-maintained literal — it cannot be written `= MIGRATIONS.length` in place,
+		// as that array is declared later in the file and the reference would hit the TDZ.
+		// This pins the two together: appending a migration without bumping the version, or
+		// two branches that each append one, fails HERE instead of silently on disk.
+		expect(DASHBOARD_SCHEMA_VERSION).toBe(MIGRATIONS.length);
+	});
+
 	it("keeps a 'failed' row even though the transaction rolled back", async () => {
 		// Written after the ROLLBACK, outside the transaction, or it would vanish
 		// with the change it describes — and most callers of withDashboardDb swallow

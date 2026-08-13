@@ -67,7 +67,7 @@ import {
 	commitCategoryLabels,
 	resolveScope,
 	scopeFilter,
-	scopeToRepoId,
+	scopeToRepoIds,
 	splitDecisionBullets,
 } from "./DashboardScopeUtil.js";
 
@@ -135,7 +135,7 @@ export function isReachable(reachable: ReachableCommits | undefined, repoIdentit
  */
 function reachableMemoryRows(
 	db: DashboardDbHandle,
-	resolved: ReturnType<typeof scopeToRepoId>,
+	resolved: ReturnType<typeof scopeToRepoIds>,
 	reachable?: ReachableCommits,
 ): ReadonlyArray<MemoryListRow> {
 	const listFilter = scopeFilter(resolved, "m.repo_id");
@@ -190,7 +190,14 @@ export function buildMemoriesPage(
 	readonly totalCount: number;
 	readonly cursorMissing?: true;
 } {
-	const resolved = scopeToRepoId(db, scope);
+	// Resolve repo NAME tokens to identities FIRST. The `/api/memories` paging route
+	// hands us the raw `?repo=` scope: `buildDashboardModel` resolves it for the page
+	// HTML, but this route did not, so a name-keyed scope (the picker's common token —
+	// see `JD.repoToken`) matched no identity, collapsed to the `[-1]` sentinel, and
+	// answered totalCount 0 + cursorMissing — which the client renders as a wiped tree.
+	// Idempotent for the already-resolved scope `buildMemoriesList` receives.
+	const resolvedScope = resolveScope(db, scope);
+	const resolved = scopeToRepoIds(db, resolvedScope);
 	const rows = reachableMemoryRows(db, resolved, reachable);
 	const at = cursor
 		? rows.findIndex((row) => row.repo_identity === cursor.repoIdentity && row.commit_hash === cursor.commitHash)
@@ -204,7 +211,7 @@ export function buildMemoriesPage(
 	const cursorMissing = cursor !== undefined && at < 0;
 	const start = cursorMissing ? 0 : at + 1;
 	return {
-		items: toListItems(db, scope, rows.slice(start, start + MEMORIES_PAGE_SIZE)),
+		items: toListItems(db, resolvedScope, rows.slice(start, start + MEMORIES_PAGE_SIZE)),
 		totalCount: rows.length,
 		...(cursorMissing ? { cursorMissing: true as const } : {}),
 	};
@@ -222,7 +229,7 @@ export function buildMemoriesList(
 	scope: DashboardScope,
 	reachable?: ReachableCommits,
 ): Omit<MemoriesModel, "selected"> {
-	const resolved = scopeToRepoId(db, scope);
+	const resolved = scopeToRepoIds(db, scope);
 	const rows = reachableMemoryRows(db, resolved, reachable);
 	const items = toListItems(db, scope, rows.slice(0, MEMORIES_PAGE_SIZE));
 
@@ -595,7 +602,7 @@ export function buildMemoryDetail(
 	// arbitrary memory. `buildMemories` already returns early on a falsy hash, but
 	// this is exported and must not depend on every caller repeating that guard.
 	if (!hash) return undefined;
-	const resolved = scopeToRepoId(db, scope);
+	const resolved = scopeToRepoIds(db, scope);
 	const filter = scopeFilter(resolved, "m.repo_id");
 	const row = db
 		.prepare(
@@ -823,14 +830,17 @@ export function buildMemories(
 	// name straight to `buildMemoryDetail` resolves to repo id -1 (matches
 	// nothing), so the tree row navigated to a page whose detail pane stayed
 	// empty: the click looked like it did nothing at all.
+	// Always exactly ONE identity: this names the memory's owner, not the page
+	// scope, and a detail pane showing one memory has one owning repo.
 	const detailScope: DashboardScope = detailRepoIdentity
-		? resolveScope(db, { kind: "repo", repoIdentity: detailRepoIdentity })
+		? resolveScope(db, { kind: "repo", repoIdentities: [detailRepoIdentity] })
 		: scope;
 	// A token that resolves to no repo means the link is stale (repo removed, or
 	// renamed since the page was rendered). Fall back to the page scope rather
 	// than to a filter that matches nothing — the hash still identifies the
 	// memory, and showing it is strictly better than showing an empty pane.
-	const detail = scopeToRepoId(db, detailScope).repoId === -1 ? scope : detailScope;
+	const detailIds = scopeToRepoIds(db, detailScope).repoIds;
+	const detail = detailIds?.includes(-1) ? scope : detailScope;
 	const selected = buildMemoryDetail(db, detail, hash);
 	return selected ? { ...list, selected } : list;
 }
@@ -861,7 +871,10 @@ export function readContextDoc(
 	kind: MemoryContextKind,
 	contextKey: string,
 ): ContextDoc | undefined {
-	const { repoId } = scopeToRepoId(db, resolveScope(db, { kind: "repo", repoIdentity: repoToken }));
+	// One token in, so at most one id out — this read is per-repository, never
+	// scoped across the picker's selection.
+	const { repoIds } = scopeToRepoIds(db, resolveScope(db, { kind: "repo", repoIdentities: [repoToken] }));
+	const repoId = repoIds?.[0];
 	if (repoId == null) return undefined;
 	if (kind === "skills") return readSkillsDoc(db, repoId, contextKey);
 	const row = db

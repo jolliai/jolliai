@@ -126,10 +126,28 @@ export interface CopilotChatScanError {
 	readonly message: string;
 }
 
-/** Throws an Error with a `CopilotChatScanError` payload attached to .cause. */
-function throwScanError(kind: CopilotChatScanError["kind"], message: string): never {
-	const err = new Error(`Copilot Chat scan failed (${kind}): ${message}`);
-	(err as Error & { cause: CopilotChatScanError }).cause = { kind, message };
+/**
+ * Throws an Error with a `CopilotChatScanError` payload attached to .cause.
+ *
+ * `original` is the error being wrapped, when there is one. Its `code` is copied
+ * onto the wrapper — which is the ONLY thing that lets a caller tell "the host
+ * rotated this transcript away" from a real read failure: this reader's `cause` is
+ * the structured scan payload (a documented contract — `CopilotChatSessionDiscoverer`
+ * surfaces `error.cause.kind`), so unlike every other per-source reader it cannot
+ * hand `isMissingTranscriptError` the ENOENT that way. Without the code an
+ * already-gone session file logged a warning per poll cycle, which is exactly the
+ * noise the shared `throwTranscriptReadError` was introduced to stop.
+ */
+function throwScanError(kind: CopilotChatScanError["kind"], message: string, original?: unknown): never {
+	const err = new Error(`Copilot Chat scan failed (${kind}): ${message}`) as Error & {
+		cause: CopilotChatScanError;
+		code?: string;
+	};
+	err.cause = { kind, message };
+	// Copied only when present — an invented code would make a parse failure look
+	// like a vanished file to the same predicate.
+	const code = (original as NodeJS.ErrnoException | undefined)?.code;
+	if (code !== undefined) err.code = code;
 	throw err;
 }
 
@@ -233,7 +251,7 @@ async function readPatchLog(
 	try {
 		raw = await readFile(transcriptPath, "utf8");
 	} catch (error: unknown) {
-		throwScanError("fs", (error as Error).message);
+		throwScanError("fs", (error as Error).message, error);
 	}
 
 	const lines = raw.split("\n").filter((l) => l.length > 0);

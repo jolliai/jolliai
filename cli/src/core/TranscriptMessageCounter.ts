@@ -38,7 +38,7 @@ import { readOpenCodeTranscript } from "./OpenCodeTranscriptReader.js";
 import { loadCursorForTranscript } from "./SessionTracker.js";
 import { loadTranscript } from "./TranscriptLoader.js";
 import { getParserForSource } from "./TranscriptParser.js";
-import { readTranscript } from "./TranscriptReader.js";
+import { isMissingTranscriptError, readTranscript } from "./TranscriptReader.js";
 
 const log = createLogger("TranscriptMessageCounter");
 
@@ -99,7 +99,9 @@ export async function countTranscriptMessages(s: SessionInfo, projectDir?: strin
  * Errors from the per-source reader (locked SQLite, malformed JSONL, missing
  * file other than ENOENT-on-cursors) degrade to an empty array. The panel
  * renders "no entries" in that case, identical to `loadTranscript`'s
- * graceful-failure contract.
+ * graceful-failure contract. A transcript the host has since rotated away is
+ * that contract working, not a fault, so it logs at debug — see
+ * `isMissingTranscriptError`.
  */
 export async function loadUnreadTranscript(
 	source: TranscriptSource,
@@ -114,7 +116,8 @@ export async function loadUnreadTranscript(
 		const result = await readUnreadTranscript(source, transcriptPath, cursor);
 		return result.entries;
 	} catch (err) {
-		log.warn("loadUnreadTranscript failed for %s/%s: %s", source, transcriptPath, errMsg(err));
+		const level = isMissingTranscriptError(err) ? log.debug : log.warn;
+		level("loadUnreadTranscript failed for %s/%s: %s", source, transcriptPath, errMsg(err));
 		return [];
 	}
 }

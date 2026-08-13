@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { _deleteAtPath, _replayPatches, _setAtPath, readCopilotChatTranscript } from "./CopilotChatTranscriptReader.js";
+import { isMissingTranscriptError } from "./TranscriptReader.js";
 
 describe("_setAtPath", () => {
 	it("sets a leaf string key on an object", () => {
@@ -280,6 +281,38 @@ describe("readCopilotChatTranscript", () => {
 		await expect(readCopilotChatTranscript(join(sessionsDir, "does-not-exist.jsonl"))).rejects.toThrow(
 			/fs|ENOENT/i,
 		);
+	});
+
+	// The rotated-transcript case, which is normal rather than a fault: a session
+	// whose host has since deleted its file still counts as a session, and the
+	// 60 s Active Conversations tick re-reads every one of them. This reader cannot
+	// carry the ENOENT on `cause` like the others — that slot holds its structured
+	// scan payload, which the discoverer reads as `error.cause.kind` — so the code
+	// on the wrapper is the only thing keeping a warning per source per poll out of
+	// the terminal. Both halves asserted together, because a fix to either one
+	// alone silently re-breaks the other.
+	it("carries the ENOENT code alongside the scan payload, so callers can tell rotation from a fault", async () => {
+		const err = await readCopilotChatTranscript(join(sessionsDir, "does-not-exist.jsonl")).then(
+			() => null,
+			(caught: unknown) => caught as Error & { code?: string; cause?: { kind?: string } },
+		);
+		expect(err?.code).toBe("ENOENT");
+		expect(err?.cause?.kind).toBe("fs");
+		expect(isMissingTranscriptError(err)).toBe(true);
+	});
+
+	// The other direction: a parse failure has no code to copy, so it must NOT
+	// arrive looking like a vanished file — that would send a genuinely corrupt
+	// transcript to `log.debug` and out of sight.
+	it("leaves a parse failure without a code, so it still reads as a fault", async () => {
+		const path = join(sessionsDir, "torn.jsonl");
+		writeFileSync(path, `${JSON.stringify({ kind: 0, v: { requests: [] } })}\n{not-json`);
+		const err = await readCopilotChatTranscript(path).then(
+			() => null,
+			(caught: unknown) => caught as Error & { code?: string },
+		);
+		expect(err?.code).toBeUndefined();
+		expect(isMissingTranscriptError(err)).toBe(false);
 	});
 
 	it("treats empty file as init-less doc → no entries, no throw", async () => {

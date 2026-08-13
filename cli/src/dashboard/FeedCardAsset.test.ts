@@ -15,7 +15,6 @@ import { MEMORY_CARD_MAJOR_LINES } from "./DashboardModel.js";
 
 interface JDNamespace {
 	renderStats: (model: unknown) => void;
-	scopeChip: (model: unknown) => string;
 	repoToken: (model: unknown, identity: string) => string;
 	withParams: (query: string, params: Record<string, string | undefined>) => string;
 }
@@ -92,7 +91,7 @@ function model(over: Record<string, unknown> = {}, statsOver: Record<string, unk
 		tier: "memory",
 		generatedAtMs: Date.parse("2026-07-30T12:00:00Z"),
 		timeZone: "UTC",
-		scope: { kind: "repo", repoIdentity: "https://github.com/jolliai/jolliai" },
+		scope: { kind: "repo", repoIdentities: ["https://github.com/jolliai/jolliai"] },
 		repos: [
 			{
 				repoIdentity: "https://github.com/jolliai/jolliai",
@@ -228,17 +227,21 @@ describe("Memory Activity — memory tier", () => {
 		expect(feedHtml(model({}, { memoryCards: [big] }))).toContain("bugfix");
 	});
 
-	it("shows captured/gap/decision counts when the backend supplies coverage data", () => {
+	it("shows captured/decision counts when the backend supplies coverage data", () => {
 		const html = feedHtml(model({}, { memoriesCreated: 110, totalCommits: 173, decisionsCaptured: 48 }));
 		expect(html).toContain('<div class="mas-item"><b class="num">110</b><span>of 173 captured</span></div>');
-		expect(html).toContain('<div class="mas-item mas-warn"><b class="num">63</b><span>gaps</span></div>');
 		expect(html).toContain('<div class="mas-item"><b class="num">48</b><span>decisions</span></div>');
 	});
 
-	it("omits the gap chip when every commit in the window is captured", () => {
-		const html = feedHtml(model({}, { memoriesCreated: 5, totalCommits: 5, decisionsCaptured: 2 }));
-		expect(html).toContain("of 5 captured");
+	it("states no gap figure, even when commits in the window went uncaptured", () => {
+		// The "N gaps" chip was removed: it flagged a deficit this page offers no
+		// way to act on, and the "of 173" denominator already reports the
+		// coverage. Both of its inputs are still on the model, so a re-render is
+		// all that would bring it back — which is exactly why this is pinned.
+		const html = feedHtml(model({}, { memoriesCreated: 110, totalCommits: 173, decisionsCaptured: 48 }));
 		expect(html).not.toContain("mas-warn");
+		expect(html).not.toContain("gaps");
+		expect(html).not.toContain(">63<");
 	});
 
 	it("renders no coverage row when the backend hasn't supplied it", () => {
@@ -295,21 +298,206 @@ describe("feed card — local tier", () => {
 	});
 });
 
-describe("scope chip", () => {
-	it("names the repo and the window instead of saying 'this repo'", () => {
-		expect(JD.scopeChip(model())).toBe('<span class="chip" style="cursor:default">jolliai · this month</span>');
+/**
+ * JOLLI-2190: the equal-third band's subtitles.
+ *
+ * Skills and MCPs describe what their card IS — read once, then noise on every
+ * later visit — so they moved onto the title as a hover tooltip. Tokens' did
+ * NOT: its subtitle is the window its numbers cover, which is a figure, and the
+ * same one every other card on the page states in the open.
+ */
+/**
+ * The daily chart Tokens and Spend share labels its two ENDPOINTS only.
+ *
+ * It used to label every other bar with a bare day-of-month — fine at 7 days,
+ * unreadable at 90, and monthless, so `12` could be any month. Two labelled ends
+ * state the window exactly and do not get denser as the range grows. Between
+ * them, the per-bar `<title>` is what keeps a bar identifiable, so it must
+ * survive.
+ */
+describe("stacked bar chart axis", () => {
+	const chart = (): string => {
+		app.innerHTML = "";
+		JD.renderStats(
+			model(
+				{},
+				{
+					series: [
+						{ date: "2026-07-28", tokens: 10, estCostUsd: 1, bySeries: { input: 10 } },
+						{ date: "2026-07-29", tokens: 20, estCostUsd: 2, bySeries: { input: 20 } },
+						{ date: "2026-07-30", tokens: 30, estCostUsd: 3, bySeries: { input: 30 } },
+					],
+					seriesKeys: ["input"],
+				},
+			),
+		);
+		// The card ICONS are svgs too, so anchor on this chart's own viewBox.
+		// Rendered here by Spend, which draws `stats.series` directly; the Tokens
+		// card draws the identical chart from the same helper.
+		const open = app.innerHTML.indexOf('<svg viewBox="0 0 660');
+		expect(open).toBeGreaterThan(-1);
+		return app.innerHTML.slice(open, app.innerHTML.indexOf("</svg>", open));
+	};
+
+	it("labels the first and last day, and nothing between", () => {
+		const svg = chart();
+		expect(svg).toContain(">Jul 28</text>");
+		expect(svg).toContain(">Jul 30</text>");
+		// The middle day gets no tick — that is the whole point.
+		expect(svg).not.toContain(">Jul 29</text>");
+		// Anchored to the plot edges, not centred on a bar.
+		expect(svg).toContain('text-anchor="start"');
 	});
 
-	it("says 'all repos' when the page is not scoped", () => {
-		expect(JD.scopeChip(model({ scope: { kind: "all" } }))).toContain("all repos · this month");
+	it("spells the month from the day key, never through a Date", () => {
+		// `new Date("2026-07-28")` is UTC midnight while getDate() reads local, so
+		// west of UTC every label would render a day early. The key is already the
+		// right day in the payload's own zone.
+		expect(chart()).not.toContain(">Jul 27</text>");
 	});
 
-	it("states its bounds for a custom range, which has no short name", () => {
-		expect(JD.scopeChip(model({}, { range: "custom" }))).toContain("jolliai · 2026-07-01 – 2026-07-30");
+	it("keeps every bar identifiable by hover", () => {
+		// The whole reason dropping the axis is safe: the FULL date survives on
+		// every segment, where the axis only ever carried a day number.
+		const svg = chart();
+		for (const day of ["2026-07-28", "2026-07-29", "2026-07-30"]) {
+			expect(svg, day).toContain(`<title>${day} · input ·`);
+		}
 	});
 
-	it("falls back to the identity when the repo is no longer listed", () => {
-		expect(JD.scopeChip(model({ repos: [] }))).toContain("https://github.com/jolliai/jolliai");
+	it("reserves exactly one label row under the baseline", () => {
+		// Baseline (214) + the label row + the 8px margin the right edge uses.
+		expect(chart()).toContain('viewBox="0 0 660 238"');
+	});
+});
+
+describe("Decisions card footer", () => {
+	const footer = (): string => {
+		app.innerHTML = "";
+		JD.renderStats(model({}, { decisionsCaptured: 4, decisions: { keptCount: 4, repoCount: 2, perDay: [] } }));
+		const start = app.innerHTML.indexOf('aria-label="Decisions"');
+		expect(start).toBeGreaterThan(-1);
+		const foot = app.innerHTML.indexOf('<div class="w-foot"', start);
+		return app.innerHTML.slice(foot, app.innerHTML.indexOf("</section>", foot));
+	};
+
+	it("states the repo count and nothing about how decisions are stored", () => {
+		// "kept, not merged" sat directly under the latest-decision quote, where it
+		// read as a status on THAT decision rather than a note about the corpus.
+		expect(footer()).toContain("across <b>2 repos</b> in this window");
+		expect(footer()).not.toContain("kept, not merged");
+		expect(footer()).not.toContain("w-chip");
+	});
+});
+
+describe("equal-third card subtitles", () => {
+	/** A card's tooltip text with the hard wraps taken back out. */
+	const hintOf = (label: string): string => {
+		const title = /title="([^"]*)"/.exec(headOf(label));
+		expect(title, label).not.toBeNull();
+		return (title as RegExpExecArray)[1].split("&#10;").join(" ");
+	};
+
+	/** The tooltip's lines, as the browser will break them. */
+	const hintLines = (label: string): string[] =>
+		((/title="([^"]*)"/.exec(headOf(label)) as RegExpExecArray)[1] || "").split("&#10;");
+
+	const headOf = (label: string): string => {
+		app.innerHTML = "";
+		JD.renderStats(model());
+		const start = app.innerHTML.indexOf(`aria-label="${label}"`);
+		expect(start, label).toBeGreaterThan(-1);
+		// To the end of the head's title block — `</div></div>` closes the
+		// title wrapper and, for a hover card, the card-head with it.
+		const h2 = app.innerHTML.indexOf("<h2", start);
+		return app.innerHTML.slice(start, app.innerHTML.indexOf("</div></div>", h2) + "</div></div>".length);
+	};
+
+	it("puts the Skills explanation in the title's tooltip", () => {
+		const head = headOf("Skills");
+		expect(head).toContain('class="has-hint"');
+		expect(hintOf("Skills")).toContain("Skill invocations, counted from the tool calls");
+		// Scope claim, pinned: only `Skill` tool calls become skill rows — a
+		// subagent is the `Task` builtin and a slash command is never a tool call
+		// — so the copy must not widen to either without the classifier widening.
+		expect(head).not.toContain("command");
+		expect(head).not.toContain('<div class="sub">');
+	});
+
+	it("puts the MCPs explanation in the title's tooltip", () => {
+		const head = headOf("MCPs");
+		expect(head).toContain('class="has-hint"');
+		expect(hintOf("MCPs")).toContain("never the arguments or the results");
+		// The rows come from captured CALLS, so the copy says "only servers that
+		// called". It must not claim a configured-but-idle server is listed: that
+		// needs the registered-server list, which no transcript carries.
+		expect(hintOf("MCPs")).toContain("Only servers that actually made a call");
+		expect(head).not.toContain("errored");
+		expect(head).not.toContain('<div class="sub">');
+	});
+
+	it("explains what Tokens counts, and no longer restates the window", () => {
+		// `Last 30 days` came off the card: the topbar range control is the one
+		// place the window is set, and it says so there. What the tooltip carries
+		// instead is the thing the bars cannot show — why this card counts tokens
+		// while Spend counts dollars.
+		const head = headOf("Tokens");
+		expect(head).toContain('class="has-hint"');
+		expect(hintOf("Tokens")).toContain("Cache reads bill at 10% of input");
+		expect(hintOf("Tokens")).toContain("this widget counts tokens and Spend counts dollars");
+		expect(head).not.toContain("Last 30 days");
+		expect(head).not.toContain('<div class="sub">');
+	});
+
+	it("hard-wraps every tooltip — a native one does not wrap itself", () => {
+		// Unwrapped, a two-sentence hint renders as one line that runs past the
+		// card and off the viewport.
+		for (const label of ["Skills", "MCPs", "Tokens"]) {
+			const lines = hintLines(label);
+			expect(lines.length, label).toBeGreaterThan(1);
+			for (const line of lines) expect(line.length, `${label}: ${line}`).toBeLessThanOrEqual(70);
+		}
+	});
+
+	it("breaks only between words", () => {
+		// The wrap is by character count against a font the page cannot measure,
+		// so word boundaries are what keep it acceptable.
+		for (const label of ["Skills", "MCPs", "Tokens"]) {
+			for (const line of hintLines(label)) {
+				expect(line.startsWith(" "), label).toBe(false);
+				expect(line.endsWith(" "), label).toBe(false);
+			}
+		}
+	});
+
+	it("leaves no visible subtitle on any card in the band", () => {
+		for (const label of ["Skills", "MCPs", "Tokens"]) {
+			expect(headOf(label), label).not.toContain('<div class="sub">');
+		}
+	});
+});
+
+describe("per-row repo tag", () => {
+	// The tag is what tells one repo's rows from another's, so it must appear
+	// whenever the page is showing more than one — and must NOT appear under a
+	// single-repo scope, where every row would repeat the topbar picker's label.
+	// `JD.scopeChip` used to state the scope in the card head instead; it went
+	// with the arrival of that picker.
+	it("names the repo on every card when the page is unscoped", () => {
+		expect(feedHtml(model({ scope: { kind: "all" } }))).toContain(">jolliai</span>");
+	});
+
+	it("names the repo when several are in scope", () => {
+		const two = { kind: "repo", repoIdentities: ["https://github.com/jolliai/jolliai", "local:other"] };
+		expect(feedHtml(model({ scope: two }))).toContain(">jolliai</span>");
+	});
+
+	it("drops the tag under a single-repo scope", () => {
+		// The card's own title still renders — this asserts the TAG is gone, not
+		// that the row vanished.
+		const html = feedHtml(model());
+		expect(html).toContain("fix: token refresh race in gateway retries");
+		expect(html).not.toContain(">jolliai</span>");
 	});
 });
 

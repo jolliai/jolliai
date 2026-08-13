@@ -47,6 +47,26 @@ describe("setIsolatedHome", () => {
 	});
 });
 
+/**
+ * Pins the SUITE-WIDE guarantee, not the helper: `test/gitEnv.ts` applies an
+ * isolated home to every test file in the monorepo, so no test can reach the
+ * developer's real `~/.jolli/`, `~/.codex/config.toml`, `~/.gemini/`, … by
+ * default. Without something asserting it, deleting that line from the setup
+ * file breaks nothing visible — every test keeps passing, against the real home,
+ * exactly as before the guard existed. That is how it got paid for twice.
+ */
+describe("suite-wide home isolation (test/gitEnv.ts)", () => {
+	it("has redirected os.homedir() away from the real home for this test file", () => {
+		expect(process.env.JOLLI_TEST_HOME).toBeTruthy();
+		expect(homedir()).toBe(process.env.JOLLI_TEST_HOME);
+	});
+
+	it("resolves the machine-global config dir inside the scratch home", async () => {
+		const { getGlobalConfigDir } = await import("../core/SessionTracker.js");
+		expect(getGlobalConfigDir().startsWith(process.env.JOLLI_TEST_HOME as string)).toBe(true);
+	});
+});
+
 describe("withIsolatedHome", () => {
 	it("restores after the block resolves", async () => {
 		const before = homedir();

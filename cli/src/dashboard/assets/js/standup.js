@@ -5,13 +5,20 @@ window.JD = window.JD || {};
 	   corpus; see JD.glyph in shell.js. */
 	var GLYPH = JD.glyph;
 
-	/* Which insight kinds belong in which column, following the sprint-dashboard
-	   mockup: a TODO is what you are going to do next (Today), while blockers,
-	   questions and gotchas are what someone has to resolve (Risks). Routing them
-	   all into Risks — as this page used to — buries the only column that is
-	   supposed to be a to-do list under things nobody can act on today. */
+	/* A TODO is what you are going to do next, so it belongs in Today.
+	   The board used to carry a third column — Risks · Blockers · Questions —
+	   filtering for the `blocker`/`question`/`gotcha` kinds. It was removed
+	   because those kinds can never exist: `TOPIC_INSIGHTS_CTE` in
+	   DashboardQuery.ts derives insights from each memory topic's own
+	   `decisions`/`todo` text, so `decision` and `todo` are the only kinds the
+	   payload can ever hold (DashboardCollector.ts says so outright, and calls it
+	   deliberate — a blocker is not guessed from prose). The column therefore
+	   always rendered "Nothing flagged in this window." at the memory tier and an
+	   upsell for a feature that would not fill it below.
+
+	   Reinstating it means teaching the SUMMARIZER to record those kinds first;
+	   a filter on its own has nothing to select. */
 	var TODAY_KINDS = ["todo"];
-	var RISK_KINDS = ["blocker", "question", "gotcha"];
 
 	/* ---- rows -------------------------------------------------------------- */
 
@@ -155,50 +162,6 @@ window.JD = window.JD || {};
 		return grouped(rows);
 	}
 
-	/* ---- risks ------------------------------------------------------------- */
-
-	/* Age, in the mockup's own tag shape. It reads from the commit the insight came
-	   out of, which is the only date on record — an unanswered question is as old as
-	   the commit that asked it.
-	   No critical/stale variant: the mockup's red 4-day blocker cannot occur here,
-	   because buildStandupInsights only selects commits from [yesterday, tomorrow),
-	   so this label is bounded at "2 days". Reintroducing a threshold means widening
-	   that window first — an unclosed blocker is only interesting once it is old. */
-	function ageTag(insight, model) {
-		if (insight.committedAtMs == null) return "";
-		var days = Math.floor((model.generatedAtMs - insight.committedAtMs) / 86400000);
-		var label = days < 1 ? "today" : days === 1 ? "1 day" : days + " days";
-		return '<span class="tag age">' + label + "</span>";
-	}
-
-	function riskItem(insight, model) {
-		var esc = JD.esc;
-		return (
-			'<div class="item"><div class="r1"><span class="tag kind-' +
-			esc(insight.kind) +
-			'">' +
-			esc(insight.kind) +
-			"</span>" +
-			(insight.addressedTo
-				? '<span class="tag kind-question" style="background:transparent;border:1px dashed var(--accent)">→ ' +
-					esc(insight.addressedTo) +
-					"</span>"
-				: "") +
-			'<span class="when"></span></div>' +
-			'<div class="note" style="padding-left:2px">' +
-			esc(insight.text) +
-			"</div>" +
-			'<div class="meta" style="padding-left:2px">' +
-			ageTag(insight, model) +
-			'<span class="tag mono">' +
-			esc(insight.commitHash.slice(0, 7)) +
-			"</span>" +
-			'<span class="tag">' +
-			esc(insight.repoName) +
-			"</span></div></div>"
-		);
-	}
-
 	/* ---- sprint context ---------------------------------------------------- */
 
 	/* The mockup's ctx-strip chips. Its own version reads `Sprint 14 · day 7 of 10`
@@ -256,15 +219,13 @@ window.JD = window.JD || {};
 
 	/* ---- the drafted standup ----------------------------------------------- */
 
-	/* The markdown the sheet shows and the clipboard gets. Same routing as the
-	   board: TODOs sit under Today, and Risks carries blockers, questions and
-	   gotchas — a draft that disagreed with the columns above it would be the
-	   worse of the two bugs. */
+	/* The markdown the sheet shows and the clipboard gets. Same two sections as the
+	   board, in the same order, with TODOs under Today — a draft that disagreed
+	   with the columns above it would be the worse of the two bugs. */
 	JD.standupMarkdown = (model) => {
 		var standup = model.standup;
 		var insights = standup.insights || [];
 		var todos = insights.filter((insight) => TODAY_KINDS.indexOf(insight.kind) >= 0);
-		var risks = insights.filter((insight) => RISK_KINDS.indexOf(insight.kind) >= 0);
 		var decisionsByHash = Object.create(null);
 		insights.forEach((insight) => {
 			if (insight.kind !== "decision") return;
@@ -334,21 +295,6 @@ window.JD = window.JD || {};
 		});
 		lines.push(today.length > 0 ? today.join("\n") : "- (nothing yet)");
 
-		if (risks.length > 0) {
-			lines.push("", "**Risks · Blockers · Questions**");
-			risks.forEach((insight) => {
-				lines.push(
-					"- [" +
-						insight.kind +
-						"] " +
-						insight.text +
-						" (`" +
-						insight.commitHash.slice(0, 7) +
-						"`)" +
-						(insight.addressedTo ? " → " + insight.addressedTo : ""),
-				);
-			});
-		}
 		return lines.join("\n");
 	};
 
@@ -379,7 +325,6 @@ window.JD = window.JD || {};
 		var memory = !!standup.insights;
 		var insights = standup.insights || [];
 		var todos = insights.filter((insight) => TODAY_KINDS.indexOf(insight.kind) >= 0);
-		var risks = insights.filter((insight) => RISK_KINDS.indexOf(insight.kind) >= 0);
 
 		/* Context strip: date, sprint chips, where this goes, and the draft action. */
 		var html =
@@ -436,29 +381,11 @@ window.JD = window.JD || {};
 			? "Open TODOs, live sessions and working-tree state — edit before sharing"
 			: "Live sessions and working-tree state";
 
-		/* Risks. */
-		var rBody = "";
-		risks.forEach((insight) => {
-			rBody += riskItem(insight, model);
-		});
-		if (memory && !rBody) rBody = '<div class="empty-note">Nothing flagged in this window.</div>';
-
+		/* Two columns. The third — Risks · Blockers · Questions — is gone; see the
+		   note on TODAY_KINDS at the top of this file for why it could never fill. */
 		html += '<div class="cols">';
 		html += column("Yesterday", yCount, ySub, yBody);
 		html += column("Today", tCount, tSub, tBody);
-		html += memory
-			? column(
-					"Risks · Blockers · Questions",
-					"· " + risks.length,
-					"Blockers, open questions and gotchas from yesterday and today's commit memories",
-					rBody,
-				)
-			: JD.lockedCard(
-					"Risks · Blockers · Questions",
-					"Blockers and questions live inside your conversations — memory extracts them, with the commit " +
-						"each one came from.",
-					"col",
-				);
 		html += "</div>";
 
 		document.getElementById("app").innerHTML = html;
@@ -488,7 +415,7 @@ window.JD = window.JD || {};
 				? "Every author's commits — no git identity configured, so check the lines are yours before posting."
 				: memory
 					? "From your commit memories. Edit anything before you post it."
-					: "From raw sessions + git log. Enable Jolli Memory for decisions, TODOs and blockers.";
+					: "From raw sessions + git log. Enable Jolli Memory for decisions and TODOs.";
 			overlay.classList.add("open");
 			output.focus();
 			/* Copied on open as well as on the button: the one-click path stays as fast

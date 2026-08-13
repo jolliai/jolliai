@@ -190,7 +190,18 @@ function model(toolUsageOver: Record<string, unknown> = {}): unknown {
 		generatedAtMs: Date.parse("2026-07-30T12:00:00Z"),
 		timeZone: "UTC",
 		scope: { kind: "all" },
-		repos: [],
+		// One enrolled repo, because `renderStats` short-circuits an empty registry
+		// to `noReposCard()` — every card below, paging footer included, is then
+		// never rendered and each assertion here fails against the empty state
+		// rather than against the behaviour it names. See the comment on that card.
+		repos: [
+			{
+				repoIdentity: "https://github.com/jolliai/jolliai",
+				repoName: "jolliai",
+				worktreeRoot: "/w",
+				sessionsThisWeek: 3,
+			},
+		],
 		usage: { available: false },
 		stats: {
 			kpis: [],

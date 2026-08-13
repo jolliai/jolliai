@@ -9,8 +9,10 @@
 <body>
 <!--
   Shell markup mirrors the `jolli stats` / `jolli standup` mockups: a sticky
-  sidebar (dashboards + repo filter), a topbar carrying the page identity,
-  repo pill and time-range control, and one `.wrap` per view.
+  sidebar (the nav list plus a pinned Settings slot), a topbar carrying the page
+  identity, the repository picker and the time-range control, and one `.wrap`
+  per view. The sidebar holds no repo filter — scope selection is the topbar
+  picker below, and nothing else sets it apart from a memory deep link.
 
   `data-tier` on `.jd` is load-bearing, not decorative — the stylesheet keys the
   synced chip and the locked-preview treatments off it, so the shell reflects the
@@ -27,6 +29,24 @@
 	<div class="main">
 		<header class="topbar">
 			<div class="wordmark"><b id="pageTitle">My stats</b><span id="pageSub">individual · local</span></div>
+			<!-- Repository scope. A popover of checkboxes rather than a segmented
+			     control, because the selection is a SET (one, several, or every
+			     repo) and the machine can hold more repos than a top row can show.
+			     Its rows are rendered by JS from `model.repos`; the "All
+			     repositories" master row and the action bar are static so the
+			     control's own chrome cannot move as the list changes. -->
+			<div class="repo-scope-wrap" id="repoScopeWrap">
+				<button type="button" class="repo-scope-btn" id="repoScopeBtn" aria-expanded="false" aria-controls="repoScope" aria-haspopup="true">
+					<span id="repoScopeLabel">All repos</span><svg class="repo-scope-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+				</button>
+				<form class="repo-scope" id="repoScope" hidden aria-label="Repositories">
+					<div class="repo-scope-list" id="repoScopeList"></div>
+					<div class="repo-scope-foot">
+						<span id="repoScopeSelection">All repositories</span>
+						<div><button type="button" class="cta ghost sm" id="repoScopeCancel">Cancel</button><button type="submit" class="cta sm" id="repoScopeApply">Apply</button></div>
+					</div>
+				</form>
+			</div>
 			<div class="seg seg-sm" role="group" aria-label="Time range" id="rangeSeg">
 				<button type="button" data-range="week">7d</button>
 				<button type="button" data-range="month">30d</button>
@@ -115,7 +135,6 @@
 <script src="js/shell.js"></script>
 <script src="js/stats.js"></script>
 <script src="js/standup.js"></script>
-<script src="js/repositories.js"></script>
 <script src="js/memories.js"></script>
 <script src="js/knowledge.js"></script>
 <script src="js/graph.js"></script>

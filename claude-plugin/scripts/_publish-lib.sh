@@ -27,8 +27,13 @@ PLUGIN_DIR="$SRC/plugins/jolli"
 # `assembleDashboardHtml` reads the stylesheet and every entry of its SCRIPT_FILES
 # at request time, so a marketplace-repo .gitignore matching `js/` or `*.css`
 # passed this gate and produced a 500 on the first `jolli dashboard` (this repo has
-# already lost a SKILL.md to exactly that). Keep in lockstep with SCRIPT_FILES in
-# cli/src/dashboard/DashboardServer.ts.
+# already lost a SKILL.md to exactly that). Keep in lockstep — same order — with
+# DASHBOARD_SCRIPT_FILES in cli/src/dashboard/DashboardServer.ts; a drift either way
+# fails PluginDashboardAssets.test.ts rather than waiting for release time. Both
+# directions matter: a script listed here that the build no longer emits makes
+# `publish_assert_dist_built` refuse EVERY publish (local/dev/prod/zip alike), and a
+# script the server loads but this list omits is exactly the silent-dropout case
+# above.
 PUBLISH_REQUIRED_DIST=(
 	Cli.js PluginBootstrapHook.js StopHook.js SessionStartHook.js
 	PostCommitHook.js PostMergeHook.js PostRewriteHook.js PrepareMsgHook.js PrePushHook.js
@@ -40,8 +45,10 @@ PUBLISH_REQUIRED_DIST=(
 	dashboard-assets/js/shell.js
 	dashboard-assets/js/stats.js
 	dashboard-assets/js/standup.js
-	dashboard-assets/js/repositories.js
 	dashboard-assets/js/memories.js
+	dashboard-assets/js/knowledge.js
+	dashboard-assets/js/graph.js
+	dashboard-assets/js/settings.js
 	dashboard-assets/js/main.js
 )
 

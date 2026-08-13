@@ -1,7 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { sumConversationTokens } from "./ConversationTokenTotals.js";
 
 const tmpDirs: string[] = [];
@@ -74,6 +74,28 @@ describe("sumConversationTokens", () => {
 	it("degrades a single unreadable Claude transcript to zero without throwing", async () => {
 		const result = await sumConversationTokens([{ source: "claude", transcriptPath: "/does/not/exist.jsonl" }]);
 		expect(result).toEqual({ input: 0, output: 0, cached: 0, total: 0, reportingCount: 0, totalCount: 1 });
+	});
+
+	it("stays quiet about a transcript that is simply gone — the meter refetches on every debounce", async () => {
+		// A rotated JSONL is the ordinary case this degrades to zero for, and the
+		// panel recomputes on each debounce, so warning would repeat the same
+		// non-news indefinitely.
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		await sumConversationTokens([{ source: "claude", transcriptPath: "/does/not/exist.jsonl" }]);
+		expect(warn).not.toHaveBeenCalled();
+		warn.mockRestore();
+	});
+
+	it("still warns when the read failed for a reason other than a missing file", async () => {
+		// A directory in place of the transcript reads EISDIR, not ENOENT — a real
+		// I/O fault, which must keep its line.
+		const dir = await mkdtemp(join(tmpdir(), "jolli-token-totals-"));
+		tmpDirs.push(dir);
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const result = await sumConversationTokens([{ source: "claude", transcriptPath: dir }]);
+		expect(result.reportingCount).toBe(0);
+		expect(warn).toHaveBeenCalledWith(expect.stringContaining("Failed to read transcript for token totals"));
+		warn.mockRestore();
 	});
 
 	it("does not count a readable Claude transcript that contributes zero tokens as reporting", async () => {

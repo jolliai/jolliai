@@ -46,7 +46,6 @@ import type {
 	RecallUsage,
 	RecentSession,
 	RepoOption,
-	RepositoriesModel,
 	SeriesDimension,
 	SettingsPageModel,
 	StandupCommit,
@@ -67,7 +66,7 @@ import {
 	placeholders,
 	resolveScope,
 	scopeFilter,
-	scopeToRepoId,
+	scopeToRepoIds,
 	splitDecisionBullets,
 } from "./DashboardScopeUtil.js";
 import { buildMemories, isReachable, type ReachableCommits } from "./MemoriesQuery.js";
@@ -382,8 +381,6 @@ export interface QueryOptions {
 	 * unfiltered; see {@link authorFilter} for why that fail-open matters.
 	 */
 	readonly authorIdentity?: AuthorIdentity;
-	/** Repositories view: the async-read registry + job state. Absent renders an empty list. */
-	readonly repositoriesModel?: RepositoriesModel;
 	/** Knowledge view: the async-read Memory Bank `_wiki` file lists. Absent renders an empty list. */
 	readonly knowledgeModel?: KnowledgeModel;
 	/** Graph view: the async-read Memory Bank repo list. Absent renders an empty list. */
@@ -452,7 +449,7 @@ interface SessionRow {
 }
 
 function sessionsInRange(db: DashboardDbHandle, scope: DashboardScope, fromMs: number, toMs: number): SessionRow[] {
-	const filter = scopeFilter(scopeToRepoId(db, scope), "s.repo_id");
+	const filter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
 	return db
 		.prepare(
 			`SELECT s.event_id, r.repo_identity, s.source, s.session_id, s.title, s.updated_at_ms,
@@ -498,7 +495,7 @@ function commitsInRange(
 	/** Standup only — every other caller reports repo-wide activity. See {@link authorFilter}. */
 	identity?: AuthorIdentity,
 ): CommitRow[] {
-	const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
+	const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
 	const author = authorFilter(identity, "c");
 	// The memory-tier columns come from `memories` (A3b): the commits copies
 	// fall behind whenever a memory regenerates, while the memory row is
@@ -616,7 +613,7 @@ function buildSeries(
 	}
 	let rows: ReadonlyArray<UsageRow>;
 	if (effective === "model") {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "s.repo_id");
+		const filter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
 		rows = db
 			.prepare(
 				`SELECT s.updated_at_ms AS at_ms, u.model AS key,
@@ -627,7 +624,7 @@ function buildSeries(
 			)
 			.all(fromMs, toMs, ...filter.params) as UsageRow[];
 	} else if (effective === "agent") {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "repo_id");
+		const filter = scopeFilter(scopeToRepoIds(db, scope), "repo_id");
 		rows = db
 			.prepare(
 				`SELECT updated_at_ms AS at_ms, source AS key,
@@ -637,7 +634,7 @@ function buildSeries(
 			)
 			.all(fromMs, toMs, ...filter.params) as UsageRow[];
 	} else if (effective === "project") {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "s.repo_id");
+		const filter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
 		rows = db
 			.prepare(
 				`SELECT s.updated_at_ms AS at_ms, r.repo_name AS key,
@@ -648,7 +645,7 @@ function buildSeries(
 			)
 			.all(fromMs, toMs, ...filter.params) as UsageRow[];
 	} else if (effective === "category") {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "m.repo_id");
+		const filter = scopeFilter(scopeToRepoIds(db, scope), "m.repo_id");
 		// One row per TOPIC, with the commit's tokens shared across its topics —
 		// category belongs to a topic, and the old per-commit mode erased every
 		// category that never won a commit's vote (security and docs vanished
@@ -674,7 +671,7 @@ function buildSeries(
 			)
 			.all(fromMs, toMs, ...filter.params) as UsageRow[];
 	} else if (effective === "branch") {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
+		const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
 		// `commit_branches` now holds ONE row per commit — the branch it was
 		// committed on — so this axis answers "what did the work on this branch
 		// cost", which is the per-PR question, and a commit counts once.
@@ -703,7 +700,7 @@ function buildSeries(
 			)
 			.all(fromMs, toMs, ...filter.params) as UsageRow[];
 	} else {
-		const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
+		const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
 		rows = db
 			.prepare(
 				`SELECT c.committed_at_ms AS at_ms, COALESCE(m.ticket_id, '(no ticket)') AS key,
@@ -745,7 +742,7 @@ function buildSeries(
 
 /** Price-table date behind the cost figures, from the newest priced session. */
 function readPricesAsOf(db: DashboardDbHandle, scope: DashboardScope): string | undefined {
-	const filter = scopeFilter(scopeToRepoId(db, scope), "repo_id");
+	const filter = scopeFilter(scopeToRepoIds(db, scope), "repo_id");
 	const row = db
 		.prepare(
 			`SELECT prices_as_of FROM sessions
@@ -772,7 +769,7 @@ function buildDecisionsCard(
 	toMs: number,
 	timeZone: string,
 ): DecisionsCard {
-	const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
+	const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
 	const rows = db
 		.prepare(
 			`${TOPIC_INSIGHTS_CTE}
@@ -849,7 +846,7 @@ function buildStats(
 	const rangeCached = rangeSessions.reduce((sum, s) => sum + s.cached_tokens, 0);
 	const rangeInput = rangeSessions.reduce((sum, s) => sum + s.input_tokens + s.cached_tokens, 0);
 
-	// "Where your tokens went" — input/output/cache over the range, day-bucketed
+	// "Tokens" — input/output/cache over the range, day-bucketed
 	// for the card's chart. Reuses `rangeSessions`, already swept above for the
 	// KPI row, rather than a second query.
 	const perDayTokens = new Map<string, { input: number; output: number; cached: number }>();
@@ -1040,7 +1037,15 @@ export function computeStreak(activityMs: ReadonlyArray<number>, timeZone: strin
 
 // ── Standup page ────────────────────────────────────────────────────────────
 
-/** Render order for standup insights: risks first, notes last. */
+/**
+ * Render order for standup insights: risks first, notes last.
+ *
+ * The first three entries never match anything — {@link TOPIC_INSIGHTS_CTE} emits
+ * only `decision` and `todo` — so today this sorts TODOs ahead of decisions and
+ * nothing else. Kept whole rather than trimmed to the producible pair: the order
+ * is the answer to "where would a risk go", which is a question the list should
+ * still answer if the summarizer learns to record one. See `CommitInsightKind`.
+ */
 const INSIGHT_ORDER: ReadonlyArray<CommitInsightKind> = ["blocker", "question", "gotcha", "todo", "decision"];
 
 /** Insights mined from the standup window's commit memories. */
@@ -1051,7 +1056,7 @@ function buildStandupInsights(
 	toMs: number,
 	identity: AuthorIdentity | undefined,
 ): StandupInsight[] {
-	const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
+	const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
 	// Same filter as the commit columns, and for a stronger reason: the Risks
 	// column is a list of things the reader is expected to answer for. A
 	// teammate's blocker rendered here is work silently reassigned to whoever
@@ -1135,7 +1140,7 @@ function buildStandup(
 		};
 	};
 
-	const filter = scopeFilter(scopeToRepoId(db, scope), "w.repo_id");
+	const filter = scopeFilter(scopeToRepoIds(db, scope), "w.repo_id");
 	const workspaceRows = db
 		.prepare(
 			// Stale observations are dropped, not shown: the row says "there is
@@ -1260,7 +1265,7 @@ function buildMemoryCards(
 	// (`r`).  Using `r.repo_id` only breaks the scoped form of the query; the
 	// catch below then intentionally degrades to an empty feed, which used to
 	// make every `?repo=...` dashboard look like it had no Memory Activity.
-	const filter = scopeFilter(scopeToRepoId(db, scope), "c.repo_id");
+	const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
 	let rows: ReadonlyArray<MemoryCardRow>;
 	try {
 		// Two steps, because the reachability filter can only run in JS (git, not
@@ -1387,7 +1392,7 @@ function sortAgents<T extends ToolUsageAgentShare>(agents: ReadonlyArray<T>): T[
  *
  * Built once and threaded into each query rather than re-derived per query: the
  * three lists, their totals, the per-row agent splits and the recall row must
- * all be answering about the same set of rows, and `scopeToRepoId` is a lookup
+ * all be answering about the same set of rows, and `scopeToRepoIds` is a lookup
  * this section would otherwise repeat six times.
  */
 function toolUsageWhere(
@@ -1395,7 +1400,7 @@ function toolUsageWhere(
 	scope: DashboardScope,
 	window: ResolvedWindow,
 ): { sql: string; params: unknown[] } {
-	const filter = scopeFilter(scopeToRepoId(db, scope), "s.repo_id");
+	const filter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
 	return {
 		sql: `${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?${filter.sql}`,
 		params: [window.startMs, window.endMs, ...filter.params],
@@ -1786,7 +1791,7 @@ function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: Re
 	// direction: "3 of 4 sessions" above a table whose rows account for one of
 	// them. Windowed, the fraction says what the caveat claims it says — sessions
 	// whose tool use is what the page is showing.
-	const sessionFilter = scopeFilter(scopeToRepoId(db, scope), "s.repo_id");
+	const sessionFilter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
 	const sessionRows = db
 		.prepare(
 			`SELECT s.source,
@@ -1905,7 +1910,7 @@ function buildRecallUsage(
 	timeZone: string,
 	nowMs: number,
 ): RecallUsage {
-	const repoId = scopeToRepoId(db, scope);
+	const repoId = scopeToRepoIds(db, scope);
 	const filter = scopeFilter(repoId, "r.repo_id");
 	const rows = db
 		.prepare(
@@ -2183,8 +2188,7 @@ function buildRecallUsage(
 	};
 }
 
-/** Fallback for a `buildDashboardModel` call that never read the repo registry. */
-const NO_REPOSITORIES_MODEL: RepositoriesModel = { repos: [], hooksManifest: [] };
+/** Fallback for a `buildDashboardModel` call that never read the Memory Bank. */
 const NO_KNOWLEDGE_MODEL: KnowledgeModel = { repos: [] };
 const NO_GRAPH_MODEL: GraphModel = { repos: [] };
 
@@ -2198,21 +2202,31 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 	// the echoed-back `model.scope` agree on one identity (see `resolveScope`).
 	const options: QueryOptions = { ...opts, scope: resolveScope(db, opts.scope) };
 
-	// `sessionsThisWeek` is the sidebar's per-repo meta figure, computed here so
+	// `sessionsThisWeek` is the repo picker's per-repo meta figure, computed here so
 	// the shell needs no second round trip.
+	//
+	// PAUSED repos are listed too, not filtered out. Their rows are never deleted
+	// (`repos_no_delete`) and they keep counting in the aggregate KPIs, so a
+	// `disabled_at IS NULL` filter here made an all-paused dashboard read as "No
+	// repositories yet" while its numbers still had the paused repo's activity in
+	// them. `disabled_at IS NOT NULL` sorts the paused ones to the bottom of the
+	// picker; `disabled` is set on the option so the picker can mark them (and stays
+	// absent on an active row, so its shape is unchanged).
 	const weekStartMs = addLocalDays(nowMs, -6, timeZone);
 	const repoRows = db
 		.prepare(
 			`SELECT r.repo_identity, r.repo_name, r.worktree_root, r.bootstrap_state,
+			        r.disabled_at,
 			        (SELECT COUNT(*) FROM sessions s
 			          WHERE s.repo_id = r.id AND s.updated_at_ms >= ?) AS week_sessions
-			   FROM repos r WHERE r.disabled_at IS NULL ORDER BY r.repo_name`,
+			   FROM repos r ORDER BY (r.disabled_at IS NOT NULL), r.repo_name`,
 		)
 		.all(weekStartMs) as ReadonlyArray<{
 		repo_identity: string;
 		repo_name: string;
 		worktree_root: string;
 		bootstrap_state: string;
+		disabled_at: string | null;
 		week_sessions: number;
 	}>;
 	const repos: RepoOption[] = repoRows.map((r) => ({
@@ -2220,6 +2234,7 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 		repoName: r.repo_name,
 		worktreeRoot: r.worktree_root,
 		sessionsThisWeek: r.week_sessions,
+		...(r.disabled_at != null ? { disabled: true as const } : {}),
 	}));
 
 	// Coverage notes are per VIEW, not global. A caveat is only honest next to
@@ -2254,10 +2269,7 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 	const window = () => resolveWindow(options.range, options.customFrom, options.customTo, nowMs, timeZone);
 	// Exactly one view payload is built per request — the other two would be
 	// wasted queries, and the page only ever reads its own.
-	const payload = (): Pick<
-		DashboardModel,
-		"stats" | "standup" | "repositories" | "memories" | "knowledge" | "graph" | "settings"
-	> => {
+	const payload = (): Pick<DashboardModel, "stats" | "standup" | "memories" | "knowledge" | "graph" | "settings"> => {
 		switch (options.view) {
 			case "stats":
 				return {
@@ -2274,11 +2286,9 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 				};
 			case "standup":
 				return { standup: buildStandup(db, options.scope, timeZone, nowMs, tier, options.authorIdentity) };
-			case "repositories":
-				return { repositories: options.repositoriesModel ?? NO_REPOSITORIES_MODEL };
 			case "knowledge":
-				// Read off disk (Memory Bank `_wiki`), pre-built in the model builder like
-				// repositories/settings — there is no DB query for it here.
+				// Read off disk (Memory Bank `_wiki`), pre-built in the model builder
+				// like settings — there is no DB query for it here.
 				return { knowledge: options.knowledgeModel ?? NO_KNOWLEDGE_MODEL };
 			case "graph":
 				return { graph: options.graphModel ?? NO_GRAPH_MODEL };
@@ -2305,12 +2315,15 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 	};
 
 	return {
-		// Bumped from 1 → 2 when Decisions was retired (its view token and
-		// payload shape removed): an old tab left open across this upgrade would
-		// otherwise poll `/api/model` and try to render a `decisions` view that
-		// no longer exists. `JD.refreshNow` compares this against the tab's own
+		// 1 → 2 when Decisions was retired (its view token and payload shape
+		// removed): an old tab left open across that upgrade would otherwise poll
+		// `/api/model` and try to render a `decisions` view that no longer exists.
+		// 2 → 3 when the scope became a repo LIST: `scope.repoIdentity` is gone,
+		// so a pre-3 tab would read `undefined` off every reply and silently
+		// repaint itself as all-repos while its URL still said otherwise.
+		// `JD.refreshNow` compares this against the tab's own
 		// `window.__JOLLI_DASHBOARD__.schemaVersion` and reloads on mismatch.
-		schemaVersion: 2,
+		schemaVersion: 3,
 		view: options.view,
 		tier,
 		generatedAtMs: nowMs,

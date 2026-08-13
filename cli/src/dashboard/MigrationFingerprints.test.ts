@@ -2,14 +2,17 @@
  * MigrationFingerprints — the development-time guard that makes an edit to
  * already-shipped DDL fail HERE rather than on a user's machine.
  *
- * Every writable open now compares each logged migration's stored DDL against
- * the constant this build carries, so editing an entry that has run anywhere
- * turns every existing database into a drift error. Entry 0 is the sharpest case:
- * ~37 KB of baseline that every database on earth has applied, where an edit used
- * to be "only new databases differ" and is now "every old database refuses".
+ * A writable open compares each logged migration's stored DDL against the constant
+ * this build carries and REPORTS any divergence (`findDriftedMigrations`, listed by
+ * `jolli doctor --schema-log`) — it does NOT refuse the database. The refuse-on-drift
+ * behaviour was removed with the version gate: ~64% of the baseline entry is SQL
+ * comments, so re-wrapping one must not lock every existing user out. Entry 0 is the
+ * sharpest case — ~37 KB of baseline every database on earth has applied — where an
+ * edit is now "reported as drift", never "old databases refuse".
  *
- * That trade is right — silent divergence is worse than a loud stop — but the
- * loud stop belongs in CI, not in an install. So the content of each entry is
+ * Reporting is right for the USER, but a silent DDL edit is still a bug the AUTHOR
+ * should never ship — and that loud stop belongs in CI, not in an install. So the
+ * content of each entry is
  * pinned here: change a DDL constant without updating its fingerprint and this
  * test fails, in the same shape and for the same reason as
  * `SkillInstaller.test.ts`'s body fingerprints.

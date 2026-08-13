@@ -377,7 +377,7 @@ describe("buildDashboardModel", () => {
 		expect(stats.kpis.find((k) => k.key === "cost")?.value).toBe("$3.00");
 		// cached share = 200 cached / (2000 input + 200 cached)
 		expect(stats.kpis.find((k) => k.key === "cached")?.value).toBe("9%");
-		// Where your tokens went: today-1 + old-1 carry the default model tokens;
+		// Tokens: today-1 + old-1 carry the default model tokens;
 		// yesterday-1 is sessions-only (cursor) and contributes nothing.
 		expect(stats.tokenBreakdown).toMatchObject({ input: 2000, output: 1000, cached: 200 });
 		expect(stats.tokenBreakdown.perDay).toHaveLength(30);
@@ -510,7 +510,8 @@ describe("buildDashboardModel", () => {
 		expect(shanghai.standup?.todaySessions.map((s) => s.sessionId)).toEqual(["boundary"]);
 	});
 
-	it("filters by repo scope", async () => {
+	/** A second and third repo, each with one session, alongside `seed()`'s. */
+	async function seedMoreRepos(): Promise<void> {
 		await seed();
 		await applySummaryEvents(
 			[
@@ -525,21 +526,114 @@ describe("buildDashboardModel", () => {
 					},
 				},
 				session({ repoIdentity: "repo-2", sessionId: "other-1", updatedAtMs: nowMs - 60_000 }),
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-3",
+						repoName: "third",
+						worktreeRoot: "/t",
+						enabledAt: "t",
+					},
+				},
+				session({ repoIdentity: "repo-3", sessionId: "third-1", updatedAtMs: nowMs - 30_000 }),
 			],
 			{ producerKind: "cli", dbPath },
 		);
+	}
+
+	const sessionsFor = async (identities: string[]): Promise<string[] | undefined> => {
 		const scoped = await withDashboardDb(
 			(db) =>
 				buildDashboardModel(db, {
 					view: "stats",
-					scope: { kind: "repo", repoIdentity: "repo-2" },
+					scope: { kind: "repo", repoIdentities: identities },
 					timeZone: "UTC",
 					nowMs,
 				}),
 			{ dbPath },
 		);
+		return scoped.stats?.recentSessions.map((s) => s.sessionId);
+	};
+
+	it("filters by repo scope", async () => {
+		await seedMoreRepos();
+		expect(await sessionsFor(["repo-2"])).toEqual(["other-1"]);
+		const scoped = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "repo", repoIdentities: ["repo-2"] },
+					timeZone: "UTC",
+					nowMs,
+				}),
+			{ dbPath },
+		);
+		expect(scoped.repos).toHaveLength(3); // the picker still lists every repo
+		expect(scoped.scope).toEqual({ kind: "repo", repoIdentities: ["repo-2"] });
+	});
+
+	it("lists a PAUSED repo too, flagged and sorted after the active ones", async () => {
+		// A paused repo's rows are never deleted and it keeps counting in the
+		// aggregate KPIs, so dropping it from the list made an all-paused dashboard
+		// read as "No repositories yet". It stays in the list, marked `disabled`,
+		// sorted to the bottom — and still scopable, since its rows exist.
+		await seedMoreRepos();
+		await applySummaryEvents(
+			[{ producerKind: "cli", event: { type: "repo.disabled", repoIdentity: "repo-2", disabledAt: "t2" } }],
+			{ producerKind: "cli", dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		// Not dropped — every repo is present.
+		expect(model.repos.map((r) => r.repoIdentity).sort()).toEqual(["repo-1", "repo-2", "repo-3"]);
+		// Active first (by name), the paused one last; only it carries the flag, and
+		// an active row's shape is unchanged (`disabled` absent, not `false`).
+		expect(model.repos.map((r) => [r.repoName, r.disabled ?? "unset"])).toEqual([
+			["jolli", "unset"],
+			["third", "unset"],
+			["other", true],
+		]);
+		// Still scopable — the paused repo's own data answers.
+		expect(await sessionsFor(["repo-2"])).toEqual(["other-1"]);
+	});
+
+	it("filters to SEVERAL repos, and to neither of the others", async () => {
+		await seedMoreRepos();
+		expect((await sessionsFor(["repo-2", "repo-3"]))?.sort()).toEqual(["other-1", "third-1"]);
+	});
+
+	it("answers for the repos it recognizes when one token is stale", async () => {
+		// A bookmark naming a repo that has since been removed, alongside a live
+		// one. Dropping the whole scope would widen it silently; dropping every
+		// row would blank a page the reader has real data for.
+		await seedMoreRepos();
+		expect(await sessionsFor(["repo-2", "repo-gone"])).toEqual(["other-1"]);
+	});
+
+	it("answers nothing — never everything — when no token resolves", async () => {
+		await seedMoreRepos();
+		expect(await sessionsFor(["repo-gone", "also-gone"])).toEqual([]);
+	});
+
+	it("dedupes a name and its own identity into one repo", async () => {
+		// `?repo=other&repo=repo-2` is one repository asked for twice, which must
+		// not become a two-element `IN (…)` naming the same row.
+		await seedMoreRepos();
+		const scoped = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "repo", repoIdentities: ["other", "repo-2"] },
+					timeZone: "UTC",
+					nowMs,
+				}),
+			{ dbPath },
+		);
+		expect(scoped.scope).toEqual({ kind: "repo", repoIdentities: ["repo-2"] });
 		expect(scoped.stats?.recentSessions.map((s) => s.sessionId)).toEqual(["other-1"]);
-		expect(scoped.repos).toHaveLength(2); // the selector still lists every repo
 	});
 
 	it("renders sensibly from an empty database — zero KPIs, empty fun stats, no series keys", async () => {
@@ -599,10 +693,18 @@ describe("buildDashboardModel", () => {
 		expect(standup.workspaces[0]).not.toHaveProperty("branch");
 	});
 
-	it("treats a repo scope without an identity as all repos", async () => {
+	it("treats a repo scope with no identities as all repos", async () => {
+		// What a `?repo=` the browser emitted with nothing behind it parses to. It
+		// is not a way to select nothing — that is what an unresolvable token does.
 		await seed();
 		const model = await withDashboardDb(
-			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "repo" }, timeZone: "UTC", nowMs }),
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "repo", repoIdentities: [] },
+					timeZone: "UTC",
+					nowMs,
+				}),
 			{ dbPath },
 		);
 		expect(model.stats?.recentSessions.length).toBeGreaterThan(0);
@@ -644,7 +746,7 @@ describe("buildDashboardModel", () => {
 
 	it("keeps the session caveats off views that show no session activity", async () => {
 		await seed();
-		const notesFor = async (view: "stats" | "standup" | "memories") =>
+		const notesFor = async (view: "stats" | "standup" | "memories" | "settings") =>
 			(
 				await withDashboardDb(
 					(db) => buildDashboardModel(db, { view, scope: { kind: "all" }, timeZone: "UTC", nowMs }),
@@ -659,7 +761,7 @@ describe("buildDashboardModel", () => {
 		// how session history is reconstructed qualifies nothing there — and with the
 		// import note gone it now carries no coverage note at all.
 		expect(await notesFor("memories")).toEqual([]);
-		expect(await notesFor("repositories" as "stats")).toEqual([]);
+		expect(await notesFor("settings")).toEqual([]);
 	});
 
 	describe("custom range", () => {
@@ -2531,17 +2633,17 @@ describe("repo scope resolution (?repo= token)", () => {
 
 	it("accepts a repo name and echoes back the stored identity", async () => {
 		await seedRepos([["https://github.com/jolliai/jolliai", "jolliai"]]);
-		expect(await scopeOf({ kind: "repo", repoIdentity: "jolliai" })).toEqual({
+		expect(await scopeOf({ kind: "repo", repoIdentities: ["jolliai"] })).toEqual({
 			kind: "repo",
-			repoIdentity: "https://github.com/jolliai/jolliai",
+			repoIdentities: ["https://github.com/jolliai/jolliai"],
 		});
 	});
 
 	it("still accepts a full identity unchanged", async () => {
 		await seedRepos([["https://github.com/jolliai/jolliai", "jolliai"]]);
-		expect(await scopeOf({ kind: "repo", repoIdentity: "https://github.com/jolliai/jolliai" })).toEqual({
+		expect(await scopeOf({ kind: "repo", repoIdentities: ["https://github.com/jolliai/jolliai"] })).toEqual({
 			kind: "repo",
-			repoIdentity: "https://github.com/jolliai/jolliai",
+			repoIdentities: ["https://github.com/jolliai/jolliai"],
 		});
 	});
 
@@ -2551,9 +2653,9 @@ describe("repo scope resolution (?repo= token)", () => {
 			["https://github.com/jolliai/jolliai", "jolliai"],
 			["local:abc", "https://github.com/jolliai/jolliai"],
 		]);
-		expect(await scopeOf({ kind: "repo", repoIdentity: "https://github.com/jolliai/jolliai" })).toEqual({
+		expect(await scopeOf({ kind: "repo", repoIdentities: ["https://github.com/jolliai/jolliai"] })).toEqual({
 			kind: "repo",
-			repoIdentity: "https://github.com/jolliai/jolliai",
+			repoIdentities: ["https://github.com/jolliai/jolliai"],
 		});
 	});
 
@@ -2564,23 +2666,58 @@ describe("repo scope resolution (?repo= token)", () => {
 		]);
 		// Left unresolved: showing the wrong project's numbers under a
 		// plausible-looking URL is worse than showing none.
-		expect(await scopeOf({ kind: "repo", repoIdentity: "jolli" })).toEqual({
+		expect(await scopeOf({ kind: "repo", repoIdentities: ["jolli"] })).toEqual({
 			kind: "repo",
-			repoIdentity: "jolli",
+			repoIdentities: ["jolli"],
 		});
 	});
 
 	it("leaves an unknown token alone", async () => {
 		await seedRepos([["https://github.com/jolliai/jolliai", "jolliai"]]);
-		expect(await scopeOf({ kind: "repo", repoIdentity: "nope" })).toEqual({
+		expect(await scopeOf({ kind: "repo", repoIdentities: ["nope"] })).toEqual({
 			kind: "repo",
-			repoIdentity: "nope",
+			repoIdentities: ["nope"],
 		});
 	});
 
 	it("passes an all-repos scope through untouched", async () => {
 		await seedRepos([["https://github.com/jolliai/jolliai", "jolliai"]]);
 		expect(await scopeOf({ kind: "all" })).toEqual({ kind: "all" });
+	});
+
+	it("resolves each token independently — a name beside an identity", async () => {
+		await seedRepos([
+			["https://github.com/jolliai/jolliai", "jolliai"],
+			["https://github.com/jolliai/site", "site"],
+		]);
+		expect(await scopeOf({ kind: "repo", repoIdentities: ["jolliai", "https://github.com/jolliai/site"] })).toEqual(
+			{
+				kind: "repo",
+				repoIdentities: ["https://github.com/jolliai/jolliai", "https://github.com/jolliai/site"],
+			},
+		);
+	});
+
+	it("does not let one ambiguous name spoil the good token beside it", async () => {
+		await seedRepos([
+			["https://github.com/one/jolli", "jolli"],
+			["https://github.com/two/jolli", "jolli"],
+			["https://github.com/jolliai/site", "site"],
+		]);
+		expect(await scopeOf({ kind: "repo", repoIdentities: ["jolli", "site"] })).toEqual({
+			kind: "repo",
+			// The ambiguous one survives as-is and goes on to match nothing; the
+			// unique one resolves. Dropping the ambiguous token instead would
+			// silently widen the answer to "site only" without saying so.
+			repoIdentities: ["jolli", "https://github.com/jolliai/site"],
+		});
+	});
+
+	it("dedupes a token that names a repo already named by another", async () => {
+		await seedRepos([["https://github.com/jolliai/jolliai", "jolliai"]]);
+		expect(
+			await scopeOf({ kind: "repo", repoIdentities: ["jolliai", "https://github.com/jolliai/jolliai"] }),
+		).toEqual({ kind: "repo", repoIdentities: ["https://github.com/jolliai/jolliai"] });
 	});
 });
 
@@ -2697,7 +2834,7 @@ describe("memory cards feed", () => {
 
 	it("keeps Memory Activity cards when the dashboard is scoped to their repository", async () => {
 		await seedCard(payload());
-		expect(await cards({ kind: "repo", repoIdentity: "repo-1" })).toHaveLength(1);
+		expect(await cards({ kind: "repo", repoIdentities: ["repo-1"] })).toHaveLength(1);
 	});
 
 	it("shows the model that did the work, not the one that wrote the summary", async () => {

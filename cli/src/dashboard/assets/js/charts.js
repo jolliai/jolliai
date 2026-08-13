@@ -1,12 +1,41 @@
 window.JD = window.JD || {};
 
 ((JD) => {
-	/* 14-day stacked bar chart. series: [{date, bySeries}], keys: series names. */
+	/* `Jul 25` from a `YYYY-MM-DD` day key.
+	 *
+	 * Formatted from the STRING, never through `new Date(key)`: that parses a bare
+	 * day key as UTC midnight while `getMonth`/`getDate` read local, so west of
+	 * UTC every label renders one day early. The key is already the right day —
+	 * the payload bucketed it in its own zone — so there is nothing to convert,
+	 * only to spell. (The range calendar in `shell.js` carries the same warning
+	 * for the same reason, from the opposite direction.) */
+	var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+	var dayLabel = (key) => {
+		var parts = String(key).split("-");
+		var month = MONTHS[Number(parts[1]) - 1];
+		return month && parts[2] ? month + " " + Number(parts[2]) : String(key);
+	};
+
+	/* Tokens' and Spend's daily chart.
+	 *
+	 * **The date axis is the two ENDPOINTS, not a tick per bar.** It used to label
+	 * every other bar with its bare day-of-month: fine over 7 days, but at 30 and
+	 * especially 90 it was a row of numbers too dense to read and too sparse to
+	 * count along, and with no month on any of them `12` could be this month's or
+	 * last quarter's. Two labelled ends state the window exactly, in the space the
+	 * ticks were wasting, and they do not get denser as the range grows.
+	 *
+	 * Between the ends, per-bar identification is the same affordance
+	 * `JD.recallBars` relies on: every segment carries a `<title>` with its full
+	 * date, series key and value.
+	 */
 	JD.stackedBars = (series, keys, valueLabel) => {
 		var W = 660;
-		var H = 240;
-		var left = 42;
 		var bottom = 214;
+		/* Baseline + room for the endpoint labels + the same 8px margin the right
+		   edge uses. */
+		var H = bottom + 24;
+		var left = 42;
 		var plotW = W - left - 8;
 		var slot = plotW / Math.max(1, series.length);
 		var barW = slot * 0.58;
@@ -69,15 +98,26 @@ window.JD = window.JD || {};
 					JD.esc(point.date + " · " + key + " · " + JD.fmtTokens(value)) +
 					"</title></rect>";
 			});
-			if (dayIndex % 2 === 0) {
-				svg +=
-					'<text x="' +
-					(x + barW / 2).toFixed(2) +
-					'" y="232" text-anchor="middle" font-size="10.5" fill="var(--muted)">' +
-					JD.esc(point.date.slice(8)) +
-					"</text>";
-			}
 		});
+		/* The two endpoints, anchored to the plot's own edges rather than to their
+		   bars' centres — at 90 days a centred label overhangs the axis, and the
+		   window's bounds are what these state, not where two particular bars sit.
+		   A single-day window prints one label: the same day twice, at both ends,
+		   would read as a range that is not one. */
+		if (series.length > 0) {
+			var axis = (x, anchor, key) =>
+				'<text x="' +
+				x +
+				'" y="' +
+				(bottom + 18) +
+				'" text-anchor="' +
+				anchor +
+				'" font-size="10.5" fill="var(--muted)">' +
+				JD.esc(dayLabel(key)) +
+				"</text>";
+			svg += axis(left, "start", series[0].date);
+			if (series.length > 1) svg += axis(W - 8, "end", series[series.length - 1].date);
+		}
 		return svg + "</svg>";
 	};
 

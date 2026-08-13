@@ -1,6 +1,6 @@
 import { createLogger } from "../Logger.js";
 import type { ConversationTokenBreakdown } from "../Types.js";
-import { readTranscript } from "./TranscriptReader.js";
+import { isMissingTranscriptError, readTranscript } from "./TranscriptReader.js";
 
 const log = createLogger("ConversationTokenTotals");
 
@@ -45,7 +45,12 @@ export async function sumConversationTokens(
 				try {
 					return (await readTranscript(entry.transcriptPath)).usageBreakdown;
 				} catch (err) {
-					log.warn("Failed to read transcript for token totals: %s", entry.transcriptPath, err);
+					// A rotated or deleted transcript is the ordinary case this meter
+					// already degrades to zero for, and the meter refetches on every
+					// debounce — so warning on it repeats the same non-news forever.
+					// Only a genuine read failure earns a line.
+					const level = isMissingTranscriptError(err) ? log.debug : log.warn;
+					level("Failed to read transcript for token totals: %s", entry.transcriptPath, err);
 					return undefined;
 				}
 			}),

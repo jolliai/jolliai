@@ -23,7 +23,7 @@ import { loadConfig } from "../core/SessionTracker.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { getIndex, getSummary, readTranscriptsForCommits } from "../core/SummaryStore.js";
 import { collectDisplayTopics, getTranscriptIds } from "../core/SummaryTree.js";
-import { readTranscript } from "../core/TranscriptReader.js";
+import { isMissingTranscriptError, readTranscript } from "../core/TranscriptReader.js";
 import { readGraph } from "../graph/GraphArtifactStore.js";
 import type { KnowledgeGraph } from "../graph/GraphSchema.js";
 import { createLogger, errMsg } from "../Logger.js";
@@ -227,8 +227,12 @@ export async function sessionEventFromInfo(
 		};
 	} catch (err) {
 		// A moved or deleted transcript still counts as a session — record it
-		// with what the discoverer knew rather than dropping the row.
-		log.warn("transcript unreadable for %s/%s: %s", source, s.sessionId, errMsg(err));
+		// with what the discoverer knew rather than dropping the row. That case is
+		// routine (a host rotates its JSONL out from under a session that is still
+		// listed), so it logs at debug; only a genuine read failure is worth a line
+		// on the user's terminal.
+		const level = isMissingTranscriptError(err) ? log.debug : log.warn;
+		level("transcript unreadable for %s/%s: %s", source, s.sessionId, errMsg(err));
 		return base;
 	}
 }

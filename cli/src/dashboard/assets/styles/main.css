@@ -173,13 +173,82 @@ body {
   .wordmark { display: flex; align-items: baseline; gap: 8px; }
   .wordmark b { font-size: 16px; letter-spacing: -.01em; }
   .wordmark span { font-size: 12px; color: var(--muted); }
-  .repo-pill {
-    font-size: 12px; color: var(--ink-2); border: 1px solid var(--border);
-    border-radius: 6px; padding: 4px 10px; background: transparent;
+  /* Repository picker. `.repo-scope-wrap` is the positioning context for the
+     popover, so the list hangs off the button rather than being placed by JS the
+     way the range calendar is (that one is `position: fixed` because it is wider
+     than its own control and has to clamp to the viewport; this one is not). */
+  .repo-scope-wrap { position: relative; display: inline-flex; }
+  .repo-scope-wrap[hidden] { display: none; }
+  .repo-scope-btn {
+    appearance: none; font: inherit; font-size: 12.5px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 8px;
+    color: var(--ink-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 12px; background: var(--page);
   }
+  .repo-scope-btn:hover { color: var(--ink); }
+  .repo-scope-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .repo-scope-btn[aria-expanded="true"] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+  /* A real chevron, not the `▾` glyph this used to be. A text triangle cannot be
+     sized to match the mockup: at the 10px it was set to it read as a speck, and
+     scaling the font up thickens it into a solid arrowhead rather than the thin
+     stroke the design shows — the two are different shapes, not one shape at two
+     sizes. 15px matches `.w-icon svg`, so the page has ONE icon scale; the
+     stroke follows `currentColor`, which is what keeps it legible when
+     `[aria-expanded="true"]` inverts the button to ink-on-surface. */
+  .repo-scope-caret { width: 15px; height: 15px; flex: none; opacity: .7; }
+  .repo-scope {
+    position: absolute; top: calc(100% + 8px); left: 0; z-index: 40; width: min(320px, calc(100vw - 32px));
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 14px 32px rgba(20,28,48,.16); overflow: hidden;
+  }
+  /* Same UA-override gotcha as `.seg[hidden]` below: an author `display` rule
+     beats `[hidden] { display: none }`, so without this the popover stays
+     visible after `popover.hidden = true`. */
+  .repo-scope[hidden] { display: none; }
+  .repo-scope-list { max-height: 320px; overflow-y: auto; padding: 6px; }
+  .repo-scope-row {
+    display: flex; align-items: center; gap: 10px; cursor: pointer;
+    padding: 7px 10px; border-radius: 7px; font-size: 12.5px; color: var(--ink);
+  }
+  .repo-scope-row:hover { background: var(--page); }
+  .repo-scope-row.all { border-bottom: 1px solid var(--border); border-radius: 7px 7px 0 0; margin-bottom: 4px; font-weight: 550; }
+  /* The master row's own accent, so checked and half-checked both read as "this
+     row speaks for the ones below it" rather than as one more item in the list.
+     `:indeterminate` is a real UA state — the JS sets the property, the UA draws
+     the dash — so nothing here has to paint the mark itself. */
+  .repo-scope-row.all input:indeterminate, .repo-scope-row.all input:checked { accent-color: var(--accent); }
+  .repo-scope-row .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .repo-scope-row .meta { margin-left: auto; font-size: 11px; color: var(--muted); white-space: nowrap; }
+  /* A paused repo: still selectable (its history is reachable), just dimmed so it
+     reads as inactive, and its "paused" meta picks up the warning tint. */
+  .repo-scope-row.paused .name { color: var(--muted); }
+  .repo-scope-row.paused .meta { color: var(--warn, var(--muted)); font-style: italic; }
+  /* The disambiguating checkout path. `direction: rtl` so a long path elides at
+     its HEAD — the tail is the part that tells two clones apart, and a
+     left-to-right ellipsis would cut off exactly that. `text-align: left` keeps
+     it reading normally once it fits. */
+  .repo-scope-row .meta.path {
+    direction: rtl; text-align: left; min-width: 0; max-width: 55%;
+    overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  .repo-scope-foot {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 14px; border-top: 1px solid var(--border); background: var(--page);
+    font-size: 11.5px; color: var(--muted);
+  }
+  .repo-scope-foot > div { margin-left: auto; display: flex; gap: 8px; }
   .spacer { flex: 1; }
   .tiers-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
-  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--page); }
+  /* Segmented control: a recessed track with the active segment raised out of it
+     as a light pill. Replaces a flush row of dividers whose active segment was a
+     solid dark fill — that read as a pressed BUTTON (an action) rather than as
+     the selected one of N (a state), which is the whole job of this control.
+     `--page` for the track and `--surface` for the pill, so the raised piece is
+     the same material as the card it sits on, in both themes. */
+  .seg {
+    display: inline-flex; gap: 2px; padding: 3px;
+    border: 1px solid var(--border); border-radius: 10px; background: var(--page);
+  }
   /* `.seg`'s own `display: inline-flex` otherwise beats the UA `[hidden] { display: none }`
      rule (same specificity, author over UA) — the same gotcha `.dx-answer[hidden]` documents
      below. Without this, `rangeSeg.hidden = true` (shell.js, for views with no time window —
@@ -188,13 +257,17 @@ body {
   .seg[hidden] { display: none; }
   .seg button {
     appearance: none; border: 0; background: transparent; color: var(--ink-2);
-    font: inherit; font-size: 12.5px; padding: 6px 14px; cursor: pointer; position: relative;
+    font: inherit; font-size: 12.5px; padding: 5px 14px; border-radius: 7px;
+    cursor: pointer; position: relative;
   }
-  .seg button + button { border-left: 1px solid var(--border); }
-  /* Solid ink pill, not accent-soft — jolli-design's real segmented controls
-     (range picker, card tabs) use a dark filled pill for the active state, not
-     a tinted accent; confirmed against a screenshot of its Dashboard route. */
-  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); font-weight: 600; }
+  .seg button:hover { color: var(--ink); }
+  /* The raised pill. A border would re-draw the divider this control just lost,
+     so the lift is a shadow plus a hairline ring — enough to separate the pill
+     from the track without adding a second line weight to the row. */
+  .seg button[aria-pressed="true"] {
+    background: var(--surface); color: var(--ink); font-weight: 600;
+    box-shadow: 0 1px 2px rgba(20, 28, 48, .10), 0 0 0 1px rgba(20, 28, 48, .04);
+  }
   .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
   /* Custom range picker. This is a real range calendar rather than two browser
@@ -281,13 +354,17 @@ body {
     padding-top: 10px; border-top: 1px solid var(--border); background: var(--surface);
   }
 
-  /* ---------- nav: Dashboard's two children + gated rows ----------
-     Six-destination nav (Repositories top slot, Dashboard/Memories/Knowledge/
-     Graph gated middle group, Settings bottom slot). Children render indented
-     under a group label rather than behind an expand/collapse toggle — that
-     interaction is a later polish pass over the same markup, not a routing
-     concern. Gating mirrors DashboardServer's GATED_PATHS: a disabled row is
-     the SAME "no repo enabled yet" fact the server's 302 already enforces. */
+  /* ---------- nav: Dashboard's two children ----------
+     Dashboard (two children) and Memories in the scrolling list, Settings in the
+     pinned bottom slot. Children render indented under a group label rather than
+     behind an expand/collapse toggle — that interaction is a later polish pass
+     over the same markup, not a routing concern.
+
+     The `[aria-disabled]` rules below are unreachable at HEAD: rows used to
+     disable themselves until a repository was enabled, mirroring the server's
+     redirect to the Repositories page. Both that page and the gate are gone (see
+     NAV_MIDDLE in shell.js), so nothing sets the attribute. Kept because the
+     treatment is the obvious one for any row that gains a disabled state. */
   .sb-group-label { display: flex; align-items: center; gap: 8px; color: var(--ink-2); padding: 8px 10px 2px; font-size: 13px; }
   .sb-group-label .sb-group-chevron { width: 14px; height: 14px; margin-left: auto; color: var(--accent); }
   .sb-item.child { padding-left: 34px; font-size: 12.5px; }
@@ -305,7 +382,7 @@ body {
   @media (min-width: 900px) {
     .span7 { grid-column: span 7; } .span5 { grid-column: span 5; }
     .span6 { grid-column: span 6; }
-    /* Equal-third band — Skills / MCP servers / Where your tokens went, matching
+    /* Equal-third band — Skills / MCP servers / Tokens, matching
        jolli-design's own three-up row: three widgets of the same weight, so
        none of them leads. */
     .span4 { grid-column: span 4; }
@@ -314,6 +391,16 @@ body {
   .card .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
   .card-head { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
   .card-head .spacer { flex: 1; }
+  /* A title whose subtitle moved into its `title=` tooltip (Skills, MCPs). The
+     dotted underline is the affordance: without it the tooltip is a thing the
+     reader has no reason to go looking for, which is indistinguishable from
+     having deleted the subtitle outright. `help` rather than `pointer` — it
+     reveals text, it does not navigate. */
+  .card-head h2.has-hint {
+    text-decoration: underline dotted var(--border); text-underline-offset: 4px;
+    cursor: help; width: fit-content;
+  }
+  .card-head h2.has-hint:hover { text-decoration-color: var(--muted); }
 
   /* ---------- widget icon badge + footer (jolli-design chrome, 2026-08) ----------
      Each card's icon badge is tinted to that card's own theme colour (soft
@@ -534,16 +621,19 @@ body {
   .callout b { color: var(--ink); }
   .callout .link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 
-  /* ---------- repositories: the setup/receipt card ----------
-     Same card renders first-run and "add another repository later" — see
-     repositories.js's header. Reuses the app's own empty-state / option-row
-     idioms rather than inventing new containers per region. */
+  /* ---------- the empty/setup card ----------
+     Built for the Repositories page's first-run and "add another repository
+     later" states; that page is gone and its one surviving user is the stats
+     view's zero-repository card (`noReposCard` in stats.js). Reuses the app's own
+     empty-state / option-row idioms rather than inventing new containers. */
   .empty { border: 1px solid var(--border); background: var(--surface); border-radius: 12px; padding: 40px; box-shadow: var(--shadow-sm, none); }
   .empty .inner { max-width: 28rem; margin: 0 auto; display: flex; flex-direction: column; align-items: center; text-align: center; }
   .empty .chip { width: 3.5rem; height: 3.5rem; border-radius: 12px; display: grid; place-items: center; margin-bottom: 20px; background: var(--accent-soft); color: var(--accent); font-size: 22px; }
   .empty h2 { margin: 0; font-size: 18px; font-weight: 600; }
   .empty p { margin-top: 8px; color: var(--ink-2); }
-  .empty .acts { margin-top: 20px; display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+  /* No rule for an action row: the Repositories page's Enable buttons were the
+     only thing that ever sat under this card, and `noReposCard` points at
+     `jolli enable` instead. Re-add `.empty .acts` if a card here grows one. */
 
   .rh { display: flex; align-items: flex-start; gap: 12px; }
   .rh .g { flex: 1 1 auto; min-width: 0; }
@@ -606,7 +696,10 @@ body {
   .share-note { font-size: 11.5px; color: var(--muted); }
 
   .cols { display: grid; grid-template-columns: 1fr; gap: 16px; }
-  @media (min-width: 980px) { .cols { grid-template-columns: 1fr 1fr 1fr; } }
+  /* Two columns — Yesterday and Today. The third (Risks · Blockers · Questions)
+     was removed because the insight kinds it filtered for are never produced; see
+     the note at the top of standup.js. */
+  @media (min-width: 980px) { .cols { grid-template-columns: 1fr 1fr; } }
   .cols > .card { grid-column: auto; }
   .col h2 { display: flex; align-items: baseline; gap: 8px; }
   .col h2 .cnt { font-size: 11px; color: var(--muted); font-weight: 500; }
@@ -863,10 +956,11 @@ body {
   .mem-e2e .e2e .gd-sec { margin-top: 18px; }
   .mem-e2e .e2e ol, .mem-e2e .e2e ul { margin: 8px 0 0; padding-left: 24px; font-size: 14px; color: var(--ink-2); line-height: 1.6; }
   .mem-e2e .e2e li::marker { color: var(--good-text); }
-  .tag.kind-gotcha    { border-color: transparent; background: var(--lock-bg); font-weight: 600; }
-  .tag.kind-blocker   { border-color: transparent; background: color-mix(in srgb, var(--crit) 12%, transparent); color: var(--crit); font-weight: 600; }
-  .tag.kind-question  { border-color: transparent; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-  .tag.age { border-style: dashed; }
+  /* `.tag.kind-gotcha` / `.kind-blocker` / `.kind-question` and `.tag.age` lived
+     here, styling the standup's Risks rows. They went with that column — those
+     three insight kinds are never produced, so nothing could ever carry them.
+     (`--kind-gotcha` further down is a DIFFERENT token, used by the memories
+     view's decision kinds; it stays.) */
   /* ---------- hot files ---------- */
   /* Four columns: path (elides), a proportional bar, the commit count, churn.
      The path column is min-width:0 so a long path shrinks rather than pushing
@@ -1002,7 +1096,6 @@ body {
   .mas-item { display: flex; align-items: baseline; gap: 6px; }
   .mas-item b { font-size: 18px; font-weight: 650; color: var(--ink); }
   .mas-item span { font-size: 12.5px; color: var(--muted); }
-  .mas-warn b { color: var(--warn); }
   .mem-activity-list { display: grid; gap: 18px; }
   .mem-activity-group { display: grid; gap: 8px; }
   .mem-activity-group h3 { margin: 0; font-size: 11.5px; color: var(--muted); font-weight: 600; }

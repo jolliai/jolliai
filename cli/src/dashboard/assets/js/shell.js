@@ -6,8 +6,9 @@ window.JD = window.JD || {};
 	   cannot drift on which params survive a click. */
 	JD.query = (model, over) => {
 		var o = over || {};
-		var repo =
-			"repo" in o ? o.repo : model.scope && model.scope.kind === "repo" ? model.scope.repoIdentity : undefined;
+		/* An ARRAY of identities, possibly empty (= all repos). Overriding with
+		   `{ repo: [] }` or `{ repo: undefined }` both clear the scope. */
+		var repos = "repo" in o ? o.repo || [] : JD.scopeIdentities(model);
 		var ranged = JD.ranged(model);
 		var range = "range" in o ? o.range : ranged ? ranged.range : undefined;
 		/* Falls back to the dimension the SERVER says it used, not to undefined.
@@ -24,7 +25,14 @@ window.JD = window.JD || {};
 		var from = "from" in o ? o.from : ranged ? ranged.rangeFrom : undefined;
 		var to = "to" in o ? o.to : ranged ? ranged.rangeTo : undefined;
 		var parts = [];
-		if (repo) parts.push("repo=" + encodeURIComponent(JD.repoToken(model, repo)));
+		/* One `repo=` per identity — REPEATED params, not a comma-joined list: an
+		   identity is a remote URL, so any delimiter is a character one may
+		   legitimately contain, and splitting on it would ask for two repos that
+		   do not exist instead of the one that does. A single selection therefore
+		   still emits exactly the `?repo=jolliai` old links carry. */
+		repos.forEach((identity) => {
+			parts.push("repo=" + encodeURIComponent(JD.repoToken(model, identity)));
+		});
 		/* Emitted whenever known — never "omitted because it equals the default".
 		   Both omissions were wrong about what the default IS: the server's is
 		   `month`/`model`, while this dropped `2w` and `model`, so a bookmarked
@@ -87,20 +95,26 @@ window.JD = window.JD || {};
 		return (query ? query + "&" : "?") + parts.join("&");
 	};
 
-	/* Back-compat alias — some callers only care about the repo scope. */
-	JD.scopeQuery = (scope) =>
-		scope && scope.kind === "repo" && scope.repoIdentity ? "?repo=" + encodeURIComponent(scope.repoIdentity) : "";
+	/* The scope's repo identities, always an array — empty means every repo.
+	   The ONE place that reads the scope's shape, so a payload change lands here
+	   rather than in each of the callers that only want "how many repos is this
+	   page showing?" (the picker's label, and the row-level repo tags that are
+	   redundant under a single-repo scope). */
+	JD.scopeIdentities = (model) => {
+		var scope = model && model.scope;
+		return scope && scope.kind === "repo" && scope.repoIdentities ? scope.repoIdentities.slice() : [];
+	};
 
 	/** How often the whole page refetches its model. */
 	var PAGE_REFRESH_MS = 30_000;
 
-	/* Page title/subtitle per view — every view the server can render. Decisions
-	   is retired: its view token, page and nav row are all gone (folded into
-	   Memories' per-topic Decisions callout). */
+	/* Page title/subtitle per view — every view the server can render. Two are
+	   retired: Decisions (folded into Memories' per-topic Decisions callout) and
+	   Repositories (its list became the topbar picker; its Pause/Resume actions
+	   were removed outright). Both lost their view token, page and nav row. */
 	var DASHBOARDS = [
 		{ view: "stats", label: "My Dashboard", sub: "individual · local" },
 		{ view: "standup", label: "Daily Standup", sub: "sprint · local" },
-		{ view: "repositories", label: "Repositories", sub: "enable · pause" },
 		{ view: "memories", label: "Memories", sub: "browse · per-commit" },
 		{ view: "knowledge", label: "Knowledge", sub: "wiki · per-repo" },
 		{ view: "graph", label: "Graph", sub: "knowledge graph · per-repo" },
@@ -110,11 +124,10 @@ window.JD = window.JD || {};
 	/* Canonical URL for a view token. `stats`/`standup` live at /dashboard(/standup)
 	   under the new nav, not at their own name — everything else's path matches
 	   its view token 1:1. One place this can diverge, so nav links, the range
-	   control and the repo filter cannot disagree on where a view lives. */
+	   control and the repo picker cannot disagree on where a view lives. */
 	var VIEW_PATH = {
 		stats: "/dashboard",
 		standup: "/dashboard/standup",
-		repositories: "/repositories",
 		memories: "/memories",
 		knowledge: "/knowledge",
 		graph: "/graph",
@@ -122,18 +135,20 @@ window.JD = window.JD || {};
 	};
 	JD.viewPath = (view) => VIEW_PATH[view] || "/" + view;
 
-	/* The nav list:
-	   Dashboard/Memories are gated until a repo is enabled (mirrors
-	   DashboardServer's GATED_PATHS, so a disabled row and a 302 never
-	   disagree); Repositories sits right under Memories, never gated — it is
-	   the row that opens the gate, so it must stay reachable with zero repos.
-	   Dashboard's two children render flat under a group label rather than
-	   behind an expand/collapse toggle — that interaction is a later polish
-	   pass, not a routing concern.
+	/* The nav list. Dashboard's two children render flat under a group label
+	   rather than behind an expand/collapse toggle — that interaction is a later
+	   polish pass, not a routing concern.
 
-	   Knowledge and Graph ARE routed (VIEW_PATHS has /knowledge, /graph) and
-	   appear below Repositories; unlike Dashboard/Memories they are NOT gated
-	   (see the note on their entries). Settings alone has no scrollable nav row
+	   NOTHING IS GATED any more. These rows used to disable themselves until a
+	   repo was enabled, mirroring DashboardServer's GATED_PATHS so a dead row and
+	   a 302 could not disagree, and Repositories sat below them as the never-gated
+	   row that opened the gate. Repositories is gone, so the gate has nowhere to
+	   send anyone — a disabled row leading nowhere is worse than a live one that
+	   explains itself, and the stats page now carries the enable instruction that
+	   page used to.
+
+	   Knowledge and Graph ARE routed (VIEW_PATHS has /knowledge, /graph) and sit
+	   below Memories. Settings alone has no scrollable nav row
 	   and no page path — it is a modal pinned to the bottom slot (NAV_BOTTOM),
 	   opened via JD.openSettings, so a direct visit to /settings 404s. Adding a
 	   new page needs its server route, view token and model payload too — a nav
@@ -141,31 +156,26 @@ window.JD = window.JD || {};
 	var NAV_MIDDLE = [
 		{
 			label: "Dashboard",
-			gated: true,
 			kids: [
 				{ view: "stats", path: "/dashboard", label: "My Dashboard" },
 				{ view: "standup", path: "/dashboard/standup", label: "Daily Standup" },
 			],
 		},
-		{ view: "memories", path: "/memories", label: "Memories", gated: true },
-		{ view: "repositories", path: "/repositories", label: "Repositories" },
+		{ view: "memories", path: "/memories", label: "Memories" },
 		/* Knowledge / Graph browse the Memory Bank FOLDER, whose repo set differs
-		   from the enabled dashboard repos GATED_PATHS keys off — so they are NOT
-		   gated (their pages carry their own empty state). */
+		   from the enabled dashboard repos — they carry their own empty state. */
 		{ view: "knowledge", path: "/knowledge", label: "Knowledge" },
 		{ view: "graph", path: "/graph", label: "Graph" },
 	];
 	/* Settings is pinned to the sidebar's bottom edge (its reserved slot), not in
 	   the scrollable menu list — a persistent destination rather than the last
-	   nav row. Never gated: agents/summary/privacy are meaningful with zero repos. */
+	   nav row. */
 	var NAV_BOTTOM = { view: "settings", path: "/settings", label: "Settings" };
 
 	/* The sidebar uses the same compact Lucide-style outlines as the mockup.
 	   Keeping the paths here makes the navigation self-contained and avoids a
 	   dependency on an icon font at dashboard start-up. */
 	var NAV_ICONS = {
-		foldergit:
-			'<path d="M9 20H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v3"/><circle cx="13" cy="12" r="2"/><path d="M18 19c-2.8 0-5-2.2-5-5v8"/><circle cx="20" cy="19" r="2"/>',
 		dashboard:
 			'<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
 		database:
@@ -185,7 +195,6 @@ window.JD = window.JD || {};
 		"</svg></span>";
 	var navIconFor = (view) =>
 		({
-			repositories: "foldergit",
 			stats: "dashboard",
 			memories: "database",
 			knowledge: "book",
@@ -209,6 +218,294 @@ window.JD = window.JD || {};
 	   also what keeps the popover open across a refresh. */
 	var calendarPending = null;
 
+	/* The repo picker's in-progress tick set (an array of identities), or null
+	   when the popover is closed — and its own document-level Escape handler.
+	   Module-scoped for exactly the two reasons the calendar's are: renderShell
+	   re-runs on the 30 s poll, so a local would be re-seeded from the
+	   server-backed scope and discard a half-made selection, and an untracked
+	   `keydown` listener would stack a fresh copy on `document` every tick. */
+	var repoPending = null;
+	var repoKeydownHandler = null;
+	/* The row markup currently in `#repoScopeList`, so a render can tell whether the
+	   ROWS changed (a repo registered, a session count moved) from whether only the
+	   TICKS did. Module-scoped rather than read back off the element: it has to
+	   outlive the closure that drew it, and it is compared, never displayed. */
+	var repoRowsDrawn = "";
+
+	/* Views the scope actually narrows — which is now every page there is, since
+	   Repositories (the one page that listed the whole registry regardless) was
+	   removed. Kept as a table rather than collapsed to `true` so a future view
+	   that ignores the scope hides the control instead of lying about it; the
+	   picker hides rather than disables, same as the range control on standup. */
+	var SCOPED_VIEWS = { stats: true, standup: true, memories: true };
+
+	/* Button label for a selection: the repo's name at one, a count past that.
+	   Names past one would either truncate or push the range control off the row,
+	   and the popover is one click away for the detail. */
+	function repoScopeLabel(model, selected) {
+		if (selected.length === 0) return "All repos";
+		if (selected.length === 1) {
+			var option = (model.repos || []).filter((r) => r.repoIdentity === selected[0])[0];
+			/* A scope naming a repo that is no longer in the list (paused since the
+			   page was rendered) still has to say SOMETHING true — the identity is
+			   what the numbers were actually filtered by. */
+			return option ? option.repoName : selected[0];
+		}
+		return selected.length + " repos";
+	}
+
+	/* The topbar repository picker: a button plus a checkbox popover.
+	   Mirrors the range calendar's lifecycle deliberately — see `repoPending`. */
+	function renderRepoPicker(model) {
+		var esc = JD.esc;
+		var wrap = document.getElementById("repoScopeWrap");
+		var button = document.getElementById("repoScopeBtn");
+		var popover = document.getElementById("repoScope");
+		var list = document.getElementById("repoScopeList");
+		var label = document.getElementById("repoScopeLabel");
+		var selectionNote = document.getElementById("repoScopeSelection");
+		var applyButton = document.getElementById("repoScopeApply");
+		var cancelButton = document.getElementById("repoScopeCancel");
+		/* All seven or none. Every one of them is static in index.html, so a missing
+		   one means the template and this file have gone out of step — and a guard
+		   over four of them just moves the resulting TypeError further down, into the
+		   render, where it takes the rest of the shell (nav, range control) with it. */
+		if (!wrap || !button || !popover || !list || !label || !selectionNote || !applyButton || !cancelButton) return;
+
+		var options = model.repos || [];
+		var scoped = JD.scopeIdentities(model);
+		var identities = options.map((option) => option.repoIdentity);
+		/* The scope split in two: tokens naming a repo that is still registered, and
+		   tokens naming nothing at all — a bookmarked `?repo=` for a repo since
+		   disabled or removed. The server keeps such a token rather than dropping it
+		   (`resolveScope` leaves what it cannot resolve in place, and the query side
+		   folds it to a row id that matches nothing) precisely so the page cannot
+		   silently widen to every repo. That makes the dead token the client's
+		   problem to show a way out of. */
+		var live = scoped.filter((id) => identities.indexOf(id) >= 0);
+		var stale = scoped.length - live.length;
+		/* Nothing to pick between with zero or one repo registered: the control would
+		   only ever be able to say what the page already says. EXCEPT with a dead
+		   token in the URL — the page is then showing an empty scope nothing on it
+		   explains, and every link rebuilds that token into the next URL
+		   (`JD.query` re-emits the scope it was handed), so hiding the control leaves
+		   no way back short of editing the address bar. With no repo registered at all
+		   there is still nothing to offer: every row would be unpickable. */
+		var shown = !!SCOPED_VIEWS[model.view] && options.length > 0 && (options.length > 1 || stale > 0);
+		wrap.hidden = !shown;
+		if (!shown) {
+			/* Closed as well as hidden — a pending selection left behind would
+			   re-open the popover on the next render of a scoped view, over a
+			   control the reader never touched there. */
+			repoPending = null;
+			popover.hidden = true;
+			button.setAttribute("aria-expanded", "false");
+			return;
+		}
+		label.textContent = repoScopeLabel(model, scoped);
+		/* The label can be ambiguous where the names are (three clones called
+		   `repo`), so the button carries the identities it actually stands for.
+		   textContent-set, never markup — these are user-controlled strings. */
+		button.setAttribute("title", scoped.length > 0 ? scoped.join("\n") : "Every registered repository");
+
+		/* "All repositories" is a SET question, not a count. A stale or foreign
+		   `?repo=` token makes `picked.length` equal `identities.length` while a
+		   real repo sits unticked, so a length test drew the master row as
+		   fully-checked and Apply collapsed to an empty `?repo=`, silently widening
+		   "just A" to every repo. Ask instead whether every enabled identity is
+		   present; extra dead tokens do not count toward "all". */
+		var everyRepoSelected = (sel) => identities.every((id) => sel.indexOf(id) >= 0);
+		/* Ticked set: the in-progress selection when the popover is open, else the
+		   scope the server answered with.
+
+		   THE UNSCOPED PAGE SEEDS EVERY BOX TICKED, not none. "All repositories"
+		   is stored as an EMPTY `?repo=` — an explicit list of every repo goes
+		   stale the moment one is registered, silently excluding it from a scope
+		   that reads as "all" — but that is how the selection is spelled in the
+		   URL, and it has no business being how it is drawn. Seeding the boxes
+		   from the empty list made the widest possible scope look like nothing
+		   was selected at all. `pickedToScope` below puts the two back together. */
+		/* The COMMITTED selection — what the boxes show when nothing is pending.
+		   Only the LIVE half of the scope: a box can only stand for a row that is
+		   there, so a dead token draws as nothing rather than padding the ticked
+		   count, and Apply drops it from the next URL. When every token is dead this
+		   is empty — no row ticked, Apply off until the reader picks one — which is
+		   both the honest reading of that scope and the way out of it.
+		   A function rather than a value because `close()` has to restore it, and
+		   restoring from a captured array would hand the closure a reference the
+		   tick-render's own `picked` then mutates. */
+		var committed = () => (scoped.length > 0 ? live.slice() : identities.slice());
+		var picked = repoPending ? repoPending.slice() : committed();
+		popover.hidden = !repoPending;
+		button.setAttribute("aria-expanded", String(!popover.hidden));
+
+		/* The ROWS, with no tick state in them at all.
+		   Every tick is a DOM property written by `syncMarks` instead, because
+		   `list.innerHTML = …` replaces the very checkbox the reader is standing on:
+		   with the state in the markup, each toggle had to redraw, and each redraw
+		   destroyed the focused element — so keyboard multi-select lost its place
+		   after every single row and had to be re-Tabbed to. `checked` has an HTML
+		   spelling and `indeterminate` does not, which is what made the split look
+		   optional; it never was. */
+		var listHtml = () => {
+			var html =
+				'<label class="repo-scope-row all"><input type="checkbox" data-repo-all="1">' +
+				'<span class="name">All repositories</span></label>';
+			options.forEach((option) => {
+				/* A repo NAME is a directory basename, so several rows can carry the
+				   same one — three clones all called `repo` is the ordinary case, not
+				   a corner. Identical rows would be a list you cannot choose from, so
+				   a duplicated name spends its meta slot on the checkout path (the
+				   thing that actually differs) instead of the session count. The full
+				   path is the row's tooltip either way. */
+				var ambiguous = options.filter((r) => r.repoName === option.repoName).length > 1;
+				/* A PAUSED repo stays in the list and stays selectable — its rows are
+				   never deleted and it still counts in the aggregate numbers, so its
+				   history is worth reaching. The meta slot says so (over the sessions
+				   figure or the disambiguating path), and `paused` on the row is what
+				   the stylesheet dims it by. */
+				var meta = option.disabled
+					? "paused"
+					: ambiguous
+						? esc(option.worktreeRoot || option.repoIdentity)
+						: option.sessionsThisWeek + (option.sessionsThisWeek === 1 ? " session" : " sessions") + " · 7d";
+				html +=
+					'<label class="repo-scope-row' +
+					(option.disabled ? " paused" : "") +
+					'" title="' +
+					esc(option.worktreeRoot || option.repoIdentity) +
+					'"><input type="checkbox" data-repo="' +
+					esc(option.repoIdentity) +
+					'"><span class="name">' +
+					esc(option.repoName) +
+					'</span><span class="meta' +
+					(ambiguous && !option.disabled ? " path" : "") +
+					'">' +
+					meta +
+					"</span></label>";
+			});
+			return html;
+		};
+
+		/* Everything a toggle changes: the ticks, the master row's half-selected
+		   mark, the footer sentence and Apply. Takes the box list it was given rather
+		   than re-querying, so it writes to the same elements the handlers are bound
+		   to even after a rebuild. */
+		var syncMarks = (boxes) => {
+			var all = everyRepoSelected(picked);
+			var none = picked.length === 0;
+			Array.prototype.forEach.call(boxes, (box) => {
+				if (box.getAttribute("data-repo-all")) {
+					box.checked = all;
+					/* The half-selected mark. A DOM PROPERTY with no HTML spelling at
+					   all, so it can only be written here. Without it the master row
+					   reads as plain unchecked while a subset is selected — the one
+					   state the tri-state pattern exists to distinguish. */
+					box.indeterminate = !all && !none;
+					return;
+				}
+				box.checked = picked.indexOf(box.getAttribute("data-repo")) >= 0;
+			});
+			/* A scope of zero repositories is not expressible — the server reads an
+			   empty `?repo=` as every repo — so rather than silently widening an
+			   empty selection back to "all" on Apply, the button says why it is off. */
+			selectionNote.textContent = all
+				? "All repositories"
+				: none
+					? "Select at least one repository"
+					: picked.length + (picked.length === 1 ? " repository selected" : " repositories selected");
+			applyButton.disabled = none;
+		};
+
+		var renderList = () => {
+			var html = listHtml();
+			/* Redrawn ONLY when the rows themselves changed. The tick state is not in
+			   this string, so a toggle never reaches here — and neither does the 30 s
+			   poll while the numbers hold steady, which is what keeps an open popover
+			   from having the row under the pointer replaced mid-selection. */
+			if (html !== repoRowsDrawn) {
+				list.innerHTML = html;
+				repoRowsDrawn = html;
+			}
+			var boxes = list.querySelectorAll("input[type=checkbox]");
+			Array.prototype.forEach.call(boxes, (box) => {
+				/* Rebound on every render even when the rows were reused: each render
+				   is a new closure over a new `picked`, and a handler left pointing at
+				   the previous one would update a set Apply no longer reads. */
+				box.onchange = () => {
+					if (box.getAttribute("data-repo-all")) {
+						/* Standard select-all: already-all clears, anything else
+						   selects everything. Clearing is what makes "just these two"
+						   two clicks instead of N-2. Recomputed here rather than read
+						   from the enclosing render, which may be several ticks old. */
+						picked = everyRepoSelected(picked) ? [] : identities.slice();
+					} else {
+						var identity = box.getAttribute("data-repo");
+						var at = picked.indexOf(identity);
+						if (at >= 0) picked.splice(at, 1);
+						else picked.push(identity);
+					}
+					repoPending = picked.slice();
+					syncMarks(boxes);
+				};
+			});
+			syncMarks(boxes);
+		};
+
+		var open = () => {
+			repoPending = picked.slice();
+			popover.hidden = false;
+			button.setAttribute("aria-expanded", "true");
+			renderList();
+		};
+		/* Cancel/Escape DISCARD, they do not merely hide. Clearing `repoPending`
+		   alone was only half of it: `open()` re-seeds from this closure's own
+		   `picked`, which the checkbox handlers have been mutating, so a re-open
+		   before the next render brought back exactly the ticks Cancel threw away.
+		   A render in between recomputes `picked` from the server's scope, which is
+		   why this looked correct — the discard really happened on the poll tick,
+		   up to PAGE_REFRESH_MS later, and only if one ran first. */
+		var close = () => {
+			repoPending = null;
+			picked = committed();
+			popover.hidden = true;
+			button.setAttribute("aria-expanded", "false");
+		};
+
+		button.onclick = () => (popover.hidden ? open() : close());
+		cancelButton.onclick = close;
+		popover.onsubmit = (event) => {
+			event.preventDefault();
+			if (picked.length === 0) return;
+			/* Every box ticked collapses back to the EMPTY param — the one the
+			   server reads as "every repo", including repos registered after this
+			   link was made. This is the only place the drawn selection and the
+			   stored one are allowed to differ, and it is the whole reason they
+			   can: an all-ticked list and an empty list mean the same thing today
+			   and only the empty one keeps meaning it tomorrow.
+
+			   The URL is the only place the scope lives, so Apply is a navigation.
+			   `repo` is passed explicitly (rather than left to the model's own
+			   scope) precisely so an empty array clears it. */
+			var next = everyRepoSelected(picked) ? [] : picked;
+			window.location.href = JD.viewPath(model.view) + JD.query(model, { repo: next });
+		};
+		/* Tracked across renders and removed before re-binding, for the same reason
+		   the calendar's is: renderShell runs on every poll tick. */
+		if (repoKeydownHandler) document.removeEventListener("keydown", repoKeydownHandler);
+		repoKeydownHandler = (event) => {
+			if (event.key === "Escape" && !popover.hidden) close();
+		};
+		document.addEventListener("keydown", repoKeydownHandler);
+		/* An open popover is RE-rendered on the tick rather than left alone:
+		   everything above rebinds to this closure while the checkboxes already in
+		   the document still call the previous one, so a click after a tick would
+		   update one closure's `picked` while Apply read another's. Rebinding is all
+		   this usually does — `renderList` redraws the rows only when they changed,
+		   so the reader's focus and the row under the pointer survive the tick. */
+		if (repoPending) renderList();
+	}
+
 	JD.renderShell = (model) => {
 		var esc = JD.esc;
 		var current = DASHBOARDS.filter((d) => d.view === model.view)[0] || DASHBOARDS[0];
@@ -218,11 +515,10 @@ window.JD = window.JD || {};
 		document.getElementById("pageTitle").textContent = current.label;
 		document.getElementById("pageSub").textContent = current.sub;
 
-		/* Sidebar — the nav list (plus an empty pinned bottom slot). `gateOpen`
-		   mirrors DashboardServer's GATED_PATHS check: at least one enabled repo,
-		   or the gated rows disable instead of dead-ending on a redirect. */
-		var gateOpen = (model.repos || []).length > 0;
-		var navRow = (item, active, disabled) =>
+		/* Sidebar — the nav list (plus an empty pinned bottom slot). No row is
+		   gated: see NAV_MIDDLE for why the zero-repo gate went away with the
+		   Repositories page it used to redirect to. */
+		var navRow = (item, active) =>
 			'<button type="button" class="sb-item' +
 			(item.child ? " child" : "") +
 			'" data-nav-path="' +
@@ -231,7 +527,6 @@ window.JD = window.JD || {};
 			(item.view || "") +
 			'"' +
 			(active ? ' aria-current="page"' : "") +
-			(disabled ? ' aria-disabled="true" title="Available once a repository is enabled"' : "") +
 			'>' +
 			(item.child ? "" : navIcon(navIconFor(item.view))) +
 			'<span class="name">' +
@@ -239,7 +534,6 @@ window.JD = window.JD || {};
 			"</span></button>";
 		var nav = "";
 		NAV_MIDDLE.forEach((item) => {
-			var disabled = item.gated && !gateOpen;
 			if (item.kids) {
 				nav +=
 				'<div class="sb-group-label">' +
@@ -250,11 +544,11 @@ window.JD = window.JD || {};
 				navIcon("chevron", "sb-group-chevron") +
 				"</div>";
 				item.kids.forEach((kid) => {
-					nav += navRow({ ...kid, child: true }, model.view === kid.view, disabled);
+					nav += navRow({ ...kid, child: true }, model.view === kid.view);
 				});
 				return;
 			}
-			nav += navRow(item, model.view === item.view, disabled);
+			nav += navRow(item, model.view === item.view);
 		});
 		document.getElementById("sbNav").innerHTML = nav;
 		/* The bottom slot is pinned to the sidebar's bottom edge, outside the
@@ -265,7 +559,10 @@ window.JD = window.JD || {};
 		   nothing. */
 		var sbBottom = document.getElementById("sbBottom");
 		sbBottom.hidden = !NAV_BOTTOM;
-		sbBottom.innerHTML = NAV_BOTTOM ? navRow(NAV_BOTTOM, model.view === NAV_BOTTOM.view, false) : "";
+		sbBottom.innerHTML = NAV_BOTTOM ? navRow(NAV_BOTTOM, model.view === NAV_BOTTOM.view) : "";
+
+		/* Topbar — repository scope. */
+		renderRepoPicker(model);
 
 		/* Topbar — time range. Standup is always a fixed yesterday/today board, so
 		   the control applies to the ranged views and is hidden on standup. */
@@ -394,17 +691,16 @@ window.JD = window.JD || {};
 
 		/* Navigation. Real links (not client-side swaps) so a view is deep-linkable
 		   and reload-safe; the server renders each page with its data inlined.
-		   A gated row's own 302 is the enforcement — disabling the click here is
-		   just so it does not visibly bounce through a redirect on the way.
 
-		   The repo scope is dropped alongside the range: the sidebar changes
-		   PAGE, and every page's default is all repos. A single-repo scope is
-		   only ever established by an explicit act on one repo — Repositories'
-		   per-row Dashboard button, or a memory deep link — and carrying it
-		   through the sidebar made it permanent, since nothing on the page
-		   offers a way back to all repos. */
+		   The repo scope SURVIVES the click; only the range is dropped. It used
+		   to be dropped too, because a scope could only be set by an explicit act
+		   on one repo (the Repositories page's per-row Dashboard button, or a
+		   memory deep link) and nothing on any page offered a way back to all
+		   repos — so carrying it through the sidebar made it permanent. The topbar
+		   picker is that way back, and with it in place dropping the scope is the
+		   wrong half of the trade: a reader who narrowed to two repos means it for
+		   the page they navigate to as well. */
 		Array.prototype.forEach.call(document.querySelectorAll("#sbNav .sb-item, #sbBottom .sb-item"), (button) => {
-			if (button.getAttribute("aria-disabled") === "true") return;
 			var path = button.getAttribute("data-nav-path");
 			var navView = button.getAttribute("data-nav-view");
 			button.onclick = () => {
@@ -415,7 +711,7 @@ window.JD = window.JD || {};
 					return;
 				}
 				if (navView && navView !== model.view) JD.track("dashboard_view_switched", { view: navView });
-				window.location.href = path + JD.query(model, { range: undefined, repo: undefined });
+				window.location.href = path + JD.query(model, { range: undefined });
 			};
 		});
 		document.getElementById("machinesChip").hidden = model.tier !== "space";
@@ -502,14 +798,16 @@ window.JD = window.JD || {};
 	   and Memories' detail pane both render commit/session/insight rows, and one
 	   kind reading as two different marks depending on the page is the drift
 	   worth preventing. The first three keys have no insight equivalent — they
-	   are standup-only row types. */
+	   are standup-only row types.
+
+	   `blocker`/`question`/`gotcha` used to have entries here, for the standup's
+	   Risks column. They went with it: those three insight kinds are never
+	   produced (see the note at the top of standup.js), so the marks could not be
+	   reached from anywhere. */
 	JD.glyph = {
 		commit: '<span class="glyph commit">◆</span>',
 		session: '<span class="glyph done">✓</span>',
 		workspace: '<span class="glyph next">▸</span>',
-		blocker: '<span class="glyph todo">■</span>',
-		question: '<span class="glyph todo">?</span>',
-		gotcha: '<span class="glyph todo">!</span>',
 		todo: '<span class="glyph todo">□</span>',
 		decision: '<span class="glyph done">★</span>',
 	};
@@ -541,28 +839,11 @@ window.JD = window.JD || {};
 		);
 	};
 
-	/* Short range names for the card-head scope chip — the mockup's `RANGES.short`,
-	   which reads as a phrase ("this month") rather than the card subtitle's
-	   duration ("Last 30 days"). */
-	var RANGE_SHORT = { today: "today", week: "this week", "2w": "2 weeks", month: "this month" };
-
-	/* Card-head scope badge: `<repo or "all repos"> · <range>`.
-	   It names the repo rather than saying "this repo" — under a single-repo scope
-	   the literal restates what the sidebar already shows, while the name plus the
-	   window says which slice of which project the card covers. A custom range has
-	   no short name, so it states its resolved bounds. */
-	JD.scopeChip = (model) => {
-		var ranged = JD.ranged(model);
-		var scoped = model.scope && model.scope.kind === "repo" ? model.scope.repoIdentity : "";
-		/* The model carries identities, not display names — resolve through the
-		   repo list the sidebar renders from, so the chip and the sidebar cannot
-		   disagree. An identity with no matching option (a repo disabled since the
-		   page was rendered) falls back to the identity rather than going blank. */
-		var option = scoped ? model.repos.filter((r) => r.repoIdentity === scoped)[0] : null;
-		var where = scoped ? (option ? option.repoName : scoped) : "all repos";
-		var when = ranged ? RANGE_SHORT[ranged.range] || ranged.rangeFrom + " – " + ranged.rangeTo : "";
-		return '<span class="chip" style="cursor:default">' + JD.esc(when ? where + " · " + when : where) + "</span>";
-	};
+	/* `JD.scopeChip` lived here — a NON-interactive `<repo> · <range>` badge in
+	   the feed card's head, and the only place the page ever stated its own
+	   repository scope. It went with the arrival of the topbar picker: the picker
+	   states the scope where the reader can also change it, and a second copy of
+	   the same fact one card down is a thing to keep in step for no gain. */
 
 	var SOURCE_ORDER = ["claude", "codex", "cursor", "copilot", "gemini", "opencode", "devin", "cline", "antigravity"];
 	JD.sourceIndex = (source) => {

@@ -327,7 +327,7 @@ describe("MemoriesQuery", () => {
 			}
 
 			const scoped = await withDashboardDb(
-				(db) => buildMemoriesList(db, { kind: "repo", repoIdentity: "repo-1" }),
+				(db) => buildMemoriesList(db, { kind: "repo", repoIdentities: ["repo-1"] }),
 				{
 					dbPath,
 				},
@@ -335,6 +335,22 @@ describe("MemoriesQuery", () => {
 			expect(scoped.items).toHaveLength(total);
 			expect(scoped.totalCount).toBe(total);
 			expect(scoped.items.every((i) => i.repoIdentity === "repo-1")).toBe(true);
+		});
+
+		it("scopes to SEVERAL repos, and to no others", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedRepo(dbPath, "repo-2", "acme-web");
+			await seedRepo(dbPath, "repo-3", "acme-docs");
+			await seedMemory(dbPath, "repo-1", "a".repeat(40), "api commit", { commitDateMs: 1 });
+			await seedMemory(dbPath, "repo-2", "b".repeat(40), "web commit", { commitDateMs: 2 });
+			await seedMemory(dbPath, "repo-3", "c".repeat(40), "docs commit", { commitDateMs: 3 });
+
+			const scoped = await withDashboardDb(
+				(db) => buildMemoriesList(db, { kind: "repo", repoIdentities: ["repo-1", "repo-3"] }),
+				{ dbPath },
+			);
+			expect(scoped.items.map((i) => i.repoIdentity).sort()).toEqual(["repo-1", "repo-3"]);
+			expect(scoped.totalCount).toBe(2);
 		});
 
 		it("shows only the root (current generation) of an amended/squashed memory tree", async () => {
@@ -431,6 +447,22 @@ describe("MemoriesQuery", () => {
 			expect(page.cursorMissing).toBe(true);
 			expect(page.items.map((i) => i.commitHash)).toEqual(["b".repeat(40), "a".repeat(40)]);
 			expect(page.totalCount).toBe(2);
+		});
+
+		it("resolves a repo-NAME scope token, so paging a name-scoped page is not empty", async () => {
+			// The `/api/memories` route hands this the raw `?repo=` token, and the
+			// picker's common token is the repo NAME (`JD.repoToken` shortens to it
+			// when unique), not the identity. Without resolving, the name matched no
+			// identity, collapsed to the [-1] sentinel, and answered totalCount 0 +
+			// cursorMissing, which the client renders as a wiped tree.
+			await seedThree(); // repo_identity "repo-1", repo_name "acme-api"
+			const byName: DashboardScope = { kind: "repo", repoIdentities: ["acme-api"] };
+
+			const page = await withDashboardDb((db) => buildMemoriesPage(db, byName, undefined), { dbPath });
+
+			expect(page.totalCount).toBe(3);
+			expect(page.cursorMissing).toBeUndefined();
+			expect(page.items.map((i) => i.commitHash)).toEqual(["c".repeat(40), "b".repeat(40), "a".repeat(40)]);
 		});
 	});
 

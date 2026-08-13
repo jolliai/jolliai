@@ -28,7 +28,7 @@ import { readFile } from "node:fs/promises";
 import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
 import { classifyToolName, ToolUseTally } from "./ToolNameClassify.js";
-import { mergeConsecutiveEntries } from "./TranscriptReader.js";
+import { mergeConsecutiveEntries, throwTranscriptReadError } from "./TranscriptReader.js";
 
 const log = createLogger("CursorCliReader");
 
@@ -124,11 +124,7 @@ export async function readCursorCliTranscript(
 	try {
 		raw = await readFile(transcriptPath, "utf8");
 	} catch (error: unknown) {
-		log.error("Failed to read Cursor CLI transcript %s: %s", transcriptPath, (error as Error).message);
-		const wrapped = new Error(`Cannot read Cursor CLI transcript: ${transcriptPath}`) as NodeJS.ErrnoException;
-		const code = (error as NodeJS.ErrnoException | undefined)?.code;
-		if (code !== undefined) wrapped.code = code;
-		throw wrapped;
+		throwTranscriptReadError(log, `Cannot read Cursor CLI transcript: ${transcriptPath}`, error);
 	}
 
 	// Drop blank lines BEFORE indexing (mirrors TranscriptReader.ts). Append-only

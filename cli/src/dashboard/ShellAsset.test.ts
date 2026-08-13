@@ -1,0 +1,705 @@
+/**
+ * Runtime test for the shell's repository scope: the URL builder and the topbar
+ * picker.
+ *
+ * Same reason as `FeedCardAsset.test.ts`: `assets/js/*.js` is plain JavaScript
+ * served verbatim, so tsc never sees it. Here that matters more than usual —
+ * `shell.js` is the one place the page decides which params survive a click, and
+ * a scope that silently stops riding along is invisible until someone notices
+ * their numbers cover the wrong project.
+ *
+ * The stub DOM has to be a little richer than the other asset tests': the picker
+ * re-reads its own checkboxes through `querySelectorAll`, and its Apply is a
+ * navigation, so `window.location.href` is recorded rather than followed.
+ */
+
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+
+interface JDNamespace {
+	renderShell: (model: unknown) => void;
+	query: (model: unknown, over?: Record<string, unknown>) => string;
+	scopeIdentities: (model: unknown) => string[];
+	repoToken: (model: unknown, identity: string) => string;
+}
+
+interface FakeInput {
+	type: string;
+	checked: boolean;
+	/** DOM PROPERTY, not an attribute — the picker sets it after each render. */
+	indeterminate: boolean;
+	onchange?: () => void;
+	attrs: Record<string, string>;
+	getAttribute: (name: string) => string | null;
+}
+
+interface FakeElement {
+	innerHTML: string;
+	/**
+	 * How many times `innerHTML` has been ASSIGNED. The picker's rows must not be
+	 * rewritten on a toggle or a poll tick — that replaces the checkbox the reader
+	 * is standing on — so the count is the only observable that distinguishes
+	 * "updated the ticks" from "redrew the list".
+	 */
+	htmlWrites: number;
+	textContent: string;
+	hidden: boolean;
+	disabled: boolean;
+	style: Record<string, string>;
+	attrs: Record<string, string>;
+	onclick?: () => void;
+	onsubmit?: (event: { preventDefault: () => void }) => void;
+	setAttribute: (name: string, value: string) => void;
+	getAttribute: (name: string) => string | null;
+	getBoundingClientRect: () => { top: number; bottom: number; left: number; width: number };
+	querySelectorAll: (selector: string) => ReadonlyArray<FakeInput>;
+	querySelector: (selector: string) => FakeElement | null;
+	addEventListener: () => void;
+	focus: () => void;
+}
+
+interface Harness {
+	JD: JDNamespace;
+	element: (id: string) => FakeElement;
+	/** Checkboxes the picker last wrote into `#repoScopeList`, by `data-repo` / `all`. */
+	boxes: () => ReadonlyArray<FakeInput>;
+	href: () => string;
+	/** Every `document`-level keydown listener still bound, so leaks are visible. */
+	keydownCount: () => number;
+	escape: () => void;
+}
+
+/**
+ * Parses the checkbox markup the picker wrote, so a click can be driven through
+ * the same `onchange` the browser would call. Deliberately a regex over the
+ * emitted HTML rather than a DOM: this suite has no DOM, and what it is testing
+ * is precisely the string the renderer produced.
+ *
+ * Both ticks start FALSE, and that is the contract rather than a stub shortcut:
+ * `checked` and `indeterminate` are DOM properties the picker writes after the
+ * markup exists, because a tick in the markup can only be applied by redrawing —
+ * which destroys the focused row. So the markup carries the rows, never the state.
+ */
+function parseBoxes(html: string): FakeInput[] {
+	const out: FakeInput[] = [];
+	for (const match of html.matchAll(/<input type="checkbox" (data-repo-all="1"|data-repo="([^"]*)")>/g)) {
+		const attrs: Record<string, string> = match[1].startsWith("data-repo-all")
+			? { "data-repo-all": "1" }
+			: { "data-repo": match[2] };
+		out.push({
+			type: "checkbox",
+			checked: false,
+			indeterminate: false,
+			attrs,
+			getAttribute: (name) => attrs[name] ?? null,
+		});
+	}
+	return out;
+}
+
+function loadJD(): Harness {
+	const elements = new Map<string, FakeElement>();
+	let listeners: Array<(event: { key: string }) => void> = [];
+	let lastBoxes: FakeInput[] = [];
+	const make = (): FakeElement => {
+		const attrs: Record<string, string> = {};
+		let html = "";
+		// Element IDENTITY, which is the whole point of the rebuild-only-when-changed
+		// rule: re-parsed only when the markup actually changed, so an unchanged list
+		// hands back the same box objects a browser would — the ones still holding
+		// focus — rather than silently fresh ones.
+		let parsed: FakeInput[] = [];
+		let parsedFrom: string | null = null;
+		const self: FakeElement = {
+			get innerHTML() {
+				return html;
+			},
+			set innerHTML(next: string) {
+				html = next;
+				self.htmlWrites++;
+			},
+			htmlWrites: 0,
+			textContent: "",
+			hidden: false,
+			disabled: false,
+			style: {},
+			attrs,
+			setAttribute: (name, value) => {
+				attrs[name] = value;
+			},
+			getAttribute: (name) => attrs[name] ?? null,
+			getBoundingClientRect: () => ({ top: 0, bottom: 40, left: 0, width: 100 }),
+			querySelectorAll: (selector) => {
+				// The picker re-reads the boxes it just wrote; everything else in the
+				// shell (the range segment, the nav) has no rows in this harness.
+				if (selector !== "input[type=checkbox]") return [];
+				if (parsedFrom !== html) {
+					parsed = parseBoxes(html);
+					parsedFrom = html;
+				}
+				lastBoxes = parsed;
+				return parsed;
+			},
+			querySelector: () => make(),
+			addEventListener: () => undefined,
+			focus: () => undefined,
+		};
+		return self;
+	};
+	const doc = {
+		getElementById: (id: string) => {
+			if (!elements.has(id)) elements.set(id, make());
+			return elements.get(id);
+		},
+		querySelectorAll: () => [],
+		addEventListener: (_type: string, fn: (event: { key: string }) => void) => void listeners.push(fn),
+		removeEventListener: (_type: string, fn: (event: { key: string }) => void) => {
+			listeners = listeners.filter((each) => each !== fn);
+		},
+		createElement: make,
+		body: make(),
+	};
+	const location = { href: "" };
+	const win = {
+		JD: {},
+		document: doc,
+		location,
+		innerWidth: 1400,
+		innerHeight: 900,
+		addEventListener: () => undefined,
+		navigator: {},
+	} as Record<string, unknown>;
+	for (const file of ["format.js", "shell.js"]) {
+		const src = readFileSync(new URL(`./assets/js/${file}`, import.meta.url), "utf8");
+		new Function("window", "document", src)(win, doc);
+	}
+	return {
+		JD: win.JD as unknown as JDNamespace,
+		element: (id) => doc.getElementById(id) as FakeElement,
+		boxes: () => lastBoxes,
+		href: () => location.href,
+		keydownCount: () => listeners.length,
+		escape: () => {
+			for (const fn of [...listeners]) fn({ key: "Escape" });
+		},
+	};
+}
+
+const JOLLIAI = "https://github.com/jolliai/jolliai";
+const SITE = "https://github.com/jolliai/site";
+
+function model(over: Record<string, unknown> = {}): unknown {
+	return {
+		schemaVersion: 3,
+		view: "stats",
+		tier: "memory",
+		generatedAtMs: Date.parse("2026-07-30T12:00:00Z"),
+		timeZone: "UTC",
+		scope: { kind: "all" },
+		repos: [
+			{ repoIdentity: JOLLIAI, repoName: "jolliai", worktreeRoot: "/a", sessionsThisWeek: 3 },
+			{ repoIdentity: SITE, repoName: "site", worktreeRoot: "/b", sessionsThisWeek: 1 },
+		],
+		coverage: [],
+		stats: { range: "month", rangeFrom: "2026-07-01", rangeTo: "2026-07-30", seriesDimension: "model" },
+		...over,
+	};
+}
+
+const scoped = (...identities: string[]) => ({ kind: "repo", repoIdentities: identities });
+
+/**
+ * Three repos, for the cases that need a selection which is genuinely PARTIAL.
+ * With the two-repo fixture, ticking the second is "all" — and all-ticked
+ * deliberately collapses to the empty param, so those cases would be asserting
+ * the opposite of what they mean to.
+ */
+const THIRD = "https://github.com/jolliai/docs";
+const threeRepos = (over: Record<string, unknown> = {}): unknown =>
+	model({
+		repos: [
+			{ repoIdentity: JOLLIAI, repoName: "jolliai", worktreeRoot: "/a", sessionsThisWeek: 3 },
+			{ repoIdentity: SITE, repoName: "site", worktreeRoot: "/b", sessionsThisWeek: 1 },
+			{ repoIdentity: THIRD, repoName: "docs", worktreeRoot: "/c", sessionsThisWeek: 0 },
+		],
+		...over,
+	});
+
+describe("JD.scopeIdentities", () => {
+	const { JD } = loadJD();
+
+	it("answers an empty list for the all-repos scope", () => {
+		expect(JD.scopeIdentities(model())).toEqual([]);
+	});
+
+	it("answers the selected identities in order", () => {
+		expect(JD.scopeIdentities(model({ scope: scoped(SITE, JOLLIAI) }))).toEqual([SITE, JOLLIAI]);
+	});
+
+	it("survives a model with no scope at all rather than throwing", () => {
+		// The refresh loop repaints whatever it last held, and a hand-built or
+		// pre-upgrade payload is exactly what reaches here after a schema bump.
+		expect(JD.scopeIdentities({})).toEqual([]);
+	});
+});
+
+describe("JD.query — repo params", () => {
+	const { JD } = loadJD();
+
+	it("emits nothing for the all-repos scope", () => {
+		expect(JD.query(model())).toBe("?range=month&dimension=model");
+	});
+
+	it("emits one repo= for a single selection, as old links carry", () => {
+		expect(JD.query(model({ scope: scoped(JOLLIAI) }))).toContain("repo=jolliai&");
+	});
+
+	it("emits one repo= per identity, never a joined list", () => {
+		const query = JD.query(model({ scope: scoped(JOLLIAI, SITE) }));
+		expect(query).toContain("repo=jolliai");
+		expect(query).toContain("repo=site");
+		// A delimiter would be a character a remote URL may legitimately contain.
+		expect(query).not.toContain(",");
+	});
+
+	it("shortens each identity independently through repoToken", () => {
+		const dupes = model({
+			repos: [
+				{
+					repoIdentity: "https://github.com/one/jolli",
+					repoName: "jolli",
+					worktreeRoot: "/a",
+					sessionsThisWeek: 0,
+				},
+				{
+					repoIdentity: "https://github.com/two/jolli",
+					repoName: "jolli",
+					worktreeRoot: "/b",
+					sessionsThisWeek: 0,
+				},
+				{ repoIdentity: SITE, repoName: "site", worktreeRoot: "/c", sessionsThisWeek: 0 },
+			],
+			scope: scoped("https://github.com/one/jolli", SITE),
+		});
+		// The ambiguous one keeps its identity; the unique one shortens. Both in
+		// the same URL — a per-URL choice would have to pick one rule for both.
+		expect(JD.query(dupes)).toContain("repo=https%3A%2F%2Fgithub.com%2Fone%2Fjolli");
+		expect(JD.query(dupes)).toContain("repo=site");
+	});
+
+	it("clears the scope when overridden with an empty list", () => {
+		expect(JD.query(model({ scope: scoped(JOLLIAI) }), { repo: [] })).not.toContain("repo=");
+	});
+});
+
+describe("the topbar repo picker", () => {
+	it("labels the scope, and opens seeded from it", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ scope: scoped(JOLLIAI) }));
+		expect(h.element("repoScopeLabel").textContent).toBe("jolliai");
+		expect(h.element("repoScope").hidden).toBe(true);
+
+		h.element("repoScopeBtn").onclick?.();
+		expect(h.element("repoScope").hidden).toBe(false);
+		expect(h.element("repoScopeBtn").getAttribute("aria-expanded")).toBe("true");
+		const boxes = h.boxes();
+		expect(boxes.map((b) => [b.getAttribute("data-repo-all") ?? b.getAttribute("data-repo"), b.checked])).toEqual([
+			["1", false],
+			[JOLLIAI, true],
+			[SITE, false],
+		]);
+	});
+
+	it("counts rather than naming past one repo", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ scope: scoped(JOLLIAI, SITE) }));
+		expect(h.element("repoScopeLabel").textContent).toBe("2 repos");
+	});
+
+	it("tells same-named repos apart by their checkout path", () => {
+		// A repo name is a directory basename, so three clones all called `repo`
+		// is ordinary, not a corner — and identical rows are a list you cannot
+		// choose from. Measured on a real machine: 3 of its 6 repos shared a name.
+		const h = loadJD();
+		h.JD.renderShell(
+			model({
+				repos: [
+					{ repoIdentity: "local:a", repoName: "repo", worktreeRoot: "/src/one", sessionsThisWeek: 2 },
+					{ repoIdentity: "local:b", repoName: "repo", worktreeRoot: "/src/two", sessionsThisWeek: 0 },
+					{ repoIdentity: JOLLIAI, repoName: "jolliai", worktreeRoot: "/src/jolliai", sessionsThisWeek: 5 },
+				],
+			}),
+		);
+		h.element("repoScopeBtn").onclick?.();
+		const html = h.element("repoScopeList").innerHTML;
+		expect(html).toContain("/src/one");
+		expect(html).toContain("/src/two");
+		// The unambiguous row keeps the session figure — the path is only worth
+		// the space where it is the thing that differs.
+		expect(html).toContain("5 sessions · 7d");
+		expect(html).not.toContain("/src/jolliai</span>");
+	});
+
+	it("lists a paused repo, marks it, and keeps it selectable", () => {
+		// A paused repo's rows are never deleted and it still counts in the
+		// aggregate numbers, so it belongs in the list — its history is worth
+		// reaching. It draws dimmed with a `paused` meta over its session figure,
+		// and its checkbox works like any other.
+		const h = loadJD();
+		h.JD.renderShell(
+			model({
+				repos: [
+					{ repoIdentity: JOLLIAI, repoName: "jolliai", worktreeRoot: "/a", sessionsThisWeek: 3 },
+					{ repoIdentity: SITE, repoName: "site", worktreeRoot: "/b", sessionsThisWeek: 1 },
+					{ repoIdentity: THIRD, repoName: "docs", worktreeRoot: "/c", sessionsThisWeek: 0, disabled: true },
+				],
+				scope: scoped(JOLLIAI),
+			}),
+		);
+		h.element("repoScopeBtn").onclick?.();
+		const html = h.element("repoScopeList").innerHTML;
+		// Flagged for the stylesheet, and the meta says paused rather than "0 sessions".
+		expect(html).toContain('class="repo-scope-row paused"');
+		expect(html).toContain(">paused</span>");
+		expect(html).not.toContain("0 sessions");
+		// A real checkbox — ticking it and applying scopes the page to it.
+		const docs = h.boxes().find((b) => b.getAttribute("data-repo") === THIRD);
+		expect(docs).toBeDefined();
+		docs?.onchange?.();
+		h.element("repoScope").onsubmit?.({ preventDefault: () => undefined });
+		expect(h.href()).toContain("repo=docs");
+	});
+
+	it("names the exact identities on the button, where the label cannot", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ scope: scoped(JOLLIAI, SITE) }));
+		expect(h.element("repoScopeBtn").getAttribute("title")).toBe(`${JOLLIAI}\n${SITE}`);
+		h.JD.renderShell(model());
+		expect(h.element("repoScopeBtn").getAttribute("title")).toBe("Every registered repository");
+	});
+
+	it("names the identity when the repo has left the list", () => {
+		// Paused since the page was rendered: the identity is still what the
+		// numbers were filtered by, so the label must not go blank.
+		const h = loadJD();
+		h.JD.renderShell(model({ scope: scoped("local:gone") }));
+		expect(h.element("repoScopeLabel").textContent).toBe("local:gone");
+	});
+
+	it("ticking a second repo applies both", () => {
+		const h = loadJD();
+		h.JD.renderShell(threeRepos({ scope: scoped(JOLLIAI) }));
+		h.element("repoScopeBtn").onclick?.();
+		const site = h.boxes().find((b) => b.getAttribute("data-repo") === SITE);
+		site?.onchange?.();
+		h.element("repoScope").onsubmit?.({ preventDefault: () => undefined });
+		expect(h.href()).toContain("repo=jolliai");
+		expect(h.href()).toContain("repo=site");
+	});
+
+	// ── the select-all master row ──────────────────────────────────────────
+	//
+	// Two things have to hold at once, and they pull in opposite directions:
+	// the DRAWN state is the ordinary tri-state select-all every list like this
+	// uses (all ticked / some ticked + indeterminate / none), while the STORED
+	// state for "all" is an EMPTY `?repo=` — an explicit list of every repo goes
+	// stale the moment one is registered, silently excluding it from a scope
+	// that reads as "all". These cases pin both halves and the seam between.
+
+	it("seeds every box ticked on an unscoped page, not none", () => {
+		const h = loadJD();
+		h.JD.renderShell(model());
+		h.element("repoScopeBtn").onclick?.();
+		expect(h.boxes().every((b) => b.checked)).toBe(true);
+		expect(h.element("repoScopeSelection").textContent).toBe("All repositories");
+	});
+
+	it("collapses an all-ticked selection back to the empty param", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ scope: scoped(JOLLIAI) }));
+		h.element("repoScopeBtn").onclick?.();
+		// Tick the one that is missing → every box ticked → "all".
+		h.boxes()
+			.find((b) => b.getAttribute("data-repo") === SITE)
+			?.onchange?.();
+		h.element("repoScope").onsubmit?.({ preventDefault: () => undefined });
+		expect(h.href()).not.toContain("repo=");
+		expect(h.href()).toContain("/dashboard?");
+	});
+
+	it("marks the master row indeterminate for a partial selection", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ scope: scoped(JOLLIAI) }));
+		h.element("repoScopeBtn").onclick?.();
+		const master = () => h.boxes().find((b) => b.getAttribute("data-repo-all"));
+		expect(master()?.indeterminate).toBe(true);
+		expect(master()?.checked).toBe(false);
+		// Tick the rest → checked, not indeterminate.
+		h.boxes()
+			.find((b) => b.getAttribute("data-repo") === SITE)
+			?.onchange?.();
+		expect(master()?.indeterminate).toBe(false);
+		expect(master()?.checked).toBe(true);
+	});
+
+	it("the master row clears when it is already all, and selects all otherwise", () => {
+		const h = loadJD();
+		h.JD.renderShell(model());
+		h.element("repoScopeBtn").onclick?.();
+		// All → none.
+		h.boxes()
+			.find((b) => b.getAttribute("data-repo-all"))
+			?.onchange?.();
+		expect(h.boxes().some((b) => b.checked)).toBe(false);
+		// None → all again.
+		h.boxes()
+			.find((b) => b.getAttribute("data-repo-all"))
+			?.onchange?.();
+		expect(h.boxes().every((b) => b.checked)).toBe(true);
+	});
+
+	it("refuses to apply an empty selection instead of widening it to all", () => {
+		// A scope of zero repositories is not expressible — the server reads an
+		// empty `?repo=` as EVERY repo — so applying nothing would hand back the
+		// widest answer under a control that says none. Say why instead.
+		const h = loadJD();
+		h.JD.renderShell(model());
+		h.element("repoScopeBtn").onclick?.();
+		h.boxes()
+			.find((b) => b.getAttribute("data-repo-all"))
+			?.onchange?.();
+		expect(h.element("repoScopeApply").disabled).toBe(true);
+		expect(h.element("repoScopeSelection").textContent).toBe("Select at least one repository");
+		h.element("repoScope").onsubmit?.({ preventDefault: () => undefined });
+		expect(h.href()).toBe("");
+	});
+
+	it("hides itself with only one repo to pick between", () => {
+		const h = loadJD();
+		const one = [{ repoIdentity: JOLLIAI, repoName: "jolliai", worktreeRoot: "/a", sessionsThisWeek: 1 }];
+		h.JD.renderShell(model({ repos: one }));
+		expect(h.element("repoScopeWrap").hidden).toBe(true);
+	});
+
+	// ── a `?repo=` token naming nothing registered ─────────────────────────
+	//
+	// The server keeps such a token rather than dropping it (`resolveScope` leaves
+	// what it cannot resolve in place, and the query side folds it to a row id that
+	// matches nothing) precisely so the page cannot silently widen to every repo —
+	// which makes showing the way out of it the client's job. Reachable from an
+	// ordinary bookmark: a repo disabled, removed, or re-cloned to a new remote.
+
+	const GHOST = "https://github.com/jolliai/gone";
+
+	it("ticks only the repos a dead token leaves, and drops it on Apply", () => {
+		const h = loadJD();
+		h.JD.renderShell(threeRepos({ scope: scoped(GHOST, JOLLIAI) }));
+		h.element("repoScopeBtn").onclick?.();
+		// The dead token is not a row, so it cannot be drawn — and must not be
+		// counted either. Counting it made two ticks out of three read as "all",
+		// which Apply then stored as the empty param: "just jolliai" silently
+		// widened to every repo.
+		expect(h.boxes().map((b) => b.checked)).toEqual([false, true, false, false]);
+		expect(h.element("repoScopeSelection").textContent).toBe("1 repository selected");
+
+		h.element("repoScope").onsubmit?.({ preventDefault: () => undefined });
+		expect(h.href()).toContain("repo=jolliai");
+		expect(h.href()).not.toContain("gone");
+	});
+
+	it("stays visible with a single repo when the URL carries a dead token", () => {
+		// The one case where "nothing to pick between" is false with one repo: the
+		// page is showing an empty scope nothing on it explains, and every link
+		// rebuilds that token into the next URL — so hiding the control leaves no
+		// way back short of editing the address bar.
+		const h = loadJD();
+		const one = [{ repoIdentity: JOLLIAI, repoName: "jolliai", worktreeRoot: "/a", sessionsThisWeek: 1 }];
+		h.JD.renderShell(model({ repos: one, scope: scoped(GHOST) }));
+		expect(h.element("repoScopeWrap").hidden).toBe(false);
+
+		h.element("repoScopeBtn").onclick?.();
+		// Nothing live in the scope → nothing ticked, and Apply off until the reader
+		// picks. That is the honest drawing of a scope naming no live repo, and
+		// ticking the only repo there is clears the token.
+		expect(h.boxes().some((b) => b.checked)).toBe(false);
+		expect(h.element("repoScopeApply").disabled).toBe(true);
+		expect(h.element("repoScopeSelection").textContent).toBe("Select at least one repository");
+
+		h.boxes()
+			.find((b) => b.getAttribute("data-repo") === JOLLIAI)
+			?.onchange?.();
+		expect(h.element("repoScopeApply").disabled).toBe(false);
+		h.element("repoScope").onsubmit?.({ preventDefault: () => undefined });
+		expect(h.href()).not.toContain("repo=");
+	});
+
+	it("still hides itself when a dead token is the only thing there is", () => {
+		// No repo registered at all: every row would be unpickable, so the control
+		// has nothing to offer and the empty page speaks for itself.
+		const h = loadJD();
+		h.JD.renderShell(model({ repos: [], scope: scoped(GHOST) }));
+		expect(h.element("repoScopeWrap").hidden).toBe(true);
+	});
+
+	// ── the rows are not redrawn for a tick ────────────────────────────────
+	//
+	// `list.innerHTML = …` replaces the very checkbox the reader is standing on, so
+	// with the tick state in the markup every toggle destroyed its own focus and
+	// keyboard multi-select lost its place after each row. The state lives on the
+	// DOM properties instead; these two pin that the markup stops moving.
+
+	it("updates ticks in place instead of rebuilding the rows", () => {
+		const h = loadJD();
+		h.JD.renderShell(threeRepos({ scope: scoped(JOLLIAI) }));
+		h.element("repoScopeBtn").onclick?.();
+		const drawn = h.element("repoScopeList").htmlWrites;
+		const before = h.boxes();
+		const site = before.find((b) => b.getAttribute("data-repo") === SITE);
+
+		site?.onchange?.();
+
+		expect(h.element("repoScopeList").htmlWrites).toBe(drawn);
+		// Same objects, not equal-looking replacements — a rebuilt list would be
+		// new elements, and the focused one would be gone.
+		expect(h.boxes()[0]).toBe(before[0]);
+		expect(site?.checked).toBe(true);
+	});
+
+	it("leaves the open list alone across a refresh tick that changed nothing", () => {
+		const h = loadJD();
+		const m = threeRepos({ scope: scoped(JOLLIAI) });
+		h.JD.renderShell(m);
+		h.element("repoScopeBtn").onclick?.();
+		const drawn = h.element("repoScopeList").htmlWrites;
+		const before = h.boxes();
+
+		h.JD.renderShell(m);
+
+		expect(h.element("repoScopeList").htmlWrites).toBe(drawn);
+		expect(h.boxes()[0]).toBe(before[0]);
+	});
+
+	it("redraws when a repo appears while the list is open", () => {
+		// The other half of the same rule: rows that genuinely changed have to be
+		// rebuilt, or a newly registered repo is unreachable until the popover is
+		// closed and re-opened.
+		const h = loadJD();
+		h.JD.renderShell(model({ scope: scoped(JOLLIAI) }));
+		h.element("repoScopeBtn").onclick?.();
+		const drawn = h.element("repoScopeList").htmlWrites;
+
+		h.JD.renderShell(threeRepos({ scope: scoped(JOLLIAI) }));
+
+		expect(h.element("repoScopeList").htmlWrites).toBe(drawn + 1);
+		expect(h.boxes()).toHaveLength(4);
+		// The in-progress selection survives the redraw.
+		expect(
+			h
+				.boxes()
+				.filter((b) => b.checked)
+				.map((b) => b.getAttribute("data-repo")),
+		).toEqual([JOLLIAI]);
+	});
+
+	it("hides itself on a view the scope does not narrow", () => {
+		// Every view HEAD ships is scoped, so this is reached only by a future
+		// one. `SCOPED_VIEWS` is an allowlist for that reason: an unrecognised
+		// view hides the control rather than offering a switch that does nothing.
+		const h = loadJD();
+		h.JD.renderShell(model({ view: "knowledge" }));
+		expect(h.element("repoScopeWrap").hidden).toBe(true);
+	});
+
+	it("closes an open popover when a re-render hides the control", () => {
+		// Otherwise the list survives its own control disappearing — a floating
+		// panel anchored to nothing.
+		const h = loadJD();
+		h.JD.renderShell(model({ scope: scoped(JOLLIAI) }));
+		h.element("repoScopeBtn").onclick?.();
+		h.JD.renderShell(model({ view: "knowledge" }));
+		expect(h.element("repoScope").hidden).toBe(true);
+	});
+
+	it("keeps an open popover and its ticks across a refresh tick", () => {
+		// renderShell runs on the 30 s poll. Closing the popover there would yank
+		// it shut mid-selection; leaving it alone would strand its checkboxes on
+		// the previous closure while Apply read the new one.
+		const h = loadJD();
+		const m = threeRepos({ scope: scoped(JOLLIAI) });
+		h.JD.renderShell(m);
+		h.element("repoScopeBtn").onclick?.();
+		h.boxes()
+			.find((b) => b.getAttribute("data-repo") === SITE)
+			?.onchange?.();
+
+		h.JD.renderShell(m);
+		expect(h.element("repoScope").hidden).toBe(false);
+		expect(
+			h
+				.boxes()
+				.filter((b) => b.checked)
+				.map((b) => b.getAttribute("data-repo")),
+		).toEqual([JOLLIAI, SITE]);
+
+		// Apply reads THIS render's selection, not the one frozen at open time.
+		h.element("repoScope").onsubmit?.({ preventDefault: () => undefined });
+		expect(h.href()).toContain("repo=jolliai");
+		expect(h.href()).toContain("repo=site");
+	});
+
+	it("binds exactly one Escape handler however many times it re-renders", () => {
+		const h = loadJD();
+		const m = model({ scope: scoped(JOLLIAI) });
+		for (let tick = 0; tick < 5; tick++) h.JD.renderShell(m);
+		// One for the picker, one for the range calendar — never five of each.
+		expect(h.keydownCount()).toBe(2);
+
+		h.element("repoScopeBtn").onclick?.();
+		h.escape();
+		expect(h.element("repoScope").hidden).toBe(true);
+	});
+
+	it("Cancel discards the pending ticks", () => {
+		const h = loadJD();
+		const m = model({ scope: scoped(JOLLIAI) });
+		h.JD.renderShell(m);
+		h.element("repoScopeBtn").onclick?.();
+		h.boxes()
+			.find((b) => b.getAttribute("data-repo") === SITE)
+			?.onchange?.();
+		h.element("repoScopeCancel").onclick?.();
+		expect(h.element("repoScope").hidden).toBe(true);
+
+		h.JD.renderShell(m);
+		expect(h.element("repoScope").hidden).toBe(true);
+		expect(h.element("repoScopeLabel").textContent).toBe("jolliai");
+	});
+
+	// The case above re-renders between Cancel and the assertion, which is what
+	// hid this: `close()` clears `repoPending` but not the closure's own `picked`,
+	// and re-opening reads `picked`. A render in between recomputes it from the
+	// server's scope — so the discard only actually happened on the poll tick, up
+	// to PAGE_REFRESH_MS later. Re-opening before that tick brought the cancelled
+	// ticks back.
+	it("Cancel discards the pending ticks even when re-opened before the next render", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ scope: scoped(JOLLIAI) }));
+		h.element("repoScopeBtn").onclick?.();
+		h.boxes()
+			.find((b) => b.getAttribute("data-repo") === SITE)
+			?.onchange?.();
+		expect(h.boxes().find((b) => b.getAttribute("data-repo") === SITE)?.checked).toBe(true);
+
+		h.element("repoScopeCancel").onclick?.();
+		h.element("repoScopeBtn").onclick?.();
+
+		expect(h.element("repoScope").hidden).toBe(false);
+		expect(
+			h.boxes().map((b) => [b.getAttribute("data-repo-all") ?? b.getAttribute("data-repo"), b.checked]),
+		).toEqual([
+			["1", false],
+			[JOLLIAI, true],
+			[SITE, false],
+		]);
+	});
+});

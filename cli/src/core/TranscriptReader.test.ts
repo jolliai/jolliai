@@ -8,23 +8,30 @@ vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
-// Capture the module logger so the transcript-budget diagnostic can be asserted.
-const { mockLogInfo } = vi.hoisted(() => ({ mockLogInfo: vi.fn() }));
+// Capture the module logger so the transcript-budget diagnostic and the
+// missing-vs-broken read distinction can be asserted.
+const { mockLogInfo, mockLogDebug, mockLogError } = vi.hoisted(() => ({
+	mockLogInfo: vi.fn(),
+	mockLogDebug: vi.fn(),
+	mockLogError: vi.fn(),
+}));
 vi.mock("../Logger.js", () => ({
 	createLogger: () => ({
 		info: mockLogInfo,
 		warn: vi.fn(),
-		debug: vi.fn(),
-		error: vi.fn(),
+		debug: mockLogDebug,
+		error: mockLogError,
 	}),
 }));
 
+import { createLogger } from "../Logger.js";
 import type { TranscriptEntry } from "../Types.js";
 import type { SessionTranscript } from "./TranscriptReader.js";
 import {
 	buildConversationContext,
 	buildMultiSessionContext,
 	DEFAULT_MAX_CHARS,
+	isMissingTranscriptError,
 	parseTranscriptLine,
 	readTranscript,
 } from "./TranscriptReader.js";
@@ -343,6 +350,71 @@ describe("TranscriptReader", () => {
 
 		it("should throw for missing files", async () => {
 			await expect(readTranscript("/nonexistent/path.jsonl")).rejects.toThrow("Cannot read transcript");
+		});
+
+		it("logs a vanished transcript at debug and marks it missing", async () => {
+			mockLogDebug.mockClear();
+			mockLogError.mockClear();
+			const err = await readTranscript(join(tempDir, "gone.jsonl")).catch((e: unknown) => e);
+			// Callers already degrade gracefully on a rotated JSONL, so it must not
+			// reach the terminal — warn/error do, debug does not.
+			expect(mockLogError).not.toHaveBeenCalled();
+			expect(mockLogDebug).toHaveBeenCalled();
+			expect(isMissingTranscriptError(err)).toBe(true);
+		});
+
+		it("logs a genuine read failure at error and does not mark it missing", async () => {
+			mockLogDebug.mockClear();
+			mockLogError.mockClear();
+			// A directory is readable-but-not-a-file: the read fails for a reason
+			// that is not "the file is gone".
+			const err = await readTranscript(tempDir).catch((e: unknown) => e);
+			expect(mockLogError).toHaveBeenCalled();
+			expect(isMissingTranscriptError(err)).toBe(false);
+		});
+
+		it("does not mistake an unrelated rejection for a missing transcript", () => {
+			expect(isMissingTranscriptError(new Error("boom"))).toBe(false);
+			expect(isMissingTranscriptError(undefined)).toBe(false);
+		});
+
+		it("recognizes ENOENT carried directly on the error, not only via cause", () => {
+			// The SQLite-backed readers copy the original `.code` straight onto their
+			// wrapper rather than nesting it under `cause` (their callers branch on
+			// `.code`). Inspecting only `.cause` is what left those sources logging a
+			// rotated transcript as a fault every poll.
+			const direct = Object.assign(new Error("Cannot read Devin session: x"), { code: "ENOENT" });
+			expect(isMissingTranscriptError(direct)).toBe(true);
+			const otherCode = Object.assign(new Error("locked"), { code: "SQLITE_BUSY" });
+			expect(isMissingTranscriptError(otherCode)).toBe(false);
+		});
+
+		it("throwTranscriptReadError preserves the code and cause, and never invents a code", async () => {
+			const { throwTranscriptReadError } = await import("./TranscriptReader.js");
+			const log = createLogger("t");
+			const enoent = Object.assign(new Error("gone"), { code: "ENOENT" });
+			let thrownMissing: unknown;
+			try {
+				throwTranscriptReadError(log, "Cannot read X: p", enoent);
+			} catch (e) {
+				thrownMissing = e;
+			}
+			expect((thrownMissing as Error).message).toBe("Cannot read X: p");
+			expect((thrownMissing as NodeJS.ErrnoException).code).toBe("ENOENT");
+			expect((thrownMissing as { cause?: unknown }).cause).toBe(enoent);
+			expect(isMissingTranscriptError(thrownMissing)).toBe(true);
+
+			// An underlying error with no code must NOT gain one — callers treat an
+			// absent code as "not the routine missing-file case".
+			const codeless = new Error("something else");
+			let thrownOther: unknown;
+			try {
+				throwTranscriptReadError(log, "Cannot read X: p", codeless);
+			} catch (e) {
+				thrownOther = e;
+			}
+			expect(thrownOther).not.toHaveProperty("code");
+			expect(isMissingTranscriptError(thrownOther)).toBe(false);
 		});
 
 		it("should merge consecutive assistant entries into one", async () => {

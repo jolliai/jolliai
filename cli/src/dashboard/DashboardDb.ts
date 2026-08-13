@@ -60,8 +60,12 @@ const log = createLogger("DashboardDb");
  * Bumping it is NOT a cross-surface event any more, and that is the one thing
  * worth knowing about it: nothing refuses a database over this number (see the
  * compatibility note below), so an appended entry costs an upgrade to nobody. It
- * is derived from the list rather than hand-written, so two branches that each
- * append one cannot collide on it.
+ * is a hand-maintained literal that MUST equal `MIGRATIONS.length` — appending a
+ * migration means bumping this by one, and `DashboardDb.test.ts` pins the two
+ * together so two branches that each append one collide loudly in CI rather than
+ * silently on disk. (It cannot be written as `= MIGRATIONS.length` in place: that
+ * array is declared further down this file, so the reference would hit the
+ * temporal dead zone at module load.)
  *
  * Nothing has shipped yet, so entry 0 could in principle
  * have absorbed the new table — it deliberately does not, because dev
@@ -702,6 +706,27 @@ export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions =
 	/** Rows for entries applied before the log table existed. See the loop. */
 	const deferredRows: LogRowInput[] = [];
 
+	/**
+	 * Write the rows this pass has been holding because the entries they record ran
+	 * before the log table existed — version-stamp baselines first (inference), then
+	 * this pass's own `applied` rows (observation) — and clear both. Must run the
+	 * instant the log becomes writable, whether THIS pass created the table (the
+	 * applied branch) or a racing writer did and this pass is now skipping over its
+	 * entries. The skip that returned without flushing was the bug: a racer can apply
+	 * and record EVERY remaining entry, so a skip may be the last time this pass ever
+	 * holds a writable log — and the dropped `applied` rows then left those slots
+	 * absent from the log, so the next open re-ran their DDL and died on a duplicate
+	 * object, permanently. Idempotent when nothing is held.
+	 */
+	const flushHeldRows = (): void => {
+		for (const seed of pendingBaseline) {
+			insertLogRow(db, { ...seed, outcome: "baseline", appliedBy, atMs: now(), durationMs: 0 });
+		}
+		pendingBaseline = [];
+		for (const held of deferredRows) insertLogRow(db, held);
+		deferredRows.length = 0;
+	};
+
 	db.exec("PRAGMA foreign_keys = OFF");
 	try {
 		for (const { m, slot } of todo) {
@@ -717,6 +742,13 @@ export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions =
 				// IMMEDIATE is the fence that makes this read authoritative.
 				const locked = readMigrationLog(db);
 				if (locked?.some((r) => r.name === m.name && (r.outcome === "applied" || r.outcome === "baseline"))) {
+					// The log table is readable here (`locked` is non-null), so any rows this
+					// pass is still holding — entries it applied before the table existed — MUST
+					// be flushed now, ahead of the skip row. A racing writer can apply and
+					// record every REMAINING entry, making this the last skip this pass reaches;
+					// returning without flushing dropped those `applied` rows for good, and their
+					// slots then re-ran on the next open and died on a duplicate object forever.
+					flushHeldRows();
 					// The row that used to be a bare `continue`. It is the single most
 					// diagnostic line in the table: a skip is what the position-keyed
 					// loop did to an entry it then never came back to.
@@ -761,12 +793,7 @@ export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions =
 				// from the stamp. The only cost is that those rows come back as
 				// inference, which is the honest description of what is then known.
 				if (readMigrationLog(db)) {
-					for (const seed of pendingBaseline) {
-						insertLogRow(db, { ...seed, outcome: "baseline", appliedBy, atMs: now(), durationMs: 0 });
-					}
-					pendingBaseline = [];
-					for (const held of deferredRows) insertLogRow(db, held);
-					deferredRows.length = 0;
+					flushHeldRows();
 					insertLogRow(db, row);
 				} else {
 					deferredRows.push(row);
@@ -785,6 +812,14 @@ export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions =
 					// error is the one worth surfacing.
 				}
 				try {
+					// Keep only the MOST RECENT failed attempt per name. A persistently broken
+					// database is re-opened on every git-hook commit, and an append-per-open
+					// grew the log without bound — each `failed` row stores the entry's full
+					// DDL verbatim (~35 KB), and `verifyMigrationLog` / `migrateDashboardDb`
+					// re-read the whole table on every open. A failed row is diagnostic, not
+					// evidence a later pass reads (drift keys off `applied` rows), so the newest
+					// attempt is all that is useful; the delete bounds the table to one such row.
+					db.prepare("DELETE FROM schema_migrations WHERE name = ? AND outcome = 'failed'").run(m.name);
 					insertLogRow(db, {
 						slot,
 						name: m.name,
@@ -828,10 +863,11 @@ function writeSchemaMeta(db: DashboardDbHandle, key: string, value: string): voi
  *
  * An append rather than an UPDATE, because the log is the evidence: the row that
  * disagreed stays visible, and the newest APPLIED row is what the check reads
- * (see {@link latestAppliedByName} for why the qualifier matters). Without
- * this there is no way out of a false positive except deleting the database, and
- * what that costs is why the wording in `SurfaceStaleness` exists. Flyway's
- * `repair` and Liquibase's `clearCheckSums` are the same escape hatch.
+ * (see {@link latestAppliedByName} for why the qualifier matters). Without this
+ * the only way out of a false positive would be deleting the database, and what
+ * that costs — other processes may hold the file open, and the memory half is the
+ * only copy there is — is why this escape hatch exists at all. Flyway's `repair`
+ * and Liquibase's `clearCheckSums` are the same escape hatch.
  *
  * Returns false for a name this build does not carry — there is no DDL to accept.
  */
@@ -1048,8 +1084,35 @@ export async function withRepairDashboardDb<T>(
 }
 
 /**
+ * True when this build has nothing left to migrate on `db` — the predicate a
+ * READ-ONLY caller uses to decide it may skip a writable (migrating) open.
+ *
+ * Under the name key the version stamp alone is NOT that predicate: an entry can be
+ * missing by NAME while the stamp is already at or past this build's version — a
+ * migration that landed on another branch under a number this build also reached by
+ * a different route. `found >= DASHBOARD_SCHEMA_VERSION` therefore answers "is the
+ * stamp current", which is no longer the same question as "is everything applied".
+ * So when the log is READABLE, ask the log: every migration name must carry an
+ * `applied`/`baseline` row. Only when the log predates this feature (`none`) or
+ * cannot be read does the version stamp stand in — no name-keyed merge could have
+ * happened before the log existed, and an unreadable log is not a question a
+ * read-only caller can answer, so it defers to the writable open, which then
+ * migrates from the stamp (a no-op when the stamp is current) and surfaces any real
+ * fault itself.
+ */
+export function isSchemaCurrent(db: DashboardDbHandle): boolean {
+	const state = readMigrationLogState(db);
+	if (state.kind === "rows") {
+		const done = new Set<string>();
+		for (const row of state.rows) if (row.outcome === "applied" || row.outcome === "baseline") done.add(row.name);
+		return MIGRATIONS.every((m) => done.has(m.name));
+	}
+	return readSchemaVersion(db) >= DASHBOARD_SCHEMA_VERSION;
+}
+
+/**
  * Creates the database file — and brings an EXISTING one's schema up to date —
- * then closes. Cheap on the common path: one read-only version read.
+ * then closes. Cheap on the common path: one read-only log/version read.
  *
  * Exists because "no writer has run yet" is a REACHABLE first-run state, not a
  * theoretical one: a `jolli dashboard` in a directory with nothing registered
@@ -1065,23 +1128,29 @@ export async function withRepairDashboardDb<T>(
  * first query for a table this build expects fails outright. Existence is the
  * wrong question — "is it current?" is the question.
  *
- * A schema NEWER than this build is left strictly alone: it has no downgrade, and
- * `openDb` refuses it with a message that names the version, which is the honest
- * answer for a surface that is simply behind.
+ * A schema NEWER than this build needs no writable open either: `isSchemaCurrent`
+ * finds every name this build carries already applied and short-circuits. Nothing
+ * refuses a newer file — `withDashboardDb` only WARNS once (see the compatibility
+ * note on `DASHBOARD_SCHEMA_VERSION`); the old version-reject behaviour is gone.
+ *
+ * The short-circuit is `isSchemaCurrent`, NOT `found >= DASHBOARD_SCHEMA_VERSION`:
+ * under the name key a file can sit at the current stamp with a named migration
+ * still missing, and gating on the stamp would skip the one writable open that
+ * would apply it — reopening the read-only 500 this function exists to prevent.
  */
 export async function ensureDashboardDbExists(opts: OpenDashboardDbOptions = {}): Promise<void> {
 	const dbPath = opts.dbPath ?? getDashboardDbPath();
 	if (existsSync(dbPath)) {
-		let found: number;
+		let current: boolean;
 		try {
-			found = await withReadonlyDashboardDb(readSchemaVersion, opts);
+			current = await withReadonlyDashboardDb(isSchemaCurrent, opts);
 		} catch {
 			// Unreadable for any other reason (corrupt, permission, sidecars-only) —
 			// not something a migration can fix, and not this function's job to
 			// report. The caller's own open surfaces it with a real message.
 			return;
 		}
-		if (found >= DASHBOARD_SCHEMA_VERSION) return;
+		if (current) return;
 	}
 	await withDashboardDb(() => undefined, opts);
 }

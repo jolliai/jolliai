@@ -164,13 +164,28 @@ export interface WorktreeStatusEvent {
 	readonly observedAtMs: number;
 }
 
-/** Insight kinds mined from a commit's memory (the standup board's buckets). */
+/**
+ * Insight kinds mined from a commit's memory (the standup board's buckets).
+ *
+ * Only `decision` and `todo` are PRODUCIBLE: `TOPIC_INSIGHTS_CTE` in
+ * `DashboardQuery.ts` derives insights from each memory topic's own
+ * `decisions`/`todo` text and emits those two literals, so nothing can carry the
+ * other three. They stay in the union because they are what a summarizer taught
+ * to record risks would emit, and because `StandupAsset.test.ts` builds them to
+ * assert the UI renders nothing for them — the standup board's Risks column was
+ * removed for exactly this reason. Anything reading a `blocker`/`question`/
+ * `gotcha` off a live model is reading a value the pipeline cannot produce yet.
+ */
 export type CommitInsightKind = "decision" | "blocker" | "question" | "todo" | "gotcha";
 
 export interface CommitInsightItem {
 	readonly kind: CommitInsightKind;
 	readonly text: string;
-	/** Who a question is addressed to (G-8) — absent for self-directed items. */
+	/**
+	 * Who a question is addressed to (G-8) — absent for self-directed items, and
+	 * absent in practice for every row: the CTE selects `NULL AS addressed_to`,
+	 * so no live model has ever carried this.
+	 */
 	readonly addressedTo?: string;
 }
 
@@ -328,38 +343,14 @@ export type AdoptionTier = "installed" | "memory" | "space";
  * one page, one URL. `decisions` is retired entirely — its content folded
  * into Memories' per-topic Decisions callout — and `/decisions` now 302s to
  * `/memories`, so this union no longer carries that token.
+ *
+ * `repositories` is retired too, and unlike `decisions` it 404s rather than
+ * redirecting: it had no content to fold anywhere. Its list is now the topbar
+ * repository picker, and its Pause / Resume actions were removed outright
+ * (`jolli disable` still pauses a repository — the dashboard just no longer
+ * offers a control for it).
  */
-export type DashboardView = "stats" | "standup" | "repositories" | "memories" | "knowledge" | "graph" | "settings";
-
-/**
- * The Repositories page payload — also first-run setup once it grows a write
- * surface. Minimal today: which repos are enabled. `RepositoriesQuery` (a
- * later phase) adds bootstrap state, memory/session counts and the enable
- * flow; this shape is deliberately small so it cannot drift ahead of what is
- * actually queried.
- */
-export interface RepositoryRow {
-	readonly repoIdentity: string;
-	readonly repoName: string;
-	readonly worktreeRoot: string;
-	/** Canonical remote URL. Absent for local-only repos (their identity is a path hash, not a URL). */
-	readonly remoteUrl?: string;
-	/** `false` means disabled/paused — the row is kept (RepoRegistry never deletes), not dropped. */
-	readonly enabled: boolean;
-	readonly memories: number;
-	readonly sessions: number;
-}
-
-/**
- * The Repositories page carries no job/progress shape: backfill has no entry
- * point in this server (see `DashboardServer.ts`'s header), so there is no
- * long-running work for a page to rejoin. Generation progress belongs to the
- * CLI that started it.
- */
-export interface RepositoriesModel {
-	readonly repos: ReadonlyArray<RepositoryRow>;
-	readonly hooksManifest: ReadonlyArray<{ readonly title: string; readonly detail: string }>;
-}
+export type DashboardView = "stats" | "standup" | "memories" | "knowledge" | "graph" | "settings";
 
 /** One browsable `_wiki` markdown file (a topic page or the `_index.md`). */
 export interface KnowledgeFile {
@@ -426,7 +417,7 @@ export interface GraphModel {
 // ── Settings page ───────────────────────────────────────────────────────────
 
 /**
- * The Settings/Repositories provider choice, reshaped from `aiProvider` by
+ * The Settings provider choice, reshaped from `aiProvider` by
  * `EnvFacts.ts`'s `readEnvironmentFacts`. `"none"` covers both an unset
  * config and a value this reader does not recognise — both mean "nothing
  * chosen yet" to the page.
@@ -815,18 +806,35 @@ export interface MemoriesModel {
 	readonly selected?: MemoryDetail;
 }
 
-/** Repo scope of a model: one repo or every enabled repo. */
-export interface DashboardScope {
-	readonly kind: "all" | "repo";
-	readonly repoIdentity?: string;
-}
+/**
+ * Repo scope of a model: a named set of repos, or every enabled one.
+ *
+ * ONE field carries the selection, even though the set is usually a single repo.
+ * A `repoIdentity` alongside a `repoIdentities` would be two spellings of one
+ * fact, and the reader of a scope has no way to know which one a given producer
+ * filled in — the sort of drift a `?repo=` link would carry silently.
+ *
+ * A `repo` kind with an EMPTY list reads as every repo, matching a `?repo=` the
+ * browser omitted entirely; it is not a way to select nothing.
+ */
+export type DashboardScope =
+	| { readonly kind: "all"; readonly repoIdentities?: undefined }
+	| { readonly kind: "repo"; readonly repoIdentities: readonly string[] };
 
 export interface RepoOption {
 	readonly repoIdentity: string;
 	readonly repoName: string;
 	readonly worktreeRoot: string;
-	/** Sessions in the last 7 local days — the sidebar's per-repo meta figure. */
+	/** Sessions in the last 7 local days — the repo picker's per-repo meta figure. */
 	readonly sessionsThisWeek: number;
+	/**
+	 * Present and `true` only for a PAUSED repo (`repos.disabled_at` set). The list
+	 * carries paused repos rather than dropping them: their rows are never deleted
+	 * and they keep counting in the aggregate KPIs, so hiding them made an
+	 * all-paused dashboard read as "No repositories yet". Absent on an active repo,
+	 * so an active row's shape is unchanged.
+	 */
+	readonly disabled?: boolean;
 }
 
 /**
@@ -962,7 +970,7 @@ export const MEMORY_CARDS_LIMIT = 20;
 export type SeriesDimension = "model" | "agent" | "project" | "branch" | "ticket" | "category";
 
 /**
- * Token volume by type, over the range — the "Where your tokens went" card.
+ * Token volume by type, over the range — the "Tokens" card.
  *
  * `cached` is one combined figure, not split into cache-write/cache-read: the
  * database only ever stores one `cached_tokens` column per session, so a
@@ -1697,8 +1705,6 @@ export interface DashboardModel {
 	readonly coverage: ReadonlyArray<CoverageNote>;
 	readonly stats?: StatsModel;
 	readonly standup?: StandupModel;
-	/** Present on the repositories view only. */
-	readonly repositories?: RepositoriesModel;
 	/** Present on the memories view only. */
 	readonly memories?: MemoriesModel;
 	/** Present on the knowledge view only. */

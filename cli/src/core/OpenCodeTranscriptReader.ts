@@ -20,7 +20,7 @@ import { createLogger } from "../Logger.js";
 import type { ToolCallCount, TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
 import { withSqliteDb } from "./SqliteHelpers.js";
 import { builtinTool, skillTool, ToolUseTally } from "./ToolNameClassify.js";
-import { mergeConsecutiveEntries } from "./TranscriptReader.js";
+import { mergeConsecutiveEntries, throwTranscriptReadError } from "./TranscriptReader.js";
 
 const log = createLogger("OpenCodeTranscriptReader");
 
@@ -143,8 +143,7 @@ export async function readOpenCodeTranscript(
 		// empty array and an absent field mean opposite things.
 		return { entries, newCursor, totalLinesRead, toolUse: tally.values() };
 	} catch (error: unknown) {
-		log.error("Failed to read OpenCode session %s: %s", sessionId.substring(0, 8), (error as Error).message);
-		throw new Error(`Cannot read OpenCode session: ${sessionId}`);
+		throwTranscriptReadError(log, `Cannot read OpenCode session: ${sessionId}`, error);
 	}
 }
 

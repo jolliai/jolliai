@@ -8,6 +8,7 @@ import {
 	type NormalizedMessage,
 } from "./ClineTranscriptShared.js";
 import { classifyToolName, ToolUseTally } from "./ToolNameClassify.js";
+import { logTranscriptReadFailure } from "./TranscriptReader.js";
 
 const log = createLogger("ClineCliReader");
 
@@ -69,7 +70,7 @@ export async function readClineCliTranscript(
 	try {
 		parsed = JSON.parse(await readFile(transcriptPath, "utf8")) as ClineCliFile;
 	} catch (error: unknown) {
-		log.error("Failed to read Cline CLI transcript %s: %s", transcriptPath, (error as Error).message);
+		logTranscriptReadFailure(log, `Cannot read Cline CLI transcript: ${transcriptPath}`, error);
 		return emptyClineReadResult(transcriptPath, cursor);
 	}
 	const messages: NormalizedMessage[] = (Array.isArray(parsed.messages) ? parsed.messages : []).map((msg) => {

@@ -140,3 +140,80 @@ describe("standup author disclosure", () => {
 		expect(element("sheetSub").textContent).toContain("From your commit memories");
 	});
 });
+
+/**
+ * The board is two columns, and the third can never come back by accident.
+ *
+ * `blocker` / `question` / `gotcha` are not producible — `TOPIC_INSIGHTS_CTE`
+ * derives insights from each topic's own `decisions`/`todo` text and nothing
+ * writes the other three — so the Risks column always said "Nothing flagged".
+ * These cases feed the renderer insights of every kind anyway, including the
+ * three it can never really receive: if a filter for them is ever re-added, the
+ * column reappears here rather than in a user's browser.
+ */
+describe("standup columns", () => {
+	const everyKind = [
+		{
+			kind: "decision",
+			text: "chose the lock",
+			commitHash: "abc1234def",
+			repoName: "jolliai",
+			committedAtMs: nowMs,
+		},
+		{ kind: "todo", text: "drop the shim", commitHash: "abc1234def", repoName: "jolliai", committedAtMs: nowMs },
+		{
+			kind: "blocker",
+			text: "waiting on infra",
+			commitHash: "abc1234def",
+			repoName: "jolliai",
+			committedAtMs: nowMs,
+		},
+		{ kind: "question", text: "which zone?", commitHash: "abc1234def", repoName: "jolliai", committedAtMs: nowMs },
+		{
+			kind: "gotcha",
+			text: "status is lossy",
+			commitHash: "abc1234def",
+			repoName: "jolliai",
+			committedAtMs: nowMs,
+		},
+	];
+
+	it("renders exactly Yesterday and Today", () => {
+		const { JD, element } = loadJD();
+		JD.renderStandup(model({ insights: everyKind }));
+		const html = element("app").innerHTML;
+		expect(html).toContain('aria-label="Yesterday"');
+		expect(html).toContain('aria-label="Today"');
+		expect(html).not.toContain("Risks");
+		expect(html).not.toContain("Blockers");
+	});
+
+	it("renders no risk rows even when the payload carries those kinds", () => {
+		const { JD, element } = loadJD();
+		JD.renderStandup(model({ insights: everyKind }));
+		const html = element("app").innerHTML;
+		expect(html).not.toContain("waiting on infra");
+		expect(html).not.toContain("which zone?");
+		expect(html).not.toContain("status is lossy");
+		expect(html).not.toContain("kind-blocker");
+		expect(html).not.toContain("tag age");
+		// TODOs stay — they are Today's work, not a risk.
+		expect(html).toContain("TODO: drop the shim");
+	});
+
+	it("shows the locked upsell for neither column below the memory tier", () => {
+		const { JD, element } = loadJD();
+		JD.renderStandup(model({ insights: undefined }));
+		expect(element("app").innerHTML).not.toContain("locked-panel");
+	});
+
+	it("drafts no risks section in the copied markdown", () => {
+		const { JD } = loadJD();
+		const md = JD.standupMarkdown(model({ insights: everyKind }));
+		expect(md).toContain("**Yesterday**");
+		expect(md).toContain("**Today**");
+		expect(md).toContain("- TODO: drop the shim");
+		expect(md).not.toContain("Risks");
+		expect(md).not.toContain("waiting on infra");
+	});
+});

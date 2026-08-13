@@ -15,43 +15,83 @@ import type { DashboardScope } from "./DashboardModel.js";
 
 const log = createLogger("DashboardScope");
 
-/** WHERE fragment + params for the repo scope. */
+/**
+ * WHERE fragment + params for the repo scope.
+ *
+ * `= ?` for one repo, `IN (…)` for several, nothing at all for every repo. The
+ * single-id spelling is not just cosmetic: it is what the query planner reads as
+ * an equality lookup on the indexed column, and one repo is the common case.
+ */
 export function scopeFilter(scope: ResolvedScope, column = "repo_id"): { sql: string; params: unknown[] } {
-	if (scope.repoId != null) return { sql: ` AND ${column} = ?`, params: [scope.repoId] };
-	return { sql: "", params: [] };
+	const ids = scope.repoIds;
+	if (ids == null) return { sql: "", params: [] };
+	if (ids.length === 1) return { sql: ` AND ${column} = ?`, params: [ids[0]] };
+	return { sql: ` AND ${column} IN (${placeholders(ids.length)})`, params: [...ids] };
 }
 
 /**
  * `?, ?, …` for an `IN (…)` list of `n` bound values.
  *
  * Exists so a fixed name list stays a BOUND parameter list instead of being
- * interpolated into the SQL — the values here are build-time constants, but a
+ * interpolated into the SQL — some callers pass build-time constants, but a
  * helper that inlines them is one refactor away from inlining a user string.
+ * The repo-scope list below is exactly that user string.
  */
 export function placeholders(n: number): string {
 	return new Array(n).fill("?").join(", ");
 }
 
 /**
- * A scope with its repo identity already resolved to a surrogate key.
+ * A scope with its repo identities already resolved to surrogate keys.
  *
  * Resolved once per query function rather than inside scopeFilter, because a
  * single page builds a dozen filters and they would otherwise repeat the same
- * lookup. A scope naming a repo the database has never seen resolves to `null`,
+ * lookup. `null` is every repo — no WHERE clause at all.
+ *
+ * A scope naming only repos the database has never seen resolves to `[-1]`,
  * which deliberately reads as "no rows" rather than "every repo": an unknown
- * repo has no data, and widening to all of them would be a silent lie.
+ * repo has no data, and widening to all of them would be a silent lie. It is
+ * `[-1]` rather than `[]` because an empty `IN ()` is not valid SQLite, and
+ * because "matches nothing" has to be expressible — `null` already means the
+ * opposite.
  */
 export interface ResolvedScope {
-	readonly repoId: number | null;
+	readonly repoIds: readonly number[] | null;
 }
 
-export function scopeToRepoId(db: DashboardDbHandle, scope: DashboardScope): ResolvedScope {
-	if (scope.kind !== "repo" || !scope.repoIdentity) return { repoId: null };
-	const row = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(scope.repoIdentity) as
-		| { id: number }
-		| undefined;
-	// -1 matches nothing, which is the honest answer for an unknown repo.
-	return { repoId: row?.id ?? -1 };
+/**
+ * Resolve a scope's identities to row ids, in one query rather than one per
+ * identity.
+ *
+ * Order follows the scope's own identity list, not the table's, so the bound
+ * parameters read the same way the URL does. Unknown identities are dropped
+ * individually — a scope naming one live repo and one stale bookmark answers for
+ * the live one, which is the only reading that is not a lie in either direction.
+ *
+ * Filtered in SQL rather than by reading `repos` whole and matching in JS:
+ * `repo_identity` is `NOT NULL UNIQUE`, so the `IN` list is an index lookup, and
+ * this runs once per filter site — a dozen-plus times for one page build. The
+ * doc on {@link ResolvedScope} promises the lookup is not repeated per filter;
+ * it should not be a full table scan when it does run.
+ */
+export function scopeToRepoIds(db: DashboardDbHandle, scope: DashboardScope): ResolvedScope {
+	const wanted = scope.kind === "repo" ? scope.repoIdentities : undefined;
+	if (!wanted || wanted.length === 0) return { repoIds: null };
+	const unique = [...new Set(wanted)];
+	const rows = db
+		.prepare(`SELECT id, repo_identity FROM repos WHERE repo_identity IN (${placeholders(unique.length)})`)
+		.all(...unique) as ReadonlyArray<{
+		id: number;
+		repo_identity: string;
+	}>;
+	const byIdentity = new Map(rows.map((row) => [row.repo_identity, row.id]));
+	const ids: number[] = [];
+	for (const identity of wanted) {
+		const id = byIdentity.get(identity);
+		if (id != null && !ids.includes(id)) ids.push(id);
+	}
+	// -1 matches nothing, which is the honest answer when no identity resolved.
+	return { repoIds: ids.length > 0 ? ids : [-1] };
 }
 
 /**
@@ -70,7 +110,7 @@ export function scopeToRepoId(db: DashboardDbHandle, scope: DashboardScope): Res
  * exactly the stable-sort-over-insertion-order behaviour the collector had.
  */
 export function commitCategoryLabels(db: DashboardDbHandle, scope: DashboardScope): Map<string, string> {
-	const filter = scopeFilter(scopeToRepoId(db, scope), "t.repo_id");
+	const filter = scopeFilter(scopeToRepoIds(db, scope), "t.repo_id");
 	const rows = db
 		.prepare(
 			`SELECT r.repo_identity, ranked.commit_hash, ranked.category
@@ -129,19 +169,40 @@ export function splitDecisionBullets(text: string | undefined): ReadonlyArray<st
  * `repos.id` is deliberately NOT accepted: it is a rowid assigned by insert
  * order, so it is not stable across a database rebuild — a bookmarked `?repo=3`
  * could quietly come back pointing at a different project.
+ *
+ * Every token in a multi-repo scope is resolved INDEPENDENTLY by those rules and
+ * the results deduped: `?repo=jolliai&repo=<identity-of-jolliai>` is one repo,
+ * not two, and an ambiguous name sitting next to a good identity does not spoil
+ * the good one.
  */
 export function resolveScope(db: DashboardDbHandle, scope: DashboardScope): DashboardScope {
-	const token = scope.kind === "repo" ? scope.repoIdentity : undefined;
-	if (!token) return scope;
+	const tokens = scope.kind === "repo" ? scope.repoIdentities : undefined;
+	if (!tokens || tokens.length === 0) return scope;
 	const rows = db.prepare("SELECT repo_identity, repo_name FROM repos").all() as ReadonlyArray<{
 		repo_identity: string;
 		repo_name: string;
 	}>;
-	if (rows.some((row) => row.repo_identity === token)) return scope;
+	const identities = new Set(rows.map((row) => row.repo_identity));
+	const resolved: string[] = [];
+	for (const token of tokens) {
+		const identity = resolveToken(rows, identities, token);
+		if (!resolved.includes(identity)) resolved.push(identity);
+	}
+	return { kind: "repo", repoIdentities: resolved };
+}
+
+function resolveToken(
+	rows: ReadonlyArray<{ repo_identity: string; repo_name: string }>,
+	identities: ReadonlySet<string>,
+	token: string,
+): string {
+	if (identities.has(token)) return token;
 	const byName = rows.filter((row) => row.repo_name === token);
-	if (byName.length === 1) return { kind: "repo", repoIdentity: byName[0].repo_identity };
+	if (byName.length === 1) return byName[0].repo_identity;
 	if (byName.length > 1) {
 		log.warn("repo name %s matches %d repos — pass the full identity to disambiguate", token, byName.length);
 	}
-	return scope;
+	// Left as-is on purpose: it then resolves to a key matching nothing, rather
+	// than being silently dropped and widening the scope.
+	return token;
 }

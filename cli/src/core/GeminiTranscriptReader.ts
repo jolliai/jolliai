@@ -20,7 +20,7 @@ import { readFile } from "node:fs/promises";
 import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
 import { builtinTool, ToolUseTally } from "./ToolNameClassify.js";
-import { mergeConsecutiveEntries } from "./TranscriptReader.js";
+import { mergeConsecutiveEntries, throwTranscriptReadError } from "./TranscriptReader.js";
 
 const log = createLogger("GeminiTranscriptReader");
 
@@ -92,8 +92,7 @@ export async function readGeminiTranscript(
 	try {
 		content = await readFile(transcriptPath, "utf-8");
 	} catch (error: unknown) {
-		log.error("Failed to read Gemini session file: %s", (error as Error).message);
-		throw new Error(`Cannot read Gemini session: ${transcriptPath}`);
+		throwTranscriptReadError(log, `Cannot read Gemini session: ${transcriptPath}`, error);
 	}
 
 	let record: GeminiConversationRecord;

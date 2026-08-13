@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	countTranscriptMessages,
 	loadUnreadMergedTranscript,
@@ -413,6 +413,34 @@ describe("countTranscriptMessages", () => {
 			);
 			const entries = await loadUnreadTranscript("claude", file);
 			expect(entries).toHaveLength(2);
+		});
+
+		// The empty-array degradation is the documented contract, so a transcript
+		// the host rotated away is that contract working — it logs at debug. A read
+		// that failed for any other reason keeps its warning.
+		it("stays quiet when the transcript is simply gone", async () => {
+			const projectDir = mkdtempSync(join(tmpdir(), "msg-counter-gone-"));
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			try {
+				expect(await loadUnreadTranscript("claude", join(dir, "rotated-away.jsonl"), projectDir)).toEqual([]);
+				expect(warn).not.toHaveBeenCalled();
+			} finally {
+				warn.mockRestore();
+				rmSync(projectDir, { recursive: true, force: true });
+			}
+		});
+
+		it("warns when the read failed for a reason other than a missing file", async () => {
+			// A directory in place of the transcript reads EISDIR, not ENOENT.
+			const projectDir = mkdtempSync(join(tmpdir(), "msg-counter-eisdir-"));
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			try {
+				expect(await loadUnreadTranscript("claude", dir, projectDir)).toEqual([]);
+				expect(warn).toHaveBeenCalledWith(expect.stringContaining("loadUnreadTranscript failed"));
+			} finally {
+				warn.mockRestore();
+				rmSync(projectDir, { recursive: true, force: true });
+			}
 		});
 
 		// Every source has to be routed to its own reader. These three were added

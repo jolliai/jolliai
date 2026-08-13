@@ -10,7 +10,10 @@ vi.mock("../core/SummaryStore.js", () => ({
 	getSummary: vi.fn(),
 	readTranscriptsForCommits: vi.fn(),
 }));
-vi.mock("../core/TranscriptReader.js", () => ({
+// Only the read is faked — `isMissingTranscriptError` classifies the rejection
+// the collector catches, so the real predicate has to stay in place.
+vi.mock("../core/TranscriptReader.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/TranscriptReader.js")>()),
 	readTranscript: vi.fn(),
 }));
 // The default session loader fans out to every discoverer; mock the registry
@@ -95,6 +98,7 @@ describe("collectSessionEvents", () => {
 	});
 
 	it("keeps a session whose transcript is unreadable, with what the discoverer knew", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 		vi.mocked(readTranscript).mockRejectedValue(new Error("moved"));
 		const events = await collectSessionEvents({
 			repoIdentity: "r",
@@ -103,6 +107,26 @@ describe("collectSessionEvents", () => {
 		});
 		expect(events).toHaveLength(1);
 		expect(events[0].messageCount).toBeUndefined();
+		// An unexplained read failure is still worth the user's terminal.
+		expect(warn).toHaveBeenCalledWith(expect.stringContaining("transcript unreadable"));
+		warn.mockRestore();
+	});
+
+	it("stays quiet when the transcript is simply gone — a rotated JSONL is not a fault", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const gone = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+		vi.mocked(readTranscript).mockRejectedValue(
+			Object.assign(new Error("Cannot read transcript: /t/s1.jsonl"), { cause: gone }),
+		);
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/w",
+			loadSessions: async () => [claudeSession()],
+		});
+		expect(events).toHaveLength(1);
+		expect(events[0].messageCount).toBeUndefined();
+		expect(warn).not.toHaveBeenCalled();
+		warn.mockRestore();
 	});
 
 	it("does not read transcripts for non-Claude sources — no per-turn usage exists there", async () => {

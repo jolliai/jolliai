@@ -64,9 +64,18 @@ window.JD = window.JD || {};
 			return { date: point.date, bySeries: bySeries };
 		});
 
+		/* Dollar in a circle — Lucide `circle-dollar-sign`. It was an axes-plus-
+		   trend-line glyph, which is the same "it's a chart" statement Tokens'
+		   bar chart already makes one card up; the only thing that distinguishes
+		   these two widgets is that this one is denominated in money, so that is
+		   what the icon has to say. */
 		var html =
 			'<section class="card span12" aria-label="Spend"><div class="card-head">' +
-			widgetIcon("--s4", '<path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-4 4"/>') +
+			widgetIcon(
+				"--s4",
+				'<circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/>' +
+					'<path d="M12 18V6"/>',
+			) +
 			'<div style="flex:1 1 300px;min-width:0">' +
 			"<h2>Spend</h2>" +
 			'<div class="sub" style="margin-top:5px">' +
@@ -190,7 +199,11 @@ window.JD = window.JD || {};
 			if (card.category) meta.push('<span class="mem-activity-category">' + esc(card.category) + "</span>");
 			if (card.turns != null) meta.push('<span class="tag metric num">' + esc(card.turns) + " turns</span>");
 			if (card.branch && view === "time") meta.push('<span class="tag mono">' + esc(card.branch) + "</span>");
-			if (model.scope.kind !== "repo") meta.push('<span class="tag">' + esc(card.repoName) + "</span>");
+			/* The repo tag earns its space only when the page is showing more than
+			   one: under a single-repo scope every row would carry the same name the
+			   topbar picker already states. `!== 1`, not `=== 0` — a two-repo
+			   selection needs the tag as much as an unscoped page does. */
+			if (JD.scopeIdentities(model).length !== 1) meta.push('<span class="tag">' + esc(card.repoName) + "</span>");
 			return (
 				'<article class="mem-activity-row" style="--memory-color:' +
 				(catColor(card.category || "feature")) +
@@ -224,19 +237,22 @@ window.JD = window.JD || {};
 		);
 	}
 
-	/* The captured/gap/decision counts atop Memory Activity. `totalCommits` is
+	/* The captured/decision counts atop Memory Activity. `totalCommits` is
 	   present at every tier, but this card never renders below the memory tier
 	   (see the early return above), so `memoriesCreated`/`decisionsCaptured`
 	   are never actually undefined here — the null checks are for a stale or
-	   hand-built model, not a real code path. Gaps are commits with no memory
-	   row at all (see CommitRow.root_hash), not commits missing turns/tokens —
-	   a sparse-but-real memory must not count as a gap. */
+	   hand-built model, not a real code path.
+
+	   A third figure used to sit between these two: `totalCommits - memoriesCreated`,
+	   rendered in the warning colour as "N gaps". It was removed — the deficit it
+	   flagged is not something this page offers any way to act on, and the "of N"
+	   denominator already states the coverage. Both of its inputs are still on the
+	   model, so this is a render decision and nothing else. */
 	function memoryCoverageStats(model) {
 		var captured = model.stats.memoriesCreated;
 		var total = model.stats.totalCommits;
 		var decisionsCount = model.stats.decisionsCaptured;
 		if (captured == null || total == null) return "";
-		var gaps = Math.max(0, total - captured);
 		return (
 			'<div class="mem-activity-stats">' +
 			'<div class="mas-item"><b class="num">' +
@@ -244,9 +260,6 @@ window.JD = window.JD || {};
 			'</b><span>of ' +
 			total +
 			" captured</span></div>" +
-			(gaps > 0
-				? '<div class="mas-item mas-warn"><b class="num">' + gaps + "</b><span>" + (gaps === 1 ? "gap" : "gaps") + "</span></div>"
-				: "") +
 			(decisionsCount != null
 				? '<div class="mas-item"><b class="num">' +
 					decisionsCount +
@@ -278,17 +291,68 @@ window.JD = window.JD || {};
 	/* Card-head for the three widgets in the equal-third band (Skills / MCPs /
 	   Tokens). Inert on purpose: the expand-to-flyout interaction these three
 	   used to carry was removed, so the head must not look clickable — no
-	   chevron, no button element. */
-	function widgetHead(icon, title, sub) {
+	   chevron, no button element.
+
+	   `sub` renders under the title; `hint` renders as a `title=` tooltip on it.
+	   All three cards in this band pass a hint and no sub today, so the band's
+	   heads are one line each. They stay SEPARATE arguments rather than collapsing
+	   to "the sub, but hovered", because they are not the same kind of text and a
+	   card that wants both is one call away: a hint EXPLAINS the card (read once,
+	   noise thereafter), while a sub QUALIFIES its numbers. Tokens is the case
+	   that proves the distinction is real — it carried `Last 30 days` as a visible
+	   sub until the window moved to being read off the topbar range control alone.
+
+	   A native `title` rather than the page's own `JD.showTip`: that helper is
+	   positioned at the pointer for chart readouts and needs listeners rebound on
+	   every 30 s refresh tick, and this needs no such thing. `esc` is what makes
+	   it safe in an attribute — it escapes both quote characters. */
+	function widgetHead(icon, title, sub, hint) {
 		return (
 			'<div class="card-head">' +
 			icon +
-			"<div><h2>" +
+			"<div><h2" +
+			(hint ? ' class="has-hint" title="' + hintAttr(hint) + '"' : "") +
+			">" +
 			title +
-			'</h2><div class="sub">' +
-			sub +
-			"</div></div></div>"
+			"</h2>" +
+			(sub ? '<div class="sub">' + sub + "</div>" : "") +
+			"</div></div>"
 		);
+	}
+
+	/** Roughly where a hint tooltip wraps. Characters, not pixels — see below. */
+	var HINT_WRAP_COLS = 58;
+
+	/* A `title=` value, hard-wrapped.
+	 *
+	 * A native tooltip does NOT wrap on its own: a two-sentence hint renders as
+	 * one line that runs past the card, past the next card, and off the viewport.
+	 * It DOES honour newlines, so the wrapping has to be in the string. `&#10;`
+	 * rather than a literal newline because this string is inlined into the served
+	 * page — a character reference is inert to anything that reformats the markup
+	 * on the way, and reads identically to the browser.
+	 *
+	 * Wrapping by character count is deliberately crude: the tooltip is drawn by
+	 * the OS in a font this page does not choose or measure, so a pixel-accurate
+	 * wrap is not available at any price. Breaking only between words is what
+	 * keeps the crude version acceptable — a word longer than the column takes its
+	 * own line rather than being cut. Escape per line, then join, so `esc` never
+	 * sees (and cannot mangle) the separators. */
+	function hintAttr(text) {
+		var lines = [];
+		var line = "";
+		String(text)
+			.split(" ")
+			.forEach((word) => {
+				if (line && (line + " " + word).length > HINT_WRAP_COLS) {
+					lines.push(line);
+					line = word;
+					return;
+				}
+				line = line ? line + " " + word : word;
+			});
+		if (line) lines.push(line);
+		return lines.map((each) => JD.esc(each)).join("&#10;");
 	}
 
 	/* Decisions (span6) — the corpus of decisions itself: kept count, a
@@ -370,10 +434,14 @@ window.JD = window.JD || {};
 				"”</div>";
 		}
 
+		/* The footer carried a "kept, not merged" chip beside the repo count. It
+		   was removed: it answered a question about how decisions are STORED that
+		   nothing else on the page raises, so under the latest-decision quote it
+		   read as a status on that decision rather than a note about the corpus.
+		   The repo-count measure stays — it qualifies the numbers above it. */
 		return (
 			html +
-			'<div class="w-foot"><span class="w-chip">kept, not merged</span>' +
-			'<span class="w-measure" aria-hidden="false">ⓘ across <b>' +
+			'<div class="w-foot"><span class="w-measure" aria-hidden="false">ⓘ across <b>' +
 			decisions.repoCount +
 			(decisions.repoCount === 1 ? " repo</b>" : " repos</b>") +
 			" in this window</span></div></section>"
@@ -772,15 +840,31 @@ window.JD = window.JD || {};
 	   per-card anatomy. Every row names the agents that ran it; which agents can
 	   be read at all is the footer's `uncoveredSources` caveat, not a fixed list
 	   here (it was hard-coded to Claude and went stale the day Codex landed). */
+	/* Skill invocations only — NOT commands or subagents. `parseToolUse` promotes
+	   a call to a skill row exactly when the tool is `Skill` and carries an
+	   `input.skill` (TranscriptParser.ts); a subagent is the `Task` tool and
+	   classifies as a builtin, and a slash command is a prompt expansion that
+	   never becomes a tool call at all. Widening this sentence means widening
+	   that classifier first. */
+	var SKILLS_HINT =
+		"Skill invocations, counted from the tool calls in your local transcripts. A skill invoked inside a " +
+		"subagent counts once, against the session that spawned it.";
+
 	function skillsCard(model) {
 		var usage = model.stats.toolUsage;
+		/* Puzzle piece — a skill is a part that slots into a run. Was a star,
+		   which is this page's "decision" mark (see JD.glyph) and read as a
+		   rating here. Lucide `puzzle`, like every other icon in this band. */
 		var icon = widgetIcon(
 			"--s2",
-			'<path d="m12 3-1.9 4.6L5 9l4.1 3.4L7.8 17 12 14.4 16.2 17l-1.3-4.6L19 9l-5.1-1.4Z"/>',
+			'<path d="M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 ' +
+				"2.414 0 0 1 0 3.414L19.61 15.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 " +
+				"1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 " +
+				".474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 " +
+				'1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z"/>',
 		);
 		var html =
-			'<section class="card span4" aria-label="Skills">' +
-			widgetHead(icon, "Skills", "What actually runs, from local transcripts");
+			'<section class="card span4" aria-label="Skills">' + widgetHead(icon, "Skills", null, SKILLS_HINT);
 
 		if (usage.skills.length === 0) {
 			return (
@@ -837,11 +921,11 @@ window.JD = window.JD || {};
 	   `data-mcpsplit` handler). */
 	function mcpViewChips(view) {
 		return (
-			'<div class="chips" role="group" aria-label="Split by" style="margin-top:10px">' +
-			'<button type="button" class="chip" data-mcpsplit="server" aria-pressed="' +
+			'<div class="seg seg-sm" role="group" aria-label="Split by" style="margin-top:10px">' +
+			'<button type="button" data-mcpsplit="server" aria-pressed="' +
 			String(view === "server") +
 			'">By server</button>' +
-			'<button type="button" class="chip" data-mcpsplit="tool" aria-pressed="' +
+			'<button type="button" data-mcpsplit="tool" aria-pressed="' +
 			String(view === "tool") +
 			'">By tool</button></div>'
 		);
@@ -884,15 +968,25 @@ window.JD = window.JD || {};
 	   that needs the full registered-server list, which lives in MCP
 	   registration config, not in captured tool calls; see ToolUsage in
 	   DashboardModel. */
+	/* What this card can and cannot see. The second sentence is the load-bearing
+	   one: the rows come from CAPTURED CALLS, so "not listed" means "made no call
+	   we can read", never "not configured" — and it cannot mean the latter,
+	   because the registered-server list lives in each host's own config file and
+	   not in any transcript (see ToolUsage in DashboardModel.ts). */
+	var MCPS_HINT =
+		"MCP tool calls read from your local transcripts — which tool, and how often, never the arguments or the " +
+		"results. Only servers that actually made a call in this window appear.";
+
 	function mcpCard(model) {
 		var usage = model.stats.toolUsage;
+		/* Plug — Lucide `plug`, the shape this card already used, redrawn to the
+		   canonical path so it sits at the same weight as its two neighbours. */
 		var icon = widgetIcon(
 			"--s1",
-			'<path d="M12 22v-6M9 8V2M15 8V2M6 8h12l-1 6a5 5 0 0 1-10 0Z"/>',
+			'<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>',
 		);
 		var html =
-			'<section class="card span4" aria-label="MCPs">' +
-			widgetHead(icon, "MCPs", "What the agent is calling");
+			'<section class="card span4" aria-label="MCPs">' + widgetHead(icon, "MCPs", null, MCPS_HINT);
 
 		if (usage.servers.length === 0) {
 			return (
@@ -933,16 +1027,33 @@ window.JD = window.JD || {};
 		html += mcpViewChips(view);
 		html += mcpViewList(usage, view);
 
-		var note = "from <b>" + usage.sessionsWithTools + "</b> of " + usage.sessionsInWindow + " sessions in this window";
-		note += uncoveredNote(usage, "a server");
-		if (usage.recallCalls) {
-			note +=
-				" · recall count is MCP-tool calls only — a bare <code>jolli recall</code> run or the skill's CLI " +
-				"fallback isn't recorded here";
-		}
-		note +=
-			" · older activity is reconstructed from commits and stored summaries; recent sessions are exact";
-		return html + '<div class="w-foot"><span class="w-measure mcp-card-note">ⓘ ' + note + "</span></div></section>";
+		/* ONE line, no hover. The coverage ratio is the whole footer: the same
+		   shape the Skills card carries, and mandatory for the reason on this
+		   card's own comment above — without a denominator, "12 calls" reads as
+		   twelve out of everything rather than twelve out of the sessions this
+		   build can see inside.
+
+		   Deliberately NO `title` on it. A hover is not a surface: it is invisible
+		   until pointed at, unreachable on touch, and it accumulated exactly the
+		   `·`-joined caveats that were unreadable when they were on the card face.
+		   If a caveat matters enough to say, it goes in the head's ⓘ (which
+		   EXPLAINS the card) or on the face; if it does not, it is not written.
+		   Two that used to hang here are now unwritten: the `uncoveredSources`
+		   list, and "the recall count is MCP-tool calls only".
+
+		   Never held the page-wide clause either ("older activity is reconstructed
+		   from commits and stored summaries") — that describes the activity
+		   timeline, while these rows are captured tool calls and nothing here is
+		   reconstructed from a commit; it is also already printed once per page
+		   (buildDashboardModel → #coverageNote). */
+		return (
+			html +
+			'<div class="w-foot"><span class="w-measure mcp-card-note">ⓘ from <b>' +
+			usage.sessionsWithTools +
+			"</b> of " +
+			usage.sessionsInWindow +
+			" sessions in this window</span></div></section>"
+		);
 	}
 
 	/* Past its first page a ranked list scrolls INSIDE the card rather than
@@ -1077,7 +1188,7 @@ window.JD = window.JD || {};
 			});
 	}
 
-	/* Where your tokens went (span4) — input/output/cache, day-bucketed. Reuses
+	/* Tokens (span4) — input/output/cache, day-bucketed. Reuses
 	   `JD.stackedBars` (the same chart Cost & tokens draws) rather than a
 	   one-off SVG, so the two cards read as the same chart language. `cached`
 	   is one combined figure, not a cache-write/cache-read split — the database
@@ -1092,14 +1203,14 @@ window.JD = window.JD || {};
 	   group-by chips they used to be described as matching were never rendered. */
 	function tokensViewChips(view) {
 		return (
-			'<div class="chips" role="group" aria-label="Split by" style="margin-top:10px">' +
-			'<button type="button" class="chip" data-toksplit="type" aria-pressed="' +
+			'<div class="seg seg-sm" role="group" aria-label="Split by" style="margin-top:10px">' +
+			'<button type="button" data-toksplit="type" aria-pressed="' +
 			String(view === "type") +
 			'">By type</button>' +
-			'<button type="button" class="chip" data-toksplit="model" aria-pressed="' +
+			'<button type="button" data-toksplit="model" aria-pressed="' +
 			String(view === "model") +
 			'">By model</button>' +
-			'<button type="button" class="chip" data-toksplit="repo" aria-pressed="' +
+			'<button type="button" data-toksplit="repo" aria-pressed="' +
 			String(view === "repo") +
 			'">By repo</button></div>'
 		);
@@ -1164,14 +1275,25 @@ window.JD = window.JD || {};
 		return html + '<div class="chart-box" style="margin-top:16px">' + JD.stackedBars(stats.series, stats.seriesKeys, "tokens by " + wantDim) + "</div>";
 	}
 
+	/* Why this card counts tokens while Spend counts dollars — the one thing a
+	   reader cannot infer from the bars, since a rising cached share moves the two
+	   in opposite directions. */
+	var TOKENS_HINT =
+		"How your tokens are actually used, by day. Cache reads bill at 10% of input, so a rising cached share " +
+		"lowers cost while tokens climb — which is why this widget counts tokens and Spend counts dollars.";
+
 	function tokensCard(model) {
 		var stats = model.stats;
 		var tb = stats.tokenBreakdown;
 		var total = tb.input + tb.output + tb.cached;
-		var icon = widgetIcon("--s3", '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>');
+		/* Bar chart — Lucide `chart-column`, matching what the card draws. It was
+		   a CLOCK, which belongs to elapsed time and said nothing about token
+		   volume; the clock is still correct on the session feed below, which is
+		   the card it was presumably copied from. */
+		var icon = widgetIcon("--s3", '<path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>');
 		var html =
-			'<section class="card span4" aria-label="Where your tokens went">' +
-			widgetHead(icon, "Where your tokens went", JD.esc(rangeSub(stats)));
+			'<section class="card span4" aria-label="Tokens">' +
+			widgetHead(icon, "Tokens", null, TOKENS_HINT);
 
 		if (total === 0) {
 			return (
@@ -1255,8 +1377,11 @@ window.JD = window.JD || {};
 				"</span>";
 		if (card.branch) chips += '<span class="tag mono">' + esc(card.branch) + "</span>";
 		if (card.model) chips += '<span class="tag mono">' + esc(card.model) + "</span>";
-		/* Cross-repo scope: name the repo, the way the session feed does. */
-		if (model.scope.kind !== "repo" && card.repoName) chips += '<span class="tag">' + esc(card.repoName) + "</span>";
+		/* Cross-repo scope: name the repo, the way the session feed does. Anything
+		   but exactly one repo in scope counts as cross-repo — see the same test
+		   in memoryActivityCard's row(). */
+		if (JD.scopeIdentities(model).length !== 1 && card.repoName)
+			chips += '<span class="tag">' + esc(card.repoName) + "</span>";
 
 		return (
 			'<div class="fcard"><div class="row1"><span class="title">' +
@@ -1310,8 +1435,6 @@ window.JD = window.JD || {};
 			JD.esc(rangeSub(stats)) +
 			" · from local agent logs" +
 			"</div></div>" +
-			'<div class="spacer"></div>' +
-			JD.scopeChip(model) +
 			'</div><div class="feed">';
 
 		/* The feed follows the range, so an empty one means "none in this window"
@@ -1331,8 +1454,32 @@ window.JD = window.JD || {};
 		return html + "</div></section>";
 	}
 
+	/* Nothing is enrolled yet. This is the instruction the Repositories page used
+	   to carry, and it moved here when that page was removed: Dashboard is now
+	   the landing page in every state, so it is what a fresh install sees. Six
+	   cards of zeroes would technically be accurate and would explain nothing.
+
+	   `repos` (not `stats`) is the test, because it is the only field that
+	   distinguishes "no repository is enrolled" from "this window is quiet" —
+	   every stats figure reads zero in both. And `repos` now carries PAUSED repos
+	   too, so this fires only when the registry is genuinely empty: an all-paused
+	   dashboard renders its (still-counting) numbers instead of claiming nothing
+	   is enrolled. */
+	function noReposCard() {
+		return (
+			'<section class="card span12"><div class="empty"><div class="inner"><div class="chip">◆</div>' +
+			"<h2>No repositories yet</h2><p>Jolli attaches memory to your commits. Run <code>jolli enable</code> " +
+			"inside the repository you want to start with — it appears here once enabled, and this page fills in " +
+			"from your next AI session and commit.</p></div></div></section>"
+		);
+	}
+
 	JD.renderStats = (model) => {
 		var stats = model.stats;
+		if ((model.repos || []).length === 0) {
+			document.getElementById("app").innerHTML = noReposCard();
+			return;
+		}
 		/* Order follows jolli-design's own Dashboard route (confirmed against a
 		   real screenshot of it): the equal-third band (what runs, what's
 		   called, what it cost in tokens) leads, then spend over time, then

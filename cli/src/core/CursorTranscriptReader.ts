@@ -24,7 +24,7 @@
 import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
 import { withSqliteDb } from "./SqliteHelpers.js";
-import { mergeConsecutiveEntries } from "./TranscriptReader.js";
+import { mergeConsecutiveEntries, throwTranscriptReadError } from "./TranscriptReader.js";
 
 const log = createLogger("CursorTranscriptReader");
 
@@ -169,8 +169,7 @@ export async function readCursorTranscript(
 
 		return { entries, newCursor, totalLinesRead };
 	} catch (error: unknown) {
-		log.error("Failed to read Cursor session %s: %s", composerId.substring(0, 8), (error as Error).message);
-		throw new Error(`Cannot read Cursor session: ${composerId}`);
+		throwTranscriptReadError(log, `Cannot read Cursor session: ${composerId}`, error);
 	}
 }
 
