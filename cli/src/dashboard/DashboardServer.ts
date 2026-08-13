@@ -325,7 +325,7 @@ body { margin: 0; padding: 24px 40px; font: 14px/1.6 -apple-system, BlinkMacSyst
  * parent page — the CSP `frame-ancestors 'self'` only controls who may embed it.
  * `bodyMd` is inlined as `escapeForInlineScript(JSON.stringify(bodyMd))`: it must
  * become a JS string literal first (marked.parse takes a string), then have
- * `</script>` / ` ` neutralised.
+ * `</script>` and the U+2028 / U+2029 line separators neutralised.
  */
 /**
  * Runs after `marked` renders `#md`. The wiki's links are all repo-relative
@@ -847,6 +847,15 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 
 /** How long a Settings sign-in may wait for the browser callback before failing. */
 const SIGNIN_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * The one sign-in error text that is safe to return to the client: a developer
+ * authored constant, carrying no internal detail. A CAUGHT error's own message
+ * can leak implementation specifics (CWE-209), so `handleSignIn` returns this or
+ * a generic fallback — never `errMsg(err)` — while still logging the real error
+ * server-side. Shared with the `withTimeout` call so the two cannot drift.
+ */
+const SIGNIN_TIMEOUT_MESSAGE = "sign-in timed out — please try again";
 
 /**
  * Rejects with `message` if `promise` has not settled within `ms`. Used to cap
@@ -1548,11 +1557,20 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	   underlying browserLogin is covered by cli/src/auth/Login.test.ts. */
 	async function handleSignIn(res: ServerResponse): Promise<void> {
 		try {
-			await withTimeout(browserLogin(getJolliUrl()), SIGNIN_TIMEOUT_MS, "sign-in timed out — please try again");
+			await withTimeout(browserLogin(getJolliUrl()), SIGNIN_TIMEOUT_MS, SIGNIN_TIMEOUT_MESSAGE);
 			sendJson(res, 200, { ok: true });
 		} catch (err) {
+			// Log the real error server-side, but return only a CONSTANT to the
+			// client: a caught error's message can carry internal detail (CWE-209),
+			// so nothing derived from `err` reaches the response. The timeout text is
+			// a safe developer-authored constant worth preserving; anything else is a
+			// generic message and the detail stays in the log above.
 			log.warn("sign-in failed: %s", errMsg(err));
-			sendJson(res, 400, { error: errMsg(err) });
+			const clientError =
+				errMsg(err) === SIGNIN_TIMEOUT_MESSAGE
+					? SIGNIN_TIMEOUT_MESSAGE
+					: "Sign-in failed — see the server log for details.";
+			sendJson(res, 400, { error: clientError });
 		}
 	}
 	/* v8 ignore stop */
