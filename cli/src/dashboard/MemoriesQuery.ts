@@ -589,6 +589,12 @@ export function buildMemoryDetail(
 	scope: DashboardScope,
 	hash: string,
 ): MemoryDetail | undefined {
+	// Guard the empty string explicitly: with the prefix predicate below,
+	// `length("")=0` makes `substr(commit_hash,1,0)=""` true for EVERY row (the
+	// old `commit_hash = ""` matched none), so an empty hash would resolve to an
+	// arbitrary memory. `buildMemories` already returns early on a falsy hash, but
+	// this is exported and must not depend on every caller repeating that guard.
+	if (!hash) return undefined;
 	const resolved = scopeToRepoId(db, scope);
 	const filter = scopeFilter(resolved, "m.repo_id");
 	const row = db
@@ -603,16 +609,35 @@ export function buildMemoryDetail(
 			   FROM memories m
 			   JOIN repos r ON r.id = m.repo_id
 			   LEFT JOIN commits cm ON cm.repo_id = m.repo_id AND cm.hash = m.commit_hash
-			  WHERE m.commit_hash = ?${filter.sql}
+			  -- Prefix match on the leading length(hash) chars, so a SHORT hash
+			  -- resolves too: the wiki's source-commit links carry an 8-char hash
+			  -- (commitHash.substring(0,8)), and /memories?hash=a742fa47 must open the
+			  -- same memory as the full 40-char form. A full hash makes this
+			  -- substr(commit_hash,1,40)=hash, i.e. exactly the old '=' — so every
+			  -- existing full-hash caller (stats/memories cards) is unchanged. substr
+			  -- rather than LIKE ...||'%' keeps it a plain equality with no wildcard or
+			  -- escape semantics (a hash is hex, but this stays true if that changes).
+			  WHERE substr(m.commit_hash, 1, length(?)) = ?${filter.sql}
 			  -- Deterministic pick. Without a scope filter (the all-repos view) one
 			  -- hash can match rows in two repos — two clones of a project, or the
 			  -- same commit cherry-picked into another — and an unordered LIMIT 1 let
-			  -- the engine hand back a different repo's memory between renders.
+			  -- the engine hand back a different repo's memory between renders. A short
+			  -- hash can also prefix-collide within one repo; the same ORDER makes that
+			  -- pick deterministic, and detailRepo narrows the scope first.
 			  ORDER BY m.repo_id
 			  LIMIT 1`,
 		)
-		.get(hash, ...filter.params) as MemoryDetailRow | undefined;
+		.get(hash, hash, ...filter.params) as MemoryDetailRow | undefined;
 	if (!row) return undefined;
+
+	// The `hash` argument may be a SHORT prefix (wiki source-commit links carry an
+	// 8-char hash). The WHERE above resolved it to a row, but every downstream
+	// lookup below matches `commit_hash = ?` EXACTLY — feeding the short prefix
+	// would miss, silently degrading the detail (bare row instead of the folded
+	// tree → tokens understated ~5x and topics lost; no commit_files → per-file
+	// line counts lost; empty activity; conversations vanish entirely). Use the
+	// full hash the row actually carries for all of them.
+	const fullHash = row.commit_hash;
 
 	// Not guarded: `memories` computes STORED generated columns with
 	// `json_extract`, so SQLite rejects a malformed payload at INSERT
@@ -624,7 +649,7 @@ export function buildMemoryDetail(
 	// on those folded children. Reading the row alone reported 639k tokens for a
 	// memory the editor shows as 3.45M. Falls back to the row if assembly finds
 	// nothing, so a detail page never fails on a tree query.
-	const summary = (assembleMemoryTree(db, row.repo_id, hash) ?? JSON.parse(row.summary_json)) as CommitSummary;
+	const summary = (assembleMemoryTree(db, row.repo_id, fullHash) ?? JSON.parse(row.summary_json)) as CommitSummary;
 
 	const categoryLabels = commitCategoryLabels(db, scope);
 	const category = categoryLabels.get(`${row.repo_identity}\0${row.commit_hash}`);
@@ -637,7 +662,11 @@ export function buildMemoryDetail(
 			  WHERE c.repo_id = ? AND c.hash = ?
 			  ORDER BY cf.path`,
 		)
-		.all(row.repo_id, hash) as ReadonlyArray<{ path: string; insertions: number | null; deletions: number | null }>;
+		.all(row.repo_id, fullHash) as ReadonlyArray<{
+		path: string;
+		insertions: number | null;
+		deletions: number | null;
+	}>;
 	const topicsRaw = collectDisplayTopics(summary);
 	// `commit_files` comes from the collector's `--numstat` pass over git, which
 	// only ever ran for commits it walked — a repo enrolled after the fact has
@@ -672,7 +701,7 @@ export function buildMemoryDetail(
 		reason: e.reason,
 	}));
 
-	const { activity, uncoveredSources } = buildActivity(db, row.repo_id, hash);
+	const { activity, uncoveredSources } = buildActivity(db, row.repo_id, fullHash);
 
 	// Aggregated over the tree, matching the editor's token meter
 	// (`SummaryHtmlBuilder.buildTokenMeter`): a squash/amend memory keeps its
@@ -744,7 +773,7 @@ export function buildMemoryDetail(
 		...(tokens ? { tokens } : {}),
 		...(summarizedBy ? { summarizedBy } : {}),
 		...(summary.recap ? { recap: summary.recap } : {}),
-		conversations: buildConversations(db, row.repo_id, hash, summary),
+		conversations: buildConversations(db, row.repo_id, fullHash, summary),
 		context,
 		excluded,
 		activity,

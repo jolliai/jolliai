@@ -494,6 +494,12 @@ describe("routes", () => {
 			expect(body).toContain("window.marked.parse(");
 			// The document must NOT carry the dashboard mutation token.
 			expect(body).not.toContain("__JOLLI_DASHBOARD_TOKEN__");
+			// It carries the link-rewrite script: source-commit links postMessage the
+			// hash up to the parent, and other relative links are de-linked. (The
+			// script's actual classification behavior is covered end-to-end in
+			// WikiViewerScript.test.ts against real href shapes.)
+			expect(body).toContain('window.parent.postMessage({type:"jolli-wiki-nav",hash:hash}');
+			expect(body).toContain("a.parentNode.replaceChild(s,a)");
 		});
 
 		it("neutralizes a </script> breakout payload in the wiki body", async () => {

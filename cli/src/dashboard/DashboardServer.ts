@@ -327,6 +327,55 @@ body { margin: 0; padding: 24px 40px; font: 14px/1.6 -apple-system, BlinkMacSyst
  * become a JS string literal first (marked.parse takes a string), then have
  * `</script>` / ` ` neutralised.
  */
+/**
+ * Runs after `marked` renders `#md`. The wiki's links are all repo-relative
+ * (`../<branch>/…`) and dead inside this framed viewer, so:
+ *
+ *   - **Source-commit** links — `../<branch>/<slug>-<hash8>.md` (NO `summary--`
+ *     prefix: the visible file `FolderStorage` writes is `<slug>-<hash8>.md`, and
+ *     the link's visible label is that 8-char hash) — get their `href` REWRITTEN
+ *     to the real target `/memories?hash=…&detailRepo=<kb>` (so the browser status
+ *     bar previews where a click goes) but still `preventDefault` + `postMessage`
+ *     the hash up to the Knowledge page, which performs the actual navigation.
+ *     This frame is sandboxed (opaque origin) — a bare `<a>` click would navigate
+ *     the FRAME, not the top page — so the anchor cannot be left to do the jump.
+ *     `kb` for the href is read from this frame's own `?kb=` (its URL already
+ *     names the repo); the parent navigates to the SAME `detailRepo=<kb>`, so the
+ *     previewed URL and the real one match exactly. Classified as a relative `.md`
+ *     whose trailing `-<hex>.md` (or link text) is a commit hash; the hash is
+ *     read from that trailing group, falling back to the link text.
+ *   - **Related-branch** links — `../<folder>/` — plus the index page's bare
+ *     `topic--<slug>.md` links and any other leftover relative link keep their
+ *     text but drop the anchor (local dashboard has no branch page, and every
+ *     other relative target is a 404 here).
+ *   - Absolute / external links are left untouched.
+ *
+ * Self-contained, no user data — inlined verbatim (unlike `bodyMd`).
+ */
+export const WIKI_LINK_REWRITE_SCRIPT =
+	'(function(){var md=document.getElementById("md");if(!md)return;' +
+	'var kb=(new URLSearchParams(window.location.search)).get("kb")||"";' +
+	'Array.prototype.forEach.call(md.querySelectorAll("a[href]"),function(a){' +
+	'var href=a.getAttribute("href")||"";' +
+	"var rel=/^\\.{1,2}\\//.test(href);" +
+	"var m=href.match(/-([0-9a-f]{7,40})\\.md$/i);" +
+	'var hash=m?m[1]:(a.textContent||"").trim();' +
+	// Source-commit link: a relative .md whose trailing -<hex>.md (or visible label)
+	// is a commit hash. There is NO "summary--" prefix — the file is <slug>-<hash8>.md.
+	"if(rel&&/\\.md$/i.test(href)&&/^[0-9a-f]{7,40}$/i.test(hash)){" +
+	// Show the real destination in the status bar (kb from this frame's own URL);
+	// the click still goes through the parent, since a sandboxed <a> would only
+	// navigate the frame. The parent navigates to this SAME detailRepo=<kb>.
+	'a.setAttribute("href","/memories?hash="+encodeURIComponent(hash)+(kb?"&detailRepo="+encodeURIComponent(kb):""));' +
+	'a.addEventListener("click",function(e){e.preventDefault();' +
+	'window.parent.postMessage({type:"jolli-wiki-nav",hash:hash},"*");});' +
+	"return;}" +
+	// Branch dir (../x/), the index page's bare topic--<slug>.md, or any other
+	// relative dead link → keep the text, drop the anchor.
+	'if(rel||/^[^/:]+\\.md$/i.test(href)){var s=document.createElement("span");' +
+	"s.textContent=a.textContent;if(a.parentNode)a.parentNode.replaceChild(s,a);}" +
+	"});})();";
+
 function buildWikiViewerHtml(graphAssetsDir: string, bodyMd: string): string {
 	const marked = readFileSync(join(graphAssetsDir, "vendor", "marked.min.js"), "utf8");
 	const safe = escapeForInlineScript(JSON.stringify(bodyMd));
@@ -336,6 +385,7 @@ function buildWikiViewerHtml(graphAssetsDir: string, bodyMd: string): string {
 		`<style>${WIKI_VIEWER_CSS}</style></head><body><article id="md" class="md"></article>` +
 		`<script>\n${marked}\n</script>` +
 		`<script>document.getElementById("md").innerHTML = window.marked.parse(${safe});</script>` +
+		`<script>${WIKI_LINK_REWRITE_SCRIPT}</script>` +
 		`</body></html>`
 	);
 }

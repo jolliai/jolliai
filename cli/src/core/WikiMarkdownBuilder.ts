@@ -24,7 +24,8 @@ export interface WikiRenderContext {
 	 * Lookup helper from short commit hash (8-char hex prefix) to the
 	 * visible-md path **relative to `<kbRoot>/_wiki/`**. Returns null when
 	 * no visible summary exists (orphan-only mode / hash unknown).
-	 * Expected return shape: `../<branchFolder>/summary--<slug>-<hash8>.md`.
+	 * Expected return shape: `../<branchFolder>/<slug>-<hash8>.md` (the visible file
+	 * `FolderStorage` writes; there is no `summary--` prefix).
 	 */
 	readonly resolveCommitVisiblePath: (commitHash8: string) => string | null;
 	/**

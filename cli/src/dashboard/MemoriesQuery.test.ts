@@ -441,6 +441,60 @@ describe("MemoriesQuery", () => {
 			expect(detail).toBeUndefined();
 		});
 
+		it("resolves a SHORT hash prefix to the same memory as the full hash", async () => {
+			// The wiki's source-commit links carry an 8-char hash, so /memories?hash=a742fa47
+			// must open the same memory the full 40-char hash does.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = `a742fa47${"b".repeat(32)}`;
+			await seedMemory(dbPath, "repo-1", hash, "feat: something", { branch: "main" });
+
+			const short = await withDashboardDb((db) => buildMemoryDetail(db, ALL, "a742fa47"), { dbPath });
+			const full = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(short?.commitHash).toBe(hash);
+			expect(full?.commitHash).toBe(hash);
+		});
+
+		it("a SHORT hash opens the SAME rich detail (files + conversations) as the full hash", async () => {
+			// Guards that the resolved row's FULL hash — not the short prefix — feeds
+			// the downstream exact-match lookups (commit_files, transcripts). With the
+			// short prefix, those miss and the detail silently degrades to a bare row:
+			// no per-file line counts, no conversations.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = `a742fa47${"b".repeat(32)}`;
+			await seedMemory(dbPath, "repo-1", hash, "feat: rich", { branch: "main" });
+			await seedCommitFiles(dbPath, "repo-1", hash, [{ path: "src/a.ts", insertions: 10, deletions: 2 }]);
+			await seedLinkedSession(dbPath, "repo-1", hash, {
+				source: "claude",
+				sessionId: "s1",
+				title: "Session",
+				messageCount: 4,
+			});
+
+			const short = await withDashboardDb((db) => buildMemoryDetail(db, ALL, "a742fa47"), { dbPath });
+			const full = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			// Per-file line counts come ONLY from the hash-matched commit_files query;
+			// a short-hash miss would fall back to (empty) topic filesAffected.
+			expect(short?.files).toEqual([{ path: "src/a.ts", insertions: 10, deletions: 2 }]);
+			expect(short?.files).toEqual(full?.files);
+			expect(short?.conversations.length).toBeGreaterThan(0);
+			expect(short?.conversations.length).toBe(full?.conversations.length);
+		});
+
+		it("resolves a short-hash prefix collision within ONE repo deterministically", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const h1 = `abcd1234${"1".repeat(32)}`;
+			const h2 = `abcd1234${"2".repeat(32)}`;
+			await seedMemory(dbPath, "repo-1", h1, "first", { commitDateMs: 1 });
+			await seedMemory(dbPath, "repo-1", h2, "second", { commitDateMs: 2 });
+
+			// Both share prefix "abcd1234" in the SAME repo, so detailRepo cannot
+			// disambiguate; the pick must be stable across calls (not throw, not vary).
+			const a = await withDashboardDb((db) => buildMemoryDetail(db, ALL, "abcd1234"), { dbPath });
+			const b = await withDashboardDb((db) => buildMemoryDetail(db, ALL, "abcd1234"), { dbPath });
+			expect(a?.commitHash).toBe(b?.commitHash);
+			expect([h1, h2]).toContain(a?.commitHash);
+		});
+
 		it("splits a topic's decisions prose into bullets, and falls back to one bullet for a plain sentence", async () => {
 			await seedRepo(dbPath, "repo-1", "acme-api");
 			const hash = "a".repeat(40);
@@ -905,6 +959,26 @@ describe("MemoriesQuery", () => {
 			const withUnknownHash = await withDashboardDb((db) => buildMemories(db, ALL, "z".repeat(40)), { dbPath });
 			expect(withUnknownHash.selected).toBeUndefined();
 			expect(withUnknownHash.items).toHaveLength(1);
+		});
+
+		it("uses detailRepo (repo name) to disambiguate a short-hash prefix shared by two repos", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedRepo(dbPath, "repo-2", "acme-web");
+			const h1 = `abcd1234${"1".repeat(32)}`;
+			const h2 = `abcd1234${"2".repeat(32)}`;
+			await seedMemory(dbPath, "repo-1", h1, "in api", { commitDateMs: 1 });
+			await seedMemory(dbPath, "repo-2", h2, "in web", { commitDateMs: 2 });
+
+			// The short prefix "abcd1234" matches BOTH repos; detailRepo picks one.
+			const toWeb = await withDashboardDb((db) => buildMemories(db, ALL, "abcd1234", undefined, "acme-web"), {
+				dbPath,
+			});
+			expect(toWeb.selected?.commitHash).toBe(h2);
+
+			// Without detailRepo the pick is deterministic (lowest repo_id), proving
+			// the disambiguation is what steered it to acme-web above.
+			const ambiguous = await withDashboardDb((db) => buildMemories(db, ALL, "abcd1234"), { dbPath });
+			expect(ambiguous.selected?.commitHash).toBe(h1);
 		});
 	});
 	describe("readContextDoc", () => {

@@ -20,6 +20,12 @@ window.JD = window.JD || {};
 	JD.memView = JD.memView || "branches";
 	JD.memCollapsed = JD.memCollapsed || {};
 	JD.memQuery = JD.memQuery || "";
+	/* The hash we last scrolled the tree to. Landing on /memories?hash=… should
+	   bring the selected row into view (centered), but the 30s tick re-renders the
+	   same page — scrolling every tick would yank the view back while the user
+	   reads. So we scroll only when the selected hash CHANGES. Reset to null on
+	   each page load (a fresh module), which is exactly when we DO want to scroll. */
+	JD.memLastScrolledHash = JD.memLastScrolledHash || null;
 
 	const MEMORY_ICONS = {
 		database: '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
@@ -278,6 +284,20 @@ window.JD = window.JD || {};
 	function refreshTree(model) {
 		document.getElementById("memTree").innerHTML = renderTreeBody(model);
 		wireTree(model);
+	}
+
+	/* Center the selected memory's row in the tree when the selection changes —
+	   the landing case for /memories?hash=…&detailRepo=… (e.g. a click from the
+	   wiki viewer), where the row is often scrolled out of view. Guarded by
+	   memLastScrolledHash so the 30s tick does not fight the user's own scrolling.
+	   Only reached from renderMemories, never from refreshTree (collapse toggles /
+	   load-more must not reposition the tree). No-op when the row isn't loaded. */
+	function scrollSelectedIntoView(model) {
+		var sel = model.memories && model.memories.selected ? model.memories.selected.commitHash : null;
+		if (!sel || sel === JD.memLastScrolledHash) return;
+		JD.memLastScrolledHash = sel;
+		var row = document.querySelector('#memTree [aria-current="true"]');
+		if (row && row.scrollIntoView) row.scrollIntoView({ block: "center" });
 	}
 
 	function renderToolbar(model) {
@@ -904,6 +924,7 @@ window.JD = window.JD || {};
 			if (detail) detail.innerHTML = '<div class="mem-read-inner">' + renderDetail(model) + "</div>";
 			wireTree(model);
 			wireDetail(model);
+			scrollSelectedIntoView(model);
 			return;
 		}
 		document.getElementById("app").innerHTML =
@@ -917,5 +938,6 @@ window.JD = window.JD || {};
 		wireToolbar(model);
 		wireTree(model);
 		wireDetail(model);
+		scrollSelectedIntoView(model);
 	};
 })(window.JD);
