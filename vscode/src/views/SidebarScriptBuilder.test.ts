@@ -3427,16 +3427,29 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).not.toContain("'data-action': 'footer-commit'");
 	});
 
-	it("footer is Create PR | Share | More", () => {
+	it("footer is Create PR | Dashboard | More, and Share is no longer a button", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("'data-action': 'footer-create-pr'");
-		expect(js).toContain("'data-action': 'footer-share'");
+		expect(js).toContain("'data-action': 'footer-dashboard'");
 		expect(js).toContain("'data-action': 'footer-more'");
+		// JOLLI-2172 moved Share into the overflow menu. Pinned as an absence
+		// because the button and the menu item dispatch the same command, so
+		// asserting on `jollimemory.shareBranch` alone cannot tell them apart.
+		expect(js).not.toContain("'data-action': 'footer-share'");
 	});
 
-	it("Review dispatches reviewNextMemory; footer Share and the row icon dispatch the share commands", () => {
+	it("the overflow menu carries Share ahead of the recall items", () => {
+		const js = buildSidebarScript();
+		const share = js.indexOf("{ label: 'Share branch'");
+		const recall = js.indexOf("{ label: 'Recall in Claude Code'");
+		expect(share).toBeGreaterThan(-1);
+		expect(recall).toBeGreaterThan(share);
+	});
+
+	it("Review dispatches reviewNextMemory; the footer opens the dashboard and Share stays wired", () => {
 		const js = buildSidebarScript();
 		expect(js).toContain("jollimemory.reviewNextMemory");
+		expect(js).toContain("jollimemory.openDashboard");
 		expect(js).toContain("jollimemory.shareBranch");
 		expect(js).toContain("jollimemory.shareMemory");
 	});

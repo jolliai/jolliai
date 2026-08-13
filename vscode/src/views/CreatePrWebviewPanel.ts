@@ -209,6 +209,7 @@ export class CreatePrWebviewPanel {
 	 * carried over from the previous vm / instance state.
 	 */
 	private async refreshAfterSubmit(): Promise<void> {
+		/* v8 ignore next -- unreachable: only reached from the createPr handler, which runs after render() has set vm (same guard as handle()'s). */
 		if (!this.vm) return;
 		let next: CreatePrViewModel = this.vm;
 		try {
@@ -424,6 +425,7 @@ export class CreatePrWebviewPanel {
 	 * failure is surfaced as a non-blocking toast; the PR is already created.
 	 */
 	private async pushMemoriesToSpace(): Promise<void> {
+		/* v8 ignore next -- unreachable: only reached from the createPr handler, which runs after render() has set vm (same guard as handle()'s). */
 		if (!this.vm) return;
 		const branch = this.vm.branch;
 		const config = await loadGlobalConfig();

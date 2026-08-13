@@ -36,6 +36,10 @@ describe("buildConversationDetailsHtml", () => {
 				"opencode",
 				"copilot",
 				"copilot-chat",
+				"devin",
+				"cursor-cli",
+				"antigravity",
+				"kimi",
 			]) {
 				const html = build(source);
 				expect(html).toContain(
@@ -45,6 +49,9 @@ describe("buildConversationDetailsHtml", () => {
 		});
 
 		it("renders the providerLabel string, not the raw enum value", () => {
+			// Every case of providerLabel is listed: the switch mirrors
+			// SidebarScriptBuilder's own label map, so a source added there and
+			// forgotten here would silently render its raw lowercase enum value.
 			const cases: Array<[string, string]> = [
 				["claude", "Claude"],
 				["cursor", "Cursor"],
@@ -53,6 +60,10 @@ describe("buildConversationDetailsHtml", () => {
 				["opencode", "OpenCode"],
 				["copilot", "Copilot"],
 				["copilot-chat", "Copilot Chat"],
+				["devin", "Devin"],
+				["cursor-cli", "Cursor CLI"],
+				["antigravity", "Antigravity"],
+				["kimi", "Kimi Code"],
 			];
 			for (const [source, label] of cases) {
 				const html = build(source);
@@ -86,6 +97,8 @@ describe("buildConversationDetailsHtml", () => {
 				"copilot-chat",
 				"devin",
 				"cursor-cli",
+				"antigravity",
+				"kimi",
 			]) {
 				const re = new RegExp(
 					"\\.badge\\.transcript-source-" +

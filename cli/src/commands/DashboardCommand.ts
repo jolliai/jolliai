@@ -26,6 +26,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Command } from "commander";
 import { getProjectRootDir } from "../core/GitOps.js";
+import { readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
@@ -48,10 +49,71 @@ export interface DashboardOptions {
 	readonly cwd?: string;
 }
 
+/**
+ * Where this command's human-facing lines go.
+ *
+ * Defaults to the console, which is exactly right for a terminal. A GUI host is
+ * the reason this is a seam at all: the VS Code extension bundles this module
+ * and runs it inside the extension host, whose `console` writes to the debug
+ * console — a place no user has open. Without a writer to hand over, every line
+ * this command produces (the URL it just opened, and more importantly each
+ * failure reason) would be invisible on that surface.
+ *
+ * Every member must stay a total function rather than an optional one: a partial
+ * writer would silently drop a whole class of output, and the classes most likely
+ * to go missing are the ones nothing else reports.
+ */
+export interface DashboardOutput {
+	readonly log: (line: string) => void;
+	readonly error: (line: string) => void;
+	/**
+	 * A line the user has to SEE, on a host where `log` is somewhere they don't
+	 * look.
+	 *
+	 * `log` and `error` are both fine on a terminal, where every line is already
+	 * in front of the user — which is why the split only pays off in a GUI. There
+	 * `log` lands in an output channel nobody opens, and that is the right home
+	 * for progress and for a reason that accompanies a visible failure. It is the
+	 * wrong home for a line that is the ONLY explanation of something the user is
+	 * looking at right now: the disabled-repo notice below opens the dashboard
+	 * successfully and silently leaves this repo out of it, so routing it through
+	 * `log` moves it from one unread place to another.
+	 *
+	 * NOT an error, so it must not be `error`: nothing failed, and a host that
+	 * renders `error` as a modal or a red toast would be lying about it.
+	 */
+	readonly notice: (line: string) => void;
+}
+
+/**
+ * The default writer. Behaviourally identical to the direct `console` calls it
+ * replaced.
+ *
+ * The members WRAP `console.log`/`console.error` instead of referencing them
+ * (`log: console.log`), and that is load-bearing rather than style: a direct
+ * reference binds the original function at module load, so a `vi.spyOn(console,
+ * "log")` installed afterwards would never be seen. Every existing assertion on
+ * this command's output is a console spy, so the reference form would leave them
+ * all passing against a console nothing writes to.
+ */
+const CONSOLE_OUTPUT: DashboardOutput = {
+	log: (line: string) => console.log(line),
+	error: (line: string) => console.error(line),
+	// Same stream as `log`, because on a terminal it already IS in front of the
+	// user — the distinction only means something to a host that has somewhere
+	// else to put it.
+	notice: (line: string) => console.log(line),
+};
+
 /** Injectable seams — every process/network/browser effect goes through these. */
 export interface DashboardDeps {
 	readonly configDir?: string;
 	readonly dbPath?: string;
+	/**
+	 * Where the human-facing lines go. Defaults to {@link CONSOLE_OUTPUT}, so a
+	 * caller that omits it gets the pre-seam behaviour byte for byte.
+	 */
+	readonly output?: DashboardOutput;
 	/**
 	 * Spawns the detached server. `cwd` is the launcher's resolved repo directory
 	 * (`--cwd` or the process cwd): the child runs there so its telemetry buffer
@@ -140,6 +202,7 @@ function defaultKillPid(pid: number): boolean {
 function resolveSeams(deps: DashboardDeps): ResolvedSeams {
 	return {
 		configDir: deps.configDir ?? getGlobalConfigDir(),
+		output: outputOf(deps),
 		spawnServer: deps.spawnServer ?? defaultSpawnServer,
 		openBrowser: deps.openBrowser ?? defaultOpenBrowser,
 		fetchHealth: deps.fetchHealth ?? defaultFetchHealth,
@@ -149,9 +212,21 @@ function resolveSeams(deps: DashboardDeps): ResolvedSeams {
 }
 /* v8 ignore stop */
 
+/**
+ * The writer this call should use.
+ *
+ * Its own function rather than only a {@link resolveSeams} field because
+ * {@link runHistoryImport} and {@link importDashboardHistory} print without ever
+ * resolving the process/network seams — they have no server to reach.
+ */
+function outputOf(deps: DashboardDeps): DashboardOutput {
+	return deps.output ?? CONSOLE_OUTPUT;
+}
+
 /** {@link DashboardDeps} with every optional seam filled in. */
 interface ResolvedSeams {
 	readonly configDir: string;
+	readonly output: DashboardOutput;
 	readonly spawnServer: (port: number | undefined, cwd: string) => void;
 	readonly openBrowser: (url: string) => Promise<void>;
 	readonly fetchHealth: (port: number) => Promise<{ ok: boolean; pid?: number }>;
@@ -349,13 +424,13 @@ async function stopServer(deps: DashboardDeps): Promise<void> {
 	const seams = resolveSeams(deps);
 	const state = await readDashboardState(seams.configDir);
 	if (!state) {
-		console.log("\n  The dashboard server is not running.\n");
+		seams.output.log("\n  The dashboard server is not running.\n");
 		return;
 	}
 	const live = await isRecordedServerLive(state, seams);
 	const killed = live && seams.killPid(state.pid);
 	await clearDashboardState(seams.configDir, state.pid);
-	console.log(
+	seams.output.log(
 		killed
 			? `\n  Dashboard server stopped (pid ${state.pid}).\n`
 			: "\n  The dashboard server had already exited — cleared its stale record.\n",
@@ -389,6 +464,7 @@ const MIGRATION_HEADER = "\n  Migrating your memories to the Jolli Memory databa
 const HISTORY_HEADER = "\n  Indexing your git history…";
 
 async function runHistoryImport(deps: DashboardDeps): Promise<void> {
+	const output = outputOf(deps);
 	try {
 		const repos = await listActiveRepos(deps.configDir);
 		// Zero registered repos stays completely silent, header included: there is
@@ -405,7 +481,7 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 		// re-migrated on every launch. The header is therefore chosen at reveal time
 		// by the tier that had work, not written up front. The closing ✓ line is the
 		// honest report and prints either way.
-		const out = createDeferredWriter();
+		const out = createDeferredWriter(output.log);
 		const printer = createProgressPrinter({ log: out.write });
 		const results = await dbBackfillRepos(repos, {
 			...(deps.dbPath ? { dbPath: deps.dbPath } : {}),
@@ -463,7 +539,7 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 			const distinct = [...new Set(missing.map((r) => r.repoName))];
 			const sample = distinct.slice(0, 3).join(", ");
 			const rest = distinct.length > 3 ? `, +${distinct.length - 3} more` : "";
-			console.log(
+			output.log(
 				`\n  ⚠ Skipped ${missing.length} repo(s) with no checkout on disk (${sample}${rest})` +
 					" — deleted, or on a drive that is not mounted. Still registered; they resume on their own.",
 			);
@@ -477,7 +553,7 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 		// A repo that threw used to reach `log.error` and nothing else, so on
 		// screen it was indistinguishable from a repo with nothing to do.
 		for (const failed of worked.filter((r) => r.mode === "skipped")) {
-			console.log(`  ⚠ ${failed.repoName} — migration failed: ${failed.error ?? "unknown error"}`);
+			output.log(`  ⚠ ${failed.repoName} — migration failed: ${failed.error ?? "unknown error"}`);
 		}
 		// Report what actually happened, not what was re-projected. A steady-state
 		// recovery pass still applies events — sessions and worktree state are
@@ -495,15 +571,15 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 			// Something landed, so the progress that produced it belongs on screen —
 			// including the runs too fast to have tripped the elapsed-time reveal.
 			out.reveal(MIGRATION_HEADER);
-			console.log(`  ✓ Migrated ${migrated} ${migrated === 1 ? "memory" : "memories"}${across}.\n`);
+			output.log(`  ✓ Migrated ${migrated} ${migrated === 1 ? "memory" : "memories"}${across}.\n`);
 		} else {
 			// Previously this branch printed NOTHING, which is the bug that started
 			// all this: a converged re-run looked identical to a run that never
 			// happened.
-			console.log(`  ✓ All ${migrated} ${migrated === 1 ? "memory" : "memories"} already migrated.\n`);
+			output.log(`  ✓ All ${migrated} ${migrated === 1 ? "memory" : "memories"} already migrated.\n`);
 		}
 	} catch (err) {
-		console.error(`  Warning: memory migration failed: ${errMsg(err)}\n`);
+		output.error(`  Warning: memory migration failed: ${errMsg(err)}\n`);
 	}
 }
 
@@ -526,7 +602,7 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
  * Ordering survives the delay: held lines flush in the order they were written,
  * ahead of anything printed after the reveal.
  */
-export function createDeferredWriter(): {
+export function createDeferredWriter(write?: (line: string) => void): {
 	/** Print if revealed, otherwise hold. */
 	readonly write: (line: string) => void;
 	/**
@@ -540,17 +616,18 @@ export function createDeferredWriter(): {
 	readonly reveal: (header?: string) => void;
 } {
 	const held: string[] = [];
+	const emit = write ?? CONSOLE_OUTPUT.log;
 	let revealed = false;
 	return {
 		write: (line: string): void => {
-			if (revealed) console.log(line);
+			if (revealed) emit(line);
 			else held.push(line);
 		},
 		reveal: (header?: string): void => {
 			if (revealed) return;
 			revealed = true;
-			if (header) console.log(header);
-			for (const line of held) console.log(line);
+			if (header) emit(header);
+			for (const line of held) emit(line);
 			held.length = 0;
 		},
 	};
@@ -569,7 +646,7 @@ export function createDeferredWriter(): {
 export function createProgressPrinter(deps: { readonly log?: (line: string) => void } = {}): {
 	onProgress: (progress: DbBackfillProgress) => void;
 } {
-	const write = deps.log ?? ((line: string) => console.log(line));
+	const write = deps.log ?? CONSOLE_OUTPUT.log;
 	let lastQuarter = 0;
 	let lastCommitQuarter = 0;
 	let warnedSlow = false;
@@ -722,18 +799,29 @@ export async function importDashboardHistory(cwd: string, deps: DashboardDeps = 
  * which Dashboard child the browser opens (`/dashboard` or
  * `/dashboard/standup`) — the retired `jolli stats` / `jolli standup` aliases
  * were the only thing that made a second value reachable from the CLI.
+ *
+ * A repo the user has disabled still gets the page — the dashboard is a
+ * machine-level view of every registered repo, so one repo's opt-out is no
+ * reason to withhold the others' data — but none of this command's writes to
+ * THAT repo run. See the `repoDisabled` gate below for which writes those are
+ * and why the machine-scoped ones stay.
  */
 export async function executeDashboard(
 	page: "stats" | "standup",
 	options: DashboardOptions,
 	deps: DashboardDeps = {},
 ): Promise<boolean> {
+	// Resolved ahead of the runtime gate below, not with the rest of the seams:
+	// the first two failure branches print before there is any reason to resolve
+	// a spawner or a browser opener, and those two messages are the ones a GUI
+	// host most needs to be able to show.
+	const output = outputOf(deps);
 	if (options.stop) {
 		await stopServer(deps);
 		return true;
 	}
 	if (!canUseDashboardDb()) {
-		console.error(
+		output.error(
 			`\n  Error: the dashboard needs Node >= ${DASHBOARD_SQLITE_MIN_VERSION.major}.${DASHBOARD_SQLITE_MIN_VERSION.minor}` +
 				` for built-in SQLite (running ${process.versions.node}).\n`,
 		);
@@ -750,24 +838,55 @@ export async function executeDashboard(
 	try {
 		await ensureDashboardDbExists(deps.dbPath ? { dbPath: deps.dbPath } : {});
 	} catch (err) {
-		console.error(`\n  Error: could not create the dashboard database: ${errMsg(err)}\n`);
+		output.error(`\n  Error: could not create the dashboard database: ${errMsg(err)}\n`);
 		return false;
 	}
 
 	const cwd = options.cwd ?? process.cwd();
 	const seams = resolveSeams(deps);
 
+	// The user's own opt-out for THIS repo, which gates this command's two writes
+	// to it (registration below, the cutover attempt at the end) and nothing else.
+	// The page still opens: the dashboard is machine-level — it aggregates every
+	// registered repo — so being launched from a repo the user turned off is no
+	// reason to withhold the other repos' data. The machine-scoped work stays too:
+	// `ensureDashboardDbExists` above and `opportunisticSnapshot` below belong to
+	// the database, not to `cwd`, and gating them on one repo's switch would mean
+	// a disabled repo silently stops the machine's backups.
+	//
+	// The read-only SYNC reader on purpose. `readManualDisableFlag` migrates a
+	// legacy marker and PERSISTS the decision, and a question asked on the way to
+	// opening a page has no business writing a profile — the same call, for the
+	// same reason, that `SkillAutoRefresh` makes.
+	const repoDisabled = readManualDisableFlagSync(cwd);
+	if (repoDisabled) {
+		// `notice`, not `log`: this line is the ONLY explanation the user gets for
+		// a dashboard that opened successfully with their repo missing from it.
+		// Nothing else reports it — the command returns success — so a host whose
+		// `log` goes to an unread channel has to put this somewhere else.
+		output.notice("\n  Jolli Memory is disabled here — opening the dashboard without adding this repo to it.\n");
+	}
+
 	// Register the current repo when we are inside one; outside a repo the
 	// dashboard still opens with whatever repos are already registered.
-	try {
-		await registerRepo({ cwd, ...(deps.configDir ? { configDir: deps.configDir } : {}) });
-	} catch (err) {
-		log.info("not registering a repo from %s: %s", cwd, errMsg(err));
+	//
+	// Skipped outright for a disabled repo, because `registerRepo` REBUILDS the
+	// entry and so clears `disabledAt` — the flag `jolli disable` sets through
+	// `deregisterRepo`, and the one `listActiveRepos` filters on. Opening a page
+	// is not an explicit re-enable, so letting it land here would silently undo
+	// the disable and put the repo back into every later history import.
+	// `ensureWorktreeListed` exists for exactly this distinction; see its header.
+	if (!repoDisabled) {
+		try {
+			await registerRepo({ cwd, ...(deps.configDir ? { configDir: deps.configDir } : {}) });
+		} catch (err) {
+			log.info("not registering a repo from %s: %s", cwd, errMsg(err));
+		}
 	}
 
 	const port = options.port !== undefined ? Number.parseInt(options.port, 10) : undefined;
 	if (port !== undefined && (!Number.isFinite(port) || port <= 0 || port > 65535)) {
-		console.error(`\n  Error: invalid --port value: ${options.port}\n`);
+		output.error(`\n  Error: invalid --port value: ${options.port}\n`);
 		return false;
 	}
 
@@ -778,7 +897,7 @@ export async function executeDashboard(
 	try {
 		state = await ensureServerRunning(port, { ...deps, configDir: seams.configDir, cwd: serverCwd });
 	} catch (err) {
-		console.error(`\n  Error: ${errMsg(err)}\n`);
+		output.error(`\n  Error: ${errMsg(err)}\n`);
 		return false;
 	}
 
@@ -793,8 +912,8 @@ export async function executeDashboard(
 			log.warn("could not open the browser (non-fatal): %s", errMsg(err));
 		}
 	}
-	console.log(`\n  Jolli dashboard → ${url}`);
-	console.log("  Reopen anytime with `jolli dashboard`; stop with `jolli dashboard --stop`.\n");
+	output.log(`\n  Jolli dashboard → ${url}`);
+	output.log("  Reopen anytime with `jolli dashboard`; stop with `jolli dashboard --stop`.\n");
 
 	// Write side last: the page is already up and polling, so history fills in
 	// as this lands. Runs in this command process — the server never writes.
@@ -812,7 +931,15 @@ export async function executeDashboard(
 	// reopen fills nothing in, and the engine's compare reads every file the
 	// frozen tip lists. Unthrottled, a repo that keeps answering `not-ready` would
 	// pay that sweep on every launch. Reports nothing and cannot throw.
-	await maybeAutoCutover(cwd, { throttle: true, ...(deps.dbPath ? { dbPath: deps.dbPath } : {}) });
+	//
+	// Skipped for a disabled repo, and this is the write that matters most: it
+	// stamps `cutoverAttemptedAtMs` into that repo's profile and, when the compare
+	// passes, FREEZES its orphan branch — a fence `jolli enable` is forbidden to
+	// clear (only `doctor`'s manual path may). Opening a page must not be able to
+	// leave that behind in a repo the user switched off.
+	if (!repoDisabled) {
+		await maybeAutoCutover(cwd, { throttle: true, ...(deps.dbPath ? { dbPath: deps.dbPath } : {}) });
+	}
 	// The "dashboard start" half of the no-daemon backup schedule (the other is
 	// the post-commit QueueWorker). It belongs here, not in the server: taking a
 	// snapshot needs a WRITABLE handle, which runs schema migrations, and the

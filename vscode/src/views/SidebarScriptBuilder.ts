@@ -4448,13 +4448,17 @@ export function buildSidebarScript(): string {
       className: 'cmd-btn', 'data-action': 'footer-create-pr', 'aria-label': 'Create PR',
     }, [el('i', { className: 'codicon codicon-git-pull-request' }), el('span', { text: 'Create PR' })]);
     if (prDisabled) prBtn.disabled = true;
-    var shareBtn = el('button', {
-      className: 'cmd-btn', 'data-action': 'footer-share', 'aria-label': 'Share',
-    }, [el('i', { className: 'codicon codicon-export' }), el('span', { text: 'Share' })]);
+    // Dashboard took the slot Share used to hold (JOLLI-2172); Share moved into
+    // the overflow menu below. Never disabled: the dashboard opens with whatever
+    // the machine-level database already holds, so an empty branch is not a
+    // reason to withhold it — unlike Create PR, which needs commits to describe.
+    var dashboardBtn = el('button', {
+      className: 'cmd-btn', 'data-action': 'footer-dashboard', 'aria-label': 'Dashboard',
+    }, [el('i', { className: 'codicon codicon-dashboard' }), el('span', { text: 'Dashboard' })]);
     var moreBtn = el('button', {
       className: 'cmd-btn aa-more', 'data-action': 'footer-more', 'aria-label': 'More branch actions',
     }, [el('i', { className: 'codicon codicon-ellipsis' })]);
-    return el('div', { className: 'branch-footer' }, [prBtn, shareBtn, moreBtn]);
+    return el('div', { className: 'branch-footer' }, [prBtn, dashboardBtn, moreBtn]);
   }
 
   function renderSectionActions(sectionId) {
@@ -5631,11 +5635,12 @@ export function buildSidebarScript(): string {
       vscode.postMessage({ type: 'command', command: 'jollimemory.createPrForBranch' });
       e.stopPropagation(); return;
     }
-    var footerShare = e.target.closest('.cmd-btn[data-action="footer-share"]');
-    if (footerShare) {
-      // Opens the newest branch memory's panel with the "Share this branch"
-      // modal — the modal lives in the summary panel's webview, not here.
-      vscode.postMessage({ type: 'command', command: 'jollimemory.shareBranch' });
+    var footerDashboard = e.target.closest('.cmd-btn[data-action="footer-dashboard"]');
+    if (footerDashboard) {
+      // Starts (or reuses) the local dashboard server and opens the browser.
+      // Everything about that decision lives in the CLI's executeDashboard —
+      // see services/DashboardLauncher.ts for the host-side plugs.
+      vscode.postMessage({ type: 'command', command: 'jollimemory.openDashboard' });
       e.stopPropagation(); return;
     }
     var footerMore = e.target.closest('.cmd-btn[data-action="footer-more"]');
@@ -5643,7 +5648,13 @@ export function buildSidebarScript(): string {
       var r = footerMore.getBoundingClientRect();
       // Open upward: showContextMenu clamps to viewport, so passing the button top
       // lets the menu sit above the footer rather than off-screen below it.
+      //
+      // Share leads the menu because it used to be a toolbar button (JOLLI-2172)
+      // — demoting an action is not a reason to bury it under the recall items.
+      // It opens the newest branch memory's panel with the "Share this branch"
+      // modal; that modal lives in the summary panel's webview, not here.
       showContextMenu(r.left, Math.max(0, r.top - 4), [
+        { label: 'Share branch', command: 'jollimemory.shareBranch', args: [] },
         { label: 'Recall in Claude Code', command: 'jollimemory.recallBranchInClaudeCode', args: [] },
         { label: 'Copy recall prompt for other tools', command: 'jollimemory.copyBranchRecallPrompt', args: [] },
       ]);

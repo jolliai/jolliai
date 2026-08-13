@@ -2085,8 +2085,10 @@ export function buildSidebarCss(): string {
   /* Commit Memory leads — the primary gets a bit more width than Review. */
   .commit-review-bar .cmd-btn { flex: 1 1 auto; }
   .commit-review-bar .cmd-btn.primary { flex-grow: 1.7; }
-  /* flex:1 — footer action buttons (Create PR / Share) share the bar's width
+  /* flex:1 — footer action buttons (Create PR / Dashboard) share the bar's width
      equally; min-width:0 + ellipsis lets labels truncate on a narrow sidebar.
+     "Dashboard" is the longest label the bar has carried, so that truncation is
+     what keeps it inside the button rather than overflowing it.
      The overflow (...) button hugs its glyph (flex:0 0 auto). */
   .branch-footer .cmd-btn { flex: 1; min-width: 0; }
   .branch-footer .cmd-btn.aa-more { flex: 0 0 auto; }

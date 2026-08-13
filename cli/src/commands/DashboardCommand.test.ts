@@ -39,7 +39,16 @@ vi.mock("../dashboard/DashboardDb.js", async (importOriginal) => {
 	const original = await importOriginal<typeof import("../dashboard/DashboardDb.js")>();
 	return { ...original, canUseDashboardDb: vi.fn(() => true) };
 });
+// The launcher asks whether THIS repo is disabled before writing anything to it.
+// Unmocked that reads the real repo this suite runs in (several cases pass no
+// `cwd`), so the answer would depend on the developer's own machine. Partial, so
+// everything else RepoProfile exports keeps working for unmocked consumers.
+vi.mock("../core/RepoProfile.js", async (importOriginal) => {
+	const original = await importOriginal<typeof import("../core/RepoProfile.js")>();
+	return { ...original, readManualDisableFlagSync: vi.fn(() => false) };
+});
 
+import { readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
@@ -104,6 +113,9 @@ beforeEach(() => {
 	});
 	vi.mocked(dbBackfillRepos).mockResolvedValue([{ mode: "bootstrapped", eventsApplied: 3, repoName: "jolli" }]);
 	vi.mocked(listActiveRepos).mockResolvedValue([]);
+	// Enabled unless a case says otherwise. Re-armed here for the same reason as
+	// the others: `clearMocks` drops the factory's implementation.
+	vi.mocked(readManualDisableFlagSync).mockReturnValue(false);
 	vi.spyOn(console, "log").mockImplementation(() => {});
 	vi.spyOn(console, "error").mockImplementation(() => {});
 	process.exitCode = undefined;
@@ -416,6 +428,36 @@ describe("executeDashboard", () => {
 		const d = deps({ fetchHealth: async () => ({ ok: false }) });
 		await expect(executeDashboard("stats", {}, d)).resolves.toBe(false);
 		expect(maybeAutoCutover).not.toHaveBeenCalled();
+	});
+
+	it("opens the dashboard for a disabled repo but writes nothing to that repo", async () => {
+		vi.mocked(readManualDisableFlagSync).mockReturnValueOnce(true);
+		const d = deps();
+		await expect(executeDashboard("stats", { cwd: "/w" }, d)).resolves.toBe(true);
+		// The page is machine-level, so it still opens with the other repos' data.
+		expect(d.opened).toHaveLength(1);
+		// `registerRepo` rebuilds the entry and would clear the `disabledAt` that
+		// `jolli disable` set — a page open is not an explicit re-enable.
+		expect(registerRepo).not.toHaveBeenCalled();
+		// And the fence this would leave behind is one `jolli enable` may not clear.
+		expect(maybeAutoCutover).not.toHaveBeenCalled();
+	});
+
+	it("still takes the machine snapshot when the launching repo is disabled", async () => {
+		// The backup belongs to the database, not to `cwd`: one repo's opt-out must
+		// not silently stop the machine's backups.
+		vi.mocked(readManualDisableFlagSync).mockReturnValueOnce(true);
+		await executeDashboard("stats", { cwd: "/w" }, deps());
+		expect(opportunisticSnapshot).toHaveBeenCalledTimes(1);
+	});
+
+	it("tells the user why their repo is missing from the dashboard", async () => {
+		vi.mocked(readManualDisableFlagSync).mockReturnValueOnce(true);
+		await executeDashboard("stats", { cwd: "/w" }, deps());
+		// `log.info` is suppressed in the terminal by design, so this has to be said
+		// on the output the user actually sees.
+		const printed = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+		expect(printed.some((line) => line.includes("disabled here"))).toBe(true);
 	});
 
 	it("takes the daily snapshot here, not in the read-only server process", async () => {

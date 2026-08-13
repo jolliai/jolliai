@@ -272,6 +272,11 @@
 				"command": "jollimemory.shareMemory",
 				"title": "Jolli Memory: Share Memory",
 				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.openDashboard",
+				"title": "Open Dashboard",
+				"category": "Jolli Memory"
 			}
 		],
 		"menus": {

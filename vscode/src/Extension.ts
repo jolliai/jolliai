@@ -125,6 +125,7 @@ import { StatusTreeProvider } from "./providers/StatusTreeProvider.js";
 import { ActiveSessionsProvider } from "./services/ActiveSessionsProvider.js";
 import { AuthService } from "./services/AuthService.js";
 import { readBackfillDismissFlag, writeBackfillDismissFlag } from "./services/BackfillDismissFlag.js";
+import { launchDashboard } from "./services/DashboardLauncher.js";
 import { KbFoldersService } from "./services/KbFoldersService.js";
 import {
 	readManualDisableFlag,
@@ -373,6 +374,7 @@ const ALL_DECLARED_COMMANDS: ReadonlyArray<string> = [
 	"jollimemory.reviewNextMemory",
 	"jollimemory.shareBranch",
 	"jollimemory.shareMemory",
+	"jollimemory.openDashboard",
 ];
 
 /**
@@ -4225,6 +4227,20 @@ export function activate(context: vscode.ExtensionContext): void {
 				await vscode.env.openExternal(uri);
 			},
 		),
+
+		// Dashboard — the branch footer button. Everything about starting the
+		// server lives in the CLI's `executeDashboard`; DashboardLauncher only
+		// supplies the editor-shaped plugs (output channel, Electron-as-node
+		// spawner, host URL opener) and the remote-window gate.
+		vscode.commands.registerCommand("jollimemory.openDashboard", () => {
+			log.info("cmd", "openDashboard invoked");
+			// Not awaited: launchDashboard resolves when the startup phase settles
+			// and reports its own failures, so there is nothing here to wait for.
+			void launchDashboard({
+				cwd: workspaceRoot,
+				distDir: join(context.extensionPath, "dist"),
+			});
+		}),
 
 		// Settings — accessible via the gear icon in the STATUS panel title bar.
 		vscode.commands.registerCommand("jollimemory.openSettings", () => {

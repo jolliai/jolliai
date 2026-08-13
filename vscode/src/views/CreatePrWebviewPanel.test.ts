@@ -552,6 +552,77 @@ describe("CreatePrWebviewPanel", () => {
 		);
 	});
 
+	it("renders the closed/merged PR history strip when the branch has one", async () => {
+		// The initial lookup returns both halves; the history one only feeds the
+		// "Previously: …" strip, which stays absent when the list is empty (every
+		// other case here) — so this is the only place the populated arm runs.
+		const { findPrWithHistoryForBranch } = await import("../services/PrCommentService.js");
+		vi.mocked(findPrWithHistoryForBranch).mockResolvedValueOnce({
+			existingPr: undefined,
+			history: [{ number: 4, url: "https://gh/pr/4", state: "MERGED" }],
+		});
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
+		expect(created[0].webview.html).toContain("Previously:");
+		expect(created[0].webview.html).toContain("#4 (merged)");
+	});
+
+	it("post-submit rebuild failure (Error): logs it and keeps the previous view model", async () => {
+		const logMod = await import("../util/Logger.js");
+		// First build is show()'s; the post-submit rebuild throws. The pane must
+		// stay on the already-rendered draft rather than blanking — the PR is live.
+		mocks.buildCreatePrViewModel
+			.mockResolvedValueOnce({
+				branch: "feature/x", mainBranch: "main", memoryCount: 1, missingCount: 0,
+				insertions: 1, deletions: 0, filesChanged: 1, title: "feat: x", bodyMarkdown: "B",
+				memories: [{ hash: "h", title: "t" }], files: [], e2eScenarios: [],
+			})
+			.mockRejectedValueOnce(new Error("rebuild boom"));
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		created[0].onMsg({ command: "createPr" });
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
+			"CreatePrPanel",
+			expect.stringContaining("rebuild boom"),
+		);
+		expect(created[0].webview.html).toContain("Create Pull Request");
+	});
+
+	it("post-submit rebuild failure (non-Error): stringifies the reason", async () => {
+		const logMod = await import("../util/Logger.js");
+		mocks.buildCreatePrViewModel
+			.mockResolvedValueOnce({
+				branch: "feature/x", mainBranch: "main", memoryCount: 1, missingCount: 0,
+				insertions: 1, deletions: 0, filesChanged: 1, title: "feat: x", bodyMarkdown: "B",
+				memories: [{ hash: "h", title: "t" }], files: [], e2eScenarios: [],
+			})
+			.mockRejectedValueOnce("rebuild string boom");
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		created[0].onMsg({ command: "createPr" });
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
+			"CreatePrPanel",
+			expect.stringContaining("rebuild string boom"),
+		);
+	});
+
+	it("post-submit rebuild that comes back empty keeps the previous view model", async () => {
+		// The branch's memories can be gone by the time the rebuild runs (a
+		// concurrent merge). An "empty" result carries no fields to render from, so
+		// it is ignored rather than rendered as a blank pane.
+		mocks.buildCreatePrViewModel
+			.mockResolvedValueOnce({
+				branch: "feature/x", mainBranch: "main", memoryCount: 1, missingCount: 0,
+				insertions: 1, deletions: 0, filesChanged: 1, title: "feat: x", bodyMarkdown: "KEEP-ME",
+				memories: [{ hash: "h", title: "t" }], files: [], e2eScenarios: [],
+			})
+			.mockResolvedValueOnce({ empty: true });
+		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, "/repo", bridge, "main");
+		created[0].onMsg({ command: "createPr" });
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect(created[0].webview.html).toContain("KEEP-ME");
+		expect(created[0].webview.postMessage).toHaveBeenCalledWith({ command: "prComplete" });
+	});
+
 	it("openPr: opens the PR url externally", async () => {
 		const vscode = await import("vscode");
 		await CreatePrWebviewPanel.show({ fsPath: "/ext" } as never, resolve("/repo"), bridge, "main");
@@ -991,6 +1062,53 @@ describe("push memories to Space after a successful submit", () => {
 		await flush();
 		expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
 			expect.stringContaining("Shared 1 memory to your Jolli Space"),
+		);
+	});
+
+	it("reports a per-repo sharing opt-out as information, not as a failure", async () => {
+		const vscode = await import("vscode");
+		const { PushDisabledError } = await import("../services/JolliPushService.js");
+		// The user turned sharing off for this repo: the PR is created and the
+		// memories stay recorded locally, so a "sharing failed" warning would
+		// misrepresent their own choice as an error.
+		mocks.pushBranchMemories.mockRejectedValue(new PushDisabledError("Sharing is disabled for this repo."));
+		await CreatePrWebviewPanel.show(uri, "/repo", bridge, "main", true);
+		await created[0].onMsg({ command: "createPr" });
+		await flush();
+		expect(vscode.window.showInformationMessage).toHaveBeenCalledWith("Sharing is disabled for this repo.");
+		expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+		expect(vscode.window.showErrorMessage).not.toHaveBeenCalled();
+	});
+
+	it("an unexpected throw before the push's own try still settles the panel", async () => {
+		const vscode = await import("vscode");
+		const logMod = await import("../util/Logger.js");
+		// loadGlobalConfig runs before pushMemoriesToSpace's inner try, so a failure
+		// there escapes past its own error handling. The PR is already live — the
+		// panel must surface it and carry on, or the buttons stay disabled forever.
+		mocks.loadGlobalConfig.mockRejectedValue(new Error("config unreadable"));
+		await CreatePrWebviewPanel.show(uri, "/repo", bridge, "main", true);
+		await created[0].onMsg({ command: "createPr" });
+		await flush();
+		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
+			"CreatePrPanel",
+			expect.stringContaining("config unreadable"),
+		);
+		expect(vscode.window.showWarningMessage).toHaveBeenCalledWith(
+			"PR is ready, but sharing memories to Jolli Space failed.",
+		);
+		expect(created[0].webview.postMessage).toHaveBeenCalledWith({ command: "prComplete" });
+	});
+
+	it("an unexpected non-Error throw before the push's own try is stringified", async () => {
+		const logMod = await import("../util/Logger.js");
+		mocks.loadGlobalConfig.mockRejectedValue("config exploded");
+		await CreatePrWebviewPanel.show(uri, "/repo", bridge, "main", true);
+		await created[0].onMsg({ command: "createPr" });
+		await flush();
+		expect((logMod.log.warn as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
+			"CreatePrPanel",
+			expect.stringContaining("config exploded"),
 		);
 	});
 

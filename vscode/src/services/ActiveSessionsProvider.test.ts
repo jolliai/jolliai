@@ -266,6 +266,41 @@ describe("ActiveSessionsProvider", () => {
 		]);
 	});
 
+	it("omits the title key entirely for a session the aggregator could not name", async () => {
+		// The aggregator falls back to an empty title when a transcript carries no
+		// usable first message. Forwarding `title: ""` would overwrite a better
+		// name a previous tick already stored, so the key is dropped instead of
+		// being sent blank.
+		const items = [
+			{
+				sessionId: "untitled1",
+				source: "codex" as const,
+				title: "",
+				messageCount: 1,
+				updatedAt: "2026-07-30T09:00:00Z",
+				transcriptPath: "/t2.jsonl",
+				isEdited: false,
+				isSelected: true,
+			},
+		];
+		vi.mocked(listActiveConversationsWithDiagnostics).mockResolvedValueOnce({
+			items,
+			failedSources: [],
+		});
+
+		const p = new ActiveSessionsProvider({ getWorkspaceCwd: () => "/proj" });
+		await p.listWithDiagnostics();
+
+		expect(recordSessionsFromTick).toHaveBeenCalledWith("/proj", [
+			{
+				sessionId: "untitled1",
+				transcriptPath: "/t2.jsonl",
+				updatedAt: "2026-07-30T09:00:00Z",
+				source: "codex",
+			},
+		]);
+	});
+
 	it("prefers an injected dashboard writer seam over the default", async () => {
 		vi.mocked(listActiveConversationsWithDiagnostics).mockResolvedValueOnce({
 			items: [],

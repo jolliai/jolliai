@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { createWebviewPanel, postMessage } = vi.hoisted(() => {
 	const postMessage = vi.fn();
@@ -33,9 +33,13 @@ vi.mock("vscode", () => ({
 	Uri: { joinPath: (...parts: unknown[]) => parts.join("/") },
 }));
 
-const { assessMock, detectPlansMock, writeAiMock } = vi.hoisted(() => ({
+const { assessMock, detectPlansMock, detectNotesMock, detectRefsMock, writeAiMock } = vi.hoisted(() => ({
 	assessMock: vi.fn(),
 	detectPlansMock: vi.fn(),
+	// Notes and references default to empty so the pre-existing cases keep
+	// ranking plans alone; the mixed-kind case below opts in.
+	detectNotesMock: vi.fn().mockResolvedValue([]),
+	detectRefsMock: vi.fn().mockResolvedValue([]),
 	writeAiMock: vi.fn(),
 }));
 vi.mock("../../../cli/src/core/ContextRelevance.js", () => ({
@@ -49,8 +53,8 @@ vi.mock("../../../cli/src/core/ContextRelevance.js", () => ({
 vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
 	loadConfig: vi.fn().mockResolvedValue({}),
 	detectActivePlansForBranch: detectPlansMock,
-	detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
-	getReferenceEntriesForBranch: vi.fn().mockResolvedValue([]),
+	detectActiveNotesForBranch: detectNotesMock,
+	getReferenceEntriesForBranch: detectRefsMock,
 }));
 vi.mock("../../../cli/src/core/CommitSelectionStore.js", () => ({
 	readExclusions: vi.fn().mockResolvedValue({
@@ -628,6 +632,46 @@ describe("NextMemoryPreviewPanel — context relevance overlay", () => {
 		]);
 	});
 
+	it("ranks plans, notes and references together and persists each under its registry name", async () => {
+		// The three registries are read and filtered independently, and each
+		// verdict is written back under the plural key the post-commit worker
+		// reads. A ranking that only ever saw plans would leave the note and
+		// reference arms of that mapping unexercised.
+		detectPlansMock.mockResolvedValue([{ slug: "p1", title: "P1" }]);
+		detectNotesMock.mockResolvedValue([{ id: "n1", title: "N1" }]);
+		detectRefsMock.mockResolvedValue([{ source: "linear", nativeId: "JOLLI-1", title: "R1" }]);
+		writeAiMock.mockClear();
+		assessMock.mockResolvedValue({
+			plans: [],
+			notes: [],
+			references: [],
+			excludedContext: [],
+			results: [
+				{ id: "p1", kind: "plan", relevant: true, score: 0.9, tier: "high", reason: "same module", rank: 1, autoExclude: false },
+				{ id: "n1", kind: "note", relevant: true, score: 0.6, tier: "mid", reason: "background", rank: 2, autoExclude: false },
+				{ id: "linear:JOLLI-1", kind: "reference", relevant: true, score: 0.8, tier: "high", reason: "the ticket", rank: 3, autoExclude: false },
+			],
+		});
+		const sidebar = makeSidebarProvider({
+			getFilesSnapshot: vi.fn().mockReturnValue([{ id: "f1", description: "src/a.ts", isSelected: true }]),
+		});
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() => expect(writeAiMock).toHaveBeenCalled());
+
+		expect(writeAiMock).toHaveBeenCalledWith(
+			"/repo",
+			[
+				{ kind: "plans", key: "p1", tier: "high", reason: "same module", excluded: false },
+				{ kind: "notes", key: "n1", tier: "mid", reason: "background", excluded: false },
+				{ kind: "references", key: "linear:JOLLI-1", tier: "high", reason: "the ticket", excluded: false },
+			],
+			"fp",
+		);
+		// Reset so the remaining cases in this suite rank plans alone again.
+		detectNotesMock.mockResolvedValue([]);
+		detectRefsMock.mockResolvedValue([]);
+	});
+
 	it("dismiss updates the cached ranking in place — reopen keeps it dismissed, no re-rank", async () => {
 		postMessage.mockClear();
 		assessMock.mockClear();
@@ -660,5 +704,219 @@ describe("NextMemoryPreviewPanel — context relevance overlay", () => {
 		);
 		expect(assessMock).not.toHaveBeenCalled();
 		expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "context:analyzing", analyzing: true }));
+	});
+});
+
+/**
+ * Superseded rankings.
+ *
+ * Several refreshes can be in flight at once (the `ready` handshake and every
+ * re-show call straight through, file toggles arrive debounced) and the LLM leg
+ * can take seconds. Each one claims a generation on entry and re-checks it at
+ * every await point, so a slow earlier refresh can never clobber a faster later
+ * one's overlay, cache or persisted fingerprint. Each case below pins one of
+ * those checkpoints by suspending the first refresh exactly there.
+ */
+describe("NextMemoryPreviewPanel — superseded refreshes", () => {
+	/** A promise the test settles by hand, to hold a refresh at one await point. */
+	function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason: unknown) => void } {
+		let resolve: (value: T) => void = () => {};
+		let reject: (reason: unknown) => void = () => {};
+		const promise = new Promise<T>((res, rej) => {
+			resolve = res;
+			reject = rej;
+		});
+		return { promise, resolve, reject };
+	}
+
+	/** Lets every pending microtask run, so a released refresh finishes. */
+	const settle = (): Promise<unknown> => new Promise((resolve) => setTimeout(resolve, 0));
+
+	const EMPTY_DECISION = { plans: [], notes: [], references: [], excludedContext: [], results: [] };
+
+	function selectedFilesSidebar() {
+		return makeSidebarProvider({
+			getFilesSnapshot: vi.fn().mockReturnValue([{ id: "f1", description: "src/a.ts", isSelected: true }]),
+		});
+	}
+
+	/**
+	 * Starts a newer refresh so the one already in flight is superseded. Its file
+	 * snapshot is empty, so it claims the new generation and returns immediately —
+	 * without ranking, writing the cache, or competing for the mock the pending
+	 * refresh is suspended on.
+	 */
+	async function supersedeInFlightRefresh(): Promise<void> {
+		await NextMemoryPreviewPanel.show(
+			"file:///ext" as never,
+			"/repo",
+			makeBridge() as never,
+			makeSidebarProvider() as never,
+		);
+	}
+
+	beforeEach(() => {
+		postMessage.mockClear();
+		detectPlansMock.mockReset().mockResolvedValue([{ slug: "p1", title: "P1" }]);
+		detectNotesMock.mockReset().mockResolvedValue([]);
+		detectRefsMock.mockReset().mockResolvedValue([]);
+		assessMock.mockReset().mockResolvedValue(EMPTY_DECISION);
+		writeAiMock.mockReset().mockResolvedValue(undefined);
+	});
+
+	it("stops before the LLM when superseded while reading the CONTEXT registry", async () => {
+		const plansGate = deferred<Array<{ slug: string; title: string }>>();
+		detectPlansMock.mockReturnValueOnce(plansGate.promise);
+		const sidebar = selectedFilesSidebar();
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() => expect(detectPlansMock).toHaveBeenCalled());
+
+		await supersedeInFlightRefresh();
+		plansGate.resolve([{ slug: "p1", title: "P1" }]);
+		await settle();
+
+		// A redundant LLM call is the expensive half of this; posting a stale
+		// overlay would be the wrong half.
+		expect(assessMock).not.toHaveBeenCalled();
+		expect(sidebar.pushContextRelevanceToSidebar).not.toHaveBeenCalled();
+	});
+
+	it("stops before the LLM when superseded while fetching the working-tree diff", async () => {
+		const diffGate = deferred<string>();
+		const bridge = makeBridge({ diffForSelection: vi.fn(() => diffGate.promise) });
+		const sidebar = selectedFilesSidebar();
+		await openAndReady(bridge, sidebar);
+		await vi.waitFor(() => expect(bridge.diffForSelection).toHaveBeenCalled());
+
+		await supersedeInFlightRefresh();
+		diffGate.resolve("+const x = 1;");
+		await settle();
+
+		expect(assessMock).not.toHaveBeenCalled();
+		expect(sidebar.pushContextRelevanceToSidebar).not.toHaveBeenCalled();
+	});
+
+	it("discards a verdict the LLM returned after a newer refresh started", async () => {
+		const rankGate = deferred<typeof EMPTY_DECISION>();
+		assessMock.mockReturnValueOnce(rankGate.promise);
+		const sidebar = selectedFilesSidebar();
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() => expect(assessMock).toHaveBeenCalled());
+
+		await supersedeInFlightRefresh();
+		rankGate.resolve(EMPTY_DECISION);
+		await settle();
+
+		// Nothing is persisted: the fingerprint this verdict belongs to describes a
+		// file set the user has already moved on from.
+		expect(writeAiMock).not.toHaveBeenCalled();
+		expect(NextMemoryPreviewPanel.getRelevanceCacheItems()).toBeUndefined();
+	});
+
+	it("neither caches nor posts a ranking superseded while it was being persisted", async () => {
+		const writeGate = deferred<void>();
+		writeAiMock.mockReturnValueOnce(writeGate.promise);
+		assessMock.mockResolvedValue({
+			...EMPTY_DECISION,
+			results: [
+				{ id: "p1", kind: "plan", relevant: true, score: 0.9, tier: "high", reason: "related", rank: 1, autoExclude: false },
+			],
+		});
+		const sidebar = selectedFilesSidebar();
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() => expect(writeAiMock).toHaveBeenCalled());
+
+		await supersedeInFlightRefresh();
+		writeGate.resolve(undefined);
+		await settle();
+
+		// The persist itself is an await point the earlier staleness checks can't
+		// cover, so this is the one that keeps a slow refresh from replacing a
+		// newer one's overlay after the fact.
+		expect(NextMemoryPreviewPanel.getRelevanceCacheItems()).toBeUndefined();
+		expect(sidebar.pushContextRelevanceToSidebar).not.toHaveBeenCalled();
+	});
+
+	it("does not re-post a cache hit a newer refresh has already superseded", async () => {
+		const plans = [{ slug: "p1", title: "P1" }];
+		const plansGate = deferred<typeof plans>();
+		// The suspended refresh takes the gate; the newer one gets the plans
+		// straight away and ranks the identical candidate set to completion.
+		detectPlansMock.mockReturnValueOnce(plansGate.promise).mockResolvedValue(plans);
+		assessMock.mockResolvedValue({
+			...EMPTY_DECISION,
+			results: [
+				{ id: "p1", kind: "plan", relevant: true, score: 0.9, tier: "high", reason: "related", rank: 1, autoExclude: false },
+			],
+		});
+		const stale = selectedFilesSidebar();
+		await openAndReady(makeBridge(), stale);
+		await vi.waitFor(() => expect(detectPlansMock).toHaveBeenCalled());
+
+		await NextMemoryPreviewPanel.show(
+			"file:///ext" as never,
+			"/repo",
+			makeBridge() as never,
+			selectedFilesSidebar() as never,
+		);
+		await vi.waitFor(() => expect(NextMemoryPreviewPanel.getRelevanceCacheItems()).toBeDefined());
+
+		plansGate.resolve(plans);
+		await settle();
+
+		// Same files, same items → the released refresh hits the cache. The result
+		// is identical, but it is no longer this refresh's to publish.
+		expect(stale.pushContextRelevanceToSidebar).not.toHaveBeenCalled();
+	});
+
+	it("keeps quiet when a superseded ranking fails", async () => {
+		const plansGate = deferred<Array<{ slug: string; title: string }>>();
+		detectPlansMock.mockReturnValueOnce(plansGate.promise);
+		const sidebar = selectedFilesSidebar();
+		await openAndReady(makeBridge(), sidebar);
+		await vi.waitFor(() => expect(detectPlansMock).toHaveBeenCalled());
+
+		await supersedeInFlightRefresh();
+		plansGate.reject(new Error("registry unreadable"));
+		await settle();
+
+		// The empty overlay on screen belongs to the newer refresh; clearing it
+		// again from a stale failure would wipe whatever that one is about to show.
+		expect(sidebar.pushContextRelevanceToSidebar).not.toHaveBeenCalled();
+	});
+
+	it("dismissInRelevanceCache is a no-op before anything has been ranked", () => {
+		NextMemoryPreviewPanel.invalidateRelevanceCache();
+		expect(() => NextMemoryPreviewPanel.dismissInRelevanceCache("p1")).not.toThrow();
+		expect(NextMemoryPreviewPanel.getRelevanceCacheItems()).toBeUndefined();
+	});
+
+	it("dismissInRelevanceCache leaves every other cached item untouched", async () => {
+		detectPlansMock.mockResolvedValue([
+			{ slug: "p1", title: "P1" },
+			{ slug: "p2", title: "P2" },
+		]);
+		assessMock.mockResolvedValue({
+			...EMPTY_DECISION,
+			excludedContext: [
+				{ kind: "plan", key: "p1", title: "P1", reason: "unrelated" },
+				{ kind: "plan", key: "p2", title: "P2", reason: "unrelated" },
+			],
+			results: [
+				{ id: "p1", kind: "plan", relevant: false, score: 0.1, tier: "low", reason: "unrelated", rank: 1, autoExclude: true },
+				{ id: "p2", kind: "plan", relevant: false, score: 0.1, tier: "low", reason: "unrelated", rank: 2, autoExclude: true },
+			],
+		});
+		await openAndReady(makeBridge(), selectedFilesSidebar());
+		await vi.waitFor(() => expect(NextMemoryPreviewPanel.getRelevanceCacheItems()).toHaveLength(2));
+
+		NextMemoryPreviewPanel.dismissInRelevanceCache("p1");
+
+		// A dismiss vetoes one item's exclusion; its neighbour keeps both the
+		// verdict and the strikethrough.
+		expect(NextMemoryPreviewPanel.getRelevanceCacheItems()).toEqual([
+			{ id: "p1", tier: "low", reason: "unrelated", autoExclude: false },
+			{ id: "p2", tier: "low", reason: "unrelated", autoExclude: true },
+		]);
 	});
 });
