@@ -14,6 +14,13 @@ window.JD = window.JD || {};
 	 * page only picks the initial repo (URL `?kb=`, else the first available) and
 	 * the initial theme, then hands off to the frame. `kb` is the Memory Bank
 	 * folder directory name, resolved to a path server-side (never a `repoIdentity`).
+	 *
+	 * One thing flows back the other way: when the user switches repos in the
+	 * frame it `postMessage`s the chosen `kb` here, and we mirror it into this
+	 * page's `/graph?kb=` URL (`replaceState`) so a refresh / bookmark / share
+	 * reopens the same repo. The frame is sandboxed (opaque origin), so we can't
+	 * trust its origin — we accept the message only if its repo key is one of our
+	 * known repos, and it drives nothing but the address bar (no token, no mutation).
 	 */
 
 	function availableRepos(model) {
@@ -48,6 +55,23 @@ window.JD = window.JD || {};
 			'title="Knowledge graph" src="' +
 			src +
 			'"></iframe></section>';
+		syncUrlWithFrame(available);
+	}
+
+	// Mirror the frame's in-iframe repo switch into this page's /graph?kb= URL.
+	// Re-registered per render with the current repo list; the previous handler
+	// is removed so repeated renders don't stack listeners.
+	function syncUrlWithFrame(available) {
+		if (JD._graphRepoHandler) window.removeEventListener("message", JD._graphRepoHandler);
+		JD._graphRepoHandler = function (ev) {
+			var d = ev && ev.data;
+			if (!d || d.type !== "jolli-graph-repo" || typeof d.kb !== "string") return;
+			if (!available.some((r) => r.kb === d.kb)) return;
+			try {
+				window.history.replaceState(null, "", "/graph?kb=" + encodeURIComponent(d.kb));
+			} catch (e) {}
+		};
+		window.addEventListener("message", JD._graphRepoHandler);
 	}
 
 	JD.renderGraph = (model) => render(model);

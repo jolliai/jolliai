@@ -8,8 +8,11 @@
  *      this iframe (no dashboard chrome), so the "which repo" control lives in
  *      the viz topbar as a `<select>`. It self-navigates the iframe to another
  *      repo's `/graph-viewer` (carrying the current theme) — a sandboxed frame
- *      may navigate itself, and keeping repo state in the URL avoids any
- *      parent↔iframe sync.
+ *      may navigate itself. Just before navigating it `postMessage`s the chosen
+ *      repo to the parent so the outer `/graph?kb=` URL tracks the frame's repo
+ *      (refresh / bookmark / share otherwise reopens the previous repo). The
+ *      message is one-way and carries only the repo key — the parent validates
+ *      it against its own repo list, so nothing here trusts the frame.
  *
  *   2. **A light palette.** The viz is dark-only outside a VS Code webview: its
  *      `:root` derives bg/text/borders from `--vscode-*` tokens (dark fallbacks
@@ -63,10 +66,16 @@ const SWITCHER_HEAD =
 	"<style>.jolli-repo-switcher{margin-left:12px;background:var(--card);color:var(--ink);" +
 	"border:1px solid var(--line);border-radius:8px;padding:4px 8px;font:inherit;font-size:13px;cursor:pointer;}</style>";
 
-/** On change, self-navigate the iframe to the chosen repo, preserving the theme. */
+/**
+ * On change: notify the parent of the chosen repo (so it can sync the outer
+ * `/graph?kb=` URL), then self-navigate the iframe to it, preserving the theme.
+ * `postMessage` is queued before navigation, so it reaches the parent even as
+ * this frame unloads; `"*"` target is fine — the payload is a non-secret repo key.
+ */
 const SWITCHER_SCRIPT =
 	'<script>(function(){var s=document.getElementById("jolli-repo-switcher");if(!s)return;' +
 	's.addEventListener("change",function(){var t=new URLSearchParams(location.search).get("theme")||"dark";' +
+	'try{window.parent.postMessage({type:"jolli-graph-repo",kb:s.value},"*");}catch(e){}' +
 	'location.href="/graph-viewer?kb="+encodeURIComponent(s.value)+"&theme="+encodeURIComponent(t);});})();</script>';
 
 /** The viz header's brand block — the anchor the switcher is inserted after. */

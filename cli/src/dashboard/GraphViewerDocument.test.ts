@@ -23,6 +23,9 @@ describe("buildGraphViewerDocument", () => {
 		// is still the real graph viz.
 		expect(html).toContain('location.href="/graph-viewer?kb="');
 		expect(html).toContain("__EMBEDDED_GRAPH__");
+		// It also notifies the parent of the chosen repo (before navigating) so the
+		// outer /graph?kb= URL can track the frame — one-way, repo key only.
+		expect(html).toContain('window.parent.postMessage({type:"jolli-graph-repo",kb:s.value},"*")');
 	});
 
 	it("escapes repo names (text) and kb keys (attribute) in the switcher", () => {
