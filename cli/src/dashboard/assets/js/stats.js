@@ -166,6 +166,18 @@ window.JD = window.JD || {};
 		return day;
 	}
 
+	/* The deep link into one memory's detail pane. Shared by the Memory Activity
+	   row's "Open memory →" and by the Decisions card's title, so a decision and
+	   the row it came from lead to the same place.
+
+	   `detailRepo` names the memory's owning repo without scoping the page it
+	   lands on — see wireTree in memories.js. Whatever scope THIS page carries
+	   rides along through JD.query, so a repo-filtered dashboard still opens a
+	   repo-filtered tree. */
+	function memoryHref(model, commitHash, repoIdentity) {
+		return "/memories" + JD.withParams(JD.query(model, {}), { hash: commitHash, detailRepo: repoIdentity });
+	}
+
 	/* Memory Activity: Branch answers "what landed on this line of work?" while
 	   Time answers "what did I capture lately?". Both views use the same memory
 	   cards already loaded for the feed, so toggling never causes a fetch. */
@@ -187,17 +199,21 @@ window.JD = window.JD || {};
 			if (!byKey[key]) { byKey[key] = { label: key, cards: [] }; groups.push(byKey[key]); }
 			byKey[key].cards.push(card);
 		});
-		/* `detailRepo` names the memory's owning repo without scoping the page it
-		   lands on — see wireTree in memories.js. Whatever scope THIS page carries
-		   rides along through JD.query, so a repo-filtered dashboard still opens a
-		   repo-filtered tree. */
-		var openHref = (card) =>
-			"/memories" +
-			JD.withParams(JD.query(model, {}), { hash: card.commitHash, detailRepo: card.repoIdentity });
+		var openHref = (card) => memoryHref(model, card.commitHash, card.repoIdentity);
 		var row = (card) => {
 			var meta = [];
 			if (card.category) meta.push('<span class="mem-activity-category">' + esc(card.category) + "</span>");
 			if (card.turns != null) meta.push('<span class="tag metric num">' + esc(card.turns) + " turns</span>");
+			/* Counted the way the "N decisions" figure above this list counts (one
+			   per topic that recorded any), not per decision bullet — see
+			   MemoryCard.decisionCount. Absent rather than "0 decisions": every
+			   other item here is conditional, and a row of zeros is noise. */
+			if (card.decisionCount)
+				meta.push(
+					'<span class="tag metric num">' +
+						esc(card.decisionCount) +
+						(card.decisionCount === 1 ? " decision</span>" : " decisions</span>"),
+				);
 			if (card.branch && view === "time") meta.push('<span class="tag mono">' + esc(card.branch) + "</span>");
 			/* The repo tag earns its space only when the page is showing more than
 			   one: under a single-repo scope every row would carry the same name the
@@ -355,13 +371,17 @@ window.JD = window.JD || {};
 		return lines.map((each) => JD.esc(each)).join("&#10;");
 	}
 
-	/* Decisions (span6) — the corpus of decisions itself: kept count, a
-	   cumulative step chart, the latest one verbatim. Distinct from the KPI
-	   sub-line (gone with the KPI strip) and from the feed's per-commit
-	   `decision` line — this is the standalone widget those always implied but
-	   never had. Pairs with the Recall lockedCard below: what got kept, and
-	   whether it came back. Carries no "recalled" figure — see DecisionsCard's
-	   doc comment in DashboardModel.ts. */
+	/* Decisions (span12) — the corpus of decisions itself: kept count, a
+	   cumulative step chart, and the latest one as a single TITLE line.
+	   Distinct from the KPI sub-line (gone with the KPI strip) and from the
+	   feed's per-commit `decision` line — this is the standalone widget those
+	   always implied but never had. Carries no "recalled" figure — see
+	   DecisionsCard's doc comment in DashboardModel.ts.
+
+	   Full width because it is now alone on its row: it was a span6 paired with
+	   the Recall card, and removing that one (JOLLI-2193) left six empty columns
+	   beside it. The step chart stretches to fill them, which is also the only
+	   part of this card that gains anything from the width. */
 	function decisionsCard(model) {
 		var esc = JD.esc;
 		var decisions = model.stats.decisions;
@@ -370,8 +390,11 @@ window.JD = window.JD || {};
 			'<path d="M9 18h6M10 22h4M12 2a6 6 0 0 0-4 10.4c.6.5 1 1.3 1 2.1V16h6v-1.5c0-.8.4-1.6 1-2.1A6 6 0 0 0 12 2Z"/>',
 		);
 		var head =
-			'<section class="card span6" aria-label="Decisions"><div class="card-head">' + icon + "<div><h2>Decisions</h2>" +
-			'<div class="sub">What Jolli decided to keep, and whether it came back</div></div>';
+			'<section class="card span12" aria-label="Decisions"><div class="card-head">' + icon + "<div><h2>Decisions</h2>" +
+			/* "…and whether it came back" until JOLLI-2193: the second half was the
+			   Recall card beside it, and the payload no longer carries a reuse
+			   signal of any kind, so the promise had nothing behind it. */
+			'<div class="sub">What Jolli decided to keep</div></div>';
 
 		if (!decisions) {
 			return (
@@ -425,13 +448,23 @@ window.JD = window.JD || {};
 			h +
 			'" fill="color-mix(in srgb, var(--s1) 12%, transparent)"/></svg></div>';
 
-		if (decisions.latest) {
+		/* Title only (JOLLI-2192), and it opens that memory (JOLLI-2197) — the same
+		   deep link the memory's own row carries, so the decision and the row lead
+		   to one place. An in-page scroll to the row was tried first and reads as a
+		   no-op: the newest decision's commit is usually the newest memory, so the
+		   scroll lands on the row already at the top of the list.
+
+		   Skipped entirely when the title came back empty, which needs a payload
+		   carrying neither a topic title nor a parseable decision line. */
+		if (decisions.latest && decisions.latest.title) {
 			html +=
 				'<div class="dec-quote"><span class="qlab">Latest · ' +
 				esc(decisions.latest.repoName) +
-				"</span>“" +
-				JD.mdInline(esc(decisions.latest.gist || decisions.latest.text)) +
-				"”</div>";
+				'</span><a class="dec-jump" href="' +
+				memoryHref(model, decisions.latest.commitHash, decisions.latest.repoIdentity) +
+				'" target="_blank" rel="noopener"><strong>' +
+				esc(decisions.latest.title) +
+				"</strong></a></div>";
 		}
 
 		/* The footer carried a "kept, not merged" chip beside the repo count. It
@@ -445,223 +478,6 @@ window.JD = window.JD || {};
 			decisions.repoCount +
 			(decisions.repoCount === 1 ? " repo</b>" : " repos</b>") +
 			" in this window</span></div></section>"
-		);
-	}
-
-	/* Recall (span6) — pairs with Decisions: what got kept, and whether it came
-	   back. One row per call, written by the surface that served it (see
-	   RecallUsage), so unlike Skills/MCPs this card carries no coverage caveat:
-	   a `jolli recall` in a plain terminal counts exactly as much as the MCP
-	   tool in a Claude session. The one thing it cannot attribute to a session
-	   is a call made outside any agent — hence the wording of the footnote. */
-	function recallCard(model) {
-		var esc = JD.esc;
-		var usage = model.stats.recallUsage;
-		var icon = widgetIcon("--s2", '<path d="M3 12a9 9 0 1 0 2.6-6.3"/><path d="M3 4v5h5"/>');
-		var head =
-			'<section class="card span6" aria-label="Recall"><div class="card-head">' +
-			icon +
-			"<div><h2>Recall</h2>" +
-			'<div class="sub">What prior memory got pulled back into a session</div></div>';
-
-		var totalCalls = usage.usedCalls + usage.setAsideCalls;
-		var noReceipt = usage.callsWithoutReceipt || 0;
-		/* Receipts only exist from the day they shipped, and nothing can rebuild
-		   them — but the CALL survives in the transcripts, so a window with only
-		   history says "recall ran N times, outcome not recorded" rather than the
-		   empty panel, which read as "recall was never used".
-		   Still no hit rate — that cannot be derived from a call count — but it
-		   DOES now carry the chart. The original "no chart either" was right while
-		   the daily series knew nothing about receipt-less calls; now that the
-		   `jollimemory` reference's own timestamps reach `daily[].estimated`, the
-		   days those calls fell on are real data, and withholding the chart was
-		   the reason a window of pure history looked like the feature was dead. */
-		var hasEstimatedDays = (usage.daily || []).some((d) => d.estimated > 0);
-		if (totalCalls === 0 && noReceipt > 0) {
-			return (
-				head +
-				'<div class="hdr-stat"><b class="num">' +
-				noReceipt +
-				" called</b><span>" +
-				esc(rangeSub(model.stats)) +
-				"</span></div>" +
-				'<div class="spacer"></div></div>' +
-				(hasEstimatedDays
-					? '<div style="margin-top:8px">' +
-						JD.recallBars(usage.daily, usage.receiptsSinceDate) +
-						'<div class="legend" style="margin-top:6px">' +
-						'<span><i style="background:var(--heat-track)"></i>called, outcome not recorded (at least)</span>' +
-						"</div></div>"
-					: "") +
-				'<div class="locked-panel"><p><b>Recall ran ' +
-				noReceipt +
-				"&times; here, but nothing recorded what it returned.</b></p>" +
-				'<p class="why">These calls come from the agent transcripts. Whether each one ' +
-				"served usable context is only recorded from the call itself, which older " +
-				"runs pre-date — newer calls show their hit rate here." +
-				(hasEstimatedDays
-					? " The chart above places them by date, from the one channel that timestamps each call — " +
-						"a repeated query collapses to a single entry there, so each day is a floor, not a count."
-					: "") +
-				(usage.skillInvocations > 0
-					? " The <code>jolli-recall</code> skill ran <b>" + usage.skillInvocations + "</b>&times; in the same window."
-					: "") +
-				(usage.skillRunsWithoutTrace > 0
-					? " <b>" +
-						usage.skillRunsWithoutTrace +
-						"</b> of those left no other trace — the skill's CLI fallback, which older builds recorded nowhere."
-					: "") +
-				"</p></div></section>"
-			);
-		}
-		if (totalCalls === 0) {
-			return (
-				head +
-				'<div class="spacer"></div></div>' +
-				'<div class="locked-panel"><p><b>No recall calls recorded in this window.</b></p>' +
-				'<p class="why">Run <code>jolli recall</code>, or let an agent call the recall tool, ' +
-				"and it shows up here as it happens." +
-				/* "without recalling anything" is only safe to say when nothing
-				   suggests otherwise: a skill run with no trace is just as likely to
-				   have recalled through the CLI fallback and had its receipt land
-				   with no session to attribute it to. */
-				(usage.skillInvocations > 0
-					? usage.skillRunsWithoutTrace > 0
-						? " The <code>jolli-recall</code> skill ran <b>" +
-							usage.skillInvocations +
-							"</b>&times; here, <b>" +
-							usage.skillRunsWithoutTrace +
-							"</b> of them leaving no record of what came back."
-						: " The <code>jolli-recall</code> skill ran <b>" +
-							usage.skillInvocations +
-							"</b>&times; in this window without recalling anything."
-					: "") +
-				"</p></div></section>"
-			);
-		}
-
-		var html =
-			head +
-			'<div class="hdr-stat"><b class="num">' +
-			usage.usedCalls +
-			' used</b><span>' +
-			esc(rangeSub(model.stats)) +
-			"</span></div>" +
-			'<div class="spacer"></div></div>';
-
-		html +=
-			'<div style="display:flex;gap:20px;align-items:flex-start;margin-top:8px;flex-wrap:wrap">' +
-			'<div style="flex:1;min-width:220px">' +
-			JD.recallBars(usage.daily, usage.receiptsSinceDate) +
-			'<div class="legend" style="margin-top:6px">' +
-			'<span><i style="background:var(--accent)"></i>the model used it</span>' +
-			'<span><i style="background:var(--muted)"></i>set aside</span>' +
-			/* Only when the window actually holds such a day: this is the rare
-			   channel (pre-receipt history), and a permanent third legend entry
-			   would suggest every chart has one. */
-			(hasEstimatedDays
-				? '<span><i style="background:var(--heat-track)"></i>outcome not recorded</span>'
-				: "") +
-			"</div></div>" +
-			'<div style="min-width:170px">' +
-			statRows(
-				[
-					["Used", usage.usedCalls],
-					["Context served", usage.contextServedPct + "%"],
-					[
-						"Memories",
-						usage.distinctMemoriesUsed + (usage.staleMemoriesUsed > 0 ? " · " + usage.staleMemoriesUsed + " older than 30d" : ""),
-					],
-				].concat(
-					/* The skill's own row, on the card FACE. It is not a call and must
-					   never move the three figures above — but computing it and then
-					   printing it only inside the ⓘ's `title` attribute was how six
-					   recall rows in the database rendered as "3 used" with nothing
-					   visible to account for the other three. A hover is not a surface.
-					   Suppressed at zero, like every other conditional figure here. */
-					usage.skillInvocations > 0
-						? [
-								[
-									"Skill runs",
-									usage.skillInvocations +
-										(usage.skillRunsWithoutTrace > 0
-											? " · " + usage.skillRunsWithoutTrace + " with no recorded outcome"
-											: ""),
-								],
-							]
-						: [],
-				),
-			) +
-			"</div></div>";
-
-		/* ONE line, which is what the design carries: the coverage ratio and
-		   nothing else. The four `·`-joined clauses this used to print were added
-		   one at a time, each defensible alone, and together they were unreadable
-		   — a reader could not tell which number the caveats even applied to.
-		   They are not deleted, they move to the ⓘ's hover: a caveat that
-		   qualifies a figure belongs next to it, but it does not belong in the
-		   reader's way every time they glance at the card. */
-		var note = "<b>" + usage.sessionsWithContext + "</b> of " + usage.sessionsInWindow + " sessions got prior context";
-
-		/* Plain text, not markup — this becomes a `title` attribute, where tags
-		   would render literally. */
-		var detail = [];
-		if (usage.bySurface.length > 0) {
-			detail.push(
-				usage.bySurface
-					.map((row) => row.calls + " via " + (row.surface === "mcp" ? "the recall tool" : "the CLI"))
-					.join(", "),
-			);
-		}
-		/* Skill invocations sit OUTSIDE the counts above on purpose: a skill run
-		   that goes on to recall already wrote its own receipt, so folding it in
-		   would count that call twice. What it adds is the gap — invoked, never
-		   recalled — which is why it is only worth mentioning when there is one. */
-		if (usage.skillInvocations > usage.usedCalls + usage.setAsideCalls) {
-			detail.push("the jolli-recall skill ran " + usage.skillInvocations + "×, more often than recall was called");
-		}
-		/* The gap's most likely explanation, stated where the gap is stated. */
-		if (usage.skillRunsWithoutTrace > 0) {
-			detail.push(
-				usage.skillRunsWithoutTrace +
-					" skill " +
-					(usage.skillRunsWithoutTrace === 1 ? "run" : "runs") +
-					" left no MCP call and no attributable receipt — typically the CLI fallback on a host that reports no session id",
-			);
-		}
-		/* Mixed window: some calls have receipts, some pre-date them. Kept so the
-		   percentage above is read as covering only the receipted ones. */
-		if (noReceipt > 0) {
-			detail.push(
-				noReceipt +
-					" further " +
-					(noReceipt === 1 ? "call is" : "calls are") +
-					" in the transcripts with no recorded outcome",
-			);
-		}
-		/* Only when there actually IS such a call, counted server-side. Printed
-		   unconditionally, it raised a caveat that did not apply — on a machine
-		   whose every recall carries a session id it described a situation that
-		   cannot occur. The first attempt at a condition tested
-		   `sessionsWithContext === 0`, which reads as "no session claims these
-		   calls" but actually means "not one receipt in the window names a
-		   session" — so the mixed window this caveat is FOR (some calls inside a
-		   session, some at a shell prompt) was precisely the case it stayed
-		   silent for. `callsWithoutSession` is the statement itself. */
-		if (usage.callsWithoutSession > 0) {
-			detail.push(
-				usage.callsWithoutSession +
-					(usage.callsWithoutSession === 1 ? " recall ran" : " recalls ran") +
-					" outside an agent session, counting above but belonging to no session",
-			);
-		}
-		return (
-			html +
-			'<div class="w-foot"><span class="w-measure"' +
-			(detail.length > 0 ? ' title="' + esc(detail.join(" · ")) + '"' : "") +
-			">ⓘ " +
-			note +
-			"</span></div></section>"
 		);
 	}
 
@@ -960,11 +776,14 @@ window.JD = window.JD || {};
 	}
 
 	/* MCP servers (span6). Only some agents' transcripts can be read for tool
-	   calls, so the coverage line is mandatory: without it, "3 sessions" reads
-	   as 3 of everything rather than 3 of the sessions this build can actually
-	   see inside. Each row also names the agents behind it, which is the finer
-	   version of the same honesty — "codegraph · codex" answers a question the
-	   whole-card caveat cannot. Deliberately no "N of M servers called" figure:
+	   calls, which is why the footer says "N of M sessions" rather than a bare
+	   count: "3 sessions" alone reads as 3 of everything rather than 3 of the
+	   sessions this build can actually see inside. Each row also names the
+	   agents behind it, which is the finer version of the same honesty —
+	   "codegraph · codex" answers a question a whole-card caveat cannot, and is
+	   now the only place that honesty is spelled out (the footer's uncovered-
+	   sources clause was trimmed — see the note there). Deliberately no
+	   "N of M servers called" figure:
 	   that needs the full registered-server list, which lives in MCP
 	   registration config, not in captured tool calls; see ToolUsage in
 	   DashboardModel. */
@@ -1483,16 +1302,17 @@ window.JD = window.JD || {};
 		/* Order follows jolli-design's own Dashboard route (confirmed against a
 		   real screenshot of it): the equal-third band (what runs, what's
 		   called, what it cost in tokens) leads, then spend over time, then
-		   decisions/recall, then the feed, then the two lower-priority cards. */
+		   decisions, then the feed, then the two lower-priority cards. Decisions
+		   used to be paired with a Recall card beside it; that card was removed
+		   (JOLLI-2193) along with its whole query path, so Decisions took the
+		   whole row rather than leaving six empty columns. */
 		var html = skillsCard(model);
 		html += mcpCard(model);
 		html += tokensCard(model);
 
 		html += costCard(model);
 
-		/* Decisions pairs with Recall — what got kept, and whether it came back. */
 		html += decisionsCard(model);
-		html += recallCard(model);
 
 		/* The session-activity card (heatmap, hour histogram, records, share card)
 		   was removed — `stats.heatmap` / `stats.hours` / `stats.fun` stay in the

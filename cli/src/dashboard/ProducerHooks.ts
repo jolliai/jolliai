@@ -244,12 +244,15 @@ const SESSION_ID_ENV_VARS: ReadonlyArray<string> = ["CLAUDE_CODE_SESSION_ID"];
  * the sessions that got prior context — and it is still the right answer,
  * because the available fallback is to pick the most recently touched session
  * for this repo, which is a GUESS that looks exactly like a fact once stored.
- * The Recall card's coverage figure would then be wrong in the one direction
- * nobody can audit: attributing a call to a session that never made it.
+ * Any figure derived from these receipts would then be wrong in the one
+ * direction nobody can audit: attributing a call to a session that never made
+ * it.
  *
- * A null is visible as a null; an invented id is not. (The coverage denominator
- * treats a session-less receipt as belonging to no session, deliberately — see
- * `buildRecallUsage`'s union.)
+ * A null is visible as a null; an invented id is not. Nothing reads that
+ * distinction today — the dashboard's Recall card was removed (JOLLI-2193) and
+ * with it the only consumer — but the receipts are still written, and a
+ * fabricated id would be indistinguishable from a real one by the time anything
+ * does.
  */
 function currentAgentSessionId(): string | undefined {
 	for (const name of SESSION_ID_ENV_VARS) {

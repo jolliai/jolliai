@@ -31,7 +31,6 @@ describe("PromptTemplates", () => {
 			"squash-consolidate",
 			"squash-consolidate-strict",
 			"commit-message",
-			"decision-gist",
 			"squash-message",
 			"e2e-test",
 			"recap",

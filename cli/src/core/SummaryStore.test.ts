@@ -148,6 +148,19 @@ function v3Index(entries: SummaryIndexEntry[], commitAliases?: Record<string, st
 	return { version: 3, entries, ...(commitAliases && { commitAliases }) };
 }
 
+/**
+ * Every store call in this suite threads this instead of letting `cwd` default
+ * to `process.cwd()`. The default is not inert: `resolveStorage` and
+ * `OrphanBranchStorage.writeFiles` answer from the REAL repo the test runner
+ * happens to sit in, so on a developer machine whose own repo has been cut over
+ * every write path here throws "orphan branch is frozen" — a failure about the
+ * author's working copy, not about the code under test. A path under `tmpdir()`
+ * is outside any git repo, so `RepoProfile` finds no profile and reports no
+ * fence, which is the state CI's fresh checkout is in. It is never created:
+ * GitOps is mocked, so nothing here touches the filesystem at that path.
+ */
+const TEST_CWD = joinPath(tmpdir(), "jolli-summarystore-test-cwd");
+
 describe("SummaryStore", () => {
 	beforeEach(() => {
 		vi.resetAllMocks();
@@ -169,7 +182,7 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
 			const summary = createMockSummary();
-			await storeSummary(summary);
+			await storeSummary(summary, TEST_CWD);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const callArgs = vi.mocked(writeMultipleFilesToBranch).mock.calls[0];
@@ -199,7 +212,7 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
 			const summary = createMockSummary();
-			await storeSummary(summary, undefined, false, {
+			await storeSummary(summary, TEST_CWD, false, {
 				transcript: {
 					id: "transcript-uuid-1",
 					data: {
@@ -247,7 +260,7 @@ describe("SummaryStore", () => {
 				},
 			];
 
-			await storeSummary(summary, undefined, false, { planProgress });
+			await storeSummary(summary, TEST_CWD, false, { planProgress });
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			// 3 base files (summary + index + catalog) + 1 plan progress
@@ -303,7 +316,7 @@ describe("SummaryStore", () => {
 				},
 			];
 
-			await storeSummary(summary, undefined, false, { planProgress });
+			await storeSummary(summary, TEST_CWD, false, { planProgress });
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			// 3 base (summary + index + catalog) + 2 plan progress
@@ -317,7 +330,7 @@ describe("SummaryStore", () => {
 
 			const child = createMockSummary("child111", "Child commit");
 			const parent: CommitSummary = { ...createMockSummary("parent222", "Parent commit"), children: [child] };
-			await storeSummary(parent);
+			await storeSummary(parent, TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const indexContent = JSON.parse(files[1].content) as SummaryIndex;
@@ -747,7 +760,7 @@ describe("SummaryStore", () => {
 	describe("storeSummary edge cases", () => {
 		it("should handle corrupt index JSON gracefully", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce("not valid json");
-			await storeSummary(createMockSummary());
+			await storeSummary(createMockSummary(), TEST_CWD);
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			// summary + index + catalog (3 base writes per storeSummary call)
@@ -757,13 +770,13 @@ describe("SummaryStore", () => {
 		it("should skip duplicate commit entirely", async () => {
 			const existingIndex = v3Index([rootEntry("abc123def456", "Fix bug")]);
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(existingIndex));
-			await storeSummary(createMockSummary());
+			await storeSummary(createMockSummary(), TEST_CWD);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
 		it("should handle missing branch gracefully (null index)", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
-			await storeSummary(createMockSummary());
+			await storeSummary(createMockSummary(), TEST_CWD);
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const indexContent = JSON.parse(files[1].content) as SummaryIndex;
@@ -800,7 +813,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash", "New message"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash", "New message"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const migrated = JSON.parse(files[0].content) as CommitSummary;
@@ -824,7 +837,7 @@ describe("SummaryStore", () => {
 
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "Rebased"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "Rebased"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const newSummary = JSON.parse(files[0].content) as CommitSummary;
@@ -844,7 +857,7 @@ describe("SummaryStore", () => {
 			// Only the old commit's transcript file exists on disk.
 			vi.mocked(listFilesInBranch).mockResolvedValueOnce([`transcripts/${oldHash}.json`]);
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const newSummary = JSON.parse(files[0].content) as CommitSummary;
@@ -860,7 +873,7 @@ describe("SummaryStore", () => {
 			// No transcript files on disk → the dangling hash must not be carried.
 			vi.mocked(listFilesInBranch).mockResolvedValueOnce([]);
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const newSummary = JSON.parse(files[0].content) as CommitSummary;
@@ -875,7 +888,7 @@ describe("SummaryStore", () => {
 			const existingIndex = v3Index([rootEntry(oldHash, "Old message", "2026-02-18T10:00:00Z")]);
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(existingIndex));
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), TEST_CWD);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -927,7 +940,7 @@ describe("SummaryStore", () => {
 
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
@@ -950,7 +963,7 @@ describe("SummaryStore", () => {
 
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
@@ -983,7 +996,7 @@ describe("SummaryStore", () => {
 
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
@@ -1035,7 +1048,7 @@ describe("SummaryStore", () => {
 
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
@@ -1084,7 +1097,7 @@ describe("SummaryStore", () => {
 
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
@@ -1117,7 +1130,7 @@ describe("SummaryStore", () => {
 
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const newSummaryContent = JSON.parse(files[0].content) as CommitSummary;
@@ -1144,14 +1157,14 @@ describe("SummaryStore", () => {
 			]);
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(existingIndex));
 
-			await migrateOneToOne(createMockSummary(oldHash), createMockCommitInfo(newHash));
+			await migrateOneToOne(createMockSummary(oldHash), createMockCommitInfo(newHash), TEST_CWD);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
 		it("should work when index is empty (null)", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 			const newHash = "newhash0000000000000002";
-			await migrateOneToOne(createMockSummary("oldhash"), createMockCommitInfo(newHash));
+			await migrateOneToOne(createMockSummary("oldhash"), createMockCommitInfo(newHash), TEST_CWD);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -1167,7 +1180,7 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
 			const newHash = "newhash0000000000000002";
-			await migrateOneToOne(createMockSummary("oldhash"), createMockCommitInfo(newHash));
+			await migrateOneToOne(createMockSummary("oldhash"), createMockCommitInfo(newHash), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const migrated = JSON.parse(files[0].content) as CommitSummary;
@@ -1185,7 +1198,7 @@ describe("SummaryStore", () => {
 				summaryError: "llm-failed",
 			};
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const migrated = JSON.parse(files[0].content) as CommitSummary;
@@ -1203,7 +1216,7 @@ describe("SummaryStore", () => {
 				llm: { model: "x", inputTokens: 0, outputTokens: 0, apiLatencyMs: 0, stopReason: "error" },
 			};
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const migrated = JSON.parse(files[0].content) as CommitSummary;
@@ -1217,7 +1230,7 @@ describe("SummaryStore", () => {
 				llm: { model: "x", inputTokens: 1, outputTokens: 1, apiLatencyMs: 1, stopReason: "end_turn" },
 			};
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash"));
+			await migrateOneToOne(oldSummary, createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const migrated = JSON.parse(files[0].content) as CommitSummary;
@@ -1255,7 +1268,7 @@ describe("SummaryStore", () => {
 
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
-			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), undefined, {
+			await migrateOneToOne(oldSummary, createMockCommitInfo(newHash, "New message"), TEST_CWD, {
 				commitType: "rebase",
 				commitSource: "plugin",
 			});
@@ -1282,7 +1295,7 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 			vi.mocked(listFilesInBranch).mockResolvedValueOnce([`transcripts/${oldHash1}.json`]);
 
-			await mergeManyToOne([summary1, summary2], createMockCommitInfo(newHash, "Squashed"));
+			await mergeManyToOne([summary1, summary2], createMockCommitInfo(newHash, "Squashed"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -1319,7 +1332,7 @@ describe("SummaryStore", () => {
 			]);
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(existingIndex));
 
-			await mergeManyToOne([summary1, summary2], createMockCommitInfo(newHash, "Squashed commit"));
+			await mergeManyToOne([summary1, summary2], createMockCommitInfo(newHash, "Squashed commit"), TEST_CWD);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -1371,14 +1384,22 @@ describe("SummaryStore", () => {
 			const existingIndex = v3Index([rootEntry(newHash, "Already here", "2026-02-20T10:00:00Z")]);
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(existingIndex));
 
-			await mergeManyToOne([createMockSummary("old1"), createMockSummary("old2")], createMockCommitInfo(newHash));
+			await mergeManyToOne(
+				[createMockSummary("old1"), createMockSummary("old2")],
+				createMockCommitInfo(newHash),
+				TEST_CWD,
+			);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
 		it("should work when index is null (empty repo)", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 			const newHash = "newhash0000000000000003";
-			await mergeManyToOne([createMockSummary("old1"), createMockSummary("old2")], createMockCommitInfo(newHash));
+			await mergeManyToOne(
+				[createMockSummary("old1"), createMockSummary("old2")],
+				createMockCommitInfo(newHash),
+				TEST_CWD,
+			);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -1396,6 +1417,7 @@ describe("SummaryStore", () => {
 			await mergeManyToOne(
 				[createMockSummary("old1"), createMockSummary("old2")],
 				createMockCommitInfo("newhash"),
+				TEST_CWD,
 			);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -1415,7 +1437,7 @@ describe("SummaryStore", () => {
 			await mergeManyToOne(
 				[createMockSummary("old1"), createMockSummary("old2")],
 				createMockCommitInfo("newhash"),
-				undefined,
+				TEST_CWD,
 				{
 					consolidated: {
 						topics: [{ title: "Consolidated topic", trigger: "t", response: "r", decisions: "d" }],
@@ -1452,7 +1474,7 @@ describe("SummaryStore", () => {
 				jolliDocUrl: "https://team.jolli.app/articles?doc=102",
 			};
 
-			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"));
+			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -1501,7 +1523,7 @@ describe("SummaryStore", () => {
 				skills: [skill("claude:superpowers:brainstorming-22222222", 202)],
 			};
 
-			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"));
+			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -1535,7 +1557,7 @@ describe("SummaryStore", () => {
 			const s1: CommitSummary = { ...createMockSummary("old1", "First"), skills: [unpushed] };
 			const s2: CommitSummary = { ...createMockSummary("old2", "Second") };
 
-			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"));
+			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -1561,7 +1583,7 @@ describe("SummaryStore", () => {
 				jolliDocUrl: "https://team.jolli.app/articles?doc=102",
 			};
 
-			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"));
+			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -1592,7 +1614,7 @@ describe("SummaryStore", () => {
 				jolliDocUrl: "https://team.jolli.app/articles?doc=102",
 			};
 
-			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"));
+			const result = await mergeManyToOne([s1, s2], createMockCommitInfo("newhash", "Squashed"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -1620,7 +1642,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
-			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -1659,7 +1681,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
-			const result = await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+			const result = await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -1713,7 +1735,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
-			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -1769,7 +1791,7 @@ describe("SummaryStore", () => {
 
 			// `cccccccc` stands in for the ref runSquashPipeline just archived for the
 			// squash commit itself — same ticket, third snapshot.
-			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), undefined, {
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), TEST_CWD, {
 				extraRefs: { references: [ref("cccccccc")] },
 			});
 
@@ -1800,7 +1822,7 @@ describe("SummaryStore", () => {
 					createMockSummary("old2"),
 				],
 				createMockCommitInfo("newhash"),
-				undefined,
+				TEST_CWD,
 				{ metadata: { commitType: "squash", commitSource: "plugin" } },
 			);
 
@@ -1847,7 +1869,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
-			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -1886,7 +1908,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
-			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -1951,7 +1973,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
-			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -2025,7 +2047,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
-			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -2077,7 +2099,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
-			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -2099,6 +2121,7 @@ describe("SummaryStore", () => {
 			await mergeManyToOne(
 				[createMockSummary("old1"), createMockSummary("old2")],
 				createMockCommitInfo("newhash"),
+				TEST_CWD,
 			);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -2112,6 +2135,7 @@ describe("SummaryStore", () => {
 			await mergeManyToOne(
 				[createMockSummary("old1"), createMockSummary("old2")],
 				createMockCommitInfo("newhash"),
+				TEST_CWD,
 			);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -2128,7 +2152,7 @@ describe("SummaryStore", () => {
 				unresolvedOrphanHashes: ["pending-grandchild"],
 			};
 
-			await mergeManyToOne([old1, createMockSummary("old2")], createMockCommitInfo("newhash"));
+			await mergeManyToOne([old1, createMockSummary("old2")], createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -2149,7 +2173,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
-			await mergeManyToOne([s1, s2], createMockCommitInfo("newhash"));
+			await mergeManyToOne([s1, s2], createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -2205,7 +2229,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([])));
 
-			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"));
+			await mergeManyToOne([old1, old2], createMockCommitInfo("newhash"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -2237,7 +2261,7 @@ describe("SummaryStore", () => {
 			const old3 = makeSourceWithStats("abc3", 15);
 
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
-			await mergeManyToOne([old1, old2, old3], createMockCommitInfo("squash1"));
+			await mergeManyToOne([old1, old2, old3], createMockCommitInfo("squash1"), TEST_CWD);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -2257,6 +2281,7 @@ describe("SummaryStore", () => {
 			await mergeManyToOne(
 				[createMockSummary("old1"), createMockSummary("old2")],
 				createMockCommitInfo("newhash"),
+				TEST_CWD,
 			);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -2271,7 +2296,7 @@ describe("SummaryStore", () => {
 			await mergeManyToOne(
 				[createMockSummary("old1"), createMockSummary("old2")],
 				createMockCommitInfo(newHash),
-				undefined,
+				TEST_CWD,
 				{
 					consolidated: {
 						topics: [{ title: "Merged", trigger: "t", response: "r", decisions: "d" }],
@@ -2290,7 +2315,7 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 			const newHash = "newhash0000000000000098";
 
-			await mergeManyToOne([createMockSummary("old1")], createMockCommitInfo(newHash), undefined, {
+			await mergeManyToOne([createMockSummary("old1")], createMockCommitInfo(newHash), TEST_CWD, {
 				consolidated: { topics: [{ title: "Merged", trigger: "t", response: "r", decisions: "d" }] },
 			});
 
@@ -2305,7 +2330,7 @@ describe("SummaryStore", () => {
 				const s1: CommitSummary = { ...createMockSummary("tok1", "Feat A"), conversationTokens: 300 };
 				const s2: CommitSummary = { ...createMockSummary("tok2", "Feat B"), conversationTokens: 700 };
 
-				await mergeManyToOne([s1, s2], createMockCommitInfo("tokmerge1", "Squashed"));
+				await mergeManyToOne([s1, s2], createMockCommitInfo("tokmerge1", "Squashed"), TEST_CWD);
 
 				const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 				const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -2320,7 +2345,7 @@ describe("SummaryStore", () => {
 				const s1 = createMockSummary("notok1", "No tokens A");
 				const s2 = createMockSummary("notok2", "No tokens B");
 
-				await mergeManyToOne([s1, s2], createMockCommitInfo("tokmerge2", "Squashed no tokens"));
+				await mergeManyToOne([s1, s2], createMockCommitInfo("tokmerge2", "Squashed no tokens"), TEST_CWD);
 
 				const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 				const merged = JSON.parse(files[0].content) as CommitSummary;
@@ -2341,7 +2366,7 @@ describe("SummaryStore", () => {
 			]);
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(existingIndex));
 
-			await removeFromIndex(hashToRemove);
+			await removeFromIndex(hashToRemove, TEST_CWD);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -2356,14 +2381,14 @@ describe("SummaryStore", () => {
 
 		it("should skip when no index exists", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
-			await removeFromIndex("anyhash");
+			await removeFromIndex("anyhash", TEST_CWD);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
 		it("should skip when hash is not found in index", async () => {
 			const existingIndex = v3Index([rootEntry("somehash000000000001", "Some commit", "2026-02-18T10:00:00Z")]);
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(existingIndex));
-			await removeFromIndex("nonexistenthash");
+			await removeFromIndex("nonexistenthash", TEST_CWD);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 	});
@@ -2421,7 +2446,7 @@ describe("SummaryStore", () => {
 			const entry2 = rootEntry("hash2", "B");
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([entry1, entry2])));
 
-			const map = await getIndexEntryMap();
+			const map = await getIndexEntryMap(TEST_CWD);
 			expect(map.size).toBe(2);
 			expect(map.get("hash1")).toEqual(entry1);
 			expect(map.get("hash2")).toEqual(entry2);
@@ -2432,7 +2457,7 @@ describe("SummaryStore", () => {
 			const index = v3Index([entry], { aliased: "target" });
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
 
-			const map = await getIndexEntryMap();
+			const map = await getIndexEntryMap(TEST_CWD);
 			expect(map.get("aliased")).toEqual(entry);
 		});
 
@@ -2443,13 +2468,13 @@ describe("SummaryStore", () => {
 			const index = v3Index([directEntry, targetEntry], { hash1: "hash2" });
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
 
-			const map = await getIndexEntryMap();
+			const map = await getIndexEntryMap(TEST_CWD);
 			expect(map.get("hash1")).toEqual(directEntry);
 		});
 
 		it("should return empty Map when no index exists", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
-			const map = await getIndexEntryMap();
+			const map = await getIndexEntryMap(TEST_CWD);
 			expect(map.size).toBe(0);
 		});
 
@@ -2465,7 +2490,7 @@ describe("SummaryStore", () => {
 			warnSpy.mockClear();
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
-			await getIndexEntryMap();
+			await getIndexEntryMap(TEST_CWD);
 
 			expect(warnSpy).not.toHaveBeenCalled();
 		});
@@ -2478,7 +2503,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([entry])));
 
-			const map = await getIndexEntryMap();
+			const map = await getIndexEntryMap(TEST_CWD);
 			const result = map.get("hash1");
 			expect(result?.topicCount).toBe(3);
 			expect(result?.diffStats).toEqual({ filesChanged: 2, insertions: 10, deletions: 5 });
@@ -2561,6 +2586,7 @@ describe("SummaryStore", () => {
 			await saveTranscriptsBatch(
 				[{ hash: "hash1", data: { sessions: [{ sessionId: "s1", entries: [] }] } }],
 				["hash2"],
+				TEST_CWD,
 			);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
@@ -2572,14 +2598,18 @@ describe("SummaryStore", () => {
 		});
 
 		it("should summarize transcript writes without a deleted suffix when nothing is deleted", async () => {
-			await saveTranscriptsBatch([{ hash: "hash1", data: { sessions: [{ sessionId: "s1", entries: [] }] } }], []);
+			await saveTranscriptsBatch(
+				[{ hash: "hash1", data: { sessions: [{ sessionId: "s1", entries: [] }] } }],
+				[],
+				TEST_CWD,
+			);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			expect(vi.mocked(writeMultipleFilesToBranch).mock.calls[0][2]).toBe("Update transcripts: 1 written");
 		});
 
 		it("should delete a single transcript via deleteTranscript", async () => {
-			await deleteTranscript("hash2");
+			await deleteTranscript("hash2", TEST_CWD);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -2587,7 +2617,7 @@ describe("SummaryStore", () => {
 		});
 
 		it("should no-op when transcript batch is empty", async () => {
-			await saveTranscriptsBatch([], []);
+			await saveTranscriptsBatch([], [], TEST_CWD);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
@@ -2669,13 +2699,13 @@ describe("SummaryStore", () => {
 	describe("tree hash aliases", () => {
 		it("should return false when index is missing", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
-			await expect(scanTreeHashAliases(["hash1"])).resolves.toBe(false);
+			await expect(scanTreeHashAliases(["hash1"], TEST_CWD)).resolves.toBe(false);
 		});
 
 		it("should return false without reading the index or taking the lock when manually disabled", async () => {
 			setManuallyDisabled(true);
 			try {
-				await expect(scanTreeHashAliases(["hash1"])).resolves.toBe(false);
+				await expect(scanTreeHashAliases(["hash1"], TEST_CWD)).resolves.toBe(false);
 				expect(readFileFromBranch).not.toHaveBeenCalled();
 				expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
 				expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
@@ -2704,7 +2734,7 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockResolvedValue(JSON.stringify(index));
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
-			const result = await scanTreeHashAliases(["unknown1", "root1", "knownAlias"]);
+			const result = await scanTreeHashAliases(["unknown1", "root1", "knownAlias"], TEST_CWD);
 
 			expect(result).toBe(true);
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
@@ -2721,7 +2751,7 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(index));
 			vi.mocked(getTreeHash).mockResolvedValueOnce(null);
 
-			await expect(scanTreeHashAliases(["unknown1"])).resolves.toBe(false);
+			await expect(scanTreeHashAliases(["unknown1"], TEST_CWD)).resolves.toBe(false);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
@@ -2731,7 +2761,7 @@ describe("SummaryStore", () => {
 			// getTreeHash returns a valid tree hash, but it matches no entry in the index
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-no-match");
 
-			await expect(scanTreeHashAliases(["unknown1"])).resolves.toBe(false);
+			await expect(scanTreeHashAliases(["unknown1"], TEST_CWD)).resolves.toBe(false);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
@@ -2741,7 +2771,7 @@ describe("SummaryStore", () => {
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 			vi.mocked(acquireOrphanWriteLock).mockResolvedValueOnce(false);
 
-			await expect(scanTreeHashAliases(["unknown1"])).resolves.toBe(false);
+			await expect(scanTreeHashAliases(["unknown1"], TEST_CWD)).resolves.toBe(false);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 			expect(releaseOrphanWriteLock).not.toHaveBeenCalled();
 		});
@@ -2755,7 +2785,7 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockResolvedValue(JSON.stringify(index));
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
-			const result = await scanTreeHashAliases(["unknown1"]);
+			const result = await scanTreeHashAliases(["unknown1"], TEST_CWD);
 
 			expect(result).toBe(true);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -2792,7 +2822,7 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockResolvedValue(JSON.stringify(index));
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
-			const result = await scanTreeHashAliases(["unknown1"]);
+			const result = await scanTreeHashAliases(["unknown1"], TEST_CWD);
 
 			expect(result).toBe(true);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -2825,7 +2855,7 @@ describe("SummaryStore", () => {
 			vi.mocked(readFileFromBranch).mockResolvedValue(JSON.stringify(index));
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
-			const result = await scanTreeHashAliases(["unknown1"]);
+			const result = await scanTreeHashAliases(["unknown1"], TEST_CWD);
 
 			expect(result).toBe(true);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -2863,7 +2893,7 @@ describe("SummaryStore", () => {
 				.mockResolvedValueOnce(JSON.stringify(freshIdx)); // inside-lock re-read
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
-			const result = await scanTreeHashAliases(["unknown1"]);
+			const result = await scanTreeHashAliases(["unknown1"], TEST_CWD);
 
 			expect(result).toBe(true);
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
@@ -2889,7 +2919,7 @@ describe("SummaryStore", () => {
 				.mockResolvedValueOnce(JSON.stringify(freshIdx));
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
-			const result = await scanTreeHashAliases(["unknown1"]);
+			const result = await scanTreeHashAliases(["unknown1"], TEST_CWD);
 
 			// Already-aliased → nothing new to write.
 			expect(result).toBe(false);
@@ -2913,7 +2943,7 @@ describe("SummaryStore", () => {
 				.mockResolvedValueOnce(JSON.stringify(freshIdx));
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
-			const result = await scanTreeHashAliases(["unknown1"]);
+			const result = await scanTreeHashAliases(["unknown1"], TEST_CWD);
 
 			expect(result).toBe(false);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
@@ -2956,7 +2986,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-X");
 
-			const result = await scanTreeHashAliases(["unknown1"], undefined, writeStorage, readStorage);
+			const result = await scanTreeHashAliases(["unknown1"], TEST_CWD, writeStorage, readStorage);
 
 			expect(result).toBe(true);
 			// Preflight (1) reads readStorage; in-lock re-read reads BOTH:
@@ -3016,7 +3046,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-X");
 
-			await scanTreeHashAliases(["unknown1"], undefined, writeStorage, readStorage);
+			await scanTreeHashAliases(["unknown1"], TEST_CWD, writeStorage, readStorage);
 
 			const [persistedFiles] = vi.mocked(writeStorage.writeFiles).mock.calls[0] as [
 				ReadonlyArray<FileWrite>,
@@ -3072,7 +3102,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-X");
 
-			const result = await scanTreeHashAliases(["unknown1"], undefined, writeStorage, readStorage);
+			const result = await scanTreeHashAliases(["unknown1"], TEST_CWD, writeStorage, readStorage);
 
 			// Deferred — no alias landed, no folder row destroyed.
 			expect(result).toBe(false);
@@ -3104,7 +3134,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-Y");
 
-			const result = await scanTreeHashAliases(["unknown1"], undefined, storage);
+			const result = await scanTreeHashAliases(["unknown1"], TEST_CWD, storage);
 
 			expect(result).toBe(true);
 			expect(storage.readFile).toHaveBeenCalledTimes(2);
@@ -3124,7 +3154,7 @@ describe("SummaryStore", () => {
 				.mockResolvedValueOnce(null); // inside-lock re-read = wiped
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-1");
 
-			const result = await scanTreeHashAliases(["unknown1"]);
+			const result = await scanTreeHashAliases(["unknown1"], TEST_CWD);
 
 			expect(result).toBe(false);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
@@ -3156,7 +3186,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(getTreeHash).mockResolvedValueOnce("tree-X");
 
-			const result = await scanTreeHashAliases(["unknown1"], undefined, writeStorage, readStorage);
+			const result = await scanTreeHashAliases(["unknown1"], TEST_CWD, writeStorage, readStorage);
 
 			// Divergence check skipped (readSideIndex null), but write proceeds
 			// normally because freshIndex on write side is intact.
@@ -3184,14 +3214,14 @@ describe("SummaryStore", () => {
 		it("should no-op when migrateIndexToV3 is called on an already-v3 index", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([rootEntry("new1")])));
 
-			await expect(migrateIndexToV3()).resolves.toEqual({ migrated: 0, skipped: 0 });
+			await expect(migrateIndexToV3(TEST_CWD)).resolves.toEqual({ migrated: 0, skipped: 0 });
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
 		it("should no-op when migrateIndexToV3 is called with no index file", async () => {
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(null);
 
-			await expect(migrateIndexToV3()).resolves.toEqual({ migrated: 0, skipped: 0 });
+			await expect(migrateIndexToV3(TEST_CWD)).resolves.toEqual({ migrated: 0, skipped: 0 });
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
@@ -3202,7 +3232,7 @@ describe("SummaryStore", () => {
 				.mockResolvedValueOnce(JSON.stringify(createMockSummary("root1", "Root 1")))
 				.mockResolvedValueOnce(JSON.stringify(createMockSummary("root2", "Root 2")));
 
-			const result = await migrateIndexToV3();
+			const result = await migrateIndexToV3(TEST_CWD);
 
 			expect(result).toEqual({ migrated: 2, skipped: 0 });
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
@@ -3219,7 +3249,7 @@ describe("SummaryStore", () => {
 				.mockResolvedValueOnce(JSON.stringify(createMockSummary("root1", "Root 1")))
 				.mockResolvedValueOnce(null);
 
-			const result = await migrateIndexToV3();
+			const result = await migrateIndexToV3(TEST_CWD);
 			expect(result).toEqual({ migrated: 1, skipped: 1 });
 		});
 
@@ -3233,7 +3263,7 @@ describe("SummaryStore", () => {
 				.mockResolvedValueOnce("tree-1")
 				.mockRejectedValueOnce(new Error("git object missing"));
 
-			const result = await migrateIndexToV3();
+			const result = await migrateIndexToV3(TEST_CWD);
 
 			expect(result).toEqual({ migrated: 1, skipped: 1 });
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
@@ -3251,6 +3281,7 @@ describe("SummaryStore", () => {
 					{ slug: "plan-b", content: "# Plan B" },
 				],
 				"Store plans",
+				TEST_CWD,
 			);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
@@ -3262,7 +3293,7 @@ describe("SummaryStore", () => {
 		});
 
 		it("should no-op when there are no plan files to store", async () => {
-			await storePlans([], "No plans");
+			await storePlans([], "No plans", TEST_CWD);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
@@ -3290,7 +3321,7 @@ describe("SummaryStore", () => {
 					deletePlanVisible,
 				} as unknown as StorageProvider);
 
-				await deletePlanVisibleArtifact("my-plan-abc12345", "feature/login");
+				await deletePlanVisibleArtifact("my-plan-abc12345", "feature/login", TEST_CWD);
 				expect(deletePlanVisible).toHaveBeenCalledWith("my-plan-abc12345", "feature/login");
 			});
 
@@ -3303,7 +3334,7 @@ describe("SummaryStore", () => {
 					ensure: vi.fn(),
 				} as unknown as StorageProvider);
 
-				await expect(deletePlanVisibleArtifact("plan-a", "main")).resolves.toBeUndefined();
+				await expect(deletePlanVisibleArtifact("plan-a", "main", TEST_CWD)).resolves.toBeUndefined();
 			});
 		});
 	});
@@ -3465,7 +3496,7 @@ describe("SummaryStore", () => {
 			const existingIndex = v3Index([rootEntry("existinghash001", "Old", "2026-02-18T10:00:00Z")]);
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(existingIndex));
 
-			await storeSummary(summary, undefined, true);
+			await storeSummary(summary, TEST_CWD, true);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledTimes(1);
 			// Verify the commit message says "Overwrite"
@@ -3482,7 +3513,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([existingEntry])));
 
-			await storeSummary(summary, undefined, true);
+			await storeSummary(summary, TEST_CWD, true);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const indexContent = JSON.parse(files[1].content) as SummaryIndex;
@@ -3508,7 +3539,7 @@ describe("SummaryStore", () => {
 			};
 			vi.mocked(readFileFromBranch).mockResolvedValueOnce(JSON.stringify(v3Index([staleEntry])));
 
-			await storeSummary(summary, undefined, true);
+			await storeSummary(summary, TEST_CWD, true);
 
 			const files = vi.mocked(writeMultipleFilesToBranch).mock.calls[0][1] as ReadonlyArray<FileWrite>;
 			const indexContent = JSON.parse(files[1].content) as SummaryIndex;
@@ -3555,7 +3586,7 @@ describe("SummaryStore", () => {
 				rootEntry("foldersync", "Folder-only peer sync"),
 			]);
 
-			await storeSummary(createMockSummary("newcommit"), undefined, false, undefined, writeStorage, readStorage);
+			await storeSummary(createMockSummary("newcommit"), TEST_CWD, false, undefined, writeStorage, readStorage);
 
 			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
 			expect(writeFilesMock).toHaveBeenCalledTimes(1);
@@ -3576,7 +3607,7 @@ describe("SummaryStore", () => {
 			// a non-existent shadow).
 			const onlyStorage = makeStorage([rootEntry("existing", "Existing")]);
 
-			await storeSummary(createMockSummary("new"), undefined, false, undefined, onlyStorage);
+			await storeSummary(createMockSummary("new"), TEST_CWD, false, undefined, onlyStorage);
 
 			const writeFilesMock = onlyStorage.writeFiles as ReturnType<typeof vi.fn>;
 			expect(writeFilesMock).toHaveBeenCalledTimes(1);
@@ -3629,7 +3660,7 @@ describe("SummaryStore", () => {
 				ensure: vi.fn(async () => undefined),
 			} as unknown as StorageProvider;
 
-			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+			await storeSummary(createMockSummary("new"), TEST_CWD, false, undefined, writeStorage, readStorage);
 
 			const files = (writeStorage.writeFiles as ReturnType<typeof vi.fn>).mock
 				.calls[0][0] as ReadonlyArray<FileWrite>;
@@ -3682,7 +3713,7 @@ describe("SummaryStore", () => {
 				{ "summaries/foldersync.json": folderOnlyPayload },
 			);
 
-			await storeSummary(createMockSummary("newcommit"), undefined, false, undefined, writeStorage, readStorage);
+			await storeSummary(createMockSummary("newcommit"), TEST_CWD, false, undefined, writeStorage, readStorage);
 
 			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
 			expect(writeFilesMock).toHaveBeenCalledTimes(1);
@@ -3712,7 +3743,7 @@ describe("SummaryStore", () => {
 				"transcripts/foldersync.json": folderOnlyTranscript,
 			});
 
-			await storeSummary(createMockSummary("newcommit"), undefined, false, undefined, writeStorage, readStorage);
+			await storeSummary(createMockSummary("newcommit"), TEST_CWD, false, undefined, writeStorage, readStorage);
 
 			const filesWritten = (writeStorage.writeFiles as ReturnType<typeof vi.fn>).mock
 				.calls[0][0] as ReadonlyArray<FileWrite>;
@@ -3734,7 +3765,7 @@ describe("SummaryStore", () => {
 				{},
 			);
 
-			await storeSummary(createMockSummary("newcommit"), undefined, false, undefined, writeStorage, readStorage);
+			await storeSummary(createMockSummary("newcommit"), TEST_CWD, false, undefined, writeStorage, readStorage);
 
 			const filesWritten = (writeStorage.writeFiles as ReturnType<typeof vi.fn>).mock
 				.calls[0][0] as ReadonlyArray<FileWrite>;
@@ -3765,7 +3796,7 @@ describe("SummaryStore", () => {
 
 			await storeSummary(
 				createMockSummary("dupe", "Force-rewrite via summarize"),
-				undefined,
+				TEST_CWD,
 				true,
 				undefined,
 				writeStorage,
@@ -3791,7 +3822,7 @@ describe("SummaryStore", () => {
 				"summaries/existing.json": JSON.stringify(createMockSummary("existing", "Existing")),
 			});
 
-			await storeSummary(createMockSummary("new"), undefined, false, undefined, onlyStorage);
+			await storeSummary(createMockSummary("new"), TEST_CWD, false, undefined, onlyStorage);
 
 			const readFileMock = onlyStorage.readFile as ReturnType<typeof vi.fn>;
 			// The only legitimate readFile calls on the single-storage path
@@ -3845,6 +3876,7 @@ describe("SummaryStore", () => {
 					{ id: "note-2", content: "# Note 2\nMore content" },
 				],
 				"Store session notes",
+				TEST_CWD,
 			);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledWith(
@@ -3854,12 +3886,12 @@ describe("SummaryStore", () => {
 					{ path: "notes/note-2.md", content: "# Note 2\nMore content" },
 				],
 				"Store session notes",
-				undefined,
+				TEST_CWD,
 			);
 		});
 
 		it("should skip writing when noteFiles array is empty", async () => {
-			await storeNotes([], "Empty commit");
+			await storeNotes([], "Empty commit", TEST_CWD);
 
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
@@ -3880,7 +3912,7 @@ describe("SummaryStore", () => {
 					deleteNoteVisible,
 				} as unknown as StorageProvider);
 
-				await deleteNoteVisibleArtifact("note-42", "main");
+				await deleteNoteVisibleArtifact("note-42", "main", TEST_CWD);
 				expect(deleteNoteVisible).toHaveBeenCalledWith("note-42", "main");
 			});
 
@@ -3893,7 +3925,7 @@ describe("SummaryStore", () => {
 					ensure: vi.fn(),
 				} as unknown as StorageProvider);
 
-				await expect(deleteNoteVisibleArtifact("note-42", "main")).resolves.toBeUndefined();
+				await expect(deleteNoteVisibleArtifact("note-42", "main", TEST_CWD)).resolves.toBeUndefined();
 			});
 		});
 	});
@@ -3906,6 +3938,7 @@ describe("SummaryStore", () => {
 					{ path: "skills/opencode/j-specs-e5f6a7b8-abc12345.md", content: "---\nbody-b" },
 				],
 				"Archive 2 skill(s) for commit abc12345",
+				TEST_CWD,
 			);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledWith(
@@ -3915,12 +3948,12 @@ describe("SummaryStore", () => {
 					{ path: "skills/opencode/j-specs-e5f6a7b8-abc12345.md", content: "---\nbody-b" },
 				],
 				"Archive 2 skill(s) for commit abc12345",
-				undefined,
+				TEST_CWD,
 			);
 		});
 
 		it("is a no-op when given an empty list", async () => {
-			await storeSkills([], "Empty commit");
+			await storeSkills([], "Empty commit", TEST_CWD);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
@@ -3947,6 +3980,7 @@ describe("SummaryStore", () => {
 					{ archivedKey: "linear:PROJ-1-abc12345", source: "linear", content: "---\nbody-linear" },
 				],
 				"Archive entities for commit abc12345",
+				TEST_CWD,
 			);
 
 			expect(writeMultipleFilesToBranch).toHaveBeenCalledWith(
@@ -3956,12 +3990,12 @@ describe("SummaryStore", () => {
 					{ path: "references/linear/PROJ-1-abc12345.md", content: "---\nbody-linear" },
 				],
 				"Archive entities for commit abc12345",
-				undefined,
+				TEST_CWD,
 			);
 		});
 
 		it("storeReferences is a no-op when given an empty list", async () => {
-			await storeReferences([], "Empty commit");
+			await storeReferences([], "Empty commit", TEST_CWD);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
@@ -3972,6 +4006,7 @@ describe("SummaryStore", () => {
 			await storeReferences(
 				[{ archivedKey: "github:owner/repo#7-abc12345", source: "github", content: "body" }],
 				"Archive github entity",
+				TEST_CWD,
 			);
 			const callArgs = vi.mocked(writeMultipleFilesToBranch).mock.calls[0];
 			const files = callArgs[1] as ReadonlyArray<FileWrite>;
@@ -3993,6 +4028,7 @@ describe("SummaryStore", () => {
 						},
 					],
 					"malicious",
+					TEST_CWD,
 				),
 			).rejects.toThrow(/unknown reference source/);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
@@ -4014,6 +4050,7 @@ describe("SummaryStore", () => {
 						},
 					],
 					"malicious",
+					TEST_CWD,
 				),
 			).rejects.toThrow(/unknown reference source/);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
@@ -4396,7 +4433,7 @@ describe("SummaryStore", () => {
 			// contention to land as a benign PAGE_WRITE_CONFLICT rather than a
 			// PAGE_WRITE_ERROR, and `jolli compile` reports it as "try again shortly"
 			// instead of letting a stack trace escape the command.
-			await expect(storeSummary(createMockSummary())).rejects.toMatchObject({
+			await expect(storeSummary(createMockSummary(), TEST_CWD)).rejects.toMatchObject({
 				name: "OrphanWriteBusyError",
 				// 30 s, the must-land budget — not the 1 s background one.
 				message: expect.stringContaining("could not acquire orphan-write.lock within 30000ms"),
@@ -4439,7 +4476,7 @@ describe("SummaryStore", () => {
 			const writeStorage = emptyStorage();
 			const readStorage = emptyStorage();
 
-			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+			await storeSummary(createMockSummary("new"), TEST_CWD, false, undefined, writeStorage, readStorage);
 
 			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
 			expect(writeFilesMock).toHaveBeenCalledTimes(1);
@@ -4455,7 +4492,7 @@ describe("SummaryStore", () => {
 			const writeStorage = makeStorageWithIndex([rootEntry("orphanonly", "Orphan only")]);
 			const readStorage = emptyStorage();
 
-			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+			await storeSummary(createMockSummary("new"), TEST_CWD, false, undefined, writeStorage, readStorage);
 
 			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
 			expect(writeFilesMock).toHaveBeenCalledTimes(1);
@@ -4470,7 +4507,7 @@ describe("SummaryStore", () => {
 			const writeStorage = emptyStorage();
 			const readStorage = makeStorageWithIndex([rootEntry("foldersynced", "Folder-synced row")]);
 
-			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+			await storeSummary(createMockSummary("new"), TEST_CWD, false, undefined, writeStorage, readStorage);
 
 			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
 			expect(writeFilesMock).toHaveBeenCalledTimes(1);
@@ -4512,7 +4549,7 @@ describe("SummaryStore", () => {
 			);
 			const readStorage = emptyStorage();
 
-			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+			await storeSummary(createMockSummary("new"), TEST_CWD, false, undefined, writeStorage, readStorage);
 
 			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
 			const files = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
@@ -4529,7 +4566,7 @@ describe("SummaryStore", () => {
 				[{ commitHash: "foldersynced", recap: "folder recap" }],
 			);
 
-			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+			await storeSummary(createMockSummary("new"), TEST_CWD, false, undefined, writeStorage, readStorage);
 
 			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
 			const files = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
@@ -4560,7 +4597,7 @@ describe("SummaryStore", () => {
 				],
 			);
 
-			await storeSummary(createMockSummary("new"), undefined, false, undefined, writeStorage, readStorage);
+			await storeSummary(createMockSummary("new"), TEST_CWD, false, undefined, writeStorage, readStorage);
 
 			const writeFilesMock = writeStorage.writeFiles as ReturnType<typeof vi.fn>;
 			const files = writeFilesMock.mock.calls[0][0] as ReadonlyArray<FileWrite>;
@@ -4590,28 +4627,28 @@ describe("SummaryStore", () => {
 		});
 
 		it("storeSummary returns without taking the lock or writing", async () => {
-			await storeSummary(createMockSummary());
+			await storeSummary(createMockSummary(), TEST_CWD);
 
 			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
 		it("saveTranscriptsBatch returns without taking the lock or writing", async () => {
-			await saveTranscriptsBatch([{ hash: "abc", data: { version: 1, messages: [] } as never }], [], undefined);
+			await saveTranscriptsBatch([{ hash: "abc", data: { version: 1, messages: [] } as never }], [], TEST_CWD);
 
 			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
 		it("storePlans returns without taking the lock or writing", async () => {
-			await storePlans([{ slug: "plan-1", content: "# Plan" }], "msg");
+			await storePlans([{ slug: "plan-1", content: "# Plan" }], "msg", TEST_CWD);
 
 			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 		});
 
 		it("storeNotes returns without taking the lock or writing", async () => {
-			await storeNotes([{ id: "note-1", content: "# Note" }], "msg");
+			await storeNotes([{ id: "note-1", content: "# Note" }], "msg", TEST_CWD);
 
 			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
@@ -4621,6 +4658,7 @@ describe("SummaryStore", () => {
 			await storeReferences(
 				[{ archivedKey: "linear:ABC-1", source: "linear" as SourceId, content: "# Ref" }],
 				"msg",
+				TEST_CWD,
 			);
 
 			expect(acquireOrphanWriteLock).not.toHaveBeenCalled();

@@ -556,9 +556,10 @@ body {
   .jd[data-tier="2"] .t2hide { display: none; }
 
   /* ---------- decisions ----------
-     Paired with the Recall lockedCard (both span6) so the row reads as one
-     idea: what got kept vs. what got reused. Carries no "recalled" figure of
-     its own — see DecisionsCard's doc comment. */
+     A span12 card: it was a span6 paired with the Recall card, and that one is
+     gone (JOLLI-2193), so it took the whole row rather than leaving six empty
+     columns. Carries no "recalled" figure of its own — see DecisionsCard's doc
+     comment. */
   .hdr-stat { margin-left: auto; text-align: right; }
   .hdr-stat b { display: block; font-size: 19px; font-weight: 650; letter-spacing: -.01em; }
   .hdr-stat span { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
@@ -569,6 +570,12 @@ body {
     margin-top: 12px; line-height: 1.55; font-style: italic;
   }
   .dec-quote .qlab { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-style: normal; display: block; margin-bottom: 3px; }
+  /* The title opens its memory (JOLLI-2197), but it is the whole content of the
+     quote — so it keeps the quote's own color and only picks up an affordance
+     on hover/focus. */
+  .dec-quote .dec-jump { color: inherit; text-decoration: none; }
+  .dec-quote .dec-jump:hover { text-decoration: underline; }
+  .dec-quote .dec-jump:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
 
   /* ---------- do next (M6) ---------- */
   .donext { display: grid; gap: 10px; }

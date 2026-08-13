@@ -135,19 +135,6 @@ function model(over: Record<string, unknown> = {}, statsOver: Record<string, unk
 				sessionsInWindow: 0,
 				uncoveredSources: [],
 			},
-			recallUsage: {
-				usedCalls: 0,
-				setAsideCalls: 0,
-				contextServedPct: 0,
-				distinctMemoriesUsed: 0,
-				staleMemoriesUsed: 0,
-				sessionsWithContext: 0,
-				callsWithoutSession: 0,
-				sessionsInWindow: 0,
-				bySurface: [],
-				skillInvocations: 0,
-				daily: [],
-			},
 			tokenBreakdown: { input: 0, output: 0, cached: 0, perDay: [] },
 			...statsOver,
 		},
@@ -246,6 +233,19 @@ describe("Memory Activity — memory tier", () => {
 
 	it("renders no coverage row when the backend hasn't supplied it", () => {
 		expect(feedHtml(model())).not.toContain("mem-activity-stats");
+	});
+
+	it("shows the decisions this commit recorded, singular when there is one", () => {
+		expect(feedHtml(model({}, { memoryCards: [{ ...CARD, decisionCount: 3 }] }))).toContain("3 decisions</span>");
+		expect(feedHtml(model({}, { memoryCards: [{ ...CARD, decisionCount: 1 }] }))).toContain("1 decision</span>");
+	});
+
+	// Absent, not zero: the server omits the field when the commit recorded none,
+	// and a row of zeros is noise beside the chips that are already conditional.
+	it("prints no decision chip when the commit recorded none", () => {
+		const html = feedHtml(model());
+		expect(html).not.toContain("decisions</span>");
+		expect(html).not.toContain("decision</span>");
 	});
 
 	it("labels the two nearest days Today/Yesterday, and leaves older groups as a bare date", () => {
@@ -545,164 +545,6 @@ describe("repo URL token", () => {
 	});
 });
 
-/** The Recall card, sliced out of the same rendered page. */
-function recallHtml(recallUsage: Record<string, unknown>): string {
-	app.innerHTML = "";
-	JD.renderStats(
-		model(
-			{},
-			{
-				recallUsage: {
-					usedCalls: 0,
-					setAsideCalls: 0,
-					contextServedPct: 0,
-					distinctMemoriesUsed: 0,
-					staleMemoriesUsed: 0,
-					sessionsWithContext: 0,
-					sessionsInWindow: 0,
-					bySurface: [],
-					skillInvocations: 0,
-					daily: [],
-					...recallUsage,
-				},
-			},
-		),
-	);
-	const html = app.innerHTML;
-	const start = html.indexOf('aria-label="Recall"');
-	expect(start).toBeGreaterThan(-1);
-	return html.slice(start, html.indexOf("</section>", start));
-}
-
-describe("Recall card", () => {
-	it("invites a CLI run in the empty state — recall is no longer MCP-only", () => {
-		const html = recallHtml({});
-		expect(html).toContain("No recall calls recorded in this window");
-		expect(html).toContain("jolli recall");
-		expect(html).not.toContain("Only Claude transcripts");
-	});
-
-	it("names the skill runs that never recalled, when that is all there is", () => {
-		expect(recallHtml({ skillInvocations: 2 })).toContain("without recalling anything");
-	});
-
-	it("splits served calls by the surface that answered them", () => {
-		const html = recallHtml({
-			usedCalls: 3,
-			setAsideCalls: 1,
-			contextServedPct: 75,
-			sessionsWithContext: 2,
-			sessionsInWindow: 4,
-			bySurface: [
-				{ surface: "mcp", calls: 3 },
-				{ surface: "cli", calls: 1 },
-			],
-			daily: [{ date: "2026-07-30", used: 3, setAside: 1 }],
-		});
-		expect(html).toContain("3 used");
-		// The footnote is ONE line now — the coverage ratio. The surface split moved
-		// into the ⓘ's hover, as plain text (a `title` attribute renders no tags).
-		expect(html).toContain("<b>2</b> of 4 sessions got prior context");
-		expect(html).toContain("3 via the recall tool, 1 via the CLI");
-		expect(html).not.toContain("<b>3</b> via the recall tool");
-		// Two sessions DO account for the calls here, so the session-less caveat
-		// does not apply and must not be raised.
-		expect(html).not.toContain("belongs to no session");
-		expect(html).not.toContain("undefined");
-		expect(html).not.toContain("NaN");
-	});
-
-	it("raises the session-less caveat exactly when such a call exists", () => {
-		const withSessions = recallHtml({
-			usedCalls: 2,
-			setAsideCalls: 0,
-			contextServedPct: 100,
-			sessionsWithContext: 2,
-			callsWithoutSession: 0,
-			sessionsInWindow: 3,
-			bySurface: [{ surface: "cli", calls: 2 }],
-			daily: [{ date: "2026-07-30", used: 2, setAside: 0 }],
-		});
-		expect(withSessions).not.toContain("belonging to no session");
-		// `jolli recall` from a plain shell, or a host that publishes no session id.
-		const sessionless = recallHtml({
-			usedCalls: 2,
-			setAsideCalls: 0,
-			contextServedPct: 100,
-			sessionsWithContext: 0,
-			callsWithoutSession: 2,
-			sessionsInWindow: 3,
-			bySurface: [{ surface: "cli", calls: 2 }],
-			daily: [{ date: "2026-07-30", used: 2, setAside: 0 }],
-		});
-		expect(sessionless).toContain("2 recalls ran outside an agent session");
-	});
-
-	it("raises it in a MIXED window too — the case the old condition stayed silent for", () => {
-		// The condition used to be `sessionsWithContext === 0`, which reads as "no
-		// session claims these calls" but means "not ONE receipt names a session".
-		// A window with both kinds of call — the very situation the caveat exists to
-		// explain — therefore never showed it.
-		const mixed = recallHtml({
-			usedCalls: 5,
-			setAsideCalls: 0,
-			contextServedPct: 100,
-			sessionsWithContext: 3,
-			callsWithoutSession: 1,
-			sessionsInWindow: 4,
-			bySurface: [{ surface: "cli", calls: 5 }],
-			daily: [{ date: "2026-07-30", used: 5, setAside: 0 }],
-		});
-		expect(mixed).toContain("1 recall ran outside an agent session");
-	});
-
-	it("says `call is` for one receipt-less call and `calls are` for several", () => {
-		const one = recallHtml({
-			usedCalls: 1,
-			setAsideCalls: 0,
-			contextServedPct: 100,
-			callsWithoutReceipt: 1,
-			bySurface: [{ surface: "cli", calls: 1 }],
-			daily: [{ date: "2026-07-30", used: 1, setAside: 0 }],
-		});
-		expect(one).toContain("1 further call is in the transcripts");
-		const many = recallHtml({
-			usedCalls: 1,
-			setAsideCalls: 0,
-			contextServedPct: 100,
-			callsWithoutReceipt: 3,
-			bySurface: [{ surface: "cli", calls: 1 }],
-			daily: [{ date: "2026-07-30", used: 1, setAside: 0 }],
-		});
-		expect(many).toContain("3 further calls are in the transcripts");
-	});
-
-	it("flags skill runs that outnumber the recalls they were supposed to make", () => {
-		const html = recallHtml({
-			usedCalls: 1,
-			setAsideCalls: 0,
-			contextServedPct: 100,
-			skillInvocations: 4,
-			bySurface: [{ surface: "mcp", calls: 1 }],
-			daily: [{ date: "2026-07-30", used: 1, setAside: 0 }],
-		});
-		// In the hover detail now, and reworded to fit a plain-text attribute.
-		expect(html).toContain("the jolli-recall skill ran 4×, more often than recall was called");
-	});
-
-	it("stays quiet about the skill when every invocation did recall", () => {
-		const html = recallHtml({
-			usedCalls: 2,
-			setAsideCalls: 0,
-			contextServedPct: 100,
-			skillInvocations: 2,
-			bySurface: [{ surface: "mcp", calls: 2 }],
-			daily: [{ date: "2026-07-30", used: 2, setAside: 0 }],
-		});
-		expect(html).not.toContain("more often than recall");
-	});
-});
-
 /** The MCPs / Skills card markup, for one `toolUsage` override. */
 function usageHtml(label: string, toolUsage: Record<string, unknown>): string {
 	app.innerHTML = "";
@@ -734,6 +576,114 @@ function usageHtml(label: string, toolUsage: Record<string, unknown>): string {
 function barWidths(html: string): ReadonlyArray<number> {
 	return [...html.matchAll(/width:(\d+)%/g)].map((m) => Number(m[1]));
 }
+
+/** The Decisions card, sliced out of the same rendered page. */
+function decisionsHtml(decisions: Record<string, unknown> | undefined): string {
+	app.innerHTML = "";
+	JD.renderStats(model({}, { decisions }));
+	const html = app.innerHTML;
+	const start = html.indexOf('aria-label="Decisions"');
+	expect(start).toBeGreaterThan(-1);
+	return html.slice(start, html.indexOf("</section>", start));
+}
+
+const LATEST = {
+	title: "Verify before documenting an exact ticket match",
+	commitHash: "h1",
+	repoName: "jolliai",
+	repoIdentity: "https://github.com/jolliai/jolliai",
+	committedAtMs: Date.parse("2026-07-27T16:54:00Z"),
+};
+
+const DECISIONS = { keptCount: 4, repoCount: 1, latest: LATEST, perDay: [{ date: "2026-07-30", count: 4 }] };
+
+describe("Decisions card", () => {
+	it("shows the decision's topic title, opening that memory in a new tab", () => {
+		const html = decisionsHtml(DECISIONS);
+		expect(html).toContain("<strong>Verify before documenting an exact ticket match</strong>");
+		expect(html).toContain('class="dec-jump"');
+		// The SAME deep link the memory's own row carries, so the decision and the
+		// row lead to one place. `detailRepo`, not `repo`: it names the owning repo
+		// without scoping the Memories tree to it.
+		expect(html).toContain("/memories?");
+		expect(html).toContain("hash=h1&detailRepo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai");
+		expect(html).toContain('target="_blank" rel="noopener"');
+	});
+
+	// The card used to render the whole decisions block through an inline-only
+	// markdown renderer — measured at ~1,900 characters on a real memory.
+	it("renders no decision prose and no quote marks", () => {
+		const html = decisionsHtml({ ...DECISIONS, latest: { ...LATEST, text: "picked sqlite because…" } });
+		expect(html).not.toContain("picked sqlite");
+		expect(html).not.toContain("“");
+		expect(html).not.toContain("undefined");
+	});
+
+	// Needs a payload carrying neither a topic title nor a parseable decision
+	// line — an empty quote block would be worse than none.
+	it("omits the quote entirely when the title came back empty", () => {
+		expect(decisionsHtml({ ...DECISIONS, latest: { ...LATEST, title: "" } })).not.toContain("dec-quote");
+	});
+
+	it("renders the card with no quote at all when the window holds no decisions", () => {
+		const html = decisionsHtml({ keptCount: 0, repoCount: 0, perDay: [] });
+		expect(html).toContain("0 kept");
+		expect(html).not.toContain("dec-quote");
+	});
+});
+
+describe("MCPs card footer", () => {
+	const withServers = (over: Record<string, unknown> = {}) =>
+		usageHtml("MCPs", {
+			servers: [{ server: "jollimemory", sessions: 2, calls: 30, tools: 3, agents: [] }],
+			serversTotal: 1,
+			serverCallsTotal: 30,
+			sessionsWithTools: 2,
+			sessionsInWindow: 9,
+			...over,
+		});
+
+	it("says only how many sessions the figures came from", () => {
+		const html = withServers();
+		// The note ends where the sentence ends — nothing follows it in the footer.
+		expect(html).toContain(
+			'<span class="w-measure mcp-card-note">ⓘ from <b>2</b> of 9 sessions in this window</span>',
+		);
+	});
+
+	// The three caveats JOLLI-2191 removed. Each is asserted separately because
+	// they came from three different branches of the old note.
+	it("drops the uncovered-sources, recall-scope and reconstructed-history caveats", () => {
+		const html = withServers({
+			uncoveredSources: ["copilot-chat"],
+			recallCalls: { calls: 4, sessions: 2 },
+		});
+		expect(html).not.toContain("record no tool calls");
+		expect(html).not.toContain("MCP-tool calls only");
+		expect(html).not.toContain("reconstructed from commits");
+		// The recall LINE above the list is a different figure and stays.
+		expect(html).toContain("recall calls");
+	});
+
+	// The empty state is a different element with no session count to trim to,
+	// so it keeps the caveat that says why the list may be short.
+	it("keeps the coverage caveat in the empty state", () => {
+		const html = usageHtml("MCPs", { servers: [], uncoveredSources: ["copilot-chat"] });
+		expect(html).toContain("No MCP calls recorded in this window.");
+		expect(html).toContain("record no tool calls");
+	});
+
+	// Same helper, still printed by the other card that has one.
+	it("leaves the Skills card's own caveat alone", () => {
+		const html = usageHtml("Skills", {
+			skills: [{ name: "jolli-recall", kind: "skill", sessions: 1, calls: 2, agents: [] }],
+			skillsTotal: 1,
+			skillCallsTotal: 2,
+			uncoveredSources: ["copilot-chat"],
+		});
+		expect(html).toContain("record no tool calls");
+	});
+});
 
 describe("ranked list bars", () => {
 	// The bug this pins is a two-layer one, and the renderer owns the second layer:

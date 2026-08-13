@@ -69,18 +69,20 @@
  *      The lone exception is the settings view, whose masked keys, sign-in
  *      state and folder path are gated by the same token above; every other
  *      model this serves is still free of key-derived material.
- *   4. `Sec-Fetch-Site` gates the one thing a GET can do that is NOT free:
- *      building the Stats payload can fire a DecisionGist LLM call. Layers
- *      1+2 do not stop a hostile tab from ISSUING a GET (a `no-cors` request
- *      carries no `Origin` to reject and a loopback `Host` to accept) — they
- *      only stop it reading the reply, which is enough when the reply is the
- *      only thing at stake and not enough when producing it spends money. So
- *      a cross-site request still gets its answer, minus the parts that cost
- *      anything; see {@link ModelRequest.allowModelSpend}. This layer is what
- *      covers the PAGE routes, which deliberately demand no token, and it
- *      degrades to the token check on a client that sends no Fetch-Metadata.
- *      An absent header is trusted as `curl` — a local process spending the
- *      local user's own budget, which needs no help from us to do that.
+ *   4. `Sec-Fetch-Site` names the initiator, which layers 1+2 cannot: they do
+ *      not stop a hostile tab from ISSUING a GET (a `no-cors` request carries
+ *      no `Origin` to reject and a loopback `Host` to accept), only from
+ *      reading the reply. It is one half of `trusted` on `/api/model`, which
+ *      is what keeps the settings view's masked keys behind our own page.
+ *      An absent header is trusted as `curl` — a local process on the user's
+ *      own machine.
+ *
+ *      No GET on this server spends money any more. It used to: the Stats
+ *      payload fired a display-time LLM call to compress the Decisions card's
+ *      text, which is why this layer also carried an `allowModelSpend` gate.
+ *      The card now shows a stored topic title and the call is retired
+ *      (JOLLI-2209), so that gate is gone. Anything reintroducing a paid path
+ *      on a GET needs it back — cross-site reachability here is unchanged.
  */
 
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -120,7 +122,6 @@ import {
 } from "./DashboardModel.js";
 import { buildDashboardModel, buildToolUsagePage, type QueryOptions } from "./DashboardQuery.js";
 import { projectRepoRegistryState } from "./DbBackfill.js";
-import { getDecisionGist } from "./DecisionGist.js";
 import { buildGraphViewerDocument } from "./GraphViewerDocument.js";
 import {
 	buildGraphModel,
@@ -420,30 +421,7 @@ function viewerMessageHtml(message: string): string {
  * because the query layer keeps gaining optional axes, and each new one would
  * otherwise be a positional argument every caller has to thread through.
  */
-export type ModelRequest = Omit<QueryOptions, "timeZone" | "nowMs"> & {
-	/**
-	 * Whether this request may spend model budget (today: the Decisions gist).
-	 * Set for a page render, and for an `/api/model` call that presented the
-	 * token — i.e. one our own page made. A token-free `/api/model` still gets
-	 * the full payload, minus the parts that cost money.
-	 *
-	 * The gate exists because `/api/model` is reachable cross-site in a way the
-	 * page routes are not: a `no-cors` GET carries no `Origin` (so layer 2 never
-	 * fires) and `Host: 127.0.0.1:<port>` passes layer 1, so a background tab
-	 * could loop `?view=stats` with varied window params — each miss on
-	 * DecisionGist's 256-entry cache being a real LLM call the user never sees.
-	 * The `/` redirect builds no model at all, so this is the only route that
-	 * needs the gate.
-	 *
-	 * A `skipReachability` twin sat here, for a caller that read only
-	 * `repos.length` and must not pay the per-repo `git rev-list --branches`
-	 * fan-out. Its one producer was the `/` redirect, back when the destination
-	 * depended on whether any repo was enabled; that redirect is unconditional
-	 * now, so the option had a reader and no writer — an axis whose only effect
-	 * was to make the reachability condition look conditional.
-	 */
-	readonly allowModelSpend?: boolean;
-};
+export type ModelRequest = Omit<QueryOptions, "timeZone" | "nowMs">;
 
 /** Builds the model for one request. Injectable so tests skip the real DB. */
 export type ModelBuilder = (request: ModelRequest) => Promise<DashboardModel>;
@@ -613,7 +591,12 @@ async function defaultModelBuilder(
 							now,
 						)
 					: undefined;
-			const built = buildDashboardModel(db, {
+			// Every view is now served straight from the database. The stats view
+			// used to get one more step here — a display-time LLM call compressing
+			// the Decisions card's text — which is what made this builder async and
+			// gave a GET a way to spend money. The card shows a stored topic title
+			// now, so the call is retired (JOLLI-2209).
+			return buildDashboardModel(db, {
 				...request,
 				...(settingsModel ? { settingsModel } : {}),
 				...(knowledgeModel ? { knowledgeModel } : {}),
@@ -621,40 +604,9 @@ async function defaultModelBuilder(
 				...(reachableCommits ? { reachableCommits } : {}),
 				...(authorIdentity ? { authorIdentity } : {}),
 			});
-			return attachDecisionGist(built, request, configDir);
 		},
 		{ dbPath },
 	);
-}
-
-/**
- * Stats view only: compresses the Decisions card's "Latest" text into one
- * sentence for display. Runs after `buildDashboardModel` (rather than as a
- * pre-fetch alongside the settings/reachability reads above) because the text to
- * compress isn't known until that call returns the `latest` decision. Fails
- * open — a missing API key, LLM error, or timeout just leaves `latest.text`
- * as-is; see DecisionGist.ts.
- *
- * This is the ONLY place a browser-reachable route can spend model budget, so
- * it is also where `allowModelSpend` is enforced; skipping it degrades the card
- * to its un-compressed text, which is what a gist failure already does.
- */
-async function attachDecisionGist(
-	model: DashboardModel,
-	request: ModelRequest,
-	configDir: string | undefined,
-): Promise<DashboardModel> {
-	if (!request.allowModelSpend) return model;
-	const stats = request.view === "stats" ? model.stats : undefined;
-	const decisions = stats?.decisions;
-	const latest = decisions?.latest;
-	if (!stats || !decisions || !latest) return model;
-
-	const config = await loadConfigFromDir(configDir ?? getGlobalConfigDir());
-	const gist = await getDecisionGist(latest.commitHash, latest.text, config);
-	if (!gist) return model;
-
-	return { ...model, stats: { ...stats, decisions: { ...decisions, latest: { ...latest, gist } } } };
 }
 
 export interface DashboardServerOptions {
@@ -799,23 +751,18 @@ function hasValidToken(req: IncomingMessage, token: string): boolean {
 }
 
 /**
- * Whether a request may build a payload that costs money — see
- * {@link ModelRequest.allowModelSpend}. Two independent signals, because
- * neither covers the whole surface on its own:
+ * Whether the request was initiated by a page we did not serve.
  *
- *   - `Sec-Fetch-Site` (sent by every current browser, and by nothing else)
- *     names the initiator. `cross-site`/`same-site` is a page we did not
- *     serve, whatever it is loading us as — and it is the ONLY signal that
- *     covers the PAGE routes, which an `<img src="…/stats">` reaches just as
- *     easily as `/api/model` and where no token can be demanded without
- *     breaking "open the URL by hand".
- *   - The token covers `/api/model` for a client that sends no Fetch-Metadata
- *     at all (an old browser), where the header's absence is indistinguishable
- *     from `curl`.
+ * `Sec-Fetch-Site` is sent by every current browser and by nothing else, so it
+ * names the initiator: `cross-site`/`same-site` is someone else's page,
+ * whatever it is loading us as. Paired with the token on `/api/model` (see
+ * `trusted`) because neither covers that route alone — the token is missing
+ * from an old browser that sends no Fetch-Metadata, and the header is missing
+ * from `curl`.
  *
  * An absent header therefore means "not a browser" and is trusted: that is
- * `curl` on the user's own machine, which can spend the user's own budget by
- * a hundred easier routes than this one.
+ * `curl` on the user's own machine, which can read this database directly by a
+ * hundred easier routes than this one.
  */
 function isCrossSiteRequest(req: IncomingMessage): boolean {
 	const site = req.headers["sec-fetch-site"];
@@ -1173,8 +1120,7 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			// on whether anything was enabled yet, so the redirect had to know.
 			// With Repositories gone there is one destination, and the "nothing
 			// enabled" case is a state the Dashboard renders rather than a place
-			// to be sent. That deletes a full model build (and the DecisionGist
-			// avoidance dance it was shaped around) from the base URL.
+			// to be sent. That deletes a full model build from the base URL.
 			res.writeHead(302, { Location: "/dashboard" });
 			res.end();
 			return;
@@ -1192,13 +1138,11 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		if (pageView) {
 			// A page render is a top-level navigation the user can see, and it is
 			// what the product call ("opening the URL by hand just works") is about
-			// — so no token here. A cross-site `<img src="…/stats">` reaches this
-			// route too, though, and only Fetch-Metadata can tell the two apart.
+			// — so no token here, and nothing this builds costs anything.
 			const model = await buildModel({
 				view: pageView,
 				scope: parseScope(url),
 				...parseWindow(url),
-				allowModelSpend: !isCrossSiteRequest(req),
 			});
 			assetsDir ??= options.assetsDir ?? resolveDashboardAssetsDir();
 			const html = assembleDashboardHtml(assetsDir, JSON.stringify(model), token);
@@ -1298,8 +1242,10 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 				sendText(res, 403, "Forbidden");
 				return;
 			}
-			// Otherwise the route stays open as layer 3 promises; the token only
-			// decides whether the answer may cost money — see `ModelRequest.allowModelSpend`.
+			// Otherwise the route stays open as layer 3 promises: every other view
+			// here is a free public read, and `trusted` decides nothing beyond the
+			// settings gate above. (It used to also gate the Decisions gist's LLM
+			// call — the one paid path a GET had, now retired.)
 			sendJson(
 				res,
 				200,
@@ -1307,7 +1253,6 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 					view,
 					scope: parseScope(url),
 					...parseWindow(url),
-					allowModelSpend: trusted,
 				}),
 			);
 			return;

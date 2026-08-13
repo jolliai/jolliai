@@ -1522,526 +1522,6 @@ describe("buildDashboardModel — tool usage", () => {
 	});
 });
 
-describe("buildDashboardModel — recall usage", () => {
-	let dir: string;
-	let dbPath: string;
-	const nowMs = Date.parse("2026-07-30T12:00:00Z");
-
-	beforeEach(() => {
-		dir = mkdtempSync(join(tmpdir(), "jolli-recall-"));
-		dbPath = join(dir, "dashboard.db");
-	});
-
-	afterEach(() => {
-		rmSync(dir, { recursive: true, force: true });
-	});
-
-	const repoEvent: StatsEventEnvelope = {
-		producerKind: "cli",
-		event: {
-			type: "repo.enabled",
-			repoIdentity: "repo-1",
-			repoName: "jolli",
-			worktreeRoot: "/w",
-			enabledAt: "t",
-		},
-	};
-
-	/** One session, with no recall of its own — receipts are their own events now. */
-	const sessionWith = (
-		sessionId: string,
-		source: "claude" | "codex" = "claude",
-		updatedAtMs: number = nowMs - 3_600_000,
-	): StatsEventEnvelope => ({
-		producerKind: "cli",
-		event: { type: "session.upserted", repoIdentity: "repo-1", source, sessionId, updatedAtMs },
-	});
-
-	/** One recall call, as the surface that served it recorded it. */
-	const recall = (
-		outcome: {
-			hit: boolean;
-			commitCount: number;
-			commits: ReadonlyArray<{ hash: string; date: string }>;
-		},
-		over: { atMs?: number; sessionId?: string; surface?: "mcp" | "cli" } = {},
-	): StatsEventEnvelope => ({
-		producerKind: "cli",
-		event: {
-			type: "recall.observed",
-			repoIdentity: "repo-1",
-			surface: over.surface ?? "mcp",
-			atMs: over.atMs ?? nowMs - 3_600_000,
-			...(over.sessionId ? { sessionId: over.sessionId } : {}),
-			outcome,
-		},
-	});
-
-	const hit = (hash: string, date: string) => ({ hit: true, commitCount: 1, commits: [{ hash, date }] });
-	const miss = { hit: false, commitCount: 0, commits: [] };
-
-	const recallUsage = async () =>
-		(
-			await withDashboardDb(
-				(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
-				{ dbPath },
-			)
-		).stats?.recallUsage;
-
-	it("splits calls into used vs set aside and computes the served percentage", async () => {
-		await applySummaryEvents(
-			[
-				repoEvent,
-				recall(hit("a".repeat(40), "2026-07-20"), { atMs: nowMs - 3_600_000 }),
-				recall(miss, { atMs: nowMs - 3_500_000 }),
-				recall(hit("b".repeat(40), "2026-07-25"), { atMs: nowMs - 3_400_000 }),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		expect(result?.usedCalls).toBe(2);
-		expect(result?.setAsideCalls).toBe(1);
-		expect(result?.contextServedPct).toBe(67); // round(2/3 * 100)
-	});
-
-	it("counts a CLI recall exactly like an MCP one, and splits them by surface", async () => {
-		// The whole point of the receipt: before it, only an MCP call inside a
-		// Claude session could ever be seen here.
-		await applySummaryEvents(
-			[
-				repoEvent,
-				recall(hit("a".repeat(40), "2026-07-20"), { surface: "cli", atMs: nowMs - 3_600_000 }),
-				recall(miss, { surface: "mcp", atMs: nowMs - 3_500_000 }),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		expect(result?.usedCalls).toBe(1);
-		expect(result?.bySurface).toEqual([
-			{ surface: "cli", calls: 1 },
-			{ surface: "mcp", calls: 1 },
-		]);
-	});
-
-	it("counts distinct memories used, deduped by hash, and flags ones older than 30 days", async () => {
-		await applySummaryEvents(
-			[
-				repoEvent,
-				// Same hash served twice — counts once.
-				recall(hit("a".repeat(40), "2026-07-25"), { atMs: nowMs - 3_600_000 }),
-				recall(hit("a".repeat(40), "2026-07-25"), { atMs: nowMs - 3_500_000 }),
-				// A second, distinct memory older than 30 days as of nowMs (2026-07-30).
-				recall(hit("b".repeat(40), "2026-06-01"), { atMs: nowMs - 3_400_000 }),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		expect(result?.distinctMemoriesUsed).toBe(2);
-		expect(result?.staleMemoriesUsed).toBe(1);
-	});
-
-	it("counts sessions that got usable context out of all sessions in the window", async () => {
-		await applySummaryEvents(
-			[
-				repoEvent,
-				sessionWith("s1"),
-				sessionWith("s2"),
-				sessionWith("s3", "codex"),
-				recall(hit("a".repeat(40), "2026-07-25"), { sessionId: "s1", atMs: nowMs - 3_600_000 }),
-				recall(miss, { sessionId: "s2", atMs: nowMs - 3_500_000 }),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		expect(result?.sessionsWithContext).toBe(1);
-		expect(result?.sessionsInWindow).toBe(3);
-	});
-
-	it("counts a recalling session that has no sessions row yet", async () => {
-		// A receipt is written at the edge the moment `recall` is called; the
-		// `sessions` row only appears when StopHook or the editor tick runs. With
-		// the denominator taken from `sessions` alone, a fresh agent that recalled
-		// on its first turn rendered "1 of 0 sessions got prior context".
-		await applySummaryEvents(
-			[repoEvent, recall(hit("a".repeat(40), "2026-07-25"), { sessionId: "brand-new", atMs: nowMs - 60_000 })],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		expect(result?.sessionsWithContext).toBe(1);
-		expect(result?.sessionsInWindow).toBe(1);
-	});
-
-	it("counts a session-less call in the totals but attributes it to no session", async () => {
-		// `jolli recall` typed at a shell prompt: a real call, no session to own it.
-		await applySummaryEvents(
-			[repoEvent, sessionWith("s1"), recall(hit("a".repeat(40), "2026-07-25"), { surface: "cli" })],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		expect(result?.usedCalls).toBe(1);
-		expect(result?.sessionsWithContext).toBe(0);
-		expect(result?.callsWithoutSession).toBe(1);
-	});
-
-	it("counts session-less calls on their own, so a mixed window can say so", async () => {
-		// `callsWithoutSession` is the statement "some receipt names no session",
-		// which `sessionsWithContext === 0` ("no receipt names one") cannot make.
-		// Both halves count: a set-aside call outside a session is just as
-		// unattributable as a used one.
-		await applySummaryEvents(
-			[
-				repoEvent,
-				sessionWith("s1"),
-				recall(hit("a".repeat(40), "2026-07-25"), { sessionId: "s1", atMs: nowMs - 3_600_000 }),
-				recall(hit("b".repeat(40), "2026-07-25"), { surface: "cli", atMs: nowMs - 3_500_000 }),
-				recall(miss, { surface: "cli", atMs: nowMs - 3_400_000 }),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		expect(result?.sessionsWithContext).toBe(1);
-		expect(result?.callsWithoutSession).toBe(2);
-	});
-
-	/**
-	 * Seeds the `jollimemory` recall REFERENCE — the only receipt-less channel
-	 * that timestamps each call, and therefore the only one that can place a
-	 * pre-receipt call on a day. Written directly because it reaches the database
-	 * through the orphan import, not through the event stream.
-	 */
-	const seedRecallReference = async (atIsos: ReadonlyArray<string>): Promise<void> => {
-		await withDashboardDb(
-			(db) => {
-				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
-					id: number;
-				};
-				// Entry-line form (`ACCUMULATED_ENTRY_RE`), one per call, distinct query
-				// texts so the accumulator does not collapse them into one.
-				const body = atIsos.map((at, i) => `- \`query ${i}\` — ${at}`).join("\n");
-				// `referenced_at` is NOT NULL exactly for a reference (schema CHECK); the
-				// value is the row's own bookmark time, which the per-call entry lines in
-				// `body_md` are what this test actually reads.
-				db.prepare(
-					`INSERT INTO context
-					   (repo_id, kind, context_key, source, native_id, referenced_at, title, body_md, created_at_ms)
-					 VALUES (?, 'reference', 'jollimemory:recall', 'jollimemory', 'recall', ?, 'Recall', ?, 1)`,
-				).run(id, atIsos[0] ?? "2026-07-01T00:00:00.000Z", body);
-			},
-			{ dbPath },
-		);
-	};
-
-	it("buckets receipts by their own day, so a multi-day window shows a bar per day", async () => {
-		// The regression this pins: `daily` is the ONLY per-day series on the card,
-		// and a chart holding one bar is indistinguishable from a broken one — so
-		// "receipts land in their own day" has to be asserted, not assumed.
-		const day = 86_400_000;
-		await applySummaryEvents(
-			[
-				repoEvent,
-				recall(hit("a".repeat(40), "2026-07-25"), { atMs: nowMs - 4 * day }),
-				// Two calls on ONE day, a second apart. Not the same instant: a receipt
-				// is keyed on `statsEventId`, whose only distinguishing part for a call
-				// is when it happened, so two receipts sharing a millisecond converge on
-				// one row by design (`ON CONFLICT(receipt_id) DO UPDATE`).
-				recall(hit("b".repeat(40), "2026-07-25"), { atMs: nowMs - 2 * day }),
-				recall(miss, { atMs: nowMs - 2 * day + 1_000 }),
-				recall(hit("c".repeat(40), "2026-07-25"), { atMs: nowMs }),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		const active = (result?.daily ?? []).filter((d) => d.used > 0 || d.setAside > 0);
-		expect(active).toEqual([
-			{ date: "2026-07-26", used: 1, setAside: 0 },
-			{ date: "2026-07-28", used: 1, setAside: 1 },
-			{ date: "2026-07-30", used: 1, setAside: 0 },
-		]);
-		// Every day of the window is present, zeros included — that is what lets
-		// the chart draw an axis instead of floating three bars in blank space.
-		expect(result?.daily.length).toBeGreaterThan(3);
-	});
-
-	it("reports the first receipt's day unwindowed, as the series' starting boundary", async () => {
-		await applySummaryEvents(
-			[repoEvent, recall(hit("a".repeat(40), "2026-07-25"), { atMs: nowMs - 2 * 86_400_000 })],
-			{ producerKind: "cli", dbPath },
-		);
-		expect((await recallUsage())?.receiptsSinceDate).toBe("2026-07-28");
-	});
-
-	it("leaves the starting boundary absent when nothing has ever been receipted", async () => {
-		await applySummaryEvents([repoEvent], { producerKind: "cli", dbPath });
-		expect((await recallUsage())?.receiptsSinceDate).toBeUndefined();
-	});
-
-	it("places a receipt-less call on its own day from the reference's timestamp", async () => {
-		// Pre-receipt history: the call is known and dated, its OUTCOME is not.
-		await applySummaryEvents([repoEvent], { producerKind: "cli", dbPath });
-		await seedRecallReference(["2026-07-28T04:00:00.000Z", "2026-07-28T05:00:00.000Z"]);
-		const result = await recallUsage();
-		expect(result?.callsWithoutReceipt).toBe(2);
-		expect(result?.daily.find((d) => d.date === "2026-07-28")).toEqual({
-			date: "2026-07-28",
-			used: 0,
-			setAside: 0,
-			estimated: 2,
-		});
-	});
-
-	it("drops the estimate on any day a receipt already covers, so one call is never counted twice", async () => {
-		// From the day receipts shipped, BOTH channels see the same call — the
-		// reference extractor bookmarks exactly the recalls the serving code
-		// receipted. Summing them would double that day.
-		await applySummaryEvents(
-			[repoEvent, recall(hit("a".repeat(40), "2026-07-25"), { atMs: Date.parse("2026-07-28T06:00:00Z") })],
-			{ producerKind: "cli", dbPath },
-		);
-		await seedRecallReference(["2026-07-28T06:00:00.000Z", "2026-07-26T06:00:00.000Z"]);
-		const result = await recallUsage();
-		// The receipted day is told by its receipt alone...
-		expect(result?.daily.find((d) => d.date === "2026-07-28")).toEqual({
-			date: "2026-07-28",
-			used: 1,
-			setAside: 0,
-		});
-		// ...while a day with no receipt keeps its estimate.
-		expect(result?.daily.find((d) => d.date === "2026-07-26")?.estimated).toBe(1);
-	});
-
-	it("omits `estimated` entirely on an ordinary day", async () => {
-		// The field means "evidence with no recorded outcome". Emitting a 0 on
-		// every point would put the key on every series for every machine.
-		await applySummaryEvents([repoEvent, recall(hit("a".repeat(40), "2026-07-25"))], {
-			producerKind: "cli",
-			dbPath,
-		});
-		expect((await recallUsage())?.daily.every((d) => !("estimated" in d))).toBe(true);
-	});
-
-	it("reports skill invocations separately, so they cannot move the hit rate", async () => {
-		await applySummaryEvents(
-			[
-				repoEvent,
-				{
-					producerKind: "cli",
-					event: {
-						type: "session.upserted",
-						repoIdentity: "repo-1",
-						source: "claude",
-						sessionId: "s1",
-						updatedAtMs: nowMs - 3_600_000,
-						tools: [{ name: "jolli-recall", kind: "skill", calls: 3 }],
-					},
-				} as StatsEventEnvelope,
-				recall(hit("a".repeat(40), "2026-07-25"), { sessionId: "s1" }),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		expect(result?.skillInvocations).toBe(3);
-		expect(result?.usedCalls).toBe(1);
-		expect(result?.contextServedPct).toBe(100);
-	});
-
-	it("buckets calls into the daily series, summing back to the totals", async () => {
-		await applySummaryEvents(
-			[repoEvent, recall(hit("a".repeat(40), "2026-07-25")), recall(miss, { atMs: nowMs - 3_500_000 })],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		const totalUsed = result?.daily.reduce((sum, d) => sum + d.used, 0);
-		const totalSetAside = result?.daily.reduce((sum, d) => sum + d.setAside, 0);
-		expect(totalUsed).toBe(1);
-		expect(totalSetAside).toBe(1);
-	});
-
-	it("windows a call by its own atMs, not by any session's updatedAtMs", async () => {
-		// A session updated (e.g. re-summarized) inside the window, but whose one
-		// recall call actually happened weeks earlier, outside the window — must
-		// NOT be counted as "today"'s call.
-		const staleCallMs = Date.parse("2026-05-01T00:00:00Z");
-		await applySummaryEvents(
-			[repoEvent, sessionWith("s1"), recall(hit("a".repeat(40), "2026-07-25"), { atMs: staleCallMs })],
-			{ producerKind: "cli", dbPath },
-		);
-		expect((await recallUsage())?.usedCalls).toBe(0);
-	});
-
-	it("counts a call inside the window even when its session last updated outside the window", async () => {
-		await applySummaryEvents(
-			[
-				repoEvent,
-				sessionWith("s1", "claude", Date.parse("2026-06-01T00:00:00Z")),
-				recall(hit("a".repeat(40), "2026-07-25"), { sessionId: "s1", atMs: nowMs - 3_600_000 }),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		expect(result?.usedCalls).toBe(1);
-		// The session itself last updated outside the window, but its in-window
-		// call must still be reflected in the denominator — otherwise the page
-		// reports the nonsensical "1 of 0 sessions got prior context".
-		expect(result?.sessionsWithContext).toBe(1);
-		expect(result?.sessionsInWindow).toBe(1);
-	});
-
-	/** One session carrying recall tool rows, with an explicit per-call time. */
-	const sessionWithRecallTools = (
-		sessionId: string,
-		tools: ReadonlyArray<{ name: string; kind: "skill" | "mcp"; server?: string; lastCallAtMs?: number }>,
-		updatedAtMs: number = nowMs - 3_600_000,
-		source: "claude" | "codex" = "claude",
-	): StatsEventEnvelope =>
-		({
-			producerKind: "cli",
-			event: {
-				type: "session.upserted",
-				repoIdentity: "repo-1",
-				source,
-				sessionId,
-				updatedAtMs,
-				tools: tools.map((t) => ({ ...t, calls: 1 })),
-			},
-		}) as StatsEventEnvelope;
-
-	it("ranks the Skills panel by the call's own time too, matching the Recall card", async () => {
-		// Same rows, same table, two panels: a bucket that lands in the window for
-		// one and outside it for the other is a contradiction with no resolution
-		// available to the reader.
-		await applySummaryEvents(
-			[
-				repoEvent,
-				sessionWithRecallTools(
-					"fresh-call",
-					[{ name: "jolli-recall", kind: "skill", lastCallAtMs: nowMs - 3_600_000 }],
-					Date.parse("2026-05-01T00:00:00Z"),
-				),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		const model = await withDashboardDb(
-			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
-			{ dbPath },
-		);
-		expect(model.stats?.toolUsage.skills).toEqual([
-			{ name: "jolli-recall", kind: "skill", sessions: 1, calls: 1, agents: [{ source: "claude", calls: 1 }] },
-		]);
-		expect(model.stats?.recallUsage.skillInvocations).toBe(1);
-	});
-
-	it("windows a tool row by the CALL's own time, not by its session's", async () => {
-		// The defect this column exists for: a session updated inside the window
-		// whose recall actually happened months ago was filed under today, and a
-		// call made an hour ago inside a long-running session was filed under
-		// whenever that session last updated.
-		await applySummaryEvents(
-			[
-				repoEvent,
-				sessionWithRecallTools("stale-call", [
-					{ name: "jolli-recall", kind: "skill", lastCallAtMs: Date.parse("2026-05-01T00:00:00Z") },
-				]),
-				sessionWithRecallTools(
-					"fresh-call",
-					[{ name: "jolli-recall", kind: "skill", lastCallAtMs: nowMs - 3_600_000 }],
-					Date.parse("2026-05-01T00:00:00Z"),
-				),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		// One in, one out — and note the two sessions' `updatedAtMs` say the exact
-		// opposite, which is what the old windowing read.
-		expect((await recallUsage())?.skillInvocations).toBe(1);
-	});
-
-	it("falls back to the session's time for a row whose parser stamped none", async () => {
-		// Rows written before the column existed, and sources whose parsers cannot
-		// supply a per-call time, hold NULL — a bare comparison against NULL is
-		// false, so without COALESCE every one of them would silently vanish from
-		// every window rather than keep its old placement.
-		await applySummaryEvents(
-			[repoEvent, sessionWithRecallTools("untimed", [{ name: "jolli-recall", kind: "skill" }])],
-			{ producerKind: "cli", dbPath },
-		);
-		expect((await recallUsage())?.skillInvocations).toBe(1);
-	});
-
-	it("counts a skill run that left no MCP call and no attributable receipt", async () => {
-		// The CLI-fallback recall: a `kind='skill'` row and nothing else. It used
-		// to be invisible — `callsWithoutReceipt` only ever looked at MCP rows.
-		await applySummaryEvents(
-			[
-				repoEvent,
-				sessionWithRecallTools("codex-1", [{ name: "jolli-recall", kind: "skill" }], undefined, "codex"),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		expect(result?.skillRunsWithoutTrace).toBe(1);
-		// Kept OUT of the call bound: a skill run that never recalled looks the same.
-		expect(result?.callsWithoutReceipt).toBe(0);
-		expect(result?.usedCalls).toBe(0);
-	});
-
-	it("does not count a skill run whose session also carries the MCP call", async () => {
-		await applySummaryEvents(
-			[
-				repoEvent,
-				sessionWithRecallTools("claude-1", [
-					{ name: "jolli:recall", kind: "skill" },
-					{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory" },
-				]),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		expect((await recallUsage())?.skillRunsWithoutTrace).toBe(0);
-	});
-
-	it("does not count a skill run whose session has a receipt of its own", async () => {
-		await applySummaryEvents(
-			[
-				repoEvent,
-				sessionWithRecallTools("claude-2", [{ name: "jolli-recall", kind: "skill" }]),
-				recall(hit("a".repeat(40), "2026-07-25"), { sessionId: "claude-2", surface: "cli" }),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		expect((await recallUsage())?.skillRunsWithoutTrace).toBe(0);
-	});
-
-	it("subtracts session-less receipts, so a CLI recall is not counted twice", async () => {
-		// codex/opencode export no session id, so their CLI receipt lands
-		// unattributed — the same call the skill row describes. Counting both
-		// would report one recall as two.
-		await applySummaryEvents(
-			[
-				repoEvent,
-				sessionWithRecallTools("codex-2", [{ name: "jolli-recall", kind: "skill" }], undefined, "codex"),
-				recall(hit("a".repeat(40), "2026-07-25"), { surface: "cli" }),
-			],
-			{ producerKind: "cli", dbPath },
-		);
-		const result = await recallUsage();
-		expect(result?.callsWithoutSession).toBe(1);
-		expect(result?.skillRunsWithoutTrace).toBe(0);
-	});
-
-	it("is empty, not absent, when nothing made a recall call", async () => {
-		await applySummaryEvents([repoEvent, sessionWith("s1", "codex")], { producerKind: "cli", dbPath });
-		expect(await recallUsage()).toMatchObject({
-			usedCalls: 0,
-			setAsideCalls: 0,
-			contextServedPct: 0,
-			distinctMemoriesUsed: 0,
-			staleMemoriesUsed: 0,
-			sessionsWithContext: 0,
-			sessionsInWindow: 1,
-			bySurface: [],
-			skillInvocations: 0,
-		});
-	});
-});
-
 describe("buildDashboardModel — memory tier (phase 2)", () => {
 	let dir: string;
 	let dbPath: string;
@@ -2234,6 +1714,13 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		expect(model.stats?.totalCommits).toBe(2);
 		expect(model.stats?.memoriesCreated).toBe(2);
 		expect(model.stats?.decisions?.keptCount).toBe(1);
+		// The card's title links here, and `/memories?hash=` resolves against
+		// `memories.commit_hash` — so this has to be the MEMORY's hash, which the
+		// rewrite left behind at `mem1`, and not the live `commits.hash` the alias
+		// join entered from. Selecting the latter sent the click to a detail pane
+		// that could not resolve, on precisely the commits this test covers.
+		expect(model.stats?.decisions?.latest?.commitHash).toBe("mem1");
+		expect(model.stats?.memoryCards?.map((c) => c.commitHash)).toContain("mem1");
 	});
 
 	it("assembles the Decisions card from mined commit decisions, latest first", async () => {
@@ -2247,12 +1734,77 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		if (!decisions) throw new Error("decisions missing");
 		expect(decisions.keptCount).toBe(1);
 		expect(decisions.repoCount).toBe(1);
-		expect(decisions.latest).toMatchObject({ text: "picked sqlite", commitHash: "mem1", repoName: "jolli" });
+		// The card renders the OWNING TOPIC'S TITLE (`t0` in this fixture), not the
+		// decision prose — which is left out of the payload entirely, since the
+		// card is one line wide and a real block runs to ~1,900 characters.
+		expect(decisions.latest).toMatchObject({
+			title: "t0",
+			commitHash: "mem1",
+			repoName: "jolli",
+			// Addresses the memory's row from the card's title link; a repo NAME
+			// cannot, since two registered repos can share one.
+			repoIdentity: "repo-1",
+		});
+		expect(decisions.latest).not.toHaveProperty("text");
 		// decisionsCaptured mirrors the card's count rather than a second query.
 		expect(model.stats?.decisionsCaptured).toBe(1);
+		// …and the per-row counts under Memory Activity are the same rule, so the
+		// list cannot contradict the "N decisions" figure above it.
+		expect(model.stats?.memoryCards.find((c) => c.commitHash === "mem1")?.decisionCount).toBe(1);
+		expect(model.stats?.memoryCards.find((c) => c.commitHash === "mem2")).not.toHaveProperty("decisionCount");
 		// One point per local day of the default 30-day window.
 		expect(decisions.perDay).toHaveLength(30);
 		expect(decisions.perDay.reduce((sum, d) => sum + d.count, 0)).toBe(1);
+	});
+
+	// `TopicSummary.title` is required by the schema, so both branches below are
+	// malformed/pre-schema payloads only — but they are the only inputs that can
+	// put unbounded prose where a one-line title goes, so the bound is pinned.
+	describe("Decisions card title fallback", () => {
+		async function seedTitlelessDecision(decisions: string): Promise<void> {
+			await seedMemory();
+			await withDashboardDb(
+				(db) => {
+					const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+						id: number;
+					};
+					db.prepare("UPDATE memories SET summary_json = ? WHERE repo_id = ? AND commit_hash = 'mem1'").run(
+						JSON.stringify({ commitHash: "mem1", topics: [{ title: "", decisions }] }),
+						id,
+					);
+				},
+				{ dbPath },
+			);
+		}
+
+		async function latestTitle(): Promise<string | undefined> {
+			const model = await withDashboardDb(
+				(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+				{ dbPath },
+			);
+			return model.stats?.decisions?.latest?.title;
+		}
+
+		it("falls back to the clause before the first colon", async () => {
+			await seedTitlelessDecision("- **Picked SQLite**: needed local durability without a server.");
+			expect(await latestTitle()).toBe("Picked SQLite");
+		});
+
+		it("answers empty rather than a paragraph when the bullet has no colon to cut at", async () => {
+			// Measured at 314 characters against a real decisions block: with no
+			// `: ` the old fallback handed the whole bullet to a one-line card.
+			const sprawling = `Rejected the second scheduler entirely ${"because it would own the same fact twice ".repeat(6)}`;
+			expect(sprawling.length).toBeGreaterThan(120);
+			await seedTitlelessDecision(`- **${sprawling}**`);
+			expect(await latestTitle()).toBe("");
+		});
+
+		// The bound only exists to stop prose; a short colon-less bullet is a
+		// perfectly good title and must survive.
+		it("keeps a colon-less bullet that is already title-length", async () => {
+			await seedTitlelessDecision("- **Picked SQLite over a server**");
+			expect(await latestTitle()).toBe("Picked SQLite over a server");
+		});
 	});
 
 	it("builds the branch dimension from memory-enriched commits", async () => {
@@ -2821,6 +2373,11 @@ describe("memory cards feed", () => {
 				severity: "minor",
 				committedAtMs: Date.parse(committedAt),
 				decision: "Keep jittered backoff: contention was the disease.",
+				// ONE, not two: the payload's single topic holds a two-bullet
+				// decisions block, and this counts topics that recorded a decision —
+				// the same rule as `decisionsCaptured`, which is rendered directly
+				// above these rows.
+				decisionCount: 1,
 				estCostUsd: 2.29,
 				turns: 3,
 				insertions: 58,
@@ -2855,6 +2412,77 @@ describe("memory cards feed", () => {
 		await seedCard(payload({ topics: [], recap: undefined }));
 		const [card] = await cards();
 		expect(card.decision).toBeUndefined();
+	});
+
+	// One per TOPIC that recorded a decision — the same rule as
+	// `decisionsCaptured`, which is rendered directly above these rows (the two
+	// are checked against each other in the Decisions card suite). A per-bullet
+	// count would read 4 here and put two disagreeing numbers in one card.
+	it("counts decisions per topic, not per bullet", async () => {
+		await seedCard(
+			payload({
+				topics: [
+					{ title: "A", category: "bugfix", decisions: "- One.\n- Two.\n- Three.", sourceCommits: ["h1"] },
+					{ title: "B", category: "feature", decisions: "- Four.", sourceCommits: ["h1"] },
+					{ title: "C", category: "feature", todo: "no decision here", sourceCommits: ["h1"] },
+				],
+			}),
+		);
+		const [card] = await cards();
+		expect(card.decisionCount).toBe(2);
+	});
+
+	it("omits the count rather than reporting zero when no topic recorded a decision", async () => {
+		await seedCard(payload({ topics: [{ title: "T", category: "feature", sourceCommits: ["h1"] }] }));
+		const [card] = await cards();
+		expect(card).not.toHaveProperty("decisionCount");
+	});
+
+	// `IN (hashes)` matches on the hash alone, so an all-repos dashboard whose
+	// repos share a commit (a fork, a vendored tree) would add the other repo's
+	// decisions to this row without the scope filter on `topic_insights.repo_id`.
+	it("counts only the owning repo's decisions when two repos share a commit hash", async () => {
+		await seedCard(payload());
+		await applySummaryEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-2",
+						repoName: "jolli-fork",
+						worktreeRoot: "/w2",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-2'").get() as {
+					id: number;
+				};
+				db.prepare(
+					`INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, depth,
+					                       summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+					 VALUES (?, 'h1', NULL, NULL, 'h1', 0, ?, 1, 1, ?)`,
+				).run(
+					id,
+					payload({
+						topics: [
+							{ title: "X", decisions: "- fork one.", sourceCommits: ["h1"] },
+							{ title: "Y", decisions: "- fork two.", sourceCommits: ["h1"] },
+						],
+					}),
+					Date.parse(committedAt),
+				);
+			},
+			{ dbPath },
+		);
+		const byRepo = new Map((await cards()).map((c) => [c.repoIdentity, c.decisionCount]));
+		expect(byRepo.get("repo-1")).toBe(1);
+		expect(byRepo.get("repo-2")).toBe(2);
 	});
 
 	it("reads severity off the diff magnitude", async () => {

@@ -914,10 +914,11 @@ window.JD = window.JD || {};
 	/* One model re-fetch (same params the page was rendered with).
 
 	   Carries the token like JD.getJson does, even though /api/model answers
-	   without one: the token is what tells the server this is our own page
-	   rather than a cross-site GET, and a token-free answer omits the parts
-	   that cost model budget (the Decisions gist). Without it a poll would
-	   silently drop the gist the page was rendered with. */
+	   most views without one: the token is what tells the server this is our own
+	   page rather than a cross-site GET, and the settings view is served only to
+	   a token-bearing same-site caller (it carries masked keys and the Memory
+	   Bank path — see DashboardServer's /api/model handler). Without it a poll of
+	   that view would 403 and fall into the catch below. */
 	JD.refreshNow = (render) => {
 		var model = window.__JOLLI_DASHBOARD__;
 		fetch(JD.modelUrl(model), { headers: { "X-Jolli-Dashboard-Token": window.__JOLLI_DASHBOARD_TOKEN__ || "" } })

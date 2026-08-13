@@ -34,14 +34,6 @@ vi.mock("./RepoRegistry.js", async (importOriginal) => ({
 	deregisterRepo: vi.fn().mockResolvedValue("r1"),
 	readRepoRegistry: vi.fn().mockResolvedValue({ version: 1, repos: [] }),
 }));
-// The real getDecisionGist makes an LLM call — mocked here so the
-// defaultModelBuilder wiring test below can control its result directly,
-// same as DecisionGist.test.ts covers the LLM call/cache/fail-open behavior.
-const mockGetDecisionGist = vi.fn<(commitHash: string, text: string, config: unknown) => Promise<string | undefined>>();
-vi.mock("./DecisionGist.js", () => ({
-	getDecisionGist: (commitHash: string, text: string, config: unknown) =>
-		mockGetDecisionGist(commitHash, text, config),
-}));
 // unlink is wrapped (not replaced) so every other state-file test keeps its
 // real filesystem behavior — only the non-ENOENT-unlink-error test below ever
 // overrides it, and only for its own call.
@@ -423,74 +415,60 @@ describe("routes", () => {
 	});
 
 	// A cross-site `no-cors` GET reaches this route (no Origin to reject, a
-	// loopback Host to accept), so the token is what separates our own page's
-	// poll from one — and only the money-spending part of the answer depends
-	// on it. The route itself stays open: `curl /api/model` must keep working.
-	describe("/api/model model-spend gate", () => {
-		const spendFlags: Array<boolean | undefined> = [];
-		const spyServer = () =>
-			testServer({
-				token: "tok",
-				buildModel: async (req) => {
-					spendFlags.push(req.allowModelSpend);
-					return model(req.view);
-				},
-			});
+	// loopback Host to accept), so the token plus Fetch-Metadata is what
+	// separates our own page's poll from one. The settings view is what that
+	// separation now protects — it is the only payload here carrying masked keys,
+	// sign-in state and the Memory Bank path. Every other view stays a free
+	// public read, including for a caller with no token at all: `curl
+	// /api/model` must keep working. (This suite replaces the retired
+	// `allowModelSpend` gate — no GET on this server spends money any more.)
+	describe("/api/model settings gate", () => {
+		const settingsServer = () => testServer({ token: "tok" });
 
-		beforeEach(() => spendFlags.splice(0));
-
-		it("withholds spend from a token-free call but still answers it", async () => {
-			const port = await listen(spyServer());
-			const res = await get(port, "/api/model?view=stats");
-			expect(res.status).toBe(200);
-			expect(((await res.json()) as DashboardModel).view).toBe("stats");
-			expect(spendFlags).toEqual([false]);
-		});
-
-		it("withholds spend when the token is wrong", async () => {
-			const port = await listen(spyServer());
-			await get(port, "/api/model?view=stats", { "X-Jolli-Dashboard-Token": "nope" });
-			expect(spendFlags).toEqual([false]);
-		});
-
-		it("allows spend for our own page's poll, which carries the token", async () => {
-			const port = await listen(spyServer());
-			await get(port, "/api/model?view=stats", { "X-Jolli-Dashboard-Token": "tok" });
-			expect(spendFlags).toEqual([true]);
-		});
-
-		it("allows spend for a page render — the by-hand URL keeps its full payload", async () => {
-			const port = await listen(spyServer());
-			expect((await get(port, "/dashboard")).status).toBe(200);
-			expect(spendFlags).toEqual([true]);
-		});
-
-		// The page routes take no token (that is the product call), so this is
-		// the only thing standing between `<img src="…/stats">` on a hostile tab
-		// and a real LLM call.
-		it("withholds spend from a cross-site page load", async () => {
-			const port = await listen(spyServer());
-			const res = await get(port, "/dashboard", { "Sec-Fetch-Site": "cross-site" });
-			expect(res.status).toBe(200);
-			expect(spendFlags).toEqual([false]);
-		});
-
-		it("withholds spend from a cross-site /api/model even with a valid token", async () => {
-			const port = await listen(spyServer());
-			await get(port, "/api/model?view=stats", {
-				"X-Jolli-Dashboard-Token": "tok",
-				"Sec-Fetch-Site": "cross-site",
-			});
-			expect(spendFlags).toEqual([false]);
-		});
-
-		it("still allows spend for our own page's same-origin poll", async () => {
-			const port = await listen(spyServer());
-			await get(port, "/api/model?view=stats", {
+		it("serves the settings view to our own token-bearing, same-site page", async () => {
+			const port = await listen(settingsServer());
+			const res = await get(port, "/api/model?view=settings", {
 				"X-Jolli-Dashboard-Token": "tok",
 				"Sec-Fetch-Site": "same-origin",
 			});
-			expect(spendFlags).toEqual([true]);
+			expect(res.status).toBe(200);
+			expect(((await res.json()) as DashboardModel).view).toBe("settings");
+		});
+
+		// No Fetch-Metadata at all is `curl`, which the token alone answers for.
+		it("serves the settings view to a token-bearing client that sends no Fetch-Metadata", async () => {
+			const port = await listen(settingsServer());
+			const res = await get(port, "/api/model?view=settings", { "X-Jolli-Dashboard-Token": "tok" });
+			expect(res.status).toBe(200);
+		});
+
+		it("refuses the settings view without a token", async () => {
+			const port = await listen(settingsServer());
+			expect((await get(port, "/api/model?view=settings")).status).toBe(403);
+		});
+
+		it("refuses the settings view when the token is wrong", async () => {
+			const port = await listen(settingsServer());
+			const res = await get(port, "/api/model?view=settings", { "X-Jolli-Dashboard-Token": "nope" });
+			expect(res.status).toBe(403);
+		});
+
+		// The half a token cannot cover: a hostile tab that somehow has the token
+		// still announces itself in `Sec-Fetch-Site`.
+		it("refuses the settings view cross-site even with a valid token", async () => {
+			const port = await listen(settingsServer());
+			const res = await get(port, "/api/model?view=settings", {
+				"X-Jolli-Dashboard-Token": "tok",
+				"Sec-Fetch-Site": "cross-site",
+			});
+			expect(res.status).toBe(403);
+		});
+
+		it("still answers a token-free call for every other view", async () => {
+			const port = await listen(settingsServer());
+			const res = await get(port, "/api/model?view=stats", { "Sec-Fetch-Site": "cross-site" });
+			expect(res.status).toBe(200);
+			expect(((await res.json()) as DashboardModel).view).toBe("stats");
 		});
 	});
 
@@ -1585,14 +1563,14 @@ describe("Decisions card gist (Stats view only)", () => {
 		return committedAtMs;
 	}
 
-	beforeEach(() => {
-		mockGetDecisionGist.mockReset();
-	});
-
-	it("attaches the gist returned by getDecisionGist to the Stats view's latest decision", async () => {
+	// The Decisions card is served straight from the database: the latest
+	// decision arrives as its OWNING TOPIC'S TITLE, with the decision prose left
+	// behind entirely. There is nothing left to gate — the display-time LLM call
+	// that used to compress that prose is retired (JOLLI-2209), so a token-free
+	// call gets the identical payload.
+	it("serves the latest decision as its topic title, with no decision prose on the wire", async () => {
 		const dbPath = join(dir, "dashboard.db");
 		await seedDecisionCommit(dbPath, "mem1", "- **Picked SQLite**: needed local durability without a server.");
-		mockGetDecisionGist.mockResolvedValueOnce("Picked SQLite for local durability.");
 
 		const port = await listen(
 			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config"), token: "tok" }),
@@ -1600,25 +1578,16 @@ describe("Decisions card gist (Stats view only)", () => {
 		const res = await get(port, "/api/model?view=stats", { "X-Jolli-Dashboard-Token": "tok" });
 
 		expect(res.status).toBe(200);
-		const body = (await res.json()) as DashboardModel;
-		expect(body.stats?.decisions?.latest).toMatchObject({
-			commitHash: "mem1",
-			gist: "Picked SQLite for local durability.",
-		});
-		expect(mockGetDecisionGist).toHaveBeenCalledWith(
-			"mem1",
-			"- **Picked SQLite**: needed local durability without a server.",
-			expect.anything(),
-		);
+		const latest = ((await res.json()) as DashboardModel).stats?.decisions?.latest;
+		// `t0` is seedDecisionCommit's topic title.
+		expect(latest).toMatchObject({ commitHash: "mem1", title: "t0" });
+		expect(latest).not.toHaveProperty("text");
+		expect(latest).not.toHaveProperty("gist");
 	});
 
-	// The actual protection: this is the only browser-reachable route that can
-	// spend money, and a cross-site tab can reach it. It must answer — with the
-	// decision, un-compressed — without ever calling the model.
-	it("serves a token-free /api/model?view=stats without calling getDecisionGist", async () => {
+	it("serves a token-free stats call the same decision payload", async () => {
 		const dbPath = join(dir, "dashboard.db");
 		await seedDecisionCommit(dbPath, "mem1", "- **Picked SQLite**: needed local durability without a server.");
-		mockGetDecisionGist.mockResolvedValue("should never be reached");
 
 		const port = await listen(
 			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config"), token: "tok" }),
@@ -1626,39 +1595,10 @@ describe("Decisions card gist (Stats view only)", () => {
 		const res = await get(port, "/api/model?view=stats");
 
 		expect(res.status).toBe(200);
-		const latest = ((await res.json()) as DashboardModel).stats?.decisions?.latest;
-		expect(latest).toMatchObject({ commitHash: "mem1" });
-		expect(latest).not.toHaveProperty("gist");
-		expect(mockGetDecisionGist).not.toHaveBeenCalled();
-	});
-
-	it("falls back to the raw decision text when getDecisionGist fails open", async () => {
-		const dbPath = join(dir, "dashboard.db");
-		await seedDecisionCommit(dbPath, "mem2", "picked sqlite");
-		mockGetDecisionGist.mockResolvedValueOnce(undefined);
-
-		const port = await listen(
-			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config") }),
-		);
-		const res = await get(port, "/api/model?view=stats");
-
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as DashboardModel;
-		expect(body.stats?.decisions?.latest).toMatchObject({ commitHash: "mem2", text: "picked sqlite" });
-		expect(body.stats?.decisions?.latest).not.toHaveProperty("gist");
-	});
-
-	it("never calls getDecisionGist for views other than Stats", async () => {
-		const dbPath = join(dir, "dashboard.db");
-		await seedDecisionCommit(dbPath, "mem3", "picked sqlite");
-
-		const port = await listen(
-			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config") }),
-		);
-		const res = await get(port, "/api/model?view=standup");
-
-		expect(res.status).toBe(200);
-		expect(mockGetDecisionGist).not.toHaveBeenCalled();
+		expect(((await res.json()) as DashboardModel).stats?.decisions?.latest).toMatchObject({
+			commitHash: "mem1",
+			title: "t0",
+		});
 	});
 
 	it("filters the standup board to the local git identity, read per enabled repo", async () => {

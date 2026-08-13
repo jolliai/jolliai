@@ -932,6 +932,17 @@ export interface MemoryCard {
 	readonly committedAtMs: number;
 	/** First recorded decision, else the recap. Absent when the summary has neither. */
 	readonly decision?: string;
+	/**
+	 * How many decisions this commit recorded — one per topic that recorded any,
+	 * the same rule behind {@link StatsModel.decisionsCaptured} and
+	 * {@link DecisionsCard.keptCount}. Those two are rendered as "N decisions" in
+	 * the same card as these rows, so a per-BULLET count here would put two
+	 * numbers that disagree side by side.
+	 *
+	 * Absent rather than `0` when the commit recorded none, like every other
+	 * optional figure on this card.
+	 */
+	readonly decisionCount?: number;
 	readonly estCostUsd?: number;
 	readonly turns?: number;
 	readonly insertions?: number;
@@ -990,23 +1001,51 @@ export interface TokenBreakdown {
 	}>;
 }
 
-/** One decision mined from a commit memory — the Decisions card's "Latest" line. */
+/**
+ * One decision mined from a commit memory — the Decisions card's "Latest" line.
+ *
+ * Carries the owning topic's TITLE, not the decision prose. The card renders
+ * that one line and nothing else, so the block itself (1 sentence to a
+ * multi-bullet paragraph, measured at ~1,900 characters on a real memory) is
+ * deliberately not on the wire — it had no reader and one display-time LLM call
+ * per render existed only to compress it (retired with JOLLI-2209).
+ */
 export interface DecisionRecord {
-	readonly text: string;
+	/**
+	 * The owning topic's title. `""` when the payload carries neither a title nor
+	 * a decision line short enough to stand in for one; the card then renders no
+	 * quote at all, which is the point — this line is one line wide.
+	 */
+	readonly title: string;
+	/**
+	 * The MEMORY's commit hash — what `/memories?hash=` resolves against, since
+	 * that route reads `memories.commit_hash`.
+	 *
+	 * Deliberately not the live `commits.hash`: a commit rewritten after it was
+	 * summarized keeps its memory under the pre-rewrite hash, so for exactly
+	 * those rows the two disagree and the live hash addresses nothing.
+	 */
 	readonly commitHash: string;
 	readonly repoName: string;
+	/**
+	 * Stable repo token, so the card's title can address this memory's row —
+	 * {@link repoName} is a display label two registered repos can share, and
+	 * their commit hashes overlap by construction (a fork, a vendored tree).
+	 */
+	readonly repoIdentity: string;
 	readonly committedAtMs: number;
-	/** One-sentence compression of `text`, generated on demand at display time — see DecisionGist.ts. Absent when not yet computed or the LLM call failed; callers fall back to `text`. */
-	readonly gist?: string;
 }
 
 /**
  * Memory-tier "Decisions" card — a standalone widget distinct from the KPI
  * sub-line and from the per-commit `MemoryCard.decision` line in the feed.
  *
- * Deliberately carries no "recalled" figure: that needs recall receipts, which
- * (like {@link MemoryCard}'s `reuse` field) nothing records yet. Inventing one
- * here would make the same unmeasured claim twice.
+ * Deliberately carries no "recalled" figure. `recall_receipts` does record one
+ * call per recall — that part is written and still is — but nothing ties a
+ * receipt back to the DECISION it served, so "this decision came back" would be
+ * inferred, not measured. The card's subtitle used to promise it and was
+ * corrected with JOLLI-2193; {@link MemoryCard}'s `reuse` field is the same
+ * unmeasured claim and is likewise never emitted.
  */
 export interface DecisionsCard {
 	/** Decisions mined from commit memories in the window. */
@@ -1084,8 +1123,6 @@ export interface StatsModel {
 	readonly decisions?: DecisionsCard;
 	/** Skills, MCP servers and the tool mix — Claude-only coverage, stated. */
 	readonly toolUsage: ToolUsage;
-	/** How often recall actually served usable context — Claude-only coverage, stated. */
-	readonly recallUsage: RecallUsage;
 }
 
 /** A commit row on the Standup page. */
@@ -1263,23 +1300,30 @@ export type ToolUsagePage =
 /**
  * `server.tool` name recorded for the recall feature's own MCP tool — the
  * `session_tool_use.tool_name` value the tool-usage card keys off for its
- * "recall calls" line. The Recall card counts `recall_receipts` — which also
- * sees CLI runs and non-Claude agents — and reads this table only for the
- * pre-receipt history (`RecallUsage.callsWithoutReceipt`).
+ * "recall calls" line, which is the only surface left that reads it. The
+ * standalone Recall card, which counted `recall_receipts` instead, was removed
+ * (JOLLI-2193) along with its query; the receipts themselves are still written.
  */
 export const RECALL_MCP_TOOL_NAME = "jollimemory.recall";
 
-/**
- * The `context` row identity of a recall bookmark — `jollimemory`'s own,
- * self-referential reference source (`cli/src/core/references/sources/
- * definitions/jollimemory.ts`), whose `nativeId` is the TOOL because its
- * identity is an act rather than an entity.
+/*
+ * Removed with the Recall card (JOLLI-2193), because that card was their only
+ * reader and a constant nothing consumes is a contract that drifts unnoticed:
  *
- * The Recall card reads it as the second pre-receipt channel: its body carries
- * one timestamped entry per call, which is what the tool-usage rows lack.
+ *   - `RECALL_REFERENCE_SOURCE` / `RECALL_REFERENCE_NATIVE_ID` — the `context`
+ *     row identity of a recall bookmark, which the card read as its second
+ *     pre-receipt channel (one timestamped entry per call, which the tool-usage
+ *     rows lack). The reference source itself is untouched; it is declared in
+ *     `cli/src/core/references/sources/definitions/jollimemory.ts` and named
+ *     there, not here.
+ *   - `RECALL_SKILL_NAME` / `RECALL_SKILL_NAMES` — every `input.skill` spelling
+ *     of the recall skill (bare `jolli-recall` from a directory install, and
+ *     `jolli:recall` from a plugin one), which fed the card's `skillInvocations`
+ *     gap detector: "the skill ran but never actually recalled".
+ *
+ * Both would have to come back to rebuild that card. `recall_receipts` and
+ * `session_tool_use` still hold the evidence — nothing about the DATA changed.
  */
-export const RECALL_REFERENCE_SOURCE = "jollimemory";
-export const RECALL_REFERENCE_NATIVE_ID = "recall";
 
 /**
  * Suffix that recognises the recall tool under a NAMESPACED server name.
@@ -1305,30 +1349,6 @@ export const RECALL_MCP_TOOL_SUFFIX = "_jollimemory.recall";
 export function isRecallMcpToolName(toolName: string): boolean {
 	return toolName === RECALL_MCP_TOOL_NAME || toolName.endsWith(RECALL_MCP_TOOL_SUFFIX);
 }
-
-/**
- * `session_tool_use` name of the recall SKILL, as `parseToolUse` records it
- * (a `Skill` call is attributed to `input.skill`, so this is the skill's
- * directory name, and its `kind` is `skill` — never `mcp`).
- */
-export const RECALL_SKILL_NAME = "jolli-recall";
-
-/**
- * Every `input.skill` spelling of the recall skill.
- *
- * The installed skill is a directory under `.agents/skills/`, so it records
- * bare (`jolli-recall`). A skill that arrives from a PLUGIN records
- * `<plugin>:<skill>` instead — measured: real transcripts on this machine
- * carry `j:rebase` beside the bare names — and the Jolli plugin re-heads its
- * copies to `jolli:<name>` (see AGENTS.md on `CODEX_PLUGIN_SKILLS`). So a
- * plugin install spells this `jolli:recall`, which matches neither the bare
- * name nor any prefix of it.
- *
- * This matters more than a missing count: `skillInvocations` exists to expose
- * the gap "the skill ran but never actually recalled", so a name that never
- * matches makes the gap detector itself blind.
- */
-export const RECALL_SKILL_NAMES: ReadonlyArray<string> = [RECALL_SKILL_NAME, "jolli:recall"];
 
 /**
  * Tool, skill and MCP-server usage over the window.
@@ -1438,196 +1458,6 @@ export interface ToolUsage {
 	 * its zero is a real zero.
 	 */
 	readonly uncoveredSources: ReadonlyArray<string>;
-}
-
-/** One day's recall calls, split by outcome — the Recall card's bar chart. */
-export interface RecallDayPoint {
-	/** `YYYY-MM-DD`, local to the dashboard's resolved time zone. */
-	readonly date: string;
-	readonly used: number;
-	readonly setAside: number;
-	/**
-	 * Calls this day is known to have had from the `jollimemory` context
-	 * REFERENCE alone — a call with no receipt, so its OUTCOME is unknown and it
-	 * can be neither `used` nor `setAside`.
-	 *
-	 * This is the per-day half of {@link RecallUsage.callsWithoutReceipt}, which
-	 * is the same evidence collapsed to one window-wide number. Only the
-	 * reference channel feeds it: `session_tool_use` rows carry no time of their
-	 * own (they are windowed by their session), so they can say how many but
-	 * never on which day.
-	 *
-	 * **A lower bound, and it must be rendered as one.** The reference body
-	 * collapses a repeated query to a single entry and keeps only the newest 20,
-	 * so a busy day reports fewer calls than it had. Drawing it in the same
-	 * style as `used`/`setAside` would state a precision this number does not
-	 * have.
-	 *
-	 * Zero on any day that has a receipt: from the day receipts shipped both
-	 * channels see the same call, and adding them would double it. The receipt
-	 * is the authoritative one, so the estimate only speaks where it is silent.
-	 */
-	readonly estimated?: number;
-}
-
-/**
- * The Recall card: how often the model actually got prior commit context back
- * versus called recall and got nothing to work with. Derived from parsed
- * `tool_result` content, not from a live write at call time — see
- * `RecallOutcome` — so its coverage is the same Claude-only, transcript-only
- * shape as {@link ToolUsage}, and a bare `jolli recall` CLI run or the skill's
- * non-MCP fallback is invisible to it for the same reason. It also inherits
- * `ToolUsage`'s seeded-session gap: a session known only through
- * `projectCommitSummary`'s `sessionLinks` (older than the source agent's own
- * retention) never gets a `session_tool_use` row for recall at all — sessionLinks
- * carries no tool/payload data — so its zero recall calls cannot be told apart
- * from "never scanned". Recent activity is exact; older activity is
- * reconstructed and silently undercounts.
- */
-export interface RecallUsage {
-	/** Calls whose result carried at least one commit — the model had something to use. */
-	readonly usedCalls: number;
-	/** Calls that came back empty (no exact branch match, or nothing recorded). */
-	readonly setAsideCalls: number;
-	/** `usedCalls / (usedCalls + setAsideCalls) * 100`, rounded; `0` when both are 0. */
-	readonly contextServedPct: number;
-	/** Distinct commit hashes served by a used call, across the window. */
-	readonly distinctMemoriesUsed: number;
-	/** Of those, how many commits are more than 30 days old as of the window end. */
-	readonly staleMemoriesUsed: number;
-	/**
-	 * Sessions with at least one used (not merely called) recall — counted over
-	 * the receipts that carry a session id. A recall run outside any agent
-	 * session (a plain terminal) still counts in {@link usedCalls} but belongs
-	 * to no session and is deliberately not invented one here.
-	 */
-	readonly sessionsWithContext: number;
-	/**
-	 * Receipts in the window that carry NO session id — a recall run outside any
-	 * agent session, which counts in {@link usedCalls} / {@link setAsideCalls} but
-	 * can never be counted in {@link sessionsWithContext}.
-	 *
-	 * Its own figure because nothing else on this card implies it. The card used
-	 * to derive the caveat from `sessionsWithContext === 0`, which is a different
-	 * statement — true only when NOT ONE receipt carries a session — so the
-	 * mixed window this caveat exists for (some calls inside a session, some at a
-	 * shell prompt) was the one case that never showed it, and a machine whose
-	 * every recall carries a session id had it printed unconditionally before
-	 * that.
-	 */
-	readonly callsWithoutSession: number;
-	/** Sessions in the window, whether or not they called recall. */
-	readonly sessionsInWindow: number;
-	/**
-	 * Calls per answering surface, for the whole window. No `uncoveredSources`
-	 * sits beside it any more: a receipt is written by the code that serves the
-	 * call, so coverage no longer depends on whether the caller's agent writes
-	 * parseable transcripts — every source is covered.
-	 */
-	readonly bySurface: ReadonlyArray<{ readonly surface: RecallSurface; readonly calls: number }>;
-	/**
-	 * How many times the `jolli-recall` SKILL was invoked in the window, from
-	 * the transcripts that record skill calls.
-	 *
-	 * Deliberately its own figure rather than part of {@link usedCalls} /
-	 * {@link setAsideCalls}: a skill invocation that goes on to recall (whether
-	 * through the MCP tool or the CLI) already wrote its own receipt, so adding
-	 * it would count that call twice and move the hit rate. What it adds is the
-	 * gap — a skill that was invoked and never actually recalled, which is
-	 * exactly what no other figure on this card can show.
-	 *
-	 * Windowed by the SESSION's `updated_at_ms`, since a per-tool row records
-	 * no time of its own. A long session straddling the window edge therefore
-	 * contributes all or none of its skill calls.
-	 */
-	readonly skillInvocations: number;
-	/**
-	 * Recall calls visible in the transcripts but with NO receipt behind them —
-	 * the backfilled history.
-	 *
-	 * `recall_receipts` is written at the edge, by the surface that serves the
-	 * call, so it starts the day that code shipped and nothing can reconstruct
-	 * it: {@link usedCalls} / {@link setAsideCalls} / {@link distinctMemoriesUsed}
-	 * all describe the call's RESULT, which no durable record keeps. The call
-	 * ITSELF is durable though, in two independent places, so this figure says
-	 * "recall was used N more times, outcome unknown" instead of leaving the
-	 * card empty and implying it was never used at all:
-	 *
-	 *   - `session_tool_use` — `jollimemory.recall` per session, imported from
-	 *     transcripts. Blind to a source that records no tool calls (the gap
-	 *     {@link ToolUsage.uncoveredSources} names). Windowed by the call's own
-	 *     `last_call_at_ms` where the source's parser could stamp one, and by
-	 *     its session's `updated_at_ms` where it could not.
-	 *   - the `jollimemory` context REFERENCE — one timestamped entry per call,
-	 *     so it windows exactly, and it exists for any source the reference
-	 *     extractor covers. Under-reports differently: a repeated query text
-	 *     collapses to one entry and only the newest 20 survive.
-	 *
-	 * Each is a lower bound with a hole the other does not have, and they share
-	 * no key that would let them be joined (a reference has no session id, a
-	 * tool row has no timestamp) — so the larger of the two is taken. Summing
-	 * would double-count the ordinary case where both saw the same call.
-	 *
-	 * Receipted MCP calls are then subtracted, so a window fully covered by
-	 * receipts reports 0 here rather than showing the same calls twice. At a
-	 * window edge the subtraction can be off by one straddling session's calls
-	 * (the receipt and the tool row disagree about which window they are in);
-	 * it is clamped at 0.
-	 */
-	readonly callsWithoutReceipt: number;
-	/**
-	 * Recall SKILL runs in the window that left no other trace: no MCP tool row
-	 * in the same session, and no receipt that can be matched to them.
-	 *
-	 * The population this exists for is the `jolli-recall` skill taking its CLI
-	 * fallback — the documented path for a host with no MCP server, and the one
-	 * every non-Claude agent in the wild actually takes. Such a run leaves a
-	 * `kind='skill'` row and nothing else: no `kind='mcp'` row (so
-	 * {@link callsWithoutReceipt}, which only ever looked at MCP rows, could not
-	 * see it), no reference entry (the extractor bookmarks MCP calls), and its
-	 * `cli` receipt is written without a session id on every host but Claude
-	 * (`currentAgentSessionId` reads `CLAUDE_CODE_SESSION_ID` and nothing else).
-	 * So a real recall could be entirely absent from this card while
-	 * {@link skillInvocations} silently counted it.
-	 *
-	 * NOT folded into {@link callsWithoutReceipt}, deliberately: that figure is a
-	 * lower bound on CALLS, and this population is ambiguous by construction — a
-	 * skill run that was invoked and then never recalled anything looks exactly
-	 * the same from here, and is precisely what {@link skillInvocations} exists
-	 * to expose. Merging the two would let "the skill ran and did nothing" inflate
-	 * a count of calls, turning a bound into a guess. Kept separate, each number
-	 * keeps its own meaning and the card can word them differently.
-	 *
-	 * Subtraction happens in two stages, and both are needed. Per session, the
-	 * session's own MCP rows and its attributed receipts come off first — that is
-	 * the ordinary Claude case, where the skill did call the MCP tool and a
-	 * receipt names the session. Then the window's SESSION-LESS receipts come off
-	 * the total, because those are exactly the CLI recalls that cannot be
-	 * attributed to any session; each one plausibly IS one of these runs, and
-	 * counting both would report the same call twice. Clamped at 0 throughout.
-	 */
-	readonly skillRunsWithoutTrace: number;
-	/**
-	 * The day the FIRST receipt in scope was written — `YYYY-MM-DD`, same local
-	 * time zone and same shape as {@link RecallDayPoint.date}.
-	 *
-	 * Absent when no receipt exists at all. Deliberately unwindowed: it answers
-	 * "since when has anything been recorded here", which is the one question a
-	 * windowed figure cannot. Without it a 30-day chart holding one bar is
-	 * indistinguishable from a broken chart — the reader has no way to know that
-	 * the 29 empty days pre-date recording rather than being days nobody
-	 * recalled. The card draws it as the boundary the series begins at.
-	 *
-	 * A day KEY, not the raw epoch-ms it is derived from, because the only
-	 * consumer compares it against `daily[].date`. Those keys are computed in the
-	 * dashboard's resolved time zone, which the browser does not necessarily
-	 * share — formatting the instant client-side would put the boundary on the
-	 * wrong day for anyone whose machine zone differs from the one the series
-	 * was bucketed in.
-	 */
-	readonly receiptsSinceDate?: string;
-	/** Daily series for the bar chart, oldest first. */
-	readonly daily: ReadonlyArray<RecallDayPoint>;
 }
 
 // ── Graph page ──────────────────────────────────────────────────────────────
