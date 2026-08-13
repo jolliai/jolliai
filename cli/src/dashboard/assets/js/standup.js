@@ -5,161 +5,95 @@ window.JD = window.JD || {};
 	   corpus; see JD.glyph in shell.js. */
 	var GLYPH = JD.glyph;
 
-	/* A TODO is what you are going to do next, so it belongs in Today.
-	   The board used to carry a third column — Risks · Blockers · Questions —
-	   filtering for the `blocker`/`question`/`gotcha` kinds. It was removed
-	   because those kinds can never exist: `TOPIC_INSIGHTS_CTE` in
-	   DashboardQuery.ts derives insights from each memory topic's own
-	   `decisions`/`todo` text, so `decision` and `todo` are the only kinds the
-	   payload can ever hold (DashboardCollector.ts says so outright, and calls it
-	   deliberate — a blocker is not guessed from prose). The column therefore
-	   always rendered "Nothing flagged in this window." at the memory tier and an
-	   upsell for a feature that would not fill it below.
+	/* No insight kind is routed into this page any more, for two independent
+	   reasons that landed together.
 
-	   Reinstating it means teaching the SUMMARIZER to record those kinds first;
-	   a filter on its own has nothing to select. */
-	var TODAY_KINDS = ["todo"];
+	   `todo` is unrouted because Today states what LANDED today, and a TODO is by
+	   definition work that has not happened — putting one there made the column
+	   assert something the board cannot know (JOLLI-2201). `decision` is unrouted
+	   because the Decisions card owns it.
 
-	/* ---- rows -------------------------------------------------------------- */
+	   The third column — Risks · Blockers · Questions — is gone because its kinds
+	   can never exist: `TOPIC_INSIGHTS_CTE` in DashboardQuery.ts derives insights
+	   from each memory topic's own `decisions`/`todo` text, so `decision` and
+	   `todo` are the only kinds the payload can ever hold (DashboardCollector.ts
+	   says so outright, and calls it deliberate — a blocker is not guessed from
+	   prose). The column therefore always rendered "Nothing flagged in this
+	   window." at the memory tier and an upsell for a feature that would not fill
+	   it below. Reinstating it means teaching the SUMMARIZER to record those kinds
+	   first; a filter on its own has nothing to select.
 
-	function itemRow(glyph, title, metas, when, note, mono) {
+	   `standup.insights` survives only as the memory-tier flag — see `memory` in
+	   renderStandup. */
+
+	/* ---- rows ---------------------------------------------------------------
+
+	   ONE row shape for both day columns, and it is the stats page's Memory Activity
+	   row restated in this page's markup. The two surfaces answer the same question
+	   for the same day out of the same commits, so a reader comparing them must not
+	   have to work out whether a difference in wording is a difference in data.
+
+	   They are NOT the same query, and the gap is worth knowing: Memory Activity
+	   lists `memories` rows for the window with no author filter, while these
+	   columns list author-filtered `commits`. On a normal machine the two coincide,
+	   because a memory only exists for a commit this machine summarized — measured
+	   18 = 18, fully overlapping, over a two-day window with seven distinct commit
+	   authors in the table. They come apart in two directions: a commit of yours
+	   that never got a memory shows HERE only, and a teammate's commit that somehow
+	   did shows THERE only. Keeping the author filter is deliberate — the board is
+	   read out as your own work — so treat the alignment as "same fields, same
+	   labels", not as an invariant that the two lists are equal. */
+
+	function commitRow(commit, model, memory) {
 		var esc = JD.esc;
-		var html =
-			'<div class="item"><div class="r1">' +
-			glyph +
-			'<span class="t' +
-			(mono ? " mono" : "") +
-			'">' +
-			esc(title) +
-			"</span>" +
-			(when ? '<span class="when">' + esc(when) + "</span>" : "") +
-			"</div>";
-		if (note) html += '<div class="note">' + note + "</div>";
-		if (metas && metas.length > 0) {
-			html += '<div class="meta">';
-			metas.forEach((meta) => {
-				html += '<span class="tag">' + esc(meta) + "</span>";
-			});
-			html += "</div>";
+		var metas = "";
+		/* Same four fields Memory Activity's row carries, in its order: category,
+		   turns, branch, repo. The category chip takes its colour from the shared
+		   JD.categoryColor, so `bugfix` cannot be one colour here and another there. */
+		if (commit.workCategory) {
+			metas +=
+				'<span class="mem-activity-category" style="color:' +
+				JD.categoryColor(commit.workCategory) +
+				'">' +
+				esc(commit.workCategory) +
+				"</span>";
 		}
-		return html + "</div>";
-	}
-
-	function commitItem(commit, model) {
-		var stats =
-			commit.insertions != null || commit.deletions != null
-				? "+" + (commit.insertions || 0) + " −" + (commit.deletions || 0)
-				: null;
-		var metas = [commit.hash.slice(0, 7)];
-		if (stats) metas.push(stats);
-		return itemRow(
-			GLYPH.commit,
-			commit.message,
-			metas,
-			JD.timeOfDay(commit.committedAtMs, model.timeZone),
-			null,
-			true,
+		if (commit.turns != null) {
+			metas += '<span class="tag metric num">' + esc(commit.turns) + " turns</span>";
+		}
+		/* Below the memory tier neither category nor turns exists, so an aligned row
+		   would be a bare title. The hash and the diff size are what git alone can
+		   say, and they keep the raw column readable without claiming enrichment it
+		   does not have. */
+		if (!memory) {
+			metas += '<span class="tag mono">' + esc(commit.hash.slice(0, 7)) + "</span>";
+			if (commit.insertions != null || commit.deletions != null) {
+				metas +=
+					'<span class="tag">+' + (commit.insertions || 0) + " −" + (commit.deletions || 0) + "</span>";
+			}
+		}
+		if (commit.branch) metas += '<span class="tag mono">' + esc(commit.branch) + "</span>";
+		/* Suppressed on a single-repo page for the same reason Memory Activity
+		   suppresses it: every row would carry the identical chip, and the topbar
+		   picker already states it. `!== 1` and not `scope.kind !== "repo"` — the
+		   scope now holds an ARRAY of identities, so a two-repo selection is still
+		   `kind === "repo"` while its rows do need telling apart. */
+		if (JD.scopeIdentities(model).length !== 1) metas += '<span class="tag">' + esc(commit.repoName) + "</span>";
+		return (
+			'<div class="item"><div class="r1">' +
+			GLYPH.commit +
+			'<span class="t">' +
+			esc(commit.message) +
+			'</span><span class="when">' +
+			esc(JD.timeOfDay(commit.committedAtMs, model.timeZone)) +
+			"</span></div>" +
+			(metas ? '<div class="meta">' + metas + "</div>" : "") +
+			"</div>"
 		);
 	}
 
-	function sessionItem(session, model) {
-		var metas = [session.source, session.messageCount + " messages"];
-		if (session.isLive) metas.unshift("live");
-		return itemRow(GLYPH.session, session.title, metas, JD.relTime(session.updatedAtMs, model.generatedAtMs));
-	}
-
-	function workspaceItem(workspace) {
-		return itemRow(GLYPH.workspace, "Uncommitted on " + (workspace.branch || "detached HEAD"), [
-			"+" + workspace.insertions + " −" + workspace.deletions,
-			workspace.filesChanged + " files",
-			workspace.repoName,
-		]);
-	}
-
-	/* ---- grouping ---------------------------------------------------------- */
-
-	/* The mockup groups Yesterday: by `repo · branch` when it only has git and
-	   session logs, and by `TICKET · topic` once memories give it a ticket. Same
-	   function, different key — the point of the group header is "these lines are
-	   one piece of work", and which field says so depends on what is known. */
-	function groupKey(commit, byTicket) {
-		if (byTicket && commit.ticketId) {
-			return commit.ticketId + (commit.workCategory ? " · " + commit.workCategory : "");
-		}
-		return commit.repoName + (commit.branch ? " · " + commit.branch : "");
-	}
-
-	function grouped(rows) {
-		var order = [];
-		/* Prototype-less: the key is `repo · branch`, so a branch called
-		   `constructor` or `__proto__` would otherwise read back an inherited
-		   value and throw on `.push`, blanking the whole page. */
-		var byKey = Object.create(null);
-		rows.forEach((row) => {
-			if (!byKey[row.key]) {
-				byKey[row.key] = [];
-				order.push(row.key);
-			}
-			byKey[row.key].push(row.html);
-		});
-		var html = "";
-		order.forEach((key) => {
-			html += '<div class="ghead"><span class="mono">' + JD.esc(key) + "</span></div>" + byKey[key].join("");
-		});
-		return html;
-	}
-
-	/* ---- yesterday --------------------------------------------------------- */
-
-	/* Below the memory tier there are no outcomes to state, so the column is the
-	   raw trail: what ran, and what it committed, grouped per branch. */
-	function yesterdayRaw(standup, model) {
-		var rows = [];
-		standup.yesterdayCommits.forEach((commit) => {
-			rows.push({ key: groupKey(commit, false), html: commitItem(commit, model) });
-		});
-		/* Sessions get their own group rather than joining a branch group: nothing
-		   records which branch a session was on, and filing it under one would be a
-		   guess printed as a header. */
-		standup.yesterdaySessions.forEach((session) => {
-			rows.push({ key: session.repoName + " · sessions", html: sessionItem(session, model) });
-		});
-		return grouped(rows);
-	}
-
-	/* At the memory tier the column becomes OUTCOMES: one line per commit saying
-	   what landed, carrying the decision the memory recorded and what it cost.
-	   Session rows drop out here on purpose — the raw session trail is what the
-	   stats page's own list is for, and repeating it made this page a duplicate of
-	   that one. */
-	function yesterdayOutcomes(standup, model) {
-		var decisionsByHash = Object.create(null);
-		(standup.insights || []).forEach((insight) => {
-			if (insight.kind !== "decision") return;
-			(decisionsByHash[insight.commitHash] = decisionsByHash[insight.commitHash] || []).push(insight.text);
-		});
-		var rows = standup.yesterdayCommits.map((commit) => {
-			var metas = [];
-			if (commit.estCostUsd != null) metas.push(JD.fmtUsd(commit.estCostUsd) + " est");
-			if (commit.turns != null) metas.push(commit.turns + (commit.turns === 1 ? " turn" : " turns"));
-			if (commit.insertions != null || commit.deletions != null) {
-				metas.push("+" + (commit.insertions || 0) + " −" + (commit.deletions || 0));
-			}
-			if (commit.branch) metas.push(commit.branch);
-			var decisions = decisionsByHash[commit.hash] || [];
-			var note = decisions.length > 0 ? "<b>Decision:</b> " + JD.mdInline(JD.esc(decisions.join(" · "))) : null;
-			return {
-				key: groupKey(commit, true),
-				html: itemRow(
-					GLYPH.session,
-					commit.message,
-					metas,
-					JD.timeOfDay(commit.committedAtMs, model.timeZone),
-					note,
-				),
-			};
-		});
-		return grouped(rows);
+	function dayColumn(commits, model, memory) {
+		return commits.map((commit) => commitRow(commit, model, memory)).join("");
 	}
 
 	/* ---- sprint context ---------------------------------------------------- */
@@ -167,8 +101,8 @@ window.JD = window.JD || {};
 	/* The mockup's ctx-strip chips. Its own version reads `Sprint 14 · day 7 of 10`
 	   and `JOL-142 · 4/7 steps · ● on track`; sprint numbering and plan-step
 	   progress do not exist locally (plan enumeration is a known gap), so the chips
-	   carry the part that does — the tickets the window's commits actually name —
-	   and the last chip states what is missing instead of inventing a status. */
+	   carry only the part that does — the tickets the window's commits actually
+	   name — rather than inventing a status. */
 	function sprintChips(standup, model) {
 		if (!standup.insights) {
 			return (
@@ -188,7 +122,7 @@ window.JD = window.JD || {};
 				"chips appear when a commit names one</span>"
 			);
 		}
-		var html = tickets
+		return tickets
 			.slice(0, 3)
 			.map(
 				(ticket) =>
@@ -200,7 +134,6 @@ window.JD = window.JD || {};
 					"</span>",
 			)
 			.join("");
-		return html + '<span class="schip" style="border-style:dashed">step progress needs plan enumeration</span>';
 	}
 
 	/* Whose commits the board is showing. Stated either way, and never silently:
@@ -217,89 +150,12 @@ window.JD = window.JD || {};
 		);
 	}
 
-	/* ---- the drafted standup ----------------------------------------------- */
-
-	/* The markdown the sheet shows and the clipboard gets. Same two sections as the
-	   board, in the same order, with TODOs under Today — a draft that disagreed
-	   with the columns above it would be the worse of the two bugs. */
-	JD.standupMarkdown = (model) => {
-		var standup = model.standup;
-		var insights = standup.insights || [];
-		var todos = insights.filter((insight) => TODAY_KINDS.indexOf(insight.kind) >= 0);
-		var decisionsByHash = Object.create(null);
-		insights.forEach((insight) => {
-			if (insight.kind !== "decision") return;
-			(decisionsByHash[insight.commitHash] = decisionsByHash[insight.commitHash] || []).push(insight.text);
-		});
-
-		var lines = ["## Standup — " + standup.today, "", "**Yesterday**"];
-		/* Built into its own array first, so the "nothing recorded" test asks what
-		   this section will ACTUALLY emit. Counting the raw inputs instead was one
-		   filter out of date: at the memory tier the session loop below is skipped,
-		   so a day with agent sessions but no commits counted as non-empty and then
-		   printed nothing — `**Yesterday**` immediately followed by `**Today**`,
-		   while the board column correctly said "Nothing recorded." */
-		var yesterday = [];
-		standup.yesterdayCommits.forEach((commit) => {
-			var prefix = commit.ticketId ? commit.ticketId + ": " : "";
-			var decisions = decisionsByHash[commit.hash] || [];
-			yesterday.push(
-				"- " +
-					prefix +
-					commit.message +
-					" (`" +
-					commit.hash.slice(0, 7) +
-					"`" +
-					(commit.branch ? ", " + commit.branch : "") +
-					")" +
-					(decisions.length > 0 ? " — decision: " + decisions.join("; ") : ""),
-			);
-		});
-		/* Session lines only below the memory tier, mirroring the board: once there
-		   are outcomes, the session trail is noise in a standup. */
-		if (!standup.insights) {
-			standup.yesterdaySessions.forEach((session) => {
-				yesterday.push("- [" + session.source + "] " + session.title);
-			});
-		}
-		lines.push(yesterday.length > 0 ? yesterday.join("\n") : "- (nothing recorded)");
-
-		lines.push("", "**Today**");
-		/* Same construction as Yesterday, and for the same reason: the session loop
-		   drops non-live rows at the memory tier, so the raw counts overstate it. */
-		var today = [];
-		standup.todayCommits.forEach((commit) => {
-			today.push("- " + commit.message + " (`" + commit.hash.slice(0, 7) + "`)");
-		});
-		standup.todaySessions.forEach((session) => {
-			if (standup.insights && !session.isLive) return;
-			today.push("- [" + session.source + "] " + session.title + (session.isLive ? " (in progress)" : ""));
-		});
-		todos.forEach((todo) => {
-			today.push("- TODO: " + todo.text + " (`" + todo.commitHash.slice(0, 7) + "`)");
-		});
-		standup.workspaces.forEach((workspace) => {
-			today.push(
-				"- Uncommitted on " +
-					(workspace.branch || "detached HEAD") +
-					" · +" +
-					workspace.insertions +
-					" −" +
-					workspace.deletions +
-					" across " +
-					workspace.filesChanged +
-					" files (" +
-					workspace.repoName +
-					")",
-			);
-		});
-		lines.push(today.length > 0 ? today.join("\n") : "- (nothing yet)");
-
-		return lines.join("\n");
-	};
-
 	/* ---- columns ----------------------------------------------------------- */
 
+	/* `sub` is optional. The two day columns pass none — their heading and count
+	   already say what they hold, and the sentence under them was restating it. An
+	   empty string must not render an empty `.sub`: it carries a bottom margin, so
+	   the blank div would leave the gap the caption used to occupy. */
 	function column(title, count, sub, bodyHtml) {
 		return (
 			'<section class="card col" aria-label="' +
@@ -309,9 +165,8 @@ window.JD = window.JD || {};
 			'<span class="cnt">' +
 			JD.esc(count) +
 			"</span></h2>" +
-			'<div class="sub">' +
-			JD.esc(sub) +
-			'</div><div class="col-list">' +
+			(sub ? '<div class="sub">' + JD.esc(sub) + "</div>" : "") +
+			'<div class="col-list">' +
 			bodyHtml +
 			"</div></section>"
 		);
@@ -323,123 +178,51 @@ window.JD = window.JD || {};
 		var esc = JD.esc;
 		var standup = model.standup;
 		var memory = !!standup.insights;
-		var insights = standup.insights || [];
-		var todos = insights.filter((insight) => TODAY_KINDS.indexOf(insight.kind) >= 0);
 
-		/* Context strip: date, sprint chips, where this goes, and the draft action. */
+		/* Context strip: date and sprint chips. The Copy-as-standup button and its
+		   "posts nowhere" caption used to close this row (JOLLI-2198); the board is
+		   now read directly, so there is nothing to right-align against and the
+		   spacer went with them. */
 		var html =
 			'<div class="ctx"><span class="date">' +
 			esc(JD.weekdayDate(model.generatedAtMs, model.timeZone)) +
 			'</span><span class="sprint-chips">' +
 			authorChip(standup) +
 			sprintChips(standup, model) +
-			'</span><div class="spacer"></div>' +
-			'<span class="share-note">posts nowhere — copy it where you like</span>' +
-			'<button class="copybtn" type="button" id="copyStandup">⧉ Copy as standup</button></div>';
+			"</span></div>";
 
-		/* Yesterday. */
-		var yBody = memory ? yesterdayOutcomes(standup, model) : yesterdayRaw(standup, model);
+		/* The two day columns. Both are COMMITS ONLY, flat, and identical in shape:
+		   what was completed that day, which is what Memory Activity lists for the
+		   same day on the stats page.
+
+		   Three things used to make them disagree with that card, all removed. Today
+		   carried open TODOs, live sessions and uncommitted worktree rows — work in
+		   flight under a heading everyone reads as "done" (JOLLI-2201). Yesterday
+		   carried session rows below the memory tier, which are not commits at all.
+		   And Yesterday grouped its rows under `TICKET · category` / `repo · branch`
+		   headers, which Memory Activity has no counterpart for: its grouping IS the
+		   day, and here the day is already the column. A group header inside one is a
+		   second axis the other page does not have, so two identical lists read as
+		   different ones.
+
+		   Neither column splits by tier any more. A commit is a commit without
+		   memory; only how many FIELDS a row can show varies, and that is the row's
+		   own business (see commitRow). */
+		var yBody = dayColumn(standup.yesterdayCommits, model, memory);
 		if (!yBody) yBody = '<div class="empty-note">Nothing recorded.</div>';
-		var yCount = memory
-			? "· " + plural(standup.yesterdayCommits.length, "outcome")
-			: "· " +
-				plural(standup.yesterdaySessions.length, "session") +
-				" · " +
-				plural(standup.yesterdayCommits.length, "commit");
-		var ySub = memory
-			? "From your commit memories — each line carries the commit it came from"
-			: "Stitched from session logs + git log — raw but real";
+		var yCount = "· " + plural(standup.yesterdayCommits.length, "commit");
 
-		/* Today. Live sessions stay visible at the memory tier (they are the closest
-		   local answer to the mockup's "next plan step, in a session now"); the rest
-		   of today's session trail drops out, same reasoning as Yesterday. */
-		var tBody = "";
-		standup.todayCommits.forEach((commit) => {
-			tBody += commitItem(commit, model);
-		});
-		standup.todaySessions.forEach((session) => {
-			if (memory && !session.isLive) return;
-			tBody += sessionItem(session, model);
-		});
-		todos.forEach((todo) => {
-			tBody += itemRow(GLYPH.todo, "TODO: " + todo.text, [
-				todo.commitHash.slice(0, 7),
-				todo.repoName,
-			]);
-		});
-		standup.workspaces.forEach((workspace) => {
-			tBody += workspaceItem(workspace);
-		});
+		var tBody = dayColumn(standup.todayCommits, model, memory);
 		if (!tBody) tBody = '<div class="empty-note">Nothing yet.</div>';
-		var live = standup.todaySessions.filter((session) => session.isLive).length;
-		var tCount = memory
-			? "· " + plural(todos.length, "TODO") + (live > 0 ? " · " + live + " live" : "")
-			: live > 0
-				? "· " + live + " live"
-				: "· " + plural(standup.todaySessions.length, "session");
-		var tSub = memory
-			? "Open TODOs, live sessions and working-tree state — edit before sharing"
-			: "Live sessions and working-tree state";
+		var tCount = "· " + plural(standup.todayCommits.length, "commit");
 
 		/* Two columns. The third — Risks · Blockers · Questions — is gone; see the
-		   note on TODAY_KINDS at the top of this file for why it could never fill. */
+		   note at the top of this file for why it could never fill. */
 		html += '<div class="cols">';
-		html += column("Yesterday", yCount, ySub, yBody);
-		html += column("Today", tCount, tSub, tBody);
+		html += column("Yesterday", yCount, "", yBody);
+		html += column("Today", tCount, "", tBody);
 		html += "</div>";
 
 		document.getElementById("app").innerHTML = html;
-
-		/* ---- draft sheet --------------------------------------------------- */
-
-		var overlay = document.getElementById("ovStandup");
-		var output = document.getElementById("mdOut");
-		var toast = document.getElementById("mdToast");
-		var copyButton = document.getElementById("copyStandup");
-
-		var flash = () => {
-			toast.classList.add("show");
-			setTimeout(() => toast.classList.remove("show"), 1600);
-		};
-		var close = () => {
-			overlay.classList.remove("open");
-			copyButton.focus();
-		};
-
-		copyButton.onclick = () => {
-			output.value = JD.standupMarkdown(model);
-			/* The unfiltered warning goes FIRST and outranks the tier note: what you
-			   are about to paste containing a teammate's commit matters more than
-			   where the lines came from. */
-			document.getElementById("sheetSub").textContent = !standup.authoredBy
-				? "Every author's commits — no git identity configured, so check the lines are yours before posting."
-				: memory
-					? "From your commit memories. Edit anything before you post it."
-					: "From raw sessions + git log. Enable Jolli Memory for decisions and TODOs.";
-			overlay.classList.add("open");
-			output.focus();
-			/* Copied on open as well as on the button: the one-click path stays as fast
-			   as it was, and the sheet is what makes the draft correctable. */
-			if (navigator.clipboard) navigator.clipboard.writeText(output.value).then(flash, () => {});
-		};
-		document.getElementById("copyMd").onclick = () => {
-			output.select();
-			if (!navigator.clipboard) return;
-			navigator.clipboard.writeText(output.value).then(flash, () => {
-				toast.textContent = "Copy failed";
-				flash();
-			});
-		};
-		document.getElementById("closeOv").onclick = close;
-		overlay.onclick = (event) => {
-			if (event.target === overlay) close();
-		};
-		/* Bound on the document, not the sheet: Escape has to work wherever focus
-		   sits inside the dialog, textarea included. An assignment rather than
-		   addEventListener, so the 30-second re-render replaces this handler instead
-		   of stacking another copy of it. */
-		document.onkeydown = (event) => {
-			if (event.key === "Escape" && overlay.classList.contains("open")) close();
-		};
 	};
 })(window.JD);

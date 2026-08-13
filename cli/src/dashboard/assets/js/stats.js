@@ -669,8 +669,8 @@ window.JD = window.JD || {};
 	function skillsCard(model) {
 		var usage = model.stats.toolUsage;
 		/* Puzzle piece — a skill is a part that slots into a run. Was a star,
-		   which is this page's "decision" mark (see JD.glyph) and read as a
-		   rating here. Lucide `puzzle`, like every other icon in this band. */
+		   which was this page's "decision" mark at the time and read as a rating
+		   here. Lucide `puzzle`, like every other icon in this band. */
 		var icon = widgetIcon(
 			"--s2",
 			'<path d="M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 ' +
@@ -861,10 +861,10 @@ window.JD = window.JD || {};
 		   list, and "the recall count is MCP-tool calls only".
 
 		   Never held the page-wide clause either ("older activity is reconstructed
-		   from commits and stored summaries") — that describes the activity
+		   from commits and stored summaries") — that described the activity
 		   timeline, while these rows are captured tool calls and nothing here is
-		   reconstructed from a commit; it is also already printed once per page
-		   (buildDashboardModel → #coverageNote). */
+		   reconstructed from a commit. That clause has since been dropped from the
+		   footer as well; see `CoverageNote` in DashboardModel.ts. */
 		return (
 			html +
 			'<div class="w-foot"><span class="w-measure mcp-card-note">ⓘ from <b>' +
@@ -1152,17 +1152,10 @@ window.JD = window.JD || {};
 		);
 	}
 
-	/* Feed-card category colours. The first five and their palette slots are the
-	   mockup's (`CAT_VAR`: bugfix→s2, feature→s1, refactor→s3, tech-debt→s4,
-	   docs→s5); the rest are categories our summarizer actually emits. A fixed
-	   order rather than a hash — same reasoning as `JD.sourceIndex`: the colour
-	   for a category must not move when the set of categories changes. Anything
-	   unlisted lands on the last slot. */
-	var CATEGORY_ORDER = ["feature", "bugfix", "refactor", "tech-debt", "docs", "ux", "performance", "devops"];
-	function catColor(category) {
-		var index = CATEGORY_ORDER.indexOf(category);
-		return JD.seriesColor(index >= 0 ? index : CATEGORY_ORDER.length);
-	}
+	/* Feed-card category colours. Shared with the standup board — the order and
+	   the rationale live on `JD.categoryColor` in shell.js, because both pages
+	   paint the same category chip for the same commits. */
+	var catColor = JD.categoryColor;
 
 	/* "Jul 27 · 4:54pm" — the mockup's row timestamp. Absolute, not relative: the
 	   feed is scanned for "when did this land", and the range control already

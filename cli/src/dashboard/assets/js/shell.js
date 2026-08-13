@@ -719,9 +719,11 @@ window.JD = window.JD || {};
 		   containing & < > " as the literal &amp; / &lt; / &quot;. */
 		var coverageNote = document.getElementById("coverageNote");
 		coverageNote.textContent = (model.coverage || []).map((note) => note.message).join(" · ");
-		/* Hidden when there is nothing to say. `.footer-note` carries `margin: 18px
-		   auto 0` plus padding, so an empty div still pushed dead space under the
-		   grid — visible on Repositories and Memories, which now carry no note. */
+		/* Hidden when there is nothing to say, which is now the NORMAL case on every
+		   page: the only surviving note is the empty-database hint on stats. That
+		   makes the branch load-bearing rather than defensive — `.footer-note`
+		   carries `margin: 18px auto 0` plus padding, so an empty div would push
+		   dead space under the grid on essentially every render. */
 		coverageNote.hidden = coverageNote.textContent.length === 0;
 	};
 
@@ -795,21 +797,20 @@ window.JD = window.JD || {};
 	};
 
 	/* Leading glyph per row kind. Shared rather than per-page: the standup board
-	   and Memories' detail pane both render commit/session/insight rows, and one
-	   kind reading as two different marks depending on the page is the drift
-	   worth preventing. The first three keys have no insight equivalent — they
-	   are standup-only row types.
+	   and Memories' detail pane both render commit rows, and one kind reading as
+	   two different marks depending on the page is the drift worth preventing.
 
-	   `blocker`/`question`/`gotcha` used to have entries here, for the standup's
-	   Risks column. They went with it: those three insight kinds are never
-	   produced (see the note at the top of standup.js), so the marks could not be
-	   reached from anywhere. */
+	   Down to one key, by one rule applied twice. `blocker`/`question`/`gotcha`
+	   went with the standup's Risks column — those insight kinds are never
+	   produced (see the note at the top of standup.js). `session`/`workspace`/
+	   `todo`/`decision` went with the rows that drew them: both day columns are
+	   commits only now (JOLLI-2200 / 2201), and nothing else ever asked for a
+	   mark. Sessions, workspaces and TODOs are all still QUERIED — see
+	   `StandupModel.yesterdaySessions` — so re-add a key here when the column
+	   that wants them is designed, rather than treating this list as the record
+	   of what the model carries. */
 	JD.glyph = {
 		commit: '<span class="glyph commit">◆</span>',
-		session: '<span class="glyph done">✓</span>',
-		workspace: '<span class="glyph next">▸</span>',
-		todo: '<span class="glyph todo">□</span>',
-		decision: '<span class="glyph done">★</span>',
 	};
 
 	/* Session row shared by both pages. */
@@ -849,6 +850,24 @@ window.JD = window.JD || {};
 	JD.sourceIndex = (source) => {
 		var index = SOURCE_ORDER.indexOf(String(source).split("-")[0]);
 		return index >= 0 ? index : SOURCE_ORDER.length;
+	};
+
+	/* Category → colour, shared because TWO pages paint the same category chip:
+	   the stats page's Memory Activity rows and the standup board's columns, which
+	   are required to show the same commits with the same labels. It lives here
+	   rather than in either page for the reason `SOURCE_ORDER` does — a second copy
+	   of the order is a second answer to "what colour is `bugfix`", and the pages
+	   would drift the first time someone appended a category to one of them.
+
+	   A fixed order rather than a hash: the colour for a category must not move
+	   when the SET of categories changes. `s1`..`s4` follow the mockup's own
+	   pairing (feature→s1, bugfix→s2, refactor→s3, docs→s5); the rest are
+	   categories the summarizer actually emits. Anything unlisted lands on the
+	   last slot. */
+	var CATEGORY_ORDER = ["feature", "bugfix", "refactor", "tech-debt", "docs", "ux", "performance", "devops"];
+	JD.categoryColor = (category) => {
+		var index = CATEGORY_ORDER.indexOf(category);
+		return JD.seriesColor(index >= 0 ? index : CATEGORY_ORDER.length);
 	};
 
 	/* The `/api/model` URL for the params the page was rendered with. */

@@ -2056,11 +2056,23 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 		...(r.disabled_at != null ? { disabled: true as const } : {}),
 	}));
 
-	// Coverage notes are per VIEW, not global. A caveat is only honest next to
-	// the data it qualifies: "older activity is reconstructed from commits and
-	// stored summaries" describes the session/commit activity timeline, and on the
-	// graph page — which renders a distilled artifact and no activity at all —
-	// it is a statement about something the reader is not looking at.
+	// The footer carries ONE note now, and only when the database is empty.
+	//
+	// The caveat that used to sit under every stats and standup render — "older
+	// activity is reconstructed from commits and stored summaries; recent sessions
+	// are exact" — is gone from both. It was true, and it was permanent: printed
+	// on every load regardless of whether the reader was anywhere near the window
+	// boundary it describes, which is the shape a reader stops seeing. Nothing
+	// about the reconstruction changed; only the decision to state it as page
+	// furniture did. See `CoverageNote` before re-adding one.
+	//
+	// `no-data` is kept for the opposite reason: it appears only on a database
+	// with no sessions at all, says what will fill it, and never comes back once
+	// one lands. It is scoped to STATS because that is the view whose cards are
+	// all session-derived and therefore all empty in that state. The standup board
+	// is commits-only (JOLLI-2200 / 2201), so it is fully populated with zero
+	// sessions, and the empty state each of its columns can really be in is
+	// already stated inside the column ("Nothing recorded.").
 	//
 	// There is deliberately NO in-progress import note. It used to be the one note
 	// that spanned every view, sitting at the foot of all four pages for the whole
@@ -2069,19 +2081,15 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 	// numbers filling in as the import runs is the behaviour, and it needs no
 	// footnote on every page to be understood.
 	const coverage: CoverageNote[] = [];
-	const showsActivity = options.view === "stats" || options.view === "standup";
-	if (showsActivity) {
+	if (options.view === "stats") {
 		const sessionCount =
 			(db.prepare("SELECT COUNT(*) AS n FROM sessions").get() as { n: number } | undefined)?.n ?? 0;
-		coverage.push(
-			sessionCount === 0
-				? { kind: "no-data", message: "No sessions recorded yet — data appears after your next AI session." }
-				: {
-						kind: "sessions-window",
-						message:
-							"Older activity is reconstructed from commits and stored summaries; recent sessions are exact.",
-					},
-		);
+		if (sessionCount === 0) {
+			coverage.push({
+				kind: "no-data",
+				message: "No sessions recorded yet — data appears after your next AI session.",
+			});
+		}
 	}
 
 	const tier = detectTier(db);

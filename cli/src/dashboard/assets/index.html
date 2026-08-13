@@ -76,32 +76,19 @@
 	</div>
 
 	<!--
-	  Two page-level layers, both `position: fixed`: a tooltip (positioned by
-	  JD.showTip) and the standup draft sheet. They sit OUTSIDE `.main` so a hover or
-	  a dialog near the edge of a scrolled card is not clipped by that card, but
+	  Page-level layers, all `position: fixed`: the tooltip (positioned by
+	  JD.showTip) and the overlays below. They sit OUTSIDE `.main` so a hover or a
+	  dialog near the edge of a scrolled card is not clipped by that card, but
 	  INSIDE `.jd` — that is the element carrying the colour tokens, and a layer
 	  outside it renders with every `var(--surface)` / `var(--border)` unresolved,
 	  i.e. as unstyled text on a transparent background.
 
-	  The sheet's textarea is EDITABLE on purpose and is this page's actual product:
-	  the mockup's whole claim for the standup view is "everyone edits before it
-	  posts", so the draft has to be visible and correctable, not just written to the
-	  clipboard behind a click.
+	  A third layer used to live here: the standup draft sheet (`#ovStandup`), an
+	  editable textarea holding markdown assembled by `JD.standupMarkdown`. It went
+	  with the Copy-as-standup button that was its only trigger (JOLLI-2198) — the
+	  standup board is read off the page now, not pasted from it.
 	-->
 	<div class="tip" id="tip"></div>
-	<div class="overlay" id="ovStandup" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
-		<div class="sheet">
-			<h3 id="sheetTitle">Your standup, drafted</h3>
-			<div class="sub" id="sheetSub"></div>
-			<textarea id="mdOut" spellcheck="false" aria-label="Standup markdown"></textarea>
-			<div class="row">
-				<button class="cta" type="button" id="copyMd">Copy markdown</button>
-				<span class="toast" id="mdToast" role="status">Copied ✓</span>
-				<div class="spacer"></div>
-				<button class="cta ghost" type="button" id="closeOv">Close</button>
-			</div>
-		</div>
-	</div>
 	<!--
 	  The Memories page's Context viewer. Same layer rules as the sheet above.
 	  Its body is a read-only <pre>, filled with textContent — the document is

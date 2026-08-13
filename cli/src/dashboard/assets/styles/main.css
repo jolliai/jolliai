@@ -690,18 +690,9 @@ body {
   .ctx .date { font-size: 15px; font-weight: 650; }
   .sprint-chips { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .schip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); border: 1px solid var(--border); border-radius: 999px; padding: 4px 11px; }
-  .schip .st { font-weight: 650; display: inline-flex; align-items: center; gap: 4px; }
-  .st.ok   { color: var(--good-text); }
-  .st.risk { color: var(--serious); }
-  .st.done { color: var(--good-text); }
-  .copybtn {
-    appearance: none; font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
-    background: var(--accent); color: #fff; border: 0; border-radius: 7px; padding: 7px 14px;
-    display: inline-flex; align-items: center; gap: 7px;
-  }
-  .copybtn:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
-  .share-note { font-size: 11.5px; color: var(--muted); }
-
+  /* No `.st` status rule: the mockup's `● on track` chip needed plan-step
+     progress, which does not exist locally, so `sprintChips` emits tickets only
+     and nothing ever carried the class. */
   .cols { display: grid; grid-template-columns: 1fr; gap: 16px; }
   /* Two columns — Yesterday and Today. The third (Risks · Blockers · Questions)
      was removed because the insight kinds it filtered for are never produced; see
@@ -712,17 +703,17 @@ body {
   .col h2 .cnt { font-size: 11px; color: var(--muted); font-weight: 500; }
   .col-list { display: grid; gap: 8px; margin-top: 12px; }
 
-  .ghead { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin: 6px 0 -2px; display: flex; gap: 8px; align-items: center; }
-  .ghead .mono { text-transform: none; letter-spacing: 0; }
-
+  /* No `.ghead` group header: both day columns are flat. Memory Activity's
+     grouping IS the day, and here the day is already the column, so a second
+     axis inside one made two identical lists read as different ones. */
   .item { border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px; display: grid; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
   .item .r1 { display: flex; gap: 8px; align-items: baseline; }
   .item .glyph { flex: 0 0 auto; width: 16px; text-align: center; }
   .item .t { color: var(--ink); font-weight: 550; }
   .item .when { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
   .item .meta { display: flex; gap: 6px; flex-wrap: wrap; padding-left: 24px; }
-  .item .note { padding-left: 24px; font-size: 12px; }
-  .item .note b { font-weight: 600; }
+  /* No `.note` second line: a row is a title plus its meta chips. The decision
+     text that used to sit here belongs to the Decisions card (JOLLI-2200). */
   .item[role="button"] { cursor: pointer; }
   .item[aria-current="true"] { border-color: var(--accent); background: var(--accent-soft); }
   .item[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -1159,9 +1150,8 @@ body {
   .dx-commit .when { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
   .dx-items { display: grid; gap: 8px; margin-top: 10px; padding-left: 12px; }
 
-  .glyph.done { color: var(--good-text); }
-  .glyph.next { color: var(--accent); }
-  .glyph.todo { color: var(--muted); }
+  /* One variant, because `JD.glyph` is down to one reachable mark — see the note
+     there. `.done` / `.next` / `.todo` went with the keys that emitted them. */
   .glyph.commit { color: var(--muted); }
 
   .team { margin-top: 16px; display: none; }
@@ -1185,18 +1175,12 @@ body {
   .sheet { background: var(--surface); color: var(--ink); border: 1px solid var(--border); border-radius: 12px; width: min(640px, 100%); padding: 18px; }
   .sheet h3 { margin: 0 0 2px; font-size: 14px; }
   .sheet .sub { font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
-  .sheet textarea {
-    width: 100%; height: 300px; resize: vertical; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 12px; color: var(--ink-2); background: var(--page); border: 1px solid var(--grid); border-radius: 8px; padding: 12px;
-  }
   .ctx-body {
     max-height: 60vh; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word;
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; line-height: 1.6;
     color: var(--ink-2); background: var(--page); border: 1px solid var(--grid); border-radius: 8px; padding: 12px;
   }
   .sheet .row { display: flex; gap: 10px; margin-top: 10px; align-items: center; }
-  .toast { font-size: 12px; color: var(--good-text); font-weight: 600; visibility: hidden; }
-  .toast.show { visibility: visible; }
 
   /* ---------- popover ---------- */
   .pop {
@@ -1247,7 +1231,7 @@ body {
 
   .footer-note { max-width: 1200px; margin: 18px auto 0; padding: 0 24px; font-size: 11.5px; color: var(--muted); }
   @media (prefers-reduced-motion: no-preference) {
-    .chip, .seg button, .cta, .copybtn { transition: background .12s ease, color .12s ease; }
+    .chip, .seg button, .cta { transition: background .12s ease, color .12s ease; }
     .icard { transition: opacity .18s ease, transform .18s ease; }
   }
 

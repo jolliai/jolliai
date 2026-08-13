@@ -1182,14 +1182,28 @@ export interface StandupModel {
 	/** Local `YYYY-MM-DD` the board was built for. */
 	readonly today: string;
 	readonly yesterday: string;
+	/**
+	 * NOT RENDERED, and absence from the page is not an oversight. Both day columns
+	 * are commits only: Today states what was COMPLETED today (JOLLI-2201), and the
+	 * columns are required to list the same rows the stats page's Memory Activity
+	 * card lists for the same day — which is commits and nothing else. A session is
+	 * not a commit, and a live session or an uncommitted worktree is work in flight
+	 * besides.
+	 *
+	 * All three are still queried: they are the only local record of "in progress",
+	 * and the column that wants them has not been designed yet. But a renderer
+	 * putting any of them back into a day column re-opens the ticket.
+	 */
 	readonly yesterdaySessions: ReadonlyArray<RecentSession>;
 	readonly yesterdayCommits: ReadonlyArray<StandupCommit>;
+	/** Not rendered — see {@link StandupModel.yesterdaySessions}. */
 	readonly todaySessions: ReadonlyArray<RecentSession>;
 	readonly todayCommits: ReadonlyArray<StandupCommit>;
+	/** Uncommitted work. Not rendered — see {@link StandupModel.yesterdaySessions}. */
 	readonly workspaces: ReadonlyArray<StandupWorkspace>;
 	/**
-	 * The git identity the commit columns and Risks were filtered to (an email,
-	 * or a name when only that is configured). ABSENT means the filter did not
+	 * The git identity the commit columns were filtered to (an email, or a name
+	 * when only that is configured). ABSENT means the filter did not
 	 * run and the board is showing every author's work — the page states which
 	 * of the two it is, because an unfiltered standup is a draft the user would
 	 * otherwise post as their own. See `authorFilter` in `DashboardQuery.ts`.
@@ -1197,8 +1211,14 @@ export interface StandupModel {
 	readonly authoredBy?: string;
 	/**
 	 * Risks/blockers/questions/TODOs mined from the window's commit memories.
-	 * Present (possibly empty) from the memory tier onwards; absent renders the
-	 * locked card.
+	 * Present (possibly empty) from the memory tier onwards.
+	 *
+	 * NOT RENDERED either, and now for two reasons at once. `todo` is unrouted for
+	 * the reason above and `decision` belongs to the Decisions card; the other
+	 * three had a column of their own until it was removed, because nothing can
+	 * produce them (see {@link CommitInsightKind}). What the field still does is
+	 * carry the memory tier: its mere PRESENCE is what `renderStandup` reads to
+	 * decide how many fields a commit row may show.
 	 */
 	readonly insights?: ReadonlyArray<StandupInsight>;
 }
@@ -1512,13 +1532,24 @@ export interface GraphVersion {
 }
 
 /**
- * Data honesty flags surfaced in the UI footer. Session-level activity older
- * than the live-log window comes only from stored summaries, so an empty
- * stretch of heatmap can mean "not recorded" rather than "not working" — the
- * page says so instead of letting the reader assume.
+ * Data honesty flags surfaced in the UI footer.
+ *
+ * One kind left, and the one that went is worth knowing about. `sessions-window`
+ * said "older activity is reconstructed from commits and stored summaries;
+ * recent sessions are exact" — a caveat about how the timeline is BUILT, printed
+ * under every stats and standup render whether or not the reader was near the
+ * boundary it describes. It was removed as permanent furniture: a line that is
+ * always there is read once and then not at all, so it bought no honesty while
+ * costing a footer on every page. The reconstruction it warned about has not
+ * changed; if that distinction needs stating again, state it where a reader can
+ * act on it (on the affected buckets) rather than under the whole page.
+ *
+ * `no-data` survives because it is not furniture — it appears only on an empty
+ * database, says what will fill it, and disappears for good after the first
+ * session.
  */
 export interface CoverageNote {
-	readonly kind: "sessions-window" | "no-data";
+	readonly kind: "no-data";
 	readonly message: string;
 }
 

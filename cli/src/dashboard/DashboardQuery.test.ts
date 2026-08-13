@@ -737,14 +737,17 @@ describe("buildDashboardModel", () => {
 			],
 			{ producerKind: "cli", dbPath },
 		);
+		// One session is enough to retire the note for good: it is a first-run hint,
+		// not a running caveat. The "older activity is reconstructed" line that used
+		// to take its place here was removed as permanent page furniture.
 		const seeded = await withDashboardDb(
 			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
 			{ dbPath },
 		);
-		expect(seeded.coverage.map((c) => c.kind)).toEqual(["sessions-window"]);
+		expect(seeded.coverage).toEqual([]);
 	});
 
-	it("keeps the session caveats off views that show no session activity", async () => {
+	it("carries no footer note on any view once there is data", async () => {
 		await seed();
 		const notesFor = async (view: "stats" | "standup" | "memories" | "settings") =>
 			(
@@ -754,14 +757,31 @@ describe("buildDashboardModel", () => {
 				)
 			).coverage.map((c) => c.kind);
 
-		// The activity views carry the caveat about how their timeline is built.
-		expect(await notesFor("stats")).toEqual(["sessions-window"]);
-		expect(await notesFor("standup")).toEqual(["sessions-window"]);
-		// Memories renders stored summaries, not a session timeline, so a note about
-		// how session history is reconstructed qualifies nothing there — and with the
-		// import note gone it now carries no coverage note at all.
+		// `seed()` writes sessions, so the one surviving note (the empty-database
+		// first-run hint) does not apply, and nothing replaces it. Stats and standup
+		// both used to print "older activity is reconstructed from commits and stored
+		// summaries" here — removed from both as permanent page furniture, which is
+		// what this case now pins: the footer is empty unless the DB is.
+		expect(await notesFor("stats")).toEqual([]);
+		expect(await notesFor("standup")).toEqual([]);
 		expect(await notesFor("memories")).toEqual([]);
 		expect(await notesFor("settings")).toEqual([]);
+	});
+
+	it("keeps the empty-database hint on stats alone", async () => {
+		// Nothing seeded: the one state the footer still speaks in. It is scoped to
+		// stats because that view's cards are all session-derived — the standup
+		// board is commits-only and says "Nothing recorded." inside each column.
+		const notesFor = async (view: "stats" | "standup") =>
+			(
+				await withDashboardDb(
+					(db) => buildDashboardModel(db, { view, scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+					{ dbPath },
+				)
+			).coverage.map((c) => c.kind);
+
+		expect(await notesFor("stats")).toEqual(["no-data"]);
+		expect(await notesFor("standup")).toEqual([]);
 	});
 
 	describe("custom range", () => {
