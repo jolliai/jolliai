@@ -1450,6 +1450,65 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect((await get(port, "/api/memories?afterRepo=repo-1")).status).toBe(400);
 	});
 
+	// The Skills / MCPs cards' "Show more" fetch. Paged in SQL, so this route
+	// opens the database itself rather than going through buildModel — the page
+	// past the first one is not part of any page payload.
+	it("serves one page of a tool-usage list, and rejects a list or offset it cannot page", async () => {
+		const dbPath = join(dir, "tool-usage-page.db");
+		const configDir = join(dir, "config-tools");
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+				{
+					producerKind: "cli",
+					event: {
+						type: "session.upserted",
+						repoIdentity: "repo-1",
+						source: "claude",
+						sessionId: "s1",
+						updatedAtMs: Date.now() - 3_600_000,
+						tools: [
+							{ name: "linear.list_issues", kind: "mcp", server: "linear", calls: 9 },
+							{ name: "github.list_prs", kind: "mcp", server: "github", calls: 4 },
+						],
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+
+		const second = await get(port, "/api/tool-usage?list=server&offset=1");
+		expect(second.status).toBe(200);
+		expect(await second.json()).toMatchObject({
+			list: "server",
+			offset: 1,
+			totalCount: 2,
+			rows: [{ server: "github", calls: 4 }],
+		});
+
+		// An unknown list is a 400, never a fallback to the first one: the answer
+		// would be a page of the WRONG list, which the client appends to the one it
+		// asked about.
+		expect((await get(port, "/api/tool-usage?list=servers")).status).toBe(400);
+		expect((await get(port, "/api/tool-usage")).status).toBe(400);
+		// A non-numeric offset would otherwise be read as 0 and answer a "Show more"
+		// click with the page the client already holds — a button that does nothing.
+		expect((await get(port, "/api/tool-usage?list=server&offset=abc")).status).toBe(400);
+		// Absent means the first page, which is the one case a default is right.
+		expect((await get(port, "/api/tool-usage?list=skill")).status).toBe(200);
+	});
+
 	// The Context dialog's fetch. A read like every other GET here — no token —
 	// and it opens the database itself rather than going through buildModel,
 	// because a document body is not part of any page payload.

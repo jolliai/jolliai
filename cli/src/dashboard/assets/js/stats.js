@@ -618,12 +618,102 @@ window.JD = window.JD || {};
 		);
 	}
 
+	/* Page size for every ranked tool list — mirrors TOOL_ROWS_LIMIT in
+	   DashboardModel.ts. Used for the SCROLL CAP only: how many rows exist and
+	   whether another page can be fetched are the server's `*Total` counts, never
+	   this number, so the two going out of step costs a slightly wrong cap height
+	   and nothing else. */
+	var TOOL_PAGE_SIZE = 8;
+
+	/* The three pageable ranked lists, and everything that differs between them:
+	   which array on `toolUsage` holds the loaded rows, which count they page
+	   against, what identifies a row (for the append dedupe) and the noun the
+	   footer prints. Table-driven because the Skills and MCPs cards would
+	   otherwise each spell the same four decisions out, and only one of them would
+	   get fixed. */
+	var TOOL_LISTS = {
+		skill: { rows: "skills", total: "skillsTotal", key: (r) => r.name, noun: "skills" },
+		server: { rows: "servers", total: "serversTotal", key: (r) => r.server, noun: "servers" },
+		tool: { rows: "mcpTools", total: "mcpToolsTotal", key: (r) => r.name, noun: "tools" },
+	};
+
+	/* Per-list paging state — in flight, failed, and which row index a click just
+	   grew the list from.
+
+	   Kept ON `toolUsage`, never on JD: the 30 s `/api/model` poll replaces that
+	   object with a fresh FIRST page, and the paging state has to reset with it. A
+	   module-level flag would survive the swap and either strand the new payload
+	   at page 1 or scroll it to a row index the new list does not have. */
+	function toolPaging(usage, list) {
+		usage.paging = usage.paging || {};
+		usage.paging[list] = usage.paging[list] || {};
+		return usage.paging[list];
+	}
+
+	/* "Showing 8 of 15 servers" plus the button that fetches the next page.
+
+	   Deliberately NOT `JD.moreToggle`, for the same reason the Memories tree's
+	   footer is not: that one expands rows the server already sent, so it can
+	   promise "Show all N" and offer "Show fewer". This costs a round trip per
+	   click, so it says only what one click will do.
+
+	   Absent entirely on a list that has never paged and never could — a footer
+	   that can only ever read "N of N" is noise on the far more common
+	   small-corpus page. But once a click HAS grown the list it stays, count only,
+	   because the card's height is part of the layout: the three cards share one
+	   equal-third band, and dropping a 40px row the moment the last page lands
+	   made the card visibly shrink under the reader on the one click that was
+	   supposed to change nothing but the rows (measured in a real browser). It is
+	   also the only place the reader is told they have reached the end. */
+	function toolMoreRow(usage, list) {
+		var spec = TOOL_LISTS[list];
+		var shown = (usage[spec.rows] || []).length;
+		var total = usage[spec.total] || 0;
+		var state = toolPaging(usage, list);
+		if (!shown) return "";
+		var count =
+			'<span class="more-count">Showing ' +
+			shown +
+			" of " +
+			total +
+			" " +
+			spec.noun +
+			/* The failure belongs next to the count it stopped from growing, not in a
+			   toast: this button still being here IS the reason it matters. */
+			(state.error && !state.loading ? " — could not load more" : "") +
+			"</span>";
+		if (shown >= total) return state.grown ? '<div class="more-row is-done">' + count + "</div>" : "";
+		var label = state.loading ? "Loading…" : state.error ? "Try again" : "Show more";
+		return (
+			'<div class="more-row">' +
+			count +
+			'<button type="button" class="cta ghost sm" data-toolmore="' +
+			JD.esc(list) +
+			'"' +
+			(state.loading ? " disabled" : "") +
+			">" +
+			label +
+			"</button></div>"
+		);
+	}
+
 	/* Ranked rows shared by Skills and MCP servers: label (+ optional kind),
-	   value, a bare colour bar underneath sized against the top row. */
-	function rankedList(rows, colorVar, valueOf, labelOf, kindOf, unit) {
+	   value, a bare colour bar underneath sized against the top row. `list` names
+	   which pageable list this is, so `capToolLists` can find the <ul> again after
+	   the render. */
+	function rankedList(rows, colorVar, valueOf, labelOf, kindOf, unit, list) {
 		if (rows.length === 0) return "";
-		var top = valueOf(rows[0]) || 1;
-		var html = '<ul class="ranklist">';
+		// The real maximum, not `rows[0]` — that is only the biggest value when the
+		// list's rank order happens to be the metric the bars measure, and Skills
+		// deliberately ranks by adoption while printing runs (see `byAdoption` in
+		// DashboardQuery). Row 0 as the denominator therefore produced widths past
+		// 100%, which `.rl-bar`'s `overflow: hidden` clamps rather than reveals:
+		// measured on the MCPs card at 68 calls in row 0, codegraph's 149 asked for
+		// 219% and dbhub's 76 for 112%, so three distinct volumes all painted as one
+		// full bar. A too-wide bar is the failure that hides itself; a short bar in
+		// row 0 is the honest signal that rank and volume disagree.
+		var top = rows.reduce((max, row) => Math.max(max, valueOf(row)), 0) || 1;
+		var html = '<ul class="ranklist"' + (list ? ' data-toollist="' + JD.esc(list) + '"' : "") + ">";
 		rows.forEach((row) => {
 			var value = valueOf(row);
 			// The name truncates with an ellipsis (see .rl-name), so the full text
@@ -651,9 +741,58 @@ window.JD = window.JD || {};
 		return html + "</ul>";
 	}
 
+	/* Which agents are behind one ranked row — `claude`, or `codex · claude` when
+	   more than one contributed. The names are `sessions.source` verbatim, the
+	   same tag the Tokens chart's Agent axis prints, so the two panels can be
+	   read against each other without a mapping in the reader's head.
+
+	   Counts are deliberately left OFF the per-row tag: the row already prints
+	   its own total beside the name, and a second set of numbers at that size
+	   reads as noise. The split WITH volume lives on the card's header line. */
+	function agentTag(agents) {
+		if (!agents || agents.length === 0) return "";
+		return agents.map((a) => a.source).join(" · ");
+	}
+
+	/* Append the agent tag to a row's existing meta slot without losing it —
+	   the MCP lists already spend that slot on tool/session counts. */
+	function withAgents(metaOf) {
+		return (row) => {
+			var tag = agentTag(row.agents);
+			var meta = metaOf ? metaOf(row) : "";
+			return meta && tag ? meta + " · " + tag : meta || tag;
+		};
+	}
+
+	/* The card's per-agent header line: who produced everything below, with
+	   volume. Built from the server's own untruncated grouping (`skillAgents` /
+	   `mcpAgents`), never from the visible rows — those are cut to 8, so summing
+	   them would quietly under-report an agent whose tools all rank lower. */
+	function agentLine(agents) {
+		if (!agents || agents.length === 0) return "";
+		var parts = agents.map((a) => '<b class="num">' + a.calls + "</b> " + JD.esc(a.source));
+		return '<div class="sub" style="margin-top:2px">by agent · ' + parts.join(" · ") + "</div>";
+	}
+
+	/* The "…so this list is not everything" caveat, shared by both cards.
+	   `uncoveredSources` is a PARSER capability the server computed, not "these
+	   agents happened to call nothing" — see ToolUsage in DashboardModel. */
+	function uncoveredNote(usage, noun) {
+		if (usage.uncoveredSources.length === 0) return "";
+		return (
+			" · <b>" +
+			JD.esc(usage.uncoveredSources.join(", ")) +
+			"</b> record no tool calls, so " +
+			noun +
+			" used only from those agents will not appear here"
+		);
+	}
+
 	/* Skills (span6) — split out of the old combined "Skills & tools" card so
 	   each half gets its own icon, stat line and footer, matching jolli-design's
-	   per-card anatomy. Claude-only by construction, like the card it replaces. */
+	   per-card anatomy. Every row names the agents that ran it; which agents can
+	   be read at all is the footer's `uncoveredSources` caveat, not a fixed list
+	   here (it was hard-coded to Claude and went stale the day Codex landed). */
 	function skillsCard(model) {
 		var usage = model.stats.toolUsage;
 		var icon = widgetIcon(
@@ -667,27 +806,36 @@ window.JD = window.JD || {};
 		if (usage.skills.length === 0) {
 			return (
 				html +
-				'<div class="empty-note">No skill invocations recorded in this window. Only Claude transcripts ' +
-				"carry them.</div></section>"
+				'<div class="empty-note">No skill invocations recorded in this window.' +
+				uncoveredNote(usage, "a skill") +
+				"</div></section>"
 			);
 		}
 
-		var totalRuns = usage.skills.reduce((sum, r) => sum + r.calls, 0);
+		/* Both figures come off the server's own COUNT/SUM, never off the rows on
+		   screen: `usage.skills` is ONE PAGE, so summing it read "12 runs · 8
+		   skills" on a machine with 30 skills — and changed every time the reader
+		   clicked Show more, which is the kind of wrong a header line cannot be. */
+		var totalRuns = usage.skillCallsTotal;
+		var totalSkills = usage.skillsTotal;
 		html +=
 			'<div class="sub" style="margin-top:2px">' +
 			totalRuns +
 			(totalRuns === 1 ? " run · " : " runs · ") +
-			usage.skills.length +
-			(usage.skills.length === 1 ? " skill</div>" : " skills</div>");
+			totalSkills +
+			(totalSkills === 1 ? " skill</div>" : " skills</div>");
+		html += agentLine(usage.skillAgents);
 
 		html += rankedList(
 			usage.skills,
 			"--s2",
 			(r) => r.calls,
 			(r) => "/" + r.name,
-			null,
+			withAgents(null),
 			"run",
+			"skill",
 		);
+		html += toolMoreRow(usage, "skill");
 
 		return (
 			html +
@@ -696,7 +844,9 @@ window.JD = window.JD || {};
 			"</b> of " +
 			usage.sessionsInWindow +
 			(usage.sessionsInWindow === 1 ? " session</b>" : " sessions") +
-			" in this window</span></div></section>"
+			" in this window" +
+			uncoveredNote(usage, "a skill") +
+			"</span></div></section>"
 		);
 	}
 
@@ -721,33 +871,41 @@ window.JD = window.JD || {};
 	function mcpViewList(usage, view) {
 		if (view === "tool") {
 			if (usage.mcpTools.length === 0) return '<div class="empty-note">No individual MCP tool calls recorded in this window.</div>';
-			return rankedList(
-				usage.mcpTools,
-				"--s1",
-				(r) => r.calls,
-				(r) => r.name,
-				(r) => r.sessions + (r.sessions === 1 ? " session" : " sessions"),
-				"call",
+			return (
+				rankedList(
+					usage.mcpTools,
+					"--s1",
+					(r) => r.calls,
+					(r) => r.name,
+					withAgents((r) => r.sessions + (r.sessions === 1 ? " session" : " sessions")),
+					"call",
+					"tool",
+				) + toolMoreRow(usage, "tool")
 			);
 		}
-		return rankedList(
-			usage.servers,
-			"--s1",
-			(r) => r.calls,
-			(r) => r.server,
-			(r) => r.tools + (r.tools === 1 ? " tool" : " tools"),
-			"call",
+		return (
+			rankedList(
+				usage.servers,
+				"--s1",
+				(r) => r.calls,
+				(r) => r.server,
+				withAgents((r) => r.tools + (r.tools === 1 ? " tool" : " tools")),
+				"call",
+				"server",
+			) + toolMoreRow(usage, "server")
 		);
 	}
 
-	/* MCP servers (span6). Claude-only by construction, so the coverage line
-	   is mandatory: without it, "3 sessions" reads as 3 of everything rather
-	   than 3 of the sessions this build can actually see inside. Deliberately
-	   no "N of M servers called" figure — that needs the full registered-server
-	   list, which lives in MCP registration config, not in captured tool calls;
-	   see ToolUsage in DashboardModel. */
+	/* MCP servers (span6). Only some agents' transcripts can be read for tool
+	   calls, so the coverage line is mandatory: without it, "3 sessions" reads
+	   as 3 of everything rather than 3 of the sessions this build can actually
+	   see inside. Each row also names the agents behind it, which is the finer
+	   version of the same honesty — "codegraph · codex" answers a question the
+	   whole-card caveat cannot. Deliberately no "N of M servers called" figure:
+	   that needs the full registered-server list, which lives in MCP
+	   registration config, not in captured tool calls; see ToolUsage in
+	   DashboardModel. */
 	function mcpCard(model) {
-		var esc = JD.esc;
 		var usage = model.stats.toolUsage;
 		var icon = widgetIcon(
 			"--s1",
@@ -760,18 +918,25 @@ window.JD = window.JD || {};
 		if (usage.servers.length === 0) {
 			return (
 				html +
-				'<div class="empty-note">No MCP calls recorded in this window. Only Claude transcripts carry them.' +
+				'<div class="empty-note">No MCP calls recorded in this window.' +
+				uncoveredNote(usage, "a server") +
 				"</div></section>"
 			);
 		}
 
-		var totalCalls = usage.servers.reduce((sum, r) => sum + r.calls, 0);
+		/* Server and call totals for the WHOLE window, from the server's own
+		   COUNT/SUM — see the same note on the Skills card. Measured on a real
+		   database: 15 servers and 375 calls, of which the first page can account
+		   for 8 and 61. */
+		var totalCalls = usage.serverCallsTotal;
+		var totalServers = usage.serversTotal;
 		html +=
 			'<div class="sub" style="margin-top:2px">' +
-			usage.servers.length +
-			(usage.servers.length === 1 ? " server · " : " servers · ") +
+			totalServers +
+			(totalServers === 1 ? " server · " : " servers · ") +
 			totalCalls +
 			(totalCalls === 1 ? " call</div>" : " calls</div>");
+		html += agentLine(usage.mcpAgents);
 
 		if (usage.recallCalls) {
 			html +=
@@ -790,12 +955,7 @@ window.JD = window.JD || {};
 		html += mcpViewList(usage, view);
 
 		var note = "from <b>" + usage.sessionsWithTools + "</b> of " + usage.sessionsInWindow + " sessions in this window";
-		if (usage.uncoveredSources.length > 0) {
-			note +=
-				" · <b>" +
-				esc(usage.uncoveredSources.join(", ")) +
-				"</b> record no tool calls, so a server used only from those agents will not appear here";
-		}
+		note += uncoveredNote(usage, "a server");
 		if (usage.recallCalls) {
 			note +=
 				" · recall count is MCP-tool calls only — a bare <code>jolli recall</code> run or the skill's CLI " +
@@ -804,6 +964,138 @@ window.JD = window.JD || {};
 		note +=
 			" · older activity is reconstructed from commits and stored summaries; recent sessions are exact";
 		return html + '<div class="w-foot"><span class="w-measure mcp-card-note">ⓘ ' + note + "</span></div></section>";
+	}
+
+	/* Past its first page a ranked list scrolls INSIDE the card rather than
+	   growing it. The three cards sit in one equal-third band, so a list that
+	   grows re-flows the two beside it and pushes everything below the fold — the
+	   card's size is part of the layout, not a consequence of its contents.
+
+	   The cap is MEASURED off the rendered rows (the height of exactly
+	   TOOL_PAGE_SIZE of them) rather than written as a CSS length: a row is a line
+	   of variable-length text plus a bar, so its height is a font measurement, not
+	   a constant, and a hard-coded one would either clip row 8 or leave a scrollbar
+	   under a list that has nothing to scroll.
+
+	   A list still on its first page gets NO cap at all — that is what keeps the
+	   default 8 rows free of a scrollbar, which a `max-height` set unconditionally
+	   would not (a cap equal to the content still arms the scroll container, and a
+	   sub-pixel row height rounds the wrong way). */
+	function capToolLists() {
+		document.querySelectorAll("[data-toollist]").forEach((list) => {
+			var items = list.children;
+			if (!items || items.length <= TOOL_PAGE_SIZE) return;
+			var first = items[0];
+			var last = items[TOOL_PAGE_SIZE - 1];
+			var height = last.offsetTop + last.offsetHeight - first.offsetTop;
+			/* 0 while the card has no layout yet (a hidden tab, a detached render).
+			   Capping to 0 would hide every row; leaving it uncapped only costs the
+			   card its fixed height until the next repaint. */
+			if (!height) return;
+			list.style.maxHeight = height + "px";
+			list.classList.add("rl-scroll");
+		});
+	}
+
+	/* Scrolls a just-grown list so the rows the click actually fetched are at the
+	   top of the visible window. Without it the card looks unchanged: the new rows
+	   are there but below the fold, and the only visible difference is the footer
+	   count — which reads as a button that half-worked. */
+	function revealToolRows(usage) {
+		if (!usage || !usage.paging) return;
+		Object.keys(TOOL_LISTS).forEach((list) => {
+			var state = usage.paging[list];
+			if (!state || state.revealFrom == null) return;
+			var at = state.revealFrom;
+			/* Cleared whether or not the scroll lands — it describes ONE click, and a
+			   sticky value would re-scroll the reader on every 30 s repaint. */
+			state.revealFrom = null;
+			var el = document.querySelector('[data-toollist="' + list + '"]');
+			if (!el) return;
+			var items = el.children;
+			if (at <= 0 || at >= items.length) return;
+			el.scrollTop = items[at].offsetTop - items[0].offsetTop;
+		});
+	}
+
+	/**
+	 * Fetches ONE more page of a ranked tool list and appends it.
+	 *
+	 * The paging is SQL-side (`/api/tool-usage` → `buildToolUsagePage`), so this
+	 * is the only way past the first page: the model carries 8 rows and the
+	 * totals, never the rest of the list.
+	 *
+	 * Re-renders the whole stats page rather than splicing the new rows into the
+	 * existing <ul>. A ranked list's bars are sized against the list's true
+	 * maximum, and a later page can carry a BIGGER value than the top row — Skills
+	 * ranks by adoption while printing runs (see `rankedList`) — so appending in
+	 * place would leave every bar already on screen measured against a denominator
+	 * that had moved.
+	 *
+	 * Never chained or auto-fired: one click, one page. The first page is already
+	 * a working card, and anything past it earns its round trip when asked for.
+	 */
+	function loadMoreToolRows(model, list) {
+		var spec = TOOL_LISTS[list];
+		var usage = model.stats && model.stats.toolUsage;
+		if (!spec || !usage) return;
+		var state = toolPaging(usage, list);
+		if (state.loading) return;
+		var rows = usage[spec.rows] || [];
+		if (rows.length >= (usage[spec.total] || 0)) return;
+		state.loading = true;
+		state.error = false;
+		JD.renderPage(model);
+		JD.getJson(JD.withParams("/api/tool-usage" + JD.query(model, {}), { list: list, offset: String(rows.length) }))
+			.then((page) => {
+				/* A 30 s model refresh can finish while this page is in flight. That
+				   refresh replaces the global model and deliberately resets every tool
+				   list to its fresh first page; an older response must not repaint the
+				   superseded model over it. Identity is enough because refreshNow replaces
+				   the object rather than mutating it. */
+				if (window.__JOLLI_DASHBOARD__ !== model) return;
+				state.loading = false;
+				var incoming = (page && page.rows) || [];
+				/* Re-read per page, not remembered from the first render: the window
+				   keeps gaining calls while the dashboard is open, so "is there more"
+				   has to be asked against a total as fresh as the rows beside it. */
+				usage[spec.total] = page.totalCount;
+				/* Deduped by row identity. An offset can repeat a row — a call arriving
+				   mid-browse shifts one across the page boundary — but it can never
+				   invent one, so a repeat is dropped and an all-repeats page is the
+				   "nothing new" case below. */
+				/* Null-prototype because tool names are data. `__proto__` and
+				   `constructor` are valid strings, not inherited rows that should be
+				   treated as already loaded. */
+				var seen = Object.create(null);
+				rows.forEach((row) => {
+					seen[spec.key(row)] = true;
+				});
+				var fresh = incoming.filter((row) => !seen[spec.key(row)]);
+				if (fresh.length === 0) {
+					/* Nothing past this offset that we do not already hold, whatever the
+					   total says. Believe the rows: pin the total to what is loaded, so
+					   the footer loses its button rather than offering a click that cannot
+					   add anything — but keeps its row, so the card does not resize on a
+					   click that found nothing. */
+					usage[spec.total] = rows.length;
+					state.grown = true;
+					JD.renderPage(model);
+					return;
+				}
+				state.revealFrom = rows.length;
+				/* Sticky for the life of this payload: it is what keeps the footer (and
+				   so the card's height) in place once the last page lands. */
+				state.grown = true;
+				usage[spec.rows] = rows.concat(fresh);
+				JD.renderPage(model);
+			})
+			.catch(() => {
+				if (window.__JOLLI_DASHBOARD__ !== model) return;
+				state.loading = false;
+				state.error = true;
+				JD.renderPage(model);
+			});
 	}
 
 	/* Where your tokens went (span4) — input/output/cache, day-bucketed. Reuses
@@ -1149,5 +1441,15 @@ window.JD = window.JD || {};
 			};
 		}
 
+		/* The Skills / MCPs lists are the one thing on this page that pages in SQL,
+		   so their "Show more" is a fetch rather than a view toggle. Capped first
+		   (both run on every repaint, so a list grown by an earlier click keeps its
+		   height and its scrollbar), then the reveal, which needs the cap in place
+		   to have anything to scroll. */
+		capToolLists();
+		revealToolRows(stats.toolUsage);
+		document.querySelectorAll("[data-toolmore]").forEach((button) => {
+			button.onclick = () => loadMoreToolRows(model, button.getAttribute("data-toolmore"));
+		});
 	};
 })(window.JD);

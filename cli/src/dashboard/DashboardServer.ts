@@ -116,8 +116,9 @@ import {
 	type DashboardScope,
 	type DashboardView,
 	type SeriesDimension,
+	type ToolUsageList,
 } from "./DashboardModel.js";
-import { buildDashboardModel, type QueryOptions } from "./DashboardQuery.js";
+import { buildDashboardModel, buildToolUsagePage, type QueryOptions } from "./DashboardQuery.js";
 import { projectRepoRegistryState } from "./DbBackfill.js";
 import { getDecisionGist } from "./DecisionGist.js";
 import { buildGraphViewerDocument } from "./GraphViewerDocument.js";
@@ -1034,6 +1035,16 @@ const VIEW_TOKENS: ReadonlySet<string> = new Set<DashboardView>([
 ]);
 
 /**
+ * Valid `?list=` tokens for `/api/tool-usage`.
+ *
+ * An unrecognized one is a 400, NOT a fallback to the first list. Every other
+ * enum on this router degrades to a default because the answer is still a page
+ * the reader can read — here the answer would be a page of the WRONG list,
+ * appended by the client to the one it asked about.
+ */
+const TOOL_USAGE_LISTS: ReadonlyArray<ToolUsageList> = ["skill", "server", "tool"];
+
+/**
  * New destinations that redirect to Repositories when nothing is enabled yet
  * — mirrors the mockup's nav gating ("nothing for any of them to read" before
  * a repo is set up). `/repositories` is deliberately absent — it is the row
@@ -1361,6 +1372,62 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			} catch (err) {
 				log.warn("memories page read failed: %s", errMsg(err));
 				sendJson(res, 500, { error: "could not read that page of memories" });
+			}
+			return;
+		}
+
+		// One page of a Skills / MCPs list, behind those cards' "Show more" button.
+		// Same shape as `/api/memories` above and for the same reason: the model is
+		// inlined into the page HTML, so only the first page can ride there. A read
+		// like every other GET here — no token.
+		//
+		// The window params ride along (`range`/`from`/`to`) because the rows are
+		// an aggregate OVER a window: paging with a different one than the card was
+		// rendered under would append rows counted from a different set. The client
+		// sends them from the same `JD.query` builder every other fetch uses.
+		//
+		// `limit` is deliberately NOT a parameter. The page size is the height the
+		// card is laid out for, so it is ours to pick; accepting one would let a
+		// browser-reachable route ask for an unbounded scan.
+		if (url.pathname === "/api/tool-usage") {
+			const requested = url.searchParams.get("list") ?? "";
+			const list = TOOL_USAGE_LISTS.find((known) => known === requested);
+			if (!list) {
+				sendJson(res, 400, { error: `list must be one of ${TOOL_USAGE_LISTS.join("|")}` });
+				return;
+			}
+			// A non-numeric offset is the caller's bug, not a position to guess at:
+			// treating it as 0 would answer a "Show more" click with the page the
+			// client already holds, which its dedupe drops — a button that visibly
+			// does nothing. (A negative or fractional NUMBER is floored instead; see
+			// `buildToolUsagePage`.)
+			const rawOffset = url.searchParams.get("offset") ?? "0";
+			const offset = Number(rawOffset);
+			if (!Number.isFinite(offset)) {
+				sendJson(res, 400, { error: "offset must be a number" });
+				return;
+			}
+			// Spelled out rather than spread from `parseWindow`: that helper also
+			// carries the series axis and the Memories view's `hash`/`detailRepo`,
+			// none of which this route has any business receiving.
+			const requestedWindow = parseWindow(url);
+			try {
+				const page = await withReadonlyDashboardDb(
+					(db) =>
+						buildToolUsagePage(db, {
+							scope: parseScope(url),
+							list,
+							offset,
+							...(requestedWindow.range ? { range: requestedWindow.range } : {}),
+							...(requestedWindow.customFrom ? { customFrom: requestedWindow.customFrom } : {}),
+							...(requestedWindow.customTo ? { customTo: requestedWindow.customTo } : {}),
+						}),
+					{ ...(options.dbPath ? { dbPath: options.dbPath } : {}) },
+				);
+				sendJson(res, 200, page);
+			} catch (err) {
+				log.warn("tool usage page read failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not read that page of tool usage" });
 			}
 			return;
 		}

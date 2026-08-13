@@ -1141,6 +1141,34 @@ export interface StandupModel {
 	readonly insights?: ReadonlyArray<StandupInsight>;
 }
 
+/**
+ * One agent's share of a single skill / tool / server row — which of Claude
+ * Code, Codex, … actually made those calls.
+ *
+ * CALLS ONLY, deliberately. A session belongs to exactly one source, so calls
+ * and session counts both partition cleanly by agent at the grouping they were
+ * counted at — but a session count does not survive being RE-SUMMED at a
+ * coarser level, and this shape appears at three of them. A session that called
+ * two of a server's tools is one session for the server and two rows in the
+ * per-tool grouping, which is the same trap {@link ToolUsage.servers}' own
+ * query exists to avoid (see `buildToolUsage`). Carrying a number that is exact
+ * on the skill rows and a double count on the server rows would be worse than
+ * carrying none. The per-kind totals in {@link ToolUsage.skillAgents} /
+ * {@link ToolUsage.mcpAgents} do carry sessions, because they come from their
+ * own `COUNT(DISTINCT …)` grouping rather than from a re-sum.
+ */
+export interface ToolUsageAgentShare {
+	/** `sessions.source` — the raw `claude` / `codex` tag every other axis shows. */
+	readonly source: string;
+	readonly calls: number;
+}
+
+/** One agent's whole-window footprint for a tool kind, counted by its own grouping. */
+export interface ToolUsageAgentTotal extends ToolUsageAgentShare {
+	/** Distinct sessions of this agent with at least one call of that kind. */
+	readonly sessions: number;
+}
+
 /** One tool, skill or MCP server, aggregated over the window. */
 export interface ToolUsageRow {
 	/** `Bash`, `linear.list_issues`, `code-review`. */
@@ -1149,6 +1177,8 @@ export interface ToolUsageRow {
 	/** Sessions that called it — the adoption figure, not the volume figure. */
 	readonly sessions: number;
 	readonly calls: number;
+	/** Which agents made those calls, most calls first — see {@link ToolUsageAgentShare}. */
+	readonly agents: ReadonlyArray<ToolUsageAgentShare>;
 }
 
 /** One MCP server, rolled up across all of its tools. */
@@ -1159,10 +1189,51 @@ export interface McpServerRow {
 	readonly calls: number;
 	/** Distinct tools of that server actually called. */
 	readonly tools: number;
+	/** Which agents called it, most calls first — see {@link ToolUsageAgentShare}. */
+	readonly agents: ReadonlyArray<ToolUsageAgentShare>;
 }
 
-/** How many rows the skill and server lists carry. */
+/**
+ * How many rows ONE PAGE of a skill / server / MCP-tool list carries.
+ *
+ * Not a cap any more: it is the page size, applied as `LIMIT` in SQL (see
+ * `buildToolUsage`), and the card's "Show more" button asks
+ * `/api/tool-usage` for the next page of the same size. It stayed 8 because
+ * that is the height the card is laid out for — past the first page the list
+ * scrolls inside the card rather than growing it, so the page size is also the
+ * number of rows visible without scrolling.
+ *
+ * The client has a copy of this number (`TOOL_PAGE_SIZE` in `assets/js/stats.js`)
+ * for the scroll cap alone; the paging itself is driven by the server's
+ * `*Total` counts below, never by the client re-deriving the page size.
+ */
 export const TOOL_ROWS_LIMIT = 8;
+
+/** Which of the three tool-usage lists a page request is for. */
+export type ToolUsageList = "skill" | "server" | "tool";
+
+/**
+ * One page of a tool-usage list — the `/api/tool-usage` answer.
+ *
+ * `totalCount` is re-read per page rather than remembered from the first
+ * render: the window keeps gaining rows while the dashboard is open, so the
+ * client's "is there more" test must be against a total as fresh as the rows
+ * it just received.
+ */
+export type ToolUsagePage =
+	| {
+			readonly list: "skill" | "tool";
+			/** Row index the page starts at — what the caller asked for, echoed back. */
+			readonly offset: number;
+			readonly rows: ReadonlyArray<ToolUsageRow>;
+			readonly totalCount: number;
+	  }
+	| {
+			readonly list: "server";
+			readonly offset: number;
+			readonly rows: ReadonlyArray<McpServerRow>;
+			readonly totalCount: number;
+	  };
 
 /**
  * `server.tool` name recorded for the recall feature's own MCP tool — the
@@ -1262,21 +1333,75 @@ export const RECALL_SKILL_NAMES: ReadonlyArray<string> = [RECALL_SKILL_NAME, "jo
  * dashboard states the limitation in the card's footnote instead.
  */
 export interface ToolUsage {
-	/** Skills, most-adopted first. */
-	readonly skills: ReadonlyArray<ToolUsageRow>;
-	/** MCP servers, most-adopted first. */
-	readonly servers: ReadonlyArray<McpServerRow>;
-	/** Individual MCP tools (name already `server.tool`), most-adopted first — the "by tool" split of `servers`. */
-	readonly mcpTools: ReadonlyArray<ToolUsageRow>;
 	/**
-	 * The recall feature's own row (`jollimemory.recall`), pulled out of `mcpTools`
-	 * before that array is truncated to TOOL_ROWS_LIMIT — recall can rank outside
-	 * the top 8 MCP tools by adoption even when it has real volume, so this must
-	 * not be derived from `mcpTools` client-side. `undefined` when the window has
-	 * no matching row (misses bare `jolli recall` CLI runs and the skill's
-	 * non-MCP fallback too — those never produce an `mcp`-kind row at all).
+	 * Skills, most-adopted first — ranked by {@link ToolUsageRow.sessions}, not by
+	 * volume, so one session that ran `/simplify` 200 times does not outrank a
+	 * skill three separate sessions reached for.
+	 *
+	 * This is the ONE list that ranks by a figure its rows do not print (they
+	 * print runs). That mismatch is why `rankedList` must size its bars against
+	 * the list's true maximum rather than its first row — and why an appended
+	 * page cannot be spliced into the rendered list in place: a later page can
+	 * carry MORE runs than the top row, which moves the bar denominator.
+	 *
+	 * ONE PAGE — the first {@link TOOL_ROWS_LIMIT} rows. The rest are fetched
+	 * per click from `/api/tool-usage?list=skill`, so anything derived from the
+	 * whole set must come off a `*Total` field or its own grouping, never off
+	 * this array.
+	 */
+	readonly skills: ReadonlyArray<ToolUsageRow>;
+	/** Distinct skills in the window — the paging total behind `skills`, and the "N skills" the card prints. */
+	readonly skillsTotal: number;
+	/** Every skill run in the window, including rows past the first page. */
+	readonly skillCallsTotal: number;
+	/**
+	 * MCP servers, busiest first — ranked by {@link McpServerRow.calls}, with
+	 * sessions as the tiebreak.
+	 *
+	 * Volume rather than adoption because this is the figure the card prints and
+	 * bars: ranking by sessions put 149 calls below 68 and made the two cards
+	 * disagree about what "first" meant, for no reading the numbers on screen
+	 * could explain. A server's adoption is still on the row (`sessions` rides in
+	 * the "by tool" split's meta slot) — it just does not order the list.
+	 *
+	 * ONE PAGE, like {@link skills} — see {@link serversTotal}.
+	 */
+	readonly servers: ReadonlyArray<McpServerRow>;
+	/** Distinct MCP servers called in the window — the paging total behind `servers`. */
+	readonly serversTotal: number;
+	/** Every MCP call in the window that carries a server, including rows past the first page. */
+	readonly serverCallsTotal: number;
+	/**
+	 * Individual MCP tools (name already `server.tool`), busiest first — the "by
+	 * tool" split of `servers`, same rule, and ONE PAGE like the other two.
+	 */
+	readonly mcpTools: ReadonlyArray<ToolUsageRow>;
+	/** Distinct MCP tools called in the window — the paging total behind `mcpTools`. */
+	readonly mcpToolsTotal: number;
+	/**
+	 * The recall feature's own row (`jollimemory.recall`), from its OWN query
+	 * rather than out of `mcpTools` — recall can rank outside the first page of
+	 * MCP tools on a busy machine even when its own volume is worth reporting, so
+	 * this must not be derived from `mcpTools` client-side (that held under the
+	 * old adoption ranking, holds under volume, and holds harder now that the
+	 * array is one page of a paged list: the reader may never click far enough to
+	 * load the row). `undefined` when the window has no matching row (misses bare
+	 * `jolli recall` CLI runs and the skill's non-MCP fallback too — those never
+	 * produce an `mcp`-kind row at all).
 	 */
 	readonly recallCalls?: ToolUsageRow;
+	/**
+	 * Agents that ran a skill in the window, most calls first.
+	 *
+	 * Its own grouping over EVERY row in the window, not a roll-up of
+	 * {@link skills} — that array is one page of {@link TOOL_ROWS_LIMIT}, so
+	 * deriving this client-side would under-report every agent whose skills all
+	 * rank outside the loaded pages, and would have to re-sum session counts (see
+	 * {@link ToolUsageAgentShare}).
+	 */
+	readonly skillAgents: ReadonlyArray<ToolUsageAgentTotal>;
+	/** Agents that called an MCP tool in the window, most calls first — same rule as {@link skillAgents}. */
+	readonly mcpAgents: ReadonlyArray<ToolUsageAgentTotal>;
 	/** Sessions with at least one recorded tool call. */
 	readonly sessionsWithTools: number;
 	/** Sessions in the window, regardless of whether tools could be read. */

@@ -3,11 +3,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { withDashboardDb } from "./DashboardDb.js";
-import type { DashboardScope, SessionUpsertedEvent, StatsEventEnvelope, StatsModel } from "./DashboardModel.js";
+import type {
+	DashboardScope,
+	McpServerRow,
+	SessionUpsertedEvent,
+	StatsEventEnvelope,
+	StatsModel,
+	ToolUsageRow,
+} from "./DashboardModel.js";
 import { TOOL_ROWS_LIMIT } from "./DashboardModel.js";
 import {
 	addLocalDays,
 	buildDashboardModel,
+	buildToolUsagePage,
 	computeStreak,
 	localDayKey,
 	localHour,
@@ -826,8 +834,20 @@ describe("buildDashboardModel — tool usage", () => {
 			{ producerKind: "cli", dbPath },
 		);
 		const result = await usage();
-		expect(result?.skills[0]).toEqual({ name: "code-review", kind: "skill", sessions: 3, calls: 4 });
-		expect(result?.skills[1]).toEqual({ name: "simplify", kind: "skill", sessions: 1, calls: 200 });
+		expect(result?.skills[0]).toEqual({
+			name: "code-review",
+			kind: "skill",
+			sessions: 3,
+			calls: 4,
+			agents: [{ source: "claude", calls: 4 }],
+		});
+		expect(result?.skills[1]).toEqual({
+			name: "simplify",
+			kind: "skill",
+			sessions: 1,
+			calls: 200,
+			agents: [{ source: "claude", calls: 200 }],
+		});
 	});
 
 	it("rolls MCP tools up to their server and counts its distinct tools", async () => {
@@ -845,17 +865,17 @@ describe("buildDashboardModel — tool usage", () => {
 		const result = await usage();
 		expect(result?.servers).toEqual([
 			// One session using two of the server's tools is ONE session, never two.
-			{ server: "linear", sessions: 1, calls: 5, tools: 2 },
-			{ server: "github", sessions: 1, calls: 1, tools: 1 },
+			{ server: "linear", sessions: 1, calls: 5, tools: 2, agents: [{ source: "claude", calls: 5 }] },
+			{ server: "github", sessions: 1, calls: 1, tools: 1, agents: [{ source: "claude", calls: 1 }] },
 		]);
 	});
 
-	it("splits the same MCP rows by individual tool, ranked by adoption", async () => {
+	it("splits the same MCP rows by individual tool, ranked by call volume", async () => {
 		await applySummaryEvents(
 			[
 				repoEvent,
 				sessionWith("s1", [
-					{ name: "linear.list_issues", kind: "mcp", server: "linear", calls: 3 },
+					{ name: "linear.list_issues", kind: "mcp", server: "linear", calls: 9 },
 					{ name: "linear.get_issue", kind: "mcp", server: "linear", calls: 2 },
 				]),
 				sessionWith("s2", [{ name: "linear.get_issue", kind: "mcp", server: "linear", calls: 1 }]),
@@ -863,12 +883,42 @@ describe("buildDashboardModel — tool usage", () => {
 			{ producerKind: "cli", dbPath },
 		);
 		const result = await usage();
-		// linear.get_issue reached across two sessions outranks list_issues' one,
-		// even though list_issues has more raw calls — same adoption-first rule
-		// as skills.
+		// The two rules disagree here on purpose — list_issues has the volume (9 vs
+		// 3) and get_issue has the adoption (2 sessions vs 1) — because the fixture
+		// this replaced tied at 3 calls each and so passed under either one, leaving
+		// the rule it named untested. Volume wins: unlike skills, both MCP lists
+		// print calls and size their bars by calls.
 		expect(result?.mcpTools).toEqual([
-			{ name: "linear.get_issue", kind: "mcp", sessions: 2, calls: 3 },
-			{ name: "linear.list_issues", kind: "mcp", sessions: 1, calls: 3 },
+			{
+				name: "linear.list_issues",
+				kind: "mcp",
+				sessions: 1,
+				calls: 9,
+				agents: [{ source: "claude", calls: 9 }],
+			},
+			{ name: "linear.get_issue", kind: "mcp", sessions: 2, calls: 3, agents: [{ source: "claude", calls: 3 }] },
+		]);
+	});
+
+	it("ranks servers by call volume, not by the sessions that reached for them", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				// The shape of the real bug: a widely-adopted server with modest volume
+				// above a narrowly-used one that dominates the calls. Ranking by
+				// sessions printed 149 below 68 on a live database, and `rankedList`
+				// sizes its bars against the top row, so the busier server's bar
+				// overflowed to 100% and read as equal rather than as bigger.
+				sessionWith("s1", [{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory", calls: 1 }]),
+				sessionWith("s2", [{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory", calls: 1 }]),
+				sessionWith("s3", [{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory", calls: 1 }]),
+				sessionWith("s4", [{ name: "codegraph.explore", kind: "mcp", server: "codegraph", calls: 30 }]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect((await usage())?.servers.map((row) => [row.server, row.sessions, row.calls])).toEqual([
+			["codegraph", 1, 30],
+			["jollimemory", 3, 3],
 		]);
 	});
 
@@ -882,7 +932,13 @@ describe("buildDashboardModel — tool usage", () => {
 			{ producerKind: "cli", dbPath },
 		);
 		const result = await usage();
-		expect(result?.recallCalls).toEqual({ name: "jollimemory.recall", kind: "mcp", sessions: 2, calls: 4 });
+		expect(result?.recallCalls).toEqual({
+			name: "jollimemory.recall",
+			kind: "mcp",
+			sessions: 2,
+			calls: 4,
+			agents: [{ source: "claude", calls: 4 }],
+		});
 	});
 
 	it("still finds recall's row once it is pushed out of mcpTools' top slots", async () => {
@@ -894,9 +950,10 @@ describe("buildDashboardModel — tool usage", () => {
 		}));
 		const events = [
 			repoEvent,
-			// Each busier tool is reached from two separate sessions — strictly
-			// outranking recall's single session by adoption — while recall itself
-			// is only called once.
+			// Each busier tool is reached from two separate sessions with one call
+			// each, so it outranks recall's single call on volume as well as on
+			// adoption — the cut is TOOL_ROWS_LIMIT rows whichever figure orders
+			// them, which is the property `recallCalls` has to survive.
 			...busierTools.flatMap((tool, i) => [sessionWith(`busyA${i}`, [tool]), sessionWith(`busyB${i}`, [tool])]),
 			sessionWith("recall-session", [
 				{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory", calls: 1 },
@@ -906,7 +963,13 @@ describe("buildDashboardModel — tool usage", () => {
 		const result = await usage();
 		expect(result?.mcpTools).toHaveLength(TOOL_ROWS_LIMIT);
 		expect(result?.mcpTools.some((row) => row.name === "jollimemory.recall")).toBe(false);
-		expect(result?.recallCalls).toEqual({ name: "jollimemory.recall", kind: "mcp", sessions: 1, calls: 1 });
+		expect(result?.recallCalls).toEqual({
+			name: "jollimemory.recall",
+			kind: "mcp",
+			sessions: 1,
+			calls: 1,
+			agents: [{ source: "claude", calls: 1 }],
+		});
 	});
 
 	it("leaves recallCalls undefined when recall was never called", async () => {
@@ -927,7 +990,111 @@ describe("buildDashboardModel — tool usage", () => {
 			{ producerKind: "cli", dbPath },
 		);
 		// Two sessions, one tool each: the per-tool max was 1 and undercounted by half.
-		expect((await usage())?.servers).toEqual([{ server: "linear", sessions: 2, calls: 2, tools: 2 }]);
+		expect((await usage())?.servers).toEqual([
+			{ server: "linear", sessions: 2, calls: 2, tools: 2, agents: [{ source: "claude", calls: 2 }] },
+		]);
+	});
+
+	it("names the agents behind one skill, most calls first, without losing the row's own totals", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWith("s1", [{ name: "code-review", kind: "skill", calls: 2 }], "claude"),
+				sessionWith("s2", [{ name: "code-review", kind: "skill", calls: 5 }], "codex"),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		// The SQL groups by source as well now, so the row itself is a fold of two
+		// buckets. A session has exactly one source, so both totals survive it
+		// exactly — that is the property the split relies on.
+		expect((await usage())?.skills).toEqual([
+			{
+				name: "code-review",
+				kind: "skill",
+				sessions: 2,
+				calls: 7,
+				agents: [
+					{ source: "codex", calls: 5 },
+					{ source: "claude", calls: 2 },
+				],
+			},
+		]);
+	});
+
+	it("splits a server by agent from the per-tool rows, leaving its tool count undoubled", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWith("s1", [{ name: "linear.get_issue", kind: "mcp", server: "linear", calls: 3 }], "claude"),
+				// The SAME tool from a second agent: `tools` must stay 1, which is why
+				// the split rides on the per-tool rows instead of a `source` column
+				// added to the server query's own GROUP BY.
+				sessionWith("s2", [{ name: "linear.get_issue", kind: "mcp", server: "linear", calls: 1 }], "codex"),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect((await usage())?.servers).toEqual([
+			{
+				server: "linear",
+				sessions: 2,
+				calls: 4,
+				tools: 1,
+				agents: [
+					{ source: "claude", calls: 3 },
+					{ source: "codex", calls: 1 },
+				],
+			},
+		]);
+	});
+
+	it("counts each agent's sessions distinctly in the per-kind totals", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				// One session, two of the server's tools. Re-summing the per-tool rows
+				// would report claude with 2 sessions; its own grouping reports 1.
+				sessionWith(
+					"s1",
+					[
+						{ name: "linear.get_issue", kind: "mcp", server: "linear", calls: 1 },
+						{ name: "linear.list_issues", kind: "mcp", server: "linear", calls: 1 },
+					],
+					"claude",
+				),
+				sessionWith("s2", [{ name: "github.list_prs", kind: "mcp", server: "github", calls: 5 }], "codex"),
+				sessionWith("s3", [{ name: "code-review", kind: "skill", calls: 1 }], "codex"),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const result = await usage();
+		expect(result?.mcpAgents).toEqual([
+			{ source: "codex", sessions: 1, calls: 5 },
+			{ source: "claude", sessions: 1, calls: 2 },
+		]);
+		// Kinds are separate groupings: the codex session that ran a skill is not
+		// in `mcpAgents`, and its MCP session is not in `skillAgents`.
+		expect(result?.skillAgents).toEqual([{ source: "codex", sessions: 1, calls: 1 }]);
+	});
+
+	it("keeps the agent split on rows that rank outside the visible list", async () => {
+		const many = Array.from({ length: TOOL_ROWS_LIMIT + 2 }, (_, i) =>
+			sessionWith(`s${i}`, [{ name: `srv${i}.t`, kind: "mcp", server: `srv${i}`, calls: 1 }], "claude"),
+		);
+		await applySummaryEvents(
+			[
+				repoEvent,
+				...many,
+				// One codex call, on a server that cannot make the top TOOL_ROWS_LIMIT.
+				sessionWith("sx", [{ name: "tail.t", kind: "mcp", server: "tail", calls: 1 }], "codex"),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const result = await usage();
+		expect(result?.servers).toHaveLength(TOOL_ROWS_LIMIT);
+		// `mcpAgents` comes from its own untruncated grouping, so codex is still
+		// named even though no visible row carries it.
+		expect(result?.servers.some((row) => row.agents.some((a) => a.source === "codex"))).toBe(false);
+		expect(result?.mcpAgents).toContainEqual({ source: "codex", sessions: 1, calls: 1 });
 	});
 
 	it("reports coverage from all sessions and names the sources it cannot see inside", async () => {
@@ -992,7 +1159,9 @@ describe("buildDashboardModel — tool usage", () => {
 			{ producerKind: "cli", dbPath },
 		);
 		const result = await usage();
-		expect(result?.skills).toEqual([{ name: "code-review", kind: "skill", sessions: 1, calls: 4 }]);
+		expect(result?.skills).toEqual([
+			{ name: "code-review", kind: "skill", sessions: 1, calls: 4, agents: [{ source: "claude", calls: 4 }] },
+		]);
 		expect(result?.sessionsInWindow).toBe(1);
 		expect(result?.sessionsWithTools).toBe(1);
 	});
@@ -1051,9 +1220,203 @@ describe("buildDashboardModel — tool usage", () => {
 			skills: [],
 			mcpTools: [],
 			servers: [],
+			skillsTotal: 0,
+			serversTotal: 0,
+			mcpToolsTotal: 0,
+			skillCallsTotal: 0,
+			serverCallsTotal: 0,
 			sessionsWithTools: 0,
 			sessionsInWindow: 1,
 		});
+	});
+
+	/**
+	 * A page row's identity, whichever list it came from.
+	 *
+	 * `ToolUsagePage` is a union discriminated on `list`, and a caller that knows
+	 * which list it asked for still has to say so — the discriminant is on the
+	 * page, not inferred from the argument. Spelled once here rather than narrowed
+	 * at each assertion.
+	 */
+	const rowKey = (row: ToolUsageRow | McpServerRow): string => ("name" in row ? row.name : row.server);
+
+	/** `TOOL_ROWS_LIMIT + 4` skills, each reached from a distinct number of sessions. */
+	const manySkillEvents = (): ReadonlyArray<StatsEventEnvelope> => {
+		const events: StatsEventEnvelope[] = [repoEvent];
+		// Skills rank by ADOPTION, so the session count is what decides the order:
+		// skill00 is reached from the most sessions, skill11 from one.
+		for (let i = 0; i !== TOOL_ROWS_LIMIT + 4; i += 1) {
+			const name = `skill${String(i).padStart(2, "0")}`;
+			for (let s = 0; s !== TOOL_ROWS_LIMIT + 4 - i; s += 1) {
+				events.push(sessionWith(`${name}-s${s}`, [{ name, kind: "skill", calls: 1 }]));
+			}
+		}
+		return events;
+	};
+
+	it("carries the whole window's totals beside the first page, not the page's own sums", async () => {
+		await applySummaryEvents(manySkillEvents(), { producerKind: "cli", dbPath });
+		const result = await usage();
+		// The page is 8 rows; the card's header line states 12 skills and every run
+		// they made. Summing the rows on screen — what it used to do — would print
+		// "8 skills" and a run count that grew with every Show more click.
+		expect(result?.skills).toHaveLength(TOOL_ROWS_LIMIT);
+		expect(result?.skillsTotal).toBe(TOOL_ROWS_LIMIT + 4);
+		// Runs are 12 + 11 + … + 1 across every skill, of which the first page holds
+		// only 12 + 11 + … + 5.
+		expect(result?.skillCallsTotal).toBe(78);
+		expect(result?.skills.reduce((n, row) => n + row.calls, 0)).toBe(68);
+	});
+
+	it("pages a skills list in SQL, partitioning it exactly across offsets", async () => {
+		await applySummaryEvents(manySkillEvents(), { producerKind: "cli", dbPath });
+		const page = async (offset: number) =>
+			await withDashboardDb(
+				(db) =>
+					buildToolUsagePage(db, { scope: { kind: "all" }, list: "skill", offset, timeZone: "UTC", nowMs }),
+				{ dbPath },
+			);
+		const first = await page(0);
+		const second = await page(TOOL_ROWS_LIMIT);
+		expect(first.rows).toHaveLength(TOOL_ROWS_LIMIT);
+		expect(second.rows).toHaveLength(4);
+		expect(second.offset).toBe(TOOL_ROWS_LIMIT);
+		// `totalCount` travels with every page — it is the client's "there is more"
+		// test, and the window keeps gaining rows while the dashboard is open.
+		expect(second.totalCount).toBe(TOOL_ROWS_LIMIT + 4);
+		// The two pages together are the list, with nothing repeated and nothing
+		// dropped: the property OFFSET paging only has while the ORDER BY is total.
+		const names = [...first.rows, ...second.rows].map(rowKey);
+		expect(new Set(names).size).toBe(TOOL_ROWS_LIMIT + 4);
+		expect(names).toEqual([...names].sort((a, b) => a.localeCompare(b)));
+	});
+
+	it("partitions rows tied on both counts, rather than repeating one and dropping another", async () => {
+		// Every row here has the same sessions and the same calls, so the ranking
+		// keys cannot separate them and only the name tiebreak can. Without it two
+		// pages could each hand back the same row and neither the one it displaced.
+		const tied = Array.from({ length: TOOL_ROWS_LIMIT + 2 }, (_, i) => `tied${String(i).padStart(2, "0")}`);
+		await applySummaryEvents(
+			[repoEvent, ...tied.map((name) => sessionWith(`${name}-s`, [{ name, kind: "skill", calls: 1 }]))],
+			{ producerKind: "cli", dbPath },
+		);
+		const rows = async (offset: number) =>
+			(
+				await withDashboardDb(
+					(db) =>
+						buildToolUsagePage(db, {
+							scope: { kind: "all" },
+							list: "skill",
+							offset,
+							timeZone: "UTC",
+							nowMs,
+						}),
+					{ dbPath },
+				)
+			).rows.map(rowKey);
+		expect([...(await rows(0)), ...(await rows(TOOL_ROWS_LIMIT))]).toEqual(tied);
+	});
+
+	it("pages the server roll-up too, keeping each row's tool count and agent split", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWith("s1", [
+					{ name: "linear.list_issues", kind: "mcp", server: "linear", calls: 9 },
+					{ name: "linear.get_issue", kind: "mcp", server: "linear", calls: 2 },
+				]),
+				sessionWith("s2", [{ name: "github.list_prs", kind: "mcp", server: "github", calls: 4 }], "codex"),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const page = await withDashboardDb(
+			(db) =>
+				buildToolUsagePage(db, {
+					scope: { kind: "all" },
+					list: "server",
+					offset: 1,
+					limit: 1,
+					timeZone: "UTC",
+					nowMs,
+				}),
+			{ dbPath },
+		);
+		// The agent split is its own query over the page's keys, so it has to survive
+		// arriving at a nonzero offset — a fold over "every row in the window" would
+		// have attributed the row that was skipped.
+		expect(page).toEqual({
+			list: "server",
+			offset: 1,
+			totalCount: 2,
+			rows: [{ server: "github", sessions: 1, calls: 4, tools: 1, agents: [{ source: "codex", calls: 4 }] }],
+		});
+	});
+
+	it("answers an offset past the end with an empty page rather than an error", async () => {
+		await applySummaryEvents([repoEvent, sessionWith("s1", [{ name: "code-review", kind: "skill", calls: 1 }])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		const page = await withDashboardDb(
+			(db) =>
+				buildToolUsagePage(db, { scope: { kind: "all" }, list: "skill", offset: 99, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		expect(page).toEqual({ list: "skill", offset: 99, rows: [], totalCount: 1 });
+	});
+
+	it("floors a negative or fractional offset onto the first page", async () => {
+		await applySummaryEvents([repoEvent, sessionWith("s1", [{ name: "code-review", kind: "skill", calls: 1 }])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		// A position has a nearest sane answer, unlike a list name — so this is
+		// clamped where an unknown `list` is a 400 (see DashboardServer).
+		const page = await withDashboardDb(
+			(db) =>
+				buildToolUsagePage(db, { scope: { kind: "all" }, list: "skill", offset: -5.7, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		expect(page.offset).toBe(0);
+		expect(page.rows).toHaveLength(1);
+	});
+
+	it("honours the page's repo scope and window, so an appended page matches the card", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWith("in-window", [{ name: "code-review", kind: "skill", calls: 1 }]),
+				{
+					producerKind: "cli",
+					event: {
+						type: "session.upserted",
+						repoIdentity: "repo-1",
+						source: "claude",
+						sessionId: "months-ago",
+						updatedAtMs: nowMs - 3_600_000,
+						tools: [{ name: "ancient", kind: "skill", calls: 1, lastCallAtMs: nowMs - 120 * 86_400_000 }],
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const page = await withDashboardDb(
+			(db) =>
+				buildToolUsagePage(db, {
+					scope: { kind: "all" },
+					list: "skill",
+					offset: 0,
+					range: "week",
+					timeZone: "UTC",
+					nowMs,
+				}),
+			{ dbPath },
+		);
+		// Windowed by the CALL's own time, exactly as the inlined first page is: a
+		// page counted over a different window would append rows the card's totals
+		// know nothing about.
+		expect(page.rows.map(rowKey)).toEqual(["code-review"]);
+		expect(page.totalCount).toBe(1);
 	});
 });
 
@@ -1459,7 +1822,9 @@ describe("buildDashboardModel — recall usage", () => {
 			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
 			{ dbPath },
 		);
-		expect(model.stats?.toolUsage.skills).toEqual([{ name: "jolli-recall", kind: "skill", sessions: 1, calls: 1 }]);
+		expect(model.stats?.toolUsage.skills).toEqual([
+			{ name: "jolli-recall", kind: "skill", sessions: 1, calls: 1, agents: [{ source: "claude", calls: 1 }] },
+		]);
 		expect(model.stats?.recallUsage.skillInvocations).toBe(1);
 	});
 

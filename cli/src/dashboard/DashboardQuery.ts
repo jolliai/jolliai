@@ -56,6 +56,10 @@ import type {
 	StatsModel,
 	TokenBreakdown,
 	ToolUsage,
+	ToolUsageAgentShare,
+	ToolUsageAgentTotal,
+	ToolUsageList,
+	ToolUsagePage,
 	ToolUsageRow,
 } from "./DashboardModel.js";
 import {
@@ -1361,93 +1365,210 @@ function withModel(summary: CommitSummary): { model?: string } {
 
 // ── Tool / skill / MCP usage ────────────────────────────────────────────────
 
+/** Most calls first, then by source, so equal-volume agents order deterministically. */
+function sortAgents<T extends ToolUsageAgentShare>(agents: ReadonlyArray<T>): T[] {
+	return [...agents].sort((a, b) => b.calls - a.calls || a.source.localeCompare(b.source));
+}
+
 /**
- * Skills, MCP servers and the tool mix over the window.
+ * The WHERE clause every query in this section shares — the window, applied to
+ * the CALL's own time, plus the page's repo scope.
  *
- * Every figure here is Claude-only by construction, so the coverage numbers are
- * computed from `sessions` — the full population — and never from the join.
- * `uncoveredSources` names the agents that contributed sessions but no tool
- * records, because "linear: 3 sessions" is a very different statement depending
- * on whether the other 40 sessions could have been counted and were not.
+ * Windowed by the CALL, like the Recall card — see {@link TOOL_CALL_TIME_SQL}.
+ * The two panels report the same rows from the same table, so a `jolli-recall`
+ * bucket landing on one day here and another day there is a contradiction the
+ * reader has no way to resolve.
  *
- * Adoption (`sessions`) leads the ranking over volume (`calls`) deliberately: a
- * single session that hammered one tool 200 times is not evidence that the tool
- * matters, whereas a tool reached for across many separate sessions is.
+ * Built once and threaded into each query rather than re-derived per query: the
+ * three lists, their totals, the per-row agent splits and the recall row must
+ * all be answering about the same set of rows, and `scopeToRepoId` is a lookup
+ * this section would otherwise repeat six times.
  */
-function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: ResolvedWindow): ToolUsage {
+function toolUsageWhere(
+	db: DashboardDbHandle,
+	scope: DashboardScope,
+	window: ResolvedWindow,
+): { sql: string; params: unknown[] } {
 	const filter = scopeFilter(scopeToRepoId(db, scope), "s.repo_id");
+	return {
+		sql: `${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?${filter.sql}`,
+		params: [window.startMs, window.endMs, ...filter.params],
+	};
+}
+
+/** `session_tool_use.kind` each list is drawn from — two of the three share one. */
+const TOOL_LIST_KIND: Readonly<Record<ToolUsageList, string>> = { skill: "skill", tool: "mcp", server: "mcp" };
+
+/**
+ * `ORDER BY` per list — the ranking, and the tiebreak that makes it pageable.
+ *
+ * A ranked list must be ordered by the figure its rows PRINT, or the card
+ * contradicts itself twice over. Both MCP lists print calls and size their bars
+ * by calls, so ranking them by sessions was wrong in a way that read as a
+ * rendering fault rather than a sort one: measured on a real database, the
+ * servers card came out jollimemory (32 sessions / 68 calls), codegraph
+ * (27 / 149), dbhub (9 / 76) — descending sessions, visibly unsorted calls — and
+ * because `rankedList` sizes every bar against the FIRST row, codegraph asked
+ * for 219% and dbhub for 112%, both clamped by `.rl-bar`'s `overflow: hidden`,
+ * so three different volumes all rendered as one full-width bar. Skills ranks by
+ * ADOPTION deliberately: one session hammering /simplify 200 times should not
+ * outrank /code-review reached from three, and that card's own doc comment is
+ * the authority for its list.
+ *
+ * The trailing name is not decoration. `LIMIT`/`OFFSET` only partition a list
+ * cleanly when the order is TOTAL: two rows tied on both counts may come back in
+ * either order per query, so an untiebroken sort can hand the same row to two
+ * pages and never hand over the one it displaced. The un-paged version leaned on
+ * SQLite's own row order for ties, which was good enough while every row was
+ * read exactly once.
+ */
+const TOOL_LIST_ORDER: Readonly<Record<ToolUsageList, string>> = {
+	skill: "session_count DESC, call_count DESC, t.tool_name ASC",
+	tool: "call_count DESC, session_count DESC, t.tool_name ASC",
+	server: "call_count DESC, session_count DESC, t.server ASC",
+};
+
+/**
+ * How many rows a list has in the window, and how many calls they account for.
+ *
+ * Both figures are what a card's header line prints, and both must come from
+ * here rather than from the page it renders: a client summing the rows it holds
+ * says "8 servers · 61 calls" on a machine with 15 servers and 375 calls, and
+ * says something different after every click. `totalCount` is also the client's
+ * "there is another page" test, so it travels with every page — see
+ * {@link ToolUsagePage}.
+ */
+function toolListTotals(
+	db: DashboardDbHandle,
+	where: { sql: string; params: unknown[] },
+	list: ToolUsageList,
+): { totalCount: number; callsTotal: number } {
+	const keyColumn = list === "server" ? "t.server" : "t.tool_name";
+	const row = db
+		.prepare(
+			`SELECT COUNT(DISTINCT ${keyColumn}) AS row_count,
+			        COALESCE(SUM(t.calls), 0) AS call_count
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${where.sql}
+			    AND t.kind = ?${list === "server" ? " AND t.server IS NOT NULL" : ""}`,
+		)
+		.get(...where.params, TOOL_LIST_KIND[list]) as { row_count: number; call_count: number } | undefined;
+	return { totalCount: row?.row_count ?? 0, callsTotal: row?.call_count ?? 0 };
+}
+
+/**
+ * The per-agent split for the rows of ONE page, keyed by whatever identifies a
+ * row in that list (`tool_name`, or `server` for the roll-up).
+ *
+ * Its own query restricted to the page's keys, rather than a fold over every row
+ * in the window: that fold is what the un-paged version did, and keeping it
+ * would defeat the `LIMIT` it now sits behind — reading the agent split of 42
+ * MCP tools to render 8 of them.
+ *
+ * Only CALLS come from here, never sessions. A session belongs to exactly one
+ * source, so per-source call buckets sum back exactly; a per-source SESSION
+ * count does not survive being re-summed at a coarser grouping, which is what a
+ * server row's split would be — see {@link ToolUsageAgentShare}.
+ */
+function toolRowAgents(
+	db: DashboardDbHandle,
+	where: { sql: string; params: unknown[] },
+	list: ToolUsageList,
+	keys: ReadonlyArray<string>,
+): Map<string, ToolUsageAgentShare[]> {
+	const byKey = new Map<string, ToolUsageAgentShare[]>();
+	// `IN ()` is a syntax error, and an empty page has nothing to attribute.
+	if (keys.length === 0) return byKey;
+	const keyColumn = list === "server" ? "t.server" : "t.tool_name";
 	const rows = db
 		.prepare(
-			// Windowed by the CALL, like the Recall card — see TOOL_CALL_TIME_SQL. The
-			// two panels report the same rows from the same table, so a `jolli-recall`
-			// bucket landing on one day here and another day there is a contradiction
-			// the reader has no way to resolve.
-			`SELECT t.tool_name, t.kind, t.server,
+			`SELECT ${keyColumn} AS row_key, s.source,
+			        COALESCE(SUM(t.calls), 0) AS call_count
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${where.sql}
+			    AND t.kind = ? AND ${keyColumn} IN (${placeholders(keys.length)})
+			  GROUP BY ${keyColumn}, s.source`,
+		)
+		.all(...where.params, TOOL_LIST_KIND[list], ...keys) as ReadonlyArray<{
+		row_key: string;
+		source: string;
+		call_count: number;
+	}>;
+	for (const row of rows) {
+		byKey.set(row.row_key, [...(byKey.get(row.row_key) ?? []), { source: row.source, calls: row.call_count }]);
+	}
+	for (const [key, agents] of byKey) byKey.set(key, sortAgents(agents));
+	return byKey;
+}
+
+/** One page of the Skills list, or of the MCPs card's "by tool" split. */
+function toolNameRowsPage(
+	db: DashboardDbHandle,
+	where: { sql: string; params: unknown[] },
+	list: "skill" | "tool",
+	offset: number,
+	limit: number,
+): ToolUsageRow[] {
+	const kind = TOOL_LIST_KIND[list];
+	const rows = db
+		.prepare(
+			// Grouped by name alone: the kind is already pinned by the WHERE, so this
+			// is the same bucket the old `(kind, tool_name)` grouping produced, and
+			// COUNT(DISTINCT) over the whole group is the same number as the sum of
+			// its per-source counts (a session has exactly one source).
+			`SELECT t.tool_name,
 			        COUNT(DISTINCT t.session_event_id) AS session_count,
 			        COALESCE(SUM(t.calls), 0) AS call_count
 			   FROM session_tool_use t
 			   JOIN sessions s ON s.event_id = t.session_event_id
-			  WHERE ${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?${filter.sql}
-			  GROUP BY t.kind, t.tool_name, t.server`,
+			  WHERE ${where.sql} AND t.kind = ?
+			  GROUP BY t.tool_name
+			  ORDER BY ${TOOL_LIST_ORDER[list]}
+			  LIMIT ? OFFSET ?`,
 		)
-		.all(window.startMs, window.endMs, ...filter.params) as ReadonlyArray<{
+		.all(...where.params, kind, limit, offset) as ReadonlyArray<{
 		tool_name: string;
-		kind: string;
-		server: string | null;
 		session_count: number;
 		call_count: number;
 	}>;
+	const agents = toolRowAgents(
+		db,
+		where,
+		list,
+		rows.map((row) => row.tool_name),
+	);
+	return rows.map((row) => ({
+		name: row.tool_name,
+		kind: list === "skill" ? ("skill" as const) : ("mcp" as const),
+		sessions: row.session_count,
+		calls: row.call_count,
+		agents: agents.get(row.tool_name) ?? [],
+	}));
+}
 
-	const skills: ToolUsageRow[] = rows
-		.filter((row) => row.kind === "skill")
-		.map((row) => ({
-			name: row.tool_name,
-			kind: "skill" as const,
-			sessions: row.session_count,
-			calls: row.call_count,
-		}));
-
-	// The same rows already carry a per-tool breakdown for MCP calls (tool_name
-	// is `server.tool`, see TranscriptParser) — this is the "by tool" split of
-	// `servers` below, not a second query.
-	const mcpTools: ToolUsageRow[] = rows
-		.filter((row) => row.kind === "mcp")
-		.map((row) => ({
-			name: row.tool_name,
-			kind: "mcp" as const,
-			sessions: row.session_count,
-			calls: row.call_count,
-		}));
-
-	// Pulled from the untruncated `rows`, not from `mcpTools` below — recall can
-	// rank outside the top TOOL_ROWS_LIMIT tools by adoption even with real
-	// volume, and filtering the truncated array would silently drop it.
-	//
-	// Matched against EVERY spelling of the tool (see RECALL_MCP_TOOL_NAMES): a
-	// plugin-registered server namespaces the row, and an equality test on the
-	// bare name reported "no recall calls" forever on those installs. Reported
-	// under the canonical name — the row is about the recall feature, not about
-	// which manifest registered the server.
-	const recallRows = rows.filter((row) => row.kind === "mcp" && isRecallMcpToolName(row.tool_name));
-	const recallCalls: ToolUsageRow | undefined = recallRows.length
-		? {
-				name: RECALL_MCP_TOOL_NAME,
-				kind: "mcp",
-				// Summed across spellings. A session that used two of them counts twice,
-				// which needs the same server registered under two namespaces at once —
-				// pathological, and not worth a second query to be exact about.
-				sessions: recallRows.reduce((n, row) => n + row.session_count, 0),
-				calls: recallRows.reduce((n, row) => n + row.call_count, 0),
-			}
-		: undefined;
-
-	// Servers get their OWN grouping rather than a roll-up of the per-tool rows
-	// above. Session counts there are per tool, so neither combining rule is
-	// right: summing double-counts a session that called two of a server's tools,
-	// and the max — what this used to do — undercounts two sessions that each
-	// called a different one. `COUNT(DISTINCT session_event_id)` grouped by server
-	// is the figure the UI already presents this as.
-	const serverRows = db
+/**
+ * One page of the MCP-server roll-up.
+ *
+ * Servers get their OWN grouping rather than a roll-up of the per-tool rows.
+ * Session counts there are per tool, so neither combining rule is right:
+ * summing double-counts a session that called two of a server's tools, and the
+ * max — what this used to do — undercounts two sessions that each called a
+ * different one. `COUNT(DISTINCT session_event_id)` grouped by server is the
+ * figure the UI already presents this as.
+ *
+ * `tool_count` is also why the agent split cannot just be an `s.source` column
+ * added here: `COUNT(DISTINCT tool_name)` per source double-counts a tool called
+ * from two agents once the buckets are summed back together.
+ */
+function serverRowsPage(
+	db: DashboardDbHandle,
+	where: { sql: string; params: unknown[] },
+	offset: number,
+	limit: number,
+): McpServerRow[] {
+	const rows = db
 		.prepare(
 			`SELECT t.server,
 			        COUNT(DISTINCT t.session_event_id) AS session_count,
@@ -1455,19 +1576,188 @@ function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: Re
 			        COUNT(DISTINCT t.tool_name) AS tool_count
 			   FROM session_tool_use t
 			   JOIN sessions s ON s.event_id = t.session_event_id
-			  WHERE ${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?${filter.sql}
+			  WHERE ${where.sql}
 			    AND t.kind = 'mcp' AND t.server IS NOT NULL
-			  GROUP BY t.server`,
+			  GROUP BY t.server
+			  ORDER BY ${TOOL_LIST_ORDER.server}
+			  LIMIT ? OFFSET ?`,
 		)
-		.all(window.startMs, window.endMs, ...filter.params) as ReadonlyArray<{
+		.all(...where.params, limit, offset) as ReadonlyArray<{
 		server: string;
 		session_count: number;
 		call_count: number;
 		tool_count: number;
 	}>;
+	const agents = toolRowAgents(
+		db,
+		where,
+		"server",
+		rows.map((row) => row.server),
+	);
+	return rows.map((row) => ({
+		server: row.server,
+		sessions: row.session_count,
+		calls: row.call_count,
+		tools: row.tool_count,
+		agents: agents.get(row.server) ?? [],
+	}));
+}
 
-	const byAdoption = <T extends { sessions: number; calls: number }>(a: T, b: T) =>
-		b.sessions - a.sessions || b.calls - a.calls;
+/**
+ * The recall tool's own row, from its own query.
+ *
+ * Never filtered out of the MCP-tool page: recall can rank outside the first
+ * page on a busy machine even with real volume of its own, and now that the page
+ * is one of several, the reader may never load the one carrying it.
+ *
+ * Matched against EVERY spelling of the tool (see {@link isRecallMcpToolName}):
+ * a plugin-registered server namespaces the row, and an equality test on the
+ * bare name reported "no recall calls" forever on those installs. SQL narrows
+ * with a suffix `LIKE` and the JS predicate decides — the pattern is derived
+ * from the canonical name, which carries no `_` or `%` and so needs no `ESCAPE`,
+ * and a name that merely ends in the same letters is rejected in JS rather than
+ * counted. Reported under the canonical name: the row is about the recall
+ * feature, not about which manifest registered the server.
+ */
+function recallToolRow(db: DashboardDbHandle, where: { sql: string; params: unknown[] }): ToolUsageRow | undefined {
+	const rows = db
+		.prepare(
+			`SELECT t.tool_name, s.source,
+			        COUNT(DISTINCT t.session_event_id) AS session_count,
+			        COALESCE(SUM(t.calls), 0) AS call_count
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${where.sql}
+			    AND t.kind = 'mcp' AND t.tool_name LIKE ?
+			  GROUP BY t.tool_name, s.source`,
+		)
+		.all(...where.params, `%${RECALL_MCP_TOOL_NAME}`) as ReadonlyArray<{
+		tool_name: string;
+		source: string;
+		session_count: number;
+		call_count: number;
+	}>;
+	const matched = rows.filter((row) => isRecallMcpToolName(row.tool_name));
+	if (matched.length === 0) return undefined;
+	const agents = new Map<string, number>();
+	for (const row of matched) agents.set(row.source, (agents.get(row.source) ?? 0) + row.call_count);
+	return {
+		name: RECALL_MCP_TOOL_NAME,
+		kind: "mcp",
+		// Summed across spellings. A session that used two of them counts twice,
+		// which needs the same server registered under two namespaces at once —
+		// pathological, and not worth a second query to be exact about.
+		sessions: matched.reduce((n, row) => n + row.session_count, 0),
+		calls: matched.reduce((n, row) => n + row.call_count, 0),
+		agents: sortAgents([...agents].map(([source, calls]) => ({ source, calls }))),
+	};
+}
+
+/** What one `/api/tool-usage` request names: a list, a position, and the page's window. */
+export interface ToolUsagePageOptions {
+	readonly scope: DashboardScope;
+	readonly list: ToolUsageList;
+	/** Row index to start at. Negative or fractional input is floored to a valid one. */
+	readonly offset: number;
+	/** Rows per page. Defaults to {@link TOOL_ROWS_LIMIT}, the size the first page rode in at. */
+	readonly limit?: number;
+	readonly range?: DashboardRange;
+	readonly customFrom?: string;
+	readonly customTo?: string;
+	readonly timeZone?: string;
+	readonly nowMs?: number;
+}
+
+/**
+ * ONE page of one tool-usage list — the `/api/tool-usage` answer behind a card's
+ * "Show more" button.
+ *
+ * Paged in SQL rather than by slicing a full read: the un-paged version grouped
+ * every `session_tool_use` row in the window, folded the per-agent split for all
+ * of them, and then kept 8 — so a machine with 42 MCP tools paid for 42 to
+ * render 8, and the other 34 were unreachable no matter what the reader did.
+ * Every figure a card states about the whole set now comes from a COUNT/SUM (see
+ * {@link toolListTotals}) instead of from the rows on screen.
+ *
+ * OFFSET rather than a cursor, unlike the Memories tree: what this pages over is
+ * an aggregate the query recomputes, not a list git can shorten under the reader,
+ * so the only movement is new calls arriving mid-browse — which shifts a row by
+ * one slot at worst. The client dedupes by row identity for that case, and
+ * {@link TOOL_LIST_ORDER}'s name tiebreak is what keeps the partition clean
+ * otherwise.
+ */
+export function buildToolUsagePage(db: DashboardDbHandle, opts: ToolUsagePageOptions): ToolUsagePage {
+	const timeZone = opts.timeZone ?? machineTimeZone();
+	const window = resolveWindow(opts.range, opts.customFrom, opts.customTo, opts.nowMs ?? Date.now(), timeZone);
+	const where = toolUsageWhere(db, opts.scope, window);
+	// Floored, not rejected: an offset is a position in a list, and a bad one has
+	// a nearest sane answer (the first page). The LIMIT is ours, never the
+	// caller's — see DashboardServer's route.
+	const offset = Math.max(0, Math.trunc(opts.offset) || 0);
+	const limit = opts.limit ?? TOOL_ROWS_LIMIT;
+	const { totalCount } = toolListTotals(db, where, opts.list);
+	if (opts.list === "server") {
+		return { list: "server", offset, rows: serverRowsPage(db, where, offset, limit), totalCount };
+	}
+	return { list: opts.list, offset, rows: toolNameRowsPage(db, where, opts.list, offset, limit), totalCount };
+}
+
+/**
+ * Skills, MCP servers and the tool mix over the window, each row carrying the
+ * agents that produced it — the FIRST page of each of the three lists, plus the
+ * totals they page against.
+ *
+ * Not every agent's transcripts can be read for tool calls, so the coverage
+ * numbers are computed from `sessions` — the full population — and never from
+ * the join. `uncoveredSources` names the agents that contributed sessions but no
+ * tool records, because "linear: 3 sessions" is a very different statement
+ * depending on whether the other 40 sessions could have been counted and were
+ * not.
+ *
+ * Adoption (`sessions`) leads the Skills ranking over volume (`calls`)
+ * deliberately: a single session that hammered one tool 200 times is not
+ * evidence that the tool matters, whereas a tool reached for across many
+ * separate sessions is. The per-agent splits are ordered by volume instead —
+ * they answer "who ran this", where the count IS the point. See
+ * {@link TOOL_LIST_ORDER}.
+ */
+function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: ResolvedWindow): ToolUsage {
+	const where = toolUsageWhere(db, scope, window);
+	const skillTotals = toolListTotals(db, where, "skill");
+	const serverTotals = toolListTotals(db, where, "server");
+	const mcpToolTotals = toolListTotals(db, where, "tool");
+	const skills = toolNameRowsPage(db, where, "skill", 0, TOOL_ROWS_LIMIT);
+	const mcpTools = toolNameRowsPage(db, where, "tool", 0, TOOL_ROWS_LIMIT);
+	const servers = serverRowsPage(db, where, 0, TOOL_ROWS_LIMIT);
+	const recallCalls = recallToolRow(db, where);
+
+	// Per-kind agent totals, from their own grouping so `sessions` is a real
+	// COUNT(DISTINCT) rather than a re-sum of the pages above — and over EVERY row
+	// in the window, so an agent whose every skill ranks past the first page still
+	// shows up in the card's header line.
+	const agentRows = db
+		.prepare(
+			`SELECT t.kind, s.source,
+			        COUNT(DISTINCT t.session_event_id) AS session_count,
+			        COALESCE(SUM(t.calls), 0) AS call_count
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${where.sql}
+			    AND t.kind IN ('skill','mcp')
+			  GROUP BY t.kind, s.source`,
+		)
+		.all(...where.params) as ReadonlyArray<{
+		kind: string;
+		source: string;
+		session_count: number;
+		call_count: number;
+	}>;
+	const agentTotals = (kind: string): ToolUsageAgentTotal[] =>
+		sortAgents(
+			agentRows
+				.filter((row) => row.kind === kind)
+				.map((row) => ({ source: row.source, sessions: row.session_count, calls: row.call_count })),
+		);
 
 	// Coverage from the FULL session population, never from the join above — and
 	// windowed by the SESSION's own time OR by any call it made, which is the
@@ -1522,20 +1812,17 @@ function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: Re
 	}>;
 
 	return {
-		skills: skills.sort(byAdoption).slice(0, TOOL_ROWS_LIMIT),
-		mcpTools: mcpTools.sort(byAdoption).slice(0, TOOL_ROWS_LIMIT),
+		skills,
+		skillsTotal: skillTotals.totalCount,
+		skillCallsTotal: skillTotals.callsTotal,
+		mcpTools,
+		mcpToolsTotal: mcpToolTotals.totalCount,
 		recallCalls,
-		servers: serverRows
-			.map(
-				(row): McpServerRow => ({
-					server: row.server,
-					sessions: row.session_count,
-					calls: row.call_count,
-					tools: row.tool_count,
-				}),
-			)
-			.sort(byAdoption)
-			.slice(0, TOOL_ROWS_LIMIT),
+		servers,
+		serversTotal: serverTotals.totalCount,
+		serverCallsTotal: serverTotals.callsTotal,
+		skillAgents: agentTotals("skill"),
+		mcpAgents: agentTotals("mcp"),
 		sessionsWithTools: sessionRows.reduce((sum, row) => sum + row.with_tools, 0),
 		sessionsInWindow: sessionRows.reduce((sum, row) => sum + row.total, 0),
 		// "No tool rows" and "cannot have tool rows" are different facts, and only

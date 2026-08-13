@@ -115,12 +115,26 @@ function model(over: Record<string, unknown> = {}, statsOver: Record<string, unk
 			range: "month",
 			rangeFrom: "2026-07-01",
 			rangeTo: "2026-07-30",
+			// Field-for-field with `ToolUsage`. Nothing type-checks that: this builder
+			// returns `unknown` on purpose (the asset scripts are plain JS), so the
+			// fixture had drifted to a `sourcesWithoutToolData` key no renderer has
+			// read since that field was renamed `uncoveredSources`, and was missing
+			// `mcpTools` outright. A renderer reading a field the server always sends
+			// is right to do so unguarded — the fixture is what has to keep up.
 			toolUsage: {
 				skills: [],
+				skillsTotal: 0,
+				skillCallsTotal: 0,
 				servers: [],
+				serversTotal: 0,
+				serverCallsTotal: 0,
+				mcpTools: [],
+				mcpToolsTotal: 0,
+				skillAgents: [],
+				mcpAgents: [],
 				sessionsWithTools: 0,
 				sessionsInWindow: 0,
-				sourcesWithoutToolData: [],
+				uncoveredSources: [],
 			},
 			recallUsage: {
 				usedCalls: 0,
@@ -498,6 +512,79 @@ describe("Recall card", () => {
 			daily: [{ date: "2026-07-30", used: 2, setAside: 0 }],
 		});
 		expect(html).not.toContain("more often than recall");
+	});
+});
+
+/** The MCPs / Skills card markup, for one `toolUsage` override. */
+function usageHtml(label: string, toolUsage: Record<string, unknown>): string {
+	app.innerHTML = "";
+	JD.renderStats(
+		model(
+			{},
+			{
+				toolUsage: {
+					skills: [],
+					servers: [],
+					mcpTools: [],
+					skillAgents: [],
+					mcpAgents: [],
+					sessionsWithTools: 1,
+					sessionsInWindow: 1,
+					uncoveredSources: [],
+					...toolUsage,
+				},
+			},
+		),
+	);
+	const html = app.innerHTML;
+	const start = html.indexOf(`aria-label="${label}"`);
+	expect(start).toBeGreaterThan(-1);
+	return html.slice(start, html.indexOf("</section>", start));
+}
+
+/** Every `width:N%` a ranked list emitted, in row order. */
+function barWidths(html: string): ReadonlyArray<number> {
+	return [...html.matchAll(/width:(\d+)%/g)].map((m) => Number(m[1]));
+}
+
+describe("ranked list bars", () => {
+	// The bug this pins is a two-layer one, and the renderer owns the second layer:
+	// the server ranks the MCP lists by calls now, but `rankedList` used `rows[0]`
+	// as the denominator, so ANY list whose order is not its bar metric painted
+	// widths above 100% — which `.rl-bar`'s `overflow: hidden` clamps into a
+	// full bar instead of showing as broken.
+	it("sizes MCP server bars against the busiest row, proportionally", () => {
+		const html = usageHtml("MCPs", {
+			servers: [
+				{ server: "codegraph", sessions: 27, calls: 150, tools: 1, agents: [{ source: "codex", calls: 150 }] },
+				{ server: "dbhub", sessions: 9, calls: 75, tools: 7, agents: [{ source: "codex", calls: 75 }] },
+				{ server: "jollimemory", sessions: 32, calls: 30, tools: 3, agents: [{ source: "claude", calls: 30 }] },
+			],
+			mcpAgents: [{ source: "codex", sessions: 2, calls: 225 }],
+		});
+		expect(barWidths(html)).toEqual([100, 50, 20]);
+		expect(html.indexOf("codegraph")).toBeLessThan(html.indexOf("jollimemory"));
+	});
+
+	it("never emits a bar past 100% when rank order and bar metric disagree", () => {
+		// Skills deliberately ranks by adoption while printing runs, so its first row
+		// is not its biggest value — the case that produced 219%-wide bars.
+		const html = usageHtml("Skills", {
+			skills: [
+				{ name: "code-review", kind: "skill", sessions: 3, calls: 4, agents: [{ source: "claude", calls: 4 }] },
+				{
+					name: "simplify",
+					kind: "skill",
+					sessions: 1,
+					calls: 200,
+					agents: [{ source: "claude", calls: 200 }],
+				},
+			],
+			skillAgents: [{ source: "claude", sessions: 4, calls: 204 }],
+		});
+		const widths = barWidths(html);
+		expect(Math.max(...widths)).toBe(100);
+		expect(widths).toEqual([2, 100]);
 	});
 });
 

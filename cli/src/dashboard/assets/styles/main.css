@@ -518,6 +518,12 @@ body {
   .more-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
   .more-count { font-size: 11.5px; color: var(--muted); }
   .more-row .cta { margin-left: auto; }
+  /* The tool-usage footer keeps its row after the last page lands, with the count
+     and no button (see `toolMoreRow`) — so the row has to hold the height the
+     button was giving it, or the card resizes on that one click. `.cta.sm` is
+     12px/1.2 text plus 5px padding and a 1px border each side, so 26px is the
+     button's own box; the two are pinned together deliberately. */
+  .more-row.is-done { min-height: 26px; }
 
   /* ---------- outcome tag (M6 do next) ---------- */
   .tag.outc { border-color: transparent; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
@@ -967,6 +973,26 @@ body {
   .ranklist .rl-val { margin-left: auto; color: var(--ink-2); white-space: nowrap; flex: none; }
   .ranklist .rl-bar { height: 10px; margin-top: 10px; border-radius: 5px; background: var(--heat-track); overflow: hidden; }
   .ranklist .rl-bar i { display: block; height: 100%; }
+  /* Added by `capToolLists` once a list has been grown past its first page, and
+     never before: the three cards share one equal-third band, so a list that got
+     taller would re-flow its neighbours, but a list still showing its default 8
+     rows must have no scrollbar at all. The `max-height` that arms this is set
+     inline, measured off the real rows — a length here could not know the row
+     height. `overscroll-behavior: contain` keeps a flick inside the card instead
+     of scrolling the page on once the list bottoms out. */
+  .ranklist.rl-scroll {
+    overflow-y: auto; overscroll-behavior: contain;
+    scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted) 42%, transparent) transparent;
+  }
+  .ranklist.rl-scroll::-webkit-scrollbar { width: 10px; }
+  .ranklist.rl-scroll::-webkit-scrollbar-track { background: transparent; }
+  .ranklist.rl-scroll::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--muted) 38%, transparent); border-radius: 999px;
+    border: 3px solid transparent; background-clip: padding-box;
+  }
+  .ranklist.rl-scroll:hover::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--muted) 55%, transparent); background-clip: padding-box;
+  }
 
   /* Memory Activity's two views share the same rows, but their grouping answers
      different questions: branches cluster work streams; time preserves the
