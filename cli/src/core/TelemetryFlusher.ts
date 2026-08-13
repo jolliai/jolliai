@@ -121,7 +121,11 @@ export async function flushTelemetry(opts: FlushOptions): Promise<FlushResult> {
 		else groups.set(e.installId, [e]);
 	}
 
-	const deadlineAt = opts.deadlineMs === undefined ? undefined : Date.now() + opts.deadlineMs;
+	// performance.now(), not Date.now(): the budget must survive a wall-clock
+	// step (NTP correction, laptop resume — likely at exactly the session-start
+	// moments the bounded callers run). A backward step would inflate the
+	// remaining budget and quietly un-bound the flush.
+	const deadlineAt = opts.deadlineMs === undefined ? undefined : performance.now() + opts.deadlineMs;
 	let budgetExhausted = false;
 	const acked: TelemetryEnvelope[] = [];
 	for (const group of groups.values()) {
@@ -130,7 +134,7 @@ export async function flushTelemetry(opts: FlushOptions): Promise<FlushResult> {
 			const batch = group.slice(i, i + maxBatch);
 			let batchTimeout = timeoutMs;
 			if (deadlineAt !== undefined) {
-				const remaining = deadlineAt - Date.now();
+				const remaining = deadlineAt - performance.now();
 				if (remaining <= 0) {
 					budgetExhausted = true;
 					break;

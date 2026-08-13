@@ -22,9 +22,9 @@ import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
 import { getGlobalConfigDir, loadConfig, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
 import { markSkipExitFlush } from "../core/TelemetryCommandHook.js";
-import { flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
 import { deregisterRepo, registerRepo } from "../dashboard/RepoRegistry.js";
+import { capturePluginOnboardingSnapshot } from "../hooks/PluginBootstrapTelemetry.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
 import { isValidSourceTag } from "../install/DistPathResolver.js";
 import { install, uninstall } from "../install/Installer.js";
@@ -447,14 +447,14 @@ export function registerEnableCommand(program: Command): void {
 					// both plugins' /jolli:init run exactly this mode — so without an emit
 					// here the plugins' primary install gesture is a funnel blind spot
 					// (the Codex plugin's SessionStart hook is trust-gated, so this can be
-					// the only trigger that ever fires for that surface). The flush must
-					// be explicit and bounded: markSkipExitFlush() above disarmed the exit
-					// flush for this mode, and neither call writes to stdout, which the
-					// automatic (SessionStart bootstrap) callers need kept byte-clean.
-					// deadlineMs bounds the WHOLE flush — timeoutMs alone is per-POST,
-					// and a full buffer flushes as several sequential POSTs.
-					await maybeEmitOnboardingProgress({ cwd: options.cwd, config: await loadConfig() });
-					await flushTelemetryNow(options.cwd, { timeoutMs: 2_000, deadlineMs: 2_000 });
+					// the only trigger that ever fires for that surface). The shared
+					// helper's own bootstrap re-points the telemetry context at
+					// options.cwd — which keeps the buffer, the bounded flush, and the
+					// dedup ledger on the SAME directory even under an explicit --cwd —
+					// and its explicit flush is what markSkipExitFlush() above made
+					// necessary. Nothing here writes to stdout, which the automatic
+					// (SessionStart bootstrap) callers need kept byte-clean.
+					await capturePluginOnboardingSnapshot(options.cwd).done;
 					return;
 				}
 

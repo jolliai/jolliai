@@ -52,7 +52,7 @@ import { loadConfig } from "../core/SessionTracker.js";
 import { install, uninstall } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import { readStdin } from "./HookUtils.js";
-import { capturePluginOnboardingSnapshot } from "./PluginBootstrapTelemetry.js";
+import { capturePluginOnboardingSnapshot, type PluginFunnelSnapshot } from "./PluginBootstrapTelemetry.js";
 import { buildSessionStartContext, ensurePluginDefaultProvider } from "./SessionStartHook.js";
 
 const log = createLogger("CodexPluginBootstrapHook");
@@ -139,49 +139,62 @@ export async function runCodexPluginBootstrap(projectDir: string): Promise<Codex
 		respectManualDisable: true,
 		automatic: true,
 	});
-	// Onboarding-funnel snapshot, on BOTH the success and failure branch — this
-	// SessionStart hook is the only per-session trigger for the codex-plugin
-	// surface (and it is trust-gated, so /jolli:init's --repo-hooks-only emit can
-	// be the surface's only other one). The bounded flush is started here but
-	// awaited only at each return, so its network wait overlaps the briefing
-	// build. See PluginBootstrapTelemetry for the full rationale (shared with
-	// the Claude hook — the Codex hook input carries no session id).
-	const funnel = await capturePluginOnboardingSnapshot(worktreeRoot);
 	if (!result.success) {
 		log.warn("Codex plugin repo-hook reconciliation failed: %s", result.message);
-		await funnel.flushed;
+		// Snapshot on the failure branch too — a setup that installs but never
+		// reaches a working state is precisely the drop-off the funnel observes.
+		// Nothing to overlap here, so await inline.
+		await capturePluginOnboardingSnapshot(worktreeRoot).done;
 		return null;
 	}
 
+	// Onboarding-funnel snapshot — this SessionStart hook is the only
+	// per-session trigger for the codex-plugin surface (and it is trust-gated,
+	// so /jolli:init's --repo-hooks-only emit can be the surface's only other
+	// one). Mirrors the Claude hook: started INSIDE the context phase right
+	// after ensurePluginDefaultProvider seeds the capture route (any earlier
+	// and a fresh install's first snapshot misreports capture_method "none"),
+	// started WITHOUT awaiting so its probes and bounded flush overlap the
+	// briefing build, and awaited in the finally so no exit — thrown or
+	// returned — orphans the in-flight chain. The Codex hook input carries no
+	// session id.
+	let funnel: PluginFunnelSnapshot | undefined;
 	let context: string | null = null;
-	const contextPhase = await withRepoHooksLock(
-		worktreeRoot,
-		async () => {
-			// Re-read: the flag can flip between the phases above and this one.
-			if (await readManualDisableFlag(worktreeRoot)) return;
-			const config = await loadConfig();
-			// Gated on codexEnabled, the mirror of the Claude path's claudeEnabled —
-			// a user who turned Codex discovery off gets no briefing from it either.
-			if (config.codexEnabled === false) return;
-			// Seeds `local-agent` + this host's own tool (`codex`), first-wins. Shared
-			// with the Claude path precisely so the two hosts cannot seed different
-			// values for the same machine-global config.
-			await ensurePluginDefaultProvider(SOURCE_TAG, config);
-			// Always include the briefing: unlike the Claude path there is no
-			// repo-installed SessionStart hook that would also produce one, so
-			// skipping it here would mean no briefing at all.
-			context = await buildSessionStartContext(worktreeRoot, SOURCE_TAG, {
-				includeBriefing: true,
-				includePluginReminders: true,
-			});
-		},
-		AUTO_LOCK_OPTS,
-	);
-	if (!contextPhase.acquired) {
+	let contextDeferred = false;
+	try {
+		const contextPhase = await withRepoHooksLock(
+			worktreeRoot,
+			async () => {
+				// Re-read: the flag can flip between the phases above and this one.
+				if (await readManualDisableFlag(worktreeRoot)) return;
+				const config = await loadConfig();
+				// Gated on codexEnabled, the mirror of the Claude path's claudeEnabled —
+				// a user who turned Codex discovery off gets no briefing from it either.
+				if (config.codexEnabled === false) return;
+				// Seeds `local-agent` + this host's own tool (`codex`), first-wins. Shared
+				// with the Claude path precisely so the two hosts cannot seed different
+				// values for the same machine-global config.
+				await ensurePluginDefaultProvider(SOURCE_TAG, config);
+				funnel = capturePluginOnboardingSnapshot(worktreeRoot);
+				// Always include the briefing: unlike the Claude path there is no
+				// repo-installed SessionStart hook that would also produce one, so
+				// skipping it here would mean no briefing at all.
+				context = await buildSessionStartContext(worktreeRoot, SOURCE_TAG, {
+					includeBriefing: true,
+					includePluginReminders: true,
+				});
+			},
+			AUTO_LOCK_OPTS,
+		);
+		contextDeferred = !contextPhase.acquired;
+	} finally {
+		funnel ??= capturePluginOnboardingSnapshot(worktreeRoot);
+		await funnel.done;
+	}
+	if (contextDeferred) {
 		log.info("Codex plugin context deferred — repo hook lifecycle lock is busy");
 	}
 
-	await funnel.flushed;
 	return buildCodexBootstrapOutput(context);
 }
 

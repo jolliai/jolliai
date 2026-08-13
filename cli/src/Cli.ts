@@ -208,9 +208,8 @@ if (!process.env.VITEST) {
 				const { shouldSkipExitFlush, trackCommandFailureIfPending } = await import(
 					"./core/TelemetryCommandHook.js"
 				);
-				const { bootstrapTelemetry, flushTelemetryNow, maybeShowCliTelemetryNotice } = await import(
-					"./core/TelemetryStartup.js"
-				);
+				const { BOUNDED_FLUSH_BUDGET_MS, bootstrapTelemetry, flushTelemetryNow, maybeShowCliTelemetryNotice } =
+					await import("./core/TelemetryStartup.js");
 				// Print the one-time, content-free telemetry disclosure FIRST (stderr), so a
 				// user who only wants to run a single command sees the disclosure before the
 				// first `app_installed` event is buffered. Independent of the telemetry
@@ -241,9 +240,14 @@ if (!process.env.VITEST) {
 				// must not send. The skip keys off the commander-parsed command, not an
 				// argv position, so it survives any future global option before the
 				// subcommand. Bounded timeout (not the flusher's 10s default) so a slow
-				// network can't stall the prompt; best-effort and never throws.
+				// network can't stall the prompt; best-effort and never throws. The
+				// deadline caps the WHOLE flush — timeoutMs alone is per-POST, and a
+				// full buffer flushes as several sequential POSTs.
 				if (!shouldSkipExitFlush()) {
-					await flushTelemetryNow(resolveProjectDir(), { timeoutMs: 2_000 });
+					await flushTelemetryNow(resolveProjectDir(), {
+						timeoutMs: BOUNDED_FLUSH_BUDGET_MS,
+						deadlineMs: BOUNDED_FLUSH_BUDGET_MS,
+					});
 				}
 				// Ask the detached ensure helper to make sure the machine-global
 				// daemon exists. Last, so it can never delay the command's own

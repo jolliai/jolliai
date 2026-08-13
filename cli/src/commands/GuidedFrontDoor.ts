@@ -31,7 +31,7 @@ import { getSummaryCount, setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
-import { isGitHookInstalled } from "../install/GitHookInstaller.js";
+import { isGitPipelineFullyInstalled } from "../install/GitHookInstaller.js";
 import { install } from "../install/Installer.js";
 import { createLogger, errMsg, setLogDir } from "../Logger.js";
 import { runBackfillFrontDoorStep } from "./BackfillFrontDoorStep.js";
@@ -51,12 +51,16 @@ export interface GuidedFrontDoorStatus {
 }
 
 /**
- * Reads only what the front door needs: whether the git hook is installed and
- * how many memories exist. Unlike `getStatus()`, this does not probe every AI
- * host, scan Codex / OpenCode sessions, or enumerate worktrees.
+ * Reads only what the front door needs: whether the git pipeline is installed
+ * and how many memories exist. Unlike `getStatus()`, this does not probe every
+ * AI host, scan Codex / OpenCode sessions, or enumerate worktrees. `enabled`
+ * uses the SAME shared predicate as `getStatus()` and the onboarding funnel's
+ * lazy probe — this used to be a bare post-commit check, which made the
+ * funnel's `repo_enabled` (and its dedup signature) disagree between the front
+ * door and every other trigger site on a partially-installed repo.
  */
 export async function getGuidedFrontDoorStatus(cwd: string): Promise<GuidedFrontDoorStatus> {
-	const enabled = await isGitHookInstalled(cwd);
+	const enabled = await isGitPipelineFullyInstalled(cwd);
 	// Read the count straight from the active storage (set by runGuidedFrontDoor
 	// before calling this). getSummaryCount returns 0 when no index exists, so
 	// this covers the fresh-repo case without gating on the orphan branch —

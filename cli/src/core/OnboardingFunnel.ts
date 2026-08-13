@@ -106,22 +106,22 @@ type FunnelStatus = Pick<StatusInfo, "enabled" | "summaryCount">;
  * several times the cost of these two reads — and some no-status triggers sit
  * on blocking per-session paths (the plugin SessionStart bootstraps), where
  * `install(..., { repoHooksOnly })` deliberately skips exactly those host
- * probes to stay fast. `enabled` replicates `getStatus()`'s own derivation
- * (the post-commit hook plus its three sibling sections), so swapping the
- * fallback cannot shift the dedup-ledger signature and trigger a spurious
- * re-emit. Lazy imports break the static Installer ⇆ OnboardingFunnel cycle.
+ * probes to stay fast. `enabled` is `getStatus()`'s own derivation, via the
+ * SHARED `isGitPipelineFullyInstalled` predicate — a shared function rather
+ * than a copied conjunction, so the dedup-ledger signature cannot drift apart
+ * between precomputing and lazy trigger sites. The two independent reads run
+ * in parallel. Lazy imports break the static Installer ⇆ OnboardingFunnel cycle.
  */
 async function resolveFunnelStatusLight(cwd: string): Promise<FunnelStatus> {
-	const [gitHooks, { getSummaryCount }] = await Promise.all([
+	const [gitHooks, summaryStore] = await Promise.all([
 		import("../install/GitHookInstaller.js"),
 		import("./SummaryStore.js"),
 	]);
-	const enabled =
-		(await gitHooks.isGitHookInstalled(cwd)) &&
-		(await gitHooks.isHookSectionInstalled(cwd, "post-rewrite", gitHooks.POST_REWRITE_MARKER_START)) &&
-		(await gitHooks.isHookSectionInstalled(cwd, "prepare-commit-msg", gitHooks.PREPARE_MSG_MARKER_START)) &&
-		(await gitHooks.isHookSectionInstalled(cwd, "post-merge", gitHooks.POST_MERGE_MARKER_START));
-	return { enabled, summaryCount: await getSummaryCount(cwd) };
+	const [enabled, summaryCount] = await Promise.all([
+		gitHooks.isGitPipelineFullyInstalled(cwd),
+		summaryStore.getSummaryCount(cwd),
+	]);
+	return { enabled, summaryCount };
 }
 
 export interface ResolveFunnelOptions {

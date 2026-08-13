@@ -29,7 +29,7 @@ import {
 } from "../install/SkillInstaller.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import { readStdin } from "./HookUtils.js";
-import { capturePluginOnboardingSnapshot } from "./PluginBootstrapTelemetry.js";
+import { capturePluginOnboardingSnapshot, type PluginFunnelSnapshot } from "./PluginBootstrapTelemetry.js";
 import { buildSessionStartContext, ensurePluginDefaultProvider } from "./SessionStartHook.js";
 
 const log = createLogger("PluginBootstrapHook");
@@ -156,39 +156,54 @@ export async function runPluginBootstrap(
 		respectManualDisable: true,
 		automatic: true,
 	});
-	// Onboarding-funnel snapshot, on BOTH the success and failure branch — this
-	// SessionStart hook is the only per-session trigger for the claude-plugin
-	// surface. The bounded flush is started here but awaited only at each return,
-	// so its network wait overlaps the briefing build instead of delaying it.
-	// See PluginBootstrapTelemetry for the full rationale (shared with Codex).
-	const funnel = await capturePluginOnboardingSnapshot(worktreeRoot, session?.sessionId);
 	if (!result.success) {
 		log.warn("Plugin repo-hook reconciliation failed: %s", result.message);
-		await funnel.flushed;
+		// Snapshot on the failure branch too — a setup that installs but never
+		// reaches a working state is precisely the drop-off the funnel observes.
+		// Nothing to overlap here, so await inline.
+		await capturePluginOnboardingSnapshot(worktreeRoot, session?.sessionId).done;
 		return buildPluginBootstrapOutput(reloadSkills, null);
 	}
 
+	// Onboarding-funnel snapshot — this SessionStart hook is the only
+	// per-session trigger for the claude-plugin surface. It is started INSIDE
+	// the context phase, right after ensurePluginDefaultProvider seeds the
+	// capture route (any earlier and a fresh install's first snapshot misreports
+	// capture_method "none" for a state this same run repairs), and started
+	// WITHOUT awaiting, so its probes and bounded flush overlap the briefing
+	// build. The finally makes every exit — including a throwing briefing build
+	// or a future early return — wait for the in-flight chain instead of
+	// orphaning it, and gives the paths that skip the seeding (manual disable,
+	// claudeEnabled off, lock contention) a fallback snapshot.
+	let funnel: PluginFunnelSnapshot | undefined;
 	let context: string | null = null;
-	const contextPhase = await withRepoHooksLock(
-		worktreeRoot,
-		async () => {
-			if (await readManualDisableFlag(worktreeRoot)) return;
-			const config = await loadConfig();
-			if (config.claudeEnabled === false) return;
-			await ensurePluginDefaultProvider(SOURCE_TAG, config);
-			const hooksWereComplete = hookHealthAtEntry.stop && hookHealthAtEntry.sessionStart;
-			context = await buildSessionStartContext(worktreeRoot, SOURCE_TAG, {
-				includeBriefing: !hooksWereComplete,
-				includePluginReminders: true,
-			});
-		},
-		AUTO_LOCK_OPTS,
-	);
-	if (!contextPhase.acquired) {
+	let contextDeferred = false;
+	try {
+		const contextPhase = await withRepoHooksLock(
+			worktreeRoot,
+			async () => {
+				if (await readManualDisableFlag(worktreeRoot)) return;
+				const config = await loadConfig();
+				if (config.claudeEnabled === false) return;
+				await ensurePluginDefaultProvider(SOURCE_TAG, config);
+				funnel = capturePluginOnboardingSnapshot(worktreeRoot, session?.sessionId);
+				const hooksWereComplete = hookHealthAtEntry.stop && hookHealthAtEntry.sessionStart;
+				context = await buildSessionStartContext(worktreeRoot, SOURCE_TAG, {
+					includeBriefing: !hooksWereComplete,
+					includePluginReminders: true,
+				});
+			},
+			AUTO_LOCK_OPTS,
+		);
+		contextDeferred = !contextPhase.acquired;
+	} finally {
+		funnel ??= capturePluginOnboardingSnapshot(worktreeRoot, session?.sessionId);
+		await funnel.done;
+	}
+	if (contextDeferred) {
 		log.info("Plugin context deferred — repo hook lifecycle lock is busy");
 	}
 
-	await funnel.flushed;
 	return buildPluginBootstrapOutput(reloadSkills, context);
 }
 

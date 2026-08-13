@@ -42,6 +42,7 @@ vi.mock("../core/RepoProfile.js", () => ({
 }));
 vi.mock("../core/SessionTracker.js", () => ({ loadConfig: mocks.loadConfig, saveSession: mocks.saveSession }));
 vi.mock("../core/TelemetryStartup.js", () => ({
+	BOUNDED_FLUSH_BUDGET_MS: 2_000,
 	bootstrapTelemetry: mocks.bootstrapTelemetry,
 	flushTelemetryNow: mocks.flushTelemetryNow,
 }));
@@ -142,37 +143,47 @@ describe("PluginBootstrapHook", () => {
 		);
 	});
 
-	it("orders telemetry by COMPLETION and holds the return until the overlapped flush resolves", async () => {
-		// invocationCallOrder only records when each call STARTED — a Promise.all
-		// rewrite would pass such an assertion while breaking the real contract:
-		// bootstrap must COMPLETE before the emit can track() through its context,
-		// the emit must COMPLETE before the flush reads the buffer, and the hook
-		// must not return before the flush (started early, awaited late) resolves.
-		const timeline: Array<string> = [];
-		const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 2));
-		mocks.bootstrapTelemetry.mockImplementation(async () => {
-			await tick();
-			timeline.push("bootstrap:done");
+	it("snapshots AFTER the default provider is seeded, and holds the return until the deferred flush resolves", async () => {
+		// Fresh-install regression pin: the capture route is seeded by
+		// ensurePluginDefaultProvider in this same run, so the snapshot must read
+		// the config AFTER that write — earlier and the funnel would misreport
+		// capture_method "none" for a state the run repairs milliseconds later.
+		// (The chain's internal bootstrap→emit→flush completion ordering is
+		// pinned in PluginBootstrapTelemetry.test.ts.)
+		let seeded = false;
+		mocks.ensurePluginDefaultProvider.mockImplementation(async () => {
+			seeded = true;
+			return true;
 		});
-		mocks.maybeEmitOnboardingProgress.mockImplementation(async () => {
-			timeline.push("emit:start");
-			await tick();
-			timeline.push("emit:done");
-		});
+		mocks.loadConfig.mockImplementation(async () => (seeded ? { aiProvider: "local-agent" } : {}));
+		let flushDone = false;
 		mocks.flushTelemetryNow.mockImplementation(async () => {
-			timeline.push("flush:start");
-			await tick();
-			timeline.push("flush:done");
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			flushDone = true;
 		});
 		await runPluginBootstrap("/repo");
-		expect(timeline).toContain("bootstrap:done");
-		expect(timeline).toContain("flush:done");
-		expect(timeline.indexOf("bootstrap:done")).toBeLessThan(timeline.indexOf("emit:start"));
-		expect(timeline.indexOf("emit:done")).toBeLessThan(timeline.indexOf("flush:start"));
-		// The flush is STARTED before the briefing build so the two overlap.
-		expect(mocks.flushTelemetryNow.mock.invocationCallOrder[0]).toBeLessThan(
-			mocks.buildSessionStartContext.mock.invocationCallOrder[0],
-		);
+		expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledWith({
+			cwd: "/repo",
+			config: { aiProvider: "local-agent" },
+		});
+		// The chain is started early (overlapping the briefing build) but the
+		// hook must not return before it has fully completed.
+		expect(flushDone).toBe(true);
+	});
+
+	it("still snapshots when the context-phase lock is contended", async () => {
+		// The context phase is where the snapshot normally starts; when its lock
+		// is busy the finally-fallback must still emit, or the surface's only
+		// per-session trigger goes silent whenever two bootstraps race.
+		mocks.withRepoHooksLock
+			.mockImplementationOnce(async (_cwd: string, fn: () => Promise<unknown>) => ({
+				acquired: true,
+				value: await fn(),
+			}))
+			.mockResolvedValueOnce({ acquired: false });
+		await runPluginBootstrap("/repo");
+		expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledTimes(1);
+		expect(mocks.flushTelemetryNow).toHaveBeenCalledTimes(1);
 	});
 
 	it("records the first session without depending on Stop-hook hot reload", async () => {
@@ -296,10 +307,16 @@ describe("PluginBootstrapHook", () => {
 		expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledWith({ cwd: "/repo", config: {} });
 	});
 
-	it("does not seed or emit context when Claude integration is disabled", async () => {
+	it("does not seed or emit context when Claude integration is disabled — but still snapshots", async () => {
 		mocks.loadConfig.mockResolvedValue({ claudeEnabled: false });
 		expect(await runPluginBootstrap("/repo")).toBeNull();
 		expect(mocks.ensurePluginDefaultProvider).not.toHaveBeenCalled();
+		// The funnel is host-independent: turning Claude discovery off must not
+		// blind the install snapshot (the finally-fallback carries it).
+		expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledWith({
+			cwd: "/repo",
+			config: { claudeEnabled: false },
+		});
 	});
 
 	it("main skips local-agent children and swallows malformed stdin", async () => {

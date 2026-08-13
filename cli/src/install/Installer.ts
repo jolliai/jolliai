@@ -89,12 +89,9 @@ import {
 	installPostRewriteHook,
 	installPrePushHook,
 	installPrepareMsgHook,
-	isGitHookInstalled,
+	isGitPipelineFullyInstalled,
 	isHookSectionInstalled,
-	POST_MERGE_MARKER_START,
-	POST_REWRITE_MARKER_START,
 	PRE_PUSH_MARKER_START,
-	PREPARE_MSG_MARKER_START,
 	removeGitHook,
 	removePostMergeHook,
 	removePostRewriteHook,
@@ -1151,11 +1148,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	log.info("Checking Jolli Memory status");
 
 	const claudeHookInstalled = await isClaudeHookInstalled(projectDir);
-	const gitHookInstalled =
-		(await isGitHookInstalled(projectDir)) &&
-		(await isHookSectionInstalled(projectDir, "post-rewrite", POST_REWRITE_MARKER_START)) &&
-		(await isHookSectionInstalled(projectDir, "prepare-commit-msg", PREPARE_MSG_MARKER_START)) &&
-		(await isHookSectionInstalled(projectDir, "post-merge", POST_MERGE_MARKER_START));
+	const gitHookInstalled = await isGitPipelineFullyInstalled(projectDir);
 	const prePushHookInstalled = await isHookSectionInstalled(projectDir, "pre-push", PRE_PUSH_MARKER_START);
 	const sessions = await loadAllSessions(projectDir);
 	// No `orphanBranchExists` gate. It used to short-circuit the count to 0

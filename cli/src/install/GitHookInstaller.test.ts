@@ -3,8 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	installGitHook,
+	installPostMergeHook,
+	installPostRewriteHook,
 	installPrePushHook,
 	installPrepareMsgHook,
+	isGitPipelineFullyInstalled,
 	isHookSectionInstalled,
 	PRE_PUSH_MARKER_START,
 	PREPARE_MSG_MARKER_START,
@@ -25,6 +29,23 @@ afterEach(async () => {
 function hookPath(): string {
 	return join(cwd, ".git", "hooks", "pre-push");
 }
+
+describe("isGitPipelineFullyInstalled", () => {
+	// The single shared "repo enabled" predicate: getStatus(), the onboarding
+	// funnel's lazy probe, and the guided front door all consume this one
+	// function, so its definition (post-commit AND all three sibling sections)
+	// is pinned here rather than re-derived at each consumer.
+	it("requires post-commit AND all three sibling sections", async () => {
+		expect(await isGitPipelineFullyInstalled(cwd)).toBe(false);
+		await installGitHook(cwd);
+		expect(await isGitPipelineFullyInstalled(cwd)).toBe(false);
+		await installPostRewriteHook(cwd);
+		await installPrepareMsgHook(cwd);
+		expect(await isGitPipelineFullyInstalled(cwd)).toBe(false);
+		await installPostMergeHook(cwd);
+		expect(await isGitPipelineFullyInstalled(cwd)).toBe(true);
+	});
+});
 
 describe("installPrePushHook / removePrePushHook", () => {
 	it("creates a pre-push hook with the Jolli marker and run-hook dispatch", async () => {

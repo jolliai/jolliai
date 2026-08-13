@@ -368,6 +368,24 @@ export async function isGitHookInstalled(projectDir: string): Promise<boolean> {
 }
 
 /**
+ * True when the FULL git pipeline is installed: post-commit plus its three
+ * sibling sections (post-rewrite, prepare-commit-msg, post-merge). This is the
+ * single definition of "repo enabled" — `getStatus()`'s `enabled` field, the
+ * onboarding funnel's `repo_enabled`, and the guided front door all consume it.
+ * It used to be spelled inline at each of those sites; a fifth section added
+ * to one copy and not the others made the funnel's dedup signature disagree
+ * with itself across trigger sites, so the conjunction lives here once.
+ */
+export async function isGitPipelineFullyInstalled(projectDir: string): Promise<boolean> {
+	return (
+		(await isGitHookInstalled(projectDir)) &&
+		(await isHookSectionInstalled(projectDir, "post-rewrite", POST_REWRITE_MARKER_START)) &&
+		(await isHookSectionInstalled(projectDir, "prepare-commit-msg", PREPARE_MSG_MARKER_START)) &&
+		(await isHookSectionInstalled(projectDir, "post-merge", POST_MERGE_MARKER_START))
+	);
+}
+
+/**
  * Checks if a named git hook file contains a Jolli Memory marker section.
  */
 export async function isHookSectionInstalled(

@@ -10,13 +10,12 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../core/SessionTracker.js", () => ({ loadConfig: mocks.loadConfig }));
 vi.mock("../core/OnboardingFunnel.js", () => ({ maybeEmitOnboardingProgress: mocks.maybeEmitOnboardingProgress }));
 vi.mock("../core/TelemetryStartup.js", () => ({
+	BOUNDED_FLUSH_BUDGET_MS: 2_000,
 	bootstrapTelemetry: mocks.bootstrapTelemetry,
 	flushTelemetryNow: mocks.flushTelemetryNow,
 }));
 
-const { capturePluginOnboardingSnapshot, PLUGIN_FUNNEL_FLUSH_BUDGET_MS } = await import(
-	"./PluginBootstrapTelemetry.js"
-);
+const { capturePluginOnboardingSnapshot } = await import("./PluginBootstrapTelemetry.js");
 
 describe("capturePluginOnboardingSnapshot", () => {
 	beforeEach(() => {
@@ -31,7 +30,7 @@ describe("capturePluginOnboardingSnapshot", () => {
 		const config = { aiProvider: "local-agent" };
 		mocks.loadConfig.mockResolvedValue(config);
 
-		await capturePluginOnboardingSnapshot("/repo", "s1");
+		await capturePluginOnboardingSnapshot("/repo", "s1").done;
 
 		// One physical read — bootstrapTelemetry and flushTelemetryNow each
 		// default to their own uncached readFile+parse of the same file, so the
@@ -43,42 +42,68 @@ describe("capturePluginOnboardingSnapshot", () => {
 		expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledWith({ cwd: "/repo", config });
 		const [flushCwd, flushDeps] = mocks.flushTelemetryNow.mock.calls[0];
 		expect(flushCwd).toBe("/repo");
-		expect(flushDeps.timeoutMs).toBe(PLUGIN_FUNNEL_FLUSH_BUDGET_MS);
-		expect(flushDeps.deadlineMs).toBe(PLUGIN_FUNNEL_FLUSH_BUDGET_MS);
+		// Both caps carry the shared bounded budget: timeoutMs bounds each POST,
+		// deadlineMs the whole flush — these callers block a session start.
+		expect(flushDeps.timeoutMs).toBe(2_000);
+		expect(flushDeps.deadlineMs).toBe(2_000);
 		await expect(flushDeps.loadConfig()).resolves.toBe(config);
 	});
 
-	it("starts the flush without awaiting it, so the caller can overlap it with briefing work", async () => {
-		let resolveFlush: () => void = () => {};
-		mocks.flushTelemetryNow.mockImplementation(
+	it("returns synchronously with the whole chain deferred, so the caller can overlap it", async () => {
+		let releaseConfig: (config: object) => void = () => {};
+		mocks.loadConfig.mockImplementation(
 			() =>
-				new Promise<void>((resolve) => {
-					resolveFlush = resolve;
+				new Promise((resolve) => {
+					releaseConfig = resolve;
 				}),
 		);
 
-		const snapshot = await capturePluginOnboardingSnapshot("/repo");
+		const snapshot = capturePluginOnboardingSnapshot("/repo");
 
-		// The helper resolved while the flush is still in flight…
-		let settled = false;
-		void snapshot.flushed.then(() => {
-			settled = true;
-		});
+		// The handle exists before the chain's first step has even resolved —
+		// nothing beyond starting the config read happened yet.
 		await Promise.resolve();
 		await Promise.resolve();
-		expect(settled).toBe(false);
-		// …and `flushed` tracks the real flush.
-		resolveFlush();
-		await snapshot.flushed;
-		expect(settled).toBe(true);
+		expect(mocks.bootstrapTelemetry).not.toHaveBeenCalled();
+		expect(mocks.maybeEmitOnboardingProgress).not.toHaveBeenCalled();
+		expect(mocks.flushTelemetryNow).not.toHaveBeenCalled();
+
+		// Releasing the read lets the chain run to completion, tracked by `done`.
+		releaseConfig({});
+		await snapshot.done;
+		expect(mocks.bootstrapTelemetry).toHaveBeenCalledTimes(1);
+		expect(mocks.maybeEmitOnboardingProgress).toHaveBeenCalledTimes(1);
+		expect(mocks.flushTelemetryNow).toHaveBeenCalledTimes(1);
 	});
 
-	it("never throws — a config read failure costs the snapshot, not the briefing", async () => {
+	it("orders the chain by completion: bootstrap, then emit, then flush", async () => {
+		const timeline: Array<string> = [];
+		const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 2));
+		mocks.bootstrapTelemetry.mockImplementation(async () => {
+			await tick();
+			timeline.push("bootstrap:done");
+		});
+		mocks.maybeEmitOnboardingProgress.mockImplementation(async () => {
+			timeline.push("emit:start");
+			await tick();
+			timeline.push("emit:done");
+		});
+		mocks.flushTelemetryNow.mockImplementation(async () => {
+			timeline.push("flush:start");
+		});
+
+		await capturePluginOnboardingSnapshot("/repo").done;
+
+		// Completion order, not invocation order: bootstrap must COMPLETE before
+		// the emit can track() through its context, and the emit must COMPLETE
+		// before the flush reads the buffer — a Promise.all rewrite fails this.
+		expect(timeline).toEqual(["bootstrap:done", "emit:start", "emit:done", "flush:start"]);
+	});
+
+	it("never rejects — a config read failure costs the snapshot, not the briefing", async () => {
 		mocks.loadConfig.mockRejectedValue(new Error("unreadable config"));
 
-		const snapshot = await capturePluginOnboardingSnapshot("/repo");
-
-		await expect(snapshot.flushed).resolves.toBeUndefined();
+		await expect(capturePluginOnboardingSnapshot("/repo").done).resolves.toBeUndefined();
 		expect(mocks.bootstrapTelemetry).not.toHaveBeenCalled();
 		expect(mocks.maybeEmitOnboardingProgress).not.toHaveBeenCalled();
 		expect(mocks.flushTelemetryNow).not.toHaveBeenCalled();

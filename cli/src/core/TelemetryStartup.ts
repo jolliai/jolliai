@@ -125,6 +125,16 @@ export async function maybeShowCliTelemetryNotice(deps?: CliNoticeDeps): Promise
 	}
 }
 
+/**
+ * The standard budget for a flush that is blocking something user-visible:
+ * used as BOTH the per-POST `timeoutMs` and the whole-flush `deadlineMs`.
+ * Consumers: the CLI's command-exit flush (holds the shell prompt), the two
+ * plugin SessionStart bootstraps and `enable --repo-hooks-only` (hold the
+ * host's session start). One name so the number cannot be tuned at one site
+ * and silently not the others.
+ */
+export const BOUNDED_FLUSH_BUDGET_MS = 2_000;
+
 export interface FlushNowDeps {
 	readonly loadConfig?: () => Promise<JolliMemoryConfig>;
 	readonly getJolliUrl?: () => string;

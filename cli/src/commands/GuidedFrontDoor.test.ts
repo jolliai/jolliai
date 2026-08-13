@@ -10,7 +10,7 @@ const h = vi.hoisted(() => ({
 	getSummaryCount: vi.fn(),
 	track: vi.fn(),
 	triggerPendingPushRetry: vi.fn(),
-	isGitHookInstalled: vi.fn(),
+	isGitPipelineFullyInstalled: vi.fn(),
 	install: vi.fn(),
 	promptText: vi.fn(),
 	resolveProjectDir: vi.fn(),
@@ -52,7 +52,7 @@ vi.mock("../core/UserProfile.js", () => ({
 }));
 vi.mock("../dashboard/DashboardDb.js", () => ({ canUseDashboardDb: h.canUseDashboardDb }));
 vi.mock("../hooks/PushCompensation.js", () => ({ triggerPendingPushRetry: h.triggerPendingPushRetry }));
-vi.mock("../install/GitHookInstaller.js", () => ({ isGitHookInstalled: h.isGitHookInstalled }));
+vi.mock("../install/GitHookInstaller.js", () => ({ isGitPipelineFullyInstalled: h.isGitPipelineFullyInstalled }));
 vi.mock("../install/Installer.js", () => ({ install: h.install }));
 vi.mock("./DashboardCommand.js", () => ({ executeDashboard: h.executeDashboard }));
 vi.mock("./EnableCommand.js", () => ({ promptSetup: h.promptSetup }));
@@ -112,7 +112,7 @@ describe("GuidedFrontDoor", () => {
 		h.resolveJolliUrlForKey.mockReturnValue("https://acme.jolli.ai");
 		h.loadAuthToken.mockResolvedValue("oauth-token");
 		h.loadConfig.mockResolvedValue({ jolliUrl: "https://acme.jolli.ai", jolliApiKey: "sk-jol-default" });
-		h.isGitHookInstalled.mockResolvedValue(true);
+		h.isGitPipelineFullyInstalled.mockResolvedValue(true);
 		h.getSummaryCount.mockResolvedValue(0);
 		h.install.mockResolvedValue({ success: true, warnings: [] });
 		h.promptText.mockResolvedValue("");
@@ -264,7 +264,7 @@ describe("GuidedFrontDoor", () => {
 	// ── Enable axis ──
 
 	it("not enabled + [Y/n]=y → install + track + push retry + delegate", async () => {
-		h.isGitHookInstalled.mockResolvedValue(false);
+		h.isGitPipelineFullyInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("y");
 		h.getSummaryCount.mockResolvedValue(5);
 		await runGuidedFrontDoor();
@@ -283,7 +283,7 @@ describe("GuidedFrontDoor", () => {
 	});
 
 	it("front-door enable that FAILS does not clear the manual-disable opt-out", async () => {
-		h.isGitHookInstalled.mockResolvedValue(false);
+		h.isGitPipelineFullyInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("y");
 		h.install.mockResolvedValue({ success: false, message: "boom", warnings: [] });
 		await runGuidedFrontDoor();
@@ -291,7 +291,7 @@ describe("GuidedFrontDoor", () => {
 	});
 
 	it("just enabled a fresh repo (no memories yet) → 0 memories", async () => {
-		h.isGitHookInstalled.mockResolvedValue(false);
+		h.isGitPipelineFullyInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("y");
 		h.getSummaryCount.mockResolvedValue(0);
 		await runGuidedFrontDoor();
@@ -300,14 +300,14 @@ describe("GuidedFrontDoor", () => {
 	});
 
 	it("not enabled + empty answer (Enter) defaults to Yes → installs", async () => {
-		h.isGitHookInstalled.mockResolvedValue(false);
+		h.isGitPipelineFullyInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("");
 		await runGuidedFrontDoor();
 		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli", clearManualDisableOnSuccess: true });
 	});
 
 	it("not enabled + [Y/n]=n → no install, early return", async () => {
-		h.isGitHookInstalled.mockResolvedValue(false);
+		h.isGitPipelineFullyInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("n");
 		await runGuidedFrontDoor();
 
@@ -317,7 +317,7 @@ describe("GuidedFrontDoor", () => {
 	});
 
 	it("install failure → error + exitCode 1 + no track + no delegate", async () => {
-		h.isGitHookInstalled.mockResolvedValue(false);
+		h.isGitPipelineFullyInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("y");
 		h.install.mockResolvedValue({ success: false, message: "boom", warnings: ["w1"] });
 		await runGuidedFrontDoor();
@@ -330,7 +330,7 @@ describe("GuidedFrontDoor", () => {
 	});
 
 	it("install success with warnings → warnings printed", async () => {
-		h.isGitHookInstalled.mockResolvedValue(false);
+		h.isGitPipelineFullyInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("y");
 		h.install.mockResolvedValue({ success: true, warnings: ["heads up"] });
 		await runGuidedFrontDoor();
@@ -783,7 +783,7 @@ describe("GuidedFrontDoor", () => {
 	});
 
 	it("enable declined → dead end omits Next steps", async () => {
-		h.isGitHookInstalled.mockResolvedValue(false);
+		h.isGitPipelineFullyInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("n");
 		await runGuidedFrontDoor();
 		expect(out()).toContain("Not enabled");
@@ -859,7 +859,7 @@ describe("GuidedFrontDoor", () => {
 			vi.clearAllMocks();
 			h.isInsideGitWorkTree.mockReturnValue(true);
 			h.canUseDashboardDb.mockReturnValue(true);
-			h.isGitHookInstalled.mockResolvedValue(false);
+			h.isGitPipelineFullyInstalled.mockResolvedValue(false);
 			h.promptText.mockResolvedValue("n");
 			h.loadAuthToken.mockResolvedValue("oauth-token");
 			h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-default" });
@@ -873,21 +873,21 @@ describe("GuidedFrontDoor", () => {
 
 	describe("getGuidedFrontDoorStatus", () => {
 		it("counts summaries from the active storage", async () => {
-			h.isGitHookInstalled.mockResolvedValue(false);
+			h.isGitPipelineFullyInstalled.mockResolvedValue(false);
 			h.getSummaryCount.mockResolvedValue(7);
 			const status = await getGuidedFrontDoorStatus("/repo");
 			expect(status).toEqual({ enabled: false, summaryCount: 7 });
 		});
 
 		it("folder-only repo with no orphan branch still reports its memories", async () => {
-			h.isGitHookInstalled.mockResolvedValue(true);
+			h.isGitPipelineFullyInstalled.mockResolvedValue(true);
 			h.getSummaryCount.mockResolvedValue(4);
 			const status = await getGuidedFrontDoorStatus("/repo");
 			expect(status).toEqual({ enabled: true, summaryCount: 4 });
 		});
 
 		it("empty index → 0 memories", async () => {
-			h.isGitHookInstalled.mockResolvedValue(true);
+			h.isGitPipelineFullyInstalled.mockResolvedValue(true);
 			h.getSummaryCount.mockResolvedValue(0);
 			const status = await getGuidedFrontDoorStatus("/repo");
 			expect(status).toEqual({ enabled: true, summaryCount: 0 });
