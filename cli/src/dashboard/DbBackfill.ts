@@ -36,6 +36,7 @@ import { isJolliInternalRef } from "../core/JolliRefs.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
+import type { ToolCallCount } from "../Types.js";
 import {
 	collectCommitEvents,
 	// collectRepoGraph,  // parked with `repo_graphs` — see SotSchema
@@ -46,7 +47,15 @@ import {
 } from "./DashboardCollector.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import { inTransaction, withDashboardDb } from "./DashboardDb.js";
-import type { CommitCreatedEvent, ProducerKind, StatsEvent, StatsEventEnvelope } from "./DashboardModel.js";
+import type {
+	CommitCreatedEvent,
+	CommitSummaryEvent,
+	ProducerKind,
+	SessionUpsertedEvent,
+	StatsEvent,
+	StatsEventEnvelope,
+	StatsModelUsage,
+} from "./DashboardModel.js";
 import { existingWorktrees, hasLiveWorktree, type RegisteredRepo, readRepoCutoverFence } from "./RepoRegistry.js";
 import {
 	countMemoriesAbsentFromListing,
@@ -416,6 +425,385 @@ function unchangedCommitEvent(
 	return true;
 }
 
+/**
+ * Session rows this repo already has, keyed `<source>\0<sessionId>` → the row's
+ * `token_coverage`.
+ *
+ * The one thing {@link unchangedSummaryEvent} cannot answer from the commits
+ * side: a summary's session links SEED rows, and whether that seed is a no-op
+ * depends on state in `sessions`, not on the summary.
+ */
+function storedSessionCoverage(db: DashboardDbHandle, repoIdentity: string): Map<string, string> {
+	const rows = db
+		.prepare(
+			`SELECT s.source, s.session_id, s.token_coverage
+			   FROM sessions s JOIN repos r ON r.id = s.repo_id
+			  WHERE r.repo_identity = ?`,
+		)
+		.all(repoIdentity) as ReadonlyArray<{ source: string; session_id: string; token_coverage: string }>;
+	return new Map(rows.map((r) => [`${r.source}\0${r.session_id}`, r.token_coverage]));
+}
+
+/**
+ * True when projecting `event` would write nothing new.
+ *
+ * The memory tier's counterpart to {@link unchangedCommitEvent}, and it exists
+ * for the same reason — with the asymmetry that made it necessary. The commit
+ * tier's gate is per-checkout (HEAD plus the ref list), so an ordinary pass
+ * usually skips collection outright; the summary gate is the index's CONTENT
+ * HASH, which moves the moment any one memory is written, and then re-collects
+ * the WHOLE set. So on a repo being actively developed the gate is open on
+ * essentially every pass and every stored summary was re-logged and re-projected
+ * — measured at 219 events per `jolli dashboard` run, every copy byte-identical
+ * (JOLLI-2224). The redo is idempotent in SQL and free in nothing else: it
+ * appends a write-ahead row per event and re-runs the projection's writes.
+ *
+ * The index hash cannot be narrowed to fix this (consolidation folds children
+ * into new roots, so per-entry cursors genuinely cannot work) — which is exactly
+ * why the answer is the same one the commit tier uses: collect everything,
+ * compare before projecting.
+ *
+ * MIRRORS {@link projectCommitSummary}, which writes THREE things and nothing
+ * else — the memory rows belong to the orphan import, not to this projection:
+ *
+ *  - The `commits` row. Its nullable columns are written `COALESCE(excluded.x,
+ *    commits.x)`, so an ABSENT value cannot change anything; a present one must
+ *    equal what is stored. `committed_at_ms` is deliberately NOT compared: the
+ *    conflict clause does not update it, so it is set on insert and never again.
+ *  - `commit_branches`, replace-when-present with exactly ONE branch — so a
+ *    present `branch` must already be the whole stored set. Absent leaves the
+ *    rows alone and is therefore not a difference (see `projectCommitSummary`
+ *    for why only `commit.created` may claim "no branch").
+ *  - The `sessions` seed. This is the half a commits-only comparison would get
+ *    wrong: a session older than the agents' own retention exists nowhere but in
+ *    these links, so skipping an event whose link has no row loses it silently.
+ *    The seed is a no-op only when the row already exists AND this link cannot
+ *    upgrade it — i.e. the link carries no models, or the row is already past
+ *    `sessions-only`.
+ *
+ * `commitPruned` is what stops the two tiers from ping-ponging. This projection
+ * CREATES the `commits` row when none exists, and `pruneUnreachableCommits`
+ * deletes it again on the next pass whenever git can no longer reach the hash —
+ * a rebased or squashed-away commit whose memory legitimately survives. Neither
+ * tier is wrong on its own, so the loop never converged: 74 events per run,
+ * forever. When the caller KNOWS the hash is unreachable, the row this event
+ * would create is one the prune has already removed in that same pass, so only
+ * the session seeding is left to decide the answer — which is why a missing row
+ * stops being an automatic "must project" and the commits comparisons are
+ * skipped rather than failed.
+ *
+ * The caller may only claim that from a COMPLETE collection: it runs before this
+ * tier and would have collected the commit if git still had it, so within such a
+ * pass "no row" and "no commit" are the same statement. With no reachable set —
+ * a failed read, or a cursor-skipped commit tier, in BOTH of which nothing was
+ * pruned either — a missing row is read the old way, because a summary really
+ * can arrive before its commit is swept.
+ */
+function unchangedSummaryEvent(
+	event: CommitSummaryEvent,
+	stored: { row: Record<string, unknown>; branches: Set<string> } | undefined,
+	sessionCoverage: ReadonlyMap<string, string>,
+	commitPruned: boolean,
+): boolean {
+	if (!stored && !commitPruned) return false;
+	if (stored) {
+		const { row, branches } = stored;
+		if (event.branch !== undefined && row.branch !== event.branch) return false;
+		if (event.message !== undefined && row.message !== event.message) return false;
+		if (event.branch !== undefined && (branches.size !== 1 || !branches.has(event.branch))) return false;
+	}
+	for (const link of event.sessionLinks ?? []) {
+		const coverage = sessionCoverage.get(`${link.source}\0${link.sessionId}`);
+		if (coverage === undefined) return false;
+		if (coverage === "sessions-only" && (link.models ?? []).length > 0) return false;
+	}
+	return true;
+}
+
+/**
+ * The `sessions` columns `projectSession` writes with `COALESCE(excluded.x,
+ * sessions.x)`, paired with the event field each is written from — one table
+ * rather than six near-identical comparisons, so adding a column to that
+ * conflict clause is one line here and cannot be half-done.
+ */
+const SESSION_COALESCED_COLUMNS: ReadonlyArray<
+	readonly [string, (event: SessionUpsertedEvent) => string | number | undefined]
+> = [
+	["title", (e) => e.title],
+	["started_at_ms", (e) => e.startedAtMs],
+	["message_count", (e) => e.messageCount],
+	["duration_ms", (e) => e.durationMs],
+	["prices_as_of", (e) => e.pricesAsOf],
+];
+
+/** A `session_model_usage` row, in the shape {@link sameModelSplit} compares. */
+interface StoredModelRow {
+	readonly input: number;
+	readonly output: number;
+	readonly cached: number;
+	readonly cost: number | null;
+}
+
+/** A `session_tool_use` row, in the shape {@link sameToolSet} compares. */
+interface StoredToolRow {
+	readonly server: string | null;
+	readonly calls: number;
+	readonly lastCallAtMs: number | null;
+}
+
+/**
+ * One session as it is currently stored: its own row plus BOTH child tables.
+ *
+ * The child maps are keyed the way their table is keyed — `session_model_usage`
+ * by `model`, `session_tool_use` by `(tool_name, kind)` — so a comparison that
+ * walks them cannot accidentally merge two rows the schema keeps apart (a skill
+ * and a builtin may share a name; see that table's DDL).
+ */
+interface StoredSession {
+	readonly row: Record<string, unknown>;
+	readonly models: ReadonlyMap<string, StoredModelRow>;
+	readonly tools: ReadonlyMap<string, StoredToolRow>;
+}
+
+/** `(tool_name, kind)` — the `session_tool_use` primary key, minus the session. */
+function toolKey(name: string, kind: string): string {
+	return `${name}\0${kind}`;
+}
+
+/** The session rows this repo already has, in the shape {@link unchangedSessionEvent} compares against. */
+function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<string, StoredSession> {
+	const rows = db
+		.prepare(
+			`SELECT s.source, s.session_id, s.title, s.started_at_ms, s.updated_at_ms, s.message_count,
+			        s.duration_ms, s.model, s.input_tokens, s.output_tokens, s.cached_tokens, s.est_cost_usd,
+			        s.token_coverage, s.prices_as_of
+			   FROM sessions s JOIN repos r ON r.id = s.repo_id
+			  WHERE r.repo_identity = ?`,
+		)
+		.all(repoIdentity) as ReadonlyArray<Record<string, unknown> & { source: string; session_id: string }>;
+	const sessions = new Map<string, StoredSession>(
+		rows.map((r) => [`${r.source}\0${r.session_id}`, { row: r, models: new Map(), tools: new Map() }]),
+	);
+
+	// Joined back through `sessions` rather than read by `session_event_id`: the
+	// id's shape is `statsEventId`'s business, and this way the child rows arrive
+	// keyed by the same `(source, sessionId)` pair the caller looks up with.
+	const modelRows = db
+		.prepare(
+			`SELECT s.source, s.session_id, u.model, u.input_tokens, u.output_tokens, u.cached_tokens, u.est_cost_usd
+			   FROM session_model_usage u
+			   JOIN sessions s ON s.event_id = u.session_event_id
+			   JOIN repos r    ON r.id = s.repo_id
+			  WHERE r.repo_identity = ?`,
+		)
+		.all(repoIdentity) as ReadonlyArray<{
+		source: string;
+		session_id: string;
+		model: string;
+		input_tokens: number;
+		output_tokens: number;
+		cached_tokens: number;
+		est_cost_usd: number | null;
+	}>;
+	for (const r of modelRows) {
+		const target = sessions.get(`${r.source}\0${r.session_id}`);
+		(target?.models as Map<string, StoredModelRow>)?.set(r.model, {
+			input: r.input_tokens,
+			output: r.output_tokens,
+			cached: r.cached_tokens,
+			cost: r.est_cost_usd,
+		});
+	}
+
+	const toolRows = db
+		.prepare(
+			`SELECT s.source, s.session_id, t.tool_name, t.kind, t.server, t.calls, t.last_call_at_ms
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			   JOIN repos r    ON r.id = s.repo_id
+			  WHERE r.repo_identity = ?`,
+		)
+		.all(repoIdentity) as ReadonlyArray<{
+		source: string;
+		session_id: string;
+		tool_name: string;
+		kind: string;
+		server: string | null;
+		calls: number;
+		last_call_at_ms: number | null;
+	}>;
+	for (const r of toolRows) {
+		const target = sessions.get(`${r.source}\0${r.session_id}`);
+		(target?.tools as Map<string, StoredToolRow>)?.set(toolKey(r.tool_name, r.kind), {
+			server: r.server,
+			calls: r.calls,
+			lastCallAtMs: r.last_call_at_ms,
+		});
+	}
+	return sessions;
+}
+
+/**
+ * True when re-writing `models` would leave `session_model_usage` as it stands.
+ *
+ * The split is replaced WHOLESALE, so this is set equality and not containment:
+ * a shrinking set leaves a stale row behind, which is the whole reason
+ * `projectSession` deletes before inserting.
+ *
+ * `model` is that table's key, so duplicate entries in one event would violate
+ * the primary key on the plain INSERT — the projection would throw, not merge.
+ * Nothing to mirror here; a size check plus a per-key lookup is exact.
+ */
+function sameModelSplit(models: ReadonlyArray<StatsModelUsage>, stored: ReadonlyMap<string, StoredModelRow>): boolean {
+	if (models.length !== stored.size) return false;
+	for (const m of models) {
+		const row = stored.get(m.model);
+		if (!row) return false;
+		if (row.input !== m.inputTokens || row.output !== m.outputTokens || row.cached !== m.cachedTokens) return false;
+		if (row.cost !== (m.estCostUsd ?? null)) return false;
+	}
+	return true;
+}
+
+/**
+ * True when re-writing `tools` would leave `session_tool_use` as it stands.
+ *
+ * Set equality against `stored`, keyed by {@link toolKey} — same shape as
+ * {@link sameModelSplit}, and same reason (the set is replaced wholesale, so a
+ * dropped tool is a real write). Three facts about the write path make this one
+ * harder than the model split, and all three are load-bearing:
+ *
+ *  1. The insert carries `ON CONFLICT(session_event_id, tool_name, kind)`, so
+ *     two entries in ONE event that share a name and kind do not both land —
+ *     they merge, with `calls` taking the later entry's value, `last_call_at_ms`
+ *     taking the MAX, and `server` keeping the FIRST entry's value because the
+ *     conflict clause does not update it.
+ *  2. `last_call_at_ms` is written through `NULLIF(MAX(...), 0)`, so an entry
+ *     with no instant does not necessarily store NULL.
+ *  3. `server` is nullable on both sides, and `undefined` on the event becomes
+ *     NULL in the row.
+ *
+ * Only the FIRST of those needs an answer here, and the answer is to refuse
+ * rather than to restate it: a repeated key is reported CHANGED, so the event
+ * projects and the merge stays where it is written. Facts 2 and 3 then stop
+ * being reachable subtleties — the projection deletes before inserting, so with
+ * no repeat inside the event there is no conflicting row for the MAX to consult
+ * and each entry stores its own value, NULL included. That is what makes plain
+ * equality exact for every list this branch actually compares.
+ *
+ * Counting entries against stored rows does NOT subsume that refusal, though it
+ * looks like it should: a repeat collapses, so `[Bash, Bash]` is two entries and
+ * one row, and it meets a stored pair of `Bash` + `Read` at equal size. Skipping
+ * there would strand `Read` forever — the row the projection was about to drop.
+ */
+function sameToolSet(tools: ReadonlyArray<ToolCallCount>, stored: ReadonlyMap<string, StoredToolRow>): boolean {
+	const keys = new Set(tools.map((t) => toolKey(t.name, t.kind)));
+	if (keys.size !== tools.length) return false;
+	if (tools.length !== stored.size) return false;
+	for (const tool of tools) {
+		const row = stored.get(toolKey(tool.name, tool.kind));
+		if (!row) return false;
+		if (row.calls !== tool.calls) return false;
+		if (row.server !== (tool.server ?? null)) return false;
+		if (row.lastCallAtMs !== (tool.lastCallAtMs ?? null)) return false;
+	}
+	return true;
+}
+
+/**
+ * True when projecting `event` would write nothing new.
+ *
+ * The session tier has NO gate whatever — its cursor is recorded for
+ * observability and never consulted, deliberately, because a global
+ * max-updatedAt would miss a session updated out of order. So every
+ * discoverable session was re-logged and re-projected on every pass; measured,
+ * half of them carry no usage at all and are byte-identical repeats
+ * (JOLLI-2224).
+ *
+ * The child tables are covered for a measured reason, not for symmetry. A first
+ * version skipped any event carrying a split or a tool list, on the grounds that
+ * their merge rules were the risky half to mirror. Two back-to-back `jolli
+ * dashboard` runs then still re-projected 17 sessions each, byte-identical, and
+ * 14 of the 17 had not been touched for a day — the carve-out WAS the remaining
+ * churn, because a real session almost always carries both.
+ *
+ * MIRRORS `projectSession`, including both child tables. It compares against the
+ * ROWS THOSE WRITES WOULD PRODUCE, never against the merge rules that produce
+ * them — the rules (the `hasUsage` gate `models: []` once fell through, the
+ * MAX/NULLIF on the tool timestamp) are exactly what a restatement would drift
+ * from, and a drifted gate fails by silently dropping data. The one rule that IS
+ * restated is `hasUsage` itself, because it decides whether a write happens at
+ * all rather than what it writes:
+ *
+ *  - `updated_at_ms` is written unconditionally, so it is always compared.
+ *  - The `COALESCE`d columns cannot be changed by an ABSENT value; a present one
+ *    must already match.
+ *  - The token scalars and `token_coverage` are written unconditionally, but the
+ *    value written comes from the model split WHEN THERE IS ONE — so the
+ *    comparison derives them the same way rather than reading the event's own
+ *    scalar fields, which a split makes advisory. When the event observed no
+ *    usage at all the stored values carried forward, so nothing can move.
+ *  - `model` and `est_cost_usd` are `COALESCE`d, but their written value is
+ *    DERIVED from the split (primary model, summed cost), so they cannot ride in
+ *    {@link SESSION_COALESCED_COLUMNS} with the fields that are copied verbatim.
+ *    And `est_cost_usd` is the one derived column that does NOT ride on
+ *    `hasUsage`: it falls back to the event's own `estCostUsd` before the stored
+ *    value, so a token-less event carrying a price still writes it, and its
+ *    comparison has to happen ahead of the carry-forward return.
+ *  - Both child tables are replace-when-observed, under the same predicate
+ *    `projectSession` uses to decide it wrote at all.
+ */
+function unchangedSessionEvent(event: SessionUpsertedEvent, stored: StoredSession | undefined): boolean {
+	if (!stored) return false;
+	const { row } = stored;
+	if (row.updated_at_ms !== event.updatedAtMs) return false;
+	for (const [column, read] of SESSION_COALESCED_COLUMNS) {
+		const value = read(event);
+		if (value !== undefined && row[column] !== value) return false;
+	}
+
+	const models = event.models ?? [];
+	// The SAME predicate `projectSession` computes, `models.length > 0` term and
+	// all. Dropping that term is not a near-miss: it routes a split-carrying event
+	// into the carry-forward branch below, which compares no tokens at all.
+	const hasUsage =
+		models.length > 0 || event.inputTokens != null || event.outputTokens != null || event.cachedTokens != null;
+
+	// Replace-when-observed, both of them. The model split's guard is `hasUsage`
+	// AND presence — an event that carries `models: []` with no scalar tokens is
+	// "unobserved", and the projection leaves the stored split alone.
+	if (hasUsage && event.models !== undefined && !sameModelSplit(models, stored.models)) return false;
+	if (event.tools !== undefined && !sameToolSet(event.tools, stored.tools)) return false;
+
+	const sum = (read: (m: StatsModelUsage) => number): number => models.reduce((total, m) => total + read(m), 0);
+	// `COALESCE`d, so only a non-null derived value can move it — but compared
+	// BEFORE the carry-forward return below, because cost does not ride on
+	// `hasUsage`. Its fallback chain is the event's own scalar first, so an event
+	// that observed no tokens at all can still carry a price, and that price is
+	// written on both branches. Gating this on `hasUsage` skipped such an event
+	// forever: the cost it brought would never reach the row, silently.
+	const cost = models.some((m) => m.estCostUsd != null) ? sum((m) => m.estCostUsd ?? 0) : event.estCostUsd;
+	if (cost != null && row.est_cost_usd !== cost) return false;
+
+	if (!hasUsage) return event.tokenCoverage === undefined || row.token_coverage === event.tokenCoverage;
+
+	const split = models.length > 0;
+	// `COALESCE`d, so only a non-null derived value can move it. Unlike cost this
+	// one cannot outlive `hasUsage` — it is derived from the split alone, which is
+	// empty on the carry-forward branch, so it is always absent there.
+	const primaryModel = [...models].sort(
+		(a, b) => b.inputTokens + b.outputTokens - (a.inputTokens + a.outputTokens),
+	)[0]?.model;
+	if (primaryModel !== undefined && row.model !== primaryModel) return false;
+
+	return (
+		row.input_tokens === (split ? sum((m) => m.inputTokens) : (event.inputTokens ?? 0)) &&
+		row.output_tokens === (split ? sum((m) => m.outputTokens) : (event.outputTokens ?? 0)) &&
+		row.cached_tokens === (split ? sum((m) => m.cachedTokens) : (event.cachedTokens ?? 0)) &&
+		row.token_coverage === (event.tokenCoverage ?? "sessions-only")
+	);
+}
+
 /** Wraps events in envelopes and applies them in small batches. */
 function applyBatches(
 	db: DashboardDbHandle,
@@ -597,6 +985,11 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 			const gitCursor = fingerprints.length > 0 ? fingerprints.sort().join(" ") : null;
 			const commitCursor = readCursor(db, repo.repoIdentity, CURSOR_GIT);
 			const commitsUnchanged = !isBootstrap && gitCursor !== null && commitCursor === gitCursor;
+			// Set only by a COMPLETE collection below — the same condition that
+			// licenses the prune, and for the same reason. The summary tier reads it
+			// to tell "this commit is gone" from "its sweep has not run yet"; null
+			// means it may not distinguish them. See `unchangedSummaryEvent`.
+			let reachableHashes: Set<string> | null = null;
 
 			if (isBootstrap) {
 				db.prepare("UPDATE repos SET bootstrap_state = 'in-progress' WHERE repo_identity = ?").run(
@@ -714,6 +1107,7 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 				).applied;
 				if (collectionComplete) {
 					const reachable = new Set(commitEvents.map((e) => e.hash));
+					reachableHashes = reachable;
 					// Prune against the UNION: pruning per worktree would delete commits that
 					// only the other checkout can reach, and the next pass would re-add them —
 					// a delete/insert cycle on every run.
@@ -750,7 +1144,25 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 					cwd,
 					storage: orphanStorage,
 				});
-				const summaryApply = applyBatches(db, summaries.events, producerKind, now);
+				// Same two-step as the commit tier: the COLLECTION stays whole (the
+				// cursor below is the index's content hash, and `summaries.complete`
+				// is a claim about that whole read), only the PROJECTION is narrowed.
+				const summaryRows = storedCommitRows(db, repo.repoIdentity);
+				const sessionCoverage = storedSessionCoverage(db, repo.repoIdentity);
+				const pruned = (hash: string): boolean => reachableHashes !== null && !reachableHashes.has(hash);
+				const changedSummaries = summaries.events.filter(
+					(event) =>
+						!unchangedSummaryEvent(event, summaryRows.get(event.hash), sessionCoverage, pruned(event.hash)),
+				);
+				if (changedSummaries.length !== summaries.events.length) {
+					log.info(
+						"%s: %d of %d summary events unchanged, skipping their projection",
+						repo.repoName,
+						summaries.events.length - changedSummaries.length,
+						summaries.events.length,
+					);
+				}
+				const summaryApply = applyBatches(db, changedSummaries, producerKind, now);
 				applied += summaryApply.applied;
 				// Same rule as the commit tier's `collectionComplete` above, and for
 				// the same reason: this cursor is the index's content hash, so
@@ -770,17 +1182,30 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 				}
 			}
 
-			// Sessions: always re-project the currently discoverable set. A global
+			// Sessions: always re-COLLECT the currently discoverable set. A global
 			// max-updatedAt cursor would miss an old session updated out of order,
 			// so the cursor only records progress for observability — it is never
-			// used to skip.
+			// used to skip. The projection is narrowed per event instead, exactly as
+			// in the two tiers above; see `unchangedSessionEvent`.
 			opts.onProgress?.({ repoName: repo.repoName, kind: "sessions", done: 0 });
 			const sessionEvents = await collectSessionEvents({
 				repoIdentity: repo.repoIdentity,
 				cwd,
 				...(opts.loadSessions ? { loadSessions: opts.loadSessions } : {}),
 			});
-			applied += applyBatches(db, sessionEvents, producerKind, now, (done, total) =>
+			const storedSessions = storedSessionRows(db, repo.repoIdentity);
+			const changedSessions = sessionEvents.filter(
+				(event) => !unchangedSessionEvent(event, storedSessions.get(`${event.source}\0${event.sessionId}`)),
+			);
+			if (changedSessions.length !== sessionEvents.length) {
+				log.info(
+					"%s: %d of %d session events unchanged, skipping their projection",
+					repo.repoName,
+					sessionEvents.length - changedSessions.length,
+					sessionEvents.length,
+				);
+			}
+			applied += applyBatches(db, changedSessions, producerKind, now, (done, total) =>
 				opts.onProgress?.({ repoName: repo.repoName, kind: "sessions", done, total }),
 			).applied;
 			const maxUpdated = sessionEvents.reduce((max, e) => Math.max(max, e.updatedAtMs), 0);

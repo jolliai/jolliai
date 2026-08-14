@@ -932,6 +932,676 @@ describe("dbBackfillRepo — summaries sweep (memory tier)", () => {
 		// Second pass: same index, so the sweep is gated out — and unannounced.
 		expect(await kinds()).not.toContain("summaries");
 	});
+
+	/** Rows the write-ahead log holds for one summary's projection identity. */
+	const loggedSummaries = async (hash: string): Promise<number> => {
+		const rows = await query<{ n: number }>(
+			"SELECT COUNT(*) AS n FROM events_raw WHERE event_id = ?",
+			`commit-summary:${repo.repoIdentity}:${hash}`,
+		);
+		return rows[0]?.n ?? 0;
+	};
+
+	/** Opens the tier's gate by making the index content differ from last pass. */
+	const changeIndex = (n: number): void => {
+		vi.mocked(getIndex).mockResolvedValue({
+			version: 3,
+			entries: Array.from({ length: n }, (_, i) => ({
+				commitHash: `idx${i}`,
+				parentCommitHash: null,
+				commitMessage: "m",
+				commitDate: "2026-07-30T00:00:00Z",
+				branch: "main",
+				generatedAt: "2026-07-30T00:01:00Z",
+			})),
+		});
+	};
+
+	// Carries a branch and a message, so its FIRST projection genuinely writes
+	// something: the bare fixture above adds nothing once `commit.created` has made
+	// the row, and is therefore skipped from pass one — correct, but it cannot show
+	// a re-run.
+	const attributedSummary = { ...summaryEvent, branch: "main", message: "summarized aaa" };
+
+	it("does not re-enqueue a summary whose projection would write nothing", async () => {
+		// The index gate is all-or-nothing: one new memory anywhere re-collects the
+		// WHOLE set, so without a per-event comparison every stored summary is
+		// re-logged and re-projected on each pass. Measured at 219 events per
+		// `jolli dashboard` run, every copy byte-identical (JOLLI-2224).
+		changeIndex(0);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [attributedSummary], complete: true });
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSummaries("aaa")).toBe(1);
+
+		changeIndex(1);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSummaries("aaa")).toBe(1);
+	});
+
+	it("still projects a summary whose branch changed", async () => {
+		// The skip must not swallow a real change: this is the late-arriving
+		// attribution the tier above exists to land.
+		changeIndex(0);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [attributedSummary], complete: true });
+		await dbBackfillRepo({ repo, dbPath });
+
+		changeIndex(1);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({
+			events: [{ ...attributedSummary, branch: "feature/x" }],
+			complete: true,
+		});
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSummaries("aaa")).toBe(2);
+		expect(await branchesOf("aaa")).toEqual(["feature/x"]);
+	});
+
+	it("still projects a summary carrying a session link the database lacks", async () => {
+		// `projectCommitSummary` also SEEDS sessions — a session older than the
+		// agents' own retention exists nowhere else. Comparing only the commits
+		// columns would skip the event and lose that row silently.
+		changeIndex(0);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [attributedSummary], complete: true });
+		await dbBackfillRepo({ repo, dbPath });
+
+		changeIndex(1);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({
+			events: [
+				{
+					...attributedSummary,
+					sessionLinks: [{ source: "codex" as const, sessionId: "old-1", confidence: "exact" as const }],
+				},
+			],
+			complete: true,
+		});
+		await dbBackfillRepo({ repo, dbPath });
+
+		const seeded = await query<{ session_id: string }>(
+			"SELECT session_id FROM sessions WHERE session_id = 'old-1'",
+		);
+		expect(seeded).toEqual([{ session_id: "old-1" }]);
+	});
+
+	it("still projects a summary whose commit row does not exist yet, when git could not be read", async () => {
+		// The summary can legitimately arrive first — `CommitSummaryEvent` carries
+		// `committedAtMs` precisely so the projection can create the row. With no
+		// reachable set to consult (the collection failed, so nothing was pruned
+		// either) a missing row has to be read that way.
+		vi.mocked(collectCommitEvents).mockRejectedValue(new Error("git log exploded"));
+		changeIndex(0);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [attributedSummary], complete: true });
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSummaries("aaa")).toBe(1);
+		expect(await branchesOf("aaa")).toEqual(["main"]);
+	});
+
+	it("does not re-enqueue a summary whose commit the prune has removed", async () => {
+		// The two tiers used to ping-pong: this tier's `INSERT INTO commits` recreates
+		// a row for a hash git can no longer reach, and the next pass's
+		// `pruneUnreachableCommits` deletes it again — 74 events per run that could
+		// never converge (JOLLI-2224). A COMPLETE commit collection is what makes the
+		// two cases distinguishable: it runs first and would have collected the commit
+		// if git still had it, so a missing row here means the commit is gone.
+		vi.mocked(collectCommitEvents).mockResolvedValue([commitEvent("bbb")]);
+		changeIndex(0);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [attributedSummary], complete: true });
+
+		await dbBackfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSummaries("aaa")).toBe(0);
+		const rows = await query<{ hash: string }>("SELECT hash FROM commits WHERE hash = 'aaa'");
+		expect(rows).toEqual([]);
+	});
+
+	it("still seeds a pruned commit's sessions, which exist nowhere else", async () => {
+		// The half that must survive the skip above: `projectCommitSummary` seeds
+		// `sessions` from the links independently of the commits row, and a session
+		// older than the agents' own retention has no other record. Only the
+		// commits-row half of the effect is pointless.
+		vi.mocked(collectCommitEvents).mockResolvedValue([commitEvent("bbb")]);
+		changeIndex(0);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({
+			events: [
+				{
+					...attributedSummary,
+					sessionLinks: [{ source: "codex" as const, sessionId: "old-1", confidence: "exact" as const }],
+				},
+			],
+			complete: true,
+		});
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		const seeded = await query<{ session_id: string }>(
+			"SELECT session_id FROM sessions WHERE session_id = 'old-1'",
+		);
+		expect(seeded).toEqual([{ session_id: "old-1" }]);
+	});
+
+	it("still projects a summary after a commit sweep cleared its attribution", async () => {
+		// The case a `commits.branch` comparison alone would miss, and it is the
+		// ordinary one: `commit.created` writes its `branch` COLUMN with COALESCE
+		// (absent keeps the stored value) but replaces `commit_branches` outright, so
+		// an index that does not list the hash clears the ROWS while the column still
+		// reads "main". Skipping there would leave the branch axis empty until an
+		// unrelated ref happened to move.
+		changeIndex(0);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [attributedSummary], complete: true });
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await branchesOf("aaa")).toEqual(["main"]);
+
+		// The sweep's own message matches what the summary stored, so the comparison
+		// gets past the columns and has only `commit_branches` left to disagree on —
+		// which is the whole point of this case.
+		vi.mocked(getHeadHash).mockResolvedValue("head-2");
+		vi.mocked(collectCommitEvents).mockResolvedValue([
+			{ ...commitEvent("aaa"), message: attributedSummary.message, branches: [] },
+		]);
+		changeIndex(1);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSummaries("aaa")).toBe(2);
+		expect(await branchesOf("aaa")).toEqual(["main"]);
+	});
+
+	it("still projects a summary whose link can upgrade a sessions-only row", async () => {
+		// The seed's own gate: a link with a model split turns a `sessions-only` row
+		// into `full`. That is the one case where the session row EXISTS and the
+		// event still has work to do, so presence alone is not the predicate.
+		const link = { source: "codex" as const, sessionId: "old-1", confidence: "exact" as const };
+		changeIndex(0);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({
+			events: [{ ...attributedSummary, sessionLinks: [link] }],
+			complete: true,
+		});
+		await dbBackfillRepo({ repo, dbPath });
+
+		changeIndex(1);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({
+			events: [
+				{
+					...attributedSummary,
+					sessionLinks: [
+						{
+							...link,
+							models: [{ model: "claude-opus-5", inputTokens: 30, outputTokens: 7, cachedTokens: 0 }],
+						},
+					],
+				},
+			],
+			complete: true,
+		});
+		await dbBackfillRepo({ repo, dbPath });
+
+		const row = await query<{ token_coverage: string; input_tokens: number }>(
+			"SELECT token_coverage, input_tokens FROM sessions WHERE session_id = 'old-1'",
+		);
+		expect(row).toEqual([{ token_coverage: "full", input_tokens: 30 }]);
+	});
+
+	it("still projects a summary whose commit message changed", async () => {
+		// `git commit --amend -m` followed by a regeneration: same hash namespace,
+		// new message. The `commits` row is COALESCE-updated from this event, so a
+		// present message that differs is a real write.
+		changeIndex(0);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [attributedSummary], complete: true });
+		await dbBackfillRepo({ repo, dbPath });
+
+		changeIndex(1);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({
+			events: [{ ...attributedSummary, message: "reworded aaa" }],
+			complete: true,
+		});
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSummaries("aaa")).toBe(2);
+		const rows = await query<{ message: string }>("SELECT message FROM commits WHERE hash = 'aaa'");
+		expect(rows).toEqual([{ message: "reworded aaa" }]);
+	});
+
+	it("skips a summary that records no session links at all", async () => {
+		// `sessionLinks` is optional on the wire, not merely empty — the loop has to
+		// read an absent list as "nothing to seed" rather than throw.
+		const { sessionLinks: _drop, ...linkless } = attributedSummary;
+		changeIndex(0);
+		vi.mocked(collectSummaryEvents).mockResolvedValue({ events: [linkless], complete: true });
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSummaries("aaa")).toBe(1);
+
+		changeIndex(1);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSummaries("aaa")).toBe(1);
+	});
+});
+
+describe("dbBackfillRepo — sessions sweep", () => {
+	/** Rows the write-ahead log holds for one session's projection identity. */
+	const loggedSessions = async (sessionId: string): Promise<number> => {
+		const rows = await query<{ n: number }>(
+			"SELECT COUNT(*) AS n FROM events_raw WHERE event_id = ?",
+			`session:${repo.repoIdentity}:claude:${sessionId}`,
+		);
+		return rows[0]?.n ?? 0;
+	};
+
+	it("does not re-enqueue a session whose projection would write nothing", async () => {
+		// This tier has NO cursor at all — spec 350 records the `sessions` cursor as
+		// observability only — so every discoverable session was re-logged on every
+		// pass. Half of them carry no usage at all and are pure repeats (JOLLI-2224).
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+	});
+
+	it("still projects a session whose transcript moved on", async () => {
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...sessionEvent, updatedAtMs: sessionEvent.updatedAtMs + 1000, messageCount: 12 },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const row = await query<{ message_count: number }>(
+			"SELECT message_count FROM sessions WHERE session_id = 's1'",
+		);
+		expect(row).toEqual([{ message_count: 12 }]);
+	});
+
+	// Every column the comparison reads, so an unchanged re-read has to clear all
+	// of them rather than falling through on absent fields.
+	const richSession: SessionUpsertedEvent = {
+		...sessionEvent,
+		title: "a conversation",
+		startedAtMs: 1_700_000_000_000,
+		messageCount: 9,
+		durationMs: 45_000,
+		inputTokens: 120,
+		outputTokens: 40,
+		cachedTokens: 8,
+		estCostUsd: 0.031,
+		tokenCoverage: "full",
+		pricesAsOf: "2026-07-30",
+	};
+
+	it("does not re-enqueue a fully-populated session that is byte-identical", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([richSession]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+	});
+
+	it("still projects a session whose token totals moved without its timestamp", async () => {
+		// A better parser re-reading the same transcript slice: `updated_at_ms` is
+		// unchanged, so the tokens are the only thing that can say the row is stale.
+		vi.mocked(collectSessionEvents).mockResolvedValue([richSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...richSession, inputTokens: 500 }]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const row = await query<{ input_tokens: number }>("SELECT input_tokens FROM sessions WHERE session_id = 's1'");
+		expect(row).toEqual([{ input_tokens: 500 }]);
+	});
+
+	it("still projects a session whose title arrived later", async () => {
+		// A COALESCE'd column: absent leaves the stored value alone (and is not a
+		// difference), but a present one that disagrees is a real write.
+		const { title: _none, ...untitled } = richSession;
+		vi.mocked(collectSessionEvents).mockResolvedValue([untitled]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([richSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const row = await query<{ title: string }>("SELECT title FROM sessions WHERE session_id = 's1'");
+		expect(row).toEqual([{ title: "a conversation" }]);
+	});
+
+	it("still projects a session whose model split arrived later", async () => {
+		// The child tables are replace-when-observed, so a session that had no split
+		// and now has one is a real write — the same shape as a COALESCE'd column
+		// filling in, one table further down.
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{
+				...sessionEvent,
+				models: [{ model: "claude-opus-5", inputTokens: 10, outputTokens: 5, cachedTokens: 0 }],
+			},
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const usage = await query<{ model: string }>("SELECT model FROM session_model_usage");
+		expect(usage).toEqual([{ model: "claude-opus-5" }]);
+	});
+
+	// The child tables are the LAST source of per-run churn: measured on a real
+	// machine, two back-to-back `jolli dashboard` runs each re-projected the same
+	// 17 sessions, byte-identical, purely because they carried a model split
+	// (JOLLI-2224 follow-up). Every one of these events is compared against the
+	// rows it would write rather than against `projectSession`'s merge RULES —
+	// the rules are what a restatement would drift from.
+	const modelSession: SessionUpsertedEvent = {
+		...sessionEvent,
+		tokenCoverage: "full",
+		models: [
+			{ model: "claude-opus-5", inputTokens: 100, outputTokens: 50, cachedTokens: 10, estCostUsd: 0.5 },
+			{ model: "claude-haiku-4-5", inputTokens: 20, outputTokens: 5, cachedTokens: 0 },
+		],
+	};
+
+	const toolSession: SessionUpsertedEvent = {
+		...sessionEvent,
+		tools: [
+			{ name: "Bash", kind: "builtin", calls: 40, lastCallAtMs: 1_700_000_040_000 },
+			{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory", calls: 1 },
+		],
+	};
+
+	it("does not re-enqueue a session whose model split is unchanged", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([modelSession]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+	});
+
+	it("still projects a session whose model split moved", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([modelSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const [opus, haiku] = modelSession.models ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...modelSession, models: [{ ...opus, outputTokens: 900 }, haiku] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const row = await query<{ output_tokens: number }>(
+			"SELECT output_tokens FROM session_model_usage WHERE model = 'claude-opus-5'",
+		);
+		expect(row).toEqual([{ output_tokens: 900 }]);
+	});
+
+	it("still projects a session that dropped a model", async () => {
+		// The split is replaced WHOLESALE, so a shrinking set is a real write even
+		// though every surviving row is identical — comparing only the rows the
+		// event carries would leave the dropped one behind forever.
+		vi.mocked(collectSessionEvents).mockResolvedValue([modelSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...modelSession, models: [(modelSession.models ?? [])[0]] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const rows = await query<{ model: string }>("SELECT model FROM session_model_usage ORDER BY model");
+		expect(rows).toEqual([{ model: "claude-opus-5" }]);
+	});
+
+	it("still projects a session that swapped one model for another", async () => {
+		// Equal cardinality, so the size check passes and only the per-key lookup can
+		// tell these apart. A rename is the ordinary way this happens.
+		vi.mocked(collectSessionEvents).mockResolvedValue([modelSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const [opus, haiku] = modelSession.models ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...modelSession, models: [opus, { ...haiku, model: "claude-haiku-5" }] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const rows = await query<{ model: string }>("SELECT model FROM session_model_usage ORDER BY model");
+		expect(rows).toEqual([{ model: "claude-haiku-5" }, { model: "claude-opus-5" }]);
+	});
+
+	it("still projects a session whose model was repriced", async () => {
+		// Same tokens, different cost — a `PRICES_AS_OF` bump re-costing an existing
+		// split. Nothing in the token columns moves, so the cost is the only witness.
+		vi.mocked(collectSessionEvents).mockResolvedValue([modelSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const [opus, haiku] = modelSession.models ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...modelSession, models: [{ ...opus, estCostUsd: 0.75 }, haiku] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const row = await query<{ est_cost_usd: number }>("SELECT est_cost_usd FROM sessions WHERE session_id = 's1'");
+		expect(row).toEqual([{ est_cost_usd: 0.75 }]);
+	});
+
+	it("still projects a session whose cost moved with no model split to explain it", async () => {
+		// `est_cost_usd` cannot ride with the verbatim COALESCE'd columns — a split
+		// makes its written value a SUM — so it is compared on its own. This is the
+		// no-split half of that comparison.
+		vi.mocked(collectSessionEvents).mockResolvedValue([richSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...richSession, estCostUsd: 0.99 }]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const row = await query<{ est_cost_usd: number }>("SELECT est_cost_usd FROM sessions WHERE session_id = 's1'");
+		expect(row).toEqual([{ est_cost_usd: 0.99 }]);
+	});
+
+	it("still projects a session whose stored display model went stale", async () => {
+		// `sessions.model` is COALESCE'd and derived (highest-token model), so it can
+		// disagree with a split that itself matches — an older build that picked the
+		// primary differently leaves exactly this state behind. Compared separately
+		// for that reason; the split alone would call this session unchanged.
+		vi.mocked(collectSessionEvents).mockResolvedValue([modelSession]);
+		await dbBackfillRepo({ repo, dbPath });
+		await withDashboardDb((db) => db.prepare("UPDATE sessions SET model = 'claude-haiku-4-5'").run(), { dbPath });
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const row = await query<{ model: string }>("SELECT model FROM sessions WHERE session_id = 's1'");
+		expect(row).toEqual([{ model: "claude-opus-5" }]);
+	});
+
+	it("does not re-enqueue a usage-less re-read carrying an empty model split", async () => {
+		// `models: []` with no scalar tokens is "unobserved", not "no models": the
+		// projection's delete is gated on `hasUsage`, so it writes NOTHING and the
+		// stored split survives. Comparing the empty list against the stored rows
+		// would call that a difference and re-project on every pass.
+		vi.mocked(collectSessionEvents).mockResolvedValue([modelSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const { models: _dropped, tokenCoverage: _coverage, ...bare } = modelSession;
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...bare, models: [] }]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+		const rows = await query<{ model: string }>("SELECT model FROM session_model_usage ORDER BY model");
+		expect(rows).toEqual([{ model: "claude-haiku-4-5" }, { model: "claude-opus-5" }]);
+	});
+
+	it("does not re-enqueue an unobserved re-read that restates the stored coverage", async () => {
+		// No tokens and no split, so the projection carries the stored values
+		// forward and only `token_coverage` is even eligible to move. Restating the
+		// value it already holds is not a move.
+		const unobserved: SessionUpsertedEvent = { ...sessionEvent, tokenCoverage: "sessions-only" };
+		vi.mocked(collectSessionEvents).mockResolvedValue([unobserved]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+	});
+
+	it("still projects an unobserved re-read whose cost moved", async () => {
+		// `est_cost_usd` is the one derived column that does not ride on `hasUsage`:
+		// its fallback chain reaches the event's own scalar BEFORE the stored value,
+		// so a token-less event carrying a price writes it. Comparing only
+		// `token_coverage` on this branch skipped such an event forever, and the
+		// price it brought never reached the row.
+		const priced: SessionUpsertedEvent = { ...sessionEvent, estCostUsd: 0.25 };
+		vi.mocked(collectSessionEvents).mockResolvedValue([priced]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...priced, estCostUsd: 0.4 }]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const row = await query<{ est_cost_usd: number }>("SELECT est_cost_usd FROM sessions WHERE session_id = 's1'");
+		expect(row).toEqual([{ est_cost_usd: 0.4 }]);
+	});
+
+	it("does not re-enqueue an unobserved re-read restating the stored cost", async () => {
+		// The other half of the check above: hoisting the cost comparison ahead of
+		// the carry-forward return must not turn a token-less session into one that
+		// re-projects on every pass just because it carries a price at all.
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...sessionEvent, estCostUsd: 0.25 }]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+	});
+
+	it("does not re-enqueue a session whose tokens are observed without a coverage claim", async () => {
+		// An event that observed usage but names no coverage is written as
+		// `sessions-only`, so the comparison has to apply the same default rather
+		// than reading the absent field as "no opinion".
+		const { tokenCoverage: _absent, ...unclaimed } = richSession;
+		vi.mocked(collectSessionEvents).mockResolvedValue([unclaimed]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+	});
+
+	it("does not re-enqueue a session whose tool calls are unchanged", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([toolSession]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+	});
+
+	it("still projects a session whose tool call count moved", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([toolSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const [bash, recall] = toolSession.tools ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...toolSession, tools: [{ ...bash, calls: 41 }, recall] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const row = await query<{ calls: number }>("SELECT calls FROM session_tool_use WHERE tool_name = 'Bash'");
+		expect(row).toEqual([{ calls: 41 }]);
+	});
+
+	it("still projects a session that dropped a tool", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([toolSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...toolSession, tools: [(toolSession.tools ?? [])[0]] }]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const rows = await query<{ tool_name: string }>("SELECT tool_name FROM session_tool_use");
+		expect(rows).toEqual([{ tool_name: "Bash" }]);
+	});
+
+	it("still projects a session whose tool list repeats one name and kind", async () => {
+		// A repeated `(name, kind)` COLLAPSES on insert — the pair is that table's
+		// key — so N entries can produce fewer than N rows. Counting entries against
+		// stored rows is therefore not enough on its own: here two entries meet two
+		// stored rows, and projecting would leave ONE, deleting `Read`.
+		const bash = { name: "Bash", kind: "builtin", calls: 40, lastCallAtMs: 1_700_000_040_000 } as const;
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...sessionEvent, tools: [bash, { name: "Read", kind: "builtin", calls: 3 }] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...sessionEvent, tools: [bash, bash] }]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const rows = await query<{ tool_name: string }>("SELECT tool_name FROM session_tool_use ORDER BY tool_name");
+		expect(rows).toEqual([{ tool_name: "Bash" }]);
+	});
+
+	it("still projects a session that swapped one tool for another", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([toolSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const [bash, recall] = toolSession.tools ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...toolSession, tools: [bash, { ...recall, name: "jollimemory.search" }] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const rows = await query<{ tool_name: string }>("SELECT tool_name FROM session_tool_use ORDER BY tool_name");
+		expect(rows).toEqual([{ tool_name: "Bash" }, { tool_name: "jollimemory.search" }]);
+	});
+
+	it("still projects a session whose MCP tool changed server", async () => {
+		// `server` is not part of the key, so a tool that moved between servers keeps
+		// its row identity — only the column moves, and only this check sees it.
+		vi.mocked(collectSessionEvents).mockResolvedValue([toolSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const [bash, recall] = toolSession.tools ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...toolSession, tools: [bash, { ...recall, server: "jollimemory-remote" }] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		const row = await query<{ server: string }>("SELECT server FROM session_tool_use WHERE kind = 'mcp'");
+		expect(row).toEqual([{ server: "jollimemory-remote" }]);
+	});
+
+	it("still projects a session whose tool lost its recorded instant", async () => {
+		// The MAX around `last_call_at_ms` cannot save the stored instant here: the
+		// projection DELETEs the tool rows before inserting, so there is no
+		// conflicting row for it to consult and the re-read's absent time lands as
+		// NULL. That erasure is a real write, which is exactly why this comparison
+		// may not treat "no instant" as equal to a stored one.
+		vi.mocked(collectSessionEvents).mockResolvedValue([toolSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const [bash, recall] = toolSession.tools ?? [];
+		const { lastCallAtMs: _gone, ...timeless } = bash;
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...toolSession, tools: [timeless, recall] }]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+	});
 });
 
 describe("multiple checkouts of one project (§10.2)", () => {
